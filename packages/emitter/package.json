@@ -1,0 +1,17 @@
+{
+  "name": "@pl-graph/emitter",
+  "module": "src/index.ts",
+  "type": "module",
+  "scripts": {},
+  "devDependencies": {
+    "@types/bun": "^1.0.2",
+    "@types/debug": "^4.1.12",
+    "bun-types": "latest",
+    "debug": "^4.3.4",
+    "prettier": "^3.2.5"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {}
+}
