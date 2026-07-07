@@ -382,7 +382,21 @@ export const createSyncHost = (store: Store, options: SyncHostOptions): SyncHost
     // empty ref) must still emit its authoritative (empty) order, or a client
     // holding warm rows across the reconnect would keep showing them as complete.
     if (rowsChanged || firstAuthoritativePush) {
-      const d = diffRows(s.key, s.prevByKey, s.prevOrder, rows as Row[], firstAuthoritativePush);
+      let d: RowDiff;
+
+      try {
+        d = diffRows(s.key, s.prevByKey, s.prevOrder, rows as Row[], firstAuthoritativePush);
+      } catch (e) {
+        // A cell that can't be diffed — e.g. `JSON.stringify` on a BigInt or a
+        // circular object-valued column — must not throw out of the store-notify
+        // callback and break the push loop for every OTHER subscription. Surface
+        // a wire error and skip this push; the subscription stays alive (real
+        // query() cells are JSON-safe, so this is a defensive guard).
+        send({ type: 'rows', sub, error: toWireError(e) });
+
+        return;
+      }
+
       s.prevByKey = d.byKey;
       s.prevOrder = d.orderKeys;
 
