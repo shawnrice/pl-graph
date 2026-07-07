@@ -187,6 +187,13 @@ export type SubscribeMessage = {
    * `complete` still reflects the whole scope, not the page.
    */
   window?: { offset: number; limit: number };
+  /**
+   * Demand-fill priority hint. Higher runs first when loads contend for the
+   * scheduler's limited concurrency (default 0). Routed to the load job so an
+   * app-supplied `loadScheduler` — or the default priority-ordered gate — can
+   * front-run a user-facing query ahead of background prefetches.
+   */
+  priority?: number;
 };
 
 /** Tear down a standing query. */

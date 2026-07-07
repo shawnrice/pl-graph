@@ -104,7 +104,7 @@ export type SyncHostOptions = {
    * Called on every subscribe with its declared deps and params — the
    * demand-fill trigger (params carry the scope of value-keyed collections).
    */
-  onSubscribe?: (deps: readonly string[] | null, params?: QueryParams) => void;
+  onSubscribe?: (deps: readonly string[] | null, params?: QueryParams, priority?: number) => void;
   /** Pending write-back count for the status message. Defaults to 0. */
   pendingWrites?: () => number;
   /**
@@ -425,7 +425,7 @@ export const createSyncHost = (store: Store, options: SyncHostOptions): SyncHost
     // field; a malformed message that omits it degrades to the safe coarse
     // default (recompute-always), never a crash.
     const deps = msg.deps ?? null;
-    options.onSubscribe?.(deps, msg.params);
+    options.onSubscribe?.(deps, msg.params, msg.priority);
 
     // Gremlin standing queries push full `values`; the `key` (keyed diffs) is a
     // GQL-rows notion and is ignored for them.

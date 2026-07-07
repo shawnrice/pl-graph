@@ -65,6 +65,39 @@ export type CollectionDefinition = {
  */
 export type CollectionScope = { name: string; scope?: QueryParams };
 
+/**
+ * One unit of demand-fill work handed to a {@link LoadScheduler}: load this
+ * `collection` at this `scope`. `attempt` is 0 for a fresh demand, ≥1 for the
+ * Nth retry after a failure; `priority` (default 0, higher first) is the
+ * subscription's hint. `run()` performs the load and rejects on failure — the
+ * engine, not the scheduler, decides whether a rejection earns another attempt.
+ */
+export type LoadJob = {
+  readonly collection: string;
+  readonly scope: QueryParams;
+  readonly attempt: number;
+  readonly priority: number;
+  run: () => Promise<void>;
+};
+
+/**
+ * The demand-fill escape hatch: an app-supplied gate deciding WHEN, in what
+ * ORDER, and at what CONCURRENCY load jobs run. Called once per job; returns a
+ * cancel fn the engine invokes when the job is superseded (a fresh explicit
+ * demand, or `retryAll`) so a stale backoff timer never double-fires.
+ *
+ * The split is deliberate: the scheduler owns timing/ordering/concurrency; the
+ * engine owns the retry POLICY (how many attempts, and that only a rejection
+ * earns the next one). This is why a custom scheduler cannot storm — the engine
+ * only ever hands it one live job per (collection, scope), and only mints the
+ * next attempt when the prior `run()` rejects, up to `loadRetry.attempts`.
+ *
+ * Omit it for the default gate: attempt-0 jobs run as soon as a concurrency
+ * slot frees (highest priority first), retries wait an exponential, capped,
+ * jittered backoff.
+ */
+export type LoadScheduler = (job: LoadJob) => () => void;
+
 export type SyncEngineOptions = {
   store: Store;
   /** The app's demand-fill scopes, keyed by collection name. */
@@ -102,9 +135,30 @@ export type SyncEngineOptions = {
    * snapshot's graph); the cap gates NEW writes only.
    */
   maxPendingWrites?: number;
+  /**
+   * Demand-fill retry policy: after a load fails, the engine schedules up to
+   * `attempts` total tries (default 5) with `baseMs * 2^(n-1)` backoff between
+   * them (default base 1s), capped at `maxMs` (default 30s). Distinct from the
+   * write-back `retry` so reads and writes back off independently.
+   */
+  loadRetry?: { attempts?: number; baseMs?: number; maxMs?: number };
+  /**
+   * The demand-fill scheduler escape hatch (see {@link LoadScheduler}). Omit for
+   * the default backoff + priority + concurrency gate; supply one to route loads
+   * through an app-owned queue (custom prioritization, a global rate limit, a
+   * circuit breaker).
+   */
+  loadScheduler?: LoadScheduler;
+  /**
+   * Max loads the DEFAULT scheduler runs at once (default 4) — the choke point
+   * that keeps a burst of standing subscriptions from stampeding the single
+   * upstream connection. Ignored when `loadScheduler` is supplied (a custom gate
+   * owns its own concurrency).
+   */
+  maxConcurrentLoads?: number;
   /** A write exhausted its retries and was dropped from the queue. */
   onWriteError?: (write: SyncWrite, error: unknown) => void;
-  /** A collection load failed (state → 'error'; the next demand re-triggers). */
+  /** A collection load failed (state → 'error'; a retry is scheduled if any remain). */
   onLoadError?: (collection: string, error: unknown) => void;
 };
 
@@ -118,8 +172,18 @@ export type SyncEngine = {
   collectionState: (name: string, scope?: QueryParams) => CollectionState | undefined;
   /** Are the collections these deps + params imply all complete? (`null` deps → yes.) */
   isComplete: (deps: readonly string[] | null, params?: QueryParams) => boolean;
-  /** Fire loaders for every intersecting, unloaded (collection, scope). */
-  ensure: (deps: readonly string[] | null, params?: QueryParams) => void;
+  /**
+   * Fire loaders for every intersecting, unloaded (collection, scope). An
+   * explicit demand: it supersedes any pending backoff with a fresh immediate
+   * attempt. `priority` (default 0, higher first) is passed to the scheduler.
+   */
+  ensure: (deps: readonly string[] | null, params?: QueryParams, priority?: number) => void;
+  /**
+   * Reset every errored collection to a fresh immediate load — for a reconnect
+   * handler that knows the backend just returned and shouldn't wait out each
+   * slice's backoff. A no-op for collections that aren't in `error`.
+   */
+  retryAll: () => void;
   /**
    * Apply a local write optimistically and queue it for upstream. GQL by default
    * (values ride `params`); pass `lang: 'gremlin'` to run `text` as a Gremlin
@@ -143,6 +207,78 @@ const sleep = (ms: number): Promise<void> =>
     setTimeout(resolve, ms);
   });
 
+/**
+ * The default demand-fill gate. Attempt-0 jobs (fresh demands) run as soon as a
+ * concurrency slot frees, highest `priority` first; retries first wait an
+ * exponential, capped, jittered backoff. A single in-flight cap across all
+ * collections is the choke point on the one upstream connection. The returned
+ * cancel fn drops a job whether it's still waiting on its backoff timer or
+ * already queued — so a superseding demand never leaves a ghost retry behind.
+ */
+const defaultScheduler = (cfg: {
+  baseMs: number;
+  maxMs: number;
+  maxConcurrent: number;
+}): LoadScheduler => {
+  let inFlight = 0;
+  const waiting: { job: LoadJob; live: boolean }[] = [];
+
+  const pump = (): void => {
+    // Highest priority first; the sort is stable so equal priorities keep
+    // arrival order (a fair-enough FIFO within a band).
+    waiting.sort((a, b) => b.job.priority - a.job.priority);
+
+    while (inFlight < cfg.maxConcurrent && waiting.length > 0) {
+      const slot = waiting.shift();
+
+      if (!slot || !slot.live) {
+        continue;
+      }
+
+      inFlight += 1;
+      void slot.job.run().finally(() => {
+        inFlight -= 1;
+        pump();
+      });
+    }
+  };
+
+  return (job) => {
+    const slot = { job, live: true };
+    const backoff =
+      job.attempt === 0 ? 0 : Math.min(cfg.maxMs, cfg.baseMs * 2 ** (job.attempt - 1));
+
+    // A fresh demand (no backoff) enqueues synchronously so `ensure` flips the
+    // slice to 'loading' on the spot (up to the concurrency cap) — no wasted
+    // tick, and the documented "immediately loading" contract holds.
+    if (backoff === 0) {
+      waiting.push(slot);
+      pump();
+
+      return () => {
+        slot.live = false;
+      };
+    }
+
+    // A retry waits full jitter over [backoff/2, backoff]: spreads a thundering
+    // herd of same-attempt retries without ever collapsing the delay to ~0.
+    const delay = backoff / 2 + Math.random() * (backoff / 2);
+    const timer = setTimeout(() => {
+      if (!slot.live) {
+        return;
+      }
+
+      waiting.push(slot);
+      pump();
+    }, delay);
+
+    return () => {
+      slot.live = false;
+      clearTimeout(timer);
+    };
+  };
+};
+
 /** The param name(s) that scope a collection — normalized from `key`. */
 const keyNamesOf = (def: CollectionDefinition): readonly string[] => {
   if (def.key === undefined) {
@@ -159,6 +295,17 @@ export const createSyncEngine = (options: SyncEngineOptions): SyncEngine => {
   const baseMs = options.retry?.baseMs ?? 250;
   const maxMs = options.retry?.maxMs ?? 30_000;
   const maxPending = options.maxPendingWrites ?? 1000;
+
+  const loadAttempts = options.loadRetry?.attempts ?? 5;
+  const loadBaseMs = options.loadRetry?.baseMs ?? 1_000;
+  const loadMaxMs = options.loadRetry?.maxMs ?? 30_000;
+  const scheduler: LoadScheduler =
+    options.loadScheduler ??
+    defaultScheduler({
+      baseMs: loadBaseMs,
+      maxMs: loadMaxMs,
+      maxConcurrent: options.maxConcurrentLoads ?? 4,
+    });
 
   // State is keyed per (collection, scope value): an unkeyed collection uses its
   // bare name; a keyed one appends its bound key values. Absent → 'empty', so
@@ -267,42 +414,98 @@ export const createSyncEngine = (options: SyncEngineOptions): SyncEngine => {
     return undefined;
   };
 
-  const load = async (match: Match): Promise<void> => {
+  // At most one pending-or-running job per (collection, scope). `attemptOf` is
+  // the failure count driving backoff; `cancelPending` supersedes a scheduled
+  // job when a fresh demand or `retryAll` arrives; `matchByKey`/`priorityOf`
+  // let the retry loop and `retryAll` re-address a slice by its state key alone.
+  const attemptOf = new Map<string, number>();
+  const cancelPending = new Map<string, () => void>();
+  const matchByKey = new Map<string, Match>();
+  const priorityOf = new Map<string, number>();
+
+  const runLoad = (match: Match): Promise<void> => {
+    cancelPending.delete(match.stateKey); // running now, no longer pending
     states.set(match.stateKey, 'loading');
     loadErrors.delete(match.stateKey); // a fresh attempt clears the stale error → UI shows loading
 
-    try {
-      const writes = await collections[match.name].load(match.scope);
+    return collections[match.name].load(match.scope).then(
+      (writes) => {
+        // One mutate for the whole scope: subscribers hear a single version
+        // bump, and epochs route it to exactly the affected live queries.
+        store.mutate((g) => {
+          for (const w of writes) {
+            runWrite(g, w);
+          }
+        });
+        states.set(match.stateKey, 'complete');
+        attemptOf.delete(match.stateKey);
+        // Even an empty load changes what `complete` means for standing
+        // queries — hosts must re-push. (A non-empty load also bumped the
+        // version, but the flip itself must be observable either way.)
+        notifyChange();
+      },
+      (e) => {
+        // The load failed. Report it, and — while attempts remain — hand the
+        // scheduler the NEXT attempt (timer-driven backoff). This scheduled job
+        // is the ONLY retry path: no refresh/push re-triggers a load, so a
+        // failure can never storm. Attempts run 0,1,…,loadAttempts-1.
+        states.set(match.stateKey, 'error');
+        options.onLoadError?.(match.name, e);
 
-      // One mutate for the whole scope: subscribers hear a single version
-      // bump, and epochs route it to exactly the affected live queries.
-      store.mutate((g) => {
-        for (const w of writes) {
-          runWrite(g, w);
+        loadErrors.set(match.stateKey, toWireError(e));
+
+        const next = (attemptOf.get(match.stateKey) ?? 0) + 1;
+
+        if (next < loadAttempts) {
+          schedule(match, next, priorityOf.get(match.stateKey) ?? 0);
+        } else {
+          attemptOf.delete(match.stateKey); // budget spent; next demand starts fresh
         }
-      });
-      states.set(match.stateKey, 'complete');
-    } catch (e) {
-      // The next demand re-triggers the load; completeness stays honest. The
-      // error is retained so standing queries over this scope can surface it
-      // (retryable) instead of spinning a forever-skeleton.
-      states.set(match.stateKey, 'error');
-      loadErrors.set(match.stateKey, toWireError(e));
-      options.onLoadError?.(match.name, e);
-    }
 
-    // Even an empty or failed load changes what `complete` means for standing
-    // queries — hosts must re-push. (A non-empty load also bumped the version,
-    // but the flip itself must be observable either way.)
-    notifyChange();
+        notifyChange();
+      },
+    );
   };
 
-  const ensure = (deps: readonly string[] | null, params?: QueryParams): void => {
+  const schedule = (match: Match, attempt: number, priority: number): void => {
+    attemptOf.set(match.stateKey, attempt);
+    priorityOf.set(match.stateKey, priority);
+    matchByKey.set(match.stateKey, match);
+    cancelPending.get(match.stateKey)?.(); // supersede any prior pending job
+
+    const job: LoadJob = {
+      collection: match.name,
+      scope: match.scope,
+      attempt,
+      priority,
+      run: () => runLoad(match),
+    };
+    cancelPending.set(match.stateKey, scheduler(job));
+  };
+
+  const ensure = (deps: readonly string[] | null, params?: QueryParams, priority = 0): void => {
     for (const match of matchesFor(deps, params)) {
       const state = stateOf(match.stateKey);
 
-      if (state === 'empty' || state === 'error') {
-        void load(match);
+      // 'loading' → a job is already running; 'complete' → nothing to do. Both
+      // 'empty' (never loaded) and 'error' (failed, maybe mid-backoff) fire a
+      // fresh attempt-0 job — an explicit demand supersedes any pending backoff
+      // so a user action isn't stuck behind a 30s timer.
+      if (state === 'loading' || state === 'complete') {
+        continue;
+      }
+
+      schedule(match, 0, priority);
+    }
+  };
+
+  const retryAll = (): void => {
+    // Reset every errored slice to a fresh attempt-0 job.
+    for (const [stateKey, state] of states) {
+      const match = state === 'error' ? matchByKey.get(stateKey) : undefined;
+
+      if (match) {
+        schedule(match, 0, priorityOf.get(stateKey) ?? 0);
       }
     }
   };
@@ -441,6 +644,7 @@ export const createSyncEngine = (options: SyncEngineOptions): SyncEngine => {
     },
     isComplete,
     ensure,
+    retryAll,
     mutate,
     ingest,
     pendingWrites: () => queue.length,

@@ -73,17 +73,17 @@ const connect = (opts: Omit<SyncEngineOptions, 'store'>, store: Store = newStore
 };
 
 // =====================================================================
-// Bug 1: demand-fill never retries after a loader failure — a standing
-// subscription driven ONLY by normal pushes/refreshes (never a manual
-// ensure) stays stuck incomplete forever once its first load fails.
+// Bug 1: demand-fill never retries after a loader failure. FIXED by the
+// demand-fill retry scheduler (engine.ts) — a failed load now schedules a
+// timer-driven backoff retry, so a standing subscription driven ONLY by
+// normal pushes/refreshes (never a manual ensure) self-heals once the backend
+// returns. The storm the old naive "re-ensure on every refresh" would have
+// caused is avoided: retries are scheduled, bounded by loadRetry.attempts, and
+// pushes/refreshes never re-trigger a load. See retry.test.ts for the full
+// storm-safety contract.
 // =====================================================================
-suite('reported-bug #1 · demand-fill never retries after a loader failure', () => {
-  // CONFIRMED, deferred: the fix is a retry-POLICY decision. Naively re-ensuring
-  // on every refresh conflicts with the intentional "stays incomplete, retries on
-  // the next explicit demand" engine test and risks a retry storm (a failed load
-  // → notifyChange → refresh → re-ensure → …). Needs a deliberate policy
-  // (backoff / trigger conditions). Kept as a skipped, documented reproduction.
-  test.skip('a failed load recovers under ordinary pushes/refreshes (no manual ensure)', async () => {
+suite('reported-bug #1 · demand-fill retries a failed load (self-heals)', () => {
+  test('a failed load recovers on a scheduled retry (no manual ensure)', async () => {
     let calls = 0;
     const { engine, host, client } = connect({
       collections: {
@@ -95,33 +95,35 @@ suite('reported-bug #1 · demand-fill never retries after a loader failure', () 
             // First load fails; every later load would succeed.
             return calls === 1
               ? Promise.reject(new Error('backend down'))
-              : Promise.resolve([{ gql: 'INSERT (:Person {name: $n})', params: { n: 'late' } }]);
+              : Promise.resolve([{ text: 'INSERT (:Person {name: $n})', params: { n: 'late' } }]);
           },
         },
       },
+      // Tiny backoff so the scheduled retry fires fast under test.
+      loadRetry: { attempts: 5, baseMs: 10, maxMs: 40 },
       onLoadError: () => {},
     });
 
     const live = client.liveQuery('MATCH (p:Person) RETURN p.name', { deps: ['Person', 'name'] });
     const stop = live.subscribe(() => {});
 
-    // The one-and-only ensure fired at subscribe; the load failed.
+    // The one-and-only ensure fired at subscribe; the first load failed.
     await until(() => engine.collectionState('people') === 'error');
     expect(live.getSnapshot().complete).toBe(false);
 
-    // Now drive the loop the way a live app would — WITHOUT calling ensure:
-    // ordinary local writes (each a real store notification + host refresh) and
-    // explicit host refreshes (what the engine does on every change).
-    for (let i = 0; i < 5; i += 1) {
+    // Drive the loop the way a live app would — WITHOUT calling ensure: ordinary
+    // local writes (real store notifications + host refreshes). These must NOT
+    // themselves re-trigger the load (that was the storm footgun)...
+    for (let i = 0; i < 3; i += 1) {
       engine.mutate('INSERT (:Other {tag: $t})', { t: i });
       host.refresh();
       await tick();
     }
 
-    // Correct behavior: a subsequent push/refresh should re-trigger the errored
-    // collection's load so the standing subscription recovers. It does not.
-    expect(calls).toBe(2); // FAILS if confirmed: the loader never re-runs (stays 1)
-    expect(live.getSnapshot().complete).toBe(true); // FAILS if confirmed: stuck incomplete
+    // ...yet the engine's own scheduled backoff retry heals the subscription.
+    await until(() => engine.collectionState('people') === 'complete');
+    expect(calls).toBe(2); // the loader re-ran exactly once, on the scheduled retry
+    expect(live.getSnapshot().complete).toBe(true);
     stop();
   });
 });
@@ -205,8 +207,10 @@ suite('reported-bug #3 · status-only change re-walks every subscription', () =>
       },
       mutate: base.mutate,
       liveGremlin: base.liveGremlin,
-      liveQuery: (text, o) => {
-        const live: LiveQuery<Row> = base.liveQuery(text, o);
+      // Generic in the row type, matching `Store.liveQuery` — a non-generic
+      // stub returning `Row[]` is not assignable to `LiveQuery<R>`.
+      liveQuery: <R extends Row = Row>(text: string, o: Parameters<Store['liveQuery']>[1]) => {
+        const live: LiveQuery<R> = base.liveQuery<R>(text, o);
 
         return {
           subscribe: live.subscribe,

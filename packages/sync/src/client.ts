@@ -127,6 +127,12 @@ export type SyncClient = {
        * `ORDER BY` so the page is stable.
        */
       window?: { offset: number; limit: number };
+      /**
+       * Demand-fill priority hint (default 0). Higher-priority subscriptions'
+       * loads run first when they contend for the engine's load concurrency —
+       * a user-facing query can jump ahead of background prefetches.
+       */
+      priority?: number;
     },
   ) => ClientLiveQuery;
   /**
@@ -421,6 +427,8 @@ type Entry = {
   lang?: 'gql' | 'gremlin';
   /** Windowed read (keyless GQL only), retained for replay. */
   window?: { offset: number; limit: number };
+  /** Demand-fill priority hint, retained so {@link SyncClient.replay} re-emits it. */
+  priority?: number;
   /** Current rows by canonical key — the base each keyed diff is applied onto. */
   rowsByKey?: Map<string, Row>;
   snapshot: ClientSnapshot;
@@ -512,6 +520,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
       lang?: 'gql' | 'gremlin';
       /** Keyless GQL only: fetch a `slice(offset, offset+limit)` page; scroll by re-subscribing with a new window. */
       window?: { offset: number; limit: number };
+      priority?: number;
     },
   ): ClientLiveQuery => {
     // Deps are semantically a SET (epoch gating sums them; collection matching
@@ -551,6 +560,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
       key: opts.key,
       lang: opts.lang,
       window: opts.window,
+      priority: opts.priority,
       snapshot: INITIAL,
       listeners: new Set(),
       handle: {
@@ -608,6 +618,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
         key: opts.key,
         lang: opts.lang,
         window: opts.window,
+        priority: opts.priority,
       });
     };
 
@@ -981,6 +992,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
           key: entry.key,
           lang: entry.lang,
           window: entry.window,
+          priority: entry.priority,
         });
       }
 
