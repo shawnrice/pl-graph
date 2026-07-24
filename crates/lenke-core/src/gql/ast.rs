@@ -406,6 +406,13 @@ pub enum Expr {
         base: Box<Self>,
         index: Box<Self>,
     },
+    /// Property access on an arbitrary expression — `relationships(p)[0].amount`,
+    /// `head(rels).x`. The bare `variable.key` form stays `Prop` (the hot path);
+    /// this is the postfix `.key` that chains off a subscript/function result.
+    Field {
+        base: Box<Self>,
+        key: String,
+    },
     Compare {
         op: CompareOp,
         left: Box<Self>,

@@ -1082,18 +1082,31 @@ impl Parser {
                 p.advance();
                 return p.parse_unary();
             }
-            // Postfix list subscript `base[index]` (0-based, ISO GQL); chains left
-            // to right (`a[0][1]`). A leading `[` is still a list literal (handled
-            // in `parse_primary`); this only fires *after* a primary.
+            // Postfix subscript `base[index]` and property access `base.key`,
+            // chained left to right (`a[0].amount`, `head(rels).x`, `a.b[0].c`). A
+            // leading `[` is still a list literal, and a bare `variable.key` is
+            // parsed as `Prop` in `parse_primary`; this loop only fires *after* a
+            // primary, extending it with further `[…]`/`.key` steps.
             let mut e = p.parse_primary()?;
-            while p.check(Tt::LBracket) {
-                p.advance();
-                let index = p.parse_expr()?;
-                p.expect(Tt::RBracket, "']' to close a list subscript")?;
-                e = Expr::Index {
-                    base: Box::new(e),
-                    index: Box::new(index),
-                };
+            loop {
+                if p.check(Tt::LBracket) {
+                    p.advance();
+                    let index = p.parse_expr()?;
+                    p.expect(Tt::RBracket, "']' to close a list subscript")?;
+                    e = Expr::Index {
+                        base: Box::new(e),
+                        index: Box::new(index),
+                    };
+                } else if p.check(Tt::Dot) {
+                    p.advance();
+                    let key = p.bind_name("a property name")?;
+                    e = Expr::Field {
+                        base: Box::new(e),
+                        key,
+                    };
+                } else {
+                    break;
+                }
             }
             Ok(e)
         })

@@ -355,6 +355,9 @@ export type Expr =
   | { kind: 'list'; items: readonly Expr[] }
   // ISO GQL list element access `base[index]` — 0-based; out of range → null.
   | { kind: 'index'; base: Expr; index: Expr }
+  // Property access chained off any expression (`relationships(p)[0].amount`).
+  // A bare `variable.key` stays `prop` (the hot path); this is the postfix `.key`.
+  | { kind: 'field'; base: Expr; key: string }
   | { kind: 'compare'; op: CompareOp; left: Expr; right: Expr }
   // n-ary left-associative operator runs: a long chain is a flat array, not a
   // chain-deep binary tree that would overflow the stack when walked (C1).

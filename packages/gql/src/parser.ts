@@ -1056,18 +1056,26 @@ export const parse = (
         return parseUnary();
       }
 
-      // Postfix list subscript `base[index]` (0-based, ISO GQL); chains left to
-      // right. A leading `[` is still a list literal (parsePrimary); this only
-      // fires after a primary.
+      // Postfix subscript `base[index]` and property access `base.key`, chained
+      // left to right (`a[0].amount`, `head(rels).x`). A leading `[` is still a
+      // list literal, and a bare `variable.key` is `prop` (parsePrimary); this
+      // loop extends a primary with further `[…]`/`.key` steps.
       let e = parsePrimary();
 
-      while (check('lbracket')) {
-        advance();
+      for (;;) {
+        if (check('lbracket')) {
+          advance();
 
-        const idx = parseExpr();
+          const idx = parseExpr();
 
-        expect('rbracket', "']' to close a list subscript");
-        e = { kind: 'index', base: e, index: idx };
+          expect('rbracket', "']' to close a list subscript");
+          e = { kind: 'index', base: e, index: idx };
+        } else if (check('dot')) {
+          advance();
+          e = { kind: 'field', base: e, key: bindName('a property name') };
+        } else {
+          break;
+        }
       }
 
       return e;

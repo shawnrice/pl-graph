@@ -266,6 +266,12 @@ pub enum CExpr {
         base: Box<Self>,
         index: Box<Self>,
     },
+    /// Property access on an arbitrary expression (`base.key`) — the postfix
+    /// chain form (`relationships(p)[0].amount`). `key_ref` resolves like `Prop`.
+    Field {
+        base: Box<Self>,
+        key_ref: usize,
+    },
     Compare {
         op: CompareOp,
         left: Box<Self>,
@@ -483,6 +489,7 @@ fn emit(e: &CExpr, out: &mut Vec<Op>) {
         | CExpr::Exists { .. }
         | CExpr::CountSubquery { .. }
         | CExpr::Index { .. }
+        | CExpr::Field { .. }
         | CExpr::Aggregate { .. } => out.push(Op::Tree(e.clone())),
     }
 }
@@ -814,6 +821,7 @@ fn has_aggregate(expr: &CExpr) -> bool {
         CExpr::In { expr, list, .. } => has_aggregate(expr) || has_aggregate(list),
         CExpr::List(items) => items.iter().any(has_aggregate),
         CExpr::Index { base, index } => has_aggregate(base) || has_aggregate(index),
+        CExpr::Field { base, .. } => has_aggregate(base),
         CExpr::Case {
             subject,
             whens,
@@ -891,6 +899,10 @@ fn extract_aggs(expr: CExpr, aggs: &mut Vec<CAgg>) -> CExpr {
         CExpr::Index { base, index } => CExpr::Index {
             base: b(base, aggs),
             index: b(index, aggs),
+        },
+        CExpr::Field { base, key_ref } => CExpr::Field {
+            base: b(base, aggs),
+            key_ref,
         },
         CExpr::Compare { op, left, right } => CExpr::Compare {
             op,
@@ -972,6 +984,7 @@ fn refs_slot_below(expr: &CExpr, n: usize) -> bool {
         CExpr::Prop { var_slot, .. } => *var_slot < n,
         CExpr::List(items) => items.iter().any(|e| refs_slot_below(e, n)),
         CExpr::Index { base, index } => refs_slot_below(base, n) || refs_slot_below(index, n),
+        CExpr::Field { base, .. } => refs_slot_below(base, n),
         CExpr::Neg(e) | CExpr::Not(e) => refs_slot_below(e, n),
         CExpr::IsNull { expr, .. }
         | CExpr::IsTruth { expr, .. }
@@ -1111,6 +1124,10 @@ impl Lowerer {
             Expr::Index { base, index } => CExpr::Index {
                 base: self.boxed(base),
                 index: self.boxed(index),
+            },
+            Expr::Field { base, key } => CExpr::Field {
+                base: self.boxed(base),
+                key_ref: intern_ref(&mut self.keys, key),
             },
             Expr::Compare { op, left, right } => CExpr::Compare {
                 op: *op,
@@ -1730,6 +1747,7 @@ fn collect_free_vars(e: &Expr, bound: &[String], free: &mut Vec<String>) {
             collect_free_vars(base, bound, free);
             collect_free_vars(index, bound, free);
         }
+        Expr::Field { base, .. } => collect_free_vars(base, bound, free),
         Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::IsLabeled { expr, .. } => {
             collect_free_vars(expr, bound, free)
         }

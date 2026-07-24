@@ -230,6 +230,26 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(tsR).toBe(tsR2);
   });
 
+  test('list[i].prop — property access chains off a subscript, byte-identical', () => {
+    const base = `MATCH p = ANY SHORTEST (a)-[]->*(b) WHERE a.name = 'marko' AND b.name = 'lop'`;
+    // relationships(p)[0].weight, nodes(p)[i].name, and out-of-range → null all
+    // agree across engines.
+    const [ts, native] = both(
+      `${base} RETURN relationships(p)[0].weight AS w, nodes(p)[0].name AS a, nodes(p)[1].name AS b, relationships(p)[9].weight AS oob`,
+    );
+    expect(ts).toBe(native);
+
+    // Value check on a single column (robust to object key ordering).
+    const [tsW] = both(`${base} RETURN relationships(p)[0].weight AS w`);
+    expect(tsW).toBe(`[{"w":0.4}]`);
+
+    // Consecutive-index comparison — the per-hop path-predicate motif — agrees.
+    const [tsC, natC] = both(
+      `${base} RETURN (relationships(p)[0].weight < relationships(p)[0].weight) AS lt`,
+    );
+    expect(tsC).toBe(natC);
+  });
+
   test('named procedure CALL (algorithms) is byte-identical across engines', () => {
     // `node` is a live vertex handle; `node.name` reads its property.
     const [tsD, natD] = both(

@@ -387,6 +387,8 @@ const hasAggregate = (expr: Expr): boolean => {
       return hasAggregate(expr.expr) || hasAggregate(expr.list);
     case 'index':
       return hasAggregate(expr.base) || hasAggregate(expr.index);
+    case 'field':
+      return hasAggregate(expr.base);
     case 'list':
       return expr.items.some(hasAggregate);
     case 'case':
@@ -1255,6 +1257,15 @@ const compileExpr = (expr: Expr): CompiledExpr => {
         return base[i] ?? null;
       };
     }
+    case 'field': {
+      // Property access chained off any expression (`relationships(p)[0].amount`).
+      // `propOf` reads a node/edge's stored property; anything else → null, exactly
+      // like the bare `prop` path.
+      const baseF = compileExpr(expr.base);
+      const { key } = expr;
+
+      return (env) => propOf(baseF(env), key);
+    }
     case 'func':
       return compileFunc(expr);
     case 'neg': {
@@ -1894,15 +1905,13 @@ export const freePredicateVars = (expr: Expr): Set<string> => {
       case 'lit':
       case 'param':
         return;
-      case 'list':
-        for (const it of e.items) {
-          walk(it, bound);
-        }
-
-        return;
       case 'index':
         walk(e.base, bound);
         walk(e.index, bound);
+
+        return;
+      case 'field':
+        walk(e.base, bound);
 
         return;
       case 'neg':
@@ -1926,6 +1935,7 @@ export const freePredicateVars = (expr: Expr): Set<string> => {
         }
 
         return;
+      case 'list':
       case 'concat':
       case 'and':
       case 'or':

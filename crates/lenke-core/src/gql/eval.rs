@@ -1388,6 +1388,13 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
                 _ => Val::Null,
             }
         }
+        CExpr::Field { base, key_ref } => {
+            // Property access chained off any expression (`relationships(p)[0].amount`).
+            // Reuses `prop_of`: a Node/Edge base reads the stored property; anything
+            // else (null / list / scalar) → null, matching the bare `Prop` path.
+            let base_v = eval(env, base);
+            prop_of(env.graph, env.ctx, &base_v, *key_ref)
+        }
         CExpr::Neg(e) => match arith_num(&eval(env, e), env.ctx) {
             Some(n) => Val::Num(-n),
             None => Val::Null,

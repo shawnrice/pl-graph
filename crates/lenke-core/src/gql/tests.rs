@@ -4902,6 +4902,47 @@ fn any_shortest_closes_on_the_seed_cycle() {
     assert_eq!(star, vec![vec![Value::Num(0.0)]]);
 }
 
+#[test]
+fn postfix_property_chains_off_a_subscript() {
+    // `list[i].prop` — property access chained off a subscript (the per-hop path
+    // accessor), incl. `list[i].prop <op> list[j].prop` (consecutive-hop
+    // comparison, the LaunderHunt motif) and out-of-range → null.
+    let mut g = ndjson::decode(
+        &[
+            r#"{"type":"node","id":"n0","labels":["N"],"properties":{"id":"n0"}}"#,
+            r#"{"type":"node","id":"n1","labels":["N"],"properties":{"id":"n1"}}"#,
+            r#"{"type":"node","id":"n2","labels":["N"],"properties":{"id":"n2"}}"#,
+            r#"{"type":"edge","id":"e1","from":"n0","to":"n1","labels":["R"],"properties":{"w":5.0}}"#,
+            r#"{"type":"edge","id":"e2","from":"n1","to":"n2","labels":["R"],"properties":{"w":9.0}}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let path = "MATCH p = ANY SHORTEST (a:N {id:'n0'})-[:R]->*(b:N {id:'n2'})";
+
+    assert_eq!(
+        rows(&mut g, &format!("{path} RETURN relationships(p)[0].w AS w")),
+        vec![vec![n(5.0)]]
+    );
+    assert_eq!(
+        rows(&mut g, &format!("{path} RETURN nodes(p)[2].id AS id")),
+        vec![vec![s("n2")]]
+    );
+    // out-of-range subscript → null, and `.prop` on that null stays null.
+    assert_eq!(
+        rows(&mut g, &format!("{path} RETURN relationships(p)[9].w AS w")),
+        vec![vec![Value::Null]]
+    );
+    // consecutive-hop comparison: hop 1's weight (9) > hop 0's (5).
+    assert_eq!(
+        rows(
+            &mut g,
+            &format!("{path} RETURN relationships(p)[1].w > relationships(p)[0].w AS inc")
+        ),
+        vec![vec![b(true)]]
+    );
+}
+
 /// The unsupported selector shapes fail to parse with a pointed message.
 #[test]
 fn shortest_unsupported_shapes_rejected() {
