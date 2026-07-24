@@ -235,6 +235,8 @@ export type PathPattern = {
   pathVar?: string;
   /** Which matching paths to keep; defaults to `walk` (every match). */
   selector?: PathSelector;
+  /** The repeated-element restrictor on a var-length walk; defaults to `trail`. */
+  mode?: PathMode;
 };
 
 /**
@@ -243,6 +245,15 @@ export type PathPattern = {
  * fewest-hop path per endpoint pair.
  */
 export type PathSelector = 'walk' | 'anyShortest' | 'allShortest';
+
+/**
+ * A path mode (restrictor): which element repeats a matched path may contain.
+ * `trail` (no repeated EDGES) is lenke's default — the spec's nominal `walk`
+ * default is unusable unbounded, so, like Neo4j/Fabric, we default to `trail`.
+ * `walk` allows repeats (bounded only by the quantifier); `acyclic` forbids any
+ * repeated NODE; `simple` forbids repeated nodes except a closing `start == end`.
+ */
+export type PathMode = 'walk' | 'trail' | 'simple' | 'acyclic';
 
 /** One hop: traverse `rel`, land on `node`. */
 export type Segment = {

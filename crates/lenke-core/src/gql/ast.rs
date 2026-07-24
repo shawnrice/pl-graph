@@ -255,15 +255,31 @@ pub enum PathSelector {
     AllShortest,
 }
 
+/// A path **mode** (restrictor): which element repeats a matched path may
+/// contain. `Trail` (no repeated EDGES) is lenke's default — the spec's nominal
+/// `Walk` default is unusable unbounded, so, like Neo4j and Microsoft Fabric, we
+/// default to `Trail`. `Walk` allows repeats (bounded only by the quantifier);
+/// `Acyclic` forbids any repeated NODE; `Simple` forbids repeated nodes except a
+/// closing `start == end` (a cycle back to the seed).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum PathMode {
+    Walk,
+    #[default]
+    Trail,
+    Simple,
+    Acyclic,
+}
+
 /// A linear path pattern: a start node followed by `(rel)(node)` segments,
 /// optionally bound to a `path_var` (`p = …`) and prefixed by a `selector`
-/// (`ANY SHORTEST …`).
+/// (`ANY SHORTEST …`) and/or a `mode` (`TRAIL …`).
 #[derive(Debug, Clone)]
 pub struct PathPattern {
     pub start: NodePattern,
     pub segments: Vec<Segment>,
     pub path_var: Option<String>,
     pub selector: PathSelector,
+    pub mode: PathMode,
 }
 
 /// One hop: traverse `rel`, land on `node`.

@@ -70,8 +70,8 @@ type FxHashSet<K> = HashSet<K, FxBuild>;
 use rayon::prelude::*;
 
 use super::ast::{
-    AccessMode, ArithOp, Clause, CompareOp, Direction, Lit, PathSelector, Quantifier, Query, SetOp,
-    SetOpKind, Statement, TxControl, TxKind,
+    AccessMode, ArithOp, Clause, CompareOp, Direction, Lit, PathMode, PathSelector, Quantifier,
+    Query, SetOp, SetOpKind, Statement, TxControl, TxKind,
 };
 use super::lexer::SyntaxError;
 use super::plan::{
@@ -2639,6 +2639,7 @@ fn reachable_each(
     from: u32,
     rel: &CRel,
     q: Quantifier,
+    mode: PathMode,
     on_end: &mut dyn FnMut(u32) -> bool,
 ) -> bool {
     let collect = |v: u32| -> Vec<(u32, u32)> {
@@ -2656,21 +2657,33 @@ fn reachable_each(
         return false;
     }
 
-    // Edges on the *current* trail: `used[eidx]` == on-trail. A pooled buffer (see
-    // `Ctx::edge_marks_pool`) gives O(1) index ops without a per-call allocation; a
-    // pool rather than one shared buffer because `on_end` may re-enter this function
-    // (a nested quantified segment) while these marks are live.
-    let mut used = ctx.take_marks(graph.edge_slots());
+    // The repeated-element marks on the CURRENT path. TRAIL (default) marks EDGES
+    // from a pooled buffer (hot, allocation-free); SIMPLE/ACYCLIC mark NODES in a
+    // local buffer with the seed pre-marked; WALK marks nothing (bounded only by
+    // the quantifier / trail budget). `Frame::entry` is the mark index to clear on
+    // backtrack. A pool (not one shared buffer) because `on_end` may re-enter this
+    // for a nested quantified segment while these marks are live.
+    let trail = matches!(mode, PathMode::Trail);
+    let vertex_mode = matches!(mode, PathMode::Simple | PathMode::Acyclic);
+    let mut marks = if trail {
+        ctx.take_marks(graph.edge_slots())
+    } else if vertex_mode {
+        vec![false; graph.vertex_count()]
+    } else {
+        Vec::new()
+    };
+    if vertex_mode {
+        marks[from as usize] = true;
+    }
+
     let mut steps: u64 = 0;
     let mut cont = true;
 
-    // Each frame walks one vertex's outgoing steps; `entry` is the edge taken to
-    // reach it, unmarked when the frame pops (backtrack).
     struct Frame {
         edges: Vec<(u32, u32)>,
         idx: usize,
         depth: u32,
-        entry: Option<u32>,
+        entry: Option<usize>,
     }
     let mut stack: Vec<Frame> = vec![Frame {
         edges: collect(from),
@@ -2681,8 +2694,8 @@ fn reachable_each(
 
     while let Some(top) = stack.last_mut() {
         if q.max.is_some_and(|m| top.depth >= m) || top.idx >= top.edges.len() {
-            if let Some(e) = top.entry {
-                used[e as usize] = false;
+            if let Some(i) = top.entry {
+                marks[i] = false;
             }
             stack.pop();
             continue;
@@ -2692,56 +2705,92 @@ fn reachable_each(
         let depth = top.depth;
         top.idx += 1; // borrow of `stack` ends here (NLL)
 
-        if used[eidx as usize] {
-            continue; // trail: each relationship traversed at most once
-        }
+        // Whether this step is allowed, its mark index (None = nothing to mark),
+        // and whether it's a non-extending SIMPLE close back on the seed.
+        let (mark_idx, is_close): (Option<usize>, bool) = match mode {
+            PathMode::Walk => (None, false),
+            PathMode::Trail => {
+                if marks[eidx as usize] {
+                    continue; // each relationship at most once
+                }
+                (Some(eidx as usize), false)
+            }
+            PathMode::Acyclic => {
+                if marks[nbr as usize] {
+                    continue; // no repeated node (not even the seed)
+                }
+                (Some(nbr as usize), false)
+            }
+            PathMode::Simple => {
+                if nbr == from {
+                    (None, true) // close the cycle on the seed: emit, don't extend
+                } else if marks[nbr as usize] {
+                    continue; // no repeated node except that close
+                } else {
+                    (Some(nbr as usize), false)
+                }
+            }
+        };
 
         steps += 1;
         if steps > TRAIL_BUDGET {
             ctx.set_fault(FAULT_BUDGET);
-            // Fault exit leaves the live stack's edges marked; clear them so the
-            // pooled buffer is all-`false` when returned.
             for f in &stack {
-                if let Some(e) = f.entry {
-                    used[e as usize] = false;
+                if let Some(i) = f.entry {
+                    marks[i] = false;
                 }
             }
             break;
         }
 
-        used[eidx as usize] = true;
+        if let Some(i) = mark_idx {
+            marks[i] = true;
+        }
         let d = depth + 1;
         if d >= q.min && !on_end(nbr) {
-            // Consumer asked to stop: clear the just-marked edge + the live stack's
-            // marks so the pooled buffer is returned all-`false`, then bail.
+            // Consumer stop: clear this mark + the live stack's marks so a pooled
+            // buffer is returned all-`false`, then bail.
             cont = false;
-            used[eidx as usize] = false;
+            if let Some(i) = mark_idx {
+                marks[i] = false;
+            }
             for f in &stack {
-                if let Some(e) = f.entry {
-                    used[e as usize] = false;
+                if let Some(i) = f.entry {
+                    marks[i] = false;
                 }
             }
             break;
         }
 
-        stack.push(Frame {
-            edges: collect(nbr),
-            idx: 0,
-            depth: d,
-            entry: Some(eidx),
-        });
+        if !is_close {
+            stack.push(Frame {
+                edges: collect(nbr),
+                idx: 0,
+                depth: d,
+                entry: mark_idx,
+            });
+        }
     }
 
-    ctx.return_marks(used);
+    if trail {
+        ctx.return_marks(marks);
+    }
     cont
 }
 
 /// Collect every trail endpoint into a `Vec` (eager). For callers that genuinely
 /// consume the whole set (e.g. grouped-count replay); short-circuiting consumers
 /// (`EXISTS`/`LIMIT`) use `reachable_each` directly so they can stop early.
-fn reachable(graph: &Graph, ctx: &Ctx, from: u32, rel: &CRel, q: Quantifier) -> Vec<u32> {
+fn reachable(
+    graph: &Graph,
+    ctx: &Ctx,
+    from: u32,
+    rel: &CRel,
+    q: Quantifier,
+    mode: PathMode,
+) -> Vec<u32> {
     let mut ends: Vec<u32> = Vec::new();
-    reachable_each(graph, ctx, from, rel, q, &mut |e| {
+    reachable_each(graph, ctx, from, rel, q, mode, &mut |e| {
         ends.push(e);
         true
     });
@@ -2768,7 +2817,7 @@ fn walk_segments(
         // Stream endpoints and stop the moment a consumer (EXISTS / LIMIT) is satisfied
         // — `match_node_then` returns false to propagate the stop, which `reachable_each`
         // returns, avoiding an exponential trail enumeration on a dense graph.
-        return reachable_each(graph, ctx, from, rel, q, &mut |end| {
+        return reachable_each(graph, ctx, from, rel, q, pattern.mode, &mut |end| {
             match_node_then(graph, ctx, binding, node, end, &mut |b| {
                 walk_segments(graph, ctx, pattern, index + 1, end, b, emit)
             })
@@ -3528,7 +3577,7 @@ fn match_path<F: FnMut(&mut Binding) -> bool>(
     if let Some(q) = rel.quantifier {
         // Stream endpoints, stopping as soon as a consumer is satisfied (see the twin
         // in `walk_segments`) — `match_node_continue` returns false to propagate.
-        return reachable_each(graph, ctx, from, rel, q, &mut |end| {
+        return reachable_each(graph, ctx, from, rel, q, path.mode, &mut |end| {
             match_node_continue(graph, ctx, binding, node, end, path, idx + 1, emit)
         });
     }
@@ -5404,6 +5453,7 @@ fn reverse_path(path: &CPath) -> CPath {
         // Reversing swaps the endpoints but not what the path binds to.
         path_var_slot: path.path_var_slot,
         selector: path.selector,
+        mode: path.mode,
     }
 }
 
@@ -8339,7 +8389,7 @@ fn try_grouped_varlen_1_2(
     let mut order: Vec<String> = Vec::with_capacity(target);
     let mut faulted = false;
     for_each_seed(graph, &ctx, la, &mut |a| {
-        for end in reachable(graph, &ctx, a, rel, q) {
+        for end in reachable(graph, &ctx, a, rel, q, path.mode) {
             if !matches_label(graph, &ctx, end, lb) {
                 continue;
             }
@@ -11042,10 +11092,15 @@ fn run_cquery_body(plan: &CQuery, graph: &mut Graph, params: &[Val]) -> CodeResu
 
 /// Does any MATCH in this part carry a path selector (`ANY SHORTEST`)? Such a
 /// part must take the general scalar driver, which is the only one that honors it.
-fn linear_has_selector(linear: &CLinear) -> bool {
+/// True if any MATCH carries a path selector (`ANY`/`ALL SHORTEST`) or a
+/// non-default path mode (`SIMPLE`/`ACYCLIC`/`WALK`). Both are implemented only in
+/// the general scalar driver; the count / vectorized / parallel fast paths below
+/// enumerate trails (edge-uniqueness), which is wrong for either.
+fn linear_needs_general_matcher(linear: &CLinear) -> bool {
     linear.clauses.iter().any(|c| {
         matches!(c, CClause::Match { patterns, .. }
-            if patterns.iter().any(|p| p.selector != PathSelector::Walk))
+            if patterns.iter().any(|p| p.selector != PathSelector::Walk
+                || p.mode != PathMode::Trail))
     })
 }
 
@@ -11058,11 +11113,11 @@ fn run_part(
     plan: &CQuery,
     params: &[Val],
 ) -> CodeResult<RowSet> {
-    // A path selector (`ANY SHORTEST`) is only implemented in the general scalar
-    // driver (`visit_pattern`'s `shortest_walk`). Skip every count / vectorized /
-    // parallel fast path below — they enumerate trails or ignore the selector,
-    // both of which would be wrong for a shortest match.
-    if linear_has_selector(linear) {
+    // A path selector (`ANY`/`ALL SHORTEST`) or a non-default mode
+    // (`SIMPLE`/`ACYCLIC`/`WALK`) is only implemented in the general scalar driver.
+    // Skip every count / vectorized / parallel fast path below — they enumerate
+    // trails (edge-uniqueness) or ignore the selector, wrong for either.
+    if linear_needs_general_matcher(linear) {
         return run_linear(linear, graph, plan, params);
     }
     // Cheapest first: the O(1) / edge-scan `count(*)` shortcuts — a bare-node

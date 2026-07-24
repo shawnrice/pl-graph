@@ -29,6 +29,7 @@ import type {
   LinearQuery,
   NodePattern,
   PathPattern,
+  PathMode,
   PathSelector,
   Projection,
   PropertyConstraint,
@@ -2468,6 +2469,8 @@ type CPath = {
   pathVar?: string;
   /** Which matching paths to keep; defaults to `walk`. */
   selector: PathSelector;
+  /** The repeated-element restrictor on a var-length walk; defaults to `trail`. */
+  mode: PathMode;
 };
 
 const compileProps = (props: readonly PropertyConstraint[] | undefined): CProp[] =>
@@ -2685,6 +2688,7 @@ const compilePath = (pattern: PathPattern): CPath => ({
   })),
   ...(pattern.pathVar !== undefined ? { pathVar: pattern.pathVar } : {}),
   selector: pattern.selector ?? 'walk',
+  mode: pattern.mode ?? 'trail',
 });
 
 /**
@@ -2929,6 +2933,7 @@ const reversePath = (path: CPath): CPath => {
     segments,
     ...(path.pathVar !== undefined ? { pathVar: path.pathVar } : {}),
     selector: path.selector,
+    mode: path.mode,
   };
 };
 
@@ -3229,7 +3234,7 @@ const walkSegments = function* (
   // (The edge variable and per-edge predicate aren't bound for var-length
   // segments — rejected at compile time.)
   if (rel.quantifier) {
-    for (const end of trailEnds(graph, from, rel, rel.quantifier)) {
+    for (const end of trailEnds(graph, from, rel, rel.quantifier, pattern.mode ?? 'trail')) {
       const matched = matchNode(binding, node, end, params, graph);
 
       if (matched) {
@@ -3279,20 +3284,31 @@ const trailEnds = function* (
   from: Vertex,
   rel: CRel,
   q: NonNullable<CRel['quantifier']>,
+  mode: PathMode,
 ): Iterable<Vertex> {
   if (q.min === 0) {
     yield from;
   }
 
-  const used = new Set<Edge>();
+  // The repeated-element marks on the CURRENT path. TRAIL (default) marks EDGES;
+  // SIMPLE/ACYCLIC mark NODES (seed pre-marked); WALK marks nothing (bounded only
+  // by the quantifier / trail budget). Mirrors native `reachable_each`.
+  const vertexMode = mode === 'simple' || mode === 'acyclic';
+  const marks = new Set<Edge | Vertex>();
+
+  if (vertexMode) {
+    marks.add(from);
+  }
+
   let steps = 0;
 
   // Explicit DFS stack — a trail can be as long as the edge count, so recursion
   // would overflow on a long chain. Each frame walks one vertex's outgoing
-  // steps; `entry` is the edge taken to reach it, unmarked when the frame pops.
+  // steps; `entry` is the mark taken to reach it, unmarked when the frame pops.
+  // A generator suspends on consumer-stop, so no explicit stop cleanup is needed.
   const stack: {
     iter: Iterator<{ edge: Edge; node: Vertex }>;
-    entry: Edge | null;
+    entry: Edge | Vertex | null;
     depth: number;
   }[] = [{ iter: expand(graph, from, rel)[Symbol.iterator](), entry: null, depth: 0 }];
 
@@ -3302,7 +3318,7 @@ const trailEnds = function* (
     // Past the max hop → this trail can't extend; backtrack.
     if (q.max !== null && top.depth >= q.max) {
       if (top.entry) {
-        used.delete(top.entry);
+        marks.delete(top.entry);
       }
 
       stack.pop();
@@ -3315,7 +3331,7 @@ const trailEnds = function* (
 
     if (res.done) {
       if (top.entry) {
-        used.delete(top.entry);
+        marks.delete(top.entry);
       }
 
       stack.pop();
@@ -3324,9 +3340,33 @@ const trailEnds = function* (
 
     const { edge, node } = res.value;
 
-    if (used.has(edge)) {
-      continue; // trail: each relationship traversed at most once
+    // Whether this step is allowed, what it marks, and whether it's a
+    // non-extending SIMPLE close back on the seed.
+    let markTarget: Edge | Vertex | null = null;
+    let isClose = false;
+
+    if (mode === 'trail') {
+      if (marks.has(edge)) {
+        continue; // each relationship at most once
+      }
+
+      markTarget = edge;
+    } else if (mode === 'acyclic') {
+      if (marks.has(node)) {
+        continue; // no repeated node (not even the seed)
+      }
+
+      markTarget = node;
+    } else if (mode === 'simple') {
+      if (node === from) {
+        isClose = true; // close the cycle on the seed: emit, don't extend
+      } else if (marks.has(node)) {
+        continue; // no repeated node except that close
+      } else {
+        markTarget = node;
+      }
     }
+    // mode === 'walk': no marks, always allowed.
 
     steps += 1;
 
@@ -3337,14 +3377,23 @@ const trailEnds = function* (
       );
     }
 
-    used.add(edge);
+    if (markTarget !== null) {
+      marks.add(markTarget);
+    }
+
     const d = top.depth + 1;
 
     if (d >= q.min) {
       yield node;
     }
 
-    stack.push({ iter: expand(graph, node, rel)[Symbol.iterator](), entry: edge, depth: d });
+    if (!isClose) {
+      stack.push({
+        iter: expand(graph, node, rel)[Symbol.iterator](),
+        entry: markTarget,
+        depth: d,
+      });
+    }
   }
 };
 
@@ -4088,6 +4137,12 @@ const reachCount = (proj: Projection, bVar: string): { countArg?: CompiledExpr }
   return arg.kind === 'var' && arg.name === bVar ? {} : { countArg: compileExpr(arg) };
 };
 
+/** A pattern that only the general scalar matcher handles — a path selector
+ * (`ANY`/`ALL SHORTEST`) or a non-default mode (`SIMPLE`/`ACYCLIC`/`WALK`). The
+ * count/vectorized shortcuts enumerate trails, which is wrong for either. */
+const needsGeneralMatcher = (p: PathPattern): boolean =>
+  (p.selector ?? 'walk') !== 'walk' || (p.mode ?? 'trail') !== 'trail';
+
 const detectReachableShortcut = (
   clauses: readonly Clause[],
   compiled: readonly CClause[],
@@ -4115,8 +4170,10 @@ const detectReachableShortcut = (
     return null;
   }
 
-  // A path selector (`ANY SHORTEST`) is handled only by the general matcher.
-  if ((m.patterns[0].selector ?? 'walk') !== 'walk') {
+  // A path selector (`ANY`/`ALL SHORTEST`) or non-default mode (`SIMPLE`/
+  // `ACYCLIC`/`WALK`) is handled only by the general matcher — this shortcut
+  // counts trails (edge-uniqueness), wrong for either.
+  if (needsGeneralMatcher(m.patterns[0])) {
     return null;
   }
 

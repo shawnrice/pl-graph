@@ -590,8 +590,9 @@ impl Parser {
                 None
             };
 
-            // Optional path selector (`ANY SHORTEST`).
+            // Optional path selector (`ANY SHORTEST`) then optional mode (`TRAIL`).
             let selector = p.parse_path_selector()?;
+            let mode = p.parse_path_mode();
             if path_var.is_some() && selector == PathSelector::Walk {
                 return err(
                     "a named path variable currently requires a path selector (e.g. `p = ANY SHORTEST …`)",
@@ -640,8 +641,30 @@ impl Parser {
                 segments,
                 path_var,
                 selector,
+                mode,
             })
         })
+    }
+
+    /// Parse an optional ISO path mode after the selector, before the pattern
+    /// (`WALK`/`TRAIL`/`SIMPLE`/`ACYCLIC`). Contextual (non-reserved) — recognized
+    /// only here, so `walk`/`simple`/… stay usable as ordinary identifiers. The
+    /// default is `TRAIL` (matching Neo4j/Fabric; bare `WALK` is unusable
+    /// unbounded), which is also the engine's existing var-length behaviour.
+    fn parse_path_mode(&mut self) -> PathMode {
+        let mode = if self.check_soft("walk") {
+            PathMode::Walk
+        } else if self.check_soft("trail") {
+            PathMode::Trail
+        } else if self.check_soft("simple") {
+            PathMode::Simple
+        } else if self.check_soft("acyclic") {
+            PathMode::Acyclic
+        } else {
+            return PathMode::Trail;
+        };
+        self.advance();
+        mode
     }
 
     /// Parse an optional ISO path selector prefixing a pattern. Only `ANY

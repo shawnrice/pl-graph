@@ -554,6 +554,9 @@ pub struct CPath {
     pub path_var_slot: Option<usize>,
     /// Which matching paths to keep (`Walk` = all; `AnyShortest` = one per pair).
     pub selector: PathSelector,
+    /// The repeated-element restrictor on a var-length walk (`Trail` default =
+    /// no repeated edges; `Simple`/`Acyclic` = no repeated nodes; `Walk` = none).
+    pub mode: PathMode,
 }
 
 #[derive(Debug, Clone)]
@@ -1318,6 +1321,7 @@ impl Lowerer {
                 .collect(),
             path_var_slot: p.path_var.as_ref().map(|v| self.slot_of(v)),
             selector: p.selector,
+            mode: p.mode,
         }
     }
 

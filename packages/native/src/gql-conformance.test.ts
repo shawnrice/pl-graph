@@ -1707,3 +1707,53 @@ suite('gql conformance: ALL SHORTEST — every tied path, byte-identical', () =>
     expect(JSON.parse(ts)).toHaveLength(1);
   });
 });
+
+// Path modes (WALK/TRAIL/SIMPLE/ACYCLIC) restrict which repeats a matched path
+// may contain; byte-identical across engines. Triangle a→b→c→a + a→d + b→a on a
+// shared graph. Default (no mode) == TRAIL.
+suite('gql conformance: path modes — byte-identical restrictors', () => {
+  const NDJSON = [
+    { type: 'node', id: 'a', labels: ['N'], properties: { id: 'a' } },
+    { type: 'node', id: 'b', labels: ['N'], properties: { id: 'b' } },
+    { type: 'node', id: 'c', labels: ['N'], properties: { id: 'c' } },
+    { type: 'node', id: 'd', labels: ['N'], properties: { id: 'd' } },
+    { type: 'edge', id: 'e1', from: 'a', to: 'b', labels: ['R'], properties: {} },
+    { type: 'edge', id: 'e2', from: 'b', to: 'c', labels: ['R'], properties: {} },
+    { type: 'edge', id: 'e3', from: 'c', to: 'a', labels: ['R'], properties: {} },
+    { type: 'edge', id: 'e4', from: 'a', to: 'd', labels: ['R'], properties: {} },
+    { type: 'edge', id: 'e5', from: 'b', to: 'a', labels: ['R'], properties: {} },
+  ]
+    .map((r) => JSON.stringify(r))
+    .join('\n');
+
+  const backend = createFfiBackend(LIB);
+  const nativeGraph = graphFromFormat(backend, NDJSON, 'ndjson');
+  const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
+  const both = (q: string): [string, string] => [
+    JSON.stringify(tsQuery(tsGraph, q)),
+    JSON.stringify(nativeGraph.query(q)),
+  ];
+
+  for (const mode of ['', 'WALK ', 'TRAIL ', 'SIMPLE ', 'ACYCLIC ']) {
+    test(`${mode || '(default)'}(a)-[:R]->{1,3}(x) — endpoints agree`, () => {
+      const [ts, native] = both(
+        `MATCH ${mode}(a:N {id:'a'})-[:R]->{1,3}(x) RETURN x.id AS id ORDER BY id`,
+      );
+      expect(ts).toBe(native);
+    });
+
+    test(`${mode || '(default)'} count(*) agrees (general matcher for non-trail)`, () => {
+      const [ts, native] = both(`MATCH ${mode}(a:N {id:'a'})-[:R]->{1,3}(x) RETURN count(*) AS c`);
+      expect(ts).toBe(native);
+    });
+  }
+
+  test('ACYCLIC excludes the cycle-back-to-seed; default (TRAIL) includes it', () => {
+    const [acTs] = both(
+      `MATCH ACYCLIC (a:N {id:'a'})-[:R]->{1,3}(x) RETURN x.id AS id ORDER BY id`,
+    );
+    const [defTs] = both(`MATCH (a:N {id:'a'})-[:R]->{1,3}(x) RETURN x.id AS id ORDER BY id`);
+    expect(acTs).not.toContain('"a"');
+    expect(defTs).toContain('"a"');
+  });
+});

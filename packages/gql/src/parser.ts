@@ -48,6 +48,7 @@ import type {
   CallNamedClause,
   NodePattern,
   PathPattern,
+  PathMode,
   PathSelector,
   Projection,
   Query,
@@ -636,6 +637,7 @@ export const parse = (
       }
 
       const selector = parsePathSelector();
+      const mode = parsePathMode();
 
       if (pathVar !== undefined && selector === 'walk') {
         throw new GqlSyntaxError(
@@ -672,8 +674,36 @@ export const parse = (
         segments,
         ...(pathVar !== undefined ? { pathVar } : {}),
         selector,
+        mode,
       };
     });
+
+  // Optional ISO path mode after the selector, before the pattern
+  // (`WALK`/`TRAIL`/`SIMPLE`/`ACYCLIC`). Contextual (non-reserved) — recognized
+  // only here, so `walk`/`simple`/… stay usable as identifiers. Default `trail`
+  // (matching Neo4j/Fabric; bare `walk` is unusable unbounded).
+  const parsePathMode = (): PathMode => {
+    const soft = (word: string): boolean =>
+      peek().type === 'ident' && !peek().delimited && peek().value.toLowerCase() === word;
+
+    let mode: PathMode;
+
+    if (soft('walk')) {
+      mode = 'walk';
+    } else if (soft('trail')) {
+      mode = 'trail';
+    } else if (soft('simple')) {
+      mode = 'simple';
+    } else if (soft('acyclic')) {
+      mode = 'acyclic';
+    } else {
+      return 'trail';
+    }
+
+    advance();
+
+    return mode;
+  };
 
   // Is the token after the current one the keyword `kw`? (Tells `OPTIONAL CALL`
   // from `OPTIONAL MATCH` without consuming.)

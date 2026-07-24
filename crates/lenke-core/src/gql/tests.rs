@@ -4903,6 +4903,53 @@ fn any_shortest_closes_on_the_seed_cycle() {
 }
 
 #[test]
+fn path_modes_restrict_repeated_elements() {
+    // Triangle a→b→c→a plus a→d and a back-edge b→a. From a within 1..3 hops the
+    // reachable-endpoint multiplicity differs by mode: WALK ⊃ TRAIL ⊃ SIMPLE ⊃
+    // ACYCLIC. No mode == TRAIL (the default), so the shape is unchanged.
+    let mut g = ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+            r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+            r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}"#,
+            r#"{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}"#,
+            r#"{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e2","from":"b","to":"c","labels":["R"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e3","from":"c","to":"a","labels":["R"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e4","from":"a","to":"d","labels":["R"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e5","from":"b","to":"a","labels":["R"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let count = |g: &mut Graph, mode: &str| {
+        rows(
+            g,
+            &format!("MATCH {mode} (a:N {{id:'a'}})-[:R]->{{1,3}}(x) RETURN x.id AS id"),
+        )
+        .len()
+    };
+
+    let default = count(&mut g, "");
+    assert_eq!(count(&mut g, "TRAIL"), default, "no mode == TRAIL");
+    assert!(
+        count(&mut g, "WALK") > default,
+        "WALK admits repeated edges"
+    );
+    // ACYCLIC forbids the cycle back to the seed; SIMPLE allows only that close.
+    let acyclic = count(&mut g, "ACYCLIC");
+    let simple = count(&mut g, "SIMPLE");
+    assert!(acyclic < default);
+    assert!(simple > acyclic && simple <= default);
+    // ACYCLIC never revisits a node, so `a` (the cycle-back endpoint) is absent.
+    let ac_ends = rows(
+        &mut g,
+        "MATCH ACYCLIC (a:N {id:'a'})-[:R]->{1,3}(x) RETURN x.id AS id",
+    );
+    assert!(ac_ends.iter().all(|r| r[0] != s("a")));
+}
+
+#[test]
 fn all_shortest_enumerates_every_tied_path() {
     // Diamond a→b→d, a→c→d: two shortest paths a..d (length 2). `ALL SHORTEST`
     // returns both (ISO per-path multiplicity); `ANY SHORTEST` returns one.
