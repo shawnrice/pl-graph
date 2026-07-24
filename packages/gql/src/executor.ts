@@ -4637,6 +4637,11 @@ const applyAlgoConfig = (cfg: AlgorithmConfig, key: string, v: unknown): void =>
     'weightProperty',
     'dampingFactor',
     'iterations',
+    // Approximate-betweenness pivot count and label-propagation seed key — the
+    // algorithms implement both, but they were missing here, so a CALL config
+    // map silently dropped them (exact O(V·E) betweenness regardless of pivots).
+    'pivots',
+    'seedProperty',
     'source',
     'sourceNodes',
     'target',

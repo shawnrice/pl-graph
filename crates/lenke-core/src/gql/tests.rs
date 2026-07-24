@@ -2089,6 +2089,46 @@ fn camelcase_procedure_name_suggests_the_snake_case_one() {
 }
 
 #[test]
+fn call_betweenness_pivots_reaches_the_algorithm() {
+    // `CALL betweenness({pivots: k})` must actually sample. The config-map path
+    // (`apply_algo_config`) used to drop `pivots` (and `seedProperty`), silently
+    // running the exact O(V·E) pass regardless — a documented, unit-tested
+    // feature that was unreachable through its primary GQL surface. On a clean
+    // directed path an 8-of-16 pivot sample scales differently from the exact
+    // pass, so the two sums must differ. If `pivots` is dropped, both are exact
+    // and equal and this fails.
+    let mut g = ndjson::decode("").unwrap();
+    let count = 16;
+    for i in 0..count {
+        rows(&mut g, &format!("INSERT (:P {{id: 'n{i}'}})"));
+    }
+    for i in 0..count - 1 {
+        let j = i + 1;
+        rows(
+            &mut g,
+            &format!("MATCH (a:P {{id:'n{i}'}}),(b:P {{id:'n{j}'}}) INSERT (a)-[:E]->(b)"),
+        );
+    }
+    let exact = rows(
+        &mut g,
+        "CALL betweenness({}) YIELD node, centrality RETURN sum(centrality) AS s",
+    );
+    let sampled = rows(
+        &mut g,
+        "CALL betweenness({pivots: 2}) YIELD node, centrality RETURN sum(centrality) AS s",
+    );
+    assert_ne!(
+        exact[0][0],
+        n(0.0),
+        "the path should have nonzero betweenness"
+    );
+    assert_ne!(
+        sampled[0][0], exact[0][0],
+        "pivots must change the result — the config must reach the algorithm"
+    );
+}
+
+#[test]
 fn unknown_function_errors_even_over_empty_input_and_dead_branches() {
     // The fault is raised EAGERLY off the plan's `unknown_fns`, before the first
     // row — so an unknown function faults identically whether the result set is

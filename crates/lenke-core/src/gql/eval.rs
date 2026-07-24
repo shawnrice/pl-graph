@@ -1030,6 +1030,12 @@ fn apply_algo_config(cfg: &mut crate::algo::AlgoConfig, field: &str, v: &Val) {
         "weightProperty" => cfg.weight_property = s(v),
         "dampingFactor" => cfg.damping_factor = num_of(v),
         "iterations" => cfg.iterations = num_of(v).map(|n| n as u32),
+        // Approximate-betweenness pivot count and label-propagation seed key —
+        // parsed by the JSON-config path (`AlgoConfig::from_json`) this function
+        // mirrors, but previously dropped here, so `CALL betweenness({pivots: k})`
+        // silently ran the exact O(V·E) pass. Wire them through.
+        "pivots" => cfg.pivots = num_of(v).map(|n| n as u32),
+        "seedProperty" => cfg.seed_property = s(v),
         "source" => cfg.source = s(v),
         "sourceNodes" => cfg.source_nodes = strs(v),
         "target" => cfg.target = s(v),

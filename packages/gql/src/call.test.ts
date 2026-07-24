@@ -83,6 +83,32 @@ describe('named procedure CALL', () => {
       'unknown procedure: totallyBogus',
     );
   });
+
+  test('CALL betweenness({pivots: k}) actually samples (config reaches the algo)', () => {
+    // The config-map path used to drop `pivots` (and `seedProperty`), silently
+    // running exact O(V·E) betweenness. On a clean directed path an 8-of-16 pivot
+    // sample scales differently from exact, so the two sums must differ. If pivots
+    // is dropped, both are exact and equal.
+    const g = new Graph();
+    const n = 16;
+    const ids = Array.from({ length: n }, (_, i) =>
+      g.addVertex({ id: `n${i}`, labels: ['P'], properties: {} }),
+    );
+
+    for (let i = 0; i < n - 1; i++) {
+      g.addEdge({ from: ids[i], to: ids[i + 1], labels: ['E'], properties: {} });
+    }
+
+    const sum = (cfg: string): number =>
+      query(g, `CALL betweenness(${cfg}) YIELD node, centrality RETURN sum(centrality) AS s`)[0]
+        .s as number;
+
+    const exact = sum('{}');
+    const sampled = sum('{pivots: 8}');
+
+    expect(exact).toBeGreaterThan(0);
+    expect(sampled).not.toBe(exact);
+  });
 });
 
 describe('inline subquery CALL', () => {
