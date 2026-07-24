@@ -242,7 +242,7 @@ export type PathPattern = {
  * selector) keeps every match; `anyShortest` (`ANY SHORTEST`) keeps one
  * fewest-hop path per endpoint pair.
  */
-export type PathSelector = 'walk' | 'anyShortest';
+export type PathSelector = 'walk' | 'anyShortest' | 'allShortest';
 
 /** One hop: traverse `rel`, land on `node`. */
 export type Segment = {

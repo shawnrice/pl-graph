@@ -2946,6 +2946,148 @@ fn reconstruct_cycle(
     (vertices, edges)
 }
 
+/// Every shortest path `seed … end` through the shortest-path DAG `preds` (each
+/// vertex → all its fewest-hop predecessors `(prev, edge)`), in forward order.
+/// Deterministic: `preds` were recorded in BFS / ascending-eidx order and are
+/// enumerated in that order, so native and TS produce identical path sequences.
+fn enumerate_shortest_paths(
+    seed: u32,
+    end: u32,
+    preds: &HashMap<u32, Vec<(u32, u32)>>,
+) -> Vec<(Vec<u32>, Vec<u32>)> {
+    if end == seed {
+        return vec![(vec![seed], Vec::new())];
+    }
+    let Some(ps) = preds.get(&end) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for &(pv, edge) in ps {
+        for (mut vs, mut es) in enumerate_shortest_paths(seed, pv, preds) {
+            vs.push(end);
+            es.push(edge);
+            out.push((vs, es));
+        }
+    }
+    out
+}
+
+/// `ALL SHORTEST` over a single quantified segment: every fewest-hop path to each
+/// reachable `end`-matching vertex (per the ISO selector). Like [`shortest_walk`]'s
+/// BFS, but records ALL shortest predecessors per vertex (not just the first) and
+/// enumerates the resulting shortest-path DAG. Determinism identical to
+/// `shortest_walk` — edges in ascending eidx, endpoints ascending by id — plus the
+/// per-endpoint paths in `preds`-recording order, so native == TS byte for byte.
+fn all_shortest_walk(
+    graph: &Graph,
+    ctx: &Ctx,
+    pattern: &CPath,
+    seed: u32,
+    binding: &mut Binding,
+    emit: &mut dyn FnMut(&mut Binding) -> bool,
+) -> bool {
+    if ctx.faulted() {
+        return true;
+    }
+    let seg = &pattern.segments[0];
+    let rel = &seg.rel;
+    let end_node = &seg.node;
+    let q = rel
+        .quantifier
+        .expect("an ALL SHORTEST pattern has a quantified segment");
+
+    let mut dist: HashMap<u32, u32> = HashMap::from([(seed, 0)]);
+    let mut preds: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+    let mut queue: VecDeque<u32> = VecDeque::from([seed]);
+    // All shortest cycles back to the seed (it's never re-discovered via `dist`):
+    // the min-distance edges `(prev, edge)` with `prev --edge--> seed`.
+    let mut seed_cycle_dist: Option<u32> = None;
+    let mut seed_cycles: Vec<(u32, u32)> = Vec::new();
+
+    while let Some(v) = queue.pop_front() {
+        let d = dist[&v];
+        if q.max.is_some_and(|m| d >= m) {
+            continue;
+        }
+        let mut nbrs: Vec<(u32, u32)> =
+            expand(graph, ctx, v, rel.direction, rel.label.as_ref()).collect();
+        nbrs.sort_unstable_by_key(|&(eidx, _)| eidx);
+        for (eidx, nbr) in nbrs {
+            if nbr == seed {
+                match seed_cycle_dist {
+                    None => {
+                        seed_cycle_dist = Some(d + 1);
+                        seed_cycles.push((v, eidx));
+                    }
+                    Some(cd) if cd == d + 1 => seed_cycles.push((v, eidx)),
+                    _ => {}
+                }
+            }
+            match dist.get(&nbr).copied() {
+                None => {
+                    dist.insert(nbr, d + 1);
+                    preds.insert(nbr, vec![(v, eidx)]);
+                    queue.push_back(nbr);
+                }
+                // Another shortest predecessor: same min distance, one hop back.
+                Some(dn) if dn == d + 1 => preds.entry(nbr).or_default().push((v, eidx)),
+                _ => {}
+            }
+        }
+    }
+
+    let mut ends: Vec<u32> = dist
+        .iter()
+        .filter(|&(_, &d)| d >= q.min)
+        .map(|(&v, _)| v)
+        .collect();
+    let seed_cycle_end =
+        q.min >= 1 && seed_cycle_dist.is_some_and(|cd| q.max.is_none_or(|m| cd <= m));
+    if seed_cycle_end {
+        ends.push(seed);
+    }
+    ends.sort_unstable();
+
+    for end in ends {
+        let paths: Vec<(Vec<u32>, Vec<u32>)> = if end == seed && seed_cycle_end {
+            let mut out = Vec::new();
+            for &(pv, edge) in &seed_cycles {
+                for (mut vs, mut es) in enumerate_shortest_paths(seed, pv, &preds) {
+                    vs.push(seed);
+                    es.push(edge);
+                    out.push((vs, es));
+                }
+            }
+            out
+        } else {
+            enumerate_shortest_paths(seed, end, &preds)
+        };
+        for (vertices, edges) in paths {
+            let path_slot = pattern.path_var_slot;
+            let stop = !match_node_then(graph, ctx, binding, end_node, end, &mut |b| {
+                if let Some(s) = path_slot {
+                    b.set(
+                        s,
+                        Val::Path {
+                            vertices: vertices.clone(),
+                            edges: edges.clone(),
+                        },
+                    );
+                }
+                let keep = emit(b);
+                if let Some(s) = path_slot {
+                    b.unset(s);
+                }
+                keep
+            });
+            if stop {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Seed and match a single path pattern, emitting each binding via `emit`.
 /// `where_` is the enclosing clause WHERE, threaded here only so the start node
 /// can seed from a property index on a `WHERE var.k = $x` conjunct (in addition
@@ -2968,6 +3110,7 @@ fn visit_pattern(
             &mut |b| match pattern.selector {
                 PathSelector::Walk => walk_segments(graph, ctx, pattern, 0, seed, b, emit),
                 PathSelector::AnyShortest => shortest_walk(graph, ctx, pattern, seed, b, emit),
+                PathSelector::AllShortest => all_shortest_walk(graph, ctx, pattern, seed, b, emit),
             },
         )
     };

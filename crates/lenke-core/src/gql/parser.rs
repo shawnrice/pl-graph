@@ -665,7 +665,9 @@ impl Parser {
         if self.check_kw("all") {
             self.advance();
             if self.check_kw("shortest") {
-                return err("ALL SHORTEST is not yet supported", pos);
+                self.advance();
+
+                return Ok(PathSelector::AllShortest);
             }
 
             return err("the bare ALL path selector is not yet supported", pos);

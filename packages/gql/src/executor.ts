@@ -3049,6 +3049,118 @@ const shortestWalk = function* (
   }
 };
 
+// `ALL SHORTEST`: every fewest-hop path to each reachable end-matching vertex.
+// Like `shortestWalk`, but records ALL shortest predecessors per vertex and
+// enumerates the resulting shortest-path DAG (one row per path — ISO per-path
+// multiplicity, even without a path variable). Determinism identical to
+// `shortestWalk` plus per-endpoint paths in predecessor-recording order, so it
+// stays byte-identical with the native `all_shortest_walk`.
+const allShortestWalk = function* (
+  graph: Graph,
+  pattern: CPath,
+  seed: Vertex,
+  binding: Binding,
+  params: Params,
+): Iterable<Binding> {
+  const [{ rel, node: endNode }] = pattern.segments;
+  const { min, max } = rel.quantifier!;
+
+  const dist = new Map<string, number>([[seed.id, 0]]);
+  const preds = new Map<string, { prev: Vertex; edge: Edge }[]>();
+  const queue: Vertex[] = [seed];
+  let seedCycleDist: number | null = null;
+  const seedCycles: { prev: Vertex; edge: Edge }[] = [];
+
+  for (const v of queue) {
+    const d = dist.get(v.id)!;
+
+    if (max !== null && d >= max) {
+      continue;
+    }
+
+    for (const { edge, node: nbr } of expand(graph, v, rel)) {
+      if (nbr.id === seed.id) {
+        if (seedCycleDist === null) {
+          seedCycleDist = d + 1;
+          seedCycles.push({ prev: v, edge });
+        } else if (seedCycleDist === d + 1) {
+          seedCycles.push({ prev: v, edge });
+        }
+      }
+
+      const dn = dist.get(nbr.id);
+
+      if (dn === undefined) {
+        dist.set(nbr.id, d + 1);
+        preds.set(nbr.id, [{ prev: v, edge }]);
+        queue.push(nbr);
+      } else if (dn === d + 1) {
+        preds.get(nbr.id)!.push({ prev: v, edge });
+      }
+    }
+  }
+
+  const seedCycleEnd = min >= 1 && seedCycleDist !== null && (max === null || seedCycleDist <= max);
+
+  // Every shortest path seed…v as a forward `steps` array, via the preds DAG.
+  const enumerate = (v: Vertex): { edge: Edge; vertex: Vertex }[][] => {
+    if (v.id === seed.id) {
+      return [[]];
+    }
+
+    const ps = preds.get(v.id);
+
+    if (!ps) {
+      return [];
+    }
+
+    const out: { edge: Edge; vertex: Vertex }[][] = [];
+
+    for (const { prev, edge } of ps) {
+      for (const sub of enumerate(prev)) {
+        out.push([...sub, { edge, vertex: v }]);
+      }
+    }
+
+    return out;
+  };
+
+  for (const end of graph.vertices) {
+    const isSeedCycle = end.id === seed.id && seedCycleEnd;
+    const d = dist.get(end.id);
+
+    if (!isSeedCycle && (d === undefined || d < min)) {
+      continue;
+    }
+
+    const matched = matchNode(binding, endNode, end, params, graph);
+
+    if (!matched) {
+      continue;
+    }
+
+    let paths: { edge: Edge; vertex: Vertex }[][];
+
+    if (isSeedCycle) {
+      paths = [];
+
+      for (const { prev, edge } of seedCycles) {
+        for (const sub of enumerate(prev)) {
+          paths.push([...sub, { edge, vertex: seed }]);
+        }
+      }
+    } else {
+      paths = enumerate(end);
+    }
+
+    for (const steps of paths) {
+      yield pattern.pathVar === undefined
+        ? matched
+        : withBinding(matched, pattern.pathVar, Path.fromSteps(seed, steps));
+    }
+  }
+};
+
 /** Yield every binding that extends `binding` by matching `pattern`. */
 const matchPattern = function* (
   graph: Graph,
@@ -3056,8 +3168,8 @@ const matchPattern = function* (
   binding: Binding,
   params: Params,
 ): Iterable<Binding> {
-  // A path selector (`ANY SHORTEST`) is matched by its own BFS driver.
-  if (pattern.selector === 'anyShortest') {
+  // A shortest-path selector (`ANY`/`ALL SHORTEST`) has its own BFS driver.
+  if (pattern.selector === 'anyShortest' || pattern.selector === 'allShortest') {
     const seeds: Iterable<Vertex> =
       pattern.start.variable && binding.has(pattern.start.variable)
         ? [binding.get(pattern.start.variable) as Vertex]
@@ -3067,7 +3179,9 @@ const matchPattern = function* (
       const seeded = matchNode(binding, pattern.start, seed, params, graph);
 
       if (seeded) {
-        yield* shortestWalk(graph, pattern, seed, seeded, params);
+        yield* pattern.selector === 'anyShortest'
+          ? shortestWalk(graph, pattern, seed, seeded, params)
+          : allShortestWalk(graph, pattern, seed, seeded, params);
       }
     }
 

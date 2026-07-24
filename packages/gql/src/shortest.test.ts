@@ -107,9 +107,9 @@ describe('ANY SHORTEST path patterns', () => {
 
   test('unsupported selector shapes are rejected at parse time', () => {
     expect(() => parseQuery('MATCH (a)-[]->*(b) RETURN b')).not.toThrow();
-    expect(() => parseQuery('MATCH ALL SHORTEST (a)-[]->*(b) RETURN b')).toThrow();
+    expect(() => parseQuery('MATCH ALL SHORTEST (a)-[]->*(b) RETURN b')).not.toThrow(); // now supported
     expect(() => parseQuery('MATCH SHORTEST (a)-[]->*(b) RETURN b')).toThrow();
-    expect(() => parseQuery('MATCH ANY (a)-[]->*(b) RETURN b')).toThrow();
+    expect(() => parseQuery('MATCH ANY (a)-[]->*(b) RETURN b')).toThrow(); // bare ANY still unsupported
     expect(() => parseQuery('MATCH ANY SHORTEST (a)-[]->(b) RETURN b')).toThrow();
     expect(() => parseQuery('MATCH ANY SHORTEST (a)-[]->{2,4}(b) RETURN b')).toThrow();
     expect(() => parseQuery('MATCH p = (a)-[]->(b) RETURN p')).toThrow();

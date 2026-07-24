@@ -4903,6 +4903,46 @@ fn any_shortest_closes_on_the_seed_cycle() {
 }
 
 #[test]
+fn all_shortest_enumerates_every_tied_path() {
+    // Diamond a→b→d, a→c→d: two shortest paths a..d (length 2). `ALL SHORTEST`
+    // returns both (ISO per-path multiplicity); `ANY SHORTEST` returns one.
+    let mut g = ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+            r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+            r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}"#,
+            r#"{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}"#,
+            r#"{"type":"edge","id":"ea","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+            r#"{"type":"edge","id":"eb","from":"a","to":"c","labels":["R"],"properties":{}}"#,
+            r#"{"type":"edge","id":"ec","from":"b","to":"d","labels":["R"],"properties":{}}"#,
+            r#"{"type":"edge","id":"ed","from":"c","to":"d","labels":["R"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let all = rows(
+        &mut g,
+        "MATCH p = ALL SHORTEST (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN path_length(p) AS len",
+    );
+    assert_eq!(all.len(), 2, "both tied shortest paths a..d");
+    assert!(all.iter().all(|r| r[0] == n(2.0)));
+
+    let any = rows(
+        &mut g,
+        "MATCH p = ANY SHORTEST (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN path_length(p) AS len",
+    );
+    assert_eq!(any.len(), 1, "ANY SHORTEST keeps one");
+
+    // Endpoint multiplicity over `->*` (min 0): a(1) b(1) c(1) d(2) = 5 rows.
+    let ends = rows(
+        &mut g,
+        "MATCH ALL SHORTEST (a:N {id:'a'})-[:R]->*(x) RETURN x.id AS id",
+    );
+    assert_eq!(ends.len(), 5);
+}
+
+#[test]
 fn postfix_property_chains_off_a_subscript() {
     // `list[i].prop` — property access chained off a subscript (the per-hop path
     // accessor), incl. `list[i].prop <op> list[j].prop` (consecutive-hop
@@ -4947,10 +4987,10 @@ fn postfix_property_chains_off_a_subscript() {
 #[test]
 fn shortest_unsupported_shapes_rejected() {
     assert!(parse("MATCH (a)-[]->*(b) RETURN b").is_ok()); // no selector: still fine
-    assert!(parse("MATCH ALL SHORTEST (a)-[]->*(b) RETURN b").is_err());
+    assert!(parse("MATCH ALL SHORTEST (a)-[]->*(b) RETURN b").is_ok()); // now supported
     assert!(parse("MATCH SHORTEST (a)-[]->*(b) RETURN b").is_err());
-    assert!(parse("MATCH ANY (a)-[]->*(b) RETURN b").is_err());
-    // A selector needs a single variable-length segment.
+    assert!(parse("MATCH ANY (a)-[]->*(b) RETURN b").is_err()); // bare ANY still unsupported
+                                                                // A selector needs a single variable-length segment.
     assert!(parse("MATCH ANY SHORTEST (a)-[]->(b) RETURN b").is_err());
     assert!(parse("MATCH ANY SHORTEST (a)-[]->*(b)-[]->*(c) RETURN c").is_err());
     // min > 1 is not the shortest semantics yet.

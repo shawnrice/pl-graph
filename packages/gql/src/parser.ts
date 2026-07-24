@@ -607,12 +607,13 @@ export const parse = (
     if (checkKeyword('all')) {
       advance();
 
-      throw new GqlSyntaxError(
-        checkKeyword('shortest')
-          ? 'ALL SHORTEST is not yet supported'
-          : 'the bare ALL path selector is not yet supported',
-        pos0,
-      );
+      if (checkKeyword('shortest')) {
+        advance();
+
+        return 'allShortest';
+      }
+
+      throw new GqlSyntaxError('the bare ALL path selector is not yet supported', pos0);
     }
 
     if (checkKeyword('shortest')) {

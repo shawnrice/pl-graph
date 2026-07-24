@@ -1641,3 +1641,69 @@ suite('GQL differential: param value validation (D2/D3)', () => {
     expect(temporal[0]).toBe(`[{"d":{"@date":"2020-07-01"}}]`);
   });
 });
+
+// ALL SHORTEST enumerates every path tied for the fewest-hop length (ISO
+// per-path multiplicity), unlike ANY SHORTEST which keeps one. Needs a graph
+// with multiple equal-length paths, so it builds its own diamond on both engines
+// from shared NDJSON (identical ids → path values compare byte-for-byte).
+suite('gql conformance: ALL SHORTEST — every tied path, byte-identical', () => {
+  // a→b→d and a→c→d (two shortest a..d), then d→e→f (the tail extends both).
+  const NDJSON = [
+    { type: 'node', id: 'a', labels: ['N'], properties: { id: 'a' } },
+    { type: 'node', id: 'b', labels: ['N'], properties: { id: 'b' } },
+    { type: 'node', id: 'c', labels: ['N'], properties: { id: 'c' } },
+    { type: 'node', id: 'd', labels: ['N'], properties: { id: 'd' } },
+    { type: 'node', id: 'e', labels: ['N'], properties: { id: 'e' } },
+    { type: 'node', id: 'f', labels: ['N'], properties: { id: 'f' } },
+    { type: 'edge', id: 'ea', from: 'a', to: 'b', labels: ['R'], properties: {} },
+    { type: 'edge', id: 'eb', from: 'a', to: 'c', labels: ['R'], properties: {} },
+    { type: 'edge', id: 'ec', from: 'b', to: 'd', labels: ['R'], properties: {} },
+    { type: 'edge', id: 'ed', from: 'c', to: 'd', labels: ['R'], properties: {} },
+    { type: 'edge', id: 'ee', from: 'd', to: 'e', labels: ['R'], properties: {} },
+    { type: 'edge', id: 'ef', from: 'e', to: 'f', labels: ['R'], properties: {} },
+  ]
+    .map((r) => JSON.stringify(r))
+    .join('\n');
+
+  const backend = createFfiBackend(LIB);
+  const nativeGraph = graphFromFormat(backend, NDJSON, 'ndjson');
+  const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
+  const both = (q: string): [string, string] => [
+    JSON.stringify(tsQuery(tsGraph, q)),
+    JSON.stringify(nativeGraph.query(q)),
+  ];
+
+  test('two tied shortest paths a..d — full Path values agree', () => {
+    const [ts, native] = both(
+      `MATCH p = ALL SHORTEST (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN p`,
+    );
+    expect(ts).toBe(native);
+    // Both length-2 paths, in predecessor-recording order (via b, then via c).
+    expect(ts).toContain('"b"');
+    expect(ts).toContain('"c"');
+    expect(JSON.parse(ts)).toHaveLength(2);
+  });
+
+  test('the tail extends both shortest paths (a..f), byte-identical', () => {
+    const [ts, native] = both(
+      `MATCH p = ALL SHORTEST (a:N {id:'a'})-[:R]->*(x:N {id:'f'}) RETURN p`,
+    );
+    expect(ts).toBe(native);
+    expect(JSON.parse(ts)).toHaveLength(2);
+  });
+
+  test('endpoint multiplicity (rows per endpoint) is byte-identical', () => {
+    const [ts, native] = both(
+      `MATCH ALL SHORTEST (a:N {id:'a'})-[:R]->*(x) RETURN x.id AS id ORDER BY id`,
+    );
+    expect(ts).toBe(native);
+  });
+
+  test('ANY SHORTEST still keeps exactly one path here', () => {
+    const [ts, native] = both(
+      `MATCH p = ANY SHORTEST (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN p`,
+    );
+    expect(ts).toBe(native);
+    expect(JSON.parse(ts)).toHaveLength(1);
+  });
+});
