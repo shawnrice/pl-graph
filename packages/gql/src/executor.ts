@@ -4627,32 +4627,94 @@ const suggestProcedure = (name: string): string | null => {
   return Object.keys(PROCEDURES).find((n) => normProcName(n) === target) ?? null;
 };
 
-/** Set one algorithm-config field from a CALL config-map entry (keys = the
- * algorithm's JSON config fields; unknown keys are ignored). */
-const applyAlgoConfig = (cfg: AlgorithmConfig, key: string, v: unknown): void => {
-  const mut = cfg as Record<string, unknown>;
-  const FIELDS = new Set([
-    'edgeLabel',
-    'direction',
-    'weightProperty',
-    'dampingFactor',
-    'iterations',
-    // Approximate-betweenness pivot count and label-propagation seed key — the
-    // algorithms implement both, but they were missing here, so a CALL config
-    // map silently dropped them (exact O(V·E) betweenness regardless of pivots).
-    'pivots',
-    'seedProperty',
-    'source',
-    'sourceNodes',
-    'target',
-    'writeProperty',
-    'algorithm',
-    'heuristicProperty',
-  ]);
+/** The accepted `CALL <algo>({...})` config keys and the value type each expects.
+ * Order is fixed so the "did you mean" tie-break matches the native engine. */
+const ALGO_CONFIG_TYPES: ReadonlyArray<readonly [string, 'string' | 'number' | 'stringList']> = [
+  ['edgeLabel', 'string'],
+  ['direction', 'string'],
+  ['weightProperty', 'string'],
+  ['dampingFactor', 'number'],
+  ['iterations', 'number'],
+  ['pivots', 'number'],
+  ['seedProperty', 'string'],
+  ['source', 'string'],
+  ['sourceNodes', 'stringList'],
+  ['target', 'string'],
+  ['writeProperty', 'string'],
+  ['algorithm', 'string'],
+  ['heuristicProperty', 'string'],
+];
 
-  if (FIELDS.has(key)) {
-    mut[key] = v;
+/** Case-insensitive Levenshtein edit distance — a plain DP over code points,
+ * matching the native `edit_distance` so both engines suggest identically. */
+const editDistance = (a: string, b: string): number => {
+  const x = Array.from(a.toLowerCase());
+  const y = Array.from(b.toLowerCase());
+  let prev = Array.from({ length: y.length + 1 }, (_, i) => i);
+  const cur = new Array<number>(y.length + 1);
+
+  for (let i = 0; i < x.length; i++) {
+    cur[0] = i + 1;
+
+    for (let j = 0; j < y.length; j++) {
+      const cost = x[i] === y[j] ? 0 : 1;
+      cur[j + 1] = Math.min(prev[j + 1] + 1, cur[j] + 1, prev[j] + cost);
+    }
+
+    prev = cur.slice();
   }
+
+  return prev[y.length];
+};
+
+/** For an unknown config key, the closest known key within edit distance 2 (else
+ * null). Scans in fixed order so ties resolve to the earliest — identical to native. */
+const suggestConfigKey = (name: string): string | null => {
+  let best: string | null = null;
+  let bestDist = 3;
+
+  for (const [key] of ALGO_CONFIG_TYPES) {
+    const d = editDistance(name, key);
+
+    if (d <= 2 && d < bestDist) {
+      best = key;
+      bestDist = d;
+    }
+  }
+
+  return best;
+};
+
+/** Set one algorithm-config field from a CALL config-map entry. An unknown key
+ * (with a "did you mean" hint) or a wrong-typed value is an error — a silently
+ * dropped key once hid the `pivots` bug. Mirrors native `apply_algo_config`. */
+const applyAlgoConfig = (cfg: AlgorithmConfig, key: string, v: unknown): void => {
+  const spec = ALGO_CONFIG_TYPES.find(([k]) => k === key);
+
+  if (spec === undefined) {
+    const s = suggestConfigKey(key);
+
+    throw new LenkeError(
+      s ? `unknown config key '${key}' (did you mean '${s}'?)` : `unknown config key '${key}'`,
+      { code: ErrorCode.InvalidValue },
+    );
+  }
+
+  const [, expected] = spec;
+  const okByType: Record<typeof expected, boolean> = {
+    string: typeof v === 'string',
+    number: typeof v === 'number',
+    stringList: Array.isArray(v),
+  };
+
+  if (!okByType[expected]) {
+    const label = expected === 'stringList' ? 'a list' : `a ${expected}`;
+
+    throw new LenkeError(`config key '${key}' expects ${label}`, { code: ErrorCode.InvalidValue });
+  }
+
+  (cfg as Record<string, unknown>)[key] =
+    expected === 'stringList' ? (v as unknown[]).filter((x) => typeof x === 'string') : v;
 };
 
 /**

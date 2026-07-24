@@ -109,6 +109,34 @@ describe('named procedure CALL', () => {
     expect(exact).toBeGreaterThan(0);
     expect(sampled).not.toBe(exact);
   });
+
+  test('CALL config keys are validated (byte-identical to native)', () => {
+    // An unknown or wrong-typed config key faults E_INVALID_VALUE with the same
+    // message the native engine produces (a silently dropped key hid the pivots bug).
+    const grab = (q: string): string => {
+      try {
+        query(modern(), q);
+      } catch (e) {
+        return (e as Error).message;
+      }
+
+      throw new Error('expected a fault');
+    };
+
+    expect(grab('CALL betweenness({pivot: 8}) YIELD node RETURN node')).toBe(
+      "unknown config key 'pivot' (did you mean 'pivots'?)",
+    );
+    expect(grab('CALL betweenness({bogusKey: 1}) YIELD node RETURN node')).toBe(
+      "unknown config key 'bogusKey'",
+    );
+    expect(grab("CALL betweenness({pivots: 'x'}) YIELD node RETURN node")).toBe(
+      "config key 'pivots' expects a number",
+    );
+    // A valid key of the right type still works.
+    expect(() =>
+      query(modern(), 'CALL pagerank({iterations: 5}) YIELD node RETURN count(*) AS c'),
+    ).not.toThrow();
+  });
 });
 
 describe('inline subquery CALL', () => {

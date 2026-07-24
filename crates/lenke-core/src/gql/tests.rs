@@ -2129,6 +2129,52 @@ fn call_betweenness_pivots_reaches_the_algorithm() {
 }
 
 #[test]
+fn call_config_key_validation() {
+    // An unknown or wrong-typed CALL config key faults E_INVALID_VALUE (a silently
+    // dropped key once hid the pivots bug). A near-miss gets a "did you mean" hint;
+    // the TS engine emits the same code and message byte-for-byte.
+    let mut g = modern();
+    use crate::error_codes::ErrorCode::InvalidValue;
+    let msg = |g: &mut Graph, q: &str| -> (crate::error_codes::ErrorCode, String) {
+        let e = parse(q).unwrap().execute(g, &Params::new()).unwrap_err();
+        (e.code, e.message)
+    };
+
+    assert_eq!(
+        msg(
+            &mut g,
+            "CALL betweenness({pivot: 8}) YIELD node RETURN node"
+        ),
+        (
+            InvalidValue,
+            "unknown config key 'pivot' (did you mean 'pivots'?)".to_string()
+        )
+    );
+    assert_eq!(
+        msg(
+            &mut g,
+            "CALL betweenness({bogusKey: 1}) YIELD node RETURN node"
+        ),
+        (InvalidValue, "unknown config key 'bogusKey'".to_string())
+    );
+    assert_eq!(
+        msg(
+            &mut g,
+            "CALL betweenness({pivots: 'x'}) YIELD node RETURN node"
+        ),
+        (
+            InvalidValue,
+            "config key 'pivots' expects a number".to_string()
+        )
+    );
+    // A valid key of the right type still works.
+    rows(
+        &mut g,
+        "CALL pagerank({iterations: 5}) YIELD node RETURN count(*) AS c",
+    );
+}
+
+#[test]
 fn unknown_function_errors_even_over_empty_input_and_dead_branches() {
     // The fault is raised EAGERLY off the plan's `unknown_fns`, before the first
     // row — so an unknown function faults identically whether the result set is

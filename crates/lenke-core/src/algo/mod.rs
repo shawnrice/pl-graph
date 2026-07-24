@@ -120,6 +120,57 @@ impl AlgoConfig {
     }
 }
 
+/// The accepted `CALL <algo>({...})` config keys — every field [`AlgoConfig`]
+/// carries. A `CALL` config map is validated against this set (unknown key →
+/// error), so a typo or a wrong key no longer silently no-ops. The order is fixed
+/// so the "did you mean" tie-break is deterministic and identical to the TS engine.
+pub const CONFIG_KEYS: &[&str] = &[
+    "edgeLabel",
+    "direction",
+    "weightProperty",
+    "dampingFactor",
+    "iterations",
+    "pivots",
+    "seedProperty",
+    "source",
+    "sourceNodes",
+    "target",
+    "writeProperty",
+    "algorithm",
+    "heuristicProperty",
+];
+
+/// Case-insensitive Levenshtein edit distance — a plain DP over `char`s. Shared by
+/// the config-key "did you mean" so both engines suggest identically.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().flat_map(char::to_lowercase).collect();
+    let b: Vec<char> = b.chars().flat_map(char::to_lowercase).collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// For an unknown config key, the closest known key within edit distance 2 (else
+/// `None`) — the `CALL` config analogue of [`crate::gql::plan::suggest_procedure`].
+/// Scans [`CONFIG_KEYS`] in order so ties resolve to the earliest, identically on
+/// both engines.
+pub fn suggest_config_key(name: &str) -> Option<&'static str> {
+    CONFIG_KEYS
+        .iter()
+        .map(|k| (edit_distance(name, k), *k))
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k)
+}
+
 /// Per-edge numeric weights (indexed by edge id) for property `key`: resolve the
 /// key to a dense id once and read each edge via `value_id` — no per-edge key-string
 /// hashing and one flat allocation the weighted algorithms can index directly.

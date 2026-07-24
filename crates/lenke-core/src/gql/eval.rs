@@ -1011,39 +1011,62 @@ fn value_to_val(v: &Value) -> Val {
     }
 }
 
-/// Set one field of a graph-algorithm config from a CALL config-map entry. The
-/// map keys are the algorithm's JSON config field names; unknown keys are ignored.
-fn apply_algo_config(cfg: &mut crate::algo::AlgoConfig, field: &str, v: &Val) {
-    let s = |v: &Val| match v {
-        Val::Str(s) => Some(s.to_string()),
-        _ => None,
+/// Set one field of a graph-algorithm config from a CALL config-map entry, keyed
+/// by the algorithm's JSON config field name. An unknown key (with a "did you
+/// mean" hint) or a value of the wrong type is an error — a silently-dropped key
+/// once hid the `pivots` bug (approximate betweenness that never sampled), so the
+/// config map is validated rather than best-effort. Mirrors the TS engine so both
+/// fault byte-identically.
+fn apply_algo_config(
+    cfg: &mut crate::algo::AlgoConfig,
+    field: &str,
+    v: &Val,
+) -> Result<(), CodeError> {
+    let err = |m: String| CodeError::new(ErrorCode::InvalidValue, m);
+    let want_str = |v: &Val| match v {
+        Val::Str(s) => Ok(s.to_string()),
+        _ => Err(err(format!("config key '{field}' expects a string"))),
     };
-    // A list config value (personalized-PageRank seed set): keep only its string
+    // A strict number — NOT `num_of` (which coerces strings/bools engine-wide);
+    // a config value should be a genuine number, matching the TS `typeof` check.
+    let want_num = |v: &Val| match v {
+        Val::Num(n) => Ok(*n),
+        _ => Err(err(format!("config key '{field}' expects a number"))),
+    };
+    // A list config value (personalized-PageRank seed set): keep its string
     // elements, exactly as the JSON-config path does.
-    let strs = |v: &Val| match v {
-        Val::List(items) => Some(items.iter().filter_map(s).collect()),
-        _ => None,
+    let want_strs = |v: &Val| match v {
+        Val::List(items) => Ok(items
+            .iter()
+            .filter_map(|x| match x {
+                Val::Str(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect()),
+        _ => Err(err(format!("config key '{field}' expects a list"))),
     };
     match field {
-        "edgeLabel" => cfg.edge_label = s(v),
-        "direction" => cfg.direction = s(v),
-        "weightProperty" => cfg.weight_property = s(v),
-        "dampingFactor" => cfg.damping_factor = num_of(v),
-        "iterations" => cfg.iterations = num_of(v).map(|n| n as u32),
-        // Approximate-betweenness pivot count and label-propagation seed key —
-        // parsed by the JSON-config path (`AlgoConfig::from_json`) this function
-        // mirrors, but previously dropped here, so `CALL betweenness({pivots: k})`
-        // silently ran the exact O(V·E) pass. Wire them through.
-        "pivots" => cfg.pivots = num_of(v).map(|n| n as u32),
-        "seedProperty" => cfg.seed_property = s(v),
-        "source" => cfg.source = s(v),
-        "sourceNodes" => cfg.source_nodes = strs(v),
-        "target" => cfg.target = s(v),
-        "writeProperty" => cfg.write_property = s(v),
-        "algorithm" => cfg.algorithm = s(v),
-        "heuristicProperty" => cfg.heuristic_property = s(v),
-        _ => {}
+        "edgeLabel" => cfg.edge_label = Some(want_str(v)?),
+        "direction" => cfg.direction = Some(want_str(v)?),
+        "weightProperty" => cfg.weight_property = Some(want_str(v)?),
+        "dampingFactor" => cfg.damping_factor = Some(want_num(v)?),
+        "iterations" => cfg.iterations = Some(want_num(v)? as u32),
+        "pivots" => cfg.pivots = Some(want_num(v)? as u32),
+        "seedProperty" => cfg.seed_property = Some(want_str(v)?),
+        "source" => cfg.source = Some(want_str(v)?),
+        "sourceNodes" => cfg.source_nodes = Some(want_strs(v)?),
+        "target" => cfg.target = Some(want_str(v)?),
+        "writeProperty" => cfg.write_property = Some(want_str(v)?),
+        "algorithm" => cfg.algorithm = Some(want_str(v)?),
+        "heuristicProperty" => cfg.heuristic_property = Some(want_str(v)?),
+        _ => {
+            return Err(err(match crate::algo::suggest_config_key(field) {
+                Some(s) => format!("unknown config key '{field}' (did you mean '{s}'?)"),
+                None => format!("unknown config key '{field}'"),
+            }))
+        }
     }
+    Ok(())
 }
 
 /// A store element's present properties as a sorted `Value::Map` — the shape a
@@ -9824,7 +9847,7 @@ fn run_linear_from(
                     let env = Env::new(graph, ctx!(), &scratch);
                     let mut cfg = crate::algo::AlgoConfig::default();
                     for (field, expr) in config {
-                        apply_algo_config(&mut cfg, field, &eval(&env, expr));
+                        apply_algo_config(&mut cfg, field, &eval(&env, expr))?;
                     }
                     cfg
                 };
