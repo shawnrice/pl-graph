@@ -10,6 +10,7 @@ import type { Graph, Vertex } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
 import type { AddEEndpoint, Plan } from '../ast.js';
+import { isPlan } from '../steps/framework.js';
 import { applyPlanToStream, applyStep } from './dispatch.js';
 import {
   extend,
@@ -144,17 +145,38 @@ export const propertyStep = function* (
   stream: Iterable<Traverser<unknown>>,
   key: string,
   value: unknown,
+  graph: Graph,
+  ctx: RunContext,
 ): Iterable<Traverser<unknown>> {
+  const asPlan = isPlan(value) ? value : undefined;
+
   for (const t of stream) {
-    const v = t.value;
+    const el = t.value;
 
-    if (isVertex(v) || isEdge(v)) {
-      v.setProperty(key, value);
-
-      yield t;
+    // `property` only makes sense on a vertex/edge — non-elements are dropped.
+    if (!isVertex(el) && !isEdge(el)) {
+      continue;
     }
-    // Non-element traversers are silently dropped — `property` only makes
-    // sense on a vertex/edge.
+
+    let v = value;
+
+    if (asPlan) {
+      // A traversal value re-evaluates per element, rooted at the CURRENT
+      // traverser (preserving tags, so it can `select(...)` an outer label —
+      // matching native `sub_vals(&t)`). Its first output is the value; no
+      // output leaves the property unset and drops the traverser.
+      const first = applyPlanToStream(asPlan, [t], graph, ctx)[Symbol.iterator]().next();
+
+      if (first.done) {
+        continue;
+      }
+
+      v = first.value.value;
+    }
+
+    el.setProperty(key, v);
+
+    yield t;
   }
 };
 

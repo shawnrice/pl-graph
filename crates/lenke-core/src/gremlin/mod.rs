@@ -291,6 +291,17 @@ pub enum Endpoint {
     Plan(Box<Traversal>),
 }
 
+/// The value written by `property(key, …)`: either a literal, or a
+/// traversal-induced value (`property('deg', __.outE().count())`) evaluated
+/// against the current element per traverser (standard TinkerPop). The subplan
+/// runs rooted at the current traverser; its first output is the value written,
+/// and no output leaves the property unset.
+#[derive(Clone, Debug)]
+pub enum PropVal {
+    Lit(GVal),
+    Trav(Box<Traversal>),
+}
+
 /// One traversal step (plain data — serializable, reorderable).
 #[derive(Clone, Debug)]
 pub enum Step {
@@ -450,7 +461,7 @@ pub enum Step {
         from: Endpoint,
         to: Endpoint,
     },
-    Property(String, GVal),
+    Property(String, PropVal),
     Drop,
 }
 
@@ -1079,7 +1090,10 @@ impl Traversal {
         self
     }
     pub fn property(self, key: &str, v: impl Into<GVal>) -> Self {
-        self.push(Step::Property(key.to_string(), v.into()))
+        self.push(Step::Property(key.to_string(), PropVal::Lit(v.into())))
+    }
+    pub fn property_trav(self, key: &str, t: Self) -> Self {
+        self.push(Step::Property(key.to_string(), PropVal::Trav(Box::new(t))))
     }
     pub fn drop(self) -> Self {
         self.push(Step::Drop)

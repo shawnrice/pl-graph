@@ -19,6 +19,7 @@
 import { isTemporal, temporalLiteralParts } from '@lenke/core';
 
 import type { By, Plan, Predicate, Step } from './ast.js';
+import { isPlan } from './steps/framework.js';
 
 //
 // The reason a case can't be dual-authored by hand: this derives the Groovy
@@ -318,6 +319,13 @@ const emitStep = (step: Step): string => {
       return `dedup(${(step.labels ?? []).map(emitLiteral).join(', ')})`;
     case 'constant':
       return `constant(${emitLiteral(step.value)})`;
+    case 'property': {
+      // A traversal-induced value emits as an anonymous sub-traversal; a literal
+      // as a Groovy literal. (cardinality is TS-superset — not emitted.)
+      const val = isPlan(step.value) ? emitSubPlan(step.value) : emitLiteral(step.value);
+
+      return `property(${emitLiteral(step.key)}, ${val})`;
+    }
     // The TS-superset kinds: no native form. Classified tsOnly.
     case 'mapFn':
     case 'flatMapFn':

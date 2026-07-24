@@ -66,6 +66,7 @@ import {
   peerPressure,
   type Plan,
   project,
+  property,
   regex,
   sum,
   toArray,
@@ -683,4 +684,85 @@ suite('gremlin conformance: bitemporal as-of across the bridge', () => {
       backend!.graphFree(handle);
     }
   });
+});
+
+// property(key, <traversal>) — "traversal-induced values" (standard TinkerPop).
+// The child traversal is evaluated per element, rooted at the current traverser;
+// its first output is written. Both engines must agree. Motivated by GraphMind's
+// message-passing write path (`property('deg', __.outE().count())`).
+suite('gremlin conformance: property(key, traversal) — traversal-induced values', () => {
+  const NDJSON = [
+    { type: 'node', id: 'marko', labels: ['P'], properties: { id: 'marko' } },
+    { type: 'node', id: 'a', labels: ['P'], properties: { id: 'a' } },
+    { type: 'node', id: 'b', labels: ['P'], properties: { id: 'b' } },
+    { type: 'edge', id: 'e1', from: 'marko', to: 'a', labels: ['KNOWS'], properties: {} },
+    { type: 'edge', id: 'e2', from: 'marko', to: 'b', labels: ['KNOWS'], properties: {} },
+  ]
+    .map((r) => JSON.stringify(r))
+    .join('\n');
+
+  const build = (): Graph => {
+    const g = new Graph();
+
+    for (const line of NDJSON.split('\n')) {
+      const r = JSON.parse(line) as {
+        type: string;
+        id: string;
+        labels: string[];
+        properties: Record<string, unknown>;
+        from?: string;
+        to?: string;
+      };
+
+      if (r.type === 'node') {
+        g.addVertex({ id: r.id, labels: r.labels, properties: r.properties });
+      } else {
+        g.addEdge({
+          id: r.id,
+          from: g.getVertexById(r.from!)!,
+          to: g.getVertexById(r.to!)!,
+          labels: r.labels,
+          properties: r.properties,
+        });
+      }
+    }
+
+    return g;
+  };
+
+  const cases: { name: string; plan: Plan; expected: unknown[] }[] = [
+    {
+      name: "property('flag', constant(1.0)) writes to every element",
+      plan: traversal(V(), hasLabel('P'), property('flag', constant(1.0)), values('flag')),
+      expected: [1, 1, 1],
+    },
+    {
+      name: "property('deg', outE().count()) — traversal-induced out-degree",
+      plan: traversal(
+        V(),
+        has('id', eq('marko')),
+        property('deg', traversal(outE(), count())),
+        values('deg'),
+      ),
+      expected: [2],
+    },
+  ];
+
+  for (const c of cases) {
+    test(c.name, () => {
+      const groovy = planToGremlin(c.plan);
+      const handle = backend!.graphFromNdjson(new TextEncoder().encode(NDJSON), false);
+
+      try {
+        const native = JSON.parse(
+          decoder.decode(backend!.gremlinJson(handle, groovy)),
+        ) as unknown[];
+
+        expect(toArray(c.plan, build()).map(canonJson)).toEqual(c.expected);
+        expect(native).toEqual(c.expected);
+      } finally {
+        backend!.graphFree(handle);
+      }
+    });
+  }
 });

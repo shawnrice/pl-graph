@@ -602,7 +602,7 @@ export const applyStep = (
       return addEStep(stream, graph, step, ctx);
 
     case 'property':
-      return propertyStep(stream, step.key, step.value);
+      return propertyStep(stream, step.key, step.value, graph, ctx);
 
     case 'drop':
       return dropStep(stream, graph);

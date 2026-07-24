@@ -5,6 +5,7 @@ import {
   buildPlan,
   CARDINALITY_TO_KIND,
   type CardinalitySym,
+  isSubPlan,
   type Plan,
   type StepFn,
   type SubPlan,
@@ -82,6 +83,11 @@ export const addE = (label: string): AddEBuilder => {
  *
  * @see https://tinkerpop.apache.org/docs/current/reference/#addproperty-step
  */
+// A traversal value (`property('deg', __.outE().count())`, standard TinkerPop
+// "traversal-induced value") is normalized to a Plan; the executor evaluates it
+// per element. A plain literal passes through unchanged.
+const normPropValue = (v: unknown): unknown => (isSubPlan(v) ? buildPlan(v) : v);
+
 export function property(key: string, value: unknown): StepFn;
 export function property(cardinality: CardinalitySym, key: string, value: unknown): StepFn;
 export function property(...args: [string, unknown] | [CardinalitySym, string, unknown]): StepFn {
@@ -94,10 +100,15 @@ export function property(...args: [string, unknown] | [CardinalitySym, string, u
       });
     }
 
-    return appendStep({ kind: 'property', key: args[1] as string, value: args[2], cardinality });
+    return appendStep({
+      kind: 'property',
+      key: args[1] as string,
+      value: normPropValue(args[2]),
+      cardinality,
+    });
   }
 
-  return appendStep({ kind: 'property', key: args[0], value: args[1] });
+  return appendStep({ kind: 'property', key: args[0], value: normPropValue(args[1]) });
 }
 
 /**

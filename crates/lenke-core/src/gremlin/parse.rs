@@ -861,8 +861,13 @@ impl Parser {
             },
             "property" => {
                 let k = args.first().ok_or("property: expected a key")?.as_str()?;
-                let v = args.get(1).ok_or("property: expected a value")?.as_gval()?;
-                t.property(k, v)
+                let arg = args.get(1).ok_or("property: expected a value")?;
+                // A traversal value is standard TinkerPop (`property('deg',
+                // __.outE().count())`) — evaluated per element, not a literal.
+                match arg {
+                    Arg::Trav(sub) => t.property_trav(k, sub.clone()),
+                    _ => t.property(k, arg.as_gval()?),
+                }
             }
             "drop" => t.drop(),
             _ => return Err(format!("unknown step `{name}`")),

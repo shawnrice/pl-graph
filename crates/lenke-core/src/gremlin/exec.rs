@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::{By, Column, Endpoint, GVal, Order, Pop, Scope, Step, Token, Traversal, P};
+use super::{By, Column, Endpoint, GVal, Order, Pop, PropVal, Scope, Step, Token, Traversal, P};
 use crate::graph::{Graph, IdxKey, RangeBound, Value};
 use crate::jsonfmt::{push_json_str, push_num};
 
@@ -2304,22 +2304,37 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             ));
             Vec::new()
         }
-        Step::Property(key, v) => stream
-            .into_iter()
-            .filter(|t| match t.val {
-                GVal::Vertex(i) => {
-                    graph.set_vertex_prop(i, key, gval_to_value(v));
-                    true
+        Step::Property(key, v) => {
+            let mut next = Vec::with_capacity(stream.len());
+            for t in stream {
+                // A traversal value is re-evaluated per element, rooted at the
+                // current traverser (so it can `select(...)` an outer label); its
+                // first output is the value, no output leaves the property unset.
+                let val = match v {
+                    PropVal::Lit(g) => Some(g.clone()),
+                    PropVal::Trav(plan) => sub_vals(graph, ctx, plan, &t).into_iter().next(),
+                };
+                let target = match &t.val {
+                    GVal::Vertex(i) => Some((true, *i)),
+                    GVal::Edge(e) => Some((false, *e)),
+                    _ => None,
+                };
+                match (target, val) {
+                    (Some((true, i)), Some(g)) => {
+                        graph.set_vertex_prop(i, key, gval_to_value(&g));
+                        next.push(t);
+                    }
+                    (Some((false, e)), Some(g)) => {
+                        graph.set_edge_prop(e, key, gval_to_value(&g));
+                        next.push(t);
+                    }
+                    // property() on a non-element (or a traversal that produced no
+                    // value) drops the traverser (matches TS), not pass-through.
+                    _ => {}
                 }
-                GVal::Edge(e) => {
-                    graph.set_edge_prop(e, key, gval_to_value(v));
-                    true
-                }
-                // property() on a non-element drops the traverser (matches TS),
-                // rather than passing it through unchanged.
-                _ => false,
-            })
-            .collect(),
+            }
+            next
+        }
         Step::Drop => {
             for t in &stream {
                 match &t.val {
