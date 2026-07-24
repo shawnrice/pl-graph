@@ -4612,6 +4612,21 @@ const PROCEDURES: Record<string, { algo: AlgorithmName; resultColumn: string }> 
 const procedureSpec = (name: string): { algo: AlgorithmName; resultColumn: string } | null =>
   PROCEDURES[name] ?? null;
 
+/**
+ * For an unknown procedure name, the canonical snake_case name it most likely
+ * meant — matched by ignoring case and `_` separators, so a camelCase spelling
+ * (`pageRank`, `connectedComponents`) resolves to its surface name. `null` when
+ * nothing plausibly matches. Mirrors the native `suggest_procedure` so both
+ * engines' "did you mean" faults read identically.
+ */
+const normProcName = (s: string): string => s.replaceAll('_', '').toLowerCase();
+
+const suggestProcedure = (name: string): string | null => {
+  const target = normProcName(name);
+
+  return Object.keys(PROCEDURES).find((n) => normProcName(n) === target) ?? null;
+};
+
 /** Set one algorithm-config field from a CALL config-map entry (keys = the
  * algorithm's JSON config fields; unknown keys are ignored). */
 const applyAlgoConfig = (cfg: AlgorithmConfig, key: string, v: unknown): void => {
@@ -4647,9 +4662,12 @@ const runCall = (
   params: Params,
 ): Iterable<Binding> => {
   if (!clause.algo) {
-    throw new LenkeError(`unknown procedure: ${clause.procName}`, {
-      code: ErrorCode.Unsupported,
-    });
+    const suggestion = suggestProcedure(clause.procName);
+    const msg = suggestion
+      ? `unknown procedure: ${clause.procName} (did you mean '${suggestion}'?)`
+      : `unknown procedure: ${clause.procName}`;
+
+    throw new LenkeError(msg, { code: ErrorCode.Unsupported });
   }
 
   const config: AlgorithmConfig = {};

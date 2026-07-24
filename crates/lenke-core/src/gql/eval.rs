@@ -9806,10 +9806,11 @@ fn run_linear_from(
                     pending.clear();
                 }
                 let Some(dispatch) = algo else {
-                    return Err(CodeError::new(
-                        ErrorCode::Unsupported,
-                        format!("unknown procedure: {proc_name}"),
-                    ));
+                    let msg = match crate::gql::plan::suggest_procedure(proc_name) {
+                        Some(s) => format!("unknown procedure: {proc_name} (did you mean '{s}'?)"),
+                        None => format!("unknown procedure: {proc_name}"),
+                    };
+                    return Err(CodeError::new(ErrorCode::Unsupported, msg));
                 };
                 // Build the algorithm config from the (constant) config exprs.
                 let cfg = {

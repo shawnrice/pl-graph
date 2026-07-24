@@ -2056,6 +2056,39 @@ fn unknown_function_errors_instead_of_silent_null() {
 }
 
 #[test]
+fn camelcase_procedure_name_suggests_the_snake_case_one() {
+    // The GQL `CALL` catalog is snake_case; a camelCase spelling of a real
+    // algorithm (the JS/Gremlin surface name) faults E_UNSUPPORTED with a "did
+    // you mean" hint pointing at the canonical name. The TS engine emits the
+    // same message byte-for-byte. An unrelated name gets no suggestion.
+    let mut g = modern();
+    let err = parse("CALL connectedComponents({}) YIELD node RETURN node")
+        .unwrap()
+        .execute(&mut g, &Params::new())
+        .unwrap_err();
+    assert_eq!(err.code, crate::error_codes::ErrorCode::Unsupported);
+    assert_eq!(
+        err.message,
+        "unknown procedure: connectedComponents (did you mean 'connected_components'?)"
+    );
+
+    let err = parse("CALL pageRank({}) YIELD node RETURN node")
+        .unwrap()
+        .execute(&mut g, &Params::new())
+        .unwrap_err();
+    assert_eq!(
+        err.message,
+        "unknown procedure: pageRank (did you mean 'pagerank'?)"
+    );
+
+    let err = parse("CALL totallyBogus({}) YIELD node RETURN node")
+        .unwrap()
+        .execute(&mut g, &Params::new())
+        .unwrap_err();
+    assert_eq!(err.message, "unknown procedure: totallyBogus");
+}
+
+#[test]
 fn unknown_function_errors_even_over_empty_input_and_dead_branches() {
     // The fault is raised EAGERLY off the plan's `unknown_fns`, before the first
     // row — so an unknown function faults identically whether the result set is

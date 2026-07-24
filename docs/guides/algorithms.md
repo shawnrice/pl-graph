@@ -85,6 +85,8 @@ const top = query(
 
 `YIELD` names the columns the procedure produces (`node`, `score` for PageRank; `node`, `componentId` for components; and so on), and everything after it is normal GQL — `WHERE`, `ORDER BY`, `RETURN`, joins against other patterns.
 
+> **Procedure names are `snake_case` in `CALL`.** The GQL catalog spells the algorithms `pagerank`, `personalized_pagerank`, `connected_components`, `strongly_connected_components`, `on_cycle`, `label_propagation`, `peer_pressure`, `degree`, `betweenness`, `closeness`, `shortest_path` — the `snake_case` form, **not** the camelCase of the JS free functions / `RustGraph` methods / Gremlin steps in the table above. A camelCase spelling faults with a hint: `CALL connectedComponents(...)` → `E_UNSUPPORTED: unknown procedure: connectedComponents (did you mean 'connected_components'?)` (both engines, byte-identical).
+
 > **`node` is the whole vertex element, not just an id.** The yielded `node` binds a full graph element, so you can read its properties (`node.name`) and — crucially — **join it back into the graph** in the same query. This makes a two-line "rank, then expand its neighbourhood" query trivial:
 >
 > ```ts

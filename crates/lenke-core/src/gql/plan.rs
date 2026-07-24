@@ -728,6 +728,38 @@ pub fn procedure_spec(name: &str) -> Option<(&'static str, &'static str)> {
     })
 }
 
+/// The canonical (snake_case) names of the built-in procedures — the surface a
+/// `CALL` accepts. Kept in sync with [`procedure_spec`].
+pub const PROCEDURE_NAMES: &[&str] = &[
+    "pagerank",
+    "personalized_pagerank",
+    "connected_components",
+    "strongly_connected_components",
+    "on_cycle",
+    "label_propagation",
+    "peer_pressure",
+    "degree",
+    "betweenness",
+    "closeness",
+    "shortest_path",
+];
+
+/// For an unknown procedure name, the canonical snake_case name it most likely
+/// meant — matched by ignoring case and `_` separators, so a camelCase spelling
+/// (`pageRank`, `connectedComponents`) resolves to its surface name. `None` when
+/// nothing plausibly matches. Drives the `CALL` "did you mean" hint; the TS
+/// engine mirrors this so both faults read identically.
+pub fn suggest_procedure(name: &str) -> Option<&'static str> {
+    let norm = |s: &str| -> String {
+        s.chars()
+            .filter(|c| *c != '_')
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let target = norm(name);
+    PROCEDURE_NAMES.iter().copied().find(|n| norm(n) == target)
+}
+
 /// Compiled `_MERGE` (see [`crate::gql::ast::MergeClause`]).
 #[derive(Debug, Clone)]
 pub struct CMerge {

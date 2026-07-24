@@ -58,6 +58,31 @@ describe('named procedure CALL', () => {
   test('unknown procedure faults', () => {
     expect(() => query(modern(), 'CALL bogus() YIELD x RETURN x')).toThrow();
   });
+
+  test('a camelCase procedure name suggests the snake_case one (native parity)', () => {
+    // The GQL `CALL` catalog is snake_case; a camelCase spelling of a real
+    // algorithm faults E_UNSUPPORTED with a "did you mean" hint. Messages are
+    // asserted verbatim — the native engine emits the same bytes.
+    const grab = (q: string): string => {
+      try {
+        query(modern(), q);
+      } catch (e) {
+        return (e as Error).message;
+      }
+
+      throw new Error('expected a fault');
+    };
+
+    expect(grab('CALL connectedComponents({}) YIELD node RETURN node')).toBe(
+      "unknown procedure: connectedComponents (did you mean 'connected_components'?)",
+    );
+    expect(grab('CALL pageRank({}) YIELD node RETURN node')).toBe(
+      "unknown procedure: pageRank (did you mean 'pagerank'?)",
+    );
+    expect(grab('CALL totallyBogus({}) YIELD node RETURN node')).toBe(
+      'unknown procedure: totallyBogus',
+    );
+  });
 });
 
 describe('inline subquery CALL', () => {
