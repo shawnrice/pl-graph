@@ -153,6 +153,7 @@ enum Arg {
     Pop(Pop),
     Token(Token),
     Column(Column),
+    SackOp(super::SackOp),
 }
 
 impl Arg {
@@ -441,6 +442,11 @@ impl Parser {
             ("Pop", "first") => Arg::Pop(Pop::First),
             ("Pop", "last") => Arg::Pop(Pop::Last),
             ("Pop", "all") => Arg::Pop(Pop::All),
+            ("Operator", "assign") => Arg::SackOp(super::SackOp::Assign),
+            ("Operator", "sum") => Arg::SackOp(super::SackOp::Sum),
+            ("Operator", "mult") => Arg::SackOp(super::SackOp::Mult),
+            ("Operator", "min") => Arg::SackOp(super::SackOp::Min),
+            ("Operator", "max") => Arg::SackOp(super::SackOp::Max),
             ("Scope", _) => Arg::Str(format!("Scope.{member}")), // consumed by scope-aware steps
             ("ShortestPath", _) => Arg::Str(format!("ShortestPath.{member}")), // consumed by with()
             ("PageRank", _) => Arg::Str(format!("PageRank.{member}")), // consumed by with()
@@ -870,6 +876,20 @@ impl Parser {
                 }
             }
             "drop" => t.drop(),
+            "withSack" => {
+                let v = args
+                    .first()
+                    .ok_or("withSack: expected an initial value")?
+                    .as_gval()?;
+                t.with_sack(v)
+            }
+            "sack" => match args.first() {
+                None => t.sack(),
+                Some(Arg::SackOp(op)) => t.sack_op(*op),
+                Some(_) => {
+                    return Err("sack: expected an operator (sum/mult/min/max/assign)".into())
+                }
+            },
             _ => return Err(format!("unknown step `{name}`")),
         })
     }
@@ -954,6 +974,12 @@ fn bare_token(id: &str) -> Option<Arg> {
         // Static-import Column selectors for `order(local).by(values|keys, …)`.
         "keys" => Arg::Column(Column::Keys),
         "values" => Arg::Column(Column::Values),
+        // Static-import `sack(sum)` / `sack(assign)` merge operators.
+        "assign" => Arg::SackOp(super::SackOp::Assign),
+        "sum" => Arg::SackOp(super::SackOp::Sum),
+        "mult" => Arg::SackOp(super::SackOp::Mult),
+        "min" => Arg::SackOp(super::SackOp::Min),
+        "max" => Arg::SackOp(super::SackOp::Max),
         "local" => Arg::Str("Scope.local".to_string()),
         "global" => Arg::Str("Scope.global".to_string()),
         "first" => Arg::Pop(Pop::First),

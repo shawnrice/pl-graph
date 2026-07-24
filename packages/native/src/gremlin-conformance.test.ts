@@ -63,15 +63,18 @@ import {
   out,
   PageRank,
   pageRank,
+  Operator,
   peerPressure,
   type Plan,
   project,
   property,
+  sack,
   regex,
   sum,
   toArray,
   traversal,
   values,
+  withSack,
 } from '@lenke/gremlin';
 
 import { createFfiBackend } from './backend-ffi.js';
@@ -520,6 +523,40 @@ const CORPUS: Case[] = [
     name: "V().has('name', eq('marko')).as('x').select('x').values('name')",
     plan: traversal(V(), has('name', eq('marko')), as_('x'), select('x'), values('name')),
     verdict: { kind: 'agree', expected: ['marko'] },
+  },
+  // sack — per-traverser state (withSack + sack + sack(op).by()). PERSON ages in
+  // insertion order are [29,27,32,35] (the `math('_ * 2')` case pins that order).
+  {
+    name: "withSack(2).V().hasLabel('PERSON').sack(mult).by('age').sack()",
+    plan: traversal(withSack(2), V(), hasLabel('PERSON'), sack(Operator.mult).by('age'), sack()),
+    verdict: { kind: 'agree', expected: [58, 54, 64, 70] },
+  },
+  {
+    name: "withSack(100).V().has('name', eq('marko')).sack(sum).by('age').sack()",
+    plan: traversal(
+      withSack(100),
+      V(),
+      has('name', eq('marko')),
+      sack(Operator.sum).by('age'),
+      sack(),
+    ),
+    verdict: { kind: 'agree', expected: [129] },
+  },
+  {
+    name: "withSack(7).V().has('name', eq('marko')).sack()  [reads the default]",
+    plan: traversal(withSack(7), V(), has('name', eq('marko')), sack()),
+    verdict: { kind: 'agree', expected: [7] },
+  },
+  {
+    name: "withSack(0).V().has('name', eq('marko')).sack(assign).by('age').sack()",
+    plan: traversal(
+      withSack(0),
+      V(),
+      has('name', eq('marko')),
+      sack(Operator.assign).by('age'),
+      sack(),
+    ),
+    verdict: { kind: 'agree', expected: [29] },
   },
   // `select(key)` on a Map traverser (a `project()` row) projects the entry — so
   // `project(...).order().by(select('age'),desc).select('name')` sorts the rows

@@ -70,6 +70,9 @@ export type Predicate =
 // A single `by()` call produces one of these. `direction` is meaningful only
 // for `order()` (Gremlin's `by(asc)` / `by(key, desc)` / etc.); other steps
 // ignore it. We attach it to every variant so the AST stays a single union.
+// A `sack(op)` merge operator: `newSack = op(currentSack, projectedValue)`.
+export type SackOp = 'assign' | 'sum' | 'mult' | 'min' | 'max';
+
 export type By =
   | { kind: 'identity'; direction?: 'asc' | 'desc' }
   | { kind: 'key'; key: string; direction?: 'asc' | 'desc' }
@@ -418,7 +421,12 @@ export type Step =
   // `drop()` removes the current vertex/edge from the graph and emits nothing
   // for that traverser. Dropping a vertex cascades through any edges
   // attached to it (per `Graph.removeVertex`).
-  | { kind: 'drop' };
+  | { kind: 'drop' }
+  // `withSack(init)` enables the per-traverser sack (default `init`).
+  | { kind: 'withSack'; init: unknown }
+  // `sack()` emits the current sack; `sack(op).by(proj)` merges the projected
+  // value into the sack via `op` and passes the traverser through.
+  | { kind: 'sack'; op?: SackOp; bys?: readonly By[] };
 
 /**
  * Endpoint specification for `addE(...).from(X)` / `.to(X)`.

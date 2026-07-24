@@ -88,6 +88,7 @@ import {
   tupleKey,
   evalBy,
 } from './runtime.js';
+import { sackStep, withSackStep } from './sack.js';
 import { shortestPathStep } from './shortest-path.js';
 import { aggregateStep, barrierStep, capStep, subgraphStep } from './side-effects.js';
 import {
@@ -603,6 +604,12 @@ export const applyStep = (
 
     case 'property':
       return propertyStep(stream, step.key, step.value, graph, ctx);
+
+    case 'withSack':
+      return withSackStep(stream, step.init, ctx);
+
+    case 'sack':
+      return sackStep(stream, step.op, step.bys, graph, ctx);
 
     case 'drop':
       return dropStep(stream, graph);

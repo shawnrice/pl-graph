@@ -9,7 +9,9 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::{By, Column, Endpoint, GVal, Order, Pop, PropVal, Scope, Step, Token, Traversal, P};
+use super::{
+    By, Column, Endpoint, GVal, Order, Pop, PropVal, SackOp, Scope, Step, Token, Traversal, P,
+};
 use crate::graph::{Graph, IdxKey, RangeBound, Value};
 use crate::jsonfmt::{push_json_str, push_num};
 
@@ -94,6 +96,12 @@ struct Trav {
     path: Vec<GVal>,
     tags: Vec<(String, Vec<GVal>)>,
     loops: usize,
+    /// The per-traverser sack (TinkerPop `sack()`). LAZY: `None` until a
+    /// `sack(op)` write allocates it; a read before that returns the `withSack`
+    /// default (held on `Ctx`) without storing. Boxed so an unused sack costs one
+    /// pointer, not an inline `GVal`, and never touches the heap. Split-on-branch
+    /// is the plain clone `step`/`with` already do.
+    sack: Option<Box<GVal>>,
 }
 
 impl Trav {
@@ -103,9 +111,10 @@ impl Trav {
             val,
             tags: Vec::new(),
             loops: 0,
+            sack: None,
         }
     }
-    /// A successor that moved to `val` (extends path, keeps tags/loops).
+    /// A successor that moved to `val` (extends path, keeps tags/loops/sack).
     fn step(&self, val: GVal) -> Self {
         let mut path = self.path.clone();
         path.push(val.clone());
@@ -114,6 +123,7 @@ impl Trav {
             path,
             tags: self.tags.clone(),
             loops: self.loops,
+            sack: self.sack.clone(),
         }
     }
     /// Same traverser with a replaced value, keeping the existing path tail.
@@ -125,6 +135,7 @@ impl Trav {
             path,
             tags: self.tags.clone(),
             loops: self.loops,
+            sack: self.sack.clone(),
         }
     }
     fn recall(&self, label: &str, pop: Pop) -> Option<GVal> {
@@ -173,6 +184,10 @@ struct Ctx {
     /// First mutation/data fault recorded during the run (e.g. `addE()` with an
     /// unresolvable endpoint). Surfaced by [`try_run`]; ignored by [`run`].
     fault: Option<(crate::error_codes::ErrorCode, &'static str)>,
+    /// The `withSack(init)` default, set once by the leading `withSack` step.
+    /// `None` = no sack configured, so `sack()` faults and NO per-traverser sack
+    /// is ever created — the laziness guarantee.
+    sack_init: Option<GVal>,
 }
 
 /// Run a traversal against `graph`, returning the final traversers' values.
@@ -566,6 +581,7 @@ fn apply_pattern(graph: &mut Graph, ctx: &mut Ctx, p: &MatchPattern, t: &Trav) -
         path: t.path.clone(),
         tags: t.tags.clone(),
         loops: t.loops,
+        sack: t.sack.clone(),
     };
     let outs = sub_vals(graph, ctx, &p.inner, &seed);
     let bound_end = p.end_key.as_ref().and_then(|k| t.recall(k, Pop::Last));
@@ -2359,6 +2375,85 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             }
             Vec::new()
         }
+        // `withSack(init)` just records the default; no sack is created until a
+        // read/write actually touches one (laziness).
+        Step::WithSack(init) => {
+            ctx.sack_init = Some(init.clone());
+            stream
+        }
+        Step::Sack { op, bys } => {
+            let Some(default) = ctx.sack_init.clone() else {
+                ctx.fault.get_or_insert((
+                    crate::error_codes::ErrorCode::InvalidGraphOp,
+                    "sack() requires a preceding withSack()",
+                ));
+                return Vec::new();
+            };
+            match op {
+                // `sack()` — emit the current sack as the traverser's value (the
+                // default when this traverser hasn't written one yet).
+                None => stream
+                    .into_iter()
+                    .map(|t| {
+                        let v = t.sack.as_deref().cloned().unwrap_or_else(|| default.clone());
+                        t.with(v)
+                    })
+                    .collect(),
+                // `sack(op).by(proj)` — merge the projected value into the sack and
+                // pass the traverser through (its value is unchanged).
+                Some(op) => {
+                    let by = bys.first().cloned();
+                    let mut next = Vec::with_capacity(stream.len());
+                    for mut t in stream {
+                        let projected = match &by {
+                            Some(b) => eval_by(graph, ctx, b, &t.val),
+                            None => t.val.clone(),
+                        };
+                        let current =
+                            t.sack.as_deref().cloned().unwrap_or_else(|| default.clone());
+                        t.sack = Some(Box::new(apply_sack_op(*op, &current, &projected)));
+                        next.push(t);
+                    }
+                    next
+                }
+            }
+        }
+    }
+}
+
+/// Merge a projected value into the sack: `newSack = op(currentSack, projected)`.
+/// `Assign` replaces; the folds require both operands numeric (else `Null`, as the
+/// TS engine yields) and use raw `<=`/`>=` for min/max so NaN resolves identically
+/// on both engines (NaN comparisons are false in Rust and JS alike).
+fn apply_sack_op(op: SackOp, current: &GVal, projected: &GVal) -> GVal {
+    let num = |v: &GVal| match v {
+        GVal::Num(n) => Some(*n),
+        _ => None,
+    };
+    match op {
+        SackOp::Assign => projected.clone(),
+        _ => match (num(current), num(projected)) {
+            (Some(a), Some(b)) => GVal::Num(match op {
+                SackOp::Sum => a + b,
+                SackOp::Mult => a * b,
+                SackOp::Min => {
+                    if a <= b {
+                        a
+                    } else {
+                        b
+                    }
+                }
+                SackOp::Max => {
+                    if a >= b {
+                        a
+                    } else {
+                        b
+                    }
+                }
+                SackOp::Assign => unreachable!(),
+            }),
+            _ => GVal::Null,
+        },
     }
 }
 

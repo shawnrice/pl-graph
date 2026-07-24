@@ -1072,6 +1072,36 @@ fn qs(query: &str) -> Vec<GVal> {
     t.run(&mut g)
 }
 
+#[test]
+fn sack_folds_and_reads_the_default() {
+    // withSack(init) + sack(op).by(proj) merges into the sack; sack() reads it.
+    // marko's age is 29.
+    assert_eq!(
+        qs("g.withSack(100).V().has('name','marko').sack(sum).by('age').sack()"),
+        vec![GVal::Num(129.0)]
+    );
+    assert_eq!(
+        qs("g.withSack(0).V().has('name','marko').sack(assign).by('age').sack()"),
+        vec![GVal::Num(29.0)]
+    );
+    // A read before any write returns the withSack default (no sack stored).
+    assert_eq!(
+        qs("g.withSack(7).V().has('name','marko').sack()"),
+        vec![GVal::Num(7.0)]
+    );
+}
+
+#[test]
+fn sack_without_with_sack_faults() {
+    // sack() with no preceding withSack() is a usage error, not a silent empty.
+    let mut g = modern();
+    let t = super::parse("g.V().sack()").unwrap();
+    assert_eq!(
+        super::try_run(&mut g, &t).unwrap_err().code,
+        crate::error_codes::ErrorCode::InvalidGraphOp
+    );
+}
+
 /// The text dialect can express and compare temporal literals — `date(...)`,
 /// `datetime(...)`, `duration(...)` — so an as-of predicate is writable.
 ///

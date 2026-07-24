@@ -291,6 +291,19 @@ pub enum Endpoint {
     Plan(Box<Traversal>),
 }
 
+/// A `sack(<op>)` merge operator: `newSack = op(currentSack, projectedValue)`.
+/// `Assign` replaces the sack with the projected value; the rest fold numerically.
+/// Split-on-branch is a plain value clone (TinkerPop's default); custom
+/// split/merge closures and OLAP merge are out of scope (this engine is OLTP).
+#[derive(Clone, Copy, Debug)]
+pub enum SackOp {
+    Assign,
+    Sum,
+    Mult,
+    Min,
+    Max,
+}
+
 /// The value written by `property(key, …)`: either a literal, or a
 /// traversal-induced value (`property('deg', __.outE().count())`) evaluated
 /// against the current element per traverser (standard TinkerPop). The subplan
@@ -463,6 +476,15 @@ pub enum Step {
     },
     Property(String, PropVal),
     Drop,
+    /// `withSack(init)` — enable the per-traverser sack, default `init`. Lazy:
+    /// with no `withSack` in the traversal no sack machinery runs at all.
+    WithSack(GVal),
+    /// `sack()` emits the current sack; `sack(op).by(proj)` merges the projected
+    /// value into the sack via `op` and passes the traverser through unchanged.
+    Sack {
+        op: Option<SackOp>,
+        bys: Vec<By>,
+    },
 }
 
 fn strs(labels: &[&str]) -> Vec<String> {
@@ -503,7 +525,8 @@ impl Traversal {
             | Step::Project(_, bys)
             | Step::WhereKey(_, _, bys)
             | Step::Math { bys, .. }
-            | Step::Select { bys, .. },
+            | Step::Select { bys, .. }
+            | Step::Sack { bys, .. },
         ) = self.steps.last_mut()
         {
             bys.push(by);
@@ -1094,6 +1117,21 @@ impl Traversal {
     }
     pub fn property_trav(self, key: &str, t: Self) -> Self {
         self.push(Step::Property(key.to_string(), PropVal::Trav(Box::new(t))))
+    }
+    pub fn with_sack(self, init: impl Into<GVal>) -> Self {
+        self.push(Step::WithSack(init.into()))
+    }
+    pub fn sack(self) -> Self {
+        self.push(Step::Sack {
+            op: None,
+            bys: Vec::new(),
+        })
+    }
+    pub fn sack_op(self, op: SackOp) -> Self {
+        self.push(Step::Sack {
+            op: Some(op),
+            bys: Vec::new(),
+        })
     }
     pub fn drop(self) -> Self {
         self.push(Step::Drop)

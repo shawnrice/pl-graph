@@ -37,6 +37,13 @@ export type Traverser<T> = {
    * to read. The default `select('a')` returns the last tagged value.
    */
   readonly tags: ReadonlyMap<string, readonly unknown[]>;
+  /**
+   * The per-traverser sack (TinkerPop `sack()`). LAZY: `undefined` until a
+   * `sack(op)` write sets it; a read before that returns the `withSack` default
+   * (on {@link RunContext}) without storing. With no `withSack`, no sack ever
+   * exists on any traverser.
+   */
+  readonly sack?: unknown;
 };
 
 export const emptyTags: ReadonlyMap<string, readonly unknown[]> = new Map();
@@ -150,6 +157,9 @@ export const extend = <T>(prev: Traverser<unknown>, value: T): Traverser<T> => (
   path: prev.path === NO_PATH ? NO_PATH : [...prev.path, value],
   loopCount: prev.loopCount,
   tags: prev.tags,
+  // Propagate the sack (split-on-branch = clone). Only defined once a sack write
+  // has run, so the common no-sack path carries `undefined` (no cost).
+  ...(prev.sack === undefined ? {} : { sack: prev.sack }),
 });
 
 export const incLoops = <T>(t: Traverser<T>): Traverser<T> => ({
@@ -195,6 +205,12 @@ export type RunContext = {
    * (e.g. sub-plan evaluation) is always correct, just unoptimized.
    */
   readonly tracksPath: boolean;
+  /**
+   * The `withSack(init)` default, boxed so `undefined` means "no sack
+   * configured" — then `sack()` faults and no per-traverser sack is created.
+   * Mutable: set once by the leading `withSack` step. This is the laziness gate.
+   */
+  sackInit?: { readonly value: unknown };
 };
 
 export const newContext = (tracksPath = true): RunContext => ({

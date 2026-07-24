@@ -326,6 +326,15 @@ const emitStep = (step: Step): string => {
 
       return `property(${emitLiteral(step.key)}, ${val})`;
     }
+    case 'withSack':
+      return `withSack(${emitLiteral(step.init)})`;
+    case 'sack': {
+      // The operator emits static-import style (`sack(sum)`), which the native
+      // `bare_token` parser accepts; the `.by(...)` projection follows.
+      const bys = (step.bys ?? []).map(emitBy).join('');
+
+      return `sack(${step.op ?? ''})${bys}`;
+    }
     // The TS-superset kinds: no native form. Classified tsOnly.
     case 'mapFn':
     case 'flatMapFn':

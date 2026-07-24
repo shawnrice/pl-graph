@@ -7,7 +7,15 @@
 
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
-import { appendStep, type By, isStepFn, type Plan, type Predicate, type Step } from '../ast.js';
+import {
+  appendStep,
+  type By,
+  isStepFn,
+  type Plan,
+  type Predicate,
+  type SackOp,
+  type Step,
+} from '../ast.js';
 
 // ---------- Core types ----------
 
@@ -72,6 +80,26 @@ export type OrderSym = (typeof Order)[keyof typeof Order];
 const ORDER_TO_DIR: ReadonlyMap<symbol, 'asc' | 'desc'> = new Map([
   [Order.asc, 'asc'],
   [Order.desc, 'desc'],
+]);
+
+// TinkerPop `Operator` merge functions for `sack(op).by(...)`: `newSack =
+// op(currentSack, projectedValue)`. `assign` replaces; the rest fold numerically.
+export const Operator = {
+  assign: familySymbol<'Operator'>('@lenke/gremlin/Operator.assign'),
+  sum: familySymbol<'Operator'>('@lenke/gremlin/Operator.sum'),
+  mult: familySymbol<'Operator'>('@lenke/gremlin/Operator.mult'),
+  min: familySymbol<'Operator'>('@lenke/gremlin/Operator.min'),
+  max: familySymbol<'Operator'>('@lenke/gremlin/Operator.max'),
+} as const;
+
+export type OperatorSym = (typeof Operator)[keyof typeof Operator];
+
+export const OPERATOR_TO_SACKOP: ReadonlyMap<symbol, SackOp> = new Map([
+  [Operator.assign, 'assign'],
+  [Operator.sum, 'sum'],
+  [Operator.mult, 'mult'],
+  [Operator.min, 'min'],
+  [Operator.max, 'max'],
 ]);
 
 // Scope of a barrier-like step. `global` (default) operates over the whole

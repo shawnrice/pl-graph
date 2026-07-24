@@ -10,7 +10,7 @@
 
 import type { Graph } from '@lenke/core';
 
-import type { Plan } from '../ast.js';
+import type { Plan, Step } from '../ast.js';
 import { applyStep } from './dispatch.js';
 import { seedFromIndex } from './index-seed.js';
 import { newContext, planReadsPath, type Traverser, unwrap } from './runtime.js';
@@ -27,11 +27,23 @@ export const run = (plan: Plan, graph: Graph): Iterable<unknown> => {
   // path bookkeeping for the whole run (see planReadsPath / startTraverser).
   const ctx = newContext(planReadsPath(plan));
 
+  // Peel leading source-configuration steps (`withSack`) — like TinkerPop's
+  // GraphTraversalSource config they precede the actual source (V()/E()/…), so
+  // they set up the context rather than seed a stream.
+  let head = 0;
+
+  while (head < plan.steps.length && plan.steps[head].kind === 'withSack') {
+    ctx.sackInit = { value: (plan.steps[head] as Extract<Step, { kind: 'withSack' }>).init };
+    head++;
+  }
+
+  const effective = head === 0 ? plan : { ...plan, steps: plan.steps.slice(head) };
+
   // If the plan opens `V()`/`E()` + a seedable `has` on an indexed key, seed
   // from the index and apply only the residual steps; otherwise scan as usual.
-  const seeded = seedFromIndex(plan, graph, ctx.tracksPath);
+  const seeded = seedFromIndex(effective, graph, ctx.tracksPath);
   let stream: Iterable<Traverser<unknown>> | null = seeded?.stream ?? null;
-  const steps = seeded?.steps ?? plan.steps;
+  const steps = seeded?.steps ?? effective.steps;
 
   for (const step of steps) {
     if (stream === null) {
