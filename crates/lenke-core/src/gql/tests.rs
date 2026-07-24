@@ -2129,6 +2129,36 @@ fn call_betweenness_pivots_reaches_the_algorithm() {
 }
 
 #[test]
+fn string_vs_temporal_comparison_is_a_type_error() {
+    // An ORDERED comparison between a temporal value and a non-temporal one — an
+    // untagged string param vs a stored DATE, or a number vs a DATE — is a type
+    // error (E_INVALID_VALUE), not a silent empty result. Equality is unaffected
+    // (simply unequal), and a real DATE operand works. Byte-identical to TS.
+    let mut g = ndjson::decode("").unwrap();
+    rows(&mut g, "INSERT (:R {vf: DATE '2021-06-01'})");
+
+    let mut p = Params::new();
+    p.insert("x".to_string(), super::eval::Val::Str("2021-01-01".into()));
+    let e = parse("MATCH (r:R) WHERE r.vf <= $x RETURN r")
+        .unwrap()
+        .execute(&mut g, &p)
+        .unwrap_err();
+    assert_eq!(e.code, crate::error_codes::ErrorCode::InvalidValue);
+
+    // number vs temporal is likewise a type error …
+    assert!(exec_err(&mut g, "MATCH (r:R) WHERE r.vf < 5 RETURN r"));
+    // … but equality with a mismatched type is fine (just unequal → 0 rows) …
+    let cnt = rows(&mut g, "MATCH (r:R) WHERE r.vf = 5 RETURN count(*) AS c");
+    assert_eq!(cnt[0][0], n(0.0));
+    // … and a proper DATE comparison still works.
+    let ok = rows(
+        &mut g,
+        "MATCH (r:R) WHERE r.vf <= DATE '2022-01-01' RETURN count(*) AS c",
+    );
+    assert_eq!(ok[0][0], n(1.0));
+}
+
+#[test]
 fn call_config_key_validation() {
     // An unknown or wrong-typed CALL config key faults E_INVALID_VALUE (a silently
     // dropped key once hid the pivots bug). A near-miss gets a "did you mean" hint;

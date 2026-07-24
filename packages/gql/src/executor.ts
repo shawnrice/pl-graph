@@ -1395,6 +1395,17 @@ const compileExpr = (expr: Expr): CompiledExpr => {
           return c === null ? null : fn(c, 0);
         }
 
+        // A temporal vs a non-temporal relational comparison (both-temporal was
+        // handled above) is a type error — an untagged string param vs a stored
+        // DATE is a mistake, not "no rows" — so fault instead of silently UNKNOWN.
+        // Byte-identical to native's FAULT_CMP_TEMPORAL.
+        if (isTemporal(lv) !== isTemporal(rv)) {
+          throw new LenkeError(
+            "cannot order-compare a temporal value with a non-temporal value; tag the literal (e.g. DATE '2024-01-01') or CAST it to the matching type",
+            { code: ErrorCode.InvalidValue },
+          );
+        }
+
         const t = typeof lv;
         const orderable = t === typeof rv && (t === 'number' || t === 'string' || t === 'boolean');
 

@@ -195,6 +195,7 @@ const FAULT_NONNUMERIC_AGG: u8 = 14;
 const FAULT_INTERMEDIATE: u8 = 15;
 const FAULT_ID_DUP: u8 = 16;
 const FAULT_ID_IMMUTABLE: u8 = 17;
+const FAULT_CMP_TEMPORAL: u8 = 18;
 
 /// Per-expansion cap on trail-traversal steps; a guard against exponential blowup.
 const TRAIL_BUDGET: u64 = 1_000_000;
@@ -298,6 +299,11 @@ impl Ctx<'_> {
                 ErrorCode::InvalidGraphOp,
                 "cannot SET `id`: a string `id` is the element's identity and is fixed at \
                  creation — insert a new element with the new id instead",
+            )),
+            FAULT_CMP_TEMPORAL => Err(CodeError::new(
+                ErrorCode::InvalidValue,
+                "cannot order-compare a temporal value with a non-temporal value; tag the \
+                 literal (e.g. DATE '2024-01-01') or CAST it to the matching type",
             )),
             FAULT_BAD_LABEL => Err(CodeError::new(
                 ErrorCode::InvalidGraphOp,
@@ -822,12 +828,22 @@ fn cmp_total(a: &Val, b: &Val) -> Ordering {
 
 /// Compare two non-null operands to a three-valued result. Equality holds across
 /// any types (mismatched types are simply unequal); ordering across incomparable
-/// types is UNKNOWN (`Val::Null`), not a coerced bool.
-fn compare_vals(op: CompareOp, lv: &Val, rv: &Val) -> Val {
+/// types is UNKNOWN (`Val::Null`), not a coerced bool — EXCEPT a temporal vs a
+/// non-temporal relational comparison, which is a type error (an untagged string
+/// param vs a stored DATE is a mistake, not "no rows"): it faults via `ctx`.
+fn compare_vals(ctx: &Ctx, op: CompareOp, lv: &Val, rv: &Val) -> Val {
     match op {
         CompareOp::Eq => Val::Bool(val_eq(lv, rv)),
         CompareOp::Ne => Val::Bool(!val_eq(lv, rv)),
-        _ if !orderable_pair(lv, rv) => Val::Null,
+        _ if !orderable_pair(lv, rv) => {
+            // Exactly one operand temporal → ordering it against a string/number is
+            // a type error; both-non-temporal (num vs str) or both-temporal
+            // cross-kind (date vs time) stay UNKNOWN as before.
+            if matches!(lv, Val::Temporal(_)) != matches!(rv, Val::Temporal(_)) {
+                ctx.set_fault(FAULT_CMP_TEMPORAL);
+            }
+            Val::Null
+        }
         _ => {
             let c = val_cmp(lv, rv);
             Val::Bool(match op {
@@ -1452,7 +1468,7 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
             if is_nullish(&lv) || is_nullish(&rv) {
                 return Val::Null; // UNKNOWN
             }
-            compare_vals(*op, &lv, &rv)
+            compare_vals(env.ctx, *op, &lv, &rv)
         }
         CExpr::Case {
             subject,
@@ -1599,7 +1615,7 @@ fn run(env: &Env, prog: &Program) -> Val {
                     st.push(if is_nullish(&lv) || is_nullish(&rv) {
                         Val::Null
                     } else {
-                        compare_vals(*op, &lv, &rv)
+                        compare_vals(env.ctx, *op, &lv, &rv)
                     });
                 }
                 Op::Concat => {
@@ -4629,7 +4645,7 @@ fn temporal_cmp_vec(
         // Both operands present: `compare_vals` yields Bool (Eq/Ne, or an ordered
         // pair) or Null (UNKNOWN — an unordered/cross-kind `< > <= >=`). Map Null to
         // an invalid slot, exactly what `VVec::Gen`+`into_truth` would produce.
-        match compare_vals(op, lv, rv) {
+        match compare_vals(ctx, op, lv, rv) {
             Val::Bool(b) => {
                 t.push(b);
                 valid.push(true);

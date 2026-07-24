@@ -229,3 +229,43 @@ describe('GQL: current_timestamp coerces $__now kind to DATETIME', () => {
     expect(String(query(g, `RETURN current_date AS d`, dateNow)[0].d)).toBe('2026-07-12');
   });
 });
+
+describe('GQL: ordering a temporal against a non-temporal is a type error', () => {
+  const dated = (): Graph => {
+    const g = new Graph();
+    query(g, `INSERT (:R {vf: DATE '2021-06-01'})`);
+
+    return g;
+  };
+
+  test('untagged string param vs a stored DATE faults E_INVALID_VALUE (not silent empty)', () => {
+    const e = thrown(() =>
+      query(dated(), `MATCH (r:R) WHERE r.vf <= $x RETURN r`, { x: '2021-01-01' }),
+    );
+    expect(hasErrorCode(e, ErrorCode.InvalidValue)).toBe(true);
+  });
+
+  test('reversed operands and number vs DATE fault the same way', () => {
+    expect(
+      hasErrorCode(
+        thrown(() => query(dated(), `MATCH (r:R) WHERE $x >= r.vf RETURN r`, { x: '2021-01-01' })),
+        ErrorCode.InvalidValue,
+      ),
+    ).toBe(true);
+    expect(
+      hasErrorCode(
+        thrown(() => query(dated(), `MATCH (r:R) WHERE r.vf < 5 RETURN r`)),
+        ErrorCode.InvalidValue,
+      ),
+    ).toBe(true);
+  });
+
+  test('equality is unaffected, and a real DATE operand works', () => {
+    // Mismatched-type equality is simply unequal (0 rows), not an error.
+    expect(query(dated(), `MATCH (r:R) WHERE r.vf = 5 RETURN count(*) AS c`)).toEqual([{ c: 0 }]);
+    // A DATE literal (or a tagged param) compares fine.
+    expect(
+      query(dated(), `MATCH (r:R) WHERE r.vf <= DATE '2022-01-01' RETURN count(*) AS c`),
+    ).toEqual([{ c: 1 }]);
+  });
+});
