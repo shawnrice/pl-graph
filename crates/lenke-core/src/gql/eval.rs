@@ -196,6 +196,7 @@ const FAULT_INTERMEDIATE: u8 = 15;
 const FAULT_ID_DUP: u8 = 16;
 const FAULT_ID_IMMUTABLE: u8 = 17;
 const FAULT_CMP_TEMPORAL: u8 = 18;
+const FAULT_DATE_PART: u8 = 19;
 
 /// Per-expansion cap on trail-traversal steps; a guard against exponential blowup.
 const TRAIL_BUDGET: u64 = 1_000_000;
@@ -304,6 +305,13 @@ impl Ctx<'_> {
                 ErrorCode::InvalidValue,
                 "cannot order-compare a temporal value with a non-temporal value; tag the \
                  literal (e.g. DATE '2024-01-01') or CAST it to the matching type",
+            )),
+            FAULT_DATE_PART => Err(CodeError::new(
+                ErrorCode::InvalidValue,
+                "year()/month()/day()/hour()/minute()/second() require a temporal value that \
+                 carries that component (a date carries year/month/day; a time carries \
+                 hour/minute/second) — a string is NOT coerced; wrap it with \
+                 date()/local_datetime()/local_time() first",
             )),
             FAULT_BAD_LABEL => Err(CodeError::new(
                 ErrorCode::InvalidGraphOp,
@@ -1541,7 +1549,7 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
                 env.ctx.set_fault(FAULT_UNKNOWN_FN); // fail loud, not silent NULL
             }
             let vals: Vec<Val> = args.iter().map(|a| eval(env, a)).collect();
-            call_scalar(env.graph, *func, &vals)
+            call_scalar(env.graph, env.ctx, *func, &vals)
         }
         CExpr::Aggregate {
             func,
@@ -1702,7 +1710,7 @@ fn run(env: &Env, prog: &Program) -> Val {
                     }
                     let at = st.len() - argc;
                     let args = st.split_off(at);
-                    st.push(call_scalar(env.graph, *func, &args));
+                    st.push(call_scalar(env.graph, env.ctx, *func, &args));
                 }
                 Op::AggRef(idx) => {
                     st.push(
@@ -1893,7 +1901,51 @@ fn utf16_slice(s: &str, start: usize, len: usize) -> String {
     String::from_utf16_lossy(&units[start..end])
 }
 
-fn call_scalar(graph: &Graph, func: ScalarFn, args: &[Val]) -> Val {
+/// Extract a calendar/clock component from a temporal value. `None` means the
+/// component is undefined for that temporal kind (`year`/`month`/`day` of a
+/// time-only value, or `hour`/`minute`/`second` of a date) — the caller faults.
+/// Zoned values are decomposed in their own stored offset (the local wall
+/// clock), matching how they render. Division is euclidean so pre-epoch instants
+/// (negative seconds) floor correctly, byte-identical to the TS `Math.floor`.
+fn date_part(func: ScalarFn, t: crate::temporal::Temporal) -> Option<i64> {
+    use crate::temporal::{civil_from_days, Temporal};
+    const SPD: i64 = 86_400;
+    match func {
+        ScalarFn::Year | ScalarFn::Month | ScalarFn::Day => {
+            let days = match t {
+                Temporal::Date(x) => i64::from(x.days),
+                Temporal::DateTime(x) => x.secs.div_euclid(SPD),
+                Temporal::ZonedDateTime(x) => (x.secs + i64::from(x.offset) * 60).div_euclid(SPD),
+                _ => return None,
+            };
+            let (y, m, d) = civil_from_days(days);
+            Some(match func {
+                ScalarFn::Year => y,
+                ScalarFn::Month => i64::from(m),
+                _ => i64::from(d),
+            })
+        }
+        ScalarFn::Hour | ScalarFn::Minute | ScalarFn::Second => {
+            let tod = match t {
+                Temporal::Time(x) => i64::from(x.secs),
+                Temporal::DateTime(x) => x.secs.rem_euclid(SPD),
+                Temporal::ZonedTime(x) => {
+                    (i64::from(x.secs) + i64::from(x.offset) * 60).rem_euclid(SPD)
+                }
+                Temporal::ZonedDateTime(x) => (x.secs + i64::from(x.offset) * 60).rem_euclid(SPD),
+                _ => return None,
+            };
+            Some(match func {
+                ScalarFn::Hour => tod / 3600,
+                ScalarFn::Minute => (tod / 60) % 60,
+                _ => tod % 60,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]) -> Val {
     use ScalarFn::*;
     let a = args.first();
     let b = args.get(1);
@@ -2351,6 +2403,25 @@ fn call_scalar(graph: &Graph, func: ScalarFn, args: &[Val]) -> Val {
         DurationBetween => match (a, b) {
             (Some(Val::Temporal(x)), Some(Val::Temporal(y))) => duration_between(x, y),
             _ => Val::Null, // null operand or a non-temporal → UNKNOWN
+        },
+        // Temporal component extraction. Null in → null out; a temporal that
+        // carries the component → its integer value; anything else (a string, a
+        // number, or a temporal lacking the component — `year` of a time, `hour`
+        // of a date) faults loudly rather than coercing or returning null.
+        Year | Month | Day | Hour | Minute | Second => match a {
+            None => Val::Null,
+            Some(v) if is_nullish(v) => Val::Null,
+            Some(Val::Temporal(t)) => match date_part(func, *t) {
+                Some(n) => Val::Num(n as f64),
+                None => {
+                    ctx.set_fault(FAULT_DATE_PART);
+                    Val::Null
+                }
+            },
+            Some(_) => {
+                ctx.set_fault(FAULT_DATE_PART);
+                Val::Null
+            }
         },
         Unknown => Val::Null,
     }

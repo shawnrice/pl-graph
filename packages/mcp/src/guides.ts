@@ -190,13 +190,20 @@ RETURN duration_between(e1.ts, e2.ts) AS gap
 \`\`\`
 Instants order directly (\`datetime < datetime\`, \`date < date\`). Compare durations *through the instants they bound* — write \`a.ts < b.ts + duration(...)\` rather than comparing one duration to another.
 
+## Calendar/clock components
+Extract a component with the named functions \`year(x)\`, \`month(x)\`, \`day(x)\`, \`hour(x)\`, \`minute(x)\`, \`second(x)\` — the ISO GQL form (not SQL \`EXTRACT\`, not a \`.year\` accessor). The argument must be a temporal that carries that component (\`year\`/\`month\`/\`day\` need a date; \`hour\`/\`minute\`/\`second\` need a time); a zoned value is read in its own offset. Bucket or cohort by a period with \`GROUP BY\`:
+\`\`\`
+MATCH (h:Hire) RETURN year(h.hired) AS yr, count(*) AS n GROUP BY yr ORDER BY yr
+\`\`\`
+A **string is not coerced** — \`year('2024-01-01')\` throws; wrap it first: \`year(date(h.day))\`.
+
 ## Current time
 \`current_date()\` and \`current_timestamp()\` read a clock you provide — \`graph.setClock(() => Date.now())\` on a native graph, or pass \`$__now\` in the query params. Without a clock they read as \`null\`, which keeps queries deterministic by default.
 
 ## Good to know
 - **Store timestamps as temporals, not strings.** A string compared against a temporal silently matches nothing. If your data has string timestamps, wrap them: \`datetime(e.ts)\`, \`date(e.day)\`.
 - **Build temporal values with the constructor functions** \`date(x)\` / \`datetime(x)\` / \`zoned_datetime(x)\` / \`duration(x)\` (rather than \`CAST(x AS DATE)\`). The bare literal prefix is \`DATETIME '…'\`.
-- **No date-part extraction** (\`year()\`/\`month()\`/\`EXTRACT\`) yet — derive parts host-side, or from \`duration_between\`.
+- **Date-part extraction is \`year()\`/\`month()\`/\`day()\`/\`hour()\`/\`minute()\`/\`second()\`** (see above), NOT SQL \`EXTRACT\` or a \`.year\` accessor. Passing a string throws — wrap with \`date()\`/\`datetime()\` first.
 - \`min\`/\`max\` over a duration column work; a duration in a numeric \`sum\`/\`avg\` is a loud \`E_DATA_EXCEPTION\`. Out-of-range date fields (month 13) are a syntax error, but a valid-looking overflow like \`date('2025-02-29')\` rolls to \`2025-03-01\`.`,
 };
 

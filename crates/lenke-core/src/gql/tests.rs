@@ -6017,3 +6017,149 @@ fn optional_match_after_match_no_barrier() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Temporal component extraction: year()/month()/day()/hour()/minute()/second()
+// — the ISO GQL named-function form (NOT SQL `EXTRACT`, NOT Cypher `.year`). A
+// string is NOT coerced (faults E_INVALID_VALUE); a temporal lacking the
+// requested component faults too; zoned values read their OWN offset (local
+// wall clock). Byte-identity with the TS engine is checked in the differential
+// suite (packages/native/src/gql-conformance.test.ts).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn date_part_extracts_from_a_date() {
+    let mut g = ndjson::decode("").unwrap();
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN year(DATE '2024-03-15') AS y, month(DATE '2024-03-15') AS mo, \
+             day(DATE '2024-03-15') AS d"
+        ),
+        vec![vec![n(2024.0), n(3.0), n(15.0)]]
+    );
+    // A pre-epoch date decomposes correctly (negative epoch-day count).
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN year(DATE '1969-12-31') AS y, month(DATE '1969-12-31') AS mo, \
+             day(DATE '1969-12-31') AS d"
+        ),
+        vec![vec![n(1969.0), n(12.0), n(31.0)]]
+    );
+}
+
+#[test]
+fn date_part_extracts_date_and_time_fields_from_a_datetime() {
+    let mut g = ndjson::decode("").unwrap();
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN year(DATETIME '2024-03-15T13:47:09') AS y, \
+             hour(DATETIME '2024-03-15T13:47:09') AS h, \
+             minute(DATETIME '2024-03-15T13:47:09') AS mi, \
+             second(DATETIME '2024-03-15T13:47:09') AS s"
+        ),
+        vec![vec![n(2024.0), n(13.0), n(47.0), n(9.0)]]
+    );
+}
+
+#[test]
+fn date_part_extracts_time_fields_from_a_local_time() {
+    let mut g = ndjson::decode("").unwrap();
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN hour(local_time('13:47:09')) AS h, minute(local_time('13:47:09')) AS mi, \
+             second(local_time('13:47:09')) AS s"
+        ),
+        vec![vec![n(13.0), n(47.0), n(9.0)]]
+    );
+}
+
+#[test]
+fn date_part_zoned_reads_its_own_offset_wall_clock() {
+    // A zoned value's components are its stored-offset wall clock, not UTC.
+    // 23:30+05:00 → local hour 23, local day 15 (the UTC instant is 18:30Z).
+    let mut g = ndjson::decode("").unwrap();
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN day(zoned_datetime('2024-03-15T23:30:00+05:00')) AS d, \
+             hour(zoned_datetime('2024-03-15T23:30:00+05:00')) AS h"
+        ),
+        vec![vec![n(15.0), n(23.0)]]
+    );
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN hour(zoned_time('01:15:00+02:00')) AS h, \
+             minute(zoned_time('01:15:00+02:00')) AS mi"
+        ),
+        vec![vec![n(1.0), n(15.0)]]
+    );
+}
+
+#[test]
+fn date_part_null_in_null_out() {
+    let mut g = ndjson::decode("").unwrap();
+    assert_eq!(
+        rows(&mut g, "RETURN year(null) AS y"),
+        vec![vec![Value::Null]]
+    );
+    // An absent property → null in → null out (no fault), so the row survives.
+    rows(&mut g, "INSERT (:H {name: 'x'})");
+    assert_eq!(
+        rows(&mut g, "MATCH (h:H) RETURN year(h.hired) AS y"),
+        vec![vec![Value::Null]]
+    );
+}
+
+#[test]
+fn date_part_rejects_strings_and_missing_components() {
+    use crate::error_codes::ErrorCode::InvalidValue;
+    let mut g = ndjson::decode("").unwrap();
+    let code = |g: &mut Graph, q: &str| {
+        parse(q)
+            .unwrap()
+            .execute(g, &Params::new())
+            .unwrap_err()
+            .code
+    };
+
+    // A string is NOT coerced — it must be wrapped with date()/local_datetime()/…
+    assert_eq!(code(&mut g, "RETURN year('2024-03-15') AS y"), InvalidValue);
+    // A number is not a temporal.
+    assert_eq!(code(&mut g, "RETURN month(5) AS m"), InvalidValue);
+    // year() of a time-only value has no date component.
+    assert_eq!(
+        code(&mut g, "RETURN year(local_time('13:47:09')) AS y"),
+        InvalidValue
+    );
+    // hour() of a date has no time component.
+    assert_eq!(
+        code(&mut g, "RETURN hour(DATE '2024-03-15') AS h"),
+        InvalidValue
+    );
+    // a duration carries neither.
+    assert_eq!(
+        code(&mut g, "RETURN day(duration('P1Y2M3D')) AS d"),
+        InvalidValue
+    );
+}
+
+#[test]
+fn date_part_group_by_year_buckets_rows() {
+    // The headline use case: cohort/bucket rows by a calendar component.
+    let mut g = ndjson::decode("").unwrap();
+    rows(&mut g, "INSERT (:H {hired: DATE '2021-05-01'})");
+    rows(&mut g, "INSERT (:H {hired: DATE '2021-11-30'})");
+    rows(&mut g, "INSERT (:H {hired: DATE '2023-02-14'})");
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (h:H) RETURN year(h.hired) AS yr, count(*) AS c ORDER BY yr"
+        ),
+        vec![vec![n(2021.0), n(2.0)], vec![n(2023.0), n(1.0)]]
+    );
+}

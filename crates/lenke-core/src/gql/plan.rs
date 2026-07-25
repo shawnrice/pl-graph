@@ -109,6 +109,17 @@ pub enum ScalarFn {
     /// two pinned points), never calendar months: whole days for two dates,
     /// seconds+nanos for two datetimes.
     DurationBetween,
+    /// Temporal component extraction (`year(x)`/`month`/`day`/`hour`/`minute`/
+    /// `second`). Argument must be a temporal value carrying the requested
+    /// component (a string is NOT coerced — it faults); zoned values are read in
+    /// their own offset (local wall clock). The ISO GQL / Spanner / Ultipa
+    /// spelling; NOT SQL `EXTRACT` and NOT Cypher's `.year` accessor.
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
     Unknown,
 }
 
@@ -234,6 +245,13 @@ fn scalar_fn(name: &str) -> ScalarFn {
         "local_datetime" | "datetime" => ScalarFn::DateTimeOf,
         "duration" => ScalarFn::DurationOf,
         "duration_between" => ScalarFn::DurationBetween,
+        // Temporal component extraction (ISO GQL named-function form).
+        "year" => ScalarFn::Year,
+        "month" => ScalarFn::Month,
+        "day" => ScalarFn::Day,
+        "hour" => ScalarFn::Hour,
+        "minute" => ScalarFn::Minute,
+        "second" => ScalarFn::Second,
         _ => ScalarFn::Unknown,
     }
 }

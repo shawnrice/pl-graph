@@ -230,6 +230,38 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(() => nativeGraph.query(q)).toThrow();
   });
 
+  test('temporal component fns year()/…/second() — byte-identical; string rejected', () => {
+    // Date parts, time parts, zoned-in-own-offset, pre-epoch, and null-in→null-out
+    // all agree bit-for-bit across engines.
+    const agree = [
+      `RETURN year(DATE '2024-03-15') AS y, month(DATE '2024-03-15') AS mo, day(DATE '2024-03-15') AS d`,
+      `RETURN hour(DATETIME '2024-03-15T13:47:09') AS h, minute(DATETIME '2024-03-15T13:47:09') AS mi, second(DATETIME '2024-03-15T13:47:09') AS s`,
+      `RETURN hour(local_time('13:47:09')) AS h, minute(local_time('13:47:09')) AS mi`,
+      // A zoned value reads its own offset (local wall clock), not UTC.
+      `RETURN day(zoned_datetime('2024-03-15T23:30:00+05:00')) AS d, hour(zoned_datetime('2024-03-15T23:30:00+05:00')) AS h`,
+      `RETURN hour(zoned_time('01:15:00+02:00')) AS h`,
+      // Pre-epoch date (negative epoch-day count).
+      `RETURN year(DATE '1969-12-31') AS y, day(DATE '1969-12-31') AS d`,
+      `RETURN year(null) AS y`,
+    ];
+
+    for (const q of agree) {
+      const [ts, native] = both(q);
+
+      expect(ts).toBe(native);
+    }
+
+    // A string is NOT coerced, and a temporal lacking the component faults — both throw.
+    for (const q of [
+      `RETURN year('2024-03-15') AS y`,
+      `RETURN hour(DATE '2024-03-15') AS h`,
+      `RETURN year(local_time('13:47:09')) AS y`,
+    ]) {
+      expect(() => tsQuery(tsGraph, q)).toThrow();
+      expect(() => nativeGraph.query(q)).toThrow();
+    }
+  });
+
   test('list[i].prop — property access chains off a subscript, byte-identical', () => {
     const base = `MATCH p = ANY SHORTEST (a)-[]->*(b) WHERE a.name = 'marko' AND b.name = 'lop'`;
     // edges(p)[0].weight, nodes(p)[i].name, and out-of-range → null all

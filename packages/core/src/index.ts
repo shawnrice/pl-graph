@@ -41,6 +41,7 @@ export {
   temporalRelCmp,
   temporalArith,
   durationBetween,
+  civilFromDays,
   graphsonType,
   graphsonTag,
   fromTaggedJson,

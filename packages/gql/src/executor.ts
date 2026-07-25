@@ -2,6 +2,7 @@ import type { Edge, Graph, IndexableValue, RangeBound, Vertex } from '@lenke/cor
 import {
   type AlgorithmConfig,
   type AlgorithmName,
+  civilFromDays,
   Duration,
   durationBetween,
   fromTaggedJson,
@@ -11,10 +12,13 @@ import {
   LocalDateTime,
   Path,
   runAlgorithmSync,
+  type Temporal,
   temporalArith,
   temporalCmpTotal,
   temporalParse,
   temporalRelCmp,
+  ZonedDateTime,
+  ZonedTime,
 } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 import { filter, flatMap, map, skip, take, toArray } from '@lenke/fp';
@@ -1129,12 +1133,92 @@ const callTemporalFn = (name: string, args: readonly unknown[]): unknown => {
   return UNHANDLED;
 };
 
+// Temporal component extraction (ISO GQL `year()`/`month()`/`day()`/`hour()`/
+// `minute()`/`second()`). Euclidean floor/mod so pre-epoch instants (negative
+// seconds) decompose byte-identically to the Rust `div_euclid`/`rem_euclid`.
+const SECS_PER_DAY = 86_400;
+const floorDiv = (n: number, d: number): number => Math.floor(n / d);
+const euclidMod = (n: number, d: number): number => ((n % d) + d) % d;
+
+/** The integer component, or `null` if the temporal kind lacks it (e.g. `year`
+ * of a LOCAL TIME, `hour` of a DATE) — the caller turns `null` into a throw. */
+const datePart = (name: string, t: Temporal): number | null => {
+  if (name === 'year' || name === 'month' || name === 'day') {
+    let epochDays: number;
+
+    if (t instanceof LocalDate) {
+      epochDays = t.days;
+    } else if (t instanceof LocalDateTime) {
+      epochDays = floorDiv(t.secs, SECS_PER_DAY);
+    } else if (t instanceof ZonedDateTime) {
+      epochDays = floorDiv(t.secs + t.offset * 60, SECS_PER_DAY);
+    } else {
+      return null;
+    }
+
+    const [y, m, d] = civilFromDays(epochDays);
+
+    if (name === 'year') {
+      return y;
+    }
+
+    return name === 'month' ? m : d;
+  }
+
+  let tod: number;
+
+  if (t instanceof LocalTime) {
+    tod = t.secs;
+  } else if (t instanceof LocalDateTime) {
+    tod = euclidMod(t.secs, SECS_PER_DAY);
+  } else if (t instanceof ZonedTime || t instanceof ZonedDateTime) {
+    tod = euclidMod(t.secs + t.offset * 60, SECS_PER_DAY);
+  } else {
+    return null;
+  }
+
+  if (name === 'hour') {
+    return floorDiv(tod, 3600);
+  }
+
+  return name === 'minute' ? floorDiv(tod, 60) % 60 : tod % 60;
+};
+
+const DATE_PART_FNS = new Set(['year', 'month', 'day', 'hour', 'minute', 'second']);
+
+const callDatePartFn = (name: string, a: unknown): unknown => {
+  if (!DATE_PART_FNS.has(name)) {
+    return UNHANDLED;
+  }
+
+  if (isNullish(a)) {
+    return null; // null in → null out
+  }
+
+  if (isTemporal(a)) {
+    const n = datePart(name, a);
+
+    if (n !== null) {
+      return n;
+    }
+  }
+
+  // A string is NOT coerced, and a temporal lacking the component faults loudly.
+  throw new LenkeError(
+    `${name}() requires a temporal value that carries that component ` +
+      `(a date carries year/month/day; a time carries hour/minute/second) — ` +
+      `a string is NOT coerced; wrap it with date()/local_datetime()/local_time() first`,
+    { code: ErrorCode.InvalidValue },
+  );
+};
+
 const callExtendedScalar = (name: string, args: readonly unknown[]): unknown => {
   const [a, b] = args;
 
   for (const result of [
     callGraphFn(name, a),
     callConversionFn(name, a),
+    callDatePartFn(name, a),
     callTemporalFn(name, args),
     callStringPredicateFn(name, a, b),
     callStringListFn(name, args),
