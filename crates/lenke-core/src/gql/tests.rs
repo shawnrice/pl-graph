@@ -5463,15 +5463,199 @@ fn bare_all_selector_over_fixed_pattern() {
     assert_eq!(r, vec![vec![s("b")], vec![s("d")]]);
 }
 
+// ---------------------------------------------------------------------------
+// Bare `ANY` selector (one arbitrary path per endpoint) and `SHORTEST k [GROUP]`
+// (the k shortest paths / the k smallest length-groups). Fixture: to `d` there
+// is one length-1 path (a→d) and two length-2 paths (a→b→d, a→c→d).
+// ---------------------------------------------------------------------------
+
+fn multi_length_to_d() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+        r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}"#,
+        r#"{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}"#,
+        r#"{"type":"edge","id":"e1","from":"a","to":"d","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e2","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e3","from":"b","to":"d","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e4","from":"a","to":"c","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e5","from":"c","to":"d","labels":["R"],"properties":{}}"#,
+    ])
+}
+
+/// Bare `ANY` keeps one path per endpoint, so `->*` from `a` yields one row each
+/// for the reachable endpoints (a itself via the zero-length path, b, c, d).
+#[test]
+fn bare_any_one_path_per_endpoint() {
+    let mut g = multi_length_to_d();
+    let ends = sorted_col0(
+        &mut g,
+        "MATCH ANY (a:N {id:'a'})-[:R]->*(x) RETURN x.id AS id",
+    );
+    assert_eq!(ends, vec![s("a"), s("b"), s("c"), s("d")]);
+}
+
+/// `ANY` over a bounded quantifier drops the zero-length self path (min 1); every
+/// endpoint still appears exactly once.
+#[test]
+fn bare_any_dedups_over_bounded_quantifier() {
+    let mut g = multi_length_to_d();
+    let ends = sorted_col0(
+        &mut g,
+        "MATCH ANY (a:N {id:'a'})-[:R]->{1,3}(x) RETURN x.id AS id",
+    );
+    assert_eq!(ends, vec![s("b"), s("c"), s("d")], "one row per endpoint");
+}
+
+/// `ANY p = …` binds a single Path per endpoint; to `d` the witness is the first
+/// walk discovered (the direct length-1 edge, first in adjacency order).
+#[test]
+fn bare_any_binds_one_path_to_d() {
+    let mut g = multi_length_to_d();
+    let r = rows(
+        &mut g,
+        "MATCH p = ANY (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN path_length(p) AS len",
+    );
+    assert_eq!(
+        r,
+        vec![vec![n(1.0)]],
+        "exactly one path, the shortest witness"
+    );
+}
+
+/// `SHORTEST 1` to `d` keeps a single (shortest, length-1) path.
+#[test]
+fn shortest_1_keeps_one_shortest_path() {
+    let mut g = multi_length_to_d();
+    let r = rows(
+        &mut g,
+        "MATCH p = SHORTEST 1 (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN path_length(p) AS len",
+    );
+    assert_eq!(r, vec![vec![n(1.0)]]);
+}
+
+/// `SHORTEST 2` to `d` keeps the two shortest paths by (length, discovery): the
+/// length-1 direct edge, then the first length-2 path.
+#[test]
+fn shortest_2_keeps_two_shortest_paths() {
+    let mut g = multi_length_to_d();
+    let r = rows(
+        &mut g,
+        "MATCH p = SHORTEST 2 (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) \
+         RETURN path_length(p) AS len ORDER BY len",
+    );
+    assert_eq!(r, vec![vec![n(1.0)], vec![n(2.0)]]);
+}
+
+/// `SHORTEST 2 GROUP` to `d` keeps EVERY path in the two smallest length groups:
+/// the one length-1 path and both length-2 paths (three rows).
+#[test]
+fn shortest_2_group_keeps_all_in_two_length_groups() {
+    let mut g = multi_length_to_d();
+    let r = rows(
+        &mut g,
+        "MATCH p = SHORTEST 2 GROUP (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) \
+         RETURN path_length(p) AS len ORDER BY len",
+    );
+    assert_eq!(r, vec![vec![n(1.0)], vec![n(2.0)], vec![n(2.0)]]);
+}
+
+/// `SHORTEST 1 GROUP` keeps every path of the single smallest length — here just
+/// the one length-1 path, identical to what `ALL SHORTEST` returns.
+#[test]
+fn shortest_1_group_matches_all_shortest() {
+    let mut g = multi_length_to_d();
+    let grp = rows(
+        &mut g,
+        "MATCH p = SHORTEST 1 GROUP (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN path_length(p) AS len",
+    );
+    let all = rows(
+        &mut g,
+        "MATCH p = ALL SHORTEST (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN path_length(p) AS len",
+    );
+    assert_eq!(grp, vec![vec![n(1.0)]]);
+    assert_eq!(grp, all);
+}
+
+/// `GROUPS` is accepted as a synonym for `GROUP`.
+#[test]
+fn shortest_k_groups_synonym() {
+    let mut g = multi_length_to_d();
+    let a = rows(
+        &mut g,
+        "MATCH (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN count(*) AS c",
+    );
+    let _ = a;
+    let r = rows(
+        &mut g,
+        "MATCH p = SHORTEST 2 GROUPS (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN path_length(p) AS len",
+    );
+    assert_eq!(r.len(), 3);
+}
+
+/// `SHORTEST k` clamps to however many paths exist (k larger than the path count).
+#[test]
+fn shortest_k_clamps_to_available_paths() {
+    let mut g = multi_length_to_d();
+    let r = rows(
+        &mut g,
+        "MATCH p = SHORTEST 10 (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN path_length(p) AS len",
+    );
+    assert_eq!(r.len(), 3, "only three paths a..d exist");
+}
+
+/// `SHORTEST k` composes with a per-hop predicate (it enumerates trails, so the
+/// filter applies): excluding the direct edge leaves only the two length-2 paths.
+#[test]
+fn shortest_k_with_per_hop_predicate() {
+    // Weight the direct a→d edge so a predicate can exclude it.
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+        r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}"#,
+        r#"{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}"#,
+        r#"{"type":"edge","id":"e1","from":"a","to":"d","labels":["R"],"properties":{"w":100.0}}"#,
+        r#"{"type":"edge","id":"e2","from":"a","to":"b","labels":["R"],"properties":{"w":1.0}}"#,
+        r#"{"type":"edge","id":"e3","from":"b","to":"d","labels":["R"],"properties":{"w":1.0}}"#,
+        r#"{"type":"edge","id":"e4","from":"a","to":"c","labels":["R"],"properties":{"w":1.0}}"#,
+        r#"{"type":"edge","id":"e5","from":"c","to":"d","labels":["R"],"properties":{"w":1.0}}"#,
+    ]);
+    let r = rows(
+        &mut g,
+        "MATCH p = SHORTEST 5 (a:N {id:'a'})-[e:R WHERE e.w < 10]->*(x:N {id:'d'}) \
+         RETURN path_length(p) AS len ORDER BY len",
+    );
+    assert_eq!(
+        r,
+        vec![vec![n(2.0)], vec![n(2.0)]],
+        "the length-1 direct edge is filtered"
+    );
+}
+
+/// SHORTEST k parse/shape rejections.
+#[test]
+fn shortest_k_rejections() {
+    assert!(parse("MATCH SHORTEST (a)-[]->*(b) RETURN b").is_err()); // needs a count
+    assert!(parse("MATCH SHORTEST 0 (a)-[]->*(b) RETURN b").is_err()); // k >= 1
+    assert!(parse("MATCH SHORTEST 3 (a)-[]->*(b) RETURN b").is_ok());
+    assert!(parse("MATCH SHORTEST 3 GROUP (a)-[]->*(b) RETURN b").is_ok());
+    assert!(parse("MATCH SHORTEST 3 GROUPS (a)-[]->*(b) RETURN b").is_ok());
+    assert!(parse("MATCH ANY (a)-[]->*(b) RETURN b").is_ok()); // bare ANY now supported
+                                                               // Selectors still need a single var-length segment.
+    assert!(parse("MATCH SHORTEST 2 (a)-[]->(b) RETURN b").is_err());
+    assert!(parse("MATCH ANY (a)-[]->(b) RETURN b").is_err());
+}
+
 /// The unsupported selector shapes fail to parse with a pointed message.
 #[test]
 fn shortest_unsupported_shapes_rejected() {
     assert!(parse("MATCH (a)-[]->*(b) RETURN b").is_ok()); // no selector: still fine
     assert!(parse("MATCH ALL SHORTEST (a)-[]->*(b) RETURN b").is_ok()); // now supported
     assert!(parse("MATCH ALL (a)-[]->*(b) RETURN b").is_ok()); // bare ALL = default selector
-    assert!(parse("MATCH SHORTEST (a)-[]->*(b) RETURN b").is_err());
-    assert!(parse("MATCH ANY (a)-[]->*(b) RETURN b").is_err()); // bare ANY still unsupported
-                                                                // A selector needs a single variable-length segment.
+    assert!(parse("MATCH ANY (a)-[]->*(b) RETURN b").is_ok()); // bare ANY now supported
+    assert!(parse("MATCH SHORTEST 2 (a)-[]->*(b) RETURN b").is_ok()); // SHORTEST k now supported
+    assert!(parse("MATCH SHORTEST (a)-[]->*(b) RETURN b").is_err()); // …but needs a count
+                                                                     // A shortest selector needs a single variable-length segment.
     assert!(parse("MATCH ANY SHORTEST (a)-[]->(b) RETURN b").is_err());
     assert!(parse("MATCH ANY SHORTEST (a)-[]->*(b)-[]->*(c) RETURN c").is_err());
     // min > 1 is not the shortest semantics yet.

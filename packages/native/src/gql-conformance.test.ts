@@ -1909,3 +1909,86 @@ suite('gql conformance: per-hop edge predicate on var-length — byte-identical'
     ).toThrow();
   });
 });
+
+// Bare `ANY` (one arbitrary path per endpoint) and `SHORTEST k [GROUP]` (the k
+// shortest / the k smallest length-groups). Fixture: to `d` there is one length-1
+// path (a→d) and two length-2 paths (a→b→d, a→c→d). Byte-identical across engines.
+suite('gql conformance: ANY / SHORTEST k — byte-identical', () => {
+  const NDJSON = [
+    { type: 'node', id: 'a', labels: ['N'], properties: { id: 'a' } },
+    { type: 'node', id: 'b', labels: ['N'], properties: { id: 'b' } },
+    { type: 'node', id: 'c', labels: ['N'], properties: { id: 'c' } },
+    { type: 'node', id: 'd', labels: ['N'], properties: { id: 'd' } },
+    { type: 'edge', id: 'e1', from: 'a', to: 'd', labels: ['R'], properties: {} },
+    { type: 'edge', id: 'e2', from: 'a', to: 'b', labels: ['R'], properties: {} },
+    { type: 'edge', id: 'e3', from: 'b', to: 'd', labels: ['R'], properties: {} },
+    { type: 'edge', id: 'e4', from: 'a', to: 'c', labels: ['R'], properties: {} },
+    { type: 'edge', id: 'e5', from: 'c', to: 'd', labels: ['R'], properties: {} },
+  ]
+    .map((r) => JSON.stringify(r))
+    .join('\n');
+
+  const backend = createFfiBackend(LIB);
+  const nativeGraph = graphFromFormat(backend, NDJSON, 'ndjson');
+  const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
+  const both = (q: string): [string, string] => [
+    JSON.stringify(tsQuery(tsGraph, q)),
+    JSON.stringify(nativeGraph.query(q)),
+  ];
+
+  test('bare ANY yields one path per endpoint', () => {
+    const [ts, native] = both(`MATCH ANY (a:N {id:'a'})-[:R]->*(x) RETURN x.id AS id ORDER BY id`);
+    expect(ts).toBe(native);
+    expect(JSON.parse(ts)).toEqual([{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }]);
+  });
+
+  test('ANY p = … binds one Path per endpoint, byte-identical', () => {
+    const [ts, native] = both(
+      `MATCH p = ANY (a:N {id:'a'})-[:R]->*(x) RETURN nodes(p) AS ns ORDER BY x.id`,
+    );
+    expect(ts).toBe(native);
+  });
+
+  test('SHORTEST 2 keeps the two shortest paths to d', () => {
+    const [ts, native] = both(
+      `MATCH p = SHORTEST 2 (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN path_length(p) AS len ORDER BY len`,
+    );
+    expect(ts).toBe(native);
+    expect(JSON.parse(ts)).toEqual([{ len: 1 }, { len: 2 }]);
+  });
+
+  test('SHORTEST 2 GROUP keeps all paths in the two smallest length groups', () => {
+    const [ts, native] = both(
+      `MATCH p = SHORTEST 2 GROUP (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) ` +
+        `RETURN nodes(p) AS ns ORDER BY path_length(p)`,
+    );
+    expect(ts).toBe(native);
+    expect(JSON.parse(ts)).toHaveLength(3);
+  });
+
+  test('SHORTEST 1 GROUP == ALL SHORTEST here', () => {
+    const [grpTs, grpNative] = both(
+      `MATCH p = SHORTEST 1 GROUP (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN path_length(p) AS len`,
+    );
+    const [allTs] = both(
+      `MATCH p = ALL SHORTEST (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN path_length(p) AS len`,
+    );
+    expect(grpTs).toBe(grpNative);
+    expect(grpTs).toBe(allTs);
+  });
+
+  test('GROUPS is a synonym for GROUP', () => {
+    const [ts, native] = both(
+      `MATCH p = SHORTEST 2 GROUPS (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN path_length(p) AS len ORDER BY len`,
+    );
+    expect(ts).toBe(native);
+    expect(JSON.parse(ts)).toHaveLength(3);
+  });
+
+  test('SHORTEST k over the whole graph (all endpoints) is byte-identical', () => {
+    const [ts, native] = both(
+      `MATCH p = SHORTEST 2 (a:N {id:'a'})-[:R]->*(x) RETURN x.id AS id, path_length(p) AS len ORDER BY id, len`,
+    );
+    expect(ts).toBe(native);
+  });
+});

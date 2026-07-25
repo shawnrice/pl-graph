@@ -609,39 +609,51 @@ impl Parser {
                 segments.push(Segment { rel, node });
             }
 
-            // A selector matches exactly one variable-length segment with a `*`/`+`
-            // minimum (min ≤ 1) — the canonical shortest shape `… (a)-[]->*(b)`. A
-            // larger minimum would need search beyond the globally shortest path.
-            if selector != PathSelector::Walk {
-                let ok = segments.len() == 1
-                    && segments[0].rel.quantifier.is_some_and(|q| q.min <= 1);
-                if !ok {
-                    return err(
-                        "ANY SHORTEST currently supports a single variable-length segment with a `*` or `+` (min ≤ 1) quantifier, e.g. `(a)-[]->*(b)`",
-                        sel_pos,
-                    );
+            // Every selector (and a bare path variable) works over exactly one
+            // variable-length segment. `ANY SHORTEST`/`ALL SHORTEST` additionally
+            // need the `*`/`+` (min ≤ 1) shortest shape and reject a per-hop
+            // predicate (their BFS drivers don't filter); `ANY`/`SHORTEST k` and
+            // bare path binding enumerate trails, so they accept any bound and a
+            // per-hop predicate.
+            let single_varlen = segments.len() == 1 && segments[0].rel.quantifier.is_some();
+            match selector {
+                PathSelector::AnyShortest | PathSelector::AllShortest => {
+                    let ok = single_varlen
+                        && segments[0].rel.quantifier.is_some_and(|q| q.min <= 1);
+                    if !ok {
+                        return err(
+                            "ANY SHORTEST / ALL SHORTEST currently support a single variable-length segment with a `*` or `+` (min ≤ 1) quantifier, e.g. `(a)-[]->*(b)`",
+                            sel_pos,
+                        );
+                    }
+                    let seg = &segments[0].rel;
+                    if !seg.props.is_empty() || seg.where_.is_some() {
+                        return err(
+                            "a per-hop edge predicate on a variable-length segment is not yet supported together with a path selector (ANY/ALL SHORTEST)",
+                            sel_pos,
+                        );
+                    }
                 }
-                // The shortest drivers are pure BFS over labels — they do not yet
-                // evaluate a per-hop edge predicate. Reject the combination rather
-                // than silently ignoring the filter.
-                let seg = &segments[0].rel;
-                if !seg.props.is_empty() || seg.where_.is_some() {
-                    return err(
-                        "a per-hop edge predicate on a variable-length segment is not yet supported together with a path selector (ANY/ALL SHORTEST)",
-                        sel_pos,
-                    );
+                PathSelector::Any | PathSelector::ShortestK { .. } => {
+                    if !single_varlen {
+                        return err(
+                            "ANY / SHORTEST k currently support a single variable-length segment, e.g. `(a)-[]->{1,5}(b)`",
+                            sel_pos,
+                        );
+                    }
                 }
-            } else if path_var.is_some() {
-                // Bare path binding (`p = (a)-[:R]->{m,n}(b)`) currently enumerates a
-                // single variable-length segment (any bound); the path value is that
-                // walk. Fixed-length / multi-segment path binding is not yet wired.
-                let ok = segments.len() == 1 && segments[0].rel.quantifier.is_some();
-                if !ok {
-                    return err(
-                        "a named path variable currently requires either a path selector (e.g. `p = ANY SHORTEST …`) or a single variable-length segment (e.g. `p = (a)-[:R]->{1,5}(b)`)",
-                        sel_pos,
-                    );
+                PathSelector::Walk if path_var.is_some() => {
+                    // Bare path binding (`p = (a)-[:R]->{m,n}(b)`) enumerates a single
+                    // variable-length segment; fixed-length / multi-segment path
+                    // binding is not yet wired.
+                    if !single_varlen {
+                        return err(
+                            "a named path variable currently requires either a path selector (e.g. `p = ANY SHORTEST …`) or a single variable-length segment (e.g. `p = (a)-[:R]->{1,5}(b)`)",
+                            sel_pos,
+                        );
+                    }
                 }
+                PathSelector::Walk => {}
             }
 
             Ok(PathPattern {
@@ -675,9 +687,9 @@ impl Parser {
         mode
     }
 
-    /// Parse an optional ISO path selector prefixing a pattern. Only `ANY
-    /// SHORTEST` is supported today; the other ISO forms (`ALL SHORTEST`, bare
-    /// `ANY`/`ALL`, `SHORTEST k`) are rejected with a pointed message.
+    /// Parse an optional ISO path selector prefixing a pattern: `ANY [SHORTEST]`,
+    /// `ALL [SHORTEST]`, `SHORTEST k [GROUP[S]]`. Bare `ALL` folds into `Walk` (the
+    /// enumerate-all default).
     fn parse_path_selector(&mut self) -> R<PathSelector> {
         let pos = self.peek().pos;
         if self.check_kw("any") {
@@ -688,10 +700,8 @@ impl Parser {
                 return Ok(PathSelector::AnyShortest);
             }
 
-            return err(
-                "expected SHORTEST after ANY (bare ANY is not yet supported)",
-                pos,
-            );
+            // Bare `ANY` — one arbitrary path per endpoint.
+            return Ok(PathSelector::Any);
         }
         if self.check_kw("all") {
             self.advance();
@@ -707,7 +717,26 @@ impl Parser {
             return Ok(PathSelector::Walk);
         }
         if self.check_kw("shortest") {
-            return err("SHORTEST must be written as `ANY SHORTEST`", pos);
+            self.advance();
+            // `SHORTEST k [GROUP[S]]`: k shortest paths per endpoint, or (GROUP)
+            // every path in the k smallest length-groups.
+            if !self.check(Tt::Number) {
+                return err(
+                    "SHORTEST must be followed by a count (e.g. `SHORTEST 3`) or written as `ANY SHORTEST`",
+                    pos,
+                );
+            }
+            let k = self.read_count("SHORTEST k")?;
+            if k == 0 {
+                return err("SHORTEST k requires k >= 1", pos);
+            }
+            // `GROUP`/`GROUPS` is a soft keyword (arrives as an identifier).
+            let group = self.check_soft("group") || self.check_soft("groups");
+            if group {
+                self.advance();
+            }
+
+            return Ok(PathSelector::ShortestK { k, group });
         }
 
         Ok(PathSelector::Walk)

@@ -244,15 +244,23 @@ pub enum RemoveItem {
 }
 
 /// How many of the paths matching a pattern to keep. `Walk` (the ISO default,
-/// no selector) keeps every match; `AnyShortest` (`ANY SHORTEST`) keeps one
-/// fewest-hop path per endpoint pair; `AllShortest` (`ALL SHORTEST`) keeps every
-/// path tied for that fewest-hop length, per endpoint pair.
+/// no selector, and the target of bare `ALL`) keeps every match; `Any` (bare
+/// `ANY`) keeps one arbitrary path per endpoint; `AnyShortest` (`ANY SHORTEST`)
+/// keeps one fewest-hop path per endpoint pair; `AllShortest` (`ALL SHORTEST`)
+/// keeps every path tied for that fewest-hop length; `ShortestK` (`SHORTEST k
+/// [GROUP]`) keeps the k shortest paths per endpoint — or, with `group`, every
+/// path in the k smallest length-groups.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum PathSelector {
     #[default]
     Walk,
+    Any,
     AnyShortest,
     AllShortest,
+    ShortestK {
+        k: u32,
+        group: bool,
+    },
 }
 
 /// A path **mode** (restrictor): which element repeats a matched path may

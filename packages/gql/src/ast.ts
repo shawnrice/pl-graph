@@ -241,10 +241,19 @@ export type PathPattern = {
 
 /**
  * How many of the paths matching a pattern to keep. `walk` (the ISO default, no
- * selector) keeps every match; `anyShortest` (`ANY SHORTEST`) keeps one
- * fewest-hop path per endpoint pair.
+ * selector, and the target of bare `ALL`) keeps every match; `any` (bare `ANY`)
+ * keeps one arbitrary path per endpoint; `anyShortest` (`ANY SHORTEST`) keeps one
+ * fewest-hop path per endpoint pair; `allShortest` (`ALL SHORTEST`) keeps every
+ * path tied for that fewest-hop length; `{ kind: 'shortestK', k, group }`
+ * (`SHORTEST k [GROUP]`) keeps the k shortest paths per endpoint — or, with
+ * `group`, every path in the k smallest length-groups.
  */
-export type PathSelector = 'walk' | 'anyShortest' | 'allShortest';
+export type PathSelector =
+  | 'walk'
+  | 'any'
+  | 'anyShortest'
+  | 'allShortest'
+  | { readonly kind: 'shortestK'; readonly k: number; readonly group: boolean };
 
 /**
  * A path mode (restrictor): which element repeats a matched path may contain.

@@ -593,6 +593,10 @@ export const parse = (
   const parsePathSelector = (): PathSelector => {
     const pos0 = peek().pos;
 
+    // `GROUP`/`GROUPS` after `SHORTEST k` is a soft keyword (arrives as an ident).
+    const soft = (word: string): boolean =>
+      peek().type === 'ident' && !peek().delimited && peek().value.toLowerCase() === word;
+
     if (checkKeyword('any')) {
       advance();
 
@@ -602,7 +606,8 @@ export const parse = (
         return 'anyShortest';
       }
 
-      throw new GqlSyntaxError('expected SHORTEST after ANY (bare ANY is not yet supported)', pos0);
+      // Bare `ANY` — one arbitrary path per endpoint.
+      return 'any';
     }
 
     if (checkKeyword('all')) {
@@ -620,7 +625,29 @@ export const parse = (
     }
 
     if (checkKeyword('shortest')) {
-      throw new GqlSyntaxError('SHORTEST must be written as `ANY SHORTEST`', pos0);
+      advance();
+
+      // `SHORTEST k [GROUP[S]]`.
+      if (!check('number')) {
+        throw new GqlSyntaxError(
+          'SHORTEST must be followed by a count (e.g. `SHORTEST 3`) or written as `ANY SHORTEST`',
+          pos0,
+        );
+      }
+
+      const k = readCount('SHORTEST k');
+
+      if (k === 0) {
+        throw new GqlSyntaxError('SHORTEST k requires k >= 1', pos0);
+      }
+
+      const group = soft('group') || soft('groups');
+
+      if (group) {
+        advance();
+      }
+
+      return { kind: 'shortestK', k, group };
     }
 
     return 'walk';
@@ -651,28 +678,38 @@ export const parse = (
         segments.push({ rel: quantifier ? { ...rel, quantifier } : rel, node });
       }
 
-      // A selector matches exactly one variable-length segment with a `*`/`+`
-      // (min ≤ 1) quantifier — the canonical shortest shape `(a)-[]->*(b)`.
-      if (selector !== 'walk') {
-        const q = segments.length === 1 ? segments[0].rel.quantifier : undefined;
+      // Every selector (and a bare path variable) works over exactly one
+      // variable-length segment. `ANY/ALL SHORTEST` additionally need the `*`/`+`
+      // (min ≤ 1) shape; `ANY`/`SHORTEST k` and bare path binding accept any bound.
+      const singleVarlen =
+        segments.length === 1 && segments[0].rel.quantifier !== undefined
+          ? segments[0].rel.quantifier
+          : undefined;
 
-        if (!q || q.min > 1) {
+      if (selector === 'anyShortest' || selector === 'allShortest') {
+        if (!singleVarlen || singleVarlen.min > 1) {
           throw new GqlSyntaxError(
-            'ANY SHORTEST currently supports a single variable-length segment with a `*` or `+` (min ≤ 1) quantifier, e.g. `(a)-[]->*(b)`',
+            'ANY SHORTEST / ALL SHORTEST currently support a single variable-length segment with a `*` or `+` (min ≤ 1) quantifier, e.g. `(a)-[]->*(b)`',
             selPos,
           );
         }
-      } else if (pathVar !== undefined) {
+      } else if (
+        selector === 'any' ||
+        (typeof selector === 'object' && selector.kind === 'shortestK')
+      ) {
+        if (!singleVarlen) {
+          throw new GqlSyntaxError(
+            'ANY / SHORTEST k currently support a single variable-length segment, e.g. `(a)-[]->{1,5}(b)`',
+            selPos,
+          );
+        }
+      } else if (pathVar !== undefined && !singleVarlen) {
         // Bare path binding (`p = (a)-[:R]->{m,n}(b)`) enumerates a single
-        // variable-length segment (any bound); the path value is that walk.
-        const q = segments.length === 1 ? segments[0].rel.quantifier : undefined;
-
-        if (!q) {
-          throw new GqlSyntaxError(
-            'a named path variable currently requires either a path selector (e.g. `p = ANY SHORTEST …`) or a single variable-length segment (e.g. `p = (a)-[:R]->{1,5}(b)`)',
-            selPos,
-          );
-        }
+        // variable-length segment; the path value is that walk.
+        throw new GqlSyntaxError(
+          'a named path variable currently requires either a path selector (e.g. `p = ANY SHORTEST …`) or a single variable-length segment (e.g. `p = (a)-[:R]->{1,5}(b)`)',
+          selPos,
+        );
       }
 
       return {

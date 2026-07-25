@@ -3182,8 +3182,10 @@ const matchPattern = function* (
   binding: Binding,
   params: Params,
 ): Iterable<Binding> {
+  const selector = pattern.selector ?? 'walk';
+
   // A shortest-path selector (`ANY`/`ALL SHORTEST`) has its own BFS driver.
-  if (pattern.selector === 'anyShortest' || pattern.selector === 'allShortest') {
+  if (selector === 'anyShortest' || selector === 'allShortest') {
     const seeds: Iterable<Vertex> =
       pattern.start.variable && binding.has(pattern.start.variable)
         ? [binding.get(pattern.start.variable) as Vertex]
@@ -3193,9 +3195,30 @@ const matchPattern = function* (
       const seeded = matchNode(binding, pattern.start, seed, params, graph);
 
       if (seeded) {
-        yield* pattern.selector === 'anyShortest'
+        yield* selector === 'anyShortest'
           ? shortestWalk(graph, pattern, seed, seeded, params)
           : allShortestWalk(graph, pattern, seed, seeded, params);
+      }
+    }
+
+    return;
+  }
+
+  // Bare `ANY` and `SHORTEST k [GROUP]` enumerate trails from the seed (so they
+  // honour the pattern's mode and any per-hop predicate), then dedup / rank.
+  if (selector === 'any' || (typeof selector === 'object' && selector.kind === 'shortestK')) {
+    const seeds: Iterable<Vertex> =
+      pattern.start.variable && binding.has(pattern.start.variable)
+        ? [binding.get(pattern.start.variable) as Vertex]
+        : seedVertices(graph, pattern.start, binding, params);
+
+    for (const seed of seeds) {
+      const seeded = matchNode(binding, pattern.start, seed, params, graph);
+
+      if (seeded) {
+        yield* selector === 'any'
+          ? anyWalk(graph, pattern, seed, seeded, params)
+          : shortestKWalk(graph, pattern, seed, seeded, params, selector);
       }
     }
 
@@ -3258,6 +3281,140 @@ const allWalk = function* (
     const steps = edges.map((edge, i) => ({ edge, vertex: verts[i + 1] }));
 
     yield withBinding(matched, pattern.pathVar, Path.fromSteps(verts[0], steps));
+  }
+};
+
+/** Bind the endpoint node and (if named) the walk as a Path, yielding the row.
+ * Shared by the trail-enumerating selectors (`ANY`, `SHORTEST k`). */
+const bindEndAndPath = (
+  graph: Graph,
+  pattern: CPath,
+  walk: TrailEnd,
+  binding: Binding,
+  params: Params,
+): Binding | null => {
+  const [{ node: endNode }] = pattern.segments;
+  const matched = matchNode(binding, endNode, walk.end, params, graph);
+
+  if (!matched) {
+    return null;
+  }
+
+  if (pattern.pathVar === undefined) {
+    return matched;
+  }
+
+  const steps = walk.edges.map((edge, i) => ({ edge, vertex: walk.verts[i + 1] }));
+
+  return withBinding(matched, pattern.pathVar, Path.fromSteps(walk.verts[0], steps));
+};
+
+// Bare `ANY`: one arbitrary path per endpoint — the first walk that reaches each
+// distinct endpoint in trail-discovery order. Byte-identical because that order
+// is. Mirrors native `any_walk`.
+const anyWalk = function* (
+  graph: Graph,
+  pattern: CPath,
+  seed: Vertex,
+  binding: Binding,
+  params: Params,
+): Iterable<Binding> {
+  const [{ rel }] = pattern.segments;
+  const seen = new Set<Vertex>();
+
+  for (const walk of trailEnds(graph, seed, rel, rel.quantifier!, {
+    mode: pattern.mode ?? 'trail',
+    binding,
+    params,
+    wantPath: pattern.pathVar !== undefined,
+  })) {
+    // First witness per endpoint only (the endpoint match is per-vertex).
+    if (seen.has(walk.end)) {
+      continue;
+    }
+
+    seen.add(walk.end);
+
+    const row = bindEndAndPath(graph, pattern, walk, binding, params);
+
+    if (row) {
+      yield row;
+    }
+  }
+};
+
+// `SHORTEST k [GROUP]`: enumerate every trail, group by endpoint, order each
+// endpoint's paths by (length, discovery), then keep the first `k` (plain) or
+// every path in the `k` smallest distinct-length groups (`group`). Mirrors native
+// `shortest_k_walk`.
+const shortestKWalk = function* (
+  graph: Graph,
+  pattern: CPath,
+  seed: Vertex,
+  binding: Binding,
+  params: Params,
+  sel: { k: number; group: boolean },
+): Iterable<Binding> {
+  const { k, group } = sel;
+  const [{ rel }] = pattern.segments;
+
+  // endpoint -> its trails as { walk, len }, in discovery order.
+  const perEnd = new Map<Vertex, { walk: TrailEnd; len: number }[]>();
+
+  for (const walk of trailEnds(graph, seed, rel, rel.quantifier!, {
+    mode: pattern.mode ?? 'trail',
+    binding,
+    params,
+    wantPath: true,
+  })) {
+    const bucket = perEnd.get(walk.end);
+    const entry = { walk, len: walk.edges.length };
+
+    if (bucket) {
+      bucket.push(entry);
+    } else {
+      perEnd.set(walk.end, [entry]);
+    }
+  }
+
+  // Endpoints in graph (insertion/index) order — mirrors native `ends.sort_unstable()`
+  // (native ids are the insertion index), the same ordering `allShortestWalk` uses.
+  for (const end of graph.vertices) {
+    const paths = perEnd.get(end);
+
+    if (!paths) {
+      continue;
+    }
+
+    // Stable sort by length → shortest first, discovery order within a length.
+    paths.sort((a, b) => a.len - b.len);
+
+    let selected: typeof paths;
+
+    if (group) {
+      // The k smallest distinct lengths (paths are length-sorted, so equal lengths
+      // are contiguous); keep every path at or below the kth.
+      const distinct: number[] = [];
+
+      for (const p of paths) {
+        if (distinct[distinct.length - 1] !== p.len) {
+          distinct.push(p.len);
+        }
+      }
+
+      const cutoff = distinct.slice(0, k).at(-1);
+      selected = cutoff === undefined ? [] : paths.filter((p) => p.len <= cutoff);
+    } else {
+      selected = paths.slice(0, k);
+    }
+
+    for (const { walk } of selected) {
+      const row = bindEndAndPath(graph, pattern, walk, binding, params);
+
+      if (row) {
+        yield row;
+      }
+    }
   }
 };
 

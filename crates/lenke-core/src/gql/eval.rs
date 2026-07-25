@@ -3303,6 +3303,177 @@ fn all_walk(
     )
 }
 
+/// Bare `ANY` selector: one arbitrary path per endpoint — the first walk that
+/// reaches each distinct endpoint in trail-discovery order. Byte-identical because
+/// that order is. Built on `reachable_each`, so it honours the pattern's mode and
+/// any per-hop edge predicate.
+fn any_walk(
+    graph: &Graph,
+    ctx: &Ctx,
+    pattern: &CPath,
+    seed: u32,
+    binding: &mut Binding,
+    emit: &mut dyn FnMut(&mut Binding) -> bool,
+) -> bool {
+    let seg = &pattern.segments[0];
+    let rel = &seg.rel;
+    let end_node = &seg.node;
+    let q = rel
+        .quantifier
+        .expect("an ANY pattern has a quantified segment");
+    let path_slot = pattern.path_var_slot;
+    let mut seen: HashSet<u32> = HashSet::new();
+    reachable_each(
+        graph,
+        ctx,
+        binding,
+        seed,
+        rel,
+        WalkSpec {
+            q,
+            mode: pattern.mode,
+            want_path: path_slot.is_some(),
+        },
+        &mut |b, end, verts, edges| {
+            // First witness per endpoint only (the endpoint match is per-vertex, so
+            // a non-matching endpoint never emits regardless of which walk reached
+            // it — marking it seen just avoids re-trying).
+            if !seen.insert(end) {
+                return true;
+            }
+            match_node_then(graph, ctx, b, end_node, end, &mut |b| {
+                if let Some(s) = path_slot {
+                    b.set(
+                        s,
+                        Val::Path {
+                            vertices: verts.to_vec(),
+                            edges: edges.to_vec(),
+                        },
+                    );
+                }
+                let keep = emit(b);
+                if let Some(s) = path_slot {
+                    b.unset(s);
+                }
+                keep
+            })
+        },
+    )
+}
+
+/// One enumerated trail to an endpoint: `(length, vertices, edges)`.
+type TrailPath = (usize, Vec<u32>, Vec<u32>);
+
+/// `SHORTEST k [GROUP]` selector: enumerate every trail, group by endpoint, order
+/// each endpoint's paths by (length, trail-discovery order), then keep the first
+/// `k` (plain) or every path whose length is among the `k` smallest distinct
+/// lengths (`group`, the `.1` of `spec`). Byte-identical because the enumeration
+/// and the stable sort are. Trades the BFS shortcut for full enumeration (needed
+/// to see beyond the single shortest length); the trail budget guards a
+/// pathological `*`.
+fn shortest_k_walk(
+    graph: &Graph,
+    ctx: &Ctx,
+    pattern: &CPath,
+    seed: u32,
+    binding: &mut Binding,
+    emit: &mut dyn FnMut(&mut Binding) -> bool,
+    spec: (u32, bool),
+) -> bool {
+    let (k, group) = spec;
+    let seg = &pattern.segments[0];
+    let rel = &seg.rel;
+    let end_node = &seg.node;
+    let q = rel
+        .quantifier
+        .expect("a SHORTEST k pattern has a quantified segment");
+    let path_slot = pattern.path_var_slot;
+
+    // endpoint -> its trails as (length, vertices, edges), in discovery order.
+    let mut per_end: HashMap<u32, Vec<TrailPath>> = HashMap::new();
+    reachable_each(
+        graph,
+        ctx,
+        binding,
+        seed,
+        rel,
+        WalkSpec {
+            q,
+            mode: pattern.mode,
+            want_path: true,
+        },
+        &mut |_b, end, verts, edges| {
+            per_end
+                .entry(end)
+                .or_default()
+                .push((edges.len(), verts.to_vec(), edges.to_vec()));
+            true
+        },
+    );
+    if ctx.faulted() {
+        return true;
+    }
+
+    let mut ends: Vec<u32> = per_end.keys().copied().collect();
+    ends.sort_unstable();
+
+    for end in ends {
+        let mut paths = per_end.remove(&end).unwrap();
+        // Stable sort by length → shortest first, discovery order within a length.
+        paths.sort_by_key(|(len, _, _)| *len);
+
+        let selected: Vec<(Vec<u32>, Vec<u32>)> = if group {
+            // The k smallest distinct lengths (paths are length-sorted, so equal
+            // lengths are contiguous); keep every path at or below the kth.
+            let mut distinct: Vec<usize> = Vec::new();
+            for (len, _, _) in &paths {
+                if distinct.last() != Some(len) {
+                    distinct.push(*len);
+                }
+            }
+            // The kth smallest distinct length (or the largest, if fewer than k).
+            let cutoff = distinct.get((k as usize).min(distinct.len()).saturating_sub(1));
+            match cutoff.copied() {
+                Some(cutoff) => paths
+                    .into_iter()
+                    .filter(|(len, _, _)| *len <= cutoff)
+                    .map(|(_, v, e)| (v, e))
+                    .collect(),
+                None => Vec::new(),
+            }
+        } else {
+            paths
+                .into_iter()
+                .take(k as usize)
+                .map(|(_, v, e)| (v, e))
+                .collect()
+        };
+
+        for (vertices, edges) in selected {
+            let stop = !match_node_then(graph, ctx, binding, end_node, end, &mut |b| {
+                if let Some(s) = path_slot {
+                    b.set(
+                        s,
+                        Val::Path {
+                            vertices: vertices.clone(),
+                            edges: edges.clone(),
+                        },
+                    );
+                }
+                let keep = emit(b);
+                if let Some(s) = path_slot {
+                    b.unset(s);
+                }
+                keep
+            });
+            if stop {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Seed and match a single path pattern, emitting each binding via `emit`.
 /// `where_` is the enclosing clause WHERE, threaded here only so the start node
 /// can seed from a property index on a `WHERE var.k = $x` conjunct (in addition
@@ -3329,8 +3500,12 @@ fn visit_pattern(
                     all_walk(graph, ctx, pattern, seed, b, emit)
                 }
                 PathSelector::Walk => walk_segments(graph, ctx, pattern, 0, seed, b, emit),
+                PathSelector::Any => any_walk(graph, ctx, pattern, seed, b, emit),
                 PathSelector::AnyShortest => shortest_walk(graph, ctx, pattern, seed, b, emit),
                 PathSelector::AllShortest => all_shortest_walk(graph, ctx, pattern, seed, b, emit),
+                PathSelector::ShortestK { k, group } => {
+                    shortest_k_walk(graph, ctx, pattern, seed, b, emit, (k, group))
+                }
             },
         )
     };
