@@ -1757,3 +1757,61 @@ suite('gql conformance: path modes — byte-identical restrictors', () => {
     expect(defTs).toContain('"a"');
   });
 });
+
+// Bare path-variable binding over a single quantified segment (`p = (a)-[]->{m,n}(b)`,
+// no selector) enumerates EVERY walk under the pattern's mode and binds each as a
+// full Path value — the `all_walk` driver, byte-identical across engines. Same
+// triangle-with-tail as the path-modes suite (shared ids → Path values compare
+// byte-for-byte).
+suite('gql conformance: bare path binding — every walk as a Path, byte-identical', () => {
+  const NDJSON = [
+    { type: 'node', id: 'a', labels: ['N'], properties: { id: 'a' } },
+    { type: 'node', id: 'b', labels: ['N'], properties: { id: 'b' } },
+    { type: 'node', id: 'c', labels: ['N'], properties: { id: 'c' } },
+    { type: 'node', id: 'd', labels: ['N'], properties: { id: 'd' } },
+    { type: 'edge', id: 'e1', from: 'a', to: 'b', labels: ['R'], properties: {} },
+    { type: 'edge', id: 'e2', from: 'b', to: 'c', labels: ['R'], properties: {} },
+    { type: 'edge', id: 'e3', from: 'c', to: 'a', labels: ['R'], properties: {} },
+    { type: 'edge', id: 'e4', from: 'a', to: 'd', labels: ['R'], properties: {} },
+  ]
+    .map((r) => JSON.stringify(r))
+    .join('\n');
+
+  const backend = createFfiBackend(LIB);
+  const nativeGraph = graphFromFormat(backend, NDJSON, 'ndjson');
+  const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
+  const both = (q: string): [string, string] => [
+    JSON.stringify(tsQuery(tsGraph, q)),
+    JSON.stringify(nativeGraph.query(q)),
+  ];
+
+  test('p bound over {1,3} — full Path values agree (a-b, a-b-c, a-b-c-a, a-d)', () => {
+    const [ts, native] = both(
+      `MATCH p = (a:N {id:'a'})-[:R]->{1,3}(x) RETURN nodes(p) AS ns ORDER BY path_length(p), x.id`,
+    );
+    expect(ts).toBe(native);
+    expect(JSON.parse(ts)).toHaveLength(4);
+  });
+
+  test('the whole Path value (vertices + edges) is byte-identical', () => {
+    const [ts, native] = both(
+      `MATCH p = (a:N {id:'a'})-[:R]->{1,3}(x) RETURN p ORDER BY path_length(p), x.id`,
+    );
+    expect(ts).toBe(native);
+  });
+
+  test('path_length agrees per row', () => {
+    const [ts, native] = both(
+      `MATCH p = (a:N {id:'a'})-[:R]->{1,3}(x) RETURN path_length(p) AS len ORDER BY len, x.id`,
+    );
+    expect(ts).toBe(native);
+  });
+
+  test('SIMPLE p back to the seed keeps only the closing cycle', () => {
+    const [ts, native] = both(
+      `MATCH p = SIMPLE (a:N {id:'a'})-[:R]->{1,3}(a) RETURN nodes(p) AS ns`,
+    );
+    expect(ts).toBe(native);
+    expect(JSON.parse(ts)).toHaveLength(1);
+  });
+});

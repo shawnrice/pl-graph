@@ -593,12 +593,6 @@ impl Parser {
             // Optional path selector (`ANY SHORTEST`) then optional mode (`TRAIL`).
             let selector = p.parse_path_selector()?;
             let mode = p.parse_path_mode();
-            if path_var.is_some() && selector == PathSelector::Walk {
-                return err(
-                    "a named path variable currently requires a path selector (e.g. `p = ANY SHORTEST …`)",
-                    sel_pos,
-                );
-            }
 
             let start = p.parse_node()?;
             let mut segments = Vec::new();
@@ -621,16 +615,26 @@ impl Parser {
                 segments.push(Segment { rel, node });
             }
 
-            // For now a selector matches exactly one variable-length segment with
-            // a `*`/`+`-style minimum (min ≤ 1) — the canonical shortest-path
-            // shape `… (a)-[]->*(b)`. A larger minimum would need search beyond the
-            // globally shortest path, which BFS doesn't do.
+            // A selector matches exactly one variable-length segment with a `*`/`+`
+            // minimum (min ≤ 1) — the canonical shortest shape `… (a)-[]->*(b)`. A
+            // larger minimum would need search beyond the globally shortest path.
             if selector != PathSelector::Walk {
                 let ok = segments.len() == 1
                     && segments[0].rel.quantifier.is_some_and(|q| q.min <= 1);
                 if !ok {
                     return err(
                         "ANY SHORTEST currently supports a single variable-length segment with a `*` or `+` (min ≤ 1) quantifier, e.g. `(a)-[]->*(b)`",
+                        sel_pos,
+                    );
+                }
+            } else if path_var.is_some() {
+                // Bare path binding (`p = (a)-[:R]->{m,n}(b)`) currently enumerates a
+                // single variable-length segment (any bound); the path value is that
+                // walk. Fixed-length / multi-segment path binding is not yet wired.
+                let ok = segments.len() == 1 && segments[0].rel.quantifier.is_some();
+                if !ok {
+                    return err(
+                        "a named path variable currently requires either a path selector (e.g. `p = ANY SHORTEST …`) or a single variable-length segment (e.g. `p = (a)-[:R]->{1,5}(b)`)",
                         sel_pos,
                     );
                 }

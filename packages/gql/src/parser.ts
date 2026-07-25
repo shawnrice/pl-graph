@@ -639,13 +639,6 @@ export const parse = (
       const selector = parsePathSelector();
       const mode = parsePathMode();
 
-      if (pathVar !== undefined && selector === 'walk') {
-        throw new GqlSyntaxError(
-          'a named path variable currently requires a path selector (e.g. `p = ANY SHORTEST …`)',
-          selPos,
-        );
-      }
-
       const start = parseNode();
       const segments: Segment[] = [];
 
@@ -664,6 +657,17 @@ export const parse = (
         if (!q || q.min > 1) {
           throw new GqlSyntaxError(
             'ANY SHORTEST currently supports a single variable-length segment with a `*` or `+` (min ≤ 1) quantifier, e.g. `(a)-[]->*(b)`',
+            selPos,
+          );
+        }
+      } else if (pathVar !== undefined) {
+        // Bare path binding (`p = (a)-[:R]->{m,n}(b)`) enumerates a single
+        // variable-length segment (any bound); the path value is that walk.
+        const q = segments.length === 1 ? segments[0].rel.quantifier : undefined;
+
+        if (!q) {
+          throw new GqlSyntaxError(
+            'a named path variable currently requires either a path selector (e.g. `p = ANY SHORTEST …`) or a single variable-length segment (e.g. `p = (a)-[:R]->{1,5}(b)`)',
             selPos,
           );
         }

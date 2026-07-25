@@ -2633,15 +2633,33 @@ fn match_node_then(
 /// on cycles. The number of trails can still be exponential, so when a consumer
 /// does need them all a per-expansion step budget records `FAULT_BUDGET`
 /// (→ `ResourceExhausted`) and stops rather than exhausting memory/time.
+/// The traversal shape for `reachable_each`: how far to repeat (`q`), which
+/// repeats are legal (`mode`), and whether the consumer needs each trail's full
+/// `(vertices, edges)` reconstructed (`want_path`) or just its endpoint.
+#[derive(Clone, Copy)]
+struct WalkSpec {
+    q: Quantifier,
+    mode: PathMode,
+    // When `true`, reconstruct each trail's `(vertices, edges)` from the frame
+    // stack and pass them to `on_end` (a path variable needs the whole walk);
+    // otherwise pass empty slices (endpoint-only consumers skip the O(depth)
+    // rebuild). The two are byte-identical — same enumeration, one just carries
+    // the path.
+    want_path: bool,
+}
+
+/// `reachable_each`'s per-trail sink: `(endpoint, vertices, edges) -> keep-going`.
+type OnEnd<'a> = &'a mut dyn FnMut(u32, &[u32], &[u32]) -> bool;
+
 fn reachable_each(
     graph: &Graph,
     ctx: &Ctx,
     from: u32,
     rel: &CRel,
-    q: Quantifier,
-    mode: PathMode,
-    on_end: &mut dyn FnMut(u32) -> bool,
+    spec: WalkSpec,
+    on_end: OnEnd<'_>,
 ) -> bool {
+    let WalkSpec { q, mode, want_path } = spec;
     let collect = |v: u32| -> Vec<(u32, u32)> {
         expand(graph, ctx, v, rel.direction, rel.label.as_ref()).collect()
     };
@@ -2653,7 +2671,7 @@ fn reachable_each(
         return true;
     }
 
-    if q.min == 0 && !on_end(from) {
+    if q.min == 0 && !on_end(from, &[from], &[]) {
         return false;
     }
 
@@ -2684,12 +2702,18 @@ fn reachable_each(
         idx: usize,
         depth: u32,
         entry: Option<usize>,
+        // For path reconstruction (want_path): the vertex this frame explores
+        // from, and the edge taken to reach it (`None` at the seed).
+        vertex: u32,
+        entry_edge: Option<u32>,
     }
     let mut stack: Vec<Frame> = vec![Frame {
         edges: collect(from),
         idx: 0,
         depth: 0,
         entry: None,
+        vertex: from,
+        entry_edge: None,
     }];
 
     while let Some(top) = stack.last_mut() {
@@ -2747,7 +2771,19 @@ fn reachable_each(
             marks[i] = true;
         }
         let d = depth + 1;
-        if d >= q.min && !on_end(nbr) {
+        // Rebuild the walk `seed … nbr` from the live stack (`from` + each frame's
+        // vertex, then `nbr`; edges are each frame's entry edge, then this `eidx`).
+        // A SIMPLE close (`nbr == from`) reconstructs the closing cycle naturally.
+        let (pv, pe): (Vec<u32>, Vec<u32>) = if want_path {
+            let mut pv: Vec<u32> = stack.iter().map(|f| f.vertex).collect();
+            pv.push(nbr);
+            let mut pe: Vec<u32> = stack.iter().filter_map(|f| f.entry_edge).collect();
+            pe.push(eidx);
+            (pv, pe)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        if d >= q.min && !on_end(nbr, &pv, &pe) {
             // Consumer stop: clear this mark + the live stack's marks so a pooled
             // buffer is returned all-`false`, then bail.
             cont = false;
@@ -2768,6 +2804,8 @@ fn reachable_each(
                 idx: 0,
                 depth: d,
                 entry: mark_idx,
+                vertex: nbr,
+                entry_edge: Some(eidx),
             });
         }
     }
@@ -2790,10 +2828,21 @@ fn reachable(
     mode: PathMode,
 ) -> Vec<u32> {
     let mut ends: Vec<u32> = Vec::new();
-    reachable_each(graph, ctx, from, rel, q, mode, &mut |e| {
-        ends.push(e);
-        true
-    });
+    reachable_each(
+        graph,
+        ctx,
+        from,
+        rel,
+        WalkSpec {
+            q,
+            mode,
+            want_path: false,
+        },
+        &mut |e, _, _| {
+            ends.push(e);
+            true
+        },
+    );
     ends
 }
 
@@ -2817,11 +2866,22 @@ fn walk_segments(
         // Stream endpoints and stop the moment a consumer (EXISTS / LIMIT) is satisfied
         // — `match_node_then` returns false to propagate the stop, which `reachable_each`
         // returns, avoiding an exponential trail enumeration on a dense graph.
-        return reachable_each(graph, ctx, from, rel, q, pattern.mode, &mut |end| {
-            match_node_then(graph, ctx, binding, node, end, &mut |b| {
-                walk_segments(graph, ctx, pattern, index + 1, end, b, emit)
-            })
-        });
+        return reachable_each(
+            graph,
+            ctx,
+            from,
+            rel,
+            WalkSpec {
+                q,
+                mode: pattern.mode,
+                want_path: false,
+            },
+            &mut |end, _, _| {
+                match_node_then(graph, ctx, binding, node, end, &mut |b| {
+                    walk_segments(graph, ctx, pattern, index + 1, end, b, emit)
+                })
+            },
+        );
     }
     for (eidx, nbr) in expand(graph, ctx, from, rel.direction, rel.label.as_ref()) {
         let Some(did_set) = bind_slot(binding, rel.var_slot, &Val::Edge(eidx)) else {
@@ -3137,6 +3197,56 @@ fn all_shortest_walk(
     true
 }
 
+/// Bare path binding over a single quantified segment (`p = (a)-[:R]->{m,n}(b)`):
+/// enumerate every walk from the seed under the pattern's mode and bind each as a
+/// Path value (vertices + edges). The plain `walk_segments` driver only knows the
+/// endpoint, so this asks `reachable_each` for the whole walk (`want_path`).
+fn all_walk(
+    graph: &Graph,
+    ctx: &Ctx,
+    pattern: &CPath,
+    seed: u32,
+    binding: &mut Binding,
+    emit: &mut dyn FnMut(&mut Binding) -> bool,
+) -> bool {
+    let seg = &pattern.segments[0];
+    let rel = &seg.rel;
+    let end_node = &seg.node;
+    let q = rel
+        .quantifier
+        .expect("bare path binding has a quantified segment");
+    let path_slot = pattern.path_var_slot;
+    reachable_each(
+        graph,
+        ctx,
+        seed,
+        rel,
+        WalkSpec {
+            q,
+            mode: pattern.mode,
+            want_path: true,
+        },
+        &mut |end, verts, edges| {
+            match_node_then(graph, ctx, binding, end_node, end, &mut |b| {
+                if let Some(s) = path_slot {
+                    b.set(
+                        s,
+                        Val::Path {
+                            vertices: verts.to_vec(),
+                            edges: edges.to_vec(),
+                        },
+                    );
+                }
+                let keep = emit(b);
+                if let Some(s) = path_slot {
+                    b.unset(s);
+                }
+                keep
+            })
+        },
+    )
+}
+
 /// Seed and match a single path pattern, emitting each binding via `emit`.
 /// `where_` is the enclosing clause WHERE, threaded here only so the start node
 /// can seed from a property index on a `WHERE var.k = $x` conjunct (in addition
@@ -3157,6 +3267,11 @@ fn visit_pattern(
             &pattern.start,
             seed,
             &mut |b| match pattern.selector {
+                // A bare path variable over a single quantified segment binds each
+                // enumerated walk as a Path; otherwise the plain endpoint walk.
+                PathSelector::Walk if pattern.path_var_slot.is_some() => {
+                    all_walk(graph, ctx, pattern, seed, b, emit)
+                }
                 PathSelector::Walk => walk_segments(graph, ctx, pattern, 0, seed, b, emit),
                 PathSelector::AnyShortest => shortest_walk(graph, ctx, pattern, seed, b, emit),
                 PathSelector::AllShortest => all_shortest_walk(graph, ctx, pattern, seed, b, emit),
@@ -3577,9 +3692,20 @@ fn match_path<F: FnMut(&mut Binding) -> bool>(
     if let Some(q) = rel.quantifier {
         // Stream endpoints, stopping as soon as a consumer is satisfied (see the twin
         // in `walk_segments`) — `match_node_continue` returns false to propagate.
-        return reachable_each(graph, ctx, from, rel, q, path.mode, &mut |end| {
-            match_node_continue(graph, ctx, binding, node, end, path, idx + 1, emit)
-        });
+        return reachable_each(
+            graph,
+            ctx,
+            from,
+            rel,
+            WalkSpec {
+                q,
+                mode: path.mode,
+                want_path: false,
+            },
+            &mut |end, _, _| {
+                match_node_continue(graph, ctx, binding, node, end, path, idx + 1, emit)
+            },
+        );
     }
     for (eidx, nbr) in expand(graph, ctx, from, rel.direction, rel.label.as_ref()) {
         let Some(eset) = bind_slot(binding, rel.var_slot, &Val::Edge(eidx)) else {
@@ -3663,15 +3789,21 @@ fn single_simple_clause<'a>(matches: &[&'a CClause]) -> Option<SimpleWhere<'a>> 
             where_,
             where_prog,
             scope_len,
-            // A path selector (`ANY SHORTEST`) needs the general `visit_pattern`
-            // driver (which knows `shortest_walk`); `match_one_path` would
-            // enumerate every trail, so decline the fast path here.
-        } if patterns.len() == 1 && patterns[0].selector == PathSelector::Walk => Some((
-            &patterns[0],
-            where_.as_ref(),
-            where_prog.as_ref(),
-            *scope_len,
-        )),
+            // A path selector (`ANY SHORTEST`) or a bound path variable needs the
+            // general `visit_pattern` driver (which knows `shortest_walk`/`all_walk`
+            // and builds the Path value); `match_one_path` only yields endpoints, so
+            // decline the fast path for those.
+        } if patterns.len() == 1
+            && patterns[0].selector == PathSelector::Walk
+            && patterns[0].path_var_slot.is_none() =>
+        {
+            Some((
+                &patterns[0],
+                where_.as_ref(),
+                where_prog.as_ref(),
+                *scope_len,
+            ))
+        }
         _ => None,
     }
 }
@@ -5550,8 +5682,9 @@ fn build_scan(
     cap: Option<usize>,
     where_: Option<&CExpr>,
 ) -> Option<ScanCols> {
-    // A path selector (`ANY SHORTEST`) is handled only by the scalar driver.
-    if path.selector != PathSelector::Walk {
+    // A path selector (`ANY SHORTEST`) or a bound path variable is handled only by
+    // the scalar driver — only it builds the Path value.
+    if path.selector != PathSelector::Walk || path.path_var_slot.is_some() {
         return None;
     }
     // Fast path: an isolated node is a tight scan. An index hint (inline `{k:v}`
@@ -6709,6 +6842,13 @@ fn vectorized_frame(
         return None;
     }
     let path = &patterns[0];
+
+    // A bound path variable needs the scalar driver — only it builds the Path
+    // value (`all_walk`/`shortest_walk`); the vectorized frame yields columns.
+    // (A selector / non-default mode already routes here via the run_part guard.)
+    if path.path_var_slot.is_some() {
+        return None;
+    }
 
     // A pure aggregate over a traversal with no WHERE stays scalar: the scalar
     // engine stream-folds the join without materializing it, and there's no
@@ -11100,7 +11240,10 @@ fn linear_needs_general_matcher(linear: &CLinear) -> bool {
     linear.clauses.iter().any(|c| {
         matches!(c, CClause::Match { patterns, .. }
             if patterns.iter().any(|p| p.selector != PathSelector::Walk
-                || p.mode != PathMode::Trail))
+                || p.mode != PathMode::Trail
+                // A bound path variable needs the general matcher — only it builds
+                // the Path value (via `all_walk`/`shortest_walk`).
+                || p.path_var_slot.is_some()))
     })
 }
 

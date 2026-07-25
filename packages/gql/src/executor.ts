@@ -3207,8 +3207,50 @@ const matchPattern = function* (
     const seeded = matchNode(binding, path.start, seed, params, graph);
 
     if (seeded) {
-      yield* walkSegments(graph, path, 0, seed, seeded, params);
+      // A bound path variable over a single quantified segment binds each walk as
+      // a Path; otherwise the plain endpoint walk.
+      yield* path.pathVar !== undefined
+        ? allWalk(graph, path, seed, seeded, params)
+        : walkSegments(graph, path, 0, seed, seeded, params);
     }
+  }
+};
+
+// Bare path binding over a single quantified segment (`p = (a)-[:R]->{m,n}(b)`):
+// enumerate every walk under the pattern's mode and bind each as a Path value.
+// Mirrors native `all_walk`.
+const allWalk = function* (
+  graph: Graph,
+  pattern: CPath,
+  seed: Vertex,
+  binding: Binding,
+  params: Params,
+): Iterable<Binding> {
+  const [{ rel, node: endNode }] = pattern.segments;
+
+  for (const { end, verts, edges } of trailEnds(
+    graph,
+    seed,
+    rel,
+    rel.quantifier!,
+    pattern.mode ?? 'trail',
+    true,
+  )) {
+    const matched = matchNode(binding, endNode, end, params, graph);
+
+    if (!matched) {
+      continue;
+    }
+
+    if (pattern.pathVar === undefined) {
+      yield matched;
+
+      continue;
+    }
+
+    const steps = edges.map((edge, i) => ({ edge, vertex: verts[i + 1] }));
+
+    yield withBinding(matched, pattern.pathVar, Path.fromSteps(verts[0], steps));
   }
 };
 
@@ -3234,7 +3276,7 @@ const walkSegments = function* (
   // (The edge variable and per-edge predicate aren't bound for var-length
   // segments — rejected at compile time.)
   if (rel.quantifier) {
-    for (const end of trailEnds(graph, from, rel, rel.quantifier, pattern.mode ?? 'trail')) {
+    for (const { end } of trailEnds(graph, from, rel, rel.quantifier, pattern.mode ?? 'trail')) {
       const matched = matchNode(binding, node, end, params, graph);
 
       if (matched) {
@@ -3279,15 +3321,20 @@ const TRAIL_BUDGET = 1_000_000;
  * a per-expansion step budget throws rather than letting a pathological `*`
  * exhaust memory/time.
  */
+type TrailEnd = { end: Vertex; verts: readonly Vertex[]; edges: readonly Edge[] };
+
 const trailEnds = function* (
   graph: Graph,
   from: Vertex,
   rel: CRel,
   q: NonNullable<CRel['quantifier']>,
   mode: PathMode,
-): Iterable<Vertex> {
+  // When true, reconstruct each trail's vertices/edges from the frame stack (a
+  // path variable needs the whole walk); otherwise `verts`/`edges` are empty.
+  wantPath = false,
+): Iterable<TrailEnd> {
   if (q.min === 0) {
-    yield from;
+    yield { end: from, verts: wantPath ? [from] : [], edges: [] };
   }
 
   // The repeated-element marks on the CURRENT path. TRAIL (default) marks EDGES;
@@ -3310,7 +3357,19 @@ const trailEnds = function* (
     iter: Iterator<{ edge: Edge; node: Vertex }>;
     entry: Edge | Vertex | null;
     depth: number;
-  }[] = [{ iter: expand(graph, from, rel)[Symbol.iterator](), entry: null, depth: 0 }];
+    // For path reconstruction (wantPath): the vertex this frame explores from,
+    // and the edge taken to reach it (`null` at the seed).
+    vertex: Vertex;
+    entryEdge: Edge | null;
+  }[] = [
+    {
+      iter: expand(graph, from, rel)[Symbol.iterator](),
+      entry: null,
+      depth: 0,
+      vertex: from,
+      entryEdge: null,
+    },
+  ];
 
   while (stack.length > 0) {
     const top = stack[stack.length - 1];
@@ -3384,7 +3443,20 @@ const trailEnds = function* (
     const d = top.depth + 1;
 
     if (d >= q.min) {
-      yield node;
+      // Rebuild the walk `seed … node` from the live stack (each frame's vertex,
+      // then `node`; edges are each frame's entry edge, then this `edge`). A
+      // SIMPLE close reconstructs the closing cycle naturally.
+      if (wantPath) {
+        const verts = stack.map((f) => f.vertex);
+        verts.push(node);
+
+        const edges = stack.map((f) => f.entryEdge).filter((e): e is Edge => e !== null);
+        edges.push(edge);
+
+        yield { end: node, verts, edges };
+      } else {
+        yield { end: node, verts: [], edges: [] };
+      }
     }
 
     if (!isClose) {
@@ -3392,6 +3464,8 @@ const trailEnds = function* (
         iter: expand(graph, node, rel)[Symbol.iterator](),
         entry: markTarget,
         depth: d,
+        vertex: node,
+        entryEdge: edge,
       });
     }
   }

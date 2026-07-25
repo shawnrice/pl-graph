@@ -5042,8 +5042,56 @@ fn shortest_unsupported_shapes_rejected() {
     assert!(parse("MATCH ANY SHORTEST (a)-[]->*(b)-[]->*(c) RETURN c").is_err());
     // min > 1 is not the shortest semantics yet.
     assert!(parse("MATCH ANY SHORTEST (a)-[]->{2,4}(b) RETURN b").is_err());
-    // A named path needs a selector for now.
+    // A named path over a *fixed*-length hop needs a selector; a single
+    // var-length segment binds the path directly (see `bare_path_binds_every_walk`).
     assert!(parse("MATCH p = (a)-[]->(b) RETURN p").is_err());
+    assert!(parse("MATCH p = (a)-[]->{1,3}(b) RETURN p").is_ok());
+    assert!(parse("MATCH p = SIMPLE (a)-[]->{1,3}(b) RETURN p").is_ok());
+}
+
+/// A bare path variable over a single quantified segment (no selector) binds
+/// EVERY walk under the pattern's mode as a full Path — the `all_walk` driver.
+/// Triangle a→b→c→a plus a→d: from `a`, TRAIL (default) yields four walks up to
+/// length 3, and SIMPLE back to `a` keeps only the closing cycle.
+#[test]
+fn bare_path_binds_every_walk() {
+    let lines = [
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+        r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}"#,
+        r#"{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}"#,
+        r#"{"type":"edge","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","from":"b","to":"c","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","from":"c","to":"a","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","from":"a","to":"d","labels":["R"],"properties":{}}"#,
+    ];
+    let mut g = ndjson::decode(&lines.join("\n")).unwrap();
+
+    // TRAIL (default): a-b, a-b-c, a-b-c-a, a-d — four distinct walks.
+    let r = rows(
+        &mut g,
+        "MATCH p = (a:N {id:'a'})-[:R]->{1,3}(x) RETURN x.id AS id ORDER BY path_length(p), id",
+    );
+    assert_eq!(r.len(), 4);
+    let ends: Vec<&Value> = r.iter().map(|row| &row[0]).collect();
+    assert_eq!(ends, vec![&s("b"), &s("d"), &s("c"), &s("a")]);
+
+    // The endpoint of a-b-c-a is the seed again (the trail closes the cycle).
+    let lens = rows(
+        &mut g,
+        "MATCH p = (a:N {id:'a'})-[:R]->{1,3}(x) RETURN path_length(p) AS len ORDER BY len",
+    );
+    assert_eq!(
+        lens,
+        vec![vec![n(1.0)], vec![n(1.0)], vec![n(2.0)], vec![n(3.0)]]
+    );
+
+    // SIMPLE p back to the seed keeps only the closing cycle a-b-c-a.
+    let cyc = rows(
+        &mut g,
+        "MATCH p = SIMPLE (a:N {id:'a'})-[:R]->{1,3}(a) RETURN path_length(p) AS len",
+    );
+    assert_eq!(cyc, vec![vec![n(3.0)]]);
 }
 
 /// ISO GQL path functions over a bound path: `path_length`/`length` (hops),
