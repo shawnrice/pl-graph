@@ -219,34 +219,32 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(ts).toBe(native);
   });
 
-  test('edges(path) — ISO name for the path edge list, == relationships(path)', () => {
+  test('edges(path) — ISO name for the path edge list; relationships() is rejected', () => {
     const base = `MATCH p = ANY SHORTEST (a)-[]->*(b) WHERE a.name = 'marko' AND b.name = 'lop'`;
     const [tsE, natE] = both(`${base} RETURN path_length(p) AS len, edges(p) AS es`);
     expect(tsE).toBe(natE);
-    // `edges` (ISO) and `relationships` (openCypher) are the same accessor.
-    const [tsR, natR] = both(`${base} RETURN edges(p) AS es`);
-    const [tsR2] = both(`${base} RETURN relationships(p) AS es`);
-    expect(tsR).toBe(natR);
-    expect(tsR).toBe(tsR2);
+    // Cypher's `relationships` is deliberately NOT accepted — GQL vocabulary is
+    // node/edge. Both engines reject it as an unknown function.
+    const q = `${base} RETURN relationships(p) AS es`;
+    expect(() => tsQuery(tsGraph, q)).toThrow();
+    expect(() => nativeGraph.query(q)).toThrow();
   });
 
   test('list[i].prop — property access chains off a subscript, byte-identical', () => {
     const base = `MATCH p = ANY SHORTEST (a)-[]->*(b) WHERE a.name = 'marko' AND b.name = 'lop'`;
-    // relationships(p)[0].weight, nodes(p)[i].name, and out-of-range → null all
+    // edges(p)[0].weight, nodes(p)[i].name, and out-of-range → null all
     // agree across engines.
     const [ts, native] = both(
-      `${base} RETURN relationships(p)[0].weight AS w, nodes(p)[0].name AS a, nodes(p)[1].name AS b, relationships(p)[9].weight AS oob`,
+      `${base} RETURN edges(p)[0].weight AS w, nodes(p)[0].name AS a, nodes(p)[1].name AS b, edges(p)[9].weight AS oob`,
     );
     expect(ts).toBe(native);
 
     // Value check on a single column (robust to object key ordering).
-    const [tsW] = both(`${base} RETURN relationships(p)[0].weight AS w`);
+    const [tsW] = both(`${base} RETURN edges(p)[0].weight AS w`);
     expect(tsW).toBe(`[{"w":0.4}]`);
 
     // Consecutive-index comparison — the per-hop path-predicate motif — agrees.
-    const [tsC, natC] = both(
-      `${base} RETURN (relationships(p)[0].weight < relationships(p)[0].weight) AS lt`,
-    );
+    const [tsC, natC] = both(`${base} RETURN (edges(p)[0].weight < edges(p)[0].weight) AS lt`);
     expect(tsC).toBe(natC);
   });
 
@@ -646,7 +644,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     const q =
       `MATCH p = ANY SHORTEST (a)-[]->*(b) WHERE a.name = 'marko' AND b.name = 'lop' ` +
       `RETURN path_length(p) AS len, length(p) AS len2, ` +
-      `nodes(p) AS ns, relationships(p) AS es, elements(p) AS el`;
+      `nodes(p) AS ns, edges(p) AS es, elements(p) AS el`;
     const [ts, native] = both(q);
     expect(ts).toBe(native);
     // Length is the hop count; nodes/edges/elements are rich element lists.

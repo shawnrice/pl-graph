@@ -1402,7 +1402,7 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
             }
         }
         CExpr::Field { base, key_ref } => {
-            // Property access chained off any expression (`relationships(p)[0].amount`).
+            // Property access chained off any expression (`edges(p)[0].amount`).
             // Reuses `prop_of`: a Node/Edge base reads the stored property; anything
             // else (null / list / scalar) → null, matching the bare `Prop` path.
             let base_v = eval(env, base);

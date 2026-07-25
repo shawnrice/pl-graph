@@ -199,9 +199,10 @@ fn scalar_fn(name: &str) -> ScalarFn {
         // `keys` is the openCypher spelling of the same thing.
         "keys" | "property_names" => ScalarFn::Keys,
         "nodes" => ScalarFn::PathNodes,
-        // `edges` is the ISO GQL name for a path's edge list; `relationships` is
-        // the openCypher spelling of the same accessor.
-        "relationships" | "edges" => ScalarFn::PathEdges,
+        // `edges` is the ISO GQL name for a path's edge list. Cypher's
+        // `relationships` is deliberately NOT accepted — GQL's element
+        // vocabulary is node/edge (Spanner + Fabric GQL both use `edges`).
+        "edges" => ScalarFn::PathEdges,
         "elements" => ScalarFn::PathElements,
         "tostring" | "to_string" => ScalarFn::ToString,
         "tointeger" | "to_integer" => ScalarFn::ToInteger,
@@ -267,7 +268,7 @@ pub enum CExpr {
         index: Box<Self>,
     },
     /// Property access on an arbitrary expression (`base.key`) — the postfix
-    /// chain form (`relationships(p)[0].amount`). `key_ref` resolves like `Prop`.
+    /// chain form (`edges(p)[0].amount`). `key_ref` resolves like `Prop`.
     Field {
         base: Box<Self>,
         key_ref: usize,

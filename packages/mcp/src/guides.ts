@@ -111,9 +111,9 @@ MATCH (a:Acct)-[e:SENT WHERE e.amount >= 1000]->{1,5}(b) RETURN b
 **Bind the whole path** to a variable and read its pieces:
 \`\`\`
 MATCH p = (a:Acct)-[:SENT]->{2,6}(b)
-RETURN path_length(p) AS hops, nodes(p) AS ns, relationships(p) AS rels
+RETURN path_length(p) AS hops, nodes(p) AS ns, edges(p) AS rels
 \`\`\`
-Path element access is 0-based: \`relationships(p)[0].amount\`, \`nodes(p)[1].id\`.
+Path element access is 0-based: \`edges(p)[0].amount\`, \`nodes(p)[1].id\`.
 
 **Path selectors and modes** pick which of many matching paths to keep:
 \`\`\`
@@ -494,10 +494,10 @@ Every hop meets a condition — put the \`WHERE\` inside the relationship bracke
 \`\`\`
 MATCH p = (a:Acct {id: $id})-[e:SENT WHERE e.amount >= 1000]->{4,6}(b) RETURN nodes(p)
 \`\`\`
-For conditions relating **consecutive** hops (e.g. each hop within 24h of the prior, amount within 10%), compare adjacent path elements — \`relationships(p)[i]\` against \`[i-1]\`:
+For conditions relating **consecutive** hops (e.g. each hop within 24h of the prior, amount within 10%), compare adjacent path elements — \`edges(p)[i]\` against \`[i-1]\`:
 \`\`\`
 MATCH p = (a:Acct)-[:SENT]->{2,6}(b)
-WHERE datetime(relationships(p)[1].ts) < datetime(relationships(p)[0].ts) + duration('PT24H')
+WHERE datetime(edges(p)[1].ts) < datetime(edges(p)[0].ts) + duration('PT24H')
   -- add one clause per index up to the max hop; guard the optional tail with IS NULL
 RETURN p
 \`\`\`

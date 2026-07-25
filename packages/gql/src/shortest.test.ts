@@ -85,12 +85,12 @@ describe('ANY SHORTEST path patterns', () => {
     expect(names(rows)).toEqual(['josh', 'lop', 'vadas']);
   });
 
-  test('ISO path functions: path_length/length, nodes, relationships, elements', () => {
+  test('ISO path functions: path_length/length, nodes, edges, elements', () => {
     const rows = query(
       modern(),
       "MATCH p = ANY SHORTEST (a)-[]->*(b) WHERE a.name = 'marko' AND b.name = 'ripple' " +
         'RETURN path_length(p) AS len, length(p) AS len2, ' +
-        'nodes(p) AS ns, relationships(p) AS es, elements(p) AS el',
+        'nodes(p) AS ns, edges(p) AS es, elements(p) AS el',
     );
     expect(rows).toHaveLength(1);
     const [row] = rows;

@@ -5066,7 +5066,7 @@ fn postfix_property_chains_off_a_subscript() {
     let path = "MATCH p = ANY SHORTEST (a:N {id:'n0'})-[:R]->*(b:N {id:'n2'})";
 
     assert_eq!(
-        rows(&mut g, &format!("{path} RETURN relationships(p)[0].w AS w")),
+        rows(&mut g, &format!("{path} RETURN edges(p)[0].w AS w")),
         vec![vec![n(5.0)]]
     );
     assert_eq!(
@@ -5075,14 +5075,14 @@ fn postfix_property_chains_off_a_subscript() {
     );
     // out-of-range subscript → null, and `.prop` on that null stays null.
     assert_eq!(
-        rows(&mut g, &format!("{path} RETURN relationships(p)[9].w AS w")),
+        rows(&mut g, &format!("{path} RETURN edges(p)[9].w AS w")),
         vec![vec![Value::Null]]
     );
     // consecutive-hop comparison: hop 1's weight (9) > hop 0's (5).
     assert_eq!(
         rows(
             &mut g,
-            &format!("{path} RETURN relationships(p)[1].w > relationships(p)[0].w AS inc")
+            &format!("{path} RETURN edges(p)[1].w > edges(p)[0].w AS inc")
         ),
         vec![vec![b(true)]]
     );
@@ -5205,14 +5205,14 @@ fn bare_path_min_zero_binds_the_seed() {
     assert_eq!(lens[0], vec![n(0.0)], "the empty walk binds path_length 0");
 }
 
-/// The bound path carries its actual edges: relationships(p) length == hops.
+/// The bound path carries its actual edges: edges(p) length == hops.
 #[test]
-fn bare_path_relationships_match_hop_count() {
+fn bare_path_edges_match_hop_count() {
     let mut g = triangle_tail();
     let r = rows(
         &mut g,
         "MATCH p = (a:N {id:'a'})-[:R]->{1,3}(x) \
-         RETURN path_length(p) AS len, size(relationships(p)) AS es ORDER BY len, x.id",
+         RETURN path_length(p) AS len, size(edges(p)) AS es ORDER BY len, x.id",
     );
     // Every row's edge count equals its hop count.
     assert!(
@@ -5779,7 +5779,7 @@ fn bare_path_binds_every_walk() {
 }
 
 /// ISO GQL path functions over a bound path: `path_length`/`length` (hops),
-/// `nodes`/`relationships` (element lists), `elements` (interleaved).
+/// `nodes`/`edges` (element lists), `elements` (interleaved).
 #[test]
 fn path_accessor_functions() {
     let mut g = modern();
@@ -5789,7 +5789,7 @@ fn path_accessor_functions() {
         &mut g,
         "MATCH p = ANY SHORTEST (a)-[]->*(b) WHERE a.name='marko' AND b.name='ripple' \
          RETURN path_length(p) AS len, length(p) AS len2, \
-                nodes(p) AS ns, relationships(p) AS es, elements(p) AS el",
+                nodes(p) AS ns, edges(p) AS es, elements(p) AS el",
     );
     assert_eq!(r.len(), 1);
     let row = &r[0];
@@ -5814,9 +5814,9 @@ fn path_accessor_functions() {
         vec!["marko", "josh", "ripple"]
     );
 
-    // relationships(p): the two edges.
+    // edges(p): the two edges.
     let Value::List(es) = &row[3] else {
-        panic!("relationships(p) should be a list");
+        panic!("edges(p) should be a list");
     };
     assert_eq!(es.len(), 2);
 

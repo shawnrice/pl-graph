@@ -868,9 +868,9 @@ const callGraphFn = (name: string, a: unknown): unknown => {
     // interleaved iteration (vertex, edge, …, vertex).
     case 'nodes':
       return a instanceof Path ? [...a.vertices] : null;
-    // `edges` is the ISO GQL name; `relationships` is the openCypher spelling.
+    // `edges` is the ISO GQL name (Cypher's `relationships` is deliberately not
+    // accepted — GQL's element vocabulary is node/edge).
     case 'edges':
-    case 'relationships':
       return a instanceof Path ? [...a.edges] : null;
     case 'elements':
       return a instanceof Path ? [...a] : null;
@@ -1259,7 +1259,7 @@ const compileExpr = (expr: Expr): CompiledExpr => {
       };
     }
     case 'field': {
-      // Property access chained off any expression (`relationships(p)[0].amount`).
+      // Property access chained off any expression (`edges(p)[0].amount`).
       // `propOf` reads a node/edge's stored property; anything else → null, exactly
       // like the bare `prop` path.
       const baseF = compileExpr(expr.base);
