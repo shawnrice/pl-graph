@@ -2648,21 +2648,69 @@ struct WalkSpec {
     want_path: bool,
 }
 
-/// `reachable_each`'s per-trail sink: `(endpoint, vertices, edges) -> keep-going`.
-type OnEnd<'a> = &'a mut dyn FnMut(u32, &[u32], &[u32]) -> bool;
+/// `reachable_each`'s per-trail sink: `(binding, endpoint, vertices, edges) ->
+/// keep-going`. The binding is threaded through so the driver can bind each hop's
+/// edge for a per-hop predicate; the sink binds the endpoint node on top of it.
+type OnEnd<'a> = &'a mut dyn FnMut(&mut Binding, u32, &[u32], &[u32]) -> bool;
+
+/// Does edge `eidx` satisfy the segment's per-hop predicate (inline properties +
+/// `WHERE`)? The optional edge variable is bound to this edge for the duration of
+/// the check so the predicate can name it (`e.amt > $t`); outer bound variables in
+/// `binding` stay visible, and the slot is restored afterward.
+fn edge_passes(graph: &Graph, ctx: &Ctx, binding: &mut Binding, rel: &CRel, eidx: u32) -> bool {
+    if rel.props.is_empty() && rel.where_.is_none() {
+        return true;
+    }
+    let restore = rel.var_slot.map(|s| {
+        let prev = binding.get(s).cloned();
+        binding.set(s, Val::Edge(eidx));
+        (s, prev)
+    });
+    let ok = satisfies(
+        graph,
+        ctx,
+        &Val::Edge(eidx),
+        &rel.props,
+        rel.where_.as_ref(),
+        binding,
+    );
+    if let Some((s, prev)) = restore {
+        match prev {
+            Some(v) => binding.set(s, v),
+            None => binding.unset(s),
+        }
+    }
+    ok
+}
+
+/// Expand one segment from `v`, keeping only edges that pass the per-hop predicate
+/// (when the segment carries one). Materialised into a `Vec` because the DFS stack
+/// needs a resumable per-frame cursor.
+fn expand_filtered(
+    graph: &Graph,
+    ctx: &Ctx,
+    binding: &mut Binding,
+    rel: &CRel,
+    v: u32,
+) -> Vec<(u32, u32)> {
+    if rel.props.is_empty() && rel.where_.is_none() {
+        return expand(graph, ctx, v, rel.direction, rel.label.as_ref()).collect();
+    }
+    expand(graph, ctx, v, rel.direction, rel.label.as_ref())
+        .filter(|(eidx, _)| edge_passes(graph, ctx, binding, rel, *eidx))
+        .collect()
+}
 
 fn reachable_each(
     graph: &Graph,
     ctx: &Ctx,
+    binding: &mut Binding,
     from: u32,
     rel: &CRel,
     spec: WalkSpec,
     on_end: OnEnd<'_>,
 ) -> bool {
     let WalkSpec { q, mode, want_path } = spec;
-    let collect = |v: u32| -> Vec<(u32, u32)> {
-        expand(graph, ctx, v, rel.direction, rel.label.as_ref()).collect()
-    };
 
     // Once the budget is blown, every later expansion short-circuits (the row
     // boundary will surface the fault) — otherwise each seed vertex would burn a
@@ -2671,7 +2719,7 @@ fn reachable_each(
         return true;
     }
 
-    if q.min == 0 && !on_end(from, &[from], &[]) {
+    if q.min == 0 && !on_end(binding, from, &[from], &[]) {
         return false;
     }
 
@@ -2708,7 +2756,7 @@ fn reachable_each(
         entry_edge: Option<u32>,
     }
     let mut stack: Vec<Frame> = vec![Frame {
-        edges: collect(from),
+        edges: expand_filtered(graph, ctx, binding, rel, from),
         idx: 0,
         depth: 0,
         entry: None,
@@ -2783,7 +2831,7 @@ fn reachable_each(
         } else {
             (Vec::new(), Vec::new())
         };
-        if d >= q.min && !on_end(nbr, &pv, &pe) {
+        if d >= q.min && !on_end(binding, nbr, &pv, &pe) {
             // Consumer stop: clear this mark + the live stack's marks so a pooled
             // buffer is returned all-`false`, then bail.
             cont = false;
@@ -2800,7 +2848,7 @@ fn reachable_each(
 
         if !is_close {
             stack.push(Frame {
-                edges: collect(nbr),
+                edges: expand_filtered(graph, ctx, binding, rel, nbr),
                 idx: 0,
                 depth: d,
                 entry: mark_idx,
@@ -2828,9 +2876,14 @@ fn reachable(
     mode: PathMode,
 ) -> Vec<u32> {
     let mut ends: Vec<u32> = Vec::new();
+    // Endpoint-only collector for predicate-free var-length segments (the count
+    // replay path). Patterns carrying a per-hop predicate are routed to the general
+    // matcher upstream, so the throwaway binding here never drives a filter.
+    let mut scratch = Binding::default();
     reachable_each(
         graph,
         ctx,
+        &mut scratch,
         from,
         rel,
         WalkSpec {
@@ -2838,7 +2891,7 @@ fn reachable(
             mode,
             want_path: false,
         },
-        &mut |e, _, _| {
+        &mut |_b, e, _, _| {
             ends.push(e);
             true
         },
@@ -2862,13 +2915,15 @@ fn walk_segments(
     }
     let CSegment { rel, node } = &pattern.segments[index];
     if let Some(q) = rel.quantifier {
-        // Var-length: edge variable / per-edge predicate not bound (known simplification).
-        // Stream endpoints and stop the moment a consumer (EXISTS / LIMIT) is satisfied
-        // — `match_node_then` returns false to propagate the stop, which `reachable_each`
-        // returns, avoiding an exponential trail enumeration on a dense graph.
+        // Var-length: `reachable_each` binds each hop's edge for the per-hop
+        // predicate (inline props / WHERE) as it walks. Stream endpoints and stop
+        // the moment a consumer (EXISTS / LIMIT) is satisfied — `match_node_then`
+        // returns false to propagate the stop, which `reachable_each` returns,
+        // avoiding an exponential trail enumeration on a dense graph.
         return reachable_each(
             graph,
             ctx,
+            binding,
             from,
             rel,
             WalkSpec {
@@ -2876,9 +2931,9 @@ fn walk_segments(
                 mode: pattern.mode,
                 want_path: false,
             },
-            &mut |end, _, _| {
-                match_node_then(graph, ctx, binding, node, end, &mut |b| {
-                    walk_segments(graph, ctx, pattern, index + 1, end, b, emit)
+            &mut |b, end, _, _| {
+                match_node_then(graph, ctx, b, node, end, &mut |b2| {
+                    walk_segments(graph, ctx, pattern, index + 1, end, b2, emit)
                 })
             },
         );
@@ -3219,6 +3274,7 @@ fn all_walk(
     reachable_each(
         graph,
         ctx,
+        binding,
         seed,
         rel,
         WalkSpec {
@@ -3226,8 +3282,8 @@ fn all_walk(
             mode: pattern.mode,
             want_path: true,
         },
-        &mut |end, verts, edges| {
-            match_node_then(graph, ctx, binding, end_node, end, &mut |b| {
+        &mut |b, end, verts, edges| {
+            match_node_then(graph, ctx, b, end_node, end, &mut |b| {
                 if let Some(s) = path_slot {
                     b.set(
                         s,
@@ -3695,6 +3751,7 @@ fn match_path<F: FnMut(&mut Binding) -> bool>(
         return reachable_each(
             graph,
             ctx,
+            binding,
             from,
             rel,
             WalkSpec {
@@ -3702,9 +3759,7 @@ fn match_path<F: FnMut(&mut Binding) -> bool>(
                 mode: path.mode,
                 want_path: false,
             },
-            &mut |end, _, _| {
-                match_node_continue(graph, ctx, binding, node, end, path, idx + 1, emit)
-            },
+            &mut |b, end, _, _| match_node_continue(graph, ctx, b, node, end, path, idx + 1, emit),
         );
     }
     for (eidx, nbr) in expand(graph, ctx, from, rel.direction, rel.label.as_ref()) {
@@ -11239,11 +11294,18 @@ fn run_cquery_body(plan: &CQuery, graph: &mut Graph, params: &[Val]) -> CodeResu
 fn linear_needs_general_matcher(linear: &CLinear) -> bool {
     linear.clauses.iter().any(|c| {
         matches!(c, CClause::Match { patterns, .. }
-            if patterns.iter().any(|p| p.selector != PathSelector::Walk
-                || p.mode != PathMode::Trail
-                // A bound path variable needs the general matcher — only it builds
-                // the Path value (via `all_walk`/`shortest_walk`).
-                || p.path_var_slot.is_some()))
+        if patterns.iter().any(|p| p.selector != PathSelector::Walk
+            || p.mode != PathMode::Trail
+            // A bound path variable needs the general matcher — only it builds
+            // the Path value (via `all_walk`/`shortest_walk`).
+            || p.path_var_slot.is_some()
+            // A per-hop edge predicate on a quantified segment is evaluated only
+            // by the general matcher's `reachable_each`; the count / vectorized
+            // shortcuts count or scan without it and would over-count.
+            || p.segments.iter().any(|s| {
+                s.rel.quantifier.is_some()
+                    && (!s.rel.props.is_empty() || s.rel.where_.is_some())
+            })))
     })
 }
 

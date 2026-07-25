@@ -93,6 +93,14 @@ fn bidir_pair() -> Graph {
     ])
 }
 
+/// Run a query and return column 0 of every row, sorted by debug repr — for
+/// set-comparing unordered endpoint results deterministically.
+fn sorted_col0(g: &mut Graph, query: &str) -> Vec<Value> {
+    let mut v: Vec<Value> = rows(g, query).into_iter().map(|r| r[0].clone()).collect();
+    v.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
+    v
+}
+
 /// Sorted endpoint ids from `MATCH <mode> (a{id:'a'})-[:R]->{lo,hi}(x) RETURN x.id`.
 /// A convenience for asserting exactly which endpoints a path mode admits.
 fn mode_ends(g: &mut Graph, mode: &str, lo: u32, hi: u32) -> Vec<Value> {
@@ -3452,11 +3460,17 @@ fn skip_limit_quantifier_valid_forms_still_parse() {
 }
 
 #[test]
-fn var_length_rejects_edge_variable_and_predicate() {
-    // A quantified segment binds no single edge, so these can't be honored.
-    assert!(parse("MATCH (a)-[r:KNOWS]->*(b) RETURN b").is_err());
-    assert!(parse("MATCH (a)-[:KNOWS {weight:1}]->+(b) RETURN b").is_err());
-    assert!(parse("MATCH (a)-[:KNOWS WHERE true]->+(b) RETURN b").is_err());
+fn var_length_accepts_per_hop_predicate() {
+    // A quantified segment may now carry a per-hop edge predicate (applied to every
+    // edge of the walk) and name each hop's edge for it. See
+    // `per_hop_predicate_filters_var_length_edges` for the execution semantics.
+    assert!(parse("MATCH (a)-[r:KNOWS]->*(b) RETURN b").is_ok());
+    assert!(parse("MATCH (a)-[:KNOWS {weight:1}]->+(b) RETURN b").is_ok());
+    assert!(parse("MATCH (a)-[:KNOWS WHERE true]->+(b) RETURN b").is_ok());
+    assert!(parse("MATCH (a)-[e:KNOWS WHERE e.weight > 0.5]->{1,5}(b) RETURN b").is_ok());
+    // …but not together with a shortest selector (the BFS drivers ignore it).
+    assert!(parse("MATCH ANY SHORTEST (a)-[e:R WHERE e.w > 1]->*(b) RETURN b").is_err());
+    assert!(parse("MATCH p = ALL SHORTEST (a)-[:R {w:1}]->*(b) RETURN p").is_err());
 }
 
 #[test]
@@ -5279,6 +5293,116 @@ fn postfix_prop_of_missing_key_is_null() {
         "MATCH p = ANY SHORTEST (a:N {id:'a'})-[:R]->*(b:N {id:'c'}) RETURN nodes(p)[0].nope AS x",
     );
     assert_eq!(r, vec![vec![Value::Null]]);
+}
+
+// ---------------------------------------------------------------------------
+// Per-hop edge predicates on variable-length segments — the predicate (inline
+// props or WHERE, optionally naming each hop's edge) filters EVERY edge of the
+// walk. A weighted chain a→b→c→d with an increasing then dropping weight.
+// ---------------------------------------------------------------------------
+
+/// a=(amt 10)=>b=(amt 20)=>c=(amt 5)=>d. The per-hop predicate filters each edge.
+fn weighted_chain() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+        r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}"#,
+        r#"{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}"#,
+        r#"{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{"amt":10.0}}"#,
+        r#"{"type":"edge","id":"e2","from":"b","to":"c","labels":["R"],"properties":{"amt":20.0}}"#,
+        r#"{"type":"edge","id":"e3","from":"c","to":"d","labels":["R"],"properties":{"amt":5.0}}"#,
+    ])
+}
+
+/// `WHERE e.amt >= 10` per hop: e3 (amt 5) is excluded, so from `a` the walk can
+/// reach b and c but never d.
+#[test]
+fn per_hop_predicate_filters_var_length_edges() {
+    let mut g = weighted_chain();
+    let ends = sorted_col0(
+        &mut g,
+        "MATCH (a:N {id:'a'})-[e:R WHERE e.amt >= 10]->{1,3}(x) RETURN x.id AS id",
+    );
+    assert_eq!(
+        ends,
+        vec![s("b"), s("c")],
+        "d is unreachable — e3 (amt 5) is filtered"
+    );
+}
+
+/// Loosening the threshold to admit every edge restores the full reach (b, c, d).
+#[test]
+fn per_hop_predicate_admitting_all_edges_reaches_all() {
+    let mut g = weighted_chain();
+    let ends = sorted_col0(
+        &mut g,
+        "MATCH (a:N {id:'a'})-[e:R WHERE e.amt >= 1]->{1,3}(x) RETURN x.id AS id",
+    );
+    assert_eq!(ends, vec![s("b"), s("c"), s("d")]);
+}
+
+/// The threshold can come from a parameter (the AML motif: host-supplied cutoff).
+#[test]
+fn per_hop_predicate_reads_a_parameter() {
+    let mut g = weighted_chain();
+    let mut params = Params::new();
+    params.insert("t".into(), super::eval::Val::Num(10.0));
+    let mut ends: Vec<Value> = qp(
+        &mut g,
+        "MATCH (a:N {id:'a'})-[e:R WHERE e.amt >= $t]->{1,3}(x) RETURN x.id AS id",
+        params,
+    )
+    .into_iter()
+    .map(|r| r[0].clone())
+    .collect();
+    ends.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
+    assert_eq!(ends, vec![s("b"), s("c")]);
+}
+
+/// Inline property equality is a per-hop predicate too: `{amt:20}` keeps only the
+/// single edge whose amount is 20 (b→c), so from `a` no walk qualifies (a→b is 10).
+#[test]
+fn per_hop_inline_property_filters_edges() {
+    let mut g = weighted_chain();
+    // Only b→c has amt 20, but you can't reach b via a qualifying edge, so empty.
+    let from_a = rows(
+        &mut g,
+        "MATCH (a:N {id:'a'})-[:R {amt:20.0}]->{1,3}(x) RETURN x.id AS id",
+    );
+    assert!(from_a.is_empty());
+    // From b, the first hop b→c (amt 20) qualifies; c→d (amt 5) does not.
+    let ends = sorted_col0(
+        &mut g,
+        "MATCH (b:N {id:'b'})-[:R {amt:20.0}]->{1,3}(x) RETURN x.id AS id",
+    );
+    assert_eq!(ends, vec![s("c")]);
+}
+
+/// The per-hop predicate composes with a bound path variable: the bound Path
+/// contains only qualifying edges.
+#[test]
+fn per_hop_predicate_with_path_binding() {
+    let mut g = weighted_chain();
+    let r = rows(
+        &mut g,
+        "MATCH p = (a:N {id:'a'})-[e:R WHERE e.amt >= 10]->{1,3}(x) \
+         RETURN path_length(p) AS len ORDER BY len",
+    );
+    // a-b (len 1) and a-b-c (len 2); a-b-c-d blocked at e3.
+    assert_eq!(r, vec![vec![n(1.0)], vec![n(2.0)]]);
+}
+
+/// The per-hop predicate may reference an outer bound variable (correlation).
+#[test]
+fn per_hop_predicate_references_outer_variable() {
+    let mut g = weighted_chain();
+    // a.id = 'a'; a nonsensical-but-valid correlation: keep edges whose amt > 8
+    // only when the seed is 'a'. Exercises outer-var visibility inside the filter.
+    let ends = sorted_col0(
+        &mut g,
+        "MATCH (a:N {id:'a'})-[e:R WHERE e.amt >= 10 AND a.id = 'a']->{1,3}(x) RETURN x.id AS id",
+    );
+    assert_eq!(ends, vec![s("b"), s("c")]);
 }
 
 // ---------------------------------------------------------------------------

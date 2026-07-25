@@ -1835,3 +1835,77 @@ suite('gql conformance: bare path binding — every walk as a Path, byte-identic
     expect(JSON.parse(ts)).toHaveLength(1);
   });
 });
+
+// Per-hop edge predicates on variable-length segments: the predicate (inline
+// props / WHERE, optionally naming each hop's edge) filters every edge of the
+// walk. Byte-identical across engines on a shared weighted chain a→b→c→d.
+suite('gql conformance: per-hop edge predicate on var-length — byte-identical', () => {
+  const NDJSON = [
+    { type: 'node', id: 'a', labels: ['N'], properties: { id: 'a' } },
+    { type: 'node', id: 'b', labels: ['N'], properties: { id: 'b' } },
+    { type: 'node', id: 'c', labels: ['N'], properties: { id: 'c' } },
+    { type: 'node', id: 'd', labels: ['N'], properties: { id: 'd' } },
+    { type: 'edge', id: 'e1', from: 'a', to: 'b', labels: ['R'], properties: { amt: 10 } },
+    { type: 'edge', id: 'e2', from: 'b', to: 'c', labels: ['R'], properties: { amt: 20 } },
+    { type: 'edge', id: 'e3', from: 'c', to: 'd', labels: ['R'], properties: { amt: 5 } },
+  ]
+    .map((r) => JSON.stringify(r))
+    .join('\n');
+
+  const backend = createFfiBackend(LIB);
+  const nativeGraph = graphFromFormat(backend, NDJSON, 'ndjson');
+  const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
+  const both = (q: string): [string, string] => [
+    JSON.stringify(tsQuery(tsGraph, q)),
+    JSON.stringify(nativeGraph.query(q)),
+  ];
+
+  test('WHERE e.amt >= 10 filters the low-weight hop (d unreachable)', () => {
+    const [ts, native] = both(
+      `MATCH (a:N {id:'a'})-[e:R WHERE e.amt >= 10]->{1,3}(x) RETURN x.id AS id ORDER BY id`,
+    );
+    expect(ts).toBe(native);
+    expect(JSON.parse(ts)).toEqual([{ id: 'b' }, { id: 'c' }]);
+  });
+
+  test('loosening the threshold restores full reach', () => {
+    const [ts, native] = both(
+      `MATCH (a:N {id:'a'})-[e:R WHERE e.amt >= 1]->{1,3}(x) RETURN x.id AS id ORDER BY id`,
+    );
+    expect(ts).toBe(native);
+    expect(JSON.parse(ts)).toEqual([{ id: 'b' }, { id: 'c' }, { id: 'd' }]);
+  });
+
+  test('inline property predicate {amt:20} filters each hop', () => {
+    const [ts, native] = both(
+      `MATCH (b:N {id:'b'})-[:R {amt:20}]->{1,3}(x) RETURN x.id AS id ORDER BY id`,
+    );
+    expect(ts).toBe(native);
+    expect(JSON.parse(ts)).toEqual([{ id: 'c' }]);
+  });
+
+  test('predicate composes with a bound path variable', () => {
+    const [ts, native] = both(
+      `MATCH p = (a:N {id:'a'})-[e:R WHERE e.amt >= 10]->{1,3}(x) ` +
+        `RETURN nodes(p) AS ns ORDER BY path_length(p), x.id`,
+    );
+    expect(ts).toBe(native);
+    expect(JSON.parse(ts)).toHaveLength(2);
+  });
+
+  test('count(*) over a predicated var-length agrees (general matcher routing)', () => {
+    const [ts, native] = both(
+      `MATCH (a:N {id:'a'})-[e:R WHERE e.amt >= 10]->{1,3}(x) RETURN count(*) AS c`,
+    );
+    expect(ts).toBe(native);
+  });
+
+  test('per-hop predicate + ANY SHORTEST is rejected by both engines', () => {
+    expect(() =>
+      tsQuery(tsGraph, `MATCH ANY SHORTEST (a:N {id:'a'})-[e:R WHERE e.amt > 1]->*(x) RETURN x`),
+    ).toThrow();
+    expect(() =>
+      nativeGraph.query(`MATCH ANY SHORTEST (a:N {id:'a'})-[e:R WHERE e.amt > 1]->*(x) RETURN x`),
+    ).toThrow();
+  });
+});

@@ -597,20 +597,14 @@ impl Parser {
             let start = p.parse_node()?;
             let mut segments = Vec::new();
             while p.starts_relationship() {
-                let seg_pos = p.peek().pos;
                 let mut rel = p.parse_rel()?;
                 rel.quantifier = p.parse_quantifier()?;
-                // A variable-length segment reaches a *set* of far vertices; it
-                // binds no single edge, so an edge variable or per-edge predicate
-                // can't be honored. Reject rather than silently ignore them.
-                if rel.quantifier.is_some()
-                    && (rel.variable.is_some() || !rel.props.is_empty() || rel.where_.is_some())
-                {
-                    return err(
-                        "A variable-length relationship cannot bind an edge variable or carry a per-edge predicate (not yet supported)",
-                        seg_pos,
-                    );
-                }
+                // A quantified segment may carry a *per-hop* predicate — inline
+                // properties or a `WHERE` — applied to every edge of the walk
+                // (`(a)-[e:R WHERE e.amt > $t]->{1,5}(b)`). The optional edge
+                // variable is scoped to that predicate (it names each hop's edge in
+                // turn); it is not yet a group/list variable exposed to the outer
+                // query, so referencing it outside the segment reads as null.
                 let node = p.parse_node()?;
                 segments.push(Segment { rel, node });
             }
@@ -624,6 +618,16 @@ impl Parser {
                 if !ok {
                     return err(
                         "ANY SHORTEST currently supports a single variable-length segment with a `*` or `+` (min ≤ 1) quantifier, e.g. `(a)-[]->*(b)`",
+                        sel_pos,
+                    );
+                }
+                // The shortest drivers are pure BFS over labels — they do not yet
+                // evaluate a per-hop edge predicate. Reject the combination rather
+                // than silently ignoring the filter.
+                let seg = &segments[0].rel;
+                if !seg.props.is_empty() || seg.where_.is_some() {
+                    return err(
+                        "a per-hop edge predicate on a variable-length segment is not yet supported together with a path selector (ANY/ALL SHORTEST)",
                         sel_pos,
                     );
                 }

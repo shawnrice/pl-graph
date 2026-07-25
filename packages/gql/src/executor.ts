@@ -2656,40 +2656,49 @@ const compileNode = (node: NodePattern): CNode => {
   };
 };
 
-const compileRel = (rel: RelPattern): CRel => {
-  // A variable-length segment reaches a *set* of far vertices; it does not bind
-  // a single edge, so a bound edge variable or a per-edge predicate cannot be
-  // honored. Rather than silently ignore them (returning unbound/unfiltered
-  // results), reject at compile time. ISO would bind a group variable / list of
-  // edges here — not yet implemented.
-  if (rel.quantifier && (rel.variable !== undefined || rel.properties?.length || rel.where)) {
-    // Native rejects this as a grammar restriction at parse time (E_SYNTAX); match
-    // that code so the two engines fault byte-identically on the same query.
-    throw new LenkeError(
-      'A variable-length relationship cannot bind an edge variable or carry a per-edge predicate (not yet supported)',
-      { code: ErrorCode.Syntax },
-    );
+// A quantified segment may carry a per-hop predicate (inline props / WHERE),
+// applied to every edge of the walk; the optional edge variable names each hop's
+// edge in turn for that predicate (it is not yet a group/list variable exposed to
+// the outer query). `trailEnds` binds and filters each hop.
+const compileRel = (rel: RelPattern): CRel => ({
+  variable: rel.variable,
+  label: rel.label,
+  direction: rel.direction,
+  pred: compilePredicate(rel.properties, rel.where),
+  quantifier: rel.quantifier,
+});
+
+const relHasPredicate = (rel: RelPattern): boolean =>
+  (rel.properties?.length ?? 0) > 0 || rel.where !== undefined;
+
+const compilePath = (pattern: PathPattern): CPath => {
+  const selector = pattern.selector ?? 'walk';
+
+  // The shortest drivers are pure BFS over labels — they do not evaluate a per-hop
+  // edge predicate. Reject rather than silently ignore the filter (native rejects
+  // the same shape at parse time; both fault E_SYNTAX).
+  if (selector === 'anyShortest' || selector === 'allShortest') {
+    const seg = pattern.segments[0]?.rel;
+
+    if (seg?.quantifier && relHasPredicate(seg)) {
+      throw new LenkeError(
+        'a per-hop edge predicate on a variable-length segment is not yet supported together with a path selector (ANY/ALL SHORTEST)',
+        { code: ErrorCode.Syntax },
+      );
+    }
   }
 
   return {
-    variable: rel.variable,
-    label: rel.label,
-    direction: rel.direction,
-    pred: compilePredicate(rel.properties, rel.where),
-    quantifier: rel.quantifier,
+    start: compileNode(pattern.start),
+    segments: pattern.segments.map(({ rel, node }) => ({
+      rel: compileRel(rel),
+      node: compileNode(node),
+    })),
+    ...(pattern.pathVar !== undefined ? { pathVar: pattern.pathVar } : {}),
+    selector,
+    mode: pattern.mode ?? 'trail',
   };
 };
-
-const compilePath = (pattern: PathPattern): CPath => ({
-  start: compileNode(pattern.start),
-  segments: pattern.segments.map(({ rel, node }) => ({
-    rel: compileRel(rel),
-    node: compileNode(node),
-  })),
-  ...(pattern.pathVar !== undefined ? { pathVar: pattern.pathVar } : {}),
-  selector: pattern.selector ?? 'walk',
-  mode: pattern.mode ?? 'trail',
-});
 
 /**
  * The ISO element-pattern predicate: every property-map entry must equal the
@@ -3228,14 +3237,12 @@ const allWalk = function* (
 ): Iterable<Binding> {
   const [{ rel, node: endNode }] = pattern.segments;
 
-  for (const { end, verts, edges } of trailEnds(
-    graph,
-    seed,
-    rel,
-    rel.quantifier!,
-    pattern.mode ?? 'trail',
-    true,
-  )) {
+  for (const { end, verts, edges } of trailEnds(graph, seed, rel, rel.quantifier!, {
+    mode: pattern.mode ?? 'trail',
+    binding,
+    params,
+    wantPath: true,
+  })) {
     const matched = matchNode(binding, endNode, end, params, graph);
 
     if (!matched) {
@@ -3273,10 +3280,13 @@ const walkSegments = function* (
 
   // Variable-length: enumerate the endpoint of every trail within [min, max]
   // hops (one per trail → ISO per-path multiplicity), then continue from each.
-  // (The edge variable and per-edge predicate aren't bound for var-length
-  // segments — rejected at compile time.)
+  // `trailEnds` binds and filters each hop's edge for a per-hop predicate.
   if (rel.quantifier) {
-    for (const { end } of trailEnds(graph, from, rel, rel.quantifier, pattern.mode ?? 'trail')) {
+    for (const { end } of trailEnds(graph, from, rel, rel.quantifier, {
+      mode: pattern.mode ?? 'trail',
+      binding,
+      params,
+    })) {
       const matched = matchNode(binding, node, end, params, graph);
 
       if (matched) {
@@ -3323,16 +3333,31 @@ const TRAIL_BUDGET = 1_000_000;
  */
 type TrailEnd = { end: Vertex; verts: readonly Vertex[]; edges: readonly Edge[] };
 
+type TrailOpts = {
+  mode: PathMode;
+  // The binding at the segment's start (outer bound vars stay visible to a per-hop
+  // predicate) and the query params. Each hop's edge is bound onto `binding` for
+  // the predicate; the binding itself is not mutated.
+  binding: Binding;
+  params: Params;
+  // When true, reconstruct each trail's vertices/edges from the frame stack (a
+  // path variable needs the whole walk); otherwise `verts`/`edges` are empty.
+  wantPath?: boolean;
+};
+
 const trailEnds = function* (
   graph: Graph,
   from: Vertex,
   rel: CRel,
   q: NonNullable<CRel['quantifier']>,
-  mode: PathMode,
-  // When true, reconstruct each trail's vertices/edges from the frame stack (a
-  // path variable needs the whole walk); otherwise `verts`/`edges` are empty.
-  wantPath = false,
+  opts: TrailOpts,
 ): Iterable<TrailEnd> {
+  const { mode, binding, params, wantPath = false } = opts;
+
+  // A per-hop predicate (inline props / WHERE) filters every edge of the walk;
+  // the optional edge variable names each hop's edge for it.
+  const hasPred = rel.pred.props.length > 0 || rel.pred.where !== undefined;
+
   if (q.min === 0) {
     yield { end: from, verts: wantPath ? [from] : [], edges: [] };
   }
@@ -3398,6 +3423,15 @@ const trailEnds = function* (
     }
 
     const { edge, node } = res.value;
+
+    // Per-hop predicate: skip edges that fail it before any mark/step accounting
+    // (a failing edge never enters the trail — mirrors native `expand_filtered`).
+    if (
+      hasPred &&
+      !satisfies(edge, rel.pred, withBinding(binding, rel.variable, edge), params, graph)
+    ) {
+      continue;
+    }
 
     // Whether this step is allowed, what it marks, and whether it's a
     // non-extending SIMPLE close back on the seed.
@@ -4212,10 +4246,13 @@ const reachCount = (proj: Projection, bVar: string): { countArg?: CompiledExpr }
 };
 
 /** A pattern that only the general scalar matcher handles — a path selector
- * (`ANY`/`ALL SHORTEST`) or a non-default mode (`SIMPLE`/`ACYCLIC`/`WALK`). The
- * count/vectorized shortcuts enumerate trails, which is wrong for either. */
+ * (`ANY`/`ALL SHORTEST`), a non-default mode (`SIMPLE`/`ACYCLIC`/`WALK`), or a
+ * per-hop edge predicate on a quantified segment. The count/vectorized shortcuts
+ * enumerate or count trails without the predicate, which is wrong for any. */
 const needsGeneralMatcher = (p: PathPattern): boolean =>
-  (p.selector ?? 'walk') !== 'walk' || (p.mode ?? 'trail') !== 'trail';
+  (p.selector ?? 'walk') !== 'walk' ||
+  (p.mode ?? 'trail') !== 'trail' ||
+  p.segments.some((s) => s.rel.quantifier !== undefined && relHasPredicate(s.rel));
 
 const detectReachableShortcut = (
   clauses: readonly Clause[],

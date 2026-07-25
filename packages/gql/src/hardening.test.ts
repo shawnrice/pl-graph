@@ -308,15 +308,23 @@ describe('hardening: DELETE vs DETACH DELETE', () => {
 describe('hardening: variable-length segment restrictions', () => {
   const g = createTestSocialGraph();
 
-  test('rejects a bound edge variable on a quantified segment', () => {
-    // Native rejects this at parse time as a grammar restriction (E_SYNTAX); the
-    // TS engine matches that code so both engines fault byte-identically.
-    const e = thrown(() => query(g, `MATCH (a)-[r:KNOWS]->*(b) RETURN b`));
-    expect(hasErrorCode(e, ErrorCode.Syntax)).toBe(true);
+  test('accepts a per-hop edge variable on a quantified segment', () => {
+    // The edge variable names each hop's edge in turn for the per-hop predicate;
+    // it is not yet a group/list variable exposed to the outer query.
+    expect(() => query(g, `MATCH (a)-[r:KNOWS]->*(b) RETURN b`)).not.toThrow();
   });
 
-  test('rejects a per-edge property predicate on a quantified segment', () => {
-    expect(() => query(g, `MATCH (a)-[:KNOWS {weight: 1}]->+(b) RETURN b`)).toThrow();
+  test('accepts a per-hop property predicate on a quantified segment', () => {
+    expect(() => query(g, `MATCH (a)-[:KNOWS {weight: 1}]->+(b) RETURN b`)).not.toThrow();
+  });
+
+  test('rejects a per-hop predicate together with a shortest selector', () => {
+    // The shortest BFS drivers do not evaluate a per-hop predicate; both engines
+    // fault E_SYNTAX rather than silently ignore the filter.
+    const e = thrown(() =>
+      query(g, `MATCH ANY SHORTEST (a)-[r:KNOWS WHERE r.weight > 0]->*(b) RETURN b`),
+    );
+    expect(hasErrorCode(e, ErrorCode.Syntax)).toBe(true);
   });
 
   test('a plain quantified segment (label only) still works', () => {

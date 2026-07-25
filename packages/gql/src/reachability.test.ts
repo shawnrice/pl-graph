@@ -1,7 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
 import { Graph } from '@lenke/core';
-import { ErrorCode, hasErrorCode } from '@lenke/errors';
 
 import { query } from './index.js';
 
@@ -72,21 +71,11 @@ describe('unbounded var-length + DISTINCT: BFS reachability (no trail-budget fau
     expect(unreachable).toEqual([{ r: false }]);
   });
 
-  // A variable-length relationship that also binds an edge variable or carries a
-  // per-edge WHERE is rejected (ISO would bind a group/list here — not yet
-  // implemented). Native rejects it at parse time as a grammar restriction
-  // (E_SYNTAX); the TS engine must fault with the SAME code, not E_UNSUPPORTED.
-  test('var-length relationship with a per-edge predicate faults E_SYNTAX (native parity)', () => {
+  // A variable-length relationship may carry a per-hop edge predicate, applied to
+  // every edge of the walk (see the byte-identity conformance suite for the
+  // execution semantics). Here we only assert it is accepted, not rejected.
+  test('var-length relationship accepts a per-hop edge predicate', () => {
     const g = ring(4, 4);
-    let err: unknown;
-
-    try {
-      query(g, `MATCH (a)-[e:ROAD WHERE e.w > 5]->{1,4}(b) RETURN b`);
-    } catch (e) {
-      err = e;
-    }
-
-    expect(err).toBeDefined();
-    expect(hasErrorCode(err, ErrorCode.Syntax)).toBe(true);
+    expect(() => query(g, `MATCH (a)-[e:ROAD WHERE e.w > 5]->{1,4}(b) RETURN b`)).not.toThrow();
   });
 });

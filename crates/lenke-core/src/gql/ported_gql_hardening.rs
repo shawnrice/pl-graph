@@ -408,27 +408,24 @@ fn h_detach_delete_cascades_edges() {
 // TS: describe('hardening: variable-length segment restrictions', ...)
 // ---------------------------------------------------------------------------
 
-/// TS: "rejects a bound edge variable on a quantified segment"
+/// TS: "accepts a bound edge variable on a quantified segment (per-hop scope)"
 ///
-/// TS checks `hasErrorCode(e, ErrorCode.Unsupported)`. In the Rust engine the
-/// parser rejects this with a `SyntaxError` (which carries no `.code` field but
-/// is structurally the same). An `Err` from `parse()` suffices.
+/// The edge variable names each hop's edge in turn for the per-hop predicate; it
+/// is not yet a group/list variable exposed to the outer query.
 #[test]
-fn h_rejects_edge_var_on_quantified_segment() {
-    // Parser must reject [r:KNOWS]->* with a bound edge variable.
+fn h_accepts_edge_var_on_quantified_segment() {
     assert!(
-        parse("MATCH (a)-[r:KNOWS]->*(b) RETURN b").is_err(),
-        "expected error for bound edge var on quantified segment"
+        parse("MATCH (a)-[r:KNOWS]->*(b) RETURN b").is_ok(),
+        "a per-hop edge variable on a quantified segment now parses"
     );
 }
 
-/// TS: "rejects a per-edge property predicate on a quantified segment"
+/// TS: "accepts a per-edge property predicate on a quantified segment"
 #[test]
-fn h_rejects_per_edge_predicate_on_quantified_segment() {
-    // Parser must reject per-edge property maps on a quantified path.
+fn h_accepts_per_edge_predicate_on_quantified_segment() {
     assert!(
-        parse("MATCH (a)-[:KNOWS {weight: 1}]->+(b) RETURN b").is_err(),
-        "expected error for edge property on quantified segment"
+        parse("MATCH (a)-[:KNOWS {weight: 1}]->+(b) RETURN b").is_ok(),
+        "a per-hop edge property predicate on a quantified segment now parses"
     );
 }
 
