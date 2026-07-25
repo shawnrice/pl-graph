@@ -1,0 +1,39 @@
+{
+  "name": "@lenke/mcp",
+  "description": "A Model Context Protocol server for lenke: run GQL and graph algorithms against a scratch graph, validate queries, and browse how-to guides — so an AI assistant can help you build with lenke.",
+  "license": "Apache-2.0",
+  "bin": {
+    "lenke-mcp": "./bin/lenke-mcp.mjs"
+  },
+  "files": [
+    "dist",
+    "bin"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "default": "./dist/esm/index.mjs"
+    }
+  },
+  "scripts": {
+    "build": "bun build.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@lenke/core": "workspace:*",
+    "@lenke/errors": "workspace:*",
+    "@lenke/gql": "workspace:*",
+    "@lenke/serialization": "workspace:*"
+  },
+  "devDependencies": {
+    "@lenke/dev": "workspace:*",
+    "@types/bun": "latest",
+    "bun-types": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^6.0.0"
+  }
+}
