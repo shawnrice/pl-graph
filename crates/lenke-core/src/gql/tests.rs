@@ -63,6 +63,50 @@ fn rows(g: &mut Graph, query: &str) -> Vec<Vec<Value>> {
     q(g, query).1
 }
 
+/// Build a graph from NDJSON lines (each already a JSON object literal).
+fn graph_of(lines: &[&str]) -> Graph {
+    ndjson::decode(&lines.join("\n")).unwrap()
+}
+
+/// Triangle a→b→c→a plus the tail a→d. Shared by the path-mode / bare-path tests.
+fn triangle_tail() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+        r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}"#,
+        r#"{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}"#,
+        r#"{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e2","from":"b","to":"c","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e3","from":"c","to":"a","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e4","from":"a","to":"d","labels":["R"],"properties":{}}"#,
+    ])
+}
+
+/// Two nodes joined by an edge each way: a→b (e0) and b→a (e1). The minimal
+/// fixture for observing WALK edge-reuse vs the TRAIL/SIMPLE/ACYCLIC restrictors.
+fn bidir_pair() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+        r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e1","from":"b","to":"a","labels":["R"],"properties":{}}"#,
+    ])
+}
+
+/// Sorted endpoint ids from `MATCH <mode> (a{id:'a'})-[:R]->{lo,hi}(x) RETURN x.id`.
+/// A convenience for asserting exactly which endpoints a path mode admits.
+fn mode_ends(g: &mut Graph, mode: &str, lo: u32, hi: u32) -> Vec<Value> {
+    let mut r: Vec<Value> = rows(
+        g,
+        &format!("MATCH {mode} (a:N {{id:'a'}})-[:R]->{{{lo},{hi}}}(x) RETURN x.id AS id"),
+    )
+    .into_iter()
+    .map(|row| row[0].clone())
+    .collect();
+    r.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
+    r
+}
+
 /// Run a query expected to fail at EXECUTION time (it must still parse), and
 /// report whether it did. Unlike [`q`], this does not panic on the error.
 fn exec_err(g: &mut Graph, query: &str) -> bool {
@@ -5030,11 +5074,277 @@ fn postfix_property_chains_off_a_subscript() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Path modes (WALK / TRAIL / SIMPLE / ACYCLIC): one focused test per restrictor,
+// on the minimal fixture that makes the distinction observable.
+// ---------------------------------------------------------------------------
+
+/// WALK places no restriction: on a→b, b→a it re-treads both edges, so `{1,4}`
+/// from `a` yields four walks (b, a, b, a).
+#[test]
+fn walk_mode_admits_repeated_edges() {
+    let mut g = bidir_pair();
+    let ends = rows(
+        &mut g,
+        "MATCH WALK (a:N {id:'a'})-[:R]->{1,4}(x) RETURN x.id AS id",
+    );
+    assert_eq!(ends.len(), 4, "a-b, a-b-a, a-b-a-b, a-b-a-b-a");
+}
+
+/// TRAIL (the default) forbids reusing an edge: a→b then b→a is fine (distinct
+/// edges), but a→b→a→b would reuse e0, so `{1,4}` stops at length 2.
+#[test]
+fn trail_mode_forbids_edge_reuse() {
+    let mut g = bidir_pair();
+    let walks = rows(
+        &mut g,
+        "MATCH TRAIL (a:N {id:'a'})-[:R]->{1,4}(x) RETURN x.id AS id",
+    );
+    assert_eq!(walks.len(), 2, "a-b, a-b-a only");
+    // No mode == TRAIL: identical count.
+    let bare = rows(
+        &mut g,
+        "MATCH (a:N {id:'a'})-[:R]->{1,4}(x) RETURN x.id AS id",
+    );
+    assert_eq!(bare.len(), 2, "default mode is TRAIL");
+}
+
+/// SIMPLE permits revisiting a node only when it closes the walk back to the
+/// start. On the triangle a→b→c→a that admits the cycle-close; no other repeats.
+#[test]
+fn simple_mode_allows_only_the_closing_cycle() {
+    let mut g = triangle_tail();
+    // a-b-c-a closes at the seed → allowed; endpoint `a` is present.
+    assert_eq!(
+        mode_ends(&mut g, "SIMPLE", 1, 3),
+        vec![s("a"), s("b"), s("c"), s("d")]
+    );
+}
+
+/// ACYCLIC forbids every repeated node, so the cycle back to the seed (`a`) is
+/// excluded even though it closes.
+#[test]
+fn acyclic_mode_excludes_the_cycle_back_to_seed() {
+    let mut g = triangle_tail();
+    let ends = mode_ends(&mut g, "ACYCLIC", 1, 3);
+    assert!(!ends.contains(&s("a")), "seed is never an ACYCLIC endpoint");
+    assert_eq!(ends, vec![s("b"), s("c"), s("d")]);
+}
+
+/// The mode words are contextual keywords: `walk`/`trail`/`simple`/`acyclic`
+/// remain usable as ordinary identifiers (variable + property names).
+#[test]
+fn path_mode_words_stay_usable_as_identifiers() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"n","labels":["N"],"properties":{"walk":1,"trail":2,"simple":3,"acyclic":4}}"#,
+    ]);
+    let r = rows(
+        &mut g,
+        "MATCH (walk:N) RETURN walk.walk AS w, walk.trail AS t, walk.simple AS s, walk.acyclic AS a",
+    );
+    assert_eq!(r, vec![vec![n(1.0), n(2.0), n(3.0), n(4.0)]]);
+}
+
+/// count(*) over a non-TRAIL mode must route through the general matcher (the
+/// count fast path assumes trail semantics); it agrees with the enumerated rows.
+#[test]
+fn non_trail_mode_count_matches_enumeration() {
+    let mut g = bidir_pair();
+    for mode in ["WALK", "SIMPLE", "ACYCLIC"] {
+        let c = rows(
+            &mut g,
+            &format!("MATCH {mode} (a:N {{id:'a'}})-[:R]->{{1,4}}(x) RETURN count(*) AS c"),
+        );
+        let enumerated = rows(
+            &mut g,
+            &format!("MATCH {mode} (a:N {{id:'a'}})-[:R]->{{1,4}}(x) RETURN x.id AS id"),
+        )
+        .len() as f64;
+        assert_eq!(c, vec![vec![n(enumerated)]], "{mode} count vs enumeration");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bare path binding (`p = (a)-[]->{m,n}(b)`, no selector) — edge cases beyond
+// `bare_path_binds_every_walk`.
+// ---------------------------------------------------------------------------
+
+/// An unreachable endpoint binds no path (empty result, not a fault).
+#[test]
+fn bare_path_empty_when_unreachable() {
+    let mut g = triangle_tail();
+    let r = rows(
+        &mut g,
+        "MATCH p = (a:N {id:'d'})-[:R]->{1,3}(x) RETURN path_length(p) AS len",
+    );
+    assert!(r.is_empty(), "d has no out-edges");
+}
+
+/// `{0,n}` includes the zero-length walk that stays at the seed (path_length 0).
+#[test]
+fn bare_path_min_zero_binds_the_seed() {
+    let mut g = triangle_tail();
+    let lens = rows(
+        &mut g,
+        "MATCH p = (a:N {id:'a'})-[:R]->{0,2}(x) RETURN path_length(p) AS len ORDER BY len",
+    );
+    assert_eq!(lens[0], vec![n(0.0)], "the empty walk binds path_length 0");
+}
+
+/// The bound path carries its actual edges: relationships(p) length == hops.
+#[test]
+fn bare_path_relationships_match_hop_count() {
+    let mut g = triangle_tail();
+    let r = rows(
+        &mut g,
+        "MATCH p = (a:N {id:'a'})-[:R]->{1,3}(x) \
+         RETURN path_length(p) AS len, size(relationships(p)) AS es ORDER BY len, x.id",
+    );
+    // Every row's edge count equals its hop count.
+    assert!(
+        r.iter().all(|row| row[0] == row[1]),
+        "edges == hops per path"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ALL SHORTEST — edge cases beyond the diamond enumeration.
+// ---------------------------------------------------------------------------
+
+/// When exactly one shortest path exists, ALL SHORTEST and ANY SHORTEST agree.
+#[test]
+fn all_shortest_single_path_agrees_with_any() {
+    // a→b→c is the only a..c path.
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+        r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}"#,
+        r#"{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e2","from":"b","to":"c","labels":["R"],"properties":{}}"#,
+    ]);
+    let all = rows(
+        &mut g,
+        "MATCH p = ALL SHORTEST (a:N {id:'a'})-[:R]->*(x:N {id:'c'}) RETURN path_length(p) AS len",
+    );
+    assert_eq!(all, vec![vec![n(2.0)]]);
+}
+
+/// No path to the target → empty result (not a fault, not a null row).
+#[test]
+fn all_shortest_no_path_is_empty() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"z","labels":["N"],"properties":{"id":"z"}}"#,
+        r#"{"type":"edge","id":"e1","from":"a","to":"a","labels":["R"],"properties":{}}"#,
+    ]);
+    let all = rows(
+        &mut g,
+        "MATCH p = ALL SHORTEST (a:N {id:'a'})-[:R]->*(x:N {id:'z'}) RETURN path_length(p) AS len",
+    );
+    assert!(all.is_empty());
+}
+
+/// ALL SHORTEST to the seed itself is the zero-length path (min 0 via `->*`).
+#[test]
+fn all_shortest_zero_length_to_self() {
+    let mut g = triangle_tail();
+    let all = rows(
+        &mut g,
+        "MATCH p = ALL SHORTEST (a:N {id:'a'})-[:R]->*(a) RETURN path_length(p) AS len",
+    );
+    assert_eq!(all, vec![vec![n(0.0)]]);
+}
+
+// ---------------------------------------------------------------------------
+// Postfix `.prop` chaining — edge cases beyond the subscript motif.
+// ---------------------------------------------------------------------------
+
+/// `.prop` reads straight off a bound vertex/edge variable (no subscript).
+#[test]
+fn postfix_prop_off_a_bound_variable() {
+    let mut g = triangle_tail();
+    let r = rows(
+        &mut g,
+        "MATCH (a:N {id:'a'})-[e:R]->(b) RETURN (b).id AS bid ORDER BY bid",
+    );
+    assert_eq!(r, vec![vec![s("b")], vec![s("d")]]);
+}
+
+/// `.prop` of an absent key is null; chaining another `.prop` off null stays null.
+#[test]
+fn postfix_prop_of_missing_key_is_null() {
+    let mut g = triangle_tail();
+    let r = rows(
+        &mut g,
+        "MATCH p = ANY SHORTEST (a:N {id:'a'})-[:R]->*(b:N {id:'c'}) RETURN nodes(p)[0].nope AS x",
+    );
+    assert_eq!(r, vec![vec![Value::Null]]);
+}
+
+// ---------------------------------------------------------------------------
+// Bare `ALL` selector — the ISO default (every matching path), a synonym for
+// writing no selector at all.
+// ---------------------------------------------------------------------------
+
+/// `ALL (a)-[]->{1,3}(x)` enumerates exactly what the bare pattern does.
+#[test]
+fn bare_all_selector_matches_default_enumeration() {
+    let mut g = triangle_tail();
+    let with_all = rows(
+        &mut g,
+        "MATCH ALL (a:N {id:'a'})-[:R]->{1,3}(x) RETURN x.id AS id ORDER BY x.id",
+    );
+    let bare = rows(
+        &mut g,
+        "MATCH (a:N {id:'a'})-[:R]->{1,3}(x) RETURN x.id AS id ORDER BY x.id",
+    );
+    assert_eq!(with_all, bare);
+    assert!(!with_all.is_empty());
+}
+
+/// `ALL p = …` binds each walk as a Path, exactly like the bare path binding.
+#[test]
+fn bare_all_selector_binds_paths() {
+    let mut g = triangle_tail();
+    let r = rows(
+        &mut g,
+        "MATCH p = ALL (a:N {id:'a'})-[:R]->{1,3}(x) RETURN path_length(p) AS len ORDER BY len",
+    );
+    assert_eq!(
+        r,
+        vec![vec![n(1.0)], vec![n(1.0)], vec![n(2.0)], vec![n(3.0)]]
+    );
+}
+
+/// `ALL` composes with a path mode: `ALL SIMPLE` keeps only the closing cycle
+/// back to the seed.
+#[test]
+fn bare_all_selector_composes_with_mode() {
+    let mut g = triangle_tail();
+    let r = rows(
+        &mut g,
+        "MATCH p = ALL SIMPLE (a:N {id:'a'})-[:R]->{1,3}(a) RETURN path_length(p) AS len",
+    );
+    assert_eq!(r, vec![vec![n(3.0)]]);
+}
+
+/// `ALL` over a plain fixed pattern is accepted and returns every match.
+#[test]
+fn bare_all_selector_over_fixed_pattern() {
+    let mut g = triangle_tail();
+    let r = rows(
+        &mut g,
+        "MATCH ALL (a:N {id:'a'})-[:R]->(x) RETURN x.id AS id ORDER BY x.id",
+    );
+    assert_eq!(r, vec![vec![s("b")], vec![s("d")]]);
+}
+
 /// The unsupported selector shapes fail to parse with a pointed message.
 #[test]
 fn shortest_unsupported_shapes_rejected() {
     assert!(parse("MATCH (a)-[]->*(b) RETURN b").is_ok()); // no selector: still fine
     assert!(parse("MATCH ALL SHORTEST (a)-[]->*(b) RETURN b").is_ok()); // now supported
+    assert!(parse("MATCH ALL (a)-[]->*(b) RETURN b").is_ok()); // bare ALL = default selector
     assert!(parse("MATCH SHORTEST (a)-[]->*(b) RETURN b").is_err());
     assert!(parse("MATCH ANY (a)-[]->*(b) RETURN b").is_err()); // bare ANY still unsupported
                                                                 // A selector needs a single variable-length segment.

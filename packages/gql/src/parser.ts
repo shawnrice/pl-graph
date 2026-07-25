@@ -614,7 +614,9 @@ export const parse = (
         return 'allShortest';
       }
 
-      throw new GqlSyntaxError('the bare ALL path selector is not yet supported', pos0);
+      // Bare `ALL` is the ISO default selector — every matching path — which is
+      // exactly the enumerate-all `walk` behaviour (no selector).
+      return 'walk';
     }
 
     if (checkKeyword('shortest')) {

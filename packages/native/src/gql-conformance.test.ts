@@ -1814,4 +1814,24 @@ suite('gql conformance: bare path binding — every walk as a Path, byte-identic
     expect(ts).toBe(native);
     expect(JSON.parse(ts)).toHaveLength(1);
   });
+
+  test('bare ALL selector == default enumeration, byte-identical', () => {
+    const [ts, native] = both(
+      `MATCH p = ALL (a:N {id:'a'})-[:R]->{1,3}(x) RETURN nodes(p) AS ns ORDER BY path_length(p), x.id`,
+    );
+    const [bareTs, bareNative] = both(
+      `MATCH p = (a:N {id:'a'})-[:R]->{1,3}(x) RETURN nodes(p) AS ns ORDER BY path_length(p), x.id`,
+    );
+    expect(ts).toBe(native);
+    expect(ts).toBe(bareTs);
+    expect(native).toBe(bareNative);
+  });
+
+  test('bare ALL composes with SIMPLE mode, byte-identical', () => {
+    const [ts, native] = both(
+      `MATCH p = ALL SIMPLE (a:N {id:'a'})-[:R]->{1,3}(a) RETURN nodes(p) AS ns`,
+    );
+    expect(ts).toBe(native);
+    expect(JSON.parse(ts)).toHaveLength(1);
+  });
 });

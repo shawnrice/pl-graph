@@ -697,7 +697,10 @@ impl Parser {
                 return Ok(PathSelector::AllShortest);
             }
 
-            return err("the bare ALL path selector is not yet supported", pos);
+            // Bare `ALL` is the ISO default selector — every matching path. That is
+            // exactly the enumerate-all behaviour of `Walk` (no selector), so it
+            // maps there and needs no downstream change.
+            return Ok(PathSelector::Walk);
         }
         if self.check_kw("shortest") {
             return err("SHORTEST must be written as `ANY SHORTEST`", pos);
