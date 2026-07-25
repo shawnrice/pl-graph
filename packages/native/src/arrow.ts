@@ -20,6 +20,7 @@ import { ErrorCode, LenkeError } from '@lenke/errors';
 const ARW_FLOAT64 = 1;
 const ARW_BOOL = 2;
 const ARW_UTF8 = 3;
+const ARW_FIXED_LIST = 4; // FixedSizeList<Float64>[dim]; dim rides buf2_len
 
 const HEADER_LEN = 24;
 const COLDESC_LEN = 40;
@@ -31,6 +32,7 @@ const MSG_RECORD_BATCH = 3; // MessageHeader.RecordBatch
 const TYPE_FLOATINGPOINT = 3; // Type.FloatingPoint
 const TYPE_UTF8 = 5; // Type.Utf8
 const TYPE_BOOL = 6; // Type.Bool
+const TYPE_FIXEDSIZELIST = 16; // Type.FixedSizeList
 const PRECISION_DOUBLE = 2; // Precision.DOUBLE
 
 /**
@@ -222,6 +224,13 @@ class FlatBufferBuilder {
     }
   }
 
+  addFieldInt32(voffset: number, value: number, def: number): void {
+    if (value !== def) {
+      this.addInt32(value);
+      this.slot(voffset);
+    }
+  }
+
   addFieldInt64(voffset: number, value: bigint, def: bigint): void {
     if (value !== def) {
       this.addInt64(value);
@@ -274,6 +283,8 @@ type Arw1Column = {
   name: string;
   type: number;
   nullCount: number;
+  /** FixedSizeList list size (0 otherwise); a FixedList adds a child field-node. */
+  dim: number;
   buffers: Uint8Array[]; // Arrow buffer order (validity, then values / offsets+data)
 };
 
@@ -307,12 +318,21 @@ const parseArw1 = (blob: Uint8Array): { nrows: number; columns: Arw1Column[] } =
 
     // Arrow buffer order: validity, then values (Float64/Bool) or offsets+data (Utf8).
     // A no-null column's validity is a length-0 buffer (readers treat it as all-valid).
-    const buffers =
-      type === ARW_UTF8
-        ? [slice(validityOff, validityLen), slice(buf1Off, buf1Len), slice(buf2Off, buf2Len)]
-        : [slice(validityOff, validityLen), slice(buf1Off, buf1Len)];
+    // FixedSizeList: [list validity, child validity (empty), child values (buf1)];
+    // its `dim` rides `buf2_len` (buf2 is not a buffer).
+    let dim = 0;
+    let buffers: Uint8Array[];
 
-    columns.push({ name, type, nullCount, buffers });
+    if (type === ARW_UTF8) {
+      buffers = [slice(validityOff, validityLen), slice(buf1Off, buf1Len), slice(buf2Off, buf2Len)];
+    } else if (type === ARW_FIXED_LIST) {
+      dim = buf2Len;
+      buffers = [slice(validityOff, validityLen), new Uint8Array(0), slice(buf1Off, buf1Len)];
+    } else {
+      buffers = [slice(validityOff, validityLen), slice(buf1Off, buf1Len)];
+    }
+
+    columns.push({ name, type, nullCount, dim, buffers });
   }
 
   return { nrows, columns };
@@ -361,6 +381,7 @@ const buildField = (b: FlatBufferBuilder, col: Arw1Column, emptyChildren: number
 
   let typeType: number;
   let typeOff: number;
+  let children = emptyChildren;
 
   if (col.type === ARW_FLOAT64) {
     b.startObject(1);
@@ -375,6 +396,25 @@ const buildField = (b: FlatBufferBuilder, col: Arw1Column, emptyChildren: number
     b.startObject(0);
     typeOff = b.endObject();
     typeType = TYPE_UTF8;
+  } else if (col.type === ARW_FIXED_LIST) {
+    // The child `item: Float64` field (nested types build inner-first).
+    const childName = b.createString('item');
+    b.startObject(1);
+    b.addFieldInt16(0, PRECISION_DOUBLE, 0);
+    const childType = b.endObject();
+    b.startObject(7);
+    b.addFieldOffset(0, childName);
+    b.addFieldInt8(1, 1, 0); // nullable
+    b.addFieldInt8(2, TYPE_FLOATINGPOINT, 0);
+    b.addFieldOffset(3, childType);
+    b.addFieldOffset(5, emptyChildren);
+    const childField = b.endObject();
+    children = b.offsetVector([childField]);
+    // FixedSizeList type table: `listSize: int` (field 0).
+    b.startObject(1);
+    b.addFieldInt32(0, col.dim, 0);
+    typeOff = b.endObject();
+    typeType = TYPE_FIXEDSIZELIST;
   } else {
     throw new LenkeError(`lenke: arrow column '${col.name}' has unknown type ${col.type}`, {
       code: ErrorCode.Ffi,
@@ -386,7 +426,7 @@ const buildField = (b: FlatBufferBuilder, col: Arw1Column, emptyChildren: number
   b.addFieldInt8(1, 1, 0); // nullable = true
   b.addFieldInt8(2, typeType, 0); // type_type (union discriminant)
   b.addFieldOffset(3, typeOff); // type (union value)
-  b.addFieldOffset(5, emptyChildren); // children (empty)
+  b.addFieldOffset(5, children); // children ([item] for FixedSizeList, else empty)
 
   return b.endObject();
 };
@@ -424,7 +464,18 @@ const recordBatchMessage = (
   body: Uint8Array,
 ): Uint8Array => {
   const b = new FlatBufferBuilder();
-  const nodes: [bigint, bigint][] = columns.map((c) => [BigInt(nrows), BigInt(c.nullCount)]);
+  // One field-node per field in depth-first order: a FixedSizeList adds a second
+  // node for its `item` child (length nrows × dim, no nulls).
+  const nodes: [bigint, bigint][] = [];
+
+  for (const c of columns) {
+    nodes.push([BigInt(nrows), BigInt(c.nullCount)]);
+
+    if (c.type === ARW_FIXED_LIST) {
+      nodes.push([BigInt(nrows * c.dim), 0n]);
+    }
+  }
+
   const buffersVec = b.structVector16(buffers);
   const nodesVec = b.structVector16(nodes);
 

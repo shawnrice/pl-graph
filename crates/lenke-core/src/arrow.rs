@@ -43,6 +43,11 @@ use crate::query::RowSet;
 pub const T_FLOAT64: u32 = 1;
 pub const T_BOOL: u32 = 2;
 pub const T_UTF8: u32 = 3;
+/// A fixed-dimension numeric list column → Arrow `FixedSizeList<Float64>[dim]`.
+/// In the ARW1 blob its `buf1` is the flat child `f64` values (`nrows × dim`), its
+/// validity is the LIST-level bitmap, and its `dim` rides the (otherwise-empty)
+/// `buf2_len` descriptor slot — so the fixed 40-byte column descriptor is unchanged.
+pub const T_FIXED_LIST: u32 = 4;
 
 const HEADER_LEN: usize = 24;
 const COLDESC_LEN: usize = 40;
@@ -107,6 +112,37 @@ pub enum ArrowColumn {
         bytes: Vec<u8>,
         valid: Option<Vec<bool>>,
     },
+    /// A fixed-dimension numeric list → `FixedSizeList<Float64>[dim]`. `data` is the
+    /// flat child values (`nrows × dim`, a null list contributing `dim` zeros);
+    /// `valid` is the LIST-level null mask.
+    FixedList {
+        dim: usize,
+        data: Vec<f64>,
+        valid: Option<Vec<bool>>,
+    },
+}
+
+/// The shared dimension iff every present cell is an all-numeric list of the SAME
+/// length (≥ 1) → a `FixedSizeList<Float64>` column; else `None` (ragged, empty,
+/// non-numeric, or a non-list present cell → the caller falls back to `Utf8`).
+fn fixed_numeric_dim(cells: &[&Value]) -> Option<usize> {
+    let mut dim: Option<usize> = None;
+    let mut saw = false;
+    for c in cells {
+        match c {
+            Value::Null => {}
+            Value::List(items) if items.iter().all(|v| matches!(v, Value::Num(_))) => {
+                saw = true;
+                match dim {
+                    None => dim = Some(items.len()),
+                    Some(d) if d != items.len() => return None,
+                    _ => {}
+                }
+            }
+            _ => return None,
+        }
+    }
+    dim.filter(|&d| saw && d >= 1)
 }
 
 impl ArrowColumn {
@@ -114,6 +150,33 @@ impl ArrowColumn {
     pub fn from_values<'a>(cells: impl Iterator<Item = &'a Value>) -> Self {
         let cells: Vec<&Value> = cells.collect();
         let n = cells.len();
+        // A fixed-dim numeric-list column → a real `FixedSizeList<Float64>` (not
+        // Utf8 JSON): a null list contributes `dim` zeros to the flat child values.
+        if let Some(dim) = fixed_numeric_dim(&cells) {
+            let mut data = Vec::with_capacity(n * dim);
+            let mut valid = vec![true; n];
+            let mut any_null = false;
+            for (i, c) in cells.iter().enumerate() {
+                match c {
+                    Value::List(items) => {
+                        data.extend(items.iter().map(|v| match v {
+                            Value::Num(x) => *x,
+                            _ => 0.0,
+                        }));
+                    }
+                    _ => {
+                        valid[i] = false;
+                        any_null = true;
+                        data.extend(std::iter::repeat_n(0.0, dim));
+                    }
+                }
+            }
+            return Self::FixedList {
+                dim,
+                data,
+                valid: any_null.then_some(valid),
+            };
+        }
         let mut seen_num = false;
         let mut seen_bool = false;
         let mut seen_other = false;
@@ -195,12 +258,16 @@ impl ArrowColumn {
 
     fn valid_mask(&self) -> &Option<Vec<bool>> {
         match self {
-            Self::Num { valid, .. } | Self::Bool { valid, .. } | Self::Utf8 { valid, .. } => valid,
+            Self::Num { valid, .. }
+            | Self::Bool { valid, .. }
+            | Self::Utf8 { valid, .. }
+            | Self::FixedList { valid, .. } => valid,
         }
     }
 
-    /// (type tag, null_count, validity bitmap, buf1, buf2) for blob assembly.
-    fn encode(&self, nrows: usize) -> (u32, u32, Vec<u8>, Vec<u8>, Vec<u8>) {
+    /// (type tag, null_count, validity bitmap, buf1, buf2, dim) for blob assembly.
+    /// `dim` is non-zero only for `FixedList` (the list size); it rides `buf2_len`.
+    fn encode(&self, nrows: usize) -> (u32, u32, Vec<u8>, Vec<u8>, Vec<u8>, u32) {
         let (null_count, validity) = match self.valid_mask() {
             None => (0, Vec::new()),
             Some(mask) => {
@@ -216,13 +283,13 @@ impl ArrowColumn {
                 (nulls, bitmap)
             }
         };
-        let (tag, buf1, buf2) = match self {
+        let (tag, buf1, buf2, dim) = match self {
             Self::Num { data, .. } => {
                 let mut b = Vec::with_capacity(data.len() * 8);
                 for v in data {
                     b.extend_from_slice(&v.to_le_bytes());
                 }
-                (T_FLOAT64, b, Vec::new())
+                (T_FLOAT64, b, Vec::new(), 0)
             }
             Self::Bool { data, .. } => {
                 let mut b = vec![0u8; data.len().div_ceil(8)];
@@ -231,17 +298,25 @@ impl ArrowColumn {
                         b[i / 8] |= 1 << (i % 8);
                     }
                 }
-                (T_BOOL, b, Vec::new())
+                (T_BOOL, b, Vec::new(), 0)
             }
             Self::Utf8 { offsets, bytes, .. } => {
                 let mut b = Vec::with_capacity(offsets.len() * 4);
                 for o in offsets {
                     b.extend_from_slice(&o.to_le_bytes());
                 }
-                (T_UTF8, b, bytes.clone())
+                (T_UTF8, b, bytes.clone(), 0)
+            }
+            // buf1 = flat child f64 values (nrows × dim); dim rides buf2_len.
+            Self::FixedList { dim, data, .. } => {
+                let mut b = Vec::with_capacity(data.len() * 8);
+                for v in data {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+                (T_FIXED_LIST, b, Vec::new(), *dim as u32)
             }
         };
-        (tag, null_count, validity, buf1, buf2)
+        (tag, null_count, validity, buf1, buf2, dim)
     }
 }
 
@@ -254,14 +329,14 @@ pub fn to_arrow_cols(names: &[String], cols: &[ArrowColumn], nrows: usize) -> Ve
         clippy::type_complexity,
         reason = "ad-hoc per-column (tag, null_count, validity, buf1, buf2) tuple local to encoding"
     )]
-    let encoded: Vec<(u32, u32, Vec<u8>, Vec<u8>, Vec<u8>)> =
+    let encoded: Vec<(u32, u32, Vec<u8>, Vec<u8>, Vec<u8>, u32)> =
         cols.iter().map(|c| c.encode(nrows)).collect();
 
     // Body base: after header + descriptors, aligned to 8.
     let body_base = align8(HEADER_LEN + ncols * COLDESC_LEN);
     let mut body: Vec<u8> = Vec::new();
     let mut descs: Vec<[u32; 10]> = Vec::with_capacity(ncols);
-    for (j, (tag, null_count, validity, buf1, buf2)) in encoded.iter().enumerate() {
+    for (j, (tag, null_count, validity, buf1, buf2, dim)) in encoded.iter().enumerate() {
         let mut place = |bytes: &[u8]| -> (u32, u32) {
             while !body.len().is_multiple_of(8) {
                 body.push(0);
@@ -273,7 +348,12 @@ pub fn to_arrow_cols(names: &[String], cols: &[ArrowColumn], nrows: usize) -> Ve
         let (name_off, name_len) = place(names[j].as_bytes());
         let (val_off, val_len) = place(validity);
         let (b1_off, b1_len) = place(buf1);
-        let (b2_off, b2_len) = place(buf2);
+        let (b2_off, mut b2_len) = place(buf2);
+        // A FixedSizeList has no buf2 buffer; its (otherwise-zero) buf2_len carries
+        // the list dimension so a reader can rebuild the child field / node.
+        if *tag == T_FIXED_LIST {
+            b2_len = *dim;
+        }
         descs.push([
             *tag,
             *null_count,
@@ -331,6 +411,7 @@ const MSG_RECORD_BATCH: u8 = 3; // MessageHeader.RecordBatch
 const TYPE_FLOATINGPOINT: u8 = 3; // Type.FloatingPoint
 const TYPE_UTF8: u8 = 5; // Type.Utf8
 const TYPE_BOOL: u8 = 6; // Type.Bool
+const TYPE_FIXEDSIZELIST: u8 = 16; // Type.FixedSizeList
 const PRECISION_DOUBLE: i16 = 2; // Precision.DOUBLE
 
 /// A minimal back-to-front FlatBuffers builder — mirrors the TS one in
@@ -503,6 +584,13 @@ impl Fbb {
         }
     }
 
+    fn add_field_i32(&mut self, voffset: usize, value: i32, def: i32) {
+        if value != def {
+            self.add_i32(value);
+            self.slot(voffset);
+        }
+    }
+
     fn add_field_i64(&mut self, voffset: usize, value: i64, def: i64) {
         if value != def {
             self.add_i64(value);
@@ -556,6 +644,10 @@ struct IpcCol<'a> {
     name: &'a str,
     tag: u32,
     null_count: i64,
+    /// List dimension for a `FixedList` column (the `FixedSizeList` listSize); 0
+    /// otherwise. A FixedList contributes a second (child) field-node of length
+    /// `nrows × dim`.
+    dim: usize,
     buffers: Vec<&'a [u8]>,
 }
 
@@ -567,19 +659,38 @@ fn u32le(b: &[u8], o: usize) -> usize {
 /// Build the Arrow `Field` sub-table for one column; returns its offset.
 fn build_field(b: &mut Fbb, col: &IpcCol, empty_children: usize) -> usize {
     let name_off = b.create_string(col.name);
-    let (type_type, type_off) = match col.tag {
+    let (type_type, type_off, children) = match col.tag {
         T_FLOAT64 => {
             b.start_object(1);
             b.add_field_i16(0, PRECISION_DOUBLE, 0);
-            (TYPE_FLOATINGPOINT, b.end_object())
+            (TYPE_FLOATINGPOINT, b.end_object(), empty_children)
         }
         T_BOOL => {
             b.start_object(0);
-            (TYPE_BOOL, b.end_object())
+            (TYPE_BOOL, b.end_object(), empty_children)
+        }
+        T_FIXED_LIST => {
+            // The child `item: Float64` field (nested types build inner-first).
+            let child_name = b.create_string("item");
+            b.start_object(1);
+            b.add_field_i16(0, PRECISION_DOUBLE, 0);
+            let child_type = b.end_object();
+            b.start_object(7);
+            b.add_field_offset(0, child_name);
+            b.add_field_i8(1, 1, 0); // nullable
+            b.add_field_i8(2, TYPE_FLOATINGPOINT, 0);
+            b.add_field_offset(3, child_type);
+            b.add_field_offset(5, empty_children);
+            let child_field = b.end_object();
+            let children_vec = b.offset_vector(&[child_field]);
+            // FixedSizeList type table: `listSize: int` (field 0).
+            b.start_object(1);
+            b.add_field_i32(0, col.dim as i32, 0);
+            (TYPE_FIXEDSIZELIST, b.end_object(), children_vec)
         }
         _ => {
             b.start_object(0);
-            (TYPE_UTF8, b.end_object())
+            (TYPE_UTF8, b.end_object(), empty_children)
         }
     };
     b.start_object(7);
@@ -587,7 +698,7 @@ fn build_field(b: &mut Fbb, col: &IpcCol, empty_children: usize) -> usize {
     b.add_field_i8(1, 1, 0); // nullable = true
     b.add_field_i8(2, type_type, 0); // type_type (union discriminant)
     b.add_field_offset(3, type_off); // type (union value)
-    b.add_field_offset(5, empty_children); // children (empty)
+    b.add_field_offset(5, children); // children ([item] for FixedSizeList, else empty)
     b.end_object()
 }
 
@@ -624,7 +735,15 @@ fn record_batch_message(
     body: &[u8],
 ) -> Vec<u8> {
     let mut b = Fbb::new();
-    let nodes: Vec<(i64, i64)> = cols.iter().map(|c| (nrows as i64, c.null_count)).collect();
+    // One field-node per field in depth-first order: a FixedSizeList adds a second
+    // node for its `item` child (length nrows × dim, no nulls).
+    let mut nodes: Vec<(i64, i64)> = Vec::with_capacity(cols.len());
+    for c in cols {
+        nodes.push((nrows as i64, c.null_count));
+        if c.tag == T_FIXED_LIST {
+            nodes.push(((nrows * c.dim) as i64, 0));
+        }
+    }
     let buffers_vec = b.struct_vector16(buffers);
     let nodes_vec = b.struct_vector16(&nodes);
     b.start_object(5);
@@ -688,16 +807,23 @@ pub fn arrow_ipc_from_blob(blob: &[u8], file: bool) -> Vec<u8> {
         .unwrap_or("");
         let validity = &blob[u32le(blob, d + 16)..u32le(blob, d + 16) + u32le(blob, d + 20)];
         let buf1 = &blob[u32le(blob, d + 24)..u32le(blob, d + 24) + u32le(blob, d + 28)];
-        let buf2 = &blob[u32le(blob, d + 32)..u32le(blob, d + 32) + u32le(blob, d + 36)];
-        let buffers = if tag == T_UTF8 {
-            vec![validity, buf1, buf2]
+        // For a FixedSizeList, `buf2_len` carries the list dimension, not a buffer
+        // length — so read buf2 only for Utf8.
+        let (buffers, dim) = if tag == T_UTF8 {
+            let buf2 = &blob[u32le(blob, d + 32)..u32le(blob, d + 32) + u32le(blob, d + 36)];
+            (vec![validity, buf1, buf2], 0)
+        } else if tag == T_FIXED_LIST {
+            // Arrow buffer order: list validity, child validity (empty, no element
+            // nulls), child values (buf1).
+            (vec![validity, &[][..], buf1], u32le(blob, d + 36))
         } else {
-            vec![validity, buf1]
+            (vec![validity, buf1], 0)
         };
         cols.push(IpcCol {
             name,
             tag,
             null_count,
+            dim,
             buffers,
         });
     }
@@ -824,6 +950,62 @@ mod tests {
             rs.push_row(r);
         }
         rs
+    }
+
+    fn list(xs: &[f64]) -> Value {
+        Value::List(xs.iter().map(|x| Value::Num(*x)).collect())
+    }
+
+    #[test]
+    fn fixed_dim_numeric_list_encodes_as_fixed_size_list() {
+        let rs = rowset(
+            &["h"],
+            vec![
+                vec![list(&[1.5, 2.5, 3.5])],
+                vec![Value::Null], // a null list → dim zeros in the child, list-invalid
+                vec![list(&[4.0, 5.0, 6.0])],
+            ],
+        );
+        let blob = to_arrow(&rs);
+        let nrows = u64_at(&blob, 8) as usize;
+        assert_eq!(nrows, 3);
+        let d = HEADER_LEN;
+        assert_eq!(u32_at(&blob, d), T_FIXED_LIST, "tag");
+        assert_eq!(u32_at(&blob, d + 4), 1, "one null list");
+        // dim rides buf2_len; buf1 is the flat child values (nrows × dim f64).
+        let dim = u32_at(&blob, d + 36) as usize;
+        assert_eq!(dim, 3);
+        let b1_off = u32_at(&blob, d + 24) as usize;
+        let b1_len = u32_at(&blob, d + 28) as usize;
+        assert_eq!(b1_len, nrows * dim * 8);
+        let read = |o: usize| f64::from_le_bytes(blob[o..o + 8].try_into().unwrap());
+        assert_eq!(read(b1_off), 1.5);
+        assert_eq!(read(b1_off + 2 * 8), 3.5);
+        assert_eq!(read(b1_off + 3 * 8), 0.0, "null row's child span is zeros");
+        assert_eq!(read(b1_off + 6 * 8), 4.0);
+        // The full IPC framing must not panic (byte-validated vs apache-arrow in
+        // packages/native/src/arrow.test.ts).
+        let _ = to_arrow_ipc(&rs, false);
+        let _ = to_arrow_ipc(&rs, true);
+    }
+
+    #[test]
+    fn ragged_or_non_numeric_list_columns_fall_back_to_utf8() {
+        // Differing lengths under one column → not a FixedSizeList.
+        let ragged = rowset(&["h"], vec![vec![list(&[1.0, 2.0])], vec![list(&[3.0])]]);
+        assert_eq!(u32_at(&to_arrow(&ragged), HEADER_LEN), T_UTF8);
+        // A non-numeric element → not a FixedSizeList.
+        let mixed = rowset(
+            &["h"],
+            vec![vec![Value::List(vec![
+                Value::Num(1.0),
+                Value::Str(Arc::from("x")),
+            ])]],
+        );
+        assert_eq!(u32_at(&to_arrow(&mixed), HEADER_LEN), T_UTF8);
+        // An all-null column is not a FixedSizeList either (no dim to infer).
+        let empty = rowset(&["h"], vec![vec![Value::Null]]);
+        assert_ne!(u32_at(&to_arrow(&empty), HEADER_LEN), T_FIXED_LIST);
     }
 
     #[test]

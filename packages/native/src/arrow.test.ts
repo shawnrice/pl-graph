@@ -7,7 +7,7 @@
 import { describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
-import { tableFromIPC } from 'apache-arrow';
+import { type Table, tableFromIPC } from 'apache-arrow';
 
 import { toArrowIPC } from './arrow.js';
 import { createFfiBackend } from './backend-ffi.js';
@@ -204,6 +204,68 @@ suite('@lenke/native/arrow — real Arrow IPC egress', () => {
 
       expect(new TextDecoder().decode(ipc.subarray(0, 6))).not.toBe('ARROW1'); // stream
       expect([...back].map((r) => r.name)).toEqual(['josh', 'marko']);
+    } finally {
+      g.free();
+    }
+  });
+});
+
+// A fixed-dim numeric-list column egresses as a real Arrow FixedSizeList<Float64>
+// (not Utf8 JSON) — the feature-matrix egress the graph-ML use case wants.
+const VEC_NDJSON = [
+  '{"type":"node","id":"a","labels":["V"],"properties":{"name":"a","h":[1.5,2.5,3.5]}}',
+  '{"type":"node","id":"b","labels":["V"],"properties":{"name":"b","h":[4,5,6]}}',
+  '{"type":"node","id":"c","labels":["V"],"properties":{"name":"c"}}', // no h → null list
+].join('\n');
+
+suite('@lenke/native/arrow — FixedSizeList<Float64> egress', () => {
+  const backend = createFfiBackend(LIB);
+  const Q = 'MATCH (n:V) RETURN n.h AS h ORDER BY n.name';
+
+  const table = (native: boolean): Table => {
+    const g = graphFromFormat(backend, VEC_NDJSON, 'ndjson');
+
+    try {
+      return tableFromIPC(
+        native ? g.queryArrowIpc(Q, { format: 'stream' }) : toArrowIPC(g.queryArrow(Q)),
+      );
+    } finally {
+      g.free();
+    }
+  };
+
+  const readRows = (t: Table) =>
+    [...t].map((r) => {
+      const v = r.h as { toArray(): Float64Array } | null;
+
+      return v === null ? null : [...v.toArray()];
+    });
+
+  const EXPECTED = [
+    [1.5, 2.5, 3.5],
+    [4, 5, 6],
+    null, // c had no `h` → a null list, not a zero vector
+  ];
+
+  for (const native of [true, false]) {
+    test(`${native ? 'native' : 'JS'} IPC decodes as FixedSizeList<Float64>[3]`, () => {
+      const t = table(native);
+
+      expect(String(t.schema.fields[0].type)).toContain('FixedSizeList');
+      expect(String(t.schema.fields[0].type.children[0].type)).toBe('Float64');
+      expect(readRows(t)).toEqual(EXPECTED);
+    });
+  }
+
+  test('native and JS encoders are byte-for-byte identical', () => {
+    const g = graphFromFormat(backend, VEC_NDJSON, 'ndjson');
+
+    try {
+      for (const format of ['stream', 'file'] as const) {
+        const nat = g.queryArrowIpc(Q, { format });
+        const js = toArrowIPC(g.queryArrow(Q), format);
+        expect(Buffer.compare(new Uint8Array(nat), new Uint8Array(js))).toBe(0);
+      }
     } finally {
       g.free();
     }

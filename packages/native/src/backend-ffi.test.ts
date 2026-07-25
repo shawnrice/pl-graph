@@ -290,6 +290,24 @@ suite('@lenke/native FFI backend', () => {
     g.free();
   });
 
+  test('decodeArrow reconstructs a FixedSizeList column (would have thrown before)', () => {
+    const backend = createFfiBackend(LIB);
+    const ndjson = new TextEncoder().encode(
+      [
+        '{"type":"node","id":"a","labels":["V"],"properties":{"name":"a","h":[1.5,2.5,3.5]}}',
+        '{"type":"node","id":"b","labels":["V"],"properties":{"name":"b"}}', // no h → null list
+      ].join('\n'),
+    );
+    const g = graphFromNdjson(backend, ndjson);
+    const q = 'MATCH (n:V) RETURN n.h AS h ORDER BY n.name';
+
+    // The list column egresses as a FixedSizeList; decodeArrow rebuilds number[].
+    expect(decodeArrow(g.queryArrow(q))).toEqual([{ h: [1.5, 2.5, 3.5] }, { h: null }]);
+    // …and matches the JSON `.query()` path exactly.
+    expect(decodeArrow(g.queryArrow(q))).toEqual(g.query(q));
+    g.free();
+  });
+
   test('round-trips through NDJSON', () => {
     const backend = createFfiBackend(LIB);
     const g = graphFromNdjson(backend, bytes);

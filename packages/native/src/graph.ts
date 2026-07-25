@@ -464,6 +464,7 @@ export function composeGremlin(q: string | TemplateStringsArray, ...subs: unknow
 const ARW_FLOAT64 = 1;
 const ARW_BOOL = 2;
 const ARW_UTF8 = 3;
+const ARW_FIXED_LIST = 4; // FixedSizeList<Float64>[dim]; dim rides buf2_len
 
 /**
  * Decode an ARW1 columnar blob (from {@link RustGraph.queryArrow} /
@@ -531,6 +532,20 @@ export const decodeArrow = <R extends Row = Row>(blob: Uint8Array): R[] => {
         const start = dv.getInt32(buf1Off + i * 4, true);
         const end = dv.getInt32(buf1Off + (i + 1) * 4, true);
         rows[i][name] = td.decode(blob.subarray(buf2Off + start, buf2Off + end));
+      }
+    } else if (type === ARW_FIXED_LIST) {
+      // FixedSizeList<Float64>[dim]: dim rides buf2_len; buf1 is the flat child
+      // values (nrows × dim). A null list → null (not a zero vector).
+      const dim = dv.getUint32(d + 36, true);
+
+      for (let i = 0; i < nrows; i += 1) {
+        if (isNull(i)) {
+          rows[i][name] = null;
+          continue;
+        }
+
+        const base = buf1Off + i * dim * 8;
+        rows[i][name] = Array.from({ length: dim }, (_, j) => dv.getFloat64(base + j * 8, true));
       }
     } else {
       throw new LenkeError(`lenke: arrow column '${name}' has unknown type ${type}`, {
