@@ -30,6 +30,7 @@ mod centrality;
 mod components;
 mod degree;
 mod label_prop;
+mod neighbor_aggregate;
 mod pagerank;
 mod peer_pressure;
 mod scc;
@@ -73,6 +74,14 @@ pub struct AlgoConfig {
     pub algorithm: Option<String>,
     /// Admissible-heuristic vertex property for A\*.
     pub heuristic_property: Option<String>,
+    /// Source list-valued property holding each vertex's feature vector
+    /// (`neighborAggregate`). Required for that algorithm.
+    pub feature: Option<String>,
+    /// Element-wise aggregation for `neighborAggregate`: `"mean"` (default),
+    /// `"sum"`, `"max"`, `"min"`.
+    pub op: Option<String>,
+    /// Include the vertex's own feature vector in its aggregate (`neighborAggregate`).
+    pub include_self: Option<bool>,
 }
 
 impl AlgoConfig {
@@ -106,6 +115,9 @@ impl AlgoConfig {
             write_property: string("writeProperty"),
             algorithm: string("algorithm"),
             heuristic_property: string("heuristicProperty"),
+            feature: string("feature"),
+            op: string("op"),
+            include_self: j.get("includeSelf").and_then(json::Json::as_bool),
         })
     }
 
@@ -138,6 +150,9 @@ pub const CONFIG_KEYS: &[&str] = &[
     "writeProperty",
     "algorithm",
     "heuristicProperty",
+    "feature",
+    "op",
+    "includeSelf",
 ];
 
 /// Case-insensitive Levenshtein edit distance — a plain DP over `char`s. Shared by
@@ -212,6 +227,10 @@ fn dispatch(graph: &Graph, name: &str, cfg: &AlgoConfig) -> Result<AlgoOutput, S
         "betweenness" => ("centrality", centrality::betweenness(graph, cfg)),
         "closeness" => ("centrality", centrality::closeness(graph, cfg)),
         "shortestPath" => ("distance", shortest_path::shortest_path(graph, cfg)),
+        "neighborAggregate" => (
+            "vector",
+            neighbor_aggregate::neighbor_aggregate(graph, cfg)?,
+        ),
         other => return Err(format!("unknown algorithm: {other}")),
     })
 }
@@ -302,6 +321,129 @@ mod tests {
             r#"{"type":"edge","from":"6","to":"3","labels":["CREATED"]}"#,
         ];
         ndjson::decode(&lines.join("\n")).unwrap()
+    }
+
+    /// A tiny feature graph: a→b, b→c, a→c with list features h.
+    /// a=[1,2], b=[3,4], c=[5,6].
+    fn featured() -> Graph {
+        let lines = [
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{"h":[1,2]}}"#,
+            r#"{"type":"node","id":"b","labels":["N"],"properties":{"h":[3,4]}}"#,
+            r#"{"type":"node","id":"c","labels":["N"],"properties":{"h":[5,6]}}"#,
+            r#"{"type":"edge","from":"a","to":"b","labels":["R"]}"#,
+            r#"{"type":"edge","from":"b","to":"c","labels":["R"]}"#,
+            r#"{"type":"edge","from":"a","to":"c","labels":["R"]}"#,
+        ];
+        ndjson::decode(&lines.join("\n")).unwrap()
+    }
+
+    /// `(external id, aggregate vector)` rows from `neighborAggregate`.
+    fn aggregates(g: &mut Graph, cfg: &str) -> Vec<(String, Vec<f64>)> {
+        let rs = run(g, "neighborAggregate", cfg).unwrap();
+        rs.rows()
+            .map(|r| match (&r[0], &r[1]) {
+                (Value::Str(id), Value::List(items)) => (
+                    id.to_string(),
+                    items
+                        .iter()
+                        .map(|x| match x {
+                            Value::Num(n) => *n,
+                            _ => panic!("aggregate element not a number"),
+                        })
+                        .collect(),
+                ),
+                _ => panic!("unexpected aggregate row shape"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn neighbor_aggregate_mean_sum_out() {
+        let mut g = featured();
+        // out-neighbours: a→{b,c}, b→{c}, c→{}. mean, no self.
+        assert_eq!(
+            aggregates(&mut g, r#"{"feature":"h","op":"mean","direction":"out"}"#),
+            vec![
+                ("a".into(), vec![4.0, 5.0]), // mean([3,4],[5,6])
+                ("b".into(), vec![5.0, 6.0]), // c
+                ("c".into(), vec![0.0, 0.0]), // no out-neighbours → zero vector
+            ]
+        );
+        assert_eq!(
+            aggregates(&mut g, r#"{"feature":"h","op":"sum","direction":"out"}"#),
+            vec![
+                ("a".into(), vec![8.0, 10.0]),
+                ("b".into(), vec![5.0, 6.0]),
+                ("c".into(), vec![0.0, 0.0]),
+            ]
+        );
+    }
+
+    #[test]
+    fn neighbor_aggregate_include_self_and_both() {
+        let mut g = featured();
+        // includeSelf, both directions: every vertex sees a,b,c (fully connected here
+        // once direction is undirected), so each mean == mean(a,b,c) = [3,4].
+        assert_eq!(
+            aggregates(
+                &mut g,
+                r#"{"feature":"h","op":"mean","direction":"both","includeSelf":true}"#
+            ),
+            vec![
+                ("a".into(), vec![3.0, 4.0]),
+                ("b".into(), vec![3.0, 4.0]),
+                ("c".into(), vec![3.0, 4.0]),
+            ]
+        );
+    }
+
+    #[test]
+    fn neighbor_aggregate_max_min_and_write() {
+        let mut g = featured();
+        // max over out-neighbours: a sees b,c → max = [5,6]; b sees c → [5,6].
+        assert_eq!(
+            aggregates(&mut g, r#"{"feature":"h","op":"max","direction":"out"}"#),
+            vec![
+                ("a".into(), vec![5.0, 6.0]),
+                ("b".into(), vec![5.0, 6.0]),
+                ("c".into(), vec![0.0, 0.0]),
+            ]
+        );
+        // writeProperty stores the aggregate list; reading it back as the feature
+        // of a *second* aggregate confirms the write round-trips as a list value.
+        run(
+            &mut g,
+            "neighborAggregate",
+            r#"{"feature":"h","op":"sum","direction":"out","writeProperty":"agg"}"#,
+        )
+        .unwrap();
+        // `agg` now holds a=[8,10], b=[5,6], c=[0,0]; sum over out-neighbours of `agg`.
+        assert_eq!(
+            aggregates(&mut g, r#"{"feature":"agg","op":"sum","direction":"out"}"#),
+            vec![
+                ("a".into(), vec![5.0, 6.0]), // b.agg + c.agg = [5,6]+[0,0]
+                ("b".into(), vec![0.0, 0.0]), // c.agg = [0,0]
+                ("c".into(), vec![0.0, 0.0]),
+            ]
+        );
+    }
+
+    #[test]
+    fn neighbor_aggregate_config_errors() {
+        let mut g = featured();
+        assert!(run(&mut g, "neighborAggregate", r#"{"op":"mean"}"#).is_err()); // no feature
+        assert!(run(
+            &mut g,
+            "neighborAggregate",
+            r#"{"feature":"h","op":"nope"}"#
+        )
+        .is_err());
+        assert!(run(
+            &mut g,
+            "neighborAggregate",
+            r#"{"feature":"h","direction":"sideways"}"#
+        )
+        .is_err());
     }
 
     /// `(external id, degree)` rows in engine order.

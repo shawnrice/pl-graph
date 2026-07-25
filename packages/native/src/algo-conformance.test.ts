@@ -27,6 +27,7 @@ import {
   degree,
   Graph,
   labelPropagation,
+  neighborAggregate,
   pagerank,
   peerPressure,
   shortestPath,
@@ -565,5 +566,86 @@ suite('graph-algorithm differential: closeness (TS core vs native)', () => {
     expect(JSON.stringify(tsQuery(tsGraph, readBack))).toBe(
       JSON.stringify(nativeGraph.query(readBack)),
     );
+  });
+});
+
+// A small weighted feature graph with FRACTIONAL vectors, so a `mean`/`sum`
+// aggregate is byte-identical only if both engines fold contributors in the same
+// order. Directed edges, aggregated by direction. Nodes carry a 3-dim `h`.
+const FEATURE_NDJSON = [
+  '{"type":"node","id":"a","labels":["N"],"properties":{"h":[0.1,0.2,0.3]}}',
+  '{"type":"node","id":"b","labels":["N"],"properties":{"h":[1.5,2.5,3.5]}}',
+  '{"type":"node","id":"c","labels":["N"],"properties":{"h":[0.7,0.9,1.1]}}',
+  '{"type":"node","id":"d","labels":["N"],"properties":{"h":[9.9,8.8,7.7]}}',
+  // e has NO feature — a neighbour of it contributes, but e contributes nothing.
+  '{"type":"node","id":"e","labels":["N"],"properties":{}}',
+  '{"type":"edge","from":"a","to":"b","labels":["R"]}',
+  '{"type":"edge","from":"a","to":"c","labels":["R"]}',
+  '{"type":"edge","from":"a","to":"d","labels":["R"]}',
+  '{"type":"edge","from":"b","to":"c","labels":["R"]}',
+  '{"type":"edge","from":"c","to":"a","labels":["R"]}',
+  '{"type":"edge","from":"e","to":"a","labels":["R"]}',
+  '{"type":"edge","from":"a","to":"e","labels":["R"]}',
+].join('\n');
+
+suite('graph-algorithm differential: neighborAggregate (TS core vs native)', () => {
+  const backend = createFfiBackend(LIB);
+  const nativeGraph = graphFromFormat(backend, FEATURE_NDJSON, 'ndjson');
+  const tsGraph = tsDeserialize(FEATURE_NDJSON, 'ndjson', new Graph());
+
+  const both = async (config: AlgorithmConfig): Promise<[string, string]> => [
+    JSON.stringify(await neighborAggregate(config, tsGraph)),
+    JSON.stringify(await nativeGraph.neighborAggregate(config)),
+  ];
+
+  for (const op of ['mean', 'sum', 'max', 'min'] as const) {
+    for (const direction of ['out', 'in', 'both'] as const) {
+      test(`${op} / ${direction} is byte-identical`, async () => {
+        const [ts, native] = await both({ feature: 'h', op, direction });
+        expect(ts).toBe(native);
+      });
+    }
+  }
+
+  test('includeSelf is byte-identical (self folds first)', async () => {
+    const [ts, native] = await both({
+      feature: 'h',
+      op: 'mean',
+      direction: 'both',
+      includeSelf: true,
+    });
+    expect(ts).toBe(native);
+  });
+
+  test('writeProperty round-trips the aggregate list identically through GQL', async () => {
+    const config = { feature: 'h', op: 'sum', direction: 'out', writeProperty: 'agg' } as const;
+    await neighborAggregate(config, tsGraph);
+    await nativeGraph.neighborAggregate(config);
+
+    const readBack = 'MATCH (n) RETURN n.agg AS agg ORDER BY n.id';
+    expect(JSON.stringify(tsQuery(tsGraph, readBack))).toBe(
+      JSON.stringify(nativeGraph.query(readBack)),
+    );
+  });
+
+  test('a missing feature contributes nothing, both engines', async () => {
+    // `e` has no `h`, so when `a` aggregates its out-neighbours (b, c, d, e) the
+    // featureless `e` is skipped: a.sum == b + c + d, byte-identical.
+    const [ts, native] = await both({ feature: 'h', op: 'sum', direction: 'out' });
+    expect(ts).toBe(native);
+    const rows = JSON.parse(ts) as { node: string; vector: number[] }[];
+    // a.sum == b + c + d (featureless e excluded); compare per element.
+    const b = [1.5, 2.5, 3.5];
+    const c = [0.7, 0.9, 1.1];
+    const d = [9.9, 8.8, 7.7];
+    const a = rows.find((r) => r.node === 'a')!.vector;
+    b.forEach((_, i) => expect(a[i]).toBeCloseTo(b[i] + c[i] + d[i], 10));
+  });
+
+  test('CALL neighbor_aggregate is byte-identical to the method', async () => {
+    // `vector` (not the reserved `aggregate`) is the result column.
+    const call =
+      "CALL neighbor_aggregate({feature:'h', op:'mean', direction:'both'}) YIELD node, vector RETURN node, vector ORDER BY node";
+    expect(JSON.stringify(tsQuery(tsGraph, call))).toBe(JSON.stringify(nativeGraph.query(call)));
   });
 });

@@ -16,4 +16,5 @@ export { peerPressure, type ClusterRow } from './peer-pressure.js';
 export { pagerank, personalizedPagerank, type PageRankRow } from './pagerank.js';
 export { betweenness, closeness, type CentralityRow } from './centrality.js';
 export { shortestPath, type ShortestPathRow } from './shortest-path.js';
+export { neighborAggregate, type NeighborAggregateRow } from './neighbor-aggregate.js';
 export { runAlgorithmSync, type AlgorithmName } from './run-sync.js';

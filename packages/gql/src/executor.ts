@@ -5104,6 +5104,7 @@ const PROCEDURES: Record<string, { algo: AlgorithmName; resultColumn: string }> 
   betweenness: { algo: 'betweenness', resultColumn: 'centrality' },
   closeness: { algo: 'closeness', resultColumn: 'centrality' },
   shortest_path: { algo: 'shortestPath', resultColumn: 'distance' },
+  neighbor_aggregate: { algo: 'neighborAggregate', resultColumn: 'vector' },
 };
 
 const procedureSpec = (name: string): { algo: AlgorithmName; resultColumn: string } | null =>
@@ -5126,7 +5127,9 @@ const suggestProcedure = (name: string): string | null => {
 
 /** The accepted `CALL <algo>({...})` config keys and the value type each expects.
  * Order is fixed so the "did you mean" tie-break matches the native engine. */
-const ALGO_CONFIG_TYPES: ReadonlyArray<readonly [string, 'string' | 'number' | 'stringList']> = [
+const ALGO_CONFIG_TYPES: ReadonlyArray<
+  readonly [string, 'string' | 'number' | 'stringList' | 'boolean']
+> = [
   ['edgeLabel', 'string'],
   ['direction', 'string'],
   ['weightProperty', 'string'],
@@ -5140,6 +5143,9 @@ const ALGO_CONFIG_TYPES: ReadonlyArray<readonly [string, 'string' | 'number' | '
   ['writeProperty', 'string'],
   ['algorithm', 'string'],
   ['heuristicProperty', 'string'],
+  ['feature', 'string'],
+  ['op', 'string'],
+  ['includeSelf', 'boolean'],
 ];
 
 /** Case-insensitive Levenshtein edit distance — a plain DP over code points,
@@ -5202,6 +5208,7 @@ const applyAlgoConfig = (cfg: AlgorithmConfig, key: string, v: unknown): void =>
     string: typeof v === 'string',
     number: typeof v === 'number',
     stringList: Array.isArray(v),
+    boolean: typeof v === 'boolean',
   };
 
   if (!okByType[expected]) {

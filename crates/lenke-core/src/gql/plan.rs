@@ -734,6 +734,7 @@ pub fn procedure_spec(name: &str) -> Option<(&'static str, &'static str)> {
         "betweenness" => ("betweenness", "centrality"),
         "closeness" => ("closeness", "centrality"),
         "shortest_path" => ("shortestPath", "distance"),
+        "neighbor_aggregate" => ("neighborAggregate", "vector"),
         _ => return None,
     })
 }
@@ -752,6 +753,7 @@ pub const PROCEDURE_NAMES: &[&str] = &[
     "betweenness",
     "closeness",
     "shortest_path",
+    "neighbor_aggregate",
 ];
 
 /// For an unknown procedure name, the canonical snake_case name it most likely

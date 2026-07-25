@@ -30,6 +30,12 @@ impl Json {
             _ => None,
         }
     }
+    pub(crate) fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
     pub(crate) fn as_array(&self) -> Option<&[Self]> {
         match self {
             Self::Arr(a) => Some(a),

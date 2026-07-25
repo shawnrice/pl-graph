@@ -46,6 +46,18 @@ export type AlgorithmConfig = {
   algorithm?: 'dijkstra' | 'astar';
   /** Admissible-heuristic vertex property for A*. */
   heuristicProperty?: string;
+  /**
+   * Source list-valued property holding each vertex's feature vector
+   * (**neighborAggregate**). Required for that algorithm.
+   */
+  feature?: string;
+  /**
+   * Element-wise aggregation for **neighborAggregate** — `'mean'` (default),
+   * `'sum'`, `'max'`, `'min'`.
+   */
+  op?: 'mean' | 'sum' | 'max' | 'min';
+  /** Include the vertex's own feature vector in its aggregate (**neighborAggregate**). */
+  includeSelf?: boolean;
 };
 
 /**

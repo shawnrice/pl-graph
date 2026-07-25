@@ -6,6 +6,7 @@ import type {
   ComponentRow,
   DegreeRow,
   LabelRow,
+  NeighborAggregateRow,
   OnCycleRow,
   PageRankRow,
   ScalarTypeName,
@@ -795,6 +796,14 @@ export type RustGraph = {
   closeness: (config?: AlgorithmConfig) => Promise<CentralityRow[]>;
   shortestPath: (config?: AlgorithmConfig) => Promise<ShortestPathRow[]>;
   /**
+   * Vectorized neighbour aggregation (message passing): for each vertex, aggregate
+   * its neighbours' list-valued `config.feature` vectors element-wise over the whole
+   * block — `config.op` (`'mean'` default / `'sum'` / `'max'` / `'min'`), by
+   * `config.direction`, optionally `config.includeSelf`. One native pass; the result
+   * list is written to `config.writeProperty` when set.
+   */
+  neighborAggregate: (config?: AlgorithmConfig) => Promise<NeighborAggregateRow[]>;
+  /**
    * Deep-copy this graph into a fresh, fully independent {@link RustGraph} — the
    * fast fork/branch substrate. An O(V+E) native clone of the columnar store, not
    * a serialize→parse NDJSON round-trip: no text, no re-validation, no re-indexing,
@@ -1176,6 +1185,8 @@ export const attachGraph = (backend: Backend, handle: GraphHandle): RustGraph =>
     betweenness: (config) => runAlgoAsync('betweenness', config) as Promise<CentralityRow[]>,
     closeness: (config) => runAlgoAsync('closeness', config) as Promise<CentralityRow[]>,
     shortestPath: (config) => runAlgoAsync('shortestPath', config) as Promise<ShortestPathRow[]>,
+    neighborAggregate: (config) =>
+      runAlgoAsync('neighborAggregate', config) as Promise<NeighborAggregateRow[]>,
     copy: () => attachGraph(backend, backend.graphClone(live())),
     toNdjson: () => backend.encodeNdjson(live()),
     mergeNdjson: (bytes) => backend.mergeNdjson(live(), bytes),

@@ -1061,6 +1061,10 @@ fn apply_algo_config(
             .collect()),
         _ => Err(err(format!("config key '{field}' expects a list"))),
     };
+    let want_bool = |v: &Val| match v {
+        Val::Bool(b) => Ok(*b),
+        _ => Err(err(format!("config key '{field}' expects a boolean"))),
+    };
     match field {
         "edgeLabel" => cfg.edge_label = Some(want_str(v)?),
         "direction" => cfg.direction = Some(want_str(v)?),
@@ -1075,6 +1079,9 @@ fn apply_algo_config(
         "writeProperty" => cfg.write_property = Some(want_str(v)?),
         "algorithm" => cfg.algorithm = Some(want_str(v)?),
         "heuristicProperty" => cfg.heuristic_property = Some(want_str(v)?),
+        "feature" => cfg.feature = Some(want_str(v)?),
+        "op" => cfg.op = Some(want_str(v)?),
+        "includeSelf" => cfg.include_self = Some(want_bool(v)?),
         _ => {
             return Err(err(match crate::algo::suggest_config_key(field) {
                 Some(s) => format!("unknown config key '{field}' (did you mean '{s}'?)"),

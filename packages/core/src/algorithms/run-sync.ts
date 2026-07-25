@@ -4,6 +4,7 @@ import { betweennessGen, closenessGen } from './centrality.js';
 import { computeGen as connectedComponentsGen } from './connected-components.js';
 import { computeGen as degreeGen } from './degree.js';
 import { computeGen as labelPropagationGen } from './label-propagation.js';
+import { computeGen as neighborAggregateGen } from './neighbor-aggregate.js';
 import {
   computeGen as pagerankGen,
   personalizedComputeGen as personalizedPagerankGen,
@@ -32,7 +33,8 @@ export type AlgorithmName =
   | 'labelPropagation'
   | 'betweenness'
   | 'closeness'
-  | 'shortestPath';
+  | 'shortestPath'
+  | 'neighborAggregate';
 
 /**
  * Synchronously run a whole-graph algorithm and (when `config.writeProperty` is
@@ -71,5 +73,7 @@ export const runAlgorithmSync = (
       return drainSync(closenessGen(config, graph));
     case 'shortestPath':
       return drainSync(shortestPathGen(config, graph));
+    case 'neighborAggregate':
+      return drainSync(neighborAggregateGen(config, graph));
   }
 };
