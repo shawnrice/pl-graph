@@ -3474,6 +3474,20 @@ fn shortest_k_walk(
     true
 }
 
+/// Can a selector pattern reduce to a BFS driver? True when the single
+/// variable-length segment is a `*`/`+` (min ≤ 1) with no per-hop predicate — the
+/// exact shape `shortest_walk`/`all_shortest_walk` are correct for. `ANY` and
+/// `SHORTEST 1 [GROUP]` then reuse the O(V+E) BFS instead of enumerating trails.
+fn bfs_reducible(pattern: &CPath) -> bool {
+    pattern.segments.len() == 1
+        && pattern.segments[0]
+            .rel
+            .quantifier
+            .is_some_and(|q| q.min <= 1)
+        && pattern.segments[0].rel.props.is_empty()
+        && pattern.segments[0].rel.where_.is_none()
+}
+
 /// Seed and match a single path pattern, emitting each binding via `emit`.
 /// `where_` is the enclosing clause WHERE, threaded here only so the start node
 /// can seed from a property index on a `WHERE var.k = $x` conjunct (in addition
@@ -3500,9 +3514,22 @@ fn visit_pattern(
                     all_walk(graph, ctx, pattern, seed, b, emit)
                 }
                 PathSelector::Walk => walk_segments(graph, ctx, pattern, 0, seed, b, emit),
+                // `ANY` and `SHORTEST 1 [GROUP]` over a shortest-shaped segment
+                // reduce to the O(V+E) BFS drivers (a shortest path is a valid
+                // arbitrary / 1-shortest path) instead of enumerating exponentially
+                // many trails. Both engines route identically → still byte-identical.
+                PathSelector::Any if bfs_reducible(pattern) => {
+                    shortest_walk(graph, ctx, pattern, seed, b, emit)
+                }
                 PathSelector::Any => any_walk(graph, ctx, pattern, seed, b, emit),
                 PathSelector::AnyShortest => shortest_walk(graph, ctx, pattern, seed, b, emit),
                 PathSelector::AllShortest => all_shortest_walk(graph, ctx, pattern, seed, b, emit),
+                PathSelector::ShortestK { k: 1, group: false } if bfs_reducible(pattern) => {
+                    shortest_walk(graph, ctx, pattern, seed, b, emit)
+                }
+                PathSelector::ShortestK { k: 1, group: true } if bfs_reducible(pattern) => {
+                    all_shortest_walk(graph, ctx, pattern, seed, b, emit)
+                }
                 PathSelector::ShortestK { k, group } => {
                     shortest_k_walk(graph, ctx, pattern, seed, b, emit, (k, group))
                 }

@@ -3175,6 +3175,62 @@ const allShortestWalk = function* (
   }
 };
 
+/** A start-seeded path driver: yields each binding extending `binding` from `seed`. */
+type SeedDriver = (
+  graph: Graph,
+  pattern: CPath,
+  seed: Vertex,
+  binding: Binding,
+  params: Params,
+) => Iterable<Binding>;
+
+/** Can a selector pattern reduce to a BFS driver? True when the single var-length
+ * segment is a `*`/`+` (min ≤ 1) with no per-hop predicate — the shape the BFS
+ * drivers are correct for. Mirrors native `bfs_reducible`. */
+const bfsReducible = (pattern: CPath): boolean => {
+  const seg = pattern.segments.length === 1 ? pattern.segments[0] : undefined;
+  const q = seg?.rel.quantifier;
+
+  return (
+    q !== undefined &&
+    q.min <= 1 &&
+    seg!.rel.pred.props.length === 0 &&
+    seg!.rel.pred.where === undefined
+  );
+};
+
+/** Pick the start-seeded driver for a selector, or null for the walk / path-var
+ * matcher (handled below). `ANY` and `SHORTEST 1 [GROUP]` reduce to the O(V+E)
+ * BFS drivers when `bfsReducible` (a shortest path is a valid arbitrary /
+ * 1-shortest path); otherwise they enumerate trails. Both engines route
+ * identically, so the result stays byte-identical. */
+const pickSeedDriver = (pattern: CPath, selector: PathSelector): SeedDriver | null => {
+  if (selector === 'anyShortest') {
+    return shortestWalk;
+  }
+
+  if (selector === 'allShortest') {
+    return allShortestWalk;
+  }
+
+  if (selector === 'any') {
+    return bfsReducible(pattern) ? shortestWalk : anyWalk;
+  }
+
+  if (typeof selector === 'object' && selector.kind === 'shortestK') {
+    if (selector.k === 1 && bfsReducible(pattern)) {
+      return selector.group ? allShortestWalk : shortestWalk;
+    }
+
+    const sel = selector;
+
+    return (graph, pat, seed, binding, params) =>
+      shortestKWalk(graph, pat, seed, binding, params, sel);
+  }
+
+  return null;
+};
+
 /** Yield every binding that extends `binding` by matching `pattern`. */
 const matchPattern = function* (
   graph: Graph,
@@ -3184,8 +3240,12 @@ const matchPattern = function* (
 ): Iterable<Binding> {
   const selector = pattern.selector ?? 'walk';
 
-  // A shortest-path selector (`ANY`/`ALL SHORTEST`) has its own BFS driver.
-  if (selector === 'anyShortest' || selector === 'allShortest') {
+  // Selectors that seed from the START and yield via a dedicated driver (a BFS
+  // one or the trail enumerator). `ANY`/`SHORTEST 1 [GROUP]` reduce to the BFS
+  // drivers when the segment is shortest-shaped — see `pickSeedDriver`.
+  const seedDriver = pickSeedDriver(pattern, selector);
+
+  if (seedDriver) {
     const seeds: Iterable<Vertex> =
       pattern.start.variable && binding.has(pattern.start.variable)
         ? [binding.get(pattern.start.variable) as Vertex]
@@ -3195,30 +3255,7 @@ const matchPattern = function* (
       const seeded = matchNode(binding, pattern.start, seed, params, graph);
 
       if (seeded) {
-        yield* selector === 'anyShortest'
-          ? shortestWalk(graph, pattern, seed, seeded, params)
-          : allShortestWalk(graph, pattern, seed, seeded, params);
-      }
-    }
-
-    return;
-  }
-
-  // Bare `ANY` and `SHORTEST k [GROUP]` enumerate trails from the seed (so they
-  // honour the pattern's mode and any per-hop predicate), then dedup / rank.
-  if (selector === 'any' || (typeof selector === 'object' && selector.kind === 'shortestK')) {
-    const seeds: Iterable<Vertex> =
-      pattern.start.variable && binding.has(pattern.start.variable)
-        ? [binding.get(pattern.start.variable) as Vertex]
-        : seedVertices(graph, pattern.start, binding, params);
-
-    for (const seed of seeds) {
-      const seeded = matchNode(binding, pattern.start, seed, params, graph);
-
-      if (seeded) {
-        yield* selector === 'any'
-          ? anyWalk(graph, pattern, seed, seeded, params)
-          : shortestKWalk(graph, pattern, seed, seeded, params, selector);
+        yield* seedDriver(graph, pattern, seed, seeded, params);
       }
     }
 
