@@ -5464,6 +5464,72 @@ fn bare_all_selector_over_fixed_pattern() {
 }
 
 // ---------------------------------------------------------------------------
+// Regression: a numeric-list property is stored in a typed `Column::Vec`. Reading
+// it through GQL must reconstruct the list — the scalar read path `prop_of` (in
+// eval.rs) matches `Column` variants DIRECTLY and originally lacked a `Vec` arm,
+// so `RETURN n.h` came back NULL (while `props.value_id` handled it). These cover
+// that path for node + edge props, subscript, list functions, and WHERE.
+// ---------------------------------------------------------------------------
+
+fn vector_props() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"name":"a","h":[1.0,2.0,3.0]}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"name":"b","h":[4.0,5.0,6.0]}}"#,
+        r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R"],"properties":{"w":[7.0,8.0]}}"#,
+    ])
+}
+
+#[test]
+fn vector_column_returns_the_whole_list_through_gql() {
+    let mut g = vector_props();
+    // `RETURN n.h` — the exact shape that regressed to NULL.
+    assert_eq!(
+        rows(&mut g, "MATCH (n:N {name:'a'}) RETURN n.h AS h"),
+        vec![vec![Value::List(vec![n(1.0), n(2.0), n(3.0)])]]
+    );
+    // An edge vector property goes through the same `prop_of` (Val::Edge branch).
+    assert_eq!(
+        rows(&mut g, "MATCH (a)-[e:R]->(b) RETURN e.w AS w"),
+        vec![vec![Value::List(vec![n(7.0), n(8.0)])]]
+    );
+}
+
+#[test]
+fn vector_column_subscript_and_list_fns_through_gql() {
+    let mut g = vector_props();
+    // Subscript reads one element (0-based) off the reconstructed list.
+    assert_eq!(
+        rows(&mut g, "MATCH (n:N {name:'a'}) RETURN n.h[1] AS x"),
+        vec![vec![n(2.0)]]
+    );
+    // `size` over the vector.
+    assert_eq!(
+        rows(&mut g, "MATCH (n:N {name:'b'}) RETURN size(n.h) AS s"),
+        vec![vec![n(3.0)]]
+    );
+    // A WHERE predicate over the vector filters, and both rows carry a 3-vector.
+    let mut names = rows(
+        &mut g,
+        "MATCH (n:N) WHERE size(n.h) = 3 RETURN n.name AS name",
+    );
+    names.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
+    assert_eq!(names, vec![vec![s("a")], vec![s("b")]]);
+}
+
+#[test]
+fn vector_column_null_when_absent_through_gql() {
+    // A vertex without the vector key reads NULL (present-gating, not the value).
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"name":"a","h":[1.0,2.0]}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"name":"b"}}"#,
+    ]);
+    assert_eq!(
+        rows(&mut g, "MATCH (n:N {name:'b'}) RETURN n.h AS h"),
+        vec![vec![Value::Null]]
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Bare `ANY` selector (one arbitrary path per endpoint) and `SHORTEST k [GROUP]`
 // (the k shortest paths / the k smallest length-groups). Fixture: to `d` there
 // is one length-1 path (a→d) and two length-2 paths (a→b→d, a→c→d).
