@@ -26,7 +26,7 @@ Both frontends run over either engine, and the results are the same. Pick one la
 
 **Reach path** — main thread, a worker (local-first UI), or a server. See the \`workers\` and \`multiplayer-sync\` guides.
 
-Everything is ESM under the \`@lenke/*\` scope. The docs/ folder has deeper guides (\`docs/guides/index.md\` is the map).`,
+Everything is ESM under the \`@lenke/*\` scope. The lenke documentation has deeper guides for each build path.`,
 };
 
 const gettingStarted: Guide = {
@@ -75,7 +75,7 @@ using g = graphFromNdjson(backend, await Bun.file('graph.ndjson').bytes());
 g.query\`MATCH (a:Person) RETURN a.name\`;   // tagged-template form (safe binding)
 \`\`\`
 
-On Node, use \`createNodeBackend()\` from \`@lenke/node/backend\` (no path needed — the prebuilt addon ships with it); in the browser, \`createWasmBackend(fetch(wasmUrl))\`. A native graph owns memory — release it with \`using\`, \`g.free()\`, or let GC back you up. See \`docs/guides/native.md\` and \`docs/guides/wasm.md\` for the artifact paths.`,
+On Node, use \`createNodeBackend()\` from \`@lenke/node/backend\` (no path needed — the prebuilt addon ships with it); in the browser, \`createWasmBackend(fetch(wasmUrl))\`. A native graph owns memory — release it with \`using\`, \`g.free()\`, or let GC back you up. The native and wasm setup docs cover where the compiled artifact lives.`,
 };
 
 const gqlGuide: Guide = {
@@ -153,6 +153,51 @@ MATCH (a:Person {name: 'ada'}) DETACH DELETE a
 
 ## Coming from Cypher?
 A few things differ: variable-length is \`-[:R]->{1,5}\` (not \`-[:R*1..5]\`); a per-hop condition goes *inside* the bracket (\`-[e:R WHERE …]->{1,5}\`); durations are ISO strings (\`duration('PT24H')\`, not a map); labels are boolean expressions. Use the \`gql_check\` tool to validate a query and \`gql_run\` to try it on sample data.`,
+};
+
+const temporalGuide: Guide = {
+  id: 'temporal',
+  title: 'Working with time',
+  description: 'Dates, datetimes, durations, time windows, and the current-time clock.',
+  text: `# Working with time
+
+lenke has first-class temporal types, all ISO-8601: dates, datetimes (zoneless and zoned), and durations.
+
+## Constructors
+\`\`\`
+RETURN date('2024-06-01')                          -- a calendar date
+RETURN datetime('2024-06-01T12:00:00')             -- a zoneless (local) datetime
+RETURN zoned_datetime('2024-06-01T12:00:00Z')      -- a datetime carrying an offset / Z
+RETURN duration('PT24H')                           -- 24 hours; also 'P1D', 'P1DT2H30M', 'PT90M'
+\`\`\`
+\`datetime()\` is **zoneless** — a timestamp that carries an offset or a \`Z\` parses with \`zoned_datetime()\` (passing such a string to \`datetime()\` yields \`null\`). Store timestamps consistently as one kind.
+
+## Arithmetic and time windows
+Shift an instant by adding a duration:
+\`\`\`
+RETURN datetime('2024-06-01T12:00:00') + duration('PT24H')   -- 2024-06-02T12:00:00
+RETURN date('2024-06-01') + duration('P7D')                  -- 2024-06-08
+\`\`\`
+Express a window by comparing **instants** (this is the idiom for "within N hours/days"):
+\`\`\`
+MATCH (a)-[e1:SENT]->(b)-[e2:SENT]->(c)
+WHERE e2.ts > e1.ts AND e2.ts < e1.ts + duration('PT24H')     -- e2 within 24h after e1
+RETURN a, c
+\`\`\`
+Measure the gap between two instants:
+\`\`\`
+RETURN duration_between(e1.ts, e2.ts) AS gap
+\`\`\`
+Instants order directly (\`datetime < datetime\`, \`date < date\`). Compare durations *through the instants they bound* — write \`a.ts < b.ts + duration(...)\` rather than comparing one duration to another.
+
+## Current time
+\`current_date()\` and \`current_timestamp()\` read a clock you provide — \`graph.setClock(() => Date.now())\` on a native graph, or pass \`$__now\` in the query params. Without a clock they read as \`null\`, which keeps queries deterministic by default.
+
+## Good to know
+- **Store timestamps as temporals, not strings.** A string compared against a temporal silently matches nothing. If your data has string timestamps, wrap them: \`datetime(e.ts)\`, \`date(e.day)\`.
+- **Build temporal values with the constructor functions** \`date(x)\` / \`datetime(x)\` / \`zoned_datetime(x)\` / \`duration(x)\` (rather than \`CAST(x AS DATE)\`). The bare literal prefix is \`DATETIME '…'\`.
+- **No date-part extraction** (\`year()\`/\`month()\`/\`EXTRACT\`) yet — derive parts host-side, or from \`duration_between\`.
+- \`min\`/\`max\` over a duration column work; a duration in a numeric \`sum\`/\`avg\` is a loud \`E_DATA_EXCEPTION\`. Out-of-range date fields (month 13) are a syntax error, but a valid-looking overflow like \`date('2025-02-29')\` rolls to \`2025-03-01\`.`,
 };
 
 const gremlinGuide: Guide = {
@@ -332,7 +377,7 @@ worker.onmessage = (e) => client.receive(e.data);
 const people = client.liveQuery('MATCH (p:Person) RETURN p.name', { deps: ['Person', 'name'] });
 \`\`\`
 
-Only query results (and NDJSON snapshots for persistence) cross the worker boundary — never the graph itself. \`docs/guides/frontend-worker.md\` has the full recipe, including OPFS persistence; \`docs/guides/wasm.md\` covers loading the wasm engine.`,
+Only query results (and NDJSON snapshots for persistence) cross the worker boundary — never the graph itself. The lenke local-first and wasm guides have the full recipe, including OPFS persistence.`,
 };
 
 const transactionsGuide: Guide = {
@@ -358,7 +403,13 @@ const t = g.tx();
 try { /* … writes … */ t.commit(); } catch (e) { t.rollback(); throw e; }
 \`\`\`
 
-Nesting joins the outer transaction (flat, no savepoints); the outermost commit runs deferred required/type/unique/cardinality/validator checks. The same surface exists on both the core \`Graph\` and native \`RustGraph\`. See \`docs/design/r-tx.md\`.`,
+Nesting joins the outer transaction (flat, no savepoints); the outermost commit runs deferred required/type/unique/cardinality/validator checks. The same surface exists on both the core \`Graph\` and native \`RustGraph\`.
+
+## Constraints and transactions work together
+- **Constraint checks defer to commit inside a transaction**, so a transaction that *transiently* violates a unique constraint and resolves it before commit is accepted — the invariant is the end state. This is how you swap two unique values or rebuild an index-backed set.
+- **A minimum-cardinality constraint forces atomic creation.** With, say, \`Airport LOCATED_IN out 1..1\`, a bare \`INSERT (:Airport)\` fails (0 < min). Create the node and its required edge in one statement, or inside \`transaction(...)\`.
+- **Constraints are a layer above the raw store.** \`createUniqueConstraint\` / \`createRequiredConstraint\` / \`createValidator\` guard the GQL write path; the underlying index itself permits duplicates. Declare them up front. Whole-invariant rules (e.g. debits == credits) are transaction invariants (\`createInvariant\`), not per-edge checks.
+- **A vetoed \`addVertex\`/\`addEdge\` still returns an element object** — check for the violation explicitly (or use the GQL write path, which throws \`E_CONSTRAINT_VIOLATION\`); don't infer success from the return value.`,
 };
 
 const typedNodesGuide: Guide = {
@@ -404,18 +455,179 @@ Formats: \`ndjson\`, \`pg-json\`, \`pg-text\`, \`graphson\`, \`csv\`. For large 
 On a native graph the equivalents are \`g.serialize(format)\`, \`g.toNdjson()\`, and \`g.mergeNdjson(bytes)\` (bulk-append, like \`deserialize(bytes, 'ndjson', existing)\`).`,
 };
 
+const performanceGuide: Guide = {
+  id: 'performance',
+  title: 'Performance & scale',
+  description:
+    'Anchoring on indexes, cheap vs expensive operations, bounds, and the memory envelope.',
+  text: `# Performance & scale
+
+## Anchor traversals on an indexed key
+The single biggest lever: seed a traversal from a specific vertex with an **inline pattern map** on an indexed property, not a post-hoc \`WHERE\`.
+\`\`\`
+MATCH (a:Acct {id: $id})-[:SENT]->{1,4}(b) RETURN b       -- seeks the index, then walks
+\`\`\`
+Writing \`MATCH (a:Acct)-[:SENT]->{1,4}(b) WHERE a.id = $id\` instead scans every \`Acct\` and expands before filtering — orders of magnitude slower on a large graph. Create the index first: \`g.createVertexIndex('id')\` (native \`RustGraph\`) or the same method on a core \`Graph\`. An indexed point lookup is dramatically faster than a scan.
+
+## Cheap vs expensive
+- **Cheap:** indexed seeks, \`degree\`, \`pagerank\`, grouped-count aggregations, and neighbor aggregation (linear in nodes × dims).
+- **Expensive:** exact \`betweenness\` and \`closeness\` are O(V·E) and dominate at scale. Use \`pivots\` for approximate betweenness (a sampled estimate — lower ranking fidelity). Unbounded \`->*\` over all pairs, and unrolled fixed-length chains, grow fast in hop count.
+
+## Bound the search, and let consumers stop early
+Prefer a bounded quantifier (\`->{1,5}\`) to an open \`->*\` when you can. Consumers that don't need every match — \`EXISTS { … }\`, \`LIMIT\` — short-circuit a variable-length walk instead of enumerating it. A pattern that would enumerate an intractable number of paths faults \`E_RESOURCE_EXHAUSTED\` — that's the guard protecting you; add a tighter bound, anchor an endpoint, or add a \`LIMIT\`.
+
+## Writes
+Prefer one aggregate or bulk operation over many wide per-node \`SET\`s. For per-node feature vectors, \`neighbor_aggregate\` writes the whole block in one pass (see the \`graph-ml\` guide).
+
+## Memory envelope
+An in-memory graph takes **several times its NDJSON text size** in memory; a whole-graph algorithm roughly doubles peak memory over the resident graph. \`graphFromNdjson\` decodes in parallel and loads quickly. \`new Graph({ maxOperatorChain })\` bounds \`AND\`/\`OR\`/arithmetic operator chains (default 10,000) as an anti-DoS guard.`,
+};
+
+const recipesGuide: Guide = {
+  id: 'recipes',
+  title: 'Recipes: common graph patterns',
+  description: 'Multi-hop chains, cycles, fan-in/structuring, and subgraph extraction.',
+  text: `# Recipes: common graph patterns
+
+## Multi-hop chains with per-hop conditions
+Every hop meets a condition — put the \`WHERE\` inside the relationship bracket so it prunes each hop:
+\`\`\`
+MATCH p = (a:Acct {id: $id})-[e:SENT WHERE e.amount >= 1000]->{4,6}(b) RETURN nodes(p)
+\`\`\`
+For conditions relating **consecutive** hops (e.g. each hop within 24h of the prior, amount within 10%), compare adjacent path elements — \`relationships(p)[i]\` against \`[i-1]\`:
+\`\`\`
+MATCH p = (a:Acct)-[:SENT]->{2,6}(b)
+WHERE datetime(relationships(p)[1].ts) < datetime(relationships(p)[0].ts) + duration('PT24H')
+  -- add one clause per index up to the max hop; guard the optional tail with IS NULL
+RETURN p
+\`\`\`
+A tractable "value-preserving relay" motif (two hops within a window, amount preserved), which you can stitch into longer chains in host code:
+\`\`\`
+MATCH (a)-[e1:SENT]->(b)-[e2:SENT]->(c)
+WHERE datetime(e2.ts) > datetime(e1.ts)
+  AND datetime(e2.ts) < datetime(e1.ts) + duration('PT24H')
+  AND abs(e2.amount - e1.amount) <= 0.1 * e1.amount
+RETURN a.id, b.id, c.id
+\`\`\`
+
+## Cycles
+On a dense graph, strongly-connected components collapse into one giant component, so filter by component **size** rather than treating membership as the signal:
+\`\`\`
+CALL strongly_connected_components() YIELD node, componentId
+WITH componentId, count(*) AS size WHERE size > 1
+RETURN componentId, size ORDER BY size DESC
+\`\`\`
+\`CALL on_cycle()\` gives per-vertex cycle membership. For money-cycle detection, anchor on time and amount as well as structure.
+
+## Fan-in / structuring
+Many transfers just under a threshold flowing into one account:
+\`\`\`
+MATCH (s)-[e:SENT]->(h) WHERE e.amount >= 8000 AND e.amount < 10000
+RETURN h.id AS account, count(*) AS n, sum(e.amount) AS total ORDER BY n DESC
+\`\`\`
+
+## Subgraph extraction for explanation
+Given a suspect pair, pull the actual edges via an indexed seek — instant, and it reads as a narrative:
+\`\`\`
+MATCH (a {id: $from})-[e:SENT]->(b {id: $to}) RETURN e.ts, e.amount ORDER BY e.ts
+\`\`\``,
+};
+
+const graphMlGuide: Guide = {
+  id: 'graph-ml',
+  title: 'Graph machine learning',
+  description: 'Feature engineering: message passing, structural features, and matrix egress.',
+  text: `# Graph machine learning
+
+lenke is a comfortable substrate for GNN-style feature engineering: propagate features across the graph, add structural signals, and egress a numeric matrix.
+
+## 1. Pack features into a vector
+Raw scalar features become one list property (stored efficiently, and it egresses as a real numeric matrix):
+\`\`\`
+MATCH (n:Account) SET n.h = [n.r0, n.r1, n.r2, n.r3]
+\`\`\`
+
+## 2. Message passing
+Aggregate each node's neighbors' feature vector element-wise, over the whole block in one pass:
+\`\`\`
+CALL neighbor_aggregate({ feature: 'h', op: 'mean', direction: 'both', includeSelf: true, writeProperty: 'h1' })
+YIELD node RETURN count(*)
+\`\`\`
+Iterate layers by alternating two buffers (\`h\` → \`h1\` → \`h2\`) rather than adding a new column per layer. If you write a neighbor-mean in plain GQL, use \`OPTIONAL MATCH\` + \`coalesce\` so degree-0 nodes aren't dropped:
+\`\`\`
+MATCH (n) OPTIONAL MATCH (n)-[]-(m) WITH n, avg(m.f) AS a SET n.h = coalesce(a, n.f)
+\`\`\`
+
+## 3. Structural features
+Write algorithm results onto nodes, then read them as features:
+\`\`\`
+CALL pagerank() YIELD node, score SET node.pr = score
+CALL degree({ direction: 'in' }) YIELD node, degree SET node.indeg = degree
+\`\`\`
+Component and label-propagation outputs are id **strings**, not numbers — use them as categories (group/compare on the string), don't coerce to a number. All numeric columns egress as Float64.
+
+## 4. Egress the feature matrix
+Hand the matrix to your training code as Apache Arrow (see the \`arrow\` guide): numbers come through as numbers, and a fixed-length numeric-list column egresses as a \`FixedSizeList<Float64>\` — a genuine numeric matrix.
+
+## Cost
+\`degree\` and \`pagerank\` are cheap; exact \`betweenness\`/\`closeness\` are O(V·E) and dominate at scale (use \`pivots\` for approximate betweenness). See the \`performance\` guide.`,
+};
+
+const gotchasGuide: Guide = {
+  id: 'gotchas',
+  title: 'Gotchas & footguns',
+  description: 'Reserved-word aliases, temporal typing, categorical outputs, and Cypher-isms.',
+  text: `# Gotchas & footguns
+
+A few behaviors worth knowing — mostly around reserved words and silently-empty results.
+
+## Reserved words can't be bare aliases or labels
+Words like \`from\`, \`to\`, \`date\`, \`datetime\`, \`value\`, \`order\`, \`group\`, \`count\`, \`sum\`, \`path\`, \`match\` can't be a bare \`AS\` alias or label. Quote with backticks or rename:
+\`\`\`
+RETURN a.name AS \`from\`, b.name AS \`to\`     -- backticks
+RETURN a.name AS knower, b.name AS known    -- or just rename
+\`\`\`
+
+## Temporal comparisons need real temporal types
+A timestamp stored as a **string** compared against a temporal silently matches nothing. Wrap it, or store timestamps as datetimes:
+\`\`\`
+WHERE datetime(e.ts) < datetime(other.ts) + duration('PT24H')
+\`\`\`
+\`datetime()\` is zoneless — use \`zoned_datetime('…Z')\` for offset/Zulu strings. Two durations don't compare relationally; compare the instants they bound (\`a.ts < b.ts + duration(...)\`). See the \`temporal\` guide.
+
+## Categorical algorithm outputs are strings
+\`connected_components\` and \`label_propagation\` write a component/label **id string**. It egresses as text — \`Number()\` on it silently yields 0. Use it as a category.
+
+## Isolated nodes drop from a naive aggregation
+\`MATCH (n)-[]-(m) …\` silently skips degree-0 nodes. Use \`OPTIONAL MATCH\` + \`coalesce\` (see \`graph-ml\`).
+
+## Procedure names are snake_case
+\`CALL pagerank()\`, \`degree\`, \`connected_components\`, \`strongly_connected_components\`, \`label_propagation\`, \`neighbor_aggregate\`, \`betweenness\`, \`closeness\`, \`on_cycle\` — not camelCase.
+
+## Grouping is by the non-aggregated RETURN items
+An aggregate that appears **only** in \`ORDER BY\` doesn't create a grouping — alias it in \`RETURN\` too if you want per-group rows.
+
+## Coming from Cypher
+lenke rejects Cypher-isms rather than silently mis-running them: use \`OFFSET\` (not \`SKIP\`), \`-[:R]->{n,m}\` (not \`-[:R*n..m]\`), \`power(x, y)\` (not \`^\`), and a per-hop \`WHERE\` **inside** the relationship bracket. Durations are ISO-8601 strings.`,
+};
+
 const GUIDES: readonly Guide[] = [
   overview,
   gettingStarted,
   gqlGuide,
+  temporalGuide,
   gremlinGuide,
   algorithmsGuide,
+  recipesGuide,
+  graphMlGuide,
   arrowGuide,
   syncGuide,
   workersGuide,
   transactionsGuide,
   typedNodesGuide,
   serializationGuide,
+  performanceGuide,
+  gotchasGuide,
 ];
 
 /** The guides as MCP resources, addressed \`lenke://guide/<id>\`. */
