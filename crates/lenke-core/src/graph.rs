@@ -169,10 +169,34 @@ pub enum Column {
         data: TemporalCol,
         present: BitSet,
     },
+    /// A homogeneous fixed-dimension numeric-vector column: `dim` contiguous f64
+    /// per element, row-major (`len × dim`), so an element's vector is a zero-copy
+    /// `&[f64]` slice. Absent slots hold a zero payload, flagged in `present`. This
+    /// is what recovers memory + read speed over boxing a `Value::List` in `Mixed`
+    /// (8·dim B/elem contiguous vs a ~40 B slot + a heap `Vec` of boxed `Value::Num`).
+    /// A list whose length differs or whose elements aren't all numbers promotes the
+    /// column to `Mixed`, like any other type disagreement.
+    Vec {
+        data: Vec<f64>,
+        dim: usize,
+        present: BitSet,
+    },
     /// Heterogeneous / list / mixed-type keys: keep the raw values.
     Mixed {
         data: Vec<Option<Value>>,
     },
+}
+
+/// The dimension of `items` iff it is a non-empty all-numeric list (→ a typed
+/// `Column::Vec`), else `None` (→ `Mixed`). An empty list or any non-number
+/// element stays boxed.
+fn numeric_vec_dim(items: &[Value]) -> Option<usize> {
+    (!items.is_empty() && items.iter().all(|v| matches!(v, Value::Num(_)))).then_some(items.len())
+}
+
+/// Element `idx`'s `dim`-wide slice of a row-major vector column's flat `data`.
+fn vec_slice(data: &[f64], dim: usize, idx: usize) -> &[f64] {
+    &data[idx * dim..idx * dim + dim]
 }
 
 /// Packed, struct-of-arrays storage for a homogeneous temporal column — one
@@ -474,6 +498,8 @@ impl Column {
             Self::Str { data, .. } => data.push(u32::MAX),
             Self::Bool { data, .. } => data.push(false),
             Self::Temporal { data, present: _ } => data.push_absent(),
+            // An absent bit reads `false`, so `present` needs no growth here.
+            Self::Vec { data, dim, .. } => data.extend(std::iter::repeat_n(0.0, *dim)),
             Self::Mixed { data } => data.push(None),
         }
     }
@@ -483,6 +509,7 @@ impl Column {
             Self::Str { data, .. } => data.len(),
             Self::Bool { data, .. } => data.len(),
             Self::Temporal { data, .. } => data.len(),
+            Self::Vec { data, dim, .. } => data.len().checked_div(*dim).unwrap_or(0),
             Self::Mixed { data } => data.len(),
         }
     }
@@ -497,6 +524,7 @@ impl Column {
             Self::Str { data, present } => data.len() * size_of::<u32>() + bits(present),
             Self::Bool { data, present } => data.len() * size_of::<bool>() + bits(present),
             Self::Temporal { data, present } => data.len() * data.slot_bytes() + bits(present),
+            Self::Vec { data, present, .. } => data.len() * size_of::<f64>() + bits(present),
             Self::Mixed { data } => data.len() * size_of::<Option<Value>>(),
         }
     }
@@ -544,9 +572,33 @@ impl Properties {
             Some(Column::Temporal { data, present }) if present.get(idx) => {
                 Value::Temporal(data.get(idx))
             }
+            Some(Column::Vec { data, dim, present }) if present.get(idx) => Value::List(
+                vec_slice(data, *dim, idx)
+                    .iter()
+                    .map(|x| Value::Num(*x))
+                    .collect(),
+            ),
             Some(Column::Mixed { data }) => data[idx].clone().unwrap_or(Value::Null),
             _ => Value::Null,
         }
+    }
+
+    /// Zero-copy view of element `idx`'s `key` as a numeric-vector slice — the fast
+    /// read path (`neighborAggregate`) when the key is a typed [`Column::Vec`] and
+    /// present. `None` when absent or when the list is still boxed in a `Mixed`
+    /// column (the caller then falls back to [`value`](Self::value)).
+    pub fn vector_id(&self, idx: usize, kid: u32) -> Option<&[f64]> {
+        match self.cols.get(kid as usize) {
+            Some(Column::Vec { data, dim, present }) if present.get(idx) => {
+                Some(vec_slice(data, *dim, idx))
+            }
+            _ => None,
+        }
+    }
+
+    /// [`vector_id`](Self::vector_id) by key name.
+    pub fn vector(&self, idx: usize, key: &str) -> Option<&[f64]> {
+        self.keys.get(key).and_then(|kid| self.vector_id(idx, kid))
     }
 
     /// Does element `idx` HAVE property `key` — regardless of whether its value
@@ -568,7 +620,8 @@ impl Properties {
                 Column::Num { present, .. }
                 | Column::Str { present, .. }
                 | Column::Bool { present, .. }
-                | Column::Temporal { present, .. },
+                | Column::Temporal { present, .. }
+                | Column::Vec { present, .. },
             ) => present.get(idx),
             Some(Column::Mixed { data }) => data[idx].is_some(),
             None => false,
@@ -617,7 +670,8 @@ impl Properties {
                     Column::Num { present, .. }
                     | Column::Str { present, .. }
                     | Column::Bool { present, .. }
-                    | Column::Temporal { present, .. } => present.clear(idx),
+                    | Column::Temporal { present, .. }
+                    | Column::Vec { present, .. } => present.clear(idx),
                     Column::Mixed { data } => data[idx] = None,
                 }
             }
@@ -3649,6 +3703,9 @@ enum Kind {
     /// different temporal sub-kinds in one key promote to `Mixed`, like any other
     /// type disagreement.
     Temporal(TemporalKind),
+    /// A homogeneous fixed-dimension numeric-vector column ([`Column::Vec`]), keyed
+    /// by the vector length. Two different lengths in one key promote to `Mixed`.
+    Vec(usize),
     Mixed,
 }
 
@@ -3661,7 +3718,9 @@ fn value_kind(v: &Value) -> Option<Kind> {
         // A temporal value gets a packed, de-boxed column keyed by its kind (see
         // [`TemporalCol`]); a key mixing temporal sub-kinds falls back to `Mixed`.
         Value::Temporal(t) => Some(Kind::Temporal(t.kind())),
-        Value::List(_) => Some(Kind::Mixed),
+        // An all-numeric fixed-length list packs into a de-boxed `Vec` column; a
+        // mixed / variable-length / non-numeric list stays `Mixed`.
+        Value::List(items) => Some(numeric_vec_dim(items).map_or(Kind::Mixed, Kind::Vec)),
         Value::Map(_) => {
             unreachable!("Value::Map is a query-result value, never a stored property")
         }
@@ -3685,6 +3744,11 @@ fn empty_col_for_kind(kind: Option<Kind>, len: usize) -> Column {
         },
         Some(Kind::Temporal(tk)) => Column::Temporal {
             data: TemporalCol::with_len(tk, len),
+            present: BitSet::zeros(len),
+        },
+        Some(Kind::Vec(dim)) => Column::Vec {
+            data: vec![0.0; len * dim],
+            dim,
             present: BitSet::zeros(len),
         },
         _ => Column::Mixed {
@@ -3726,6 +3790,20 @@ fn col_set(col: &mut Column, idx: usize, v: &Value, strs: &mut Dict) -> bool {
                 false
             }
         }
+        (Column::Vec { data, dim, present }, Value::List(items)) => {
+            // Fits only an all-numeric list of the column's dimension; anything else
+            // (different length, a non-number) returns `false` → promote to Mixed.
+            if numeric_vec_dim(items) != Some(*dim) {
+                return false;
+            }
+            for (j, it) in items.iter().enumerate() {
+                if let Value::Num(x) = it {
+                    data[idx * *dim + j] = *x;
+                }
+            }
+            present.set(idx);
+            true
+        }
         (Column::Mixed { data }, val) => {
             data[idx] = Some(val.clone());
             true
@@ -3746,6 +3824,12 @@ fn to_mixed(col: &Column, strs: &Dict) -> Column {
             Column::Temporal { data, present } if present.get(i) => {
                 Some(Value::Temporal(data.get(i)))
             }
+            Column::Vec { data, dim, present } if present.get(i) => Some(Value::List(
+                vec_slice(data, *dim, i)
+                    .iter()
+                    .map(|x| Value::Num(*x))
+                    .collect(),
+            )),
             Column::Mixed { data } => data[i].clone(),
             _ => None,
         };
@@ -4064,6 +4148,126 @@ mod wellformed_names {
         assert!(validate_prop_key("name").is_ok());
         assert!(validate_prop_key("a::b").is_ok()); // keys are never `::`-joined
         assert!(validate_prop_key("").is_err());
+    }
+}
+
+#[cfg(test)]
+mod vector_column {
+    //! The typed fixed-dim numeric-vector column (`Column::Vec`): an all-numeric
+    //! fixed-length list packs into a de-boxed f64 column, invisibly to callers
+    //! (`value` reconstructs the identical `Value::List`), and a non-conforming
+    //! write promotes it to `Mixed` losslessly.
+    use super::*;
+
+    fn decode(s: &str) -> Graph {
+        crate::ndjson::decode(s).unwrap()
+    }
+
+    /// Which column variant backs `key` in the vertex store.
+    fn col_name(g: &Graph, key: &str) -> &'static str {
+        match g.props.col(key) {
+            Some(Column::Vec { .. }) => "vec",
+            Some(Column::Mixed { .. }) => "mixed",
+            Some(Column::Num { .. }) => "num",
+            _ => "other",
+        }
+    }
+
+    #[test]
+    fn numeric_list_packs_into_a_vec_column_and_reads_back_identically() {
+        let g = decode(
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{"h":[1.5,2.5,3.5]}}
+{"type":"node","id":"b","labels":["N"],"properties":{"h":[9,8,7]}}"#,
+        );
+        assert_eq!(
+            col_name(&g, "h"),
+            "vec",
+            "an all-numeric fixed-len list is a Vec column"
+        );
+        // `value` reconstructs the exact `Value::List` a caller would have seen.
+        let a = g.vid.get("a").unwrap() as usize;
+        assert_eq!(
+            g.props.value(a, "h", &g.strs),
+            Value::List(vec![Value::Num(1.5), Value::Num(2.5), Value::Num(3.5)])
+        );
+        // Zero-copy slice accessor.
+        assert_eq!(g.props.vector(a, "h"), Some(&[1.5, 2.5, 3.5][..]));
+        // NDJSON round-trips byte-for-byte (the Vec column encodes like a boxed list).
+        let round = crate::ndjson::encode(&g);
+        let g2 = crate::ndjson::decode(&round).unwrap();
+        assert_eq!(crate::ndjson::encode(&g2), round);
+        assert_eq!(col_name(&g2, "h"), "vec");
+    }
+
+    #[test]
+    fn a_ragged_or_non_numeric_list_stays_mixed() {
+        // Different lengths under one key → Mixed.
+        let g = decode(
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{"h":[1,2,3]}}
+{"type":"node","id":"b","labels":["N"],"properties":{"h":[1,2]}}"#,
+        );
+        assert_eq!(col_name(&g, "h"), "mixed");
+        // A non-numeric element → Mixed.
+        let g2 = decode(r#"{"type":"node","id":"a","labels":["N"],"properties":{"h":[1,"x",3]}}"#);
+        assert_eq!(col_name(&g2, "h"), "mixed");
+        assert!(g2
+            .props
+            .vector(g2.vid.get("a").unwrap() as usize, "h")
+            .is_none());
+    }
+
+    #[test]
+    fn a_mismatched_set_promotes_the_vec_column_to_mixed_losslessly() {
+        let mut g = decode(
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{"h":[1.0,2.0]}}
+{"type":"node","id":"b","labels":["N"],"properties":{"h":[3.0,4.0]}}"#,
+        );
+        assert_eq!(col_name(&g, "h"), "vec");
+        // Overwrite b's vector with a length-3 list → promotes the whole column.
+        let b = g.vid.get("b").unwrap();
+        g.set_vertex_prop(b, "h", Value::List(vec![Value::Num(5.0); 3]));
+        assert_eq!(
+            col_name(&g, "h"),
+            "mixed",
+            "a dim mismatch promotes to Mixed"
+        );
+        // a's original vector survives the promotion.
+        let a = g.vid.get("a").unwrap() as usize;
+        assert_eq!(
+            g.props.value(a, "h", &g.strs),
+            Value::List(vec![Value::Num(1.0), Value::Num(2.0)])
+        );
+        assert_eq!(
+            g.props.value(b as usize, "h", &g.strs),
+            Value::List(vec![Value::Num(5.0), Value::Num(5.0), Value::Num(5.0)])
+        );
+    }
+
+    #[test]
+    fn vec_column_uses_less_heap_than_a_boxed_list() {
+        // 8 B/f64 contiguous vs a ~40 B Option<Value> slot per element (plus the
+        // uncounted heap Vec of boxed Nums that a Mixed list also carries).
+        let g = decode(r#"{"type":"node","id":"a","labels":["N"],"properties":{"h":[1,2,3,4]}}"#);
+        match g.props.col("h").unwrap() {
+            Column::Vec { data, dim, .. } => {
+                assert_eq!(*dim, 4);
+                assert_eq!(data.len(), 4); // one element × dim
+            }
+            _ => panic!("expected a Vec column"),
+        }
+    }
+
+    #[test]
+    fn removing_a_vector_clears_presence_but_a_reset_repopulates() {
+        let mut g =
+            decode(r#"{"type":"node","id":"a","labels":["N"],"properties":{"h":[1.0,2.0]}}"#);
+        let a = g.vid.get("a").unwrap();
+        g.remove_vertex_prop(a, "h");
+        assert!(!g.props.is_present(a as usize, "h"));
+        assert_eq!(g.props.value(a as usize, "h", &g.strs), Value::Null);
+        // Re-set with a conforming vector — the column is still a Vec.
+        g.set_vertex_prop(a, "h", Value::List(vec![Value::Num(7.0), Value::Num(8.0)]));
+        assert_eq!(g.props.vector(a as usize, "h"), Some(&[7.0, 8.0][..]));
     }
 }
 

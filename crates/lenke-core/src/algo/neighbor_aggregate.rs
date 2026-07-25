@@ -27,7 +27,12 @@ enum Op {
 
 /// Read vertex `v`'s `key` property as a numeric vector, or `None` if it is absent
 /// or not a list of numbers (such a vertex contributes nothing to an aggregate).
+/// A typed `Column::Vec` feature is a zero-copy slice (no boxing) → the fast path;
+/// a list still boxed in a `Mixed` column falls back to unboxing via `value`.
 fn read_vec(graph: &Graph, v: u32, key: &str) -> Option<Vec<f64>> {
+    if let Some(slice) = graph.props.vector(v as usize, key) {
+        return Some(slice.to_vec()); // contiguous copy — no per-element unboxing
+    }
     match graph.props.value(v as usize, key, &graph.strs) {
         Value::List(items) => {
             let mut out = Vec::with_capacity(items.len());

@@ -1247,6 +1247,12 @@ fn prop_of(graph: &Graph, ctx: &Ctx, bound: &Val, key_ref: usize) -> Val {
         Some(Column::Temporal { data, present }) if present.get(idx) => {
             Val::Temporal(data.get(idx))
         }
+        // A typed vector column reconstructs the same list `value_to_val` would
+        // yield for the boxed form — via the zero-copy slice accessor.
+        Some(Column::Vec { .. }) => store
+            .vector_id(idx, kid)
+            .map(|s| Val::List(s.iter().map(|x| Val::Num(*x)).collect()))
+            .unwrap_or(Val::Null),
         Some(Column::Mixed { data }) => data[idx].as_ref().map(value_to_val).unwrap_or(Val::Null),
         _ => Val::Null,
     }

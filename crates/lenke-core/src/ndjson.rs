@@ -342,7 +342,8 @@ fn col_present(col: &Column, idx: usize) -> bool {
         Column::Num { present, .. }
         | Column::Str { present, .. }
         | Column::Bool { present, .. }
-        | Column::Temporal { present, .. } => present.get(idx),
+        | Column::Temporal { present, .. }
+        | Column::Vec { present, .. } => present.get(idx),
         Column::Mixed { data } => data[idx].is_some(),
     }
 }
@@ -367,6 +368,17 @@ fn push_props(out: &mut String, store: &Properties, strs: &Dict, idx: usize) {
             Column::Str { data, .. } => push_json_str(out, strs.text(data[idx])),
             Column::Bool { data, .. } => out.push_str(if data[idx] { "true" } else { "false" }),
             Column::Temporal { data, .. } => push_value(out, &Value::Temporal(data.get(idx))),
+            // Reconstruct the list and reuse the `push_value` path, so a vector column
+            // encodes byte-for-byte identically to the same list boxed in `Mixed`.
+            Column::Vec { data, dim, .. } => push_value(
+                out,
+                &Value::List(
+                    data[idx * *dim..idx * *dim + *dim]
+                        .iter()
+                        .map(|x| Value::Num(*x))
+                        .collect(),
+                ),
+            ),
             Column::Mixed { data } => push_value(out, data[idx].as_ref().unwrap()),
         }
     }
