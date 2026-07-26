@@ -4639,6 +4639,30 @@ fn step_aggs(
     }
 }
 
+/// ISO `HAVING`: does a group survive its post-aggregation predicate? Evaluated
+/// with the group's representative binding (its group keys / input vars) and the
+/// folded `agg_values`. Three-valued — only TRUE keeps the group. `None` HAVING
+/// (the `RETURN`/`WITH` case) always passes.
+fn passes_having(
+    proj: &CProjection,
+    graph: &Graph,
+    ctx: &Ctx,
+    rep: &Binding,
+    agg_values: &[Val],
+) -> bool {
+    let Some(cond) = proj.having.as_ref() else {
+        return true;
+    };
+    let env = Env {
+        graph,
+        ctx,
+        binding: rep,
+        group: None,
+        agg_values: Some(agg_values),
+    };
+    as_truth(&eval(&env, cond)) == Some(true)
+}
+
 /// A streaming projection: accepts bindings one at a time (folding aggregates
 /// incrementally; never storing the full input), then `finish`es to result rows.
 struct ProjAccum<'p> {
@@ -4882,18 +4906,26 @@ impl<'p> ProjAccum<'p> {
         let proj = self.proj;
         if proj.aggregating {
             if !self.grouped {
-                // Global aggregate always emits exactly one row (0/null over no input).
+                // Global aggregate always emits exactly one row (0/null over no input)
+                // — unless a HAVING on the whole-input group filters it out.
                 let (rep, aggs) = self.global.take().unwrap_or_else(|| {
                     (Binding::default(), proj.aggs.iter().map(Agg::new).collect())
                 });
                 let agg_values: Vec<Val> = aggs.into_iter().map(Agg::finish).collect();
-                let projected = self.project_row(graph, ctx, &rep, Some(&agg_values));
-                let keys = self.sort_keys(graph, ctx, &rep, &projected, Some(&agg_values));
-                self.rows.push((projected, keys));
+                if passes_having(proj, graph, ctx, &rep, &agg_values) {
+                    let projected = self.project_row(graph, ctx, &rep, Some(&agg_values));
+                    let keys = self.sort_keys(graph, ctx, &rep, &projected, Some(&agg_values));
+                    self.rows.push((projected, keys));
+                }
             } else {
                 let groups = std::mem::take(&mut self.group_vec);
                 for (_key, rep, aggs) in groups {
                     let agg_values: Vec<Val> = aggs.into_iter().map(Agg::finish).collect();
+                    // ISO HAVING: drop a group whose post-aggregation predicate is
+                    // not TRUE (three-valued — NULL/false both drop).
+                    if !passes_having(proj, graph, ctx, &rep, &agg_values) {
+                        continue;
+                    }
                     let projected = self.project_row(graph, ctx, &rep, Some(&agg_values));
                     let keys = self.sort_keys(graph, ctx, &rep, &projected, Some(&agg_values));
                     self.rows.push((projected, keys));
@@ -7579,6 +7611,11 @@ fn project_frame_cols(
         return None;
     }
     if proj.aggregating {
+        // HAVING filters groups post-fold; that path lives in the scalar
+        // `ProjAccum::finish`, so bail to it rather than duplicate it here.
+        if proj.having.is_some() {
+            return None;
+        }
         return vectorized_aggregate(graph, ctx, sc, proj);
     }
 

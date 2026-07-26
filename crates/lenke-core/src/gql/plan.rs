@@ -668,6 +668,10 @@ pub struct CProjection {
     /// When false, sort keys come from the input alone, so `ORDER BY … LIMIT n`
     /// can keep only the top-k *input* bindings and project just those.
     pub order_needs_output: bool,
+    /// ISO `HAVING` — a post-aggregation predicate on each group, lowered against
+    /// the input scope (group keys) with its aggregates lifted into `aggs`. A
+    /// group survives only when this is TRUE. `None` on `RETURN`/`WITH`.
+    pub having: Option<CExpr>,
     pub skip: Option<CCount>,
     pub limit: Option<CCount>,
 }
@@ -1541,7 +1545,16 @@ impl Lowerer {
                 }
             })
             .collect();
-        let aggregating = !p.star && (items.iter().any(|i| i.is_agg) || !group_by.is_empty());
+        // HAVING is lowered here, while the scope is still the input scope, so it
+        // reads group keys (input vars); its aggregates lift into `aggs` alongside
+        // the items' so they fold per group. Evaluated post-aggregation in
+        // `Aggregator::finish`.
+        let having = p
+            .having
+            .as_ref()
+            .map(|h| extract_aggs(self.expr(h), &mut aggs));
+        let aggregating =
+            !p.star && (items.iter().any(|i| i.is_agg) || !group_by.is_empty() || having.is_some());
 
         // ORDER BY scope = output columns, then input vars not shadowed by one.
         let mut sort_scope = out_names.clone();
@@ -1582,6 +1595,7 @@ impl Lowerer {
             order_by,
             order_overlay,
             order_needs_output,
+            having,
             skip: self.count_bound(&p.skip),
             limit: self.count_bound(&p.limit),
         }
@@ -2220,6 +2234,7 @@ fn try_decorrelate(c: &CallInline, outer: &[String]) -> Option<(MatchClause, Wit
             items,
             distinct: false,
             group_by: Vec::new(),
+            having: None,
             order_by: Vec::new(),
             skip: None,
             limit: None,

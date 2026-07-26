@@ -288,6 +288,25 @@ impl Parser {
         Ok(self.advance())
     }
 
+    /// Consume a soft keyword (a reserved word that lexes as an ident, e.g.
+    /// `SELECT`/`FROM`/`HAVING`) or error. The counterpart of [`expect_kw`] for
+    /// the reserved-but-not-structural words.
+    fn expect_soft(&mut self, word: &str) -> R<Token> {
+        if !self.check_soft(word) {
+            let t = self.peek();
+            let got = if t.value.is_empty() {
+                format!("{:?}", t.tt)
+            } else {
+                t.value.clone()
+            };
+            return err(
+                format!("Expected '{}', got '{got}'", word.to_uppercase()),
+                t.pos,
+            );
+        }
+        Ok(self.advance())
+    }
+
     /// Run `body` one level deeper, guarding against unbounded recursion. Used to
     /// wrap the recursive entry points so deep nesting yields a `SyntaxError`
     /// rather than a stack-overflow abort.
@@ -1987,10 +2006,142 @@ impl Parser {
             items,
             distinct,
             group_by,
+            having: None,
             order_by,
             skip,
             limit,
         })
+    }
+
+    /// ISO `<select statement>`: the SQL-shaped query form —
+    /// `SELECT [DISTINCT] {* | items} FROM [<graph>] MATCH pattern[, …]
+    ///  [WHERE c] [GROUP BY g] [HAVING h] [ORDER BY o] [OFFSET n] [LIMIT n]`.
+    /// A parser-only desugar to the linear pipeline: an optional `MATCH` (from the
+    /// `FROM MATCH` body, carrying the WHERE) plus a terminal `RETURN` projection
+    /// that carries GROUP BY / HAVING / ORDER BY / paging. HAVING is the one piece
+    /// the linear `RETURN` can't express, so it rides the projection. `SELECT`,
+    /// `FROM`, `HAVING`, `GROUP` are reserved idents (soft keywords).
+    fn parse_select(&mut self) -> R<Vec<Clause>> {
+        self.expect_soft("select")?;
+        let distinct = if self.check_kw("distinct") {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let mut star = false;
+        let mut items = Vec::new();
+        if self.check(Tt::Star) {
+            self.advance();
+            star = true;
+        } else {
+            items.push(self.parse_return_item()?);
+            while self.check(Tt::Comma) {
+                self.advance();
+                items.push(self.parse_return_item()?);
+            }
+        }
+
+        // `FROM [<graph>] MATCH pattern[, …] [WHERE c]`. The body is optional
+        // (`SELECT 1 + 1` is a one-row constant); GROUP BY / HAVING require it.
+        let mut match_clause = None;
+        let mut where_ = None;
+        if self.check_soft("from") {
+            self.advance();
+            // Optional graph expression. lenke is single-graph, so accept only a
+            // reference to the current/home graph (consumed and ignored); a named
+            // graph is rejected by falling through to the required MATCH.
+            if !self.check_kw("match")
+                && (self.check_soft("current_graph")
+                    || self.check_soft("home_graph")
+                    || self.check_soft("current_property_graph")
+                    || self.check_soft("home_property_graph"))
+            {
+                self.advance();
+            }
+            self.expect_kw("match")?;
+            let match_mode = self.parse_match_mode();
+            let mut patterns = vec![self.parse_path_pattern()?];
+            while self.check(Tt::Comma) {
+                self.advance();
+                patterns.push(self.parse_path_pattern()?);
+            }
+            if let Some(mode) = match_mode {
+                for p in &mut patterns {
+                    p.mode = mode;
+                }
+            }
+            if self.check_kw("where") {
+                self.advance();
+                where_ = Some(self.parse_expr()?);
+            }
+            match_clause = Some(Clause::Match(MatchClause {
+                optional: false,
+                patterns,
+                where_,
+            }));
+        }
+
+        // `GROUP BY g` — before HAVING (SQL order), unlike RETURN's after-items.
+        let mut group_by = Vec::new();
+        if self.check_soft("group") || self.check_kw("group") {
+            self.advance();
+            self.expect_kw("by")?;
+            group_by.push(self.parse_expr()?);
+            while self.check(Tt::Comma) {
+                self.advance();
+                group_by.push(self.parse_expr()?);
+            }
+        }
+
+        // `HAVING h` — the post-aggregation group filter (SELECT-statement only).
+        let having = if self.check_soft("having") {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        let mut order_by = Vec::new();
+        if self.check_kw("order") {
+            self.advance();
+            self.expect_kw("by")?;
+            order_by.push(self.parse_sort_item()?);
+            while self.check(Tt::Comma) {
+                self.advance();
+                order_by.push(self.parse_sort_item()?);
+            }
+        }
+        let mut skip = None;
+        if self.check_kw("skip") || self.check_kw("offset") {
+            let allow_param = self.check_kw("offset");
+            self.advance();
+            skip = Some(
+                self.expect_count_bound("a non-negative integer after SKIP/OFFSET", allow_param)?,
+            );
+        }
+        let mut limit = None;
+        if self.check_kw("limit") {
+            self.advance();
+            limit = Some(self.expect_count_bound("a non-negative integer after LIMIT", true)?);
+        }
+
+        let projection = Projection {
+            star,
+            items,
+            distinct,
+            group_by,
+            having,
+            order_by,
+            skip,
+            limit,
+        };
+        let mut clauses = Vec::new();
+        if let Some(m) = match_clause {
+            clauses.push(m);
+        }
+        clauses.push(Clause::Return(projection));
+        Ok(clauses)
     }
 
     fn parse_with_clause(&mut self) -> R<WithClause> {
@@ -2354,6 +2505,11 @@ impl Parser {
                 self.advance();
                 clauses.push(Clause::Return(self.parse_projection()?));
                 done = true;
+            } else if self.check_soft("select") {
+                // ISO `<select statement>` — a SQL-shaped terminal query that
+                // desugars to MATCH + RETURN (carrying GROUP BY / HAVING / paging).
+                clauses.extend(self.parse_select()?);
+                done = true;
             } else if self.check_kw("finish") {
                 self.advance();
                 clauses.push(Clause::Finish);
@@ -2454,6 +2610,7 @@ impl Parser {
                         items,
                         distinct: false,
                         group_by: Vec::new(),
+                        having: None,
                         order_by: Vec::new(),
                         skip: None,
                         limit: None,

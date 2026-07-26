@@ -6925,6 +6925,123 @@ fn subpath_where_referencing_only_start_or_end() {
 }
 
 #[test]
+fn select_statement_basic_and_grouping() {
+    // ISO SELECT desugars to MATCH + RETURN. Ages: 30,25,20,40,35,35 (erin=frank=35).
+    let mut g = ages_graph();
+    // Plain projection (no FROM) → a one-row constant.
+    assert_eq!(rows(&mut g, "SELECT 1 + 2 AS v"), vec![vec![n(3.0)]]);
+    // SELECT * over a single matched node.
+    assert_eq!(
+        rows(
+            &mut g,
+            "SELECT n.name AS nm FROM MATCH (n:Person {name: 'Alice'})"
+        ),
+        vec![vec![s("Alice")]]
+    );
+    // A pre-aggregation WHERE filters rows before the count.
+    assert_eq!(
+        rows(
+            &mut g,
+            "SELECT count(*) AS c FROM MATCH (n:Person) WHERE n.age >= 30",
+        ),
+        vec![vec![n(4.0)]] // alice30, dave40, erin35, frank35
+    );
+    // GROUP BY a property, with an aggregate and ORDER BY for determinism.
+    assert_eq!(
+        rows(
+            &mut g,
+            "SELECT n.age AS age, count(*) AS c FROM MATCH (n:Person) GROUP BY n.age ORDER BY age",
+        ),
+        vec![
+            vec![n(20.0), n(1.0)],
+            vec![n(25.0), n(1.0)],
+            vec![n(30.0), n(1.0)],
+            vec![n(35.0), n(2.0)], // erin + frank
+            vec![n(40.0), n(1.0)],
+        ]
+    );
+}
+
+#[test]
+fn select_having_filters_groups_post_aggregation() {
+    let mut g = ages_graph();
+    // HAVING on the grouped count: keep only ages shared by >1 person → 35.
+    assert_eq!(
+        rows(
+            &mut g,
+            "SELECT n.age AS age, count(*) AS c FROM MATCH (n:Person) \
+             GROUP BY n.age HAVING count(*) > 1 ORDER BY age",
+        ),
+        vec![vec![n(35.0), n(2.0)]]
+    );
+    // HAVING referencing an aggregate NOT in the SELECT list — still folded.
+    assert_eq!(
+        rows(
+            &mut g,
+            "SELECT n.age AS age FROM MATCH (n:Person) GROUP BY n.age HAVING count(*) > 1",
+        ),
+        vec![vec![n(35.0)]]
+    );
+    // HAVING on a group key (not an aggregate).
+    assert_eq!(
+        rows(
+            &mut g,
+            "SELECT n.age AS age, count(*) AS c FROM MATCH (n:Person) \
+             GROUP BY n.age HAVING n.age >= 35 ORDER BY age",
+        ),
+        vec![vec![n(35.0), n(2.0)], vec![n(40.0), n(1.0)]]
+    );
+}
+
+#[test]
+fn select_having_on_global_aggregate() {
+    let mut g = ages_graph();
+    // No GROUP BY → a single global group; HAVING keeps or drops the whole row.
+    assert_eq!(
+        rows(
+            &mut g,
+            "SELECT count(*) AS c FROM MATCH (n:Person) HAVING count(*) > 3",
+        ),
+        vec![vec![n(6.0)]]
+    );
+    // The same query with a failing threshold → zero rows (not a NULL/0 row).
+    assert!(rows(
+        &mut g,
+        "SELECT count(*) AS c FROM MATCH (n:Person) HAVING count(*) > 100",
+    )
+    .is_empty());
+}
+
+#[test]
+fn select_having_three_valued_and_ordering() {
+    let mut g = ages_graph();
+    // ORDER BY + LIMIT compose after HAVING: all five age-groups, keep the two
+    // youngest by age. (HAVING true for all here — count(*) >= 1.)
+    assert_eq!(
+        rows(
+            &mut g,
+            "SELECT n.age AS age FROM MATCH (n:Person) GROUP BY n.age \
+             HAVING count(*) >= 1 ORDER BY age LIMIT 2",
+        ),
+        vec![vec![n(20.0)], vec![n(25.0)]]
+    );
+    // A NULL HAVING (three-valued) drops the group: `HAVING null` keeps nothing.
+    assert!(rows(
+        &mut g,
+        "SELECT n.age AS age FROM MATCH (n:Person) GROUP BY n.age HAVING null",
+    )
+    .is_empty());
+}
+
+#[test]
+fn having_is_select_only_not_on_return() {
+    // HAVING is the SELECT statement's; a bare RETURN must not accept it (it is
+    // left as trailing input → a parse error), matching ISO where HAVING lives on
+    // the SELECT statement, not the return statement.
+    assert!(parse("MATCH (n:Person) RETURN count(*) AS c HAVING count(*) > 1").is_err());
+}
+
+#[test]
 fn match_mode_repeatable_vs_different_edges() {
     // 2-cycle a<->b. Under DIFFERENT EDGES (= default TRAIL) a 3-hop walk can't
     // re-tread an edge; under REPEATABLE ELEMENTS (WALK) it can re-tread.

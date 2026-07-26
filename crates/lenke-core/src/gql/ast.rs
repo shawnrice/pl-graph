@@ -369,6 +369,10 @@ pub struct Projection {
     /// force it on, even with no aggregate); empty → implicit grouping by the
     /// non-aggregate items.
     pub group_by: Vec<Expr>,
+    /// ISO `HAVING <search condition>` — a post-aggregation filter on groups (the
+    /// `SELECT` statement only; `RETURN`/`WITH` never set it). References group
+    /// keys + aggregates; a group is kept only when it is TRUE.
+    pub having: Option<Expr>,
     pub order_by: Vec<SortItem>,
     pub skip: Option<CountBound>,
     pub limit: Option<CountBound>,

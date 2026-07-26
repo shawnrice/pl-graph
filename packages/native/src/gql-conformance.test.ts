@@ -258,6 +258,51 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     }
   });
 
+  test('SELECT statement + HAVING — ISO, byte-identical', () => {
+    // MODERN: Person marko(29)/vadas(27)/josh(32); Software lop. SELECT desugars
+    // to MATCH + RETURN.
+    const [ts1, nat1] = both(`SELECT 1 + 2 AS v`);
+    expect(ts1).toBe(nat1);
+    expect(ts1).toBe(`[{"v":3}]`);
+
+    // GROUP BY label with a count.
+    const [ts2, nat2] = both(
+      `SELECT labels(n)[0] AS lab, count(*) AS c FROM MATCH (n) GROUP BY labels(n)[0] ORDER BY lab`,
+    );
+    expect(ts2).toBe(nat2);
+    expect(ts2).toBe(`[{"lab":"Person","c":3},{"lab":"Software","c":1}]`);
+
+    // HAVING on the grouped count: keep only labels with >1 member → Person.
+    const [ts3, nat3] = both(
+      `SELECT labels(n)[0] AS lab, count(*) AS c FROM MATCH (n) ` +
+        `GROUP BY labels(n)[0] HAVING count(*) > 1 ORDER BY lab`,
+    );
+    expect(ts3).toBe(nat3);
+    expect(ts3).toBe(`[{"lab":"Person","c":3}]`);
+
+    // HAVING on a global aggregate — keep or drop the single row.
+    const [ts4, nat4] = both(`SELECT count(*) AS c FROM MATCH (n:Person) HAVING count(*) > 2`);
+    expect(ts4).toBe(nat4);
+    expect(ts4).toBe(`[{"c":3}]`);
+    const [ts5, nat5] = both(`SELECT count(*) AS c FROM MATCH (n:Person) HAVING count(*) > 100`);
+    expect(ts5).toBe(nat5);
+    expect(ts5).toBe(`[]`);
+
+    // A pre-aggregation WHERE, then HAVING referencing an aggregate not projected.
+    const [ts6, nat6] = both(
+      `SELECT labels(n)[0] AS lab FROM MATCH (n) WHERE n.name <> 'lop' ` +
+        `GROUP BY labels(n)[0] HAVING count(*) >= 3`,
+    );
+    expect(ts6).toBe(nat6);
+    expect(ts6).toBe(`[{"lab":"Person"}]`);
+  });
+
+  test('HAVING is SELECT-only — rejected on a bare RETURN in both engines', () => {
+    const q = `MATCH (n:Person) RETURN count(*) AS c HAVING count(*) > 1`;
+    expect(() => tsQuery(tsGraph, q)).toThrow();
+    expect(() => nativeGraph.query(q)).toThrow();
+  });
+
   test('list[i] — ISO GQL 0-based subscript, null-safe, byte-identical', () => {
     const cases: Array<[string, string]> = [
       // 0-based: [0] is the first element.

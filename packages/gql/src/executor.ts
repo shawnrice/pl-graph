@@ -2551,6 +2551,8 @@ type CProjection = {
   aggregating: boolean;
   /** The non-aggregate item closures, used to build each group's key. */
   groupKeys: readonly CompiledExpr[];
+  /** ISO HAVING — a post-aggregation predicate on each group (SELECT only). */
+  having?: CompiledExpr;
   orderBy: readonly CSortItem[];
   skip?: CountValue;
   limit?: CountValue;
@@ -2576,7 +2578,10 @@ const compileProjection = (projection: Projection): CProjection => {
   // Explicit GROUP BY keys DRIVE grouping (and force it on, even without an
   // aggregate); absent → implicit grouping by the non-aggregate items.
   const groupByExprs = projection.groupBy ?? [];
-  const aggregating = !projection.star && (items.some((i) => i.isAgg) || groupByExprs.length > 0);
+  const having = projection.having ? compileExpr(projection.having) : undefined;
+  const aggregating =
+    !projection.star &&
+    (items.some((i) => i.isAgg) || groupByExprs.length > 0 || having !== undefined);
   const groupKeys =
     groupByExprs.length > 0
       ? groupByExprs.map((e) => compileExpr(e))
@@ -2596,6 +2601,7 @@ const compileProjection = (projection: Projection): CProjection => {
     items,
     aggregating,
     groupKeys,
+    ...(having ? { having } : {}),
     orderBy,
     skip: projection.skip,
     limit: projection.limit,
@@ -2753,6 +2759,18 @@ const applyProjection = (
       groups.set('[]', []);
     }
 
+    // ISO HAVING: drop a group whose post-aggregation predicate is not exactly
+    // TRUE (three-valued — NULL/false both drop). The aggregates fold over the
+    // group array; group keys read the representative binding.
+    const { having } = proj;
+    const groupList = having
+      ? [...groups.values()].filter((group) => {
+          const rep = group[0] ?? new Map();
+
+          return asTruth(having({ binding: rep, params, graph, group })) === true;
+        })
+      : groups.values();
+
     keyed = map((group: Binding[]) => {
       const rep: Binding = group[0] ?? new Map();
       const projected = projectBinding(proj, rep, params, graph, group);
@@ -2763,7 +2781,7 @@ const applyProjection = (
         b: projected,
         keys: orderBy.map((s) => s.fn({ binding: sortBinding, params, graph, group })),
       };
-    }, groups.values());
+    }, groupList);
   } else {
     // Non-aggregating: a lazy map — rows are projected on demand.
     keyed = map((b: Binding) => {

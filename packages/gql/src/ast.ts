@@ -332,6 +332,10 @@ export type Projection = {
   // ISO `GROUP BY` keys. When present they drive grouping (and force it on);
   // absent → implicit grouping by the non-aggregate items.
   groupBy?: readonly Expr[];
+  // ISO `HAVING <search condition>` — a post-aggregation filter on groups (the
+  // `SELECT` statement only; `RETURN`/`WITH` never set it). References group keys
+  // + aggregates; a group is kept only when it is TRUE.
+  having?: Expr;
   orderBy?: readonly SortItem[];
   skip?: CountValue;
   limit?: CountValue;

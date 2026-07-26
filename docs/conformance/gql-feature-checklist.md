@@ -60,13 +60,11 @@ Unicode normalization above.
 
 Ordered roughly cheap→involved.
 
-| Gap                                                               | Notes                                                                                                                                                                        |
-| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `HAVING` clause                                                   | ISO but lives on the **`SELECT` statement** (a SQL-like query form lenke doesn't implement), not on `RETURN` — so it requires the whole SELECT statement. See below.         |
-| `SELECT` statement (+ its `WHERE`/`HAVING`)                       | ISO GQL has a SQL-like `SELECT … WHERE … GROUP BY … HAVING …` query form alongside `MATCH`/`RETURN`. lenke implements the linear form only. Large (a parallel query syntax). |
-| Multi-`MATCH` `EXISTS { … }` (GQ22)                               | Single-`MATCH` `EXISTS` works.                                                                                                                                               |
-| Map / record values (GV45)                                        | No first-class map value; larger (touches the value model).                                                                                                                  |
-| `DIFFERENT EDGES` / `REPEATABLE ELEMENTS` match modes (G002/G003) | Graph-pattern match modes (distinct from the path modes, which work).                                                                                                        |
+| Gap                                                               | Notes                                                                 |
+| ----------------------------------------------------------------- | --------------------------------------------------------------------- |
+| Multi-`MATCH` `EXISTS { … }` (GQ22)                               | Single-`MATCH` `EXISTS` works.                                        |
+| Map / record values (GV45)                                        | No first-class map value; larger (touches the value model).           |
+| `DIFFERENT EDGES` / `REPEATABLE ELEMENTS` match modes (G002/G003) | Graph-pattern match modes (distinct from the path modes, which work). |
 
 ### Tier 3 — Excluded by design (NOT gaps to close)
 
@@ -280,15 +278,16 @@ productions and probed against the engine.
 
 ### Clauses & projection
 
-| Clause                                  | lenke | Notes                                                                                                                              |
-| --------------------------------------- | :---: | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `OPTIONAL MATCH`                        |  ✅   |                                                                                                                                    |
-| `RETURN DISTINCT`, `count(DISTINCT …)`  |  ✅   |                                                                                                                                    |
-| `ORDER BY … ASC/DESC NULLS FIRST/LAST`  |  ✅   |                                                                                                                                    |
-| `DETACH DELETE`                         |  ✅   |                                                                                                                                    |
-| Implicit grouping (non-aggregated keys) |  ✅   | Cypher-style — the default grouping model.                                                                                         |
-| Explicit `GROUP BY` clause              |  ✅   | ISO (on the RETURN statement). Drives grouping — incl. `GROUP BY` a non-returned key, and no-aggregate `GROUP BY` (= DISTINCT).    |
-| `HAVING` clause                         |  ❌   | ISO but on the `SELECT` statement (which lenke lacks), not `RETURN`. Filter aggregates in a following `WITH … WHERE` step instead. |
+| Clause                                  | lenke | Notes                                                                                                                                                                            |
+| --------------------------------------- | :---: | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OPTIONAL MATCH`                        |  ✅   |                                                                                                                                                                                  |
+| `RETURN DISTINCT`, `count(DISTINCT …)`  |  ✅   |                                                                                                                                                                                  |
+| `ORDER BY … ASC/DESC NULLS FIRST/LAST`  |  ✅   |                                                                                                                                                                                  |
+| `DETACH DELETE`                         |  ✅   |                                                                                                                                                                                  |
+| Implicit grouping (non-aggregated keys) |  ✅   | Cypher-style — the default grouping model.                                                                                                                                       |
+| Explicit `GROUP BY` clause              |  ✅   | ISO (on the RETURN statement). Drives grouping — incl. `GROUP BY` a non-returned key, and no-aggregate `GROUP BY` (= DISTINCT).                                                  |
+| `HAVING` clause                         |  ✅   | On the ISO `SELECT` statement (not `RETURN`, per spec). Post-aggregation group filter; references group keys + aggregates (incl. aggregates not in the SELECT list).             |
+| `SELECT` statement                      |  ✅   | `SELECT [DISTINCT] {* \| items} FROM [<graph>] MATCH … [WHERE] [GROUP BY] [HAVING] [ORDER BY] [OFFSET] [LIMIT]` — SQL-shaped, desugars to MATCH + RETURN. Single implicit graph. |
 
 ---
 
@@ -313,8 +312,7 @@ these.
 majority — read / pattern-matching / path-search / function / composition,
 predicates, `CASE`/`COALESCE`/`NULLIF`, `OPTIONAL MATCH`, `DISTINCT`, `ORDER BY …
 NULLS FIRST/LAST`, `DETACH DELETE`, the full scalar/aggregate function set. The
-genuine gaps found (deep grammar walk): **`HAVING`** (ISO, but on the `SELECT`
-statement lenke lacks — not `RETURN`), `IS NORMALIZED` (declined — see
+genuine gaps found (deep grammar walk): `IS NORMALIZED` (declined — see
 Tier 1), multi-`MATCH` `EXISTS` (GQ22),
 map/record
 values (GV45), the `DIFFERENT

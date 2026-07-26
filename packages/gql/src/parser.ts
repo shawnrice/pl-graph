@@ -285,6 +285,22 @@ export const parse = (
     peek().value.toLowerCase() === 'value' &&
     tokens[pos + 1]?.type === 'lbrace';
 
+  // A soft keyword: a reserved word that lexes as an ident (`SELECT`/`FROM`/
+  // `HAVING`/`GROUP`), matched case-insensitively and never when backtick-quoted.
+  const checkSoft = (word: string): boolean =>
+    peek().type === 'ident' && !peek().delimited && peek().value.toLowerCase() === word;
+
+  const expectSoft = (word: string): Token => {
+    if (!checkSoft(word)) {
+      throw new GqlSyntaxError(
+        `Expected '${word.toUpperCase()}', got '${peek().value || peek().type}'`,
+        peek().pos,
+      );
+    }
+
+    return advance();
+  };
+
   const expect = (type: TokenType, what: string): Token => {
     if (!check(type)) {
       throw new GqlSyntaxError(
@@ -2207,6 +2223,137 @@ export const parse = (
     return { kind: 'delete', detach, targets };
   };
 
+  // ISO `<select statement>`: the SQL-shaped query form —
+  // `SELECT [DISTINCT] {* | items} FROM [<graph>] MATCH pattern[, …]
+  //  [WHERE c] [GROUP BY g] [HAVING h] [ORDER BY o] [OFFSET n] [LIMIT n]`.
+  // A parser-only desugar to the linear pipeline: an optional MATCH (from the
+  // `FROM MATCH` body, carrying the WHERE) plus a terminal RETURN projection that
+  // carries GROUP BY / HAVING / ORDER BY / paging. HAVING is the one piece the
+  // linear RETURN can't express, so it rides the projection. `select`/`from`/
+  // `having`/`group` are reserved idents (soft keywords).
+  const parseSelect = (): Clause[] => {
+    expectSoft('select');
+    const distinct = checkKeyword('distinct') ? (advance(), true) : false;
+
+    let star = false;
+    const items: ReturnItem[] = [];
+
+    if (check('star')) {
+      advance();
+      star = true;
+    } else {
+      items.push(parseReturnItem());
+
+      while (check('comma')) {
+        advance();
+        items.push(parseReturnItem());
+      }
+    }
+
+    // `FROM [<graph>] MATCH pattern[, …] [WHERE c]`. The body is optional
+    // (`SELECT 1 + 1` is a one-row constant); GROUP BY / HAVING require it.
+    let matchClause: MatchClause | undefined;
+
+    if (checkSoft('from')) {
+      advance();
+
+      // Optional graph expression. lenke is single-graph, so accept only a
+      // reference to the current/home graph (consumed and ignored).
+      if (
+        !checkKeyword('match') &&
+        (checkSoft('current_graph') ||
+          checkSoft('home_graph') ||
+          checkSoft('current_property_graph') ||
+          checkSoft('home_property_graph'))
+      ) {
+        advance();
+      }
+
+      expectKeyword('match');
+      const matchMode = parseMatchMode();
+      let patterns: PathPattern[] = [parsePathPattern()];
+
+      while (check('comma')) {
+        advance();
+        patterns.push(parsePathPattern());
+      }
+
+      if (matchMode) {
+        patterns = patterns.map((p) => ({ ...p, mode: matchMode }));
+      }
+
+      const where = checkKeyword('where') ? (advance(), parseExpr()) : undefined;
+
+      matchClause = { kind: 'match', optional: false, patterns, where };
+    }
+
+    // `GROUP BY g` — before HAVING (SQL order), unlike RETURN's after-items.
+    let groupBy: Expr[] | undefined;
+
+    if (checkSoft('group')) {
+      advance();
+      expectKeyword('by');
+      groupBy = [parseExpr()];
+
+      while (check('comma')) {
+        advance();
+        groupBy.push(parseExpr());
+      }
+    }
+
+    // `HAVING h` — the post-aggregation group filter (SELECT-statement only).
+    const having = checkSoft('having') ? (advance(), parseExpr()) : undefined;
+
+    let orderBy: SortItem[] | undefined;
+
+    if (checkKeyword('order')) {
+      advance();
+      expectKeyword('by');
+      orderBy = [parseSortItem()];
+
+      while (check('comma')) {
+        advance();
+        orderBy.push(parseSortItem());
+      }
+    }
+
+    let skip: CountValue | undefined;
+
+    if (checkKeyword('skip') || checkKeyword('offset')) {
+      const allowParam = checkKeyword('offset');
+      advance();
+      skip = expectCountValue('a non-negative integer after SKIP/OFFSET', allowParam);
+    }
+
+    let limit: CountValue | undefined;
+
+    if (checkKeyword('limit')) {
+      advance();
+      limit = expectCountValue('a non-negative integer after LIMIT', true);
+    }
+
+    const projection: Projection = {
+      star,
+      items,
+      distinct,
+      ...(groupBy ? { groupBy } : {}),
+      ...(having ? { having } : {}),
+      ...(orderBy ? { orderBy } : {}),
+      ...(skip !== undefined ? { skip } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+    };
+
+    const clauses: Clause[] = [];
+
+    if (matchClause) {
+      clauses.push(matchClause);
+    }
+
+    clauses.push({ kind: 'return', projection });
+
+    return clauses;
+  };
+
   // A linear query: a sequence of clauses, optionally ending in RETURN or
   // FINISH (a write-only query needs neither).
   const parseLinearQuery = (): LinearQuery => {
@@ -2216,6 +2363,11 @@ export const parse = (
     while (!done && !atEnd()) {
       if (checkKeyword('return')) {
         clauses.push(parseReturnClause());
+        done = true;
+      } else if (checkSoft('select')) {
+        // ISO `<select statement>` — a SQL-shaped terminal query that desugars to
+        // MATCH + RETURN (carrying GROUP BY / HAVING / paging).
+        clauses.push(...parseSelect());
         done = true;
       } else if (checkKeyword('finish')) {
         advance();
