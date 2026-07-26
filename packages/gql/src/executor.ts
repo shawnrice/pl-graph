@@ -152,6 +152,16 @@ const consistent = (binding: Binding, name: string | undefined, value: Bound): b
 const propOf = (bound: unknown, key: string): unknown =>
   (bound as { properties?: Record<string, unknown> } | undefined)?.properties?.[key] ?? null;
 
+// `PROPERTY_EXISTS(n, key)`: is `key` a *present* property of element `n`? A
+// boolean for an element (distinguishing an absent key from a stored null — null
+// is first-class), and `null` for a non-element / NULL (three-valued). `key in
+// props` would walk the prototype chain, so use `hasOwnProperty`.
+const propPresent = (bound: unknown, key: string): boolean | null => {
+  const props = (bound as { properties?: Record<string, unknown> } | undefined)?.properties;
+
+  return props == null ? null : Object.hasOwn(props, key);
+};
+
 // --- three-valued logic & scalar helpers -------------------------------------
 
 // ISO three-valued (Kleene) logic: `null` is UNKNOWN. A row is kept only when a
@@ -1319,6 +1329,11 @@ const compileExpr = (expr: Expr): CompiledExpr => {
 
       return (env) => propOf(env.binding.get(variable), key);
     }
+    case 'property_exists': {
+      const { variable, key } = expr;
+
+      return (env) => propPresent(env.binding.get(variable), key);
+    }
     case 'list': {
       const items = expr.items.map(compileExpr);
 
@@ -1979,6 +1994,29 @@ export const freePredicateVars = (expr: Expr): Set<string> => {
     }
   };
 
+  // `EXISTS { … }` / `COUNT { … }`: the sub-pattern binds its own variables, so
+  // extend the bound set before descending into its inline predicates/WHERE —
+  // those bindings aren't free references, but outer names still are. Extracted
+  // from `walk` to keep that switch under the complexity budget.
+  const walkSubquery = (
+    e: Extract<Expr, { kind: 'exists' | 'countSubquery' }>,
+    bound: ReadonlySet<string>,
+  ): void => {
+    const inner = new Set(bound);
+
+    for (const p of e.patterns) {
+      patternBoundVars(p, inner);
+    }
+
+    for (const p of e.patterns) {
+      walkPattern(p, inner);
+    }
+
+    if (e.where) {
+      walk(e.where, inner);
+    }
+  };
+
   const walk = (e: Expr, bound: ReadonlySet<string>): void => {
     switch (e.kind) {
       case 'var':
@@ -1987,6 +2025,7 @@ export const freePredicateVars = (expr: Expr): Set<string> => {
         }
 
         return;
+      case 'property_exists':
       case 'prop':
         if (!bound.has(e.variable)) {
           free.add(e.variable);
@@ -2063,26 +2102,10 @@ export const freePredicateVars = (expr: Expr): Set<string> => {
 
         return;
       case 'exists':
-      case 'countSubquery': {
-        // The sub-pattern binds its own variables; extend the bound set before
-        // descending into its inline predicates and WHERE so those bindings are
-        // not mistaken for free references. Outer names still read as free.
-        const inner = new Set(bound);
-
-        for (const p of e.patterns) {
-          patternBoundVars(p, inner);
-        }
-
-        for (const p of e.patterns) {
-          walkPattern(p, inner);
-        }
-
-        if (e.where) {
-          walk(e.where, inner);
-        }
+      case 'countSubquery':
+        walkSubquery(e, bound);
 
         return;
-      }
     }
   };
 
@@ -2100,6 +2123,8 @@ const columnName = (expr: Expr): string => {
       return expr.name;
     case 'prop':
       return `${expr.variable}.${expr.key}`;
+    case 'property_exists':
+      return `property_exists(${expr.variable}, ${expr.key})`;
     default:
       return 'expr';
   }
@@ -4346,6 +4371,7 @@ const refsOnlyVar = (e: Expr, v: string): boolean => {
   switch (e.kind) {
     case 'var':
       return e.name === v;
+    case 'property_exists':
     case 'prop':
       return e.variable === v;
     case 'lit':

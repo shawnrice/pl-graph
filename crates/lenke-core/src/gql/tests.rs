@@ -6172,3 +6172,79 @@ fn date_part_group_by_year_buckets_rows() {
         vec![vec![n(2021.0), n(2.0)], vec![n(2023.0), n(1.0)]]
     );
 }
+
+// ---------------------------------------------------------------------------
+// PROPERTY_EXISTS(n, key) — ISO presence predicate. The point: it distinguishes
+// an ABSENT key from a PRESENT-but-null one, which `n.key IS NOT NULL` cannot
+// (null is a first-class stored value in lenke).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn property_exists_distinguishes_absent_from_present_null() {
+    // n1 has {a:1, z:null(stored)}; n2 has {a:2} (no z).
+    let mut g = ndjson::decode(
+        &[
+            r#"{"type":"node","id":"n1","labels":["N"],"properties":{"a":1,"z":null}}"#,
+            r#"{"type":"node","id":"n2","labels":["N"],"properties":{"a":2}}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    // present key → true; a stored null still EXISTS → true; absent key → false.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:N {a:1}) RETURN property_exists(n, a) AS ha, property_exists(n, z) AS hz, \
+             property_exists(n, nope) AS hn",
+        ),
+        vec![vec![b(true), b(true), b(false)]]
+    );
+    // n2 has no `z` at all → false, even though n1's `z IS NULL` reads the same.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:N {a:2}) RETURN property_exists(n, z) AS hz"
+        ),
+        vec![vec![b(false)]]
+    );
+    // Contrast with `IS NOT NULL`, which CANNOT tell absent from stored-null:
+    // both n1.z (stored null) and n2.z (absent) read as null → both false.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:N) RETURN property_exists(n, z) AS present, (n.z IS NOT NULL) AS notnull \
+             ORDER BY n.a",
+        ),
+        vec![vec![b(true), b(false)], vec![b(false), b(false)]]
+    );
+}
+
+#[test]
+fn property_exists_on_edges_and_non_elements() {
+    let mut g = ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{}}"#,
+            r#"{"type":"node","id":"b","labels":["N"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e","from":"a","to":"b","labels":["R"],"properties":{"w":5.0}}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH ()-[e:R]->() RETURN property_exists(e, w) AS hw, property_exists(e, gone) AS hg",
+        ),
+        vec![vec![b(true), b(false)]]
+    );
+    // A NULL element (unbound OPTIONAL) → NULL (three-valued), not false.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:N) OPTIONAL MATCH (n)-[:NOSUCH]->(m) RETURN property_exists(m, x) AS hx",
+        ),
+        vec![vec![Value::Null], vec![Value::Null]]
+    );
+}

@@ -57,18 +57,17 @@ The one genuinely-open item:
 
 Ordered roughly cheap→involved.
 
-| Gap                                                                                                             | Notes                                                                                                                                                                 |
-| --------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| List slicing `[i..j]`                                                                                           | Indexing `[i]` already works; slice is a small addition.                                                                                                              |
-| `TRIM(LEADING\|TRAILING\|BOTH … FROM …)`                                                                        | The SQL trim-spec form; simple `trim()` works.                                                                                                                        |
-| Element predicates: `IS DIRECTED`, `IS SOURCE/DESTINATION OF`, `ALL_DIFFERENT()`, `SAME()`, `PROPERTY_EXISTS()` | Small, self-contained predicate/function additions.                                                                                                                   |
-| `!` unary-not operator                                                                                          | Alias for the working `NOT` keyword.                                                                                                                                  |
-| Explicit `GROUP BY` / `HAVING` clauses                                                                          | lenke groups **implicitly** (Cypher-style). Adding the explicit clauses is a parser+planner change; lower value since implicit grouping already covers the use cases. |
-| Multi-`MATCH` `EXISTS { … }` (GQ22)                                                                             | Single-`MATCH` `EXISTS` works.                                                                                                                                        |
-| Map / record values (GV45)                                                                                      | No first-class map value; larger (touches the value model).                                                                                                           |
-| Parenthesized-subpath `WHERE` (G050/G051)                                                                       | Per-_edge_ `WHERE` works; per-subpath doesn't.                                                                                                                        |
-| `DIFFERENT EDGES` / `REPEATABLE ELEMENTS` match modes (G002/G003)                                               | Graph-pattern match modes (distinct from the path modes, which work).                                                                                                 |
-| Inline `LET…IN…END`, `VALUE{}` scalar subquery                                                                  | The `LET` statement works; these are the inline-expression forms.                                                                                                     |
+| Gap                                                                                        | Notes                                                                                                                                                                 |
+| ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TRIM(LEADING\|TRAILING\|BOTH … FROM …)`                                                   | The SQL trim-spec form; simple `trim()` works.                                                                                                                        |
+| Element predicates: `IS DIRECTED`, `IS SOURCE/DESTINATION OF`, `ALL_DIFFERENT()`, `SAME()` | Small, self-contained predicate/function additions. (`PROPERTY_EXISTS()` **closed** 2026-07-26.)                                                                      |
+| `!` unary-not operator                                                                     | Alias for the working `NOT` keyword.                                                                                                                                  |
+| Explicit `GROUP BY` / `HAVING` clauses                                                     | lenke groups **implicitly** (Cypher-style). Adding the explicit clauses is a parser+planner change; lower value since implicit grouping already covers the use cases. |
+| Multi-`MATCH` `EXISTS { … }` (GQ22)                                                        | Single-`MATCH` `EXISTS` works.                                                                                                                                        |
+| Map / record values (GV45)                                                                 | No first-class map value; larger (touches the value model).                                                                                                           |
+| Parenthesized-subpath `WHERE` (G050/G051)                                                  | Per-_edge_ `WHERE` works; per-subpath doesn't.                                                                                                                        |
+| `DIFFERENT EDGES` / `REPEATABLE ELEMENTS` match modes (G002/G003)                          | Graph-pattern match modes (distinct from the path modes, which work).                                                                                                 |
+| Inline `LET…IN…END`, `VALUE{}` scalar subquery                                             | The `LET` statement works; these are the inline-expression forms.                                                                                                     |
 
 ### Tier 3 — Excluded by design (NOT gaps to close)
 
@@ -81,6 +80,7 @@ schemaless-by-default engine. Documented so they aren't mistaken for gaps.
 - **`INT64` / integer subtypes** (GV12) — single f64 numeric model.
 - **`BYTES`/`BINARY`/`VARBINARY`, sized `VARCHAR(n)`** — out of value model.
 - **`BETWEEN`** — not ISO GQL at all (absent from the grammar); correctly rejected.
+- **List indexing `[i]` / slicing `[i..j]`** — not ISO GQL (no subscript production in the grammar; it only has list _literals_ `[a,b]`). lenke already ships bare `[i]` as a Cypher-style convenience (from R-STATAGG); `[i..j]` slicing would be _new_ non-ISO surface, so it's **not a conformance gap** — a convenience-feature decision, and one in tension with the sigil convention (a bare Cypher-ism).
 
 ---
 
@@ -238,19 +238,19 @@ productions and probed against the engine.
 
 ### Predicates
 
-| Predicate                                  | lenke | Notes                                                                   |
-| ------------------------------------------ | :---: | ----------------------------------------------------------------------- |
-| Comparison `= <> < > <= >=`                |  ✅   |                                                                         |
-| `IS [NOT] NULL`                            |  ✅   | Also the idiom for property existence.                                  |
-| `IN` (list membership)                     |  ✅   |                                                                         |
-| Labeled `n:L` / `IS [NOT] LABELED`         |  ✅   |                                                                         |
-| Boolean test `IS [NOT] TRUE/FALSE/UNKNOWN` |  ✅   |                                                                         |
-| `IS [NOT] DIRECTED`                        |  ❌   | Edge-direction predicate.                                               |
-| `IS [NOT] SOURCE/DESTINATION OF`           |  ❌   |                                                                         |
-| `IS [NOT] NORMALIZED`                      |  ❌   |                                                                         |
-| `ALL_DIFFERENT(…)` / `SAME(…)`             |  ❌   | Element-identity predicates (unknown function).                         |
-| `PROPERTY_EXISTS(n, k)`                    |  ❌   | Use `n.k IS NOT NULL`.                                                  |
-| `BETWEEN`                                  |  ➖   | Not an ISO GQL predicate (absent from the grammar); correctly rejected. |
+| Predicate                                  | lenke | Notes                                                                                                                                              |
+| ------------------------------------------ | :---: | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Comparison `= <> < > <= >=`                |  ✅   |                                                                                                                                                    |
+| `IS [NOT] NULL`                            |  ✅   | Also the idiom for property existence.                                                                                                             |
+| `IN` (list membership)                     |  ✅   |                                                                                                                                                    |
+| Labeled `n:L` / `IS [NOT] LABELED`         |  ✅   |                                                                                                                                                    |
+| Boolean test `IS [NOT] TRUE/FALSE/UNKNOWN` |  ✅   |                                                                                                                                                    |
+| `IS [NOT] DIRECTED`                        |  ❌   | Edge-direction predicate.                                                                                                                          |
+| `IS [NOT] SOURCE/DESTINATION OF`           |  ❌   |                                                                                                                                                    |
+| `IS [NOT] NORMALIZED`                      |  ❌   |                                                                                                                                                    |
+| `ALL_DIFFERENT(…)` / `SAME(…)`             |  ❌   | Element-identity predicates (unknown function).                                                                                                    |
+| `PROPERTY_EXISTS(n, k)`                    |  ✅   | Presence test — distinguishes an absent key from a stored null (`n.k IS NOT NULL` cannot, since null is first-class). Both engines byte-identical. |
+| `BETWEEN`                                  |  ➖   | Not an ISO GQL predicate (absent from the grammar); correctly rejected.                                                                            |
 
 ### Expressions & operators
 
@@ -315,10 +315,10 @@ majority — read / pattern-matching / path-search / function / composition,
 predicates, `CASE`/`COALESCE`/`NULLIF`, `OPTIONAL MATCH`, `DISTINCT`, `ORDER BY …
 NULLS FIRST/LAST`, `DETACH DELETE`, the full scalar/aggregate function set. The
 genuine gaps found (deep grammar walk): explicit **`GROUP BY`** and **`HAVING`**
-clauses (lenke groups implicitly, Cypher-style), **list slicing** `[i..j]`, the
-**`TRIM(… FROM …)`** spec form, the element predicates (`IS DIRECTED`,
-`IS SOURCE/DESTINATION OF`, `ALL_DIFFERENT`, `SAME`, `PROPERTY_EXISTS`,
-`IS NORMALIZED`), `IS TYPED` (GA06), multi-`MATCH` `EXISTS` (GQ22), map/record
+clauses (lenke groups implicitly, Cypher-style), the **`TRIM(… FROM …)`** spec
+form, the remaining element predicates (`IS DIRECTED`, `IS SOURCE/DESTINATION OF`,
+`ALL_DIFFERENT`, `SAME`, `IS NORMALIZED` — `PROPERTY_EXISTS` is now **done**),
+`IS TYPED` (GA06), multi-`MATCH` `EXISTS` (GQ22), map/record
 values (GV45), parenthesized-subpath `WHERE` (G050), the `DIFFERENT
 EDGES`/`REPEATABLE ELEMENTS` match modes (G002/G003), inline `LET…IN…END` /
 `VALUE{}` scalar subqueries, and — by design — multi-graph `USE` (GQ01) and

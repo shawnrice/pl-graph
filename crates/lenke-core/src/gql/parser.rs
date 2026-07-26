@@ -1457,6 +1457,17 @@ impl Parser {
                     if !t.delimited && t.value.eq_ignore_ascii_case("cast") {
                         return self.parse_cast();
                     }
+                    // `PROPERTY_EXISTS(n, key)` — presence predicate; the second
+                    // arg is a bare property NAME, not an expression, so it can't
+                    // ride the generic function-call path.
+                    if !t.delimited && t.value.eq_ignore_ascii_case("property_exists") {
+                        self.expect(Tt::LParen, "'('")?;
+                        let variable = self.bind_name("an element variable")?;
+                        self.expect(Tt::Comma, "','")?;
+                        let key = self.bind_name("a property name")?;
+                        self.expect(Tt::RParen, "')'")?;
+                        return Ok(Expr::PropertyExists { variable, key });
+                    }
                     let (args, distinct, star) = self.parse_call_args()?;
                     return Ok(Expr::Func {
                         name: t.value.to_ascii_lowercase(),

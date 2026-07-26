@@ -371,6 +371,10 @@ export type Expr =
   | { kind: 'var'; name: string }
   | { kind: 'param'; name: string }
   | { kind: 'prop'; variable: string; key: string }
+  // `PROPERTY_EXISTS(n, key)` — true iff `key` is *present* on element `n`,
+  // regardless of value (distinguishes an absent key from a stored null). The
+  // second argument is a bare property name, not an expression.
+  | { kind: 'property_exists'; variable: string; key: string }
   | { kind: 'lit'; value: unknown }
   | { kind: 'list'; items: readonly Expr[] }
   // ISO GQL list element access `base[index]` — 0-based; out of range → null.

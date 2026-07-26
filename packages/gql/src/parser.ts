@@ -1452,6 +1452,19 @@ export const parse = (
           return parseCast();
         }
 
+        // `PROPERTY_EXISTS(n, key)` — presence predicate; the second argument is
+        // a bare property NAME, not an expression, so it can't ride the generic
+        // function-call path.
+        if (!t.delimited && t.value.toLowerCase() === 'property_exists') {
+          expect('lparen', "'(' after PROPERTY_EXISTS");
+          const variable = bindName('an element variable');
+          expect('comma', "',' in PROPERTY_EXISTS(n, key)");
+          const key = bindName('a property name');
+          expect('rparen', "')' to close PROPERTY_EXISTS");
+
+          return { kind: 'property_exists', variable, key };
+        }
+
         return { kind: 'func', name: t.value.toLowerCase(), ...parseCallArgs() };
       }
 

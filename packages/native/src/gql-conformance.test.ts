@@ -269,6 +269,30 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(() => nativeGraph.query(bare)).toThrow();
   });
 
+  test('PROPERTY_EXISTS(n, key) — byte-identical presence predicate', () => {
+    const [ts, native] = both(
+      `MATCH (n:Person {name: 'marko'}) RETURN property_exists(n, name) AS hn, property_exists(n, age) AS ha, property_exists(n, nope) AS hx`,
+    );
+
+    expect(ts).toBe(native);
+    expect(ts).toContain('"hn":true');
+    expect(ts).toContain('"hx":false');
+
+    // Edge properties agree.
+    const [tsE, natE] = both(
+      `MATCH ()-[e:created]->() RETURN property_exists(e, weight) AS hw, property_exists(e, gone) AS hg`,
+    );
+
+    expect(tsE).toBe(natE);
+
+    // A NULL element (unmatched OPTIONAL) → NULL, not false — both engines.
+    const [tsN, natN] = both(
+      `MATCH (n:Person {name: 'marko'}) OPTIONAL MATCH (n)-[:NOSUCH]->(m) RETURN property_exists(m, x) AS hx`,
+    );
+
+    expect(tsN).toBe(natN);
+  });
+
   test('list[i].prop — property access chains off a subscript, byte-identical', () => {
     const base = `MATCH p = ANY SHORTEST (a)-[]->*(b) WHERE a.name = 'marko' AND b.name = 'lop'`;
     // edges(p)[0].weight, nodes(p)[i].name, and out-of-range → null all

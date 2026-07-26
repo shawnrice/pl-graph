@@ -480,6 +480,14 @@ pub enum Expr {
         label: LabelExpr,
         negated: bool,
     },
+    /// `PROPERTY_EXISTS(n, key)` — true iff property `key` is *present* on element
+    /// `n`, regardless of value. Distinguishes an absent key from a present null
+    /// (null is a first-class stored value here), which `n.key IS NOT NULL`
+    /// cannot. The second argument is a bare property name, not an expression.
+    PropertyExists {
+        variable: String,
+        key: String,
+    },
     In {
         expr: Box<Self>,
         list: Box<Self>,

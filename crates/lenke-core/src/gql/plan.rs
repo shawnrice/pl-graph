@@ -283,6 +283,12 @@ pub enum CExpr {
         var_slot: usize,
         key_ref: usize,
     },
+    /// `PROPERTY_EXISTS(n, key)` — a presence test; resolves the element + key
+    /// exactly like `Prop`, but yields a `Bool` (or `Null` on a non-element).
+    PropertyExists {
+        var_slot: usize,
+        key_ref: usize,
+    },
     Lit(Lit),
     List(Vec<Self>),
     /// ISO GQL list element access `base[index]` — 0-based; out of range → null.
@@ -514,6 +520,7 @@ fn emit(e: &CExpr, out: &mut Vec<Op>) {
         | CExpr::CountSubquery { .. }
         | CExpr::Index { .. }
         | CExpr::Field { .. }
+        | CExpr::PropertyExists { .. }
         | CExpr::Aggregate { .. } => out.push(Op::Tree(e.clone())),
     }
 }
@@ -1148,6 +1155,10 @@ impl Lowerer {
                 var_slot: self.slot_of(variable),
                 key_ref: intern_ref(&mut self.keys, key),
             },
+            Expr::PropertyExists { variable, key } => CExpr::PropertyExists {
+                var_slot: self.slot_of(variable),
+                key_ref: intern_ref(&mut self.keys, key),
+            },
             Expr::Lit(l) => CExpr::Lit(l.clone()),
             Expr::List(items) => CExpr::List(items.iter().map(|x| self.expr(x)).collect()),
             Expr::Index { base, index } => CExpr::Index {
@@ -1766,6 +1777,7 @@ fn collect_free_vars(e: &Expr, bound: &[String], free: &mut Vec<String>) {
     match e {
         Expr::Var(n) => note_free(n, bound, free),
         Expr::Prop { variable, .. } => note_free(variable, bound, free),
+        Expr::PropertyExists { variable, .. } => note_free(variable, bound, free),
         Expr::Lit(_) | Expr::Param(_) => {}
         Expr::List(items) => {
             for it in items {

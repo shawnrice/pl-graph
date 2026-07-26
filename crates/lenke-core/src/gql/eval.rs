@@ -1237,6 +1237,20 @@ fn val_to_value(graph: &Graph, v: &Val) -> Value {
 /// ISO: an absent property — or a property of a non-element/NULL — yields NULL.
 /// Vertices and edges read from the same columnar store; `key_ref`'s id was
 /// resolved once at execute time (no per-access name lookup).
+/// `PROPERTY_EXISTS(n, key)`: is `key` a *present* property of element `n`? A
+/// `Bool` for an element (distinguishing an absent key from a stored null), and
+/// `Null` for a non-element/NULL (three-valued, like a comparison). Resolves the
+/// key exactly like [`prop_of`] but tests presence instead of reading the value.
+fn prop_present(graph: &Graph, ctx: &Ctx, bound: &Val, key_ref: usize) -> Val {
+    let (store, kid, idx) = match bound {
+        Val::Node(vi) => (&graph.props, ctx.prop_keys[key_ref].0, *vi as usize),
+        Val::Edge(ei) => (&graph.edge_props, ctx.prop_keys[key_ref].1, *ei as usize),
+        _ => return Val::Null,
+    };
+    // `kid == None` means the key was never interned in this store → not present.
+    Val::Bool(kid.is_some_and(|kid| store.is_present_id(idx, kid)))
+}
+
 fn prop_of(graph: &Graph, ctx: &Ctx, bound: &Val, key_ref: usize) -> Val {
     let (store, kid, idx) = match bound {
         Val::Node(vi) => (&graph.props, ctx.prop_keys[key_ref].0, *vi as usize),
@@ -1393,6 +1407,10 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
         CExpr::Prop { var_slot, key_ref } => {
             let bound = env.binding.get(*var_slot).cloned().unwrap_or(Val::Null);
             prop_of(env.graph, env.ctx, &bound, *key_ref)
+        }
+        CExpr::PropertyExists { var_slot, key_ref } => {
+            let bound = env.binding.get(*var_slot).cloned().unwrap_or(Val::Null);
+            prop_present(env.graph, env.ctx, &bound, *key_ref)
         }
         CExpr::List(items) => Val::List(items.iter().map(|e| eval(env, e)).collect()),
         CExpr::Index { base, index } => {
