@@ -300,3 +300,30 @@ pure. New behavioral tests live in both `packages/gql/src/*.test.ts` and
 Per slice: edit → `cargo test` / `bun test` the touched area → commit locally
 (**never push** — standing constraint). Full gate `bun run check` + `bun run
 build` before calling it done.
+
+## 6. Extension functions — temporal components (`_year` … `_second`)
+
+Status: **implemented** (2026-07-25). The first _function_-shaped extensions (the
+sigil convention was born on statement keywords like `_MERGE`; it applies to
+functions too).
+
+`_year(x)`, `_month(x)`, `_day(x)`, `_hour(x)`, `_minute(x)`, `_second(x)` extract
+a calendar/clock component from a temporal value. They wear the sigil because
+**date-part extraction is not in the ISO GQL function catalogue** — verified
+against the 39075 Feature-ID taxonomy (as reproduced in Neo4j's `docs-cypher`
+`appendix/gql-conformance/*.adoc`): it is neither a mandatory value function nor a
+catalogued optional feature. Other vendors each solve it differently and
+non-portably (Ultipa `year()`, Spanner SQL `EXTRACT`, Fabric omits it, Cypher a
+`.year` accessor) — precisely the "no single conformant form" situation the sigil
+exists to mark. So the bare `year(...)` stays an unknown function; only `_year(…)`
+resolves.
+
+Semantics (both engines byte-identical): `_year`/`_month`/`_day` require a
+date-bearing temporal (`DATE`/`LOCAL DATETIME`/`ZONED DATETIME`);
+`_hour`/`_minute`/`_second` require a time-bearing one (`LOCAL TIME`/`LOCAL
+DATETIME`/`ZONED *`). A zoned value is read in its **own stored offset** (local
+wall clock). A string is **not coerced** — it throws `E_INVALID_VALUE` (wrap with
+`date()`/`local_datetime()`/`local_time()`); a temporal lacking the requested
+component, or a duration, throws likewise; `null` → `null`. **Migration:** if a
+future GQL edition standardizes component extraction, add the bare conformant name
+then and keep `_year` as a deprecated alias (per §1's migration rule).

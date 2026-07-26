@@ -1133,9 +1133,10 @@ const callTemporalFn = (name: string, args: readonly unknown[]): unknown => {
   return UNHANDLED;
 };
 
-// Temporal component extraction (ISO GQL `year()`/`month()`/`day()`/`hour()`/
-// `minute()`/`second()`). Euclidean floor/mod so pre-epoch instants (negative
-// seconds) decompose byte-identically to the Rust `div_euclid`/`rem_euclid`.
+// Temporal component extraction (the `_year`/`_month`/`_day`/`_hour`/`_minute`/
+// `_second` lenke extension — see docs/design/gql-extensions.md). Euclidean
+// floor/mod so pre-epoch instants (negative seconds) decompose byte-identically
+// to the Rust `div_euclid`/`rem_euclid`.
 const SECS_PER_DAY = 86_400;
 const floorDiv = (n: number, d: number): number => Math.floor(n / d);
 const euclidMod = (n: number, d: number): number => ((n % d) + d) % d;
@@ -1184,7 +1185,10 @@ const datePart = (name: string, t: Temporal): number | null => {
   return name === 'minute' ? floorDiv(tod, 60) % 60 : tod % 60;
 };
 
-const DATE_PART_FNS = new Set(['year', 'month', 'day', 'hour', 'minute', 'second']);
+// Sigil-prefixed because date-part extraction is a lenke EXTENSION, not in the
+// ISO GQL function catalogue (see docs/design/gql-extensions.md). The bare names
+// (`year`/…) stay unknown functions, flagging non-portability at the call site.
+const DATE_PART_FNS = new Set(['_year', '_month', '_day', '_hour', '_minute', '_second']);
 
 const callDatePartFn = (name: string, a: unknown): unknown => {
   if (!DATE_PART_FNS.has(name)) {
@@ -1195,8 +1199,10 @@ const callDatePartFn = (name: string, a: unknown): unknown => {
     return null; // null in → null out
   }
 
+  const component = name.slice(1); // strip the extension sigil → year/month/…
+
   if (isTemporal(a)) {
-    const n = datePart(name, a);
+    const n = datePart(component, a);
 
     if (n !== null) {
       return n;

@@ -6019,7 +6019,7 @@ fn optional_match_after_match_no_barrier() {
 }
 
 // ---------------------------------------------------------------------------
-// Temporal component extraction: year()/month()/day()/hour()/minute()/second()
+// Temporal component extraction: _year()/_month()/_day()/_hour()/_minute()/_second()
 // — the ISO GQL named-function form (NOT SQL `EXTRACT`, NOT Cypher `.year`). A
 // string is NOT coerced (faults E_INVALID_VALUE); a temporal lacking the
 // requested component faults too; zoned values read their OWN offset (local
@@ -6033,8 +6033,8 @@ fn date_part_extracts_from_a_date() {
     assert_eq!(
         rows(
             &mut g,
-            "RETURN year(DATE '2024-03-15') AS y, month(DATE '2024-03-15') AS mo, \
-             day(DATE '2024-03-15') AS d"
+            "RETURN _year(DATE '2024-03-15') AS y, _month(DATE '2024-03-15') AS mo, \
+             _day(DATE '2024-03-15') AS d"
         ),
         vec![vec![n(2024.0), n(3.0), n(15.0)]]
     );
@@ -6042,8 +6042,8 @@ fn date_part_extracts_from_a_date() {
     assert_eq!(
         rows(
             &mut g,
-            "RETURN year(DATE '1969-12-31') AS y, month(DATE '1969-12-31') AS mo, \
-             day(DATE '1969-12-31') AS d"
+            "RETURN _year(DATE '1969-12-31') AS y, _month(DATE '1969-12-31') AS mo, \
+             _day(DATE '1969-12-31') AS d"
         ),
         vec![vec![n(1969.0), n(12.0), n(31.0)]]
     );
@@ -6055,10 +6055,10 @@ fn date_part_extracts_date_and_time_fields_from_a_datetime() {
     assert_eq!(
         rows(
             &mut g,
-            "RETURN year(DATETIME '2024-03-15T13:47:09') AS y, \
-             hour(DATETIME '2024-03-15T13:47:09') AS h, \
-             minute(DATETIME '2024-03-15T13:47:09') AS mi, \
-             second(DATETIME '2024-03-15T13:47:09') AS s"
+            "RETURN _year(DATETIME '2024-03-15T13:47:09') AS y, \
+             _hour(DATETIME '2024-03-15T13:47:09') AS h, \
+             _minute(DATETIME '2024-03-15T13:47:09') AS mi, \
+             _second(DATETIME '2024-03-15T13:47:09') AS s"
         ),
         vec![vec![n(2024.0), n(13.0), n(47.0), n(9.0)]]
     );
@@ -6070,8 +6070,8 @@ fn date_part_extracts_time_fields_from_a_local_time() {
     assert_eq!(
         rows(
             &mut g,
-            "RETURN hour(local_time('13:47:09')) AS h, minute(local_time('13:47:09')) AS mi, \
-             second(local_time('13:47:09')) AS s"
+            "RETURN _hour(local_time('13:47:09')) AS h, _minute(local_time('13:47:09')) AS mi, \
+             _second(local_time('13:47:09')) AS s"
         ),
         vec![vec![n(13.0), n(47.0), n(9.0)]]
     );
@@ -6085,16 +6085,16 @@ fn date_part_zoned_reads_its_own_offset_wall_clock() {
     assert_eq!(
         rows(
             &mut g,
-            "RETURN day(zoned_datetime('2024-03-15T23:30:00+05:00')) AS d, \
-             hour(zoned_datetime('2024-03-15T23:30:00+05:00')) AS h"
+            "RETURN _day(zoned_datetime('2024-03-15T23:30:00+05:00')) AS d, \
+             _hour(zoned_datetime('2024-03-15T23:30:00+05:00')) AS h"
         ),
         vec![vec![n(15.0), n(23.0)]]
     );
     assert_eq!(
         rows(
             &mut g,
-            "RETURN hour(zoned_time('01:15:00+02:00')) AS h, \
-             minute(zoned_time('01:15:00+02:00')) AS mi"
+            "RETURN _hour(zoned_time('01:15:00+02:00')) AS h, \
+             _minute(zoned_time('01:15:00+02:00')) AS mi"
         ),
         vec![vec![n(1.0), n(15.0)]]
     );
@@ -6104,13 +6104,13 @@ fn date_part_zoned_reads_its_own_offset_wall_clock() {
 fn date_part_null_in_null_out() {
     let mut g = ndjson::decode("").unwrap();
     assert_eq!(
-        rows(&mut g, "RETURN year(null) AS y"),
+        rows(&mut g, "RETURN _year(null) AS y"),
         vec![vec![Value::Null]]
     );
     // An absent property → null in → null out (no fault), so the row survives.
     rows(&mut g, "INSERT (:H {name: 'x'})");
     assert_eq!(
-        rows(&mut g, "MATCH (h:H) RETURN year(h.hired) AS y"),
+        rows(&mut g, "MATCH (h:H) RETURN _year(h.hired) AS y"),
         vec![vec![Value::Null]]
     );
 }
@@ -6128,23 +6128,32 @@ fn date_part_rejects_strings_and_missing_components() {
     };
 
     // A string is NOT coerced — it must be wrapped with date()/local_datetime()/…
-    assert_eq!(code(&mut g, "RETURN year('2024-03-15') AS y"), InvalidValue);
-    // A number is not a temporal.
-    assert_eq!(code(&mut g, "RETURN month(5) AS m"), InvalidValue);
-    // year() of a time-only value has no date component.
     assert_eq!(
-        code(&mut g, "RETURN year(local_time('13:47:09')) AS y"),
+        code(&mut g, "RETURN _year('2024-03-15') AS y"),
         InvalidValue
     );
-    // hour() of a date has no time component.
+    // A number is not a temporal.
+    assert_eq!(code(&mut g, "RETURN _month(5) AS m"), InvalidValue);
+    // _year() of a time-only value has no date component.
     assert_eq!(
-        code(&mut g, "RETURN hour(DATE '2024-03-15') AS h"),
+        code(&mut g, "RETURN _year(local_time('13:47:09')) AS y"),
+        InvalidValue
+    );
+    // _hour() of a date has no time component.
+    assert_eq!(
+        code(&mut g, "RETURN _hour(DATE '2024-03-15') AS h"),
         InvalidValue
     );
     // a duration carries neither.
     assert_eq!(
-        code(&mut g, "RETURN day(duration('P1Y2M3D')) AS d"),
+        code(&mut g, "RETURN _day(duration('P1Y2M3D')) AS d"),
         InvalidValue
+    );
+    // The bare (sigil-less) names are NOT functions — date-parts are a lenke
+    // extension, so only the `_`-prefixed form resolves.
+    assert_eq!(
+        code(&mut g, "RETURN year(DATE '2024-03-15') AS y"),
+        crate::error_codes::ErrorCode::UnknownFunction
     );
 }
 
@@ -6158,7 +6167,7 @@ fn date_part_group_by_year_buckets_rows() {
     assert_eq!(
         rows(
             &mut g,
-            "MATCH (h:H) RETURN year(h.hired) AS yr, count(*) AS c ORDER BY yr"
+            "MATCH (h:H) RETURN _year(h.hired) AS yr, count(*) AS c ORDER BY yr"
         ),
         vec![vec![n(2021.0), n(2.0)], vec![n(2023.0), n(1.0)]]
     );

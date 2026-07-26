@@ -109,11 +109,14 @@ pub enum ScalarFn {
     /// two pinned points), never calendar months: whole days for two dates,
     /// seconds+nanos for two datetimes.
     DurationBetween,
-    /// Temporal component extraction (`year(x)`/`month`/`day`/`hour`/`minute`/
-    /// `second`). Argument must be a temporal value carrying the requested
-    /// component (a string is NOT coerced — it faults); zoned values are read in
-    /// their own offset (local wall clock). The ISO GQL / Spanner / Ultipa
-    /// spelling; NOT SQL `EXTRACT` and NOT Cypher's `.year` accessor.
+    /// Temporal component extraction (`_year(x)`/`_month`/`_day`/`_hour`/
+    /// `_minute`/`_second`). **A lenke extension** — date-part extraction is NOT
+    /// in the ISO GQL function catalogue (not mandatory, not a catalogued optional
+    /// feature; verified against the 39075 Feature-ID taxonomy), so it wears the
+    /// leading-underscore sigil per `docs/design/gql-extensions.md`. Argument must
+    /// be a temporal value carrying the requested component (a string is NOT
+    /// coerced — it faults); zoned values are read in their own offset (local wall
+    /// clock). NOT SQL `EXTRACT`, NOT Cypher's `.year` accessor.
     Year,
     Month,
     Day,
@@ -245,13 +248,15 @@ fn scalar_fn(name: &str) -> ScalarFn {
         "local_datetime" | "datetime" => ScalarFn::DateTimeOf,
         "duration" => ScalarFn::DurationOf,
         "duration_between" => ScalarFn::DurationBetween,
-        // Temporal component extraction (ISO GQL named-function form).
-        "year" => ScalarFn::Year,
-        "month" => ScalarFn::Month,
-        "day" => ScalarFn::Day,
-        "hour" => ScalarFn::Hour,
-        "minute" => ScalarFn::Minute,
-        "second" => ScalarFn::Second,
+        // Temporal component extraction — a lenke EXTENSION (not in the ISO GQL
+        // function catalogue), so sigil-prefixed. The bare `year`/… names stay
+        // unknown, signalling non-portability at the call site.
+        "_year" => ScalarFn::Year,
+        "_month" => ScalarFn::Month,
+        "_day" => ScalarFn::Day,
+        "_hour" => ScalarFn::Hour,
+        "_minute" => ScalarFn::Minute,
+        "_second" => ScalarFn::Second,
         _ => ScalarFn::Unknown,
     }
 }

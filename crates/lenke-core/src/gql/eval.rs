@@ -308,8 +308,8 @@ impl Ctx<'_> {
             )),
             FAULT_DATE_PART => Err(CodeError::new(
                 ErrorCode::InvalidValue,
-                "year()/month()/day()/hour()/minute()/second() require a temporal value that \
-                 carries that component (a date carries year/month/day; a time carries \
+                "_year()/_month()/_day()/_hour()/_minute()/_second() require a temporal value \
+                 that carries that component (a date carries year/month/day; a time carries \
                  hour/minute/second) — a string is NOT coerced; wrap it with \
                  date()/local_datetime()/local_time() first",
             )),

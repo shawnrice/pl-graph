@@ -230,19 +230,19 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(() => nativeGraph.query(q)).toThrow();
   });
 
-  test('temporal component fns year()/…/second() — byte-identical; string rejected', () => {
+  test('temporal component fns _year()/…/_second() — byte-identical; string rejected', () => {
     // Date parts, time parts, zoned-in-own-offset, pre-epoch, and null-in→null-out
     // all agree bit-for-bit across engines.
     const agree = [
-      `RETURN year(DATE '2024-03-15') AS y, month(DATE '2024-03-15') AS mo, day(DATE '2024-03-15') AS d`,
-      `RETURN hour(DATETIME '2024-03-15T13:47:09') AS h, minute(DATETIME '2024-03-15T13:47:09') AS mi, second(DATETIME '2024-03-15T13:47:09') AS s`,
-      `RETURN hour(local_time('13:47:09')) AS h, minute(local_time('13:47:09')) AS mi`,
+      `RETURN _year(DATE '2024-03-15') AS y, _month(DATE '2024-03-15') AS mo, _day(DATE '2024-03-15') AS d`,
+      `RETURN _hour(DATETIME '2024-03-15T13:47:09') AS h, _minute(DATETIME '2024-03-15T13:47:09') AS mi, _second(DATETIME '2024-03-15T13:47:09') AS s`,
+      `RETURN _hour(local_time('13:47:09')) AS h, _minute(local_time('13:47:09')) AS mi`,
       // A zoned value reads its own offset (local wall clock), not UTC.
-      `RETURN day(zoned_datetime('2024-03-15T23:30:00+05:00')) AS d, hour(zoned_datetime('2024-03-15T23:30:00+05:00')) AS h`,
-      `RETURN hour(zoned_time('01:15:00+02:00')) AS h`,
+      `RETURN _day(zoned_datetime('2024-03-15T23:30:00+05:00')) AS d, _hour(zoned_datetime('2024-03-15T23:30:00+05:00')) AS h`,
+      `RETURN _hour(zoned_time('01:15:00+02:00')) AS h`,
       // Pre-epoch date (negative epoch-day count).
-      `RETURN year(DATE '1969-12-31') AS y, day(DATE '1969-12-31') AS d`,
-      `RETURN year(null) AS y`,
+      `RETURN _year(DATE '1969-12-31') AS y, _day(DATE '1969-12-31') AS d`,
+      `RETURN _year(null) AS y`,
     ];
 
     for (const q of agree) {
@@ -253,13 +253,20 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
 
     // A string is NOT coerced, and a temporal lacking the component faults — both throw.
     for (const q of [
-      `RETURN year('2024-03-15') AS y`,
-      `RETURN hour(DATE '2024-03-15') AS h`,
-      `RETURN year(local_time('13:47:09')) AS y`,
+      `RETURN _year('2024-03-15') AS y`,
+      `RETURN _hour(DATE '2024-03-15') AS h`,
+      `RETURN _year(local_time('13:47:09')) AS y`,
     ]) {
       expect(() => tsQuery(tsGraph, q)).toThrow();
       expect(() => nativeGraph.query(q)).toThrow();
     }
+
+    // The bare (sigil-less) names are NOT functions — date-parts are a lenke
+    // extension, so only the `_`-prefixed form resolves. Both engines reject.
+    const bare = `RETURN year(DATE '2024-03-15') AS y`;
+
+    expect(() => tsQuery(tsGraph, bare)).toThrow();
+    expect(() => nativeGraph.query(bare)).toThrow();
   });
 
   test('list[i].prop — property access chains off a subscript, byte-identical', () => {
