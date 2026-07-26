@@ -384,7 +384,11 @@ export type Expr =
   | { kind: 'property_exists'; variable: string; key: string }
   | { kind: 'lit'; value: unknown }
   | { kind: 'list'; items: readonly Expr[] }
+  // ISO `<record constructor>` `{ field: expr, … }` — canonicalized (sorted keys,
+  // duplicate last-wins) into a record/map value at eval time.
+  | { kind: 'record'; fields: readonly { key: string; value: Expr }[] }
   // ISO GQL list element access `base[index]` — 0-based; out of range → null.
+  // Also a record field access when `base` is a map and `index` is a string.
   | { kind: 'index'; base: Expr; index: Expr }
   // Property access chained off any expression (`edges(p)[0].amount`).
   // A bare `variable.key` stays `prop` (the hot path); this is the postfix `.key`.

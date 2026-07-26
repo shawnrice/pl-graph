@@ -1557,6 +1557,26 @@ export const parse = (
     return { kind: 'valueSubquery', patterns, where, ret };
   };
 
+  // ISO `<record constructor>`: `{ field: expr [, field: expr]… }` (or `{}`).
+  // Field names are identifiers (a reserved word must be backtick-quoted). The
+  // `{` has NOT been consumed.
+  const parseRecord = (): Expr => {
+    expect('lbrace', "'{' to open a record");
+    const fields: { key: string; value: Expr }[] = [];
+
+    if (!check('rbrace')) {
+      do {
+        const key = bindName('a record field name');
+        expect('colon', "':' after a record field name");
+        fields.push({ key, value: parseExpr() });
+      } while (check('comma') && (advance(), true));
+    }
+
+    expect('rbrace', "'}' to close a record");
+
+    return { kind: 'record', fields };
+  };
+
   // ISO `<let value expression>`: `LET x = e1, y = e2 IN <body> END`. Each
   // binding's RHS is parsed with the bare `IN` operator suppressed so the value
   // expression ends at the structural `IN` (a parenthesized `IN` predicate still
@@ -1863,6 +1883,13 @@ export const parse = (
       expect('rbracket', "']' to close a list");
 
       return { kind: 'list', items };
+    }
+
+    // ISO `<record constructor>`: `{ field: expr, … }`. A bare `{` in expression
+    // position is unambiguous (VALUE/EXISTS/COUNT lead with a keyword; property
+    // maps and subqueries live in their own positions).
+    if (t.type === 'lbrace') {
+      return parseRecord();
     }
 
     if (t.type === 'ident') {

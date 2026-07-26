@@ -303,6 +303,34 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(() => nativeGraph.query(q)).toThrow();
   });
 
+  test('record constructor + field access — ISO map value, byte-identical', () => {
+    // Constructor canonicalizes (sorted keys, dup last-wins); access by dot and
+    // by string subscript; nested; missing field → null.
+    const cases: Array<[string, string]> = [
+      [`RETURN {name: 'marko', age: 29} AS r`, `[{"r":{"age":29,"name":"marko"}}]`],
+      [`RETURN {} AS r`, `[{"r":{}}]`],
+      [`RETURN {a: 1, a: 2} AS r`, `[{"r":{"a":2}}]`],
+      [`RETURN {a: 1, b: 2}.a AS x`, `[{"x":1}]`],
+      [`RETURN {a: 1, b: 2}['b'] AS x`, `[{"x":2}]`],
+      [`RETURN {a: 1}.zzz AS x`, `[{"x":null}]`],
+      [`RETURN {p: {n: 5}}.p.n AS x`, `[{"x":5}]`],
+      // A field value is any expression; correlated to a matched element.
+      [
+        `MATCH (n:Person {name: 'marko'}) RETURN {who: n.name, yrs: n.age} AS r`,
+        `[{"r":{"who":"marko","yrs":29}}]`,
+      ],
+      // Equality is structural; ordering / DISTINCT are total.
+      [`RETURN {a: 1, b: 2} = {b: 2, a: 1} AS eq`, `[{"eq":true}]`],
+      [`RETURN {a: 1} = {a: 2} AS eq`, `[{"eq":false}]`],
+    ];
+
+    for (const [q, want] of cases) {
+      const [ts, native] = both(q);
+      expect(ts).toBe(native);
+      expect(ts).toBe(want);
+    }
+  });
+
   test('list[i] — ISO GQL 0-based subscript, null-safe, byte-identical', () => {
     const cases: Array<[string, string]> = [
       // 0-based: [0] is the first element.

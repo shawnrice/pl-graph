@@ -299,9 +299,47 @@ const dataException = (message: string): never => {
   throw new LenkeError(message, { code: ErrorCode.DataException });
 };
 
+/**
+ * A GQL record/map value: a `Map` with keys kept sorted (canonical) and JSON
+ * serialization as an object. A `Map` subclass so it is distinct from a graph
+ * element (a plain object with an `id`) and from a plain object, while
+ * `JSON.stringify` still emits a sorted `{…}` (via `toJSON`) — byte-identical to
+ * the native `Value::Map`.
+ */
+export class LenkeRecord extends Map<string, unknown> {
+  toJSON(): Record<string, unknown> {
+    return Object.fromEntries(this);
+  }
+}
+
+/** Lexicographic compare of two field-name strings (matches the native key sort). */
+const cmpKey = (a: string, b: string): number => {
+  if (a < b) {
+    return -1;
+  }
+
+  return a > b ? 1 : 0;
+};
+
+/** Build a canonical record from field pairs: duplicate keys collapse last-wins,
+ *  then keys are sorted (matching the native canonical form). */
+const makeRecord = (fields: readonly (readonly [string, unknown])[]): LenkeRecord => {
+  const dedup = new Map<string, unknown>(fields); // later entry wins
+  const sorted = [...dedup].sort(([a], [b]) => cmpKey(a, b));
+
+  return new LenkeRecord(sorted);
+};
+
+/** Read field `key` from a record/map, or `null` if absent (three-valued). */
+const recordGet = (rec: LenkeRecord, key: string): unknown => (rec.has(key) ? rec.get(key) : null);
+
 const typeName = (v: unknown): string => {
   if (Array.isArray(v)) {
     return 'a list';
+  }
+
+  if (v instanceof LenkeRecord) {
+    return 'a map';
   }
 
   if (v !== null && typeof v === 'object') {
@@ -344,6 +382,26 @@ const structuralEq = (a: unknown, b: unknown): boolean => {
   }
 
   if (aList || bList) {
+    return false;
+  }
+
+  // Records are equal iff they have the same fields (keys canonical/sorted) with
+  // recursively-equal values — ISO records support `=`/`<>`.
+  const aRec = a instanceof LenkeRecord;
+  const bRec = b instanceof LenkeRecord;
+
+  if (aRec && bRec) {
+    if (a.size !== b.size) {
+      return false;
+    }
+
+    const ae = [...a];
+    const be = [...b];
+
+    return ae.every(([k, v], i) => k === be[i][0] && structuralEq(v, be[i][1]));
+  }
+
+  if (aRec || bRec) {
     return false;
   }
 
@@ -513,6 +571,8 @@ const hasAggregate = (expr: Expr): boolean => {
       return hasAggregate(expr.base);
     case 'list':
       return expr.items.some(hasAggregate);
+    case 'record':
+      return expr.fields.some((f) => hasAggregate(f.value));
     case 'case':
       return (
         (expr.subject ? hasAggregate(expr.subject) : false) ||
@@ -1490,16 +1550,28 @@ const compileExpr = (expr: Expr): CompiledExpr => {
 
       return (env) => items.map((f) => f(env));
     }
+    case 'record': {
+      // ISO record constructor → a canonical (sorted, dup-last-wins) map value.
+      const fields = expr.fields.map((f) => ({ key: f.key, fn: compileExpr(f.value) }));
+
+      return (env) => makeRecord(fields.map((f) => [f.key, f.fn(env)] as const));
+    }
     case 'index': {
       // ISO GQL list subscript `base[index]`: 0-based, out of range → null, and
-      // null-safe (non-list base, null / non-integer / negative index → null).
-      // `numOf` mirrors the native `num_of` coercion for byte-identity.
+      // null-safe. A STRING index on a record/map is field access; a non-string
+      // index / non-integer list index → null. `numOf` mirrors native `num_of`.
       const baseF = compileExpr(expr.base);
       const idxF = compileExpr(expr.index);
 
       return (env) => {
         const base = baseF(env);
-        const i = numOf(idxF(env));
+        const idx = idxF(env);
+
+        if (base instanceof LenkeRecord) {
+          return typeof idx === 'string' ? recordGet(base, idx) : null;
+        }
+
+        const i = numOf(idx);
 
         if (
           !Array.isArray(base) ||
@@ -1515,13 +1587,17 @@ const compileExpr = (expr: Expr): CompiledExpr => {
       };
     }
     case 'field': {
-      // Property access chained off any expression (`edges(p)[0].amount`).
-      // `propOf` reads a node/edge's stored property; anything else → null, exactly
-      // like the bare `prop` path.
+      // `.field` chained off any expression. A record/map base reads the field by
+      // name; a node/edge base reads its stored property via `propOf`; anything
+      // else → null, exactly like the bare `prop` path.
       const baseF = compileExpr(expr.base);
       const { key } = expr;
 
-      return (env) => propOf(baseF(env), key);
+      return (env) => {
+        const base = baseF(env);
+
+        return base instanceof LenkeRecord ? recordGet(base, key) : propOf(base, key);
+      };
     }
     case 'func':
       return compileFunc(expr);
@@ -2300,6 +2376,12 @@ export const freePredicateVars = (expr: Expr): Set<string> => {
     walk(e.body, inner);
   };
 
+  const walkAll = (exprs: Iterable<Expr>, bound: ReadonlySet<string>): void => {
+    for (const x of exprs) {
+      walk(x, bound);
+    }
+  };
+
   const walk = (e: Expr, bound: ReadonlySet<string>): void => {
     switch (e.kind) {
       case 'var':
@@ -2354,14 +2436,19 @@ export const freePredicateVars = (expr: Expr): Set<string> => {
       case 'and':
       case 'or':
       case 'xor':
-        for (const el of e.items) {
-          walk(el, bound);
-        }
+        walkAll(e.items, bound);
 
         return;
       case 'in':
         walk(e.expr, bound);
         walk(e.list, bound);
+
+        return;
+      case 'record':
+        walkAll(
+          e.fields.map((f) => f.value),
+          bound,
+        );
 
         return;
       case 'case':
@@ -2370,9 +2457,7 @@ export const freePredicateVars = (expr: Expr): Set<string> => {
         return;
       case 'func':
       case 'graphPred':
-        for (const a of e.args) {
-          walk(a, bound);
-        }
+        walkAll(e.args, bound);
 
         return;
       case 'exists':
@@ -2475,6 +2560,35 @@ const compareValues = (a: unknown, b: unknown): number => {
     }
 
     return a.length > b.length ? 1 : 0;
+  }
+
+  // Records: keys are canonical (sorted), so compare field-by-field (key then
+  // value), shorter-is-less — a total order for ORDER BY/DISTINCT even though ISO
+  // defines no relational `<`/`>` on records. Mirrors the Rust `cmp_total`.
+  if (a instanceof LenkeRecord && b instanceof LenkeRecord) {
+    const ae = [...a];
+    const be = [...b];
+    const n = Math.min(ae.length, be.length);
+
+    for (let i = 0; i < n; i++) {
+      const kc = cmpKey(ae[i][0], be[i][0]);
+
+      if (kc !== 0) {
+        return kc;
+      }
+
+      const vc = compareValues(ae[i][1], be[i][1]);
+
+      if (vc !== 0) {
+        return vc;
+      }
+    }
+
+    if (ae.length < be.length) {
+      return -1;
+    }
+
+    return ae.length > be.length ? 1 : 0;
   }
 
   const x = a as number | string;
