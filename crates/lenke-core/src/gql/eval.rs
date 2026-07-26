@@ -1237,6 +1237,43 @@ fn val_to_value(graph: &Graph, v: &Val) -> Value {
 /// ISO: an absent property — or a property of a non-element/NULL — yields NULL.
 /// Vertices and edges read from the same columnar store; `key_ref`'s id was
 /// resolved once at execute time (no per-access name lookup).
+/// Trim `s` from the chosen ends. `chars = Some(set)` strips any code point in
+/// that set; `None` strips Unicode whitespace (matching `str::trim*`). Code-point
+/// based (`chars()` / TS `[...s]`) so it's byte-identical across engines.
+fn multi_trim(s: &str, chars: Option<&str>, leading: bool, trailing: bool) -> String {
+    let cps: Vec<char> = s.chars().collect();
+    let hit = |ch: char| match chars {
+        Some(set) => set.chars().any(|c| c == ch),
+        None => ch.is_whitespace(),
+    };
+    let mut lo = 0;
+    let mut hi = cps.len();
+    if leading {
+        while lo < hi && hit(cps[lo]) {
+            lo += 1;
+        }
+    }
+    if trailing {
+        while hi > lo && hit(cps[hi - 1]) {
+            hi -= 1;
+        }
+    }
+    cps[lo..hi].iter().collect()
+}
+
+/// The `trim`/`ltrim`/`rtrim`/`btrim` scalar arm: null in → null out; an optional
+/// 2nd arg is the character set to strip (else whitespace).
+fn trim_arm(a: Option<&Val>, b: Option<&Val>, graph: &Graph, leading: bool, trailing: bool) -> Val {
+    match a {
+        Some(v) if !is_nullish(v) => {
+            let s = js_str(graph, v);
+            let chars = b.filter(|c| !is_nullish(c)).map(|c| js_str(graph, c));
+            vstr(multi_trim(&s, chars.as_deref(), leading, trailing))
+        }
+        _ => Val::Null,
+    }
+}
+
 /// The graph-element predicates. All are three-valued: a null operand — or a
 /// type mismatch (a non-edge for `DIRECTED`, a non-node/edge for `SOURCE OF`) —
 /// yields NULL rather than a definite bool. `SOURCE/DESTINATION OF` reads the
@@ -2136,9 +2173,12 @@ fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]) -> Val {
         },
         Upper => us(|s| vstr(s.to_uppercase())),
         Lower => us(|s| vstr(s.to_lowercase())),
-        Trim => us(|s| vstr(s.trim())),
-        Ltrim => us(|s| vstr(s.trim_start())),
-        Rtrim => us(|s| vstr(s.trim_end())),
+        // `trim`/`btrim` (both ends), `ltrim` (leading), `rtrim` (trailing). The
+        // optional 2nd arg is a SET of characters to strip; absent → whitespace
+        // (byte-identical to `str::trim*`, which is `char::is_whitespace`).
+        Trim => trim_arm(a, b, graph, true, true),
+        Ltrim => trim_arm(a, b, graph, true, false),
+        Rtrim => trim_arm(a, b, graph, false, true),
         // String length/slicing count UTF-16 code units, matching JS `.length`
         // (the TS engine) — NOT Unicode code points. So `size('😀')` == 2, and
         // `left`/`right` slice on the same unit as JS `String.slice`.

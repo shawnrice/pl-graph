@@ -341,6 +341,19 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(tsN).toBe(natN);
   });
 
+  test('trim family (2-arg char set) + TRIM(… FROM …) — byte-identical', () => {
+    const [ts, native] = both(
+      `RETURN btrim('xxhixx','x') AS a, ltrim('xxhixx','x') AS b, rtrim('xxhixx','x') AS c, ` +
+        `btrim('xyxhixyx','xy') AS d, trim('  hi  ') AS e, ` +
+        `TRIM(LEADING 'x' FROM 'xxhi') AS f, TRIM('x' FROM 'xxhixx') AS g, ` +
+        `TRIM(TRAILING FROM 'hi  ') AS h`,
+    );
+
+    expect(ts).toBe(native);
+    expect(ts).toContain('"a":"hi"');
+    expect(ts).toContain('"b":"hixx"');
+  });
+
   test('list[i].prop — property access chains off a subscript, byte-identical', () => {
     const base = `MATCH p = ANY SHORTEST (a)-[]->*(b) WHERE a.name = 'marko' AND b.name = 'lop'`;
     // edges(p)[0].weight, nodes(p)[i].name, and out-of-range → null all

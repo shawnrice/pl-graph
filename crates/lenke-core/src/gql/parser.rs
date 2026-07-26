@@ -1313,6 +1313,48 @@ impl Parser {
         Ok((args, distinct, star))
     }
 
+    /// `TRIM([[LEADING|TRAILING|BOTH] [char] FROM] src)` — the SQL trim form.
+    /// Desugars to `ltrim`/`rtrim`/`trim` (BOTH), each taking the optional trim
+    /// character set. The leading `trim` ident is consumed; current token is `(`.
+    fn parse_trim(&mut self) -> R<Expr> {
+        self.expect(Tt::LParen, "'(' after TRIM")?;
+        let soft = |p: &mut Self, w: &str| p.check_kw(w) || p.check_soft(w);
+        let fn_name = if soft(self, "leading") {
+            self.advance();
+            "ltrim"
+        } else if soft(self, "trailing") {
+            self.advance();
+            "rtrim"
+        } else if soft(self, "both") {
+            self.advance();
+            "trim"
+        } else {
+            "trim" // BOTH is the default
+        };
+        // `[ [char] FROM ] src`.
+        let (src, char_arg) = if soft(self, "from") {
+            self.advance();
+            (self.parse_expr()?, None)
+        } else {
+            let e1 = self.parse_expr()?;
+            if soft(self, "from") {
+                self.advance();
+                (self.parse_expr()?, Some(e1)) // e1 was the trim character
+            } else {
+                (e1, None) // simple `TRIM(src)`
+            }
+        };
+        self.expect(Tt::RParen, "')' to close TRIM")?;
+        let mut args = vec![src];
+        args.extend(char_arg);
+        Ok(Expr::Func {
+            name: fn_name.to_string(),
+            args,
+            distinct: false,
+            star: false,
+        })
+    }
+
     /// `ALL_DIFFERENT(a, b, …)` / `SAME(a, b, …)` — parse the ≥2-element operand
     /// list (the leading name is consumed; the current token is `(`).
     fn parse_element_identity(&mut self, kind: GraphPredKind) -> R<Expr> {
@@ -1624,6 +1666,11 @@ impl Parser {
                     }
                     if !t.delimited && t.value.eq_ignore_ascii_case("same") {
                         return self.parse_element_identity(GraphPredKind::Same);
+                    }
+                    // `TRIM([[spec] [char] FROM] src)` — the SQL trim form; desugars
+                    // to trim/ltrim/rtrim (the comma-char forms use btrim/ltrim/rtrim).
+                    if !t.delimited && t.value.eq_ignore_ascii_case("trim") {
+                        return self.parse_trim();
                     }
                     let (args, distinct, star) = self.parse_call_args()?;
                     return Ok(Expr::Func {

@@ -62,7 +62,6 @@ Ordered roughly cheap→involved.
 
 | Gap                                                               | Notes                                                                                                                                                                 |
 | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TRIM(LEADING\|TRAILING\|BOTH … FROM …)`                          | The SQL trim-spec form; simple `trim()` works.                                                                                                                        |
 | Explicit `GROUP BY` / `HAVING` clauses                            | lenke groups **implicitly** (Cypher-style). Adding the explicit clauses is a parser+planner change; lower value since implicit grouping already covers the use cases. |
 | Multi-`MATCH` `EXISTS { … }` (GQ22)                               | Single-`MATCH` `EXISTS` works.                                                                                                                                        |
 | Map / record values (GV45)                                        | No first-class map value; larger (touches the value model).                                                                                                           |
@@ -145,7 +144,7 @@ char_length/character_length, `||`, left/lower/right/trim/upper).
 | GF02 | Trigonometric functions            |  ✅   |                                                                                                                                                                     |
 | GF03 | Logarithmic functions              |  ✅   |                                                                                                                                                                     |
 | GF04 | Enhanced path functions            |  ✅   | `path_length`, `nodes`, `edges`, `elements`.                                                                                                                        |
-| GF05 | Multi-character trim functions     |  ✅   | `ltrim`/`rtrim`/`btrim`.                                                                                                                                            |
+| GF05 | Multi-character trim functions     |  ✅   | `ltrim`/`rtrim`/`btrim`, incl. the 2-arg character-set form (`btrim('xxhi','x')`→`hi`) — previously silently ignored the char arg.                                  |
 | GF06 | Explicit `TRIM` function           |  ✅   |                                                                                                                                                                     |
 | GF07 | Temporal duration functions        |  ✅   | `duration_between`.                                                                                                                                                 |
 | GF10 | Advanced aggregates: general set   |  ✅   | `stddev_pop`/`stddev_samp`.                                                                                                                                         |
@@ -277,7 +276,7 @@ productions and probed against the engine.
 | `ceil`/`ceiling`                                   |  ✅   | Synonyms.                                                          |
 | `upper`/`lower` (fold), `left`/`right` (substring) |  ✅   |                                                                    |
 | `trim(x)` / `btrim`/`ltrim`/`rtrim`                |  ✅   |                                                                    |
-| `TRIM(LEADING\|TRAILING\|BOTH … FROM x)`           |  ❌   | The SQL trim-specification form; simple `trim()` works.            |
+| `TRIM(LEADING\|TRAILING\|BOTH … FROM x)`           |  ✅   | SQL trim-specification form; desugars to trim/ltrim/rtrim.         |
 | `normalize(x)`                                     |  ❌   | **Mandatory-feature gap** (part of `<character string function>`). |
 
 ### Clauses & projection
@@ -316,8 +315,8 @@ majority — read / pattern-matching / path-search / function / composition,
 predicates, `CASE`/`COALESCE`/`NULLIF`, `OPTIONAL MATCH`, `DISTINCT`, `ORDER BY …
 NULLS FIRST/LAST`, `DETACH DELETE`, the full scalar/aggregate function set. The
 genuine gaps found (deep grammar walk): explicit **`GROUP BY`** and **`HAVING`**
-clauses (lenke groups implicitly, Cypher-style), the **`TRIM(… FROM …)`** spec
-form, `IS NORMALIZED` (declined — see Tier 1), multi-`MATCH` `EXISTS` (GQ22),
+clauses (lenke groups implicitly, Cypher-style), `IS NORMALIZED` (declined — see
+Tier 1), multi-`MATCH` `EXISTS` (GQ22),
 map/record
 values (GV45), parenthesized-subpath `WHERE` (G050), the `DIFFERENT
 EDGES`/`REPEATABLE ELEMENTS` match modes (G002/G003), inline `LET…IN…END` /

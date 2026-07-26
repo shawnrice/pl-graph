@@ -6488,3 +6488,46 @@ fn property_keys_and_values_are_case_sensitive() {
         vec![vec![n(1.0)]]
     );
 }
+
+#[test]
+fn trim_char_set_two_arg() {
+    let mut g = ndjson::decode("").unwrap();
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN btrim('xxhixx','x') AS b, ltrim('xxhixx','x') AS l, rtrim('xxhixx','x') AS r"
+        ),
+        vec![vec![s("hi"), s("hixx"), s("xxhi")]]
+    );
+    // multi-char set + whitespace default still works.
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN btrim('xyxhixyx','xy') AS a, trim('  hi  ') AS b, ltrim('  hi') AS c"
+        ),
+        vec![vec![s("hi"), s("hi"), s("hi")]]
+    );
+}
+
+#[test]
+fn trim_sql_spec_form() {
+    let mut g = ndjson::decode("").unwrap();
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN TRIM('  hi  ') AS a, TRIM(BOTH FROM '  hi  ') AS b, \
+             TRIM(LEADING FROM '  hi') AS c, TRIM(TRAILING FROM 'hi  ') AS d, \
+             TRIM(LEADING 'x' FROM 'xxhi') AS e, TRIM('x' FROM 'xxhixx') AS f, \
+             TRIM(TRAILING 'x' FROM 'hixx') AS gg",
+        ),
+        vec![vec![
+            s("hi"),
+            s("hi"),
+            s("hi"),
+            s("hi"),
+            s("hi"),
+            s("hi"),
+            s("hi"),
+        ]]
+    );
+}

@@ -580,12 +580,52 @@ const mathSign = (x: number): number => {
 const UNARY_STR: Record<string, (s: string) => unknown> = {
   upper: (s) => s.toUpperCase(),
   lower: (s) => s.toLowerCase(),
-  trim: (s) => s.trim(),
-  btrim: (s) => s.trim(),
-  ltrim: (s) => s.replace(/^\s+/, ''),
-  rtrim: (s) => s.replace(/\s+$/, ''),
   char_length: (s) => s.length,
   character_length: (s) => s.length,
+};
+
+// `trim`/`btrim` (both ends), `ltrim` (leading), `rtrim` (trailing). With a 2nd
+// arg — a SET of characters to strip — they trim those code points (mirrors the
+// Rust `multi_trim`); without one they strip whitespace (the existing JS
+// behavior, kept as-is for byte-identity on the whitespace path).
+const multiTrim = (s: string, chars: string, leading: boolean, trailing: boolean): string => {
+  // Code-point iteration (matches the Rust `chars()`), so the trim is
+  // byte-identical across engines for the character-set case.
+  const set = new Set(Array.from(chars));
+  const cps = Array.from(s);
+  let lo = 0;
+  let hi = cps.length;
+
+  while (leading && lo < hi && set.has(cps[lo])) {
+    lo++;
+  }
+
+  while (trailing && hi > lo && set.has(cps[hi - 1])) {
+    hi--;
+  }
+
+  return cps.slice(lo, hi).join('');
+};
+
+const TRIM_FNS = new Set(['trim', 'btrim', 'ltrim', 'rtrim']);
+
+const callTrim = (name: string, a: unknown, b: unknown): unknown => {
+  if (isNullish(a)) {
+    return null;
+  }
+
+  const s = str(a);
+
+  if (isNullish(b)) {
+    // whitespace default — unchanged JS behavior.
+    if (name === 'ltrim') {
+      return s.replace(/^\s+/, '');
+    }
+
+    return name === 'rtrim' ? s.replace(/\s+$/, '') : s.trim();
+  }
+
+  return multiTrim(s, str(b), name !== 'rtrim', name !== 'ltrim');
 };
 
 /** ISO binary numeric value functions: LOG takes (base, value). */
@@ -678,6 +718,10 @@ const callScalar = (name: string, args: readonly unknown[]): unknown => {
 
   if (name in NUM_CONSTANTS) {
     return NUM_CONSTANTS[name];
+  }
+
+  if (TRIM_FNS.has(name)) {
+    return callTrim(name, a, b);
   }
 
   switch (name) {

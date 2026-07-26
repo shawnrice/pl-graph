@@ -1441,9 +1441,56 @@ export const parse = (
     }
   };
 
+  // `TRIM([[LEADING|TRAILING|BOTH] [char] FROM] src)` — the SQL trim form;
+  // desugars to trim/ltrim/rtrim (each takes the optional trim character set).
+  const parseTrim = (): Expr => {
+    expect('lparen', "'(' after TRIM");
+    const softKw = (w: string): boolean =>
+      (check('keyword') || check('ident')) && peek().value.toLowerCase() === w;
+    let name = 'trim';
+
+    if (softKw('leading')) {
+      advance();
+      name = 'ltrim';
+    } else if (softKw('trailing')) {
+      advance();
+      name = 'rtrim';
+    } else if (softKw('both')) {
+      advance();
+    }
+
+    let source: Expr;
+    let charArg: Expr | null = null;
+
+    if (softKw('from')) {
+      advance();
+      source = parseExpr();
+    } else {
+      const e1 = parseExpr();
+
+      if (softKw('from')) {
+        advance();
+        charArg = e1;
+        source = parseExpr();
+      } else {
+        source = e1;
+      }
+    }
+
+    expect('rparen', "')' to close TRIM");
+
+    return {
+      kind: 'func',
+      name,
+      args: charArg ? [source, charArg] : [source],
+      distinct: false,
+      star: false,
+    };
+  };
+
   // An ident followed by `(`: a function call or one of the keyword-shaped
-  // special forms (`CAST`, `PROPERTY_EXISTS`, `ALL_DIFFERENT`/`SAME`). Extracted
-  // from `parsePrimary` to keep that dispatcher under the complexity budget.
+  // special forms (`CAST`, `PROPERTY_EXISTS`, `ALL_DIFFERENT`/`SAME`, `TRIM`).
+  // Extracted from `parsePrimary` to keep that dispatcher under the complexity budget.
   const parseCallOrSpecial = (t: ReturnType<typeof peek>): Expr => {
     if (!t.delimited && t.value.toLowerCase() === 'cast') {
       return parseCast();
@@ -1474,6 +1521,10 @@ export const parse = (
         args,
         negated: false,
       };
+    }
+
+    if (!t.delimited && t.value.toLowerCase() === 'trim') {
+      return parseTrim();
     }
 
     return { kind: 'func', name: t.value.toLowerCase(), ...parseCallArgs() };
