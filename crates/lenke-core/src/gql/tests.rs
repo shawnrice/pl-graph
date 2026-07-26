@@ -6776,6 +6776,154 @@ fn let_in_binding_suppresses_bare_in_operator() {
     );
 }
 
+/// Fixture for subpath-WHERE tests: three KNOWS edges with ages + weights.
+///   alice(30) -w0.9-> bob(25)     (older → younger)
+///   carol(20) -w0.3-> dave(40)    (younger → older)
+///   erin(35)  -w0.7-> frank(35)   (equal ages)
+fn ages_graph() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"alice","labels":["Person"],"properties":{"id":"alice","name":"Alice","age":30}}"#,
+        r#"{"type":"node","id":"bob","labels":["Person"],"properties":{"id":"bob","name":"Bob","age":25}}"#,
+        r#"{"type":"node","id":"carol","labels":["Person"],"properties":{"id":"carol","name":"Carol","age":20}}"#,
+        r#"{"type":"node","id":"dave","labels":["Person"],"properties":{"id":"dave","name":"Dave","age":40}}"#,
+        r#"{"type":"node","id":"erin","labels":["Person"],"properties":{"id":"erin","name":"Erin","age":35}}"#,
+        r#"{"type":"node","id":"frank","labels":["Person"],"properties":{"id":"frank","name":"Frank","age":35}}"#,
+        r#"{"type":"edge","id":"k1","from":"alice","to":"bob","labels":["KNOWS"],"properties":{"weight":0.9}}"#,
+        r#"{"type":"edge","id":"k2","from":"carol","to":"dave","labels":["KNOWS"],"properties":{"weight":0.3}}"#,
+        r#"{"type":"edge","id":"k3","from":"erin","to":"frank","labels":["KNOWS"],"properties":{"weight":0.7}}"#,
+    ])
+}
+
+#[test]
+fn subpath_where_filters_across_elements() {
+    // ISO parenthesized-subpath WHERE: the predicate spans both endpoints and is
+    // part of the pattern. Only carol(20)→dave(40) has age(x) < age(y).
+    let mut g = ages_graph();
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH ((x:Person)-[:KNOWS]->(y:Person) WHERE x.age < y.age) RETURN x.name AS n",
+        ),
+        vec![vec![s("Carol")]]
+    );
+    // Referencing the edge inside the subpath WHERE: weight > 0.5 → alice, erin.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH ((x:Person)-[e:KNOWS]->(y:Person) WHERE e.weight > 0.5) \
+             RETURN x.name AS n ORDER BY n",
+        ),
+        vec![vec![s("Alice")], vec![s("Erin")]]
+    );
+}
+
+#[test]
+fn subpath_where_equals_clause_where_when_unquantified() {
+    // For a single non-quantified pattern, a subpath WHERE and a clause WHERE are
+    // semantically identical — same rows, proving we didn't misinterpret either.
+    let mut g = ages_graph();
+    let subpath = rows(
+        &mut g,
+        "MATCH ((x:Person)-[:KNOWS]->(y:Person) WHERE x.age < y.age) RETURN x.name AS n ORDER BY n",
+    );
+    let clause = rows(
+        &mut g,
+        "MATCH (x:Person)-[:KNOWS]->(y:Person) WHERE x.age < y.age RETURN x.name AS n ORDER BY n",
+    );
+    assert_eq!(subpath, clause);
+    assert_eq!(subpath, vec![vec![s("Carol")]]);
+}
+
+#[test]
+fn subpath_where_and_clause_where_compose() {
+    // Both a subpath WHERE (inside the parens) AND a trailing clause WHERE — they
+    // are distinct and AND together. Subpath: x.age < y.age (→ carol→dave); then
+    // clause: y.name = 'Dave' (still carol). Flipping the clause to a non-match
+    // (y.name = 'Bob') yields nothing, proving the clause WHERE is really applied.
+    let mut g = ages_graph();
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH ((x:Person)-[:KNOWS]->(y:Person) WHERE x.age < y.age) WHERE y.name = 'Dave' \
+             RETURN x.name AS n",
+        ),
+        vec![vec![s("Carol")]]
+    );
+    assert!(rows(
+        &mut g,
+        "MATCH ((x:Person)-[:KNOWS]->(y:Person) WHERE x.age < y.age) WHERE y.name = 'Bob' \
+             RETURN x.name AS n",
+    )
+    .is_empty());
+}
+
+#[test]
+fn regular_clause_where_still_works_alongside_subpath() {
+    // A plain clause WHERE (no subpath parens) is unaffected — it filters rows and
+    // sees every pattern variable, exactly as before.
+    let mut g = ages_graph();
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (x:Person)-[:KNOWS]->(y:Person) WHERE x.age > y.age RETURN x.name AS n",
+        ),
+        vec![vec![s("Alice")]]
+    );
+    // Inline element WHERE (per-node) also still works.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (x:Person WHERE x.age >= 40) RETURN x.name AS n",
+        ),
+        vec![vec![s("Dave")]]
+    );
+}
+
+#[test]
+fn subpath_where_single_node() {
+    // A single-node subpath: `((x:Person) WHERE p)` attaches the WHERE to the start
+    // node. Ages ≥ 35 → dave(40), erin(35), frank(35).
+    let mut g = ages_graph();
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH ((x:Person) WHERE x.age >= 35) RETURN x.name AS n ORDER BY n",
+        ),
+        vec![vec![s("Dave")], vec![s("Erin")], vec![s("Frank")]]
+    );
+}
+
+#[test]
+fn subpath_quantifier_and_pathvar_rejected() {
+    // A quantifier on a whole subpath (per-iteration predicate on a var-length
+    // path) is not yet supported — reject loudly, never silently mishandle.
+    assert!(parse("MATCH ((x)-[:KNOWS]->(y) WHERE x.age < y.age)+ RETURN x").is_err());
+    // A path variable on a subpath is likewise rejected for now.
+    assert!(parse("MATCH p = ((x)-[:KNOWS]->(y) WHERE x.age < y.age) RETURN p").is_err());
+}
+
+#[test]
+fn subpath_where_referencing_only_start_or_end() {
+    // The subpath WHERE may reference any subset of the subpath's variables.
+    let mut g = ages_graph();
+    // Only the start: x.age < 30 → carol(20).
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH ((x:Person)-[:KNOWS]->(y:Person) WHERE x.age < 30) RETURN x.name AS n",
+        ),
+        vec![vec![s("Carol")]]
+    );
+    // Only the end: y.age < 30 → bob's predecessor alice.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH ((x:Person)-[:KNOWS]->(y:Person) WHERE y.age < 30) RETURN x.name AS n",
+        ),
+        vec![vec![s("Alice")]]
+    );
+}
+
 #[test]
 fn match_mode_repeatable_vs_different_edges() {
     // 2-cycle a<->b. Under DIFFERENT EDGES (= default TRAIL) a 3-hop walk can't

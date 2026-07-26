@@ -66,7 +66,6 @@ Ordered roughly cheap→involved.
 | `SELECT` statement (+ its `WHERE`/`HAVING`)                       | ISO GQL has a SQL-like `SELECT … WHERE … GROUP BY … HAVING …` query form alongside `MATCH`/`RETURN`. lenke implements the linear form only. Large (a parallel query syntax). |
 | Multi-`MATCH` `EXISTS { … }` (GQ22)                               | Single-`MATCH` `EXISTS` works.                                                                                                                                               |
 | Map / record values (GV45)                                        | No first-class map value; larger (touches the value model).                                                                                                                  |
-| Parenthesized-subpath `WHERE` (G050/G051)                         | Per-_edge_ `WHERE` works; per-subpath doesn't.                                                                                                                               |
 | `DIFFERENT EDGES` / `REPEATABLE ELEMENTS` match modes (G002/G003) | Graph-pattern match modes (distinct from the path modes, which work).                                                                                                        |
 
 ### Tier 3 — Excluded by design (NOT gaps to close)
@@ -113,28 +112,28 @@ char_length/character_length, `||`, left/lower/right/trim/upper).
 
 ### Paths, patterns & path search
 
-| ID   | Feature                                     | lenke | Notes                                                                              |
-| ---- | ------------------------------------------- | :---: | ---------------------------------------------------------------------------------- |
-| G004 | Path variables (`p = …`)                    |  ✅   | Bound `Path` value, both engines byte-identical.                                   |
-| G005 | Path search prefix                          |  ✅   |                                                                                    |
-| G010 | Explicit `WALK`                             |  ✅   |                                                                                    |
-| G011 | Path mode `TRAIL`                           |  ✅   | lenke default.                                                                     |
-| G013 | Path mode `ACYCLIC`                         |  ✅   | `SIMPLE` also supported.                                                           |
-| G016 | Any path search (`ANY`)                     |  ✅   |                                                                                    |
-| G017 | All shortest (`ALL SHORTEST`)               |  ✅   |                                                                                    |
-| G018 | Any shortest (`ANY SHORTEST`)               |  ✅   |                                                                                    |
-| G019 | Counted shortest (`SHORTEST k`)             |  ✅   |                                                                                    |
-| G020 | Counted shortest group (`SHORTEST k GROUP`) |  ✅   |                                                                                    |
-| G035 | Quantified paths (`{n,m}`)                  |  ✅   |                                                                                    |
-| G036 | Quantified edges                            |  ✅   |                                                                                    |
-| G043 | Complete full edge patterns                 |  ✅   | `-[e:R WHERE …]->` per-hop predicate supported.                                    |
-| G060 | Bounded graph pattern quantifier            |  ✅   |                                                                                    |
-| G061 | Unbounded graph pattern quantifier          |  ✅   | `*` / `+`.                                                                         |
-| G074 | Label expressions: wildcard label           |  ✅   | `(:%)`.                                                                            |
-| G002 | Different-edges match mode                  |  ❌   | `MATCH DIFFERENT EDGES …` rejected.                                                |
-| G003 | Explicit `REPEATABLE ELEMENTS`              |  ❌   | Rejected.                                                                          |
-| G050 | Parenthesized path pattern `WHERE`          |  ❌   | `((a)-->(b) WHERE …)` rejected (per-_edge_ `WHERE` works; per-_subpath_ does not). |
-| G051 | Parenthesized path non-local predicate      |  ❓   | Not separately verified; expected ❌ alongside G050.                               |
+| ID   | Feature                                     | lenke | Notes                                                                                                                                                                                                 |
+| ---- | ------------------------------------------- | :---: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| G004 | Path variables (`p = …`)                    |  ✅   | Bound `Path` value, both engines byte-identical.                                                                                                                                                      |
+| G005 | Path search prefix                          |  ✅   |                                                                                                                                                                                                       |
+| G010 | Explicit `WALK`                             |  ✅   |                                                                                                                                                                                                       |
+| G011 | Path mode `TRAIL`                           |  ✅   | lenke default.                                                                                                                                                                                        |
+| G013 | Path mode `ACYCLIC`                         |  ✅   | `SIMPLE` also supported.                                                                                                                                                                              |
+| G016 | Any path search (`ANY`)                     |  ✅   |                                                                                                                                                                                                       |
+| G017 | All shortest (`ALL SHORTEST`)               |  ✅   |                                                                                                                                                                                                       |
+| G018 | Any shortest (`ANY SHORTEST`)               |  ✅   |                                                                                                                                                                                                       |
+| G019 | Counted shortest (`SHORTEST k`)             |  ✅   |                                                                                                                                                                                                       |
+| G020 | Counted shortest group (`SHORTEST k GROUP`) |  ✅   |                                                                                                                                                                                                       |
+| G035 | Quantified paths (`{n,m}`)                  |  ✅   |                                                                                                                                                                                                       |
+| G036 | Quantified edges                            |  ✅   |                                                                                                                                                                                                       |
+| G043 | Complete full edge patterns                 |  ✅   | `-[e:R WHERE …]->` per-hop predicate supported.                                                                                                                                                       |
+| G060 | Bounded graph pattern quantifier            |  ✅   |                                                                                                                                                                                                       |
+| G061 | Unbounded graph pattern quantifier          |  ✅   | `*` / `+`.                                                                                                                                                                                            |
+| G074 | Label expressions: wildcard label           |  ✅   | `(:%)`.                                                                                                                                                                                               |
+| G002 | Different-edges match mode                  |  ❌   | `MATCH DIFFERENT EDGES …` rejected.                                                                                                                                                                   |
+| G003 | Explicit `REPEATABLE ELEMENTS`              |  ❌   | Rejected.                                                                                                                                                                                             |
+| G050 | Parenthesized path pattern `WHERE`          |  ✅   | `((a)-[e]->(b) WHERE a.age < b.age)` — subpath WHERE spanning both endpoints; distinct from the clause WHERE, composes with it. Quantified subpath (`( … )+`) + subpath variable deferred (rejected). |
+| G051 | Parenthesized path non-local predicate      |  ✅   | Non-local (multi-element) predicate inside the subpath — covered by the same parenthesized-subpath WHERE.                                                                                             |
 
 ### Built-in functions
 
@@ -318,7 +317,7 @@ genuine gaps found (deep grammar walk): **`HAVING`** (ISO, but on the `SELECT`
 statement lenke lacks — not `RETURN`), `IS NORMALIZED` (declined — see
 Tier 1), multi-`MATCH` `EXISTS` (GQ22),
 map/record
-values (GV45), parenthesized-subpath `WHERE` (G050), the `DIFFERENT
+values (GV45), the `DIFFERENT
 EDGES`/`REPEATABLE ELEMENTS` match modes (G002/G003), and — by design —
 multi-graph `USE` (GQ01) and
 `INT64` (GV12). The remaining **mandatory** gap is the deliberately-declined

@@ -60,6 +60,21 @@ fn type_test_category(type_name: &str) -> Option<&'static str> {
     })
 }
 
+/// AND a parenthesized-subpath `WHERE` into the last element the subpath binds —
+/// the final segment's node, or the start node when the subpath is a single node.
+/// That element binds last, so its inline `WHERE` sees every variable in the
+/// subpath; evaluating there is exact for a non-quantified subpath.
+fn attach_subpath_where(pat: &mut PathPattern, cond: Expr) {
+    let target = match pat.segments.last_mut() {
+        Some(seg) => &mut seg.node.where_,
+        None => &mut pat.start.where_,
+    };
+    *target = Some(match target.take() {
+        Some(existing) => Expr::And(vec![existing, cond]),
+        None => cond,
+    });
+}
+
 /// The single, consistent reserved-word rejection used in every binding
 /// position. `what` names the role (a label name, a variable, …). The message
 /// names backticks explicitly and echoes the user's ORIGINAL casing in both the
@@ -630,6 +645,39 @@ impl Parser {
             } else {
                 None
             };
+
+            // ISO `<parenthesized path pattern expression>`: `( <path> [WHERE
+            // cond] )` — a subpath grouping whose WHERE is scoped to (and applied
+            // as part of) the subpath. Detected by a paren that immediately opens
+            // another paren: a node pattern never nests a `(`, so `((` can only
+            // begin a subpath. The inner WHERE is a *pattern* predicate, distinct
+            // from the clause-level `WHERE` that follows the whole MATCH.
+            if p.check(Tt::LParen) && p.peek2().tt == Tt::LParen {
+                if path_var.is_some() {
+                    return err(
+                        "a path variable on a parenthesized subpath (`p = ( … )`) is not yet supported",
+                        sel_pos,
+                    );
+                }
+                p.advance(); // outer '('
+                let mut inner = p.parse_path_pattern()?;
+                if p.check_kw("where") {
+                    p.advance();
+                    let cond = p.parse_expr()?;
+                    attach_subpath_where(&mut inner, cond);
+                }
+                p.expect(Tt::RParen, "')' to close a parenthesized subpath")?;
+                // A quantifier on the whole subpath (`( … )+`) would make the WHERE
+                // a per-iteration predicate on a variable-length path — a different
+                // matcher. Reject loudly rather than silently mishandle it.
+                if p.check(Tt::Star) || p.check(Tt::Plus) || p.check(Tt::LBrace) {
+                    return err(
+                        "a quantifier on a parenthesized subpath (`( … )+`) is not yet supported",
+                        p.peek().pos,
+                    );
+                }
+                return Ok(inner);
+            }
 
             // Optional path selector (`ANY SHORTEST`) then optional mode (`TRAIL`).
             let selector = p.parse_path_selector()?;

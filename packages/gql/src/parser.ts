@@ -235,6 +235,16 @@ const reservedError = (tok: Token, what: string): never => {
   );
 };
 
+// AND a parenthesized-subpath `WHERE` into the last element the subpath binds —
+// the final segment's node, or the start node when the subpath is a single node.
+// That element binds last, so its inline `WHERE` sees every variable in the
+// subpath; evaluating there is exact for a non-quantified subpath.
+const attachSubpathWhere = (pat: PathPattern, cond: Expr): void => {
+  const target = pat.segments.at(-1)?.node ?? pat.start;
+
+  target.where = target.where ? { kind: 'and', items: [target.where, cond] } : cond;
+};
+
 // eslint-disable-next-line max-statements -- recursive-descent parser: the body is a suite of stateful closures over the token cursor; splitting them would only thread that state through parameters
 export const parse = (
   src: string,
@@ -717,6 +727,43 @@ export const parse = (
       if (check('ident') && tokens[pos + 1]?.type === 'eq') {
         pathVar = advance().value;
         advance(); // '='
+      }
+
+      // ISO `<parenthesized path pattern expression>`: `( <path> [WHERE cond] )` —
+      // a subpath grouping whose WHERE is scoped to (and applied as part of) the
+      // subpath. Detected by a paren that immediately opens another paren: a node
+      // pattern never nests a `(`, so `((` can only begin a subpath. The inner
+      // WHERE is a *pattern* predicate, distinct from the clause-level `WHERE`
+      // that follows the whole MATCH.
+      if (check('lparen') && tokens[pos + 1]?.type === 'lparen') {
+        if (pathVar !== undefined) {
+          throw new GqlSyntaxError(
+            'a path variable on a parenthesized subpath (`p = ( … )`) is not yet supported',
+            selPos,
+          );
+        }
+
+        advance(); // outer '('
+        const inner = parsePathPattern();
+
+        if (checkKeyword('where')) {
+          advance();
+          attachSubpathWhere(inner, parseExpr());
+        }
+
+        expect('rparen', "')' to close a parenthesized subpath");
+
+        // A quantifier on the whole subpath (`( … )+`) would make the WHERE a
+        // per-iteration predicate on a variable-length path — a different matcher.
+        // Reject loudly rather than silently mishandle it.
+        if (check('star') || check('plus') || check('lbrace')) {
+          throw new GqlSyntaxError(
+            'a quantifier on a parenthesized subpath (`( … )+`) is not yet supported',
+            peek().pos,
+          );
+        }
+
+        return inner;
       }
 
       const selector = parsePathSelector();

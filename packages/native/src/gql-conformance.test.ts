@@ -204,6 +204,60 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(ts5).toBe(`[{"present":true}]`);
   });
 
+  test('parenthesized-subpath WHERE — ISO, byte-identical, distinct from clause WHERE', () => {
+    // MODERN: marko(29)→vadas(27), marko(29)→josh(32) (KNOWS); marko(29)→lop (CREATED).
+    // Subpath WHERE spanning both endpoints: KNOWS pairs where age(x) < age(y).
+    const [ts1, nat1] = both(
+      `MATCH ((x:Person)-[:KNOWS]->(y:Person) WHERE x.age < y.age) RETURN y.name AS n ORDER BY n`,
+    );
+    expect(ts1).toBe(nat1);
+    expect(ts1).toBe(`[{"n":"josh"}]`); // only marko(29)→josh(32)
+
+    // The SAME predicate as a clause WHERE yields the SAME rows (proves neither is
+    // misinterpreted for a single non-quantified pattern).
+    const [ts2, nat2] = both(
+      `MATCH (x:Person)-[:KNOWS]->(y:Person) WHERE x.age < y.age RETURN y.name AS n ORDER BY n`,
+    );
+    expect(ts2).toBe(nat2);
+    expect(ts2).toBe(ts1);
+
+    // A subpath WHERE AND a trailing clause WHERE compose (both applied, AND).
+    const [ts3, nat3] = both(
+      `MATCH ((x:Person)-[:KNOWS]->(y:Person) WHERE x.age < y.age) WHERE y.name = 'josh' RETURN x.name AS n`,
+    );
+    expect(ts3).toBe(nat3);
+    expect(ts3).toBe(`[{"n":"marko"}]`);
+
+    // Same subpath, a clause WHERE that excludes the row → empty (clause really runs).
+    const [ts4, nat4] = both(
+      `MATCH ((x:Person)-[:KNOWS]->(y:Person) WHERE x.age < y.age) WHERE y.name = 'vadas' RETURN x.name AS n`,
+    );
+    expect(ts4).toBe(nat4);
+    expect(ts4).toBe(`[]`);
+
+    // Subpath WHERE referencing the edge; single-node subpath.
+    const [ts5, nat5] = both(
+      `MATCH ((x:Person)-[e:KNOWS]->(y:Person) WHERE e.weight > 0.7) RETURN y.name AS n`,
+    );
+    expect(ts5).toBe(nat5);
+    expect(ts5).toBe(`[{"n":"josh"}]`); // marko→josh weight 1.0; marko→vadas 0.5
+    const [ts6, nat6] = both(
+      `MATCH ((n:Person) WHERE n.age >= 29) RETURN n.name AS nm ORDER BY nm`,
+    );
+    expect(ts6).toBe(nat6);
+    expect(ts6).toBe(`[{"nm":"josh"},{"nm":"marko"}]`);
+  });
+
+  test('a quantified / path-var subpath is rejected in BOTH engines', () => {
+    for (const q of [
+      `MATCH ((x:Person)-[:KNOWS]->(y:Person) WHERE x.age < y.age)+ RETURN x.name AS n`,
+      `MATCH p = ((x:Person)-[:KNOWS]->(y:Person)) RETURN x.name AS n`,
+    ]) {
+      expect(() => tsQuery(tsGraph, q)).toThrow();
+      expect(() => nativeGraph.query(q)).toThrow();
+    }
+  });
+
   test('list[i] — ISO GQL 0-based subscript, null-safe, byte-identical', () => {
     const cases: Array<[string, string]> = [
       // 0-based: [0] is the first element.
