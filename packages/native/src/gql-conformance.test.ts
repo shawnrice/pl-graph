@@ -375,6 +375,19 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(ts3).toBe(nat3);
   });
 
+  test('multi-MATCH EXISTS / COUNT { … } — byte-identical', () => {
+    for (const q of [
+      `RETURN EXISTS { MATCH (a:Person) MATCH (s:Software) } AS e`,
+      `RETURN EXISTS { MATCH (a:Person) WHERE a.name='marko' MATCH (s:Software) WHERE s.name='lop' } AS e`,
+      `RETURN EXISTS { MATCH (a:Person) MATCH (z:Nope) } AS e`,
+      `RETURN COUNT { MATCH (a:Person {name:'marko'}) MATCH (s:Software {name:'lop'}) } AS c`,
+    ]) {
+      const [ts, native] = both(q);
+
+      expect(ts).toBe(native);
+    }
+  });
+
   test('list[i].prop — property access chains off a subscript, byte-identical', () => {
     const base = `MATCH p = ANY SHORTEST (a)-[]->*(b) WHERE a.name = 'marko' AND b.name = 'lop'`;
     // edges(p)[0].weight, nodes(p)[i].name, and out-of-range → null all

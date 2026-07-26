@@ -6580,3 +6580,42 @@ fn group_by_without_aggregate_is_distinct() {
         vec![vec![s("eng")], vec![s("sales")]]
     );
 }
+
+#[test]
+fn exists_multi_match() {
+    // ISO `EXISTS { MATCH … MATCH … }` — a conjunction of MATCH blocks, each with
+    // its own optional WHERE. True iff all jointly match.
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["M"],"properties":{"id":"b"}}"#,
+    ]);
+    // Both an N and an M exist → true; an N and a (missing) Z → false.
+    assert_eq!(
+        rows(&mut g, "RETURN EXISTS { MATCH (x:N) MATCH (y:M) } AS e"),
+        vec![vec![b(true)]]
+    );
+    assert_eq!(
+        rows(&mut g, "RETURN EXISTS { MATCH (x:N) MATCH (y:Z) } AS e"),
+        vec![vec![b(false)]]
+    );
+    // Per-block WHERE, ANDed: N with id 'a' AND M with id 'b' → true; wrong id → false.
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN EXISTS { MATCH (x:N) WHERE x.id='a' MATCH (y:M) WHERE y.id='b' } AS e",
+        ),
+        vec![vec![b(true)]]
+    );
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN EXISTS { MATCH (x:N) WHERE x.id='a' MATCH (y:M) WHERE y.id='nope' } AS e",
+        ),
+        vec![vec![b(false)]]
+    );
+    // COUNT { } over multi-MATCH counts the joint solutions (1 N × 1 M = 1).
+    assert_eq!(
+        rows(&mut g, "RETURN COUNT { MATCH (x:N) MATCH (y:M) } AS c"),
+        vec![vec![n(1.0)]]
+    );
+}

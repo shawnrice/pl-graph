@@ -1270,23 +1270,39 @@ impl Parser {
         })
     }
 
+    /// The braced subquery inside `EXISTS { … }` / `COUNT { … }`. Accepts one or
+    /// more `MATCH` blocks (ISO GQL: `EXISTS { MATCH (a) [WHERE …] MATCH (b) …}`).
+    /// Multiple `MATCH`es are a conjunction, so they flatten to one pattern list +
+    /// the AND of their `WHERE`s — the existing single-block eval handles it.
     fn parse_braced_subquery(&mut self) -> R<(Vec<PathPattern>, Option<Expr>)> {
         self.expect(Tt::LBrace, "'{'")?;
-        if self.check_kw("match") {
-            self.advance();
-        }
-        let mut patterns = vec![self.parse_path_pattern()?];
-        while self.check(Tt::Comma) {
-            self.advance();
+        let mut patterns = Vec::new();
+        let mut wheres: Vec<Expr> = Vec::new();
+        loop {
+            // A leading `MATCH` is optional on the first block, required to start
+            // each subsequent one.
+            if self.check_kw("match") {
+                self.advance();
+            }
             patterns.push(self.parse_path_pattern()?);
+            while self.check(Tt::Comma) {
+                self.advance();
+                patterns.push(self.parse_path_pattern()?);
+            }
+            if self.check_kw("where") {
+                self.advance();
+                wheres.push(self.parse_expr()?);
+            }
+            if !self.check_kw("match") {
+                break;
+            }
         }
-        let where_ = if self.check_kw("where") {
-            self.advance();
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
         self.expect(Tt::RBrace, "'}'")?;
+        let where_ = match wheres.len() {
+            0 => None,
+            1 => wheres.pop(),
+            _ => Some(Expr::And(wheres)),
+        };
         Ok((patterns, where_))
     }
 

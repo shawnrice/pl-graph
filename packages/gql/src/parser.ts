@@ -1253,22 +1253,40 @@ export const parse = (
 
   // The body shared by the braced subqueries `EXISTS { … }` and `COUNT { … }`:
   // `{ pattern, … [WHERE pred] }`, with an optional leading MATCH keyword.
+  // `EXISTS { … }` / `COUNT { … }`. Accepts one or more `MATCH` blocks (ISO GQL);
+  // multiple MATCHes are a conjunction → one pattern list + the AND of the WHEREs.
   const parseBracedSubquery = (): { patterns: PathPattern[]; where?: Expr } => {
     expect('lbrace', "'{'");
+    const patterns: PathPattern[] = [];
+    const wheres: Expr[] = [];
 
-    if (checkKeyword('match')) {
-      advance();
-    }
+    do {
+      if (checkKeyword('match')) {
+        advance();
+      }
 
-    const patterns: PathPattern[] = [parsePathPattern()];
-
-    while (check('comma')) {
-      advance();
       patterns.push(parsePathPattern());
-    }
 
-    const where = checkKeyword('where') ? (advance(), parseExpr()) : undefined;
+      while (check('comma')) {
+        advance();
+        patterns.push(parsePathPattern());
+      }
+
+      if (checkKeyword('where')) {
+        advance();
+        wheres.push(parseExpr());
+      }
+    } while (checkKeyword('match'));
+
     expect('rbrace', "'}'");
+
+    let where: Expr | undefined;
+
+    if (wheres.length === 1) {
+      [where] = wheres;
+    } else if (wheres.length > 1) {
+      where = { kind: 'and', items: wheres };
+    }
 
     return { patterns, where };
   };
