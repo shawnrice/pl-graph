@@ -6417,3 +6417,74 @@ fn bang_unary_not_binds_tightly() {
         vec![vec![b(true), b(false), b(true)]]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Case sensitivity (regression guard). ISO GQL is case-SENSITIVE for labels,
+// edge types, property keys, and string values — `:Person` != `:person`,
+// `:CREATED` != `:created`. (A latent test bug once used `:created` against a
+// `CREATED` edge and silently matched nothing.) Keywords stay case-INSENSITIVE.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn labels_and_edge_types_are_case_sensitive() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["Person"],"properties":{"name":"marko"}}"#,
+        r#"{"type":"node","id":"b","labels":["Software"],"properties":{"name":"lop"}}"#,
+        r#"{"type":"edge","id":"e","from":"a","to":"b","labels":["CREATED"],"properties":{}}"#,
+    ]);
+
+    // Exact-case label matches; a different-case label matches nothing.
+    assert_eq!(
+        rows(&mut g, "MATCH (n:Person) RETURN count(*) AS c"),
+        vec![vec![n(1.0)]]
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH (n:person) RETURN count(*) AS c"),
+        vec![vec![n(0.0)]]
+    );
+    // Exact-case edge type matches; the lowercase form matches nothing.
+    assert_eq!(
+        rows(&mut g, "MATCH ()-[e:CREATED]->() RETURN count(*) AS c"),
+        vec![vec![n(1.0)]]
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH ()-[e:created]->() RETURN count(*) AS c"),
+        vec![vec![n(0.0)]]
+    );
+}
+
+#[test]
+fn property_keys_and_values_are_case_sensitive() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"name":"marko","Name":"OTHER"}}"#,
+    ]);
+
+    // `name` and `Name` are distinct keys.
+    assert_eq!(
+        rows(&mut g, "MATCH (n:N) RETURN n.name AS a, n.Name AS b"),
+        vec![vec![s("marko"), s("OTHER")]]
+    );
+    // String value equality is case-sensitive.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:N) WHERE n.name = 'marko' RETURN count(*) AS c"
+        ),
+        vec![vec![n(1.0)]]
+    );
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:N) WHERE n.name = 'MARKO' RETURN count(*) AS c"
+        ),
+        vec![vec![n(0.0)]]
+    );
+    // But structural keywords remain case-INSENSITIVE (match/return/where).
+    assert_eq!(
+        rows(
+            &mut g,
+            "match (n:N) where n.name = 'marko' return count(*) AS c"
+        ),
+        vec![vec![n(1.0)]]
+    );
+}
