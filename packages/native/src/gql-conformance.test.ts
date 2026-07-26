@@ -388,6 +388,20 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     }
   });
 
+  test('match modes REPEATABLE ELEMENTS / DIFFERENT EDGES — byte-identical', () => {
+    // marko knows josh knows … (walkable). REPEATABLE ELEMENTS (WALK) allows
+    // re-treading; DIFFERENT EDGES (= default TRAIL) does not.
+    for (const q of [
+      `MATCH REPEATABLE ELEMENTS (m:Person {name:'marko'})-[:KNOWS]->{2}(y) RETURN y.name AS n ORDER BY n`,
+      `MATCH DIFFERENT EDGES (m:Person {name:'marko'})-[:KNOWS]->{1}(y) RETURN y.name AS n ORDER BY n`,
+      `MATCH (m:Person {name:'marko'})-[:KNOWS]->{1}(y) RETURN y.name AS n ORDER BY n`,
+    ]) {
+      const [ts, native] = both(q);
+
+      expect(ts).toBe(native);
+    }
+  });
+
   test('list[i].prop — property access chains off a subscript, byte-identical', () => {
     const base = `MATCH p = ANY SHORTEST (a)-[]->*(b) WHERE a.name = 'marko' AND b.name = 'lop'`;
     // edges(p)[0].weight, nodes(p)[i].name, and out-of-range → null all

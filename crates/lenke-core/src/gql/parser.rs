@@ -873,10 +873,18 @@ impl Parser {
             false
         };
         self.expect_kw("match")?;
+        // Optional ISO match mode — `REPEATABLE ELEMENTS` / `DIFFERENT EDGES` —
+        // applies to every path in this MATCH.
+        let match_mode = self.parse_match_mode();
         let mut patterns = vec![self.parse_path_pattern()?];
         while self.check(Tt::Comma) {
             self.advance();
             patterns.push(self.parse_path_pattern()?);
+        }
+        if let Some(mode) = match_mode {
+            for p in &mut patterns {
+                p.mode = mode;
+            }
         }
         let where_ = if self.check_kw("where") {
             self.advance();
@@ -889,6 +897,38 @@ impl Parser {
             patterns,
             where_,
         })
+    }
+
+    /// ISO `<match mode>`: `REPEATABLE (ELEMENT [BINDINGS] | ELEMENTS)` → `Walk`
+    /// (elements may repeat); `DIFFERENT (EDGE [BINDINGS] | EDGES)` → `Trail`
+    /// (no edge repeated — lenke's default). `None` if no mode is present.
+    fn parse_match_mode(&mut self) -> Option<PathMode> {
+        let soft = |p: &Self, w: &str| p.check_kw(w) || p.check_soft(w);
+        if soft(self, "repeatable") {
+            self.advance();
+            if soft(self, "elements") {
+                self.advance();
+            } else if soft(self, "element") {
+                self.advance();
+                if soft(self, "bindings") {
+                    self.advance();
+                }
+            }
+            return Some(PathMode::Walk);
+        }
+        if soft(self, "different") {
+            self.advance();
+            if soft(self, "edges") {
+                self.advance();
+            } else if soft(self, "edge") {
+                self.advance();
+                if soft(self, "bindings") {
+                    self.advance();
+                }
+            }
+            return Some(PathMode::Trail);
+        }
+        None
     }
 
     // --- expressions -------------------------------------------------------

@@ -6619,3 +6619,37 @@ fn exists_multi_match() {
         vec![vec![n(1.0)]]
     );
 }
+
+#[test]
+fn match_mode_repeatable_vs_different_edges() {
+    // 2-cycle a<->b. Under DIFFERENT EDGES (= default TRAIL) a 3-hop walk can't
+    // re-tread an edge; under REPEATABLE ELEMENTS (WALK) it can re-tread.
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+        r#"{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e2","from":"b","to":"a","labels":["R"],"properties":{}}"#,
+    ]);
+    // REPEATABLE ELEMENTS: a→b→a→b re-treads e1,e2 → reaches b at hop 3.
+    let rep = rows(
+        &mut g,
+        "MATCH REPEATABLE ELEMENTS (x:N {id:'a'})-[:R]->{3}(y) RETURN y.id AS id",
+    );
+    assert_eq!(rep, vec![vec![s("b")]]);
+    // DIFFERENT EDGES (= default): only 2 distinct edges exist, so a 3-hop TRAIL
+    // has no solution.
+    let diff = rows(
+        &mut g,
+        "MATCH DIFFERENT EDGES (x:N {id:'a'})-[:R]->{3}(y) RETURN y.id AS id",
+    );
+    assert!(
+        diff.is_empty(),
+        "DIFFERENT EDGES 3-hop should have no trail: {diff:?}"
+    );
+    // DIFFERENT EDGES is exactly the default (no mode) behavior.
+    let default = rows(
+        &mut g,
+        "MATCH (x:N {id:'a'})-[:R]->{3}(y) RETURN y.id AS id",
+    );
+    assert_eq!(diff, default);
+}

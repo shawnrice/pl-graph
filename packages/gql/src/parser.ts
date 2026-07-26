@@ -788,6 +788,48 @@ export const parse = (
     return mode;
   };
 
+  // ISO `<match mode>`: `REPEATABLE (ELEMENT [BINDINGS] | ELEMENTS)` → walk;
+  // `DIFFERENT (EDGE [BINDINGS] | EDGES)` → trail (lenke's default). Applies to
+  // every path in the MATCH.
+  const parseMatchMode = (): PathMode | undefined => {
+    const soft = (word: string): boolean =>
+      (peek().type === 'ident' || peek().type === 'keyword') && peek().value.toLowerCase() === word;
+
+    if (soft('repeatable')) {
+      advance();
+
+      if (soft('elements')) {
+        advance();
+      } else if (soft('element')) {
+        advance();
+
+        if (soft('bindings')) {
+          advance();
+        }
+      }
+
+      return 'walk';
+    }
+
+    if (soft('different')) {
+      advance();
+
+      if (soft('edges')) {
+        advance();
+      } else if (soft('edge')) {
+        advance();
+
+        if (soft('bindings')) {
+          advance();
+        }
+      }
+
+      return 'trail';
+    }
+
+    return undefined;
+  };
+
   // Is the token after the current one the keyword `kw`? (Tells `OPTIONAL CALL`
   // from `OPTIONAL MATCH` without consuming.)
   const kwAfter = (kw: string): boolean => {
@@ -896,11 +938,16 @@ export const parse = (
   const parseMatchClause = (): MatchClause => {
     const optional = checkKeyword('optional') ? (advance(), true) : false;
     expectKeyword('match');
-    const patterns: PathPattern[] = [parsePathPattern()];
+    const matchMode = parseMatchMode();
+    let patterns: PathPattern[] = [parsePathPattern()];
 
     while (check('comma')) {
       advance();
       patterns.push(parsePathPattern());
+    }
+
+    if (matchMode) {
+      patterns = patterns.map((p) => ({ ...p, mode: matchMode }));
     }
 
     const where = checkKeyword('where') ? (advance(), parseExpr()) : undefined;
