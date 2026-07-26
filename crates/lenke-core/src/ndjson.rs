@@ -4,8 +4,9 @@
 //!
 //! Scope note: an edge's *type* is its first label. Edge **properties** are
 //! supported (same columnar store as vertex properties). A property value that
-//! is a nested object is outside the LPG scalar/list model → `InvalidValue`
-//! (matching the TS codec), rather than a silent null coercion.
+//! is a nested JSON object is a first-class map/record value (canonicalized to
+//! sorted keys on store); a single-key `{"@date":…}` object is still a tagged
+//! temporal scalar.
 
 use std::sync::Arc;
 
@@ -37,19 +38,23 @@ fn to_value(j: &Json) -> CodeResult<Value> {
         Json::Str(s) => Value::Str(Arc::from(s.as_str())),
         Json::Arr(a) => Value::List(a.iter().map(to_value).collect::<CodeResult<Vec<_>>>()?),
         // A tagged temporal `{"@date":"…"}` (single key) round-trips as a scalar;
-        // any other object is outside the LPG scalar/list model.
+        // any other JSON object is a record/map value (canonicalized on store).
         Json::Obj(pairs) => match json::temporal_from_pairs(pairs) {
-            Some(res) => Value::Temporal(res.map_err(|e| CodeError::new(ErrorCode::InvalidValue, e))?),
-            None => return Err(CodeError::new(
-                ErrorCode::InvalidValue,
-                "ndjson: property value is a nested object, which is outside the LPG scalar/list model",
-            )),
+            Some(res) => {
+                Value::Temporal(res.map_err(|e| CodeError::new(ErrorCode::InvalidValue, e))?)
+            }
+            None => Value::Map(
+                pairs
+                    .iter()
+                    .map(|(k, v)| Ok((Arc::from(k.as_str()), to_value(v)?)))
+                    .collect::<CodeResult<Vec<_>>>()?,
+            ),
         },
     })
 }
 
 /// Decode a JSON object's `properties` field into core property pairs, or an
-/// empty vec when absent. A nested-object value propagates as `InvalidValue`.
+/// empty vec when absent. A nested-object value becomes a map/record property.
 fn props_of(obj: &Json) -> CodeResult<Vec<(String, Value)>> {
     match obj.get("properties").and_then(Json::as_object) {
         Some(m) => m
@@ -78,9 +83,9 @@ enum Rec {
 
 /// Parse one line. A blank line is skipped (`Ok(None)`); everything else is
 /// strict and matches the TS codec: invalid JSON → `InvalidJson`, a non-object
-/// or an unknown/missing `type` → `InvalidShape`, a nested-object property value
-/// → `InvalidValue`. (Previously these all silently skipped the line, which
-/// could mask corrupt fixtures since `decode` is the crate's test-fixture loader.)
+/// or an unknown/missing `type` → `InvalidShape`. (Previously these all silently
+/// skipped the line, which could mask corrupt fixtures since `decode` is the
+/// crate's test-fixture loader.)
 fn parse_line(line: &str) -> CodeResult<Option<Rec>> {
     let line = line.trim();
     if line.is_empty() {
@@ -330,8 +335,19 @@ fn push_value(out: &mut String, v: &Value) {
             }
             out.push(']');
         }
-        Value::Map(_) => {
-            unreachable!("Value::Map is a query-result value, never a stored property")
+        // A record/map property → a JSON object. Keys are already canonical
+        // (sorted) from the store, so emit in order.
+        Value::Map(pairs) => {
+            out.push('{');
+            for (i, (k, e)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_str(out, k);
+                out.push(':');
+                push_value(out, e);
+            }
+            out.push('}');
         }
     }
 }
@@ -508,17 +524,18 @@ mod tests {
     }
 
     #[test]
-    fn nested_object_property_is_invalid_value() {
-        // A nested object is outside the LPG scalar/list model (matching TS ndjson).
-        let line = r#"{"type":"node","id":"a","labels":[],"properties":{"bad":{"x":1}}}"#;
-        match decode(line) {
-            Err(e) => assert_eq!(e.code, ErrorCode::InvalidValue),
-            Ok(_) => panic!("expected InvalidValue"),
-        }
-        // The serial path agrees with the parallel one.
-        match decode_serial(line) {
-            Err(e) => assert_eq!(e.code, ErrorCode::InvalidValue),
-            Ok(_) => panic!("expected InvalidValue"),
+    fn nested_object_property_is_a_map() {
+        // A nested object is now a first-class map/record property (canonicalized
+        // to sorted keys on store). Both parse paths agree.
+        let line = r#"{"type":"node","id":"a","labels":[],"properties":{"m":{"b":2,"a":1}}}"#;
+        for g in [decode(line).unwrap(), decode_serial(line).unwrap()] {
+            assert_eq!(
+                g.props.value(0, "m", &g.strs),
+                Value::Map(vec![
+                    ("a".into(), Value::Num(1.0)),
+                    ("b".into(), Value::Num(2.0)),
+                ]),
+            );
         }
     }
 

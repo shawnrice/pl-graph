@@ -613,6 +613,18 @@ impl Properties {
             .is_some_and(|kid| self.is_present_id(idx, kid))
     }
 
+    /// True if any stored value in this store contains a map/record (at any
+    /// depth). The flat codecs (pg-text / csv) use this to reject an export they
+    /// can't faithfully carry — a map only ever lives boxed in a `Mixed` column.
+    pub fn has_map_value(&self) -> bool {
+        self.cols.iter().any(|c| match c {
+            Column::Mixed { data } => data
+                .iter()
+                .any(|v| v.as_ref().is_some_and(value_contains_map)),
+            _ => false,
+        })
+    }
+
     /// [`is_present`](Self::is_present) for an already-resolved key id.
     pub fn is_present_id(&self, idx: usize, kid: u32) -> bool {
         match self.cols.get(kid as usize) {
@@ -1316,6 +1328,13 @@ impl Graph {
     }
     pub fn edge_count(&self) -> usize {
         self.live_e
+    }
+    /// True if any vertex or edge property holds a map/record value (at any
+    /// depth). The flat codecs (pg-text / csv) reject an export containing one,
+    /// since a nested record has no faithful line/column representation — use a
+    /// structured format (ndjson / graphson / pg-json) instead.
+    pub fn has_map_property(&self) -> bool {
+        self.props.has_map_value() || self.edge_props.has_map_value()
     }
     /// Diagnostic: `(packed_heap_bytes, mixed_equiv_bytes)` for vertex property
     /// `key`'s column — the actual heap it uses vs what the same column would cost
@@ -3724,6 +3743,15 @@ fn value_kind(v: &Value) -> Option<Kind> {
         // A map/record is inherently variable-shape, so it lives boxed in a
         // `Mixed` column (like a non-numeric list) — never a de-boxed SoA column.
         Value::Map(_) => Some(Kind::Mixed),
+    }
+}
+
+/// Does a value contain a map/record anywhere (itself, or nested in a list)?
+fn value_contains_map(v: &Value) -> bool {
+    match v {
+        Value::Map(_) => true,
+        Value::List(items) => items.iter().any(value_contains_map),
+        _ => false,
     }
 }
 

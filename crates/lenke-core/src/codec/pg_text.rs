@@ -64,8 +64,10 @@ fn scalar_token(out: &mut String, v: &Value) {
             out.push('"');
         }
         Value::List(_) => {} // handled by the caller (one token per element)
+        // A map has no flat-token form; `serialize` pre-rejects a pg-text export
+        // that contains one, so this is unreachable in practice.
         Value::Map(_) => {
-            unreachable!("Value::Map is a query-result value, never a stored property")
+            unreachable!("pg-text cannot carry a map; serialize() rejects it up front")
         }
     }
 }

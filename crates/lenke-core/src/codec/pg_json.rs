@@ -239,10 +239,18 @@ mod tests {
     }
 
     #[test]
-    fn nested_object_property_is_invalid_value() {
-        // A nested object is outside the LPG scalar/list model.
-        let doc = r#"{"nodes":[{"id":"a","labels":[],"properties":{"bad":{"x":1}}}],"edges":[]}"#;
-        assert_eq!(decode_err_code(doc), ErrorCode::InvalidValue);
+    fn nested_object_property_is_a_map() {
+        // A nested object is now a first-class map/record property.
+        let doc =
+            r#"{"nodes":[{"id":"a","labels":[],"properties":{"m":{"b":2,"a":1}}}],"edges":[]}"#;
+        let g = decode(doc).unwrap();
+        assert_eq!(
+            g.props.value(0, "m", &g.strs),
+            Value::Map(vec![
+                ("a".into(), Value::Num(1.0)),
+                ("b".into(), Value::Num(2.0)),
+            ]),
+        );
     }
 
     #[test]

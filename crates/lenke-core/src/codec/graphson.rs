@@ -56,8 +56,20 @@ fn push_typed(out: &mut String, v: &Value) {
             }
             out.push_str("]}");
         }
-        Value::Map(_) => {
-            unreachable!("Value::Map is a query-result value, never a stored property")
+        // GraphSON v3 `g:Map`: a FLAT `[k1, v1, k2, v2, …]` value array (keys are
+        // typed too, but a string key is bare, like `push_typed` for `Str`). Keys
+        // are already canonical (sorted).
+        Value::Map(pairs) => {
+            out.push_str("{\"@type\":\"g:Map\",\"@value\":[");
+            for (i, (k, e)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_str(out, k);
+                out.push(',');
+                push_typed(out, e);
+            }
+            out.push_str("]}");
         }
     }
 }
@@ -94,6 +106,36 @@ fn decode_typed(node: &Json) -> CodeResult<Value> {
                             .map(decode_typed)
                             .collect::<CodeResult<Vec<_>>>()?,
                     )
+                }
+                // GraphSON v3 `g:Map`: a flat `[k1, v1, …]` array → a record value.
+                // Stored maps are string-keyed, so a non-string key is rejected.
+                Some("g:Map") => {
+                    let arr = value.and_then(Json::as_array).ok_or_else(|| {
+                        CodeError::new(
+                            ErrorCode::InvalidShape,
+                            "graphson: g:Map value must be an array",
+                        )
+                    })?;
+                    if arr.len() % 2 != 0 {
+                        return Err(CodeError::new(
+                            ErrorCode::InvalidShape,
+                            "graphson: g:Map value must have an even number of entries",
+                        ));
+                    }
+                    let mut pairs = Vec::with_capacity(arr.len() / 2);
+                    for ch in arr.chunks_exact(2) {
+                        let key = match decode_typed(&ch[0])? {
+                            Value::Str(s) => s,
+                            _ => {
+                                return Err(CodeError::new(
+                                    ErrorCode::InvalidShape,
+                                    "graphson: a stored g:Map key must be a string",
+                                ))
+                            }
+                        };
+                        pairs.push((key, decode_typed(&ch[1])?));
+                    }
+                    Value::Map(pairs)
                 }
                 // A temporal wrapper (`gx:LocalDate`/`gx:LocalDateTime`/`gx:Duration`)
                 // whose `@value` is the ISO-8601 string.

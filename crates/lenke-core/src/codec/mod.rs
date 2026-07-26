@@ -102,8 +102,18 @@ pub(crate) fn push_value(out: &mut String, v: &Value) {
             }
             out.push(']');
         }
-        Value::Map(_) => {
-            unreachable!("Value::Map is a query-result value, never a stored property")
+        // A record/map → a JSON object; keys are already canonical (sorted).
+        Value::Map(pairs) => {
+            out.push('{');
+            for (i, (k, e)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_str(out, k);
+                out.push(':');
+                push_value(out, e);
+            }
+            out.push('}');
         }
     }
 }
@@ -112,9 +122,8 @@ pub(crate) fn push_value(out: &mut String, v: &Value) {
 // JSON scalar parse (shared by pg-json; graphson has its own typed decode)
 // ---------------------------------------------------------------------------
 
-/// A `serde_json::Value` as a core [`Value`]. A nested object is outside the LPG
-/// scalar/list property model, so it's an `InvalidValue` error (mirrors the TS
-/// `normalizeValue` contract) rather than a silent coercion.
+/// A `serde_json::Value` as a core [`Value`]. A nested JSON object is a
+/// map/record property (a single-key `{"@date":…}` stays a tagged temporal).
 pub(crate) fn json_to_value(j: &Json) -> CodeResult<Value> {
     Ok(match j {
         Json::Null => Value::Null,
@@ -136,18 +145,19 @@ pub(crate) fn json_to_value(j: &Json) -> CodeResult<Value> {
                 .map(json_to_value)
                 .collect::<CodeResult<Vec<_>>>()?,
         ),
-        // A tagged temporal `{"@date":"…"}` (single key) round-trips as a scalar.
-        Json::Obj(pairs) => {
-            match crate::json::temporal_from_pairs(pairs) {
-                Some(res) => {
-                    Value::Temporal(res.map_err(|e| CodeError::new(ErrorCode::InvalidValue, e))?)
-                }
-                None => return Err(CodeError::new(
-                    ErrorCode::InvalidValue,
-                    "property value is a nested object, which is outside the LPG scalar/list model",
-                )),
+        // A tagged temporal `{"@date":"…"}` (single key) round-trips as a scalar;
+        // any other JSON object is a record/map value (canonicalized on store).
+        Json::Obj(pairs) => match crate::json::temporal_from_pairs(pairs) {
+            Some(res) => {
+                Value::Temporal(res.map_err(|e| CodeError::new(ErrorCode::InvalidValue, e))?)
             }
-        }
+            None => Value::Map(
+                pairs
+                    .iter()
+                    .map(|(k, v)| Ok((Arc::from(k.as_str()), json_to_value(v)?)))
+                    .collect::<CodeResult<Vec<_>>>()?,
+            ),
+        },
     })
 }
 
@@ -202,6 +212,16 @@ fn unknown_format(format: &str) -> CodeError {
 
 /// Serialize `g` in the named format: `pg-json | pg-text | graphson | csv | ndjson`.
 pub fn serialize(g: &Graph, format: &str) -> CodeResult<String> {
+    // The flat codecs can't faithfully carry a nested record; reject loudly rather
+    // than mangle or drop it. The structured codecs (ndjson/graphson/pg-json)
+    // round-trip maps, so point the caller there.
+    if matches!(format, "pg-text" | "csv") && g.has_map_property() {
+        return Err(CodeError::new(
+            ErrorCode::Unsupported,
+            "a map/record property can't be serialized to a flat format (pg-text/csv); \
+             use a structured format: ndjson, graphson, or pg-json",
+        ));
+    }
     match format {
         "pg-json" => Ok(pg_json::encode(g)),
         "pg-text" => Ok(pg_text::encode(g)),
@@ -310,5 +330,52 @@ mod tests {
                 "reverse lookup lost via {format}"
             );
         }
+    }
+
+    // --- map/record properties (Phase 2) -----------------------------------
+    // A node with a map property, authored with keys out of order and a nested
+    // list-of-maps, so the round-trip proves canonicalization + structure survive.
+    const MAP_NDJSON: &str = concat!(
+        r#"{"type":"node","id":"a","labels":["Person"],"#,
+        r#""properties":{"meta":{"name":"marko","age":29,"tags":[{"w":2,"k":"x"}]}}}"#,
+    );
+
+    #[test]
+    fn map_property_round_trips_through_structured_codecs() {
+        let g = crate::ndjson::decode(MAP_NDJSON).unwrap();
+        // Stored + read back canonical (sorted keys, recursively).
+        let want = "{\"meta\":{\"age\":29,\"name\":\"marko\",\"tags\":[{\"k\":\"x\",\"w\":2}]}}";
+        let ndjson = crate::ndjson::encode(&g);
+        assert!(ndjson.contains(want), "ndjson map shape: {ndjson}");
+
+        // Round-trip through each structured codec back to identical ndjson.
+        let base = crate::ndjson::encode(&g);
+        for format in ["ndjson", "graphson", "pg-json"] {
+            let blob = serialize(&g, format).unwrap();
+            let g2 = deserialize(&blob, format).unwrap();
+            assert_eq!(
+                crate::ndjson::encode(&g2),
+                base,
+                "map lost/altered via {format}"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_codecs_reject_a_map_property_loudly() {
+        let g = crate::ndjson::decode(MAP_NDJSON).unwrap();
+        for format in ["pg-text", "csv"] {
+            assert!(
+                serialize(&g, format).is_err(),
+                "{format} should reject a map property, not mangle it"
+            );
+        }
+        // A graph with no map still serializes to the flat codecs fine.
+        let plain = crate::ndjson::decode(
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{"n":1}}"#,
+        )
+        .unwrap();
+        assert!(serialize(&plain, "csv").is_ok());
+        assert!(serialize(&plain, "pg-text").is_ok());
     }
 }
