@@ -1,12 +1,16 @@
 # lenke ISO GQL — feature checklist
 
 Where lenke's **GQL engine** stands against the ISO/IEC 39075:2024 feature set.
-The feature list + IDs are transcribed from Neo4j's reproduction of the 39075
-Feature-ID taxonomy (see [references.md](./references.md) §2); lenke's status was
-determined **empirically** — each feature was exercised with a probe query
-against the engine (parse + execute), not inferred from the presence of a
-reserved word (the reserved-word list is verbatim from the spec and says nothing
-about implementation).
+Two lenses are combined: the **optional Feature-ID taxonomy** (the _query_
+surface) is transcribed from Neo4j's reproduction of 39075 (see
+[references.md](./references.md) §2); the **statement / program surface** (the
+_structural_ layer — transactions, sessions, catalog & schema DDL) is derived by
+walking the [TuGraph ANTLR grammar](https://github.com/TuGraph-family/gql-grammar)
+of the spec, which covers what the Cypher-centric pages do not. In both cases
+lenke's status was determined **empirically** — each feature was exercised with a
+probe query (parse + execute), not inferred from the presence of a reserved word
+(the reserved-word list is verbatim from the spec and says nothing about
+implementation).
 
 Last verified: **2026-07-25** (`@lenke/gql` portable engine; native is
 byte-identical).
@@ -140,6 +144,26 @@ functions (`left/lower/right/trim/upper`).
 
 ---
 
+## Statement & program surface (structural)
+
+This layer is **grammar-derived** — it comes from walking the ISO GQL statement
+taxonomy in the [TuGraph ANTLR grammar](https://github.com/TuGraph-family/gql-grammar)
+(`gqlProgram → programActivity → session/transaction activity → procedureBody`),
+not from Neo4j's Cypher-centric feature pages (which barely cover it). Status was
+probed against the engine + confirmed in the parser.
+
+| Area                                                                         | GQL surface                                                                                   | lenke | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- | :---: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Transactions**                                                             | `START TRANSACTION [READ ONLY \| READ WRITE]`, `COMMIT [WORK]`, `ROLLBACK [WORK]`             |  ✅   | Shipped both engines as **session commands** — the graph _is_ the ISO session, so tx state persists across `query()` calls (per-statement auto-frames nest inside). `READ ONLY` rejects writes. Also a host API (`graph.transaction(fn)` / `graph.tx()`). The single-program combined form (`START TRANSACTION <stmts> … COMMIT` in one query, grammar's `transactionActivity`) is **not** parsed — issue the commands separately. Deferred: MVCC / savepoints / true nesting. |
+| **Session management**                                                       | `SESSION SET SCHEMA/GRAPH/TIME ZONE/PARAMETER`, `SESSION RESET`, `SESSION CLOSE`              |  ➖   | Embedded engine — no multi-session catalog concept. The graph is an _implicit_ session (see transactions); the explicit `SESSION …` commands aren't parsed.                                                                                                                                                                                                                                                                                                                    |
+| **Catalog DDL**                                                              | `CREATE`/`DROP GRAPH`, `CREATE`/`DROP SCHEMA`                                                 |  ➖   | Single-graph, embedded — graph lifecycle is the **host API** (`new Graph()` / `createEmptyGraph`), not in-query DDL.                                                                                                                                                                                                                                                                                                                                                           |
+| **Graph-type / schema DDL**                                                  | `CREATE GRAPH TYPE …`, node/edge type specifications, typed/closed graphs (`OF <graph type>`) |  ➖   | Schemaless by default (open graph type = GG01 ✅). Typed schemas are **host-side** (`defineNode` + Standard Schema, R-TYPED) and in-engine constraints (`createUniqueConstraint`/`createValidator`/`createInvariant`, R-CONSTRAINTS) — deliberately _not_ GQL DDL (the write/schema layer belongs to the core + host; see `docs/design/gql-extensions.md`).                                                                                                                    |
+| **`USE` / focused statements**                                               | `USE <graph> …`                                                                               |  ➖   | Single-graph → no graph selection.                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| **Procedure-body binding-variable defs**                                     | `PROPERTY GRAPH g = …`, `BINDING TABLE t = …`, `VALUE x = …` (before the statement block)     |  ❌   | Not supported. The `LET` statement covers value binding within a linear query; there is no first-class **binding-table** value.                                                                                                                                                                                                                                                                                                                                                |
+| **`BYTES`/`BINARY`/`VARBINARY` types, sized `VARCHAR(n)`, integer subtypes** | The wider `predefinedType` set                                                                |  ➖   | lenke's value model is f64 / string / bool / temporal / list / path / null (see the Value-types table + `numeric-model-f64`); byte-string types, length-parameterised strings, and integer subtypes are out of model.                                                                                                                                                                                                                                                          |
+
+---
+
 ## lenke extensions (non-ISO — sigil'd 🔷)
 
 Deliberately outside the standard; each wears the leading-underscore sigil
@@ -157,13 +181,28 @@ these.
 
 ## Summary
 
-Of the optional features in the taxonomy, lenke implements the great majority of
-the **read / pattern-matching / path-search / function / composition** surface
-(the parts GQL specifies well), and is missing or excludes a small set:
-`IS TYPED` predicates (GA06), multi-`MATCH` `EXISTS` (GQ22), map/record values
-(GV45), parenthesized-subpath `WHERE` (G050), the `DIFFERENT EDGES`/`REPEATABLE
-ELEMENTS` match modes (G002/G003), and — by design — multi-graph `USE` (GQ01) and
-`INT64` (GV12). The one concrete **mandatory** gap found is `normalize()`.
+**Query surface** (the parts GQL specifies well): lenke implements the great
+majority — read / pattern-matching / path-search / function / composition — and
+is missing or excludes a small set: `IS TYPED` predicates (GA06), multi-`MATCH`
+`EXISTS` (GQ22), map/record values (GV45), parenthesized-subpath `WHERE` (G050),
+the `DIFFERENT EDGES`/`REPEATABLE ELEMENTS` match modes (G002/G003), and — by
+design — multi-graph `USE` (GQ01) and `INT64` (GV12). The one concrete
+**mandatory** gap found is `normalize()`.
 
-This is a living document — re-run the probes (and a proper mandatory audit) when
-the GQL surface changes.
+**Statement/program surface** (grammar-derived): **transactions are supported**
+(`START TRANSACTION`/`COMMIT`/`ROLLBACK` as session commands, both engines).
+Session management, catalog DDL (`CREATE GRAPH`), and schema/graph-type DDL
+(`CREATE GRAPH TYPE`) are **deliberately excluded** — lenke is an embedded,
+single-graph, schemaless-by-default engine, so graph lifecycle and typed schemas
+live in the host API, not in GQL DDL. This is a design stance (see
+`docs/design/gql-extensions.md`), not a gap to close.
+
+**So: is this the whole of 39075?** The _query surface_ is thoroughly mapped and
+the _statement/program surface_ is now covered structurally. What remains only
+partially seen is the **full optional Feature-ID catalogue**: this checklist
+covers the ~75 IDs Neo4j documents, but the ID gaps (e.g. `G006–G009`,
+`G021–G034`, `G037–G042`) are real spec features no free source enumerates — a
+complete ID-by-ID scorecard needs the paywalled Annex.
+
+This is a living document — re-run the probes (and a proper per-production
+mandatory audit) when the GQL surface changes.
