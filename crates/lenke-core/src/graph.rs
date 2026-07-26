@@ -1185,40 +1185,79 @@ pub enum TxCommitError {
 /// A set of property indexes (key name → ordered value buckets).
 type PropIndex = HashMap<String, std::collections::BTreeMap<IdxKey, Vec<u32>>>;
 
-/// Add or remove element `id` from `map`'s bucket for `key`=`value`. No-op if the
-/// key isn't indexed or the value isn't indexable (null/list).
+/// An index key/path split into its root property and the descent into a stored
+/// map: `"meta.city"` → `("meta", ["city"])`; a plain `"name"` → `("name", [])`.
+/// Property/field names with a literal `.` aren't reachable as a nested path (a
+/// rare edge case), consistent with the `.`-as-access convention.
+fn split_index_path(path: &str) -> (&str, Vec<&str>) {
+    let mut segs = path.split('.');
+    let root = segs.next().unwrap_or("");
+    (root, segs.collect())
+}
+
+/// Follow a descent of field names into a value, returning the leaf — or `None`
+/// if a segment isn't present or the value isn't a map there. Maps are canonical
+/// (sorted keys), so each hop is a binary search. An empty descent is the value
+/// itself (a plain top-level index).
+fn value_at_descent<'a>(v: &'a Value, descent: &[&str]) -> Option<&'a Value> {
+    let mut cur = v;
+    for seg in descent {
+        let Value::Map(pairs) = cur else { return None };
+        match pairs.binary_search_by(|(k, _)| k.as_ref().cmp(*seg)) {
+            Ok(i) => cur = &pairs[i].1,
+            Err(_) => return None,
+        }
+    }
+    Some(cur)
+}
+
+/// Element `id`'s property `key` was set/removed with `value`; update every index
+/// whose path is rooted at `key`. A top-level index indexes `value` itself; a
+/// dotted-path index (`meta.city`) indexes the scalar leaf at that descent. The
+/// leaf isn't indexable (null / list / map / absent) → that index is skipped.
 fn idx_apply(map: &mut PropIndex, key: &str, id: u32, value: &Value, add: bool) {
-    let Some(bt) = map.get_mut(key) else { return };
-    let Some(k) = IdxKey::from_value(value) else {
-        return;
-    };
-    if add {
-        bt.entry(k).or_default().push(id);
-    } else if let Some(bucket) = bt.get_mut(&k) {
-        bucket.retain(|&x| x != id);
-        if bucket.is_empty() {
-            bt.remove(&k);
+    for (path, bt) in map.iter_mut() {
+        let (root, descent) = split_index_path(path);
+        if root != key {
+            continue;
+        }
+        let Some(leaf) = value_at_descent(value, &descent) else {
+            continue;
+        };
+        let Some(k) = IdxKey::from_value(leaf) else {
+            continue;
+        };
+        if add {
+            bt.entry(k).or_default().push(id);
+        } else if let Some(bucket) = bt.get_mut(&k) {
+            bucket.retain(|&x| x != id);
+            if bucket.is_empty() {
+                bt.remove(&k);
+            }
         }
     }
 }
 
-/// Backfill an index for `key` over a property store (vertex or edge).
+/// Backfill an index for `path` (a property name or a dotted `root.field…` path
+/// into a stored map) over a property store (vertex or edge).
 fn build_prop_index(
     store: &Properties,
     live: &[bool],
     strs: &Dict,
-    key: &str,
+    path: &str,
     n: usize,
 ) -> std::collections::BTreeMap<IdxKey, Vec<u32>> {
     let mut map: std::collections::BTreeMap<IdxKey, Vec<u32>> = std::collections::BTreeMap::new();
-    let Some(kid) = store.keys.get(key) else {
+    let (root, descent) = split_index_path(path);
+    let Some(kid) = store.keys.get(root) else {
         return map;
     };
     for id in 0..n as u32 {
         if !live.get(id as usize).copied().unwrap_or(false) {
             continue;
         }
-        if let Some(k) = IdxKey::from_value(&store.value_id(id as usize, kid, strs)) {
+        let v = store.value_id(id as usize, kid, strs);
+        if let Some(k) = value_at_descent(&v, &descent).and_then(IdxKey::from_value) {
             map.entry(k).or_default().push(id);
         }
     }
@@ -1459,6 +1498,17 @@ impl Graph {
     }
     pub fn edge_indexed(&self, key: &str) -> bool {
         self.eidx.contains_key(key)
+    }
+
+    /// Does any vertex index depend on property `key` — either indexing it
+    /// directly or via a dotted path rooted at it (`key.field…`)? A write to
+    /// `key` must refresh all such indexes, so the maintenance gates use this
+    /// rather than an exact-name `contains_key`.
+    fn any_vidx_rooted_at(&self, key: &str) -> bool {
+        self.vidx.keys().any(|p| split_index_path(p).0 == key)
+    }
+    fn any_eidx_rooted_at(&self, key: &str) -> bool {
+        self.eidx.keys().any(|p| split_index_path(p).0 == key)
     }
 
     /// The vertex property keys that currently carry a secondary index, sorted
@@ -3352,7 +3402,7 @@ impl Graph {
         self.in_.push(Vec::new());
         self.props.push_element();
         for (k, v) in props {
-            if self.vidx.contains_key(&k) {
+            if self.any_vidx_rooted_at(&k) {
                 idx_apply(&mut self.vidx, &k, vi, &v, true);
             }
             self.touch(&k);
@@ -3400,7 +3450,7 @@ impl Graph {
         });
         self.edge_props.push_element();
         for (k, v) in props {
-            if self.eidx.contains_key(&k) {
+            if self.any_eidx_rooted_at(&k) {
                 idx_apply(&mut self.eidx, &k, ei, &v, true);
             }
             self.touch(&k);
@@ -3448,12 +3498,12 @@ impl Graph {
             };
             self.record_undo(Undo::VProp(vi, key.to_string(), prior));
         }
-        if self.vidx.contains_key(key) {
+        if self.any_vidx_rooted_at(key) {
             let old = self.props.value(vi as usize, key, &self.strs);
             idx_apply(&mut self.vidx, key, vi, &old, false);
         }
         self.props.set_value(vi as usize, key, v, &mut self.strs);
-        if self.vidx.contains_key(key) {
+        if self.any_vidx_rooted_at(key) {
             let new = self.props.value(vi as usize, key, &self.strs);
             idx_apply(&mut self.vidx, key, vi, &new, true);
         }
@@ -3471,7 +3521,7 @@ impl Graph {
             };
             self.record_undo(Undo::VProp(vi, key.to_string(), prior));
         }
-        if self.vidx.contains_key(key) {
+        if self.any_vidx_rooted_at(key) {
             let old = self.props.value(vi as usize, key, &self.strs);
             idx_apply(&mut self.vidx, key, vi, &old, false);
         }
@@ -3488,13 +3538,13 @@ impl Graph {
             };
             self.record_undo(Undo::EProp(ei, key.to_string(), prior));
         }
-        if self.eidx.contains_key(key) {
+        if self.any_eidx_rooted_at(key) {
             let old = self.edge_props.value(ei as usize, key, &self.strs);
             idx_apply(&mut self.eidx, key, ei, &old, false);
         }
         self.edge_props
             .set_value(ei as usize, key, v, &mut self.strs);
-        if self.eidx.contains_key(key) {
+        if self.any_eidx_rooted_at(key) {
             let new = self.edge_props.value(ei as usize, key, &self.strs);
             idx_apply(&mut self.eidx, key, ei, &new, true);
         }
@@ -3510,7 +3560,7 @@ impl Graph {
             };
             self.record_undo(Undo::EProp(ei, key.to_string(), prior));
         }
-        if self.eidx.contains_key(key) {
+        if self.any_eidx_rooted_at(key) {
             let old = self.edge_props.value(ei as usize, key, &self.strs);
             idx_apply(&mut self.eidx, key, ei, &old, false);
         }
@@ -4533,6 +4583,77 @@ mod storable_maps {
         p.set_value(0, "m", map(&[("a", Value::Num(1.0))]), &mut strs);
         assert!(matches!(p.value(0, "n", &strs), Value::Num(n) if n == 1.0));
         assert_eq!(p.value(0, "m", &strs), map(&[("a", Value::Num(1.0))]));
+    }
+
+    // A three-vertex graph with a nested `meta.city` field, for the dotted-path
+    // index. Never index the map — index the scalar leaf at the path.
+    fn city_graph() -> Graph {
+        crate::ndjson::decode(
+            "{\"type\":\"node\",\"id\":\"a\",\"labels\":[\"P\"],\"properties\":{\"meta\":{\"city\":\"NYC\"}}}\n\
+             {\"type\":\"node\",\"id\":\"b\",\"labels\":[\"P\"],\"properties\":{\"meta\":{\"city\":\"LA\"}}}\n\
+             {\"type\":\"node\",\"id\":\"c\",\"labels\":[\"P\"],\"properties\":{\"meta\":{\"city\":\"NYC\"}}}",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn dotted_path_index_seeks_a_nested_field() {
+        let mut g = city_graph();
+        g.create_vertex_index("meta.city");
+        // Both NYC vertices (a=0, c=2), the one LA vertex (b=1).
+        let nyc = g
+            .vertices_by_prop("meta.city", &IdxKey::Str("NYC".into()))
+            .unwrap();
+        assert_eq!(nyc, &[0, 2]);
+        let la = g
+            .vertices_by_prop("meta.city", &IdxKey::Str("LA".into()))
+            .unwrap();
+        assert_eq!(la, &[1]);
+        // A city with no vertex → an empty (but present) bucket.
+        assert_eq!(
+            g.vertices_by_prop("meta.city", &IdxKey::Str("SF".into())),
+            Some(&[][..]),
+        );
+    }
+
+    #[test]
+    fn dotted_path_index_maintained_on_write() {
+        let mut g = city_graph();
+        g.create_vertex_index("meta.city");
+        // Move vertex b (LA → NYC): the index must follow. Bucket order is
+        // unspecified, so compare as a set.
+        g.set_vertex_prop(1, "meta", map(&[("city", s("NYC"))]));
+        let mut nyc = g
+            .vertices_by_prop("meta.city", &IdxKey::Str("NYC".into()))
+            .unwrap()
+            .to_vec();
+        nyc.sort_unstable();
+        assert_eq!(nyc, vec![0, 1, 2]);
+        assert_eq!(
+            g.vertices_by_prop("meta.city", &IdxKey::Str("LA".into())),
+            Some(&[][..]),
+        );
+    }
+
+    #[test]
+    fn dotted_path_index_skips_absent_or_nonscalar_leaves() {
+        let mut g = city_graph();
+        // An index into a field that doesn't exist on any vertex → empty index.
+        g.create_vertex_index("meta.zip");
+        assert_eq!(
+            g.vertices_by_prop("meta.zip", &IdxKey::Str("10001".into())),
+            Some(&[][..]),
+        );
+        // Point one vertex's `meta.zip` at a nested map (non-scalar) → not indexed.
+        g.set_vertex_prop(
+            0,
+            "meta",
+            map(&[("city", s("NYC")), ("zip", map(&[("k", s("v"))]))]),
+        );
+        assert_eq!(
+            g.vertices_by_prop("meta.zip", &IdxKey::Str("10001".into())),
+            Some(&[][..]),
+        );
     }
 }
 
