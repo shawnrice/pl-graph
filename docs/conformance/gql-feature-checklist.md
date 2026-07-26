@@ -34,16 +34,24 @@ sigil'd) · ➖ excluded by design · ❓ not yet verified
 Everything lenke does **not** do, pulled out of the tables below and sorted by
 whether it's worth closing. Tiers 1–2 are real gaps; Tier 3 is deliberate.
 
-### Tier 1 — Mandatory-conformance gaps (break baseline conformance)
+### Tier 1 — Mandatory-conformance gaps
 
-These are in the mandatory feature set, so they're the only gaps that affect
-_conformance_ (vs. feature richness). All small.
+Three mandatory-set gaps exist. **Two are a deliberate decline, not a to-do:**
 
-| Gap                                    | Fix shape                                                                                                                   |
-| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `normalize()` string function          | Add one scalar fn (Unicode NFC/NFD/NFKC/NFKD normalization) both engines.                                                   |
-| `IS [NOT] NORMALIZED` predicate        | Add the predicate (pairs naturally with `normalize()`).                                                                     |
-| `IS TYPED` / `::` value-type predicate | Add the runtime type-check predicate. (Mandatory-vs-optional here is ambiguous without the spec text; treat as ≥ optional.) |
+- **`normalize()` + `IS [NOT] NORMALIZED`** — the Unicode string-normalization
+  feature (NFC/NFD/NFKC/NFKD). **Declined** (2026-07 conformance audit): a
+  byte-identical implementation needs a Unicode-normalization table as a Rust
+  dependency **plus** a matching TS copy, and its only use — canonicalizing two
+  encodings of the same glyph — is niche and better handled at ingest. A
+  conscious zero-dependency-vs-strict-conformance tradeoff on this one mandatory
+  function; would only return as an opt-in if a real workload needs it. So lenke
+  is knowingly, minimally non-conformant here.
+
+The one genuinely-open item:
+
+| Gap                                    | Fix shape                                                                                                                      |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `IS TYPED` / `::` value-type predicate | Add the runtime type-check predicate. (Mandatory-vs-optional is ambiguous without the spec text; no prior decision on record.) |
 
 ### Tier 2 — Genuine optional-feature gaps (real, not by design)
 
@@ -88,11 +96,11 @@ functions (`left/lower/right/trim/upper`).
 `supported-mandatory` list and probing lenke — see the [Gaps](#gaps-prioritized)
 section):
 
-| Mandatory production          | Gap                   | Detail                                                                                                                   |
-| ----------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `<character string function>` | `normalize()`         | Set is `left/lower/normalize/right/trim/upper`; lenke has all but `normalize()` → `E_UNKNOWN_FUNCTION`.                  |
-| `<normalized predicate>`      | `IS [NOT] NORMALIZED` | Rejected (parse error).                                                                                                  |
-| `<value type predicate>`      | `IS TYPED` / `::`     | Rejected. (Also surfaces as optional GA06 — the mandatory-vs-optional boundary here is ambiguous without the spec text.) |
+| Mandatory production          | Gap                   | Detail                                                                                                                                                    |
+| ----------------------------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<character string function>` | `normalize()`         | **Declined** — Unicode normalization; needs a normalization-table dep, niche, handle at ingest. See [Gaps → Tier 1](#tier-1--mandatory-conformance-gaps). |
+| `<normalized predicate>`      | `IS [NOT] NORMALIZED` | **Declined** — same Unicode-normalization feature as `normalize()`.                                                                                       |
+| `<value type predicate>`      | `IS TYPED` / `::`     | Rejected; genuinely open (no prior decision). Also surfaces as optional GA06 — mandatory-vs-optional is ambiguous.                                        |
 
 Everything else in the mandatory list is supported (INSERT/SET/REMOVE/DELETE,
 MATCH/OPTIONAL MATCH, RETURN/FINISH, ORDER BY/SKIP/OFFSET/LIMIT, UNION/UNION ALL,
@@ -314,8 +322,10 @@ clauses (lenke groups implicitly, Cypher-style), **list slicing** `[i..j]`, the
 values (GV45), parenthesized-subpath `WHERE` (G050), the `DIFFERENT
 EDGES`/`REPEATABLE ELEMENTS` match modes (G002/G003), inline `LET…IN…END` /
 `VALUE{}` scalar subqueries, and — by design — multi-graph `USE` (GQ01) and
-`INT64` (GV12). The **mandatory** gaps (three, all small) are `normalize()`,
-`IS NORMALIZED`, and `IS TYPED` — see [Gaps](#gaps-prioritized).
+`INT64` (GV12). Of the three **mandatory** gaps, two — `normalize()` and
+`IS NORMALIZED` (the Unicode-normalization feature) — are a **deliberate decline**
+(zero-dep tradeoff); only `IS TYPED` is genuinely open. See
+[Gaps](#gaps-prioritized).
 
 **Statement/program surface** (grammar-derived): **transactions are supported**
 (`START TRANSACTION`/`COMMIT`/`ROLLBACK` as session commands, both engines).
