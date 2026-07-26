@@ -191,9 +191,9 @@ RETURN duration_between(e1.ts, e2.ts) AS gap
 Instants order directly (\`datetime < datetime\`, \`date < date\`). Compare durations *through the instants they bound* — write \`a.ts < b.ts + duration(...)\` rather than comparing one duration to another.
 
 ## Calendar/clock components
-Extract a component with \`_year(x)\`, \`_month(x)\`, \`_day(x)\`, \`_hour(x)\`, \`_minute(x)\`, \`_second(x)\`. These are a **lenke extension** (date-part extraction is not part of the ISO GQL function set), so they wear the leading-underscore sigil that marks every non-standard construct — the bare \`year(...)\` is deliberately not a function. The argument must be a temporal that carries that component (\`_year\`/\`_month\`/\`_day\` need a date; \`_hour\`/\`_minute\`/\`_second\` need a time); a zoned value is read in its own offset. Bucket or cohort by a period with \`GROUP BY\`:
+Extract a component with \`_year(x)\`, \`_month(x)\`, \`_day(x)\`, \`_hour(x)\`, \`_minute(x)\`, \`_second(x)\`. These are a **lenke extension** (date-part extraction is not part of the ISO GQL function set), so they wear the leading-underscore sigil that marks every non-standard construct — the bare \`year(...)\` is deliberately not a function. The argument must be a temporal that carries that component (\`_year\`/\`_month\`/\`_day\` need a date; \`_hour\`/\`_minute\`/\`_second\` need a time); a zoned value is read in its own offset. Bucket or cohort by a period — grouping is **implicit** (the non-aggregated return keys are the grouping keys; there is no \`GROUP BY\` clause):
 \`\`\`
-MATCH (h:Hire) RETURN _year(h.hired) AS yr, count(*) AS n GROUP BY yr ORDER BY yr
+MATCH (h:Hire) RETURN _year(h.hired) AS yr, count(*) AS n ORDER BY yr
 \`\`\`
 A **string is not coerced** — \`_year('2024-01-01')\` throws; wrap it first: \`_year(date(h.day))\`.
 

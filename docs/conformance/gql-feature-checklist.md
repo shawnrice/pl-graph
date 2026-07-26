@@ -12,7 +12,7 @@ probe query (parse + execute), not inferred from the presence of a reserved word
 (the reserved-word list is verbatim from the spec and says nothing about
 implementation).
 
-Last verified: **2026-07-25** (`@lenke/gql` portable engine; native is
+Last verified: **2026-07-26** (`@lenke/gql` portable engine; native is
 byte-identical).
 
 **Legend:** ✅ supported · 🟡 partial · ❌ not yet · 🔷 lenke extension (non-ISO,
@@ -164,6 +164,69 @@ probed against the engine + confirmed in the parser.
 
 ---
 
+## Expression, predicate & clause surface (grammar-derived)
+
+Fine-grained coverage the Feature-ID tables don't capture, walked from the
+grammar's `expression`/`expressionPredicate`/`functionCall` and clause
+productions and probed against the engine.
+
+### Predicates
+
+| Predicate                                  | lenke | Notes                                                                   |
+| ------------------------------------------ | :---: | ----------------------------------------------------------------------- |
+| Comparison `= <> < > <= >=`                |  ✅   |                                                                         |
+| `IS [NOT] NULL`                            |  ✅   | Also the idiom for property existence.                                  |
+| `IN` (list membership)                     |  ✅   |                                                                         |
+| Labeled `n:L` / `IS [NOT] LABELED`         |  ✅   |                                                                         |
+| Boolean test `IS [NOT] TRUE/FALSE/UNKNOWN` |  ✅   |                                                                         |
+| `IS [NOT] DIRECTED`                        |  ❌   | Edge-direction predicate.                                               |
+| `IS [NOT] SOURCE/DESTINATION OF`           |  ❌   |                                                                         |
+| `IS [NOT] NORMALIZED`                      |  ❌   |                                                                         |
+| `ALL_DIFFERENT(…)` / `SAME(…)`             |  ❌   | Element-identity predicates (unknown function).                         |
+| `PROPERTY_EXISTS(n, k)`                    |  ❌   | Use `n.k IS NOT NULL`.                                                  |
+| `BETWEEN`                                  |  ➖   | Not an ISO GQL predicate (absent from the grammar); correctly rejected. |
+
+### Expressions & operators
+
+| Construct                                        | lenke | Notes                                                             |
+| ------------------------------------------------ | :---: | ----------------------------------------------------------------- |
+| `NOT` / `AND` / `OR` / `XOR`                     |  ✅   | (`XOR` = GE07.)                                                   |
+| `!` unary-not operator                           |  ❌   | Use the `NOT` keyword.                                            |
+| Unary `+` / `-`                                  |  ✅   |                                                                   |
+| Concatenation `\|\|`                             |  ✅   | Strings, lists, paths.                                            |
+| Arithmetic `+ - * /`, `%`/`mod`, `^`/`power`     |  ✅   | (`^` ≤1 ULP vs `power` on some inputs — see gql README.)          |
+| `CASE` (simple + searched), `NULLIF`, `COALESCE` |  ✅   |                                                                   |
+| Property `.`, list index `[i]`                   |  ✅   |                                                                   |
+| List slice `[i..j]`                              |  ❌   | No slicing.                                                       |
+| `LET … IN … END` (inline let-expression)         |  ❌   | The `LET` _statement_ works; the inline expression form does not. |
+| `VALUE { subquery }` (scalar subquery)           |  ❌   |                                                                   |
+
+### Scalar / string functions (detail)
+
+| Function                                           | lenke | Notes                                                              |
+| -------------------------------------------------- | :---: | ------------------------------------------------------------------ |
+| `char_length`/`character_length`                   |  ✅   |                                                                    |
+| `octet_length`/`byte_length`                       |  ✅   |                                                                    |
+| `ceil`/`ceiling`                                   |  ✅   | Synonyms.                                                          |
+| `upper`/`lower` (fold), `left`/`right` (substring) |  ✅   |                                                                    |
+| `trim(x)` / `btrim`/`ltrim`/`rtrim`                |  ✅   |                                                                    |
+| `TRIM(LEADING\|TRAILING\|BOTH … FROM x)`           |  ❌   | The SQL trim-specification form; simple `trim()` works.            |
+| `normalize(x)`                                     |  ❌   | **Mandatory-feature gap** (part of `<character string function>`). |
+
+### Clauses & projection
+
+| Clause                                  | lenke | Notes                                                                           |
+| --------------------------------------- | :---: | ------------------------------------------------------------------------------- |
+| `OPTIONAL MATCH`                        |  ✅   |                                                                                 |
+| `RETURN DISTINCT`, `count(DISTINCT …)`  |  ✅   |                                                                                 |
+| `ORDER BY … ASC/DESC NULLS FIRST/LAST`  |  ✅   |                                                                                 |
+| `DETACH DELETE`                         |  ✅   |                                                                                 |
+| Implicit grouping (non-aggregated keys) |  ✅   | Cypher-style — the grouping model lenke uses.                                   |
+| Explicit `GROUP BY` clause              |  ❌   | In the ISO grammar (attaches to `RETURN`), but lenke groups implicitly instead. |
+| `HAVING` clause                         |  ❌   | Filter aggregates in a following linear step instead.                           |
+
+---
+
 ## lenke extensions (non-ISO — sigil'd 🔷)
 
 Deliberately outside the standard; each wears the leading-underscore sigil
@@ -182,12 +245,18 @@ these.
 ## Summary
 
 **Query surface** (the parts GQL specifies well): lenke implements the great
-majority — read / pattern-matching / path-search / function / composition — and
-is missing or excludes a small set: `IS TYPED` predicates (GA06), multi-`MATCH`
-`EXISTS` (GQ22), map/record values (GV45), parenthesized-subpath `WHERE` (G050),
-the `DIFFERENT EDGES`/`REPEATABLE ELEMENTS` match modes (G002/G003), and — by
-design — multi-graph `USE` (GQ01) and `INT64` (GV12). The one concrete
-**mandatory** gap found is `normalize()`.
+majority — read / pattern-matching / path-search / function / composition,
+predicates, `CASE`/`COALESCE`/`NULLIF`, `OPTIONAL MATCH`, `DISTINCT`, `ORDER BY …
+NULLS FIRST/LAST`, `DETACH DELETE`, the full scalar/aggregate function set. The
+genuine gaps found (deep grammar walk): explicit **`GROUP BY`** and **`HAVING`**
+clauses (lenke groups implicitly, Cypher-style), **list slicing** `[i..j]`, the
+**`TRIM(… FROM …)`** spec form, the element predicates (`IS DIRECTED`,
+`IS SOURCE/DESTINATION OF`, `ALL_DIFFERENT`, `SAME`, `PROPERTY_EXISTS`,
+`IS NORMALIZED`), `IS TYPED` (GA06), multi-`MATCH` `EXISTS` (GQ22), map/record
+values (GV45), parenthesized-subpath `WHERE` (G050), the `DIFFERENT
+EDGES`/`REPEATABLE ELEMENTS` match modes (G002/G003), inline `LET…IN…END` /
+`VALUE{}` scalar subqueries, and — by design — multi-graph `USE` (GQ01) and
+`INT64` (GV12). The one **mandatory** gap is `normalize()`.
 
 **Statement/program surface** (grammar-derived): **transactions are supported**
 (`START TRANSACTION`/`COMMIT`/`ROLLBACK` as session commands, both engines).
