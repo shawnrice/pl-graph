@@ -280,7 +280,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
 
     // Edge properties agree.
     const [tsE, natE] = both(
-      `MATCH ()-[e:created]->() RETURN property_exists(e, weight) AS hw, property_exists(e, gone) AS hg`,
+      `MATCH ()-[e:CREATED]->() RETURN property_exists(e, weight) AS hw, property_exists(e, gone) AS hg`,
     );
 
     expect(tsE).toBe(natE);
@@ -311,6 +311,34 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(ts).toContain('"d":true');
     expect(ts).toContain('"l":true');
     expect(ts).toContain('"m":false');
+  });
+
+  test('graph-element predicates + ! — byte-identical', () => {
+    // IS DIRECTED / IS SOURCE|DESTINATION OF / ALL_DIFFERENT / SAME over a real edge.
+    const [ts, native] = both(
+      `MATCH (m:Person {name: 'marko'})-[e:CREATED]->(s) ` +
+        `RETURN e IS DIRECTED AS d, m IS SOURCE OF e AS msrc, s IS DESTINATION OF e AS sdst, ` +
+        `s IS SOURCE OF e AS ssrc, ALL_DIFFERENT(m, s) AS diff, SAME(m, m) AS allsame, ` +
+        `SAME(m, s) AS msame ORDER BY sdst LIMIT 1`,
+    );
+
+    expect(ts).toBe(native);
+    expect(ts).toContain('"d":true');
+    expect(ts).toContain('"msrc":true');
+    expect(ts).toContain('"ssrc":false');
+
+    // `!` unary-not, tight-binding.
+    const [tsB, natB] = both(`RETURN !(1=2) AS a, !true AS b, (!(1=2) = true) AS c`);
+
+    expect(tsB).toBe(natB);
+
+    // NULL element (unmatched OPTIONAL) → NULL, both engines.
+    const [tsN, natN] = both(
+      `MATCH (m:Person {name: 'marko'}) OPTIONAL MATCH (m)-[:NOSUCH]->(x) ` +
+        `RETURN x IS DIRECTED AS d, ALL_DIFFERENT(m, x) AS ad`,
+    );
+
+    expect(tsN).toBe(natN);
   });
 
   test('list[i].prop — property access chains off a subscript, byte-identical', () => {

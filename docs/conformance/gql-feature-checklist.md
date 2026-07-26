@@ -60,17 +60,15 @@ Unicode normalization above.
 
 Ordered roughly cheap→involved.
 
-| Gap                                                                                        | Notes                                                                                                                                                                 |
-| ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TRIM(LEADING\|TRAILING\|BOTH … FROM …)`                                                   | The SQL trim-spec form; simple `trim()` works.                                                                                                                        |
-| Element predicates: `IS DIRECTED`, `IS SOURCE/DESTINATION OF`, `ALL_DIFFERENT()`, `SAME()` | Small, self-contained predicate/function additions. (`PROPERTY_EXISTS()` **closed** 2026-07-26.)                                                                      |
-| `!` unary-not operator                                                                     | Alias for the working `NOT` keyword.                                                                                                                                  |
-| Explicit `GROUP BY` / `HAVING` clauses                                                     | lenke groups **implicitly** (Cypher-style). Adding the explicit clauses is a parser+planner change; lower value since implicit grouping already covers the use cases. |
-| Multi-`MATCH` `EXISTS { … }` (GQ22)                                                        | Single-`MATCH` `EXISTS` works.                                                                                                                                        |
-| Map / record values (GV45)                                                                 | No first-class map value; larger (touches the value model).                                                                                                           |
-| Parenthesized-subpath `WHERE` (G050/G051)                                                  | Per-_edge_ `WHERE` works; per-subpath doesn't.                                                                                                                        |
-| `DIFFERENT EDGES` / `REPEATABLE ELEMENTS` match modes (G002/G003)                          | Graph-pattern match modes (distinct from the path modes, which work).                                                                                                 |
-| Inline `LET…IN…END`, `VALUE{}` scalar subquery                                             | The `LET` statement works; these are the inline-expression forms.                                                                                                     |
+| Gap                                                               | Notes                                                                                                                                                                 |
+| ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TRIM(LEADING\|TRAILING\|BOTH … FROM …)`                          | The SQL trim-spec form; simple `trim()` works.                                                                                                                        |
+| Explicit `GROUP BY` / `HAVING` clauses                            | lenke groups **implicitly** (Cypher-style). Adding the explicit clauses is a parser+planner change; lower value since implicit grouping already covers the use cases. |
+| Multi-`MATCH` `EXISTS { … }` (GQ22)                               | Single-`MATCH` `EXISTS` works.                                                                                                                                        |
+| Map / record values (GV45)                                        | No first-class map value; larger (touches the value model).                                                                                                           |
+| Parenthesized-subpath `WHERE` (G050/G051)                         | Per-_edge_ `WHERE` works; per-subpath doesn't.                                                                                                                        |
+| `DIFFERENT EDGES` / `REPEATABLE ELEMENTS` match modes (G002/G003) | Graph-pattern match modes (distinct from the path modes, which work).                                                                                                 |
+| Inline `LET…IN…END`, `VALUE{}` scalar subquery                    | The `LET` statement works; these are the inline-expression forms.                                                                                                     |
 
 ### Tier 3 — Excluded by design (NOT gaps to close)
 
@@ -248,10 +246,10 @@ productions and probed against the engine.
 | `IN` (list membership)                     |  ✅   |                                                                                                                                                    |
 | Labeled `n:L` / `IS [NOT] LABELED`         |  ✅   |                                                                                                                                                    |
 | Boolean test `IS [NOT] TRUE/FALSE/UNKNOWN` |  ✅   |                                                                                                                                                    |
-| `IS [NOT] DIRECTED`                        |  ❌   | Edge-direction predicate.                                                                                                                          |
-| `IS [NOT] SOURCE/DESTINATION OF`           |  ❌   |                                                                                                                                                    |
+| `IS [NOT] DIRECTED`                        |  ✅   | Every lenke edge is directed → true; null/non-edge → null.                                                                                         |
+| `IS [NOT] SOURCE/DESTINATION OF`           |  ✅   | `node IS SOURCE/DESTINATION OF edge` — reads the edge's stored endpoints.                                                                          |
 | `IS [NOT] NORMALIZED`                      |  ❌   |                                                                                                                                                    |
-| `ALL_DIFFERENT(…)` / `SAME(…)`             |  ❌   | Element-identity predicates (unknown function).                                                                                                    |
+| `ALL_DIFFERENT(…)` / `SAME(…)`             |  ✅   | Element-identity predicates (≥2 operands); three-valued on null.                                                                                   |
 | `PROPERTY_EXISTS(n, k)`                    |  ✅   | Presence test — distinguishes an absent key from a stored null (`n.k IS NOT NULL` cannot, since null is first-class). Both engines byte-identical. |
 | `BETWEEN`                                  |  ➖   | Not an ISO GQL predicate (absent from the grammar); correctly rejected.                                                                            |
 
@@ -260,7 +258,7 @@ productions and probed against the engine.
 | Construct                                        | lenke | Notes                                                             |
 | ------------------------------------------------ | :---: | ----------------------------------------------------------------- |
 | `NOT` / `AND` / `OR` / `XOR`                     |  ✅   | (`XOR` = GE07.)                                                   |
-| `!` unary-not operator                           |  ❌   | Use the `NOT` keyword.                                            |
+| `!` unary-not operator                           |  ✅   | Tight-binding (harder than the loose `NOT` keyword).              |
 | Unary `+` / `-`                                  |  ✅   |                                                                   |
 | Concatenation `\|\|`                             |  ✅   | Strings, lists, paths.                                            |
 | Arithmetic `+ - * /`, `%`/`mod`, `^`/`power`     |  ✅   | (`^` ≤1 ULP vs `power` on some inputs — see gql README.)          |
@@ -319,9 +317,8 @@ predicates, `CASE`/`COALESCE`/`NULLIF`, `OPTIONAL MATCH`, `DISTINCT`, `ORDER BY 
 NULLS FIRST/LAST`, `DETACH DELETE`, the full scalar/aggregate function set. The
 genuine gaps found (deep grammar walk): explicit **`GROUP BY`** and **`HAVING`**
 clauses (lenke groups implicitly, Cypher-style), the **`TRIM(… FROM …)`** spec
-form, the remaining element predicates (`IS DIRECTED`, `IS SOURCE/DESTINATION OF`,
-`ALL_DIFFERENT`, `SAME`, `IS NORMALIZED` — `PROPERTY_EXISTS` and `IS TYPED` are now
-**done**), multi-`MATCH` `EXISTS` (GQ22), map/record
+form, `IS NORMALIZED` (declined — see Tier 1), multi-`MATCH` `EXISTS` (GQ22),
+map/record
 values (GV45), parenthesized-subpath `WHERE` (G050), the `DIFFERENT
 EDGES`/`REPEATABLE ELEMENTS` match modes (G002/G003), inline `LET…IN…END` /
 `VALUE{}` scalar subqueries, and — by design — multi-graph `USE` (GQ01) and

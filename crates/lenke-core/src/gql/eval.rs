@@ -1237,6 +1237,61 @@ fn val_to_value(graph: &Graph, v: &Val) -> Value {
 /// ISO: an absent property — or a property of a non-element/NULL — yields NULL.
 /// Vertices and edges read from the same columnar store; `key_ref`'s id was
 /// resolved once at execute time (no per-access name lookup).
+/// The graph-element predicates. All are three-valued: a null operand — or a
+/// type mismatch (a non-edge for `DIRECTED`, a non-node/edge for `SOURCE OF`) —
+/// yields NULL rather than a definite bool. `SOURCE/DESTINATION OF` reads the
+/// edge's stored endpoints (`e_src`/`e_dst`); `ALL_DIFFERENT`/`SAME` compare by
+/// value/element identity (`val_eq`, which is element-id for nodes/edges).
+fn eval_graph_pred(
+    env: &Env,
+    kind: super::ast::GraphPredKind,
+    args: &[CExpr],
+    negated: bool,
+) -> Val {
+    use super::ast::GraphPredKind::*;
+    let vals: Vec<Val> = args.iter().map(|a| eval(env, a)).collect();
+    let result: Option<bool> = match kind {
+        Directed => match vals.first() {
+            Some(Val::Edge(_)) => Some(true), // every lenke edge is directed
+            _ => None,                        // null / non-edge → unknown
+        },
+        SourceOf | DestOf => match (vals.first(), vals.get(1)) {
+            (Some(Val::Node(vi)), Some(Val::Edge(ei))) => {
+                let idx = *ei as usize;
+                let endpoint = if matches!(kind, SourceOf) {
+                    env.graph.e_src[idx]
+                } else {
+                    env.graph.e_dst[idx]
+                };
+                Some(endpoint == *vi)
+            }
+            _ => None, // null / wrong kinds → unknown
+        },
+        AllDifferent | Same => {
+            if vals.iter().any(is_nullish) {
+                None
+            } else if matches!(kind, Same) {
+                Some(vals.windows(2).all(|w| val_eq(&w[0], &w[1])))
+            } else {
+                let mut distinct = true;
+                'outer: for i in 0..vals.len() {
+                    for j in (i + 1)..vals.len() {
+                        if val_eq(&vals[i], &vals[j]) {
+                            distinct = false;
+                            break 'outer;
+                        }
+                    }
+                }
+                Some(distinct)
+            }
+        }
+    };
+    match result {
+        Some(b) => Val::Bool(if negated { !b } else { b }),
+        None => Val::Null,
+    }
+}
+
 /// The ISO value-type predicate `x IS TYPED <category> [NOT NULL]`. Null conforms
 /// to any *nullable* type (Neo4j-verified reading), so a null value is `!not_null`
 /// regardless of category. A non-null value matches its runtime kind against the
@@ -1538,6 +1593,11 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
             let m = value_is_typed(&eval(env, expr), category, *not_null);
             Val::Bool(if *negated { !m } else { m })
         }
+        CExpr::GraphPred {
+            kind,
+            args,
+            negated,
+        } => eval_graph_pred(env, *kind, args, *negated),
         CExpr::In {
             expr,
             list,

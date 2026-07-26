@@ -404,6 +404,14 @@ export type Expr =
   // `x IS [NOT] TYPED <type> [NOT NULL]` — the ISO value-type predicate. `category`
   // is a normalized type family; null conforms to any nullable type.
   | { kind: 'isTyped'; expr: Expr; category: string; notNull: boolean; negated: boolean }
+  // Graph-element predicates: IS DIRECTED / IS SOURCE|DESTINATION OF / ALL_DIFFERENT
+  // / SAME. `args` are the element operands; `negated` only for the IS NOT forms.
+  | {
+      kind: 'graphPred';
+      predKind: 'directed' | 'sourceOf' | 'destOf' | 'allDifferent' | 'same';
+      args: Expr[];
+      negated: boolean;
+    }
   | { kind: 'in'; expr: Expr; list: Expr; negated: boolean }
   // ISO `<exists predicate>`: `EXISTS { p1, p2, … [WHERE pred] }` — TRUE when the
   // (correlated) sub-pattern has at least one match. Carries its own patterns and

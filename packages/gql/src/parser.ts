@@ -1047,8 +1047,34 @@ export const parse = (
         return { kind: 'isTyped', expr: e, category, notNull, negated };
       }
 
+      // `<edge> IS [NOT] DIRECTED`.
+      if (check('ident') && peek().value.toLowerCase() === 'directed') {
+        advance();
+
+        return { kind: 'graphPred', predKind: 'directed', args: [e], negated };
+      }
+
+      // `<node> IS [NOT] SOURCE OF <edge>` / `DESTINATION OF <edge>`.
+      for (const [word, predKind] of [
+        ['source', 'sourceOf'],
+        ['destination', 'destOf'],
+      ] as const) {
+        if (check('ident') && peek().value.toLowerCase() === word) {
+          advance();
+
+          if (!((check('keyword') || check('ident')) && peek().value.toLowerCase() === 'of')) {
+            throw new GqlSyntaxError('expected OF after SOURCE/DESTINATION', peek().pos);
+          }
+
+          advance();
+          const edge = parsePrimary();
+
+          return { kind: 'graphPred', predKind, args: [e, edge], negated };
+        }
+      }
+
       throw new GqlSyntaxError(
-        'Expected NULL, TRUE, FALSE, UNKNOWN, LABELED, or TYPED after IS',
+        'Expected NULL, TRUE, FALSE, UNKNOWN, LABELED, TYPED, DIRECTED, or SOURCE/DESTINATION OF after IS',
         peek().pos,
       );
     }
@@ -1190,6 +1216,14 @@ export const parse = (
         advance();
 
         return parseUnary();
+      }
+
+      // ISO `!` unary-not — a TIGHT unary operator (binds harder than the loose
+      // `NOT` keyword). Reuses the `not` node.
+      if (check('bang')) {
+        advance();
+
+        return { kind: 'not', expr: parseUnary() };
       }
 
       // Postfix subscript `base[index]` and property access `base.key`, chained
@@ -1407,6 +1441,44 @@ export const parse = (
     }
   };
 
+  // An ident followed by `(`: a function call or one of the keyword-shaped
+  // special forms (`CAST`, `PROPERTY_EXISTS`, `ALL_DIFFERENT`/`SAME`). Extracted
+  // from `parsePrimary` to keep that dispatcher under the complexity budget.
+  const parseCallOrSpecial = (t: ReturnType<typeof peek>): Expr => {
+    if (!t.delimited && t.value.toLowerCase() === 'cast') {
+      return parseCast();
+    }
+
+    if (!t.delimited && t.value.toLowerCase() === 'property_exists') {
+      expect('lparen', "'(' after PROPERTY_EXISTS");
+      const variable = bindName('an element variable');
+      expect('comma', "',' in PROPERTY_EXISTS(n, key)");
+      const key = bindName('a property name');
+      expect('rparen', "')' to close PROPERTY_EXISTS");
+
+      return { kind: 'property_exists', variable, key };
+    }
+
+    const identityKind = { all_different: 'allDifferent', same: 'same' }[t.value.toLowerCase()];
+
+    if (!t.delimited && identityKind) {
+      const { args } = parseCallArgs();
+
+      if (args.length < 2) {
+        throw new GqlSyntaxError('ALL_DIFFERENT/SAME require at least two arguments', peek().pos);
+      }
+
+      return {
+        kind: 'graphPred',
+        predKind: identityKind as 'allDifferent' | 'same',
+        args,
+        negated: false,
+      };
+    }
+
+    return { kind: 'func', name: t.value.toLowerCase(), ...parseCallArgs() };
+  };
+
   const parsePrimary = (): Expr => {
     const t = peek();
 
@@ -1510,28 +1582,9 @@ export const parse = (
     if (t.type === 'ident') {
       advance();
 
-      // Function call: the name may be a reserved word (e.g. UPPER, SUM, ABS).
+      // Function call or a keyword-shaped special form (the name may be reserved).
       if (check('lparen')) {
-        // `CAST(value AS type)` is a keyword-shaped call; desugar it to the
-        // matching conversion function (to_integer/…).
-        if (!t.delimited && t.value.toLowerCase() === 'cast') {
-          return parseCast();
-        }
-
-        // `PROPERTY_EXISTS(n, key)` — presence predicate; the second argument is
-        // a bare property NAME, not an expression, so it can't ride the generic
-        // function-call path.
-        if (!t.delimited && t.value.toLowerCase() === 'property_exists') {
-          expect('lparen', "'(' after PROPERTY_EXISTS");
-          const variable = bindName('an element variable');
-          expect('comma', "',' in PROPERTY_EXISTS(n, key)");
-          const key = bindName('a property name');
-          expect('rparen', "')' to close PROPERTY_EXISTS");
-
-          return { kind: 'property_exists', variable, key };
-        }
-
-        return { kind: 'func', name: t.value.toLowerCase(), ...parseCallArgs() };
+        return parseCallOrSpecial(t);
       }
 
       // A bare reserved word is not a valid variable reference.

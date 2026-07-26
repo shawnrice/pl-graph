@@ -416,6 +416,21 @@ pub enum Lit {
     Temporal(crate::temporal::Temporal),
 }
 
+/// Which graph-element predicate an [`Expr::GraphPred`] is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GraphPredKind {
+    /// `<edge> IS [NOT] DIRECTED`.
+    Directed,
+    /// `<node> IS [NOT] SOURCE OF <edge>`.
+    SourceOf,
+    /// `<node> IS [NOT] DESTINATION OF <edge>`.
+    DestOf,
+    /// `ALL_DIFFERENT(a, b, …)` — all operands are pairwise-distinct elements.
+    AllDifferent,
+    /// `SAME(a, b, …)` — all operands are the same element.
+    Same,
+}
+
 /// Expression tree (see TS `Expr`). Sub-expressions are boxed.
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -489,6 +504,16 @@ pub enum Expr {
         expr: Box<Self>,
         category: String,
         not_null: bool,
+        negated: bool,
+    },
+    /// A graph-element predicate: `IS [NOT] DIRECTED`, `IS [NOT] SOURCE/DESTINATION
+    /// OF <edge>`, `ALL_DIFFERENT(a, b, …)`, `SAME(a, b, …)`. `args` holds the
+    /// element operands (Directed: `[edge]`; Source/Dest: `[node, edge]`;
+    /// AllDifferent/Same: `[e1, e2, …]`). `negated` applies only to the `IS NOT`
+    /// forms (the function forms are never negated).
+    GraphPred {
+        kind: GraphPredKind,
+        args: Vec<Self>,
         negated: bool,
     },
     /// `PROPERTY_EXISTS(n, key)` — true iff property `key` is *present* on element

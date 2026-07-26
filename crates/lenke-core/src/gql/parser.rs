@@ -1049,8 +1049,39 @@ impl Parser {
                     negated,
                 });
             }
+            // `<edge> IS [NOT] DIRECTED`.
+            if self.check_soft("directed") || self.check_kw("directed") {
+                self.advance();
+                return Ok(Expr::GraphPred {
+                    kind: GraphPredKind::Directed,
+                    args: vec![e],
+                    negated,
+                });
+            }
+            // `<node> IS [NOT] SOURCE OF <edge>` / `DESTINATION OF <edge>`.
+            if self.check_soft("source") || self.check_kw("source") {
+                self.advance();
+                self.expect_of()?;
+                let edge = self.parse_primary()?;
+                return Ok(Expr::GraphPred {
+                    kind: GraphPredKind::SourceOf,
+                    args: vec![e, edge],
+                    negated,
+                });
+            }
+            if self.check_soft("destination") || self.check_kw("destination") {
+                self.advance();
+                self.expect_of()?;
+                let edge = self.parse_primary()?;
+                return Ok(Expr::GraphPred {
+                    kind: GraphPredKind::DestOf,
+                    args: vec![e, edge],
+                    negated,
+                });
+            }
             return err(
-                "Expected NULL, TRUE, FALSE, UNKNOWN, LABELED, or TYPED after IS",
+                "Expected NULL, TRUE, FALSE, UNKNOWN, LABELED, TYPED, DIRECTED, or \
+                 SOURCE/DESTINATION OF after IS",
                 self.peek().pos,
             );
         }
@@ -1203,6 +1234,12 @@ impl Parser {
                 p.advance();
                 return p.parse_unary();
             }
+            // ISO `!` unary-not — a TIGHT unary operator (`expressionAtom` level),
+            // so it binds harder than the loose `NOT` keyword. Reuses `Not`.
+            if p.check(Tt::Bang) {
+                p.advance();
+                return Ok(Expr::Not(Box::new(p.parse_unary()?)));
+            }
             // Postfix subscript `base[index]` and property access `base.key`,
             // chained left to right (`a[0].amount`, `head(rels).x`, `a.b[0].c`). A
             // leading `[` is still a list literal, and a bare `variable.key` is
@@ -1274,6 +1311,33 @@ impl Parser {
         }
         self.expect(Tt::RParen, "')' to close a function call")?;
         Ok((args, distinct, star))
+    }
+
+    /// `ALL_DIFFERENT(a, b, …)` / `SAME(a, b, …)` — parse the ≥2-element operand
+    /// list (the leading name is consumed; the current token is `(`).
+    fn parse_element_identity(&mut self, kind: GraphPredKind) -> R<Expr> {
+        let (args, _distinct, _star) = self.parse_call_args()?;
+        if args.len() < 2 {
+            return err(
+                "ALL_DIFFERENT/SAME require at least two element arguments",
+                self.peek().pos,
+            );
+        }
+        Ok(Expr::GraphPred {
+            kind,
+            args,
+            negated: false,
+        })
+    }
+
+    /// Consume the `OF` keyword (in `IS SOURCE/DESTINATION OF`).
+    fn expect_of(&mut self) -> R<()> {
+        if self.check_kw("of") || self.check_soft("of") {
+            self.advance();
+            Ok(())
+        } else {
+            err("expected OF after SOURCE/DESTINATION", self.peek().pos)
+        }
     }
 
     /// Read a type-name token, joining the two-word `LOCAL`/`ZONED` temporal
@@ -1552,6 +1616,14 @@ impl Parser {
                         let key = self.bind_name("a property name")?;
                         self.expect(Tt::RParen, "')'")?;
                         return Ok(Expr::PropertyExists { variable, key });
+                    }
+                    // `ALL_DIFFERENT(a, b, …)` / `SAME(a, b, …)` — element-identity
+                    // predicates over ≥2 element operands.
+                    if !t.delimited && t.value.eq_ignore_ascii_case("all_different") {
+                        return self.parse_element_identity(GraphPredKind::AllDifferent);
+                    }
+                    if !t.delimited && t.value.eq_ignore_ascii_case("same") {
+                        return self.parse_element_identity(GraphPredKind::Same);
                     }
                     let (args, distinct, star) = self.parse_call_args()?;
                     return Ok(Expr::Func {

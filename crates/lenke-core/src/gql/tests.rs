@@ -6323,3 +6323,97 @@ fn is_typed_rejects_unknown_type() {
     // An unknown type name is a loud parse error, not a silent false.
     assert!(parse("RETURN 5 IS TYPED FROBNICATE AS x").is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Graph-element predicates: IS DIRECTED, IS SOURCE/DESTINATION OF, ALL_DIFFERENT,
+// SAME — plus the `!` unary-not operator (tight-binding).
+// ---------------------------------------------------------------------------
+
+fn diamond() -> Graph {
+    // a -> b, a -> c (so a is SOURCE of both; b,c are DESTINATIONs).
+    graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+        r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}"#,
+        r#"{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e2","from":"a","to":"c","labels":["R"],"properties":{}}"#,
+    ])
+}
+
+#[test]
+fn graph_pred_is_directed() {
+    let mut g = diamond();
+    // Every lenke edge is directed → true; IS NOT DIRECTED → false.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH ()-[e:R]->() RETURN e IS DIRECTED AS d, e IS NOT DIRECTED AS nd ORDER BY d LIMIT 1",
+        ),
+        vec![vec![b(true), b(false)]]
+    );
+}
+
+#[test]
+fn graph_pred_source_destination_of() {
+    let mut g = diamond();
+    // a is the SOURCE of e1(a->b); b is the DESTINATION; b is NOT the source.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:N {id:'a'})-[e:R]->(b:N {id:'b'}) \
+             RETURN a IS SOURCE OF e AS asrc, b IS DESTINATION OF e AS bdst, \
+             b IS SOURCE OF e AS bsrc, a IS NOT DESTINATION OF e AS anotdst",
+        ),
+        vec![vec![b(true), b(true), b(false), b(true)]]
+    );
+}
+
+#[test]
+fn graph_pred_all_different_and_same() {
+    let mut g = diamond();
+    // In (a)-->(b), a and b are different elements; SAME(a,a) is true.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:N {id:'a'})-[e:R]->(b:N {id:'b'}) \
+             RETURN ALL_DIFFERENT(a, b) AS diff, SAME(a, a) AS same_aa, SAME(a, b) AS same_ab",
+        ),
+        vec![vec![b(true), b(true), b(false)]]
+    );
+    // ALL_DIFFERENT is false when two operands are the same element.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:N {id:'a'}) RETURN ALL_DIFFERENT(a, a) AS d"
+        ),
+        vec![vec![b(false)]]
+    );
+}
+
+#[test]
+fn graph_pred_null_is_three_valued() {
+    let mut g = diamond();
+    // A NULL element (unmatched OPTIONAL) → NULL, not false.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:N {id:'a'}) OPTIONAL MATCH (a)-[:NOSUCH]->(m) \
+             RETURN m IS DIRECTED AS d, ALL_DIFFERENT(a, m) AS ad",
+        ),
+        vec![vec![Value::Null, Value::Null]]
+    );
+}
+
+#[test]
+fn bang_unary_not_binds_tightly() {
+    let mut g = ndjson::decode("").unwrap();
+    // `!` is a TIGHT unary-not: `!(1=2)` true; `!true` false; and it binds harder
+    // than comparison, so `!(1=2) = true` parses as `((!(1=2)) = true)` = true.
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN !(1=2) AS a, !true AS b, (!(1=2) = true) AS c"
+        ),
+        vec![vec![b(true), b(false), b(true)]]
+    );
+}

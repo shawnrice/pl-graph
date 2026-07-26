@@ -342,6 +342,13 @@ pub enum CExpr {
         not_null: bool,
         negated: bool,
     },
+    /// A graph-element predicate (`IS DIRECTED` / `IS SOURCE|DESTINATION OF` /
+    /// `ALL_DIFFERENT` / `SAME`). Resolves like a Vec-args scalar; tree-walked.
+    GraphPred {
+        kind: super::ast::GraphPredKind,
+        args: Vec<Self>,
+        negated: bool,
+    },
     In {
         expr: Box<Self>,
         list: Box<Self>,
@@ -529,6 +536,7 @@ fn emit(e: &CExpr, out: &mut Vec<Op>) {
         | CExpr::Field { .. }
         | CExpr::PropertyExists { .. }
         | CExpr::IsTyped { .. }
+        | CExpr::GraphPred { .. }
         | CExpr::Aggregate { .. } => out.push(Op::Tree(e.clone())),
     }
 }
@@ -851,6 +859,7 @@ fn has_aggregate(expr: &CExpr) -> bool {
     match expr {
         CExpr::Aggregate { .. } => true,
         CExpr::Scalar { args, .. } => args.iter().any(has_aggregate),
+        CExpr::GraphPred { args, .. } => args.iter().any(has_aggregate),
         CExpr::Neg(e) | CExpr::Not(e) => has_aggregate(e),
         CExpr::IsNull { expr, .. }
         | CExpr::IsTruth { expr, .. }
@@ -1066,6 +1075,7 @@ fn refs_slot_below(expr: &CExpr, n: usize) -> bool {
                 || else_.as_deref().is_some_and(|e| refs_slot_below(e, n))
         }
         CExpr::Scalar { args, .. } => args.iter().any(|e| refs_slot_below(e, n)),
+        CExpr::GraphPred { args, .. } => args.iter().any(|e| refs_slot_below(e, n)),
         CExpr::Aggregate { arg, .. } => arg.as_deref().is_some_and(|e| refs_slot_below(e, n)),
         // exists/count subqueries correlate via their own bindings; lits/params/aggref don't.
         _ => false,
@@ -1236,6 +1246,15 @@ impl Lowerer {
                 expr: self.boxed(expr),
                 category: category.clone(),
                 not_null: *not_null,
+                negated: *negated,
+            },
+            Expr::GraphPred {
+                kind,
+                args,
+                negated,
+            } => CExpr::GraphPred {
+                kind: *kind,
+                args: args.iter().map(|a| self.expr(a)).collect(),
                 negated: *negated,
             },
             Expr::In {
@@ -1862,6 +1881,11 @@ fn collect_free_vars(e: &Expr, bound: &[String], free: &mut Vec<String>) {
             }
         }
         Expr::Func { args, .. } => {
+            for a in args {
+                collect_free_vars(a, bound, free);
+            }
+        }
+        Expr::GraphPred { args, .. } => {
             for a in args {
                 collect_free_vars(a, bound, free);
             }

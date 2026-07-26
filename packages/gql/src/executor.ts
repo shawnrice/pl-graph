@@ -152,6 +152,66 @@ const consistent = (binding: Binding, name: string | undefined, value: Bound): b
 const propOf = (bound: unknown, key: string): unknown =>
   (bound as { properties?: Record<string, unknown> } | undefined)?.properties?.[key] ?? null;
 
+// Element identity, mirroring the Rust `val_eq`: nodes/edges are equal iff same
+// kind + same id; a non-element falls back to structural (value) equality.
+const sameElement = (a: unknown, b: unknown): boolean => {
+  if (isVertex(a) && isVertex(b)) {
+    return a.id === b.id;
+  }
+
+  if (isEdge(a) && isEdge(b)) {
+    return a.id === b.id;
+  }
+
+  if (isElement(a) || isElement(b)) {
+    return false; // element vs non-element (or node vs edge)
+  }
+
+  return structuralEq(a, b);
+};
+
+// The graph-element predicates (`IS DIRECTED` / `IS SOURCE|DESTINATION OF` /
+// `ALL_DIFFERENT` / `SAME`). Three-valued: `null` on a null operand or a type
+// mismatch. Mirrors the Rust `eval_graph_pred`.
+const graphPredResult = (predKind: string, vals: readonly unknown[]): boolean | null => {
+  switch (predKind) {
+    case 'directed':
+      return isEdge(vals[0]) ? true : null; // every edge is directed; else unknown
+    case 'sourceOf':
+    case 'destOf': {
+      const [node, edge] = vals;
+
+      if (!isVertex(node) || !isEdge(edge)) {
+        return null;
+      }
+
+      return (predKind === 'sourceOf' ? edge.from : edge.to).id === node.id;
+    }
+    case 'allDifferent':
+    case 'same': {
+      if (vals.some(isNullish)) {
+        return null;
+      }
+
+      if (predKind === 'same') {
+        return vals.every((v) => sameElement(v, vals[0]));
+      }
+
+      for (let i = 0; i < vals.length; i++) {
+        for (let j = i + 1; j < vals.length; j++) {
+          if (sameElement(vals[i], vals[j])) {
+            return false;
+          }
+        }
+      }
+
+      return true;
+    }
+    default:
+      return null;
+  }
+};
+
 // The ISO value-type predicate `x IS TYPED <category> [NOT NULL]`. Null conforms
 // to any nullable type (Neo4j-verified), so a null value is `!notNull`. A non-null
 // value matches its runtime kind. Numeric split: `integer` = a whole-valued
@@ -425,6 +485,8 @@ const hasAggregate = (expr: Expr): boolean => {
   switch (expr.kind) {
     case 'func':
       return AGGREGATES.has(expr.name) || expr.args.some(hasAggregate);
+    case 'graphPred':
+      return expr.args.some(hasAggregate);
     case 'neg':
     case 'not':
     case 'isNull':
@@ -1522,6 +1584,24 @@ const compileExpr = (expr: Expr): CompiledExpr => {
         return negated ? !m : m;
       };
     }
+    case 'graphPred': {
+      // IS DIRECTED / IS SOURCE|DESTINATION OF / ALL_DIFFERENT / SAME.
+      const argFns = expr.args.map(compileExpr);
+      const { predKind, negated } = expr;
+
+      return (env) => {
+        const r = graphPredResult(
+          predKind,
+          argFns.map((f) => f(env)),
+        );
+
+        if (r === null) {
+          return null;
+        }
+
+        return negated ? !r : r;
+      };
+    }
     case 'in': {
       const e = compileExpr(expr.expr);
       const list = compileExpr(expr.list);
@@ -2151,6 +2231,7 @@ export const freePredicateVars = (expr: Expr): Set<string> => {
 
         return;
       case 'func':
+      case 'graphPred':
         for (const a of e.args) {
           walk(a, bound);
         }
