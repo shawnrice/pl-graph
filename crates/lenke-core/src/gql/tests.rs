@@ -6727,6 +6727,56 @@ fn value_subquery_constant_and_where() {
 }
 
 #[test]
+fn let_in_expression_binds_scoped_locals() {
+    // ISO `<let value expression>`: LET x = e IN body END. A constant fold.
+    let mut g = value_graph();
+    assert_eq!(
+        rows(&mut g, "RETURN LET x = 2 + 3 IN x * x END AS v"),
+        vec![vec![n(25.0)]]
+    );
+    // Multiple bindings, later sees earlier (y references x).
+    assert_eq!(
+        rows(&mut g, "RETURN LET x = 4, y = x + 1 IN x * y END AS v"),
+        vec![vec![n(20.0)]]
+    );
+    // Correlated: reads an outer variable in the binding.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:Person) WHERE a.id='alice' \
+             RETURN LET u = a.name IN u || '!' END AS greet",
+        ),
+        vec![vec![s("Alice!")]]
+    );
+}
+
+#[test]
+fn let_in_binding_suppresses_bare_in_operator() {
+    // The binding RHS ends at the structural IN: `LET x = a.id IN [...] END` binds
+    // `x = a.id` (NOT `a.id IN [...]`), then the body is the list membership isn't
+    // even here — the body is what follows IN. Here body = a truthy compare.
+    let mut g = value_graph();
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:Person) WHERE a.id='alice' \
+             RETURN LET nm = a.name IN nm = 'Alice' END AS ok",
+        ),
+        vec![vec![b(true)]]
+    );
+    // A parenthesized IN predicate inside a binding still works (parens re-enable
+    // the operator): x = whether alice.name is in a list.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:Person) WHERE a.id='alice' \
+             RETURN LET hit = (a.name IN ['Alice', 'Bob']) IN hit END AS present",
+        ),
+        vec![vec![b(true)]]
+    );
+}
+
+#[test]
 fn match_mode_repeatable_vs_different_edges() {
     // 2-cycle a<->b. Under DIFFERENT EDGES (= default TRAIL) a 3-hop walk can't
     // re-tread an edge; under REPEATABLE ELEMENTS (WALK) it can re-tread.

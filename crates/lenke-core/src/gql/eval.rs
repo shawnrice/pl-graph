@@ -1719,6 +1719,28 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
             env.binding,
             *sub_len,
         ),
+        CExpr::LetIn { bindings, body } => {
+            // Bind each local into a per-eval clone (left-to-right, so a later
+            // binding sees earlier ones), then evaluate the body against it. The
+            // group / aggregate context is preserved so an aggregate binding folds
+            // over the same group and the body reads the resulting scalar.
+            let mut local = env.binding.clone();
+            for (slot, cexpr) in bindings {
+                let v = {
+                    let e = Env {
+                        binding: &local,
+                        ..*env
+                    };
+                    eval(&e, cexpr)
+                };
+                local.set(*slot, v);
+            }
+            let e = Env {
+                binding: &local,
+                ..*env
+            };
+            eval(&e, body)
+        }
         CExpr::Scalar { func, args } => {
             if matches!(func, ScalarFn::Unknown) {
                 env.ctx.set_fault(FAULT_UNKNOWN_FN); // fail loud, not silent NULL

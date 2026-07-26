@@ -503,6 +503,8 @@ const hasAggregate = (expr: Expr): boolean => {
       return expr.items.some(hasAggregate);
     case 'compare':
       return hasAggregate(expr.left) || hasAggregate(expr.right);
+    case 'letIn':
+      return expr.bindings.some((b) => hasAggregate(b.expr)) || hasAggregate(expr.body);
     case 'in':
       return hasAggregate(expr.expr) || hasAggregate(expr.list);
     case 'index':
@@ -1719,6 +1721,8 @@ const compileExpr = (expr: Expr): CompiledExpr => {
       return compileCountSubquery(expr);
     case 'valueSubquery':
       return compileValueSubquery(expr);
+    case 'letIn':
+      return compileLetIn(expr);
   }
 };
 
@@ -1901,6 +1905,29 @@ const compileValueSubquery = (expr: Extract<Expr, { kind: 'valueSubquery' }>): C
     }
 
     return retFn({ ...env, binding: matches[0] });
+  };
+};
+
+/**
+ * ISO `<let value expression>`: `LET x = e, … IN body END`. Binds each local into
+ * a fresh extended binding (left-to-right, so a later binding sees earlier ones),
+ * then evaluates the body against it. The group / aggregate context is preserved
+ * so an aggregate binding folds over the same group and the body reads the
+ * resulting scalar. Mirrors the native `CExpr::LetIn`.
+ */
+const compileLetIn = (expr: Extract<Expr, { kind: 'letIn' }>): CompiledExpr => {
+  const bindings = expr.bindings.map((b) => ({ name: b.var, fn: compileExpr(b.expr) }));
+  const bodyFn = compileExpr(expr.body);
+
+  return (env) => {
+    const local = new Map(env.binding);
+    const scoped: EvalEnv = { ...env, binding: local };
+
+    for (const { name, fn } of bindings) {
+      local.set(name, fn(scoped));
+    }
+
+    return bodyFn(scoped);
   };
 };
 
@@ -2259,6 +2286,20 @@ export const freePredicateVars = (expr: Expr): Set<string> => {
     }
   };
 
+  // `LET x = e, … IN body END`: each binding may reference outer vars and prior
+  // LET locals; the local it introduces then shadows for later bindings and the
+  // body. Extracted from `walk` to keep that switch under the complexity budget.
+  const walkLetIn = (e: Extract<Expr, { kind: 'letIn' }>, bound: ReadonlySet<string>): void => {
+    const inner = new Set(bound);
+
+    for (const b of e.bindings) {
+      walk(b.expr, inner);
+      inner.add(b.var);
+    }
+
+    walk(e.body, inner);
+  };
+
   const walk = (e: Expr, bound: ReadonlySet<string>): void => {
     switch (e.kind) {
       case 'var':
@@ -2338,6 +2379,10 @@ export const freePredicateVars = (expr: Expr): Set<string> => {
       case 'countSubquery':
       case 'valueSubquery':
         walkSubquery(e, bound);
+
+        return;
+      case 'letIn':
+        walkLetIn(e, bound);
 
         return;
     }

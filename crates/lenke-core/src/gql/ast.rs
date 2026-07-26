@@ -552,6 +552,13 @@ pub enum Expr {
         where_: Option<Box<Self>>,
         ret: Box<Self>,
     },
+    /// ISO `<let value expression>`: `LET x = e1, y = e2 IN <body> END` — binds
+    /// scoped locals (each visible to later bindings and the body), then yields
+    /// the body's value. A scalar expression, not a clause.
+    LetIn {
+        bindings: Vec<LetItem>,
+        body: Box<Self>,
+    },
     /// ISO CASE: `subject` present → simple CASE, else searched.
     Case {
         subject: Option<Box<Self>>,

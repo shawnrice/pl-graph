@@ -434,6 +434,14 @@ export type Expr =
       where?: Expr;
       ret: Expr;
     }
+  // ISO `<let value expression>`: `LET x = e1, y = e2 IN <body> END` — binds
+  // scoped locals (each visible to later bindings and the body), then yields the
+  // body's value. A scalar expression, not the `LET` clause.
+  | {
+      kind: 'letIn';
+      bindings: readonly { var: string; expr: Expr }[];
+      body: Expr;
+    }
   // ISO `<case expression>`. With `subject`: a simple CASE (`subject = when`);
   // without: a searched CASE (`when` is a boolean condition). `elseExpr` is the
   // ELSE result, defaulting to NULL.

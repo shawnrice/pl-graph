@@ -374,6 +374,13 @@ pub enum CExpr {
         is_agg: bool,
         sub_len: usize,
     },
+    /// `LET (slot = expr)+ IN body END` — each binding is written into a per-eval
+    /// clone of the row binding (left-to-right, later sees earlier), then `body`
+    /// is evaluated against it.
+    LetIn {
+        bindings: Vec<(usize, Box<Self>)>,
+        body: Box<Self>,
+    },
     Case {
         subject: Option<Box<Self>>,
         whens: Vec<(Self, Self)>,
@@ -542,6 +549,7 @@ fn emit(e: &CExpr, out: &mut Vec<Op>) {
         | CExpr::Exists { .. }
         | CExpr::CountSubquery { .. }
         | CExpr::ValueSubquery { .. }
+        | CExpr::LetIn { .. }
         | CExpr::Index { .. }
         | CExpr::Field { .. }
         | CExpr::PropertyExists { .. }
@@ -898,6 +906,9 @@ fn has_aggregate(expr: &CExpr) -> bool {
             items.iter().any(has_aggregate)
         }
         CExpr::Compare { left, right, .. } => has_aggregate(left) || has_aggregate(right),
+        CExpr::LetIn { bindings, body } => {
+            bindings.iter().any(|(_, e)| has_aggregate(e)) || has_aggregate(body)
+        }
         CExpr::In { expr, list, .. } => has_aggregate(expr) || has_aggregate(list),
         CExpr::List(items) => items.iter().any(has_aggregate),
         CExpr::Index { base, index } => has_aggregate(base) || has_aggregate(index),
@@ -1329,6 +1340,27 @@ impl Lowerer {
                     ret: cret,
                     is_agg,
                     sub_len,
+                }
+            }
+            Expr::LetIn { bindings, body } => {
+                // Each binding compiles against the scope so far (prior LET vars
+                // included), THEN its variable is added so later bindings and the
+                // body can see it — mirroring the LET *statement*. The locals are
+                // scoped to this expression, so restore the outer scope after.
+                let parent_len = self.scope.len();
+                let cbindings = bindings
+                    .iter()
+                    .map(|it| {
+                        let cexpr = self.boxed(&it.expr);
+                        let slot = self.add_var(&it.var);
+                        (slot, cexpr)
+                    })
+                    .collect();
+                let cbody = self.boxed(body);
+                self.scope.truncate(parent_len);
+                CExpr::LetIn {
+                    bindings: cbindings,
+                    body: cbody,
                 }
             }
             Expr::Case {
@@ -1989,6 +2021,18 @@ fn collect_free_vars(e: &Expr, bound: &[String], free: &mut Vec<String>) {
                 collect_free_vars(w, &inner, free);
             }
             collect_free_vars(ret, &inner, free);
+        }
+        Expr::LetIn { bindings, body } => {
+            // Each binding may reference outer vars and prior LET locals; the LET
+            // variable it introduces then shadows for later bindings and the body.
+            let mut inner = bound.to_vec();
+            for it in bindings {
+                collect_free_vars(&it.expr, &inner, free);
+                if !inner.iter().any(|n| n == &it.var) {
+                    inner.push(it.var.clone());
+                }
+            }
+            collect_free_vars(body, &inner, free);
         }
     }
 }

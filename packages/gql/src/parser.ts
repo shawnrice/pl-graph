@@ -304,6 +304,11 @@ export const parse = (
   // `GqlSyntaxError` past a fixed bound, well below any real stack limit.
   const MAX_DEPTH = 500;
   let depth = 0;
+  // Whether a bare `IN` is the membership operator (default) or a structural
+  // keyword. Suppressed only while parsing a `LET … IN … END` binding's RHS so
+  // the binding's value expression ends at the structural `IN`; re-enabled inside
+  // any grouped sub-expression (see `parsePrimary`).
+  let inOperatorEnabled = true;
 
   const descend = <T>(body: () => T): T => {
     depth += 1;
@@ -1135,13 +1140,13 @@ export const parse = (
       );
     }
 
-    if (checkKeyword('in')) {
+    if (inOperatorEnabled && checkKeyword('in')) {
       advance();
 
       return { kind: 'in', expr: e, list: parseUnary(), negated: false };
     }
 
-    if (checkKeyword('not')) {
+    if (inOperatorEnabled && checkKeyword('not')) {
       advance();
       expectKeyword('in');
 
@@ -1489,6 +1494,34 @@ export const parse = (
     return { kind: 'valueSubquery', patterns, where, ret };
   };
 
+  // ISO `<let value expression>`: `LET x = e1, y = e2 IN <body> END`. Each
+  // binding's RHS is parsed with the bare `IN` operator suppressed so the value
+  // expression ends at the structural `IN` (a parenthesized `IN` predicate still
+  // works — `parsePrimary` re-enables it inside the parens).
+  const parseLetIn = (): Expr => {
+    expectKeyword('let');
+    const bindings: { var: string; expr: Expr }[] = [];
+
+    do {
+      const v = bindName('a LET variable');
+      expect('eq', "'=' after a LET variable");
+      const saved = inOperatorEnabled;
+      inOperatorEnabled = false;
+
+      try {
+        bindings.push({ var: v, expr: parseExpr() });
+      } finally {
+        inOperatorEnabled = saved;
+      }
+    } while (check('comma') && (advance(), true));
+
+    expectKeyword('in');
+    const body = parseExpr();
+    expectKeyword('end');
+
+    return { kind: 'letIn', bindings, body };
+  };
+
   // ISO `<case expression>`: `CASE [subject] (WHEN test THEN result)+ [ELSE r] END`.
   // A subject before the first WHEN makes it a simple CASE; otherwise searched.
   const parseCase = (): Expr => {
@@ -1640,7 +1673,23 @@ export const parse = (
     return { kind: 'func', name: t.value.toLowerCase(), ...parseCallArgs() };
   };
 
+  // A primary is a grouping boundary: any sub-expression it parses (parens, list,
+  // call args, subscript, CASE, subquery bodies) is a fresh value expression, so
+  // re-enable the `IN` operator for its extent. This restores the default inside
+  // `(…)` even while a `LET` binding's top level suppresses a bare `IN`, so
+  // `LET x = (a IN [1]) IN body END` parses as intended.
   const parsePrimary = (): Expr => {
+    const saved = inOperatorEnabled;
+    inOperatorEnabled = true;
+
+    try {
+      return parsePrimaryInner();
+    } finally {
+      inOperatorEnabled = saved;
+    }
+  };
+
+  const parsePrimaryInner = (): Expr => {
     const t = peek();
 
     if (t.type === 'number') {
@@ -1707,6 +1756,13 @@ export const parse = (
 
     if (checkKeyword('case')) {
       return parseCase();
+    }
+
+    // ISO `<let value expression>`: `LET x = e, … IN <body> END`. In expression
+    // position `LET` is always the let-value-expression (the LET *statement* only
+    // appears at clause position).
+    if (checkKeyword('let')) {
+      return parseLetIn();
     }
 
     if (checkKeyword('exists')) {

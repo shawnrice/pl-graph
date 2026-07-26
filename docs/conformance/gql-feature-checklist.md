@@ -68,7 +68,6 @@ Ordered roughly cheap→involved.
 | Map / record values (GV45)                                        | No first-class map value; larger (touches the value model).                                                                                                                  |
 | Parenthesized-subpath `WHERE` (G050/G051)                         | Per-_edge_ `WHERE` works; per-subpath doesn't.                                                                                                                               |
 | `DIFFERENT EDGES` / `REPEATABLE ELEMENTS` match modes (G002/G003) | Graph-pattern match modes (distinct from the path modes, which work).                                                                                                        |
-| Inline `LET…IN…END`                                               | The `LET` statement works; this is the inline-expression form. (`VALUE{}` scalar subquery — ✅ shipped.)                                                                     |
 
 ### Tier 3 — Excluded by design (NOT gaps to close)
 
@@ -255,18 +254,18 @@ productions and probed against the engine.
 
 ### Expressions & operators
 
-| Construct                                        | lenke | Notes                                                             |
-| ------------------------------------------------ | :---: | ----------------------------------------------------------------- |
-| `NOT` / `AND` / `OR` / `XOR`                     |  ✅   | (`XOR` = GE07.)                                                   |
-| `!` unary-not operator                           |  ✅   | Tight-binding (harder than the loose `NOT` keyword).              |
-| Unary `+` / `-`                                  |  ✅   |                                                                   |
-| Concatenation `\|\|`                             |  ✅   | Strings, lists, paths.                                            |
-| Arithmetic `+ - * /`, `%`/`mod`, `^`/`power`     |  ✅   | (`^` ≤1 ULP vs `power` on some inputs — see gql README.)          |
-| `CASE` (simple + searched), `NULLIF`, `COALESCE` |  ✅   |                                                                   |
-| Property `.`, list index `[i]`                   |  ✅   |                                                                   |
-| List slice `[i..j]`                              |  ❌   | No slicing.                                                       |
-| `LET … IN … END` (inline let-expression)         |  ❌   | The `LET` _statement_ works; the inline expression form does not. |
-| `VALUE { subquery }` (scalar subquery)           |  ✅   | Correlated; 0 rows→NULL, 1→value, >1 non-agg→cardinality error, aggregate RETURN folds the group. |
+| Construct                                        | lenke | Notes                                                                                                                     |
+| ------------------------------------------------ | :---: | ------------------------------------------------------------------------------------------------------------------------- |
+| `NOT` / `AND` / `OR` / `XOR`                     |  ✅   | (`XOR` = GE07.)                                                                                                           |
+| `!` unary-not operator                           |  ✅   | Tight-binding (harder than the loose `NOT` keyword).                                                                      |
+| Unary `+` / `-`                                  |  ✅   |                                                                                                                           |
+| Concatenation `\|\|`                             |  ✅   | Strings, lists, paths.                                                                                                    |
+| Arithmetic `+ - * /`, `%`/`mod`, `^`/`power`     |  ✅   | (`^` ≤1 ULP vs `power` on some inputs — see gql README.)                                                                  |
+| `CASE` (simple + searched), `NULLIF`, `COALESCE` |  ✅   |                                                                                                                           |
+| Property `.`, list index `[i]`                   |  ✅   |                                                                                                                           |
+| List slice `[i..j]`                              |  ❌   | No slicing.                                                                                                               |
+| `LET … IN … END` (inline let-expression)         |  ✅   | Scoped locals (later binding sees earlier); binding RHS ends at the structural `IN` (parenthesize a bare `IN` predicate). |
+| `VALUE { subquery }` (scalar subquery)           |  ✅   | Correlated; 0 rows→NULL, 1→value, >1 non-agg→cardinality error, aggregate RETURN folds the group.                         |
 
 ### Scalar / string functions (detail)
 
@@ -320,8 +319,8 @@ statement lenke lacks — not `RETURN`), `IS NORMALIZED` (declined — see
 Tier 1), multi-`MATCH` `EXISTS` (GQ22),
 map/record
 values (GV45), parenthesized-subpath `WHERE` (G050), the `DIFFERENT
-EDGES`/`REPEATABLE ELEMENTS` match modes (G002/G003), inline `LET…IN…END` /
-`VALUE{}` scalar subqueries, and — by design — multi-graph `USE` (GQ01) and
+EDGES`/`REPEATABLE ELEMENTS` match modes (G002/G003), and — by design —
+multi-graph `USE` (GQ01) and
 `INT64` (GV12). The remaining **mandatory** gap is the deliberately-declined
 Unicode normalization (`normalize()` + `IS NORMALIZED`, zero-dep tradeoff); with
 `IS TYPED` shipped, there are **no open mandatory gaps**. See

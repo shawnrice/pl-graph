@@ -170,6 +170,40 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(() => nativeGraph.query(q)).toThrow();
   });
 
+  test('LET … IN … END — ISO scalar let-expression, byte-identical', () => {
+    // Constant fold.
+    const [ts1, nat1] = both(`RETURN LET x = 2 + 3 IN x * x END AS v`);
+    expect(ts1).toBe(nat1);
+    expect(ts1).toBe(`[{"v":25}]`);
+
+    // Multiple bindings; a later binding sees an earlier one.
+    const [ts2, nat2] = both(`RETURN LET x = 4, y = x + 1 IN x * y END AS v`);
+    expect(ts2).toBe(nat2);
+    expect(ts2).toBe(`[{"v":20}]`);
+
+    // Correlated: the binding reads an outer variable.
+    const [ts3, nat3] = both(
+      `MATCH (n:Person {name: 'marko'}) RETURN LET u = n.name IN u || '!' END AS greet`,
+    );
+    expect(ts3).toBe(nat3);
+    expect(ts3).toBe(`[{"greet":"marko!"}]`);
+
+    // The binding RHS ends at the structural IN (bare IN operator suppressed).
+    const [ts4, nat4] = both(
+      `MATCH (n:Person {name: 'marko'}) RETURN LET nm = n.name IN nm = 'marko' END AS ok`,
+    );
+    expect(ts4).toBe(nat4);
+    expect(ts4).toBe(`[{"ok":true}]`);
+
+    // A parenthesized IN predicate inside a binding still works (parens re-enable
+    // the operator).
+    const [ts5, nat5] = both(
+      `MATCH (n:Person {name: 'marko'}) RETURN LET hit = (n.name IN ['marko', 'josh']) IN hit END AS present`,
+    );
+    expect(ts5).toBe(nat5);
+    expect(ts5).toBe(`[{"present":true}]`);
+  });
+
   test('list[i] — ISO GQL 0-based subscript, null-safe, byte-identical', () => {
     const cases: Array<[string, string]> = [
       // 0-based: [0] is the first element.

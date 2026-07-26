@@ -94,6 +94,7 @@ pub fn parse_with_max_chain(src: &str, max_chain: usize) -> Result<Statement, Sy
         tokens,
         pos: 0,
         depth: 0,
+        in_operator_enabled: true,
         dialect: Dialect::Lenke,
         max_chain,
     };
@@ -113,6 +114,7 @@ pub fn parse_predicate(src: &str) -> Result<Expr, SyntaxError> {
         tokens,
         pos: 0,
         depth: 0,
+        in_operator_enabled: true,
         dialect: Dialect::Lenke,
         max_chain: DEFAULT_MAX_CHAIN,
     };
@@ -140,6 +142,7 @@ pub fn parse_with_dialect(src: &str, dialect: Dialect) -> Result<Query, SyntaxEr
         tokens,
         pos: 0,
         depth: 0,
+        in_operator_enabled: true,
         dialect,
         max_chain: DEFAULT_MAX_CHAIN,
     };
@@ -155,6 +158,7 @@ pub fn parse_query_with_max_chain(src: &str, max_chain: usize) -> Result<Query, 
         tokens,
         pos: 0,
         depth: 0,
+        in_operator_enabled: true,
         dialect: Dialect::Lenke,
         max_chain,
     };
@@ -170,6 +174,11 @@ struct Parser {
     dialect: Dialect,
     /// Operator-chain ceiling for this parse (see [`DEFAULT_MAX_CHAIN`]).
     max_chain: usize,
+    /// Whether a bare `IN` is the membership operator (default) or a structural
+    /// keyword. Suppressed only while parsing a `LET … IN … END` binding's RHS so
+    /// the binding's value expression ends at the structural `IN`; re-enabled
+    /// inside any grouped sub-expression (see [`Parser::parse_primary`]).
+    in_operator_enabled: bool,
 }
 
 /// Recursion-depth ceiling. Recursive descent over deeply nested input
@@ -1130,7 +1139,7 @@ impl Parser {
                 self.peek().pos,
             );
         }
-        if self.check_kw("in") {
+        if self.in_operator_enabled && self.check_kw("in") {
             self.advance();
             return Ok(Expr::In {
                 expr: Box::new(e),
@@ -1138,7 +1147,7 @@ impl Parser {
                 negated: false,
             });
         }
-        if self.check_kw("not") {
+        if self.in_operator_enabled && self.check_kw("not") {
             self.advance();
             self.expect_kw("in")?;
             return Ok(Expr::In {
@@ -1634,7 +1643,20 @@ impl Parser {
         }
     }
 
+    /// A primary is a grouping boundary: any sub-expression it parses (parens,
+    /// list, call args, subscript, CASE, subquery bodies) is a fresh value
+    /// expression, so re-enable the `IN` operator for its extent. This restores
+    /// the default inside `(…)` even while a `LET` binding's top level suppresses
+    /// a bare `IN` — so `LET x = (a IN [1]) IN body END` parses as intended.
     fn parse_primary(&mut self) -> R<Expr> {
+        let saved = self.in_operator_enabled;
+        self.in_operator_enabled = true;
+        let r = self.parse_primary_inner();
+        self.in_operator_enabled = saved;
+        r
+    }
+
+    fn parse_primary_inner(&mut self) -> R<Expr> {
         let t = self.peek().clone();
         match t.tt {
             Tt::Number => {
@@ -1686,6 +1708,10 @@ impl Parser {
                 Ok(Expr::Lit(Lit::Null))
             }
             Tt::Keyword if t.value == "case" => self.parse_case(),
+            // ISO `<let value expression>`: `LET x = e, … IN <body> END`. In
+            // expression position `LET` is always the let-value-expression (the
+            // LET *statement* only appears at clause position).
+            Tt::Keyword if t.value == "let" => self.parse_let_in(),
             Tt::Keyword if t.value == "exists" => {
                 self.advance();
                 let (patterns, where_) = self.parse_braced_subquery()?;
@@ -1943,6 +1969,33 @@ impl Parser {
 
     /// `LET x = <expr> [, y = <expr>]*` — ISO GQL §14.7. Comma-separated bindings,
     /// evaluated left-to-right (a later item may reference an earlier one).
+    /// `LET x = e1, y = e2 IN <body> END` — the inline let-value expression.
+    /// Each binding's RHS is parsed with the bare `IN` operator suppressed so the
+    /// value expression ends at the structural `IN` (a parenthesized `IN`
+    /// predicate still works — `parse_primary` re-enables it inside the parens).
+    fn parse_let_in(&mut self) -> R<Expr> {
+        self.expect_kw("let")?;
+        let mut bindings = Vec::new();
+        loop {
+            let var = self.bind_name("a LET variable")?;
+            self.expect(Tt::Eq, "'=' after a LET variable")?;
+            let saved = self.in_operator_enabled;
+            self.in_operator_enabled = false;
+            let expr = self.parse_expr();
+            self.in_operator_enabled = saved;
+            bindings.push(LetItem { var, expr: expr? });
+            if self.check(Tt::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect_kw("in")?;
+        let body = Box::new(self.parse_expr()?);
+        self.expect_kw("end")?;
+        Ok(Expr::LetIn { bindings, body })
+    }
+
     fn parse_let_clause(&mut self) -> R<Vec<LetItem>> {
         self.expect_kw("let")?;
         let mut items = Vec::new();
