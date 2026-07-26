@@ -6248,3 +6248,78 @@ fn property_exists_on_edges_and_non_elements() {
         vec![vec![Value::Null], vec![Value::Null]]
     );
 }
+
+// ---------------------------------------------------------------------------
+// IS [NOT] TYPED <type> [NOT NULL] — the ISO value-type predicate. Null conforms
+// to any nullable type (Neo4j-verified reading); `NOT NULL` excludes it. Numeric
+// split is boundary-inferred (INTEGER = whole number) since lenke has one f64 type.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn is_typed_scalar_and_numeric_inference() {
+    let mut g = ndjson::decode("").unwrap();
+    let row = rows(
+        &mut g,
+        "RETURN 5 IS TYPED INTEGER AS a, 5.5 IS TYPED INTEGER AS b, 5.5 IS TYPED FLOAT AS c, \
+         5 IS TYPED FLOAT AS d, 'x' IS TYPED STRING AS e, true IS TYPED BOOL AS f, \
+         [1,2] IS TYPED LIST AS h, 5 IS TYPED STRING AS i",
+    );
+    assert_eq!(
+        row,
+        vec![vec![
+            b(true),  // 5 is a whole number → INTEGER
+            b(false), // 5.5 is not whole → not INTEGER
+            b(true),  // 5.5 is a number → FLOAT
+            b(true),  // 5 is a number → FLOAT (one f64 type: a whole number is both)
+            b(true),
+            b(true),
+            b(true),
+            b(false), // 5 is not a STRING
+        ]]
+    );
+}
+
+#[test]
+fn is_typed_temporal_and_negation() {
+    let mut g = ndjson::decode("").unwrap();
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN DATE '2020-01-01' IS TYPED DATE AS a, \
+             DATE '2020-01-01' IS TYPED LOCAL DATETIME AS b, \
+             DATETIME '2020-01-01T00:00:00' IS TYPED LOCAL DATETIME AS c, \
+             duration('P1D') IS TYPED DURATION AS d, \
+             5 IS NOT TYPED STRING AS e, 5 IS NOT TYPED INTEGER AS f",
+        ),
+        vec![vec![b(true), b(false), b(true), b(true), b(true), b(false)]]
+    );
+}
+
+#[test]
+fn is_typed_null_conformance_and_not_null() {
+    let mut g = ndjson::decode("").unwrap();
+    // Null conforms to any nullable type → true; NOT NULL excludes it → false.
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN null IS TYPED INTEGER AS a, null IS TYPED INTEGER NOT NULL AS b, \
+             null IS TYPED STRING AS c, null IS TYPED NULL AS d, null IS TYPED ANY AS e, \
+             null IS TYPED ANY NOT NULL AS f",
+        ),
+        vec![vec![b(true), b(false), b(true), b(true), b(true), b(false)]]
+    );
+    // A non-null value: NOT NULL makes no difference; ANY always matches.
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN 5 IS TYPED INTEGER NOT NULL AS a, 5 IS TYPED ANY AS b, 5 IS TYPED NULL AS c",
+        ),
+        vec![vec![b(true), b(true), b(false)]]
+    );
+}
+
+#[test]
+fn is_typed_rejects_unknown_type() {
+    // An unknown type name is a loud parse error, not a silent false.
+    assert!(parse("RETURN 5 IS TYPED FROBNICATE AS x").is_err());
+}

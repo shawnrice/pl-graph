@@ -36,7 +36,8 @@ whether it's worth closing. Tiers 1–2 are real gaps; Tier 3 is deliberate.
 
 ### Tier 1 — Mandatory-conformance gaps
 
-Three mandatory-set gaps exist. **Two are a deliberate decline, not a to-do:**
+**No open mandatory gaps.** Of the three the audit found, one (`IS TYPED`) is now
+shipped; the other two are a deliberate decline, not a to-do:
 
 - **`normalize()` + `IS [NOT] NORMALIZED`** — the Unicode string-normalization
   feature (NFC/NFD/NFKC/NFKD). **Declined** (2026-07 conformance audit): a
@@ -47,11 +48,13 @@ Three mandatory-set gaps exist. **Two are a deliberate decline, not a to-do:**
   function; would only return as an opt-in if a real workload needs it. So lenke
   is knowingly, minimally non-conformant here.
 
-The one genuinely-open item:
-
-| Gap                                    | Fix shape                                                                                                                      |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `IS TYPED` / `::` value-type predicate | Add the runtime type-check predicate. (Mandatory-vs-optional is ambiguous without the spec text; no prior decision on record.) |
+The one genuinely-open item — **`IS TYPED` — is now closed** (2026-07-26): the
+`x IS [NOT] TYPED <type> [NOT NULL]` value-type predicate ships on both engines,
+byte-identical. Null conforms to any nullable type (`NOT NULL` excludes it);
+numeric split is boundary-inferred (INTEGER = whole-valued number, since lenke has
+one f64 type). The `::` alias and parameterized types (`LIST<T>`, `VARCHAR(n)`)
+are deferred. So the only remaining mandatory-set gap is the deliberately-declined
+Unicode normalization above.
 
 ### Tier 2 — Genuine optional-feature gaps (real, not by design)
 
@@ -100,7 +103,7 @@ section):
 | ----------------------------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `<character string function>` | `normalize()`         | **Declined** — Unicode normalization; needs a normalization-table dep, niche, handle at ingest. See [Gaps → Tier 1](#tier-1--mandatory-conformance-gaps). |
 | `<normalized predicate>`      | `IS [NOT] NORMALIZED` | **Declined** — same Unicode-normalization feature as `normalize()`.                                                                                       |
-| `<value type predicate>`      | `IS TYPED` / `::`     | Rejected; genuinely open (no prior decision). Also surfaces as optional GA06 — mandatory-vs-optional is ambiguous.                                        |
+| `<value type predicate>`      | `IS TYPED`            | **Closed 2026-07-26** — `x IS [NOT] TYPED <type> [NOT NULL]` (also optional GA06). `::` alias + parameterized types deferred.                             |
 
 Everything else in the mandatory list is supported (INSERT/SET/REMOVE/DELETE,
 MATCH/OPTIONAL MATCH, RETURN/FINISH, ORDER BY/SKIP/OFFSET/LIMIT, UNION/UNION ALL,
@@ -138,20 +141,20 @@ char_length/character_length, `||`, left/lower/right/trim/upper).
 
 ### Built-in functions
 
-| ID   | Feature                                   | lenke | Notes                                        |
-| ---- | ----------------------------------------- | :---: | -------------------------------------------- |
-| GF01 | Enhanced numeric functions                |  ✅   | `abs/floor/ceil/sqrt/…`                      |
-| GF02 | Trigonometric functions                   |  ✅   |                                              |
-| GF03 | Logarithmic functions                     |  ✅   |                                              |
-| GF04 | Enhanced path functions                   |  ✅   | `path_length`, `nodes`, `edges`, `elements`. |
-| GF05 | Multi-character trim functions            |  ✅   | `ltrim`/`rtrim`/`btrim`.                     |
-| GF06 | Explicit `TRIM` function                  |  ✅   |                                              |
-| GF07 | Temporal duration functions               |  ✅   | `duration_between`.                          |
-| GF10 | Advanced aggregates: general set          |  ✅   | `stddev_pop`/`stddev_samp`.                  |
-| GF11 | Advanced aggregates: binary set           |  ✅   | `percentile_cont`/`percentile_disc`.         |
-| GA05 | Cast specification (`CAST`)               |  ✅   |                                              |
-| G100 | `ELEMENT_ID` function                     |  ✅   | `element_id(x)`.                             |
-| GA06 | Value type predicates (`IS TYPED` / `::`) |  ❌   | Rejected.                                    |
+| ID   | Feature                            | lenke | Notes                                                                                                                                                               |
+| ---- | ---------------------------------- | :---: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GF01 | Enhanced numeric functions         |  ✅   | `abs/floor/ceil/sqrt/…`                                                                                                                                             |
+| GF02 | Trigonometric functions            |  ✅   |                                                                                                                                                                     |
+| GF03 | Logarithmic functions              |  ✅   |                                                                                                                                                                     |
+| GF04 | Enhanced path functions            |  ✅   | `path_length`, `nodes`, `edges`, `elements`.                                                                                                                        |
+| GF05 | Multi-character trim functions     |  ✅   | `ltrim`/`rtrim`/`btrim`.                                                                                                                                            |
+| GF06 | Explicit `TRIM` function           |  ✅   |                                                                                                                                                                     |
+| GF07 | Temporal duration functions        |  ✅   | `duration_between`.                                                                                                                                                 |
+| GF10 | Advanced aggregates: general set   |  ✅   | `stddev_pop`/`stddev_samp`.                                                                                                                                         |
+| GF11 | Advanced aggregates: binary set    |  ✅   | `percentile_cont`/`percentile_disc`.                                                                                                                                |
+| GA05 | Cast specification (`CAST`)        |  ✅   |                                                                                                                                                                     |
+| G100 | `ELEMENT_ID` function              |  ✅   | `element_id(x)`.                                                                                                                                                    |
+| GA06 | Value type predicates (`IS TYPED`) |  ✅   | `x IS [NOT] TYPED <type> [NOT NULL]`, both engines. Null conforms to nullable types; INTEGER = whole number (f64 model). `::` alias + parameterized types deferred. |
 
 ### Query composition & clauses
 
@@ -317,14 +320,14 @@ NULLS FIRST/LAST`, `DETACH DELETE`, the full scalar/aggregate function set. The
 genuine gaps found (deep grammar walk): explicit **`GROUP BY`** and **`HAVING`**
 clauses (lenke groups implicitly, Cypher-style), the **`TRIM(… FROM …)`** spec
 form, the remaining element predicates (`IS DIRECTED`, `IS SOURCE/DESTINATION OF`,
-`ALL_DIFFERENT`, `SAME`, `IS NORMALIZED` — `PROPERTY_EXISTS` is now **done**),
-`IS TYPED` (GA06), multi-`MATCH` `EXISTS` (GQ22), map/record
+`ALL_DIFFERENT`, `SAME`, `IS NORMALIZED` — `PROPERTY_EXISTS` and `IS TYPED` are now
+**done**), multi-`MATCH` `EXISTS` (GQ22), map/record
 values (GV45), parenthesized-subpath `WHERE` (G050), the `DIFFERENT
 EDGES`/`REPEATABLE ELEMENTS` match modes (G002/G003), inline `LET…IN…END` /
 `VALUE{}` scalar subqueries, and — by design — multi-graph `USE` (GQ01) and
-`INT64` (GV12). Of the three **mandatory** gaps, two — `normalize()` and
-`IS NORMALIZED` (the Unicode-normalization feature) — are a **deliberate decline**
-(zero-dep tradeoff); only `IS TYPED` is genuinely open. See
+`INT64` (GV12). The remaining **mandatory** gap is the deliberately-declined
+Unicode normalization (`normalize()` + `IS NORMALIZED`, zero-dep tradeoff); with
+`IS TYPED` shipped, there are **no open mandatory gaps**. See
 [Gaps](#gaps-prioritized).
 
 **Statement/program surface** (grammar-derived): **transactions are supported**

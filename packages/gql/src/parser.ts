@@ -127,6 +127,46 @@ const CAST_TEMPORAL = new Map<string, string>([
   ['duration', 'duration'],
 ]);
 
+// Map a type name to the normalized `IS TYPED` category. Reuses the CAST
+// vocabulary + temporal kinds + `null`/`nothing`/`any`. Mirrors Rust
+// `type_test_category`. The `integer` vs `float` split is resolved at eval by
+// boundary inference (one f64 numeric type).
+const typeTestCategory = (typeName: string): string | null => {
+  const t = typeName.toLowerCase();
+
+  if (CAST_INT.has(t)) {
+    return 'integer';
+  }
+
+  if (CAST_FLOAT.has(t)) {
+    return 'float';
+  }
+
+  if (CAST_STRING.has(t)) {
+    return 'string';
+  }
+
+  if (CAST_BOOL.has(t)) {
+    return 'bool';
+  }
+
+  if (CAST_LIST.has(t)) {
+    return 'list';
+  }
+
+  if (CAST_TEMPORAL.has(t)) {
+    return CAST_TEMPORAL.get(t) === 'datetime'
+      ? 'local_datetime'
+      : (CAST_TEMPORAL.get(t) as string);
+  }
+
+  if (t === 'null' || t === 'nothing') {
+    return 'null';
+  }
+
+  return t === 'any' ? 'any' : null;
+};
+
 const castTargetFn = (typeName: string): string | null => {
   const t = typeName.toLowerCase();
 
@@ -985,8 +1025,30 @@ export const parse = (
         return { kind: 'isLabeled', expr: e, label: parseLabelExpr(), negated };
       }
 
+      // ISO `<value type predicate>`: IS [NOT] TYPED <type> [NOT NULL]. TYPED is
+      // reserved-but-not-structural, so it arrives as an identifier.
+      if ((check('ident') || check('keyword')) && peek().value.toLowerCase() === 'typed') {
+        advance();
+        const typeName = readTypeName();
+        const category = typeTestCategory(typeName);
+
+        if (category === null) {
+          throw new GqlSyntaxError(`unsupported type '${typeName}' in IS TYPED`, peek().pos);
+        }
+
+        let notNull = false;
+
+        if (checkKeyword('not')) {
+          advance();
+          expectKeyword('null');
+          notNull = true;
+        }
+
+        return { kind: 'isTyped', expr: e, category, notNull, negated };
+      }
+
       throw new GqlSyntaxError(
-        'Expected NULL, TRUE, FALSE, UNKNOWN, or LABELED after IS',
+        'Expected NULL, TRUE, FALSE, UNKNOWN, LABELED, or TYPED after IS',
         peek().pos,
       );
     }
@@ -1207,32 +1269,20 @@ export const parse = (
     return { args, distinct, star };
   };
 
-  // `CAST(value AS type)` — the leading `cast` ident is consumed; the current
-  // token is `(`. Desugars to the conversion function for the target type. An
-  // unrepresentable target type is a loud syntax error, never a silent null.
-  const parseCast = (): Expr => {
-    expect('lparen', "'(' after CAST");
-    const value = parseExpr();
-
-    if (!checkKeyword('as')) {
-      throw new GqlSyntaxError("expected 'AS' in CAST(value AS type)", peek().pos);
-    }
-
-    advance();
+  // Read a type-name token, joining the two-word `LOCAL`/`ZONED` temporal forms
+  // (`LOCAL DATETIME` → `local_datetime`). Shared by CAST and IS TYPED. Mirrors
+  // the Rust `read_type_name`.
+  const readTypeName = (): string => {
     const typeTok = peek();
 
     if (typeTok.type !== 'ident' && typeTok.type !== 'keyword') {
       throw new GqlSyntaxError(
-        `expected a type name in CAST, got '${typeTok.value || typeTok.type}'`,
+        `expected a type name, got '${typeTok.value || typeTok.type}'`,
         typeTok.pos,
       );
     }
 
     advance();
-
-    // Two-word temporal type names: `LOCAL DATETIME` / `LOCAL TIME` /
-    // `ZONED TIME` / `ZONED DATETIME`. The compact `LOCAL_DATETIME` keyword forms
-    // are single tokens and fall through unchanged.
     let typeName = typeTok.value;
     const lead = typeName.toLowerCase();
 
@@ -1249,10 +1299,26 @@ export const parse = (
       }
     }
 
+    return typeName;
+  };
+
+  // `CAST(value AS type)` — the leading `cast` ident is consumed; the current
+  // token is `(`. Desugars to the conversion function for the target type. An
+  // unrepresentable target type is a loud syntax error, never a silent null.
+  const parseCast = (): Expr => {
+    expect('lparen', "'(' after CAST");
+    const value = parseExpr();
+
+    if (!checkKeyword('as')) {
+      throw new GqlSyntaxError("expected 'AS' in CAST(value AS type)", peek().pos);
+    }
+
+    advance();
+    const typeName = readTypeName();
     const fn = castTargetFn(typeName);
 
     if (fn === null) {
-      throw new GqlSyntaxError(`CAST to unsupported type '${typeName}'`, typeTok.pos);
+      throw new GqlSyntaxError(`CAST to unsupported type '${typeName}'`, peek().pos);
     }
 
     expect('rparen', "')' to close CAST");

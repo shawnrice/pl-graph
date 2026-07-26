@@ -1237,6 +1237,35 @@ fn val_to_value(graph: &Graph, v: &Val) -> Value {
 /// ISO: an absent property — or a property of a non-element/NULL — yields NULL.
 /// Vertices and edges read from the same columnar store; `key_ref`'s id was
 /// resolved once at execute time (no per-access name lookup).
+/// The ISO value-type predicate `x IS TYPED <category> [NOT NULL]`. Null conforms
+/// to any *nullable* type (Neo4j-verified reading), so a null value is `!not_null`
+/// regardless of category. A non-null value matches its runtime kind against the
+/// category. Numeric split: `integer` = a whole-valued number, `float` = any
+/// number (lenke has one f64 numeric type — boundary inference, matching how it
+/// renders whole f64s as ints / tags them `g:Int64`).
+fn value_is_typed(v: &Val, category: &str, not_null: bool) -> bool {
+    use crate::temporal::Temporal;
+    if is_nullish(v) {
+        return !not_null;
+    }
+    match category {
+        "any" => true,
+        "null" => false, // v is non-null
+        "bool" => matches!(v, Val::Bool(_)),
+        "string" => matches!(v, Val::Str(_)),
+        "integer" => matches!(v, Val::Num(n) if n.is_finite() && n.fract() == 0.0),
+        "float" => matches!(v, Val::Num(_)),
+        "list" => matches!(v, Val::List(_)),
+        "date" => matches!(v, Val::Temporal(Temporal::Date(_))),
+        "local_time" => matches!(v, Val::Temporal(Temporal::Time(_))),
+        "local_datetime" => matches!(v, Val::Temporal(Temporal::DateTime(_))),
+        "zoned_time" => matches!(v, Val::Temporal(Temporal::ZonedTime(_))),
+        "zoned_datetime" => matches!(v, Val::Temporal(Temporal::ZonedDateTime(_))),
+        "duration" => matches!(v, Val::Temporal(Temporal::Duration(_))),
+        _ => false,
+    }
+}
+
 /// `PROPERTY_EXISTS(n, key)`: is `key` a *present* property of element `n`? A
 /// `Bool` for an element (distinguishing an absent key from a stored null), and
 /// `Null` for a non-element/NULL (three-valued, like a comparison). Resolves the
@@ -1499,6 +1528,15 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
             let el = eval(env, expr);
             let has = labels_match(env.graph, env.ctx, &el, label);
             Val::Bool(if *negated { !has } else { has })
+        }
+        CExpr::IsTyped {
+            expr,
+            category,
+            not_null,
+            negated,
+        } => {
+            let m = value_is_typed(&eval(env, expr), category, *not_null);
+            Val::Bool(if *negated { !m } else { m })
         }
         CExpr::In {
             expr,
@@ -8366,7 +8404,8 @@ fn expr_slot_refs(e: &CExpr, out: &mut Vec<usize>) -> bool {
         CExpr::Neg(x) | CExpr::Not(x) => expr_slot_refs(x, out),
         CExpr::IsNull { expr, .. }
         | CExpr::IsTruth { expr, .. }
-        | CExpr::IsLabeled { expr, .. } => expr_slot_refs(expr, out),
+        | CExpr::IsLabeled { expr, .. }
+        | CExpr::IsTyped { expr, .. } => expr_slot_refs(expr, out),
         CExpr::In { expr, list, .. } => expr_slot_refs(expr, out) && expr_slot_refs(list, out),
         _ => false, // Exists / CountSubquery / Case / Scalar / Aggregate / AggRef
     }

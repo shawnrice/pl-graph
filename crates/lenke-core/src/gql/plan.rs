@@ -335,6 +335,13 @@ pub enum CExpr {
         label: CLabelExpr,
         negated: bool,
     },
+    /// `x IS [NOT] TYPED <category> [NOT NULL]` — the ISO value-type predicate.
+    IsTyped {
+        expr: Box<Self>,
+        category: String,
+        not_null: bool,
+        negated: bool,
+    },
     In {
         expr: Box<Self>,
         list: Box<Self>,
@@ -521,6 +528,7 @@ fn emit(e: &CExpr, out: &mut Vec<Op>) {
         | CExpr::Index { .. }
         | CExpr::Field { .. }
         | CExpr::PropertyExists { .. }
+        | CExpr::IsTyped { .. }
         | CExpr::Aggregate { .. } => out.push(Op::Tree(e.clone())),
     }
 }
@@ -846,7 +854,8 @@ fn has_aggregate(expr: &CExpr) -> bool {
         CExpr::Neg(e) | CExpr::Not(e) => has_aggregate(e),
         CExpr::IsNull { expr, .. }
         | CExpr::IsTruth { expr, .. }
-        | CExpr::IsLabeled { expr, .. } => has_aggregate(expr),
+        | CExpr::IsLabeled { expr, .. }
+        | CExpr::IsTyped { expr, .. } => has_aggregate(expr),
         CExpr::Arith { head, tail } => {
             has_aggregate(head) || tail.iter().any(|(_, e)| has_aggregate(e))
         }
@@ -982,6 +991,17 @@ fn extract_aggs(expr: CExpr, aggs: &mut Vec<CAgg>) -> CExpr {
             label,
             negated,
         },
+        CExpr::IsTyped {
+            expr,
+            category,
+            not_null,
+            negated,
+        } => CExpr::IsTyped {
+            expr: b(expr, aggs),
+            category,
+            not_null,
+            negated,
+        },
         CExpr::In {
             expr,
             list,
@@ -1024,7 +1044,8 @@ fn refs_slot_below(expr: &CExpr, n: usize) -> bool {
         CExpr::Neg(e) | CExpr::Not(e) => refs_slot_below(e, n),
         CExpr::IsNull { expr, .. }
         | CExpr::IsTruth { expr, .. }
-        | CExpr::IsLabeled { expr, .. } => refs_slot_below(expr, n),
+        | CExpr::IsLabeled { expr, .. }
+        | CExpr::IsTyped { expr, .. } => refs_slot_below(expr, n),
         CExpr::Arith { head, tail } => {
             refs_slot_below(head, n) || tail.iter().any(|(_, e)| refs_slot_below(e, n))
         }
@@ -1204,6 +1225,17 @@ impl Lowerer {
             } => CExpr::IsLabeled {
                 expr: self.boxed(expr),
                 label: self.label_expr(label),
+                negated: *negated,
+            },
+            Expr::IsTyped {
+                expr,
+                category,
+                not_null,
+                negated,
+            } => CExpr::IsTyped {
+                expr: self.boxed(expr),
+                category: category.clone(),
+                not_null: *not_null,
                 negated: *negated,
             },
             Expr::In {
@@ -1790,9 +1822,10 @@ fn collect_free_vars(e: &Expr, bound: &[String], free: &mut Vec<String>) {
             collect_free_vars(index, bound, free);
         }
         Expr::Field { base, .. } => collect_free_vars(base, bound, free),
-        Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::IsLabeled { expr, .. } => {
-            collect_free_vars(expr, bound, free)
-        }
+        Expr::IsNull { expr, .. }
+        | Expr::IsTruth { expr, .. }
+        | Expr::IsLabeled { expr, .. }
+        | Expr::IsTyped { expr, .. } => collect_free_vars(expr, bound, free),
         Expr::Compare { left, right, .. } => {
             collect_free_vars(left, bound, free);
             collect_free_vars(right, bound, free);

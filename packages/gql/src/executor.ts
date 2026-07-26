@@ -152,6 +152,48 @@ const consistent = (binding: Binding, name: string | undefined, value: Bound): b
 const propOf = (bound: unknown, key: string): unknown =>
   (bound as { properties?: Record<string, unknown> } | undefined)?.properties?.[key] ?? null;
 
+// The ISO value-type predicate `x IS TYPED <category> [NOT NULL]`. Null conforms
+// to any nullable type (Neo4j-verified), so a null value is `!notNull`. A non-null
+// value matches its runtime kind. Numeric split: `integer` = a whole-valued
+// number, `float` = any number (one f64 numeric type; boundary inference). Mirrors
+// the Rust `value_is_typed`.
+const valueIsTyped = (v: unknown, category: string, notNull: boolean): boolean => {
+  if (isNullish(v)) {
+    return !notNull;
+  }
+
+  switch (category) {
+    case 'any':
+      return true;
+    case 'null':
+      return false;
+    case 'bool':
+      return typeof v === 'boolean';
+    case 'string':
+      return typeof v === 'string';
+    case 'integer':
+      return typeof v === 'number' && Number.isInteger(v);
+    case 'float':
+      return typeof v === 'number';
+    case 'list':
+      return Array.isArray(v);
+    case 'date':
+      return v instanceof LocalDate;
+    case 'local_time':
+      return v instanceof LocalTime;
+    case 'local_datetime':
+      return v instanceof LocalDateTime;
+    case 'zoned_time':
+      return v instanceof ZonedTime;
+    case 'zoned_datetime':
+      return v instanceof ZonedDateTime;
+    case 'duration':
+      return v instanceof Duration;
+    default:
+      return false;
+  }
+};
+
 // `PROPERTY_EXISTS(n, key)`: is `key` a *present* property of element `n`? A
 // boolean for an element (distinguishing an absent key from a stored null — null
 // is first-class), and `null` for a non-element / NULL (three-valued). `key in
@@ -388,6 +430,7 @@ const hasAggregate = (expr: Expr): boolean => {
     case 'isNull':
     case 'isTruth':
     case 'isLabeled':
+    case 'isTyped':
       return hasAggregate(expr.expr);
     case 'arith':
       return hasAggregate(expr.head) || expr.tail.some(([, e]) => hasAggregate(e));
@@ -1468,6 +1511,17 @@ const compileExpr = (expr: Expr): CompiledExpr => {
         return negated ? !has : has;
       };
     }
+    case 'isTyped': {
+      // `x IS [NOT] TYPED <category> [NOT NULL]` — the ISO value-type predicate.
+      const fn = compileExpr(expr.expr);
+      const { category, notNull, negated } = expr;
+
+      return (env) => {
+        const m = valueIsTyped(fn(env), category, notNull);
+
+        return negated ? !m : m;
+      };
+    }
     case 'in': {
       const e = compileExpr(expr.expr);
       const list = compileExpr(expr.list);
@@ -2049,6 +2103,7 @@ export const freePredicateVars = (expr: Expr): Set<string> => {
       case 'isNull':
       case 'isTruth':
       case 'isLabeled':
+      case 'isTyped':
         walk(e.expr, bound);
 
         return;

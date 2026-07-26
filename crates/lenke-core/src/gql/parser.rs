@@ -33,6 +33,33 @@ fn cast_target_fn(type_name: &str) -> Option<&'static str> {
     })
 }
 
+/// Map a type name to the normalized `IS TYPED` category. Reuses the `CAST`
+/// vocabulary and adds the temporal kinds + `null`/`nothing`/`any`. Numeric split
+/// (`integer` vs `float`) is resolved at eval by boundary inference (lenke has one
+/// f64 numeric type). Mirrors the TS `typeTestCategory`.
+fn type_test_category(type_name: &str) -> Option<&'static str> {
+    Some(match type_name.to_ascii_lowercase().as_str() {
+        "int" | "integer" | "int8" | "int16" | "int32" | "int64" | "int128" | "int256" | "uint"
+        | "uint8" | "uint16" | "uint32" | "uint64" | "uint128" | "uint256" | "bigint"
+        | "ubigint" | "smallint" | "usmallint" | "signed" | "unsigned" => "integer",
+        "float" | "float32" | "float64" | "double" | "decimal" | "real" | "number" | "numeric" => {
+            "float"
+        }
+        "string" | "text" | "varchar" | "char" => "string",
+        "bool" | "boolean" => "bool",
+        "list" | "array" => "list",
+        "date" => "date",
+        "local_time" => "local_time",
+        "local_datetime" | "datetime" | "timestamp" => "local_datetime",
+        "zoned_time" => "zoned_time",
+        "zoned_datetime" => "zoned_datetime",
+        "duration" => "duration",
+        "null" | "nothing" => "null",
+        "any" => "any",
+        _ => return None,
+    })
+}
+
 /// The single, consistent reserved-word rejection used in every binding
 /// position. `what` names the role (a label name, a variable, …). The message
 /// names backticks explicitly and echoes the user's ORIGINAL casing in both the
@@ -993,8 +1020,37 @@ impl Parser {
                     negated,
                 });
             }
+            // `IS [NOT] TYPED <type> [NOT NULL]` — the ISO value-type predicate.
+            if self.check_soft("typed") || self.check_kw("typed") {
+                self.advance();
+                let type_name = self.read_type_name("after IS TYPED")?;
+                let category = match type_test_category(&type_name) {
+                    Some(c) => c.to_string(),
+                    None => {
+                        return err(
+                            format!("unsupported type '{type_name}' in IS TYPED"),
+                            self.peek().pos,
+                        );
+                    }
+                };
+                // Optional `NOT NULL` type modifier (distinct from the `IS NOT`
+                // predicate negation): excludes null from the type's value set.
+                let not_null = if self.check_kw("not") {
+                    self.advance();
+                    self.expect_kw("null")?;
+                    true
+                } else {
+                    false
+                };
+                return Ok(Expr::IsTyped {
+                    expr: Box::new(e),
+                    category,
+                    not_null,
+                    negated,
+                });
+            }
             return err(
-                "Expected NULL, TRUE, FALSE, UNKNOWN, or LABELED after IS",
+                "Expected NULL, TRUE, FALSE, UNKNOWN, LABELED, or TYPED after IS",
                 self.peek().pos,
             );
         }
@@ -1218,6 +1274,35 @@ impl Parser {
         }
         self.expect(Tt::RParen, "')' to close a function call")?;
         Ok((args, distinct, star))
+    }
+
+    /// Read a type-name token, joining the two-word `LOCAL`/`ZONED` temporal
+    /// forms (`LOCAL DATETIME` → `local_datetime`). Shared by `CAST` and the
+    /// `IS TYPED` value-type predicate.
+    fn read_type_name(&mut self, ctx: &str) -> R<String> {
+        let tok = self.peek().clone();
+        if tok.tt != Tt::Ident && tok.tt != Tt::Keyword {
+            return err(
+                format!("expected a type name {ctx}, got '{}'", tok.value),
+                tok.pos,
+            );
+        }
+        self.advance();
+        let mut type_name = tok.value.clone();
+        let lead = type_name.to_ascii_lowercase();
+        if lead == "local" || lead == "zoned" {
+            let next = self.peek().clone();
+            if (next.tt == Tt::Ident || next.tt == Tt::Keyword)
+                && matches!(
+                    next.value.to_ascii_lowercase().as_str(),
+                    "datetime" | "time"
+                )
+            {
+                self.advance();
+                type_name = format!("{lead}_{}", next.value.to_ascii_lowercase());
+            }
+        }
+        Ok(type_name)
     }
 
     /// `CAST(value AS type)` — the leading `cast` ident is already consumed and

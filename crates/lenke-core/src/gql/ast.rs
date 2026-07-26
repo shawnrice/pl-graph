@@ -480,6 +480,17 @@ pub enum Expr {
         label: LabelExpr,
         negated: bool,
     },
+    /// `x IS [NOT] TYPED <type> [NOT NULL]` — the ISO value-type predicate.
+    /// `category` is a normalized type family (`integer`/`float`/`string`/`bool`/
+    /// `list`/`date`/`local_time`/`local_datetime`/`zoned_time`/`zoned_datetime`/
+    /// `duration`/`null`/`any`). Null conforms to any nullable type, so
+    /// `null IS TYPED T` is true unless `not_null`.
+    IsTyped {
+        expr: Box<Self>,
+        category: String,
+        not_null: bool,
+        negated: bool,
+    },
     /// `PROPERTY_EXISTS(n, key)` — true iff property `key` is *present* on element
     /// `n`, regardless of value. Distinguishes an absent key from a present null
     /// (null is a first-class stored value here), which `n.key IS NOT NULL`

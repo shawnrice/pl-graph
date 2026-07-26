@@ -293,6 +293,26 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(tsN).toBe(natN);
   });
 
+  test('IS [NOT] TYPED <type> [NOT NULL] — byte-identical value-type predicate', () => {
+    const q =
+      `RETURN 5 IS TYPED INTEGER AS a, 5.5 IS TYPED INTEGER AS b, 5.5 IS TYPED FLOAT AS c, ` +
+      `5 IS TYPED FLOAT AS d, 'x' IS TYPED STRING AS e, true IS TYPED BOOL AS f, ` +
+      `[1,2] IS TYPED LIST AS g, DATE '2020-01-01' IS TYPED DATE AS h, ` +
+      `DATETIME '2020-01-01T00:00:00' IS TYPED LOCAL DATETIME AS i, ` +
+      `duration('P1D') IS TYPED DURATION AS j, 5 IS NOT TYPED STRING AS k, ` +
+      `null IS TYPED INTEGER AS l, null IS TYPED INTEGER NOT NULL AS m, ` +
+      `null IS TYPED NULL AS n, null IS TYPED ANY NOT NULL AS o`;
+    const [ts, native] = both(q);
+
+    expect(ts).toBe(native);
+    // spot-check the tricky ones (numeric inference + null conformance)
+    expect(ts).toContain('"a":true');
+    expect(ts).toContain('"b":false');
+    expect(ts).toContain('"d":true');
+    expect(ts).toContain('"l":true');
+    expect(ts).toContain('"m":false');
+  });
+
   test('list[i].prop — property access chains off a subscript, byte-identical', () => {
     const base = `MATCH p = ANY SHORTEST (a)-[]->*(b) WHERE a.name = 'marko' AND b.name = 'lop'`;
     // edges(p)[0].weight, nodes(p)[i].name, and out-of-range → null all
