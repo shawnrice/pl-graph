@@ -6068,6 +6068,27 @@ fn expr_to_idxkey(e: &CExpr, ctx: &Ctx) -> Option<crate::graph::IdxKey> {
     }
 }
 
+/// The (var slot, index path) a comparison's left side addresses: a bare
+/// `var.key` → (slot, `"key"`), a nested `var.a.b…` (a `Field` chain rooted at a
+/// `Prop`) → (slot, `"a.b…"`) — the dotted path the [dotted-path index] is keyed
+/// by, so `WHERE n.meta.city = $x` can seek a `meta.city` index instead of
+/// scanning. Any other shape (a computed base, a non-`Prop` root) → `None`.
+fn prop_path(left: &CExpr, graph: &Graph, ctx: &Ctx, edge: bool) -> Option<(usize, String)> {
+    match left {
+        CExpr::Prop { var_slot, key_ref } => Some((
+            *var_slot,
+            prop_name(graph, ctx, *key_ref, edge)?.to_string(),
+        )),
+        CExpr::Field { base, name, .. } => {
+            let (slot, mut path) = prop_path(base, graph, ctx, edge)?;
+            path.push('.');
+            path.push_str(name);
+            Some((slot, path))
+        }
+        _ => None,
+    }
+}
+
 /// A `var.key OP <literal-or-$param>` comparison, as (var slot, key ref, op,
 /// resolved index key). The RHS is resolved via [`expr_to_idxkey`] so params
 /// seek as well as literals.
@@ -6147,21 +6168,22 @@ fn prop_index_hint(
     use crate::graph::RangeBound;
     let slot_ok = |s: usize| want_slot.is_none_or(|w| w == s);
     match e {
-        CExpr::Compare { .. } => {
-            let (vslot, key_ref, op, key) = cmp_bound(e, ctx)?;
+        CExpr::Compare { op, left, right } => {
+            // Handles a bare `var.key` AND a nested `var.a.b` (dotted-path index).
+            let (vslot, path) = prop_path(left, graph, ctx, edge)?;
             if !slot_ok(vslot) {
                 return None;
             }
-            let name = prop_name(graph, ctx, key_ref, edge)?;
-            if !idx_indexed(graph, name, edge) {
+            let key = expr_to_idxkey(right, ctx)?;
+            if !idx_indexed(graph, &path, edge) {
                 return None;
             }
-            if op == CompareOp::Eq {
-                return idx_eq(graph, name, &key, edge);
+            if *op == CompareOp::Eq {
+                return idx_eq(graph, &path, &key, edge);
             }
             let mut rb = RangeBound::default();
-            apply_bound(&mut rb, op, key);
-            idx_range(graph, name, &rb, edge)
+            apply_bound(&mut rb, *op, key);
+            idx_range(graph, &path, &rb, edge)
         }
         CExpr::And(items) => {
             // Coalesce any pair of same-var/same-key comparisons into one tight

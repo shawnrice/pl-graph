@@ -7246,3 +7246,46 @@ fn where_on_a_nested_map_field_scans_correctly() {
     ids.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
     assert_eq!(ids, vec![s("a"), s("b")]);
 }
+
+#[test]
+fn set_a_map_property_then_read_it_back() {
+    // The write path: SET n.x = {record} stores a canonical map; read it back.
+    let mut g = map_graph();
+    let out = rows(
+        &mut g,
+        "MATCH (n:P {id:'a'}) SET n.tag = {b: 2, a: 1} RETURN n.tag AS t",
+    );
+    assert_eq!(out, vec![vec![vmap(&[("a", n(1.0)), ("b", n(2.0))])]]);
+    // And it persists (a second read sees it).
+    assert_eq!(
+        rows(&mut g, "MATCH (n:P {id:'a'}) RETURN n.tag.a AS a"),
+        vec![vec![n(1.0)]],
+    );
+}
+
+#[test]
+fn nested_field_where_uses_the_dotted_path_index() {
+    // With a `meta.city` index, `WHERE n.meta.city = 'NYC'` seeks it (Phase 3
+    // proved the seek primitive; this proves the planner routes to it without
+    // altering results — same rows as the scan path).
+    let mut g = map_graph();
+    g.create_vertex_index("meta.city");
+    let mut ids: Vec<Value> = rows(
+        &mut g,
+        "MATCH (n:P) WHERE n.meta.city = 'NYC' RETURN n.id AS id",
+    )
+    .into_iter()
+    .map(|r| r[0].clone())
+    .collect();
+    ids.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
+    assert_eq!(ids, vec![s("a"), s("b")]);
+    // A param seeks the same index (`WHERE n.meta.city = $c`).
+    let mut p = Params::new();
+    p.insert("c".to_string(), super::eval::Val::Str("LA".into()));
+    let out = qp(
+        &mut g,
+        "MATCH (n:P) WHERE n.meta.city = $c RETURN n.id AS id",
+        p,
+    );
+    assert_eq!(out, vec![vec![s("c")]]);
+}
