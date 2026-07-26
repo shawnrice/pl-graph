@@ -4591,7 +4591,8 @@ impl<'p> ProjAccum<'p> {
             && !proj.order_needs_output;
         ProjAccum {
             proj,
-            grouped: proj.aggregating && proj.items.iter().any(|i| !i.is_agg),
+            grouped: proj.aggregating
+                && (!proj.group_by.is_empty() || proj.items.iter().any(|i| !i.is_agg)),
             topk,
             cap: proj.skip_val(ctx) + proj.limit_val(ctx).unwrap_or(0),
             threshold: None,
@@ -4716,8 +4717,15 @@ impl<'p> ProjAccum<'p> {
             self.key_vals.clear();
             {
                 let env = Env::new(graph, ctx, binding);
-                for item in proj.items.iter().filter(|i| !i.is_agg) {
-                    self.key_vals.push(eval_item(&env, item));
+                // Explicit GROUP BY keys drive grouping; else the non-agg items.
+                if proj.group_by.is_empty() {
+                    for item in proj.items.iter().filter(|i| !i.is_agg) {
+                        self.key_vals.push(eval_item(&env, item));
+                    }
+                } else {
+                    for item in &proj.group_by {
+                        self.key_vals.push(eval_item(&env, item));
+                    }
                 }
             }
             // Streaming fast path: rows for one group usually arrive contiguously
@@ -7159,7 +7167,7 @@ fn vectorized_aggregate(
     sc: &ScanCols,
     proj: &CProjection,
 ) -> Option<Vec<Vec<Val>>> {
-    let key_items: Vec<&CReturnItem> = proj.items.iter().filter(|i| !i.is_agg).collect();
+    let key_items = proj.group_keys();
     let (gid_of_row, rep_row, ngroups) = group_ids(graph, ctx, sc, &key_items)?;
     let agg_cols = fold_group_agg_cols(graph, ctx, sc, proj, &gid_of_row, ngroups)?;
 
@@ -7707,7 +7715,7 @@ fn with_frame_aggregate(
     sc: &ScanCols,
     proj: &CProjection,
 ) -> Option<ScanCols> {
-    let key_items: Vec<&CReturnItem> = proj.items.iter().filter(|i| !i.is_agg).collect();
+    let key_items = proj.group_keys();
     let (gid_of_row, rep_row, ngroups) = group_ids(graph, ctx, sc, &key_items)?;
     let agg_cols = fold_group_agg_cols(graph, ctx, sc, proj, &gid_of_row, ngroups)?;
 
@@ -8141,6 +8149,7 @@ fn try_count_star(
         || proj.aggs.len() != 1
         || proj.items.len() != 1
         || !matches!(proj.items[0].expr, CExpr::AggRef(0))
+        || !proj.group_by.is_empty()
     {
         return None;
     }
@@ -8231,6 +8240,7 @@ fn try_count_edges(
         || proj.aggs.len() != 1
         || proj.items.len() != 1
         || !matches!(proj.items[0].expr, CExpr::AggRef(0))
+        || !proj.group_by.is_empty()
     {
         return None;
     }
@@ -8387,6 +8397,7 @@ fn try_count_two_hop(
         || proj.aggs.len() != 1
         || proj.items.len() != 1
         || !matches!(proj.items[0].expr, CExpr::AggRef(0))
+        || !proj.group_by.is_empty()
     {
         return None;
     }
@@ -8559,6 +8570,7 @@ fn try_count_comma_join(
         || proj.aggs.len() != 1
         || proj.items.len() != 1
         || !matches!(proj.items[0].expr, CExpr::AggRef(0))
+        || !proj.group_by.is_empty()
     {
         return None;
     }
@@ -8739,6 +8751,7 @@ fn try_count_varlen_1_2(
         || proj.aggs.len() != 1
         || proj.items.len() != 1
         || !matches!(proj.items[0].expr, CExpr::AggRef(0))
+        || !proj.group_by.is_empty()
     {
         return None;
     }
@@ -8930,7 +8943,7 @@ fn try_grouped_varlen_1_2(
         return None;
     }
     // Every non-agg item is a group key over `b`; the one agg item is a bare count.
-    let key_items: Vec<&CReturnItem> = proj.items.iter().filter(|i| !i.is_agg).collect();
+    let key_items = proj.group_keys();
     if key_items.is_empty() {
         return None; // a global count uses `try_count_varlen_1_2`
     }
@@ -9149,7 +9162,7 @@ fn try_grouped_2hop(
     if !agg.star || agg.distinct || !matches!(agg.func, AggFn::Count) {
         return None;
     }
-    let key_items: Vec<&CReturnItem> = proj.items.iter().filter(|i| !i.is_agg).collect();
+    let key_items = proj.group_keys();
     if key_items.is_empty() {
         return None;
     }
@@ -9326,7 +9339,7 @@ fn try_count_distinct_endpoint(
     if !wp.aggregating {
         return None;
     }
-    let key_items: Vec<&CReturnItem> = wp.items.iter().filter(|i| !i.is_agg).collect();
+    let key_items = wp.group_keys();
     if key_items.len() != 1 || !matches!(key_items[0].expr, CExpr::Var(s) if s == n_slot) {
         return None;
     }
@@ -9425,6 +9438,7 @@ fn try_count_semi_join(
         || proj.aggs.len() != 1
         || proj.items.len() != 1
         || !matches!(proj.items[0].expr, CExpr::AggRef(0))
+        || !proj.group_by.is_empty()
     {
         return None;
     }
@@ -9568,6 +9582,7 @@ fn try_count_distinct_reachable(
         || proj.aggs.len() != 1
         || proj.items.len() != 1
         || !matches!(proj.items[0].expr, CExpr::AggRef(0))
+        || !proj.group_by.is_empty()
     {
         return None;
     }
@@ -9909,6 +9924,7 @@ fn try_parallel_count(
         || proj.aggs.len() != 1
         || proj.items.len() != 1
         || !matches!(proj.items[0].expr, CExpr::AggRef(0))
+        || !proj.group_by.is_empty()
     {
         return None;
     }

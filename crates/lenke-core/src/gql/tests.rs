@@ -6531,3 +6531,52 @@ fn trim_sql_spec_form() {
         ]]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Explicit GROUP BY (ISO — on the RETURN statement). Drives grouping (forces it
+// on, even without an aggregate); an empty GROUP BY keeps implicit grouping.
+// ---------------------------------------------------------------------------
+
+fn hires() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"a","labels":["E"],"properties":{"dept":"eng","name":"a","sal":100.0}}"#,
+        r#"{"type":"node","id":"b","labels":["E"],"properties":{"dept":"eng","name":"b","sal":200.0}}"#,
+        r#"{"type":"node","id":"c","labels":["E"],"properties":{"dept":"sales","name":"c","sal":50.0}}"#,
+    ])
+}
+
+#[test]
+fn group_by_with_aggregate() {
+    let mut g = hires();
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (e:E) RETURN e.dept AS d, count(*) AS c GROUP BY e.dept ORDER BY d"
+        ),
+        vec![vec![s("eng"), n(2.0)], vec![s("sales"), n(1.0)]]
+    );
+}
+
+#[test]
+fn group_by_non_returned_key() {
+    // `RETURN count(*) GROUP BY e.dept` — group by a key that is NOT returned.
+    // Implicit grouping can't express this (there'd be no key); explicit GROUP BY
+    // must → one count per dept.
+    let mut g = hires();
+    let mut out = rows(&mut g, "MATCH (e:E) RETURN count(*) AS c GROUP BY e.dept");
+    out.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+    assert_eq!(out, vec![vec![n(1.0)], vec![n(2.0)]]);
+}
+
+#[test]
+fn group_by_without_aggregate_is_distinct() {
+    // `RETURN e.dept GROUP BY e.dept` — no aggregate → one row per distinct dept.
+    let mut g = hires();
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (e:E) RETURN e.dept AS d GROUP BY e.dept ORDER BY d"
+        ),
+        vec![vec![s("eng")], vec![s("sales")]]
+    );
+}

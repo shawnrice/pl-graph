@@ -2472,10 +2472,16 @@ const compileProjection = (projection: Projection): CProjection => {
     fn: compileExpr(i.expr),
     isAgg: hasAggregate(i.expr),
   }));
-  const aggregating = !projection.star && items.some((i) => i.isAgg);
   noteCountParam(projection.skip);
   noteCountParam(projection.limit);
-  const groupKeys = items.filter((i) => !i.isAgg).map((i) => i.fn);
+  // Explicit GROUP BY keys DRIVE grouping (and force it on, even without an
+  // aggregate); absent → implicit grouping by the non-aggregate items.
+  const groupByExprs = projection.groupBy ?? [];
+  const aggregating = !projection.star && (items.some((i) => i.isAgg) || groupByExprs.length > 0);
+  const groupKeys =
+    groupByExprs.length > 0
+      ? groupByExprs.map((e) => compileExpr(e))
+      : items.filter((i) => !i.isAgg).map((i) => i.fn);
   // ORDER BY keys are evaluated against the projected output overlaid on the
   // input binding (see `applyProjection`), so output aliases resolve even inside
   // an expression — `ORDER BY n + 2` uses the column `n`, not the input variable.

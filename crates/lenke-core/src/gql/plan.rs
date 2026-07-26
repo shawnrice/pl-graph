@@ -627,8 +627,12 @@ pub struct CProjection {
     pub star: bool,
     pub distinct: bool,
     pub items: Vec<CReturnItem>,
-    /// True when any item aggregates → implicit grouping (precomputed).
+    /// True when any item aggregates OR `GROUP BY` is present → grouping.
     pub aggregating: bool,
+    /// Explicit `GROUP BY` keys (compiled). When non-empty they DRIVE grouping;
+    /// empty → implicit grouping by the non-aggregate items. See
+    /// [`CProjection::group_keys`].
+    pub group_by: Vec<CReturnItem>,
     /// Aggregates lifted out of the item/ORDER BY expressions, folded per group;
     /// the expressions reference them via [`CExpr::AggRef`].
     pub aggs: Vec<CAgg>,
@@ -648,6 +652,18 @@ pub struct CProjection {
     pub order_needs_output: bool,
     pub skip: Option<CCount>,
     pub limit: Option<CCount>,
+}
+
+impl CProjection {
+    /// The grouping keys: explicit `GROUP BY` items if present, else the
+    /// non-aggregate output items (implicit grouping).
+    pub fn group_keys(&self) -> Vec<&CReturnItem> {
+        if self.group_by.is_empty() {
+            self.items.iter().filter(|i| !i.is_agg).collect()
+        } else {
+            self.group_by.iter().collect()
+        }
+    }
 }
 
 /// A lowered `LIMIT` / `OFFSET` bound: an integer literal, or a `$param` slot
@@ -1444,7 +1460,23 @@ impl Lowerer {
             (items.iter().map(|i| i.name.clone()).collect(), Vec::new())
         };
         let out_len = out_names.len();
-        let aggregating = !p.star && items.iter().any(|i| i.is_agg);
+        // `GROUP BY` keys are compiled like items (input-scope expressions used
+        // purely for keying, never output). They force grouping on.
+        let group_by: Vec<CReturnItem> = p
+            .group_by
+            .iter()
+            .map(|e| {
+                let expr = self.expr(e);
+                let prog = compile_program(&expr);
+                CReturnItem {
+                    expr,
+                    prog,
+                    name: String::new(),
+                    is_agg: false,
+                }
+            })
+            .collect();
+        let aggregating = !p.star && (items.iter().any(|i| i.is_agg) || !group_by.is_empty());
 
         // ORDER BY scope = output columns, then input vars not shadowed by one.
         let mut sort_scope = out_names.clone();
@@ -1477,6 +1509,7 @@ impl Lowerer {
             distinct: p.distinct,
             items,
             aggregating,
+            group_by,
             aggs,
             out_len,
             out_names,
@@ -2090,6 +2123,7 @@ fn try_decorrelate(c: &CallInline, outer: &[String]) -> Option<(MatchClause, Wit
             star: false,
             items,
             distinct: false,
+            group_by: Vec::new(),
             order_by: Vec::new(),
             skip: None,
             limit: None,

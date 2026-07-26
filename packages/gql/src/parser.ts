@@ -1722,6 +1722,21 @@ export const parse = (
       }
     }
 
+    // ISO `GROUP BY <grouping element list>` — after the items, before ORDER BY.
+    // `group` arrives as a reserved ident (like `order`'s soft handling).
+    let groupBy: Expr[] | undefined;
+
+    if ((check('keyword') || check('ident')) && peek().value.toLowerCase() === 'group') {
+      advance();
+      expectKeyword('by');
+      groupBy = [parseExpr()];
+
+      while (check('comma')) {
+        advance();
+        groupBy.push(parseExpr());
+      }
+    }
+
     let orderBy: SortItem[] | undefined;
 
     if (checkKeyword('order')) {
@@ -1752,7 +1767,7 @@ export const parse = (
       limit = expectCountValue('a non-negative integer after LIMIT', true);
     }
 
-    return { star, items, distinct, orderBy, skip, limit };
+    return { star, items, distinct, groupBy, orderBy, skip, limit };
   };
 
   const parseWithClause = (): WithClause => {

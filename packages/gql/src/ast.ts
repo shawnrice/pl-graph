@@ -329,6 +329,9 @@ export type Projection = {
   star: boolean;
   items: readonly ReturnItem[];
   distinct: boolean;
+  // ISO `GROUP BY` keys. When present they drive grouping (and force it on);
+  // absent → implicit grouping by the non-aggregate items.
+  groupBy?: readonly Expr[];
   orderBy?: readonly SortItem[];
   skip?: CountValue;
   limit?: CountValue;

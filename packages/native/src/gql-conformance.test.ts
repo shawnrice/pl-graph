@@ -354,6 +354,27 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(ts).toContain('"b":"hixx"');
   });
 
+  test('explicit GROUP BY (RETURN) — byte-identical, incl. group-by-non-returned', () => {
+    // marko/vadas/josh/peter are Person; group by age presence etc. Use a stable
+    // grouping key (labels) over the modern graph.
+    const q1 = `MATCH (n) RETURN labels(n)[0] AS lbl, count(*) AS c GROUP BY labels(n)[0] ORDER BY lbl`;
+    const [ts1, nat1] = both(q1);
+
+    expect(ts1).toBe(nat1);
+
+    // GROUP BY a key that is NOT in the RETURN list — implicit grouping can't do this.
+    const q2 = `MATCH (n) RETURN count(*) AS c GROUP BY labels(n)[0] ORDER BY c`;
+    const [ts2, nat2] = both(q2);
+
+    expect(ts2).toBe(nat2);
+
+    // GROUP BY with no aggregate == DISTINCT on the key.
+    const q3 = `MATCH (n) RETURN labels(n)[0] AS lbl GROUP BY labels(n)[0] ORDER BY lbl`;
+    const [ts3, nat3] = both(q3);
+
+    expect(ts3).toBe(nat3);
+  });
+
   test('list[i].prop — property access chains off a subscript, byte-identical', () => {
     const base = `MATCH p = ANY SHORTEST (a)-[]->*(b) WHERE a.name = 'marko' AND b.name = 'lop'`;
     // edges(p)[0].weight, nodes(p)[i].name, and out-of-range → null all

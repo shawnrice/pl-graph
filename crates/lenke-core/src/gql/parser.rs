@@ -1765,6 +1765,18 @@ impl Parser {
                 items.push(self.parse_return_item()?);
             }
         }
+        // ISO `GROUP BY <grouping element list>` — comes after the items, before
+        // ORDER BY. Drives the grouping (see `Projection::group_by`).
+        let mut group_by = Vec::new();
+        if self.check_kw("group") || self.check_soft("group") {
+            self.advance();
+            self.expect_kw("by")?;
+            group_by.push(self.parse_expr()?);
+            while self.check(Tt::Comma) {
+                self.advance();
+                group_by.push(self.parse_expr()?);
+            }
+        }
         let mut order_by = Vec::new();
         if self.check_kw("order") {
             self.advance();
@@ -1794,6 +1806,7 @@ impl Parser {
             star,
             items,
             distinct,
+            group_by,
             order_by,
             skip,
             limit,
@@ -2233,6 +2246,7 @@ impl Parser {
                         star: false,
                         items,
                         distinct: false,
+                        group_by: Vec::new(),
                         order_by: Vec::new(),
                         skip: None,
                         limit: None,

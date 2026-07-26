@@ -365,6 +365,10 @@ pub struct Projection {
     pub star: bool,
     pub items: Vec<ReturnItem>,
     pub distinct: bool,
+    /// ISO `GROUP BY` grouping keys. When non-empty they DRIVE the grouping (and
+    /// force it on, even with no aggregate); empty → implicit grouping by the
+    /// non-aggregate items.
+    pub group_by: Vec<Expr>,
     pub order_by: Vec<SortItem>,
     pub skip: Option<CountBound>,
     pub limit: Option<CountBound>,
