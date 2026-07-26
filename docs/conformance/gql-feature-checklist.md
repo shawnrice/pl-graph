@@ -68,7 +68,7 @@ Ordered roughly cheap→involved.
 | Map / record values (GV45)                                        | No first-class map value; larger (touches the value model).                                                                                                                  |
 | Parenthesized-subpath `WHERE` (G050/G051)                         | Per-_edge_ `WHERE` works; per-subpath doesn't.                                                                                                                               |
 | `DIFFERENT EDGES` / `REPEATABLE ELEMENTS` match modes (G002/G003) | Graph-pattern match modes (distinct from the path modes, which work).                                                                                                        |
-| Inline `LET…IN…END`, `VALUE{}` scalar subquery                    | The `LET` statement works; these are the inline-expression forms.                                                                                                            |
+| Inline `LET…IN…END`                                               | The `LET` statement works; this is the inline-expression form. (`VALUE{}` scalar subquery — ✅ shipped.)                                                                     |
 
 ### Tier 3 — Excluded by design (NOT gaps to close)
 
@@ -266,7 +266,7 @@ productions and probed against the engine.
 | Property `.`, list index `[i]`                   |  ✅   |                                                                   |
 | List slice `[i..j]`                              |  ❌   | No slicing.                                                       |
 | `LET … IN … END` (inline let-expression)         |  ❌   | The `LET` _statement_ works; the inline expression form does not. |
-| `VALUE { subquery }` (scalar subquery)           |  ❌   |                                                                   |
+| `VALUE { subquery }` (scalar subquery)           |  ✅   | Correlated; 0 rows→NULL, 1→value, >1 non-agg→cardinality error, aggregate RETURN folds the group. |
 
 ### Scalar / string functions (detail)
 

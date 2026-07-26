@@ -6620,6 +6620,112 @@ fn exists_multi_match() {
     );
 }
 
+/// Fixture for the VALUE scalar-subquery tests: alice→bob (KNOWS), carol with no
+/// out-edges, and dave→erin + dave→frank (KNOWS) so `dave` has two neighbours.
+fn value_graph() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"alice","labels":["Person"],"properties":{"id":"alice","name":"Alice"}}"#,
+        r#"{"type":"node","id":"bob","labels":["Person"],"properties":{"id":"bob","name":"Bob"}}"#,
+        r#"{"type":"node","id":"carol","labels":["Person"],"properties":{"id":"carol","name":"Carol"}}"#,
+        r#"{"type":"node","id":"dave","labels":["Person"],"properties":{"id":"dave","name":"Dave"}}"#,
+        r#"{"type":"node","id":"erin","labels":["Person"],"properties":{"id":"erin","name":"Erin"}}"#,
+        r#"{"type":"node","id":"frank","labels":["Person"],"properties":{"id":"frank","name":"Frank"}}"#,
+        r#"{"type":"edge","id":"k1","from":"alice","to":"bob","labels":["KNOWS"],"properties":{}}"#,
+        r#"{"type":"edge","id":"k2","from":"dave","to":"erin","labels":["KNOWS"],"properties":{}}"#,
+        r#"{"type":"edge","id":"k3","from":"dave","to":"frank","labels":["KNOWS"],"properties":{}}"#,
+    ])
+}
+
+#[test]
+fn value_subquery_correlated_scalar() {
+    // Correlated single-row VALUE: the one neighbour's name, NULL when there is
+    // none. `alice`→`bob` yields "Bob"; `carol` has no KNOWS edge → NULL.
+    let mut g = value_graph();
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:Person) WHERE a.id='alice' \
+             RETURN VALUE { MATCH (a)-[:KNOWS]->(b) RETURN b.name } AS friend",
+        ),
+        vec![vec![s("Bob")]]
+    );
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:Person) WHERE a.id='carol' \
+             RETURN VALUE { MATCH (a)-[:KNOWS]->(b) RETURN b.name } AS friend",
+        ),
+        vec![vec![Value::Null]]
+    );
+}
+
+#[test]
+fn value_subquery_aggregate_folds_group() {
+    // An aggregate RETURN folds the whole matched group to one value regardless
+    // of row count — no cardinality error. Six people; dave has two neighbours.
+    let mut g = value_graph();
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN VALUE { MATCH (n:Person) RETURN count(*) } AS c"
+        ),
+        vec![vec![n(6.0)]]
+    );
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:Person) WHERE a.id='dave' \
+             RETURN VALUE { MATCH (a)-[:KNOWS]->(b) RETURN count(*) } AS deg",
+        ),
+        vec![vec![n(2.0)]]
+    );
+    // count() over zero matches is 0 (the aggregate's empty answer), not NULL.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:Person) WHERE a.id='carol' \
+             RETURN VALUE { MATCH (a)-[:KNOWS]->(b) RETURN count(*) } AS deg",
+        ),
+        vec![vec![n(0.0)]]
+    );
+}
+
+#[test]
+fn value_subquery_multi_row_is_cardinality_error() {
+    // A non-aggregate RETURN that matches >1 row is an ISO cardinality violation:
+    // loud error, never a silent first-of-many. `dave` has two neighbours.
+    let mut g = value_graph();
+    assert!(exec_err(
+        &mut g,
+        "MATCH (a:Person) WHERE a.id='dave' \
+         RETURN VALUE { MATCH (a)-[:KNOWS]->(b) RETURN b.name } AS friend",
+    ));
+    // The global form matches all six people → also a cardinality error.
+    assert!(exec_err(
+        &mut g,
+        "RETURN VALUE { MATCH (n:Person) RETURN n.name } AS nm",
+    ));
+}
+
+#[test]
+fn value_subquery_constant_and_where() {
+    // No patterns → a constant scalar. And a WHERE filters the correlated match.
+    let mut g = value_graph();
+    assert_eq!(
+        rows(&mut g, "RETURN VALUE { RETURN 1 + 2 } AS v"),
+        vec![vec![n(3.0)]]
+    );
+    // WHERE narrows dave's two neighbours to exactly one → no cardinality error.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:Person) WHERE a.id='dave' \
+             RETURN VALUE { MATCH (a)-[:KNOWS]->(b) WHERE b.name='Erin' RETURN b.name } AS f",
+        ),
+        vec![vec![s("Erin")]]
+    );
+}
+
 #[test]
 fn match_mode_repeatable_vs_different_edges() {
     // 2-cycle a<->b. Under DIFFERENT EDGES (= default TRAIL) a 3-hop walk can't

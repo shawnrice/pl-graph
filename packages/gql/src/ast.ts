@@ -424,6 +424,16 @@ export type Expr =
   // the (correlated) sub-pattern. A scalar per outer row, distinct from the
   // `count(...)` grouping aggregate.
   | { kind: 'countSubquery'; patterns: readonly PathPattern[]; where?: Expr }
+  // ISO `<value query expression>`: `VALUE { [MATCH p1, … [WHERE pred]] RETURN e }`
+  // — a scalar (single-value) correlated subquery. 0 rows → NULL; exactly one row
+  // → its value; >1 rows with a non-aggregate RETURN → cardinality error; an
+  // aggregate RETURN folds the whole group to one value.
+  | {
+      kind: 'valueSubquery';
+      patterns: readonly PathPattern[];
+      where?: Expr;
+      ret: Expr;
+    }
   // ISO `<case expression>`. With `subject`: a simple CASE (`subject = when`);
   // without: a searched CASE (`when` is a boolean condition). `elseExpr` is the
   // ELSE result, defaulting to NULL.

@@ -197,6 +197,7 @@ const FAULT_ID_DUP: u8 = 16;
 const FAULT_ID_IMMUTABLE: u8 = 17;
 const FAULT_CMP_TEMPORAL: u8 = 18;
 const FAULT_DATE_PART: u8 = 19;
+const FAULT_CARDINALITY: u8 = 20;
 
 /// Per-expansion cap on trail-traversal steps; a guard against exponential blowup.
 const TRAIL_BUDGET: u64 = 1_000_000;
@@ -281,6 +282,11 @@ impl Ctx<'_> {
             FAULT_TYPE => Err(CodeError::new(
                 ErrorCode::DataException,
                 "arithmetic requires a number",
+            )),
+            FAULT_CARDINALITY => Err(CodeError::new(
+                ErrorCode::DataException,
+                "a VALUE scalar subquery returned more than one row; add an aggregate \
+                 (e.g. count/collect), a LIMIT-like bound, or a more selective pattern",
             )),
             FAULT_BUDGET => Err(CodeError::new(
                 ErrorCode::ResourceExhausted,
@@ -1697,6 +1703,22 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
             env.binding,
             *sub_len,
         ) as f64),
+        CExpr::ValueSubquery {
+            patterns,
+            where_,
+            ret,
+            is_agg,
+            sub_len,
+        } => value_subquery(
+            env.graph,
+            env.ctx,
+            patterns,
+            where_.as_deref(),
+            ret,
+            *is_agg,
+            env.binding,
+            *sub_len,
+        ),
         CExpr::Scalar { func, args } => {
             if matches!(func, ScalarFn::Unknown) {
                 env.ctx.set_fault(FAULT_UNKNOWN_FN); // fail loud, not silent NULL
@@ -4039,6 +4061,58 @@ fn count_matches(
         true
     });
     count
+}
+
+/// Evaluate a `VALUE { … RETURN <expr> }` scalar subquery: a single value.
+///
+/// Collect every correlated match (read-only, via `visit_patterns`), then:
+/// - an aggregate RETURN folds the whole group to one value (0 rows → the
+///   aggregate's empty answer, e.g. `count` → 0, `sum` → NULL);
+/// - a non-aggregate RETURN yields NULL for 0 rows, the value for exactly one
+///   row, and a **cardinality fault** for more than one (ISO: a scalar subquery
+///   must not deliver more than one row) — loud, never a silent first-of-many.
+#[allow(clippy::too_many_arguments)]
+fn value_subquery(
+    graph: &Graph,
+    ctx: &Ctx,
+    patterns: &[CPath],
+    where_: Option<&CExpr>,
+    ret: &CExpr,
+    is_agg: bool,
+    binding: &Binding,
+    sub_len: usize,
+) -> Val {
+    let mut work = binding.clone();
+    work.resize(sub_len);
+    let mut matches: Vec<Binding> = Vec::new();
+    visit_patterns(graph, ctx, patterns, 0, where_, &mut work, &mut |b| {
+        matches.push(b.clone());
+        // A non-aggregate scalar subquery is over the moment a second row appears
+        // (it's already a cardinality error); an aggregate needs the full group.
+        is_agg || matches.len() < 2
+    });
+
+    if is_agg {
+        // Fold over the group. The tree-walk `CExpr::Aggregate` arm reads
+        // `env.group`; a plain sub-expression around it reads the first match.
+        let base = matches.first().cloned().unwrap_or_else(|| {
+            let mut b = binding.clone();
+            b.resize(sub_len);
+            b
+        });
+        let mut env = Env::new(graph, ctx, &base);
+        env.group = Some(&matches);
+        return eval(&env, ret);
+    }
+
+    match matches.as_slice() {
+        [] => Val::Null,
+        [b] => eval(&Env::new(graph, ctx, b), ret),
+        _ => {
+            ctx.set_fault(FAULT_CARDINALITY);
+            Val::Null
+        }
+    }
 }
 
 /// Slots a pattern set introduces (for OPTIONAL MATCH null-binding).

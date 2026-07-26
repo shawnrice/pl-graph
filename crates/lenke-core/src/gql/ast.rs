@@ -543,6 +543,15 @@ pub enum Expr {
         patterns: Vec<PathPattern>,
         where_: Option<Box<Self>>,
     },
+    /// ISO `VALUE { [MATCH p1, … [WHERE pred]] RETURN <expr> }` — a scalar
+    /// (single-value) correlated subquery. 0 rows → NULL; exactly one row → its
+    /// value; >1 rows with a non-aggregate RETURN → cardinality fault; an
+    /// aggregate RETURN folds the whole group to one value.
+    ValueSubquery {
+        patterns: Vec<PathPattern>,
+        where_: Option<Box<Self>>,
+        ret: Box<Self>,
+    },
     /// ISO CASE: `subject` present → simple CASE, else searched.
     Case {
         subject: Option<Box<Self>>,

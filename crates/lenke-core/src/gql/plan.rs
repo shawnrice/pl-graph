@@ -365,6 +365,15 @@ pub enum CExpr {
         where_: Option<Box<Self>>,
         sub_len: usize,
     },
+    ValueSubquery {
+        patterns: Vec<CPath>,
+        where_: Option<Box<Self>>,
+        ret: Box<Self>,
+        /// RETURN is (or contains) an aggregate → fold over the group rather than
+        /// enforcing the one-row cardinality rule.
+        is_agg: bool,
+        sub_len: usize,
+    },
     Case {
         subject: Option<Box<Self>>,
         whens: Vec<(Self, Self)>,
@@ -532,6 +541,7 @@ fn emit(e: &CExpr, out: &mut Vec<Op>) {
         CExpr::Case { .. }
         | CExpr::Exists { .. }
         | CExpr::CountSubquery { .. }
+        | CExpr::ValueSubquery { .. }
         | CExpr::Index { .. }
         | CExpr::Field { .. }
         | CExpr::PropertyExists { .. }
@@ -1298,6 +1308,29 @@ impl Lowerer {
                     sub_len,
                 }
             }
+            Expr::ValueSubquery {
+                patterns,
+                where_,
+                ret,
+            } => {
+                // The RETURN expression reads the subquery's own bindings, so lower
+                // it inside the sub-scope alongside the patterns/WHERE, then restore.
+                let parent_len = self.scope.len();
+                self.add_pattern_vars(patterns);
+                let cpatterns = patterns.iter().map(|p| self.path(p)).collect();
+                let cwhere = where_.as_deref().map(|w| self.boxed(w));
+                let cret = self.boxed(ret);
+                let sub_len = self.scope.len();
+                self.scope.truncate(parent_len);
+                let is_agg = has_aggregate(&cret);
+                CExpr::ValueSubquery {
+                    patterns: cpatterns,
+                    where_: cwhere,
+                    ret: cret,
+                    is_agg,
+                    sub_len,
+                }
+            }
             Expr::Case {
                 subject,
                 whens,
@@ -1937,6 +1970,25 @@ fn collect_free_vars(e: &Expr, bound: &[String], free: &mut Vec<String>) {
             if let Some(w) = where_ {
                 collect_free_vars(w, &inner, free);
             }
+        }
+        Expr::ValueSubquery {
+            patterns,
+            where_,
+            ret,
+        } => {
+            // Same as EXISTS/COUNT, plus the RETURN expression, which also reads the
+            // subquery's own bindings.
+            let mut inner = bound.to_vec();
+            for p in patterns {
+                pattern_bound_vars(p, &mut inner);
+            }
+            for p in patterns {
+                collect_pattern_free_vars(p, &inner, free);
+            }
+            if let Some(w) = where_ {
+                collect_free_vars(w, &inner, free);
+            }
+            collect_free_vars(ret, &inner, free);
         }
     }
 }

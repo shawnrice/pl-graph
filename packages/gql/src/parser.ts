@@ -266,6 +266,15 @@ export const parse = (
     !peek().delimited &&
     peek().value.toUpperCase() === name;
 
+  // ISO `VALUE { … }` scalar subquery: `value` is reserved but not a structural
+  // keyword, so it arrives as a (reserved) ident; the following `{` disambiguates
+  // it from any other use. A backtick-delimited `` `value` `` stays an identifier.
+  const valueSubqueryAhead = (): boolean =>
+    peek().type === 'ident' &&
+    !peek().delimited &&
+    peek().value.toLowerCase() === 'value' &&
+    tokens[pos + 1]?.type === 'lbrace';
+
   const expect = (type: TokenType, what: string): Token => {
     if (!check(type)) {
       throw new GqlSyntaxError(
@@ -1444,6 +1453,42 @@ export const parse = (
     return { kind: 'func', name: 'count', ...parseCallArgs() };
   };
 
+  // ISO `VALUE { [MATCH p1, … [WHERE pred]] RETURN e }` — a scalar subquery.
+  // VALUE has been consumed; parse the braced query specification. v1 scope: an
+  // optional single MATCH block (comma-joined patterns + WHERE) then a single-
+  // expression RETURN.
+  const parseValueSubquery = (): Expr => {
+    expect('lbrace', "'{' after VALUE");
+    const patterns: PathPattern[] = [];
+    let where: Expr | undefined;
+
+    // Patterns are optional (`VALUE { RETURN 1 }` is a constant), signalled by
+    // anything other than a leading RETURN.
+    if (!checkKeyword('return')) {
+      if (checkKeyword('match')) {
+        advance();
+      }
+
+      patterns.push(parsePathPattern());
+
+      while (check('comma')) {
+        advance();
+        patterns.push(parsePathPattern());
+      }
+
+      if (checkKeyword('where')) {
+        advance();
+        where = parseExpr();
+      }
+    }
+
+    expectKeyword('return');
+    const ret = parseExpr();
+    expect('rbrace', "'}' to close VALUE");
+
+    return { kind: 'valueSubquery', patterns, where, ret };
+  };
+
   // ISO `<case expression>`: `CASE [subject] (WHEN test THEN result)+ [ELSE r] END`.
   // A subject before the first WHEN makes it a simple CASE; otherwise searched.
   const parseCase = (): Expr => {
@@ -1670,6 +1715,12 @@ export const parse = (
 
     if (checkKeyword('count')) {
       return parseCount();
+    }
+
+    if (valueSubqueryAhead()) {
+      advance();
+
+      return parseValueSubquery();
     }
 
     if (t.type === 'lparen') {

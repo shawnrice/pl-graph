@@ -1717,6 +1717,8 @@ const compileExpr = (expr: Expr): CompiledExpr => {
       return compileExists(expr);
     case 'countSubquery':
       return compileCountSubquery(expr);
+    case 'valueSubquery':
+      return compileValueSubquery(expr);
   }
 };
 
@@ -1860,6 +1862,46 @@ const compileCountSubquery = (expr: Extract<Expr, { kind: 'countSubquery' }>): C
   const sub = compileSubMatch(expr);
 
   return (env) => [...matchClauseBindings(env.graph, sub, env.binding, env.params)].length;
+};
+
+/**
+ * ISO `VALUE { … RETURN e }`: a scalar (single-value) correlated subquery.
+ * Collect every correlated match, then: an aggregate RETURN folds the whole
+ * group to one value (0 rows → the aggregate's empty answer); a non-aggregate
+ * RETURN yields NULL for 0 rows, the value for exactly one, and a **cardinality
+ * error** for more than one (ISO: a scalar subquery must not deliver >1 row) —
+ * loud, never a silent first-of-many. Mirrors the native `value_subquery`.
+ */
+const compileValueSubquery = (expr: Extract<Expr, { kind: 'valueSubquery' }>): CompiledExpr => {
+  const sub = compileSubMatch(expr);
+  const retFn = compileExpr(expr.ret);
+  const isAgg = hasAggregate(expr.ret);
+
+  return (env) => {
+    const matches = [...matchClauseBindings(env.graph, sub, env.binding, env.params)];
+
+    if (isAgg) {
+      // Fold over the group: `count(*)` reads its length, other aggregates read
+      // `env.group`; a plain sub-expression reads the first match (or the outer
+      // binding when there were none).
+      const base = matches[0] ?? env.binding;
+
+      return retFn({ ...env, binding: base, group: matches });
+    }
+
+    if (matches.length === 0) {
+      return null;
+    }
+
+    if (matches.length > 1) {
+      dataException(
+        'a VALUE scalar subquery returned more than one row; add an aggregate ' +
+          '(e.g. count/collect), a LIMIT-like bound, or a more selective pattern',
+      );
+    }
+
+    return retFn({ ...env, binding: matches[0] });
+  };
 };
 
 /**
@@ -2177,7 +2219,7 @@ export const freePredicateVars = (expr: Expr): Set<string> => {
   // those bindings aren't free references, but outer names still are. Extracted
   // from `walk` to keep that switch under the complexity budget.
   const walkSubquery = (
-    e: Extract<Expr, { kind: 'exists' | 'countSubquery' }>,
+    e: Extract<Expr, { kind: 'exists' | 'countSubquery' | 'valueSubquery' }>,
     bound: ReadonlySet<string>,
   ): void => {
     const inner = new Set(bound);
@@ -2192,6 +2234,28 @@ export const freePredicateVars = (expr: Expr): Set<string> => {
 
     if (e.where) {
       walk(e.where, inner);
+    }
+
+    // A VALUE subquery's RETURN expression also reads the subquery's own bindings.
+    if (e.kind === 'valueSubquery') {
+      walk(e.ret, inner);
+    }
+  };
+
+  // A CASE expression's operands: subject (simple CASE), every WHEN/THEN, and
+  // ELSE. Extracted from `walk` to keep that switch under the complexity budget.
+  const walkCase = (e: Extract<Expr, { kind: 'case' }>, bound: ReadonlySet<string>): void => {
+    if (e.subject) {
+      walk(e.subject, bound);
+    }
+
+    for (const w of e.whens) {
+      walk(w.when, bound);
+      walk(w.then, bound);
+    }
+
+    if (e.elseExpr) {
+      walk(e.elseExpr, bound);
     }
   };
 
@@ -2260,18 +2324,7 @@ export const freePredicateVars = (expr: Expr): Set<string> => {
 
         return;
       case 'case':
-        if (e.subject) {
-          walk(e.subject, bound);
-        }
-
-        for (const w of e.whens) {
-          walk(w.when, bound);
-          walk(w.then, bound);
-        }
-
-        if (e.elseExpr) {
-          walk(e.elseExpr, bound);
-        }
+        walkCase(e, bound);
 
         return;
       case 'func':
@@ -2283,6 +2336,7 @@ export const freePredicateVars = (expr: Expr): Set<string> => {
         return;
       case 'exists':
       case 'countSubquery':
+      case 'valueSubquery':
         walkSubquery(e, bound);
 
         return;

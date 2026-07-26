@@ -130,6 +130,46 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(ts1).toBe(`[{"sp":0,"ss":null}]`);
   });
 
+  test('VALUE { … } — ISO scalar subquery, correlated + aggregate, byte-identical', () => {
+    // Correlated single-row: marko's one CREATED target is "lop".
+    const [ts1, nat1] = both(
+      `MATCH (n:Person {name: 'marko'}) RETURN VALUE { MATCH (n)-[:CREATED]->(s) RETURN s.name } AS made`,
+    );
+    expect(ts1).toBe(nat1);
+    expect(ts1).toBe(`[{"made":"lop"}]`);
+
+    // 0 rows → NULL: vadas has no out-edges.
+    const [ts2, nat2] = both(
+      `MATCH (n:Person {name: 'vadas'}) RETURN VALUE { MATCH (n)-[:KNOWS]->(m) RETURN m.name } AS f`,
+    );
+    expect(ts2).toBe(nat2);
+    expect(ts2).toBe(`[{"f":null}]`);
+
+    // Aggregate RETURN folds the group: three Person nodes.
+    const [ts3, nat3] = both(`RETURN VALUE { MATCH (n:Person) RETURN count(*) } AS c`);
+    expect(ts3).toBe(nat3);
+    expect(ts3).toBe(`[{"c":3}]`);
+
+    // Correlated aggregate: marko's KNOWS out-degree is 2 (no cardinality error).
+    const [ts4, nat4] = both(
+      `MATCH (n:Person {name: 'marko'}) RETURN VALUE { MATCH (n)-[:KNOWS]->(m) RETURN count(*) } AS deg`,
+    );
+    expect(ts4).toBe(nat4);
+    expect(ts4).toBe(`[{"deg":2}]`);
+
+    // No patterns → a constant scalar.
+    const [ts5, nat5] = both(`RETURN VALUE { RETURN 1 + 2 } AS v`);
+    expect(ts5).toBe(nat5);
+    expect(ts5).toBe(`[{"v":3}]`);
+  });
+
+  test('VALUE { … } — a multi-row non-aggregate RETURN is a cardinality error in both', () => {
+    // marko has two KNOWS neighbours; a non-aggregate scalar subquery must fault.
+    const q = `MATCH (n:Person {name: 'marko'}) RETURN VALUE { MATCH (n)-[:KNOWS]->(m) RETURN m.name } AS f`;
+    expect(() => tsQuery(tsGraph, q)).toThrow();
+    expect(() => nativeGraph.query(q)).toThrow();
+  });
+
   test('list[i] — ISO GQL 0-based subscript, null-safe, byte-identical', () => {
     const cases: Array<[string, string]> = [
       // 0-based: [0] is the first element.

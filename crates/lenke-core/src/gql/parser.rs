@@ -200,6 +200,11 @@ impl Parser {
     fn peek(&self) -> &Token {
         &self.tokens[self.pos]
     }
+    /// One token past `peek` (clamped to EOF), for two-token lookahead.
+    fn peek2(&self) -> &Token {
+        let i = (self.pos + 1).min(self.tokens.len() - 1);
+        &self.tokens[i]
+    }
     fn at_end(&self) -> bool {
         self.peek().tt == Tt::Eof
     }
@@ -1346,6 +1351,40 @@ impl Parser {
         Ok((patterns, where_))
     }
 
+    /// `VALUE { [MATCH p1, … [WHERE pred]] RETURN <expr> }` — a scalar subquery.
+    /// The `VALUE` token has been consumed; parse the braced query specification.
+    /// v1 scope: an optional single MATCH block (comma-joined patterns + WHERE)
+    /// then a single-expression RETURN. The `{` is required.
+    fn parse_value_subquery(&mut self) -> R<Expr> {
+        self.expect(Tt::LBrace, "'{' after VALUE")?;
+        let mut patterns = Vec::new();
+        let mut where_ = None;
+        // Patterns are optional (`VALUE { RETURN 1 }` is a constant); their
+        // presence is signalled by anything other than a leading RETURN.
+        if !self.check_kw("return") {
+            if self.check_kw("match") {
+                self.advance();
+            }
+            patterns.push(self.parse_path_pattern()?);
+            while self.check(Tt::Comma) {
+                self.advance();
+                patterns.push(self.parse_path_pattern()?);
+            }
+            if self.check_kw("where") {
+                self.advance();
+                where_ = Some(Box::new(self.parse_expr()?));
+            }
+        }
+        self.expect_kw("return")?;
+        let ret = Box::new(self.parse_expr()?);
+        self.expect(Tt::RBrace, "'}' to close VALUE")?;
+        Ok(Expr::ValueSubquery {
+            patterns,
+            where_,
+            ret,
+        })
+    }
+
     fn parse_call_args(&mut self) -> R<(Vec<Expr>, bool, bool)> {
         self.expect(Tt::LParen, "'(' to open a function call")?;
         let mut star = false;
@@ -1696,6 +1735,17 @@ impl Parser {
                 Ok(Expr::List(items))
             }
             Tt::Ident => {
+                // ISO `VALUE { … RETURN e }` — scalar (single-value) subquery.
+                // `value` isn't a reserved word, so disambiguate on the following
+                // `{` (an identifier is never followed by a brace). A backtick-
+                // delimited `` `value` `` stays a plain identifier.
+                if !t.delimited
+                    && t.value.eq_ignore_ascii_case("value")
+                    && self.peek2().tt == Tt::LBrace
+                {
+                    self.advance();
+                    return self.parse_value_subquery();
+                }
                 self.advance();
                 // Function call: the name may be a reserved word (UPPER, SUM, ABS).
                 if self.check(Tt::LParen) {
