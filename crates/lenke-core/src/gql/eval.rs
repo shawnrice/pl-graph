@@ -100,6 +100,11 @@ pub enum Val {
     /// An ISO temporal scalar (`DATE`/`LOCAL DATETIME`/`DURATION`).
     Temporal(crate::temporal::Temporal),
     List(Vec<Self>),
+    /// An ISO record / map: string field names → values, **keys kept sorted**
+    /// (the canonical invariant — equality is a slice compare, output is a
+    /// straight emit). Boxed in an `Arc` so a clone is a refcount bump, not a
+    /// deep copy — the per-row `Binding` clone stays cheap.
+    Map(Arc<[(Arc<str>, Self)]>),
     Node(u32),
     Edge(u32),
     /// A walked path: interleaved vertices and edges (`vertices.len() ==
@@ -716,6 +721,13 @@ fn js_str(graph: &Graph, v: &Val) -> String {
 
             parts.join(",")
         }
+        // A record stringifies to its canonical JSON object (via the shared result
+        // serializer, so it's byte-identical to how the map serializes elsewhere).
+        Val::Map(_) => {
+            let mut s = String::new();
+            crate::codec::push_value(&mut s, &val_to_value(graph, v));
+            s
+        }
     }
 }
 
@@ -738,6 +750,14 @@ fn val_eq(a: &Val, b: &Val) -> bool {
         (Val::Edge(x), Val::Edge(y)) => x == y,
         (Val::List(x), Val::List(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| val_eq(p, q))
+        }
+        // Records are equal iff they have the same fields (keys are canonical, so
+        // positional) with recursively-equal values. ISO records support `=`/`<>`.
+        (Val::Map(x), Val::Map(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|((k1, v1), (k2, v2))| k1 == k2 && val_eq(v1, v2))
         }
         _ => false,
     }
@@ -836,6 +856,22 @@ fn cmp_total(a: &Val, b: &Val) -> Ordering {
             }
             x.len().cmp(&y.len())
         }
+        // Records: keys are canonical (sorted), so compare field-by-field (key
+        // then value), shorter-is-less. Gives ORDER BY / DISTINCT a total order
+        // even though ISO defines no relational `<`/`>` on records.
+        (Val::Map(x), Val::Map(y)) => {
+            for ((k1, v1), (k2, v2)) in x.iter().zip(y.iter()) {
+                let kc = k1.cmp(k2);
+                if kc != Ordering::Equal {
+                    return kc;
+                }
+                let vc = cmp_total(v1, v2);
+                if vc != Ordering::Equal {
+                    return vc;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
         _ => Ordering::Equal,
     }
 }
@@ -924,6 +960,17 @@ fn val_key(v: &Val, out: &mut String) {
                 out.push(',');
             }
             out.push(']');
+        }
+        // Canonical (sorted) keys → a canonical grouping/DISTINCT key string.
+        Val::Map(pairs) => {
+            out.push('{');
+            for (k, it) in pairs.iter() {
+                out.push_str(k);
+                out.push(':');
+                val_key(it, out);
+                out.push(',');
+            }
+            out.push('}');
         }
         Val::Path { vertices, edges } => {
             // Structural: two paths are the same key iff they visit the same
@@ -1035,9 +1082,14 @@ fn value_to_val(v: &Value) -> Val {
         Value::Str(s) => Val::Str(s.clone()), // shared Arc — refcount bump, no alloc
         Value::Temporal(t) => Val::Temporal(*t),
         Value::List(items) => Val::List(items.iter().map(value_to_val).collect()),
-        // Map is a query-result-only value (a serialized node/edge); it is never a
-        // stored property, so it never flows back through property/label reads.
-        Value::Map(_) => Val::Null,
+        // A stored record/map reads back as a first-class runtime map (keys are
+        // already canonical/sorted in the store).
+        Value::Map(pairs) => Val::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.clone(), value_to_val(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -1170,6 +1222,13 @@ fn val_to_value(graph: &Graph, v: &Val) -> Value {
         Val::Str(s) => Value::Str(s.clone()), // shared Arc — refcount bump, no alloc
         Val::Temporal(t) => Value::Temporal(*t),
         Val::List(items) => Value::List(items.iter().map(|x| val_to_value(graph, x)).collect()),
+        // A runtime record → the result map (keys already canonical/sorted).
+        Val::Map(pairs) => Value::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.clone(), val_to_value(graph, v)))
+                .collect(),
+        ),
         Val::Node(i) => {
             let mut labels: Vec<Arc<str>> = graph
                 .vertex_labels(*i)

@@ -7074,3 +7074,91 @@ fn match_mode_repeatable_vs_different_edges() {
     );
     assert_eq!(diff, default);
 }
+
+// --- map/record runtime value (Phase 4) --------------------------------------
+
+/// Build a result `Value::Map` for assertions (keys given in any order; the
+/// engine canonicalizes on store, so expectations use sorted order).
+fn vmap(pairs: &[(&str, Value)]) -> Value {
+    Value::Map(
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).into(), v.clone()))
+            .collect(),
+    )
+}
+
+fn map_graph() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"a","labels":["P"],"properties":{"id":"a","meta":{"city":"NYC","n":1}}}"#,
+        r#"{"type":"node","id":"b","labels":["P"],"properties":{"id":"b","meta":{"city":"NYC","n":1}}}"#,
+        r#"{"type":"node","id":"c","labels":["P"],"properties":{"id":"c","meta":{"city":"LA","n":2}}}"#,
+    ])
+}
+
+#[test]
+fn read_and_return_a_stored_map() {
+    let mut g = map_graph();
+    assert_eq!(
+        rows(&mut g, "MATCH (n:P {id:'a'}) RETURN n.meta AS m"),
+        vec![vec![vmap(&[("city", s("NYC")), ("n", n(1.0))])]],
+    );
+    // An absent field of a map is not reachable yet (Phase 5); the whole map reads.
+    assert_eq!(
+        rows(&mut g, "MATCH (n:P {id:'c'}) RETURN n.meta AS m"),
+        vec![vec![vmap(&[("city", s("LA")), ("n", n(2.0))])]],
+    );
+}
+
+#[test]
+fn map_equality_is_structural() {
+    // a.meta == b.meta (same fields/values), != c.meta.
+    let mut g = map_graph();
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:P {id:'a'}), (b:P {id:'b'}) RETURN a.meta = b.meta AS eq",
+        ),
+        vec![vec![b(true)]],
+    );
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:P {id:'a'}), (c:P {id:'c'}) RETURN a.meta = c.meta AS eq",
+        ),
+        vec![vec![b(false)]],
+    );
+}
+
+#[test]
+fn distinct_over_map_values_collapses_equal_maps() {
+    // a and b share an identical map → DISTINCT yields two maps, not three.
+    let mut g = map_graph();
+    let mut got: Vec<Value> = rows(&mut g, "MATCH (n:P) RETURN DISTINCT n.meta AS m")
+        .into_iter()
+        .map(|r| r[0].clone())
+        .collect();
+    got.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
+    assert_eq!(
+        got,
+        vec![
+            vmap(&[("city", s("LA")), ("n", n(2.0))]),
+            vmap(&[("city", s("NYC")), ("n", n(1.0))]),
+        ],
+    );
+}
+
+#[test]
+fn order_by_over_map_values_is_deterministic() {
+    // A total order on maps (sorted-field lexicographic) makes ORDER BY well-
+    // defined: "LA" < "NYC" on the first field. a and b tie (equal maps).
+    let mut g = map_graph();
+    let ids: Vec<Value> = rows(
+        &mut g,
+        "MATCH (n:P) RETURN n.id AS id, n.meta AS m ORDER BY m, id",
+    )
+    .into_iter()
+    .map(|r| r[0].clone())
+    .collect();
+    assert_eq!(ids, vec![s("c"), s("a"), s("b")]); // LA first, then the two NYC
+}
