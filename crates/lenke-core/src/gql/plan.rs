@@ -14,6 +14,8 @@
 //! Graph-dependent resolution (property key → id) stays at execute time — the
 //! graph is mutable and key ids are graph-specific.
 
+use std::sync::Arc;
+
 use super::ast::*;
 
 /// A variable reference that resolves to no in-scope slot reads as NULL.
@@ -291,6 +293,8 @@ pub enum CExpr {
     },
     Lit(Lit),
     List(Vec<Self>),
+    /// ISO `<record constructor>` — `{ field: expr, … }`. Field name → value.
+    Record(Vec<(Arc<str>, Self)>),
     /// ISO GQL list element access `base[index]` — 0-based; out of range → null.
     Index {
         base: Box<Self>,
@@ -301,6 +305,9 @@ pub enum CExpr {
     Field {
         base: Box<Self>,
         key_ref: usize,
+        /// The field name as a string — used when the base is a record/map (the
+        /// `key_ref` only resolves against a graph element's property columns).
+        name: Arc<str>,
     },
     Compare {
         op: CompareOp,
@@ -550,6 +557,7 @@ fn emit(e: &CExpr, out: &mut Vec<Op>) {
         | CExpr::CountSubquery { .. }
         | CExpr::ValueSubquery { .. }
         | CExpr::LetIn { .. }
+        | CExpr::Record(_)
         | CExpr::Index { .. }
         | CExpr::Field { .. }
         | CExpr::PropertyExists { .. }
@@ -915,6 +923,7 @@ fn has_aggregate(expr: &CExpr) -> bool {
         }
         CExpr::In { expr, list, .. } => has_aggregate(expr) || has_aggregate(list),
         CExpr::List(items) => items.iter().any(has_aggregate),
+        CExpr::Record(fields) => fields.iter().any(|(_, e)| has_aggregate(e)),
         CExpr::Index { base, index } => has_aggregate(base) || has_aggregate(index),
         CExpr::Field { base, .. } => has_aggregate(base),
         CExpr::Case {
@@ -991,13 +1000,24 @@ fn extract_aggs(expr: CExpr, aggs: &mut Vec<CAgg>) -> CExpr {
         CExpr::List(items) => {
             CExpr::List(items.into_iter().map(|e| extract_aggs(e, aggs)).collect())
         }
+        CExpr::Record(fields) => CExpr::Record(
+            fields
+                .into_iter()
+                .map(|(k, e)| (k, extract_aggs(e, aggs)))
+                .collect(),
+        ),
         CExpr::Index { base, index } => CExpr::Index {
             base: b(base, aggs),
             index: b(index, aggs),
         },
-        CExpr::Field { base, key_ref } => CExpr::Field {
+        CExpr::Field {
+            base,
+            key_ref,
+            name,
+        } => CExpr::Field {
             base: b(base, aggs),
             key_ref,
+            name,
         },
         CExpr::Compare { op, left, right } => CExpr::Compare {
             op,
@@ -1089,6 +1109,7 @@ fn refs_slot_below(expr: &CExpr, n: usize) -> bool {
         CExpr::Var(s) => *s < n,
         CExpr::Prop { var_slot, .. } => *var_slot < n,
         CExpr::List(items) => items.iter().any(|e| refs_slot_below(e, n)),
+        CExpr::Record(fields) => fields.iter().any(|(_, e)| refs_slot_below(e, n)),
         CExpr::Index { base, index } => refs_slot_below(base, n) || refs_slot_below(index, n),
         CExpr::Field { base, .. } => refs_slot_below(base, n),
         CExpr::Neg(e) | CExpr::Not(e) => refs_slot_below(e, n),
@@ -1233,6 +1254,12 @@ impl Lowerer {
             },
             Expr::Lit(l) => CExpr::Lit(l.clone()),
             Expr::List(items) => CExpr::List(items.iter().map(|x| self.expr(x)).collect()),
+            Expr::Record(fields) => CExpr::Record(
+                fields
+                    .iter()
+                    .map(|(k, e)| (Arc::from(k.as_str()), self.expr(e)))
+                    .collect(),
+            ),
             Expr::Index { base, index } => CExpr::Index {
                 base: self.boxed(base),
                 index: self.boxed(index),
@@ -1240,6 +1267,7 @@ impl Lowerer {
             Expr::Field { base, key } => CExpr::Field {
                 base: self.boxed(base),
                 key_ref: intern_ref(&mut self.keys, key),
+                name: Arc::from(key.as_str()),
             },
             Expr::Compare { op, left, right } => CExpr::Compare {
                 op: *op,
@@ -1945,6 +1973,11 @@ fn collect_free_vars(e: &Expr, bound: &[String], free: &mut Vec<String>) {
         Expr::List(items) => {
             for it in items {
                 collect_free_vars(it, bound, free);
+            }
+        }
+        Expr::Record(fields) => {
+            for (_, e) in fields {
+                collect_free_vars(e, bound, free);
             }
         }
         Expr::Neg(x) | Expr::Not(x) => collect_free_vars(x, bound, free),

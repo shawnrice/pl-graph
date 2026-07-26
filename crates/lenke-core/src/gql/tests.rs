@@ -7162,3 +7162,87 @@ fn order_by_over_map_values_is_deterministic() {
     .collect();
     assert_eq!(ids, vec![s("c"), s("a"), s("b")]); // LA first, then the two NYC
 }
+
+// --- record constructor + field access (Phase 5) -----------------------------
+
+#[test]
+fn record_constructor_builds_a_canonical_map() {
+    let mut g = map_graph();
+    // Fields authored out of order → canonical (sorted) map on output.
+    assert_eq!(
+        rows(&mut g, "RETURN {name: 'marko', age: 29} AS r"),
+        vec![vec![vmap(&[("age", n(29.0)), ("name", s("marko"))])]],
+    );
+    // Empty record.
+    assert_eq!(
+        rows(&mut g, "RETURN {} AS r"),
+        vec![vec![Value::Map(vec![])]],
+    );
+    // Duplicate field name → last write wins.
+    assert_eq!(
+        rows(&mut g, "RETURN {a: 1, a: 2} AS r"),
+        vec![vec![vmap(&[("a", n(2.0))])]],
+    );
+    // A field value can be any expression (incl. a variable / property).
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:P {id:'a'}) RETURN {who: n.id, city: n.meta.city} AS r",
+        ),
+        vec![vec![vmap(&[("city", s("NYC")), ("who", s("a"))])]],
+    );
+}
+
+#[test]
+fn field_access_on_a_record() {
+    let mut g = map_graph();
+    // Dot access, subscript access, and a missing field (→ null).
+    assert_eq!(
+        rows(&mut g, "RETURN {a: 1, b: 2}.a AS x"),
+        vec![vec![n(1.0)]]
+    );
+    assert_eq!(
+        rows(&mut g, "RETURN {a: 1, b: 2}['b'] AS x"),
+        vec![vec![n(2.0)]],
+    );
+    assert_eq!(
+        rows(&mut g, "RETURN {a: 1}.zzz AS x"),
+        vec![vec![Value::Null]],
+    );
+    // Nested construction + chained access.
+    assert_eq!(
+        rows(&mut g, "RETURN {p: {n: 5}}.p.n AS x"),
+        vec![vec![n(5.0)]],
+    );
+}
+
+#[test]
+fn field_access_on_a_stored_map() {
+    let mut g = map_graph();
+    // Nested access into a stored map property.
+    assert_eq!(
+        rows(&mut g, "MATCH (n:P {id:'a'}) RETURN n.meta.city AS c"),
+        vec![vec![s("NYC")]],
+    );
+    // A missing nested field reads as null.
+    assert_eq!(
+        rows(&mut g, "MATCH (n:P {id:'a'}) RETURN n.meta.zip AS z"),
+        vec![vec![Value::Null]],
+    );
+}
+
+#[test]
+fn where_on_a_nested_map_field_scans_correctly() {
+    // Nested-field predicate works via scan (the planner index seek is a later
+    // phase; correctness must hold regardless).
+    let mut g = map_graph();
+    let mut ids: Vec<Value> = rows(
+        &mut g,
+        "MATCH (n:P) WHERE n.meta.city = 'NYC' RETURN n.id AS id",
+    )
+    .into_iter()
+    .map(|r| r[0].clone())
+    .collect();
+    ids.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
+    assert_eq!(ids, vec![s("a"), s("b")]);
+}

@@ -450,7 +450,12 @@ pub enum Expr {
     },
     Lit(Lit),
     List(Vec<Self>),
+    /// ISO `<record constructor>` — `{ field: expr, … }`. Field names are
+    /// identifiers; keys are canonicalized (sorted, duplicate last-wins) into a
+    /// `Val::Map` at eval time.
+    Record(Vec<(String, Self)>),
     /// ISO GQL list element access `base[index]` — 0-based; out of range → null.
+    /// Also a record field access when `base` is a map and `index` is a string.
     Index {
         base: Box<Self>,
         index: Box<Self>,

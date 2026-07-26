@@ -736,6 +736,16 @@ fn vstr(s: impl Into<Arc<str>>) -> Val {
     Val::Str(s.into())
 }
 
+/// Look up field `key` in a record/map — a binary search (keys are canonical /
+/// sorted). A missing field reads as NULL (an absent field, three-valued like an
+/// absent property). Cheap clone: scalars copy, `Str`/`Map` are refcount bumps.
+fn map_get(pairs: &[(Arc<str>, Val)], key: &str) -> Val {
+    match pairs.binary_search_by(|(k, _)| k.as_ref().cmp(key)) {
+        Ok(i) => pairs[i].1.clone(),
+        Err(_) => Val::Null,
+    }
+}
+
 /// Structural / identity equality (Null == Null is true). Used by `=` (after a
 /// nullish guard) and by the element-pattern predicate's strict comparison.
 fn val_eq(a: &Val, b: &Val) -> bool {
@@ -1599,26 +1609,53 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
             prop_present(env.graph, env.ctx, &bound, *key_ref)
         }
         CExpr::List(items) => Val::List(items.iter().map(|e| eval(env, e)).collect()),
+        // ISO record constructor → a canonical `Val::Map`: fields inserted in
+        // sorted-key order, a duplicate field name taking the last value.
+        CExpr::Record(fields) => {
+            let mut out: Vec<(Arc<str>, Val)> = Vec::with_capacity(fields.len());
+            for (k, e) in fields {
+                let v = eval(env, e);
+                match out.binary_search_by(|(ek, _)| ek.as_ref().cmp(k.as_ref())) {
+                    Ok(i) => out[i].1 = v,
+                    Err(i) => out.insert(i, (k.clone(), v)),
+                }
+            }
+            Val::Map(out.into())
+        }
         CExpr::Index { base, index } => {
-            // ISO GQL list subscript `base[index]`: 0-based, out of range → null, and
-            // null-safe (non-list base, null / non-integer / negative index → null).
+            // ISO GQL list subscript `base[index]`: 0-based, out of range → null,
+            // null-safe. A STRING index on a record/map is field access; a
+            // non-string index / non-integer list index → null.
             let base_v = eval(env, base);
             let idx_v = eval(env, index);
-            match (base_v, num_of(&idx_v)) {
-                (Val::List(items), Some(i))
-                    if i >= 0.0 && i.fract() == 0.0 && (i as usize) < items.len() =>
-                {
-                    items[i as usize].clone()
-                }
+            match base_v {
+                Val::List(items) => match num_of(&idx_v) {
+                    Some(i) if i >= 0.0 && i.fract() == 0.0 && (i as usize) < items.len() => {
+                        items[i as usize].clone()
+                    }
+                    _ => Val::Null,
+                },
+                Val::Map(pairs) => match &idx_v {
+                    Val::Str(k) => map_get(&pairs, k),
+                    _ => Val::Null,
+                },
                 _ => Val::Null,
             }
         }
-        CExpr::Field { base, key_ref } => {
-            // Property access chained off any expression (`edges(p)[0].amount`).
-            // Reuses `prop_of`: a Node/Edge base reads the stored property; anything
-            // else (null / list / scalar) → null, matching the bare `Prop` path.
+        CExpr::Field {
+            base,
+            key_ref,
+            name,
+        } => {
+            // `.field` chained off any expression. A record/map base reads the
+            // field by name; a Node/Edge base reads the stored property via
+            // `prop_of`; anything else → null, matching the bare `Prop` path.
             let base_v = eval(env, base);
-            prop_of(env.graph, env.ctx, &base_v, *key_ref)
+            if let Val::Map(pairs) = &base_v {
+                map_get(pairs, name)
+            } else {
+                prop_of(env.graph, env.ctx, &base_v, *key_ref)
+            }
         }
         CExpr::Neg(e) => match arith_num(&eval(env, e), env.ctx) {
             Some(n) => Val::Num(-n),

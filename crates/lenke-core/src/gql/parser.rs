@@ -1827,6 +1827,10 @@ impl Parser {
                 self.expect(Tt::RBracket, "']' to close a list")?;
                 Ok(Expr::List(items))
             }
+            // ISO `<record constructor>`: `{ field: expr, … }`. A bare `{` in
+            // expression position is unambiguous — VALUE/EXISTS/COUNT lead with a
+            // keyword, and property maps / subqueries live in their own positions.
+            Tt::LBrace => self.parse_record(),
             Tt::Ident => {
                 // ISO `VALUE { … RETURN e }` — scalar (single-value) subquery.
                 // `value` isn't a reserved word, so disambiguate on the following
@@ -2172,6 +2176,29 @@ impl Parser {
     /// Each binding's RHS is parsed with the bare `IN` operator suppressed so the
     /// value expression ends at the structural `IN` (a parenthesized `IN`
     /// predicate still works — `parse_primary` re-enables it inside the parens).
+    /// ISO `<record constructor>`: `{ field: expr [, field: expr]… }` (or `{}`).
+    /// Field names are identifiers (a reserved word must be backtick-quoted, like
+    /// any binding name). The `{` has NOT been consumed.
+    fn parse_record(&mut self) -> R<Expr> {
+        self.expect(Tt::LBrace, "'{' to open a record")?;
+        let mut fields = Vec::new();
+        if !self.check(Tt::RBrace) {
+            loop {
+                let key = self.bind_name("a record field name")?;
+                self.expect(Tt::Colon, "':' after a record field name")?;
+                let value = self.parse_expr()?;
+                fields.push((key, value));
+                if self.check(Tt::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(Tt::RBrace, "'}' to close a record")?;
+        Ok(Expr::Record(fields))
+    }
+
     fn parse_let_in(&mut self) -> R<Expr> {
         self.expect_kw("let")?;
         let mut bindings = Vec::new();
