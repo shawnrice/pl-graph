@@ -842,8 +842,8 @@ impl Csr {
     }
 }
 
-/// The scalar type of a stored value, or `None` for null / a non-stored `Map`
-/// (both type-exempt — a null has no type).
+/// The scalar type of a stored value, or `None` for null / a `Map` (both
+/// type-exempt — a null has no type, and a record has no scalar `PropType`).
 fn value_type(v: &Value) -> Option<PropType> {
     match v {
         Value::Null | Value::Map(_) => None,
@@ -3721,9 +3721,34 @@ fn value_kind(v: &Value) -> Option<Kind> {
         // An all-numeric fixed-length list packs into a de-boxed `Vec` column; a
         // mixed / variable-length / non-numeric list stays `Mixed`.
         Value::List(items) => Some(numeric_vec_dim(items).map_or(Kind::Mixed, Kind::Vec)),
-        Value::Map(_) => {
-            unreachable!("Value::Map is a query-result value, never a stored property")
+        // A map/record is inherently variable-shape, so it lives boxed in a
+        // `Mixed` column (like a non-numeric list) — never a de-boxed SoA column.
+        Value::Map(_) => Some(Kind::Mixed),
+    }
+}
+
+/// Normalize a value to its canonical stored form: every map (at any depth) has
+/// its fields sorted by key, with duplicate keys collapsed last-wins. Sorted keys
+/// are the invariant the whole engine relies on — equality is a slice compare,
+/// serialization is a straight emit, and the sync-diff `JSON.stringify` byte-
+/// equality holds. Only maps/lists are rebuilt; a scalar is a plain clone, so the
+/// typed-column hot paths (which never reach this) pay nothing.
+fn canonical_value(v: &Value) -> Value {
+    match v {
+        Value::Map(pairs) => {
+            let mut out: Vec<(Arc<str>, Value)> = Vec::with_capacity(pairs.len());
+            for (k, val) in pairs {
+                let cv = canonical_value(val);
+                match out.binary_search_by(|(ek, _)| ek.as_ref().cmp(k.as_ref())) {
+                    // Duplicate field name → last write wins (JS-object / SQL-ish).
+                    Ok(i) => out[i].1 = cv,
+                    Err(i) => out.insert(i, (k.clone(), cv)),
+                }
+            }
+            Value::Map(out)
         }
+        Value::List(items) => Value::List(items.iter().map(canonical_value).collect()),
+        other => other.clone(),
     }
 }
 
@@ -3805,7 +3830,9 @@ fn col_set(col: &mut Column, idx: usize, v: &Value, strs: &mut Dict) -> bool {
             true
         }
         (Column::Mixed { data }, val) => {
-            data[idx] = Some(val.clone());
+            // Canonicalize on the way in so a stored map's keys are always sorted
+            // (the boxed path only — scalars never reach here).
+            data[idx] = Some(canonical_value(val));
             true
         }
         _ => false,
@@ -4371,6 +4398,113 @@ mod null_is_first_class {
 
         p.remove_value(0, "k"); // explicit removal is the ONLY way to unset it
         assert!(!p.is_present(0, "k"));
+    }
+}
+
+#[cfg(test)]
+mod storable_maps {
+    //! A `Value::Map` is a first-class STORED property (boxed in a `Mixed`
+    //! column, like a non-numeric list), canonicalized to sorted keys on the way
+    //! in — the substrate foundation for GQL records / Gremlin maps.
+    use super::*;
+
+    fn s(x: &str) -> Value {
+        Value::Str(x.into())
+    }
+    fn map(pairs: &[(&str, Value)]) -> Value {
+        Value::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).into(), v.clone()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn stored_map_roundtrips_with_keys_sorted() {
+        let mut strs = Dict::default();
+        let mut p = Properties::default();
+        p.push_element();
+        // Author keys OUT of order; storage must canonicalize to sorted.
+        p.set_value(
+            0,
+            "meta",
+            map(&[("name", s("marko")), ("age", Value::Num(29.0))]),
+            &mut strs,
+        );
+        assert!(p.is_present(0, "meta"));
+        assert_eq!(
+            p.value(0, "meta", &strs),
+            map(&[("age", Value::Num(29.0)), ("name", s("marko"))]),
+        );
+    }
+
+    #[test]
+    fn nested_maps_and_lists_are_canonicalized_recursively() {
+        let mut strs = Dict::default();
+        let mut p = Properties::default();
+        p.push_element();
+        p.set_value(
+            0,
+            "m",
+            map(&[
+                ("z", Value::Num(1.0)),
+                (
+                    "a",
+                    Value::List(vec![map(&[("y", Value::Num(2.0)), ("x", Value::Num(3.0))])]),
+                ),
+            ]),
+            &mut strs,
+        );
+        assert_eq!(
+            p.value(0, "m", &strs),
+            map(&[
+                (
+                    "a",
+                    Value::List(vec![map(&[("x", Value::Num(3.0)), ("y", Value::Num(2.0))])]),
+                ),
+                ("z", Value::Num(1.0)),
+            ]),
+        );
+    }
+
+    #[test]
+    fn duplicate_field_names_collapse_last_wins() {
+        let mut strs = Dict::default();
+        let mut p = Properties::default();
+        p.push_element();
+        p.set_value(
+            0,
+            "m",
+            Value::Map(vec![
+                ("k".into(), Value::Num(1.0)),
+                ("k".into(), Value::Num(2.0)),
+            ]),
+            &mut strs,
+        );
+        assert_eq!(p.value(0, "m", &strs), map(&[("k", Value::Num(2.0))]));
+    }
+
+    #[test]
+    fn map_null_field_is_preserved_and_distinct_from_absence() {
+        // A present field with a null value survives the round-trip (null is a
+        // first-class value inside a record, mirroring the top-level policy).
+        let mut strs = Dict::default();
+        let mut p = Properties::default();
+        p.push_element();
+        p.set_value(0, "m", map(&[("k", Value::Null)]), &mut strs);
+        assert_eq!(p.value(0, "m", &strs), map(&[("k", Value::Null)]));
+    }
+
+    #[test]
+    fn a_map_key_coexists_with_scalar_keys_via_mixed() {
+        let mut strs = Dict::default();
+        let mut p = Properties::default();
+        p.push_element();
+        p.set_value(0, "n", Value::Num(1.0), &mut strs);
+        p.set_value(0, "m", map(&[("a", Value::Num(1.0))]), &mut strs);
+        assert!(matches!(p.value(0, "n", &strs), Value::Num(n) if n == 1.0));
+        assert_eq!(p.value(0, "m", &strs), map(&[("a", Value::Num(1.0))]));
     }
 }
 
