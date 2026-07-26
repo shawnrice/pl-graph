@@ -15,16 +15,25 @@ lenke's actual surface.
 
 ---
 
-## 1. The standard itself (primary, paywalled)
+## 1. The standard itself
 
-- **ISO/IEC 39075:2024 — Information technology — Database languages — GQL.**
-  <https://www.iso.org/standard/76120.html> · free browse (front matter/ToC
-  only): <https://www.iso.org/obp/ui/en/#!iso:std:76120:en>
+- **ISO/IEC 39075:2024 — Information technology — Database languages — GQL** _(text
+  paywalled)_. <https://www.iso.org/standard/76120.html> · free browse (front
+  matter/ToC only): <https://www.iso.org/obp/ui/en/#!iso:std:76120:en>
   The authoritative text. Conformance is defined in **subclause 24.2**:
   a system conforms by supporting the data model + the **mandatory** features;
   **optional** features each carry a Feature ID (letter(s)+digits, e.g. `G035`,
   `GF07`, `GV39`). Mandatory features have **no** ID and are cited by subclause.
-  We do not have the full text — everything below is how to work without it.
+  The prose + the **Feature-ID Annex** are behind the paywall.
+
+- **ISO GQL grammar (BNF) — FREE, authoritative.** ISO publishes the machine-readable
+  grammar as a "digital artifact," no paywall:
+  <https://standards.iso.org/iso-iec/39075/ed-1/en/ISO_IEC_39075(en).bnf.txt>
+  (~78 KB, `<GQL-program>` downward). This is the **primary** source for the full
+  _syntax_ surface — better than any vendor reproduction for "what productions
+  exist." It does **not** contain the Feature-ID taxonomy (that's in the paywalled
+  Annex), so pair it with §2 for IDs. The [TuGraph ANTLR grammar](#3-independent-vendor-implementations-cross-check-divergence)
+  is a convenient navigable rendering of the same grammar.
 
 ## 2. Best FREE reproductions of the feature taxonomy
 

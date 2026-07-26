@@ -18,11 +18,61 @@ byte-identical).
 **Legend:** ✅ supported · 🟡 partial · ❌ not yet · 🔷 lenke extension (non-ISO,
 sigil'd) · ➖ excluded by design · ❓ not yet verified
 
-> **Caveats.** (1) The taxonomy is a faithful _secondary_ source (Neo4j, a GQL
-> co-author), not the paywalled spec text. (2) Feature IDs `GF08`/`GF09` could not
-> be resolved from any free source. (3) The **mandatory** layer below is a
-> summary + spot-checks, not a full per-production audit — treat baseline
-> conformance as "substantially yes, with the noted gaps," pending a deeper pass.
+> **Caveats.** (1) The Feature-ID taxonomy is a faithful _secondary_ source
+> (Neo4j, a GQL co-author); the spec _text_ + Feature-ID Annex are paywalled,
+> though the [grammar BNF is free](./references.md#1-the-standard-itself). (2)
+> Feature IDs `GF08`/`GF09` couldn't be resolved from any free source, and the
+> optional table covers only the ~75 IDs Neo4j documents (the ID gaps are real
+> spec features no free source names). (3) Every mandatory production in Neo4j's
+> list has now been probed; the whole language _syntax_ surface has been walked
+> from the grammar.
+
+---
+
+## Gaps (prioritized)
+
+Everything lenke does **not** do, pulled out of the tables below and sorted by
+whether it's worth closing. Tiers 1–2 are real gaps; Tier 3 is deliberate.
+
+### Tier 1 — Mandatory-conformance gaps (break baseline conformance)
+
+These are in the mandatory feature set, so they're the only gaps that affect
+_conformance_ (vs. feature richness). All small.
+
+| Gap                                    | Fix shape                                                                                                                   |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `normalize()` string function          | Add one scalar fn (Unicode NFC/NFD/NFKC/NFKD normalization) both engines.                                                   |
+| `IS [NOT] NORMALIZED` predicate        | Add the predicate (pairs naturally with `normalize()`).                                                                     |
+| `IS TYPED` / `::` value-type predicate | Add the runtime type-check predicate. (Mandatory-vs-optional here is ambiguous without the spec text; treat as ≥ optional.) |
+
+### Tier 2 — Genuine optional-feature gaps (real, not by design)
+
+Ordered roughly cheap→involved.
+
+| Gap                                                                                                             | Notes                                                                                                                                                                 |
+| --------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| List slicing `[i..j]`                                                                                           | Indexing `[i]` already works; slice is a small addition.                                                                                                              |
+| `TRIM(LEADING\|TRAILING\|BOTH … FROM …)`                                                                        | The SQL trim-spec form; simple `trim()` works.                                                                                                                        |
+| Element predicates: `IS DIRECTED`, `IS SOURCE/DESTINATION OF`, `ALL_DIFFERENT()`, `SAME()`, `PROPERTY_EXISTS()` | Small, self-contained predicate/function additions.                                                                                                                   |
+| `!` unary-not operator                                                                                          | Alias for the working `NOT` keyword.                                                                                                                                  |
+| Explicit `GROUP BY` / `HAVING` clauses                                                                          | lenke groups **implicitly** (Cypher-style). Adding the explicit clauses is a parser+planner change; lower value since implicit grouping already covers the use cases. |
+| Multi-`MATCH` `EXISTS { … }` (GQ22)                                                                             | Single-`MATCH` `EXISTS` works.                                                                                                                                        |
+| Map / record values (GV45)                                                                                      | No first-class map value; larger (touches the value model).                                                                                                           |
+| Parenthesized-subpath `WHERE` (G050/G051)                                                                       | Per-_edge_ `WHERE` works; per-subpath doesn't.                                                                                                                        |
+| `DIFFERENT EDGES` / `REPEATABLE ELEMENTS` match modes (G002/G003)                                               | Graph-pattern match modes (distinct from the path modes, which work).                                                                                                 |
+| Inline `LET…IN…END`, `VALUE{}` scalar subquery                                                                  | The `LET` statement works; these are the inline-expression forms.                                                                                                     |
+
+### Tier 3 — Excluded by design (NOT gaps to close)
+
+Deliberate consequences of lenke being an embedded, single-graph,
+schemaless-by-default engine. Documented so they aren't mistaken for gaps.
+
+- **Multi-graph `USE`, catalog DDL** (`CREATE/DROP GRAPH`, `CREATE SCHEMA`) — graph lifecycle is the host API.
+- **Schema / graph-type DDL** (`CREATE GRAPH TYPE`, node/edge type specs, typed graphs) — typed schemas are host-side (`defineNode`) + in-engine constraints.
+- **Session management** (`SESSION SET/RESET/CLOSE`) — no multi-session catalog.
+- **`INT64` / integer subtypes** (GV12) — single f64 numeric model.
+- **`BYTES`/`BINARY`/`VARBINARY`, sized `VARCHAR(n)`** — out of value model.
+- **`BETWEEN`** — not ISO GQL at all (absent from the grammar); correctly rejected.
 
 ---
 
@@ -34,12 +84,20 @@ lenke supports the core mandatory read/write surface: `MATCH`, `INSERT`, `SET`,
 reference, numeric value functions (`char_length`), and character string
 functions (`left/lower/right/trim/upper`).
 
-**Known mandatory gaps (honest):**
+**Mandatory gaps** (found by walking every `<production>` in Neo4j's
+`supported-mandatory` list and probing lenke — see the [Gaps](#gaps-prioritized)
+section):
 
-| Gap                              | Detail                                                                                                                                                                              |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 🟡 `normalize()` string function | The mandatory `<character string function>` set includes `normalize()`; lenke implements the rest (`left/lower/right/trim/upper`) but **not** `normalize()` → `E_UNKNOWN_FUNCTION`. |
-| ❓ full per-production audit     | The mandatory table maps GQL grammar productions to features; a rigorous production-by-production conformance pass has not been run.                                                |
+| Mandatory production          | Gap                   | Detail                                                                                                                   |
+| ----------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `<character string function>` | `normalize()`         | Set is `left/lower/normalize/right/trim/upper`; lenke has all but `normalize()` → `E_UNKNOWN_FUNCTION`.                  |
+| `<normalized predicate>`      | `IS [NOT] NORMALIZED` | Rejected (parse error).                                                                                                  |
+| `<value type predicate>`      | `IS TYPED` / `::`     | Rejected. (Also surfaces as optional GA06 — the mandatory-vs-optional boundary here is ambiguous without the spec text.) |
+
+Everything else in the mandatory list is supported (INSERT/SET/REMOVE/DELETE,
+MATCH/OPTIONAL MATCH, RETURN/FINISH, ORDER BY/SKIP/OFFSET/LIMIT, UNION/UNION ALL,
+comparison/null/EXISTS predicates, CASE/nullIf/coalesce, avg/count/max/min/sum,
+char_length/character_length, `||`, left/lower/right/trim/upper).
 
 ---
 
@@ -256,7 +314,8 @@ clauses (lenke groups implicitly, Cypher-style), **list slicing** `[i..j]`, the
 values (GV45), parenthesized-subpath `WHERE` (G050), the `DIFFERENT
 EDGES`/`REPEATABLE ELEMENTS` match modes (G002/G003), inline `LET…IN…END` /
 `VALUE{}` scalar subqueries, and — by design — multi-graph `USE` (GQ01) and
-`INT64` (GV12). The one **mandatory** gap is `normalize()`.
+`INT64` (GV12). The **mandatory** gaps (three, all small) are `normalize()`,
+`IS NORMALIZED`, and `IS TYPED` — see [Gaps](#gaps-prioritized).
 
 **Statement/program surface** (grammar-derived): **transactions are supported**
 (`START TRANSACTION`/`COMMIT`/`ROLLBACK` as session commands, both engines).
