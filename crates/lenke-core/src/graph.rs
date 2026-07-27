@@ -893,7 +893,10 @@ fn value_matches(v: &Value, spec: &TypeSpec) -> bool {
         return true;
     }
     match spec {
-        TypeSpec::Scalar(ty) => value_type(v) == Some(*ty),
+        // A scalar constraint governs scalar values; a value with no scalar type
+        // (a map) is exempt — the record path governs maps. Matches the scalar
+        // write-check (`type_conflict_on_set`), which skips a non-scalar value.
+        TypeSpec::Scalar(ty) => value_type(v).is_none_or(|got| got == *ty),
         TypeSpec::Record(fields) => {
             let Value::Map(pairs) = v else { return false };
             pairs.len() == fields.len()
