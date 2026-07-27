@@ -6284,6 +6284,47 @@ mod record_debox {
     }
 
     #[test]
+    fn typing_a_mixed_population_succeeds_and_deboxes_each_faithfully() {
+        // The scenario: pre-existing vertices, then you type the label. A LABELED
+        // vertex that already conforms de-boxes into fields; a labeled vertex that
+        // merely LACKS the property is exempt (nullable); a DIFFERENT-label vertex
+        // holding a non-conforming value isn't checked and escapes. Declaration
+        // succeeds and every value survives byte-identically.
+        let mut g = crate::ndjson::decode(
+            r#"{"type":"node","id":"a","labels":["Person"],"properties":{"meta":{"city":"NYC","tier":2}}}"#,
+        )
+        .unwrap();
+        let b = g.add_vertex(&["Person".into()], vec![]) as usize; // labeled, meta ABSENT
+        let c = g.add_vertex(&["Other".into()], vec![("meta".into(), n(42.0))]) as usize; // other label, scalar
+        assert!(g
+            .create_type_constraint("Person", "meta", "record{city::string,tier::number}")
+            .is_ok());
+        assert_eq!(col_name(&g, "meta"), "record");
+        assert_eq!(read(&g, 0), vmap(&[("city", s("NYC")), ("tier", n(2.0))])); // scattered
+        assert!(!g.props.is_present(b, "meta")); // still absent (nullable, exempt)
+        assert_eq!(read(&g, c as usize), n(42.0)); // escaped, unchanged
+    }
+
+    #[test]
+    fn a_labeled_violator_makes_typing_throw_and_deboxes_nothing() {
+        // If ANY live vertex carrying the label already violates the shape, the
+        // declaration throws — atomically. No constraint is recorded and the column
+        // is NOT de-boxed (no half-applied state, no grandfathered landmine).
+        let mut g = crate::ndjson::decode(
+            r#"{"type":"node","id":"a","labels":["Person"],"properties":{"meta":{"city":"NYC","tier":2}}}"#,
+        )
+        .unwrap();
+        // A second Person whose meta is a scalar — a violation of the record shape.
+        g.add_vertex(&["Person".into()], vec![("meta".into(), n(1.0))]);
+        assert!(g
+            .create_type_constraint("Person", "meta", "record{city::string,tier::number}")
+            .is_err());
+        assert_eq!(col_name(&g, "meta"), "mixed", "column untouched on failure");
+        // No constraint recorded → a would-be-violating write no longer conflicts.
+        assert!(!g.type_conflict_on_set(0, "meta", &n(7.0)));
+    }
+
+    #[test]
     fn field_at_reads_a_deboxed_field_directly() {
         let mut g = declared();
         let kid = g.props.keys.get("meta").unwrap();
