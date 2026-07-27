@@ -238,6 +238,9 @@ const valueIsTyped = (v: unknown, category: string, notNull: boolean): boolean =
       return typeof v === 'number';
     case 'list':
       return Array.isArray(v);
+    // The OPEN record type (`ANY RECORD` / bare `RECORD`): any map value.
+    case 'record':
+      return v instanceof LenkeRecord;
     case 'date':
       return v instanceof LocalDate;
     case 'local_time':

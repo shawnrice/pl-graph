@@ -1144,14 +1144,44 @@ impl Parser {
             // `IS [NOT] TYPED <type> [NOT NULL]` — the ISO value-type predicate.
             if self.check_soft("typed") || self.check_kw("typed") {
                 self.advance();
-                let type_name = self.read_type_name("after IS TYPED")?;
-                let category = match type_test_category(&type_name) {
-                    Some(c) => c.to_string(),
-                    None => {
+                // ISO `<record type> ::= [ANY] RECORD …`. The OPEN form (`ANY RECORD`
+                // / a bare `RECORD`) tests "is a map". A bare `ANY` (no `RECORD`) is
+                // the `any`-type test, unchanged. The closed shape form (`RECORD {…}`)
+                // in a predicate is deferred (loud, not silent).
+                let is_record_kw = |p: &Self| p.check_soft("record") || p.check_kw("record");
+                let reject_closed = |p: &mut Self| -> R<()> {
+                    if p.check(Tt::LBrace) {
                         return err(
-                            format!("unsupported type '{type_name}' in IS TYPED"),
-                            self.peek().pos,
+                            "closed-record `IS TYPED RECORD {…}` is not yet supported; use \
+                             `IS TYPED ANY RECORD`, or test fields with per-field predicates",
+                            p.peek().pos,
                         );
+                    }
+                    Ok(())
+                };
+                let category = if is_record_kw(self) {
+                    self.advance(); // RECORD
+                    reject_closed(self)?;
+                    "record".to_string()
+                } else if self.check_kw("any") || self.check_soft("any") {
+                    self.advance(); // ANY
+                    if is_record_kw(self) {
+                        self.advance(); // RECORD
+                        reject_closed(self)?;
+                        "record".to_string()
+                    } else {
+                        "any".to_string() // the bare `ANY` type
+                    }
+                } else {
+                    let type_name = self.read_type_name("after IS TYPED")?;
+                    match type_test_category(&type_name) {
+                        Some(c) => c.to_string(),
+                        None => {
+                            return err(
+                                format!("unsupported type '{type_name}' in IS TYPED"),
+                                self.peek().pos,
+                            );
+                        }
                     }
                 };
                 // Optional `NOT NULL` type modifier (distinct from the `IS NOT`

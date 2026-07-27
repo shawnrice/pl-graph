@@ -6324,6 +6324,33 @@ fn is_typed_rejects_unknown_type() {
     assert!(parse("RETURN 5 IS TYPED FROBNICATE AS x").is_err());
 }
 
+#[test]
+fn is_typed_open_record() {
+    // ISO `IS TYPED [ANY] RECORD` — the OPEN record type tests "is this a map".
+    let mut g = ndjson::decode("").unwrap();
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN {a: 1} IS TYPED ANY RECORD AS a, {a: 1} IS TYPED RECORD AS b, \
+             5 IS TYPED ANY RECORD AS c, [1,2] IS TYPED RECORD AS d, \
+             5 IS NOT TYPED RECORD AS e",
+        ),
+        vec![vec![b(true), b(true), b(false), b(false), b(true)]]
+    );
+    // NOT NULL / null semantics match the scalar predicate.
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN null IS TYPED ANY RECORD AS a, null IS TYPED ANY RECORD NOT NULL AS b",
+        ),
+        vec![vec![b(true), b(false)]]
+    );
+    // The closed shape form in a predicate is a loud, deferred error (not silent).
+    assert!(parse("RETURN {a:1} IS TYPED RECORD {a :: INTEGER} AS x").is_err());
+    // `ANY` without `RECORD` is a parse error.
+    assert!(parse("RETURN {a:1} IS TYPED ANY FOO AS x").is_err());
+}
+
 // ---------------------------------------------------------------------------
 // Graph-element predicates: IS DIRECTED, IS SOURCE/DESTINATION OF, ALL_DIFFERENT,
 // SAME — plus the `!` unary-not operator (tight-binding).

@@ -1423,6 +1423,8 @@ fn value_is_typed(v: &Val, category: &str, not_null: bool) -> bool {
         "integer" => matches!(v, Val::Num(n) if n.is_finite() && n.fract() == 0.0),
         "float" => matches!(v, Val::Num(_)),
         "list" => matches!(v, Val::List(_)),
+        // The OPEN record type (`ANY RECORD` / bare `RECORD`): any map value.
+        "record" => matches!(v, Val::Map(_)),
         "date" => matches!(v, Val::Temporal(Temporal::Date(_))),
         "local_time" => matches!(v, Val::Temporal(Temporal::Time(_))),
         "local_datetime" => matches!(v, Val::Temporal(Temporal::DateTime(_))),

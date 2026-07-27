@@ -1153,11 +1153,43 @@ export const parse = (
       // reserved-but-not-structural, so it arrives as an identifier.
       if ((check('ident') || check('keyword')) && peek().value.toLowerCase() === 'typed') {
         advance();
-        const typeName = readTypeName();
-        const category = typeTestCategory(typeName);
+        // ISO `<record type> ::= [ANY] RECORD …`. The OPEN form (`ANY RECORD` /
+        // bare `RECORD`) tests "is a map". A bare `ANY` is the `any`-type test. The
+        // closed shape form (`RECORD {…}`) in a predicate is deferred (loud).
+        const isWord = (w: string): boolean =>
+          (check('ident') || check('keyword')) && peek().value.toLowerCase() === w;
+        const rejectClosed = (): void => {
+          if (check('lbrace')) {
+            throw new GqlSyntaxError(
+              'closed-record `IS TYPED RECORD {…}` is not yet supported; use ' +
+                '`IS TYPED ANY RECORD`, or test fields with per-field predicates',
+              peek().pos,
+            );
+          }
+        };
+        let category: string | null;
 
-        if (category === null) {
-          throw new GqlSyntaxError(`unsupported type '${typeName}' in IS TYPED`, peek().pos);
+        if (isWord('record')) {
+          advance();
+          rejectClosed();
+          category = 'record';
+        } else if (isWord('any')) {
+          advance();
+
+          if (isWord('record')) {
+            advance();
+            rejectClosed();
+            category = 'record';
+          } else {
+            category = 'any';
+          }
+        } else {
+          const typeName = readTypeName();
+          category = typeTestCategory(typeName);
+
+          if (category === null) {
+            throw new GqlSyntaxError(`unsupported type '${typeName}' in IS TYPED`, peek().pos);
+          }
         }
 
         let notNull = false;

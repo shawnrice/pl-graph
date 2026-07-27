@@ -514,6 +514,21 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(ts).toContain('"m":false');
   });
 
+  test('IS TYPED [ANY] RECORD — the open record type, byte-identical', () => {
+    const q =
+      `RETURN {a: 1} IS TYPED ANY RECORD AS a, {a: 1} IS TYPED RECORD AS b, ` +
+      `5 IS TYPED ANY RECORD AS c, [1,2] IS TYPED RECORD AS d, ` +
+      `5 IS NOT TYPED RECORD AS e, null IS TYPED ANY RECORD AS f, ` +
+      `null IS TYPED ANY RECORD NOT NULL AS g`;
+    const [ts, native] = both(q);
+
+    expect(ts).toBe(native);
+    expect(ts).toContain('"a":true');
+    expect(ts).toContain('"c":false');
+    expect(ts).toContain('"e":true');
+    expect(ts).toContain('"g":false');
+  });
+
   test('graph-element predicates + ! — byte-identical', () => {
     // IS DIRECTED / IS SOURCE|DESTINATION OF / ALL_DIFFERENT / SAME over a real edge.
     const [ts, native] = both(
