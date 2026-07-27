@@ -21,6 +21,7 @@ const ARW_FLOAT64 = 1;
 const ARW_BOOL = 2;
 const ARW_UTF8 = 3;
 const ARW_FIXED_LIST = 4; // FixedSizeList<Float64>[dim]; dim rides buf2_len
+const ARW_STRUCT = 5; // Struct<field: type, …>; child count rides buf2_len, children follow in pre-order
 
 const HEADER_LEN = 24;
 const COLDESC_LEN = 40;
@@ -32,6 +33,7 @@ const MSG_RECORD_BATCH = 3; // MessageHeader.RecordBatch
 const TYPE_FLOATINGPOINT = 3; // Type.FloatingPoint
 const TYPE_UTF8 = 5; // Type.Utf8
 const TYPE_BOOL = 6; // Type.Bool
+const TYPE_STRUCT = 13; // Type.Struct_
 const TYPE_FIXEDSIZELIST = 16; // Type.FixedSizeList
 const PRECISION_DOUBLE = 2; // Precision.DOUBLE
 
@@ -278,7 +280,8 @@ class FlatBufferBuilder {
   }
 }
 
-/** One column's ARW1 view: its Arrow type + physical buffers (validity/data). */
+/** One column's ARW1 view: its Arrow type + physical buffers (validity/data). A
+ * `Struct` carries only its validity buffer and its typed `children`. */
 type Arw1Column = {
   name: string;
   type: number;
@@ -286,9 +289,12 @@ type Arw1Column = {
   /** FixedSizeList list size (0 otherwise); a FixedList adds a child field-node. */
   dim: number;
   buffers: Uint8Array[]; // Arrow buffer order (validity, then values / offsets+data)
+  children: Arw1Column[]; // Struct field columns (empty for every other type)
 };
 
-/** Parse an ARW1 blob into per-column name/type/null-count + Arrow buffers. */
+/** Parse an ARW1 blob into per-column name/type/null-count + Arrow buffers. A
+ * struct's children ride as pre-order descriptors, so the reader recurses; the
+ * header's `ncols` counts only top-level columns. */
 const parseArw1 = (blob: Uint8Array): { nrows: number; columns: Arw1Column[] } => {
   const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
   const td = new TextDecoder();
@@ -299,10 +305,14 @@ const parseArw1 = (blob: Uint8Array): { nrows: number; columns: Arw1Column[] } =
 
   const nrows = Number(dv.getBigUint64(8, true));
   const ncols = Number(dv.getBigUint64(16, true));
-  const columns: Arw1Column[] = [];
+  const slice = (off: number, len: number): Uint8Array => blob.subarray(off, off + len);
 
-  for (let c = 0; c < ncols; c += 1) {
-    const d = HEADER_LEN + c * COLDESC_LEN;
+  // Read descriptor `cursor.i` into a column, advancing past it and (for a struct)
+  // its children in pre-order.
+  const cursor = { i: 0 };
+  const readCol = (): Arw1Column => {
+    const d = HEADER_LEN + cursor.i * COLDESC_LEN;
+    cursor.i += 1;
     const type = dv.getUint32(d, true);
     const nullCount = dv.getUint32(d + 4, true);
     const nameOff = dv.getUint32(d + 8, true);
@@ -314,32 +324,45 @@ const parseArw1 = (blob: Uint8Array): { nrows: number; columns: Arw1Column[] } =
     const buf2Off = dv.getUint32(d + 32, true);
     const buf2Len = dv.getUint32(d + 36, true);
     const name = td.decode(blob.subarray(nameOff, nameOff + nameLen));
-    const slice = (off: number, len: number): Uint8Array => blob.subarray(off, off + len);
 
     // Arrow buffer order: validity, then values (Float64/Bool) or offsets+data (Utf8).
     // A no-null column's validity is a length-0 buffer (readers treat it as all-valid).
     // FixedSizeList: [list validity, child validity (empty), child values (buf1)];
-    // its `dim` rides `buf2_len` (buf2 is not a buffer).
+    // its `dim` rides `buf2_len`. Struct: [validity] only; `buf2_len` = child count.
     let dim = 0;
     let buffers: Uint8Array[];
+    const children: Arw1Column[] = [];
 
     if (type === ARW_UTF8) {
       buffers = [slice(validityOff, validityLen), slice(buf1Off, buf1Len), slice(buf2Off, buf2Len)];
     } else if (type === ARW_FIXED_LIST) {
       dim = buf2Len;
       buffers = [slice(validityOff, validityLen), new Uint8Array(0), slice(buf1Off, buf1Len)];
+    } else if (type === ARW_STRUCT) {
+      buffers = [slice(validityOff, validityLen)];
+
+      for (let k = 0; k < buf2Len; k += 1) {
+        children.push(readCol());
+      }
     } else {
       buffers = [slice(validityOff, validityLen), slice(buf1Off, buf1Len)];
     }
 
-    columns.push({ name, type, nullCount, dim, buffers });
+    return { name, type, nullCount, dim, buffers, children };
+  };
+
+  const columns: Arw1Column[] = [];
+
+  for (let c = 0; c < ncols; c += 1) {
+    columns.push(readCol());
   }
 
   return { nrows, columns };
 };
 
-/** Concatenate the Arrow buffers into a RecordBatch body (each 8-aligned), and
- * record the `{offset, length}` for every buffer plus the body's total length. */
+/** Concatenate the Arrow buffers into a RecordBatch body (each 8-aligned) in
+ * depth-first order (a struct's validity, then each child's buffers), and record
+ * the `{offset, length}` for every buffer plus the body's total length. */
 const assembleBody = (columns: Arw1Column[]): { body: Uint8Array; buffers: [bigint, bigint][] } => {
   const parts: Uint8Array[] = [];
   const buffers: [bigint, bigint][] = [];
@@ -352,14 +375,21 @@ const assembleBody = (columns: Arw1Column[]): { body: Uint8Array; buffers: [bigi
       pos += p;
     }
   };
-
-  for (const col of columns) {
+  const pushBuffers = (col: Arw1Column): void => {
     for (const b of col.buffers) {
       align(); // every Arrow buffer starts on an 8-byte boundary
       buffers.push([BigInt(pos), BigInt(b.length)]);
       parts.push(b);
       pos += b.length;
     }
+
+    for (const c of col.children) {
+      pushBuffers(c);
+    }
+  };
+
+  for (const col of columns) {
+    pushBuffers(col);
   }
 
   align(); // pad the whole body to a multiple of 8
@@ -396,6 +426,14 @@ const buildField = (b: FlatBufferBuilder, col: Arw1Column, emptyChildren: number
     b.startObject(0);
     typeOff = b.endObject();
     typeType = TYPE_UTF8;
+  } else if (col.type === ARW_STRUCT) {
+    // Nested types build inner-first: each child Field, then the children vector,
+    // then this struct's (empty) type table.
+    const childFields = col.children.map((c) => buildField(b, c, emptyChildren));
+    children = b.offsetVector(childFields);
+    b.startObject(0); // Struct_ has no type-table fields
+    typeOff = b.endObject();
+    typeType = TYPE_STRUCT;
   } else if (col.type === ARW_FIXED_LIST) {
     // The child `item: Float64` field (nested types build inner-first).
     const childName = b.createString('item');
@@ -464,16 +502,23 @@ const recordBatchMessage = (
   body: Uint8Array,
 ): Uint8Array => {
   const b = new FlatBufferBuilder();
-  // One field-node per field in depth-first order: a FixedSizeList adds a second
-  // node for its `item` child (length nrows × dim, no nulls).
+  // One field-node per field in depth-first pre-order: a FixedSizeList adds a
+  // second node for its `item` child; a Struct adds a node per child (recursively).
   const nodes: [bigint, bigint][] = [];
-
-  for (const c of columns) {
+  const pushNodes = (c: Arw1Column): void => {
     nodes.push([BigInt(nrows), BigInt(c.nullCount)]);
 
     if (c.type === ARW_FIXED_LIST) {
       nodes.push([BigInt(nrows * c.dim), 0n]);
+    } else if (c.type === ARW_STRUCT) {
+      for (const child of c.children) {
+        pushNodes(child);
+      }
     }
+  };
+
+  for (const c of columns) {
+    pushNodes(c);
   }
 
   const buffersVec = b.structVector16(buffers);
@@ -549,8 +594,8 @@ const concat = (parts: Uint8Array[]): Uint8Array => {
  * `polars.read_ipc_stream`) or the file / Feather-v2 layout (`pandas.read_feather`,
  * `polars.read_ipc`, `pyarrow.ipc.open_file`). Feed a query straight through:
  * `toArrowIPC(graph.queryArrow('MATCH (n:P) RETURN n.name, n.age'))`. Float64, Bool,
- * and Utf8 columns are supported (the tags ARW1 emits); nulls carry through the
- * validity bitmap. No runtime dependencies.
+ * Utf8, FixedSizeList, and Struct (record) columns are supported (the tags ARW1
+ * emits); nulls carry through the validity bitmap. No runtime dependencies.
  */
 export const toArrowIPC = (blob: Uint8Array, format: 'stream' | 'file' = 'stream'): Uint8Array => {
   const { nrows, columns } = parseArw1(blob);

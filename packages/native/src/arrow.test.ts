@@ -271,3 +271,61 @@ suite('@lenke/native/arrow — FixedSizeList<Float64> egress', () => {
     }
   });
 });
+
+// A record/map column egresses as a real Arrow Struct<field: type, …> (typed
+// child arrays), not a stringified `{k=v}` blob — the analytics egress a
+// declared RECORD constraint (R-CONSTRAINTS Step 2) unlocks. A field a row omits
+// (nullable) is a null in that child.
+const REC_NDJSON = [
+  '{"type":"node","id":"a","labels":["P"],"properties":{"name":"a","meta":{"city":"NYC","tier":1}}}',
+  '{"type":"node","id":"b","labels":["P"],"properties":{"name":"b","meta":{"city":"LA"}}}', // tier omitted
+].join('\n');
+
+suite('@lenke/native/arrow — Struct (record) egress', () => {
+  const backend = createFfiBackend(LIB);
+  const Q = 'MATCH (n:P) RETURN n.meta AS meta ORDER BY n.name';
+
+  const table = (native: boolean): Table => {
+    const g = graphFromFormat(backend, REC_NDJSON, 'ndjson');
+
+    try {
+      return tableFromIPC(
+        native ? g.queryArrowIpc(Q, { format: 'stream' }) : toArrowIPC(g.queryArrow(Q)),
+      );
+    } finally {
+      g.free();
+    }
+  };
+
+  for (const native of [true, false]) {
+    test(`${native ? 'native' : 'JS'} IPC decodes as Struct<city: Utf8, tier: Float64>`, () => {
+      const t = table(native);
+      const [field] = t.schema.fields;
+
+      expect(String(field.type)).toContain('Struct');
+      // Children sorted by name: city (Utf8), tier (Float64).
+      expect(field.type.children.map((c: { name: string }) => c.name)).toEqual(['city', 'tier']);
+      expect(String(field.type.children[0].type)).toBe('Utf8');
+      expect(String(field.type.children[1].type)).toBe('Float64');
+      // Values, including the null child where `tier` was omitted.
+      expect([...t].map((r) => structuredClone(r.meta.toJSON()))).toEqual([
+        { city: 'NYC', tier: 1 },
+        { city: 'LA', tier: null },
+      ]);
+    });
+  }
+
+  test('native and JS encoders are byte-for-byte identical', () => {
+    const g = graphFromFormat(backend, REC_NDJSON, 'ndjson');
+
+    try {
+      for (const format of ['stream', 'file'] as const) {
+        const nat = g.queryArrowIpc(Q, { format });
+        const js = toArrowIPC(g.queryArrow(Q), format);
+        expect(Buffer.compare(new Uint8Array(nat), new Uint8Array(js))).toBe(0);
+      }
+    } finally {
+      g.free();
+    }
+  });
+});

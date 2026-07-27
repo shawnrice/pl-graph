@@ -48,6 +48,15 @@ pub const T_UTF8: u32 = 3;
 /// validity is the LIST-level bitmap, and its `dim` rides the (otherwise-empty)
 /// `buf2_len` descriptor slot — so the fixed 40-byte column descriptor is unchanged.
 pub const T_FIXED_LIST: u32 = 4;
+/// A record/map column → Arrow `Struct<field: type, …>`. The struct has NO values
+/// buffer of its own — only a validity bitmap (a null row = a null/absent map) —
+/// and one typed CHILD column per field. Its child COUNT rides the (otherwise-empty)
+/// `buf2_len` descriptor slot, and its `n` child descriptors follow it in the
+/// descriptor array in pre-order (a child may itself be a struct → nesting). The
+/// header's `ncols` counts only TOP-LEVEL columns; a reader recurses via each
+/// struct's child count. A scalar-only blob has no struct descriptors, so its bytes
+/// are unchanged (byte-identical to before this type existed).
+pub const T_STRUCT: u32 = 5;
 
 const HEADER_LEN: usize = 24;
 const COLDESC_LEN: usize = 40;
@@ -120,6 +129,14 @@ pub enum ArrowColumn {
         data: Vec<f64>,
         valid: Option<Vec<bool>>,
     },
+    /// A record/map column → Arrow `Struct`. `valid` is the struct-level null mask
+    /// (a null row = a null/absent map); each child is a full typed column of the
+    /// same length (a field a row omits contributes a null to that child). Children
+    /// are ordered by field name (canonical).
+    Struct {
+        valid: Option<Vec<bool>>,
+        children: Vec<(String, Self)>,
+    },
 }
 
 /// The shared dimension iff every present cell is an all-numeric list of the SAME
@@ -150,6 +167,46 @@ impl ArrowColumn {
     pub fn from_values<'a>(cells: impl Iterator<Item = &'a Value>) -> Self {
         let cells: Vec<&Value> = cells.collect();
         let n = cells.len();
+        // A column whose present cells are all maps → a real Arrow `Struct` (typed
+        // child columns), not a stringified `{k=v}` blob. Fields = the sorted union
+        // of keys across rows; a row that omits a field contributes null to that
+        // child (a nullable struct field). Recurses: a map-valued field nests.
+        if !cells.is_empty()
+            && cells
+                .iter()
+                .all(|c| matches!(c, Value::Null | Value::Map(_)))
+            && cells.iter().any(|c| matches!(c, Value::Map(_)))
+        {
+            let mut keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            for c in &cells {
+                if let Value::Map(pairs) = c {
+                    for (k, _) in pairs.iter() {
+                        keys.insert(k.as_ref());
+                    }
+                }
+            }
+            let valid: Vec<bool> = cells.iter().map(|c| matches!(c, Value::Map(_))).collect();
+            let any_null = valid.iter().any(|&v| !v);
+            let children: Vec<(String, Self)> = keys
+                .iter()
+                .map(|k| {
+                    let child: Vec<Value> = cells
+                        .iter()
+                        .map(|c| match c {
+                            Value::Map(pairs) => pairs
+                                .binary_search_by(|(pk, _)| pk.as_ref().cmp(k))
+                                .map_or(Value::Null, |i| pairs[i].1.clone()),
+                            _ => Value::Null,
+                        })
+                        .collect();
+                    ((*k).to_string(), Self::from_values(child.iter()))
+                })
+                .collect();
+            return Self::Struct {
+                valid: any_null.then_some(valid),
+                children,
+            };
+        }
         // A fixed-dim numeric-list column → a real `FixedSizeList<Float64>` (not
         // Utf8 JSON): a null list contributes `dim` zeros to the flat child values.
         if let Some(dim) = fixed_numeric_dim(&cells) {
@@ -261,28 +318,16 @@ impl ArrowColumn {
             Self::Num { valid, .. }
             | Self::Bool { valid, .. }
             | Self::Utf8 { valid, .. }
-            | Self::FixedList { valid, .. } => valid,
+            | Self::FixedList { valid, .. }
+            | Self::Struct { valid, .. } => valid,
         }
     }
 
     /// (type tag, null_count, validity bitmap, buf1, buf2, dim) for blob assembly.
     /// `dim` is non-zero only for `FixedList` (the list size); it rides `buf2_len`.
+    /// A `Struct` never reaches here — it is flattened by [`flatten_descs`].
     fn encode(&self, nrows: usize) -> (u32, u32, Vec<u8>, Vec<u8>, Vec<u8>, u32) {
-        let (null_count, validity) = match self.valid_mask() {
-            None => (0, Vec::new()),
-            Some(mask) => {
-                let mut bitmap = vec![0u8; nrows.div_ceil(8)];
-                let mut nulls = 0u32;
-                for (i, &v) in mask.iter().enumerate() {
-                    if v {
-                        bitmap[i / 8] |= 1 << (i % 8);
-                    } else {
-                        nulls += 1;
-                    }
-                }
-                (nulls, bitmap)
-            }
-        };
+        let (null_count, validity) = encode_validity(self.valid_mask(), nrows);
         let (tag, buf1, buf2, dim) = match self {
             Self::Num { data, .. } => {
                 let mut b = Vec::with_capacity(data.len() * 8);
@@ -315,8 +360,83 @@ impl ArrowColumn {
                 }
                 (T_FIXED_LIST, b, Vec::new(), *dim as u32)
             }
+            Self::Struct { .. } => {
+                unreachable!("structs are flattened by flatten_descs, not encoded")
+            }
         };
         (tag, null_count, validity, buf1, buf2, dim)
+    }
+}
+
+/// Build an Arrow validity bitmap + null count from a presence mask (`None` ⇒ all
+/// valid ⇒ no bitmap). Shared by scalar column encoding and struct flattening.
+fn encode_validity(mask: &Option<Vec<bool>>, nrows: usize) -> (u32, Vec<u8>) {
+    match mask {
+        None => (0, Vec::new()),
+        Some(mask) => {
+            let mut bitmap = vec![0u8; nrows.div_ceil(8)];
+            let mut nulls = 0u32;
+            for (i, &v) in mask.iter().enumerate() {
+                if v {
+                    bitmap[i / 8] |= 1 << (i % 8);
+                } else {
+                    nulls += 1;
+                }
+            }
+            (nulls, bitmap)
+        }
+    }
+}
+
+/// One ARW1 descriptor entry (pre-order): its type tag, null count, name, and
+/// buffers. `extra` rides `buf2_len` — the list size for `FixedList`, the child
+/// count for `Struct`, else 0. A `Struct` contributes only its validity buffer.
+struct FlatDesc<'a> {
+    tag: u32,
+    null_count: u32,
+    name: &'a str,
+    validity: Vec<u8>,
+    buf1: Vec<u8>,
+    buf2: Vec<u8>,
+    extra: u32,
+}
+
+/// Flatten a (possibly nested) column into pre-order descriptor entries: a struct
+/// descriptor followed by its children's descriptors (recursively).
+fn flatten_descs<'a>(
+    name: &'a str,
+    col: &'a ArrowColumn,
+    nrows: usize,
+    out: &mut Vec<FlatDesc<'a>>,
+) {
+    match col {
+        ArrowColumn::Struct { valid, children } => {
+            let (null_count, validity) = encode_validity(valid, nrows);
+            out.push(FlatDesc {
+                tag: T_STRUCT,
+                null_count,
+                name,
+                validity,
+                buf1: Vec::new(),
+                buf2: Vec::new(),
+                extra: children.len() as u32,
+            });
+            for (child_name, child) in children {
+                flatten_descs(child_name, child, nrows, out);
+            }
+        }
+        other => {
+            let (tag, null_count, validity, buf1, buf2, extra) = other.encode(nrows);
+            out.push(FlatDesc {
+                tag,
+                null_count,
+                name,
+                validity,
+                buf1,
+                buf2,
+                extra,
+            });
+        }
     }
 }
 
@@ -324,19 +444,19 @@ impl ArrowColumn {
 /// Assemble an Arrow columnar blob from typed columns (see module docs for the
 /// layout). `nrows` is the row count (columns must all be that long).
 pub fn to_arrow_cols(names: &[String], cols: &[ArrowColumn], nrows: usize) -> Vec<u8> {
+    // The header counts TOP-LEVEL columns; a struct's children ride along as extra
+    // pre-order descriptors, so `flat` (all descriptors) can be longer than `ncols`.
     let ncols = cols.len();
-    #[allow(
-        clippy::type_complexity,
-        reason = "ad-hoc per-column (tag, null_count, validity, buf1, buf2) tuple local to encoding"
-    )]
-    let encoded: Vec<(u32, u32, Vec<u8>, Vec<u8>, Vec<u8>, u32)> =
-        cols.iter().map(|c| c.encode(nrows)).collect();
+    let mut flat: Vec<FlatDesc> = Vec::new();
+    for (name, col) in names.iter().zip(cols) {
+        flatten_descs(name, col, nrows, &mut flat);
+    }
 
-    // Body base: after header + descriptors, aligned to 8.
-    let body_base = align8(HEADER_LEN + ncols * COLDESC_LEN);
+    // Body base: after header + ALL descriptors, aligned to 8.
+    let body_base = align8(HEADER_LEN + flat.len() * COLDESC_LEN);
     let mut body: Vec<u8> = Vec::new();
-    let mut descs: Vec<[u32; 10]> = Vec::with_capacity(ncols);
-    for (j, (tag, null_count, validity, buf1, buf2, dim)) in encoded.iter().enumerate() {
+    let mut descs: Vec<[u32; 10]> = Vec::with_capacity(flat.len());
+    for fd in &flat {
         let mut place = |bytes: &[u8]| -> (u32, u32) {
             while !body.len().is_multiple_of(8) {
                 body.push(0);
@@ -345,18 +465,19 @@ pub fn to_arrow_cols(names: &[String], cols: &[ArrowColumn], nrows: usize) -> Ve
             body.extend_from_slice(bytes);
             (off, bytes.len() as u32)
         };
-        let (name_off, name_len) = place(names[j].as_bytes());
-        let (val_off, val_len) = place(validity);
-        let (b1_off, b1_len) = place(buf1);
-        let (b2_off, mut b2_len) = place(buf2);
-        // A FixedSizeList has no buf2 buffer; its (otherwise-zero) buf2_len carries
-        // the list dimension so a reader can rebuild the child field / node.
-        if *tag == T_FIXED_LIST {
-            b2_len = *dim;
+        let (name_off, name_len) = place(fd.name.as_bytes());
+        let (val_off, val_len) = place(&fd.validity);
+        let (b1_off, b1_len) = place(&fd.buf1);
+        let (b2_off, mut b2_len) = place(&fd.buf2);
+        // A FixedSizeList (dim) and a Struct (child count) have no buf2 buffer; their
+        // (otherwise-zero) buf2_len carries that count so a reader can rebuild the
+        // child field(s) / node(s).
+        if fd.tag == T_FIXED_LIST || fd.tag == T_STRUCT {
+            b2_len = fd.extra;
         }
         descs.push([
-            *tag,
-            *null_count,
+            fd.tag,
+            fd.null_count,
             name_off,
             name_len,
             val_off,
@@ -411,6 +532,7 @@ const MSG_RECORD_BATCH: u8 = 3; // MessageHeader.RecordBatch
 const TYPE_FLOATINGPOINT: u8 = 3; // Type.FloatingPoint
 const TYPE_UTF8: u8 = 5; // Type.Utf8
 const TYPE_BOOL: u8 = 6; // Type.Bool
+const TYPE_STRUCT: u8 = 13; // Type.Struct_
 const TYPE_FIXEDSIZELIST: u8 = 16; // Type.FixedSizeList
 const PRECISION_DOUBLE: i16 = 2; // Precision.DOUBLE
 
@@ -639,7 +761,8 @@ impl Fbb {
 }
 
 /// One column's ARW1 view for IPC framing: name, Arrow type tag, null count, and
-/// the Arrow buffers in order (validity, then values / offsets+data).
+/// the Arrow buffers in order (validity, then values / offsets+data). A `Struct`
+/// carries only its validity buffer and its typed `children` (each a full `IpcCol`).
 struct IpcCol<'a> {
     name: &'a str,
     tag: u32,
@@ -649,6 +772,8 @@ struct IpcCol<'a> {
     /// `nrows × dim`.
     dim: usize,
     buffers: Vec<&'a [u8]>,
+    /// Child columns for a `Struct` (empty for every other type).
+    children: Vec<Self>,
 }
 
 /// Read a little-endian `u32` at byte offset `o` in `b`.
@@ -668,6 +793,18 @@ fn build_field(b: &mut Fbb, col: &IpcCol, empty_children: usize) -> usize {
         T_BOOL => {
             b.start_object(0);
             (TYPE_BOOL, b.end_object(), empty_children)
+        }
+        T_STRUCT => {
+            // Nested types build inner-first: each child Field, then the children
+            // vector, then this struct's (empty) type table.
+            let child_fields: Vec<usize> = col
+                .children
+                .iter()
+                .map(|c| build_field(b, c, empty_children))
+                .collect();
+            let children_vec = b.offset_vector(&child_fields);
+            b.start_object(0); // Struct_ has no type-table fields
+            (TYPE_STRUCT, b.end_object(), children_vec)
         }
         T_FIXED_LIST => {
             // The child `item: Float64` field (nested types build inner-first).
@@ -735,14 +872,23 @@ fn record_batch_message(
     body: &[u8],
 ) -> Vec<u8> {
     let mut b = Fbb::new();
-    // One field-node per field in depth-first order: a FixedSizeList adds a second
-    // node for its `item` child (length nrows × dim, no nulls).
+    // One field-node per field in depth-first pre-order: a FixedSizeList adds a
+    // second node for its `item` child; a Struct adds a node per child (recursively).
+    fn push_nodes(col: &IpcCol, nrows: usize, nodes: &mut Vec<(i64, i64)>) {
+        nodes.push((nrows as i64, col.null_count));
+        match col.tag {
+            T_FIXED_LIST => nodes.push(((nrows * col.dim) as i64, 0)),
+            T_STRUCT => {
+                for c in &col.children {
+                    push_nodes(c, nrows, nodes);
+                }
+            }
+            _ => {}
+        }
+    }
     let mut nodes: Vec<(i64, i64)> = Vec::with_capacity(cols.len());
     for c in cols {
-        nodes.push((nrows as i64, c.null_count));
-        if c.tag == T_FIXED_LIST {
-            nodes.push(((nrows * c.dim) as i64, 0));
-        }
+        push_nodes(c, nrows, &mut nodes);
     }
     let buffers_vec = b.struct_vector16(buffers);
     let nodes_vec = b.struct_vector16(&nodes);
@@ -791,14 +937,17 @@ fn encapsulate(meta: &[u8], body: Option<&[u8]>) -> Vec<u8> {
 
 /// Transcode an `ARW1` columnar blob into standard Apache Arrow IPC bytes —
 /// `file` selects the file / Feather-v2 layout, else the IPC stream layout.
-/// Float64 / Bool / Utf8 columns (the tags `ARW1` emits) are supported.
+/// Float64 / Bool / Utf8 / FixedSizeList / Struct columns (the tags `ARW1` emits)
+/// are supported.
 pub fn arrow_ipc_from_blob(blob: &[u8], file: bool) -> Vec<u8> {
     let nrows = u64::from_le_bytes(blob[8..16].try_into().unwrap()) as usize;
     let ncols = u64::from_le_bytes(blob[16..24].try_into().unwrap()) as usize;
 
-    let mut cols: Vec<IpcCol> = Vec::with_capacity(ncols);
-    for c in 0..ncols {
-        let d = 24 + c * 40;
+    // Read one descriptor at pre-order index `*idx` into an `IpcCol`, advancing
+    // `*idx` past it and (recursively) its struct children.
+    fn read_col<'a>(blob: &'a [u8], idx: &mut usize) -> IpcCol<'a> {
+        let d = 24 + *idx * 40;
+        *idx += 1;
         let tag = u32le(blob, d) as u32;
         let null_count = u32le(blob, d + 4) as i64;
         let name = std::str::from_utf8(
@@ -807,32 +956,49 @@ pub fn arrow_ipc_from_blob(blob: &[u8], file: bool) -> Vec<u8> {
         .unwrap_or("");
         let validity = &blob[u32le(blob, d + 16)..u32le(blob, d + 16) + u32le(blob, d + 20)];
         let buf1 = &blob[u32le(blob, d + 24)..u32le(blob, d + 24) + u32le(blob, d + 28)];
-        // For a FixedSizeList, `buf2_len` carries the list dimension, not a buffer
-        // length — so read buf2 only for Utf8.
-        let (buffers, dim) = if tag == T_UTF8 {
+        // For a FixedSizeList / Struct, `buf2_len` carries a COUNT (dim / children),
+        // not a buffer length — so read buf2 as a buffer only for Utf8.
+        let (buffers, dim, children) = if tag == T_UTF8 {
             let buf2 = &blob[u32le(blob, d + 32)..u32le(blob, d + 32) + u32le(blob, d + 36)];
-            (vec![validity, buf1, buf2], 0)
+            (vec![validity, buf1, buf2], 0, Vec::new())
         } else if tag == T_FIXED_LIST {
             // Arrow buffer order: list validity, child validity (empty, no element
             // nulls), child values (buf1).
-            (vec![validity, &[][..], buf1], u32le(blob, d + 36))
+            (
+                vec![validity, &[][..], buf1],
+                u32le(blob, d + 36),
+                Vec::new(),
+            )
+        } else if tag == T_STRUCT {
+            // A struct has only a validity buffer; its children follow in pre-order.
+            let n_children = u32le(blob, d + 36);
+            let children: Vec<IpcCol> = (0..n_children).map(|_| read_col(blob, idx)).collect();
+            (vec![validity], 0, children)
         } else {
-            (vec![validity, buf1], 0)
+            (vec![validity, buf1], 0, Vec::new())
         };
-        cols.push(IpcCol {
+        IpcCol {
             name,
             tag,
             null_count,
             dim,
             buffers,
-        });
+            children,
+        }
     }
 
-    // Body: every Arrow buffer concatenated on an 8-byte boundary, whole body
+    let mut cols: Vec<IpcCol> = Vec::with_capacity(ncols);
+    let mut idx = 0usize;
+    for _ in 0..ncols {
+        cols.push(read_col(blob, &mut idx));
+    }
+
+    // Body: every Arrow buffer concatenated on an 8-byte boundary in depth-first
+    // order (a struct's own validity, then each child's buffers), the whole body
     // padded to 8; record each buffer's (offset, length).
     let mut body: Vec<u8> = Vec::new();
     let mut buffers: Vec<(i64, i64)> = Vec::new();
-    for col in &cols {
+    fn push_buffers(col: &IpcCol, body: &mut Vec<u8>, buffers: &mut Vec<(i64, i64)>) {
         for b in &col.buffers {
             while !body.len().is_multiple_of(8) {
                 body.push(0);
@@ -840,6 +1006,12 @@ pub fn arrow_ipc_from_blob(blob: &[u8], file: bool) -> Vec<u8> {
             buffers.push((body.len() as i64, b.len() as i64));
             body.extend_from_slice(b);
         }
+        for c in &col.children {
+            push_buffers(c, body, buffers);
+        }
+    }
+    for col in &cols {
+        push_buffers(col, &mut body, &mut buffers);
     }
     while !body.len().is_multiple_of(8) {
         body.push(0);
@@ -1156,5 +1328,104 @@ mod tests {
         let es = to_arrow_ipc(&empty, false);
         assert_eq!(&es[0..4], &[0xFF, 0xFF, 0xFF, 0xFF]);
         assert!(es.len() > 8);
+    }
+
+    /// Record de-boxing (R-CONSTRAINTS Step 2) must NOT change Arrow egress: a
+    /// projected record FIELD still comes out as its native typed column, and a
+    /// whole-record projection is byte-identical whether the column is boxed or
+    /// de-boxed. This is the regression guard the de-boxing work needs — if a
+    /// future change routed a de-boxed field through the stringified path, the tag
+    /// assertions below would flip.
+    #[test]
+    fn deboxing_does_not_change_arrow_egress() {
+        let lines = [
+            r#"{"type":"node","id":"a","labels":["P"],"properties":{"id":"a","meta":{"city":"NYC","tier":1}}}"#,
+            r#"{"type":"node","id":"b","labels":["P"],"properties":{"id":"b","meta":{"city":"LA","tier":2}}}"#,
+        ];
+        let run = |q: &str, declare: bool| -> Vec<u8> {
+            let mut g = crate::ndjson::decode(&lines.join("\n")).unwrap();
+            if declare {
+                g.create_type_constraint("P", "meta", "record{city::string,tier::number}")
+                    .unwrap();
+            }
+            to_arrow(
+                &crate::gql::parse(q)
+                    .unwrap()
+                    .execute(&mut g, &crate::gql::eval::Params::new())
+                    .unwrap(),
+            )
+        };
+
+        // A projected string field → a native Utf8 column; a numeric field → Float64.
+        // (The physical type is the field's, NOT a stringified map.)
+        let city = run("MATCH (n:P {id:'a'}) RETURN n.meta.city AS c", true);
+        assert_eq!(u32_at(&city, HEADER_LEN), T_UTF8);
+        let tier = run("MATCH (n:P {id:'a'}) RETURN n.meta.tier AS t", true);
+        assert_eq!(u32_at(&tier, HEADER_LEN), T_FLOAT64);
+
+        // Byte-identical to the boxed graph: de-boxing is invisible at the boundary.
+        for q in [
+            "MATCH (n:P {id:'a'}) RETURN n.meta.city AS c",
+            "MATCH (n:P {id:'a'}) RETURN n.meta.tier AS t",
+            "MATCH (n:P) RETURN n.meta AS m ORDER BY n.id", // whole record
+        ] {
+            assert_eq!(
+                run(q, false),
+                run(q, true),
+                "de-boxing changed egress for `{q}`"
+            );
+        }
+
+        // A whole-record projection egresses as a real Arrow Struct (tag T_STRUCT),
+        // NOT a stringified Utf8 map.
+        let whole = run("MATCH (n:P) RETURN n.meta AS m ORDER BY n.id", true);
+        assert_eq!(u32_at(&whole, HEADER_LEN), T_STRUCT);
+    }
+
+    /// Read descriptor `idx` (pre-order) of an ARW1 blob → (tag, name). For a
+    /// `T_STRUCT` descriptor, `buf2_len` (offset d+36) additionally carries its
+    /// child count.
+    fn desc(blob: &[u8], idx: usize) -> (u32, String) {
+        let d = HEADER_LEN + idx * COLDESC_LEN;
+        let tag = u32_at(blob, d);
+        let name_off = u32_at(blob, d + 8) as usize;
+        let name_len = u32_at(blob, d + 12) as usize;
+        let name = String::from_utf8(blob[name_off..name_off + name_len].to_vec()).unwrap();
+        (tag, name)
+    }
+
+    #[test]
+    fn whole_record_projects_as_a_typed_arrow_struct() {
+        // A record column → Struct<city: Utf8, tier: Float64> with the fields as
+        // child descriptors in pre-order (sorted by name), and a null child value
+        // where a nullable field is omitted.
+        let lines = [
+            r#"{"type":"node","id":"a","labels":["P"],"properties":{"id":"a","meta":{"city":"NYC","tier":1}}}"#,
+            // `tier` omitted (nullable) → a null in the tier child.
+            r#"{"type":"node","id":"b","labels":["P"],"properties":{"id":"b","meta":{"city":"LA"}}}"#,
+        ];
+        let mut g = crate::ndjson::decode(&lines.join("\n")).unwrap();
+        g.create_type_constraint("P", "meta", "record{city::string,tier::number}")
+            .unwrap();
+        let blob = to_arrow(
+            &crate::gql::parse("MATCH (n:P) RETURN n.meta AS m ORDER BY n.id")
+                .unwrap()
+                .execute(&mut g, &crate::gql::eval::Params::new())
+                .unwrap(),
+        );
+        // Header: ONE top-level column; the two children ride as pre-order descriptors.
+        assert_eq!(u64_at(&blob, 16), 1, "ncols counts only top-level columns");
+        assert_eq!(desc(&blob, 0), (T_STRUCT, "m".into()));
+        assert_eq!(
+            u32_at(&blob, HEADER_LEN + 36),
+            2,
+            "struct child count rides buf2_len"
+        );
+        assert_eq!(desc(&blob, 1), (T_UTF8, "city".into())); // sorted: city first
+        assert_eq!(desc(&blob, 2), (T_FLOAT64, "tier".into()));
+        // The whole blob round-trips into valid IPC (stream + file framing).
+        let stream = arrow_ipc_from_blob(&blob, false);
+        assert_eq!(&stream[0..4], &[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(&arrow_ipc_from_blob(&blob, true)[0..6], b"ARROW1");
     }
 }
