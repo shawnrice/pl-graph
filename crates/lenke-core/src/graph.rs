@@ -208,9 +208,15 @@ pub enum Column {
         /// Declared field names, sorted (canonical map order) — parallel to `fields`.
         field_names: Vec<Arc<str>>,
         /// One typed sub-column per declared field; each sized to the element count.
-        /// A field set to a stored null (nullable) promotes its sub-column to
-        /// `Mixed` locally, exactly like the top-level store.
+        /// A nested `RECORD`-typed field is itself a de-boxed `Column::Record`
+        /// (recursive); a `list` / `any record` field stays boxed (`Mixed`).
         fields: Vec<Self>,
+        /// Per-field stored-null bitsets, parallel to `fields`: bit `idx` set means
+        /// that field holds a *present null* for element `idx` (its `fields` slot is
+        /// absent). This keeps a nullable field's sub-column TYPED — a stored null no
+        /// longer forces it to `Mixed`. A field is absent when neither its `fields`
+        /// slot is present nor its `field_nulls` bit is set.
+        field_nulls: Vec<BitSet>,
         /// Non-conforming values (a scalar, a list, a differently-shaped map from
         /// another label) kept boxed by element index. An entry here overrides
         /// `present`/`fields` for that element.
@@ -570,11 +576,13 @@ impl Column {
                 present,
                 nulls,
                 fields,
+                field_nulls,
                 escaped,
                 ..
             } => {
                 bits(present)
                     + bits(nulls)
+                    + field_nulls.iter().map(bits).sum::<usize>()
                     + fields.iter().map(Self::heap_bytes).sum::<usize>()
                     + escaped.len() * (size_of::<u32>() + size_of::<Option<Value>>())
             }
@@ -655,6 +663,7 @@ impl Properties {
                 nulls,
                 field_names,
                 fields,
+                field_nulls,
                 escaped,
             }) => {
                 if let Some(v) = escaped.get(&(idx as u32)) {
@@ -662,7 +671,7 @@ impl Properties {
                 }
                 if descent.is_empty() {
                     return if present.get(idx) && !nulls.get(idx) {
-                        record_map(field_names, fields, idx, strs)
+                        record_map(field_names, fields, field_nulls, idx, strs)
                     } else {
                         Value::Null
                     };
@@ -671,6 +680,9 @@ impl Properties {
                     return Value::Null;
                 }
                 match field_names.binary_search_by(|n| n.as_ref().cmp(descent[0])) {
+                    // A stored-null field reads back as `Null` directly (its typed
+                    // sub-column slot is absent).
+                    Ok(fi) if field_nulls[fi].get(idx) => Value::Null,
                     Ok(fi) => match col_get(&fields[fi], idx, strs) {
                         Some(fv) if descent.len() == 1 => fv,
                         Some(fv) => value_at_descent(&fv, &descent[1..])
@@ -818,18 +830,7 @@ impl Properties {
         if matches!(self.cols[kid], Column::Record { .. }) {
             return;
         }
-        let field_names: Vec<Arc<str>> = defs.iter().map(|(n, ..)| n.clone()).collect();
-        let fields: Vec<Column> = defs
-            .iter()
-            .map(|(_, t, _)| empty_col_for_kind(field_kind(t), self.len))
-            .collect();
-        let mut rec = Column::Record {
-            present: BitSet::zeros(self.len),
-            nulls: BitSet::zeros(self.len),
-            field_names,
-            fields,
-            escaped: std::collections::HashMap::new(),
-        };
+        let mut rec = empty_record_column(defs, self.len);
         let old = std::mem::replace(&mut self.cols[kid], Column::Mixed { data: Vec::new() });
         for i in 0..self.len {
             if let Some(v) = col_get(&old, i, strs) {
@@ -4545,10 +4546,20 @@ fn col_set(col: &mut Column, idx: usize, v: &Value, strs: &mut Dict) -> bool {
                 nulls,
                 field_names,
                 fields,
+                field_nulls,
                 escaped,
             },
             val,
         ) => {
+            // Clear every field slot (typed sub-column AND its stored-null bit) at idx.
+            let clear_fields = |fields: &mut [Column], field_nulls: &mut [BitSet]| {
+                for f in fields.iter_mut() {
+                    col_clear(f, idx);
+                }
+                for fnull in field_nulls.iter_mut() {
+                    fnull.clear(idx);
+                }
+            };
             // The record constraint guarantees a label-matching write conforms, but
             // this column is shared across labels — a value that isn't a conforming
             // map (all keys declared) stays boxed in `escaped`. Canonicalize first so
@@ -4558,9 +4569,7 @@ fn col_set(col: &mut Column, idx: usize, v: &Value, strs: &mut Dict) -> bool {
                     escaped.remove(&(idx as u32));
                     present.set(idx);
                     nulls.set(idx);
-                    for f in fields.iter_mut() {
-                        col_clear(f, idx);
-                    }
+                    clear_fields(fields, field_nulls);
                 }
                 Value::Map(pairs)
                     if pairs.iter().all(|(k, _)| {
@@ -4572,24 +4581,34 @@ fn col_set(col: &mut Column, idx: usize, v: &Value, strs: &mut Dict) -> bool {
                     nulls.clear(idx);
                     for (fi, name) in field_names.iter().enumerate() {
                         match pairs.binary_search_by(|(k, _)| k.as_ref().cmp(name)) {
-                            Ok(pi) => {
+                            // A present, NON-null field value scatters into its typed
+                            // sub-column (promoting only on a genuine type mismatch).
+                            Ok(pi) if !matches!(pairs[pi].1, Value::Null) => {
+                                field_nulls[fi].clear(idx);
                                 let fv = &pairs[pi].1;
                                 if !col_set(&mut fields[fi], idx, fv, strs) {
                                     fields[fi] = to_mixed(&fields[fi], strs);
                                     col_set(&mut fields[fi], idx, fv, strs);
                                 }
                             }
+                            // A present STORED-NULL field: mark its null bit, keep the
+                            // sub-column typed (no Mixed promotion — the 1b win).
+                            Ok(_) => {
+                                col_clear(&mut fields[fi], idx);
+                                field_nulls[fi].set(idx);
+                            }
                             // A nullable field the value omits → absent in its column.
-                            Err(_) => col_clear(&mut fields[fi], idx),
+                            Err(_) => {
+                                col_clear(&mut fields[fi], idx);
+                                field_nulls[fi].clear(idx);
+                            }
                         }
                     }
                 }
                 other => {
                     present.clear(idx);
                     nulls.clear(idx);
-                    for f in fields.iter_mut() {
-                        col_clear(f, idx);
-                    }
+                    clear_fields(fields, field_nulls);
                     escaped.insert(idx as u32, other);
                 }
             }
@@ -4620,6 +4639,7 @@ fn col_get(col: &Column, i: usize, strs: &Dict) -> Option<Value> {
             nulls,
             field_names,
             fields,
+            field_nulls,
             escaped,
         } => {
             if let Some(v) = escaped.get(&(i as u32)) {
@@ -4628,7 +4648,7 @@ fn col_get(col: &Column, i: usize, strs: &Dict) -> Option<Value> {
                 Some(if nulls.get(i) {
                     Value::Null
                 } else {
-                    record_map(field_names, fields, i, strs)
+                    record_map(field_names, fields, field_nulls, i, strs)
                 })
             } else {
                 None
@@ -4655,6 +4675,7 @@ fn col_clear(col: &mut Column, idx: usize) {
             present,
             nulls,
             fields,
+            field_nulls,
             escaped,
             ..
         } => {
@@ -4664,25 +4685,66 @@ fn col_clear(col: &mut Column, idx: usize) {
             for f in fields.iter_mut() {
                 col_clear(f, idx);
             }
+            for fnull in field_nulls.iter_mut() {
+                fnull.clear(idx);
+            }
         }
     }
 }
 
 /// Synthesize the canonical map for element `i` of a de-boxed record from its
 /// present field sub-columns. An absent field is omitted (nullable/optional); a
-/// field holding a stored null is included as `Null`. Field names are sorted, so
-/// the result is canonical.
-fn record_map(names: &[Arc<str>], fields: &[Column], i: usize, strs: &Dict) -> Value {
+/// field holding a stored null (its `field_nulls` bit set) is included as `Null`.
+/// Field names are sorted, so the result is canonical.
+fn record_map(
+    names: &[Arc<str>],
+    fields: &[Column],
+    field_nulls: &[BitSet],
+    i: usize,
+    strs: &Dict,
+) -> Value {
     let pairs: Vec<(Arc<str>, Value)> = names
         .iter()
-        .zip(fields)
-        .filter_map(|(n, sub)| col_get(sub, i, strs).map(|v| (n.clone(), v)))
+        .enumerate()
+        .filter_map(|(fi, n)| {
+            if field_nulls[fi].get(i) {
+                Some((n.clone(), Value::Null)) // a present stored-null field
+            } else {
+                col_get(&fields[fi], i, strs).map(|v| (n.clone(), v))
+            }
+        })
         .collect();
     Value::Map(pairs)
 }
 
+/// Build an empty (all-absent) de-boxed [`Column::Record`] from sorted field
+/// defs, sized to `len`. A `RECORD`-typed field is RECURSIVELY de-boxed into a
+/// nested `Column::Record` (so `n.meta.geo.lat` lives in its own typed
+/// sub-column); a scalar → its typed column; a `list` / `any record` / degenerate
+/// 0-field record → boxed `Mixed`.
+fn empty_record_column(defs: &[(Arc<str>, TypeSpec, bool)], len: usize) -> Column {
+    let field_names: Vec<Arc<str>> = defs.iter().map(|(n, ..)| n.clone()).collect();
+    let fields: Vec<Column> = defs
+        .iter()
+        .map(|(_, t, _)| match t {
+            TypeSpec::Record(inner) if !inner.is_empty() => empty_record_column(inner, len),
+            _ => empty_col_for_kind(field_kind(t), len),
+        })
+        .collect();
+    let field_nulls: Vec<BitSet> = (0..field_names.len()).map(|_| BitSet::zeros(len)).collect();
+    Column::Record {
+        present: BitSet::zeros(len),
+        nulls: BitSet::zeros(len),
+        field_names,
+        fields,
+        field_nulls,
+        escaped: std::collections::HashMap::new(),
+    }
+}
+
 /// The de-boxed column kind for a declared record field type: a scalar maps to
-/// its typed column; a `list` or a nested record stays boxed (`Mixed`).
+/// its typed column; a `list` / `any record` / nested record stays boxed here
+/// (`Mixed`) — a nested closed record is handled by [`empty_record_column`].
 fn field_kind(t: &TypeSpec) -> Option<Kind> {
     match t {
         TypeSpec::Scalar(pt) => Some(match pt {
@@ -6650,6 +6712,75 @@ mod record_debox {
         assert!(matches!(fields[1], Column::Num { .. }));
         // The backfilled value reads back identically to the boxed map.
         assert_eq!(read(&g, 0), vmap(&[("city", s("NYC")), ("tier", n(2.0))]));
+    }
+
+    #[test]
+    fn a_stored_null_field_keeps_its_sub_column_typed() {
+        // 1b: a nullable field set to an explicit null records the null in the
+        // per-field `field_nulls` bitset and keeps the sub-column TYPED — it no
+        // longer promotes to `Mixed`. The value still round-trips.
+        let mut g = declared();
+        write(&mut g, 0, vmap(&[("city", s("LA")), ("tier", Value::Null)]));
+        assert_eq!(
+            read(&g, 0),
+            vmap(&[("city", s("LA")), ("tier", Value::Null)])
+        );
+        let Some(Column::Record {
+            fields,
+            field_nulls,
+            ..
+        }) = g.props.col("meta")
+        else {
+            panic!();
+        };
+        // `tier` (field 1) stayed a Num column; its null bit is set for element 0.
+        assert!(matches!(fields[1], Column::Num { .. }), "tier stayed typed");
+        assert!(field_nulls[1].get(0), "tier null recorded in field_nulls");
+        assert!(!field_nulls[0].get(0), "city is not null");
+        // Overwriting the null with a value clears the null bit.
+        write(&mut g, 0, vmap(&[("city", s("LA")), ("tier", n(9.0))]));
+        let Some(Column::Record { field_nulls, .. }) = g.props.col("meta") else {
+            panic!();
+        };
+        assert!(
+            !field_nulls[1].get(0),
+            "null bit cleared on a non-null write"
+        );
+    }
+
+    #[test]
+    fn a_nested_record_field_deboxes_recursively() {
+        // 1a: a RECORD-typed field is itself a de-boxed `Column::Record`.
+        let mut g = crate::ndjson::decode(
+            r#"{"type":"node","id":"a","labels":["P"],"properties":{"addr":{"geo":{"lat":1.0,"lng":2.0}}}}"#,
+        )
+        .unwrap();
+        g.create_type_constraint("P", "addr", "record{geo::record{lat::number,lng::number}}")
+            .unwrap();
+        let Some(Column::Record { fields, .. }) = g.props.col("addr") else {
+            panic!("addr should be de-boxed");
+        };
+        // The `geo` field is a NESTED record column whose own fields are typed.
+        let Column::Record {
+            field_names: geo_names,
+            fields: geo_fields,
+            ..
+        } = &fields[0]
+        else {
+            panic!("geo should be a nested record column, not boxed");
+        };
+        assert_eq!(
+            geo_names.iter().map(|n| n.as_ref()).collect::<Vec<_>>(),
+            ["lat", "lng"]
+        );
+        assert!(matches!(geo_fields[0], Column::Num { .. }));
+        // Reads round-trip (whole record + a deep field).
+        assert_eq!(
+            g.props.value(0, "addr", &g.strs),
+            vmap(&[("geo", vmap(&[("lat", n(1.0)), ("lng", n(2.0))]))])
+        );
+        let kid = g.props.keys.get("addr").unwrap();
+        assert_eq!(g.props.field_at(0, kid, &["geo", "lat"], &g.strs), n(1.0));
     }
 
     #[test]
