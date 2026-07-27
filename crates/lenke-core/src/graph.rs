@@ -583,6 +583,18 @@ impl Properties {
         }
     }
 
+    /// Borrow element `idx`'s `key` value WITHOUT cloning — but only when it lives
+    /// boxed in a `Mixed` column (the only place a map/list can be). `None` for a
+    /// typed-column scalar (there's no owned `Value` to borrow) or an absent slot.
+    /// Lets a field access navigate a stored record in place, converting only the
+    /// leaf instead of materializing the whole map.
+    pub(crate) fn value_ref(&self, idx: usize, kid: u32) -> Option<&Value> {
+        match self.cols.get(kid as usize) {
+            Some(Column::Mixed { data }) => data.get(idx).and_then(Option::as_ref),
+            _ => None,
+        }
+    }
+
     /// Zero-copy view of element `idx`'s `key` as a numeric-vector slice — the fast
     /// read path (`neighborAggregate`) when the key is a typed [`Column::Vec`] and
     /// present. `None` when absent or when the list is still boxed in a `Mixed`
@@ -1199,7 +1211,7 @@ fn split_index_path(path: &str) -> (&str, Vec<&str>) {
 /// if a segment isn't present or the value isn't a map there. Maps are canonical
 /// (sorted keys), so each hop is a binary search. An empty descent is the value
 /// itself (a plain top-level index).
-fn value_at_descent<'a>(v: &'a Value, descent: &[&str]) -> Option<&'a Value> {
+pub(crate) fn value_at_descent<'a>(v: &'a Value, descent: &[&str]) -> Option<&'a Value> {
     let mut cur = v;
     for seg in descent {
         let Value::Map(pairs) = cur else { return None };

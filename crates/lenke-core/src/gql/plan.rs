@@ -285,6 +285,16 @@ pub enum CExpr {
         var_slot: usize,
         key_ref: usize,
     },
+    /// A field access on a stored record: `n.meta.city` (or `n.meta['city']`).
+    /// The `Prop`-rooted `Field`/`Index` chain is collapsed here at plan time so
+    /// eval navigates the stored `Value` in place and materializes ONLY the leaf,
+    /// instead of cloning the whole `meta` map into a `Val::Map` first. `descent`
+    /// is the field-name path after the root property.
+    PropField {
+        var_slot: usize,
+        root_key_ref: usize,
+        descent: Vec<Arc<str>>,
+    },
     /// `PROPERTY_EXISTS(n, key)` — a presence test; resolves the element + key
     /// exactly like `Prop`, but yields a `Bool` (or `Null` on a non-element).
     PropertyExists {
@@ -560,6 +570,7 @@ fn emit(e: &CExpr, out: &mut Vec<Op>) {
         | CExpr::Record(_)
         | CExpr::Index { .. }
         | CExpr::Field { .. }
+        | CExpr::PropField { .. }
         | CExpr::PropertyExists { .. }
         | CExpr::IsTyped { .. }
         | CExpr::GraphPred { .. }
@@ -900,6 +911,33 @@ pub struct CQuery {
     pub unknown_fns: Vec<String>,
 }
 
+/// Collapse a field access on a stored-property base into a single `PropField`
+/// (which reads only the leaf). Returns `Ok(PropField)` when `base_c` is a
+/// `Prop`/`PropField` chain rooted at a stored property; otherwise `Err(base_c)`
+/// hands the lowered base back so the caller keeps the general `Field`/`Index`.
+fn prop_field(base_c: CExpr, name: Arc<str>) -> Result<CExpr, CExpr> {
+    match base_c {
+        CExpr::Prop { var_slot, key_ref } => Ok(CExpr::PropField {
+            var_slot,
+            root_key_ref: key_ref,
+            descent: vec![name],
+        }),
+        CExpr::PropField {
+            var_slot,
+            root_key_ref,
+            mut descent,
+        } => {
+            descent.push(name);
+            Ok(CExpr::PropField {
+                var_slot,
+                root_key_ref,
+                descent,
+            })
+        }
+        other => Err(other),
+    }
+}
+
 /// Does a lowered expression contain an aggregate anywhere?
 fn has_aggregate(expr: &CExpr) -> bool {
     match expr {
@@ -1107,7 +1145,7 @@ fn extract_aggs(expr: CExpr, aggs: &mut Vec<CAgg>) -> CExpr {
 fn refs_slot_below(expr: &CExpr, n: usize) -> bool {
     match expr {
         CExpr::Var(s) => *s < n,
-        CExpr::Prop { var_slot, .. } => *var_slot < n,
+        CExpr::Prop { var_slot, .. } | CExpr::PropField { var_slot, .. } => *var_slot < n,
         CExpr::List(items) => items.iter().any(|e| refs_slot_below(e, n)),
         CExpr::Record(fields) => fields.iter().any(|(_, e)| refs_slot_below(e, n)),
         CExpr::Index { base, index } => refs_slot_below(base, n) || refs_slot_below(index, n),
@@ -1260,15 +1298,37 @@ impl Lowerer {
                     .map(|(k, e)| (Arc::from(k.as_str()), self.expr(e)))
                     .collect(),
             ),
-            Expr::Index { base, index } => CExpr::Index {
-                base: self.boxed(base),
-                index: self.boxed(index),
-            },
-            Expr::Field { base, key } => CExpr::Field {
-                base: self.boxed(base),
-                key_ref: intern_ref(&mut self.keys, key),
-                name: Arc::from(key.as_str()),
-            },
+            Expr::Index { base, index } => {
+                // `base['field']` on a stored-record base is field access — collapse
+                // it into a `PropField` (reads only the leaf), same as `.field`.
+                if let Expr::Lit(Lit::Str(s)) = index.as_ref() {
+                    match prop_field(self.expr(base), Arc::from(s.as_str())) {
+                        Ok(pf) => return pf,
+                        Err(other) => {
+                            return CExpr::Index {
+                                base: Box::new(other),
+                                index: self.boxed(index),
+                            }
+                        }
+                    }
+                }
+                CExpr::Index {
+                    base: self.boxed(base),
+                    index: self.boxed(index),
+                }
+            }
+            Expr::Field { base, key } => {
+                let name = Arc::from(key.as_str());
+                match prop_field(self.expr(base), Arc::clone(&name)) {
+                    Ok(pf) => pf,
+                    // A computed (non-stored-prop) base keeps the general Field.
+                    Err(other) => CExpr::Field {
+                        base: Box::new(other),
+                        key_ref: intern_ref(&mut self.keys, key),
+                        name,
+                    },
+                }
+            }
             Expr::Compare { op, left, right } => CExpr::Compare {
                 op: *op,
                 left: self.boxed(left),

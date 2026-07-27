@@ -1476,6 +1476,33 @@ fn prop_of(graph: &Graph, ctx: &Ctx, bound: &Val, key_ref: usize) -> Val {
     }
 }
 
+/// Read `element.root.field.field…` — a field access on a stored record — WITHOUT
+/// materializing the whole map. Borrows the stored root `Value` in place (only a
+/// `Mixed`-boxed map can be navigated), walks the descent in the `Value` domain,
+/// and converts ONLY the leaf to a `Val`. A non-element base, a non-map root, or
+/// a missing/scalar segment → `Val::Null` (three-valued, like a missing field).
+fn prop_field_of(env: &Env, var_slot: usize, root_key_ref: usize, descent: &[Arc<str>]) -> Val {
+    let (store, kid, idx) = match env.binding.get(var_slot) {
+        Some(Val::Node(vi)) => (
+            &env.graph.props,
+            env.ctx.prop_keys[root_key_ref].0,
+            *vi as usize,
+        ),
+        Some(Val::Edge(ei)) => (
+            &env.graph.edge_props,
+            env.ctx.prop_keys[root_key_ref].1,
+            *ei as usize,
+        ),
+        _ => return Val::Null,
+    };
+    let Some(kid) = kid else { return Val::Null };
+    let Some(root) = store.value_ref(idx, kid) else {
+        return Val::Null; // typed-column scalar / absent — not a stored map
+    };
+    let segs: Vec<&str> = descent.iter().map(|s| s.as_ref()).collect();
+    crate::graph::value_at_descent(root, &segs).map_or(Val::Null, value_to_val)
+}
+
 fn eval_label_node(graph: &Graph, ctx: &Ctx, vi: u32, expr: &CLabelExpr) -> bool {
     match expr {
         CLabelExpr::Label(r) => ctx.labels[*r].0.is_some_and(|lid| graph.has_label(vi, lid)),
@@ -1657,6 +1684,11 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
                 prop_of(env.graph, env.ctx, &base_v, *key_ref)
             }
         }
+        CExpr::PropField {
+            var_slot,
+            root_key_ref,
+            descent,
+        } => prop_field_of(env, *var_slot, *root_key_ref, descent),
         CExpr::Neg(e) => match arith_num(&eval(env, e), env.ctx) {
             Some(n) => Val::Num(-n),
             None => Val::Null,
@@ -6079,6 +6111,20 @@ fn prop_path(left: &CExpr, graph: &Graph, ctx: &Ctx, edge: bool) -> Option<(usiz
             *var_slot,
             prop_name(graph, ctx, *key_ref, edge)?.to_string(),
         )),
+        // A collapsed stored-field read (`n.meta.city`) — the common nested form.
+        CExpr::PropField {
+            var_slot,
+            root_key_ref,
+            descent,
+        } => {
+            let mut path = prop_name(graph, ctx, *root_key_ref, edge)?.to_string();
+            for seg in descent {
+                path.push('.');
+                path.push_str(seg);
+            }
+            Some((*var_slot, path))
+        }
+        // A `Field` that didn't collapse (a computed base) — still walk it.
         CExpr::Field { base, name, .. } => {
             let (slot, mut path) = prop_path(base, graph, ctx, edge)?;
             path.push('.');

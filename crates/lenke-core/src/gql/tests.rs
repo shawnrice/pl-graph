@@ -7289,3 +7289,36 @@ fn nested_field_where_uses_the_dotted_path_index() {
     );
     assert_eq!(out, vec![vec![s("c")]]);
 }
+
+#[test]
+fn deep_stored_field_access_reads_only_the_leaf() {
+    // A 3-level nested stored map — the collapsed `PropField` navigates the stored
+    // `Value` in place and materializes only the addressed leaf.
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["P"],"properties":{"id":"a","deep":{"x":{"y":{"z":42}}}}}"#,
+    ]);
+    assert_eq!(
+        rows(&mut g, "MATCH (n:P) RETURN n.deep.x.y.z AS v"),
+        vec![vec![n(42.0)]],
+    );
+    // A mid-path leaf reads back as the nested map (materialized only there).
+    assert_eq!(
+        rows(&mut g, "MATCH (n:P) RETURN n.deep.x.y AS m"),
+        vec![vec![vmap(&[("z", n(42.0))])]],
+    );
+    // A missing segment anywhere → null (not an error).
+    assert_eq!(
+        rows(&mut g, "MATCH (n:P) RETURN n.deep.x.nope.z AS v"),
+        vec![vec![Value::Null]],
+    );
+    // Subscript form collapses the same way.
+    assert_eq!(
+        rows(&mut g, "MATCH (n:P) RETURN n.deep['x']['y']['z'] AS v"),
+        vec![vec![n(42.0)]],
+    );
+    // A field access on a non-map property is null (root isn't a stored map).
+    assert_eq!(
+        rows(&mut g, "MATCH (n:P) RETURN n.id.foo AS v"),
+        vec![vec![Value::Null]],
+    );
+}
