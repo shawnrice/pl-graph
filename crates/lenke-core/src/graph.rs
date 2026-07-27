@@ -946,6 +946,29 @@ impl TypeSpec {
         (p.i == p.s.len()).then_some(t)
     }
 
+    /// Like [`parse`](Self::parse) but also consumes an optional TOP-LEVEL `NOT
+    /// NULL` modifier (`string NOT NULL`), returning it as the second tuple element.
+    /// A top-level `NOT NULL` makes the property REQUIRED (present + non-null),
+    /// exactly like a `createRequiredConstraint` — the type-surface spelling of the
+    /// same guarantee, mirroring the per-field `NOT NULL` inside a record.
+    pub fn parse_with_not_null(s: &str) -> Option<(Self, bool)> {
+        let mut p = TypeParser {
+            s: s.as_bytes(),
+            i: 0,
+        };
+        let t = p.parse_type()?;
+        let not_null = if p.eat_kw("not") {
+            if !p.eat_kw("null") {
+                return None;
+            }
+            true
+        } else {
+            false
+        };
+        p.skip_ws();
+        (p.i == p.s.len()).then_some((t, not_null))
+    }
+
     /// Re-emit the canonical type name (round-trips through [`parse`](Self::parse));
     /// used by `dump_schema` to replay a declared constraint.
     fn to_name(&self) -> String {
@@ -1314,6 +1337,13 @@ pub struct Graph {
     /// kept separate so the scalar path stays a `Copy` `PropType` map. A declared
     /// record shape is the contract that later lets the store de-box the column.
     v_record: HashMap<String, HashMap<String, TypeSpec>>,
+    /// `label` → the set of scalar-typed keys declared `NOT NULL` (`string NOT
+    /// NULL`). A parallel, additive set beside `v_type` (the scalar map stays a
+    /// `Copy` `PropType`): a `NOT NULL` key is REQUIRED (present + non-null), so
+    /// enforcement folds this into the required checks. Kept distinct from
+    /// `v_required` so dropping the type constraint removes only ITS not-null,
+    /// leaving any independently-declared required constraint intact.
+    v_type_not_null: HashMap<String, std::collections::HashSet<String>>,
     /// UNIQUE constraints over **edge** properties: edge-type name → the sorted
     /// property keys that must be unique among live edges of that type. The edge
     /// analogue of `v_unique`, backed by the edge property index (`eidx`).
@@ -1327,6 +1357,9 @@ pub struct Graph {
     e_type_constraints: HashMap<String, HashMap<String, PropType>>,
     /// RECORD-typed constraints over edges — the edge analogue of `v_record`.
     e_record: HashMap<String, HashMap<String, TypeSpec>>,
+    /// Edge-type → scalar keys declared `NOT NULL`. The edge analogue of
+    /// `v_type_not_null`.
+    e_type_not_null: HashMap<String, std::collections::HashSet<String>>,
     /// CARDINALITY constraints: bound the DEGREE of every vertex carrying `label`
     /// over `etype` in `direction` (0 = out / the vertex is the edge source, 1 =
     /// in / the target) to `min..=max` (`max: None` unbounded). A small flat list
@@ -1435,10 +1468,12 @@ impl Clone for Graph {
             v_required: self.v_required.clone(),
             v_type: self.v_type.clone(),
             v_record: self.v_record.clone(),
+            v_type_not_null: self.v_type_not_null.clone(),
             e_unique: self.e_unique.clone(),
             e_required: self.e_required.clone(),
             e_type_constraints: self.e_type_constraints.clone(),
             e_record: self.e_record.clone(),
+            e_type_not_null: self.e_type_not_null.clone(),
             v_cardinality: self.v_cardinality.clone(),
             v_validators: self.v_validators.clone(),
             v_invariants: self.v_invariants.clone(),
@@ -2087,32 +2122,57 @@ impl Graph {
         labels: &[String],
         props: &[(String, Value)],
     ) -> Option<(String, String)> {
-        if self.v_required.is_empty() {
+        if self.v_required.is_empty() && self.v_type_not_null.is_empty() {
             return None;
         }
         for label in labels {
-            for key in self.required_keys(label) {
+            for key in self.effective_required_keys(label) {
                 let present = props
                     .iter()
                     .any(|(k, v)| k == key && !matches!(v, Value::Null));
                 if !present {
-                    return Some((label.clone(), key.clone()));
+                    return Some((label.clone(), key.to_string()));
                 }
             }
         }
         None
     }
 
+    /// The keys REQUIRED (present + non-null) for `label`: the declared required
+    /// constraints UNION the scalar keys declared `NOT NULL` on a type constraint.
+    fn effective_required_keys(&self, label: &str) -> Vec<&str> {
+        let mut ks: Vec<&str> = self
+            .required_keys(label)
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if let Some(nn) = self.v_type_not_null.get(label) {
+            for k in nn {
+                if !ks.contains(&k.as_str()) {
+                    ks.push(k);
+                }
+            }
+        }
+        ks
+    }
+
     /// True iff `key` is required by a label currently on vertex `vi` (so it can't
     /// be removed or set to null).
     pub fn is_required_key(&self, vi: u32, key: &str) -> bool {
+        let carries = |label: &str| {
+            self.labels
+                .get(label)
+                .is_some_and(|lid| self.vlabels[vi as usize].contains(&lid))
+        };
         for (label, keys) in &self.v_required {
-            if keys.iter().any(|k| k == key) {
-                if let Some(lid) = self.labels.get(label) {
-                    if self.vlabels[vi as usize].contains(&lid) {
-                        return true;
-                    }
-                }
+            if keys.iter().any(|k| k == key) && carries(label) {
+                return true;
+            }
+        }
+        // A scalar `NOT NULL` type constraint makes the key required too.
+        for (label, keys) in &self.v_type_not_null {
+            if keys.contains(key) && carries(label) {
+                return true;
             }
         }
         false
@@ -2121,9 +2181,9 @@ impl Graph {
     /// If adding `label` to vertex `vi` would violate a required key the vertex
     /// lacks (absent or null), that key; else `None`.
     pub fn required_missing_for_label(&self, vi: u32, label: &str) -> Option<String> {
-        for key in self.required_keys(label) {
+        for key in self.effective_required_keys(label) {
             if matches!(self.props.value(vi as usize, key, &self.strs), Value::Null) {
-                return Some(key.clone());
+                return Some(key.to_string());
             }
         }
         None
@@ -2144,21 +2204,38 @@ impl Graph {
         key: &str,
         type_name: &str,
     ) -> CodeResult<()> {
-        let Some(spec) = TypeSpec::parse(type_name) else {
+        let Some((spec, not_null)) = TypeSpec::parse_with_not_null(type_name) else {
             return Err(CodeError::new(
                 ErrorCode::InvalidValue,
                 "unknown or malformed type name for a type constraint",
             ));
         };
-        // Validate existing data against the declared type (a null is exempt).
+        // A top-level `NOT NULL` is only meaningful on a scalar for now (a required
+        // whole RECORD is a separate, deferred surface).
+        if not_null && matches!(spec, TypeSpec::Record(_)) {
+            return Err(CodeError::new(
+                ErrorCode::InvalidValue,
+                "`NOT NULL` on a record-typed constraint is not supported",
+            ));
+        }
+        // Validate existing data against the declared type (a null is exempt) — and,
+        // when `NOT NULL`, that no label vertex already holds an absent/null value.
         if let Some(lid) = self.labels.get(label) {
             for vi in self.vertex_indices() {
-                if self.vlabels[vi as usize].contains(&lid)
-                    && !value_matches(&self.props.value(vi as usize, key, &self.strs), &spec)
-                {
+                if !self.vlabels[vi as usize].contains(&lid) {
+                    continue;
+                }
+                let v = self.props.value(vi as usize, key, &self.strs);
+                if !value_matches(&v, &spec) {
                     return Err(CodeError::new(
                         ErrorCode::ConstraintViolation,
                         "existing data already violates the type constraint being declared",
+                    ));
+                }
+                if not_null && matches!(v, Value::Null) {
+                    return Err(CodeError::new(
+                        ErrorCode::ConstraintViolation,
+                        "existing data already violates the NOT NULL constraint being declared",
                     ));
                 }
             }
@@ -2171,6 +2248,12 @@ impl Graph {
                     .entry(label.to_string())
                     .or_default()
                     .insert(key.to_string(), ty);
+                if not_null {
+                    self.v_type_not_null
+                        .entry(label.to_string())
+                        .or_default()
+                        .insert(key.to_string());
+                }
             }
             record => {
                 // De-box the store for this key into typed sub-columns — the shape
@@ -2198,6 +2281,14 @@ impl Graph {
             keys.remove(key);
             if keys.is_empty() {
                 self.v_record.remove(label);
+            }
+        }
+        // Drop this constraint's `NOT NULL` (leaving any independently-declared
+        // required constraint on the same key intact).
+        if let Some(keys) = self.v_type_not_null.get_mut(label) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.v_type_not_null.remove(label);
             }
         }
         // Re-box the column once NO label still constrains this key as a record.
@@ -2425,16 +2516,28 @@ impl Graph {
         etypes: &[String],
         props: &[(String, Value)],
     ) -> Option<(String, String)> {
-        if self.e_required.is_empty() {
+        if self.e_required.is_empty() && self.e_type_not_null.is_empty() {
             return None;
         }
         for etype in etypes {
-            for key in self.edge_required_keys(etype) {
+            let mut keys: Vec<&str> = self
+                .edge_required_keys(etype)
+                .iter()
+                .map(String::as_str)
+                .collect();
+            if let Some(nn) = self.e_type_not_null.get(etype) {
+                for k in nn {
+                    if !keys.contains(&k.as_str()) {
+                        keys.push(k);
+                    }
+                }
+            }
+            for key in keys {
                 let present = props
                     .iter()
                     .any(|(k, v)| k == key && !matches!(v, Value::Null));
                 if !present {
-                    return Some((etype.clone(), key.clone()));
+                    return Some((etype.clone(), key.to_string()));
                 }
             }
         }
@@ -2450,18 +2553,31 @@ impl Graph {
         key: &str,
         type_name: &str,
     ) -> CodeResult<()> {
-        let Some(spec) = TypeSpec::parse(type_name) else {
+        let Some((spec, not_null)) = TypeSpec::parse_with_not_null(type_name) else {
             return Err(CodeError::new(
                 ErrorCode::InvalidValue,
                 "unknown or malformed type name for an edge type constraint",
             ));
         };
+        if not_null && matches!(spec, TypeSpec::Record(_)) {
+            return Err(CodeError::new(
+                ErrorCode::InvalidValue,
+                "`NOT NULL` on a record-typed constraint is not supported",
+            ));
+        }
         if let Some(edges) = self.edges_with_etype_name(etype) {
             for &ei in edges {
-                if !value_matches(&self.edge_props.value(ei as usize, key, &self.strs), &spec) {
+                let v = self.edge_props.value(ei as usize, key, &self.strs);
+                if !value_matches(&v, &spec) {
                     return Err(CodeError::new(
                         ErrorCode::ConstraintViolation,
                         "existing data already violates the edge type constraint being declared",
+                    ));
+                }
+                if not_null && matches!(v, Value::Null) {
+                    return Err(CodeError::new(
+                        ErrorCode::ConstraintViolation,
+                        "existing data already violates the NOT NULL constraint being declared",
                     ));
                 }
             }
@@ -2472,6 +2588,12 @@ impl Graph {
                     .entry(etype.to_string())
                     .or_default()
                     .insert(key.to_string(), ty);
+                if not_null {
+                    self.e_type_not_null
+                        .entry(etype.to_string())
+                        .or_default()
+                        .insert(key.to_string());
+                }
             }
             record => {
                 self.edge_props.debox_record(key, &record, &mut self.strs);
@@ -2496,6 +2618,12 @@ impl Graph {
             keys.remove(key);
             if keys.is_empty() {
                 self.e_record.remove(etype);
+            }
+        }
+        if let Some(keys) = self.e_type_not_null.get_mut(etype) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.e_type_not_null.remove(etype);
             }
         }
         if !self.e_record.values().any(|ks| ks.contains_key(key)) {
@@ -2979,8 +3107,19 @@ impl Graph {
             .v_type
             .iter()
             .flat_map(|(label, ks)| {
-                ks.iter()
-                    .map(move |(k, t)| (label.clone(), k.clone(), t.to_name().to_string()))
+                ks.iter().map(move |(k, t)| {
+                    // Round-trip a scalar `NOT NULL` type constraint.
+                    let nn = self
+                        .v_type_not_null
+                        .get(label)
+                        .is_some_and(|s| s.contains(k));
+                    let ty = if nn {
+                        format!("{} NOT NULL", t.to_name())
+                    } else {
+                        t.to_name().to_string()
+                    };
+                    (label.clone(), k.clone(), ty)
+                })
             })
             .chain(self.v_record.iter().flat_map(|(label, ks)| {
                 ks.iter()
@@ -3014,8 +3153,15 @@ impl Graph {
             .e_type_constraints
             .iter()
             .flat_map(|(et, ks)| {
-                ks.iter()
-                    .map(move |(k, t)| (et.clone(), k.clone(), t.to_name().to_string()))
+                ks.iter().map(move |(k, t)| {
+                    let nn = self.e_type_not_null.get(et).is_some_and(|s| s.contains(k));
+                    let ty = if nn {
+                        format!("{} NOT NULL", t.to_name())
+                    } else {
+                        t.to_name().to_string()
+                    };
+                    (et.clone(), k.clone(), ty)
+                })
             })
             .chain(self.e_record.iter().flat_map(|(et, ks)| {
                 ks.iter()
@@ -4789,10 +4935,12 @@ impl Builder {
             v_required: HashMap::new(),
             v_type: HashMap::new(),
             v_record: HashMap::new(),
+            v_type_not_null: HashMap::new(),
             e_unique: HashMap::new(),
             e_required: HashMap::new(),
             e_type_constraints: HashMap::new(),
             e_record: HashMap::new(),
+            e_type_not_null: HashMap::new(),
             v_cardinality: Vec::new(),
             v_validators: HashMap::new(),
             v_invariants: Vec::new(),
@@ -6156,6 +6304,129 @@ mod record_constraint {
             .unwrap();
         g.drop_type_constraint("Person", "meta");
         assert!(!g.type_conflict_on_set(0, "meta", &vmap(&[("city", Value::Num(1.0))])));
+    }
+}
+
+/// Scalar `NOT NULL` on a type constraint (`string NOT NULL`) — the type-surface
+/// spelling of a required (present + non-null) property, mirroring per-field
+/// `NOT NULL` in a record.
+#[cfg(test)]
+mod scalar_not_null {
+    use super::*;
+
+    fn node(props: &str) -> Graph {
+        crate::ndjson::decode(&format!(
+            r#"{{"type":"node","id":"a","labels":["P"],"properties":{props}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn parse_roundtrips_a_top_level_not_null() {
+        assert_eq!(
+            TypeSpec::parse_with_not_null("string"),
+            Some((TypeSpec::Scalar(PropType::Str), false))
+        );
+        assert_eq!(
+            TypeSpec::parse_with_not_null("string NOT NULL"),
+            Some((TypeSpec::Scalar(PropType::Str), true))
+        );
+        // case-insensitive, whitespace-tolerant
+        assert_eq!(
+            TypeSpec::parse_with_not_null("number  not null"),
+            Some((TypeSpec::Scalar(PropType::Num), true))
+        );
+        assert_eq!(TypeSpec::parse_with_not_null("string NOT"), None); // NOT without NULL
+        assert_eq!(TypeSpec::parse_with_not_null("bogus"), None);
+    }
+
+    #[test]
+    fn declare_requires_existing_data_present_and_non_null() {
+        // present + non-null → OK
+        assert!(node(r#"{"name":"marko"}"#)
+            .create_type_constraint("P", "name", "string NOT NULL")
+            .is_ok());
+        // absent → declare fails
+        assert!(node("{}")
+            .create_type_constraint("P", "name", "string NOT NULL")
+            .is_err());
+        // stored null → declare fails
+        assert!(node(r#"{"name":null}"#)
+            .create_type_constraint("P", "name", "string NOT NULL")
+            .is_err());
+        // a plain (nullable) type constraint stays exempt from absent/null
+        assert!(node("{}")
+            .create_type_constraint("P", "name", "string")
+            .is_ok());
+    }
+
+    #[test]
+    fn missing_required_folds_in_the_not_null_type_constraint() {
+        let mut g = node(r#"{"name":"marko"}"#);
+        g.create_type_constraint("P", "name", "string NOT NULL")
+            .unwrap();
+        let labels = ["P".to_string()];
+        // absent / null → a required violation; present non-null → OK.
+        assert!(g.missing_required(&labels, &[]).is_some());
+        assert!(g
+            .missing_required(&labels, &[("name".to_string(), Value::Null)])
+            .is_some());
+        assert!(g
+            .missing_required(&labels, &[("name".to_string(), Value::Str("x".into()))])
+            .is_none());
+        // A wrong TYPE is still a separate type violation.
+        assert!(g
+            .type_violation(&labels, &[("name".to_string(), Value::Num(1.0))])
+            .is_some());
+    }
+
+    #[test]
+    fn dropping_leaves_an_independent_required_intact() {
+        let mut g = node(r#"{"name":"marko"}"#);
+        g.create_required_constraint("P", "name").unwrap(); // declared independently
+        g.create_type_constraint("P", "name", "string NOT NULL")
+            .unwrap();
+        g.drop_type_constraint("P", "name");
+        // The type not-null is gone, but the independent required still enforces.
+        assert!(!g.v_type_not_null.contains_key("P"));
+        assert!(g.missing_required(&["P".to_string()], &[]).is_some());
+    }
+
+    #[test]
+    fn dump_schema_roundtrips_scalar_not_null() {
+        let mut g = node(r#"{"name":"marko"}"#);
+        g.create_type_constraint("P", "name", "string NOT NULL")
+            .unwrap();
+        assert!(g.dump_schema().contains(r#""type":"string NOT NULL""#));
+    }
+
+    #[test]
+    fn not_null_on_a_record_type_is_rejected() {
+        assert!(node("{}")
+            .create_type_constraint("P", "meta", "record{a::number} NOT NULL")
+            .is_err());
+    }
+
+    #[test]
+    fn edge_scalar_not_null_enforces_and_roundtrips() {
+        let mut g = crate::ndjson::decode(
+            concat!(
+                r#"{"type":"node","id":"a","labels":["P"],"properties":{}}"#,
+                "\n",
+                r#"{"type":"node","id":"b","labels":["P"],"properties":{}}"#,
+                "\n",
+                r#"{"type":"edge","id":"e","from":"a","to":"b","labels":["LINK"],"properties":{"w":1.5}}"#,
+            ),
+        )
+        .unwrap();
+        g.create_edge_type_constraint("LINK", "w", "number NOT NULL")
+            .unwrap();
+        let et = ["LINK".to_string()];
+        assert!(g.edge_missing_required(&et, &[]).is_some());
+        assert!(g
+            .edge_missing_required(&et, &[("w".to_string(), Value::Num(2.0))])
+            .is_none());
+        assert!(g.dump_schema().contains(r#""type":"number NOT NULL""#));
     }
 }
 

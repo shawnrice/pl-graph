@@ -95,7 +95,15 @@ const cmpField = (a: string, b: string): number => {
 /** Parse a constraint type name: a scalar, or `record { field :: type, … }`
  *  (`:`/`::`, whitespace-tolerant, nesting allowed). `null` if malformed.
  *  Mirrors the native `TypeSpec::parse`. */
-export const parseTypeSpec = (input: string): TypeSpec | null => {
+/**
+ * Parse a constraint type name, also capturing an optional TOP-LEVEL `NOT NULL`
+ * (`string NOT NULL`) as `notNull`. A top-level `NOT NULL` makes the property
+ * REQUIRED (present + non-null) — the type-surface spelling of a required
+ * constraint, mirroring per-field `NOT NULL` inside a record.
+ */
+export const parseTypeSpecWithNotNull = (
+  input: string,
+): { spec: TypeSpec; notNull: boolean } | null => {
   let i = 0;
   const s = input;
   const ws = (): void => {
@@ -209,9 +217,33 @@ export const parseTypeSpec = (input: string): TypeSpec | null => {
   };
 
   const t = parseType();
+
+  if (t === null) {
+    return null;
+  }
+
+  // Optional TOP-LEVEL `NOT NULL`.
+  let notNull = false;
+
+  if (eatKw('not')) {
+    if (!eatKw('null')) {
+      return null;
+    }
+
+    notNull = true;
+  }
+
   ws();
 
-  return t !== null && i === s.length ? t : null;
+  return i === s.length ? { spec: t, notNull } : null;
+};
+
+/** Parse a constraint type name (strict — a trailing `NOT NULL` is rejected; use
+ * {@link parseTypeSpecWithNotNull} to accept it). */
+export const parseTypeSpec = (input: string): TypeSpec | null => {
+  const parsed = parseTypeSpecWithNotNull(input);
+
+  return parsed !== null && !parsed.notNull ? parsed.spec : null;
 };
 
 /** The canonical type name for a `TypeSpec` (round-trips through `parseTypeSpec`);
@@ -763,9 +795,11 @@ export class Graph {
     copySetMap(this.vertexUniqueConstraints, next.vertexUniqueConstraints);
     copySetMap(this.vertexRequiredConstraints, next.vertexRequiredConstraints);
     copyTypeMap(this.vertexTypeConstraints, next.vertexTypeConstraints);
+    copySetMap(this.vertexTypeNotNull, next.vertexTypeNotNull);
     copySetMap(this.edgeUniqueConstraints, next.edgeUniqueConstraints);
     copySetMap(this.edgeRequiredConstraints, next.edgeRequiredConstraints);
     copyTypeMap(this.edgeTypeConstraints, next.edgeTypeConstraints);
+    copySetMap(this.edgeTypeNotNull, next.edgeTypeNotNull);
 
     // Record-typed constraints: `TypeSpec` values are immutable, so a shallow
     // inner-map copy is a full copy.
@@ -1625,12 +1659,18 @@ export class Graph {
     labels: Iterable<string>,
     properties: Readonly<Record<string, unknown>>,
   ): { label: string; key: string } | undefined => {
-    if (this.vertexRequiredConstraints.size === 0) {
+    if (this.vertexRequiredConstraints.size === 0 && this.vertexTypeNotNull.size === 0) {
       return undefined;
     }
 
     for (const label of labels) {
-      for (const key of this.vertexRequiredConstraints.get(label) ?? []) {
+      // Required keys = declared required constraints UNION scalar `NOT NULL` keys.
+      const keys = new Set([
+        ...(this.vertexRequiredConstraints.get(label) ?? []),
+        ...(this.vertexTypeNotNull.get(label) ?? []),
+      ]);
+
+      for (const key of keys) {
         if (!this.isPresent(properties[key])) {
           return { label, key };
         }
@@ -1643,12 +1683,15 @@ export class Graph {
   /** True iff `key` is required by any of `vertex`'s labels (so it can't be
    *  removed or set to null). */
   public isRequiredKey = (vertex: Vertex, key: string): boolean => {
-    if (this.vertexRequiredConstraints.size === 0) {
+    if (this.vertexRequiredConstraints.size === 0 && this.vertexTypeNotNull.size === 0) {
       return false;
     }
 
     for (const label of vertex.labels) {
-      if (this.vertexRequiredConstraints.get(label)?.has(key)) {
+      if (
+        this.vertexRequiredConstraints.get(label)?.has(key) ||
+        this.vertexTypeNotNull.get(label)?.has(key)
+      ) {
         return true;
       }
     }
@@ -1713,6 +1756,12 @@ export class Graph {
 
   private readonly vertexRecordConstraints = new Map<string, Map<string, TypeSpec>>();
 
+  /** `label` → scalar keys declared `NOT NULL` (`string NOT NULL`). A `NOT NULL`
+   *  key is REQUIRED (present + non-null); folded into the required checks. Kept
+   *  separate from {@link vertexRequiredConstraints} so dropping the type
+   *  constraint leaves an independently-declared required constraint intact. */
+  private readonly vertexTypeNotNull = new Map<string, Set<string>>();
+
   /** The scalar type of a stored value, or `null` for null/absent/record
    *  (type-exempt from a scalar constraint — the record path governs maps). */
   private valueType = (v: unknown): ScalarTypeName | null => {
@@ -1748,19 +1797,36 @@ export class Graph {
    * vertex with `label` holds a present, non-null `key` of a different type.
    */
   public createTypeConstraint = (label: string, key: string, type: string): void => {
-    const spec = parseTypeSpec(type);
+    const parsed = parseTypeSpecWithNotNull(type);
 
-    if (spec === null) {
+    if (parsed === null) {
       throw new LenkeError(
         `unknown or malformed type '${type}' for the type constraint on (${label}, ${key})`,
         { code: ErrorCode.InvalidValue },
       );
     }
 
+    const { spec, notNull } = parsed;
+
+    if (notNull && spec.kind === 'record') {
+      throw new LenkeError('`NOT NULL` on a record-typed constraint is not supported', {
+        code: ErrorCode.InvalidValue,
+      });
+    }
+
     for (const vertex of this.getVerticesByLabel(label)) {
-      if (!valueMatches(vertex.properties[key], spec, this.valueType)) {
+      const v = vertex.properties[key];
+
+      if (!valueMatches(v, spec, this.valueType)) {
         throw new LenkeError(
           `existing data already violates the type constraint being declared on (${label}, ${key})`,
+          { code: ErrorCode.ConstraintViolation },
+        );
+      }
+
+      if (notNull && !this.isPresent(v)) {
+        throw new LenkeError(
+          `existing data already violates the NOT NULL constraint being declared on (${label}, ${key})`,
           { code: ErrorCode.ConstraintViolation },
         );
       }
@@ -1776,6 +1842,17 @@ export class Graph {
       }
 
       keys.set(key, spec.type);
+
+      if (notNull) {
+        let nn = this.vertexTypeNotNull.get(label);
+
+        if (!nn) {
+          nn = new Set();
+          this.vertexTypeNotNull.set(label, nn);
+        }
+
+        nn.add(key);
+      }
     } else {
       let keys = this.vertexRecordConstraints.get(label);
 
@@ -1788,9 +1865,14 @@ export class Graph {
     }
   };
 
-  /** Drop a type constraint (scalar or record). Idempotent. */
+  /** Drop a type constraint (scalar or record). Idempotent. Removes this
+   *  constraint's `NOT NULL` (leaving any independent required constraint). */
   public dropTypeConstraint = (label: string, key: string): void => {
-    for (const map of [this.vertexTypeConstraints, this.vertexRecordConstraints]) {
+    for (const map of [
+      this.vertexTypeConstraints,
+      this.vertexRecordConstraints,
+      this.vertexTypeNotNull,
+    ]) {
       const keys = map.get(label);
 
       if (keys) {
@@ -2014,6 +2096,10 @@ export class Graph {
   private readonly edgeRequiredConstraints = new Map<string, Set<string>>();
   private readonly edgeTypeConstraints = new Map<string, Map<string, ScalarTypeName>>();
   private readonly edgeRecordConstraints = new Map<string, Map<string, TypeSpec>>();
+
+  /** Edge-type → scalar keys declared `NOT NULL`. Edge analogue of
+   *  {@link vertexTypeNotNull}. */
+  private readonly edgeTypeNotNull = new Map<string, Set<string>>();
 
   /**
    * Inside a transaction (or a rollback replay) the per-write edge-constraint
@@ -2250,12 +2336,17 @@ export class Graph {
     labels: Iterable<string>,
     properties: Readonly<Record<string, unknown>>,
   ): { label: string; key: string } | undefined => {
-    if (this.edgeRequiredConstraints.size === 0) {
+    if (this.edgeRequiredConstraints.size === 0 && this.edgeTypeNotNull.size === 0) {
       return undefined;
     }
 
     for (const label of labels) {
-      for (const key of this.edgeRequiredConstraints.get(label) ?? []) {
+      const keys = new Set([
+        ...(this.edgeRequiredConstraints.get(label) ?? []),
+        ...(this.edgeTypeNotNull.get(label) ?? []),
+      ]);
+
+      for (const key of keys) {
         if (!this.isPresent(properties[key])) {
           return { label, key };
         }
@@ -2268,11 +2359,15 @@ export class Graph {
   /** True iff `key` is required by any of `edge`'s types (so it can't be removed
    *  or set to null). */
   public isEdgeRequiredKey = (edge: Edge, key: string): boolean => {
-    if (this.edgeRequiredConstraints.size === 0) {
+    if (this.edgeRequiredConstraints.size === 0 && this.edgeTypeNotNull.size === 0) {
       return false;
     }
 
     for (const label of edge.labels) {
+      if (this.edgeTypeNotNull.get(label)?.has(key)) {
+        return true;
+      }
+
       if (this.edgeRequiredConstraints.get(label)?.has(key)) {
         return true;
       }
@@ -2316,19 +2411,36 @@ export class Graph {
    * holds a present, non-null `key` of a different type.
    */
   public createEdgeTypeConstraint = (edgeType: string, key: string, type: string): void => {
-    const spec = parseTypeSpec(type);
+    const parsed = parseTypeSpecWithNotNull(type);
 
-    if (spec === null) {
+    if (parsed === null) {
       throw new LenkeError(
         `unknown or malformed type '${type}' for the edge type constraint on (${edgeType}, ${key})`,
         { code: ErrorCode.InvalidValue },
       );
     }
 
+    const { spec, notNull } = parsed;
+
+    if (notNull && spec.kind === 'record') {
+      throw new LenkeError('`NOT NULL` on a record-typed constraint is not supported', {
+        code: ErrorCode.InvalidValue,
+      });
+    }
+
     for (const edge of this.getEdgesByLabel(edgeType)) {
-      if (!valueMatches(edge.properties[key], spec, this.valueType)) {
+      const v = edge.properties[key];
+
+      if (!valueMatches(v, spec, this.valueType)) {
         throw new LenkeError(
           `existing data already violates the edge type constraint being declared on (${edgeType}, ${key})`,
+          { code: ErrorCode.ConstraintViolation },
+        );
+      }
+
+      if (notNull && !this.isPresent(v)) {
+        throw new LenkeError(
+          `existing data already violates the NOT NULL constraint being declared on (${edgeType}, ${key})`,
           { code: ErrorCode.ConstraintViolation },
         );
       }
@@ -2343,6 +2455,17 @@ export class Graph {
       }
 
       keys.set(key, spec.type);
+
+      if (notNull) {
+        let nn = this.edgeTypeNotNull.get(edgeType);
+
+        if (!nn) {
+          nn = new Set();
+          this.edgeTypeNotNull.set(edgeType, nn);
+        }
+
+        nn.add(key);
+      }
     } else {
       let keys = this.edgeRecordConstraints.get(edgeType);
 
@@ -2357,7 +2480,11 @@ export class Graph {
 
   /** Drop an edge type constraint (scalar or record). Idempotent. */
   public dropEdgeTypeConstraint = (edgeType: string, key: string): void => {
-    for (const map of [this.edgeTypeConstraints, this.edgeRecordConstraints]) {
+    for (const map of [
+      this.edgeTypeConstraints,
+      this.edgeRecordConstraints,
+      this.edgeTypeNotNull,
+    ]) {
       const keys = map.get(edgeType);
 
       if (keys) {

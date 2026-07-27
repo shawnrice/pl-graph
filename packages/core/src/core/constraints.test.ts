@@ -633,3 +633,90 @@ describe('R-CONSTRAINTS: RECORD-typed', () => {
     ).not.toThrow();
   });
 });
+
+describe('R-CONSTRAINTS: scalar NOT NULL type constraint', () => {
+  test('declaring over already absent/null data throws', () => {
+    const absent = new Graph();
+    absent.addVertex({ id: 'a', labels: ['P'], properties: {} });
+    expect(isCV(() => absent.createTypeConstraint('P', 'name', 'string NOT NULL'))).toBe(true);
+
+    const nulled = new Graph();
+    nulled.addVertex({ id: 'a', labels: ['P'], properties: { name: null } });
+    expect(isCV(() => nulled.createTypeConstraint('P', 'name', 'string NOT NULL'))).toBe(true);
+
+    // A plain (nullable) type constraint is exempt from absent/null.
+    const ok = new Graph();
+    ok.addVertex({ id: 'a', labels: ['P'], properties: {} });
+    expect(() => ok.createTypeConstraint('P', 'name', 'string')).not.toThrow();
+  });
+
+  test('NOT NULL requires present + non-null AND the declared type', () => {
+    const g = new Graph();
+    g.addVertex({ id: 'a', labels: ['P'], properties: { name: 'marko' } });
+    g.createTypeConstraint('P', 'name', 'string NOT NULL');
+
+    // absent / null → rejected (the required half)
+    expect(isCV(() => g.addVertex({ id: 'b', labels: ['P'], properties: {} }))).toBe(true);
+    expect(isCV(() => g.addVertex({ id: 'c', labels: ['P'], properties: { name: null } }))).toBe(
+      true,
+    );
+    // wrong type → rejected (the type half)
+    expect(isCV(() => g.addVertex({ id: 'd', labels: ['P'], properties: { name: 42 } }))).toBe(
+      true,
+    );
+    // present, non-null, right type → OK
+    expect(
+      g
+        .addVertex({ id: 'e', labels: ['P'], properties: { name: 'vadas' } })
+        .getProperty<string>('name'),
+    ).toBe('vadas');
+  });
+
+  test('a NOT NULL key cannot be nulled or removed', () => {
+    const g = new Graph();
+    const v = g.addVertex({ id: 'a', labels: ['P'], properties: { name: 'marko' } });
+    g.createTypeConstraint('P', 'name', 'string NOT NULL');
+
+    expect(isCV(() => v.setProperty('name', null))).toBe(true);
+    expect(isCV(() => v.removeProperty('name'))).toBe(true);
+    expect(v.getProperty<string>('name')).toBe('marko');
+  });
+
+  test('dropping the type constraint leaves an independent required intact', () => {
+    const g = new Graph();
+    const v = g.addVertex({ id: 'a', labels: ['P'], properties: { name: 'marko' } });
+    g.createRequiredConstraint('P', 'name'); // declared independently
+    g.createTypeConstraint('P', 'name', 'string NOT NULL');
+    g.dropTypeConstraint('P', 'name');
+
+    // The required survives; a wrong TYPE is now allowed (type constraint gone).
+    expect(isCV(() => v.setProperty('name', null))).toBe(true);
+    expect(() => v.setProperty('name', 42)).not.toThrow();
+  });
+
+  test('NOT NULL on a record-typed constraint is rejected', () => {
+    const g = new Graph();
+    expect(
+      hasErrorCode(
+        thrown(() => g.createTypeConstraint('P', 'meta', 'record{a::number} NOT NULL')),
+        ErrorCode.InvalidValue,
+      ),
+    ).toBe(true);
+  });
+
+  test('edge scalar NOT NULL enforces present + non-null', () => {
+    const g = new Graph();
+    const a = g.addVertex({ id: 'a', labels: ['P'], properties: {} });
+    const b = g.addVertex({ id: 'b', labels: ['P'], properties: {} });
+    g.addEdge({ from: a, to: b, labels: ['LINK'], properties: { w: 1.5 } });
+    g.createEdgeTypeConstraint('LINK', 'w', 'number NOT NULL');
+
+    expect(isCV(() => g.addEdge({ from: a, to: b, labels: ['LINK'], properties: {} }))).toBe(true);
+    expect(
+      isCV(() => g.addEdge({ from: a, to: b, labels: ['LINK'], properties: { w: null } })),
+    ).toBe(true);
+    expect(() =>
+      g.addEdge({ from: a, to: b, labels: ['LINK'], properties: { w: 2.5 } }),
+    ).not.toThrow();
+  });
+});
