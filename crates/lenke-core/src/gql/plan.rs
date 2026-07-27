@@ -352,10 +352,10 @@ pub enum CExpr {
         label: CLabelExpr,
         negated: bool,
     },
-    /// `x IS [NOT] TYPED <category> [NOT NULL]` — the ISO value-type predicate.
+    /// `x IS [NOT] TYPED <value type> [NOT NULL]` — the ISO value-type predicate.
     IsTyped {
         expr: Box<Self>,
-        category: String,
+        ty: TypeTest,
         not_null: bool,
         negated: bool,
     },
@@ -1101,12 +1101,12 @@ fn extract_aggs(expr: CExpr, aggs: &mut Vec<CAgg>) -> CExpr {
         },
         CExpr::IsTyped {
             expr,
-            category,
+            ty,
             not_null,
             negated,
         } => CExpr::IsTyped {
             expr: b(expr, aggs),
-            category,
+            ty,
             not_null,
             negated,
         },
@@ -1368,12 +1368,12 @@ impl Lowerer {
             },
             Expr::IsTyped {
                 expr,
-                category,
+                ty,
                 not_null,
                 negated,
             } => CExpr::IsTyped {
                 expr: self.boxed(expr),
-                category: category.clone(),
+                ty: ty.clone(),
                 not_null: *not_null,
                 negated: *negated,
             },

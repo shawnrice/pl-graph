@@ -440,6 +440,22 @@ pub enum GraphPredKind {
 }
 
 /// Expression tree (see TS `Expr`). Sub-expressions are boxed.
+/// A `<value type>` in the `IS TYPED` predicate (ISO `<value type predicate>`).
+/// Scalar leaves carry a normalized category (`integer`/`float`/`string`/`bool`/
+/// `list`/`date`/…/`null`/`any`) — the predicate keeps its richer vocabulary (e.g.
+/// the integer/float split) rather than the constraint `TypeSpec`'s single numeric
+/// type. Records mirror the constraint shape: closed on extras, each field
+/// nullable/optional unless `NOT NULL`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeTest {
+    /// A predefined/scalar type family.
+    Scalar(String),
+    /// The OPEN record type (`ANY RECORD` / bare `RECORD`): any map.
+    AnyRecord,
+    /// A CLOSED record: an exact, sorted field set — `(name, type, not_null)`.
+    Record(Vec<(String, Self, bool)>),
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     Var(String),
@@ -508,14 +524,13 @@ pub enum Expr {
         label: LabelExpr,
         negated: bool,
     },
-    /// `x IS [NOT] TYPED <type> [NOT NULL]` — the ISO value-type predicate.
-    /// `category` is a normalized type family (`integer`/`float`/`string`/`bool`/
-    /// `list`/`date`/`local_time`/`local_datetime`/`zoned_time`/`zoned_datetime`/
-    /// `duration`/`null`/`any`). Null conforms to any nullable type, so
+    /// `x IS [NOT] TYPED <value type> [NOT NULL]` — the ISO value-type predicate.
+    /// `ty` is the declared `<value type>` (a scalar family, an open `ANY RECORD`,
+    /// or a closed `RECORD {…}`). Null conforms to any nullable type, so
     /// `null IS TYPED T` is true unless `not_null`.
     IsTyped {
         expr: Box<Self>,
-        category: String,
+        ty: TypeTest,
         not_null: bool,
         negated: bool,
     },

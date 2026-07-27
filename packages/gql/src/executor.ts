@@ -46,6 +46,7 @@ import type {
   SetOp,
   Statement,
   TxControl,
+  TypeTest,
 } from './ast.js';
 import { isTxControl } from './ast.js';
 import {
@@ -213,16 +214,11 @@ const graphPredResult = (predKind: string, vals: readonly unknown[]): boolean | 
   }
 };
 
-// The ISO value-type predicate `x IS TYPED <category> [NOT NULL]`. Null conforms
-// to any nullable type (Neo4j-verified), so a null value is `!notNull`. A non-null
-// value matches its runtime kind. Numeric split: `integer` = a whole-valued
-// number, `float` = any number (one f64 numeric type; boundary inference). Mirrors
-// the Rust `value_is_typed`.
-const valueIsTyped = (v: unknown, category: string, notNull: boolean): boolean => {
-  if (isNullish(v)) {
-    return !notNull;
-  }
-
+// Does a NON-null value match a scalar type category? Numeric split: `integer` =
+// a whole-valued number, `float` = any number (one f64 numeric type; boundary
+// inference). The open record (`ANY RECORD`) is a `TypeTest`, not a category —
+// handled in `valueIsTypedTy`. Mirrors the Rust `category_matches`.
+const categoryMatches = (v: unknown, category: string): boolean => {
   switch (category) {
     case 'any':
       return true;
@@ -238,9 +234,6 @@ const valueIsTyped = (v: unknown, category: string, notNull: boolean): boolean =
       return typeof v === 'number';
     case 'list':
       return Array.isArray(v);
-    // The OPEN record type (`ANY RECORD` / bare `RECORD`): any map value.
-    case 'record':
-      return v instanceof LenkeRecord;
     case 'date':
       return v instanceof LocalDate;
     case 'local_time':
@@ -256,6 +249,42 @@ const valueIsTyped = (v: unknown, category: string, notNull: boolean): boolean =
     default:
       return false;
   }
+};
+
+// The ISO value-type predicate `x IS TYPED <value type> [NOT NULL]`. Null conforms
+// to any nullable type, so a null value is `!notNull`. A closed `RECORD {…}` is
+// CLOSED on extras and matches each present field's value against its type (a field
+// null/absent is OK unless the field is NOT NULL). Mirrors the Rust
+// `value_is_typed_ty`.
+const valueIsTypedTy = (v: unknown, ty: TypeTest, notNull: boolean): boolean => {
+  if (isNullish(v)) {
+    return !notNull;
+  }
+
+  if (ty.kind === 'scalar') {
+    return categoryMatches(v, ty.category);
+  }
+
+  if (ty.kind === 'anyRecord') {
+    return v instanceof LenkeRecord;
+  }
+
+  if (!(v instanceof LenkeRecord)) {
+    return false;
+  }
+
+  // Closed: every present key must be a declared field.
+  const declared = new Set(ty.fields.map(([k]) => k));
+
+  for (const k of v.keys()) {
+    if (!declared.has(k)) {
+      return false;
+    }
+  }
+
+  return ty.fields.every(([k, ft, fieldNotNull]) =>
+    v.has(k) ? valueIsTypedTy(v.get(k), ft, fieldNotNull) : !fieldNotNull,
+  );
 };
 
 // `PROPERTY_EXISTS(n, key)`: is `key` a *present* property of element `n`? A
@@ -1684,12 +1713,12 @@ const compileExpr = (expr: Expr): CompiledExpr => {
       };
     }
     case 'isTyped': {
-      // `x IS [NOT] TYPED <category> [NOT NULL]` — the ISO value-type predicate.
+      // `x IS [NOT] TYPED <value type> [NOT NULL]` — the ISO value-type predicate.
       const fn = compileExpr(expr.expr);
-      const { category, notNull, negated } = expr;
+      const { ty, notNull, negated } = expr;
 
       return (env) => {
-        const m = valueIsTyped(fn(env), category, notNull);
+        const m = valueIsTypedTy(fn(env), ty, notNull);
 
         return negated ? !m : m;
       };

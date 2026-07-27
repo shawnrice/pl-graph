@@ -374,6 +374,17 @@ export type CompareOp = '=' | '<>' | '<' | '>' | '<=' | '>=';
  */
 export type ArithOp = '+' | '-' | '*' | '/' | '%';
 
+/**
+ * A `<value type>` in the `IS TYPED` predicate. A scalar leaf carries a normalized
+ * category (integer/float/string/…/any); `anyRecord` is the open record; `record`
+ * is a closed field set — `[name, type, notNull]`, closed on extras, each field
+ * nullable/optional unless NOT NULL. Mirrors native `TypeTest`.
+ */
+export type TypeTest =
+  | { kind: 'scalar'; category: string }
+  | { kind: 'anyRecord' }
+  | { kind: 'record'; fields: ReadonlyArray<readonly [string, TypeTest, boolean]> };
+
 export type Expr =
   | { kind: 'var'; name: string }
   | { kind: 'param'; name: string }
@@ -412,9 +423,10 @@ export type Expr =
   | { kind: 'isTruth'; expr: Expr; truth: boolean | null; negated: boolean }
   // ISO `<labeled predicate>`: `x IS [NOT] LABELED <label expression>`.
   | { kind: 'isLabeled'; expr: Expr; label: LabelExpr; negated: boolean }
-  // `x IS [NOT] TYPED <type> [NOT NULL]` — the ISO value-type predicate. `category`
-  // is a normalized type family; null conforms to any nullable type.
-  | { kind: 'isTyped'; expr: Expr; category: string; notNull: boolean; negated: boolean }
+  // `x IS [NOT] TYPED <value type> [NOT NULL]` — the ISO value-type predicate. `ty`
+  // is the declared type (a scalar family, `ANY RECORD`, or a closed `RECORD {…}`);
+  // null conforms to any nullable type.
+  | { kind: 'isTyped'; expr: Expr; ty: TypeTest; notNull: boolean; negated: boolean }
   // Graph-element predicates: IS DIRECTED / IS SOURCE|DESTINATION OF / ALL_DIFFERENT
   // / SAME. `args` are the element operands; `negated` only for the IS NOT forms.
   | {

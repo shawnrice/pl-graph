@@ -6345,10 +6345,42 @@ fn is_typed_open_record() {
         ),
         vec![vec![b(true), b(false)]]
     );
-    // The closed shape form in a predicate is a loud, deferred error (not silent).
-    assert!(parse("RETURN {a:1} IS TYPED RECORD {a :: INTEGER} AS x").is_err());
     // `ANY` without `RECORD` is a parse error.
     assert!(parse("RETURN {a:1} IS TYPED ANY FOO AS x").is_err());
+}
+
+#[test]
+fn is_typed_closed_record() {
+    // ISO `IS TYPED RECORD { field :: type [NOT NULL], … }` — closed on extras,
+    // fields nullable/optional unless NOT NULL, with the predicate's INTEGER/FLOAT
+    // split and nesting.
+    let mut g = ndjson::decode("").unwrap();
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN {a: 1, b: 'x'} IS TYPED RECORD {a :: INTEGER, b :: STRING} AS a, \
+             {a: 1} IS TYPED RECORD {a :: INTEGER, b :: STRING} AS b, \
+             {a: 1, b: 'x', c: 9} IS TYPED RECORD {a :: INTEGER, b :: STRING} AS c, \
+             {a: 1.5} IS TYPED RECORD {a :: INTEGER} AS d, \
+             {a: 1.5} IS TYPED RECORD {a :: FLOAT} AS e",
+        ),
+        // a: exact match. b: `b` nullable-absent → OK. c: extra field → closed → false.
+        // d: 1.5 not INTEGER → false. e: 1.5 IS FLOAT → true.
+        vec![vec![b(true), b(true), b(false), b(false), b(true)]]
+    );
+    // NOT NULL fields + nested records.
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN {} IS TYPED RECORD {a :: INTEGER NOT NULL} AS a, \
+             {a: null} IS TYPED RECORD {a :: INTEGER NOT NULL} AS b, \
+             {geo: {lat: 1, lng: 2}} IS TYPED RECORD {geo :: RECORD {lat :: INTEGER, lng :: INTEGER}} AS c, \
+             {geo: {lat: 'x'}} IS TYPED RECORD {geo :: RECORD {lat :: INTEGER, lng :: INTEGER}} AS d",
+        ),
+        // a: NOT NULL absent → false. b: NOT NULL null → false. c: nested match → true.
+        // d: nested wrong type + extra-missing → false.
+        vec![vec![b(false), b(false), b(true), b(false)]]
+    );
 }
 
 // ---------------------------------------------------------------------------

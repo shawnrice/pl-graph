@@ -1141,49 +1141,10 @@ impl Parser {
                     negated,
                 });
             }
-            // `IS [NOT] TYPED <type> [NOT NULL]` — the ISO value-type predicate.
+            // `IS [NOT] TYPED <value type> [NOT NULL]` — the ISO value-type predicate.
             if self.check_soft("typed") || self.check_kw("typed") {
                 self.advance();
-                // ISO `<record type> ::= [ANY] RECORD …`. The OPEN form (`ANY RECORD`
-                // / a bare `RECORD`) tests "is a map". A bare `ANY` (no `RECORD`) is
-                // the `any`-type test, unchanged. The closed shape form (`RECORD {…}`)
-                // in a predicate is deferred (loud, not silent).
-                let is_record_kw = |p: &Self| p.check_soft("record") || p.check_kw("record");
-                let reject_closed = |p: &mut Self| -> R<()> {
-                    if p.check(Tt::LBrace) {
-                        return err(
-                            "closed-record `IS TYPED RECORD {…}` is not yet supported; use \
-                             `IS TYPED ANY RECORD`, or test fields with per-field predicates",
-                            p.peek().pos,
-                        );
-                    }
-                    Ok(())
-                };
-                let category = if is_record_kw(self) {
-                    self.advance(); // RECORD
-                    reject_closed(self)?;
-                    "record".to_string()
-                } else if self.check_kw("any") || self.check_soft("any") {
-                    self.advance(); // ANY
-                    if is_record_kw(self) {
-                        self.advance(); // RECORD
-                        reject_closed(self)?;
-                        "record".to_string()
-                    } else {
-                        "any".to_string() // the bare `ANY` type
-                    }
-                } else {
-                    let type_name = self.read_type_name("after IS TYPED")?;
-                    match type_test_category(&type_name) {
-                        Some(c) => c.to_string(),
-                        None => {
-                            return err(
-                                format!("unsupported type '{type_name}' in IS TYPED"),
-                                self.peek().pos,
-                            );
-                        }
-                    }
-                };
+                let ty = self.parse_value_type_test()?;
                 // Optional `NOT NULL` type modifier (distinct from the `IS NOT`
                 // predicate negation): excludes null from the type's value set.
                 let not_null = if self.check_kw("not") {
@@ -1195,7 +1156,7 @@ impl Parser {
                 };
                 return Ok(Expr::IsTyped {
                     expr: Box::new(e),
-                    category,
+                    ty,
                     not_null,
                     negated,
                 });
@@ -1586,6 +1547,74 @@ impl Parser {
     /// Read a type-name token, joining the two-word `LOCAL`/`ZONED` temporal
     /// forms (`LOCAL DATETIME` → `local_datetime`). Shared by `CAST` and the
     /// `IS TYPED` value-type predicate.
+    /// Parse a `<value type>` for the `IS TYPED` predicate: `[ANY] RECORD [{…}]`
+    /// (open or closed record), or a scalar type name. Recursive — a record field
+    /// is itself a `<value type>`.
+    fn parse_value_type_test(&mut self) -> R<TypeTest> {
+        let is_record_word = |p: &Self| p.check_soft("record") || p.check_kw("record");
+        if is_record_word(self) {
+            self.advance();
+            return self.parse_record_type_body();
+        }
+        // `ANY RECORD` → open record; a bare `ANY` → the any-type test.
+        if self.check_kw("any") || self.check_soft("any") {
+            self.advance();
+            if is_record_word(self) {
+                self.advance();
+                return self.parse_record_type_body();
+            }
+            return Ok(TypeTest::Scalar("any".to_string()));
+        }
+        let type_name = self.read_type_name("in IS TYPED")?;
+        match type_test_category(&type_name) {
+            Some(c) => Ok(TypeTest::Scalar(c.to_string())),
+            None => err(
+                format!("unsupported type '{type_name}' in IS TYPED"),
+                self.peek().pos,
+            ),
+        }
+    }
+
+    /// `RECORD` already consumed → parse an optional `{ field ::type [NOT NULL], … }`.
+    /// No brace = the OPEN record (`ANY RECORD` / bare `RECORD`).
+    fn parse_record_type_body(&mut self) -> R<TypeTest> {
+        if !self.check(Tt::LBrace) {
+            return Ok(TypeTest::AnyRecord);
+        }
+        self.advance(); // {
+        let mut fields: Vec<(String, TypeTest, bool)> = Vec::new();
+        if !self.check(Tt::RBrace) {
+            loop {
+                let name = self.bind_name("a record field name")?;
+                self.expect(Tt::Colon, "':' or '::' after a record field name")?;
+                if self.check(Tt::Colon) {
+                    self.advance(); // optional second colon (`::`)
+                }
+                let ty = self.parse_value_type_test()?;
+                let not_null = if self.check_kw("not") {
+                    self.advance();
+                    self.expect_kw("null")?;
+                    true
+                } else {
+                    false
+                };
+                // Sorted insert, duplicate last-wins — canonical, so a value's
+                // (canonical, sorted) map keys align field-for-field at eval.
+                match fields.binary_search_by(|(k, _, _)| k.as_str().cmp(name.as_str())) {
+                    Ok(i) => fields[i] = (name, ty, not_null),
+                    Err(i) => fields.insert(i, (name, ty, not_null)),
+                }
+                if self.check(Tt::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect(Tt::RBrace, "'}' to close a record type")?;
+        Ok(TypeTest::Record(fields))
+    }
+
     fn read_type_name(&mut self, ctx: &str) -> R<String> {
         let tok = self.peek().clone();
         if tok.tt != Tt::Ident && tok.tt != Tt::Keyword {

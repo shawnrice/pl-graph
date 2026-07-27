@@ -71,7 +71,7 @@ use rayon::prelude::*;
 
 use super::ast::{
     AccessMode, ArithOp, Clause, CompareOp, Direction, Lit, PathMode, PathSelector, Quantifier,
-    Query, SetOp, SetOpKind, Statement, TxControl, TxKind,
+    Query, SetOp, SetOpKind, Statement, TxControl, TxKind, TypeTest,
 };
 use super::lexer::SyntaxError;
 use super::plan::{
@@ -1404,17 +1404,13 @@ fn eval_graph_pred(
     }
 }
 
-/// The ISO value-type predicate `x IS TYPED <category> [NOT NULL]`. Null conforms
-/// to any *nullable* type (Neo4j-verified reading), so a null value is `!not_null`
-/// regardless of category. A non-null value matches its runtime kind against the
-/// category. Numeric split: `integer` = a whole-valued number, `float` = any
-/// number (lenke has one f64 numeric type — boundary inference, matching how it
-/// renders whole f64s as ints / tags them `g:Int64`).
-fn value_is_typed(v: &Val, category: &str, not_null: bool) -> bool {
+/// Does a NON-null value match a scalar type category? Numeric split: `integer` =
+/// a whole-valued number, `float` = any number (lenke has one f64 numeric type —
+/// boundary inference, matching how it renders whole f64s as ints / tags them
+/// `g:Int64`). The open-record category isn't here — `ANY RECORD` is a
+/// [`TypeTest::AnyRecord`], handled in [`value_is_typed_ty`].
+fn category_matches(v: &Val, category: &str) -> bool {
     use crate::temporal::Temporal;
-    if is_nullish(v) {
-        return !not_null;
-    }
     match category {
         "any" => true,
         "null" => false, // v is non-null
@@ -1423,8 +1419,6 @@ fn value_is_typed(v: &Val, category: &str, not_null: bool) -> bool {
         "integer" => matches!(v, Val::Num(n) if n.is_finite() && n.fract() == 0.0),
         "float" => matches!(v, Val::Num(_)),
         "list" => matches!(v, Val::List(_)),
-        // The OPEN record type (`ANY RECORD` / bare `RECORD`): any map value.
-        "record" => matches!(v, Val::Map(_)),
         "date" => matches!(v, Val::Temporal(Temporal::Date(_))),
         "local_time" => matches!(v, Val::Temporal(Temporal::Time(_))),
         "local_datetime" => matches!(v, Val::Temporal(Temporal::DateTime(_))),
@@ -1432,6 +1426,39 @@ fn value_is_typed(v: &Val, category: &str, not_null: bool) -> bool {
         "zoned_datetime" => matches!(v, Val::Temporal(Temporal::ZonedDateTime(_))),
         "duration" => matches!(v, Val::Temporal(Temporal::Duration(_))),
         _ => false,
+    }
+}
+
+/// The ISO value-type predicate `x IS TYPED <value type> [NOT NULL]`. Null conforms
+/// to any *nullable* type (Neo4j-verified reading), so a null value is `!not_null`
+/// regardless of type. A closed `RECORD {…}` is CLOSED on extras and matches each
+/// present field's value against its type (a field null is OK unless the field is
+/// `NOT NULL`; an absent field is OK unless `NOT NULL`) — mirrors the record
+/// constraint's `value_matches`, but keeps the predicate's scalar vocabulary.
+fn value_is_typed_ty(v: &Val, ty: &TypeTest, not_null: bool) -> bool {
+    if is_nullish(v) {
+        return !not_null;
+    }
+    match ty {
+        TypeTest::Scalar(category) => category_matches(v, category),
+        TypeTest::AnyRecord => matches!(v, Val::Map(_)),
+        TypeTest::Record(fields) => {
+            let Val::Map(pairs) = v else { return false };
+            // Closed: every present key must be a declared field.
+            if pairs.iter().any(|(vk, _)| {
+                fields
+                    .binary_search_by(|(fk, _, _)| fk.as_str().cmp(vk.as_ref()))
+                    .is_err()
+            }) {
+                return false;
+            }
+            fields.iter().all(|(fk, ft, field_not_null)| {
+                match pairs.binary_search_by(|(vk, _)| vk.as_ref().cmp(fk.as_str())) {
+                    Ok(i) => value_is_typed_ty(&pairs[i].1, ft, *field_not_null),
+                    Err(_) => !field_not_null, // absent OK unless the field is NOT NULL
+                }
+            })
+        }
     }
 }
 
@@ -1760,11 +1787,11 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
         }
         CExpr::IsTyped {
             expr,
-            category,
+            ty,
             not_null,
             negated,
         } => {
-            let m = value_is_typed(&eval(env, expr), category, *not_null);
+            let m = value_is_typed_ty(&eval(env, expr), ty, *not_null);
             Val::Bool(if *negated { !m } else { m })
         }
         CExpr::GraphPred {

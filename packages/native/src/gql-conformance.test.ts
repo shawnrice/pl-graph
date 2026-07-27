@@ -529,6 +529,24 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(ts).toContain('"g":false');
   });
 
+  test('IS TYPED RECORD {…} — the closed record type, byte-identical', () => {
+    const q =
+      `RETURN {a: 1, b: 'x'} IS TYPED RECORD {a :: INTEGER, b :: STRING} AS a, ` +
+      `{a: 1} IS TYPED RECORD {a :: INTEGER, b :: STRING} AS b, ` +
+      `{a: 1, b: 'x', c: 9} IS TYPED RECORD {a :: INTEGER, b :: STRING} AS c, ` +
+      `{a: 1.5} IS TYPED RECORD {a :: INTEGER} AS d, ` +
+      `{} IS TYPED RECORD {a :: INTEGER NOT NULL} AS e, ` +
+      `{geo: {lat: 1, lng: 2}} IS TYPED RECORD {geo :: RECORD {lat :: INTEGER, lng :: INTEGER}} AS f`;
+    const [ts, native] = both(q);
+
+    expect(ts).toBe(native);
+    expect(ts).toContain('"a":true');
+    expect(ts).toContain('"c":false'); // closed on extras
+    expect(ts).toContain('"d":false'); // 1.5 is not INTEGER
+    expect(ts).toContain('"e":false'); // NOT NULL field absent
+    expect(ts).toContain('"f":true'); // nested record match
+  });
+
   test('graph-element predicates + ! — byte-identical', () => {
     // IS DIRECTED / IS SOURCE|DESTINATION OF / ALL_DIFFERENT / SAME over a real edge.
     const [ts, native] = both(

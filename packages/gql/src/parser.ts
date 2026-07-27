@@ -66,6 +66,7 @@ import type {
   SortItem,
   Statement,
   TxControl,
+  TypeTest,
   WithClause,
   FilterClause,
   LetClause,
@@ -1153,45 +1154,7 @@ export const parse = (
       // reserved-but-not-structural, so it arrives as an identifier.
       if ((check('ident') || check('keyword')) && peek().value.toLowerCase() === 'typed') {
         advance();
-        // ISO `<record type> ::= [ANY] RECORD …`. The OPEN form (`ANY RECORD` /
-        // bare `RECORD`) tests "is a map". A bare `ANY` is the `any`-type test. The
-        // closed shape form (`RECORD {…}`) in a predicate is deferred (loud).
-        const isWord = (w: string): boolean =>
-          (check('ident') || check('keyword')) && peek().value.toLowerCase() === w;
-        const rejectClosed = (): void => {
-          if (check('lbrace')) {
-            throw new GqlSyntaxError(
-              'closed-record `IS TYPED RECORD {…}` is not yet supported; use ' +
-                '`IS TYPED ANY RECORD`, or test fields with per-field predicates',
-              peek().pos,
-            );
-          }
-        };
-        let category: string | null;
-
-        if (isWord('record')) {
-          advance();
-          rejectClosed();
-          category = 'record';
-        } else if (isWord('any')) {
-          advance();
-
-          if (isWord('record')) {
-            advance();
-            rejectClosed();
-            category = 'record';
-          } else {
-            category = 'any';
-          }
-        } else {
-          const typeName = readTypeName();
-          category = typeTestCategory(typeName);
-
-          if (category === null) {
-            throw new GqlSyntaxError(`unsupported type '${typeName}' in IS TYPED`, peek().pos);
-          }
-        }
-
+        const ty = parseValueTypeTest();
         let notNull = false;
 
         if (checkKeyword('not')) {
@@ -1200,7 +1163,7 @@ export const parse = (
           notNull = true;
         }
 
-        return { kind: 'isTyped', expr: e, category, notNull, negated };
+        return { kind: 'isTyped', expr: e, ty, notNull, negated };
       }
 
       // `<edge> IS [NOT] DIRECTED`.
@@ -1480,6 +1443,85 @@ export const parse = (
   // Read a type-name token, joining the two-word `LOCAL`/`ZONED` temporal forms
   // (`LOCAL DATETIME` → `local_datetime`). Shared by CAST and IS TYPED. Mirrors
   // the Rust `read_type_name`.
+  // Parse a `<value type>` for `IS TYPED`: `[ANY] RECORD [{…}]` (open/closed) or a
+  // scalar type name. Recursive — a record field is itself a `<value type>`.
+  const parseValueTypeTest = (): TypeTest => {
+    const isWord = (w: string): boolean =>
+      (check('ident') || check('keyword')) && peek().value.toLowerCase() === w;
+
+    if (isWord('record')) {
+      advance();
+
+      return parseRecordTypeBody();
+    }
+
+    if (isWord('any')) {
+      advance();
+
+      if (isWord('record')) {
+        advance();
+
+        return parseRecordTypeBody();
+      }
+
+      return { kind: 'scalar', category: 'any' };
+    }
+
+    const typeName = readTypeName();
+    const category = typeTestCategory(typeName);
+
+    if (category === null) {
+      throw new GqlSyntaxError(`unsupported type '${typeName}' in IS TYPED`, peek().pos);
+    }
+
+    return { kind: 'scalar', category };
+  };
+
+  // `RECORD` already consumed → an optional `{ field ::type [NOT NULL], … }`. No
+  // brace = the OPEN record (`ANY RECORD` / bare `RECORD`).
+  const parseRecordTypeBody = (): TypeTest => {
+    if (!check('lbrace')) {
+      return { kind: 'anyRecord' };
+    }
+
+    advance(); // {
+    const fields: Array<[string, TypeTest, boolean]> = [];
+
+    if (!check('rbrace')) {
+      do {
+        const name = bindName('a record field name');
+        expect('colon', "':' or '::' after a record field name");
+
+        if (check('colon')) {
+          advance(); // optional second colon (`::`)
+        }
+
+        const ty = parseValueTypeTest();
+        let notNull = false;
+
+        if (checkKeyword('not')) {
+          advance();
+          expectKeyword('null');
+          notNull = true;
+        }
+
+        // Sorted insert, duplicate last-wins (canonical, aligns with sorted maps).
+        const at = fields.findIndex(([k]) => k === name);
+
+        if (at >= 0) {
+          fields[at] = [name, ty, notNull];
+        } else {
+          fields.push([name, ty, notNull]);
+        }
+      } while (check('comma') && (advance(), true));
+    }
+
+    expect('rbrace', "'}' to close a record type");
+    fields.sort(([a], [b]) => (a < b ? -1 : Number(a > b)));
+
+    return { kind: 'record', fields };
+  };
+
   const readTypeName = (): string => {
     const typeTok = peek();
 
