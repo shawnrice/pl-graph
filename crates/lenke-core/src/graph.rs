@@ -3823,21 +3823,27 @@ fn value_contains_map(v: &Value) -> bool {
 /// serialization is a straight emit, and the sync-diff `JSON.stringify` byte-
 /// equality holds. Only maps/lists are rebuilt; a scalar is a plain clone, so the
 /// typed-column hot paths (which never reach this) pay nothing.
-fn canonical_value(v: &Value) -> Value {
+///
+/// Map field NAMES are **interned** through `strs`, so 50k `{city, tier, …}`
+/// records share ONE `Arc<str>` per distinct field instead of allocating a fresh
+/// key per record — the codec-decode win (each decoder allocates keys per map).
+fn canonical_value(v: &Value, strs: &mut Dict) -> Value {
     match v {
         Value::Map(pairs) => {
             let mut out: Vec<(Arc<str>, Value)> = Vec::with_capacity(pairs.len());
             for (k, val) in pairs {
-                let cv = canonical_value(val);
+                let id = strs.intern(k); // shared, deduped field name
+                let key = strs.arc(id);
+                let cv = canonical_value(val, strs);
                 match out.binary_search_by(|(ek, _)| ek.as_ref().cmp(k.as_ref())) {
                     // Duplicate field name → last write wins (JS-object / SQL-ish).
                     Ok(i) => out[i].1 = cv,
-                    Err(i) => out.insert(i, (k.clone(), cv)),
+                    Err(i) => out.insert(i, (key, cv)),
                 }
             }
             Value::Map(out)
         }
-        Value::List(items) => Value::List(items.iter().map(canonical_value).collect()),
+        Value::List(items) => Value::List(items.iter().map(|x| canonical_value(x, strs)).collect()),
         other => other.clone(),
     }
 }
@@ -3922,7 +3928,7 @@ fn col_set(col: &mut Column, idx: usize, v: &Value, strs: &mut Dict) -> bool {
         (Column::Mixed { data }, val) => {
             // Canonicalize on the way in so a stored map's keys are always sorted
             // (the boxed path only — scalars never reach here).
-            data[idx] = Some(canonical_value(val));
+            data[idx] = Some(canonical_value(val, strs));
             true
         }
         _ => false,
