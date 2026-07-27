@@ -2286,8 +2286,13 @@ const patternBoundVars = (p: PathPattern, into: Set<string>): void => {
   addNode(p.start);
 
   for (const seg of p.segments) {
+    // The inner source `(x)` and target `(y)` group variables of a subpath.
     if (seg.hopFrom !== undefined) {
-      addNode(seg.hopFrom); // the inner source `(x)` of a quantified subpath
+      addNode(seg.hopFrom);
+    }
+
+    if (seg.hopTo !== undefined) {
+      addNode(seg.hopTo);
     }
 
     if (seg.rel.variable !== undefined) {
@@ -3013,9 +3018,11 @@ type CRel = {
   direction: RelPattern['direction'];
   pred: CPredicate;
   quantifier?: RelPattern['quantifier'];
-  /** For a quantified parenthesized subpath `((x)-[e]->(y) WHERE …){n,m}`: the
-   *  hop's source `(x)` and target `(y)` variable names, bound per repetition so
-   *  the per-hop predicate can name them. Absent for a plain / abbreviated hop. */
+  /** `true` for a quantified parenthesized subpath `((x)-[e]->(y) …){n,m}`. The
+   *  hop's source `(x)` / edge `(e)` / target `(y)` are bound per repetition for the
+   *  predicate AND exposed to the outer query as GROUP-variable lists at each end. */
+  subpath?: boolean;
+  /** The subpath's inner source `(x)` and target `(y)` variable names. */
   hopFromVar?: string;
   hopToVar?: string;
 };
@@ -3248,12 +3255,13 @@ const compilePath = (pattern: PathPattern): CPath => {
 
   return {
     start: compileNode(pattern.start),
-    segments: pattern.segments.map(({ rel, node, hopFrom }) => {
+    segments: pattern.segments.map(({ rel, node, hopFrom, hopTo }) => {
       const crel = compileRel(rel);
-      // A quantified parenthesized subpath binds the hop's source `(x)` and target
-      // `(y)` per repetition for its per-hop predicate.
+      // A quantified parenthesized subpath: bind the inner source `(x)` and target
+      // `(y)` per hop (and expose them as group-variable lists); `node` is the
+      // separate outer endpoint.
       const withHop = hopFrom
-        ? { ...crel, hopFromVar: hopFrom.variable, hopToVar: node.variable }
+        ? { ...crel, subpath: true, hopFromVar: hopFrom.variable, hopToVar: hopTo?.variable }
         : crel;
 
       return { rel: withHop, node: compileNode(node) };
@@ -4020,6 +4028,32 @@ const shortestKWalk = function* (
 };
 
 /** Recursively extend a binding across the remaining segments of a pattern. */
+/** Bind a quantified subpath's GROUP variables to the trail's per-hop value lists:
+ *  `e` = the edges in hop order, `x` = each hop's source (`verts[..last]`), `y` =
+ *  each hop's target (`verts[1..]`). Mirrors native `bind_group_vars`. */
+const bindGroupVars = (
+  binding: Binding,
+  rel: CRel,
+  verts: readonly Vertex[],
+  edges: readonly Edge[],
+): Binding => {
+  const next = new Map(binding);
+
+  if (rel.variable !== undefined) {
+    next.set(rel.variable, [...edges]);
+  }
+
+  if (rel.hopFromVar !== undefined) {
+    next.set(rel.hopFromVar, verts.slice(0, -1));
+  }
+
+  if (rel.hopToVar !== undefined) {
+    next.set(rel.hopToVar, verts.slice(1));
+  }
+
+  return next;
+};
+
 const walkSegments = function* (
   graph: Graph,
   pattern: CPath,
@@ -4040,12 +4074,16 @@ const walkSegments = function* (
   // hops (one per trail → ISO per-path multiplicity), then continue from each.
   // `trailEnds` binds and filters each hop's edge for a per-hop predicate.
   if (rel.quantifier) {
-    for (const { end } of trailEnds(graph, from, rel, rel.quantifier, {
+    for (const { end, verts, edges } of trailEnds(graph, from, rel, rel.quantifier, {
       mode: pattern.mode ?? 'trail',
       binding,
       params,
+      // A quantified parenthesized subpath needs the whole trail so its GROUP
+      // variables (x/e/y) can be exposed as lists.
+      wantPath: rel.subpath ?? false,
     })) {
-      const matched = matchNode(binding, node, end, params, graph);
+      const withGroups = rel.subpath ? bindGroupVars(binding, rel, verts, edges) : binding;
+      const matched = matchNode(withGroups, node, end, params, graph);
 
       if (matched) {
         yield* walkSegments(graph, pattern, index + 1, end, matched, params);

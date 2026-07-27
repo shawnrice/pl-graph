@@ -629,10 +629,10 @@ export const parse = (
     check('ltilde') ||
     check('tilder');
 
-  // ISO quantified parenthesized subpath `( (x)-[e]->(y) [WHERE cond] ) {n,m}`
-  // (Phase 1: a single-edge repetition unit). The per-repetition `cond` may name
-  // the hop's source `x`, edge `e`, and target `y`; `y` is also the landing node.
-  // The opening `((` is at the cursor.
+  // ISO quantified parenthesized subpath `( (x)-[e]->(y) [WHERE cond] ) {n,m} (b)`
+  // (a single-edge repetition unit), optionally followed by an endpoint `(b)`.
+  // `x`/`e`/`y` are GROUP variables (per-hop scalars for `cond`, lists outside);
+  // `(b)` (or an anonymous node) is the singleton landing endpoint. `((` is at cursor.
   const parseQuantifiedSubpath = (): Segment => {
     const open = peek().pos;
     expect('lparen', "'(' to open a quantified subpath");
@@ -646,7 +646,7 @@ export const parse = (
     }
 
     const rel = parseRel();
-    const node = parseNode(); // inner (y) = the landing node
+    const hopTo = parseNode(); // inner (y)
 
     if (startsRelationship()) {
       throw new GqlSyntaxError(
@@ -655,9 +655,9 @@ export const parse = (
       );
     }
 
-    // Phase 1: inner nodes carry only a variable — put per-hop label/property tests
-    // in the subpath `WHERE`, so nothing is silently dropped.
-    for (const n of [hopFrom, node]) {
+    // Inner nodes carry only a variable — put per-hop label/property tests in the
+    // subpath `WHERE`, so nothing is silently dropped.
+    for (const n of [hopFrom, hopTo]) {
       if (n.label !== undefined || (n.properties?.length ?? 0) > 0 || n.where !== undefined) {
         throw new GqlSyntaxError(
           "a label or property on a quantified-subpath node isn't supported yet — " +
@@ -682,7 +682,10 @@ export const parse = (
       throw new GqlSyntaxError('a parenthesized subpath must be quantified (`( … ){n,m}`)', open);
     }
 
-    return { rel: { ...rel, where, quantifier }, node, hopFrom };
+    // Optional following endpoint `(b)`; else an anonymous synthetic endpoint.
+    const node = check('lparen') ? parseNode() : {};
+
+    return { rel: { ...rel, where, quantifier }, node, hopFrom, hopTo };
   };
 
   // Variable-length quantifier following an edge: `*`, `+`, `{n}`, `{n,m}`,

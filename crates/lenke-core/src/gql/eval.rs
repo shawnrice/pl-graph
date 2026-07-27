@@ -3159,6 +3159,46 @@ fn expand_filtered(
         .collect()
 }
 
+/// Bind a quantified subpath's GROUP variables to the trail's per-hop value lists:
+/// `e` = the edges in hop order, `x` = each hop's source (`verts[..last]`), `y` =
+/// each hop's target (`verts[1..]`). Returns the prior slot values so the caller
+/// can restore them after the continuation (a sibling trail must not see them).
+fn bind_group_vars(
+    binding: &mut Binding,
+    rel: &CRel,
+    verts: &[u32],
+    edges: &[u32],
+) -> Vec<(usize, Option<Val>)> {
+    let n = verts.len();
+    let lists: [(Option<usize>, Vec<Val>); 3] = [
+        (rel.var_slot, edges.iter().map(|&e| Val::Edge(e)).collect()),
+        (
+            rel.hop_from_slot,
+            verts[..n.saturating_sub(1)]
+                .iter()
+                .map(|&v| Val::Node(v))
+                .collect(),
+        ),
+        (
+            rel.hop_to_slot,
+            verts
+                .get(1..)
+                .unwrap_or(&[])
+                .iter()
+                .map(|&v| Val::Node(v))
+                .collect(),
+        ),
+    ];
+    let mut restores = Vec::new();
+    for (slot, list) in lists {
+        if let Some(s) = slot {
+            restores.push((s, binding.get(s).cloned()));
+            binding.set(s, Val::List(list));
+        }
+    }
+    restores
+}
+
 fn reachable_each(
     graph: &Graph,
     ctx: &Ctx,
@@ -3387,12 +3427,26 @@ fn walk_segments(
             WalkSpec {
                 q,
                 mode: pattern.mode,
-                want_path: false,
+                // A quantified parenthesized subpath needs the whole trail so its
+                // GROUP variables (x/e/y) can be exposed as lists.
+                want_path: rel.subpath,
             },
-            &mut |b, end, _, _| {
-                match_node_then(graph, ctx, b, node, end, &mut |b2| {
+            &mut |b, end, verts, edges| {
+                let restores = if rel.subpath {
+                    bind_group_vars(b, rel, verts, edges)
+                } else {
+                    Vec::new()
+                };
+                let keep = match_node_then(graph, ctx, b, node, end, &mut |b2| {
                     walk_segments(graph, ctx, pattern, index + 1, end, b2, emit)
-                })
+                });
+                for (s, prev) in restores.into_iter().rev() {
+                    match prev {
+                        Some(v) => b.set(s, v),
+                        None => b.unset(s),
+                    }
+                }
+                keep
             },
         );
     }
@@ -4459,7 +4513,9 @@ fn match_path<F: FnMut(&mut Binding) -> bool>(
     let CSegment { rel, node } = &path.segments[idx];
     if let Some(q) = rel.quantifier {
         // Stream endpoints, stopping as soon as a consumer is satisfied (see the twin
-        // in `walk_segments`) — `match_node_continue` returns false to propagate.
+        // in `walk_segments`) — `match_node_continue` returns false to propagate. A
+        // quantified parenthesized subpath exposes its GROUP variables (x/e/y) as
+        // per-hop value lists at each trail end (see `bind_group_vars`).
         return reachable_each(
             graph,
             ctx,
@@ -4469,9 +4525,23 @@ fn match_path<F: FnMut(&mut Binding) -> bool>(
             WalkSpec {
                 q,
                 mode: path.mode,
-                want_path: false,
+                want_path: rel.subpath,
             },
-            &mut |b, end, _, _| match_node_continue(graph, ctx, b, node, end, path, idx + 1, emit),
+            &mut |b, end, verts, edges| {
+                let restores = if rel.subpath {
+                    bind_group_vars(b, rel, verts, edges)
+                } else {
+                    Vec::new()
+                };
+                let keep = match_node_continue(graph, ctx, b, node, end, path, idx + 1, emit);
+                for (s, prev) in restores.into_iter().rev() {
+                    match prev {
+                        Some(v) => b.set(s, v),
+                        None => b.unset(s),
+                    }
+                }
+                keep
+            },
         );
     }
     for (eidx, nbr) in expand(graph, ctx, from, rel.direction, rel.label.as_ref()) {

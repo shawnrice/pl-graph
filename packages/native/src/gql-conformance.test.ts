@@ -1109,9 +1109,17 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     const ts = tsDeserialize(BAL_NDJSON, 'ndjson', new Graph());
 
     for (const q of [
-      "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt <= x.bal){1,3} RETURN y.id AS id ORDER BY y.id",
-      "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE y.bal >= 100){1,3} RETURN y.id AS id ORDER BY y.id",
-      "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt >= 1){1,3} RETURN y.id AS id ORDER BY y.id",
+      // Per-hop source/target/cross-element predicates; `(t)` is the endpoint.
+      "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt <= x.bal){1,3} (t) RETURN t.id AS id ORDER BY t.id",
+      "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE y.bal >= 100){1,3} (t) RETURN t.id AS id ORDER BY t.id",
+      "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt >= 1){1,3} (t) RETURN t.id AS id ORDER BY t.id",
+      // GROUP variables: x/e/y exposed as lists, endpoint + list-index + size.
+      "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){2} (t) RETURN t.id AS tid, size(e) AS ne, size(x) AS nx, size(y) AS ny, x[0].id AS x0, y[1].id AS y1, e[0].amt AS e0",
+      // Dual context: per-hop WHERE reads scalars, size(e) reads the list.
+      "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt >= 15){1,3} (t) RETURN t.id AS tid, size(e) AS ne ORDER BY t.id",
+      // Zero-hop inclusion + anonymous endpoint.
+      "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){0,1} (t) RETURN t.id AS tid, size(e) AS ne ORDER BY t.id, ne",
+      "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){2} RETURN size(e) AS ne",
     ]) {
       expect(JSON.stringify(nat.query(q)), q).toBe(JSON.stringify(tsQuery(ts, q)));
     }

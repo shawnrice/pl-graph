@@ -264,17 +264,20 @@ export type PathSelector =
  */
 export type PathMode = 'walk' | 'trail' | 'simple' | 'acyclic';
 
-/** One hop: traverse `rel`, land on `node`. */
+/**
+ * One hop: traverse `rel`, land on `node`.
+ *
+ * For an ISO quantified PARENTHESIZED subpath `((x)-[e]->(y) WHERE …){n,m} (b)`,
+ * `hopFrom`/`hopTo` are the inner source `(x)` and target `(y)` and `node` is the
+ * (possibly anonymous) outer endpoint `(b)`. The inner variables are GROUP
+ * variables: bound per-hop as scalars for the predicate, then exposed to the outer
+ * query as LISTS of every hop's value. Both absent for a plain / abbreviated hop.
+ */
 export type Segment = {
   rel: RelPattern;
   node: NodePattern;
-  /**
-   * For an ISO quantified PARENTHESIZED subpath `((x)-[e]->(y) WHERE …){n,m}`:
-   * the inner SOURCE node `(x)` of each repetition, bound PER-HOP so the
-   * per-repetition predicate (`rel.where`) can reference the hop's source (`node`
-   * is the per-hop TARGET `y`). Absent for a plain hop / abbreviated `-[e]->{n,m}`.
-   */
   hopFrom?: NodePattern;
+  hopTo?: NodePattern;
 };
 
 /**

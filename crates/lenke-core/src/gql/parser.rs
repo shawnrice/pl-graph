@@ -611,9 +611,10 @@ impl Parser {
     }
 
     /// ISO quantified parenthesized subpath `( (x)-[e]->(y) [WHERE cond] ) {n,m}`
-    /// (Phase 1: a single-edge repetition unit). The per-repetition `cond` may
-    /// reference the hop's source `x`, edge `e`, and target `y`; `y` is also the
-    /// landing/endpoint node. The opening `((` is at the cursor.
+    /// (a single-edge repetition unit), optionally followed by an endpoint node
+    /// `(b)`. `x`/`e`/`y` are GROUP variables — bound per hop for `cond`, exposed
+    /// to the outer query as lists; `(b)` (or an anonymous synthetic node) is the
+    /// singleton landing endpoint. The opening `((` is at the cursor.
     fn parse_quantified_subpath(&mut self) -> R<Segment> {
         let open = self.peek().pos;
         self.expect(Tt::LParen, "'(' to open a quantified subpath")?;
@@ -625,17 +626,17 @@ impl Parser {
             );
         }
         let mut rel = self.parse_rel()?;
-        let node = self.parse_node()?; // inner (y) = the landing node
+        let hop_to = self.parse_node()?; // inner (y)
         if self.starts_relationship() {
             return err(
                 "a quantified subpath with more than one relationship is not yet supported",
                 self.peek().pos,
             );
         }
-        // Phase 1: the inner nodes carry only a variable — put any per-hop label /
-        // property test in the subpath `WHERE` (`((x)-[e]->(y) WHERE x:Account AND
-        // e.amt > 0){1,3}`), so nothing is silently dropped.
-        for n in [&hop_from, &node] {
+        // The inner nodes carry only a variable — put any per-hop label / property
+        // test in the subpath `WHERE` (`((x)-[e]->(y) WHERE x:Account AND e.amt >
+        // 0){1,3}`), so nothing is silently dropped.
+        for n in [&hop_from, &hop_to] {
             if n.label.is_some() || !n.props.is_empty() || n.where_.is_some() {
                 return err(
                     "a label or property on a quantified-subpath node isn't supported yet — \
@@ -662,10 +663,18 @@ impl Parser {
             );
         };
         rel.quantifier = Some(q);
+        // An optional following endpoint `(b)`; else a synthetic anonymous endpoint
+        // (the walk still lands on the last target, just unnamed).
+        let node = if self.check(Tt::LParen) {
+            self.parse_node()?
+        } else {
+            NodePattern::default()
+        };
         Ok(Segment {
             rel,
             node,
             hop_from: Some(hop_from),
+            hop_to: Some(hop_to),
         })
     }
 
@@ -789,6 +798,7 @@ impl Parser {
                     rel,
                     node,
                     hop_from: None,
+                    hop_to: None,
                 });
             }
 

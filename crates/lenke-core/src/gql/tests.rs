@@ -5328,9 +5328,10 @@ fn balanced_chain() -> Graph {
     ])
 }
 
-/// ISO quantified parenthesized subpath `((x)-[e]->(y) WHERE …){n,m}` — Phase 1:
-/// the per-repetition predicate can name the hop's SOURCE `(x)`, edge `(e)`, and
-/// TARGET `(y)`, which the abbreviated `-[e]->{n,m}` form cannot.
+/// ISO quantified parenthesized subpath `((x)-[e]->(y) WHERE …){n,m}(t)` — the
+/// per-repetition predicate can name the hop's SOURCE `(x)`, edge `(e)`, and
+/// TARGET `(y)` (which the abbreviated `-[e]->{n,m}` form cannot); `(t)` is the
+/// endpoint (the inner `y` is a group variable, so the endpoint is a separate node).
 #[test]
 fn quantified_subpath_per_hop_node_and_cross_element_predicates() {
     let mut g = balanced_chain();
@@ -5339,7 +5340,7 @@ fn quantified_subpath_per_hop_node_and_cross_element_predicates() {
     assert_eq!(
         sorted_col0(
             &mut g,
-            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt <= x.bal){1,3} RETURN y.id AS id",
+            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt <= x.bal){1,3} (t) RETURN t.id AS id",
         ),
         vec![s("b"), s("c")],
     );
@@ -5348,7 +5349,7 @@ fn quantified_subpath_per_hop_node_and_cross_element_predicates() {
     assert_eq!(
         sorted_col0(
             &mut g,
-            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE y.bal >= 100){1,3} RETURN y.id AS id",
+            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE y.bal >= 100){1,3} (t) RETURN t.id AS id",
         ),
         vec![s("b")],
     );
@@ -5356,9 +5357,64 @@ fn quantified_subpath_per_hop_node_and_cross_element_predicates() {
     assert_eq!(
         sorted_col0(
             &mut g,
-            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt >= 1){1,3} RETURN y.id AS id",
+            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt >= 1){1,3} (t) RETURN t.id AS id",
         ),
         vec![s("b"), s("c"), s("d")],
+    );
+}
+
+/// Phase 2 — GROUP variables: `x`/`e`/`y` bound inside the quantifier are exposed
+/// to the outer query as LISTS of every hop's value (edges, source nodes, target
+/// nodes), while the endpoint `(t)` is a singleton and the per-hop `WHERE` still
+/// sees each as a SCALAR.
+#[test]
+fn quantified_subpath_group_variables() {
+    let mut g = balanced_chain();
+    // Exactly 2 hops from a: a→b→c. Endpoint t=c; e=[e1,e2]; x=[a,b]; y=[b,c].
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){2} (t) \
+             RETURN t.id AS tid, size(e) AS ne, size(x) AS nx, size(y) AS ny, \
+             x[0].id AS x0, y[1].id AS y1, e[0].amt AS e0",
+        ),
+        vec![vec![
+            s("c"),
+            n(2.0),
+            n(2.0),
+            n(2.0),
+            s("a"),
+            s("c"),
+            n(30.0)
+        ]],
+    );
+    // The DUAL context: the per-hop `WHERE` reads `e`/`x` as SCALARS, while `size(e)`
+    // reads the group-variable LIST. `e.amt >= 15` admits a→b (30) and b→c (20) but
+    // not c→d (10) → endpoints {b (1 hop), c (2 hops)} with their edge-list sizes.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt >= 15){1,3} (t) \
+             RETURN t.id AS tid, size(e) AS ne ORDER BY t.id",
+        ),
+        vec![vec![s("b"), n(1.0)], vec![s("c"), n(2.0)]],
+    );
+    // A `{0,1}` walk includes the zero-hop match: endpoint = the seed, empty groups.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){0,1} (t) \
+             RETURN t.id AS tid, size(e) AS ne ORDER BY t.id, ne",
+        ),
+        vec![vec![s("a"), n(0.0)], vec![s("b"), n(1.0)]],
+    );
+    // The endpoint may be anonymous (no `(t)`): the group vars still bind.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){2} RETURN size(e) AS ne",
+        ),
+        vec![vec![n(2.0)]],
     );
 }
 

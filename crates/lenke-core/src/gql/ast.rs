@@ -291,17 +291,20 @@ pub struct PathPattern {
 }
 
 /// One hop: traverse `rel`, land on `node`.
+///
+/// For an ISO quantified PARENTHESIZED subpath `((x)-[e]->(y) WHERE …){n,m} (b)`,
+/// `hop_from`/`hop_to` are the inner source `(x)` and target `(y)` and `node` is the
+/// (possibly anonymous) outer endpoint `(b)`. The inner variables are **group
+/// variables**: bound PER-HOP as scalars for the per-repetition predicate
+/// (`rel.where_`), then exposed to the outer query as LISTS of every hop's value.
+/// Both `hop_from`/`hop_to` are `None` for a plain hop / the abbreviated
+/// `-[e]->{n,m}` form.
 #[derive(Debug, Clone)]
 pub struct Segment {
     pub rel: RelPattern,
     pub node: NodePattern,
-    /// For an ISO quantified PARENTHESIZED subpath `((x)-[e]->(y) WHERE …){n,m}`:
-    /// the inner FROM-node `(x)` of each repetition, bound PER-HOP so the
-    /// per-repetition predicate (`rel.where_`) can reference the hop's source node
-    /// (`node` is the per-hop TARGET `y`). `None` for a plain hop or the abbreviated
-    /// `-[e]->{n,m}` form (where the source is just the previous node, unnamed).
-    /// Group-variable exposure of the inner vars is a later phase.
     pub hop_from: Option<NodePattern>,
+    pub hop_to: Option<NodePattern>,
 }
 
 /// `(variable:LabelExpr {props} WHERE pred)` — all parts optional.

@@ -622,10 +622,13 @@ pub struct CRel {
     pub props: Vec<CPropConstraint>,
     pub where_: Option<CExpr>,
     pub quantifier: Option<Quantifier>,
-    /// For an ISO quantified parenthesized subpath `((x)-[e]->(y) WHERE …){n,m}`:
-    /// the per-hop SOURCE `(x)` and TARGET `(y)` node slots, bound to each hop's
-    /// endpoints so the per-repetition predicate (`where_`) can name them. Both
-    /// `None` for a plain hop / the abbreviated `-[e]->{n,m}` form.
+    /// `true` for an ISO quantified parenthesized subpath `((x)-[e]->(y) …){n,m}`.
+    /// The walk then binds `(x)`/`(e)`/`(y)` per hop for the predicate AND, at each
+    /// trail end, exposes them to the outer query as GROUP variables (lists of every
+    /// hop's value) via [`hop_from_slot`]/`var_slot`/[`hop_to_slot`].
+    pub subpath: bool,
+    /// The per-hop SOURCE `(x)` and TARGET `(y)` node slots of a subpath (`None` if
+    /// anonymous). For a plain / abbreviated hop both are `None`.
     pub hop_from_slot: Option<usize>,
     pub hop_to_slot: Option<usize>,
 }
@@ -1274,9 +1277,10 @@ impl Lowerer {
                 self.add_var(v);
             }
             for seg in &p.segments {
-                // The inner source `(x)` of a quantified parenthesized subpath.
-                if let Some(from) = &seg.hop_from {
-                    if let Some(v) = &from.variable {
+                // The inner source `(x)` and target `(y)` group variables of a
+                // quantified parenthesized subpath.
+                for inner in [&seg.hop_from, &seg.hop_to].into_iter().flatten() {
+                    if let Some(v) = &inner.variable {
                         self.add_var(v);
                     }
                 }
@@ -1578,6 +1582,7 @@ impl Lowerer {
             props: r.props.iter().map(|p| self.prop(p)).collect(),
             where_: r.where_.as_ref().map(|w| self.expr(w)),
             quantifier: r.quantifier,
+            subpath: false,
             hop_from_slot: None,
             hop_to_slot: None,
         }
@@ -1586,11 +1591,17 @@ impl Lowerer {
     fn segment(&mut self, s: &Segment) -> CSegment {
         let node = self.node(&s.node);
         let mut rel = self.rel(&s.rel);
-        // A quantified parenthesized subpath binds the hop's source `(x)` and
-        // target `(y)` per repetition for its per-hop predicate.
+        // A quantified parenthesized subpath: bind the hop's inner source `(x)` and
+        // target `(y)` per repetition (and expose them as group-variable lists);
+        // `node` is the separate outer endpoint `(b)`.
         if let Some(from) = &s.hop_from {
+            rel.subpath = true;
             rel.hop_from_slot = from.variable.as_ref().map(|v| self.slot_of(v));
-            rel.hop_to_slot = node.var_slot;
+            rel.hop_to_slot = s
+                .hop_to
+                .as_ref()
+                .and_then(|to| to.variable.as_ref())
+                .map(|v| self.slot_of(v));
         }
         CSegment { rel, node }
     }
