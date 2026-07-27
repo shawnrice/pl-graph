@@ -4,6 +4,7 @@ import { ErrorCode, LenkeError } from '@lenke/errors';
 import type { Clock } from '../temporal.js';
 import { Edge } from './Edge.js';
 import type { GraphEvent, GraphEvents, GraphEventType } from './GraphEvents.js';
+import { isRecord } from './LenkeRecord.js';
 import { PropertyIndex, type RangeBound } from './PropertyIndex.js';
 import { validateElementNames, validateLabel } from './validate.js';
 import { Vertex } from './Vertex.js';
@@ -62,6 +63,180 @@ export type ScalarTypeName =
   | 'datetime'
   | 'duration'
   | 'list';
+
+/** A declared property type for a constraint: a scalar, or a closed ISO
+ *  `RECORD { field :: type, … }` (an exact field set, each field a `TypeSpec`,
+ *  so records nest). Mirrors the native `TypeSpec`. */
+export type TypeSpec =
+  | { kind: 'scalar'; type: ScalarTypeName }
+  | { kind: 'record'; fields: ReadonlyArray<readonly [string, TypeSpec]> };
+
+const SCALARS = new Set<ScalarTypeName>([
+  'string',
+  'number',
+  'boolean',
+  'date',
+  'datetime',
+  'duration',
+  'list',
+]);
+
+/** Lexicographic compare of two field-name strings (the canonical key sort). */
+const cmpField = (a: string, b: string): number => {
+  if (a < b) {
+    return -1;
+  }
+
+  return a > b ? 1 : 0;
+};
+
+/** Parse a constraint type name: a scalar, or `record { field :: type, … }`
+ *  (`:`/`::`, whitespace-tolerant, nesting allowed). `null` if malformed.
+ *  Mirrors the native `TypeSpec::parse`. */
+export const parseTypeSpec = (input: string): TypeSpec | null => {
+  let i = 0;
+  const s = input;
+  const ws = (): void => {
+    while (i < s.length && /\s/.test(s[i])) {
+      i++;
+    }
+  };
+  const ident = (): string | null => {
+    ws();
+    const start = i;
+
+    while (i < s.length && /[A-Za-z0-9_]/.test(s[i])) {
+      i++;
+    }
+
+    return i > start ? s.slice(start, i) : null;
+  };
+  const eat = (c: string): boolean => {
+    ws();
+
+    if (i < s.length && s[i] === c) {
+      i++;
+
+      return true;
+    }
+
+    return false;
+  };
+  const parseType = (): TypeSpec | null => {
+    const word = ident();
+
+    if (word === null) {
+      return null;
+    }
+
+    if (word.toLowerCase() === 'record') {
+      if (!eat('{')) {
+        return null;
+      }
+
+      const fields: Array<[string, TypeSpec]> = [];
+      ws();
+
+      if (!eat('}')) {
+        for (;;) {
+          const name = ident();
+
+          if (name === null || !eat(':')) {
+            return null;
+          }
+
+          eat(':'); // optional second colon
+          const ty = parseType();
+
+          if (ty === null) {
+            return null;
+          }
+
+          // Duplicate field → last wins; keep canonical sorted order.
+          const at = fields.findIndex(([k]) => k === name);
+
+          if (at >= 0) {
+            fields[at] = [name, ty];
+          } else {
+            fields.push([name, ty]);
+          }
+
+          if (eat(',')) {
+            continue;
+          }
+
+          if (eat('}')) {
+            break;
+          }
+
+          return null;
+        }
+      }
+
+      fields.sort((x, y) => cmpField(x[0], y[0]));
+
+      return { kind: 'record', fields };
+    }
+
+    return SCALARS.has(word as ScalarTypeName)
+      ? { kind: 'scalar', type: word as ScalarTypeName }
+      : null;
+  };
+
+  const t = parseType();
+  ws();
+
+  return t !== null && i === s.length ? t : null;
+};
+
+/** The canonical type name for a `TypeSpec` (round-trips through `parseTypeSpec`);
+ *  used by the schema dump. */
+export const typeSpecName = (spec: TypeSpec): string =>
+  spec.kind === 'scalar'
+    ? spec.type
+    : `record{${spec.fields.map(([k, t]) => `${k}::${typeSpecName(t)}`).join(',')}}`;
+
+/** Does a value satisfy a `TypeSpec`? A null is exempt (REQUIRED is separate); a
+ *  scalar constraint exempts a non-scalar (a map — the record path governs those);
+ *  a record must match the closed shape exactly. Mirrors native `value_matches`. */
+export const valueMatches = (
+  v: unknown,
+  spec: TypeSpec,
+  scalarTypeOf: (x: unknown) => ScalarTypeName | null,
+): boolean => {
+  if (v === null || v === undefined) {
+    return true;
+  }
+
+  if (spec.kind === 'scalar') {
+    const got = scalarTypeOf(v);
+
+    return got === null || got === spec.type;
+  }
+
+  // Accept the value in any record-like form — the write path checks it BEFORE
+  // canonicalizing to a `LenkeRecord`, so a bare `Map` or plain object must match
+  // too. Sort entries to align with the (sorted) declared fields.
+  let raw: Array<[string, unknown]>;
+
+  if (isRecord(v) || v instanceof Map) {
+    raw = [...(v as Map<string, unknown>)];
+  } else if (typeof v === 'object' && v !== null && !Array.isArray(v)) {
+    raw = Object.entries(v);
+  } else {
+    return false;
+  }
+
+  const entries = raw.sort((x, y) => cmpField(x[0], y[0]));
+
+  return (
+    entries.length === spec.fields.length &&
+    entries.every(
+      ([k, val], idx) =>
+        k === spec.fields[idx][0] && valueMatches(val, spec.fields[idx][1], scalarTypeOf),
+    )
+  );
+};
 
 /**
  * A declared CARDINALITY constraint (R-CONSTRAINTS): every vertex carrying
@@ -129,17 +304,6 @@ type InvariantEntry = { src: string; fn: InvariantFn };
  * commit-time dispatch instead of re-deriving from a possibly-evicted element.
  */
 const TX_TOKENS = Symbol('lenke.txTokens');
-
-/** The set of accepted {@link ScalarTypeName}s, for runtime validation at the constraint boundary. */
-const SCALAR_TYPE_NAMES: ReadonlySet<ScalarTypeName> = new Set([
-  'string',
-  'number',
-  'boolean',
-  'date',
-  'datetime',
-  'duration',
-  'list',
-]);
 
 /**
  * A Property-Label graph.
@@ -559,6 +723,16 @@ export class Graph {
     copySetMap(this.edgeUniqueConstraints, next.edgeUniqueConstraints);
     copySetMap(this.edgeRequiredConstraints, next.edgeRequiredConstraints);
     copyTypeMap(this.edgeTypeConstraints, next.edgeTypeConstraints);
+
+    // Record-typed constraints: `TypeSpec` values are immutable, so a shallow
+    // inner-map copy is a full copy.
+    for (const [k, v] of this.vertexRecordConstraints) {
+      next.vertexRecordConstraints.set(k, new Map(v));
+    }
+
+    for (const [k, v] of this.edgeRecordConstraints) {
+      next.edgeRecordConstraints.set(k, new Map(v));
+    }
 
     for (const [k, v] of this.vertexCardinalityConstraints) {
       next.vertexCardinalityConstraints.set(k, { ...v });
@@ -1494,9 +1668,12 @@ export class Graph {
 
   private readonly vertexTypeConstraints = new Map<string, Map<string, ScalarTypeName>>();
 
-  /** The scalar type of a stored value, or `null` for null/absent (type-exempt). */
+  private readonly vertexRecordConstraints = new Map<string, Map<string, TypeSpec>>();
+
+  /** The scalar type of a stored value, or `null` for null/absent/record
+   *  (type-exempt from a scalar constraint — the record path governs maps). */
   private valueType = (v: unknown): ScalarTypeName | null => {
-    if (v === undefined || v === null) {
+    if (v === undefined || v === null || isRecord(v)) {
       return null;
     }
 
@@ -1527,44 +1704,58 @@ export class Graph {
    * replaces). Throws {@link ErrorCode.ConstraintViolation} if any existing
    * vertex with `label` holds a present, non-null `key` of a different type.
    */
-  public createTypeConstraint = (label: string, key: string, type: ScalarTypeName): void => {
-    if (!SCALAR_TYPE_NAMES.has(type)) {
+  public createTypeConstraint = (label: string, key: string, type: string): void => {
+    const spec = parseTypeSpec(type);
+
+    if (spec === null) {
       throw new LenkeError(
-        `unknown scalar type '${type}' for the type constraint on (${label}, ${key}); expected one of ${[...SCALAR_TYPE_NAMES].join(', ')}`,
+        `unknown or malformed type '${type}' for the type constraint on (${label}, ${key})`,
         { code: ErrorCode.InvalidValue },
       );
     }
 
     for (const vertex of this.getVerticesByLabel(label)) {
-      const got = this.valueType(vertex.properties[key]);
-
-      if (got !== null && got !== type) {
+      if (!valueMatches(vertex.properties[key], spec, this.valueType)) {
         throw new LenkeError(
-          `existing data already violates the type constraint being declared on (${label}, ${key}): found ${got}, expected ${type}`,
+          `existing data already violates the type constraint being declared on (${label}, ${key})`,
           { code: ErrorCode.ConstraintViolation },
         );
       }
     }
 
-    let keys = this.vertexTypeConstraints.get(label);
+    // Scalar → the existing map; a record shape → the parallel record map.
+    if (spec.kind === 'scalar') {
+      let keys = this.vertexTypeConstraints.get(label);
 
-    if (!keys) {
-      keys = new Map();
-      this.vertexTypeConstraints.set(label, keys);
+      if (!keys) {
+        keys = new Map();
+        this.vertexTypeConstraints.set(label, keys);
+      }
+
+      keys.set(key, spec.type);
+    } else {
+      let keys = this.vertexRecordConstraints.get(label);
+
+      if (!keys) {
+        keys = new Map();
+        this.vertexRecordConstraints.set(label, keys);
+      }
+
+      keys.set(key, spec);
     }
-
-    keys.set(key, type);
   };
 
-  /** Drop a type constraint. Idempotent. */
+  /** Drop a type constraint (scalar or record). Idempotent. */
   public dropTypeConstraint = (label: string, key: string): void => {
-    const keys = this.vertexTypeConstraints.get(label);
+    for (const map of [this.vertexTypeConstraints, this.vertexRecordConstraints]) {
+      const keys = map.get(label);
 
-    if (keys) {
-      keys.delete(key);
+      if (keys) {
+        keys.delete(key);
 
-      if (keys.size === 0) {
-        this.vertexTypeConstraints.delete(label);
+        if (keys.size === 0) {
+          map.delete(label);
+        }
       }
     }
   };
@@ -1589,22 +1780,30 @@ export class Graph {
     labels: Iterable<string>,
     properties: Readonly<Record<string, unknown>>,
   ): { label: string; key: string; expected: ScalarTypeName; got: ScalarTypeName } | undefined => {
-    if (this.vertexTypeConstraints.size === 0) {
+    if (this.vertexTypeConstraints.size === 0 && this.vertexRecordConstraints.size === 0) {
       return undefined;
     }
 
     for (const label of labels) {
       const cs = this.vertexTypeConstraints.get(label);
 
-      if (!cs) {
-        continue;
+      if (cs) {
+        for (const [key, type] of cs) {
+          const got = this.valueType(properties[key]);
+
+          if (got !== null && got !== type) {
+            return { label, key, expected: type, got };
+          }
+        }
       }
 
-      for (const [key, type] of cs) {
-        const got = this.valueType(properties[key]);
+      const rs = this.vertexRecordConstraints.get(label);
 
-        if (got !== null && got !== type) {
-          return { label, key, expected: type, got };
+      if (rs) {
+        for (const [key, spec] of rs) {
+          if (key in properties && !valueMatches(properties[key], spec, this.valueType)) {
+            return { label, key, expected: 'string', got: 'string' }; // shape mismatch
+          }
         }
       }
     }
@@ -1619,10 +1818,26 @@ export class Graph {
       return;
     }
 
-    if (this.vertexTypeConstraints.size === 0) {
+    if (this.vertexTypeConstraints.size === 0 && this.vertexRecordConstraints.size === 0) {
       return;
     }
 
+    // Record constraints: the value must match the declared shape (a null is
+    // exempt via `valueMatches`).
+    for (const label of vertex.labels) {
+      const spec = this.vertexRecordConstraints.get(label)?.get(key);
+
+      if (spec && !valueMatches(value, spec, this.valueType)) {
+        throw new LenkeError(
+          `property '${key}' must match the declared record type on '${label}'`,
+          {
+            code: ErrorCode.ConstraintViolation,
+          },
+        );
+      }
+    }
+
+    // Scalar constraints: a non-scalar (null/record) has no scalar type → exempt.
     const got = this.valueType(value);
 
     if (got === null) {
@@ -1755,6 +1970,7 @@ export class Graph {
   private readonly edgeUniqueConstraints = new Map<string, Set<string>>();
   private readonly edgeRequiredConstraints = new Map<string, Set<string>>();
   private readonly edgeTypeConstraints = new Map<string, Map<string, ScalarTypeName>>();
+  private readonly edgeRecordConstraints = new Map<string, Map<string, TypeSpec>>();
 
   /**
    * Inside a transaction (or a rollback replay) the per-write edge-constraint
@@ -2056,44 +2272,57 @@ export class Graph {
    * or {@link ErrorCode.ConstraintViolation} if any existing edge of `edgeType`
    * holds a present, non-null `key` of a different type.
    */
-  public createEdgeTypeConstraint = (edgeType: string, key: string, type: ScalarTypeName): void => {
-    if (!SCALAR_TYPE_NAMES.has(type)) {
+  public createEdgeTypeConstraint = (edgeType: string, key: string, type: string): void => {
+    const spec = parseTypeSpec(type);
+
+    if (spec === null) {
       throw new LenkeError(
-        `unknown scalar type '${type}' for the edge type constraint on (${edgeType}, ${key}); expected one of ${[...SCALAR_TYPE_NAMES].join(', ')}`,
+        `unknown or malformed type '${type}' for the edge type constraint on (${edgeType}, ${key})`,
         { code: ErrorCode.InvalidValue },
       );
     }
 
     for (const edge of this.getEdgesByLabel(edgeType)) {
-      const got = this.valueType(edge.properties[key]);
-
-      if (got !== null && got !== type) {
+      if (!valueMatches(edge.properties[key], spec, this.valueType)) {
         throw new LenkeError(
-          `existing data already violates the edge type constraint being declared on (${edgeType}, ${key}): found ${got}, expected ${type}`,
+          `existing data already violates the edge type constraint being declared on (${edgeType}, ${key})`,
           { code: ErrorCode.ConstraintViolation },
         );
       }
     }
 
-    let keys = this.edgeTypeConstraints.get(edgeType);
+    if (spec.kind === 'scalar') {
+      let keys = this.edgeTypeConstraints.get(edgeType);
 
-    if (!keys) {
-      keys = new Map();
-      this.edgeTypeConstraints.set(edgeType, keys);
+      if (!keys) {
+        keys = new Map();
+        this.edgeTypeConstraints.set(edgeType, keys);
+      }
+
+      keys.set(key, spec.type);
+    } else {
+      let keys = this.edgeRecordConstraints.get(edgeType);
+
+      if (!keys) {
+        keys = new Map();
+        this.edgeRecordConstraints.set(edgeType, keys);
+      }
+
+      keys.set(key, spec);
     }
-
-    keys.set(key, type);
   };
 
-  /** Drop an edge type constraint. Idempotent. */
+  /** Drop an edge type constraint (scalar or record). Idempotent. */
   public dropEdgeTypeConstraint = (edgeType: string, key: string): void => {
-    const keys = this.edgeTypeConstraints.get(edgeType);
+    for (const map of [this.edgeTypeConstraints, this.edgeRecordConstraints]) {
+      const keys = map.get(edgeType);
 
-    if (keys) {
-      keys.delete(key);
+      if (keys) {
+        keys.delete(key);
 
-      if (keys.size === 0) {
-        this.edgeTypeConstraints.delete(edgeType);
+        if (keys.size === 0) {
+          map.delete(edgeType);
+        }
       }
     }
   };
@@ -2118,22 +2347,30 @@ export class Graph {
     labels: Iterable<string>,
     properties: Readonly<Record<string, unknown>>,
   ): { label: string; key: string; expected: ScalarTypeName; got: ScalarTypeName } | undefined => {
-    if (this.edgeTypeConstraints.size === 0) {
+    if (this.edgeTypeConstraints.size === 0 && this.edgeRecordConstraints.size === 0) {
       return undefined;
     }
 
     for (const label of labels) {
       const cs = this.edgeTypeConstraints.get(label);
 
-      if (!cs) {
-        continue;
+      if (cs) {
+        for (const [key, type] of cs) {
+          const got = this.valueType(properties[key]);
+
+          if (got !== null && got !== type) {
+            return { label, key, expected: type, got };
+          }
+        }
       }
 
-      for (const [key, type] of cs) {
-        const got = this.valueType(properties[key]);
+      const rs = this.edgeRecordConstraints.get(label);
 
-        if (got !== null && got !== type) {
-          return { label, key, expected: type, got };
+      if (rs) {
+        for (const [key, spec] of rs) {
+          if (key in properties && !valueMatches(properties[key], spec, this.valueType)) {
+            return { label, key, expected: 'string', got: 'string' };
+          }
         }
       }
     }
@@ -2148,8 +2385,19 @@ export class Graph {
       return;
     }
 
-    if (this.edgeTypeConstraints.size === 0) {
+    if (this.edgeTypeConstraints.size === 0 && this.edgeRecordConstraints.size === 0) {
       return;
+    }
+
+    for (const label of edge.labels) {
+      const spec = this.edgeRecordConstraints.get(label)?.get(key);
+
+      if (spec && !valueMatches(value, spec, this.valueType)) {
+        throw new LenkeError(
+          `property '${key}' must match the declared record type on edge type '${label}'`,
+          { code: ErrorCode.ConstraintViolation },
+        );
+      }
     }
 
     const got = this.valueType(value);

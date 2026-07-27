@@ -542,3 +542,54 @@ describe('R-CONSTRAINTS: cardinality', () => {
     g.dropCardinalityConstraint('Order', 'PLACED_BY', 'out'); // idempotent
   });
 });
+
+describe('R-CONSTRAINTS: RECORD-typed', () => {
+  test('parseTypeSpec + typeSpecName round-trip; declare validates existing data', () => {
+    const g = new Graph();
+    g.addVertex({ id: 'a', labels: ['P'], properties: { meta: { city: 'NYC', tier: 2 } } });
+    // Matching shape declares OK.
+    g.createTypeConstraint('P', 'meta', 'record{city::string,tier::number}');
+    // Conflicting shape against existing data → rejected.
+    const g2 = new Graph();
+    g2.addVertex({ id: 'a', labels: ['P'], properties: { meta: { city: 'NYC', tier: 2 } } });
+    expect(isCV(() => g2.createTypeConstraint('P', 'meta', 'record{city::number,tier::number}'))).toBe(true);
+  });
+
+  test('set/insert enforce the closed record shape; null exempt', () => {
+    const g = new Graph();
+    g.createTypeConstraint('P', 'meta', 'record{city::string,tier::number}');
+    const v = g.addVertex({ id: 'a', labels: ['P'], properties: { meta: { city: 'NYC', tier: 1 } } });
+    // A well-shaped plain-object write passes.
+    expect(() => v.setProperty('meta', { city: 'LA', tier: 3 })).not.toThrow();
+    // Wrong field type / missing field / extra field → rejected (closed).
+    expect(isCV(() => v.setProperty('meta', { city: 1, tier: 3 }))).toBe(true);
+    expect(isCV(() => v.setProperty('meta', { city: 'X' }))).toBe(true);
+    expect(isCV(() => v.setProperty('meta', { city: 'X', tier: 1, extra: 9 }))).toBe(true);
+    // Null is exempt.
+    expect(() => v.setProperty('meta', null)).not.toThrow();
+    // A bad-shape insert is a violation.
+    expect(isCV(() => g.addVertex({ id: 'b', labels: ['P'], properties: { meta: { city: 9, tier: 1 } } }))).toBe(true);
+  });
+
+  test('nested record type + edge record constraint + drop', () => {
+    const g = new Graph();
+    g.createTypeConstraint('P', 'addr', 'record{geo::record{lat::number,lng::number}}');
+    const v = g.addVertex({ id: 'a', labels: ['P'], properties: { addr: { geo: { lat: 1, lng: 2 } } } });
+    expect(isCV(() => v.setProperty('addr', { geo: { lat: 'x', lng: 2 } }))).toBe(true);
+    // Dropping lifts enforcement.
+    g.dropTypeConstraint('P', 'addr');
+    expect(() => v.setProperty('addr', { geo: { lat: 'x', lng: 2 } })).not.toThrow();
+
+    // Edge record constraint.
+    const g2 = new Graph();
+    const a = g2.addVertex({ id: 'a', labels: ['P'], properties: {} });
+    const b = g2.addVertex({ id: 'b', labels: ['P'], properties: {} });
+    g2.createEdgeTypeConstraint('LINK', 'meta', 'record{w::number}');
+    expect(isCV(() =>
+      g2.addEdge({ from: a, to: b, labels: ['LINK'], properties: { meta: { w: 'x' } } }),
+    )).toBe(true);
+    expect(() =>
+      g2.addEdge({ from: a, to: b, labels: ['LINK'], properties: { meta: { w: 0.5 } } }),
+    ).not.toThrow();
+  });
+});
