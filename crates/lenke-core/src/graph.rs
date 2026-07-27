@@ -6325,6 +6325,42 @@ mod record_debox {
     }
 
     #[test]
+    fn declaring_before_bulk_append_scatters_directly_never_boxing() {
+        // The order the user expects to pay off: declare the constraint on an empty
+        // graph, THEN bulk-ingest. `ndjson::append` routes through add_vertex_with_id
+        // → set_value → the Record arm, so conforming maps scatter straight into the
+        // typed sub-columns — no `Value::Map` is ever boxed, nothing escapes.
+        let mut g = crate::ndjson::decode("").unwrap();
+        g.create_type_constraint("Person", "meta", "record{city::string,tier::number}")
+            .unwrap();
+        assert_eq!(col_name(&g, "meta"), "record"); // empty Record column exists up front
+        let batch = [
+            r#"{"type":"node","id":"p0","labels":["Person"],"properties":{"meta":{"city":"NYC","tier":1}}}"#,
+            // nullable `tier` omitted — a conforming partial record
+            r#"{"type":"node","id":"p1","labels":["Person"],"properties":{"meta":{"city":"LA"}}}"#,
+        ]
+        .join("\n");
+        crate::ndjson::append(&mut g, &batch).unwrap();
+
+        let Some(Column::Record {
+            fields, escaped, ..
+        }) = g.props.col("meta")
+        else {
+            panic!("meta stayed boxed after a declare-then-append");
+        };
+        assert!(matches!(fields[0], Column::Str { .. }));
+        assert!(matches!(fields[1], Column::Num { .. }));
+        assert!(
+            escaped.is_empty(),
+            "a conforming bulk append must never box/escape"
+        );
+        let p0 = g.vertex_by_id("p0").unwrap() as usize;
+        let p1 = g.vertex_by_id("p1").unwrap() as usize;
+        assert_eq!(read(&g, p0), vmap(&[("city", s("NYC")), ("tier", n(1.0))]));
+        assert_eq!(read(&g, p1), vmap(&[("city", s("LA"))]));
+    }
+
+    #[test]
     fn field_at_reads_a_deboxed_field_directly() {
         let mut g = declared();
         let kid = g.props.keys.get("meta").unwrap();
