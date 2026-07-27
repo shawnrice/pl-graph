@@ -930,6 +930,10 @@ pub enum TypeSpec {
     /// value may not carry a field outside the declared set. Sorted names →
     /// structurally-equal record types compare equal.
     Record(Vec<(Arc<str>, Self, bool)>),
+    /// The ISO OPEN record type — `ANY RECORD` (or a bare `RECORD` with no field
+    /// spec). Matches any map value regardless of shape; carries no field
+    /// contract, so it is NOT de-boxed (the column stays boxed `Mixed`).
+    AnyRecord,
 }
 
 impl TypeSpec {
@@ -984,6 +988,7 @@ impl TypeSpec {
                     .collect();
                 format!("record{{{}}}", inner.join(","))
             }
+            Self::AnyRecord => "any record".to_string(),
         }
     }
 }
@@ -1033,11 +1038,20 @@ impl TypeParser<'_> {
     }
     fn parse_type(&mut self) -> Option<TypeSpec> {
         let word = self.ident()?;
-        if word.eq_ignore_ascii_case("record") {
-            self.parse_record()
-        } else {
-            PropType::from_name(&word).map(TypeSpec::Scalar)
+        // ISO `<record type> ::= [ANY] RECORD [<field types spec>]`. `ANY RECORD`
+        // (and a bare `RECORD` with no `{…}`) is the OPEN record — any map.
+        if word.eq_ignore_ascii_case("any") {
+            return self.eat_kw("record").then_some(TypeSpec::AnyRecord);
         }
+        if word.eq_ignore_ascii_case("record") {
+            self.skip_ws();
+            return if self.i < self.s.len() && self.s[self.i] == b'{' {
+                self.parse_record() // closed: `record { … }`
+            } else {
+                Some(TypeSpec::AnyRecord) // bare `record` → open
+            };
+        }
+        PropType::from_name(&word).map(TypeSpec::Scalar)
     }
     /// `{ field [::|:] type [, …] }` — the `record` keyword already consumed.
     fn parse_record(&mut self) -> Option<TypeSpec> {
@@ -1124,6 +1138,9 @@ fn value_matches(v: &Value, spec: &TypeSpec) -> bool {
                 }
             })
         }
+        // The open record type — any map value, any shape (a non-map present value
+        // is a violation, like a wrong-typed scalar).
+        TypeSpec::AnyRecord => matches!(v, Value::Map(_)),
     }
 }
 
@@ -2210,14 +2227,6 @@ impl Graph {
                 "unknown or malformed type name for a type constraint",
             ));
         };
-        // A top-level `NOT NULL` is only meaningful on a scalar for now (a required
-        // whole RECORD is a separate, deferred surface).
-        if not_null && matches!(spec, TypeSpec::Record(_)) {
-            return Err(CodeError::new(
-                ErrorCode::InvalidValue,
-                "`NOT NULL` on a record-typed constraint is not supported",
-            ));
-        }
         // Validate existing data against the declared type (a null is exempt) — and,
         // when `NOT NULL`, that no label vertex already holds an absent/null value.
         if let Some(lid) = self.labels.get(label) {
@@ -2257,13 +2266,20 @@ impl Graph {
             }
             record => {
                 // De-box the store for this key into typed sub-columns — the shape
-                // is now a contract (see [`Column::Record`]). Backfills existing data;
-                // future writes scatter in place.
+                // is now a contract (see [`Column::Record`]). A no-op for `AnyRecord`
+                // (no field contract → stays boxed). Future writes scatter in place.
                 self.props.debox_record(key, &record, &mut self.strs);
                 self.v_record
                     .entry(label.to_string())
                     .or_default()
                     .insert(key.to_string(), record);
+                // A record-level `NOT NULL` makes the whole property required.
+                if not_null {
+                    self.v_type_not_null
+                        .entry(label.to_string())
+                        .or_default()
+                        .insert(key.to_string());
+                }
             }
         }
         Ok(())
@@ -2559,12 +2575,6 @@ impl Graph {
                 "unknown or malformed type name for an edge type constraint",
             ));
         };
-        if not_null && matches!(spec, TypeSpec::Record(_)) {
-            return Err(CodeError::new(
-                ErrorCode::InvalidValue,
-                "`NOT NULL` on a record-typed constraint is not supported",
-            ));
-        }
         if let Some(edges) = self.edges_with_etype_name(etype) {
             for &ei in edges {
                 let v = self.edge_props.value(ei as usize, key, &self.strs);
@@ -2601,6 +2611,12 @@ impl Graph {
                     .entry(etype.to_string())
                     .or_default()
                     .insert(key.to_string(), record);
+                if not_null {
+                    self.e_type_not_null
+                        .entry(etype.to_string())
+                        .or_default()
+                        .insert(key.to_string());
+                }
             }
         }
         Ok(())
@@ -3122,8 +3138,18 @@ impl Graph {
                 })
             })
             .chain(self.v_record.iter().flat_map(|(label, ks)| {
-                ks.iter()
-                    .map(move |(k, spec)| (label.clone(), k.clone(), spec.to_name()))
+                ks.iter().map(move |(k, spec)| {
+                    let nn = self
+                        .v_type_not_null
+                        .get(label)
+                        .is_some_and(|s| s.contains(k));
+                    let ty = if nn {
+                        format!("{} NOT NULL", spec.to_name())
+                    } else {
+                        spec.to_name()
+                    };
+                    (label.clone(), k.clone(), ty)
+                })
             }))
             .collect();
         vtypes.sort();
@@ -3164,8 +3190,15 @@ impl Graph {
                 })
             })
             .chain(self.e_record.iter().flat_map(|(et, ks)| {
-                ks.iter()
-                    .map(move |(k, spec)| (et.clone(), k.clone(), spec.to_name()))
+                ks.iter().map(move |(k, spec)| {
+                    let nn = self.e_type_not_null.get(et).is_some_and(|s| s.contains(k));
+                    let ty = if nn {
+                        format!("{} NOT NULL", spec.to_name())
+                    } else {
+                        spec.to_name()
+                    };
+                    (et.clone(), k.clone(), ty)
+                })
             }))
             .collect();
         etypes.sort();
@@ -4664,7 +4697,8 @@ fn field_kind(t: &TypeSpec) -> Option<Kind> {
             PropType::Duration => Kind::Temporal(TemporalKind::Duration),
             PropType::List => Kind::Mixed,
         }),
-        TypeSpec::Record(_) => Some(Kind::Mixed),
+        // A nested record OR an open `any record` field stays boxed (`Mixed`).
+        TypeSpec::Record(_) | TypeSpec::AnyRecord => Some(Kind::Mixed),
     }
 }
 
@@ -6401,10 +6435,13 @@ mod scalar_not_null {
     }
 
     #[test]
-    fn not_null_on_a_record_type_is_rejected() {
-        assert!(node("{}")
+    fn not_null_on_a_record_type_is_now_supported() {
+        // Previously rejected; a whole-record NOT NULL is now a valid constraint
+        // (see the `any_record_and_record_not_null` module). Over PRESENT data it
+        // declares cleanly.
+        assert!(node(r#"{"meta":{"a":1}}"#)
             .create_type_constraint("P", "meta", "record{a::number} NOT NULL")
-            .is_err());
+            .is_ok());
     }
 
     #[test]
@@ -6427,6 +6464,119 @@ mod scalar_not_null {
             .edge_missing_required(&et, &[("w".to_string(), Value::Num(2.0))])
             .is_none());
         assert!(g.dump_schema().contains(r#""type":"number NOT NULL""#));
+    }
+}
+
+/// ISO `<record type> ::= [ANY] RECORD [<field spec>] [NOT NULL]` — the OPEN
+/// record (`ANY RECORD` / bare `RECORD`) and a whole-record `NOT NULL`.
+#[cfg(test)]
+mod any_record_and_record_not_null {
+    use super::*;
+
+    fn s(x: &str) -> Value {
+        Value::Str(x.into())
+    }
+    fn vmap(pairs: &[(&str, Value)]) -> Value {
+        Value::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).into(), v.clone()))
+                .collect(),
+        )
+    }
+    fn node(props: &str) -> Graph {
+        crate::ndjson::decode(&format!(
+            r#"{{"type":"node","id":"a","labels":["P"],"properties":{props}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn parse_open_record_forms() {
+        // `any record`, bare `record` → the open type; canonical name is `any record`.
+        assert_eq!(TypeSpec::parse("any record"), Some(TypeSpec::AnyRecord));
+        assert_eq!(TypeSpec::parse("record"), Some(TypeSpec::AnyRecord));
+        assert_eq!(TypeSpec::parse("ANY  RECORD"), Some(TypeSpec::AnyRecord));
+        assert_eq!(TypeSpec::AnyRecord.to_name(), "any record");
+        assert_eq!(TypeSpec::parse("any"), None); // ANY without RECORD
+                                                  // The closed form still parses to a Record.
+        assert!(matches!(
+            TypeSpec::parse("record{a::number}"),
+            Some(TypeSpec::Record(_))
+        ));
+    }
+
+    #[test]
+    fn any_record_matches_any_map_but_not_a_scalar() {
+        assert!(value_matches(
+            &vmap(&[("x", Value::Num(1.0))]),
+            &TypeSpec::AnyRecord
+        ));
+        assert!(value_matches(&vmap(&[]), &TypeSpec::AnyRecord)); // empty map OK
+        assert!(value_matches(&Value::Null, &TypeSpec::AnyRecord)); // top-level null exempt
+        assert!(!value_matches(&Value::Num(1.0), &TypeSpec::AnyRecord)); // a scalar is not a record
+    }
+
+    #[test]
+    fn any_record_constraint_enforces_and_does_not_debox() {
+        let mut g = node(r#"{"meta":{"city":"NYC"}}"#);
+        g.create_type_constraint("P", "meta", "any record").unwrap();
+        // Any-shaped map passes; a scalar is a type violation.
+        assert!(!g.type_conflict_on_set(0, "meta", &vmap(&[("anything", Value::Num(9.0))])));
+        assert!(g.type_conflict_on_set(0, "meta", &Value::Num(1.0)));
+        // Open record has no field contract → the column stays boxed (NOT de-boxed).
+        assert!(matches!(g.props.col("meta"), Some(Column::Mixed { .. })));
+    }
+
+    #[test]
+    fn record_level_not_null_parses_and_is_required() {
+        assert_eq!(
+            TypeSpec::parse_with_not_null("record{a::number} NOT NULL"),
+            TypeSpec::parse("record{a::number}").map(|s| (s, true))
+        );
+        assert_eq!(
+            TypeSpec::parse_with_not_null("any record NOT NULL"),
+            Some((TypeSpec::AnyRecord, true))
+        );
+
+        // A closed record + NOT NULL: present map OK; absent / null → required violation.
+        let mut g = node(r#"{"meta":{"city":"NYC"}}"#);
+        g.create_type_constraint("P", "meta", "record{city::string} NOT NULL")
+            .unwrap();
+        let labels = ["P".to_string()];
+        assert!(g.missing_required(&labels, &[]).is_some());
+        assert!(g
+            .missing_required(&labels, &[("meta".to_string(), Value::Null)])
+            .is_some());
+        assert!(g
+            .missing_required(&labels, &[("meta".to_string(), vmap(&[("city", s("LA"))]))])
+            .is_none());
+        // A NOT NULL closed record STILL de-boxes (presence is orthogonal to shape).
+        assert!(matches!(g.props.col("meta"), Some(Column::Record { .. })));
+        assert!(g
+            .dump_schema()
+            .contains(r#""type":"record{city::string} NOT NULL""#));
+    }
+
+    #[test]
+    fn declaring_record_not_null_over_absent_data_fails() {
+        // A label vertex missing the key → the NOT NULL declare is rejected.
+        assert!(node("{}")
+            .create_type_constraint("P", "meta", "any record NOT NULL")
+            .is_err());
+        // A present map satisfies it.
+        assert!(node(r#"{"meta":{"a":1}}"#)
+            .create_type_constraint("P", "meta", "any record NOT NULL")
+            .is_ok());
+    }
+
+    #[test]
+    fn dropping_a_record_not_null_removes_its_requiredness() {
+        let mut g = node(r#"{"meta":{"a":1}}"#);
+        g.create_type_constraint("P", "meta", "any record NOT NULL")
+            .unwrap();
+        g.drop_type_constraint("P", "meta");
+        assert!(g.missing_required(&["P".to_string()], &[]).is_none());
     }
 }
 

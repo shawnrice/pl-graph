@@ -71,7 +71,9 @@ export type TypeSpec =
   | { kind: 'scalar'; type: ScalarTypeName }
   // Each record field is `[name, type, notNull]`. A field is nullable/optional by
   // default (absent OR null both satisfy it); `NOT NULL` makes it required.
-  | { kind: 'record'; fields: ReadonlyArray<readonly [string, TypeSpec, boolean]> };
+  | { kind: 'record'; fields: ReadonlyArray<readonly [string, TypeSpec, boolean]> }
+  // The ISO OPEN record type (`ANY RECORD` / bare `RECORD`): any map, any shape.
+  | { kind: 'anyRecord' };
 
 const SCALARS = new Set<ScalarTypeName>([
   'string',
@@ -151,7 +153,18 @@ export const parseTypeSpecWithNotNull = (
       return null;
     }
 
+    // ISO `[ANY] RECORD [{…}]`: `any record` / bare `record` → the OPEN type.
+    if (word.toLowerCase() === 'any') {
+      return eatKw('record') ? { kind: 'anyRecord' } : null;
+    }
+
     if (word.toLowerCase() === 'record') {
+      ws();
+
+      if (i >= s.length || s[i] !== '{') {
+        return { kind: 'anyRecord' }; // bare `record` → open
+      }
+
       if (!eat('{')) {
         return null;
       }
@@ -248,12 +261,19 @@ export const parseTypeSpec = (input: string): TypeSpec | null => {
 
 /** The canonical type name for a `TypeSpec` (round-trips through `parseTypeSpec`);
  *  used by the schema dump. */
-export const typeSpecName = (spec: TypeSpec): string =>
-  spec.kind === 'scalar'
-    ? spec.type
-    : `record{${spec.fields
-        .map(([k, t, notNull]) => `${k}::${typeSpecName(t)}${notNull ? ' NOT NULL' : ''}`)
-        .join(',')}}`;
+export const typeSpecName = (spec: TypeSpec): string => {
+  if (spec.kind === 'scalar') {
+    return spec.type;
+  }
+
+  if (spec.kind === 'anyRecord') {
+    return 'any record';
+  }
+
+  return `record{${spec.fields
+    .map(([k, t, notNull]) => `${k}::${typeSpecName(t)}${notNull ? ' NOT NULL' : ''}`)
+    .join(',')}}`;
+};
 
 /** Does a value satisfy a `TypeSpec`? A null is exempt (REQUIRED is separate); a
  *  scalar constraint exempts a non-scalar (a map — the record path governs those);
@@ -271,6 +291,16 @@ export const valueMatches = (
     const got = scalarTypeOf(v);
 
     return got === null || got === spec.type;
+  }
+
+  // The OPEN record type — any map value, any shape. A map is a `LenkeRecord` or a
+  // bare `{…}` plain object (a class instance like a temporal/element is NOT a map),
+  // mirroring both `normalizePropertyValue` and native `matches!(v, Value::Map)`.
+  if (spec.kind === 'anyRecord') {
+    return (
+      isRecord(v) ||
+      (typeof v === 'object' && v !== null && Object.getPrototypeOf(v) === Object.prototype)
+    );
   }
 
   // Accept the value in any record-like form — the write path checks it BEFORE
@@ -1808,12 +1838,6 @@ export class Graph {
 
     const { spec, notNull } = parsed;
 
-    if (notNull && spec.kind === 'record') {
-      throw new LenkeError('`NOT NULL` on a record-typed constraint is not supported', {
-        code: ErrorCode.InvalidValue,
-      });
-    }
-
     for (const vertex of this.getVerticesByLabel(label)) {
       const v = vertex.properties[key];
 
@@ -1832,7 +1856,22 @@ export class Graph {
       }
     }
 
-    // Scalar → the existing map; a record shape → the parallel record map.
+    const markNotNull = (): void => {
+      if (!notNull) {
+        return;
+      }
+
+      let nn = this.vertexTypeNotNull.get(label);
+
+      if (!nn) {
+        nn = new Set();
+        this.vertexTypeNotNull.set(label, nn);
+      }
+
+      nn.add(key);
+    };
+
+    // Scalar → the existing map; a record / any-record shape → the parallel map.
     if (spec.kind === 'scalar') {
       let keys = this.vertexTypeConstraints.get(label);
 
@@ -1842,17 +1881,6 @@ export class Graph {
       }
 
       keys.set(key, spec.type);
-
-      if (notNull) {
-        let nn = this.vertexTypeNotNull.get(label);
-
-        if (!nn) {
-          nn = new Set();
-          this.vertexTypeNotNull.set(label, nn);
-        }
-
-        nn.add(key);
-      }
     } else {
       let keys = this.vertexRecordConstraints.get(label);
 
@@ -1863,6 +1891,8 @@ export class Graph {
 
       keys.set(key, spec);
     }
+
+    markNotNull(); // record-level (or scalar) NOT NULL makes the property required
   };
 
   /** Drop a type constraint (scalar or record). Idempotent. Removes this
@@ -2422,12 +2452,6 @@ export class Graph {
 
     const { spec, notNull } = parsed;
 
-    if (notNull && spec.kind === 'record') {
-      throw new LenkeError('`NOT NULL` on a record-typed constraint is not supported', {
-        code: ErrorCode.InvalidValue,
-      });
-    }
-
     for (const edge of this.getEdgesByLabel(edgeType)) {
       const v = edge.properties[key];
 
@@ -2446,6 +2470,21 @@ export class Graph {
       }
     }
 
+    const markNotNull = (): void => {
+      if (!notNull) {
+        return;
+      }
+
+      let nn = this.edgeTypeNotNull.get(edgeType);
+
+      if (!nn) {
+        nn = new Set();
+        this.edgeTypeNotNull.set(edgeType, nn);
+      }
+
+      nn.add(key);
+    };
+
     if (spec.kind === 'scalar') {
       let keys = this.edgeTypeConstraints.get(edgeType);
 
@@ -2455,17 +2494,6 @@ export class Graph {
       }
 
       keys.set(key, spec.type);
-
-      if (notNull) {
-        let nn = this.edgeTypeNotNull.get(edgeType);
-
-        if (!nn) {
-          nn = new Set();
-          this.edgeTypeNotNull.set(edgeType, nn);
-        }
-
-        nn.add(key);
-      }
     } else {
       let keys = this.edgeRecordConstraints.get(edgeType);
 
@@ -2476,6 +2504,8 @@ export class Graph {
 
       keys.set(key, spec);
     }
+
+    markNotNull();
   };
 
   /** Drop an edge type constraint (scalar or record). Idempotent. */

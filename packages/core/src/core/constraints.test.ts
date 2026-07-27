@@ -694,14 +694,9 @@ describe('R-CONSTRAINTS: scalar NOT NULL type constraint', () => {
     expect(() => v.setProperty('name', 42)).not.toThrow();
   });
 
-  test('NOT NULL on a record-typed constraint is rejected', () => {
+  test('NOT NULL on a record-typed constraint is now accepted (required whole record)', () => {
     const g = new Graph();
-    expect(
-      hasErrorCode(
-        thrown(() => g.createTypeConstraint('P', 'meta', 'record{a::number} NOT NULL')),
-        ErrorCode.InvalidValue,
-      ),
-    ).toBe(true);
+    expect(() => g.createTypeConstraint('P', 'meta', 'record{a::number} NOT NULL')).not.toThrow();
   });
 
   test('edge scalar NOT NULL enforces present + non-null', () => {
@@ -718,5 +713,78 @@ describe('R-CONSTRAINTS: scalar NOT NULL type constraint', () => {
     expect(() =>
       g.addEdge({ from: a, to: b, labels: ['LINK'], properties: { w: 2.5 } }),
     ).not.toThrow();
+  });
+});
+
+describe('R-CONSTRAINTS: ANY RECORD + record-level NOT NULL', () => {
+  test('parseTypeSpec / typeSpecName round-trip the open record forms', () => {
+    // `any record` and a bare `record` are the same open type; canonical = 'any record'.
+    const any = parseTypeSpec('any record');
+    const bare = parseTypeSpec('record');
+    expect(any).toEqual({ kind: 'anyRecord' });
+    expect(bare).toEqual({ kind: 'anyRecord' });
+    expect(typeSpecName(any!)).toBe('any record');
+    expect(parseTypeSpec('any')).toBeNull(); // ANY without RECORD
+  });
+
+  test('ANY RECORD accepts any map but rejects a scalar', () => {
+    const g = new Graph();
+    g.addVertex({ id: 'a', labels: ['P'], properties: { meta: { city: 'NYC' } } });
+    g.createTypeConstraint('P', 'meta', 'any record');
+
+    // Any-shaped map commits; null is exempt; a scalar is a type violation.
+    expect(
+      g
+        .addVertex({ id: 'b', labels: ['P'], properties: { meta: { anything: 9, else: true } } })
+        .getProperty('meta'),
+    ).toBeTruthy();
+    expect(g.addVertex({ id: 'n', labels: ['P'], properties: { meta: null } })).toBeTruthy();
+    expect(isCV(() => g.addVertex({ id: 'c', labels: ['P'], properties: { meta: 42 } }))).toBe(
+      true,
+    );
+  });
+
+  test('a closed record + NOT NULL is required and still shape-checked', () => {
+    const g = new Graph();
+    g.addVertex({ id: 'a', labels: ['P'], properties: { meta: { city: 'NYC' } } });
+    g.createTypeConstraint('P', 'meta', 'record{city::string} NOT NULL');
+
+    // absent / null → rejected (required); wrong shape → rejected; good map → OK.
+    expect(isCV(() => g.addVertex({ id: 'b', labels: ['P'], properties: {} }))).toBe(true);
+    expect(isCV(() => g.addVertex({ id: 'c', labels: ['P'], properties: { meta: null } }))).toBe(
+      true,
+    );
+    expect(
+      isCV(() => g.addVertex({ id: 'd', labels: ['P'], properties: { meta: { extra: 1 } } })),
+    ).toBe(true);
+    expect(
+      g
+        .addVertex({ id: 'e', labels: ['P'], properties: { meta: { city: 'LA' } } })
+        .getProperty('meta'),
+    ).toBeTruthy();
+  });
+
+  test('ANY RECORD NOT NULL: required + must be a map', () => {
+    const g = new Graph();
+    g.addVertex({ id: 'a', labels: ['P'], properties: { meta: { x: 1 } } });
+    g.createTypeConstraint('P', 'meta', 'any record NOT NULL');
+
+    expect(isCV(() => g.addVertex({ id: 'b', labels: ['P'], properties: {} }))).toBe(true);
+    expect(isCV(() => g.addVertex({ id: 'c', labels: ['P'], properties: { meta: null } }))).toBe(
+      true,
+    );
+    // declaring over absent data fails, too
+    const bad = new Graph();
+    bad.addVertex({ id: 'a', labels: ['P'], properties: {} });
+    expect(isCV(() => bad.createTypeConstraint('P', 'meta', 'any record NOT NULL'))).toBe(true);
+  });
+
+  test('dropping a record NOT NULL removes its requiredness', () => {
+    const g = new Graph();
+    const v = g.addVertex({ id: 'a', labels: ['P'], properties: { meta: { x: 1 } } });
+    g.createTypeConstraint('P', 'meta', 'any record NOT NULL');
+    expect(isCV(() => v.setProperty('meta', null))).toBe(true);
+    g.dropTypeConstraint('P', 'meta');
+    expect(() => v.setProperty('meta', null)).not.toThrow();
   });
 });
