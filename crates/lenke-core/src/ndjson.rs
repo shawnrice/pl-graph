@@ -361,6 +361,9 @@ fn col_present(col: &Column, idx: usize) -> bool {
         | Column::Temporal { present, .. }
         | Column::Vec { present, .. } => present.get(idx),
         Column::Mixed { data } => data[idx].is_some(),
+        Column::Record {
+            present, escaped, ..
+        } => escaped.contains_key(&(idx as u32)) || present.get(idx),
     }
 }
 
@@ -396,6 +399,9 @@ fn push_props(out: &mut String, store: &Properties, strs: &Dict, idx: usize) {
                 ),
             ),
             Column::Mixed { data } => push_value(out, data[idx].as_ref().unwrap()),
+            // Synthesize the record (or read an escapee) and reuse `push_value`, so a
+            // de-boxed record encodes byte-for-byte identically to a boxed map.
+            Column::Record { .. } => push_value(out, &store.value_id(idx, kid as u32, strs)),
         }
     }
     out.push('}');

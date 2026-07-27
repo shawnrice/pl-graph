@@ -1472,6 +1472,8 @@ fn prop_of(graph: &Graph, ctx: &Ctx, bound: &Val, key_ref: usize) -> Val {
             .map(|s| Val::List(s.iter().map(|x| Val::Num(*x)).collect()))
             .unwrap_or(Val::Null),
         Some(Column::Mixed { data }) => data[idx].as_ref().map(value_to_val).unwrap_or(Val::Null),
+        // A de-boxed record synthesizes its map (or reads an escapee) via the store.
+        Some(Column::Record { .. }) => value_to_val(&store.value_id(idx, kid, &graph.strs)),
         _ => Val::Null,
     }
 }
@@ -1496,11 +1498,10 @@ fn prop_field_of(env: &Env, var_slot: usize, root_key_ref: usize, descent: &[Arc
         _ => return Val::Null,
     };
     let Some(kid) = kid else { return Val::Null };
-    let Some(root) = store.value_ref(idx, kid) else {
-        return Val::Null; // typed-column scalar / absent — not a stored map
-    };
     let segs: Vec<&str> = descent.iter().map(|s| s.as_ref()).collect();
-    crate::graph::value_at_descent(root, &segs).map_or(Val::Null, value_to_val)
+    // `field_at` reads a de-boxed record field DIRECTLY from its sub-column (no
+    // whole-map materialization) and walks a boxed `Mixed` map otherwise.
+    value_to_val(&store.field_at(idx, kid, &segs, &env.graph.strs))
 }
 
 fn eval_label_node(graph: &Graph, ctx: &Ctx, vi: u32, expr: &CLabelExpr) -> bool {

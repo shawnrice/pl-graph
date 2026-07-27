@@ -185,6 +185,37 @@ pub enum Column {
     Mixed {
         data: Vec<Option<Value>>,
     },
+    /// A **de-boxed record** column: the store for a property key that carries a
+    /// declared `RECORD { … }` type constraint (R-CONSTRAINTS). Because the
+    /// constraint is a contract on the field set + types, a conforming map is
+    /// scattered across one typed sub-column per field (`meta.city` → a `Str`
+    /// column, `meta.tier` → a `Num` column) instead of a ~40 B boxed
+    /// `Value::Map` slot + a heap `Vec` of pairs. This recovers memory, closes the
+    /// codec-decode gap (fields decode straight into their columns), lets a field
+    /// vectorize, and makes `n.meta.city` a direct sub-column read.
+    ///
+    /// A property key is GLOBAL but a record constraint is per-`(label, key)`, so
+    /// an element of another label may store `meta` as a scalar or a
+    /// differently-shaped map — those can't be scattered, so they stay boxed in
+    /// `escaped` (a sparse overlay, usually empty). This keeps de-boxing SOUND for
+    /// a shared key while still de-boxing the conforming majority.
+    Record {
+        /// Element holds a CONFORMING map (fields scattered below) or a stored
+        /// null (see `nulls`). NOT set for an absent element or an escaped one.
+        present: BitSet,
+        /// Among `present`, the value is a stored `Null` (not a map).
+        nulls: BitSet,
+        /// Declared field names, sorted (canonical map order) — parallel to `fields`.
+        field_names: Vec<Arc<str>>,
+        /// One typed sub-column per declared field; each sized to the element count.
+        /// A field set to a stored null (nullable) promotes its sub-column to
+        /// `Mixed` locally, exactly like the top-level store.
+        fields: Vec<Self>,
+        /// Non-conforming values (a scalar, a list, a differently-shaped map from
+        /// another label) kept boxed by element index. An entry here overrides
+        /// `present`/`fields` for that element.
+        escaped: std::collections::HashMap<u32, Value>,
+    },
 }
 
 /// The dimension of `items` iff it is a non-empty all-numeric list (→ a typed
@@ -501,6 +532,13 @@ impl Column {
             // An absent bit reads `false`, so `present` needs no growth here.
             Self::Vec { data, dim, .. } => data.extend(std::iter::repeat_n(0.0, *dim)),
             Self::Mixed { data } => data.push(None),
+            // `present`/`nulls` bitsets read absent past their end, so only the
+            // field sub-columns grow; `escaped` is sparse and untouched.
+            Self::Record { fields, .. } => {
+                for f in fields {
+                    f.push_absent();
+                }
+            }
         }
     }
     fn element_len(&self) -> usize {
@@ -511,6 +549,8 @@ impl Column {
             Self::Temporal { data, .. } => data.len(),
             Self::Vec { data, dim, .. } => data.len().checked_div(*dim).unwrap_or(0),
             Self::Mixed { data } => data.len(),
+            // Every de-boxed record has ≥1 field (0-field records aren't de-boxed).
+            Self::Record { fields, .. } => fields.first().map_or(0, Self::element_len),
         }
     }
 
@@ -526,6 +566,18 @@ impl Column {
             Self::Temporal { data, present } => data.len() * data.slot_bytes() + bits(present),
             Self::Vec { data, present, .. } => data.len() * size_of::<f64>() + bits(present),
             Self::Mixed { data } => data.len() * size_of::<Option<Value>>(),
+            Self::Record {
+                present,
+                nulls,
+                fields,
+                escaped,
+                ..
+            } => {
+                bits(present)
+                    + bits(nulls)
+                    + fields.iter().map(Self::heap_bytes).sum::<usize>()
+                    + escaped.len() * (size_of::<u32>() + size_of::<Option<Value>>())
+            }
         }
     }
 }
@@ -579,19 +631,63 @@ impl Properties {
                     .collect(),
             ),
             Some(Column::Mixed { data }) => data[idx].clone().unwrap_or(Value::Null),
+            Some(
+                col @ Column::Record {
+                    field_names: _,
+                    fields: _,
+                    ..
+                },
+            ) => col_get(col, idx, strs).unwrap_or(Value::Null),
             _ => Value::Null,
         }
     }
 
-    /// Borrow element `idx`'s `key` value WITHOUT cloning — but only when it lives
-    /// boxed in a `Mixed` column (the only place a map/list can be). `None` for a
-    /// typed-column scalar (there's no owned `Value` to borrow) or an absent slot.
-    /// Lets a field access navigate a stored record in place, converting only the
-    /// leaf instead of materializing the whole map.
-    pub(crate) fn value_ref(&self, idx: usize, kid: u32) -> Option<&Value> {
+    /// Read element `idx`'s value at `descent` under key id `kid`, without
+    /// materializing the whole record. For a de-boxed [`Column::Record`], the first
+    /// descent segment resolves to a sub-column and reads it DIRECTLY (the
+    /// `n.meta.city` win — one typed read, no map allocation); a deeper descent then
+    /// walks the boxed sub-value. For a boxed map in a `Mixed` column, walks the
+    /// stored map. Absent / missing / not-a-map at a hop → `Null`.
+    pub(crate) fn field_at(&self, idx: usize, kid: u32, descent: &[&str], strs: &Dict) -> Value {
         match self.cols.get(kid as usize) {
-            Some(Column::Mixed { data }) => data.get(idx).and_then(Option::as_ref),
-            _ => None,
+            Some(Column::Record {
+                present,
+                nulls,
+                field_names,
+                fields,
+                escaped,
+            }) => {
+                if let Some(v) = escaped.get(&(idx as u32)) {
+                    return value_at_descent(v, descent).cloned().unwrap_or(Value::Null);
+                }
+                if descent.is_empty() {
+                    return if present.get(idx) && !nulls.get(idx) {
+                        record_map(field_names, fields, idx, strs)
+                    } else {
+                        Value::Null
+                    };
+                }
+                if !present.get(idx) || nulls.get(idx) {
+                    return Value::Null;
+                }
+                match field_names.binary_search_by(|n| n.as_ref().cmp(descent[0])) {
+                    Ok(fi) => match col_get(&fields[fi], idx, strs) {
+                        Some(fv) if descent.len() == 1 => fv,
+                        Some(fv) => value_at_descent(&fv, &descent[1..])
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                        None => Value::Null,
+                    },
+                    Err(_) => Value::Null,
+                }
+            }
+            Some(Column::Mixed { data }) => match data.get(idx).and_then(Option::as_ref) {
+                Some(root) => value_at_descent(root, descent)
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                None => Value::Null,
+            },
+            _ => Value::Null,
         }
     }
 
@@ -633,6 +729,9 @@ impl Properties {
             Column::Mixed { data } => data
                 .iter()
                 .any(|v| v.as_ref().is_some_and(value_contains_map)),
+            // A de-boxed record IS a map; a scalar escapee might not be, but the
+            // conforming fields make this key un-flattenable regardless.
+            Column::Record { .. } => true,
             _ => false,
         })
     }
@@ -648,6 +747,10 @@ impl Properties {
                 | Column::Vec { present, .. },
             ) => present.get(idx),
             Some(Column::Mixed { data }) => data[idx].is_some(),
+            // Present iff it holds a value (map/null) OR an escaped one.
+            Some(Column::Record {
+                present, escaped, ..
+            }) => escaped.contains_key(&(idx as u32)) || present.get(idx),
             None => false,
         }
     }
@@ -690,14 +793,60 @@ impl Properties {
     pub fn remove_value(&mut self, idx: usize, key: &str) {
         if let Some(kid) = self.keys.get(key) {
             if let Some(col) = self.cols.get_mut(kid as usize) {
-                match col {
-                    Column::Num { present, .. }
-                    | Column::Str { present, .. }
-                    | Column::Bool { present, .. }
-                    | Column::Temporal { present, .. }
-                    | Column::Vec { present, .. } => present.clear(idx),
-                    Column::Mixed { data } => data[idx] = None,
-                }
+                col_clear(col, idx);
+            }
+        }
+    }
+
+    /// De-box the column for `key` into a [`Column::Record`] typed by `spec` — the
+    /// backfill a `RECORD`-typed constraint declaration triggers. Existing values
+    /// are scattered (a conforming map → its field sub-columns; a null → the null
+    /// marker; anything else → the escape overlay). Idempotent: a key already a
+    /// `Record` (an earlier constraint on the same key) is left as-is. A 0-field
+    /// record isn't de-boxed (degenerate).
+    pub(crate) fn debox_record(&mut self, key: &str, spec: &TypeSpec, strs: &mut Dict) {
+        let TypeSpec::Record(defs) = spec else { return };
+        if defs.is_empty() {
+            return;
+        }
+        let kid = self.keys.intern(key) as usize;
+        if kid >= self.cols.len() {
+            self.cols.push(Column::Mixed {
+                data: vec![None; self.len],
+            });
+        }
+        if matches!(self.cols[kid], Column::Record { .. }) {
+            return;
+        }
+        let field_names: Vec<Arc<str>> = defs.iter().map(|(n, ..)| n.clone()).collect();
+        let fields: Vec<Column> = defs
+            .iter()
+            .map(|(_, t, _)| empty_col_for_kind(field_kind(t), self.len))
+            .collect();
+        let mut rec = Column::Record {
+            present: BitSet::zeros(self.len),
+            nulls: BitSet::zeros(self.len),
+            field_names,
+            fields,
+            escaped: std::collections::HashMap::new(),
+        };
+        let old = std::mem::replace(&mut self.cols[kid], Column::Mixed { data: Vec::new() });
+        for i in 0..self.len {
+            if let Some(v) = col_get(&old, i, strs) {
+                col_set(&mut rec, i, &v, strs);
+            }
+        }
+        self.cols[kid] = rec;
+    }
+
+    /// Re-box a de-boxed [`Column::Record`] back to a plain `Mixed` column — the
+    /// inverse of [`debox_record`], run when the last record constraint on `key` is
+    /// dropped so the shape is no longer a contract. No-op if `key` isn't de-boxed.
+    pub(crate) fn rebox_record(&mut self, key: &str, strs: &Dict) {
+        if let Some(kid) = self.keys.get(key) {
+            let kid = kid as usize;
+            if matches!(self.cols.get(kid), Some(Column::Record { .. })) {
+                self.cols[kid] = to_mixed(&self.cols[kid], strs);
             }
         }
     }
@@ -2024,6 +2173,10 @@ impl Graph {
                     .insert(key.to_string(), ty);
             }
             record => {
+                // De-box the store for this key into typed sub-columns — the shape
+                // is now a contract (see [`Column::Record`]). Backfills existing data;
+                // future writes scatter in place.
+                self.props.debox_record(key, &record, &mut self.strs);
                 self.v_record
                     .entry(label.to_string())
                     .or_default()
@@ -2046,6 +2199,10 @@ impl Graph {
             if keys.is_empty() {
                 self.v_record.remove(label);
             }
+        }
+        // Re-box the column once NO label still constrains this key as a record.
+        if !self.v_record.values().any(|ks| ks.contains_key(key)) {
+            self.props.rebox_record(key, &self.strs);
         }
     }
 
@@ -2317,6 +2474,7 @@ impl Graph {
                     .insert(key.to_string(), ty);
             }
             record => {
+                self.edge_props.debox_record(key, &record, &mut self.strs);
                 self.e_record
                     .entry(etype.to_string())
                     .or_default()
@@ -2339,6 +2497,9 @@ impl Graph {
             if keys.is_empty() {
                 self.e_record.remove(etype);
             }
+        }
+        if !self.e_record.values().any(|ks| ks.contains_key(key)) {
+            self.edge_props.rebox_record(key, &self.strs);
         }
     }
 
@@ -4199,7 +4360,165 @@ fn col_set(col: &mut Column, idx: usize, v: &Value, strs: &mut Dict) -> bool {
             data[idx] = Some(canonical_value(val, strs));
             true
         }
+        (
+            Column::Record {
+                present,
+                nulls,
+                field_names,
+                fields,
+                escaped,
+            },
+            val,
+        ) => {
+            // The record constraint guarantees a label-matching write conforms, but
+            // this column is shared across labels — a value that isn't a conforming
+            // map (all keys declared) stays boxed in `escaped`. Canonicalize first so
+            // field keys are sorted (binary search) and escaped values are canonical.
+            match canonical_value(val, strs) {
+                Value::Null => {
+                    escaped.remove(&(idx as u32));
+                    present.set(idx);
+                    nulls.set(idx);
+                    for f in fields.iter_mut() {
+                        col_clear(f, idx);
+                    }
+                }
+                Value::Map(pairs)
+                    if pairs.iter().all(|(k, _)| {
+                        field_names.binary_search_by(|n| n.as_ref().cmp(k)).is_ok()
+                    }) =>
+                {
+                    escaped.remove(&(idx as u32));
+                    present.set(idx);
+                    nulls.clear(idx);
+                    for (fi, name) in field_names.iter().enumerate() {
+                        match pairs.binary_search_by(|(k, _)| k.as_ref().cmp(name)) {
+                            Ok(pi) => {
+                                let fv = &pairs[pi].1;
+                                if !col_set(&mut fields[fi], idx, fv, strs) {
+                                    fields[fi] = to_mixed(&fields[fi], strs);
+                                    col_set(&mut fields[fi], idx, fv, strs);
+                                }
+                            }
+                            // A nullable field the value omits → absent in its column.
+                            Err(_) => col_clear(&mut fields[fi], idx),
+                        }
+                    }
+                }
+                other => {
+                    present.clear(idx);
+                    nulls.clear(idx);
+                    for f in fields.iter_mut() {
+                        col_clear(f, idx);
+                    }
+                    escaped.insert(idx as u32, other);
+                }
+            }
+            true
+        }
         _ => false,
+    }
+}
+
+/// Read a single column at element `i` as an owned [`Value`], or `None` if the
+/// slot is absent. The read-side inverse of [`col_set`], shared by [`to_mixed`],
+/// record synthesis, and [`Properties::field_at`].
+fn col_get(col: &Column, i: usize, strs: &Dict) -> Option<Value> {
+    match col {
+        Column::Num { data, present } if present.get(i) => Some(Value::Num(data[i])),
+        Column::Bool { data, present } if present.get(i) => Some(Value::Bool(data[i])),
+        Column::Str { data, present } if present.get(i) => Some(Value::Str(strs.arc(data[i]))),
+        Column::Temporal { data, present } if present.get(i) => Some(Value::Temporal(data.get(i))),
+        Column::Vec { data, dim, present } if present.get(i) => Some(Value::List(
+            vec_slice(data, *dim, i)
+                .iter()
+                .map(|x| Value::Num(*x))
+                .collect(),
+        )),
+        Column::Mixed { data } => data.get(i).cloned().flatten(),
+        Column::Record {
+            present,
+            nulls,
+            field_names,
+            fields,
+            escaped,
+        } => {
+            if let Some(v) = escaped.get(&(i as u32)) {
+                Some(v.clone())
+            } else if present.get(i) {
+                Some(if nulls.get(i) {
+                    Value::Null
+                } else {
+                    record_map(field_names, fields, i, strs)
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Clear (mark absent) element `idx` of a column — the read-side inverse of a set.
+fn col_clear(col: &mut Column, idx: usize) {
+    match col {
+        Column::Num { present, .. }
+        | Column::Str { present, .. }
+        | Column::Bool { present, .. }
+        | Column::Temporal { present, .. }
+        | Column::Vec { present, .. } => present.clear(idx),
+        Column::Mixed { data } => {
+            if idx < data.len() {
+                data[idx] = None;
+            }
+        }
+        Column::Record {
+            present,
+            nulls,
+            fields,
+            escaped,
+            ..
+        } => {
+            escaped.remove(&(idx as u32));
+            present.clear(idx);
+            nulls.clear(idx);
+            for f in fields.iter_mut() {
+                col_clear(f, idx);
+            }
+        }
+    }
+}
+
+/// Synthesize the canonical map for element `i` of a de-boxed record from its
+/// present field sub-columns. An absent field is omitted (nullable/optional); a
+/// field holding a stored null is included as `Null`. Field names are sorted, so
+/// the result is canonical.
+fn record_map(names: &[Arc<str>], fields: &[Column], i: usize, strs: &Dict) -> Value {
+    let pairs: Vec<(Arc<str>, Value)> = names
+        .iter()
+        .zip(fields)
+        .filter_map(|(n, sub)| col_get(sub, i, strs).map(|v| (n.clone(), v)))
+        .collect();
+    Value::Map(pairs)
+}
+
+/// The de-boxed column kind for a declared record field type: a scalar maps to
+/// its typed column; a `list` or a nested record stays boxed (`Mixed`).
+fn field_kind(t: &TypeSpec) -> Option<Kind> {
+    match t {
+        TypeSpec::Scalar(pt) => Some(match pt {
+            PropType::Str => Kind::Str,
+            PropType::Num => Kind::Num,
+            PropType::Bool => Kind::Bool,
+            PropType::Date => Kind::Temporal(TemporalKind::Date),
+            PropType::Time => Kind::Temporal(TemporalKind::Time),
+            PropType::DateTime => Kind::Temporal(TemporalKind::DateTime),
+            PropType::ZonedTime => Kind::Temporal(TemporalKind::ZonedTime),
+            PropType::ZonedDateTime => Kind::Temporal(TemporalKind::ZonedDateTime),
+            PropType::Duration => Kind::Temporal(TemporalKind::Duration),
+            PropType::List => Kind::Mixed,
+        }),
+        TypeSpec::Record(_) => Some(Kind::Mixed),
     }
 }
 
@@ -4222,6 +4541,7 @@ fn to_mixed(col: &Column, strs: &Dict) -> Column {
                     .collect(),
             )),
             Column::Mixed { data } => data[i].clone(),
+            rec @ Column::Record { .. } => col_get(rec, i, strs),
             _ => None,
         };
         data.push(v);
@@ -4562,6 +4882,7 @@ mod vector_column {
             Some(Column::Vec { .. }) => "vec",
             Some(Column::Mixed { .. }) => "mixed",
             Some(Column::Num { .. }) => "num",
+            Some(Column::Record { .. }) => "record",
             _ => "other",
         }
     }
@@ -5835,5 +6156,248 @@ mod record_constraint {
             .unwrap();
         g.drop_type_constraint("Person", "meta");
         assert!(!g.type_conflict_on_set(0, "meta", &vmap(&[("city", Value::Num(1.0))])));
+    }
+}
+
+/// R-CONSTRAINTS Step 2: a declared RECORD constraint de-boxes the property key's
+/// column into typed per-field sub-columns ([`Column::Record`]). These tests pin
+/// the substrate: de-boxing happens on declare, every read round-trips
+/// byte-identically to the boxed map, non-conforming values (a shared key across
+/// labels) stay correct via the escape overlay, backfill + drop-rebox work, and a
+/// field reads straight from its sub-column.
+#[cfg(test)]
+mod record_debox {
+    use super::*;
+
+    fn s(x: &str) -> Value {
+        Value::Str(x.into())
+    }
+    fn n(x: f64) -> Value {
+        Value::Num(x)
+    }
+    fn vmap(pairs: &[(&str, Value)]) -> Value {
+        Value::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).into(), v.clone()))
+                .collect(),
+        )
+    }
+    /// A graph with `Person` a whose `meta = {city, tier}` and a record constraint
+    /// already declared (so `meta` is de-boxed).
+    fn declared() -> Graph {
+        let mut g = crate::ndjson::decode(
+            r#"{"type":"node","id":"a","labels":["Person"],"properties":{"meta":{"city":"NYC","tier":2}}}"#,
+        )
+        .unwrap();
+        g.create_type_constraint("Person", "meta", "record{city::string,tier::number}")
+            .unwrap();
+        g
+    }
+    fn read(g: &Graph, idx: usize) -> Value {
+        g.props.value(idx, "meta", &g.strs)
+    }
+    fn write(g: &mut Graph, idx: usize, v: Value) {
+        g.props.set_value(idx, "meta", v, &mut g.strs);
+    }
+    fn col_name(g: &Graph, key: &str) -> &'static str {
+        match g.props.col(key) {
+            Some(Column::Record { .. }) => "record",
+            Some(Column::Mixed { .. }) => "mixed",
+            _ => "other",
+        }
+    }
+
+    #[test]
+    fn declaring_deboxes_the_column_and_types_the_fields() {
+        let g = declared();
+        assert_eq!(col_name(&g, "meta"), "record");
+        // The field sub-columns are TYPED (string→Str, number→Num), not boxed.
+        let Some(Column::Record {
+            field_names,
+            fields,
+            ..
+        }) = g.props.col("meta")
+        else {
+            panic!("meta should be a de-boxed record column");
+        };
+        assert_eq!(
+            field_names.iter().map(|n| n.as_ref()).collect::<Vec<_>>(),
+            ["city", "tier"] // sorted canonical order
+        );
+        assert!(matches!(fields[0], Column::Str { .. }));
+        assert!(matches!(fields[1], Column::Num { .. }));
+        // The backfilled value reads back identically to the boxed map.
+        assert_eq!(read(&g, 0), vmap(&[("city", s("NYC")), ("tier", n(2.0))]));
+    }
+
+    #[test]
+    fn every_record_shape_roundtrips_byte_identically() {
+        let mut g = declared();
+        for v in [
+            vmap(&[("city", s("LA")), ("tier", n(3.0))]),     // full
+            vmap(&[("city", s("SF"))]),                       // nullable field omitted
+            vmap(&[("city", s("X")), ("tier", Value::Null)]), // field stored null
+            vmap(&[]),                                        // empty map (present, not absent)
+        ] {
+            write(&mut g, 0, v.clone());
+            assert_eq!(read(&g, 0), v, "round-trip mismatch");
+            assert!(g.props.is_present(0, "meta"));
+        }
+        // A stored null at the top level reads back as null but stays PRESENT.
+        write(&mut g, 0, Value::Null);
+        assert_eq!(read(&g, 0), Value::Null);
+        assert!(g.props.is_present(0, "meta"));
+        // Removal is distinct from a stored null: absent, not present.
+        g.props.remove_value(0, "meta");
+        assert_eq!(read(&g, 0), Value::Null);
+        assert!(!g.props.is_present(0, "meta"));
+    }
+
+    #[test]
+    fn nonconforming_values_stay_correct_via_the_escape_overlay() {
+        // The column is de-boxed for `Person.meta`, but the key is global — a
+        // scalar or a differently-shaped map must still round-trip.
+        let mut g = declared();
+        let a = g.add_vertex(&["Other".into()], vec![]);
+        let b = g.add_vertex(&["Other".into()], vec![]);
+        write(&mut g, a as usize, n(42.0)); // a scalar escapes
+        write(
+            &mut g,
+            b as usize,
+            vmap(&[("lat", n(1.0)), ("lng", n(2.0))]), // an extra-keyed map escapes
+        );
+        assert_eq!(read(&g, a as usize), n(42.0));
+        assert_eq!(
+            read(&g, b as usize),
+            vmap(&[("lat", n(1.0)), ("lng", n(2.0))])
+        );
+        assert!(g.props.is_present(a as usize, "meta"));
+        // Overwriting an escapee with a conforming map clears the escape.
+        write(&mut g, a as usize, vmap(&[("city", s("NYC"))]));
+        assert_eq!(read(&g, a as usize), vmap(&[("city", s("NYC"))]));
+        let Some(Column::Record { escaped, .. }) = g.props.col("meta") else {
+            panic!();
+        };
+        assert!(!escaped.contains_key(&a), "escape not cleared on reconform");
+        assert!(escaped.contains_key(&b), "b still escaped");
+    }
+
+    #[test]
+    fn field_at_reads_a_deboxed_field_directly() {
+        let mut g = declared();
+        let kid = g.props.keys.get("meta").unwrap();
+        write(&mut g, 0, vmap(&[("city", s("LA")), ("tier", n(3.0))]));
+        assert_eq!(g.props.field_at(0, kid, &["city"], &g.strs), s("LA"));
+        assert_eq!(g.props.field_at(0, kid, &["tier"], &g.strs), n(3.0));
+        // A field the (nullable) value omits → Null.
+        write(&mut g, 0, vmap(&[("city", s("LA"))]));
+        assert_eq!(g.props.field_at(0, kid, &["tier"], &g.strs), Value::Null);
+        // An undeclared segment → Null (closed record).
+        assert_eq!(g.props.field_at(0, kid, &["nope"], &g.strs), Value::Null);
+        // On a stored-null / absent record, a field is Null.
+        write(&mut g, 0, Value::Null);
+        assert_eq!(g.props.field_at(0, kid, &["city"], &g.strs), Value::Null);
+        // On an escapee, `field_at` walks the boxed value.
+        let e = g.add_vertex(&["Other".into()], vec![]) as usize;
+        write(&mut g, e, vmap(&[("lat", n(9.0))]));
+        assert_eq!(g.props.field_at(e, kid, &["lat"], &g.strs), n(9.0));
+    }
+
+    #[test]
+    fn backfill_on_declare_matches_the_boxed_reads() {
+        // Store several boxed maps FIRST, snapshot their reads, then declare.
+        let mut g = crate::ndjson::decode(
+            r#"{"type":"node","id":"a","labels":["Person"],"properties":{"meta":{"city":"NYC","tier":2}}}"#,
+        )
+        .unwrap();
+        let b = g.add_vertex(
+            &["Person".into()],
+            vec![("meta".into(), vmap(&[("city", s("LA"))]))],
+        ) as usize;
+        let c = g.add_vertex(
+            &["Person".into()],
+            vec![("meta".into(), vmap(&[("city", s("SF")), ("tier", n(7.0))]))],
+        ) as usize;
+        let before: Vec<Value> = (0..=c).map(|i| read(&g, i)).collect();
+        assert_eq!(col_name(&g, "meta"), "mixed");
+        g.create_type_constraint("Person", "meta", "record{city::string,tier::number}")
+            .unwrap();
+        assert_eq!(col_name(&g, "meta"), "record");
+        let after: Vec<Value> = (0..=c).map(|i| read(&g, i)).collect();
+        assert_eq!(before, after, "backfill changed a value");
+        assert!(g.props.is_present(b, "meta") && g.props.is_present(c, "meta"));
+    }
+
+    #[test]
+    fn dropping_the_constraint_reboxes_to_mixed_without_data_loss() {
+        let mut g = declared();
+        write(&mut g, 0, vmap(&[("city", s("LA")), ("tier", n(3.0))]));
+        let before = read(&g, 0);
+        g.drop_type_constraint("Person", "meta");
+        assert_eq!(col_name(&g, "meta"), "mixed");
+        assert_eq!(read(&g, 0), before, "rebox changed the value");
+    }
+
+    #[test]
+    fn a_second_label_on_the_same_key_keeps_it_deboxed_until_both_drop() {
+        let mut g = declared();
+        g.create_type_constraint("Company", "meta", "record{city::string,tier::number}")
+            .unwrap();
+        assert_eq!(col_name(&g, "meta"), "record");
+        // Dropping one of two constraints on the key must NOT re-box.
+        g.drop_type_constraint("Person", "meta");
+        assert_eq!(col_name(&g, "meta"), "record");
+        // Dropping the last one re-boxes.
+        g.drop_type_constraint("Company", "meta");
+        assert_eq!(col_name(&g, "meta"), "mixed");
+    }
+
+    #[test]
+    fn ndjson_encodes_a_deboxed_record_identically_to_the_boxed_map() {
+        // The same graph, boxed vs de-boxed, must serialize to the same NDJSON.
+        let boxed = crate::ndjson::decode(
+            r#"{"type":"node","id":"a","labels":["Person"],"properties":{"meta":{"city":"NYC","tier":2}}}"#,
+        )
+        .unwrap();
+        let deboxed = declared();
+        assert_eq!(col_name(&deboxed, "meta"), "record");
+        assert_eq!(
+            crate::ndjson::encode(&boxed),
+            crate::ndjson::encode(&deboxed)
+        );
+    }
+
+    #[test]
+    fn edge_record_constraint_deboxes_and_roundtrips() {
+        let mut g = crate::ndjson::decode(
+            concat!(
+                r#"{"type":"node","id":"a","labels":["P"],"properties":{}}"#,
+                "\n",
+                r#"{"type":"node","id":"b","labels":["P"],"properties":{}}"#,
+                "\n",
+                r#"{"type":"edge","id":"e","from":"a","to":"b","labels":["LINK"],"properties":{"meta":{"w":0.5}}}"#,
+            ),
+        )
+        .unwrap();
+        g.create_edge_type_constraint("LINK", "meta", "record{w::number}")
+            .unwrap();
+        assert!(matches!(
+            g.edge_props.col("meta"),
+            Some(Column::Record { .. })
+        ));
+        assert_eq!(
+            g.edge_props.value(0, "meta", &g.strs),
+            vmap(&[("w", n(0.5))])
+        );
+        g.drop_edge_type_constraint("LINK", "meta");
+        assert!(matches!(
+            g.edge_props.col("meta"),
+            Some(Column::Mixed { .. })
+        ));
+        assert_eq!(
+            g.edge_props.value(0, "meta", &g.strs),
+            vmap(&[("w", n(0.5))])
+        );
     }
 }

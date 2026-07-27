@@ -7322,3 +7322,79 @@ fn deep_stored_field_access_reads_only_the_leaf() {
         vec![vec![Value::Null]],
     );
 }
+
+#[test]
+fn deboxed_record_queries_identically_to_the_boxed_map() {
+    // R-CONSTRAINTS Step 2: declaring a RECORD constraint de-boxes `meta` into
+    // typed sub-columns. Every read path (whole map, field access, nested WHERE,
+    // dotted-path index seek) must return exactly what the boxed map did.
+    let mut g = map_graph();
+    g.create_type_constraint("P", "meta", "record{city::string,n::number}")
+        .unwrap();
+    // Whole-map read (synthesized from sub-columns).
+    assert_eq!(
+        rows(&mut g, "MATCH (n:P {id:'a'}) RETURN n.meta AS m"),
+        vec![vec![vmap(&[("city", s("NYC")), ("n", n(1.0))])]],
+    );
+    // Direct field read (sub-column, no map materialization) + a missing field.
+    assert_eq!(
+        rows(&mut g, "MATCH (n:P {id:'a'}) RETURN n.meta.city AS c"),
+        vec![vec![s("NYC")]],
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH (n:P {id:'a'}) RETURN n.meta.zip AS z"),
+        vec![vec![Value::Null]],
+    );
+    // Nested-field predicate (scan over the de-boxed column).
+    let mut ids: Vec<Value> = rows(
+        &mut g,
+        "MATCH (n:P) WHERE n.meta.city = 'NYC' RETURN n.id AS id",
+    )
+    .into_iter()
+    .map(|r| r[0].clone())
+    .collect();
+    ids.sort_by(|x, y| format!("{x:?}").cmp(&format!("{y:?}")));
+    assert_eq!(ids, vec![s("a"), s("b")]);
+    // The dotted-path index still seeks after de-boxing (build reads via synthesis).
+    g.create_vertex_index("meta.city");
+    let mut p = Params::new();
+    p.insert("c".to_string(), super::eval::Val::Str("LA".into()));
+    let out = qp(
+        &mut g,
+        "MATCH (n:P) WHERE n.meta.city = $c RETURN n.id AS id",
+        p,
+    );
+    assert_eq!(out, vec![vec![s("c")]]);
+    // A SET that scatters into sub-columns round-trips.
+    let updated = rows(
+        &mut g,
+        "MATCH (n:P {id:'a'}) SET n.meta = {city: 'SF', n: 9} RETURN n.meta.city AS c",
+    );
+    assert_eq!(updated, vec![vec![s("SF")]]);
+}
+
+#[test]
+fn deboxed_record_survives_transaction_rollback() {
+    // A SET that scatters into the record sub-columns must undo exactly on
+    // rollback — the undo log captures the synthesized prior map and re-scatters.
+    let mut g = map_graph();
+    g.create_type_constraint("P", "meta", "record{city::string,n::number}")
+        .unwrap();
+    let before = rows(&mut g, "MATCH (n:P {id:'a'}) RETURN n.meta AS m");
+    g.begin_tx();
+    let _ = rows(
+        &mut g,
+        "MATCH (n:P {id:'a'}) SET n.meta = {city: 'SF', n: 9}",
+    );
+    // Read-your-writes inside the transaction.
+    assert_eq!(
+        rows(&mut g, "MATCH (n:P {id:'a'}) RETURN n.meta.city AS c"),
+        vec![vec![s("SF")]],
+    );
+    g.rollback_tx();
+    assert_eq!(
+        rows(&mut g, "MATCH (n:P {id:'a'}) RETURN n.meta AS m"),
+        before,
+        "the record is exactly restored after rollback",
+    );
+}
