@@ -5447,10 +5447,14 @@ fn layered_dense(layers: usize, width: usize) -> Graph {
     graph_of(&refs)
 }
 
-/// Throwaway micro-benchmark (ignored; run with `--ignored --nocapture`) comparing
-/// the HOT abbreviated var-length path at k=1. Prints elapsed wall time — no
-/// assertion (wall clock is flaky as a gate). Used only to decide whether the
-/// unified unit matcher needs a k=1 fast-path pitch.
+/// Throwaway micro-benchmark (ignored; run with `--ignored --nocapture`) for the HOT
+/// abbreviated var-length path at k=1. Prints elapsed wall time — no assertion (wall
+/// clock is flaky as a gate). As shipped this measures the single-edge fast-path
+/// (`reachable_each`, ~180µs/iter here). Temporarily building a 1-hop `CUnit` for the
+/// abbreviated form in `plan::segment` reroutes it through the general unit matcher —
+/// that measured 720µs before the flat-buffer + gated-reconstruct work and ~480µs
+/// after, versus ~180µs fused; the residual is `expand_unit`'s materialization, which
+/// is exactly what the fast-path specializes away. See `reachable_each_unit`'s doc.
 #[test]
 #[ignore]
 fn bench_k1_abbreviated_walk() {

@@ -641,6 +641,19 @@ pub struct CUnit {
     pub where_: Option<CExpr>,
 }
 
+impl CUnit {
+    /// Whether this unit binds any GROUP variable (source, an edge, or a hop target).
+    /// When it binds nothing, the walk's `verts`/`edges` need not be reconstructed —
+    /// the matcher can skip the per-end path rebuild (the abbreviated form's speed).
+    pub fn exposes(&self) -> bool {
+        self.start_slot.is_some()
+            || self
+                .hops
+                .iter()
+                .any(|h| h.target_slot.is_some() || h.rel.var_slot.is_some())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CUnitHop {
     /// The relationship (for expansion + its own inline label/property filter).

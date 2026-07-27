@@ -3192,11 +3192,29 @@ fn bind_group_vars(
     restores
 }
 
-/// One traversal of a repetition UNIT from a frontier vertex: the `k` edges and the
-/// `k` target vertices (in hop order); the unit's end is `verts.last()`.
-struct UnitMatch {
+/// FLAT storage for every unit-traversal from one frontier vertex: match `i` occupies
+/// `edges[i*k .. (i+1)*k]` and `verts[i*k .. (i+1)*k]` (in hop order); its end is the
+/// last vert. One pair of allocations for the whole frontier — NOT two `Vec`s per
+/// candidate edge (a naive per-match layout is what made the unit matcher 4× slower
+/// than the single-edge fast-path at `k = 1`).
+struct UnitMatches {
     edges: Vec<u32>,
     verts: Vec<u32>,
+}
+
+impl UnitMatches {
+    fn count(&self, k: usize) -> usize {
+        self.edges.len() / k // a unit has k ≥ 1 hops, and buffers grow k at a time
+    }
+    fn edges_of(&self, i: usize, k: usize) -> &[u32] {
+        &self.edges[i * k..(i + 1) * k]
+    }
+    fn verts_of(&self, i: usize, k: usize) -> &[u32] {
+        &self.verts[i * k..(i + 1) * k]
+    }
+    fn end_of(&self, i: usize, k: usize) -> u32 {
+        self.verts[(i + 1) * k - 1]
+    }
 }
 
 /// Enumerate every way to traverse `unit`'s `k` hops from `from`, honouring each
@@ -3211,7 +3229,7 @@ fn expand_unit(
     binding: &mut Binding,
     unit: &CUnit,
     from: u32,
-) -> Vec<UnitMatch> {
+) -> UnitMatches {
     fn restore(binding: &mut Binding, saved: Option<(usize, Option<Val>)>) {
         if let Some((s, prev)) = saved {
             match prev {
@@ -3227,6 +3245,8 @@ fn expand_unit(
             (s, prev)
         })
     }
+    // `scratch_e`/`scratch_v` hold the current partial unit (k values); a completed unit
+    // is appended to the flat `out` buffers in one `extend_from_slice`.
     #[allow(clippy::too_many_arguments)]
     fn walk(
         graph: &Graph,
@@ -3235,9 +3255,9 @@ fn expand_unit(
         unit: &CUnit,
         hop_i: usize,
         cur: u32,
-        edges: &mut Vec<u32>,
-        verts: &mut Vec<u32>,
-        out: &mut Vec<UnitMatch>,
+        scratch_e: &mut Vec<u32>,
+        scratch_v: &mut Vec<u32>,
+        out: &mut UnitMatches,
     ) {
         if hop_i == unit.hops.len() {
             // The whole unit is matched — every inner variable is bound, so the
@@ -3247,16 +3267,14 @@ fn expand_unit(
                 .as_ref()
                 .is_none_or(|w| as_truth(&eval(&Env::new(graph, ctx, binding), w)) == Some(true));
             if ok {
-                out.push(UnitMatch {
-                    edges: edges.clone(),
-                    verts: verts.clone(),
-                });
+                out.edges.extend_from_slice(scratch_e);
+                out.verts.extend_from_slice(scratch_v);
             }
             return;
         }
         let hop = &unit.hops[hop_i];
         for (eidx, nbr) in expand(graph, ctx, cur, hop.rel.direction, hop.rel.label.as_ref()) {
-            if edges.contains(&eidx) {
+            if scratch_e.contains(&eidx) {
                 continue; // no edge twice within one unit
             }
             let e_saved = bind(binding, hop.rel.var_slot, Val::Edge(eidx));
@@ -3266,21 +3284,42 @@ fn expand_unit(
                 continue;
             }
             let t_saved = bind(binding, hop.target_slot, Val::Node(nbr));
-            edges.push(eidx);
-            verts.push(nbr);
-            walk(graph, ctx, binding, unit, hop_i + 1, nbr, edges, verts, out);
-            edges.pop();
-            verts.pop();
+            scratch_e.push(eidx);
+            scratch_v.push(nbr);
+            walk(
+                graph,
+                ctx,
+                binding,
+                unit,
+                hop_i + 1,
+                nbr,
+                scratch_e,
+                scratch_v,
+                out,
+            );
+            scratch_e.pop();
+            scratch_v.pop();
             restore(binding, t_saved);
             restore(binding, e_saved);
         }
     }
     let start_saved = bind(binding, unit.start_slot, Val::Node(from));
-    let mut edges = Vec::with_capacity(unit.hops.len());
-    let mut verts = Vec::with_capacity(unit.hops.len());
-    let mut out = Vec::new();
+    let mut scratch_e = Vec::with_capacity(unit.hops.len());
+    let mut scratch_v = Vec::with_capacity(unit.hops.len());
+    let mut out = UnitMatches {
+        edges: Vec::new(),
+        verts: Vec::new(),
+    };
     walk(
-        graph, ctx, binding, unit, 0, from, &mut edges, &mut verts, &mut out,
+        graph,
+        ctx,
+        binding,
+        unit,
+        0,
+        from,
+        &mut scratch_e,
+        &mut scratch_v,
+        &mut out,
     );
     restore(binding, start_saved);
     out
@@ -3293,14 +3332,20 @@ fn expand_unit(
 /// a whole unit's edges/targets). This is the ONE code path shared by single- AND
 /// multi-element parenthesized subpaths — a one-hop unit (`k = 1`) is not special-cased.
 ///
-/// [`reachable_each`] is a hand-specialized `k = 1` twin of this function, kept ONLY
-/// as a fast-path for the hot abbreviated `-[]->{n,m}` form: routing that form
-/// through here instead measured a 4.15× regression (173µs → 720µs/iter, see the
-/// `bench_k1_abbreviated_walk` test), because a one-hop `UnitMatch` heap-allocates
-/// two `Vec`s per edge and reconstructs the walk unconditionally, where the single-
-/// edge stepper works over borrowed `(eidx, nbr)` tuples and only reconstructs under
-/// `want_path`. The two share an IDENTICAL DFS skeleton (seed/min-0 handling, mark
-/// setup, `TRAIL_BUDGET`, SIMPLE-close, consumer-stop clearing); the
+/// [`reachable_each`] is a hand-specialized `k = 1` twin of this function, kept as a
+/// fast-path for the hot abbreviated `-[]->{n,m}` form. The gap is STRUCTURAL, not
+/// merely allocational: this general matcher MATERIALIZES every unit-traversal from a
+/// frontier vertex into a buffer (`expand_unit`) before stepping, because a `k`-hop
+/// unit needs a nested enumeration Rust can't express as a cheap lazy iterator; the
+/// single-edge stepper instead FUSES expansion with stepping over borrowed
+/// `(eidx, nbr)` tuples, materializing nothing. Routing the abbreviated form through
+/// here measured 720µs/iter vs the fast-path's ~180µs (`bench_k1_abbreviated_walk`) —
+/// a 4.15× gap. Flat stride-`k` buffers (one alloc-pair per vertex, not two `Vec`s per
+/// edge) plus a `want_path`-gated reconstruct cut that to ~2.7×, but the residual is
+/// the materialization itself, which parity would require removing — i.e. becoming the
+/// single-edge special case. Those same wins also speed up REAL subpaths, which always
+/// run here. The two share an IDENTICAL DFS skeleton (seed/min-0 handling, mark setup,
+/// `TRAIL_BUDGET`, SIMPLE-close, consumer-stop clearing); the
 /// `abbreviated_and_single_edge_subpath_agree_k1` test pins them byte-identical at
 /// `k = 1` across every path mode so they cannot silently drift.
 fn reachable_each_unit(
@@ -3312,7 +3357,7 @@ fn reachable_each_unit(
     spec: WalkSpec,
     on_end: OnEnd<'_>,
 ) -> bool {
-    let WalkSpec { q, mode, .. } = spec;
+    let WalkSpec { q, mode, want_path } = spec;
     if ctx.faulted() {
         return true;
     }
@@ -3334,132 +3379,145 @@ fn reachable_each_unit(
     }
 
     struct Frame {
-        units: Vec<UnitMatch>,
+        m: UnitMatches,
         idx: usize,
         depth: u32,
-        // Mark indices this frame set (a whole unit's edges or target nodes),
-        // cleared on backtrack.
-        entry_marks: Vec<usize>,
-        // The unit that led to this frame's vertex (for path reconstruction).
-        entry_unit: Option<UnitMatch>,
+        // The match index in the PARENT frame's `m` that led here: identifies both the
+        // marks THIS frame set (cleared on backtrack) and its slice of the reconstructed
+        // path. Meaningless for the seed frame (never read — reconstruction / clearing
+        // start at frame 1).
+        entry_idx: usize,
     }
 
-    // Reconstruct the full walk (seed + every unit's targets / edges) from the live
-    // stack, for the group-variable exposure at `on_end`.
-    fn reconstruct(stack: &[Frame], last: &UnitMatch, seed: u32) -> (Vec<u32>, Vec<u32>) {
-        let mut pv = vec![seed];
-        let mut pe = Vec::new();
-        for f in stack.iter().skip(1) {
-            if let Some(u) = &f.entry_unit {
-                pv.extend_from_slice(&u.verts);
-                pe.extend_from_slice(&u.edges);
+    // The marks a matched unit claims: its edges (TRAIL) or its target verts
+    // (SIMPLE/ACYCLIC), read straight off the flat buffer — no per-step allocation.
+    // WALK claims nothing.
+    fn unit_marks(m: &UnitMatches, i: usize, k: usize, mode: PathMode) -> &[u32] {
+        match mode {
+            PathMode::Trail => m.edges_of(i, k),
+            PathMode::Simple | PathMode::Acyclic => m.verts_of(i, k),
+            PathMode::Walk => &[],
+        }
+    }
+
+    // Clear every live frame's marks (each frame's entry-match marks in its parent) —
+    // used on consumer-stop / budget-fault so a pooled TRAIL buffer is returned clean.
+    fn clear_live(stack: &[Frame], k: usize, mode: PathMode, marks: &mut [bool]) {
+        for f in 1..stack.len() {
+            let ei = stack[f].entry_idx;
+            for &x in unit_marks(&stack[f - 1].m, ei, k, mode) {
+                marks[x as usize] = false;
             }
         }
-        pv.extend_from_slice(&last.verts);
-        pe.extend_from_slice(&last.edges);
+    }
+
+    // Reconstruct the full walk (seed + every frame's entry match + the current match
+    // `i` on the top frame) for the group-variable exposure at `on_end`.
+    fn reconstruct(stack: &[Frame], i: usize, k: usize, seed: u32) -> (Vec<u32>, Vec<u32>) {
+        let mut pv = vec![seed];
+        let mut pe = Vec::new();
+        for f in 1..stack.len() {
+            let em = &stack[f - 1].m;
+            let ei = stack[f].entry_idx;
+            pv.extend_from_slice(em.verts_of(ei, k));
+            pe.extend_from_slice(em.edges_of(ei, k));
+        }
+        let last = &stack[stack.len() - 1].m;
+        pv.extend_from_slice(last.verts_of(i, k));
+        pe.extend_from_slice(last.edges_of(i, k));
         (pv, pe)
     }
 
+    let k = unit.hops.len();
     let mut steps: u64 = 0;
     let mut cont = true;
     let mut stack: Vec<Frame> = vec![Frame {
-        units: expand_unit(graph, ctx, binding, unit, from),
+        m: expand_unit(graph, ctx, binding, unit, from),
         idx: 0,
         depth: 0,
-        entry_marks: Vec::new(),
-        entry_unit: None,
+        entry_idx: 0,
     }];
 
-    while let Some(top) = stack.last_mut() {
-        if q.max.is_some_and(|m| top.depth >= m) || top.idx >= top.units.len() {
-            let cleared = std::mem::take(&mut top.entry_marks);
-            for i in cleared {
-                marks[i] = false;
+    while let Some(top) = stack.last() {
+        let li = stack.len() - 1;
+        if q.max.is_some_and(|m| top.depth >= m) || top.idx >= top.m.count(k) {
+            // Backtrack: clear the marks this frame set (its entry match, in the parent).
+            if li > 0 {
+                let ei = stack[li].entry_idx;
+                for &x in unit_marks(&stack[li - 1].m, ei, k, mode) {
+                    marks[x as usize] = false;
+                }
             }
             stack.pop();
             continue;
         }
-        let m = std::mem::replace(
-            &mut top.units[top.idx],
-            UnitMatch {
-                edges: Vec::new(),
-                verts: Vec::new(),
-            },
-        );
         let depth = top.depth;
-        top.idx += 1;
+        let i = top.idx;
+        stack[li].idx += 1;
+        let top = &stack[li];
 
-        // Restrictor: which marks this unit claims (all its edges for TRAIL, all its
-        // targets for SIMPLE/ACYCLIC), and whether it is a non-extending SIMPLE close
-        // back on the seed. A unit is rejected outright if it collides with a mark.
-        let end = *m.verts.last().expect("a unit has ≥ 1 hop");
-        let (new_marks, is_close): (Vec<usize>, bool) = match mode {
-            PathMode::Walk => (Vec::new(), false),
-            PathMode::Trail => {
-                if m.edges.iter().any(|&e| marks[e as usize]) {
-                    continue;
+        // Restrictor: whether this unit collides with a mark (rejected), and whether it
+        // is a non-extending SIMPLE close back on the seed.
+        let end = top.m.end_of(i, k);
+        let is_close = matches!(mode, PathMode::Simple) && end == from;
+        if !is_close {
+            let collide = match mode {
+                PathMode::Trail => top.m.edges_of(i, k).iter().any(|&e| marks[e as usize]),
+                PathMode::Simple | PathMode::Acyclic => {
+                    top.m.verts_of(i, k).iter().any(|&v| marks[v as usize])
                 }
-                (m.edges.iter().map(|&e| e as usize).collect(), false)
+                PathMode::Walk => false,
+            };
+            if collide {
+                continue;
             }
-            PathMode::Acyclic => {
-                if m.verts.iter().any(|&v| marks[v as usize]) {
-                    continue;
-                }
-                (m.verts.iter().map(|&v| v as usize).collect(), false)
-            }
-            PathMode::Simple => {
-                if end == from {
-                    (Vec::new(), true) // close the cycle on the seed
-                } else if m.verts.iter().any(|&v| marks[v as usize]) {
-                    continue;
-                } else {
-                    (m.verts.iter().map(|&v| v as usize).collect(), false)
-                }
-            }
-        };
+        }
 
         steps += 1;
         if steps > TRAIL_BUDGET {
             ctx.set_fault(FAULT_BUDGET);
-            for f in &stack {
-                for &i in &f.entry_marks {
-                    marks[i] = false;
-                }
-            }
+            clear_live(&stack, k, mode, &mut marks);
             break;
         }
 
-        for &i in &new_marks {
-            marks[i] = true;
+        // Claim this unit's marks (nothing for WALK / a close).
+        if !is_close {
+            for &x in unit_marks(&stack[li].m, i, k, mode) {
+                marks[x as usize] = true;
+            }
         }
         let d = depth + 1;
-        let (pv, pe) = reconstruct(&stack, &m, from);
-        if d >= q.min && !on_end(binding, end, &pv, &pe) {
+        // Only rebuild the walk (an alloc + full-stack walk PER end) when the caller
+        // exposes group variables. The abbreviated form wants only the endpoint, so it
+        // skips this entirely — matching the single-edge fast-path's cost.
+        let stop = d >= q.min
+            && !if want_path {
+                let (pv, pe) = reconstruct(&stack, i, k, from);
+                on_end(binding, end, &pv, &pe)
+            } else {
+                on_end(binding, end, &[], &[])
+            };
+        if stop {
             cont = false;
-            for &i in &new_marks {
-                marks[i] = false;
-            }
-            for f in &stack {
-                for &i in &f.entry_marks {
-                    marks[i] = false;
+            if !is_close {
+                for &x in unit_marks(&stack[li].m, i, k, mode) {
+                    marks[x as usize] = false;
                 }
             }
+            clear_live(&stack, k, mode, &mut marks);
             break;
         }
 
+        // A SIMPLE close emits but doesn't extend (and set no marks); otherwise descend
+        // from the unit's end, remembering which match `i` led there.
         if !is_close {
+            let child = expand_unit(graph, ctx, binding, unit, end);
             stack.push(Frame {
-                units: expand_unit(graph, ctx, binding, unit, end),
+                m: child,
                 idx: 0,
                 depth: d,
-                entry_marks: new_marks,
-                entry_unit: Some(m),
+                entry_idx: i,
             });
-        } else {
-            // A SIMPLE close emits but doesn't extend; drop the marks it would have set.
-            for &i in &new_marks {
-                marks[i] = false;
-            }
         }
     }
 
@@ -3713,7 +3771,7 @@ fn walk_segments(
         let spec = WalkSpec {
             q,
             mode: pattern.mode,
-            want_path: unit.is_some(),
+            want_path: unit.as_ref().is_some_and(|u| u.exposes()),
         };
         return match unit {
             Some(u) => reachable_each_unit(graph, ctx, binding, from, u, spec, sink),
@@ -4802,7 +4860,7 @@ fn match_path<F: FnMut(&mut Binding) -> bool>(
         let spec = WalkSpec {
             q,
             mode: path.mode,
-            want_path: unit.is_some(),
+            want_path: unit.as_ref().is_some_and(|u| u.exposes()),
         };
         return match unit {
             Some(u) => reachable_each_unit(graph, ctx, binding, from, u, spec, sink),
