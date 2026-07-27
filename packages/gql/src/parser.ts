@@ -629,6 +629,62 @@ export const parse = (
     check('ltilde') ||
     check('tilder');
 
+  // ISO quantified parenthesized subpath `( (x)-[e]->(y) [WHERE cond] ) {n,m}`
+  // (Phase 1: a single-edge repetition unit). The per-repetition `cond` may name
+  // the hop's source `x`, edge `e`, and target `y`; `y` is also the landing node.
+  // The opening `((` is at the cursor.
+  const parseQuantifiedSubpath = (): Segment => {
+    const open = peek().pos;
+    expect('lparen', "'(' to open a quantified subpath");
+    const hopFrom = parseNode(); // inner (x)
+
+    if (!startsRelationship()) {
+      throw new GqlSyntaxError(
+        'a quantified subpath must contain a relationship, e.g. `((x)-[e]->(y)){1,3}`',
+        peek().pos,
+      );
+    }
+
+    const rel = parseRel();
+    const node = parseNode(); // inner (y) = the landing node
+
+    if (startsRelationship()) {
+      throw new GqlSyntaxError(
+        'a quantified subpath with more than one relationship is not yet supported',
+        peek().pos,
+      );
+    }
+
+    // Phase 1: inner nodes carry only a variable — put per-hop label/property tests
+    // in the subpath `WHERE`, so nothing is silently dropped.
+    for (const n of [hopFrom, node]) {
+      if (n.label !== undefined || (n.properties?.length ?? 0) > 0 || n.where !== undefined) {
+        throw new GqlSyntaxError(
+          "a label or property on a quantified-subpath node isn't supported yet — " +
+            'put the per-hop test in the subpath `WHERE` instead',
+          open,
+        );
+      }
+    }
+
+    let { where } = rel;
+
+    if (checkKeyword('where')) {
+      advance();
+      const cond = parseExpr();
+      where = where ? { kind: 'and', items: [where, cond] } : cond;
+    }
+
+    expect('rparen', "')' to close a quantified subpath");
+    const quantifier = parseQuantifier();
+
+    if (quantifier === undefined) {
+      throw new GqlSyntaxError('a parenthesized subpath must be quantified (`( … ){n,m}`)', open);
+    }
+
+    return { rel: { ...rel, where, quantifier }, node, hopFrom };
+  };
+
   // Variable-length quantifier following an edge: `*`, `+`, `{n}`, `{n,m}`,
   // `{n,}`, `{,m}`.
   const parseQuantifier = (): RelPattern['quantifier'] => {
@@ -789,7 +845,19 @@ export const parse = (
       const start = parseNode();
       const segments: Segment[] = [];
 
-      while (startsRelationship()) {
+      for (;;) {
+        // ISO quantified PARENTHESIZED subpath `((x)-[e]->(y) WHERE …){n,m}`: the
+        // per-repetition predicate may reference the hop's source `x`, edge `e`,
+        // and target `y`. `((` can only open a subpath (a node never nests a `(`).
+        if (check('lparen') && tokens[pos + 1]?.type === 'lparen') {
+          segments.push(parseQuantifiedSubpath());
+          continue;
+        }
+
+        if (!startsRelationship()) {
+          break;
+        }
+
         const rel = parseRel();
         const quantifier = parseQuantifier();
         const node = parseNode();

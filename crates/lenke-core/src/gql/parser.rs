@@ -610,6 +610,65 @@ impl Parser {
         )
     }
 
+    /// ISO quantified parenthesized subpath `( (x)-[e]->(y) [WHERE cond] ) {n,m}`
+    /// (Phase 1: a single-edge repetition unit). The per-repetition `cond` may
+    /// reference the hop's source `x`, edge `e`, and target `y`; `y` is also the
+    /// landing/endpoint node. The opening `((` is at the cursor.
+    fn parse_quantified_subpath(&mut self) -> R<Segment> {
+        let open = self.peek().pos;
+        self.expect(Tt::LParen, "'(' to open a quantified subpath")?;
+        let hop_from = self.parse_node()?; // inner (x)
+        if !self.starts_relationship() {
+            return err(
+                "a quantified subpath must contain a relationship, e.g. `((x)-[e]->(y)){1,3}`",
+                self.peek().pos,
+            );
+        }
+        let mut rel = self.parse_rel()?;
+        let node = self.parse_node()?; // inner (y) = the landing node
+        if self.starts_relationship() {
+            return err(
+                "a quantified subpath with more than one relationship is not yet supported",
+                self.peek().pos,
+            );
+        }
+        // Phase 1: the inner nodes carry only a variable — put any per-hop label /
+        // property test in the subpath `WHERE` (`((x)-[e]->(y) WHERE x:Account AND
+        // e.amt > 0){1,3}`), so nothing is silently dropped.
+        for n in [&hop_from, &node] {
+            if n.label.is_some() || !n.props.is_empty() || n.where_.is_some() {
+                return err(
+                    "a label or property on a quantified-subpath node isn't supported yet — \
+                     put the per-hop test in the subpath `WHERE` instead",
+                    open,
+                );
+            }
+        }
+        // The subpath `WHERE` (over x/e/y) becomes the per-repetition predicate,
+        // AND-ed with any inline `-[e {…} WHERE …]->` predicate.
+        if self.check_kw("where") {
+            self.advance();
+            let cond = self.parse_expr()?;
+            rel.where_ = Some(match rel.where_.take() {
+                Some(w) => Expr::And(vec![w, cond]),
+                None => cond,
+            });
+        }
+        self.expect(Tt::RParen, "')' to close a quantified subpath")?;
+        let Some(q) = self.parse_quantifier()? else {
+            return err(
+                "a parenthesized subpath must be quantified (`( … ){n,m}`)",
+                open,
+            );
+        };
+        rel.quantifier = Some(q);
+        Ok(Segment {
+            rel,
+            node,
+            hop_from: Some(hop_from),
+        })
+    }
+
     fn parse_quantifier(&mut self) -> R<Option<Quantifier>> {
         if self.check(Tt::Star) {
             self.advance();
@@ -704,7 +763,19 @@ impl Parser {
 
             let start = p.parse_node()?;
             let mut segments = Vec::new();
-            while p.starts_relationship() {
+            loop {
+                // A quantified PARENTHESIZED subpath `((x)-[e]->(y) WHERE …){n,m}`
+                // (ISO `<parenthesized path pattern expression> <quantifier>`): the
+                // per-repetition predicate may reference the hop's SOURCE node `x`,
+                // edge `e`, and TARGET node `y`. A `((` can only open a subpath (a
+                // node pattern never nests a `(`).
+                if p.check(Tt::LParen) && p.peek2().tt == Tt::LParen {
+                    segments.push(p.parse_quantified_subpath()?);
+                    continue;
+                }
+                if !p.starts_relationship() {
+                    break;
+                }
                 let mut rel = p.parse_rel()?;
                 rel.quantifier = p.parse_quantifier()?;
                 // A quantified segment may carry a *per-hop* predicate — inline
@@ -714,7 +785,11 @@ impl Parser {
                 // turn); it is not yet a group/list variable exposed to the outer
                 // query, so referencing it outside the segment reads as null.
                 let node = p.parse_node()?;
-                segments.push(Segment { rel, node });
+                segments.push(Segment {
+                    rel,
+                    node,
+                    hop_from: None,
+                });
             }
 
             // Every selector (and a bare path variable) works over exactly one

@@ -268,6 +268,13 @@ export type PathMode = 'walk' | 'trail' | 'simple' | 'acyclic';
 export type Segment = {
   rel: RelPattern;
   node: NodePattern;
+  /**
+   * For an ISO quantified PARENTHESIZED subpath `((x)-[e]->(y) WHERE …){n,m}`:
+   * the inner SOURCE node `(x)` of each repetition, bound PER-HOP so the
+   * per-repetition predicate (`rel.where`) can reference the hop's source (`node`
+   * is the per-hop TARGET `y`). Absent for a plain hop / abbreviated `-[e]->{n,m}`.
+   */
+  hopFrom?: NodePattern;
 };
 
 /**

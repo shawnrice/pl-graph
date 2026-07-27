@@ -5314,6 +5314,54 @@ fn weighted_chain() -> Graph {
     ])
 }
 
+/// Chain with node balances + edge amounts, for the quantified parenthesized
+/// subpath (per-hop node + cross-element predicates).
+fn balanced_chain() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a","bal":100.0}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b","bal":200.0}}"#,
+        r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c","bal":5.0}}"#,
+        r#"{"type":"node","id":"d","labels":["N"],"properties":{"id":"d","bal":200.0}}"#,
+        r#"{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{"amt":30.0}}"#,
+        r#"{"type":"edge","id":"e2","from":"b","to":"c","labels":["R"],"properties":{"amt":20.0}}"#,
+        r#"{"type":"edge","id":"e3","from":"c","to":"d","labels":["R"],"properties":{"amt":10.0}}"#,
+    ])
+}
+
+/// ISO quantified parenthesized subpath `((x)-[e]->(y) WHERE …){n,m}` — Phase 1:
+/// the per-repetition predicate can name the hop's SOURCE `(x)`, edge `(e)`, and
+/// TARGET `(y)`, which the abbreviated `-[e]->{n,m}` form cannot.
+#[test]
+fn quantified_subpath_per_hop_node_and_cross_element_predicates() {
+    let mut g = balanced_chain();
+    // Cross-element: each hop's source can afford the edge (`e.amt <= x.bal`).
+    // a→b 30<=100 ✓, b→c 20<=200 ✓, c→d 10<=5 ✗ → reaches {b, c}, not d.
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt <= x.bal){1,3} RETURN y.id AS id",
+        ),
+        vec![s("b"), s("c")],
+    );
+    // Per-hop TARGET node predicate (`y.bal >= 100`): a→b b.bal 200 ✓, b→c c.bal 5
+    // ✗ → reaches {b} only.
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE y.bal >= 100){1,3} RETURN y.id AS id",
+        ),
+        vec![s("b")],
+    );
+    // A permissive predicate reaches the whole chain (b, c, d).
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt >= 1){1,3} RETURN y.id AS id",
+        ),
+        vec![s("b"), s("c"), s("d")],
+    );
+}
+
 /// `WHERE e.amt >= 10` per hop: e3 (amt 5) is excluded, so from `a` the walk can
 /// reach b and c but never d.
 #[test]

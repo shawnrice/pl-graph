@@ -3099,15 +3099,31 @@ type OnEnd<'a> = &'a mut dyn FnMut(&mut Binding, u32, &[u32], &[u32]) -> bool;
 /// `WHERE`)? The optional edge variable is bound to this edge for the duration of
 /// the check so the predicate can name it (`e.amt > $t`); outer bound variables in
 /// `binding` stay visible, and the slot is restored afterward.
-fn edge_passes(graph: &Graph, ctx: &Ctx, binding: &mut Binding, rel: &CRel, eidx: u32) -> bool {
+fn edge_passes(
+    graph: &Graph,
+    ctx: &Ctx,
+    binding: &mut Binding,
+    rel: &CRel,
+    from: u32,
+    eidx: u32,
+    to: u32,
+) -> bool {
     if rel.props.is_empty() && rel.where_.is_none() {
         return true;
     }
-    let restore = rel.var_slot.map(|s| {
-        let prev = binding.get(s).cloned();
-        binding.set(s, Val::Edge(eidx));
-        (s, prev)
-    });
+    // Bind this hop's edge, and — for a quantified parenthesized subpath — its
+    // source `(x)` and target `(y)` nodes, so the per-repetition predicate can name
+    // them (`((x)-[e]->(y) WHERE e.amt <= x.balance){1,5}`). Restored afterward.
+    let mut restores: Vec<(usize, Option<Val>)> = Vec::new();
+    let mut bind = |binding: &mut Binding, slot: Option<usize>, v: Val| {
+        if let Some(s) = slot {
+            restores.push((s, binding.get(s).cloned()));
+            binding.set(s, v);
+        }
+    };
+    bind(binding, rel.var_slot, Val::Edge(eidx));
+    bind(binding, rel.hop_from_slot, Val::Node(from));
+    bind(binding, rel.hop_to_slot, Val::Node(to));
     let ok = satisfies(
         graph,
         ctx,
@@ -3116,7 +3132,7 @@ fn edge_passes(graph: &Graph, ctx: &Ctx, binding: &mut Binding, rel: &CRel, eidx
         rel.where_.as_ref(),
         binding,
     );
-    if let Some((s, prev)) = restore {
+    for (s, prev) in restores.into_iter().rev() {
         match prev {
             Some(v) => binding.set(s, v),
             None => binding.unset(s),
@@ -3139,7 +3155,7 @@ fn expand_filtered(
         return expand(graph, ctx, v, rel.direction, rel.label.as_ref()).collect();
     }
     expand(graph, ctx, v, rel.direction, rel.label.as_ref())
-        .filter(|(eidx, _)| edge_passes(graph, ctx, binding, rel, *eidx))
+        .filter(|(eidx, nbr)| edge_passes(graph, ctx, binding, rel, v, *eidx, *nbr))
         .collect()
 }
 

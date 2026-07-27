@@ -1093,6 +1093,44 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     }
   });
 
+  // ISO quantified parenthesized subpath `((x)-[e]->(y) WHERE …){n,m}` — the
+  // per-repetition predicate names the hop's source/edge/target. Byte-identical.
+  test('quantified parenthesized subpath: per-hop node + cross-element predicate (TS vs native)', () => {
+    const BAL_NDJSON = [
+      '{"type":"node","id":"a","labels":["N"],"properties":{"id":"a","bal":100.0}}',
+      '{"type":"node","id":"b","labels":["N"],"properties":{"id":"b","bal":200.0}}',
+      '{"type":"node","id":"c","labels":["N"],"properties":{"id":"c","bal":5.0}}',
+      '{"type":"node","id":"d","labels":["N"],"properties":{"id":"d","bal":200.0}}',
+      '{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{"amt":30.0}}',
+      '{"type":"edge","id":"e2","from":"b","to":"c","labels":["R"],"properties":{"amt":20.0}}',
+      '{"type":"edge","id":"e3","from":"c","to":"d","labels":["R"],"properties":{"amt":10.0}}',
+    ].join('\n');
+    const nat = graphFromFormat(backend, BAL_NDJSON, 'ndjson');
+    const ts = tsDeserialize(BAL_NDJSON, 'ndjson', new Graph());
+
+    for (const q of [
+      "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt <= x.bal){1,3} RETURN y.id AS id ORDER BY y.id",
+      "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE y.bal >= 100){1,3} RETURN y.id AS id ORDER BY y.id",
+      "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt >= 1){1,3} RETURN y.id AS id ORDER BY y.id",
+    ]) {
+      expect(JSON.stringify(nat.query(q)), q).toBe(JSON.stringify(tsQuery(ts, q)));
+    }
+
+    // A labelled inner node is rejected by BOTH engines (Phase 1 restriction).
+    const throws = (fn: () => void): boolean => {
+      try {
+        fn();
+
+        return false;
+      } catch {
+        return true;
+      }
+    };
+    const bad = 'MATCH (s:N) ((x:N)-[e]->(y)){1,2} RETURN 1 AS c';
+    expect(throws(() => nat.query(bad))).toBe(true);
+    expect(throws(() => tsQuery(ts, bad))).toBe(true);
+  });
+
   // --- string `id` as element identity: `INSERT (:P {id: 'x'})` makes 'x' the
   // element id (so element_id === n.id and it round-trips), a numeric id stays an
   // ordinary property, dup/SET-id are rejected. Must be byte-identical. ---------

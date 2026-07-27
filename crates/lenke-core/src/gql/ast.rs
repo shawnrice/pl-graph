@@ -295,6 +295,13 @@ pub struct PathPattern {
 pub struct Segment {
     pub rel: RelPattern,
     pub node: NodePattern,
+    /// For an ISO quantified PARENTHESIZED subpath `((x)-[e]->(y) WHERE …){n,m}`:
+    /// the inner FROM-node `(x)` of each repetition, bound PER-HOP so the
+    /// per-repetition predicate (`rel.where_`) can reference the hop's source node
+    /// (`node` is the per-hop TARGET `y`). `None` for a plain hop or the abbreviated
+    /// `-[e]->{n,m}` form (where the source is just the previous node, unnamed).
+    /// Group-variable exposure of the inner vars is a later phase.
+    pub hop_from: Option<NodePattern>,
 }
 
 /// `(variable:LabelExpr {props} WHERE pred)` — all parts optional.

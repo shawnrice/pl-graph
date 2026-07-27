@@ -622,6 +622,12 @@ pub struct CRel {
     pub props: Vec<CPropConstraint>,
     pub where_: Option<CExpr>,
     pub quantifier: Option<Quantifier>,
+    /// For an ISO quantified parenthesized subpath `((x)-[e]->(y) WHERE …){n,m}`:
+    /// the per-hop SOURCE `(x)` and TARGET `(y)` node slots, bound to each hop's
+    /// endpoints so the per-repetition predicate (`where_`) can name them. Both
+    /// `None` for a plain hop / the abbreviated `-[e]->{n,m}` form.
+    pub hop_from_slot: Option<usize>,
+    pub hop_to_slot: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -1268,6 +1274,12 @@ impl Lowerer {
                 self.add_var(v);
             }
             for seg in &p.segments {
+                // The inner source `(x)` of a quantified parenthesized subpath.
+                if let Some(from) = &seg.hop_from {
+                    if let Some(v) = &from.variable {
+                        self.add_var(v);
+                    }
+                }
                 if let Some(v) = &seg.rel.variable {
                     self.add_var(v);
                 }
@@ -1566,20 +1578,27 @@ impl Lowerer {
             props: r.props.iter().map(|p| self.prop(p)).collect(),
             where_: r.where_.as_ref().map(|w| self.expr(w)),
             quantifier: r.quantifier,
+            hop_from_slot: None,
+            hop_to_slot: None,
         }
+    }
+
+    fn segment(&mut self, s: &Segment) -> CSegment {
+        let node = self.node(&s.node);
+        let mut rel = self.rel(&s.rel);
+        // A quantified parenthesized subpath binds the hop's source `(x)` and
+        // target `(y)` per repetition for its per-hop predicate.
+        if let Some(from) = &s.hop_from {
+            rel.hop_from_slot = from.variable.as_ref().map(|v| self.slot_of(v));
+            rel.hop_to_slot = node.var_slot;
+        }
+        CSegment { rel, node }
     }
 
     fn path(&mut self, p: &PathPattern) -> CPath {
         CPath {
             start: self.node(&p.start),
-            segments: p
-                .segments
-                .iter()
-                .map(|s| CSegment {
-                    rel: self.rel(&s.rel),
-                    node: self.node(&s.node),
-                })
-                .collect(),
+            segments: p.segments.iter().map(|s| self.segment(s)).collect(),
             path_var_slot: p.path_var.as_ref().map(|v| self.slot_of(v)),
             selector: p.selector,
             mode: p.mode,

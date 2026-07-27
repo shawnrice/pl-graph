@@ -2286,6 +2286,10 @@ const patternBoundVars = (p: PathPattern, into: Set<string>): void => {
   addNode(p.start);
 
   for (const seg of p.segments) {
+    if (seg.hopFrom !== undefined) {
+      addNode(seg.hopFrom); // the inner source `(x)` of a quantified subpath
+    }
+
     if (seg.rel.variable !== undefined) {
       into.add(seg.rel.variable);
     }
@@ -3009,6 +3013,11 @@ type CRel = {
   direction: RelPattern['direction'];
   pred: CPredicate;
   quantifier?: RelPattern['quantifier'];
+  /** For a quantified parenthesized subpath `((x)-[e]->(y) WHERE …){n,m}`: the
+   *  hop's source `(x)` and target `(y)` variable names, bound per repetition so
+   *  the per-hop predicate can name them. Absent for a plain / abbreviated hop. */
+  hopFromVar?: string;
+  hopToVar?: string;
 };
 type CSegment = { rel: CRel; node: CNode };
 type CPath = {
@@ -3239,10 +3248,16 @@ const compilePath = (pattern: PathPattern): CPath => {
 
   return {
     start: compileNode(pattern.start),
-    segments: pattern.segments.map(({ rel, node }) => ({
-      rel: compileRel(rel),
-      node: compileNode(node),
-    })),
+    segments: pattern.segments.map(({ rel, node, hopFrom }) => {
+      const crel = compileRel(rel);
+      // A quantified parenthesized subpath binds the hop's source `(x)` and target
+      // `(y)` per repetition for its per-hop predicate.
+      const withHop = hopFrom
+        ? { ...crel, hopFromVar: hopFrom.variable, hopToVar: node.variable }
+        : crel;
+
+      return { rel: withHop, node: compileNode(node) };
+    }),
     ...(pattern.pathVar !== undefined ? { pathVar: pattern.pathVar } : {}),
     selector,
     mode: pattern.mode ?? 'trail',
@@ -4169,10 +4184,15 @@ const trailEnds = function* (
 
     // Per-hop predicate: skip edges that fail it before any mark/step accounting
     // (a failing edge never enters the trail — mirrors native `expand_filtered`).
-    if (
-      hasPred &&
-      !satisfies(edge, rel.pred, withBinding(binding, rel.variable, edge), params, graph)
-    ) {
+    // A quantified subpath also binds the hop's source (`top.vertex`) and target
+    // (`node`) so the predicate can reference `(x)`/`(y)`.
+    const hopBinding = withBinding(
+      withBinding(withBinding(binding, rel.variable, edge), rel.hopFromVar, top.vertex),
+      rel.hopToVar,
+      node,
+    );
+
+    if (hasPred && !satisfies(edge, rel.pred, hopBinding, params, graph)) {
       continue;
     }
 
