@@ -765,6 +765,146 @@ impl PropType {
     }
 }
 
+/// A declared property TYPE for an R-CONSTRAINT: either a scalar [`PropType`] or
+/// an ISO `RECORD { field :: type, … }` (a *closed* record — an exact field set,
+/// each field itself a `TypeSpec`, so records nest). This is the contract a
+/// record-typed constraint enforces; a fixed-shape record is what later lets the
+/// store de-box it into columns. `PropType` stays `Copy`; only the (rare) record
+/// type carries the nested `Vec`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TypeSpec {
+    Scalar(PropType),
+    /// A closed record: sorted `(field, type)` pairs. Canonical key order so two
+    /// structurally-equal record types compare equal.
+    Record(Vec<(Arc<str>, Self)>),
+}
+
+impl TypeSpec {
+    /// Parse a constraint type name: a scalar (`string`, `number`, …) or a record
+    /// `record { field :: type, … }` (`:` or `::` accepted, whitespace ignored,
+    /// nesting allowed). `None` on any malformed input — the caller faults.
+    pub fn parse(s: &str) -> Option<Self> {
+        let mut p = TypeParser {
+            s: s.as_bytes(),
+            i: 0,
+        };
+        let t = p.parse_type()?;
+        p.skip_ws();
+        (p.i == p.s.len()).then_some(t)
+    }
+
+    /// Re-emit the canonical type name (round-trips through [`parse`](Self::parse));
+    /// used by `dump_schema` to replay a declared constraint.
+    fn to_name(&self) -> String {
+        match self {
+            Self::Scalar(t) => t.to_name().to_string(),
+            Self::Record(fields) => {
+                let inner: Vec<String> = fields
+                    .iter()
+                    .map(|(k, t)| format!("{k}::{}", t.to_name()))
+                    .collect();
+                format!("record{{{}}}", inner.join(","))
+            }
+        }
+    }
+}
+
+/// A tiny recursive-descent parser for a constraint type expression.
+struct TypeParser<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+
+impl TypeParser<'_> {
+    fn skip_ws(&mut self) {
+        while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {
+            self.i += 1;
+        }
+    }
+    /// Read a bare identifier (a field name or a scalar-type keyword).
+    fn ident(&mut self) -> Option<String> {
+        self.skip_ws();
+        let start = self.i;
+        while self.i < self.s.len()
+            && (self.s[self.i].is_ascii_alphanumeric() || self.s[self.i] == b'_')
+        {
+            self.i += 1;
+        }
+        (self.i > start).then(|| String::from_utf8_lossy(&self.s[start..self.i]).into_owned())
+    }
+    fn eat(&mut self, c: u8) -> bool {
+        self.skip_ws();
+        if self.i < self.s.len() && self.s[self.i] == c {
+            self.i += 1;
+            true
+        } else {
+            false
+        }
+    }
+    fn parse_type(&mut self) -> Option<TypeSpec> {
+        let word = self.ident()?;
+        if word.eq_ignore_ascii_case("record") {
+            self.parse_record()
+        } else {
+            PropType::from_name(&word).map(TypeSpec::Scalar)
+        }
+    }
+    /// `{ field [::|:] type [, …] }` — the `record` keyword already consumed.
+    fn parse_record(&mut self) -> Option<TypeSpec> {
+        if !self.eat(b'{') {
+            return None;
+        }
+        let mut fields: Vec<(Arc<str>, TypeSpec)> = Vec::new();
+        self.skip_ws();
+        if !self.eat(b'}') {
+            loop {
+                let name = self.ident()?;
+                // `::` or `:` between a field name and its type.
+                if !self.eat(b':') {
+                    return None;
+                }
+                self.eat(b':'); // optional second colon
+                let ty = self.parse_type()?;
+                let key: Arc<str> = name.into();
+                match fields.binary_search_by(|(k, _)| k.as_ref().cmp(key.as_ref())) {
+                    Ok(i) => fields[i].1 = ty, // duplicate field → last wins
+                    Err(i) => fields.insert(i, (key, ty)),
+                }
+                if self.eat(b',') {
+                    continue;
+                }
+                if self.eat(b'}') {
+                    break;
+                }
+                return None;
+            }
+        }
+        Some(TypeSpec::Record(fields))
+    }
+}
+
+/// Does a stored value satisfy a declared [`TypeSpec`]? A `Null` satisfies any
+/// type (nullability is the separate REQUIRED constraint — matching the scalar
+/// path). A record must be a map with EXACTLY the declared fields, each field's
+/// value recursively matching. Keys are canonical on both sides, so field
+/// alignment is positional.
+fn value_matches(v: &Value, spec: &TypeSpec) -> bool {
+    if matches!(v, Value::Null) {
+        return true;
+    }
+    match spec {
+        TypeSpec::Scalar(ty) => value_type(v) == Some(*ty),
+        TypeSpec::Record(fields) => {
+            let Value::Map(pairs) = v else { return false };
+            pairs.len() == fields.len()
+                && pairs
+                    .iter()
+                    .zip(fields.iter())
+                    .all(|((vk, vv), (fk, ft))| vk == fk && value_matches(vv, ft))
+        }
+    }
+}
+
 /// A scalar field value for [`schema_op`] — the small set of JSON leaf shapes a
 /// [`SchemaOp`](Graph::dump_schema) object carries.
 enum Jv<'a> {
@@ -970,6 +1110,11 @@ pub struct Graph {
     /// TYPE constraints: `label` → (`key` → the scalar type its present, non-null
     /// values must be). Null/absent are exempt (R-CONSTRAINTS).
     v_type: HashMap<String, HashMap<String, PropType>>,
+    /// RECORD-typed constraints: `label` → (`key` → a closed `RECORD {…}` shape
+    /// its present, non-null values must match). The record analogue of `v_type`,
+    /// kept separate so the scalar path stays a `Copy` `PropType` map. A declared
+    /// record shape is the contract that later lets the store de-box the column.
+    v_record: HashMap<String, HashMap<String, TypeSpec>>,
     /// UNIQUE constraints over **edge** properties: edge-type name → the sorted
     /// property keys that must be unique among live edges of that type. The edge
     /// analogue of `v_unique`, backed by the edge property index (`eidx`).
@@ -981,6 +1126,8 @@ pub struct Graph {
     /// analogue of `v_type` (named `e_type_constraints` because `e_type: Vec<u32>`
     /// already holds the per-edge type ids).
     e_type_constraints: HashMap<String, HashMap<String, PropType>>,
+    /// RECORD-typed constraints over edges — the edge analogue of `v_record`.
+    e_record: HashMap<String, HashMap<String, TypeSpec>>,
     /// CARDINALITY constraints: bound the DEGREE of every vertex carrying `label`
     /// over `etype` in `direction` (0 = out / the vertex is the edge source, 1 =
     /// in / the target) to `min..=max` (`max: None` unbounded). A small flat list
@@ -1088,9 +1235,11 @@ impl Clone for Graph {
             v_unique: self.v_unique.clone(),
             v_required: self.v_required.clone(),
             v_type: self.v_type.clone(),
+            v_record: self.v_record.clone(),
             e_unique: self.e_unique.clone(),
             e_required: self.e_required.clone(),
             e_type_constraints: self.e_type_constraints.clone(),
+            e_record: self.e_record.clone(),
             v_cardinality: self.v_cardinality.clone(),
             v_validators: self.v_validators.clone(),
             v_invariants: self.v_invariants.clone(),
@@ -1796,39 +1945,56 @@ impl Graph {
         key: &str,
         type_name: &str,
     ) -> CodeResult<()> {
-        let Some(ty) = PropType::from_name(type_name) else {
+        let Some(spec) = TypeSpec::parse(type_name) else {
             return Err(CodeError::new(
                 ErrorCode::InvalidValue,
-                "unknown scalar type name for a type constraint",
+                "unknown or malformed type name for a type constraint",
             ));
         };
+        // Validate existing data against the declared type (a null is exempt).
         if let Some(lid) = self.labels.get(label) {
             for vi in self.vertex_indices() {
-                if self.vlabels[vi as usize].contains(&lid) {
-                    if let Some(got) = value_type(&self.props.value(vi as usize, key, &self.strs)) {
-                        if got != ty {
-                            return Err(CodeError::new(
-                                ErrorCode::ConstraintViolation,
-                                "existing data already violates the type constraint being declared",
-                            ));
-                        }
-                    }
+                if self.vlabels[vi as usize].contains(&lid)
+                    && !value_matches(&self.props.value(vi as usize, key, &self.strs), &spec)
+                {
+                    return Err(CodeError::new(
+                        ErrorCode::ConstraintViolation,
+                        "existing data already violates the type constraint being declared",
+                    ));
                 }
             }
         }
-        self.v_type
-            .entry(label.to_string())
-            .or_default()
-            .insert(key.to_string(), ty);
+        // Scalar → the `Copy` `v_type` map (unchanged fast path); a record shape →
+        // the parallel `v_record` map.
+        match spec {
+            TypeSpec::Scalar(ty) => {
+                self.v_type
+                    .entry(label.to_string())
+                    .or_default()
+                    .insert(key.to_string(), ty);
+            }
+            record => {
+                self.v_record
+                    .entry(label.to_string())
+                    .or_default()
+                    .insert(key.to_string(), record);
+            }
+        }
         Ok(())
     }
 
-    /// Drop a type constraint. Idempotent.
+    /// Drop a type constraint (scalar or record). Idempotent.
     pub fn drop_type_constraint(&mut self, label: &str, key: &str) {
         if let Some(keys) = self.v_type.get_mut(label) {
             keys.remove(key);
             if keys.is_empty() {
                 self.v_type.remove(label);
+            }
+        }
+        if let Some(keys) = self.v_record.get_mut(label) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.v_record.remove(label);
             }
         }
     }
@@ -1840,7 +2006,7 @@ impl Graph {
         labels: &[String],
         props: &[(String, Value)],
     ) -> Option<(String, String)> {
-        if self.v_type.is_empty() {
+        if self.v_type.is_empty() && self.v_record.is_empty() {
             return None;
         }
         for label in labels {
@@ -1855,6 +2021,15 @@ impl Graph {
                     }
                 }
             }
+            if let Some(cs) = self.v_record.get(label) {
+                for (key, spec) in cs {
+                    if let Some((_, v)) = props.iter().find(|(k, _)| k == key) {
+                        if !value_matches(v, spec) {
+                            return Some((label.clone(), key.clone()));
+                        }
+                    }
+                }
+            }
         }
         None
     }
@@ -1862,13 +2037,25 @@ impl Graph {
     /// True iff setting `vi.key = value` would break a type constraint on one of
     /// `vi`'s labels. A null value is exempt.
     pub fn type_conflict_on_set(&self, vi: u32, key: &str, value: &Value) -> bool {
-        let Some(got) = value_type(value) else {
-            return false;
-        };
-        for (label, cs) in &self.v_type {
-            if let Some(ty) = cs.get(key) {
+        // Scalar constraints: a non-scalar (null/map) has no scalar type, so it
+        // can't conflict with a scalar declaration here.
+        if let Some(got) = value_type(value) {
+            for (label, cs) in &self.v_type {
+                if let Some(ty) = cs.get(key) {
+                    if let Some(lid) = self.labels.get(label) {
+                        if self.vlabels[vi as usize].contains(&lid) && got != *ty {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        // Record constraints: a map value must match the declared shape (a null is
+        // exempt via `value_matches`).
+        for (label, cs) in &self.v_record {
+            if let Some(spec) = cs.get(key) {
                 if let Some(lid) = self.labels.get(label) {
-                    if self.vlabels[vi as usize].contains(&lid) && got != *ty {
+                    if self.vlabels[vi as usize].contains(&lid) && !value_matches(value, spec) {
                         return true;
                     }
                 }
@@ -2056,38 +2243,51 @@ impl Graph {
         key: &str,
         type_name: &str,
     ) -> CodeResult<()> {
-        let Some(ty) = PropType::from_name(type_name) else {
+        let Some(spec) = TypeSpec::parse(type_name) else {
             return Err(CodeError::new(
                 ErrorCode::InvalidValue,
-                "unknown scalar type name for an edge type constraint",
+                "unknown or malformed type name for an edge type constraint",
             ));
         };
         if let Some(edges) = self.edges_with_etype_name(etype) {
             for &ei in edges {
-                if let Some(got) = value_type(&self.edge_props.value(ei as usize, key, &self.strs))
-                {
-                    if got != ty {
-                        return Err(CodeError::new(
-                            ErrorCode::ConstraintViolation,
-                            "existing data already violates the edge type constraint being declared",
-                        ));
-                    }
+                if !value_matches(&self.edge_props.value(ei as usize, key, &self.strs), &spec) {
+                    return Err(CodeError::new(
+                        ErrorCode::ConstraintViolation,
+                        "existing data already violates the edge type constraint being declared",
+                    ));
                 }
             }
         }
-        self.e_type_constraints
-            .entry(etype.to_string())
-            .or_default()
-            .insert(key.to_string(), ty);
+        match spec {
+            TypeSpec::Scalar(ty) => {
+                self.e_type_constraints
+                    .entry(etype.to_string())
+                    .or_default()
+                    .insert(key.to_string(), ty);
+            }
+            record => {
+                self.e_record
+                    .entry(etype.to_string())
+                    .or_default()
+                    .insert(key.to_string(), record);
+            }
+        }
         Ok(())
     }
 
-    /// Drop an edge type constraint. Idempotent.
+    /// Drop an edge type constraint (scalar or record). Idempotent.
     pub fn drop_edge_type_constraint(&mut self, etype: &str, key: &str) {
         if let Some(keys) = self.e_type_constraints.get_mut(etype) {
             keys.remove(key);
             if keys.is_empty() {
                 self.e_type_constraints.remove(etype);
+            }
+        }
+        if let Some(keys) = self.e_record.get_mut(etype) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.e_record.remove(etype);
             }
         }
     }
@@ -2115,7 +2315,7 @@ impl Graph {
         etypes: &[String],
         props: &[(String, Value)],
     ) -> Option<(String, String)> {
-        if self.e_type_constraints.is_empty() {
+        if self.e_type_constraints.is_empty() && self.e_record.is_empty() {
             return None;
         }
         for etype in etypes {
@@ -2126,6 +2326,15 @@ impl Graph {
                             if got != *ty {
                                 return Some((etype.clone(), key.clone()));
                             }
+                        }
+                    }
+                }
+            }
+            if let Some(cs) = self.e_record.get(etype) {
+                for (key, spec) in cs {
+                    if let Some((_, v)) = props.iter().find(|(k, _)| k == key) {
+                        if !value_matches(v, spec) {
+                            return Some((etype.clone(), key.clone()));
                         }
                     }
                 }
@@ -2552,15 +2761,20 @@ impl Graph {
                 &[("label", Jv::S(&label)), ("key", Jv::S(&key))],
             ));
         }
-        // Node type constraints carry the scalar type, which the `(label, key)`
-        // readers drop — iterate the map directly (sorted for determinism).
-        let mut vtypes: Vec<(String, String, &'static str)> = self
+        // Node type constraints carry the type name (scalar OR a `record{…}`),
+        // which the `(label, key)` readers drop — iterate both maps directly
+        // (sorted for determinism), so a record constraint round-trips too.
+        let mut vtypes: Vec<(String, String, String)> = self
             .v_type
             .iter()
             .flat_map(|(label, ks)| {
                 ks.iter()
-                    .map(move |(k, t)| (label.clone(), k.clone(), t.to_name()))
+                    .map(move |(k, t)| (label.clone(), k.clone(), t.to_name().to_string()))
             })
+            .chain(self.v_record.iter().flat_map(|(label, ks)| {
+                ks.iter()
+                    .map(move |(k, spec)| (label.clone(), k.clone(), spec.to_name()))
+            }))
             .collect();
         vtypes.sort();
         for (label, key, ty) in vtypes {
@@ -2569,7 +2783,7 @@ impl Graph {
                 &[
                     ("label", Jv::S(&label)),
                     ("key", Jv::S(&key)),
-                    ("type", Jv::S(ty)),
+                    ("type", Jv::S(&ty)),
                 ],
             ));
         }
@@ -2585,13 +2799,17 @@ impl Graph {
                 &[("edgeType", Jv::S(&etype)), ("key", Jv::S(&key))],
             ));
         }
-        let mut etypes: Vec<(String, String, &'static str)> = self
+        let mut etypes: Vec<(String, String, String)> = self
             .e_type_constraints
             .iter()
             .flat_map(|(et, ks)| {
                 ks.iter()
-                    .map(move |(k, t)| (et.clone(), k.clone(), t.to_name()))
+                    .map(move |(k, t)| (et.clone(), k.clone(), t.to_name().to_string()))
             })
+            .chain(self.e_record.iter().flat_map(|(et, ks)| {
+                ks.iter()
+                    .map(move |(k, spec)| (et.clone(), k.clone(), spec.to_name()))
+            }))
             .collect();
         etypes.sort();
         for (etype, key, ty) in etypes {
@@ -2600,7 +2818,7 @@ impl Graph {
                 &[
                     ("edgeType", Jv::S(&etype)),
                     ("key", Jv::S(&key)),
-                    ("type", Jv::S(ty)),
+                    ("type", Jv::S(&ty)),
                 ],
             ));
         }
@@ -4200,9 +4418,11 @@ impl Builder {
             v_unique: HashMap::new(),
             v_required: HashMap::new(),
             v_type: HashMap::new(),
+            v_record: HashMap::new(),
             e_unique: HashMap::new(),
             e_required: HashMap::new(),
             e_type_constraints: HashMap::new(),
+            e_record: HashMap::new(),
             v_cardinality: Vec::new(),
             v_validators: HashMap::new(),
             v_invariants: Vec::new(),
@@ -5363,5 +5583,173 @@ mod clone_graph {
 
         // The unique constraint came along: a duplicate id is rejected in the copy.
         assert!(run(&mut copy, "INSERT (:P {id: 'a'})").is_err());
+    }
+}
+
+#[cfg(test)]
+mod record_type_spec {
+    use super::*;
+
+    fn sc(k: &str, t: PropType) -> (Arc<str>, TypeSpec) {
+        (k.into(), TypeSpec::Scalar(t))
+    }
+    fn s(x: &str) -> Value {
+        Value::Str(x.into())
+    }
+    fn vmap(pairs: &[(&str, Value)]) -> Value {
+        Value::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).into(), v.clone()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn parse_scalar_and_record_types() {
+        assert_eq!(
+            TypeSpec::parse("string"),
+            Some(TypeSpec::Scalar(PropType::Str))
+        );
+        // Fields canonicalized to sorted order; `::` and `:` both accepted.
+        assert_eq!(
+            TypeSpec::parse("record { tier :: number, city :: string }"),
+            Some(TypeSpec::Record(vec![
+                sc("city", PropType::Str),
+                sc("tier", PropType::Num)
+            ])),
+        );
+        assert_eq!(
+            TypeSpec::parse("record{a:number}"),
+            Some(TypeSpec::Record(vec![sc("a", PropType::Num)])),
+        );
+        // Nested record.
+        assert_eq!(
+            TypeSpec::parse("record{addr::record{city::string}}"),
+            Some(TypeSpec::Record(vec![(
+                "addr".into(),
+                TypeSpec::Record(vec![sc("city", PropType::Str)]),
+            )])),
+        );
+        // Round-trips through to_name.
+        let t = TypeSpec::parse("record{city::string,tier::number}").unwrap();
+        assert_eq!(TypeSpec::parse(&t.to_name()), Some(t));
+        // Malformed.
+        assert_eq!(TypeSpec::parse("record{a}"), None);
+        assert_eq!(TypeSpec::parse("nope"), None);
+        assert_eq!(TypeSpec::parse("record{a:string"), None);
+    }
+
+    #[test]
+    fn value_matches_record_type() {
+        let ty = TypeSpec::parse("record{city::string,tier::number}").unwrap();
+        // Exact shape matches.
+        assert!(value_matches(
+            &vmap(&[("city", s("NYC")), ("tier", Value::Num(2.0))]),
+            &ty
+        ));
+        // A null value satisfies any type (REQUIRED is separate).
+        assert!(value_matches(&Value::Null, &ty));
+        // A null FIELD is allowed (field-level required is separate).
+        assert!(value_matches(
+            &vmap(&[("city", Value::Null), ("tier", Value::Num(2.0))]),
+            &ty
+        ));
+        // Wrong field type → no match.
+        assert!(!value_matches(
+            &vmap(&[("city", Value::Num(1.0)), ("tier", Value::Num(2.0))]),
+            &ty
+        ));
+        // Missing field / extra field → no match (closed record).
+        assert!(!value_matches(&vmap(&[("city", s("NYC"))]), &ty));
+        assert!(!value_matches(
+            &vmap(&[
+                ("city", s("NYC")),
+                ("tier", Value::Num(2.0)),
+                ("x", Value::Num(1.0))
+            ]),
+            &ty,
+        ));
+        // A non-map value → no match.
+        assert!(!value_matches(&Value::Num(1.0), &ty));
+    }
+}
+
+#[cfg(test)]
+mod record_constraint {
+    use super::*;
+
+    fn s(x: &str) -> Value {
+        Value::Str(x.into())
+    }
+    fn vmap(pairs: &[(&str, Value)]) -> Value {
+        Value::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).into(), v.clone()))
+                .collect(),
+        )
+    }
+    fn base() -> Graph {
+        crate::ndjson::decode(
+            r#"{"type":"node","id":"a","labels":["Person"],"properties":{"meta":{"city":"NYC","tier":2}}}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn declare_record_constraint_validates_existing_data() {
+        let mut g = base();
+        // Matching shape → declares OK.
+        assert!(g
+            .create_type_constraint("Person", "meta", "record{city::string,tier::number}")
+            .is_ok());
+        // A conflicting shape against existing data → rejected at declaration.
+        let mut g2 = base();
+        assert!(g2
+            .create_type_constraint("Person", "meta", "record{city::number,tier::number}")
+            .is_err());
+    }
+
+    #[test]
+    fn record_constraint_enforced_on_set_and_insert() {
+        let mut g = base();
+        g.create_type_constraint("Person", "meta", "record{city::string,tier::number}")
+            .unwrap();
+        // A well-shaped write passes.
+        assert!(!g.type_conflict_on_set(
+            0,
+            "meta",
+            &vmap(&[("city", s("LA")), ("tier", Value::Num(3.0))])
+        ));
+        // A wrong field type conflicts.
+        assert!(g.type_conflict_on_set(
+            0,
+            "meta",
+            &vmap(&[("city", Value::Num(1.0)), ("tier", Value::Num(3.0))])
+        ));
+        // A missing / extra field conflicts (closed record).
+        assert!(g.type_conflict_on_set(0, "meta", &vmap(&[("city", s("LA"))])));
+        // A null is exempt.
+        assert!(!g.type_conflict_on_set(0, "meta", &Value::Null));
+        // A new-vertex insert with a bad meta is a type_violation.
+        assert!(g
+            .type_violation(
+                &["Person".to_string()],
+                &[(
+                    "meta".to_string(),
+                    vmap(&[("city", Value::Num(9.0)), ("tier", Value::Num(1.0))])
+                )],
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn dropping_the_record_constraint_lifts_enforcement() {
+        let mut g = base();
+        g.create_type_constraint("Person", "meta", "record{city::string,tier::number}")
+            .unwrap();
+        g.drop_type_constraint("Person", "meta");
+        assert!(!g.type_conflict_on_set(0, "meta", &vmap(&[("city", Value::Num(1.0))])));
     }
 }
