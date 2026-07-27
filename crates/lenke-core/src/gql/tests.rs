@@ -3835,6 +3835,43 @@ fn trail_budget_guards_dense_unbounded_star() {
     assert_eq!(err.code, crate::error_codes::ErrorCode::ResourceExhausted);
 }
 
+/// A MULTI-element repetition unit fans out `d^k` traversals from a SINGLE vertex, so
+/// on a dense graph one `expand_unit` could materialize enough to OOM the host. Even
+/// with a single repetition `{1}` — no outer looping — the per-expansion budget must
+/// fault with `E_RESOURCE_EXHAUSTED` mid-materialization. (The abbreviated `-[]->{n}`
+/// form can't hit this: it fans out only `d` per vertex, lazily.)
+#[test]
+fn unit_expansion_budget_guards_dense_multi_element() {
+    // Complete digraph K_64: every vertex → every other (4032 edges). A single 4-hop
+    // unit expansion from one seed fans out ~63⁴ ≈ 15M traversals.
+    let n = 64;
+    let mut lines: Vec<String> = Vec::new();
+    for i in 0..n {
+        lines.push(format!(
+            r#"{{"type":"node","id":"{i}","labels":["N"],"properties":{{}}}}"#
+        ));
+    }
+    for i in 0..n {
+        for j in 0..n {
+            if i != j {
+                lines.push(format!(
+                    r#"{{"type":"edge","from":"{i}","to":"{j}","labels":["R"],"properties":{{}}}}"#
+                ));
+            }
+        }
+    }
+    let mut g = ndjson::decode(&lines.join("\n")).unwrap();
+    // `{1}` — exactly one repetition, so the whole fan-out is ONE `expand_unit` call:
+    // proof the guard fires inside a single expansion, not just across repetitions.
+    let err = parse(
+        "MATCH (s:N) ((a)-[:R]->(b)-[:R]->(c)-[:R]->(d)-[:R]->(e)){1} (t) RETURN count(*) AS c",
+    )
+    .unwrap()
+    .execute(&mut g, &Params::new())
+    .unwrap_err();
+    assert_eq!(err.code, crate::error_codes::ErrorCode::ResourceExhausted);
+}
+
 /// A fixed-length multi-hop pattern with a per-hop WHERE and a LIMIT must be
 /// answered by the scalar depth-first driver — which filters during traversal and
 /// stops the instant the LIMIT fills — NOT the breadth-first vectorized path,

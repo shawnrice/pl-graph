@@ -3223,12 +3223,20 @@ impl UnitMatches {
 /// bound). Inner variables are bound only transiently, for the `WHERE`; the caller
 /// re-binds them (as scalars per hop for a nested walk, or as group lists at a trail
 /// end). A **one-hop** unit is exactly the old single-edge expansion.
+///
+/// A `k`-hop unit fans out up to `d^k` traversals from ONE vertex, so on a dense graph
+/// a single expansion (especially a multi-element unit) could materialize enough to
+/// OOM the host. `steps` — shared with the outer walk's `TRAIL_BUDGET` — is charged per
+/// edge visited and, when blown, faults with `E_RESOURCE_EXHAUSTED` mid-recursion
+/// rather than allocating unbounded (the "stream or fault, never OOM" invariant). The
+/// single-edge fast-path can't hit this: it fans out only `d` per vertex, lazily.
 fn expand_unit(
     graph: &Graph,
     ctx: &Ctx,
     binding: &mut Binding,
     unit: &CUnit,
     from: u32,
+    steps: &mut u64,
 ) -> UnitMatches {
     fn restore(binding: &mut Binding, saved: Option<(usize, Option<Val>)>) {
         if let Some((s, prev)) = saved {
@@ -3258,7 +3266,11 @@ fn expand_unit(
         scratch_e: &mut Vec<u32>,
         scratch_v: &mut Vec<u32>,
         out: &mut UnitMatches,
+        steps: &mut u64,
     ) {
+        if ctx.faulted() {
+            return; // a sibling branch already blew the budget — unwind
+        }
         if hop_i == unit.hops.len() {
             // The whole unit is matched — every inner variable is bound, so the
             // per-unit predicate can reference any of them.
@@ -3274,6 +3286,11 @@ fn expand_unit(
         }
         let hop = &unit.hops[hop_i];
         for (eidx, nbr) in expand(graph, ctx, cur, hop.rel.direction, hop.rel.label.as_ref()) {
+            *steps += 1;
+            if *steps > TRAIL_BUDGET {
+                ctx.set_fault(FAULT_BUDGET); // never materialize an unbounded fan-out
+                return;
+            }
             if scratch_e.contains(&eidx) {
                 continue; // no edge twice within one unit
             }
@@ -3296,6 +3313,7 @@ fn expand_unit(
                 scratch_e,
                 scratch_v,
                 out,
+                steps,
             );
             scratch_e.pop();
             scratch_v.pop();
@@ -3320,6 +3338,7 @@ fn expand_unit(
         &mut scratch_e,
         &mut scratch_v,
         &mut out,
+        steps,
     );
     restore(binding, start_saved);
     out
@@ -3432,13 +3451,19 @@ fn reachable_each_unit(
     let mut steps: u64 = 0;
     let mut cont = true;
     let mut stack: Vec<Frame> = vec![Frame {
-        m: expand_unit(graph, ctx, binding, unit, from),
+        m: expand_unit(graph, ctx, binding, unit, from, &mut steps),
         idx: 0,
         depth: 0,
         entry_idx: 0,
     }];
 
     while let Some(top) = stack.last() {
+        // A single (dense, multi-element) `expand_unit` can blow the budget while
+        // materializing; honour that fault before touching its partial result.
+        if ctx.faulted() {
+            clear_live(&stack, k, mode, &mut marks);
+            break;
+        }
         let li = stack.len() - 1;
         if q.max.is_some_and(|m| top.depth >= m) || top.idx >= top.m.count(k) {
             // Backtrack: clear the marks this frame set (its entry match, in the parent).
@@ -3511,7 +3536,7 @@ fn reachable_each_unit(
         // A SIMPLE close emits but doesn't extend (and set no marks); otherwise descend
         // from the unit's end, remembering which match `i` led there.
         if !is_close {
-            let child = expand_unit(graph, ctx, binding, unit, end);
+            let child = expand_unit(graph, ctx, binding, unit, end, &mut steps);
             stack.push(Frame {
                 m: child,
                 idx: 0,

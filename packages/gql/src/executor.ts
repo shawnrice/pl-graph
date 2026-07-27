@@ -4134,12 +4134,20 @@ type UnitMatch = { end: Vertex; verts: Vertex[]; edges: Edge[] };
  *  Inner variables are bound only transiently, for the `where`; the caller re-binds
  *  them as group lists at each trail end. A one-hop unit is exactly the single-edge
  *  expansion. Mirrors native `expand_unit`. */
+// A `k`-hop unit fans out up to `d^k` traversals from ONE vertex, so on a dense graph
+// a single expansion (especially a multi-element unit) could materialize enough to OOM
+// the host. `budget.steps` — shared with the outer walk's `TRAIL_BUDGET` — is charged
+// per edge visited and, when blown, throws `E_RESOURCE_EXHAUSTED` mid-recursion rather
+// than allocating unbounded (the "stream or fault, never OOM" invariant). The
+// single-edge fast-path can't hit this: it fans out only `d` per vertex, lazily.
+// Mirrors native `expand_unit`.
 const expandUnit = (
   graph: Graph,
   from: Vertex,
   unit: CUnit,
   binding: Binding,
   params: Params,
+  budget: { steps: number },
 ): UnitMatch[] => {
   const out: UnitMatch[] = [];
   const edges: Edge[] = [];
@@ -4159,6 +4167,15 @@ const expandUnit = (
     const hop = unit.hops[hopI];
 
     for (const { edge, node: nbr } of expand(graph, cur, hop.rel)) {
+      budget.steps += 1;
+
+      if (budget.steps > TRAIL_BUDGET) {
+        throw new LenkeError(
+          'Variable-length pattern exceeded the trail budget; add a tighter bound',
+          { code: ErrorCode.ResourceExhausted },
+        );
+      }
+
       if (edges.includes(edge)) {
         continue; // no edge twice within one unit
       }
@@ -4212,7 +4229,9 @@ const trailEndsUnit = function* (
     marks.add(from);
   }
 
-  let steps = 0;
+  // One budget shared with `expandUnit`, so a dense fan-out inside a single expansion
+  // is charged the same as the outer unit-steps (never OOM; fault at the ceiling).
+  const budget = { steps: 0 };
 
   type Frame = {
     units: UnitMatch[];
@@ -4226,7 +4245,7 @@ const trailEndsUnit = function* (
 
   const stack: Frame[] = [
     {
-      units: expandUnit(graph, from, unit, binding, params),
+      units: expandUnit(graph, from, unit, binding, params, budget),
       idx: 0,
       depth: 0,
       entryMarks: [],
@@ -4299,9 +4318,9 @@ const trailEndsUnit = function* (
     }
     // mode === 'walk': no marks.
 
-    steps += 1;
+    budget.steps += 1;
 
-    if (steps > TRAIL_BUDGET) {
+    if (budget.steps > TRAIL_BUDGET) {
       throw new LenkeError(
         'Variable-length pattern exceeded the trail budget; add a tighter bound',
         { code: ErrorCode.ResourceExhausted },
@@ -4322,7 +4341,7 @@ const trailEndsUnit = function* (
 
     if (!isClose) {
       stack.push({
-        units: expandUnit(graph, end, unit, binding, params),
+        units: expandUnit(graph, end, unit, binding, params, budget),
         idx: 0,
         depth: d,
         entryMarks: newMarks,

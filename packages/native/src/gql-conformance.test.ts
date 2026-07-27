@@ -1171,6 +1171,45 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     }
   });
 
+  // A dense multi-element unit fans out d^k from ONE vertex — both engines must FAULT
+  // with the same code (E_RESOURCE_EXHAUSTED) rather than one OOMing. `{1}` (a single
+  // repetition) proves the guard fires inside a single `expand_unit`, not just across
+  // repetitions.
+  test('dense multi-element unit expansion faults (not OOM), byte-identical (TS vs native)', () => {
+    const lines: string[] = [];
+    const n = 64;
+
+    for (let i = 0; i < n; i += 1) {
+      lines.push(`{"type":"node","id":"${i}","labels":["N"],"properties":{}}`);
+    }
+
+    for (let i = 0; i < n; i += 1) {
+      for (let j = 0; j < n; j += 1) {
+        if (i !== j) {
+          lines.push(`{"type":"edge","from":"${i}","to":"${j}","labels":["R"],"properties":{}}`);
+        }
+      }
+    }
+
+    const K = lines.join('\n');
+    const nat = graphFromFormat(backend, K, 'ndjson');
+    const ts = tsDeserialize(K, 'ndjson', new Graph());
+    const q =
+      'MATCH (s:N) ((a)-[:R]->(b)-[:R]->(c)-[:R]->(d)-[:R]->(e)){1} (t) RETURN count(*) AS c';
+    const code = (fn: () => void): unknown => {
+      try {
+        fn();
+      } catch (e) {
+        return (e as { code?: unknown }).code;
+      }
+
+      return 'ok';
+    };
+    const natCode = code(() => nat.query(q));
+    expect(natCode).toBe('E_RESOURCE_EXHAUSTED');
+    expect(code(() => tsQuery(ts, q))).toBe(natCode);
+  });
+
   // ANTI-DRIFT: the abbreviated `-[]->{n,m}` form (each engine's single-edge
   // fast-path) and an equivalent single-edge parenthesized subpath (the general
   // unit matcher) return IDENTICAL endpoints — across every path mode, on BOTH
