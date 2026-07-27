@@ -77,8 +77,8 @@ use super::lexer::SyntaxError;
 use super::plan::{
     has_argless_aggregate, has_nested_aggregate, lower, AggFn, CAgg, CClause, CCount, CExpr,
     CLabelExpr, CLinear, CMerge, CMergeUpdate, CNode, CPath, CPredicate, CProjection,
-    CPropConstraint, CQuery, CRel, CRemoveItem, CReturnItem, CSegment, CSetItem, Op, Program,
-    ScalarFn,
+    CPropConstraint, CQuery, CRel, CRemoveItem, CReturnItem, CSegment, CSetItem, CUnit, Op,
+    Program, ScalarFn,
 };
 #[cfg(feature = "arrow")]
 use crate::arrow::ArrowColumn;
@@ -3098,32 +3098,18 @@ type OnEnd<'a> = &'a mut dyn FnMut(&mut Binding, u32, &[u32], &[u32]) -> bool;
 /// Does edge `eidx` satisfy the segment's per-hop predicate (inline properties +
 /// `WHERE`)? The optional edge variable is bound to this edge for the duration of
 /// the check so the predicate can name it (`e.amt > $t`); outer bound variables in
-/// `binding` stay visible, and the slot is restored afterward.
-fn edge_passes(
-    graph: &Graph,
-    ctx: &Ctx,
-    binding: &mut Binding,
-    rel: &CRel,
-    from: u32,
-    eidx: u32,
-    to: u32,
-) -> bool {
+/// `binding` stay visible, and the slot is restored afterward. (For a parenthesized
+/// subpath the per-repetition source/target binding is done by the unit walk in
+/// [`expand_unit`], not here.)
+fn edge_passes(graph: &Graph, ctx: &Ctx, binding: &mut Binding, rel: &CRel, eidx: u32) -> bool {
     if rel.props.is_empty() && rel.where_.is_none() {
         return true;
     }
-    // Bind this hop's edge, and — for a quantified parenthesized subpath — its
-    // source `(x)` and target `(y)` nodes, so the per-repetition predicate can name
-    // them (`((x)-[e]->(y) WHERE e.amt <= x.balance){1,5}`). Restored afterward.
-    let mut restores: Vec<(usize, Option<Val>)> = Vec::new();
-    let mut bind = |binding: &mut Binding, slot: Option<usize>, v: Val| {
-        if let Some(s) = slot {
-            restores.push((s, binding.get(s).cloned()));
-            binding.set(s, v);
-        }
-    };
-    bind(binding, rel.var_slot, Val::Edge(eidx));
-    bind(binding, rel.hop_from_slot, Val::Node(from));
-    bind(binding, rel.hop_to_slot, Val::Node(to));
+    let restore = rel.var_slot.map(|s| {
+        let prev = binding.get(s).cloned();
+        binding.set(s, Val::Edge(eidx));
+        (s, prev)
+    });
     let ok = satisfies(
         graph,
         ctx,
@@ -3132,7 +3118,7 @@ fn edge_passes(
         rel.where_.as_ref(),
         binding,
     );
-    for (s, prev) in restores.into_iter().rev() {
+    if let Some((s, prev)) = restore {
         match prev {
             Some(v) => binding.set(s, v),
             None => binding.unset(s),
@@ -3155,50 +3141,339 @@ fn expand_filtered(
         return expand(graph, ctx, v, rel.direction, rel.label.as_ref()).collect();
     }
     expand(graph, ctx, v, rel.direction, rel.label.as_ref())
-        .filter(|(eidx, nbr)| edge_passes(graph, ctx, binding, rel, v, *eidx, *nbr))
+        .filter(|(eidx, _)| edge_passes(graph, ctx, binding, rel, *eidx))
         .collect()
 }
 
-/// Bind a quantified subpath's GROUP variables to the trail's per-hop value lists:
-/// `e` = the edges in hop order, `x` = each hop's source (`verts[..last]`), `y` =
-/// each hop's target (`verts[1..]`). Returns the prior slot values so the caller
-/// can restore them after the continuation (a sibling trail must not see them).
+/// Expose a quantified subpath's inner variables as GROUP variables — each is the
+/// list of its value over every repetition. The full walk is `r` repetitions of a
+/// `k`-hop unit, so `verts` = `[seed, …]` of length `r·k + 1` and `edges` of length
+/// `r·k`; variable at unit **node position** `p` (0 = source `x`, … `k` = last
+/// target `y`) is `verts[rep·k + p]` across reps, and at **edge position** `p` is
+/// `edges[rep·k + p]`. For a single-edge unit (`k = 1`) this is exactly `x =
+/// verts[..last]`, `y = verts[1..]`, `e = edges`. Returns the prior slot values so
+/// the caller can restore them (a sibling trail must not see them).
 fn bind_group_vars(
     binding: &mut Binding,
-    rel: &CRel,
+    unit: &CUnit,
     verts: &[u32],
     edges: &[u32],
 ) -> Vec<(usize, Option<Val>)> {
-    let n = verts.len();
-    let lists: [(Option<usize>, Vec<Val>); 3] = [
-        (rel.var_slot, edges.iter().map(|&e| Val::Edge(e)).collect()),
-        (
-            rel.hop_from_slot,
-            verts[..n.saturating_sub(1)]
-                .iter()
-                .map(|&v| Val::Node(v))
-                .collect(),
-        ),
-        (
-            rel.hop_to_slot,
-            verts
-                .get(1..)
-                .unwrap_or(&[])
-                .iter()
-                .map(|&v| Val::Node(v))
-                .collect(),
-        ),
-    ];
+    let k = unit.hops.len();
+    let reps = edges.len().checked_div(k).unwrap_or(0);
     let mut restores = Vec::new();
-    for (slot, list) in lists {
+    let mut bind = |binding: &mut Binding, slot: Option<usize>, list: Vec<Val>| {
         if let Some(s) = slot {
             restores.push((s, binding.get(s).cloned()));
             binding.set(s, Val::List(list));
         }
+    };
+    // Node positions 0..=k: the unit source, then each hop's target.
+    for p in 0..=k {
+        let slot = if p == 0 {
+            unit.start_slot
+        } else {
+            unit.hops[p - 1].target_slot
+        };
+        bind(
+            binding,
+            slot,
+            (0..reps).map(|rep| Val::Node(verts[rep * k + p])).collect(),
+        );
+    }
+    // Edge positions 0..k: each hop's edge.
+    for (p, hop) in unit.hops.iter().enumerate() {
+        bind(
+            binding,
+            hop.rel.var_slot,
+            (0..reps).map(|rep| Val::Edge(edges[rep * k + p])).collect(),
+        );
     }
     restores
 }
 
+/// One traversal of a repetition UNIT from a frontier vertex: the `k` edges and the
+/// `k` target vertices (in hop order); the unit's end is `verts.last()`.
+struct UnitMatch {
+    edges: Vec<u32>,
+    verts: Vec<u32>,
+}
+
+/// Enumerate every way to traverse `unit`'s `k` hops from `from`, honouring each
+/// hop's inline label/property filter, intra-unit edge-distinctness (no edge twice
+/// in one unit), and the per-unit `WHERE` (checked once every inner variable is
+/// bound). Inner variables are bound only transiently, for the `WHERE`; the caller
+/// re-binds them (as scalars per hop for a nested walk, or as group lists at a trail
+/// end). A **one-hop** unit is exactly the old single-edge expansion.
+fn expand_unit(
+    graph: &Graph,
+    ctx: &Ctx,
+    binding: &mut Binding,
+    unit: &CUnit,
+    from: u32,
+) -> Vec<UnitMatch> {
+    fn restore(binding: &mut Binding, saved: Option<(usize, Option<Val>)>) {
+        if let Some((s, prev)) = saved {
+            match prev {
+                Some(v) => binding.set(s, v),
+                None => binding.unset(s),
+            }
+        }
+    }
+    fn bind(binding: &mut Binding, slot: Option<usize>, v: Val) -> Option<(usize, Option<Val>)> {
+        slot.map(|s| {
+            let prev = binding.get(s).cloned();
+            binding.set(s, v);
+            (s, prev)
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn walk(
+        graph: &Graph,
+        ctx: &Ctx,
+        binding: &mut Binding,
+        unit: &CUnit,
+        hop_i: usize,
+        cur: u32,
+        edges: &mut Vec<u32>,
+        verts: &mut Vec<u32>,
+        out: &mut Vec<UnitMatch>,
+    ) {
+        if hop_i == unit.hops.len() {
+            // The whole unit is matched — every inner variable is bound, so the
+            // per-unit predicate can reference any of them.
+            let ok = unit
+                .where_
+                .as_ref()
+                .is_none_or(|w| as_truth(&eval(&Env::new(graph, ctx, binding), w)) == Some(true));
+            if ok {
+                out.push(UnitMatch {
+                    edges: edges.clone(),
+                    verts: verts.clone(),
+                });
+            }
+            return;
+        }
+        let hop = &unit.hops[hop_i];
+        for (eidx, nbr) in expand(graph, ctx, cur, hop.rel.direction, hop.rel.label.as_ref()) {
+            if edges.contains(&eidx) {
+                continue; // no edge twice within one unit
+            }
+            let e_saved = bind(binding, hop.rel.var_slot, Val::Edge(eidx));
+            let pass = satisfies(graph, ctx, &Val::Edge(eidx), &hop.rel.props, None, binding);
+            if !pass {
+                restore(binding, e_saved);
+                continue;
+            }
+            let t_saved = bind(binding, hop.target_slot, Val::Node(nbr));
+            edges.push(eidx);
+            verts.push(nbr);
+            walk(graph, ctx, binding, unit, hop_i + 1, nbr, edges, verts, out);
+            edges.pop();
+            verts.pop();
+            restore(binding, t_saved);
+            restore(binding, e_saved);
+        }
+    }
+    let start_saved = bind(binding, unit.start_slot, Val::Node(from));
+    let mut edges = Vec::with_capacity(unit.hops.len());
+    let mut verts = Vec::with_capacity(unit.hops.len());
+    let mut out = Vec::new();
+    walk(
+        graph, ctx, binding, unit, 0, from, &mut edges, &mut verts, &mut out,
+    );
+    restore(binding, start_saved);
+    out
+}
+
+/// The GENERAL repetition matcher: repeat `unit` (a `k`-hop sub-path) from `from`,
+/// streaming each trail end in `[min, max]` REPETITIONS to `on_end` (endpoint + the
+/// whole walk's `verts`/`edges`, so the caller can expose group variables).
+/// TRAIL/SIMPLE/ACYCLIC/WALK restrictors apply across the ENTIRE walk (a mark covers
+/// a whole unit's edges/targets). This is the ONE code path shared by single- AND
+/// multi-element parenthesized subpaths — a one-hop unit (`k = 1`) is not special-cased.
+///
+/// [`reachable_each`] is a hand-specialized `k = 1` twin of this function, kept ONLY
+/// as a fast-path for the hot abbreviated `-[]->{n,m}` form: routing that form
+/// through here instead measured a 4.15× regression (173µs → 720µs/iter, see the
+/// `bench_k1_abbreviated_walk` test), because a one-hop `UnitMatch` heap-allocates
+/// two `Vec`s per edge and reconstructs the walk unconditionally, where the single-
+/// edge stepper works over borrowed `(eidx, nbr)` tuples and only reconstructs under
+/// `want_path`. The two share an IDENTICAL DFS skeleton (seed/min-0 handling, mark
+/// setup, `TRAIL_BUDGET`, SIMPLE-close, consumer-stop clearing); the
+/// `abbreviated_and_single_edge_subpath_agree_k1` test pins them byte-identical at
+/// `k = 1` across every path mode so they cannot silently drift.
+fn reachable_each_unit(
+    graph: &Graph,
+    ctx: &Ctx,
+    binding: &mut Binding,
+    from: u32,
+    unit: &CUnit,
+    spec: WalkSpec,
+    on_end: OnEnd<'_>,
+) -> bool {
+    let WalkSpec { q, mode, .. } = spec;
+    if ctx.faulted() {
+        return true;
+    }
+    if q.min == 0 && !on_end(binding, from, &[from], &[]) {
+        return false;
+    }
+
+    let trail = matches!(mode, PathMode::Trail);
+    let vertex_mode = matches!(mode, PathMode::Simple | PathMode::Acyclic);
+    let mut marks = if trail {
+        ctx.take_marks(graph.edge_slots())
+    } else if vertex_mode {
+        vec![false; graph.vertex_count()]
+    } else {
+        Vec::new()
+    };
+    if vertex_mode {
+        marks[from as usize] = true;
+    }
+
+    struct Frame {
+        units: Vec<UnitMatch>,
+        idx: usize,
+        depth: u32,
+        // Mark indices this frame set (a whole unit's edges or target nodes),
+        // cleared on backtrack.
+        entry_marks: Vec<usize>,
+        // The unit that led to this frame's vertex (for path reconstruction).
+        entry_unit: Option<UnitMatch>,
+    }
+
+    // Reconstruct the full walk (seed + every unit's targets / edges) from the live
+    // stack, for the group-variable exposure at `on_end`.
+    fn reconstruct(stack: &[Frame], last: &UnitMatch, seed: u32) -> (Vec<u32>, Vec<u32>) {
+        let mut pv = vec![seed];
+        let mut pe = Vec::new();
+        for f in stack.iter().skip(1) {
+            if let Some(u) = &f.entry_unit {
+                pv.extend_from_slice(&u.verts);
+                pe.extend_from_slice(&u.edges);
+            }
+        }
+        pv.extend_from_slice(&last.verts);
+        pe.extend_from_slice(&last.edges);
+        (pv, pe)
+    }
+
+    let mut steps: u64 = 0;
+    let mut cont = true;
+    let mut stack: Vec<Frame> = vec![Frame {
+        units: expand_unit(graph, ctx, binding, unit, from),
+        idx: 0,
+        depth: 0,
+        entry_marks: Vec::new(),
+        entry_unit: None,
+    }];
+
+    while let Some(top) = stack.last_mut() {
+        if q.max.is_some_and(|m| top.depth >= m) || top.idx >= top.units.len() {
+            let cleared = std::mem::take(&mut top.entry_marks);
+            for i in cleared {
+                marks[i] = false;
+            }
+            stack.pop();
+            continue;
+        }
+        let m = std::mem::replace(
+            &mut top.units[top.idx],
+            UnitMatch {
+                edges: Vec::new(),
+                verts: Vec::new(),
+            },
+        );
+        let depth = top.depth;
+        top.idx += 1;
+
+        // Restrictor: which marks this unit claims (all its edges for TRAIL, all its
+        // targets for SIMPLE/ACYCLIC), and whether it is a non-extending SIMPLE close
+        // back on the seed. A unit is rejected outright if it collides with a mark.
+        let end = *m.verts.last().expect("a unit has ≥ 1 hop");
+        let (new_marks, is_close): (Vec<usize>, bool) = match mode {
+            PathMode::Walk => (Vec::new(), false),
+            PathMode::Trail => {
+                if m.edges.iter().any(|&e| marks[e as usize]) {
+                    continue;
+                }
+                (m.edges.iter().map(|&e| e as usize).collect(), false)
+            }
+            PathMode::Acyclic => {
+                if m.verts.iter().any(|&v| marks[v as usize]) {
+                    continue;
+                }
+                (m.verts.iter().map(|&v| v as usize).collect(), false)
+            }
+            PathMode::Simple => {
+                if end == from {
+                    (Vec::new(), true) // close the cycle on the seed
+                } else if m.verts.iter().any(|&v| marks[v as usize]) {
+                    continue;
+                } else {
+                    (m.verts.iter().map(|&v| v as usize).collect(), false)
+                }
+            }
+        };
+
+        steps += 1;
+        if steps > TRAIL_BUDGET {
+            ctx.set_fault(FAULT_BUDGET);
+            for f in &stack {
+                for &i in &f.entry_marks {
+                    marks[i] = false;
+                }
+            }
+            break;
+        }
+
+        for &i in &new_marks {
+            marks[i] = true;
+        }
+        let d = depth + 1;
+        let (pv, pe) = reconstruct(&stack, &m, from);
+        if d >= q.min && !on_end(binding, end, &pv, &pe) {
+            cont = false;
+            for &i in &new_marks {
+                marks[i] = false;
+            }
+            for f in &stack {
+                for &i in &f.entry_marks {
+                    marks[i] = false;
+                }
+            }
+            break;
+        }
+
+        if !is_close {
+            stack.push(Frame {
+                units: expand_unit(graph, ctx, binding, unit, end),
+                idx: 0,
+                depth: d,
+                entry_marks: new_marks,
+                entry_unit: Some(m),
+            });
+        } else {
+            // A SIMPLE close emits but doesn't extend; drop the marks it would have set.
+            for &i in &new_marks {
+                marks[i] = false;
+            }
+        }
+    }
+
+    if trail {
+        ctx.return_marks(marks);
+    }
+    cont
+}
+
+/// The hand-specialized `k = 1` fast-path of [`reachable_each_unit`] (see its doc for
+/// why this twin exists): step ONE edge at a time via borrowed `(eidx, nbr)` tuples,
+/// marking a single edge/node per step, reconstructing the walk only under
+/// `want_path`. Behaviourally identical to a one-hop unit; pinned so by the
+/// `abbreviated_and_single_edge_subpath_agree_k1` test.
 fn reachable_each(
     graph: &Graph,
     ctx: &Ctx,
@@ -3411,44 +3686,39 @@ fn walk_segments(
     if index >= pattern.segments.len() {
         return emit(binding);
     }
-    let CSegment { rel, node } = &pattern.segments[index];
+    let CSegment { rel, node, unit } = &pattern.segments[index];
     if let Some(q) = rel.quantifier {
-        // Var-length: `reachable_each` binds each hop's edge for the per-hop
-        // predicate (inline props / WHERE) as it walks. Stream endpoints and stop
-        // the moment a consumer (EXISTS / LIMIT) is satisfied — `match_node_then`
-        // returns false to propagate the stop, which `reachable_each` returns,
-        // avoiding an exponential trail enumeration on a dense graph.
-        return reachable_each(
-            graph,
-            ctx,
-            binding,
-            from,
-            rel,
-            WalkSpec {
-                q,
-                mode: pattern.mode,
-                // A quantified parenthesized subpath needs the whole trail so its
-                // GROUP variables (x/e/y) can be exposed as lists.
-                want_path: rel.subpath,
-            },
-            &mut |b, end, verts, edges| {
-                let restores = if rel.subpath {
-                    bind_group_vars(b, rel, verts, edges)
-                } else {
-                    Vec::new()
-                };
-                let keep = match_node_then(graph, ctx, b, node, end, &mut |b2| {
-                    walk_segments(graph, ctx, pattern, index + 1, end, b2, emit)
-                });
-                for (s, prev) in restores.into_iter().rev() {
-                    match prev {
-                        Some(v) => b.set(s, v),
-                        None => b.unset(s),
-                    }
+        // Var-length: stream endpoints and stop the moment a consumer (EXISTS /
+        // LIMIT) is satisfied — `match_node_then` returns false to propagate the
+        // stop, avoiding an exponential trail enumeration on a dense graph. A
+        // parenthesized SUBPATH repeats a unit and exposes its group variables at
+        // each trail end; the abbreviated `-[e]->{n}` form is the plain single-edge
+        // walk. Both stream through the same `on_end` contract.
+        let sink = &mut |b: &mut Binding, end: u32, verts: &[u32], edges: &[u32]| {
+            let restores = unit
+                .as_ref()
+                .map(|u| bind_group_vars(b, u, verts, edges))
+                .unwrap_or_default();
+            let keep = match_node_then(graph, ctx, b, node, end, &mut |b2| {
+                walk_segments(graph, ctx, pattern, index + 1, end, b2, emit)
+            });
+            for (s, prev) in restores.into_iter().rev() {
+                match prev {
+                    Some(v) => b.set(s, v),
+                    None => b.unset(s),
                 }
-                keep
-            },
-        );
+            }
+            keep
+        };
+        let spec = WalkSpec {
+            q,
+            mode: pattern.mode,
+            want_path: unit.is_some(),
+        };
+        return match unit {
+            Some(u) => reachable_each_unit(graph, ctx, binding, from, u, spec, sink),
+            None => reachable_each(graph, ctx, binding, from, rel, spec, sink),
+        };
     }
     for (eidx, nbr) in expand(graph, ctx, from, rel.direction, rel.label.as_ref()) {
         let Some(did_set) = bind_slot(binding, rel.var_slot, &Val::Edge(eidx)) else {
@@ -4376,7 +4646,7 @@ fn pattern_slots(patterns: &[CPath]) -> Vec<usize> {
     for p in patterns {
         push(p.path_var_slot);
         push(p.start.var_slot);
-        for CSegment { rel, node } in &p.segments {
+        for CSegment { rel, node, .. } in &p.segments {
             push(rel.var_slot);
             push(node.var_slot);
         }
@@ -4510,39 +4780,34 @@ fn match_path<F: FnMut(&mut Binding) -> bool>(
     if idx >= path.segments.len() {
         return emit(binding);
     }
-    let CSegment { rel, node } = &path.segments[idx];
+    let CSegment { rel, node, unit } = &path.segments[idx];
     if let Some(q) = rel.quantifier {
-        // Stream endpoints, stopping as soon as a consumer is satisfied (see the twin
-        // in `walk_segments`) — `match_node_continue` returns false to propagate. A
-        // quantified parenthesized subpath exposes its GROUP variables (x/e/y) as
-        // per-hop value lists at each trail end (see `bind_group_vars`).
-        return reachable_each(
-            graph,
-            ctx,
-            binding,
-            from,
-            rel,
-            WalkSpec {
-                q,
-                mode: path.mode,
-                want_path: rel.subpath,
-            },
-            &mut |b, end, verts, edges| {
-                let restores = if rel.subpath {
-                    bind_group_vars(b, rel, verts, edges)
-                } else {
-                    Vec::new()
-                };
-                let keep = match_node_continue(graph, ctx, b, node, end, path, idx + 1, emit);
-                for (s, prev) in restores.into_iter().rev() {
-                    match prev {
-                        Some(v) => b.set(s, v),
-                        None => b.unset(s),
-                    }
+        // The twin of `walk_segments`' branch: a parenthesized SUBPATH repeats a unit
+        // and exposes its group variables at each trail end; the abbreviated form is
+        // the plain single-edge walk. Same `on_end` contract.
+        let sink = &mut |b: &mut Binding, end: u32, verts: &[u32], edges: &[u32]| {
+            let restores = unit
+                .as_ref()
+                .map(|u| bind_group_vars(b, u, verts, edges))
+                .unwrap_or_default();
+            let keep = match_node_continue(graph, ctx, b, node, end, path, idx + 1, emit);
+            for (s, prev) in restores.into_iter().rev() {
+                match prev {
+                    Some(v) => b.set(s, v),
+                    None => b.unset(s),
                 }
-                keep
-            },
-        );
+            }
+            keep
+        };
+        let spec = WalkSpec {
+            q,
+            mode: path.mode,
+            want_path: unit.is_some(),
+        };
+        return match unit {
+            Some(u) => reachable_each_unit(graph, ctx, binding, from, u, spec, sink),
+            None => reachable_each(graph, ctx, binding, from, rel, spec, sink),
+        };
     }
     for (eidx, nbr) in expand(graph, ctx, from, rel.direction, rel.label.as_ref()) {
         let Some(eset) = bind_slot(binding, rel.var_slot, &Val::Edge(eidx)) else {
@@ -6490,6 +6755,7 @@ fn reverse_path(path: &CPath) -> CPath {
                 ..seg.rel.clone()
             },
             node: node_at(i).clone(),
+            unit: seg.unit.clone(),
         });
     }
     CPath {
@@ -11496,7 +11762,7 @@ fn run_insert(
         // a sibling created earlier in the same INSERT (forward reference).
         ctx.refresh_ids(graph, plan);
         let mut prev = ensure_node(graph, ctx, &mut out, &pattern.start);
-        for CSegment { rel, node } in &pattern.segments {
+        for CSegment { rel, node, .. } in &pattern.segments {
             ctx.refresh_ids(graph, plan);
             let next = ensure_node(graph, ctx, &mut out, node);
             let (from, to) = if rel.direction == Direction::In {

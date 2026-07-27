@@ -5418,6 +5418,184 @@ fn quantified_subpath_group_variables() {
     );
 }
 
+/// A layered graph: `layers` ranks of `width` nodes each, every node fully
+/// connected to the next rank (dense fan-out). Rank-0 node 0 is `src`.
+fn layered_dense(layers: usize, width: usize) -> Graph {
+    let mut lines: Vec<String> = Vec::new();
+    for l in 0..layers {
+        for w in 0..width {
+            let id = l * width + w;
+            lines.push(format!(
+                r#"{{"type":"node","id":"n{id}","labels":["N"],"properties":{{"id":"n{id}"}}}}"#
+            ));
+        }
+    }
+    let mut e = 0;
+    for l in 0..layers - 1 {
+        for a in 0..width {
+            for b in 0..width {
+                let from = l * width + a;
+                let to = (l + 1) * width + b;
+                lines.push(format!(
+                    r#"{{"type":"edge","id":"e{e}","from":"n{from}","to":"n{to}","labels":["R"],"properties":{{"amt":10.0}}}}"#
+                ));
+                e += 1;
+            }
+        }
+    }
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    graph_of(&refs)
+}
+
+/// Throwaway micro-benchmark (ignored; run with `--ignored --nocapture`) comparing
+/// the HOT abbreviated var-length path at k=1. Prints elapsed wall time — no
+/// assertion (wall clock is flaky as a gate). Used only to decide whether the
+/// unified unit matcher needs a k=1 fast-path pitch.
+#[test]
+#[ignore]
+fn bench_k1_abbreviated_walk() {
+    let mut g = layered_dense(6, 6);
+    let q = "MATCH (s:N {id:'n0'})-[:R]->{1,4}(x) RETURN count(*) AS c";
+    // warm
+    for _ in 0..5 {
+        let _ = rows(&mut g, q);
+    }
+    let t = std::time::Instant::now();
+    let iters = 200;
+    for _ in 0..iters {
+        let _ = rows(&mut g, q);
+    }
+    let el = t.elapsed();
+    eprintln!(
+        "bench_k1_abbreviated_walk: {iters} iters in {:?} ({:?}/iter)",
+        el,
+        el / iters
+    );
+}
+
+/// A five-node chain a→b→c→d→e (uniform edge amt 10) for exercising MULTI-element
+/// repetition units, where each repetition of the unit advances more than one hop.
+fn five_chain() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+        r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}"#,
+        r#"{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}"#,
+        r#"{"type":"node","id":"e","labels":["N"],"properties":{"id":"e"}}"#,
+        r#"{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{"amt":10.0}}"#,
+        r#"{"type":"edge","id":"e2","from":"b","to":"c","labels":["R"],"properties":{"amt":10.0}}"#,
+        r#"{"type":"edge","id":"e3","from":"c","to":"d","labels":["R"],"properties":{"amt":10.0}}"#,
+        r#"{"type":"edge","id":"e4","from":"d","to":"e","labels":["R"],"properties":{"amt":10.0}}"#,
+    ])
+}
+
+/// ANTI-DRIFT: the abbreviated `-[]->{n,m}` form (the [`reachable_each`] fast-path)
+/// and an equivalent single-edge parenthesized subpath `((x)-[]->(y)){n,m}` (the
+/// general [`reachable_each_unit`] matcher) must return IDENTICAL endpoints for the
+/// same walk under EVERY path mode — the two share a DFS skeleton and this pins them
+/// so a change to one that isn't mirrored in the other fails the suite. See the
+/// fast-path justification on `reachable_each_unit`.
+#[test]
+fn abbreviated_and_single_edge_subpath_agree_k1() {
+    // A graph with a cycle + a tail so TRAIL/SIMPLE/ACYCLIC/WALK genuinely diverge
+    // from one another (and thus meaningfully test that BOTH matchers agree per mode).
+    let mut g = triangle_tail();
+    for mode in ["WALK", "TRAIL", "SIMPLE", "ACYCLIC"] {
+        // Bounded quantifiers only: an unbounded `+`/`*` under WALK on the cycle is
+        // legitimately infinite (trail-budget fault), which is orthogonal to drift.
+        for quant in ["{1,3}", "{0,2}", "{2}", "{1,4}"] {
+            let abbrev =
+                format!("MATCH {mode} (s:N {{id:'a'}})-[:R]->{quant}(x) RETURN x.id AS id");
+            let subpath = format!(
+                "MATCH {mode} (s:N {{id:'a'}}) ((y)-[:R]->(z)){quant} (x) RETURN x.id AS id"
+            );
+            assert_eq!(
+                sorted_col0(&mut g, &abbrev),
+                sorted_col0(&mut g, &subpath),
+                "abbreviated vs single-edge subpath diverged for mode={mode} quant={quant}",
+            );
+        }
+    }
+}
+
+/// ISO MULTI-element repetition unit `((x)-[e1]->(m)-[e2]->(y)){n,m}`: each
+/// repetition advances TWO hops, so the endpoints land on even hop counts only.
+#[test]
+fn quantified_subpath_multi_element_unit_endpoints() {
+    let mut g = five_chain();
+    // One repetition of the 2-hop unit from a: a→b→c → endpoint c (never b — that's
+    // mid-unit, not a repetition boundary).
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e1:R]->(m)-[e2:R]->(y)){1} (t) RETURN t.id AS id",
+        ),
+        vec![s("c")],
+    );
+    // {1,2}: one rep → c, two reps → a→b→c→d→e → e. Endpoints {c, e}; d (odd) excluded.
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e1:R]->(m)-[e2:R]->(y)){1,2} (t) RETURN t.id AS id",
+        ),
+        vec![s("c"), s("e")],
+    );
+}
+
+/// The intermediate node `m` and BOTH edges of a multi-element unit are group
+/// variables, exposed as LISTS whose length is the repetition count.
+#[test]
+fn quantified_subpath_multi_element_group_variables() {
+    let mut g = five_chain();
+    // Two repetitions (a→b→c→d→e): x=[a,c], m=[b,d], y=[c,e]; e1=[a→b,c→d], e2=[b→c,d→e].
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e1:R]->(m)-[e2:R]->(y)){2} (t) \
+             RETURN t.id AS tid, size(e1) AS n1, size(e2) AS n2, size(m) AS nm, \
+             x[0].id AS x0, x[1].id AS x1, m[0].id AS m0, m[1].id AS m1, y[1].id AS y1",
+        ),
+        vec![vec![
+            s("e"),
+            n(2.0),
+            n(2.0),
+            n(2.0),
+            s("a"),
+            s("c"),
+            s("b"),
+            s("d"),
+            s("e"),
+        ]],
+    );
+}
+
+/// A per-unit `WHERE` spanning BOTH hops of a multi-element unit (`m` is the shared
+/// interior node): admit a repetition only when the second edge is no larger than
+/// the first. On the uniform chain (all amt 10) every unit passes; a stricter test
+/// with `<` would admit none.
+#[test]
+fn quantified_subpath_multi_element_cross_hop_predicate() {
+    let mut g = five_chain();
+    // `e2.amt <= e1.amt` (10<=10) holds for every unit → endpoints {c, e} as before.
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e1:R]->(m)-[e2:R]->(y) WHERE e2.amt <= e1.amt){1,2} (t) \
+             RETURN t.id AS id",
+        ),
+        vec![s("c"), s("e")],
+    );
+    // `e2.amt < e1.amt` (10<10) fails for the first unit → nothing reachable.
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e1:R]->(m)-[e2:R]->(y) WHERE e2.amt < e1.amt){1,2} (t) \
+             RETURN t.id AS id",
+        ),
+        Vec::<Value>::new(),
+    );
+}
+
 /// `WHERE e.amt >= 10` per hop: e3 (amt 5) is excluded, so from `a` the walk can
 /// reach b and c but never d.
 #[test]

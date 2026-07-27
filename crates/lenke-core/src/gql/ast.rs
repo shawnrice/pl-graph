@@ -305,6 +305,11 @@ pub struct Segment {
     pub node: NodePattern,
     pub hop_from: Option<NodePattern>,
     pub hop_to: Option<NodePattern>,
+    /// For a MULTI-element repetition unit `((x)-[e1]->(m)-[e2]->(y) …){n,m}`: the
+    /// unit's hops beyond the first (`rel`/`hop_to` is the first, `x`-[e1]->`m`);
+    /// each entry is one more `-[e]->node` hop. Empty for a single-edge unit / plain
+    /// hop. Every inner variable (x, each edge, each intermediate) is a group var.
+    pub unit_rest: Vec<Self>,
 }
 
 /// `(variable:LabelExpr {props} WHERE pred)` — all parts optional.

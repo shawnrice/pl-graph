@@ -1139,6 +1139,76 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(throws(() => tsQuery(ts, bad))).toBe(true);
   });
 
+  // ISO MULTI-element repetition unit `((x)-[e1]->(m)-[e2]->(y)){n,m}`: each
+  // repetition advances k hops. Intermediate node + every edge are group vars.
+  // Byte-identical across engines.
+  test('multi-element repetition unit + group variables (TS vs native)', () => {
+    const CHAIN = [
+      '{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}',
+      '{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}',
+      '{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}',
+      '{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}',
+      '{"type":"node","id":"e","labels":["N"],"properties":{"id":"e"}}',
+      '{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{"amt":10.0}}',
+      '{"type":"edge","id":"e2","from":"b","to":"c","labels":["R"],"properties":{"amt":10.0}}',
+      '{"type":"edge","id":"e3","from":"c","to":"d","labels":["R"],"properties":{"amt":10.0}}',
+      '{"type":"edge","id":"e4","from":"d","to":"e","labels":["R"],"properties":{"amt":10.0}}',
+    ].join('\n');
+    const nat = graphFromFormat(backend, CHAIN, 'ndjson');
+    const ts = tsDeserialize(CHAIN, 'ndjson', new Graph());
+
+    for (const q of [
+      // A 2-hop unit lands only on even hop counts: {1}→c, {1,2}→{c,e}.
+      "MATCH (s:N {id:'a'}) ((x)-[e1:R]->(m)-[e2:R]->(y)){1} (t) RETURN t.id AS id ORDER BY t.id",
+      "MATCH (s:N {id:'a'}) ((x)-[e1:R]->(m)-[e2:R]->(y)){1,2} (t) RETURN t.id AS id ORDER BY t.id",
+      // Group vars: intermediate `m` and BOTH edges are lists sized by repetition count.
+      "MATCH (s:N {id:'a'}) ((x)-[e1:R]->(m)-[e2:R]->(y)){2} (t) RETURN t.id AS tid, size(e1) AS n1, size(e2) AS n2, size(m) AS nm, x[0].id AS x0, x[1].id AS x1, m[0].id AS m0, m[1].id AS m1, y[1].id AS y1",
+      // Per-unit WHERE spanning BOTH hops (interior node `m` shared).
+      "MATCH (s:N {id:'a'}) ((x)-[e1:R]->(m)-[e2:R]->(y) WHERE e2.amt <= e1.amt){1,2} (t) RETURN t.id AS id ORDER BY t.id",
+      "MATCH (s:N {id:'a'}) ((x)-[e1:R]->(m)-[e2:R]->(y) WHERE e2.amt < e1.amt){1,2} (t) RETURN t.id AS id ORDER BY t.id",
+    ]) {
+      expect(JSON.stringify(nat.query(q)), q).toBe(JSON.stringify(tsQuery(ts, q)));
+    }
+  });
+
+  // ANTI-DRIFT: the abbreviated `-[]->{n,m}` form (each engine's single-edge
+  // fast-path) and an equivalent single-edge parenthesized subpath (the general
+  // unit matcher) return IDENTICAL endpoints — across every path mode, on BOTH
+  // engines. Pins the two matchers together so neither can silently diverge.
+  test('abbreviated == single-edge subpath at k=1, every mode (TS vs native)', () => {
+    const TRI = [
+      '{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}',
+      '{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}',
+      '{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}',
+      '{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}',
+      '{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{}}',
+      '{"type":"edge","id":"e2","from":"b","to":"c","labels":["R"],"properties":{}}',
+      '{"type":"edge","id":"e3","from":"c","to":"a","labels":["R"],"properties":{}}',
+      '{"type":"edge","id":"e4","from":"a","to":"d","labels":["R"],"properties":{}}',
+    ].join('\n');
+    const nat = graphFromFormat(backend, TRI, 'ndjson');
+    const ts = tsDeserialize(TRI, 'ndjson', new Graph());
+
+    for (const mode of ['WALK', 'TRAIL', 'SIMPLE', 'ACYCLIC']) {
+      for (const quant of ['{1,3}', '{0,2}', '{2}', '{1,4}']) {
+        const abbrev = `MATCH ${mode} (s:N {id:'a'})-[:R]->${quant}(x) RETURN x.id AS id ORDER BY x.id`;
+        const subpath = `MATCH ${mode} (s:N {id:'a'}) ((y)-[:R]->(z))${quant} (x) RETURN x.id AS id ORDER BY x.id`;
+        const key = `${mode} ${quant}`;
+        // Both engines agree abbreviated == subpath, AND the two engines agree with
+        // each other (transitively pinning all four result sets equal).
+        expect(JSON.stringify(nat.query(abbrev)), `native ${key}`).toBe(
+          JSON.stringify(nat.query(subpath)),
+        );
+        expect(JSON.stringify(tsQuery(ts, abbrev)), `ts ${key}`).toBe(
+          JSON.stringify(tsQuery(ts, subpath)),
+        );
+        expect(JSON.stringify(nat.query(abbrev)), `cross ${key}`).toBe(
+          JSON.stringify(tsQuery(ts, abbrev)),
+        );
+      }
+    }
+  });
+
   // --- string `id` as element identity: `INSERT (:P {id: 'x'})` makes 'x' the
   // element id (so element_id === n.id and it round-trips), a numeric id stays an
   // ordinary property, dup/SET-id are rejected. Must be byte-identical. ---------

@@ -646,18 +646,20 @@ export const parse = (
     }
 
     const rel = parseRel();
-    const hopTo = parseNode(); // inner (y)
+    const hopTo = parseNode(); // first inner target (m / y)
 
-    if (startsRelationship()) {
-      throw new GqlSyntaxError(
-        'a quantified subpath with more than one relationship is not yet supported',
-        peek().pos,
-      );
+    // Additional hops → a MULTI-element repetition unit `(x)-[e1]->(m)-[e2]->(y)`.
+    const unitRest: Segment[] = [];
+
+    while (startsRelationship()) {
+      const r = parseRel();
+      const n = parseNode();
+      unitRest.push({ rel: r, node: n });
     }
 
     // Inner nodes carry only a variable — put per-hop label/property tests in the
     // subpath `WHERE`, so nothing is silently dropped.
-    for (const n of [hopFrom, hopTo]) {
+    for (const n of [hopFrom, hopTo, ...unitRest.map((s) => s.node)]) {
       if (n.label !== undefined || (n.properties?.length ?? 0) > 0 || n.where !== undefined) {
         throw new GqlSyntaxError(
           "a label or property on a quantified-subpath node isn't supported yet — " +
@@ -685,7 +687,7 @@ export const parse = (
     // Optional following endpoint `(b)`; else an anonymous synthetic endpoint.
     const node = check('lparen') ? parseNode() : {};
 
-    return { rel: { ...rel, where, quantifier }, node, hopFrom, hopTo };
+    return { rel: { ...rel, where, quantifier }, node, hopFrom, hopTo, unitRest };
   };
 
   // Variable-length quantifier following an edge: `*`, `+`, `{n}`, `{n,m}`,

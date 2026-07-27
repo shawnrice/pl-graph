@@ -626,17 +626,27 @@ impl Parser {
             );
         }
         let mut rel = self.parse_rel()?;
-        let hop_to = self.parse_node()?; // inner (y)
-        if self.starts_relationship() {
-            return err(
-                "a quantified subpath with more than one relationship is not yet supported",
-                self.peek().pos,
-            );
+        let hop_to = self.parse_node()?; // first inner target (m / y)
+                                         // Additional hops → a MULTI-element repetition unit `(x)-[e1]->(m)-[e2]->(y)`.
+        let mut unit_rest: Vec<Segment> = Vec::new();
+        while self.starts_relationship() {
+            let r = self.parse_rel()?;
+            let n = self.parse_node()?;
+            unit_rest.push(Segment {
+                rel: r,
+                node: n,
+                hop_from: None,
+                hop_to: None,
+                unit_rest: Vec::new(),
+            });
         }
-        // The inner nodes carry only a variable — put any per-hop label / property
-        // test in the subpath `WHERE` (`((x)-[e]->(y) WHERE x:Account AND e.amt >
-        // 0){1,3}`), so nothing is silently dropped.
-        for n in [&hop_from, &hop_to] {
+        // The inner NODES carry only a variable — put any per-hop label / property
+        // test in the subpath `WHERE`, so nothing is silently dropped. (Inner EDGES
+        // keep their normal label/property filters.)
+        let inner_nodes = [&hop_from, &hop_to]
+            .into_iter()
+            .chain(unit_rest.iter().map(|s| &s.node));
+        for n in inner_nodes {
             if n.label.is_some() || !n.props.is_empty() || n.where_.is_some() {
                 return err(
                     "a label or property on a quantified-subpath node isn't supported yet — \
@@ -675,6 +685,7 @@ impl Parser {
             node,
             hop_from: Some(hop_from),
             hop_to: Some(hop_to),
+            unit_rest,
         })
     }
 
@@ -799,6 +810,7 @@ impl Parser {
                     node,
                     hop_from: None,
                     hop_to: None,
+                    unit_rest: Vec::new(),
                 });
             }
 

@@ -622,21 +622,41 @@ pub struct CRel {
     pub props: Vec<CPropConstraint>,
     pub where_: Option<CExpr>,
     pub quantifier: Option<Quantifier>,
-    /// `true` for an ISO quantified parenthesized subpath `((x)-[e]->(y) …){n,m}`.
-    /// The walk then binds `(x)`/`(e)`/`(y)` per hop for the predicate AND, at each
-    /// trail end, exposes them to the outer query as GROUP variables (lists of every
-    /// hop's value) via [`hop_from_slot`]/`var_slot`/[`hop_to_slot`].
-    pub subpath: bool,
-    /// The per-hop SOURCE `(x)` and TARGET `(y)` node slots of a subpath (`None` if
-    /// anonymous). For a plain / abbreviated hop both are `None`.
-    pub hop_from_slot: Option<usize>,
-    pub hop_to_slot: Option<usize>,
+}
+
+/// The repetition UNIT of an ISO quantified parenthesized subpath
+/// `((x)-[e1]->(m)-[e2]->(y) [WHERE]){n,m}`: a fixed linear sub-path repeated k ≥ 1
+/// hops. Every inner variable is a GROUP variable (exposed to the outer query as
+/// the list of each repetition's value). A single-edge subpath is a **one-hop
+/// unit** — the SAME matcher, just `k = 1` — so the single and multi cases can't
+/// drift.
+#[derive(Debug, Clone)]
+pub struct CUnit {
+    /// One entry per hop.
+    pub hops: Vec<CUnitHop>,
+    /// The unit SOURCE node `(x)`'s group-variable slot (`None` if anonymous).
+    pub start_slot: Option<usize>,
+    /// The per-unit predicate (the subpath `WHERE`), checked once the whole unit is
+    /// matched (every inner variable bound), so it can reference any of them.
+    pub where_: Option<CExpr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CUnitHop {
+    /// The relationship (for expansion + its own inline label/property filter).
+    pub rel: CRel,
+    /// The hop's target node's group-variable slot (`None` if anonymous).
+    pub target_slot: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
 pub struct CSegment {
     pub rel: CRel,
     pub node: CNode,
+    /// For a quantified parenthesized subpath: the repetition unit (`rel.quantifier`
+    /// carries the bounds; `node` is the outer landing endpoint). `None` for a plain
+    /// hop or the abbreviated `-[e]->{n,m}` form.
+    pub unit: Option<CUnit>,
 }
 
 #[derive(Debug, Clone)]
@@ -1278,9 +1298,18 @@ impl Lowerer {
             }
             for seg in &p.segments {
                 // The inner source `(x)` and target `(y)` group variables of a
-                // quantified parenthesized subpath.
+                // quantified parenthesized subpath, plus any intermediate nodes /
+                // edges of a MULTI-element repetition unit (`(x)-[e1]->(m)-[e2]->(y)`).
                 for inner in [&seg.hop_from, &seg.hop_to].into_iter().flatten() {
                     if let Some(v) = &inner.variable {
+                        self.add_var(v);
+                    }
+                }
+                for extra in &seg.unit_rest {
+                    if let Some(v) = &extra.rel.variable {
+                        self.add_var(v);
+                    }
+                    if let Some(v) = &extra.node.variable {
                         self.add_var(v);
                     }
                 }
@@ -1582,28 +1611,52 @@ impl Lowerer {
             props: r.props.iter().map(|p| self.prop(p)).collect(),
             where_: r.where_.as_ref().map(|w| self.expr(w)),
             quantifier: r.quantifier,
-            subpath: false,
-            hop_from_slot: None,
-            hop_to_slot: None,
         }
+    }
+
+    /// A node's binding slot (`None` if anonymous).
+    fn node_slot(&mut self, n: &NodePattern) -> Option<usize> {
+        n.variable.as_ref().map(|v| self.slot_of(v))
     }
 
     fn segment(&mut self, s: &Segment) -> CSegment {
         let node = self.node(&s.node);
         let mut rel = self.rel(&s.rel);
-        // A quantified parenthesized subpath: bind the hop's inner source `(x)` and
-        // target `(y)` per repetition (and expose them as group-variable lists);
-        // `node` is the separate outer endpoint `(b)`.
-        if let Some(from) = &s.hop_from {
-            rel.subpath = true;
-            rel.hop_from_slot = from.variable.as_ref().map(|v| self.slot_of(v));
-            rel.hop_to_slot = s
-                .hop_to
-                .as_ref()
-                .and_then(|to| to.variable.as_ref())
-                .map(|v| self.slot_of(v));
-        }
-        CSegment { rel, node }
+        // A quantified parenthesized subpath compiles to a repetition UNIT: the inner
+        // hops (`(x)-[e1]->(m)-[e2]->(y)`) with their group-variable slots + the
+        // per-unit `WHERE`. `node` is the separate outer endpoint. A single-edge
+        // subpath is a one-hop unit — the same shape, `k = 1`.
+        let unit = s.hop_from.as_ref().map(|from| {
+            // Every hop's `WHERE` (the subpath predicate the parser merged onto the
+            // first hop, plus any inline `-[e WHERE …]->` on a later hop) is lifted to
+            // the unit level and AND-ed, so it is checked exactly once — after all `k`
+            // hops are bound (letting it span the whole unit) — and cleared from the
+            // hops themselves.
+            let mut where_ = rel.where_.take();
+            let mut hops = vec![CUnitHop {
+                rel: rel.clone(),
+                target_slot: s.hop_to.as_ref().and_then(|to| self.node_slot(to)),
+            }];
+            for extra in &s.unit_rest {
+                let mut extra_rel = self.rel(&extra.rel);
+                if let Some(w) = extra_rel.where_.take() {
+                    where_ = Some(match where_.take() {
+                        Some(prev) => CExpr::And(vec![prev, w]),
+                        None => w,
+                    });
+                }
+                hops.push(CUnitHop {
+                    rel: extra_rel,
+                    target_slot: self.node_slot(&extra.node),
+                });
+            }
+            CUnit {
+                hops,
+                start_slot: self.node_slot(from),
+                where_,
+            }
+        });
+        CSegment { rel, node, unit }
     }
 
     fn path(&mut self, p: &PathPattern) -> CPath {

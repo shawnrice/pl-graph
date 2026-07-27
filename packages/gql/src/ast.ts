@@ -278,6 +278,13 @@ export type Segment = {
   node: NodePattern;
   hopFrom?: NodePattern;
   hopTo?: NodePattern;
+  /**
+   * For a MULTI-element repetition unit `((x)-[e1]->(m)-[e2]->(y) …){n,m}`: the
+   * unit's hops beyond the first (`rel`/`hopTo` is the first, `x`-[e1]->`m`); each
+   * entry is one more `-[e]->node` hop. Absent/empty for a single-edge unit or a
+   * plain hop. Every inner variable (x, each edge, each intermediate) is a group var.
+   */
+  unitRest?: Segment[];
 };
 
 /**

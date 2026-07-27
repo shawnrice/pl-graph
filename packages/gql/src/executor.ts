@@ -2286,13 +2286,22 @@ const patternBoundVars = (p: PathPattern, into: Set<string>): void => {
   addNode(p.start);
 
   for (const seg of p.segments) {
-    // The inner source `(x)` and target `(y)` group variables of a subpath.
+    // The inner source `(x)` and target `(y)` group variables of a subpath, plus any
+    // intermediate nodes / edges of a MULTI-element repetition unit.
     if (seg.hopFrom !== undefined) {
       addNode(seg.hopFrom);
     }
 
     if (seg.hopTo !== undefined) {
       addNode(seg.hopTo);
+    }
+
+    for (const extra of seg.unitRest ?? []) {
+      if (extra.rel.variable !== undefined) {
+        into.add(extra.rel.variable);
+      }
+
+      addNode(extra.node);
     }
 
     if (seg.rel.variable !== undefined) {
@@ -3018,15 +3027,19 @@ type CRel = {
   direction: RelPattern['direction'];
   pred: CPredicate;
   quantifier?: RelPattern['quantifier'];
-  /** `true` for a quantified parenthesized subpath `((x)-[e]->(y) …){n,m}`. The
-   *  hop's source `(x)` / edge `(e)` / target `(y)` are bound per repetition for the
-   *  predicate AND exposed to the outer query as GROUP-variable lists at each end. */
-  subpath?: boolean;
-  /** The subpath's inner source `(x)` and target `(y)` variable names. */
-  hopFromVar?: string;
-  hopToVar?: string;
 };
-type CSegment = { rel: CRel; node: CNode };
+/** One hop of a repetition unit: traverse `rel`, land on `targetVar` (a group var). */
+type CUnitHop = { rel: CRel; targetVar?: string };
+/**
+ * A quantified parenthesized subpath compiled to a repetition UNIT: a fixed linear
+ * sub-path of `k` hops repeated `[min, max]` times. `startVar` is the source `(x)`
+ * group var; each hop's `targetVar` is an intermediate/target group var; `where` is
+ * the per-repetition predicate, evaluated once every inner variable is bound (so it
+ * can span all `k` hops). A single-edge subpath is a one-hop unit — the same shape,
+ * `k = 1`. Mirrors native `CUnit`.
+ */
+type CUnit = { hops: readonly CUnitHop[]; startVar?: string; where?: CompiledExpr };
+type CSegment = { rel: CRel; node: CNode; unit?: CUnit };
 type CPath = {
   start: CNode;
   segments: readonly CSegment[];
@@ -3255,16 +3268,50 @@ const compilePath = (pattern: PathPattern): CPath => {
 
   return {
     start: compileNode(pattern.start),
-    segments: pattern.segments.map(({ rel, node, hopFrom, hopTo }) => {
+    segments: pattern.segments.map(({ rel, node, hopFrom, hopTo, unitRest }) => {
       const crel = compileRel(rel);
-      // A quantified parenthesized subpath: bind the inner source `(x)` and target
-      // `(y)` per hop (and expose them as group-variable lists); `node` is the
-      // separate outer endpoint.
-      const withHop = hopFrom
-        ? { ...crel, subpath: true, hopFromVar: hopFrom.variable, hopToVar: hopTo?.variable }
-        : crel;
 
-      return { rel: withHop, node: compileNode(node) };
+      if (hopFrom === undefined) {
+        // A plain / abbreviated hop — no repetition unit.
+        return { rel: crel, node: compileNode(node) };
+      }
+
+      // A quantified parenthesized subpath compiles to a UNIT. Every hop's `WHERE`
+      // (the subpath predicate the parser merged onto the first hop, plus any inline
+      // `-[e WHERE …]->` on a later hop) is lifted to the unit level and AND-ed, so it
+      // is checked once — after all `k` hops are bound (letting it span the whole
+      // unit) — and stripped from the hops, whose predicate keeps only inline props.
+      // `node` is the separate outer endpoint. Folding at the AST level reuses the
+      // exact three-valued `and` semantics; mirrors native `plan::segment`.
+      const astHops: { rel: RelPattern; targetVar?: string }[] = [
+        { rel, ...(hopTo?.variable !== undefined ? { targetVar: hopTo.variable } : {}) },
+        ...(unitRest ?? []).map((extra) => ({
+          rel: extra.rel,
+          ...(extra.node.variable !== undefined ? { targetVar: extra.node.variable } : {}),
+        })),
+      ];
+
+      const whereExprs = astHops.map((h) => h.rel.where).filter((w): w is Expr => w !== undefined);
+      let unitWhere: Expr | undefined;
+
+      if (whereExprs.length === 1) {
+        [unitWhere] = whereExprs;
+      } else if (whereExprs.length > 1) {
+        unitWhere = { kind: 'and', items: whereExprs };
+      }
+
+      const hops: CUnitHop[] = astHops.map((h) => ({
+        rel: compileRel({ ...h.rel, where: undefined }),
+        ...(h.targetVar !== undefined ? { targetVar: h.targetVar } : {}),
+      }));
+
+      const unit: CUnit = {
+        hops,
+        ...(hopFrom.variable !== undefined ? { startVar: hopFrom.variable } : {}),
+        ...(unitWhere !== undefined ? { where: compileExpr(unitWhere) } : {}),
+      };
+
+      return { rel: crel, node: compileNode(node), unit };
     }),
     ...(pattern.pathVar !== undefined ? { pathVar: pattern.pathVar } : {}),
     selector,
@@ -4028,30 +4075,261 @@ const shortestKWalk = function* (
 };
 
 /** Recursively extend a binding across the remaining segments of a pattern. */
-/** Bind a quantified subpath's GROUP variables to the trail's per-hop value lists:
- *  `e` = the edges in hop order, `x` = each hop's source (`verts[..last]`), `y` =
- *  each hop's target (`verts[1..]`). Mirrors native `bind_group_vars`. */
+/** Bind a repetition unit's GROUP variables to the walk's per-repetition value
+ *  lists. For a `k`-hop unit repeated `reps` times: each node position `p` (0..=k;
+ *  the unit source then each hop's target) and each edge position (each hop's edge)
+ *  is exposed as the LIST of that position's value across every repetition
+ *  (`verts[rep*k + p]` / `edges[rep*k + p]`). A one-hop unit (`k = 1`) collapses to
+ *  `x = verts[..last]`, `y = verts[1..]`, `e = edges`. Mirrors native `bind_group_vars`. */
 const bindGroupVars = (
   binding: Binding,
-  rel: CRel,
+  unit: CUnit,
   verts: readonly Vertex[],
   edges: readonly Edge[],
 ): Binding => {
   const next = new Map(binding);
+  const k = unit.hops.length;
+  const reps = k === 0 ? 0 : Math.floor(edges.length / k);
 
-  if (rel.variable !== undefined) {
-    next.set(rel.variable, [...edges]);
+  // Node positions 0..=k: the unit source, then each hop's target.
+  for (let p = 0; p <= k; p += 1) {
+    const varName = p === 0 ? unit.startVar : unit.hops[p - 1].targetVar;
+
+    if (varName !== undefined) {
+      const list: Vertex[] = [];
+
+      for (let rep = 0; rep < reps; rep += 1) {
+        list.push(verts[rep * k + p]);
+      }
+
+      next.set(varName, list);
+    }
   }
 
-  if (rel.hopFromVar !== undefined) {
-    next.set(rel.hopFromVar, verts.slice(0, -1));
-  }
+  // Edge positions 0..k: each hop's edge.
+  for (let p = 0; p < k; p += 1) {
+    const varName = unit.hops[p].rel.variable;
 
-  if (rel.hopToVar !== undefined) {
-    next.set(rel.hopToVar, verts.slice(1));
+    if (varName !== undefined) {
+      const list: Edge[] = [];
+
+      for (let rep = 0; rep < reps; rep += 1) {
+        list.push(edges[rep * k + p]);
+      }
+
+      next.set(varName, list);
+    }
   }
 
   return next;
+};
+
+/** One traversal of a repetition UNIT from a frontier vertex: the `k` edges and `k`
+ *  target vertices in hop order; the unit's end is `verts[verts.length - 1]`. */
+type UnitMatch = { end: Vertex; verts: Vertex[]; edges: Edge[] };
+
+/** Enumerate every way to traverse `unit`'s `k` hops from `from`, honouring each
+ *  hop's inline props filter, intra-unit edge distinctness (no edge twice in one
+ *  unit), and the per-unit `where` (checked once every inner variable is bound).
+ *  Inner variables are bound only transiently, for the `where`; the caller re-binds
+ *  them as group lists at each trail end. A one-hop unit is exactly the single-edge
+ *  expansion. Mirrors native `expand_unit`. */
+const expandUnit = (
+  graph: Graph,
+  from: Vertex,
+  unit: CUnit,
+  binding: Binding,
+  params: Params,
+): UnitMatch[] => {
+  const out: UnitMatch[] = [];
+  const edges: Edge[] = [];
+  const verts: Vertex[] = [];
+
+  const walk = (hopI: number, cur: Vertex, bnd: Binding): void => {
+    if (hopI === unit.hops.length) {
+      // The whole unit is matched — every inner variable is bound, so the per-unit
+      // predicate can reference any of them.
+      if (unit.where === undefined || unit.where({ binding: bnd, params, graph }) === true) {
+        out.push({ end: cur, verts: [...verts], edges: [...edges] });
+      }
+
+      return;
+    }
+
+    const hop = unit.hops[hopI];
+
+    for (const { edge, node: nbr } of expand(graph, cur, hop.rel)) {
+      if (edges.includes(edge)) {
+        continue; // no edge twice within one unit
+      }
+
+      const eBnd = withBinding(bnd, hop.rel.variable, edge);
+
+      if (!satisfies(edge, hop.rel.pred, eBnd, params, graph)) {
+        continue;
+      }
+
+      const tBnd = withBinding(eBnd, hop.targetVar, nbr);
+      edges.push(edge);
+      verts.push(nbr);
+      walk(hopI + 1, nbr, tBnd);
+      edges.pop();
+      verts.pop();
+    }
+  };
+
+  walk(0, from, withBinding(binding, unit.startVar, from));
+
+  return out;
+};
+
+/**
+ * The GENERAL repetition matcher: repeat `unit` (a `k`-hop sub-path) from `from`,
+ * yielding each trail end in [min, max] REPETITIONS (with the whole walk's
+ * verts/edges, so the caller can expose group variables). TRAIL/SIMPLE/ACYCLIC/WALK
+ * restrictors apply across the ENTIRE walk (a mark covers a whole unit's
+ * edges/targets). A one-hop unit (`k = 1`) reproduces `trailEnds` exactly; that
+ * single-edge twin is kept only as a fast-path for the hot abbreviated form.
+ * Mirrors native `reachable_each_unit`.
+ */
+const trailEndsUnit = function* (
+  graph: Graph,
+  from: Vertex,
+  unit: CUnit,
+  q: NonNullable<CRel['quantifier']>,
+  opts: { mode: PathMode; binding: Binding; params: Params },
+): Iterable<TrailEnd> {
+  const { mode, binding, params } = opts;
+
+  if (q.min === 0) {
+    yield { end: from, verts: [from], edges: [] };
+  }
+
+  const vertexMode = mode === 'simple' || mode === 'acyclic';
+  const marks = new Set<Edge | Vertex>();
+
+  if (vertexMode) {
+    marks.add(from);
+  }
+
+  let steps = 0;
+
+  type Frame = {
+    units: UnitMatch[];
+    idx: number;
+    depth: number;
+    // Marks this frame set (a whole unit's edges or target nodes), cleared on backtrack.
+    entryMarks: (Edge | Vertex)[];
+    // The unit that led to this frame's vertex (for path reconstruction).
+    entryUnit: UnitMatch | null;
+  };
+
+  const stack: Frame[] = [
+    {
+      units: expandUnit(graph, from, unit, binding, params),
+      idx: 0,
+      depth: 0,
+      entryMarks: [],
+      entryUnit: null,
+    },
+  ];
+
+  // Reconstruct the full walk (seed + every unit's targets/edges) from the live stack.
+  const reconstruct = (last: UnitMatch): { verts: Vertex[]; edges: Edge[] } => {
+    const verts: Vertex[] = [from];
+    const edges: Edge[] = [];
+
+    for (let i = 1; i < stack.length; i += 1) {
+      const u = stack[i].entryUnit;
+
+      if (u) {
+        verts.push(...u.verts);
+        edges.push(...u.edges);
+      }
+    }
+
+    verts.push(...last.verts);
+    edges.push(...last.edges);
+
+    return { verts, edges };
+  };
+
+  while (stack.length > 0) {
+    const top = stack[stack.length - 1];
+
+    if ((q.max !== null && top.depth >= q.max) || top.idx >= top.units.length) {
+      for (const mk of top.entryMarks) {
+        marks.delete(mk);
+      }
+
+      stack.pop();
+      continue;
+    }
+
+    const m = top.units[top.idx];
+    const { depth } = top;
+    top.idx += 1;
+
+    // Restrictor: which marks this unit claims (all its edges for TRAIL, all its
+    // targets for SIMPLE/ACYCLIC), and whether it is a non-extending SIMPLE close.
+    const end = m.verts[m.verts.length - 1]; // a unit has ≥ 1 hop
+    let newMarks: (Edge | Vertex)[] = [];
+    let isClose = false;
+
+    if (mode === 'trail') {
+      if (m.edges.some((e) => marks.has(e))) {
+        continue;
+      }
+
+      newMarks = [...m.edges];
+    } else if (mode === 'acyclic') {
+      if (m.verts.some((v) => marks.has(v))) {
+        continue;
+      }
+
+      newMarks = [...m.verts];
+    } else if (mode === 'simple') {
+      if (end === from) {
+        isClose = true; // close the cycle on the seed
+      } else if (m.verts.some((v) => marks.has(v))) {
+        continue;
+      } else {
+        newMarks = [...m.verts];
+      }
+    }
+    // mode === 'walk': no marks.
+
+    steps += 1;
+
+    if (steps > TRAIL_BUDGET) {
+      throw new LenkeError(
+        'Variable-length pattern exceeded the trail budget; add a tighter bound',
+        { code: ErrorCode.ResourceExhausted },
+      );
+    }
+
+    for (const mk of newMarks) {
+      marks.add(mk);
+    }
+
+    const d = depth + 1;
+
+    if (d >= q.min) {
+      const { verts, edges } = reconstruct(m);
+
+      yield { end, verts, edges };
+    }
+
+    if (!isClose) {
+      stack.push({
+        units: expandUnit(graph, end, unit, binding, params),
+        idx: 0,
+        depth: d,
+        entryMarks: newMarks,
+        entryUnit: m,
+      });
+    }
+  }
 };
 
 const walkSegments = function* (
@@ -4068,21 +4346,21 @@ const walkSegments = function* (
     return;
   }
 
-  const { rel, node } = pattern.segments[index];
+  const { rel, node, unit } = pattern.segments[index];
 
   // Variable-length: enumerate the endpoint of every trail within [min, max]
-  // hops (one per trail → ISO per-path multiplicity), then continue from each.
-  // `trailEnds` binds and filters each hop's edge for a per-hop predicate.
+  // repetitions (one per trail → ISO per-path multiplicity), then continue from
+  // each. A parenthesized SUBPATH repeats a `k`-hop unit and exposes its group
+  // variables (`trailEndsUnit`); the abbreviated form is the single-edge walk
+  // (`trailEnds`, the k=1 fast-path). Both bind/filter each hop's edge.
   if (rel.quantifier) {
-    for (const { end, verts, edges } of trailEnds(graph, from, rel, rel.quantifier, {
-      mode: pattern.mode ?? 'trail',
-      binding,
-      params,
-      // A quantified parenthesized subpath needs the whole trail so its GROUP
-      // variables (x/e/y) can be exposed as lists.
-      wantPath: rel.subpath ?? false,
-    })) {
-      const withGroups = rel.subpath ? bindGroupVars(binding, rel, verts, edges) : binding;
+    const mode = pattern.mode ?? 'trail';
+    const ends = unit
+      ? trailEndsUnit(graph, from, unit, rel.quantifier, { mode, binding, params })
+      : trailEnds(graph, from, rel, rel.quantifier, { mode, binding, params, wantPath: false });
+
+    for (const { end, verts, edges } of ends) {
+      const withGroups = unit ? bindGroupVars(binding, unit, verts, edges) : binding;
       const matched = matchNode(withGroups, node, end, params, graph);
 
       if (matched) {
@@ -4222,16 +4500,12 @@ const trailEnds = function* (
 
     // Per-hop predicate: skip edges that fail it before any mark/step accounting
     // (a failing edge never enters the trail — mirrors native `expand_filtered`).
-    // A quantified subpath also binds the hop's source (`top.vertex`) and target
-    // (`node`) so the predicate can reference `(x)`/`(y)`.
-    const hopBinding = withBinding(
-      withBinding(withBinding(binding, rel.variable, edge), rel.hopFromVar, top.vertex),
-      rel.hopToVar,
-      node,
-    );
+    if (hasPred) {
+      const hopBinding = withBinding(binding, rel.variable, edge);
 
-    if (hasPred && !satisfies(edge, rel.pred, hopBinding, params, graph)) {
-      continue;
+      if (!satisfies(edge, rel.pred, hopBinding, params, graph)) {
+        continue;
+      }
     }
 
     // Whether this step is allowed, what it marks, and whether it's a
