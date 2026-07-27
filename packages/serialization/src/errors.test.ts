@@ -117,7 +117,8 @@ describe('serialization error codes', () => {
 
     // Duck-typed TC39 Temporal.PlainDate (brand + ISO toString), no hard dep.
     const fake = { [Symbol.toStringTag]: 'Temporal.PlainDate', toString: () => '2021-02-03' };
-    expect(String(normalizeValue(fake))).toBe('2021-02-03');
+    const normalized = normalizeValue(fake) as { toString(): string };
+    expect(normalized.toString()).toBe('2021-02-03');
   });
 
   test('a native Date reject points at the explicit converter', () => {

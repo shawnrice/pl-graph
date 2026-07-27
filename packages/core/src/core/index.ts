@@ -1,6 +1,7 @@
 export * from './Edge.js';
 export * from './Element.js';
 export * from './Graph.js';
+export * from './LenkeRecord.js';
 export type * from './GraphEvents.js';
 export * from './Path.js';
 export * from './PropertyIndex.js';

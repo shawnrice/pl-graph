@@ -1,5 +1,12 @@
 import type { Graph } from '@lenke/core';
-import { graphsonTag, graphsonType, isTemporal, temporalFormat, temporalParse } from '@lenke/core';
+import {
+  graphsonTag,
+  graphsonType,
+  isTemporal,
+  LenkeRecord,
+  temporalFormat,
+  temporalParse,
+} from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
 import type { Codec } from '../codec.js';
@@ -57,6 +64,18 @@ const encodeValue = (value: PropertyValue): unknown => {
     return { '@type': graphsonType(value), '@value': temporalFormat(value) };
   }
 
+  if (value instanceof LenkeRecord) {
+    // g:Map — a FLAT [k1, v1, k2, v2, …] array; a string key is bare.
+    const flat: unknown[] = [];
+
+    for (const [k, v] of value) {
+      flat.push(k);
+      flat.push(encodeValue(v as PropertyValue));
+    }
+
+    return { '@type': 'g:Map', '@value': flat };
+  }
+
   // Array → g:List of typed values.
   return { '@type': 'g:List', '@value': value.map(encodeValue) };
 };
@@ -111,6 +130,33 @@ const decodeValue = (node: unknown, depth = 0): PropertyValue => {
       }
 
       return v.map((el) => decodeValue(el, depth + 1));
+    }
+    case 'g:Map': {
+      // A flat `[k1, v1, k2, v2, …]` array → a canonical record. Stored map keys
+      // are strings, so a non-string key is rejected.
+      const v = typed['@value'];
+
+      if (!Array.isArray(v) || v.length % 2 !== 0) {
+        return shapeError('g:Map value must be an even-length array');
+      }
+
+      if (depth >= MAX_NESTING) {
+        return shapeError('g:Map nesting exceeds the maximum depth');
+      }
+
+      const entries: [string, unknown][] = [];
+
+      for (let i = 0; i < v.length; i += 2) {
+        const key = decodeValue(v[i], depth + 1);
+
+        if (typeof key !== 'string') {
+          return shapeError('a stored g:Map key must be a string');
+        }
+
+        entries.push([key, decodeValue(v[i + 1], depth + 1)]);
+      }
+
+      return LenkeRecord.from(entries);
     }
     default: {
       // A temporal wrapper (`gx:LocalDate`/`gx:LocalDateTime`/`gx:Duration`).

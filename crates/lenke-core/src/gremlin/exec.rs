@@ -831,10 +831,14 @@ fn value_to_gval(v: Value) -> GVal {
         Value::Str(s) => GVal::Str(s),
         Value::Temporal(t) => GVal::Temporal(t),
         Value::List(items) => GVal::List(items.into_iter().map(value_to_gval).collect()),
-        // Map is a GQL-result-only value; it never reaches the Gremlin value path.
-        Value::Map(_) => {
-            unreachable!("Value::Map is a GQL query-result value, not a Gremlin value")
-        }
+        // A stored record/map reads back as a `GVal::Map` (string keys), so it
+        // flows through `valueMap`/`select`/`order(local)` like any Gremlin map.
+        Value::Map(pairs) => GVal::Map(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (GVal::Str(k), value_to_gval(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -846,6 +850,25 @@ fn gval_to_value(v: &GVal) -> Value {
         GVal::Str(s) => Value::Str(s.clone()),
         GVal::Temporal(t) => Value::Temporal(*t),
         GVal::List(items) => Value::List(items.iter().map(gval_to_value).collect()),
+        // A Gremlin map written back to a property → a stored record. Stored map
+        // keys are strings; a scalar key coerces to its string form, any richer
+        // key (element/list/map) can't be a field name and is dropped. The store
+        // canonicalizes (sorts) on write.
+        GVal::Map(pairs) => Value::Map(
+            pairs
+                .iter()
+                .filter_map(|(k, v)| {
+                    let key: std::sync::Arc<str> = match k {
+                        GVal::Str(s) => s.clone(),
+                        GVal::Num(n) => crate::jsonfmt::js_number(*n).into(),
+                        GVal::Bool(b) => if *b { "true" } else { "false" }.into(),
+                        GVal::Null => "null".into(),
+                        _ => return None,
+                    };
+                    Some((key, gval_to_value(v)))
+                })
+                .collect(),
+        ),
         _ => Value::Null,
     }
 }

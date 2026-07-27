@@ -2352,3 +2352,29 @@ fn algo_parse_edges_modulator_rejected() {
         "expected .with(PageRank.edges,...) to be rejected"
     );
 }
+
+#[test]
+fn gremlin_reads_a_stored_map_property() {
+    // A stored record/map property reads back as a `GVal::Map` (string keys),
+    // flowing through `values()`/`valueMap()` like any Gremlin map.
+    let mut gr = ndjson::decode(
+        r#"{"type":"node","id":"a","labels":["P"],"properties":{"meta":{"city":"NYC","zip":"10001"}}}"#,
+    )
+    .unwrap();
+    let r = g().V().values(&["meta"]).run(&mut gr);
+    match r.as_slice() {
+        [GVal::Map(pairs)] => {
+            // Keys are the stored (canonical, sorted) fields, as GVal::Str.
+            let keys: Vec<String> = pairs
+                .iter()
+                .map(|(k, _)| match k {
+                    GVal::Str(s) => s.to_string(),
+                    other => format!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(keys, vec!["city".to_string(), "zip".to_string()]);
+            assert!(matches!(&pairs[0].1, GVal::Str(s) if s.as_ref() == "NYC"));
+        }
+        other => panic!("expected one GVal::Map, got {other:?}"),
+    }
+}

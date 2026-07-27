@@ -803,3 +803,60 @@ suite('gremlin conformance: property(key, traversal) — traversal-induced value
     });
   }
 });
+
+// A stored map/record property flows through the Gremlin value path in BOTH
+// engines (native `value_to_gval` → GVal::Map; TS core → LenkeRecord) and
+// serializes to the same canonical string-keyed object.
+suite('gremlin conformance: stored map property', () => {
+  const MAP_NDJSON = [
+    {
+      type: 'node',
+      id: 'a',
+      labels: ['P'],
+      properties: { id: 'a', meta: { city: 'NYC', zip: '10001' } },
+    },
+    {
+      type: 'node',
+      id: 'b',
+      labels: ['P'],
+      properties: { id: 'b', meta: { city: 'LA', zip: '90001' } },
+    },
+  ]
+    .map((r) => JSON.stringify(r))
+    .join('\n');
+
+  const buildTs = (): Graph => {
+    const g = new Graph();
+
+    for (const line of MAP_NDJSON.split('\n')) {
+      const r = JSON.parse(line) as {
+        id: string;
+        labels: string[];
+        properties: Record<string, unknown>;
+      };
+
+      g.addVertex({ id: r.id, labels: r.labels, properties: r.properties });
+    }
+
+    return g;
+  };
+
+  test('values(meta) reads a stored map identically in both engines', () => {
+    const plan = traversal(V(), values('meta'));
+    const groovy = planToGremlin(plan);
+    const ts = toArray(plan, buildTs()).map(canonJson);
+    const handle = backend!.graphFromNdjson(new TextEncoder().encode(MAP_NDJSON), false);
+
+    try {
+      const native = JSON.parse(decoder.decode(backend!.gremlinJson(handle, groovy))) as unknown[];
+
+      expect(ts).toEqual(native);
+      expect(ts).toEqual([
+        { city: 'NYC', zip: '10001' },
+        { city: 'LA', zip: '90001' },
+      ]);
+    } finally {
+      backend!.graphFree(handle);
+    }
+  });
+});

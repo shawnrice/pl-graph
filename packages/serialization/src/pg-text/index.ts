@@ -1,5 +1,6 @@
 import type { Graph } from '@lenke/core';
-import { isTemporal, temporalFormat, temporalParse } from '@lenke/core';
+import { isTemporal, LenkeRecord, temporalFormat, temporalParse } from '@lenke/core';
+import { ErrorCode, LenkeError } from '@lenke/errors';
 
 import type { Codec } from '../codec.js';
 import { type ChunkSource, linesFromChunks } from '../streaming.js';
@@ -132,6 +133,16 @@ const encodeScalar = (value: Exclude<PropertyValue, readonly PropertyValue[]>): 
   // from a quoted string on decode.
   if (isTemporal(value)) {
     return `@${value.kind}:${temporalFormat(value)}`;
+  }
+
+  // A map/record has no faithful flat-token form — reject loudly (mirrors the
+  // native codec) rather than mangle it. Use a structured format instead.
+  if (value instanceof LenkeRecord) {
+    throw new LenkeError(
+      'a map/record property cannot be serialized to pg-text (a flat format); ' +
+        'use ndjson, graphson, or pg-json',
+      { code: ErrorCode.Unsupported },
+    );
   }
 
   return `"${value.replace(STR_ESCAPE, (c) => STR_ESCAPE_MAP[c])}"`;

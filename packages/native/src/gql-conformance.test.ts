@@ -2363,3 +2363,62 @@ suite('gql conformance: ANY / SHORTEST k — byte-identical', () => {
     expect(ts).toBe(native);
   });
 });
+
+// A graph with stored map/record properties (nested, out-of-order keys) — proves
+// the map round-trips through BOTH engines' storage and reads back byte-identical.
+const MAP_NDJSON = [
+  '{"type":"node","id":"a","labels":["P"],"properties":{"id":"a","meta":{"city":"NYC","zip":"10001"}}}',
+  '{"type":"node","id":"b","labels":["P"],"properties":{"id":"b","meta":{"city":"LA","zip":"90001"}}}',
+  '{"type":"node","id":"c","labels":["P"],"properties":{"id":"c","meta":{"city":"NYC","zip":"10002"}}}',
+].join('\n');
+
+suite('GQL differential: stored map/record properties (TS vs native)', () => {
+  const backend = createFfiBackend(LIB);
+  const nativeGraph = graphFromFormat(backend, MAP_NDJSON, 'ndjson');
+  const tsGraph = tsDeserialize(MAP_NDJSON, 'ndjson', new Graph());
+
+  const both = (q: string, params?: Record<string, unknown>): [string, string] => [
+    JSON.stringify(tsQuery(tsGraph, q, params)),
+    JSON.stringify(nativeGraph.query(q, params)),
+  ];
+
+  test('read a whole stored map — canonical (sorted keys), byte-identical', () => {
+    const [ts, native] = both(`MATCH (n:P {id: 'a'}) RETURN n.meta AS m`);
+    expect(ts).toBe(native);
+    expect(ts).toBe(`[{"m":{"city":"NYC","zip":"10001"}}]`);
+  });
+
+  test('nested field access on a stored map', () => {
+    const [ts, native] = both(`MATCH (n:P {id: 'b'}) RETURN n.meta.city AS c, n.meta.zip AS z`);
+    expect(ts).toBe(native);
+    expect(ts).toBe(`[{"c":"LA","z":"90001"}]`);
+    // A missing nested field → null.
+    const [ts2, nat2] = both(`MATCH (n:P {id: 'b'}) RETURN n.meta.nope AS x`);
+    expect(ts2).toBe(nat2);
+    expect(ts2).toBe(`[{"x":null}]`);
+  });
+
+  test('WHERE on a nested map field filters rows identically', () => {
+    const [ts, native] = both(
+      `MATCH (n:P) WHERE n.meta.city = 'NYC' RETURN n.id AS id ORDER BY id`,
+    );
+    expect(ts).toBe(native);
+    expect(ts).toBe(`[{"id":"a"},{"id":"c"}]`);
+  });
+
+  test('construct a record from a stored map field, and compare', () => {
+    const [ts, native] = both(
+      `MATCH (n:P {id: 'a'}) RETURN {here: n.meta.city, eq: n.meta = {city: 'NYC', zip: '10001'}} AS r`,
+    );
+    expect(ts).toBe(native);
+    expect(ts).toBe(`[{"r":{"eq":true,"here":"NYC"}}]`);
+  });
+
+  test('SET a map property, then read it back — byte-identical write path', () => {
+    // Mutating both graphs in lockstep; assert the read matches.
+    const q = `MATCH (n:P {id: 'c'}) SET n.tag = {b: 2, a: 1} RETURN n.tag AS t`;
+    const [ts, native] = both(q);
+    expect(ts).toBe(native);
+    expect(ts).toBe(`[{"t":{"a":1,"b":2}}]`);
+  });
+});

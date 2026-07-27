@@ -1,5 +1,5 @@
 import type { Graph } from '@lenke/core';
-import { isTemporal, temporalFormat, temporalParse } from '@lenke/core';
+import { isTemporal, LenkeRecord, temporalFormat, temporalParse } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
 import type { Codec } from '../codec.js';
@@ -233,6 +233,16 @@ const parseCsv = (input: string): Cell[][] => {
 // ---------------------------------------------------------------------------
 
 const scalarOf = (value: Exclude<PropertyValue, readonly PropertyValue[]>): ScalarType => {
+  // A map/record has no faithful flat cell — reject loudly (mirrors the native
+  // codec), rather than mangle it. Use a structured format instead.
+  if (value instanceof LenkeRecord) {
+    throw new LenkeError(
+      'a map/record property cannot be serialized to csv (a flat format); ' +
+        'use ndjson, graphson, or pg-json',
+      { code: ErrorCode.Unsupported },
+    );
+  }
+
   if (typeof value === 'boolean') {
     return 'boolean';
   }
@@ -325,7 +335,17 @@ const scalarToRaw = (scalar: ScalarType, value: PropertyValue): string => {
     return temporalFormat(value);
   }
 
-  return String(value);
+  // A map has no flat cell — `scalarOf` already rejected the export, so this is
+  // unreachable, but the guard keeps the value a stringifiable scalar.
+  if (value instanceof LenkeRecord) {
+    throw new LenkeError('a map/record property cannot be serialized to csv', {
+      code: ErrorCode.Unsupported,
+    });
+  }
+
+  // A CSV scalar cell is only ever a string/number/null here (lists are written
+  // element-by-element, temporals/booleans/maps handled above).
+  return String(value as string | number | null);
 };
 
 /** Parse one raw scalar string back into a `PropertyValue` of the column type. */

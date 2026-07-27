@@ -5,10 +5,17 @@
  * single source of truth for "what a property value may be" — and where richer
  * JS values lose information — lives here, not in each format.
  */
-import { coerceTemporal, fromTaggedJson, type Temporal } from '@lenke/core';
+import { coerceTemporal, fromTaggedJson, LenkeRecord, type Temporal } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
-export type PropertyValue = string | boolean | number | null | Temporal | readonly PropertyValue[];
+export type PropertyValue =
+  | string
+  | boolean
+  | number
+  | null
+  | Temporal
+  | LenkeRecord
+  | readonly PropertyValue[];
 
 /** A property bag on a vertex or edge in the LPG model. */
 export type PropertyBag = Readonly<Record<string, PropertyValue>>;
@@ -138,6 +145,22 @@ const normalizeAt = (value: unknown, depth: number): PropertyValue => {
         'or pass an ISO string / a TC39 `Temporal.PlainDateTime`.',
       { code: ErrorCode.InvalidValue },
     );
+  }
+
+  // A record/map value: an existing `LenkeRecord` re-normalizes its fields; a
+  // bare plain object becomes a canonical record (sorted keys, dup last-wins).
+  if (depth >= MAX_NESTING) {
+    throw new LenkeError('Property value nesting exceeds the maximum depth', {
+      code: ErrorCode.InvalidShape,
+    });
+  }
+
+  if (value instanceof LenkeRecord) {
+    return LenkeRecord.from([...value].map(([k, v]) => [k, normalizeAt(v, depth + 1)]));
+  }
+
+  if (Object.getPrototypeOf(value) === Object.prototype) {
+    return LenkeRecord.from(Object.entries(value).map(([k, v]) => [k, normalizeAt(v, depth + 1)]));
   }
 
   throw new LenkeError(

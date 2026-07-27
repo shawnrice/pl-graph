@@ -11,6 +11,7 @@ import {
   LocalTime,
   LocalDateTime,
   Path,
+  LenkeRecord,
   runAlgorithmSync,
   type Temporal,
   temporalArith,
@@ -299,19 +300,6 @@ const dataException = (message: string): never => {
   throw new LenkeError(message, { code: ErrorCode.DataException });
 };
 
-/**
- * A GQL record/map value: a `Map` with keys kept sorted (canonical) and JSON
- * serialization as an object. A `Map` subclass so it is distinct from a graph
- * element (a plain object with an `id`) and from a plain object, while
- * `JSON.stringify` still emits a sorted `{…}` (via `toJSON`) — byte-identical to
- * the native `Value::Map`.
- */
-export class LenkeRecord extends Map<string, unknown> {
-  toJSON(): Record<string, unknown> {
-    return Object.fromEntries(this);
-  }
-}
-
 /** Lexicographic compare of two field-name strings (matches the native key sort). */
 const cmpKey = (a: string, b: string): number => {
   if (a < b) {
@@ -321,14 +309,11 @@ const cmpKey = (a: string, b: string): number => {
   return a > b ? 1 : 0;
 };
 
-/** Build a canonical record from field pairs: duplicate keys collapse last-wins,
- *  then keys are sorted (matching the native canonical form). */
-const makeRecord = (fields: readonly (readonly [string, unknown])[]): LenkeRecord => {
-  const dedup = new Map<string, unknown>(fields); // later entry wins
-  const sorted = [...dedup].sort(([a], [b]) => cmpKey(a, b));
-
-  return new LenkeRecord(sorted);
-};
+/** Build a canonical record from field pairs (dup last-wins, keys sorted). The
+ *  record value (`LenkeRecord`) lives in `@lenke/core`, shared with the
+ *  serialization codecs and the Gremlin engine. */
+const makeRecord = (fields: readonly (readonly [string, unknown])[]): LenkeRecord =>
+  LenkeRecord.from(fields);
 
 /** Read field `key` from a record/map, or `null` if absent (three-valued). */
 const recordGet = (rec: LenkeRecord, key: string): unknown => (rec.has(key) ? rec.get(key) : null);

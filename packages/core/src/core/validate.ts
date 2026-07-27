@@ -1,6 +1,7 @@
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
 import { fromTaggedJson } from '../temporal.js';
+import { LenkeRecord } from './LenkeRecord.js';
 
 /**
  * A well-formed **label** (node label / edge type): non-empty and free of the
@@ -61,6 +62,23 @@ export const validatePropertyValue = (value: unknown): void => {
       validatePropertyValue(element);
     }
   }
+
+  // A record/map is a valid property value; recurse its fields (a bigint inside
+  // a map is still rejected). Both a `LenkeRecord` and a raw plain object (which
+  // the write path canonicalizes into one) are checked.
+  if (value instanceof LenkeRecord) {
+    for (const v of value.values()) {
+      validatePropertyValue(v);
+    }
+  } else if (
+    value !== null &&
+    typeof value === 'object' &&
+    Object.getPrototypeOf(value) === Object.prototype
+  ) {
+    for (const v of Object.values(value)) {
+      validatePropertyValue(v);
+    }
+  }
 };
 
 /** Validate every label, property key, and property value about to enter the graph. */
@@ -111,6 +129,22 @@ export const normalizePropertyValue = (value: unknown): unknown => {
     });
 
     return changed ? out : value;
+  }
+
+  // An existing record re-normalizes its values (they may be tagged temporals
+  // from a decoded document); a plain object becomes a canonical record. A class
+  // instance (Temporal, Vertex/Edge/Path) is NOT a plain object, so it passes
+  // through — only a bare `{…}` (or a record) is a map value.
+  if (value instanceof LenkeRecord) {
+    return LenkeRecord.from([...value].map(([k, v]) => [k, normalizePropertyValue(v)]));
+  }
+
+  if (
+    value !== null &&
+    typeof value === 'object' &&
+    Object.getPrototypeOf(value) === Object.prototype
+  ) {
+    return LenkeRecord.from(Object.entries(value).map(([k, v]) => [k, normalizePropertyValue(v)]));
   }
 
   return value;
