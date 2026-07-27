@@ -69,7 +69,9 @@ export type ScalarTypeName =
  *  so records nest). Mirrors the native `TypeSpec`. */
 export type TypeSpec =
   | { kind: 'scalar'; type: ScalarTypeName }
-  | { kind: 'record'; fields: ReadonlyArray<readonly [string, TypeSpec]> };
+  // Each record field is `[name, type, notNull]`. A field is nullable/optional by
+  // default (absent OR null both satisfy it); `NOT NULL` makes it required.
+  | { kind: 'record'; fields: ReadonlyArray<readonly [string, TypeSpec, boolean]> };
 
 const SCALARS = new Set<ScalarTypeName>([
   'string',
@@ -122,6 +124,18 @@ export const parseTypeSpec = (input: string): TypeSpec | null => {
 
     return false;
   };
+  const eatKw = (word: string): boolean => {
+    const save = i;
+    const w = ident();
+
+    if (w?.toLowerCase() === word) {
+      return true;
+    }
+
+    i = save;
+
+    return false;
+  };
   const parseType = (): TypeSpec | null => {
     const word = ident();
 
@@ -134,7 +148,7 @@ export const parseTypeSpec = (input: string): TypeSpec | null => {
         return null;
       }
 
-      const fields: Array<[string, TypeSpec]> = [];
+      const fields: Array<[string, TypeSpec, boolean]> = [];
       ws();
 
       if (!eat('}')) {
@@ -152,13 +166,24 @@ export const parseTypeSpec = (input: string): TypeSpec | null => {
             return null;
           }
 
+          // ISO `NOT NULL` → a required (present, non-null) field.
+          let notNull = false;
+
+          if (eatKw('not')) {
+            if (!eatKw('null')) {
+              return null;
+            }
+
+            notNull = true;
+          }
+
           // Duplicate field → last wins; keep canonical sorted order.
           const at = fields.findIndex(([k]) => k === name);
 
           if (at >= 0) {
-            fields[at] = [name, ty];
+            fields[at] = [name, ty, notNull];
           } else {
-            fields.push([name, ty]);
+            fields.push([name, ty, notNull]);
           }
 
           if (eat(',')) {
@@ -194,7 +219,9 @@ export const parseTypeSpec = (input: string): TypeSpec | null => {
 export const typeSpecName = (spec: TypeSpec): string =>
   spec.kind === 'scalar'
     ? spec.type
-    : `record{${spec.fields.map(([k, t]) => `${k}::${typeSpecName(t)}`).join(',')}}`;
+    : `record{${spec.fields
+        .map(([k, t, notNull]) => `${k}::${typeSpecName(t)}${notNull ? ' NOT NULL' : ''}`)
+        .join(',')}}`;
 
 /** Does a value satisfy a `TypeSpec`? A null is exempt (REQUIRED is separate); a
  *  scalar constraint exempts a non-scalar (a map — the record path governs those);
@@ -227,15 +254,31 @@ export const valueMatches = (
     return false;
   }
 
-  const entries = raw.sort((x, y) => cmpField(x[0], y[0]));
+  const present = new Map(raw);
+  const declared = new Set(spec.fields.map(([k]) => k));
 
-  return (
-    entries.length === spec.fields.length &&
-    entries.every(
-      ([k, val], idx) =>
-        k === spec.fields[idx][0] && valueMatches(val, spec.fields[idx][1], scalarTypeOf),
-    )
-  );
+  // Closed record: any value key that isn't a declared field is a violation.
+  for (const k of present.keys()) {
+    if (!declared.has(k)) {
+      return false;
+    }
+  }
+
+  // Each field is nullable/optional by default — absent OR null both satisfy it.
+  // `NOT NULL` makes the field required (must be present AND non-null).
+  return spec.fields.every(([k, ft, notNull]) => {
+    if (!present.has(k)) {
+      return !notNull;
+    }
+
+    const fv = present.get(k);
+
+    if (fv === null || fv === undefined) {
+      return !notNull;
+    }
+
+    return valueMatches(fv, ft, scalarTypeOf);
+  });
 };
 
 /**

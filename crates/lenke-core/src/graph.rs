@@ -774,9 +774,13 @@ impl PropType {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TypeSpec {
     Scalar(PropType),
-    /// A closed record: sorted `(field, type)` pairs. Canonical key order so two
+    /// A closed record: sorted fields. Each is `(name, type, not_null)`. A field
+    /// is nullable/optional by default (absent OR a null value both satisfy it) —
+    /// ISO makes `NOT NULL` the explicit marker, so it is the *required* flag: a
+    /// `not_null` field must be present with a non-null value. Closed on extras: a
+    /// value may not carry a field outside the declared set. Sorted names →
     /// structurally-equal record types compare equal.
-    Record(Vec<(Arc<str>, Self)>),
+    Record(Vec<(Arc<str>, Self, bool)>),
 }
 
 impl TypeSpec {
@@ -801,7 +805,10 @@ impl TypeSpec {
             Self::Record(fields) => {
                 let inner: Vec<String> = fields
                     .iter()
-                    .map(|(k, t)| format!("{k}::{}", t.to_name()))
+                    .map(|(k, t, not_null)| {
+                        let nn = if *not_null { " NOT NULL" } else { "" };
+                        format!("{k}::{}{nn}", t.to_name())
+                    })
                     .collect();
                 format!("record{{{}}}", inner.join(","))
             }
@@ -841,6 +848,17 @@ impl TypeParser<'_> {
             false
         }
     }
+    /// Consume the identifier `word` (case-insensitive) if it's next; otherwise
+    /// leave the cursor untouched.
+    fn eat_kw(&mut self, word: &str) -> bool {
+        let save = self.i;
+        if self.ident().is_some_and(|w| w.eq_ignore_ascii_case(word)) {
+            true
+        } else {
+            self.i = save;
+            false
+        }
+    }
     fn parse_type(&mut self) -> Option<TypeSpec> {
         let word = self.ident()?;
         if word.eq_ignore_ascii_case("record") {
@@ -854,7 +872,7 @@ impl TypeParser<'_> {
         if !self.eat(b'{') {
             return None;
         }
-        let mut fields: Vec<(Arc<str>, TypeSpec)> = Vec::new();
+        let mut fields: Vec<(Arc<str>, TypeSpec, bool)> = Vec::new();
         self.skip_ws();
         if !self.eat(b'}') {
             loop {
@@ -865,10 +883,20 @@ impl TypeParser<'_> {
                 }
                 self.eat(b':'); // optional second colon
                 let ty = self.parse_type()?;
+                // ISO `NOT NULL` after the field type → a required (present,
+                // non-null) field; absent it, the field is nullable/optional.
+                let not_null = if self.eat_kw("not") {
+                    if !self.eat_kw("null") {
+                        return None;
+                    }
+                    true
+                } else {
+                    false
+                };
                 let key: Arc<str> = name.into();
-                match fields.binary_search_by(|(k, _)| k.as_ref().cmp(key.as_ref())) {
-                    Ok(i) => fields[i].1 = ty, // duplicate field → last wins
-                    Err(i) => fields.insert(i, (key, ty)),
+                match fields.binary_search_by(|(k, _, _)| k.as_ref().cmp(key.as_ref())) {
+                    Ok(i) => fields[i] = (key, ty, not_null), // duplicate → last wins
+                    Err(i) => fields.insert(i, (key, ty, not_null)),
                 }
                 if self.eat(b',') {
                     continue;
@@ -883,11 +911,12 @@ impl TypeParser<'_> {
     }
 }
 
-/// Does a stored value satisfy a declared [`TypeSpec`]? A `Null` satisfies any
-/// type (nullability is the separate REQUIRED constraint — matching the scalar
-/// path). A record must be a map with EXACTLY the declared fields, each field's
-/// value recursively matching. Keys are canonical on both sides, so field
-/// alignment is positional.
+/// Does a stored value satisfy a declared [`TypeSpec`]? A top-level `Null` is
+/// exempt (nullability of the property itself is the separate REQUIRED
+/// constraint). A record is CLOSED on extras (no field outside the declared set)
+/// and each field is optional by default — absent OR a null value both satisfy a
+/// nullable field; a `NOT NULL` field must be present with a non-null value that
+/// matches its type. Keys are canonical (sorted) on both sides.
 fn value_matches(v: &Value, spec: &TypeSpec) -> bool {
     if matches!(v, Value::Null) {
         return true;
@@ -899,11 +928,29 @@ fn value_matches(v: &Value, spec: &TypeSpec) -> bool {
         TypeSpec::Scalar(ty) => value_type(v).is_none_or(|got| got == *ty),
         TypeSpec::Record(fields) => {
             let Value::Map(pairs) = v else { return false };
-            pairs.len() == fields.len()
-                && pairs
-                    .iter()
-                    .zip(fields.iter())
-                    .all(|((vk, vv), (fk, ft))| vk == fk && value_matches(vv, ft))
+            // No extra fields: every present key must be a declared field.
+            if pairs.iter().any(|(vk, _)| {
+                fields
+                    .binary_search_by(|(fk, _, _)| fk.as_ref().cmp(vk))
+                    .is_err()
+            }) {
+                return false;
+            }
+            // Each declared field: present → match its type (null only if the
+            // field is nullable); absent → OK unless the field is `NOT NULL`.
+            fields.iter().all(|(fk, ft, not_null)| {
+                match pairs.binary_search_by(|(vk, _)| vk.as_ref().cmp(fk)) {
+                    Ok(i) => {
+                        let fv = &pairs[i].1;
+                        if matches!(fv, Value::Null) {
+                            !not_null // a null is OK only for a nullable field
+                        } else {
+                            value_matches(fv, ft)
+                        }
+                    }
+                    Err(_) => !not_null, // absent is OK only for a nullable field
+                }
+            })
         }
     }
 }
@@ -5593,8 +5640,8 @@ mod clone_graph {
 mod record_type_spec {
     use super::*;
 
-    fn sc(k: &str, t: PropType) -> (Arc<str>, TypeSpec) {
-        (k.into(), TypeSpec::Scalar(t))
+    fn sc(k: &str, t: PropType) -> (Arc<str>, TypeSpec, bool) {
+        (k.into(), TypeSpec::Scalar(t), false)
     }
     fn s(x: &str) -> Value {
         Value::Str(x.into())
@@ -5632,9 +5679,21 @@ mod record_type_spec {
             Some(TypeSpec::Record(vec![(
                 "addr".into(),
                 TypeSpec::Record(vec![sc("city", PropType::Str)]),
+                false,
             )])),
         );
-        // Round-trips through to_name.
+        // A `NOT NULL` field parses to the required flag and round-trips.
+        let nn = TypeSpec::parse("record{id::string NOT NULL,tier::number}").unwrap();
+        assert_eq!(
+            nn,
+            TypeSpec::Record(vec![
+                ("id".into(), TypeSpec::Scalar(PropType::Str), true),
+                sc("tier", PropType::Num),
+            ]),
+        );
+        assert_eq!(TypeSpec::parse(&nn.to_name()), Some(nn));
+        assert_eq!(TypeSpec::parse("record{id::string NOT}"), None); // NOT without NULL
+                                                                     // Round-trips through to_name.
         let t = TypeSpec::parse("record{city::string,tier::number}").unwrap();
         assert_eq!(TypeSpec::parse(&t.to_name()), Some(t));
         // Malformed.
@@ -5663,8 +5722,10 @@ mod record_type_spec {
             &vmap(&[("city", Value::Num(1.0)), ("tier", Value::Num(2.0))]),
             &ty
         ));
-        // Missing field / extra field → no match (closed record).
-        assert!(!value_matches(&vmap(&[("city", s("NYC"))]), &ty));
+        // A missing NULLABLE field is OK (optional by default); the empty record
+        // is OK too. An EXTRA field is rejected (closed on extras).
+        assert!(value_matches(&vmap(&[("city", s("NYC"))]), &ty));
+        assert!(value_matches(&vmap(&[]), &ty));
         assert!(!value_matches(
             &vmap(&[
                 ("city", s("NYC")),
@@ -5675,6 +5736,16 @@ mod record_type_spec {
         ));
         // A non-map value → no match.
         assert!(!value_matches(&Value::Num(1.0), &ty));
+
+        // `NOT NULL` makes a field required (present + non-null).
+        let req = TypeSpec::parse("record{id::string NOT NULL,tier::number}").unwrap();
+        assert!(value_matches(&vmap(&[("id", s("x"))]), &req)); // tier optional
+        assert!(!value_matches(&vmap(&[("tier", Value::Num(1.0))]), &req)); // id absent
+        assert!(!value_matches(&vmap(&[("id", Value::Null)]), &req)); // id null
+        assert!(value_matches(
+            &vmap(&[("id", s("x")), ("tier", Value::Null)]),
+            &req
+        )); // tier nullable null OK
     }
 }
 
@@ -5731,8 +5802,18 @@ mod record_constraint {
             "meta",
             &vmap(&[("city", Value::Num(1.0)), ("tier", Value::Num(3.0))])
         ));
-        // A missing / extra field conflicts (closed record).
-        assert!(g.type_conflict_on_set(0, "meta", &vmap(&[("city", s("LA"))])));
+        // A missing NULLABLE field does NOT conflict (optional by default); an
+        // EXTRA field does (closed on extras).
+        assert!(!g.type_conflict_on_set(0, "meta", &vmap(&[("city", s("LA"))])));
+        assert!(g.type_conflict_on_set(
+            0,
+            "meta",
+            &vmap(&[
+                ("city", s("LA")),
+                ("tier", Value::Num(1.0)),
+                ("x", Value::Num(9.0))
+            ])
+        ));
         // A null is exempt.
         assert!(!g.type_conflict_on_set(0, "meta", &Value::Null));
         // A new-vertex insert with a bad meta is a type_violation.
