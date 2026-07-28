@@ -4124,102 +4124,93 @@ const bindGroupVars = (
   return next;
 };
 
-/** One traversal of a repetition UNIT from a frontier vertex: the `k` edges and `k`
- *  target vertices in hop order; the unit's end is `verts[verts.length - 1]`. */
-type UnitMatch = { end: Vertex; verts: Vertex[]; edges: Edge[] };
-
-/** Enumerate every way to traverse `unit`'s `k` hops from `from`, honouring each
- *  hop's inline props filter, intra-unit edge distinctness (no edge twice in one
- *  unit), and the per-unit `where` (checked once every inner variable is bound).
- *  Inner variables are bound only transiently, for the `where`; the caller re-binds
- *  them as group lists at each trail end. A one-hop unit is exactly the single-edge
- *  expansion. Mirrors native `expand_unit`. */
-// A `k`-hop unit fans out up to `d^k` traversals from ONE vertex, so on a dense graph
-// a single expansion (especially a multi-element unit) could materialize enough to OOM
-// the host. `budget.steps` — shared with the outer walk's `TRAIL_BUDGET` — is charged
-// per edge visited and, when blown, throws `E_RESOURCE_EXHAUSTED` mid-recursion rather
-// than allocating unbounded (the "stream or fault, never OOM" invariant). The
-// single-edge fast-path can't hit this: it fans out only `d` per vertex, lazily.
-// Mirrors native `expand_unit`.
-const expandUnit = (
-  graph: Graph,
-  from: Vertex,
+/** Evaluate a unit's per-repetition `WHERE` at a completion: bind its source `x` (the
+ *  boundary frame's vertex) and each hop's edge/target — from the unit's `k` frames
+ *  (`frames[base..]`) plus the completing `edge`/`nbr` — as SCALARS, then test the
+ *  predicate. `true` when there is no `WHERE`. Mirrors native `reachable_each_unit`. */
+const unitWherePasses = (
   unit: CUnit,
-  binding: Binding,
-  params: Params,
-  budget: { steps: number },
-): UnitMatch[] => {
-  const out: UnitMatch[] = [];
-  const edges: Edge[] = [];
-  const verts: Vertex[] = [];
+  frames: readonly { vertex: Vertex; entryEdge: Edge | null }[],
+  base: number,
+  edge: Edge,
+  nbr: Vertex,
+  env: EvalEnv,
+): boolean => {
+  if (unit.where === undefined) {
+    return true;
+  }
 
-  const walk = (hopI: number, cur: Vertex, bnd: Binding): void => {
-    if (hopI === unit.hops.length) {
-      // The whole unit is matched — every inner variable is bound, so the per-unit
-      // predicate can reference any of them.
-      if (unit.where === undefined || unit.where({ binding: bnd, params, graph }) === true) {
-        out.push({ end: cur, verts: [...verts], edges: [...edges] });
-      }
+  const k = unit.hops.length;
+  let wb = withBinding(env.binding, unit.startVar, frames[base].vertex);
 
-      return;
-    }
+  for (let j = 0; j < k; j += 1) {
+    const e = j + 1 < k ? frames[base + j + 1].entryEdge! : edge;
+    const t = j + 1 < k ? frames[base + j + 1].vertex : nbr;
+    wb = withBinding(withBinding(wb, unit.hops[j].rel.variable, e), unit.hops[j].targetVar, t);
+  }
 
-    const hop = unit.hops[hopI];
+  return unit.where({ ...env, binding: wb }) === true;
+};
 
-    for (const { edge, node: nbr } of expand(graph, cur, hop.rel)) {
-      budget.steps += 1;
+/** The mark a hop claims under `mode`: its edge (TRAIL) / its target vertex (SIMPLE,
+ *  ACYCLIC), or nothing (WALK, or a SIMPLE close back on the seed). */
+const hopMark = (
+  mode: PathMode,
+  isClose: boolean,
+  edge: Edge,
+  nbr: Vertex,
+): Edge | Vertex | null => {
+  if (isClose || mode === 'walk') {
+    return null;
+  }
 
-      if (budget.steps > TRAIL_BUDGET) {
-        throw new LenkeError(
-          'Variable-length pattern exceeded the trail budget; add a tighter bound',
-          { code: ErrorCode.ResourceExhausted },
-        );
-      }
+  return mode === 'trail' ? edge : nbr;
+};
 
-      if (edges.includes(edge)) {
-        continue; // no edge twice within one unit
-      }
+/** Whether this hop repeats an already-marked element under `mode` (edge for TRAIL,
+ *  target vertex for SIMPLE/ACYCLIC) — the per-hop restrictor. */
+const hopCollides = (
+  mode: PathMode,
+  marks: ReadonlySet<Edge | Vertex>,
+  edge: Edge,
+  nbr: Vertex,
+): boolean => {
+  if (mode === 'trail') {
+    return marks.has(edge);
+  }
 
-      const eBnd = withBinding(bnd, hop.rel.variable, edge);
+  if (mode === 'simple' || mode === 'acyclic') {
+    return marks.has(nbr);
+  }
 
-      if (!satisfies(edge, hop.rel.pred, eBnd, params, graph)) {
-        continue;
-      }
-
-      const tBnd = withBinding(eBnd, hop.targetVar, nbr);
-      edges.push(edge);
-      verts.push(nbr);
-      walk(hopI + 1, nbr, tBnd);
-      edges.pop();
-      verts.pop();
-    }
-  };
-
-  walk(0, from, withBinding(binding, unit.startVar, from));
-
-  return out;
+  return false;
 };
 
 /**
- * The GENERAL repetition matcher: repeat `unit` (a `k`-hop sub-path) from `from`,
- * yielding each trail end in [min, max] REPETITIONS (with the whole walk's
- * verts/edges, so the caller can expose group variables). TRAIL/SIMPLE/ACYCLIC/WALK
- * restrictors apply across the ENTIRE walk (a mark covers a whole unit's
- * edges/targets). A one-hop unit (`k = 1`) reproduces `trailEnds` exactly; that
- * single-edge twin is kept only as a fast-path for the hot abbreviated form.
- * Mirrors native `reachable_each_unit`.
+ * The single, LAZY repetition matcher: repeat `unit` (a `k`-hop sub-path) from
+ * `from`, yielding each trail end in [min, max] REPETITIONS. The stack holds one frame
+ * per hop of the CURRENT path only — never the `d^k` traversals from a vertex — so
+ * memory is O(path length). Each frame records which hop within the unit it expands
+ * (`pos`) and how many whole repetitions precede it (`reps`); the per-unit `WHERE`, the
+ * emit, and the repetition count happen every `k`-th hop. Marks are applied PER HOP, so
+ * ACYCLIC/SIMPLE also forbid a unit repeating a vertex internally (the correct reading).
+ * A one-hop unit reduces to the single-edge walk. The consumer owns any group-variable
+ * exposure — this matcher only reconstructs the walk under `wantPath`. Mirrors native
+ * `reachable_each_unit`. A generator suspends on consumer-stop, so the mark set needs no
+ * explicit stop cleanup.
  */
 const trailEndsUnit = function* (
   graph: Graph,
   from: Vertex,
   unit: CUnit,
   q: NonNullable<CRel['quantifier']>,
-  opts: { mode: PathMode; binding: Binding; params: Params },
+  opts: { mode: PathMode; binding: Binding; params: Params; wantPath?: boolean },
 ): Iterable<TrailEnd> {
-  const { mode, binding, params } = opts;
+  const { mode, binding, params, wantPath = false } = opts;
+  const k = unit.hops.length;
 
   if (q.min === 0) {
-    yield { end: from, verts: [from], edges: [] };
+    yield { end: from, verts: wantPath ? [from] : [], edges: [] };
   }
 
   const vertexMode = mode === 'simple' || mode === 'acyclic';
@@ -4229,124 +4220,140 @@ const trailEndsUnit = function* (
     marks.add(from);
   }
 
-  // One budget shared with `expandUnit`, so a dense fan-out inside a single expansion
-  // is charged the same as the outer unit-steps (never OOM; fault at the ceiling).
-  const budget = { steps: 0 };
+  let steps = 0;
 
   type Frame = {
-    units: UnitMatch[];
-    idx: number;
-    depth: number;
-    // Marks this frame set (a whole unit's edges or target nodes), cleared on backtrack.
-    entryMarks: (Edge | Vertex)[];
-    // The unit that led to this frame's vertex (for path reconstruction).
-    entryUnit: UnitMatch | null;
+    iter: Iterator<{ edge: Edge; node: Vertex }>;
+    // The hop within the current unit this frame expands (`0..k`).
+    pos: number;
+    // Whole repetitions completed before this frame's unit boundary.
+    reps: number;
+    vertex: Vertex;
+    entryEdge: Edge | null;
+    // The mark this frame's entry set (edge for TRAIL, target vertex otherwise).
+    entryMark: Edge | Vertex | null;
   };
 
   const stack: Frame[] = [
     {
-      units: expandUnit(graph, from, unit, binding, params, budget),
-      idx: 0,
-      depth: 0,
-      entryMarks: [],
-      entryUnit: null,
+      iter: expand(graph, from, unit.hops[0].rel)[Symbol.iterator](),
+      pos: 0,
+      reps: 0,
+      vertex: from,
+      entryEdge: null,
+      entryMark: null,
     },
   ];
-
-  // Reconstruct the full walk (seed + every unit's targets/edges) from the live stack.
-  const reconstruct = (last: UnitMatch): { verts: Vertex[]; edges: Edge[] } => {
-    const verts: Vertex[] = [from];
-    const edges: Edge[] = [];
-
-    for (let i = 1; i < stack.length; i += 1) {
-      const u = stack[i].entryUnit;
-
-      if (u) {
-        verts.push(...u.verts);
-        edges.push(...u.edges);
-      }
-    }
-
-    verts.push(...last.verts);
-    edges.push(...last.edges);
-
-    return { verts, edges };
-  };
 
   while (stack.length > 0) {
     const top = stack[stack.length - 1];
 
-    if ((q.max !== null && top.depth >= q.max) || top.idx >= top.units.length) {
-      for (const mk of top.entryMarks) {
-        marks.delete(mk);
+    // Max gate applies only at a unit boundary (a partial unit must always finish).
+    if (top.pos === 0 && q.max !== null && top.reps >= q.max) {
+      if (top.entryMark !== null) {
+        marks.delete(top.entryMark);
       }
 
       stack.pop();
       continue;
     }
 
-    const m = top.units[top.idx];
-    const { depth } = top;
-    top.idx += 1;
+    const res = top.iter.next();
 
-    // Restrictor: which marks this unit claims (all its edges for TRAIL, all its
-    // targets for SIMPLE/ACYCLIC), and whether it is a non-extending SIMPLE close.
-    const end = m.verts[m.verts.length - 1]; // a unit has ≥ 1 hop
-    let newMarks: (Edge | Vertex)[] = [];
-    let isClose = false;
-
-    if (mode === 'trail') {
-      if (m.edges.some((e) => marks.has(e))) {
-        continue;
+    if (res.done) {
+      if (top.entryMark !== null) {
+        marks.delete(top.entryMark);
       }
 
-      newMarks = [...m.edges];
-    } else if (mode === 'acyclic') {
-      if (m.verts.some((v) => marks.has(v))) {
-        continue;
-      }
+      stack.pop();
+      continue;
+    }
 
-      newMarks = [...m.verts];
-    } else if (mode === 'simple') {
-      if (end === from) {
-        isClose = true; // close the cycle on the seed
-      } else if (m.verts.some((v) => marks.has(v))) {
+    const { edge, node: nbr } = res.value;
+    const { pos, reps } = top;
+    const hop = unit.hops[pos];
+
+    // Per-hop predicate (inline props / WHERE on this hop's edge).
+    if (hop.rel.pred.props.length > 0 || hop.rel.pred.where !== undefined) {
+      const eBnd = withBinding(binding, hop.rel.variable, edge);
+
+      if (!satisfies(edge, hop.rel.pred, eBnd, params, graph)) {
         continue;
-      } else {
-        newMarks = [...m.verts];
       }
     }
-    // mode === 'walk': no marks.
 
-    budget.steps += 1;
+    const completing = pos + 1 === k;
+    const isClose = mode === 'simple' && completing && nbr === from;
 
-    if (budget.steps > TRAIL_BUDGET) {
+    // Per-hop restrictor (also enforces intra-unit distinctness).
+    if (!isClose && hopCollides(mode, marks, edge, nbr)) {
+      continue;
+    }
+
+    // Per-unit WHERE at a completion (every inner variable of THIS unit bound as a scalar).
+    if (
+      completing &&
+      !unitWherePasses(unit, stack, stack.length - k, edge, nbr, { binding, params, graph })
+    ) {
+      continue;
+    }
+
+    steps += 1;
+
+    if (steps > TRAIL_BUDGET) {
       throw new LenkeError(
         'Variable-length pattern exceeded the trail budget; add a tighter bound',
         { code: ErrorCode.ResourceExhausted },
       );
     }
 
-    for (const mk of newMarks) {
-      marks.add(mk);
+    // Claim this hop's mark (nothing for WALK / a SIMPLE close).
+    const mark = hopMark(mode, isClose, edge, nbr);
+
+    if (mark !== null) {
+      marks.add(mark);
     }
 
-    const d = depth + 1;
+    const repsAfter = completing ? reps + 1 : reps;
 
-    if (d >= q.min) {
-      const { verts, edges } = reconstruct(m);
+    if (completing && repsAfter >= q.min) {
+      if (wantPath) {
+        const verts = stack.map((f) => f.vertex);
+        verts.push(nbr);
 
-      yield { end, verts, edges };
+        const edges = stack.map((f) => f.entryEdge).filter((e): e is Edge => e !== null);
+        edges.push(edge);
+
+        yield { end: nbr, verts, edges };
+      } else {
+        yield { end: nbr, verts: [], edges: [] };
+      }
     }
 
-    if (!isClose) {
+    // Descend: a mid-unit hop always continues the unit; a completion opens the next
+    // repetition (unless it is a SIMPLE close, or `max` is reached).
+    let next: { pos: number; reps: number } | null;
+
+    if (completing) {
+      const canExtend = !isClose && (q.max === null || repsAfter < q.max);
+      next = canExtend ? { pos: 0, reps: repsAfter } : null;
+    } else {
+      next = { pos: pos + 1, reps };
+    }
+
+    if (next !== null) {
       stack.push({
-        units: expandUnit(graph, end, unit, binding, params, budget),
-        idx: 0,
-        depth: d,
-        entryMarks: newMarks,
-        entryUnit: m,
+        iter: expand(graph, nbr, unit.hops[next.pos].rel)[Symbol.iterator](),
+        pos: next.pos,
+        reps: next.reps,
+        vertex: nbr,
+        entryEdge: edge,
+        entryMark: mark,
       });
+    } else if (mark !== null) {
+      // No descent from here (a close, or the repetition ceiling): this hop's mark has
+      // no deeper use.
+      marks.delete(mark);
     }
   }
 };
@@ -4375,7 +4382,7 @@ const walkSegments = function* (
   if (rel.quantifier) {
     const mode = pattern.mode ?? 'trail';
     const ends = unit
-      ? trailEndsUnit(graph, from, unit, rel.quantifier, { mode, binding, params })
+      ? trailEndsUnit(graph, from, unit, rel.quantifier, { mode, binding, params, wantPath: true })
       : trailEnds(graph, from, rel, rel.quantifier, { mode, binding, params, wantPath: false });
 
     for (const { end, verts, edges } of ends) {
@@ -4445,158 +4452,19 @@ const trailEnds = function* (
   q: NonNullable<CRel['quantifier']>,
   opts: TrailOpts,
 ): Iterable<TrailEnd> {
-  const { mode, binding, params, wantPath = false } = opts;
+  // A single edge is a one-hop repetition unit — the abbreviated `-[]->{n,m}` form is
+  // just the general lazy matcher with a `k = 1` unit, so there is ONE traversal
+  // implementation and no hand-tuned twin to drift. The unit exposes no group
+  // variables (its edge var is a per-hop predicate scalar, not a list); `wantPath` here
+  // only rebuilds the path for a path-variable caller. Mirrors native `reachable_each`.
+  const unit: CUnit = { hops: [{ rel }] };
 
-  // A per-hop predicate (inline props / WHERE) filters every edge of the walk;
-  // the optional edge variable names each hop's edge for it.
-  const hasPred = rel.pred.props.length > 0 || rel.pred.where !== undefined;
-
-  if (q.min === 0) {
-    yield { end: from, verts: wantPath ? [from] : [], edges: [] };
-  }
-
-  // The repeated-element marks on the CURRENT path. TRAIL (default) marks EDGES;
-  // SIMPLE/ACYCLIC mark NODES (seed pre-marked); WALK marks nothing (bounded only
-  // by the quantifier / trail budget). Mirrors native `reachable_each`.
-  const vertexMode = mode === 'simple' || mode === 'acyclic';
-  const marks = new Set<Edge | Vertex>();
-
-  if (vertexMode) {
-    marks.add(from);
-  }
-
-  let steps = 0;
-
-  // Explicit DFS stack — a trail can be as long as the edge count, so recursion
-  // would overflow on a long chain. Each frame walks one vertex's outgoing
-  // steps; `entry` is the mark taken to reach it, unmarked when the frame pops.
-  // A generator suspends on consumer-stop, so no explicit stop cleanup is needed.
-  const stack: {
-    iter: Iterator<{ edge: Edge; node: Vertex }>;
-    entry: Edge | Vertex | null;
-    depth: number;
-    // For path reconstruction (wantPath): the vertex this frame explores from,
-    // and the edge taken to reach it (`null` at the seed).
-    vertex: Vertex;
-    entryEdge: Edge | null;
-  }[] = [
-    {
-      iter: expand(graph, from, rel)[Symbol.iterator](),
-      entry: null,
-      depth: 0,
-      vertex: from,
-      entryEdge: null,
-    },
-  ];
-
-  while (stack.length > 0) {
-    const top = stack[stack.length - 1];
-
-    // Past the max hop → this trail can't extend; backtrack.
-    if (q.max !== null && top.depth >= q.max) {
-      if (top.entry) {
-        marks.delete(top.entry);
-      }
-
-      stack.pop();
-      continue;
-    }
-
-    // Each visit advances this frame's iterator by one step (the recursion-free
-    // equivalent of the for-loop); when exhausted, backtrack.
-    const res = top.iter.next();
-
-    if (res.done) {
-      if (top.entry) {
-        marks.delete(top.entry);
-      }
-
-      stack.pop();
-      continue;
-    }
-
-    const { edge, node } = res.value;
-
-    // Per-hop predicate: skip edges that fail it before any mark/step accounting
-    // (a failing edge never enters the trail — mirrors native `expand_filtered`).
-    if (hasPred) {
-      const hopBinding = withBinding(binding, rel.variable, edge);
-
-      if (!satisfies(edge, rel.pred, hopBinding, params, graph)) {
-        continue;
-      }
-    }
-
-    // Whether this step is allowed, what it marks, and whether it's a
-    // non-extending SIMPLE close back on the seed.
-    let markTarget: Edge | Vertex | null = null;
-    let isClose = false;
-
-    if (mode === 'trail') {
-      if (marks.has(edge)) {
-        continue; // each relationship at most once
-      }
-
-      markTarget = edge;
-    } else if (mode === 'acyclic') {
-      if (marks.has(node)) {
-        continue; // no repeated node (not even the seed)
-      }
-
-      markTarget = node;
-    } else if (mode === 'simple') {
-      if (node === from) {
-        isClose = true; // close the cycle on the seed: emit, don't extend
-      } else if (marks.has(node)) {
-        continue; // no repeated node except that close
-      } else {
-        markTarget = node;
-      }
-    }
-    // mode === 'walk': no marks, always allowed.
-
-    steps += 1;
-
-    if (steps > TRAIL_BUDGET) {
-      throw new LenkeError(
-        'Variable-length pattern exceeded the trail budget; add a tighter bound',
-        { code: ErrorCode.ResourceExhausted },
-      );
-    }
-
-    if (markTarget !== null) {
-      marks.add(markTarget);
-    }
-
-    const d = top.depth + 1;
-
-    if (d >= q.min) {
-      // Rebuild the walk `seed … node` from the live stack (each frame's vertex,
-      // then `node`; edges are each frame's entry edge, then this `edge`). A
-      // SIMPLE close reconstructs the closing cycle naturally.
-      if (wantPath) {
-        const verts = stack.map((f) => f.vertex);
-        verts.push(node);
-
-        const edges = stack.map((f) => f.entryEdge).filter((e): e is Edge => e !== null);
-        edges.push(edge);
-
-        yield { end: node, verts, edges };
-      } else {
-        yield { end: node, verts: [], edges: [] };
-      }
-    }
-
-    if (!isClose) {
-      stack.push({
-        iter: expand(graph, node, rel)[Symbol.iterator](),
-        entry: markTarget,
-        depth: d,
-        vertex: node,
-        entryEdge: edge,
-      });
-    }
-  }
+  yield* trailEndsUnit(graph, from, unit, q, {
+    mode: opts.mode,
+    binding: opts.binding,
+    params: opts.params,
+    wantPath: opts.wantPath ?? false,
+  });
 };
 
 // --- clause compilation ------------------------------------------------------

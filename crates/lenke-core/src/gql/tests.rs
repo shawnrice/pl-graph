@@ -3835,11 +3835,10 @@ fn trail_budget_guards_dense_unbounded_star() {
     assert_eq!(err.code, crate::error_codes::ErrorCode::ResourceExhausted);
 }
 
-/// A MULTI-element repetition unit fans out `d^k` traversals from a SINGLE vertex, so
-/// on a dense graph one `expand_unit` could materialize enough to OOM the host. Even
-/// with a single repetition `{1}` — no outer looping — the per-expansion budget must
-/// fault with `E_RESOURCE_EXHAUSTED` mid-materialization. (The abbreviated `-[]->{n}`
-/// form can't hit this: it fans out only `d` per vertex, lazily.)
+/// A dense multi-element unit still enumerates `d^k` traversals from a vertex, but the
+/// fused matcher walks them LAZILY (O(path) memory, no `d^k` buffer), so the concern is
+/// now runaway TIME, not memory. The per-seed `TRAIL_BUDGET` (charged per hop) must
+/// still fault with `E_RESOURCE_EXHAUSTED` — even for a single repetition `{1}`.
 #[test]
 fn unit_expansion_budget_guards_dense_multi_element() {
     // Complete digraph K_64: every vertex → every other (4032 edges). A single 4-hop
@@ -5486,12 +5485,10 @@ fn layered_dense(layers: usize, width: usize) -> Graph {
 
 /// Throwaway micro-benchmark (ignored; run with `--ignored --nocapture`) for the HOT
 /// abbreviated var-length path at k=1. Prints elapsed wall time — no assertion (wall
-/// clock is flaky as a gate). As shipped this measures the single-edge fast-path
-/// (`reachable_each`, ~180µs/iter here). Temporarily building a 1-hop `CUnit` for the
-/// abbreviated form in `plan::segment` reroutes it through the general unit matcher —
-/// that measured 720µs before the flat-buffer + gated-reconstruct work and ~480µs
-/// after, versus ~180µs fused; the residual is `expand_unit`'s materialization, which
-/// is exactly what the fast-path specializes away. See `reachable_each_unit`'s doc.
+/// clock is flaky as a gate). The abbreviated form is a one-hop unit run by the single
+/// fused matcher (`reachable_each` → `reachable_each_unit`): ~74µs/iter here, vs ~177µs
+/// for the old hand-tuned materialize-then-step fast-path it replaced. The lazy fused
+/// walk is both faster AND O(path)-memory (no `d^k` per-vertex buffer).
 #[test]
 #[ignore]
 fn bench_k1_abbreviated_walk() {
@@ -5530,12 +5527,11 @@ fn five_chain() -> Graph {
     ])
 }
 
-/// ANTI-DRIFT: the abbreviated `-[]->{n,m}` form (the [`reachable_each`] fast-path)
-/// and an equivalent single-edge parenthesized subpath `((x)-[]->(y)){n,m}` (the
-/// general [`reachable_each_unit`] matcher) must return IDENTICAL endpoints for the
-/// same walk under EVERY path mode — the two share a DFS skeleton and this pins them
-/// so a change to one that isn't mirrored in the other fails the suite. See the
-/// fast-path justification on `reachable_each_unit`.
+/// The abbreviated `-[]->{n,m}` form (`reachable_each`, a one-hop-unit wrapper) and an
+/// equivalent single-edge parenthesized subpath `((x)-[]->(y)){n,m}` (a `k = 1` unit
+/// with group binding) must return IDENTICAL endpoints under EVERY path mode. They run
+/// the SAME fused matcher now, so this guards that the `k = 1` reduction stays exact
+/// (and that group binding doesn't perturb endpoints).
 #[test]
 fn abbreviated_and_single_edge_subpath_agree_k1() {
     // A graph with a cycle + a tail so TRAIL/SIMPLE/ACYCLIC/WALK genuinely diverge
@@ -5556,6 +5552,42 @@ fn abbreviated_and_single_edge_subpath_agree_k1() {
                 "abbreviated vs single-edge subpath diverged for mode={mode} quant={quant}",
             );
         }
+    }
+}
+
+/// The fused matcher marks PER HOP, so ACYCLIC/SIMPLE now forbid a multi-element unit
+/// from repeating a vertex INTERNALLY — the correct ISO reading (a node at most once
+/// on an acyclic path), which the old per-unit-set check missed. A 2-hop unit through
+/// a self-loop (`s→p`, `p→p`) revisits `p` within one unit: TRAIL keeps it (distinct
+/// edges), ACYCLIC and SIMPLE reject it.
+#[test]
+fn multi_element_acyclic_rejects_intra_unit_vertex_repeat() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"s","labels":["N"],"properties":{"id":"s"}}"#,
+        r#"{"type":"node","id":"p","labels":["N"],"properties":{"id":"p"}}"#,
+        r#"{"type":"edge","id":"e1","from":"s","to":"p","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e2","from":"p","to":"p","labels":["R"],"properties":{}}"#,
+    ]);
+    // TRAIL (default): s→p→p uses two distinct edges → endpoint p.
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH (s:N {id:'s'}) ((x)-[:R]->(m)-[:R]->(y)){1} (t) RETURN t.id AS id",
+        ),
+        vec![s("p")],
+    );
+    // ACYCLIC / SIMPLE: the unit revisits p internally → rejected → no endpoint.
+    for mode in ["ACYCLIC", "SIMPLE"] {
+        assert_eq!(
+            sorted_col0(
+                &mut g,
+                &format!(
+                    "MATCH {mode} (s:N {{id:'s'}}) ((x)-[:R]->(m)-[:R]->(y)){{1}} (t) RETURN t.id AS id"
+                ),
+            ),
+            Vec::<Value>::new(),
+            "mode={mode} should reject the intra-unit vertex repeat",
+        );
     }
 }
 

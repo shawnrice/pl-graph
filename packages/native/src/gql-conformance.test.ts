@@ -1171,6 +1171,25 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     }
   });
 
+  // The fused matcher marks PER HOP, so ACYCLIC/SIMPLE forbid a multi-element unit from
+  // repeating a vertex INTERNALLY (a self-loop `s→p, p→p` revisits p within one unit).
+  // Both engines must agree: TRAIL keeps it (distinct edges), ACYCLIC/SIMPLE reject it.
+  test('multi-element unit: per-hop vertex marking, byte-identical (TS vs native)', () => {
+    const SELF = [
+      '{"type":"node","id":"s","labels":["N"],"properties":{"id":"s"}}',
+      '{"type":"node","id":"p","labels":["N"],"properties":{"id":"p"}}',
+      '{"type":"edge","id":"e1","from":"s","to":"p","labels":["R"],"properties":{}}',
+      '{"type":"edge","id":"e2","from":"p","to":"p","labels":["R"],"properties":{}}',
+    ].join('\n');
+    const nat = graphFromFormat(backend, SELF, 'ndjson');
+    const ts = tsDeserialize(SELF, 'ndjson', new Graph());
+
+    for (const mode of ['', 'ACYCLIC', 'SIMPLE']) {
+      const q = `MATCH ${mode} (s:N {id:'s'}) ((x)-[:R]->(m)-[:R]->(y)){1} (t) RETURN t.id AS id`;
+      expect(JSON.stringify(nat.query(q)), q).toBe(JSON.stringify(tsQuery(ts, q)));
+    }
+  });
+
   // A dense multi-element unit fans out d^k from ONE vertex — both engines must FAULT
   // with the same code (E_RESOURCE_EXHAUSTED) rather than one OOMing. `{1}` (a single
   // repetition) proves the guard fires inside a single `expand_unit`, not just across
