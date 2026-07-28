@@ -4014,6 +4014,40 @@ fn reachable(
 /// predecessor chosen for each vertex is identical, and endpoints are emitted in
 /// ascending vertex id. `q.max` bounds the BFS depth; `q.min ≤ 1` is enforced at
 /// parse time (a larger minimum needs longer-than-shortest search).
+/// Bind `end` as a walk's endpoint node, expose the reconstructed `(verts, edges)` as
+/// the pattern's path variable if it names one, emit, and restore — the shared tail of
+/// every path-selector walk (SHORTEST / ALL SHORTEST / ALL / ANY / SHORTEST k). Returns
+/// the consumer's keep-going, so callers stop on `!emit_walk_end(..)`.
+#[allow(clippy::too_many_arguments)]
+fn emit_walk_end(
+    graph: &Graph,
+    ctx: &Ctx,
+    b: &mut Binding,
+    end_node: &CNode,
+    end: u32,
+    path_slot: Option<usize>,
+    verts: &[u32],
+    edges: &[u32],
+    emit: &mut dyn FnMut(&mut Binding) -> bool,
+) -> bool {
+    match_node_then(graph, ctx, b, end_node, end, &mut |b| {
+        if let Some(s) = path_slot {
+            b.set(
+                s,
+                Val::Path {
+                    vertices: verts.to_vec(),
+                    edges: edges.to_vec(),
+                },
+            );
+        }
+        let keep = emit(b);
+        if let Some(s) = path_slot {
+            b.unset(s);
+        }
+        keep
+    })
+}
+
 fn shortest_walk(
     graph: &Graph,
     ctx: &Ctx,
@@ -4087,24 +4121,9 @@ fn shortest_walk(
             reconstruct_path(seed, end, &pred)
         };
         let path_slot = pattern.path_var_slot;
-        let stop = !match_node_then(graph, ctx, binding, end_node, end, &mut |b| {
-            if let Some(s) = path_slot {
-                b.set(
-                    s,
-                    Val::Path {
-                        vertices: path.0.clone(),
-                        edges: path.1.clone(),
-                    },
-                );
-            }
-            let keep = emit(b);
-            if let Some(s) = path_slot {
-                b.unset(s);
-            }
-
-            keep
-        });
-        if stop {
+        if !emit_walk_end(
+            graph, ctx, binding, end_node, end, path_slot, &path.0, &path.1, emit,
+        ) {
             return false;
         }
     }
@@ -4262,23 +4281,9 @@ fn all_shortest_walk(
         };
         for (vertices, edges) in paths {
             let path_slot = pattern.path_var_slot;
-            let stop = !match_node_then(graph, ctx, binding, end_node, end, &mut |b| {
-                if let Some(s) = path_slot {
-                    b.set(
-                        s,
-                        Val::Path {
-                            vertices: vertices.clone(),
-                            edges: edges.clone(),
-                        },
-                    );
-                }
-                let keep = emit(b);
-                if let Some(s) = path_slot {
-                    b.unset(s);
-                }
-                keep
-            });
-            if stop {
+            if !emit_walk_end(
+                graph, ctx, binding, end_node, end, path_slot, &vertices, &edges, emit,
+            ) {
                 return false;
             }
         }
@@ -4317,22 +4322,7 @@ fn all_walk(
             want_path: true,
         },
         &mut |b, end, verts, edges, _steps: &[StepRec]| {
-            match_node_then(graph, ctx, b, end_node, end, &mut |b| {
-                if let Some(s) = path_slot {
-                    b.set(
-                        s,
-                        Val::Path {
-                            vertices: verts.to_vec(),
-                            edges: edges.to_vec(),
-                        },
-                    );
-                }
-                let keep = emit(b);
-                if let Some(s) = path_slot {
-                    b.unset(s);
-                }
-                keep
-            })
+            emit_walk_end(graph, ctx, b, end_node, end, path_slot, verts, edges, emit)
         },
     )
 }
@@ -4375,22 +4365,7 @@ fn any_walk(
             if !seen.insert(end) {
                 return true;
             }
-            match_node_then(graph, ctx, b, end_node, end, &mut |b| {
-                if let Some(s) = path_slot {
-                    b.set(
-                        s,
-                        Val::Path {
-                            vertices: verts.to_vec(),
-                            edges: edges.to_vec(),
-                        },
-                    );
-                }
-                let keep = emit(b);
-                if let Some(s) = path_slot {
-                    b.unset(s);
-                }
-                keep
-            })
+            emit_walk_end(graph, ctx, b, end_node, end, path_slot, verts, edges, emit)
         },
     )
 }
@@ -4484,23 +4459,9 @@ fn shortest_k_walk(
         };
 
         for (vertices, edges) in selected {
-            let stop = !match_node_then(graph, ctx, binding, end_node, end, &mut |b| {
-                if let Some(s) = path_slot {
-                    b.set(
-                        s,
-                        Val::Path {
-                            vertices: vertices.clone(),
-                            edges: edges.clone(),
-                        },
-                    );
-                }
-                let keep = emit(b);
-                if let Some(s) = path_slot {
-                    b.unset(s);
-                }
-                keep
-            });
-            if stop {
+            if !emit_walk_end(
+                graph, ctx, binding, end_node, end, path_slot, &vertices, &edges, emit,
+            ) {
                 return false;
             }
         }
