@@ -3988,44 +3988,8 @@ const matchPattern = function* (
   }
 };
 
-// Bare path binding over a single quantified segment (`p = (a)-[:R]->{m,n}(b)`):
-// enumerate every walk under the pattern's mode and bind each as a Path value.
-// Mirrors native `all_walk`.
-const allWalk = function* (
-  graph: Graph,
-  pattern: CPath,
-  seed: Vertex,
-  binding: Binding,
-  params: Params,
-): Iterable<Binding> {
-  const [{ rel, node: endNode }] = pattern.segments;
-
-  for (const { end, verts, edges } of trailEnds(graph, seed, rel, rel.quantifier!, {
-    mode: pattern.mode ?? 'trail',
-    binding,
-    params,
-    wantPath: true,
-  })) {
-    const matched = matchNode(binding, endNode, end, params, graph);
-
-    if (!matched) {
-      continue;
-    }
-
-    if (pattern.pathVar === undefined) {
-      yield matched;
-
-      continue;
-    }
-
-    const steps = edges.map((edge, i) => ({ edge, vertex: verts[i + 1] }));
-
-    yield withBinding(matched, pattern.pathVar, Path.fromSteps(verts[0], steps));
-  }
-};
-
 /** Bind the endpoint node and (if named) the walk as a Path, yielding the row.
- * Shared by the trail-enumerating selectors (`ANY`, `SHORTEST k`). */
+ * Shared by every trail-enumerating selector (bare `ALL`, `ANY`, `SHORTEST k`). */
 const bindEndAndPath = (
   graph: Graph,
   pattern: CPath,
@@ -4047,6 +4011,32 @@ const bindEndAndPath = (
   const steps = walk.edges.map((edge, i) => ({ edge, vertex: walk.verts[i + 1] }));
 
   return withBinding(matched, pattern.pathVar, Path.fromSteps(walk.verts[0], steps));
+};
+
+// Bare path binding over a single quantified segment (`p = (a)-[:R]->{m,n}(b)`):
+// enumerate every walk under the pattern's mode and bind each as a Path value.
+// Mirrors native `all_walk`.
+const allWalk = function* (
+  graph: Graph,
+  pattern: CPath,
+  seed: Vertex,
+  binding: Binding,
+  params: Params,
+): Iterable<Binding> {
+  const [{ rel }] = pattern.segments;
+
+  for (const walk of trailEnds(graph, seed, rel, rel.quantifier!, {
+    mode: pattern.mode ?? 'trail',
+    binding,
+    params,
+    wantPath: true,
+  })) {
+    const row = bindEndAndPath(graph, pattern, walk, binding, params);
+
+    if (row) {
+      yield row;
+    }
+  }
 };
 
 // Bare `ANY`: one arbitrary path per endpoint — the first walk that reaches each
