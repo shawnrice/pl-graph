@@ -610,6 +610,33 @@ impl Parser {
         )
     }
 
+    /// Positioned at a `(` whose next token is `(` (a `((` candidate): is it a
+    /// QUANTIFIED subpath `((…)){n,m}` rather than a bare `( <path> [WHERE] )`
+    /// grouping? Scan to the OUTER paren's match (parens balance, so nested
+    /// `(`/`)` in an inner WHERE cancel out) and look for a following quantifier.
+    fn starts_quantified_subpath(&self) -> bool {
+        let mut depth = 0usize;
+        let mut i = self.pos;
+        while let Some(t) = self.tokens.get(i) {
+            match t.tt {
+                Tt::LParen => depth += 1,
+                Tt::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(
+                            self.tokens.get(i + 1).map(|n| n.tt),
+                            Some(Tt::Star | Tt::Plus | Tt::LBrace)
+                        );
+                    }
+                }
+                Tt::Eof => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// ISO quantified parenthesized subpath `( (x)-[e]->(y) [WHERE cond] ) {n,m}`
     /// (a single-edge repetition unit), optionally followed by an endpoint node
     /// `(b)`. `x`/`e`/`y` are GROUP variables — bound per hop for `cond`, exposed
@@ -750,7 +777,7 @@ impl Parser {
             // another paren: a node pattern never nests a `(`, so `((` can only
             // begin a subpath. The inner WHERE is a *pattern* predicate, distinct
             // from the clause-level `WHERE` that follows the whole MATCH.
-            if p.check(Tt::LParen) && p.peek2().tt == Tt::LParen {
+            if p.check(Tt::LParen) && p.peek2().tt == Tt::LParen && !p.starts_quantified_subpath() {
                 if path_var.is_some() {
                     return err(
                         "a path variable on a parenthesized subpath (`p = ( … )`) is not yet supported",
@@ -765,15 +792,6 @@ impl Parser {
                     attach_subpath_where(&mut inner, cond);
                 }
                 p.expect(Tt::RParen, "')' to close a parenthesized subpath")?;
-                // A quantifier on the whole subpath (`( … )+`) would make the WHERE
-                // a per-iteration predicate on a variable-length path — a different
-                // matcher. Reject loudly rather than silently mishandle it.
-                if p.check(Tt::Star) || p.check(Tt::Plus) || p.check(Tt::LBrace) {
-                    return err(
-                        "a quantifier on a parenthesized subpath (`( … )+`) is not yet supported",
-                        p.peek().pos,
-                    );
-                }
                 return Ok(inner);
             }
 
@@ -781,7 +799,16 @@ impl Parser {
             let selector = p.parse_path_selector()?;
             let mode = p.parse_path_mode();
 
-            let start = p.parse_node()?;
+            // A pattern may BEGIN with a quantified subpath (no anchor node), e.g.
+            // `p = ((x)-[e]->(y)){1,3} (t)`. Synthesize an anonymous start so the walk
+            // seeds from every vertex (the subpath's source `x` is the group variable,
+            // bound per repetition). `((` reaching here can only be such a subpath — the
+            // bare grouping form returned above.
+            let start = if p.check(Tt::LParen) && p.peek2().tt == Tt::LParen {
+                NodePattern::default()
+            } else {
+                p.parse_node()?
+            };
             let mut segments = Vec::new();
             loop {
                 // A quantified PARENTHESIZED subpath `((x)-[e]->(y) WHERE …){n,m}`

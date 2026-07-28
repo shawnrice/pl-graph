@@ -1171,6 +1171,35 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     }
   });
 
+  // A pattern may BEGIN with a quantified subpath (no anchor node), and a path variable
+  // may bind the whole repeated walk — ISO, byte-identical both engines.
+  test('unanchored quantified subpath + path variable (TS vs native)', () => {
+    const CHAIN = [
+      '{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}',
+      '{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}',
+      '{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}',
+      '{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}',
+      '{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{}}',
+      '{"type":"edge","id":"e2","from":"b","to":"c","labels":["R"],"properties":{}}',
+      '{"type":"edge","id":"e3","from":"c","to":"d","labels":["R"],"properties":{}}',
+    ].join('\n');
+    const nat = graphFromFormat(backend, CHAIN, 'ndjson');
+    const ts = tsDeserialize(CHAIN, 'ndjson', new Graph());
+
+    for (const q of [
+      // Path variable over a leading quantified subpath (no anchor).
+      'MATCH p = ((x)-[e:R]->(y)){2} (t) RETURN t.id AS tid, path_length(p) AS len ORDER BY tid',
+      // Unanchored, no path variable.
+      'MATCH ((x)-[:R]->(y)){1,2} (t) RETURN t.id AS id ORDER BY id',
+      // nodes(p) over the repeated walk.
+      "MATCH p = ((x)-[e:R]->(y)){2} (t) WHERE t.id = 'c' RETURN size(nodes(p)) AS n",
+      // The bare grouping (no quantifier) still parses as a WHERE-scoped grouping.
+      'MATCH ((a)-[:R]->(b) WHERE a.id < b.id) RETURN a.id AS id ORDER BY id',
+    ]) {
+      expect(JSON.stringify(nat.query(q)), q).toBe(JSON.stringify(tsQuery(ts, q)));
+    }
+  });
+
   // The fused matcher marks PER HOP, so ACYCLIC/SIMPLE forbid a multi-element unit from
   // repeating a vertex INTERNALLY (a self-loop `s→p, p→p` revisits p within one unit).
   // Both engines must agree: TRAIL keeps it (distinct edges), ACYCLIC/SIMPLE reject it.

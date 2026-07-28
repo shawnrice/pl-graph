@@ -5555,6 +5555,52 @@ fn abbreviated_and_single_edge_subpath_agree_k1() {
     }
 }
 
+/// A pattern may BEGIN with a quantified subpath (no leading anchor node), and a path
+/// variable may bind the whole repeated walk — ISO `<parenthesized path pattern
+/// expression> <quantifier>` as the first path factor. The walk seeds from every vertex
+/// (anonymous start); the eval already handled the anchored form, this is the parser
+/// accepting the unanchored one.
+#[test]
+fn unanchored_quantified_subpath_and_path_variable() {
+    let mut g = balanced_chain(); // a→b→c→d, plus the `bal` props
+                                  // Path variable over a quantified subpath: `p` is the repeated walk; from every
+                                  // seed a 2-hop (2-rep single-edge) walk. Endpoints c (a→b→c) and d (b→c→d).
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH p = ((x)-[e:R]->(y)){2} (t) RETURN t.id AS tid, path_length(p) AS len ORDER BY tid",
+        ),
+        vec![vec![s("c"), n(2.0)], vec![s("d"), n(2.0)]],
+    );
+    // Unanchored, no path variable: bounded {1,2} from every seed.
+    assert_eq!(
+        sorted_col0(&mut g, "MATCH ((x)-[:R]->(y)){1,2} (t) RETURN t.id AS id",),
+        vec![s("b"), s("c"), s("c"), s("d"), s("d")],
+    );
+    // `nodes(p)` exposes the whole repeated walk's vertices (a→b→c for the first).
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH p = ((x)-[e:R]->(y)){2} (t) WHERE t.id = 'c' RETURN size(nodes(p)) AS n",
+        ),
+        vec![vec![n(3.0)]],
+    );
+}
+
+/// The bare parenthesized-subpath GROUPING `( <path> [WHERE] )` (NO quantifier) must
+/// still parse as a WHERE-scoped grouping — the lookahead only reroutes a `((…)){n}`.
+#[test]
+fn parenthesized_grouping_without_quantifier_still_works() {
+    let mut g = balanced_chain();
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH ((a)-[:R]->(b) WHERE a.bal < b.bal) RETURN a.id AS id",
+        ),
+        vec![s("a"), s("c")], // a→b 100<200 ✓; b→c 200<5 ✗; c→d 5<200 ✓
+    );
+}
+
 /// The fused matcher marks PER HOP, so ACYCLIC/SIMPLE now forbid a multi-element unit
 /// from repeating a vertex INTERNALLY — the correct ISO reading (a node at most once
 /// on an acyclic path), which the old per-unit-set check missed. A 2-hop unit through
@@ -7309,10 +7355,12 @@ fn subpath_where_single_node() {
 
 #[test]
 fn subpath_quantifier_and_pathvar_rejected() {
-    // A quantifier on a whole subpath (per-iteration predicate on a var-length
-    // path) is not yet supported — reject loudly, never silently mishandle.
-    assert!(parse("MATCH ((x)-[:KNOWS]->(y) WHERE x.age < y.age)+ RETURN x").is_err());
-    // A path variable on a subpath is likewise rejected for now.
+    // A quantified subpath as the FIRST path factor (no leading anchor) now parses —
+    // it is ISO `<parenthesized path pattern expression> <quantifier>`.
+    assert!(parse("MATCH ((x)-[:KNOWS]->(y) WHERE x.age < y.age)+ RETURN x").is_ok());
+    // A path variable is fine over a QUANTIFIED subpath (it binds the repeated walk)…
+    assert!(parse("MATCH p = ((x)-[:KNOWS]->(y)){1,3} (z) RETURN p").is_ok());
+    // …but a path variable on a bare NON-quantified grouping is still not supported.
     assert!(parse("MATCH p = ((x)-[:KNOWS]->(y) WHERE x.age < y.age) RETURN p").is_err());
 }
 

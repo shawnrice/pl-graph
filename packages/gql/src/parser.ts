@@ -629,6 +629,34 @@ export const parse = (
     check('ltilde') ||
     check('tilder');
 
+  // Positioned at a `(` whose next token is `(` (a `((` candidate): is it a QUANTIFIED
+  // subpath `((…)){n,m}` rather than a bare `( <path> [WHERE] )` grouping? Scan to the
+  // OUTER paren's match (parens balance, so nested `(`/`)` in an inner WHERE cancel out)
+  // and look for a following quantifier. Mirrors native `starts_quantified_subpath`.
+  const startsQuantifiedSubpath = (): boolean => {
+    let parenDepth = 0;
+
+    for (let i = pos; i < tokens.length; i += 1) {
+      const t = tokens[i].type;
+
+      if (t === 'lparen') {
+        parenDepth += 1;
+      } else if (t === 'rparen') {
+        parenDepth -= 1;
+
+        if (parenDepth === 0) {
+          const next = tokens[i + 1]?.type;
+
+          return next === 'star' || next === 'plus' || next === 'lbrace';
+        }
+      } else if (t === 'eof') {
+        break;
+      }
+    }
+
+    return false;
+  };
+
   // ISO quantified parenthesized subpath `( (x)-[e]->(y) [WHERE cond] ) {n,m} (b)`
   // (a single-edge repetition unit), optionally followed by an endpoint `(b)`.
   // `x`/`e`/`y` are GROUP variables (per-hop scalars for `cond`, lists outside);
@@ -813,7 +841,7 @@ export const parse = (
       // pattern never nests a `(`, so `((` can only begin a subpath. The inner
       // WHERE is a *pattern* predicate, distinct from the clause-level `WHERE`
       // that follows the whole MATCH.
-      if (check('lparen') && tokens[pos + 1]?.type === 'lparen') {
+      if (check('lparen') && tokens[pos + 1]?.type === 'lparen' && !startsQuantifiedSubpath()) {
         if (pathVar !== undefined) {
           throw new GqlSyntaxError(
             'a path variable on a parenthesized subpath (`p = ( … )`) is not yet supported',
@@ -831,23 +859,19 @@ export const parse = (
 
         expect('rparen', "')' to close a parenthesized subpath");
 
-        // A quantifier on the whole subpath (`( … )+`) would make the WHERE a
-        // per-iteration predicate on a variable-length path — a different matcher.
-        // Reject loudly rather than silently mishandle it.
-        if (check('star') || check('plus') || check('lbrace')) {
-          throw new GqlSyntaxError(
-            'a quantifier on a parenthesized subpath (`( … )+`) is not yet supported',
-            peek().pos,
-          );
-        }
-
         return inner;
       }
 
       const selector = parsePathSelector();
       const mode = parsePathMode();
 
-      const start = parseNode();
+      // A pattern may BEGIN with a quantified subpath (no anchor node), e.g.
+      // `p = ((x)-[e]->(y)){1,3} (t)`. Synthesize an anonymous start so the walk seeds
+      // from every vertex (the subpath's source `x` is the group variable, bound per
+      // repetition). `((` reaching here can only be such a subpath — the bare grouping
+      // form returned above.
+      const start: NodePattern =
+        check('lparen') && tokens[pos + 1]?.type === 'lparen' ? {} : parseNode();
       const segments: Segment[] = [];
 
       for (;;) {
