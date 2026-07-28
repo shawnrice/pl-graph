@@ -1336,6 +1336,27 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     }
   });
 
+  // A subpath-level WHERE on a NESTED quantifier: a per-OUTER-rep predicate with the inner
+  // variables bound as LISTS (`size(e)`, `x[0]`). Byte-identical both engines.
+  test('nested quantifier per-rep WHERE over grouped vars (TS vs native)', () => {
+    const nat = graphFromFormat(backend, NCHAIN, 'ndjson');
+    const ts = tsDeserialize(NCHAIN, 'ndjson', new Graph());
+
+    for (const q of [
+      // Abbreviated inner: `size(e)` constrains each outer rep's inner-walk length.
+      "MATCH (s:N {id:'a'}) ( ()-[e:R]->{1,2}() WHERE size(e) = 2 ){2} (t) RETURN t.id AS id ORDER BY id",
+      "MATCH (s:N {id:'a'}) ( ()-[e:R]->{1,2}() WHERE size(e) = 1 ){2} (t) RETURN t.id AS id ORDER BY id",
+      // Nested parenthesized subpath: same per-rep constraint, list-of-lists still exposed.
+      "MATCH (s:N {id:'a'}) ( ((x)-[e:R]->(y)){1,2} WHERE size(e) = 2 ){2} (t) RETURN t.id AS tid, size(x) AS nx, size(x[0]) AS nx0",
+      // Per-rep WHERE over list ELEMENTS.
+      "MATCH (s:N {id:'a'}) ( ((x)-[e:R]->(y)){2,2} WHERE x[0].id <> y[1].id ){2} (t) RETURN t.id AS id ORDER BY id",
+      // A per-rep WHERE that prunes EVERYTHING → empty, both engines.
+      "MATCH (s:N {id:'a'}) ( ()-[e:R]->{1,2}() WHERE size(e) = 5 ){2} (t) RETURN t.id AS id",
+    ]) {
+      expect(JSON.stringify(nat.query(q)), q).toBe(JSON.stringify(tsQuery(ts, q)));
+    }
+  });
+
   // The fused matcher marks PER HOP, so ACYCLIC/SIMPLE forbid a multi-element unit from
   // repeating a vertex INTERNALLY (a self-loop `s→p, p→p` revisits p within one unit).
   // Both engines must agree: TRAIL keeps it (distinct edges), ACYCLIC/SIMPLE reject it.

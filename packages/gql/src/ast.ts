@@ -299,6 +299,13 @@ export type Segment = {
    * The inner subpath's variables (x, e, y) are exposed as LIST-OF-LISTS.
    */
   nested?: Segment;
+  /**
+   * The subpath-level `WHERE` (`( … WHERE cond ){n,m}`): a PER-REPETITION predicate over
+   * the unit's group variables, evaluated once per outer rep. Kept SEPARATE from a hop's
+   * inline `-[e WHERE …]->` edge predicate (which stays per-edge) so a nested quantifier's
+   * per-rep `WHERE` (inner vars bound as lists) and its per-edge filters don't conflate.
+   */
+  subpathWhere?: Expr;
 };
 
 /**

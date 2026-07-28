@@ -3275,9 +3275,11 @@ const compileSubpathUnit = (seg: Segment): CUnit => {
     const q = inner.rel.quantifier!; // a nested subpath is always quantified
 
     // The nested subpath's LANDING is the outer segment's endpoint node, matched
-    // separately — not a group variable of this unit (so no `targetVar` on the `Sub`).
+    // separately — not a group variable of this unit (so no `targetVar` on the `Sub`). The
+    // outer subpath-level WHERE (per outer rep, inner vars bound as lists) is the unit WHERE.
     return {
       elems: [{ sub: { unit: compileSubpathUnit(inner), min: q.min, max: q.max ?? null } }],
+      ...(seg.subpathWhere !== undefined ? { where: compileExpr(seg.subpathWhere) } : {}),
     };
   }
 
@@ -3298,13 +3300,13 @@ const compileSubpathUnit = (seg: Segment): CUnit => {
     })),
   ];
 
-  // A PLAIN hop's WHERE lifts to the unit level; a NESTED hop's WHERE
-  // (`-[e WHERE …]->{a,b}`) is a per-inner-edge predicate that STAYS on the `Sub`'s inner
-  // hop, so it filters every edge of the inner walk (not lifted).
-  const whereExprs = astElems
-    .filter((h) => h.q === undefined)
-    .map((h) => h.rel.where)
-    .filter((w): w is Expr => w !== undefined);
+  // The subpath-level WHERE is the per-repetition predicate; a PLAIN hop's inline WHERE is
+  // also lifted to the unit level; a NESTED hop's WHERE (`-[e WHERE …]->{a,b}`) is a
+  // per-inner-edge predicate that STAYS on the `Sub`'s inner hop (not lifted).
+  const whereExprs = [
+    seg.subpathWhere,
+    ...astElems.filter((h) => h.q === undefined).map((h) => h.rel.where),
+  ].filter((w): w is Expr => w !== undefined);
   let unitWhere: Expr | undefined;
 
   if (whereExprs.length === 1) {
@@ -4158,17 +4160,6 @@ const shortestKWalk = function* (
  *  is exposed as the LIST of that position's value across every repetition
  *  (`verts[rep*k + p]` / `edges[rep*k + p]`). A one-hop unit (`k = 1`) collapses to
  *  `x = verts[..last]`, `y = verts[1..]`, `e = edges`. Mirrors native `bind_group_vars`. */
-/** A unit element as a hop — the linear (group-var / WHERE) paths only see all-`Hop`
- *  units; a nested `Sub` is handled by the pushdown, not here. Mirrors native `hop()`. */
-const asHop = (e: CElem): CHop => {
-  if ('hop' in e) {
-    return e.hop;
-  }
-
-  throw new LenkeError('nested sub-unit reached the linear matcher', {
-    code: ErrorCode.NotImplemented,
-  });
-};
 
 /** One graph-consuming hop of a matched trail, tagged with its position in the (possibly
  *  nested) repetition pattern. `levels` is the cursor stack outer→inner: one `[rep,
@@ -4176,17 +4167,27 @@ const asHop = (e: CElem): CHop => {
  *  (so the hop's own element is `elemAfter - 1`). Mirrors native `StepRec`. */
 type StepRec = { levels: readonly [number, number][]; source: Vertex; edge: Edge; target: Vertex };
 
-/** Place `val` at `root[idx[0]][idx[1]]…`, growing intermediate lists as needed — a
- *  variable nested `d` quantifiers deep has `d+1`-element index tuples. Mirrors native
- *  `Nest`. */
-const nestInsert = (root: unknown[], idx: readonly number[], val: unknown): void => {
-  let cur = root;
+/** Place `val` at `root[idx[0]][idx[1]]…`, growing intermediate lists as needed, and
+ *  return the new root. An EMPTY `idx` yields the value itself (a SCALAR — the per-rep
+ *  `WHERE` view of an outer-unit variable); a `d`-element tuple nests `d` levels deep.
+ *  Mirrors native `Nest` (empty index → `Leaf`). */
+const nestInsert = (root: unknown, idx: readonly number[], val: unknown): unknown => {
+  if (idx.length === 0) {
+    return val;
+  }
+
+  const arr: unknown[] = Array.isArray(root) ? root : [];
+  let cur = arr;
 
   for (let d = 0; d < idx.length - 1; d += 1) {
     const i = idx[d];
 
     while (cur.length <= i) {
       cur.push([]);
+    }
+
+    if (!Array.isArray(cur[i])) {
+      cur[i] = [];
     }
 
     cur = cur[i] as unknown[];
@@ -4199,6 +4200,8 @@ const nestInsert = (root: unknown[], idx: readonly number[], val: unknown): void
   }
 
   cur[last] = val;
+
+  return arr;
 };
 
 /** Assemble one unit's group variables from the structured walk. `treePath` is the
@@ -4211,17 +4214,18 @@ const bindUnit = (
   next: Map<string, unknown>,
   unit: CUnit,
   treePath: readonly number[],
+  keyStart: number,
   steps: readonly StepRec[],
 ): void => {
   const depth = treePath.length;
-  const key = (s: StepRec): number[] => s.levels.slice(0, depth + 1).map(([r]) => r);
+  const key = (s: StepRec): number[] => s.levels.slice(keyStart, depth + 1).map(([r]) => r);
   const within = (s: StepRec): boolean =>
     s.levels.length > depth && treePath.every((e, j) => s.levels[j][1] === e);
 
   // `startVar` = each rep-instance's source = its FIRST hop's source (which may sit
   // inside a leading `Sub`, hence `within`, not just direct hops).
   if (unit.startVar !== undefined) {
-    const root: unknown[] = [];
+    let root: unknown = [];
     const seen = new Set<string>();
 
     for (const s of steps) {
@@ -4231,7 +4235,7 @@ const bindUnit = (
 
         if (!seen.has(kk)) {
           seen.add(kk);
-          nestInsert(root, k, s.source);
+          root = nestInsert(root, k, s.source);
         }
       }
     }
@@ -4245,11 +4249,11 @@ const bindUnit = (
         within(s) && s.levels.length === depth + 1 && s.levels[depth][1] === e + 1;
 
       if (el.hop.targetVar !== undefined) {
-        const root: unknown[] = [];
+        let root: unknown = [];
 
         for (const s of steps) {
           if (direct(s)) {
-            nestInsert(root, key(s), s.target);
+            root = nestInsert(root, key(s), s.target);
           }
         }
 
@@ -4257,11 +4261,11 @@ const bindUnit = (
       }
 
       if (el.hop.rel.variable !== undefined) {
-        const root: unknown[] = [];
+        let root: unknown = [];
 
         for (const s of steps) {
           if (direct(s)) {
-            nestInsert(root, key(s), s.edge);
+            root = nestInsert(root, key(s), s.edge);
           }
         }
 
@@ -4280,16 +4284,16 @@ const bindUnit = (
           }
         }
 
-        const root: unknown[] = [];
+        let root: unknown = [];
 
         for (const { k, target } of last.values()) {
-          nestInsert(root, k, target);
+          root = nestInsert(root, k, target);
         }
 
         next.set(el.sub.targetVar, root);
       }
 
-      bindUnit(next, el.sub.unit, [...treePath, e], steps);
+      bindUnit(next, el.sub.unit, [...treePath, e], keyStart, steps);
     }
   });
 };
@@ -4299,36 +4303,33 @@ const bindUnit = (
  *  native `bind_group_vars`. */
 const bindGroupVars = (binding: Binding, unit: CUnit, steps: readonly StepRec[]): Binding => {
   const next = new Map(binding);
-  bindUnit(next, unit, [], steps);
+  bindUnit(next, unit, [], 0, steps);
 
   return next;
 };
 
-/** Evaluate a unit's per-repetition `WHERE` at a completion: bind its source `x` (the
- *  boundary frame's vertex) and each hop's edge/target — from the unit's `k` frames
- *  (`frames[base..]`) plus the completing `edge`/`nbr` — as SCALARS, then test the
- *  predicate. `true` when there is no `WHERE`. Mirrors native `reachable_each_unit`. */
-const unitWherePasses = (
-  unit: CUnit,
-  frames: readonly { vertex: Vertex; entryEdge: Edge | null }[],
-  base: number,
-  edge: Edge,
-  nbr: Vertex,
-  env: EvalEnv,
-): boolean => {
+/** Bind ONE outer rep's variables for the per-repetition `WHERE` (`steps` already filtered
+ *  to that rep). `keyStart = 1` drops the outer-rep index, so an outer-unit variable
+ *  collapses to a SCALAR and a variable inside a `Sub` becomes a LIST over the inner reps —
+ *  the per-rep view the predicate sees (`size(e)`, `x[0]`, …). Mirrors native
+ *  `bind_group_vars_perrep`. */
+const bindGroupVarsPerRep = (binding: Binding, unit: CUnit, steps: readonly StepRec[]): Binding => {
+  const next = new Map(binding);
+  bindUnit(next, unit, [], 1, steps);
+
+  return next;
+};
+
+/** Evaluate a unit's per-repetition `WHERE` at an OUTER-rep completion. `repSteps` are the
+ *  completing rep's hops; bind the unit's variables to their per-rep values — a direct
+ *  variable is a SCALAR, a variable inside a nested `Sub` is a LIST over the inner reps
+ *  (`bindGroupVarsPerRep`) — then test the predicate. Mirrors native `where_ok`. */
+const unitWherePasses = (unit: CUnit, repSteps: readonly StepRec[], env: EvalEnv): boolean => {
   if (unit.where === undefined) {
     return true;
   }
 
-  const k = unit.elems.length;
-  let wb = withBinding(env.binding, unit.startVar, frames[base].vertex);
-
-  for (let j = 0; j < k; j += 1) {
-    const e = j + 1 < k ? frames[base + j + 1].entryEdge! : edge;
-    const t = j + 1 < k ? frames[base + j + 1].vertex : nbr;
-    const hop = asHop(unit.elems[j]);
-    wb = withBinding(withBinding(wb, hop.rel.variable, e), hop.targetVar, t);
-  }
+  const wb = bindGroupVarsPerRep(env.binding, unit, repSteps);
 
   return unit.where({ ...env, binding: wb }) === true;
 };
@@ -4390,10 +4391,13 @@ type Cursor = { unit: CUnit; min: number; max: number | null; rep: number; elem:
 type HopMove = { rel: CRel; after: Cursor[] };
 
 /** Follow epsilon moves (enter a sub / close a nested unit / repeat) from `start`,
- *  collecting whether the TOP unit accepts here (emit) and every graph-consuming hop
- *  reachable. A visited set breaks min-0 epsilon cycles. Mirrors native `resolve`. */
-const resolve = (start: Cursor[]): { emit: boolean; moves: HopMove[] } => {
+ *  collecting whether the TOP unit accepts here (`emit`), whether an OUTER rep just
+ *  completed (`completedOuter` — the top unit reached its end, the per-rep `WHERE` hook,
+ *  true even below `min`), and every graph-consuming hop reachable. A visited set breaks
+ *  min-0 epsilon cycles. Mirrors native `resolve`. */
+const resolve = (start: Cursor[]): { emit: boolean; completedOuter: boolean; moves: HopMove[] } => {
   let emit = false;
+  let completedOuter = false;
   const moves: HopMove[] = [];
   const work: Cursor[][] = [start];
   const seen = new Set<string>();
@@ -4441,6 +4445,11 @@ const resolve = (start: Cursor[]): { emit: boolean; moves: HopMove[] } => {
         }
       }
 
+      // The TOP unit at its end (any `rep`, `min` or not) = an outer rep completed.
+      if (p.length === 1) {
+        completedOuter = true;
+      }
+
       if (top.max === null || rep2 < top.max) {
         const again = p.map((c) => ({ ...c }));
         again[again.length - 1] = { ...again[again.length - 1], rep: rep2, elem: 0 };
@@ -4449,7 +4458,7 @@ const resolve = (start: Cursor[]): { emit: boolean; moves: HopMove[] } => {
     }
   }
 
-  return { emit, moves };
+  return { emit, completedOuter, moves };
 };
 
 /** A hop's out-edges materialized and filtered by its inline predicate. Mirrors native
@@ -4539,6 +4548,23 @@ const trailEndsUnit = function* (
     },
   ];
 
+  // The structured walk up to (and including) the current hop `(edgeV, nbrV)`. Each frame's
+  // taken move stays frozen at the hop that spawned its child while that child is live, so
+  // `stack[i].moves[moveIdx].after` is hop `i`'s landing position; the final hop is this
+  // one. Mirrors native `rebuild_steps`.
+  const buildSteps = (nbrV: Vertex, edgeV: Edge): StepRec[] =>
+    stack.map((f, i) => {
+      const at = f.moves[f.moveIdx].after;
+      const isLast = i + 1 >= stack.length;
+
+      return {
+        levels: at.map((c) => [c.rep, c.elem] as [number, number]),
+        source: f.vertex,
+        edge: isLast ? edgeV : stack[i + 1].entryEdge!,
+        target: isLast ? nbrV : stack[i + 1].vertex,
+      };
+    });
+
   while (stack.length > 0) {
     const top = stack[stack.length - 1];
 
@@ -4573,17 +4599,28 @@ const trailEndsUnit = function* (
       continue;
     }
 
-    // Per-rep WHERE at the top unit's completion (linear only — nested units have none).
+    // Resolve the epsilon-closure: does the top unit ACCEPT here, did an OUTER rep just
+    // complete (the per-rep `WHERE` hook), and the onward hops.
+    const [{ rep: outerRep }] = after;
+    const resolved = resolve(after);
+    const { completedOuter } = resolved;
+    let { emit, moves: nextMoves } = resolved;
+
+    // Per-repetition `WHERE` at each outer-rep completion. On failure, PRUNE only the
+    // outer-completion branch: suppress the emit and drop the moves that start the next
+    // outer rep, while inner-continue branches (same outer rep) survive. For a linear unit
+    // there is no inner branch, so this prunes the whole hop (the old per-rep skip).
     if (
-      completesTop &&
+      completedOuter &&
       hasWhere &&
-      !unitWherePasses(unit, stack, stack.length - unit.elems.length, edge, nbr, {
-        binding,
-        params,
-        graph,
-      })
+      !unitWherePasses(
+        unit,
+        buildSteps(nbr, edge).filter((s) => s.levels[0]?.[0] === outerRep),
+        { binding, params, graph },
+      )
     ) {
-      continue;
+      emit = false;
+      nextMoves = nextMoves.filter((m) => m.after[0].rep <= outerRep);
     }
 
     steps += 1;
@@ -4601,8 +4638,6 @@ const trailEndsUnit = function* (
       marks.add(mark);
     }
 
-    const { emit, moves: nextMoves } = resolve(after);
-
     if (emit) {
       if (wantPath) {
         const verts = stack.map((f) => f.vertex);
@@ -4611,23 +4646,7 @@ const trailEndsUnit = function* (
         const edges = stack.map((f) => f.entryEdge).filter((e): e is Edge => e !== null);
         edges.push(edge);
 
-        // The structured walk: each hop tagged with its pattern position. A frame's taken
-        // move stays frozen at the hop that spawned its child while that child is live, so
-        // `stack[i].moves[moveIdx].after` is hop `i`'s landing position (top `elem` one
-        // past the element traversed); the final hop (this emit) is `(edge, nbr)`.
-        const stepRecs: StepRec[] = stack.map((f, i) => {
-          const at = f.moves[f.moveIdx].after;
-          const isLast = i + 1 >= stack.length;
-
-          return {
-            levels: at.map((c) => [c.rep, c.elem] as [number, number]),
-            source: f.vertex,
-            edge: isLast ? edge : stack[i + 1].entryEdge!,
-            target: isLast ? nbr : stack[i + 1].vertex,
-          };
-        });
-
-        yield { end: nbr, verts, edges, steps: stepRecs };
+        yield { end: nbr, verts, edges, steps: buildSteps(nbr, edge) };
       } else {
         yield { end: nbr, verts: [], edges: [], steps: [] };
       }

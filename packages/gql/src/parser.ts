@@ -670,6 +670,9 @@ export const parse = (
     // quantified, so `startsQuantifiedSubpath` distinguishes them.
     if (startsQuantifiedSubpath()) {
       const inner = parseQuantifiedSubpath();
+      // An optional per-OUTER-rep `WHERE` over the inner subpath's group variables (bound
+      // as lists per outer rep, e.g. `WHERE size(e) = 2`).
+      const subpathWhere = checkKeyword('where') ? (advance(), parseExpr()) : undefined;
       expect('rparen', "')' to close a quantified subpath");
       const quantifier = parseQuantifier();
 
@@ -681,7 +684,12 @@ export const parse = (
 
       // A synthetic rel carries only the OUTER quantifier (the unit body is the nested
       // subpath, not a hop of this segment's `rel`).
-      return { rel: { direction: 'out', quantifier }, node, nested: inner };
+      return {
+        rel: { direction: 'out', quantifier },
+        node,
+        nested: inner,
+        ...(subpathWhere !== undefined ? { subpathWhere } : {}),
+      };
     }
 
     const hopFrom = parseNode(); // inner (x)
@@ -723,26 +731,13 @@ export const parse = (
 
     // A NESTED repetition (`( … {a,b} … ){n,m}`). Its NODE variables (source, a nested
     // hop's landing, intermediates) are all group variables at the OUTER unit's depth
-    // (flat lists), and a per-hop EDGE predicate on a nested inner hop filters every inner
-    // edge — both supported by the structured binder. Only a subpath-level WHERE over
-    // grouped variables is still deferred (rejected just below). Mirrors native.
-    const nested = innerQ !== undefined || unitRest.some((s) => s.rel.quantifier !== undefined);
+    // (flat lists), a per-hop EDGE predicate filters inner edges, and a subpath-level WHERE
+    // (below) is a per-outer-rep predicate over the grouped variables — all supported by
+    // the structured binder. Mirrors native.
 
-    let { where } = rel;
-
-    if (checkKeyword('where')) {
-      if (nested) {
-        throw new GqlSyntaxError(
-          'a subpath-level WHERE on a nested quantifier is not yet supported — put the ' +
-            'predicate inline on the edge (`-[e WHERE …]->{a,b}`)',
-          peek().pos,
-        );
-      }
-
-      advance();
-      const cond = parseExpr();
-      where = where ? { kind: 'and', items: [where, cond] } : cond;
-    }
+    // The subpath-level `WHERE` — a PER-REPETITION predicate over the unit's group
+    // variables, kept SEPARATE from any inline `-[e WHERE …]->` edge predicate.
+    const subpathWhere = checkKeyword('where') ? (advance(), parseExpr()) : undefined;
 
     expect('rparen', "')' to close a quantified subpath");
     const quantifier = parseQuantifier();
@@ -755,12 +750,13 @@ export const parse = (
     const node = check('lparen') ? parseNode() : {};
 
     return {
-      rel: { ...rel, where, quantifier },
+      rel: { ...rel, quantifier },
       node,
       hopFrom,
       hopTo,
       unitRest,
       ...(innerQ !== undefined ? { innerQ } : {}),
+      ...(subpathWhere !== undefined ? { subpathWhere } : {}),
     };
   };
 
