@@ -2308,6 +2308,62 @@ fn exists_bound_endpoint_reachability_is_bidirectional_and_exact() {
     .is_empty());
 }
 
+/// A MULTI-segment bound-both-endpoints EXISTS (the ReBAC `check()` shape) takes the
+/// meet-in-the-middle fast path; it must give the SAME boolean as the general matcher.
+/// Covers nested-group + resource-inheritance grants, a direct (0-hop) grant, a deny, and a
+/// `->*` vs `->{0,N}` (general) differential.
+#[test]
+fn exists_multiseg_meet_in_middle_matches_general() {
+    // u1∈g1∈g2; g2 OWNER f1; f1 PARENT d1. u2 OWNER d3 directly. d2 ungranted.
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"u1","labels":["User"],"properties":{"id":"u1"}}"#,
+        r#"{"type":"node","id":"u2","labels":["User"],"properties":{"id":"u2"}}"#,
+        r#"{"type":"node","id":"g1","labels":["Grp"],"properties":{"id":"g1"}}"#,
+        r#"{"type":"node","id":"g2","labels":["Grp"],"properties":{"id":"g2"}}"#,
+        r#"{"type":"node","id":"f1","labels":["Res"],"properties":{"id":"f1"}}"#,
+        r#"{"type":"node","id":"d1","labels":["Res"],"properties":{"id":"d1"}}"#,
+        r#"{"type":"node","id":"d2","labels":["Res"],"properties":{"id":"d2"}}"#,
+        r#"{"type":"node","id":"d3","labels":["Res"],"properties":{"id":"d3"}}"#,
+        r#"{"type":"edge","from":"u1","to":"g1","labels":["MEMBER"]}"#,
+        r#"{"type":"edge","from":"g1","to":"g2","labels":["MEMBER"]}"#,
+        r#"{"type":"edge","from":"g2","to":"f1","labels":["OWNER"]}"#,
+        r#"{"type":"edge","from":"f1","to":"d1","labels":["PARENT"]}"#,
+        r#"{"type":"edge","from":"u2","to":"d3","labels":["OWNER"]}"#,
+    ]);
+    let check = |g: &mut Graph, u: &str, t: &str, arrow: &str| -> bool {
+        !rows(
+            g,
+            &format!(
+                "MATCH (u:User {{id:'{u}'}}), (t:Res {{id:'{t}'}}) WHERE EXISTS {{ MATCH \
+                 (u)-[:MEMBER]->{arrow}(s)-[:OWNER|EDITOR|VIEWER]->(gr)-[:PARENT]->{arrow}(t) }} \
+                 RETURN 1 AS x"
+            ),
+        )
+        .is_empty()
+    };
+    // Known answers via the meet-in-the-middle path (`->*`).
+    assert!(check(&mut g, "u1", "f1", "*")); // nested group grant, 0 PARENT hops
+    assert!(check(&mut g, "u1", "d1", "*")); // + resource inheritance (1 PARENT hop)
+    assert!(!check(&mut g, "u1", "d2", "*")); // ungranted — the NEGATIVE case
+    assert!(!check(&mut g, "u1", "d3", "*")); // granted to u2, not u1
+    assert!(check(&mut g, "u2", "d3", "*")); // DIRECT grant: 0 MEMBER hops (min-0)
+                                             // Differential: `->*` (meet-in-the-middle) must equal `->{0,20}` (general matcher).
+    for (u, t) in [
+        ("u1", "f1"),
+        ("u1", "d1"),
+        ("u1", "d2"),
+        ("u1", "d3"),
+        ("u2", "d3"),
+        ("u2", "f1"),
+    ] {
+        assert_eq!(
+            check(&mut g, u, t, "*"),
+            check(&mut g, u, t, "{0,20}"),
+            "meet-in-the-middle diverged from general for {u} → {t}",
+        );
+    }
+}
+
 /// `neighborAggregate`'s `norm` (and `weightProperty`) must be accepted via GQL `CALL`,
 /// not only via the direct-method API — the CALL path has its OWN config-key mapping.
 /// Regression guard: `norm` shipped to the algorithm + `CONFIG_KEYS` but was initially

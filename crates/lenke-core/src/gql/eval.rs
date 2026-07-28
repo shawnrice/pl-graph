@@ -4903,6 +4903,206 @@ fn any_match_reachable(
 /// Does the (correlated) sub-pattern have at least one match? Short-circuits.
 /// The work binding is the outer binding grown to the sub-scope (`sub_len`):
 /// outer slots stay set (correlation), the sub's own slots start unbound.
+/// Resolve a relationship label expression to the concrete set of edge-type ids it can
+/// match — `Some(ids)` for a single `Label` or an `Or` of labels, `None` for anything the
+/// bidirectional evaluator won't reason about disjointness for (wildcard / And / Not /
+/// absent label). Used only to prove two segments can't share an edge.
+fn label_etypes(el: Option<&CLabelExpr>, ctx: &Ctx) -> Option<Vec<u32>> {
+    fn collect(e: &CLabelExpr, ctx: &Ctx, out: &mut Vec<u32>) -> bool {
+        match e {
+            CLabelExpr::Label(r) => {
+                if let Some(id) = ctx.labels[*r].1 {
+                    out.push(id);
+                }
+                true
+            }
+            CLabelExpr::Or(a, b) => collect(a, ctx, out) && collect(b, ctx, out),
+            _ => false,
+        }
+    }
+    let e = el?;
+    let mut out = Vec::new();
+    collect(e, ctx, &mut out).then_some(out)
+}
+
+/// One segment of a linear pattern reduced to a set-reachability step: its edge label,
+/// direction, and whether it is a var-length closure (and admits the zero-length path).
+struct BidirStep<'a> {
+    label: Option<&'a CLabelExpr>,
+    dir: Direction,
+    varlen: bool,
+    min0: bool,
+}
+
+/// Advance a frontier vertex-set by one step — a fixed 1-hop expansion, or a full closure
+/// for a var-length segment (`min0` folds in the zero-length path = the set itself).
+/// `reverse` walks the step backward (for the right frontier growing from the bound target).
+fn bidir_apply(
+    graph: &Graph,
+    ctx: &Ctx,
+    set: &FxHashSet<u32>,
+    step: &BidirStep,
+    reverse: bool,
+) -> FxHashSet<u32> {
+    let dir = if reverse {
+        match step.dir {
+            Direction::Out => Direction::In,
+            Direction::In => Direction::Out,
+            Direction::Both => Direction::Both,
+        }
+    } else {
+        step.dir
+    };
+    let mut out: FxHashSet<u32> = FxHashSet::default();
+    if step.varlen {
+        // Every vertex reachable in ≥1 hop from `set` (BFS), plus `set` itself when min-0.
+        let mut work: Vec<u32> = set.iter().copied().collect();
+        while let Some(v) = work.pop() {
+            for (_e, w) in expand(graph, ctx, v, dir, step.label) {
+                if out.insert(w) {
+                    work.push(w);
+                }
+            }
+        }
+        if step.min0 {
+            out.extend(set.iter().copied());
+        }
+    } else {
+        for &v in set {
+            for (_e, w) in expand(graph, ctx, v, dir, step.label) {
+                out.insert(w);
+            }
+        }
+    }
+    out
+}
+
+/// Meet-in-the-middle EXISTENCE for a LINEAR pattern with BOTH endpoints already bound
+/// (`u = n0 —seg1→ n1 … —segk→ nk = t`). Grow a left frontier-set from `u` and a right
+/// frontier-set from `t`, always advancing the SMALLER by one segment (forward left,
+/// reversed right), and stop when they meet at a shared waypoint — never expanding the far,
+/// possibly huge, cone (the negative-check win). Existence → boolean, so this is byte-
+/// identical to a forward walk. Applies only where reachability == existence: WALK/TRAIL
+/// mode (SIMPLE/ACYCLIC need node-distinctness the set search doesn't track) with
+/// edge-type-DISJOINT segments (so no edge is reused across segments under TRAIL). Declines
+/// (`None`) on anything richer — a path variable, an inner WHERE, a shortest selector, a
+/// filtered intermediate node, a bounded `{m,n}` quantifier, a parenthesized subpath, an
+/// edge variable/predicate, an undirected/unresolvable label — falling back to the general
+/// matcher. Single-segment patterns are `any_match_reachable`'s job.
+fn exists_bidir_multiseg(
+    graph: &Graph,
+    ctx: &Ctx,
+    patterns: &[CPath],
+    where_: Option<&CExpr>,
+    binding: &Binding,
+) -> Option<bool> {
+    let [path] = patterns else {
+        return None;
+    };
+    if path.segments.len() < 2
+        || !matches!(path.mode, PathMode::Walk | PathMode::Trail)
+        || !matches!(path.selector, PathSelector::Walk)
+        || path.path_var_slot.is_some()
+        || where_.is_some()
+    {
+        return None;
+    }
+    // Both endpoints already bound (correlated from the outer scope).
+    let u = match path.start.var_slot.and_then(|s| binding.get(s)) {
+        Some(Val::Node(v)) => *v,
+        _ => return None,
+    };
+    let last = path.segments.last()?;
+    let t = match last.node.var_slot.and_then(|s| binding.get(s)) {
+        Some(Val::Node(v)) => *v,
+        _ => return None,
+    };
+    // Endpoint nodes' own label / props / WHERE must hold (validate once); intermediate
+    // nodes must be PLAIN (a filter there would restrict the frontier).
+    let endpoint_ok = |v: u32, n: &CNode| -> bool {
+        matches_label(graph, ctx, v, n.label.as_ref())
+            && satisfies(
+                graph,
+                ctx,
+                &Val::Node(v),
+                &n.props,
+                n.where_.as_ref(),
+                binding,
+            )
+    };
+    if !endpoint_ok(u, &path.start) || !endpoint_ok(t, &last.node) {
+        return Some(false);
+    }
+    for seg in &path.segments[..path.segments.len() - 1] {
+        let n = &seg.node;
+        if n.label.is_some() || !n.props.is_empty() || n.where_.is_some() {
+            return None;
+        }
+    }
+    // Reduce each segment to a set-reachability step; bail on anything not handled.
+    let mut steps: Vec<BidirStep> = Vec::with_capacity(path.segments.len());
+    let mut etypes: Vec<Vec<u32>> = Vec::with_capacity(path.segments.len());
+    for seg in &path.segments {
+        let r = &seg.rel;
+        if seg.unit.is_some()
+            || r.var_slot.is_some()
+            || !r.props.is_empty()
+            || r.where_.is_some()
+            || !matches!(r.direction, Direction::Out | Direction::In)
+        {
+            return None;
+        }
+        let (varlen, min0) = match r.quantifier {
+            None => (false, false),
+            Some(q) if q.max.is_none() => (true, q.min == 0),
+            _ => return None, // bounded {m,n} needs level tracking — decline
+        };
+        etypes.push(label_etypes(r.label.as_ref(), ctx)?);
+        steps.push(BidirStep {
+            label: r.label.as_ref(),
+            dir: r.direction,
+            varlen,
+            min0,
+        });
+    }
+    // Edge-type-DISJOINT segments ⇒ no edge is shared across segments, so a reachable
+    // (walk) match is also a TRAIL. Any overlap → decline (the set search can't prove the
+    // per-edge-uniqueness a TRAIL requires).
+    for i in 0..etypes.len() {
+        for j in (i + 1)..etypes.len() {
+            if etypes[i].iter().any(|a| etypes[j].contains(a)) {
+                return None;
+            }
+        }
+    }
+
+    // Meet in the middle. Left set at waypoint `li` (from `u`), right at `ri` (from `t`).
+    let k = steps.len();
+    let mut left: FxHashSet<u32> = FxHashSet::from_iter([u]);
+    let mut right: FxHashSet<u32> = FxHashSet::from_iter([t]);
+    let (mut li, mut ri) = (0usize, k);
+    let intersects = |a: &FxHashSet<u32>, b: &FxHashSet<u32>| -> bool {
+        let (small, big) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+        small.iter().any(|v| big.contains(v))
+    };
+    while li < ri {
+        if left.len() <= right.len() {
+            left = bidir_apply(graph, ctx, &left, &steps[li], false);
+            li += 1;
+        } else {
+            right = bidir_apply(graph, ctx, &right, &steps[ri - 1], true);
+            ri -= 1;
+        }
+        if li == ri {
+            return Some(intersects(&left, &right));
+        }
+        if left.is_empty() || right.is_empty() {
+            return Some(false);
+        }
+    }
+    Some(intersects(&left, &right))
+}
+
 fn any_match(
     graph: &Graph,
     ctx: &Ctx,
@@ -4912,6 +5112,9 @@ fn any_match(
     sub_len: usize,
 ) -> bool {
     if let Some(res) = any_match_reachable(graph, ctx, patterns, where_, binding, sub_len) {
+        return res;
+    }
+    if let Some(res) = exists_bidir_multiseg(graph, ctx, patterns, where_, binding) {
         return res;
     }
     let mut found = false;
