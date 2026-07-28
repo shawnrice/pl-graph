@@ -3624,7 +3624,9 @@ fn reachable_each_unit(
             }
         }
 
-        if next_moves.is_empty() {
+        // A SIMPLE close emits but does NOT extend (the cycle is closed); likewise a
+        // position with no onward move. Nothing to descend into.
+        if is_close || next_moves.is_empty() {
             if let Some(mi) = mark {
                 marks[mi] = false;
             }

@@ -5694,6 +5694,33 @@ fn parenthesized_grouping_without_quantifier_still_works() {
     );
 }
 
+/// A SIMPLE close (a walk returning to the seed) EMITS the seed but must NOT extend
+/// past it — the cycle is closed. Regression for the unified matcher (this shape
+/// slipped past cargo tests but conformance caught it). Triangle a→b→c→a + a→d + b→a.
+#[test]
+fn simple_close_emits_but_does_not_extend() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+        r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}"#,
+        r#"{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}"#,
+        r#"{"type":"edge","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","from":"b","to":"c","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","from":"c","to":"a","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","from":"a","to":"d","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","from":"b","to":"a","labels":["R"],"properties":{}}"#,
+    ]);
+    // 1-hop: b, d. 2-hop: a→b→c (c), a→b→a (close → a). 3-hop: a→b→c→a (close → a).
+    // Two distinct closing trails to a → a twice; the close never extends further.
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH SIMPLE (a:N {id:'a'})-[:R]->{1,3}(x) RETURN x.id AS id",
+        ),
+        vec![s("a"), s("a"), s("b"), s("c"), s("d")],
+    );
+}
+
 /// A five-node chain fixture a→b→c→d→e for nested-quantifier tests.
 fn chain5() -> Graph {
     graph_of(&[
