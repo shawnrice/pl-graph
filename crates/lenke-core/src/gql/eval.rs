@@ -9017,6 +9017,66 @@ fn with_frame_aggregate(
 /// path's segments from that row's start vertex, fanning out to matching
 /// neighbors and replicating the frame's other columns. Returns `None` for a
 /// fresh/unbound start (cartesian), var-length, or a segment slot already bound.
+/// Does neighbor edge `(eidx → nbr)` pass segment `seg`'s node label and — when
+/// `need_bind` — its inline rel/node property + WHERE predicates? When `need_bind`, the
+/// rel/node slots are set into `nb` as a side effect (so a caller that keeps the row
+/// sees them bound). `rel_check`/`node_check` are the precomputed "has a predicate"
+/// flags. The shared per-edge accept test of `expand_frame` and `expand_frame_optional`;
+/// the divergent output (column scatter vs null-fillable push) stays in each caller.
+/// The `rel_check`/`node_check` flags are precomputed once per segment by the caller to
+/// keep this per-edge test free of repeated `props`/`where_` inspection.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn seg_edge_accepts(
+    graph: &Graph,
+    ctx: &Ctx,
+    seg: &CSegment,
+    eidx: u32,
+    nbr: u32,
+    need_bind: bool,
+    rel_check: bool,
+    node_check: bool,
+    nb: &mut Binding,
+) -> bool {
+    let (rel, node) = (&seg.rel, &seg.node);
+    if !matches_label(graph, ctx, nbr, node.label.as_ref()) {
+        return false;
+    }
+    if need_bind {
+        if let Some(s) = rel.var_slot {
+            nb.set(s, Val::Edge(eidx));
+        }
+        if let Some(s) = node.var_slot {
+            nb.set(s, Val::Node(nbr));
+        }
+        if rel_check
+            && !satisfies(
+                graph,
+                ctx,
+                &Val::Edge(eidx),
+                &rel.props,
+                rel.where_.as_ref(),
+                nb,
+            )
+        {
+            return false;
+        }
+        if node_check
+            && !satisfies(
+                graph,
+                ctx,
+                &Val::Node(nbr),
+                &node.props,
+                node.where_.as_ref(),
+                nb,
+            )
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn expand_frame(
     graph: &Graph,
     ctx: &Ctx,
@@ -9124,40 +9184,10 @@ fn expand_frame(
                 bind_row(&mut nb, &cur, i);
             }
             for (eidx, nbr) in expand(graph, ctx, endpoint[i], rel.direction, rel.label.as_ref()) {
-                if !matches_label(graph, ctx, nbr, node.label.as_ref()) {
+                if !seg_edge_accepts(
+                    graph, ctx, seg, eidx, nbr, need_bind, rel_check, node_check, &mut nb,
+                ) {
                     continue;
-                }
-                if need_bind {
-                    if let Some(s) = rel.var_slot {
-                        nb.set(s, Val::Edge(eidx));
-                    }
-                    if let Some(s) = node.var_slot {
-                        nb.set(s, Val::Node(nbr));
-                    }
-                    if rel_check
-                        && !satisfies(
-                            graph,
-                            ctx,
-                            &Val::Edge(eidx),
-                            &rel.props,
-                            rel.where_.as_ref(),
-                            &nb,
-                        )
-                    {
-                        continue;
-                    }
-                    if node_check
-                        && !satisfies(
-                            graph,
-                            ctx,
-                            &Val::Node(nbr),
-                            &node.props,
-                            node.where_.as_ref(),
-                            &nb,
-                        )
-                    {
-                        continue;
-                    }
                 }
                 for s in 0..width {
                     if Some(s) == rel.var_slot {
@@ -9284,40 +9314,10 @@ fn expand_frame_optional(
         }
         let mut matched = false;
         for (eidx, nbr) in expand(graph, ctx, start_ids[i], rel.direction, rel.label.as_ref()) {
-            if !matches_label(graph, ctx, nbr, node.label.as_ref()) {
+            if !seg_edge_accepts(
+                graph, ctx, seg, eidx, nbr, need_bind, rel_check, node_check, &mut nb,
+            ) {
                 continue;
-            }
-            if need_bind {
-                if let Some(s) = rel.var_slot {
-                    nb.set(s, Val::Edge(eidx));
-                }
-                if let Some(s) = node.var_slot {
-                    nb.set(s, Val::Node(nbr));
-                }
-                if rel_check
-                    && !satisfies(
-                        graph,
-                        ctx,
-                        &Val::Edge(eidx),
-                        &rel.props,
-                        rel.where_.as_ref(),
-                        &nb,
-                    )
-                {
-                    continue;
-                }
-                if node_check
-                    && !satisfies(
-                        graph,
-                        ctx,
-                        &Val::Node(nbr),
-                        &node.props,
-                        node.where_.as_ref(),
-                        &nb,
-                    )
-                {
-                    continue;
-                }
             }
             push(&mut out, i, &Val::Edge(eidx), &Val::Node(nbr));
             nrows += 1;
