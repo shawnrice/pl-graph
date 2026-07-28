@@ -707,4 +707,20 @@ suite('graph-algorithm differential: neighborAggregate (TS core vs native)', () 
       "CALL neighbor_aggregate({feature:'h', op:'mean', direction:'both'}) YIELD node, vector RETURN node, vector ORDER BY node";
     expect(JSON.stringify(tsQuery(tsGraph, call))).toBe(JSON.stringify(nativeGraph.query(call)));
   });
+
+  // The CALL config-key allowlist must accept `norm` (and `weightProperty`) on BOTH
+  // engines — a native-only allowlist would reject the documented GCN recipe via GQL even
+  // though the method form works. Guards the exact gap that shipped `norm` to native's
+  // CONFIG_KEYS but not the TS mirror.
+  test('CALL neighbor_aggregate accepts norm:gcn / weightProperty, byte-identical', async () => {
+    for (const cfg of [
+      "{feature:'h', op:'sum', direction:'both', includeSelf:true, norm:'gcn'}",
+      "{feature:'h', op:'mean', direction:'out', weightProperty:'w'}",
+    ]) {
+      const call = `CALL neighbor_aggregate(${cfg}) YIELD node, vector RETURN node, vector ORDER BY node`;
+      expect(JSON.stringify(tsQuery(tsGraph, call)), call).toBe(
+        JSON.stringify(nativeGraph.query(call)),
+      );
+    }
+  });
 });

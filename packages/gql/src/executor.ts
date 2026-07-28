@@ -6307,6 +6307,7 @@ const ALGO_CONFIG_TYPES: ReadonlyArray<
   ['feature', 'string'],
   ['op', 'string'],
   ['includeSelf', 'boolean'],
+  ['norm', 'string'],
 ];
 
 /** Case-insensitive Levenshtein edit distance — a plain DP over code points,

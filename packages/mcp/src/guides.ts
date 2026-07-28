@@ -263,12 +263,14 @@ CALL degree() RETURN node.name AS n, degree                        -- YIELD-less
 
 Algorithms: \`degree\`, \`pagerank\`, \`personalizedPagerank\`, \`connectedComponents\`, \`stronglyConnectedComponents\`, \`labelPropagation\`, \`peerPressure\`, \`betweenness\`, \`closeness\`, \`shortestPath\`, \`onCycle\`, \`neighborAggregate\`. Each yields \`{ node, <result> }\` rows in vertex order.
 
-**Config** (all optional): \`direction\` ('out'|'in'|'both'), \`edgeLabel\`, \`weightProperty\`, \`dampingFactor\`, \`iterations\`, \`pivots\` (approximate betweenness), \`seedProperty\` (label propagation), \`source\`/\`target\` + \`algorithm\` ('dijkstra'|'astar') + \`heuristicProperty\` (shortest path), \`sourceNodes\` (personalized PageRank), \`writeProperty\` (write the result onto each vertex), and \`feature\` + \`op\` ('mean'|'sum'|'max'|'min') + \`includeSelf\` (neighborAggregate).
+**Config** (all optional): \`direction\` ('out'|'in'|'both'), \`edgeLabel\`, \`weightProperty\`, \`dampingFactor\`, \`iterations\`, \`pivots\` (approximate betweenness), \`seedProperty\` (label propagation), \`source\`/\`target\` + \`algorithm\` ('dijkstra'|'astar') + \`heuristicProperty\` (shortest path), \`sourceNodes\` (personalized PageRank), \`writeProperty\` (write the result onto each vertex), and \`feature\` + \`op\` ('mean'|'sum'|'max'|'min') + \`includeSelf\` + \`weightProperty\` + \`norm\` ('none'|'gcn') (neighborAggregate).
 
-**neighborAggregate** is the message-passing / feature-propagation primitive: for each vertex it aggregates its neighbors' list-valued \`feature\` vector element-wise, in one pass — useful for GNN-style feature engineering.
+Reserved-word footgun: \`writeProperty\` names a property, so avoid GQL keywords — \`closeness({writeProperty:'close'})\` writes but \`n.close\` won't parse; use \`closeness_c\` or quote \`n.\\\`close\\\`\`.
+
+**neighborAggregate** is the message-passing / feature-propagation primitive: for each vertex it aggregates its neighbors' list-valued \`feature\` vector element-wise, in one pass — the GNN / graph-convolution layer. \`weightProperty\` scales each contributor by its edge weight (weighted sum/mean); \`norm:'gcn'\` applies the symmetric GCN factor \`1/sqrt(deg_i·deg_j)\` and composes with the weight. Standard GCN = \`{op:'sum', direction:'both', includeSelf:true, norm:'gcn'}\`. Vector \`writeProperty\` values egress as a real Arrow \`FixedSizeList<Float64>\`.
 \`\`\`
 MATCH (n:Account) SET n.h = [n.r0, n.r1, n.r2]            -- pack scalar features into a vector
-CALL neighbor_aggregate({ feature: 'h', op: 'mean', direction: 'both', writeProperty: 'h1' }) YIELD node RETURN node
+CALL neighbor_aggregate({ feature: 'h', op: 'sum', direction: 'both', includeSelf: true, norm: 'gcn', writeProperty: 'h1' }) YIELD node RETURN node
 \`\`\``,
 };
 
@@ -518,13 +520,13 @@ RETURN a.id, b.id, c.id
 \`\`\`
 
 ## Cycles
-On a dense graph, strongly-connected components collapse into one giant component, so filter by component **size** rather than treating membership as the signal:
+On a dense graph, strongly-connected components collapse into one giant component, so filter by component **size** rather than treating membership as the signal (note: \`size\` is a reserved word, so alias the count as \`csize\` — or quote it \`\\\`size\\\`\`):
 \`\`\`
 CALL strongly_connected_components() YIELD node, componentId
-WITH componentId, count(*) AS size WHERE size > 1
-RETURN componentId, size ORDER BY size DESC
+WITH componentId, count(*) AS csize WHERE csize > 1
+RETURN componentId, csize ORDER BY csize DESC
 \`\`\`
-\`CALL on_cycle()\` gives per-vertex cycle membership. For money-cycle detection, anchor on time and amount as well as structure.
+\`CALL on_cycle()\` gives per-vertex cycle membership — but on a dense graph nearly every node sits on *some* cycle, so raw membership is a near-useless signal by itself; anchor on time and amount as well as structure for money-cycle detection.
 
 ## Fan-in / structuring
 Many transfers just under a threshold flowing into one account:

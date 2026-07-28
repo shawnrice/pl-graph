@@ -1158,6 +1158,7 @@ fn apply_algo_config(
         "feature" => cfg.feature = Some(want_str(v)?),
         "op" => cfg.op = Some(want_str(v)?),
         "includeSelf" => cfg.include_self = Some(want_bool(v)?),
+        "norm" => cfg.norm = Some(want_str(v)?),
         _ => {
             return Err(err(match crate::algo::suggest_config_key(field) {
                 Some(s) => format!("unknown config key '{field}' (did you mean '{s}'?)"),

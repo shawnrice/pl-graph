@@ -2256,6 +2256,38 @@ fn call_config_key_validation() {
     );
 }
 
+/// `neighborAggregate`'s `norm` (and `weightProperty`) must be accepted via GQL `CALL`,
+/// not only via the direct-method API — the CALL path has its OWN config-key mapping.
+/// Regression guard: `norm` shipped to the algorithm + `CONFIG_KEYS` but was initially
+/// missing from the `CALL` mapper, so the documented GCN recipe faulted through GQL.
+#[test]
+fn call_neighbor_aggregate_accepts_norm_and_weight() {
+    // a[1,2]↔b[3,4] via one edge; `both` + includeSelf + gcn → degree 2 each → coef 1/2 →
+    // sum = ½([1,2]+[3,4]) = [2,3] for both.
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a","h":[1.0,2.0]}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b","h":[3.0,4.0]}}"#,
+        r#"{"type":"edge","from":"a","to":"b","labels":["R"],"properties":{"w":2.0}}"#,
+    ]);
+    assert_eq!(
+        rows(
+            &mut g,
+            "CALL neighbor_aggregate({feature:'h', op:'sum', direction:'both', includeSelf:true, norm:'gcn'}) \
+             YIELD node, vector RETURN vector ORDER BY node",
+        ),
+        vec![
+            vec![Value::List(vec![n(2.0), n(3.0)])],
+            vec![Value::List(vec![n(2.0), n(3.0)])],
+        ],
+    );
+    // `weightProperty` is likewise accepted through CALL (no fault).
+    rows(
+        &mut g,
+        "CALL neighbor_aggregate({feature:'h', op:'mean', direction:'out', weightProperty:'w'}) \
+         YIELD node RETURN count(*) AS c",
+    );
+}
+
 #[test]
 fn unknown_function_errors_even_over_empty_input_and_dead_branches() {
     // The fault is raised EAGERLY off the plan's `unknown_fns`, before the first

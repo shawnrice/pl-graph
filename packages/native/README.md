@@ -48,6 +48,21 @@ const backend = await createWasmBackend(fetch('/lenke_core.wasm'));
 const g = graphFromNdjson(backend, ndjsonBytes);
 ```
 
+## Guides, recipes & query patterns
+
+`g.query(...)` speaks **ISO GQL** (ISO/IEC 39075:2024 — not Cypher). For the query
+language itself, worked recipes, and the graph-algorithm / graph-ML surface, see:
+
+- **[`docs/guides/`](../../docs/guides/index.md)** — the canonical guides, including
+  [`algorithms.md`](../../docs/guides/algorithms.md) (PageRank, components, centrality,
+  and **`neighborAggregate`** message passing with edge weights + GCN normalization).
+- **The `@lenke/mcp` how-to guides** ([`packages/mcp/src/guides.ts`](../../packages/mcp/src/guides.ts)) —
+  a growing cookbook: writing GQL, temporal queries, Arrow egress, and a **Recipes**
+  guide (per-hop path predicates over quantified paths, fan-in/structuring, cycles,
+  subgraph explanation) plus a **graph-ml** guide. AI coding assistants get these
+  automatically through the `@lenke/mcp` server; humans can read them as source or via
+  the MCP `how_to` tool.
+
 ## Loading a backend
 
 The entry point (`@lenke/native`) is environment-neutral: it exports the `RustGraph` facade, the graph constructors, and the reactive store. The backend itself comes from a subpath:

@@ -19,12 +19,47 @@ The same computation is reachable from **four surfaces**. Pick the one that fits
 | `shortestPath`                | `{ node, distance }`    | Shortest path from `source` (BFS / Dijkstra / A\*).             |
 | `betweenness`                 | `{ node, centrality }`  | Brokerage — how often a node lies on shortest paths.            |
 | `closeness`                   | `{ node, centrality }`  | Reciprocal of total distance to reachable nodes.                |
+| `neighborAggregate`           | `{ node, vector }`      | GNN message passing: aggregate neighbors' feature vectors.      |
 
-The shared `config` object (all fields optional) carries `edgeLabel`, `direction` (`'out' | 'in'`), `weightProperty`, `dampingFactor`, `iterations`, `source`/`target`, `writeProperty`, and a few algorithm-specific knobs: `sourceNodes` (personalized-PageRank seed set), `pivots` (approximate betweenness — see below), and `seedProperty` (label-propagation anchors — a vertex carrying a non-null value for that key keeps its own label, so communities form around seeds instead of collapsing on a hubby graph). It is portable _verbatim_ across the four surfaces below.
+The shared `config` object (all fields optional) carries `edgeLabel`, `direction` (`'out' | 'in' | 'both'`), `weightProperty`, `dampingFactor`, `iterations`, `source`/`target`, `writeProperty`, and a few algorithm-specific knobs: `sourceNodes` (personalized-PageRank seed set), `pivots` (approximate betweenness — see below), `seedProperty` (label-propagation anchors — a vertex carrying a non-null value for that key keeps its own label, so communities form around seeds instead of collapsing on a hubby graph), and `feature`/`op`/`includeSelf`/`norm` (`neighborAggregate` — see below). It is portable _verbatim_ across the four surfaces below.
+
+> **Reserved-word footgun on `writeProperty`.** The result is written back as a property, so pick a name that isn't a GQL reserved word — `closeness({ writeProperty: 'close' })` writes fine, but reading it back as `n.close` is `E_SYNTAX` (`close` is reserved). Use a safe name (`closeness_c`, `cc`) or quote it with backticks (`` n.`close` ``). Same for `size`, `count`, etc.
 
 > **Centrality cost — exact vs approximate.** `betweenness` (Brandes' algorithm) and `closeness` are exact and byte-identical across engines, but **O(V·E)** — every node runs a full traversal. Fine for thousands of nodes; past ~100k, pass `betweenness({ pivots: k })` for an **approximate** run — Brandes from a deterministic evenly-spaced sample of `k` sources scaled by `|V|/k`, so it's O(pivots·E) and still byte-identical across engines (`pivots >= |V|` is exact). `betweenness`/`closeness` are directed and unnormalized (`closeness = 1 / Σ distance`, 0 when nothing is reachable).
 >
 > **Memory sizing.** A whole-graph algorithm allocates per-vertex working state on top of the resident graph, so peak RSS during a run is roughly **~2× the resident graph** (budget ≈760 B/element resident as a rough guide). A ~30M-element graph therefore wants ~40+ GB to run centrality/PageRank comfortably; size the host accordingly, or fan the work out (per-component, or the `pivots` sample for betweenness) when the graph doesn't fit ~2× in RAM.
+
+### `neighborAggregate` — message passing / GNN feature engineering
+
+For each vertex, aggregate its neighbors' **list-valued** `feature` vectors element-wise over the whole `D`-dim block in one native pass — the message-passing / graph-convolution primitive, instead of `D` separate GQL `SET`s. It returns `{ node, vector }` rows (and, with `writeProperty`, writes the aggregated list back onto each vertex, so a downstream query or a second layer can read it — vector properties egress as a real Arrow `FixedSizeList<Float64>`, see the Arrow guide).
+
+Config (beyond `feature`, `edgeLabel`, `direction`, `writeProperty`):
+
+| key              | values                                     | meaning                                                                                                                                                                   |
+| ---------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `feature`        | property key (**required**)                | Each vertex's list-of-numbers feature vector (all vertices must share the dimension).                                                                                     |
+| `op`             | `'mean'` (default) `'sum'` `'max'` `'min'` | Element-wise reduction over contributors.                                                                                                                                 |
+| `direction`      | `'out'` `'in'` `'both'` (default)          | Which neighbors contribute.                                                                                                                                               |
+| `includeSelf`    | `false` (default) / `true`                 | Fold the vertex's own vector in too (the GCN self-loop).                                                                                                                  |
+| `weightProperty` | numeric edge property                      | **Weighted** aggregation: contributor `j` is scaled by its edge weight (weighted `mean` divides by Σ weights). `sum`/`mean` only.                                         |
+| `norm`           | `'none'` (default) `'gcn'`                 | **GCN symmetric normalization**: contributor `j` of `i` scaled by `1/sqrt(deg_i·deg_j)`. Composes with `weightProperty` (coefficient = weight × norm). `sum`/`mean` only. |
+
+A `weightProperty`/`norm` is rejected for `max`/`min` (scale-independent). Standard GCN = `{ op: 'sum', direction: 'both', includeSelf: true, norm: 'gcn' }`. Byte-identical across engines (fixed edge-index accumulation order; integer degrees make the `1/sqrt(deg_i·deg_j)` match bit for bit).
+
+```ts
+// One GCN-style message-passing layer, written back for the next layer / egress.
+await neighborAggregate(
+  {
+    feature: 'h',
+    op: 'sum',
+    direction: 'both',
+    includeSelf: true,
+    norm: 'gcn',
+    writeProperty: 'h1',
+  },
+  g,
+);
+```
 
 ## Surface 1 — `@lenke/core` async free functions
 
