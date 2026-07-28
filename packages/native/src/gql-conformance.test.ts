@@ -1226,6 +1226,49 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     }
   });
 
+  // NESTED quantifiers `( … {a,b} … ){n,m}` — the outer repetition repeats an inner
+  // variable-length sub-walk (the pushdown matcher's `Sub` path). Byte-identical.
+  test('nested quantifiers (TS vs native)', () => {
+    const CHAIN = [
+      '{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}',
+      '{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}',
+      '{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}',
+      '{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}',
+      '{"type":"node","id":"e","labels":["N"],"properties":{"id":"e"}}',
+      '{"type":"edge","from":"a","to":"b","labels":["R"],"properties":{}}',
+      '{"type":"edge","from":"b","to":"c","labels":["R"],"properties":{}}',
+      '{"type":"edge","from":"c","to":"d","labels":["R"],"properties":{}}',
+      '{"type":"edge","from":"d","to":"e","labels":["R"],"properties":{}}',
+    ].join('\n');
+    const nat = graphFromFormat(backend, CHAIN, 'ndjson');
+    const ts = tsDeserialize(CHAIN, 'ndjson', new Graph());
+
+    for (const q of [
+      "MATCH (s:N {id:'a'}) ( ()-[:R]->{1,3}() ){1} (t) RETURN t.id AS id ORDER BY id",
+      "MATCH (s:N {id:'a'}) ( ()-[:R]->{1,2}() ){2} (t) RETURN t.id AS id ORDER BY id",
+      "MATCH (s:N {id:'a'}) ( ()-[:R]->()-[:R]->{1,2}() ){1} (t) RETURN t.id AS id ORDER BY id",
+      // count(*) form (per-trail multiplicity).
+      "MATCH (s:N {id:'a'}) ( ()-[:R]->{1,2}() ){1,2} (t) RETURN count(*) AS c",
+      // Nested under a path mode.
+      "MATCH ACYCLIC (s:N {id:'a'}) ( ()-[:R]->{1,2}() ){2} (t) RETURN t.id AS id ORDER BY id",
+    ]) {
+      expect(JSON.stringify(nat.query(q)), q).toBe(JSON.stringify(tsQuery(ts, q)));
+    }
+
+    // The v1 rejections are identical on both engines.
+    const code = (fn: () => void): unknown => {
+      try {
+        fn();
+      } catch (e) {
+        return (e as { code?: unknown }).code;
+      }
+
+      return 'ok';
+    };
+    const bad = 'MATCH (s) ( (x)-[:R]->{1,2}(m) ){2} (t) RETURN t';
+    expect(code(() => nat.query(bad))).toBe(code(() => tsQuery(ts, bad)));
+  });
+
   // The fused matcher marks PER HOP, so ACYCLIC/SIMPLE forbid a multi-element unit from
   // repeating a vertex INTERNALLY (a self-loop `s→p, p→p` revisits p within one unit).
   // Both engines must agree: TRAIL keeps it (distinct edges), ACYCLIC/SIMPLE reject it.

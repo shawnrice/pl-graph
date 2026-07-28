@@ -674,6 +674,8 @@ export const parse = (
     }
 
     const rel = parseRel();
+    // A NESTED quantifier on the first inner hop (`-[e]->{a,b}`).
+    const innerQ = parseQuantifier();
     const hopTo = parseNode(); // first inner target (m / y)
 
     // Additional hops → a MULTI-element repetition unit `(x)-[e1]->(m)-[e2]->(y)`.
@@ -681,8 +683,10 @@ export const parse = (
 
     while (startsRelationship()) {
       const r = parseRel();
+      // A nested quantifier on this inner hop lives on its own `rel.quantifier`.
+      const rq = parseQuantifier();
       const n = parseNode();
-      unitRest.push({ rel: r, node: n });
+      unitRest.push({ rel: { ...r, quantifier: rq }, node: n });
     }
 
     // Inner nodes carry only a variable — put per-hop label/property tests in the
@@ -697,9 +701,39 @@ export const parse = (
       }
     }
 
+    // A NESTED repetition (`( … {a,b} … ){n,m}`) — v1 supports endpoint enumeration
+    // only: no group variables and no WHERE inside it. Reject loudly (mirrors native).
+    const nested = innerQ !== undefined || unitRest.some((s) => s.rel.quantifier !== undefined);
+
+    if (nested) {
+      const bound =
+        hopFrom.variable !== undefined ||
+        hopTo.variable !== undefined ||
+        rel.variable !== undefined ||
+        rel.where !== undefined ||
+        unitRest.some(
+          (s) =>
+            s.node.variable !== undefined ||
+            s.rel.variable !== undefined ||
+            s.rel.where !== undefined,
+        );
+
+      if (bound) {
+        throw new GqlSyntaxError(
+          'group variables / WHERE inside a nested quantifier (`( … {a,b} … ){n,m}`) ' +
+            'are not yet supported — use anonymous nodes and edges',
+          open,
+        );
+      }
+    }
+
     let { where } = rel;
 
     if (checkKeyword('where')) {
+      if (nested) {
+        throw new GqlSyntaxError('a WHERE on a nested quantifier is not yet supported', peek().pos);
+      }
+
       advance();
       const cond = parseExpr();
       where = where ? { kind: 'and', items: [where, cond] } : cond;
@@ -715,7 +749,14 @@ export const parse = (
     // Optional following endpoint `(b)`; else an anonymous synthetic endpoint.
     const node = check('lparen') ? parseNode() : {};
 
-    return { rel: { ...rel, where, quantifier }, node, hopFrom, hopTo, unitRest };
+    return {
+      rel: { ...rel, where, quantifier },
+      node,
+      hopFrom,
+      hopTo,
+      unitRest,
+      ...(innerQ !== undefined ? { innerQ } : {}),
+    };
   };
 
   // Variable-length quantifier following an edge: `*`, `+`, `{n}`, `{n,m}`,

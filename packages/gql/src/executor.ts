@@ -38,6 +38,7 @@ import type {
   PathSelector,
   Projection,
   PropertyConstraint,
+  Quantifier,
   Query,
   RelPattern,
   Segment,
@@ -3029,17 +3030,31 @@ type CRel = {
   quantifier?: RelPattern['quantifier'];
 };
 /** One hop of a repetition unit: traverse `rel`, land on `targetVar` (a group var). */
-type CUnitHop = { rel: CRel; targetVar?: string };
+type CHop = { rel: CRel; targetVar?: string };
+/** A nested quantified sub-unit — the general `( … ){a,b}` nesting. `max` is `null`
+ *  for an unbounded `*`/`+`/`{n,}`. Mirrors native `CSub`. */
+type CSub = { unit: CUnit; min: number; max: number | null };
+/** One element of a unit: a single hop, or a nested quantified sub-unit. Mirrors
+ *  native `CElem`. */
+type CElem = { hop: CHop } | { sub: CSub };
 /**
- * A quantified parenthesized subpath compiled to a repetition UNIT: a fixed linear
- * sub-path of `k` hops repeated `[min, max]` times. `startVar` is the source `(x)`
- * group var; each hop's `targetVar` is an intermediate/target group var; `where` is
- * the per-repetition predicate, evaluated once every inner variable is bound (so it
- * can span all `k` hops). A single-edge subpath is a one-hop unit — the same shape,
- * `k = 1`. Mirrors native `CUnit`.
+ * A quantified parenthesized subpath compiled to a repetition UNIT: a linear element
+ * sequence repeated `[min, max]` times. `startVar` is the source `(x)` group var; a
+ * hop's `targetVar` is an intermediate/target group var; `where` is the per-repetition
+ * predicate. Elements may be nested quantified sub-units. Mirrors native `CUnit`.
  */
-type CUnit = { hops: readonly CUnitHop[]; startVar?: string; where?: CompiledExpr };
+type CUnit = { elems: readonly CElem[]; startVar?: string; where?: CompiledExpr };
 type CSegment = { rel: CRel; node: CNode; unit?: CUnit };
+
+/** Whether a unit binds any GROUP variable (source, an edge, a target, or anything a
+ *  nested sub-unit binds). Mirrors native `CUnit::exposes`. */
+const unitExposes = (u: CUnit): boolean =>
+  u.startVar !== undefined ||
+  u.elems.some((e) =>
+    'hop' in e
+      ? e.hop.targetVar !== undefined || e.hop.rel.variable !== undefined
+      : unitExposes(e.sub.unit),
+  );
 type CPath = {
   start: CNode;
   segments: readonly CSegment[];
@@ -3254,7 +3269,7 @@ const compilePath = (pattern: PathPattern): CPath => {
 
   return {
     start: compileNode(pattern.start),
-    segments: pattern.segments.map(({ rel, node, hopFrom, hopTo, unitRest }) => {
+    segments: pattern.segments.map(({ rel, node, hopFrom, hopTo, unitRest, innerQ }) => {
       const crel = compileRel(rel);
 
       if (hopFrom === undefined) {
@@ -3262,22 +3277,26 @@ const compilePath = (pattern: PathPattern): CPath => {
         return { rel: crel, node: compileNode(node) };
       }
 
-      // A quantified parenthesized subpath compiles to a UNIT. Every hop's `WHERE`
-      // (the subpath predicate the parser merged onto the first hop, plus any inline
-      // `-[e WHERE …]->` on a later hop) is lifted to the unit level and AND-ed, so it
-      // is checked once — after all `k` hops are bound (letting it span the whole
-      // unit) — and stripped from the hops, whose predicate keeps only inline props.
-      // `node` is the separate outer endpoint. Folding at the AST level reuses the
-      // exact three-valued `and` semantics; mirrors native `plan::segment`.
-      const astHops: { rel: RelPattern; targetVar?: string }[] = [
-        { rel, ...(hopTo?.variable !== undefined ? { targetVar: hopTo.variable } : {}) },
+      // A quantified parenthesized subpath compiles to a UNIT. Each inner hop is a
+      // plain hop, OR a nested single-edge `Sub` when it carries its own quantifier
+      // (`-[e]->{a,b}` — the general nesting). The first hop's nested quantifier is
+      // `innerQ`; later hops carry theirs on `rel.quantifier`. Every hop's WHERE is
+      // lifted to the unit level and AND-ed (nested units have none — rejected at
+      // parse). `node` is the separate outer endpoint. Mirrors native `plan::segment`.
+      const astElems: { rel: RelPattern; targetVar?: string; q?: Quantifier }[] = [
+        {
+          rel,
+          ...(hopTo?.variable !== undefined ? { targetVar: hopTo.variable } : {}),
+          ...(innerQ !== undefined ? { q: innerQ } : {}),
+        },
         ...(unitRest ?? []).map((extra) => ({
           rel: extra.rel,
           ...(extra.node.variable !== undefined ? { targetVar: extra.node.variable } : {}),
+          ...(extra.rel.quantifier !== undefined ? { q: extra.rel.quantifier } : {}),
         })),
       ];
 
-      const whereExprs = astHops.map((h) => h.rel.where).filter((w): w is Expr => w !== undefined);
+      const whereExprs = astElems.map((h) => h.rel.where).filter((w): w is Expr => w !== undefined);
       let unitWhere: Expr | undefined;
 
       if (whereExprs.length === 1) {
@@ -3286,13 +3305,21 @@ const compilePath = (pattern: PathPattern): CPath => {
         unitWhere = { kind: 'and', items: whereExprs };
       }
 
-      const hops: CUnitHop[] = astHops.map((h) => ({
-        rel: compileRel({ ...h.rel, where: undefined }),
-        ...(h.targetVar !== undefined ? { targetVar: h.targetVar } : {}),
-      }));
+      const hopOrSub = (h: { rel: RelPattern; targetVar?: string; q?: Quantifier }): CElem => {
+        const chop: CHop = {
+          rel: compileRel({ ...h.rel, where: undefined, quantifier: undefined }),
+          ...(h.targetVar !== undefined ? { targetVar: h.targetVar } : {}),
+        };
+
+        if (h.q === undefined) {
+          return { hop: chop };
+        }
+
+        return { sub: { unit: { elems: [{ hop: chop }] }, min: h.q.min, max: h.q.max ?? null } };
+      };
 
       const unit: CUnit = {
-        hops,
+        elems: astElems.map(hopOrSub),
         ...(hopFrom.variable !== undefined ? { startVar: hopFrom.variable } : {}),
         ...(unitWhere !== undefined ? { where: compileExpr(unitWhere) } : {}),
       };
@@ -4094,6 +4121,18 @@ const shortestKWalk = function* (
  *  is exposed as the LIST of that position's value across every repetition
  *  (`verts[rep*k + p]` / `edges[rep*k + p]`). A one-hop unit (`k = 1`) collapses to
  *  `x = verts[..last]`, `y = verts[1..]`, `e = edges`. Mirrors native `bind_group_vars`. */
+/** A unit element as a hop — the linear (group-var / WHERE) paths only see all-`Hop`
+ *  units; a nested `Sub` is handled by the pushdown, not here. Mirrors native `hop()`. */
+const asHop = (e: CElem): CHop => {
+  if ('hop' in e) {
+    return e.hop;
+  }
+
+  throw new LenkeError('nested sub-unit reached the linear matcher', {
+    code: ErrorCode.NotImplemented,
+  });
+};
+
 const bindGroupVars = (
   binding: Binding,
   unit: CUnit,
@@ -4101,12 +4140,12 @@ const bindGroupVars = (
   edges: readonly Edge[],
 ): Binding => {
   const next = new Map(binding);
-  const k = unit.hops.length;
+  const k = unit.elems.length;
   const reps = k === 0 ? 0 : Math.floor(edges.length / k);
 
   // Node positions 0..=k: the unit source, then each hop's target.
   for (let p = 0; p <= k; p += 1) {
-    const varName = p === 0 ? unit.startVar : unit.hops[p - 1].targetVar;
+    const varName = p === 0 ? unit.startVar : asHop(unit.elems[p - 1]).targetVar;
 
     if (varName !== undefined) {
       const list: Vertex[] = [];
@@ -4121,7 +4160,7 @@ const bindGroupVars = (
 
   // Edge positions 0..k: each hop's edge.
   for (let p = 0; p < k; p += 1) {
-    const varName = unit.hops[p].rel.variable;
+    const varName = asHop(unit.elems[p]).rel.variable;
 
     if (varName !== undefined) {
       const list: Edge[] = [];
@@ -4153,13 +4192,14 @@ const unitWherePasses = (
     return true;
   }
 
-  const k = unit.hops.length;
+  const k = unit.elems.length;
   let wb = withBinding(env.binding, unit.startVar, frames[base].vertex);
 
   for (let j = 0; j < k; j += 1) {
     const e = j + 1 < k ? frames[base + j + 1].entryEdge! : edge;
     const t = j + 1 < k ? frames[base + j + 1].vertex : nbr;
-    wb = withBinding(withBinding(wb, unit.hops[j].rel.variable, e), unit.hops[j].targetVar, t);
+    const hop = asHop(unit.elems[j]);
+    wb = withBinding(withBinding(wb, hop.rel.variable, e), hop.targetVar, t);
   }
 
   return unit.where({ ...env, binding: wb }) === true;
@@ -4199,18 +4239,128 @@ const hopCollides = (
   return false;
 };
 
+// Stable ids for the epsilon-cycle visited-set in `resolve` (a min-0 nested unit can
+// loop through the same position without consuming an edge).
+const unitIdMap = new WeakMap<object, number>();
+let unitIdNext = 0;
+const unitId = (u: CUnit): number => {
+  let id = unitIdMap.get(u);
+
+  if (id === undefined) {
+    id = unitIdNext;
+    unitIdNext += 1;
+    unitIdMap.set(u, id);
+  }
+
+  return id;
+};
+
+// A loop cursor + a pattern position (a cursor stack, innermost last). TS keeps the
+// simple `Cursor[]` form (the native engine's `Flat`/`Deep` split is a hot-path
+// optimization; this is the reference impl).
+type Cursor = { unit: CUnit; min: number; max: number | null; rep: number; elem: number };
+type HopMove = { rel: CRel; after: Cursor[] };
+
+/** Follow epsilon moves (enter a sub / close a nested unit / repeat) from `start`,
+ *  collecting whether the TOP unit accepts here (emit) and every graph-consuming hop
+ *  reachable. A visited set breaks min-0 epsilon cycles. Mirrors native `resolve`. */
+const resolve = (start: Cursor[]): { emit: boolean; moves: HopMove[] } => {
+  let emit = false;
+  const moves: HopMove[] = [];
+  const work: Cursor[][] = [start];
+  const seen = new Set<string>();
+
+  while (work.length > 0) {
+    const p = work.pop()!;
+    const key = p.map((c) => `${unitId(c.unit)}:${c.rep}:${c.elem}`).join(';');
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    const top = p[p.length - 1];
+
+    if (top.elem < top.unit.elems.length) {
+      const el = top.unit.elems[top.elem];
+
+      if ('hop' in el) {
+        const after = p.map((c) => ({ ...c }));
+        after[after.length - 1].elem += 1;
+        moves.push({ rel: el.hop.rel, after });
+      } else {
+        const enter = p.map((c) => ({ ...c }));
+        enter.push({ unit: el.sub.unit, min: el.sub.min, max: el.sub.max, rep: 0, elem: 0 });
+        work.push(enter);
+
+        if (el.sub.min === 0) {
+          const bypass = p.map((c) => ({ ...c }));
+          bypass[bypass.length - 1].elem += 1;
+          work.push(bypass);
+        }
+      }
+    } else {
+      const rep2 = top.rep + 1;
+
+      if (rep2 >= top.min) {
+        if (p.length === 1) {
+          emit = true;
+        } else {
+          const close = p.map((c) => ({ ...c }));
+          close.pop();
+          close[close.length - 1].elem += 1;
+          work.push(close);
+        }
+      }
+
+      if (top.max === null || rep2 < top.max) {
+        const again = p.map((c) => ({ ...c }));
+        again[again.length - 1] = { ...again[again.length - 1], rep: rep2, elem: 0 };
+        work.push(again);
+      }
+    }
+  }
+
+  return { emit, moves };
+};
+
+/** A hop's out-edges materialized and filtered by its inline predicate. Mirrors native
+ *  `expand_filtered`. */
+const expandFilteredArr = (
+  graph: Graph,
+  v: Vertex,
+  rel: CRel,
+  binding: Binding,
+  params: Params,
+): { edge: Edge; node: Vertex }[] => {
+  const hasPred = rel.pred.props.length > 0 || rel.pred.where !== undefined;
+  const out: { edge: Edge; node: Vertex }[] = [];
+
+  for (const step of expand(graph, v, rel)) {
+    if (hasPred) {
+      const eb = withBinding(binding, rel.variable, step.edge);
+
+      if (!satisfies(step.edge, rel.pred, eb, params, graph)) {
+        continue;
+      }
+    }
+
+    out.push(step);
+  }
+
+  return out;
+};
+
 /**
- * The single, LAZY repetition matcher: repeat `unit` (a `k`-hop sub-path) from
- * `from`, yielding each trail end in [min, max] REPETITIONS. The stack holds one frame
- * per hop of the CURRENT path only — never the `d^k` traversals from a vertex — so
- * memory is O(path length). Each frame records which hop within the unit it expands
- * (`pos`) and how many whole repetitions precede it (`reps`); the per-unit `WHERE`, the
- * emit, and the repetition count happen every `k`-th hop. Marks are applied PER HOP, so
- * ACYCLIC/SIMPLE also forbid a unit repeating a vertex internally (the correct reading).
- * A one-hop unit reduces to the single-edge walk. The consumer owns any group-variable
- * exposure — this matcher only reconstructs the walk under `wantPath`. Mirrors native
- * `reachable_each_unit`. A generator suspends on consumer-stop, so the mark set needs no
- * explicit stop cleanup.
+ * The GENERAL repetition matcher: repeat `unit` from `from`, yielding each trail end in
+ * [min, max] REPETITIONS. `unit`'s elements are hops OR nested quantified sub-units, so
+ * this is ONE matcher for every var-length shape. A single, LAZY, explicit-stack
+ * pushdown DFS — one frame per hop of the CURRENT path (O(path length), no d^k buffer).
+ * A frame's pattern position is a cursor stack; `resolve` follows the epsilon moves to
+ * the reachable hops. TRAIL/SIMPLE/ACYCLIC/WALK restrictors are applied PER HOP. The
+ * consumer owns group-variable exposure — this only reconstructs under `wantPath`. A
+ * generator suspends on consumer-stop, so the mark set needs no explicit stop cleanup.
+ * Mirrors native `reachable_each_unit`.
  */
 const trailEndsUnit = function* (
   graph: Graph,
@@ -4220,12 +4370,6 @@ const trailEndsUnit = function* (
   opts: { mode: PathMode; binding: Binding; params: Params; wantPath?: boolean },
 ): Iterable<TrailEnd> {
   const { mode, binding, params, wantPath = false } = opts;
-  const k = unit.hops.length;
-
-  if (q.min === 0) {
-    yield { end: from, verts: wantPath ? [from] : [], edges: [] };
-  }
-
   const vertexMode = mode === 'simple' || mode === 'acyclic';
   const marks = new Set<Edge | Vertex>();
 
@@ -4234,25 +4378,34 @@ const trailEndsUnit = function* (
   }
 
   let steps = 0;
+  const hasWhere = unit.where !== undefined;
+
+  // The top unit's `min == 0` zero-rep acceptance — the empty walk at the seed.
+  if (q.min === 0) {
+    yield { end: from, verts: wantPath ? [from] : [], edges: [] };
+  }
 
   type Frame = {
-    iter: Iterator<{ edge: Edge; node: Vertex }>;
-    // The hop within the current unit this frame expands (`0..k`).
-    pos: number;
-    // Whole repetitions completed before this frame's unit boundary.
-    reps: number;
     vertex: Vertex;
+    moves: HopMove[];
+    moveIdx: number;
+    edges: { edge: Edge; node: Vertex }[];
+    edgeIdx: number;
     entryEdge: Edge | null;
-    // The mark this frame's entry set (edge for TRAIL, target vertex otherwise).
     entryMark: Edge | Vertex | null;
   };
 
+  const seed = resolve([{ unit, min: q.min, max: q.max, rep: 0, elem: 0 }]);
   const stack: Frame[] = [
     {
-      iter: expand(graph, from, unit.hops[0].rel)[Symbol.iterator](),
-      pos: 0,
-      reps: 0,
       vertex: from,
+      moves: seed.moves,
+      moveIdx: 0,
+      edges:
+        seed.moves.length > 0
+          ? expandFilteredArr(graph, from, seed.moves[0].rel, binding, params)
+          : [],
+      edgeIdx: 0,
       entryEdge: null,
       entryMark: null,
     },
@@ -4261,52 +4414,46 @@ const trailEndsUnit = function* (
   while (stack.length > 0) {
     const top = stack[stack.length - 1];
 
-    // Max gate applies only at a unit boundary (a partial unit must always finish).
-    if (top.pos === 0 && q.max !== null && top.reps >= q.max) {
-      if (top.entryMark !== null) {
-        marks.delete(top.entryMark);
-      }
+    if (top.edgeIdx >= top.edges.length) {
+      const nextMove = top.moveIdx + 1;
 
-      stack.pop();
-      continue;
-    }
-
-    const res = top.iter.next();
-
-    if (res.done) {
-      if (top.entryMark !== null) {
-        marks.delete(top.entryMark);
-      }
-
-      stack.pop();
-      continue;
-    }
-
-    const { edge, node: nbr } = res.value;
-    const { pos, reps } = top;
-    const hop = unit.hops[pos];
-
-    // Per-hop predicate (inline props / WHERE on this hop's edge).
-    if (hop.rel.pred.props.length > 0 || hop.rel.pred.where !== undefined) {
-      const eBnd = withBinding(binding, hop.rel.variable, edge);
-
-      if (!satisfies(edge, hop.rel.pred, eBnd, params, graph)) {
+      if (nextMove < top.moves.length) {
+        top.moveIdx = nextMove;
+        top.edges = expandFilteredArr(graph, top.vertex, top.moves[nextMove].rel, binding, params);
+        top.edgeIdx = 0;
         continue;
       }
+
+      if (top.entryMark !== null) {
+        marks.delete(top.entryMark);
+      }
+
+      stack.pop();
+      continue;
     }
 
-    const completing = pos + 1 === k;
-    const isClose = mode === 'simple' && completing && nbr === from;
+    const { edge, node: nbr } = top.edges[top.edgeIdx];
+    top.edgeIdx += 1;
+    const { after } = top.moves[top.moveIdx];
 
-    // Per-hop restrictor (also enforces intra-unit distinctness).
+    // Does this hop finish the TOP unit's rep? (The position is back to a single cursor
+    // sitting at its unit's end.)
+    const completesTop = after.length === 1 && after[0].elem === after[0].unit.elems.length;
+    const isClose = mode === 'simple' && completesTop && nbr === from;
+
     if (!isClose && hopCollides(mode, marks, edge, nbr)) {
       continue;
     }
 
-    // Per-unit WHERE at a completion (every inner variable of THIS unit bound as a scalar).
+    // Per-rep WHERE at the top unit's completion (linear only — nested units have none).
     if (
-      completing &&
-      !unitWherePasses(unit, stack, stack.length - k, edge, nbr, { binding, params, graph })
+      completesTop &&
+      hasWhere &&
+      !unitWherePasses(unit, stack, stack.length - unit.elems.length, edge, nbr, {
+        binding,
+        params,
+        graph,
+      })
     ) {
       continue;
     }
@@ -4320,16 +4467,15 @@ const trailEndsUnit = function* (
       );
     }
 
-    // Claim this hop's mark (nothing for WALK / a SIMPLE close).
     const mark = hopMark(mode, isClose, edge, nbr);
 
     if (mark !== null) {
       marks.add(mark);
     }
 
-    const repsAfter = completing ? reps + 1 : reps;
+    const { emit, moves: nextMoves } = resolve(after);
 
-    if (completing && repsAfter >= q.min) {
+    if (emit) {
       if (wantPath) {
         const verts = stack.map((f) => f.vertex);
         verts.push(nbr);
@@ -4343,31 +4489,24 @@ const trailEndsUnit = function* (
       }
     }
 
-    // Descend: a mid-unit hop always continues the unit; a completion opens the next
-    // repetition (unless it is a SIMPLE close, or `max` is reached).
-    let next: { pos: number; reps: number } | null;
+    // A SIMPLE close emits but does NOT extend; likewise a position with no onward move.
+    if (isClose || nextMoves.length === 0) {
+      if (mark !== null) {
+        marks.delete(mark);
+      }
 
-    if (completing) {
-      const canExtend = !isClose && (q.max === null || repsAfter < q.max);
-      next = canExtend ? { pos: 0, reps: repsAfter } : null;
-    } else {
-      next = { pos: pos + 1, reps };
+      continue;
     }
 
-    if (next !== null) {
-      stack.push({
-        iter: expand(graph, nbr, unit.hops[next.pos].rel)[Symbol.iterator](),
-        pos: next.pos,
-        reps: next.reps,
-        vertex: nbr,
-        entryEdge: edge,
-        entryMark: mark,
-      });
-    } else if (mark !== null) {
-      // No descent from here (a close, or the repetition ceiling): this hop's mark has
-      // no deeper use.
-      marks.delete(mark);
-    }
+    stack.push({
+      vertex: nbr,
+      moves: nextMoves,
+      moveIdx: 0,
+      edges: expandFilteredArr(graph, nbr, nextMoves[0].rel, binding, params),
+      edgeIdx: 0,
+      entryEdge: edge,
+      entryMark: mark,
+    });
   }
 };
 
@@ -4399,7 +4538,8 @@ const walkSegments = function* (
       : trailEnds(graph, from, rel, rel.quantifier, { mode, binding, params, wantPath: false });
 
     for (const { end, verts, edges } of ends) {
-      const withGroups = unit ? bindGroupVars(binding, unit, verts, edges) : binding;
+      const withGroups =
+        unit && unitExposes(unit) ? bindGroupVars(binding, unit, verts, edges) : binding;
       const matched = matchNode(withGroups, node, end, params, graph);
 
       if (matched) {
@@ -4470,7 +4610,7 @@ const trailEnds = function* (
   // implementation and no hand-tuned twin to drift. The unit exposes no group
   // variables (its edge var is a per-hop predicate scalar, not a list); `wantPath` here
   // only rebuilds the path for a path-variable caller. Mirrors native `reachable_each`.
-  const unit: CUnit = { hops: [{ rel }] };
+  const unit: CUnit = { elems: [{ hop: { rel } }] };
 
   yield* trailEndsUnit(graph, from, unit, q, {
     mode: opts.mode,

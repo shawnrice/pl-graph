@@ -285,6 +285,12 @@ export type Segment = {
    * plain hop. Every inner variable (x, each edge, each intermediate) is a group var.
    */
   unitRest?: Segment[];
+  /**
+   * A quantifier on the FIRST inner hop (`((x)-[e]->{a,b}(m) …){n,m}`) — a NESTED
+   * repetition. `rel.quantifier` on the segment is the OUTER subpath quantifier, so the
+   * first hop's own quantifier needs its own slot (later hops use their `rel.quantifier`).
+   */
+  innerQ?: Quantifier;
 };
 
 /**
@@ -334,8 +340,12 @@ export type RelPattern = {
   properties?: readonly PropertyConstraint[];
   where?: Expr;
   /** Variable-length quantifier: `*`={0,∞}, `+`={1,∞}, `{n}`, `{n,m}`. */
-  quantifier?: { min: number; max: number | null };
+  quantifier?: Quantifier;
 };
+
+/** A variable-length quantifier: `*`={0,∞}, `+`={1,∞}, `{n}`, `{n,m}`. `max` is `null`
+ *  for an unbounded upper bound. */
+export type Quantifier = { min: number; max: number | null };
 
 /**
  * A projection body, shared by `RETURN` and `WITH`:
