@@ -75,10 +75,10 @@ use super::ast::{
 };
 use super::lexer::SyntaxError;
 use super::plan::{
-    has_argless_aggregate, has_nested_aggregate, lower, AggFn, CAgg, CClause, CCount, CExpr,
-    CLabelExpr, CLinear, CMerge, CMergeUpdate, CNode, CPath, CPredicate, CProjection,
-    CPropConstraint, CQuery, CRel, CRemoveItem, CReturnItem, CSegment, CSetItem, CUnit, CUnitHop,
-    Op, Program, ScalarFn,
+    has_argless_aggregate, has_nested_aggregate, lower, AggFn, CAgg, CClause, CCount, CElem, CExpr,
+    CHop, CLabelExpr, CLinear, CMerge, CMergeUpdate, CNode, CPath, CPredicate, CProjection,
+    CPropConstraint, CQuery, CRel, CRemoveItem, CReturnItem, CSegment, CSetItem, CUnit, Op,
+    Program, ScalarFn,
 };
 #[cfg(feature = "arrow")]
 use crate::arrow::ArrowColumn;
@@ -3159,7 +3159,7 @@ fn bind_group_vars(
     verts: &[u32],
     edges: &[u32],
 ) -> Vec<(usize, Option<Val>)> {
-    let k = unit.hops.len();
+    let k = unit.elems.len();
     let reps = edges.len().checked_div(k).unwrap_or(0);
     let mut restores = Vec::new();
     let mut bind = |binding: &mut Binding, slot: Option<usize>, list: Vec<Val>| {
@@ -3173,7 +3173,7 @@ fn bind_group_vars(
         let slot = if p == 0 {
             unit.start_slot
         } else {
-            unit.hops[p - 1].target_slot
+            unit.hop(p - 1).target_slot
         };
         bind(
             binding,
@@ -3182,10 +3182,10 @@ fn bind_group_vars(
         );
     }
     // Edge positions 0..k: each hop's edge.
-    for (p, hop) in unit.hops.iter().enumerate() {
+    for p in 0..k {
         bind(
             binding,
-            hop.rel.var_slot,
+            unit.hop(p).rel.var_slot,
             (0..reps).map(|rep| Val::Edge(edges[rep * k + p])).collect(),
         );
     }
@@ -3227,7 +3227,7 @@ fn reachable_each_unit(
         return false;
     }
 
-    let k = unit.hops.len();
+    let k = unit.elems.len();
     let trail = matches!(mode, PathMode::Trail);
     let vertex_mode = matches!(mode, PathMode::Simple | PathMode::Acyclic);
     let mut marks = if trail {
@@ -3269,7 +3269,7 @@ fn reachable_each_unit(
     let mut steps: u64 = 0;
     let mut cont = true;
     let mut stack: Vec<Frame> = vec![Frame {
-        edges: expand_filtered(graph, ctx, binding, &unit.hops[0].rel, from),
+        edges: expand_filtered(graph, ctx, binding, &unit.hop(0).rel, from),
         idx: 0,
         pos: 0,
         reps: 0,
@@ -3324,7 +3324,8 @@ fn reachable_each_unit(
                     }
                 };
                 set(binding, unit.start_slot, Val::Node(stack[base].vertex));
-                for (j, hop) in unit.hops.iter().enumerate() {
+                for j in 0..k {
+                    let hop = unit.hop(j);
                     let (e, t) = if j + 1 < k {
                         let f = &stack[base + j + 1];
                         (f.entry_edge.expect("inner hop has an edge"), f.vertex)
@@ -3401,7 +3402,7 @@ fn reachable_each_unit(
         };
         match next {
             Some((next_pos, next_reps)) => {
-                let edges = expand_filtered(graph, ctx, binding, &unit.hops[next_pos].rel, nbr);
+                let edges = expand_filtered(graph, ctx, binding, &unit.hop(next_pos).rel, nbr);
                 stack.push(Frame {
                     edges,
                     idx: 0,
@@ -3444,10 +3445,10 @@ fn reachable_each(
     on_end: OnEnd<'_>,
 ) -> bool {
     let unit = CUnit {
-        hops: vec![CUnitHop {
+        elems: vec![CElem::Hop(CHop {
             rel: rel.clone(),
             target_slot: None,
-        }],
+        })],
         start_slot: None,
         where_: None,
     };

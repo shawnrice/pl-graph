@@ -5560,6 +5560,50 @@ fn bench_k1_abbreviated_walk() {
     );
 }
 
+/// Micro-benchmark (ignored) covering the whole var-length matcher surface the
+/// unification touches: abbreviated k=1, single-edge subpath (k=1), and multi-element
+/// units (k=2, k=3). Same dense DAG. Run before AND after a matcher change to catch a
+/// regression on the linear (degenerate) case. No assertion — wall clock is flaky.
+#[test]
+#[ignore]
+fn bench_var_length_matcher() {
+    let mut g = layered_dense(6, 6);
+    let cases = [
+        (
+            "k1_abbrev  ",
+            "MATCH (s:N {id:'n0'})-[:R]->{1,4}(x) RETURN count(*) AS c",
+        ),
+        (
+            "k1_subpath ",
+            "MATCH (s:N {id:'n0'}) ((x)-[:R]->(y)){1,4} (t) RETURN count(*) AS c",
+        ),
+        (
+            "k2_subpath ",
+            "MATCH (s:N {id:'n0'}) ((x)-[:R]->(m)-[:R]->(y)){1,2} (t) RETURN count(*) AS c",
+        ),
+        (
+            "k2_groupvar",
+            "MATCH (s:N {id:'n0'}) ((x)-[e:R]->(m)-[e2:R]->(y)){1,2} (t) RETURN count(size(e)) AS c",
+        ),
+        (
+            "k3_subpath ",
+            "MATCH (s:N {id:'n0'}) ((x)-[:R]->(m)-[:R]->(w)-[:R]->(y)){1} (t) RETURN count(*) AS c",
+        ),
+    ];
+    for (label, q) in cases {
+        for _ in 0..5 {
+            let _ = rows(&mut g, q);
+        }
+        let iters = 200;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = rows(&mut g, q);
+        }
+        let el = t.elapsed();
+        eprintln!("bench {label}: {iters} iters, {:?}/iter", el / iters);
+    }
+}
+
 /// A five-node chain a→b→c→d→e (uniform edge amt 10) for exercising MULTI-element
 /// repetition units, where each repetition of the unit advances more than one hop.
 fn five_chain() -> Graph {

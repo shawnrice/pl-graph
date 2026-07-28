@@ -632,8 +632,9 @@ pub struct CRel {
 /// drift.
 #[derive(Debug, Clone)]
 pub struct CUnit {
-    /// One entry per hop.
-    pub hops: Vec<CUnitHop>,
+    /// The unit's linear element sequence — each a single hop or a nested quantified
+    /// sub-unit. A plain linear subpath is all `Hop`s.
+    pub elems: Vec<CElem>,
     /// The unit SOURCE node `(x)`'s group-variable slot (`None` if anonymous).
     pub start_slot: Option<usize>,
     /// The per-unit predicate (the subpath `WHERE`), checked once the whole unit is
@@ -642,24 +643,49 @@ pub struct CUnit {
 }
 
 impl CUnit {
-    /// Whether this unit binds any GROUP variable (source, an edge, or a hop target).
-    /// When it binds nothing, the walk's `verts`/`edges` need not be reconstructed —
-    /// the matcher can skip the per-end path rebuild (the abbreviated form's speed).
+    /// Whether this unit binds any GROUP variable (source, an edge, a hop target, or
+    /// anything a nested sub-unit binds). When it binds nothing, the walk's
+    /// `verts`/`edges` need not be reconstructed — the matcher can skip the per-end
+    /// path rebuild (the abbreviated form's speed).
     pub fn exposes(&self) -> bool {
         self.start_slot.is_some()
-            || self
-                .hops
-                .iter()
-                .any(|h| h.target_slot.is_some() || h.rel.var_slot.is_some())
+            || self.elems.iter().any(|e| match e {
+                CElem::Hop(h) => h.target_slot.is_some() || h.rel.var_slot.is_some(),
+                CElem::Sub(s) => s.unit.exposes(),
+            })
+    }
+
+    /// The element at `i` as a hop. The current matcher only handles all-`Hop` (linear)
+    /// units; a nested `Sub` element is lowered by the pushdown path, not here.
+    pub fn hop(&self, i: usize) -> &CHop {
+        match &self.elems[i] {
+            CElem::Hop(h) => h,
+            CElem::Sub(_) => unreachable!("nested sub-unit reached the linear matcher"),
+        }
     }
 }
 
+/// One element of a unit's linear sequence: a single edge, or a nested quantified
+/// sub-unit (repeated `[min, max]` times — the general `( … ){n,m}` nesting).
 #[derive(Debug, Clone)]
-pub struct CUnitHop {
+pub enum CElem {
+    Hop(CHop),
+    Sub(CSub),
+}
+
+#[derive(Debug, Clone)]
+pub struct CHop {
     /// The relationship (for expansion + its own inline label/property filter).
     pub rel: CRel,
     /// The hop's target node's group-variable slot (`None` if anonymous).
     pub target_slot: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CSub {
+    pub unit: Box<CUnit>,
+    pub min: u32,
+    pub max: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -1646,10 +1672,10 @@ impl Lowerer {
             // hops are bound (letting it span the whole unit) — and cleared from the
             // hops themselves.
             let mut where_ = rel.where_.take();
-            let mut hops = vec![CUnitHop {
+            let mut elems = vec![CElem::Hop(CHop {
                 rel: rel.clone(),
                 target_slot: s.hop_to.as_ref().and_then(|to| self.node_slot(to)),
-            }];
+            })];
             for extra in &s.unit_rest {
                 let mut extra_rel = self.rel(&extra.rel);
                 if let Some(w) = extra_rel.where_.take() {
@@ -1658,13 +1684,13 @@ impl Lowerer {
                         None => w,
                     });
                 }
-                hops.push(CUnitHop {
+                elems.push(CElem::Hop(CHop {
                     rel: extra_rel,
                     target_slot: self.node_slot(&extra.node),
-                });
+                }));
             }
             CUnit {
-                hops,
+                elems,
                 start_slot: self.node_slot(from),
                 where_,
             }
