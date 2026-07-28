@@ -318,13 +318,12 @@ describe('hardening: variable-length segment restrictions', () => {
     expect(() => query(g, `MATCH (a)-[:KNOWS {weight: 1}]->+(b) RETURN b`)).not.toThrow();
   });
 
-  test('rejects a per-hop predicate together with a shortest selector', () => {
-    // The shortest BFS drivers do not evaluate a per-hop predicate; both engines
-    // fault E_SYNTAX rather than silently ignore the filter.
-    const e = thrown(() =>
+  test('accepts a per-hop predicate together with a shortest selector', () => {
+    // The shortest BFS now expands only over predicate-passing edges (shortest path
+    // in the filtered subgraph); both engines accept it.
+    expect(() =>
       query(g, `MATCH ANY SHORTEST (a)-[r:KNOWS WHERE r.weight > 0]->*(b) RETURN b`),
-    );
-    expect(hasErrorCode(e, ErrorCode.Syntax)).toBe(true);
+    ).not.toThrow();
   });
 
   test('a plain quantified segment (label only) still works', () => {

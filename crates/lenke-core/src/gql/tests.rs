@@ -3468,14 +3468,63 @@ fn var_length_accepts_per_hop_predicate() {
     assert!(parse("MATCH (a)-[:KNOWS {weight:1}]->+(b) RETURN b").is_ok());
     assert!(parse("MATCH (a)-[:KNOWS WHERE true]->+(b) RETURN b").is_ok());
     assert!(parse("MATCH (a)-[e:KNOWS WHERE e.weight > 0.5]->{1,5}(b) RETURN b").is_ok());
-    // …but not together with a shortest selector (the BFS drivers ignore it).
-    assert!(parse("MATCH ANY SHORTEST (a)-[e:R WHERE e.w > 1]->*(b) RETURN b").is_err());
-    assert!(parse("MATCH p = ALL SHORTEST (a)-[:R {w:1}]->*(b) RETURN p").is_err());
+    // …including together with a shortest selector: the BFS now expands only over
+    // predicate-passing edges (shortest path in the filtered subgraph).
+    assert!(parse("MATCH ANY SHORTEST (a)-[e:R WHERE e.w > 1]->*(b) RETURN b").is_ok());
+    assert!(parse("MATCH p = ALL SHORTEST (a)-[:R {w:1}]->*(b) RETURN p").is_ok());
 }
 
 #[test]
 fn var_length_label_only_still_parses() {
     assert!(parse("MATCH (a:Person {name:'marko'})-[:KNOWS]->+(b) RETURN b.name").is_ok());
+}
+
+/// ANY/ALL SHORTEST now honour a per-hop edge predicate: the BFS expands only over
+/// predicate-passing edges, so it finds the shortest path in the FILTERED subgraph.
+/// (Sound because a per-hop predicate is element-local — not path-dependent — so the
+/// filtered graph is well-defined and BFS's discover-once invariant still holds.)
+#[test]
+fn shortest_honours_per_hop_edge_predicate() {
+    // a→b (w=1), a→c (w=10), c→b (w=10). Unfiltered shortest a→b is 1 hop; with
+    // `WHERE e.w > 5` the direct edge is blocked, so the shortest is a→c→b (2 hops).
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+        r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}"#,
+        r#"{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{"w":1.0}}"#,
+        r#"{"type":"edge","id":"e2","from":"a","to":"c","labels":["R"],"properties":{"w":10.0}}"#,
+        r#"{"type":"edge","id":"e3","from":"c","to":"b","labels":["R"],"properties":{"w":10.0}}"#,
+    ]);
+    let len = |g: &mut Graph, q: &str| rows(g, q)[0][0].clone();
+    // Unfiltered: 1 hop.
+    assert_eq!(
+        len(
+            &mut g,
+            "MATCH p = ANY SHORTEST (a:N {id:'a'})-[e:R]->*(b:N {id:'b'}) RETURN path_length(p)",
+        ),
+        n(1.0),
+    );
+    // Filtered (w > 5): the direct edge is gone → 2 hops.
+    assert_eq!(
+        len(
+            &mut g,
+            "MATCH p = ANY SHORTEST (a:N {id:'a'})-[e:R WHERE e.w > 5]->*(b:N {id:'b'}) RETURN path_length(p)",
+        ),
+        n(2.0),
+    );
+    assert_eq!(
+        len(
+            &mut g,
+            "MATCH p = ALL SHORTEST (a:N {id:'a'})-[e:R WHERE e.w > 5]->*(b:N {id:'b'}) RETURN path_length(p)",
+        ),
+        n(2.0),
+    );
+    // A predicate that blocks EVERY edge out of the seed → no path.
+    assert!(rows(
+        &mut g,
+        "MATCH ANY SHORTEST (a:N {id:'a'})-[e:R WHERE e.w > 100]->*(b:N {id:'b'}) RETURN b.id AS id",
+    )
+    .is_empty());
 }
 
 #[test]

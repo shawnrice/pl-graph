@@ -858,13 +858,6 @@ impl Parser {
                             sel_pos,
                         );
                     }
-                    let seg = &segments[0].rel;
-                    if !seg.props.is_empty() || seg.where_.is_some() {
-                        return err(
-                            "a per-hop edge predicate on a variable-length segment is not yet supported together with a path selector (ANY/ALL SHORTEST)",
-                            sel_pos,
-                        );
-                    }
                 }
                 PathSelector::Any | PathSelector::ShortestK { .. } => {
                     if !single_varlen {

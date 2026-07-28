@@ -3252,20 +3252,6 @@ const relHasPredicate = (rel: RelPattern): boolean =>
 const compilePath = (pattern: PathPattern): CPath => {
   const selector = pattern.selector ?? 'walk';
 
-  // The shortest drivers are pure BFS over labels — they do not evaluate a per-hop
-  // edge predicate. Reject rather than silently ignore the filter (native rejects
-  // the same shape at parse time; both fault E_SYNTAX).
-  if (selector === 'anyShortest' || selector === 'allShortest') {
-    const seg = pattern.segments[0]?.rel;
-
-    if (seg?.quantifier && relHasPredicate(seg)) {
-      throw new LenkeError(
-        'a per-hop edge predicate on a variable-length segment is not yet supported together with a path selector (ANY/ALL SHORTEST)',
-        { code: ErrorCode.Syntax },
-      );
-    }
-  }
-
   return {
     start: compileNode(pattern.start),
     segments: pattern.segments.map(({ rel, node, hopFrom, hopTo, unitRest }) => {
@@ -3583,6 +3569,25 @@ const orient = (graph: Graph, pattern: CPath, binding: Binding, params: Params):
   return endEst < startEst ? reversePath(pattern) : pattern;
 };
 
+/** Whether `edge` passes a segment's per-hop predicate (inline props / WHERE). The
+ *  edge variable is bound so the predicate can name it. `true` when the segment has no
+ *  predicate. Lets the shortest BFS expand only over passing edges — a per-hop
+ *  predicate is element-local, so the filtered graph is well-defined and BFS's
+ *  discover-once shortest invariant still holds. Mirrors native `edge_passes`. */
+const edgePasses = (
+  rel: CRel,
+  edge: Edge,
+  binding: Binding,
+  params: Params,
+  graph: Graph,
+): boolean => {
+  if (rel.pred.props.length === 0 && rel.pred.where === undefined) {
+    return true;
+  }
+
+  return satisfies(edge, rel.pred, withBinding(binding, rel.variable, edge), params, graph);
+};
+
 /**
  * `ANY SHORTEST` over a single quantified segment `(start)-[rel q]->(end)`: from
  * the already-matched `seed`, BFS out to one fewest-hop path per reachable
@@ -3623,6 +3628,10 @@ const shortestWalk = function* (
     }
 
     for (const { edge, node: nbr } of expand(graph, v, rel)) {
+      if (!edgePasses(rel, edge, binding, params, graph)) {
+        continue; // filtered BFS: only expand over predicate-passing edges
+      }
+
       if (nbr.id === seed.id && seedCycle === null) {
         seedCycle = { dist: d + 1, prev: v, edge };
       }
@@ -3712,6 +3721,10 @@ const allShortestWalk = function* (
     }
 
     for (const { edge, node: nbr } of expand(graph, v, rel)) {
+      if (!edgePasses(rel, edge, binding, params, graph)) {
+        continue; // filtered BFS: only expand over predicate-passing edges
+      }
+
       if (nbr.id === seed.id) {
         if (seedCycleDist === null) {
           seedCycleDist = d + 1;

@@ -3611,8 +3611,7 @@ fn shortest_walk(
         if q.max.is_some_and(|m| d >= m) {
             continue; // don't expand past the hop ceiling
         }
-        let mut nbrs: Vec<(u32, u32)> =
-            expand(graph, ctx, v, rel.direction, rel.label.as_ref()).collect();
+        let mut nbrs: Vec<(u32, u32)> = expand_filtered(graph, ctx, binding, rel, v);
         nbrs.sort_unstable_by_key(|&(eidx, _)| eidx);
         for (eidx, nbr) in nbrs {
             if nbr == seed && seed_cycle.is_none() {
@@ -3772,8 +3771,7 @@ fn all_shortest_walk(
         if q.max.is_some_and(|m| d >= m) {
             continue;
         }
-        let mut nbrs: Vec<(u32, u32)> =
-            expand(graph, ctx, v, rel.direction, rel.label.as_ref()).collect();
+        let mut nbrs: Vec<(u32, u32)> = expand_filtered(graph, ctx, binding, rel, v);
         nbrs.sort_unstable_by_key(|&(eidx, _)| eidx);
         for (eidx, nbr) in nbrs {
             if nbr == seed {

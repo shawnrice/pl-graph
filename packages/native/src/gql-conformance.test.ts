@@ -1171,6 +1171,32 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     }
   });
 
+  // ANY/ALL SHORTEST now honour a per-hop edge predicate — the BFS expands only over
+  // passing edges (shortest path in the filtered subgraph). Byte-identical both engines.
+  test('shortest selector honours a per-hop edge predicate (TS vs native)', () => {
+    const W = [
+      '{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}',
+      '{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}',
+      '{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}',
+      '{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{"w":1.0}}',
+      '{"type":"edge","id":"e2","from":"a","to":"c","labels":["R"],"properties":{"w":10.0}}',
+      '{"type":"edge","id":"e3","from":"c","to":"b","labels":["R"],"properties":{"w":10.0}}',
+    ].join('\n');
+    const nat = graphFromFormat(backend, W, 'ndjson');
+    const ts = tsDeserialize(W, 'ndjson', new Graph());
+
+    for (const q of [
+      // Unfiltered: 1 hop. Filtered (w>5): the direct edge is blocked → 2 hops (a→c→b).
+      "MATCH p = ANY SHORTEST (a:N {id:'a'})-[e:R]->*(b:N {id:'b'}) RETURN path_length(p) AS len",
+      "MATCH p = ANY SHORTEST (a:N {id:'a'})-[e:R WHERE e.w > 5]->*(b:N {id:'b'}) RETURN path_length(p) AS len",
+      "MATCH p = ALL SHORTEST (a:N {id:'a'})-[e:R WHERE e.w > 5]->*(b:N {id:'b'}) RETURN path_length(p) AS len",
+      // A predicate blocking every seed-edge → empty.
+      "MATCH ANY SHORTEST (a:N {id:'a'})-[e:R WHERE e.w > 100]->*(b:N {id:'b'}) RETURN b.id AS id",
+    ]) {
+      expect(JSON.stringify(nat.query(q)), q).toBe(JSON.stringify(tsQuery(ts, q)));
+    }
+  });
+
   // A pattern may BEGIN with a quantified subpath (no anchor node), and a path variable
   // may bind the whole repeated walk — ISO, byte-identical both engines.
   test('unanchored quantified subpath + path variable (TS vs native)', () => {
@@ -2507,13 +2533,9 @@ suite('gql conformance: per-hop edge predicate on var-length — byte-identical'
     expect(ts).toBe(native);
   });
 
-  test('per-hop predicate + ANY SHORTEST is rejected by both engines', () => {
-    expect(() =>
-      tsQuery(tsGraph, `MATCH ANY SHORTEST (a:N {id:'a'})-[e:R WHERE e.amt > 1]->*(x) RETURN x`),
-    ).toThrow();
-    expect(() =>
-      nativeGraph.query(`MATCH ANY SHORTEST (a:N {id:'a'})-[e:R WHERE e.amt > 1]->*(x) RETURN x`),
-    ).toThrow();
+  test('per-hop predicate + ANY SHORTEST runs (filtered BFS), byte-identical', () => {
+    const q = `MATCH ANY SHORTEST (a:N {id:'a'})-[e:R WHERE e.amt > 1]->*(x) RETURN x.id AS id ORDER BY id`;
+    expect(JSON.stringify(nativeGraph.query(q))).toBe(JSON.stringify(tsQuery(tsGraph, q)));
   });
 });
 
