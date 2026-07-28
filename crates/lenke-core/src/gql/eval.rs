@@ -3192,24 +3192,26 @@ fn bind_group_vars(
     restores
 }
 
-/// The GENERAL repetition matcher: repeat `unit` (a `k`-hop sub-path) from `from`,
-/// streaming each trail end in `[min, max]` REPETITIONS to `on_end` (endpoint + the
-/// whole walk's `verts`/`edges`, so the caller can expose group variables).
+/// The GENERAL repetition matcher: repeat `unit` from `from`, streaming each trail end
+/// in `[min, max]` REPETITIONS to `on_end` (endpoint + the whole walk's `verts`/`edges`
+/// for group-variable / path exposure). `unit`'s elements are hops OR nested quantified
+/// sub-units, so this is ONE matcher for every var-length shape — abbreviated,
+/// multi-element, and nested `( … ){n,m}`.
 ///
-/// It is a single, LAZY hop-stepping DFS: the stack holds one frame per hop of the
-/// CURRENT path only — never the `d^k` traversals from a vertex — so memory is
-/// O(path length), exactly like the single-edge walk. Each frame records which hop
-/// within the unit it expands (`pos`) and how many whole repetitions precede it
-/// (`reps`); unit-boundary work (the per-unit `WHERE`, the emit, the repetition
-/// count) happens every `k`-th hop. TRAIL/SIMPLE/ACYCLIC/WALK restrictors are applied
-/// PER HOP (an edge/vertex is marked the moment it is traversed), which also forbids a
-/// unit from repeating a vertex internally — the correct reading, and the reason a
-/// `k = 1` walk here is byte-identical to the fast-path.
+/// It is a single, LAZY, explicit-stack pushdown DFS. The stack holds one frame per hop
+/// of the CURRENT path only — never the `d^k` traversals from a vertex — so memory is
+/// O(path length) and there is no native recursion (no stack overflow on a deep walk).
+/// A frame's pattern **position** is a stack of loop cursors (`Position`), and `resolve`
+/// follows the epsilon moves (enter a sub / close a nested unit / repeat) to the graph-
+/// consuming hops reachable from it; a visited set breaks min-0 epsilon cycles.
+/// TRAIL/SIMPLE/ACYCLIC/WALK restrictors are applied PER HOP.
 ///
-/// A one-hop unit (`k = 1`) makes every hop a completion, so this reduces EXACTLY to
-/// [`reachable_each`] — that twin is kept only as a lean fast-path for the hot
-/// abbreviated `-[]->{n,m}` form; the `abbreviated_and_single_edge_subpath_agree_k1`
-/// test pins them byte-identical at `k = 1` across every path mode.
+/// Performance: the linear world (a depth-1 `Position::Flat`, no branching) is the hot
+/// case, so `resolve`'s fast path computes it inline with no allocation, the position is
+/// borrowed not copied per hop, and moves are a `One`/`Many` enum (no vector for the
+/// common single move). Subpath / multi-element walks run at the old fused matcher's
+/// speed; only the tightest abbreviated loop pays a small (~10%) per-hop overhead for
+/// carrying the general position — the price of one code path instead of a special case.
 fn reachable_each_unit(
     graph: &Graph,
     ctx: &Ctx,
@@ -3241,23 +3243,220 @@ fn reachable_each_unit(
         marks[from as usize] = true;
     }
 
-    struct Frame {
-        // Out-edges from `vertex` via `hops[pos].rel` (per-hop inline props applied).
-        edges: Vec<(u32, u32)>,
-        idx: usize,
-        // The hop within the current unit this frame expands (`0..k`).
-        pos: usize,
-        // Whole repetitions completed before this frame's unit boundary.
-        reps: u32,
+    // A loop cursor: which unit, its `[min,max]`, completed reps, next element.
+    #[derive(Clone, Copy)]
+    struct Cursor<'a> {
+        unit: &'a CUnit,
+        min: u32,
+        // `u32::MAX` = unbounded (`*` / `+` / `{n,}`) — a sentinel, so the cursor stays
+        // small and `Copy` (no `Option` on the hot path).
+        max: u32,
+        rep: u32,
+        elem: usize,
+    }
+
+    // A position in the (possibly nested) pattern — a cursor stack, innermost last.
+    // `Flat` is the depth-1 case (the entire linear world): a single `Copy` cursor with
+    // NO heap allocation. Nesting deepens to `Deep`.
+    #[derive(Clone)]
+    enum Position<'a> {
+        Flat(Cursor<'a>),
+        Deep(Vec<Cursor<'a>>),
+    }
+
+    impl<'a> Position<'a> {
+        fn top(&self) -> &Cursor<'a> {
+            match self {
+                Position::Flat(c) => c,
+                Position::Deep(v) => v.last().expect("a position has ≥ 1 cursor"),
+            }
+        }
+        fn top_mut(&mut self) -> &mut Cursor<'a> {
+            match self {
+                Position::Flat(c) => c,
+                Position::Deep(v) => v.last_mut().expect("a position has ≥ 1 cursor"),
+            }
+        }
+        fn len(&self) -> usize {
+            match self {
+                Position::Flat(_) => 1,
+                Position::Deep(v) => v.len(),
+            }
+        }
+        fn push(&mut self, c: Cursor<'a>) {
+            match self {
+                Position::Flat(old) => *self = Position::Deep(vec![*old, c]),
+                Position::Deep(v) => v.push(c),
+            }
+        }
+        fn pop(&mut self) {
+            if let Position::Deep(v) = self {
+                v.pop();
+                if v.len() == 1 {
+                    *self = Position::Flat(v[0]);
+                }
+            }
+        }
+        fn key(&self) -> Vec<(usize, u32, usize)> {
+            let one = |c: &Cursor| (c.unit as *const CUnit as usize, c.rep, c.elem);
+            match self {
+                Position::Flat(c) => vec![one(c)],
+                Position::Deep(v) => v.iter().map(one).collect(),
+            }
+        }
+    }
+
+    struct HopMove<'a> {
+        rel: &'a CRel,
+        after: Position<'a>,
+    }
+
+    // The graph-consuming moves from a position. `One` (the linear case) never allocates
+    // a vector; `Many` is the general branching case (nesting).
+    enum MoveSet<'a> {
+        None,
+        One(HopMove<'a>),
+        Many(Vec<HopMove<'a>>),
+    }
+
+    impl<'a> MoveSet<'a> {
+        fn get(&self, i: usize) -> Option<&HopMove<'a>> {
+            match self {
+                MoveSet::None => None,
+                MoveSet::One(m) => (i == 0).then_some(m),
+                MoveSet::Many(v) => v.get(i),
+            }
+        }
+        fn is_empty(&self) -> bool {
+            matches!(self, MoveSet::None)
+        }
+    }
+
+    // Follow epsilon moves (enter a sub / close a nested unit / repeat) from `start`,
+    // collecting whether the TOP unit accepts here (emit) and every graph-consuming hop
+    // reachable. A visited set breaks epsilon cycles (a zero-edge min-0 inner loop).
+    //
+    // A `Flat` (depth-1) position has no epsilon branching — the ENTIRE linear world —
+    // so its ≤1 hop move is computed inline here (no worklist / visited-set / heap
+    // position); only nesting reaches the out-of-line general resolver.
+    #[inline]
+    fn resolve<'a>(start: &Position<'a>) -> (bool, MoveSet<'a>) {
+        if let Position::Flat(c) = start {
+            let c = *c;
+            if c.elem < c.unit.elems.len() {
+                if let CElem::Hop(h) = &c.unit.elems[c.elem] {
+                    let mut a = c;
+                    a.elem += 1;
+                    return (
+                        false,
+                        MoveSet::One(HopMove {
+                            rel: &h.rel,
+                            after: Position::Flat(a),
+                        }),
+                    );
+                }
+            } else {
+                let rep2 = c.rep + 1;
+                let emit = rep2 >= c.min;
+                if rep2 < c.max {
+                    if let CElem::Hop(h) = &c.unit.elems[0] {
+                        let mut a = c;
+                        a.rep = rep2;
+                        a.elem = 1;
+                        return (
+                            emit,
+                            MoveSet::One(HopMove {
+                                rel: &h.rel,
+                                after: Position::Flat(a),
+                            }),
+                        );
+                    }
+                } else {
+                    return (emit, MoveSet::None);
+                }
+            }
+        }
+        resolve_general(start)
+    }
+
+    // The general epsilon-closure (nesting): kept out of line so the linear fast path
+    // above stays small enough to inline at its call sites.
+    #[inline(never)]
+    fn resolve_general<'a>(start: &Position<'a>) -> (bool, MoveSet<'a>) {
+        let mut emit = false;
+        let mut hops: Vec<HopMove<'a>> = Vec::new();
+        let mut work = vec![start.clone()];
+        let mut seen: Vec<Vec<(usize, u32, usize)>> = Vec::new();
+        while let Some(p) = work.pop() {
+            let key = p.key();
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            let top = *p.top();
+            if top.elem < top.unit.elems.len() {
+                match &top.unit.elems[top.elem] {
+                    CElem::Hop(h) => {
+                        let mut after = p.clone();
+                        after.top_mut().elem += 1;
+                        hops.push(HopMove { rel: &h.rel, after });
+                    }
+                    CElem::Sub(s) => {
+                        let mut enter = p.clone();
+                        enter.push(Cursor {
+                            unit: &s.unit,
+                            min: s.min,
+                            max: s.max.unwrap_or(u32::MAX),
+                            rep: 0,
+                            elem: 0,
+                        });
+                        work.push(enter);
+                        if s.min == 0 {
+                            let mut skip = p.clone();
+                            skip.top_mut().elem += 1;
+                            work.push(skip);
+                        }
+                    }
+                }
+            } else {
+                let rep2 = top.rep + 1;
+                if rep2 >= top.min {
+                    if p.len() == 1 {
+                        emit = true;
+                    } else {
+                        let mut close = p.clone();
+                        close.pop();
+                        close.top_mut().elem += 1;
+                        work.push(close);
+                    }
+                }
+                if rep2 < top.max {
+                    let mut again = p.clone();
+                    let t = again.top_mut();
+                    t.rep = rep2;
+                    t.elem = 0;
+                    work.push(again);
+                }
+            }
+        }
+        let moves = if hops.is_empty() {
+            MoveSet::None
+        } else {
+            MoveSet::Many(hops)
+        };
+        (emit, moves)
+    }
+
+    struct Frame<'a> {
         vertex: u32,
+        moves: MoveSet<'a>,
+        move_idx: usize,
+        edges: Vec<(u32, u32)>,
+        edge_idx: usize,
         entry_edge: Option<u32>,
-        // The mark this frame's entry set (edge for TRAIL, target vertex otherwise),
-        // cleared when the frame pops.
         entry_mark: Option<usize>,
     }
 
-    // Clear every live frame's mark — used on consumer-stop / budget-fault so a pooled
-    // TRAIL buffer is returned clean.
     fn clear_live(stack: &[Frame], marks: &mut [bool]) {
         for f in stack {
             if let Some(mi) = f.entry_mark {
@@ -3266,39 +3465,116 @@ fn reachable_each_unit(
         }
     }
 
+    fn rebuild(stack: &[Frame], v: u32, e: u32) -> (Vec<u32>, Vec<u32>) {
+        let mut pv: Vec<u32> = stack.iter().map(|f| f.vertex).collect();
+        pv.push(v);
+        let mut pe: Vec<u32> = stack.iter().filter_map(|f| f.entry_edge).collect();
+        pe.push(e);
+        (pv, pe)
+    }
+
+    // The top unit's per-rep `WHERE` (linear only — a nested unit's WHERE is rejected at
+    // compile). Reconstruct the just-completed rep's `k` hops from the top `k` frames +
+    // the current edge, bind them as scalars, evaluate.
+    let where_ok =
+        |graph: &Graph, ctx: &Ctx, b: &mut Binding, stack: &[Frame], eidx: u32, nbr: u32| -> bool {
+            let Some(w) = &unit.where_ else {
+                return true;
+            };
+            let base = stack.len() - k;
+            let mut saves: Vec<(usize, Option<Val>)> = Vec::new();
+            let mut set = |b: &mut Binding, slot: Option<usize>, v: Val| {
+                if let Some(s) = slot {
+                    saves.push((s, b.get(s).cloned()));
+                    b.set(s, v);
+                }
+            };
+            set(b, unit.start_slot, Val::Node(stack[base].vertex));
+            for j in 0..k {
+                let hop = unit.hop(j);
+                let (e, t) = if j + 1 < k {
+                    let f = &stack[base + j + 1];
+                    (f.entry_edge.expect("inner hop has an edge"), f.vertex)
+                } else {
+                    (eidx, nbr)
+                };
+                set(b, hop.rel.var_slot, Val::Edge(e));
+                set(b, hop.target_slot, Val::Node(t));
+            }
+            let ok = as_truth(&eval(&Env::new(graph, ctx, b), w)) == Some(true);
+            for (s, prev) in saves.into_iter().rev() {
+                match prev {
+                    Some(v) => b.set(s, v),
+                    None => b.unset(s),
+                }
+            }
+            ok
+        };
+
     let mut steps: u64 = 0;
     let mut cont = true;
+    let has_where = unit.where_.is_some();
+
+    // (The top unit's `min == 0` zero-rep acceptance is emitted upfront, before marks.)
+    let (_, seed_moves) = resolve(&Position::Flat(Cursor {
+        unit,
+        min: q.min,
+        max: q.max.unwrap_or(u32::MAX),
+        rep: 0,
+        elem: 0,
+    }));
+    let seed_edges = match seed_moves.get(0) {
+        Some(m) => expand_filtered(graph, ctx, binding, m.rel, from),
+        None => Vec::new(),
+    };
     let mut stack: Vec<Frame> = vec![Frame {
-        edges: expand_filtered(graph, ctx, binding, &unit.hop(0).rel, from),
-        idx: 0,
-        pos: 0,
-        reps: 0,
         vertex: from,
+        moves: seed_moves,
+        move_idx: 0,
+        edges: seed_edges,
+        edge_idx: 0,
         entry_edge: None,
         entry_mark: None,
     }];
 
-    while let Some(top) = stack.last_mut() {
-        // Max gate applies only at a unit boundary (a partial unit must always finish).
-        let maxed = top.pos == 0 && q.max.is_some_and(|m| top.reps >= m);
-        if maxed || top.idx >= top.edges.len() {
-            if let Some(mi) = top.entry_mark {
+    while !stack.is_empty() {
+        let li = stack.len() - 1;
+        if stack[li].edge_idx >= stack[li].edges.len() {
+            // Move to the next resolved hop-move, or backtrack.
+            let next = stack[li].move_idx + 1;
+            if let Some(m) = stack[li].moves.get(next) {
+                let v = stack[li].vertex;
+                let e = expand_filtered(graph, ctx, binding, m.rel, v);
+                stack[li].move_idx = next;
+                stack[li].edges = e;
+                stack[li].edge_idx = 0;
+                continue;
+            }
+            if let Some(mi) = stack[li].entry_mark {
                 marks[mi] = false;
             }
             stack.pop();
             continue;
         }
-        let (eidx, nbr) = top.edges[top.idx];
-        let pos = top.pos;
-        let reps = top.reps;
-        top.idx += 1; // last use of the mutable borrow (NLL)
 
-        let completing = pos + 1 == k;
-        let is_close = matches!(mode, PathMode::Simple) && completing && nbr == from;
+        let (eidx, nbr) = stack[li].edges[stack[li].edge_idx];
+        stack[li].edge_idx += 1;
+        // Borrow the current move's landing position — no per-hop copy (only the general
+        // resolver clones it, and only under nesting).
+        let after: &Position = &stack[li]
+            .moves
+            .get(stack[li].move_idx)
+            .expect("an in-range move")
+            .after;
 
-        // Per-hop restrictor: an edge (TRAIL) / target vertex (SIMPLE, ACYCLIC) at most
-        // once across the whole walk — which also enforces intra-unit distinctness. A
-        // SIMPLE close back on the seed is the one allowed vertex repeat.
+        // Does this hop finish the TOP unit's rep? (Linear: the position is a single
+        // cursor sitting at its unit's end.)
+        let completes_top = {
+            let t = after.top();
+            after.len() == 1 && t.elem == t.unit.elems.len()
+        };
+        let is_close = matches!(mode, PathMode::Simple) && completes_top && nbr == from;
+
         if !is_close {
             let collide = match mode {
                 PathMode::Trail => marks[eidx as usize],
@@ -3310,42 +3586,8 @@ fn reachable_each_unit(
             }
         }
 
-        // The per-unit `WHERE` (only at a completion, with every inner variable of THIS
-        // unit bound as a scalar). The unit's `k` hops are the top `k` frames plus the
-        // current edge; its source is the boundary frame's vertex.
-        if completing {
-            if let Some(w) = &unit.where_ {
-                let base = stack.len() - k; // the pos-0 boundary frame of this unit
-                let mut saves: Vec<(usize, Option<Val>)> = Vec::new();
-                let mut set = |b: &mut Binding, slot: Option<usize>, v: Val| {
-                    if let Some(s) = slot {
-                        saves.push((s, b.get(s).cloned()));
-                        b.set(s, v);
-                    }
-                };
-                set(binding, unit.start_slot, Val::Node(stack[base].vertex));
-                for j in 0..k {
-                    let hop = unit.hop(j);
-                    let (e, t) = if j + 1 < k {
-                        let f = &stack[base + j + 1];
-                        (f.entry_edge.expect("inner hop has an edge"), f.vertex)
-                    } else {
-                        (eidx, nbr)
-                    };
-                    set(binding, hop.rel.var_slot, Val::Edge(e));
-                    set(binding, hop.target_slot, Val::Node(t));
-                }
-                let ok = as_truth(&eval(&Env::new(graph, ctx, binding), w)) == Some(true);
-                for (s, prev) in saves.into_iter().rev() {
-                    match prev {
-                        Some(v) => binding.set(s, v),
-                        None => binding.unset(s),
-                    }
-                }
-                if !ok {
-                    continue;
-                }
-            }
+        if completes_top && has_where && !where_ok(graph, ctx, binding, &stack, eidx, nbr) {
+            continue;
         }
 
         steps += 1;
@@ -3355,7 +3597,6 @@ fn reachable_each_unit(
             break;
         }
 
-        // Claim this hop's mark (nothing for WALK / a SIMPLE close).
         let mark = match (is_close, mode) {
             (true, _) | (_, PathMode::Walk) => None,
             (_, PathMode::Trail) => Some(eidx as usize),
@@ -3365,20 +3606,11 @@ fn reachable_each_unit(
             marks[mi] = true;
         }
 
-        let reps_after = if completing { reps + 1 } else { reps };
+        let (emit, next_moves) = resolve(after);
 
-        // Emit at a completion whose repetition count is in range. Under `want_path`
-        // rebuild the whole walk to `nbr` (the live stack's vertices/edges + this hop)
-        // and hand it to `on_end`, which owns any group-variable exposure — this matcher
-        // only reconstructs, so a plain path-variable caller gets the path with NO group
-        // binding, while a subpath's sink binds the lists.
-        if completing && reps_after >= q.min {
-            let (pv, pe): (Vec<u32>, Vec<u32>) = if want_path {
-                let mut pv: Vec<u32> = stack.iter().map(|f| f.vertex).collect();
-                pv.push(nbr);
-                let mut pe: Vec<u32> = stack.iter().filter_map(|f| f.entry_edge).collect();
-                pe.push(eidx);
-                (pv, pe)
+        if emit {
+            let (pv, pe) = if want_path {
+                rebuild(&stack, nbr, eidx)
             } else {
                 (Vec::new(), Vec::new())
             };
@@ -3392,35 +3624,29 @@ fn reachable_each_unit(
             }
         }
 
-        // Descend: a mid-unit hop always continues the unit; a completion opens the
-        // next repetition (unless it is a SIMPLE close, or `max` is reached).
-        let next = if completing {
-            let can_extend = !is_close && q.max.is_none_or(|m| reps_after < m);
-            can_extend.then_some((0usize, reps_after))
-        } else {
-            Some((pos + 1, reps))
-        };
-        match next {
-            Some((next_pos, next_reps)) => {
-                let edges = expand_filtered(graph, ctx, binding, &unit.hop(next_pos).rel, nbr);
-                stack.push(Frame {
-                    edges,
-                    idx: 0,
-                    pos: next_pos,
-                    reps: next_reps,
-                    vertex: nbr,
-                    entry_edge: Some(eidx),
-                    entry_mark: mark,
-                });
+        if next_moves.is_empty() {
+            if let Some(mi) = mark {
+                marks[mi] = false;
             }
-            None => {
-                // No descent from here (a close, or the repetition ceiling): this hop's
-                // mark has no deeper use.
-                if let Some(mi) = mark {
-                    marks[mi] = false;
-                }
-            }
+            continue;
         }
+
+        let edges = expand_filtered(
+            graph,
+            ctx,
+            binding,
+            next_moves.get(0).expect("non-empty move set").rel,
+            nbr,
+        );
+        stack.push(Frame {
+            vertex: nbr,
+            moves: next_moves,
+            move_idx: 0,
+            edges,
+            edge_idx: 0,
+            entry_edge: Some(eidx),
+            entry_mark: mark,
+        });
     }
 
     if trail {
