@@ -3200,13 +3200,56 @@ impl Nest {
     }
 }
 
+/// The HOT-path group-variable binder for a FLAT (all-`Hop`) unit: the walk is `r`
+/// repetitions of a fixed `k`-hop unit, so `verts` = `[seed, …]` of length `r·k + 1` and
+/// `edges` of length `r·k`; the variable at node position `p` (0 = source `x`, … `k` = last
+/// target) is `verts[rep·k + p]` across reps, at edge position `p` is `edges[rep·k + p]`.
+/// A direct stride over two flat arrays — no per-hop `StepRec`/`levels`/`Nest` allocation
+/// (that generality is only needed for nesting; see [`bind_group_vars`]). Byte-identical to
+/// the structured binder on a flat unit (conformance-guarded).
+fn bind_group_vars_flat(
+    binding: &mut Binding,
+    unit: &CUnit,
+    verts: &[u32],
+    edges: &[u32],
+) -> Vec<(usize, Option<Val>)> {
+    let k = unit.elems.len();
+    let reps = edges.len().checked_div(k).unwrap_or(0);
+    let mut restores = Vec::new();
+    let mut bind = |binding: &mut Binding, slot: Option<usize>, list: Vec<Val>| {
+        if let Some(s) = slot {
+            restores.push((s, binding.get(s).cloned()));
+            binding.set(s, Val::List(list));
+        }
+    };
+    for p in 0..=k {
+        let slot = if p == 0 {
+            unit.start_slot
+        } else {
+            unit.hop(p - 1).target_slot
+        };
+        bind(
+            binding,
+            slot,
+            (0..reps).map(|rep| Val::Node(verts[rep * k + p])).collect(),
+        );
+    }
+    for p in 0..k {
+        bind(
+            binding,
+            unit.hop(p).rel.var_slot,
+            (0..reps).map(|rep| Val::Edge(edges[rep * k + p])).collect(),
+        );
+    }
+    restores
+}
+
 /// Expose a quantified subpath's inner variables as GROUP variables from the
-/// structured walk. Each variable becomes the (possibly nested) list of its value over
-/// every repetition — one list level per enclosing quantifier. Reproduces the old
-/// `k`-stride binding EXACTLY for a flat (depth-0, all-`Hop`) unit — `x`, each hop's
-/// `target`, each edge — and generalizes with no special cases to nested units
-/// (a `Sub`'s inner variables nest one level deeper; a `Sub`'s landing is its last
-/// inner hop's target). Returns the prior slot values so the caller can restore them.
+/// structured walk (the GENERAL path, for NESTED units). Each variable becomes the
+/// (possibly nested) list of its value over every repetition — one list level per
+/// enclosing quantifier (a `Sub`'s inner variables nest one level deeper; a `Sub`'s
+/// landing is its last inner hop's target). A flat unit takes [`bind_group_vars_flat`]
+/// instead (same result, no per-hop allocation). Returns prior slot values to restore.
 fn bind_group_vars(
     binding: &mut Binding,
     unit: &CUnit,
@@ -3732,6 +3775,9 @@ fn reachable_each_unit(
     let mut steps: u64 = 0;
     let mut cont = true;
     let has_where = unit.where_.is_some();
+    // A flat (all-`Hop`) unit binds group vars by the cheap `k`-stride over the flat walk,
+    // so it never needs per-hop `StepRec`s — only a nested unit does.
+    let unit_flat = unit.is_flat();
 
     // (The top unit's `min == 0` zero-rep acceptance is emitted upfront, before marks.)
     let (_, _, seed_moves) = resolve(&Position::Flat(Cursor {
@@ -3841,7 +3887,14 @@ fn reachable_each_unit(
         if emit {
             let (pv, pe, steps) = if want_path {
                 let (pv, pe) = rebuild(&stack, nbr, eidx);
-                (pv, pe, rebuild_steps(&stack, nbr, eidx))
+                // Only a NESTED unit needs the structured per-hop steps; a flat unit binds
+                // from `pv`/`pe` directly (the hot path — no per-hop allocation).
+                let steps = if unit_flat {
+                    Vec::new()
+                } else {
+                    rebuild_steps(&stack, nbr, eidx)
+                };
+                (pv, pe, steps)
             } else {
                 (Vec::new(), Vec::new(), Vec::new())
             };
@@ -3972,11 +4025,17 @@ fn walk_segments(
         // each trail end; the abbreviated `-[e]->{n}` form is the plain single-edge
         // walk. Both stream through the same `on_end` contract.
         let sink =
-            &mut |b: &mut Binding, end: u32, _verts: &[u32], _edges: &[u32], steps: &[StepRec]| {
+            &mut |b: &mut Binding, end: u32, verts: &[u32], edges: &[u32], steps: &[StepRec]| {
                 let restores = unit
                     .as_ref()
                     .filter(|u| u.exposes())
-                    .map(|u| bind_group_vars(b, u, steps))
+                    .map(|u| {
+                        if u.is_flat() {
+                            bind_group_vars_flat(b, u, verts, edges)
+                        } else {
+                            bind_group_vars(b, u, steps)
+                        }
+                    })
                     .unwrap_or_default();
                 let keep = match_node_then(graph, ctx, b, node, end, &mut |b2| {
                     walk_segments(graph, ctx, pattern, index + 1, end, b2, emit)
@@ -5063,11 +5122,17 @@ fn match_path<F: FnMut(&mut Binding) -> bool>(
         // and exposes its group variables at each trail end; the abbreviated form is
         // the plain single-edge walk. Same `on_end` contract.
         let sink =
-            &mut |b: &mut Binding, end: u32, _verts: &[u32], _edges: &[u32], steps: &[StepRec]| {
+            &mut |b: &mut Binding, end: u32, verts: &[u32], edges: &[u32], steps: &[StepRec]| {
                 let restores = unit
                     .as_ref()
                     .filter(|u| u.exposes())
-                    .map(|u| bind_group_vars(b, u, steps))
+                    .map(|u| {
+                        if u.is_flat() {
+                            bind_group_vars_flat(b, u, verts, edges)
+                        } else {
+                            bind_group_vars(b, u, steps)
+                        }
+                    })
                     .unwrap_or_default();
                 let keep = match_node_continue(graph, ctx, b, node, end, path, idx + 1, emit);
                 for (s, prev) in restores.into_iter().rev() {

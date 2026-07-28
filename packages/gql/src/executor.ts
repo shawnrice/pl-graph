@@ -3056,6 +3056,11 @@ const unitExposes = (u: CUnit): boolean =>
       ? e.hop.targetVar !== undefined || e.hop.rel.variable !== undefined
       : e.sub.targetVar !== undefined || unitExposes(e.sub.unit),
   );
+
+/** Whether every element is a plain hop (no nested `Sub`) — a flat unit binds group
+ *  variables by the cheap `k`-stride over the flat walk, never per-hop steps. Mirrors
+ *  native `CUnit::is_flat`. */
+const unitIsFlat = (u: CUnit): boolean => u.elems.every((e) => 'hop' in e);
 type CPath = {
   start: CNode;
   segments: readonly CSegment[];
@@ -4298,8 +4303,61 @@ const bindUnit = (
   });
 };
 
+/** The HOT-path binder for a FLAT (all-hop) unit: the walk is `r` reps of a fixed `k`-hop
+ *  unit, so the node var at position `p` is `verts[rep·k + p]` and the edge var is
+ *  `edges[rep·k + p]`. A direct stride over two flat arrays — no per-hop `StepRec`
+ *  allocation (that generality is only needed for nesting). Byte-identical to the
+ *  structured binder on a flat unit. Mirrors native `bind_group_vars_flat`. */
+const bindGroupVarsFlat = (
+  binding: Binding,
+  unit: CUnit,
+  verts: readonly Vertex[],
+  edges: readonly Edge[],
+): Binding => {
+  const next = new Map(binding);
+  const k = unit.elems.length;
+  const reps = k === 0 ? 0 : Math.floor(edges.length / k);
+
+  for (let p = 0; p <= k; p += 1) {
+    let varName = unit.startVar;
+
+    if (p > 0) {
+      const el = unit.elems[p - 1];
+      varName = 'hop' in el ? el.hop.targetVar : undefined;
+    }
+
+    if (varName !== undefined) {
+      const list: Vertex[] = [];
+
+      for (let rep = 0; rep < reps; rep += 1) {
+        list.push(verts[rep * k + p]);
+      }
+
+      next.set(varName, list);
+    }
+  }
+
+  for (let p = 0; p < k; p += 1) {
+    const el = unit.elems[p];
+    const varName = 'hop' in el ? el.hop.rel.variable : undefined;
+
+    if (varName !== undefined) {
+      const list: Edge[] = [];
+
+      for (let rep = 0; rep < reps; rep += 1) {
+        list.push(edges[rep * k + p]);
+      }
+
+      next.set(varName, list);
+    }
+  }
+
+  return next;
+};
+
 /** Expose a quantified subpath's inner variables as GROUP variables from the structured
- *  walk — each a (possibly nested) list, one level per enclosing quantifier. Mirrors
+ *  walk (the GENERAL path, for NESTED units) — each a (possibly nested) list, one level
+ *  per enclosing quantifier. A flat unit takes {@link bindGroupVarsFlat} instead. Mirrors
  *  native `bind_group_vars`. */
 const bindGroupVars = (binding: Binding, unit: CUnit, steps: readonly StepRec[]): Binding => {
   const next = new Map(binding);
@@ -4516,6 +4574,9 @@ const trailEndsUnit = function* (
 
   let steps = 0;
   const hasWhere = unit.where !== undefined;
+  // A flat (all-hop) unit binds group vars by the cheap `k`-stride over the flat walk, so
+  // it never needs per-hop steps — only a nested unit does.
+  const flat = unitIsFlat(unit);
 
   // The top unit's `min == 0` zero-rep acceptance — the empty walk at the seed.
   if (q.min === 0) {
@@ -4646,7 +4707,9 @@ const trailEndsUnit = function* (
         const edges = stack.map((f) => f.entryEdge).filter((e): e is Edge => e !== null);
         edges.push(edge);
 
-        yield { end: nbr, verts, edges, steps: buildSteps(nbr, edge) };
+        // Only a NESTED unit needs the structured per-hop steps; a flat unit binds from
+        // `verts`/`edges` directly (the hot path — no per-hop allocation).
+        yield { end: nbr, verts, edges, steps: flat ? [] : buildSteps(nbr, edge) };
       } else {
         yield { end: nbr, verts: [], edges: [], steps: [] };
       }
@@ -4700,8 +4763,17 @@ const walkSegments = function* (
       ? trailEndsUnit(graph, from, unit, rel.quantifier, { mode, binding, params, wantPath: true })
       : trailEnds(graph, from, rel, rel.quantifier, { mode, binding, params, wantPath: false });
 
-    for (const { end, steps } of ends) {
-      const withGroups = unit && unitExposes(unit) ? bindGroupVars(binding, unit, steps) : binding;
+    for (const { end, verts, edges, steps } of ends) {
+      // A flat unit binds from the flat walk (`verts`/`edges`, the k-stride hot path); a
+      // nested unit uses the structured per-hop steps.
+      let withGroups = binding;
+
+      if (unit && unitExposes(unit)) {
+        withGroups = unitIsFlat(unit)
+          ? bindGroupVarsFlat(binding, unit, verts, edges)
+          : bindGroupVars(binding, unit, steps);
+      }
+
       const matched = matchNode(withGroups, node, end, params, graph);
 
       if (matched) {

@@ -5589,6 +5589,15 @@ fn bench_var_length_matcher() {
             "k3_subpath ",
             "MATCH (s:N {id:'n0'}) ((x)-[:R]->(m)-[:R]->(w)-[:R]->(y)){1} (t) RETURN count(*) AS c",
         ),
+        // NESTED units take the general structured binder (not the flat k-stride fast path).
+        (
+            "nest_anon  ",
+            "MATCH (s:N {id:'n0'}) ( ()-[:R]->{1,2}() ){1,2} (t) RETURN count(*) AS c",
+        ),
+        (
+            "nest_grpvar",
+            "MATCH (s:N {id:'n0'}) ( (x)-[:R]->{1,2}(y) ){1,2} (t) RETURN count(size(x)) AS c",
+        ),
     ];
     for (label, q) in cases {
         for _ in 0..5 {

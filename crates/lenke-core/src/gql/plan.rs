@@ -658,6 +658,21 @@ impl CUnit {
                 CElem::Sub(s) => s.target_slot.is_some() || s.unit.exposes(),
             })
     }
+
+    /// Whether every element is a plain `Hop` (no nested `Sub`). A flat unit has a fixed
+    /// `k` hops per rep, so its group variables can be bound by the cheap `k`-stride over
+    /// the flat walk — the hot path — instead of the general structured binder.
+    pub fn is_flat(&self) -> bool {
+        self.elems.iter().all(|e| matches!(e, CElem::Hop(_)))
+    }
+
+    /// The element at `i` as a hop (a flat unit's elements are all hops).
+    pub fn hop(&self, i: usize) -> &CHop {
+        match &self.elems[i] {
+            CElem::Hop(h) => h,
+            CElem::Sub(_) => unreachable!("a nested sub-unit is not bound by the k-stride path"),
+        }
+    }
 }
 
 /// One element of a unit's linear sequence: a single edge, or a nested quantified
