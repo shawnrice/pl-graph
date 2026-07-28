@@ -689,6 +689,10 @@ pub struct CSub {
     pub unit: Box<CUnit>,
     pub min: u32,
     pub max: Option<u32>,
+    /// The subpath's LANDING node variable (`y` in `( (x)-[]->{1,3}(y) ){2}`) — the
+    /// vertex after the whole sub-unit completes, exposed as a group variable at the
+    /// enclosing unit's depth. `None` until nested exposure is compiled in.
+    pub target_slot: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -1685,6 +1689,7 @@ impl Lowerer {
                     }),
                     min: quant.min,
                     max: quant.max,
+                    target_slot: None,
                 }),
             }
         }

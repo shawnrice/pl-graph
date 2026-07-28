@@ -3090,10 +3090,13 @@ struct WalkSpec {
     want_path: bool,
 }
 
-/// `reachable_each`'s per-trail sink: `(binding, endpoint, vertices, edges) ->
+/// `reachable_each`'s per-trail sink: `(binding, endpoint, vertices, edges, steps) ->
 /// keep-going`. The binding is threaded through so the driver can bind each hop's
 /// edge for a per-hop predicate; the sink binds the endpoint node on top of it.
-type OnEnd<'a> = &'a mut dyn FnMut(&mut Binding, u32, &[u32], &[u32]) -> bool;
+/// `vertices`/`edges` are the FLAT walk (for a Path value); `steps` is the same walk
+/// tagged with each hop's position in the (possibly nested) repetition pattern, so a
+/// subpath sink can assemble group variables at any nesting depth (see [`StepRec`]).
+type OnEnd<'a> = &'a mut dyn FnMut(&mut Binding, u32, &[u32], &[u32], &[StepRec]) -> bool;
 
 /// Does edge `eidx` satisfy the segment's per-hop predicate (inline properties +
 /// `WHERE`)? The optional edge variable is bound to this edge for the duration of
@@ -3145,51 +3148,167 @@ fn expand_filtered(
         .collect()
 }
 
-/// Expose a quantified subpath's inner variables as GROUP variables — each is the
-/// list of its value over every repetition. The full walk is `r` repetitions of a
-/// `k`-hop unit, so `verts` = `[seed, …]` of length `r·k + 1` and `edges` of length
-/// `r·k`; variable at unit **node position** `p` (0 = source `x`, … `k` = last
-/// target `y`) is `verts[rep·k + p]` across reps, and at **edge position** `p` is
-/// `edges[rep·k + p]`. For a single-edge unit (`k = 1`) this is exactly `x =
-/// verts[..last]`, `y = verts[1..]`, `e = edges`. Returns the prior slot values so
-/// the caller can restore them (a sibling trail must not see them).
+/// One graph-consuming hop of a matched trail, tagged with its position in the
+/// (possibly nested) repetition pattern. `levels` is the cursor stack outer→inner:
+/// one `(rep, elem_after)` per active unit, where `elem_after` is the element index
+/// the hop ADVANCED PAST (so the hop's own element is `elem_after - 1`, and a step
+/// sitting inside a `Sub` keeps the outer unit's `elem` pinned at that Sub's index).
+/// This is what lets ONE structured binder assemble group variables at any nesting
+/// depth, instead of striding a flat array by a fixed `k`.
+struct StepRec {
+    levels: Vec<(u32, usize)>,
+    source: u32,
+    edge: u32,
+    target: u32,
+}
+
+/// A partially-built nested list, indexed by a rep-tuple. `insert([i,j], v)` places
+/// `v` at `list[i][j]`, growing intermediate lists as needed. A depth-0 variable has
+/// 1-element index tuples (a flat list); a variable nested `d` quantifiers deep has
+/// `d+1`-element tuples (a list nested `d+1` deep).
+enum Nest {
+    Leaf(Val),
+    List(Vec<Self>),
+}
+
+impl Nest {
+    fn empty() -> Self {
+        Self::List(Vec::new())
+    }
+    fn insert(&mut self, idx: &[u32], val: Val) {
+        match idx.split_first() {
+            None => *self = Self::Leaf(val),
+            Some((&i, rest)) => {
+                if !matches!(self, Self::List(_)) {
+                    *self = Self::List(Vec::new());
+                }
+                if let Self::List(v) = self {
+                    let i = i as usize;
+                    while v.len() <= i {
+                        v.push(Self::List(Vec::new()));
+                    }
+                    v[i].insert(rest, val);
+                }
+            }
+        }
+    }
+    fn into_val(self) -> Val {
+        match self {
+            Self::Leaf(v) => v,
+            Self::List(items) => Val::List(items.into_iter().map(Self::into_val).collect()),
+        }
+    }
+}
+
+/// Expose a quantified subpath's inner variables as GROUP variables from the
+/// structured walk. Each variable becomes the (possibly nested) list of its value over
+/// every repetition — one list level per enclosing quantifier. Reproduces the old
+/// `k`-stride binding EXACTLY for a flat (depth-0, all-`Hop`) unit — `x`, each hop's
+/// `target`, each edge — and generalizes with no special cases to nested units
+/// (a `Sub`'s inner variables nest one level deeper; a `Sub`'s landing is its last
+/// inner hop's target). Returns the prior slot values so the caller can restore them.
 fn bind_group_vars(
     binding: &mut Binding,
     unit: &CUnit,
-    verts: &[u32],
-    edges: &[u32],
+    steps: &[StepRec],
 ) -> Vec<(usize, Option<Val>)> {
-    let k = unit.elems.len();
-    let reps = edges.len().checked_div(k).unwrap_or(0);
     let mut restores = Vec::new();
-    let mut bind = |binding: &mut Binding, slot: Option<usize>, list: Vec<Val>| {
-        if let Some(s) = slot {
-            restores.push((s, binding.get(s).cloned()));
-            binding.set(s, Val::List(list));
-        }
-    };
-    // Node positions 0..=k: the unit source, then each hop's target.
-    for p in 0..=k {
-        let slot = if p == 0 {
-            unit.start_slot
-        } else {
-            unit.hop(p - 1).target_slot
-        };
-        bind(
-            binding,
-            slot,
-            (0..reps).map(|rep| Val::Node(verts[rep * k + p])).collect(),
-        );
-    }
-    // Edge positions 0..k: each hop's edge.
-    for p in 0..k {
-        bind(
-            binding,
-            unit.hop(p).rel.var_slot,
-            (0..reps).map(|rep| Val::Edge(edges[rep * k + p])).collect(),
-        );
-    }
+    bind_unit(binding, unit, &[], steps, &mut restores);
     restores
+}
+
+/// Assemble one unit's group variables. `tree_path` is the sequence of `Sub`-element
+/// indices from the top unit down to THIS unit, so `depth = tree_path.len()` is the
+/// unit's nesting depth (0 = top). A variable here is indexed by the rep counters of
+/// levels `0..=depth`: the enclosing quantifiers form the outer list dimensions, this
+/// unit's own rep is the innermost. `steps` is in walk order, so "first/last matching
+/// step" needs no sort. Recurses into each `Sub` child.
+fn bind_unit(
+    binding: &mut Binding,
+    unit: &CUnit,
+    tree_path: &[usize],
+    steps: &[StepRec],
+    restores: &mut Vec<(usize, Option<Val>)>,
+) {
+    let depth = tree_path.len();
+    // The rep-tuple that indexes a variable of THIS unit: reps of levels `0..=depth`.
+    let key = |s: &StepRec| -> Vec<u32> { s.levels[..=depth].iter().map(|(r, _)| *r).collect() };
+    // Is `s` a hop somewhere inside this unit (at this tree position), possibly deeper?
+    let within = |s: &StepRec| -> bool {
+        s.levels.len() > depth
+            && s.levels[..depth]
+                .iter()
+                .map(|(_, e)| *e)
+                .eq(tree_path.iter().copied())
+    };
+
+    // `start_slot` = the source vertex of each rep-instance = its FIRST hop's source
+    // (which may sit inside a leading `Sub`, hence `within`, not just direct hops).
+    if let Some(slot) = unit.start_slot {
+        let mut nest = Nest::empty();
+        let mut seen: FxHashSet<Vec<u32>> = FxHashSet::default();
+        for s in steps.iter().filter(|s| within(s)) {
+            let k = key(s);
+            if seen.insert(k.clone()) {
+                nest.insert(&k, Val::Node(s.source));
+            }
+        }
+        restores.push((slot, binding.get(slot).cloned()));
+        binding.set(slot, nest.into_val());
+    }
+
+    for (e, elem) in unit.elems.iter().enumerate() {
+        match elem {
+            CElem::Hop(h) => {
+                // A DIRECT hop at element `e`: one level deeper than the enclosing
+                // path, its own `elem_after` == e + 1.
+                let direct = |s: &&StepRec| {
+                    within(s) && s.levels.len() == depth + 1 && s.levels[depth].1 == e + 1
+                };
+                if let Some(slot) = h.target_slot {
+                    let mut nest = Nest::empty();
+                    for s in steps.iter().filter(direct) {
+                        nest.insert(&key(s), Val::Node(s.target));
+                    }
+                    restores.push((slot, binding.get(slot).cloned()));
+                    binding.set(slot, nest.into_val());
+                }
+                if let Some(slot) = h.rel.var_slot {
+                    let mut nest = Nest::empty();
+                    for s in steps.iter().filter(direct) {
+                        nest.insert(&key(s), Val::Edge(s.edge));
+                    }
+                    restores.push((slot, binding.get(slot).cloned()));
+                    binding.set(slot, nest.into_val());
+                }
+            }
+            CElem::Sub(sub) => {
+                // A `Sub`'s landing = the target of its LAST inner hop, per rep-instance
+                // (inner steps keep this unit's `elem` pinned at `e`).
+                if let Some(slot) = sub.target_slot {
+                    let mut last: Vec<(Vec<u32>, u32)> = Vec::new();
+                    for s in steps.iter().filter(|s| {
+                        within(s) && s.levels.len() > depth + 1 && s.levels[depth].1 == e
+                    }) {
+                        let k = key(s);
+                        match last.iter_mut().find(|(kk, _)| *kk == k) {
+                            Some(slot) => slot.1 = s.target,
+                            None => last.push((k, s.target)),
+                        }
+                    }
+                    let mut nest = Nest::empty();
+                    for (k, t) in last {
+                        nest.insert(&k, Val::Node(t));
+                    }
+                    restores.push((slot, binding.get(slot).cloned()));
+                    binding.set(slot, nest.into_val());
+                }
+                let mut child_path = tree_path.to_vec();
+                child_path.push(e);
+                bind_unit(binding, &sub.unit, &child_path, steps, restores);
+            }
+        }
+    }
 }
 
 /// The GENERAL repetition matcher: repeat `unit` from `from`, streaming each trail end
@@ -3225,7 +3344,7 @@ fn reachable_each_unit(
     if ctx.faulted() {
         return true;
     }
-    if q.min == 0 && !on_end(binding, from, &[from], &[]) {
+    if q.min == 0 && !on_end(binding, from, &[from], &[], &[]) {
         return false;
     }
 
@@ -3299,6 +3418,15 @@ fn reachable_each_unit(
         }
         fn key(&self) -> Vec<(usize, u32, usize)> {
             let one = |c: &Cursor| (c.unit as *const CUnit as usize, c.rep, c.elem);
+            match self {
+                Position::Flat(c) => vec![one(c)],
+                Position::Deep(v) => v.iter().map(one).collect(),
+            }
+        }
+        // The `(rep, elem)` per active unit, outer→inner — the tag [`StepRec`] carries
+        // so one structured binder can place a hop's value at its nesting depth.
+        fn levels(&self) -> Vec<(u32, usize)> {
+            let one = |c: &Cursor| (c.rep, c.elem);
             match self {
                 Position::Flat(c) => vec![one(c)],
                 Position::Deep(v) => v.iter().map(one).collect(),
@@ -3473,6 +3601,38 @@ fn reachable_each_unit(
         (pv, pe)
     }
 
+    // The structured walk: one `StepRec` per hop, tagged with its pattern position. Each
+    // frame's taken move stays frozen at the hop that spawned its child while that child
+    // is live, so `stack[i].moves[move_idx].after` is exactly hop `i`'s landing position
+    // (whose top `elem` is one past the element traversed). The final hop (this emit) is
+    // `stack[last]`'s current move → `(eidx, nbr)`.
+    fn rebuild_steps(stack: &[Frame], nbr: u32, eidx: u32) -> Vec<StepRec> {
+        let mut steps = Vec::with_capacity(stack.len());
+        for i in 0..stack.len() {
+            let at = &stack[i]
+                .moves
+                .get(stack[i].move_idx)
+                .expect("a live move")
+                .after;
+            let source = stack[i].vertex;
+            let (edge, target) = if i + 1 < stack.len() {
+                (
+                    stack[i + 1].entry_edge.expect("an inner hop has an edge"),
+                    stack[i + 1].vertex,
+                )
+            } else {
+                (eidx, nbr)
+            };
+            steps.push(StepRec {
+                levels: at.levels(),
+                source,
+                edge,
+                target,
+            });
+        }
+        steps
+    }
+
     // The top unit's per-rep `WHERE` (linear only — a nested unit's WHERE is rejected at
     // compile). Reconstruct the just-completed rep's `k` hops from the top `k` frames +
     // the current edge, bind them as scalars, evaluate.
@@ -3609,12 +3769,13 @@ fn reachable_each_unit(
         let (emit, next_moves) = resolve(after);
 
         if emit {
-            let (pv, pe) = if want_path {
-                rebuild(&stack, nbr, eidx)
+            let (pv, pe, steps) = if want_path {
+                let (pv, pe) = rebuild(&stack, nbr, eidx);
+                (pv, pe, rebuild_steps(&stack, nbr, eidx))
             } else {
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), Vec::new())
             };
-            if !on_end(binding, nbr, &pv, &pe) {
+            if !on_end(binding, nbr, &pv, &pe, &steps) {
                 cont = false;
                 if let Some(mi) = mark {
                     marks[mi] = false;
@@ -3710,7 +3871,7 @@ fn reachable(
             mode,
             want_path: false,
         },
-        &mut |_b, e, _, _| {
+        &mut |_b, e, _, _, _| {
             ends.push(e);
             true
         },
@@ -3740,23 +3901,24 @@ fn walk_segments(
         // parenthesized SUBPATH repeats a unit and exposes its group variables at
         // each trail end; the abbreviated `-[e]->{n}` form is the plain single-edge
         // walk. Both stream through the same `on_end` contract.
-        let sink = &mut |b: &mut Binding, end: u32, verts: &[u32], edges: &[u32]| {
-            let restores = unit
-                .as_ref()
-                .filter(|u| u.exposes())
-                .map(|u| bind_group_vars(b, u, verts, edges))
-                .unwrap_or_default();
-            let keep = match_node_then(graph, ctx, b, node, end, &mut |b2| {
-                walk_segments(graph, ctx, pattern, index + 1, end, b2, emit)
-            });
-            for (s, prev) in restores.into_iter().rev() {
-                match prev {
-                    Some(v) => b.set(s, v),
-                    None => b.unset(s),
+        let sink =
+            &mut |b: &mut Binding, end: u32, _verts: &[u32], _edges: &[u32], steps: &[StepRec]| {
+                let restores = unit
+                    .as_ref()
+                    .filter(|u| u.exposes())
+                    .map(|u| bind_group_vars(b, u, steps))
+                    .unwrap_or_default();
+                let keep = match_node_then(graph, ctx, b, node, end, &mut |b2| {
+                    walk_segments(graph, ctx, pattern, index + 1, end, b2, emit)
+                });
+                for (s, prev) in restores.into_iter().rev() {
+                    match prev {
+                        Some(v) => b.set(s, v),
+                        None => b.unset(s),
+                    }
                 }
-            }
-            keep
-        };
+                keep
+            };
         let spec = WalkSpec {
             q,
             mode: pattern.mode,
@@ -4109,7 +4271,7 @@ fn all_walk(
             mode: pattern.mode,
             want_path: true,
         },
-        &mut |b, end, verts, edges| {
+        &mut |b, end, verts, edges, _steps: &[StepRec]| {
             match_node_then(graph, ctx, b, end_node, end, &mut |b| {
                 if let Some(s) = path_slot {
                     b.set(
@@ -4161,7 +4323,7 @@ fn any_walk(
             mode: pattern.mode,
             want_path: path_slot.is_some(),
         },
-        &mut |b, end, verts, edges| {
+        &mut |b, end, verts, edges, _steps: &[StepRec]| {
             // First witness per endpoint only (the endpoint match is per-vertex, so
             // a non-matching endpoint never emits regardless of which walk reached
             // it — marking it seen just avoids re-trying).
@@ -4229,7 +4391,7 @@ fn shortest_k_walk(
             mode: pattern.mode,
             want_path: true,
         },
-        &mut |_b, end, verts, edges| {
+        &mut |_b, end, verts, edges, _steps: &[StepRec]| {
             per_end
                 .entry(end)
                 .or_default()
@@ -4830,21 +4992,22 @@ fn match_path<F: FnMut(&mut Binding) -> bool>(
         // The twin of `walk_segments`' branch: a parenthesized SUBPATH repeats a unit
         // and exposes its group variables at each trail end; the abbreviated form is
         // the plain single-edge walk. Same `on_end` contract.
-        let sink = &mut |b: &mut Binding, end: u32, verts: &[u32], edges: &[u32]| {
-            let restores = unit
-                .as_ref()
-                .filter(|u| u.exposes())
-                .map(|u| bind_group_vars(b, u, verts, edges))
-                .unwrap_or_default();
-            let keep = match_node_continue(graph, ctx, b, node, end, path, idx + 1, emit);
-            for (s, prev) in restores.into_iter().rev() {
-                match prev {
-                    Some(v) => b.set(s, v),
-                    None => b.unset(s),
+        let sink =
+            &mut |b: &mut Binding, end: u32, _verts: &[u32], _edges: &[u32], steps: &[StepRec]| {
+                let restores = unit
+                    .as_ref()
+                    .filter(|u| u.exposes())
+                    .map(|u| bind_group_vars(b, u, steps))
+                    .unwrap_or_default();
+                let keep = match_node_continue(graph, ctx, b, node, end, path, idx + 1, emit);
+                for (s, prev) in restores.into_iter().rev() {
+                    match prev {
+                        Some(v) => b.set(s, v),
+                        None => b.unset(s),
+                    }
                 }
-            }
-            keep
-        };
+                keep
+            };
         let spec = WalkSpec {
             q,
             mode: path.mode,
