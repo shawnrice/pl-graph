@@ -4726,6 +4726,75 @@ fn visit_patterns(
 /// WHERE), instead of enumerating trails (exponential — it hits the trail budget and
 /// faults, e.g. testing whether an *unreachable* target is reachable). Returns
 /// `Some(bool)` when it applies, else `None` (fall back to the general matcher).
+/// Does a ≥1-hop `dir`-directed, `el`-labeled path `from → to` exist? BIDIRECTIONAL
+/// BFS: grow a forward frontier from `from` and a backward frontier from `to`, always
+/// expanding the smaller, and stop the instant they meet (`to` reached forward, `from`
+/// reached backward, or the frontiers intersect) — or both exhaust. Same boolean as a
+/// one-directional search, but the NEGATIVE case costs ≈ min(forward-cone, backward-cone)
+/// instead of the full forward cone — the win when both endpoints are bound (a reachability
+/// `EXISTS` like group-membership or resource-ancestry). Vertex-visited = reachability
+/// (mode-independent, as `EXISTS` is).
+fn reachable_bidir(
+    graph: &Graph,
+    ctx: &Ctx,
+    from: u32,
+    to: u32,
+    dir: Direction,
+    el: Option<&CLabelExpr>,
+) -> bool {
+    let rev = match dir {
+        Direction::Out => Direction::In,
+        Direction::In => Direction::Out,
+        Direction::Both => Direction::Both,
+    };
+    let n = graph.vertex_count();
+    let mut vf = crate::graph::BitSet::zeros(n); // reachable FROM `from` (≥1 hop)
+    let mut vb = crate::graph::BitSet::zeros(n); // can REACH `to` (≥1 hop)
+    let mut ff: Vec<u32> = Vec::new();
+    let mut fb: Vec<u32> = Vec::new();
+    let seed = |v: u32, d: Direction, seen: &mut crate::graph::BitSet, front: &mut Vec<u32>| {
+        for (_e, w) in expand(graph, ctx, v, d, el) {
+            if !seen.get(w as usize) {
+                seen.set(w as usize);
+                front.push(w);
+            }
+        }
+    };
+    seed(from, dir, &mut vf, &mut ff);
+    seed(to, rev, &mut vb, &mut fb);
+    loop {
+        // Meeting: `to` reachable forward, `from` reachable backward, or the two sets overlap.
+        if vf.get(to as usize) || vb.get(from as usize) {
+            return true;
+        }
+        if ff.iter().any(|&w| vb.get(w as usize)) || fb.iter().any(|&w| vf.get(w as usize)) {
+            return true;
+        }
+        // Terminate as soon as EITHER side is fully explored without meeting: if every
+        // vertex that can reach `to` (or is reachable from `from`) is enumerated and the
+        // opposite anchor is not among them, no path exists — no need to exhaust the other,
+        // possibly huge, cone. This is where the negative-case win comes from.
+        if ff.is_empty() || fb.is_empty() {
+            return false;
+        }
+        // Expand the smaller frontier (an exhausted side never gets picked).
+        let forward = !ff.is_empty() && (fb.is_empty() || ff.len() <= fb.len());
+        let (cur, d, seen, front) = if forward {
+            (std::mem::take(&mut ff), dir, &mut vf, &mut ff)
+        } else {
+            (std::mem::take(&mut fb), rev, &mut vb, &mut fb)
+        };
+        for u in cur {
+            for (_e, w) in expand(graph, ctx, u, d, el) {
+                if !seen.get(w as usize) {
+                    seen.set(w as usize);
+                    front.push(w);
+                }
+            }
+        }
+    }
+}
+
 fn any_match_reachable(
     graph: &Graph,
     ctx: &Ctx,
@@ -4798,6 +4867,15 @@ fn any_match_reachable(
         return Some(true);
     }
     let (dir, el) = (seg.rel.direction, seg.rel.label.as_ref());
+    // BOTH endpoints bound → a pure `from → to` reachability question. Validate the target
+    // once (label / inline props / WHERE), then answer bidirectionally so a NEGATIVE check
+    // costs ≈ min(forward, backward) instead of exhausting the whole forward cone.
+    if let Some(be) = bound_end {
+        if !hit(graph, be, &mut work) {
+            return Some(false);
+        }
+        return Some(reachable_bidir(graph, ctx, sv, be, dir, el));
+    }
     let mut seen = crate::graph::BitSet::zeros(graph.vertex_count());
     let mut stack: Vec<u32> = Vec::new();
     let visit = |w: u32, seen: &mut crate::graph::BitSet, stack: &mut Vec<u32>| -> bool {

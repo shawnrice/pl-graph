@@ -2256,6 +2256,58 @@ fn call_config_key_validation() {
     );
 }
 
+/// A bound-both-endpoints reachability `EXISTS { (a)-[:R]->+(b) }` (both anchored) takes
+/// the bidirectional fast path; it must give the SAME boolean as a one-directional search
+/// across reachable / UNreachable (the exhaust-the-cone case) / cycles / self-loops / the
+/// zero-length `*` / reversed direction.
+#[test]
+fn exists_bound_endpoint_reachability_is_bidirectional_and_exact() {
+    // chain a→b→c→d; isolated e; self-loop f→f; 2-cycle g↔h.
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+        r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}"#,
+        r#"{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}"#,
+        r#"{"type":"node","id":"e","labels":["N"],"properties":{"id":"e"}}"#,
+        r#"{"type":"node","id":"f","labels":["N"],"properties":{"id":"f"}}"#,
+        r#"{"type":"node","id":"g","labels":["N"],"properties":{"id":"g"}}"#,
+        r#"{"type":"node","id":"h","labels":["N"],"properties":{"id":"h"}}"#,
+        r#"{"type":"edge","from":"a","to":"b","labels":["R"]}"#,
+        r#"{"type":"edge","from":"b","to":"c","labels":["R"]}"#,
+        r#"{"type":"edge","from":"c","to":"d","labels":["R"]}"#,
+        r#"{"type":"edge","from":"f","to":"f","labels":["R"]}"#,
+        r#"{"type":"edge","from":"g","to":"h","labels":["R"]}"#,
+        r#"{"type":"edge","from":"h","to":"g","labels":["R"]}"#,
+    ]);
+    // Both endpoints bound (the outer MATCH anchors a AND b) → bidirectional fast path.
+    let reaches = |g: &mut Graph, from: &str, to: &str, arrow: &str| -> bool {
+        !rows(
+            g,
+            &format!(
+                "MATCH (a:N {{id:'{from}'}}), (b:N {{id:'{to}'}}) \
+                 WHERE EXISTS {{ MATCH (a)-[:R]->{arrow}(b) }} RETURN 1 AS x"
+            ),
+        )
+        .is_empty()
+    };
+    assert!(reaches(&mut g, "a", "d", "+")); // a→→→d
+    assert!(reaches(&mut g, "a", "b", "+"));
+    assert!(!reaches(&mut g, "a", "e", "+")); // e unreachable — NEGATIVE, must exhaust
+    assert!(!reaches(&mut g, "d", "a", "+")); // wrong direction — NEGATIVE
+    assert!(reaches(&mut g, "g", "g", "+")); // g on a 2-cycle
+    assert!(reaches(&mut g, "f", "f", "+")); // self-loop
+    assert!(!reaches(&mut g, "e", "e", "+")); // no self-loop; `+` needs ≥1 hop
+    assert!(reaches(&mut g, "e", "e", "*")); // `*` admits the zero-length self path
+    assert!(reaches(&mut g, "a", "a", "*"));
+    assert!(!reaches(&mut g, "a", "a", "+")); // a not on a cycle
+                                              // Reversed direction: `<-[:R]-+` = follow edges backward.
+    assert!(!rows(
+        &mut g,
+        "MATCH (a:N {id:'a'}), (d:N {id:'d'}) WHERE EXISTS { MATCH (d)<-[:R]-+(a) } RETURN 1 AS x",
+    )
+    .is_empty());
+}
+
 /// `neighborAggregate`'s `norm` (and `weightProperty`) must be accepted via GQL `CALL`,
 /// not only via the direct-method API — the CALL path has its OWN config-key mapping.
 /// Regression guard: `norm` shipped to the algorithm + `CONFIG_KEYS` but was initially
