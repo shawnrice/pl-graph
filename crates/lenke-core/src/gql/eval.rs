@@ -3029,13 +3029,13 @@ fn expand<'a>(
 /// Try to match `node` at vertex `vi`, extending `binding` in place and invoking
 /// `cont` on success, then restoring it. Returns `false` only if `cont` asked to
 /// stop the whole traversal.
-fn match_node_then(
+fn match_node_then<C: FnMut(&mut Binding) -> bool + ?Sized>(
     graph: &Graph,
     ctx: &Ctx,
     binding: &mut Binding,
     node: &CNode,
     vi: u32,
-    cont: &mut dyn FnMut(&mut Binding) -> bool,
+    cont: &mut C,
 ) -> bool {
     if !matches_label(graph, ctx, vi, node.label.as_ref()) {
         return true; // no match here, but keep going
@@ -5304,6 +5304,8 @@ fn drive_matches(
     clippy::too_many_arguments,
     reason = "recursive backtracking matcher; bundling its args into a struct would obscure the hot recursion"
 )]
+/// Bind `vi` to `node` and continue into `path[next_idx..]` — the specialized
+/// (next-segment) continuation of the shared node-binder [`match_node_then`].
 fn match_node_continue<F: FnMut(&mut Binding) -> bool + ?Sized>(
     graph: &Graph,
     ctx: &Ctx,
@@ -5314,29 +5316,9 @@ fn match_node_continue<F: FnMut(&mut Binding) -> bool + ?Sized>(
     next_idx: usize,
     emit: &mut F,
 ) -> bool {
-    if !matches_label(graph, ctx, vi, node.label.as_ref()) {
-        return true;
-    }
-    let Some(did) = bind_slot(binding, node.var_slot, &Val::Node(vi)) else {
-        return true;
-    };
-    let go = satisfies(
-        graph,
-        ctx,
-        &Val::Node(vi),
-        &node.props,
-        node.where_.as_ref(),
-        binding,
-    );
-    let keep = if go {
-        match_path(graph, ctx, path, next_idx, vi, binding, emit)
-    } else {
-        true
-    };
-    if did {
-        binding.unset(node.var_slot.unwrap());
-    }
-    keep
+    match_node_then(graph, ctx, binding, node, vi, &mut |b| {
+        match_path(graph, ctx, path, next_idx, vi, b, emit)
+    })
 }
 
 /// Walk segments `idx..` of `path` from `from`, emitting each complete binding. Generic
