@@ -4048,6 +4048,34 @@ fn emit_walk_end(
     })
 }
 
+/// The endpoint set for a shortest / all-shortest BFS: every vertex whose shortest
+/// distance is ≥ `q.min`, plus the seed itself when `q.min ≥ 1` and a cycle returns to
+/// it within the hop ceiling (`(a)-[]->+(a)`). Returns the ascending-id-sorted ends and
+/// whether the seed was added as a cycle endpoint (the caller reconstructs the seed path
+/// specially in that case). `seed_cycle_dist` is the shortest cycle length back to the
+/// seed, or `None` if none exists; `q.min ≤ 1` is enforced upstream, so the seed added
+/// here is never already present at dist 0 (the min-0 case). Shared, byte-identically,
+/// by `shortest_walk` (single predecessor) and `all_shortest_walk` (all predecessors).
+fn shortest_ends(
+    dist: &HashMap<u32, u32>,
+    q: &Quantifier,
+    seed: u32,
+    seed_cycle_dist: Option<u32>,
+) -> (Vec<u32>, bool) {
+    let mut ends: Vec<u32> = dist
+        .iter()
+        .filter(|&(_, &d)| d >= q.min)
+        .map(|(&v, _)| v)
+        .collect();
+    let seed_cycle_end =
+        q.min >= 1 && seed_cycle_dist.is_some_and(|cd| q.max.is_none_or(|m| cd <= m));
+    if seed_cycle_end {
+        ends.push(seed);
+    }
+    ends.sort_unstable();
+    (ends, seed_cycle_end)
+}
+
 fn shortest_walk(
     graph: &Graph,
     ctx: &Ctx,
@@ -4097,21 +4125,7 @@ fn shortest_walk(
     }
 
     // Endpoints: every vertex reached within [min, max] hops, ascending by id.
-    let mut ends: Vec<u32> = dist
-        .iter()
-        .filter(|&(_, &d)| d >= q.min)
-        .map(|(&v, _)| v)
-        .collect();
-    // When `q.min ≥ 1` excludes the seed's zero-hop path but a cycle back to it
-    // exists within the hop ceiling, the seed is an endpoint at the shortest-cycle
-    // distance (`(a)-[]->+(a)`). `q.min ≤ 1` is enforced, so this never
-    // double-adds a seed already present at dist 0 (min = 0 case).
-    let seed_cycle_end =
-        q.min >= 1 && seed_cycle.is_some_and(|(cd, _, _)| q.max.is_none_or(|m| cd <= m));
-    if seed_cycle_end {
-        ends.push(seed);
-    }
-    ends.sort_unstable();
+    let (ends, seed_cycle_end) = shortest_ends(&dist, &q, seed, seed_cycle.map(|(cd, _, _)| cd));
 
     for end in ends {
         let path = if end == seed && seed_cycle_end {
@@ -4253,17 +4267,7 @@ fn all_shortest_walk(
         }
     }
 
-    let mut ends: Vec<u32> = dist
-        .iter()
-        .filter(|&(_, &d)| d >= q.min)
-        .map(|(&v, _)| v)
-        .collect();
-    let seed_cycle_end =
-        q.min >= 1 && seed_cycle_dist.is_some_and(|cd| q.max.is_none_or(|m| cd <= m));
-    if seed_cycle_end {
-        ends.push(seed);
-    }
-    ends.sort_unstable();
+    let (ends, seed_cycle_end) = shortest_ends(&dist, &q, seed, seed_cycle_dist);
 
     for end in ends {
         let paths: Vec<(Vec<u32>, Vec<u32>)> = if end == seed && seed_cycle_end {
