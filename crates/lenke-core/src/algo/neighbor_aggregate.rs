@@ -48,14 +48,17 @@ fn read_vec(graph: &Graph, v: u32, key: &str) -> Option<Vec<f64>> {
     }
 }
 
-/// Fold one contributor vector into `acc` under `op`; `count`/`started` track how
-/// many have folded (for `mean`) and whether `acc` holds a real value yet (for
-/// `max`/`min`, whose identity is the first contributor, not zero).
-fn fold(op: Op, acc: &mut [f64], count: &mut usize, started: &mut bool, vec: &[f64]) {
+/// Fold one contributor vector into `acc` under `op`, scaled by `coef` (the edge
+/// weight × normalization factor; `1.0` for a plain unweighted aggregate). `coef_sum`
+/// accumulates the coefficients (the denominator for a weighted `mean`); `started`
+/// tracks whether `acc` holds a real value yet (for `max`/`min`, whose identity is the
+/// first contributor, not zero). `max`/`min` ignore `coef` — they are scale-independent
+/// and reject a weight/norm at the call site.
+fn fold(op: Op, acc: &mut [f64], coef_sum: &mut f64, started: &mut bool, vec: &[f64], coef: f64) {
     match op {
         Op::Sum | Op::Mean => {
             for (a, x) in acc.iter_mut().zip(vec) {
-                *a += x;
+                *a += coef * x;
             }
         }
         Op::Max => {
@@ -78,7 +81,7 @@ fn fold(op: Op, acc: &mut [f64], count: &mut usize, started: &mut bool, vec: &[f
         }
     }
     *started = true;
-    *count += 1;
+    *coef_sum += coef;
 }
 
 pub fn neighbor_aggregate(graph: &Graph, cfg: &AlgoConfig) -> Result<Vec<(u32, Value)>, String> {
@@ -108,6 +111,30 @@ pub fn neighbor_aggregate(graph: &Graph, cfg: &AlgoConfig) -> Result<Vec<(u32, V
         }
     };
     let include_self = cfg.include_self.unwrap_or(false);
+    let gcn = match cfg.norm.as_deref().unwrap_or("none") {
+        "none" => false,
+        "gcn" => true,
+        other => {
+            return Err(format!(
+                "neighborAggregate `norm` must be one of none|gcn, got '{other}'"
+            ));
+        }
+    };
+    // Per-edge weights (`None` = unweighted, coefficient 1.0). A weight or a `gcn` norm
+    // SCALES each contributor, which is meaningless for the order/scale-independent
+    // `max`/`min` — reject loudly rather than silently ignore.
+    let weighted = cfg.weight_property.is_some();
+    if (weighted || gcn) && matches!(op, Op::Max | Op::Min) {
+        return Err(
+            "neighborAggregate `weightProperty`/`norm` apply only to op=sum|mean \
+             (max/min are scale-independent)"
+                .to_string(),
+        );
+    }
+    let weights: Option<Vec<f64>> = cfg
+        .weight_property
+        .as_deref()
+        .map(|k| crate::algo::edge_weights(graph, k));
     // `Some(None)` = every type, `Some(Some(id))` = one, `None` = named-but-unknown
     // (no edges match, so every aggregate is over an empty neighbourhood).
     let etype = cfg.etype(graph);
@@ -140,10 +167,10 @@ pub fn neighbor_aggregate(graph: &Graph, cfg: &AlgoConfig) -> Result<Vec<(u32, V
         None => false,
     };
 
-    let mut out: Vec<(u32, Value)> = Vec::with_capacity(graph.vertex_count());
-    for v in graph.vertex_indices() {
-        // Gather contributor `(eidx, nbr)` pairs by direction, then sort by edge
-        // index for a canonical, engine-independent accumulation order.
+    // Gather a vertex's contributor `(eidx, nbr)` pairs by direction, sorted by edge
+    // index for a canonical, engine-independent accumulation order. A `both`-direction
+    // self-loop is counted once (the in-side copy is dropped, mirroring `expand`).
+    let contributors = |v: u32| -> Vec<(u32, u32)> {
         let mut contrib: Vec<(u32, u32)> = Vec::new();
         if want_out {
             for a in graph.out_adj(v) {
@@ -154,7 +181,6 @@ pub fn neighbor_aggregate(graph: &Graph, cfg: &AlgoConfig) -> Result<Vec<(u32, V
         }
         if want_in {
             for a in graph.in_adj(v) {
-                // A `both`-direction self-loop is already counted on the out-side.
                 if want_out && a.nbr == v {
                     continue;
                 }
@@ -164,23 +190,61 @@ pub fn neighbor_aggregate(graph: &Graph, cfg: &AlgoConfig) -> Result<Vec<(u32, V
             }
         }
         contrib.sort_unstable_by_key(|&(eidx, _)| eidx);
+        contrib
+    };
+
+    // GCN degree per vertex: its contributor count under the SAME direction/etype filter,
+    // plus the self-loop when `includeSelf` (the `Ã = A + I` self-loop). Floored at 1 so a
+    // sink/source contributes a finite `1/sqrt(deg_i·deg_j)` instead of dividing by zero.
+    let deg: Vec<f64> = if gcn {
+        graph
+            .vertex_indices()
+            .map(|v| (contributors(v).len() + usize::from(include_self)).max(1) as f64)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut out: Vec<(u32, Value)> = Vec::with_capacity(graph.vertex_count());
+    for v in graph.vertex_indices() {
+        let contrib = contributors(v);
 
         let mut acc = vec![0.0f64; d];
-        let mut count = 0usize;
+        let mut coef_sum = 0.0f64;
         let mut started = false;
+        // The coefficient scaling a contributor at edge `eidx` from neighbour `nbr`:
+        // edge weight (1.0 unweighted) × GCN factor (`1/sqrt(deg_i·deg_j)`, else 1.0).
+        let coef_of = |eidx: u32, nbr: u32| -> f64 {
+            let w = weights.as_ref().map_or(1.0, |ws| ws[eidx as usize]);
+            let nf = if gcn {
+                1.0 / (deg[v as usize] * deg[nbr as usize]).sqrt()
+            } else {
+                1.0
+            };
+            w * nf
+        };
         if include_self {
             if let Some(sv) = &feats[v as usize] {
-                fold(op, &mut acc, &mut count, &mut started, sv);
+                // The self-loop has weight 1.0 and GCN factor `1/deg_i` (`sqrt(deg_i·deg_i)`).
+                let coef = if gcn { 1.0 / deg[v as usize] } else { 1.0 };
+                fold(op, &mut acc, &mut coef_sum, &mut started, sv, coef);
             }
         }
-        for &(_, nbr) in &contrib {
+        for &(eidx, nbr) in &contrib {
             if let Some(nv) = &feats[nbr as usize] {
-                fold(op, &mut acc, &mut count, &mut started, nv);
+                fold(
+                    op,
+                    &mut acc,
+                    &mut coef_sum,
+                    &mut started,
+                    nv,
+                    coef_of(eidx, nbr),
+                );
             }
         }
-        if op == Op::Mean && count > 0 {
+        if op == Op::Mean && coef_sum != 0.0 {
             for a in &mut acc {
-                *a /= count as f64;
+                *a /= coef_sum;
             }
         }
         // No contributors → the zero vector (acc is already zeros; `max`/`min` also

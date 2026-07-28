@@ -82,6 +82,11 @@ pub struct AlgoConfig {
     pub op: Option<String>,
     /// Include the vertex's own feature vector in its aggregate (`neighborAggregate`).
     pub include_self: Option<bool>,
+    /// Normalization for `neighborAggregate`: `"none"` (default) or `"gcn"` — the
+    /// symmetric GCN operator, weighting each contributor `j` of `i` by
+    /// `1/sqrt(deg_i · deg_j)`. Composes with `weightProperty` (coefficient =
+    /// `weight · norm`). `sum`/`mean` only.
+    pub norm: Option<String>,
 }
 
 impl AlgoConfig {
@@ -118,6 +123,7 @@ impl AlgoConfig {
             feature: string("feature"),
             op: string("op"),
             include_self: j.get("includeSelf").and_then(json::Json::as_bool),
+            norm: string("norm"),
         })
     }
 
@@ -153,6 +159,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "feature",
     "op",
     "includeSelf",
+    "norm",
 ];
 
 /// Case-insensitive Levenshtein edit distance — a plain DP over `char`s. Shared by
@@ -442,6 +449,92 @@ mod tests {
             &mut g,
             "neighborAggregate",
             r#"{"feature":"h","direction":"sideways"}"#
+        )
+        .is_err());
+    }
+
+    /// A weighted feature graph: a[1,2]→b[3,4] (w2), a→c[5,6] (w1), b→c (w3).
+    fn weighted_featured() -> Graph {
+        let lines = [
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{"h":[1,2]}}"#,
+            r#"{"type":"node","id":"b","labels":["N"],"properties":{"h":[3,4]}}"#,
+            r#"{"type":"node","id":"c","labels":["N"],"properties":{"h":[5,6]}}"#,
+            r#"{"type":"edge","from":"a","to":"b","labels":["R"],"properties":{"w":2.0}}"#,
+            r#"{"type":"edge","from":"a","to":"c","labels":["R"],"properties":{"w":1.0}}"#,
+            r#"{"type":"edge","from":"b","to":"c","labels":["R"],"properties":{"w":3.0}}"#,
+        ];
+        ndjson::decode(&lines.join("\n")).unwrap()
+    }
+
+    #[test]
+    fn neighbor_aggregate_weighted_sum_and_mean() {
+        let mut g = weighted_featured();
+        // Weighted SUM over out-neighbours: a = 2·[3,4] + 1·[5,6] = [11,14]; b = 3·[5,6].
+        assert_eq!(
+            aggregates(
+                &mut g,
+                r#"{"feature":"h","op":"sum","direction":"out","weightProperty":"w"}"#
+            ),
+            vec![
+                ("a".into(), vec![11.0, 14.0]),
+                ("b".into(), vec![15.0, 18.0]),
+                ("c".into(), vec![0.0, 0.0]),
+            ]
+        );
+        // Weighted MEAN divides by the WEIGHT sum, not the count: a = [11,14]/3.
+        assert_eq!(
+            aggregates(
+                &mut g,
+                r#"{"feature":"h","op":"mean","direction":"out","weightProperty":"w"}"#
+            ),
+            vec![
+                ("a".into(), vec![11.0 / 3.0, 14.0 / 3.0]),
+                ("b".into(), vec![5.0, 6.0]), // 3·[5,6]/3
+                ("c".into(), vec![0.0, 0.0]),
+            ]
+        );
+    }
+
+    #[test]
+    fn neighbor_aggregate_gcn_norm() {
+        // Two nodes a[1,2]→b[3,4], `both` + includeSelf → each has degree 2 (one neighbour
+        // + self), so every GCN coefficient is 1/sqrt(2·2) = 1/2: sum = ½([1,2]+[3,4]) = [2,3].
+        let lines = [
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{"h":[1,2]}}"#,
+            r#"{"type":"node","id":"b","labels":["N"],"properties":{"h":[3,4]}}"#,
+            r#"{"type":"edge","from":"a","to":"b","labels":["R"]}"#,
+        ];
+        let mut g = ndjson::decode(&lines.join("\n")).unwrap();
+        assert_eq!(
+            aggregates(
+                &mut g,
+                r#"{"feature":"h","op":"sum","direction":"both","includeSelf":true,"norm":"gcn"}"#
+            ),
+            vec![("a".into(), vec![2.0, 3.0]), ("b".into(), vec![2.0, 3.0])]
+        );
+    }
+
+    #[test]
+    fn neighbor_aggregate_weight_norm_reject_maxmin() {
+        let mut g = weighted_featured();
+        // A weight or a `gcn` norm scales contributions → meaningless for max/min: reject.
+        assert!(run(
+            &mut g,
+            "neighborAggregate",
+            r#"{"feature":"h","op":"max","weightProperty":"w"}"#
+        )
+        .is_err());
+        assert!(run(
+            &mut g,
+            "neighborAggregate",
+            r#"{"feature":"h","op":"min","norm":"gcn"}"#
+        )
+        .is_err());
+        // An unknown `norm` value → loud error.
+        assert!(run(
+            &mut g,
+            "neighborAggregate",
+            r#"{"feature":"h","op":"sum","norm":"nope"}"#
         )
         .is_err());
     }
