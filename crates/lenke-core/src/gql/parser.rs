@@ -687,25 +687,13 @@ impl Parser {
                 );
             }
         }
-        // A NESTED repetition (`( … {a,b} … ){n,m}`). A per-hop EDGE predicate on a
-        // nested inner hop (`-[e WHERE …]->{a,b}`, `-[:R {k:v}]->{a,b}`) IS supported —
-        // it filters every edge of the inner walk. What's still deferred (needs
-        // list-of-list group variables): NODE group variables inside the nesting. Reject
-        // those loudly so nothing is silently dropped.
+        // A NESTED repetition (`( … {a,b} … ){n,m}`). Its NODE variables — the source, a
+        // nested hop's landing `-[]->{a,b}(y)`, any intermediate — are all group variables
+        // at the OUTER unit's depth (flat lists), and a per-hop EDGE predicate on a nested
+        // inner hop (`-[e WHERE …]->{a,b}`) filters every inner edge. Both are supported by
+        // the structured binder. Only a subpath-level WHERE over grouped variables is still
+        // deferred (rejected just below).
         let nested = inner_q.is_some() || unit_rest.iter().any(|s| s.rel.quantifier.is_some());
-        if nested {
-            let named_node = hop_from.variable.is_some()
-                || hop_to.variable.is_some()
-                || unit_rest.iter().any(|s| s.node.variable.is_some());
-            if named_node {
-                return err(
-                    "a NODE group variable inside a nested quantifier \
-                     (`( … {a,b} … ){n,m}`) is not yet supported — use anonymous nodes \
-                     (a per-hop edge predicate `-[e WHERE …]->{a,b}` is fine)",
-                    open,
-                );
-            }
-        }
         // The subpath `WHERE` (over x/e/y) becomes the per-repetition predicate,
         // AND-ed with any inline `-[e {…} WHERE …]->` predicate.
         if self.check_kw("where") {

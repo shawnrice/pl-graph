@@ -651,10 +651,11 @@ impl CUnit {
         self.start_slot.is_some()
             || self.elems.iter().any(|e| match e {
                 CElem::Hop(h) => h.target_slot.is_some() || h.rel.var_slot.is_some(),
-                // A nested sub-unit exposes NO group variables in v1 (an inner edge var is
-                // a per-hop predicate scalar; node group vars are rejected at parse). When
-                // list-of-list exposure lands this recurses into `s.unit.exposes()`.
-                CElem::Sub(_) => false,
+                // A `Sub` exposes its LANDING (`y` in `-[]->{a,b}(y)`, a flat list at this
+                // unit's depth) and — for a nested parenthesized subpath — its inner unit's
+                // own variables (one list level deeper). An anonymous-endpoint `Sub` with a
+                // bare per-hop edge predicate exposes nothing.
+                CElem::Sub(s) => s.target_slot.is_some() || s.unit.exposes(),
             })
     }
 
@@ -1678,18 +1679,23 @@ impl Lowerer {
         // cleared of it; the `Sub` carries the bounds.
         fn hop_or_sub(mut rel: CRel, target_slot: Option<usize>, q: Option<Quantifier>) -> CElem {
             rel.quantifier = None;
-            let hop = CElem::Hop(CHop { rel, target_slot });
             match q {
-                None => hop,
+                None => CElem::Hop(CHop { rel, target_slot }),
+                // A nested `-[]->{a,b}(y)` hop: the inner hop's own target is an ANONYMOUS
+                // intermediate; the landing `y` is the WHOLE sub-unit's target, bound once
+                // per enclosing rep as a group variable (`CSub.target_slot`).
                 Some(quant) => CElem::Sub(CSub {
                     unit: Box::new(CUnit {
-                        elems: vec![hop],
+                        elems: vec![CElem::Hop(CHop {
+                            rel,
+                            target_slot: None,
+                        })],
                         start_slot: None,
                         where_: None,
                     }),
                     min: quant.min,
                     max: quant.max,
-                    target_slot: None,
+                    target_slot,
                 }),
             }
         }

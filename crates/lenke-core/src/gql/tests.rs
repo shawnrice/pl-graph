@@ -5769,20 +5769,54 @@ fn nested_quantifier_endpoints() {
     );
 }
 
-/// v1 restrictions on nesting are LOUD (never silently dropped): group variables or a
-/// WHERE inside a nested quantifier are rejected at parse.
+/// What's supported vs. still loudly-rejected on a nested quantifier. NODE group
+/// variables (source, a nested hop's landing) are now exposed as flat lists; only a
+/// subpath-level WHERE over grouped variables remains deferred.
 #[test]
-fn nested_quantifier_group_vars_and_where_rejected() {
-    // A NAMED inner NODE inside a nested quantifier → rejected (list-of-list exposure
-    // deferred).
-    assert!(parse("MATCH (s) ( (x)-[:R]->{1,2}(m) ){2} (t) RETURN t").is_err());
-    // A subpath-level WHERE on a nested quantifier → rejected.
-    assert!(parse("MATCH (s) ( ()-[:R]->{1,2}() WHERE true ){2} (t) RETURN t").is_err());
+fn nested_quantifier_group_vars_and_where() {
+    // A NAMED inner NODE inside a nested quantifier IS supported (its landing is a group
+    // variable at the outer unit's depth — a flat list).
+    assert!(parse("MATCH (s) ( (x)-[:R]->{1,2}(m) ){2} (t) RETURN size(x)").is_ok());
     // A per-hop EDGE predicate on a nested inner hop IS supported (filters inner edges).
     assert!(parse("MATCH (s) ( ()-[e:R WHERE e.amt >= 5]->{1,2}() ){2} (t) RETURN t").is_ok());
     assert!(parse("MATCH (s) ( ()-[:R {amt:10.0}]->{1,3}() ){1} (t) RETURN t").is_ok());
+    // A subpath-level WHERE on a nested quantifier → still rejected (deferred).
+    assert!(parse("MATCH (s) ( ()-[:R]->{1,2}() WHERE true ){2} (t) RETURN t").is_err());
     // A plain (non-nested) subpath keeps its group variables + WHERE.
     assert!(parse("MATCH (s) ((x)-[e:R]->(y) WHERE x = y){1,2} (t) RETURN size(e)").is_ok());
+}
+
+/// #1 — a nested quantifier's NODE group variables are exposed as FLAT lists at the
+/// outer unit's depth: the source `x` (once per outer rep) and the nested hop's landing
+/// `y` (`-[]->{a,b}(y)`, the whole sub-unit's endpoint per outer rep).
+#[test]
+fn nested_quantifier_outer_group_variables() {
+    let mut g = five_chain();
+    // `( (x)-[:R]->{2,2}(y) ){2}` on a→b→c→d→e: two outer reps of exactly two inner hops.
+    // rep1 = a→b→c (x=a, landing y=c); rep2 = c→d→e (x=c, y=e). x=[a,c], y=[c,e].
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ( (x)-[:R]->{2,2}(y) ){2} (t) \
+             RETURN t.id AS tid, size(x) AS nx, size(y) AS ny, \
+             x[0].id AS x0, x[1].id AS x1, y[0].id AS y0, y[1].id AS y1",
+        ),
+        vec![vec![s("e"), n(2.0), n(2.0), s("a"), s("c"), s("c"), s("e"),]],
+    );
+    // Varying inner count: `( (x)-[:R]->{1,2}(y) ){1}`, one outer rep from a → landings
+    // b, c (1 or 2 hops). x is a 1-element list [a] each; y is [b] or [c].
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ( (x)-[:R]->{1,2}(y) ){1} (t) \
+             RETURN t.id AS tid, size(x) AS nx, x[0].id AS x0, y[0].id AS y0 \
+             ORDER BY tid",
+        ),
+        vec![
+            vec![s("b"), n(1.0), s("a"), s("b")],
+            vec![s("c"), n(1.0), s("a"), s("c")],
+        ],
+    );
 }
 
 /// A per-hop EDGE predicate on a nested inner hop (`-[e WHERE …]->{a,b}`) filters every
