@@ -1293,6 +1293,49 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     }
   });
 
+  // A five-node chain a→b→c→d→e for the nested group-variable exposure tests below.
+  const NCHAIN = [
+    '{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}',
+    '{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}',
+    '{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}',
+    '{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}',
+    '{"type":"node","id":"e","labels":["N"],"properties":{"id":"e"}}',
+    '{"type":"edge","from":"a","to":"b","labels":["R"],"properties":{}}',
+    '{"type":"edge","from":"b","to":"c","labels":["R"],"properties":{}}',
+    '{"type":"edge","from":"c","to":"d","labels":["R"],"properties":{}}',
+    '{"type":"edge","from":"d","to":"e","labels":["R"],"properties":{}}',
+  ].join('\n');
+
+  // #1 — a nested quantifier's NODE group variables exposed as FLAT lists (the source `x`
+  // per outer rep, and a nested hop's landing `-[]->{a,b}(y)`). Byte-identical.
+  test('nested quantifier outer group variables (TS vs native)', () => {
+    const nat = graphFromFormat(backend, NCHAIN, 'ndjson');
+    const ts = tsDeserialize(NCHAIN, 'ndjson', new Graph());
+
+    for (const q of [
+      "MATCH (s:N {id:'a'}) ( (x)-[:R]->{2,2}(y) ){2} (t) RETURN t.id AS tid, size(x) AS nx, x[0].id AS x0, x[1].id AS x1, y[0].id AS y0, y[1].id AS y1",
+      "MATCH (s:N {id:'a'}) ( (x)-[:R]->{1,2}(y) ){1} (t) RETURN t.id AS tid, size(x) AS nx, x[0].id AS x0, y[0].id AS y0 ORDER BY tid",
+      "MATCH (s:N {id:'a'}) ( (x)-[:R]->{1,2}(y) ){2} (t) RETURN t.id AS id ORDER BY id",
+    ]) {
+      expect(JSON.stringify(nat.query(q)), q).toBe(JSON.stringify(tsQuery(ts, q)));
+    }
+  });
+
+  // #2 — a nested PARENTHESIZED subpath exposes its inner variables as LIST-OF-LISTS
+  // (one list level per enclosing quantifier). Byte-identical.
+  test('nested parenthesized subpath list-of-lists (TS vs native)', () => {
+    const nat = graphFromFormat(backend, NCHAIN, 'ndjson');
+    const ts = tsDeserialize(NCHAIN, 'ndjson', new Graph());
+
+    for (const q of [
+      "MATCH (s:N {id:'a'}) ( ((x)-[:R]->(y)){2,2} ){2} (t) RETURN t.id AS tid, size(x) AS nx, size(x[0]) AS nx0, x[0][0].id AS a00, x[0][1].id AS a01, x[1][0].id AS a10, y[0][1].id AS y01, y[1][1].id AS y11",
+      "MATCH (s:N {id:'a'}) ( ((x)-[e:R]->(y)){1,2} ){1} (t) RETURN t.id AS tid, size(x) AS nx, size(x[0]) AS nx0, size(e[0]) AS ne0 ORDER BY tid",
+      "MATCH (s:N {id:'a'}) ( ((x)-[e:R]->(y)){1,1} ){2} (t) RETURN t.id AS tid, size(x) AS nx, size(x[0]) AS nx0, x[0][0].id AS a00, x[1][0].id AS a10, y[1][0].id AS y10",
+    ]) {
+      expect(JSON.stringify(nat.query(q)), q).toBe(JSON.stringify(tsQuery(ts, q)));
+    }
+  });
+
   // The fused matcher marks PER HOP, so ACYCLIC/SIMPLE forbid a multi-element unit from
   // repeating a vertex INTERNALLY (a self-loop `s→p, p→p` revisits p within one unit).
   // Both engines must agree: TRAIL keeps it (distinct edges), ACYCLIC/SIMPLE reject it.

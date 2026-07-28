@@ -291,6 +291,14 @@ export type Segment = {
    * first hop's own quantifier needs its own slot (later hops use their `rel.quantifier`).
    */
   innerQ?: Quantifier;
+  /**
+   * A nested PARENTHESIZED-and-quantified subpath as this subpath's body:
+   * `( ((x)-[e]->(y)){a,b} ){n,m}`. When set, this outer subpath's sole element is the
+   * nested subpath (its own `rel.quantifier` = the inner `{a,b}`; the outer `{n,m}` is on
+   * this segment's `rel.quantifier`), and `hopFrom`/`hopTo`/`unitRest`/`innerQ` are unused.
+   * The inner subpath's variables (x, e, y) are exposed as LIST-OF-LISTS.
+   */
+  nested?: Segment;
 };
 
 /**

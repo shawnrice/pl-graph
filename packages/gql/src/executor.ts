@@ -3032,8 +3032,9 @@ type CRel = {
 /** One hop of a repetition unit: traverse `rel`, land on `targetVar` (a group var). */
 type CHop = { rel: CRel; targetVar?: string };
 /** A nested quantified sub-unit — the general `( … ){a,b}` nesting. `max` is `null`
- *  for an unbounded `*`/`+`/`{n,}`. Mirrors native `CSub`. */
-type CSub = { unit: CUnit; min: number; max: number | null };
+ *  for an unbounded `*`/`+`/`{n,}`. `targetVar` is the sub-unit's LANDING group var
+ *  (`y` in `-[]->{a,b}(y)`), bound once per enclosing rep. Mirrors native `CSub`. */
+type CSub = { unit: CUnit; min: number; max: number | null; targetVar?: string };
 /** One element of a unit: a single hop, or a nested quantified sub-unit. Mirrors
  *  native `CElem`. */
 type CElem = { hop: CHop } | { sub: CSub };
@@ -3046,14 +3047,14 @@ type CElem = { hop: CHop } | { sub: CSub };
 type CUnit = { elems: readonly CElem[]; startVar?: string; where?: CompiledExpr };
 type CSegment = { rel: CRel; node: CNode; unit?: CUnit };
 
-/** Whether a unit binds any GROUP variable (source, an edge, a target, or anything a
- *  nested sub-unit binds). Mirrors native `CUnit::exposes`. */
+/** Whether a unit binds any GROUP variable (source, an edge, a target, a `Sub`'s
+ *  landing, or anything a nested sub-unit binds). Mirrors native `CUnit::exposes`. */
 const unitExposes = (u: CUnit): boolean =>
   u.startVar !== undefined ||
-  // A nested sub-unit exposes NO group variables in v1 (an inner edge var is a per-hop
-  // predicate scalar; node group vars are rejected at parse).
-  u.elems.some(
-    (e) => 'hop' in e && (e.hop.targetVar !== undefined || e.hop.rel.variable !== undefined),
+  u.elems.some((e) =>
+    'hop' in e
+      ? e.hop.targetVar !== undefined || e.hop.rel.variable !== undefined
+      : e.sub.targetVar !== undefined || unitExposes(e.sub.unit),
   );
 type CPath = {
   start: CNode;
@@ -3264,82 +3265,103 @@ const compileRel = (rel: RelPattern): CRel => ({
 const relHasPredicate = (rel: RelPattern): boolean =>
   (rel.properties?.length ?? 0) > 0 || rel.where !== undefined;
 
+/** Build one repetition unit from a quantified-subpath segment. A NESTED parenthesized
+ *  subpath (`( ((x)-[e]->(y)){a,b} ){n,m}`) recurses: the outer unit's sole element is a
+ *  `Sub` wrapping the inner subpath's unit, so its variables nest one list level deeper.
+ *  Otherwise it's the inner hop chain. Mirrors native `plan::Lowerer::subpath_unit`. */
+const compileSubpathUnit = (seg: Segment): CUnit => {
+  if (seg.nested !== undefined) {
+    const inner = seg.nested;
+    const q = inner.rel.quantifier!; // a nested subpath is always quantified
+
+    // The nested subpath's LANDING is the outer segment's endpoint node, matched
+    // separately — not a group variable of this unit (so no `targetVar` on the `Sub`).
+    return {
+      elems: [{ sub: { unit: compileSubpathUnit(inner), min: q.min, max: q.max ?? null } }],
+    };
+  }
+
+  const { rel, hopFrom, hopTo, unitRest, innerQ } = seg;
+  // Each inner hop is a plain hop, OR a nested single-edge `Sub` when it carries its own
+  // quantifier (`-[e]->{a,b}`). The first hop's nested quantifier is `innerQ`; later hops
+  // carry theirs on `rel.quantifier`.
+  const astElems: { rel: RelPattern; targetVar?: string; q?: Quantifier }[] = [
+    {
+      rel,
+      ...(hopTo?.variable !== undefined ? { targetVar: hopTo.variable } : {}),
+      ...(innerQ !== undefined ? { q: innerQ } : {}),
+    },
+    ...(unitRest ?? []).map((extra) => ({
+      rel: extra.rel,
+      ...(extra.node.variable !== undefined ? { targetVar: extra.node.variable } : {}),
+      ...(extra.rel.quantifier !== undefined ? { q: extra.rel.quantifier } : {}),
+    })),
+  ];
+
+  // A PLAIN hop's WHERE lifts to the unit level; a NESTED hop's WHERE
+  // (`-[e WHERE …]->{a,b}`) is a per-inner-edge predicate that STAYS on the `Sub`'s inner
+  // hop, so it filters every edge of the inner walk (not lifted).
+  const whereExprs = astElems
+    .filter((h) => h.q === undefined)
+    .map((h) => h.rel.where)
+    .filter((w): w is Expr => w !== undefined);
+  let unitWhere: Expr | undefined;
+
+  if (whereExprs.length === 1) {
+    [unitWhere] = whereExprs;
+  } else if (whereExprs.length > 1) {
+    unitWhere = { kind: 'and', items: whereExprs };
+  }
+
+  const hopOrSub = (h: { rel: RelPattern; targetVar?: string; q?: Quantifier }): CElem => {
+    if (h.q === undefined) {
+      // Plain hop: its WHERE was lifted, so strip it from the hop predicate.
+      const chop: CHop = {
+        rel: compileRel({ ...h.rel, where: undefined, quantifier: undefined }),
+        ...(h.targetVar !== undefined ? { targetVar: h.targetVar } : {}),
+      };
+
+      return { hop: chop };
+    }
+
+    // Nested `-[]->{a,b}(y)` hop: the landing `y` is the WHOLE sub-unit's target (bound
+    // once per enclosing rep — `CSub.targetVar`); the inner hop's own target is anonymous.
+    // The inner hop keeps its WHERE (per-inner-edge predicate).
+    const innerHop: CHop = { rel: compileRel({ ...h.rel, quantifier: undefined }) };
+
+    return {
+      sub: {
+        unit: { elems: [{ hop: innerHop }] },
+        min: h.q.min,
+        max: h.q.max ?? null,
+        ...(h.targetVar !== undefined ? { targetVar: h.targetVar } : {}),
+      },
+    };
+  };
+
+  return {
+    elems: astElems.map(hopOrSub),
+    ...(hopFrom?.variable !== undefined ? { startVar: hopFrom.variable } : {}),
+    ...(unitWhere !== undefined ? { where: compileExpr(unitWhere) } : {}),
+  };
+};
+
 const compilePath = (pattern: PathPattern): CPath => {
   const selector = pattern.selector ?? 'walk';
 
   return {
     start: compileNode(pattern.start),
-    segments: pattern.segments.map(({ rel, node, hopFrom, hopTo, unitRest, innerQ }) => {
-      const crel = compileRel(rel);
+    segments: pattern.segments.map((seg) => {
+      const crel = compileRel(seg.rel);
 
-      if (hopFrom === undefined) {
-        // A plain / abbreviated hop — no repetition unit.
-        return { rel: crel, node: compileNode(node) };
+      // A plain / abbreviated hop — no repetition unit.
+      if (seg.hopFrom === undefined && seg.nested === undefined) {
+        return { rel: crel, node: compileNode(seg.node) };
       }
 
-      // A quantified parenthesized subpath compiles to a UNIT. Each inner hop is a
-      // plain hop, OR a nested single-edge `Sub` when it carries its own quantifier
-      // (`-[e]->{a,b}` — the general nesting). The first hop's nested quantifier is
-      // `innerQ`; later hops carry theirs on `rel.quantifier`. Every hop's WHERE is
-      // lifted to the unit level and AND-ed (nested units have none — rejected at
-      // parse). `node` is the separate outer endpoint. Mirrors native `plan::segment`.
-      const astElems: { rel: RelPattern; targetVar?: string; q?: Quantifier }[] = [
-        {
-          rel,
-          ...(hopTo?.variable !== undefined ? { targetVar: hopTo.variable } : {}),
-          ...(innerQ !== undefined ? { q: innerQ } : {}),
-        },
-        ...(unitRest ?? []).map((extra) => ({
-          rel: extra.rel,
-          ...(extra.node.variable !== undefined ? { targetVar: extra.node.variable } : {}),
-          ...(extra.rel.quantifier !== undefined ? { q: extra.rel.quantifier } : {}),
-        })),
-      ];
-
-      // A PLAIN hop's WHERE lifts to the unit level; a NESTED hop's WHERE
-      // (`-[e WHERE …]->{a,b}`) is a per-inner-edge predicate that STAYS on the `Sub`'s
-      // inner hop, so it filters every edge of the inner walk (not lifted).
-      const whereExprs = astElems
-        .filter((h) => h.q === undefined)
-        .map((h) => h.rel.where)
-        .filter((w): w is Expr => w !== undefined);
-      let unitWhere: Expr | undefined;
-
-      if (whereExprs.length === 1) {
-        [unitWhere] = whereExprs;
-      } else if (whereExprs.length > 1) {
-        unitWhere = { kind: 'and', items: whereExprs };
-      }
-
-      const hopOrSub = (h: { rel: RelPattern; targetVar?: string; q?: Quantifier }): CElem => {
-        if (h.q === undefined) {
-          // Plain hop: its WHERE was lifted, so strip it from the hop predicate.
-          const chop: CHop = {
-            rel: compileRel({ ...h.rel, where: undefined, quantifier: undefined }),
-            ...(h.targetVar !== undefined ? { targetVar: h.targetVar } : {}),
-          };
-
-          return { hop: chop };
-        }
-
-        // Nested sub: keep the WHERE on the inner hop (per-inner-edge predicate).
-        const innerHop: CHop = {
-          rel: compileRel({ ...h.rel, quantifier: undefined }),
-          ...(h.targetVar !== undefined ? { targetVar: h.targetVar } : {}),
-        };
-
-        return {
-          sub: { unit: { elems: [{ hop: innerHop }] }, min: h.q.min, max: h.q.max ?? null },
-        };
-      };
-
-      const unit: CUnit = {
-        elems: astElems.map(hopOrSub),
-        ...(hopFrom.variable !== undefined ? { startVar: hopFrom.variable } : {}),
-        ...(unitWhere !== undefined ? { where: compileExpr(unitWhere) } : {}),
-      };
-
-      return { rel: crel, node: compileNode(node), unit };
+      // A quantified parenthesized subpath compiles to a UNIT; `node` is the separate
+      // outer endpoint. Mirrors native `plan::segment`.
+      return { rel: crel, node: compileNode(seg.node), unit: compileSubpathUnit(seg) };
     }),
     ...(pattern.pathVar !== undefined ? { pathVar: pattern.pathVar } : {}),
     selector,
@@ -4148,45 +4170,136 @@ const asHop = (e: CElem): CHop => {
   });
 };
 
-const bindGroupVars = (
-  binding: Binding,
+/** One graph-consuming hop of a matched trail, tagged with its position in the (possibly
+ *  nested) repetition pattern. `levels` is the cursor stack outer→inner: one `[rep,
+ *  elemAfter]` per active unit, where `elemAfter` is the element the hop advanced PAST
+ *  (so the hop's own element is `elemAfter - 1`). Mirrors native `StepRec`. */
+type StepRec = { levels: readonly [number, number][]; source: Vertex; edge: Edge; target: Vertex };
+
+/** Place `val` at `root[idx[0]][idx[1]]…`, growing intermediate lists as needed — a
+ *  variable nested `d` quantifiers deep has `d+1`-element index tuples. Mirrors native
+ *  `Nest`. */
+const nestInsert = (root: unknown[], idx: readonly number[], val: unknown): void => {
+  let cur = root;
+
+  for (let d = 0; d < idx.length - 1; d += 1) {
+    const i = idx[d];
+
+    while (cur.length <= i) {
+      cur.push([]);
+    }
+
+    cur = cur[i] as unknown[];
+  }
+
+  const last = idx[idx.length - 1];
+
+  while (cur.length <= last) {
+    cur.push([]);
+  }
+
+  cur[last] = val;
+};
+
+/** Assemble one unit's group variables from the structured walk. `treePath` is the
+ *  `Sub`-element indices from the top unit down to THIS unit, so `depth = treePath.length`
+ *  is its nesting depth (0 = top). A variable is indexed by the rep counters of levels
+ *  `0..=depth` — enclosing quantifiers are the outer list dimensions, this unit's own rep
+ *  the innermost. Reproduces the old k-stride binding for a flat unit; recurses into each
+ *  `Sub`. Mirrors native `bind_unit`. */
+const bindUnit = (
+  next: Map<string, unknown>,
   unit: CUnit,
-  verts: readonly Vertex[],
-  edges: readonly Edge[],
-): Binding => {
+  treePath: readonly number[],
+  steps: readonly StepRec[],
+): void => {
+  const depth = treePath.length;
+  const key = (s: StepRec): number[] => s.levels.slice(0, depth + 1).map(([r]) => r);
+  const within = (s: StepRec): boolean =>
+    s.levels.length > depth && treePath.every((e, j) => s.levels[j][1] === e);
+
+  // `startVar` = each rep-instance's source = its FIRST hop's source (which may sit
+  // inside a leading `Sub`, hence `within`, not just direct hops).
+  if (unit.startVar !== undefined) {
+    const root: unknown[] = [];
+    const seen = new Set<string>();
+
+    for (const s of steps) {
+      if (within(s)) {
+        const k = key(s);
+        const kk = k.join(',');
+
+        if (!seen.has(kk)) {
+          seen.add(kk);
+          nestInsert(root, k, s.source);
+        }
+      }
+    }
+
+    next.set(unit.startVar, root);
+  }
+
+  unit.elems.forEach((el, e) => {
+    if ('hop' in el) {
+      const direct = (s: StepRec): boolean =>
+        within(s) && s.levels.length === depth + 1 && s.levels[depth][1] === e + 1;
+
+      if (el.hop.targetVar !== undefined) {
+        const root: unknown[] = [];
+
+        for (const s of steps) {
+          if (direct(s)) {
+            nestInsert(root, key(s), s.target);
+          }
+        }
+
+        next.set(el.hop.targetVar, root);
+      }
+
+      if (el.hop.rel.variable !== undefined) {
+        const root: unknown[] = [];
+
+        for (const s of steps) {
+          if (direct(s)) {
+            nestInsert(root, key(s), s.edge);
+          }
+        }
+
+        next.set(el.hop.rel.variable, root);
+      }
+    } else {
+      // A `Sub`'s landing = its LAST inner hop's target, per rep-instance (inner steps
+      // keep this unit's `elem` pinned at `e`).
+      if (el.sub.targetVar !== undefined) {
+        const last = new Map<string, { k: number[]; target: Vertex }>();
+
+        for (const s of steps) {
+          if (within(s) && s.levels.length > depth + 1 && s.levels[depth][1] === e) {
+            const k = key(s);
+            last.set(k.join(','), { k, target: s.target });
+          }
+        }
+
+        const root: unknown[] = [];
+
+        for (const { k, target } of last.values()) {
+          nestInsert(root, k, target);
+        }
+
+        next.set(el.sub.targetVar, root);
+      }
+
+      bindUnit(next, el.sub.unit, [...treePath, e], steps);
+    }
+  });
+};
+
+/** Expose a quantified subpath's inner variables as GROUP variables from the structured
+ *  walk — each a (possibly nested) list, one level per enclosing quantifier. Mirrors
+ *  native `bind_group_vars`. */
+const bindGroupVars = (binding: Binding, unit: CUnit, steps: readonly StepRec[]): Binding => {
   const next = new Map(binding);
-  const k = unit.elems.length;
-  const reps = k === 0 ? 0 : Math.floor(edges.length / k);
-
-  // Node positions 0..=k: the unit source, then each hop's target.
-  for (let p = 0; p <= k; p += 1) {
-    const varName = p === 0 ? unit.startVar : asHop(unit.elems[p - 1]).targetVar;
-
-    if (varName !== undefined) {
-      const list: Vertex[] = [];
-
-      for (let rep = 0; rep < reps; rep += 1) {
-        list.push(verts[rep * k + p]);
-      }
-
-      next.set(varName, list);
-    }
-  }
-
-  // Edge positions 0..k: each hop's edge.
-  for (let p = 0; p < k; p += 1) {
-    const varName = asHop(unit.elems[p]).rel.variable;
-
-    if (varName !== undefined) {
-      const list: Edge[] = [];
-
-      for (let rep = 0; rep < reps; rep += 1) {
-        list.push(edges[rep * k + p]);
-      }
-
-      next.set(varName, list);
-    }
-  }
+  bindUnit(next, unit, [], steps);
 
   return next;
 };
@@ -4397,7 +4510,7 @@ const trailEndsUnit = function* (
 
   // The top unit's `min == 0` zero-rep acceptance — the empty walk at the seed.
   if (q.min === 0) {
-    yield { end: from, verts: wantPath ? [from] : [], edges: [] };
+    yield { end: from, verts: wantPath ? [from] : [], edges: [], steps: [] };
   }
 
   type Frame = {
@@ -4498,9 +4611,25 @@ const trailEndsUnit = function* (
         const edges = stack.map((f) => f.entryEdge).filter((e): e is Edge => e !== null);
         edges.push(edge);
 
-        yield { end: nbr, verts, edges };
+        // The structured walk: each hop tagged with its pattern position. A frame's taken
+        // move stays frozen at the hop that spawned its child while that child is live, so
+        // `stack[i].moves[moveIdx].after` is hop `i`'s landing position (top `elem` one
+        // past the element traversed); the final hop (this emit) is `(edge, nbr)`.
+        const stepRecs: StepRec[] = stack.map((f, i) => {
+          const at = f.moves[f.moveIdx].after;
+          const isLast = i + 1 >= stack.length;
+
+          return {
+            levels: at.map((c) => [c.rep, c.elem] as [number, number]),
+            source: f.vertex,
+            edge: isLast ? edge : stack[i + 1].entryEdge!,
+            target: isLast ? nbr : stack[i + 1].vertex,
+          };
+        });
+
+        yield { end: nbr, verts, edges, steps: stepRecs };
       } else {
-        yield { end: nbr, verts: [], edges: [] };
+        yield { end: nbr, verts: [], edges: [], steps: [] };
       }
     }
 
@@ -4552,9 +4681,8 @@ const walkSegments = function* (
       ? trailEndsUnit(graph, from, unit, rel.quantifier, { mode, binding, params, wantPath: true })
       : trailEnds(graph, from, rel, rel.quantifier, { mode, binding, params, wantPath: false });
 
-    for (const { end, verts, edges } of ends) {
-      const withGroups =
-        unit && unitExposes(unit) ? bindGroupVars(binding, unit, verts, edges) : binding;
+    for (const { end, steps } of ends) {
+      const withGroups = unit && unitExposes(unit) ? bindGroupVars(binding, unit, steps) : binding;
       const matched = matchNode(withGroups, node, end, params, graph);
 
       if (matched) {
@@ -4599,7 +4727,12 @@ const TRAIL_BUDGET = 1_000_000;
  * a per-expansion step budget throws rather than letting a pathological `*`
  * exhaust memory/time.
  */
-type TrailEnd = { end: Vertex; verts: readonly Vertex[]; edges: readonly Edge[] };
+type TrailEnd = {
+  end: Vertex;
+  verts: readonly Vertex[];
+  edges: readonly Edge[];
+  steps: readonly StepRec[];
+};
 
 type TrailOpts = {
   mode: PathMode;

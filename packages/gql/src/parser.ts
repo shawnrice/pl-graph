@@ -664,6 +664,26 @@ export const parse = (
   const parseQuantifiedSubpath = (): Segment => {
     const open = peek().pos;
     expect('lparen', "'(' to open a quantified subpath");
+
+    // A nested PARENTHESIZED subpath as the body: `( ((x)-[e]->(y)){a,b} ){n,m}`. After
+    // the outer `(`, an inner `( … ){q}` means nesting; a plain `(x)` source is not
+    // quantified, so `startsQuantifiedSubpath` distinguishes them.
+    if (startsQuantifiedSubpath()) {
+      const inner = parseQuantifiedSubpath();
+      expect('rparen', "')' to close a quantified subpath");
+      const quantifier = parseQuantifier();
+
+      if (quantifier === undefined) {
+        throw new GqlSyntaxError('a parenthesized subpath must be quantified (`( … ){n,m}`)', open);
+      }
+
+      const node = check('lparen') ? parseNode() : {};
+
+      // A synthetic rel carries only the OUTER quantifier (the unit body is the nested
+      // subpath, not a hop of this segment's `rel`).
+      return { rel: { direction: 'out', quantifier }, node, nested: inner };
+    }
+
     const hopFrom = parseNode(); // inner (x)
 
     if (!startsRelationship()) {
@@ -701,27 +721,12 @@ export const parse = (
       }
     }
 
-    // A NESTED repetition (`( … {a,b} … ){n,m}`). A per-hop EDGE predicate on a nested
-    // inner hop (`-[e WHERE …]->{a,b}`, `-[:R {k:v}]->{a,b}`) IS supported — it filters
-    // every edge of the inner walk. Only NODE group variables inside the nesting are
-    // deferred (need list-of-list group vars). Reject those loudly (mirrors native).
+    // A NESTED repetition (`( … {a,b} … ){n,m}`). Its NODE variables (source, a nested
+    // hop's landing, intermediates) are all group variables at the OUTER unit's depth
+    // (flat lists), and a per-hop EDGE predicate on a nested inner hop filters every inner
+    // edge — both supported by the structured binder. Only a subpath-level WHERE over
+    // grouped variables is still deferred (rejected just below). Mirrors native.
     const nested = innerQ !== undefined || unitRest.some((s) => s.rel.quantifier !== undefined);
-
-    if (nested) {
-      const namedNode =
-        hopFrom.variable !== undefined ||
-        hopTo.variable !== undefined ||
-        unitRest.some((s) => s.node.variable !== undefined);
-
-      if (namedNode) {
-        throw new GqlSyntaxError(
-          'a NODE group variable inside a nested quantifier (`( … {a,b} … ){n,m}`) is ' +
-            'not yet supported — use anonymous nodes (a per-hop edge predicate ' +
-            '`-[e WHERE …]->{a,b}` is fine)',
-          open,
-        );
-      }
-    }
 
     let { where } = rel;
 
