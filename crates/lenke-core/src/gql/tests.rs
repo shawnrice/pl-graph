@@ -5694,6 +5694,66 @@ fn parenthesized_grouping_without_quantifier_still_works() {
     );
 }
 
+/// A five-node chain fixture a→b→c→d→e for nested-quantifier tests.
+fn chain5() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+        r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}"#,
+        r#"{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}"#,
+        r#"{"type":"node","id":"e","labels":["N"],"properties":{"id":"e"}}"#,
+        r#"{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e2","from":"b","to":"c","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e3","from":"c","to":"d","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e4","from":"d","to":"e","labels":["R"],"properties":{}}"#,
+    ])
+}
+
+/// NESTED quantifiers `( … {a,b} … ){n,m}` — the outer repetition repeats an inner
+/// variable-length sub-walk. Exercises the pushdown matcher's `resolve_general` path
+/// (a `CElem::Sub`); v1 is endpoint enumeration (anonymous inner nodes/edges).
+#[test]
+fn nested_quantifier_endpoints() {
+    let mut g = chain5();
+    // One outer rep of a 1-3 hop walk from a → b, c, d.
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ( ()-[:R]->{1,3}() ){1} (t) RETURN t.id AS id",
+        ),
+        vec![s("b"), s("c"), s("d")],
+    );
+    // TWO outer reps of a 1-2 hop walk: (a→{b,c}) then (→{c,d} or →{d,e}) → c,d,d,e
+    // (one path per trail: b→c, b→c→d, c→d, c→d→e).
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ( ()-[:R]->{1,2}() ){2} (t) RETURN t.id AS id",
+        ),
+        vec![s("c"), s("d"), s("d"), s("e")],
+    );
+    // A plain hop followed by a quantified hop, one outer rep: 2–3 hops → c, d.
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ( ()-[:R]->()-[:R]->{1,2}() ){1} (t) RETURN t.id AS id",
+        ),
+        vec![s("c"), s("d")],
+    );
+}
+
+/// v1 restrictions on nesting are LOUD (never silently dropped): group variables or a
+/// WHERE inside a nested quantifier are rejected at parse.
+#[test]
+fn nested_quantifier_group_vars_and_where_rejected() {
+    // A named inner node inside a nested quantifier → rejected.
+    assert!(parse("MATCH (s) ( (x)-[:R]->{1,2}(m) ){2} (t) RETURN t").is_err());
+    // A WHERE on a nested quantifier → rejected.
+    assert!(parse("MATCH (s) ( ()-[:R]->{1,2}() WHERE true ){2} (t) RETURN t").is_err());
+    // But a plain (non-nested) subpath keeps its group variables + WHERE.
+    assert!(parse("MATCH (s) ((x)-[e:R]->(y) WHERE x = y){1,2} (t) RETURN size(e)").is_ok());
+}
+
 /// The fused matcher marks PER HOP, so ACYCLIC/SIMPLE now forbid a multi-element unit
 /// from repeating a vertex INTERNALLY — the correct ISO reading (a node at most once
 /// on an acyclic path), which the old per-unit-set check missed. A 2-hop unit through

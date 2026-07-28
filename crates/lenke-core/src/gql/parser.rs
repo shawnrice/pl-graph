@@ -653,11 +653,15 @@ impl Parser {
             );
         }
         let mut rel = self.parse_rel()?;
+        // A NESTED quantifier on the first inner hop (`-[e]->{a,b}`).
+        let inner_q = self.parse_quantifier()?;
         let hop_to = self.parse_node()?; // first inner target (m / y)
                                          // Additional hops → a MULTI-element repetition unit `(x)-[e1]->(m)-[e2]->(y)`.
         let mut unit_rest: Vec<Segment> = Vec::new();
         while self.starts_relationship() {
-            let r = self.parse_rel()?;
+            let mut r = self.parse_rel()?;
+            // A nested quantifier on this inner hop lives on its own `rel.quantifier`.
+            r.quantifier = self.parse_quantifier()?;
             let n = self.parse_node()?;
             unit_rest.push(Segment {
                 rel: r,
@@ -665,6 +669,7 @@ impl Parser {
                 hop_from: None,
                 hop_to: None,
                 unit_rest: Vec::new(),
+                inner_q: None,
             });
         }
         // The inner NODES carry only a variable — put any per-hop label / property
@@ -682,9 +687,36 @@ impl Parser {
                 );
             }
         }
+        // A NESTED repetition (`( … {a,b} … ){n,m}`) — v1 supports endpoint enumeration
+        // only: no group variables and no WHERE inside it (that needs list-of-list group
+        // vars / nested-unit predicates, deferred). Reject loudly so nothing is dropped.
+        let nested = inner_q.is_some() || unit_rest.iter().any(|s| s.rel.quantifier.is_some());
+        if nested {
+            let bound = hop_from.variable.is_some()
+                || hop_to.variable.is_some()
+                || rel.variable.is_some()
+                || rel.where_.is_some()
+                || unit_rest.iter().any(|s| {
+                    s.node.variable.is_some() || s.rel.variable.is_some() || s.rel.where_.is_some()
+                });
+            if bound {
+                return err(
+                    "group variables / WHERE inside a nested quantifier \
+                     (`( … {a,b} … ){n,m}`) are not yet supported — use anonymous \
+                     nodes and edges",
+                    open,
+                );
+            }
+        }
         // The subpath `WHERE` (over x/e/y) becomes the per-repetition predicate,
         // AND-ed with any inline `-[e {…} WHERE …]->` predicate.
         if self.check_kw("where") {
+            if nested {
+                return err(
+                    "a WHERE on a nested quantifier is not yet supported",
+                    self.peek().pos,
+                );
+            }
             self.advance();
             let cond = self.parse_expr()?;
             rel.where_ = Some(match rel.where_.take() {
@@ -699,9 +731,9 @@ impl Parser {
                 open,
             );
         };
-        rel.quantifier = Some(q);
-        // An optional following endpoint `(b)`; else a synthetic anonymous endpoint
-        // (the walk still lands on the last target, just unnamed).
+        rel.quantifier = Some(q); // the OUTER subpath quantifier
+                                  // An optional following endpoint `(b)`; else a synthetic anonymous endpoint
+                                  // (the walk still lands on the last target, just unnamed).
         let node = if self.check(Tt::LParen) {
             self.parse_node()?
         } else {
@@ -713,6 +745,7 @@ impl Parser {
             hop_from: Some(hop_from),
             hop_to: Some(hop_to),
             unit_rest,
+            inner_q,
         })
     }
 
@@ -838,6 +871,7 @@ impl Parser {
                     hop_from: None,
                     hop_to: None,
                     unit_rest: Vec::new(),
+                    inner_q: None,
                 });
             }
 

@@ -1665,29 +1665,46 @@ impl Lowerer {
         // hops (`(x)-[e1]->(m)-[e2]->(y)`) with their group-variable slots + the
         // per-unit `WHERE`. `node` is the separate outer endpoint. A single-edge
         // subpath is a one-hop unit — the same shape, `k = 1`.
+        // A hop element: a plain `Hop`, or a nested single-edge `Sub` when the hop
+        // carries its own quantifier (`-[e]->{a,b}` — a nested repetition). The matcher
+        // ignores a hop's own quantifier (it steps one edge), so a `Hop`'s `CRel` is
+        // cleared of it; the `Sub` carries the bounds.
+        fn hop_or_sub(mut rel: CRel, target_slot: Option<usize>, q: Option<Quantifier>) -> CElem {
+            rel.quantifier = None;
+            let hop = CElem::Hop(CHop { rel, target_slot });
+            match q {
+                None => hop,
+                Some(quant) => CElem::Sub(CSub {
+                    unit: Box::new(CUnit {
+                        elems: vec![hop],
+                        start_slot: None,
+                        where_: None,
+                    }),
+                    min: quant.min,
+                    max: quant.max,
+                }),
+            }
+        }
+        // `rel.quantifier` stays the OUTER subpath quantifier (for the matcher); each
+        // hop's own (nested) quantifier is consumed into a `Sub` by `hop_or_sub`.
         let unit = s.hop_from.as_ref().map(|from| {
             // Every hop's `WHERE` (the subpath predicate the parser merged onto the
             // first hop, plus any inline `-[e WHERE …]->` on a later hop) is lifted to
-            // the unit level and AND-ed, so it is checked exactly once — after all `k`
-            // hops are bound (letting it span the whole unit) — and cleared from the
-            // hops themselves.
+            // the unit level and AND-ed. Nested units have no WHERE (rejected at parse).
             let mut where_ = rel.where_.take();
-            let mut elems = vec![CElem::Hop(CHop {
-                rel: rel.clone(),
-                target_slot: s.hop_to.as_ref().and_then(|to| self.node_slot(to)),
-            })];
+            let first_target = s.hop_to.as_ref().and_then(|to| self.node_slot(to));
+            let mut elems = vec![hop_or_sub(rel.clone(), first_target, s.inner_q)];
             for extra in &s.unit_rest {
                 let mut extra_rel = self.rel(&extra.rel);
+                let q = extra.rel.quantifier;
                 if let Some(w) = extra_rel.where_.take() {
                     where_ = Some(match where_.take() {
                         Some(prev) => CExpr::And(vec![prev, w]),
                         None => w,
                     });
                 }
-                elems.push(CElem::Hop(CHop {
-                    rel: extra_rel,
-                    target_slot: self.node_slot(&extra.node),
-                }));
+                let target = self.node_slot(&extra.node);
+                elems.push(hop_or_sub(extra_rel, target, q));
             }
             CUnit {
                 elems,

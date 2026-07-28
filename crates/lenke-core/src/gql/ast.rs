@@ -308,8 +308,14 @@ pub struct Segment {
     /// For a MULTI-element repetition unit `((x)-[e1]->(m)-[e2]->(y) …){n,m}`: the
     /// unit's hops beyond the first (`rel`/`hop_to` is the first, `x`-[e1]->`m`);
     /// each entry is one more `-[e]->node` hop. Empty for a single-edge unit / plain
-    /// hop. Every inner variable (x, each edge, each intermediate) is a group var.
+    /// hop. Every inner variable (x, each edge, each intermediate) is a group var. A
+    /// NESTED inner hop (`-[e]->{a,b}`) carries its quantifier in its own
+    /// `rel.quantifier` (the outer subpath quantifier lives on the segment's `rel`).
     pub unit_rest: Vec<Self>,
+    /// A quantifier on the FIRST inner hop (`((x)-[e]->{a,b}(m) …){n,m}`) — a nested
+    /// repetition. `rel.quantifier` on the segment is the OUTER subpath quantifier, so
+    /// the first hop's own quantifier needs its own slot.
+    pub inner_q: Option<Quantifier>,
 }
 
 /// `(variable:LabelExpr {props} WHERE pred)` — all parts optional.

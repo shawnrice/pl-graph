@@ -3741,6 +3741,7 @@ fn walk_segments(
         let sink = &mut |b: &mut Binding, end: u32, verts: &[u32], edges: &[u32]| {
             let restores = unit
                 .as_ref()
+                .filter(|u| u.exposes())
                 .map(|u| bind_group_vars(b, u, verts, edges))
                 .unwrap_or_default();
             let keep = match_node_then(graph, ctx, b, node, end, &mut |b2| {
@@ -4830,6 +4831,7 @@ fn match_path<F: FnMut(&mut Binding) -> bool>(
         let sink = &mut |b: &mut Binding, end: u32, verts: &[u32], edges: &[u32]| {
             let restores = unit
                 .as_ref()
+                .filter(|u| u.exposes())
                 .map(|u| bind_group_vars(b, u, verts, edges))
                 .unwrap_or_default();
             let keep = match_node_continue(graph, ctx, b, node, end, path, idx + 1, emit);
