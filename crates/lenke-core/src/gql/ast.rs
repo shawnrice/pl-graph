@@ -323,6 +323,12 @@ pub struct Segment {
     /// `unit_rest`/`inner_q` are unused. The inner subpath's variables (x, e, y) are
     /// exposed to the outer query as LIST-OF-LISTS — one list level per quantifier.
     pub nested: Option<Box<Self>>,
+    /// The subpath-level `WHERE` (`( … WHERE cond ){n,m}`): a PER-REPETITION predicate
+    /// over the unit's group variables, evaluated once per outer rep. Kept SEPARATE from
+    /// a hop's inline `-[e WHERE …]->` edge predicate (which stays per-edge) so a nested
+    /// quantifier's per-rep `WHERE` (inner vars bound as lists) and its per-edge filters
+    /// don't conflate.
+    pub subpath_where: Option<Expr>,
 }
 
 /// `(variable:LabelExpr {props} WHERE pred)` — all parts optional.

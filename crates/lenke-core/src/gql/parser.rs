@@ -650,6 +650,14 @@ impl Parser {
         // is not quantified, so `starts_quantified_subpath` distinguishes them.)
         if self.starts_quantified_subpath() {
             let inner = self.parse_quantified_subpath()?;
+            // An optional per-OUTER-rep `WHERE` over the inner subpath's group variables
+            // (bound as lists per outer rep, e.g. `WHERE size(e) = 2`).
+            let subpath_where = if self.check_kw("where") {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             self.expect(Tt::RParen, "')' to close a quantified subpath")?;
             let Some(q) = self.parse_quantifier()? else {
                 return err(
@@ -680,6 +688,7 @@ impl Parser {
                 unit_rest: Vec::new(),
                 inner_q: None,
                 nested: Some(Box::new(inner)),
+                subpath_where,
             });
         }
         let hop_from = self.parse_node()?; // inner (x)
@@ -708,6 +717,7 @@ impl Parser {
                 unit_rest: Vec::new(),
                 inner_q: None,
                 nested: None,
+                subpath_where: None,
             });
         }
         // The inner NODES carry only a variable — put any per-hop label / property
@@ -725,30 +735,16 @@ impl Parser {
                 );
             }
         }
-        // A NESTED repetition (`( … {a,b} … ){n,m}`). Its NODE variables — the source, a
-        // nested hop's landing `-[]->{a,b}(y)`, any intermediate — are all group variables
-        // at the OUTER unit's depth (flat lists), and a per-hop EDGE predicate on a nested
-        // inner hop (`-[e WHERE …]->{a,b}`) filters every inner edge. Both are supported by
-        // the structured binder. Only a subpath-level WHERE over grouped variables is still
-        // deferred (rejected just below).
-        let nested = inner_q.is_some() || unit_rest.iter().any(|s| s.rel.quantifier.is_some());
-        // The subpath `WHERE` (over x/e/y) becomes the per-repetition predicate,
-        // AND-ed with any inline `-[e {…} WHERE …]->` predicate.
-        if self.check_kw("where") {
-            if nested {
-                return err(
-                    "a subpath-level WHERE on a nested quantifier is not yet supported \
-                     — put the predicate inline on the edge (`-[e WHERE …]->{a,b}`)",
-                    self.peek().pos,
-                );
-            }
+        // The subpath-level `WHERE` (over the unit's group variables) — a PER-REPETITION
+        // predicate, kept SEPARATE from any inline `-[e WHERE …]->` edge predicate. On a
+        // NESTED quantifier it is evaluated per OUTER rep with the inner variables bound as
+        // lists (`size(e)`, `x[0]`, …) — the structured per-rep binding handles any nesting.
+        let subpath_where = if self.check_kw("where") {
             self.advance();
-            let cond = self.parse_expr()?;
-            rel.where_ = Some(match rel.where_.take() {
-                Some(w) => Expr::And(vec![w, cond]),
-                None => cond,
-            });
-        }
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
         self.expect(Tt::RParen, "')' to close a quantified subpath")?;
         let Some(q) = self.parse_quantifier()? else {
             return err(
@@ -772,6 +768,7 @@ impl Parser {
             unit_rest,
             inner_q,
             nested: None,
+            subpath_where,
         })
     }
 
@@ -899,6 +896,7 @@ impl Parser {
                     unit_rest: Vec::new(),
                     inner_q: None,
                 nested: None,
+                subpath_where: None,
                 });
             }
 

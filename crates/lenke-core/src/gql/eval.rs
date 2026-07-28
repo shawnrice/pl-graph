@@ -3213,26 +3213,48 @@ fn bind_group_vars(
     steps: &[StepRec],
 ) -> Vec<(usize, Option<Val>)> {
     let mut restores = Vec::new();
-    bind_unit(binding, unit, &[], steps, &mut restores);
+    bind_unit(binding, unit, &[], 0, steps, &mut restores);
+    restores
+}
+
+/// Bind ONE outer rep's variables for the per-repetition `WHERE` (`steps` already
+/// filtered to that rep). `key_start = 1` drops the outer-rep index from every key, so a
+/// variable at the OUTER unit's depth collapses to a SCALAR (this rep's single value) and
+/// a variable inside a `Sub` becomes a LIST over the inner reps — exactly the per-rep view
+/// the predicate sees (`size(e)`, `x[0]`, …).
+fn bind_group_vars_perrep(
+    binding: &mut Binding,
+    unit: &CUnit,
+    steps: &[StepRec],
+) -> Vec<(usize, Option<Val>)> {
+    let mut restores = Vec::new();
+    bind_unit(binding, unit, &[], 1, steps, &mut restores);
     restores
 }
 
 /// Assemble one unit's group variables. `tree_path` is the sequence of `Sub`-element
 /// indices from the top unit down to THIS unit, so `depth = tree_path.len()` is the
 /// unit's nesting depth (0 = top). A variable here is indexed by the rep counters of
-/// levels `0..=depth`: the enclosing quantifiers form the outer list dimensions, this
-/// unit's own rep is the innermost. `steps` is in walk order, so "first/last matching
-/// step" needs no sort. Recurses into each `Sub` child.
+/// levels `key_start..=depth`: the enclosing quantifiers form the outer list dimensions,
+/// this unit's own rep is the innermost. `key_start = 0` is the full-nesting emit binding;
+/// `key_start = 1` drops the outer level for a per-rep `WHERE` view. `steps` is in walk
+/// order, so "first/last matching step" needs no sort. Recurses into each `Sub` child.
 fn bind_unit(
     binding: &mut Binding,
     unit: &CUnit,
     tree_path: &[usize],
+    key_start: usize,
     steps: &[StepRec],
     restores: &mut Vec<(usize, Option<Val>)>,
 ) {
     let depth = tree_path.len();
-    // The rep-tuple that indexes a variable of THIS unit: reps of levels `0..=depth`.
-    let key = |s: &StepRec| -> Vec<u32> { s.levels[..=depth].iter().map(|(r, _)| *r).collect() };
+    // The rep-tuple that indexes a variable of THIS unit: reps of levels `key_start..=depth`.
+    let key = |s: &StepRec| -> Vec<u32> {
+        s.levels[key_start..depth + 1]
+            .iter()
+            .map(|(r, _)| *r)
+            .collect()
+    };
     // Is `s` a hop somewhere inside this unit (at this tree position), possibly deeper?
     let within = |s: &StepRec| -> bool {
         s.levels.len() > depth
@@ -3305,7 +3327,7 @@ fn bind_unit(
                 }
                 let mut child_path = tree_path.to_vec();
                 child_path.push(e);
-                bind_unit(binding, &sub.unit, &child_path, steps, restores);
+                bind_unit(binding, &sub.unit, &child_path, key_start, steps, restores);
             }
         }
     }
@@ -3348,7 +3370,6 @@ fn reachable_each_unit(
         return false;
     }
 
-    let k = unit.elems.len();
     let trail = matches!(mode, PathMode::Trail);
     let vertex_mode = matches!(mode, PathMode::Simple | PathMode::Acyclic);
     let mut marks = if trail {
@@ -3432,6 +3453,13 @@ fn reachable_each_unit(
                 Position::Deep(v) => v.iter().map(one).collect(),
             }
         }
+        // The OUTERMOST unit's rep index — which outer repetition this position is in.
+        fn outer_rep(&self) -> u32 {
+            match self {
+                Position::Flat(c) => c.rep,
+                Position::Deep(v) => v[0].rep,
+            }
+        }
     }
 
     struct HopMove<'a> {
@@ -3458,6 +3486,32 @@ fn reachable_each_unit(
         fn is_empty(&self) -> bool {
             matches!(self, MoveSet::None)
         }
+        // Drop moves that ADVANCE past outer rep `rep` (they start the next outer rep) —
+        // used when a failed per-rep `WHERE` prunes the outer-completion branch but the
+        // inner-continue branches (outer rep == `rep`) must survive.
+        fn retain_outer_le(self, rep: u32) -> Self {
+            match self {
+                MoveSet::None => MoveSet::None,
+                MoveSet::One(m) => {
+                    if m.after.outer_rep() <= rep {
+                        MoveSet::One(m)
+                    } else {
+                        MoveSet::None
+                    }
+                }
+                MoveSet::Many(v) => {
+                    let kept: Vec<_> = v
+                        .into_iter()
+                        .filter(|m| m.after.outer_rep() <= rep)
+                        .collect();
+                    if kept.is_empty() {
+                        MoveSet::None
+                    } else {
+                        MoveSet::Many(kept)
+                    }
+                }
+            }
+        }
     }
 
     // Follow epsilon moves (enter a sub / close a nested unit / repeat) from `start`,
@@ -3467,8 +3521,11 @@ fn reachable_each_unit(
     // A `Flat` (depth-1) position has no epsilon branching — the ENTIRE linear world —
     // so its ≤1 hop move is computed inline here (no worklist / visited-set / heap
     // position); only nesting reaches the out-of-line general resolver.
+    // Returns `(emit, completed_outer, moves)`: whether the top unit ACCEPTS here, whether
+    // an OUTER rep just completed (the top unit reached its end — the per-rep `WHERE` hook,
+    // true even below `min`), and every graph-consuming hop reachable.
     #[inline]
-    fn resolve<'a>(start: &Position<'a>) -> (bool, MoveSet<'a>) {
+    fn resolve<'a>(start: &Position<'a>) -> (bool, bool, MoveSet<'a>) {
         if let Position::Flat(c) = start {
             let c = *c;
             if c.elem < c.unit.elems.len() {
@@ -3477,6 +3534,7 @@ fn reachable_each_unit(
                     a.elem += 1;
                     return (
                         false,
+                        false,
                         MoveSet::One(HopMove {
                             rel: &h.rel,
                             after: Position::Flat(a),
@@ -3484,6 +3542,7 @@ fn reachable_each_unit(
                     );
                 }
             } else {
+                // The flat unit reached its end — outer rep `c.rep` completed.
                 let rep2 = c.rep + 1;
                 let emit = rep2 >= c.min;
                 if rep2 < c.max {
@@ -3493,6 +3552,7 @@ fn reachable_each_unit(
                         a.elem = 1;
                         return (
                             emit,
+                            true,
                             MoveSet::One(HopMove {
                                 rel: &h.rel,
                                 after: Position::Flat(a),
@@ -3500,7 +3560,7 @@ fn reachable_each_unit(
                         );
                     }
                 } else {
-                    return (emit, MoveSet::None);
+                    return (emit, true, MoveSet::None);
                 }
             }
         }
@@ -3510,8 +3570,9 @@ fn reachable_each_unit(
     // The general epsilon-closure (nesting): kept out of line so the linear fast path
     // above stays small enough to inline at its call sites.
     #[inline(never)]
-    fn resolve_general<'a>(start: &Position<'a>) -> (bool, MoveSet<'a>) {
+    fn resolve_general<'a>(start: &Position<'a>) -> (bool, bool, MoveSet<'a>) {
         let mut emit = false;
+        let mut completed = false;
         let mut hops: Vec<HopMove<'a>> = Vec::new();
         let mut work = vec![start.clone()];
         let mut seen: Vec<Vec<(usize, u32, usize)>> = Vec::new();
@@ -3558,6 +3619,10 @@ fn reachable_each_unit(
                         work.push(close);
                     }
                 }
+                // The TOP unit at its end (any `rep`, `min` or not) = an outer rep completed.
+                if p.len() == 1 {
+                    completed = true;
+                }
                 if rep2 < top.max {
                     let mut again = p.clone();
                     let t = again.top_mut();
@@ -3572,7 +3637,7 @@ fn reachable_each_unit(
         } else {
             MoveSet::Many(hops)
         };
-        (emit, moves)
+        (emit, completed, moves)
     }
 
     struct Frame<'a> {
@@ -3633,50 +3698,43 @@ fn reachable_each_unit(
         steps
     }
 
-    // The top unit's per-rep `WHERE` (linear only — a nested unit's WHERE is rejected at
-    // compile). Reconstruct the just-completed rep's `k` hops from the top `k` frames +
-    // the current edge, bind them as scalars, evaluate.
-    let where_ok =
-        |graph: &Graph, ctx: &Ctx, b: &mut Binding, stack: &[Frame], eidx: u32, nbr: u32| -> bool {
-            let Some(w) = &unit.where_ else {
-                return true;
-            };
-            let base = stack.len() - k;
-            let mut saves: Vec<(usize, Option<Val>)> = Vec::new();
-            let mut set = |b: &mut Binding, slot: Option<usize>, v: Val| {
-                if let Some(s) = slot {
-                    saves.push((s, b.get(s).cloned()));
-                    b.set(s, v);
-                }
-            };
-            set(b, unit.start_slot, Val::Node(stack[base].vertex));
-            for j in 0..k {
-                let hop = unit.hop(j);
-                let (e, t) = if j + 1 < k {
-                    let f = &stack[base + j + 1];
-                    (f.entry_edge.expect("inner hop has an edge"), f.vertex)
-                } else {
-                    (eidx, nbr)
-                };
-                set(b, hop.rel.var_slot, Val::Edge(e));
-                set(b, hop.target_slot, Val::Node(t));
-            }
-            let ok = as_truth(&eval(&Env::new(graph, ctx, b), w)) == Some(true);
-            for (s, prev) in saves.into_iter().rev() {
-                match prev {
-                    Some(v) => b.set(s, v),
-                    None => b.unset(s),
-                }
-            }
-            ok
+    // The top unit's per-repetition `WHERE`, at each OUTER-rep completion. Reconstruct the
+    // just-completed rep `rep`'s hops (all steps whose outer level is `rep`), bind the
+    // unit's variables to their per-rep values — a direct variable is a SCALAR, a variable
+    // inside a nested `Sub` is a LIST over the inner reps (`bind_group_vars_perrep`) — then
+    // evaluate. Generalizes the old linear/scalar reconstruction to any nesting.
+    let where_ok = |graph: &Graph,
+                    ctx: &Ctx,
+                    b: &mut Binding,
+                    stack: &[Frame],
+                    eidx: u32,
+                    nbr: u32,
+                    rep: u32|
+     -> bool {
+        let Some(w) = &unit.where_ else {
+            return true;
         };
+        let rep_steps: Vec<StepRec> = rebuild_steps(stack, nbr, eidx)
+            .into_iter()
+            .filter(|s| s.levels.first().is_some_and(|(r, _)| *r == rep))
+            .collect();
+        let restores = bind_group_vars_perrep(b, unit, &rep_steps);
+        let ok = as_truth(&eval(&Env::new(graph, ctx, b), w)) == Some(true);
+        for (s, prev) in restores.into_iter().rev() {
+            match prev {
+                Some(v) => b.set(s, v),
+                None => b.unset(s),
+            }
+        }
+        ok
+    };
 
     let mut steps: u64 = 0;
     let mut cont = true;
     let has_where = unit.where_.is_some();
 
     // (The top unit's `min == 0` zero-rep acceptance is emitted upfront, before marks.)
-    let (_, seed_moves) = resolve(&Position::Flat(Cursor {
+    let (_, _, seed_moves) = resolve(&Position::Flat(Cursor {
         unit,
         min: q.min,
         max: q.max.unwrap_or(u32::MAX),
@@ -3746,8 +3804,22 @@ fn reachable_each_unit(
             }
         }
 
-        if completes_top && has_where && !where_ok(graph, ctx, binding, &stack, eidx, nbr) {
-            continue;
+        // Resolve the epsilon-closure: does the top unit ACCEPT here, did an OUTER rep just
+        // complete (the per-rep `WHERE` hook), and the onward hops.
+        let outer_rep = after.outer_rep();
+        let (mut emit, completed_outer, mut next_moves) = resolve(after);
+
+        // Per-repetition `WHERE` at each outer-rep completion. On failure, PRUNE only the
+        // outer-completion branch: suppress the emit and drop the moves that start the next
+        // outer rep, while inner-continue branches (same outer rep, their rep not yet done)
+        // survive. For a linear unit there is no inner branch, so this prunes the whole hop
+        // (equivalent to the old per-rep skip).
+        if completed_outer
+            && has_where
+            && !where_ok(graph, ctx, binding, &stack, eidx, nbr, outer_rep)
+        {
+            emit = false;
+            next_moves = next_moves.retain_outer_le(outer_rep);
         }
 
         steps += 1;
@@ -3765,8 +3837,6 @@ fn reachable_each_unit(
         if let Some(mi) = mark {
             marks[mi] = true;
         }
-
-        let (emit, next_moves) = resolve(after);
 
         if emit {
             let (pv, pe, steps) = if want_path {

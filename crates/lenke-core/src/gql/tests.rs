@@ -5769,9 +5769,9 @@ fn nested_quantifier_endpoints() {
     );
 }
 
-/// What's supported vs. still loudly-rejected on a nested quantifier. NODE group
-/// variables (source, a nested hop's landing) are now exposed as flat lists; only a
-/// subpath-level WHERE over grouped variables remains deferred.
+/// Nested-quantifier surface: NODE group variables are exposed as flat lists, per-hop
+/// EDGE predicates filter inner edges, and a subpath-level WHERE is now a per-outer-rep
+/// predicate over the grouped variables (all supported).
 #[test]
 fn nested_quantifier_group_vars_and_where() {
     // A NAMED inner NODE inside a nested quantifier IS supported (its landing is a group
@@ -5780,8 +5780,9 @@ fn nested_quantifier_group_vars_and_where() {
     // A per-hop EDGE predicate on a nested inner hop IS supported (filters inner edges).
     assert!(parse("MATCH (s) ( ()-[e:R WHERE e.amt >= 5]->{1,2}() ){2} (t) RETURN t").is_ok());
     assert!(parse("MATCH (s) ( ()-[:R {amt:10.0}]->{1,3}() ){1} (t) RETURN t").is_ok());
-    // A subpath-level WHERE on a nested quantifier → still rejected (deferred).
-    assert!(parse("MATCH (s) ( ()-[:R]->{1,2}() WHERE true ){2} (t) RETURN t").is_err());
+    // A subpath-level WHERE on a nested quantifier IS supported (per outer rep, inner
+    // variables bound as lists — e.g. `size(e)`).
+    assert!(parse("MATCH (s) ( ()-[e:R]->{1,2}() WHERE size(e) = 2 ){2} (t) RETURN t").is_ok());
     // A plain (non-nested) subpath keeps its group variables + WHERE.
     assert!(parse("MATCH (s) ((x)-[e:R]->(y) WHERE x = y){1,2} (t) RETURN size(e)").is_ok());
 }
@@ -5913,16 +5914,60 @@ fn nested_parenthesized_subpath_varying_and_edges() {
     );
 }
 
-/// #2 restrictions stay LOUD: a subpath-level WHERE on the OUTER nested quantifier is
-/// still rejected, but a per-hop edge predicate INSIDE the nested subpath is fine.
+/// #2 WHERE surface: predicates at every level of a nested parenthesized subpath.
 #[test]
 fn nested_parenthesized_subpath_restrictions() {
     // Per-hop predicate inside the inner subpath → OK.
     assert!(parse("MATCH (s) ( ((x)-[e:R WHERE e.amt > 0]->(y)){1,2} ){2} (t) RETURN t").is_ok());
     // The inner subpath keeps its own WHERE (a per-rep predicate over its group vars).
     assert!(parse("MATCH (s) ( ((x)-[e:R]->(y) WHERE x = y){1,2} ){2} (t) RETURN t").is_ok());
-    // A WHERE on the OUTER nested quantifier → rejected (deferred).
-    assert!(parse("MATCH (s) ( ((x)-[:R]->(y)){1,2} WHERE true ){2} (t) RETURN t").is_err());
+    // A WHERE on the OUTER nested quantifier IS supported — per outer rep, the inner vars
+    // (x, e, y) are bound as lists.
+    assert!(parse("MATCH (s) ( ((x)-[e:R]->(y)){1,2} WHERE size(e) = 2 ){2} (t) RETURN t").is_ok());
+}
+
+/// A subpath-level WHERE on a NESTED quantifier is a PER-OUTER-REP predicate with the
+/// inner variables bound as LISTS. `size(e)` constrains each outer rep's inner walk
+/// length — the crux that distinguishes per-rep from per-edge / whole-match filtering.
+#[test]
+fn nested_quantifier_per_rep_where_over_grouped_vars() {
+    let mut g = five_chain(); // a→b→c→d→e
+                              // Abbreviated inner: each outer rep must be exactly TWO inner hops (`size(e)=2`), so
+                              // two outer reps walk all four edges → endpoint e. (`=1` → each rep one hop → c.)
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ( ()-[e:R]->{1,2}() WHERE size(e) = 2 ){2} (t) RETURN t.id AS id",
+        ),
+        vec![s("e")],
+    );
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ( ()-[e:R]->{1,2}() WHERE size(e) = 1 ){2} (t) RETURN t.id AS id",
+        ),
+        vec![s("c")],
+    );
+    // Nested parenthesized subpath: same per-outer-rep constraint, inner vars still exposed
+    // as list-of-lists at the end (x = [[a,b],[c,d]]).
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ( ((x)-[e:R]->(y)){1,2} WHERE size(e) = 2 ){2} (t) \
+             RETURN t.id AS tid, size(x) AS nx, size(x[0]) AS nx0, x[1][0].id AS a10",
+        ),
+        vec![vec![s("e"), n(2.0), n(2.0), s("c")]],
+    );
+    // A per-rep WHERE referencing list ELEMENTS: keep only outer reps whose inner walk
+    // starts at 'a' or 'c' (the actual rep sources). Both reps qualify → endpoint e.
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ( ((x)-[e:R]->(y)){2,2} WHERE x[0].id <> y[1].id ){2} (t) \
+             RETURN t.id AS id",
+        ),
+        vec![s("e")],
+    );
 }
 
 /// The fused matcher marks PER HOP, so ACYCLIC/SIMPLE now forbid a multi-element unit

@@ -658,15 +658,6 @@ impl CUnit {
                 CElem::Sub(s) => s.target_slot.is_some() || s.unit.exposes(),
             })
     }
-
-    /// The element at `i` as a hop. The current matcher only handles all-`Hop` (linear)
-    /// units; a nested `Sub` element is lowered by the pushdown path, not here.
-    pub fn hop(&self, i: usize) -> &CHop {
-        match &self.elems[i] {
-            CElem::Hop(h) => h,
-            CElem::Sub(_) => unreachable!("nested sub-unit reached the linear matcher"),
-        }
-    }
 }
 
 /// One element of a unit's linear sequence: a single edge, or a nested quantified
@@ -1729,6 +1720,8 @@ impl Lowerer {
                 .rel
                 .quantifier
                 .expect("a nested subpath is quantified");
+            // The outer subpath-level `WHERE` (per OUTER rep, inner vars bound as lists).
+            let where_ = s.subpath_where.as_ref().map(|w| self.expr(w));
             return CUnit {
                 elems: vec![CElem::Sub(CSub {
                     unit: Box::new(inner_unit),
@@ -1739,19 +1732,24 @@ impl Lowerer {
                     target_slot: None,
                 })],
                 start_slot: None,
-                where_: None,
+                where_,
             };
         }
         let from = s.hop_from.as_ref().expect("a subpath has a source");
         let mut rel = self.rel(&s.rel);
-        // A PLAIN hop's `WHERE` is lifted to the unit level and AND-ed (checked once the
-        // whole rep is bound). A NESTED hop's `WHERE` (`-[e WHERE …]->{a,b}`) is a per-inner-
-        // edge predicate — it stays on the `Sub`'s inner hop, NOT lifted.
-        let mut where_ = if s.inner_q.is_none() {
-            rel.where_.take()
-        } else {
-            None
-        };
+        // The subpath-level `WHERE` is the per-repetition predicate. A PLAIN first hop's
+        // inline edge `WHERE` is also lifted to the unit level and AND-ed (checked once the
+        // rep is bound); a NESTED hop's inline `WHERE` (`-[e WHERE …]->{a,b}`) is a per-inner-
+        // edge predicate that stays on the `Sub`'s inner hop, NOT lifted.
+        let mut where_ = s.subpath_where.as_ref().map(|w| self.expr(w));
+        if s.inner_q.is_none() {
+            if let Some(w) = rel.where_.take() {
+                where_ = Some(match where_.take() {
+                    Some(prev) => CExpr::And(vec![prev, w]),
+                    None => w,
+                });
+            }
+        }
         let first_target = s.hop_to.as_ref().and_then(|to| self.node_slot(to));
         let mut elems = vec![hop_or_sub(rel.clone(), first_target, s.inner_q)];
         for extra in &s.unit_rest {
