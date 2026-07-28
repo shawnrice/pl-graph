@@ -4003,91 +4003,6 @@ fn reachable(
     ends
 }
 
-/// Walk the remaining segments of `pattern` from `from`, emitting each complete
-/// binding via `emit`. Returns `false` to propagate a consumer's stop request.
-fn walk_segments(
-    graph: &Graph,
-    ctx: &Ctx,
-    pattern: &CPath,
-    index: usize,
-    from: u32,
-    binding: &mut Binding,
-    emit: &mut dyn FnMut(&mut Binding) -> bool,
-) -> bool {
-    if index >= pattern.segments.len() {
-        return emit(binding);
-    }
-    let CSegment { rel, node, unit } = &pattern.segments[index];
-    if let Some(q) = rel.quantifier {
-        // Var-length: stream endpoints and stop the moment a consumer (EXISTS /
-        // LIMIT) is satisfied — `match_node_then` returns false to propagate the
-        // stop, avoiding an exponential trail enumeration on a dense graph. A
-        // parenthesized SUBPATH repeats a unit and exposes its group variables at
-        // each trail end; the abbreviated `-[e]->{n}` form is the plain single-edge
-        // walk. Both stream through the same `on_end` contract.
-        let sink =
-            &mut |b: &mut Binding, end: u32, verts: &[u32], edges: &[u32], steps: &[StepRec]| {
-                let restores = unit
-                    .as_ref()
-                    .filter(|u| u.exposes())
-                    .map(|u| {
-                        if u.is_flat() {
-                            bind_group_vars_flat(b, u, verts, edges)
-                        } else {
-                            bind_group_vars(b, u, steps)
-                        }
-                    })
-                    .unwrap_or_default();
-                let keep = match_node_then(graph, ctx, b, node, end, &mut |b2| {
-                    walk_segments(graph, ctx, pattern, index + 1, end, b2, emit)
-                });
-                for (s, prev) in restores.into_iter().rev() {
-                    match prev {
-                        Some(v) => b.set(s, v),
-                        None => b.unset(s),
-                    }
-                }
-                keep
-            };
-        let spec = WalkSpec {
-            q,
-            mode: pattern.mode,
-            want_path: unit.as_ref().is_some_and(|u| u.exposes()),
-        };
-        return match unit {
-            Some(u) => reachable_each_unit(graph, ctx, binding, from, u, spec, sink),
-            None => reachable_each(graph, ctx, binding, from, rel, spec, sink),
-        };
-    }
-    for (eidx, nbr) in expand(graph, ctx, from, rel.direction, rel.label.as_ref()) {
-        let Some(did_set) = bind_slot(binding, rel.var_slot, &Val::Edge(eidx)) else {
-            continue; // join conflict on the edge variable
-        };
-        let ok = satisfies(
-            graph,
-            ctx,
-            &Val::Edge(eidx),
-            &rel.props,
-            rel.where_.as_ref(),
-            binding,
-        );
-        let keep = if ok {
-            match_node_then(graph, ctx, binding, node, nbr, &mut |b| {
-                walk_segments(graph, ctx, pattern, index + 1, nbr, b, emit)
-            })
-        } else {
-            true
-        };
-        if did_set {
-            binding.unset(rel.var_slot.unwrap());
-        }
-        if !keep {
-            return false;
-        }
-    }
-    true
-}
-
 /// `ANY SHORTEST` over a single quantified segment `(start)-[rel q]->(end)`: from
 /// the already-matched `seed` (bound to `start`), find one fewest-hop path to each
 /// reachable vertex that matches `end`, bind it to the path variable (if named),
@@ -4373,7 +4288,7 @@ fn all_shortest_walk(
 
 /// Bare path binding over a single quantified segment (`p = (a)-[:R]->{m,n}(b)`):
 /// enumerate every walk from the seed under the pattern's mode and bind each as a
-/// Path value (vertices + edges). The plain `walk_segments` driver only knows the
+/// Path value (vertices + edges). The plain `match_path` driver only knows the
 /// endpoint, so this asks `reachable_each` for the whole walk (`want_path`).
 fn all_walk(
     graph: &Graph,
@@ -4632,7 +4547,7 @@ fn visit_pattern(
                 PathSelector::Walk if pattern.path_var_slot.is_some() => {
                     all_walk(graph, ctx, pattern, seed, b, emit)
                 }
-                PathSelector::Walk => walk_segments(graph, ctx, pattern, 0, seed, b, emit),
+                PathSelector::Walk => match_path(graph, ctx, pattern, 0, seed, b, emit),
                 // `ANY` and `SHORTEST 1 [GROUP]` over a shortest-shaped segment
                 // reduce to the O(V+E) BFS drivers (a shortest path is a valid
                 // arbitrary / 1-shortest path) instead of enumerating exponentially
@@ -5389,7 +5304,7 @@ fn drive_matches(
     clippy::too_many_arguments,
     reason = "recursive backtracking matcher; bundling its args into a struct would obscure the hot recursion"
 )]
-fn match_node_continue<F: FnMut(&mut Binding) -> bool>(
+fn match_node_continue<F: FnMut(&mut Binding) -> bool + ?Sized>(
     graph: &Graph,
     ctx: &Ctx,
     binding: &mut Binding,
@@ -5424,8 +5339,11 @@ fn match_node_continue<F: FnMut(&mut Binding) -> bool>(
     keep
 }
 
-/// Walk segments `idx..` of `path` from `from`, emitting each complete binding.
-fn match_path<F: FnMut(&mut Binding) -> bool>(
+/// Walk segments `idx..` of `path` from `from`, emitting each complete binding. Generic
+/// over the emit sink AND `?Sized`, so it is the ONE segment-walker for both the hot
+/// top-level caller (a concrete `F` → monomorphized, static dispatch) and the subquery
+/// caller (`F = dyn FnMut` → one instantiation, dynamic dispatch) — no duplicated body.
+fn match_path<F: FnMut(&mut Binding) -> bool + ?Sized>(
     graph: &Graph,
     ctx: &Ctx,
     path: &CPath,
@@ -5439,7 +5357,7 @@ fn match_path<F: FnMut(&mut Binding) -> bool>(
     }
     let CSegment { rel, node, unit } = &path.segments[idx];
     if let Some(q) = rel.quantifier {
-        // The twin of `walk_segments`' branch: a parenthesized SUBPATH repeats a unit
+        // A parenthesized SUBPATH repeats a unit
         // and exposes its group variables at each trail end; the abbreviated form is
         // the plain single-edge walk. Same `on_end` contract.
         let sink =
