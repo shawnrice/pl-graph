@@ -257,6 +257,44 @@ suite('@lenke/native/arrow — FixedSizeList<Float64> egress', () => {
     });
   }
 
+  // End to end: compute a GCN-normalized aggregate, write it to a property, and pull the
+  // whole [V×D] matrix out as a real Arrow FixedSizeList<Float64> — the ML message-passing
+  // → training-tensor path composing neighborAggregate (weights+norm) with vector egress.
+  test('a neighborAggregate embedding egresses as a FixedSizeList feature matrix', async () => {
+    const g = graphFromFormat(
+      backend,
+      [
+        '{"type":"node","id":"a","labels":["V"],"properties":{"h":[1,2]}}',
+        '{"type":"node","id":"b","labels":["V"],"properties":{"h":[3,4]}}',
+        '{"type":"edge","from":"a","to":"b","labels":["R"]}',
+      ].join('\n'),
+      'ndjson',
+    );
+
+    try {
+      // a↔b, both + includeSelf → degree 2 each → every GCN coef 1/2 → ½([1,2]+[3,4]) = [2,3].
+      await g.neighborAggregate({
+        feature: 'h',
+        op: 'sum',
+        direction: 'both',
+        includeSelf: true,
+        norm: 'gcn',
+        writeProperty: 'emb',
+      });
+      const t = tableFromIPC(
+        toArrowIPC(g.queryArrow('MATCH (n:V) RETURN n.emb AS emb ORDER BY n.id')),
+      );
+
+      expect(String(t.schema.fields[0].type)).toContain('FixedSizeList');
+      expect([...t].map((r) => [...(r.emb as { toArray(): Float64Array }).toArray()])).toEqual([
+        [2, 3],
+        [2, 3],
+      ]);
+    } finally {
+      g.free();
+    }
+  });
+
   test('native and JS encoders are byte-for-byte identical', () => {
     const g = graphFromFormat(backend, VEC_NDJSON, 'ndjson');
 
