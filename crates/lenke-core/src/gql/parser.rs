@@ -645,6 +645,43 @@ impl Parser {
     fn parse_quantified_subpath(&mut self) -> R<Segment> {
         let open = self.peek().pos;
         self.expect(Tt::LParen, "'(' to open a quantified subpath")?;
+        // A nested PARENTHESIZED subpath as the body: `( ((x)-[e]->(y)){a,b} ){n,m}`.
+        // (After the outer `(`, an inner `( … ){q}` means nesting; a plain `(x)` source
+        // is not quantified, so `starts_quantified_subpath` distinguishes them.)
+        if self.starts_quantified_subpath() {
+            let inner = self.parse_quantified_subpath()?;
+            self.expect(Tt::RParen, "')' to close a quantified subpath")?;
+            let Some(q) = self.parse_quantifier()? else {
+                return err(
+                    "a parenthesized subpath must be quantified (`( … ){n,m}`)",
+                    open,
+                );
+            };
+            let node = if self.check(Tt::LParen) {
+                self.parse_node()?
+            } else {
+                NodePattern::default()
+            };
+            // A synthetic rel carries only the OUTER quantifier (the unit body is the
+            // nested subpath, not a hop of this segment's `rel`).
+            let rel = RelPattern {
+                variable: None,
+                label: None,
+                direction: Direction::Out,
+                props: Vec::new(),
+                where_: None,
+                quantifier: Some(q),
+            };
+            return Ok(Segment {
+                rel,
+                node,
+                hop_from: None,
+                hop_to: None,
+                unit_rest: Vec::new(),
+                inner_q: None,
+                nested: Some(Box::new(inner)),
+            });
+        }
         let hop_from = self.parse_node()?; // inner (x)
         if !self.starts_relationship() {
             return err(
@@ -670,6 +707,7 @@ impl Parser {
                 hop_to: None,
                 unit_rest: Vec::new(),
                 inner_q: None,
+                nested: None,
             });
         }
         // The inner NODES carry only a variable — put any per-hop label / property
@@ -733,6 +771,7 @@ impl Parser {
             hop_to: Some(hop_to),
             unit_rest,
             inner_q,
+            nested: None,
         })
     }
 
@@ -859,6 +898,7 @@ impl Parser {
                     hop_to: None,
                     unit_rest: Vec::new(),
                     inner_q: None,
+                nested: None,
                 });
             }
 

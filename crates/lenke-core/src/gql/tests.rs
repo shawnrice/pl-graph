@@ -5851,6 +5851,80 @@ fn nested_quantifier_per_hop_edge_predicate() {
     );
 }
 
+/// #2 — a nested PARENTHESIZED subpath `( ((x)-[e]->(y)){a,b} ){n,m}` exposes its inner
+/// variables as LIST-OF-LISTS: one list level per enclosing quantifier. The structured
+/// binder assembles this with no special case (a `Sub` whose inner unit itself exposes).
+#[test]
+fn nested_parenthesized_subpath_list_of_lists() {
+    let mut g = five_chain();
+    // `( ((x)-[:R]->(y)){2,2} ){2}` on a→b→c→d→e: outer 2 reps, each 2 inner hops.
+    // rep1: a→b, b→c → x=[a,b], y=[b,c]; rep2: c→d, d→e → x=[c,d], y=[d,e].
+    // So x=[[a,b],[c,d]], y=[[b,c],[d,e]].
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ( ((x)-[:R]->(y)){2,2} ){2} (t) \
+             RETURN t.id AS tid, size(x) AS nx, size(x[0]) AS nx0, \
+             x[0][0].id AS a00, x[0][1].id AS a01, x[1][0].id AS a10, \
+             y[0][1].id AS y01, y[1][1].id AS y11",
+        ),
+        vec![vec![
+            s("e"),
+            n(2.0),
+            n(2.0),
+            s("a"),
+            s("b"),
+            s("c"),
+            s("c"),
+            s("e"),
+        ]],
+    );
+}
+
+/// #2 — a nested subpath's inner EDGE variable is also list-of-lists, and the inner
+/// count may VARY per outer rep (the nested lists are ragged, not rectangular).
+#[test]
+fn nested_parenthesized_subpath_varying_and_edges() {
+    let mut g = five_chain();
+    // `( ((x)-[e:R]->(y)){1,2} ){1}`: one outer rep, inner walk of 1 or 2 hops from a.
+    // → endpoint b (1 inner hop: x=[[a]]) or c (2 inner hops: x=[[a,b]]).
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ( ((x)-[e:R]->(y)){1,2} ){1} (t) \
+             RETURN t.id AS tid, size(x) AS nx, size(x[0]) AS nx0, size(e[0]) AS ne0 \
+             ORDER BY tid",
+        ),
+        vec![
+            vec![s("b"), n(1.0), n(1.0), n(1.0)],
+            vec![s("c"), n(1.0), n(2.0), n(2.0)],
+        ],
+    );
+    // Two outer reps, exactly one inner hop each: `( ((x)-[e:R]->(y)){1,1} ){2}` on
+    // a→b→c → x=[[a],[b]], y=[[b],[c]] (each inner list length 1).
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ( ((x)-[e:R]->(y)){1,1} ){2} (t) \
+             RETURN t.id AS tid, size(x) AS nx, size(x[0]) AS nx0, \
+             x[0][0].id AS a00, x[1][0].id AS a10, y[1][0].id AS y10",
+        ),
+        vec![vec![s("c"), n(2.0), n(1.0), s("a"), s("b"), s("c")]],
+    );
+}
+
+/// #2 restrictions stay LOUD: a subpath-level WHERE on the OUTER nested quantifier is
+/// still rejected, but a per-hop edge predicate INSIDE the nested subpath is fine.
+#[test]
+fn nested_parenthesized_subpath_restrictions() {
+    // Per-hop predicate inside the inner subpath → OK.
+    assert!(parse("MATCH (s) ( ((x)-[e:R WHERE e.amt > 0]->(y)){1,2} ){2} (t) RETURN t").is_ok());
+    // The inner subpath keeps its own WHERE (a per-rep predicate over its group vars).
+    assert!(parse("MATCH (s) ( ((x)-[e:R]->(y) WHERE x = y){1,2} ){2} (t) RETURN t").is_ok());
+    // A WHERE on the OUTER nested quantifier → rejected (deferred).
+    assert!(parse("MATCH (s) ( ((x)-[:R]->(y)){1,2} WHERE true ){2} (t) RETURN t").is_err());
+}
+
 /// The fused matcher marks PER HOP, so ACYCLIC/SIMPLE now forbid a multi-element unit
 /// from repeating a vertex INTERNALLY — the correct ISO reading (a node at most once
 /// on an acyclic path), which the old per-unit-set check missed. A 2-hop unit through

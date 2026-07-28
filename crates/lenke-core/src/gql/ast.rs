@@ -316,6 +316,13 @@ pub struct Segment {
     /// repetition. `rel.quantifier` on the segment is the OUTER subpath quantifier, so
     /// the first hop's own quantifier needs its own slot.
     pub inner_q: Option<Quantifier>,
+    /// A nested PARENTHESIZED-and-quantified subpath as this subpath's body:
+    /// `( ((x)-[e]->(y)){a,b} ){n,m}`. When set, this outer subpath's sole element is
+    /// the nested subpath (its own `rel.quantifier` = the inner `{a,b}`; the outer
+    /// `{n,m}` is on this segment's `rel.quantifier`), and `hop_from`/`hop_to`/
+    /// `unit_rest`/`inner_q` are unused. The inner subpath's variables (x, e, y) are
+    /// exposed to the outer query as LIST-OF-LISTS — one list level per quantifier.
+    pub nested: Option<Box<Self>>,
 }
 
 /// `(variable:LabelExpr {props} WHERE pred)` — all parts optional.

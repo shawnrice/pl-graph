@@ -1293,6 +1293,33 @@ fn intern_ref(table: &mut Vec<String>, name: &str) -> usize {
     }
 }
 
+/// A subpath hop element: a plain `Hop`, or a nested single-edge `Sub` when the hop
+/// carries its own quantifier (`-[e]->{a,b}` — a nested repetition). The matcher steps
+/// one edge, so a `Hop`'s `CRel` is cleared of the hop quantifier; the `Sub` carries the
+/// bounds, and the hop's target becomes the `Sub`'s landing group variable.
+fn hop_or_sub(mut rel: CRel, target_slot: Option<usize>, q: Option<Quantifier>) -> CElem {
+    rel.quantifier = None;
+    match q {
+        None => CElem::Hop(CHop { rel, target_slot }),
+        // A nested `-[]->{a,b}(y)` hop: the inner hop's own target is an ANONYMOUS
+        // intermediate; the landing `y` is the WHOLE sub-unit's target, bound once per
+        // enclosing rep as a group variable (`CSub.target_slot`).
+        Some(quant) => CElem::Sub(CSub {
+            unit: Box::new(CUnit {
+                elems: vec![CElem::Hop(CHop {
+                    rel,
+                    target_slot: None,
+                })],
+                start_slot: None,
+                where_: None,
+            }),
+            min: quant.min,
+            max: quant.max,
+            target_slot,
+        }),
+    }
+}
+
 impl Lowerer {
     fn param_slot(&mut self, name: &str) -> usize {
         if let Some(i) = self.params.iter().position(|n| n == name) {
@@ -1344,29 +1371,39 @@ impl Lowerer {
                 self.add_var(v);
             }
             for seg in &p.segments {
-                // The inner source `(x)` and target `(y)` group variables of a
-                // quantified parenthesized subpath, plus any intermediate nodes /
-                // edges of a MULTI-element repetition unit (`(x)-[e1]->(m)-[e2]->(y)`).
-                for inner in [&seg.hop_from, &seg.hop_to].into_iter().flatten() {
-                    if let Some(v) = &inner.variable {
-                        self.add_var(v);
-                    }
-                }
-                for extra in &seg.unit_rest {
-                    if let Some(v) = &extra.rel.variable {
-                        self.add_var(v);
-                    }
-                    if let Some(v) = &extra.node.variable {
-                        self.add_var(v);
-                    }
-                }
-                if let Some(v) = &seg.rel.variable {
-                    self.add_var(v);
-                }
-                if let Some(v) = &seg.node.variable {
-                    self.add_var(v);
-                }
+                self.add_segment_vars(seg);
             }
+        }
+    }
+
+    /// Register a segment's variables. Recurses into a nested parenthesized subpath so
+    /// its inner variables get slots too (else `slot_of` returns the `UNBOUND` sentinel
+    /// and the binder writes to a bogus slot).
+    fn add_segment_vars(&mut self, seg: &Segment) {
+        // The inner source `(x)` and target `(y)` group variables of a quantified
+        // parenthesized subpath, plus any intermediate nodes / edges of a MULTI-element
+        // repetition unit (`(x)-[e1]->(m)-[e2]->(y)`).
+        for inner in [&seg.hop_from, &seg.hop_to].into_iter().flatten() {
+            if let Some(v) = &inner.variable {
+                self.add_var(v);
+            }
+        }
+        for extra in &seg.unit_rest {
+            if let Some(v) = &extra.rel.variable {
+                self.add_var(v);
+            }
+            if let Some(v) = &extra.node.variable {
+                self.add_var(v);
+            }
+        }
+        if let Some(inner) = &seg.nested {
+            self.add_segment_vars(inner);
+        }
+        if let Some(v) = &seg.rel.variable {
+            self.add_var(v);
+        }
+        if let Some(v) = &seg.node.variable {
+            self.add_var(v);
         }
     }
 
@@ -1668,72 +1705,74 @@ impl Lowerer {
 
     fn segment(&mut self, s: &Segment) -> CSegment {
         let node = self.node(&s.node);
-        let mut rel = self.rel(&s.rel);
-        // A quantified parenthesized subpath compiles to a repetition UNIT: the inner
-        // hops (`(x)-[e1]->(m)-[e2]->(y)`) with their group-variable slots + the
-        // per-unit `WHERE`. `node` is the separate outer endpoint. A single-edge
-        // subpath is a one-hop unit — the same shape, `k = 1`.
-        // A hop element: a plain `Hop`, or a nested single-edge `Sub` when the hop
-        // carries its own quantifier (`-[e]->{a,b}` — a nested repetition). The matcher
-        // ignores a hop's own quantifier (it steps one edge), so a `Hop`'s `CRel` is
-        // cleared of it; the `Sub` carries the bounds.
-        fn hop_or_sub(mut rel: CRel, target_slot: Option<usize>, q: Option<Quantifier>) -> CElem {
-            rel.quantifier = None;
-            match q {
-                None => CElem::Hop(CHop { rel, target_slot }),
-                // A nested `-[]->{a,b}(y)` hop: the inner hop's own target is an ANONYMOUS
-                // intermediate; the landing `y` is the WHOLE sub-unit's target, bound once
-                // per enclosing rep as a group variable (`CSub.target_slot`).
-                Some(quant) => CElem::Sub(CSub {
-                    unit: Box::new(CUnit {
-                        elems: vec![CElem::Hop(CHop {
-                            rel,
-                            target_slot: None,
-                        })],
-                        start_slot: None,
-                        where_: None,
-                    }),
-                    min: quant.min,
-                    max: quant.max,
-                    target_slot,
-                }),
-            }
-        }
-        // `rel.quantifier` stays the OUTER subpath quantifier (for the matcher); each
-        // hop's own (nested) quantifier is consumed into a `Sub` by `hop_or_sub`.
-        let unit = s.hop_from.as_ref().map(|from| {
-            // A PLAIN hop's `WHERE` is lifted to the unit level and AND-ed (checked once
-            // the whole rep is bound). A NESTED hop's `WHERE` (`-[e WHERE …]->{a,b}`) is a
-            // per-inner-edge predicate — it stays on the `Sub`'s inner hop so it filters
-            // every edge of the inner walk, NOT lifted.
-            let mut where_ = if s.inner_q.is_none() {
-                rel.where_.take()
-            } else {
-                None
-            };
-            let first_target = s.hop_to.as_ref().and_then(|to| self.node_slot(to));
-            let mut elems = vec![hop_or_sub(rel.clone(), first_target, s.inner_q)];
-            for extra in &s.unit_rest {
-                let mut extra_rel = self.rel(&extra.rel);
-                let q = extra.rel.quantifier;
-                if q.is_none() {
-                    if let Some(w) = extra_rel.where_.take() {
-                        where_ = Some(match where_.take() {
-                            Some(prev) => CExpr::And(vec![prev, w]),
-                            None => w,
-                        });
-                    }
-                }
-                let target = self.node_slot(&extra.node);
-                elems.push(hop_or_sub(extra_rel, target, q));
-            }
-            CUnit {
-                elems,
-                start_slot: self.node_slot(from),
-                where_,
-            }
-        });
+        let rel = self.rel(&s.rel);
+        // A quantified parenthesized subpath compiles to a repetition UNIT (its inner hops
+        // with group-variable slots + the per-unit `WHERE`); `node` is the separate outer
+        // endpoint, and `rel.quantifier` stays the OUTER subpath quantifier for the matcher.
+        // A plain hop has no unit.
+        let unit = if s.hop_from.is_some() || s.nested.is_some() {
+            Some(self.subpath_unit(s))
+        } else {
+            None
+        };
         CSegment { rel, node, unit }
+    }
+
+    /// Build one repetition unit from a quantified-subpath segment. A NESTED parenthesized
+    /// subpath (`( ((x)-[e]->(y)){a,b} ){n,m}`) recurses: the outer unit's sole element is
+    /// a `Sub` wrapping the inner subpath's unit, so its variables nest one list level
+    /// deeper. Otherwise it's the inner hop chain (`(x)-[e1]->(m)-[e2]->(y)`).
+    fn subpath_unit(&mut self, s: &Segment) -> CUnit {
+        if let Some(inner) = &s.nested {
+            let inner_unit = self.subpath_unit(inner);
+            let q = inner
+                .rel
+                .quantifier
+                .expect("a nested subpath is quantified");
+            return CUnit {
+                elems: vec![CElem::Sub(CSub {
+                    unit: Box::new(inner_unit),
+                    min: q.min,
+                    max: q.max,
+                    // The nested subpath's LANDING is the outer segment's endpoint node,
+                    // matched separately — not a group variable of this unit.
+                    target_slot: None,
+                })],
+                start_slot: None,
+                where_: None,
+            };
+        }
+        let from = s.hop_from.as_ref().expect("a subpath has a source");
+        let mut rel = self.rel(&s.rel);
+        // A PLAIN hop's `WHERE` is lifted to the unit level and AND-ed (checked once the
+        // whole rep is bound). A NESTED hop's `WHERE` (`-[e WHERE …]->{a,b}`) is a per-inner-
+        // edge predicate — it stays on the `Sub`'s inner hop, NOT lifted.
+        let mut where_ = if s.inner_q.is_none() {
+            rel.where_.take()
+        } else {
+            None
+        };
+        let first_target = s.hop_to.as_ref().and_then(|to| self.node_slot(to));
+        let mut elems = vec![hop_or_sub(rel.clone(), first_target, s.inner_q)];
+        for extra in &s.unit_rest {
+            let mut extra_rel = self.rel(&extra.rel);
+            let q = extra.rel.quantifier;
+            if q.is_none() {
+                if let Some(w) = extra_rel.where_.take() {
+                    where_ = Some(match where_.take() {
+                        Some(prev) => CExpr::And(vec![prev, w]),
+                        None => w,
+                    });
+                }
+            }
+            let target = self.node_slot(&extra.node);
+            elems.push(hop_or_sub(extra_rel, target, q));
+        }
+        CUnit {
+            elems,
+            start_slot: self.node_slot(from),
+            where_,
+        }
     }
 
     fn path(&mut self, p: &PathPattern) -> CPath {
