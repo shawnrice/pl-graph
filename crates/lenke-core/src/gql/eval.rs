@@ -4734,51 +4734,73 @@ fn visit_patterns(
 /// instead of the full forward cone — the win when both endpoints are bound (a reachability
 /// `EXISTS` like group-membership or resource-ancestry). Vertex-visited = reachability
 /// (mode-independent, as `EXISTS` is).
-fn reachable_bidir(
+fn reachable_sets_bidir(
     graph: &Graph,
     ctx: &Ctx,
-    from: u32,
-    to: u32,
+    from_set: &FxHashSet<u32>,
+    to_set: &FxHashSet<u32>,
     dir: Direction,
     el: Option<&CLabelExpr>,
+    min0: bool,
 ) -> bool {
+    // A 0-hop path (var-length min-0) is a vertex shared by both ends.
+    if min0 {
+        let (small, big) = if from_set.len() <= to_set.len() {
+            (from_set, to_set)
+        } else {
+            (to_set, from_set)
+        };
+        if small.iter().any(|v| big.contains(v)) {
+            return true;
+        }
+    }
     let rev = match dir {
         Direction::Out => Direction::In,
         Direction::In => Direction::Out,
         Direction::Both => Direction::Both,
     };
     let n = graph.vertex_count();
-    let mut vf = crate::graph::BitSet::zeros(n); // reachable FROM `from` (≥1 hop)
-    let mut vb = crate::graph::BitSet::zeros(n); // can REACH `to` (≥1 hop)
+    let mut vf = crate::graph::BitSet::zeros(n); // reachable FROM `from_set` (≥1 hop)
+    let mut vb = crate::graph::BitSet::zeros(n); // can REACH `to_set` (≥1 hop)
     let mut ff: Vec<u32> = Vec::new();
     let mut fb: Vec<u32> = Vec::new();
-    let seed = |v: u32, d: Direction, seen: &mut crate::graph::BitSet, front: &mut Vec<u32>| {
-        for (_e, w) in expand(graph, ctx, v, d, el) {
-            if !seen.get(w as usize) {
-                seen.set(w as usize);
-                front.push(w);
+    let seed = |set: &FxHashSet<u32>,
+                d: Direction,
+                seen: &mut crate::graph::BitSet,
+                front: &mut Vec<u32>| {
+        for &v in set {
+            for (_e, w) in expand(graph, ctx, v, d, el) {
+                if !seen.get(w as usize) {
+                    seen.set(w as usize);
+                    front.push(w);
+                }
             }
         }
     };
-    seed(from, dir, &mut vf, &mut ff);
-    seed(to, rev, &mut vb, &mut fb);
+    seed(from_set, dir, &mut vf, &mut ff);
+    seed(to_set, rev, &mut vb, &mut fb);
     loop {
-        // Meeting: `to` reachable forward, `from` reachable backward, or the two sets overlap.
-        if vf.get(to as usize) || vb.get(from as usize) {
+        // Meeting: a forward-reached vertex is a target (or already backward-visited), or a
+        // backward-reached vertex is a source (or already forward-visited).
+        if ff
+            .iter()
+            .any(|&w| to_set.contains(&w) || vb.get(w as usize))
+        {
             return true;
         }
-        if ff.iter().any(|&w| vb.get(w as usize)) || fb.iter().any(|&w| vf.get(w as usize)) {
+        if fb
+            .iter()
+            .any(|&w| from_set.contains(&w) || vf.get(w as usize))
+        {
             return true;
         }
-        // Terminate as soon as EITHER side is fully explored without meeting: if every
-        // vertex that can reach `to` (or is reachable from `from`) is enumerated and the
-        // opposite anchor is not among them, no path exists — no need to exhaust the other,
-        // possibly huge, cone. This is where the negative-case win comes from.
+        // Terminate as soon as EITHER side is fully explored without meeting — no need to
+        // exhaust the other, possibly huge, cone (the negative-case win).
         if ff.is_empty() || fb.is_empty() {
             return false;
         }
-        // Expand the smaller frontier (an exhausted side never gets picked).
-        let forward = !ff.is_empty() && (fb.is_empty() || ff.len() <= fb.len());
+        // Expand the smaller frontier.
+        let forward = ff.len() <= fb.len();
         let (cur, d, seen, front) = if forward {
             (std::mem::take(&mut ff), dir, &mut vf, &mut ff)
         } else {
@@ -4867,15 +4889,9 @@ fn any_match_reachable(
         return Some(true);
     }
     let (dir, el) = (seg.rel.direction, seg.rel.label.as_ref());
-    // BOTH endpoints bound → a pure `from → to` reachability question. Validate the target
-    // once (label / inline props / WHERE), then answer bidirectionally so a NEGATIVE check
-    // costs ≈ min(forward, backward) instead of exhausting the whole forward cone.
-    if let Some(be) = bound_end {
-        if !hit(graph, be, &mut work) {
-            return Some(false);
-        }
-        return Some(reachable_bidir(graph, ctx, sv, be, dir, el));
-    }
+    // (A bound-both-endpoints single segment is handled by the unified `exists_bidir`
+    // meet-in-the-middle, tried before this in `any_match`; here `bound_end` only survives
+    // when that path declined — e.g. an inner WHERE — so fall to the forward search.)
     let mut seen = crate::graph::BitSet::zeros(graph.vertex_count());
     let mut stack: Vec<u32> = Vec::new();
     let visit = |w: u32, seen: &mut crate::graph::BitSet, stack: &mut Vec<u32>| -> bool {
@@ -4977,19 +4993,23 @@ fn bidir_apply(
     out
 }
 
-/// Meet-in-the-middle EXISTENCE for a LINEAR pattern with BOTH endpoints already bound
-/// (`u = n0 —seg1→ n1 … —segk→ nk = t`). Grow a left frontier-set from `u` and a right
-/// frontier-set from `t`, always advancing the SMALLER by one segment (forward left,
-/// reversed right), and stop when they meet at a shared waypoint — never expanding the far,
-/// possibly huge, cone (the negative-check win). Existence → boolean, so this is byte-
-/// identical to a forward walk. Applies only where reachability == existence: WALK/TRAIL
-/// mode (SIMPLE/ACYCLIC need node-distinctness the set search doesn't track) with
-/// edge-type-DISJOINT segments (so no edge is reused across segments under TRAIL). Declines
-/// (`None`) on anything richer — a path variable, an inner WHERE, a shortest selector, a
-/// filtered intermediate node, a bounded `{m,n}` quantifier, a parenthesized subpath, an
-/// edge variable/predicate, an undirected/unresolvable label — falling back to the general
-/// matcher. Single-segment patterns are `any_match_reachable`'s job.
-fn exists_bidir_multiseg(
+/// Meet-in-the-middle EXISTENCE for a LINEAR pattern (`k ≥ 1` segments) with BOTH endpoints
+/// already bound (`u = n0 —seg1→ n1 … —segk→ nk = t`). Grow a left frontier-set from `u`
+/// and a right frontier-set from `t`, always advancing the SMALLER by a whole segment until
+/// they are ONE segment apart, then answer whether that gap segment connects them — a fixed
+/// hop by expand-and-intersect, a var-length gap by an EDGE-level bidirectional reachability
+/// between the sets ([`reachable_sets_bidir`]). Never expands the far, possibly huge, cone
+/// (the negative-check win). **This is the single meet-in-the-middle path: a single segment
+/// (`k = 1`) is the degenerate case — no advance, just the edge-level bidirectional between
+/// `{u}` and `{t}`.** Existence → boolean, so byte-identical to a forward walk. Applies only
+/// where reachability == existence: WALK/TRAIL mode (SIMPLE/ACYCLIC need node-distinctness
+/// the set search doesn't track) with edge-type-DISJOINT segments (so no edge is reused
+/// across segments under TRAIL). Declines (`None`) on anything richer — a path variable, an
+/// inner WHERE, a shortest selector, a filtered intermediate node, a bounded `{m,n}`
+/// quantifier, a parenthesized subpath, an edge variable/predicate, an undirected/
+/// unresolvable label — falling back to `any_match_reachable` (unbound-end / inner-WHERE
+/// single-segment) or the general matcher.
+fn exists_bidir(
     graph: &Graph,
     ctx: &Ctx,
     patterns: &[CPath],
@@ -4999,7 +5019,7 @@ fn exists_bidir_multiseg(
     let [path] = patterns else {
         return None;
     };
-    if path.segments.len() < 2
+    if path.segments.is_empty()
         || !matches!(path.mode, PathMode::Walk | PathMode::Trail)
         || !matches!(path.selector, PathSelector::Walk)
         || path.path_var_slot.is_some()
@@ -5076,16 +5096,17 @@ fn exists_bidir_multiseg(
         }
     }
 
-    // Meet in the middle. Left set at waypoint `li` (from `u`), right at `ri` (from `t`).
+    // Advance a left set from `u` and a right set from `t`, always growing the SMALLER by a
+    // whole segment (forward left, reversed right), until they are ONE segment apart. Then
+    // answer whether that gap segment connects the two frontiers — a fixed hop is a 1-hop
+    // expand-and-intersect; a var-length gap is an EDGE-level bidirectional reachability
+    // between the sets. For a single segment (`k == 1`) the loop never runs and this reduces
+    // to a bound-both-ends single-segment bidirectional reachability.
     let k = steps.len();
     let mut left: FxHashSet<u32> = FxHashSet::from_iter([u]);
     let mut right: FxHashSet<u32> = FxHashSet::from_iter([t]);
     let (mut li, mut ri) = (0usize, k);
-    let intersects = |a: &FxHashSet<u32>, b: &FxHashSet<u32>| -> bool {
-        let (small, big) = if a.len() <= b.len() { (a, b) } else { (b, a) };
-        small.iter().any(|v| big.contains(v))
-    };
-    while li < ri {
+    while ri - li > 1 {
         if left.len() <= right.len() {
             left = bidir_apply(graph, ctx, &left, &steps[li], false);
             li += 1;
@@ -5093,14 +5114,30 @@ fn exists_bidir_multiseg(
             right = bidir_apply(graph, ctx, &right, &steps[ri - 1], true);
             ri -= 1;
         }
-        if li == ri {
-            return Some(intersects(&left, &right));
-        }
         if left.is_empty() || right.is_empty() {
             return Some(false);
         }
     }
-    Some(intersects(&left, &right))
+    let intersects = |a: &FxHashSet<u32>, b: &FxHashSet<u32>| -> bool {
+        let (small, big) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+        small.iter().any(|v| big.contains(v))
+    };
+    let gap = &steps[li]; // ri == li + 1 → the segment between them
+    if gap.varlen {
+        Some(reachable_sets_bidir(
+            graph, ctx, &left, &right, gap.dir, gap.label, gap.min0,
+        ))
+    } else if left.len() <= right.len() {
+        Some(intersects(
+            &bidir_apply(graph, ctx, &left, gap, false),
+            &right,
+        ))
+    } else {
+        Some(intersects(
+            &left,
+            &bidir_apply(graph, ctx, &right, gap, true),
+        ))
+    }
 }
 
 fn any_match(
@@ -5111,10 +5148,12 @@ fn any_match(
     binding: &Binding,
     sub_len: usize,
 ) -> bool {
-    if let Some(res) = any_match_reachable(graph, ctx, patterns, where_, binding, sub_len) {
+    // The unified meet-in-the-middle first (bound-both-endpoints existence, k ≥ 1); then the
+    // single-segment forward search for the cases it declines (unbound end, inner WHERE).
+    if let Some(res) = exists_bidir(graph, ctx, patterns, where_, binding) {
         return res;
     }
-    if let Some(res) = exists_bidir_multiseg(graph, ctx, patterns, where_, binding) {
+    if let Some(res) = any_match_reachable(graph, ctx, patterns, where_, binding, sub_len) {
         return res;
     }
     let mut found = false;
