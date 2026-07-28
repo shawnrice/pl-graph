@@ -5,14 +5,18 @@
 //! host-driven GCN / GraphSAGE message passing wants (instead of D separate GQL
 //! `SET`s). `op` chooses `mean` (default) / `sum` / `max` / `min`; `direction`
 //! picks out- / in- / both-neighbours; `includeSelf` adds the vertex's own vector.
-//! The result is a list value per vertex, optionally written to `writeProperty`.
+//! Each contributor is scaled by a COEFFICIENT = edge weight (`weightProperty`, 1.0
+//! unweighted) × normalization (`norm:"gcn"` → `1/sqrt(deg_i·deg_j)`, else 1.0), so
+//! `sum` = Σ coefⱼ·hⱼ and `mean` = that ÷ Σ coefⱼ (a WEIGHTED mean). A weight/norm is
+//! rejected for `max`/`min` (scale-independent). The result is a list value per vertex,
+//! optionally written to `writeProperty`.
 //!
 //! **Byte-identity with the TS mirror** rests on a fixed accumulation order: the
 //! vertex's own vector first (when included), then each neighbour in ascending
-//! **edge-index** order — so the f64 `sum`/`mean` adds land in the same order in
-//! both engines (`mean` divides by an integer contributor count; `max`/`min` are
-//! order-independent). A `both`-direction self-loop is counted once (the in-side
-//! copy is dropped, mirroring `expand`).
+//! **edge-index** order — so the f64 `sum`/`mean` adds land in the same order in both
+//! engines. `max`/`min` are order-independent; degrees are integers (exact) so the GCN
+//! `1/sqrt(deg_i·deg_j)` matches. A `both`-direction self-loop is counted once (the
+//! in-side copy is dropped, mirroring `expand`).
 
 use crate::algo::AlgoConfig;
 use crate::graph::{Graph, Value};

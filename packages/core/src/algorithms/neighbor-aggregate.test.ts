@@ -95,4 +95,87 @@ describe('neighborAggregate', () => {
       ),
     ).toBe(true);
   });
+
+  // a[1,2]→b[3,4] (w2), a→c[5,6] (w1), b→c (w3).
+  const weightedFeatured = (): Graph => {
+    const g = new Graph();
+
+    for (const [id, h] of [
+      ['a', [1, 2]],
+      ['b', [3, 4]],
+      ['c', [5, 6]],
+    ] as const) {
+      g.addVertex({ id, labels: ['N'], properties: { h } });
+    }
+
+    for (const [from, to, w] of [
+      ['a', 'b', 2],
+      ['a', 'c', 1],
+      ['b', 'c', 3],
+    ] as const) {
+      g.addEdge({
+        from: g.getVertexById(from)!,
+        to: g.getVertexById(to)!,
+        labels: ['R'],
+        properties: { w },
+      });
+    }
+
+    return g;
+  };
+
+  test('weighted sum and mean over out-neighbours', async () => {
+    // sum: a = 2·[3,4]+1·[5,6] = [11,14]; b = 3·[5,6] = [15,18].
+    expect(
+      await neighborAggregate(
+        { feature: 'h', op: 'sum', direction: 'out', weightProperty: 'w' },
+        weightedFeatured(),
+      ),
+    ).toEqual([
+      { node: 'a', vector: [11, 14] },
+      { node: 'b', vector: [15, 18] },
+      { node: 'c', vector: [0, 0] },
+    ]);
+    // mean divides by the WEIGHT sum: a = [11,14]/3.
+    expect(
+      await neighborAggregate(
+        { feature: 'h', op: 'mean', direction: 'out', weightProperty: 'w' },
+        weightedFeatured(),
+      ),
+    ).toEqual([
+      { node: 'a', vector: [11 / 3, 14 / 3] },
+      { node: 'b', vector: [5, 6] },
+      { node: 'c', vector: [0, 0] },
+    ]);
+  });
+
+  test('gcn norm on a two-node graph gives clean 1/2 coefficients', async () => {
+    // a[1,2]→b[3,4], both + includeSelf → degree 2 each → every coef 1/2 → ½([1,2]+[3,4]) = [2,3].
+    const g = new Graph();
+    g.addVertex({ id: 'a', labels: ['N'], properties: { h: [1, 2] } });
+    g.addVertex({ id: 'b', labels: ['N'], properties: { h: [3, 4] } });
+    g.addEdge({ from: g.getVertexById('a')!, to: g.getVertexById('b')!, labels: ['R'] });
+    expect(
+      await neighborAggregate(
+        { feature: 'h', op: 'sum', direction: 'both', includeSelf: true, norm: 'gcn' },
+        g,
+      ),
+    ).toEqual([
+      { node: 'a', vector: [2, 3] },
+      { node: 'b', vector: [2, 3] },
+    ]);
+  });
+
+  test('rejects a weight / norm with max|min, and a bad norm', async () => {
+    const g = weightedFeatured();
+    expect(
+      await rejects(neighborAggregate({ feature: 'h', op: 'max', weightProperty: 'w' }, g)),
+    ).toBe(true);
+    expect(await rejects(neighborAggregate({ feature: 'h', op: 'min', norm: 'gcn' }, g))).toBe(
+      true,
+    );
+    expect(
+      await rejects(neighborAggregate({ feature: 'h', op: 'sum', norm: 'nope' as never }, g)),
+    ).toBe(true);
+  });
 });

@@ -32,12 +32,14 @@ const readVec = (vertex: Vertex, key: string): number[] | null => {
   return out;
 };
 
-/** Fold one contributor vector into `acc` under `op`; `started` marks whether `acc`
- * holds a real value yet (the identity for max/min is the first contributor). */
-const fold = (op: Op, acc: number[], vec: number[], started: boolean): void => {
+/** Fold one contributor vector into `acc` under `op`, scaled by `coef` (edge weight ×
+ * normalization; 1 unweighted). `started` marks whether `acc` holds a real value yet (the
+ * identity for max/min is the first contributor). `max`/`min` ignore `coef` (scale-
+ * independent; a weight/norm is rejected at the call site). Mirrors native `fold`. */
+const fold = (op: Op, acc: number[], vec: number[], started: boolean, coef: number): void => {
   for (let i = 0; i < acc.length; i++) {
     if (op === 'sum' || op === 'mean') {
-      acc[i] += vec[i];
+      acc[i] += coef * vec[i];
     } else if (!started) {
       acc[i] = vec[i];
     } else if (op === 'max') {
@@ -66,6 +68,28 @@ const resolveDirs = (raw: string): [boolean, boolean] => {
   }
 
   return [raw === 'out' || raw === 'both', raw === 'in' || raw === 'both'];
+};
+
+/** Validate `norm` into a GCN flag. */
+const resolveGcn = (raw: string): boolean => {
+  if (raw !== 'none' && raw !== 'gcn') {
+    throw new Error(`neighborAggregate \`norm\` must be one of none|gcn, got '${raw}'`);
+  }
+
+  return raw === 'gcn';
+};
+
+/** Per-edge weights by edge-insertion index (= native eidx); a missing / non-numeric
+ * value is 0, mirroring native `edge_weights`. */
+const buildEdgeWeights = (graph: Graph, key: string): number[] => {
+  const out: number[] = [];
+
+  for (const edge of graph.edges) {
+    const w = edge.getProperty(key);
+    out.push(typeof w === 'number' ? w : 0);
+  }
+
+  return out;
 };
 
 /** Every vertex's feature vector (by id), plus the shared dimension `d`; a length
@@ -148,7 +172,7 @@ export const computeGen = function* (
   config: AlgorithmConfig,
   graph: Graph,
 ): AlgorithmGen<NeighborAggregateRow> {
-  const { feature, edgeLabel, direction = 'both', writeProperty } = config;
+  const { feature, edgeLabel, direction = 'both', writeProperty, weightProperty } = config;
 
   if (feature === undefined) {
     throw new Error('neighborAggregate requires a `feature` property');
@@ -157,35 +181,70 @@ export const computeGen = function* (
   const op = resolveOp(config.op ?? 'mean');
   const [wantOut, wantIn] = resolveDirs(direction);
   const includeSelf = config.includeSelf ?? false;
+  const gcn = resolveGcn(config.norm ?? 'none');
+  // A weight or `gcn` norm SCALES contributors — meaningless for order/scale-independent
+  // max/min. Reject loudly rather than silently ignore. Mirrors native.
+  const weighted = weightProperty !== undefined;
+
+  if ((weighted || gcn) && (op === 'max' || op === 'min')) {
+    throw new Error(
+      'neighborAggregate `weightProperty`/`norm` apply only to op=sum|mean (max/min are scale-independent)',
+    );
+  }
 
   const { feats, d } = buildFeatures(graph, feature);
   const { outAdj, inAdj } = buildAdjacency(graph, edgeLabel);
+  const edgeWeights = weighted ? buildEdgeWeights(graph, weightProperty) : [];
+
+  // GCN degree per vertex: contributor count under the configured direction/etype (+ the
+  // self-loop when includeSelf), floored at 1. Mirrors native `deg`.
+  const deg = new Map<string, number>();
+
+  if (gcn) {
+    for (const vertex of graph.vertices) {
+      const c = gatherContributors(vertex.id, outAdj, inAdj, wantOut, wantIn).length;
+      deg.set(vertex.id, Math.max(c + (includeSelf ? 1 : 0), 1));
+    }
+  }
 
   const rows: NeighborAggregateRow[] = [];
   let sinceYield = 0;
 
   for (const vertex of graph.vertices) {
+    const v = vertex.id;
     const acc = new Array<number>(d).fill(0);
-    let count = 0;
+    let coefSum = 0;
     let started = false;
-    // Self first (when included), then neighbours in edge-index order.
-    const order = includeSelf ? [feats.get(vertex.id) ?? null] : ([] as (number[] | null)[]);
 
-    for (const { nbr } of gatherContributors(vertex.id, outAdj, inAdj, wantOut, wantIn)) {
-      order.push(feats.get(nbr) ?? null);
-    }
+    // Self first (when included), with GCN factor 1/deg_i (= 1/sqrt(deg_i·deg_i)).
+    if (includeSelf) {
+      const sv = feats.get(v) ?? null;
 
-    for (const vec of order) {
-      if (vec !== null) {
-        fold(op, acc, vec, started);
+      if (sv !== null) {
+        const coef = gcn ? 1 / deg.get(v)! : 1;
+        fold(op, acc, sv, started, coef);
         started = true;
-        count++;
+        coefSum += coef;
       }
     }
 
-    if (op === 'mean' && count > 0) {
+    // Then neighbours in edge-index order, each scaled by edge weight × GCN factor.
+    for (const { eidx, nbr } of gatherContributors(v, outAdj, inAdj, wantOut, wantIn)) {
+      const nv = feats.get(nbr) ?? null;
+
+      if (nv !== null) {
+        const w = weighted ? edgeWeights[eidx] : 1;
+        const nf = gcn ? 1 / Math.sqrt(deg.get(v)! * deg.get(nbr)!) : 1;
+        const coef = w * nf;
+        fold(op, acc, nv, started, coef);
+        started = true;
+        coefSum += coef;
+      }
+    }
+
+    if (op === 'mean' && coefSum !== 0) {
       for (let i = 0; i < d; i++) {
-        acc[i] /= count;
+        acc[i] /= coefSum;
       }
     }
 

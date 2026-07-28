@@ -617,6 +617,65 @@ suite('graph-algorithm differential: neighborAggregate (TS core vs native)', () 
     expect(ts).toBe(native);
   });
 
+  // GCN symmetric normalization (`1/sqrt(deg_i·deg_j)`) on the IRREGULAR feature graph —
+  // varying degrees make the coefficients irrational, so byte-identity is a real test that
+  // both engines compute the same f64 in the same order.
+  for (const op of ['mean', 'sum'] as const) {
+    for (const direction of ['out', 'both'] as const) {
+      for (const includeSelf of [false, true]) {
+        test(`gcn norm ${op} / ${direction} / self=${includeSelf} is byte-identical`, async () => {
+          const [ts, native] = await both({
+            feature: 'h',
+            op,
+            direction,
+            includeSelf,
+            norm: 'gcn',
+          });
+          expect(ts).toBe(native);
+        });
+      }
+    }
+  }
+
+  // Edge weighting on a weighted feature graph — weighted sum / mean, and GCN composed with
+  // weights (coefficient = weight × norm).
+  const WEIGHTED = [
+    '{"type":"node","id":"a","labels":["N"],"properties":{"h":[0.1,0.2]}}',
+    '{"type":"node","id":"b","labels":["N"],"properties":{"h":[1.5,2.5]}}',
+    '{"type":"node","id":"c","labels":["N"],"properties":{"h":[0.7,0.9]}}',
+    '{"type":"edge","from":"a","to":"b","labels":["R"],"properties":{"w":2.5}}',
+    '{"type":"edge","from":"a","to":"c","labels":["R"],"properties":{"w":0.4}}',
+    '{"type":"edge","from":"b","to":"c","labels":["R"],"properties":{"w":3.1}}',
+    '{"type":"edge","from":"c","to":"a","labels":["R"],"properties":{"w":1.2}}',
+  ].join('\n');
+  const natW = graphFromFormat(backend, WEIGHTED, 'ndjson');
+  const tsW = tsDeserialize(WEIGHTED, 'ndjson', new Graph());
+
+  for (const op of ['mean', 'sum'] as const) {
+    for (const direction of ['out', 'both'] as const) {
+      test(`weighted ${op} / ${direction} is byte-identical`, async () => {
+        const cfg = { feature: 'h', op, direction, weightProperty: 'w' } as const;
+        expect(JSON.stringify(await neighborAggregate(cfg, tsW))).toBe(
+          JSON.stringify(await natW.neighborAggregate(cfg)),
+        );
+      });
+    }
+  }
+
+  test('weighted + gcn compose byte-identically', async () => {
+    const cfg = {
+      feature: 'h',
+      op: 'mean' as const,
+      direction: 'both' as const,
+      weightProperty: 'w',
+      norm: 'gcn' as const,
+      includeSelf: true,
+    };
+    expect(JSON.stringify(await neighborAggregate(cfg, tsW))).toBe(
+      JSON.stringify(await natW.neighborAggregate(cfg)),
+    );
+  });
+
   test('writeProperty round-trips the aggregate list identically through GQL', async () => {
     const config = { feature: 'h', op: 'sum', direction: 'out', writeProperty: 'agg' } as const;
     await neighborAggregate(config, tsGraph);

@@ -58,6 +58,12 @@ export type AlgorithmConfig = {
   op?: 'mean' | 'sum' | 'max' | 'min';
   /** Include the vertex's own feature vector in its aggregate (**neighborAggregate**). */
   includeSelf?: boolean;
+  /**
+   * Normalization for **neighborAggregate** — `'none'` (default) or `'gcn'` (the
+   * symmetric GCN operator, each contributor weighted by `1/sqrt(deg_i·deg_j)`).
+   * Composes with `weightProperty`; `sum`/`mean` only.
+   */
+  norm?: 'none' | 'gcn';
 };
 
 /**
