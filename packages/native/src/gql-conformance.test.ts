@@ -1413,7 +1413,10 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     const natCode = code(() => nat.query(q));
     expect(natCode).toBe('E_RESOURCE_EXHAUSTED');
     expect(code(() => tsQuery(ts, q))).toBe(natCode);
-  });
+    // The TS reference engine must grind the full TRAIL_BUDGET (~1M steps) before it
+    // faults — inherently a few seconds, and 2–3× slower on a CI runner — so this
+    // deliberate stress test needs more than bun's 5s default per-test timeout.
+  }, 30_000);
 
   // ANTI-DRIFT: the abbreviated `-[]->{n,m}` form (each engine's single-edge
   // fast-path) and an equivalent single-edge parenthesized subpath (the general
