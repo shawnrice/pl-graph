@@ -4630,11 +4630,7 @@ fn reachable_sets_bidir(
             return true;
         }
     }
-    let rev = match dir {
-        Direction::Out => Direction::In,
-        Direction::In => Direction::Out,
-        Direction::Both => Direction::Both,
-    };
+    let rev = flip_direction(dir);
     let n = graph.vertex_count();
     let mut vf = crate::graph::BitSet::zeros(n); // reachable FROM `from_set` (≥1 hop)
     let mut vb = crate::graph::BitSet::zeros(n); // can REACH `to_set` (≥1 hop)
@@ -4691,6 +4687,47 @@ fn reachable_sets_bidir(
             }
         }
     }
+}
+
+/// Closed forward DFS from `sources` over `dir`/`el`: each vertex is discovered and
+/// expanded exactly once (dedup via a `BitSet`), the source vertices themselves NOT
+/// delivered (≥1 hop only). `on_reach(w)` fires once per newly-discovered `w` in stack
+/// pop-order; returning `false` short-circuits the whole walk and the helper returns
+/// `false`. Returns `true` when the walk ran to exhaustion. The shared engine behind
+/// existence short-circuit (`any_match_reachable`) and distinct-set collection
+/// (`try_reachable_distinct`); the ≥1-hop discovery order is load-bearing for both.
+fn reach_dfs_forward<F: FnMut(u32) -> bool>(
+    graph: &Graph,
+    ctx: &Ctx,
+    sources: impl IntoIterator<Item = u32>,
+    dir: Direction,
+    el: Option<&CLabelExpr>,
+    mut on_reach: F,
+) -> bool {
+    let mut seen = crate::graph::BitSet::zeros(graph.vertex_count());
+    let mut stack: Vec<u32> = Vec::new();
+    let discover = |w: u32, seen: &mut crate::graph::BitSet, stack: &mut Vec<u32>| -> bool {
+        !seen.get(w as usize) && {
+            seen.set(w as usize);
+            stack.push(w);
+            true
+        }
+    };
+    for s in sources {
+        for (_e, w) in expand(graph, ctx, s, dir, el) {
+            if discover(w, &mut seen, &mut stack) && !on_reach(w) {
+                return false;
+            }
+        }
+    }
+    while let Some(u) = stack.pop() {
+        for (_e, w) in expand(graph, ctx, u, dir, el) {
+            if discover(w, &mut seen, &mut stack) && !on_reach(w) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn any_match_reachable(
@@ -4768,28 +4805,11 @@ fn any_match_reachable(
     // (A bound-both-endpoints single segment is handled by the unified `exists_bidir`
     // meet-in-the-middle, tried before this in `any_match`; here `bound_end` only survives
     // when that path declined — e.g. an inner WHERE — so fall to the forward search.)
-    let mut seen = crate::graph::BitSet::zeros(graph.vertex_count());
-    let mut stack: Vec<u32> = Vec::new();
-    let visit = |w: u32, seen: &mut crate::graph::BitSet, stack: &mut Vec<u32>| -> bool {
-        !seen.get(w as usize) && {
-            seen.set(w as usize);
-            stack.push(w);
-            true
-        }
-    };
-    for (_e, w) in expand(graph, ctx, sv, dir, el) {
-        if visit(w, &mut seen, &mut stack) && hit(graph, w, &mut work) {
-            return Some(true);
-        }
-    }
-    while let Some(u) = stack.pop() {
-        for (_e, w) in expand(graph, ctx, u, dir, el) {
-            if visit(w, &mut seen, &mut stack) && hit(graph, w, &mut work) {
-                return Some(true);
-            }
-        }
-    }
-    Some(false)
+    // `hit` returning true = match found → short-circuit (`on_reach` returns false).
+    let exhausted = reach_dfs_forward(graph, ctx, std::iter::once(sv), dir, el, |w| {
+        !hit(graph, w, &mut work)
+    });
+    Some(!exhausted)
 }
 
 /// Does the (correlated) sub-pattern have at least one match? Short-circuits.
@@ -4837,11 +4857,7 @@ fn bidir_apply(
     reverse: bool,
 ) -> FxHashSet<u32> {
     let dir = if reverse {
-        match step.dir {
-            Direction::Out => Direction::In,
-            Direction::In => Direction::Out,
-            Direction::Both => Direction::Both,
-        }
+        flip_direction(step.dir)
     } else {
         step.dir
     };
@@ -10991,34 +11007,21 @@ fn try_reachable_distinct(
 
     let ctx = resolve_ctx(graph, plan, params);
     let seeds = reach_seed_vertices(graph, &ctx, &path.start, *scope_len);
-    // Forward reachability (≥1 hop) as a DFS closure — each vertex expands once.
+    // Forward reachability (≥1 hop) as a closed DFS — each vertex expands once, in
+    // discovery order.
     let (dir, el) = (seg.rel.direction, seg.rel.label.as_ref());
-    let mut seen = crate::graph::BitSet::zeros(graph.vertex_count());
     let mut reached: Vec<u32> = Vec::new();
-    let mut stack: Vec<u32> = Vec::new();
-    for &s in &seeds {
-        for (_e, w) in expand(graph, &ctx, s, dir, el) {
-            if !seen.get(w as usize) {
-                seen.set(w as usize);
-                reached.push(w);
-                stack.push(w);
-            }
-        }
-    }
-    while let Some(u) = stack.pop() {
-        for (_e, w) in expand(graph, &ctx, u, dir, el) {
-            if !seen.get(w as usize) {
-                seen.set(w as usize);
-                reached.push(w);
-                stack.push(w);
-            }
-        }
-    }
-    // `->*` also admits the zero-length path — the seeds themselves.
+    reach_dfs_forward(graph, &ctx, seeds.iter().copied(), dir, el, |w| {
+        reached.push(w);
+        true
+    });
+    // `->*` also admits the zero-length path — the seeds themselves. `reach_dfs_forward`
+    // dedups internally but its `seen` isn't exposed; a seed already ≥1-hop reachable is
+    // therefore re-added here, so guard against duplicating it.
     if q.min == 0 {
+        let mut have: FxHashSet<u32> = reached.iter().copied().collect();
         for &s in &seeds {
-            if !seen.get(s as usize) {
-                seen.set(s as usize);
+            if have.insert(s) {
                 reached.push(s);
             }
         }
