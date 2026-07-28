@@ -651,7 +651,10 @@ impl CUnit {
         self.start_slot.is_some()
             || self.elems.iter().any(|e| match e {
                 CElem::Hop(h) => h.target_slot.is_some() || h.rel.var_slot.is_some(),
-                CElem::Sub(s) => s.unit.exposes(),
+                // A nested sub-unit exposes NO group variables in v1 (an inner edge var is
+                // a per-hop predicate scalar; node group vars are rejected at parse). When
+                // list-of-list exposure lands this recurses into `s.unit.exposes()`.
+                CElem::Sub(_) => false,
             })
     }
 
@@ -1688,20 +1691,27 @@ impl Lowerer {
         // `rel.quantifier` stays the OUTER subpath quantifier (for the matcher); each
         // hop's own (nested) quantifier is consumed into a `Sub` by `hop_or_sub`.
         let unit = s.hop_from.as_ref().map(|from| {
-            // Every hop's `WHERE` (the subpath predicate the parser merged onto the
-            // first hop, plus any inline `-[e WHERE …]->` on a later hop) is lifted to
-            // the unit level and AND-ed. Nested units have no WHERE (rejected at parse).
-            let mut where_ = rel.where_.take();
+            // A PLAIN hop's `WHERE` is lifted to the unit level and AND-ed (checked once
+            // the whole rep is bound). A NESTED hop's `WHERE` (`-[e WHERE …]->{a,b}`) is a
+            // per-inner-edge predicate — it stays on the `Sub`'s inner hop so it filters
+            // every edge of the inner walk, NOT lifted.
+            let mut where_ = if s.inner_q.is_none() {
+                rel.where_.take()
+            } else {
+                None
+            };
             let first_target = s.hop_to.as_ref().and_then(|to| self.node_slot(to));
             let mut elems = vec![hop_or_sub(rel.clone(), first_target, s.inner_q)];
             for extra in &s.unit_rest {
                 let mut extra_rel = self.rel(&extra.rel);
                 let q = extra.rel.quantifier;
-                if let Some(w) = extra_rel.where_.take() {
-                    where_ = Some(match where_.take() {
-                        Some(prev) => CExpr::And(vec![prev, w]),
-                        None => w,
-                    });
+                if q.is_none() {
+                    if let Some(w) = extra_rel.where_.take() {
+                        where_ = Some(match where_.take() {
+                            Some(prev) => CExpr::And(vec![prev, w]),
+                            None => w,
+                        });
+                    }
                 }
                 let target = self.node_slot(&extra.node);
                 elems.push(hop_or_sub(extra_rel, target, q));

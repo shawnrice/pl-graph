@@ -687,23 +687,21 @@ impl Parser {
                 );
             }
         }
-        // A NESTED repetition (`( … {a,b} … ){n,m}`) — v1 supports endpoint enumeration
-        // only: no group variables and no WHERE inside it (that needs list-of-list group
-        // vars / nested-unit predicates, deferred). Reject loudly so nothing is dropped.
+        // A NESTED repetition (`( … {a,b} … ){n,m}`). A per-hop EDGE predicate on a
+        // nested inner hop (`-[e WHERE …]->{a,b}`, `-[:R {k:v}]->{a,b}`) IS supported —
+        // it filters every edge of the inner walk. What's still deferred (needs
+        // list-of-list group variables): NODE group variables inside the nesting. Reject
+        // those loudly so nothing is silently dropped.
         let nested = inner_q.is_some() || unit_rest.iter().any(|s| s.rel.quantifier.is_some());
         if nested {
-            let bound = hop_from.variable.is_some()
+            let named_node = hop_from.variable.is_some()
                 || hop_to.variable.is_some()
-                || rel.variable.is_some()
-                || rel.where_.is_some()
-                || unit_rest.iter().any(|s| {
-                    s.node.variable.is_some() || s.rel.variable.is_some() || s.rel.where_.is_some()
-                });
-            if bound {
+                || unit_rest.iter().any(|s| s.node.variable.is_some());
+            if named_node {
                 return err(
-                    "group variables / WHERE inside a nested quantifier \
-                     (`( … {a,b} … ){n,m}`) are not yet supported — use anonymous \
-                     nodes and edges",
+                    "a NODE group variable inside a nested quantifier \
+                     (`( … {a,b} … ){n,m}`) is not yet supported — use anonymous nodes \
+                     (a per-hop edge predicate `-[e WHERE …]->{a,b}` is fine)",
                     open,
                 );
             }
@@ -713,7 +711,8 @@ impl Parser {
         if self.check_kw("where") {
             if nested {
                 return err(
-                    "a WHERE on a nested quantifier is not yet supported",
+                    "a subpath-level WHERE on a nested quantifier is not yet supported \
+                     — put the predicate inline on the edge (`-[e WHERE …]->{a,b}`)",
                     self.peek().pos,
                 );
             }

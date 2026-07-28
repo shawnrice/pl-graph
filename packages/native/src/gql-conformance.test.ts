@@ -1269,6 +1269,30 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(code(() => nat.query(bad))).toBe(code(() => tsQuery(ts, bad)));
   });
 
+  // A per-hop EDGE predicate on a nested inner hop filters every edge of the inner walk
+  // (the tractable slice of "WHERE inside a nested quantifier"). Byte-identical.
+  test('nested quantifier per-hop edge predicate (TS vs native)', () => {
+    const W = [
+      '{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}',
+      '{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}',
+      '{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}',
+      '{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}',
+      '{"type":"edge","from":"a","to":"b","labels":["R"],"properties":{"amt":10.0}}',
+      '{"type":"edge","from":"b","to":"c","labels":["R"],"properties":{"amt":1.0}}',
+      '{"type":"edge","from":"c","to":"d","labels":["R"],"properties":{"amt":10.0}}',
+    ].join('\n');
+    const nat = graphFromFormat(backend, W, 'ndjson');
+    const ts = tsDeserialize(W, 'ndjson', new Graph());
+
+    for (const q of [
+      "MATCH (s:N {id:'a'}) ( ()-[e:R WHERE e.amt >= 5]->{1,2}() ){1,2} (t) RETURN t.id AS id ORDER BY id",
+      "MATCH (s:N {id:'a'}) ( ()-[:R {amt:10.0}]->{1,3}() ){1} (t) RETURN t.id AS id ORDER BY id",
+      "MATCH (s:N {id:'a'}) ( ()-[e:R WHERE e.amt >= 5]->{1,3}() ){1,3} (t) RETURN count(*) AS c",
+    ]) {
+      expect(JSON.stringify(nat.query(q)), q).toBe(JSON.stringify(tsQuery(ts, q)));
+    }
+  });
+
   // The fused matcher marks PER HOP, so ACYCLIC/SIMPLE forbid a multi-element unit from
   // repeating a vertex INTERNALLY (a self-loop `s→p, p→p` revisits p within one unit).
   // Both engines must agree: TRAIL keeps it (distinct edges), ACYCLIC/SIMPLE reject it.

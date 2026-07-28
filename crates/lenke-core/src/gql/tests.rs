@@ -5773,12 +5773,48 @@ fn nested_quantifier_endpoints() {
 /// WHERE inside a nested quantifier are rejected at parse.
 #[test]
 fn nested_quantifier_group_vars_and_where_rejected() {
-    // A named inner node inside a nested quantifier → rejected.
+    // A NAMED inner NODE inside a nested quantifier → rejected (list-of-list exposure
+    // deferred).
     assert!(parse("MATCH (s) ( (x)-[:R]->{1,2}(m) ){2} (t) RETURN t").is_err());
-    // A WHERE on a nested quantifier → rejected.
+    // A subpath-level WHERE on a nested quantifier → rejected.
     assert!(parse("MATCH (s) ( ()-[:R]->{1,2}() WHERE true ){2} (t) RETURN t").is_err());
-    // But a plain (non-nested) subpath keeps its group variables + WHERE.
+    // A per-hop EDGE predicate on a nested inner hop IS supported (filters inner edges).
+    assert!(parse("MATCH (s) ( ()-[e:R WHERE e.amt >= 5]->{1,2}() ){2} (t) RETURN t").is_ok());
+    assert!(parse("MATCH (s) ( ()-[:R {amt:10.0}]->{1,3}() ){1} (t) RETURN t").is_ok());
+    // A plain (non-nested) subpath keeps its group variables + WHERE.
     assert!(parse("MATCH (s) ((x)-[e:R]->(y) WHERE x = y){1,2} (t) RETURN size(e)").is_ok());
+}
+
+/// A per-hop EDGE predicate on a nested inner hop (`-[e WHERE …]->{a,b}`) filters every
+/// edge of the inner walk — the tractable slice of "WHERE inside a nested quantifier".
+#[test]
+fn nested_quantifier_per_hop_edge_predicate() {
+    // a→b(10)→c(1)→d(10): the inner walk only follows amt ≥ 5 edges, so b→c blocks it.
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b"}}"#,
+        r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c"}}"#,
+        r#"{"type":"node","id":"d","labels":["N"],"properties":{"id":"d"}}"#,
+        r#"{"type":"edge","from":"a","to":"b","labels":["R"],"properties":{"amt":10.0}}"#,
+        r#"{"type":"edge","from":"b","to":"c","labels":["R"],"properties":{"amt":1.0}}"#,
+        r#"{"type":"edge","from":"c","to":"d","labels":["R"],"properties":{"amt":10.0}}"#,
+    ]);
+    // WHERE on the inner edge: from a, only a→b passes (b→c amt 1 < 5 blocks). Endpoint b.
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ( ()-[e:R WHERE e.amt >= 5]->{1,2}() ){1,2} (t) RETURN t.id AS id",
+        ),
+        vec![s("b")],
+    );
+    // Inline property predicate on the inner edge (amt = 10): same block at b→c.
+    assert_eq!(
+        sorted_col0(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ( ()-[:R {amt:10.0}]->{1,3}() ){1} (t) RETURN t.id AS id",
+        ),
+        vec![s("b")],
+    );
 }
 
 /// The fused matcher marks PER HOP, so ACYCLIC/SIMPLE now forbid a multi-element unit

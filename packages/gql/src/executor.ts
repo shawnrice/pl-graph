@@ -3050,10 +3050,10 @@ type CSegment = { rel: CRel; node: CNode; unit?: CUnit };
  *  nested sub-unit binds). Mirrors native `CUnit::exposes`. */
 const unitExposes = (u: CUnit): boolean =>
   u.startVar !== undefined ||
-  u.elems.some((e) =>
-    'hop' in e
-      ? e.hop.targetVar !== undefined || e.hop.rel.variable !== undefined
-      : unitExposes(e.sub.unit),
+  // A nested sub-unit exposes NO group variables in v1 (an inner edge var is a per-hop
+  // predicate scalar; node group vars are rejected at parse).
+  u.elems.some(
+    (e) => 'hop' in e && (e.hop.targetVar !== undefined || e.hop.rel.variable !== undefined),
   );
 type CPath = {
   start: CNode;
@@ -3296,7 +3296,13 @@ const compilePath = (pattern: PathPattern): CPath => {
         })),
       ];
 
-      const whereExprs = astElems.map((h) => h.rel.where).filter((w): w is Expr => w !== undefined);
+      // A PLAIN hop's WHERE lifts to the unit level; a NESTED hop's WHERE
+      // (`-[e WHERE …]->{a,b}`) is a per-inner-edge predicate that STAYS on the `Sub`'s
+      // inner hop, so it filters every edge of the inner walk (not lifted).
+      const whereExprs = astElems
+        .filter((h) => h.q === undefined)
+        .map((h) => h.rel.where)
+        .filter((w): w is Expr => w !== undefined);
       let unitWhere: Expr | undefined;
 
       if (whereExprs.length === 1) {
@@ -3306,16 +3312,25 @@ const compilePath = (pattern: PathPattern): CPath => {
       }
 
       const hopOrSub = (h: { rel: RelPattern; targetVar?: string; q?: Quantifier }): CElem => {
-        const chop: CHop = {
-          rel: compileRel({ ...h.rel, where: undefined, quantifier: undefined }),
-          ...(h.targetVar !== undefined ? { targetVar: h.targetVar } : {}),
-        };
-
         if (h.q === undefined) {
+          // Plain hop: its WHERE was lifted, so strip it from the hop predicate.
+          const chop: CHop = {
+            rel: compileRel({ ...h.rel, where: undefined, quantifier: undefined }),
+            ...(h.targetVar !== undefined ? { targetVar: h.targetVar } : {}),
+          };
+
           return { hop: chop };
         }
 
-        return { sub: { unit: { elems: [{ hop: chop }] }, min: h.q.min, max: h.q.max ?? null } };
+        // Nested sub: keep the WHERE on the inner hop (per-inner-edge predicate).
+        const innerHop: CHop = {
+          rel: compileRel({ ...h.rel, quantifier: undefined }),
+          ...(h.targetVar !== undefined ? { targetVar: h.targetVar } : {}),
+        };
+
+        return {
+          sub: { unit: { elems: [{ hop: innerHop }] }, min: h.q.min, max: h.q.max ?? null },
+        };
       };
 
       const unit: CUnit = {

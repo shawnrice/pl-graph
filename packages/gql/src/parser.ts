@@ -701,27 +701,23 @@ export const parse = (
       }
     }
 
-    // A NESTED repetition (`( … {a,b} … ){n,m}`) — v1 supports endpoint enumeration
-    // only: no group variables and no WHERE inside it. Reject loudly (mirrors native).
+    // A NESTED repetition (`( … {a,b} … ){n,m}`). A per-hop EDGE predicate on a nested
+    // inner hop (`-[e WHERE …]->{a,b}`, `-[:R {k:v}]->{a,b}`) IS supported — it filters
+    // every edge of the inner walk. Only NODE group variables inside the nesting are
+    // deferred (need list-of-list group vars). Reject those loudly (mirrors native).
     const nested = innerQ !== undefined || unitRest.some((s) => s.rel.quantifier !== undefined);
 
     if (nested) {
-      const bound =
+      const namedNode =
         hopFrom.variable !== undefined ||
         hopTo.variable !== undefined ||
-        rel.variable !== undefined ||
-        rel.where !== undefined ||
-        unitRest.some(
-          (s) =>
-            s.node.variable !== undefined ||
-            s.rel.variable !== undefined ||
-            s.rel.where !== undefined,
-        );
+        unitRest.some((s) => s.node.variable !== undefined);
 
-      if (bound) {
+      if (namedNode) {
         throw new GqlSyntaxError(
-          'group variables / WHERE inside a nested quantifier (`( … {a,b} … ){n,m}`) ' +
-            'are not yet supported — use anonymous nodes and edges',
+          'a NODE group variable inside a nested quantifier (`( … {a,b} … ){n,m}`) is ' +
+            'not yet supported — use anonymous nodes (a per-hop edge predicate ' +
+            '`-[e WHERE …]->{a,b}` is fine)',
           open,
         );
       }
@@ -731,7 +727,11 @@ export const parse = (
 
     if (checkKeyword('where')) {
       if (nested) {
-        throw new GqlSyntaxError('a WHERE on a nested quantifier is not yet supported', peek().pos);
+        throw new GqlSyntaxError(
+          'a subpath-level WHERE on a nested quantifier is not yet supported — put the ' +
+            'predicate inline on the edge (`-[e WHERE …]->{a,b}`)',
+          peek().pos,
+        );
       }
 
       advance();
