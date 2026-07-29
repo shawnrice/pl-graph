@@ -154,6 +154,41 @@ pub type Params = HashMap<String, Val>;
 /// per-row path is an array index, not a `HashMap` lookup. It owns the resolved
 /// tables and borrows nothing from the graph, so the write path can still take
 /// `&mut Graph` alongside it.
+/// Pool of reusable per-edge trail-mark buffers for var-length TRAIL walks
+/// (`reachable_each`): pop a buffer, walk with it, push it back clean. Backed by a
+/// `RefCell` in the default single-threaded build (a borrow flag — effectively free);
+/// a `Mutex` only under `parallel-query`, where `Ctx` must be `Sync` to be shared
+/// across rayon's projection threads. Only the pop/push is guarded — never the walk
+/// itself — so even the parallel build contends for nothing more than the brief buffer
+/// hand-off, and the default build pays no synchronization cost at all.
+#[derive(Default)]
+struct MarksPool {
+    #[cfg(not(feature = "parallel-query"))]
+    inner: std::cell::RefCell<Vec<Vec<bool>>>,
+    #[cfg(feature = "parallel-query")]
+    inner: std::sync::Mutex<Vec<Vec<bool>>>,
+}
+
+impl MarksPool {
+    /// Take a buffer from the pool, or a fresh empty one if it's dry.
+    fn pop(&self) -> Vec<bool> {
+        #[cfg(not(feature = "parallel-query"))]
+        let mut pool = self.inner.borrow_mut();
+        #[cfg(feature = "parallel-query")]
+        let mut pool = self.inner.lock().expect("edge-marks pool mutex poisoned");
+        pool.pop().unwrap_or_default()
+    }
+
+    /// Return a buffer to the pool for reuse.
+    fn push(&self, buf: Vec<bool>) {
+        #[cfg(not(feature = "parallel-query"))]
+        let mut pool = self.inner.borrow_mut();
+        #[cfg(feature = "parallel-query")]
+        let mut pool = self.inner.lock().expect("edge-marks pool mutex poisoned");
+        pool.push(buf);
+    }
+}
+
 struct Ctx<'a> {
     params: &'a [Val],
     /// key_ref -> (vertex property-key id, edge property-key id).
@@ -177,9 +212,9 @@ struct Ctx<'a> {
     /// A pool (not one buffer) because the walk is now *lazy*: it invokes a callback
     /// per endpoint that may re-enter `reachable_each` (a nested quantified segment)
     /// while the outer walk's marks are still live — so each active walk borrows its
-    /// own buffer (`take_marks`) and returns it clean (`return_marks`). The RefCell is
+    /// own buffer (`take_marks`) and returns it clean (`return_marks`). The pool lock is
     /// held only for the brief pop/push, never across the walk, so nesting is safe.
-    edge_marks_pool: std::cell::RefCell<Vec<Vec<bool>>>,
+    edge_marks_pool: MarksPool,
 }
 
 const FAULT_NONE: u8 = 0;
@@ -239,7 +274,7 @@ impl Ctx<'_> {
     /// pool (or a fresh one). Returned clean by `return_marks`, so a pooled buffer is
     /// already all-`false`; only grow it if the graph gained edges since last use.
     fn take_marks(&self, slots: usize) -> Vec<bool> {
-        let mut buf = self.edge_marks_pool.borrow_mut().pop().unwrap_or_default();
+        let mut buf = self.edge_marks_pool.pop();
         if buf.len() < slots {
             buf.resize(slots, false);
         }
@@ -250,7 +285,7 @@ impl Ctx<'_> {
     /// (backtracking clears it on the normal path; the stop/fault paths clear the
     /// live stack's marks before returning).
     fn return_marks(&self, buf: Vec<bool>) {
-        self.edge_marks_pool.borrow_mut().push(buf);
+        self.edge_marks_pool.push(buf);
     }
 
     /// Record a data-exception fault (first one wins; later faults are ignored).
@@ -405,7 +440,7 @@ fn resolve_ctx<'a>(graph: &Graph, plan: &'a CQuery, params: &'a [Val]) -> Ctx<'a
         label_names: &plan.label_names,
         unknown_fns: &plan.unknown_fns,
         fault: AtomicU8::new(FAULT_NONE),
-        edge_marks_pool: std::cell::RefCell::new(Vec::new()),
+        edge_marks_pool: MarksPool::default(),
     }
 }
 
@@ -463,7 +498,7 @@ pub fn eval_predicate(graph: &Graph, pred: &CPredicate, element: Val) -> CodeRes
         label_names: &pred.label_names,
         unknown_fns: &pred.unknown_fns,
         fault: AtomicU8::new(FAULT_NONE),
-        edge_marks_pool: std::cell::RefCell::new(Vec::new()),
+        edge_marks_pool: MarksPool::default(),
     };
     let mut binding = Binding::default();
     binding.set(0, element);

@@ -8378,3 +8378,80 @@ fn deboxed_record_survives_transaction_rollback() {
         "the record is exactly restored after rollback",
     );
 }
+
+/// `par_project` (the opt-in `parallel-query` feature) splits a large projection
+/// frame across rayon threads. Over more than `MIN_ROWS` (16_384) rows, prove the
+/// parallel result equals the serial one: no row dropped or duplicated, and each
+/// row's columns stay paired (no cross-chunk mixing). `w == 2v+1` on every row is the
+/// pairing witness; the `seen` sieve is the completeness witness.
+#[cfg(feature = "parallel-query")]
+#[test]
+fn parallel_projection_preserves_every_row_over_a_large_frame() {
+    let count = 20_000usize; // > MIN_ROWS, so the frame is chunked across threads
+    let lines: Vec<String> = (0..count)
+        .map(|i| {
+            format!(r#"{{"type":"node","id":"v{i}","labels":["T"],"properties":{{"val":{i}}}}}"#)
+        })
+        .collect();
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let mut g = graph_of(&refs);
+
+    let out = rows(&mut g, "MATCH (a:T) RETURN a.val AS v, a.val * 2 + 1 AS w");
+    assert_eq!(out.len(), count);
+    let mut seen = vec![false; count];
+    for r in &out {
+        let vi = match &r[0] {
+            Value::Num(x) => *x as usize,
+            other => panic!("v not numeric: {other:?}"),
+        };
+        // w == 2v+1 proves this row's two columns came from the same source row.
+        assert_eq!(r[1], n(2.0 * vi as f64 + 1.0), "row {vi}: columns unpaired");
+        assert!(
+            !std::mem::replace(&mut seen[vi], true),
+            "val {vi} duplicated"
+        );
+    }
+    assert!(seen.iter().all(|&x| x), "a row was dropped");
+}
+
+/// Same large-frame parallel projection, but each row runs a var-length subquery
+/// (`EXISTS { (a)-[:R]->+(:T) }`) — a per-row traversal evaluated concurrently across
+/// the rayon projection threads, exercising the shared trail-mark pool (a `Mutex`
+/// under this feature) under real contention. Isolated pairs keep each answer
+/// determinate and O(1): even vertices reach exactly one `T`, odd ones none.
+#[cfg(feature = "parallel-query")]
+#[test]
+fn parallel_projection_with_per_row_subquery_over_a_large_frame() {
+    let count = 20_000usize; // even, > MIN_ROWS
+    let mut lines: Vec<String> = (0..count)
+        .map(|i| {
+            format!(r#"{{"type":"node","id":"v{i}","labels":["T"],"properties":{{"val":{i}}}}}"#)
+        })
+        .collect();
+    for i in (0..count).step_by(2) {
+        lines.push(format!(
+            r#"{{"type":"edge","id":"e{i}","from":"v{i}","to":"v{}","labels":["R"],"properties":{{}}}}"#,
+            i + 1
+        ));
+    }
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let mut g = graph_of(&refs);
+
+    let out = rows(
+        &mut g,
+        "MATCH (a:T) RETURN a.val AS v, EXISTS { MATCH (a)-[:R]->+(b:T) } AS reach",
+    );
+    assert_eq!(out.len(), count);
+    let mut reachable = 0usize;
+    for r in &out {
+        let vi = match &r[0] {
+            Value::Num(x) => *x as usize,
+            other => panic!("v not numeric: {other:?}"),
+        };
+        assert_eq!(r[1], b(vi % 2 == 0), "row {vi}: wrong reachability");
+        if vi % 2 == 0 {
+            reachable += 1;
+        }
+    }
+    assert_eq!(reachable, count / 2);
+}
