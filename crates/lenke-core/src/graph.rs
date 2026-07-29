@@ -1934,6 +1934,14 @@ impl Graph {
         self.edge_interval_idx.as_ref().map(|idx| idx.tree.stab(q))
     }
 
+    /// Candidate edge ids whose `[lo, hi]` overlaps `[d1, d2]`, via the RI-tree interval
+    /// index (None if no such index). A superset the caller's `WHERE` then verifies.
+    pub fn edge_interval_overlap(&self, d1: i128, d2: i128) -> Option<Vec<u32>> {
+        self.edge_interval_idx
+            .as_ref()
+            .map(|idx| idx.tree.overlap(d1, d2))
+    }
+
     /// The `(lo_key, hi_key)` an edge interval index covers, if one exists — for the
     /// seed selector to recognize a matching as-of predicate.
     pub(crate) fn edge_interval_index_keys(&self) -> Option<(&str, &str)> {

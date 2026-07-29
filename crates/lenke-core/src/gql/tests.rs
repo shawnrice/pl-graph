@@ -8941,11 +8941,15 @@ fn bench_temporal_index() {
     // Contender B — now LIVE through the query path: prop_index_hint recognizes the
     // as-of predicate and seeds from the RI-tree stab. Run the same GQL query the other
     // configs run; `matched` proves correctness (== the scan's 25000).
-    eprintln!("== B: RI-tree interval index (as-of, via GQL query path) ==");
+    eprintln!("== B: RI-tree interval index (as-of + overlap, via GQL query path) ==");
     let b_now = bench(&mut g_ri, "as-of now", asof, &p_now);
     eprintln!("      └─ {:.2}x vs scan", base[0] / b_now);
     let b_hist = bench(&mut g_ri, "as-of historical", asof, &p_hist);
     eprintln!("      └─ {:.2}x vs scan", base[1] / b_hist);
+    let b_narrow = bench(&mut g_ri, "narrow overlap (straddlers)", overlap, &p_narrow);
+    eprintln!("      └─ {:.2}x vs scan", base[2] / b_narrow);
+    let b_wide = bench(&mut g_ri, "wide overlap", overlap, &p_wide);
+    eprintln!("      └─ {:.2}x vs scan", base[3] / b_wide);
 }
 
 /// Round-16's #1 bitemporal BLOCKER was that variable-length paths couldn't filter

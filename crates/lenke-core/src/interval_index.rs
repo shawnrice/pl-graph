@@ -130,6 +130,61 @@ impl RiTree {
         }
         out
     }
+
+    /// All ids whose interval `[lo, hi]` overlaps the closed query range `[d1, d2]`
+    /// (`lo <= d2 AND hi >= d1`). A superset for a half-open `lo < d2 AND hi > d1`
+    /// predicate, which the caller's `WHERE` then verifies. Three disjoint fork
+    /// classes (an interval registers at exactly one fork, so no double-count):
+    ///   • fork ∈ [d1, d2]  — the fork itself is in range ⇒ the interval overlaps.
+    ///   • fork < d1        — on the root→d1 path (it must contain d1); overlaps iff hi >= d1.
+    ///   • fork > d2        — on the root→d2 path (it must contain d2); overlaps iff lo <= d2.
+    pub(crate) fn overlap(&self, d1: i128, d2: i128) -> Vec<u32> {
+        use std::ops::Bound::Included;
+        let (a, b) = (bias(d1), bias(d2));
+        if a > b {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        // Inner: every interval whose fork ∈ [a, b] (one `lower` entry each).
+        for (_, ids) in self
+            .lower
+            .range((Included((a, 0)), Included((b, u128::MAX))))
+        {
+            out.extend_from_slice(ids);
+        }
+        // Left boundary: nodes v < a on the root→a path — overlaps iff hi >= a.
+        let (mut v, mut step) = (ROOT, ROOT_STEP);
+        loop {
+            if v < a {
+                for (_, ids) in self
+                    .upper
+                    .range((Included((v, a)), Included((v, u128::MAX))))
+                {
+                    out.extend_from_slice(ids);
+                }
+            }
+            if step == 0 {
+                break;
+            }
+            v = if a < v { v - step } else { v + step };
+            step >>= 1;
+        }
+        // Right boundary: nodes v > b on the root→b path — overlaps iff lo <= b.
+        let (mut v, mut step) = (ROOT, ROOT_STEP);
+        loop {
+            if v > b {
+                for (_, ids) in self.lower.range((Included((v, 0)), Included((v, b)))) {
+                    out.extend_from_slice(ids);
+                }
+            }
+            if step == 0 {
+                break;
+            }
+            v = if b < v { v - step } else { v + step };
+            step >>= 1;
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -179,6 +234,35 @@ mod tests {
                 .collect();
             want.sort_unstable();
             assert_eq!(got, want, "stab({q}) mismatch");
+        }
+    }
+
+    #[test]
+    fn overlap_matches_brute_force() {
+        let mut rng = Lcg(0xabcd_ef01);
+        let intervals: Vec<(i128, i128)> = (0..800)
+            .map(|_| {
+                let a = rng.range(-1_000_000, 1_000_000) as i128;
+                (a, a + rng.range(0, 500) as i128)
+            })
+            .collect();
+        let mut t = RiTree::new();
+        for (id, &(lo, hi)) in intervals.iter().enumerate() {
+            t.insert(lo, hi, id as u32);
+        }
+        for _ in 0..2000 {
+            let d1 = rng.range(-1_100_000, 1_100_000) as i128;
+            let d2 = d1 + rng.range(0, 3000) as i128; // windows from empty to wide
+            let mut got = t.overlap(d1, d2);
+            got.sort_unstable();
+            let mut want: Vec<u32> = intervals
+                .iter()
+                .enumerate()
+                .filter(|(_, &(lo, hi))| lo <= d2 && hi >= d1)
+                .map(|(id, _)| id as u32)
+                .collect();
+            want.sort_unstable();
+            assert_eq!(got, want, "overlap([{d1},{d2}]) mismatch");
         }
     }
 

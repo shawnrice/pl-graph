@@ -7244,8 +7244,17 @@ fn prop_index_hint(
                     if let (Some((slo, qlo)), Some((shi, qhi))) =
                         (probe(lo_key, true), probe(hi_key, false))
                     {
-                        if slo == shi && qlo == qhi {
-                            if let Some(cand) = graph.edge_interval_stab(qlo) {
+                        // `probe(lo_key,..)` matched `lo_key < X` → qlo = X (the upper
+                        // window end d2); `probe(hi_key,..)` matched `hi_key > Y` → qhi =
+                        // Y (the lower end d1). Same probe (as-of `≤v AND >v`) → point
+                        // stab; distinct probes (overlap `<d2 AND >d1`) → range overlap.
+                        if slo == shi {
+                            let cand = if qlo == qhi {
+                                graph.edge_interval_stab(qlo)
+                            } else {
+                                graph.edge_interval_overlap(qhi, qlo)
+                            };
+                            if let Some(cand) = cand {
                                 return Some(cand);
                             }
                         }
