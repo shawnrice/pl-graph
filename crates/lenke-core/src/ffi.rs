@@ -67,7 +67,8 @@ unsafe fn in_str<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
 
 #[no_mangle]
 pub extern "C" fn lnk_abi_version() -> u32 {
-    15 // 15: lnk_dump_schema (read schema back as SchemaOps, for snapshot persistence);
+    16 // 16: lnk_create_edge_interval_index (RI-tree interval index for as-of/overlap);
+       // 15: lnk_dump_schema (read schema back as SchemaOps, for snapshot persistence);
        // 14: lnk_last_write_scope (content-derived CDC value-scope);
        // 13: lnk_query_arrow_ipc (native Arrow IPC egress);
        // 12: lnk_prepare takes a max-operator-chain arg; 11: per-graph operator-chain
@@ -347,6 +348,36 @@ pub unsafe extern "C" fn lnk_create_edge_index(
     }) {
         (Some(g), Some(name)) => {
             g.create_edge_index(name);
+            0
+        }
+        _ => -1,
+    }
+}
+
+/// Declare (and backfill) an RI-tree interval index over an edge `[lo_key, hi_key)`
+/// temporal pair — an as-of / overlap predicate then seeds from the interval index.
+/// Two of them (valid `[vf,vt)` + transaction `[tf,tt)`) intersect for a bitemporal
+/// as-of. Returns 0 on success, -1 on a null / bad-UTF-8 error.
+///
+/// # Safety
+/// `g` valid + uniquely borrowed; `lo_ptr`/`lo_len` and `hi_ptr`/`hi_len` valid UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn lnk_create_edge_interval_index(
+    g: *mut Graph,
+    lo_ptr: *const u8,
+    lo_len: usize,
+    hi_ptr: *const u8,
+    hi_len: usize,
+) -> i32 {
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires valid (or null).
+    let g = unsafe { graph_mut(g) };
+    // SAFETY: lo_ptr/lo_len is the caller-supplied buffer this fn's # Safety contract requires valid.
+    let lo = unsafe { in_str(lo_ptr, lo_len) };
+    // SAFETY: hi_ptr/hi_len is the caller-supplied buffer this fn's # Safety contract requires valid.
+    let hi = unsafe { in_str(hi_ptr, hi_len) };
+    match (g, lo, hi) {
+        (Some(g), Some(lo), Some(hi)) => {
+            g.create_edge_interval_index(lo, hi);
             0
         }
         _ => -1,

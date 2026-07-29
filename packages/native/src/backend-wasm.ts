@@ -26,6 +26,13 @@ type WasmExports = {
   lnk_create_vertex_index: (h: number, key: number, keyLen: number) => number;
   lnk_graph_set_max_operator_chain: (h: number, n: number) => void;
   lnk_create_edge_index: (h: number, key: number, keyLen: number) => number;
+  lnk_create_edge_interval_index: (
+    h: number,
+    lo: number,
+    loLen: number,
+    hi: number,
+    hiLen: number,
+  ) => number;
   lnk_create_unique_constraint: (
     h: number,
     label: number,
@@ -712,6 +719,19 @@ export const createWasmBackend = async (source: WasmSource): Promise<Backend> =>
         ex.lnk_create_edge_index(handle, p, k.byteLength);
       } finally {
         ex.lnk_dealloc(p, k.byteLength);
+      }
+    },
+    createEdgeIntervalIndex: (handle, loKey, hiKey) => {
+      const lo = encoder.encode(loKey);
+      const hi = encoder.encode(hiKey);
+      const plo = writeBytes(lo);
+      const phi = writeBytes(hi);
+
+      try {
+        ex.lnk_create_edge_interval_index(handle, plo, lo.byteLength, phi, hi.byteLength);
+      } finally {
+        ex.lnk_dealloc(plo, lo.byteLength);
+        ex.lnk_dealloc(phi, hi.byteLength);
       }
     },
     dropVertexIndex: (handle, key) => {

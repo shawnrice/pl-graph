@@ -191,6 +191,13 @@ impl Graph {
         self.inner.create_edge_index(&key);
     }
 
+    /// Declare an RI-tree interval index over an edge `[lo_key, hi_key)` temporal pair
+    /// (as-of / overlap seeks; two intersect for a bitemporal as-of).
+    #[napi]
+    pub fn create_edge_interval_index(&mut self, lo_key: String, hi_key: String) {
+        self.inner.create_edge_interval_index(&lo_key, &hi_key);
+    }
+
     /// Drop a vertex / edge property index (no-op if absent). Rejected if the key
     /// backs a unique constraint — drop the constraint first.
     #[napi]

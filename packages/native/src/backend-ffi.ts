@@ -24,6 +24,10 @@ const SYMBOLS = {
   lnk_create_vertex_index: { args: [FFIType.ptr, FFIType.ptr, U], returns: FFIType.i32 },
   lnk_graph_set_max_operator_chain: { args: [FFIType.ptr, U], returns: FFIType.void },
   lnk_create_edge_index: { args: [FFIType.ptr, FFIType.ptr, U], returns: FFIType.i32 },
+  lnk_create_edge_interval_index: {
+    args: [FFIType.ptr, FFIType.ptr, U, FFIType.ptr, U],
+    returns: FFIType.i32,
+  },
   lnk_create_unique_constraint: {
     args: [FFIType.ptr, FFIType.ptr, U, FFIType.ptr, U],
     returns: FFIType.i32,
@@ -259,6 +263,18 @@ export const createFfiBackend = (libPath: string): Backend => {
       const k = encoder.encode(key);
 
       symbols.lnk_create_edge_index(asPtr(handle), ptr(k), k.byteLength);
+    },
+    createEdgeIntervalIndex: (handle, loKey, hiKey) => {
+      const lo = encoder.encode(loKey);
+      const hi = encoder.encode(hiKey);
+
+      symbols.lnk_create_edge_interval_index(
+        asPtr(handle),
+        ptr(lo),
+        lo.byteLength,
+        ptr(hi),
+        hi.byteLength,
+      );
     },
     createUniqueConstraint: (handle, label, key) => {
       const l = encoder.encode(label);

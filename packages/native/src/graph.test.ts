@@ -21,6 +21,7 @@ const countingBackend = (): { backend: Backend; freed: GraphHandle[] } => {
     epoch: () => 0,
     createVertexIndex: () => {},
     createEdgeIndex: () => {},
+    createEdgeIntervalIndex: () => {},
     createUniqueConstraint: () => {},
     createRequiredConstraint: () => {},
     createTypeConstraint: () => {},

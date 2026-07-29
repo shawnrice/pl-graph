@@ -77,6 +77,13 @@ export type Backend = {
    */
   createVertexIndex: (handle: GraphHandle, key: string) => void;
   createEdgeIndex: (handle: GraphHandle, key: string) => void;
+  /**
+   * Declare an RI-tree interval index over an edge `[loKey, hiKey)` temporal pair.
+   * An as-of (`lo <= v AND hi > v`) / overlap predicate then seeds from the interval
+   * index; two of them (valid `[vf,vt)` + transaction `[tf,tt)`) intersect for a
+   * bitemporal as-of.
+   */
+  createEdgeIntervalIndex: (handle: GraphHandle, loKey: string, hiKey: string) => void;
 
   /**
    * Set the GQL operator-chain ceiling for this graph (the `maxOperatorChain`

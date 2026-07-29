@@ -37,8 +37,8 @@ const NDJSON = Buffer.from(
 const dec = new TextDecoder();
 const json = (buf) => JSON.parse(dec.decode(buf));
 
-test('abiVersion matches the C ABI (15)', () => {
-  assert.equal(abiVersion(), 15);
+test('abiVersion matches the C ABI (16)', () => {
+  assert.equal(abiVersion(), 16);
 });
 
 test('fromNdjson decodes counts', () => {
@@ -156,7 +156,7 @@ test('createNodeBackend errors are coded LenkeErrors (parity with ffi/wasm)', ()
 
 test('createNodeBackend powers the @lenke/native facade + liveQuery', () => {
   const backend = createNodeBackend();
-  assert.equal(backend.abiVersion, 15);
+  assert.equal(backend.abiVersion, 16);
 
   const g = graphFromNdjson(backend, NDJSON);
   const store = createStore(g);

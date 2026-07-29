@@ -103,6 +103,8 @@ export function createNodeBackend() {
     // napi-rs camelCases the Rust `create_vertex_index` / `create_edge_index`.
     createVertexIndex: (handle, key) => get(handle).createVertexIndex(key),
     createEdgeIndex: (handle, key) => get(handle).createEdgeIndex(key),
+    createEdgeIntervalIndex: (handle, loKey, hiKey) =>
+      get(handle).createEdgeIntervalIndex(loKey, hiKey),
     setMaxOperatorChain: (handle, n) => get(handle).setMaxOperatorChain(n),
     dropVertexIndex: (handle, key) => get(handle).dropVertexIndex(key),
     dropEdgeIndex: (handle, key) => get(handle).dropEdgeIndex(key),

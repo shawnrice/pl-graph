@@ -587,6 +587,12 @@ export type RustGraph = {
   createVertexIndex: (key: string) => void;
   createEdgeIndex: (key: string) => void;
   /**
+   * Declare an RI-tree interval index over an edge `[loKey, hiKey)` temporal pair, so an
+   * as-of (`lo <= v AND hi > v`) / overlap predicate seeds from the interval index; two
+   * (valid `[vf,vt)` + transaction `[tf,tt)`) intersect for a bitemporal as-of.
+   */
+  createEdgeIntervalIndex: (loKey: string, hiKey: string) => void;
+  /**
    * Declare a UNIQUE constraint on `(label, key)`: at most one vertex carrying
    * `label` may hold a given non-null value for `key`. Index-backed. Throws
    * `ConstraintViolation` if the current data already violates it. The Pattern-B
@@ -1101,6 +1107,8 @@ export const attachGraph = (backend: Backend, handle: GraphHandle): RustGraph =>
     epoch: (name) => backend.epoch(live(), name),
     createVertexIndex: (key) => backend.createVertexIndex(live(), key),
     createEdgeIndex: (key) => backend.createEdgeIndex(live(), key),
+    createEdgeIntervalIndex: (loKey, hiKey) =>
+      backend.createEdgeIntervalIndex(live(), loKey, hiKey),
     createUniqueConstraint: (label, key) => backend.createUniqueConstraint(live(), label, key),
     createRequiredConstraint: (label, key) => backend.createRequiredConstraint(live(), label, key),
     createTypeConstraint: (label, key, type) =>
