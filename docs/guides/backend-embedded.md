@@ -47,7 +47,7 @@ An NDJSON document is one JSON object per line, tagged `node` or `edge`:
 
 The native graph mirrors the pure-TS engine's opt-in property indexes and prepared queries:
 
-- `graph.createIndex({ on, kind, keys })` — e.g. `{ on: 'vertex', kind: 'hash', keys: ['id'] }` — a point lookup (`WHERE v.k = $x` or inline `{k: $x}`) then seeks instead of scanning. `vertexIndexes()` / `dropVertexIndex(key)` round it out. (Host-API only — there is no GQL `CREATE INDEX`.)
+- `graph.createIndex({ on, kind, keys })` — use `kind: 'hash'` for almost everything (`{ on: 'vertex', kind: 'hash', keys: ['id'] }`): a point lookup (`WHERE v.k = $x` / inline `{k: $x}`) or range then seeks instead of scanning, over any value type incl. temporals. Keys can be dotted for a nested field (`keys: ['meta.errorId']`). `kind: 'interval'` is an edge-only `[lo, hi)` containment/overlap index (lo inclusive, hi exclusive) for bitemporal/valid-time, reservations, or numeric ranges. `vertexIndexes()` / `dropVertexIndex(key)` round it out. (Host-API only — there is no GQL `CREATE INDEX`.)
 - `graph.prepare(text)` returns a `PreparedQuery` — parse/lower once, run many with different `params`. It has **no GC backstop**: release it with `free()` or a `using` binding.
 
 ## Loading and rebuilding from a source of truth

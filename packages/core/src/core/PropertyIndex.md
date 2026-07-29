@@ -9,15 +9,29 @@ per-key secondary index that turns those into an index seek.
 
 Indexes are **opt-in per key** — an ephemeral in-memory graph (especially in a
 browser tab) shouldn't pay heap for keys nobody filters on. Declare the ones you
-query:
+query with `createIndex({ on, kind, keys })`:
 
 ```ts
 graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] }); // backfills existing vertices, then stays current
 graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
 graph.createIndex({ on: 'edge', kind: 'hash', keys: ['weight'] });
 
-graph.vertexIndexes(); // ['name', 'age']
+graph.vertexIndexes(); // ['age', 'name']
 graph.dropVertexIndex('age');
+```
+
+`on` is `'vertex'` or `'edge'`; `keys` is the property name(s). **`kind: 'hash'`
+is what you want for almost everything** — it's an ordered map (a `BTreeMap` in
+the native engine; a bucket map + sorted distinct-value list here) that serves
+equality, `IN`, and range from one structure. The other kind, `'interval'`, is a
+specialized native-only index for `[lo, hi)` containment/overlap — see below.
+
+**Nested / dotted keys.** Index a field _inside_ a map/record property by naming
+the dotted path; the whole path is the key:
+
+```ts
+graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['meta.errorId'] });
+// WHERE e.meta.errorId = $x  then seeks the dotted index instead of scanning.
 ```
 
 Maintenance is automatic and synchronous: inserts, removes, and property writes
@@ -90,3 +104,27 @@ blocks in the index). For type-consistent data — the norm — results are
 identical to the scan. For a key that genuinely mixes numbers and numeric
 strings, declaring an index changes range results to the type-strict reading.
 Equality and `within` are always exact (`===`), so they're never affected.
+
+## Interval indexes (native engine)
+
+A hash index answers "value = / < / IN". It cannot answer, in one seek, "which
+rows' interval **contains** this point" or "**overlaps** this window" — that's a
+2-D predicate over a _pair_ of endpoints. When a row carries a half-open interval
+`[lo, hi)` (**lo inclusive, hi exclusive**) and you query it by containment or
+overlap, use an interval index instead — an RI-tree, native-only
+(`@lenke/native`; the pure-TS engine throws on `kind: 'interval'`):
+
+```ts
+g.createIndex({ on: 'edge', kind: 'interval', keys: ['vf', 'vt'] }); // valid-from, valid-to
+// as-of — which edges were valid at $v? (vf inclusive, vt exclusive):
+//   MATCH ()-[r:EMPLOYS]->() WHERE r.vf <= $v AND r.vt > $v RETURN r
+```
+
+Half-open means `hi` is the first instant **not** covered: `[10, 20)` contains
+`10`, excludes `20`. Model an open-ended ("still current") interval with a
+far-future sentinel for `hi`, never `null` — the stab needs both endpoints; a
+zero-width `[x, x)` contains nothing. Reach for it for **bitemporal / valid-time
+history** (two interval indexes — valid `[vf, vt)` + transaction `[tf, tt)` —
+cover a bitemporal as-of), **reservations/calendars** (overlap), or any **numeric
+range** (price bands, version ranges) — it isn't temporal-only. A row that stores
+a single instant, not a `[start, end)` pair, is a hash index, not an interval one.

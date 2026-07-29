@@ -464,6 +464,63 @@ Formats: \`ndjson\`, \`pg-json\`, \`pg-text\`, \`graphson\`, \`csv\`. For large 
 On a native graph the equivalents are \`g.serialize(format)\`, \`g.toNdjson()\`, and \`g.mergeNdjson(bytes)\` (bulk-append, like \`deserialize(bytes, 'ndjson', existing)\`).`,
 };
 
+const indexesGuide: Guide = {
+  id: 'indexes',
+  title: 'Indexes',
+  description: 'Adding property indexes, hash vs interval, nested keys, and when to use each.',
+  text: `# Indexes
+
+Matching on a property value — \`WHERE n.age > 30\`, \`{id: $x}\` — is a full scan unless the key is indexed. Indexes are **opt-in per key** (an in-memory graph shouldn't pay heap for keys nobody filters on) and kept current automatically on every write. There are two kinds; you want **hash** for almost everything.
+
+## Adding an index
+\`\`\`ts
+g.createIndex({ on: 'vertex', kind: 'hash', keys: ['email'] });   // a vertex property
+g.createIndex({ on: 'edge',   kind: 'hash', keys: ['weight'] });  // an edge property
+
+g.vertexIndexes();          // ['email']  (sorted)
+g.dropVertexIndex('email');
+\`\`\`
+\`on\` is \`'vertex'\` or \`'edge'\`; \`keys\` is the property name(s). The same call works on a native \`RustGraph\` and a core \`Graph\`. Declaring an index never changes results — only speed.
+
+## Nested / dotted keys
+Index a field **inside** a map/record property with a dotted path; the whole path is the key:
+\`\`\`ts
+g.createIndex({ on: 'vertex', kind: 'hash', keys: ['meta.errorId'] });
+\`\`\`
+\`\`\`
+MATCH (e:Event) WHERE e.meta.errorId = $x RETURN e.id   -- seeks the dotted index
+\`\`\`
+
+## Hash is the default — use it for almost everything
+A \`hash\` index is an **ordered map** (a B-tree in the native engine) keyed by the property value, so **one** index serves BOTH:
+- **equality / IN** — \`{id: $x}\`, \`WHERE k = $x\`, \`WHERE k IN [...]\` → a direct bucket hit.
+- **range** — \`WHERE k >= $lo AND k < $hi\`, \`BETWEEN\`, prefix \`startsWith\` → a sorted slice.
+
+This holds for numbers, strings, booleans **and temporals** (dates/datetimes sort in order), so **a single date column is a hash index**: both a point probe (\`WHERE at = $d\`) and a window (\`WHERE at >= $d1 AND at < $d2\`) seek it. Reach for hash unless you specifically have the interval shape below.
+
+## Interval indexes — for \`[lo, hi)\` containment / overlap (native engine only)
+When a row carries a **pair** of endpoints describing a half-open interval \`[lo, hi)\` — **lo inclusive, hi EXCLUSIVE** — and you ask "which rows' interval *contains* point v" (a stab) or "*overlaps* window [d1, d2)", that's a 2-D predicate a hash index can't do in one seek. An interval index (an RI-tree) does:
+\`\`\`ts
+g.createIndex({ on: 'edge', kind: 'interval', keys: ['vf', 'vt'] });   // valid-from, valid-to
+\`\`\`
+\`\`\`
+-- as-of: which employments were valid at instant $v?  (vf inclusive, vt exclusive)
+MATCH ()-[r:EMPLOYS]->() WHERE r.vf <= $v AND r.vt > $v RETURN r
+\`\`\`
+Half-open means \`hi\` is the first instant **not** covered: \`[10, 20)\` contains 10 and excludes 20. Model an **open-ended** ("still valid") interval with a far-future sentinel for \`hi\` (e.g. a max date), never \`null\` — the stab needs both endpoints. A zero-width \`[x, x)\` contains nothing.
+
+**Use interval (not hash) when:**
+- **Bitemporal / valid-time history** — "employees as of 2024-06-01", "the org chart as it was believed last quarter". Two interval indexes (valid \`[vf, vt)\` + transaction \`[tf, tt)\`) cover a bitemporal as-of; the engine seeds from whichever axis is more selective and filters the other.
+- **Reservations / calendars** — "bookings overlapping this night", "who was on-call at 03:14".
+- **Numeric ranges** (interval is not temporal-only) — price bands, version ranges \`[minVersion, maxVersion)\`, IP/port ranges: "which band contains 42".
+
+If a row stores a **single instant** (an event timestamp), not a \`[start, end)\` pair, that's a **hash** index — not interval.
+
+## Notes
+- **hash** works on both engines and both elements. **interval** is **edge-only** and **native-only** — the pure-TS \`@lenke/core\` throws on \`kind: 'interval'\`.
+- There is no GQL \`CREATE INDEX\` statement — index management is host-API only (ISO GQL, like SQL, leaves index DDL to the host). See the \`performance\` guide for anchoring traversals on an indexed key.`,
+};
+
 const performanceGuide: Guide = {
   id: 'performance',
   title: 'Performance & scale',
@@ -635,6 +692,7 @@ const GUIDES: readonly Guide[] = [
   transactionsGuide,
   typedNodesGuide,
   serializationGuide,
+  indexesGuide,
   performanceGuide,
   gotchasGuide,
 ];

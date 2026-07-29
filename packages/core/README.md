@@ -60,7 +60,7 @@ vertex.removeLabel(label);
 
 ## Property indexes
 
-Secondary indexes are opt-in per key — declare one with `createIndex({ on, kind, keys })` (e.g. `{ on: 'vertex', kind: 'hash', keys: ['age'] }`, backfilled from existing elements and kept current on every mutation), then query it:
+Secondary indexes are opt-in per key — declare one with `createIndex({ on, kind, keys })` (backfilled from existing elements and kept current on every mutation), then query it. Use **`kind: 'hash'`** for almost everything (`{ on: 'vertex', kind: 'hash', keys: ['age'] }`) — an ordered map that serves equality, `IN`, and range from one structure. A key can be **dotted** to index a nested field: `keys: ['meta.errorId']`. (The `'interval'` kind — an `[lo, hi)` containment/overlap index — is native-engine only; the pure-TS engine throws on it. See `@lenke/native`.)
 
 - `getVerticesByProperty(key, value)` / `getEdgesByProperty(key, value)` — equality, an O(1) bucket lookup.
 - `getVerticesByPropertyRange(key, bound)` / `getEdgesByPropertyRange(key, bound)` — range, where `bound` is a `RangeBound` (`{ gt?, gte?, lt?, lte? }`). Indexable values are `string | number | boolean | null`; ranges are clamped to the bound's value type.
