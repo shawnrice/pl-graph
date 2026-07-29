@@ -1335,6 +1335,10 @@ pub struct Graph {
     /// mutation methods. Absent key ⇒ no index (full scan).
     vidx: PropIndex,
     eidx: PropIndex,
+    /// Optional RI-tree interval index over an edge `[lo_key, hi_key)` temporal pair
+    /// (Contender B): an as-of `lo <= v AND hi > v` seeds from `tree.stab(v)` instead
+    /// of a scan or a materialize-and-intersect. Maintained incrementally on writes.
+    edge_interval_idx: Option<EdgeIntervalIdx>,
     /// UNIQUE constraints over vertex properties: label name → the sorted
     /// property keys that must be unique among live vertices carrying that label.
     /// Each constrained key is index-backed (declaring the constraint creates the
@@ -1482,6 +1486,7 @@ impl Clone for Graph {
             synth: self.synth,
             vidx: self.vidx.clone(),
             eidx: self.eidx.clone(),
+            edge_interval_idx: self.edge_interval_idx.clone(),
             v_unique: self.v_unique.clone(),
             v_required: self.v_required.clone(),
             v_type: self.v_type.clone(),
@@ -1597,6 +1602,14 @@ pub enum TxCommitError {
 
 /// A set of property indexes (key name → ordered value buckets).
 type PropIndex = HashMap<String, std::collections::BTreeMap<IdxKey, Vec<u32>>>;
+
+/// An RI-tree interval index over an edge `[lo_key, hi_key)` temporal pair.
+#[derive(Clone)]
+struct EdgeIntervalIdx {
+    lo_key: String,
+    hi_key: String,
+    tree: crate::interval_index::RiTree,
+}
 
 /// An index key/path split into its root property and the descent into a stored
 /// map: `"meta.city"` → `("meta", ["city"])`; a plain `"name"` → `("name", [])`.
@@ -1880,6 +1893,47 @@ impl Graph {
         );
         self.eidx.insert(key.to_string(), map);
     }
+
+    /// This edge's temporal property `key` as a monotonic `i128` (None if absent /
+    /// non-temporal / duration) — the RI-tree interval endpoint.
+    pub(crate) fn edge_interval_key(&self, ei: u32, key: &str) -> Option<i128> {
+        match self.edge_props.value(ei as usize, key, &self.strs) {
+            Value::Temporal(t) => t.index_key().map(|(_, k)| k),
+            _ => None,
+        }
+    }
+
+    /// Declare (and backfill) an RI-tree interval index over an edge `[lo_key, hi_key)`
+    /// temporal pair (Contender B). Maintained on `add_edge`. An edge missing either
+    /// endpoint (or non-temporal) is simply not registered — the query's `WHERE`
+    /// verifies membership regardless, so an unregistered edge is never a wrong answer,
+    /// only a missed seek acceleration.
+    pub fn create_edge_interval_index(&mut self, lo_key: &str, hi_key: &str) {
+        let mut tree = crate::interval_index::RiTree::new();
+        for ei in 0..self.e_src.len() as u32 {
+            if !self.e_live[ei as usize] {
+                continue;
+            }
+            if let (Some(lo), Some(hi)) = (
+                self.edge_interval_key(ei, lo_key),
+                self.edge_interval_key(ei, hi_key),
+            ) {
+                tree.insert(lo, hi, ei);
+            }
+        }
+        self.edge_interval_idx = Some(EdgeIntervalIdx {
+            lo_key: lo_key.to_string(),
+            hi_key: hi_key.to_string(),
+            tree,
+        });
+    }
+
+    /// Candidate edge ids whose `[lo, hi]` contains point `q`, via the RI-tree interval
+    /// index (None if no such index). A superset the caller's `WHERE` then verifies.
+    pub fn edge_interval_stab(&self, q: i128) -> Option<Vec<u32>> {
+        self.edge_interval_idx.as_ref().map(|idx| idx.tree.stab(q))
+    }
+
     /// Drop a vertex index. Rejected (`InvalidGraphOp`) if the key backs a unique
     /// constraint — dropping it would downgrade enforcement to a scan (or, on the
     /// TS twin, silently lose it); drop the constraint first. Idempotent otherwise.
@@ -4077,6 +4131,20 @@ impl Graph {
             nbr: from,
             etype: tid,
         });
+        // Capture the interval endpoints from `props` before it's consumed (the tree
+        // is updated after the write to avoid a borrow conflict).
+        let interval_ins: Option<(i128, i128)> = self.edge_interval_idx.as_ref().and_then(|idx| {
+            let get = |key: &str| {
+                props
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .and_then(|(_, v)| match v {
+                        Value::Temporal(t) => t.index_key().map(|(_, k)| k),
+                        _ => None,
+                    })
+            };
+            get(&idx.lo_key).zip(get(&idx.hi_key))
+        });
         self.edge_props.push_element();
         for (k, v) in props {
             if self.any_eidx_rooted_at(&k) {
@@ -4085,6 +4153,9 @@ impl Graph {
             self.touch(&k);
             self.edge_props
                 .set_value(ei as usize, &k, v, &mut self.strs);
+        }
+        if let (Some((lo, hi)), Some(idx)) = (interval_ins, self.edge_interval_idx.as_mut()) {
+            idx.tree.insert(lo, hi, ei);
         }
         // Topology change: drop the CSR snapshot, bump the global version and type.
         self.invalidate_csr();
@@ -5035,6 +5106,7 @@ impl Builder {
             synth: 0,
             vidx: HashMap::new(),
             eidx: HashMap::new(),
+            edge_interval_idx: None,
             v_unique: HashMap::new(),
             v_required: HashMap::new(),
             v_type: HashMap::new(),

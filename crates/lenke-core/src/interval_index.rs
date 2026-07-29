@@ -1,4 +1,4 @@
-#![allow(dead_code)] // wired into the store + planner in the next commits
+#![allow(dead_code)] // remove()/len() used by tests + productionization (delete-maintenance, planner wiring)
 //! Relational Interval Tree (RI-tree, Kriegel/Pötke/Seidl) — interval **stabbing**
 //! (which stored `[lo, hi]` intervals contain a query point `q`) answered on top of
 //! ordinary sorted maps, so it inherits incremental B-tree maintenance and never needs
@@ -48,7 +48,7 @@ fn fork(lo: u128, hi: u128) -> u128 {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct RiTree {
     lower: BTreeMap<(u128, u128), Vec<u32>>, // (fork, lo) -> ids
     upper: BTreeMap<(u128, u128), Vec<u32>>, // (fork, hi) -> ids
@@ -101,9 +101,10 @@ impl RiTree {
         loop {
             if q >= v {
                 // lo <= v <= q for anything registered here, so it contains q iff hi >= q.
-                for (&(f, _), ids) in
-                    self.upper.range((std::ops::Bound::Included((v, q)), std::ops::Bound::Included((v, u128::MAX))))
-                {
+                for (&(f, _), ids) in self.upper.range((
+                    std::ops::Bound::Included((v, q)),
+                    std::ops::Bound::Included((v, u128::MAX)),
+                )) {
                     debug_assert_eq!(f, v);
                     out.extend_from_slice(ids);
                 }
@@ -113,9 +114,10 @@ impl RiTree {
                 v += step;
             } else {
                 // hi >= v > q for anything registered here, so it contains q iff lo <= q.
-                for (&(f, _), ids) in
-                    self.lower.range((std::ops::Bound::Included((v, 0)), std::ops::Bound::Included((v, q))))
-                {
+                for (&(f, _), ids) in self.lower.range((
+                    std::ops::Bound::Included((v, 0)),
+                    std::ops::Bound::Included((v, q)),
+                )) {
                     debug_assert_eq!(f, v);
                     out.extend_from_slice(ids);
                 }
@@ -138,7 +140,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             self.0 >> 16
         }
         fn range(&mut self, lo: i64, hi: i64) -> i64 {
@@ -197,8 +202,11 @@ mod tests {
             let q = rng.range(-11_000, 11_000) as i128;
             let mut got = t.stab(q);
             got.sort_unstable();
-            let mut want: Vec<u32> =
-                live.iter().filter(|&&(lo, hi, _)| lo <= q && q <= hi).map(|&(_, _, id)| id).collect();
+            let mut want: Vec<u32> = live
+                .iter()
+                .filter(|&&(lo, hi, _)| lo <= q && q <= hi)
+                .map(|&(_, _, id)| id)
+                .collect();
             want.sort_unstable();
             assert_eq!(got, want, "post-remove stab({q}) mismatch");
         }

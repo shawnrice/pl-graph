@@ -8814,11 +8814,16 @@ fn bench_temporal_index() {
 
     // Build the org; if `indexed`, create the vf/vt edge indexes BEFORE inserting so
     // every add_edge maintains them — the write-interleaved cost. Returns (graph, write_ms).
-    let build = |indexed: bool| -> (Graph, f64) {
+    // mode: 0 = no index, 1 = A (vf+vt edge indexes), 2 = B (RI-tree interval index).
+    let build = |mode: u8| -> (Graph, f64) {
         let mut g = ndjson::decode("").unwrap();
-        if indexed {
-            g.create_edge_index("vf");
-            g.create_edge_index("vt");
+        match mode {
+            1 => {
+                g.create_edge_index("vf");
+                g.create_edge_index("vt");
+            }
+            2 => g.create_edge_interval_index("vf", "vt"),
+            _ => {}
         }
         let t0 = Instant::now();
         let vids: Vec<u32> = (0..N)
@@ -8854,18 +8859,18 @@ fn bench_temporal_index() {
         (g, t0.elapsed().as_secs_f64() * 1000.0)
     };
 
-    let (mut g_plain, w_plain) = build(false);
-    let (mut g_idx, w_idx) = build(true);
+    let (mut g_plain, w_plain) = build(0);
+    let (mut g_idx, w_idx) = build(1);
+    let (g_ri, w_ri) = build(2);
     eprintln!(
         "\nbitemporal org: {} emps / {} edge versions",
         g_plain.vertex_count(),
         g_plain.edge_count()
     );
     eprintln!(
-        "WRITE-INTERLEAVED build: no-index {:.0}ms | vf+vt index {:.0}ms | amplification {:.2}x",
-        w_plain,
-        w_idx,
-        w_idx / w_plain
+        "WRITE-INTERLEAVED build: no-index {w_plain:.0}ms | A vf+vt index {w_idx:.0}ms ({:.2}x) | B RI-tree {w_ri:.0}ms ({:.2}x)",
+        w_idx / w_plain,
+        w_ri / w_plain
     );
 
     let bench = |g: &mut Graph, name: &str, q: &str, params: &Params| -> f64 {
@@ -8927,9 +8932,47 @@ fn bench_temporal_index() {
         .iter()
         .map(|(n, q, p)| bench(&mut g_plain, n, q, p))
         .collect();
-    eprintln!("== vf+vt INDEX (M0 single-column) ==");
+    eprintln!("== A: vf+vt INDEX (most-selective seek) ==");
     for (i, (n, q, p)) in cases.iter().enumerate() {
         let idx = bench(&mut g_idx, n, q, p);
         eprintln!("      └─ {:.2}x vs scan", base[i] / idx);
     }
+
+    // Contender B — RI-tree stab (as-of only; stab is a point query). Seed from
+    // stab(v), verify vf<=v AND vt>v, count. Same seed→verify→count a planner-wired B
+    // would run; the executor wrapper is common overhead we exclude on both sides.
+    let bench_ri = |g: &Graph, name: &str, v: i32, base_ms: f64| {
+        let q = v as i128;
+        let count = || {
+            g.edge_interval_stab(q)
+                .unwrap()
+                .iter()
+                .filter(|&&ei| {
+                    g.edge_interval_key(ei, "vf").is_some_and(|lo| lo <= q)
+                        && g.edge_interval_key(ei, "vt").is_some_and(|hi| hi > q)
+                })
+                .count()
+        };
+        let matched = count();
+        let mut ms = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let t = Instant::now();
+            std::hint::black_box(count());
+            ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p50 = ms[ms.len() / 2];
+        eprintln!(
+            "  {name:<28} p50={p50:>8.3}ms  (matched={matched})  └─ {:.2}x vs scan",
+            base_ms / p50
+        );
+    };
+    eprintln!("== B: RI-tree interval index (as-of stab) ==");
+    bench_ri(
+        &g_ri,
+        "as-of now",
+        BASE + PERIOD * (VERSIONS as i32) - 10,
+        base[0],
+    );
+    bench_ri(&g_ri, "as-of historical", BASE + PERIOD * 3 + 20, base[1]);
 }
