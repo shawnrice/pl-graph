@@ -1,4 +1,3 @@
-#![allow(dead_code)] // remove()/len() used by tests + productionization (delete-maintenance, planner wiring)
 //! Relational Interval Tree (RI-tree, Kriegel/Pötke/Seidl) — interval **stabbing**
 //! (which stored `[lo, hi]` intervals contain a query point `q`) answered on top of
 //! ordinary sorted maps, so it inherits incremental B-tree maintenance and never needs
@@ -60,6 +59,7 @@ impl RiTree {
         Self::default()
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.len
     }

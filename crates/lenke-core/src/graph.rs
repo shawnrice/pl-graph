@@ -1903,6 +1903,54 @@ impl Graph {
         }
     }
 
+    /// True if `key` is an endpoint of the edge interval index — a write to it moves
+    /// the interval, so the RI-tree must be updated.
+    fn key_is_interval_endpoint(&self, key: &str) -> bool {
+        self.edge_interval_idx
+            .as_ref()
+            .is_some_and(|i| i.lo_key == key || i.hi_key == key)
+    }
+
+    /// Remove edge `ei`'s current `[lo, hi]` from the interval index (no-op if no index
+    /// or the edge lacks an endpoint). Endpoints are read *before* the caller mutates.
+    fn interval_idx_remove(&mut self, ei: u32) {
+        let Some((lo_key, hi_key)) = self
+            .edge_interval_idx
+            .as_ref()
+            .map(|i| (i.lo_key.clone(), i.hi_key.clone()))
+        else {
+            return;
+        };
+        if let (Some(lo), Some(hi)) = (
+            self.edge_interval_key(ei, &lo_key),
+            self.edge_interval_key(ei, &hi_key),
+        ) {
+            if let Some(idx) = self.edge_interval_idx.as_mut() {
+                idx.tree.remove(lo, hi, ei);
+            }
+        }
+    }
+
+    /// Insert edge `ei`'s current `[lo, hi]` into the interval index (no-op if no index
+    /// or the edge lacks an endpoint).
+    fn interval_idx_insert(&mut self, ei: u32) {
+        let Some((lo_key, hi_key)) = self
+            .edge_interval_idx
+            .as_ref()
+            .map(|i| (i.lo_key.clone(), i.hi_key.clone()))
+        else {
+            return;
+        };
+        if let (Some(lo), Some(hi)) = (
+            self.edge_interval_key(ei, &lo_key),
+            self.edge_interval_key(ei, &hi_key),
+        ) {
+            if let Some(idx) = self.edge_interval_idx.as_mut() {
+                idx.tree.insert(lo, hi, ei);
+            }
+        }
+    }
+
     /// Declare (and backfill) an RI-tree interval index over an edge `[lo_key, hi_key)`
     /// temporal pair (Contender B). Maintained on `add_edge`. An edge missing either
     /// endpoint (or non-temporal) is simply not registered — the query's `WHERE`
@@ -4023,6 +4071,7 @@ impl Graph {
                 idx_apply(&mut self.eidx, &key, ei, &val, true);
             }
         }
+        self.interval_idx_insert(ei);
         if let Some(arc) = eid {
             self.eid_fwd.insert(ei, arc.clone());
             self.eid_rev.insert(arc, ei);
@@ -4254,6 +4303,12 @@ impl Graph {
             };
             self.record_undo(Undo::EProp(ei, key.to_string(), prior));
         }
+        // The interval index keys on both endpoints, so a write to either moves the
+        // whole interval: drop the old [lo,hi] before the write, re-insert after.
+        let touch_interval = self.key_is_interval_endpoint(key);
+        if touch_interval {
+            self.interval_idx_remove(ei);
+        }
         if self.any_eidx_rooted_at(key) {
             let old = self.edge_props.value(ei as usize, key, &self.strs);
             idx_apply(&mut self.eidx, key, ei, &old, false);
@@ -4263,6 +4318,9 @@ impl Graph {
         if self.any_eidx_rooted_at(key) {
             let new = self.edge_props.value(ei as usize, key, &self.strs);
             idx_apply(&mut self.eidx, key, ei, &new, true);
+        }
+        if touch_interval {
+            self.interval_idx_insert(ei);
         }
         self.bump();
         self.touch(key);
@@ -4275,6 +4333,11 @@ impl Graph {
                 None
             };
             self.record_undo(Undo::EProp(ei, key.to_string(), prior));
+        }
+        // Removing an endpoint makes the interval incomplete — drop it from the index
+        // (read while both endpoints are still present).
+        if self.key_is_interval_endpoint(key) {
+            self.interval_idx_remove(ei);
         }
         if self.any_eidx_rooted_at(key) {
             let old = self.edge_props.value(ei as usize, key, &self.strs);
@@ -4375,6 +4438,7 @@ impl Graph {
                 idx_apply(&mut self.eidx, &key, ei, &val, false);
             }
         }
+        self.interval_idx_remove(ei);
         // Invalidate the edge's type and every property key it carried.
         let mut touched: Vec<String> = vec![self.etype.text(self.e_type[i]).to_string()];
         for kid in 0..self.edge_props.cols.len() as u32 {

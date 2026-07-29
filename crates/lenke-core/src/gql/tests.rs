@@ -8997,3 +8997,60 @@ fn bitemporal_per_rep_where_filters_variable_length_traversal() {
         vec![vec![s("v0")], vec![s("v1")], vec![s("v2")], vec![s("v3")]],
     );
 }
+
+/// The RI-tree interval index must stay correct under mutation. The dangerous case is
+/// a SET that EXTENDS an interval to newly cover the query point — without remove+insert
+/// maintenance the stab would MISS the row (a wrong answer, not just a stale extra).
+/// Also covers SET-shrink and DELETE.
+#[test]
+fn interval_index_maintained_under_set_and_delete() {
+    let edge = |id: &str, from: &str, to: &str, vf: &str, vt: &str| {
+        format!(
+            r#"{{"type":"edge","id":"{id}","from":"{from}","to":"{to}","labels":["R"],"properties":{{"id":"{id}","vf":{{"@date":"{vf}"}},"vt":{{"@date":"{vt}"}}}}}}"#
+        )
+    };
+    let lines = [
+        r#"{"type":"node","id":"v0","labels":["N"],"properties":{"id":"v0"}}"#.to_string(),
+        r#"{"type":"node","id":"v1","labels":["N"],"properties":{"id":"v1"}}"#.to_string(),
+        r#"{"type":"node","id":"v2","labels":["N"],"properties":{"id":"v2"}}"#.to_string(),
+        edge("e0", "v1", "v0", "2020-01-01", "2022-01-01"), // expired at 2024
+        edge("e1", "v2", "v1", "2020-01-01", "9999-12-31"), // current
+    ];
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let mut g = graph_of(&refs);
+    g.create_edge_interval_index("vf", "vt");
+
+    let asof =
+        "MATCH ()-[r:R]->() WHERE r.vf <= DATE '2024-01-01' AND r.vt > DATE '2024-01-01' RETURN count(*) AS n";
+    let count = |g: &mut Graph| -> i64 {
+        match rows(g, asof)[0][0] {
+            Value::Num(n) => n as i64,
+            _ => -1,
+        }
+    };
+
+    assert_eq!(count(&mut g), 1, "only e1 is valid at 2024");
+    // SET-extend e0 past 2024 — without remove+insert this MISSES the row.
+    rows(
+        &mut g,
+        "MATCH ()-[r:R {id:'e0'}]->() SET r.vt = DATE '2026-01-01'",
+    );
+    assert_eq!(
+        count(&mut g),
+        2,
+        "extended e0 must now appear (SET maintenance / no miss)"
+    );
+    // SET-shrink e0 back before 2024.
+    rows(
+        &mut g,
+        "MATCH ()-[r:R {id:'e0'}]->() SET r.vt = DATE '2021-01-01'",
+    );
+    assert_eq!(count(&mut g), 1, "re-expired e0 must drop out");
+    // DELETE e1 — the only remaining valid edge.
+    rows(&mut g, "MATCH ()-[r:R {id:'e1'}]->() DELETE r");
+    assert_eq!(
+        count(&mut g),
+        0,
+        "deleted e1 must not be returned (delete maintenance)"
+    );
+}
