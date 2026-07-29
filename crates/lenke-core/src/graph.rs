@@ -1720,6 +1720,10 @@ pub enum IdxKey {
     Bool(bool),
     Num(f64),
     Str(Arc<str>),
+    /// Temporal as `(kind_rank, monotonic_key)` — see [`Temporal::index_key`]. The
+    /// kind rank keeps Date/Time/DateTime/Zoned* in disjoint ranges (their `i128`
+    /// keys aren't cross-kind comparable); Duration is excluded (no monotonic key).
+    Temporal(u8, i128),
 }
 
 impl IdxKey {
@@ -1728,14 +1732,16 @@ impl IdxKey {
             Self::Bool(_) => 0,
             Self::Num(_) => 1,
             Self::Str(_) => 2,
+            Self::Temporal(..) => 3,
         }
     }
-    /// Build from a core [`Value`] (absent / list → not indexable).
+    /// Build from a core [`Value`] (absent / list / duration → not indexable).
     fn from_value(v: &Value) -> Option<Self> {
         match v {
             Value::Bool(b) => Some(Self::Bool(*b)),
             Value::Num(n) => Some(Self::Num(*n)),
             Value::Str(s) => Some(Self::Str(s.clone())),
+            Value::Temporal(t) => t.index_key().map(|(k, key)| Self::Temporal(k, key)),
             _ => None,
         }
     }
@@ -1758,6 +1764,8 @@ impl Ord for IdxKey {
             (Self::Bool(a), Self::Bool(b)) => a.cmp(b),
             (Self::Num(a), Self::Num(b)) => a.total_cmp(b),
             (Self::Str(a), Self::Str(b)) => a.as_ref().cmp(b.as_ref()),
+            // Within temporals: kind rank first, then the monotonic key.
+            (Self::Temporal(ka, va), Self::Temporal(kb, vb)) => ka.cmp(kb).then(va.cmp(vb)),
             _ => self.rank().cmp(&other.rank()),
         }
     }
@@ -7027,6 +7035,127 @@ mod record_debox {
         assert_eq!(
             g.edge_props.value(0, "meta", &g.strs),
             vmap(&[("w", n(0.5))])
+        );
+    }
+}
+
+#[cfg(test)]
+mod temporal_index_key_tests {
+    use super::*;
+    use crate::temporal as t;
+
+    /// The scalar `Temporal::index_key` i128 MUST equal the column's
+    /// `monotonic_key` bit-for-bit — otherwise a key built from a query literal
+    /// won't match a key built from a stored column and the index silently returns
+    /// wrong rows. Guards against the two encodings drifting apart.
+    #[test]
+    fn temporal_index_key_matches_column() {
+        let cases: Vec<(TemporalKind, Vec<Temporal>)> = vec![
+            (
+                TemporalKind::Date,
+                vec![
+                    Temporal::Date(t::Date { days: -1000 }),
+                    Temporal::Date(t::Date { days: 0 }),
+                    Temporal::Date(t::Date { days: 19_723 }),
+                ],
+            ),
+            (
+                TemporalKind::DateTime,
+                vec![
+                    Temporal::DateTime(t::DateTime { secs: -5, nanos: 0 }),
+                    Temporal::DateTime(t::DateTime {
+                        secs: 1_700_000_000,
+                        nanos: 123,
+                    }),
+                ],
+            ),
+            (
+                TemporalKind::ZonedDateTime,
+                vec![
+                    Temporal::ZonedDateTime(t::ZonedDateTime {
+                        secs: 1_700_000_000,
+                        nanos: 5,
+                        offset: -120,
+                    }),
+                    Temporal::ZonedDateTime(t::ZonedDateTime {
+                        secs: 1_700_000_000,
+                        nanos: 5,
+                        offset: 300,
+                    }),
+                ],
+            ),
+            (
+                TemporalKind::Time,
+                vec![Temporal::Time(t::Time {
+                    secs: 3600,
+                    nanos: 42,
+                })],
+            ),
+            (
+                TemporalKind::ZonedTime,
+                vec![Temporal::ZonedTime(t::ZonedTime {
+                    secs: 3600,
+                    nanos: 42,
+                    offset: 60,
+                })],
+            ),
+        ];
+        for (kind, vals) in cases {
+            let mut col = TemporalCol::with_len(kind, vals.len());
+            for (i, v) in vals.iter().enumerate() {
+                assert!(col.set(i, v), "{kind:?} slot {i}: set kind mismatch");
+            }
+            for (i, v) in vals.iter().enumerate() {
+                let col_key = col.monotonic_key(i).expect("indexable kind has a key");
+                assert_eq!(
+                    col.get(i).index_key().unwrap().1,
+                    col_key,
+                    "{kind:?} slot {i}: get→scalar drift"
+                );
+                assert_eq!(
+                    v.index_key().unwrap().1,
+                    col_key,
+                    "{kind:?} slot {i}: scalar drift"
+                );
+            }
+        }
+        // Duration has no monotonic key on either side.
+        assert!(Temporal::Duration(t::Duration {
+            months: 1,
+            days: 2,
+            secs: 3,
+            nanos: 4
+        })
+        .index_key()
+        .is_none());
+    }
+
+    /// Within a kind the key is monotonic with the value's own order; across kinds
+    /// the kind rank keeps them disjoint so a range seek never interleaves them.
+    #[test]
+    fn temporal_index_key_is_monotonic_and_kind_disjoint() {
+        let dates: Vec<Temporal> = (0..40)
+            .map(|k| Temporal::Date(t::Date { days: k * 9 - 137 }))
+            .collect();
+        for w in dates.windows(2) {
+            assert!(
+                w[0].index_key().unwrap() < w[1].index_key().unwrap(),
+                "date order broke"
+            );
+        }
+        // A max Date still ranks below a min DateTime (disjoint kind ranges).
+        let big_date = Temporal::Date(t::Date { days: i32::MAX })
+            .index_key()
+            .unwrap();
+        let small_dt = Temporal::DateTime(t::DateTime {
+            secs: i64::MIN,
+            nanos: 0,
+        })
+        .index_key()
+        .unwrap();
+        assert!(
+            big_date < small_dt,
+            "kind ranks must keep Date below DateTime"
         );
     }
 }

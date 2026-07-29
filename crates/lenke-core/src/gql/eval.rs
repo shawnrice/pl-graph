@@ -7053,9 +7053,10 @@ fn lit_to_idxkey(lit: &Lit) -> Option<crate::graph::IdxKey> {
         Lit::Str(s) => Some(IdxKey::Str(s.as_str().into())),
         Lit::Num(n) => Some(IdxKey::Num(*n)),
         Lit::Bool(b) => Some(IdxKey::Bool(*b)),
-        // Temporals aren't index-key-able yet (no temporal range index) — a
-        // temporal comparison falls back to a scan.
-        Lit::Null | Lit::Temporal(_) => None,
+        // Temporals key via the same monotonic encoding as the stored column, so a
+        // `WHERE r.vf <= DATE '…'` seeks (Duration → None, still a scan).
+        Lit::Temporal(t) => t.index_key().map(|(k, key)| IdxKey::Temporal(k, key)),
+        Lit::Null => None,
     }
 }
 
@@ -7066,6 +7067,7 @@ fn val_to_idxkey(v: &Val) -> Option<crate::graph::IdxKey> {
         Val::Str(s) => Some(IdxKey::Str(s.as_ref().into())),
         Val::Num(n) => Some(IdxKey::Num(*n)),
         Val::Bool(b) => Some(IdxKey::Bool(*b)),
+        Val::Temporal(t) => t.index_key().map(|(k, key)| IdxKey::Temporal(k, key)),
         _ => None,
     }
 }

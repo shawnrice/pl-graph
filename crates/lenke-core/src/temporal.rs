@@ -122,6 +122,36 @@ impl Temporal {
             Self::Duration(_) => TemporalKind::Duration,
         }
     }
+
+    /// Total-ordered secondary-index key as `(kind_rank, i128)`. The `i128` mirrors
+    /// [`TemporalCol::monotonic_key`](crate::graph::TemporalCol::monotonic_key) **bit
+    /// for bit** (guarded by `temporal_index_key_matches_column`), so a value built
+    /// from a stored column and one built from a query literal/param compare equal.
+    /// The leading `kind_rank` keeps distinct temporal kinds in disjoint key ranges
+    /// (the `i128` is only comparable *within* a kind — Date days vs DateTime
+    /// secs<<32 don't share a scale), so a range seek never bleeds Date into DateTime.
+    /// `None` for `Duration` — same exclusion as the column (no monotonic key).
+    pub(crate) fn index_key(&self) -> Option<(u8, i128)> {
+        const OFF_BIAS: i128 = 32_768; // offset (whole minutes, i16) → non-negative 0..=65535
+        Some(match self {
+            Self::Date(d) => (0, d.days as i128),
+            Self::Time(t) => (1, ((t.secs as i128) << 32) | (t.nanos as i128)),
+            Self::DateTime(dt) => (2, ((dt.secs as i128) << 32) | (dt.nanos as i128)),
+            Self::ZonedTime(z) => (
+                3,
+                ((z.secs as i128) << 48)
+                    | ((z.nanos as i128) << 16)
+                    | ((z.offset as i128) + OFF_BIAS),
+            ),
+            Self::ZonedDateTime(z) => (
+                4,
+                ((z.secs as i128) << 48)
+                    | ((z.nanos as i128) << 16)
+                    | ((z.offset as i128) + OFF_BIAS),
+            ),
+            Self::Duration(_) => return None,
+        })
+    }
 }
 
 const SECS_PER_DAY: i64 = 86_400;
