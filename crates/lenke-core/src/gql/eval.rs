@@ -7216,28 +7216,52 @@ fn prop_index_hint(
             idx_range(graph, &path, &rb, edge)
         }
         CExpr::And(items) => {
-            // Coalesce any pair of same-var/same-key comparisons into one tight
-            // range seek (e.g. `x >= a AND … AND x <= b`).
-            for (i, first) in items.iter().enumerate() {
-                let Some((s1, k1, o1, key1)) = cmp_bound(first, ctx) else {
+            // Group every indexed single-column comparison by (var slot, key ref) and
+            // fold all comparisons on that key into one tight `RangeBound`; then SEEK
+            // each group and INTERSECT the candidate sets across groups, driven from
+            // the smallest. A conjunction ANDs necessary conditions, so the true
+            // matches lie in every group's seek — the intersection is a correct
+            // candidate superset (the final WHERE re-verifies, so extra rows are
+            // dropped and none are missed). One group reproduces the old same-key
+            // band seek (`x>=a AND x<=b`); two groups make an interval-containment
+            // as-of (`vf<=v AND vt>v`) a real seek instead of only the first column;
+            // four groups do the bitemporal 4-way.
+            let mut groups: std::collections::HashMap<(usize, usize), RangeBound> =
+                std::collections::HashMap::new();
+            for it in items {
+                let Some((s, kref, op, key)) = cmp_bound(it, ctx) else {
                     continue;
                 };
-                for second in &items[i + 1..] {
-                    if let Some((s2, k2, o2, key2)) = cmp_bound(second, ctx) {
-                        if s1 == s2 && k1 == k2 && slot_ok(s1) {
-                            if let Some(name) = prop_name(graph, ctx, k1, edge) {
-                                if idx_indexed(graph, name, edge) {
-                                    let mut rb = RangeBound::default();
-                                    apply_bound(&mut rb, o1, key1.clone());
-                                    apply_bound(&mut rb, o2, key2);
-                                    return idx_range(graph, name, &rb, edge);
-                                }
-                            }
-                        }
+                if !slot_ok(s) || matches!(op, CompareOp::Ne) {
+                    continue;
+                }
+                match prop_name(graph, ctx, kref, edge) {
+                    Some(name) if idx_indexed(graph, name, edge) => {
+                        apply_bound(groups.entry((s, kref)).or_default(), op, key);
                     }
+                    _ => {}
                 }
             }
-            // Else the first usable single conjunct.
+            // Return the MOST SELECTIVE single group's seek (smallest candidate set);
+            // the final WHERE verifies the remaining conjuncts. Blind intersection of
+            // the groups was measured to TANK on a low-selectivity conjunct — building
+            // and probing two ~200k halves costs more than the scan it replaces — so
+            // pick the best column instead of AND-ing them. (Getting the small "active
+            // at v" set *without* materializing the huge halves is exactly the RI-tree's
+            // job; this is the non-structure baseline it must beat.) The old code
+            // picked the *first* usable conjunct, which is why an as-of seeded on the
+            // non-selective `vf`; choosing by result size fixes that.
+            if let Some(best) = groups
+                .iter()
+                .filter_map(|((_, kref), rb)| {
+                    idx_range(graph, prop_name(graph, ctx, *kref, edge)?, rb, edge)
+                })
+                .min_by_key(Vec::len)
+            {
+                return Some(best);
+            }
+            // No indexed conjunct grouped (e.g. only dotted paths) — try the first
+            // usable single conjunct via the recursive single-Compare path.
             items
                 .iter()
                 .find_map(|it| prop_index_hint(graph, ctx, it, want_slot, edge))
