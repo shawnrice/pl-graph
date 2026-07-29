@@ -8861,7 +8861,7 @@ fn bench_temporal_index() {
 
     let (mut g_plain, w_plain) = build(0);
     let (mut g_idx, w_idx) = build(1);
-    let (g_ri, w_ri) = build(2);
+    let (mut g_ri, w_ri) = build(2);
     eprintln!(
         "\nbitemporal org: {} emps / {} edge versions",
         g_plain.vertex_count(),
@@ -8938,41 +8938,12 @@ fn bench_temporal_index() {
         eprintln!("      └─ {:.2}x vs scan", base[i] / idx);
     }
 
-    // Contender B — RI-tree stab (as-of only; stab is a point query). Seed from
-    // stab(v), verify vf<=v AND vt>v, count. Same seed→verify→count a planner-wired B
-    // would run; the executor wrapper is common overhead we exclude on both sides.
-    let bench_ri = |g: &Graph, name: &str, v: i32, base_ms: f64| {
-        let q = v as i128;
-        let count = || {
-            g.edge_interval_stab(q)
-                .unwrap()
-                .iter()
-                .filter(|&&ei| {
-                    g.edge_interval_key(ei, "vf").is_some_and(|lo| lo <= q)
-                        && g.edge_interval_key(ei, "vt").is_some_and(|hi| hi > q)
-                })
-                .count()
-        };
-        let matched = count();
-        let mut ms = Vec::with_capacity(20);
-        for _ in 0..20 {
-            let t = Instant::now();
-            std::hint::black_box(count());
-            ms.push(t.elapsed().as_secs_f64() * 1000.0);
-        }
-        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let p50 = ms[ms.len() / 2];
-        eprintln!(
-            "  {name:<28} p50={p50:>8.3}ms  (matched={matched})  └─ {:.2}x vs scan",
-            base_ms / p50
-        );
-    };
-    eprintln!("== B: RI-tree interval index (as-of stab) ==");
-    bench_ri(
-        &g_ri,
-        "as-of now",
-        BASE + PERIOD * (VERSIONS as i32) - 10,
-        base[0],
-    );
-    bench_ri(&g_ri, "as-of historical", BASE + PERIOD * 3 + 20, base[1]);
+    // Contender B — now LIVE through the query path: prop_index_hint recognizes the
+    // as-of predicate and seeds from the RI-tree stab. Run the same GQL query the other
+    // configs run; `matched` proves correctness (== the scan's 25000).
+    eprintln!("== B: RI-tree interval index (as-of, via GQL query path) ==");
+    let b_now = bench(&mut g_ri, "as-of now", asof, &p_now);
+    eprintln!("      └─ {:.2}x vs scan", base[0] / b_now);
+    let b_hist = bench(&mut g_ri, "as-of historical", asof, &p_hist);
+    eprintln!("      └─ {:.2}x vs scan", base[1] / b_hist);
 }

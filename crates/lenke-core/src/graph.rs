@@ -1934,6 +1934,14 @@ impl Graph {
         self.edge_interval_idx.as_ref().map(|idx| idx.tree.stab(q))
     }
 
+    /// The `(lo_key, hi_key)` an edge interval index covers, if one exists — for the
+    /// seed selector to recognize a matching as-of predicate.
+    pub(crate) fn edge_interval_index_keys(&self) -> Option<(&str, &str)> {
+        self.edge_interval_idx
+            .as_ref()
+            .map(|idx| (idx.lo_key.as_str(), idx.hi_key.as_str()))
+    }
+
     /// Drop a vertex index. Rejected (`InvalidGraphOp`) if the key backs a unique
     /// constraint — dropping it would downgrade enforcement to a scan (or, on the
     /// TS twin, silently lose it); drop the constraint first. Idempotent otherwise.

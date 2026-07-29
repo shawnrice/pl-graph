@@ -7216,6 +7216,42 @@ fn prop_index_hint(
             idx_range(graph, &path, &rb, edge)
         }
         CExpr::And(items) => {
+            // Contender B: an as-of over an edge RI-tree interval index (`lo_key <= $v
+            // AND hi_key > $v`, same var, same probe) seeds from `stab($v)` — the small
+            // "active at v" set directly — instead of the BTreeMap seeks A would pick.
+            // Same recognizer style, different seek; falls through to A when no interval
+            // index covers the pair. The stab is inclusive of `hi == v`, a superset the
+            // final `WHERE hi > v` then verifies.
+            if edge {
+                if let Some((lo_key, hi_key)) = graph.edge_interval_index_keys() {
+                    let probe = |name: &str, want_lo: bool| -> Option<(usize, i128)> {
+                        items.iter().find_map(|it| {
+                            let (s, kref, op, key) = cmp_bound(it, ctx)?;
+                            let ok = if want_lo {
+                                matches!(op, CompareOp::Le | CompareOp::Lt)
+                            } else {
+                                matches!(op, CompareOp::Gt | CompareOp::Ge)
+                            };
+                            if !ok || !slot_ok(s) || prop_name(graph, ctx, kref, true)? != name {
+                                return None;
+                            }
+                            match key {
+                                crate::graph::IdxKey::Temporal(_, q) => Some((s, q)),
+                                _ => None,
+                            }
+                        })
+                    };
+                    if let (Some((slo, qlo)), Some((shi, qhi))) =
+                        (probe(lo_key, true), probe(hi_key, false))
+                    {
+                        if slo == shi && qlo == qhi {
+                            if let Some(cand) = graph.edge_interval_stab(qlo) {
+                                return Some(cand);
+                            }
+                        }
+                    }
+                }
+            }
             // Group every indexed single-column comparison by (var slot, key ref) and
             // fold all comparisons on that key into one tight `RangeBound`; then SEEK
             // each group and INTERSECT the candidate sets across groups, driven from
