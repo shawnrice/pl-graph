@@ -17,7 +17,7 @@ const ids = (vs: Iterable<{ id: string }>): string[] => Array.from(vs, (v) => v.
 describe('PropertyIndex equality', () => {
   test('createIndex backfills existing vertices', () => {
     const graph = personGraph();
-    graph.createVertexIndex('age');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
     expect(ids(graph.getVerticesByProperty('age', 29))).toEqual(['a']);
     expect(ids(graph.getVerticesByProperty('age', 27))).toEqual(['b']);
   });
@@ -30,14 +30,14 @@ describe('PropertyIndex equality', () => {
 
   test('insert after index keeps it current', () => {
     const graph = personGraph();
-    graph.createVertexIndex('age');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
     graph.addVertex({ id: 'e', labels: ['Person'], properties: { age: 29 } });
     expect(ids(graph.getVerticesByProperty('age', 29))).toEqual(['a', 'e']);
   });
 
   test('type-tagged values do not collide', () => {
     const graph = new Graph();
-    graph.createVertexIndex('v');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['v'] });
     graph.addVertex({ id: 'num', labels: [], properties: { v: 1 } });
     graph.addVertex({ id: 'str', labels: [], properties: { v: '1' } });
     graph.addVertex({ id: 'bool', labels: [], properties: { v: true } });
@@ -48,7 +48,7 @@ describe('PropertyIndex equality', () => {
 
   test('setProperty moves a vertex between buckets', () => {
     const graph = personGraph();
-    graph.createVertexIndex('age');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
     graph.getVertexById('a')!.setProperty('age', 27);
     expect(ids(graph.getVerticesByProperty('age', 29))).toEqual([]);
     expect(ids(graph.getVerticesByProperty('age', 27))).toEqual(['a', 'b']);
@@ -56,22 +56,22 @@ describe('PropertyIndex equality', () => {
 
   test('removeProperty de-indexes the value', () => {
     const graph = personGraph();
-    graph.createVertexIndex('age');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
     graph.getVertexById('a')!.removeProperty('age');
     expect(ids(graph.getVerticesByProperty('age', 29))).toEqual([]);
   });
 
   test('removeVertex de-indexes its properties', () => {
     const graph = personGraph();
-    graph.createVertexIndex('age');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
     graph.removeVertex('c');
     expect(ids(graph.getVerticesByProperty('age', 32))).toEqual([]);
   });
 
   test('setProperties maintains every changed key', () => {
     const graph = personGraph();
-    graph.createVertexIndex('age');
-    graph.createVertexIndex('name');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     graph.getVertexById('a')!.setProperties({ age: 40, name: 'marco' });
     expect(ids(graph.getVerticesByProperty('age', 40))).toEqual(['a']);
     expect(ids(graph.getVerticesByProperty('name', 'marco'))).toEqual(['a']);
@@ -82,7 +82,7 @@ describe('PropertyIndex equality', () => {
     // Events are observation-only: a listener reacts (here, just watches) but
     // cannot veto, so the write commits and the index reflects it.
     const graph = personGraph();
-    graph.createVertexIndex('age');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
     let seen = 0;
     graph.on('@graph/VertexPropertyChanged', () => {
       seen += 1;
@@ -97,14 +97,14 @@ describe('PropertyIndex equality', () => {
 describe('PropertyIndex range', () => {
   test('open lower bound stays within the numeric type', () => {
     const graph = personGraph();
-    graph.createVertexIndex('age');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
     expect(ids(graph.getVerticesByPropertyRange('age', { gt: 30 }))).toEqual(['c', 'd']);
     expect(ids(graph.getVerticesByPropertyRange('age', { gte: 32 }))).toEqual(['c', 'd']);
   });
 
   test('closed range is inclusive on both ends', () => {
     const graph = personGraph();
-    graph.createVertexIndex('age');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
     expect(ids(graph.getVerticesByPropertyRange('age', { gte: 27, lte: 32 }))).toEqual([
       'a',
       'b',
@@ -115,7 +115,7 @@ describe('PropertyIndex range', () => {
 
   test('a numeric bound never bleeds into string values', () => {
     const graph = new Graph();
-    graph.createVertexIndex('v');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['v'] });
     graph.addVertex({ id: 'n', labels: [], properties: { v: 5 } });
     graph.addVertex({ id: 's', labels: [], properties: { v: 'zzz' } });
     expect(ids(graph.getVerticesByPropertyRange('v', { gt: 0 }))).toEqual(['n']);
@@ -123,7 +123,7 @@ describe('PropertyIndex range', () => {
 
   test('range reflects mutations', () => {
     const graph = personGraph();
-    graph.createVertexIndex('age');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
     graph.getVertexById('b')!.setProperty('age', 50);
     expect(ids(graph.getVerticesByPropertyRange('age', { gt: 30 }))).toEqual(['b', 'c', 'd']);
   });
@@ -131,7 +131,7 @@ describe('PropertyIndex range', () => {
   test('countEquals / countRange match the set sizes without building them', () => {
     const graph = personGraph();
     const index = graph.vertexPropertyIndex;
-    graph.createVertexIndex('age');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
     // countEquals: undefined for unindexed key, a count for an indexed one.
     expect(index.countEquals('name', 'marko')).toBeUndefined();
     expect(index.countEquals('age', 29)).toBe(1);
@@ -144,7 +144,7 @@ describe('PropertyIndex range', () => {
 
   test('the ordered view is maintained after it is lazily built', () => {
     const graph = new Graph();
-    graph.createVertexIndex('age');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
     graph.addVertex({ id: 'a', labels: [], properties: { age: 10 } });
     graph.addVertex({ id: 'b', labels: [], properties: { age: 30 } });
     // First range query materializes the ordered view from the buckets.
@@ -161,7 +161,7 @@ describe('PropertyIndex range', () => {
     // > 64^2 distinct values forces internal splits and a 3-level tree.
     const COUNT = 5000;
     const graph = new Graph();
-    graph.createVertexIndex('k');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['k'] });
     const present = new Set<number>();
     let seed = 12345;
     const rnd = (n: number): number => {
@@ -226,7 +226,7 @@ describe('PropertyIndex range', () => {
 
   test('a mixed-type column rebuilds with the full comparator', () => {
     const graph = new Graph();
-    graph.createVertexIndex('v');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['v'] });
     graph.addVertex({ id: 'n1', labels: [], properties: { v: 10 } });
     graph.addVertex({ id: 'n2', labels: [], properties: { v: 20 } });
     // First range query builds a numeric (monomorphic) ordered view.
@@ -241,7 +241,7 @@ describe('PropertyIndex range', () => {
 
   test('the ordered structure stays correct across heavy insert/delete churn', () => {
     const graph = new Graph();
-    graph.createVertexIndex('k');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['k'] });
     // Insert 500 distinct values in shuffled order.
     const order = Array.from({ length: 500 }, (_, i) => i);
 
@@ -273,7 +273,7 @@ describe('PropertyIndex range', () => {
 describe('PropertyIndex snapshots and edges', () => {
   test('clone does not alias the source buckets', () => {
     const graph = personGraph();
-    graph.createVertexIndex('age');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
     const snapshot = graph.clone();
 
     // Mutating the original must not change the snapshot's view.
@@ -286,7 +286,7 @@ describe('PropertyIndex snapshots and edges', () => {
     const graph = new Graph();
     const a = graph.addVertex({ id: 'a', labels: ['P'], properties: {} });
     const b = graph.addVertex({ id: 'b', labels: ['P'], properties: {} });
-    graph.createEdgeIndex('weight');
+    graph.createIndex({ on: 'edge', kind: 'hash', keys: ['weight'] });
     graph.addEdge({ id: 'e1', from: a, to: b, labels: ['knows'], properties: { weight: 5 } });
     graph.addEdge({ id: 'e2', from: a, to: b, labels: ['knows'], properties: { weight: 9 } });
     expect(Array.from(graph.getEdgesByProperty('weight', 5), (e) => e.id)).toEqual(['e1']);
@@ -297,9 +297,9 @@ describe('PropertyIndex snapshots and edges', () => {
 
   test('vertexIndexes / edgeIndexes report declared keys', () => {
     const graph = personGraph();
-    graph.createVertexIndex('name');
-    graph.createVertexIndex('age');
-    graph.createEdgeIndex('weight');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
+    graph.createIndex({ on: 'edge', kind: 'hash', keys: ['weight'] });
     expect(graph.vertexIndexes().sort()).toEqual(['age', 'name']);
     expect(graph.edgeIndexes()).toEqual(['weight']);
     graph.dropVertexIndex('age');
@@ -308,7 +308,7 @@ describe('PropertyIndex snapshots and edges', () => {
 
   test('truncate empties buckets but keeps declarations', () => {
     const graph = personGraph();
-    graph.createVertexIndex('age');
+    graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
     graph.truncate();
     expect(graph.vertexPropertyIndex.isIndexed('age')).toBe(true);
     graph.addVertex({ id: 'z', labels: [], properties: { age: 29 } });

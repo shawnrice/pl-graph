@@ -476,7 +476,7 @@ The single biggest lever: seed a traversal from a specific vertex with an **inli
 \`\`\`
 MATCH (a:Acct {id: $id})-[:SENT]->{1,4}(b) RETURN b       -- seeks the index, then walks
 \`\`\`
-Writing \`MATCH (a:Acct)-[:SENT]->{1,4}(b) WHERE a.id = $id\` instead scans every \`Acct\` and expands before filtering — orders of magnitude slower on a large graph. Create the index first: \`g.createVertexIndex('id')\` (native \`RustGraph\`) or the same method on a core \`Graph\`. An indexed point lookup is dramatically faster than a scan.
+Writing \`MATCH (a:Acct)-[:SENT]->{1,4}(b) WHERE a.id = $id\` instead scans every \`Acct\` and expands before filtering — orders of magnitude slower on a large graph. Create the index first: \`g.createIndex({ on: 'vertex', kind: 'hash', keys: ['id'] })\` (native \`RustGraph\`) or the same method on a core \`Graph\`. An indexed point lookup is dramatically faster than a scan.
 
 ## Cheap vs expensive
 - **Cheap:** indexed seeks, \`degree\`, \`pagerank\`, grouped-count aggregations, and neighbor aggregation (linear in nodes × dims).

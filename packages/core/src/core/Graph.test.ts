@@ -241,8 +241,8 @@ describe('Graph Tests', () => {
       test('copies indexes (declared + functional) and every constraint kind', async () => {
         const g = new Graph();
 
-        g.createVertexIndex('v');
-        g.createEdgeIndex('w');
+        g.createIndex({ on: 'vertex', kind: 'hash', keys: ['v'] });
+        g.createIndex({ on: 'edge', kind: 'hash', keys: ['w'] });
         g.createUniqueConstraint('P', 'id');
         g.createRequiredConstraint('P', 'id');
         g.createTypeConstraint('P', 'age', 'number');

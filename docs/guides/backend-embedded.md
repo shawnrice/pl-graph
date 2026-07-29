@@ -47,7 +47,7 @@ An NDJSON document is one JSON object per line, tagged `node` or `edge`:
 
 The native graph mirrors the pure-TS engine's opt-in property indexes and prepared queries:
 
-- `graph.createVertexIndex(key)` / `createEdgeIndex(key)` — a point lookup (`WHERE v.k = $x` or inline `{k: $x}`) then seeks instead of scanning. `vertexIndexes()` / `dropVertexIndex(key)` round it out. (Host-API only — there is no GQL `CREATE INDEX`.)
+- `graph.createIndex({ on, kind, keys })` — e.g. `{ on: 'vertex', kind: 'hash', keys: ['id'] }` — a point lookup (`WHERE v.k = $x` or inline `{k: $x}`) then seeks instead of scanning. `vertexIndexes()` / `dropVertexIndex(key)` round it out. (Host-API only — there is no GQL `CREATE INDEX`.)
 - `graph.prepare(text)` returns a `PreparedQuery` — parse/lower once, run many with different `params`. It has **no GC backstop**: release it with `free()` or a `using` binding.
 
 ## Loading and rebuilding from a source of truth

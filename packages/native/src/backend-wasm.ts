@@ -23,15 +23,15 @@ type WasmExports = {
   lnk_graph_edge_count: (h: number) => bigint;
   lnk_graph_version: (h: number) => bigint;
   lnk_graph_epoch: (h: number, name: number, nameLen: number) => bigint;
-  lnk_create_vertex_index: (h: number, key: number, keyLen: number) => number;
   lnk_graph_set_max_operator_chain: (h: number, n: number) => void;
-  lnk_create_edge_index: (h: number, key: number, keyLen: number) => number;
-  lnk_create_edge_interval_index: (
+  lnk_create_index: (
     h: number,
-    lo: number,
-    loLen: number,
-    hi: number,
-    hiLen: number,
+    element: number,
+    kind: number,
+    k0: number,
+    k0Len: number,
+    k1: number,
+    k1Len: number,
   ) => number;
   lnk_create_unique_constraint: (
     h: number,
@@ -401,14 +401,31 @@ export const createWasmBackend = async (source: WasmSource): Promise<Backend> =>
         ex.lnk_dealloc(p, n.byteLength);
       }
     },
-    createVertexIndex: (handle, key) => {
-      const k = encoder.encode(key);
-      const p = writeBytes(k);
+    createIndex: (handle, on, kind, keys) => {
+      const element = on === 'edge' ? 1 : 0;
+      const k = kind === 'interval' ? 1 : 0;
+      const k0 = encoder.encode(keys[0] ?? '');
+      const p0 = writeBytes(k0);
+      const hasK1 = keys.length > 1;
+      const k1 = hasK1 ? encoder.encode(keys[1]) : null;
+      const p1 = k1 === null ? 0 : writeBytes(k1);
 
       try {
-        ex.lnk_create_vertex_index(handle, p, k.byteLength);
+        ex.lnk_create_index(
+          handle,
+          element,
+          k,
+          p0,
+          k0.byteLength,
+          p1,
+          k1 === null ? 0 : k1.byteLength,
+        );
       } finally {
-        ex.lnk_dealloc(p, k.byteLength);
+        ex.lnk_dealloc(p0, k0.byteLength);
+
+        if (k1 !== null) {
+          ex.lnk_dealloc(p1, k1.byteLength);
+        }
       }
     },
     setMaxOperatorChain: (handle, n) => {
@@ -709,29 +726,6 @@ export const createWasmBackend = async (source: WasmSource): Promise<Backend> =>
       } finally {
         ex.lnk_dealloc(np, n.byteLength);
         ex.lnk_dealloc(qp, q.byteLength);
-      }
-    },
-    createEdgeIndex: (handle, key) => {
-      const k = encoder.encode(key);
-      const p = writeBytes(k);
-
-      try {
-        ex.lnk_create_edge_index(handle, p, k.byteLength);
-      } finally {
-        ex.lnk_dealloc(p, k.byteLength);
-      }
-    },
-    createEdgeIntervalIndex: (handle, loKey, hiKey) => {
-      const lo = encoder.encode(loKey);
-      const hi = encoder.encode(hiKey);
-      const plo = writeBytes(lo);
-      const phi = writeBytes(hi);
-
-      try {
-        ex.lnk_create_edge_interval_index(handle, plo, lo.byteLength, phi, hi.byteLength);
-      } finally {
-        ex.lnk_dealloc(plo, lo.byteLength);
-        ex.lnk_dealloc(phi, hi.byteLength);
       }
     },
     dropVertexIndex: (handle, key) => {

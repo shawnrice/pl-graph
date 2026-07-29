@@ -67,7 +67,9 @@ unsafe fn in_str<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
 
 #[no_mangle]
 pub extern "C" fn lnk_abi_version() -> u32 {
-    16 // 16: lnk_create_edge_interval_index (RI-tree interval index for as-of/overlap);
+    17 // 17: lnk_create_index (single parametric index creator — replaces the three
+       //     lnk_create_{vertex,edge,edge_interval}_index exports with element+kind);
+       // 16: lnk_create_edge_interval_index (RI-tree interval index for as-of/overlap);
        // 15: lnk_dump_schema (read schema back as SchemaOps, for snapshot persistence);
        // 14: lnk_last_write_scope (content-derived CDC value-scope);
        // 13: lnk_query_arrow_ipc (native Arrow IPC egress);
@@ -305,82 +307,64 @@ pub unsafe extern "C" fn lnk_graph_epoch(
     }
 }
 
-/// Declare an opt-in secondary index over a vertex property `key` (backfills the
-/// existing vertices, then stays current). Idempotent. Turns `WHERE v.key = …`
-/// pattern/filter constraints into index seeks instead of scans. Returns 0 on
-/// success, -1 on a null / bad-UTF-8 error.
+/// Declare an opt-in secondary index — the single consolidated index-creation
+/// entry point (backfills existing elements, then stays current; idempotent).
+///
+/// `element`: 0 = vertex, 1 = edge. `kind`: 0 = hash (equality seek, one key —
+/// turns `WHERE x.k = …` into a seek), 1 = interval (RI-tree over an edge
+/// `[k0, k1)` temporal pair — an as-of/overlap predicate seeds from it; two of
+/// them, valid `[vf,vt)` + transaction `[tf,tt)`, cover a bitemporal as-of).
+///
+/// Keys are passed positionally: `k0` (required) and an optional `k1` (the hi key
+/// of an interval index; pass a null `k1_ptr` for a one-key hash index).
+///
+/// Returns 0 on success, -1 on a null/bad-UTF-8 error or an unsupported
+/// (element, kind) combination (e.g. a vertex interval index, or an interval
+/// index missing its second key).
 ///
 /// # Safety
-/// `g` is a valid, uniquely-borrowed `*mut Graph`; `name_ptr`/`name_len` a valid
-/// UTF-8 slice.
+/// `g` is a valid, uniquely-borrowed `*mut Graph`; `k0_ptr`/`k0_len` a valid UTF-8
+/// slice; `k1_ptr`/`k1_len` a valid UTF-8 slice when `k1_ptr` is non-null.
 #[no_mangle]
-pub unsafe extern "C" fn lnk_create_vertex_index(
+pub unsafe extern "C" fn lnk_create_index(
     g: *mut Graph,
-    name_ptr: *const u8,
-    name_len: usize,
-) -> i32 {
-    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-    match (unsafe { graph_mut(g) }, unsafe {
-        in_str(name_ptr, name_len)
-    }) {
-        (Some(g), Some(name)) => {
-            g.create_vertex_index(name);
-            0
-        }
-        _ => -1,
-    }
-}
-
-/// Declare an opt-in secondary index over an edge property `key`. Edge analogue
-/// of [`lnk_create_vertex_index`]. Returns 0 on success, -1 on error.
-///
-/// # Safety
-/// As [`lnk_create_vertex_index`].
-#[no_mangle]
-pub unsafe extern "C" fn lnk_create_edge_index(
-    g: *mut Graph,
-    name_ptr: *const u8,
-    name_len: usize,
-) -> i32 {
-    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-    match (unsafe { graph_mut(g) }, unsafe {
-        in_str(name_ptr, name_len)
-    }) {
-        (Some(g), Some(name)) => {
-            g.create_edge_index(name);
-            0
-        }
-        _ => -1,
-    }
-}
-
-/// Declare (and backfill) an RI-tree interval index over an edge `[lo_key, hi_key)`
-/// temporal pair — an as-of / overlap predicate then seeds from the interval index.
-/// Two of them (valid `[vf,vt)` + transaction `[tf,tt)`) intersect for a bitemporal
-/// as-of. Returns 0 on success, -1 on a null / bad-UTF-8 error.
-///
-/// # Safety
-/// `g` valid + uniquely borrowed; `lo_ptr`/`lo_len` and `hi_ptr`/`hi_len` valid UTF-8.
-#[no_mangle]
-pub unsafe extern "C" fn lnk_create_edge_interval_index(
-    g: *mut Graph,
-    lo_ptr: *const u8,
-    lo_len: usize,
-    hi_ptr: *const u8,
-    hi_len: usize,
+    element: u8,
+    kind: u8,
+    k0_ptr: *const u8,
+    k0_len: usize,
+    k1_ptr: *const u8,
+    k1_len: usize,
 ) -> i32 {
     // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires valid (or null).
     let g = unsafe { graph_mut(g) };
-    // SAFETY: lo_ptr/lo_len is the caller-supplied buffer this fn's # Safety contract requires valid.
-    let lo = unsafe { in_str(lo_ptr, lo_len) };
-    // SAFETY: hi_ptr/hi_len is the caller-supplied buffer this fn's # Safety contract requires valid.
-    let hi = unsafe { in_str(hi_ptr, hi_len) };
-    match (g, lo, hi) {
-        (Some(g), Some(lo), Some(hi)) => {
-            g.create_edge_interval_index(lo, hi);
+    // SAFETY: k0_ptr/k0_len is the caller-supplied buffer this fn's # Safety contract requires valid.
+    let k0 = unsafe { in_str(k0_ptr, k0_len) };
+    let k1 = if k1_ptr.is_null() {
+        None
+    } else {
+        // SAFETY: k1_ptr/k1_len is a valid UTF-8 slice when non-null, per this fn's # Safety contract.
+        unsafe { in_str(k1_ptr, k1_len) }
+    };
+    let (Some(g), Some(k0)) = (g, k0) else {
+        return -1;
+    };
+    match (element, kind) {
+        (0, 0) => {
+            g.create_vertex_index(k0);
             0
         }
-        _ => -1,
+        (1, 0) => {
+            g.create_edge_index(k0);
+            0
+        }
+        (1, 1) => match k1 {
+            Some(k1) => {
+                g.create_edge_interval_index(k0, k1);
+                0
+            }
+            None => -1, // interval index requires a second key
+        },
+        _ => -1, // unsupported (e.g. vertex interval index)
     }
 }
 

@@ -176,26 +176,32 @@ impl Graph {
         self.inner.epoch(&name) as f64
     }
 
-    /// Declare an opt-in secondary index over a vertex property `key` (backfills
-    /// the existing vertices, then stays current). Idempotent; turns
-    /// `WHERE v.key = …` into an index seek instead of a scan.
+    /// Declare an opt-in secondary index (backfills existing elements, then stays
+    /// current; idempotent) — the single index-creation entry point. `on` is
+    /// `"vertex"` or `"edge"`; `kind` is `"hash"` (equality seek, one key — turns
+    /// `WHERE x.k = …` into a seek) or `"interval"` (RI-tree over an edge
+    /// `[keys[0], keys[1])` temporal pair for as-of / overlap seeks; two cover a
+    /// bitemporal as-of). Unsupported combinations are a no-op.
     #[napi]
-    pub fn create_vertex_index(&mut self, key: String) {
-        self.inner.create_vertex_index(&key);
-    }
-
-    /// Declare an opt-in secondary index over an edge property `key`. Edge
-    /// analogue of [`Graph::create_vertex_index`].
-    #[napi]
-    pub fn create_edge_index(&mut self, key: String) {
-        self.inner.create_edge_index(&key);
-    }
-
-    /// Declare an RI-tree interval index over an edge `[lo_key, hi_key)` temporal pair
-    /// (as-of / overlap seeks; two intersect for a bitemporal as-of).
-    #[napi]
-    pub fn create_edge_interval_index(&mut self, lo_key: String, hi_key: String) {
-        self.inner.create_edge_interval_index(&lo_key, &hi_key);
+    pub fn create_index(&mut self, on: String, kind: String, keys: Vec<String>) {
+        match (on.as_str(), kind.as_str()) {
+            ("edge", "interval") => {
+                if keys.len() >= 2 {
+                    self.inner.create_edge_interval_index(&keys[0], &keys[1]);
+                }
+            }
+            ("edge", "hash") => {
+                if let Some(k) = keys.first() {
+                    self.inner.create_edge_index(k);
+                }
+            }
+            ("vertex", "hash") => {
+                if let Some(k) = keys.first() {
+                    self.inner.create_vertex_index(k);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Drop a vertex / edge property index (no-op if absent). Rejected if the key

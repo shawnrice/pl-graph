@@ -60,7 +60,7 @@ const boot = async () => {
   // (`WHERE s.sid = $sid`) and the blast radius (`WHERE x.sid = $sid`). The
   // planner uses the index automatically for those `{sid: $x}` / `WHERE .sid = $x`
   // seeks.
-  store.graph.createVertexIndex('sid');
+  store.graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['sid'] });
   const server = createReconnectingClient({
     connect: ({ opened, received, closed }) => {
       const ws = new WebSocket(SERVER_URL);

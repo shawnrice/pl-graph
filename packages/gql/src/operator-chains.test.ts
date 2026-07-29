@@ -112,7 +112,7 @@ describe('operator-chain semantics (n-ary refactor regression guard)', () => {
     const g = deserialize(nd, 'ndjson', new Graph());
 
     if (index) {
-      g.createVertexIndex('id');
+      g.createIndex({ on: 'vertex', kind: 'hash', keys: ['id'] });
     }
 
     return g;

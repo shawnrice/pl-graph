@@ -12,9 +12,9 @@ browser tab) shouldn't pay heap for keys nobody filters on. Declare the ones you
 query:
 
 ```ts
-graph.createVertexIndex('name'); // backfills existing vertices, then stays current
-graph.createVertexIndex('age');
-graph.createEdgeIndex('weight');
+graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] }); // backfills existing vertices, then stays current
+graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
+graph.createIndex({ on: 'edge', kind: 'hash', keys: ['weight'] });
 
 graph.vertexIndexes(); // ['name', 'age']
 graph.dropVertexIndex('age');

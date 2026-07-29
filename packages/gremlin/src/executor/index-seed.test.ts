@@ -13,7 +13,7 @@ describe('index-seeded V() source', () => {
   test('equality has() returns the same result whether or not name is indexed', () => {
     const plain = createTestTinkerGraph();
     const indexed = createTestTinkerGraph();
-    indexed.createVertexIndex('name');
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
 
     const plan = () => traversal(V(), has('name', 'marko'), values('age'));
     expect(arr(run(plan(), indexed))).toEqual(arr(run(plan(), plain)));
@@ -22,7 +22,7 @@ describe('index-seeded V() source', () => {
 
   test('3-arg has(label, key, value) keeps the label constraint when seeded', () => {
     const g = createTestTinkerGraph();
-    g.createVertexIndex('name');
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     // lop is SOFTWARE; the PERSON label must still exclude it.
     expect(arr(run(traversal(V(), has('PERSON', 'name', 'lop'), values('name')), g))).toEqual([]);
     expect(arr(run(traversal(V(), has('PERSON', 'name', 'marko'), values('name')), g))).toEqual([
@@ -32,7 +32,7 @@ describe('index-seeded V() source', () => {
 
   test('downstream steps still run after an index seed', () => {
     const g = createTestTinkerGraph();
-    g.createVertexIndex('name');
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     // marko -created-> lop, so out() then name should reach lop/vadas/josh.
     const result = arr(run(traversal(V(), has('name', 'marko'), out(), values('name')), g));
     expect((result as string[]).sort()).toEqual(['josh', 'lop', 'vadas']);
@@ -40,7 +40,7 @@ describe('index-seeded V() source', () => {
 
   test('seedFromIndex drops a plain has but keeps other filters', () => {
     const g = createTestTinkerGraph();
-    g.createVertexIndex('name');
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     const plan = traversal(V(), hasLabel('PERSON'), has('name', eq('marko')));
     const seeded = seedFromIndex(plan, g, false);
     expect(seeded).not.toBeNull();
@@ -57,7 +57,7 @@ describe('index-seeded V() source', () => {
 
   test('range predicates are seeded but kept as a residual filter', () => {
     const g = createTestTinkerGraph();
-    g.createVertexIndex('age');
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
     // Ages: marko=29, vadas=27, josh=32, peter=35.
     const seeded = seedFromIndex(traversal(V(), has('age', gt(30))), g, false);
     expect(seeded).not.toBeNull();
@@ -68,7 +68,7 @@ describe('index-seeded V() source', () => {
   test('range results match the unindexed scan', () => {
     const plain = createTestTinkerGraph();
     const indexed = createTestTinkerGraph();
-    indexed.createVertexIndex('age');
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
     const cases = [gt(30), between(28, 33), inside(28, 33)];
 
     for (const pred of cases) {
@@ -81,7 +81,7 @@ describe('index-seeded V() source', () => {
 
   test('within is seeded from a union of buckets and dropped', () => {
     const g = createTestTinkerGraph();
-    g.createVertexIndex('name');
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     const seeded = seedFromIndex(
       traversal(V(), has('name', within('marko', 'josh', 'nobody'))),
       g,
@@ -95,7 +95,7 @@ describe('index-seeded V() source', () => {
   test('startsWith is seeded from a prefix range and matches the scan', () => {
     const plain = createTestTinkerGraph();
     const indexed = createTestTinkerGraph();
-    indexed.createVertexIndex('name');
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     // Names: marko, vadas, josh, peter, lop, ripple.
     const plan = () => traversal(V(), has('name', startsWith('r')), values('name'));
     expect((arr(run(plan(), indexed)) as string[]).sort()).toEqual(
@@ -106,7 +106,7 @@ describe('index-seeded V() source', () => {
 
   test('startsWith seeds the prefix slice as a residual filter', () => {
     const g = createTestTinkerGraph();
-    g.createVertexIndex('name');
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     const seeded = seedFromIndex(traversal(V(), has('name', startsWith('m'))), g, false);
     expect(seeded).not.toBeNull();
     expect(arr(seeded!.stream).length).toBe(1); // marko
@@ -116,7 +116,7 @@ describe('index-seeded V() source', () => {
   test('within results match the unindexed scan', () => {
     const plain = createTestTinkerGraph();
     const indexed = createTestTinkerGraph();
-    indexed.createVertexIndex('name');
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     const plan = () => traversal(V(), has('name', within('vadas', 'josh')), values('name'));
     expect((arr(run(plan(), indexed)) as string[]).sort()).toEqual(
       (arr(run(plan(), plain)) as string[]).sort(),
@@ -125,7 +125,7 @@ describe('index-seeded V() source', () => {
 
   test('falls back (null) for a non-seedable predicate', () => {
     const g = createTestTinkerGraph();
-    g.createVertexIndex('name');
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     // `neq` has no bucket to seed from.
     const plan = traversal(V(), has('name', { op: 'neq', value: 'marko' }));
     expect(seedFromIndex(plan, g, false)).toBeNull();
@@ -133,14 +133,14 @@ describe('index-seeded V() source', () => {
 
   test('an empty bucket short-circuits to no results', () => {
     const g = createTestTinkerGraph();
-    g.createVertexIndex('name');
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     expect(arr(run(traversal(V(), has('name', 'nobody'), values('name')), g))).toEqual([]);
   });
 
   test('picks the most selective filter by count; the rest stay residual', () => {
     const g = createTestTinkerGraph();
-    g.createVertexIndex('name');
-    g.createVertexIndex('lang');
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['lang'] });
     // lang=java → 2 (lop, ripple); name=lop → 1; name wins on count.
     const plan = traversal(V(), has('lang', eq('java')), has('name', eq('lop')));
     const seeded = seedFromIndex(plan, g, false);
@@ -152,8 +152,8 @@ describe('index-seeded V() source', () => {
 
   test('a more selective equality is chosen over a wider range', () => {
     const g = createTestTinkerGraph();
-    g.createVertexIndex('age');
-    g.createVertexIndex('name');
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     // name=josh → 1; age>30 → 2 (josh, peter); name wins, age stays residual.
     const plan = traversal(V(), has('name', eq('josh')), has('age', gt(30)));
     const seeded = seedFromIndex(plan, g, false);
@@ -165,8 +165,8 @@ describe('index-seeded V() source', () => {
   test('multi-filter results match the unindexed scan', () => {
     const plain = createTestTinkerGraph();
     const indexed = createTestTinkerGraph();
-    indexed.createVertexIndex('age');
-    indexed.createVertexIndex('name');
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     const plan = () =>
       traversal(V(), has('age', gt(28)), has('name', startsWith('j')), values('name'));
     expect((arr(run(plan(), indexed)) as string[]).sort()).toEqual(
@@ -180,7 +180,7 @@ describe('index-seeded E() source', () => {
   test('equality has() on an indexed edge property seeds and matches the scan', () => {
     const plain = createTestTinkerGraph();
     const indexed = createTestTinkerGraph();
-    indexed.createEdgeIndex('weight');
+    indexed.createIndex({ on: 'edge', kind: 'hash', keys: ['weight'] });
 
     const plan = () => traversal(E(), has('weight', 1.0));
     const got = (arr(run(plan(), indexed)) as Array<{ id: string }>).map((e) => e.id).sort();
@@ -191,7 +191,7 @@ describe('index-seeded E() source', () => {
 
   test('seedFromIndex seeds E() from the edge property index', () => {
     const g = createTestTinkerGraph();
-    g.createEdgeIndex('weight');
+    g.createIndex({ on: 'edge', kind: 'hash', keys: ['weight'] });
     const seeded = seedFromIndex(traversal(E(), has('weight', eq(0.4))), g, false);
     expect(seeded).not.toBeNull();
     expect(arr(seeded!.stream).length).toBe(2); // edges 9 and 11
@@ -201,7 +201,7 @@ describe('index-seeded E() source', () => {
   test('range on an indexed edge property matches the scan', () => {
     const plain = createTestTinkerGraph();
     const indexed = createTestTinkerGraph();
-    indexed.createEdgeIndex('weight');
+    indexed.createIndex({ on: 'edge', kind: 'hash', keys: ['weight'] });
     const plan = () => traversal(E(), has('weight', gt(0.5)), values('weight'));
     expect((arr(run(plan(), indexed)) as number[]).sort()).toEqual(
       (arr(run(plan(), plain)) as number[]).sort(),

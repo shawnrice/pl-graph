@@ -116,7 +116,11 @@ suite('unique-constraint differential (TS vs native)', () => {
       g: {
         createUniqueConstraint: (l: string, k: string) => void;
         createEdgeUniqueConstraint: (t: string, k: string) => void;
-        createVertexIndex: (k: string) => void;
+        createIndex: (spec: {
+          on: 'vertex' | 'edge';
+          kind: 'hash' | 'interval';
+          keys: string[];
+        }) => void;
         dropVertexIndex: (k: string) => void;
         dropEdgeIndex: (k: string) => void;
       };
@@ -129,7 +133,7 @@ suite('unique-constraint differential (TS vs native)', () => {
     for (const { g } of engines) {
       g.createUniqueConstraint('Acct', 'email');
       g.createEdgeUniqueConstraint('LINK', 'id');
-      g.createVertexIndex('age'); // plain, droppable
+      g.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] }); // plain, droppable
     }
 
     for (const { g } of engines) {

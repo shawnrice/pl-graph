@@ -10,7 +10,7 @@ describe('GQL property-index seeding', () => {
   test('an equality property constraint returns the same rows whether or not name is indexed', () => {
     const plain = createTestSocialGraph();
     const indexed = createTestSocialGraph();
-    indexed.createVertexIndex('name');
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
 
     const q = `MATCH (p:Person {name: 'marko'})-[:KNOWS]->(b) RETURN b.name`;
     expect(sorted(query(indexed, q), 'b.name')).toEqual(sorted(query(plain, q), 'b.name'));
@@ -19,7 +19,7 @@ describe('GQL property-index seeding', () => {
 
   test('the label constraint still excludes a same-named wrong-label vertex', () => {
     const g = createTestSocialGraph();
-    g.createVertexIndex('name');
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     // lop is Software; seeding from the name bucket must still honor :Person.
     expect(query(g, `MATCH (p:Person {name: 'lop'}) RETURN p.name`)).toEqual([]);
     expect(query(g, `MATCH (s:Software {name: 'lop'}) RETURN s.name`)).toEqual([
@@ -29,14 +29,14 @@ describe('GQL property-index seeding', () => {
 
   test('a non-indexed key still works via the scan fallback', () => {
     const g = createTestSocialGraph();
-    g.createVertexIndex('name'); // age is NOT indexed
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] }); // age is NOT indexed
     const rows = query(g, `MATCH (p:Person {age: 32}) RETURN p.name`);
     expect(sorted(rows, 'p.name')).toEqual(['josh']);
   });
 
   test('seeding reflects live mutations', () => {
     const g = createTestSocialGraph();
-    g.createVertexIndex('name');
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     g.addVertex({ id: '99', labels: ['Person'], properties: { name: 'marko', age: 50 } });
     const rows = query(g, `MATCH (p:Person {name: 'marko'}) RETURN p.age`);
     expect(sorted(rows, 'p.age')).toEqual([29, 50]);
@@ -44,7 +44,7 @@ describe('GQL property-index seeding', () => {
 
   test('an empty bucket yields no rows', () => {
     const g = createTestSocialGraph();
-    g.createVertexIndex('name');
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     expect(query(g, `MATCH (p:Person {name: 'nobody'}) RETURN p.name`)).toEqual([]);
   });
 });
@@ -54,8 +54,8 @@ describe('GQL WHERE-derived seed hints', () => {
   const both = (q: string) => {
     const plain = createTestSocialGraph();
     const indexed = createTestSocialGraph();
-    indexed.createVertexIndex('name');
-    indexed.createVertexIndex('age');
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
 
     return { plain: query(plain, q), indexed: query(indexed, q) };
   };
@@ -139,7 +139,7 @@ describe('GQL smaller-side seed selection', () => {
   test('seeds from the selective far end and walks back (results match the scan)', () => {
     const plain = createTestSocialGraph();
     const indexed = createTestSocialGraph();
-    indexed.createVertexIndex('name');
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
 
     const q = `MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE b.name = 'josh' RETURN a.name`;
     expect(sorted(query(indexed, q), 'a.name')).toEqual(sorted(query(plain, q), 'a.name'));
@@ -149,7 +149,7 @@ describe('GQL smaller-side seed selection', () => {
   test('far-end element-map constraint also drives the seed side', () => {
     const plain = createTestSocialGraph();
     const indexed = createTestSocialGraph();
-    indexed.createVertexIndex('name');
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     const q = `MATCH (a:Person)-[:KNOWS]->(b:Person {name: 'vadas'}) RETURN a.name`;
     expect(sorted(query(indexed, q), 'a.name')).toEqual(sorted(query(plain, q), 'a.name'));
     expect(sorted(query(indexed, q), 'a.name')).toEqual(['marko']); // marko KNOWS vadas
@@ -158,7 +158,7 @@ describe('GQL smaller-side seed selection', () => {
   test('a variable-length segment keeps its orientation and still matches', () => {
     const plain = createTestSocialGraph();
     const indexed = createTestSocialGraph();
-    indexed.createVertexIndex('name');
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     const q = `MATCH (a:Person)-[:KNOWS]->{1,2}(b:Person) WHERE b.name = 'josh' RETURN a.name`;
     expect(sorted(query(indexed, q), 'a.name')).toEqual(sorted(query(plain, q), 'a.name'));
   });
@@ -166,7 +166,7 @@ describe('GQL smaller-side seed selection', () => {
   test('an unlabeled start seeds the indexed far end instead of a full scan', () => {
     const plain = createTestSocialGraph();
     const indexed = createTestSocialGraph();
-    indexed.createVertexIndex('name');
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     // `a` has no label (a whole-graph scan); seeding from b=josh avoids it.
     const q = `MATCH (a)-[:KNOWS]->(b:Person) WHERE b.name = 'josh' RETURN a.name`;
     expect(sorted(query(indexed, q), 'a.name')).toEqual(sorted(query(plain, q), 'a.name'));
@@ -176,7 +176,7 @@ describe('GQL smaller-side seed selection', () => {
   test('multi-hop pattern seeds from the selective end either way', () => {
     const plain = createTestSocialGraph();
     const indexed = createTestSocialGraph();
-    indexed.createVertexIndex('name');
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     // marko -KNOWS-> josh -CREATED-> ripple/lop
     const q = `MATCH (a:Person {name: 'marko'})-[:KNOWS]->(b)-[:CREATED]->(c) RETURN c.name`;
     expect(sorted(query(indexed, q), 'c.name')).toEqual(sorted(query(plain, q), 'c.name'));

@@ -16,11 +16,31 @@ import type {
 import { fromTaggedJson, isTemporal, temporalLiteralParts } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
-import type { Backend, GraphHandle, MergeReport, PreparedHandle } from './backend.js';
+import type {
+  Backend,
+  GraphHandle,
+  IndexKind,
+  IndexTarget,
+  MergeReport,
+  PreparedHandle,
+} from './backend.js';
 import { ensureDisposeSymbol } from './dispose.js';
 
 /** A decoded result row: column name → cell value. */
 export type Row = Record<string, unknown>;
+
+export type { IndexKind, IndexTarget } from './backend.js';
+
+/**
+ * The spec passed to {@link RustGraph.createIndex}: which element (`on`), the
+ * index `kind`, and the property `keys` (`[k]` for a hash index, `[loKey, hiKey]`
+ * for an interval index).
+ */
+export type IndexSpec = {
+  on: IndexTarget;
+  kind: IndexKind;
+  keys: string[];
+};
 
 /**
  * The tagged wire form of a temporal — what `toJSON` emits and what comes back
@@ -71,10 +91,10 @@ export type SchemaOp =
 export const applySchemaOp = (g: RustGraph, s: SchemaOp): void => {
   switch (s.op) {
     case 'createVertexIndex':
-      g.createVertexIndex(s.key);
+      g.createIndex({ on: 'vertex', kind: 'hash', keys: [s.key] });
       break;
     case 'createEdgeIndex':
-      g.createEdgeIndex(s.key);
+      g.createIndex({ on: 'edge', kind: 'hash', keys: [s.key] });
       break;
     case 'dropVertexIndex':
       g.dropVertexIndex(s.key);
@@ -578,20 +598,24 @@ export type RustGraph = {
   /** Per-token change epoch (label / edge-type / property-key) for finer invalidation. */
   epoch: (name: string) => number;
   /**
-   * Declare an opt-in secondary index over a vertex / edge property `key`
-   * (backfills existing elements, then stays current). Idempotent. Turns
-   * `WHERE x.key = …` / `x.key IN […]` / range constraints into index seeks
-   * instead of full scans — a large win for repeated point lookups (e.g. bulk
-   * edge inserts that `MATCH` their endpoints by id).
+   * Declare an opt-in secondary index (backfills existing elements, then stays
+   * current; idempotent). The single index-creation entry point:
+   *   - `on`: `'vertex'` or `'edge'`.
+   *   - `kind`: `'hash'` — an equality seek over one key, turning
+   *     `WHERE x.k = …` / `x.k IN […]` / range constraints into seeks instead of
+   *     scans (a large win for repeated point lookups, e.g. bulk edge inserts that
+   *     `MATCH` their endpoints by id); or `'interval'` — an RI-tree over an edge
+   *     `[loKey, hiKey)` temporal pair, so an as-of (`lo <= v AND hi > v`) /
+   *     overlap predicate seeds from it (two — valid `[vf,vt)` + transaction
+   *     `[tf,tt)` — cover a bitemporal as-of).
+   *   - `keys`: `[k]` for a hash index, `[loKey, hiKey]` for an interval index.
+   *
+   * An interval index is edge-only.
+   *
+   * @example g.createIndex({ on: 'vertex', kind: 'hash', keys: ['email'] })
+   * @example g.createIndex({ on: 'edge', kind: 'interval', keys: ['vf', 'vt'] })
    */
-  createVertexIndex: (key: string) => void;
-  createEdgeIndex: (key: string) => void;
-  /**
-   * Declare an RI-tree interval index over an edge `[loKey, hiKey)` temporal pair, so an
-   * as-of (`lo <= v AND hi > v`) / overlap predicate seeds from the interval index; two
-   * (valid `[vf,vt)` + transaction `[tf,tt)`) intersect for a bitemporal as-of.
-   */
-  createEdgeIntervalIndex: (loKey: string, hiKey: string) => void;
+  createIndex: (spec: IndexSpec) => void;
   /**
    * Declare a UNIQUE constraint on `(label, key)`: at most one vertex carrying
    * `label` may hold a given non-null value for `key`. Index-backed. Throws
@@ -1105,10 +1129,7 @@ export const attachGraph = (backend: Backend, handle: GraphHandle): RustGraph =>
       return backend.version(live());
     },
     epoch: (name) => backend.epoch(live(), name),
-    createVertexIndex: (key) => backend.createVertexIndex(live(), key),
-    createEdgeIndex: (key) => backend.createEdgeIndex(live(), key),
-    createEdgeIntervalIndex: (loKey, hiKey) =>
-      backend.createEdgeIntervalIndex(live(), loKey, hiKey),
+    createIndex: (spec) => backend.createIndex(live(), spec.on, spec.kind, spec.keys),
     createUniqueConstraint: (label, key) => backend.createUniqueConstraint(live(), label, key),
     createRequiredConstraint: (label, key) => backend.createRequiredConstraint(live(), label, key),
     createTypeConstraint: (label, key, type) =>

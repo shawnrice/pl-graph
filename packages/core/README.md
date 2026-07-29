@@ -28,7 +28,7 @@ graph.addEdge({ from: alice, to: bob, labels: ['KNOWS'], properties: { since: 20
 graph.getVerticesByLabel('Person'); // Set { alice, bob }
 
 // Declare a secondary index, then query by property value or range.
-graph.createVertexIndex('age');
+graph.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
 graph.getVerticesByProperty('age', 34); // Set { alice }
 graph.getVerticesByPropertyRange('age', { gte: 30 }); // Set { alice }
 
@@ -60,7 +60,7 @@ vertex.removeLabel(label);
 
 ## Property indexes
 
-Secondary indexes are opt-in per key — declare a key with `createVertexIndex(key)` / `createEdgeIndex(key)` (backfilled from existing elements and kept current on every mutation), then query it:
+Secondary indexes are opt-in per key — declare one with `createIndex({ on, kind, keys })` (e.g. `{ on: 'vertex', kind: 'hash', keys: ['age'] }`, backfilled from existing elements and kept current on every mutation), then query it:
 
 - `getVerticesByProperty(key, value)` / `getEdgesByProperty(key, value)` — equality, an O(1) bucket lookup.
 - `getVerticesByPropertyRange(key, bound)` / `getEdgesByPropertyRange(key, bound)` — range, where `bound` is a `RangeBound` (`{ gt?, gte?, lt?, lte? }`). Indexable values are `string | number | boolean | null`; ranges are clamped to the bound's value type.

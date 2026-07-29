@@ -380,7 +380,7 @@ suite('@lenke/sync snapshot · schema restore', () => {
     store.mutate((g) => {
       g.createUniqueConstraint('User', 'email');
       g.createValidator('User', 'u', 'u.age >= 0');
-      g.createVertexIndex('email');
+      g.createIndex({ on: 'vertex', kind: 'hash', keys: ['email'] });
       g.query("_MERGE (u:User {email: 'a@b.com', age: 30})");
     });
 

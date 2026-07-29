@@ -24,7 +24,7 @@ const buildTime = (n: number, index: 'none' | 'age' | 'name'): number => {
   g.disableEvents();
 
   if (index !== 'none') {
-    g.createVertexIndex(index);
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: [index] });
   }
 
   const start = performance.now();

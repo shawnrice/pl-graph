@@ -25,6 +25,28 @@ type AddEdgeArgs = {
   properties?: Record<string, unknown>;
 };
 
+/** Which element an index covers (see {@link Graph.createIndex}). */
+export type IndexTarget = 'vertex' | 'edge';
+
+/**
+ * The kind of secondary index (see {@link Graph.createIndex}): `'hash'` is an
+ * equality seek over a single key; `'interval'` is an RI-tree over an edge
+ * `[loKey, hiKey)` temporal pair — native-engine-only (throws in the pure-TS
+ * engine).
+ */
+export type IndexKind = 'hash' | 'interval';
+
+/**
+ * The spec passed to {@link Graph.createIndex}: which element (`on`), the index
+ * `kind`, and the property `keys` (`[k]` for a hash index, `[loKey, hiKey]` for
+ * an interval index).
+ */
+export type IndexSpec = {
+  on: IndexTarget;
+  kind: IndexKind;
+  keys: string[];
+};
+
 export type GraphOptions = {
   /**
    * Invoked when a graph-event listener or a `subscribe()` callback throws.
@@ -1433,14 +1455,39 @@ export class Graph {
   /* Property indexes */
 
   /**
-   * Declare `key` as an indexed vertex property and backfill it from the
-   * vertices already in the graph. Subsequent mutations keep it current.
+   * Declare an opt-in secondary index and backfill it from the elements already
+   * in the graph (subsequent mutations keep it current). The single
+   * index-creation entry point:
+   *   - `on`: `'vertex'` or `'edge'`.
+   *   - `kind`: `'hash'` — an equality seek over one key (turns `WHERE x.k = …`
+   *     into a seek). `'interval'` is only available in the native engine
+   *     (`@lenke/native`) and throws here.
+   *   - `keys`: `[k]` for a hash index.
+   *
+   * @example g.createIndex({ on: 'vertex', kind: 'hash', keys: ['email'] })
    */
-  public createVertexIndex = (key: string): void => {
-    this.vertexPropertyIndex.createIndex(key);
+  public createIndex = (spec: IndexSpec): void => {
+    if (spec.kind === 'interval') {
+      throw new LenkeError(
+        'lenke: interval indexes are only available in the native engine (@lenke/native), not the pure-TS engine',
+        { code: ErrorCode.InvalidGraphOp },
+      );
+    }
 
-    for (const vertex of this.verticesById.values()) {
-      this.vertexPropertyIndex.addForKey(vertex, key, vertex.properties[key]);
+    const [key] = spec.keys;
+
+    if (spec.on === 'vertex') {
+      this.vertexPropertyIndex.createIndex(key);
+
+      for (const vertex of this.verticesById.values()) {
+        this.vertexPropertyIndex.addForKey(vertex, key, vertex.properties[key]);
+      }
+    } else {
+      this.edgePropertyIndex.createIndex(key);
+
+      for (const edge of this.edgesById.values()) {
+        this.edgePropertyIndex.addForKey(edge, key, edge.properties[key]);
+      }
     }
   };
 
@@ -1458,14 +1505,6 @@ export class Graph {
     }
 
     this.vertexPropertyIndex.dropIndex(key);
-  };
-
-  public createEdgeIndex = (key: string): void => {
-    this.edgePropertyIndex.createIndex(key);
-
-    for (const edge of this.edgesById.values()) {
-      this.edgePropertyIndex.addForKey(edge, key, edge.properties[key]);
-    }
   };
 
   public dropEdgeIndex = (key: string): void => {
@@ -1552,7 +1591,7 @@ export class Graph {
    */
   public createUniqueConstraint = (label: string, key: string): void => {
     if (!this.vertexIndexes().includes(key)) {
-      this.createVertexIndex(key);
+      this.createIndex({ on: 'vertex', kind: 'hash', keys: [key] });
     }
 
     const seen = new Set<unknown>();
@@ -2161,7 +2200,7 @@ export class Graph {
    */
   public createEdgeUniqueConstraint = (edgeType: string, key: string): void => {
     if (!this.edgeIndexes().includes(key)) {
-      this.createEdgeIndex(key);
+      this.createIndex({ on: 'edge', kind: 'hash', keys: [key] });
     }
 
     const seen = new Set<unknown>();

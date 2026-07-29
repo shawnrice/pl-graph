@@ -64,8 +64,8 @@ const plain = load(ndjson);
 
 const indexed = load(ndjson);
 const t0 = performance.now();
-indexed.createVertexIndex('name');
-indexed.createVertexIndex('age');
+indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
+indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
 const buildMs = performance.now() - t0;
 console.log(`Index build (name + age backfill): ${fmt(buildMs)} ms\n`);
 

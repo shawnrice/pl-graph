@@ -23,7 +23,7 @@ g.getVertexById(marko.id);
 g.getVerticesByLabel('Person'); // a Set
 
 // Opt-in secondary index for property lookups / ranges
-g.createVertexIndex('age');
+g.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
 g.getVerticesByProperty('age', 29);
 g.getVerticesByPropertyRange('age', { gte: 30 });
 ```

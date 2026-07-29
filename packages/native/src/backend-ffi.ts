@@ -21,11 +21,10 @@ const SYMBOLS = {
   lnk_graph_edge_count: { args: [FFIType.ptr], returns: U },
   lnk_graph_version: { args: [FFIType.ptr], returns: U },
   lnk_graph_epoch: { args: [FFIType.ptr, FFIType.ptr, U], returns: U },
-  lnk_create_vertex_index: { args: [FFIType.ptr, FFIType.ptr, U], returns: FFIType.i32 },
   lnk_graph_set_max_operator_chain: { args: [FFIType.ptr, U], returns: FFIType.void },
-  lnk_create_edge_index: { args: [FFIType.ptr, FFIType.ptr, U], returns: FFIType.i32 },
-  lnk_create_edge_interval_index: {
-    args: [FFIType.ptr, FFIType.ptr, U, FFIType.ptr, U],
+  // (g, element:u8, kind:u8, k0_ptr, k0_len, k1_ptr, k1_len) -> i32
+  lnk_create_index: {
+    args: [FFIType.ptr, FFIType.u8, FFIType.u8, FFIType.ptr, U, FFIType.ptr, U],
     returns: FFIType.i32,
   },
   lnk_create_unique_constraint: {
@@ -251,29 +250,24 @@ export const createFfiBackend = (libPath: string): Backend => {
 
       return Number(symbols.lnk_graph_epoch(asPtr(handle), ptr(n), n.byteLength));
     },
-    createVertexIndex: (handle, key) => {
-      const k = encoder.encode(key);
-
-      symbols.lnk_create_vertex_index(asPtr(handle), ptr(k), k.byteLength);
-    },
     setMaxOperatorChain: (handle, n) => {
       symbols.lnk_graph_set_max_operator_chain(asPtr(handle), n);
     },
-    createEdgeIndex: (handle, key) => {
-      const k = encoder.encode(key);
+    createIndex: (handle, on, kind, keys) => {
+      const element = on === 'edge' ? 1 : 0;
+      const k = kind === 'interval' ? 1 : 0;
+      const k0 = encoder.encode(keys[0] ?? '');
+      const hasK1 = keys.length > 1;
+      const k1 = hasK1 ? encoder.encode(keys[1]) : null;
 
-      symbols.lnk_create_edge_index(asPtr(handle), ptr(k), k.byteLength);
-    },
-    createEdgeIntervalIndex: (handle, loKey, hiKey) => {
-      const lo = encoder.encode(loKey);
-      const hi = encoder.encode(hiKey);
-
-      symbols.lnk_create_edge_interval_index(
+      symbols.lnk_create_index(
         asPtr(handle),
-        ptr(lo),
-        lo.byteLength,
-        ptr(hi),
-        hi.byteLength,
+        element,
+        k,
+        ptr(k0),
+        k0.byteLength,
+        k1 === null ? null : ptr(k1),
+        k1 === null ? 0 : k1.byteLength,
       );
     },
     createUniqueConstraint: (handle, label, key) => {

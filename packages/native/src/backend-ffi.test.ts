@@ -76,8 +76,8 @@ suite('@lenke/native FFI backend', () => {
 
     // Idempotent; declaring an index must not change query results — only make
     // `{k: $x}` / `WHERE .k = $x` seek instead of scan.
-    g.createVertexIndex('name');
-    g.createVertexIndex('name');
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
 
     expect(g.query('MATCH (n:P {name: $n}) RETURN n.age', { n: 'marko' })).toEqual([
       { 'n.age': 29 },
@@ -95,9 +95,9 @@ suite('@lenke/native FFI backend', () => {
     const g = graphFromNdjson(backend, bytes);
 
     expect(g.vertexIndexes()).toEqual([]);
-    g.createVertexIndex('name');
-    g.createVertexIndex('age');
-    g.createEdgeIndex('weight');
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
+    g.createIndex({ on: 'edge', kind: 'hash', keys: ['weight'] });
     expect(g.vertexIndexes()).toEqual(['age', 'name']); // sorted
     expect(g.edgeIndexes()).toEqual(['weight']);
 
@@ -107,6 +107,41 @@ suite('@lenke/native FFI backend', () => {
     expect(g.vertexIndexes()).toEqual(['name']);
 
     g.free();
+  });
+
+  test('createIndex routes kind:interval to the RI-tree — an as-of seek is byte-identical to the scan', () => {
+    const backend = createFfiBackend(LIB);
+
+    // Three employment edges with a valid interval [vf, vt); an as-of query at
+    // v=15 should match only the edge whose interval covers it. The consolidated
+    // createIndex({ on:'edge', kind:'interval' }) must route to the edge interval
+    // index and return exactly what the un-indexed scan does.
+    const build = () => {
+      const g = createEmptyGraph(backend);
+      g.query(
+        "INSERT (:E {id: 'a'})-[:EMPLOYS {vf: 0, vt: 10}]->(:C {id: 'x'}), " +
+          "(:E {id: 'b'})-[:EMPLOYS {vf: 10, vt: 20}]->(:C {id: 'y'}), " +
+          "(:E {id: 'c'})-[:EMPLOYS {vf: 20, vt: 30}]->(:C {id: 'z'})",
+      );
+
+      return g;
+    };
+    const asOf =
+      'MATCH ()-[r:EMPLOYS]->() WHERE r.vf <= $v AND r.vt > $v RETURN r.vf ORDER BY r.vf';
+
+    const scan = build();
+    const expected = scan.query(asOf, { v: 15 });
+
+    expect(expected).toEqual([{ 'r.vf': 10 }]);
+    scan.free();
+
+    const seek = build();
+
+    seek.createIndex({ on: 'edge', kind: 'interval', keys: ['vf', 'vt'] });
+    expect(seek.query(asOf, { v: 15 })).toEqual(expected);
+    // A boundary probe (vt is exclusive): v=10 excludes [0,10), includes [10,20).
+    expect(seek.query(asOf, { v: 10 })).toEqual([{ 'r.vf': 10 }]);
+    seek.free();
   });
 
   test('mergeNdjson bulk-appends into a live graph (COPY FROM)', () => {
@@ -152,7 +187,7 @@ suite('@lenke/native FFI backend', () => {
       'vadas',
     ]);
     // An indexed key stays queryable — the append maintained the index.
-    g.createVertexIndex('name');
+    g.createIndex({ on: 'vertex', kind: 'hash', keys: ['name'] });
     g.mergeNdjson(
       new TextEncoder().encode(
         '{"type":"node","id":"d","labels":["P"],"properties":{"name":"peter"}}',

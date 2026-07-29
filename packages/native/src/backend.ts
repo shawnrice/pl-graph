@@ -20,6 +20,16 @@ export type GraphHandle = number;
 /** An opaque handle to a compiled, reusable GQL query (see {@link Backend.prepare}). */
 export type PreparedHandle = number;
 
+/** Which element an index covers (see {@link Backend.createIndex}). */
+export type IndexTarget = 'vertex' | 'edge';
+
+/**
+ * The kind of secondary index (see {@link Backend.createIndex}): `'hash'` is an
+ * equality seek over a single key; `'interval'` is an RI-tree over an edge
+ * `[loKey, hiKey)` temporal pair for as-of / overlap seeks (edge-only).
+ */
+export type IndexKind = 'hash' | 'interval';
+
 /**
  * What a {@link Backend.mergeNdjson} applied vs. skipped — so a caller sees
  * anything that didn't land cleanly. Empty `*Skipped`/`phantomVertices` arrays
@@ -71,19 +81,17 @@ export type Backend = {
   epoch: (handle: GraphHandle, name: string) => number;
 
   /**
-   * Declare an opt-in secondary index over a vertex / edge property `key`
-   * (backfills existing elements, then stays current). Idempotent; turns
-   * `WHERE x.key = …` constraints into index seeks instead of full scans.
+   * Declare an opt-in secondary index (backfills existing elements, then stays
+   * current; idempotent). The single parametric index creator:
+   *   - `on`: `'vertex'` or `'edge'` — which element the index covers.
+   *   - `kind`: `'hash'` (equality seek, one key — turns `WHERE x.k = …` into a
+   *     seek) or `'interval'` (RI-tree over an edge `[k0, k1)` temporal pair — an
+   *     as-of `k0 <= v AND k1 > v` / overlap predicate seeds from it; two of them,
+   *     valid `[vf,vt)` + transaction `[tf,tt)`, cover a bitemporal as-of).
+   *   - `keys`: `[k]` for a hash index, `[loKey, hiKey]` for an interval index.
+   * An interval index is edge-only; a hash index takes exactly one key.
    */
-  createVertexIndex: (handle: GraphHandle, key: string) => void;
-  createEdgeIndex: (handle: GraphHandle, key: string) => void;
-  /**
-   * Declare an RI-tree interval index over an edge `[loKey, hiKey)` temporal pair.
-   * An as-of (`lo <= v AND hi > v`) / overlap predicate then seeds from the interval
-   * index; two of them (valid `[vf,vt)` + transaction `[tf,tt)`) intersect for a
-   * bitemporal as-of.
-   */
-  createEdgeIntervalIndex: (handle: GraphHandle, loKey: string, hiKey: string) => void;
+  createIndex: (handle: GraphHandle, on: IndexTarget, kind: IndexKind, keys: string[]) => void;
 
   /**
    * Set the GQL operator-chain ceiling for this graph (the `maxOperatorChain`

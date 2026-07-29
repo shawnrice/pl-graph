@@ -25,7 +25,7 @@ const WASM = new URL(
 // Declare one of every schema kind. Cardinality/type carry their extra fields;
 // the edge-unique below also proves an index-backed constraint dumps its auto-index.
 const declareAll = (g: RustGraph): void => {
-  g.createVertexIndex('handle');
+  g.createIndex({ on: 'vertex', kind: 'hash', keys: ['handle'] });
   g.createUniqueConstraint('User', 'email');
   g.createRequiredConstraint('User', 'name');
   g.createTypeConstraint('User', 'age', 'number');

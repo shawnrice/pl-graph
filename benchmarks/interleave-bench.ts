@@ -71,7 +71,7 @@ const measure = (engine: Engine, n: number): Phases => {
   const q = (s: string, p?: Record<string, unknown>) =>
     engine === 'TS' ? tsQuery(g, s, p as never) : g.query(s, p);
   g.disableEvents?.();
-  g.createVertexIndex('id');
+  g.createIndex({ on: 'vertex', kind: 'hash', keys: ['id'] });
 
   // Bulk load: N vertices, each with one outgoing edge to the next.
   for (let i = 0; i < n; i++) {

@@ -91,7 +91,7 @@ describe('hardening: SET/REMOVE maintain the property index', () => {
   test('SET reindexes, so an indexed seek finds the new value', () => {
     const plain = createTestSocialGraph();
     const indexed = createTestSocialGraph();
-    indexed.createVertexIndex('age');
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
 
     for (const g of [plain, indexed]) {
       query(g, `MATCH (n:Person {name: 'marko'}) SET n.age = 31`);
@@ -107,7 +107,7 @@ describe('hardening: SET/REMOVE maintain the property index', () => {
 
   test('SET reindexes, so the old value no longer seeks the node', () => {
     const indexed = createTestSocialGraph();
-    indexed.createVertexIndex('age');
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
     query(indexed, `MATCH (n:Person {name: 'marko'}) SET n.age = 31`);
 
     expect(query(indexed, `MATCH (n:Person) WHERE n.age = 29 RETURN n.name`)).toEqual([]);
@@ -116,7 +116,7 @@ describe('hardening: SET/REMOVE maintain the property index', () => {
   test('REMOVE reindexes (indexed and unindexed agree)', () => {
     const plain = createTestSocialGraph();
     const indexed = createTestSocialGraph();
-    indexed.createVertexIndex('age');
+    indexed.createIndex({ on: 'vertex', kind: 'hash', keys: ['age'] });
 
     for (const g of [plain, indexed]) {
       query(g, `MATCH (n:Person {name: 'marko'}) SET n.age = 100`);
