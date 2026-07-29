@@ -8947,3 +8947,49 @@ fn bench_temporal_index() {
     let b_hist = bench(&mut g_ri, "as-of historical", asof, &p_hist);
     eprintln!("      └─ {:.2}x vs scan", base[1] / b_hist);
 }
+
+/// Round-16's #1 bitemporal BLOCKER was that variable-length paths couldn't filter
+/// edges, forcing a materialize-a-slice-then-traverse hack. The per-repetition WHERE
+/// (shipped round-18, ISO `parenthesizedPathPatternWhereClause`) should retire it:
+/// each hop's edge is filtered by the as-of predicate inline, no slice, no mutation.
+/// Chain v4→v3→v2→v1→v0; the v3→v2 edge is EXPIRED at the query date, so an as-of
+/// traversal from v4 must stop at v3.
+#[test]
+fn bitemporal_per_rep_where_filters_variable_length_traversal() {
+    let e = |from: &str, to: &str, vf: &str, vt: &str| {
+        format!(
+            r#"{{"type":"edge","from":"{from}","to":"{to}","labels":["REPORTS_TO"],"properties":{{"vf":{{"@date":"{vf}"}},"vt":{{"@date":"{vt}"}}}}}}"#
+        )
+    };
+    let mut lines: Vec<String> = (0..5)
+        .map(|i| {
+            format!(r#"{{"type":"node","id":"v{i}","labels":["E"],"properties":{{"id":"v{i}"}}}}"#)
+        })
+        .collect();
+    lines.push(e("v1", "v0", "2020-01-01", "9999-12-31")); // valid at 2024
+    lines.push(e("v2", "v1", "2020-01-01", "9999-12-31")); // valid at 2024
+    lines.push(e("v3", "v2", "2020-01-01", "2022-01-01")); // EXPIRED by 2024
+    lines.push(e("v4", "v3", "2020-01-01", "9999-12-31")); // valid at 2024
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let mut g = graph_of(&refs);
+
+    // As-of 2024: per-rep WHERE keeps only edges valid at the date. From v4 the walk
+    // follows v4→v3 (valid) then finds v3→v2 expired, so it stops — reachable = {v3}.
+    let asof = "MATCH (a:E {id:'v4'}) \
+        ((x)-[r:REPORTS_TO]->(y) WHERE r.vf <= DATE '2024-01-01' AND r.vt > DATE '2024-01-01'){1,4} \
+        (z:E) RETURN z.id AS id ORDER BY id";
+    assert_eq!(
+        rows(&mut g, asof),
+        vec![vec![s("v3")]],
+        "per-rep as-of must stop at the expired edge"
+    );
+
+    // Unfiltered, the same shape reaches every ancestor — proving the filter is what
+    // pruned the chain, not the topology.
+    let plain =
+        "MATCH (a:E {id:'v4'}) ((x)-[:REPORTS_TO]->(y)){1,4} (z:E) RETURN z.id AS id ORDER BY id";
+    assert_eq!(
+        rows(&mut g, plain),
+        vec![vec![s("v0")], vec![s("v1")], vec![s("v2")], vec![s("v3")]],
+    );
+}
