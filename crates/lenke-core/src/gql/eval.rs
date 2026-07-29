@@ -7241,38 +7241,47 @@ fn prop_index_hint(
                     })
                 };
                 // Each edge interval index whose `lo_key ≤/< qlo AND hi_key >/≥ qhi` pair
-                // is present in the conjunction contributes one candidate SUPERSET (the
-                // WHERE refines it): a point stab when qlo==qhi, else a window-normalized
-                // overlap — covering as-of, overlap, AND contains (min/max is essential;
-                // overlap(qhi,qlo) on contains would be min>max → empty → a silent miss).
-                // Intersecting across indexes gives the bitemporal 4-way: valid [vf,vt)
-                // stab(V) ∩ transaction [tf,tt) stab(T). Intersect smallest-first.
-                let mut seeks: Vec<Vec<u32>> = Vec::new();
+                // is present in the conjunction can seed a candidate SUPERSET (a point stab
+                // when qlo==qhi, else a window-normalized overlap — min/max is essential, or
+                // `overlap(qhi,qlo)` on a contains shape would be min>max → empty → a silent
+                // miss). For the bitemporal 4-way we DON'T intersect the axes: one axis is
+                // often non-selective — e.g. "believed now" (`tt=∞`) matches ~every version,
+                // so materializing its stab and intersecting is O(all rows) and can lose to
+                // a scan. Instead compare axes' sizes CHEAPLY via *_len (no materialization),
+                // seed from the MOST SELECTIVE axis only, and let the final WHERE verify the
+                // rest. (An enum: stab point, or overlap window.)
+                enum Probe {
+                    Stab(i128),
+                    Overlap(i128, i128),
+                }
+                let mut best: Option<(usize, Probe, usize)> = None; // (index, probe, size)
                 for (n, (lo_key, hi_key)) in graph.edge_interval_index_specs().iter().enumerate() {
-                    if let (Some((slo, qlo)), Some((shi, qhi))) =
+                    let (Some((slo, qlo)), Some((shi, qhi))) =
                         (probe(lo_key, true), probe(hi_key, false))
-                    {
-                        if slo == shi {
-                            seeks.push(if qlo == qhi {
-                                graph.edge_interval_stab_nth(n, qlo)
-                            } else {
-                                graph.edge_interval_overlap_nth(n, qlo.min(qhi), qlo.max(qhi))
-                            });
-                        }
+                    else {
+                        continue;
+                    };
+                    if slo != shi {
+                        continue;
+                    }
+                    let (pr, len) = if qlo == qhi {
+                        (Probe::Stab(qlo), graph.edge_interval_stab_len_nth(n, qlo))
+                    } else {
+                        let (d1, d2) = (qlo.min(qhi), qlo.max(qhi));
+                        (
+                            Probe::Overlap(d1, d2),
+                            graph.edge_interval_overlap_len_nth(n, d1, d2),
+                        )
+                    };
+                    if best.as_ref().is_none_or(|(_, _, b)| len < *b) {
+                        best = Some((n, pr, len));
                     }
                 }
-                if let Some(pos) = seeks
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, s)| s.len())
-                    .map(|(i, _)| i)
-                {
-                    let mut acc = seeks.swap_remove(pos);
-                    for s in &seeks {
-                        let set: std::collections::HashSet<u32> = s.iter().copied().collect();
-                        acc.retain(|id| set.contains(id));
-                    }
-                    return Some(acc);
+                if let Some((n, pr, _)) = best {
+                    return Some(match pr {
+                        Probe::Stab(q) => graph.edge_interval_stab_nth(n, q),
+                        Probe::Overlap(d1, d2) => graph.edge_interval_overlap_nth(n, d1, d2),
+                    });
                 }
             }
             // Group every indexed single-column comparison by (var slot, key ref) and

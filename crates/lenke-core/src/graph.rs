@@ -1984,6 +1984,16 @@ impl Graph {
         self.edge_interval_idxs[n].tree.overlap(d1, d2)
     }
 
+    /// The result SIZE of a stab / overlap on the `n`-th interval index without
+    /// materializing — for cheap cross-axis selectivity comparison (seed from the
+    /// smallest; never materialize a non-selective stab like "everything believed now").
+    pub fn edge_interval_stab_len_nth(&self, n: usize, q: i128) -> usize {
+        self.edge_interval_idxs[n].tree.stab_len(q)
+    }
+    pub fn edge_interval_overlap_len_nth(&self, n: usize, d1: i128, d2: i128) -> usize {
+        self.edge_interval_idxs[n].tree.overlap_len(d1, d2)
+    }
+
     /// The `(lo_key, hi_key)` each edge interval index covers, in order — for the seed
     /// selector to recognize matching predicates and intersect across dimensions.
     pub(crate) fn edge_interval_index_specs(&self) -> Vec<(&str, &str)> {

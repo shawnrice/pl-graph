@@ -90,23 +90,20 @@ impl RiTree {
         self.len -= 1;
     }
 
-    /// All ids whose interval contains the point `q` (`lo <= q <= hi`). For a half-open
-    /// as-of `[vf, vt)` the caller passes `hi = vt - 1` so the seek stays a superset that
-    /// the final `WHERE vt > v` verifies (and `vf <= v` too).
-    pub(crate) fn stab(&self, q: i128) -> Vec<u32> {
+    /// Walk the stab of point `q`, calling `visit(ids)` for each matching bucket.
+    fn stab_visit(&self, q: i128, mut visit: impl FnMut(&[u32])) {
+        use std::ops::Bound::Included;
         let q = bias(q);
-        let mut out = Vec::new();
         let mut v = ROOT;
         let mut step = ROOT_STEP;
         loop {
             if q >= v {
                 // lo <= v <= q for anything registered here, so it contains q iff hi >= q.
-                for (&(f, _), ids) in self.upper.range((
-                    std::ops::Bound::Included((v, q)),
-                    std::ops::Bound::Included((v, u128::MAX)),
-                )) {
-                    debug_assert_eq!(f, v);
-                    out.extend_from_slice(ids);
+                for (_, ids) in self
+                    .upper
+                    .range((Included((v, q)), Included((v, u128::MAX))))
+                {
+                    visit(ids);
                 }
                 if step == 0 {
                     break;
@@ -114,12 +111,8 @@ impl RiTree {
                 v += step;
             } else {
                 // hi >= v > q for anything registered here, so it contains q iff lo <= q.
-                for (&(f, _), ids) in self.lower.range((
-                    std::ops::Bound::Included((v, 0)),
-                    std::ops::Bound::Included((v, q)),
-                )) {
-                    debug_assert_eq!(f, v);
-                    out.extend_from_slice(ids);
+                for (_, ids) in self.lower.range((Included((v, 0)), Included((v, q)))) {
+                    visit(ids);
                 }
                 if step == 0 {
                     break;
@@ -128,7 +121,25 @@ impl RiTree {
             }
             step >>= 1;
         }
+    }
+
+    /// All ids whose interval contains the point `q` (`lo <= q <= hi`). For a half-open
+    /// as-of `[vf, vt)` the caller passes `hi = vt - 1` so the seek stays a superset that
+    /// the final `WHERE vt > v` verifies (and `vf <= v` too).
+    pub(crate) fn stab(&self, q: i128) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.stab_visit(q, |ids| out.extend_from_slice(ids));
         out
+    }
+
+    /// The stab result SIZE, without materializing the ids — sums bucket lengths in one
+    /// walk (O(buckets on the path), not O(result)). Lets a multi-index seek compare
+    /// axes' selectivity CHEAPLY and seed from the smallest, never materializing a
+    /// non-selective stab (e.g. "everything believed now").
+    pub(crate) fn stab_len(&self, q: i128) -> usize {
+        let mut n = 0;
+        self.stab_visit(q, |ids| n += ids.len());
+        n
     }
 
     /// All ids whose interval `[lo, hi]` overlaps the closed query range `[d1, d2]`
@@ -138,19 +149,18 @@ impl RiTree {
     ///   • fork ∈ [d1, d2]  — the fork itself is in range ⇒ the interval overlaps.
     ///   • fork < d1        — on the root→d1 path (it must contain d1); overlaps iff hi >= d1.
     ///   • fork > d2        — on the root→d2 path (it must contain d2); overlaps iff lo <= d2.
-    pub(crate) fn overlap(&self, d1: i128, d2: i128) -> Vec<u32> {
+    fn overlap_visit(&self, d1: i128, d2: i128, mut visit: impl FnMut(&[u32])) {
         use std::ops::Bound::Included;
         let (a, b) = (bias(d1), bias(d2));
         if a > b {
-            return Vec::new();
+            return;
         }
-        let mut out = Vec::new();
         // Inner: every interval whose fork ∈ [a, b] (one `lower` entry each).
         for (_, ids) in self
             .lower
             .range((Included((a, 0)), Included((b, u128::MAX))))
         {
-            out.extend_from_slice(ids);
+            visit(ids);
         }
         // Left boundary: nodes v < a on the root→a path — overlaps iff hi >= a.
         let (mut v, mut step) = (ROOT, ROOT_STEP);
@@ -160,7 +170,7 @@ impl RiTree {
                     .upper
                     .range((Included((v, a)), Included((v, u128::MAX))))
                 {
-                    out.extend_from_slice(ids);
+                    visit(ids);
                 }
             }
             if step == 0 {
@@ -174,7 +184,7 @@ impl RiTree {
         loop {
             if v > b {
                 for (_, ids) in self.lower.range((Included((v, 0)), Included((v, b)))) {
-                    out.extend_from_slice(ids);
+                    visit(ids);
                 }
             }
             if step == 0 {
@@ -183,7 +193,20 @@ impl RiTree {
             v = if b < v { v - step } else { v + step };
             step >>= 1;
         }
+    }
+
+    /// All ids whose interval `[lo, hi]` overlaps `[d1, d2]` (superset the WHERE verifies).
+    pub(crate) fn overlap(&self, d1: i128, d2: i128) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.overlap_visit(d1, d2, |ids| out.extend_from_slice(ids));
         out
+    }
+
+    /// The overlap result SIZE without materializing — the analogue of [`Self::stab_len`].
+    pub(crate) fn overlap_len(&self, d1: i128, d2: i128) -> usize {
+        let mut n = 0;
+        self.overlap_visit(d1, d2, |ids| n += ids.len());
+        n
     }
 }
 

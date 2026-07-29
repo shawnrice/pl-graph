@@ -9522,14 +9522,22 @@ fn bench_bitemporal_4way() {
         }
         let a = g.add_vertex(&["N".to_string()], vec![]);
         let b = g.add_vertex(&["N".to_string()], vec![]);
+        const INF: i32 = 3_000_000; // far-future "believed now" sentinel
         let mut rng = Rng(0x51ed_2701);
         for _ in 0..N {
-            // Wide start spread, narrow durations → valid-at-V and believed-at-T each
-            // select ~7%, so their intersection is small and the two-index seek pays off.
+            // Valid axis is selective (wide start spread, narrow durations → ~7% at V).
+            // Transaction axis is deliberately NON-selective: ~90% are current belief
+            // (tt = ∞), so tx-stab(T="now") matches ~everything — the "current org chart"
+            // case where the old two-stab-intersect LOST to a scan. The fix must seed
+            // from the selective valid axis and verify tx, never materialize the tx stab.
             let vf = V - rng.r(0, 30_000);
             let vt = vf + rng.r(50, 2000);
             let tf = T - rng.r(0, 30_000);
-            let tt = tf + rng.r(50, 2000);
+            let tt = if rng.r(0, 10) == 0 {
+                tf + rng.r(50, 2000)
+            } else {
+                INF
+            };
             g.add_edge(
                 a,
                 b,
