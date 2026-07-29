@@ -7244,15 +7244,20 @@ fn prop_index_hint(
                     if let (Some((slo, qlo)), Some((shi, qhi))) =
                         (probe(lo_key, true), probe(hi_key, false))
                     {
-                        // `probe(lo_key,..)` matched `lo_key < X` → qlo = X (the upper
-                        // window end d2); `probe(hi_key,..)` matched `hi_key > Y` → qhi =
-                        // Y (the lower end d1). Same probe (as-of `≤v AND >v`) → point
-                        // stab; distinct probes (overlap `<d2 AND >d1`) → range overlap.
+                        // The predicate is `lo_key ≤/< qlo AND hi_key >/≥ qhi` — i.e.
+                        // every interval with `vf ≤ qlo AND vt ≥ qhi`. That set is always
+                        // a subset of "intersects the window [min(qlo,qhi), max]", so a
+                        // window-normalized overlap seek is a correct SUPERSET the WHERE
+                        // then refines — covering as-of (qlo==qhi → point), overlap
+                        // (qhi<qlo → window), AND contains (qhi>qlo, e.g. `vf<qf AND
+                        // vt>qt`). Normalizing to (min,max) is essential: `overlap(qhi,
+                        // qlo)` on the contains shape would be min>max → empty → a silent
+                        // miss. Point case keeps the cheaper single-walk stab.
                         if slo == shi {
                             let cand = if qlo == qhi {
                                 graph.edge_interval_stab(qlo)
                             } else {
-                                graph.edge_interval_overlap(qhi, qlo)
+                                graph.edge_interval_overlap(qlo.min(qhi), qlo.max(qhi))
                             };
                             if let Some(cand) = cand {
                                 return Some(cand);
