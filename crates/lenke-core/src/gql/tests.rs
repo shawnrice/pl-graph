@@ -8455,3 +8455,292 @@ fn parallel_projection_with_per_row_subquery_over_a_large_frame() {
     }
     assert_eq!(reachable, count / 2);
 }
+
+/// Serial-vs-parallel timing for `parallel-query`, across the shapes it parallelizes
+/// (large-frame projection, per-row subqueries, GROUP BY aggregation). Ignored — it's a
+/// benchmark, not a check. Run the SAME binary twice to isolate the parallelization
+/// effect (only the rayon thread count changes):
+///   RAYON_NUM_THREADS=1 cargo test --release --features parallel-query bench_parallel_query -- --ignored --nocapture
+///   cargo test --release --features parallel-query bench_parallel_query -- --ignored --nocapture
+#[cfg(feature = "parallel-query")]
+#[test]
+#[ignore = "benchmark; run with --ignored --nocapture and vary RAYON_NUM_THREADS"]
+fn bench_parallel_query_speedup() {
+    use std::time::Instant;
+
+    // N vertices in bounded C-chains: each `-[:R]->+` walk stays within its chain, so
+    // a per-row subquery does real but O(C) traversal — the "advanced query that fans
+    // out" shape. Frame is N rows (>> the 16_384 par_project threshold).
+    let n = 100_000usize;
+    let chain = 32usize;
+    let mut lines: Vec<String> = (0..n)
+        .map(|i| {
+            format!(
+                r#"{{"type":"node","id":"v{i}","labels":["T"],"properties":{{"val":{i},"grp":{}}}}}"#,
+                i % 256
+            )
+        })
+        .collect();
+    for i in 0..n {
+        if i + 1 < n && (i + 1) % chain != 0 {
+            lines.push(format!(
+                r#"{{"type":"edge","id":"e{i}","from":"v{i}","to":"v{}","labels":["R"],"properties":{{}}}}"#,
+                i + 1
+            ));
+        }
+    }
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let mut g = graph_of(&refs);
+    eprintln!(
+        "\nrayon threads = {} | graph {} nodes / {} edges",
+        rayon::current_num_threads(),
+        g.vertex_count(),
+        g.edge_count()
+    );
+
+    let bench = |g: &mut Graph, name: &str, query: &str, iters: usize| {
+        let _ = rows(g, query); // warmup
+        let mut ms: Vec<f64> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = Instant::now();
+            let out = rows(g, query);
+            ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            std::hint::black_box(out);
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "  {:<34} p50={:>8.2}ms  min={:>8.2}ms",
+            name,
+            ms[ms.len() / 2],
+            ms[0]
+        );
+    };
+
+    bench(
+        &mut g,
+        "light scalar projection",
+        "MATCH (a:T) RETURN a.val * 2 + 1 AS w",
+        25,
+    );
+    bench(
+        &mut g,
+        "heavy scalar projection",
+        "MATCH (a:T) RETURN (a.val * 2 + 1) * (a.val - 3) + a.val * a.val - a.val / 2 AS w",
+        25,
+    );
+    bench(
+        &mut g,
+        "per-row EXISTS subquery",
+        "MATCH (a:T) RETURN a.val AS v, EXISTS { MATCH (a)-[:R]->+(b:T) } AS r",
+        15,
+    );
+    bench(
+        &mut g,
+        "per-row COUNT subquery",
+        "MATCH (a:T) RETURN a.val AS v, COUNT { MATCH (a)-[:R]->+(b:T) } AS c",
+        10,
+    );
+    bench(
+        &mut g,
+        "GROUP BY aggregation",
+        "MATCH (a:T) RETURN a.grp AS g, count(*) AS c, avg(a.val) AS m",
+        25,
+    );
+    bench(
+        &mut g,
+        "WHERE arith filter",
+        "MATCH (a:T) WHERE a.val * 3 > 100000 AND a.val < 250000 RETURN a.val AS v",
+        25,
+    );
+    bench(
+        &mut g,
+        "1-hop expansion join",
+        "MATCH (a:T)-[:R]->(b:T) RETURN a.val AS x, b.val AS y",
+        20,
+    );
+    bench(
+        &mut g,
+        "2-hop expansion join",
+        "MATCH (a:T)-[:R]->(b:T)-[:R]->(c:T) RETURN c.val AS v",
+        20,
+    );
+    bench(
+        &mut g,
+        "1-hop COUNT subquery",
+        "MATCH (a:T) RETURN a.val AS v, COUNT { MATCH (a)-[:R]->(b:T) } AS c",
+        15,
+    );
+    bench(
+        &mut g,
+        "global aggregate",
+        "MATCH (a:T) RETURN count(*) AS c, avg(a.val) AS m, sum(a.val) AS s",
+        25,
+    );
+    bench(
+        &mut g,
+        "heavy GROUP BY (5 aggs)",
+        "MATCH (a:T) RETURN a.grp AS g, count(*) AS c, avg(a.val) AS m, min(a.val) AS lo, max(a.val) AS hi",
+        25,
+    );
+}
+
+/// AML-shaped workload (the gnarly round-16/17/18 patterns): a transaction network,
+/// then the layering / structuring / circular-flow queries. Same serial-vs-parallel
+/// protocol (vary RAYON_NUM_THREADS) to gauge whether real AML queries speed up.
+#[cfg(feature = "parallel-query")]
+#[test]
+#[ignore = "benchmark; run with --ignored --nocapture and vary RAYON_NUM_THREADS"]
+fn bench_aml_shapes() {
+    use std::time::Instant;
+
+    // 50k accounts, fan-out 3 (i→i+1, i→7i+3, i→13i+5 mod n) with amount + ts. Gives
+    // chains, fan-in/out, and cycles — the AML substrate.
+    let n = 50_000usize;
+    let mut lines: Vec<String> = (0..n)
+        .map(|i| {
+            format!(r#"{{"type":"node","id":"a{i}","labels":["A"],"properties":{{"id":{i}}}}}"#)
+        })
+        .collect();
+    let mut e = 0usize;
+    for i in 0..n {
+        for &t in &[(i + 1) % n, (i * 7 + 3) % n, (i * 13 + 5) % n] {
+            lines.push(format!(
+                r#"{{"type":"edge","id":"t{e}","from":"a{i}","to":"a{t}","labels":["TX"],"properties":{{"amt":{},"ts":{i}}}}}"#,
+                (i % 900) + 100
+            ));
+            e += 1;
+        }
+    }
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let mut g = graph_of(&refs);
+    eprintln!(
+        "\nrayon threads = {} | AML graph {} accts / {} tx",
+        rayon::current_num_threads(),
+        g.vertex_count(),
+        g.edge_count()
+    );
+
+    let bench = |g: &mut Graph, name: &str, query: &str, iters: usize| {
+        let _ = rows(g, query);
+        let mut ms: Vec<f64> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = Instant::now();
+            std::hint::black_box(rows(g, query));
+            ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "  {:<40} p50={:>8.2}ms  min={:>8.2}ms",
+            name,
+            ms[ms.len() / 2],
+            ms[0]
+        );
+    };
+
+    // Per-account subquery shapes (the outer fan-out over 50k accounts parallelizes).
+    bench(
+        &mut g,
+        "layering spread COUNT ->{1,3}",
+        "MATCH (a:A) RETURN a.id AS id, COUNT { MATCH (a)-[:TX]->{1,3}(b:A) } AS spread",
+        8,
+    );
+    bench(
+        &mut g,
+        "circular-flow EXISTS ->{2,4}(a)",
+        "MATCH (a:A) WHERE EXISTS { MATCH (a)-[:TX]->{2,4}(a) } RETURN a.id AS id",
+        8,
+    );
+    bench(
+        &mut g,
+        "fundedby depth COUNT <-{1,3}",
+        "MATCH (a:A) RETURN a.id AS id, COUNT { MATCH (a)<-[:TX]-{1,3}(s:A) } AS sources",
+        8,
+    );
+    // Unrolled fixed-3-hop layering with monotone-decreasing amounts (structuring).
+    bench(
+        &mut g,
+        "3-hop decreasing-amount chain",
+        "MATCH (a:A)-[e1:TX]->(b:A)-[e2:TX]->(c:A)-[e3:TX]->(d:A) \
+         WHERE e1.amt > e2.amt AND e2.amt > e3.amt RETURN a.id AS s, d.id AS t LIMIT 5000",
+        8,
+    );
+}
+
+/// HRIS-shaped workload: an org hierarchy (tree, each person REPORTS_TO one manager)
+/// plus departments, then the span-of-control / depth / chain queries. Sparse tree
+/// (vs AML's dense network), so per-entity work is cheaper and imbalanced — measure
+/// whether it still parallelizes. Same RAYON_NUM_THREADS protocol.
+#[cfg(feature = "parallel-query")]
+#[test]
+#[ignore = "benchmark; run with --ignored --nocapture and vary RAYON_NUM_THREADS"]
+fn bench_hris_shapes() {
+    use std::time::Instant;
+
+    // 100k employees, branching factor 6: employee i REPORTS_TO (i-1)/6 (i=0 is the CEO).
+    // dept = i % 50. A realistic ~7-level org tree.
+    let n = 100_000usize;
+    let mut lines: Vec<String> = (0..n)
+        .map(|i| {
+            format!(
+                r#"{{"type":"node","id":"e{i}","labels":["Emp"],"properties":{{"id":{i},"dept":{}}}}}"#,
+                i % 50
+            )
+        })
+        .collect();
+    for i in 1..n {
+        lines.push(format!(
+            r#"{{"type":"edge","id":"r{i}","from":"e{i}","to":"e{}","labels":["REPORTS_TO"],"properties":{{}}}}"#,
+            (i - 1) / 6
+        ));
+    }
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let mut g = graph_of(&refs);
+    eprintln!(
+        "\nrayon threads = {} | HRIS org {} emps / {} reports-to",
+        rayon::current_num_threads(),
+        g.vertex_count(),
+        g.edge_count()
+    );
+
+    let bench = |g: &mut Graph, name: &str, query: &str, iters: usize| {
+        let _ = rows(g, query);
+        let mut ms: Vec<f64> = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = Instant::now();
+            std::hint::black_box(rows(g, query));
+            ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "  {:<40} p50={:>8.2}ms  min={:>8.2}ms",
+            name,
+            ms[ms.len() / 2],
+            ms[0]
+        );
+    };
+
+    bench(
+        &mut g,
+        "span-of-control COUNT descendants",
+        "MATCH (m:Emp) RETURN m.id AS id, COUNT { MATCH (m)<-[:REPORTS_TO]-*(r:Emp) } AS reports",
+        8,
+    );
+    bench(
+        &mut g,
+        "management depth COUNT ancestors",
+        "MATCH (e:Emp) RETURN e.id AS id, COUNT { MATCH (e)-[:REPORTS_TO]->+(m:Emp) } AS levels",
+        8,
+    );
+    bench(
+        &mut g,
+        "in-chain-of-exec EXISTS (bound)",
+        "MATCH (e:Emp) WHERE EXISTS { MATCH (e)-[:REPORTS_TO]->+(m:Emp {id:5}) } RETURN e.id AS id",
+        8,
+    );
+    bench(
+        &mut g,
+        "headcount by dept (GROUP BY)",
+        "MATCH (e:Emp) RETURN e.dept AS d, count(*) AS n",
+        20,
+    );
+}

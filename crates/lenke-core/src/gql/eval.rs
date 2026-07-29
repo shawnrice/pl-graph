@@ -6557,25 +6557,45 @@ fn temporal_compare_sort(
 /// for any subexpression outside the numeric vector subset). Reuses one binding,
 /// setting every scanned slot to its per-row element.
 fn scalar_col(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> Vec<Val> {
-    let mut b = Binding(vec![None; sc.slots.len()]);
-    (0..sc.n)
-        .map(|i| {
-            for (slot, col) in sc.slots.iter().enumerate() {
-                if let Some((elem, ids)) = col {
-                    b.set(
-                        slot,
-                        match elem {
-                            Elem::Node => Val::Node(ids[i]),
-                            Elem::Edge => Val::Edge(ids[i]),
-                        },
-                    );
-                } else if let Some(vals) = &sc.vals[slot] {
-                    b.set(slot, vals[i].clone());
-                }
+    // Bind row `i`'s frame columns into `b`, then evaluate `e`. `Gen` columns are where
+    // per-row subqueries (EXISTS / COUNT / pattern) and other non-vectorizable exprs land,
+    // so this is often the heaviest per-row work in a projection or WHERE.
+    let bind_and_eval = |b: &mut Binding, i: usize| -> Val {
+        for (slot, col) in sc.slots.iter().enumerate() {
+            if let Some((elem, ids)) = col {
+                b.set(
+                    slot,
+                    match elem {
+                        Elem::Node => Val::Node(ids[i]),
+                        Elem::Edge => Val::Edge(ids[i]),
+                    },
+                );
+            } else if let Some(vals) = &sc.vals[slot] {
+                b.set(slot, vals[i].clone());
             }
-            eval(&Env::new(graph, ctx, &b), e)
-        })
-        .collect()
+        }
+        eval(&Env::new(graph, ctx, b), e)
+    };
+
+    // Rows are independent, so for a large frame split them across rayon threads: each
+    // thread reuses its own `Binding`, and an indexed collect preserves row order. Sound
+    // because `&Ctx` is `Sync` under this feature (atomic fault + `Mutex` trail-mark pool).
+    #[cfg(feature = "parallel-query")]
+    {
+        const MIN_ROWS: usize = 8_192;
+        if sc.n >= MIN_ROWS && rayon::current_num_threads() > 1 {
+            return (0..sc.n)
+                .into_par_iter()
+                .map_init(
+                    || Binding(vec![None; sc.slots.len()]),
+                    |b, i| bind_and_eval(b, i),
+                )
+                .collect();
+        }
+    }
+
+    let mut b = Binding(vec![None; sc.slots.len()]);
+    (0..sc.n).map(|i| bind_and_eval(&mut b, i)).collect()
 }
 
 /// Evaluate `e` over the whole matched row set `sc`. Numeric and boolean
