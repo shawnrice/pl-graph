@@ -17,6 +17,11 @@
 //! This module carries no `serde_json` (the `gql` feature deliberately omits it
 //! to keep the binary small), so the JSON report is hand-rolled.
 
+// C-ABI boundary module: re-permit `unsafe` (denied crate-wide) but keep every raw-pointer
+// op an explicit block via `unsafe_op_in_unsafe_fn`. See the note atop `ffi.rs`.
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
 use std::cell::RefCell;
 #[cfg(feature = "_fallible-ffi")]
 use std::fmt::Write as _;
@@ -81,7 +86,8 @@ pub unsafe extern "C" fn lnk_last_error_json(out_len: *mut usize) -> *mut u8 {
         Some(json) => {
             let bytes = json.into_bytes().into_boxed_slice();
             if !out_len.is_null() {
-                *out_len = bytes.len();
+                // SAFETY: out_len is non-null (checked) and the caller's # Safety contract requires it be writable.
+                unsafe { *out_len = bytes.len() };
             }
             Box::into_raw(bytes) as *mut u8
         }

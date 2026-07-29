@@ -12,6 +12,11 @@
 //! Binding-agnostic: `ffi` exposes a C ABI for bun:ffi (and later wasm-bindgen)
 //! over a stateful graph handle.
 
+// The engine is safe Rust. `unsafe` is denied crate-wide and re-permitted only in the
+// C-ABI boundary modules (`ffi`, `ffi_error`), which additionally deny
+// `unsafe_op_in_unsafe_fn` so every raw-pointer op there is an explicit, minimal block.
+#![deny(unsafe_code)]
+
 // Core (always compiled): the columnar graph, the fingerprint query subset, and
 // the C-ABI surface.
 pub mod error;

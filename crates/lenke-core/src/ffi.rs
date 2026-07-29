@@ -6,10 +6,64 @@
 //! (`lnk_encode_ndjson`) are heap-allocated here and must be returned via
 //! `lnk_free_buf`. The graph handle must be returned via `lnk_graph_free`.
 
+// This module IS the unsafe boundary: the crate root denies `unsafe_code`, so it is
+// re-permitted here — and `unsafe_op_in_unsafe_fn` is denied so every raw-pointer op is
+// an explicit `unsafe { … }` block, never an implicit whole-body context. The real
+// unsafe surface is the three shims below; every export routes its pointers through them
+// and is otherwise ordinary safe Rust.
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
 #[cfg(feature = "_fallible-ffi")]
 use crate::error_codes::ErrorCode;
 use crate::graph::Graph;
 use crate::query;
+
+// ---------- raw-pointer boundary shims ----------
+//
+// The only place caller-owned raw pointers become safe references/slices. `as_ref`/
+// `as_mut` fold the null check into the deref (null → None); `in_str`/`in_bytes` borrow
+// an inbound buffer. Reviewed once here, so every `lnk_*` export below is safe code apart
+// from its `unsafe { … }` call to one of these.
+
+/// Borrow a graph handle immutably (null → `None`).
+///
+/// # Safety
+/// If non-null, `g` must point to a live `Graph` that is not mutably aliased for `'a`.
+unsafe fn graph_ref<'a>(g: *const Graph) -> Option<&'a Graph> {
+    // SAFETY: as_ref() yields None for a null pointer; otherwise the caller's # Safety contract requires g point to a live, aligned, non-mutably-aliased Graph for 'a.
+    unsafe { g.as_ref() }
+}
+
+/// Borrow a graph handle mutably (null → `None`).
+///
+/// # Safety
+/// If non-null, `g` must point to a live `Graph` uniquely borrowed (no other alias) for `'a`.
+unsafe fn graph_mut<'a>(g: *mut Graph) -> Option<&'a mut Graph> {
+    // SAFETY: as_mut() yields None for a null pointer; otherwise the caller's # Safety contract requires g point to a live, aligned, uniquely-borrowed Graph for 'a.
+    unsafe { g.as_mut() }
+}
+
+/// Borrow a caller-owned byte buffer as bytes (null → `None`).
+///
+/// # Safety
+/// If non-null, `ptr`/`len` must describe a readable, initialized byte range valid for `'a`.
+unsafe fn in_bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: ptr is non-null (checked above); the caller's # Safety contract requires ptr/len describe a readable, initialized byte range valid for 'a.
+    Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
+/// Borrow a caller-owned byte buffer as UTF-8 `&str` (null or non-UTF-8 → `None`).
+///
+/// # Safety
+/// If non-null, `ptr`/`len` must describe a readable, initialized byte range valid for `'a`.
+unsafe fn in_str<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
+    // SAFETY: forwards ptr/len to in_bytes (null -> None) under this fn's # Safety contract; the surrounding from_utf8 is safe.
+    std::str::from_utf8(unsafe { in_bytes(ptr, len) }?).ok()
+}
 
 #[no_mangle]
 pub extern "C" fn lnk_abi_version() -> u32 {
@@ -57,7 +111,8 @@ pub extern "C" fn lnk_alloc(len: usize) -> *mut u8 {
 #[no_mangle]
 pub unsafe extern "C" fn lnk_dealloc(ptr: *mut u8, len: usize) {
     if !ptr.is_null() && len != 0 {
-        drop(Vec::from_raw_parts(ptr, 0, len));
+        // SAFETY: ptr/len came from a prior lnk_alloc, per the fn's # Safety contract, and is freed exactly once.
+        drop(unsafe { Vec::from_raw_parts(ptr, 0, len) });
     }
 }
 
@@ -79,10 +134,10 @@ pub unsafe extern "C" fn lnk_graph_from_ndjson(
         crate::ffi_error::set_code(ErrorCode::Ffi, "null NDJSON pointer");
         return std::ptr::null_mut();
     }
-    let bytes = std::slice::from_raw_parts(ptr, len);
-    let text = match std::str::from_utf8(bytes) {
-        Ok(t) => t,
-        Err(_) => {
+    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+    let text = match unsafe { in_str(ptr, len) } {
+        Some(t) => t,
+        None => {
             crate::ffi_error::set_code(ErrorCode::Ffi, "NDJSON bytes are not valid UTF-8");
             return std::ptr::null_mut();
         }
@@ -123,17 +178,23 @@ pub unsafe extern "C" fn lnk_merge_ndjson(
         crate::ffi_error::set_code(ErrorCode::Ffi, "null graph or NDJSON pointer");
         return std::ptr::null_mut();
     }
-    let text = match std::str::from_utf8(std::slice::from_raw_parts(ptr, len)) {
-        Ok(t) => t,
-        Err(_) => {
+    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+    let text = match unsafe { in_str(ptr, len) } {
+        Some(t) => t,
+        None => {
             crate::ffi_error::set_code(ErrorCode::Ffi, "NDJSON bytes are not valid UTF-8");
             return std::ptr::null_mut();
         }
     };
-    match crate::ndjson::append(&mut *g, text) {
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let Some(g) = (unsafe { graph_mut(g) }) else {
+        return std::ptr::null_mut();
+    };
+    match crate::ndjson::append(g, text) {
         Ok(report) => {
             let bytes = report.to_json().into_bytes().into_boxed_slice();
-            *out_len = bytes.len();
+            // SAFETY: the caller's # Safety contract requires out_len be a valid, writable pointer.
+            unsafe { *out_len = bytes.len() };
             Box::into_raw(bytes) as *mut u8
         }
         Err(e) => {
@@ -154,10 +215,11 @@ pub unsafe extern "C" fn lnk_merge_ndjson(
 /// `g` must be a valid graph handle (or null).
 #[no_mangle]
 pub unsafe extern "C" fn lnk_graph_clone(g: *const Graph) -> *mut Graph {
-    if g.is_null() {
-        return std::ptr::null_mut();
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    match unsafe { graph_ref(g) } {
+        Some(g) => Box::into_raw(Box::new(g.clone())),
+        None => std::ptr::null_mut(),
     }
-    Box::into_raw(Box::new((*g).clone()))
 }
 
 /// # Safety
@@ -165,7 +227,9 @@ pub unsafe extern "C" fn lnk_graph_clone(g: *const Graph) -> *mut Graph {
 #[no_mangle]
 pub unsafe extern "C" fn lnk_graph_free(g: *mut Graph) {
     if !g.is_null() {
-        drop(Box::from_raw(g));
+        // Reconstitute ownership to drop it — the one op the borrow shims can't cover.
+        // SAFETY: the pointer came from this module's matching Box::into_raw, per the fn's # Safety contract, and is freed exactly once.
+        drop(unsafe { Box::from_raw(g) });
     }
 }
 
@@ -173,10 +237,11 @@ pub unsafe extern "C" fn lnk_graph_free(g: *mut Graph) {
 /// `g` must be a valid graph handle.
 #[no_mangle]
 pub unsafe extern "C" fn lnk_graph_vertex_count(g: *const Graph) -> u64 {
-    if g.is_null() {
-        return 0;
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    match unsafe { graph_ref(g) } {
+        Some(g) => g.vertex_count() as u64,
+        None => 0,
     }
-    (*g).vertex_count() as u64
 }
 
 /// Set the graph's GQL operator-chain ceiling (the native `maxOperatorChain`
@@ -187,8 +252,9 @@ pub unsafe extern "C" fn lnk_graph_vertex_count(g: *const Graph) -> u64 {
 /// `g` must be a valid graph handle.
 #[no_mangle]
 pub unsafe extern "C" fn lnk_graph_set_max_operator_chain(g: *mut Graph, n: u64) {
-    if !g.is_null() {
-        (*g).set_max_operator_chain(n as usize);
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    if let Some(g) = unsafe { graph_mut(g) } {
+        g.set_max_operator_chain(n as usize);
     }
 }
 
@@ -196,10 +262,11 @@ pub unsafe extern "C" fn lnk_graph_set_max_operator_chain(g: *mut Graph, n: u64)
 /// `g` must be a valid graph handle.
 #[no_mangle]
 pub unsafe extern "C" fn lnk_graph_edge_count(g: *const Graph) -> u64 {
-    if g.is_null() {
-        return 0;
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    match unsafe { graph_ref(g) } {
+        Some(g) => g.edge_count() as u64,
+        None => 0,
     }
-    (*g).edge_count() as u64
 }
 
 /// The graph's monotonic mutation version — an O(1) "did anything change?" read
@@ -210,10 +277,11 @@ pub unsafe extern "C" fn lnk_graph_edge_count(g: *const Graph) -> u64 {
 /// `g` must be a valid graph handle.
 #[no_mangle]
 pub unsafe extern "C" fn lnk_graph_version(g: *const Graph) -> u64 {
-    if g.is_null() {
-        return 0;
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    match unsafe { graph_ref(g) } {
+        Some(g) => g.version(),
+        None => 0,
     }
-    (*g).version()
 }
 
 /// The per-token change epoch for a label / edge-type / property-key `name`
@@ -227,12 +295,12 @@ pub unsafe extern "C" fn lnk_graph_epoch(
     name_ptr: *const u8,
     name_len: usize,
 ) -> u64 {
-    if g.is_null() || name_ptr.is_null() {
-        return 0;
-    }
-    match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)) {
-        Ok(name) => (*g).epoch(name),
-        Err(_) => 0,
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    match (unsafe { graph_ref(g) }, unsafe {
+        in_str(name_ptr, name_len)
+    }) {
+        (Some(g), Some(name)) => g.epoch(name),
+        _ => 0,
     }
 }
 
@@ -250,15 +318,15 @@ pub unsafe extern "C" fn lnk_create_vertex_index(
     name_ptr: *const u8,
     name_len: usize,
 ) -> i32 {
-    if g.is_null() || name_ptr.is_null() {
-        return -1;
-    }
-    match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)) {
-        Ok(name) => {
-            (*g).create_vertex_index(name);
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    match (unsafe { graph_mut(g) }, unsafe {
+        in_str(name_ptr, name_len)
+    }) {
+        (Some(g), Some(name)) => {
+            g.create_vertex_index(name);
             0
         }
-        Err(_) => -1,
+        _ => -1,
     }
 }
 
@@ -273,15 +341,15 @@ pub unsafe extern "C" fn lnk_create_edge_index(
     name_ptr: *const u8,
     name_len: usize,
 ) -> i32 {
-    if g.is_null() || name_ptr.is_null() {
-        return -1;
-    }
-    match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)) {
-        Ok(name) => {
-            (*g).create_edge_index(name);
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    match (unsafe { graph_mut(g) }, unsafe {
+        in_str(name_ptr, name_len)
+    }) {
+        (Some(g), Some(name)) => {
+            g.create_edge_index(name);
             0
         }
-        Err(_) => -1,
+        _ => -1,
     }
 }
 
@@ -302,16 +370,17 @@ pub unsafe extern "C" fn lnk_create_unique_constraint(
     key_ptr: *const u8,
     key_len: usize,
 ) -> i32 {
-    if g.is_null() || label_ptr.is_null() || key_ptr.is_null() {
-        return -1;
-    }
-    let (Ok(label), Ok(key)) = (
-        std::str::from_utf8(std::slice::from_raw_parts(label_ptr, label_len)),
-        std::str::from_utf8(std::slice::from_raw_parts(key_ptr, key_len)),
+    let (Some(g), Some(label), Some(key)) = (
+        // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+        unsafe { graph_mut(g) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(label_ptr, label_len) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(key_ptr, key_len) },
     ) else {
         return -1;
     };
-    match (*g).create_unique_constraint(label, key) {
+    match g.create_unique_constraint(label, key) {
         Ok(()) => 0,
         Err(_) => -2,
     }
@@ -332,16 +401,17 @@ pub unsafe extern "C" fn lnk_create_required_constraint(
     key_ptr: *const u8,
     key_len: usize,
 ) -> i32 {
-    if g.is_null() || label_ptr.is_null() || key_ptr.is_null() {
-        return -1;
-    }
-    let (Ok(label), Ok(key)) = (
-        std::str::from_utf8(std::slice::from_raw_parts(label_ptr, label_len)),
-        std::str::from_utf8(std::slice::from_raw_parts(key_ptr, key_len)),
+    let (Some(g), Some(label), Some(key)) = (
+        // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+        unsafe { graph_mut(g) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(label_ptr, label_len) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(key_ptr, key_len) },
     ) else {
         return -1;
     };
-    match (*g).create_required_constraint(label, key) {
+    match g.create_required_constraint(label, key) {
         Ok(()) => 0,
         Err(_) => -2,
     }
@@ -364,17 +434,19 @@ pub unsafe extern "C" fn lnk_create_type_constraint(
     type_ptr: *const u8,
     type_len: usize,
 ) -> i32 {
-    if g.is_null() || label_ptr.is_null() || key_ptr.is_null() || type_ptr.is_null() {
-        return -1;
-    }
-    let (Ok(label), Ok(key), Ok(ty)) = (
-        std::str::from_utf8(std::slice::from_raw_parts(label_ptr, label_len)),
-        std::str::from_utf8(std::slice::from_raw_parts(key_ptr, key_len)),
-        std::str::from_utf8(std::slice::from_raw_parts(type_ptr, type_len)),
+    let (Some(g), Some(label), Some(key), Some(ty)) = (
+        // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+        unsafe { graph_mut(g) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(label_ptr, label_len) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(key_ptr, key_len) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(type_ptr, type_len) },
     ) else {
         return -1;
     };
-    match (*g).create_type_constraint(label, key, ty) {
+    match g.create_type_constraint(label, key, ty) {
         Ok(()) => 0,
         Err(e) if e.code == crate::error_codes::ErrorCode::InvalidValue => -3,
         Err(_) => -2,
@@ -398,16 +470,17 @@ pub unsafe extern "C" fn lnk_create_edge_unique_constraint(
     key_ptr: *const u8,
     key_len: usize,
 ) -> i32 {
-    if g.is_null() || etype_ptr.is_null() || key_ptr.is_null() {
-        return -1;
-    }
-    let (Ok(etype), Ok(key)) = (
-        std::str::from_utf8(std::slice::from_raw_parts(etype_ptr, etype_len)),
-        std::str::from_utf8(std::slice::from_raw_parts(key_ptr, key_len)),
+    let (Some(g), Some(etype), Some(key)) = (
+        // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+        unsafe { graph_mut(g) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(etype_ptr, etype_len) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(key_ptr, key_len) },
     ) else {
         return -1;
     };
-    match (*g).create_edge_unique_constraint(etype, key) {
+    match g.create_edge_unique_constraint(etype, key) {
         Ok(()) => 0,
         Err(_) => -2,
     }
@@ -428,16 +501,17 @@ pub unsafe extern "C" fn lnk_create_edge_required_constraint(
     key_ptr: *const u8,
     key_len: usize,
 ) -> i32 {
-    if g.is_null() || etype_ptr.is_null() || key_ptr.is_null() {
-        return -1;
-    }
-    let (Ok(etype), Ok(key)) = (
-        std::str::from_utf8(std::slice::from_raw_parts(etype_ptr, etype_len)),
-        std::str::from_utf8(std::slice::from_raw_parts(key_ptr, key_len)),
+    let (Some(g), Some(etype), Some(key)) = (
+        // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+        unsafe { graph_mut(g) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(etype_ptr, etype_len) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(key_ptr, key_len) },
     ) else {
         return -1;
     };
-    match (*g).create_edge_required_constraint(etype, key) {
+    match g.create_edge_required_constraint(etype, key) {
         Ok(()) => 0,
         Err(_) => -2,
     }
@@ -460,17 +534,19 @@ pub unsafe extern "C" fn lnk_create_edge_type_constraint(
     type_ptr: *const u8,
     type_len: usize,
 ) -> i32 {
-    if g.is_null() || etype_ptr.is_null() || key_ptr.is_null() || type_ptr.is_null() {
-        return -1;
-    }
-    let (Ok(etype), Ok(key), Ok(ty)) = (
-        std::str::from_utf8(std::slice::from_raw_parts(etype_ptr, etype_len)),
-        std::str::from_utf8(std::slice::from_raw_parts(key_ptr, key_len)),
-        std::str::from_utf8(std::slice::from_raw_parts(type_ptr, type_len)),
+    let (Some(g), Some(etype), Some(key), Some(ty)) = (
+        // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+        unsafe { graph_mut(g) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(etype_ptr, etype_len) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(key_ptr, key_len) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(type_ptr, type_len) },
     ) else {
         return -1;
     };
-    match (*g).create_edge_type_constraint(etype, key, ty) {
+    match g.create_edge_type_constraint(etype, key, ty) {
         Ok(()) => 0,
         Err(e) if e.code == crate::error_codes::ErrorCode::InvalidValue => -3,
         Err(_) => -2,
@@ -498,17 +574,18 @@ pub unsafe extern "C" fn lnk_create_cardinality_constraint(
     min: u32,
     max: i64,
 ) -> i32 {
-    if g.is_null() || label_ptr.is_null() || etype_ptr.is_null() {
-        return -2;
-    }
-    let (Ok(label), Ok(etype)) = (
-        std::str::from_utf8(std::slice::from_raw_parts(label_ptr, label_len)),
-        std::str::from_utf8(std::slice::from_raw_parts(etype_ptr, etype_len)),
+    let (Some(g), Some(label), Some(etype)) = (
+        // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+        unsafe { graph_mut(g) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(label_ptr, label_len) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(etype_ptr, etype_len) },
     ) else {
         return -2;
     };
     let max_opt = if max < 0 { None } else { Some(max as u32) };
-    match (*g).create_cardinality_constraint(label, etype, direction, min, max_opt) {
+    match g.create_cardinality_constraint(label, etype, direction, min, max_opt) {
         Ok(()) => 0,
         Err(_) => -1,
     }
@@ -540,14 +617,21 @@ pub unsafe extern "C" fn lnk_create_validator(
     if g.is_null() || label_ptr.is_null() || var_ptr.is_null() || pred_ptr.is_null() {
         return -3;
     }
-    let (Ok(label), Ok(var), Ok(predicate)) = (
-        std::str::from_utf8(std::slice::from_raw_parts(label_ptr, label_len)),
-        std::str::from_utf8(std::slice::from_raw_parts(var_ptr, var_len)),
-        std::str::from_utf8(std::slice::from_raw_parts(pred_ptr, pred_len)),
+    let (Some(label), Some(var), Some(predicate)) = (
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(label_ptr, label_len) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(var_ptr, var_len) },
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        unsafe { in_str(pred_ptr, pred_len) },
     ) else {
         return -2;
     };
-    match (*g).create_validator(label, var, predicate) {
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let Some(g) = (unsafe { graph_mut(g) }) else {
+        return -3;
+    };
+    match g.create_validator(label, var, predicate) {
         Ok(()) => 0,
         Err(e) if e.code == ErrorCode::Syntax => -2,
         Err(_) => -1,
@@ -578,13 +662,17 @@ pub unsafe extern "C" fn lnk_create_invariant(
     if g.is_null() || name_ptr.is_null() || query_ptr.is_null() {
         return -3;
     }
-    let (Ok(name), Ok(query)) = (
-        std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)),
-        std::str::from_utf8(std::slice::from_raw_parts(query_ptr, query_len)),
-    ) else {
+    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+    let (Some(name), Some(query)) = (unsafe { in_str(name_ptr, name_len) }, unsafe {
+        in_str(query_ptr, query_len)
+    }) else {
         return -2;
     };
-    match (*g).create_invariant(name, query) {
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let Some(g) = (unsafe { graph_mut(g) }) else {
+        return -3;
+    };
+    match g.create_invariant(name, query) {
         Ok(()) => 0,
         Err(e) if e.code == ErrorCode::Syntax => -2,
         Err(_) => -1,
@@ -601,11 +689,14 @@ pub unsafe extern "C" fn lnk_create_invariant(
 /// `g` is a valid, uniquely-borrowed `*mut Graph`.
 #[no_mangle]
 pub unsafe extern "C" fn lnk_begin_tx(g: *mut Graph) -> i32 {
-    if g.is_null() {
-        return -1;
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    match unsafe { graph_mut(g) } {
+        Some(g) => {
+            g.begin_tx();
+            0
+        }
+        None => -1,
     }
-    (*g).begin_tx();
-    0
 }
 
 /// Commit the current transaction frame. Returns **0** on success (or an inner
@@ -618,13 +709,14 @@ pub unsafe extern "C" fn lnk_begin_tx(g: *mut Graph) -> i32 {
 /// As [`lnk_begin_tx`].
 #[no_mangle]
 pub unsafe extern "C" fn lnk_commit_tx(g: *mut Graph) -> i32 {
-    if g.is_null() {
-        return -3;
-    }
-    match (*g).commit_tx() {
-        Ok(()) => 0,
-        Err(crate::graph::TxCommitError::NoTx) => -2,
-        Err(_) => -1, // Required / Type / Unique — all surface as ConstraintViolation
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    match unsafe { graph_mut(g) } {
+        Some(g) => match g.commit_tx() {
+            Ok(()) => 0,
+            Err(crate::graph::TxCommitError::NoTx) => -2,
+            Err(_) => -1, // Required / Type / Unique — all surface as ConstraintViolation
+        },
+        None => -3,
     }
 }
 
@@ -635,11 +727,14 @@ pub unsafe extern "C" fn lnk_commit_tx(g: *mut Graph) -> i32 {
 /// As [`lnk_begin_tx`].
 #[no_mangle]
 pub unsafe extern "C" fn lnk_rollback_tx(g: *mut Graph) -> i32 {
-    if g.is_null() {
-        return -1;
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    match unsafe { graph_mut(g) } {
+        Some(g) => {
+            g.rollback_tx();
+            0
+        }
+        None => -1,
     }
-    (*g).rollback_tx();
-    0
 }
 
 /// Drop a vertex property index (no-op if absent). Returns 0 on success, -1 on
@@ -653,15 +748,15 @@ pub unsafe extern "C" fn lnk_drop_vertex_index(
     name_ptr: *const u8,
     name_len: usize,
 ) -> i32 {
-    if g.is_null() || name_ptr.is_null() {
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let (Some(g), Some(name)) = (unsafe { graph_mut(g) }, unsafe {
+        in_str(name_ptr, name_len)
+    }) else {
         return -1;
-    }
-    match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)) {
-        Ok(name) => match (*g).drop_vertex_index(name) {
-            Ok(()) => 0,
-            Err(_) => -2, // backs a unique constraint (InvalidGraphOp)
-        },
-        Err(_) => -1,
+    };
+    match g.drop_vertex_index(name) {
+        Ok(()) => 0,
+        Err(_) => -2, // backs a unique constraint (InvalidGraphOp)
     }
 }
 
@@ -675,15 +770,15 @@ pub unsafe extern "C" fn lnk_drop_edge_index(
     name_ptr: *const u8,
     name_len: usize,
 ) -> i32 {
-    if g.is_null() || name_ptr.is_null() {
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let (Some(g), Some(name)) = (unsafe { graph_mut(g) }, unsafe {
+        in_str(name_ptr, name_len)
+    }) else {
         return -1;
-    }
-    match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)) {
-        Ok(name) => match (*g).drop_edge_index(name) {
-            Ok(()) => 0,
-            Err(_) => -2, // backs a unique constraint (InvalidGraphOp)
-        },
-        Err(_) => -1,
+    };
+    match g.drop_edge_index(name) {
+        Ok(()) => 0,
+        Err(_) => -2, // backs a unique constraint (InvalidGraphOp)
     }
 }
 
@@ -695,12 +790,13 @@ pub unsafe extern "C" fn lnk_drop_edge_index(
 /// `g` valid; `out_len` writable.
 #[no_mangle]
 pub unsafe extern "C" fn lnk_vertex_indexes(g: *const Graph, out_len: *mut usize) -> *mut u8 {
-    let keys = if g.is_null() {
-        Vec::new()
-    } else {
-        (*g).vertex_indexes()
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let keys = match unsafe { graph_ref(g) } {
+        Some(g) => g.vertex_indexes(),
+        None => Vec::new(),
     };
-    index_keys_buf(&keys, out_len)
+    // SAFETY: index_keys_buf writes only through out_len, which this fn's # Safety contract requires be a valid, writable pointer.
+    unsafe { index_keys_buf(&keys, out_len) }
 }
 
 /// The currently-indexed edge property keys as a JSON string array. Edge
@@ -710,12 +806,13 @@ pub unsafe extern "C" fn lnk_vertex_indexes(g: *const Graph, out_len: *mut usize
 /// `g` valid; `out_len` writable.
 #[no_mangle]
 pub unsafe extern "C" fn lnk_edge_indexes(g: *const Graph, out_len: *mut usize) -> *mut u8 {
-    let keys = if g.is_null() {
-        Vec::new()
-    } else {
-        (*g).edge_indexes()
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let keys = match unsafe { graph_ref(g) } {
+        Some(g) => g.edge_indexes(),
+        None => Vec::new(),
     };
-    index_keys_buf(&keys, out_len)
+    // SAFETY: index_keys_buf writes only through out_len, which this fn's # Safety contract requires be a valid, writable pointer.
+    unsafe { index_keys_buf(&keys, out_len) }
 }
 
 /// The full active schema as a JSON array of replayable `SchemaOp` objects (see
@@ -727,13 +824,14 @@ pub unsafe extern "C" fn lnk_edge_indexes(g: *const Graph, out_len: *mut usize) 
 /// `g` valid; `out_len` writable.
 #[no_mangle]
 pub unsafe extern "C" fn lnk_dump_schema(g: *const Graph, out_len: *mut usize) -> *mut u8 {
-    let json = if g.is_null() {
-        String::from("[]")
-    } else {
-        (*g).dump_schema()
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let json = match unsafe { graph_ref(g) } {
+        Some(g) => g.dump_schema(),
+        None => String::from("[]"),
     };
     let bytes = json.into_bytes().into_boxed_slice();
-    *out_len = bytes.len();
+    // SAFETY: the caller's # Safety contract requires out_len be a valid, writable pointer.
+    unsafe { *out_len = bytes.len() };
     Box::into_raw(bytes) as *mut u8
 }
 
@@ -749,7 +847,8 @@ unsafe fn index_keys_buf(keys: &[String], out_len: *mut usize) -> *mut u8 {
     }
     json.push(']');
     let bytes = json.into_bytes().into_boxed_slice();
-    *out_len = bytes.len();
+    // SAFETY: the caller's # Safety contract requires out_len be a valid, writable pointer.
+    unsafe { *out_len = bytes.len() };
     Box::into_raw(bytes) as *mut u8
 }
 
@@ -768,15 +867,13 @@ pub unsafe extern "C" fn lnk_last_write_scope(
     key_len: usize,
     out_len: *mut usize,
 ) -> *mut u8 {
-    let scope = if g.is_null() || key_ptr.is_null() {
-        Vec::new()
-    } else {
-        match std::str::from_utf8(std::slice::from_raw_parts(key_ptr, key_len)) {
-            Ok(key) => (*g).last_write_scope(key),
-            Err(_) => Vec::new(),
-        }
+    // SAFETY: g is the caller-supplied handle, and the ptr/len the caller-supplied buffer, that this fn's # Safety contract requires be valid (or null -> None).
+    let scope = match (unsafe { graph_ref(g) }, unsafe { in_str(key_ptr, key_len) }) {
+        (Some(g), Some(key)) => g.last_write_scope(key),
+        _ => Vec::new(),
     };
-    index_keys_buf(&scope, out_len)
+    // SAFETY: index_keys_buf writes only through out_len, which this fn's # Safety contract requires be a valid, writable pointer.
+    unsafe { index_keys_buf(&scope, out_len) }
 }
 
 /// Parse + run a GQL-subset query, writing the `(count, sum)` signature.
@@ -793,21 +890,21 @@ pub unsafe extern "C" fn lnk_query(
     out_sum: *mut f64,
     out_checksum: *mut u64,
 ) -> i32 {
-    if g.is_null() || q_ptr.is_null() {
+    // SAFETY: g is the caller-supplied handle, and the ptr/len the caller-supplied buffer, that this fn's # Safety contract requires be valid (or null -> None).
+    let (Some(g), Some(q)) = (unsafe { graph_ref(g) }, unsafe { in_str(q_ptr, q_len) }) else {
         return -1;
-    }
-    let q = match std::str::from_utf8(std::slice::from_raw_parts(q_ptr, q_len)) {
-        Ok(s) => s,
-        Err(_) => return -1,
     };
     let parsed = match query::parse(q) {
         Ok(p) => p,
         Err(_) => return -1,
     };
-    let r = parsed.run(&*g);
-    *out_count = r.count;
-    *out_sum = r.sum;
-    *out_checksum = r.checksum;
+    let r = parsed.run(g);
+    // SAFETY: the caller's # Safety contract requires out_count be a valid, writable pointer.
+    unsafe { *out_count = r.count };
+    // SAFETY: the caller's # Safety contract requires out_sum be a valid, writable pointer.
+    unsafe { *out_sum = r.sum };
+    // SAFETY: the caller's # Safety contract requires out_checksum be a valid, writable pointer.
+    unsafe { *out_checksum = r.checksum };
     0
 }
 
@@ -827,14 +924,10 @@ pub unsafe extern "C" fn lnk_query_batch(
     out_sum: *mut f64,
     out_checksum: *mut u64,
 ) -> i64 {
-    if g.is_null() || q_ptr.is_null() {
+    // SAFETY: g is the caller-supplied handle, and the ptr/len the caller-supplied buffer, that this fn's # Safety contract requires be valid (or null -> None).
+    let (Some(g), Some(text)) = (unsafe { graph_ref(g) }, unsafe { in_str(q_ptr, q_len) }) else {
         return -1;
-    }
-    let text = match std::str::from_utf8(std::slice::from_raw_parts(q_ptr, q_len)) {
-        Ok(s) => s,
-        Err(_) => return -1,
     };
-    let g = &*g;
     let mut i = 0isize;
     for line in text.split('\n') {
         if line.trim().is_empty() {
@@ -844,9 +937,12 @@ pub unsafe extern "C" fn lnk_query_batch(
             Ok(p) => p.run(g),
             Err(_) => return -1,
         };
-        *out_count.offset(i) = r.count;
-        *out_sum.offset(i) = r.sum;
-        *out_checksum.offset(i) = r.checksum;
+        // SAFETY: index i < the run count, so out_count.offset(i) is in-bounds of the caller-provided output array (# Safety contract), and the slot is writable.
+        unsafe { *out_count.offset(i) = r.count };
+        // SAFETY: index i < the run count, so out_sum.offset(i) is in-bounds of the caller-provided output array (# Safety contract), and the slot is writable.
+        unsafe { *out_sum.offset(i) = r.sum };
+        // SAFETY: index i < the run count, so out_checksum.offset(i) is in-bounds of the caller-provided output array (# Safety contract), and the slot is writable.
+        unsafe { *out_checksum.offset(i) = r.checksum };
         i += 1;
     }
     i as i64
@@ -863,9 +959,10 @@ unsafe fn decode_params(p_ptr: *const u8, p_len: usize) -> Result<crate::gql::ev
     if p_ptr.is_null() || p_len == 0 {
         return Ok(crate::gql::eval::Params::new());
     }
-    let text = match std::str::from_utf8(std::slice::from_raw_parts(p_ptr, p_len)) {
-        Ok(s) => s,
-        Err(_) => {
+    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+    let text = match unsafe { in_str(p_ptr, p_len) } {
+        Some(s) => s,
+        None => {
             crate::ffi_error::set_code(ErrorCode::Ffi, "params bytes are not valid UTF-8");
             return Err(());
         }
@@ -914,20 +1011,26 @@ pub unsafe extern "C" fn lnk_query_rows(
         crate::ffi_error::set_code(ErrorCode::Ffi, "null graph or query pointer");
         return std::ptr::null_mut();
     }
-    let q = match std::str::from_utf8(std::slice::from_raw_parts(q_ptr, q_len)) {
-        Ok(s) => s,
-        Err(_) => {
+    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+    let q = match unsafe { in_str(q_ptr, q_len) } {
+        Some(s) => s,
+        None => {
             crate::ffi_error::set_code(ErrorCode::Ffi, "query bytes are not valid UTF-8");
             return std::ptr::null_mut();
         }
     };
-    let Ok(params) = decode_params(p_ptr, p_len) else {
+    // SAFETY: p_ptr/p_len is the caller-supplied params buffer this fn's # Safety contract requires be null or a valid readable range.
+    let Ok(params) = (unsafe { decode_params(p_ptr, p_len) }) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let Some(g) = (unsafe { graph_mut(g) }) else {
         return std::ptr::null_mut();
     };
     // Route to the full GQL engine (the complete ISO-subset port). A parse
     // failure carries its source offset; an execution failure (an unsupported
     // clause in this partial engine) carries the engine's message.
-    let parsed = match crate::gql::parse_with_max_chain(q, (*g).max_operator_chain()) {
+    let parsed = match crate::gql::parse_with_max_chain(q, g.max_operator_chain()) {
         Ok(p) => p,
         Err(e) => {
             crate::ffi_error::set(
@@ -938,7 +1041,7 @@ pub unsafe extern "C" fn lnk_query_rows(
             return std::ptr::null_mut();
         }
     };
-    let rowset = match parsed.execute(&mut *g, &params) {
+    let rowset = match parsed.execute(g, &params) {
         Ok(rs) => rs,
         Err(e) => {
             crate::ffi_error::set_code(e.code, &e.message);
@@ -946,7 +1049,8 @@ pub unsafe extern "C" fn lnk_query_rows(
         }
     };
     let bytes = rowset.to_json().into_bytes().into_boxed_slice();
-    *out_len = bytes.len();
+    // SAFETY: the caller's # Safety contract requires out_len be a valid, writable pointer.
+    unsafe { *out_len = bytes.len() };
     Box::into_raw(bytes) as *mut u8
 }
 
@@ -983,9 +1087,10 @@ pub unsafe extern "C" fn lnk_algo(
         );
         return std::ptr::null_mut();
     }
-    let name = match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)) {
-        Ok(s) => s,
-        Err(_) => {
+    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+    let name = match unsafe { in_str(name_ptr, name_len) } {
+        Some(s) => s,
+        None => {
             crate::ffi_error::set_code(
                 crate::error_codes::ErrorCode::Ffi,
                 "algorithm name bytes are not valid UTF-8",
@@ -996,9 +1101,10 @@ pub unsafe extern "C" fn lnk_algo(
     let cfg = if cfg_ptr.is_null() {
         ""
     } else {
-        match std::str::from_utf8(std::slice::from_raw_parts(cfg_ptr, cfg_len)) {
-            Ok(s) => s,
-            Err(_) => {
+        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+        match unsafe { in_str(cfg_ptr, cfg_len) } {
+            Some(s) => s,
+            None => {
                 crate::ffi_error::set_code(
                     crate::error_codes::ErrorCode::Ffi,
                     "algorithm config bytes are not valid UTF-8",
@@ -1007,7 +1113,11 @@ pub unsafe extern "C" fn lnk_algo(
             }
         }
     };
-    let rowset = match crate::algo::run(&mut *g, name, cfg) {
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let Some(g) = (unsafe { graph_mut(g) }) else {
+        return std::ptr::null_mut();
+    };
+    let rowset = match crate::algo::run(g, name, cfg) {
         Ok(rs) => rs,
         Err(msg) => {
             crate::ffi_error::set_code(crate::error_codes::ErrorCode::Ffi, &msg);
@@ -1015,7 +1125,8 @@ pub unsafe extern "C" fn lnk_algo(
         }
     };
     let bytes = rowset.to_json().into_bytes().into_boxed_slice();
-    *out_len = bytes.len();
+    // SAFETY: the caller's # Safety contract requires out_len be a valid, writable pointer.
+    unsafe { *out_len = bytes.len() };
     Box::into_raw(bytes) as *mut u8
 }
 
@@ -1052,19 +1163,25 @@ pub unsafe extern "C" fn lnk_query_arrow(
         crate::ffi_error::set_code(ErrorCode::Ffi, "null graph or query pointer");
         return std::ptr::null_mut();
     }
-    let q = match std::str::from_utf8(std::slice::from_raw_parts(q_ptr, q_len)) {
-        Ok(s) => s,
-        Err(_) => {
+    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+    let q = match unsafe { in_str(q_ptr, q_len) } {
+        Some(s) => s,
+        None => {
             crate::ffi_error::set_code(ErrorCode::Ffi, "query bytes are not valid UTF-8");
             return std::ptr::null_mut();
         }
     };
-    let Ok(params) = decode_params(p_ptr, p_len) else {
+    // SAFETY: p_ptr/p_len is the caller-supplied params buffer this fn's # Safety contract requires be null or a valid readable range.
+    let Ok(params) = (unsafe { decode_params(p_ptr, p_len) }) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let Some(g) = (unsafe { graph_mut(g) }) else {
         return std::ptr::null_mut();
     };
     // The error rides the last-error channel, never this return pointer — so the
     // binary Arrow carrier below stays a pure column blob with no error union.
-    let parsed = match crate::gql::parse_with_max_chain(q, (*g).max_operator_chain()) {
+    let parsed = match crate::gql::parse_with_max_chain(q, g.max_operator_chain()) {
         Ok(p) => p,
         Err(e) => {
             crate::ffi_error::set(
@@ -1077,20 +1194,23 @@ pub unsafe extern "C" fn lnk_query_arrow(
     };
     // execute_arrow keeps numeric/bool result columns typed end-to-end (no
     // Val/Value boxing) for the common single-MATCH … RETURN shape.
-    let blob = match parsed.execute_arrow(&mut *g, &params) {
+    let blob = match parsed.execute_arrow(g, &params) {
         Ok(b) => b,
         Err(e) => {
             crate::ffi_error::set_code(e.code, &e.message);
             return std::ptr::null_mut();
         }
     };
-    *out_len = blob.len();
+    // SAFETY: the caller's # Safety contract requires out_len be a valid, writable pointer.
+    unsafe { *out_len = blob.len() };
     // 8-byte-aligned copy so the caller can view f64/i32 column buffers directly.
     let len = blob.len().max(1);
     let layout = std::alloc::Layout::from_size_align(len, 8).unwrap();
-    let p = std::alloc::alloc(layout);
+    // SAFETY: layout has non-zero size (len.max(1)) and valid 8-byte alignment; alloc returns null on failure, checked before use.
+    let p = unsafe { std::alloc::alloc(layout) };
     if !p.is_null() {
-        std::ptr::copy_nonoverlapping(blob.as_ptr(), p, blob.len());
+        // SAFETY: the source blob is valid for blob.len() bytes; the destination is freshly allocated, non-null (checked), sized len >= blob.len(), and non-overlapping.
+        unsafe { std::ptr::copy_nonoverlapping(blob.as_ptr(), p, blob.len()) };
     }
     p
 }
@@ -1121,17 +1241,23 @@ pub unsafe extern "C" fn lnk_query_arrow_ipc(
         crate::ffi_error::set_code(ErrorCode::Ffi, "null graph or query pointer");
         return std::ptr::null_mut();
     }
-    let q = match std::str::from_utf8(std::slice::from_raw_parts(q_ptr, q_len)) {
-        Ok(s) => s,
-        Err(_) => {
+    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+    let q = match unsafe { in_str(q_ptr, q_len) } {
+        Some(s) => s,
+        None => {
             crate::ffi_error::set_code(ErrorCode::Ffi, "query bytes are not valid UTF-8");
             return std::ptr::null_mut();
         }
     };
-    let Ok(params) = decode_params(p_ptr, p_len) else {
+    // SAFETY: p_ptr/p_len is the caller-supplied params buffer this fn's # Safety contract requires be null or a valid readable range.
+    let Ok(params) = (unsafe { decode_params(p_ptr, p_len) }) else {
         return std::ptr::null_mut();
     };
-    let parsed = match crate::gql::parse_with_max_chain(q, (*g).max_operator_chain()) {
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let Some(g) = (unsafe { graph_mut(g) }) else {
+        return std::ptr::null_mut();
+    };
+    let parsed = match crate::gql::parse_with_max_chain(q, g.max_operator_chain()) {
         Ok(p) => p,
         Err(e) => {
             crate::ffi_error::set(
@@ -1143,7 +1269,7 @@ pub unsafe extern "C" fn lnk_query_arrow_ipc(
         }
     };
     // Reuse the typed Arrow column path, then frame it as IPC natively.
-    let blob = match parsed.execute_arrow(&mut *g, &params) {
+    let blob = match parsed.execute_arrow(g, &params) {
         Ok(b) => b,
         Err(e) => {
             crate::ffi_error::set_code(e.code, &e.message);
@@ -1151,12 +1277,15 @@ pub unsafe extern "C" fn lnk_query_arrow_ipc(
         }
     };
     let ipc = crate::arrow::arrow_ipc_from_blob(&blob, file != 0);
-    *out_len = ipc.len();
+    // SAFETY: the caller's # Safety contract requires out_len be a valid, writable pointer.
+    unsafe { *out_len = ipc.len() };
     let len = ipc.len().max(1);
     let layout = std::alloc::Layout::from_size_align(len, 8).unwrap();
-    let p = std::alloc::alloc(layout);
+    // SAFETY: layout has non-zero size (len.max(1)) and valid 8-byte alignment; alloc returns null on failure, checked before use.
+    let p = unsafe { std::alloc::alloc(layout) };
     if !p.is_null() {
-        std::ptr::copy_nonoverlapping(ipc.as_ptr(), p, ipc.len());
+        // SAFETY: the source blob is valid for blob.len() bytes; the destination is freshly allocated, non-null (checked), sized len >= blob.len(), and non-overlapping.
+        unsafe { std::ptr::copy_nonoverlapping(ipc.as_ptr(), p, ipc.len()) };
     }
     p
 }
@@ -1186,9 +1315,10 @@ pub unsafe extern "C" fn lnk_prepare(
         crate::ffi_error::set_code(ErrorCode::Ffi, "null query pointer");
         return std::ptr::null_mut();
     }
-    let q = match std::str::from_utf8(std::slice::from_raw_parts(q_ptr, q_len)) {
-        Ok(s) => s,
-        Err(_) => {
+    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+    let q = match unsafe { in_str(q_ptr, q_len) } {
+        Some(s) => s,
+        None => {
             crate::ffi_error::set_code(ErrorCode::Ffi, "query bytes are not valid UTF-8");
             return std::ptr::null_mut();
         }
@@ -1213,7 +1343,8 @@ pub unsafe extern "C" fn lnk_prepare(
 #[no_mangle]
 pub unsafe extern "C" fn lnk_prepared_free(p: *mut crate::gql::Prepared) {
     if !p.is_null() {
-        drop(Box::from_raw(p));
+        // SAFETY: the pointer came from this module's matching Box::into_raw, per the fn's # Safety contract, and is freed exactly once.
+        drop(unsafe { Box::from_raw(p) });
     }
 }
 
@@ -1237,10 +1368,17 @@ pub unsafe extern "C" fn lnk_prepared_query_rows(
         crate::ffi_error::set_code(ErrorCode::Ffi, "null prepared or graph pointer");
         return std::ptr::null_mut();
     }
-    let Ok(params) = decode_params(p_ptr, p_len) else {
+    // SAFETY: p_ptr/p_len is the caller-supplied params buffer this fn's # Safety contract requires be null or a valid readable range.
+    let Ok(params) = (unsafe { decode_params(p_ptr, p_len) }) else {
         return std::ptr::null_mut();
     };
-    let rowset = match (*p).execute(&mut *g, &params) {
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let Some(g) = (unsafe { graph_mut(g) }) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: p is the caller-supplied Prepared handle this fn's # Safety contract requires be valid.
+    let prepared = unsafe { &*p };
+    let rowset = match prepared.execute(g, &params) {
         Ok(rs) => rs,
         Err(e) => {
             crate::ffi_error::set_code(e.code, &e.message);
@@ -1248,7 +1386,8 @@ pub unsafe extern "C" fn lnk_prepared_query_rows(
         }
     };
     let bytes = rowset.to_json().into_bytes().into_boxed_slice();
-    *out_len = bytes.len();
+    // SAFETY: the caller's # Safety contract requires out_len be a valid, writable pointer.
+    unsafe { *out_len = bytes.len() };
     Box::into_raw(bytes) as *mut u8
 }
 
@@ -1270,22 +1409,32 @@ pub unsafe extern "C" fn lnk_prepared_query_arrow(
         crate::ffi_error::set_code(ErrorCode::Ffi, "null prepared or graph pointer");
         return std::ptr::null_mut();
     }
-    let Ok(params) = decode_params(p_ptr, p_len) else {
+    // SAFETY: p_ptr/p_len is the caller-supplied params buffer this fn's # Safety contract requires be null or a valid readable range.
+    let Ok(params) = (unsafe { decode_params(p_ptr, p_len) }) else {
         return std::ptr::null_mut();
     };
-    let blob = match (*p).execute_arrow(&mut *g, &params) {
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let Some(g) = (unsafe { graph_mut(g) }) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: p is the caller-supplied Prepared handle this fn's # Safety contract requires be valid.
+    let prepared = unsafe { &*p };
+    let blob = match prepared.execute_arrow(g, &params) {
         Ok(b) => b,
         Err(e) => {
             crate::ffi_error::set_code(e.code, &e.message);
             return std::ptr::null_mut();
         }
     };
-    *out_len = blob.len();
+    // SAFETY: the caller's # Safety contract requires out_len be a valid, writable pointer.
+    unsafe { *out_len = blob.len() };
     let len = blob.len().max(1);
     let layout = std::alloc::Layout::from_size_align(len, 8).unwrap();
-    let ptr = std::alloc::alloc(layout);
+    // SAFETY: layout has non-zero size (len.max(1)) and valid 8-byte alignment; alloc returns null on failure, checked before use.
+    let ptr = unsafe { std::alloc::alloc(layout) };
     if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(blob.as_ptr(), ptr, blob.len());
+        // SAFETY: the source blob is valid for blob.len() bytes; the destination is freshly allocated, non-null (checked), sized len >= blob.len(), and non-overlapping.
+        unsafe { std::ptr::copy_nonoverlapping(blob.as_ptr(), ptr, blob.len()) };
     }
     ptr
 }
@@ -1300,7 +1449,8 @@ pub unsafe extern "C" fn lnk_prepared_query_arrow(
 pub unsafe extern "C" fn lnk_free_arrow(ptr: *mut u8, len: usize) {
     if !ptr.is_null() {
         let len = len.max(1);
-        std::alloc::dealloc(ptr, std::alloc::Layout::from_size_align(len, 8).unwrap());
+        // SAFETY: ptr came from this module's std::alloc::alloc with the same 8-byte layout, per the fn's # Safety contract, and is freed exactly once.
+        unsafe { std::alloc::dealloc(ptr, std::alloc::Layout::from_size_align(len, 8).unwrap()) };
     }
 }
 
@@ -1327,12 +1477,17 @@ pub unsafe extern "C" fn lnk_gremlin_json(
         crate::ffi_error::set_code(ErrorCode::Ffi, "null graph or query pointer");
         return std::ptr::null_mut();
     }
-    let q = match std::str::from_utf8(std::slice::from_raw_parts(q_ptr, q_len)) {
-        Ok(s) => s,
-        Err(_) => {
+    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+    let q = match unsafe { in_str(q_ptr, q_len) } {
+        Some(s) => s,
+        None => {
             crate::ffi_error::set_code(ErrorCode::Ffi, "query bytes are not valid UTF-8");
             return std::ptr::null_mut();
         }
+    };
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let Some(g) = (unsafe { graph_mut(g) }) else {
+        return std::ptr::null_mut();
     };
     let plan = match crate::gremlin::parse(q) {
         Ok(p) => p,
@@ -1341,17 +1496,18 @@ pub unsafe extern "C" fn lnk_gremlin_json(
             return std::ptr::null_mut();
         }
     };
-    let vals = match crate::gremlin::try_run(&mut *g, &plan) {
+    let vals = match crate::gremlin::try_run(g, &plan) {
         Ok(v) => v,
         Err(e) => {
             crate::ffi_error::set_code(e.code, &e.message);
             return std::ptr::null_mut();
         }
     };
-    let bytes = crate::gremlin::exec::results_to_json(&*g, &vals)
+    let bytes = crate::gremlin::exec::results_to_json(g, &vals)
         .into_bytes()
         .into_boxed_slice();
-    *out_len = bytes.len();
+    // SAFETY: the caller's # Safety contract requires out_len be a valid, writable pointer.
+    unsafe { *out_len = bytes.len() };
     Box::into_raw(bytes) as *mut u8
 }
 
@@ -1375,17 +1531,23 @@ pub unsafe extern "C" fn lnk_serialize(
         crate::ffi_error::set_code(ErrorCode::Ffi, "null graph or format pointer");
         return std::ptr::null_mut();
     }
-    let fmt = match std::str::from_utf8(std::slice::from_raw_parts(fmt_ptr, fmt_len)) {
-        Ok(s) => s,
-        Err(_) => {
+    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+    let fmt = match unsafe { in_str(fmt_ptr, fmt_len) } {
+        Some(s) => s,
+        None => {
             crate::ffi_error::set_code(ErrorCode::Ffi, "format bytes are not valid UTF-8");
             return std::ptr::null_mut();
         }
     };
-    match crate::codec::serialize(&*g, fmt) {
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let Some(g) = (unsafe { graph_ref(g) }) else {
+        return std::ptr::null_mut();
+    };
+    match crate::codec::serialize(g, fmt) {
         Ok(s) => {
             let bytes = s.into_bytes().into_boxed_slice();
-            *out_len = bytes.len();
+            // SAFETY: the caller's # Safety contract requires out_len be a valid, writable pointer.
+            unsafe { *out_len = bytes.len() };
             Box::into_raw(bytes) as *mut u8
         }
         Err(e) => {
@@ -1414,16 +1576,18 @@ pub unsafe extern "C" fn lnk_deserialize(
         crate::ffi_error::set_code(ErrorCode::Ffi, "null input or format pointer");
         return std::ptr::null_mut();
     }
-    let text = match std::str::from_utf8(std::slice::from_raw_parts(ptr, len)) {
-        Ok(s) => s,
-        Err(_) => {
+    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+    let text = match unsafe { in_str(ptr, len) } {
+        Some(s) => s,
+        None => {
             crate::ffi_error::set_code(ErrorCode::Ffi, "input bytes are not valid UTF-8");
             return std::ptr::null_mut();
         }
     };
-    let fmt = match std::str::from_utf8(std::slice::from_raw_parts(fmt_ptr, fmt_len)) {
-        Ok(s) => s,
-        Err(_) => {
+    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
+    let fmt = match unsafe { in_str(fmt_ptr, fmt_len) } {
+        Some(s) => s,
+        None => {
             crate::ffi_error::set_code(ErrorCode::Ffi, "format bytes are not valid UTF-8");
             return std::ptr::null_mut();
         }
@@ -1447,11 +1611,13 @@ pub unsafe extern "C" fn lnk_deserialize(
 #[cfg(feature = "ndjson")]
 #[no_mangle]
 pub unsafe extern "C" fn lnk_encode_ndjson(g: *const Graph, out_len: *mut usize) -> *mut u8 {
-    if g.is_null() {
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let Some(g) = (unsafe { graph_ref(g) }) else {
         return std::ptr::null_mut();
-    }
-    let bytes = crate::ndjson::encode(&*g).into_bytes().into_boxed_slice();
-    *out_len = bytes.len();
+    };
+    let bytes = crate::ndjson::encode(g).into_bytes().into_boxed_slice();
+    // SAFETY: the caller's # Safety contract requires out_len be a valid, writable pointer.
+    unsafe { *out_len = bytes.len() };
     Box::into_raw(bytes) as *mut u8
 }
 
@@ -1460,7 +1626,8 @@ pub unsafe extern "C" fn lnk_encode_ndjson(g: *const Graph, out_len: *mut usize)
 #[no_mangle]
 pub unsafe extern "C" fn lnk_free_buf(ptr: *mut u8, len: usize) {
     if !ptr.is_null() {
-        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
+        // SAFETY: the pointer came from this module's matching Box::into_raw, per the fn's # Safety contract, and is freed exactly once.
+        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)) });
     }
 }
 
@@ -1481,14 +1648,13 @@ pub unsafe extern "C" fn lnk_write_ndjson(
     path_ptr: *const u8,
     path_len: usize,
 ) -> i64 {
-    if g.is_null() || path_ptr.is_null() {
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
+    let (Some(g), Some(path)) = (unsafe { graph_ref(g) }, unsafe {
+        in_str(path_ptr, path_len)
+    }) else {
         return -1;
-    }
-    let path = match std::str::from_utf8(std::slice::from_raw_parts(path_ptr, path_len)) {
-        Ok(s) => s,
-        Err(_) => return -1,
     };
-    let bytes = crate::ndjson::encode(&*g).into_bytes();
+    let bytes = crate::ndjson::encode(g).into_bytes();
     match std::fs::write(path, &bytes) {
         Ok(()) => bytes.len() as i64,
         Err(_) => -1,
