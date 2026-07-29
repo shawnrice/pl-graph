@@ -9176,3 +9176,202 @@ fn allen_interval_relations_decompose_and_seek_correctly() {
         assert_eq!(reg, scan, "{rel}: regular-index seed disagrees with scan");
     }
 }
+
+/// Comprehensive Allen-relations bitemporal benchmark: a batch of edge-versions in
+/// EACH of the 13 relations to a fixed query interval Q (so every relation is flexed
+/// with a real, isolated count), on a graph carrying BOTH the RI-tree interval index
+/// and regular vf/vt indexes, write-interleaved. Times each relation + combinations,
+/// scan vs indexed, showing which index serves which shape. Run:
+///   cargo test --release bench_allen_relations -- --ignored --nocapture
+#[test]
+#[ignore = "benchmark; run with --ignored --nocapture"]
+fn bench_allen_relations() {
+    use crate::temporal::{Date, Temporal};
+    use std::time::Instant;
+
+    const QF: i32 = 19_723; // ~2024-01-01 (days since epoch)
+    const QT: i32 = 20_088; // ~2025-01-01
+    const PER: usize = 4_000; // edge-versions per relation
+
+    // Deterministic LCG (no rng crate, no Math.random); each build owns a fresh one.
+    struct Rng(u64);
+    impl Rng {
+        fn r(&mut self, lo: i32, hi: i32) -> i32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            lo + ((self.0 >> 20) % ((hi - lo).max(1) as u64)) as i32
+        }
+    }
+    const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+    // (vf, vt) strictly inside relation `r` to Q=[QF,QT). Mutually exclusive by construction.
+    let gen = |g: &mut Rng, r: usize| -> (i32, i32) {
+        match r {
+            0 => {
+                let vf = QF - g.r(2000, 6000);
+                (vf, QF - g.r(100, 1000))
+            } // before
+            1 => (QF - g.r(100, 4000), QF), // meets (vt=QF)
+            2 => (QF - g.r(100, 4000), QF + g.r(100, QT - QF - 100)), // overlaps
+            3 => (QF - g.r(100, 4000), QT), // finished_by (vt=QT)
+            4 => (QF - g.r(100, 4000), QT + g.r(100, 4000)), // contains
+            5 => (QF, QF + g.r(100, QT - QF - 100)), // starts (vf=QF)
+            6 => (QF, QT),                  // equals
+            7 => (QF, QT + g.r(100, 4000)), // started_by
+            8 => {
+                let vf = QF + g.r(100, QT - QF - 2000);
+                (vf, vf + g.r(50, QT - vf - 100))
+            } // during
+            9 => (QF + g.r(100, QT - QF - 100), QT), // finishes (vt=QT)
+            10 => (QF + g.r(100, QT - QF - 100), QT + g.r(100, 4000)), // overlapped_by
+            11 => (QT, QT + g.r(100, 4000)), // met_by (vf=QT)
+            _ => {
+                let vf = QT + g.r(100, 4000);
+                (vf, vf + g.r(30, 4000))
+            } // after
+        }
+    };
+
+    let names = [
+        "before",
+        "meets",
+        "overlaps",
+        "finished_by",
+        "contains",
+        "starts",
+        "equals",
+        "started_by",
+        "during",
+        "finishes",
+        "overlapped_by",
+        "met_by",
+        "after",
+    ];
+    let dval = |d: i32| Value::Temporal(Temporal::Date(Date { days: d }));
+
+    let build = |indexed: bool| -> (Graph, f64) {
+        let mut g = ndjson::decode("").unwrap();
+        if indexed {
+            g.create_edge_interval_index("vf", "vt");
+            g.create_edge_index("vf");
+            g.create_edge_index("vt");
+        }
+        let a = g.add_vertex(&["N".to_string()], vec![]);
+        let b = g.add_vertex(&["N".to_string()], vec![]);
+        let t0 = Instant::now();
+        // regenerate the same intervals deterministically for both builds
+        let mut rng = Rng(SEED);
+        for r in 0..13 {
+            for _ in 0..PER {
+                let (vf, vt) = gen(&mut rng, r);
+                g.add_edge(
+                    a,
+                    b,
+                    "R",
+                    vec![("vf".to_string(), dval(vf)), ("vt".to_string(), dval(vt))],
+                );
+            }
+        }
+        (g, t0.elapsed().as_secs_f64() * 1000.0)
+    };
+
+    let (mut g_scan, w_scan) = build(false);
+    let (mut g_idx, w_idx) = build(true);
+    eprintln!(
+        "\nAllen bench: {} edge-versions ({} per relation) | write: scan {w_scan:.0}ms | indexed {w_idx:.0}ms ({:.2}x)",
+        g_scan.edge_count(), PER, w_idx / w_scan
+    );
+
+    let mut q = Params::new();
+    q.insert(
+        "qf".into(),
+        super::eval::Val::Temporal(Temporal::Date(Date { days: QF })),
+    );
+    q.insert(
+        "qt".into(),
+        super::eval::Val::Temporal(Temporal::Date(Date { days: QT })),
+    );
+
+    let clauses = [
+        "r.vt < $qf",                               // before
+        "r.vt = $qf",                               // meets
+        "r.vf < $qf AND r.vt > $qf AND r.vt < $qt", // overlaps
+        "r.vf < $qf AND r.vt = $qt",                // finished_by
+        "r.vf < $qf AND r.vt > $qt",                // contains
+        "r.vf = $qf AND r.vt < $qt",                // starts
+        "r.vf = $qf AND r.vt = $qt",                // equals
+        "r.vf = $qf AND r.vt > $qt",                // started_by
+        "r.vf > $qf AND r.vt < $qt",                // during
+        "r.vf > $qf AND r.vt = $qt",                // finishes
+        "r.vf > $qf AND r.vf < $qt AND r.vt > $qt", // overlapped_by
+        "r.vf = $qt",                               // met_by
+        "r.vf > $qt",                               // after
+    ];
+
+    let bench = |g: &mut Graph, q: &str, params: &Params, iters: usize| -> (f64, i64) {
+        let prep = parse(q).unwrap();
+        let matched = match prep
+            .execute(g, params)
+            .unwrap()
+            .rows()
+            .next()
+            .and_then(|r| r.first().cloned())
+        {
+            Some(Value::Num(n)) => n as i64,
+            _ => -1,
+        };
+        let mut ms = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let t = Instant::now();
+            std::hint::black_box(prep.execute(g, params).unwrap().rows().count());
+            ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        ms.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        (ms[ms.len() / 2], matched)
+    };
+
+    eprintln!(
+        "  {:<14} {:>10} {:>10} {:>8}  {:>8}",
+        "relation", "scan", "indexed", "speedup", "matched"
+    );
+    for (i, cl) in clauses.iter().enumerate() {
+        let query = format!("MATCH ()-[r:R]->() WHERE {cl} RETURN count(*) AS n");
+        let (scan, mc) = bench(&mut g_scan, &query, &q, 30);
+        let (idx, mi) = bench(&mut g_idx, &query, &q, 30);
+        assert_eq!(mc, mi, "{}: indexed count != scan count", names[i]);
+        eprintln!(
+            "  {:<14} {scan:>8.3}ms {idx:>8.3}ms {:>7.2}x  {mc:>8}",
+            names[i],
+            scan / idx
+        );
+    }
+
+    // Combinations.
+    let combos: [(&str, &str); 4] = [
+        ("intersects Q (o∪s∪d∪…)", "r.vf < $qt AND r.vt > $qf"),
+        (
+            "overlaps OR contains",
+            "(r.vf < $qf AND r.vt > $qf AND r.vt < $qt) OR (r.vf < $qf AND r.vt > $qt)",
+        ),
+        (
+            "during ∧ ends-early",
+            "r.vf > $qf AND r.vt < $qt AND r.vt < $qf + 100",
+        ),
+        (
+            "not(before) ∧ not(after)",
+            "NOT (r.vt < $qf) AND NOT (r.vf > $qt)",
+        ),
+    ];
+    eprintln!("  -- combinations --");
+    for (label, cl) in combos {
+        let query = format!("MATCH ()-[r:R]->() WHERE {cl} RETURN count(*) AS n");
+        let (scan, mc) = bench(&mut g_scan, &query, &q, 20);
+        let (idx, mi) = bench(&mut g_idx, &query, &q, 20);
+        assert_eq!(mc, mi, "{label}: indexed count != scan count");
+        eprintln!(
+            "  {label:<26} {scan:>8.3}ms {idx:>8.3}ms {:>7.2}x  {mc:>8}",
+            scan / idx
+        );
+    }
+}
