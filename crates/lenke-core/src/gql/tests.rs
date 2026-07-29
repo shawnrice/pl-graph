@@ -8744,3 +8744,192 @@ fn bench_hris_shapes() {
         20,
     );
 }
+
+/// M0 end-to-end: a temporal property index must be transparent — a range seek
+/// returns exactly the rows the unindexed scan does. Proves the query-side key
+/// (from the `DATE` literal) matches the stored column key and that
+/// `prop_index_hint` actually picks up the temporal comparison.
+#[test]
+fn temporal_property_index_seek_agrees_with_scan() {
+    let dates = [
+        "2019-03-01",
+        "2020-06-15",
+        "2021-01-01",
+        "2022-11-30",
+        "2023-07-04",
+        "2024-02-29",
+        "2025-12-31",
+    ];
+    let lines: Vec<String> = dates
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            format!(
+                r#"{{"type":"node","id":"n{i}","labels":["E"],"properties":{{"id":{i},"d":{{"@date":"{d}"}}}}}}"#
+            )
+        })
+        .collect();
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let q = "MATCH (v:E) WHERE v.d <= DATE '2022-11-30' RETURN v.id AS id ORDER BY id";
+
+    let mut g_scan = graph_of(&refs);
+    let scan = rows(&mut g_scan, q);
+
+    let mut g_seek = graph_of(&refs);
+    g_seek.create_vertex_index("d");
+    let seek = rows(&mut g_seek, q);
+
+    assert_eq!(
+        scan, seek,
+        "temporal index seek must return the same rows as the scan"
+    );
+    assert_eq!(
+        scan.len(),
+        4,
+        "sanity: 2019,2020,2021,2022 are <= 2022-11-30; 2023-25 excluded"
+    );
+}
+
+/// Bitemporal temporal-index bake-off harness. Builds an SCD-2 org (REPORTS_TO
+/// edge versions with valid [vf,vt) + transaction [tf,tt) DATE intervals, most
+/// current via a vt=INF sentinel, churn producing closed versions), then times
+/// the hard as-of / overlap / range queries with and without the temporal index,
+/// plus the write-interleaved build cost (index maintained on every insert). Run:
+///   cargo test --release bench_temporal_index -- --ignored --nocapture
+/// Bump N / VERSIONS toward the round-16 xxl (212k) / xxxl (1.75M) version counts.
+#[test]
+#[ignore = "benchmark; run with --ignored --nocapture"]
+fn bench_temporal_index() {
+    use crate::temporal::{Date, Temporal};
+    use std::time::Instant;
+
+    const N: usize = 25_000; // employees
+    const VERSIONS: usize = 8; // REPORTS_TO versions per employee → N*VERSIONS edge versions
+    const BASE: i32 = 18_000; // ~2019-04
+    const PERIOD: i32 = 250; // days between reorgs
+    const INF: i32 = 3_000_000; // far-future "current" sentinel (days)
+
+    let dval = |d: i32| Value::Temporal(Temporal::Date(Date { days: d }));
+    let dparam = |d: i32| super::eval::Val::Temporal(Temporal::Date(Date { days: d }));
+
+    // Build the org; if `indexed`, create the vf/vt edge indexes BEFORE inserting so
+    // every add_edge maintains them — the write-interleaved cost. Returns (graph, write_ms).
+    let build = |indexed: bool| -> (Graph, f64) {
+        let mut g = ndjson::decode("").unwrap();
+        if indexed {
+            g.create_edge_index("vf");
+            g.create_edge_index("vt");
+        }
+        let t0 = Instant::now();
+        let vids: Vec<u32> = (0..N)
+            .map(|i| {
+                g.add_vertex(
+                    &["Emp".to_string()],
+                    vec![("id".to_string(), Value::Num(i as f64))],
+                )
+            })
+            .collect();
+        for i in 0..N {
+            let mgr = vids[(i / 6).min(N - 1)];
+            for v in 0..VERSIONS {
+                let vf = BASE + (v as i32) * PERIOD;
+                let vt = if v + 1 == VERSIONS {
+                    INF
+                } else {
+                    BASE + ((v + 1) as i32) * PERIOD
+                };
+                g.add_edge(
+                    vids[i],
+                    mgr,
+                    "REPORTS_TO",
+                    vec![
+                        ("vf".to_string(), dval(vf)),
+                        ("vt".to_string(), dval(vt)),
+                        ("tf".to_string(), dval(vf)),
+                        ("tt".to_string(), dval(INF)),
+                    ],
+                );
+            }
+        }
+        (g, t0.elapsed().as_secs_f64() * 1000.0)
+    };
+
+    let (mut g_plain, w_plain) = build(false);
+    let (mut g_idx, w_idx) = build(true);
+    eprintln!(
+        "\nbitemporal org: {} emps / {} edge versions",
+        g_plain.vertex_count(),
+        g_plain.edge_count()
+    );
+    eprintln!(
+        "WRITE-INTERLEAVED build: no-index {:.0}ms | vf+vt index {:.0}ms | amplification {:.2}x",
+        w_plain,
+        w_idx,
+        w_idx / w_plain
+    );
+
+    let bench = |g: &mut Graph, name: &str, q: &str, params: &Params| -> f64 {
+        let prepared = parse(q).unwrap();
+        // The count(*) value = how many edge versions matched (the selectivity).
+        let matched = prepared
+            .execute(g, params)
+            .unwrap()
+            .rows()
+            .next()
+            .and_then(|r| match r.to_vec().first() {
+                Some(Value::Num(n)) => Some(*n as i64),
+                _ => None,
+            })
+            .unwrap_or(-1);
+        let mut ms = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let t = Instant::now();
+            let rs = prepared.execute(g, params).unwrap();
+            ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            std::hint::black_box(rs.rows().count());
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p50 = ms[ms.len() / 2];
+        eprintln!("  {name:<28} p50={p50:>8.3}ms  (matched={matched})");
+        p50
+    };
+
+    // Probe params for the hard cases.
+    let mut p_now = Params::new();
+    p_now.insert("v".into(), dparam(BASE + PERIOD * (VERSIONS as i32) - 10)); // near "now"
+    let mut p_hist = Params::new();
+    p_hist.insert("v".into(), dparam(BASE + PERIOD * 3 + 20)); // mid-history
+    let mut p_narrow = Params::new();
+    p_narrow.insert("d1".into(), dparam(BASE + PERIOD * 3));
+    p_narrow.insert("d2".into(), dparam(BASE + PERIOD * 3 + 60)); // 60-day window
+    let mut p_wide = Params::new();
+    p_wide.insert("d1".into(), dparam(BASE));
+    p_wide.insert("d2".into(), dparam(INF));
+    let mut p_range = Params::new();
+    p_range.insert("d1".into(), dparam(BASE + PERIOD * 2));
+    p_range.insert("d2".into(), dparam(BASE + PERIOD * 4));
+
+    let asof = "MATCH ()-[r:REPORTS_TO]->() WHERE r.vf <= $v AND r.vt > $v RETURN count(*) AS n";
+    let overlap =
+        "MATCH ()-[r:REPORTS_TO]->() WHERE r.vf < $d2 AND r.vt > $d1 RETURN count(*) AS n";
+    let range =
+        "MATCH ()-[r:REPORTS_TO]->() WHERE r.vf >= $d1 AND r.vf <= $d2 RETURN count(*) AS n";
+
+    let cases: [(&str, &str, &Params); 5] = [
+        ("as-of now", asof, &p_now),
+        ("as-of historical", asof, &p_hist),
+        ("narrow overlap (straddlers)", overlap, &p_narrow),
+        ("wide overlap", overlap, &p_wide),
+        ("single-col range (vf)", range, &p_range),
+    ];
+    eprintln!("== NO INDEX (scan baseline) ==");
+    let base: Vec<f64> = cases
+        .iter()
+        .map(|(n, q, p)| bench(&mut g_plain, n, q, p))
+        .collect();
+    eprintln!("== vf+vt INDEX (M0 single-column) ==");
+    for (i, (n, q, p)) in cases.iter().enumerate() {
+        let idx = bench(&mut g_idx, n, q, p);
+        eprintln!("      └─ {:.2}x vs scan", base[i] / idx);
+    }
+}
