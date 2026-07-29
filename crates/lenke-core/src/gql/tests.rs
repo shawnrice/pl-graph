@@ -9055,18 +9055,13 @@ fn interval_index_maintained_under_set_and_delete() {
     );
 }
 
-/// All 13 Allen interval relations must (a) return exactly the intervals in that
-/// relation to a fixed query interval Q=[2024-04-01, 2024-08-01), and (b) return the
-/// SAME rows whether seeded by the RI-tree interval index, by regular vf/vt indexes,
-/// or by a full scan — proving the evaluator decomposes each relation into supported
-/// primitives with no index config missing or adding a row. One stored interval sits
-/// in each relation (they are mutually exclusive), so each predicate yields exactly it.
-#[test]
-fn allen_interval_relations_decompose_and_seek_correctly() {
-    let d = "DATE"; // brevity
-    let qf = "2024-04-01";
-    let qt = "2024-08-01";
-    // (id, vf, vt) — one interval per relation to Q=[qf,qt).
+/// Shared fixture for the per-relation Allen tests: 13 stored intervals (one in each
+/// Allen relation to Q=[2024-04-01, 2024-08-01), mutually exclusive) built three ways,
+/// asserting `where_` returns exactly `{want}` under the RI-tree interval index, under
+/// regular vf/vt indexes, AND under a full scan. Each relation gets its own `#[test]`
+/// below so the count reflects the coverage and a failure names the exact relation.
+fn allen_check(where_: &str, want: &str) {
+    // (id, vf, vt) — one interval per relation to Q=[2024-04-01, 2024-08-01).
     let ivals = [
         ("before", "2024-01-01", "2024-03-01"),
         ("meets", "2024-01-01", "2024-04-01"),
@@ -9093,60 +9088,7 @@ fn allen_interval_relations_decompose_and_seek_correctly() {
     }
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
 
-    // (relation, WHERE clause, expected matching id).
-    let cases: [(&str, String, &str); 13] = [
-        ("before", format!("r.vt < {d} '{qf}'"), "before"),
-        ("meets", format!("r.vt = {d} '{qf}'"), "meets"),
-        (
-            "overlaps",
-            format!("r.vf < {d} '{qf}' AND r.vt > {d} '{qf}' AND r.vt < {d} '{qt}'"),
-            "overlaps",
-        ),
-        (
-            "finished_by",
-            format!("r.vf < {d} '{qf}' AND r.vt = {d} '{qt}'"),
-            "finished_by",
-        ),
-        (
-            "contains",
-            format!("r.vf < {d} '{qf}' AND r.vt > {d} '{qt}'"),
-            "contains",
-        ),
-        (
-            "starts",
-            format!("r.vf = {d} '{qf}' AND r.vt < {d} '{qt}'"),
-            "starts",
-        ),
-        (
-            "equals",
-            format!("r.vf = {d} '{qf}' AND r.vt = {d} '{qt}'"),
-            "equals",
-        ),
-        (
-            "started_by",
-            format!("r.vf = {d} '{qf}' AND r.vt > {d} '{qt}'"),
-            "started_by",
-        ),
-        (
-            "during",
-            format!("r.vf > {d} '{qf}' AND r.vt < {d} '{qt}'"),
-            "during",
-        ),
-        (
-            "finishes",
-            format!("r.vf > {d} '{qf}' AND r.vt = {d} '{qt}'"),
-            "finishes",
-        ),
-        (
-            "overlapped_by",
-            format!("r.vf > {d} '{qf}' AND r.vf < {d} '{qt}' AND r.vt > {d} '{qt}'"),
-            "overlapped_by",
-        ),
-        ("met_by", format!("r.vf = {d} '{qt}'"), "met_by"),
-        ("after", format!("r.vf > {d} '{qt}'"), "after"),
-    ];
-
-    // Three index configurations that must all agree.
+    // Three index configurations that must all agree: interval index, regular indexes, scan.
     let make = |cfg: u8| {
         let mut g = graph_of(&refs);
         match cfg {
@@ -9159,22 +9101,105 @@ fn allen_interval_relations_decompose_and_seek_correctly() {
         }
         g
     };
-    let mut g_scan = make(0);
-    let mut g_ri = make(1);
-    let mut g_reg = make(2);
+    let q = format!("MATCH ()-[r:R]->() WHERE {where_} RETURN r.id AS id ORDER BY id");
+    let scan = rows(&mut make(0), &q);
+    assert_eq!(
+        scan,
+        vec![vec![s(want)]],
+        "scan returned wrong rows for `{where_}`"
+    );
+    assert_eq!(
+        rows(&mut make(1), &q),
+        scan,
+        "interval-index seed disagrees for `{where_}`"
+    );
+    assert_eq!(
+        rows(&mut make(2), &q),
+        scan,
+        "regular-index seed disagrees for `{where_}`"
+    );
+}
 
-    for (rel, where_, want) in &cases {
-        let q = format!("MATCH ()-[r:R]->() WHERE {where_} RETURN r.id AS id ORDER BY id");
-        let scan = rows(&mut g_scan, &q);
-        let ri = rows(&mut g_ri, &q);
-        let reg = rows(&mut g_reg, &q);
-        assert_eq!(scan, vec![vec![s(want)]], "{rel}: scan returned wrong rows");
-        assert_eq!(
-            ri, scan,
-            "{rel}: interval-index seed disagrees with scan (miss/extra)"
-        );
-        assert_eq!(reg, scan, "{rel}: regular-index seed disagrees with scan");
-    }
+// One #[test] per Allen relation (Q=[2024-04-01, 2024-08-01)); each is independently
+// named and runnable, and the cargo count reflects the 13-way coverage.
+#[test]
+fn allen_before() {
+    allen_check("r.vt < DATE '2024-04-01'", "before");
+}
+#[test]
+fn allen_meets() {
+    allen_check("r.vt = DATE '2024-04-01'", "meets");
+}
+#[test]
+fn allen_overlaps() {
+    allen_check(
+        "r.vf < DATE '2024-04-01' AND r.vt > DATE '2024-04-01' AND r.vt < DATE '2024-08-01'",
+        "overlaps",
+    );
+}
+#[test]
+fn allen_finished_by() {
+    allen_check(
+        "r.vf < DATE '2024-04-01' AND r.vt = DATE '2024-08-01'",
+        "finished_by",
+    );
+}
+#[test]
+fn allen_contains() {
+    allen_check(
+        "r.vf < DATE '2024-04-01' AND r.vt > DATE '2024-08-01'",
+        "contains",
+    );
+}
+#[test]
+fn allen_starts() {
+    allen_check(
+        "r.vf = DATE '2024-04-01' AND r.vt < DATE '2024-08-01'",
+        "starts",
+    );
+}
+#[test]
+fn allen_equals() {
+    allen_check(
+        "r.vf = DATE '2024-04-01' AND r.vt = DATE '2024-08-01'",
+        "equals",
+    );
+}
+#[test]
+fn allen_started_by() {
+    allen_check(
+        "r.vf = DATE '2024-04-01' AND r.vt > DATE '2024-08-01'",
+        "started_by",
+    );
+}
+#[test]
+fn allen_during() {
+    allen_check(
+        "r.vf > DATE '2024-04-01' AND r.vt < DATE '2024-08-01'",
+        "during",
+    );
+}
+#[test]
+fn allen_finishes() {
+    allen_check(
+        "r.vf > DATE '2024-04-01' AND r.vt = DATE '2024-08-01'",
+        "finishes",
+    );
+}
+#[test]
+fn allen_overlapped_by() {
+    allen_check(
+        "r.vf > DATE '2024-04-01' AND r.vf < DATE '2024-08-01' AND r.vt > DATE '2024-08-01'",
+        "overlapped_by",
+    );
+}
+#[test]
+fn allen_met_by() {
+    allen_check("r.vf = DATE '2024-08-01'", "met_by");
+}
+#[test]
+fn allen_after() {
+    allen_check("r.vf > DATE '2024-08-01'", "after");
 }
 
 /// Comprehensive Allen-relations bitemporal benchmark: a batch of edge-versions in
