@@ -23,6 +23,7 @@ pub mod error;
 pub mod error_codes;
 pub mod ffi;
 pub mod ffi_error;
+mod interval_index;
 // In-engine graph algorithms. Config is a JSON object, so this rides on the
 // shared JSON parser (the `ndjson` feature) — present in every build that can
 // load a graph; only the `gql`-only minimal wasm bundle omits it.
