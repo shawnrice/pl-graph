@@ -9400,3 +9400,191 @@ fn bench_allen_relations() {
         );
     }
 }
+
+/// Bitemporal 4-way as-of: two RI-tree interval indexes (valid [vf,vt) + transaction
+/// [tf,tt)) intersect so a query "as of valid V, as believed at T" returns the version
+/// believed at T — the *same* valid point V yields different rows for different T, which
+/// is the whole point of transaction time. e0 and e1 share a valid interval but e1 is a
+/// later belief (correction) that supersedes e0. Correct across index configs.
+#[test]
+fn bitemporal_4way_asof_intersects_valid_and_tx() {
+    // e0: valid [2020,2025) believed [2020,2023);  e1: valid [2020,2025) believed [2023,9999).
+    let lines = [
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R"],"properties":{"id":"e0","vf":{"@date":"2020-01-01"},"vt":{"@date":"2025-01-01"},"tf":{"@date":"2020-01-01"},"tt":{"@date":"2023-01-01"}}}"#,
+        r#"{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{"id":"e1","vf":{"@date":"2020-01-01"},"vt":{"@date":"2025-01-01"},"tf":{"@date":"2023-01-01"},"tt":{"@date":"9999-12-31"}}}"#,
+    ];
+    let q = "MATCH ()-[r:R]->() \
+        WHERE r.vf <= $v AND r.vt > $v AND r.tf <= $t AND r.tt > $t \
+        RETURN r.id AS id ORDER BY id";
+    let make = |indexed: bool| {
+        let mut g = graph_of(&lines);
+        if indexed {
+            g.create_edge_interval_index("vf", "vt"); // valid-time
+            g.create_edge_interval_index("tf", "tt"); // transaction-time
+        }
+        g
+    };
+    let params = |v: &str, t: &str| {
+        let mut m = Params::new();
+        let d = |s: &str| {
+            super::eval::Val::Temporal(crate::temporal::Temporal::parse("date", s).unwrap())
+        };
+        m.insert("v".into(), d(v));
+        m.insert("t".into(), d(t));
+        m
+    };
+
+    // valid 2022, believed 2021 → e0 (e1 not yet believed).
+    for indexed in [false, true] {
+        let mut g = make(indexed);
+        assert_eq!(
+            qp(&mut g, q, params("2022-01-01", "2021-01-01")),
+            vec![vec![s("e0")]],
+            "as-of valid 2022 believed 2021 (indexed={indexed})"
+        );
+        // same valid point, later belief 2024 → e1 (the correction).
+        assert_eq!(
+            qp(&mut g, q, params("2022-01-01", "2024-01-01")),
+            vec![vec![s("e1")]],
+            "as-of valid 2022 believed 2024 (indexed={indexed})"
+        );
+    }
+}
+
+/// contains-window ("valid THROUGHOUT [d1,d2]"): `vf <= d1 AND vt >= d2` returns exactly
+/// the intervals covering the whole window, seeking via the interval index (a superset
+/// the WHERE refines), identical across index configs.
+#[test]
+fn contains_window_valid_throughout() {
+    let edge = |id: &str, vf: &str, vt: &str| {
+        format!(
+            r#"{{"type":"edge","id":"{id}","from":"a","to":"b","labels":["R"],"properties":{{"id":"{id}","vf":{{"@date":"{vf}"}},"vt":{{"@date":"{vt}"}}}}}}"#
+        )
+    };
+    let lines = [
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{}}"#.to_string(),
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{}}"#.to_string(),
+        edge("covers", "2024-01-01", "2024-12-01"), // ⊇ [Apr,Aug)
+        edge("exact", "2024-04-01", "2024-08-01"),  // ⊇ (equal)
+        edge("starts_inside", "2024-06-01", "2024-12-01"), // vf>Apr → not throughout
+        edge("ends_inside", "2024-01-01", "2024-06-01"), // vt<Aug → not throughout
+        edge("disjoint", "2024-01-01", "2024-03-01"), // before
+    ];
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let q = "MATCH ()-[r:R]->() WHERE r.vf <= DATE '2024-04-01' AND r.vt >= DATE '2024-08-01' RETURN r.id AS id ORDER BY id";
+    for indexed in [false, true] {
+        let mut g = graph_of(&refs);
+        if indexed {
+            g.create_edge_interval_index("vf", "vt");
+        }
+        assert_eq!(
+            rows(&mut g, q),
+            vec![vec![s("covers")], vec![s("exact")]],
+            "contains-window must return only the throughout-covering intervals (indexed={indexed})"
+        );
+    }
+}
+
+/// Bitemporal 4-way as-of at scale: valid AND transaction intervals varied so
+/// valid-at-V and believed-at-T each select ~half, their intersection ~a quarter.
+/// Compares scan vs one interval index (valid only, then filter tx) vs two interval
+/// indexes (valid ∩ tx). Run: cargo test --release bench_bitemporal_4way -- --ignored --nocapture
+#[test]
+#[ignore = "benchmark; run with --ignored --nocapture"]
+fn bench_bitemporal_4way() {
+    use crate::temporal::{Date, Temporal};
+    use std::time::Instant;
+    const N: usize = 40_000;
+    const V: i32 = 19_900; // query valid point
+    const T: i32 = 20_000; // query belief point
+
+    struct Rng(u64);
+    impl Rng {
+        fn r(&mut self, lo: i32, hi: i32) -> i32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            lo + ((self.0 >> 20) % ((hi - lo).max(1) as u64)) as i32
+        }
+    }
+    let dval = |d: i32| Value::Temporal(Temporal::Date(Date { days: d }));
+    // mode: 0 none, 1 valid-only interval index, 2 valid+tx interval indexes.
+    let build = |mode: u8| -> Graph {
+        let mut g = ndjson::decode("").unwrap();
+        if mode >= 1 {
+            g.create_edge_interval_index("vf", "vt");
+        }
+        if mode == 2 {
+            g.create_edge_interval_index("tf", "tt");
+        }
+        let a = g.add_vertex(&["N".to_string()], vec![]);
+        let b = g.add_vertex(&["N".to_string()], vec![]);
+        let mut rng = Rng(0x51ed_2701);
+        for _ in 0..N {
+            // Wide start spread, narrow durations → valid-at-V and believed-at-T each
+            // select ~7%, so their intersection is small and the two-index seek pays off.
+            let vf = V - rng.r(0, 30_000);
+            let vt = vf + rng.r(50, 2000);
+            let tf = T - rng.r(0, 30_000);
+            let tt = tf + rng.r(50, 2000);
+            g.add_edge(
+                a,
+                b,
+                "R",
+                vec![
+                    ("vf".to_string(), dval(vf)),
+                    ("vt".to_string(), dval(vt)),
+                    ("tf".to_string(), dval(tf)),
+                    ("tt".to_string(), dval(tt)),
+                ],
+            );
+        }
+        g
+    };
+    let (mut g0, mut g1, mut g2) = (build(0), build(1), build(2));
+    let mut q = Params::new();
+    let td = |d: i32| super::eval::Val::Temporal(Temporal::Date(Date { days: d }));
+    q.insert("v".into(), td(V));
+    q.insert("t".into(), td(T));
+    let query = "MATCH ()-[r:R]->() WHERE r.vf <= $v AND r.vt > $v AND r.tf <= $t AND r.tt > $t RETURN count(*) AS n";
+
+    let bench = |g: &mut Graph| -> (f64, i64) {
+        let prep = parse(query).unwrap();
+        let mc = match prep
+            .execute(g, &q)
+            .unwrap()
+            .rows()
+            .next()
+            .and_then(|r| r.first().cloned())
+        {
+            Some(Value::Num(n)) => n as i64,
+            _ => -1,
+        };
+        let mut ms = Vec::with_capacity(30);
+        for _ in 0..30 {
+            let t = Instant::now();
+            std::hint::black_box(prep.execute(g, &q).unwrap().rows().count());
+            ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (ms[ms.len() / 2], mc)
+    };
+    let (s, ms) = bench(&mut g0);
+    let (o, mo) = bench(&mut g1);
+    let (b, mb) = bench(&mut g2);
+    assert_eq!(ms, mo);
+    assert_eq!(ms, mb); // all three agree on the answer
+    eprintln!("\nbitemporal 4-way ({N} versions), matched={ms}:");
+    eprintln!("  scan                {s:>8.3}ms  1.00x");
+    eprintln!(
+        "  valid index only    {o:>8.3}ms  {:.2}x  (stab(V), filter tx)",
+        s / o
+    );
+    eprintln!(
+        "  valid ∩ tx indexes  {b:>8.3}ms  {:.2}x  (stab(V) ∩ stab(T))",
+        s / b
+    );
+}

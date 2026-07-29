@@ -7223,47 +7223,56 @@ fn prop_index_hint(
             // index covers the pair. The stab is inclusive of `hi == v`, a superset the
             // final `WHERE hi > v` then verifies.
             if edge {
-                if let Some((lo_key, hi_key)) = graph.edge_interval_index_keys() {
-                    let probe = |name: &str, want_lo: bool| -> Option<(usize, i128)> {
-                        items.iter().find_map(|it| {
-                            let (s, kref, op, key) = cmp_bound(it, ctx)?;
-                            let ok = if want_lo {
-                                matches!(op, CompareOp::Le | CompareOp::Lt)
-                            } else {
-                                matches!(op, CompareOp::Gt | CompareOp::Ge)
-                            };
-                            if !ok || !slot_ok(s) || prop_name(graph, ctx, kref, true)? != name {
-                                return None;
-                            }
-                            match key {
-                                crate::graph::IdxKey::Temporal(_, q) => Some((s, q)),
-                                _ => None,
-                            }
-                        })
-                    };
+                let probe = |name: &str, want_lo: bool| -> Option<(usize, i128)> {
+                    items.iter().find_map(|it| {
+                        let (s, kref, op, key) = cmp_bound(it, ctx)?;
+                        let ok = if want_lo {
+                            matches!(op, CompareOp::Le | CompareOp::Lt)
+                        } else {
+                            matches!(op, CompareOp::Gt | CompareOp::Ge)
+                        };
+                        if !ok || !slot_ok(s) || prop_name(graph, ctx, kref, true)? != name {
+                            return None;
+                        }
+                        match key {
+                            crate::graph::IdxKey::Temporal(_, q) => Some((s, q)),
+                            _ => None,
+                        }
+                    })
+                };
+                // Each edge interval index whose `lo_key ≤/< qlo AND hi_key >/≥ qhi` pair
+                // is present in the conjunction contributes one candidate SUPERSET (the
+                // WHERE refines it): a point stab when qlo==qhi, else a window-normalized
+                // overlap — covering as-of, overlap, AND contains (min/max is essential;
+                // overlap(qhi,qlo) on contains would be min>max → empty → a silent miss).
+                // Intersecting across indexes gives the bitemporal 4-way: valid [vf,vt)
+                // stab(V) ∩ transaction [tf,tt) stab(T). Intersect smallest-first.
+                let mut seeks: Vec<Vec<u32>> = Vec::new();
+                for (n, (lo_key, hi_key)) in graph.edge_interval_index_specs().iter().enumerate() {
                     if let (Some((slo, qlo)), Some((shi, qhi))) =
                         (probe(lo_key, true), probe(hi_key, false))
                     {
-                        // The predicate is `lo_key ≤/< qlo AND hi_key >/≥ qhi` — i.e.
-                        // every interval with `vf ≤ qlo AND vt ≥ qhi`. That set is always
-                        // a subset of "intersects the window [min(qlo,qhi), max]", so a
-                        // window-normalized overlap seek is a correct SUPERSET the WHERE
-                        // then refines — covering as-of (qlo==qhi → point), overlap
-                        // (qhi<qlo → window), AND contains (qhi>qlo, e.g. `vf<qf AND
-                        // vt>qt`). Normalizing to (min,max) is essential: `overlap(qhi,
-                        // qlo)` on the contains shape would be min>max → empty → a silent
-                        // miss. Point case keeps the cheaper single-walk stab.
                         if slo == shi {
-                            let cand = if qlo == qhi {
-                                graph.edge_interval_stab(qlo)
+                            seeks.push(if qlo == qhi {
+                                graph.edge_interval_stab_nth(n, qlo)
                             } else {
-                                graph.edge_interval_overlap(qlo.min(qhi), qlo.max(qhi))
-                            };
-                            if let Some(cand) = cand {
-                                return Some(cand);
-                            }
+                                graph.edge_interval_overlap_nth(n, qlo.min(qhi), qlo.max(qhi))
+                            });
                         }
                     }
+                }
+                if let Some(pos) = seeks
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, s)| s.len())
+                    .map(|(i, _)| i)
+                {
+                    let mut acc = seeks.swap_remove(pos);
+                    for s in &seeks {
+                        let set: std::collections::HashSet<u32> = s.iter().copied().collect();
+                        acc.retain(|id| set.contains(id));
+                    }
+                    return Some(acc);
                 }
             }
             // Group every indexed single-column comparison by (var slot, key ref) and

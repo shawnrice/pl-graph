@@ -1335,10 +1335,10 @@ pub struct Graph {
     /// mutation methods. Absent key ⇒ no index (full scan).
     vidx: PropIndex,
     eidx: PropIndex,
-    /// Optional RI-tree interval index over an edge `[lo_key, hi_key)` temporal pair
-    /// (Contender B): an as-of `lo <= v AND hi > v` seeds from `tree.stab(v)` instead
-    /// of a scan or a materialize-and-intersect. Maintained incrementally on writes.
-    edge_interval_idx: Option<EdgeIntervalIdx>,
+    /// RI-tree interval indexes over edge `[lo_key, hi_key)` temporal pairs: an as-of
+    /// `lo <= v AND hi > v` seeds from `tree.stab(v)`, and TWO indexes (valid `[vf,vt)`
+    /// + transaction `[tf,tt)`) intersect for a bitemporal as-of. Maintained on writes.
+    edge_interval_idxs: Vec<EdgeIntervalIdx>,
     /// UNIQUE constraints over vertex properties: label name → the sorted
     /// property keys that must be unique among live vertices carrying that label.
     /// Each constrained key is index-backed (declaring the constraint creates the
@@ -1486,7 +1486,7 @@ impl Clone for Graph {
             synth: self.synth,
             vidx: self.vidx.clone(),
             eidx: self.eidx.clone(),
-            edge_interval_idx: self.edge_interval_idx.clone(),
+            edge_interval_idxs: self.edge_interval_idxs.clone(),
             v_unique: self.v_unique.clone(),
             v_required: self.v_required.clone(),
             v_type: self.v_type.clone(),
@@ -1903,60 +1903,57 @@ impl Graph {
         }
     }
 
-    /// True if `key` is an endpoint of the edge interval index — a write to it moves
-    /// the interval, so the RI-tree must be updated.
+    /// True if `key` is an endpoint of ANY edge interval index — a write to it moves
+    /// that interval, so its RI-tree must be updated.
     fn key_is_interval_endpoint(&self, key: &str) -> bool {
-        self.edge_interval_idx
-            .as_ref()
-            .is_some_and(|i| i.lo_key == key || i.hi_key == key)
+        self.edge_interval_idxs
+            .iter()
+            .any(|i| i.lo_key == key || i.hi_key == key)
     }
 
-    /// Remove edge `ei`'s current `[lo, hi]` from the interval index (no-op if no index
-    /// or the edge lacks an endpoint). Endpoints are read *before* the caller mutates.
-    fn interval_idx_remove(&mut self, ei: u32) {
-        let Some((lo_key, hi_key)) = self
-            .edge_interval_idx
-            .as_ref()
+    /// Endpoint key pairs of every interval index, owned (to sidestep the borrow between
+    /// reading an edge's endpoints and mutating a tree).
+    fn interval_specs(&self) -> Vec<(String, String)> {
+        self.edge_interval_idxs
+            .iter()
             .map(|i| (i.lo_key.clone(), i.hi_key.clone()))
-        else {
-            return;
-        };
-        if let (Some(lo), Some(hi)) = (
-            self.edge_interval_key(ei, &lo_key),
-            self.edge_interval_key(ei, &hi_key),
-        ) {
-            if let Some(idx) = self.edge_interval_idx.as_mut() {
-                idx.tree.remove(lo, hi, ei);
+            .collect()
+    }
+
+    /// Remove edge `ei` from every interval index whose endpoints it carries (no-op if
+    /// none). Endpoints are read *before* the caller mutates.
+    fn interval_idx_remove(&mut self, ei: u32) {
+        for (n, (lo_key, hi_key)) in self.interval_specs().into_iter().enumerate() {
+            if let (Some(lo), Some(hi)) = (
+                self.edge_interval_key(ei, &lo_key),
+                self.edge_interval_key(ei, &hi_key),
+            ) {
+                self.edge_interval_idxs[n].tree.remove(lo, hi, ei);
             }
         }
     }
 
-    /// Insert edge `ei`'s current `[lo, hi]` into the interval index (no-op if no index
-    /// or the edge lacks an endpoint).
+    /// Insert edge `ei` into every interval index whose endpoints it carries.
     fn interval_idx_insert(&mut self, ei: u32) {
-        let Some((lo_key, hi_key)) = self
-            .edge_interval_idx
-            .as_ref()
-            .map(|i| (i.lo_key.clone(), i.hi_key.clone()))
-        else {
-            return;
-        };
-        if let (Some(lo), Some(hi)) = (
-            self.edge_interval_key(ei, &lo_key),
-            self.edge_interval_key(ei, &hi_key),
-        ) {
-            if let Some(idx) = self.edge_interval_idx.as_mut() {
-                idx.tree.insert(lo, hi, ei);
+        for (n, (lo_key, hi_key)) in self.interval_specs().into_iter().enumerate() {
+            if let (Some(lo), Some(hi)) = (
+                self.edge_interval_key(ei, &lo_key),
+                self.edge_interval_key(ei, &hi_key),
+            ) {
+                self.edge_interval_idxs[n].tree.insert(lo, hi, ei);
             }
         }
     }
 
     /// Declare (and backfill) an RI-tree interval index over an edge `[lo_key, hi_key)`
-    /// temporal pair (Contender B). Maintained on `add_edge`. An edge missing either
-    /// endpoint (or non-temporal) is simply not registered — the query's `WHERE`
-    /// verifies membership regardless, so an unregistered edge is never a wrong answer,
-    /// only a missed seek acceleration.
+    /// temporal pair. Maintained on every edge mutation. Declaring a SECOND one (e.g.
+    /// transaction-time `[tf, tt)` alongside valid-time `[vf, vt)`) lets a bitemporal
+    /// as-of intersect both dimensions. Re-declaring the same pair rebuilds it. An edge
+    /// missing an endpoint is simply not registered — the `WHERE` verifies regardless,
+    /// so it's never a wrong answer, only a missed acceleration.
     pub fn create_edge_interval_index(&mut self, lo_key: &str, hi_key: &str) {
+        self.edge_interval_idxs
+            .retain(|i| !(i.lo_key == lo_key && i.hi_key == hi_key));
         let mut tree = crate::interval_index::RiTree::new();
         for ei in 0..self.e_src.len() as u32 {
             if !self.e_live[ei as usize] {
@@ -1969,33 +1966,31 @@ impl Graph {
                 tree.insert(lo, hi, ei);
             }
         }
-        self.edge_interval_idx = Some(EdgeIntervalIdx {
+        self.edge_interval_idxs.push(EdgeIntervalIdx {
             lo_key: lo_key.to_string(),
             hi_key: hi_key.to_string(),
             tree,
         });
     }
 
-    /// Candidate edge ids whose `[lo, hi]` contains point `q`, via the RI-tree interval
-    /// index (None if no such index). A superset the caller's `WHERE` then verifies.
-    pub fn edge_interval_stab(&self, q: i128) -> Option<Vec<u32>> {
-        self.edge_interval_idx.as_ref().map(|idx| idx.tree.stab(q))
+    /// Candidate edge ids whose `[lo, hi]` contains point `q`, via the `n`-th interval
+    /// index. A superset the caller's `WHERE` then verifies.
+    pub fn edge_interval_stab_nth(&self, n: usize, q: i128) -> Vec<u32> {
+        self.edge_interval_idxs[n].tree.stab(q)
     }
 
-    /// Candidate edge ids whose `[lo, hi]` overlaps `[d1, d2]`, via the RI-tree interval
-    /// index (None if no such index). A superset the caller's `WHERE` then verifies.
-    pub fn edge_interval_overlap(&self, d1: i128, d2: i128) -> Option<Vec<u32>> {
-        self.edge_interval_idx
-            .as_ref()
-            .map(|idx| idx.tree.overlap(d1, d2))
+    /// Candidate edge ids whose `[lo, hi]` overlaps `[d1, d2]`, via the `n`-th index.
+    pub fn edge_interval_overlap_nth(&self, n: usize, d1: i128, d2: i128) -> Vec<u32> {
+        self.edge_interval_idxs[n].tree.overlap(d1, d2)
     }
 
-    /// The `(lo_key, hi_key)` an edge interval index covers, if one exists — for the
-    /// seed selector to recognize a matching as-of predicate.
-    pub(crate) fn edge_interval_index_keys(&self) -> Option<(&str, &str)> {
-        self.edge_interval_idx
-            .as_ref()
-            .map(|idx| (idx.lo_key.as_str(), idx.hi_key.as_str()))
+    /// The `(lo_key, hi_key)` each edge interval index covers, in order — for the seed
+    /// selector to recognize matching predicates and intersect across dimensions.
+    pub(crate) fn edge_interval_index_specs(&self) -> Vec<(&str, &str)> {
+        self.edge_interval_idxs
+            .iter()
+            .map(|i| (i.lo_key.as_str(), i.hi_key.as_str()))
+            .collect()
     }
 
     /// Drop a vertex index. Rejected (`InvalidGraphOp`) if the key backs a unique
@@ -4196,20 +4191,6 @@ impl Graph {
             nbr: from,
             etype: tid,
         });
-        // Capture the interval endpoints from `props` before it's consumed (the tree
-        // is updated after the write to avoid a borrow conflict).
-        let interval_ins: Option<(i128, i128)> = self.edge_interval_idx.as_ref().and_then(|idx| {
-            let get = |key: &str| {
-                props
-                    .iter()
-                    .find(|(k, _)| k == key)
-                    .and_then(|(_, v)| match v {
-                        Value::Temporal(t) => t.index_key().map(|(_, k)| k),
-                        _ => None,
-                    })
-            };
-            get(&idx.lo_key).zip(get(&idx.hi_key))
-        });
         self.edge_props.push_element();
         for (k, v) in props {
             if self.any_eidx_rooted_at(&k) {
@@ -4219,9 +4200,8 @@ impl Graph {
             self.edge_props
                 .set_value(ei as usize, &k, v, &mut self.strs);
         }
-        if let (Some((lo, hi)), Some(idx)) = (interval_ins, self.edge_interval_idx.as_mut()) {
-            idx.tree.insert(lo, hi, ei);
-        }
+        // Register the new edge in every interval index it has endpoints for.
+        self.interval_idx_insert(ei);
         // Topology change: drop the CSR snapshot, bump the global version and type.
         self.invalidate_csr();
         self.bump();
@@ -5186,7 +5166,7 @@ impl Builder {
             synth: 0,
             vidx: HashMap::new(),
             eidx: HashMap::new(),
-            edge_interval_idx: None,
+            edge_interval_idxs: Vec::new(),
             v_unique: HashMap::new(),
             v_required: HashMap::new(),
             v_type: HashMap::new(),
