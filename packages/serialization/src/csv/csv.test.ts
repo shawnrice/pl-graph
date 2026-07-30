@@ -20,6 +20,24 @@ import {
 const roundTripNodes = (graph: Graph): Graph => decodeNodes(encodeNodes(graph), new Graph());
 const roundTrip = (graph: Graph): Graph => decode(encode(graph), new Graph());
 
+test('foreign numeric cells outside the strict grammar decode to null (matches Rust)', () => {
+  // JS Number() accepts " 5 " / "0x1F" as 5 / 31; Rust's str::parse rejects them.
+  // Both decoders now gate on a finite-decimal grammar → NaN → null. (Our encoder
+  // only ever writes canonical decimals, which still round-trip.)
+  const header = 'id,:LABEL,n:integer\n';
+  const footer = '\n=== EDGES ===\nid,:START_ID,:END_ID,:TYPE';
+
+  for (const cell of [' 5 ', '0x1F']) {
+    const back = decode(`${header}1,T,${cell}${footer}`, new Graph());
+    // Foreign cell rejected → NaN (a query then renders it null, matching Rust),
+    // NOT coerced to 5 / 31 as JS Number() would.
+    expect(back.getVertexById('1')?.properties.n).toBeNaN();
+  }
+
+  const ok = decode(`${header}1,T,5${footer}`, new Graph());
+  expect(ok.getVertexById('1')?.properties.n).toBe(5);
+});
+
 const FORMULA = /^[=+\-@\t\r]/;
 const FORMULA_CHARS = ['=', '+', '-', '@', '\t', '\r'] as const;
 

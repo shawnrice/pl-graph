@@ -348,6 +348,14 @@ const scalarToRaw = (scalar: ScalarType, value: PropertyValue): string => {
   return String(value as string | number | null);
 };
 
+// A finite decimal/scientific literal — the grammar Rust's f64::from_str accepts
+// for a typed number column (NO surrounding whitespace, NO 0x/0o/0b radix, NO
+// empty string, NO inf/nan). JS `Number()` accepts all of those, so a foreign
+// cell like " 5 " / "0x1F" / "" would decode to 5 / 31 / 0 in TS but NaN in Rust;
+// gating on this regex keeps the two decoders byte-identical. Our own encoder only
+// ever writes canonical `js_number` decimals, which match.
+const CSV_NUMERIC = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
+
 /** Parse one raw scalar string back into a `PropertyValue` of the column type. */
 const rawToScalar = (scalar: ScalarType, raw: string): PropertyValue => {
   switch (scalar) {
@@ -355,7 +363,7 @@ const rawToScalar = (scalar: ScalarType, raw: string): PropertyValue => {
       return raw === 'true';
     case 'integer':
     case 'float':
-      return Number(raw);
+      return CSV_NUMERIC.test(raw) ? Number(raw) : Number.NaN;
     case 'date':
     case 'localtime':
     case 'datetime':
