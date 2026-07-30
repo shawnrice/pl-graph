@@ -1198,18 +1198,34 @@ export const callDatePartFn = (name: string, a: unknown): unknown => {
   );
 };
 
+// The extended-scalar family dispatchers, in priority order. Each returns UNHANDLED
+// for a name that isn't one of its own, so `callExtendedScalar` returns the first
+// non-UNHANDLED result. Built once at module scope. Order matters only for
+// callDatePartFn, whose throw is keyed to its own `_year`/… names.
+const EXTENDED_DISPATCHERS: readonly ((
+  name: string,
+  a: unknown,
+  b: unknown,
+  args: readonly unknown[],
+) => unknown)[] = [
+  (name, a) => callGraphFn(name, a),
+  (name, a) => callConversionFn(name, a),
+  (name, a) => callDatePartFn(name, a),
+  (name, _a, _b, args) => callTemporalFn(name, args),
+  (name, a, b) => callStringPredicateFn(name, a, b),
+  (name, _a, _b, args) => callStringListFn(name, args),
+  (name, a, b, args) => callListSetFn(name, a, b, args),
+];
+
 export const callExtendedScalar = (name: string, args: readonly unknown[]): unknown => {
   const [a, b] = args;
 
-  for (const result of [
-    callGraphFn(name, a),
-    callConversionFn(name, a),
-    callDatePartFn(name, a),
-    callTemporalFn(name, args),
-    callStringPredicateFn(name, a, b),
-    callStringListFn(name, args),
-    callListSetFn(name, a, b, args),
-  ]) {
+  // Short-circuit on the first handler. (The previous array-literal form invoked
+  // ALL seven before the `!== UNHANDLED` check, so the early-return was dead and
+  // every fall-through call paid for all seven switch dispatches.)
+  for (const dispatch of EXTENDED_DISPATCHERS) {
+    const result = dispatch(name, a, b, args);
+
     if (result !== UNHANDLED) {
       return result;
     }
