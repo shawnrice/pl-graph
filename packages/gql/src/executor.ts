@@ -302,6 +302,7 @@ import {
   isNullish,
   makeRecord,
   nonNumericAgg,
+  compareCodePoints,
   not3,
   numOf,
   percentileOf,
@@ -1453,6 +1454,12 @@ const compareValues = (a: unknown, b: unknown): number => {
 
   const x = a as number | string;
   const y = b as number | string;
+
+  // Strings compare by Unicode code point (matching Rust str::cmp), not JS's
+  // UTF-16 code-unit order — see compareCodePoints.
+  if (typeof x === 'string' && typeof y === 'string') {
+    return compareCodePoints(x, y);
+  }
 
   if (x < y) {
     return -1;

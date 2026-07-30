@@ -231,13 +231,74 @@ export const concatStep = (lv: unknown, rv: unknown): unknown => {
 
   return String(lv) + String(rv);
 };
+/**
+ * Compare two strings by Unicode CODE POINT, matching Rust `str::cmp` (UTF-8 byte
+ * order == code-point order). JS `<`/`>` order by UTF-16 code UNIT, which disagrees
+ * when an astral char (surrogate pair, ≥ U+10000) meets a BMP char in U+E000..U+FFFF:
+ * the high surrogate (0xD800..0xDBFF) sorts BELOW U+E000 by code unit, but the astral
+ * code point sorts ABOVE it. Iterating code points (via `codePointAt` + a 1-or-2 unit
+ * step, allocation-free) makes both engines agree. Fast path: with no surrogate in
+ * either string every char is BMP, so UTF-16 order already equals code-point order and
+ * the native compare (much faster than a per-char loop) is exact.
+ */
+export const compareCodePoints = (a: string, b: string): number => {
+  if (!HAS_SURROGATE.test(a) && !HAS_SURROGATE.test(b)) {
+    if (a < b) {
+      return -1;
+    }
+
+    return a > b ? 1 : 0;
+  }
+
+  let i = 0;
+  let j = 0;
+
+  while (i < a.length && j < b.length) {
+    const ca = a.codePointAt(i) as number;
+    const cb = b.codePointAt(j) as number;
+
+    if (ca !== cb) {
+      return ca < cb ? -1 : 1;
+    }
+
+    i += ca > 0xffff ? 2 : 1;
+    j += cb > 0xffff ? 2 : 1;
+  }
+
+  // Whichever string still has characters is the longer one, hence greater; a
+  // prefix sorts before its extension.
+  if (i < a.length) {
+    return 1;
+  }
+
+  return j < b.length ? -1 : 0;
+};
+const HAS_SURROGATE = /[\uD800-\uDBFF]/;
+
+const strOr =
+  (op: (c: number) => boolean, raw: (a: number | string, b: number | string) => boolean) =>
+  (a: number | string, b: number | string): boolean =>
+    typeof a === 'string' && typeof b === 'string' ? op(compareCodePoints(a, b)) : raw(a, b);
+
 export const COMPARE: Record<CompareOp, (a: number | string, b: number | string) => boolean> = {
   '=': (a, b) => a === b,
   '<>': (a, b) => a !== b,
-  '<': (a, b) => a < b,
-  '>': (a, b) => a > b,
-  '<=': (a, b) => a <= b,
-  '>=': (a, b) => a >= b,
+  '<': strOr(
+    (c) => c < 0,
+    (a, b) => a < b,
+  ),
+  '>': strOr(
+    (c) => c > 0,
+    (a, b) => a > b,
+  ),
+  '<=': strOr(
+    (c) => c <= 0,
+    (a, b) => a <= b,
+  ),
+  '>=': strOr(
+    (c) => c >= 0,
+    (a, b) => a >= b,
+  ),
 };
 
 export type FuncExpr = Extract<Expr, { kind: 'func' }>;

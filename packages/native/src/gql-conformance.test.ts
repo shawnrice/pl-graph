@@ -94,6 +94,17 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     }
   });
 
+  test('string comparison is by code point, not UTF-16 unit (astral vs BMP), byte-identical', () => {
+    // '😀' is U+1F600 (code point 0x1F600 > 0xE000), so '😀' > ''. JS `<`/`>`
+    // once said the opposite (the high surrogate 0xD83D < 0xE000 by code unit),
+    // diverging from Rust str::cmp. Now both engines order by code point.
+    const [ts, native] = both(
+      `RETURN ('😀' < '\\uE000') AS lt, ('😀' > '\\uE000') AS gt, ('😀' = '😀') AS eq`,
+    );
+    expect(ts).toBe(native);
+    expect(ts).toBe(`[{"lt":false,"gt":true,"eq":true}]`);
+  });
+
   test('RETURN n — rich node object, byte-identical, keys sorted', () => {
     const q = `MATCH (n:Person {name: 'marko'}) RETURN n`;
     const [ts, native] = both(q);
