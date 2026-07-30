@@ -200,6 +200,18 @@ A **string is not coerced** — \`_year('2024-01-01')\` throws; wrap it first: \
 ## Current time
 \`current_date()\` and \`current_timestamp()\` read a clock you provide — \`graph.setClock(() => Date.now())\` on a native graph, or pass \`$__now\` in the query params. Without a clock they read as \`null\`, which keeps queries deterministic by default.
 
+## Time zones, DST & instants (read this — it surprises JS users)
+**lenke datetimes are *instants*, not wall clocks, and the math is NOT JavaScript \`Date\`.** Two consequences that trip people up:
+
+1. **A duration adds elapsed *seconds*, and a day is exactly 86,400 s — so \`P1D\` == \`PT24H\`.** There is no calendar-aware "add a day". Across a daylight-saving change a civil day is really 23 or 25 hours, but lenke always adds 24h of real time.
+2. **A \`ZONED DATETIME\` carries a fixed *offset* (\`-05:00\`), not a zone (\`America/New_York\`), and lenke has no IANA tz database.** So adding a duration keeps the offset **frozen** — lenke never "springs forward". The resulting *instant* is exactly right; only the wall-clock *label* goes stale.
+
+Concretely, \`zoned_datetime('2026-03-07T20:00:00-05:00') + duration('P1D')\` → \`2026-03-08T20:00:00-05:00\`. That is the correct instant (as UTC, exactly +24h), but a tz-aware library would render the same instant as \`21:00-04:00\` (9pm EDT, after that night's spring-forward). And because \`_hour\`/\`_day\` read the value's own frozen offset, grouping over data that crossed a DST edge can bucket an hour off — or, near midnight, a whole day off (\`_day\` of \`23:30-05:00 + P1D\` is 8, though the real Eastern instant is day 9).
+
+The **plus** side: unlike JS \`Date\`, lenke's temporal math never consults the host machine's timezone, so results are deterministic across machines and byte-identical on both engines — no "works in NYC, breaks on the UTC server" bug.
+
+**The rule:** store instants as **UTC / \`Z\`** and treat lenke datetimes as instants. Do every zone/DST/wall-clock conversion at the app boundary with a real tz library (the TC39 \`Temporal\` API, Luxon, \`date-fns-tz\`). Don't materialize recurring *local* schedules by adding day-durations in a query — expand them app-side. Ordering, range/interval indexes, as-of predicates, and \`duration_between\` (as elapsed time) are all exact, because they never leave instant-space.
+
 ## Good to know
 - **Store timestamps as temporals, not strings.** A string compared against a temporal silently matches nothing. If your data has string timestamps, wrap them: \`datetime(e.ts)\`, \`date(e.day)\`.
 - **Build temporal values with the constructor functions** \`date(x)\` / \`datetime(x)\` / \`zoned_datetime(x)\` / \`duration(x)\` (rather than \`CAST(x AS DATE)\`). The bare literal prefix is \`DATETIME '…'\`.

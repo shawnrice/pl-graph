@@ -7019,6 +7019,82 @@ fn date_part_zoned_reads_its_own_offset_wall_clock() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// EXPECTED behavior — NOT bugs. lenke is an INSTANT engine, not a civil-time
+// (wall-clock) engine: a duration adds elapsed SECONDS to the instant, the
+// stored offset is FROZEN (no IANA tz database, so no DST re-derivation), and a
+// day is exactly 86_400 s (so `PT24H` and `P1D` are the same operation). These
+// tests pin the surprising-to-JS-users consequences so they can't silently
+// regress. The fix for civil-time semantics is app-side: store UTC/`Z` and do
+// zone/DST conversion at the boundary with a real tz library. See the `temporal`
+// MCP guide's "Time zones, DST & instants" section and docs/guides/bitemporal.md.
+// The scenario: 8pm on 2026-03-07, the evening BEFORE US "spring forward"
+// (2026-03-08 02:00 local, EST -05:00 → EDT -04:00).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn duration_add_is_elapsed_seconds_pt24h_equals_p1d() {
+    // Adding a duration advances the INSTANT by its seconds and keeps the offset
+    // frozen — it does NOT spring forward. As UTC the result is 2026-03-09T01:00Z
+    // (exactly +24h from the 2026-03-08T01:00Z start), which is correct elapsed
+    // time; a tz-aware library would RENDER that same instant as 21:00-04:00
+    // (9pm EDT). lenke renders it in the original -05:00, so the wall clock reads
+    // 20:00. And because a lenke "day" is 86_400 s, `P1D` == `PT24H` exactly —
+    // there is no shorter/longer calendar day across the DST boundary.
+    let mut g = ndjson::decode("").unwrap();
+    let frozen = Value::Temporal(
+        crate::temporal::Temporal::parse("zoned_datetime", "2026-03-08T20:00:00-05:00").unwrap(),
+    );
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN zoned_datetime('2026-03-07T20:00:00-05:00') + duration('PT24H') AS r"
+        ),
+        vec![vec![frozen.clone()]]
+    );
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN zoned_datetime('2026-03-07T20:00:00-05:00') + duration('P1D') AS r"
+        ),
+        vec![vec![frozen]],
+        "P1D and PT24H are the same operation — a day is 86_400 s, no DST-shortened day"
+    );
+}
+
+#[test]
+fn date_part_hour_reads_frozen_offset_across_a_dst_boundary() {
+    // `_hour` reads the value's OWN (frozen) offset, so after crossing spring-
+    // forward the hour is 20 (the stale -05:00 wall clock), not 21 (the real EDT
+    // -04:00 local hour of the identical instant). A `GROUP BY _hour` over data
+    // that crossed a DST edge therefore buckets an hour off — expected, because
+    // lenke never re-derived the offset.
+    let mut g = ndjson::decode("").unwrap();
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN _hour(zoned_datetime('2026-03-07T20:00:00-05:00') + duration('P1D')) AS h"
+        ),
+        vec![vec![n(20.0)]] // reality in America/New_York is 21 (9pm EDT)
+    );
+}
+
+#[test]
+fn date_part_day_does_not_roll_across_a_dst_boundary() {
+    // The nastier bucketing case: a value near midnight. 23:30 EST + P1D stays
+    // 23:30-05:00, so `_day` is 8 — but the identical instant in real EDT is
+    // 2026-03-09T00:30-04:00, i.e. day 9. A daily rollup over cross-DST data can
+    // put a row on the wrong DATE. Expected: the offset is frozen, so no rollover.
+    let mut g = ndjson::decode("").unwrap();
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN _day(zoned_datetime('2026-03-07T23:30:00-05:00') + duration('P1D')) AS d"
+        ),
+        vec![vec![n(8.0)]] // reality in America/New_York is day 9
+    );
+}
+
 #[test]
 fn date_part_null_in_null_out() {
     let mut g = ndjson::decode("").unwrap();

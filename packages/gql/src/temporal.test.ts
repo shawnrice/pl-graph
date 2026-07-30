@@ -269,3 +269,52 @@ describe('GQL: ordering a temporal against a non-temporal is a type error', () =
     ).toEqual([{ c: 1 }]);
   });
 });
+
+// EXPECTED behavior — NOT bugs, and a deliberate surprise for JS users. lenke is
+// an INSTANT engine, not a civil-time engine, and — unlike JS `Date` — its math
+// does NOT consult the host machine's timezone (verified: identical output under
+// TZ=America/New_York, TZ=Asia/Kolkata, and unset). A duration adds elapsed
+// seconds, the stored offset is frozen (no IANA tz db → no DST re-derivation),
+// and a day is exactly 86_400 s (so `P1D` == `PT24H`). These mirror the Rust
+// `gql::tests` DST tests one-for-one — byte-identical across both engines. Store
+// UTC/`Z` and convert zones/DST at the boundary. See the `temporal` MCP guide.
+describe('GQL: instant math, not civil time (DST / time zones)', () => {
+  const one = (q: string): unknown => query(new Graph(), q)[0].r;
+  // 8pm on the evening BEFORE US "spring forward" (2026-03-08 02:00, EST→EDT).
+
+  test('adding a duration is elapsed seconds with a frozen offset — no DST flip', () => {
+    // The instant advances exactly 24h (as UTC, 2026-03-09T01:00Z), but lenke
+    // keeps the -05:00 offset, so the wall clock reads 20:00. A tz-aware library
+    // would render that same instant as 21:00-04:00 (9pm EDT).
+    expect(
+      String(one(`RETURN zoned_datetime('2026-03-07T20:00:00-05:00') + duration('PT24H') AS r`)),
+    ).toBe('2026-03-08T20:00:00-05:00');
+  });
+
+  test('P1D and PT24H are the same operation (a day is 86_400 s)', () => {
+    const pt24h = String(
+      one(`RETURN zoned_datetime('2026-03-07T20:00:00-05:00') + duration('PT24H') AS r`),
+    );
+    const p1d = String(
+      one(`RETURN zoned_datetime('2026-03-07T20:00:00-05:00') + duration('P1D') AS r`),
+    );
+    expect(p1d).toBe(pt24h); // no DST-shortened calendar day
+  });
+
+  test('component extraction reads the frozen offset across a DST boundary', () => {
+    // _hour is the stale -05:00 wall clock (20), not the real EDT local hour (21);
+    // near midnight the date does not roll (_day 8, not the real EDT day 9).
+    expect(
+      query(
+        new Graph(),
+        `RETURN _hour(zoned_datetime('2026-03-07T20:00:00-05:00') + duration('P1D')) AS r`,
+      ),
+    ).toEqual([{ r: 20 }]);
+    expect(
+      query(
+        new Graph(),
+        `RETURN _day(zoned_datetime('2026-03-07T23:30:00-05:00') + duration('P1D')) AS r`,
+      ),
+    ).toEqual([{ r: 8 }]);
+  });
+});
