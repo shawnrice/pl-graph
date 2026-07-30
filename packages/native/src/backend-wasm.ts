@@ -210,6 +210,21 @@ const instantiate = async (source: WasmSource): Promise<WebAssembly.Instance> =>
  * (see `build:wasm`) as a module, bytes, or fetch `Response` for streaming
  * compilation in the browser.
  */
+const throwConstraintResult = (op: string, kind: string, args: string, r: number): void => {
+  if (r === -2) {
+    throw new LenkeError(
+      `lenke: ${op}(${args}): existing data already violates the ${kind} constraint`,
+      {
+        code: ErrorCode.ConstraintViolation,
+      },
+    );
+  }
+
+  if (r !== 0) {
+    throw new LenkeError(`lenke: ${op} failed`, { code: ErrorCode.Ffi });
+  }
+};
+
 export const createWasmBackend = async (source: WasmSource): Promise<Backend> => {
   const instance = await instantiate(source);
   const ex = instance.exports as unknown as WasmExports;
@@ -440,16 +455,7 @@ export const createWasmBackend = async (source: WasmSource): Promise<Backend> =>
       try {
         const r = ex.lnk_create_unique_constraint(handle, lp, l.byteLength, kp, k.byteLength);
 
-        if (r === -2) {
-          throw new LenkeError(
-            `lenke: createUniqueConstraint(${label}, ${key}): existing data already violates the unique constraint`,
-            { code: ErrorCode.ConstraintViolation },
-          );
-        }
-
-        if (r !== 0) {
-          throw new LenkeError('lenke: createUniqueConstraint failed', { code: ErrorCode.Ffi });
-        }
+        throwConstraintResult('createUniqueConstraint', 'unique', `${label}, ${key}`, r);
       } finally {
         ex.lnk_dealloc(lp, l.byteLength);
         ex.lnk_dealloc(kp, k.byteLength);
@@ -464,16 +470,7 @@ export const createWasmBackend = async (source: WasmSource): Promise<Backend> =>
       try {
         const r = ex.lnk_create_required_constraint(handle, lp, l.byteLength, kp, k.byteLength);
 
-        if (r === -2) {
-          throw new LenkeError(
-            `lenke: createRequiredConstraint(${label}, ${key}): existing data already violates the required constraint`,
-            { code: ErrorCode.ConstraintViolation },
-          );
-        }
-
-        if (r !== 0) {
-          throw new LenkeError('lenke: createRequiredConstraint failed', { code: ErrorCode.Ffi });
-        }
+        throwConstraintResult('createRequiredConstraint', 'required', `${label}, ${key}`, r);
       } finally {
         ex.lnk_dealloc(lp, l.byteLength);
         ex.lnk_dealloc(kp, k.byteLength);
@@ -505,16 +502,7 @@ export const createWasmBackend = async (source: WasmSource): Promise<Backend> =>
           );
         }
 
-        if (r === -2) {
-          throw new LenkeError(
-            `lenke: createTypeConstraint(${label}, ${key}, ${type}): existing data already violates the type constraint`,
-            { code: ErrorCode.ConstraintViolation },
-          );
-        }
-
-        if (r !== 0) {
-          throw new LenkeError('lenke: createTypeConstraint failed', { code: ErrorCode.Ffi });
-        }
+        throwConstraintResult('createTypeConstraint', 'type', `${label}, ${key}, ${type}`, r);
       } finally {
         ex.lnk_dealloc(lp, l.byteLength);
         ex.lnk_dealloc(kp, k.byteLength);
@@ -530,16 +518,7 @@ export const createWasmBackend = async (source: WasmSource): Promise<Backend> =>
       try {
         const r = ex.lnk_create_edge_unique_constraint(handle, lp, l.byteLength, kp, k.byteLength);
 
-        if (r === -2) {
-          throw new LenkeError(
-            `lenke: createEdgeUniqueConstraint(${edgeType}, ${key}): existing data already violates the unique constraint`,
-            { code: ErrorCode.ConstraintViolation },
-          );
-        }
-
-        if (r !== 0) {
-          throw new LenkeError('lenke: createEdgeUniqueConstraint failed', { code: ErrorCode.Ffi });
-        }
+        throwConstraintResult('createEdgeUniqueConstraint', 'unique', `${edgeType}, ${key}`, r);
       } finally {
         ex.lnk_dealloc(lp, l.byteLength);
         ex.lnk_dealloc(kp, k.byteLength);
@@ -560,18 +539,7 @@ export const createWasmBackend = async (source: WasmSource): Promise<Backend> =>
           k.byteLength,
         );
 
-        if (r === -2) {
-          throw new LenkeError(
-            `lenke: createEdgeRequiredConstraint(${edgeType}, ${key}): existing data already violates the required constraint`,
-            { code: ErrorCode.ConstraintViolation },
-          );
-        }
-
-        if (r !== 0) {
-          throw new LenkeError('lenke: createEdgeRequiredConstraint failed', {
-            code: ErrorCode.Ffi,
-          });
-        }
+        throwConstraintResult('createEdgeRequiredConstraint', 'required', `${edgeType}, ${key}`, r);
       } finally {
         ex.lnk_dealloc(lp, l.byteLength);
         ex.lnk_dealloc(kp, k.byteLength);
@@ -603,16 +571,12 @@ export const createWasmBackend = async (source: WasmSource): Promise<Backend> =>
           );
         }
 
-        if (r === -2) {
-          throw new LenkeError(
-            `lenke: createEdgeTypeConstraint(${edgeType}, ${key}, ${type}): existing data already violates the type constraint`,
-            { code: ErrorCode.ConstraintViolation },
-          );
-        }
-
-        if (r !== 0) {
-          throw new LenkeError('lenke: createEdgeTypeConstraint failed', { code: ErrorCode.Ffi });
-        }
+        throwConstraintResult(
+          'createEdgeTypeConstraint',
+          'type',
+          `${edgeType}, ${key}, ${type}`,
+          r,
+        );
       } finally {
         ex.lnk_dealloc(lp, l.byteLength);
         ex.lnk_dealloc(kp, k.byteLength);
