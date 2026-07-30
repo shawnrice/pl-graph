@@ -162,7 +162,7 @@ interest routing, clean reconnect-when-ack-arrived — all verified working.
 
 ---
 
-## New roadmap codes proposed (see ROADMAP.md)
+## New roadmap codes proposed
 
 - **R-TEMPORAL2** — temporal v2 value ops: duration aggregates (`sum`/`avg`),
   date-part extraction (`year`/`month`/`day`/`EXTRACT`), duration↔number, `CAST`

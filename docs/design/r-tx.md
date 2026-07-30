@@ -83,7 +83,7 @@ behaves identically whether the store is TS or Rust.
 - ~~The R-CONSTRAINTS items that build on R-TX~~ — **SHIPPED**: edge-side
   constraints, min/`exactly one` cardinality, declarative (GQL-predicate)
   validators, and graph-level (cross-write) invariants all now use these deferred
-  checks. See the R-CONSTRAINTS entry in `docs/dogfood/ROADMAP.md`.
+  checks.
 - Concurrency/MVCC, savepoints, and true nested (savepoint) transactions —
   nesting is flat in v1 (an inner rollback rolls the whole transaction back).
 

@@ -127,7 +127,7 @@ not created. Concretely:
 
 **Deliberately deferred to v2: multi-create compound patterns** (where any
 element in the path may be created). That case needs per-element dispositions and
-leans on multi-anchor index-seed planning (`R-SEED` in `docs/dogfood/ROADMAP.md`).
+leans on multi-anchor index-seed planning (the shipped `R-SEED` work).
 It is out of scope because the performance, predictability, and — especially — the
 _conflict ergonomics_ of multi-element create are exactly where Cypher's MERGE
 becomes a foot-cannon. v1 stays bounded, footgun-free, and covers the two use
@@ -283,7 +283,7 @@ pure. New behavioral tests live in both `packages/gql/src/*.test.ts` and
 
 ---
 
-## 5. Build slices (see task list / ROADMAP `R-MERGE`)
+## 5. Build slices
 
 1. Unique-constraint primitive — Rust core (storage + index-backing +
    INSERT-time enforcement).

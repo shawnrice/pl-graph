@@ -20,8 +20,7 @@ This directory is the durable record so the loop survives context compaction.
 5. **Rebuild** — re-run fresh personas on the same domains; measure the delta
    (which friction is gone, what's newly smooth, any regressions).
 
-See [`ROADMAP.md`](./ROADMAP.md) for the live pain-point tracker (open vs fixed),
-and [`findings/`](./findings/) for each round's raw persona reports.
+See [`findings/`](./findings/) for each round's raw persona reports. The `ROADMAP.md` pain-point tracker was retired once every item it tracked had shipped or been decided against.
 
 ## Confirmed use cases we want to support
 
