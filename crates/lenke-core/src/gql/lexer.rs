@@ -209,13 +209,15 @@ fn read_escape(b: &[u8], src: &str, i: usize) -> Result<(String, usize), SyntaxE
     if esc == 'u' || esc == 'U' {
         let width = if esc == 'u' { 4 } else { 6 };
         let end = i + 2 + width;
-        if end > src.len() {
+        // `.get` (not `&src[..]`) so an escape whose window runs past the end OR
+        // crosses a UTF-8 char boundary (e.g. `\u123é`) yields the escape error
+        // rather than panicking — which under panic="abort" would abort the host.
+        let Some(hex) = src.get(i + 2..end) else {
             return err(
                 format!("Invalid \\{esc} escape (expected {width} hex digits)"),
                 i,
             );
-        }
-        let hex = &src[i + 2..end];
+        };
         match u32::from_str_radix(hex, 16).ok().and_then(char::from_u32) {
             Some(ch) => Ok((ch.to_string(), end)),
             None => err(
@@ -559,4 +561,20 @@ fn parse_number(s: &str) -> Option<f64> {
         return u64::from_str_radix(bin, 2).ok().map(|n| n as f64);
     }
     s.parse::<f64>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tokenize;
+
+    #[test]
+    fn malformed_unicode_escape_errors_not_panics() {
+        // A `\u` escape whose hex window crosses a multi-byte char (`é` is two
+        // bytes) must error, not panic on a non-char-boundary slice — which under
+        // panic="abort" would abort the host.
+        assert!(tokenize("RETURN \"\\u123é\"").is_err());
+        assert!(tokenize("RETURN \"\\U12345é\"").is_err());
+        // A well-formed escape still tokenizes.
+        assert!(tokenize("RETURN \"\\u0041\"").is_ok());
+    }
 }
