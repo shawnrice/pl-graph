@@ -680,29 +680,27 @@ fn props_from_row(row: &[Cell], prop_cols: &[(String, ColType)], fixed: usize) -
 // Bags from the graph
 // ---------------------------------------------------------------------------
 
+/// Build the property `Bag` for one element (`idx` into `store`), stringifying the
+/// interned keys. Shared by `vertex_bags` / `edge_bags`, which differ only in the
+/// id type, the live-check, and which property store they read.
+fn make_bag(store: &crate::graph::Properties, strs: &crate::graph::Dict, idx: usize) -> Bag {
+    element_props(store, strs, idx)
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+}
+
 fn vertex_bags(g: &Graph) -> Vec<(u32, Bag)> {
     (0..g.n as u32)
         .filter(|&vi| g.is_vertex_live(vi))
-        .map(|vi| {
-            let bag = element_props(&g.props, &g.strs, vi as usize)
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect();
-            (vi, bag)
-        })
+        .map(|vi| (vi, make_bag(&g.props, &g.strs, vi as usize)))
         .collect()
 }
 
 fn edge_bags(g: &Graph) -> Vec<(usize, Bag)> {
     (0..g.edge_slots())
         .filter(|&i| g.is_edge_live(i as u32))
-        .map(|i| {
-            let bag = element_props(&g.edge_props, &g.strs, i)
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect();
-            (i, bag)
-        })
+        .map(|i| (i, make_bag(&g.edge_props, &g.strs, i)))
         .collect()
 }
 
