@@ -1797,6 +1797,36 @@ fn repeat_budget_guards_runaway_on_dense_graph() {
 }
 
 #[test]
+fn order_by_mixed_type_property_faults_not_panics() {
+    // A schemaless property that is a number on some vertices and a string on
+    // others makes `order().by('p')` compare incomparable pairs. The comparator
+    // must be a TOTAL order or Rust's sort_by panics ("does not implement a total
+    // order") — which under panic=abort would abort the host. ~60 vertices to
+    // reliably trip sort_by's total-order check. try_run surfaces the recorded
+    // type fault as E_INVALID_VALUE; run must not panic.
+    let lines: Vec<String> = (0..100u64)
+        .map(|i| {
+            // Pseudo-random number/string split (a strict alternation doesn't
+            // reliably trip sort_by's total-order check; a shuffled one does).
+            let p = if (i.wrapping_mul(2_654_435_761) >> 16) & 1 == 0 {
+                format!("{i}")
+            } else {
+                format!("\"s{i}\"")
+            };
+            format!(r#"{{"type":"node","id":"{i}","labels":["T"],"properties":{{"p":{p}}}}}"#)
+        })
+        .collect();
+    let mut g = crate::ndjson::decode(&lines.join("\n")).unwrap();
+    let t = super::parse("g.V().order().by('p')").unwrap();
+    assert_eq!(
+        super::try_run(&mut g, &t).unwrap_err().code,
+        crate::error_codes::ErrorCode::InvalidValue
+    );
+    // Infallible path: best-effort, but must not panic.
+    let _ = t.run(&mut g);
+}
+
+#[test]
 fn lexer_preserves_utf8_string_literals() {
     let lines = [r#"{"type":"node","id":"1","labels":["P"],"properties":{"name":"café"}}"#];
     let mut g = crate::ndjson::decode(&lines.join("\n")).unwrap();

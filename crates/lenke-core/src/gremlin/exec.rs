@@ -1303,6 +1303,71 @@ fn cmp_or_fault(a: &GVal, b: &GVal) -> Option<Ordering> {
     c
 }
 
+fn gval_type_rank(v: &GVal) -> u8 {
+    match v {
+        GVal::Null => 0,
+        GVal::Bool(_) => 1,
+        GVal::Num(_) => 2,
+        GVal::Str(_) => 3,
+        GVal::Temporal(_) => 4,
+        GVal::Vertex(_) => 5,
+        GVal::Edge(_) => 6,
+        GVal::List(_) => 7,
+        GVal::Map(_) => 8,
+        GVal::Property { .. } => 9,
+    }
+}
+
+/// A genuine TOTAL order over `GVal`, used only as the `order()` sort comparator's
+/// tie-break so `slice::sort_by` can never see a non-total order — Rust panics on
+/// that ("comparison function does not implement a total order"), which under the
+/// release `panic = "abort"` build would abort the host on ordinary mixed-type
+/// input. It AGREES with `gcmp` on every comparable pair (numbers by value, same-
+/// kind temporals chronologically, …), so a homogeneous stream sorts identically;
+/// for incomparable pairs (cross-type, NaN, cross-kind temporal) it falls back to a
+/// deterministic order (type-rank, then a within-type total order — `f64::total_cmp`
+/// puts NaN last). `order()` still records a type fault for those pairs via
+/// `cmp_or_fault`, so `try_run` surfaces the error and this tie-break order is never
+/// observed there; it only makes the infallible `run` path deterministic.
+fn gcmp_total(a: &GVal, b: &GVal) -> Ordering {
+    let (ra, rb) = (gval_type_rank(a), gval_type_rank(b));
+    if ra != rb {
+        return ra.cmp(&rb);
+    }
+    match (a, b) {
+        (GVal::Bool(x), GVal::Bool(y)) => x.cmp(y),
+        (GVal::Num(x), GVal::Num(y)) => x.total_cmp(y),
+        (GVal::Str(x), GVal::Str(y)) => x.as_ref().cmp(y.as_ref()),
+        (GVal::Temporal(x), GVal::Temporal(y)) => x.cmp_total(y),
+        (GVal::Vertex(x), GVal::Vertex(y)) | (GVal::Edge(x), GVal::Edge(y)) => x.cmp(y),
+        (GVal::List(x), GVal::List(y)) => x
+            .iter()
+            .zip(y.iter())
+            .map(|(xi, yi)| gcmp_total(xi, yi))
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or_else(|| x.len().cmp(&y.len())),
+        (GVal::Map(x), GVal::Map(y)) => x
+            .iter()
+            .zip(y.iter())
+            .map(|((k1, v1), (k2, v2))| gcmp_total(k1, k2).then_with(|| gcmp_total(v1, v2)))
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or_else(|| x.len().cmp(&y.len())),
+        (
+            GVal::Property {
+                key: k1, value: v1, ..
+            },
+            GVal::Property {
+                key: k2, value: v2, ..
+            },
+        ) => k1
+            .as_ref()
+            .cmp(k2.as_ref())
+            .then_with(|| gcmp_total(v1, v2)),
+        // Same rank ⟹ same variant (Null==Null falls here as Equal).
+        _ => Ordering::Equal,
+    }
+}
+
 thread_local! {
     /// Compile each `regex()` pattern once and reuse it per value — the pattern
     /// is re-applied across the whole stream. Mirrors the TS `regexCache`.
@@ -2458,7 +2523,10 @@ fn apply_order(
             let dir = by
                 .direction()
                 .unwrap_or(if desc { Order::Desc } else { Order::Asc });
-            let mut o = cmp_or_fault(&ka[i], &kb[i]).unwrap_or(Ordering::Equal);
+            // `cmp_or_fault` records a type fault for an incomparable pair (so
+            // `try_run` still errors); fall back to the TOTAL `gcmp_total` for the
+            // ordering so `sort_by` never sees a non-total comparator and panics.
+            let mut o = cmp_or_fault(&ka[i], &kb[i]).unwrap_or_else(|| gcmp_total(&ka[i], &kb[i]));
             if dir == Order::Desc {
                 o = o.reverse();
             }
