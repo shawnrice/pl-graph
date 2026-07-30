@@ -1670,7 +1670,12 @@ fn arith_vec_step(ctx: &Ctx, op: ArithOp, l: VVec, r: VVec, n: usize) -> VVec {
     let (rd, rv) = r.into_num();
     if matches!(op, ArithOp::Div | ArithOp::Mod) {
         for i in 0..n {
-            if rv[i] && rd[i] == 0.0 {
+            // Fault only when BOTH operands are non-null (`lv[i] && rv[i]`), matching
+            // scalar `arith_step`: a null dividend short-circuits to null BEFORE the
+            // divide-by-zero check, so `null / 0` is null (no fault), not an error.
+            // The scalar path returns null here without faulting; the vectorized scan
+            // omitted `lv[i]` and so faulted `null / 0`, diverging from TS/scalar.
+            if lv[i] && rv[i] && rd[i] == 0.0 {
                 ctx.set_fault(FAULT_DIV_ZERO);
                 break;
             }

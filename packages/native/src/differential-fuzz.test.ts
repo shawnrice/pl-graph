@@ -222,7 +222,7 @@ suite('differential fuzz: TS gql engine vs Rust core', () => {
   };
 
   const SEED = 0x1234_5678;
-  const ITERATIONS = 4000;
+  const ITERATIONS = 20_000;
 
   test(`${ITERATIONS} random expressions render byte-identically across engines`, () => {
     const divergences: string[] = [];

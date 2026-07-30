@@ -3798,6 +3798,29 @@ fn division_by_zero_raises_over_rows_vectorized() {
 }
 
 #[test]
+fn null_dividend_over_zero_is_null_not_a_fault_vectorized() {
+    // A null dividend short-circuits to null BEFORE the divide-by-zero check, so
+    // `null / 0` (and `% 0`) over MATCH rows is null — NOT a data exception. The
+    // vectorized fault scan once omitted the dividend-validity check and faulted
+    // these, diverging from the scalar path and the TS engine (found by the
+    // differential fuzzer). A real numeric dividend over zero must still fault.
+    let mut g = modern();
+    for q in [
+        "MATCH (n:Person) RETURN null / 0 AS r",
+        "MATCH (n:Person) RETURN null % 0 AS r",
+        // n.age is present, but the null literal still short-circuits the row.
+        "MATCH (n:Person) RETURN (null / (n.age - n.age)) AS r",
+    ] {
+        let out = rows(&mut g, q);
+        assert!(!out.is_empty(), "{q}");
+        assert!(
+            out.iter().all(|row| row == &vec![Value::Null]),
+            "{q}: expected all-null rows, got {out:?}"
+        );
+    }
+}
+
+#[test]
 fn date_arithmetic_overflow_raises_data_exception() {
     // A date/datetime shifted past the representable range (Date is i32 days,
     // ≈±5.88M years) is a loud data exception, not a silent null — same policy as
