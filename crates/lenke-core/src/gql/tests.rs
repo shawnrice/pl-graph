@@ -707,6 +707,31 @@ fn count_star_shortcut_edges() {
 }
 
 #[test]
+fn order_by_letin_over_output_column_sorts_by_that_column() {
+    // Regression (refs_slot_below): the vectorized-scan fast path is gated by
+    // whether an ORDER BY key reads an output column. That check once missed
+    // `LetIn` (and PropertyExists / correlated subqueries), so an ORDER BY key that
+    // reads an OUTPUT column *through* a LET was mis-reported as input-only — the
+    // query wrongly vectorized and sorted in the INPUT scope (by node identity)
+    // instead of by the projected value. TS has no such fast path, so it was a
+    // silent Rust-only divergence. The key `(LET x = a IN x END)` sorts by `a`.
+    let mut g = modern();
+    let r = rows(
+        &mut g,
+        "MATCH (n:Person) RETURN n.name AS nm, n.age AS a ORDER BY (LET x = a IN x END)",
+    );
+    let names: Vec<String> = r
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Str(name) => name.to_string(),
+            other => panic!("expected a name, got {other:?}"),
+        })
+        .collect();
+    // ages: vadas 27, marko 29, josh 32, peter 35 → ascending by age, not by id.
+    assert_eq!(names, vec!["vadas", "marko", "josh", "peter"]);
+}
+
+#[test]
 fn projection_column_names_and_order() {
     let mut g = modern();
     let (cols, r) = q(

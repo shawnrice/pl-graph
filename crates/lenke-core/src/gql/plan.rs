@@ -1259,7 +1259,23 @@ fn refs_slot_below(expr: &CExpr, n: usize) -> bool {
         CExpr::Scalar { args, .. } => args.iter().any(|e| refs_slot_below(e, n)),
         CExpr::GraphPred { args, .. } => args.iter().any(|e| refs_slot_below(e, n)),
         CExpr::Aggregate { arg, .. } => arg.as_deref().is_some_and(|e| refs_slot_below(e, n)),
-        // exists/count subqueries correlate via their own bindings; lits/params/aggref don't.
+        // `PROPERTY_EXISTS(v, k)` resolves the element in slot `var_slot`, exactly
+        // like `Prop` — so an ORDER BY over `PROPERTY_EXISTS(<output col>, …)` reads
+        // an output slot and must NOT take the input-scope vectorized fast path.
+        CExpr::PropertyExists { var_slot, .. } => *var_slot < n,
+        // `LET x = e IN body`: the binding exprs read the enclosing scope (which may
+        // include an output column < n); the body may too. The LET-bound slots are
+        // fresh (≥ n), so a body ref to one is harmless — and a false positive only
+        // makes the fast path more conservative, never wrong.
+        CExpr::LetIn { bindings, body } => {
+            bindings.iter().any(|(_, e)| refs_slot_below(e, n)) || refs_slot_below(body, n)
+        }
+        // A correlated subquery can read an output column through its patterns /
+        // WHERE / RETURN correlation, which `refs_slot_below` can't see (they live in
+        // `CPath`, not `CExpr`). Conservatively force the safe non-vectorized path
+        // whenever ORDER BY contains one — correctness over a rarely-hit fast path.
+        CExpr::Exists { .. } | CExpr::CountSubquery { .. } | CExpr::ValueSubquery { .. } => true,
+        // Lits / params / aggref reference no input slot.
         _ => false,
     }
 }
