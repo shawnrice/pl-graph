@@ -1435,11 +1435,23 @@ pub(super) fn fold_group_agg_cols(
                         if valid[i] {
                             let g = gid_of_row[i];
                             m[g] = Some(match m[g] {
+                                // First-seen semantics matching the scalar `cmp_total`
+                                // path (and the TS `reduce`): replace only on a STRICT
+                                // partial_cmp result, so a NaN (partial_cmp → None)
+                                // never displaces a real extreme, and a first-seen NaN
+                                // sticks. `f64::min/max` instead silently drop NaN, so
+                                // the vectorized and scalar min/max disagreed on a
+                                // computed NaN (e.g. `min(sqrt(x))` with some x < 0).
                                 Some(x) => {
-                                    if is_min {
-                                        x.min(d[i])
+                                    let want = if is_min {
+                                        Ordering::Less
                                     } else {
-                                        x.max(d[i])
+                                        Ordering::Greater
+                                    };
+                                    if d[i].partial_cmp(&x) == Some(want) {
+                                        d[i]
+                                    } else {
+                                        x
                                     }
                                 }
                                 None => d[i],

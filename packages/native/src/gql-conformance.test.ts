@@ -105,6 +105,16 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(ts).toBe(`[{"lt":false,"gt":true,"eq":true}]`);
   });
 
+  test('min/max over a computed NaN agrees across engines (vectorized == scalar)', () => {
+    // sqrt(age-30): marko(29)→NaN, vadas(27)→NaN, josh(32)→~1.41. A first-seen NaN
+    // sticks under cmp_total/compareValues (min/max is a reduce), so both are NaN →
+    // null. The vectorized Rust fold once used f64::min/max, which DROP NaN → ~1.41,
+    // diverging from the scalar path and from TS. Now all three agree.
+    const [ts, native] = both(`MATCH (n:Person) RETURN min(sqrt(n.age - 30)) AS lo, max(sqrt(n.age - 30)) AS hi`);
+    expect(ts).toBe(native);
+    expect(ts).toBe(`[{"lo":null,"hi":null}]`);
+  });
+
   test('RETURN n — rich node object, byte-identical, keys sorted', () => {
     const q = `MATCH (n:Person {name: 'marko'}) RETURN n`;
     const [ts, native] = both(q);
