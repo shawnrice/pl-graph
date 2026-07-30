@@ -1723,8 +1723,12 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
             let base_v = eval(env, base);
             let idx_v = eval(env, index);
             match base_v {
-                Val::List(items) => match num_of(&idx_v) {
-                    Some(i) if i >= 0.0 && i.fract() == 0.0 && (i as usize) < items.len() => {
+                // Match `Val::Num` directly — a non-number index (string, bool, …)
+                // is null, NOT coerced via num_of. Both engines' contract is
+                // "non-integer list index → null"; `num_of` silently turned `['1']`
+                // into index 1 (and TS threw), so the two disagreed.
+                Val::List(items) => match idx_v {
+                    Val::Num(i) if i >= 0.0 && i.fract() == 0.0 && (i as usize) < items.len() => {
                         items[i as usize].clone()
                     }
                     _ => Val::Null,

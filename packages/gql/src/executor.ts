@@ -423,7 +423,10 @@ export const compileExpr = (expr: Expr): CompiledExpr => {
           return typeof idx === 'string' ? recordGet(base, idx) : null;
         }
 
-        const i = numOf(idx);
+        // A non-number index → null (the contract is "non-integer list index →
+        // null"), NOT the throwing numOf — which diverged from Rust, and from this
+        // path's own intent, on e.g. `list['1']` / `list[true]`.
+        const i = typeof idx === 'number' ? idx : null;
 
         if (
           !Array.isArray(base) ||

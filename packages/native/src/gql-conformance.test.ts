@@ -151,6 +151,17 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(ts).toBe(`[{"c":2}]`);
   });
 
+  test('list subscript with a non-number index is null in both engines', () => {
+    // A number index works; a string / boolean / non-integer index is null (the
+    // ISO "non-integer list index → null" contract). Rust once coerced ['1']→index 1;
+    // TS once threw on a non-number index. Now both return null.
+    const [ts, native] = both(
+      `RETURN [10,20,30][1] AS a, [10,20,30]['1'] AS b, [10,20,30][true] AS c, [10,20,30][1.5] AS d`,
+    );
+    expect(ts).toBe(native);
+    expect(ts).toBe(`[{"a":20,"b":null,"c":null,"d":null}]`);
+  });
+
   test('RETURN n — rich node object, byte-identical, keys sorted', () => {
     const q = `MATCH (n:Person {name: 'marko'}) RETURN n`;
     const [ts, native] = both(q);
