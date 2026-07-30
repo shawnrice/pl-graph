@@ -1826,37 +1826,14 @@ impl Parser {
         self.expect(Tt::LParen, "'(' after CAST")?;
         let value = self.parse_expr()?;
         self.expect_kw("as")?;
-        let type_tok = self.peek().clone();
-        if type_tok.tt != Tt::Ident && type_tok.tt != Tt::Keyword {
-            return err(
-                format!("expected a type name in CAST, got '{}'", type_tok.value),
-                type_tok.pos,
-            );
-        }
-        self.advance();
-        // Two-word temporal type names: `LOCAL DATETIME` / `LOCAL TIME` /
-        // `ZONED TIME` / `ZONED DATETIME`. The compact `LOCAL_DATETIME` keyword
-        // forms are single tokens and fall through unchanged. Mirrors TS `parseCast`.
-        let mut type_name = type_tok.value.clone();
-        let lead = type_name.to_ascii_lowercase();
-        if lead == "local" || lead == "zoned" {
-            let next = self.peek().clone();
-            if next.tt == Tt::Ident || next.tt == Tt::Keyword {
-                let word = next.value.to_ascii_lowercase();
-                if word == "datetime" || word == "time" {
-                    self.advance();
-                    type_name = format!("{lead}_{word}");
-                }
-            }
-        }
+        // `read_type_name` handles the two-word temporal forms (`LOCAL DATETIME` /
+        // `ZONED TIME` / …); the compact `LOCAL_DATETIME` keywords are single tokens
+        // and pass through unchanged. Mirrors TS `parseCast`.
+        let type_pos = self.peek().pos;
+        let type_name = self.read_type_name("in CAST")?;
         let fn_name = match cast_target_fn(&type_name) {
             Some(f) => f,
-            None => {
-                return err(
-                    format!("CAST to unsupported type '{type_name}'"),
-                    type_tok.pos,
-                )
-            }
+            None => return err(format!("CAST to unsupported type '{type_name}'"), type_pos),
         };
         self.expect(Tt::RParen, "')' to close CAST")?;
         Ok(Expr::Func {
@@ -2184,6 +2161,60 @@ impl Parser {
         })
     }
 
+    /// ISO `GROUP BY <grouping element list>` — an optional comma list of grouping
+    /// keys, empty when the clause is absent. `GROUP` is a soft keyword. Shared by
+    /// the RETURN projection and the SELECT statement (which differ only in where
+    /// this sits relative to HAVING).
+    fn parse_group_by(&mut self) -> R<Vec<Expr>> {
+        let mut group_by = Vec::new();
+        if self.check_kw("group") || self.check_soft("group") {
+            self.advance();
+            self.expect_kw("by")?;
+            group_by.push(self.parse_expr()?);
+            while self.check(Tt::Comma) {
+                self.advance();
+                group_by.push(self.parse_expr()?);
+            }
+        }
+        Ok(group_by)
+    }
+
+    /// ISO `ORDER BY <sort specification list>` — an optional comma list, empty
+    /// when the clause is absent.
+    fn parse_order_by(&mut self) -> R<Vec<SortItem>> {
+        let mut order_by = Vec::new();
+        if self.check_kw("order") {
+            self.advance();
+            self.expect_kw("by")?;
+            order_by.push(self.parse_sort_item()?);
+            while self.check(Tt::Comma) {
+                self.advance();
+                order_by.push(self.parse_sort_item()?);
+            }
+        }
+        Ok(order_by)
+    }
+
+    /// ISO paging `[OFFSET|SKIP n] [LIMIT n]` → `(skip, limit)`, each `None` when
+    /// absent. OFFSET is the ISO spelling and accepts a dynamic `$param`; SKIP is
+    /// the Cypher synonym and stays literal-only.
+    fn parse_paging(&mut self) -> R<(Option<CountBound>, Option<CountBound>)> {
+        let mut skip = None;
+        if self.check_kw("skip") || self.check_kw("offset") {
+            let allow_param = self.check_kw("offset");
+            self.advance();
+            skip = Some(
+                self.expect_count_bound("a non-negative integer after SKIP/OFFSET", allow_param)?,
+            );
+        }
+        let mut limit = None;
+        if self.check_kw("limit") {
+            self.advance();
+            limit = Some(self.expect_count_bound("a non-negative integer after LIMIT", true)?);
+        }
+        Ok((skip, limit))
+    }
+
     fn parse_projection(&mut self) -> R<Projection> {
         let distinct = if self.check_kw("distinct") {
             self.advance();
@@ -2203,43 +2234,11 @@ impl Parser {
                 items.push(self.parse_return_item()?);
             }
         }
-        // ISO `GROUP BY <grouping element list>` — comes after the items, before
-        // ORDER BY. Drives the grouping (see `Projection::group_by`).
-        let mut group_by = Vec::new();
-        if self.check_kw("group") || self.check_soft("group") {
-            self.advance();
-            self.expect_kw("by")?;
-            group_by.push(self.parse_expr()?);
-            while self.check(Tt::Comma) {
-                self.advance();
-                group_by.push(self.parse_expr()?);
-            }
-        }
-        let mut order_by = Vec::new();
-        if self.check_kw("order") {
-            self.advance();
-            self.expect_kw("by")?;
-            order_by.push(self.parse_sort_item()?);
-            while self.check(Tt::Comma) {
-                self.advance();
-                order_by.push(self.parse_sort_item()?);
-            }
-        }
-        let mut skip = None;
-        if self.check_kw("skip") || self.check_kw("offset") {
-            // OFFSET is the ISO spelling and accepts a dynamic `$param`; SKIP is
-            // the Cypher synonym and stays literal-only.
-            let allow_param = self.check_kw("offset");
-            self.advance();
-            skip = Some(
-                self.expect_count_bound("a non-negative integer after SKIP/OFFSET", allow_param)?,
-            );
-        }
-        let mut limit = None;
-        if self.check_kw("limit") {
-            self.advance();
-            limit = Some(self.expect_count_bound("a non-negative integer after LIMIT", true)?);
-        }
+        // ISO order for RETURN: GROUP BY (drives the grouping) then ORDER BY then
+        // paging — see the shared `parse_group_by`/`parse_order_by`/`parse_paging`.
+        let group_by = self.parse_group_by()?;
+        let order_by = self.parse_order_by()?;
+        let (skip, limit) = self.parse_paging()?;
         Ok(Projection {
             star,
             items,
@@ -2321,49 +2320,17 @@ impl Parser {
             }));
         }
 
-        // `GROUP BY g` — before HAVING (SQL order), unlike RETURN's after-items.
-        let mut group_by = Vec::new();
-        if self.check_soft("group") || self.check_kw("group") {
-            self.advance();
-            self.expect_kw("by")?;
-            group_by.push(self.parse_expr()?);
-            while self.check(Tt::Comma) {
-                self.advance();
-                group_by.push(self.parse_expr()?);
-            }
-        }
-
-        // `HAVING h` — the post-aggregation group filter (SELECT-statement only).
+        // SQL clause order: GROUP BY, then HAVING (SELECT-only, so it stays inline
+        // between the shared helpers), then ORDER BY, then paging.
+        let group_by = self.parse_group_by()?;
         let having = if self.check_soft("having") {
             self.advance();
             Some(self.parse_expr()?)
         } else {
             None
         };
-
-        let mut order_by = Vec::new();
-        if self.check_kw("order") {
-            self.advance();
-            self.expect_kw("by")?;
-            order_by.push(self.parse_sort_item()?);
-            while self.check(Tt::Comma) {
-                self.advance();
-                order_by.push(self.parse_sort_item()?);
-            }
-        }
-        let mut skip = None;
-        if self.check_kw("skip") || self.check_kw("offset") {
-            let allow_param = self.check_kw("offset");
-            self.advance();
-            skip = Some(
-                self.expect_count_bound("a non-negative integer after SKIP/OFFSET", allow_param)?,
-            );
-        }
-        let mut limit = None;
-        if self.check_kw("limit") {
-            self.advance();
-            limit = Some(self.expect_count_bound("a non-negative integer after LIMIT", true)?);
-        }
+        let order_by = self.parse_order_by()?;
+        let (skip, limit) = self.parse_paging()?;
 
         let projection = Projection {
             star,
