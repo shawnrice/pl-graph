@@ -231,6 +231,18 @@ fn fmt_frac(nanos: u32) -> String {
     format!(".{}", s.trim_end_matches('0'))
 }
 
+/// Zero-pad a year to at least 4 digits, matching the TS `padYear`. A NEGATIVE year
+/// must render as `-0009` (sign, then 4 digits), NOT Rust's `{:04}` which counts the
+/// sign inside the width and yields `-009`. Years ≥ 10000 render with their natural
+/// width (no leading `+`), same as TS.
+fn fmt_year(y: i64) -> String {
+    if y < 0 {
+        format!("-{:04}", -y)
+    } else {
+        format!("{y:04}")
+    }
+}
+
 /// Render a UTC offset (whole minutes) as `Z` (=0) or `±HH:MM`.
 fn fmt_offset(offset: i16) -> String {
     if offset == 0 {
@@ -309,7 +321,7 @@ impl Date {
 
     pub fn format(&self) -> String {
         let (y, m, d) = civil_from_days(self.days as i64);
-        format!("{y:04}-{m:02}-{d:02}")
+        format!("{}-{m:02}-{d:02}", fmt_year(y))
     }
 }
 
@@ -336,7 +348,8 @@ impl DateTime {
         let (y, mo, d) = civil_from_days(days);
         let (h, m, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
         format!(
-            "{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}{}",
+            "{}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}{}",
+            fmt_year(y),
             fmt_frac(self.nanos)
         )
     }
@@ -894,6 +907,33 @@ mod tests {
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(days_from_civil(1970, 1, 2), 1);
         assert_eq!(days_from_civil(1969, 12, 31), -1);
+    }
+
+    #[test]
+    fn negative_year_pads_to_four_digits_like_ts() {
+        // A negative year renders as sign + 4 digits (`-0001`), matching the TS
+        // `padYear` — NOT Rust's `{:04}`, which counts the sign inside the width and
+        // yields `-001`. Found by the differential fuzzer via a date arithmetic that
+        // crosses into a negative year (`date('0001-01-01') - duration('P1Y2M')`).
+        let d = Date {
+            days: i32::try_from(days_from_civil(-1, 11, 1)).unwrap(),
+        };
+        assert_eq!(d.format(), "-0001-11-01");
+        let dt = DateTime {
+            secs: days_from_civil(-1, 11, 1) * SECS_PER_DAY,
+            nanos: 0,
+        };
+        assert_eq!(dt.format(), "-0001-11-01T00:00:00");
+        // A single-digit negative year still gets 4 magnitude digits.
+        let d9 = Date {
+            days: i32::try_from(days_from_civil(-9, 6, 15)).unwrap(),
+        };
+        assert_eq!(d9.format(), "-0009-06-15");
+        // Positive years are unchanged: 4-pad small, natural width for large.
+        let d_small = Date {
+            days: i32::try_from(days_from_civil(9, 1, 1)).unwrap(),
+        };
+        assert_eq!(d_small.format(), "0009-01-01");
     }
 
     #[test]
