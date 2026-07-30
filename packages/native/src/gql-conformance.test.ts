@@ -64,6 +64,20 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     JSON.stringify(nativeGraph.query(q, params)),
   ];
 
+  test('extreme-magnitude numbers render in exponential form (JS toString), byte-identical', () => {
+    // Rust gql once used Display (never exponential): 1e21 → "1000000000000000000000",
+    // TS → "1e+21". Both the numeric cell and toString(n) now match JS Number::toString.
+    for (const [expr, want] of [
+      ['1e21', '1e+21'],
+      ['1e-7', '1e-7'],
+      ['1e100', '1e+100'],
+    ] as const) {
+      const [ts, native] = both(`RETURN ${expr} AS n, toString(${expr}) AS s`);
+      expect(ts).toBe(native);
+      expect(ts).toBe(`[{"n":${want},"s":"${want}"}]`);
+    }
+  });
+
   test('RETURN n — rich node object, byte-identical, keys sorted', () => {
     const q = `MATCH (n:Person {name: 'marko'}) RETURN n`;
     const [ts, native] = both(q);

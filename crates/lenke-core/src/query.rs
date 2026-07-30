@@ -210,13 +210,15 @@ fn push_json_str(out: &mut String, s: &str) {
 /// form, so they serialize as null — matching how a JS engine would surface an
 /// absent/undefined numeric cell.
 fn push_json_value(out: &mut String, v: &Value) {
-    use std::fmt::Write as _;
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Num(x) => {
             if x.is_finite() {
-                let _ = write!(out, "{x}");
+                // ECMA-262 `Number::toString` (exponential for very large/small
+                // magnitudes, -0 → "0") so every numeric result cell matches JS
+                // `JSON.stringify` / the TS engine — Rust's Display never does that.
+                out.push_str(&crate::jsonfmt::js_number(*x));
             } else {
                 out.push_str("null");
             }

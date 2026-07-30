@@ -711,10 +711,11 @@ fn js_num(n: f64) -> String {
             "-Infinity".to_string()
         }
     } else {
-        // Negative zero renders as "0" — JS `String(-0)` and the repo's -0→0 numeric
-        // policy — not Rust's Display "-0". (`-0.0 == 0.0`, so this normalizes both.)
-        let n = if n == 0.0 { 0.0 } else { n };
-        format!("{n}")
+        // ECMA-262 `Number::toString` (via the shared jsonfmt formatter): switches to
+        // exponential for |n| >= 1e21 or 0 < |n| < 1e-6 and normalizes -0 → "0" —
+        // matching JS `String(n)`. Rust's Display (`format!("{n}")`) never uses
+        // exponential, so `toString(1e21)`/list-map stringify diverged from the TS engine.
+        crate::jsonfmt::js_number(n)
     }
 }
 

@@ -2,8 +2,11 @@
 //! escaper — so the (serde-free) JSON writers all emit byte-identical output:
 //! the gremlin result carrier, the ndjson encoder, and the extra codecs.
 //!
-//! Gated to the surfaces that actually serialize JSON. The `gql` engine
-//! hand-rolls its own tabular output and deliberately pulls none of this.
+//! Used by every JSON-serializing surface: the gremlin result carrier, the ndjson
+//! encoder, the extra codecs, and the gql engine's row output + value
+//! stringification (`js_number` — so a numeric cell / `toString(n)` renders in
+//! exponential form for extreme magnitudes exactly as JS `Number::toString` does,
+//! matching the TS engine byte-for-byte).
 
 use std::fmt::Write as _;
 
