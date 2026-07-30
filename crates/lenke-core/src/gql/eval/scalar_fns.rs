@@ -276,16 +276,24 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
         },
         ToInteger => match a {
             Some(Val::Num(n)) => Val::Num(n.trunc()),
+            // `.filter(is_finite)`: a non-finite spelling ("inf"/"nan") parses in Rust
+            // but must yield NULL, matching the TS strict grammar (numericStringToFloat).
             Some(Val::Str(s)) => s
                 .trim()
                 .parse::<f64>()
                 .ok()
+                .filter(|n| n.is_finite())
                 .map_or(Val::Null, |n| Val::Num(n.trunc())),
             _ => Val::Null,
         },
         ToFloat => match a {
             Some(Val::Num(n)) => Val::Num(*n),
-            Some(Val::Str(s)) => s.trim().parse::<f64>().ok().map_or(Val::Null, Val::Num),
+            Some(Val::Str(s)) => s
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|n| n.is_finite())
+                .map_or(Val::Null, Val::Num),
             _ => Val::Null,
         },
         ToBoolean => match a {

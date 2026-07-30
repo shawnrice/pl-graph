@@ -694,7 +694,14 @@ fn num_of(v: &Val) -> Option<f64> {
             Some(if t.is_empty() {
                 0.0
             } else {
-                t.parse().unwrap_or(f64::NAN)
+                // Reject the non-finite spellings ("inf"/"infinity"/"nan"/"Infinity")
+                // that Rust's f64::from_str accepts — the TS engine's strict
+                // FINITE_NUMERIC grammar coerces them to NaN, so we must too. (Hex/
+                // octal already fail to parse → NaN, matching TS.)
+                t.parse::<f64>()
+                    .ok()
+                    .filter(|n| n.is_finite())
+                    .unwrap_or(f64::NAN)
             })
         }
         _ => Some(f64::NAN),

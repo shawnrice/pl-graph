@@ -162,6 +162,22 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(ts).toBe(`[{"a":20,"b":null,"c":null,"d":null}]`);
   });
 
+  test('numeric-string coercion is strict + byte-identical (inf/nan/hex)', () => {
+    // One strict grammar across both engines: non-finite spellings and hex/octal
+    // coerce to NaN (scalar fns / aggregates) or NULL (to_integer/to_float). Rust
+    // once accepted 'inf' (str::parse) and TS aggregates once accepted hex (Number()).
+    const [ts, native] = both(
+      `RETURN sign('inf') AS a, abs('inf') AS b, (to_integer('nan') IS NULL) AS c, (to_float('inf') IS NULL) AS d`,
+    );
+    expect(ts).toBe(native);
+    expect(ts).toBe(`[{"a":null,"b":null,"c":true,"d":true}]`);
+
+    // Aggregates coerce a hex / inf string to NaN → null in both, not JS Number()'s 16.
+    const [ts2, nat2] = both(`MATCH (n:Person) RETURN sum('0x10') AS s, sum('inf') AS t`);
+    expect(ts2).toBe(nat2);
+    expect(ts2).toBe(`[{"s":null,"t":null}]`);
+  });
+
   test('RETURN n — rich node object, byte-identical, keys sorted', () => {
     const q = `MATCH (n:Person {name: 'marko'}) RETURN n`;
     const [ts, native] = both(q);

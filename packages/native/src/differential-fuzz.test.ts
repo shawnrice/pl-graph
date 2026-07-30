@@ -99,12 +99,21 @@ const TEMPORALS = [
   "zoned_datetime('2020-01-01T00:00:00Z')",
 ] as const;
 
+// Strings that stress numeric-string coercion: non-finite spellings, radix
+// prefixes, whitespace, empty — the exact forms JS Number() and Rust
+// str::parse::<f64> disagree on.
+const NUM_STRINGS = ["'inf'", "'nan'", "'0x10'", "'  5  '", "''", "'Infinity'", "'1e3'"] as const;
+
 // A leaf: a literal value or a property reference.
 const genLeaf = (r: () => number): string => {
   const p = r();
 
-  if (p < 0.35) {
+  if (p < 0.3) {
     return pick(r, NUMS);
+  }
+
+  if (p < 0.4) {
+    return pick(r, NUM_STRINGS);
   }
 
   if (p < 0.55) {

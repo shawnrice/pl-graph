@@ -304,6 +304,7 @@ import {
   nonNumericAgg,
   compareCodePoints,
   not3,
+  numArg,
   numOf,
   percentileOf,
   recordGet,
@@ -1017,7 +1018,7 @@ const compileAggregate = (expr: FuncExpr): CompiledExpr => {
           throw nonNumericAgg();
         }
 
-        return values.reduce<number>((s, v) => s + Number(v), 0);
+        return values.reduce<number>((s, v) => s + numArg(v), 0);
       case 'avg':
         if (values.some(isTemporal)) {
           throw unsupportedTemporalAgg();
@@ -1029,7 +1030,7 @@ const compileAggregate = (expr: FuncExpr): CompiledExpr => {
 
         return values.length === 0
           ? null
-          : values.reduce<number>((s, v) => s + Number(v), 0) / values.length;
+          : values.reduce<number>((s, v) => s + numArg(v), 0) / values.length;
       case 'min':
         return values.length === 0
           ? null
@@ -1062,7 +1063,7 @@ const compileAggregate = (expr: FuncExpr): CompiledExpr => {
         let sq = 0;
 
         for (const v of values) {
-          const x = Number(v);
+          const x = numArg(v);
           s += x;
           sq += x * x;
         }

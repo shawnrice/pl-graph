@@ -578,7 +578,7 @@ export const lengthOf = (a: unknown): number | null => {
 // and single-element arrays ([5] → 5). Numbers pass through; booleans → 0/1; a
 // string parses under the strict decimal/scientific grammar (empty → 0); anything
 // else → NaN. So abs('0x10') / abs([5]) are NaN in both engines.
-const numArg = (v: unknown): number => {
+export const numArg = (v: unknown): number => {
   if (typeof v === 'number') {
     return v;
   }
@@ -649,14 +649,14 @@ export const callScalar = (name: string, args: readonly unknown[]): unknown => {
     case 'left':
       return isNullish(a) || isNullish(b)
         ? null
-        : sanitizeSurrogates(str(a).slice(0, Math.max(0, Number(b))));
+        : sanitizeSurrogates(str(a).slice(0, Math.max(0, numArg(b))));
     case 'right': {
       if (isNullish(a) || isNullish(b)) {
         return null;
       }
 
       const s = str(a);
-      const n = Number(b);
+      const n = numArg(b);
 
       return n <= 0 ? '' : sanitizeSurrogates(s.slice(Math.max(0, s.length - n)));
     }
@@ -730,11 +730,11 @@ export const substringScalar = (a: unknown, b: unknown, len: unknown): string | 
   // `substring('crystal hawk river', 1, 7)` → 'crystal'. Convert to a 0-based
   // UTF-16 offset; a start <= 0 shrinks the window from the front (SQL
   // semantics), which the native engine mirrors exactly.
-  const zeroStart = Number(b) - 1;
+  const zeroStart = numArg(b) - 1;
   const from = Math.max(0, zeroStart);
 
   return sanitizeSurrogates(
-    isNullish(len) ? s.slice(from) : s.slice(from, Math.max(0, zeroStart + Number(len))),
+    isNullish(len) ? s.slice(from) : s.slice(from, Math.max(0, zeroStart + numArg(len))),
   );
 };
 
@@ -860,9 +860,9 @@ export const rangeScalar = (a: unknown, b: unknown, step: unknown): number[] | n
     return null;
   }
 
-  const s = Math.trunc(Number(a));
-  const e = Math.trunc(Number(b));
-  const st = isNullish(step) ? 1 : Math.trunc(Number(step));
+  const s = Math.trunc(numArg(a));
+  const e = Math.trunc(numArg(b));
+  const st = isNullish(step) ? 1 : Math.trunc(numArg(step));
 
   if (st === 0) {
     return null;
