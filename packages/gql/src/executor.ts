@@ -712,20 +712,7 @@ const existsReachable = (
 
   const startV = binding.get(startVar) as Vertex;
   const out = rel.direction === 'out';
-  const nbrs = (v: Vertex): Vertex[] => {
-    const byType = (out ? graph.edgesFromByLabel : graph.edgesToByLabel).get(v.id);
-    const acc: Vertex[] = [];
-
-    for (const set of bucketsFor(byType, types ?? undefined)) {
-      if (set) {
-        for (const e of set) {
-          acc.push(out ? e.to : e.from);
-        }
-      }
-    }
-
-    return acc;
-  };
+  const nbrs = (v: Vertex): Vertex[] => outNeighbors(graph, v, out, types ?? undefined);
   // Is `v` a valid endpoint (label + inline pred + the EXISTS WHERE)?
   const hit = (v: Vertex): boolean => {
     const bound = matchNode(binding, node, v, params, graph);
@@ -2632,6 +2619,29 @@ const bucketsFor = (
   return types ? types.map((t) => byType.get(t)) : [...byType.values()];
 };
 
+/** One-hop neighbours of `v` along `out` (or in) edges of the given `types` (all
+ * types when undefined). Shared by the EXISTS-reachable and RETURN-reachable
+ * traversals so their neighbour expansion can't drift from each other or native. */
+const outNeighbors = (
+  graph: Graph,
+  v: Vertex,
+  out: boolean,
+  types: string[] | undefined,
+): Vertex[] => {
+  const byType = (out ? graph.edgesFromByLabel : graph.edgesToByLabel).get(v.id);
+  const acc: Vertex[] = [];
+
+  for (const set of bucketsFor(byType, types)) {
+    if (set) {
+      for (const e of set) {
+        acc.push(out ? e.to : e.from);
+      }
+    }
+  }
+
+  return acc;
+};
+
 /** Count edges across `buckets` that pass `keep`. */
 const countEdges = (buckets: (Set<Edge> | undefined)[], keep: (e: Edge) => boolean): number => {
   let n = 0;
@@ -2898,20 +2908,7 @@ const runReach = (spec: ReachSpec, graph: Graph, params: Params): Row[] => {
   const seeds = [...seedVertices(graph, cstart, new Map(), params)].filter(
     (v) => matchNode(new Map(), cstart, v, params, graph) !== null,
   );
-  const nbrs = (v: Vertex): Vertex[] => {
-    const byType = (out ? graph.edgesFromByLabel : graph.edgesToByLabel).get(v.id);
-    const acc: Vertex[] = [];
-
-    for (const set of bucketsFor(byType, types)) {
-      if (set) {
-        for (const e of set) {
-          acc.push(out ? e.to : e.from);
-        }
-      }
-    }
-
-    return acc;
-  };
+  const nbrs = (v: Vertex): Vertex[] => outNeighbors(graph, v, out, types);
 
   // Forward reachability (≥1 hop) as a DFS closure — each vertex expands once.
   const seen = new Set<string>();

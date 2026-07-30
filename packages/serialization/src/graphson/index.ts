@@ -285,7 +285,14 @@ export const decode = (input: string, graph: Graph): Graph => {
     shapeError("'edges' must be an array");
   }
 
-  graph.disableEvents();
+  // Only toggle events we actually turned off — decoding inside an already
+  // events-off batch must leave them off (matches the other four codecs, which
+  // this once diverged from by unconditionally re-enabling).
+  const wasEnabled = graph.eventsEnabled();
+
+  if (wasEnabled) {
+    graph.disableEvents();
+  }
 
   for (const wrapper of (vertices as Array<{ '@value'?: unknown }> | undefined) ?? []) {
     const value = wrapper['@value'];
@@ -354,7 +361,10 @@ export const decode = (input: string, graph: Graph): Graph => {
     graph.addEdge({ id: e.id, from, to, labels: splitLabels(e.label), properties });
   }
 
-  graph.enableEvents();
+  if (wasEnabled) {
+    graph.enableEvents();
+    graph.snapshot();
+  }
 
   return graph;
 };

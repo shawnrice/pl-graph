@@ -92,6 +92,24 @@ describe('graphson typed-value shapes', () => {
 });
 
 describe('graphson multi-label :: convention', () => {
+  test('decode preserves the target graph events flag (does not force-enable)', () => {
+    const g = new Graph();
+    g.addVertex({ id: 'n0', labels: ['A'], properties: { x: 1 } });
+    const doc = encode(g);
+
+    // Decoding inside an events-off batch must leave events off — this once
+    // unconditionally re-enabled, diverging from the other four codecs.
+    const off = new Graph();
+    off.disableEvents();
+    decode(doc, off);
+    expect(off.eventsEnabled()).toBe(false);
+
+    // Default (events on) still ends up on.
+    const on = new Graph();
+    decode(doc, on);
+    expect(on.eventsEnabled()).toBe(true);
+  });
+
   test('multiple labels join with :: and split back', () => {
     const g = new Graph();
     g.addVertex({ id: 'n0', labels: ['A', 'B'], properties: {} });
