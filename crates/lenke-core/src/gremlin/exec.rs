@@ -182,8 +182,13 @@ struct Ctx {
     /// Set when a `repeat()` hit `REPEAT_BUDGET` and stopped early.
     over_budget: bool,
     /// First mutation/data fault recorded during the run (e.g. `addE()` with an
-    /// unresolvable endpoint). Surfaced by [`try_run`]; ignored by [`run`].
-    fault: Option<(crate::error_codes::ErrorCode, &'static str)>,
+    /// unresolvable endpoint, or a `fail()` reached). Surfaced by [`try_run`];
+    /// ignored by [`run`]. `Cow` so most faults stay `&'static` while `fail()`
+    /// can carry its user-supplied message.
+    fault: Option<(
+        crate::error_codes::ErrorCode,
+        std::borrow::Cow<'static, str>,
+    )>,
     /// The `withSack(init)` default, set once by the leading `withSack` step.
     /// `None` = no sack configured, so `sack()` faults and NO per-traverser sack
     /// is ever created — the laziness guarantee.
@@ -760,7 +765,7 @@ fn algo_step(
     if crate::algo::run_with(graph, name, &cfg).is_err() {
         ctx.fault.get_or_insert((
             crate::error_codes::ErrorCode::InvalidValue,
-            "graph algorithm step failed",
+            "graph algorithm step failed".into(),
         ));
         return Vec::new();
     }
@@ -2171,10 +2176,20 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         Step::None(None) => Vec::new(),
         Step::None(Some(pred)) => stream.into_iter().filter(|t| !local_elems(&t.val).iter().any(|e| p_matches(pred, e))).collect(),
         Step::Fail(msg) => {
-            if !stream.is_empty() {
-                panic!("{}", msg.clone().unwrap_or_else(|| "fail() reached".to_string()));
+            // `fail()` on a non-empty stream is a user-raised runtime exception:
+            // record it as a data fault (surfaced by `try_run`, ignored by `run`)
+            // and drop the stream — never `panic!`, which under the release
+            // `panic = "abort"` build with no FFI `catch_unwind` would abort the
+            // whole host process. The TS engine throws a catchable error here.
+            if stream.is_empty() {
+                stream
+            } else {
+                ctx.fault.get_or_insert((
+                    crate::error_codes::ErrorCode::DataException,
+                    msg.clone().map_or(std::borrow::Cow::Borrowed("fail() reached"), std::borrow::Cow::Owned),
+                ));
+                Vec::new()
             }
-            stream
         }
 
         // --- mutation ---
@@ -2186,7 +2201,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             if labels.iter().any(|l| crate::graph::validate_label(l).is_err()) {
                 ctx.fault.get_or_insert((
                     crate::error_codes::ErrorCode::InvalidValue,
-                    "addV(): a label must be non-empty and cannot contain '::'",
+                    "addV(): a label must be non-empty and cannot contain '::'".into(),
                 ));
                 return Vec::new();
             }
@@ -2198,7 +2213,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             if crate::graph::validate_label(label).is_err() {
                 ctx.fault.get_or_insert((
                     crate::error_codes::ErrorCode::InvalidValue,
-                    "addE(): a label must be non-empty and cannot contain '::'",
+                    "addE(): a label must be non-empty and cannot contain '::'".into(),
                 ));
                 return Vec::new();
             }
@@ -2209,7 +2224,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                     // MissingVertex), not a silent drop.
                     ctx.fault.get_or_insert((
                         crate::error_codes::ErrorCode::MissingVertex,
-                        "addE(): could not resolve endpoint vertices",
+                        "addE(): could not resolve endpoint vertices".into(),
                     ));
                     continue;
                 };
@@ -2221,7 +2236,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         Step::Property(key, _) if crate::graph::validate_prop_key(key).is_err() => {
             ctx.fault.get_or_insert((
                 crate::error_codes::ErrorCode::InvalidValue,
-                "property(): a key must be non-empty",
+                "property(): a key must be non-empty".into(),
             ));
             Vec::new()
         }
@@ -2290,7 +2305,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             let Some(default) = ctx.sack_init.clone() else {
                 ctx.fault.get_or_insert((
                     crate::error_codes::ErrorCode::InvalidGraphOp,
-                    "sack() requires a preceding withSack()",
+                    "sack() requires a preceding withSack()".into(),
                 ));
                 return Vec::new();
             };

@@ -841,35 +841,37 @@ fn p2_label_on_property_returns_key() {
 
 #[test]
 fn p2_fail_throws_with_message() {
-    // fail() panics in the Rust engine; assert the panic + message.
-    let res = std::panic::catch_unwind(|| {
-        qs("g.V().hasLabel('PERSON').has('name', eq('peter')).fold().fail('Test Fail')")
-    });
-    let err = res.unwrap_err();
-    let msg = err
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
-        .unwrap_or_default();
-    assert!(msg.contains("Test Fail"), "got panic message: {msg:?}");
+    // fail() on a non-empty stream is a DataException surfaced by try_run —
+    // carrying the user's message — NOT a process-aborting panic. TS throws a
+    // catchable error here too. (`run` ignores it, matching the addV/addE faults.)
+    let mut g = modern();
+    let t =
+        super::parse("g.V().hasLabel('PERSON').has('name', eq('peter')).fold().fail('Test Fail')")
+            .unwrap();
+    let err = super::try_run(&mut g, &t).unwrap_err();
+    assert_eq!(err.code, crate::error_codes::ErrorCode::DataException);
+    assert!(err.message.contains("Test Fail"), "got: {}", err.message);
 }
 
 #[test]
 fn p2_fail_no_throw_on_empty_stream() {
-    let r = qs("g.V().has('name', eq('nobody')).fail('should not fire')");
-    assert!(r.is_empty());
+    // Empty stream: fail() is a pass-through — no fault, even via try_run.
+    let mut g = modern();
+    let t = super::parse("g.V().has('name', eq('nobody')).fail('should not fire')").unwrap();
+    assert!(super::try_run(&mut g, &t).unwrap().is_empty());
 }
 
 #[test]
 fn p2_fail_default_message() {
-    let res = std::panic::catch_unwind(|| qs("g.V().fail()"));
-    let err = res.unwrap_err();
-    let msg = err
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
-        .unwrap_or_default();
-    assert!(msg.contains("fail() reached"), "got panic message: {msg:?}");
+    let mut g = modern();
+    let t = super::parse("g.V().fail()").unwrap();
+    let err = super::try_run(&mut g, &t).unwrap_err();
+    assert_eq!(err.code, crate::error_codes::ErrorCode::DataException);
+    assert!(
+        err.message.contains("fail() reached"),
+        "got: {}",
+        err.message
+    );
 }
 
 // ===== subgraph (subgraph.test.ts) ========================================
