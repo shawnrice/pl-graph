@@ -988,7 +988,11 @@ const compileAggregate = (expr: FuncExpr): CompiledExpr => {
 
     const raw = group.map((b) => argFn!({ ...env, binding: b, group }));
     const nonNull = raw.filter((v) => !isNullish(v));
-    const values = distinct ? [...new Set(nonNull)] : nonNull;
+    // DISTINCT dedups STRUCTURALLY by valueKey (mirroring Rust val_key / dense id),
+    // not by reference-identity `new Set` — which would keep value-equal but distinct
+    // object instances (temporals, lists, records) separate. e.g. count(DISTINCT
+    // DATE'2020-01-01') over two rows must be 1, and count(DISTINCT [x]) dedups too.
+    const values = distinct ? distinctByValueKey(nonNull) : nonNull;
 
     switch (name) {
       case 'count':
@@ -1551,6 +1555,25 @@ export const valueKey = (v: unknown): string => {
   }
 };
 const rowKey = (b: Binding): string => [...b].map(([k, v]) => `${k}=${valueKey(v)}`).join('');
+
+/** Keep the first occurrence of each distinct value, keyed structurally by
+ *  `valueKey` (so value-equal temporals/lists/records collapse) — the DISTINCT
+ *  aggregate dedup, matching the Rust engine's `val_key` / dense-id partition. */
+const distinctByValueKey = (values: readonly unknown[]): unknown[] => {
+  const seen = new Set<string>();
+  const out: unknown[] = [];
+
+  for (const v of values) {
+    const k = valueKey(v);
+
+    if (!seen.has(k)) {
+      seen.add(k);
+      out.push(v);
+    }
+  }
+
+  return out;
+};
 
 // --- projection compilation --------------------------------------------------
 

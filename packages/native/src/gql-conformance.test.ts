@@ -78,6 +78,22 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     }
   });
 
+  test('count(DISTINCT ...) dedups structurally, not by object identity, byte-identical', () => {
+    // A constant temporal is a FRESH instance per row; `[x]` a fresh array. Rust
+    // dedups by val_key (structural), so both collapse. TS once used a reference-
+    // identity Set (kept every instance separate) — now it dedups by valueKey too.
+    for (const q of [
+      // every Person row yields the same date value → 1 distinct.
+      `MATCH (n:Person) RETURN count(DISTINCT date('2020-01-01')) AS c`,
+      // both Software nodes have lang 'java' → [n.lang] is [java] both times → 1.
+      `MATCH (n:Software) RETURN count(DISTINCT [n.lang]) AS c`,
+    ]) {
+      const [ts, native] = both(q);
+      expect(ts).toBe(native);
+      expect(ts).toBe(`[{"c":1}]`);
+    }
+  });
+
   test('RETURN n — rich node object, byte-identical, keys sorted', () => {
     const q = `MATCH (n:Person {name: 'marko'}) RETURN n`;
     const [ts, native] = both(q);
