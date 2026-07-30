@@ -13,6 +13,7 @@ import {
   parseDateTime,
   parseDuration,
   TEMPORAL_TAG_KEYS,
+  temporalArith,
   temporalCmpTotal,
   temporalRelCmp,
 } from './temporal.js';
@@ -56,6 +57,18 @@ describe('temporal: canonical tagged-temporal keys', () => {
     }
 
     expect(fromTaggedJson({ '@time': '12:00:00' })).toBeNull();
+  });
+});
+
+describe('temporal: negative (BCE) year formatting', () => {
+  // A negative year (reachable only via arithmetic — both engines reject a leading
+  // `-` on input) must pad AFTER the sign, matching Rust `format!("{y:04}")`:
+  // `-0009`, not the old `pad`'s `00-9` (which padded across the minus).
+  test('year is padded after the sign for a pre-year-1 date/datetime', () => {
+    const d = temporalArith('-', parseDate('0001-01-01'), parseDuration('P10Y'));
+    expect(String(d)).toBe('-0009-01-01');
+    const dt = temporalArith('-', parseDateTime('0001-01-01T12:00:00'), parseDuration('P10Y'));
+    expect(String(dt)).toBe('-0009-01-01T12:00:00');
   });
 });
 

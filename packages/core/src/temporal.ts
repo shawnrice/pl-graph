@@ -263,6 +263,13 @@ export function civilFromDays(z: number): [number, number, number] {
 
 const pad = (n: number, width: number): string => String(n).padStart(width, '0');
 
+// Zero-pad a year to 4 digits AFTER the sign — matching Rust `format!("{y:04}")`.
+// A negative (BCE) year (reachable only via temporal arithmetic; both engines
+// reject a leading `-` on input) must render as `-0009`, not `pad`'s `00-9` (which
+// pads across the minus). Only the year is ever negative in a formatted temporal.
+const padYear = (y: number): string =>
+  y < 0 ? `-${String(-y).padStart(4, '0')}` : String(y).padStart(4, '0');
+
 const parseIntStrict = (s: string): number => {
   if (!/^-?\d+$/.test(s)) {
     throw new Error(`invalid integer '${s}'`);
@@ -398,7 +405,7 @@ export function parseDate(s: string): LocalDate {
 export function formatDate(dt: LocalDate): string {
   const [y, m, d] = civilFromDays(dt.days);
 
-  return `${pad(y, 4)}-${pad(m, 2)}-${pad(d, 2)}`;
+  return `${padYear(y)}-${pad(m, 2)}-${pad(d, 2)}`;
 }
 
 // --- Time --------------------------------------------------------------------
@@ -473,7 +480,7 @@ export function formatDateTime(dt: LocalDateTime): string {
   const m = tdiv(tod % 3600, 60);
   const s = tod % 60;
 
-  return `${pad(y, 4)}-${pad(mo, 2)}-${pad(d, 2)}T${pad(h, 2)}:${pad(m, 2)}:${pad(s, 2)}${fmtFrac(dt.nanos)}`;
+  return `${padYear(y)}-${pad(mo, 2)}-${pad(d, 2)}T${pad(h, 2)}:${pad(m, 2)}:${pad(s, 2)}${fmtFrac(dt.nanos)}`;
 }
 
 // --- Duration ----------------------------------------------------------------
