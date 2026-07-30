@@ -260,14 +260,23 @@ fn split_offset(s: &str) -> Result<(&str, i16), String> {
         if sign != b'+' && sign != b'-' {
             continue;
         }
-        let hh = &s[start + 1..start + 3];
+        // `.get` (not `&s[..]`) so an offset window containing a non-ASCII byte —
+        // e.g. `…+0é` — yields None and falls to the Err path below, rather than
+        // panicking on a non-char-boundary slice (which under `panic = "abort"`
+        // would abort the host; the TS engine returns an error here).
+        let Some(hh) = s.get(start + 1..start + 3) else {
+            continue;
+        };
         let mm = if colon {
             if b[start + 3] != b':' {
                 continue;
             }
-            &s[start + 4..start + 6]
+            s.get(start + 4..start + 6)
         } else {
-            &s[start + 3..start + 5]
+            s.get(start + 3..start + 5)
+        };
+        let Some(mm) = mm else {
+            continue;
         };
         if let (Ok(h), Ok(m)) = (hh.parse::<i16>(), mm.parse::<i16>()) {
             if (0..=23).contains(&h) && (0..60).contains(&m) {
@@ -1001,5 +1010,16 @@ mod tests {
         assert_eq!(du.rel_cmp(&du), None); // durations not relationally ordered
         assert_eq!(du.cmp_total(&du), Ordering::Equal);
         assert_eq!(t1.cmp_total(&du), Ordering::Less); // datetime kind-rank < duration
+    }
+
+    #[test]
+    fn zoned_offset_with_non_ascii_byte_errors_not_panics() {
+        // A non-ASCII byte in the trailing offset window must surface an error, not
+        // panic on a non-char-boundary slice (which under panic=abort aborts the
+        // host). `é` is two bytes, so the offset window `+0éxy` crosses a char.
+        assert!(ZonedDateTime::parse("2020-01-01T00:00:00+0éxy").is_err());
+        assert!(ZonedTime::parse("00:00:00+0é:0").is_err());
+        // A well-formed offset still parses.
+        assert!(ZonedDateTime::parse("2020-01-01T00:00:00+05:30").is_ok());
     }
 }
