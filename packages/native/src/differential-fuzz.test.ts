@@ -221,7 +221,16 @@ suite('differential fuzz: TS gql engine vs Rust core', () => {
     }
   };
 
-  const SEED = 0x1234_5678;
+  // Seed: random each run, so every run explores fresh expressions — fuzzing is
+  // discovery, not a fixed corpus (the specific bugs found here are pinned as their
+  // own deterministic unit tests, which are the permanent regression guards). Set
+  // FUZZ_SEED=<n> to replay a run exactly; the seed is printed on failure so any
+  // divergence is reproducible. Property-based-testing convention: random by
+  // default, seed on failure (proptest, QuickCheck, fast-check all do this).
+  const SEED =
+    process.env.FUZZ_SEED !== undefined
+      ? Number(process.env.FUZZ_SEED) >>> 0
+      : Math.floor(Math.random() * 0x1_0000_0000);
   const ITERATIONS = 20_000;
 
   test(`${ITERATIONS} random expressions render byte-identically across engines`, () => {
@@ -251,6 +260,9 @@ suite('differential fuzz: TS gql engine vs Rust core', () => {
       }
     }
 
-    expect(divergences.join('\n\n') || 'no divergences').toBe('no divergences');
+    const report = divergences.length
+      ? `FUZZ_SEED=${SEED} bun test <this file> to reproduce:\n\n${divergences.join('\n\n')}`
+      : 'no divergences';
+    expect(report).toBe('no divergences');
   });
 });

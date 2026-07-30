@@ -3,9 +3,36 @@
 //! built `panic = "abort"` with no `catch_unwind` on the FFI boundary, so a panic on
 //! malformed input aborts the host process — exactly the R1/R2/R3 char-boundary bugs
 //! this round found. Under the test profile a panic unwinds into a test failure, so
-//! this pins "no input can crash a parser". Deterministic (fixed seed) for CI.
+//! this pins "no input can crash a parser".
+//!
+//! Seed: random each run so every run explores fresh inputs (fuzzing is discovery —
+//! the specific panics found are pinned as their own deterministic unit tests). The
+//! seed is printed at the start and cargo shows captured output on failure, so a
+//! crash is reproducible: re-run with `FUZZ_SEED=<n>` (decimal or 0x-hex). This is
+//! the property-based-testing convention: random by default, seed on failure.
 
-// A tiny deterministic PRNG (xorshift64*), so a failure is reproducible.
+/// The base seed for a run: `FUZZ_SEED` if set (decimal or `0x…` hex), else derived
+/// from the wall clock. Never 0 — xorshift needs nonzero state. (`SystemTime` is
+/// fine in a normal `cargo test`; only Workflow scripts forbid the wall clock.)
+fn fuzz_seed() -> u64 {
+    if let Ok(s) = std::env::var("FUZZ_SEED") {
+        let s = s.trim();
+        let parsed = s.strip_prefix("0x").map_or_else(
+            || s.parse::<u64>().ok(),
+            |h| u64::from_str_radix(h, 16).ok(),
+        );
+        if let Some(v) = parsed {
+            return v | 1;
+        }
+    }
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0x1234_5678_9abc_def1, |d| d.as_nanos() as u64);
+    nanos | 1
+}
+
+// A tiny deterministic PRNG (xorshift64*), so a run replays exactly from its seed.
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
@@ -55,7 +82,9 @@ fn exercise(s: &str) {
 
 #[test]
 fn fuzz_random_strings_never_panic() {
-    let mut rng = Rng(0x1234_5678_9abc_def1);
+    let seed = fuzz_seed();
+    eprintln!("fuzz_random_strings_never_panic: FUZZ_SEED={seed} (0x{seed:x}) to reproduce");
+    let mut rng = Rng(seed);
     for _ in 0..40_000 {
         let s = random_string(&mut rng, 48);
         exercise(&s);
@@ -82,7 +111,12 @@ fn fuzz_template_mutations_never_panic() {
             "g.V('1').out('E').values('n')",
             "{\"type\":\"node\",\"id\":\"1\",\"labels\":[\"T\"],\"properties\":{\"d\":{\"@date\":\"2020-01-01\"}}}",
         ];
-    let mut rng = Rng(0xfeed_face_dead_beef);
+    // Print the BASE seed (what you pass to FUZZ_SEED); the RNG xors a constant so
+    // this test explores a different stream than the random-string test under the
+    // same base seed.
+    let base = fuzz_seed();
+    eprintln!("fuzz_template_mutations_never_panic: FUZZ_SEED={base} (0x{base:x}) to reproduce");
+    let mut rng = Rng(base ^ 0x5555_5555_5555_5555);
     for _ in 0..40_000 {
         let template = TEMPLATES[rng.below(TEMPLATES.len())];
         let mut chars: Vec<char> = template.chars().collect();
