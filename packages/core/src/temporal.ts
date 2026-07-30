@@ -590,111 +590,71 @@ type TemporalTag = 'date' | 'localtime' | 'datetime' | 'zoned_time' | 'zoned_dat
 
 export const temporalTag = (t: Temporal): TemporalTag => t.kind;
 
+/**
+ * The single source of truth for each temporal kind: its wire tag, its GraphSON
+ * `@type`, and its format/parse pair. Every temporal type is one row here — the
+ * dispatchers below derive from it, so adding a type is one entry rather than
+ * four parallel `instanceof`/tag ladders that must be kept in lockstep.
+ */
+type TemporalSpec = {
+  readonly tag: TemporalTag;
+  readonly graphson: string;
+  readonly format: (t: Temporal) => string;
+  readonly parse: (s: string) => Temporal;
+};
+
+// Bind one row: the generic ties `format`/`parse` to a single concrete class, so
+// a mismatched pair (e.g. `formatDate` with `parseLocalTime`) is a type error.
+// The widening casts are sound because the dispatchers only ever look a row up by
+// that same class's `kind` discriminant.
+const specRow = <T extends Temporal>(
+  tag: TemporalTag,
+  graphson: string,
+  format: (t: T) => string,
+  parse: (s: string) => T,
+): TemporalSpec => ({ tag, graphson, format: format as (t: Temporal) => string, parse });
+
+const TEMPORAL_SPEC: Record<TemporalTag, TemporalSpec> = {
+  date: specRow('date', 'gx:LocalDate', formatDate, parseDate),
+  localtime: specRow('localtime', 'gx:LocalTime', formatTime, parseLocalTime),
+  datetime: specRow('datetime', 'gx:LocalDateTime', formatDateTime, parseDateTime),
+  zoned_time: specRow('zoned_time', 'gx:OffsetTime', formatZonedTime, parseZonedTime),
+  zoned_datetime: specRow(
+    'zoned_datetime',
+    'gx:OffsetDateTime',
+    formatZonedDateTime,
+    parseZonedDateTime,
+  ),
+  duration: specRow('duration', 'gx:Duration', formatDuration, parseDuration),
+};
+
+// Reverse index for `graphsonTag`. A `Map` (not a plain object) so an unknown
+// `@type` like `'toString'` misses cleanly instead of hitting a prototype method.
+const GRAPHSON_TO_TAG = new Map<string, TemporalTag>(
+  Object.values(TEMPORAL_SPEC).map((s) => [s.graphson, s.tag]),
+);
+
 export function temporalFormat(t: Temporal): string {
-  if (t instanceof LocalDate) {
-    return formatDate(t);
-  }
-
-  if (t instanceof LocalTime) {
-    return formatTime(t);
-  }
-
-  if (t instanceof LocalDateTime) {
-    return formatDateTime(t);
-  }
-
-  if (t instanceof ZonedTime) {
-    return formatZonedTime(t);
-  }
-
-  if (t instanceof ZonedDateTime) {
-    return formatZonedDateTime(t);
-  }
-
-  return formatDuration(t);
+  return TEMPORAL_SPEC[t.kind].format(t);
 }
 
 /** Build from a kind tag + ISO string (the codec decode path); throws on error. */
 export function temporalParse(tag: string, s: string): Temporal {
-  if (tag === 'date') {
-    return parseDate(s);
+  if (!Object.hasOwn(TEMPORAL_SPEC, tag)) {
+    throw new Error(`unknown temporal kind '${tag}'`);
   }
 
-  if (tag === 'localtime') {
-    return parseLocalTime(s);
-  }
-
-  if (tag === 'datetime') {
-    return parseDateTime(s);
-  }
-
-  if (tag === 'zoned_time') {
-    return parseZonedTime(s);
-  }
-
-  if (tag === 'zoned_datetime') {
-    return parseZonedDateTime(s);
-  }
-
-  if (tag === 'duration') {
-    return parseDuration(s);
-  }
-
-  throw new Error(`unknown temporal kind '${tag}'`);
+  return TEMPORAL_SPEC[tag as TemporalTag].parse(s);
 }
 
 /** GraphSON v3 `@type` name (TinkerPop extended types). */
 export function graphsonType(t: Temporal): string {
-  if (t instanceof LocalDate) {
-    return 'gx:LocalDate';
-  }
-
-  if (t instanceof LocalTime) {
-    return 'gx:LocalTime';
-  }
-
-  if (t instanceof LocalDateTime) {
-    return 'gx:LocalDateTime';
-  }
-
-  if (t instanceof ZonedTime) {
-    return 'gx:OffsetTime';
-  }
-
-  if (t instanceof ZonedDateTime) {
-    return 'gx:OffsetDateTime';
-  }
-
-  return 'gx:Duration';
+  return TEMPORAL_SPEC[t.kind].graphson;
 }
 
 /** GraphSON `@type` → kind tag, or `undefined` if not a temporal type. */
 export function graphsonTag(ty: string): TemporalTag | undefined {
-  if (ty === 'gx:LocalDate') {
-    return 'date';
-  }
-
-  if (ty === 'gx:LocalTime') {
-    return 'localtime';
-  }
-
-  if (ty === 'gx:LocalDateTime') {
-    return 'datetime';
-  }
-
-  if (ty === 'gx:OffsetTime') {
-    return 'zoned_time';
-  }
-
-  if (ty === 'gx:OffsetDateTime') {
-    return 'zoned_datetime';
-  }
-
-  if (ty === 'gx:Duration') {
-    return 'duration';
-  }
-
-  return undefined;
+  return GRAPHSON_TO_TAG.get(ty);
 }
 
 /** Recognize a single-key tagged temporal object `{"@date":"…"}`, else null. */
