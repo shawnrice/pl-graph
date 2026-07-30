@@ -1906,12 +1906,14 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
         } => value_subquery(
             env.graph,
             env.ctx,
-            patterns,
-            where_.as_deref(),
-            ret,
-            *is_agg,
+            SubqueryPlan {
+                patterns,
+                where_: where_.as_deref(),
+                ret,
+                is_agg: *is_agg,
+                sub_len: *sub_len,
+            },
             env.binding,
-            *sub_len,
         ),
         CExpr::LetIn { bindings, body } => {
             // Bind each local into a per-eval clone (left-to-right, so a later

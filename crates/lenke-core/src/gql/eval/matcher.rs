@@ -105,6 +105,17 @@ pub(super) fn count_matches(
     count
 }
 
+/// The compiled `VALUE { … }` subquery, bundled to keep `value_subquery` under the
+/// arg limit: the correlated pattern(s), the optional inner WHERE, the RETURN
+/// expression, whether that RETURN aggregates, and the subquery's binding width.
+pub(super) struct SubqueryPlan<'a> {
+    pub patterns: &'a [CPath],
+    pub where_: Option<&'a CExpr>,
+    pub ret: &'a CExpr,
+    pub is_agg: bool,
+    pub sub_len: usize,
+}
+
 /// Evaluate a `VALUE { … RETURN <expr> }` scalar subquery: a single value.
 ///
 /// Collect every correlated match (read-only, via `visit_patterns`), then:
@@ -113,17 +124,19 @@ pub(super) fn count_matches(
 /// - a non-aggregate RETURN yields NULL for 0 rows, the value for exactly one
 ///   row, and a **cardinality fault** for more than one (ISO: a scalar subquery
 ///   must not deliver more than one row) — loud, never a silent first-of-many.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn value_subquery(
     graph: &Graph,
     ctx: &Ctx,
-    patterns: &[CPath],
-    where_: Option<&CExpr>,
-    ret: &CExpr,
-    is_agg: bool,
+    plan: SubqueryPlan,
     binding: &Binding,
-    sub_len: usize,
 ) -> Val {
+    let SubqueryPlan {
+        patterns,
+        where_,
+        ret,
+        is_agg,
+        sub_len,
+    } = plan;
     let mut work = binding.clone();
     work.resize(sub_len);
     let mut matches: Vec<Binding> = Vec::new();

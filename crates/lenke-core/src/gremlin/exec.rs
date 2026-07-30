@@ -1998,7 +1998,19 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             }
         }
         Step::Barrier => stream,
-        Step::Repeat { body, times, until, until_before, emit, emit_before } => run_repeat(graph, ctx, &stream, body, *times, until.as_deref(), *until_before, emit.as_deref(), *emit_before),
+        Step::Repeat { body, times, until, until_before, emit, emit_before } => run_repeat(
+            graph,
+            ctx,
+            &stream,
+            body,
+            RepeatMods {
+                times: *times,
+                until: until.as_deref(),
+                until_before: *until_before,
+                emit: emit.as_deref(),
+                emit_before: *emit_before,
+            },
+        ),
 
         // --- tagging / select ---
         Step::As(label) => stream
@@ -2743,19 +2755,32 @@ fn insert_tree(node: &mut Vec<(GVal, GVal)>, keys: &[GVal]) {
     insert_tree(child, rest);
 }
 
+/// The `repeat()` modulators, bundled so `run_repeat` stays under the arg limit:
+/// how many times, the `until`/`emit` sub-traversals, and whether each is checked
+/// before the body (do-while / emit-before-step) vs after.
+struct RepeatMods<'a> {
+    times: Option<usize>,
+    until: Option<&'a Traversal>,
+    until_before: bool,
+    emit: Option<&'a Traversal>,
+    emit_before: bool,
+}
+
 /// `repeat(body)` with `times` / `until` / `emit` modulators.
-#[allow(clippy::too_many_arguments)]
 fn run_repeat(
     graph: &mut Graph,
     ctx: &mut Ctx,
     stream: &[Trav],
     body: &Traversal,
-    times: Option<usize>,
-    until: Option<&Traversal>,
-    until_before: bool,
-    emit: Option<&Traversal>,
-    emit_before: bool,
+    mods: RepeatMods,
 ) -> Vec<Trav> {
+    let RepeatMods {
+        times,
+        until,
+        until_before,
+        emit,
+        emit_before,
+    } = mods;
     const CAP: usize = 64;
     let emit_matches = |graph: &mut Graph, ctx: &mut Ctx, t: &Trav, e: &Traversal| {
         e.steps.is_empty() || sub_nonempty(graph, ctx, e, t)

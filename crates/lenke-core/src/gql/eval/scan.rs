@@ -2069,6 +2069,16 @@ pub(super) fn with_frame_aggregate(
 /// path's segments from that row's start vertex, fanning out to matching
 /// neighbors and replicating the frame's other columns. Returns `None` for a
 /// fresh/unbound start (cartesian), var-length, or a segment slot already bound.
+/// Which per-segment checks an edge must pass, bundled to keep `seg_edge_accepts`
+/// under the arg limit: whether the relationship/target need to be *bound* into the
+/// candidate binding, and whether the relationship / node property predicates need
+/// re-checking.
+pub(super) struct SegChecks {
+    pub need_bind: bool,
+    pub rel_check: bool,
+    pub node_check: bool,
+}
+
 /// Does neighbor edge `(eidx → nbr)` pass segment `seg`'s node label and — when
 /// `need_bind` — its inline rel/node property + WHERE predicates? When `need_bind`, the
 /// rel/node slots are set into `nb` as a side effect (so a caller that keeps the row
@@ -2078,18 +2088,20 @@ pub(super) fn with_frame_aggregate(
 /// The `rel_check`/`node_check` flags are precomputed once per segment by the caller to
 /// keep this per-edge test free of repeated `props`/`where_` inspection.
 #[inline]
-#[allow(clippy::too_many_arguments)]
 pub(super) fn seg_edge_accepts(
     graph: &Graph,
     ctx: &Ctx,
     seg: &CSegment,
     eidx: u32,
     nbr: u32,
-    need_bind: bool,
-    rel_check: bool,
-    node_check: bool,
+    checks: SegChecks,
     nb: &mut Binding,
 ) -> bool {
+    let SegChecks {
+        need_bind,
+        rel_check,
+        node_check,
+    } = checks;
     let (rel, node) = (&seg.rel, &seg.node);
     if !matches_label(graph, ctx, nbr, node.label.as_ref()) {
         return false;
@@ -2237,7 +2249,17 @@ pub(super) fn expand_frame(
             }
             for (eidx, nbr) in expand(graph, ctx, endpoint[i], rel.direction, rel.label.as_ref()) {
                 if !seg_edge_accepts(
-                    graph, ctx, seg, eidx, nbr, need_bind, rel_check, node_check, &mut nb,
+                    graph,
+                    ctx,
+                    seg,
+                    eidx,
+                    nbr,
+                    SegChecks {
+                        need_bind,
+                        rel_check,
+                        node_check,
+                    },
+                    &mut nb,
                 ) {
                     continue;
                 }
@@ -2367,7 +2389,17 @@ pub(super) fn expand_frame_optional(
         let mut matched = false;
         for (eidx, nbr) in expand(graph, ctx, start_ids[i], rel.direction, rel.label.as_ref()) {
             if !seg_edge_accepts(
-                graph, ctx, seg, eidx, nbr, need_bind, rel_check, node_check, &mut nb,
+                graph,
+                ctx,
+                seg,
+                eidx,
+                nbr,
+                SegChecks {
+                    need_bind,
+                    rel_check,
+                    node_check,
+                },
+                &mut nb,
             ) {
                 continue;
             }
