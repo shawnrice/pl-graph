@@ -38,6 +38,7 @@ export {
   isTemporal,
   coerceTemporal,
   temporalTag,
+  TEMPORAL_TAG_KEYS,
   temporalFormat,
   temporalParse,
   temporalCmpTotal,

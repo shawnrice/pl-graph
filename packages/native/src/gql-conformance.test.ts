@@ -389,13 +389,24 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(tsCmp).toBe(natCmp);
     expect(tsCmp).toBe(`[{"le":true}]`);
 
-    // Every tagged kind revives; also inside a list param.
-    const [tsAll, natAll] = both(`RETURN $dt AS dt, $dur AS dur, $xs AS xs`, {
+    // Every tagged kind revives; also inside a list param. @zoned_time is here
+    // explicitly: the host param gate once rejected it (its accepted-tag set had
+    // a bogus '@time' and omitted the real '@zoned_time'), so a valid ZONED TIME
+    // param threw E_INVALID_JSON before reaching the engine. Now the gate derives
+    // from the canonical TEMPORAL_TAG_KEYS, so every kind fromTaggedJson accepts
+    // passes through byte-identically.
+    const [tsAll, natAll] = both(`RETURN $dt AS dt, $dur AS dur, $zt AS zt, $xs AS xs`, {
       dt: { '@datetime': '2020-06-15T08:30:00' },
       dur: { '@duration': 'P1Y2M3DT4H' },
+      zt: { '@zoned_time': '12:00:00Z' },
       xs: [{ '@date': '2020-01-01' }, { '@localtime': '08:30:00' }],
     });
     expect(tsAll).toBe(natAll);
+    expect(tsAll).toContain(`"@zoned_time"`);
+
+    // A bogus tag ('@time' is never emitted by any toJSON) is rejected by the
+    // host gate — not silently shipped to the crate to fault differently.
+    expect(() => nativeGraph.query(`RETURN $t AS t`, { t: { '@time': '12:00:00' } })).toThrow();
   });
 
   // --- ANY SHORTEST: the path value serializes byte-identically across engines.

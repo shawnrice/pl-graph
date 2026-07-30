@@ -13,7 +13,7 @@ import type {
   ShortestPathRow,
   Temporal,
 } from '@lenke/core';
-import { fromTaggedJson, isTemporal, temporalLiteralParts } from '@lenke/core';
+import { fromTaggedJson, isTemporal, TEMPORAL_TAG_KEYS, temporalLiteralParts } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
 import type {
@@ -253,23 +253,16 @@ const withClock = (
 // error instead. (Serializing a bigint as a JSON number would silently lose
 // precision above 2^53, so a param rejects it rather than corrupt it — pass such
 // a value as a string, or as a number if it is within the safe integer range.)
-const TEMPORAL_TAGS = new Set([
-  '@date',
-  '@datetime',
-  '@localtime',
-  '@time',
-  '@zoned_datetime',
-  '@duration',
-]);
-
 /** A tagged-temporal plain object, e.g. `{ '@date': '2027-05-25' }` (one @-key,
- *  string value) — the only object shape valid as a param value. */
+ *  string value) — the only object shape valid as a param value. The accepted
+ *  keys come from the canonical `TEMPORAL_TAG_KEYS` (the exact set `fromTaggedJson`
+ *  accepts), so this gate can't drift from what the engine actually ingests. */
 const isTaggedTemporalObject = (v: object): boolean => {
   const keys = Object.keys(v);
 
   return (
     keys.length === 1 &&
-    TEMPORAL_TAGS.has(keys[0]) &&
+    TEMPORAL_TAG_KEYS.has(keys[0]) &&
     typeof (v as Record<string, unknown>)[keys[0]] === 'string'
   );
 };

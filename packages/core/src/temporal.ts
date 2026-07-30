@@ -634,6 +634,17 @@ const GRAPHSON_TO_TAG = new Map<string, TemporalTag>(
   Object.values(TEMPORAL_SPEC).map((s) => [s.graphson, s.tag]),
 );
 
+/**
+ * The valid tagged-temporal JSON keys — the `@`-prefixed wire form every temporal
+ * `toJSON()` emits and `fromTaggedJson` accepts (`@date`, `@localtime`, `@datetime`,
+ * `@zoned_time`, `@zoned_datetime`, `@duration`). Derived from TEMPORAL_SPEC so it
+ * can never drift from the kinds themselves — the single authority for "is this
+ * object a tagged temporal?", shared by the host-side param gate in `@lenke/native`.
+ */
+export const TEMPORAL_TAG_KEYS: ReadonlySet<string> = new Set(
+  Object.values(TEMPORAL_SPEC).map((s) => `@${s.tag}`),
+);
+
 export function temporalFormat(t: Temporal): string {
   return TEMPORAL_SPEC[t.kind].format(t);
 }
@@ -671,14 +682,7 @@ export function fromTaggedJson(v: unknown): Temporal | null {
 
   const [key] = keys;
 
-  if (
-    key !== '@date' &&
-    key !== '@localtime' &&
-    key !== '@datetime' &&
-    key !== '@zoned_time' &&
-    key !== '@zoned_datetime' &&
-    key !== '@duration'
-  ) {
+  if (!TEMPORAL_TAG_KEYS.has(key)) {
     return null;
   }
 
@@ -1126,14 +1130,12 @@ export function temporalArith(op: string, l: unknown, r: unknown): unknown {
  *  restating the tag table. Note `@localtime` maps to `time`, which is why a
  *  plain `tag.slice(1)` will not do.
  */
-const TEMPORAL_TAG_KIND: Readonly<Record<string, string>> = {
-  '@date': 'date',
-  '@localtime': 'time',
-  '@datetime': 'datetime',
-  '@zoned_time': 'zoned_time',
-  '@zoned_datetime': 'zoned_datetime',
-  '@duration': 'duration',
-};
+// Also derived from TEMPORAL_SPEC (keys can't drift from the tag set). The only
+// value that isn't its own tag is `@localtime`, whose literal-constructor keyword
+// is `time` (see the doc above) — the single documented exception.
+const TEMPORAL_TAG_KIND: Readonly<Record<string, string>> = Object.fromEntries(
+  Object.values(TEMPORAL_SPEC).map((s) => [`@${s.tag}`, s.tag === 'localtime' ? 'time' : s.tag]),
+);
 
 export const temporalLiteralParts = (v: Temporal): { kind: string; iso: string } | null => {
   const tagged = v.toJSON() as Record<string, string>;

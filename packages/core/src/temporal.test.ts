@@ -6,11 +6,13 @@ import {
   coerceTemporal,
   Duration,
   formatDuration,
+  fromTaggedJson,
   LocalDate,
   LocalDateTime,
   parseDate,
   parseDateTime,
   parseDuration,
+  TEMPORAL_TAG_KEYS,
   temporalCmpTotal,
   temporalRelCmp,
 } from './temporal.js';
@@ -18,6 +20,44 @@ import {
 // These mirror the Rust `temporal::tests` one-for-one — identical inputs and
 // expected outputs pin the two engines' calendar math + ISO parse/format to the
 // same byte string (the real cross-engine differential rides on top of this).
+
+describe('temporal: canonical tagged-temporal keys', () => {
+  // TEMPORAL_TAG_KEYS is the single source of accepted `@`-keys, derived from
+  // TEMPORAL_SPEC. It must exactly equal what fromTaggedJson revives — and must
+  // NOT drift into bogus tags (a hand-maintained copy once had '@time' and
+  // dropped '@zoned_time', silently rejecting valid ZONED TIME params).
+  const CANONICAL = [
+    '@date',
+    '@localtime',
+    '@datetime',
+    '@zoned_time',
+    '@zoned_datetime',
+    '@duration',
+  ];
+
+  test('the set is exactly the six canonical keys', () => {
+    expect([...TEMPORAL_TAG_KEYS].sort()).toEqual([...CANONICAL].sort());
+    expect(TEMPORAL_TAG_KEYS.has('@time')).toBe(false);
+    expect(TEMPORAL_TAG_KEYS.has('@zoned_time')).toBe(true);
+  });
+
+  test('every key in the set is revived by fromTaggedJson (and only those)', () => {
+    const sample: Record<string, string> = {
+      '@date': '2020-01-01',
+      '@localtime': '08:30:00',
+      '@datetime': '2020-01-01T08:30:00',
+      '@zoned_time': '12:00:00Z',
+      '@zoned_datetime': '2020-01-01T08:30:00Z',
+      '@duration': 'P1Y2M3DT4H',
+    };
+
+    for (const key of TEMPORAL_TAG_KEYS) {
+      expect(fromTaggedJson({ [key]: sample[key] })).not.toBeNull();
+    }
+
+    expect(fromTaggedJson({ '@time': '12:00:00' })).toBeNull();
+  });
+});
 
 describe('temporal: civil calendar', () => {
   test('round-trips known dates', () => {
