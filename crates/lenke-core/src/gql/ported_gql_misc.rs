@@ -11,56 +11,6 @@
 use super::eval::Params;
 use super::parse;
 use crate::graph::{Graph, Value};
-use crate::ndjson;
-
-// ── helpers (mirrors tests.rs) ───────────────────────────────────────────────
-
-#[allow(dead_code)]
-fn modern() -> Graph {
-    let lines = [
-        r#"{"type":"node","id":"marko","labels":["Person"],"properties":{"name":"marko","age":29}}"#,
-        r#"{"type":"node","id":"vadas","labels":["Person"],"properties":{"name":"vadas","age":27}}"#,
-        r#"{"type":"node","id":"josh","labels":["Person"],"properties":{"name":"josh","age":32}}"#,
-        r#"{"type":"node","id":"peter","labels":["Person"],"properties":{"name":"peter","age":35}}"#,
-        r#"{"type":"node","id":"lop","labels":["Software"],"properties":{"name":"lop","lang":"java"}}"#,
-        r#"{"type":"node","id":"ripple","labels":["Software"],"properties":{"name":"ripple","lang":"java"}}"#,
-        r#"{"type":"edge","from":"marko","to":"vadas","labels":["KNOWS"],"properties":{"weight":0.5}}"#,
-        r#"{"type":"edge","from":"marko","to":"josh","labels":["KNOWS"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","from":"marko","to":"lop","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","from":"josh","to":"ripple","labels":["CREATED"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","from":"josh","to":"lop","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","from":"peter","to":"lop","labels":["CREATED"],"properties":{"weight":0.2}}"#,
-    ];
-    ndjson::decode(&lines.join("\n")).unwrap()
-}
-
-#[allow(dead_code)]
-fn n(x: f64) -> Value {
-    Value::Num(x)
-}
-#[allow(dead_code)]
-fn s(x: &str) -> Value {
-    Value::Str(x.into())
-}
-#[allow(dead_code)]
-fn b(x: bool) -> Value {
-    Value::Bool(x)
-}
-
-/// Run a query (no params) and return (columns, rows).
-#[allow(dead_code)]
-fn q(g: &mut Graph, query: &str) -> (Vec<String>, Vec<Vec<Value>>) {
-    let parsed = parse(query).unwrap_or_else(|e| panic!("parse error for `{query}`: {e}"));
-    let rs = parsed
-        .execute(g, &Params::new())
-        .unwrap_or_else(|e| panic!("exec error for `{query}`: {e}"));
-    (rs.cols.clone(), rs.rows().map(|r| r.to_vec()).collect())
-}
-
-#[allow(dead_code)]
-fn rows(g: &mut Graph, query: &str) -> Vec<Vec<Value>> {
-    q(g, query).1
-}
 
 // ── Mulberry32 RNG — direct port of the TS makeRng ───────────────────────────
 //
