@@ -573,12 +573,39 @@ export const lengthOf = (a: unknown): number | null => {
 };
 
 /** Scalar (non-aggregate) functions: the ISO numeric/string value functions. */
+// Coerce a numeric-function argument the way the Rust `num_of` does, NOT JS
+// `Number()` — which additionally accepts hex/binary/octal strings ('0x10' → 16)
+// and single-element arrays ([5] → 5). Numbers pass through; booleans → 0/1; a
+// string parses under the strict decimal/scientific grammar (empty → 0); anything
+// else → NaN. So abs('0x10') / abs([5]) are NaN in both engines.
+const numArg = (v: unknown): number => {
+  if (typeof v === 'number') {
+    return v;
+  }
+
+  if (typeof v === 'boolean') {
+    return v ? 1 : 0;
+  }
+
+  if (typeof v === 'string') {
+    const t = v.trim();
+
+    if (t === '') {
+      return 0;
+    }
+
+    return FINITE_NUMERIC.test(t) ? Number(t) : Number.NaN;
+  }
+
+  return Number.NaN;
+};
+
 export const callScalar = (name: string, args: readonly unknown[]): unknown => {
   const [a, b] = args;
   const unaryNum = UNARY_NUM[name];
 
   if (unaryNum) {
-    return isNullish(a) ? null : unaryNum(Number(a));
+    return isNullish(a) ? null : unaryNum(numArg(a));
   }
 
   const unaryStr = UNARY_STR[name];
@@ -590,7 +617,7 @@ export const callScalar = (name: string, args: readonly unknown[]): unknown => {
   const binaryNum = BINARY_NUM[name];
 
   if (binaryNum) {
-    return isNullish(a) || isNullish(b) ? null : binaryNum(Number(a), Number(b));
+    return isNullish(a) || isNullish(b) ? null : binaryNum(numArg(a), numArg(b));
   }
 
   if (name in NUM_CONSTANTS) {
@@ -608,10 +635,10 @@ export const callScalar = (name: string, args: readonly unknown[]): unknown => {
         return null;
       }
 
-      const digits = isNullish(b) ? 0 : Math.trunc(Number(b));
+      const digits = isNullish(b) ? 0 : Math.trunc(numArg(b));
       const f = 10 ** digits;
 
-      return roundHalfAway(Number(a) * f) / f;
+      return roundHalfAway(numArg(a) * f) / f;
     }
     // `cardinality` is the ISO GQL / SQL name; `size` is the openCypher spelling.
     case 'cardinality':

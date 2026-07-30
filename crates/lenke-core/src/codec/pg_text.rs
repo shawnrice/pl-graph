@@ -228,7 +228,11 @@ fn tokenize(line: &str) -> Vec<String> {
 /// Looks like a JS-`Number`-shaped token (so a bare `1e3` parses, but `inf` does not).
 fn is_number(raw: &str) -> bool {
     let first = raw.as_bytes().first().copied();
-    matches!(first, Some(b'0'..=b'9') | Some(b'-') | Some(b'.')) && raw.parse::<f64>().is_ok()
+    // Require a FINITE parse: Rust's f64::from_str accepts "inf"/"-inf"/"nan", but
+    // JS Number() maps those to NaN (→ treated as a string), so a foreign token like
+    // "-inf" must not be read as a number here (byte-identity with the TS decoder).
+    matches!(first, Some(b'0'..=b'9') | Some(b'-') | Some(b'.'))
+        && raw.parse::<f64>().is_ok_and(|n| n.is_finite())
 }
 
 /// Parse the value half of a `key:value` token into a scalar value.

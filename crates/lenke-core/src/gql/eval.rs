@@ -728,7 +728,11 @@ fn js_str(graph: &Graph, v: &Val) -> String {
         Val::Str(s) => s.to_string(),
         Val::Temporal(t) => t.format(),
         Val::Node(i) => graph.vid.text(*i).to_string(),
-        Val::Edge(i) => format!("e{i}"),
+        // The external edge id (like `Val::Node` above and `element_id`), which for
+        // an id-less edge is the canonical `e{index}` — so this is a no-op there and
+        // a fix only when the edge carries an assigned id (was always the synthetic
+        // index, inconsistent with the node case).
+        Val::Edge(i) => graph.edge_id(*i).into_owned(),
         Val::List(items) => items
             .iter()
             // JS `Array.prototype.join` renders a null/undefined element as the empty

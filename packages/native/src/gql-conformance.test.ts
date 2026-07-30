@@ -110,7 +110,9 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     // sticks under cmp_total/compareValues (min/max is a reduce), so both are NaN →
     // null. The vectorized Rust fold once used f64::min/max, which DROP NaN → ~1.41,
     // diverging from the scalar path and from TS. Now all three agree.
-    const [ts, native] = both(`MATCH (n:Person) RETURN min(sqrt(n.age - 30)) AS lo, max(sqrt(n.age - 30)) AS hi`);
+    const [ts, native] = both(
+      `MATCH (n:Person) RETURN min(sqrt(n.age - 30)) AS lo, max(sqrt(n.age - 30)) AS hi`,
+    );
     expect(ts).toBe(native);
     expect(ts).toBe(`[{"lo":null,"hi":null}]`);
   });
@@ -131,6 +133,22 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       expect(() => tsQuery(ts, q)).toThrow();
       expect(() => nat.query(q)).toThrow();
     }
+  });
+
+  test('scalar numeric fns coerce like Rust num_of (not JS Number), byte-identical', () => {
+    // JS Number('0x10') is 16 and Number([5]) is 5; Rust num_of gives NaN → null.
+    const [ts, native] = both(`RETURN abs('0x10') AS a, abs([5]) AS b, abs('12') AS c`);
+    expect(ts).toBe(native);
+    expect(ts).toBe(`[{"a":null,"b":null,"c":12}]`);
+  });
+
+  test('-0 and +0 are distinct GROUP BY/DISTINCT keys (bit-keyed), byte-identical', () => {
+    // (age-30)*0 yields -0 for marko/vadas (age<30) and +0 for josh (age>30). Rust
+    // val_key keys by bit pattern so -0 ≠ +0 (2 groups); TS once collapsed them to
+    // one (String(-0) === "0"). Now both count 2.
+    const [ts, native] = both(`MATCH (n:Person) RETURN count(DISTINCT (n.age - 30) * 0) AS c`);
+    expect(ts).toBe(native);
+    expect(ts).toBe(`[{"c":2}]`);
   });
 
   test('RETURN n — rich node object, byte-identical, keys sorted', () => {

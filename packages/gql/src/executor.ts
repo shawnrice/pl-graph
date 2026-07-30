@@ -1524,7 +1524,18 @@ const keyReplacer = (_k: string, val: unknown): unknown => {
 export const valueKey = (v: unknown): string => {
   switch (typeof v) {
     case 'number':
-      return Number.isFinite(v) ? `n${v}` : `#${v}`;
+      if (!Number.isFinite(v)) {
+        return `#${v}`;
+      }
+
+      // Rust `val_key` keys numbers by bit pattern, so -0 and +0 are distinct
+      // groups. `n${v}` collapses them (String(-0) === "0"); the `v === 0` gate keeps
+      // the Object.is check off the common (non-zero) hot path.
+      if (v === 0) {
+        return Object.is(v, -0) ? 'n-0' : 'n0';
+      }
+
+      return `n${v}`;
     case 'string':
       return `s${v}`;
     case 'boolean':

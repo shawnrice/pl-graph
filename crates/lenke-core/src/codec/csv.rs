@@ -272,7 +272,14 @@ fn raw_to_scalar(scalar: Scalar, raw: &str) -> Value {
     }
     match scalar {
         Scalar::Bool => Value::Bool(raw == "true"),
-        Scalar::Int | Scalar::Float => Value::Num(raw.parse().unwrap_or(f64::NAN)),
+        // A foreign "inf"/"-inf"/"nan" parses in Rust but is NaN under JS Number();
+        // filter to finite so both decoders agree (our encoder never writes these).
+        Scalar::Int | Scalar::Float => Value::Num(
+            raw.parse::<f64>()
+                .ok()
+                .filter(|n| n.is_finite())
+                .unwrap_or(f64::NAN),
+        ),
         _ => Value::Str(raw.into()),
     }
 }

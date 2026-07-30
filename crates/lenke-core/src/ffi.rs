@@ -753,8 +753,9 @@ pub unsafe extern "C" fn lnk_rollback_tx(g: *mut Graph) -> i32 {
     }
 }
 
-/// Drop a vertex property index (no-op if absent). Returns 0 on success, -1 on
-/// error.
+/// Drop a vertex property index (no-op if absent). Returns 0 on success, -1 on a
+/// null / bad-UTF-8 error, and **-2** if the index backs a unique constraint (the
+/// TS binding relies on this -2 to raise `InvalidGraphOp`).
 ///
 /// # Safety
 /// As [`lnk_create_index`].
