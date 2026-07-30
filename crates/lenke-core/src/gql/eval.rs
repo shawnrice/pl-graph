@@ -3201,16 +3201,19 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> VVec {
         }
         CExpr::Arith { head, tail } => {
             // n-ary left-associative fold, column at a time. A non-numeric operand
-            // (general column, incl. temporal) → scalar fallback for the whole
-            // node, which raises the ISO type error / does temporal arithmetic
-            // per-row rather than coercing to NaN.
+            // (general column, incl. temporal, OR a boolean) → scalar fallback for
+            // the whole node, which raises the ISO type error / does temporal
+            // arithmetic per-row rather than coercing to NaN. A Bool VVec must fall
+            // back too: `into_num` would coerce it to 0/1 (valid), but the scalar
+            // `arith_num` faults on a boolean — and the TS engine throws — so
+            // `true + 1` over rows must fault, not compute 2.
             let mut acc = eval_vec(graph, ctx, sc, head);
-            if matches!(acc, VVec::Gen(_)) {
+            if matches!(acc, VVec::Gen(_) | VVec::Bool { .. }) {
                 return gen(e);
             }
             for (op, rhs) in tail {
                 let r = eval_vec(graph, ctx, sc, rhs);
-                if matches!(r, VVec::Gen(_)) {
+                if matches!(r, VVec::Gen(_) | VVec::Bool { .. }) {
                     return gen(e);
                 }
                 acc = arith_vec_step(ctx, *op, acc, r, n);
