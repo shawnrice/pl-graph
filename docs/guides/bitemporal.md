@@ -2,8 +2,6 @@
 
 **A recipe, not a feature.** lenke ships the _primitives_ you need to model bitemporality — `DATE` properties, parameterized `WHERE` predicates, a host clock, and atomic transactions — but it does **not** ship a bitemporal engine. There is no `PERIOD` type, no system-time column, no `AS OF` keyword. You compose bitemporality from the pieces below, and you keep full control over the schema. This guide shows the working pattern end to end; every query here is executable (verified against `@lenke/gql` on the pure-TS engine, and byte-identical on the Rust core).
 
-> The [`.dogfood`](../../.dogfood/round9/sofia/bitemporal.ts) scratch script is the reference implementation this guide is distilled from — a cold reader built the whole slice from public docs and exported types alone.
-
 ## The model: four DATE columns on the fact
 
 A _bitemporal_ fact is true along two independent time axes:

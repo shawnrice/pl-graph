@@ -1100,7 +1100,7 @@ mod tests {
     #[test]
     fn null_list_element_round_trips() {
         // A null INSIDE a list must round-trip exactly — it was lost to the string
-        // "null" (R-CSV-LISTNULL). It encodes with the `\Tn:` element sigil.
+        // "null" before this fix. It encodes with the `\Tn:` element sigil.
         let g = crate::codec::pg_json::decode(
             r#"{"nodes":[{"id":"t","labels":["T"],"properties":{"dims":[1,null,2],"oneNull":[null]}}],"edges":[]}"#,
         )

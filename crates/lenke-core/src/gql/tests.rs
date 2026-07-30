@@ -302,8 +302,8 @@ fn count_subquery_degree_matches_enumeration() {
             3.0,
         ),
         (
-            // Reverse degree — the correlated node is the ENDPOINT (like the dogfood
-            // `COUNT { (:User)-[:PURCHASED]->(y) }`). in-R of n1 from a free start = 3.
+            // Reverse degree — the correlated node is the ENDPOINT (like a popularity
+            // shape `COUNT { (:User)-[:PURCHASED]->(y) }`). in-R of n1 from a free start = 3.
             "MATCH (n:Node) WHERE n.name = 'n1' RETURN COUNT { (m)-[:R]->(n) } AS c",
             "MATCH (n:Node) WHERE n.name = 'n1' RETURN COUNT { (m)-[:R]->(n) WHERE true } AS c",
             3.0,
@@ -2611,7 +2611,7 @@ fn unique_constraint_introspection_and_drop() {
     assert!(g.has_unique_constraint("Acct", "handle"));
 }
 
-// --- edge-side constraints (R-CONSTRAINTS, edge types) ----------------------
+// --- edge-side constraints (edge types) -------------------------------------
 // Direct mirror of the vertex constraint tests above, keyed by edge type and
 // enforced against the edge property store. Byte-identical to the TS engine.
 
@@ -2934,8 +2934,8 @@ fn string_id_property_is_the_edge_identity() {
 /// vertices. Regression: `resolve_merge_endpoint` ignored the binding and re-
 /// inferred a unique key from the (empty) node pattern, so every bound-variable
 /// edge merge failed with `_MERGE could not determine a unique key` — the whole
-/// keyed-edge-upsert path was unreachable. Found by the round-16 dogfood sim
-/// (ScenarioForge), which needed it to replay edges as upserts during a merge.
+/// keyed-edge-upsert path was unreachable. Surfaced when replaying edges as
+/// upserts during a merge.
 #[test]
 fn merge_edge_between_bound_endpoints_upserts() {
     let mut g = ndjson::decode(
@@ -4072,8 +4072,8 @@ fn unit_expansion_budget_guards_dense_multi_element() {
 /// faults with `E_RESOURCE_EXHAUSTED` rather than OOM-killing the host. That path
 /// is impractical to unit-test cheaply — tripping the ceiling means materializing
 /// tens of millions of rows — so this test covers the routing that makes the
-/// common case both correct and bounded. Found by the round-16 dogfood simulation,
-/// where a correlated multi-hop join took the host down with an OOM kill.
+/// common case both correct and bounded. Regression: a correlated multi-hop join
+/// took the host down with an OOM kill.
 #[test]
 fn multi_hop_with_limit_streams_and_stays_correct() {
     // A small DAG: a -> {b,c} -> {d,e} -> f, with rising `amt` on exactly one
@@ -4237,7 +4237,7 @@ fn for_first_clause_needs_no_seed_row() {
 
 #[test]
 fn for_drives_batch_optional_match_allow_and_deny() {
-    // R-BATCH deny-side: one row per requested name, present or not. `josh`
+    // `FOR` clause deny-side: one row per requested name, present or not. `josh`
     // exists (age 32); `nobody` does not, so OPTIONAL MATCH leaves `p` null.
     let mut g = modern();
     assert_eq!(
@@ -4599,8 +4599,8 @@ fn tx_keywords_start_insert_commit_persists() {
 /// index seek"), so a target-anchored pattern seeded from the *unindexed* source
 /// and scanned its whole label bucket — 26x at N=32k while the source-anchored
 /// form was already flat. It now orients toward the seekable end, reversing the
-/// path when that end is last. Found by the round-16 dogfood sim (report §4,
-/// `directReportsOf`), isolated by `_p35_target_anchor.ts`.
+/// path when that end is last. Regression: a target-anchored "direct reports of"
+/// traversal scanned the whole label bucket.
 #[test]
 fn traversal_anchored_on_the_target_is_independent_of_graph_size() {
     use std::time::Instant;
@@ -4662,8 +4662,8 @@ fn traversal_anchored_on_the_target_is_independent_of_graph_size() {
 ///
 /// `Graph::adj` now serves a single vertex from the `out`/`in_` delta and only
 /// repacks once `CSR_WARM_READS` reads accumulate. Same 16x-spread / 6x-bound
-/// construction as the sibling test below. Found by the round-16 dogfood sim
-/// (`_p33_csr.ts`, first-call column).
+/// construction as the sibling test below. Regression: an ingest that reads as it
+/// writes repacked the whole CSR on the first read after each write.
 #[test]
 fn interleaved_write_and_traverse_is_independent_of_graph_size() {
     use std::time::Instant;
@@ -4725,8 +4725,8 @@ fn interleaved_write_and_traverse_is_independent_of_graph_size() {
 /// A one-edge lookup cost O(edges of type); measured 193x at N=32k.
 ///
 /// Timing-based, but the spread is 16x of graph size against a 6x bound: unfixed
-/// this ratio is ~16, fixed it is ~1. Found by the round-16 dogfood sim
-/// (`_p34_edgetype.ts`), which discriminated edge-type population from graph size.
+/// this ratio is ~16, fixed it is ~1. The cost must track edge-type population,
+/// not graph size.
 #[test]
 fn traversal_from_indexed_anchor_is_independent_of_edge_type_size() {
     use std::time::Instant;
@@ -4784,8 +4784,8 @@ fn traversal_from_indexed_anchor_is_independent_of_edge_type_size() {
 /// writes and leave the transaction OPEN. Regression: `finish_statement` used to
 /// call `rollback_tx`, which resets `tx_depth` to 0 unconditionally — so an app
 /// that caught a statement error silently fell out of its transaction, every later
-/// write auto-committed, and the closing ROLLBACK became a no-op. Found by the
-/// round-16 dogfood sim (`_p16_repro.ts`); pure-TS `@lenke/core` was never affected.
+/// write auto-committed, and the closing ROLLBACK became a no-op. Native-only;
+/// pure-TS `@lenke/core` was never affected.
 #[test]
 fn tx_statement_error_does_not_end_the_enclosing_transaction() {
     let mut g = ndjson::decode("").unwrap();
@@ -5154,7 +5154,7 @@ fn any_shortest_plus_and_bounded() {
     assert_eq!(one, vec!["josh", "lop", "vadas"]);
 }
 
-/// Round-11 B2: `->+(a)` closing on the seed finds the shortest cycle back to it
+/// `->+(a)` closing on the seed finds the shortest cycle back to it
 /// (the seed is marked at BFS distance 0 yet is a valid endpoint via a cycle),
 /// while `->*` still yields the zero-length self path.
 #[test]
@@ -8381,7 +8381,7 @@ fn deep_stored_field_access_reads_only_the_leaf() {
 
 #[test]
 fn deboxed_record_queries_identically_to_the_boxed_map() {
-    // R-CONSTRAINTS Step 2: declaring a RECORD constraint de-boxes `meta` into
+    // Record-typed constraints, step 2: declaring a RECORD constraint de-boxes `meta` into
     // typed sub-columns. Every read path (whole map, field access, nested WHERE,
     // dotted-path index seek) must return exactly what the boxed map did.
     let mut g = map_graph();
@@ -8660,7 +8660,7 @@ fn bench_parallel_query_speedup() {
     );
 }
 
-/// AML-shaped workload (the gnarly round-16/17/18 patterns): a transaction network,
+/// AML-shaped workload (the gnarly layering/structuring patterns): a transaction network,
 /// then the layering / structuring / circular-flow queries. Same serial-vs-parallel
 /// protocol (vary RAYON_NUM_THREADS) to gauge whether real AML queries speed up.
 #[cfg(feature = "parallel-query")]
@@ -8872,7 +8872,7 @@ fn temporal_property_index_seek_agrees_with_scan() {
 /// the hard as-of / overlap / range queries with and without the temporal index,
 /// plus the write-interleaved build cost (index maintained on every insert). Run:
 ///   cargo test --release bench_temporal_index -- --ignored --nocapture
-/// Bump N / VERSIONS toward the round-16 xxl (212k) / xxxl (1.75M) version counts.
+/// Bump N / VERSIONS toward the xxl (212k) / xxxl (1.75M) version counts.
 #[test]
 #[ignore = "benchmark; run with --ignored --nocapture"]
 fn bench_temporal_index() {
@@ -9028,9 +9028,9 @@ fn bench_temporal_index() {
     eprintln!("      └─ {:.2}x vs scan", base[3] / b_wide);
 }
 
-/// Round-16's #1 bitemporal BLOCKER was that variable-length paths couldn't filter
+/// A key bitemporal BLOCKER was that variable-length paths couldn't filter
 /// edges, forcing a materialize-a-slice-then-traverse hack. The per-repetition WHERE
-/// (shipped round-18, ISO `parenthesizedPathPatternWhereClause`) should retire it:
+/// (ISO `parenthesizedPathPatternWhereClause`) should retire it:
 /// each hop's edge is filtered by the as-of predicate inline, no slice, no mutation.
 /// Chain v4→v3→v2→v1→v0; the v3→v2 edge is EXPIRED at the query date, so an as-of
 /// traversal from v4 must stop at v3.

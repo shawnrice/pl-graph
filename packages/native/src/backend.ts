@@ -124,7 +124,7 @@ export type Backend = {
    * Declare a CARDINALITY constraint bounding the degree of every vertex carrying
    * `label` over `edgeType` in `direction` to `min..=max` (`max: null`
    * unbounded). Throws `ConstraintViolation` if the current data already violates
-   * it. The degree-bound member of R-CONSTRAINTS (see docs/design/r-tx.md).
+   * it. The degree-bound constraint (see docs/design/transactions.md).
    */
   createCardinalityConstraint: (
     handle: GraphHandle,
@@ -160,7 +160,7 @@ export type Backend = {
   dropEdgeIndex: (handle: GraphHandle, key: string) => void;
 
   /**
-   * Transaction primitives (R-TX). `beginTransaction` opens a frame (writes still
+   * Transaction primitives. `beginTransaction` opens a frame (writes still
    * apply eagerly, but record undo ops); nesting joins the outer frame.
    * `commitTransaction` closes it — the outermost commit runs the deferred
    * constraint checks and **throws `ConstraintViolation`** (after rolling back) if

@@ -87,7 +87,7 @@ Both engines (this TS engine and the Rust core) produce **byte-identical** resul
 - **String length and slicing count UTF-16 code units** (JS `.length` parity), not Unicode code points. `split('')` and `reverse` therefore operate on UTF-16 units; splitting or reversing _across_ an astral (surrogate-pair) character is inherently lossy and yields U+FFFD on both engines — a deliberate divergence from JS `String.split('')`, which preserves lone surrogate halves.
 - **`null` is a first-class stored property value** (distinct from absent); remove a property with `REMOVE`, never `SET x.k = null`.
 - **Ordering across unlike types.** ISO GQL doesn't define an order between different value types, so `ORDER BY` / `min` / `max` / `list_sort` impose a deterministic **total order across type groups** — `number < string < boolean < other` (graph elements/lists) — with **nulls last** by default (overridable with `NULLS FIRST`/`LAST`). The relational operators `< > <= >=` are unaffected: comparing unlike types there is still `UNKNOWN`, per ISO.
-- **`power(x, y)` is not byte-identical cross-engine (≤1 ULP, won't-fix).** The pure-TS engine evaluates `power` with V8's `Math.pow`/`**`; the native/wasm engines use Rust's `powf` (glibc `pow`). These agree to the last bit almost everywhere but differ by **≤1 ULP** on some inputs — e.g. `power(0.7, 10)` and `power(2, -0.5)`. Every other numeric function (trig, `sqrt`, `exp`, `ln`, `log10`, `atan2`, …) is byte-identical; only `pow` inherits the platform `pow`'s rounding. A true fix needs a shared deterministic pow kernel and is deferred (see `docs/dogfood/findings/round15.md`). The same op backs Gremlin `math()`'s `pow`/`^`.
+- **`power(x, y)` is not byte-identical cross-engine (≤1 ULP, won't-fix).** The pure-TS engine evaluates `power` with V8's `Math.pow`/`**`; the native/wasm engines use Rust's `powf` (glibc `pow`). These agree to the last bit almost everywhere but differ by **≤1 ULP** on some inputs — e.g. `power(0.7, 10)` and `power(2, -0.5)`. Every other numeric function (trig, `sqrt`, `exp`, `ln`, `log10`, `atan2`, …) is byte-identical; only `pow` inherits the platform `pow`'s rounding. A true fix needs a shared deterministic pow kernel and is deferred. The same op backs Gremlin `math()`'s `pow`/`^`.
 
 ### Temporal values (`DATE` / `DATETIME` / `TIME` / zoned / `DURATION`)
 
@@ -175,7 +175,7 @@ The `config` map is optional (`CALL pagerank()`), and each procedure reads only 
 
 ## Constraints & validators
 
-Beyond the unique constraint below, a graph carries the full R-CONSTRAINTS surface — enforced at the mutation boundary on **both** engines, throwing `ErrorCode.ConstraintViolation` on a violating write. The core primitives (`createRequiredConstraint`, `createTypeConstraint`, `createCardinalityConstraint`, edge variants) live on the `Graph` — see [`@lenke/core`](../core#constraints). `@lenke/gql` adds two that need a GQL expression:
+Beyond the unique constraint below, a graph carries the full constraint surface — enforced at the mutation boundary on **both** engines, throwing `ErrorCode.ConstraintViolation` on a violating write. The core primitives (`createRequiredConstraint`, `createTypeConstraint`, `createCardinalityConstraint`, edge variants) live on the `Graph` — see [`@lenke/core`](../core#constraints). `@lenke/gql` adds two that need a GQL expression:
 
 ```ts
 import { createValidator, createInvariant } from '@lenke/gql';

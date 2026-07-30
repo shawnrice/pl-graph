@@ -191,7 +191,7 @@ suite('CDC write stream (TS vs native store)', () => {
     expect(seen).toEqual([]);
   });
 
-  test('the live tail cold-boots on a gap or reordered batch (round-10 B1)', () => {
+  test('the live tail cold-boots on a gap or reordered batch', () => {
     const s = server();
     const a = s.client();
 
@@ -325,7 +325,7 @@ suite('CDC write stream (TS vs native store)', () => {
     expect([...sent1, ...sent2].filter((m) => m.type === 'ack' && m.ok).length).toBe(2); // both acked ok
   });
 
-  test('origin-skip survives reconnect: a client never re-ingests its OWN backlog write (R-CDC-ORIGIN)', () => {
+  test('origin-skip survives reconnect: a client never re-ingests its OWN backlog write', () => {
     const store = newStore();
     const writeLog = createWriteLog();
     const sent1: HostMessage[] = [];
@@ -558,7 +558,7 @@ describe('CDC write stream — client ordering guard (transport-free)', () => {
 // is what lets a replica derive a keyed `_MERGE` or reject the same writes as the
 // source — without it, the replica is missing the constraints. Server-authoritative
 // (no CRDT): the store is the single writer; replicas receive, they don't originate.
-suite('schema replication over the CDC log (R-SCHEMA-REPL)', () => {
+suite('schema replication over the CDC log', () => {
   /** A replica: pipe the write stream into a fresh local store (what engine.ingest
    *  does). Subscribing with a default cursor replays the full backlog in seq order. */
   const replicaOf = (c: SyncClient): Store => {

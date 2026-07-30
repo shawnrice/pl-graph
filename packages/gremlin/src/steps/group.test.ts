@@ -67,7 +67,7 @@ describe('STEP, group', () => {
   // doc: g.V().group().by(label).by(count()) → {PERSON: 4, SOFTWARE: 2}
   // A reducing value-by (count/sum/min/max/mean/fold) folds over the whole group
   // as a barrier, yielding a single value per bucket — not a per-traverser list
-  // of 1s (the pre-R-GREMLIN-AGG behavior).
+  // of 1s (the behavior before local aggregation folded groups).
   test('group by(label()).by(count()) yields a per-bucket count', () => {
     const result = arr(run(traversal(V(), group().by(label()).by(count())), g));
     const map = result[0] as Map<unknown, number>;

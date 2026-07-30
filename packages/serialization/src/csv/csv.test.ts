@@ -190,7 +190,7 @@ describe('CSV formula neutralization: complete coverage (every string-cell surfa
 
     const back = roundTrip(g);
     const [v] = [...back.vertices];
-    expect(v.getProperty<unknown[]>('dims')).toEqual([1, null, 2]); // was [1, "null", 2] (R-CSV-LISTNULL)
+    expect(v.getProperty<unknown[]>('dims')).toEqual([1, null, 2]); // was [1, "null", 2] before the fix
     expect(v.getProperty<unknown[]>('oneNull')).toEqual([null]);
   });
 

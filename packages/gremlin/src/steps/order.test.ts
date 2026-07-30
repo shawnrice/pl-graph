@@ -108,7 +108,7 @@ describe('Gremlin tests', () => {
 
   // order(Scope.local) sorts WITHIN each traverser's value, not across the stream.
   // The canonical use: rank a groupCount() Map by its counts (was silently a
-  // no-op — order(Scope.local) spread a Symbol and did nothing; R-GREMLIN-AGG).
+  // no-op — order(Scope.local) spread a Symbol and did nothing).
   test('order(Scope.local) sorts a group Map by value desc (top-N-from-groupCount)', () => {
     const [m] = arr(
       run(traversal(V(), groupCount().by(T.label), order(Scope.local).by(Order.desc)), tinkerGraph),

@@ -643,7 +643,7 @@ export type RustGraph = {
    * `label` over `edgeType` in `direction` (`out` = source, `in` = target) to
    * `min..=max` (`max: null` unbounded). Throws `ConstraintViolation` if the
    * current data already violates it. Max is enforced at each statement's
-   * auto-commit; min is commit-time only. See docs/design/r-tx.md.
+   * auto-commit; min is commit-time only. See docs/design/transactions.md.
    */
   createCardinalityConstraint: (
     label: string,
@@ -702,7 +702,7 @@ export type RustGraph = {
    */
   lastWriteScope: (key: string) => string[];
   /**
-   * Run `fn` as one atomic transaction (R-TX). Every write inside applies to the
+   * Run `fn` as one atomic transaction. Every write inside applies to the
    * graph immediately (so reads see their own writes), but if `fn` throws — or a
    * deferred constraint check fails at commit — the whole batch rolls back and
    * nothing persists. On success the writes commit together. Returns whatever

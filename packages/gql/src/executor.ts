@@ -714,8 +714,7 @@ const BINARY_NUM: Record<string, (x: number, y: number) => number> = {
   // `powf` (glibc `pow`, the native engine) by ≤1 ULP on some inputs — e.g.
   // power(0.7,10) → …4ae here vs …4af native; power(2,-0.5) → …bcc vs …bcd. So
   // `power`/`pow`/`^` are NOT byte-identical cross-engine on those inputs; a true
-  // fix needs a shared deterministic pow kernel. See docs/dogfood/findings/
-  // round15.md and this package's README.md.
+  // fix needs a shared deterministic pow kernel. See this package's README.md.
   power: (x, y) => x ** y,
   mod: (x, y) => x % y,
   log: (base, value) => Math.log(value) / Math.log(base),
@@ -5795,9 +5794,9 @@ const ensureNode = (
   // A plain INSERT that breaks a unique constraint is rejected — but the check is
   // deferred to commit (via `addVertex`'s constraint chokepoint + `runDeferredChecks`),
   // not eager, so a transient duplicate resolved before commit is allowed. This
-  // matches the native engine's R-TX deferred-check semantics; an eager check here
+  // matches the native engine's deferred-check (transaction) semantics; an eager check here
   // wrongly rejected `INSERT` + later `DELETE` of the dup within one transaction
-  // (round-12 F3). `_MERGE` still reconciles instead (docs/design/gql-extensions.md §3).
+  // `_MERGE` still reconciles instead (docs/design/gql-extensions.md §3).
   const vertex = insertVertexWithId(graph, node.labels, properties);
 
   if (node.variable) {
@@ -6116,7 +6115,7 @@ const runSet = (graph: Graph, clause: CSet, binding: Binding, params: Params): v
       // property-write chokepoint (`assertUniqueOnSet`), which defers the check to
       // commit inside a transaction. Deferring (rather than an eager check here)
       // lets a transient collision that is reverted before commit succeed, matching
-      // the native engine's R-TX semantics (round-12 F3). Constraints are vertex-only.
+      // the native engine's transaction semantics. Constraints are vertex-only.
       el.setProperty(item.key, value);
     }
   }

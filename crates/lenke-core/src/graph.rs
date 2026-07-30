@@ -186,7 +186,7 @@ pub enum Column {
         data: Vec<Option<Value>>,
     },
     /// A **de-boxed record** column: the store for a property key that carries a
-    /// declared `RECORD { … }` type constraint (R-CONSTRAINTS). Because the
+    /// declared `RECORD { … }` type constraint. Because the
     /// constraint is a contract on the field set + types, a conforming map is
     /// scattered across one typed sub-column per field (`meta.city` → a `Str`
     /// column, `meta.tier` → a `Num` column) instead of a ~40 B boxed
@@ -862,7 +862,7 @@ pub struct Adj {
     pub etype: u32,
 }
 
-/// The scalar type a TYPE constraint (R-CONSTRAINTS) can require of a property
+/// The scalar type a TYPE constraint can require of a property
 /// value. Mirrors the TS `ScalarTypeName`; `number` maps to `Num` (the f64 model
 /// has no integer/float split), `list` is "an array" (elements unconstrained).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -915,7 +915,7 @@ impl PropType {
     }
 }
 
-/// A declared property TYPE for an R-CONSTRAINT: either a scalar [`PropType`] or
+/// A declared property TYPE for a type constraint: either a scalar [`PropType`] or
 /// an ISO `RECORD { field :: type, … }` (a *closed* record — an exact field set,
 /// each field itself a `TypeSpec`, so records nest). This is the contract a
 /// record-typed constraint enforces; a fixed-shape record is what later lets the
@@ -1348,11 +1348,11 @@ pub struct Graph {
     /// `docs/design/gql-extensions.md` §3.
     v_unique: HashMap<String, Vec<String>>,
     /// REQUIRED constraints: `label` → the property keys that must be present and
-    /// non-null on every live vertex carrying that label (R-CONSTRAINTS). Unlike
+    /// non-null on every live vertex carrying that label. Unlike
     /// `v_unique` these need no backing index — enforcement is a presence check.
     v_required: HashMap<String, Vec<String>>,
     /// TYPE constraints: `label` → (`key` → the scalar type its present, non-null
-    /// values must be). Null/absent are exempt (R-CONSTRAINTS).
+    /// values must be). Null/absent are exempt.
     v_type: HashMap<String, HashMap<String, PropType>>,
     /// RECORD-typed constraints: `label` → (`key` → a closed `RECORD {…}` shape
     /// its present, non-null values must match). The record analogue of `v_type`,
@@ -1388,7 +1388,7 @@ pub struct Graph {
     /// (schema-sized), searched linearly; keyed by `(label, etype, direction)` for
     /// declare-replace and drop. Max is checked at commit against touched
     /// endpoints; min is commit-time only (unsatisfiable by a single write). A
-    /// self-loop counts once for out and once for in. See `docs/design/r-tx.md`.
+    /// self-loop counts once for out and once for in. See `docs/design/transactions.md`.
     v_cardinality: Vec<CardinalityRule>,
     /// VALIDATOR constraints: a custom GQL boolean predicate per label (a vertex
     /// label OR an edge type — one string namespace). Every element carrying the
@@ -1409,7 +1409,7 @@ pub struct Graph {
     /// `createInvariant`. Keyed insertion order is irrelevant; `invariants()`
     /// sorts by name.
     v_invariants: Vec<InvariantRule>,
-    /// Transaction state (R-TX). `tx_depth > 0` means an open transaction: writes
+    /// Transaction state. `tx_depth > 0` means an open transaction: writes
     /// still apply eagerly to the live store (read-your-writes with no overlay),
     /// but each mutation records an inverse op in `tx_undo`, the built-in
     /// constraint checks defer to commit (the touched vertex ids collect in
@@ -1423,7 +1423,7 @@ pub struct Graph {
     tx_undo: Vec<Undo>,
     tx_touched: Vec<u32>,
     /// Edge analogue of `tx_touched`: edge indices whose built-in edge constraints
-    /// must be re-checked at commit (R-TX deferral for edge writes).
+    /// must be re-checked at commit (deferred to commit for edge writes).
     tx_touched_edges: Vec<u32>,
     /// The vertices touched by the most recent committed write — a snapshot of
     /// `tx_touched` taken at commit (before it's cleared), so a caller can derive
@@ -2201,7 +2201,7 @@ impl Graph {
         None
     }
 
-    // --- required constraints (R-CONSTRAINTS) --------------------------------
+    // --- required constraints -------------------------------------------------
     // Every live vertex carrying `label` must hold a present, non-null value for
     // each required `key`. Enforced in the write path (INSERT/SET/REMOVE) like
     // `unique`; declarative (no closures), so it is byte-identical to the TS core.
@@ -2338,7 +2338,7 @@ impl Graph {
         None
     }
 
-    // --- type constraints (R-CONSTRAINTS) ------------------------------------
+    // --- type constraints -----------------------------------------------------
     // Every present, non-null value under a constrained `key` on a vertex with
     // `label` must be of the declared scalar type. Null/absent are exempt.
     // Enforced in the write path; byte-identical to the TS core.
@@ -2510,7 +2510,7 @@ impl Graph {
         false
     }
 
-    // --- edge constraints (R-CONSTRAINTS, edge types) -----------------------
+    // --- edge constraints (edge types) --------------------------------------
     // Direct mirror of the vertex unique/required/type constraints, keyed by edge
     // TYPE instead of node label, enforced against the edge property store
     // (`edge_props`) and the edge property index (`eidx`). Byte-identical to the
@@ -2899,7 +2899,7 @@ impl Graph {
         out
     }
 
-    // --- cardinality constraints (R-CONSTRAINTS, degree bounds) --------------
+    // --- cardinality constraints (degree bounds) ----------------------------
     // Bound the degree of every vertex carrying `label` over `etype` in
     // `direction` (0 = out / the vertex is the edge source, 1 = in / the target).
     // Max is deferred to commit against touched endpoints (the GQL layer runs
@@ -3699,7 +3699,7 @@ impl Graph {
         self.eid_rev.insert(arc, eidx);
     }
 
-    // --- transactions (R-TX) -----------------------------------------------
+    // --- transactions -------------------------------------------------------
     // An atomic mutation boundary with rollback + deferred constraint checks.
     // Mechanism: eager-apply + undo-log + deferred-check-at-commit. Writes apply
     // immediately (read-your-writes), each recording an inverse op; the built-in
@@ -3826,7 +3826,7 @@ impl Graph {
     }
 
     /// Note an edge whose built-in edge constraints must be re-checked at commit —
-    /// the edge analogue of [`Graph::tx_note_touched`] (R-TX deferral for edges).
+    /// the edge analogue of [`Graph::tx_note_touched`] (deferred to commit for edges).
     #[inline]
     pub fn tx_note_touched_edge(&mut self, ei: u32) {
         if self.tx_active() {
@@ -5672,7 +5672,7 @@ mod storable_maps {
 
 #[cfg(test)]
 mod transactions {
-    //! R-TX: an explicit transaction over the GQL eval mutation path must roll
+    //! Transactions: an explicit transaction over the GQL eval mutation path must roll
     //! back to byte-identical prior state, and commit must persist. The eval layer
     //! wraps each statement in its own auto-commit frame, so these tests exercise
     //! the *nested* case (explicit begin → statements → rollback/commit), where
@@ -5774,7 +5774,7 @@ mod transactions {
 
 #[cfg(test)]
 mod cardinality {
-    //! R-CONSTRAINTS cardinality (degree bounds), exercised over the GQL eval
+    //! Cardinality constraints (degree bounds), exercised over the GQL eval
     //! path (each statement is an auto-commit frame, so max AND min land at the
     //! per-statement commit). Byte-identical to the TS core.
     use super::*;
@@ -5894,7 +5894,7 @@ mod cardinality {
 
 #[cfg(test)]
 mod validator {
-    //! R-CONSTRAINTS custom validators (a GQL boolean predicate per label),
+    //! Custom validator constraints (a GQL boolean predicate per label),
     //! exercised over the GQL eval path (each statement is an auto-commit frame,
     //! so the predicate is re-checked against every touched element at the
     //! per-statement commit). SQL-`CHECK` semantics — a definite `false` fails, a
@@ -6817,7 +6817,7 @@ mod any_record_and_record_not_null {
     }
 }
 
-/// R-CONSTRAINTS Step 2: a declared RECORD constraint de-boxes the property key's
+/// Record-typed constraints, step 2: a declared RECORD constraint de-boxes the property key's
 /// column into typed per-field sub-columns ([`Column::Record`]). These tests pin
 /// the substrate: de-boxing happens on declare, every read round-trips
 /// byte-identically to the boxed map, non-conforming values (a shared key across

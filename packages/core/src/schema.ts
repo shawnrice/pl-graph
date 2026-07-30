@@ -103,7 +103,7 @@ export type NodeSchema<S extends StandardSchemaV1> = {
  * This validates HOST-side, before the write — it guards `create` calls, not a
  * raw GQL `INSERT` or `mergeNdjson` (those write through the engine, which can't
  * run a JS schema). For in-engine, both-engine enforcement that also guards raw
- * writes, use the R-CONSTRAINTS surface (`createTypeConstraint` /
+ * writes, use the constraint surface (`createTypeConstraint` /
  * `createRequiredConstraint` / `createUniqueConstraint` / `createValidator`);
  * the two compose — a schema at the app boundary, constraints at the engine.
  *

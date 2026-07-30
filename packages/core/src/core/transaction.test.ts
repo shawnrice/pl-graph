@@ -14,7 +14,7 @@ const isCV = (fn: () => unknown): boolean => {
   return false;
 };
 
-describe('R-TX: atomic transaction (commit / rollback)', () => {
+describe('atomic transaction (commit / rollback)', () => {
   test('transaction(fn) commits on return and returns fn result', () => {
     const g = new Graph();
     const out = g.transaction((tx) => {
@@ -90,7 +90,7 @@ describe('R-TX: atomic transaction (commit / rollback)', () => {
   });
 });
 
-describe('R-TX: deferred constraint checks', () => {
+describe('deferred constraint checks', () => {
   test('required is checked at commit, not per-write (add node, fill mandatory key later)', () => {
     const g = new Graph();
     g.createRequiredConstraint('User', 'email');
@@ -181,7 +181,7 @@ describe('R-TX: deferred constraint checks', () => {
   });
 });
 
-describe('R-TX: event buffering', () => {
+describe('event buffering', () => {
   test('events fire once on commit, not mid-transaction', () => {
     const g = new Graph();
     const seen: string[] = [];

@@ -1540,8 +1540,8 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
   // the scalar depth-first driver (filters during traversal, stops at the LIMIT)
   // instead of the breadth-first vectorized path (which materializes the whole
   // cross-product of partial matches, and on a dense graph OOMs the host). TS has
-  // always streamed it. They must return the same rows. Regression: the round-16
-  // dogfood sim drove native to an OOM kill on exactly this shape. -------------
+  // always streamed it. They must return the same rows. Regression: guards against
+  // native OOM-killing the host on exactly this dense-graph shape. -------------
   test('multi-hop with per-hop WHERE + LIMIT agrees (TS vs native)', () => {
     const CHAIN_NDJSON = [
       '{"type":"node","id":"a","labels":["A"],"properties":{"nm":"a"}}',
@@ -1707,7 +1707,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(ts).toBe(`[{"x":"marko"},{"x":29}]`);
   });
 
-  test('R-BATCH: FOR drives a batch OPTIONAL MATCH (allow + deny) byte-identically', () => {
+  test('the `FOR` clause drives a batch OPTIONAL MATCH (allow + deny) byte-identically', () => {
     // One row per requested name; josh exists (age 32), nobody does not (null).
     const [ts, native] = both(
       `FOR name IN ['josh', 'nobody'] OPTIONAL MATCH (p:Person {name: name}) RETURN name, p.age`,

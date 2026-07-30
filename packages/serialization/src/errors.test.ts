@@ -73,7 +73,7 @@ describe('serialization error codes', () => {
     expect(normalizeValue(Infinity)).toBeNull();
   });
 
-  test('a lone UTF-16 surrogate is rejected (round-12 F1: match native serde)', () => {
+  test('a lone UTF-16 surrogate is rejected (match native serde)', () => {
     // A `\uD800` escape survives JSON.parse in JS but the native UTF-8 store
     // can't hold a lone surrogate — its serde JSON decoder rejects it at ingest.
     // The value boundary rejects it too so both engines accept/reject the same

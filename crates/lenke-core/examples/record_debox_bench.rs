@@ -1,4 +1,5 @@
-//! R-CONSTRAINTS Step 2: what declaring a `RECORD` type constraint buys. The
+//! Record-typed constraints, step 2: what declaring a `RECORD` type constraint
+//! buys. The
 //! same graph, read boxed (a `Value::Map` per vertex in a `Mixed` column) vs
 //! de-boxed (the constraint scatters each field into a typed sub-column —
 //! `Column::Record`). We measure the three things the de-boxing is supposed to

@@ -61,7 +61,7 @@ describe('repeat tests', () => {
   test('repeat(out(KNOWS)).until(hasLabel(PERSON)) runs the body once first (do-while)', () => {
     // Post-form .until() is do-while: from marko (already a PERSON) the body runs
     // once → out('KNOWS') → josh, vadas (both PERSON) → they satisfy until and
-    // exit. (The old while-do behavior returned [marko] — R-REPEAT-UNTIL.)
+    // exit. (The old while-do behavior returned [marko].)
     const r = arr(
       run(
         traversal(V('1'), repeat(out('KNOWS')).until(hasLabel('PERSON')), values('name')),

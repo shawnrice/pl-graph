@@ -1,17 +1,17 @@
-# R-TX — transactions & deferred constraint checks
+# Transactions & deferred constraint checks
 
 Status: **v1 shipped** (foundation). Both engines, byte-identical.
 
 ## Why
 
 Neither engine had any staging or rollback: writes applied eagerly, and a
-mid-sequence failure left partial writes committed (round-7: a two-leg transfer
-where leg 2 throws leaves the books unbalanced, `sum=1000`). And the built-in
+mid-sequence failure left partial writes committed — a two-leg transfer
+where leg 2 throws leaves the books unbalanced (`sum=1000`). And the built-in
 constraints checked one write at a time, so cross-write invariants
 (`debits==credits`) and "node + mandatory edge"–style rules were inexpressible.
 
-R-TX adds an **atomic mutation boundary with rollback + deferred constraint
-checks**. Because lenke is in-memory, single-writer, and synchronous, of the
+Transactions add an **atomic mutation boundary with rollback + deferred
+constraint checks**. Because lenke is in-memory, single-writer, and synchronous, of the
 classic ACID four only **Atomicity** and **Consistency** are in play — Isolation
 is trivial (no concurrency) and Durability is the host's job (see the temporal
 design note). So "transaction" here is deliberately smaller than a database
@@ -48,7 +48,7 @@ element before the event dispatches at commit.
 engines: every top-level write statement runs in an auto-commit frame, so a
 faulting multi-row `INSERT`/`SET` rolls its earlier rows back instead of leaving
 the write half-applied. This is Gremlin's "auto-commit per traversal" and the
-fix for the round-7 partial-write bug, in one.
+fix for the partial-write bug, in one.
 
 ## Surface
 
@@ -80,7 +80,7 @@ behaves identically whether the store is TS or Rust.
 
 ## Not in scope (follow-ups)
 
-- ~~The R-CONSTRAINTS items that build on R-TX~~ — **SHIPPED**: edge-side
+- ~~The constraint items that build on transactions~~ — **SHIPPED**: edge-side
   constraints, min/`exactly one` cardinality, declarative (GQL-predicate)
   validators, and graph-level (cross-write) invariants all now use these deferred
   checks.

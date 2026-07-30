@@ -312,7 +312,7 @@ suite('@lenke/native/arrow — FixedSizeList<Float64> egress', () => {
 
 // A record/map column egresses as a real Arrow Struct<field: type, …> (typed
 // child arrays), not a stringified `{k=v}` blob — the analytics egress a
-// declared RECORD constraint (R-CONSTRAINTS Step 2) unlocks. A field a row omits
+// declared RECORD constraint unlocks. A field a row omits
 // (nullable) is a null in that child.
 const REC_NDJSON = [
   '{"type":"node","id":"a","labels":["P"],"properties":{"name":"a","meta":{"city":"NYC","tier":1}}}',

@@ -18,7 +18,7 @@ const thrown = (fn: () => unknown): unknown => {
 const isCV = (fn: () => unknown): boolean =>
   hasErrorCode(thrown(fn), ErrorCode.ConstraintViolation);
 
-describe('R-CONSTRAINTS: required', () => {
+describe('required constraints', () => {
   test('declaring over already-violating data throws', () => {
     const g = new Graph();
     g.addVertex({ id: 'a', labels: ['User'], properties: {} }); // no email
@@ -85,7 +85,7 @@ describe('R-CONSTRAINTS: required', () => {
   });
 });
 
-describe('R-CONSTRAINTS: type', () => {
+describe('type constraints', () => {
   test('declaring over wrong-typed data throws', () => {
     const g = new Graph();
     g.addVertex({ id: 'a', labels: ['P'], properties: { age: 'old' } });
@@ -144,11 +144,11 @@ describe('R-CONSTRAINTS: type', () => {
   });
 });
 
-// V3 (Rafael, r7): a unique constraint used to be enforced only on the GQL
+// A unique constraint used to be enforced only on the GQL
 // `INSERT`/`SET` path — the direct `addVertex`/`setProperty` API bypassed it,
 // yielding count=2 with no throw. It's now a core invariant at the mutation
 // chokepoint, so every write path agrees.
-describe('R-CONSTRAINTS: unique (direct-API enforcement, V3)', () => {
+describe('unique constraints (direct-API enforcement)', () => {
   test('addVertex rejects a duplicate under a unique constraint', () => {
     const g = new Graph();
     g.createUniqueConstraint('User', 'email');
@@ -189,8 +189,8 @@ describe('R-CONSTRAINTS: unique (direct-API enforcement, V3)', () => {
 
 // Edge-side constraints are a direct mirror of the vertex ones, keyed by edge
 // TYPE, enforced at the addEdge gate + Edge property mutators + addLabelToEdge,
-// and deferred to commit inside a transaction (R-TX). Byte-identical to Rust.
-describe('R-CONSTRAINTS: edge unique/required/type', () => {
+// and deferred to commit inside a transaction. Byte-identical to Rust.
+describe('edge unique/required/type constraints', () => {
   // Two anchor vertices for edges; every edge below runs between them (parallel
   // edges are fine — an LPG allows many edges between the same pair).
   const anchors = (g: Graph): [ReturnType<Graph['addVertex']>, ReturnType<Graph['addVertex']>] => [
@@ -345,7 +345,7 @@ describe('R-CONSTRAINTS: edge unique/required/type', () => {
   });
 });
 
-describe('R-CONSTRAINTS: cardinality', () => {
+describe('cardinality constraints', () => {
   // An Order must be placed by exactly one Customer: bound the OUT-degree of every
   // :Order over PLACED_BY to [1, 1].
   const order = (g: Graph, id: string) => g.addVertex({ id, labels: ['Order'], properties: {} });
@@ -543,7 +543,7 @@ describe('R-CONSTRAINTS: cardinality', () => {
   });
 });
 
-describe('R-CONSTRAINTS: RECORD-typed', () => {
+describe('RECORD-typed constraints', () => {
   test('parseTypeSpec + typeSpecName round-trip; declare validates existing data', () => {
     const g = new Graph();
     g.addVertex({ id: 'a', labels: ['P'], properties: { meta: { city: 'NYC', tier: 2 } } });
@@ -634,7 +634,7 @@ describe('R-CONSTRAINTS: RECORD-typed', () => {
   });
 });
 
-describe('R-CONSTRAINTS: scalar NOT NULL type constraint', () => {
+describe('scalar NOT NULL type constraint', () => {
   test('declaring over already absent/null data throws', () => {
     const absent = new Graph();
     absent.addVertex({ id: 'a', labels: ['P'], properties: {} });
@@ -716,7 +716,7 @@ describe('R-CONSTRAINTS: scalar NOT NULL type constraint', () => {
   });
 });
 
-describe('R-CONSTRAINTS: ANY RECORD + record-level NOT NULL', () => {
+describe('ANY RECORD + record-level NOT NULL', () => {
   test('parseTypeSpec / typeSpecName round-trip the open record forms', () => {
     // `any record` and a bare `record` are the same open type; canonical = 'any record'.
     const any = parseTypeSpec('any record');

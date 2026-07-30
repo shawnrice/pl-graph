@@ -526,7 +526,7 @@ pub enum Expr {
     /// multiplicative): `head` then each `(op, operand)` folded left to right, so
     /// `a - b - c` is `head=a, tail=[(Sub,b),(Sub,c)]`. n-ary (not nested `Box`s)
     /// so a long chain is a flat `Vec`, not a chain-deep tree that would overflow
-    /// the stack when walked — see round-12 C1.
+    /// the stack when walked.
     Arith {
         head: Box<Self>,
         tail: Vec<(ArithOp, Self)>,

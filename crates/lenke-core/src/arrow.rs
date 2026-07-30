@@ -1330,7 +1330,7 @@ mod tests {
         assert!(es.len() > 8);
     }
 
-    /// Record de-boxing (R-CONSTRAINTS Step 2) must NOT change Arrow egress: a
+    /// Record de-boxing (record-typed constraints, step 2) must NOT change Arrow egress: a
     /// projected record FIELD still comes out as its native typed column, and a
     /// whole-record projection is byte-identical whether the column is boxed or
     /// de-boxed. This is the regression guard the de-boxing work needs — if a

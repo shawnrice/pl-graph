@@ -43,7 +43,7 @@ describe('GQL: unique constraints', () => {
     query(g, `MATCH (n:Acct {email: 'b@x.io'}) SET n.email = 'b@x.io'`);
   });
 
-  test('the check is deferred to commit — a transient duplicate resolved before commit is allowed (round-12 F3)', () => {
+  test('the check is deferred to commit — a transient duplicate resolved before commit is allowed', () => {
     const g = createTestSocialGraph();
     g.createUniqueConstraint('Acct', 'id');
     query(g, `INSERT (:Acct {id: 1, bal: 100})`);

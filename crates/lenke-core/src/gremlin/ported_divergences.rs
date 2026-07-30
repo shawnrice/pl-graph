@@ -166,8 +166,8 @@ fn textual_emit_before_repeat_yields_every_level() {
     // TEXTUAL pre-form emit: `emit().repeat(out()).times(2)` — the emit modulator
     // PRECEDES its repeat (TinkerPop allows this). It must match the builder's
     // `.repeat(...).emit_before(...)` above (start vertex + every level), not
-    // silently drop the emit because it came before the repeat step. (Priyanka r4;
-    // owner-check `emit().repeat(out('MEMBER_OF'))` needs the zero-hop start.)
+    // silently drop the emit because it came before the repeat step.
+    // (`emit().repeat(out('MEMBER_OF'))` needs the zero-hop start.)
     let t = super::parse("g.V('1').emit().repeat(out()).times(2).values('name')").unwrap();
     assert_eq!(
         sorted_names(q(t)),
@@ -188,7 +188,7 @@ fn textual_until_before_repeat_attaches() {
 }
 
 // --- repeat().until() is do-while: the body runs at least once ----------------
-// R-REPEAT-UNTIL (Anouk r6): post-form `repeat(body).until(cond)` checks the
+// The repeat/until do-while form: post-form `repeat(body).until(cond)` checks the
 // condition AFTER the body (TinkerPop), so a start already satisfying `until`
 // still runs the body once. Pre-form `until(cond).repeat(body)` stays while-do.
 #[test]
@@ -215,7 +215,7 @@ fn repeat_until_post_form_is_do_while() {
 }
 
 // --- order(Scope.local): rank a group Map by value (was a silent no-op) -------
-// R-GREMLIN-AGG (Omar r5): order(Scope.local) sorts WITHIN each traverser's value
+// Gremlin local aggregation: order(Scope.local) sorts WITHIN each traverser's value
 // instead of across the stream — the canonical use is ranking a groupCount() Map
 // by its counts. It was silently ignored; now it matches @lenke/gremlin's
 // orderLocalStep (Map entries sorted by value; a list's elements sorted).
@@ -277,7 +277,7 @@ fn order_local_sorts_a_folded_list() {
 }
 
 // --- group().by(k).by(reduce) folds each group to one value (was a list) ------
-// R-GREMLIN-AGG (Omar r5, Anouk r6): a reducing value-by (count/sum/min/max/mean/
+// Gremlin local aggregation: a reducing value-by (count/sum/min/max/mean/
 // fold) folds over the group as a barrier — group().by(k).by(count()) yields
 // {k: n}, not {k: [1,1,...]}. A mapping value-by still collects a list.
 #[test]

@@ -1,4 +1,4 @@
-// Cross-engine differential for R-TX. The SAME transaction scripts — explicit
+// Cross-engine differential for transactions. The SAME transaction scripts — explicit
 // begin/commit/rollback around GQL statements, plus per-statement atomicity and
 // deferred constraint checks — run on BOTH the TS engine (@lenke/core + @lenke/gql)
 // and the Rust core (over bun:ffi), asserting the two agree on every outcome AND
@@ -87,7 +87,7 @@ const differential = (
   );
 };
 
-suite('R-TX differential: explicit transactions (TS vs native)', () => {
+suite('transactions differential: explicit transactions (TS vs native)', () => {
   test('a committed transaction persists all its statements', () => {
     differential(() => {}, [
       {
@@ -122,7 +122,7 @@ suite('R-TX differential: explicit transactions (TS vs native)', () => {
   });
 });
 
-suite('R-TX differential: per-statement atomicity (TS vs native)', () => {
+suite('transactions differential: per-statement atomicity (TS vs native)', () => {
   test('a multi-row INSERT that violates unique on a later row leaves zero rows', () => {
     differential(
       (e) => declareUnique(e),
@@ -139,7 +139,7 @@ suite('R-TX differential: per-statement atomicity (TS vs native)', () => {
   });
 });
 
-suite('R-TX differential: deferred constraint checks (TS vs native)', () => {
+suite('transactions differential: deferred constraint checks (TS vs native)', () => {
   test('required is checked at commit, not per statement (fill the key in a later statement)', () => {
     differential(
       (e) => declareRequired(e),
@@ -178,7 +178,7 @@ suite('R-TX differential: deferred constraint checks (TS vs native)', () => {
   });
 });
 
-suite('R-TX differential: ISO transaction keywords (TS vs native)', () => {
+suite('transactions differential: ISO transaction keywords (TS vs native)', () => {
   test('START … INSERT … COMMIT via keywords persists on both engines', () => {
     differential(() => {}, [
       { label: 'START', run: (e) => e.query(`START TRANSACTION`) },

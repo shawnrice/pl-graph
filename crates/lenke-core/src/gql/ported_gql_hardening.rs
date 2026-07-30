@@ -168,8 +168,8 @@ fn h_normally_nested_query_still_parses() {
 /// The associative operator AST is n-ary (a flat `Vec`), so a long
 /// left-associative chain far past the old crash point (~40k) parses AND
 /// *evaluates* — no stack overflow — instead of aborting the process (given a
-/// ceiling that admits it). Regression test for round-12 C1 (native SIGSEGV on
-/// `RETURN true AND true AND … (100k)`).
+/// ceiling that admits it). Regression test for the native SIGSEGV on
+/// `RETURN true AND true AND … (100k)`.
 #[test]
 fn h_long_chain_evaluates_without_stack_overflow() {
     let val = |q: &str| -> Value {

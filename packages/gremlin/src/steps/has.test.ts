@@ -217,8 +217,7 @@ describe('Gremlin tests', () => {
     // `===` and SILENTLY matched nothing, while the ordering predicates never
     // reached the temporal branch of `compareValues` (`isTemporal` recognizes only
     // instances) and threw E_INVALID_VALUE. A silent empty result is the worse of
-    // the two: it ships. Found by the round-16 dogfood sim (report §0.2/§5,
-    // "a bitemporal app is unbuildable on that frontend").
+    // the two: it ships.
     describe('temporal predicates', () => {
       const D = (iso: string) => ({ '@date': iso });
       // Built through GQL so `vf` is stored as a real temporal instance, which is

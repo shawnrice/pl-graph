@@ -202,7 +202,7 @@ export type SyncClient = {
    * stale and the app should cold-boot from a fresh snapshot. `onIngestError`
    * (optional) fires when handing a batch to `onWrites` throws — the batch is
    * isolated so it can't wedge the transport, but ingest isn't atomic yet
-   * (R-TX), so a partial apply means the app should cold-boot to re-sync.
+   * so a partial apply means the app should cold-boot to re-sync.
    * Survives reconnect (resumes from the last cursor via {@link replay}).
    */
   subscribeWrites: (
@@ -786,7 +786,7 @@ export const createSyncClient = (options: SyncClientOptions): SyncClient => {
 
     if (msg.writes.length > 0) {
       // Isolate ingest: an un-appliable write must not escape `receive()` and
-      // wedge the transport pump. Since ingest isn't atomic yet (R-TX) the batch
+      // wedge the transport pump. Since ingest isn't atomic yet the batch
       // may have partially applied, so the app should cold-boot to re-sync.
       try {
         writeHandler?.(msg.writes);

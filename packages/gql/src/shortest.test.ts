@@ -58,7 +58,7 @@ describe('ANY SHORTEST path patterns', () => {
     expect(names(rows)).toEqual(['josh', 'lop', 'ripple', 'vadas']);
   });
 
-  test('-> + closes on the seed via the shortest cycle (round-11 B2)', () => {
+  test('-> + closes on the seed via the shortest cycle', () => {
     const g = new Graph();
     const a = g.addVertex({ id: 'a', labels: ['N'], properties: { id: 'a' } });
     const b = g.addVertex({ id: 'b', labels: ['N'], properties: { id: 'b' } });

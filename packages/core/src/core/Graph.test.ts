@@ -375,7 +375,7 @@ describe('Graph Tests', () => {
     });
   });
 
-  describe('dogfood round-3 ergonomics', () => {
+  describe('ergonomics', () => {
     test('addVertex/addEdge accept no properties (a plain labeled element)', () => {
       const g = createTestGraph();
       const a = g.addVertex({ id: 'x', labels: ['N'] }); // no properties
@@ -450,7 +450,7 @@ describe('Graph Tests', () => {
 
       // Every element is announced (edges first, then vertices), so an audit
       // journal / the CDC WriteLog / a React store sees the most destructive op
-      // without special-casing — it used to emit nothing (R-TRUNCATE-EVENTS).
+      // without special-casing — it used to emit nothing.
       expect(removedEdges).toEqual(['e']);
       expect(removedVertices.sort()).toEqual(['a', 'b']);
       expect(mutations).toBe(3); // all three flow through @graph/mutate

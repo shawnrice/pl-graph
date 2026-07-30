@@ -223,7 +223,7 @@ fn p4_by_order_by_key() {
 
 #[test]
 fn p4_order_by_key_over_project_rows() {
-    // Round-11 BUG A: `order().by('<key>')` over `project()` Map rows sorts by the
+    // Regression: `order().by('<key>')` over `project()` Map rows sorts by the
     // keyed value, not "cannot order an element with an element" (both engines had
     // this — `eval_by` only projected a key off a vertex/edge, not a Map).
     let rows = run(

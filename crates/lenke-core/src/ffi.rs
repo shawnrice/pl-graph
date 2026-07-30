@@ -694,7 +694,7 @@ pub unsafe extern "C" fn lnk_create_invariant(
     }
 }
 
-/// Open a transaction frame (R-TX): an atomic mutation boundary with rollback +
+/// Open a transaction frame: an atomic mutation boundary with rollback +
 /// deferred constraint checks. Writes still apply eagerly (read-your-writes), but
 /// record an inverse op; the outermost commit runs the built-in constraint checks
 /// against the fully-staged graph. Nesting joins the outer frame. Returns 0 on

@@ -2426,7 +2426,7 @@ fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]) -> Val {
         // e.g. power(0.7,10) → …4af here vs …4ae in JS; power(2,-0.5) → …bcd vs
         // …bcc. So `power`/`pow`/`^` are NOT byte-identical cross-engine on those
         // inputs; a true fix needs a shared deterministic pow kernel. See
-        // docs/dogfood/findings/round15.md and packages/gql/README.md.
+        // packages/gql/README.md.
         Power => bn(|x, y| x.powf(y)),
         Mod => bn(|x, y| x % y),
         Log => bn(|base, value| value.ln() / base.ln()),
@@ -4580,7 +4580,7 @@ fn visit_pattern(
         // `WHERE this.k=$x` conjunct), falling back to the label bucket / live
         // range. Without this, a comma-joined multi-pattern MATCH bails out of
         // every vectorized (seek-capable) path and full-scans *every* anchor —
-        // the O(n) footgun R-SEED closes; `build_scan` already does this for the
+        // the O(n) footgun multi-anchor index-seed planning closes; `build_scan` already does this for the
         // single-pattern fast path. Postings are live-only in principle, but the
         // index can lag a delete, so re-check liveness (as `build_scan` does).
         //

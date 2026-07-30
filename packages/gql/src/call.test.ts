@@ -192,7 +192,7 @@ describe('inline subquery CALL', () => {
   // Regression: an undeclared YIELD column used to bind silently to `undefined`,
   // so `YIELD nodeId` (or any typo) returned rows with the column simply missing —
   // a silent wrong answer, and a divergence from native, which raises
-  // E_INVALID_VALUE. Found by the round-16 dogfood sim (`_p14_bug.ts`).
+  // E_INVALID_VALUE.
   test('YIELD rejects a column the procedure does not expose', () => {
     // `node` and the single result column are the whole contract.
     expect(() =>

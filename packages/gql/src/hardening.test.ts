@@ -59,7 +59,7 @@ describe('hardening: a bigint param is rejected, not silently mishandled', () =>
     // The numeric model is float64 — a bigint can't bind without precision loss
     // above 2^53, so it is rejected the same way the native FFI boundary rejects
     // it. Previously a bigint param slipped into the comparator and `> $n`
-    // silently dropped every row (round-6 R-BIGINT-MODEL).
+    // silently dropped every row — the numeric model is float64.
     const err = thrown(() => query(g, 'MATCH (n:N) WHERE n.amt > $n RETURN n.amt', { n: 50n }));
     expect(hasErrorCode(err, ErrorCode.InvalidValue)).toBe(true);
 
@@ -70,7 +70,7 @@ describe('hardening: a bigint param is rejected, not silently mishandled', () =>
   });
 });
 
-describe('hardening: a lone-surrogate string param is rejected (round-12 F1)', () => {
+describe('hardening: a lone-surrogate string param is rejected', () => {
   test('an unpaired UTF-16 surrogate $param throws InvalidJson; a valid pair binds', () => {
     const g = new Graph();
 

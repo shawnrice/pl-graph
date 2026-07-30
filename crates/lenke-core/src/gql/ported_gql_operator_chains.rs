@@ -1,5 +1,5 @@
 //! Behavioral golden tests for operator-CHAIN semantics, pinned BEFORE the
-//! n-ary AST flatten refactor (round-12 C1 hardening) so a regression in
+//! n-ary AST flatten refactor (the operator-chain hardening) so a regression in
 //! precedence, associativity, three-valued boolean folding, string-concat null
 //! propagation, error propagation (the evaluator does NOT short-circuit), the
 //! long-chain arithmetic result, or the planner's AND-split index seed is caught.
@@ -13,7 +13,7 @@ use crate::graph::{Graph, Value};
 use crate::ndjson;
 
 /// A prepared statement honours the operator-chain ceiling too: `prepare` uses the
-/// default (10k), `prepare_with_max_chain` overrides it (round-12 C1 follow-up).
+/// default (10k), `prepare_with_max_chain` overrides it.
 #[test]
 fn oc_prepared_statement_ceiling_is_configurable() {
     let over = format!("RETURN {} AS r", vec!["true"; 10_002].join(" AND ")); // 10_001 ops

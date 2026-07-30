@@ -6,7 +6,7 @@ import { deserialize } from '@lenke/serialization';
 import { prepare, query } from './index.js';
 
 // Behavioral golden tests for operator-CHAIN semantics, pinned BEFORE the n-ary
-// AST flatten refactor (round-12 C1 hardening) so a regression in precedence,
+// AST flatten refactor so a regression in precedence,
 // associativity, three-valued boolean folding, concat null propagation, error
 // propagation (the evaluator does NOT short-circuit), the long-chain value, or
 // the planner's AND-split index seed is caught. Mirror of

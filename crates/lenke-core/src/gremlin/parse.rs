@@ -549,7 +549,7 @@ impl Parser {
         // via `emit_before`; until is while-semantics either side). This is also
         // where `repeat` itself is built, so it can pull in any stashed modulator.
         // Post-form (`repeat(body).emit()`) still flows through the match below.
-        // See Priyanka r4: `emit().repeat(out('MEMBER_OF'))` needs the zero-hop start.
+        // Note: `emit().repeat(out('MEMBER_OF'))` needs the zero-hop start.
         let ends_in_repeat = matches!(t.steps.last(), Some(Step::Repeat { .. }));
         match name {
             "emit" if !ends_in_repeat => {

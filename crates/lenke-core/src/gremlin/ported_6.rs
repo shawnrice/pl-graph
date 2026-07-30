@@ -745,7 +745,7 @@ fn p6_group_by_label_by_name() {
 #[test]
 fn p6_group_by_label_by_count() {
     // A reducing value-by (count) folds over the group as a barrier → a single
-    // per-bucket count, not a per-traverser list of 1s (pre-R-GREMLIN-AGG).
+    // per-bucket count, not a per-traverser list of 1s (before local aggregation).
     let out = q(g().V().group().by_label().by_t(super::__().count()));
     let m = as_map(&out[0]);
     let num = |v: &GVal| -> f64 {

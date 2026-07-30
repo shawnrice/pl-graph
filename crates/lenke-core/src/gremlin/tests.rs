@@ -1110,8 +1110,7 @@ fn sack_without_with_sack_faults() {
 /// inexpressible), and `gcmp` had no `Temporal` arm (so once it parsed, ordering
 /// still raised `E_INVALID_VALUE`). Between them, a bitemporal query — the
 /// `vf <= t` slice every as-of read needs — could not be written on this dialect
-/// at all, on the engine the perf guidance recommends as the default. Found by the
-/// round-16 dogfood sim (report §5, `_p38_bridge.ts`).
+/// at all, on the engine the perf guidance recommends as the default.
 #[test]
 fn text_dialect_temporal_literals_and_ordering() {
     let mut g = ndjson::decode(

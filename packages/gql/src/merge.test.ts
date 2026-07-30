@@ -182,9 +182,8 @@ describe('GQL: _MERGE (keyed upsert, node form)', () => {
   // upsert an edge between two known vertices. Regression: resolveMergeEndpoint
   // ignored the binding and re-inferred a unique key from the (empty) node
   // pattern, so the bound-variable edge-merge form was unusable (it threw
-  // "_MERGE needs a unique constraint on the pattern's label(s) []"). Found by the
-  // round-16 dogfood sim (ScenarioForge). Mirrors the native
-  // `merge_edge_between_bound_endpoints_upserts` test for byte-identity.
+  // "_MERGE needs a unique constraint on the pattern's label(s) []"). Mirrors the
+  // native `merge_edge_between_bound_endpoints_upserts` test for byte-identity.
   test('edge form: upserts between bound endpoints (create then update)', () => {
     const g = new Graph();
     g.addVertex({ id: 'a', labels: ['A'], properties: { id: 'a' } });

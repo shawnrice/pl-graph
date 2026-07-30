@@ -18,11 +18,11 @@ the type system. What it barely touches is the **write / schema / transaction**
 layer: no `MERGE`/upsert, no constraint DDL, transactions largely
 implementation-defined, no temporal types. (Transactions are now implemented at
 the core as an engine-neutral host API — `graph.transaction(fn)` / `graph.tx()`,
-matching how Gremlin exposes them — see `docs/design/r-tx.md`. GQL's ISO
+matching how Gremlin exposes them — see `docs/design/transactions.md`. GQL's ISO
 `START TRANSACTION`/`COMMIT`/`ROLLBACK` keywords are a planned thin veneer over
 those primitives, not invented syntax.) Every graph vendor (Neo4j, Ultipa,
 TigerGraph, SQL Server) fills those gaps with **mutually incompatible,
-non-conformant extensions** (see the research summarized in `docs/dogfood/` and
+non-conformant extensions** (see
 the memory `iso-gql-reference`). When the whole field is extending in different
 directions, the standard is not yet carrying that weight.
 
@@ -127,7 +127,7 @@ not created. Concretely:
 
 **Deliberately deferred to v2: multi-create compound patterns** (where any
 element in the path may be created). That case needs per-element dispositions and
-leans on multi-anchor index-seed planning (the shipped `R-SEED` work).
+leans on multi-anchor index-seed planning (the shipped index-seed planner).
 It is out of scope because the performance, predictability, and — especially — the
 _conflict ergonomics_ of multi-element create are exactly where Cypher's MERGE
 becomes a foot-cannon. v1 stays bounded, footgun-free, and covers the two use

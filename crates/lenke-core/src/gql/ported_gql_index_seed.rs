@@ -380,10 +380,10 @@ fn idx_multi_hop_seeds_from_selective_end() {
 }
 
 // ===========================================================================
-// Multi-anchor comma patterns (R-SEED)
+// Multi-anchor comma patterns (index-seed planning)
 //
 // A comma-joined MATCH `(a {..}), (b {..})` is a nested-loop cross-join; before
-// R-SEED it bailed out of every vectorized (seek-capable) path and full-scanned
+// multi-anchor index-seed planning it bailed out of every vectorized (seek-capable) path and full-scanned
 // *every* anchor — an O(n) footgun on a large graph. These lock in that each
 // anchor now seeds from its property index (inline props AND WHERE conjuncts),
 // byte-identical to the scan fallback, and that unseedable predicates still fall

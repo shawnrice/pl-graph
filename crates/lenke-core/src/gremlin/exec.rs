@@ -1086,8 +1086,8 @@ fn unary_math_fn(name: &str) -> Option<fn(f64) -> f64> {
 /// Dispatch a `math()` function call. `b` is `Some` for the 2-arg forms
 /// (`atan2`/`pow`/`log`), which REQUIRE parens — the bare form is unary-only.
 /// `pow` inherits GQL's `Power`: `x.powf(y)` matches JS `x ** y` except for a
-/// ≤1-ULP glibc-`powf`-vs-V8-`pow` difference on some inputs (see
-/// `docs/dogfood/findings/round15.md` — a documented won't-fix). Arity mismatch
+/// ≤1-ULP glibc-`powf`-vs-V8-`pow` difference on some inputs (a documented
+/// won't-fix). Arity mismatch
 /// → `None` (fault). Note: `log(base, value)` and `ln` (natural) follow GQL
 /// naming; TinkerPop/mXparser spells natural log `log`.
 fn math_call(name: &str, a: f64, b: Option<f64>) -> Option<f64> {
