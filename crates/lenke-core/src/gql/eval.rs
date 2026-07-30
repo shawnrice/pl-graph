@@ -2171,17 +2171,31 @@ fn eval_aggregate(
             }
         });
     }
-    let temporal = values
-        .first()
-        .is_some_and(|v| matches!(v, Val::Temporal(_)));
+    // Determine the group's aggregate type by scanning ALL values, not just the
+    // first — order-independent, matching the TS engine. Checking only `first()`
+    // made `sum([5, DATE])` take the numeric arm (coercing DATE → NaN → null) while
+    // TS threw, and made the result depend on scan order.
+    let has_temporal = values.iter().any(|v| matches!(v, Val::Temporal(_)));
+    let has_list = values.iter().any(|v| matches!(v, Val::List(_)));
     match func {
         AggFn::Count => Val::Num(values.len() as f64),
-        // `sum` over DURATIONs computes; over a non-summable temporal it faults.
-        AggFn::Sum if temporal => temporal_values_sum(&values, env.ctx),
+        // `sum` over DURATIONs computes; any non-DURATION temporal (or a numeric
+        // mixed in) faults via `temporal_values_sum`.
+        AggFn::Sum if has_temporal => temporal_values_sum(&values, env.ctx),
+        // A list/map isn't summable — fault loud (matches TS `nonNumericAgg`) rather
+        // than coercing it to NaN → null.
+        AggFn::Sum if has_list => {
+            env.ctx.set_fault(FAULT_NONNUMERIC_AGG);
+            Val::Null
+        }
         AggFn::Sum => Val::Num(values.iter().filter_map(num_of).sum()),
         // `avg` over any temporal faults (needs unrepresentable duration÷count).
-        AggFn::Avg if temporal => {
+        AggFn::Avg if has_temporal => {
             env.ctx.set_fault(FAULT_TEMPORAL_AGG);
+            Val::Null
+        }
+        AggFn::Avg if has_list => {
+            env.ctx.set_fault(FAULT_NONNUMERIC_AGG);
             Val::Null
         }
         AggFn::Avg => {

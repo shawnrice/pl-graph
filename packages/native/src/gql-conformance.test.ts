@@ -115,6 +115,24 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(ts).toBe(`[{"lo":null,"hi":null}]`);
   });
 
+  test('sum/avg over a mixed numeric+temporal group faults in both engines', () => {
+    // p is a number on one T and a DATE on another — an unsummable heterogeneous
+    // group. Rust once checked only the first value (numeric) → DATE coerced to
+    // NaN → null (no error), while TS scanned all values and threw. Now Rust scans
+    // all values too, so both fault (order-independent).
+    const mixed = [
+      '{"type":"node","id":"1","labels":["T"],"properties":{"p":5}}',
+      '{"type":"node","id":"2","labels":["T"],"properties":{"p":{"@date":"2020-01-01"}}}',
+    ].join('\n');
+    const nat = graphFromFormat(backend, mixed, 'ndjson');
+    const ts = tsDeserialize(mixed, 'ndjson', new Graph());
+
+    for (const q of [`MATCH (n:T) RETURN sum(n.p) AS x`, `MATCH (n:T) RETURN avg(n.p) AS x`]) {
+      expect(() => tsQuery(ts, q)).toThrow();
+      expect(() => nat.query(q)).toThrow();
+    }
+  });
+
   test('RETURN n — rich node object, byte-identical, keys sorted', () => {
     const q = `MATCH (n:Person {name: 'marko'}) RETURN n`;
     const [ts, native] = both(q);
