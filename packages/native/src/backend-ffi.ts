@@ -129,6 +129,25 @@ const asHandle = (p: Pointer | null): GraphHandle => p as unknown as GraphHandle
  * Load the native dynamic library over `bun:ffi`. Pass the absolute path to the
  * built `liblenke_core.{dylib,so,dll}` (see `build:rust`).
  */
+// Turn a constraint-creation FFI return code into a coded error (or nothing on
+// success): -2 = the current data already violates it; any other non-zero = an
+// FFI fault. Shared by every create*Constraint below so the message shape lives
+// in one place.
+const throwConstraintResult = (op: string, kind: string, args: string, r: number): void => {
+  if (r === -2) {
+    throw new LenkeError(
+      `lenke: ${op}(${args}): existing data already violates the ${kind} constraint`,
+      {
+        code: ErrorCode.ConstraintViolation,
+      },
+    );
+  }
+
+  if (r !== 0) {
+    throw new LenkeError(`lenke: ${op} failed`, { code: ErrorCode.Ffi });
+  }
+};
+
 export const createFfiBackend = (libPath: string): Backend => {
   const { symbols } = dlopen(libPath, SYMBOLS);
 
@@ -281,16 +300,7 @@ export const createFfiBackend = (libPath: string): Backend => {
         k.byteLength,
       );
 
-      if (r === -2) {
-        throw new LenkeError(
-          `lenke: createUniqueConstraint(${label}, ${key}): existing data already violates the unique constraint`,
-          { code: ErrorCode.ConstraintViolation },
-        );
-      }
-
-      if (r !== 0) {
-        throw new LenkeError('lenke: createUniqueConstraint failed', { code: ErrorCode.Ffi });
-      }
+      throwConstraintResult('createUniqueConstraint', 'unique', `${label}, ${key}`, r);
     },
     createRequiredConstraint: (handle, label, key) => {
       const l = encoder.encode(label);
@@ -303,16 +313,7 @@ export const createFfiBackend = (libPath: string): Backend => {
         k.byteLength,
       );
 
-      if (r === -2) {
-        throw new LenkeError(
-          `lenke: createRequiredConstraint(${label}, ${key}): existing data already violates the required constraint`,
-          { code: ErrorCode.ConstraintViolation },
-        );
-      }
-
-      if (r !== 0) {
-        throw new LenkeError('lenke: createRequiredConstraint failed', { code: ErrorCode.Ffi });
-      }
+      throwConstraintResult('createRequiredConstraint', 'required', `${label}, ${key}`, r);
     },
     createTypeConstraint: (handle, label, key, type) => {
       const l = encoder.encode(label);
@@ -328,22 +329,13 @@ export const createFfiBackend = (libPath: string): Backend => {
         t.byteLength,
       );
 
-      if (r === -2) {
-        throw new LenkeError(
-          `lenke: createTypeConstraint(${label}, ${key}, ${type}): existing data already violates the type constraint`,
-          { code: ErrorCode.ConstraintViolation },
-        );
-      }
-
       if (r === -3) {
         throw new LenkeError(`lenke: createTypeConstraint: unknown scalar type '${type}'`, {
           code: ErrorCode.InvalidValue,
         });
       }
 
-      if (r !== 0) {
-        throw new LenkeError('lenke: createTypeConstraint failed', { code: ErrorCode.Ffi });
-      }
+      throwConstraintResult('createTypeConstraint', 'type', `${label}, ${key}, ${type}`, r);
     },
     createEdgeUniqueConstraint: (handle, edgeType, key) => {
       const l = encoder.encode(edgeType);
@@ -356,16 +348,7 @@ export const createFfiBackend = (libPath: string): Backend => {
         k.byteLength,
       );
 
-      if (r === -2) {
-        throw new LenkeError(
-          `lenke: createEdgeUniqueConstraint(${edgeType}, ${key}): existing data already violates the unique constraint`,
-          { code: ErrorCode.ConstraintViolation },
-        );
-      }
-
-      if (r !== 0) {
-        throw new LenkeError('lenke: createEdgeUniqueConstraint failed', { code: ErrorCode.Ffi });
-      }
+      throwConstraintResult('createEdgeUniqueConstraint', 'unique', `${edgeType}, ${key}`, r);
     },
     createEdgeRequiredConstraint: (handle, edgeType, key) => {
       const l = encoder.encode(edgeType);
@@ -378,16 +361,7 @@ export const createFfiBackend = (libPath: string): Backend => {
         k.byteLength,
       );
 
-      if (r === -2) {
-        throw new LenkeError(
-          `lenke: createEdgeRequiredConstraint(${edgeType}, ${key}): existing data already violates the required constraint`,
-          { code: ErrorCode.ConstraintViolation },
-        );
-      }
-
-      if (r !== 0) {
-        throw new LenkeError('lenke: createEdgeRequiredConstraint failed', { code: ErrorCode.Ffi });
-      }
+      throwConstraintResult('createEdgeRequiredConstraint', 'required', `${edgeType}, ${key}`, r);
     },
     createEdgeTypeConstraint: (handle, edgeType, key, type) => {
       const l = encoder.encode(edgeType);
@@ -403,22 +377,13 @@ export const createFfiBackend = (libPath: string): Backend => {
         t.byteLength,
       );
 
-      if (r === -2) {
-        throw new LenkeError(
-          `lenke: createEdgeTypeConstraint(${edgeType}, ${key}, ${type}): existing data already violates the type constraint`,
-          { code: ErrorCode.ConstraintViolation },
-        );
-      }
-
       if (r === -3) {
         throw new LenkeError(`lenke: createEdgeTypeConstraint: unknown scalar type '${type}'`, {
           code: ErrorCode.InvalidValue,
         });
       }
 
-      if (r !== 0) {
-        throw new LenkeError('lenke: createEdgeTypeConstraint failed', { code: ErrorCode.Ffi });
-      }
+      throwConstraintResult('createEdgeTypeConstraint', 'type', `${edgeType}, ${key}, ${type}`, r);
     },
     createCardinalityConstraint: (handle, label, edgeType, direction, min, max) => {
       const l = encoder.encode(label);
