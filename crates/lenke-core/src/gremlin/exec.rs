@@ -1588,38 +1588,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         Step::Is(pred) => stream.into_iter().filter(|t| p_matches(pred, &t.val)).collect(),
         Step::SimplePath => stream.into_iter().filter(|t| !has_dup(&t.path)).collect(),
         Step::CyclicPath => stream.into_iter().filter(|t| has_dup(&t.path)).collect(),
-        Step::Dedupe { labels, bys } => {
-            // Key on: the tuple of values tagged at `labels` (`dedup('a','b')`),
-            // else the tuple of `by` modulators (`dedup().by(...)`), else the
-            // current value. A hash set on the hashable projection makes this
-            // O(n); the old `Vec::contains` scan was O(n²).
-            let mut seen: HashSet<Vec<DedupKey>> = HashSet::new();
-            let mut next = Vec::new();
-            for t in stream {
-                let key: Vec<GVal> = if !labels.is_empty() {
-                    labels
-                        .iter()
-                        .map(|l| t.recall(l, Pop::Last).unwrap_or(GVal::Null))
-                        .collect()
-                } else if bys.is_empty() {
-                    vec![t.val.clone()]
-                } else {
-                    bys.iter().map(|by| eval_by(graph, ctx, by, &t.val)).collect()
-                };
-                match key.iter().map(dedup_key).collect::<Option<Vec<DedupKey>>>() {
-                    // A NaN anywhere in the key is never equal to anything (NaN !=
-                    // NaN), so it can't be a duplicate — pass it straight through,
-                    // exactly as the old structural `Vec::contains` scan did.
-                    None => next.push(t),
-                    Some(dk) => {
-                        if seen.insert(dk) {
-                            next.push(t);
-                        }
-                    }
-                }
-            }
-            next
-        }
+        Step::Dedupe { labels, bys } => apply_dedupe(graph, ctx, labels, bys, stream),
 
         // --- projection ---
         Step::Values(keys) => {
@@ -1732,20 +1701,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 t.with(GVal::Map(entries))
             })
             .collect(),
-        Step::Tree(bys) => {
-            // Build a nested map from each traverser's path.
-            let mut root: Vec<(GVal, GVal)> = Vec::new();
-            for t in &stream {
-                let keys: Vec<GVal> = t
-                    .path
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| if bys.is_empty() { v.clone() } else { eval_by(graph, ctx, &bys[i % bys.len()], v) })
-                    .collect();
-                insert_tree(&mut root, &keys);
-            }
-            vec![Trav::root(GVal::Map(root))]
-        }
+        Step::Tree(bys) => apply_tree(graph, ctx, bys, stream),
 
         // --- cardinality ---
         Step::Limit(n, Scope::Global) => stream.into_iter().take(*n).collect(),
@@ -1763,21 +1719,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             let start = e.len().saturating_sub(*n);
             vec![GVal::List(e[start..].to_vec())]
         }),
-        Step::Sample(n) => {
-            // A pseudo-random sample (partial Fisher-Yates), NOT a prefix. The
-            // fixed-seed Mulberry32 makes it reproducible and byte-identical with
-            // the TS engine's `sampleStep`, which runs the same shuffle.
-            let mut buf = stream;
-            let len = buf.len();
-            let k = (*n).min(len);
-            let mut rng = Mulberry32::new(SAMPLE_SEED);
-            for i in 0..k {
-                let j = i + (rng.next_f64() * (len - i) as f64) as usize;
-                buf.swap(i, j);
-            }
-            buf.truncate(k);
-            buf
-        }
+        Step::Sample(n) => apply_sample(*n, stream),
 
         // --- aggregates ---
         Step::Count(Scope::Global) => vec![Trav::root(GVal::Num(stream.len() as f64))],
@@ -1791,79 +1733,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         Step::Min(Scope::Local) => map_step(stream, |t| vec![local_extreme(&t.val, Ordering::Less)]),
         Step::Max(Scope::Global) => fold_extreme(stream, Ordering::Greater),
         Step::Max(Scope::Local) => map_step(stream, |t| vec![local_extreme(&t.val, Ordering::Greater)]),
-        Step::Order(bys, desc, scope) => {
-            let bys: Vec<By> = if bys.is_empty() { vec![By::Identity(None)] } else { bys.clone() };
-
-            // Compare two by-projected key vectors under the per-by direction.
-            let cmp_keys = |ka: &[GVal], kb: &[GVal]| -> Ordering {
-                for (i, by) in bys.iter().enumerate() {
-                    let dir = by.direction().unwrap_or(if *desc { Order::Desc } else { Order::Asc });
-                    let mut o = cmp_or_fault(&ka[i], &kb[i]).unwrap_or(Ordering::Equal);
-                    if dir == Order::Desc {
-                        o = o.reverse();
-                    }
-                    if o != Ordering::Equal {
-                        return o;
-                    }
-                }
-                Ordering::Equal
-            };
-
-            match scope {
-                // Local: sort WITHIN each traverser's value — a Map's entries by
-                // their VALUE (the groupCount top-N idiom; Column-parameterized
-                // by(values)/by(keys) isn't modeled → local order on a Map is by
-                // value), or a list's elements. A scalar has nothing to sort.
-                Scope::Local => stream
-                    .into_iter()
-                    .map(|t| {
-                        let val = match &t.val {
-                            GVal::Map(entries) => {
-                                // Sort a Map's entries. `by(keys)` sorts on the entry
-                                // KEY, `by(values)` (the default) on its VALUE, and a
-                                // key/traversal by projects out of the value.
-                                let mut es: Vec<(Vec<GVal>, (GVal, GVal))> = entries
-                                    .iter()
-                                    .map(|(k, v)| {
-                                        let key: Vec<GVal> = bys
-                                            .iter()
-                                            .map(|by| match by {
-                                                By::Column(Column::Keys, _) => k.clone(),
-                                                By::Column(Column::Values, _) => v.clone(),
-                                                _ => eval_by(graph, ctx, by, v),
-                                            })
-                                            .collect();
-                                        (key, (k.clone(), v.clone()))
-                                    })
-                                    .collect();
-                                es.sort_by(|(ka, _), (kb, _)| cmp_keys(ka, kb));
-                                GVal::Map(es.into_iter().map(|(_, e)| e).collect())
-                            }
-                            GVal::List(items) => {
-                                let mut xs: Vec<(Vec<GVal>, GVal)> = items
-                                    .iter()
-                                    .map(|x| (bys.iter().map(|by| eval_by(graph, ctx, by, x)).collect(), x.clone()))
-                                    .collect();
-                                xs.sort_by(|(ka, _), (kb, _)| cmp_keys(ka, kb));
-                                GVal::List(xs.into_iter().map(|(_, x)| x).collect())
-                            }
-                            _ => return t,
-                        };
-                        t.step(val)
-                    })
-                    .collect(),
-                // Global: sort the traversers across the stream by their value.
-                Scope::Global => {
-                    // Precompute sort keys (eval_by needs &mut; not usable in the comparator).
-                    let mut keyed: Vec<(Vec<GVal>, Trav)> = stream
-                        .into_iter()
-                        .map(|t| (bys.iter().map(|by| eval_by(graph, ctx, by, &t.val)).collect(), t))
-                        .collect();
-                    keyed.sort_by(|(ka, _), (kb, _)| cmp_keys(ka, kb));
-                    keyed.into_iter().map(|(_, t)| t).collect()
-                }
-            }
-        }
+        Step::Order(bys, desc, scope) => apply_order(graph, ctx, bys, *desc, scope, stream),
         Step::Group(bys) => {
             let key_by = bys.first().cloned().unwrap_or(By::Identity(None));
             let val_by = bys.get(1).cloned().unwrap_or(By::Identity(None));
@@ -2442,6 +2312,192 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             }
         }
     }
+}
+
+/// `tree()`: fold every traverser's path into one nested map, keyed level by
+/// level (by the `by`-projected step values, or the raw values by default).
+fn apply_tree(graph: &mut Graph, ctx: &mut Ctx, bys: &[By], stream: Vec<Trav>) -> Vec<Trav> {
+    // Build a nested map from each traverser's path.
+    let mut root: Vec<(GVal, GVal)> = Vec::new();
+    for t in &stream {
+        let keys: Vec<GVal> = t
+            .path
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                if bys.is_empty() {
+                    v.clone()
+                } else {
+                    eval_by(graph, ctx, &bys[i % bys.len()], v)
+                }
+            })
+            .collect();
+        insert_tree(&mut root, &keys);
+    }
+    vec![Trav::root(GVal::Map(root))]
+}
+
+/// `dedup([labels]).by(...)`: keep the first traverser per distinct key — the
+/// tuple of values tagged at `labels`, else the `by`-modulator tuple, else the
+/// current value. A hash set on the hashable projection makes it O(n); a NaN in
+/// the key is never a duplicate (NaN != NaN) so it passes straight through.
+fn apply_dedupe(
+    graph: &mut Graph,
+    ctx: &mut Ctx,
+    labels: &[String],
+    bys: &[By],
+    stream: Vec<Trav>,
+) -> Vec<Trav> {
+    // Key on: the tuple of values tagged at `labels` (`dedup('a','b')`),
+    // else the tuple of `by` modulators (`dedup().by(...)`), else the
+    // current value. A hash set on the hashable projection makes this
+    // O(n); the old `Vec::contains` scan was O(n²).
+    let mut seen: HashSet<Vec<DedupKey>> = HashSet::new();
+    let mut next = Vec::new();
+    for t in stream {
+        let key: Vec<GVal> = if !labels.is_empty() {
+            labels
+                .iter()
+                .map(|l| t.recall(l, Pop::Last).unwrap_or(GVal::Null))
+                .collect()
+        } else if bys.is_empty() {
+            vec![t.val.clone()]
+        } else {
+            bys.iter()
+                .map(|by| eval_by(graph, ctx, by, &t.val))
+                .collect()
+        };
+        match key.iter().map(dedup_key).collect::<Option<Vec<DedupKey>>>() {
+            // A NaN anywhere in the key is never equal to anything (NaN !=
+            // NaN), so it can't be a duplicate — pass it straight through,
+            // exactly as the old structural `Vec::contains` scan did.
+            None => next.push(t),
+            Some(dk) => {
+                if seen.insert(dk) {
+                    next.push(t);
+                }
+            }
+        }
+    }
+    next
+}
+
+/// `order(...)`: sort the stream (Global) or, for `Scope::Local`, within each
+/// traverser's value (a Map's entries / a list's elements) by the by-projected
+/// keys under each by's direction.
+fn apply_order(
+    graph: &mut Graph,
+    ctx: &mut Ctx,
+    bys: &[By],
+    desc: bool,
+    scope: &Scope,
+    stream: Vec<Trav>,
+) -> Vec<Trav> {
+    let bys: Vec<By> = if bys.is_empty() {
+        vec![By::Identity(None)]
+    } else {
+        bys.to_vec()
+    };
+
+    // Compare two by-projected key vectors under the per-by direction.
+    let cmp_keys = |ka: &[GVal], kb: &[GVal]| -> Ordering {
+        for (i, by) in bys.iter().enumerate() {
+            let dir = by
+                .direction()
+                .unwrap_or(if desc { Order::Desc } else { Order::Asc });
+            let mut o = cmp_or_fault(&ka[i], &kb[i]).unwrap_or(Ordering::Equal);
+            if dir == Order::Desc {
+                o = o.reverse();
+            }
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        Ordering::Equal
+    };
+
+    match scope {
+        // Local: sort WITHIN each traverser's value — a Map's entries by
+        // their VALUE (the groupCount top-N idiom; Column-parameterized
+        // by(values)/by(keys) isn't modeled → local order on a Map is by
+        // value), or a list's elements. A scalar has nothing to sort.
+        Scope::Local => stream
+            .into_iter()
+            .map(|t| {
+                let val = match &t.val {
+                    GVal::Map(entries) => {
+                        // Sort a Map's entries. `by(keys)` sorts on the entry
+                        // KEY, `by(values)` (the default) on its VALUE, and a
+                        // key/traversal by projects out of the value.
+                        let mut es: Vec<(Vec<GVal>, (GVal, GVal))> = entries
+                            .iter()
+                            .map(|(k, v)| {
+                                let key: Vec<GVal> = bys
+                                    .iter()
+                                    .map(|by| match by {
+                                        By::Column(Column::Keys, _) => k.clone(),
+                                        By::Column(Column::Values, _) => v.clone(),
+                                        _ => eval_by(graph, ctx, by, v),
+                                    })
+                                    .collect();
+                                (key, (k.clone(), v.clone()))
+                            })
+                            .collect();
+                        es.sort_by(|(ka, _), (kb, _)| cmp_keys(ka, kb));
+                        GVal::Map(es.into_iter().map(|(_, e)| e).collect())
+                    }
+                    GVal::List(items) => {
+                        let mut xs: Vec<(Vec<GVal>, GVal)> = items
+                            .iter()
+                            .map(|x| {
+                                (
+                                    bys.iter().map(|by| eval_by(graph, ctx, by, x)).collect(),
+                                    x.clone(),
+                                )
+                            })
+                            .collect();
+                        xs.sort_by(|(ka, _), (kb, _)| cmp_keys(ka, kb));
+                        GVal::List(xs.into_iter().map(|(_, x)| x).collect())
+                    }
+                    _ => return t,
+                };
+                t.step(val)
+            })
+            .collect(),
+        // Global: sort the traversers across the stream by their value.
+        Scope::Global => {
+            // Precompute sort keys (eval_by needs &mut; not usable in the comparator).
+            let mut keyed: Vec<(Vec<GVal>, Trav)> = stream
+                .into_iter()
+                .map(|t| {
+                    (
+                        bys.iter()
+                            .map(|by| eval_by(graph, ctx, by, &t.val))
+                            .collect(),
+                        t,
+                    )
+                })
+                .collect();
+            keyed.sort_by(|(ka, _), (kb, _)| cmp_keys(ka, kb));
+            keyed.into_iter().map(|(_, t)| t).collect()
+        }
+    }
+}
+
+/// `sample(k)`: a pseudo-random sample (partial Fisher-Yates), NOT a prefix. The
+/// fixed-seed Mulberry32 makes it reproducible and byte-identical with the TS
+/// engine's `sampleStep`, which runs the same shuffle.
+fn apply_sample(n: usize, stream: Vec<Trav>) -> Vec<Trav> {
+    let mut buf = stream;
+    let len = buf.len();
+    let k = n.min(len);
+    let mut rng = Mulberry32::new(SAMPLE_SEED);
+    for i in 0..k {
+        let j = i + (rng.next_f64() * (len - i) as f64) as usize;
+        buf.swap(i, j);
+    }
+    buf.truncate(k);
+    buf
 }
 
 /// Merge a projected value into the sack: `newSack = op(currentSack, projected)`.
