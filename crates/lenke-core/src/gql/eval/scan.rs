@@ -1156,7 +1156,11 @@ pub(super) fn group_ids(
     let mut ngroups = 1; // global group (overwritten once any key column refines)
     for &item in key_items {
         let col = key_raw_col(graph, ctx, sc, item)?;
-        let mut map: HashMap<(usize, Option<u64>), usize> = HashMap::new();
+        // FxHash, not SipHash: this refines groups by hashing a short key per row —
+        // exactly the case the module's FxHash was introduced for. Group numbering
+        // is by first-appearance in row order, so iteration order is irrelevant →
+        // byte-identity-safe. (See the FxHasher rationale in `eval.rs`.)
+        let mut map: FxHashMap<(usize, Option<u64>), usize> = FxHashMap::default();
         let mut next = 0usize;
         let mut refined = vec![0usize; n];
         for i in 0..n {
@@ -1240,7 +1244,9 @@ pub(super) fn fused_global_agg(
             return None; // sum/avg/min/max DISTINCT stay scalar
         }
         let bits = raw_bits_of(graph, ctx, sc, spec.arg.as_ref()?)?;
-        let seen: std::collections::HashSet<u64> = bits.into_iter().flatten().collect();
+        // FxHash: a per-row insert to count distinct values (membership only → order
+        // irrelevant → byte-identity-safe).
+        let seen: FxHashSet<u64> = bits.into_iter().flatten().collect();
         return Some(Val::Num(seen.len() as f64));
     }
     if spec.func == AggFn::Count && spec.star {
@@ -1903,7 +1909,8 @@ pub(super) fn project_frame_cols(
     if proj.distinct {
         // Generic DISTINCT (expression / non-typed items): keep the first
         // occurrence of each row in scan order, dedup on a composite cell key.
-        let mut seen: HashSet<String> = HashSet::new();
+        // FxHash: membership only; the kept order comes from the scan, not the set.
+        let mut seen: FxHashSet<String> = FxHashSet::default();
         let skip = proj.skip_val(ctx);
         let mut seen_count = 0usize;
         let mut kept: Vec<usize> = Vec::new();

@@ -866,7 +866,7 @@ pub(super) fn try_grouped_varlen_1_2(
 
     // Accumulate group counts (order-independent): endpoints matching Lb with a
     // positive multiplicity, keyed by the `val_key` of their group-key values.
-    let mut groups: HashMap<String, (Vec<Val>, i64)> = HashMap::new();
+    let mut groups: FxHashMap<String, (Vec<Val>, i64)> = FxHashMap::default();
     let mut bb = Binding(vec![None; b_slot + 1]);
     let mut key_buf = String::new();
     for b in 0..n as u32 {
@@ -891,7 +891,7 @@ pub(super) fn try_grouped_varlen_1_2(
     // Recover first-seen group order by replaying the scalar walk order until every
     // group has appeared (the group set is already fixed by `groups`).
     let target = groups.len();
-    let mut seen: HashSet<String> = HashSet::with_capacity(target);
+    let mut seen: FxHashSet<String> = HashSet::with_capacity_and_hasher(target, Default::default());
     let mut order: Vec<String> = Vec::with_capacity(target);
     let mut faulted = false;
     for_each_seed(graph, &ctx, la, &mut |a| {
@@ -1066,7 +1066,7 @@ pub(super) fn try_grouped_2hop(
 
     // Accumulate group counts, then recover first-seen order (both share the tail
     // shape with `try_grouped_varlen_1_2`).
-    let mut groups: HashMap<String, (Vec<Val>, i64)> = HashMap::new();
+    let mut groups: FxHashMap<String, (Vec<Val>, i64)> = FxHashMap::default();
     let mut bb = Binding(vec![None; c_slot + 1]);
     let mut key_buf = String::new();
     for c in 0..n as u32 {
@@ -1089,7 +1089,7 @@ pub(super) fn try_grouped_2hop(
     }
 
     let target = groups.len();
-    let mut seen: HashSet<String> = HashSet::with_capacity(target);
+    let mut seen: FxHashSet<String> = HashSet::with_capacity_and_hasher(target, Default::default());
     let mut order: Vec<String> = Vec::with_capacity(target);
     'seeds: for a in {
         let mut starts: Vec<u32> = Vec::new();
@@ -1352,7 +1352,7 @@ pub(super) fn try_count_semi_join(
     // Distinct `a`s reachable back from the `Lb` bucket over `T`. For `(a)-[:T]->b`
     // (Out) `a` is `b`'s in-neighbor; for `(a)<-[:T]-b` (In) `a` is `b`'s out-neighbor.
     let out_side = rel.direction == Direction::In;
-    let mut preds: HashSet<u32> = HashSet::new();
+    let mut preds: FxHashSet<u32> = FxHashSet::default();
     for &b in lb_bucket {
         if !matches_label(graph, &ctx, b, lb) {
             continue; // conjunct label: the bucket is only a superset
@@ -1693,7 +1693,7 @@ pub(super) fn try_reachable_distinct(
 
     // rows_mode: project the endpoint per reached vertex, dedup the output tuples.
     let mut rs = RowSet::new(proj.out_names.clone());
-    let mut seen_rows: HashSet<String> = HashSet::new();
+    let mut seen_rows: FxHashSet<String> = FxHashSet::default();
     for &v in &reached {
         if !matches_label(graph, &ctx, v, lb) {
             continue;

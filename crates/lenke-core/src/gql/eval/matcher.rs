@@ -465,11 +465,11 @@ pub(super) struct Agg {
     sum_sq: f64,
     extreme: Option<Val>,
     list: Vec<Val>,
-    seen: HashSet<String>,
+    seen: FxHashSet<String>,
     /// DISTINCT fast path for element values: a node/edge is identified by its
     /// dense id, so dedup by a tagged `u64` (no per-value string key). Scalars fall
     /// back to `seen`.
-    seen_ids: HashSet<u64>,
+    seen_ids: FxHashSet<u64>,
     /// Percentile fraction (clamped `[0, 1]`); unused by other aggregates.
     frac: f64,
 }
@@ -491,8 +491,8 @@ impl Agg {
             sum_sq: 0.0,
             extreme: None,
             list: Vec::new(),
-            seen: HashSet::new(),
-            seen_ids: HashSet::new(),
+            seen: FxHashSet::default(),
+            seen_ids: FxHashSet::default(),
             frac: spec.frac.unwrap_or(0.0),
         }
     }
@@ -968,7 +968,7 @@ impl<'p> ProjAccum<'p> {
                     self.rows.push((projected, keys));
                 }
                 if proj.distinct {
-                    let mut seen = HashSet::new();
+                    let mut seen: FxHashSet<String> = FxHashSet::default();
                     self.rows.retain(|(b, _)| seen.insert(row_key(b)));
                 }
             }

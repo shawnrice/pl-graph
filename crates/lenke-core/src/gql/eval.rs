@@ -2162,8 +2162,8 @@ fn eval_aggregate(
     let mut values: Vec<Val> = raw.into_iter().filter(|v| !is_nullish(v)).collect();
     if distinct {
         // Mirror Agg::step: dedup element values by dense id, scalars by `val_key`.
-        let mut seen = HashSet::new();
-        let mut seen_ids = HashSet::new();
+        let mut seen: FxHashSet<String> = FxHashSet::default();
+        let mut seen_ids: FxHashSet<u64> = FxHashSet::default();
         values.retain(|v| match v {
             Val::Node(i) => seen_ids.insert(*i as u64),
             Val::Edge(i) => seen_ids.insert(*i as u64 | EDGE_ID_TAG),
@@ -3612,7 +3612,7 @@ fn project_to_rows(
     // Fast path: project each row straight into the flat cell buffer — no
     // intermediate per-row Vec, no second conversion pass.
     let cap = proj.limit_val(ctx).map(|l| proj.skip_val(ctx) + l);
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: FxHashSet<String> = FxHashSet::default();
     let simple = single_simple_clause(matches);
     for inb in incoming {
         let mut work = inb.clone();
