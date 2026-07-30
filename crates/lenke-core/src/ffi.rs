@@ -571,9 +571,10 @@ pub unsafe extern "C" fn lnk_create_edge_type_constraint(
 /// Declare a CARDINALITY constraint bounding the degree of every vertex carrying
 /// `label` over `etype` in `direction` (0 = out / the vertex is the edge source,
 /// 1 = in / the target) to `min..=max`, where `max < 0` means unbounded. Existing
-/// data is scanned at declare time. Returns **0** on success, **-1** if the
-/// current data already violates it (surfaced as `ConstraintViolation` by the
-/// caller), and **-2** on a null graph / bad-UTF-8 slice.
+/// data is scanned at declare time. Returns **0** on success, **-1** on a null
+/// graph / bad-UTF-8 slice, and **-2** if the current data already violates it
+/// (surfaced as `ConstraintViolation` by the caller) — the same code convention
+/// as the other `lnk_create_*_constraint` builders.
 ///
 /// # Safety
 /// `g` is a valid, uniquely-borrowed `*mut Graph`; both ptr/len pairs are valid
@@ -597,12 +598,12 @@ pub unsafe extern "C" fn lnk_create_cardinality_constraint(
         // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
         unsafe { in_str(etype_ptr, etype_len) },
     ) else {
-        return -2;
+        return -1;
     };
     let max_opt = if max < 0 { None } else { Some(max as u32) };
     match g.create_cardinality_constraint(label, etype, direction, min, max_opt) {
         Ok(()) => 0,
-        Err(_) => -1,
+        Err(_) => -2,
     }
 }
 

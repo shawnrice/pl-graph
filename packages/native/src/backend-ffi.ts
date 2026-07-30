@@ -374,16 +374,12 @@ export const createFfiBackend = (libPath: string): Backend => {
         BigInt(max ?? -1),
       );
 
-      if (r === -1) {
-        throw new LenkeError(
-          `lenke: createCardinalityConstraint(${label}, ${edgeType}, ${direction}): existing data already violates the cardinality constraint`,
-          { code: ErrorCode.ConstraintViolation },
-        );
-      }
-
-      if (r !== 0) {
-        throw new LenkeError('lenke: createCardinalityConstraint failed', { code: ErrorCode.Ffi });
-      }
+      throwConstraintResult(
+        'createCardinalityConstraint',
+        'cardinality',
+        `${label}, ${edgeType}, ${direction}`,
+        r,
+      );
     },
     createValidator: (handle, label, varName, predicate) => {
       const l = encoder.encode(label);
