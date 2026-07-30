@@ -701,10 +701,6 @@ fn num_of(v: &Val) -> Option<f64> {
     }
 }
 
-fn num_of_owned(v: &Val) -> Option<f64> {
-    num_of(v)
-}
-
 fn js_num(n: f64) -> String {
     if n.is_nan() {
         "NaN".to_string()
@@ -2181,7 +2177,7 @@ fn eval_aggregate(
         AggFn::Count => Val::Num(values.len() as f64),
         // `sum` over DURATIONs computes; over a non-summable temporal it faults.
         AggFn::Sum if temporal => temporal_values_sum(&values, env.ctx),
-        AggFn::Sum => Val::Num(values.iter().filter_map(num_of_owned).sum()),
+        AggFn::Sum => Val::Num(values.iter().filter_map(num_of).sum()),
         // `avg` over any temporal faults (needs unrepresentable duration÷count).
         AggFn::Avg if temporal => {
             env.ctx.set_fault(FAULT_TEMPORAL_AGG);
@@ -2191,7 +2187,7 @@ fn eval_aggregate(
             if values.is_empty() {
                 Val::Null
             } else {
-                let s: f64 = values.iter().filter_map(num_of_owned).sum();
+                let s: f64 = values.iter().filter_map(num_of).sum();
                 Val::Num(s / values.len() as f64)
             }
         }
@@ -2202,7 +2198,7 @@ fn eval_aggregate(
         AggFn::PercentileDisc => percentile(&values, frac.unwrap_or(0.0), false),
         AggFn::StddevPop | AggFn::StddevSamp => {
             let (mut n, mut sum, mut sum_sq) = (0u64, 0.0f64, 0.0f64);
-            for x in values.iter().filter_map(num_of_owned) {
+            for x in values.iter().filter_map(num_of) {
                 sum += x;
                 sum_sq += x * x;
                 n += 1;

@@ -1937,6 +1937,9 @@ impl Parser {
 
     fn parse_primary_inner(&mut self) -> R<Expr> {
         let t = self.peek().clone();
+        // Compute the now-function kind once (cheap peek); the arm below reads it
+        // in both its guard and body instead of calling `now_function()` twice.
+        let now_kind = self.now_function();
         match t.tt {
             Tt::Number => {
                 self.advance();
@@ -1959,8 +1962,8 @@ impl Parser {
             // `local_datetime(...)` so the result is DATETIME-kind regardless of
             // what kind `$__now` was supplied as (a DATE `$__now` coerces to
             // midnight rather than leaking a DATE out of `current_timestamp`).
-            Tt::Ident if self.now_function().is_some() => {
-                let is_date = self.now_function() == Some(true);
+            Tt::Ident if now_kind.is_some() => {
+                let is_date = now_kind == Some(true);
                 self.advance();
                 if self.check(Tt::LParen) {
                     self.advance();

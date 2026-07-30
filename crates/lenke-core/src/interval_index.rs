@@ -77,17 +77,23 @@ impl RiTree {
     pub(crate) fn remove(&mut self, lo: i128, hi: i128, id: u32) {
         let (lo, hi) = (bias(lo), bias(hi));
         let f = fork(lo, hi);
+        let mut removed = false;
         for (map, key) in [(&mut self.lower, (f, lo)), (&mut self.upper, (f, hi))] {
             if let Some(v) = map.get_mut(&key) {
                 if let Some(pos) = v.iter().position(|&x| x == id) {
                     v.swap_remove(pos);
+                    removed = true;
                 }
                 if v.is_empty() {
                     map.remove(&key);
                 }
             }
         }
-        self.len -= 1;
+        // Only count a real removal — a mispaired remove (absent bucket / id) must
+        // not underflow `len` (debug panic / release wrap).
+        if removed {
+            self.len -= 1;
+        }
     }
 
     /// Walk the stab of point `q`, calling `visit(ids)` for each matching bucket.

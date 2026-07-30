@@ -757,7 +757,7 @@ pub unsafe extern "C" fn lnk_rollback_tx(g: *mut Graph) -> i32 {
 /// error.
 ///
 /// # Safety
-/// As [`lnk_create_vertex_index`].
+/// As [`lnk_create_index`].
 #[no_mangle]
 pub unsafe extern "C" fn lnk_drop_vertex_index(
     g: *mut Graph,
@@ -779,7 +779,7 @@ pub unsafe extern "C" fn lnk_drop_vertex_index(
 /// Drop an edge property index. Edge analogue of [`lnk_drop_vertex_index`].
 ///
 /// # Safety
-/// As [`lnk_create_vertex_index`].
+/// As [`lnk_create_index`].
 #[no_mangle]
 pub unsafe extern "C" fn lnk_drop_edge_index(
     g: *mut Graph,

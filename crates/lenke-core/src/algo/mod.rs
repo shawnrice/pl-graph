@@ -210,7 +210,6 @@ pub(super) fn edge_weights(graph: &Graph, key: &str) -> Vec<f64> {
         .collect()
 }
 
-/// An algorithm's output: the result column name + per-vertex `(dense id, value)`s.
 /// An algorithm's output: the result column name + `(dense vertex id, value)` rows.
 pub type AlgoOutput = (&'static str, Vec<(u32, Value)>);
 /// Pending `writeProperty` writes: the property key + per-vertex `(dense id, value)`s.
