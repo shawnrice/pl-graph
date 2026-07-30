@@ -63,6 +63,7 @@ export type TaggedTemporal = Readonly<Record<`@${string}`, string>>;
 export type SchemaOp =
   | { op: 'createVertexIndex'; key: string }
   | { op: 'createEdgeIndex'; key: string }
+  | { op: 'createEdgeIntervalIndex'; loKey: string; hiKey: string }
   | { op: 'dropVertexIndex'; key: string }
   | { op: 'dropEdgeIndex'; key: string }
   | { op: 'createUniqueConstraint'; label: string; key: string }
@@ -95,6 +96,9 @@ export const applySchemaOp = (g: RustGraph, s: SchemaOp): void => {
       break;
     case 'createEdgeIndex':
       g.createIndex({ on: 'edge', kind: 'hash', keys: [s.key] });
+      break;
+    case 'createEdgeIntervalIndex':
+      g.createIndex({ on: 'edge', kind: 'interval', keys: [s.loKey, s.hiKey] });
       break;
     case 'dropVertexIndex':
       g.dropVertexIndex(s.key);

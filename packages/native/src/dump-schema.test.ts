@@ -26,6 +26,7 @@ const WASM = new URL(
 // the edge-unique below also proves an index-backed constraint dumps its auto-index.
 const declareAll = (g: RustGraph): void => {
   g.createIndex({ on: 'vertex', kind: 'hash', keys: ['handle'] });
+  g.createIndex({ on: 'edge', kind: 'interval', keys: ['vf', 'vt'] }); // RI-tree accelerator
   g.createUniqueConstraint('User', 'email');
   g.createRequiredConstraint('User', 'name');
   g.createTypeConstraint('User', 'age', 'number');
@@ -102,6 +103,11 @@ for (const { name, make, ok } of backends) {
       // The edge unique constraint is index-backed → its auto-created edge index is
       // in the dump too (so a replay reconstructs the index, not just the constraint).
       expect(by('createEdgeIndex')).toEqual([{ op: 'createEdgeIndex', key: 'id' }]);
+      // The RI-tree interval index (an accelerator not derivable from data) must
+      // also dump, so it survives a snapshot reload / CDC replay.
+      expect(by('createEdgeIntervalIndex')).toEqual([
+        { op: 'createEdgeIntervalIndex', loKey: 'vf', hiKey: 'vt' },
+      ]);
     });
 
     test('round-trips: applying the dump to a fresh graph reproduces it exactly', async () => {

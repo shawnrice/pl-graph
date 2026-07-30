@@ -3236,6 +3236,16 @@ impl Graph {
         for k in self.edge_indexes() {
             ops.push(schema_op("createEdgeIndex", &[("key", Jv::S(&k))]));
         }
+        // Edge interval (RI-tree) indexes: emitted as a granular op carrying the
+        // `[loKey, hiKey)` pair, so an as-of/overlap accelerator survives a
+        // snapshot reload and replicates over the CDC schema stream (like the
+        // hash indexes above). `applySchemaOp` routes it back to `createIndex`.
+        for (lo, hi) in self.edge_interval_index_specs() {
+            ops.push(schema_op(
+                "createEdgeIntervalIndex",
+                &[("loKey", Jv::S(lo)), ("hiKey", Jv::S(hi))],
+            ));
+        }
         for (label, key) in self.unique_constraints() {
             ops.push(schema_op(
                 "createUniqueConstraint",
@@ -6644,6 +6654,21 @@ mod scalar_not_null {
         g.create_type_constraint("P", "name", "string NOT NULL")
             .unwrap();
         assert!(g.dump_schema().contains(r#""type":"string NOT NULL""#));
+    }
+
+    #[test]
+    fn dump_schema_emits_edge_interval_index() {
+        // An RI-tree interval index is an accelerator, not derivable from data, so
+        // it must appear in dump_schema to survive a snapshot reload and replicate
+        // over the CDC schema stream. `applySchemaOp` routes it back to createIndex.
+        let mut g = crate::ndjson::decode("").unwrap();
+        g.create_edge_interval_index("vf", "vt");
+        assert!(
+            g.dump_schema()
+                .contains(r#"{"op":"createEdgeIntervalIndex","loKey":"vf","hiKey":"vt"}"#),
+            "got: {}",
+            g.dump_schema()
+        );
     }
 
     #[test]
