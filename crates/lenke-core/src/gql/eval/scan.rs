@@ -5,6 +5,44 @@
 //! the evaluator (`super`); shares its context/helpers via `use super::*`.
 use super::*;
 
+/// Scatter the frame's bound element slots into binding `b` at row `ri`: each
+/// bound slot becomes the Node/Edge id sitting at that row. Value/scalar slots are
+/// filled separately by the caller. Shared by every place that materializes a
+/// representative row from the columnar frame (grouped aggregation, sort binding).
+#[inline]
+fn bind_frame_row(b: &mut Binding, sc: &ScanCols, ri: usize) {
+    for (slot, col) in sc.slots.iter().enumerate() {
+        if let Some((elem, ids)) = col {
+            b.set(
+                slot,
+                match elem {
+                    Elem::Node => Val::Node(ids[ri]),
+                    Elem::Edge => Val::Edge(ids[ri]),
+                },
+            );
+        }
+    }
+}
+
+/// Resolve `(var_slot, key_ref)` in the scan frame to the property `Column` the
+/// slot's element type stores it in, plus the row→element-id map for that slot.
+/// Outer `None` = the slot isn't bound to an element; inner `None` = that property
+/// column is absent (the caller decides how to treat an absent column).
+fn prop_col<'a>(
+    graph: &'a Graph,
+    ctx: &Ctx,
+    sc: &'a ScanCols,
+    var_slot: usize,
+    key_ref: usize,
+) -> Option<(Option<&'a Column>, &'a [u32])> {
+    let (elem, ids) = sc.slot(var_slot)?;
+    let (store, kid) = match elem {
+        Elem::Node => (&graph.props, ctx.prop_keys[key_ref].0),
+        Elem::Edge => (&graph.edge_props, ctx.prop_keys[key_ref].1),
+    };
+    Some((kid.and_then(|k| store.cols.get(k as usize)), ids))
+}
+
 // --- vertex/edge-agnostic index seeks (dispatched by an `edge` flag) ---------
 pub(super) fn idx_indexed(graph: &Graph, name: &str, edge: bool) -> bool {
     if edge {
@@ -1075,12 +1113,7 @@ pub(super) fn raw_bits_of(
     let CExpr::Prop { var_slot, key_ref } = expr else {
         return None;
     };
-    let (elem, ids) = sc.slot(*var_slot)?;
-    let (store, kid) = match elem {
-        Elem::Node => (&graph.props, ctx.prop_keys[*key_ref].0),
-        Elem::Edge => (&graph.edge_props, ctx.prop_keys[*key_ref].1),
-    };
-    let col = kid.and_then(|k| store.cols.get(k as usize));
+    let (col, ids) = prop_col(graph, ctx, sc, *var_slot, *key_ref)?;
     let bits = |i: usize, present: &crate::graph::BitSet, raw: u64| {
         present.get(ids[i] as usize).then_some(raw)
     };
@@ -1165,12 +1198,8 @@ pub(super) fn num_col_of<'a>(
     let CExpr::Prop { var_slot, key_ref } = arg else {
         return None;
     };
-    let (elem, ids) = sc.slot(*var_slot)?;
-    let (store, kid) = match elem {
-        Elem::Node => (&graph.props, ctx.prop_keys[*key_ref].0),
-        Elem::Edge => (&graph.edge_props, ctx.prop_keys[*key_ref].1),
-    };
-    match kid.and_then(|k| store.cols.get(k as usize)) {
+    let (col, ids) = prop_col(graph, ctx, sc, *var_slot, *key_ref)?;
+    match col {
         Some(Column::Num { data, present }) => Some((data.as_slice(), present, ids)),
         _ => None,
     }
@@ -1438,17 +1467,7 @@ pub(super) fn vectorized_aggregate(
     // global group (no input rows) — leave unbound; only pure aggregates read it.
     let bind_rep = |b: &mut Binding, g: usize| {
         if let Some(&ri) = rep_row.get(g).filter(|&&ri| ri != usize::MAX) {
-            for (slot, col) in sc.slots.iter().enumerate() {
-                if let Some((elem, ids)) = col {
-                    b.set(
-                        slot,
-                        match elem {
-                            Elem::Node => Val::Node(ids[ri]),
-                            Elem::Edge => Val::Edge(ids[ri]),
-                        },
-                    );
-                }
-            }
+            bind_frame_row(b, sc, ri);
         }
     };
 
@@ -1868,17 +1887,7 @@ pub(super) fn project_frame_cols(
             let mut out: Vec<Vec<Val>> = vec![Vec::with_capacity(end - start); proj.items.len()];
             let mut b = Binding(vec![None; sc.slots.len()]);
             for &ri in &rep_row[start..end] {
-                for (slot, col) in sc.slots.iter().enumerate() {
-                    if let Some((elem, ids)) = col {
-                        b.set(
-                            slot,
-                            match elem {
-                                Elem::Node => Val::Node(ids[ri]),
-                                Elem::Edge => Val::Edge(ids[ri]),
-                            },
-                        );
-                    }
-                }
+                bind_frame_row(&mut b, sc, ri);
                 let env = Env::new(graph, ctx, &b);
                 for (item_idx, item) in proj.items.iter().enumerate() {
                     out[item_idx].push(eval(&env, &item.expr));
@@ -2032,17 +2041,7 @@ pub(super) fn with_frame_aggregate(
             // (`p.age`) or an aggregate expr that references a key resolves.
             // `usize::MAX` = the empty global group (no rows); leave unbound.
             if let Some(&ri) = rep_row.get(g).filter(|&&ri| ri != usize::MAX) {
-                for (slot, col) in sc.slots.iter().enumerate() {
-                    if let Some((elem, ids)) = col {
-                        b.set(
-                            slot,
-                            match elem {
-                                Elem::Node => Val::Node(ids[ri]),
-                                Elem::Edge => Val::Edge(ids[ri]),
-                            },
-                        );
-                    }
-                }
+                bind_frame_row(&mut b, sc, ri);
             }
             let agg_values: Vec<Val> = agg_cols.iter().map(|c| c[g].clone()).collect();
             let env = Env {
