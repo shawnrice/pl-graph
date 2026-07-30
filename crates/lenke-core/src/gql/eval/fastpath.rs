@@ -12,6 +12,27 @@ use super::*;
 /// of materializing and counting the whole id column — turning an O(n) scan into
 /// an O(1) read. Provably identical to the general path, which counts that same
 /// bucket; the difference is `bucket.len()` vs `bucket.iter().count()`.
+/// Is the projection exactly a bare, un-grouped `count(*)` — no DISTINCT, ORDER BY,
+/// SKIP, LIMIT, grouping, or any extra item/aggregate? Every scalar-count shortcut
+/// below requires this shape before it may substitute a closed-form count for row
+/// enumeration, and bails the moment any of these is present. (The grouped and
+/// DISTINCT-count shortcuts have their own, different guards.)
+fn is_bare_count_star(proj: &CProjection) -> bool {
+    !proj.distinct
+        && proj.order_by.is_empty()
+        && proj.skip.is_none()
+        && proj.limit.is_none()
+        && proj.out_len == 1
+        && proj.aggs.len() == 1
+        && proj.items.len() == 1
+        && matches!(proj.items[0].expr, CExpr::AggRef(0))
+        && proj.group_by.is_empty()
+        && {
+            let agg = &proj.aggs[0];
+            agg.star && !agg.distinct && matches!(agg.func, AggFn::Count)
+        }
+}
+
 pub(super) fn try_count_star(
     linear: &CLinear,
     graph: &Graph,
@@ -40,20 +61,7 @@ pub(super) fn try_count_star(
         return None;
     };
     // the projection is exactly `count(*)` and nothing else.
-    if proj.distinct
-        || !proj.order_by.is_empty()
-        || proj.skip.is_some()
-        || proj.limit.is_some()
-        || proj.out_len != 1
-        || proj.aggs.len() != 1
-        || proj.items.len() != 1
-        || !matches!(proj.items[0].expr, CExpr::AggRef(0))
-        || !proj.group_by.is_empty()
-    {
-        return None;
-    }
-    let agg = &proj.aggs[0];
-    if !agg.star || agg.distinct || !matches!(agg.func, AggFn::Count) {
+    if !is_bare_count_star(proj) {
         return None;
     }
     let ctx = resolve_ctx(graph, plan, params);
@@ -131,20 +139,7 @@ pub(super) fn try_count_edges(
         return None;
     }
     // The projection is exactly `count(*)` (mirrors `try_count_star`).
-    if proj.distinct
-        || !proj.order_by.is_empty()
-        || proj.skip.is_some()
-        || proj.limit.is_some()
-        || proj.out_len != 1
-        || proj.aggs.len() != 1
-        || proj.items.len() != 1
-        || !matches!(proj.items[0].expr, CExpr::AggRef(0))
-        || !proj.group_by.is_empty()
-    {
-        return None;
-    }
-    let agg = &proj.aggs[0];
-    if !agg.star || agg.distinct || !matches!(agg.func, AggFn::Count) {
+    if !is_bare_count_star(proj) {
         return None;
     }
     // The relationship must name its type(s): `:T` or `:A|B`.
@@ -288,20 +283,7 @@ pub(super) fn try_count_two_hop(
         return None;
     };
     // The projection is exactly `count(*)` (mirrors `try_count_star`).
-    if proj.distinct
-        || !proj.order_by.is_empty()
-        || proj.skip.is_some()
-        || proj.limit.is_some()
-        || proj.out_len != 1
-        || proj.aggs.len() != 1
-        || proj.items.len() != 1
-        || !matches!(proj.items[0].expr, CExpr::AggRef(0))
-        || !proj.group_by.is_empty()
-    {
-        return None;
-    }
-    let agg = &proj.aggs[0];
-    if !agg.star || agg.distinct || !matches!(agg.func, AggFn::Count) {
+    if !is_bare_count_star(proj) {
         return None;
     }
     // Both relationships: anonymous (no edge-uniqueness to enforce), directed, no
@@ -461,20 +443,7 @@ pub(super) fn try_count_comma_join(
         return None;
     };
     // Exactly `count(*)`.
-    if proj.distinct
-        || !proj.order_by.is_empty()
-        || proj.skip.is_some()
-        || proj.limit.is_some()
-        || proj.out_len != 1
-        || proj.aggs.len() != 1
-        || proj.items.len() != 1
-        || !matches!(proj.items[0].expr, CExpr::AggRef(0))
-        || !proj.group_by.is_empty()
-    {
-        return None;
-    }
-    let agg = &proj.aggs[0];
-    if !agg.star || agg.distinct || !matches!(agg.func, AggFn::Count) {
+    if !is_bare_count_star(proj) {
         return None;
     }
     let [p1, p2] = patterns.as_slice() else {
@@ -642,20 +611,7 @@ pub(super) fn try_count_varlen_1_2(
         return None;
     };
     // Exactly `count(*)` (mirrors try_count_star).
-    if proj.distinct
-        || !proj.order_by.is_empty()
-        || proj.skip.is_some()
-        || proj.limit.is_some()
-        || proj.out_len != 1
-        || proj.aggs.len() != 1
-        || proj.items.len() != 1
-        || !matches!(proj.items[0].expr, CExpr::AggRef(0))
-        || !proj.group_by.is_empty()
-    {
-        return None;
-    }
-    let agg = &proj.aggs[0];
-    if !agg.star || agg.distinct || !matches!(agg.func, AggFn::Count) {
+    if !is_bare_count_star(proj) {
         return None;
     }
     // The one relationship: `{1,2}`, directed Out, anonymous, no inline props/WHERE.
@@ -1329,20 +1285,7 @@ pub(super) fn try_count_semi_join(
     }
     let a_slot = outer.start.var_slot?;
     // Exactly `count(*)` (mirrors try_count_star).
-    if proj.distinct
-        || !proj.order_by.is_empty()
-        || proj.skip.is_some()
-        || proj.limit.is_some()
-        || proj.out_len != 1
-        || proj.aggs.len() != 1
-        || proj.items.len() != 1
-        || !matches!(proj.items[0].expr, CExpr::AggRef(0))
-        || !proj.group_by.is_empty()
-    {
-        return None;
-    }
-    let agg = &proj.aggs[0];
-    if !agg.star || agg.distinct || !matches!(agg.func, AggFn::Count) {
+    if !is_bare_count_star(proj) {
         return None;
     }
     // Unwrap `EXISTS { … }` or `NOT EXISTS { … }`.
@@ -1807,20 +1750,7 @@ pub(super) fn try_parallel_count(
         return None;
     }
     // The projection is exactly `count(*)` (mirrors `try_count_star`).
-    if proj.distinct
-        || !proj.order_by.is_empty()
-        || proj.skip.is_some()
-        || proj.limit.is_some()
-        || proj.out_len != 1
-        || proj.aggs.len() != 1
-        || proj.items.len() != 1
-        || !matches!(proj.items[0].expr, CExpr::AggRef(0))
-        || !proj.group_by.is_empty()
-    {
-        return None;
-    }
-    let agg = &proj.aggs[0];
-    if !agg.star || agg.distinct || !matches!(agg.func, AggFn::Count) {
+    if !is_bare_count_star(proj) {
         return None;
     }
 
