@@ -90,6 +90,31 @@ fn v_by_id() {
 }
 
 #[test]
+fn repeat_default_cap_matches_ts_100() {
+    // A directed 5-cycle a→b→c→d→e→a. `repeat(out())` with no `times()` runs the
+    // default iteration cap; emit() (post-form) fires once per iteration and the
+    // frontier stays size 1, so the emitted count is the cap — which must be 100
+    // (the TS engine's cap), not the old 64.
+    let lines = [
+        r#"{"type":"node","id":"a","labels":["V"],"properties":{}}"#,
+        r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#,
+        r#"{"type":"node","id":"c","labels":["V"],"properties":{}}"#,
+        r#"{"type":"node","id":"d","labels":["V"],"properties":{}}"#,
+        r#"{"type":"node","id":"e","labels":["V"],"properties":{}}"#,
+        r#"{"type":"edge","from":"a","to":"b","labels":["E"],"properties":{}}"#,
+        r#"{"type":"edge","from":"b","to":"c","labels":["E"],"properties":{}}"#,
+        r#"{"type":"edge","from":"c","to":"d","labels":["E"],"properties":{}}"#,
+        r#"{"type":"edge","from":"d","to":"e","labels":["E"],"properties":{}}"#,
+        r#"{"type":"edge","from":"e","to":"a","labels":["E"],"properties":{}}"#,
+    ];
+    let mut g = crate::ndjson::decode(&lines.join("\n")).unwrap();
+    let r = super::parse("g.V('a').repeat(__.out()).emit().count()")
+        .unwrap()
+        .run(&mut g);
+    assert_eq!(r, vec![GVal::Num(100.0)]);
+}
+
+#[test]
 fn e_by_id_resolves_directly_in_id_order() {
     // E(ids) resolves each id directly (like V(ids)) and yields per requested id in
     // id order — mirroring the TS engine — not a full edge scan in edge-index order.

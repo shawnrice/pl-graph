@@ -2911,7 +2911,11 @@ fn run_repeat(
         emit,
         emit_before,
     } = mods;
-    const CAP: usize = 64;
+    // Default iteration bound for a `repeat()` with no `times()` — must match the TS
+    // engine's cap (packages/gremlin/.../iteration.ts) so an unbounded/deep repeat
+    // stops at the same depth on both. (This is the per-count default, separate from
+    // the REPEAT_BUDGET traverser-count safety.)
+    const CAP: usize = 100;
     let emit_matches = |graph: &mut Graph, ctx: &mut Ctx, t: &Trav, e: &Traversal| {
         e.steps.is_empty() || sub_nonempty(graph, ctx, e, t)
     };
