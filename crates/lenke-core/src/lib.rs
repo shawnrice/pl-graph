@@ -53,3 +53,6 @@ mod jsonfmt;
 mod json;
 #[cfg(feature = "ndjson")]
 pub mod ndjson;
+
+#[cfg(test)]
+mod fuzz_tests;

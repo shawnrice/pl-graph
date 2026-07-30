@@ -190,8 +190,12 @@ fn is_ident_part(c: char) -> bool {
 
 /// Decode the backslash escape beginning at byte `i` (the backslash). Returns the
 /// decoded text and the byte index just past the escape.
-fn read_escape(b: &[u8], src: &str, i: usize) -> Result<(String, usize), SyntaxError> {
-    let esc = b[i + 1] as char;
+fn read_escape(src: &str, i: usize) -> Result<(String, usize), SyntaxError> {
+    // The escaped CHARACTER after the backslash. `i` is `\` so `i+1` is a char
+    // boundary; read the whole char (not `b[i+1] as char`, which mangles a multi-byte
+    // char's first byte into Latin-1 and then advances only one byte — leaving the
+    // caller mid-char, which panics on the next `src[i..]` slice).
+    let esc = src[i + 1..].chars().next().unwrap_or('\\');
     let simple = match esc {
         '\\' => Some('\\'),
         '\'' => Some('\''),
@@ -226,7 +230,9 @@ fn read_escape(b: &[u8], src: &str, i: usize) -> Result<(String, usize), SyntaxE
             ),
         }
     } else {
-        Ok((esc.to_string(), i + 2))
+        // Advance past the WHOLE escaped char (i + `\` + the char's byte length), so
+        // a multi-byte `\中` doesn't leave the caller inside the char.
+        Ok((esc.to_string(), i + 1 + esc.len_utf8()))
     }
 }
 
@@ -345,7 +351,7 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SyntaxError> {
             let mut s = String::new();
             while i < b.len() && b[i] != quote {
                 if b[i] == b'\\' && i + 1 < b.len() {
-                    let (text, next) = read_escape(b, src, i)?;
+                    let (text, next) = read_escape(src, i)?;
                     s.push_str(&text);
                     i = next;
                     continue;
@@ -565,7 +571,17 @@ fn parse_number(s: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::tokenize;
+    use super::{tokenize, Tt};
+
+    #[test]
+    fn backslash_before_multibyte_char_does_not_panic() {
+        // `\中` (backslash + a multi-byte char) is taken as the literal char and must
+        // advance past the WHOLE char — a one-byte advance left the string loop
+        // mid-char and panicked on the next slice (found by the robustness fuzzer).
+        let toks = tokenize("RETURN 'a\\中b'").expect("must not panic or error");
+        // the string literal token carries the un-escaped content `a中b`.
+        assert!(toks.iter().any(|t| t.tt == Tt::Str && t.value == "a中b"));
+    }
 
     #[test]
     fn malformed_unicode_escape_errors_not_panics() {
