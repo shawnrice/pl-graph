@@ -2669,6 +2669,23 @@ fn adj_in_label_order(
     inn: bool,
     labels: &[String],
 ) -> Vec<(u32, u32)> {
+    let mut res = Vec::new();
+    // No label filter (the common out()/in()/both()): stream adjacency straight
+    // into `res` — out-edges then in-edges, each in adjacency order — skipping the
+    // two intermediate per-direction Vecs and the copy the labeled path needs.
+    if labels.is_empty() {
+        if out {
+            res.extend(graph.out_adj(v).map(|a| (a.eidx, a.nbr)));
+        }
+
+        if inn {
+            res.extend(graph.in_adj(v).map(|a| (a.eidx, a.nbr)));
+        }
+
+        return res;
+    }
+    // Labeled: materialize each direction once (it is re-scanned per label so the
+    // result comes out in the arguments' label order), then filter by edge type.
     let outs: Vec<(u32, u32, u32)> = if out {
         graph.out_adj(v).map(|a| (a.eidx, a.nbr, a.etype)).collect()
     } else {
@@ -2680,17 +2697,12 @@ fn adj_in_label_order(
         Vec::new()
     };
     let collect_dir = |adjs: &[(u32, u32, u32)], dst: &mut Vec<(u32, u32)>| {
-        if labels.is_empty() {
-            dst.extend(adjs.iter().map(|a| (a.0, a.1)));
-        } else {
-            for lbl in labels {
-                if let Some(id) = graph.etype.get(lbl) {
-                    dst.extend(adjs.iter().filter(|a| a.2 == id).map(|a| (a.0, a.1)));
-                }
+        for lbl in labels {
+            if let Some(id) = graph.etype.get(lbl) {
+                dst.extend(adjs.iter().filter(|a| a.2 == id).map(|a| (a.0, a.1)));
             }
         }
     };
-    let mut res = Vec::new();
     collect_dir(&outs, &mut res);
     collect_dir(&ins, &mut res);
     res
