@@ -218,7 +218,7 @@ An as-of query on lenke is _just a `WHERE` clause over the period columns you ch
 
 SQL:2011 earns `AS OF SYSTEM_TIME` only because it also mandates `PERIOD FOR SYSTEM_TIME (sys_start, sys_end)` — the engine _owns_ those two columns, auto-stamps them on every write, and forbids you from setting them. The keyword is sugar over an engine-managed schema contract. lenke deliberately declines that contract: **you** pick the column names, **you** decide how many axes you model (uni- or bitemporal), and **you** stamp them in your own writes (a correction's `txFrom` is _your_ correction date, not the engine's commit instant). That flexibility is the point — a knowledge graph often wants valid time without system time, or four columns with domain-specific names. A hardcoded `AS OF` over engine-owned `PERIOD` columns would impose exactly the schema mandate lenke avoids. The predicate is three lines; keep the control.
 
-## Temporal caveats
+## Temporal behavior
 
 A few behaviors worth internalizing before you build windows or velocity checks on top of the period columns:
 

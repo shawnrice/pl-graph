@@ -651,11 +651,11 @@ Hand the matrix to your training code as Apache Arrow (see the \`arrow\` guide):
 \`degree\` and \`pagerank\` are cheap; exact \`betweenness\`/\`closeness\` are O(V·E) and dominate at scale (use \`pivots\` for approximate betweenness). See the \`performance\` guide.`,
 };
 
-const gotchasGuide: Guide = {
-  id: 'gotchas',
-  title: 'Common pitfalls',
+const thingsToKnowGuide: Guide = {
+  id: 'things-to-know',
+  title: 'Things to know',
   description: 'Reserved-word aliases, temporal typing, categorical outputs, and Cypher-isms.',
-  text: `# Common pitfalls
+  text: `# Things to know
 
 A few behaviors worth knowing — mostly around reserved words and silently-empty results.
 
@@ -706,7 +706,7 @@ const GUIDES: readonly Guide[] = [
   serializationGuide,
   indexesGuide,
   performanceGuide,
-  gotchasGuide,
+  thingsToKnowGuide,
 ];
 
 /** The guides as MCP resources, addressed \`lenke://guide/<id>\`. */
