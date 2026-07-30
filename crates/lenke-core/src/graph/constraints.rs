@@ -5,6 +5,36 @@
 //! types/functions via `use super::*`.
 use super::*;
 
+// Shared accessors for the key-set constraint maps (`HashMap<name, Vec<key>>`),
+// used identically by the unique / required families on both vertices (keyed by
+// label) and edges (keyed by edge type). Centralizing them keeps the "drop empties
+// the entry" and "listing is sorted" rules in one place instead of four copies.
+fn keyset_drop(map: &mut HashMap<String, Vec<String>>, name: &str, key: &str) {
+    if let Some(keys) = map.get_mut(name) {
+        keys.retain(|k| k != key);
+        if keys.is_empty() {
+            map.remove(name);
+        }
+    }
+}
+
+fn keyset_get<'a>(map: &'a HashMap<String, Vec<String>>, name: &str) -> &'a [String] {
+    map.get(name).map_or(&[], Vec::as_slice)
+}
+
+fn keyset_has(map: &HashMap<String, Vec<String>>, name: &str, key: &str) -> bool {
+    map.get(name).is_some_and(|ks| ks.iter().any(|k| k == key))
+}
+
+fn keyset_list(map: &HashMap<String, Vec<String>>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = map
+        .iter()
+        .flat_map(|(n, ks)| ks.iter().map(move |k| (n.clone(), k.clone())))
+        .collect();
+    out.sort();
+    out
+}
+
 impl Graph {
     // --- unique constraints (declared over `(label, property key)`) ---------
     // At most one live vertex carrying `label` may hold a given non-null value
@@ -37,37 +67,24 @@ impl Graph {
     /// Drop a unique constraint. The backing index is left in place (drop it via
     /// [`Graph::drop_vertex_index`] if unwanted). Idempotent.
     pub fn drop_unique_constraint(&mut self, label: &str, key: &str) {
-        if let Some(keys) = self.v_unique.get_mut(label) {
-            keys.retain(|k| k != key);
-            if keys.is_empty() {
-                self.v_unique.remove(label);
-            }
-        }
+        keyset_drop(&mut self.v_unique, label, key);
     }
 
     /// Property keys under a unique constraint for `label` (sorted; empty if
     /// none). `_MERGE` intersects this with the pattern to infer the conflict key.
     pub fn unique_keys(&self, label: &str) -> &[String] {
-        self.v_unique.get(label).map_or(&[], Vec::as_slice)
+        keyset_get(&self.v_unique, label)
     }
 
     /// True iff `(label, key)` carries a unique constraint.
     pub fn has_unique_constraint(&self, label: &str, key: &str) -> bool {
-        self.v_unique
-            .get(label)
-            .is_some_and(|ks| ks.iter().any(|k| k == key))
+        keyset_has(&self.v_unique, label, key)
     }
 
     /// Every declared unique constraint as sorted `(label, key)` pairs — a
     /// deterministic listing for host introspection.
     pub fn unique_constraints(&self) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = self
-            .v_unique
-            .iter()
-            .flat_map(|(l, ks)| ks.iter().map(move |k| (l.clone(), k.clone())))
-            .collect();
-        out.sort();
-        out
+        keyset_list(&self.v_unique)
     }
 
     /// The single live vertex carrying `label` whose `key == value`, if any (≤1
@@ -170,35 +187,22 @@ impl Graph {
 
     /// Drop a required constraint. Idempotent.
     pub fn drop_required_constraint(&mut self, label: &str, key: &str) {
-        if let Some(keys) = self.v_required.get_mut(label) {
-            keys.retain(|k| k != key);
-            if keys.is_empty() {
-                self.v_required.remove(label);
-            }
-        }
+        keyset_drop(&mut self.v_required, label, key);
     }
 
     /// Property keys required for `label` (sorted; empty if none).
     pub fn required_keys(&self, label: &str) -> &[String] {
-        self.v_required.get(label).map_or(&[], Vec::as_slice)
+        keyset_get(&self.v_required, label)
     }
 
     /// True iff `(label, key)` carries a required constraint.
     pub fn has_required_constraint(&self, label: &str, key: &str) -> bool {
-        self.v_required
-            .get(label)
-            .is_some_and(|ks| ks.iter().any(|k| k == key))
+        keyset_has(&self.v_required, label, key)
     }
 
     /// Every declared required constraint as sorted `(label, key)` pairs.
     pub fn required_constraints(&self) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = self
-            .v_required
-            .iter()
-            .flat_map(|(l, ks)| ks.iter().map(move |k| (l.clone(), k.clone())))
-            .collect();
-        out.sort();
-        out
+        keyset_list(&self.v_required)
     }
 
     /// The first `(label, key)` a new vertex with these `labels`/`props` would
@@ -477,35 +481,22 @@ impl Graph {
 
     /// Drop an edge unique constraint. The backing index is left in place. Idempotent.
     pub fn drop_edge_unique_constraint(&mut self, etype: &str, key: &str) {
-        if let Some(keys) = self.e_unique.get_mut(etype) {
-            keys.retain(|k| k != key);
-            if keys.is_empty() {
-                self.e_unique.remove(etype);
-            }
-        }
+        keyset_drop(&mut self.e_unique, etype, key);
     }
 
     /// Property keys under a unique constraint for `etype` (sorted; empty if none).
     pub fn edge_unique_keys(&self, etype: &str) -> &[String] {
-        self.e_unique.get(etype).map_or(&[], Vec::as_slice)
+        keyset_get(&self.e_unique, etype)
     }
 
     /// True iff `(edge_type, key)` carries a unique constraint.
     pub fn has_edge_unique_constraint(&self, etype: &str, key: &str) -> bool {
-        self.e_unique
-            .get(etype)
-            .is_some_and(|ks| ks.iter().any(|k| k == key))
+        keyset_has(&self.e_unique, etype, key)
     }
 
     /// Every declared edge unique constraint as sorted `(edge_type, key)` pairs.
     pub fn edge_unique_constraints(&self) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = self
-            .e_unique
-            .iter()
-            .flat_map(|(t, ks)| ks.iter().map(move |k| (t.clone(), k.clone())))
-            .collect();
-        out.sort();
-        out
+        keyset_list(&self.e_unique)
     }
 
     /// If adding an edge of `etypes` with `props` would break a unique constraint,
@@ -563,35 +554,22 @@ impl Graph {
 
     /// Drop an edge required constraint. Idempotent.
     pub fn drop_edge_required_constraint(&mut self, etype: &str, key: &str) {
-        if let Some(keys) = self.e_required.get_mut(etype) {
-            keys.retain(|k| k != key);
-            if keys.is_empty() {
-                self.e_required.remove(etype);
-            }
-        }
+        keyset_drop(&mut self.e_required, etype, key);
     }
 
     /// Property keys required for edge type `etype` (sorted; empty if none).
     pub fn edge_required_keys(&self, etype: &str) -> &[String] {
-        self.e_required.get(etype).map_or(&[], Vec::as_slice)
+        keyset_get(&self.e_required, etype)
     }
 
     /// True iff `(edge_type, key)` carries a required constraint.
     pub fn has_edge_required_constraint(&self, etype: &str, key: &str) -> bool {
-        self.e_required
-            .get(etype)
-            .is_some_and(|ks| ks.iter().any(|k| k == key))
+        keyset_has(&self.e_required, etype, key)
     }
 
     /// Every declared edge required constraint as sorted `(edge_type, key)` pairs.
     pub fn edge_required_constraints(&self) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = self
-            .e_required
-            .iter()
-            .flat_map(|(t, ks)| ks.iter().map(move |k| (t.clone(), k.clone())))
-            .collect();
-        out.sort();
-        out
+        keyset_list(&self.e_required)
     }
 
     /// The first `(edge_type, key)` a new edge with these `etypes`/`props` would
