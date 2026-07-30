@@ -455,6 +455,11 @@ pub(super) struct Agg {
     distinct: bool,
     n: u64,
     sum: f64,
+    /// `sum()` only: a non-DURATION scalar (number/bool) has contributed to `sum`.
+    /// Paired with `tsum`, it detects a number-and-DURATION mix, which is unsummable
+    /// and faults (matches TS and the scalar `temporal_values_sum`) rather than
+    /// silently returning just the duration.
+    saw_num: bool,
     /// Running DURATION sum for `sum()` over a temporal column (`None` until the
     /// first duration; keeps `sum` for the numeric path).
     tsum: Option<crate::temporal::Duration>,
@@ -486,6 +491,7 @@ impl Agg {
             distinct: spec.distinct,
             n: 0,
             sum: 0.0,
+            saw_num: false,
             tsum: None,
             tfault: None,
             sum_sq: 0.0,
@@ -536,6 +542,11 @@ impl Agg {
                             }
                         },
                     });
+                    // A DURATION summed alongside a plain number is a type mix — not
+                    // summable. Fault (matches TS) instead of dropping the numeric.
+                    if self.saw_num {
+                        self.tfault.get_or_insert(FAULT_TEMPORAL_AGG);
+                    }
                 } else {
                     self.tfault = Some(FAULT_TEMPORAL_AGG);
                 }
@@ -548,7 +559,14 @@ impl Agg {
             AggFn::Sum | AggFn::Avg if matches!(val, Val::List(_)) => {
                 self.tfault = Some(FAULT_NONNUMERIC_AGG);
             }
-            AggFn::Sum => self.sum += num_of(&val).unwrap_or(f64::NAN),
+            AggFn::Sum => {
+                self.saw_num = true;
+                self.sum += num_of(&val).unwrap_or(f64::NAN);
+                // A number after a DURATION already accumulated is the same type mix.
+                if self.tsum.is_some() {
+                    self.tfault.get_or_insert(FAULT_TEMPORAL_AGG);
+                }
+            }
             AggFn::Avg => {
                 self.sum += num_of(&val).unwrap_or(f64::NAN);
                 self.n += 1;
@@ -617,6 +635,7 @@ impl Agg {
     fn merge(&mut self, other: Self) {
         self.n += other.n;
         self.sum += other.sum;
+        self.saw_num |= other.saw_num;
         self.sum_sq += other.sum_sq;
         self.list.extend(other.list);
         // DURATION sum folds across partials (same `Duration::add`); a fault in
@@ -633,6 +652,11 @@ impl Agg {
                     }
                 },
             });
+        }
+        // A numeric-only partial merged with a DURATION-only partial is the same
+        // number-and-DURATION mix a serial fold would have faulted on.
+        if self.saw_num && self.tsum.is_some() {
+            self.tfault = self.tfault.or(Some(FAULT_TEMPORAL_AGG));
         }
         if let Some(o) = other.extreme {
             let take = match self.func {

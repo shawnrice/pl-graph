@@ -3821,6 +3821,39 @@ fn null_dividend_over_zero_is_null_not_a_fault_vectorized() {
 }
 
 #[test]
+fn sum_mixing_number_and_duration_faults_not_drops() {
+    // `sum()` over a mix of a plain number and a DURATION is an unsummable type mix —
+    // a loud E_DATA_EXCEPTION, matching TS. The streaming accumulator kept separate
+    // numeric (`sum`) and duration (`tsum`) totals and, at finish, returned just the
+    // duration — silently dropping the number (found by the differential fuzzer).
+    let mut g = modern();
+    let tdur = |s: &str| Value::Temporal(crate::temporal::Temporal::parse("duration", s).unwrap());
+    for q in [
+        "MATCH (n:Person) RETURN sum(CASE WHEN n.age < 30 THEN 1 ELSE duration('P1M') END) AS r",
+        // DISTINCT takes the same accumulator; the mix must still fault.
+        "MATCH (n:Person) RETURN sum(DISTINCT CASE WHEN n.age < 30 THEN 1 ELSE duration('P1M') END) AS r",
+        // a non-numeric scalar mixed with a duration faults too.
+        "MATCH (n:Person) RETURN sum(CASE WHEN n.age < 30 THEN 'x' ELSE duration('P1M') END) AS r",
+    ] {
+        let err = parse(q)
+            .unwrap()
+            .execute(&mut g, &Params::new())
+            .unwrap_err();
+        assert_eq!(err.code, crate::error_codes::ErrorCode::DataException, "{q}");
+    }
+    // The unmixed paths are unaffected: pure durations sum (4 people × P1M = P4M),
+    // pure numbers sum (29+27+32+35).
+    assert_eq!(
+        rows(&mut g, "MATCH (n:Person) RETURN sum(duration('P1M')) AS r"),
+        vec![vec![tdur("P4M")]]
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH (n:Person) RETURN sum(n.age) AS r"),
+        vec![vec![n(123.0)]]
+    );
+}
+
+#[test]
 fn date_arithmetic_overflow_raises_data_exception() {
     // A date/datetime shifted past the representable range (Date is i32 days,
     // ≈±5.88M years) is a loud data exception, not a silent null — same policy as
