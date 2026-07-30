@@ -1745,11 +1745,25 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             // Bucket the group's MEMBERS (traversers), keeping key + insertion
             // order, so a reducing value-by can fold over each group as a barrier.
             let mut buckets: Vec<(GVal, Vec<Trav>)> = Vec::new();
+            // O(1) key->bucket index beside the insertion-ordered Vec (output order
+            // is the Vec's, unchanged). A NaN-bearing key has no DedupKey, so it
+            // falls back to the linear scan — matching the old exact `GVal` equality.
+            let mut index: HashMap<DedupKey, usize> = HashMap::new();
             for t in stream {
                 let key = eval_by(graph, ctx, &key_by, &t.val);
-                match buckets.iter_mut().find(|(k, _)| *k == key) {
-                    Some((_, members)) => members.push(t),
-                    None => buckets.push((key, vec![t])),
+                let dk = dedup_key(&key);
+                let existing = match &dk {
+                    Some(dk) => index.get(dk).copied(),
+                    None => buckets.iter().position(|(k, _)| *k == key),
+                };
+                match existing {
+                    Some(i) => buckets[i].1.push(t),
+                    None => {
+                        if let Some(dk) = dk {
+                            index.insert(dk, buckets.len());
+                        }
+                        buckets.push((key, vec![t]));
+                    }
                 }
             }
             let entries: Vec<(GVal, GVal)> = buckets
@@ -1761,11 +1775,23 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         Step::GroupCount(bys) => {
             let by = bys.first().cloned().unwrap_or(By::Identity(None));
             let mut entries: Vec<(GVal, f64)> = Vec::new();
+            // O(1) key->slot index beside the insertion-ordered Vec (see Group above).
+            let mut index: HashMap<DedupKey, usize> = HashMap::new();
             for t in &stream {
                 let key = eval_by(graph, ctx, &by, &t.val);
-                match entries.iter_mut().find(|(k, _)| *k == key) {
-                    Some((_, n)) => *n += 1.0,
-                    None => entries.push((key, 1.0)),
+                let dk = dedup_key(&key);
+                let existing = match &dk {
+                    Some(dk) => index.get(dk).copied(),
+                    None => entries.iter().position(|(k, _)| *k == key),
+                };
+                match existing {
+                    Some(i) => entries[i].1 += 1.0,
+                    None => {
+                        if let Some(dk) = dk {
+                            index.insert(dk, entries.len());
+                        }
+                        entries.push((key, 1.0));
+                    }
                 }
             }
             vec![Trav::root(GVal::Map(entries.into_iter().map(|(k, n)| (k, GVal::Num(n))).collect()))]
@@ -2680,9 +2706,13 @@ fn map_step(stream: Vec<Trav>, f: impl Fn(&Trav) -> Vec<GVal>) -> Vec<Trav> {
 }
 
 fn has_dup(path: &[GVal]) -> bool {
-    for i in 0..path.len() {
-        for j in (i + 1)..path.len() {
-            if path[i] == path[j] {
+    // O(path) via a DedupKey set, replacing the O(path²) pairwise `==` scan (paths
+    // grow under long repeat()). A NaN-bearing value has no DedupKey and — like the
+    // `==` scan it replaces — can never be a duplicate (NaN != NaN), so skip it.
+    let mut seen: HashSet<DedupKey> = HashSet::with_capacity(path.len());
+    for v in path {
+        if let Some(dk) = dedup_key(v) {
+            if !seen.insert(dk) {
                 return true;
             }
         }
