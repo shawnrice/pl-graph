@@ -5,6 +5,7 @@
 import { describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
+import type { ScalarTypeName } from '@lenke/core';
 import { ErrorCode, hasErrorCode, isLenkeError } from '@lenke/errors';
 
 import { ABI_VERSION } from './abi.js';
@@ -67,6 +68,24 @@ suite('@lenke/native FFI backend', () => {
 
     g.query(`INSERT (:Person {name: 'ada'})`);
     expect(g.vertexCount).toBe(1);
+    g.free();
+  });
+
+  // The `-3` (unknown scalar type) return code is decoded by the shared
+  // `throwConstraintResult` helper, so the message is byte-identical across the
+  // FFI and wasm backends. Pin the wording here so the two can't drift apart
+  // again (they once diverged: `type '${type}'` vs the `op(args)` form).
+  test('createTypeConstraint rejects an unknown scalar type with the shared message', () => {
+    const backend = createFfiBackend(LIB);
+    const g = createEmptyGraph(backend);
+    // Casts: an unknown type name only reaches the native `-3` path from an
+    // untyped (JS) caller — the ScalarTypeName union rejects it at compile time.
+    expect(() => g.createTypeConstraint('Person', 'age', 'bogus' as ScalarTypeName)).toThrow(
+      'lenke: createTypeConstraint(Person, age, bogus): unknown scalar type',
+    );
+    expect(() => g.createEdgeTypeConstraint('KNOWS', 'since', 'nope' as ScalarTypeName)).toThrow(
+      'lenke: createEdgeTypeConstraint(KNOWS, since, nope): unknown scalar type',
+    );
     g.free();
   });
 

@@ -85,3 +85,33 @@ export const errorFromNapi = (message: string | undefined): LenkeError => {
     ? new LenkeError(tagged[1], { code: tagged[2] as ErrorCode })
     : new LenkeError(message, { code: ErrorCode.Ffi });
 };
+
+/**
+ * Map a `create*Constraint` FFI return code to the shared error, so both backends
+ * surface byte-identical messages regardless of runtime (native vs wasm):
+ * - `-2` — existing data already violates the constraint ({@link ErrorCode.ConstraintViolation});
+ * - `-3` — a type constraint named an unknown scalar type ({@link ErrorCode.InvalidValue});
+ * - any other non-zero — an ABI fault ({@link ErrorCode.Ffi}).
+ *
+ * `args` is the already-formatted call arguments (e.g. `label, key, type`), so the
+ * `-3` message names the offending type without needing it as a separate parameter.
+ * Only the type-constraint builders ever return `-3`; the others never hit that arm.
+ */
+export const throwConstraintResult = (op: string, kind: string, args: string, r: number): void => {
+  if (r === -2) {
+    throw new LenkeError(
+      `lenke: ${op}(${args}): existing data already violates the ${kind} constraint`,
+      { code: ErrorCode.ConstraintViolation },
+    );
+  }
+
+  if (r === -3) {
+    throw new LenkeError(`lenke: ${op}(${args}): unknown scalar type`, {
+      code: ErrorCode.InvalidValue,
+    });
+  }
+
+  if (r !== 0) {
+    throw new LenkeError(`lenke: ${op} failed`, { code: ErrorCode.Ffi });
+  }
+};

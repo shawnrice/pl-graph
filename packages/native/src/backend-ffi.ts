@@ -5,7 +5,12 @@ import { ErrorCode, LenkeError } from '@lenke/errors';
 import { assertAbi } from './abi.js';
 import type { Backend, GraphHandle, MergeReport } from './backend.js';
 import type { SchemaOp } from './graph.js';
-import { asByteLength, type ErrorReport, parseErrorReport } from './marshal.js';
+import {
+  asByteLength,
+  type ErrorReport,
+  parseErrorReport,
+  throwConstraintResult,
+} from './marshal.js';
 
 // usize / pointer are 64-bit on the native targets we load (arm64 / x86_64);
 // the wasm backend uses 32-bit equivalents and lives in its own module.
@@ -129,25 +134,6 @@ const asHandle = (p: Pointer | null): GraphHandle => p as unknown as GraphHandle
  * Load the native dynamic library over `bun:ffi`. Pass the absolute path to the
  * built `liblenke_core.{dylib,so,dll}` (see `build:rust`).
  */
-// Turn a constraint-creation FFI return code into a coded error (or nothing on
-// success): -2 = the current data already violates it; any other non-zero = an
-// FFI fault. Shared by every create*Constraint below so the message shape lives
-// in one place.
-const throwConstraintResult = (op: string, kind: string, args: string, r: number): void => {
-  if (r === -2) {
-    throw new LenkeError(
-      `lenke: ${op}(${args}): existing data already violates the ${kind} constraint`,
-      {
-        code: ErrorCode.ConstraintViolation,
-      },
-    );
-  }
-
-  if (r !== 0) {
-    throw new LenkeError(`lenke: ${op} failed`, { code: ErrorCode.Ffi });
-  }
-};
-
 export const createFfiBackend = (libPath: string): Backend => {
   const { symbols } = dlopen(libPath, SYMBOLS);
 
@@ -329,12 +315,6 @@ export const createFfiBackend = (libPath: string): Backend => {
         t.byteLength,
       );
 
-      if (r === -3) {
-        throw new LenkeError(`lenke: createTypeConstraint: unknown scalar type '${type}'`, {
-          code: ErrorCode.InvalidValue,
-        });
-      }
-
       throwConstraintResult('createTypeConstraint', 'type', `${label}, ${key}, ${type}`, r);
     },
     createEdgeUniqueConstraint: (handle, edgeType, key) => {
@@ -376,12 +356,6 @@ export const createFfiBackend = (libPath: string): Backend => {
         ptr(t),
         t.byteLength,
       );
-
-      if (r === -3) {
-        throw new LenkeError(`lenke: createEdgeTypeConstraint: unknown scalar type '${type}'`, {
-          code: ErrorCode.InvalidValue,
-        });
-      }
 
       throwConstraintResult('createEdgeTypeConstraint', 'type', `${edgeType}, ${key}, ${type}`, r);
     },

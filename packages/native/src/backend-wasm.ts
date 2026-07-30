@@ -3,7 +3,7 @@ import { ErrorCode, LenkeError } from '@lenke/errors';
 import { assertAbi } from './abi.js';
 import type { Backend, GraphHandle, MergeReport } from './backend.js';
 import type { SchemaOp } from './graph.js';
-import { type ErrorReport, parseErrorReport } from './marshal.js';
+import { type ErrorReport, parseErrorReport, throwConstraintResult } from './marshal.js';
 
 // The wasm module exports the same `lnk_*` C ABI as the native library, but
 // everything is 32-bit linear-memory offsets (usize → i32) and u64 returns
@@ -210,21 +210,6 @@ const instantiate = async (source: WasmSource): Promise<WebAssembly.Instance> =>
  * (see `build:wasm`) as a module, bytes, or fetch `Response` for streaming
  * compilation in the browser.
  */
-const throwConstraintResult = (op: string, kind: string, args: string, r: number): void => {
-  if (r === -2) {
-    throw new LenkeError(
-      `lenke: ${op}(${args}): existing data already violates the ${kind} constraint`,
-      {
-        code: ErrorCode.ConstraintViolation,
-      },
-    );
-  }
-
-  if (r !== 0) {
-    throw new LenkeError(`lenke: ${op} failed`, { code: ErrorCode.Ffi });
-  }
-};
-
 export const createWasmBackend = async (source: WasmSource): Promise<Backend> => {
   const instance = await instantiate(source);
   const ex = instance.exports as unknown as WasmExports;
@@ -495,13 +480,6 @@ export const createWasmBackend = async (source: WasmSource): Promise<Backend> =>
           t.byteLength,
         );
 
-        if (r === -3) {
-          throw new LenkeError(
-            `lenke: createTypeConstraint(${label}, ${key}, ${type}): unknown scalar type`,
-            { code: ErrorCode.InvalidValue },
-          );
-        }
-
         throwConstraintResult('createTypeConstraint', 'type', `${label}, ${key}, ${type}`, r);
       } finally {
         ex.lnk_dealloc(lp, l.byteLength);
@@ -563,13 +541,6 @@ export const createWasmBackend = async (source: WasmSource): Promise<Backend> =>
           tp,
           t.byteLength,
         );
-
-        if (r === -3) {
-          throw new LenkeError(
-            `lenke: createEdgeTypeConstraint(${edgeType}, ${key}, ${type}): unknown scalar type`,
-            { code: ErrorCode.InvalidValue },
-          );
-        }
 
         throwConstraintResult(
           'createEdgeTypeConstraint',
