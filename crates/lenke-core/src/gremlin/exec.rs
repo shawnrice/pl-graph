@@ -1562,14 +1562,19 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         Step::E(ids) => {
             // Match an external edge id (e.g. `E('7')`, like `V('1')`), falling
             // back to the synthetic `e{index}` form when no external id was set.
-            let edges: Vec<u32> = (0..graph.e_src.len() as u32)
-                .filter(|&e| graph.is_edge_live(e))
-                .filter(|&e| {
-                    // `edge_by_id` resolves both an assigned id and the canonical
-                    // `e{index}` form, so no separate synthetic fallback is needed.
-                    ids.is_empty() || ids.iter().any(|i| graph.edge_by_id(i) == Some(e))
-                })
-                .collect();
+            let edges: Vec<u32> = if ids.is_empty() {
+                (0..graph.e_src.len() as u32).filter(|&e| graph.is_edge_live(e)).collect()
+            } else {
+                // Resolve each id DIRECTLY (like `V(ids)`) — O(ids), not the old
+                // O(edges × ids) scan of every edge. `edge_by_id` resolves both an
+                // assigned id and the canonical `e{index}` form. This also matches the
+                // TS engine, which yields per requested id in id order (no dedup) — the
+                // old full scan emitted in edge-index order and deduped.
+                ids.iter()
+                    .filter_map(|i| graph.edge_by_id(i))
+                    .filter(|&e| graph.is_edge_live(e))
+                    .collect()
+            };
             if stream.is_empty() {
                 edges.into_iter().map(|e| Trav::root(GVal::Edge(e))).collect()
             } else {

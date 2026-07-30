@@ -90,6 +90,28 @@ fn v_by_id() {
 }
 
 #[test]
+fn e_by_id_resolves_directly_in_id_order() {
+    // E(ids) resolves each id directly (like V(ids)) and yields per requested id in
+    // id order — mirroring the TS engine — not a full edge scan in edge-index order.
+    let lines = [
+        r#"{"type":"node","id":"1","labels":["V"],"properties":{}}"#,
+        r#"{"type":"node","id":"2","labels":["V"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e-a","from":"1","to":"2","labels":["E"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e-b","from":"2","to":"1","labels":["E"],"properties":{}}"#,
+    ];
+    let mut g = crate::ndjson::decode(&lines.join("\n")).unwrap();
+    let r = super::parse("g.E('e-b','e-a').id()").unwrap().run(&mut g);
+    let ids: Vec<String> = r
+        .iter()
+        .map(|v| match v {
+            GVal::Str(s) => s.to_string(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(ids, vec!["e-b", "e-a"]);
+}
+
+#[test]
 fn out_multi_label_order_matters() {
     assert_eq!(
         ordered(q(g()
