@@ -409,6 +409,18 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(() => nativeGraph.query(`RETURN $t AS t`, { t: { '@time': '12:00:00' } })).toThrow();
   });
 
+  // --- nested non-finite under DISTINCT: persons have `age` (sqrt(age-100)=NaN),
+  // software nodes don't (sqrt(null)=null), so `[sqrt(age-100)]` yields the two
+  // groups [NaN] and [null] in BOTH engines. The TS distinct key once JSON.stringify'd
+  // the list, folding NaN into null (one group) — Rust's bit-keyed val_key never did.
+  // Now the key tags non-finite at any depth, so the partition matches.
+  test('nested non-finite in a DISTINCT list stays distinct, byte-identical', () => {
+    const q = `MATCH (n) RETURN DISTINCT [sqrt(n.age - 100)] AS k`;
+    const [ts, native] = both(q);
+    expect(ts).toBe(native);
+    expect(JSON.parse(ts)).toHaveLength(2);
+  });
+
   // --- ANY SHORTEST: the path value serializes byte-identically across engines.
   test('RETURN p — a shortest Path is {vertices, edges, length}, byte-identical', () => {
     const q = `MATCH p = ANY SHORTEST (a)-[]->*(b) WHERE a.name = 'marko' AND b.name = 'lop' RETURN p`;

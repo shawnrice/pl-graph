@@ -1499,19 +1499,69 @@ export const compareSort = (
   return compareValues(a, b) * (descending ? -1 : 1);
 };
 
-/** Stable distinct key for a projected binding; graph elements key by id. */
+// The replacer used only for nested containers (below): `JSON.stringify` maps
+// NaN/±Infinity all to `null`, collapsing them with each other AND with real null —
+// a byte-identity break vs the Rust `val_key`, which keys numbers by bit pattern
+// (so `[NaN]`, `[Infinity]`, `[null]` are three groups). This tags non-finite
+// numbers as bare `#…` tokens and prefixes every string with `$`, keeping the two
+// key-spaces disjoint at any depth — a real string `"#Infinity"` (→ `"$#Infinity"`)
+// can never collide with the number `Infinity` (→ `"#Infinity"`).
+const keyReplacer = (_k: string, val: unknown): unknown => {
+  if (typeof val === 'number') {
+    return Number.isFinite(val) ? val : `#${val}`;
+  }
+
+  return typeof val === 'string' ? `$${val}` : val;
+};
+
+/**
+ * Stable distinct/group key for a projected value, partitioning exactly as the
+ * Rust `val_key`. Primitives and graph elements are keyed inline (the common
+ * DISTINCT/GROUP BY case — no `JSON.stringify`, so it's off the hot path); only a
+ * nested container (list/record/temporal/path — rare as a group key) pays the
+ * `JSON.stringify` + `keyReplacer` cost, which is what makes nested non-finite safe.
+ * Type-tag prefixes (`n`/`s`/`b`/`@`/`#`/`N`) keep the primitive key-spaces disjoint
+ * from each other and from container JSON (which starts with `{`/`[`).
+ */
 export const valueKey = (v: unknown): string => {
-  if (v && typeof v === 'object' && 'id' in v) {
-    return `@${String((v as { id: unknown }).id)}`;
-  }
+  switch (typeof v) {
+    case 'number':
+      return Number.isFinite(v) ? `n${v}` : `#${v}`;
+    case 'string':
+      return `s${v}`;
+    case 'boolean':
+      return v ? 'bT' : 'bF';
+    case 'object':
+      if (v === null) {
+        return 'N';
+      }
 
-  // `JSON.stringify` maps NaN and ±Infinity all to `"null"`, collapsing them
-  // into the real-null group (and each other). Tag non-finite numbers distinctly.
-  if (typeof v === 'number' && !Number.isFinite(v)) {
-    return `#${String(v)}`;
-  }
+      if ('id' in v) {
+        return `@${String((v as { id: unknown }).id)}`;
+      }
 
-  return JSON.stringify(v) ?? 'undefined';
+      // Lists are native arrays (the common container key): recurse through the
+      // inline keyer — no JSON.stringify, and nested non-finite is handled by the
+      // element's own `#…` tag. `[` can't collide with a record's `{` (below) or
+      // any primitive prefix. A manual loop (no `.map` intermediate) keeps this on
+      // the hot path for large DISTINCT/GROUP BY over projected tuples.
+      if (Array.isArray(v)) {
+        let key = '[';
+
+        for (const item of v) {
+          key += `${valueKey(item)},`;
+        }
+
+        return `${key}]`;
+      }
+
+      // Record / temporal / path — rarer as a group key; JSON.stringify + the
+      // replacer keeps their nested non-finite safe too.
+      return JSON.stringify(v, keyReplacer) ?? 'undefined';
+    default:
+      // undefined / bigint / symbol are outside the value model; a stable fallback.
+      return `j${String(v)}`;
+  }
 };
 const rowKey = (b: Binding): string => [...b].map(([k, v]) => `${k}=${valueKey(v)}`).join('');
 
