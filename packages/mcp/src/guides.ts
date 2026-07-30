@@ -653,9 +653,9 @@ Hand the matrix to your training code as Apache Arrow (see the \`arrow\` guide):
 
 const gotchasGuide: Guide = {
   id: 'gotchas',
-  title: 'Gotchas & footguns',
+  title: 'Common pitfalls',
   description: 'Reserved-word aliases, temporal typing, categorical outputs, and Cypher-isms.',
-  text: `# Gotchas & footguns
+  text: `# Common pitfalls
 
 A few behaviors worth knowing — mostly around reserved words and silently-empty results.
 
