@@ -14,7 +14,7 @@
 /// The base seed for a run: `FUZZ_SEED` if set (decimal or `0x…` hex), else derived
 /// from the wall clock. Never 0 — xorshift needs nonzero state. (`SystemTime` is
 /// fine in a normal `cargo test`; only Workflow scripts forbid the wall clock.)
-fn fuzz_seed() -> u64 {
+pub(crate) fn fuzz_seed() -> u64 {
     if let Ok(s) = std::env::var("FUZZ_SEED") {
         let s = s.trim();
         let parsed = s.strip_prefix("0x").map_or_else(
@@ -33,9 +33,9 @@ fn fuzz_seed() -> u64 {
 }
 
 // A tiny deterministic PRNG (xorshift64*), so a run replays exactly from its seed.
-struct Rng(u64);
+pub(crate) struct Rng(pub u64);
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -43,7 +43,7 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
-    fn below(&mut self, n: usize) -> usize {
+    pub(crate) fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
 }

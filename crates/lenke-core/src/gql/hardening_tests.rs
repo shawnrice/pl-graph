@@ -736,3 +736,142 @@ fn h_trail_budget_guards_dense_unbounded_star() {
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::ResourceExhausted);
 }
+
+// ---------------------------------------------------------------------------
+// § — INSERT with a REPEATED property key indexes only the surviving value
+//
+// `INSERT (:P {k: 1, k: 2})` stores last-wins (`2`), and the TS engine agrees.
+// The insert path used to apply the index once per PAIR, so each repeat left a
+// live entry pointing at a value the element no longer held. Those stale entries
+// never produced a wrong-value match — the final WHERE re-verifies — but they
+// duplicated the element in any candidate set seeded from the index, so a seek
+// returned more rows than the scan for the same query. Found by the
+// index-equivalence fuzzer.
+// ---------------------------------------------------------------------------
+
+/// An empty graph indexed on `k`, loaded with `stmts`.
+fn indexed_on_k(stmts: &[&str], edge: bool) -> Graph {
+    let mut g = ndjson::decode("").expect("empty ndjson decodes");
+
+    if edge {
+        g.create_edge_index("k");
+    } else {
+        g.create_vertex_index("k");
+    }
+    for s in stmts {
+        rows(&mut g, s);
+    }
+
+    g
+}
+
+#[test]
+fn h_insert_repeated_key_stores_last_value() {
+    let mut g = indexed_on_k(&["INSERT (:P {id: 'a', k: 1, k: 'zz'})"], false);
+
+    assert_eq!(rows(&mut g, "MATCH (n) RETURN n.k"), vec![vec![s("zz")]]);
+}
+
+#[test]
+fn h_insert_repeated_key_leaves_no_stale_index_entry() {
+    let mut g = indexed_on_k(&["INSERT (:P {id: 'a', k: 1, k: 'zz'})"], false);
+
+    // The overwritten value must not seek the element.
+    assert!(
+        rows(&mut g, "MATCH (n) WHERE n.k = 1 RETURN n.id").is_empty(),
+        "the discarded value 1 should not seek the node"
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH (n) WHERE n.k = 'zz' RETURN n.id"),
+        vec![vec![s("a")]]
+    );
+}
+
+#[test]
+fn h_insert_repeated_key_does_not_duplicate_rows() {
+    // An index-driven candidate set must yield the element ONCE, however many
+    // times the insert repeated the key.
+    let mut g = indexed_on_k(&["INSERT (:P {id: 'a', k: 1, k: 5, k: 9})"], false);
+
+    assert_eq!(
+        rows(&mut g, "MATCH (n) WHERE n.k <> 999 RETURN n.id"),
+        vec![vec![s("a")]],
+        "three assignments to `k` must not yield three rows"
+    );
+}
+
+#[test]
+fn h_insert_repeated_key_seek_agrees_with_scan() {
+    let stmts = [
+        "INSERT (:P {id: 'a', k: 1, k: 9})",
+        "INSERT (:P {id: 'b', k: 9})",
+        "INSERT (:P {id: 'c', k: 1})",
+    ];
+    let mut indexed = indexed_on_k(&stmts, false);
+    let mut plain = ndjson::decode("").expect("empty ndjson decodes");
+
+    for st in stmts {
+        rows(&mut plain, st);
+    }
+    for qry in [
+        "MATCH (n) WHERE n.k = 9 RETURN n.id",
+        "MATCH (n) WHERE n.k = 1 RETURN n.id",
+        "MATCH (n) WHERE n.k <> 0 RETURN n.id",
+    ] {
+        // Sorted, because seeding from an index legitimately changes row order.
+        let key = |rs: Vec<Vec<Value>>| {
+            let mut ks: Vec<String> = rs.iter().map(|r| format!("{r:?}")).collect();
+            ks.sort();
+            ks
+        };
+
+        assert_eq!(
+            key(rows(&mut plain, qry)),
+            key(rows(&mut indexed, qry)),
+            "seek disagreed with scan for `{qry}`"
+        );
+    }
+}
+
+#[test]
+fn h_insert_edge_repeated_key_leaves_no_stale_index_entry() {
+    // The edge insert path has its own copy of the loop, so it needs its own case.
+    let mut g = indexed_on_k(
+        &[
+            "INSERT (:P {id: 'a'})",
+            "INSERT (:P {id: 'b'})",
+            "MATCH (a) WHERE a.id = 'a' MATCH (b) WHERE b.id = 'b' \
+             INSERT (a)-[:R {k: 1, k: 7}]->(b)",
+        ],
+        true,
+    );
+
+    assert_eq!(
+        rows(&mut g, "MATCH ()-[e]->() RETURN e.k"),
+        vec![vec![n(7.0)]]
+    );
+    assert!(
+        rows(&mut g, "MATCH ()-[e]->() WHERE e.k = 1 RETURN e.k").is_empty(),
+        "the discarded edge value 1 should not seek the edge"
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH ()-[e]->() WHERE e.k <> 0 RETURN e.k"),
+        vec![vec![n(7.0)]],
+        "the edge must appear once, not once per repeat"
+    );
+}
+
+#[test]
+fn h_insert_without_repeats_is_unchanged() {
+    // The dedupe must be inert on the overwhelmingly common shape: no repeats,
+    // every key still present with its own value.
+    let mut g = indexed_on_k(
+        &["INSERT (:P {id: 'a', k: 1, other: 2, third: 'x'})"],
+        false,
+    );
+
+    assert_eq!(
+        rows(&mut g, "MATCH (n) RETURN n.k, n.other, n.third"),
+        vec![vec![n(1.0), n(2.0), s("x")]]
+    );
+}

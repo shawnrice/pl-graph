@@ -23,6 +23,8 @@ pub mod plan;
 #[cfg(test)]
 mod hardening_tests;
 #[cfg(test)]
+mod index_equivalence_fuzz;
+#[cfg(test)]
 mod index_seed_tests;
 #[cfg(test)]
 mod language_tests;

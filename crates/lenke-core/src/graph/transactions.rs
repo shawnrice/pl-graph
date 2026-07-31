@@ -4,6 +4,37 @@
 //! `impl Graph` block; shares helper types via `use super::*`.
 use super::*;
 
+/// Collapse repeated keys in a new element's property list to their **last**
+/// value. `set_value` already stores last-wins (`INSERT (:P {k: 1, k: 2})` keeps
+/// `2`, and the TS engine agrees), but the insert loop below applies the index
+/// once per PAIR — so without this collapse a repeated key left one live index
+/// entry per repeat while storage kept only the final value. Those stale entries
+/// never produced a wrong-value match (the final WHERE re-verifies) but they did
+/// duplicate the element in any candidate set seeded from the index, so the same
+/// query answered by a seek returned more rows than the scan.
+///
+/// The common case has no repeats and returns the list untouched; only a list
+/// that actually repeats a key pays for the rebuild.
+fn dedupe_props_last_wins(props: Vec<(String, Value)>) -> Vec<(String, Value)> {
+    let has_repeat = {
+        let mut seen = std::collections::HashSet::with_capacity(props.len());
+        props.iter().any(|(k, _)| !seen.insert(k.as_str()))
+    };
+    if !has_repeat {
+        return props;
+    }
+
+    let mut kept: Vec<(String, Value)> = Vec::with_capacity(props.len());
+    for (k, v) in props.into_iter().rev() {
+        if !kept.iter().any(|(seen, _)| *seen == k) {
+            kept.push((k, v));
+        }
+    }
+    kept.reverse();
+
+    kept
+}
+
 impl Graph {
     // --- reactive change tracking ----------------------------------------
 
@@ -542,7 +573,7 @@ impl Graph {
         self.out.push(Vec::new());
         self.in_.push(Vec::new());
         self.props.push_element();
-        for (k, v) in props {
+        for (k, v) in dedupe_props_last_wins(props) {
             if self.any_vidx_rooted_at(&k) {
                 idx_apply(&mut self.vidx, &k, vi, &v, true);
             }
@@ -590,7 +621,7 @@ impl Graph {
             etype: tid,
         });
         self.edge_props.push_element();
-        for (k, v) in props {
+        for (k, v) in dedupe_props_last_wins(props) {
             if self.any_eidx_rooted_at(&k) {
                 idx_apply(&mut self.eidx, &k, ei, &v, true);
             }
