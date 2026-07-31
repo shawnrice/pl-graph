@@ -320,3 +320,40 @@ fn repeat_emit_loops_predicate_offset() {
         vec!["josh", "lop", "lop", "ripple", "vadas"]
     );
 }
+
+#[test]
+fn id_of_a_non_element_is_null() {
+    // `id()` used to pass a non-element THROUGH unchanged, so `path().id()` handed
+    // the paths back instead of nulls — and a following numeric step then faulted
+    // on them where the TS engine summed nulls. Its sibling `label()` already
+    // returned null here, and so does the TS engine. Found by the Gremlin
+    // differential fuzzer.
+    let ids = q(g().E().path().id());
+    assert_eq!(ids.len(), 6);
+    assert!(
+        ids.iter().all(|v| matches!(v, GVal::Null)),
+        "path().id() must be null, got {ids:?}"
+    );
+
+    // The sibling accessor agrees — that symmetry is the actual invariant.
+    assert_eq!(ids, q(g().E().path().label()));
+}
+
+#[test]
+fn summing_the_ids_of_non_elements_is_an_all_null_fold_not_a_fault() {
+    // The shape the fuzzer hit. `try_run` (not the `q` helper) on purpose: `run`
+    // SWALLOWS a data fault, so summing the un-nulled paths would still have
+    // looked fine here — and that fault is exactly what this rules out.
+    let mut graph = modern();
+    let out = super::try_run(&mut graph, &g().E().path().id().sum());
+
+    assert!(matches!(out.as_deref(), Ok([GVal::Null])), "got {out:?}");
+}
+
+#[test]
+fn id_of_a_real_element_still_reports_it() {
+    // The null case must not swallow the real one.
+    let ids = q(g().V().has_label(&["SOFTWARE"]).id());
+    assert_eq!(ids.len(), 2);
+    assert!(ids.iter().all(|v| matches!(v, GVal::Str(_))), "got {ids:?}");
+}

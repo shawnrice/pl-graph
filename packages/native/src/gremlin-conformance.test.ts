@@ -25,7 +25,7 @@
 import { describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
-import { Graph, isElement } from '@lenke/core';
+import { Edge, Graph, isElement } from '@lenke/core';
 import { ErrorCode, hasErrorCode } from '@lenke/errors';
 import {
   V,
@@ -117,9 +117,15 @@ const MODERN_NDJSON = [
 
 // --- canonJson: normalize a TS result to the Rust JSON-carrier shape --------
 //
-// `results_to_json` (exec.rs) emits: vertices/edges → {id, label}; lists →
-// arrays; maps → string-keyed objects; and `Number::from_f64` maps non-finite
+// `results_to_json` (exec.rs) emits the RICH element form — a vertex as
+// `{id, labels, properties}` and an edge as `{id, from, to, labels, properties}`,
+// property keys sorted, the same shapes GQL uses for a returned node/edge; lists
+// → arrays; maps → string-keyed objects; and `Number::from_f64` maps non-finite
 // → null. `canonJson` reproduces exactly that so the two sides are comparable.
+//
+// This said `{id, label}` until 2026-07-31, which no test caught because no case
+// returned a bare element — so element results were never compared across the two
+// engines at all. The Gremlin fuzzer found it; the cases below now cover it.
 
 export const canonJson = (v: unknown): unknown => {
   if (v === null || typeof v === 'boolean' || typeof v === 'string') {
@@ -135,7 +141,19 @@ export const canonJson = (v: unknown): unknown => {
   }
 
   if (isElement(v)) {
-    return { id: v.id, label: [...v.labels][0] ?? '' };
+    const properties: Record<string, unknown> = {};
+
+    for (const k of Object.keys(v.properties).sort()) {
+      properties[k] = canonJson(v.properties[k]);
+    }
+
+    const labels = [...v.labels].sort();
+
+    // Key ORDER matters: these are compared as parsed JSON, but authoring them in
+    // the engine's order keeps the corpus readable next to real output.
+    return v instanceof Edge
+      ? { id: v.id, from: v.from.id, to: v.to.id, labels, properties }
+      : { id: v.id, labels, properties };
   }
 
   if (Array.isArray(v)) {
@@ -211,6 +229,39 @@ const CORPUS: Case[] = [
     name: "V().hasLabel('SOFTWARE').count()",
     plan: traversal(V(), hasLabel('SOFTWARE'), count()),
     verdict: { kind: 'agree', expected: [2] },
+  },
+  // Returning bare ELEMENTS — the shape the canonicalizer got wrong for months
+  // because nothing exercised it. A vertex carries {id, labels, properties}; an
+  // edge additionally carries {from, to}.
+  {
+    name: "V().has('name', eq('marko')) — a returned vertex is the rich form",
+    plan: traversal(V(), has('name', eq('marko'))),
+    verdict: {
+      kind: 'agree',
+      expected: [{ id: '1', labels: ['PERSON'], properties: { age: 29, name: 'marko' } }],
+    },
+  },
+  {
+    name: "V().has('name', eq('marko')).outE('KNOWS') — a returned edge carries from/to",
+    plan: traversal(V(), has('name', eq('marko')), outE('KNOWS')),
+    verdict: {
+      kind: 'agree',
+      expected: [
+        { id: '7', from: '1', to: '2', labels: ['KNOWS'], properties: { weight: 0.5 } },
+        { id: '8', from: '1', to: '4', labels: ['KNOWS'], properties: { weight: 1.0 } },
+      ],
+    },
+  },
+  {
+    name: "V().hasLabel('SOFTWARE') — elements inside a list keep the rich form",
+    plan: traversal(V(), hasLabel('SOFTWARE')),
+    verdict: {
+      kind: 'agree',
+      expected: [
+        { id: '3', labels: ['SOFTWARE'], properties: { lang: 'java', name: 'lop' } },
+        { id: '5', labels: ['SOFTWARE'], properties: { lang: 'java', name: 'ripple' } },
+      ],
+    },
   },
   {
     name: "V().has('age', gt(30)).values('name')",
