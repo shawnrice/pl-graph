@@ -68,6 +68,8 @@ This is a well-trodden problem, and the standard answer is to **name one referen
 
 lenke has not made that move yet. If cross-machine reproducibility matters more to you than matching the host's libm, say so — routing the Rust engine through its own compiled-in math on native as well as wasm would make **every** Rust build agree on every operating system, at the cost of widening the pure-TS gap. Today's default instead keeps pure-TS and native closely aligned and accepts that native tracks the host.
 
+How far apart are they in practice? The worst single-call disagreement measured is **4 ulp — agreement to 15.3 significant digits** (`power(0.1, 10)`), and it does not meaningfully compound: an aggregate over 2000 rows still agrees to ~14 significant digits. So the gap is far below any tolerance you would set. The reason it matters anyway is **equality, not accuracy** — a 1-ulp difference still puts the same logical value in different `DISTINCT`/`GROUP BY` buckets on the two builds. The measured costs of each way out are recorded in [numeric-determinism](../design/numeric-determinism.md).
+
 If a number has to match bit-for-bit across builds today, round it at the boundary (`round(x, 9)`) or compare it with a tolerance. Everything outside that function list — including all of the graph algorithms, the storage layer and every serialization codec — is safe to compare exactly.
 
 ## Memory model
