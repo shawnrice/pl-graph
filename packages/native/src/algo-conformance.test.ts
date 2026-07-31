@@ -36,7 +36,7 @@ import { query as tsQuery } from '@lenke/gql';
 import { deserialize as tsDeserialize } from '@lenke/serialization';
 
 import { createFfiBackend } from './backend-ffi.js';
-import { graphFromFormat } from './graph.js';
+import { graphFromNdjson } from './graph.js';
 
 // --- native library bootstrap (mirrors gql-conformance.test.ts) -------------
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
@@ -73,7 +73,7 @@ const MODERN_NDJSON = [
 
 suite('graph-algorithm differential: degree (TS core vs native)', () => {
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, MODERN_NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, MODERN_NDJSON);
   const tsGraph = tsDeserialize(MODERN_NDJSON, 'ndjson', new Graph());
 
   const both = async (config: AlgorithmConfig): Promise<[string, string]> => [
@@ -144,7 +144,7 @@ const TWO_COMPONENT_NDJSON = [
 
 suite('graph-algorithm differential: connectedComponents (TS core vs native)', () => {
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, TWO_COMPONENT_NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, TWO_COMPONENT_NDJSON);
   const tsGraph = tsDeserialize(TWO_COMPONENT_NDJSON, 'ndjson', new Graph());
 
   for (const config of [{} as const, { edgeLabel: 'E' } as const, { edgeLabel: 'NOPE' } as const]) {
@@ -201,7 +201,7 @@ const LABELPROP_NDJSON = [
 
 suite('graph-algorithm differential: labelPropagation (TS core vs native)', () => {
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, LABELPROP_NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, LABELPROP_NDJSON);
   const tsGraph = tsDeserialize(LABELPROP_NDJSON, 'ndjson', new Graph());
 
   for (const config of [
@@ -253,7 +253,7 @@ const PEERPRESSURE_NDJSON = [
 
 suite('graph-algorithm differential: peerPressure (TS core vs native, f64 votes)', () => {
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, PEERPRESSURE_NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, PEERPRESSURE_NDJSON);
   const tsGraph = tsDeserialize(PEERPRESSURE_NDJSON, 'ndjson', new Graph());
 
   for (const config of [
@@ -304,7 +304,7 @@ const PAGERANK_NDJSON = [
 
 suite('graph-algorithm differential: pagerank (TS core vs native, f64)', () => {
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, PAGERANK_NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, PAGERANK_NDJSON);
   const tsGraph = tsDeserialize(PAGERANK_NDJSON, 'ndjson', new Graph());
 
   for (const config of [
@@ -354,7 +354,7 @@ const ZERO_WEIGHT_NDJSON = [
 
 suite('graph-algorithm differential: weighted pagerank with a zero-out-weight node', () => {
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, ZERO_WEIGHT_NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, ZERO_WEIGHT_NDJSON);
   const tsGraph = tsDeserialize(ZERO_WEIGHT_NDJSON, 'ndjson', new Graph());
 
   for (const config of [
@@ -396,7 +396,7 @@ const SHORTEST_NDJSON = [
 
 suite('graph-algorithm differential: shortestPath (TS core vs native)', () => {
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, SHORTEST_NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, SHORTEST_NDJSON);
   const tsGraph = tsDeserialize(SHORTEST_NDJSON, 'ndjson', new Graph());
 
   for (const config of [
@@ -489,7 +489,7 @@ const CENTRALITY_NDJSON = [
 
 suite('graph-algorithm differential: betweenness (Brandes, TS core vs native)', () => {
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, CENTRALITY_NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, CENTRALITY_NDJSON);
   const tsGraph = tsDeserialize(CENTRALITY_NDJSON, 'ndjson', new Graph());
 
   for (const config of [
@@ -530,7 +530,7 @@ suite('graph-algorithm differential: betweenness (Brandes, TS core vs native)', 
 
 suite('graph-algorithm differential: closeness (TS core vs native)', () => {
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, CENTRALITY_NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, CENTRALITY_NDJSON);
   const tsGraph = tsDeserialize(CENTRALITY_NDJSON, 'ndjson', new Graph());
 
   for (const config of [
@@ -590,7 +590,7 @@ const FEATURE_NDJSON = [
 
 suite('graph-algorithm differential: neighborAggregate (TS core vs native)', () => {
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, FEATURE_NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, FEATURE_NDJSON);
   const tsGraph = tsDeserialize(FEATURE_NDJSON, 'ndjson', new Graph());
 
   const both = async (config: AlgorithmConfig): Promise<[string, string]> => [
@@ -648,7 +648,7 @@ suite('graph-algorithm differential: neighborAggregate (TS core vs native)', () 
     '{"type":"edge","from":"b","to":"c","labels":["R"],"properties":{"w":3.1}}',
     '{"type":"edge","from":"c","to":"a","labels":["R"],"properties":{"w":1.2}}',
   ].join('\n');
-  const natW = graphFromFormat(backend, WEIGHTED, 'ndjson');
+  const natW = graphFromNdjson(backend, WEIGHTED);
   const tsW = tsDeserialize(WEIGHTED, 'ndjson', new Graph());
 
   for (const op of ['mean', 'sum'] as const) {

@@ -838,6 +838,15 @@ pub enum CClause {
         pred: CExpr,
         prog: Program,
     },
+    /// `ORDER BY … [OFFSET n] [LIMIT n]` as a STATEMENT — sort and/or slice the
+    /// working binding table in place. Distinct from a projection's trailing
+    /// paging: there is no projection here, so the sort keys read the binding
+    /// scope directly and a later RETURN only ever projects the surviving rows.
+    Page {
+        order_by: Vec<CSortItem>,
+        skip: Option<CCount>,
+        limit: Option<CCount>,
+    },
     /// `LET x = e, …` — bind new value variables (additive). Each `(slot, expr,
     /// prog)` is evaluated and stored, left-to-right (a later item sees earlier).
     Let(Vec<(usize, CExpr, Program)>),
@@ -1979,6 +1988,27 @@ impl Lowerer {
                 let pred = self.expr(cond);
                 let prog = compile_program(&pred);
                 CClause::Filter { pred, prog }
+            }
+            Clause::Page(p) => {
+                // Sort keys are ordinary expressions over the CURRENT scope — the
+                // working table — so they lower exactly like a FILTER predicate.
+                // No projection, no new vars, no aggregate lifting (an aggregate
+                // here has no group to fold and is rejected by the same rule that
+                // rejects one in a FILTER).
+                let order_by = p
+                    .order_by
+                    .iter()
+                    .map(|it| CSortItem {
+                        expr: self.expr(&it.expr),
+                        descending: it.descending,
+                        nulls_first: it.nulls_first,
+                    })
+                    .collect();
+                CClause::Page {
+                    order_by,
+                    skip: self.count_bound(&p.skip),
+                    limit: self.count_bound(&p.limit),
+                }
             }
             Clause::Let(items) => {
                 // Each binding is compiled against the scope so far (prior LET vars

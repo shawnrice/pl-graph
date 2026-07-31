@@ -1,4 +1,6 @@
-import { graphFromNdjson } from '@lenke/native';
+import {
+  graphFromNdjson,
+} from '@lenke/native';
 import { createNodeBackend } from '@lenke/node/backend';
 
 const nd = [

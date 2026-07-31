@@ -4,7 +4,11 @@
 
 import { readFile } from 'node:fs/promises';
 
-import { createStore, graphFromNdjson, type Store } from '@lenke/native';
+import {
+  createStore,
+  graphFromNdjson,
+  type Store,
+} from '@lenke/native';
 import { createWasmBackend } from '@lenke/native/wasm';
 
 import { BACKLINKS, TAG_COUNTS, seedNdjson, type Backlink, type TagCount } from './data.ts';

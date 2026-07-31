@@ -1,4 +1,7 @@
-import { createStore, graphFromNdjson } from '@lenke/native';
+import {
+  createStore,
+  graphFromNdjson,
+} from '@lenke/native';
 // BONUS: propagate a tuple write to a second in-process replica via @lenke/sync.
 //
 // Two independent authz graphs (primary + replica), each fronted by a SyncHost.

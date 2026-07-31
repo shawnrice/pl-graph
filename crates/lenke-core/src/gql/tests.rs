@@ -9753,3 +9753,591 @@ fn bench_bitemporal_4way() {
         s / b
     );
 }
+
+// --- fuzzer-found byte-identity regressions ----------------------------------
+// Each of these pins a divergence the differential fuzzer surfaced between this
+// engine and the TS twin. They are the permanent guards; the fuzzer itself is
+// randomized and only rediscovers a regression by luck.
+
+#[test]
+fn stddev_over_non_numeric_values_is_null_not_zero() {
+    // A non-numeric value coerces to NaN, so the variance is NaN — and must STAY
+    // NaN (→ null on output), like `avg`. The negative-variance clamp used
+    // `f64::max`, which returns the non-NaN operand (`NAN.max(0.0)` == 0.0) and so
+    // reported a real 0. JS `Math.max(0, NaN)` is NaN, so the TS twin said null.
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"1","labels":["T"],"properties":{"n":3,"s":"a"}}"#,
+        r#"{"type":"node","id":"2","labels":["T"],"properties":{"n":7,"s":"z"}}"#,
+    ]);
+    // NaN is the in-engine spelling of "no value"; it serializes to JSON null,
+    // which is what the TS twin returns. A real 0 would serialize as 0.
+    let is_nan = |g: &mut Graph, q: &str| match rows(g, q).as_slice() {
+        [row] => matches!(row.as_slice(), [Value::Num(x)] if x.is_nan()),
+        _ => false,
+    };
+    assert!(is_nan(&mut g, "MATCH (n:T) RETURN stddev_pop(n.s) AS x"));
+    assert!(is_nan(&mut g, "MATCH (n:T) RETURN stddev_samp(n.s) AS x"));
+    // A single non-numeric value among numbers poisons the whole aggregate.
+    assert!(is_nan(
+        &mut g,
+        "MATCH (n:T) RETURN stddev_pop(CASE WHEN n.n = 3 THEN 3 ELSE 'a' END) AS x"
+    ));
+    // Not a zero — the bug reported a real 0 here.
+    assert_ne!(
+        rows(&mut g, "MATCH (n:T) RETURN stddev_pop(n.s) AS x"),
+        vec![vec![n(0.0)]]
+    );
+}
+
+#[test]
+fn stddev_over_numbers_is_unaffected_by_the_nan_guard() {
+    // The NaN guard must not disturb the ordinary numeric path, including the
+    // genuinely-zero case (all values equal → variance 0) it has to stay distinct
+    // from, and the tiny-negative cancellation the clamp exists for.
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"1","labels":["T"],"properties":{"n":3,"k":5}}"#,
+        r#"{"type":"node","id":"2","labels":["T"],"properties":{"n":7,"k":5}}"#,
+    ]);
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) RETURN stddev_pop(n.n) AS x"),
+        vec![vec![n(2.0)]]
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) RETURN stddev_pop(n.k) AS x"),
+        vec![vec![n(0.0)]]
+    );
+    // stddev_samp needs 2+ rows; stddev_pop needs 1+. Neither is NaN here.
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) RETURN stddev_samp(n.k) AS x"),
+        vec![vec![n(0.0)]]
+    );
+}
+
+#[test]
+fn degrees_and_radians_use_the_multiply_then_divide_association() {
+    // `f64::to_degrees` is `n * (180/PI)` — it pre-rounds the constant and lands
+    // one ulp from `(n * 180) / PI`, which is what the TS twin computes. Multiply
+    // and divide are exactly specified by IEEE 754, so the two forms are
+    // reproducible and must be spelled the same way in both engines.
+    let mut g = modern();
+    assert_eq!(
+        rows(&mut g, "RETURN degrees(1e100) AS x"),
+        vec![vec![n((1e100 * 180.0) / std::f64::consts::PI)]]
+    );
+    assert_eq!(
+        rows(&mut g, "RETURN radians(3) AS x"),
+        vec![vec![n((3.0 * std::f64::consts::PI) / 180.0)]]
+    );
+    // The association actually differs for these inputs — guard against a silent
+    // revert to `to_degrees`/`to_radians`.
+    assert_ne!(
+        1e100_f64.to_degrees(),
+        (1e100 * 180.0) / std::f64::consts::PI
+    );
+    assert_ne!(3.0_f64.to_radians(), (3.0 * std::f64::consts::PI) / 180.0);
+}
+
+#[test]
+fn degrees_and_radians_round_trip_the_common_angles() {
+    let mut g = modern();
+    assert_eq!(rows(&mut g, "RETURN degrees(0) AS x"), vec![vec![n(0.0)]]);
+    assert_eq!(rows(&mut g, "RETURN radians(0) AS x"), vec![vec![n(0.0)]]);
+    assert_eq!(
+        rows(&mut g, "RETURN degrees(pi()) AS x"),
+        vec![vec![n(180.0)]]
+    );
+}
+
+#[test]
+fn zero_limit_returns_no_rows_without_evaluating_the_projection() {
+    // `LIMIT 0` emits no rows, so a faulting projection never runs — the same rule
+    // the engine already follows for a non-zero LIMIT ("project exactly the rows you
+    // emit"). Both engines used to decide this by whether an ORDER BY was present,
+    // and took OPPOSITE branches.
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"1","labels":["T"],"properties":{"n":3}}"#,
+        r#"{"type":"node","id":"2","labels":["T"],"properties":{"n":7}}"#,
+    ]);
+    let empty: Vec<Vec<Value>> = vec![];
+    assert_eq!(rows(&mut g, "MATCH (n:T) RETURN 1/0 AS x LIMIT 0"), empty);
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:T) RETURN 1/0 AS x, n.n AS t ORDER BY t LIMIT 0"
+        ),
+        empty
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) RETURN DISTINCT 1/0 AS x LIMIT 0"),
+        empty
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) RETURN sum(1/0) AS x LIMIT 0"),
+        empty
+    );
+    // An intermediate WITH carries the same rule.
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) WITH 1/0 AS x LIMIT 0 RETURN x"),
+        empty
+    );
+}
+
+#[test]
+fn a_nonzero_limit_still_evaluates_and_still_faults() {
+    // The short-circuit is for LIMIT 0 ONLY — a limit that keeps any row must
+    // still project it (and still raise the projection's fault).
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"1","labels":["T"],"properties":{"n":3}}"#,
+        r#"{"type":"node","id":"2","labels":["T"],"properties":{"n":7}}"#,
+    ]);
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) RETURN n.n AS x ORDER BY x LIMIT 1"),
+        vec![vec![n(3.0)]]
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) RETURN n.n AS x ORDER BY x LIMIT 2"),
+        vec![vec![n(3.0)], vec![n(7.0)]]
+    );
+    assert!(parse("MATCH (n:T) RETURN 1/0 AS x LIMIT 1")
+        .unwrap()
+        .execute(&mut g, &Params::new())
+        .is_err());
+    // SKIP past the end still evaluates — only a zero LIMIT short-circuits.
+    assert!(parse("MATCH (n:T) RETURN 1/0 AS x SKIP 5")
+        .unwrap()
+        .execute(&mut g, &Params::new())
+        .is_err());
+}
+
+#[test]
+fn distinct_and_group_by_treat_every_nan_as_one_value() {
+    // The grouping key was the raw bit pattern, but NaNs differ by sign and
+    // payload depending on which operation made them (`ln(-1)` vs `x / NaN`), so
+    // two NaNs landed in different DISTINCT groups. The engine's total order says
+    // NaN == NaN, and the TS twin keys all non-finite values by their rendered
+    // form, so both must collapse to one.
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"1","labels":["T"],"properties":{"n":3,"x":-1}}"#,
+        r#"{"type":"node","id":"2","labels":["T"],"properties":{"n":7,"x":4}}"#,
+    ]);
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:T) RETURN count(DISTINCT log('nan', n.x)) AS x"
+        ),
+        vec![vec![n(1.0)]]
+    );
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:T) RETURN count(DISTINCT (log('inf', n.x) * n.x)) AS x"
+        ),
+        vec![vec![n(1.0)]]
+    );
+    // A DISTINCT collect over the same NaNs yields ONE element.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:T) RETURN size(collect_list(DISTINCT log('nan', n.x))) AS x"
+        ),
+        vec![vec![n(1.0)]]
+    );
+}
+
+#[test]
+fn distinct_collapses_signed_zero_but_not_ordinary_values() {
+    // The canonicalization must not collapse anything else.
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"1","labels":["T"],"properties":{"n":3,"s":"a"}}"#,
+        r#"{"type":"node","id":"2","labels":["T"],"properties":{"n":7,"s":"z"}}"#,
+    ]);
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) RETURN count(DISTINCT n.n) AS x"),
+        vec![vec![n(2.0)]]
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) RETURN count(DISTINCT n.s) AS x"),
+        vec![vec![n(2.0)]]
+    );
+    // -0.0 and 0.0 are ONE group: `-0 = 0` is true, and the distinction is
+    // normalized everywhere else (ORDER BY, sign(), the result JSON, the property
+    // index), so two groups here would both render as `0`.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:T) RETURN count(DISTINCT CASE WHEN n.n = 3 THEN 0.0 ELSE -0.0 END) AS x"
+        ),
+        vec![vec![n(1.0)]]
+    );
+    // And a GROUP BY over the same values yields one group holding both rows.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:T) RETURN CASE WHEN n.n = 3 THEN 0.0 ELSE -0.0 END AS k, count(*) AS c GROUP BY k"
+        ),
+        vec![vec![n(0.0), n(2.0)]]
+    );
+    // Infinities stay distinct from each other and from NaN.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:T) RETURN count(DISTINCT CASE WHEN n.n = 3 THEN 1e100 ELSE -1e100 END) AS x"
+        ),
+        vec![vec![n(2.0)]]
+    );
+}
+
+#[test]
+fn a_numeric_string_that_overflows_is_not_a_number() {
+    // '1e1000' is a syntactically-valid literal that parses to Infinity. Both
+    // engines read a non-finite parse as "not a number" (NaN → null), so it never
+    // reaches a math function as Infinity.
+    let mut g = modern();
+    assert_eq!(
+        rows(&mut g, "RETURN (to_float('1e1000') IS NULL) AS x"),
+        vec![vec![b(true)]]
+    );
+    assert_eq!(
+        rows(&mut g, "RETURN (to_float('-1e1000') IS NULL) AS x"),
+        vec![vec![b(true)]]
+    );
+    // Just inside the range still converts.
+    assert_eq!(
+        rows(&mut g, "RETURN (to_float('1e300') IS NULL) AS x"),
+        vec![vec![b(false)]]
+    );
+    assert_eq!(
+        rows(&mut g, "RETURN sqrt('1e300') AS x"),
+        vec![vec![n(1e150)]]
+    );
+}
+
+#[test]
+fn the_total_order_ties_every_pair_in_the_catch_all_rank() {
+    // `type_rank` 4 holds graph elements, lists, and records. Same-kind pairs
+    // compare structurally (element-wise / field-wise); a MIXED pair — a list vs a
+    // record — is Equal, so a stable sort leaves it in input order. The TS twin
+    // fell through to JS `<`, which compared their string coercions ("1,2" vs
+    // "[object Map]") and invented an order this engine does not have.
+    let mut g = modern();
+    assert_eq!(
+        rows(&mut g, "RETURN list_sort([{a: 1}, [1, 2]]) AS x"),
+        rows(&mut g, "RETURN [{a: 1}, [1, 2]] AS x")
+    );
+    assert_eq!(
+        rows(&mut g, "RETURN list_sort([[1, 2], {a: 1}]) AS x"),
+        rows(&mut g, "RETURN [[1, 2], {a: 1}] AS x")
+    );
+}
+
+#[test]
+fn the_total_order_still_separates_the_type_groups_and_sorts_within_them() {
+    // The rank-4 tie must not weaken the rest of the order: the groups stay
+    // number < string < boolean < temporal < other, and same-kind values inside
+    // rank 4 still sort structurally.
+    let mut g = modern();
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN list_sort([[1, 2], date('2020-01-01'), {a: 1}, true, 'z', 3]) AS x"
+        ),
+        rows(
+            &mut g,
+            "RETURN [3, 'z', true, date('2020-01-01'), [1, 2], {a: 1}] AS x"
+        )
+    );
+    // Lists sort element-wise, records field-wise — both still total.
+    assert_eq!(
+        rows(&mut g, "RETURN list_sort([[3], [1], [2]]) AS x"),
+        rows(&mut g, "RETURN [[1], [2], [3]] AS x")
+    );
+    assert_eq!(
+        rows(&mut g, "RETURN list_sort([{b: 1}, {a: 1}]) AS x"),
+        rows(&mut g, "RETURN [{a: 1}, {b: 1}] AS x")
+    );
+}
+
+#[test]
+fn range_is_bounded_and_faults_past_the_budget() {
+    // A GQL list is materialized, so an unbounded `range` is an OOM kill rather
+    // than a query error. Past `RANGE_BUDGET` the call faults loudly.
+    let mut g = modern();
+    assert_eq!(
+        rows(&mut g, "RETURN size(range(0, 999999)) AS x"),
+        vec![vec![n(1_000_000.0)]]
+    );
+    let err = parse("RETURN size(range(0, 1000000)) AS x")
+        .unwrap()
+        .execute(&mut g, &Params::new())
+        .unwrap_err();
+    assert_eq!(err.code, crate::error_codes::ErrorCode::ResourceExhausted);
+    // The case that used to hang the process outright.
+    let err = parse("RETURN size(range(0, 1e21)) AS x")
+        .unwrap()
+        .execute(&mut g, &Params::new())
+        .unwrap_err();
+    assert_eq!(err.code, crate::error_codes::ErrorCode::ResourceExhausted);
+    // A wide step brings a wide span back under the budget.
+    assert_eq!(
+        rows(&mut g, "RETURN size(range(0, 1000000, 2)) AS x"),
+        vec![vec![n(500_001.0)]]
+    );
+}
+
+#[test]
+fn range_terminates_past_the_float_step_stall() {
+    // `i += 1.0` is a NO-OP once `i` reaches 2^53, so a comparison-driven loop
+    // (`while i <= e`) never terminates there — even for a 3-element span. The
+    // loop is count-driven, so it ends; the repeated-addition values themselves
+    // stall, which is the honest f64 result and identical in both engines.
+    let mut g = modern();
+    assert_eq!(
+        rows(
+            &mut g,
+            "RETURN size(range(to_float('9007199254740992'), to_float('9007199254740994'))) AS x"
+        ),
+        vec![vec![n(3.0)]]
+    );
+}
+
+#[test]
+fn range_keeps_its_ordinary_semantics() {
+    // The bound must not disturb the normal cases: inclusive of both bounds, a
+    // negative step counts down, an empty span yields [], a zero step is null.
+    let mut g = modern();
+    assert_eq!(
+        rows(&mut g, "RETURN range(0, 5) AS x"),
+        rows(&mut g, "RETURN [0, 1, 2, 3, 4, 5] AS x")
+    );
+    assert_eq!(
+        rows(&mut g, "RETURN range(5, 0, -1) AS x"),
+        rows(&mut g, "RETURN [5, 4, 3, 2, 1, 0] AS x")
+    );
+    assert_eq!(
+        rows(&mut g, "RETURN range(0, 10, 3) AS x"),
+        rows(&mut g, "RETURN [0, 3, 6, 9] AS x")
+    );
+    assert_eq!(
+        rows(&mut g, "RETURN range(0, 0) AS x"),
+        rows(&mut g, "RETURN [0] AS x")
+    );
+    assert_eq!(
+        rows(&mut g, "RETURN range(5, 0) AS x"),
+        rows(&mut g, "RETURN [] AS x")
+    );
+    assert_eq!(
+        rows(&mut g, "RETURN range(0, 10, 0) AS x"),
+        vec![vec![Value::Null]]
+    );
+}
+
+#[test]
+fn settings_are_configurable_per_graph() {
+    // The budgets are host policy, not semantics: a query under the ceiling
+    // behaves identically whatever the ceiling is, and tripping one is always a
+    // loud E_RESOURCE_EXHAUSTED.
+    use crate::graph::ConfigId;
+    let mut g = modern();
+    assert_eq!(g.limits().range, 1_000_000);
+    // Over the default ceiling → faults.
+    assert!(parse("RETURN size(range(0, 1000000)) AS x")
+        .unwrap()
+        .execute(&mut g, &Params::new())
+        .is_err());
+    // Raise it and the same query runs.
+    assert!(g.set_config(ConfigId::LimitsRange, 5_000_000));
+    assert_eq!(
+        rows(&mut g, "RETURN size(range(0, 1000000)) AS x"),
+        vec![vec![n(1_000_001.0)]]
+    );
+    // Lower it and a much smaller range now trips.
+    assert!(g.set_config(ConfigId::LimitsTrail, 25));
+    assert!(g.set_config(ConfigId::LimitsRange, 10));
+    assert!(parse("RETURN size(range(0, 20)) AS x")
+        .unwrap()
+        .execute(&mut g, &Params::new())
+        .is_err());
+    // Under the new ceiling it still works, unchanged.
+    assert_eq!(
+        rows(&mut g, "RETURN size(range(0, 5)) AS x"),
+        vec![vec![n(6.0)]]
+    );
+    assert_eq!(g.limits().trail, 25);
+}
+
+#[test]
+fn an_unknown_or_zero_setting_is_rejected_not_silently_ignored() {
+    // A host talking to an older artifact must be able to tell that its limit was
+    // not applied — silently running with the default is the failure mode this
+    // guards against. Zero is rejected for the same reason: it would fail every
+    // query, so it is never the intent.
+    use crate::graph::ConfigId;
+    let mut g = modern();
+    assert!(crate::graph::ConfigId::from_u32(0).is_some());
+    assert!(crate::graph::ConfigId::from_u32(3).is_some());
+    assert!(crate::graph::ConfigId::from_u32(99).is_none());
+    assert!(!g.set_config(ConfigId::LimitsRange, 0));
+    // The rejected write left the ceiling alone.
+    assert_eq!(g.limits().range, 1_000_000);
+}
+
+#[test]
+fn settings_survive_a_graph_clone() {
+    use crate::graph::ConfigId;
+    let mut g = modern();
+    assert!(g.set_config(ConfigId::LimitsRange, 42));
+    assert!(g.set_config(ConfigId::LimitsIntermediate, 4242));
+    let copy = g.clone();
+    assert_eq!(copy.limits().range, 42);
+    assert_eq!(copy.limits().intermediate, 4242);
+    assert_eq!(copy.limits().trail, 1_000_000);
+}
+
+#[test]
+fn the_operator_chain_ceiling_lives_in_the_same_config_space() {
+    // It used to be its own field with its own FFI export; folding it in is the
+    // point of the config space. The named getter still reads it.
+    use crate::graph::ConfigId;
+    let mut g = modern();
+    assert_eq!(g.max_operator_chain(), 10_000);
+    assert_eq!(g.limits().operator_chain, 10_000);
+    assert!(g.set_config(ConfigId::LimitsOperatorChain, 25));
+    assert_eq!(g.max_operator_chain(), 25);
+    // The named alias writes the same slot.
+    g.set_max_operator_chain(77);
+    assert_eq!(g.config().limits.operator_chain, 77);
+}
+
+// --- ISO <order by and page statement> in STATEMENT position ------------------
+// The ISO grammar puts `orderByAndPageStatement` in TWO places: trailing a RETURN
+// (`primitiveResultStatement`) and as a pipeline step of its own
+// (`primitiveQueryStatement`). These cover the second form, which sorts/slices the
+// working BINDING table before any projection runs.
+
+fn paged() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"1","labels":["T"],"properties":{"n":3,"s":"a"}}"#,
+        r#"{"type":"node","id":"2","labels":["T"],"properties":{"n":7,"s":"z"}}"#,
+        r#"{"type":"node","id":"3","labels":["T"],"properties":{"n":5,"s":"m"}}"#,
+    ])
+}
+
+#[test]
+fn a_standalone_order_by_statement_sorts_the_binding_table() {
+    let mut g = paged();
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) ORDER BY n.n RETURN n.n AS x"),
+        vec![vec![n(3.0)], vec![n(5.0)], vec![n(7.0)]]
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) ORDER BY n.n DESC RETURN n.n AS x"),
+        vec![vec![n(7.0)], vec![n(5.0)], vec![n(3.0)]]
+    );
+    // A string key sorts by the same total order as a projection's ORDER BY.
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) ORDER BY n.s RETURN n.s AS x"),
+        vec![vec![s("a")], vec![s("m")], vec![s("z")]]
+    );
+}
+
+#[test]
+fn a_standalone_limit_or_offset_statement_slices_the_binding_table() {
+    let mut g = paged();
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) ORDER BY n.n LIMIT 2 RETURN n.n AS x"),
+        vec![vec![n(3.0)], vec![n(5.0)]]
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) ORDER BY n.n OFFSET 1 RETURN n.n AS x"),
+        vec![vec![n(5.0)], vec![n(7.0)]]
+    );
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:T) ORDER BY n.n OFFSET 1 LIMIT 1 RETURN n.n AS x"
+        ),
+        vec![vec![n(5.0)]]
+    );
+    // OFFSET past the end is empty, not an error.
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) ORDER BY n.n OFFSET 99 RETURN n.n AS x"),
+        Vec::<Vec<Value>>::new()
+    );
+}
+
+#[test]
+fn a_standalone_page_statement_runs_before_the_projection() {
+    // The semantic point of the statement form: paging trims the binding table, so
+    // the RETURN only ever projects the survivors — a faulting projection on a
+    // dropped row never runs. (The trailing form reaches the same answer for
+    // LIMIT 0, but for a different reason; see the note on `project_to_rows`.)
+    let mut g = paged();
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) ORDER BY n.n LIMIT 0 RETURN 1/0 AS x"),
+        Vec::<Vec<Value>>::new()
+    );
+    // Only the kept row is projected, so dividing by `n.n - 7` is safe here.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:T) ORDER BY n.n LIMIT 1 RETURN 1/(n.n - 7) AS x"
+        ),
+        vec![vec![n(-0.25)]]
+    );
+}
+
+#[test]
+fn a_page_statement_composes_with_the_other_statements() {
+    let mut g = paged();
+    // After a FILTER, and feeding an aggregate.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:T) FILTER n.n > 3 ORDER BY n.n LIMIT 1 RETURN n.n AS x"
+        ),
+        vec![vec![n(5.0)]]
+    );
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:T) ORDER BY n.n LIMIT 2 RETURN count(*) AS c"
+        ),
+        vec![vec![n(2.0)]]
+    );
+    // Two paging statements in a row: the second applies to the first's output.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:T) ORDER BY n.n LIMIT 2 ORDER BY n.n DESC LIMIT 1 RETURN n.n AS x"
+        ),
+        vec![vec![n(5.0)]]
+    );
+    // The trailing form still works, and is unaffected.
+    assert_eq!(
+        rows(&mut g, "MATCH (n:T) RETURN n.n AS x ORDER BY x LIMIT 2"),
+        vec![vec![n(3.0)], vec![n(5.0)]]
+    );
+}
+
+#[test]
+fn a_page_statement_takes_a_dynamic_bound() {
+    // OFFSET/LIMIT accept a `$param` here exactly as they do trailing a RETURN —
+    // including the up-front bound check, so an unbound one is a clean
+    // MissingParameter rather than a surprise at row time.
+    let mut g = paged();
+    let mut params = Params::new();
+    params.insert("k".to_string(), super::eval::Val::Num(2.0));
+    assert_eq!(
+        qp(
+            &mut g,
+            "MATCH (n:T) ORDER BY n.n LIMIT $k RETURN n.n AS x",
+            params
+        ),
+        vec![vec![n(3.0)], vec![n(5.0)]]
+    );
+    let err = parse("MATCH (n:T) ORDER BY n.n LIMIT $k RETURN n.n AS x")
+        .unwrap()
+        .execute(&mut g, &Params::new())
+        .unwrap_err();
+    assert_eq!(err.code, crate::error_codes::ErrorCode::MissingParameter);
+}

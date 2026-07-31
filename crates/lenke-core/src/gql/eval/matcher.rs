@@ -1075,6 +1075,12 @@ pub(super) fn project_matches(
     matches: &[&CClause],
     proj: &CProjection,
 ) -> Vec<Binding> {
+    // A zero LIMIT carries no rows forward, so the projection never runs — the same
+    // rule `project_to_rows` applies to a terminal RETURN (see the note there), here
+    // for an intermediate `WITH … LIMIT 0`.
+    if proj.limit_val(ctx) == Some(0) {
+        return Vec::new();
+    }
     if use_vec() {
         if let Some(cols) = vectorized_cols(graph, ctx, incoming, matches, proj) {
             // WITH stage: carry output forward as bindings, *preserving* element

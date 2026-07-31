@@ -18,7 +18,7 @@ const NDJSON = [
 ].join('\n');
 
 const backend = createFfiBackend(LIB);
-const nativeGraph = graphFromFormat(backend, NDJSON, 'ndjson');
+const nativeGraph = graphFromNdjson(backend, NDJSON);
 const tsGraph = (await import('@lenke/serialization')).deserialize(NDJSON, 'ndjson', new Graph());
 
 type Case = { expr: string; params?: Record<string, unknown>; js?: unknown };

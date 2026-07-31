@@ -161,6 +161,44 @@ pub(super) fn run_linear_from(
                 bindings
                     .retain(|b| where_keep(&Env::new(graph, ctx!(), b), Some(pred), Some(prog)));
             }
+            CClause::Page {
+                order_by,
+                skip,
+                limit,
+            } => {
+                // ISO `<order by and page statement>` in statement position. Flush
+                // deferred matches (the sort keys may reference their vars), then
+                // sort and slice the working table. Because this runs BEFORE any
+                // projection, a later RETURN only ever projects the surviving rows.
+                if !pending.is_empty() {
+                    bindings = materialize_matches(graph, ctx!(), &bindings, &pending);
+                    pending.clear();
+                }
+                if !order_by.is_empty() {
+                    // Key each row once, then a STABLE sort — same comparator (and
+                    // so the same total order and NULLS FIRST/LAST handling) as a
+                    // projection's ORDER BY.
+                    let mut keyed: Vec<(Binding, Vec<Val>)> = bindings
+                        .drain(..)
+                        .map(|b| {
+                            let keys = {
+                                let env = Env::new(graph, ctx!(), &b);
+                                order_by.iter().map(|s| eval(&env, &s.expr)).collect()
+                            };
+                            (b, keys)
+                        })
+                        .collect();
+                    keyed.sort_by(|a, b| cmp_keyed(a, b, order_by));
+                    bindings = keyed.into_iter().map(|(b, _)| b).collect();
+                }
+                let start = count_of(skip.as_ref(), ctx!())
+                    .unwrap_or(0)
+                    .min(bindings.len());
+                bindings.drain(..start);
+                if let Some(n) = count_of(limit.as_ref(), ctx!()) {
+                    bindings.truncate(n);
+                }
+            }
             CClause::Let(items) => {
                 // Flush deferred matches, then bind each new variable into every
                 // row (left-to-right, so a later item sees an earlier one).

@@ -2218,6 +2218,19 @@ impl Parser {
         Ok((skip, limit))
     }
 
+    /// ISO `<order by and page statement>`: `ORDER BY …`, `OFFSET n`, `LIMIT n`,
+    /// in that order, at least one present (the caller only enters on one of the
+    /// three keywords, so that is guaranteed).
+    fn parse_page_clause(&mut self) -> R<PageClause> {
+        let order_by = self.parse_order_by()?;
+        let (skip, limit) = self.parse_paging()?;
+        Ok(PageClause {
+            order_by,
+            skip,
+            limit,
+        })
+    }
+
     fn parse_projection(&mut self) -> R<Projection> {
         let distinct = if self.check_kw("distinct") {
             self.advance();
@@ -2752,6 +2765,15 @@ impl Parser {
                 clauses.push(Clause::Let(self.parse_let_clause()?));
             } else if self.check_kw("filter") {
                 clauses.push(Clause::Filter(self.parse_filter_clause()?));
+            } else if self.check_kw("order") || self.check_kw("offset") || self.check_kw("limit") {
+                // ISO `<order by and page statement>` in its STATEMENT position —
+                // a pipeline step before the RETURN, sorting/slicing the binding
+                // table. `SKIP` is deliberately NOT a starter here: it is the
+                // Cypher synonym for OFFSET, and only the ISO spellings open a
+                // statement (it still works as a trailing modifier on a
+                // projection). Reached only when a clause is expected, so the
+                // trailing `RETURN … ORDER BY …` form is unaffected.
+                clauses.push(Clause::Page(self.parse_page_clause()?));
             } else if self.check_kw("for") {
                 clauses.push(Clause::For(self.parse_for_clause()?));
             } else if self.check_kw("call") || (self.check_kw("optional") && self.kw_after("call"))

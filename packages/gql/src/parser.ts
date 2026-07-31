@@ -69,6 +69,7 @@ import type {
   TypeTest,
   WithClause,
   FilterClause,
+  PageClause,
   LetClause,
   ForClause,
 } from './ast.js';
@@ -2254,6 +2255,39 @@ export const parse = (
   };
 
   // `FILTER [WHERE] <condition>` — ISO GQL §14.6 (the WHERE is optional noise).
+  // ISO `<order by and page statement>`: `ORDER BY …`, `OFFSET n`, `LIMIT n`, in
+  // that order, at least one present (the caller only enters on one of the three).
+  const parsePageClause = (): PageClause => {
+    let orderBy: SortItem[] | undefined;
+
+    if (checkKeyword('order')) {
+      advance();
+      expectKeyword('by');
+      orderBy = [parseSortItem()];
+
+      while (check('comma')) {
+        advance();
+        orderBy.push(parseSortItem());
+      }
+    }
+
+    let skip: CountValue | undefined;
+
+    if (checkKeyword('offset')) {
+      advance();
+      skip = expectCountValue('a non-negative integer after OFFSET', true);
+    }
+
+    let limit: CountValue | undefined;
+
+    if (checkKeyword('limit')) {
+      advance();
+      limit = expectCountValue('a non-negative integer after LIMIT', true);
+    }
+
+    return { kind: 'page', orderBy, skip, limit };
+  };
+
   const parseFilterClause = (): FilterClause => {
     expectKeyword('filter');
 
@@ -2619,6 +2653,14 @@ export const parse = (
         clauses.push(parseLetClause());
       } else if (checkKeyword('filter')) {
         clauses.push(parseFilterClause());
+      } else if (checkKeyword('order') || checkKeyword('offset') || checkKeyword('limit')) {
+        // ISO `<order by and page statement>` in its STATEMENT position — a
+        // pipeline step before the RETURN, sorting/slicing the binding table.
+        // `SKIP` is deliberately NOT a starter: it is the Cypher synonym for
+        // OFFSET, and only the ISO spellings open a statement (it still works as
+        // a trailing modifier on a projection). Reached only where a clause is
+        // expected, so the trailing `RETURN … ORDER BY …` form is unaffected.
+        clauses.push(parsePageClause());
       } else if (checkKeyword('for')) {
         clauses.push(parseForClause());
       } else if (checkKeyword('call') || (checkKeyword('optional') && kwAfter('call'))) {

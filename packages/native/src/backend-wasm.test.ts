@@ -119,10 +119,10 @@ suite('@lenke/native wasm backend', () => {
     const backend = await createWasmBackend(wasmBytes);
     const g = graphFromNdjson(backend, bytes);
 
-    for (const fmt of ['pg-json', 'pg-text', 'graphson', 'csv', 'ndjson']) {
+    for (const fmt of ['pg-json', 'pg-text', 'graphson', 'csv', 'ndjson'] as const) {
       const doc = g.serialize(fmt);
       expect(doc.length).toBeGreaterThan(0);
-      const g2 = graphFromFormat(backend, doc, fmt);
+      const g2 = graphFromFormat(backend, doc, { format: fmt });
       expect(g2.vertexCount).toBe(2);
       expect(g2.edgeCount).toBe(1);
       g2.free();

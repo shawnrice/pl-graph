@@ -31,7 +31,7 @@ console.log(
 // empty input on other native surfaces
 console.log('\n--- empty on other native surfaces ---');
 for (const fmt of ['ndjson', 'csv', 'pg-json', 'pg-text', 'graphson']) {
-  const r = classify(() => graphFromFormat(backend, '', fmt));
+  const r = classify(() => graphFromFormat(backend, '', { format: fmt }));
   console.log(
     `deserialize '' ${fmt}: ${r.kind} ${(r as any).code || (r as any).name || ''} ${((r as any).msg || '').slice(0, 60)}`,
   );

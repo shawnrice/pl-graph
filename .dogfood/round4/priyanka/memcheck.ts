@@ -1,4 +1,6 @@
-import { graphFromNdjson } from '@lenke/native';
+import {
+  graphFromNdjson,
+} from '@lenke/native';
 import { createNodeBackend } from '@lenke/node/backend';
 const before = process.memoryUsage().rss;
 const bytes = await Bun.file(`${import.meta.dir}/graph.ndjson`).bytes();

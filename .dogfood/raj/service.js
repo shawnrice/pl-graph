@@ -4,7 +4,9 @@
 // Exercises: createNodeBackend -> graphFromNdjson (bulk) -> mergeNdjson (+report)
 // -> createVertexIndex -> prepare() in a hot loop -> friend-of-friend / mutuals.
 
-import { graphFromNdjson } from '@lenke/native';
+import {
+  graphFromNdjson,
+} from '@lenke/native';
 import { createNodeBackend } from '@lenke/node/backend';
 
 import { makeBatch, toNdjson } from './seed.js';

@@ -1,4 +1,6 @@
-import { graphFromNdjson } from '@lenke/native';
+import {
+  graphFromNdjson,
+} from '@lenke/native';
 import { createNodeBackend } from '@lenke/node/backend';
 
 // small directed graph: a->b, a->c, b->c, c->a  (a cycle for pagerank)

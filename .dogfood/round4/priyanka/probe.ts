@@ -1,4 +1,6 @@
-import { graphFromNdjson } from '@lenke/native';
+import {
+  graphFromNdjson,
+} from '@lenke/native';
 // Probe GQL features needed for ReBAC check(): variable-length paths,
 // edge-label disjunction, EXISTS subquery, *0.. semantics.
 import { createNodeBackend } from '@lenke/node/backend';

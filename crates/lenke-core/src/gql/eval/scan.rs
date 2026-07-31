@@ -799,7 +799,7 @@ pub(super) fn expand_scan(
                 // layer first. Faults (surfaced as `E_RESOURCE_EXHAUSTED` at the row
                 // boundary) and bails; returning drops `new_cols`/`new_endpoint`, so
                 // the memory is released rather than continuing to grow.
-                if new_endpoint.len() > INTERMEDIATE_BUDGET {
+                if new_endpoint.len() as u64 > graph.limits().intermediate {
                     ctx.set_fault(FAULT_INTERMEDIATE);
                     return None;
                 }
@@ -1123,9 +1123,11 @@ pub(super) fn raw_bits_of(
                 .map(|i| bits(i, present, data[ids[i] as usize] as u64))
                 .collect(),
         ),
+        // Canonicalized like the scalar key (`group_num_bits`): a stored -0 must
+        // group with 0, and a stored NaN with any other NaN.
         Some(Column::Num { data, present }) => Some(
             (0..sc.n)
-                .map(|i| bits(i, present, data[ids[i] as usize].to_bits()))
+                .map(|i| bits(i, present, group_num_bits(data[ids[i] as usize])))
                 .collect(),
         ),
         Some(Column::Bool { data, present }) => Some(

@@ -1,3 +1,4 @@
+import { DEFAULT_CONFIG } from '@lenke/core';
 import type { Edge, Graph, Path, Vertex } from '@lenke/core';
 import {
   type AlgorithmName,
@@ -914,6 +915,7 @@ const compileFunc = (expr: FuncExpr): CompiledExpr => {
     callScalar(
       name,
       args.map((f) => f(env)),
+      env.graph.limits,
     );
 };
 
@@ -933,7 +935,7 @@ const FN_PROBE_ARGS: readonly unknown[] = [];
  */
 const isKnownScalarFn = (name: string): boolean => {
   try {
-    callScalar(name, FN_PROBE_ARGS);
+    callScalar(name, FN_PROBE_ARGS, DEFAULT_CONFIG.limits);
 
     return true;
   } catch (error) {
@@ -1456,6 +1458,15 @@ const compareValues = (a: unknown, b: unknown): number => {
     return ae.length > be.length ? 1 : 0;
   }
 
+  // Rank 4 is the catch-all group (graph elements, plus any list/record pair the
+  // branches above did not match — a list vs a record). The native `cmp_total`
+  // returns Equal for all of those, leaving them in stable order. Falling through
+  // to `<` would order them by their JS string coercions ("1,2" vs "[object Map]"),
+  // an accidental order the native engine does not have.
+  if (ra === 4) {
+    return 0;
+  }
+
   const x = a as number | string;
   const y = b as number | string;
 
@@ -1532,13 +1543,11 @@ export const valueKey = (v: unknown): string => {
         return `#${v}`;
       }
 
-      // Rust `val_key` keys numbers by bit pattern, so -0 and +0 are distinct
-      // groups. `n${v}` collapses them (String(-0) === "0"); the `v === 0` gate keeps
-      // the Object.is check off the common (non-zero) hot path.
-      if (v === 0) {
-        return Object.is(v, -0) ? 'n-0' : 'n0';
-      }
-
+      // `-0` and `0` are ONE group: `-0 = 0` is true, and the distinction is
+      // normalized everywhere else (ORDER BY, sign(), the result JSON, the
+      // property index), so keeping them apart here alone produced two groups
+      // that both rendered as `0`. `String(-0)` is already "0", so the plain
+      // template does it — mirrors the Rust `group_num_bits`.
       return `n${v}`;
     case 'string':
       return `s${v}`;
@@ -1568,8 +1577,23 @@ export const valueKey = (v: unknown): string => {
         return `${key}]`;
       }
 
-      // Record / temporal / path — rarer as a group key; JSON.stringify + the
-      // replacer keeps their nested non-finite safe too.
+      // A record recurses through this keyer (like a list above), NOT through
+      // JSON.stringify: stringify renders -0 as `0`, so `{b: -0}` and `{b: 0}`
+      // collapsed into one DISTINCT group here while the native `value_key` —
+      // which recurses and keys numbers by bit pattern — kept them apart. Mirrors
+      // the Rust `Value::Map` arm's `{k=<key>,…}` shape.
+      if (v instanceof LenkeRecord) {
+        let key = '{';
+
+        for (const [name, field] of v) {
+          key += `${name}=${valueKey(field)},`;
+        }
+
+        return `${key}}`;
+      }
+
+      // Temporal / path — rarer as a group key, and neither has a -0 to lose;
+      // JSON.stringify + the replacer keeps their nested non-finite safe.
       return JSON.stringify(v, keyReplacer) ?? 'undefined';
     default:
       // undefined / bigint / symbol are outside the value model; a stable fallback.
@@ -1619,6 +1643,16 @@ type CProjection = {
   /** ISO HAVING — a post-aggregation predicate on each group (SELECT only). */
   having?: CompiledExpr;
   orderBy: readonly CSortItem[];
+  /**
+   * True when any ORDER BY key references an OUTPUT column. When false the sort
+   * keys come from the input binding alone, so `ORDER BY … LIMIT n` can keep only
+   * the top-k *input* bindings and project just those (see `applyProjection`).
+   * Mirrors the Rust `CProjection::order_needs_output`, which asks the same
+   * question as a slot test (`refs_slot_below(expr, out_len)`) — output slots come
+   * first in the ORDER BY scope, so a name that is both an alias and an input
+   * variable resolves to the OUTPUT column in both engines.
+   */
+  orderNeedsOutput: boolean;
   skip?: CountValue;
   limit?: CountValue;
 };
@@ -1659,6 +1693,14 @@ const compileProjection = (projection: Projection): CProjection => {
     descending: s.descending,
     nullsFirst: s.nullsFirst,
   }));
+  // Does a sort key read an output column? With `RETURN *` every in-scope
+  // variable IS carried to the output, so any variable reference counts.
+  const outNames = new Set(items.map((i) => i.name));
+  const orderNeedsOutput = (projection.orderBy ?? []).some((s) => {
+    const refs = freePredicateVars(s.expr);
+
+    return projection.star ? refs.size > 0 : [...refs].some((n) => outNames.has(n));
+  });
 
   return {
     star: projection.star,
@@ -1668,6 +1710,7 @@ const compileProjection = (projection: Projection): CProjection => {
     groupKeys,
     ...(having ? { having } : {}),
     orderBy,
+    orderNeedsOutput,
     skip: projection.skip,
     limit: projection.limit,
   };
@@ -1799,7 +1842,59 @@ export const applyProjection = (
   // A `$param` bound resolves here (validated up-front); a literal passes through.
   const skipBound = resolveCount(proj.skip, params);
   const limitBound = resolveCount(proj.limit, params);
+
+  // A zero LIMIT emits no rows, so the projection never runs. The rule the engine
+  // already follows for a non-zero LIMIT is "project exactly the rows you emit" —
+  // `RETURN 1/(n.n - 7) AS x LIMIT 1` returns the first row rather than faulting on
+  // the second, in BOTH engines. LIMIT 0 emits nothing, so it projects nothing;
+  // faulting here would make LIMIT 0 the one limit that evaluates discarded rows.
+  // (Not a SQL rule: ISO GQL's `<order by and page statement>` is a statement in its
+  // own right that may PRECEDE the RETURN, where paging trims the binding table
+  // before any projection — this is what that form yields. We implement only the
+  // trailing form. Postgres is not the reference and does not agree: it
+  // constant-folds `1/0` at plan time and raises even under LIMIT 0.)
+  if (limitBound === 0) {
+    return [];
+  }
+
   type Keyed = { b: Binding; keys: readonly unknown[] };
+
+  const cmp = (a: Keyed, b: Keyed): number => {
+    for (let i = 0; i < orderBy.length; i += 1) {
+      const c = compareSort(a.keys[i], b.keys[i], orderBy[i].descending, orderBy[i].nullsFirst);
+
+      if (c !== 0) {
+        return c;
+      }
+    }
+
+    return 0;
+  };
+
+  // Top-k: `ORDER BY … LIMIT n` whose sort keys don't read the output. The keys
+  // come from the input binding alone, so only the top-k INPUT bindings are kept
+  // and just those are projected — the rest are never projected at all. Same five
+  // conditions as the Rust `ProjAccum::new` (`topk`), so both engines project
+  // exactly the same rows: a projection that would fault on a row outside the
+  // top-k does not fault in either. DISTINCT is excluded because dedup keys are
+  // built from the projected row, and an aggregate has no per-input row to keep.
+  if (
+    !proj.aggregating &&
+    orderBy.length > 0 &&
+    limitBound !== undefined &&
+    !proj.distinct &&
+    !proj.orderNeedsOutput
+  ) {
+    const inputKeyed = map(
+      (b: Binding) => ({ b, keys: orderBy.map((s) => s.fn({ binding: b, params, graph })) }),
+      bindings,
+    );
+    const top = boundedTopK(inputKeyed, (skipBound ?? 0) + limitBound, cmp);
+    const afterSkip = skipBound ? skip(skipBound, top) : top;
+
+    return map((r: Keyed) => projectBinding(proj, r.b, params, graph), take(limitBound, afterSkip));
+  }
+
   let keyed: Iterable<Keyed>;
 
   if (proj.aggregating) {
@@ -1878,17 +1973,6 @@ export const applyProjection = (
   // ORDER BY is the other barrier. With a LIMIT we only need skip+limit rows, so a
   // bounded top-k (O(n log k), never materializing the rest) beats sorting all n;
   // without a LIMIT, sort the whole owned array.
-  const cmp = (a: Keyed, b: Keyed): number => {
-    for (let i = 0; i < orderBy.length; i += 1) {
-      const c = compareSort(a.keys[i], b.keys[i], orderBy[i].descending, orderBy[i].nullsFirst);
-
-      if (c !== 0) {
-        return c;
-      }
-    }
-
-    return 0;
-  };
   let ordered: Iterable<Keyed> = keyed;
 
   if (orderBy.length > 0 && limitBound !== undefined) {
@@ -2317,7 +2401,7 @@ export const satisfies = (
     }
   }
 
-  return pred.where === undefined || pred.where(env) === true;
+  return pred.where === undefined || asTruth(pred.where(env)) === true;
 };
 
 // Pattern matching (see executor/matching.ts).
@@ -2379,6 +2463,19 @@ export type CMatch = {
 };
 type CWith = { kind: 'with'; projection: CProjection; where?: CompiledExpr };
 type CFilter = { kind: 'filter'; where: CompiledExpr };
+
+/**
+ * `ORDER BY … [OFFSET n] [LIMIT n]` as a STATEMENT — sort and/or slice the working
+ * binding table in place. Distinct from a projection's trailing paging: there is
+ * no projection here, so the sort keys read the binding scope directly and a later
+ * RETURN only ever projects the surviving rows.
+ */
+type CPage = {
+  kind: 'page';
+  orderBy: readonly CSortItem[];
+  skip?: CountValue;
+  limit?: CountValue;
+};
 type CLet = { kind: 'let'; items: readonly { var: string; expr: CompiledExpr }[] };
 export type CFor = {
   kind: 'for';
@@ -2429,6 +2526,7 @@ export type CClause =
   | CMatch
   | CWith
   | CFilter
+  | CPage
   | CLet
   | CFor
   | CReturn
@@ -2535,6 +2633,23 @@ const compileClause = (clause: Clause): CClause => {
       };
     case 'filter':
       return { kind: 'filter', where: compileExpr(clause.where) };
+    case 'page':
+      // Sort keys are ordinary expressions over the CURRENT scope (the working
+      // table), so they compile exactly like a FILTER predicate — no projection,
+      // no new variables.
+      noteCountParam(clause.skip);
+      noteCountParam(clause.limit);
+
+      return {
+        kind: 'page',
+        orderBy: (clause.orderBy ?? []).map((sortItem) => ({
+          fn: compileExpr(sortItem.expr),
+          descending: sortItem.descending,
+          nullsFirst: sortItem.nullsFirst,
+        })),
+        skip: clause.skip,
+        limit: clause.limit,
+      };
     case 'let':
       return {
         kind: 'let',

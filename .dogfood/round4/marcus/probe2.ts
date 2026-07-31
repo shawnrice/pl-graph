@@ -1,4 +1,6 @@
-import { graphFromNdjson } from '@lenke/native';
+import {
+  graphFromNdjson,
+} from '@lenke/native';
 import { createNodeBackend } from '@lenke/node/backend';
 
 // a->b, a->c, b->c, c->a

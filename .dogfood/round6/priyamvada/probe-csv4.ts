@@ -2,7 +2,7 @@ import { graphFromFormat } from '../../../packages/native/src/graph.js';
 import { tsDeserialize, Graph, tsQuery, classify, backend } from './harness.ts';
 const show = (label: string, inp: string) => {
   const t = classify(() => tsQuery(tsDeserialize(inp, 'csv', new Graph()), 'MATCH (n) RETURN n'));
-  const n = classify(() => graphFromFormat(backend, inp, 'csv').query('MATCH (n) RETURN n'));
+  const n = classify(() => graphFromFormat(backend, inp, { format: 'csv' }).query('MATCH (n) RETURN n'));
   const tv =
     t.kind === 'ok'
       ? JSON.stringify((t as any).value)

@@ -2,7 +2,7 @@
 // one segment at a time (matchNode/matchPath/matchSegment), plus OPTIONAL MATCH,
 // var-length expansion, and shortest-path selectors. Extracted from the executor.
 
-import { Path } from '@lenke/core';
+import { DEFAULT_CONFIG, Path } from '@lenke/core';
 import type { Edge, Graph, IndexableValue, RangeBound, Vertex } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
@@ -23,6 +23,7 @@ import type {
 } from '../executor.js';
 import { consistent, satisfies, unitExposes, unitIsFlat, withBinding } from '../executor.js';
 import { candidateCount, candidateVertices, expand, matchesLabel } from '../graph-queries.js';
+import { asTruth } from './scalars.js';
 
 // --- matching ----------------------------------------------------------------
 
@@ -1025,7 +1026,7 @@ export const unitWherePasses = (
 
   const wb = bindGroupVarsPerRep(env.binding, unit, repSteps);
 
-  return unit.where({ ...env, binding: wb }) === true;
+  return asTruth(unit.where({ ...env, binding: wb })) === true;
 };
 
 /** The mark a hop claims under `mode`: its edge (TRAIL) / its target vertex (SIMPLE,
@@ -1324,7 +1325,7 @@ export const trailEndsUnit = function* (
 
     steps += 1;
 
-    if (steps > TRAIL_BUDGET) {
+    if (steps > graph.limits.trail) {
       throw new LenkeError(
         'Variable-length pattern exceeded the trail budget; add a tighter bound',
         { code: ErrorCode.ResourceExhausted },
@@ -1441,8 +1442,14 @@ export const walkSegments = function* (
   }
 };
 
-/** Per-expansion cap on trail-traversal steps; a guard against exponential blowup. */
-export const TRAIL_BUDGET = 1_000_000;
+/**
+ * Per-expansion cap on trail-traversal steps; a guard against exponential blowup.
+ * The DEFAULT only — the live bound is `graph.limits.trail`, which a host can
+ * raise or lower per graph (see `GraphLimits`). Kept exported because the
+ * shortcut detector reasons about the default when deciding whether a trail
+ * enumeration is worth attempting.
+ */
+export const TRAIL_BUDGET = DEFAULT_CONFIG.limits.trail;
 
 /**
  * Endpoints of every *trail* — a path that traverses each relationship at most

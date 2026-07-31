@@ -7,7 +7,7 @@ const both = (input: string) => {
     const g = tsDeserialize(input, 'csv', new Graph());
     return tsSerialize(g, 'ndjson').trim();
   });
-  const n = classify(() => graphFromFormat(backend, input, 'csv').serialize('ndjson').trim());
+  const n = classify(() => graphFromFormat(backend, input, { format: 'csv' }).serialize('ndjson').trim());
   const tv = t.kind === 'ok' ? (t as any).value : `${t.kind}:${(t as any).code || (t as any).name}`;
   const nv = n.kind === 'ok' ? (n as any).value : `${n.kind}:${(n as any).code || (n as any).name}`;
   const mark = tv === nv ? 'MATCH' : '*** DIVERGE ***';

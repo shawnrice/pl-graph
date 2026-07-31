@@ -69,7 +69,7 @@ const LIB = new URL('../../../crates/lenke-core/target/release/liblenke_core.so'
   .pathname;
 if (existsSync(LIB)) {
   const backend = createFfiBackend(LIB);
-  const nvG = graphFromFormat(backend, NDJSON, 'ndjson');
+  const nvG = graphFromNdjson(backend, NDJSON);
   console.log('\n=== native (number-typed) baseline ===');
   for (const [w, p] of wheres) {
     try {

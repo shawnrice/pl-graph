@@ -6,7 +6,7 @@ for (const [inp, fmt] of [
   ['\n\n', 'csv'],
   ['\n', 'graphson'],
 ] as const) {
-  const r = classify(() => graphFromFormat(backend, inp, fmt));
+  const r = classify(() => graphFromFormat(backend, inp, { format: fmt }));
   console.log(
     `native deser ${JSON.stringify(inp)} ${fmt}: ${r.kind} ${(r as any).code || (r as any).name || ''} ${((r as any).msg || '').slice(0, 50)}`,
   );

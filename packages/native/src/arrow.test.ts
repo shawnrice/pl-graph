@@ -11,7 +11,7 @@ import { type Table, tableFromIPC } from 'apache-arrow';
 
 import { toArrowIPC } from './arrow.js';
 import { createFfiBackend } from './backend-ffi.js';
-import { graphFromFormat } from './graph.js';
+import { graphFromNdjson } from './graph.js';
 
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
@@ -37,7 +37,7 @@ const NDJSON = [
 suite('@lenke/native/arrow — real Arrow IPC egress', () => {
   const backend = createFfiBackend(LIB);
   const blobOf = (q: string): Uint8Array => {
-    const g = graphFromFormat(backend, NDJSON, 'ndjson');
+    const g = graphFromNdjson(backend, NDJSON);
 
     try {
       return g.queryArrow(q);
@@ -117,14 +117,13 @@ suite('@lenke/native/arrow — real Arrow IPC egress', () => {
   });
 
   test('unicode strings survive (multi-byte offsets)', () => {
-    const g = graphFromFormat(
+    const g = graphFromNdjson(
       backend,
       [
         '{"type":"node","id":"a","labels":["P"],"properties":{"name":"café ☕"}}',
         '{"type":"node","id":"b","labels":["P"],"properties":{"name":"日本語"}}',
         '{"type":"node","id":"c","labels":["P"],"properties":{"name":"marko`s"}}',
       ].join('\n'),
-      'ndjson',
     );
 
     try {
@@ -143,7 +142,7 @@ suite('@lenke/native/arrow — real Arrow IPC egress', () => {
       (_, i) =>
         `{"type":"node","id":"n${i}","labels":["P"],"properties":{"name":"user_${i}","age":${i % 90},"flag":${i % 2 === 0}}}`,
     ).join('\n');
-    const g = graphFromFormat(backend, rows, 'ndjson');
+    const g = graphFromNdjson(backend, rows);
 
     try {
       for (const fmt of ['stream', 'file'] as const) {
@@ -175,7 +174,7 @@ suite('@lenke/native/arrow — real Arrow IPC egress', () => {
   // (no JS transcode). It must produce byte-identical IPC to the JS encoder AND
   // read back through the reference decoder.
   test('native queryArrowIpc matches the JS encoder byte-for-byte and decodes', () => {
-    const g = graphFromFormat(backend, NDJSON, 'ndjson');
+    const g = graphFromNdjson(backend, NDJSON);
 
     try {
       for (const format of ['stream', 'file'] as const) {
@@ -196,7 +195,7 @@ suite('@lenke/native/arrow — real Arrow IPC egress', () => {
   });
 
   test('native queryArrowIpc binds params (tagged-template form is stream)', () => {
-    const g = graphFromFormat(backend, NDJSON, 'ndjson');
+    const g = graphFromNdjson(backend, NDJSON);
 
     try {
       const ipc = g.queryArrowIpc`MATCH (n:P) WHERE n.age > ${28} RETURN n.name AS name ORDER BY n.name`;
@@ -223,7 +222,7 @@ suite('@lenke/native/arrow — FixedSizeList<Float64> egress', () => {
   const Q = 'MATCH (n:V) RETURN n.h AS h ORDER BY n.name';
 
   const table = (native: boolean): Table => {
-    const g = graphFromFormat(backend, VEC_NDJSON, 'ndjson');
+    const g = graphFromNdjson(backend, VEC_NDJSON);
 
     try {
       return tableFromIPC(
@@ -261,14 +260,13 @@ suite('@lenke/native/arrow — FixedSizeList<Float64> egress', () => {
   // whole [V×D] matrix out as a real Arrow FixedSizeList<Float64> — the ML message-passing
   // → training-tensor path composing neighborAggregate (weights+norm) with vector egress.
   test('a neighborAggregate embedding egresses as a FixedSizeList feature matrix', async () => {
-    const g = graphFromFormat(
+    const g = graphFromNdjson(
       backend,
       [
         '{"type":"node","id":"a","labels":["V"],"properties":{"h":[1,2]}}',
         '{"type":"node","id":"b","labels":["V"],"properties":{"h":[3,4]}}',
         '{"type":"edge","from":"a","to":"b","labels":["R"]}',
       ].join('\n'),
-      'ndjson',
     );
 
     try {
@@ -296,7 +294,7 @@ suite('@lenke/native/arrow — FixedSizeList<Float64> egress', () => {
   });
 
   test('native and JS encoders are byte-for-byte identical', () => {
-    const g = graphFromFormat(backend, VEC_NDJSON, 'ndjson');
+    const g = graphFromNdjson(backend, VEC_NDJSON);
 
     try {
       for (const format of ['stream', 'file'] as const) {
@@ -324,7 +322,7 @@ suite('@lenke/native/arrow — Struct (record) egress', () => {
   const Q = 'MATCH (n:P) RETURN n.meta AS meta ORDER BY n.name';
 
   const table = (native: boolean): Table => {
-    const g = graphFromFormat(backend, REC_NDJSON, 'ndjson');
+    const g = graphFromNdjson(backend, REC_NDJSON);
 
     try {
       return tableFromIPC(
@@ -354,7 +352,7 @@ suite('@lenke/native/arrow — Struct (record) egress', () => {
   }
 
   test('native and JS encoders are byte-for-byte identical', () => {
-    const g = graphFromFormat(backend, REC_NDJSON, 'ndjson');
+    const g = graphFromNdjson(backend, REC_NDJSON);
 
     try {
       for (const format of ['stream', 'file'] as const) {

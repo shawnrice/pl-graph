@@ -17,7 +17,7 @@ for (const inp of ['\n\n', '\n', ' ', '\r\n']) {
     tsDeserialize(inp, 'csv', new Graph());
     return 'ok';
   });
-  const nr = classify(() => graphFromFormat(backend, inp, 'csv'));
+  const nr = classify(() => graphFromFormat(backend, inp, { format: 'csv' }));
   console.log(
     `csv ${JSON.stringify(inp)}: ts=${tr.kind}/${(tr as any).code || (tr as any).name || ''} native=${nr.kind}/${(nr as any).code || (nr as any).name || ''}`,
   );
@@ -28,7 +28,7 @@ for (const inp of ['\n\n', '\n', ' ', '\r\n', '  \n  ']) {
     tsDeserialize(inp, 'ndjson', new Graph());
     return 'ok';
   });
-  const nr = classify(() => graphFromFormat(backend, inp, 'ndjson'));
+  const nr = classify(() => graphFromNdjson(backend, inp));
   console.log(
     `ndjson ${JSON.stringify(inp)}: ts=${tr.kind}/${(tr as any).code || (tr as any).name || ''} native=${nr.kind}/${(nr as any).code || (nr as any).name || ''}`,
   );

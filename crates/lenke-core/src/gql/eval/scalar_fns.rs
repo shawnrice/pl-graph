@@ -98,8 +98,12 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
         Sinh => un(f64::sinh),
         Cosh => un(f64::cosh),
         Tanh => un(f64::tanh),
-        Degrees => un(f64::to_degrees),
-        Radians => un(f64::to_radians),
+        // Spelled as the multiply-then-divide the TS twin uses, NOT `f64::to_degrees`
+        // / `to_radians` — those are `n * (180/PI)` / `n * (PI/180)`, which pre-round
+        // the constant and land one ulp away from `(n * 180) / PI`. Plain multiply and
+        // divide are exactly specified by IEEE 754, so this form is byte-identical.
+        Degrees => un(|n| (n * 180.0) / std::f64::consts::PI),
+        Radians => un(|n| (n * std::f64::consts::PI) / 180.0),
         // pi()/e() are 0-arg constants; sign()/round() null-in → null-out.
         Pi => Val::Num(std::f64::consts::PI),
         E => Val::Num(std::f64::consts::E),
@@ -490,21 +494,34 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
                 if st == 0.0 {
                     Val::Null // a zero step has no defined progression
                 } else {
-                    // Inclusive of both bounds (Cypher/ISO convention).
-                    let mut out = Vec::new();
-                    let mut i = s;
-                    if st > 0.0 {
-                        while i <= e {
-                            out.push(Val::Num(i));
-                            i += st;
-                        }
+                    // Inclusive of both bounds (Cypher/ISO convention). The element
+                    // count is computed UP FRONT, for two reasons. It bounds the
+                    // allocation against `RANGE_BUDGET` before a single push — the
+                    // list is materialized, so an unbounded range is an OOM kill
+                    // rather than a query error. And it makes the loop COUNT-driven
+                    // instead of comparison-driven: `i += st` stops advancing once
+                    // `i` reaches 2^53 (a no-op in f64), so `while i <= e` never
+                    // terminates for a large enough end — even when the count is
+                    // tiny, as in `range(9007199254740992, 9007199254740994)`.
+                    // The values themselves still come from repeated addition, so
+                    // the emitted sequence is unchanged.
+                    let count = ((e - s) / st).floor() + 1.0;
+                    if count.is_nan() || count <= 0.0 {
+                        // A backwards span (or a NaN bound) yields no elements.
+                        Val::List(Vec::new())
+                    } else if count > graph.limits().range as f64 {
+                        ctx.set_fault(FAULT_RANGE_BUDGET);
+                        Val::Null
                     } else {
-                        while i >= e {
+                        let n = count as usize;
+                        let mut out = Vec::with_capacity(n);
+                        let mut i = s;
+                        for _ in 0..n {
                             out.push(Val::Num(i));
                             i += st;
                         }
+                        Val::List(out)
                     }
-                    Val::List(out)
                 }
             }
             _ => Val::Null,

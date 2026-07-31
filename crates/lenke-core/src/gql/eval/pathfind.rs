@@ -822,7 +822,7 @@ pub(super) fn reachable_each_unit(
         }
 
         steps += 1;
-        if steps > TRAIL_BUDGET {
+        if steps > graph.limits().trail {
             ctx.set_fault(FAULT_BUDGET);
             clear_live(&stack, &mut marks);
             break;

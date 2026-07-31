@@ -4,7 +4,9 @@
 // verifies the result agrees (pr sum ~1.0, same top nodes).
 //
 // Run: N=100000 M=10 bun .dogfood/round4/marcus/pagerank_bench.ts
-import { graphFromNdjson } from '@lenke/native';
+import {
+  graphFromNdjson,
+} from '@lenke/native';
 import { createNodeBackend } from '@lenke/node/backend';
 
 import { generate } from './gen.ts';

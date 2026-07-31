@@ -1,4 +1,8 @@
-import { createEmptyGraph, createStore, graphFromNdjson } from '@lenke/native';
+import {
+  createEmptyGraph,
+  createStore,
+  graphFromNdjson,
+} from '@lenke/native';
 /**
  * Bonus: the port lifecycle helper (`servePort`) and the snapshot store's
  * warm-boot path — an offline write survives a "reload" and drains after.

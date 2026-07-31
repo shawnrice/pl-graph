@@ -67,7 +67,11 @@ unsafe fn in_str<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
 
 #[no_mangle]
 pub extern "C" fn lnk_abi_version() -> u32 {
-    17 // 17: lnk_create_index (single parametric index creator — replaces the three
+    18 // 18: lnk_graph_set_config (ONE id-keyed setter for the whole GraphConfig
+       //     space, REPLACING lnk_graph_set_max_operator_chain — which is now
+       //     ConfigId::LimitsOperatorChain. New settings are additive ids and need
+       //     NO further bump, so this is the last config-shaped ABI change);
+       // 17: lnk_create_index (single parametric index creator — replaces the three
        //     lnk_create_{vertex,edge,edge_interval}_index exports with element+kind);
        // 16: lnk_create_edge_interval_index (RI-tree interval index for as-of/overlap);
        // 15: lnk_dump_schema (read schema back as SchemaOps, for snapshot persistence);
@@ -251,14 +255,28 @@ pub unsafe extern "C" fn lnk_graph_vertex_count(g: *const Graph) -> u64 {
 /// option); the parser rejects a longer chain with `E_SYNTAX`. A no-op on a null
 /// handle.
 ///
+/// Set one graph setting by its stable id (see `ConfigId`). Returns 1 when
+/// applied, 0 for an unrecognized id or a zero value — so a host running against
+/// an older artifact can report the unsupported setting instead of silently
+/// running with the default.
+///
+/// This is deliberately ONE id-keyed export rather than one export per knob: that
+/// is how the surface grew a `lnk_graph_set_max_operator_chain` (now folded in as
+/// `ConfigId::LimitsOperatorChain`) and would have kept growing, bumping the ABI
+/// each time. A new setting is now purely additive — a new id, no ABI change.
+///
 /// # Safety
 /// `g` must be a valid graph handle.
 #[no_mangle]
-pub unsafe extern "C" fn lnk_graph_set_max_operator_chain(g: *mut Graph, n: u64) {
+pub unsafe extern "C" fn lnk_graph_set_config(g: *mut Graph, id: u32, value: u64) -> u32 {
     // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-    if let Some(g) = unsafe { graph_mut(g) } {
-        g.set_max_operator_chain(n as usize);
-    }
+    let Some(g) = (unsafe { graph_mut(g) }) else {
+        return 0;
+    };
+    let Some(id) = crate::graph::ConfigId::from_u32(id) else {
+        return 0;
+    };
+    u32::from(g.set_config(id, value))
 }
 
 /// # Safety

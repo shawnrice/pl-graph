@@ -75,7 +75,9 @@ All assert that the loaded artifact's ABI version matches the exported `ABI_VERS
 
 ## Graph API
 
-`graphFromNdjson(backend, bytes, { parallel? })` and `graphFromFormat(backend, input, format)` deserialize a document into a `RustGraph`; `createEmptyGraph(backend)` cold-boots a blank one to `INSERT` / `mergeNdjson` into; `attachGraph(backend, handle)` wraps an existing backend + handle. A `RustGraph` exposes:
+`graphFromNdjson(backend, ndjson, { parallel? })` (string or bytes) and `graphFromFormat(backend, input, { format })` deserialize a document into a `RustGraph`; `createEmptyGraph(backend)` cold-boots a blank one to `INSERT` / `mergeNdjson` into; `attachGraph(backend, handle)` wraps an existing backend + handle.
+
+Every factory takes the graph's settings, which are fixed for its life — `{ limits: { range, trail, intermediate, operatorChain } }`, each a ceiling whose breach is a loud `E_RESOURCE_EXHAUSTED` rather than a truncated result (`maxOperatorChain` is the shorthand for `limits.operatorChain`). A `RustGraph` exposes:
 
 - `vertexCount` / `edgeCount` — counts (numbers).
 - `version` — monotonic mutation counter for O(1) change detection.

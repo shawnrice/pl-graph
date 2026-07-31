@@ -68,7 +68,9 @@ Formats: \`ndjson\`, \`pg-json\`, \`pg-text\`, \`graphson\`, \`csv\`. NDJSON is 
 
 \`\`\`ts
 import { createFfiBackend } from '@lenke/native/ffi';   // Bun/server
-import { graphFromNdjson } from '@lenke/native';
+import {
+  graphFromNdjson,
+} from '@lenke/native';
 
 const backend = createFfiBackend(libPath);   // libPath = the compiled lenke native library
 using g = graphFromNdjson(backend, await Bun.file('graph.ndjson').bytes());
@@ -129,6 +131,21 @@ Grouping is implicit — the non-aggregated RETURN items are the group key:
 \`\`\`
 MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name AS name, count(*) AS friends
 \`\`\`
+
+## Sorting and paging as their own statements
+\`ORDER BY\` / \`OFFSET\` / \`LIMIT\` are ISO statements in their own right, so they can come
+**before** the RETURN as a pipeline step, not only trailing it:
+\`\`\`
+MATCH (p:Person)-[:workAt]->(c:Company)
+FILTER c.name CONTAINS 'Air'
+ORDER BY p.name
+LIMIT 10
+RETURN p.name AS name, c.name AS company
+\`\`\`
+The difference is what they act on. In statement position they sort and slice the working
+row table, so the RETURN only ever sees — and only ever computes — the surviving rows.
+Trailing a RETURN (\`RETURN … ORDER BY x LIMIT 10\`) they page the projected result, and a
+sort key may reference an output alias. Both forms are ISO; use whichever reads better.
 
 ## Parameters (injection-safe)
 \`\`\`ts
@@ -558,7 +575,14 @@ Prefer a bounded quantifier (\`->{1,5}\`) to an open \`->*\` when you can. Consu
 Prefer one aggregate or bulk operation over many wide per-node \`SET\`s. For per-node feature vectors, \`neighbor_aggregate\` writes the whole block in one pass (see the \`graph-ml\` guide).
 
 ## Memory envelope
-An in-memory graph takes **several times its NDJSON text size** in memory; a whole-graph algorithm roughly doubles peak memory over the resident graph. \`graphFromNdjson\` decodes in parallel and loads quickly. \`new Graph({ maxOperatorChain })\` bounds \`AND\`/\`OR\`/arithmetic operator chains (default 10,000) as an anti-DoS guard.`,
+An in-memory graph takes **several times its NDJSON text size** in memory; a whole-graph algorithm roughly doubles peak memory over the resident graph. \`graphFromNdjson\` decodes in parallel and loads quickly.
+
+**Resource ceilings** are set at construction and fixed for the graph's life — they are host policy, so a query can never raise its own:
+\`\`\`ts
+new Graph({ limits: { range: 5_000_000, operatorChain: 20_000 } });
+graphFromNdjson(backend, ndjson, { limits: { trail: 250_000 } });   // native, same shape
+\`\`\`
+\`operatorChain\` bounds \`AND\`/\`OR\`/arithmetic chains (default 10,000; \`maxOperatorChain\` is the shorthand), \`range\` bounds how many elements \`range(a, b)\` may build (default 1,000,000 — it is a materialized list), and \`trail\` bounds steps per variable-length expansion (default 1,000,000). Exceeding one is a loud \`E_RESOURCE_EXHAUSTED\`, never a truncated result.`,
 };
 
 const recipesGuide: Guide = {

@@ -28,9 +28,18 @@ import type {
   Params,
   Row,
 } from '../executor.js';
-import { applyProjection, isEdge, isElement, isVertex, valueKey } from '../executor.js';
+import {
+  applyProjection,
+  compareSort,
+  isEdge,
+  isElement,
+  isVertex,
+  resolveCount,
+  valueKey,
+} from '../executor.js';
 import { hasIncidentEdges } from '../graph-queries.js';
 import { matchPattern } from './matching.js';
+import { asTruth } from './scalars.js';
 
 export const evalProps = (
   props: readonly CProp[],
@@ -331,7 +340,7 @@ export const runMergeEdge = (
       }
     } else if (disp.kind === 'set') {
       const passes =
-        disp.where === undefined || disp.where({ binding: out, params, graph }) === true;
+        disp.where === undefined || asTruth(disp.where({ binding: out, params, graph })) === true;
 
       if (passes) {
         applyMergeSets(graph, disp.items, out, params);
@@ -405,7 +414,7 @@ export const runMerge = (
     } else if (disp.kind === 'set') {
       // An explicit update replaces the default, gated by WHERE if present.
       const passes =
-        disp.where === undefined || disp.where({ binding: out, params, graph }) === true;
+        disp.where === undefined || asTruth(disp.where({ binding: out, params, graph })) === true;
 
       if (passes) {
         applyMergeSets(graph, disp.items, out, params);
@@ -535,7 +544,10 @@ export const matchClauseBindings = (
 
   return clause.where === undefined
     ? stream
-    : filter((b: Binding) => clause.where!({ binding: b, params, graph }) === true, stream);
+    : filter(
+        (b: Binding) => asTruth(clause.where!({ binding: b, params, graph })) === true,
+        stream,
+      );
 };
 
 /** Per-incoming-binding: stream its matches, or (for OPTIONAL) one null-filled row. */
@@ -1013,7 +1025,7 @@ export const runLinearClauses = (
           clause.where === undefined
             ? projected
             : filter(
-                (b: Binding) => clause.where!({ binding: b, params, graph }) === true,
+                (b: Binding) => asTruth(clause.where!({ binding: b, params, graph })) === true,
                 projected,
               );
         break;
@@ -1021,10 +1033,45 @@ export const runLinearClauses = (
       case 'filter':
         // ISO §14.6: drop rows where the condition is not TRUE (three-valued).
         bindings = filter(
-          (b: Binding) => clause.where({ binding: b, params, graph }) === true,
+          (b: Binding) => asTruth(clause.where({ binding: b, params, graph })) === true,
           bindings,
         );
         break;
+      case 'page': {
+        // ISO `<order by and page statement>` in statement position: sort and/or
+        // slice the working BINDING table. Because this runs before any
+        // projection, a later RETURN only ever projects the surviving rows.
+        let rows = toArray(bindings);
+
+        if (clause.orderBy.length > 0) {
+          // Key each row once, then a STABLE sort — the same comparator (so the
+          // same total order and NULLS FIRST/LAST) as a projection's ORDER BY.
+          const keyed = rows.map((b: Binding) => ({
+            b,
+            keys: clause.orderBy.map((s) => s.fn({ binding: b, params, graph })),
+          }));
+
+          keyed.sort((x, y) => {
+            for (const [i, sortItem] of clause.orderBy.entries()) {
+              const c = compareSort(x.keys[i], y.keys[i], sortItem.descending, sortItem.nullsFirst);
+
+              if (c !== 0) {
+                return c;
+              }
+            }
+
+            return 0;
+          });
+          rows = keyed.map((r) => r.b);
+        }
+
+        const start = resolveCount(clause.skip, params) ?? 0;
+        const take = resolveCount(clause.limit, params);
+
+        rows = rows.slice(start, take === undefined ? undefined : start + take);
+        bindings = rows;
+        break;
+      }
       case 'let':
         // ISO §14.7: bind new vars additively, left-to-right (a later item sees
         // an earlier one via the in-progress binding copy).

@@ -9,7 +9,10 @@ import type { Backend } from '@lenke/native';
  * @example
  * ```ts
  * import { createNodeBackend } from '@lenke/node/backend';
- * import { graphFromNdjson, createStore } from '@lenke/native';
+ * import {
+  createStore,
+  graphFromNdjson,
+} from '@lenke/native';
  *
  * const backend = createNodeBackend();
  * const g = graphFromNdjson(backend, await readFile('graph.ndjson'));

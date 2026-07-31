@@ -16,7 +16,7 @@
 // key-ordering divergence, shows up here as a red diff.
 //
 // Run: bun test packages/native/src/gql-conformance.test.ts
-import { describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 
 import { Graph, parseDate, parseDateTime } from '@lenke/core';
@@ -24,7 +24,7 @@ import { query as tsQuery } from '@lenke/gql';
 import { deserialize as tsDeserialize } from '@lenke/serialization';
 
 import { createFfiBackend } from './backend-ffi.js';
-import { graphFromFormat } from './graph.js';
+import { graphFromNdjson } from './graph.js';
 
 // --- native library bootstrap (mirrors gremlin-conformance.test.ts) ---------
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
@@ -56,7 +56,7 @@ const MODERN_NDJSON = [
 
 suite('GQL differential: rich RETURN results (TS vs native)', () => {
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, MODERN_NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, MODERN_NDJSON);
   const tsGraph = tsDeserialize(MODERN_NDJSON, 'ndjson', new Graph());
 
   const both = (q: string, params?: Record<string, unknown>): [string, string] => [
@@ -126,7 +126,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       '{"type":"node","id":"1","labels":["T"],"properties":{"p":5}}',
       '{"type":"node","id":"2","labels":["T"],"properties":{"p":{"@date":"2020-01-01"}}}',
     ].join('\n');
-    const nat = graphFromFormat(backend, mixed, 'ndjson');
+    const nat = graphFromNdjson(backend, mixed);
     const ts = tsDeserialize(mixed, 'ndjson', new Graph());
 
     for (const q of [`MATCH (n:T) RETURN sum(n.p) AS x`, `MATCH (n:T) RETURN avg(n.p) AS x`]) {
@@ -142,13 +142,28 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(ts).toBe(`[{"a":null,"b":null,"c":12}]`);
   });
 
-  test('-0 and +0 are distinct GROUP BY/DISTINCT keys (bit-keyed), byte-identical', () => {
-    // (age-30)*0 yields -0 for marko/vadas (age<30) and +0 for josh (age>30). Rust
-    // val_key keys by bit pattern so -0 ≠ +0 (2 groups); TS once collapsed them to
-    // one (String(-0) === "0"). Now both count 2.
+  test('-0 and +0 are ONE GROUP BY/DISTINCT key, byte-identical', () => {
+    // (age-30)*0 yields -0 for marko/vadas (age<30) and +0 for josh (age>30).
+    //
+    // These used to be two groups because the Rust `val_key` keyed by raw bit
+    // pattern and TS was aligned to it. That matched an implementation detail
+    // rather than a rule: `-0 = 0` is TRUE, and the engine normalizes the
+    // distinction everywhere else — ORDER BY and the total order sort them equal,
+    // `sign()` returns 0 for both, the result JSON and `to_string` both render
+    // `0`, an indexed equality seek finds both, `1 / ±0` faults rather than
+    // yielding ±∞, and the Gremlin engine's `dedup_key` already collapsed them.
+    // Grouping was the ONE place they differed, which produced two groups whose
+    // rendered values were both `0` — a distinction no result could show.
     const [ts, native] = both(`MATCH (n:Person) RETURN count(DISTINCT (n.age - 30) * 0) AS c`);
     expect(ts).toBe(native);
-    expect(ts).toBe(`[{"c":2}]`);
+    expect(ts).toBe(`[{"c":1}]`);
+    // The group holds every row, and its key renders as a plain `0`.
+    const [gts, gnative] = both(
+      `MATCH (n:Person) RETURN (n.age - 30) * 0 AS k, count(*) AS c GROUP BY k`,
+    );
+
+    expect(gts).toBe(gnative);
+    expect(gts).toBe(`[{"k":0,"c":3}]`);
   });
 
   test('list subscript with a non-number index is null in both engines', () => {
@@ -1219,7 +1234,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       '{"type":"edge","id":"e4","from":"a","to":"a","labels":["KNOWS"],"properties":{}}',
       '{"type":"edge","id":"e5","from":"c","to":"a","labels":["KNOWS"],"properties":{}}',
     ].join('\n');
-    const nat = graphFromFormat(backend, VARLEN_NDJSON, 'ndjson');
+    const nat = graphFromNdjson(backend, VARLEN_NDJSON);
     const ts = tsDeserialize(VARLEN_NDJSON, 'ndjson', new Graph());
 
     for (const q of [
@@ -1242,7 +1257,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       '{"type":"edge","id":"e2","from":"b","to":"c","labels":["R"],"properties":{"amt":20.0}}',
       '{"type":"edge","id":"e3","from":"c","to":"d","labels":["R"],"properties":{"amt":10.0}}',
     ].join('\n');
-    const nat = graphFromFormat(backend, BAL_NDJSON, 'ndjson');
+    const nat = graphFromNdjson(backend, BAL_NDJSON);
     const ts = tsDeserialize(BAL_NDJSON, 'ndjson', new Graph());
 
     for (const q of [
@@ -1291,7 +1306,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       '{"type":"edge","id":"e3","from":"c","to":"d","labels":["R"],"properties":{"amt":10.0}}',
       '{"type":"edge","id":"e4","from":"d","to":"e","labels":["R"],"properties":{"amt":10.0}}',
     ].join('\n');
-    const nat = graphFromFormat(backend, CHAIN, 'ndjson');
+    const nat = graphFromNdjson(backend, CHAIN);
     const ts = tsDeserialize(CHAIN, 'ndjson', new Graph());
 
     for (const q of [
@@ -1319,7 +1334,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       '{"type":"edge","id":"e2","from":"a","to":"c","labels":["R"],"properties":{"w":10.0}}',
       '{"type":"edge","id":"e3","from":"c","to":"b","labels":["R"],"properties":{"w":10.0}}',
     ].join('\n');
-    const nat = graphFromFormat(backend, W, 'ndjson');
+    const nat = graphFromNdjson(backend, W);
     const ts = tsDeserialize(W, 'ndjson', new Graph());
 
     for (const q of [
@@ -1346,7 +1361,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       '{"type":"edge","id":"e2","from":"b","to":"c","labels":["R"],"properties":{}}',
       '{"type":"edge","id":"e3","from":"c","to":"d","labels":["R"],"properties":{}}',
     ].join('\n');
-    const nat = graphFromFormat(backend, CHAIN, 'ndjson');
+    const nat = graphFromNdjson(backend, CHAIN);
     const ts = tsDeserialize(CHAIN, 'ndjson', new Graph());
 
     for (const q of [
@@ -1377,7 +1392,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       '{"type":"edge","from":"c","to":"d","labels":["R"],"properties":{}}',
       '{"type":"edge","from":"d","to":"e","labels":["R"],"properties":{}}',
     ].join('\n');
-    const nat = graphFromFormat(backend, CHAIN, 'ndjson');
+    const nat = graphFromNdjson(backend, CHAIN);
     const ts = tsDeserialize(CHAIN, 'ndjson', new Graph());
 
     for (const q of [
@@ -1418,7 +1433,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       '{"type":"edge","from":"b","to":"c","labels":["R"],"properties":{"amt":1.0}}',
       '{"type":"edge","from":"c","to":"d","labels":["R"],"properties":{"amt":10.0}}',
     ].join('\n');
-    const nat = graphFromFormat(backend, W, 'ndjson');
+    const nat = graphFromNdjson(backend, W);
     const ts = tsDeserialize(W, 'ndjson', new Graph());
 
     for (const q of [
@@ -1446,7 +1461,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
   // #1 — a nested quantifier's NODE group variables exposed as FLAT lists (the source `x`
   // per outer rep, and a nested hop's landing `-[]->{a,b}(y)`). Byte-identical.
   test('nested quantifier outer group variables (TS vs native)', () => {
-    const nat = graphFromFormat(backend, NCHAIN, 'ndjson');
+    const nat = graphFromNdjson(backend, NCHAIN);
     const ts = tsDeserialize(NCHAIN, 'ndjson', new Graph());
 
     for (const q of [
@@ -1461,7 +1476,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
   // #2 — a nested PARENTHESIZED subpath exposes its inner variables as LIST-OF-LISTS
   // (one list level per enclosing quantifier). Byte-identical.
   test('nested parenthesized subpath list-of-lists (TS vs native)', () => {
-    const nat = graphFromFormat(backend, NCHAIN, 'ndjson');
+    const nat = graphFromNdjson(backend, NCHAIN);
     const ts = tsDeserialize(NCHAIN, 'ndjson', new Graph());
 
     for (const q of [
@@ -1476,7 +1491,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
   // A subpath-level WHERE on a NESTED quantifier: a per-OUTER-rep predicate with the inner
   // variables bound as LISTS (`size(e)`, `x[0]`). Byte-identical both engines.
   test('nested quantifier per-rep WHERE over grouped vars (TS vs native)', () => {
-    const nat = graphFromFormat(backend, NCHAIN, 'ndjson');
+    const nat = graphFromNdjson(backend, NCHAIN);
     const ts = tsDeserialize(NCHAIN, 'ndjson', new Graph());
 
     for (const q of [
@@ -1504,7 +1519,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       '{"type":"edge","id":"e1","from":"s","to":"p","labels":["R"],"properties":{}}',
       '{"type":"edge","id":"e2","from":"p","to":"p","labels":["R"],"properties":{}}',
     ].join('\n');
-    const nat = graphFromFormat(backend, SELF, 'ndjson');
+    const nat = graphFromNdjson(backend, SELF);
     const ts = tsDeserialize(SELF, 'ndjson', new Graph());
 
     for (const mode of ['', 'ACYCLIC', 'SIMPLE']) {
@@ -1534,7 +1549,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     }
 
     const K = lines.join('\n');
-    const nat = graphFromFormat(backend, K, 'ndjson');
+    const nat = graphFromNdjson(backend, K);
     const ts = tsDeserialize(K, 'ndjson', new Graph());
     const q =
       'MATCH (s:N) ((a)-[:R]->(b)-[:R]->(c)-[:R]->(d)-[:R]->(e)){1} (t) RETURN count(*) AS c';
@@ -1570,7 +1585,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       '{"type":"edge","id":"e3","from":"c","to":"a","labels":["R"],"properties":{}}',
       '{"type":"edge","id":"e4","from":"a","to":"d","labels":["R"],"properties":{}}',
     ].join('\n');
-    const nat = graphFromFormat(backend, TRI, 'ndjson');
+    const nat = graphFromNdjson(backend, TRI);
     const ts = tsDeserialize(TRI, 'ndjson', new Graph());
 
     for (const mode of ['WALK', 'TRAIL', 'SIMPLE', 'ACYCLIC']) {
@@ -1597,7 +1612,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
   // element id (so element_id === n.id and it round-trips), a numeric id stays an
   // ordinary property, dup/SET-id are rejected. Must be byte-identical. ---------
   test('string id property is the element identity (TS vs native)', () => {
-    const nat = graphFromFormat(backend, '', 'ndjson');
+    const nat = graphFromNdjson(backend, '');
     const ts = tsDeserialize('', 'ndjson', new Graph());
 
     for (const q of [
@@ -1645,7 +1660,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       "INSERT (:P {id: 'a'}), (:P {id: 'b'}), (:P {id: 'c'})",
       "MATCH (a:P {id: 'a'}), (b:P {id: 'b'}) INSERT (a)-[:R {id: 'e1', w: 5}]->(b)",
     ];
-    const nat = graphFromFormat(backend, '', 'ndjson');
+    const nat = graphFromNdjson(backend, '');
     const ts = tsDeserialize('', 'ndjson', new Graph());
 
     for (const q of seed) {
@@ -1694,7 +1709,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       '{"type":"edge","from":"c","to":"e","labels":["E"],"properties":{"amt":1}}',
       '{"type":"edge","from":"e","to":"f","labels":["E"],"properties":{"amt":9}}',
     ].join('\n');
-    const nat = graphFromFormat(backend, CHAIN_NDJSON, 'ndjson');
+    const nat = graphFromNdjson(backend, CHAIN_NDJSON);
     const ts = tsDeserialize(CHAIN_NDJSON, 'ndjson', new Graph());
     const q =
       'MATCH (v0:A)-[e1:E]->(v1:A)-[e2:E]->(v2:A)-[e3:E]->(v3:A) ' +
@@ -1769,7 +1784,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
       '{"type":"edge","id":"r3","from":"a2","to":"a1","labels":["R"],"properties":{}}',
       '{"type":"edge","id":"r4","from":"a2","to":"t3","labels":["R"],"properties":{}}',
     ].join('\n');
-    const nat = graphFromFormat(backend, REACH_NDJSON, 'ndjson');
+    const nat = graphFromNdjson(backend, REACH_NDJSON);
     const ts = tsDeserialize(REACH_NDJSON, 'ndjson', new Graph());
 
     // DISTINCT rows with no ORDER BY are a set — the native BFS and TS enumeration
@@ -2007,7 +2022,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     // clock's LocalDateTime serializes to a tagged param, crosses the FFI, and
     // the crate revives it as $__now — so `current_*` reads it identically.
     const clock = () => parseDateTime('2026-07-13T09:00:00');
-    const nat = graphFromFormat(backend, MODERN_NDJSON, 'ndjson').setClock(clock);
+    const nat = graphFromNdjson(backend, MODERN_NDJSON).setClock(clock);
     const ts = tsDeserialize(MODERN_NDJSON, 'ndjson', new Graph()).setClock(clock);
 
     for (const [q, want] of [
@@ -2080,7 +2095,7 @@ suite('GQL differential: columnar grouped aggregation (TS vs native)', () => {
   ].join('\n');
 
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
     JSON.stringify(tsQuery(tsGraph, q)),
@@ -2236,7 +2251,7 @@ suite('GQL differential: grouped var-length count shortcut (TS vs native)', () =
   ].join('\n');
 
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
     JSON.stringify(tsQuery(tsGraph, q)),
@@ -2326,7 +2341,7 @@ suite('GQL differential: comma-join count shortcut (TS vs native)', () => {
   ].join('\n');
 
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
     JSON.stringify(tsQuery(tsGraph, q)),
@@ -2381,7 +2396,7 @@ suite('GQL differential: comma-join count shortcut (TS vs native)', () => {
 // Both must produce byte-identical rows across the two engines.
 suite('GQL differential: LIMIT/OFFSET $param + label-test predicate (TS vs native)', () => {
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, MODERN_NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, MODERN_NDJSON);
   const tsGraph = tsDeserialize(MODERN_NDJSON, 'ndjson', new Graph());
   const both = (q: string, params?: Record<string, unknown>): [string, string] => [
     JSON.stringify(tsQuery(tsGraph, q, params)),
@@ -2437,7 +2452,7 @@ suite('GQL differential: non-finite number coerces to null (D1)', () => {
     '{"type":"node","id":"2","labels":["N"],"properties":{"k":2,"v":-1e400}}',
     '{"type":"node","id":"3","labels":["N"],"properties":{"k":3,"v":2.5}}',
   ].join('\n');
-  const nativeGraph = graphFromFormat(backend, NF_NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, NF_NDJSON);
   const tsGraph = tsDeserialize(NF_NDJSON, 'ndjson', new Graph());
 
   const both = (q: string): [string, string] => [
@@ -2470,7 +2485,7 @@ suite('GQL differential: non-finite number coerces to null (D1)', () => {
 // accept and reject exactly the same param shapes with the same error code.
 suite('GQL differential: param value validation (D2/D3)', () => {
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, MODERN_NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, MODERN_NDJSON);
   const tsGraph = tsDeserialize(MODERN_NDJSON, 'ndjson', new Graph());
 
   const outcome = (run: () => unknown): { ok: true } | { code: unknown } => {
@@ -2570,7 +2585,7 @@ suite('gql conformance: ALL SHORTEST — every tied path, byte-identical', () =>
     .join('\n');
 
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
     JSON.stringify(tsQuery(tsGraph, q)),
@@ -2631,7 +2646,7 @@ suite('gql conformance: path modes — byte-identical restrictors', () => {
     .join('\n');
 
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
     JSON.stringify(tsQuery(tsGraph, q)),
@@ -2682,7 +2697,7 @@ suite('gql conformance: bare path binding — every walk as a Path, byte-identic
     .join('\n');
 
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
     JSON.stringify(tsQuery(tsGraph, q)),
@@ -2757,7 +2772,7 @@ suite('gql conformance: per-hop edge predicate on var-length — byte-identical'
     .join('\n');
 
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
     JSON.stringify(tsQuery(tsGraph, q)),
@@ -2829,7 +2844,7 @@ suite('gql conformance: ANY / SHORTEST k — byte-identical', () => {
     .join('\n');
 
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
   const both = (q: string): [string, string] => [
     JSON.stringify(tsQuery(tsGraph, q)),
@@ -2903,7 +2918,7 @@ const MAP_NDJSON = [
 
 suite('GQL differential: stored map/record properties (TS vs native)', () => {
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, MAP_NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, MAP_NDJSON);
   const tsGraph = tsDeserialize(MAP_NDJSON, 'ndjson', new Graph());
 
   const both = (q: string, params?: Record<string, unknown>): [string, string] => [
@@ -2949,5 +2964,181 @@ suite('GQL differential: stored map/record properties (TS vs native)', () => {
     const [ts, native] = both(q);
     expect(ts).toBe(native);
     expect(ts).toBe(`[{"t":{"a":1,"b":2}}]`);
+  });
+});
+
+// ORDER BY + LIMIT top-k: the engines must project exactly the same rows, so a
+// projection that would fault on a row OUTSIDE the top-k must not fault in
+// either. Native has always kept only the top-k input bindings when the sort
+// keys don't read the output; the TS engine projected every row first, so it
+// faulted where native returned a row.
+suite('ORDER BY + LIMIT projects only the emitted rows', () => {
+  const NDJSON = [
+    '{"type":"node","id":"1","labels":["T"],"properties":{"n":3,"s":"a"}}',
+    '{"type":"node","id":"2","labels":["T"],"properties":{"n":7,"s":"z"}}',
+    '{"type":"node","id":"3","labels":["T"],"properties":{"n":5,"s":"m"}}',
+  ].join('\n');
+
+  const backend = createFfiBackend(LIB);
+  const nativeGraph = graphFromNdjson(backend, NDJSON);
+  const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
+  const both = (q: string): [string, string] => [
+    JSON.stringify(tsQuery(tsGraph, q)),
+    JSON.stringify(nativeGraph.query(q)),
+  ];
+
+  // Release the native handle deterministically — the GC backstop warns (and is
+  // not guaranteed to run) once enough graphs accumulate across this file.
+  afterAll(() => {
+    nativeGraph.free();
+  });
+
+  test('a faulting projection outside the top-k is never evaluated', () => {
+    // `n.n = 7` divides by zero, but ORDER BY n.n LIMIT 1 emits only n.n = 3.
+    const [ts, native] = both(`MATCH (n:T) RETURN 1/(n.n - 7) AS x ORDER BY n.n LIMIT 1`);
+
+    expect(ts).toBe(native);
+    expect(ts).toBe(`[{"x":-0.25}]`);
+  });
+
+  test('a sort key that READS the output still projects every row', () => {
+    // The sort key is the projected column, so every row must be projected to
+    // sort at all — both engines fault. Same for an alias of the input column.
+    for (const q of [
+      `MATCH (n:T) RETURN 1/(n.n - 7) AS x ORDER BY x LIMIT 1`,
+      `MATCH (n:T) RETURN 1/(n.n - 7) AS x, n.n AS t ORDER BY t LIMIT 1`,
+    ]) {
+      expect(() => tsQuery(tsGraph, q)).toThrow();
+      expect(() => nativeGraph.query(q)).toThrow();
+    }
+  });
+
+  test('the ordinary ORDER BY + LIMIT results are unchanged', () => {
+    for (const q of [
+      `MATCH (n:T) RETURN n.n AS v ORDER BY n.n LIMIT 2`,
+      `MATCH (n:T) RETURN n.n AS v ORDER BY n.n DESC LIMIT 2`,
+      `MATCH (n:T) RETURN n.n AS v ORDER BY n.n SKIP 1 LIMIT 1`,
+      `MATCH (n:T) RETURN n.s AS v ORDER BY n.n DESC LIMIT 2`,
+      `MATCH (n:T) RETURN DISTINCT n.n AS v ORDER BY n.n LIMIT 2`,
+      `MATCH (n:T) RETURN * ORDER BY n.n LIMIT 1`,
+      `MATCH (n:T) RETURN n.n AS v ORDER BY n.n`,
+      `MATCH (n:T) RETURN n.n AS v ORDER BY n.n LIMIT 99`,
+    ]) {
+      const [ts, native] = both(q);
+
+      expect(ts).toBe(native);
+    }
+  });
+});
+
+// Grouping keys must agree with equality. `-0 = 0` is true, and the distinction is
+// normalized everywhere else (ORDER BY, sign(), the result JSON, the property
+// index), so both engines collapse the two zeroes into ONE group — including
+// inside a record, which the TS side used to key by stringifying (and which had
+// disagreed with native in the other direction).
+suite('signed zero is one grouping key, nested or not', () => {
+  const NDJSON = [
+    '{"type":"node","id":"1","labels":["T"],"properties":{"n":3,"x":-1}}',
+    '{"type":"node","id":"2","labels":["T"],"properties":{"n":7,"x":4}}',
+  ].join('\n');
+
+  const backend = createFfiBackend(LIB);
+  const nativeGraph = graphFromNdjson(backend, NDJSON);
+  const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
+
+  afterAll(() => {
+    nativeGraph.free();
+  });
+
+  test('-0 and 0 collapse inside a record, a list, and bare', () => {
+    for (const q of [
+      // `0 * -1` is -0 and `0 * 4` is 0 — ONE group, and it renders as `0`.
+      `MATCH (n:T) RETURN count(DISTINCT {b: (0 * n.x)}) AS x`,
+      `MATCH (n:T) RETURN (0 * n.x) AS k, count(*) AS c GROUP BY k`,
+      `MATCH (n:T) RETURN count(DISTINCT {a: 1, b: (0 * n.x)}) AS x`,
+      `MATCH (n:T) RETURN count(DISTINCT {b: [0 * n.x]}) AS x`,
+      `MATCH (n:T) RETURN count(DISTINCT (0 * n.x)) AS x`,
+      `MATCH (n:T) RETURN collect_list(DISTINCT {a: 1, b: (0 * n.x)}) AS x`,
+      // …and equal records still collapse.
+      `MATCH (n:T) RETURN count(DISTINCT {b: 1}) AS x`,
+      `MATCH (n:T) RETURN count(DISTINCT {b: n.n}) AS x`,
+    ]) {
+      const ts = JSON.stringify(tsQuery(tsGraph, q));
+      const native = JSON.stringify(nativeGraph.query(q));
+
+      expect(ts).toBe(native);
+    }
+  });
+});
+
+// ISO `<order by and page statement>` in STATEMENT position — the grammar puts
+// `orderByAndPageStatement` both trailing a RETURN (`primitiveResultStatement`)
+// and as a pipeline step of its own (`primitiveQueryStatement`). This covers the
+// second form, which sorts/slices the working BINDING table before any projection
+// runs, so a later RETURN only ever projects the survivors.
+suite('ISO standalone ORDER BY / OFFSET / LIMIT statement', () => {
+  const NDJSON = [
+    '{"type":"node","id":"1","labels":["T"],"properties":{"n":3,"s":"a"}}',
+    '{"type":"node","id":"2","labels":["T"],"properties":{"n":7,"s":"z"}}',
+    '{"type":"node","id":"3","labels":["T"],"properties":{"n":5,"s":"m"}}',
+  ].join('\n');
+
+  const backend = createFfiBackend(LIB);
+  const nativeGraph = graphFromNdjson(backend, NDJSON);
+  const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
+  const both = (q: string): [string, string] => [
+    JSON.stringify(tsQuery(tsGraph, q)),
+    JSON.stringify(nativeGraph.query(q)),
+  ];
+
+  afterAll(() => {
+    nativeGraph.free();
+  });
+
+  test('the statement form sorts, slices, and composes identically', () => {
+    for (const q of [
+      `MATCH (n:T) ORDER BY n.n RETURN n.n AS x`,
+      `MATCH (n:T) ORDER BY n.n DESC RETURN n.n AS x`,
+      `MATCH (n:T) ORDER BY n.s RETURN n.s AS x`,
+      `MATCH (n:T) ORDER BY n.n LIMIT 2 RETURN n.n AS x`,
+      `MATCH (n:T) ORDER BY n.n DESC LIMIT 2 RETURN n.n AS x`,
+      `MATCH (n:T) ORDER BY n.n OFFSET 1 RETURN n.n AS x`,
+      `MATCH (n:T) ORDER BY n.n OFFSET 1 LIMIT 1 RETURN n.n AS x`,
+      `MATCH (n:T) ORDER BY n.n OFFSET 99 RETURN n.n AS x`,
+      // Bare LIMIT / OFFSET with no ORDER BY.
+      `MATCH (n:T) LIMIT 1 RETURN n.n AS x`,
+      `MATCH (n:T) OFFSET 1 RETURN n.n AS x`,
+      // Composes with FILTER, with an aggregate, and with itself.
+      `MATCH (n:T) FILTER n.n > 3 ORDER BY n.n LIMIT 1 RETURN n.n AS x`,
+      `MATCH (n:T) ORDER BY n.n LIMIT 2 RETURN count(*) AS c`,
+      `MATCH (n:T) ORDER BY n.n LIMIT 2 ORDER BY n.n DESC LIMIT 1 RETURN n.n AS x`,
+      // The trailing form is unaffected.
+      `MATCH (n:T) RETURN n.n AS x ORDER BY x LIMIT 2`,
+    ]) {
+      const [ts, native] = both(q);
+
+      expect(ts).toBe(native);
+    }
+  });
+
+  test('paging trims the binding table BEFORE the projection runs', () => {
+    // The semantic point of the statement form: a projection that would fault on
+    // a dropped row never runs, because the row is gone before RETURN sees it.
+    for (const [q, want] of [
+      [`MATCH (n:T) ORDER BY n.n LIMIT 0 RETURN 1/0 AS x`, `[]`],
+      [`MATCH (n:T) ORDER BY n.n LIMIT 1 RETURN 1/(n.n - 7) AS x`, `[{"x":-0.25}]`],
+    ] as const) {
+      const [ts, native] = both(q);
+
+      expect(ts).toBe(native);
+      expect(ts).toBe(want);
+    }
+  });
+
+  test('an unbound dynamic bound is a clean MissingParameter in both', () => {
+    const q = `MATCH (n:T) ORDER BY n.n LIMIT $k RETURN n.n AS x`;
+
+    expect(() => tsQuery(tsGraph, q)).toThrow();
+    expect(() => nativeGraph.query(q)).toThrow();
   });
 });

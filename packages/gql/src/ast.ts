@@ -63,6 +63,7 @@ export type Clause =
   | MatchClause
   | WithClause
   | FilterClause
+  | PageClause
   | LetClause
   | ForClause
   | InsertClause
@@ -205,6 +206,22 @@ export type WithClause = {
 export type FilterClause = {
   kind: 'filter';
   where: Expr;
+};
+
+/**
+ * `ORDER BY … [OFFSET n] [LIMIT n]` as a STATEMENT of its own — the ISO
+ * `<order by and page statement>` in its `primitiveQueryStatement` position, i.e.
+ * a pipeline step that may precede the RETURN rather than trail it.
+ *
+ * Different from the paging carried ON a projection: here the sort and slice
+ * apply to the working BINDING table, so a later RETURN only ever sees (and only
+ * ever projects) the surviving rows.
+ */
+export type PageClause = {
+  kind: 'page';
+  orderBy?: readonly SortItem[];
+  skip?: CountValue;
+  limit?: CountValue;
 };
 
 /**

@@ -26,7 +26,7 @@ const SYMBOLS = {
   lnk_graph_edge_count: { args: [FFIType.ptr], returns: U },
   lnk_graph_version: { args: [FFIType.ptr], returns: U },
   lnk_graph_epoch: { args: [FFIType.ptr, FFIType.ptr, U], returns: U },
-  lnk_graph_set_max_operator_chain: { args: [FFIType.ptr, U], returns: FFIType.void },
+  lnk_graph_set_config: { args: [FFIType.ptr, FFIType.u32, U], returns: FFIType.u32 },
   // (g, element:u8, kind:u8, k0_ptr, k0_len, k1_ptr, k1_len) -> i32
   lnk_create_index: {
     args: [FFIType.ptr, FFIType.u8, FFIType.u8, FFIType.ptr, U, FFIType.ptr, U],
@@ -255,9 +255,7 @@ export const createFfiBackend = (libPath: string): Backend => {
 
       return Number(symbols.lnk_graph_epoch(asPtr(handle), ptr(n), n.byteLength));
     },
-    setMaxOperatorChain: (handle, n) => {
-      symbols.lnk_graph_set_max_operator_chain(asPtr(handle), n);
-    },
+    setConfig: (handle, id, value) => symbols.lnk_graph_set_config(asPtr(handle), id, value) === 1,
     createIndex: (handle, on, kind, keys) => {
       const element = on === 'edge' ? 1 : 0;
       const k = kind === 'interval' ? 1 : 0;

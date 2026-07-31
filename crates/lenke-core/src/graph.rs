@@ -1265,6 +1265,89 @@ fn value_type(v: &Value) -> Option<PropType> {
 }
 
 /// The mutable columnar graph.
+/// Host-configurable settings for one graph — the single place engine knobs live,
+/// so adding one does not mean adding another `set_*` export and another ABI bump.
+///
+/// Sections keep the space from becoming a flat pile as it grows; today there is
+/// one (`limits`), and the FFI setter is keyed by a stable [`ConfigId`] rather
+/// than by section+field, so a new setting is purely additive across the ABI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GraphConfig {
+    pub limits: GraphLimits,
+}
+
+/// Resource ceilings. These are ANTI-RUNAWAY bounds, not semantics: a query under
+/// the ceiling behaves identically whatever the ceiling is, and tripping one is
+/// always a loud `E_RESOURCE_EXHAUSTED` (or `E_SYNTAX`, for the parse-time
+/// `operator_chain`), never a truncated result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphLimits {
+    /// Ceiling on the element count `range(start, end [, step])` may materialize.
+    /// A GQL list is a MATERIALIZED value in both engines (`Val::List(Vec<Val>)` /
+    /// a JS array) — indexing, `size`, sorting, equality and serialization all
+    /// assume that — so a range cannot be produced lazily without a lazy-list
+    /// variant threaded through both value models. Unbounded, `range(0, 1e21)` is
+    /// not merely slow: the f64 counter stops advancing at 2^53 (`i += 1.0` is a
+    /// no-op there), so the loop never terminates while pushing, and the host dies
+    /// on an OOM kill instead of the query erroring.
+    pub range: u64,
+    /// Per-expansion cap on trail-traversal steps; a guard against exponential
+    /// blowup on a dense graph. Mirrored by the TS engine's `TRAIL_BUDGET`.
+    pub trail: u64,
+    /// Ceiling on the intermediate frontier a fixed-length multi-segment scan may
+    /// materialize. A chain `(a)-[]->(b)-[]->(c)-[]->…` fans out the cross-product
+    /// of partial matches segment by segment, and the trailing LIMIT only prunes
+    /// the *last* segment — every earlier layer is built in full first. On a dense
+    /// graph that reaches billions of rows and takes the host down with an OOM kill
+    /// rather than the query erroring. Generous enough that a real analytical join
+    /// clears it; only a runaway cross-product trips it. NATIVE-ONLY — the TS
+    /// engine has no vectorized frontier, so it ignores this one.
+    pub intermediate: u64,
+    /// Ceiling on GQL operator-chain length (`a AND b AND …`, `x + y + …`), applied
+    /// by the PARSER rather than at evaluation time, so an over-long chain is
+    /// `E_SYNTAX`. Anti-resource-abuse only — the n-ary AST never overflows the
+    /// stack. A `prepare()` call may override it for that statement.
+    pub operator_chain: u64,
+}
+
+impl Default for GraphLimits {
+    fn default() -> Self {
+        Self {
+            range: 1_000_000,
+            trail: 1_000_000,
+            intermediate: 50_000_000,
+            operator_chain: 10_000,
+        }
+    }
+}
+
+/// Stable wire ids for [`GraphConfig`] settings, so the FFI setter is ONE export
+/// keyed by id rather than one export per knob (which is how the surface grew a
+/// `lnk_graph_set_max_operator_chain` and was about to grow more). Ids are
+/// append-only: an artifact predating a setting reports it as unknown rather than
+/// silently ignoring it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ConfigId {
+    LimitsRange = 0,
+    LimitsTrail = 1,
+    LimitsIntermediate = 2,
+    LimitsOperatorChain = 3,
+}
+
+impl ConfigId {
+    #[must_use]
+    pub const fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            0 => Some(Self::LimitsRange),
+            1 => Some(Self::LimitsTrail),
+            2 => Some(Self::LimitsIntermediate),
+            3 => Some(Self::LimitsOperatorChain),
+            _ => None,
+        }
+    }
+}
+
 pub struct Graph {
     /// Vertex slots (including tombstoned). Index space for queries is `0..n`.
     pub n: usize,
@@ -1434,7 +1517,10 @@ pub struct Graph {
     /// Anti-resource-abuse ceiling on GQL operator-chain length, passed to the
     /// parser on each query (see `gql::parser::DEFAULT_MAX_CHAIN`). Defaults to
     /// 10_000; set at graph creation via the native `maxOperatorChain` option.
-    max_operator_chain: usize,
+    /// Host-configurable settings (see [`GraphConfig`]) — every engine knob,
+    /// including the operator-chain ceiling that used to be its own field and its
+    /// own FFI export.
+    config: GraphConfig,
     /// Access mode of the active explicit transaction opened by ISO GQL
     /// `START TRANSACTION READ ONLY` (see the gql eval layer). Set true by that
     /// statement, cleared on commit/rollback. Only the GQL statement executor reads
@@ -1506,7 +1592,7 @@ impl Clone for Graph {
             tx_touched_edges: self.tx_touched_edges.clone(),
             last_touched: self.last_touched.clone(),
             applying_undo: self.applying_undo,
-            max_operator_chain: self.max_operator_chain,
+            config: self.config,
             tx_read_only: self.tx_read_only,
         }
     }
@@ -2738,7 +2824,7 @@ impl Builder {
             last_touched: Vec::new(),
             applying_undo: false,
             tx_read_only: false,
-            max_operator_chain: 10_000,
+            config: GraphConfig::default(),
         }
     }
 }

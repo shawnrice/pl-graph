@@ -3,8 +3,10 @@
 // matching), so this is a leaf module.
 import {
   civilFromDays,
+  DEFAULT_CONFIG,
   Duration,
   durationBetween,
+  isRecord,
   isTemporal,
   LenkeRecord,
   LocalDate,
@@ -17,7 +19,7 @@ import {
   ZonedDateTime,
   ZonedTime,
 } from '@lenke/core';
-import type { Temporal } from '@lenke/core';
+import type { GraphLimits, Temporal } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
 import type { ArithOp, CompareOp, Expr } from '../ast.js';
@@ -229,7 +231,7 @@ export const concatStep = (lv: unknown, rv: unknown): unknown => {
     return [...lv, ...rv];
   }
 
-  return String(lv) + String(rv);
+  return str(lv) + str(rv);
 };
 /**
  * Compare two strings by Unicode CODE POINT, matching Rust `str::cmp` (UTF-8 byte
@@ -328,8 +330,12 @@ export const percentileOf = (
   frac: number,
   cont: boolean,
 ): number | null => {
+  // `numArg`, not `Number` — the engine's numeric coercion, which the native
+  // side uses here too. Raw `Number` accepts spellings the engine rejects
+  // everywhere else (`Number('0x10')` is 16, while `to_float`/`sum`/`avg` and
+  // the native `percentile` all read '0x10' as non-numeric).
   const nums = values
-    .map(Number)
+    .map(numArg)
     .filter((x) => Number.isFinite(x))
     .sort((a, b) => a - b);
   const n = nums.length;
@@ -427,7 +433,47 @@ export const NUM_CONSTANTS: Record<string, number> = {
   e: Math.E,
 };
 
-export const str = (v: unknown): string => String(v);
+/**
+ * Render one element of a list/path: a null element joins as the EMPTY string
+ * (`String([1,null,3])` === `"1,,3"`), unlike a top-level null, which renders as
+ * `"null"`. The native engine mirrors this JS rule deliberately.
+ */
+const joinElement = (x: unknown): string => (isNullish(x) ? '' : str(x));
+
+/**
+ * Stringify a value the way the native engine does (`js_str` in `gql/eval.rs`) —
+ * the single coercion behind `to_string`, `CAST(… AS STRING)`, `||`, and every
+ * string function's arguments.
+ *
+ * Plain `String(v)` agrees only on the primitives. A record is a `Map` subclass,
+ * so it stringifies as `"[object Map]"`; a vertex/edge/path carries a debug
+ * `toString` (`"Vertex (1) {}"`); and `Array.prototype.join` re-enters `String`
+ * rather than this function, so a record nested in a list would slip through.
+ * Each of those rendered differently from the native engine.
+ */
+export const str = (v: unknown): string => {
+  // A record renders as its canonical JSON object — the same form it serializes
+  // to in a result row (keys sorted by `LenkeRecord.from`).
+  if (isRecord(v)) {
+    return JSON.stringify(v);
+  }
+
+  // An element renders as its id, matching `element_id` (and native's `js_str`).
+  if (isElement(v)) {
+    return String((v as { id: unknown }).id);
+  }
+
+  if (Array.isArray(v)) {
+    return v.map(joinElement).join(',');
+  }
+
+  // A path renders as its interleaved vertex/edge id sequence.
+  if (v instanceof Path) {
+    return [...v].map(joinElement).join(',');
+  }
+
+  return String(v);
+};
 
 // Round half away from zero — Rust's `f64::round` semantics. JS `Math.round`
 // rounds half toward +∞ (`Math.round(-2.5) === -2`), so we apply the sign
@@ -594,13 +640,28 @@ export const numArg = (v: unknown): number => {
       return 0;
     }
 
-    return FINITE_NUMERIC.test(t) ? Number(t) : Number.NaN;
+    if (!FINITE_NUMERIC.test(t)) {
+      return Number.NaN;
+    }
+
+    // A syntactically-valid literal can still overflow ('1e1000' → Infinity).
+    // Native filters non-finite parses to NaN, so this must too — otherwise
+    // `sqrt('1e1000')` is Infinity here and null there.
+    const parsed = Number(t);
+
+    return Number.isFinite(parsed) ? parsed : Number.NaN;
   }
 
   return Number.NaN;
 };
 
-export const callScalar = (name: string, args: readonly unknown[]): unknown => {
+export const callScalar = (
+  name: string,
+  args: readonly unknown[],
+  // Required, not defaulted: a default parameter counts against this function's
+  // complexity budget, and every real call site has a graph in hand anyway.
+  limits: GraphLimits,
+): unknown => {
   const [a, b] = args;
   const unaryNum = UNARY_NUM[name];
 
@@ -656,22 +717,34 @@ export const callScalar = (name: string, args: readonly unknown[]): unknown => {
       }
 
       const s = str(a);
-      const n = numArg(b);
+      // Truncate toward zero to mirror native's `as usize` cast: a fractional
+      // length takes whole characters, so `right('abcdef', 2.9)` is 'ef' (2), not
+      // the 'def' that `slice(6 - 2.9)` = `slice(3.1)` would give. `left` already
+      // truncates, because its fraction lands in `slice`'s END argument.
+      const n = Math.trunc(numArg(b));
 
-      return n <= 0 ? '' : sanitizeSurrogates(s.slice(Math.max(0, s.length - n)));
+      // `n > 0`, not `!(n <= 0)`, so a NaN length (`right(s, 'nan')`) takes the
+      // empty branch. Falling through with NaN would `slice(NaN)` — i.e.
+      // `slice(0)`, the WHOLE string — whereas native's `NaN as usize` saturates
+      // to 0 and yields ''. `left` is already empty for NaN.
+      return n > 0 ? sanitizeSurrogates(s.slice(Math.max(0, s.length - n))) : '';
     }
     case 'coalesce':
       return args.find((x) => !isNullish(x)) ?? null;
     case 'nullif':
-      // ISO `<case abbreviation>`: NULLIF(a, b) = NULL when a = b, else a.
-      return !isNullish(a) && !isNullish(b) && a === b ? null : (a ?? null);
+      // ISO `<case abbreviation>`: NULLIF(a, b) = NULL when a = b, else a. The
+      // equality is the engine's VALUE equality (`structuralEq`, what `=` uses),
+      // not JS `===` — two temporals/lists/records holding the same value are
+      // distinct objects, so `===` said "not equal" where the native `val_eq`
+      // said equal.
+      return !isNullish(a) && !isNullish(b) && structuralEq(a, b) ? null : (a ?? null);
     case 'element_id':
       // ISO `<element_id function>`: the identifier of a node or edge.
       return a && typeof a === 'object' && 'id' in a ? (a as { id: unknown }).id : null;
     default:
       // Graph/conversion/string/list functions live in a second dispatcher so
       // neither switch exceeds the complexity budget.
-      return callExtendedScalar(name, args);
+      return callExtendedScalar(name, args, limits);
   }
 };
 
@@ -691,7 +764,17 @@ export const FINITE_NUMERIC = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
 export const numericStringToFloat = (s: string): number | null => {
   const t = s.trim();
 
-  return FINITE_NUMERIC.test(t) ? Number.parseFloat(t) : null;
+  if (!FINITE_NUMERIC.test(t)) {
+    return null;
+  }
+
+  // A syntactically-valid literal can still overflow to Infinity ('1e1000').
+  // Native filters those out (`.filter(|n| n.is_finite())`), so a non-finite
+  // result is NOT a value here either — it reads as null, which matters for
+  // `IS NOT NULL` even though JSON renders both as null.
+  const v = Number.parseFloat(t);
+
+  return Number.isFinite(v) ? v : null;
 };
 
 export const toIntScalar = (a: unknown): number | null => {
@@ -703,7 +786,15 @@ export const toIntScalar = (a: unknown): number | null => {
     return Math.trunc(a);
   }
 
-  const p = numericStringToFloat(str(a));
+  // Only a number or a STRING converts — mirroring the native arms. Falling back
+  // to `str(a)` would convert by stringifying, so a one-element list (`[0]` → "0")
+  // or a vertex (whose `str` is its id) would come back as a number instead of the
+  // null the native engine returns.
+  if (typeof a !== 'string') {
+    return null;
+  }
+
+  const p = numericStringToFloat(a);
 
   return p === null ? null : Math.trunc(p);
 };
@@ -717,7 +808,8 @@ export const toFloatScalar = (a: unknown): number | null => {
     return a;
   }
 
-  return numericStringToFloat(str(a));
+  // Number or string only — see the note in `toIntScalar`.
+  return typeof a === 'string' ? numericStringToFloat(a) : null;
 };
 
 export const substringScalar = (a: unknown, b: unknown, len: unknown): string | null => {
@@ -824,7 +916,12 @@ export const toBooleanScalar = (a: unknown): boolean | null => {
     return Number.isNaN(a) ? null : a !== 0;
   }
 
-  const t = str(a).trim().toLowerCase();
+  // Boolean, number, or string only — see the note in `toIntScalar`.
+  if (typeof a !== 'string') {
+    return null;
+  }
+
+  const t = a.trim().toLowerCase();
 
   if (t === 'true' || t === 'yes' || t === '1') {
     return true;
@@ -855,7 +952,22 @@ export const byteLen = (s: string): number => UTF8.encode(s).length;
 
 // ISO GQL `range(start, end, [step])` → an inclusive list of integers. A zero
 // step has no defined progression → null. Mirrors the Rust `Range` arm.
-export const rangeScalar = (a: unknown, b: unknown, step: unknown): number[] | null => {
+/**
+ * `range()`, bounded by the graph's `limits.range` ceiling (see `GraphLimits`) —
+ * the same bound the native engine applies, so both fault on exactly the same
+ * inputs. A GQL list is a MATERIALIZED value in both engines (a JS array here,
+ * `Vec<Val>` there), so it cannot be produced lazily without a lazy-list variant
+ * threaded through both value models. Unbounded, `range(0, 1e21)` is not merely
+ * slow: the counter stops advancing at 2^53 (`i += 1` is a no-op there), so the
+ * loop never terminates while pushing, and the host dies on an OOM kill instead of
+ * the query erroring.
+ */
+export const rangeScalar = (
+  a: unknown,
+  b: unknown,
+  step: unknown,
+  limit: number = DEFAULT_CONFIG.limits.range,
+): number[] | null => {
   if (isNullish(a) || isNullish(b)) {
     return null;
   }
@@ -868,16 +980,31 @@ export const rangeScalar = (a: unknown, b: unknown, step: unknown): number[] | n
     return null;
   }
 
-  const out: number[] = [];
+  // The element count is computed UP FRONT: it bounds the allocation before a
+  // single push, and it makes the loop COUNT-driven rather than comparison-driven,
+  // so the 2^53 stall cannot spin forever (`range(9007199254740992,
+  // 9007199254740994)` has a count of 3 but never terminates under `i <= e`).
+  // The values still come from repeated addition, so the sequence is unchanged.
+  const count = Math.floor((e - s) / st) + 1;
 
-  if (st > 0) {
-    for (let i = s; i <= e; i += st) {
-      out.push(i);
-    }
-  } else {
-    for (let i = s; i >= e; i += st) {
-      out.push(i);
-    }
+  // A backwards span (or a NaN bound) yields no elements.
+  if (Number.isNaN(count) || count <= 0) {
+    return [];
+  }
+
+  if (count > limit) {
+    throw new LenkeError(
+      `range() would materialize more than ${limit} elements; narrow the bounds or widen the step`,
+      { code: ErrorCode.ResourceExhausted },
+    );
+  }
+
+  const out: number[] = new Array<number>(count);
+  let i = s;
+
+  for (let k = 0; k < count; k++) {
+    out[k] = i;
+    i += st;
   }
 
   return out;
@@ -987,7 +1114,11 @@ export const callStringPredicateFn = (name: string, a: unknown, b: unknown): unk
 };
 
 // String / list functions.
-export const callStringListFn = (name: string, args: readonly unknown[]): unknown => {
+export const callStringListFn = (
+  name: string,
+  args: readonly unknown[],
+  limits: GraphLimits,
+): unknown => {
   const [a, b] = args;
 
   switch (name) {
@@ -1009,7 +1140,7 @@ export const callStringListFn = (name: string, args: readonly unknown[]): unknow
       // The element may be null (a first-class value); only a null LIST → null.
       return Array.isArray(a) ? [...a, args[1] ?? null] : null;
     case 'range':
-      return rangeScalar(a, b, args[2]);
+      return rangeScalar(a, b, args[2], limits.range);
     default:
       return UNHANDLED;
   }
@@ -1295,24 +1426,29 @@ const EXTENDED_DISPATCHERS: readonly ((
   a: unknown,
   b: unknown,
   args: readonly unknown[],
+  limits: GraphLimits,
 ) => unknown)[] = [
   (name, a) => callGraphFn(name, a),
   (name, a) => callConversionFn(name, a),
   (name, a) => callDatePartFn(name, a),
   (name, _a, _b, args) => callTemporalFn(name, args),
   (name, a, b) => callStringPredicateFn(name, a, b),
-  (name, _a, _b, args) => callStringListFn(name, args),
+  (name, _a, _b, args, limits) => callStringListFn(name, args, limits),
   (name, a, b, args) => callListSetFn(name, a, b, args),
 ];
 
-export const callExtendedScalar = (name: string, args: readonly unknown[]): unknown => {
+export const callExtendedScalar = (
+  name: string,
+  args: readonly unknown[],
+  limits: GraphLimits = DEFAULT_CONFIG.limits,
+): unknown => {
   const [a, b] = args;
 
   // Short-circuit on the first handler. (The previous array-literal form invoked
   // ALL seven before the `!== UNHANDLED` check, so the early-return was dead and
   // every fall-through call paid for all seven switch dispatches.)
   for (const dispatch of EXTENDED_DISPATCHERS) {
-    const result = dispatch(name, a, b, args);
+    const result = dispatch(name, a, b, args, limits);
 
     if (result !== UNHANDLED) {
       return result;

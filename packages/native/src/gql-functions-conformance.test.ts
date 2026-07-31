@@ -14,7 +14,7 @@ import { query as tsQuery } from '@lenke/gql';
 import { deserialize as tsDeserialize } from '@lenke/serialization';
 
 import { createFfiBackend } from './backend-ffi.js';
-import { graphFromFormat } from './graph.js';
+import { graphFromNdjson } from './graph.js';
 
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
@@ -39,7 +39,7 @@ const NDJSON = [
 
 suite('GQL function differential (TS vs native)', () => {
   const backend = createFfiBackend(LIB);
-  const nativeGraph = graphFromFormat(backend, NDJSON, 'ndjson');
+  const nativeGraph = graphFromNdjson(backend, NDJSON);
   const tsGraph = tsDeserialize(NDJSON, 'ndjson', new Graph());
 
   // Each case is a RETURN expression; both engines evaluate it over the single
@@ -201,6 +201,76 @@ suite('GQL function differential (TS vs native)', () => {
     `list_sort([2, 'a', 1], 'desc')`,
     `list_sort(['banana', 'apple', 'cherry'])`,
     `list_union([1], 2)`,
+    // Slice 3 — regressions the differential FUZZER found. The fuzzer is
+    // randomized, so these pin the specific cases as permanent table rows.
+    // Value stringification: `String(v)` disagreed for every non-primitive.
+    `to_string({b: 2, a: 1})`,
+    `CAST({a: 1} AS STRING)`,
+    `upper({a: 'q'})`,
+    `char_length({a: 1})`,
+    `({a: 1} || 'x')`,
+    `to_string([{a: 1}])`,
+    `to_string({a: date('2020-01-01')})`,
+    `to_string(n)`,
+    `to_string([1, null, 3])`,
+    // right(): a fractional length truncates, a NaN length is empty.
+    `right(n.s, 2.9)`,
+    `right(n.s, 'nan')`,
+    `right(n.s, 'inf')`,
+    `right(n.s, 3)`,
+    `right(n.s, 0)`,
+    // nullif() compares by VALUE — equal temporals/lists/records are distinct JS
+    // objects, so a `===` test disagreed with the native `val_eq`.
+    `nullif(date('2020-01-01'), date('2020-01-01'))`,
+    `nullif(duration('P1Y2M'), duration('P1Y2M'))`,
+    `nullif([1, 2], [1, 2])`,
+    `nullif({a: 1}, {a: 1})`,
+    `nullif([1, 2], [1, 3])`,
+    // The conversion functions take numbers and strings only — they must not
+    // convert by stringifying (a one-element list, or an element's id).
+    `to_integer([0])`,
+    `to_float([1.5])`,
+    `to_boolean([true])`,
+    `to_integer(n)`,
+    `to_boolean(n)`,
+    // A numeric string that overflows to Infinity is not a number. JSON renders
+    // Infinity and null identically, so the IS NULL form is what shows it.
+    `(to_float('1e1000') IS NULL)`,
+    `(to_integer('1e1000') IS NULL)`,
+    `(sqrt('1e1000') IS NULL)`,
+    `(to_float('1e300') IS NULL)`,
+    // percentile coerces with the engine rule, not raw Number() (hex).
+    `percentile_cont('0x10', 0.5)`,
+    `percentile_disc('0x10', 0.5)`,
+    `percentile_cont('5', 0.5)`,
+    // degrees/radians: multiply-then-divide, not the pre-rounded constant that
+    // Rust's `to_degrees`/`to_radians` use.
+    `degrees(1e100)`,
+    `degrees(123456.789)`,
+    `degrees(3.14)`,
+    `radians(3)`,
+    `radians('1e3')`,
+    // stddev over non-numeric values is NaN (→ null), like avg — not a real 0.
+    `stddev_pop(n.s)`,
+    `stddev_samp(n.s)`,
+    // The total order ties a list against a record (rank 4's catch-all) instead
+    // of ordering them by a JS string coercion.
+    `list_sort([{a: 1}, [1, 2]])`,
+    `list_sort([[1, 2], {a: 1}])`,
+    `list_sort([[1, 2], date('2020-01-01'), {a: 1}, true, 'z', 3])`,
+    `list_sort([[3], [1], [2]])`,
+    `list_sort([{b: 1}, {a: 1}])`,
+    // range() is bounded (a materialized list) and its loop is count-driven, so
+    // the float-step stall at 2^53 terminates instead of spinning.
+    `size(range(0, 999999))`,
+    `size(range(0, 1000000, 2))`,
+    `size(range(to_float('9007199254740992'), to_float('9007199254740994')))`,
+    `range(0, 5)`,
+    `range(5, 0, -1)`,
+    `range(0, 10, 3)`,
+    `range(0, 0)`,
+    `range(5, 0)`,
+    `range(0, 10, 0)`,
   ];
 
   for (const expr of CASES) {

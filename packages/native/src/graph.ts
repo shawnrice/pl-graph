@@ -5,6 +5,7 @@ import type {
   ClusterRow,
   ComponentRow,
   DegreeRow,
+  GraphLimits,
   LabelRow,
   NeighborAggregateRow,
   OnCycleRow,
@@ -13,7 +14,13 @@ import type {
   ShortestPathRow,
   Temporal,
 } from '@lenke/core';
-import { fromTaggedJson, isTemporal, TEMPORAL_TAG_KEYS, temporalLiteralParts } from '@lenke/core';
+import {
+  CONFIG_IDS,
+  fromTaggedJson,
+  isTemporal,
+  TEMPORAL_TAG_KEYS,
+  temporalLiteralParts,
+} from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
 import type {
@@ -25,6 +32,27 @@ import type {
   PreparedHandle,
 } from './backend.js';
 import { ensureDisposeSymbol } from './dispose.js';
+
+/**
+ * The document formats the native codecs read and write. A union, not a bare
+ * `string`, so a typo (`'njson'`) is a compile error rather than a runtime one.
+ * Mirrors the Rust `codec::decode` dispatch; the pure-TS `FormatName` is the
+ * separate TS-codec list, and `@lenke/native` deliberately doesn't depend on it.
+ */
+export type GraphFormat = 'ndjson' | 'pg-json' | 'pg-text' | 'graphson' | 'csv';
+
+/**
+ * Construction-time settings for a native graph. Settings are constructor-only —
+ * they are host policy, fixed for the graph's life, and pinning them removes any
+ * question about what a mid-transaction change would mean. The one exception is
+ * the clock (`RustGraph.setClock`), a host dependency rather than a resource bound.
+ */
+export type GraphConfigOptions = {
+  /** Resource ceilings (see `GraphLimits`). */
+  limits?: Partial<GraphLimits>;
+  /** Shorthand for `limits.operatorChain`; the two are the same setting. */
+  maxOperatorChain?: number;
+};
 
 /** A decoded result row: column name → cell value. */
 export type Row = Record<string, unknown>;
@@ -1177,6 +1205,11 @@ export const attachGraph = (backend: Backend, handle: GraphHandle): RustGraph =>
       return result;
     },
     setClock: (c) => {
+      // The clock is a callback, not a value — it never crosses the native
+      // boundary; the host resolves it once per query into `$__now`. It is also
+      // the one setting that stays runtime-settable: a host dependency rather
+      // than a resource bound, and clearing it with `null` is part of its
+      // contract. Every other setting is fixed at construction.
       clock = c;
 
       return graph;
@@ -1249,19 +1282,53 @@ export const attachGraph = (backend: Backend, handle: GraphHandle): RustGraph =>
  * boundary can't take a zero-length buffer, so it crosses as one newline,
  * which the decoder treats as zero elements.
  */
+/**
+ * Apply construction-time settings to a freshly created handle. Settings are
+ * constructor-only: they are host policy, fixed for the graph's life, so the
+ * id-keyed backend setter stays INTERNAL rather than becoming a public mutator.
+ * `maxOperatorChain` is the shorthand for `limits.operatorChain`.
+ */
+const applyGraphConfig = (
+  backend: Backend,
+  handle: GraphHandle,
+  opts: GraphConfigOptions,
+): void => {
+  const limits: Partial<GraphLimits> = {
+    ...(opts.maxOperatorChain === undefined ? {} : { operatorChain: opts.maxOperatorChain }),
+    ...opts.limits,
+  };
+
+  for (const [name, value] of Object.entries(limits) as [keyof GraphLimits, number][]) {
+    if (!Number.isInteger(value) || value <= 0) {
+      throw new LenkeError(`limits.${name} must be a positive integer, got ${value}`, {
+        code: ErrorCode.InvalidValue,
+      });
+    }
+
+    if (!backend.setConfig(handle, CONFIG_IDS[`limits.${name}`], value)) {
+      throw new LenkeError(
+        `the loaded lenke artifact does not support the \`limits.${name}\` setting; rebuild the native crate`,
+        { code: ErrorCode.InvalidValue },
+      );
+    }
+  }
+};
+
 export const graphFromNdjson = (
   backend: Backend,
-  bytes: Uint8Array,
-  opts: { parallel?: boolean; maxOperatorChain?: number } = {},
+  input: string | Uint8Array,
+  opts: GraphConfigOptions & { parallel?: boolean } = {},
 ): RustGraph => {
+  // Accepts the text form as well as bytes: NDJSON is a text format, and needing
+  // to hand-encode it was why most callers reached for `graphFromFormat(…,
+  // 'ndjson')` instead of this, the dedicated entry point.
+  const bytes = typeof input === 'string' ? new TextEncoder().encode(input) : input;
   const handle = backend.graphFromNdjson(
     bytes.byteLength === 0 ? new TextEncoder().encode('\n') : bytes,
     opts.parallel ?? true,
   );
 
-  if (opts.maxOperatorChain !== undefined) {
-    backend.setMaxOperatorChain(handle, opts.maxOperatorChain);
-  }
+  applyGraphConfig(backend, handle, opts);
 
   return attachGraph(backend, handle);
 };
@@ -1272,27 +1339,27 @@ export const graphFromNdjson = (
  * without the encode-an-empty-buffer incantation.) Pass `{ maxOperatorChain }` to
  * override the GQL operator-chain ceiling (default 10_000).
  */
-export const createEmptyGraph = (
-  backend: Backend,
-  opts: { maxOperatorChain?: number } = {},
-): RustGraph => graphFromNdjson(backend, new Uint8Array(0), opts);
+export const createEmptyGraph = (backend: Backend, opts: GraphConfigOptions = {}): RustGraph =>
+  graphFromNdjson(backend, new Uint8Array(0), opts);
 
 /**
- * Deserialize a document in a named format (`pg-json | pg-text | graphson | csv |
- * ndjson`) into a {@link RustGraph}. Accepts a string or raw bytes.
+ * Deserialize a document into a {@link RustGraph}. Accepts a string or raw bytes.
+ *
+ * The format and any settings travel together in one options object, so the call
+ * reads as `graphFromFormat(backend, doc, { format: 'graphson' })` rather than as
+ * a run of positional arguments whose meanings you have to remember. For NDJSON
+ * use {@link graphFromNdjson}, which needs no format at all.
  */
 export const graphFromFormat = (
   backend: Backend,
   input: string | Uint8Array,
-  format: string,
-  opts: { maxOperatorChain?: number } = {},
+  options: GraphConfigOptions & { format: GraphFormat },
 ): RustGraph => {
+  const { format, ...opts } = options;
   const bytes = typeof input === 'string' ? new TextEncoder().encode(input) : input;
   const handle = backend.deserialize(bytes, format);
 
-  if (opts.maxOperatorChain !== undefined) {
-    backend.setMaxOperatorChain(handle, opts.maxOperatorChain);
-  }
+  applyGraphConfig(backend, handle, opts);
 
   return attachGraph(backend, handle);
 };

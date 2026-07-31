@@ -1,6 +1,11 @@
 import { rm } from 'node:fs/promises';
 
-import { createEmptyGraph, createStore, graphFromNdjson, type Store } from '@lenke/native';
+import {
+  createEmptyGraph,
+  createStore,
+  graphFromNdjson,
+  type Store,
+} from '@lenke/native';
 /**
  * Collaborative kanban board — a REAL client<->server split over a WebSocket.
  *

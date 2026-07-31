@@ -25,6 +25,7 @@ const fakeStore = () => {
     version: () => version,
     epoch: () => version, // every dep's epoch tracks version → any dep fires on a bump
     createIndex: () => {},
+    setConfig: () => true,
     createUniqueConstraint: () => {},
     createRequiredConstraint: () => {},
     createTypeConstraint: () => {},
@@ -69,7 +70,6 @@ const fakeStore = () => {
     encodeNdjson: () => new Uint8Array(),
     serialize: () => new Uint8Array(),
     deserialize: (): GraphHandle => 1,
-    setMaxOperatorChain: () => {},
     lastWriteScope: () => [],
   };
   const store = createStore(attachGraph(backend, 1));

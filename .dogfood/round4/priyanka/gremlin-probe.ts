@@ -1,4 +1,7 @@
-import { graphFromNdjson, gremlin } from '@lenke/native';
+import {
+  graphFromNdjson,
+  gremlin,
+} from '@lenke/native';
 import { createNodeBackend } from '@lenke/node/backend';
 const g = graphFromNdjson(
   createNodeBackend(),

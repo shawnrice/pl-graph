@@ -6,7 +6,11 @@
 
 import { readFile } from 'node:fs/promises';
 
-import { graphFromNdjson, decodeArrow, type Row } from '@lenke/native';
+import {
+  decodeArrow,
+  graphFromNdjson,
+  type Row,
+} from '@lenke/native';
 import { createNodeBackend } from '@lenke/node/backend';
 
 const here = (f: string) => new URL(f, import.meta.url).pathname;

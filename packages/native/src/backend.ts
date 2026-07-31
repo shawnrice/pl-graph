@@ -94,11 +94,16 @@ export type Backend = {
   createIndex: (handle: GraphHandle, on: IndexTarget, kind: IndexKind, keys: string[]) => void;
 
   /**
-   * Set the GQL operator-chain ceiling for this graph (the `maxOperatorChain`
-   * option); the parser rejects a longer `a AND b AND …` / `x + y + …` chain with
-   * `E_SYNTAX`. Anti-resource-abuse only — the n-ary AST never overflows the stack.
+   * Apply one graph setting, keyed by its stable id (see `CONFIG_IDS`). Returns
+   * false for an unrecognized id (an older artifact) or a zero value, letting the
+   * caller report an unsupported setting instead of silently running with the
+   * default.
+   *
+   * Deliberately ONE id-keyed method rather than one per knob — that is how this
+   * interface grew a `setMaxOperatorChain` (now `limits.operatorChain`) and an FFI
+   * export to match. A new setting is now additive: a new id, no ABI change.
    */
-  setMaxOperatorChain: (handle: GraphHandle, n: number) => void;
+  setConfig: (handle: GraphHandle, id: number, value: number) => boolean;
   /**
    * Declare a UNIQUE constraint on `(label, key)`. Throws `ConstraintViolation`
    * if the current data already violates it. See docs/design/gql-extensions.md §3.

@@ -377,10 +377,10 @@ suite('@lenke/native FFI backend', () => {
     const backend = createFfiBackend(LIB);
     const g = graphFromNdjson(backend, bytes);
 
-    for (const fmt of ['pg-json', 'pg-text', 'graphson', 'csv', 'ndjson']) {
+    for (const fmt of ['pg-json', 'pg-text', 'graphson', 'csv', 'ndjson'] as const) {
       const doc = g.serialize(fmt);
       expect(doc.length).toBeGreaterThan(0);
-      const g2 = graphFromFormat(backend, doc, fmt);
+      const g2 = graphFromFormat(backend, doc, { format: fmt });
       expect(g2.vertexCount).toBe(2);
       expect(g2.edgeCount).toBe(1);
       // the GQL query gives the same answer regardless of the carrier format
@@ -432,5 +432,56 @@ suite('@lenke/native FFI backend', () => {
     // the parse offset carried over from the crate's structured report
     expect((caught as { details?: { pos?: number } }).details?.pos).toBeTypeOf('number');
     g.free();
+  });
+});
+
+suite('graph settings are constructor-only', () => {
+  const NDJSON = '{"type":"node","id":"1","labels":["T"],"properties":{"n":3}}';
+  const backend = createFfiBackend(LIB);
+
+  test('a raised range ceiling lets a bigger range through', () => {
+    using dflt = graphFromNdjson(backend, NDJSON);
+    using raised = graphFromNdjson(backend, NDJSON, {
+      limits: { range: 5_000_000 },
+    });
+
+    expect(() => dflt.query('RETURN size(range(0, 1000000)) AS x')).toThrow();
+    expect(raised.query('RETURN size(range(0, 1000000)) AS x')).toEqual([{ x: 1_000_001 }]);
+  });
+
+  test('a lowered ceiling clamps harder; queries under it are unchanged', () => {
+    using g = graphFromNdjson(backend, NDJSON, { limits: { range: 10 } });
+
+    expect(() => g.query('RETURN size(range(0, 20)) AS x')).toThrow();
+    expect(g.query('RETURN size(range(0, 5)) AS x')).toEqual([{ x: 6 }]);
+  });
+
+  test('the operator-chain ceiling is the same setting under two names', () => {
+    const chain = `RETURN ${Array.from({ length: 30 }, (_, i) => i).join(' + ')} AS x`;
+
+    using viaLimits = graphFromNdjson(backend, NDJSON, {
+      limits: { operatorChain: 5 },
+    });
+    using viaShorthand = graphFromNdjson(backend, NDJSON, { maxOperatorChain: 5 });
+
+    expect(() => viaLimits.query(chain)).toThrow();
+    expect(() => viaShorthand.query(chain)).toThrow();
+  });
+
+  test('a non-positive or non-integer ceiling is rejected at construction', () => {
+    for (const bad of [0, -1, 1.5, Number.NaN]) {
+      expect(() => graphFromNdjson(backend, NDJSON, { limits: { range: bad } })).toThrow();
+    }
+  });
+
+  test('there is no runtime mutator on the graph', () => {
+    // Settings are host policy fixed at construction; the id-keyed backend setter
+    // stays internal rather than being re-exposed as a public method.
+    using g = graphFromNdjson(backend, NDJSON);
+
+    expect('configure' in g).toBe(false);
+    expect('setLimits' in g).toBe(false);
+    // The clock is the documented exception — a host dependency, not a bound.
+    expect(typeof g.setClock).toBe('function');
   });
 });

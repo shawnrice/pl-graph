@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { ErrorCode, hasErrorCode, isLenkeError } from '@lenke/errors';
-import { graphFromNdjson, createStore } from '@lenke/native';
+import { createStore, graphFromNdjson } from '@lenke/native';
 
 import { createNodeBackend } from './backend.js';
 import { Graph, abiVersion } from './index.js';
@@ -37,8 +37,8 @@ const NDJSON = Buffer.from(
 const dec = new TextDecoder();
 const json = (buf) => JSON.parse(dec.decode(buf));
 
-test('abiVersion matches the C ABI (17)', () => {
-  assert.equal(abiVersion(), 17);
+test('abiVersion matches the C ABI (18)', () => {
+  assert.equal(abiVersion(), 18);
 });
 
 test('fromNdjson decodes counts', () => {
@@ -156,7 +156,7 @@ test('createNodeBackend errors are coded LenkeErrors (parity with ffi/wasm)', ()
 
 test('createNodeBackend powers the @lenke/native facade + liveQuery', () => {
   const backend = createNodeBackend();
-  assert.equal(backend.abiVersion, 17);
+  assert.equal(backend.abiVersion, 18);
 
   const g = graphFromNdjson(backend, NDJSON);
   const store = createStore(g);

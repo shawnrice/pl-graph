@@ -16,7 +16,9 @@
  * @example bun / server
  * ```ts
  * import { createFfiBackend } from '@lenke/native/ffi';
- * import { graphFromNdjson } from '@lenke/native';
+ * import {
+  graphFromNdjson,
+} from '@lenke/native';
  * const backend = createFfiBackend('/path/to/liblenke_core.dylib');
  * const g = graphFromNdjson(backend, await Bun.file('graph.ndjson').bytes());
  * g.query`MATCH (a:Person) RETURN a.name`;

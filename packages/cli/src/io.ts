@@ -48,7 +48,9 @@ export const emptyGraph = (backend: Backend): RustGraph =>
   graphFromNdjson(backend, new Uint8Array());
 
 export const loadGraph = (backend: Backend, bytes: Uint8Array, format: Format): RustGraph =>
-  format === 'ndjson' ? graphFromNdjson(backend, bytes) : graphFromFormat(backend, bytes, format);
+  format === 'ndjson'
+    ? graphFromNdjson(backend, bytes)
+    : graphFromFormat(backend, bytes, { format });
 
 export const saveGraph = (graph: RustGraph, format: Format): Uint8Array =>
   format === 'ndjson' ? graph.toNdjson() : new TextEncoder().encode(graph.serialize(format));

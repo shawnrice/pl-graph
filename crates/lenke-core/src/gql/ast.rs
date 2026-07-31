@@ -85,6 +85,15 @@ pub enum Clause {
     /// rows from the working table where the condition is not TRUE (three-valued,
     /// exactly like a `WHERE`). The `WHERE` keyword is optional.
     Filter(Expr),
+    /// `ORDER BY … [OFFSET n] [LIMIT n]` as a STATEMENT of its own — the ISO
+    /// `<order by and page statement>` in its `primitiveQueryStatement` position,
+    /// i.e. a pipeline step that may precede the RETURN rather than trail it.
+    ///
+    /// This is a different thing from the paging carried ON a projection: here the
+    /// sort and the slice apply to the working BINDING table, so a later RETURN
+    /// only ever sees (and only ever projects) the surviving rows. At least one of
+    /// the three parts is present — a bare statement with none is not a statement.
+    Page(PageClause),
     /// `LET x = e, y = e, …` — ISO GQL §14.7 `<let statement>`. Binds new value
     /// variables into the current scope (additive: existing bindings are kept).
     /// Bindings are evaluated left-to-right, so a later item may reference an
@@ -206,6 +215,17 @@ pub struct ForClause {
     pub alias: String,
     pub list: Expr,
     pub ordinal: Option<ForOrdinal>,
+}
+
+/// The ISO `<order by and page statement>` payload: sort keys and/or a slice
+/// applied to the working binding table. Reuses the same `SortItem`/`CountBound`
+/// types as a projection's trailing paging, so the two forms sort and slice
+/// identically — only the stage differs.
+#[derive(Debug, Clone)]
+pub struct PageClause {
+    pub order_by: Vec<SortItem>,
+    pub skip: Option<CountBound>,
+    pub limit: Option<CountBound>,
 }
 
 /// The optional `WITH ORDINALITY <var>` (1-based index) or `WITH OFFSET <var>`

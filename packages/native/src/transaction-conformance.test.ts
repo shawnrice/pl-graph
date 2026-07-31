@@ -13,7 +13,7 @@ import { query as tsQuery } from '@lenke/gql';
 import { deserialize as tsDeserialize } from '@lenke/serialization';
 
 import { createFfiBackend } from './backend-ffi.js';
-import { graphFromFormat, type RustGraph } from './graph.js';
+import { graphFromNdjson, type RustGraph } from './graph.js';
 
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
@@ -58,7 +58,7 @@ const tsEngine = (): Engine & { _g: Graph } => {
 
 const nativeEngine = (): Engine & { _g: RustGraph } => {
   const backend = createFfiBackend(LIB);
-  const g = graphFromFormat(backend, SEED, 'ndjson');
+  const g = graphFromNdjson(backend, SEED);
 
   return { query: (sql) => g.query(sql), transaction: (fn) => g.transaction(fn), _g: g };
 };

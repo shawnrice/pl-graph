@@ -8,7 +8,10 @@
 import { readFileSync } from 'node:fs';
 
 import { Graph } from '@lenke/core';
-import { createEmptyGraph, graphFromNdjson } from '@lenke/native';
+import {
+  createEmptyGraph,
+  graphFromNdjson,
+} from '@lenke/native';
 import { createFfiBackend } from '@lenke/native/ffi';
 import { serialize, deserialize, graphContentEqual } from '@lenke/serialization';
 

@@ -1,11 +1,23 @@
-export { Edge, Graph, isElement, Path, PropertyIndex, Vertex } from './core/index.js';
+export {
+  CONFIG_IDS,
+  DEFAULT_CONFIG,
+  Edge,
+  Graph,
+  isElement,
+  Path,
+  PropertyIndex,
+  Vertex,
+} from './core/index.js';
 export { isRecord, LenkeRecord } from './core/index.js';
 export { validateLabel, validatePropertyKey, validatePropertyValue } from './core/index.js';
 
 export type {
   CardinalityConstraint,
   Element,
+  GraphConfig,
+  GraphConfigPatch,
   GraphElement,
+  GraphLimits,
   GraphOptions,
   IndexableValue,
   IndexKind,

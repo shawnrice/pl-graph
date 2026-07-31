@@ -32,7 +32,7 @@ export const MODERN_NDJSON = [
 ].join('\n');
 
 export const backend = createFfiBackend(LIB);
-export const nativeGraph = graphFromFormat(backend, MODERN_NDJSON, 'ndjson');
+export const nativeGraph = graphFromNdjson(backend, MODERN_NDJSON);
 export const tsGraph = tsDeserialize(MODERN_NDJSON, 'ndjson', new Graph());
 
 export { Graph, parseDate, parseDateTime, tsQuery, tsDeserialize, LenkeError, hasErrorCode };

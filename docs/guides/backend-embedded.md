@@ -31,7 +31,7 @@ store[Symbol.dispose]?.(); // or `using store = createStore(...)`
 
 For ingest, prefer a bulk path over looping single GQL/Gremlin writes:
 
-- **Build a fresh graph** from a serialized format — `graphFromNdjson(backend, bytes)` (or `graphFromFormat` for CSV/GraphSON/pg-json/pg-text). This is the fastest cold load.
+- **Build a fresh graph** from a serialized format — `graphFromNdjson(backend, ndjson)` (or `graphFromFormat(backend, input, { format })` for CSV/GraphSON/pg-json/pg-text). This is the fastest cold load.
 - **Bulk-append into a LIVE graph** — `graph.mergeNdjson(bytes)` is a `COPY FROM`: it appends a batch to an existing graph in one native call (no per-record round-trip), keeps indexes current, and returns a `MergeReport` (`{ nodesAdded, edgesAdded, nodesSkipped, edgesSkipped, phantomVertices }`) so you can see what wasn't applied cleanly (duplicate ids, undeclared edge endpoints).
 
 An NDJSON document is one JSON object per line, tagged `node` or `edge`:
@@ -52,7 +52,7 @@ The native graph mirrors the pure-TS engine's opt-in property indexes and prepar
 
 ## Loading and rebuilding from a source of truth
 
-The Rust engine decodes serialized bytes directly (`graphFromNdjson`, or `graphFromFormat(backend, input, 'pg-json' | 'pg-text' | 'graphson' | 'csv' | 'ndjson')`). To rebuild the cache from your system of record, stream its rows out as NDJSON and decode:
+The Rust engine decodes serialized bytes directly (`graphFromNdjson`, or `graphFromFormat(backend, input, { format: 'pg-json' | 'pg-text' | 'graphson' | 'csv' | 'ndjson' })`). To rebuild the cache from your system of record, stream its rows out as NDJSON and decode:
 
 ```ts
 const g = graphFromNdjson(backend, await pullSnapshotFromDb()); // Uint8Array of NDJSON

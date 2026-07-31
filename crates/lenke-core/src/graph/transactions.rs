@@ -80,16 +80,50 @@ impl Graph {
         self.tx_read_only = read_only;
     }
 
-    /// The configured operator-chain ceiling (see [`Graph::max_operator_chain`]).
-    #[inline]
+    /// The configured operator-chain ceiling. Reads through the config space; kept
+    /// as a named getter because the parse sites ask for exactly this one value.
+    #[must_use]
     pub fn max_operator_chain(&self) -> usize {
-        self.max_operator_chain
+        self.config.limits.operator_chain as usize
     }
 
-    /// Set the operator-chain ceiling (the native `maxOperatorChain` graph option).
-    #[inline]
+    /// Set the operator-chain ceiling. A thin alias for the config setter, kept so
+    /// the construction-time `maxOperatorChain` option and the napi binding have a
+    /// named entry point.
     pub fn set_max_operator_chain(&mut self, n: usize) {
-        self.max_operator_chain = n;
+        self.set_config(crate::graph::ConfigId::LimitsOperatorChain, n as u64);
+    }
+
+    /// This graph's settings (see [`crate::graph::GraphConfig`]).
+    #[must_use]
+    pub fn config(&self) -> &crate::graph::GraphConfig {
+        &self.config
+    }
+
+    /// This graph's resource ceilings — shorthand for `config().limits`, which is
+    /// what every guard site reads.
+    #[must_use]
+    pub fn limits(&self) -> &crate::graph::GraphLimits {
+        &self.config.limits
+    }
+
+    /// Set one setting by its stable id. Returns false for an unrecognized id, so
+    /// a host talking to an older artifact can report the unknown setting instead
+    /// of silently running with the default. A zero value is rejected the same way
+    /// — every setting here is a ceiling, and a ceiling of zero would fail every
+    /// query, which is never the intent.
+    pub fn set_config(&mut self, id: crate::graph::ConfigId, value: u64) -> bool {
+        use crate::graph::ConfigId;
+        if value == 0 {
+            return false;
+        }
+        match id {
+            ConfigId::LimitsRange => self.config.limits.range = value,
+            ConfigId::LimitsTrail => self.config.limits.trail = value,
+            ConfigId::LimitsIntermediate => self.config.limits.intermediate = value,
+            ConfigId::LimitsOperatorChain => self.config.limits.operator_chain = value,
+        }
+        true
     }
 
     /// Open a transaction frame. Nesting increments depth; the outermost frame

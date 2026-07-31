@@ -3,7 +3,9 @@
  * confirm it round-trips into a fresh graph with the same counts.
  * Run:  bun restore-check.ts
  */
-import { graphFromNdjson } from '@lenke/native';
+import {
+  graphFromNdjson,
+} from '@lenke/native';
 import { createFfiBackend } from '@lenke/native/ffi';
 
 const LIB = '/home/shawn/projects/pl-graph/crates/lenke-core/target/release/liblenke_core.so';

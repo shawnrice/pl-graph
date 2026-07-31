@@ -56,7 +56,7 @@ const countingBackend = (): { backend: Backend; freed: GraphHandle[] } => {
     encodeNdjson: () => new Uint8Array(),
     serialize: () => new Uint8Array(),
     deserialize: () => 1,
-    setMaxOperatorChain: () => {},
+    setConfig: () => true,
     lastWriteScope: () => [],
   };
 

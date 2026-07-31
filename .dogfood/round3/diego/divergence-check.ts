@@ -1,6 +1,9 @@
 import { readFile } from 'node:fs/promises';
 
-import { graphFromNdjson, decodeArrow } from '@lenke/native';
+import {
+  decodeArrow,
+  graphFromNdjson,
+} from '@lenke/native';
 import { createNodeBackend } from '@lenke/node/backend';
 const bytes = await readFile(new URL('./org-graph.ndjson', import.meta.url).pathname);
 using g = graphFromNdjson(createNodeBackend(), bytes);

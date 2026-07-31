@@ -18,7 +18,7 @@ import {
 import { deserialize as tsDeserialize } from '@lenke/serialization';
 
 import { createFfiBackend } from './backend-ffi.js';
-import { graphFromFormat } from './graph.js';
+import { graphFromNdjson } from './graph.js';
 
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB_EXT = LIB_EXTENSIONS[process.platform] ?? 'so';
@@ -72,7 +72,7 @@ suite('unique-constraint differential (TS vs native)', () => {
     tsGraph.createUniqueConstraint('Acct', 'email');
 
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, SEED);
     nativeGraph.createUniqueConstraint('Acct', 'email');
 
     for (const { label, sql } of SCRIPT) {
@@ -98,7 +98,7 @@ suite('unique-constraint differential (TS vs native)', () => {
 
     const tsGraph = tsDeserialize(dup, 'ndjson', new Graph());
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, dup, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, dup);
 
     const ts = outcome(() => tsGraph.createUniqueConstraint('Acct', 'email'));
     const native = outcome(() => nativeGraph.createUniqueConstraint('Acct', 'email'));
@@ -111,7 +111,7 @@ suite('unique-constraint differential (TS vs native)', () => {
   // refuse it identically; a plain index still drops, and enforcement survives.
   test('dropping a unique-constraint-backing index is refused, identically', () => {
     const tsGraph = tsDeserialize(SEED, 'ndjson', new Graph());
-    const nativeGraph = graphFromFormat(createFfiBackend(LIB), SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(createFfiBackend(LIB), SEED);
     const engines: Array<{
       g: {
         createUniqueConstraint: (l: string, k: string) => void;
@@ -173,7 +173,7 @@ suite('unique-constraint differential (TS vs native)', () => {
     const tsGraph = tsDeserialize(SEED, 'ndjson', new Graph());
     tsGraph.createUniqueConstraint('Acct', 'email');
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, SEED);
     nativeGraph.createUniqueConstraint('Acct', 'email');
 
     for (const sql of script) {
@@ -190,7 +190,7 @@ suite('unique-constraint differential (TS vs native)', () => {
   test('_MERGE edge form outcomes and final state agree across engines', () => {
     const tsGraph = tsDeserialize(SEED, 'ndjson', new Graph());
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, SEED);
 
     for (const g of [tsGraph, nativeGraph]) {
       g.createUniqueConstraint('User', 'id');
@@ -251,7 +251,7 @@ suite('required-constraint differential (TS vs native)', () => {
     tsGraph.createRequiredConstraint('Acct', 'email');
 
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, SEED);
     nativeGraph.createRequiredConstraint('Acct', 'email');
 
     for (const { label, sql } of SCRIPT) {
@@ -273,7 +273,7 @@ suite('required-constraint differential (TS vs native)', () => {
 
     const tsGraph = tsDeserialize(missing, 'ndjson', new Graph());
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, missing, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, missing);
 
     const ts = outcome(() => tsGraph.createRequiredConstraint('Acct', 'email'));
     const native = outcome(() => nativeGraph.createRequiredConstraint('Acct', 'email'));
@@ -311,7 +311,7 @@ suite('type-constraint differential (TS vs native)', () => {
     tsGraph.createTypeConstraint('Acct', 'age', 'number');
 
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, SEED);
     nativeGraph.createTypeConstraint('Acct', 'age', 'number');
 
     for (const { label, sql } of SCRIPT) {
@@ -333,7 +333,7 @@ suite('type-constraint differential (TS vs native)', () => {
 
     const tsGraph = tsDeserialize(wrong, 'ndjson', new Graph());
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, wrong, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, wrong);
 
     const ts = outcome(() => tsGraph.createTypeConstraint('Acct', 'age', 'number'));
     const native = outcome(() => nativeGraph.createTypeConstraint('Acct', 'age', 'number'));
@@ -345,7 +345,7 @@ suite('type-constraint differential (TS vs native)', () => {
   test('unknown scalar type name is rejected (InvalidValue) across engines', () => {
     const tsGraph = tsDeserialize(SEED, 'ndjson', new Graph());
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, SEED);
 
     const ts = outcome(() => tsGraph.createTypeConstraint('Acct', 'age', 'int' as never));
     const native = outcome(() => nativeGraph.createTypeConstraint('Acct', 'age', 'int' as never));
@@ -397,7 +397,7 @@ suite('edge unique-constraint differential (TS vs native)', () => {
     tsGraph.createEdgeUniqueConstraint('FOLLOWS', 'tag');
 
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, SEED);
     nativeGraph.createEdgeUniqueConstraint('FOLLOWS', 'tag');
 
     for (const { label, sql } of SCRIPT) {
@@ -416,7 +416,7 @@ suite('edge unique-constraint differential (TS vs native)', () => {
     const tsGraph = tsDeserialize(SEED, 'ndjson', new Graph());
     tsQuery(tsGraph, build);
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, SEED);
     nativeGraph.query(build);
 
     const ts = outcome(() => tsGraph.createEdgeUniqueConstraint('FOLLOWS', 'tag'));
@@ -464,7 +464,7 @@ suite('edge required-constraint differential (TS vs native)', () => {
     tsGraph.createEdgeRequiredConstraint('FOLLOWS', 'since');
 
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, SEED);
     nativeGraph.createEdgeRequiredConstraint('FOLLOWS', 'since');
 
     for (const { label, sql } of SCRIPT) {
@@ -508,7 +508,7 @@ suite('edge type-constraint differential (TS vs native)', () => {
     tsGraph.createEdgeTypeConstraint('FOLLOWS', 'since', 'number');
 
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, SEED);
     nativeGraph.createEdgeTypeConstraint('FOLLOWS', 'since', 'number');
 
     for (const { label, sql } of SCRIPT) {
@@ -525,7 +525,7 @@ suite('edge type-constraint differential (TS vs native)', () => {
   test('unknown scalar type name is rejected (InvalidValue) across engines', () => {
     const tsGraph = tsDeserialize(SEED, 'ndjson', new Graph());
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, SEED);
 
     const ts = outcome(() => tsGraph.createEdgeTypeConstraint('FOLLOWS', 'since', 'int' as never));
     const native = outcome(() =>
@@ -571,7 +571,7 @@ suite('cardinality-constraint differential (TS vs native)', () => {
     tsGraph.createCardinalityConstraint('Purchase', 'PLACED_BY', 'out', 1, 1);
 
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, SEED);
     nativeGraph.createCardinalityConstraint('Purchase', 'PLACED_BY', 'out', 1, 1);
 
     for (const { label, sql } of SCRIPT) {
@@ -596,7 +596,7 @@ suite('cardinality-constraint differential (TS vs native)', () => {
     const tsGraph = tsDeserialize(SEED, 'ndjson', new Graph());
     tsQuery(tsGraph, build);
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, SEED);
     nativeGraph.query(build);
 
     const ts = outcome(() =>
@@ -644,7 +644,7 @@ suite('validator differential (TS vs native)', () => {
     tsCreateValidator(tsGraph, 'Acct', 'u', 'u.age >= 0 AND u.age < 150');
 
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, SEED);
     nativeGraph.createValidator('Acct', 'u', 'u.age >= 0 AND u.age < 150');
 
     for (const { label, sql } of SCRIPT) {
@@ -667,7 +667,7 @@ suite('validator differential (TS vs native)', () => {
     const tsGraph = tsDeserialize(seed, 'ndjson', new Graph());
     tsCreateValidator(tsGraph, 'KNOWS', 'r', 'r.weight >= 0');
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, seed, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, seed);
     nativeGraph.createValidator('KNOWS', 'r', 'r.weight >= 0');
 
     const script = [
@@ -695,7 +695,7 @@ suite('validator differential (TS vs native)', () => {
 
     const tsGraph = tsDeserialize(dup, 'ndjson', new Graph());
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, dup, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, dup);
 
     const ts = outcome(() => tsCreateValidator(tsGraph, 'Acct', 'u', 'u.age >= 0'));
     const native = outcome(() => nativeGraph.createValidator('Acct', 'u', 'u.age >= 0'));
@@ -707,7 +707,7 @@ suite('validator differential (TS vs native)', () => {
   test('an unparseable predicate is E_SYNTAX on both engines', () => {
     const tsGraph = tsDeserialize(SEED, 'ndjson', new Graph());
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, SEED);
 
     const ts = outcome(() => tsCreateValidator(tsGraph, 'Acct', 'u', 'u.age >>>'));
     const native = outcome(() => nativeGraph.createValidator('Acct', 'u', 'u.age >>>'));
@@ -719,7 +719,7 @@ suite('validator differential (TS vs native)', () => {
   test('a predicate referencing the wrong variable is E_SYNTAX on both engines', () => {
     const tsGraph = tsDeserialize(SEED, 'ndjson', new Graph());
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, SEED);
 
     // Predicate binds `u`, but references `x` — unbound → the validator would
     // silently never fire. Both engines reject it at declare time (E_SYNTAX).
@@ -762,7 +762,7 @@ suite('graph-level invariant differential (TS vs native)', () => {
     const tsGraph = tsDeserialize(LEDGER, 'ndjson', new Graph());
     tsCreateInvariant(tsGraph, 'balanced', INV);
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, LEDGER, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, LEDGER);
     nativeGraph.createInvariant('balanced', INV);
 
     // A balance-preserving transfer (sum stays 0) commits on both engines.
@@ -808,7 +808,7 @@ suite('graph-level invariant differential (TS vs native)', () => {
 
     const tsGraph = tsDeserialize(skewed, 'ndjson', new Graph());
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, skewed, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, skewed);
 
     const ts = outcome(() => tsCreateInvariant(tsGraph, 'balanced', INV));
     const native = outcome(() => nativeGraph.createInvariant('balanced', INV));
@@ -820,7 +820,7 @@ suite('graph-level invariant differential (TS vs native)', () => {
   test('an unparseable invariant query is E_SYNTAX on both engines', () => {
     const tsGraph = tsDeserialize(LEDGER, 'ndjson', new Graph());
     const backend = createFfiBackend(LIB);
-    const nativeGraph = graphFromFormat(backend, LEDGER, 'ndjson');
+    const nativeGraph = graphFromNdjson(backend, LEDGER);
 
     const ts = outcome(() => tsCreateInvariant(tsGraph, 'bad', `MATCH (a:Acct) RETURN >>>`));
     const native = outcome(() => nativeGraph.createInvariant('bad', `MATCH (a:Acct) RETURN >>>`));
@@ -843,7 +843,7 @@ suite('temporal-in-aggregate differential (TS vs native)', () => {
   for (const agg of ['sum', 'avg']) {
     test(`${agg}() over a mixed numeric+temporal column throws on both engines`, () => {
       const tsGraph = tsDeserialize(MIXED, 'ndjson', new Graph());
-      const nativeGraph = graphFromFormat(createFfiBackend(LIB), MIXED, 'ndjson');
+      const nativeGraph = graphFromNdjson(createFfiBackend(LIB), MIXED);
       const q = `MATCH (n:P) RETURN ${agg}(n.k) AS v`;
 
       const ts = outcome(() => tsQuery(tsGraph, q));
@@ -863,7 +863,7 @@ suite('temporal-in-aggregate differential (TS vs native)', () => {
 suite('list-in-aggregate differential (TS vs native)', () => {
   const seed = (rows: readonly string[]) => {
     const tsGraph = tsDeserialize(SEED, 'ndjson', new Graph());
-    const nativeGraph = graphFromFormat(createFfiBackend(LIB), SEED, 'ndjson');
+    const nativeGraph = graphFromNdjson(createFfiBackend(LIB), SEED);
 
     for (const s of rows) {
       tsQuery(tsGraph, s);

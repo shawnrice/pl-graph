@@ -238,19 +238,7 @@ const FAULT_ID_IMMUTABLE: u8 = 17;
 const FAULT_CMP_TEMPORAL: u8 = 18;
 const FAULT_DATE_PART: u8 = 19;
 const FAULT_CARDINALITY: u8 = 20;
-
-/// Per-expansion cap on trail-traversal steps; a guard against exponential blowup.
-const TRAIL_BUDGET: u64 = 1_000_000;
-
-/// Ceiling on the intermediate frontier a fixed-length multi-segment scan may
-/// materialize. A chain `(a)-[]->(b)-[]->(c)-[]->…` fans out the cross-product of
-/// partial matches segment by segment, and the trailing LIMIT only prunes the
-/// *last* segment — every earlier layer is built in full first. On a dense graph
-/// that reaches billions of rows and takes the host down with an OOM kill rather
-/// than the query erroring. This bounds it: past the ceiling the scan faults with
-/// `E_RESOURCE_EXHAUSTED` (see [`FAULT_INTERMEDIATE`]). Generous enough that a real
-/// analytical join clears it; only a runaway cross-product trips it.
-const INTERMEDIATE_BUDGET: usize = 50_000_000;
+const FAULT_RANGE_BUDGET: u8 = 21;
 
 impl Ctx<'_> {
     /// Re-resolve property-key and label ids against the current graph (keeping
@@ -331,6 +319,10 @@ impl Ctx<'_> {
             FAULT_BUDGET => Err(CodeError::new(
                 ErrorCode::ResourceExhausted,
                 "variable-length pattern exceeded the trail budget; add a tighter bound",
+            )),
+            FAULT_RANGE_BUDGET => Err(CodeError::new(
+                ErrorCode::ResourceExhausted,
+                "range() would materialize more than 1000000 elements; narrow the bounds                  or widen the step",
             )),
             FAULT_INTERMEDIATE => Err(CodeError::new(
                 ErrorCode::ResourceExhausted,
@@ -471,6 +463,16 @@ impl CProjection {
             Some(CCount::Lit(n)) => Some(*n),
             Some(CCount::Param(slot)) => Some(count_param_val(ctx.params.get(*slot))),
         }
+    }
+}
+
+/// Resolve a bare `CCount` (literal or `$param`) to a row count. `CProjection`'s
+/// `skip_val`/`limit_val` do the same for the paging carried ON a projection; this
+/// is the statement-position form (`CClause::Page`).
+fn count_of(c: Option<&CCount>, ctx: &Ctx) -> Option<usize> {
+    match c? {
+        CCount::Lit(n) => Some(*n),
+        CCount::Param(slot) => Some(count_param_val(ctx.params.get(*slot))),
     }
 }
 
@@ -980,6 +982,32 @@ fn in_list(v: &Val, list: &Val) -> Truth {
     }
 }
 
+/// The bit pattern a number groups / dedups by, canonicalized so that grouping
+/// agrees with equality.
+///
+/// Two values need collapsing. **NaN**: the engine's total order treats NaN ==
+/// NaN, but the RAW bits differ by sign and payload depending on which operation
+/// produced it — `ln(-1)` and `x / NaN` do not agree — which split one logical
+/// value into several groups. **Signed zero**: `-0.0 == 0.0` is true, and this
+/// engine normalizes the distinction absolutely everywhere else — `=`, `IN`,
+/// ORDER BY, `sign()`, the result JSON, `to_string`, and the property index all
+/// treat them as one value, and `1 / ±0` faults rather than yielding ±∞. Keeping
+/// them apart HERE alone produced two DISTINCT groups whose rendered values were
+/// both `0` — indistinguishable in the output, so readable only as a bug. The
+/// Gremlin engine's `dedup_key` already collapsed them; this brings GQL in line.
+fn group_num_bits(n: f64) -> u64 {
+    if n.is_nan() {
+        return f64::NAN.to_bits();
+    }
+    // Signed zero, BRANCHLESSLY: IEEE 754 gives `-0.0 + 0.0 == +0.0` under the
+    // default rounding mode, while `x + 0.0 == x` exactly for every other finite
+    // or infinite x. So one add does the normalization with no compare and no
+    // branch — the historical reason for keeping -0 apart here was the cost of
+    // that check, and this removes the cost rather than the correctness. (Rust
+    // does not assume fast-math, so the add is never optimized away.)
+    (n + 0.0).to_bits()
+}
+
 /// A canonical, hashable key for a value — grouping, DISTINCT, row keys.
 fn val_key(v: &Val, out: &mut String) {
     match v {
@@ -989,7 +1017,7 @@ fn val_key(v: &Val, out: &mut String) {
             out.push(if *b { '1' } else { '0' });
         }
         Val::Num(n) => {
-            let _ = write!(out, "n{:016x}", n.to_bits());
+            let _ = write!(out, "n{:016x}", group_num_bits(*n));
         }
         Val::Str(s) => {
             // Raw byte push (same bytes as `write!("s{s}")`, without the fmt
@@ -1056,7 +1084,7 @@ fn group_val_eq(a: &Val, b: &Val) -> bool {
     match (a, b) {
         (Val::Null, Val::Null) => true,
         (Val::Bool(x), Val::Bool(y)) => x == y,
-        (Val::Num(x), Val::Num(y)) => x.to_bits() == y.to_bits(),
+        (Val::Num(x), Val::Num(y)) => group_num_bits(*x) == group_num_bits(*y),
         (Val::Str(x), Val::Str(y)) => x == y,
         (Val::Node(x), Val::Node(y)) => x == y,
         (Val::Edge(x), Val::Edge(y)) => x == y,
@@ -1088,7 +1116,7 @@ fn value_key(v: &Value, out: &mut String) {
             out.push(if *b { '1' } else { '0' });
         }
         Value::Num(n) => {
-            let _ = write!(out, "n{:016x}", n.to_bits());
+            let _ = write!(out, "n{:016x}", group_num_bits(*n));
         }
         Value::Str(s) => {
             let _ = write!(out, "s{s}");
@@ -2262,7 +2290,17 @@ fn stddev_of(n: u64, sum: f64, sum_sq: f64, sample: bool) -> Val {
     };
     let nf = n as f64;
     let variance = (sum_sq - sum * sum / nf) / denom;
-    Val::Num(variance.max(0.0).sqrt())
+    // Clamp a negative variance to 0 WITHOUT swallowing NaN. `f64::max` returns
+    // the non-NaN operand — `f64::NAN.max(0.0)` is 0.0 — while the TS twin's
+    // `Math.max(0, NaN)` is NaN. A non-numeric value in the group (`stddev_pop`
+    // over a string column) makes the variance NaN, which has to stay NaN (→
+    // null, like `avg`) rather than render as a real 0.
+    let clamped = if variance.is_nan() {
+        f64::NAN
+    } else {
+        variance.max(0.0)
+    };
+    Val::Num(clamped.sqrt())
 }
 
 /// ISO ordered-set percentile over a group's numeric values. `cont` (=
@@ -2615,8 +2653,12 @@ fn unary_math(func: ScalarFn) -> Option<fn(f64) -> f64> {
         Sinh => f64::sinh,
         Cosh => f64::cosh,
         Tanh => f64::tanh,
-        Degrees => f64::to_degrees,
-        Radians => f64::to_radians,
+        // Same multiply-then-divide association as the scalar arm in
+        // `scalar_fns.rs` — `to_degrees`/`to_radians` pre-round the constant and
+        // land one ulp off. This vectorized table is a SECOND dispatch site, so a
+        // fix to one is only half a fix.
+        Degrees => |n| (n * 180.0) / std::f64::consts::PI,
+        Radians => |n| (n * std::f64::consts::PI) / 180.0,
         _ => return None,
     })
 }
@@ -3605,6 +3647,19 @@ fn project_to_rows(
     matches: &[&CClause],
     proj: &CProjection,
 ) -> RowSet {
+    // A zero LIMIT emits no rows, so the projection never runs. The rule the engine
+    // already follows for a non-zero LIMIT is "project exactly the rows you emit" —
+    // `RETURN 1/(n.n - 7) AS x LIMIT 1` returns the first row rather than faulting on
+    // the second, in BOTH engines. LIMIT 0 emits nothing, so it projects nothing;
+    // faulting here would make LIMIT 0 the one limit that evaluates discarded rows.
+    // (Not a SQL rule: ISO GQL's `<order by and page statement>` is a statement in
+    // its own right that may PRECEDE the RETURN, where paging trims the binding table
+    // before any projection — this is what that form yields. We implement only the
+    // trailing form. Postgres is not the reference and does not agree: it
+    // constant-folds `1/0` at plan time and raises even under LIMIT 0.)
+    if proj.limit_val(ctx) == Some(0) {
+        return RowSet::new(proj.out_names.clone());
+    }
     if use_vec() {
         // Plain projection: transpose straight from the typed `VVec`s to the
         // RowSet (no intermediate `Vec<Val>` columns / second conversion pass).

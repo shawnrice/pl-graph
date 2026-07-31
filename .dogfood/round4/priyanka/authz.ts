@@ -1,4 +1,7 @@
-import { graphFromNdjson, type RustGraph } from '@lenke/native';
+import {
+  graphFromNdjson,
+  type RustGraph,
+} from '@lenke/native';
 // Zanzibar-style ReBAC authorization service on lenke (native N-API backend).
 //
 //   check(user, permission, resource)  — resolves:

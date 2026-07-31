@@ -6,7 +6,11 @@
 // encode->encrypt->store->load->decrypt path here. gzip + subtle.crypto are
 // native in Bun.
 
-import { createEmptyGraph, createStore, graphFromNdjson } from '@lenke/native';
+import {
+  createEmptyGraph,
+  createStore,
+  graphFromNdjson,
+} from '@lenke/native';
 import { createFfiBackend } from '@lenke/native/ffi';
 import {
   createSyncEngine,

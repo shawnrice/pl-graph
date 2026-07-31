@@ -37,6 +37,86 @@ export type IndexTarget = 'vertex' | 'edge';
 export type IndexKind = 'hash' | 'interval';
 
 /**
+ * Resource ceilings (see {@link GraphConfig}). These are ANTI-RUNAWAY bounds, not
+ * semantics: a query under the ceiling behaves identically whatever the ceiling
+ * is, and tripping one is always a loud `E_RESOURCE_EXHAUSTED` (or `E_SYNTAX`, for
+ * the parse-time `operatorChain`), never a truncated result.
+ */
+export type GraphLimits = {
+  /**
+   * Max elements `range(start, end [, step])` may materialize. A GQL list is a
+   * materialized value in both engines, so this bounds the allocation before the
+   * first element is pushed.
+   */
+  range: number;
+  /** Max steps one variable-length pattern expansion may take. */
+  trail: number;
+  /**
+   * Max intermediate frontier rows a fixed-length multi-segment scan may
+   * materialize. NATIVE-ONLY — the pure-TS engine has no vectorized frontier and
+   * ignores this one.
+   */
+  intermediate: number;
+  /**
+   * Max GQL operator-chain length (`a AND b AND …`, `x + y + …`), applied by the
+   * PARSER, so an over-long chain is `E_SYNTAX`. A `prepare()` call may override
+   * it for that statement.
+   */
+  operatorChain: number;
+};
+
+/**
+ * Host-configurable settings for one graph — the single place engine knobs live.
+ *
+ * The point of a config space (rather than a `setX` per knob) is that adding a
+ * setting stays additive: no new method, and on the native side no new FFI export
+ * and no ABI bump. Sections keep it from becoming a flat pile as it grows.
+ *
+ * `clock` is host-resident by nature — it is a callback, not a value, so it never
+ * crosses the native boundary; the host resolves it once per query into `$__now`.
+ */
+export type GraphConfig = {
+  limits: GraphLimits;
+  clock: Clock | null;
+};
+
+/**
+ * What {@link Graph.configure} accepts: any subset of the settings. Written out
+ * rather than a generic deep-partial so each section says exactly what it takes.
+ */
+export type GraphConfigPatch = {
+  limits?: Partial<GraphLimits>;
+  clock?: Clock | null;
+};
+
+/**
+ * The default settings. Mirrors the Rust `GraphConfig::default()` — both engines
+ * must fault on the same inputs, so these are part of the cross-engine contract,
+ * not a per-engine tuning choice.
+ */
+export const DEFAULT_CONFIG: GraphConfig = {
+  limits: {
+    range: 1_000_000,
+    trail: 1_000_000,
+    intermediate: 50_000_000,
+    operatorChain: 10_000,
+  },
+  clock: null,
+};
+
+/**
+ * Wire ids for the settings that cross the native boundary, matching the Rust
+ * `ConfigId`. Append-only: a new setting takes the next id and needs no ABI bump.
+ * Host-only settings (`clock`) have no id — they never cross.
+ */
+export const CONFIG_IDS: Record<`limits.${keyof GraphLimits}`, number> = {
+  'limits.range': 0,
+  'limits.trail': 1,
+  'limits.intermediate': 2,
+  'limits.operatorChain': 3,
+};
+
+/**
  * The spec passed to {@link Graph.createIndex}: which element (`on`), the index
  * `kind`, and the property `keys` (`[k]` for a hash index, `[loKey, hiKey]` for
  * an interval index).
@@ -67,8 +147,26 @@ export type GraphOptions = {
    * 10_000, far beyond any hand- or machine-generated predicate; raise it only if
    * a legitimate generated query needs longer chains. Mirrors the native engine's
    * `createEmptyGraph(backend, { maxOperatorChain })`.
+   *
+   * Shorthand for `limits.operatorChain`; the two are the same setting.
    */
   maxOperatorChain?: number;
+
+  /**
+   * Resource ceilings for this graph (see {@link GraphLimits}). Set at
+   * construction and fixed for the graph's life — they are host policy, not
+   * something a query should be able to move, and pinning them removes any
+   * question about what a mid-transaction change would mean.
+   */
+  limits?: Partial<GraphLimits>;
+
+  /**
+   * The host {@link Clock} supplying `$__now` for the ISO now-functions. Unlike
+   * the limits this one is also settable later via {@link Graph.setClock}: it is
+   * a host dependency, not a resource bound, and clearing it with `null` is part
+   * of its contract (tests pin and unpin a clock on a live graph).
+   */
+  clock?: Clock | null;
 };
 
 /**
@@ -534,16 +632,6 @@ export class Graph {
   // one level up, at the statement boundary, before any mutation applies.
   private txReadOnly = false;
 
-  // The host wall-clock this graph's GQL now-functions (`current_date`,
-  // `current_timestamp`) read, wired via `setClock`. Null → those functions read
-  // null: the engine never invents a clock. The clock lives here, not in the
-  // engine, so the engine stays a pure function of (graph, params).
-  private queryClock: Clock | null = null;
-
-  // Anti-resource-abuse ceiling on operator-chain length (see GraphOptions).
-  // Read by `@lenke/gql`'s query entries and passed to the parser. Default 10k.
-  private maxChain = 10_000;
-
   /**
    * Wire (or clear, with `null`) the host {@link Clock} that supplies `$__now`
    * for the ISO now-functions. `@lenke/gql`'s `query`/`gql` call it once per
@@ -553,19 +641,70 @@ export class Graph {
    * chaining: `new Graph().setClock(() => LocalDateTime.fromJSDate(new Date()))`.
    */
   setClock(clock: Clock | null): this {
-    this.queryClock = clock;
-
-    return this;
+    return this.applyConfig({ clock });
   }
 
   /** The wired host {@link Clock}, or null. Read by the GQL query entries. */
   get clock(): Clock | null {
-    return this.queryClock;
+    return this.settings.clock;
   }
 
-  /** The operator-chain ceiling (see {@link GraphOptions.maxOperatorChain}). */
+  /** The operator-chain ceiling — `config.limits.operatorChain`, which the
+   *  construction-time {@link GraphOptions.maxOperatorChain} writes. */
   get maxOperatorChain(): number {
-    return this.maxChain;
+    return this.settings.limits.operatorChain;
+  }
+
+  // This graph's settings, wired via `configure`. Held on the host (not in the
+  // engine) for the same reason as everything else here: the engine stays a pure
+  // function of its inputs, and the host owns the policy.
+  private settings: GraphConfig = { ...DEFAULT_CONFIG, limits: { ...DEFAULT_CONFIG.limits } };
+
+  /**
+   * Apply a settings patch. PRIVATE: the limits are constructor-only (see
+   * {@link GraphOptions.limits}) — they are host policy, fixed for the graph's
+   * life — so the only public way in is construction, plus {@link Graph.setClock}
+   * for the one setting that is a host dependency rather than a resource bound.
+   *
+   * Every limit must be a positive integer; zero or negative would fail every
+   * query, which is never the intent.
+   */
+  private applyConfig(config: GraphConfigPatch): this {
+    for (const [name, value] of Object.entries(config.limits ?? {}) as [
+      keyof GraphLimits,
+      number | undefined,
+    ][]) {
+      if (value === undefined) {
+        continue;
+      }
+
+      if (!Number.isInteger(value) || value <= 0) {
+        throw new LenkeError(`limits.${name} must be a positive integer, got ${value}`, {
+          code: ErrorCode.InvalidValue,
+        });
+      }
+
+      this.settings = {
+        ...this.settings,
+        limits: { ...this.settings.limits, [name]: value },
+      };
+    }
+
+    if ('clock' in config) {
+      this.settings = { ...this.settings, clock: config.clock ?? null };
+    }
+
+    return this;
+  }
+
+  /** This graph's settings. The query engine reads its guards from here. */
+  get config(): GraphConfig {
+    return this.settings;
+  }
+
+  /** Shorthand for `config.limits` — what every guard site actually reads. */
+  get limits(): GraphLimits {
+    return this.settings.limits;
   }
 
   constructor(options: GraphOptions = {}) {
@@ -582,9 +721,17 @@ export class Graph {
     this.vertexPropertyIndex = new PropertyIndex();
     this.edgePropertyIndex = new PropertyIndex();
 
-    if (options.maxOperatorChain !== undefined) {
-      this.maxChain = options.maxOperatorChain;
-    }
+    // Settings are applied once, here: `maxOperatorChain` is the shorthand, so a
+    // `limits.operatorChain` alongside it wins.
+    this.applyConfig({
+      limits: {
+        ...(options.maxOperatorChain === undefined
+          ? {}
+          : { operatorChain: options.maxOperatorChain }),
+        ...options.limits,
+      },
+      ...('clock' in options ? { clock: options.clock ?? null } : {}),
+    });
 
     this.mutationVersion = 0;
     this.tokenEpochs = new Map();

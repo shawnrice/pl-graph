@@ -1,4 +1,6 @@
-import { graphFromNdjson } from '@lenke/native';
+import {
+  graphFromNdjson,
+} from '@lenke/native';
 // Bulk tuple ingest into a LIVE graph via mergeNdjson (COPY FROM), with indexes
 // staying current — the write path a Zanzibar service uses to apply a batch of
 // new relationship tuples without a full reload.

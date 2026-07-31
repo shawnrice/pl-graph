@@ -23,7 +23,7 @@ type WasmExports = {
   lnk_graph_edge_count: (h: number) => bigint;
   lnk_graph_version: (h: number) => bigint;
   lnk_graph_epoch: (h: number, name: number, nameLen: number) => bigint;
-  lnk_graph_set_max_operator_chain: (h: number, n: number) => void;
+  lnk_graph_set_config: (h: number, id: number, value: number) => number;
   lnk_create_index: (
     h: number,
     element: number,
@@ -428,9 +428,7 @@ export const createWasmBackend = async (source: WasmSource): Promise<Backend> =>
         }
       }
     },
-    setMaxOperatorChain: (handle, n) => {
-      ex.lnk_graph_set_max_operator_chain(handle, n);
-    },
+    setConfig: (handle, id, value) => ex.lnk_graph_set_config(handle, id, value) === 1,
     createUniqueConstraint: (handle, label, key) => {
       const l = encoder.encode(label);
       const lp = writeBytes(l);

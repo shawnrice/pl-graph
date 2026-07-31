@@ -248,11 +248,20 @@ impl Graph {
         self.inner.dump_schema()
     }
 
-    /// Set the GQL operator-chain ceiling (the native `maxOperatorChain` option);
-    /// the parser rejects a longer chain with `E_SYNTAX`. Defaults to 10_000.
+    /// Apply one graph setting by its stable id (see the core `ConfigId`).
+    /// Returns false for an unrecognized id or a zero value, so the caller can
+    /// report an unsupported setting rather than silently running with the
+    /// default. ONE id-keyed method rather than one per knob — the operator-chain
+    /// ceiling is now `ConfigId::LimitsOperatorChain`.
     #[napi]
-    pub fn set_max_operator_chain(&mut self, n: f64) {
-        self.inner.set_max_operator_chain(n as usize);
+    pub fn set_config(&mut self, id: u32, value: f64) -> bool {
+        let Some(id) = lenke_core::graph::ConfigId::from_u32(id) else {
+            return false;
+        };
+        if value < 1.0 {
+            return false;
+        }
+        self.inner.set_config(id, value as u64)
     }
 
     /// Run a GQL query; returns the `{columns, rows}` JSON document as bytes.

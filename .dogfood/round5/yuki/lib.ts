@@ -7,11 +7,11 @@
 import { existsSync } from 'node:fs';
 
 import {
+  createEmptyGraph,
   createStore,
   graphFromNdjson,
-  createEmptyGraph,
-  type Store,
   type RustGraph,
+  type Store,
 } from '@lenke/native';
 import { createFfiBackend } from '@lenke/native/ffi';
 import {
