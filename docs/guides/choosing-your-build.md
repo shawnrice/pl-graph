@@ -1,6 +1,6 @@
 # Choosing your build
 
-Three independent choices — **engine**, **query frontend**, **reach-path** — plus one cross-cutting concern, **memory**. This page is the matrix; the topology guides ([pure-ts](./pure-ts.md), [native](./native.md), [wasm](./wasm.md), and the frontend/backend guides) show each in context.
+Three independent choices — **engine**, **query frontend**, **reach-path** — plus two cross-cutting concerns, **memory** and **numeric results**. This page is the matrix; the topology guides ([pure-ts](./pure-ts.md), [native](./native.md), [wasm](./wasm.md), and the frontend/backend guides) show each in context.
 
 ## Axis 1 — the engine
 
@@ -42,6 +42,33 @@ The Rust core is one crate reachable three ways. All three present the **same JS
 | **Threads**  | rayon (parallel NDJSON decode)                                                   | rayon                                                                                            | none — wasm has no threads, so the parallel decoder falls back to serial                              |
 
 Guides: [native](./native.md) covers bun:ffi + N-API (server/CLI); [wasm](./wasm.md) covers WebAssembly (browser/universal).
+
+## Numeric results across builds
+
+**Arithmetic is exact everywhere.** `+ - * / %`, comparisons, `sqrt`, `round`/`floor`/`ceil`/`sign`, `degrees`/`radians`, the aggregations, and every [graph algorithm](./algorithms.md) give **bit-identical** answers on both engines and all three reach-paths. IEEE 754 pins those operations to one correctly-rounded result, and the algorithms additionally fix their summation order so floating-point non-associativity can't drift.
+
+The **transcendental** functions are the exception — `exp`, `ln`, `log`, `log10`, `power`, `sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`. IEEE 754 deliberately does _not_ mandate a correctly-rounded result for these, so implementations are free to differ in the last unit in the last place — and each build reaches a different implementation:
+
+| build                    | where the math comes from                                                                           |
+| ------------------------ | --------------------------------------------------------------------------------------------------- |
+| pure-TS — `@lenke/core`  | the JS runtime's `Math.*` (so it can also vary between V8, JSC and SpiderMonkey)                    |
+| native — bun:ffi / N-API | the **host operating system's** math library — glibc on Linux, Apple's on macOS, the CRT on Windows |
+| wasm                     | compiled into the module by Rust; `lenke_core.wasm` imports nothing from the host                   |
+
+Two consequences worth planning around:
+
+- **A native result depends on the machine that produced it.** The same query answered on a Linux server and on a macOS laptop can differ in the last ulp, and so can two Linux hosts on different glibc versions. This is a property of the platform, not something lenke chooses.
+- **wasm is the most reproducible reach-path.** Because the module carries its own implementations and imports nothing, it computes the same value on every machine that runs it — worth knowing if reproducibility across heterogeneous clients matters more to you than raw throughput.
+
+Measured on Linux/glibc over 396 (function, argument) pairs, every disagreement is ~1 ulp and confined to the functions listed above: pure-TS and native agree on 391 of them, and the two Rust builds on 368. Those counts describe _that_ platform pairing rather than a constant — a macOS host, with a different system libm, would produce a different table.
+
+A ~7% disagreement rate is unremarkable for two independent implementations. Nothing here is out of tolerance: a good libm targets under 1 ulp of error, and glibc's is nearer half that, so on the fraction of arguments where the two land on opposite sides of a rounding boundary they print different last digits. That is the expected behavior of implementations that are each individually correct, not a defect in either.
+
+This is a well-trodden problem, and the standard answer is to **name one reference implementation and use it everywhere**. Java is the clearest case: [`java.lang.Math`](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/StrictMath.html) is fast and platform-dependent, while `StrictMath` is specified to reproduce the published [fdlibm](https://www.netlib.org/fdlibm/readme) algorithms bit for bit on every platform — for very nearly the same function list as above — at some cost in speed. JS engines have converged the same way: ECMA-262 recommends (without requiring) fdlibm for `Math.sin`/`cos`/`tan`, and both V8 and SpiderMonkey adopted it, partly for reproducibility. The other end of the spectrum is consensus systems, which avoid floating point for these operations altogether.
+
+lenke has not made that move yet. If cross-machine reproducibility matters more to you than matching the host's libm, say so — routing the Rust engine through its own compiled-in math on native as well as wasm would make **every** Rust build agree on every operating system, at the cost of widening the pure-TS gap. Today's default instead keeps pure-TS and native closely aligned and accepts that native tracks the host.
+
+If a number has to match bit-for-bit across builds today, round it at the boundary (`round(x, 9)`) or compare it with a tolerance. Everything outside that function list — including all of the graph algorithms, the storage layer and every serialization codec — is safe to compare exactly.
 
 ## Memory model
 
