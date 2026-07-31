@@ -11,18 +11,30 @@
 //! nothing to resolve relative to the working directory (the tests also run under
 //! wasm, where there is no filesystem).
 //!
-//! Three graphs, because they are genuinely different — do not merge them:
-//!   - [`modern_gql`] keys nodes by NAME (`marko`) and labels them `Person`;
-//!   - [`modern_gremlin`] keys nodes by NUMBER (`1`) and labels them `PERSON`,
-//!     leaving edges id-less so they take the canonical `e{index}` form;
+//! All three are the TinkerPop "Modern" graph — same six vertices, same six edges,
+//! same weights and ids as the canonical TinkerPop definition (`v[1]`..`v[6]`,
+//! `e[7][1-knows->2]`..`e[12]`). The one deliberate departure is LABEL CASING,
+//! which follows each language's conventions rather than TinkerPop's lowercase,
+//! matching the TS fixtures these mirror.
+//!
+//! Three files, because the remaining differences are load-bearing — do not merge
+//! them:
+//!   - [`modern_gql`] labels nodes `Person` / `Software` and edges `KNOWS` /
+//!     `CREATED` (the GQL convention: PascalCase labels, SCREAMING_SNAKE types).
+//!     Mirrors `packages/gql/src/fixtures/createTestSocialGraph.ts` exactly,
+//!     element ids included, so a ported test asserts the same ids as its TS twin.
+//!   - [`modern_gremlin`] labels everything SCREAMING_SNAKE (`PERSON`, `KNOWS`),
+//!     mirroring `packages/core/src/fixtures/createTestTinkerGraph.ts`, and leaves
+//!     edges id-less so they take the canonical `e{index}` form.
 //!   - [`modern_gremlin_edge_ids`] is that graph with explicit edge ids `7..=12`,
 //!     which the step tests that assert TinkerGraph edge ids need.
 
 use crate::graph::Graph;
 use crate::ndjson;
 
-/// The TinkerPop "Modern" graph as the GQL suites use it: nodes keyed by name
-/// (`marko`, `vadas`, …), labelled `Person` / `Software`.
+/// The TinkerPop "Modern" graph as the GQL suites use it: canonical ids (`1`..`6`
+/// for nodes, `7`..`12` for edges), labelled `Person` / `Software` + `KNOWS` /
+/// `CREATED`. A byte-for-byte mirror of the TS `createTestSocialGraph`.
 pub(crate) fn modern_gql() -> Graph {
     decode(include_str!("fixtures/modern_gql.ndjson"))
 }

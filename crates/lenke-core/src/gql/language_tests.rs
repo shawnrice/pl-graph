@@ -1667,12 +1667,11 @@ fn m_skip_rejects_dynamic_param() {
 #[test]
 fn m_element_id_returns_identifier() {
     let mut g = modern();
-    // In our Rust modern() fixture, the id for marko is "marko" (not "1" like TS)
     let r = rows(
         &mut g,
         "MATCH (n:Person {name: 'marko'}) RETURN element_id(n) AS id",
     );
-    assert_eq!(r, vec![vec![s("marko")]]);
+    assert_eq!(r, vec![vec![s("1")]]); // the same value the TS test asserts
 }
 
 // ── "GQL: ISO reserved words" ────────────────────────────────────────────────

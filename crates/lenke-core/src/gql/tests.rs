@@ -1201,7 +1201,7 @@ fn element_id_and_identity() {
         &mut g,
         "MATCH (a:Person {name:'marko'}) RETURN element_id(a) AS id",
     );
-    assert_eq!(r, vec![vec![s("marko")]]);
+    assert_eq!(r, vec![vec![s("1")]]); // marko is node 1 (see `crate::fixtures`)
     let c = rows(
         &mut g,
         "MATCH (a:Person), (b:Person) WHERE a = b RETURN count(*) AS c",
@@ -1565,7 +1565,7 @@ fn return_star_columns_are_bound_vars() {
     // A returned node serializes to a rich `{id, labels, properties}` map
     // (byte-identical to the TS engine); keys/labels are sorted.
     let node = Value::Map(vec![
-        (Arc::from("id"), s("marko")),
+        (Arc::from("id"), s("1")), // marko is node 1 (see `crate::fixtures`)
         (Arc::from("labels"), Value::List(vec![s("Person")])),
         (
             Arc::from("properties"),
@@ -1727,7 +1727,7 @@ fn set_null_stores_a_present_null_and_remove_deletes_it() {
     let mut g = modern();
     rows(&mut g, "MATCH (n:Person {name:'marko'}) SET n.nick = null");
 
-    let marko = g.vid.get("marko").unwrap() as usize;
+    let marko = g.vid.get("1").unwrap() as usize; // marko is node 1
     assert!(
         g.props.is_present(marko, "nick"),
         "SET null stores a PRESENT null, not a removal"
@@ -6793,9 +6793,10 @@ fn path_accessor_functions() {
         },
         _ => panic!("not a node map"),
     };
+    // marko → josh → ripple, by element id (see `crate::fixtures`).
     assert_eq!(
         ns.iter().map(node_id).collect::<Vec<_>>(),
-        vec!["marko", "josh", "ripple"]
+        vec!["1", "4", "5"]
     );
 
     // edges(p): the two edges.
