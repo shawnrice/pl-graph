@@ -272,7 +272,7 @@ const padYear = (y: number): string =>
 
 const parseIntStrict = (s: string): number => {
   if (!/^-?\d+$/.test(s)) {
-    throw new Error(`invalid integer '${s}'`);
+    throw new LenkeError(`invalid integer '${s}'`, { code: ErrorCode.InvalidValue });
   }
 
   return Number(s);
@@ -285,7 +285,7 @@ const parseFrac = (frac: string | undefined): number => {
   }
 
   if (frac.length === 0 || frac.length > 9 || !/^\d+$/.test(frac)) {
-    throw new Error(`bad fractional seconds '.${frac}'`);
+    throw new LenkeError(`bad fractional seconds '.${frac}'`, { code: ErrorCode.InvalidValue });
   }
 
   return Number(frac.padEnd(9, '0'));
@@ -361,7 +361,9 @@ const splitOffset = (s: string): [string, number] => {
     }
   }
 
-  throw new Error(`missing/invalid time-zone offset in '${s}'`);
+  throw new LenkeError(`missing/invalid time-zone offset in '${s}'`, {
+    code: ErrorCode.InvalidValue,
+  });
 };
 
 /** Parse `HH:MM:SS[.fraction]` into [seconds-of-day, nanos]. */
@@ -372,13 +374,13 @@ const parseTime = (s: string): [number, number] => {
   const parts = hms.split(':');
 
   if (parts.length !== 3) {
-    throw new Error(`bad time '${s}'`);
+    throw new LenkeError(`bad time '${s}'`, { code: ErrorCode.InvalidValue });
   }
 
   const [h, m, sec] = parts.map(parseIntStrict);
 
   if (h < 0 || h >= 24 || m < 0 || m >= 60 || sec < 0 || sec >= 60) {
-    throw new Error(`time out of range '${s}'`);
+    throw new LenkeError(`time out of range '${s}'`, { code: ErrorCode.InvalidValue });
   }
 
   return [h * 3600 + m * 60 + sec, parseFrac(frac)];
@@ -390,13 +392,13 @@ export function parseDate(s: string): LocalDate {
   const parts = s.split('-');
 
   if (parts.length !== 3) {
-    throw new Error(`bad date '${s}'`);
+    throw new LenkeError(`bad date '${s}'`, { code: ErrorCode.InvalidValue });
   }
 
   const [y, m, d] = parts.map(parseIntStrict);
 
   if (m < 1 || m > 12 || d < 1 || d > 31) {
-    throw new Error(`date out of range '${s}'`);
+    throw new LenkeError(`date out of range '${s}'`, { code: ErrorCode.InvalidValue });
   }
 
   return new LocalDate(daysFromCivil(y, m, d));
@@ -462,7 +464,7 @@ export function parseDateTime(s: string): LocalDateTime {
   const sep = s.search(/[T ]/);
 
   if (sep === -1) {
-    throw new Error(`datetime missing time part '${s}'`);
+    throw new LenkeError(`datetime missing time part '${s}'`, { code: ErrorCode.InvalidValue });
   }
 
   const date = parseDate(s.slice(0, sep));
@@ -487,7 +489,7 @@ export function formatDateTime(dt: LocalDateTime): string {
 
 export function parseDuration(s: string): Duration {
   if (!s.startsWith('P')) {
-    throw new Error(`duration must start with 'P': '${s}'`);
+    throw new LenkeError(`duration must start with 'P': '${s}'`, { code: ErrorCode.InvalidValue });
   }
 
   const rest = s.slice(1);
@@ -499,7 +501,9 @@ export function parseDuration(s: string): Duration {
   let num = '';
   const takeNum = (designator: string): number => {
     if (num === '') {
-      throw new Error(`missing number before '${designator}' in '${s}'`);
+      throw new LenkeError(`missing number before '${designator}' in '${s}'`, {
+        code: ErrorCode.InvalidValue,
+      });
     }
 
     const v = parseIntStrict(num);
@@ -520,12 +524,14 @@ export function parseDuration(s: string): Duration {
     } else if (c === 'D') {
       days += takeNum('D');
     } else {
-      throw new Error(`bad duration date field '${c}' in '${s}'`);
+      throw new LenkeError(`bad duration date field '${c}' in '${s}'`, {
+        code: ErrorCode.InvalidValue,
+      });
     }
   }
 
   if (num !== '') {
-    throw new Error(`dangling number in duration '${s}'`);
+    throw new LenkeError(`dangling number in duration '${s}'`, { code: ErrorCode.InvalidValue });
   }
 
   let secs = 0;
@@ -545,19 +551,23 @@ export function parseDuration(s: string): Duration {
         const frac = dot === -1 ? undefined : num.slice(dot + 1);
 
         if (whole === '') {
-          throw new Error(`missing number before 'S' in '${s}'`);
+          throw new LenkeError(`missing number before 'S' in '${s}'`, {
+            code: ErrorCode.InvalidValue,
+          });
         }
 
         secs += parseIntStrict(whole);
         nanos = parseFrac(frac);
         num = '';
       } else {
-        throw new Error(`bad duration time field '${c}' in '${s}'`);
+        throw new LenkeError(`bad duration time field '${c}' in '${s}'`, {
+          code: ErrorCode.InvalidValue,
+        });
       }
     }
 
     if (num !== '') {
-      throw new Error(`dangling number in duration '${s}'`);
+      throw new LenkeError(`dangling number in duration '${s}'`, { code: ErrorCode.InvalidValue });
     }
   }
 
@@ -567,7 +577,9 @@ export function parseDuration(s: string): Duration {
   // and native rejects it too (Duration::representable) — so reject rather than
   // silently round, keeping the engines byte-identical.
   if (!durationRepresentable(d)) {
-    throw new Error(`duration component is not representable as float64: '${s}'`);
+    throw new LenkeError(`duration component is not representable as float64: '${s}'`, {
+      code: ErrorCode.InvalidValue,
+    });
   }
 
   return d;
@@ -659,7 +671,7 @@ export function temporalFormat(t: Temporal): string {
 /** Build from a kind tag + ISO string (the codec decode path); throws on error. */
 export function temporalParse(tag: string, s: string): Temporal {
   if (!Object.hasOwn(TEMPORAL_SPEC, tag)) {
-    throw new Error(`unknown temporal kind '${tag}'`);
+    throw new LenkeError(`unknown temporal kind '${tag}'`, { code: ErrorCode.InvalidValue });
   }
 
   return TEMPORAL_SPEC[tag as TemporalTag].parse(s);
@@ -717,8 +729,9 @@ const toTemporalGlobal = (
     .Temporal;
 
   if (T === undefined) {
-    throw new Error(
+    throw new LenkeError(
       'TC39 Temporal is not available in this runtime — use .toISOString() with your date library',
+      { code: ErrorCode.Unsupported },
     );
   }
 

@@ -15,6 +15,7 @@ import {
   TEMPORAL_TAG_KEYS,
   temporalArith,
   temporalCmpTotal,
+  temporalParse,
   temporalRelCmp,
 } from './temporal.js';
 
@@ -182,5 +183,65 @@ describe('temporal: JS interop', () => {
     expect(coerceTemporal(new Date())).toBeNull();
     expect(coerceTemporal('2020-01-01')).toBeNull(); // a bare string stays a string
     expect(coerceTemporal(42)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Every temporal parse failure carries an error CODE.
+//
+// These parsers sit behind `fromTaggedJson`, which the graph mutation boundary,
+// the GQL param binder, the Gremlin predicates and every codec decoder all call
+// on caller-supplied data. They used to throw bare `Error`s, so a hostile
+// `{"@date": "…"}` produced an UNCODED failure on each of those surfaces while
+// the Rust engine coded the same input — a boundary that maps coded errors to a
+// 4xx and everything else to a 5xx would answer attacker-controlled input with a
+// 500. Nothing executed and nothing was injectable; the discipline was the gap.
+// Found by extending the injection fuzz to structured (non-string) values.
+// ---------------------------------------------------------------------------
+
+describe('temporal parse failures are coded', () => {
+  const code = (fn: () => unknown): string | undefined => {
+    try {
+      fn();
+    } catch (e) {
+      return (e as { code?: string }).code;
+    }
+
+    return undefined;
+  };
+
+  test.each([
+    ['date', 'nope'],
+    ['date', "'); DROP //"],
+    ['date', '2020-13-01'],
+    ['date', ''],
+    ['datetime', 'nope'],
+    ['datetime', '2020-01-01'],
+    ['localtime', 'nope'],
+    ['localtime', '99:99:99'],
+    ['duration', 'nope'],
+    ['duration', 'P1X'],
+    ['duration', 'PT1'],
+    ['zoned_datetime', '2020-01-01T00:00:00'],
+    ['zoned_time', 'nope'],
+  ])('{"@%s": %j} throws E_INVALID_VALUE', (tag, bad) => {
+    expect(code(() => fromTaggedJson({ [`@${tag}`]: bad }))).toBe('E_INVALID_VALUE');
+  });
+
+  test('an unknown temporal kind is coded too', () => {
+    expect(code(() => temporalParse('bogus', '2020-01-01'))).toBe('E_INVALID_VALUE');
+  });
+
+  test('the direct parsers are coded as well', () => {
+    expect(code(() => parseDate('nope'))).toBe('E_INVALID_VALUE');
+    expect(code(() => parseDateTime('nope'))).toBe('E_INVALID_VALUE');
+    expect(code(() => parseDuration('nope'))).toBe('E_INVALID_VALUE');
+  });
+
+  test('a well-formed tagged temporal still parses, and a non-temporal is still null', () => {
+    expect(fromTaggedJson({ '@date': '2020-01-01' })).toBeInstanceOf(LocalDate);
+    expect(fromTaggedJson({ notATag: 'x' })).toBeNull();
+    expect(fromTaggedJson({ '@date': 5 })).toBeNull();
+    expect(fromTaggedJson(null)).toBeNull();
   });
 });
