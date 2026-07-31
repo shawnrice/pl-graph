@@ -168,11 +168,28 @@ const canon = (line: string): string => {
 const norm = (s: string): string =>
   s.trim().split('\n').filter(Boolean).map(canon).sort().join('\n');
 
+/**
+ * A statement's outcome for comparison: its rows, or just "it failed".
+ *
+ * The error CODE is deliberately not compared. When a single statement has two
+ * independent faults reachable — say `MATCH (n) WHERE n.n > 1 DELETE n` over a
+ * graph holding both a node whose `n` is a DATE (invalid comparison) and a still-
+ * connected node (invalid delete) — which fault is reported depends on the
+ * interleaving: the TS engine filters every row before writing any, the native one
+ * streams and writes as it matches. Both reject the statement and both leave the
+ * graph untouched, so only the diagnostic differs; pinning it would mean forcing
+ * filter-all-then-write and giving up streaming writes. Each fault ALONE reports
+ * the same code in both engines. The read fuzzer takes the same stance.
+ *
+ * The graph STATE after every statement is still compared exactly — that is where
+ * a write divergence actually costs something, and it is what caught the
+ * transaction-frame bug this fuzzer was written for.
+ */
 const outcome = (run: () => unknown): string => {
   try {
     return JSON.stringify(run());
-  } catch (e) {
-    return `ERR ${(e as { code?: string }).code}`;
+  } catch {
+    return 'ERR';
   }
 };
 
