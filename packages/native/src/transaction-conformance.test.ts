@@ -139,6 +139,68 @@ suite('transactions differential: per-statement atomicity (TS vs native)', () =>
   });
 });
 
+suite('transactions differential: a faulted statement keeps the caller frame', () => {
+  // Found by the write-path fuzzer. A GQL write statement runs in its OWN frame for
+  // per-statement atomicity; when that statement faults inside a transaction the
+  // CALLER opened, only the statement's own writes may unwind. The TS engine used
+  // to tear the whole transaction down: the caller's earlier writes were lost, the
+  // depth dropped to 0 so every later write escaped the transaction entirely, and
+  // the caller's own commit then threw `commit called with no open transaction`.
+  //
+  // This is the realistic "skip the bad rows, commit the good ones" loop.
+  const script = (abort: boolean): Array<{ label: string; run: (e: Engine) => unknown }> => [
+    {
+      label: `swallowed fault inside a caller transaction (abort=${abort})`,
+      run: (e) =>
+        e.transaction(() => {
+          e.query(`MATCH (n:Acct) WHERE n.id = 'a' SET n.bal = 111`);
+
+          try {
+            // Collides with the unique constraint → faults, and the app skips it.
+            e.query(`INSERT (:Acct {id: 'a', bal: 1})`);
+          } catch {
+            /* swallowed on purpose */
+          }
+
+          e.query(`MATCH (n:Acct) WHERE n.id = 'b' SET n.bal = 222`);
+
+          if (abort) {
+            throw new Error('abort');
+          }
+        }),
+    },
+  ];
+
+  test('the writes around a swallowed fault still commit together', () => {
+    differential((e) => declareUnique(e), script(false));
+  });
+
+  test('and an abort still rolls every one of them back', () => {
+    differential((e) => declareUnique(e), script(true));
+  });
+
+  test('a faulted statement does not leak its own partial writes either', () => {
+    differential(
+      (e) => declareUnique(e),
+      [
+        {
+          label: 'FOR-INSERT collides on the 2nd row inside a caller transaction',
+          run: (e) =>
+            e.transaction(() => {
+              try {
+                e.query(`FOR x IN [1, 2] INSERT (:Acct {id: 'dup2', bal: x})`);
+              } catch {
+                /* swallowed */
+              }
+
+              e.query(`MATCH (n:Acct) WHERE n.id = 'a' SET n.bal = 7`);
+            }),
+        },
+      ],
+    );
+  });
+});
+
 suite('transactions differential: deferred constraint checks (TS vs native)', () => {
   test('required is checked at commit, not per statement (fill the key in a later statement)', () => {
     differential(

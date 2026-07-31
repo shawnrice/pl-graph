@@ -618,6 +618,15 @@ export class Graph {
   // ops, which must neither re-record undo nor re-run constraint checks.
   private txDepth = 0;
   private txUndo: Array<() => void> = [];
+  // Savepoint marks — one per open frame: the `txUndo` / `txEvents` lengths when
+  // that frame opened. An INNER frame's rollback replays only the ops recorded
+  // since its own mark and hands control back to the enclosing frame, instead of
+  // tearing the whole transaction down. Without this, a statement that faults
+  // inside a caller's transaction (a "skip the bad rows" loop swallowing the
+  // error) rolled back the caller's earlier writes, left the depth at 0 so every
+  // later write escaped the transaction, and made the caller's own commit throw
+  // "commit called with no open transaction". The native engine keeps the frame.
+  private txMarks: Array<{ undo: number; events: number }> = [];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private txEvents: Array<EmitterEvent<any, any>> = [];
   private txTouched = new Set<string>();
@@ -3247,6 +3256,7 @@ export class Graph {
 
   /** Open a transaction frame. Nesting increments depth; the outermost frame owns commit/rollback. */
   public beginTransaction = (): void => {
+    this.txMarks.push({ undo: this.txUndo.length, events: this.txEvents.length });
     this.txDepth += 1;
   };
 
@@ -3263,6 +3273,7 @@ export class Graph {
     }
 
     this.txDepth -= 1;
+    this.txMarks.pop();
 
     if (this.txDepth > 0) {
       return; // an inner commit — the outermost frame finalizes
@@ -3293,7 +3304,35 @@ export class Graph {
       return;
     }
 
+    // An inner frame undoes only what it recorded, then returns control to the
+    // frame around it — the enclosing transaction is still open and still
+    // protecting everything written before and after. Only the outermost frame
+    // tears the transaction down. (A GQL write statement runs in its own frame,
+    // so this is what gives a faulting statement per-statement atomicity without
+    // destroying a transaction the caller opened.)
+    if (this.txDepth > 1) {
+      const mark = this.txMarks.pop() ?? { undo: 0, events: 0 };
+
+      this.undoTo(mark.undo);
+      this.txEvents.length = mark.events; // discard the frame's buffered events
+      this.txDepth -= 1;
+
+      return;
+    }
+
     this.applyUndoAndReset();
+  };
+
+  /** Replay inverse ops newest-first down to `mark`, then drop them. */
+  private undoTo = (mark: number): void => {
+    this.applyingUndo = true;
+
+    for (let i = this.txUndo.length - 1; i >= mark; i -= 1) {
+      this.txUndo[i]();
+    }
+
+    this.applyingUndo = false;
+    this.txUndo.length = mark;
   };
 
   /** Record an inverse op to replay if the current transaction rolls back (no-op outside a transaction). */
@@ -3304,17 +3343,10 @@ export class Graph {
   };
 
   private applyUndoAndReset = (): void => {
-    this.applyingUndo = true;
-
-    const undo = this.txUndo;
-
-    // Replay inverse ops newest-first; each reverses exactly one forward write.
-    for (let i = undo.length - 1; i >= 0; i -= 1) {
-      undo[i]();
-    }
-
-    this.applyingUndo = false;
+    // Replay every inverse op newest-first; each reverses one forward write.
+    this.undoTo(0);
     this.txDepth = 0;
+    this.txMarks = [];
     this.txUndo = [];
     this.txEvents = []; // discard everything buffered (forward writes and undo replay alike)
     this.txTouched.clear();
