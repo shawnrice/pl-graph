@@ -1334,7 +1334,19 @@ export class Graph {
     this.elementLabels.set(vertex.id, next);
 
     if (!hadLabel) {
-      this.recordUndo(() => this.removeLabelFromVertex(label, vertex));
+      // Re-resolve by id at replay — never capture the instance. A later write may
+      // remove and (on rollback) re-create this element under a FRESH instance,
+      // leaving the captured one severed from the graph; touching it throws a raw
+      // TypeError that aborts the replay mid-way. See the note on `addEdge`.
+      const undoVertexId = vertex.id;
+
+      this.recordUndo(() => {
+        const live = this.getVertexById(undoVertexId);
+
+        if (live) {
+          this.removeLabelFromVertex(label, live);
+        }
+      });
     }
 
     return vertex;
@@ -1351,7 +1363,19 @@ export class Graph {
     this.elementLabels.set(vertex.id, next);
 
     if (hadLabel) {
-      this.recordUndo(() => this.addLabelToVertex(label, vertex));
+      // Re-resolve by id at replay — never capture the instance. A later write may
+      // remove and (on rollback) re-create this element under a FRESH instance,
+      // leaving the captured one severed from the graph; touching it throws a raw
+      // TypeError that aborts the replay mid-way. See the note on `addEdge`.
+      const undoVertexId = vertex.id;
+
+      this.recordUndo(() => {
+        const live = this.getVertexById(undoVertexId);
+
+        if (live) {
+          this.addLabelToVertex(label, live);
+        }
+      });
     }
 
     return vertex;
@@ -1477,7 +1501,23 @@ export class Graph {
 
     this.edgePropertyIndex.add(edge, edge.properties);
 
-    this.recordUndo(() => this.removeEdge(edge));
+    // Capture the ID and re-resolve at replay, never the instance: a later write
+    // may remove this edge (a DETACH DELETE of either endpoint cascades to it)
+    // and `evict()` severs the instance from the graph, while the rollback replay
+    // re-adds a FRESH instance for the same id. Calling `removeEdge` on the stale
+    // one dereferences a null `#graph` (via `edge.from`) and throws a raw
+    // TypeError, which aborts the replay and leaves every OLDER undo op
+    // unapplied — a half-rolled-back graph. `addVertex`'s inverse already
+    // re-resolves by id, as do the property-level undos in Edge/Vertex.
+    const undoEdgeId = edge.id;
+
+    this.recordUndo(() => {
+      const live = this.getEdgeById(undoEdgeId);
+
+      if (live) {
+        this.removeEdge(live);
+      }
+    });
 
     return edge;
   };
@@ -1552,7 +1592,19 @@ export class Graph {
 
     this.indexEdgeLabel(label, edge);
 
-    this.recordUndo(() => this.removeLabelFromEdge(label, edge));
+    // Re-resolve by id at replay — never capture the instance. A later write may
+    // remove and (on rollback) re-create this element under a FRESH instance,
+    // leaving the captured one severed from the graph; touching it throws a raw
+    // TypeError that aborts the replay mid-way. See the note on `addEdge`.
+    const undoLabelEdgeId = edge.id;
+
+    this.recordUndo(() => {
+      const live = this.getEdgeById(undoLabelEdgeId);
+
+      if (live) {
+        this.removeLabelFromEdge(label, live);
+      }
+    });
 
     return edge;
   };
@@ -1570,7 +1622,19 @@ export class Graph {
 
     this.deIndexEdgeLabel(label, edge);
 
-    this.recordUndo(() => this.addLabelToEdge(label, edge));
+    // Re-resolve by id at replay — never capture the instance. A later write may
+    // remove and (on rollback) re-create this element under a FRESH instance,
+    // leaving the captured one severed from the graph; touching it throws a raw
+    // TypeError that aborts the replay mid-way. See the note on `addEdge`.
+    const undoLabelEdgeId = edge.id;
+
+    this.recordUndo(() => {
+      const live = this.getEdgeById(undoLabelEdgeId);
+
+      if (live) {
+        this.addLabelToEdge(label, live);
+      }
+    });
 
     return edge;
   };

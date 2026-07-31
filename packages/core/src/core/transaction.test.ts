@@ -213,3 +213,86 @@ describe('event buffering', () => {
     expect(seen).toEqual([]);
   });
 });
+
+// Found by the write-path differential fuzzer. An undo op must re-resolve its
+// element by id at replay time, never hold the instance: a later write inside the
+// same transaction can remove the element (a DETACH DELETE of an endpoint cascades
+// to its edges), and `evict()` severs that instance from the graph while the replay
+// re-creates a FRESH one for the same id. Touching the stale instance throws a raw
+// TypeError mid-replay, which abandons every OLDER undo op — leaving the graph
+// half-rolled-back rather than restored.
+describe('rollback replays every op when an element is re-created mid-transaction', () => {
+  const seed = (): Graph => {
+    const g = new Graph();
+    const a = g.addVertex({ id: 'a', labels: ['P'], properties: { n: 1 } });
+    const b = g.addVertex({ id: 'b', labels: ['P'], properties: { n: 2 } });
+
+    g.addEdge({ id: 'e1', from: a, to: b, labels: ['R'], properties: { w: 1 } });
+
+    return g;
+  };
+  const snapshot = (g: Graph): string =>
+    JSON.stringify([
+      [...g.vertices].map((v) => [v.id, [...v.labels].sort(), { ...v.properties }]).sort(),
+      [...g.edges].map((e) => [e.id, e.from.id, e.to.id, [...e.labels].sort()]).sort(),
+    ]);
+
+  const rollsBackCleanly = (write: (g: Graph) => void): void => {
+    const g = seed();
+    const before = snapshot(g);
+
+    expect(() =>
+      g.transaction(() => {
+        write(g);
+
+        throw new Error('abort');
+      }),
+    ).toThrow('abort'); // the ABORT must surface — not a TypeError from the replay
+
+    expect(snapshot(g)).toBe(before);
+  };
+
+  test('an edge added then removed by a cascading delete', () => {
+    rollsBackCleanly((g) => {
+      const a = g.getVertexById('a')!;
+      const b = g.getVertexById('b')!;
+
+      g.addEdge({ id: 'e2', from: a, to: b, labels: ['R'], properties: {} });
+      g.removeVertex(b); // cascades to e1 AND the just-added e2
+    });
+  });
+
+  test('an edge label added then the edge removed', () => {
+    rollsBackCleanly((g) => {
+      const e = g.getEdgeById('e1')!;
+
+      g.addLabelToEdge('T', e);
+      g.removeEdge(e);
+    });
+  });
+
+  test('an edge label added then an endpoint detach-deleted', () => {
+    rollsBackCleanly((g) => {
+      g.addLabelToEdge('T', g.getEdgeById('e1')!);
+      g.removeVertex(g.getVertexById('a')!);
+    });
+  });
+
+  test('a vertex label added then the vertex removed', () => {
+    rollsBackCleanly((g) => {
+      const a = g.getVertexById('a')!;
+
+      g.addLabelToVertex('Z', a);
+      g.removeVertex(a);
+    });
+  });
+
+  test('a property set then the element removed', () => {
+    rollsBackCleanly((g) => {
+      const a = g.getVertexById('a')!;
+
+      a.setProperty('z', 1);
+      g.removeVertex(a);
+    });
+  });
+});
