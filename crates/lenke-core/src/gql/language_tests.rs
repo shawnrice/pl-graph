@@ -1,6 +1,9 @@
-//! Ported conformance tests from packages/gql/src/gql.test.ts.
-//! Each test is named `m_<snake_case>` matching the describe/test structure
-//! from the TypeScript source. SKIP annotations mark TS-specific tests.
+//! The broad GQL language suite: matching, projection, expressions, writes,
+//! aggregation — the widest single body of conformance tests for the engine.
+//!
+//! Ports `packages/gql/src/gql.test.ts`; each test is named `m_<snake_case>`
+//! mirroring that file's describe/test structure, so a change to either side
+//! should change both. `SKIP` annotations mark TS-specific tests.
 
 use super::eval::{Params, Val};
 use super::{parse, prepare};
@@ -9,22 +12,9 @@ use crate::ndjson;
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
+/// The shared TinkerPop "Modern" fixture (see `crate::fixtures`).
 fn modern() -> Graph {
-    let lines = [
-        r#"{"type":"node","id":"marko","labels":["Person"],"properties":{"name":"marko","age":29}}"#,
-        r#"{"type":"node","id":"vadas","labels":["Person"],"properties":{"name":"vadas","age":27}}"#,
-        r#"{"type":"node","id":"josh","labels":["Person"],"properties":{"name":"josh","age":32}}"#,
-        r#"{"type":"node","id":"peter","labels":["Person"],"properties":{"name":"peter","age":35}}"#,
-        r#"{"type":"node","id":"lop","labels":["Software"],"properties":{"name":"lop","lang":"java"}}"#,
-        r#"{"type":"node","id":"ripple","labels":["Software"],"properties":{"name":"ripple","lang":"java"}}"#,
-        r#"{"type":"edge","from":"marko","to":"vadas","labels":["KNOWS"],"properties":{"weight":0.5}}"#,
-        r#"{"type":"edge","from":"marko","to":"josh","labels":["KNOWS"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","from":"marko","to":"lop","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","from":"josh","to":"ripple","labels":["CREATED"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","from":"josh","to":"lop","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","from":"peter","to":"lop","labels":["CREATED"],"properties":{"weight":0.2}}"#,
-    ];
-    ndjson::decode(&lines.join("\n")).unwrap()
+    crate::fixtures::modern_gql()
 }
 
 fn financial() -> Graph {

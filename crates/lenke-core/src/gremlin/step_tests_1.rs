@@ -1,51 +1,25 @@
-//! Ported TS per-step conformance tests (batch 1): out, limit, count, sideEffect,
-//! fold, outE, groupCount, tail, not, hasId, and, local, filter, value, hasNot,
-//! plus the index-seed equivalence cases. Faithful 1:1 ports of
-//! `packages/gremlin/src/{steps,executor}/*.test.ts` over the TinkerPop Modern
-//! graph. Each test name is prefixed `p1_` to avoid collisions.
+//! Per-step conformance tests, part 1 of 6: `out`, `limit`, `count`, `sideEffect`,
+//! `fold`, `outE`, `groupCount`, `tail`, `not`, `hasId`, `and`, `local`, `filter`,
+//! `value`, `hasNot`, plus the index-seed equivalence cases.
+//!
+//! The six parts are a SIZE split, not a thematic one — the number carries no
+//! meaning, so look for a step by grepping rather than by guessing a part.
+//!
+//! Mirrors `packages/gremlin/src/{steps,executor}/*.test.ts` 1:1 over the
+//! TinkerPop Modern graph, so a change to either side should change both. Test
+//! names are prefixed `p1_`.
 
 use super::{GVal, P};
 use crate::graph::Graph;
-use crate::ndjson;
 
-/// The Modern graph (no explicit edge ids — edges stay id-less, like tests.rs).
+/// The shared TinkerPop "Modern" fixture (see `crate::fixtures`).
 fn modern() -> Graph {
-    let lines = [
-        r#"{"type":"node","id":"1","labels":["PERSON"],"properties":{"name":"marko","age":29}}"#,
-        r#"{"type":"node","id":"2","labels":["PERSON"],"properties":{"name":"vadas","age":27}}"#,
-        r#"{"type":"node","id":"4","labels":["PERSON"],"properties":{"name":"josh","age":32}}"#,
-        r#"{"type":"node","id":"6","labels":["PERSON"],"properties":{"name":"peter","age":35}}"#,
-        r#"{"type":"node","id":"3","labels":["SOFTWARE"],"properties":{"name":"lop","lang":"java"}}"#,
-        r#"{"type":"node","id":"5","labels":["SOFTWARE"],"properties":{"name":"ripple","lang":"java"}}"#,
-        r#"{"type":"edge","from":"1","to":"2","labels":["KNOWS"],"properties":{"weight":0.5}}"#,
-        r#"{"type":"edge","from":"1","to":"4","labels":["KNOWS"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","from":"1","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","from":"4","to":"5","labels":["CREATED"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","from":"4","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","from":"6","to":"3","labels":["CREATED"],"properties":{"weight":0.2}}"#,
-    ];
-    ndjson::decode(&lines.join("\n")).unwrap()
+    crate::fixtures::modern_gremlin()
 }
 
-/// The Modern graph with the canonical TinkerPop edge ids (7..12), so edge-id
-/// assertions (hasId on edges, outE id ordering, edge-index seeding) line up
-/// with the TS fixture.
+/// The shared TinkerPop "Modern" fixture (see `crate::fixtures`).
 fn modern_eids() -> Graph {
-    let lines = [
-        r#"{"type":"node","id":"1","labels":["PERSON"],"properties":{"name":"marko","age":29}}"#,
-        r#"{"type":"node","id":"2","labels":["PERSON"],"properties":{"name":"vadas","age":27}}"#,
-        r#"{"type":"node","id":"4","labels":["PERSON"],"properties":{"name":"josh","age":32}}"#,
-        r#"{"type":"node","id":"6","labels":["PERSON"],"properties":{"name":"peter","age":35}}"#,
-        r#"{"type":"node","id":"3","labels":["SOFTWARE"],"properties":{"name":"lop","lang":"java"}}"#,
-        r#"{"type":"node","id":"5","labels":["SOFTWARE"],"properties":{"name":"ripple","lang":"java"}}"#,
-        r#"{"type":"edge","id":"7","from":"1","to":"2","labels":["KNOWS"],"properties":{"weight":0.5}}"#,
-        r#"{"type":"edge","id":"8","from":"1","to":"4","labels":["KNOWS"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","id":"9","from":"1","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","id":"10","from":"4","to":"5","labels":["CREATED"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","id":"11","from":"4","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","id":"12","from":"6","to":"3","labels":["CREATED"],"properties":{"weight":0.2}}"#,
-    ];
-    ndjson::decode(&lines.join("\n")).unwrap()
+    crate::fixtures::modern_gremlin_edge_ids()
 }
 
 fn s(g: &GVal) -> String {

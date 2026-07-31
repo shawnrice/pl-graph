@@ -14,22 +14,22 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+mod divergence_tests;
 pub mod exec;
 pub mod parse;
 #[cfg(test)]
-mod ported_1;
+mod step_tests_1;
 #[cfg(test)]
-mod ported_2;
+mod step_tests_2;
 #[cfg(test)]
-mod ported_3;
+mod step_tests_3;
 #[cfg(test)]
-mod ported_4;
+mod step_tests_4;
 #[cfg(test)]
-mod ported_5;
+mod step_tests_5;
 #[cfg(test)]
-mod ported_6;
-#[cfg(test)]
-mod ported_divergences;
+mod step_tests_6;
 #[cfg(test)]
 mod tests;
 

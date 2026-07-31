@@ -1,34 +1,23 @@
-//! Ported TS per-step conformance tests (batch 4): where, by, is, project,
-//! tokens, in_, V, property, map, constant, simplePath, index, barrier-store,
-//! otherV, mutation-combinators. Each `#[test]` mirrors one TS `test(...)` from
-//! `packages/gremlin/src/steps/*.test.ts`, translated to a Gremlin text query
-//! (via [`super::parse`]) or the fluent builder where text can't express it.
+//! Per-step conformance tests, part 4 of 6: `where`, `by`, `is`, `project`,
+//! tokens, `in_`, `V`, `property`, `map`, `constant`, `simplePath`, `index`,
+//! barrier-`store`, `otherV`, mutation combinators.
 //!
-//! Skips (genuine Rust gaps / divergences) are documented inline with `// SKIP:`.
+//! The six parts are a SIZE split, not a thematic one — the number carries no
+//! meaning.
+//!
+//! Each `#[test]` mirrors one TS `test(...)` from
+//! `packages/gremlin/src/steps/*.test.ts`, as a Gremlin text query (via
+//! [`super::parse`]) or the fluent builder where text can't express it. Genuine
+//! Rust gaps / divergences are documented inline with `// SKIP:`.
 
 #![allow(clippy::float_cmp)]
 
 use super::{g, GVal, __};
 use crate::graph::Graph;
-use crate::ndjson;
 
-/// Canonical TinkerPop "Modern" graph (copied from `tests.rs`).
+/// The shared TinkerPop "Modern" fixture (see `crate::fixtures`).
 fn modern() -> Graph {
-    let lines = [
-        r#"{"type":"node","id":"1","labels":["PERSON"],"properties":{"name":"marko","age":29}}"#,
-        r#"{"type":"node","id":"2","labels":["PERSON"],"properties":{"name":"vadas","age":27}}"#,
-        r#"{"type":"node","id":"4","labels":["PERSON"],"properties":{"name":"josh","age":32}}"#,
-        r#"{"type":"node","id":"6","labels":["PERSON"],"properties":{"name":"peter","age":35}}"#,
-        r#"{"type":"node","id":"3","labels":["SOFTWARE"],"properties":{"name":"lop","lang":"java"}}"#,
-        r#"{"type":"node","id":"5","labels":["SOFTWARE"],"properties":{"name":"ripple","lang":"java"}}"#,
-        r#"{"type":"edge","from":"1","to":"2","labels":["KNOWS"],"properties":{"weight":0.5}}"#,
-        r#"{"type":"edge","from":"1","to":"4","labels":["KNOWS"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","from":"1","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","from":"4","to":"5","labels":["CREATED"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","from":"4","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","from":"6","to":"3","labels":["CREATED"],"properties":{"weight":0.2}}"#,
-    ];
-    ndjson::decode(&lines.join("\n")).unwrap()
+    crate::fixtures::modern_gremlin()
 }
 
 /// Run a textual Gremlin query against a fresh Modern graph.

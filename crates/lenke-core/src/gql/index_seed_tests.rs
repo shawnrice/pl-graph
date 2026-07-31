@@ -1,36 +1,22 @@
-//! Ported GQL index-seeding tests — a faithful behavioral-parity port of the
-//! TypeScript `packages/gql/src/index-seed.test.ts` spec.
+//! Property-index SEEDING tests: equality / range predicates served from a sorted
+//! secondary index, WHERE-derived seed hints, and smaller-side seed selection.
 //!
-//! Covers property-index seeding (equality / range `has`-style predicates served
-//! from a sorted secondary index), WHERE-derived seed hints, and smaller-side
-//! seed selection. Result parity is the contract; TS-internal plan structures
+//! Behavioral-parity port of `packages/gql/src/index-seed.test.ts`. Result parity
+//! is the contract — the TS-internal plan structures are deliberately not
+//! asserted, only that the same rows come back.
 //! have no Rust equivalent and are treated as unsupported.
 
 use super::eval::Params;
 use super::parse;
 use crate::graph::{Graph, Value};
-use crate::ndjson;
 
 // ---------------------------------------------------------------------------
 // Fixture — TinkerPop "Modern" graph.  Identical to tests.rs `modern()`.
 // ---------------------------------------------------------------------------
 
+/// The shared TinkerPop "Modern" fixture (see `crate::fixtures`).
 fn modern() -> Graph {
-    let lines = [
-        r#"{"type":"node","id":"marko","labels":["Person"],"properties":{"name":"marko","age":29}}"#,
-        r#"{"type":"node","id":"vadas","labels":["Person"],"properties":{"name":"vadas","age":27}}"#,
-        r#"{"type":"node","id":"josh","labels":["Person"],"properties":{"name":"josh","age":32}}"#,
-        r#"{"type":"node","id":"peter","labels":["Person"],"properties":{"name":"peter","age":35}}"#,
-        r#"{"type":"node","id":"lop","labels":["Software"],"properties":{"name":"lop","lang":"java"}}"#,
-        r#"{"type":"node","id":"ripple","labels":["Software"],"properties":{"name":"ripple","lang":"java"}}"#,
-        r#"{"type":"edge","from":"marko","to":"vadas","labels":["KNOWS"],"properties":{"weight":0.5}}"#,
-        r#"{"type":"edge","from":"marko","to":"josh","labels":["KNOWS"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","from":"marko","to":"lop","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","from":"josh","to":"ripple","labels":["CREATED"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","from":"josh","to":"lop","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","from":"peter","to":"lop","labels":["CREATED"],"properties":{"weight":0.2}}"#,
-    ];
-    ndjson::decode(&lines.join("\n")).unwrap()
+    crate::fixtures::modern_gql()
 }
 
 // ---------------------------------------------------------------------------

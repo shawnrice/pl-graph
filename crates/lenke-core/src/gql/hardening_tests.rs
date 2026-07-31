@@ -1,8 +1,10 @@
-//! Behavioral-parity port of `packages/gql/src/hardening.test.ts` into Rust.
+//! Hardening tests: malformed input, resource bounds, and the error paths a
+//! hostile or careless query can reach.
 //!
-//! Each test is named `h_<snake_case>` and maps 1-to-1 to a TS test.
-//! Tests that diverge from the Rust engine behaviour are commented out with
-//! `// SKIPPED (divergence): ...` or `// SKIPPED (unsupported): ...`.
+//! Behavioral-parity port of `packages/gql/src/hardening.test.ts` — each test is
+//! named `h_<snake_case>` and maps 1-to-1 to a TS test, so a change to either side
+//! should change both. Cases that diverge from this engine are commented out with
+//! `// SKIPPED (divergence): …` or `// SKIPPED (unsupported): …`.
 
 use super::eval::Params;
 use super::{parse, parse_with_max_chain};
@@ -14,24 +16,9 @@ use crate::ndjson;
 // Fixtures & helpers (self-contained, mirroring tests.rs conventions)
 // ---------------------------------------------------------------------------
 
-/// The TinkerPop "Modern" graph — 4 Person, 2 Software, KNOWS + CREATED edges
-/// with `weight` properties. Identical to `tests::modern()`.
+/// The shared TinkerPop "Modern" fixture (see `crate::fixtures`).
 fn modern() -> Graph {
-    let lines = [
-        r#"{"type":"node","id":"marko","labels":["Person"],"properties":{"name":"marko","age":29}}"#,
-        r#"{"type":"node","id":"vadas","labels":["Person"],"properties":{"name":"vadas","age":27}}"#,
-        r#"{"type":"node","id":"josh","labels":["Person"],"properties":{"name":"josh","age":32}}"#,
-        r#"{"type":"node","id":"peter","labels":["Person"],"properties":{"name":"peter","age":35}}"#,
-        r#"{"type":"node","id":"lop","labels":["Software"],"properties":{"name":"lop","lang":"java"}}"#,
-        r#"{"type":"node","id":"ripple","labels":["Software"],"properties":{"name":"ripple","lang":"java"}}"#,
-        r#"{"type":"edge","from":"marko","to":"vadas","labels":["KNOWS"],"properties":{"weight":0.5}}"#,
-        r#"{"type":"edge","from":"marko","to":"josh","labels":["KNOWS"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","from":"marko","to":"lop","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","from":"josh","to":"ripple","labels":["CREATED"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","from":"josh","to":"lop","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","from":"peter","to":"lop","labels":["CREATED"],"properties":{"weight":0.2}}"#,
-    ];
-    ndjson::decode(&lines.join("\n")).unwrap()
+    crate::fixtures::modern_gql()
 }
 
 fn n(x: f64) -> Value {

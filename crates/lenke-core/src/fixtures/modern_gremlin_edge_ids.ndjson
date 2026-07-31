@@ -1,0 +1,12 @@
+{"type":"node","id":"1","labels":["PERSON"],"properties":{"name":"marko","age":29}}
+{"type":"node","id":"2","labels":["PERSON"],"properties":{"name":"vadas","age":27}}
+{"type":"node","id":"4","labels":["PERSON"],"properties":{"name":"josh","age":32}}
+{"type":"node","id":"6","labels":["PERSON"],"properties":{"name":"peter","age":35}}
+{"type":"node","id":"3","labels":["SOFTWARE"],"properties":{"name":"lop","lang":"java"}}
+{"type":"node","id":"5","labels":["SOFTWARE"],"properties":{"name":"ripple","lang":"java"}}
+{"type":"edge","id":"7","from":"1","to":"2","labels":["KNOWS"],"properties":{"weight":0.5}}
+{"type":"edge","id":"8","from":"1","to":"4","labels":["KNOWS"],"properties":{"weight":1.0}}
+{"type":"edge","id":"9","from":"1","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}
+{"type":"edge","id":"10","from":"4","to":"5","labels":["CREATED"],"properties":{"weight":1.0}}
+{"type":"edge","id":"11","from":"4","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}
+{"type":"edge","id":"12","from":"6","to":"3","labels":["CREATED"],"properties":{"weight":0.2}}

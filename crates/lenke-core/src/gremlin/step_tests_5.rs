@@ -1,10 +1,13 @@
-//! Ported TS per-step conformance tests (batch 5): values, sum, dedup,
-//! path-tracking, properties, inject, valueMap, propertyMap, loops, branch,
-//! shortestPath, id, as, inV. Each test translates a TS fluent traversal into
-//! the Rust fluent/text builder, runs it over a local `modern()` graph, and
-//! asserts the equivalent `GVal` shape.
+//! Per-step conformance tests, part 5 of 6: `values`, `sum`, `dedup`,
+//! path-tracking, `properties`, `inject`, `valueMap`, `propertyMap`, `loops`,
+//! `branch`, `shortestPath`, `id`, `as`, `inV`.
 //!
-//! Intentional divergences (per GAPS.md / engine behavior) are respected:
+//! The six parts are a SIZE split, not a thematic one — the number carries no
+//! meaning.
+//!
+//! Each test translates a TS fluent traversal into the Rust fluent/text builder,
+//! runs it over a local `modern()` graph, and asserts the equivalent `GVal` shape.
+//! Intentional divergences (per the engine's documented behavior) are respected:
 //!   - valueMap/propertyMap flat-value behavior already matches the TS v2 impl.
 //!   - dedupe() only keys on its first by() modulator and By::Key on a Map is a
 //!     no-op, so dedupe(a,b)/dedupe(a) over select-maps are not expressible.
@@ -20,23 +23,9 @@ fn with_step(mut t: Traversal, s: Step) -> Traversal {
     t
 }
 
-/// Canonical TinkerPop "Modern" graph (ids/labels/edges match the TS fixture).
+/// The shared TinkerPop "Modern" fixture (see `crate::fixtures`).
 fn modern() -> crate::graph::Graph {
-    let lines = [
-        r#"{"type":"node","id":"1","labels":["PERSON"],"properties":{"name":"marko","age":29}}"#,
-        r#"{"type":"node","id":"2","labels":["PERSON"],"properties":{"name":"vadas","age":27}}"#,
-        r#"{"type":"node","id":"4","labels":["PERSON"],"properties":{"name":"josh","age":32}}"#,
-        r#"{"type":"node","id":"6","labels":["PERSON"],"properties":{"name":"peter","age":35}}"#,
-        r#"{"type":"node","id":"3","labels":["SOFTWARE"],"properties":{"name":"lop","lang":"java"}}"#,
-        r#"{"type":"node","id":"5","labels":["SOFTWARE"],"properties":{"name":"ripple","lang":"java"}}"#,
-        r#"{"type":"edge","id":"7","from":"1","to":"2","labels":["KNOWS"],"properties":{"weight":0.5}}"#,
-        r#"{"type":"edge","id":"8","from":"1","to":"4","labels":["KNOWS"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","id":"9","from":"1","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","id":"10","from":"4","to":"5","labels":["CREATED"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","id":"11","from":"4","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","id":"12","from":"6","to":"3","labels":["CREATED"],"properties":{"weight":0.2}}"#,
-    ];
-    ndjson::decode(&lines.join("\n")).unwrap()
+    crate::fixtures::modern_gremlin_edge_ids()
 }
 
 fn q(t: Traversal) -> Vec<GVal> {
@@ -583,7 +572,7 @@ fn p5_propertymap_on_edges() {
 // NOTE: `repeat(out()).until(loops().is(2))` and
 // `repeat(out()).times(3).emit(loops().is(gt(1)))` now match TS — the loop
 // counter increments on entry and on body output (loops() counts from 1 in the
-// first body pass). See ported_divergences::repeat_until_loops_stops_after_first_pass
+// first body pass). See divergence_tests::repeat_until_loops_stops_after_first_pass
 // and ::repeat_emit_loops_predicate_offset.
 
 #[test]

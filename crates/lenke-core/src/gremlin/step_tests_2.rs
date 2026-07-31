@@ -1,34 +1,20 @@
-//! Second batch of ported TS Gremlin step-tests (conformance parity), covering
-//! repeat / elementMap / textP / aggregate / select-pop / choose / min / coalesce
-//! / sideeffects-in-closures / mean / flatMap / addE / label / fail / subgraph /
-//! cyclicPath. Self-contained: own `modern()` fixture + helpers.
+//! Per-step conformance tests, part 2 of 6: `repeat`, `elementMap`, `textP`,
+//! `aggregate`, `select`-pop, `choose`, `min`, `coalesce`, side-effects in
+//! closures, `mean`, `flatMap`, `addE`, `label`, `fail`, `subgraph`, `cyclicPath`.
 //!
-//! TS closures (`filter((v,t)=>…)`, `choose((p)=>…)`) are expressed as
-//! sub-traversals. Tests that hit a genuine Rust gap or behavioral divergence are
-//! omitted and recorded in the delivery notes (not asserted as failing).
+//! The six parts are a SIZE split, not a thematic one — the number carries no
+//! meaning. Self-contained: own `modern()` fixture + helpers.
+//!
+//! Mirrors the TS Gremlin step tests. TS closures (`filter((v,t)=>…)`,
+//! `choose((p)=>…)`) are expressed as sub-traversals. Tests that hit a genuine
+//! Rust gap or behavioral divergence are omitted rather than asserted failing.
 
 use super::{GVal, Step, Traversal};
 use crate::graph::Graph;
-use crate::ndjson;
 
-/// Canonical TinkerPop "Modern" graph. Edge ids 7..12 included so element/id
-/// projections over edges match the TS fixture exactly.
+/// The shared TinkerPop "Modern" fixture (see `crate::fixtures`).
 fn modern() -> Graph {
-    let lines = [
-        r#"{"type":"node","id":"1","labels":["PERSON"],"properties":{"name":"marko","age":29}}"#,
-        r#"{"type":"node","id":"2","labels":["PERSON"],"properties":{"name":"vadas","age":27}}"#,
-        r#"{"type":"node","id":"4","labels":["PERSON"],"properties":{"name":"josh","age":32}}"#,
-        r#"{"type":"node","id":"6","labels":["PERSON"],"properties":{"name":"peter","age":35}}"#,
-        r#"{"type":"node","id":"3","labels":["SOFTWARE"],"properties":{"name":"lop","lang":"java"}}"#,
-        r#"{"type":"node","id":"5","labels":["SOFTWARE"],"properties":{"name":"ripple","lang":"java"}}"#,
-        r#"{"type":"edge","id":"7","from":"1","to":"2","labels":["KNOWS"],"properties":{"weight":0.5}}"#,
-        r#"{"type":"edge","id":"8","from":"1","to":"4","labels":["KNOWS"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","id":"9","from":"1","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","id":"10","from":"4","to":"5","labels":["CREATED"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","id":"11","from":"4","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","id":"12","from":"6","to":"3","labels":["CREATED"],"properties":{"weight":0.2}}"#,
-    ];
-    ndjson::decode(&lines.join("\n")).unwrap()
+    crate::fixtures::modern_gremlin_edge_ids()
 }
 
 /// Parse a Gremlin string and run it against a fresh Modern graph.
@@ -127,7 +113,7 @@ fn p2_repeat_emit_filtered_software() {
 }
 
 // NOTE: `emitBefore() yields the start vertex plus every level` now matches TS —
-// see ported_divergences::repeat_emit_before_yields_every_level.
+// see divergence_tests::repeat_emit_before_yields_every_level.
 
 #[test]
 fn p2_repeat_times_two_path() {
@@ -628,7 +614,7 @@ fn p2_min_all_null_yields_null() {
 }
 
 // NOTE: `min filters out null` (inject(null,10,9,null).min() → 9) now matches
-// TS — see ported_divergences::min_skips_nulls / min_all_null_is_null.
+// TS — see divergence_tests::min_skips_nulls / min_all_null_is_null.
 
 // ===== coalesce (coalesce.test.ts) ========================================
 
@@ -722,7 +708,7 @@ fn p2_mean_filters_null() {
 }
 
 // NOTE: `mean/sum take null if that is all they got` now matches TS — see
-// ported_divergences::mean_all_null_is_null / sum_all_null_is_null.
+// divergence_tests::mean_all_null_is_null / sum_all_null_is_null.
 
 // ===== flatMap (flatMap.test.ts) ==========================================
 

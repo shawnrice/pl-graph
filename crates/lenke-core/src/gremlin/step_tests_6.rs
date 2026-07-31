@@ -1,33 +1,20 @@
-//! Ported TS Gremlin per-step conformance tests (batch 6):
-//! select / order / group / skip / hasLabel / path / inE / tree / or /
-//! hasKey / both / optional / hasValue / addV / identity.
+//! Per-step conformance tests, part 6 of 6: `select`, `order`, `group`, `skip`,
+//! `hasLabel`, `path`, `inE`, `tree`, `or`, `hasKey`, `both`, `optional`,
+//! `hasValue`, `addV`, `identity`.
 //!
-//! Self-contained: own `modern()` fixture (with explicit edge ids 7..=12 to
-//! match the TS TinkerGraph edge-id assertions), own helpers, own tests.
-//! Read-only queries use `run`; there are no error/throw cases in this batch.
+//! The six parts are a SIZE split, not a thematic one — the number carries no
+//! meaning.
+//!
+//! Mirrors the TS Gremlin step tests. Self-contained: own `modern()` fixture
+//! (with explicit edge ids 7..=12 to match the TS TinkerGraph edge-id assertions),
+//! own helpers, own tests. Read-only queries use `run`; no error cases here.
 
 use super::{g, GVal, Order, P};
 use crate::graph::Graph;
-use crate::ndjson;
 
-/// The canonical TinkerPop "Modern" graph, with explicit edge ids 7..=12 so
-/// `id()` / `path()` over edges match the TS fixture (`createTestTinkerGraph`).
+/// The shared TinkerPop "Modern" fixture (see `crate::fixtures`).
 fn modern() -> Graph {
-    let lines = [
-        r#"{"type":"node","id":"1","labels":["PERSON"],"properties":{"name":"marko","age":29}}"#,
-        r#"{"type":"node","id":"2","labels":["PERSON"],"properties":{"name":"vadas","age":27}}"#,
-        r#"{"type":"node","id":"4","labels":["PERSON"],"properties":{"name":"josh","age":32}}"#,
-        r#"{"type":"node","id":"6","labels":["PERSON"],"properties":{"name":"peter","age":35}}"#,
-        r#"{"type":"node","id":"3","labels":["SOFTWARE"],"properties":{"name":"lop","lang":"java"}}"#,
-        r#"{"type":"node","id":"5","labels":["SOFTWARE"],"properties":{"name":"ripple","lang":"java"}}"#,
-        r#"{"type":"edge","id":"7","from":"1","to":"2","labels":["KNOWS"],"properties":{"weight":0.5}}"#,
-        r#"{"type":"edge","id":"8","from":"1","to":"4","labels":["KNOWS"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","id":"9","from":"1","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","id":"10","from":"4","to":"5","labels":["CREATED"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","id":"11","from":"4","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","id":"12","from":"6","to":"3","labels":["CREATED"],"properties":{"weight":0.2}}"#,
-    ];
-    ndjson::decode(&lines.join("\n")).unwrap()
+    crate::fixtures::modern_gremlin_edge_ids()
 }
 
 // ---- helpers --------------------------------------------------------------

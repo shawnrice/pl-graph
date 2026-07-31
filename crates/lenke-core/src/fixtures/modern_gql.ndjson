@@ -1,0 +1,12 @@
+{"type":"node","id":"marko","labels":["Person"],"properties":{"name":"marko","age":29}}
+{"type":"node","id":"vadas","labels":["Person"],"properties":{"name":"vadas","age":27}}
+{"type":"node","id":"josh","labels":["Person"],"properties":{"name":"josh","age":32}}
+{"type":"node","id":"peter","labels":["Person"],"properties":{"name":"peter","age":35}}
+{"type":"node","id":"lop","labels":["Software"],"properties":{"name":"lop","lang":"java"}}
+{"type":"node","id":"ripple","labels":["Software"],"properties":{"name":"ripple","lang":"java"}}
+{"type":"edge","from":"marko","to":"vadas","labels":["KNOWS"],"properties":{"weight":0.5}}
+{"type":"edge","from":"marko","to":"josh","labels":["KNOWS"],"properties":{"weight":1.0}}
+{"type":"edge","from":"marko","to":"lop","labels":["CREATED"],"properties":{"weight":0.4}}
+{"type":"edge","from":"josh","to":"ripple","labels":["CREATED"],"properties":{"weight":1.0}}
+{"type":"edge","from":"josh","to":"lop","labels":["CREATED"],"properties":{"weight":0.4}}
+{"type":"edge","from":"peter","to":"lop","labels":["CREATED"],"properties":{"weight":0.2}}

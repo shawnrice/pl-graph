@@ -1,9 +1,9 @@
-//! Conformance tests ported from `packages/gql/src/tck.test.ts`.
+//! TCK (Technology Compatibility Kit) scenarios adapted from the openCypher TCK
+//! (github.com/opencypher/openCypher, `tck/features`, Apache License 2.0),
+//! re-expressed as Rust unit tests.
 //!
-//! These are TCK (Technology Compatibility Kit) scenarios adapted from the
-//! openCypher TCK (github.com/opencypher/openCypher, `tck/features`, Apache
-//! License 2.0) re-expressed as Rust unit tests.
-//!
+//! Ports `packages/gql/src/tck.test.ts`, so a change to either side should change
+//! both.
 //! Each test is named `tck_<snake_case_description>` mirroring the TS test
 //! name. The module is self-contained: helpers and fixtures are defined here.
 

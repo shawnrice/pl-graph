@@ -1,10 +1,13 @@
-//! Ported GQL tests — faithful Rust port of `packages/gql/src/errors.test.ts`
-//! and `packages/gql/src/fuzz.test.ts`.
+//! Metamorphic / property-based tests: rather than check a random query against a
+//! known answer (there is no oracle), these assert RELATIONSHIPS between related
+//! queries that must hold for any input — Kleene boolean-algebra laws, the
+//! EXISTS/COUNT correspondence, compiled-plan agreement, aggregate identities,
+//! set-operation laws, and ORDER BY/SKIP/LIMIT slicing. Plus the error-code suite.
 //!
-//! errors.test.ts: 1 test, ported 1:1.
-//! fuzz.test.ts: 7 property-based fuzz suites, all using a seeded mulberry32 RNG
-//! with 400 iterations each. The RNG and graph/predicate generators are ported
-//! directly from the TS source so the same seeded sequence executes in Rust.
+//! Ports `packages/gql/src/fuzz.test.ts` (7 suites, seeded mulberry32, 400
+//! iterations each) and `packages/gql/src/errors.test.ts`. The RNG and the
+//! graph/predicate generators are ported too, so the same seed drives the same
+//! sequence in both engines.
 //!
 //! Self-contained: copies the `modern()` fixture, helper functions, and imports.
 

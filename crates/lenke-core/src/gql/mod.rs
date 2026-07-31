@@ -21,17 +21,17 @@ pub mod parser;
 pub mod plan;
 
 #[cfg(test)]
-mod ported_gql_hardening;
+mod hardening_tests;
 #[cfg(test)]
-mod ported_gql_index_seed;
+mod index_seed_tests;
 #[cfg(test)]
-mod ported_gql_main;
+mod language_tests;
 #[cfg(test)]
-mod ported_gql_misc;
+mod metamorphic_tests;
 #[cfg(test)]
-mod ported_gql_operator_chains;
+mod operator_chain_tests;
 #[cfg(test)]
-mod ported_gql_tck;
+mod tck_tests;
 #[cfg(test)]
 mod temporal_differential;
 #[cfg(test)]

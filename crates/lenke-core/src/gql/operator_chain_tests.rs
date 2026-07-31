@@ -1,9 +1,10 @@
-//! Behavioral golden tests for operator-CHAIN semantics, pinned BEFORE the
-//! n-ary AST flatten refactor (the operator-chain hardening) so a regression in
-//! precedence, associativity, three-valued boolean folding, string-concat null
-//! propagation, error propagation (the evaluator does NOT short-circuit), the
-//! long-chain arithmetic result, or the planner's AND-split index seed is caught.
+//! Golden tests for operator-CHAIN semantics — precedence, associativity,
+//! three-valued boolean folding, string-concat null propagation, error propagation
+//! (the evaluator does NOT short-circuit), long-chain arithmetic results, and the
+//! planner's AND-split index seed.
 //!
+//! Pinned BEFORE the n-ary AST flatten refactor so any regression in that
+//! behavior is caught by a failing diff rather than noticed later.
 //! Mirror of `packages/gql/src/operator-chains.test.ts` (byte-identity). Golden
 //! values were captured from the pre-refactor engine, where TS and native agree.
 

@@ -1,54 +1,26 @@
-//! Ported TS per-step conformance tests (batch 3): has / closures / none /
-//! subplan-shapes / range / union / max / bothE / sample / match / E / unfold /
-//! inside-outside / drop / outV / bothV.
+//! Per-step conformance tests, part 3 of 6: `has`, closures, `none`,
+//! subplan-shapes, `range`, `union`, `max`, `bothE`, `sample`, `match`, `E`,
+//! `unfold`, inside/outside, `drop`, `outV`, `bothV`.
 //!
-//! Self-contained: own `modern()` fixture (a copy of the canonical TinkerPop
-//! "Modern" graph used in `tests.rs`), own helpers, own `#[test]` fns. Every
-//! test fn is prefixed `p3_<step>_<short>`. TS closures are expressed as Rust
-//! sub-traversals; textual Gremlin (`super::parse`) is preferred.
+//! The six parts are a SIZE split, not a thematic one — the number carries no
+//! meaning. Self-contained: own `modern()` fixture (a copy of the canonical
+//! TinkerPop "Modern" graph used in `tests.rs`), own helpers, own `#[test]` fns.
+//!
+//! Mirrors the TS Gremlin step tests. Test names are prefixed `p3_<step>_<short>`;
+//! TS closures become Rust sub-traversals, and textual Gremlin (`super::parse`) is
+//! preferred where it can express the query.
 
 use super::{GVal, Step};
 use crate::graph::Graph;
-use crate::ndjson;
 
-/// Canonical TinkerPop "Modern" graph (ids: 1 marko/29, 2 vadas/27, 4 josh/32,
-/// 6 peter/35, 3 lop, 5 ripple). Edges are id-less (auto `e{idx}` ids).
+/// The shared TinkerPop "Modern" fixture (see `crate::fixtures`).
 fn modern() -> Graph {
-    let lines = [
-        r#"{"type":"node","id":"1","labels":["PERSON"],"properties":{"name":"marko","age":29}}"#,
-        r#"{"type":"node","id":"2","labels":["PERSON"],"properties":{"name":"vadas","age":27}}"#,
-        r#"{"type":"node","id":"4","labels":["PERSON"],"properties":{"name":"josh","age":32}}"#,
-        r#"{"type":"node","id":"6","labels":["PERSON"],"properties":{"name":"peter","age":35}}"#,
-        r#"{"type":"node","id":"3","labels":["SOFTWARE"],"properties":{"name":"lop","lang":"java"}}"#,
-        r#"{"type":"node","id":"5","labels":["SOFTWARE"],"properties":{"name":"ripple","lang":"java"}}"#,
-        r#"{"type":"edge","from":"1","to":"2","labels":["KNOWS"],"properties":{"weight":0.5}}"#,
-        r#"{"type":"edge","from":"1","to":"4","labels":["KNOWS"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","from":"1","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","from":"4","to":"5","labels":["CREATED"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","from":"4","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","from":"6","to":"3","labels":["CREATED"],"properties":{"weight":0.2}}"#,
-    ];
-    ndjson::decode(&lines.join("\n")).unwrap()
+    crate::fixtures::modern_gremlin()
 }
 
-/// Same Modern graph but with explicit edge ids 7..12 (matching the TS fixture),
-/// for tests that assert on edge ids / order.
+/// The shared TinkerPop "Modern" fixture (see `crate::fixtures`).
 fn modern_eids() -> Graph {
-    let lines = [
-        r#"{"type":"node","id":"1","labels":["PERSON"],"properties":{"name":"marko","age":29}}"#,
-        r#"{"type":"node","id":"2","labels":["PERSON"],"properties":{"name":"vadas","age":27}}"#,
-        r#"{"type":"node","id":"4","labels":["PERSON"],"properties":{"name":"josh","age":32}}"#,
-        r#"{"type":"node","id":"6","labels":["PERSON"],"properties":{"name":"peter","age":35}}"#,
-        r#"{"type":"node","id":"3","labels":["SOFTWARE"],"properties":{"name":"lop","lang":"java"}}"#,
-        r#"{"type":"node","id":"5","labels":["SOFTWARE"],"properties":{"name":"ripple","lang":"java"}}"#,
-        r#"{"type":"edge","id":"7","from":"1","to":"2","labels":["KNOWS"],"properties":{"weight":0.5}}"#,
-        r#"{"type":"edge","id":"8","from":"1","to":"4","labels":["KNOWS"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","id":"9","from":"1","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","id":"10","from":"4","to":"5","labels":["CREATED"],"properties":{"weight":1.0}}"#,
-        r#"{"type":"edge","id":"11","from":"4","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}"#,
-        r#"{"type":"edge","id":"12","from":"6","to":"3","labels":["CREATED"],"properties":{"weight":0.2}}"#,
-    ];
-    ndjson::decode(&lines.join("\n")).unwrap()
+    crate::fixtures::modern_gremlin_edge_ids()
 }
 
 fn s(g: &GVal) -> String {
@@ -506,7 +478,7 @@ fn p3_max_after_repeat_both_times3() {
 }
 
 // NOTE (max.test.ts): `max()` over null operands now skips them, matching TS —
-// see ported_divergences::max_skips_nulls (built via the fluent builder, since
+// see divergence_tests::max_skips_nulls (built via the fluent builder, since
 // the textual parser has no `null` literal).
 
 // ===================== bothE.test.ts =====================
