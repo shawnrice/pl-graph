@@ -87,6 +87,36 @@ describe('hardening: a lone-surrogate string param is rejected', () => {
   });
 });
 
+describe('hardening: a param error names the right KIND of mistake', () => {
+  // A malformed document is invalid JSON; a well-formed one holding a value the
+  // binding model rejects is an invalid VALUE. Every one of these parses as JSON
+  // without complaint — and on this engine a param is a JS object, so no JSON is
+  // involved at all. All three used to report `E_INVALID_JSON`, inherited from
+  // the native decoder, which stamped one code on every failure.
+  test.each([
+    ['a nested list', [1, [2]]],
+    ['a doubly nested list', [[1]]],
+    ['a plain object', { a: 1 }],
+    ['an object with a string value', { a: 'x' }],
+    ['a malformed tagged temporal', { '@date': 'nope' }],
+    ['a tagged temporal with a non-string value', { '@date': 1 }],
+    ['a Date instance', new Date(0)],
+  ])('%s is E_INVALID_VALUE, not E_INVALID_JSON', (_label, p) => {
+    const err = thrown(() => query(new Graph(), 'RETURN $p AS x', { p }));
+
+    expect(hasErrorCode(err, ErrorCode.InvalidValue)).toBe(true);
+    expect(hasErrorCode(err, ErrorCode.InvalidJson)).toBe(false);
+  });
+
+  test('the values the model does accept still bind', () => {
+    const g = new Graph();
+
+    expect(() => query(g, 'RETURN $p AS x', { p: [1, 'a', true, null] })).not.toThrow();
+    expect(() => query(g, 'RETURN $p AS x', { p: { '@date': '2020-01-01' } })).not.toThrow();
+    expect(() => query(g, 'RETURN $p AS x', { p: 'plain' })).not.toThrow();
+  });
+});
+
 describe('hardening: SET/REMOVE maintain the property index', () => {
   test('SET reindexes, so an indexed seek finds the new value', () => {
     const plain = createTestSocialGraph();

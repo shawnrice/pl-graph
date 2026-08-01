@@ -105,13 +105,19 @@ test('params bind as data, never spliced (injection stays inert)', () => {
   assert.equal(hostile.rows.length, 0);
   assert.equal(g.vertexCount, before);
 
-  // Malformed params reject with the coded error, not silent misbehavior. The
-  // raw Graph message carries the stable WIRE code in its tail (`[E_INVALID_JSON]`),
-  // the same string the ffi/wasm backends surface — not the Rust Debug name.
+  // Rejected params carry the coded error, not silent misbehavior. The raw Graph
+  // message carries the stable WIRE code in its tail, the same string the
+  // ffi/wasm backends surface — not the Rust Debug name.
+  //
+  // Which code depends on WHICH mistake: a document that isn't JSON is
+  // `E_INVALID_JSON`, while one that parses and then holds a value the binding
+  // model refuses is `E_INVALID_VALUE`. `{"bad":{"nested":1}}` is well-formed
+  // JSON carrying a non-temporal object, so it is the latter.
   assert.throws(
     () => g.query('MATCH (p:Person) RETURN p', '{"bad":{"nested":1}}'),
-    /E_INVALID_JSON/,
+    /E_INVALID_VALUE/,
   );
+  assert.throws(() => g.query('MATCH (p:Person) RETURN p', '{"bad": }'), /E_INVALID_JSON/);
 });
 
 test('createNodeBackend errors are coded LenkeErrors (parity with ffi/wasm)', () => {

@@ -50,9 +50,23 @@ struct Parser<'a> {
 }
 
 impl Parser<'_> {
+    /// A **syntax** failure: these bytes are not valid JSON. Bindings cross the
+    /// FFI boundary as a JSON document, so a malformed one is exactly that.
     fn err(&self, msg: &str) -> CodeError {
         CodeError::new(
             ErrorCode::InvalidJson,
+            format!("params: {msg} (at byte {})", self.pos),
+        )
+    }
+
+    /// A **value** failure: the JSON parsed fine and then broke a rule about what
+    /// a binding may hold. `[[1]]`, `{"a":1}` and `{"@date":"nope"}` are all
+    /// well-formed JSON — calling them invalid JSON would blame the transport for
+    /// a value the caller got wrong, and would report a code the TS engine (which
+    /// takes JS objects and parses no JSON at all) has no way to mirror honestly.
+    fn err_value(&self, msg: &str) -> CodeError {
+        CodeError::new(
+            ErrorCode::InvalidValue,
             format!("params: {msg} (at byte {})", self.pos),
         )
     }
@@ -119,7 +133,7 @@ impl Parser<'_> {
             Some(b'f') => self.literal(b"false", Val::Bool(false)),
             Some(b'n') => self.literal(b"null", Val::Null),
             Some(b'[') if allow_list => self.list(),
-            Some(b'[') => Err(self.err("nested arrays are not valid param values")),
+            Some(b'[') => Err(self.err_value("nested arrays are not valid param values")),
             // The only valid object param value is a tagged temporal
             // (`{"@date":"…"}` / `@datetime` / `@duration`).
             Some(b'{') => self.temporal_object(),
@@ -138,13 +152,24 @@ impl Parser<'_> {
         self.skip_ws();
         self.expect(b':')?;
         self.skip_ws();
+        // The KEY decides whether this object can be a binding at all, so settle
+        // that before demanding a string value. `{"a":1}` is well-formed JSON that
+        // simply isn't a param; faulting on the `1` would report a syntax error
+        // about the document when the caller's mistake was the value.
+        if !crate::temporal::Temporal::is_json_tag(&key) {
+            return Err(self.err_value("the only valid object param value is a tagged temporal"));
+        }
+        if self.peek() != Some(b'"') {
+            return Err(self.err_value("a tagged temporal's value must be an ISO-8601 string"));
+        }
+
         let iso = self.string()?;
         self.skip_ws();
         self.expect(b'}')?;
         match crate::temporal::Temporal::from_json_tag(&key, &iso) {
             Some(Ok(t)) => Ok(Val::Temporal(t)),
-            Some(Err(e)) => Err(self.err(&format!("invalid temporal param: {e}"))),
-            None => Err(self.err("the only valid object param value is a tagged temporal")),
+            Some(Err(e)) => Err(self.err_value(&format!("invalid temporal param: {e}"))),
+            None => Err(self.err_value("the only valid object param value is a tagged temporal")),
         }
     }
 
@@ -472,5 +497,74 @@ mod tests {
         assert!(matches!(p["c"], Val::Num(x) if (x - 1000.0).abs() < 1e-9));
         assert!(matches!(p["d"], Val::Num(x) if (x - 0.025).abs() < 1e-12));
         assert!(params_from_json(r#"{"a":1e999}"#).is_err()); // overflows to inf
+    }
+
+    // -----------------------------------------------------------------------
+    // Error CLASS: a malformed document is invalid JSON; a well-formed document
+    // holding an unacceptable value is an invalid VALUE. Bindings arrive here as
+    // a JSON document, so both failures are reachable and they are not the same
+    // mistake — one blames the transport, the other the caller's value. The
+    // parser used to stamp `InvalidJson` on every failure, which also gave the TS
+    // engine (which takes JS objects and parses no JSON at all) a code it could
+    // only mirror dishonestly.
+    // -----------------------------------------------------------------------
+
+    fn code_of(json: &str) -> ErrorCode {
+        params_from_json(json).expect_err("should have failed").code
+    }
+
+    #[test]
+    fn malformed_json_is_invalid_json() {
+        for bad in [
+            r#"{"p": }"#,
+            r#"{"p": tru}"#,
+            r#"{"p" "x"}"#,
+            r#"{"p": "unterminated"#,
+            r#"{"p": 1,}"#,
+            "{",
+            r#"{"p": "\ud800"}"#,
+        ] {
+            assert_eq!(code_of(bad), ErrorCode::InvalidJson, "for {bad}");
+        }
+    }
+
+    #[test]
+    fn a_nested_array_is_an_invalid_value_not_invalid_json() {
+        // `[[1]]` parses as JSON perfectly well; it just isn't a binding.
+        assert_eq!(code_of(r#"{"p": [[1]]}"#), ErrorCode::InvalidValue);
+    }
+
+    #[test]
+    fn a_non_temporal_object_is_an_invalid_value() {
+        // Both of these are well-formed JSON — the value shape is what is wrong,
+        // and the string-valued case must not be reported differently from the
+        // number-valued one just because the parser reaches it sooner.
+        assert_eq!(code_of(r#"{"p": {"a":1}}"#), ErrorCode::InvalidValue);
+        assert_eq!(code_of(r#"{"p": {"a":"x"}}"#), ErrorCode::InvalidValue);
+    }
+
+    #[test]
+    fn a_bad_temporal_string_is_an_invalid_value() {
+        assert_eq!(
+            code_of(r#"{"p": {"@date":"nope"}}"#),
+            ErrorCode::InvalidValue
+        );
+        assert_eq!(
+            code_of(r#"{"p": {"@duration":"nope"}}"#),
+            ErrorCode::InvalidValue
+        );
+    }
+
+    #[test]
+    fn a_tagged_temporal_with_a_non_string_value_is_an_invalid_value() {
+        assert_eq!(code_of(r#"{"p": {"@date":1}}"#), ErrorCode::InvalidValue);
+        assert_eq!(code_of(r#"{"p": {"@date":null}}"#), ErrorCode::InvalidValue);
+    }
+
+    #[test]
+    fn a_well_formed_tagged_temporal_still_binds() {
+        let p = params_from_json(r#"{"p": {"@date":"2020-01-01"}}"#).expect("should bind");
+
+        assert!(matches!(p["p"], Val::Temporal(_)));
     }
 }

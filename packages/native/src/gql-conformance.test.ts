@@ -2520,15 +2520,22 @@ suite('GQL differential: param value validation (D2/D3)', () => {
   }
 
   // D3: a nested object / nested array is outside the LPG param model → both
-  // engines reject with E_INVALID_JSON (native's `params.rs` grammar).
+  // engines reject with E_INVALID_VALUE. Not E_INVALID_JSON: `{"a":1}` and
+  // `[[1]]` are well-formed JSON, and what they break is a rule about what a
+  // binding may HOLD. (They were reported as JSON errors until the three
+  // implementations of this rule — native's `params.rs`, the TS engine's
+  // validator, and the JS marshaller — were split into syntax vs value.)
   for (const [label, value] of [
     ['a nested object', { a: 1 }],
+    ['a nested object with a string value', { a: 'x' }],
     ['a nested array', [[1]]],
+    ['a malformed tagged temporal', { '@date': 'nope' }],
+    ['a tagged temporal with a non-string value', { '@date': 1 }],
   ] as const) {
-    test(`D3: ${label} param faults as E_INVALID_JSON on both engines`, () => {
+    test(`D3: ${label} param faults as E_INVALID_VALUE on both engines`, () => {
       const { ts, native } = both(`RETURN $x AS x`, { x: value });
       expect(native).toEqual(ts);
-      expect(ts).toEqual({ code: 'E_INVALID_JSON' });
+      expect(ts).toEqual({ code: 'E_INVALID_VALUE' });
     });
   }
 

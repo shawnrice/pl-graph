@@ -328,7 +328,7 @@ const assertParamModel = (name: string, value: unknown, inList = false): void =>
     if (inList) {
       throw new LenkeError(
         `parameter $${name} is a nested list; only a flat list of scalars is a valid param value`,
-        { code: ErrorCode.InvalidJson, details: { param: name } },
+        { code: ErrorCode.InvalidValue, details: { param: name } },
       );
     }
 
@@ -354,7 +354,7 @@ const assertParamModel = (name: string, value: unknown, inList = false): void =>
   throw new LenkeError(
     `parameter $${name} is outside the LPG param model: only a scalar, a flat list ` +
       `of scalars, or a tagged-temporal object is a valid param value`,
-    { code: ErrorCode.InvalidJson, details: { param: name } },
+    { code: ErrorCode.InvalidValue, details: { param: name } },
   );
 };
 

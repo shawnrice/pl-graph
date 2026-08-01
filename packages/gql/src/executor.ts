@@ -2894,9 +2894,12 @@ const isEffectivelyMissing = (v: unknown): boolean =>
  * null`), a revived tagged-temporal instance, or a FLAT list of those. Rejects:
  *   - a `bigint` → `E_INVALID_VALUE` (float64 model; native rejects it JS-side in
  *     `stringifyParams` before the FFI crossing)
- *   - a nested list, or a plain (non-temporal) object → `E_INVALID_JSON` (native:
+ *   - a nested list, or a plain (non-temporal) object → `E_INVALID_VALUE` (native:
  *     "nested arrays are not valid param values" / "the only valid object param
- *     value is a tagged temporal")
+ *     value is a tagged temporal"). These parse as JSON perfectly well and then
+ *     break a rule about what a binding may HOLD, so they are value errors, not
+ *     JSON ones — and on this engine a param is a JS object with no JSON in
+ *     sight. `E_INVALID_JSON` stays for a genuinely malformed document.
  * A tagged-temporal object is already a `Temporal` instance by this point
  * (`reviveParams` ran first), so it passes as a scalar — never mistaken for a
  * rejected plain object.
@@ -2958,7 +2961,7 @@ const validateParamScalar = (name: string, v: unknown): void => {
   throw new LenkeError(
     `parameter $${name} is outside the LPG param model: only a scalar, a flat list ` +
       `of scalars, or a tagged-temporal object is a valid param value`,
-    { code: ErrorCode.InvalidJson, details: { param: name } },
+    { code: ErrorCode.InvalidValue, details: { param: name } },
   );
 };
 
@@ -2967,7 +2970,7 @@ const validateParamValue = (name: string, v: unknown): void => {
     for (const el of v) {
       if (Array.isArray(el)) {
         throw new LenkeError(`parameter $${name}: nested arrays are not valid param values`, {
-          code: ErrorCode.InvalidJson,
+          code: ErrorCode.InvalidValue,
           details: { param: name },
         });
       }

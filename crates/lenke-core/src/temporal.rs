@@ -620,6 +620,17 @@ impl Temporal {
 
     /// Decode from a `@date`/`@datetime`/`@duration` JSON object key + its string
     /// value (the single-key tagged form). `None` if the key isn't a temporal tag.
+    /// Is `key` one of the tagged-temporal keys, independent of its value? Lets a
+    /// caller decide an object's SHAPE before it commits to reading the value.
+    pub fn is_json_tag(key: &str) -> bool {
+        key.strip_prefix('@').is_some_and(|tag| {
+            matches!(
+                tag,
+                "date" | "localtime" | "datetime" | "zoned_time" | "zoned_datetime" | "duration"
+            )
+        })
+    }
+
     pub fn from_json_tag(key: &str, s: &str) -> Option<Result<Self, String>> {
         let tag = key.strip_prefix('@')?;
         matches!(
