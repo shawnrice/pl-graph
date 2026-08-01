@@ -134,11 +134,11 @@ fn build(kinds: &[TempKind]) -> Graph {
         for k in kinds {
             props.push((k.key.to_string(), Value::Temporal((k.make)(j))));
         }
-        b.nodes.push(NodeRec {
-            id: format!("p{i}"),
-            labels: vec!["Person".to_string()],
+        b.nodes.push(NodeRec::owned(
+            format!("p{i}"),
+            vec!["Person".to_string()],
             props,
-        });
+        ));
     }
     b.finalize()
 }

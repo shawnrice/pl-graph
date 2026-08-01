@@ -48,21 +48,21 @@ fn build() -> Graph {
             vec.push(Value::Num(v));
         }
         props.push(("h".to_string(), Value::List(vec)));
-        b.nodes.push(NodeRec {
-            id: format!("n{i}"),
-            labels: vec!["N".to_string()],
+        b.nodes.push(NodeRec::owned(
+            format!("n{i}"),
+            vec!["N".to_string()],
             props,
-        });
+        ));
     }
     for i in 0..N {
         for _ in 0..DEG {
-            b.edges.push(EdgeRec {
-                src: format!("n{i}"),
-                dst: format!("n{}", rng.below(N)),
-                etype: "R".to_string(),
-                props: vec![],
-                id: None,
-            });
+            b.edges.push(EdgeRec::owned(
+                format!("n{i}"),
+                format!("n{}", rng.below(N)),
+                "R".to_string(),
+                vec![],
+                None,
+            ));
         }
     }
     b.finalize()

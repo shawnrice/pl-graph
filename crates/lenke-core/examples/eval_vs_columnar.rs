@@ -34,11 +34,11 @@ fn scalar_floor(data: &[f64], thr: f64) -> (u64, f64) {
 fn build() -> Graph {
     let mut b = Builder::default();
     for i in 0..N {
-        b.nodes.push(NodeRec {
-            id: format!("p{i}"),
-            labels: vec!["Person".to_string()],
-            props: vec![("age".to_string(), Value::Num((18 + (i % 62)) as f64))],
-        });
+        b.nodes.push(NodeRec::owned(
+            format!("p{i}"),
+            vec!["Person".to_string()],
+            vec![("age".to_string(), Value::Num((18 + (i % 62)) as f64))],
+        ));
     }
     b.finalize()
 }

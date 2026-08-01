@@ -1463,7 +1463,10 @@ mod tests {
         for c in &cases {
             rs.push_row([c.clone()]);
         }
-        let doc = crate::json::parse(&rs.to_json()).expect("hand-rolled JSON must parse");
+        // The parsed tree borrows its source, so the JSON text needs a binding
+        // rather than living as a temporary.
+        let json = rs.to_json();
+        let doc = crate::json::parse(&json).expect("hand-rolled JSON must parse");
         let rows = doc
             .get("rows")
             .and_then(crate::json::Json::as_array)

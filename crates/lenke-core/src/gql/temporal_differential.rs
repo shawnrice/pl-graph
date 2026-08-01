@@ -127,25 +127,25 @@ fn build(n: usize, seed: u64) -> Graph {
                 props.push((k.key.to_string(), Value::Temporal((k.make)(idx))));
             }
         }
-        b.nodes.push(NodeRec {
-            id: format!("p{i}"),
-            labels: vec!["T".to_string()],
+        b.nodes.push(NodeRec::owned(
+            format!("p{i}"),
+            vec!["T".to_string()],
             props,
-        });
+        ));
     }
     for i in 0..n {
-        b.edges.push(EdgeRec {
-            src: format!("p{i}"),
-            dst: format!("p{}", (i + 1) % n),
-            etype: "R".to_string(),
-            props: vec![(
+        b.edges.push(EdgeRec::owned(
+            format!("p{i}"),
+            format!("p{}", (i + 1) % n),
+            "R".to_string(),
+            vec![(
                 "ed".to_string(),
                 Value::Temporal(Temporal::Date(Date {
                     days: (i % 300) as i32,
                 })),
             )],
-            id: None,
-        });
+            None,
+        ));
     }
     b.finalize()
 }

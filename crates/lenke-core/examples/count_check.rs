@@ -31,10 +31,10 @@ fn build(n: usize, eper: usize) -> Graph {
         } else {
             vec!["Person".to_string()]
         };
-        b.nodes.push(NodeRec {
-            id: format!("p{i}"),
+        b.nodes.push(NodeRec::owned(
+            format!("p{i}"),
             labels,
-            props: vec![
+            vec![
                 ("age".to_string(), Value::Num((18 + (i % 62)) as f64)),
                 ("name".to_string(), Value::Str(format!("name{i}").into())),
                 (
@@ -42,18 +42,18 @@ fn build(n: usize, eper: usize) -> Graph {
                     Value::Str(format!("city{}", i % 50).into()),
                 ),
             ],
-        });
+        ));
     }
     let mut rng = Rng(0x1234_5678_9abc_def0);
     for i in 0..n {
         for _ in 0..eper {
-            b.edges.push(EdgeRec {
-                src: format!("p{i}"),
-                dst: format!("p{}", rng.below(n)),
-                etype: "KNOWS".to_string(),
-                props: vec![],
-                id: None,
-            });
+            b.edges.push(EdgeRec::owned(
+                format!("p{i}"),
+                format!("p{}", rng.below(n)),
+                "KNOWS".to_string(),
+                vec![],
+                None,
+            ));
         }
     }
     b.finalize()

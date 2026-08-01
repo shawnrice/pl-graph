@@ -6,18 +6,31 @@
 //! Object keys are de-duplicated last-value-wins (like `serde_json::Map`) and
 //! kept in first-seen order.
 
+use std::borrow::Cow;
+
 /// A parsed JSON value — the slice of `serde_json::Value` the decoders consume.
+///
+/// Strings BORROW from the input document whenever they can. A JSON string that
+/// contains no escape needs no transformation, and those are the overwhelming
+/// majority: ids, labels, property keys and most values arrive clean, so the
+/// parser hands out a slice of the caller's buffer instead of allocating and
+/// copying. Only a string carrying an escape has to be rebuilt, and it says so
+/// by being `Cow::Owned`.
+///
+/// This is where the allocation actually was. A decoder building an owned record
+/// out of an owned tree paid for every string twice — once into the tree, once
+/// copying out — and both were freed again immediately afterwards.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Json {
+pub(crate) enum Json<'a> {
     Null,
     Bool(bool),
     Num(f64),
-    Str(String),
+    Str(Cow<'a, str>),
     Arr(Vec<Self>),
-    Obj(Vec<(String, Self)>),
+    Obj(Vec<(Cow<'a, str>, Self)>),
 }
 
-impl Json {
+impl<'a> Json<'a> {
     pub(crate) fn as_str(&self) -> Option<&str> {
         match self {
             Self::Str(s) => Some(s),
@@ -42,7 +55,7 @@ impl Json {
             _ => None,
         }
     }
-    pub(crate) fn as_object(&self) -> Option<&[(String, Self)]> {
+    pub(crate) fn as_object(&self) -> Option<&[(Cow<'a, str>, Self)]> {
         match self {
             Self::Obj(o) => Some(o),
             _ => None,
@@ -64,17 +77,17 @@ impl Json {
 /// shape — the caller then treats the object as outside the LPG value model;
 /// `Some(Err)` if the tag matched but the ISO string is malformed.
 pub(crate) fn temporal_from_pairs(
-    pairs: &[(String, Json)],
+    pairs: &[(Cow<'_, str>, Json<'_>)],
 ) -> Option<Result<crate::temporal::Temporal, String>> {
     let [(k, v)] = pairs else { return None };
-    crate::temporal::Temporal::from_json_tag(k, v.as_str()?)
+    crate::temporal::Temporal::from_json_tag(k.as_ref(), v.as_str()?)
 }
 
 const MAX_DEPTH: usize = 128;
 
 /// Parse a complete JSON document. `Err(())` on any malformed input (the callers
 /// map it to their own `InvalidJson`-style error).
-pub(crate) fn parse(s: &str) -> Result<Json, ()> {
+pub(crate) fn parse(s: &str) -> Result<Json<'_>, ()> {
     let mut p = Parser {
         b: s.as_bytes(),
         i: 0,
@@ -95,7 +108,7 @@ struct Parser<'a> {
     depth: usize,
 }
 
-impl Parser<'_> {
+impl<'a> Parser<'a> {
     fn peek(&self) -> Option<u8> {
         self.b.get(self.i).copied()
     }
@@ -112,7 +125,7 @@ impl Parser<'_> {
         }
     }
 
-    fn value(&mut self) -> Result<Json, ()> {
+    fn value(&mut self) -> Result<Json<'a>, ()> {
         self.ws();
         match self.peek().ok_or(())? {
             b'n' => self.lit("null", Json::Null),
@@ -126,7 +139,7 @@ impl Parser<'_> {
         }
     }
 
-    fn lit(&mut self, kw: &str, val: Json) -> Result<Json, ()> {
+    fn lit(&mut self, kw: &str, val: Json<'a>) -> Result<Json<'a>, ()> {
         if self.b[self.i..].starts_with(kw.as_bytes()) {
             self.i += kw.len();
             Ok(val)
@@ -135,7 +148,7 @@ impl Parser<'_> {
         }
     }
 
-    fn array(&mut self) -> Result<Json, ()> {
+    fn array(&mut self) -> Result<Json<'a>, ()> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             return Err(());
@@ -161,13 +174,13 @@ impl Parser<'_> {
         Ok(Json::Arr(out))
     }
 
-    fn object(&mut self) -> Result<Json, ()> {
+    fn object(&mut self) -> Result<Json<'a>, ()> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             return Err(());
         }
         self.i += 1; // '{'
-        let mut out: Vec<(String, Json)> = Vec::new();
+        let mut out: Vec<(Cow<'a, str>, Json<'a>)> = Vec::new();
         self.ws();
         if self.peek() == Some(b'}') {
             self.i += 1;
@@ -200,7 +213,7 @@ impl Parser<'_> {
         Ok(Json::Obj(out))
     }
 
-    fn number(&mut self) -> Result<Json, ()> {
+    fn number(&mut self) -> Result<Json<'a>, ()> {
         let start = self.i;
         if self.peek() == Some(b'-') {
             self.i += 1;
@@ -243,13 +256,42 @@ impl Parser<'_> {
         text.parse::<f64>().map(Json::Num).map_err(|_| ())
     }
 
-    fn string(&mut self) -> Result<String, ()> {
+    fn string(&mut self) -> Result<Cow<'a, str>, ()> {
         self.i += 1; // opening quote
-        let mut out = String::new();
+                     // Scan the first run of ordinary bytes. If it ends at the closing quote,
+                     // the string needed no transformation and can be handed back as a slice of
+                     // the caller's buffer — no allocation, no copy. That is the common case by
+                     // a wide margin: ids, labels, keys and most values carry no escape.
+        let start = self.i;
+        while let Some(c) = self.peek() {
+            if c == b'"' || c == b'\\' || c < 0x20 {
+                break;
+            }
+            self.i += 1;
+        }
+
+        let first = std::str::from_utf8(&self.b[start..self.i]).map_err(|_| ())?;
+
+        if self.peek() == Some(b'"') {
+            self.i += 1;
+
+            return Ok(Cow::Borrowed(first));
+        }
+
+        // An escape (or an unescaped control char, which is an error). From here
+        // the string has to be rebuilt, so it becomes owned.
+        let mut out = String::with_capacity(first.len() + 16);
+
+        out.push_str(first);
         loop {
-            // Copy a run of ordinary bytes (a valid UTF-8 substring — breaks only
-            // at ASCII `"`, `\`, or a control byte, all of which are char boundaries).
+            match self.bump().ok_or(())? {
+                b'"' => return Ok(Cow::Owned(out)),
+                b'\\' => self.escape(&mut out)?,
+                _ => return Err(()), // an unescaped control char (< 0x20)
+            }
+
             let start = self.i;
+
             while let Some(c) = self.peek() {
                 if c == b'"' || c == b'\\' || c < 0x20 {
                     break;
@@ -257,11 +299,6 @@ impl Parser<'_> {
                 self.i += 1;
             }
             out.push_str(std::str::from_utf8(&self.b[start..self.i]).map_err(|_| ())?);
-            match self.bump().ok_or(())? {
-                b'"' => return Ok(out),
-                b'\\' => self.escape(&mut out)?,
-                _ => return Err(()), // an unescaped control char (< 0x20)
-            }
         }
     }
 
@@ -319,7 +356,7 @@ impl Parser<'_> {
 mod tests {
     use super::*;
 
-    fn ok(s: &str) -> Json {
+    fn ok(s: &str) -> Json<'_> {
         parse(s).unwrap()
     }
     fn bad(s: &str) -> bool {

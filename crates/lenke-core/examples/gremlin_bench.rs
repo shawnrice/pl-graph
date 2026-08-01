@@ -27,40 +27,40 @@ fn build() -> Graph {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let mut b = Builder::default();
     for i in 0..N {
-        b.nodes.push(NodeRec {
-            id: format!("p{i}"),
-            labels: vec!["Person".to_string()],
-            props: vec![
+        b.nodes.push(NodeRec::owned(
+            format!("p{i}"),
+            vec!["Person".to_string()],
+            vec![
                 ("name".to_string(), Value::Str(format!("name{i}").into())),
                 ("age".to_string(), Value::Num((18 + (i % 62)) as f64)),
             ],
-        });
+        ));
     }
     for j in 0..SOFTWARE {
-        b.nodes.push(NodeRec {
-            id: format!("s{j}"),
-            labels: vec!["Software".to_string()],
-            props: vec![("name".to_string(), Value::Str(format!("sw{j}").into()))],
-        });
+        b.nodes.push(NodeRec::owned(
+            format!("s{j}"),
+            vec!["Software".to_string()],
+            vec![("name".to_string(), Value::Str(format!("sw{j}").into()))],
+        ));
     }
     for i in 0..N {
         for _ in 0..KNOWS_PER {
-            b.edges.push(EdgeRec {
-                src: format!("p{i}"),
-                dst: format!("p{}", rng.below(N)),
-                etype: "KNOWS".to_string(),
-                props: vec![],
-                id: None,
-            });
+            b.edges.push(EdgeRec::owned(
+                format!("p{i}"),
+                format!("p{}", rng.below(N)),
+                "KNOWS".to_string(),
+                vec![],
+                None,
+            ));
         }
         if i % 2 == 0 {
-            b.edges.push(EdgeRec {
-                src: format!("p{i}"),
-                dst: format!("s{}", rng.below(SOFTWARE)),
-                etype: "CREATED".to_string(),
-                props: vec![],
-                id: None,
-            });
+            b.edges.push(EdgeRec::owned(
+                format!("p{i}"),
+                format!("s{}", rng.below(SOFTWARE)),
+                "CREATED".to_string(),
+                vec![],
+                None,
+            ));
         }
     }
     b.finalize()

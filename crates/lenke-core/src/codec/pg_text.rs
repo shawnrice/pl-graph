@@ -411,16 +411,20 @@ pub fn decode(input: &str) -> Graph {
             let to = parse_id(&tokens[1]);
             let (labels, props) = parse_labels_props(&tokens[2..]);
             b.edges.push(EdgeRec {
-                src: from,
-                dst: to,
-                etype: labels.into_iter().next().unwrap_or_default(),
-                props,
+                src: from.into(),
+                dst: to.into(),
+                etype: labels.into_iter().next().unwrap_or_default().into(),
+                props: crate::graph::owned_props(props),
                 id: None, // the .pg textual format has no edge-id slot
             });
         } else {
             let id = parse_id(&tokens[0]);
             let (labels, props) = parse_labels_props(&tokens[1..]);
-            b.nodes.push(NodeRec { id, labels, props });
+            b.nodes.push(NodeRec {
+                id: id.into(),
+                labels: crate::graph::owned_labels(labels),
+                props: crate::graph::owned_props(props),
+            });
         }
     }
     b.finalize()

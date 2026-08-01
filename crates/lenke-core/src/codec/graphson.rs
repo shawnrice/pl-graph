@@ -79,7 +79,7 @@ fn decode_typed(node: &Json) -> CodeResult<Value> {
     Ok(match node {
         Json::Null => Value::Null,
         Json::Bool(b) => Value::Bool(*b),
-        Json::Str(s) => Value::Str(s.as_str().into()),
+        Json::Str(s) => Value::Str(s.as_ref().into()),
         Json::Num(n) => Value::Num(*n),
         Json::Arr(a) => Value::List(a.iter().map(decode_typed).collect::<CodeResult<Vec<_>>>()?),
         Json::Obj(_) => {
@@ -237,7 +237,7 @@ pub fn encode(g: &Graph) -> String {
 }
 
 /// The `value` slot inside a `g:VertexProperty` / `g:Property` `@value` object.
-fn inner_value(prop_value: &Json) -> Option<&Json> {
+fn inner_value<'a, 'b>(prop_value: &'b Json<'a>) -> Option<&'b Json<'a>> {
     prop_value.get("@value").and_then(|v| v.get("value"))
 }
 
@@ -282,7 +282,11 @@ pub fn decode(input: &str) -> CodeResult<Graph> {
                     }
                 }
             }
-            b.nodes.push(NodeRec { id, labels, props });
+            b.nodes.push(NodeRec {
+                id: id.into(),
+                labels: crate::graph::owned_labels(labels),
+                props,
+            });
         }
     }
 
@@ -309,11 +313,11 @@ pub fn decode(input: &str) -> CodeResult<Graph> {
             }
             let id = e.get("id").map(crate::codec::json_id);
             b.edges.push(EdgeRec {
-                src,
-                dst,
-                etype,
+                src: src.into(),
+                dst: dst.into(),
+                etype: etype.into(),
                 props,
-                id,
+                id: id.map(Into::into),
             });
         }
     }

@@ -72,7 +72,7 @@ fn normalize(g: &Graph) -> String {
     lines.join("\n")
 }
 
-fn corpus() -> Json {
+fn corpus() -> Json<'static> {
     json::parse(CORPUS).expect("conformance corpus is valid JSON")
 }
 

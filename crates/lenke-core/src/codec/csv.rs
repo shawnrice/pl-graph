@@ -789,9 +789,9 @@ pub fn decode(input: &str) -> CodeResult<Graph> {
             let id = unguard_field(row.first().map(|c| c.text.as_str()).unwrap_or(""));
             let labels = split_labels(row.get(1).map(|c| c.text.as_str()).unwrap_or(""));
             b.nodes.push(NodeRec {
-                id,
-                labels,
-                props: props_from_row(row, &prop_cols, 2),
+                id: id.into(),
+                labels: crate::graph::owned_labels(labels),
+                props: crate::graph::owned_props(props_from_row(row, &prop_cols, 2)),
             });
         }
     }
@@ -811,11 +811,11 @@ pub fn decode(input: &str) -> CodeResult<Graph> {
                 .next()
                 .unwrap_or_default();
             b.edges.push(EdgeRec {
-                src,
-                dst,
-                etype,
-                props: props_from_row(row, &prop_cols, 4),
-                id,
+                src: src.into(),
+                dst: dst.into(),
+                etype: etype.into(),
+                props: crate::graph::owned_props(props_from_row(row, &prop_cols, 4)),
+                id: id.map(Into::into),
             });
         }
     }

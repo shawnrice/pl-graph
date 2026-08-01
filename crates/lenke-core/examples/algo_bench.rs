@@ -37,22 +37,22 @@ impl Rng {
 fn build(n: usize, eper: usize) -> Graph {
     let mut b = Builder::default();
     for i in 0..n {
-        b.nodes.push(NodeRec {
-            id: format!("p{i}"),
-            labels: vec!["N".to_string()],
-            props: vec![],
-        });
+        b.nodes.push(NodeRec::owned(
+            format!("p{i}"),
+            vec!["N".to_string()],
+            vec![],
+        ));
     }
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     for i in 0..n {
         for _ in 0..eper {
-            b.edges.push(EdgeRec {
-                src: format!("p{i}"),
-                dst: format!("p{}", rng.below(n)),
-                etype: "KNOWS".to_string(),
-                props: vec![("w".to_string(), Value::Num(rng.unit() + 0.001))],
-                id: None,
-            });
+            b.edges.push(EdgeRec::owned(
+                format!("p{i}"),
+                format!("p{}", rng.below(n)),
+                "KNOWS".to_string(),
+                vec![("w".to_string(), Value::Num(rng.unit() + 0.001))],
+                None,
+            ));
         }
     }
     b.finalize()

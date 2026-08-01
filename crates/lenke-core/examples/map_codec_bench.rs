@@ -19,10 +19,10 @@ fn map(pairs: Vec<(&str, Value)>) -> Value {
 fn build_maps() -> Graph {
     let mut b = Builder::default();
     for i in 0..N {
-        b.nodes.push(NodeRec {
-            id: format!("p{i}"),
-            labels: vec!["P".to_string()],
-            props: vec![(
+        b.nodes.push(NodeRec::owned(
+            format!("p{i}"),
+            vec!["P".to_string()],
+            vec![(
                 "meta".to_string(),
                 map(vec![
                     ("a", Value::Num((i % 100) as f64)),
@@ -33,7 +33,7 @@ fn build_maps() -> Graph {
                     ("tier", Value::Num((i % 5) as f64)),
                 ]),
             )],
-        });
+        ));
     }
     b.finalize()
 }
@@ -42,10 +42,10 @@ fn build_maps() -> Graph {
 fn build_scalars() -> Graph {
     let mut b = Builder::default();
     for i in 0..N {
-        b.nodes.push(NodeRec {
-            id: format!("p{i}"),
-            labels: vec!["P".to_string()],
-            props: vec![
+        b.nodes.push(NodeRec::owned(
+            format!("p{i}"),
+            vec!["P".to_string()],
+            vec![
                 ("a".to_string(), Value::Num((i % 100) as f64)),
                 ("b".to_string(), Value::Num((i % 7) as f64)),
                 ("c".to_string(), Value::Bool(i % 2 == 0)),
@@ -56,7 +56,7 @@ fn build_scalars() -> Graph {
                 ),
                 ("tier".to_string(), Value::Num((i % 5) as f64)),
             ],
-        });
+        ));
     }
     b.finalize()
 }
