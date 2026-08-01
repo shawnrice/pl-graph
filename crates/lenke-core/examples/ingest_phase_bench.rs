@@ -29,8 +29,25 @@
 //!
 //! So "fewer allocations" does not automatically mean "faster" here, and the
 //! 15-36% above — measured by standing records up with `format!`, which also
-//! formats — is an upper bound rather than an expected gain. Worth prototyping
-//! the borrow on the NDJSON path alone before committing five codecs to it.
+//! formats — is an upper bound rather than an expected gain.
+//!
+//! The borrow was then done (`Json<'a>` holds `Cow<'a, str>`, records pass it
+//! through) and delivered 13-24%.
+//!
+//! What is LEFT after it, and why it is not worth taking: string VALUES still
+//! allocate an `Arc` each, because `Value::Str` is `Arc<str>`. Measured
+//! directly — 400k `Arc<str>::from` plus their drop costs 11.5 ms at 8-byte
+//! values, 13.6 ms at 14 bytes, 16.6 ms at 40 bytes. Against a 220-275 ms
+//! decode of the same shape that is **~5%**, not the 13% the pre-borrow numbers
+//! suggested: most of that 13% was the id/label/key copying, which the borrow
+//! already removed. (The repeated-string-vs-number gap was 36 ms before the
+//! borrow and is 7.6 ms after it.)
+//!
+//! Buying that ~5% means putting a lifetime on `Value` — the core stored and
+//! result type, carried through query evaluation, Gremlin, the algorithms and
+//! the FFI — and growing it from a 16-byte `Arc<str>` to a 24-byte `Cow`. That
+//! is a far wider blast radius than the parser change for a fifth of the
+//! return. Not worth it; measure again if `Value` is being reworked anyway.
 use std::time::Instant;
 
 /// One materialized record, shaped like what the decoder builds: an owned id,
