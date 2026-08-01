@@ -129,10 +129,17 @@ update, append, and three interleaved read/write shapes — drawn from the
 applications this engine has been exercised against. Reported as operations per
 second on all three engines.
 
-Each read appears twice, unindexed and indexed, because the difference is not
-marginal: a point lookup goes from 876 to 95k ops/sec on the TS engine and from
-3.6k to 164k on the Rust one. A `WHERE u.name = $n` with no index is a full scan
-that reads exactly like a lookup, which is easy to benchmark by accident.
+Every workload runs TWICE, without indexes and with — the `(-)` and `(+)`
+columns. The difference is not marginal: a point lookup goes from 922 to 112k
+ops/sec on the TS engine and 3.5k to 173k on the Rust one, because a
+`WHERE u.name = $n` with no index is a full scan that reads exactly like a
+lookup. Benchmarking only one column is how a scan gets mistaken for a lookup.
+
+Both directions carry signal. Reads gain a seek; **writes pay maintenance** —
+appending a node carrying two indexed keys costs 249k -> 228k ops/sec on ffi and
+214k -> 167k on wasm. (Watch for the trap: an append whose properties are all
+UNindexed pays nothing, so that row looked like indexes were free on writes until
+the fixture was changed to carry one.)
 
 **It found a 60x planner cliff.** These two are semantically identical:
 

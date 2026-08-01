@@ -134,8 +134,6 @@ type Workload = {
   name: string;
   /** One operation. `i` is the operation index, so each does different work. */
   op: (e: Engine, g: unknown, i: number) => void;
-  /** Vertex property keys to index before the batch runs. */
-  indexes?: string[];
   /** Fewer operations for workloads that are inherently expensive. */
   scale?: number;
 };
@@ -191,8 +189,12 @@ const WORKLOADS: Workload[] = [
       }),
   },
   {
+    // Carries an INDEXED key deliberately. An append whose properties are all
+    // unindexed pays no maintenance, so the indexed and unindexed columns would
+    // come out the same and the row would look like indexes are free on writes.
     name: 'write: append node',
-    op: (e, g, i) => void e.query(g, `INSERT (:Event {id: 'ev${i}', seq: ${i}})`),
+    op: (e, g, i) =>
+      void e.query(g, `INSERT (:Event {name: 'ev${i}', score: ${i % 100}, seq: ${i}})`),
   },
   {
     // THE interleaved shape: one write, then one read, repeatedly. A write
@@ -224,25 +226,13 @@ const WORKLOADS: Workload[] = [
     },
   },
   {
-    // The SAME point lookup with the property indexed. Without this the engine
-    // scans every vertex, which is what the un-suffixed rows above measure —
-    // easy to mistake for a lookup because the query reads like one.
-    name: 'read: point lookup (indexed)',
-    indexes: ['name'],
-    op: (e, g, i) =>
-      void e.query(g, 'MATCH (u:User) WHERE u.name = $n RETURN u.score AS s', {
-        n: `user${i % GRAPH}`,
-      }),
-  },
-  {
     // The SAME check with the anchor written inline rather than in a trailing
     // WHERE. On the Rust engine these two rows differ by ~60x: a WHERE-form
     // anchor followed by a traversal stops seeding from the index and falls back
     // to a scan, while the inline form keeps the seek. The pure-TS engine seeds
     // both. Two rows rather than one, so the cliff cannot regress unseen — and
     // so nobody reads the slow row as the cost of the check itself.
-    name: 'read: permission check (indexed, inline anchor)',
-    indexes: ['name'],
+    name: 'read: permission check (inline anchor)',
     op: (e, g, i) =>
       void e.query(
         g,
@@ -251,43 +241,11 @@ const WORKLOADS: Workload[] = [
       ),
   },
   {
-    // Authorization with the anchor indexed: the seek replaces the scan, and the
-    // traversal from it is bounded by the user's own degree.
-    name: 'read: permission check (indexed, WHERE)',
-    indexes: ['name'],
-    op: (e, g, i) =>
-      void e.query(
-        g,
-        'MATCH (u:User)-[:MEMBER_OF]->(gr:Team)-[:VIEWER]->(r:Resource) WHERE u.name = $n RETURN count(*) AS c',
-        { n: `user${i % GRAPH}` },
-      ),
-  },
-  {
-    name: 'read: 2-hop recommendation (indexed)',
-    indexes: ['name'],
-    op: (e, g, i) =>
-      void e.query(
-        g,
-        'MATCH (u:User {name: $n})-[:FOLLOWS]->()-[:FOLLOWS]->(x) RETURN count(*) AS c',
-        { n: `user${i % GRAPH}` },
-      ),
-  },
-  {
-    name: 'write: property update (indexed)',
-    indexes: ['name'],
-    op: (e, g, i) =>
-      void e.query(g, 'MATCH (u:User) WHERE u.name = $n SET u.score = $v', {
-        n: `user${i % GRAPH}`,
-        v: i % 1000,
-      }),
-  },
-  {
     // Writes batched into one transaction, against the same writes committing
     // individually above. A transaction records an undo entry per write and
     // defers its constraint checks to commit, so this is the cost of that
     // bookkeeping amortized over a batch.
     name: 'write: 100 updates in a transaction',
-    indexes: ['name'],
     scale: 100,
     op: (e, g, i) =>
       e.transaction(g, () => {
@@ -303,7 +261,6 @@ const WORKLOADS: Workload[] = [
     // Money-flow shapes, on the follow graph as the transfer network: fan-out
     // over a bounded number of hops, the pattern a structuring check computes.
     name: 'analytic: fan-out spread 1-3 hops',
-    indexes: ['name'],
     scale: 20,
     op: (e, g, i) =>
       void e.query(
@@ -315,7 +272,6 @@ const WORKLOADS: Workload[] = [
   {
     // Does value return to where it started? The cycle test a layering check runs.
     name: 'analytic: cycle detection 2-4 hops',
-    indexes: ['name'],
     scale: 20,
     op: (e, g, i) =>
       void e.query(
@@ -369,8 +325,16 @@ if (engines.length === 0) {
   process.exit(1);
 }
 
+/**
+ * The property keys indexed in the "with indexes" pass.
+ *
+ * `name` anchors most reads; `score` is written by the update workloads and read
+ * by the dedup lookup, so it shows index MAINTENANCE cost as well as seek gain.
+ */
+const INDEXED_KEYS = ['name', 'score'];
+
 /** Operations per second for one workload, best of `BATCHES` batches. */
-const rate = (e: Engine, w: Workload): number => {
+const rate = (e: Engine, w: Workload, indexed: boolean): number => {
   let bestOps = 0;
 
   for (let b = 0; b < BATCHES; b++) {
@@ -379,8 +343,10 @@ const rate = (e: Engine, w: Workload): number => {
     const g = e.load(fixture);
 
     try {
-      for (const key of w.indexes ?? []) {
-        e.index(g, 'vertex', key);
+      if (indexed) {
+        for (const key of INDEXED_KEYS) {
+          e.index(g, 'vertex', key);
+        }
       }
 
       const ops = Math.max(1, Math.floor(OPS / (w.scale ?? 1)));
@@ -404,8 +370,11 @@ const rate = (e: Engine, w: Workload): number => {
   return bestOps;
 };
 
-const base = engines[0].name;
 const fmt = (n: number): string => {
+  if (Number.isNaN(n)) {
+    return 'n/a';
+  }
+
   if (n >= 1e6) {
     return `${(n / 1e6).toFixed(2)}M`;
   }
@@ -420,40 +389,32 @@ const fmt = (n: number): string => {
 console.log(
   `\n${GRAPH} users, ${OPS} ops/batch, best of ${BATCHES}. Engines: ${engines.map((e) => e.name).join(', ')}`,
 );
-console.log(`Operations per second, higher is better. Ratios against ${base}.\n`);
+console.log(
+  `Operations per second, higher is better. (-) no indexes, (+) indexed on ${INDEXED_KEYS.join(', ')}.\n`,
+);
 
-const ratioHeads = engines
-  .slice(1)
-  .map((e) => `${e.name}/${base}`.padStart(12))
-  .join('');
-const header = `${['workload'.padEnd(32), ...engines.map((e) => e.name.padStart(10))].join('')}  ${ratioHeads}`;
+const cols = engines.flatMap((e) => [`${e.name}(-)`, `${e.name}(+)`]);
+const header = ['workload'.padEnd(34), ...cols.map((c) => c.padStart(10))].join('');
 
 console.log(header);
 console.log('-'.repeat(header.length));
 
 for (const w of WORKLOADS) {
-  const rates = engines.map((e) => {
-    try {
-      return rate(e, w);
-    } catch (err) {
-      // Report rather than silently printing `n/a` — a workload that cannot run
-      // is a bug in the workload or a gap in an engine, and either is worth
-      // seeing.
-      console.error(
-        `  ! ${w.name} [${e.name}]: ${(err as { code?: string }).code ?? ''} ${(err as Error).message?.slice(0, 120)}`,
-      );
+  const cells = engines.flatMap((e) =>
+    [false, true].map((indexed) => {
+      try {
+        return fmt(rate(e, w, indexed)).padStart(10);
+      } catch (err) {
+        // Reported rather than silently `n/a` — a workload that cannot run is a
+        // bug in the workload or a gap in an engine, and both are worth seeing.
+        console.error(
+          `  ! ${w.name} [${e.name}${indexed ? '+' : '-'}]: ${(err as { code?: string }).code ?? ''} ${(err as Error).message?.slice(0, 100)}`,
+        );
 
-      return Number.NaN;
-    }
-  });
-  const cells = rates.map((r) => (Number.isNaN(r) ? 'n/a' : fmt(r)).padStart(10));
-  const ratios = rates
-    .slice(1)
-    .map((r) =>
-      Number.isNaN(r) || Number.isNaN(rates[0])
-        ? ''.padStart(12)
-        : `${(r / rates[0]).toFixed(1)}x`.padStart(12),
-    );
+        return 'n/a'.padStart(10);
+      }
+    }),
+  );
 
-  console.log(`${w.name.padEnd(32)}${cells.join('')}  ${ratios.join('')}`);
+  console.log(`${w.name.padEnd(34)}${cells.join('')}`);
 }
