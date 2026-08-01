@@ -18,6 +18,8 @@
 //! single type is its first `:Label`.
 
 use crate::codec::{element_props, node_labels};
+use std::borrow::Cow;
+
 use crate::graph::{Builder, EdgeRec, Graph, NodeRec, Value};
 
 // ---------------------------------------------------------------------------
@@ -183,45 +185,58 @@ pub fn encode(g: &Graph) -> String {
 // ---------------------------------------------------------------------------
 
 /// Split a line into tokens, keeping double-quoted spans (with `\` escapes) whole.
-fn tokenize(line: &str) -> Vec<String> {
+fn tokenize(line: &str) -> Vec<&str> {
+    // Byte scan, emitting slices of `line`. Every delimiter this format uses —
+    // space, tab, `"`, `\` — is ASCII, and a UTF-8 continuation byte is always
+    // >= 0x80, so no multi-byte character can be mistaken for one. Collecting the
+    // line into a `Vec<char>` (an allocation and a 4x expansion PER LINE) and then
+    // building each token by pushing chars into a fresh `String` was pure
+    // overhead: the scanner only ever needed to look at one byte and the next.
+    let b = line.as_bytes();
     let mut tokens = Vec::new();
-    let mut current = String::new();
+    let mut i = 0;
+    let mut start = 0;
     let mut started = false;
     let mut in_quote = false;
-    let chars: Vec<char> = line.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
+
+    while i < b.len() {
+        let c = b[i];
+
         if in_quote {
-            current.push(c);
-            if c == '\\' && i + 1 < chars.len() {
-                current.push(chars[i + 1]);
+            // A backslash escapes the next byte. Skipping one byte rather than one
+            // char is safe here for the same reason as above — the trailing bytes
+            // of a multi-byte character cannot match a delimiter.
+            if c == b'\\' && i + 1 < b.len() {
                 i += 2;
                 continue;
-            } else if c == '"' {
+            }
+            if c == b'"' {
                 in_quote = false;
             }
             i += 1;
             continue;
         }
-        if c == '"' {
+        if c == b'"' {
+            if !started {
+                start = i;
+                started = true;
+            }
             in_quote = true;
-            started = true;
-            current.push(c);
-        } else if c == ' ' || c == '\t' {
+        } else if c == b' ' || c == b'\t' {
             if started {
-                tokens.push(std::mem::take(&mut current));
+                tokens.push(&line[start..i]);
                 started = false;
             }
-        } else {
-            current.push(c);
+        } else if !started {
+            start = i;
             started = true;
         }
         i += 1;
     }
     if started {
-        tokens.push(current);
+        tokens.push(&line[start..]);
     }
+
     tokens
 }
 
@@ -279,30 +294,43 @@ fn parse_scalar(raw: &str) -> Value {
 }
 
 /// Pull labels and properties (repeated keys → lists) from the trailing tokens.
-fn parse_labels_props(tokens: &[String]) -> (Vec<String>, Vec<(String, Value)>) {
+/// A line's labels plus its first-seen-ordered properties, both borrowed from the
+/// input where no unescaping was needed.
+type LabelsAndProps<'a> = (Vec<Cow<'a, str>>, Vec<(Cow<'a, str>, Value)>);
+
+fn parse_labels_props<'a>(tokens: &[&'a str]) -> LabelsAndProps<'a> {
     let mut labels = Vec::new();
-    // preserve first-seen key order, collecting repeats
-    let mut order: Vec<String> = Vec::new();
-    let mut collected: std::collections::HashMap<String, Vec<Value>> =
-        std::collections::HashMap::new();
+    // First-seen key order, with repeats collected into a list.
+    //
+    // This used to keep a `HashMap<String, Vec<Value>>` plus a parallel order
+    // vector, so EVERY line paid for a hash map, a hash per key, a clone of each
+    // key for the order vector, and a `Vec` per value — all to serve a repeated
+    // key, which real lines essentially never have. Now the common path just
+    // pushes, and only a line that actually repeats a key allocates anything
+    // extra.
+    let mut props: Vec<(Cow<'a, str>, Value)> = Vec::new();
+    // Indices whose value has been promoted to an accumulating list. Stays empty
+    // unless a key repeats — which is also why promotion cannot simply look for a
+    // `Value::List`, since a single value is allowed to BE a list.
+    let mut promoted: Vec<usize> = Vec::new();
+
     for token in tokens {
         if let Some(rest) = token.strip_prefix(':') {
             // `:label` or `:"quoted label"` — unquote the latter.
-            labels.push(if rest.starts_with('"') {
-                parse_id(rest)
-            } else {
-                rest.to_string()
-            });
+            labels.push(parse_id(rest));
             continue;
         }
+
         // Find the key:value separator, skipping a quoted key's own colons.
         let sep = if token.starts_with('"') {
             let end = quoted_span_end(token, 0);
+
             // A whole quoted span with no trailing `:value` is a stray id-shaped
             // token, not a property; ignore it.
             if end >= token.len() || token.as_bytes()[end] != b':' {
                 continue;
             }
+
             end
         } else {
             match token.find(':') {
@@ -312,25 +340,25 @@ fn parse_labels_props(tokens: &[String]) -> (Vec<String>, Vec<(String, Value)>) 
         };
         let key = parse_id(&token[..sep]); // unquotes a quoted key, else verbatim
         let value = parse_scalar(&token[sep + 1..]);
-        if let Some(list) = collected.get_mut(&key) {
-            list.push(value);
-        } else {
-            order.push(key.clone());
-            collected.insert(key, vec![value]);
+
+        // Property counts per line are single digits, so a linear scan beats
+        // hashing and allocates nothing.
+        match props.iter().position(|(k, _)| *k == key) {
+            Some(pos) if promoted.contains(&pos) => {
+                if let Value::List(items) = &mut props[pos].1 {
+                    items.push(value);
+                }
+            }
+            Some(pos) => {
+                let prev = std::mem::replace(&mut props[pos].1, Value::Null);
+
+                props[pos].1 = Value::List(vec![prev, value]);
+                promoted.push(pos);
+            }
+            None => props.push((key, value)),
         }
     }
-    let props = order
-        .into_iter()
-        .map(|k| {
-            let mut vals = collected.remove(&k).unwrap();
-            let v = if vals.len() == 1 {
-                vals.pop().unwrap()
-            } else {
-                Value::List(vals)
-            };
-            (k, v)
-        })
-        .collect();
+
     (labels, props)
 }
 
@@ -363,18 +391,35 @@ fn is_id_token(t: &str) -> bool {
 }
 
 /// A second token that is an id (not a `:label` / `key:value`) marks an edge line.
-fn is_edge_line(tokens: &[String]) -> bool {
-    tokens.len() >= 2 && is_id_token(&tokens[1])
+fn is_edge_line(tokens: &[&str]) -> bool {
+    tokens.len() >= 2 && is_id_token(tokens[1])
 }
 
 /// Read an id token, unquoting + unescaping it if it was quoted.
-fn parse_id(raw: &str) -> String {
+///
+/// Borrows whenever the token needs no rewriting: an unquoted token verbatim, and
+/// a quoted one whose body carries no escape (just the quotes stripped). Only a
+/// token with an actual escape is rebuilt.
+fn parse_id(raw: &str) -> Cow<'_, str> {
     let Some(rest) = raw.strip_prefix('"') else {
-        return raw.to_string();
+        return Cow::Borrowed(raw);
     };
     let body = rest.strip_suffix('"').unwrap_or(rest);
+
+    if !body.contains('\\') {
+        return Cow::Borrowed(body);
+    }
+
+    Cow::Owned(unescape(body))
+}
+
+/// Undo the encode escapes: `\n`/`\r`/`\t` decode to the control chars, `\\`/`\"`
+/// to themselves, and any other `\x` to a literal `x` (lenient for foreign `.pg`).
+/// Must match the TS codec exactly.
+fn unescape(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut chars = body.chars();
+
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
@@ -388,6 +433,7 @@ fn parse_id(raw: &str) -> String {
             out.push(c);
         }
     }
+
     out
 }
 
@@ -407,24 +453,20 @@ pub fn decode(input: &str) -> Graph {
             continue;
         }
         if is_edge_line(&tokens) {
-            let from = parse_id(&tokens[0]);
-            let to = parse_id(&tokens[1]);
+            let from = parse_id(tokens[0]);
+            let to = parse_id(tokens[1]);
             let (labels, props) = parse_labels_props(&tokens[2..]);
             b.edges.push(EdgeRec {
-                src: from.into(),
-                dst: to.into(),
-                etype: labels.into_iter().next().unwrap_or_default().into(),
-                props: crate::graph::owned_props(props),
+                src: from,
+                dst: to,
+                etype: labels.into_iter().next().unwrap_or_default(),
+                props,
                 id: None, // the .pg textual format has no edge-id slot
             });
         } else {
-            let id = parse_id(&tokens[0]);
+            let id = parse_id(tokens[0]);
             let (labels, props) = parse_labels_props(&tokens[1..]);
-            b.nodes.push(NodeRec {
-                id: id.into(),
-                labels: crate::graph::owned_labels(labels),
-                props: crate::graph::owned_props(props),
-            });
+            b.nodes.push(NodeRec { id, labels, props });
         }
     }
     b.finalize()
@@ -461,6 +503,62 @@ a b :KNOWS since:2020";
             Value::List(vec![Value::Str("x".into()), Value::Str("y".into())]),
         );
         assert_eq!(g2.edge_count(), 1);
+    }
+
+    #[test]
+    fn a_key_repeated_three_times_collects_in_order() {
+        // Two occurrences promote a scalar to a list; a third has to APPEND to
+        // the list already there rather than nest a second one. Only the
+        // two-occurrence case was covered before the decoder stopped collecting
+        // every property through a per-line hash map.
+        let g = decode("a t:x t:y t:z");
+        let a = g.vid.get("a").unwrap() as usize;
+
+        assert_eq!(
+            g.props.value(a, "t", &g.strs),
+            Value::List(vec![
+                Value::Str("x".into()),
+                Value::Str("y".into()),
+                Value::Str("z".into()),
+            ]),
+        );
+    }
+
+    #[test]
+    fn repeats_keep_first_seen_key_order_when_interleaved() {
+        // The repeated key keeps the position of its FIRST occurrence, and the
+        // key that appeared between the repeats keeps its own.
+        let g = decode("a t:x other:1 t:y last:2");
+        let a = g.vid.get("a").unwrap() as usize;
+
+        assert_eq!(
+            g.props.value(a, "t", &g.strs),
+            Value::List(vec![Value::Str("x".into()), Value::Str("y".into())]),
+        );
+        assert_eq!(g.props.value(a, "other", &g.strs), Value::Num(1.0));
+        assert_eq!(g.props.value(a, "last", &g.strs), Value::Num(2.0));
+
+        // And the whole thing survives a round trip.
+        let g2 = decode(&encode(&g));
+        let a2 = g2.vid.get("a").unwrap() as usize;
+
+        assert_eq!(
+            g2.props.value(a2, "t", &g2.strs),
+            Value::List(vec![Value::Str("x".into()), Value::Str("y".into())]),
+        );
+    }
+
+    #[test]
+    fn a_quoted_repeated_key_promotes_too() {
+        // The quoted-key path unquotes before comparing, so `"t t"` twice is one
+        // key — the comparison happens on the DECODED key, not the raw token.
+        let g = decode("a \"t t\":x \"t t\":y");
+        let a = g.vid.get("a").unwrap() as usize;
+
+        assert_eq!(
+            g.props.value(a, "t t", &g.strs),
+            Value::List(vec![Value::Str("x".into()), Value::Str("y".into())]),
+        );
     }
 
     #[test]
