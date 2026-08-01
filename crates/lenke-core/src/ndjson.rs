@@ -860,6 +860,22 @@ mod tests {
     /// overlap saves. Measured at 1M alone it would have looked harmless, and at
     /// 200k alone like a serious regression. Neither is the whole answer.
     ///
+    /// Reordering the adjacency FILL was tried against rows 6 and 7 and rejected.
+    /// Decomposing the 1M penalty gives a ceiling: src sorted + dst sorted 1255
+    /// ms, dst scattered +271, src scattered +163, both +335. A stable counting
+    /// sort by endpoint — filling each direction in ascending vertex order
+    /// instead of edge order — recovered 27 ms of that 335 (1230 -> 1203,
+    /// ~2%) and nothing on already-clustered edges. The sort's own permutation
+    /// pass scatters writes across a cursor array and reads back through
+    /// `resolved`, which costs about what the ordered writes save. Not worth ~50
+    /// lines of stable-counting-sort in the middle of graph construction, where
+    /// getting it subtly wrong reorders traversal silently.
+    ///
+    /// The structural fix — CSR adjacency — is off the table for a different and
+    /// better reason: it was tried historically and collapsed once the graph
+    /// started changing. `interleaved_write_and_traverse_is_independent_of_graph_
+    /// size` in the GQL tests exists to keep it that way.
+    ///
     /// `INGEST_N=3000000,5000000` overrides the default sweep.
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]
