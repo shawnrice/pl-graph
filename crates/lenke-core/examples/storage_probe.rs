@@ -32,22 +32,22 @@ fn build_graph(nv: usize, deg: usize) -> Graph {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let mut b = Builder::default();
     for i in 0..nv {
-        b.nodes.push(NodeRec {
-            id: format!("v{i}"),
-            labels: vec!["N".to_string()],
-            props: vec![],
-        });
+        b.nodes.push(NodeRec::owned(
+            format!("v{i}"),
+            vec!["N".to_string()],
+            vec![],
+        ));
     }
     let types = ["A", "B", "C"];
     for i in 0..nv {
         for k in 0..deg {
-            b.edges.push(EdgeRec {
-                src: format!("v{i}"),
-                dst: format!("v{}", rng.below(nv)),
-                etype: types[k % 3].to_string(),
-                props: vec![],
-                id: None,
-            });
+            b.edges.push(EdgeRec::owned(
+                format!("v{i}"),
+                format!("v{}", rng.below(nv)),
+                types[k % 3].to_string(),
+                vec![],
+                None,
+            ));
         }
     }
     b.finalize()

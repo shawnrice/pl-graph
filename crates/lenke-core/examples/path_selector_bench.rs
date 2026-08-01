@@ -41,29 +41,29 @@ impl Rng {
 fn weighted_graph(n: usize, deg: usize) -> Graph {
     let mut rng = Rng(0x1234_5678_9abc_def0);
     let mut b = Builder::default();
-    b.nodes.push(NodeRec {
-        id: "s0".to_string(),
-        labels: vec!["Seed".to_string()],
-        props: vec![("id".to_string(), Value::Str("s0".into()))],
-    });
+    b.nodes.push(NodeRec::owned(
+        "s0".to_string(),
+        vec!["Seed".to_string()],
+        vec![("id".to_string(), Value::Str("s0".into()))],
+    ));
     for i in 0..n {
-        b.nodes.push(NodeRec {
-            id: format!("n{i}"),
-            labels: vec!["N".to_string()],
-            props: vec![("id".to_string(), Value::Num(i as f64))],
-        });
+        b.nodes.push(NodeRec::owned(
+            format!("n{i}"),
+            vec!["N".to_string()],
+            vec![("id".to_string(), Value::Num(i as f64))],
+        ));
     }
     // The seed points at `deg` random N vertices; every N vertex points at `deg`
     // more, so a `{1,4}` walk fans out ~deg^k.
     let out = |b: &mut Builder, src: String, rng: &mut Rng| {
         for _ in 0..deg {
-            b.edges.push(EdgeRec {
-                src: src.clone(),
-                dst: format!("n{}", rng.below(n)),
-                etype: "R".to_string(),
-                props: vec![("w".to_string(), Value::Num(rng.unit()))],
-                id: None,
-            });
+            b.edges.push(EdgeRec::owned(
+                src.clone(),
+                format!("n{}", rng.below(n)),
+                "R".to_string(),
+                vec![("w".to_string(), Value::Num(rng.unit()))],
+                None,
+            ));
         }
     };
     out(&mut b, "s0".to_string(), &mut rng);
@@ -79,22 +79,22 @@ fn weighted_graph(n: usize, deg: usize) -> Graph {
 fn skip_chain(m: usize) -> Graph {
     let mut b = Builder::default();
     for i in 0..m {
-        b.nodes.push(NodeRec {
-            id: format!("c{i}"),
-            labels: vec!["C".to_string()],
-            props: vec![("id".to_string(), Value::Num(i as f64))],
-        });
+        b.nodes.push(NodeRec::owned(
+            format!("c{i}"),
+            vec!["C".to_string()],
+            vec![("id".to_string(), Value::Num(i as f64))],
+        ));
     }
     for i in 0..m {
         for step in 1..=2 {
             if i + step < m {
-                b.edges.push(EdgeRec {
-                    src: format!("c{i}"),
-                    dst: format!("c{}", i + step),
-                    etype: "R".to_string(),
-                    props: vec![],
-                    id: None,
-                });
+                b.edges.push(EdgeRec::owned(
+                    format!("c{i}"),
+                    format!("c{}", i + step),
+                    "R".to_string(),
+                    vec![],
+                    None,
+                ));
             }
         }
     }

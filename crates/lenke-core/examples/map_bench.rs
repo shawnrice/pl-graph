@@ -43,10 +43,10 @@ fn build() -> Graph {
     let mut b = Builder::default();
     for i in 0..N {
         let age = 18 + (i % 62);
-        b.nodes.push(NodeRec {
-            id: format!("p{i}"),
-            labels: vec!["Person".to_string()],
-            props: vec![
+        b.nodes.push(NodeRec::owned(
+            format!("p{i}"),
+            vec!["Person".to_string()],
+            vec![
                 ("age".to_string(), Value::Num(age as f64)),
                 ("name".to_string(), Value::Str(format!("name{i}").into())),
                 (
@@ -62,17 +62,17 @@ fn build() -> Graph {
                     ]),
                 ),
             ],
-        });
+        ));
     }
     for i in 0..N {
         for _ in 0..KNOWS_PER {
-            b.edges.push(EdgeRec {
-                src: format!("p{i}"),
-                dst: format!("p{}", rng.below(N)),
-                etype: "KNOWS".to_string(),
-                props: vec![],
-                id: None,
-            });
+            b.edges.push(EdgeRec::owned(
+                format!("p{i}"),
+                format!("p{}", rng.below(N)),
+                "KNOWS".to_string(),
+                vec![],
+                None,
+            ));
         }
     }
     b.finalize()

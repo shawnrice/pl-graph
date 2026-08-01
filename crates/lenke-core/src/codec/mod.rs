@@ -139,7 +139,7 @@ pub(crate) fn json_to_value(j: &Json) -> CodeResult<Value> {
                 Value::Null
             }
         }
-        Json::Str(s) => Value::Str(Arc::from(s.as_str())),
+        Json::Str(s) => Value::Str(Arc::from(s.as_ref())),
         Json::Arr(a) => Value::List(
             a.iter()
                 .map(json_to_value)
@@ -154,7 +154,7 @@ pub(crate) fn json_to_value(j: &Json) -> CodeResult<Value> {
             None => Value::Map(
                 pairs
                     .iter()
-                    .map(|(k, v)| Ok((Arc::from(k.as_str()), json_to_value(v)?)))
+                    .map(|(k, v)| Ok((Arc::from(k.as_ref()), json_to_value(v)?)))
                     .collect::<CodeResult<Vec<_>>>()?,
             ),
         },
@@ -165,7 +165,7 @@ pub(crate) fn json_to_value(j: &Json) -> CodeResult<Value> {
 /// JSON text — matching serde_json's `Display`).
 pub(crate) fn json_id(j: &Json) -> String {
     match j {
-        Json::Str(s) => s.clone(),
+        Json::Str(s) => s.clone().into_owned(),
         Json::Num(n) => crate::jsonfmt::js_number(*n),
         Json::Bool(b) => b.to_string(),
         _ => "null".to_string(),
@@ -190,7 +190,7 @@ pub(crate) fn json_props(field: Option<&Json>) -> CodeResult<Vec<(String, Value)
     match field.and_then(Json::as_object) {
         Some(m) => m
             .iter()
-            .map(|(k, v)| Ok((k.clone(), json_to_value(v)?)))
+            .map(|(k, v)| Ok((k.clone().into_owned(), json_to_value(v)?)))
             .collect(),
         None => Ok(Vec::new()),
     }

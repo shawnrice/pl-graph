@@ -28,10 +28,10 @@ fn map(pairs: &[(&str, Value)]) -> Value {
 fn build() -> Graph {
     let mut b = Builder::default();
     for i in 0..N {
-        b.nodes.push(NodeRec {
-            id: format!("p{i}"),
-            labels: vec!["P".to_string()],
-            props: vec![(
+        b.nodes.push(NodeRec::owned(
+            format!("p{i}"),
+            vec!["P".to_string()],
+            vec![(
                 "meta".to_string(),
                 map(&[
                     ("a", Value::Num((i % 100) as f64)),
@@ -42,7 +42,7 @@ fn build() -> Graph {
                     ("tier", Value::Num((i % 5) as f64)),
                 ]),
             )],
-        });
+        ));
     }
     b.finalize()
 }

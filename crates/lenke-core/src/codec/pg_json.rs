@@ -125,9 +125,9 @@ pub fn decode(input: &str) -> CodeResult<Graph> {
             return Err(shape("node 'properties' must be an object"));
         }
         b.nodes.push(NodeRec {
-            id: o.get("id").map(json_id).unwrap_or_default(),
-            labels: json_str_array(o.get("labels")),
-            props: json_props(o.get("properties"))?,
+            id: o.get("id").map(json_id).unwrap_or_default().into(),
+            labels: crate::graph::owned_labels(json_str_array(o.get("labels"))),
+            props: crate::graph::owned_props(json_props(o.get("properties"))?),
         });
     }
 
@@ -156,11 +156,11 @@ pub fn decode(input: &str) -> CodeResult<Graph> {
                     .unwrap_or("")
                     .to_string();
                 b.edges.push(EdgeRec {
-                    src: o.get("from").map(json_id).unwrap_or_default(),
-                    dst: o.get("to").map(json_id).unwrap_or_default(),
-                    etype,
-                    props: json_props(o.get("properties"))?,
-                    id: o.get("id").map(json_id),
+                    src: o.get("from").map(json_id).unwrap_or_default().into(),
+                    dst: o.get("to").map(json_id).unwrap_or_default().into(),
+                    etype: etype.into(),
+                    props: crate::graph::owned_props(json_props(o.get("properties"))?),
+                    id: o.get("id").map(json_id).map(Into::into),
                 });
             }
         }

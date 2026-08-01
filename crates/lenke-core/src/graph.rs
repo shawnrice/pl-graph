@@ -16,6 +16,7 @@
 //! use [`Properties::is_present`] for presence, not "value == Null". Vertices
 //! and edges share the same [`Properties`] store type.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -2595,33 +2596,82 @@ fn to_mixed(col: &Column, strs: &Dict) -> Column {
 // Builder: accumulate node/edge records, then finalize into the columnar form.
 // ---------------------------------------------------------------------------
 
-pub struct NodeRec {
-    pub id: String,
-    pub labels: Vec<String>,
-    pub props: Vec<(String, Value)>,
+/// One element's property list as the builder sees it: its dense index plus a
+/// borrowed view of its key/value pairs.
+type PropItem<'a, 'b> = (usize, &'b [(Cow<'a, str>, Value)]);
+
+/// Lift an owned label list into the record shape. The records borrow from their
+/// source document where they can (NDJSON hands out slices of the input), but a
+/// codec that has to unescape, split or synthesize a name owns its strings and
+/// says so here.
+pub fn owned_labels(v: Vec<String>) -> Vec<Cow<'static, str>> {
+    v.into_iter().map(Cow::Owned).collect()
 }
 
-pub struct EdgeRec {
-    pub src: String,
-    pub dst: String,
-    pub etype: String,
-    pub props: Vec<(String, Value)>,
+/// The property-list counterpart of [`owned_labels`].
+pub fn owned_props(v: Vec<(String, Value)>) -> Vec<(Cow<'static, str>, Value)> {
+    v.into_iter().map(|(k, val)| (Cow::Owned(k), val)).collect()
+}
+
+pub struct NodeRec<'a> {
+    pub id: Cow<'a, str>,
+    pub labels: Vec<Cow<'a, str>>,
+    pub props: Vec<(Cow<'a, str>, Value)>,
+}
+
+pub struct EdgeRec<'a> {
+    pub src: Cow<'a, str>,
+    pub dst: Cow<'a, str>,
+    pub etype: Cow<'a, str>,
+    pub props: Vec<(Cow<'a, str>, Value)>,
     /// Optional external string id. The dense edge index is the edge's canonical
     /// identity; this is an opt-in overlay (set by codecs that carry edge ids) so
     /// a user-assigned id survives a serialization round-trip. `None` ⇒ id-less.
-    pub id: Option<String>,
+    pub id: Option<Cow<'a, str>>,
+}
+
+impl NodeRec<'static> {
+    /// A record that owns its strings — for a caller that synthesizes names
+    /// rather than slicing them out of a document (fixtures, benches, and the
+    /// codecs that unescape).
+    pub fn owned(id: String, labels: Vec<String>, props: Vec<(String, Value)>) -> Self {
+        Self {
+            id: Cow::Owned(id),
+            labels: owned_labels(labels),
+            props: owned_props(props),
+        }
+    }
+}
+
+impl EdgeRec<'static> {
+    /// The edge counterpart of [`NodeRec::owned`].
+    pub fn owned(
+        src: String,
+        dst: String,
+        etype: String,
+        props: Vec<(String, Value)>,
+        id: Option<String>,
+    ) -> Self {
+        Self {
+            src: Cow::Owned(src),
+            dst: Cow::Owned(dst),
+            etype: Cow::Owned(etype),
+            props: owned_props(props),
+            id: id.map(Cow::Owned),
+        }
+    }
 }
 
 #[derive(Default)]
-pub struct Builder {
-    pub nodes: Vec<NodeRec>,
-    pub edges: Vec<EdgeRec>,
+pub struct Builder<'a> {
+    pub nodes: Vec<NodeRec<'a>>,
+    pub edges: Vec<EdgeRec<'a>>,
 }
 
 /// Build a typed property store for `len` elements from `(index, props)` items.
 /// A key's column type is inferred from its first non-null value; values that
 /// disagree land in `Mixed` (lossless). Shared by the vertex and edge builds.
-fn build_props(len: usize, items: &[(usize, &[(String, Value)])], strs: &mut Dict) -> Properties {
+fn build_props(len: usize, items: &[PropItem], strs: &mut Dict) -> Properties {
     let mut props = Properties {
         keys: Dict::default(),
         cols: Vec::new(),
@@ -2672,7 +2722,7 @@ fn build_props(len: usize, items: &[(usize, &[(String, Value)])], strs: &mut Dic
     props
 }
 
-impl Builder {
+impl Builder<'_> {
     /// Like [`finalize`](Self::finalize), but enforces a **declared-nodes**
     /// contract: every edge endpoint must be a declared node. Returns
     /// `MissingVertex` instead of silently fabricating a phantom vertex (the
@@ -2680,11 +2730,11 @@ impl Builder {
     /// legitimately created on demand). The JSON document codecs (pg-json,
     /// graphson) use this so a dangling edge is an error, mirroring the TS codecs.
     pub fn finalize_strict(self) -> CodeResult<Graph> {
-        let declared: HashSet<&str> = self.nodes.iter().map(|n| n.id.as_str()).collect();
+        let declared: HashSet<&str> = self.nodes.iter().map(|n| n.id.as_ref()).collect();
         for e in &self.edges {
-            let missing = if !declared.contains(e.src.as_str()) {
+            let missing = if !declared.contains(e.src.as_ref()) {
                 Some(&e.src)
-            } else if !declared.contains(e.dst.as_str()) {
+            } else if !declared.contains(e.dst.as_ref()) {
                 Some(&e.dst)
             } else {
                 None
@@ -2727,14 +2777,14 @@ impl Builder {
         // Borrowed-`&str` sets keep this allocation-free on the common path.
         let keep_node: Vec<bool> = {
             let mut seen: HashSet<&str> = HashSet::with_capacity(nodes.len());
-            nodes.iter().map(|nd| seen.insert(nd.id.as_str())).collect()
+            nodes.iter().map(|nd| seen.insert(nd.id.as_ref())).collect()
         };
         let kept_edges: Vec<&EdgeRec> = {
             let mut seen: HashSet<&str> = HashSet::with_capacity(edges.len());
             edges
                 .iter()
                 .filter(|e| match &e.id {
-                    Some(id) => seen.insert(id.as_str()),
+                    Some(id) => seen.insert(id.as_ref()),
                     None => true, // id-less edges get a unique e{index}; never dup
                 })
                 .collect()
@@ -2795,7 +2845,7 @@ impl Builder {
 
         // (3) Vertex property columns. `strs` is graph-wide, shared with edges.
         let mut strs = Dict::default();
-        let node_items: Vec<(usize, &[(String, Value)])> = nodes
+        let node_items: Vec<PropItem> = nodes
             .iter()
             .enumerate()
             .filter(|(idx, _)| keep_node[*idx])
@@ -2873,14 +2923,14 @@ impl Builder {
                 etype: t,
             });
             if let Some(id) = &ed.id {
-                let arc: Arc<str> = Arc::from(id.as_str());
+                let arc: Arc<str> = Arc::from(id.as_ref());
                 eid_fwd.insert(i as u32, arc.clone());
                 eid_rev.insert(arc, i as u32);
             }
         }
 
         // (5) Edge property columns — same machinery, indexed by edge index.
-        let edge_items: Vec<(usize, &[(String, Value)])> = kept_edges
+        let edge_items: Vec<PropItem> = kept_edges
             .iter()
             .enumerate()
             .map(|(i, ed)| (i, ed.props.as_slice()))

@@ -8,6 +8,7 @@
 //! sorted keys on store); a single-key `{"@date":…}` object is still a tagged
 //! temporal scalar.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::error::{CodeError, CodeResult};
@@ -35,7 +36,7 @@ fn to_value(j: &Json) -> CodeResult<Value> {
                 Value::Null
             }
         }
-        Json::Str(s) => Value::Str(Arc::from(s.as_str())),
+        Json::Str(s) => Value::Str(Arc::from(s.as_ref())),
         Json::Arr(a) => Value::List(a.iter().map(to_value).collect::<CodeResult<Vec<_>>>()?),
         // A tagged temporal `{"@date":"…"}` (single key) round-trips as a scalar;
         // any other JSON object is a record/map value (canonicalized on store).
@@ -46,7 +47,7 @@ fn to_value(j: &Json) -> CodeResult<Value> {
             None => Value::Map(
                 pairs
                     .iter()
-                    .map(|(k, v)| Ok((Arc::from(k.as_str()), to_value(v)?)))
+                    .map(|(k, v)| Ok((Arc::from(k.as_ref()), to_value(v)?)))
                     .collect::<CodeResult<Vec<_>>>()?,
             ),
         },
@@ -55,7 +56,7 @@ fn to_value(j: &Json) -> CodeResult<Value> {
 
 /// Decode a JSON object's `properties` field into core property pairs, or an
 /// empty vec when absent. A nested-object value becomes a map/record property.
-fn props_of(obj: &Json) -> CodeResult<Vec<(String, Value)>> {
+fn props_of<'a>(obj: &Json<'a>) -> CodeResult<Vec<(Cow<'a, str>, Value)>> {
     match obj.get("properties").and_then(Json::as_object) {
         Some(m) => m
             .iter()
@@ -67,18 +68,18 @@ fn props_of(obj: &Json) -> CodeResult<Vec<(String, Value)>> {
 
 /// A JSON id field as a string (a string verbatim; a number/bool/null via its
 /// JSON text — matching serde_json's `Display`).
-fn as_id(j: &Json) -> String {
+fn as_id<'a>(j: &Json<'a>) -> Cow<'a, str> {
     match j {
         Json::Str(s) => s.clone(),
-        Json::Num(n) => crate::jsonfmt::js_number(*n),
-        Json::Bool(b) => b.to_string(),
-        _ => "null".to_string(),
+        Json::Num(n) => Cow::Owned(crate::jsonfmt::js_number(*n)),
+        Json::Bool(b) => Cow::Owned(b.to_string()),
+        _ => Cow::Borrowed("null"),
     }
 }
 
-enum Rec {
-    Node(NodeRec),
-    Edge(EdgeRec),
+enum Rec<'a> {
+    Node(NodeRec<'a>),
+    Edge(EdgeRec<'a>),
 }
 
 /// Parse one line. A blank line is skipped (`Ok(None)`); everything else is
@@ -86,7 +87,7 @@ enum Rec {
 /// or an unknown/missing `type` → `InvalidShape`. (Previously these all silently
 /// skipped the line, which could mask corrupt fixtures since `decode` is the
 /// crate's test-fixture loader.)
-fn parse_line(line: &str) -> CodeResult<Option<Rec>> {
+fn parse_line(line: &str) -> CodeResult<Option<Rec<'_>>> {
     let line = line.trim();
     if line.is_empty() {
         return Ok(None);
@@ -115,7 +116,10 @@ fn parse_line(line: &str) -> CodeResult<Option<Rec>> {
                 .and_then(Json::as_array)
                 .map(|a| {
                     a.iter()
-                        .filter_map(|x| x.as_str().map(String::from))
+                        .filter_map(|x| match x {
+                            Json::Str(s) => Some(s.clone()),
+                            _ => None,
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -128,15 +132,19 @@ fn parse_line(line: &str) -> CodeResult<Option<Rec>> {
         Some("edge") => {
             let src = j.get("from").map(as_id).unwrap_or_default();
             let dst = j.get("to").map(as_id).unwrap_or_default();
-            let etype = j
+            let etype = match j
                 .get("labels")
                 .and_then(Json::as_array)
                 .and_then(<[Json]>::first)
-                .and_then(Json::as_str)
-                .unwrap_or("")
-                .to_string();
+            {
+                Some(Json::Str(s)) => s.clone(),
+                _ => Cow::Borrowed(""),
+            };
             // Optional external edge id (absent ⇒ id-less, stays lazy).
-            let id = j.get("id").and_then(Json::as_str).map(String::from);
+            let id = match j.get("id") {
+                Some(Json::Str(s)) => Some(s.clone()),
+                _ => None,
+            };
             Rec::Edge(EdgeRec {
                 src,
                 dst,
@@ -217,9 +225,19 @@ pub fn append(graph: &mut Graph, text: &str) -> CodeResult<MergeReport> {
     for r in &recs {
         if let Rec::Node(n) = r {
             if graph.vertex_by_id(&n.id).is_some() {
-                report.nodes_skipped.push(n.id.clone()); // first-wins: existing kept
+                report.nodes_skipped.push(n.id.to_string()); // first-wins: existing kept
             } else {
-                graph.add_vertex_with_id(&n.id, &n.labels, n.props.clone());
+                // The incremental path writes through the graph's owned mutation
+                // API, so the borrowed record is materialized here. Only the bulk
+                // `decode` path builds columns directly and keeps the borrow.
+                let labels: Vec<String> = n.labels.iter().map(ToString::to_string).collect();
+                let props: Vec<(String, Value)> = n
+                    .props
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect();
+
+                graph.add_vertex_with_id(&n.id, &labels, props);
                 report.nodes_added += 1;
             }
         }
@@ -228,13 +246,18 @@ pub fn append(graph: &mut Graph, text: &str) -> CodeResult<MergeReport> {
         if let Rec::Edge(e) = r {
             if let Some(id) = &e.id {
                 if graph.edge_by_id(id).is_some() {
-                    report.edges_skipped.push(id.clone()); // duplicate id → drop
+                    report.edges_skipped.push(id.to_string()); // duplicate id → drop
                     continue;
                 }
             }
             let from = resolve_or_create(graph, &e.src, &mut report);
             let to = resolve_or_create(graph, &e.dst, &mut report);
-            let ei = graph.add_edge(from, to, &e.etype, e.props.clone());
+            let eprops: Vec<(String, Value)> = e
+                .props
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+            let ei = graph.add_edge(from, to, &e.etype, eprops);
             if let Some(id) = &e.id {
                 graph.set_edge_id(ei, id);
             }
