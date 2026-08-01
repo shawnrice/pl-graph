@@ -18,6 +18,10 @@
 //! clean).
 use std::time::Instant;
 
+/// One materialized record, shaped like what the decoder builds: an owned id,
+/// owned labels, and an owned key/value pair per property.
+type Record = (String, Vec<String>, Vec<(String, String)>);
+
 fn doc(nodes: usize, props: usize, edges: bool) -> String {
     let mut lines: Vec<String> = (0..nodes)
         .map(|i| {
@@ -63,7 +67,7 @@ fn main() {
         // String per id, per label, per property key and per string value — the
         // exact allocation profile borrowing from the input would remove.
         let t = Instant::now();
-        let recs: Vec<(String, Vec<String>, Vec<(String, String)>)> = (0..nodes)
+        let recs: Vec<Record> = (0..nodes)
             .map(|i| {
                 (
                     format!("v{i}"),
