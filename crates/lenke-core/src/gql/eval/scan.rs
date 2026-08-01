@@ -569,7 +569,7 @@ pub(super) fn build_scan(
     // scanning the whole edge-type bucket (O(E)). Same decision as
     // `try_parallel_scan`, so the serial and parallel paths seed identically.
     if let Some(oriented) = try_orient_node_seed(graph, ctx, path, where_) {
-        let endpoint = scan_start_seed(graph, ctx, &oriented.start, scope_len);
+        let endpoint = scan_start_seed(graph, ctx, &oriented.start, scope_len, where_);
         return expand_scan(graph, ctx, &oriented, scope_len, endpoint, cap);
     }
     // Edge-first: a single segment with an indexed edge-property hint → seek the
@@ -596,7 +596,7 @@ pub(super) fn build_scan(
         }
     }
     // Seed the start-node endpoints, then expand the segments into columns.
-    let endpoint = scan_start_seed(graph, ctx, &path.start, scope_len);
+    let endpoint = scan_start_seed(graph, ctx, &path.start, scope_len, where_);
     expand_scan(graph, ctx, path, scope_len, endpoint, cap)
 }
 
@@ -609,6 +609,7 @@ pub(super) fn scan_start_seed(
     ctx: &Ctx,
     start: &CNode,
     scope_len: usize,
+    where_: Option<&CExpr>,
 ) -> Vec<u32> {
     let start_check = !start.props.is_empty() || start.where_.is_some();
     let mut sb = Binding(vec![None; scope_len.max(1)]);
@@ -636,14 +637,28 @@ pub(super) fn scan_start_seed(
             endpoint.push(vi);
             true
         };
-        // An indexed inline `{k: lit}` / `{k: $param}` pins the start to a handful
-        // of candidates — seek them rather than walking the whole label bucket.
-        // Without this a traversal from an indexed anchor costs O(label bucket)
-        // instead of O(degree): `(s:Employee {id:$x})-[:T]->(t)` scanned every
-        // Employee to reach one vertex. The per-vertex label + props re-check above
-        // still runs, so the seek only ever *narrows* the same candidate set and
-        // seed order is unchanged for the unindexed path.
-        match node_index_seed(graph, ctx, start, None) {
+        // An indexed anchor pins the start to a handful of candidates — seek them
+        // rather than walking the whole label bucket. Without this a traversal
+        // from an indexed anchor costs O(label bucket) instead of O(degree):
+        // `(s:Employee {id:$x})-[:T]->(t)` scanned every Employee to reach one.
+        //
+        // A WHERE counts as an anchor, not just an inline `{k: lit}` /
+        // `{k: $param}` — both the node's own and the surrounding clause's.
+        //
+        // The clause WHERE used to be dropped here: this function never received
+        // it, so `(u:User {name:$n})-[:R]->(x)` seeked while the identical
+        // `(u:User)-[:R]->(x) WHERE u.name = $n` scanned the whole label bucket.
+        // Measured at 60x on a 5k-vertex graph, and the WHERE form is the one
+        // people write. Both forms already seeked when the node stood ALONE; only
+        // the traversal case lost it, which is what made it easy to miss.
+        //
+        // Taking a conjunct of the clause WHERE as a seed is sound because it must
+        // hold for every matching row, and `prop_index_hint` only descends
+        // conjunctions — a disjunction yields no hint rather than a wrong one.
+        // The full WHERE is still applied downstream, and the per-vertex label +
+        // props re-check below still runs, so the seek only ever *narrows* the
+        // candidate set.
+        match node_index_seed(graph, ctx, start, where_.or(start.where_.as_ref())) {
             Some(cands) => {
                 for vi in cands {
                     keep(vi);

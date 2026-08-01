@@ -1525,7 +1525,10 @@ pub(super) fn reach_seed_vertices(
         }
         true
     };
-    match node_index_seed(graph, ctx, start, None) {
+    // The node's own WHERE anchors the seek just as an inline `{k: v}` does; see
+    // the note in `scan_start_seed`. `satisfies` above re-checks it either way, so
+    // seeking only narrows the candidates.
+    match node_index_seed(graph, ctx, start, start.where_.as_ref()) {
         Some(cands) => {
             for vi in cands {
                 if graph.is_vertex_live(vi) && ok(graph, vi, &mut b) {
@@ -2012,7 +2015,7 @@ pub(super) fn try_parallel_scan(
     // wouldn't orient (an index / edge-property seek), so serial and parallel seed
     // from the identical end and produce the identical row order.
     let oriented = try_orient_node_seed(graph, &ctx, path, where_.as_ref())?;
-    let start_ids = scan_start_seed(graph, &ctx, &oriented.start, *scope_len);
+    let start_ids = scan_start_seed(graph, &ctx, &oriented.start, *scope_len, where_);
     const MIN_SEEDS: usize = 8_192;
     if start_ids.len() < MIN_SEEDS {
         return None;

@@ -432,3 +432,94 @@ fn idx_multi_anchor_mixed_seed_and_scan() {
         vec![vec![s("marko"), s("lop")], vec![s("marko"), s("ripple")]]
     );
 }
+
+// ---------------------------------------------------------------------------
+// A clause WHERE anchors the seek, not only an inline `{k: v}`.
+//
+// `scan_start_seed` never received the surrounding clause's WHERE, so
+// `(u:P {k:$x})-[:R]->(y)` seeked while the identical
+// `(u:P)-[:R]->(y) WHERE u.k = $x` scanned the whole label bucket — 60x on a 5k
+// graph, on the form people actually write. Both seeked correctly when the node
+// stood ALONE, which is what made it easy to miss.
+// ---------------------------------------------------------------------------
+
+/// A star: one hub with `n` spokes, every spoke carrying a distinct `k`.
+fn star(n: usize) -> Graph {
+    let mut lines =
+        vec![r#"{"type":"node","id":"hub","labels":["H"],"properties":{}}"#.to_string()];
+
+    for i in 0..n {
+        lines.push(format!(
+            r#"{{"type":"node","id":"s{i}","labels":["P"],"properties":{{"k":"key{i}"}}}}"#
+        ));
+        lines.push(format!(
+            r#"{{"type":"edge","id":"e{i}","labels":["R"],"from":"s{i}","to":"hub","properties":{{}}}}"#
+        ));
+    }
+
+    crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes")
+}
+
+#[test]
+fn clause_where_anchors_a_traversal_seek() {
+    let mut g = star(200);
+
+    g.create_vertex_index("k");
+
+    // Both forms must find the one spoke, and the WHERE form is the one that
+    // used to fall back to a scan.
+    let inline = rows(&mut g, "MATCH (u:P {k: 'key7'})-[:R]->(h:H) RETURN u.k");
+    let where_ = rows(
+        &mut g,
+        "MATCH (u:P)-[:R]->(h:H) WHERE u.k = 'key7' RETURN u.k",
+    );
+
+    assert_eq!(inline, vec![vec![s("key7")]]);
+    assert_eq!(
+        where_, inline,
+        "the WHERE form must return what the inline form does"
+    );
+}
+
+#[test]
+fn clause_where_seek_agrees_with_the_unindexed_scan() {
+    let mut plain = star(200);
+    let mut indexed = star(200);
+
+    indexed.create_vertex_index("k");
+
+    for q in [
+        "MATCH (u:P)-[:R]->(h:H) WHERE u.k = 'key3' RETURN u.k",
+        "MATCH (u:P)-[:R]->(h:H) WHERE u.k = 'missing' RETURN u.k",
+        // A conjunction: only the indexed conjunct can seed, the rest filters.
+        "MATCH (u:P)-[:R]->(h:H) WHERE u.k = 'key9' AND h.id IS NULL RETURN u.k",
+        // A DISJUNCTION must not seed — seeding one arm would drop the other's
+        // matches, so this is the case where a wrong hint shows up as wrong rows.
+        "MATCH (u:P)-[:R]->(h:H) WHERE u.k = 'key1' OR u.k = 'key2' RETURN u.k",
+    ] {
+        let mut a = rows(&mut plain, q);
+        let mut b = rows(&mut indexed, q);
+
+        a.sort_by(|x, y| cmp_val(&x[0], &y[0]));
+        b.sort_by(|x, y| cmp_val(&x[0], &y[0]));
+
+        assert_eq!(a, b, "index changed the answer for `{q}`");
+    }
+}
+
+#[test]
+fn clause_where_seek_survives_a_negated_or_absent_key() {
+    let mut plain = star(50);
+    let mut indexed = star(50);
+
+    indexed.create_vertex_index("k");
+
+    for q in [
+        // `<>` is not seekable; it must still return every non-match.
+        "MATCH (u:P)-[:R]->(h:H) WHERE u.k <> 'key1' RETURN count(*) AS c",
+        // A key the index does not cover at all.
+        "MATCH (u:P)-[:R]->(h:H) WHERE u.id = 's4' RETURN count(*) AS c",
+    ] {
+        assert_eq!(rows(&mut plain, q), rows(&mut indexed, q), "for `{q}`");
+    }
+}
