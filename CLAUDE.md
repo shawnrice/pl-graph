@@ -19,22 +19,24 @@ the write penalty — when `storage_probe` already did all of it, better.
 Add a new one only when the question genuinely is not covered, and add it to the
 index when you do.
 
-### Two backends, two harnesses
+### Three engines, two harnesses
 
 Rust examples measure the **native** build only. They compile for
-`wasm32-unknown-unknown` but cannot run there: `Instant::now()` panics (no
-clock), there is no stdout, and there is no runner.
+`wasm32-unknown-unknown` but cannot run there — `Instant::now()` panics (no
+clock), no stdout, no runner — and they cannot reach the pure-TS engine at all.
 
-To measure **wasm** — or to compare backends — use the JS harness:
+For **wasm** or **pure-TS**, or to compare engines:
 
 ```
-cd packages/native && bun run bench            # ffi vs wasm, side by side
-BENCH_BACKENDS=wasm bun run bench              # one backend
-BENCH_N=1000000 bun run bench                  # bigger workload
+cd packages/native && bun run bench          # ts, ffi and wasm side by side
+BENCH_ENGINES=ts,wasm bun run bench
+BENCH_N=1000000 bun run bench
 ```
 
-It drives the same workloads through whichever backend is asked for, which is
-also the only way anyone reaches wasm in production.
+Roughly: the Rust core is 1.5-4x pure-TS depending on workload, and wasm gives
+up about a third of that. The gap is widest on edge-heavy ingest and traversal —
+which is where most optimization work lands, so those wins do not reach pure-TS
+users. Check both when changing anything shared.
 
 ### Before trusting a number
 

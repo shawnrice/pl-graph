@@ -74,32 +74,45 @@ conclusion was drawn and committed.
   after other shapes and inherits their allocator state. Anything under ~10%
   needs its own isolated harness.
 
-## Measuring wasm
+## Measuring wasm and the pure-TS engine
 
-Nothing here measures the wasm build. These examples compile for
-`wasm32-unknown-unknown` but cannot RUN there: `Instant::now()` panics (that
-target has no clock), there is no stdout, and there is no runner. A green
-`cargo build --target wasm32-unknown-unknown --example …` proves nothing.
+Nothing here reaches either. These examples compile for
+`wasm32-unknown-unknown` but cannot RUN there — `Instant::now()` panics (that
+target has no clock), there is no stdout, and there is no runner, so a green
+`cargo build --target wasm32-unknown-unknown --example …` proves nothing. And the
+pure-TS engine is a separate implementation no Rust benchmark can touch at all.
 
-The wasm build is measured the only way it is ever used — from JS, through a
-backend:
+Both are reachable from one JS harness, through the same workloads:
 
 ```
 cd packages/native
-bun run bench                      # ffi vs wasm, side by side
-BENCH_BACKENDS=wasm bun run bench  # one backend
-BENCH_N=1000000 bun run bench      # bigger workload
+bun run bench                        # ts, ffi and wasm side by side
+BENCH_ENGINES=ts,wasm bun run bench
+BENCH_N=1000000 bun run bench        # bigger workload
 ```
 
-That harness covers ingest, all five codecs both ways, and representative query
-shapes. As of writing, wasm runs at roughly 0.93-1.5x of ffi depending on the
-workload — and part of the decode gap is threads rather than codegen, since the
-parallel decoder falls back to serial on a target with no threads.
+It covers ingest, all five codecs both directions, and representative query
+shapes. As of writing, at 20k nodes, relative to pure-TS:
+
+|                              | ffi        | wasm       |
+| ---------------------------- | ---------- | ---------- |
+| decode ndjson (nodes)        | 0.49x      | 0.62x      |
+| decode ndjson (5 edges/node) | 0.24x      | 0.36x      |
+| encode (five codecs)         | 0.39-0.63x | 0.56-0.87x |
+| query: count / group         | 0.33-0.35x | 0.51-0.53x |
+| query: 1-hop traversal       | 0.23x      | 0.34x      |
+
+So the Rust core is 1.5-4x faster than pure-TS depending on the workload, and
+wasm gives up perhaps a third of that advantage. The gap is widest exactly where
+this repo has been optimizing — edge-heavy ingest and traversal — which is worth
+remembering: those wins do not reach pure-TS users.
+
+Part of the decode gap is threads rather than codegen: decode defaults to the
+parallel path and only ffi has any, so wasm and TS both run it serially.
 
 ## Known gaps
 
-- **The TS engine has no benchmarks at all.** Every number here is the Rust core.
-  Pure-TS users get none of these results, and nothing would catch a regression
-  there.
 - **The FFI boundary** — marshalling, param encoding, result decoding — is only
   ever measured end-to-end from JS, never in isolation.
+- **Writes and transactions on the TS engine.** `perf_bench` covers them for the
+  Rust core; the JS harness above is read/ingest-shaped only.
