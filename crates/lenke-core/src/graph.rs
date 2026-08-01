@@ -37,6 +37,18 @@ pub struct Dict {
 }
 
 impl Dict {
+    /// A dictionary sized for `n` distinct entries up front. Interning grows the
+    /// map by doubling, and every growth REHASHES everything already in it, so a
+    /// dictionary built to 400k ids re-hashes each key on the order of twenty
+    /// times. The element count is known before the build starts, so none of that
+    /// is necessary.
+    pub fn with_capacity(n: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity(n),
+            strings: Vec::with_capacity(n),
+        }
+    }
+
     pub fn intern(&mut self, s: &str) -> u32 {
         if let Some(&id) = self.map.get(s) {
             return id;
@@ -2616,31 +2628,40 @@ fn build_props(len: usize, items: &[(usize, &[(String, Value)])], strs: &mut Dic
         len,
     };
     // Infer a kind per key (by dense key id) from its first non-null value.
-    let mut kinds: HashMap<u32, Kind> = HashMap::new();
+    //
+    // `kinds` is indexed by the dense key id rather than hashed on it, and each
+    // property's id is remembered so the store pass below does not have to look
+    // the key up a second time. Together those remove two of the three hashes a
+    // property used to cost (intern, kind lookup, re-lookup) — on a 16-property
+    // element that was 48 hashes where 16 will do.
+    let mut kinds: Vec<Option<Kind>> = Vec::new();
+    let mut kids: Vec<u32> = Vec::with_capacity(items.iter().map(|(_, it)| it.len()).sum());
     for (_, item) in items {
         for (k, v) in *item {
             let kid = props.keys.intern(k);
+            kids.push(kid);
+            if kinds.len() <= kid as usize {
+                kinds.resize(kid as usize + 1, None);
+            }
             if let Some(vk) = value_kind(v) {
-                kinds
-                    .entry(kid)
-                    .and_modify(|cur| {
-                        if *cur != vk {
-                            *cur = Kind::Mixed;
-                        }
-                    })
-                    .or_insert(vk);
+                match &mut kinds[kid as usize] {
+                    Some(cur) if *cur != vk => *cur = Kind::Mixed,
+                    Some(_) => {}
+                    slot @ None => *slot = Some(vk),
+                }
             }
         }
     }
     // One column per interned key (dense by id); an all-null key gets an empty Mixed.
     props.cols = (0..props.keys.len() as u32)
-        .map(|kid| empty_col_for_kind(kinds.get(&kid).copied(), len))
+        .map(|kid| empty_col_for_kind(kinds.get(kid as usize).copied().flatten(), len))
         .collect();
+    let mut kid_at = kids.into_iter();
     for (idx, item) in items {
-        for (k, v) in *item {
+        for (_k, v) in *item {
             // Store every value, `Null` included — a present null promotes the
             // column to `Mixed` (mirrors `set_value`; null is a first-class value).
-            let kid = props.keys.get(k).unwrap() as usize;
+            let kid = kid_at.next().expect("one key id recorded per property") as usize;
             let col = &mut props.cols[kid];
             if !col_set(col, *idx, v, strs) {
                 *col = to_mixed(col, strs);
@@ -2683,12 +2704,16 @@ impl Builder {
 
     pub fn finalize(self) -> Graph {
         let Self { nodes, edges } = self;
-        let mut vid = Dict::default();
+        // Sized for the worst case (every endpoint a fresh id) so the id
+        // dictionary never rehashes mid-build. Over-reserving costs one
+        // allocation; growing costs a full rehash of everything interned so far,
+        // about twenty times over on a 400k-element load.
+        let mut vid = Dict::with_capacity(nodes.len() + edges.len() * 2);
 
         // (1) Dense indices: declared nodes first (in order), then edge endpoints.
-        for node in &nodes {
-            vid.intern(&node.id);
-        }
+        // The dense id each node landed on is kept, so the label pass below does
+        // not have to hash the id string all over again to rediscover it.
+        let node_vi: Vec<u32> = nodes.iter().map(|node| vid.intern(&node.id)).collect();
         for e in &edges {
             vid.intern(&e.src);
             vid.intern(&e.dst);
@@ -2723,7 +2748,7 @@ impl Builder {
             if !keep_node[idx] {
                 continue; // first-wins: ignore a duplicate node id's labels
             }
-            let vi = vid.get(&node.id).unwrap();
+            let vi = node_vi[idx];
             for l in &node.labels {
                 let lid = labels.intern(l);
                 vlabels[vi as usize].push(lid);
@@ -2737,7 +2762,7 @@ impl Builder {
             .iter()
             .enumerate()
             .filter(|(idx, _)| keep_node[*idx])
-            .map(|(_, nd)| (vid.get(&nd.id).unwrap() as usize, nd.props.as_slice()))
+            .map(|(idx, nd)| (node_vi[idx] as usize, nd.props.as_slice()))
             .collect();
         let props = build_props(n, &node_items, &mut strs);
 
@@ -2750,9 +2775,12 @@ impl Builder {
         let mut out: Vec<Vec<Adj>> = vec![Vec::new(); n];
         let mut in_: Vec<Vec<Adj>> = vec![Vec::new(); n];
         let mut by_etype: HashMap<u32, Vec<u32>> = HashMap::new();
-        // Lazy external-id overlay: only edges that carry an id land here.
-        let mut eid_fwd: HashMap<u32, Arc<str>> = HashMap::new();
-        let mut eid_rev: HashMap<Arc<str>, u32> = HashMap::new();
+        // Lazy external-id overlay: only edges that carry an id land here. Sized
+        // for all of them — a document where every edge carries an id is the norm
+        // (it is what `encode` emits), and growing these mid-build rehashes every
+        // id already inserted.
+        let mut eid_fwd: HashMap<u32, Arc<str>> = HashMap::with_capacity(e);
+        let mut eid_rev: HashMap<Arc<str>, u32> = HashMap::with_capacity(e);
         for (i, ed) in kept_edges.iter().enumerate() {
             let s = vid.get(&ed.src).unwrap();
             let d = vid.get(&ed.dst).unwrap();
