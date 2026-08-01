@@ -876,14 +876,23 @@ mod tests {
     /// started changing. `interleaved_write_and_traverse_is_independent_of_graph_
     /// size` in the GQL tests exists to keep it that way.
     ///
-    /// Row 8 also carries a rejected experiment. The edge-id path consults two
-    /// tables over the same strings — a `HashSet` to reject a duplicate, then the
-    /// `eid_rev` overlay — and merging them (the overlay IS the duplicate check)
-    /// measured a wash at 1M: 1427 ms before, 1432 after. Worth recording that
-    /// the FIRST cut of it measured 8% slower, because moving the overlay maps
-    /// earlier lost their `with_capacity` and they rehashed their way up. The
-    /// same trick on the NODE side is a real 12% win (see `keep_node`), which is
-    /// the difference between removing a table and merely merging two.
+    /// Row 8 also carries a rejected experiment, and the reason it was rejected
+    /// is worth stating precisely. The edge-id path consults two tables over the
+    /// same strings — a `HashSet` to reject a duplicate, then the `eid_rev`
+    /// overlay — so merging them (the overlay IS the duplicate check) is the same
+    /// trick that removed 83 ms from the node side. It measured 1427 ms before
+    /// and 1432 after.
+    ///
+    /// Not because the shapes differ: the edge dedup pass costs **28 ms of a
+    /// 1491 ms decode**, and run-to-run spread on this benchmark is around 35 ms.
+    /// The effect is real and simply below what this measurement can resolve. The
+    /// node equivalent was 83 ms, comfortably above it. An effect that small
+    /// needs its own microbenchmark, not a whole-decode timing.
+    ///
+    /// Worth recording that the FIRST cut of it measured 8% SLOWER, because
+    /// moving the overlay maps earlier lost their `with_capacity` and they
+    /// rehashed their way up — the same regression already fixed once in this
+    /// file. The number only became trustworthy after that was corrected.
     ///
     /// `INGEST_N=3000000,5000000` overrides the default sweep.
     #[test]
@@ -1021,5 +1030,25 @@ mod tests {
                 std::hint::black_box(super::decode(&scattered).is_ok());
             },
         );
+
+        // Edges carrying explicit ids — what `encode` emits, so this is the shape
+        // a reloaded snapshot has. Rows 6 and 7 omit the id, which skips the
+        // external-id bookkeeping entirely and hides its cost.
+        let ided: String = scattered
+            .lines()
+            .enumerate()
+            .map(|(i, line)| {
+                line.replacen(
+                    r#"{"type":"edge","#,
+                    &format!(r#"{{"type":"edge","id":"e{i}","#),
+                    1,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        bench("8. decode, scattered + edge ids", ided.len(), reps, || {
+            std::hint::black_box(super::decode(&ided).is_ok());
+        });
     }
 }
