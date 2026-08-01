@@ -11,25 +11,26 @@ obvious without opening them.
 
 ## By question
 
-| If you are asking…                                                | Run                                                      |
-| ----------------------------------------------------------------- | -------------------------------------------------------- |
-| Is a query shape slow? Which of the four perf levers moved?       | `perf_bench`                                             |
-| How do query shapes scale with graph size?                        | `scale_bench`                                            |
-| What does an individual GQL query shape cost?                     | `gql_bench`                                              |
-| Same, for Gremlin traversals                                      | `gremlin_bench`                                          |
-| **Should adjacency storage change, and what would writes pay?**   | **`storage_probe`**                                      |
-| How far is the WHERE path from a hand-written columnar kernel?    | `eval_vs_columnar`                                       |
-| Does the property index actually seed a seek? (GQL / Gremlin)     | `edge_type_index_bench`, `gremlin_index_bench`           |
-| What do the graph algorithms cost?                                | `algo_bench`, `neighbor_aggregate_bench`                 |
-| What does `CALL` add over calling an algorithm directly?          | `call_bench`                                             |
-| What do map/record properties cost — stored, and through a codec? | `map_bench`, `map_codec_bench`                           |
-| What do temporal columns cost?                                    | `temporal_bench`                                         |
-| What do path selectors and per-hop predicates cost?               | `path_selector_bench`                                    |
-| What does a record-typed constraint cost to declare?              | `record_debox_bench`                                     |
-| What does CDC scope extraction cost per write?                    | `cdc_extract_bench`                                      |
-| How much memory does a graph of N vertices take?                  | `mem_probe`                                              |
-| **Where does NDJSON ingest time go, and what is the ceiling?**    | **`ingest_phase_bench`**, plus `ingest_throughput` below |
-| Are the count fast paths correct? (not a benchmark)               | `count_check`                                            |
+| If you are asking…                                                 | Run                                                      |
+| ------------------------------------------------------------------ | -------------------------------------------------------- |
+| Is a query shape slow? Which of the four perf levers moved?        | `perf_bench`                                             |
+| How do query shapes scale with graph size?                         | `scale_bench`                                            |
+| What does an individual GQL query shape cost?                      | `gql_bench`                                              |
+| Same, for Gremlin traversals                                       | `gremlin_bench`                                          |
+| **Should adjacency storage change, and what would writes pay?**    | **`storage_probe`**                                      |
+| How far is the WHERE path from a hand-written columnar kernel?     | `eval_vs_columnar`                                       |
+| Does the property index actually seed a seek? (GQL / Gremlin)      | `edge_type_index_bench`, `gremlin_index_bench`           |
+| What do the graph algorithms cost?                                 | `algo_bench`, `neighbor_aggregate_bench`                 |
+| What does `CALL` add over calling an algorithm directly?           | `call_bench`                                             |
+| What do map/record properties cost — stored, and through a codec?  | `map_bench`, `map_codec_bench`                           |
+| What do temporal columns cost?                                     | `temporal_bench`                                         |
+| What do path selectors and per-hop predicates cost?                | `path_selector_bench`                                    |
+| What does a record-typed constraint cost to declare?               | `record_debox_bench`                                     |
+| What does CDC scope extraction cost per write?                     | `cdc_extract_bench`                                      |
+| How much memory does a graph of N vertices take?                   | `mem_probe`                                              |
+| **What does query TEXT cost to turn into a plan, before it runs?** | **`plan_bench`**                                         |
+| **Where does NDJSON ingest time go, and what is the ceiling?**     | **`ingest_phase_bench`**, plus `ingest_throughput` below |
+| Are the count fast paths correct? (not a benchmark)                | `count_check`                                            |
 
 ## Benchmarks that live as ignored tests
 
@@ -69,6 +70,10 @@ conclusion was drawn and committed.
 - **Match the sample count on both sides**, and prefer min or p25 over the mean.
   Several conclusions here were single-run against single-run and did not
   survive repetition.
+- **Plan time hides inside execution time.** `gql_bench` reports parse/lower as
+  a delta against a 2.7 ms execute, so a change that doubled lowering would move
+  that row under 2% and read as noise. `plan_bench` measures lex/parse/lower with
+  no graph at all; use it for anything that touches `plan.rs` or the parser.
 - **Know the noise floor before believing a small delta.** The `whole node` row
   of `query_row_cost` has ranged 72–161 ms for the same binary, because it runs
   after other shapes and inherits their allocator state. Anything under ~10%
