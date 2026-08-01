@@ -952,5 +952,49 @@ mod tests {
             parse / ceiling * 100.0,
             decode_gibs / parse * 100.0
         );
+
+        // Edge ENDPOINT LOCALITY, which a nodes-only document hides entirely.
+        // Both documents below have the same node count, edge count and byte
+        // count; they differ only in where the endpoints point. Filling adjacency
+        // writes to `out[src]`/`in_[dst]`, so scattered endpoints scatter those
+        // writes across a per-vertex `Vec<Vec<Adj>>` — one miss for the header,
+        // another for its buffer. At 10k it is worth ~5%; at 1M, ~22%.
+        let with_edges = |scatter: bool| -> String {
+            let mut lines: Vec<String> = (0..n)
+                .map(|i| {
+                    format!(
+                        r#"{{"type":"node","id":"v{i}","labels":["P"],"properties":{{"n":{i}}}}}"#
+                    )
+                })
+                .collect();
+
+            for i in 0..n.saturating_sub(1) {
+                let (a, b) = if scatter {
+                    ((i * 7919) % n, (i * 104_729) % n)
+                } else {
+                    (i, i + 1)
+                };
+
+                lines.push(format!(
+                    r#"{{"type":"edge","labels":["R"],"from":"v{a}","to":"v{b}","properties":{{}}}}"#
+                ));
+            }
+
+            lines.join("\n")
+        };
+        let seq = with_edges(false);
+        let scattered = with_edges(true);
+
+        bench("6. decode, adjacent endpoints", seq.len(), reps, || {
+            std::hint::black_box(super::decode(&seq).is_ok());
+        });
+        bench(
+            "7. decode, scattered endpoints",
+            scattered.len(),
+            reps,
+            || {
+                std::hint::black_box(super::decode(&scattered).is_ok());
+            },
+        );
     }
 }
