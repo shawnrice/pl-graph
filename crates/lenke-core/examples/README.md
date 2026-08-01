@@ -129,12 +129,29 @@ update, append, and three interleaved read/write shapes — drawn from the
 applications this engine has been exercised against. Reported as operations per
 second on all three engines.
 
-Two things it makes visible. The **permission check** (two labelled hops from a
-point lookup) runs at tens to low hundreds of operations per second — single-digit
-milliseconds each, orders of magnitude off the other reads, because it scans
-rather than seeks. And **interleaving a write with a traversal** costs about 2.5x
-the same traversal alone, which is the read-snapshot invalidation showing up
-exactly where it was predicted to.
+Each read appears twice, unindexed and indexed, because the difference is not
+marginal: a point lookup goes from 876 to 95k ops/sec on the TS engine and from
+3.6k to 164k on the Rust one. A `WHERE u.name = $n` with no index is a full scan
+that reads exactly like a lookup, which is easy to benchmark by accident.
+
+**It found a 60x planner cliff.** These two are semantically identical:
+
+```
+MATCH (u:User)-[:MEMBER_OF]->(t:Team) WHERE u.name = $n RETURN count(*)   2.2k ops/s
+MATCH (u:User {name: $n})-[:MEMBER_OF]->(t:Team) RETURN count(*)        136.8k ops/s
+```
+
+On the Rust engine a WHERE-form anchor followed by a traversal stops seeding
+from the index and falls back to a scan; the inline form keeps the seek. Alone,
+both forms seed fine — it is the traversal that loses it. The pure-TS engine
+seeds both, so on that one shape pure-TS is ~240x FASTER than native. Both forms
+are kept as separate rows so the cliff cannot regress unseen.
+
+Also visible: **interleaving a write with a traversal** costs about 2.5x the
+traversal alone, which is the read-snapshot invalidation showing up where it was
+predicted to; and **100 updates inside a transaction** run at roughly half the
+per-write rate of the same updates auto-committing, which is the undo log and
+deferred checks.
 
 ## Known gaps
 

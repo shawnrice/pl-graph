@@ -55,11 +55,17 @@ type Engine = {
   name: string;
   load: (doc: string) => unknown;
   query: (g: unknown, text: string, params?: Record<string, unknown>) => unknown;
+  index: (g: unknown, on: 'vertex' | 'edge', key: string) => void;
+  transaction: (g: unknown, body: () => void) => void;
   free: (g: unknown) => void;
 };
 
+type IndexSpec = { on: 'vertex' | 'edge'; kind: 'hash'; keys: string[] };
+
 type NativeGraph = {
   query: (t: string, p?: Record<string, unknown>) => unknown;
+  createIndex: (s: IndexSpec) => void;
+  transaction: (f: () => void) => void;
   free: () => void;
 };
 
@@ -67,6 +73,8 @@ const nativeEngine = (name: string, backend: Backend): Engine => ({
   name,
   load: (doc) => graphFromNdjson(backend, doc),
   query: (g, text, params) => (g as NativeGraph).query(text, params),
+  index: (g, on, key) => (g as NativeGraph).createIndex({ on, kind: 'hash', keys: [key] }),
+  transaction: (g, body) => (g as NativeGraph).transaction(body),
   free: (g) => (g as NativeGraph).free(),
 });
 
@@ -74,6 +82,14 @@ const tsEngine: Engine = {
   name: 'ts',
   load: (doc) => tsDeserialize(doc, 'ndjson', new TsGraph()),
   query: (g, text, params) => tsQuery(g as TsGraph, text, params),
+  index: (g, on, key) =>
+    (g as unknown as { createIndex: (s: IndexSpec) => void }).createIndex({
+      on,
+      kind: 'hash',
+      keys: [key],
+    }),
+  transaction: (g, body) =>
+    (g as unknown as { transaction: (f: () => void) => void }).transaction(body),
   free: () => {},
 };
 
@@ -124,6 +140,10 @@ type Workload = {
   name: string;
   /** One operation. `i` is the operation index, so each does different work. */
   op: (e: Engine, g: unknown, i: number) => void;
+  /** Vertex property keys to index before the batch runs. */
+  indexes?: string[];
+  /** Fewer operations for workloads that are inherently expensive. */
+  scale?: number;
 };
 
 const WORKLOADS: Workload[] = [
@@ -210,6 +230,107 @@ const WORKLOADS: Workload[] = [
     },
   },
   {
+    // The SAME point lookup with the property indexed. Without this the engine
+    // scans every vertex, which is what the un-suffixed rows above measure —
+    // easy to mistake for a lookup because the query reads like one.
+    name: 'read: point lookup (indexed)',
+    indexes: ['name'],
+    op: (e, g, i) =>
+      void e.query(g, 'MATCH (u:User) WHERE u.name = $n RETURN u.score AS s', {
+        n: `user${i % GRAPH}`,
+      }),
+  },
+  {
+    // The SAME check with the anchor written inline rather than in a trailing
+    // WHERE. On the Rust engine these two rows differ by ~60x: a WHERE-form
+    // anchor followed by a traversal stops seeding from the index and falls back
+    // to a scan, while the inline form keeps the seek. The pure-TS engine seeds
+    // both. Two rows rather than one, so the cliff cannot regress unseen — and
+    // so nobody reads the slow row as the cost of the check itself.
+    name: 'read: permission check (indexed, inline anchor)',
+    indexes: ['name'],
+    op: (e, g, i) =>
+      void e.query(
+        g,
+        'MATCH (u:User {name: $n})-[:MEMBER_OF]->(gr:Team)-[:VIEWER]->(r:Resource) RETURN count(*) AS c',
+        { n: `user${i % GRAPH}` },
+      ),
+  },
+  {
+    // Authorization with the anchor indexed: the seek replaces the scan, and the
+    // traversal from it is bounded by the user's own degree.
+    name: 'read: permission check (indexed, WHERE)',
+    indexes: ['name'],
+    op: (e, g, i) =>
+      void e.query(
+        g,
+        'MATCH (u:User)-[:MEMBER_OF]->(gr:Team)-[:VIEWER]->(r:Resource) WHERE u.name = $n RETURN count(*) AS c',
+        { n: `user${i % GRAPH}` },
+      ),
+  },
+  {
+    name: 'read: 2-hop recommendation (indexed)',
+    indexes: ['name'],
+    op: (e, g, i) =>
+      void e.query(
+        g,
+        'MATCH (u:User {name: $n})-[:FOLLOWS]->()-[:FOLLOWS]->(x) RETURN count(*) AS c',
+        { n: `user${i % GRAPH}` },
+      ),
+  },
+  {
+    name: 'write: property update (indexed)',
+    indexes: ['name'],
+    op: (e, g, i) =>
+      void e.query(g, 'MATCH (u:User) WHERE u.name = $n SET u.score = $v', {
+        n: `user${i % GRAPH}`,
+        v: i % 1000,
+      }),
+  },
+  {
+    // Writes batched into one transaction, against the same writes committing
+    // individually above. A transaction records an undo entry per write and
+    // defers its constraint checks to commit, so this is the cost of that
+    // bookkeeping amortized over a batch.
+    name: 'write: 100 updates in a transaction',
+    indexes: ['name'],
+    scale: 100,
+    op: (e, g, i) =>
+      e.transaction(g, () => {
+        for (let k = 0; k < 100; k++) {
+          e.query(g, 'MATCH (u:User) WHERE u.name = $n SET u.score = $v', {
+            n: `user${(i * 100 + k) % GRAPH}`,
+            v: k,
+          });
+        }
+      }),
+  },
+  {
+    // Money-flow shapes, on the follow graph as the transfer network: fan-out
+    // over a bounded number of hops, the pattern a structuring check computes.
+    name: 'analytic: fan-out spread 1-3 hops',
+    indexes: ['name'],
+    scale: 20,
+    op: (e, g, i) =>
+      void e.query(
+        g,
+        'MATCH (u:User) WHERE u.name = $n RETURN COUNT { MATCH (u)-[:FOLLOWS]->{1,3}(x:User) } AS spread',
+        { n: `user${i % GRAPH}` },
+      ),
+  },
+  {
+    // Does value return to where it started? The cycle test a layering check runs.
+    name: 'analytic: cycle detection 2-4 hops',
+    indexes: ['name'],
+    scale: 20,
+    op: (e, g, i) =>
+      void e.query(
+        g,
+        'MATCH (u:User) WHERE u.name = $n AND EXISTS { MATCH (u)-[:FOLLOWS]->{2,4}(u) } RETURN u.name AS n',
+        { n: `user${i % GRAPH}` },
+      ),
+  },
+  {
     // Append-only audit: a ledger entry written and attached in one statement.
     //
     // Deliberately ONE statement against a fixed set, not `MATCH (a:Entry),
@@ -264,15 +385,21 @@ const rate = (e: Engine, w: Workload): number => {
     const g = e.load(fixture);
 
     try {
+      for (const key of w.indexes ?? []) {
+        e.index(g, 'vertex', key);
+      }
+
+      const ops = Math.max(1, Math.floor(OPS / (w.scale ?? 1)));
+
       w.op(e, g, 0); // warm
 
       const t = Bun.nanoseconds();
 
-      for (let i = 1; i <= OPS; i++) {
+      for (let i = 1; i <= ops; i++) {
         w.op(e, g, i);
       }
 
-      const perSec = OPS / ((Bun.nanoseconds() - t) / 1e9);
+      const perSec = ops / ((Bun.nanoseconds() - t) / 1e9);
 
       bestOps = Math.max(bestOps, perSec);
     } finally {
