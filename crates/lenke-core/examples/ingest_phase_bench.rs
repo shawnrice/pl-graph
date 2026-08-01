@@ -16,6 +16,21 @@
 //! at the price of a lifetime on `NodeRec`/`EdgeRec`/`Builder` and a `Cow` in
 //! the codecs that unescape (a borrow is only possible when a string arrives
 //! clean).
+//!
+//! Read that number with care. A cheaper version of the same idea has already
+//! been tried and REJECTED: `Value::Str` is an `Arc<str>` by the time it reaches
+//! the column writer, which then interned it through `Dict::intern(&str)` and so
+//! allocated and copied the string a second time. Adopting the existing `Arc`
+//! instead removes an allocation and a memcpy per distinct value — and measured
+//! neutral above 40-byte values and 6% WORSE at 8 bytes (500k x 8B: 486 -> 518
+//! ms). Short-lived allocations are served from a hot free list and die in
+//! order; keeping them alive for the graph's lifetime costs more in locality
+//! than the copy ever cost.
+//!
+//! So "fewer allocations" does not automatically mean "faster" here, and the
+//! 15-36% above — measured by standing records up with `format!`, which also
+//! formats — is an upper bound rather than an expected gain. Worth prototyping
+//! the borrow on the NDJSON path alone before committing five codecs to it.
 use std::time::Instant;
 
 /// One materialized record, shaped like what the decoder builds: an owned id,
