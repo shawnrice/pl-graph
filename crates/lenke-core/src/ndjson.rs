@@ -851,6 +851,15 @@ mod tests {
     /// — which is exactly what happened to a faster hash function — so a change
     /// is only believable if it is measured across the whole range.
     ///
+    /// A worked example of why: batching the id interning and prefetching each
+    /// slot a few iterations ahead — the textbook fix for a miss-bound loop —
+    /// measured 110 -> 130 ms at 200k (17% WORSE) and nothing at all at 1M. At
+    /// 200k the dictionary is cache-resident, so there are no misses to hide and
+    /// the extra load is overhead that also evicts something useful; at 1M the
+    /// two-pass structure and the hash array it materializes cost about what the
+    /// overlap saves. Measured at 1M alone it would have looked harmless, and at
+    /// 200k alone like a serious regression. Neither is the whole answer.
+    ///
     /// `INGEST_N=3000000,5000000` overrides the default sweep.
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]
