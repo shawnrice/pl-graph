@@ -839,6 +839,17 @@ mod tests {
     /// The gap between 3 and 4 is the graph BUILD, which no JSON parser does —
     /// which is why comparing a graph loader's GiB/s against a JSON parser's is
     /// not like for like.
+    ///
+    /// **Run it at a realistic size.** The answer changes qualitatively with `n`,
+    /// because the working set falls out of cache somewhere between 200k and 1M
+    /// elements. At 200k the document and its dictionaries stay resident and
+    /// decode reaches ~40% of parse; at 1M and beyond it settles at ~26%, and the
+    /// per-element build cost roughly doubles (385 ns -> 721 ns) before going
+    /// flat. Line 2 shows the transition directly: allocate-and-memcpy of the
+    /// input runs at 27 GiB/s over 22 MiB and 2.6 GiB/s over 112 MiB. Past that
+    /// point ingest is bound by random access into the dictionaries, not by
+    /// hashing or allocation — so an optimization tuned at 200k can measure as
+    /// nothing at 1M, which is exactly what happened to a faster hash function.
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]
     fn ingest_throughput_against_the_ceiling() {
@@ -868,7 +879,11 @@ mod tests {
             gibs
         }
 
-        let n = 200_000;
+        // `INGEST_N=3000000 cargo test --release ingest_throughput -- --ignored --nocapture`
+        let n: usize = std::env::var("INGEST_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000);
         let text: String = (0..n)
             .map(|i| {
                 format!(
