@@ -230,14 +230,25 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
     take_type_fault(); // reset any leftover flag from a prior run on this thread
                        // Index seeding: `V().has(key, pred)` on an indexed key seeds from the
                        // property index (skipping the full label scan + the now-satisfied `has`).
-    let (seed, start) = match index_seed(graph, &t.steps) {
-        Some(s) => (s, 2),
-        None => (Vec::new(), 0),
-    };
-    run_steps(graph, ctx, &t.steps[start..], seed)
-        .into_iter()
-        .map(|t| t.val)
-        .collect()
+                       // A seeded plan drops the `V()`/`E()` it started from and the one `has` the
+                       // index fully answered, keeping every other step — including any filters that
+                       // preceded that `has`, which still have to run over the seed.
+    match index_seed(graph, &t.steps) {
+        Some((seed, at)) => {
+            let rest: Vec<Step> = t.steps[1..]
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i + 1 != at)
+                .map(|(_, step)| step.clone())
+                .collect();
+
+            run_steps(graph, ctx, &rest, seed)
+        }
+        None => run_steps(graph, ctx, &t.steps, Vec::new()),
+    }
+    .into_iter()
+    .map(|t| t.val)
+    .collect()
 }
 
 fn gval_to_idxkey(v: &GVal) -> Option<IdxKey> {
@@ -263,18 +274,54 @@ fn prefix_upper(s: &str) -> Option<String> {
     None
 }
 
-/// If the plan opens with `V().has(key, pred)` / `E().has(key, pred)` on an
-/// indexed key and `pred` is index-seekable (eq / within / range / startsWith),
-/// return the seeded elements (the `has` is then fully satisfied by the index).
-/// `None` ⇒ fall back to scan.
-fn index_seed(graph: &Graph, steps: &[Step]) -> Option<Vec<Trav>> {
-    let (key, pred, is_edge) = match steps {
-        [Step::V(ids), Step::Has(k, p), ..] if ids.is_empty() && graph.vertex_indexed(k) => {
-            (k, p, false)
+/// If the plan opens with `V()` / `E()` and a `has(key, pred)` on an indexed key
+/// follows — not necessarily IMMEDIATELY — return the seeded elements and the
+/// index of the `has` that produced them, which the caller then drops from the
+/// pipeline because the index has fully satisfied it. `None` ⇒ fall back to scan.
+///
+/// The seekable `has` used to have to be step 1 exactly, so
+/// `V().hasLabel('P').has('k', v)` scanned while `V().has('k', v).hasLabel('P')`
+/// seeked — 207x on a 20k-vertex graph, and label-first is the idiomatic
+/// TinkerPop order. `E().hasLabel('R').has('w', 5)` was 553x.
+///
+/// Only pure element-filter steps may sit in between. `hasLabel` / `has` /
+/// `hasNot` narrow the current element set without changing what a traverser
+/// IS, so seeding from a later `has` and re-running them over the seed gives the
+/// same answer. A navigating step (`out`, `values`, …) rebinds the traverser, so
+/// a `has` after one addresses a different element entirely and must not seed
+/// the start.
+fn index_seed(graph: &Graph, steps: &[Step]) -> Option<(Vec<Trav>, usize)> {
+    let is_edge = match steps.first()? {
+        Step::V(ids) if ids.is_empty() => false,
+        Step::E(ids) if ids.is_empty() => true,
+        _ => return None,
+    };
+    let indexed = |k: &str| {
+        if is_edge {
+            graph.edge_indexed(k)
+        } else {
+            graph.vertex_indexed(k)
         }
-        [Step::E(ids), Step::Has(k, p), ..] if ids.is_empty() && graph.edge_indexed(k) => {
-            (k, p, true)
+    };
+    // The first seekable `has` in the leading run of element filters.
+    let mut at = None;
+
+    for (i, step) in steps.iter().enumerate().skip(1) {
+        match step {
+            Step::Has(k, _) if indexed(k) => {
+                at = Some(i);
+                break;
+            }
+            // Not seekable itself, but harmless to look past.
+            Step::Has(..) | Step::HasLabel(..) | Step::HasNot(..) => {}
+            // Anything else rebinds or consumes the traverser.
+            _ => return None,
         }
+    }
+
+    let at = at?;
+    let (key, pred) = match &steps[at] {
+        Step::Has(k, p) => (k, p),
         _ => return None,
     };
     let eq = |k: &IdxKey| {
@@ -359,7 +406,7 @@ fn index_seed(graph: &Graph, steps: &[Step]) -> Option<Vec<Trav>> {
             GVal::Vertex(id)
         }
     };
-    Some(ids.into_iter().map(|id| Trav::root(mk(id))).collect())
+    Some((ids.into_iter().map(|id| Trav::root(mk(id))).collect(), at))
 }
 
 /// Serialize traversal results to a JSON array string — the FFI carrier. Graph

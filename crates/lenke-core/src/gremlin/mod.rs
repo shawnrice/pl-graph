@@ -17,6 +17,8 @@ use std::sync::Arc;
 #[cfg(test)]
 mod divergence_tests;
 pub mod exec;
+#[cfg(test)]
+mod index_seed_tests;
 pub mod parse;
 #[cfg(test)]
 mod step_tests_1;
