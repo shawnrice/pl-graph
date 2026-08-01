@@ -1038,4 +1038,170 @@ mod tests {
             std::hint::black_box(super::decode(&dense).is_ok());
         });
     }
+    /// Where does a simple query's time go, per row?
+    ///
+    /// Every query pays projection and row materialization, so a per-row cost
+    /// there is paid by everything. Compares shapes that do progressively more
+    /// per row against one that produces almost none, over the same graph.
+    ///
+    /// Measured at 500k-1M rows: a numeric column is ~7-23 ns, a string column
+    /// roughly double that (an `Arc` clone and a dictionary index), and `RETURN n`
+    /// — the shape most application code actually issues — is 230-310 ns, an
+    /// order of magnitude more. That decomposes into ~208 ns fixed per row plus
+    /// ~23 ns per PRESENT property key.
+    ///
+    /// The sparse row is the reassuring one: 24 keys in the store with one on
+    /// each element costs less than a one-key store, so an absent key is a
+    /// bitset test rather than a walk. The fixed 208 ns is roughly four `Vec`
+    /// allocations per row (labels twice over, the property map, the outer
+    /// three-entry map) plus a handful of atomic `Arc` clones.
+    ///
+    /// **This harness cannot resolve a change worth ~10% of that.** Back-to-back
+    /// runs of the `whole node` row have landed anywhere from 72 to 161 ms for
+    /// the same binary, because it runs after several other shapes and inherits
+    /// their allocator and cache state. Removing one of the four allocations was
+    /// tried and could not be told apart from noise. Anything at that scale needs
+    /// its own isolated microbenchmark, not another row here.
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn query_row_cost() {
+        use std::time::Instant;
+
+        let n: usize = std::env::var("ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000_000);
+        let text: String = (0..n)
+            .map(|i| {
+                format!(
+                    r#"{{"type":"node","id":"v{i}","labels":["P"],"properties":{{"a":{i},"s":"str{i}","b":true}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut g = super::decode(&text).expect("decodes");
+
+        let mut run = |label: &str, q: &str| {
+            let plan = crate::gql::parse(q).expect("parses");
+            let mut best = f64::MAX;
+
+            for _ in 0..5 {
+                let t = Instant::now();
+                let rs = plan
+                    .execute(&mut g, &crate::gql::eval::Params::new())
+                    .expect("runs");
+                let rows = rs.rows().count();
+                let s = t.elapsed().as_secs_f64();
+
+                std::hint::black_box(rows);
+                if s < best {
+                    best = s;
+                }
+            }
+
+            println!(
+                "  {label:<30} {:>8.1} ms   {:>6.0} ns/row",
+                best * 1000.0,
+                best * 1e9 / n as f64
+            );
+        };
+
+        println!("\n=== {n} rows ===");
+        run("count(*) only", "MATCH (n:P) RETURN count(*) AS c");
+        run("1 numeric column", "MATCH (n:P) RETURN n.a AS a");
+        run("1 string column", "MATCH (n:P) RETURN n.s AS s");
+        run(
+            "3 columns",
+            "MATCH (n:P) RETURN n.a AS a, n.s AS s, n.b AS b",
+        );
+        run(
+            "1 col + filter (all pass)",
+            "MATCH (n:P) WHERE n.a >= 0 RETURN n.a AS a",
+        );
+        run("1 col + arithmetic", "MATCH (n:P) RETURN n.a + 1 AS a");
+        run("whole node", "MATCH (n:P) RETURN n AS n");
+
+        // How `RETURN n` scales with the number of property KEYS in the store —
+        // separating per-element work from per-key work. `props_map` walks every
+        // key in the store per row (not just the ones present) and sorts what it
+        // finds, though the relative order of two keys never changes.
+        for keys in [1usize, 8, 24] {
+            let doc: String = (0..n)
+                .map(|i| {
+                    let props: Vec<String> = (0..keys).map(|k| format!(r#""k{k}":{i}"#)).collect();
+
+                    format!(
+                        r#"{{"type":"node","id":"w{i}","labels":["Q"],"properties":{{{}}}}}"#,
+                        props.join(",")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut gk = super::decode(&doc).expect("decodes");
+            let plan = crate::gql::parse("MATCH (n:Q) RETURN n AS n").expect("parses");
+            let mut best = f64::MAX;
+
+            for _ in 0..3 {
+                let t = Instant::now();
+                let rs = plan
+                    .execute(&mut gk, &crate::gql::eval::Params::new())
+                    .expect("runs");
+
+                std::hint::black_box(rs.rows().count());
+
+                let el = t.elapsed().as_secs_f64();
+
+                if el < best {
+                    best = el;
+                }
+            }
+
+            println!(
+                "  {:<30} {:>8.1} ms   {:>6.0} ns/row",
+                format!("whole node, {keys} keys"),
+                best * 1000.0,
+                best * 1e9 / n as f64
+            );
+        }
+
+        // SPARSE properties: 24 distinct keys in the store, but each element
+        // carries only one of them. If the cost tracks the store's key count
+        // rather than the element's, the per-row walk is over all keys.
+        {
+            let doc: String = (0..n)
+                .map(|i| {
+                    format!(
+                        r#"{{"type":"node","id":"s{i}","labels":["S"],"properties":{{"k{}":{i}}}}}"#,
+                        i % 24
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut gs = super::decode(&doc).expect("decodes");
+            let plan = crate::gql::parse("MATCH (n:S) RETURN n AS n").expect("parses");
+            let mut best = f64::MAX;
+
+            for _ in 0..3 {
+                let t = Instant::now();
+                let rs = plan
+                    .execute(&mut gs, &crate::gql::eval::Params::new())
+                    .expect("runs");
+
+                std::hint::black_box(rs.rows().count());
+
+                let el = t.elapsed().as_secs_f64();
+
+                if el < best {
+                    best = el;
+                }
+            }
+
+            println!(
+                "  {:<30} {:>8.1} ms   {:>6.0} ns/row",
+                "whole node, 24 keys / 1 each",
+                best * 1000.0,
+                best * 1e9 / n as f64
+            );
+        }
+    }
 }
