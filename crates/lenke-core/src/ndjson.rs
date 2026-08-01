@@ -988,12 +988,16 @@ mod tests {
         );
 
         // Edge ENDPOINT LOCALITY, which a nodes-only document hides entirely.
-        // Both documents below have the same node count, edge count and byte
-        // count; they differ only in where the endpoints point. Filling adjacency
-        // writes to `out[src]`/`in_[dst]`, so scattered endpoints scatter those
-        // writes across a per-vertex `Vec<Vec<Adj>>` — one miss for the header,
-        // another for its buffer. At 10k it is worth ~5%; at 1M, ~22%.
-        let with_edges = |scatter: bool| -> String {
+        // Filling adjacency writes to `out[src]`/`in_[dst]`, so scattered
+        // endpoints scatter those writes across a per-vertex `Vec<Vec<Adj>>` —
+        // one miss for the header, another for its buffer.
+        //
+        // Every edge here carries an id, because `encode` emits one and so every
+        // reloaded snapshot has them. Omitting the id skips the external-id
+        // bookkeeping entirely, which is a shape nothing actually loads — an
+        // earlier version of this benchmark did exactly that and led to a wrong
+        // conclusion about how much that bookkeeping costs.
+        let with_edges = |per_node: usize, scatter: bool| -> String {
             let mut lines: Vec<String> = (0..n)
                 .map(|i| {
                     format!(
@@ -1002,22 +1006,22 @@ mod tests {
                 })
                 .collect();
 
-            for i in 0..n.saturating_sub(1) {
+            for k in 0..n.saturating_sub(1) * per_node {
                 let (a, b) = if scatter {
-                    ((i * 7919) % n, (i * 104_729) % n)
+                    ((k * 7919) % n, (k * 104_729) % n)
                 } else {
-                    (i, i + 1)
+                    (k % n, (k + 1) % n)
                 };
 
                 lines.push(format!(
-                    r#"{{"type":"edge","labels":["R"],"from":"v{a}","to":"v{b}","properties":{{}}}}"#
+                    r#"{{"type":"edge","id":"e{k}","labels":["R"],"from":"v{a}","to":"v{b}","properties":{{}}}}"#
                 ));
             }
 
             lines.join("\n")
         };
-        let seq = with_edges(false);
-        let scattered = with_edges(true);
+        let seq = with_edges(1, false);
+        let scattered = with_edges(1, true);
 
         bench("6. decode, adjacent endpoints", seq.len(), reps, || {
             std::hint::black_box(super::decode(&seq).is_ok());
@@ -1031,24 +1035,14 @@ mod tests {
             },
         );
 
-        // Edges carrying explicit ids — what `encode` emits, so this is the shape
-        // a reloaded snapshot has. Rows 6 and 7 omit the id, which skips the
-        // external-id bookkeeping entirely and hides its cost.
-        let ided: String = scattered
-            .lines()
-            .enumerate()
-            .map(|(i, line)| {
-                line.replacen(
-                    r#"{"type":"edge","#,
-                    &format!(r#"{{"type":"edge","id":"e{i}","#),
-                    1,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        // EDGE-DENSE. One edge per node is a sparse graph; real ones carry many
+        // more edges than nodes, and every per-edge cost scales with that ratio
+        // while every per-node cost does not. A conclusion drawn at 1:1 about
+        // anything on the edge path is drawn at the wrong ratio.
+        let dense = with_edges(5, true);
 
-        bench("8. decode, scattered + edge ids", ided.len(), reps, || {
-            std::hint::black_box(super::decode(&ided).is_ok());
+        bench("8. decode, 5 edges per node", dense.len(), reps, || {
+            std::hint::black_box(super::decode(&dense).is_ok());
         });
     }
 }
