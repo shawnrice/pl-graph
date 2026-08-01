@@ -3139,9 +3139,34 @@ impl Builder<'_> {
         // an edge with an already-seen *assigned* id is **dropped** (its endpoints
         // are still interned above, as TS ensures them before the dedup check).
         // Borrowed-`&str` sets keep this allocation-free on the common path.
+        // First-wins duplicate detection, read straight off the interning pass
+        // instead of building a second hash table over the same strings.
+        //
+        // `intern` hands out dense ids in order of FIRST occurrence, so the k-th
+        // distinct id is exactly `k`. A node is therefore the first to carry its
+        // id precisely when the id it interned to equals the number of distinct
+        // ids seen before it; a repeat necessarily interned to something smaller.
+        //
+        // What this replaces was a `HashSet<&str>` sized to the node count — on a
+        // million-node load, a second million-entry table competing for cache
+        // with the dictionary, plus a million hashes and a million random probes,
+        // all to recompute something `node_vi` already recorded. Here it is a
+        // sequential walk of a `Vec<u32>` with a counter.
         let keep_node: Vec<bool> = {
-            let mut seen: HashSet<&str> = HashSet::with_capacity(nodes.len());
-            nodes.iter().map(|nd| seen.insert(nd.id.as_ref())).collect()
+            let mut distinct = 0u32;
+
+            node_vi
+                .iter()
+                .map(|&vi| {
+                    let first = vi == distinct;
+
+                    if first {
+                        distinct += 1;
+                    }
+
+                    first
+                })
+                .collect()
         };
         // An edge id is looked up here to reject a duplicate, and again later to
         // build the external-id overlay — twice over the same strings, in two
