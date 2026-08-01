@@ -68,6 +68,19 @@ Each of these is here because a wrong conclusion was drawn and committed first.
 Record rejected optimizations with their numbers, next to the code they would
 have changed. Several have been re-attempted otherwise.
 
+### Equivalent spellings must cost the same
+
+Every index-seeding bug found so far had one shape: the planner recognized one
+spelling of a predicate and scanned for another that meant exactly the same
+thing — `$x = u.k` vs `u.k = $x`, `k = $a OR k = $b` vs `k IN [$a, $b]`, a clause
+`WHERE` vs an inline `{k: $x}`, `5 <= u.n` vs `u.n >= 5`. Each cost 100-300x and
+each returned the correct answer, so no correctness test could catch it.
+
+`equivalent_spellings_cost_the_same` (in `gql/index_seed_tests.rs`, ignored)
+asserts that groups of equivalent queries return the same rows AND run within a
+factor of each other. It found one of the four immediately, in the fix for
+another. When adding a predicate form to the planner, add its spellings there.
+
 ## Gates
 
 `bun run lint` and `cargo clippy --all-targets -- -D warnings` are separate from

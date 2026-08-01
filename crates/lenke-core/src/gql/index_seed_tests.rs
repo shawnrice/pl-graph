@@ -569,7 +569,11 @@ fn in_list_with_a_repeated_value_does_not_duplicate_rows() {
     indexed.create_vertex_index("k");
 
     assert_eq!(
-        rows(&mut indexed, "MATCH (u:P) WHERE u.k IN ['key1', 'key1', 'key2'] RETURN u.k").len(),
+        rows(
+            &mut indexed,
+            "MATCH (u:P) WHERE u.k IN ['key1', 'key1', 'key2'] RETURN u.k"
+        )
+        .len(),
         2
     );
 }
@@ -650,8 +654,14 @@ fn a_reversed_range_keeps_its_direction() {
 
     // And the two spellings agree with each other, not just with the scan.
     assert_eq!(
-        rows(&mut indexed, "MATCH (u:P) WHERE 'key5' < u.k RETURN count(*) AS c"),
-        rows(&mut indexed, "MATCH (u:P) WHERE u.k > 'key5' RETURN count(*) AS c"),
+        rows(
+            &mut indexed,
+            "MATCH (u:P) WHERE 'key5' < u.k RETURN count(*) AS c"
+        ),
+        rows(
+            &mut indexed,
+            "MATCH (u:P) WHERE u.k > 'key5' RETURN count(*) AS c"
+        ),
     );
 }
 
@@ -697,4 +707,179 @@ fn a_disjunction_across_two_variables_is_not_seeded() {
     let q = "MATCH (a:P), (b:P) WHERE a.k = 'key1' OR b.k = 'key2' RETURN count(*) AS c";
 
     assert_eq!(rows(&mut plain, q), rows(&mut indexed, q));
+}
+
+// ---------------------------------------------------------------------------
+// SEMANTIC EQUIVALENCE: spellings that mean the same thing must also COST the
+// same.
+//
+// Every seeding gap found so far had the same shape — the hint recognized one
+// spelling of a predicate and scanned for another that meant exactly the same
+// thing. `u.k IN [$a]` vs `u.k = $a`, `$x = u.k` vs `u.k = $x`,
+// `u.k = $a OR u.k = $b` vs the IN-list, a clause WHERE vs an inline `{k: $x}`.
+// Each was 100-300x, and each was found by hand.
+//
+// This generalizes the hunt: each group below is a set of queries that must
+// return the same rows AND run within a factor of each other. Correctness alone
+// would not have caught any of them — every one returned the right answer.
+//
+// The bound is deliberately loose (`MAX_RATIO`). A missed seek is two to three
+// orders of magnitude; anything a slack factor could hide is not the class of
+// bug this exists for, and a tight bound on wall-clock in a test suite is a
+// flake generator.
+// ---------------------------------------------------------------------------
+
+/// How much slower the worst spelling in a group may be than the best.
+const MAX_RATIO: f64 = 12.0;
+
+/// A graph big enough that a scan and a seek are unmistakably different.
+fn equiv_graph() -> Graph {
+    let mut lines: Vec<String> = Vec::new();
+
+    for i in 0..20_000 {
+        lines.push(format!(
+            r#"{{"type":"node","id":"u{i}","labels":["P"],"properties":{{"k":"key{i:06}","n":{i},"m":{{"city":"c{i}"}}}}}}"#
+        ));
+    }
+    for i in 0..20_000 {
+        lines.push(format!(
+            r#"{{"type":"edge","id":"e{i}","labels":["R"],"from":"u{i}","to":"u{}","properties":{{"w":{i}}}}}"#,
+            (i + 1) % 20_000
+        ));
+    }
+
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    g.create_vertex_index("k");
+    g.create_vertex_index("n");
+    g.create_vertex_index("m.city");
+    g.create_edge_index("w");
+
+    g
+}
+
+/// Median-of-5 seconds for one execution of `q`.
+fn equiv_time(g: &mut Graph, q: &str) -> f64 {
+    let plan = parse(q).unwrap_or_else(|e| panic!("parse error for `{q}`: {e}"));
+    let mut best = f64::MAX;
+
+    for _ in 0..5 {
+        let t = std::time::Instant::now();
+        let rs = plan
+            .execute(g, &Params::new())
+            .unwrap_or_else(|e| panic!("exec error for `{q}`: {e}"));
+        let secs = t.elapsed().as_secs_f64();
+
+        std::hint::black_box(rs.rows().count());
+        if secs < best {
+            best = secs;
+        }
+    }
+
+    best
+}
+
+#[test]
+#[ignore = "timing-sensitive; run with --ignored --nocapture"]
+fn equivalent_spellings_cost_the_same() {
+    // Each group: every query must return identical rows and run within
+    // MAX_RATIO of the fastest member.
+    let groups: &[(&str, &[&str])] = &[
+        (
+            "point equality",
+            &[
+                "MATCH (u:P) WHERE u.k = 'key000005' RETURN count(*) AS c",
+                "MATCH (u:P) WHERE 'key000005' = u.k RETURN count(*) AS c",
+                "MATCH (u:P {k: 'key000005'}) RETURN count(*) AS c",
+                "MATCH (u:P) WHERE u.k IN ['key000005'] RETURN count(*) AS c",
+            ],
+        ),
+        (
+            "two values",
+            &[
+                "MATCH (u:P) WHERE u.k IN ['key000005', 'key000009'] RETURN count(*) AS c",
+                "MATCH (u:P) WHERE u.k = 'key000005' OR u.k = 'key000009' RETURN count(*) AS c",
+                "MATCH (u:P) WHERE 'key000005' = u.k OR 'key000009' = u.k RETURN count(*) AS c",
+            ],
+        ),
+        (
+            "equality through a traversal",
+            &[
+                "MATCH (u:P)-[:R]->(x) WHERE u.k = 'key000005' RETURN count(*) AS c",
+                "MATCH (u:P {k: 'key000005'})-[:R]->(x) RETURN count(*) AS c",
+                "MATCH (u:P)-[:R]->(x) WHERE 'key000005' = u.k RETURN count(*) AS c",
+                "MATCH (u:P)-[:R]->(x) WHERE u.k IN ['key000005'] RETURN count(*) AS c",
+            ],
+        ),
+        (
+            "numeric range",
+            &[
+                "MATCH (u:P) WHERE u.n >= 5 AND u.n <= 9 RETURN count(*) AS c",
+                "MATCH (u:P) WHERE 5 <= u.n AND 9 >= u.n RETURN count(*) AS c",
+                "MATCH (u:P) WHERE u.n >= 5 AND 9 >= u.n RETURN count(*) AS c",
+            ],
+        ),
+        (
+            "dotted path",
+            &[
+                "MATCH (u:P) WHERE u.m.city = 'c5' RETURN count(*) AS c",
+                "MATCH (u:P) WHERE 'c5' = u.m.city RETURN count(*) AS c",
+                "MATCH (u:P) WHERE u.m.city IN ['c5'] RETURN count(*) AS c",
+            ],
+        ),
+        (
+            "edge property",
+            &[
+                "MATCH ()-[e:R]->() WHERE e.w = 5 RETURN count(*) AS c",
+                "MATCH ()-[e:R]->() WHERE 5 = e.w RETURN count(*) AS c",
+                "MATCH ()-[e:R]->() WHERE e.w IN [5] RETURN count(*) AS c",
+                "MATCH ()-[e:R {w: 5}]->() RETURN count(*) AS c",
+            ],
+        ),
+        (
+            "conjunction with a non-seekable extra",
+            &[
+                "MATCH (u:P) WHERE u.k = 'key000005' AND u.n >= 0 RETURN count(*) AS c",
+                "MATCH (u:P) WHERE u.n >= 0 AND u.k = 'key000005' RETURN count(*) AS c",
+            ],
+        ),
+    ];
+    let mut g = equiv_graph();
+    let mut failures: Vec<String> = Vec::new();
+
+    for (name, queries) in groups {
+        // Same rows, first of all — a "fast" spelling that answers differently
+        // is not an equivalent spelling.
+        let expect = rows(&mut g, queries[0]);
+
+        for q in &queries[1..] {
+            let got = rows(&mut g, q);
+
+            assert_eq!(
+                &got, &expect,
+                "[{name}] `{q}` disagreed with `{}`",
+                queries[0]
+            );
+        }
+
+        let times: Vec<f64> = queries.iter().map(|q| equiv_time(&mut g, q)).collect();
+        let fastest = times.iter().copied().fold(f64::MAX, f64::min);
+
+        for (q, t) in queries.iter().zip(&times) {
+            let ratio = t / fastest;
+
+            println!("  {ratio:>6.1}x  [{name}] {q}");
+            if ratio > MAX_RATIO {
+                failures.push(format!(
+                    "[{name}] {ratio:.0}x slower than the best spelling in its group:\n    {q}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "\nspellings that mean the same thing but do not cost the same:\n\n{}\n",
+        failures.join("\n\n")
+    );
 }

@@ -92,7 +92,7 @@ pub(super) fn prop_name<'a>(
 
 /// `a OP b` as `b OP' a` — the same predicate with the operands exchanged.
 /// Equality and inequality are symmetric; the orderings invert.
-fn flip_compare(op: CompareOp) -> CompareOp {
+pub(super) fn flip_compare(op: CompareOp) -> CompareOp {
     match op {
         CompareOp::Lt => CompareOp::Gt,
         CompareOp::Le => CompareOp::Ge,

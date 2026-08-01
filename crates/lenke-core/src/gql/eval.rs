@@ -3480,13 +3480,26 @@ fn prop_path(left: &CExpr, graph: &Graph, ctx: &Ctx, edge: bool) -> Option<(usiz
 }
 
 /// A `var.key OP <literal-or-$param>` comparison, as (var slot, key ref, op,
-/// resolved index key). The RHS is resolved via [`expr_to_idxkey`] so params
-/// seek as well as literals.
+/// resolved index key). The constant is resolved via [`expr_to_idxkey`] so
+/// params seek as well as literals.
+///
+/// Either ORDER, with the operator flipped to match: `5 <= u.n` is `u.n >= 5`.
+/// This used to read only the left operand, so a conjunction written
+/// `5 <= u.n AND 9 >= u.n` lost its range seek and scanned — 197x on a 20k-vertex
+/// graph — while the identical `u.n >= 5 AND u.n <= 9` seeked. The single-
+/// comparison path in `prop_index_hint` had the same gap; this is the grouped
+/// path, which is separate code and needed the same fix.
 fn cmp_bound(e: &CExpr, ctx: &Ctx) -> Option<(usize, usize, CompareOp, crate::graph::IdxKey)> {
     if let CExpr::Compare { op, left, right } = e {
         if let CExpr::Prop { var_slot, key_ref } = left.as_ref() {
             let key = expr_to_idxkey(right, ctx)?;
+
             return Some((*var_slot, *key_ref, *op, key));
+        }
+        if let CExpr::Prop { var_slot, key_ref } = right.as_ref() {
+            let key = expr_to_idxkey(left, ctx)?;
+
+            return Some((*var_slot, *key_ref, flip_compare(*op), key));
         }
     }
     None
