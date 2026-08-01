@@ -32,6 +32,7 @@ pub mod pg_text;
 #[cfg(test)]
 mod conformance;
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::error::{CodeError, CodeResult};
@@ -163,22 +164,27 @@ pub(crate) fn json_to_value(j: &Json) -> CodeResult<Value> {
 
 /// A JSON id field as a string (a string verbatim; a number/bool/null via its
 /// JSON text — matching serde_json's `Display`).
-pub(crate) fn json_id(j: &Json) -> String {
+pub(crate) fn json_id<'a>(j: &Json<'a>) -> Cow<'a, str> {
     match j {
-        Json::Str(s) => s.clone().into_owned(),
-        Json::Num(n) => crate::jsonfmt::js_number(*n),
-        Json::Bool(b) => b.to_string(),
-        _ => "null".to_string(),
+        Json::Str(s) => s.clone(),
+        Json::Num(n) => Cow::Owned(crate::jsonfmt::js_number(*n)),
+        Json::Bool(b) => Cow::Owned(b.to_string()),
+        _ => Cow::Borrowed("null"),
     }
 }
 
 /// A JSON array field as a `Vec<String>` (non-string elements dropped).
-pub(crate) fn json_str_array(field: Option<&Json>) -> Vec<String> {
+pub(crate) fn json_str_array<'a>(field: Option<&Json<'a>>) -> Vec<Cow<'a, str>> {
     field
         .and_then(Json::as_array)
         .map(|a| {
             a.iter()
-                .filter_map(|x| x.as_str().map(String::from))
+                .filter_map(|x| match x {
+                    // Cloning the `Cow` keeps the INPUT's lifetime; `as_str()`
+                    // would hand back a reference into the tree instead.
+                    Json::Str(s) => Some(s.clone()),
+                    _ => None,
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -186,11 +192,11 @@ pub(crate) fn json_str_array(field: Option<&Json>) -> Vec<String> {
 
 /// A JSON object field as core property pairs (used by pg-json). A nested-object
 /// value anywhere is an `InvalidValue` error (see [`json_to_value`]).
-pub(crate) fn json_props(field: Option<&Json>) -> CodeResult<Vec<(String, Value)>> {
+pub(crate) fn json_props<'a>(field: Option<&Json<'a>>) -> CodeResult<Vec<(Cow<'a, str>, Value)>> {
     match field.and_then(Json::as_object) {
         Some(m) => m
             .iter()
-            .map(|(k, v)| Ok((k.clone().into_owned(), json_to_value(v)?)))
+            .map(|(k, v)| Ok((k.clone(), json_to_value(v)?)))
             .collect(),
         None => Ok(Vec::new()),
     }

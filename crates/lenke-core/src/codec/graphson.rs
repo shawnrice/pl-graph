@@ -15,6 +15,8 @@
 
 use crate::json::{self, Json};
 
+use std::borrow::Cow;
+
 use crate::codec::{element_props, is_intish, node_labels, push_json_str, push_num};
 use crate::error::{CodeError, CodeResult};
 use crate::error_codes::ErrorCode;
@@ -266,9 +268,19 @@ pub fn decode(input: &str) -> CodeResult<Graph> {
                 return Err(shape("vertex @value.id must be a string or number"));
             }
             let id = v.get("id").map(crate::codec::json_id).unwrap_or_default();
-            let labels = match v.get("label") {
+            let labels: Vec<Cow<'_, str>> = match v.get("label") {
                 Some(Json::Str(s)) if s.is_empty() => Vec::new(),
-                Some(Json::Str(s)) => s.split(LABEL_SEP).map(String::from).collect(),
+                // A multi-label vertex arrives `::`-joined. Splitting a slice of
+                // the INPUT yields slices of the input, so those borrow; splitting
+                // a label that had to be unescaped can only borrow from the tree,
+                // so those pieces are copied.
+                Some(Json::Str(Cow::Borrowed(s))) => {
+                    s.split(LABEL_SEP).map(Cow::Borrowed).collect()
+                }
+                Some(Json::Str(s)) => s
+                    .split(LABEL_SEP)
+                    .map(|x| Cow::Owned(x.to_string()))
+                    .collect(),
                 _ => return Err(shape("vertex @value.label must be a string")),
             };
             let mut props = Vec::new();
@@ -282,11 +294,7 @@ pub fn decode(input: &str) -> CodeResult<Graph> {
                     }
                 }
             }
-            b.nodes.push(NodeRec {
-                id: id.into(),
-                labels: crate::graph::owned_labels(labels),
-                props,
-            });
+            b.nodes.push(NodeRec { id, labels, props });
         }
     }
 
@@ -313,11 +321,11 @@ pub fn decode(input: &str) -> CodeResult<Graph> {
             }
             let id = e.get("id").map(crate::codec::json_id);
             b.edges.push(EdgeRec {
-                src: src.into(),
-                dst: dst.into(),
+                src,
+                dst,
                 etype: etype.into(),
                 props,
-                id: id.map(Into::into),
+                id,
             });
         }
     }
