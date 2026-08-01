@@ -2741,9 +2741,18 @@ impl Builder {
         };
 
         // (2) Labels: per-vertex list + inverted (label -> live vertices).
-        let mut vlabels: Vec<Vec<u32>> = vec![Vec::new(); n];
+        //
+        // Counted first, then filled. Growing these by pushing means every
+        // vertex's label list allocates and the per-label bucket doubles its way
+        // up — on a load where most nodes share one label that bucket reallocates
+        // and copies its way to the full vertex count. One counting pass makes
+        // every allocation below exact and final. Push ORDER is unchanged, which
+        // is what the byte-identical output depends on.
         let mut labels = Dict::default();
-        let mut by_label: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut label_ids: Vec<u32> =
+            Vec::with_capacity(nodes.iter().map(|nd| nd.labels.len()).sum());
+        let mut vlabel_count = vec![0u32; n];
+        let mut label_count: Vec<u32> = Vec::new();
         for (idx, node) in nodes.iter().enumerate() {
             if !keep_node[idx] {
                 continue; // first-wins: ignore a duplicate node id's labels
@@ -2751,6 +2760,34 @@ impl Builder {
             let vi = node_vi[idx];
             for l in &node.labels {
                 let lid = labels.intern(l);
+                label_ids.push(lid);
+                vlabel_count[vi as usize] += 1;
+                if label_count.len() <= lid as usize {
+                    label_count.resize(lid as usize + 1, 0);
+                }
+                label_count[lid as usize] += 1;
+            }
+        }
+
+        let mut vlabels: Vec<Vec<u32>> = vlabel_count
+            .iter()
+            .map(|&c| Vec::with_capacity(c as usize))
+            .collect();
+        let mut by_label: HashMap<u32, Vec<u32>> = HashMap::with_capacity(label_count.len());
+        for (lid, &c) in label_count.iter().enumerate() {
+            if c > 0 {
+                by_label.insert(lid as u32, Vec::with_capacity(c as usize));
+            }
+        }
+
+        let mut label_at = label_ids.into_iter();
+        for (idx, node) in nodes.iter().enumerate() {
+            if !keep_node[idx] {
+                continue;
+            }
+            let vi = node_vi[idx];
+            for _ in &node.labels {
+                let lid = label_at.next().expect("one label id recorded per label");
                 vlabels[vi as usize].push(lid);
                 by_label.entry(lid).or_default().push(vi);
             }
@@ -2772,9 +2809,47 @@ impl Builder {
         let mut e_src = vec![0u32; e];
         let mut e_dst = vec![0u32; e];
         let mut e_type = vec![0u32; e];
-        let mut out: Vec<Vec<Adj>> = vec![Vec::new(); n];
-        let mut in_: Vec<Vec<Adj>> = vec![Vec::new(); n];
-        let mut by_etype: HashMap<u32, Vec<u32>> = HashMap::new();
+        // Endpoints and type resolved ONCE, then counted, then filled. The old
+        // single pass pushed into `out[s]`/`in_[d]`, so every vertex touched by an
+        // edge allocated an adjacency list and doubled it as its degree grew — a
+        // hub reallocating and copying its way up. Resolving first also means the
+        // id dictionary is consulted once per endpoint instead of once per pass.
+        let resolved: Vec<(u32, u32, u32)> = kept_edges
+            .iter()
+            .map(|ed| {
+                (
+                    vid.get(&ed.src).unwrap(),
+                    vid.get(&ed.dst).unwrap(),
+                    etype.intern(&ed.etype),
+                )
+            })
+            .collect();
+        let mut out_deg = vec![0u32; n];
+        let mut in_deg = vec![0u32; n];
+        let mut etype_count: Vec<u32> = Vec::new();
+        for &(sv, dv, t) in &resolved {
+            out_deg[sv as usize] += 1;
+            in_deg[dv as usize] += 1;
+            if etype_count.len() <= t as usize {
+                etype_count.resize(t as usize + 1, 0);
+            }
+            etype_count[t as usize] += 1;
+        }
+
+        let mut out: Vec<Vec<Adj>> = out_deg
+            .iter()
+            .map(|&d| Vec::with_capacity(d as usize))
+            .collect();
+        let mut in_: Vec<Vec<Adj>> = in_deg
+            .iter()
+            .map(|&d| Vec::with_capacity(d as usize))
+            .collect();
+        let mut by_etype: HashMap<u32, Vec<u32>> = HashMap::with_capacity(etype_count.len());
+        for (t, &c) in etype_count.iter().enumerate() {
+            if c > 0 {
+                by_etype.insert(t as u32, Vec::with_capacity(c as usize));
+            }
+        }
         // Lazy external-id overlay: only edges that carry an id land here. Sized
         // for all of them — a document where every edge carries an id is the norm
         // (it is what `encode` emits), and growing these mid-build rehashes every
@@ -2782,9 +2857,7 @@ impl Builder {
         let mut eid_fwd: HashMap<u32, Arc<str>> = HashMap::with_capacity(e);
         let mut eid_rev: HashMap<Arc<str>, u32> = HashMap::with_capacity(e);
         for (i, ed) in kept_edges.iter().enumerate() {
-            let s = vid.get(&ed.src).unwrap();
-            let d = vid.get(&ed.dst).unwrap();
-            let t = etype.intern(&ed.etype);
+            let (s, d, t) = resolved[i];
             e_src[i] = s;
             e_dst[i] = d;
             e_type[i] = t;
