@@ -33,6 +33,8 @@ mod interval_index;
 pub mod algo;
 pub mod graph;
 pub mod query;
+/// The shared index access path both query engines lower into.
+pub mod seek;
 pub mod temporal;
 
 // Composable capabilities — gated so a minimal (e.g. frontend wasm) build ships
