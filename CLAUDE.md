@@ -38,6 +38,12 @@ up about a third of that. The gap is widest on edge-heavy ingest and traversal â
 which is where most optimization work lands, so those wins do not reach pure-TS
 users. Check both when changing anything shared.
 
+`bun run bench:usage` is the serving counterpart: small operations against a warm
+graph, including interleaved read/write. Bulk throughput and per-operation cost
+are different questions and a change can help one while hurting the other â€”
+interleaving a write with a traversal already costs ~2.5x the traversal alone,
+because a write invalidates the read-side snapshot.
+
 ### Before trusting a number
 
 Each of these is here because a wrong conclusion was drawn and committed first.

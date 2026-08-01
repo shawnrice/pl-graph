@@ -29,7 +29,8 @@
     "build:wasm": "cargo build --release --target wasm32-unknown-unknown --no-default-features --features gql,gremlin,ndjson,codecs,arrow --manifest-path ../../crates/lenke-core/Cargo.toml",
     "build:wasm:min": "cargo build --release --target wasm32-unknown-unknown --no-default-features --features gql --manifest-path ../../crates/lenke-core/Cargo.toml",
     "test": "bun test",
-    "bench": "bun bench.ts"
+    "bench": "bun bench.ts",
+    "bench:usage": "bun bench-usage.ts"
   },
   "dependencies": {
     "@lenke/core": "workspace:*",

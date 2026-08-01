@@ -110,9 +110,36 @@ remembering: those wins do not reach pure-TS users.
 Part of the decode gap is threads rather than codegen: decode defaults to the
 parallel path and only ffi has any, so wasm and TS both run it serially.
 
+### Usage-shaped workloads
+
+`bun run bench` is the ingest shape: load a big document, run one query over all
+of it. Serving is the opposite — many small operations against a warm graph, and
+often reads and writes INTERLEAVED, which is the pattern that has historically
+broken things here (a write invalidates the read-side snapshot, so alternating
+them can repack the adjacency every cycle).
+
+```
+cd packages/native
+bun run bench:usage
+BENCH_OPS=20000 BENCH_GRAPH=50000 bun run bench:usage
+```
+
+Point lookup, permission check, 2-hop recommendation, keyed dedup, property
+update, append, and three interleaved read/write shapes — drawn from the
+applications this engine has been exercised against. Reported as operations per
+second on all three engines.
+
+Two things it makes visible. The **permission check** (two labelled hops from a
+point lookup) runs at tens to low hundreds of operations per second — single-digit
+milliseconds each, orders of magnitude off the other reads, because it scans
+rather than seeks. And **interleaving a write with a traversal** costs about 2.5x
+the same traversal alone, which is the read-snapshot invalidation showing up
+exactly where it was predicted to.
+
 ## Known gaps
 
 - **The FFI boundary** — marshalling, param encoding, result decoding — is only
   ever measured end-to-end from JS, never in isolation.
-- **Writes and transactions on the TS engine.** `perf_bench` covers them for the
-  Rust core; the JS harness above is read/ingest-shaped only.
+- **Transactions** are not covered from JS. `perf_bench` shows `set_prop` inside
+  a transaction at ~2.5x the cost of outside one on the Rust core; the TS
+  equivalent is unmeasured.
