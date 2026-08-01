@@ -2083,3 +2083,124 @@ mod temporal_index_key_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The interning dictionary's open-addressed table.
+//
+// It replaced a `HashMap` for memory-access reasons (8-byte slots, and a stored
+// hash that rejects a non-match without dereferencing the string), so the paths
+// a hash map used to handle for us — growth, rehashing, probe termination,
+// 32-bit hash collisions — are now ours and need their own cover.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dict_interning_is_stable_and_dense() {
+    use crate::graph::Dict;
+
+    let mut d = Dict::default();
+
+    assert_eq!(d.intern("a"), 0);
+    assert_eq!(d.intern("b"), 1);
+    assert_eq!(d.intern("a"), 0, "re-interning must return the first id");
+    assert_eq!(d.intern("c"), 2);
+    assert_eq!(d.len(), 3);
+    assert_eq!(d.text(0), "a");
+    assert_eq!(d.text(2), "c");
+    assert_eq!(d.get("b"), Some(1));
+    assert_eq!(d.get("nope"), None);
+}
+
+#[test]
+fn dict_survives_many_growths_with_ids_intact() {
+    use crate::graph::Dict;
+
+    // Well past several doublings from the default size, so the rehash path runs
+    // repeatedly and every previously-assigned id has to survive it.
+    let mut d = Dict::default();
+    let n = 5_000u32;
+
+    for i in 0..n {
+        assert_eq!(d.intern(&format!("key{i}")), i);
+    }
+
+    assert_eq!(d.len(), n as usize);
+    for i in 0..n {
+        assert_eq!(
+            d.get(&format!("key{i}")),
+            Some(i),
+            "id moved during a growth"
+        );
+        assert_eq!(d.text(i), format!("key{i}"));
+    }
+}
+
+#[test]
+fn dict_with_capacity_matches_a_grown_one() {
+    use crate::graph::Dict;
+
+    // Pre-sizing must not change any assigned id.
+    let mut grown = Dict::default();
+    let mut sized = Dict::with_capacity(1_000);
+
+    for i in 0..1_000u32 {
+        let k = format!("k{i}");
+
+        assert_eq!(grown.intern(&k), sized.intern(&k));
+    }
+
+    assert_eq!(grown.len(), sized.len());
+}
+
+#[test]
+fn dict_distinguishes_strings_that_share_a_hash_bucket() {
+    use crate::graph::Dict;
+
+    // The table stores a 32-bit hash and only compares the string when that
+    // matches, so a bucket shared by different strings must still resolve by
+    // content. With thousands of keys in a small table this exercises long probe
+    // runs as well.
+    let mut d = Dict::default();
+    let keys: Vec<String> = (0..2_000)
+        .map(|i| format!("{i:width$}", width = 40))
+        .collect();
+
+    for (i, k) in keys.iter().enumerate() {
+        assert_eq!(d.intern(k), i as u32);
+    }
+    for (i, k) in keys.iter().enumerate() {
+        assert_eq!(d.get(k), Some(i as u32));
+    }
+}
+
+#[test]
+fn dict_handles_empty_and_unicode_keys() {
+    use crate::graph::Dict;
+
+    let mut d = Dict::default();
+
+    assert_eq!(d.intern(""), 0);
+    assert_eq!(d.intern("😀"), 1);
+    assert_eq!(d.intern("中文"), 2);
+    assert_eq!(d.intern(""), 0);
+    assert_eq!(d.get("😀"), Some(1));
+    assert_eq!(d.text(2), "中文");
+}
+
+#[test]
+fn dict_clone_keeps_lookups_working() {
+    use crate::graph::Dict;
+
+    // The table is cloned alongside the strings; a clone that kept one without
+    // the other would look empty or panic.
+    let mut d = Dict::default();
+
+    for i in 0..500u32 {
+        d.intern(&format!("v{i}"));
+    }
+
+    let c = d.clone();
+
+    for i in 0..500u32 {
+        assert_eq!(c.get(&format!("v{i}")), Some(i));
+    }
+}
