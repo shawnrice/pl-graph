@@ -125,9 +125,18 @@ them can repack the adjacency every cycle).
 
 ```
 cd packages/native
-bun run bench:usage
-BENCH_OPS=20000 BENCH_GRAPH=50000 bun run bench:usage
+bun run bench:usage                                # the whole matrix, ~3 min
+BENCH_BUDGET_MS=500 BENCH_GRAPH=50000 bun run bench:usage
 ```
+
+Batches are **time-boxed**, not fixed-count, and each one is sized from a single
+pilot operation. Cells here span five orders of magnitude — an unindexed 2-hop
+traversal runs at 6 ops/s and an indexed batched update at 580k — so one op
+count is wrong at both ends simultaneously: it gave the fast cells a 2 ms sample
+(noise) and made the slow ones take five minutes EACH. The matrix took ~40
+minutes and two thirds of that was three pure-TS cells. The two workloads that
+grow the graph still run a fixed count, because a time box would let a fast
+engine append 100x more elements and then charge it for the bigger graph.
 
 Point lookup, permission check, 2-hop recommendation, keyed dedup, property
 update, append, and three interleaved read/write shapes — drawn from the

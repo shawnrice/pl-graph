@@ -16,12 +16,13 @@
  *
  *   bun run bench:usage
  *   BENCH_ENGINES=ts,ffi bun run bench:usage
- *   BENCH_OPS=20000 bun run bench:usage      # operations per workload
+ *   BENCH_BUDGET_MS=500 bun run bench:usage  # longer batches, tighter numbers
  *   BENCH_GRAPH=50000 bun run bench:usage    # graph size to serve from
  *
- * Reported as operations per second, best of three batches. A batch is a fixed
- * number of operations, so the number is a rate rather than a duration and is
- * comparable across engines with very different absolute speeds.
+ * Reported as operations per second, best of three batches. Each batch runs for
+ * a fixed DURATION and counts how many operations fit, so the number is a rate
+ * and is comparable across engines with very different absolute speeds — and
+ * every cell costs the same wall clock regardless of how slow it is.
  */
 import { existsSync } from 'node:fs';
 
@@ -44,7 +45,19 @@ const WASM = new URL(
   import.meta.url,
 ).pathname;
 
+/** Fixed op count — used only by the `grows` workloads now (see `rate`). */
 const OPS = Number(process.env.BENCH_OPS ?? 5_000);
+/** Milliseconds each timed batch runs for. */
+const BUDGET_MS = Number(process.env.BENCH_BUDGET_MS ?? 250);
+/**
+ * Floor on ops per batch, so a very slow cell is still more than one sample.
+ * Small on purpose: a cell running at 6 ops/s spends 167 ms PER OPERATION, and
+ * an operation that large is already a stable measurement — the many-samples
+ * argument is about microsecond operations, not this end of the range.
+ */
+const MIN_OPS = Number(process.env.BENCH_MIN_OPS ?? 4);
+/** Ceiling, so a pilot that happens to land fast cannot run away. */
+const MAX_OPS = Number(process.env.BENCH_MAX_OPS ?? 2_000_000);
 const GRAPH = Number(process.env.BENCH_GRAPH ?? 20_000);
 const BATCHES = Number(process.env.BENCH_BATCHES ?? 3);
 const WANTED = new Set(
@@ -144,6 +157,13 @@ type Workload = {
    * because they are counted differently.
    */
   units?: number;
+  /**
+   * This workload ADDS elements, so its cost depends on how many iterations ran.
+   * Those run a fixed count on every engine; everything else is time-boxed. A
+   * time-boxed append would let a fast engine grow the graph 100x more than a
+   * slow one and then charge it for the larger graph.
+   */
+  grows?: true;
 };
 
 const WORKLOADS: Workload[] = [
@@ -201,6 +221,7 @@ const WORKLOADS: Workload[] = [
     // unindexed pays no maintenance, so the indexed and unindexed columns would
     // come out the same and the row would look like indexes are free on writes.
     name: 'write: append node',
+    grows: true,
     op: (e, g, i) =>
       void e.query(g, `INSERT (:Event {name: 'ev${i}', score: ${i % 100}, seq: ${i}})`),
   },
@@ -316,6 +337,7 @@ const WORKLOADS: Workload[] = [
     // BENCH_OPS — a benchmark measuring its own accumulation rather than the
     // operation.
     name: 'interleaved: append + link',
+    grows: true,
     op: (e, g, i) =>
       void e.query(
         g,
@@ -360,9 +382,26 @@ if (engines.length === 0) {
  */
 const INDEXED_KEYS = ['name', 'score'];
 
-/** Operations per second for one workload, best of `BATCHES` batches. */
+/**
+ * Operations per second for one workload, best of `BATCHES` batches.
+ *
+ * Batches are TIME-BOXED, not fixed-count. Cells in this matrix differ by five
+ * orders of magnitude — an unindexed 2-hop traversal runs at 6 ops/s and an
+ * indexed batched update at 543k — so a single op count is wrong at both ends
+ * at once: it made the slow cells take 5+ minutes each (the whole matrix ran
+ * ~40 minutes, nearly all of it three TS cells) while giving the fast cells a
+ * 2 ms sample, which is noise. A time box spends the same wall clock everywhere
+ * and lets the fast cells take the many more samples they need.
+ *
+ * Ops/sec is a rate, so a cell that completes 40 ops in 250 ms reports just as
+ * validly as one that completes a million.
+ *
+ * `grows` workloads are the exception and stay fixed-count — see the flag.
+ */
 const rate = (e: Engine, w: Workload, indexed: boolean): number => {
   let bestOps = 0;
+  const budgetNs = BUDGET_MS * 1e6;
+  const fixed = w.grows ? Math.max(1, Math.floor(OPS / (w.scale ?? 1))) : 0;
 
   for (let b = 0; b < BATCHES; b++) {
     // A fresh graph per batch: the write workloads mutate, and a batch that
@@ -376,10 +415,18 @@ const rate = (e: Engine, w: Workload, indexed: boolean): number => {
         }
       }
 
-      const ops = Math.max(1, Math.floor(OPS / (w.scale ?? 1)));
+      // Warm, and use that one operation as the PILOT that sizes the batch.
+      // Polling the clock inside the loop instead needs a chunk size, and any
+      // fixed chunk is wrong at one end: 16 ops is nothing at 500k ops/s and is
+      // 5.3 SECONDS at 6 ops/s, which is where most of this benchmark's runtime
+      // went. Sizing up front costs one extra operation and nothing else.
+      const pilot = Bun.nanoseconds();
 
-      w.op(e, g, 0); // warm
+      w.op(e, g, 0);
 
+      const perOp = Math.max(1, Bun.nanoseconds() - pilot);
+      const ops =
+        fixed > 0 ? fixed : Math.max(MIN_OPS, Math.min(MAX_OPS, Math.ceil(budgetNs / perOp)));
       const t = Bun.nanoseconds();
 
       for (let i = 1; i <= ops; i++) {
@@ -414,7 +461,7 @@ const fmt = (n: number): string => {
 };
 
 console.log(
-  `\n${GRAPH} users, ${OPS} ops/batch, best of ${BATCHES}. Engines: ${engines.map((e) => e.name).join(', ')}`,
+  `\n${GRAPH} users, ${BUDGET_MS}ms batches, best of ${BATCHES}. Engines: ${engines.map((e) => e.name).join(', ')}`,
 );
 console.log(
   `Operations per second, higher is better. (-) no indexes, (+) indexed on ${INDEXED_KEYS.join(', ')}.\n`,
