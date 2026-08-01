@@ -821,4 +821,98 @@ mod tests {
         let line = r#"{"type":"node","id":"a","labels":["N"],"properties":{"s":"\ud83e"}}"#;
         assert_eq!(decode(line).err().unwrap().code, ErrorCode::InvalidJson);
     }
+
+    /// How fast COULD ingest go, and how close is it?
+    ///
+    /// A throughput number means nothing without a reference, so this measures
+    /// one document at five levels:
+    ///
+    ///   1. scan   — count newlines. LLVM vectorizes it, so this is roughly what
+    ///               the machine pulls through memory: the hard ceiling.
+    ///   2. copy   — allocate and memcpy the input. The floor for anything that
+    ///               must produce as much output as it consumed.
+    ///   3. parse  — run the JSON parser over every line and drop the result.
+    ///               Structure recognized, nothing built.
+    ///   4. decode — the whole thing: dictionaries, columns, adjacency.
+    ///   5. encode — the way back out.
+    ///
+    /// The gap between 3 and 4 is the graph BUILD, which no JSON parser does —
+    /// which is why comparing a graph loader's GiB/s against a JSON parser's is
+    /// not like for like.
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn ingest_throughput_against_the_ceiling() {
+        use std::time::Instant;
+
+        fn bench(label: &str, bytes: usize, reps: usize, mut f: impl FnMut()) -> f64 {
+            f();
+
+            let mut best = f64::MAX;
+
+            for _ in 0..reps {
+                let t = Instant::now();
+
+                f();
+
+                let s = t.elapsed().as_secs_f64();
+
+                if s < best {
+                    best = s;
+                }
+            }
+
+            let gibs = bytes as f64 / best / (1024.0 * 1024.0 * 1024.0);
+
+            println!("  {label:<30} {:>8.1} ms  {gibs:>7.3} GiB/s", best * 1000.0);
+
+            gibs
+        }
+
+        let n = 200_000;
+        let text: String = (0..n)
+            .map(|i| {
+                format!(
+                    concat!(
+                        r#"{{"type":"node","id":"v{i}","labels":["Person"],"#,
+                        r#""properties":{{"name":"person{i}","city":"Springfield","age":{a}}}}}"#
+                    ),
+                    i = i,
+                    a = i % 90
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bytes = text.len();
+
+        println!("\n{n} nodes, {:.1} MiB\n", bytes as f64 / (1024.0 * 1024.0));
+
+        let ceiling = bench("1. scan (count newlines)", bytes, 20, || {
+            std::hint::black_box(text.bytes().filter(|b| *b == b'\n').count());
+        });
+
+        bench("2. copy (allocate + memcpy)", bytes, 20, || {
+            std::hint::black_box(text.to_string());
+        });
+
+        let parse = bench("3. parse only (drop result)", bytes, 5, || {
+            for line in text.lines() {
+                std::hint::black_box(crate::json::parse(line).is_ok());
+            }
+        });
+        let decode_gibs = bench("4. decode (build the graph)", bytes, 5, || {
+            std::hint::black_box(super::decode(&text).is_ok());
+        });
+        let g = super::decode(&text).expect("decodes");
+        let obytes = encode(&g).len();
+
+        bench("5. encode", obytes, 5, || {
+            std::hint::black_box(encode(&g).len());
+        });
+
+        println!(
+            "\n  parse reaches {:.0}% of the scan ceiling; decode reaches {:.0}% of parse.\n",
+            parse / ceiling * 100.0,
+            decode_gibs / parse * 100.0
+        );
+    }
 }
