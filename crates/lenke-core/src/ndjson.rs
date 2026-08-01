@@ -876,6 +876,15 @@ mod tests {
     /// started changing. `interleaved_write_and_traverse_is_independent_of_graph_
     /// size` in the GQL tests exists to keep it that way.
     ///
+    /// Row 8 also carries a rejected experiment. The edge-id path consults two
+    /// tables over the same strings — a `HashSet` to reject a duplicate, then the
+    /// `eid_rev` overlay — and merging them (the overlay IS the duplicate check)
+    /// measured a wash at 1M: 1427 ms before, 1432 after. Worth recording that
+    /// the FIRST cut of it measured 8% slower, because moving the overlay maps
+    /// earlier lost their `with_capacity` and they rehashed their way up. The
+    /// same trick on the NODE side is a real 12% win (see `keep_node`), which is
+    /// the difference between removing a table and merely merging two.
+    ///
     /// `INGEST_N=3000000,5000000` overrides the default sweep.
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]
