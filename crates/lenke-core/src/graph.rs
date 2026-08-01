@@ -31,38 +31,123 @@ use crate::error_codes::ErrorCode;
 /// so a string property is never re-allocated end to end. `Arc` (not `Rc`) keeps
 /// the graph `Send` — needed for the parallel ndjson decode and a shared
 /// read-only graph on the server.
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct Dict {
-    map: HashMap<Arc<str>, u32>,
+    /// Open-addressed index into `strings`: each slot is `(hash, id + 1)`, with
+    /// `0` marking empty. Power-of-two length, linear probing.
+    ///
+    /// This replaced a `HashMap<Arc<str>, u32>`, and the reason is memory access
+    /// rather than hashing. That map stored a 16-byte fat pointer per entry, and
+    /// any probe surviving the control-byte filter had to DEREFERENCE the `Arc`
+    /// to compare the key — a second cache miss, into a separate allocation, for
+    /// every lookup. Past roughly a million entries the dictionary no longer fits
+    /// in cache and those misses become the cost of ingest.
+    ///
+    /// Here a slot is 8 bytes, so a cache line holds eight of them, and the
+    /// stored hash rejects a non-match without touching the string at all. The
+    /// string is dereferenced only when the full 32-bit hash already matched.
+    ///
+    /// The hash itself is unchanged — still `RandomState`, still SipHash, still
+    /// seeded per process. This is deliberate: the keys are ids, labels and
+    /// property names taken straight from a document, so a weaker hash would let
+    /// a crafted upload collide them and make ingest quadratic.
+    table: Vec<(u32, u32)>,
+    hasher: std::collections::hash_map::RandomState,
     pub strings: Vec<Arc<str>>,
 }
 
+impl Default for Dict {
+    fn default() -> Self {
+        Self::with_capacity(0)
+    }
+}
+
 impl Dict {
-    /// A dictionary sized for `n` distinct entries up front. Interning grows the
-    /// map by doubling, and every growth REHASHES everything already in it, so a
-    /// dictionary built to 400k ids re-hashes each key on the order of twenty
-    /// times. The element count is known before the build starts, so none of that
-    /// is necessary.
+    /// A dictionary sized for `n` distinct entries up front, so the table never
+    /// has to grow and rehash mid-build.
     pub fn with_capacity(n: usize) -> Self {
+        // Keep the load factor under 7/8.
+        let want = (n * 8 / 7).next_power_of_two().max(16);
+
         Self {
-            map: HashMap::with_capacity(n),
+            table: vec![(0, 0); want],
+            hasher: std::collections::hash_map::RandomState::new(),
             strings: Vec::with_capacity(n),
         }
     }
 
-    pub fn intern(&mut self, s: &str) -> u32 {
-        if let Some(&id) = self.map.get(s) {
-            return id;
+    fn hash_of(&self, s: &str) -> u32 {
+        use std::hash::{BuildHasher, Hasher};
+
+        let mut h = self.hasher.build_hasher();
+
+        h.write(s.as_bytes());
+        // Fold to 32 bits; the low bits pick the slot, so keep the high entropy.
+        (h.finish() >> 32) as u32
+    }
+
+    /// Slot holding `s`, or the first empty slot where it would go.
+    fn probe(&self, s: &str, hash: u32) -> usize {
+        let mask = self.table.len() - 1;
+        let mut i = hash as usize & mask;
+
+        loop {
+            let (h, id) = self.table[i];
+
+            if id == 0 || (h == hash && &*self.strings[(id - 1) as usize] == s) {
+                return i;
+            }
+            i = (i + 1) & mask;
         }
+    }
+
+    fn grow(&mut self) {
+        let mut bigger = vec![(0u32, 0u32); self.table.len() * 2];
+        let mask = bigger.len() - 1;
+
+        for &(h, id) in &self.table {
+            if id != 0 {
+                let mut i = h as usize & mask;
+
+                while bigger[i].1 != 0 {
+                    i = (i + 1) & mask;
+                }
+                bigger[i] = (h, id);
+            }
+        }
+        self.table = bigger;
+    }
+
+    pub fn intern(&mut self, s: &str) -> u32 {
+        let hash = self.hash_of(s);
+        let mut slot = self.probe(s, hash);
+
+        if self.table[slot].1 != 0 {
+            return self.table[slot].1 - 1;
+        }
+
+        // Grow at 7/8, which also guarantees the table always holds an empty
+        // slot — `probe` relies on that to terminate.
+        if (self.strings.len() + 1) * 8 >= self.table.len() * 7 {
+            self.grow();
+            slot = self.probe(s, hash);
+        }
+
         let id = self.strings.len() as u32;
-        let arc: Arc<str> = Arc::from(s);
-        self.strings.push(arc.clone());
-        self.map.insert(arc, id);
+
+        self.strings.push(Arc::from(s));
+        self.table[slot] = (hash, id + 1);
+
         id
     }
+
     pub fn get(&self, s: &str) -> Option<u32> {
-        self.map.get(s).copied()
+        let hash = self.hash_of(s);
+        let (_, id) = self.table[self.probe(s, hash)];
+
+        (id != 0).then(|| id - 1)
     }
+
     pub fn text(&self, id: u32) -> &str {
         &self.strings[id as usize]
     }
