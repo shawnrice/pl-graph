@@ -96,8 +96,16 @@ fn bench(g: &mut Graph, q: &str) -> (f64, i64) {
 /// outside a transaction and (for property writes) inside one — so the undo-log
 /// cost of the transaction path is visible. Run last, on a copy of the graph, so
 /// it doesn't perturb the read timings above.
-fn bench_writes(ops: usize) {
-    let mut g = build(200_000, 4);
+/// Write throughput at a given average degree.
+///
+/// Degree is a parameter because it decides which adjacency representations can
+/// pay off. A small-vector adjacency (first N entries inline, spilling to a
+/// `Vec`) only helps vertices below N; measured against a degree-4 fixture it
+/// looked like a flat 11% regression, because every list had already spilled and
+/// it was paying the extra branch for nothing. A degree-1 graph is the case it
+/// exists for, and any future attempt should be judged against both.
+fn bench_writes_at(ops: usize, vertices: usize, degree: usize) {
+    let mut g = build(vertices, degree);
     let n = g.vertex_count() as u32;
     let mut rng = Rng(0xDEAD_BEEF_CAFE_1234);
     let rate = |ops: usize, secs: f64| ops as f64 / secs / 1e6; // M ops/sec
@@ -127,7 +135,7 @@ fn bench_writes(ops: usize) {
     let set_prop_tx = rate(ops, t.elapsed().as_secs_f64());
     let _ = g.commit_tx();
 
-    println!("\n  write throughput (M ops/sec, higher is better):");
+    println!("\n  write throughput at degree {degree} (M ops/sec, higher is better):");
     println!("    add_edge              {add_edge:>7.2}");
     println!("    set_prop (no tx)      {set_prop:>7.2}");
     println!("    set_prop (in tx)      {set_prop_tx:>7.2}");
@@ -445,5 +453,10 @@ fn main() {
     }
 
     std::hint::black_box(&g);
-    bench_writes(500_000);
+    // Both ends of the degree range: a hub-ish graph where every adjacency list
+    // is long, and a sparse one where each is a single entry.
+    // Vertex count held constant so only DEGREE varies — otherwise the bigger
+    // per-vertex arrays of a larger graph dominate and hide it.
+    bench_writes_at(500_000, 200_000, 1);
+    bench_writes_at(500_000, 200_000, 4);
 }

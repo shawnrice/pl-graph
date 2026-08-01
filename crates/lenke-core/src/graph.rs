@@ -1324,6 +1324,15 @@ const CSR_WARM_READS: u32 = 64;
 /// the WRITE path, and reads already have a flat one. Optimizing it for read
 /// locality targets a cost that has already been paid elsewhere, while any
 /// per-push overhead lands on every mutation.
+///
+/// One caveat on that 11%, because it is easy to draw the wrong conclusion from
+/// it: the write benchmark's fixture has average degree 4, against two inline
+/// slots. Every list there had ALREADY spilled to a `Vec`, so the small-vector
+/// form was paying its discriminant branch and its larger array for no benefit
+/// at all — it was never measured on a graph it could help. `bench_writes_at`
+/// now takes degree as a parameter for that reason. A fresh attempt should size
+/// the inline capacity above the degree it is aimed at, and be judged at both
+/// ends of the range rather than at one.
 fn csr_pack(adjs: &[Vec<Adj>]) -> (Vec<u32>, Vec<Adj>) {
     let total: usize = adjs.iter().map(Vec::len).sum();
     let mut off = Vec::with_capacity(adjs.len() + 1);
