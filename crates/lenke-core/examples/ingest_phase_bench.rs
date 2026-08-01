@@ -43,6 +43,24 @@
 //! already removed. (The repeated-string-vs-number gap was 36 ms before the
 //! borrow and is 7.6 ms after it.)
 //!
+//! A third idea, also tried and REJECTED: `element_props` and `node_labels`
+//! build a `Vec` per element, for every codec on both sides, which looked like
+//! obvious per-element overhead. Both ways of removing it were measured on
+//! pg-json encode at 400k elements, 15 reps (min / p25 / median ms):
+//!
+//!     Vec per element (today)   85.3 / 85.7 / 89.9
+//!     lazy iterator             84.0 / 85.0 / 88.4
+//!     caller-supplied scratch   83.7 / 84.5 / 87.7
+//!
+//! ~1-2%, against an estimate of 15% — the `Vec` costs a couple of nanoseconds
+//! per element, not fifty. A small short-lived allocation comes off a hot free
+//! list and goes straight back; the estimate assumed a malloc costs what a
+//! malloc costs in isolation. Threading a scratch buffer through five codecs, or
+//! splitting the helper in two so single-pass callers can take an iterator while
+//! csv (which needs a slice for its two passes) keeps the `Vec`, is not worth
+//! that. Note this is the SAME shape of error as the `Arc` adoption above:
+//! counting allocations is not measuring time.
+//!
 //! Buying that ~5% means putting a lifetime on `Value` — the core stored and
 //! result type, carried through query evaluation, Gremlin, the algorithms and
 //! the FFI — and growing it from a 16-byte `Arc<str>` to a 24-byte `Cow`. That
