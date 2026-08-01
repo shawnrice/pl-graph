@@ -1303,6 +1303,27 @@ struct Csr {
 const CSR_WARM_READS: u32 = 64;
 
 /// Flatten per-vertex adjacency `Vec`s into `(offsets, concatenated slots)`.
+/// Why the per-vertex adjacency is a `Vec<Vec<Adj>>` and stays one.
+///
+/// It looks wasteful, and partly is: a vertex with any edge owns a separate heap
+/// allocation, so building a million-vertex graph makes ~2M small ones. Measured
+/// on 1M edges, spreading them over 1M vertices rather than 10k costs ~380 ms of
+/// a 1537 ms decode.
+///
+/// Storing the first two entries inline (a hand-rolled small-vector, no new
+/// dependency) was built and measured. It recovered only ~5% of the build, since
+/// most of that 380 ms turned out to be the header array's cache footprint
+/// rather than the allocations, and the inline enum is 32 bytes against a
+/// `Vec`'s 24, so the array grew by a third and gave some of it back. Traversal
+/// did not benefit at all, because a warm read goes through the packed CSR
+/// snapshot below and never touches this structure. And `add_edge` got 11%
+/// SLOWER (4.28 -> 3.82 M ops/sec) — the enum dispatch and spill check on every
+/// push.
+///
+/// Which is the same lesson the CSR experiment left behind: this structure is on
+/// the WRITE path, and reads already have a flat one. Optimizing it for read
+/// locality targets a cost that has already been paid elsewhere, while any
+/// per-push overhead lands on every mutation.
 fn csr_pack(adjs: &[Vec<Adj>]) -> (Vec<u32>, Vec<Adj>) {
     let total: usize = adjs.iter().map(Vec::len).sum();
     let mut off = Vec::with_capacity(adjs.len() + 1);
