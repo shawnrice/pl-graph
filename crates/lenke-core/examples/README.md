@@ -11,25 +11,25 @@ obvious without opening them.
 
 ## By question
 
-| If you are asking… | Run |
-| --- | --- |
-| Is a query shape slow? Which of the four perf levers moved? | `perf_bench` |
-| How do query shapes scale with graph size? | `scale_bench` |
-| What does an individual GQL query shape cost? | `gql_bench` |
-| Same, for Gremlin traversals | `gremlin_bench` |
-| **Should adjacency storage change, and what would writes pay?** | **`storage_probe`** |
-| How far is the WHERE path from a hand-written columnar kernel? | `eval_vs_columnar` |
-| Does the property index actually seed a seek? (GQL / Gremlin) | `edge_type_index_bench`, `gremlin_index_bench` |
-| What do the graph algorithms cost? | `algo_bench`, `neighbor_aggregate_bench` |
-| What does `CALL` add over calling an algorithm directly? | `call_bench` |
-| What do map/record properties cost — stored, and through a codec? | `map_bench`, `map_codec_bench` |
-| What do temporal columns cost? | `temporal_bench` |
-| What do path selectors and per-hop predicates cost? | `path_selector_bench` |
-| What does a record-typed constraint cost to declare? | `record_debox_bench` |
-| What does CDC scope extraction cost per write? | `cdc_extract_bench` |
-| How much memory does a graph of N vertices take? | `mem_probe` |
-| **Where does NDJSON ingest time go, and what is the ceiling?** | **`ingest_phase_bench`**, plus `ingest_throughput` below |
-| Are the count fast paths correct? (not a benchmark) | `count_check` |
+| If you are asking…                                                | Run                                                      |
+| ----------------------------------------------------------------- | -------------------------------------------------------- |
+| Is a query shape slow? Which of the four perf levers moved?       | `perf_bench`                                             |
+| How do query shapes scale with graph size?                        | `scale_bench`                                            |
+| What does an individual GQL query shape cost?                     | `gql_bench`                                              |
+| Same, for Gremlin traversals                                      | `gremlin_bench`                                          |
+| **Should adjacency storage change, and what would writes pay?**   | **`storage_probe`**                                      |
+| How far is the WHERE path from a hand-written columnar kernel?    | `eval_vs_columnar`                                       |
+| Does the property index actually seed a seek? (GQL / Gremlin)     | `edge_type_index_bench`, `gremlin_index_bench`           |
+| What do the graph algorithms cost?                                | `algo_bench`, `neighbor_aggregate_bench`                 |
+| What does `CALL` add over calling an algorithm directly?          | `call_bench`                                             |
+| What do map/record properties cost — stored, and through a codec? | `map_bench`, `map_codec_bench`                           |
+| What do temporal columns cost?                                    | `temporal_bench`                                         |
+| What do path selectors and per-hop predicates cost?               | `path_selector_bench`                                    |
+| What does a record-typed constraint cost to declare?              | `record_debox_bench`                                     |
+| What does CDC scope extraction cost per write?                    | `cdc_extract_bench`                                      |
+| How much memory does a graph of N vertices take?                  | `mem_probe`                                              |
+| **Where does NDJSON ingest time go, and what is the ceiling?**    | **`ingest_phase_bench`**, plus `ingest_throughput` below |
+| Are the count fast paths correct? (not a benchmark)               | `count_check`                                            |
 
 ## Benchmarks that live as ignored tests
 
@@ -40,16 +40,16 @@ cannot be examples. Run with:
 cargo test --release <name> -- --ignored --nocapture
 ```
 
-| Name | Question |
-| --- | --- |
+| Name                                    | Question                                                                                                                                 |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | `ingest_throughput_against_the_ceiling` | How close is decode to what the machine can do? Sweeps 10k / 200k / 1M, and covers edge locality and edge ids. `INGEST_N=…` to override. |
-| `query_row_cost` | What does a query pay PER ROW, by column type and by `RETURN n`? `ROWS=…` to override. |
-| `bench_parallel_query_speedup` | How does query parallelism scale? Needs `--features parallel-query`; vary `RAYON_NUM_THREADS`. |
-| `bench_aml_shapes` | An AML-shaped workload — layering and structuring patterns over a transaction network. |
-| `bench_hris_shapes` | An HRIS-shaped workload — an org hierarchy with `REPORTS_TO`. |
-| `bench_temporal_index` | Bitemporal index bake-off over an SCD-2 org. |
-| `bench_allen_relations` | All thirteen Allen relations over a batch of edge versions. |
-| `bench_var_length_matcher` | The whole var-length matcher surface. |
+| `query_row_cost`                        | What does a query pay PER ROW, by column type and by `RETURN n`? `ROWS=…` to override.                                                   |
+| `bench_parallel_query_speedup`          | How does query parallelism scale? Needs `--features parallel-query`; vary `RAYON_NUM_THREADS`.                                           |
+| `bench_aml_shapes`                      | An AML-shaped workload — layering and structuring patterns over a transaction network.                                                   |
+| `bench_hris_shapes`                     | An HRIS-shaped workload — an org hierarchy with `REPORTS_TO`.                                                                            |
+| `bench_temporal_index`                  | Bitemporal index bake-off over an SCD-2 org.                                                                                             |
+| `bench_allen_relations`                 | All thirteen Allen relations over a batch of edge versions.                                                                              |
+| `bench_var_length_matcher`              | The whole var-length matcher surface.                                                                                                    |
 
 ## Things worth knowing before trusting a number
 
@@ -74,11 +74,30 @@ conclusion was drawn and committed.
   after other shapes and inherits their allocator state. Anything under ~10%
   needs its own isolated harness.
 
+## Measuring wasm
+
+Nothing here measures the wasm build. These examples compile for
+`wasm32-unknown-unknown` but cannot RUN there: `Instant::now()` panics (that
+target has no clock), there is no stdout, and there is no runner. A green
+`cargo build --target wasm32-unknown-unknown --example …` proves nothing.
+
+The wasm build is measured the only way it is ever used — from JS, through a
+backend:
+
+```
+cd packages/native
+bun run bench                      # ffi vs wasm, side by side
+BENCH_BACKENDS=wasm bun run bench  # one backend
+BENCH_N=1000000 bun run bench      # bigger workload
+```
+
+That harness covers ingest, all five codecs both ways, and representative query
+shapes. As of writing, wasm runs at roughly 0.93-1.5x of ffi depending on the
+workload — and part of the decode gap is threads rather than codegen, since the
+parallel decoder falls back to serial on a target with no threads.
+
 ## Known gaps
 
-- **Codec throughput beyond NDJSON.** `map_codec_bench` covers map properties;
-  encode/decode for pg-json, graphson, pg-text and csv has only ever been
-  measured from throwaway scripts on the TS side.
 - **The TS engine has no benchmarks at all.** Every number here is the Rust core.
   Pure-TS users get none of these results, and nothing would catch a regression
   there.
