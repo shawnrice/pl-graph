@@ -27,6 +27,8 @@
 //! (not a set); the edge `id` column round-trips an assigned external id and is
 //! empty for id-less edges.
 
+use std::borrow::Cow;
+
 use crate::codec::{element_props, is_intish};
 use crate::error::CodeResult;
 use crate::graph::{Builder, EdgeRec, Graph, NodeRec, Value};
@@ -292,11 +294,13 @@ fn escape_element(s: &str) -> String {
 // an endpoint id, or a property KEY in a header): prefix `\` when it begins with
 // `\` (so a genuine leading backslash survives) or a formula char (so a
 // spreadsheet won't evaluate it); `unguard_field` strips one leading `\`.
-fn guard_field(s: &str) -> String {
+/// Prefix a field that would otherwise be read as an escape or a spreadsheet
+/// formula. Borrows when neither applies.
+fn guard_field(s: &str) -> Cow<'_, str> {
     if s.starts_with('\\') || starts_with_formula(s) {
-        format!("\\{s}")
+        Cow::Owned(format!("\\{s}"))
     } else {
-        s.to_string()
+        Cow::Borrowed(s)
     }
 }
 
@@ -505,16 +509,19 @@ struct Cell {
     quoted: bool,
 }
 
-fn quote_field(raw: &str) -> String {
-    if raw.contains(',')
-        || raw.contains('"')
-        || raw.contains('\n')
-        || raw.contains('\r')
-        || raw.contains(LIST_SEP)
-    {
-        format!("\"{}\"", raw.replace('"', "\"\""))
+/// RFC-4180 quoting, borrowing when the field needs none — which is almost every
+/// field. It also used to make FIVE separate passes over the string, one per
+/// delimiter, before deciding; a single byte scan answers the same question, and
+/// every delimiter involved is ASCII so it is UTF-8 safe.
+fn quote_field(raw: &str) -> Cow<'_, str> {
+    let needs = raw
+        .bytes()
+        .any(|b| b == b',' || b == b'"' || b == b'\n' || b == b'\r' || b == LIST_SEP as u8);
+
+    if needs {
+        Cow::Owned(format!("\"{}\"", raw.replace('"', "\"\"")))
     } else {
-        raw.to_string()
+        Cow::Borrowed(raw)
     }
 }
 
@@ -587,23 +594,31 @@ fn parse_csv(input: &str) -> Vec<Vec<Cell>> {
 // Column-set computation (header = union of all keys, first-seen order)
 // ---------------------------------------------------------------------------
 
-type Bag = Vec<(String, Value)>;
+/// One element's properties for the CSV column machinery. Keys are BORROWED
+/// from the graph's key dictionary, which outlives the encode — `make_bag` used
+/// to copy each one into a `String` even though `element_props` already hands
+/// back a slice.
+type Bag<'a> = Vec<(&'a str, Value)>;
 
-fn bag_get<'a>(bag: &'a Bag, key: &str) -> Option<&'a Value> {
-    bag.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+fn bag_get<'a>(bag: &'a Bag<'_>, key: &str) -> Option<&'a Value> {
+    bag.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
 }
 
-fn compute_columns(bags: &[Bag]) -> (Vec<String>, std::collections::HashMap<String, ColType>) {
+/// Takes the entries directly rather than a `&[Bag]`, so the caller no longer
+/// has to deep-CLONE every element's properties just to hand them over.
+fn compute_columns<K>(
+    entries: &[(K, Bag<'_>)],
+) -> (Vec<String>, std::collections::HashMap<String, ColType>) {
     let mut keys: Vec<String> = Vec::new();
     let mut types: std::collections::HashMap<String, ColType> = std::collections::HashMap::new();
     let mut seen = std::collections::HashSet::new();
-    for bag in bags {
+    for (_, bag) in entries {
         for (key, value) in bag {
-            if seen.insert(key.clone()) {
-                keys.push(key.clone());
+            if seen.insert((*key).to_string()) {
+                keys.push((*key).to_string());
             }
-            if !matches!(value, Value::Null) && !types.contains_key(key) {
-                types.insert(key.clone(), infer_column(value));
+            if !matches!(value, Value::Null) && !types.contains_key(*key) {
+                types.insert((*key).to_string(), infer_column(value));
             }
         }
     }
@@ -616,27 +631,40 @@ fn compute_columns(bags: &[Bag]) -> (Vec<String>, std::collections::HashMap<Stri
     (keys, types)
 }
 
-fn build_row(
+/// Append one row to `out`. Writing straight into the output buffer replaces a
+/// `Vec<String>` of cells joined per row, which was then collected into a
+/// `Vec<String>` of rows and joined again — every byte of the document copied
+/// three times before it was returned.
+fn write_row(
+    out: &mut String,
     fixed: &[&str],
     keys: &[String],
     types: &std::collections::HashMap<String, ColType>,
-    bag: &Bag,
-) -> String {
-    let mut cells: Vec<String> = fixed.iter().map(|s| quote_field(s)).collect();
+    bag: &Bag<'_>,
+) {
+    for (i, f) in fixed.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&quote_field(f));
+    }
     for key in keys {
+        out.push(',');
         match bag_get(bag, key) {
-            None => cells.push(String::new()), // absent
+            None => {} // absent
             Some(v) => {
                 let enc = encode_cell(types[key], v);
-                cells.push(if enc.force_quote {
-                    format!("\"{}\"", enc.raw.replace('"', "\"\""))
+
+                if enc.force_quote {
+                    out.push('"');
+                    out.push_str(&enc.raw.replace('"', "\"\""));
+                    out.push('"');
                 } else {
-                    quote_field(&enc.raw)
-                });
+                    out.push_str(&quote_field(&enc.raw));
+                }
             }
         }
     }
-    cells.join(",")
 }
 
 /// Join a label set into a `;`-separated cell, escaping `;`/`\` inside each label
@@ -667,8 +695,14 @@ fn prop_cols_from_header(header: &[Cell], fixed: usize) -> Vec<(String, ColType)
         .collect()
 }
 
-fn props_from_row(row: &[Cell], prop_cols: &[(String, ColType)], fixed: usize) -> Bag {
-    let mut props = Bag::new();
+/// Decoded properties for one row. Owned, unlike the encode-side [`Bag`]: these
+/// keys come from the parsed header and the values from unquoted cells.
+fn props_from_row(
+    row: &[Cell],
+    prop_cols: &[(String, ColType)],
+    fixed: usize,
+) -> Vec<(String, Value)> {
+    let mut props: Vec<(String, Value)> = Vec::new();
     for (c, (key, t)) in prop_cols.iter().enumerate() {
         let Some(cell) = row.get(c + fixed) else {
             continue;
@@ -690,24 +724,17 @@ fn props_from_row(row: &[Cell], prop_cols: &[(String, ColType)], fixed: usize) -
 /// Build the property `Bag` for one element (`idx` into `store`), stringifying the
 /// interned keys. Shared by `vertex_bags` / `edge_bags`, which differ only in the
 /// id type, the live-check, and which property store they read.
-fn make_bag(store: &crate::graph::Properties, strs: &crate::graph::Dict, idx: usize) -> Bag {
-    element_props(store, strs, idx)
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v))
-        .collect()
-}
-
-fn vertex_bags(g: &Graph) -> Vec<(u32, Bag)> {
+fn vertex_bags(g: &Graph) -> Vec<(u32, Bag<'_>)> {
     (0..g.n as u32)
         .filter(|&vi| g.is_vertex_live(vi))
-        .map(|vi| (vi, make_bag(&g.props, &g.strs, vi as usize)))
+        .map(|vi| (vi, element_props(&g.props, &g.strs, vi as usize)))
         .collect()
 }
 
-fn edge_bags(g: &Graph) -> Vec<(usize, Bag)> {
+fn edge_bags(g: &Graph) -> Vec<(usize, Bag<'_>)> {
     (0..g.edge_slots())
         .filter(|&i| g.is_edge_live(i as u32))
-        .map(|i| (i, make_bag(&g.edge_props, &g.strs, i)))
+        .map(|i| (i, element_props(&g.edge_props, &g.strs, i)))
         .collect()
 }
 
@@ -717,27 +744,31 @@ fn edge_bags(g: &Graph) -> Vec<(usize, Bag)> {
 
 pub fn encode_nodes(g: &Graph) -> String {
     let entries = vertex_bags(g);
-    let bags: Vec<Bag> = entries.iter().map(|(_, b)| b.clone()).collect();
-    let (keys, types) = compute_columns(&bags);
+    let (keys, types) = compute_columns(&entries);
 
     let header = {
         let mut h = vec!["id".to_string(), ":LABEL".to_string()];
         h.extend(keys.iter().map(|k| column_header(k, types[k])));
         header_line(&h)
     };
-    let mut rows = vec![header];
+    // One buffer, sized for the whole document up front.
+    let mut out = String::with_capacity(header.len() + entries.len() * 64);
+
+    out.push_str(&header);
     for (vi, bag) in &entries {
         let labels = join_labels(crate::codec::node_labels(g, *vi));
         let id = guard_field(g.vid.text(*vi));
-        rows.push(build_row(&[&id, &labels], &keys, &types, bag));
+
+        out.push('\n');
+        write_row(&mut out, &[&id, &labels], &keys, &types, bag);
     }
-    rows.join("\n")
+
+    out
 }
 
 pub fn encode_edges(g: &Graph) -> String {
     let entries = edge_bags(g);
-    let bags: Vec<Bag> = entries.iter().map(|(_, b)| b.clone()).collect();
-    let (keys, types) = compute_columns(&bags);
+    let (keys, types) = compute_columns(&entries);
 
     let header = {
         let mut h = vec![
@@ -749,15 +780,22 @@ pub fn encode_edges(g: &Graph) -> String {
         h.extend(keys.iter().map(|k| column_header(k, types[k])));
         header_line(&h)
     };
-    let mut rows = vec![header];
+    let mut out = String::with_capacity(header.len() + entries.len() * 64);
+
+    out.push_str(&header);
     for (i, bag) in &entries {
-        let id = guard_field(&g.edge_id(*i as u32));
+        // Bound, because `guard_field` borrows and `edge_id` returns a temporary.
+        let eid = g.edge_id(*i as u32);
+        let id = guard_field(&eid);
         let from = guard_field(g.vid.text(g.e_src[*i]));
         let to = guard_field(g.vid.text(g.e_dst[*i]));
         let etype = guard_element(escape_element(g.etype.text(g.e_type[*i])));
-        rows.push(build_row(&[&id, &from, &to, &etype], &keys, &types, bag));
+
+        out.push('\n');
+        write_row(&mut out, &[&id, &from, &to, &etype], &keys, &types, bag);
     }
-    rows.join("\n")
+
+    out
 }
 
 /// Encode a graph to the combined single string: nodes CSV, sentinel, edges CSV.
