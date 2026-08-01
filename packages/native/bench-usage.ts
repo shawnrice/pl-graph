@@ -82,14 +82,8 @@ const tsEngine: Engine = {
   name: 'ts',
   load: (doc) => tsDeserialize(doc, 'ndjson', new TsGraph()),
   query: (g, text, params) => tsQuery(g as TsGraph, text, params),
-  index: (g, on, key) =>
-    (g as unknown as { createIndex: (s: IndexSpec) => void }).createIndex({
-      on,
-      kind: 'hash',
-      keys: [key],
-    }),
-  transaction: (g, body) =>
-    (g as unknown as { transaction: (f: () => void) => void }).transaction(body),
+  index: (g, on, key) => (g as TsGraph).createIndex({ on, kind: 'hash', keys: [key] }),
+  transaction: (g, body) => (g as TsGraph).transaction(body),
   free: () => {},
 };
 
