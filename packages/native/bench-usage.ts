@@ -134,8 +134,15 @@ type Workload = {
   name: string;
   /** One operation. `i` is the operation index, so each does different work. */
   op: (e: Engine, g: unknown, i: number) => void;
-  /** Fewer operations for workloads that are inherently expensive. */
+  /** Fewer iterations for workloads that are inherently expensive. */
   scale?: number;
+  /**
+   * Elementary operations each iteration performs, so every row is reported in
+   * the same units. A batch of 100 updates is 100, not 1 — without this the
+   * batched rows read as catastrophically slow next to the single-op rows purely
+   * because they are counted differently.
+   */
+  units?: number;
 };
 
 const WORKLOADS: Workload[] = [
@@ -245,8 +252,9 @@ const WORKLOADS: Workload[] = [
     // individually above. A transaction records an undo entry per write and
     // defers its constraint checks to commit, so this is the cost of that
     // bookkeeping amortized over a batch.
-    name: 'write: 100 updates in a transaction',
+    name: 'write: 100 updates in one transaction',
     scale: 100,
+    units: 100,
     op: (e, g, i) =>
       e.transaction(g, () => {
         for (let k = 0; k < 100; k++) {
@@ -255,6 +263,24 @@ const WORKLOADS: Workload[] = [
             v: k,
           });
         }
+      }),
+  },
+  {
+    // The SAME 100 updates as one statement with an IN-list, rather than 100
+    // statements. This is the algorithmic fix for the row above: the cost there
+    // is not the transaction, it is that each of the 100 statements re-scans to
+    // find its target. One statement scans once and updates all 100.
+    //
+    // Which means it should close most of the gap WITHOUT an index — and with an
+    // index it should not help much, because a seek per statement is already
+    // cheap. Both columns are the point.
+    name: 'write: 100 updates in one statement',
+    scale: 100,
+    units: 100,
+    op: (e, g, i) =>
+      void e.query(g, 'MATCH (u:User) WHERE u.name IN $names SET u.score = $v', {
+        names: Array.from({ length: 100 }, (_, k) => `user${(i * 100 + k) % GRAPH}`),
+        v: i % 1000,
       }),
   },
   {
@@ -359,7 +385,7 @@ const rate = (e: Engine, w: Workload, indexed: boolean): number => {
         w.op(e, g, i);
       }
 
-      const perSec = ops / ((Bun.nanoseconds() - t) / 1e9);
+      const perSec = (ops * (w.units ?? 1)) / ((Bun.nanoseconds() - t) / 1e9);
 
       bestOps = Math.max(bestOps, perSec);
     } finally {

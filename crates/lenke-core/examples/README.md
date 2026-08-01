@@ -156,9 +156,31 @@ are kept as separate rows so the cliff cannot regress unseen.
 
 Also visible: **interleaving a write with a traversal** costs about 2.5x the
 traversal alone, which is the read-snapshot invalidation showing up where it was
-predicted to; and **100 updates inside a transaction** run at roughly half the
-per-write rate of the same updates auto-committing, which is the undo log and
-deferred checks.
+predicted to.
+
+**Rows are in elementary operations per second, not iterations.** A workload that
+performs 100 updates per iteration declares `units: 100`. Without that the
+batched rows read as catastrophically slow next to the single-op rows purely
+because they were counted differently — which is exactly how "100 updates in a
+transaction" once looked like the worst cell in the table at 7/sec, when it was
+700 updates/sec against 776 for the same update outside a transaction. A
+transaction costs about 15%, not 100x.
+
+**Batching is the fix when there is no index, and a pessimisation when there
+is.** The same 100 updates as one `IN`-list statement rather than 100 statements:
+
+|                          | ts         | ffi        |
+| ------------------------ | ---------- | ---------- |
+| 100 statements, no index | 690        | 4.0k       |
+| one statement, no index  | **38.6k**  | **18.7k**  |
+| 100 statements, indexed  | **101.7k** | **191.2k** |
+| one statement, indexed   | 36.2k      | 18.2k      |
+
+Unindexed the batch wins 56x on TS, because 100 statements re-scan 100 times and
+one statement scans once. Indexed it LOSES by up to 10x, because an `IN`-list
+does not seed from the index — 20 values that should cost 20 seeks cost a full
+scan (147k stmt/s for `= $n` against 220 for `IN $ns` on a 20k graph, param or
+literal alike). The same family of gap as the clause-WHERE one, still open.
 
 ## Known gaps
 
