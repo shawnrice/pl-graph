@@ -827,14 +827,14 @@ mod tests {
     /// A throughput number means nothing without a reference, so this measures
     /// one document at five levels:
     ///
-    ///   1. scan   — count newlines. LLVM vectorizes it, so this is roughly what
-    ///               the machine pulls through memory: the hard ceiling.
-    ///   2. copy   — allocate and memcpy the input. The floor for anything that
-    ///               must produce as much output as it consumed.
-    ///   3. parse  — run the JSON parser over every line and drop the result.
-    ///               Structure recognized, nothing built.
-    ///   4. decode — the whole thing: dictionaries, columns, adjacency.
-    ///   5. encode — the way back out.
+    /// 1. scan — count newlines. LLVM vectorizes it, so this is roughly what the
+    ///    machine pulls through memory: the hard ceiling.
+    /// 2. copy — allocate and memcpy the input. The floor for anything that must
+    ///    produce as much output as it consumed.
+    /// 3. parse — run the JSON parser over every line and drop the result.
+    ///    Structure recognized, nothing built.
+    /// 4. decode — the whole thing: dictionaries, columns, adjacency.
+    /// 5. encode — the way back out.
     ///
     /// The gap between 3 and 4 is the graph BUILD, which no JSON parser does —
     /// which is why comparing a graph loader's GiB/s against a JSON parser's is
