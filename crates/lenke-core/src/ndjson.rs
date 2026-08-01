@@ -840,19 +840,33 @@ mod tests {
     /// which is why comparing a graph loader's GiB/s against a JSON parser's is
     /// not like for like.
     ///
-    /// **Run it at a realistic size.** The answer changes qualitatively with `n`,
-    /// because the working set falls out of cache somewhere between 200k and 1M
-    /// elements. At 200k the document and its dictionaries stay resident and
-    /// decode reaches ~40% of parse; at 1M and beyond it settles at ~26%, and the
-    /// per-element build cost roughly doubles (385 ns -> 721 ns) before going
-    /// flat. Line 2 shows the transition directly: allocate-and-memcpy of the
-    /// input runs at 27 GiB/s over 22 MiB and 2.6 GiB/s over 112 MiB. Past that
-    /// point ingest is bound by random access into the dictionaries, not by
-    /// hashing or allocation — so an optimization tuned at 200k can measure as
-    /// nothing at 1M, which is exactly what happened to a faster hash function.
+    /// **It sweeps sizes, and that matters.** The answer changes qualitatively
+    /// with `n`, because the working set falls out of cache somewhere between
+    /// 200k and 1M elements. At 10k-200k the document and its dictionaries stay
+    /// resident; past 1M they do not, the per-element build cost roughly doubles,
+    /// and ingest becomes bound by random access into the dictionaries rather
+    /// than by hashing or allocation. Line 2 shows the transition directly:
+    /// allocate-and-memcpy runs at 27 GiB/s over 22 MiB and 2.6 GiB/s over 112
+    /// MiB. An optimization tuned at one end can measure as nothing at the other
+    /// — which is exactly what happened to a faster hash function — so a change
+    /// is only believable if it is measured across the whole range.
+    ///
+    /// `INGEST_N=3000000,5000000` overrides the default sweep.
     #[test]
     #[ignore = "benchmark; run with --ignored --nocapture"]
     fn ingest_throughput_against_the_ceiling() {
+        let sizes: Vec<usize> = std::env::var("INGEST_N").map_or_else(
+            |_| vec![10_000, 200_000, 1_000_000],
+            |v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
+        );
+
+        for n in sizes {
+            ingest_throughput_at(n);
+        }
+    }
+
+    #[cfg(test)]
+    fn ingest_throughput_at(n: usize) {
         use std::time::Instant;
 
         fn bench(label: &str, bytes: usize, reps: usize, mut f: impl FnMut()) -> f64 {
@@ -879,11 +893,6 @@ mod tests {
             gibs
         }
 
-        // `INGEST_N=3000000 cargo test --release ingest_throughput -- --ignored --nocapture`
-        let n: usize = std::env::var("INGEST_N")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(200_000);
         let text: String = (0..n)
             .map(|i| {
                 format!(
@@ -898,8 +907,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let bytes = text.len();
+        // Fewer reps as the document grows; each is already a best-of.
+        let reps = if n >= 1_000_000 { 3 } else { 5 };
 
-        println!("\n{n} nodes, {:.1} MiB\n", bytes as f64 / (1024.0 * 1024.0));
+        println!(
+            "\n=== {n} nodes, {:.1} MiB ===",
+            bytes as f64 / (1024.0 * 1024.0)
+        );
 
         let ceiling = bench("1. scan (count newlines)", bytes, 20, || {
             std::hint::black_box(text.bytes().filter(|b| *b == b'\n').count());
@@ -909,23 +923,23 @@ mod tests {
             std::hint::black_box(text.to_string());
         });
 
-        let parse = bench("3. parse only (drop result)", bytes, 5, || {
+        let parse = bench("3. parse only (drop result)", bytes, reps, || {
             for line in text.lines() {
                 std::hint::black_box(crate::json::parse(line).is_ok());
             }
         });
-        let decode_gibs = bench("4. decode (build the graph)", bytes, 5, || {
+        let decode_gibs = bench("4. decode (build the graph)", bytes, reps, || {
             std::hint::black_box(super::decode(&text).is_ok());
         });
         let g = super::decode(&text).expect("decodes");
         let obytes = encode(&g).len();
 
-        bench("5. encode", obytes, 5, || {
+        bench("5. encode", obytes, reps, || {
             std::hint::black_box(encode(&g).len());
         });
 
         println!(
-            "\n  parse reaches {:.0}% of the scan ceiling; decode reaches {:.0}% of parse.\n",
+            "  parse reaches {:.0}% of the scan ceiling; decode reaches {:.0}% of parse.",
             parse / ceiling * 100.0,
             decode_gibs / parse * 100.0
         );
