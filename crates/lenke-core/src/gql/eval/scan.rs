@@ -90,6 +90,18 @@ pub(super) fn prop_name<'a>(
     }
 }
 
+/// `a OP b` as `b OP' a` — the same predicate with the operands exchanged.
+/// Equality and inequality are symmetric; the orderings invert.
+fn flip_compare(op: CompareOp) -> CompareOp {
+    match op {
+        CompareOp::Lt => CompareOp::Gt,
+        CompareOp::Le => CompareOp::Ge,
+        CompareOp::Gt => CompareOp::Lt,
+        CompareOp::Ge => CompareOp::Le,
+        other => other,
+    }
+}
+
 /// An index seek from a WHERE comparison `var.key OP <literal>` where `var` is at
 /// `want_slot` (`None` = any), against the vertex or edge index. An `AND` of two
 /// same-var/same-key comparisons coalesces into one tight range seek; else the
@@ -106,11 +118,25 @@ pub(super) fn prop_index_hint(
     match e {
         CExpr::Compare { op, left, right } => {
             // Handles a bare `var.key` AND a nested `var.a.b` (dotted-path index).
-            let (vslot, path) = prop_path(left, graph, ctx, edge)?;
+            //
+            // Either ORDER: `$x = u.key` is the same predicate as `u.key = $x`,
+            // and only the left side used to be inspected, so writing the
+            // constant first silently cost a full scan — measured at 107x on a
+            // 20k graph. Flipping the operator with the operands keeps a range
+            // correct: `$x < u.n` means `u.n > $x`, not `u.n < $x`.
+            let (vslot, path, key, op) = match prop_path(left, graph, ctx, edge) {
+                Some((vslot, path)) => (vslot, path, expr_to_idxkey(right, ctx)?, *op),
+                None => {
+                    let (vslot, path) = prop_path(right, graph, ctx, edge)?;
+
+                    (vslot, path, expr_to_idxkey(left, ctx)?, flip_compare(*op))
+                }
+            };
+            let op = &op;
+
             if !slot_ok(vslot) {
                 return None;
             }
-            let key = expr_to_idxkey(right, ctx)?;
             if !idx_indexed(graph, &path, edge) {
                 return None;
             }
@@ -120,6 +146,92 @@ pub(super) fn prop_index_hint(
             let mut rb = RangeBound::default();
             apply_bound(&mut rb, *op, key);
             idx_range(graph, &path, &rb, edge)
+        }
+        // `var.key IN [...]` — a union of point seeks, one per list element.
+        //
+        // This had no arm at all, so an IN-list scanned even on an indexed key:
+        // measured at 147k statements/sec for `= $n` against 220 for `IN $ns`
+        // over twenty values on a 20k-vertex graph, where twenty seeks should
+        // have cost a fraction of one scan. It also made the natural batching fix
+        // for a hot write loop — one IN statement instead of N statements —
+        // slower than the loop it replaced whenever an index existed.
+        //
+        // `NOT IN` is deliberately not seekable: its matches are everything the
+        // list does NOT name, which no point seek enumerates.
+        CExpr::In {
+            expr,
+            list,
+            negated: false,
+        } => {
+            let (vslot, path) = prop_path(expr, graph, ctx, edge)?;
+
+            if !slot_ok(vslot) || !idx_indexed(graph, &path, edge) {
+                return None;
+            }
+
+            // Only a constant list can seed — a literal one, or a parameter
+            // holding a list. Anything computed per row is unknown here.
+            let keys: Vec<crate::graph::IdxKey> = match list.as_ref() {
+                CExpr::List(items) => items
+                    .iter()
+                    .map(|it| expr_to_idxkey(it, ctx))
+                    .collect::<Option<_>>()?,
+                CExpr::Param(slot) => match ctx.params.get(*slot)? {
+                    Val::List(items) => items.iter().map(val_to_idxkey).collect::<Option<_>>()?,
+                    single => vec![val_to_idxkey(single)?],
+                },
+                _ => return None,
+            };
+            // An empty IN matches nothing, and an empty candidate set says so
+            // exactly — falling through to `None` would scan instead.
+            let mut out: Vec<u32> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+
+            for k in &keys {
+                // A key absent from the index contributes nothing rather than
+                // aborting the seek — `idx_eq` returning `None` means "no index",
+                // which cannot happen here since `idx_indexed` already held.
+                for id in idx_eq(graph, &path, k, edge)? {
+                    // Dedup: a repeated value in the list would otherwise yield
+                    // the same element twice, and duplicate candidates become
+                    // duplicate ROWS — a wrong answer, not just wasted work.
+                    if seen.insert(id) {
+                        out.push(id);
+                    }
+                }
+            }
+
+            Some(out)
+        }
+        // A disjunction seeds only when EVERY branch does — the union of the
+        // branches' candidates is the candidate set, and one unseekable branch
+        // means its matches are missing from that union entirely. That is a wrong
+        // answer rather than a slow one, so a single `None` abandons the whole
+        // seek.
+        //
+        // `u.k = $a OR u.k = $b` is the same predicate as `u.k IN [$a, $b]`,
+        // which seeks; spelled as a disjunction it scanned, 220x slower on a 20k
+        // graph.
+        CExpr::Or(items) => {
+            let mut out: Vec<u32> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+
+            for it in items {
+                // Branches may address different keys — `a.x = 1 OR a.y = 2` is
+                // fine, both seeks are over the same element space — but a branch
+                // on a DIFFERENT variable is not: its candidates identify another
+                // element, so unioning them is meaningless. `slot_ok` is threaded
+                // through the recursion and rejects that.
+                for id in prop_index_hint(graph, ctx, it, want_slot, edge)? {
+                    // The branches can overlap; a duplicate candidate becomes a
+                    // duplicate ROW.
+                    if seen.insert(id) {
+                        out.push(id);
+                    }
+                }
+            }
+
+            Some(out)
         }
         CExpr::And(items) => {
             // Contender B: an as-of over an edge RI-tree interval index (`lo_key <= $v

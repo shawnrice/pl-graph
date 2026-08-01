@@ -523,3 +523,178 @@ fn clause_where_seek_survives_a_negated_or_absent_key() {
         assert_eq!(rows(&mut plain, q), rows(&mut indexed, q), "for `{q}`");
     }
 }
+
+// ---------------------------------------------------------------------------
+// `key IN [...]` seeds a union of point seeks.
+//
+// There was no `In` arm in the hint at all, so an IN-list scanned even on an
+// indexed key — 220 statements/sec against 147k for a single `=` over twenty
+// values on a 20k graph. It also made the natural batching fix for a hot write
+// loop (one IN statement instead of N statements) slower than the loop it
+// replaced whenever an index existed.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn in_list_seeds_and_matches_the_scan() {
+    let mut plain = star(200);
+    let mut indexed = star(200);
+
+    indexed.create_vertex_index("k");
+
+    for q in [
+        "MATCH (u:P) WHERE u.k IN ['key3', 'key7'] RETURN u.k",
+        "MATCH (u:P)-[:R]->(h:H) WHERE u.k IN ['key3', 'key7'] RETURN u.k",
+        // Nothing in the list exists.
+        "MATCH (u:P) WHERE u.k IN ['nope', 'also-nope'] RETURN u.k",
+        // Mixed hit and miss.
+        "MATCH (u:P) WHERE u.k IN ['key1', 'nope'] RETURN u.k",
+    ] {
+        let mut a = rows(&mut plain, q);
+        let mut b = rows(&mut indexed, q);
+
+        a.sort_by(|x, y| cmp_val(&x[0], &y[0]));
+        b.sort_by(|x, y| cmp_val(&x[0], &y[0]));
+
+        assert_eq!(a, b, "index changed the answer for `{q}`");
+    }
+}
+
+#[test]
+fn in_list_with_a_repeated_value_does_not_duplicate_rows() {
+    // A union of point seeks visits the same element once per occurrence, so
+    // without dedup a repeated list value returns the element twice — duplicate
+    // ROWS, a wrong answer rather than wasted work.
+    let mut indexed = star(50);
+
+    indexed.create_vertex_index("k");
+
+    assert_eq!(
+        rows(&mut indexed, "MATCH (u:P) WHERE u.k IN ['key1', 'key1', 'key2'] RETURN u.k").len(),
+        2
+    );
+}
+
+#[test]
+fn an_empty_in_list_matches_nothing() {
+    let mut plain = star(50);
+    let mut indexed = star(50);
+
+    indexed.create_vertex_index("k");
+
+    let q = "MATCH (u:P) WHERE u.k IN [] RETURN u.k";
+
+    assert!(rows(&mut indexed, q).is_empty());
+    assert_eq!(rows(&mut plain, q), rows(&mut indexed, q));
+}
+
+#[test]
+fn not_in_is_not_seekable_and_still_correct() {
+    // The matches of a NOT IN are everything the list does not name, which no
+    // point seek enumerates. It must fall back to the scan rather than seed from
+    // the list and return its complement.
+    let mut plain = star(50);
+    let mut indexed = star(50);
+
+    indexed.create_vertex_index("k");
+
+    let q = "MATCH (u:P) WHERE NOT (u.k IN ['key1', 'key2']) RETURN count(*) AS c";
+
+    assert_eq!(rows(&mut indexed, q), vec![vec![n(48.0)]]);
+    assert_eq!(rows(&mut plain, q), rows(&mut indexed, q));
+}
+
+// ---------------------------------------------------------------------------
+// Spellings that mean the same thing seek the same way.
+//
+// The hint recognized one spelling of each predicate and scanned for the others,
+// so a semantically identical query cost 100-300x depending on how it was
+// written. Two more of that family, found by probing every predicate form
+// against an indexed graph and comparing rates:
+//
+//   `$x = u.k`               107x slower than `u.k = $x`  (only `left` inspected)
+//   `u.k = $a OR u.k = $b`   220x slower than the same IN-list
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_reversed_comparison_seeks_like_the_forward_one() {
+    let mut plain = star(200);
+    let mut indexed = star(200);
+
+    indexed.create_vertex_index("k");
+
+    for q in [
+        "MATCH (u:P) WHERE 'key5' = u.k RETURN u.k",
+        "MATCH (u:P)-[:R]->(h:H) WHERE 'key5' = u.k RETURN u.k",
+    ] {
+        assert_eq!(rows(&mut plain, q), rows(&mut indexed, q), "for `{q}`");
+    }
+}
+
+#[test]
+fn a_reversed_range_keeps_its_direction() {
+    // The operands flip, so the operator must too: `'key5' < u.k` means
+    // `u.k > 'key5'`. Getting this backwards returns the complement — a wrong
+    // answer that a rate check would never notice.
+    let mut plain = star(20);
+    let mut indexed = star(20);
+
+    indexed.create_vertex_index("k");
+
+    for q in [
+        "MATCH (u:P) WHERE 'key5' < u.k RETURN count(*) AS c",
+        "MATCH (u:P) WHERE 'key5' >= u.k RETURN count(*) AS c",
+        "MATCH (u:P) WHERE u.k > 'key5' RETURN count(*) AS c",
+    ] {
+        assert_eq!(rows(&mut plain, q), rows(&mut indexed, q), "for `{q}`");
+    }
+
+    // And the two spellings agree with each other, not just with the scan.
+    assert_eq!(
+        rows(&mut indexed, "MATCH (u:P) WHERE 'key5' < u.k RETURN count(*) AS c"),
+        rows(&mut indexed, "MATCH (u:P) WHERE u.k > 'key5' RETURN count(*) AS c"),
+    );
+}
+
+#[test]
+fn a_disjunction_seeds_only_when_every_branch_can() {
+    // The union of the branches' candidates IS the candidate set, so one
+    // unseekable branch means its matches are absent from the union — missing
+    // rows, not slow ones. `other` is deliberately not indexed.
+    let mut plain = star(200);
+    let mut indexed = star(200);
+
+    indexed.create_vertex_index("k");
+
+    for q in [
+        // Both branches indexed → seeks.
+        "MATCH (u:P) WHERE u.k = 'key3' OR u.k = 'key7' RETURN u.k",
+        // One branch on an UNindexed key → must fall back and still find both.
+        "MATCH (u:P) WHERE u.k = 'key3' OR u.id = 's7' RETURN u.k",
+        // Overlapping branches must not double-count.
+        "MATCH (u:P) WHERE u.k = 'key3' OR u.k = 'key3' RETURN u.k",
+        // Nested.
+        "MATCH (u:P) WHERE (u.k = 'key1' OR u.k = 'key2') OR u.k = 'key3' RETURN u.k",
+    ] {
+        let mut a = rows(&mut plain, q);
+        let mut b = rows(&mut indexed, q);
+
+        a.sort_by(|x, y| cmp_val(&x[0], &y[0]));
+        b.sort_by(|x, y| cmp_val(&x[0], &y[0]));
+
+        assert_eq!(a, b, "index changed the answer for `{q}`");
+    }
+}
+
+#[test]
+fn a_disjunction_across_two_variables_is_not_seeded() {
+    // Branches on DIFFERENT variables identify different elements, so unioning
+    // their candidates is meaningless. Must agree with the scan regardless.
+    let mut plain = star(30);
+    let mut indexed = star(30);
+
+    indexed.create_vertex_index("k");
+
+    let q = "MATCH (a:P), (b:P) WHERE a.k = 'key1' OR b.k = 'key2' RETURN count(*) AS c";
+
+    assert_eq!(rows(&mut plain, q), rows(&mut indexed, q));
+}
