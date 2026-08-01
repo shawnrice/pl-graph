@@ -2864,15 +2864,40 @@ impl Builder<'_> {
             let mut seen: HashSet<&str> = HashSet::with_capacity(nodes.len());
             nodes.iter().map(|nd| seen.insert(nd.id.as_ref())).collect()
         };
+        // An edge id is looked up here to reject a duplicate, and again later to
+        // build the external-id overlay — twice over the same strings, in two
+        // separate tables. One pass does both: the overlay IS the duplicate
+        // check, since an id already in it has been seen.
+        //
+        // This drops a `HashSet<&str>` sized to the edge count. Real graphs carry
+        // several edges per node, so that table — and the million-plus hashes and
+        // probes it takes — scales with the EDGE count, which is the dimension
+        // that grows.
+        let mut eid_fwd: HashMap<u32, Arc<str>> = HashMap::with_capacity(edges.len());
+        let mut eid_rev: HashMap<Arc<str>, u32> = HashMap::with_capacity(edges.len());
         let kept_edges: Vec<&EdgeRec> = {
-            let mut seen: HashSet<&str> = HashSet::with_capacity(edges.len());
-            edges
-                .iter()
-                .filter(|e| match &e.id {
-                    Some(id) => seen.insert(id.as_ref()),
-                    None => true, // id-less edges get a unique e{index}; never dup
-                })
-                .collect()
+            let mut kept: Vec<&EdgeRec> = Vec::with_capacity(edges.len());
+
+            for ed in &edges {
+                if let Some(id) = &ed.id {
+                    let arc: Arc<str> = Arc::from(id.as_ref());
+
+                    match eid_rev.entry(arc) {
+                        std::collections::hash_map::Entry::Occupied(_) => continue, // dup → drop
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            let idx = kept.len() as u32;
+
+                            eid_fwd.insert(idx, slot.key().clone());
+                            slot.insert(idx);
+                        }
+                    }
+                }
+                // An id-less edge takes the canonical `e{index}` form and can
+                // never collide, so it is kept without consulting the overlay.
+                kept.push(ed);
+            }
+
+            kept
         };
 
         // (2) Labels: per-vertex list + inverted (label -> live vertices).
@@ -2985,13 +3010,7 @@ impl Builder<'_> {
                 by_etype.insert(t as u32, Vec::with_capacity(c as usize));
             }
         }
-        // Lazy external-id overlay: only edges that carry an id land here. Sized
-        // for all of them — a document where every edge carries an id is the norm
-        // (it is what `encode` emits), and growing these mid-build rehashes every
-        // id already inserted.
-        let mut eid_fwd: HashMap<u32, Arc<str>> = HashMap::with_capacity(e);
-        let mut eid_rev: HashMap<Arc<str>, u32> = HashMap::with_capacity(e);
-        for (i, ed) in kept_edges.iter().enumerate() {
+        for i in 0..kept_edges.len() {
             let (s, d, t) = resolved[i];
             e_src[i] = s;
             e_dst[i] = d;
@@ -3007,11 +3026,6 @@ impl Builder<'_> {
                 nbr: s,
                 etype: t,
             });
-            if let Some(id) = &ed.id {
-                let arc: Arc<str> = Arc::from(id.as_ref());
-                eid_fwd.insert(i as u32, arc.clone());
-                eid_rev.insert(arc, i as u32);
-            }
         }
 
         // (5) Edge property columns — same machinery, indexed by edge index.
