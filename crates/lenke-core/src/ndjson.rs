@@ -876,23 +876,16 @@ mod tests {
     /// started changing. `interleaved_write_and_traverse_is_independent_of_graph_
     /// size` in the GQL tests exists to keep it that way.
     ///
-    /// Row 8 also carries a rejected experiment, and the reason it was rejected
-    /// is worth stating precisely. The edge-id path consults two tables over the
-    /// same strings — a `HashSet` to reject a duplicate, then the `eid_rev`
-    /// overlay — so merging them (the overlay IS the duplicate check) is the same
-    /// trick that removed 83 ms from the node side. It measured 1427 ms before
-    /// and 1432 after.
+    /// Row 8 is where the edge path becomes measurable at all. Merging the edge
+    /// dedup table into the id overlay measured FLAT when this benchmark ran one
+    /// edge per node and left the id off — 28 ms of effect against 35 ms of
+    /// run-to-run spread. At five edges per node, with ids present, the same
+    /// change is a clean 5% (894 -> 843 ms, four samples each, no overlap).
     ///
-    /// Not because the shapes differ: the edge dedup pass costs **28 ms of a
-    /// 1491 ms decode**, and run-to-run spread on this benchmark is around 35 ms.
-    /// The effect is real and simply below what this measurement can resolve. The
-    /// node equivalent was 83 ms, comfortably above it. An effect that small
-    /// needs its own microbenchmark, not a whole-decode timing.
-    ///
-    /// Worth recording that the FIRST cut of it measured 8% SLOWER, because
-    /// moving the overlay maps earlier lost their `with_capacity` and they
-    /// rehashed their way up — the same regression already fixed once in this
-    /// file. The number only became trustworthy after that was corrected.
+    /// The lesson is about the benchmark, not the change: every per-edge cost
+    /// scales with the edge:node ratio while every per-node cost does not, so a
+    /// sparse fixture systematically understates anything on the edge path. A
+    /// 1:1 graph is not a small version of a real one.
     ///
     /// `INGEST_N=3000000,5000000` overrides the default sweep.
     #[test]
