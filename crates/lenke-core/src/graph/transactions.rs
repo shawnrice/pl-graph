@@ -163,6 +163,50 @@ impl Graph {
         self.tx_depth += 1;
     }
 
+    /// Check every interned name added since the last check, and remember how far
+    /// we got. The dictionaries are append-only and a well-formed name stays
+    /// well-formed, so this is O(names added by this transaction) — normally zero.
+    ///
+    /// This runs at COMMIT rather than at each write site because the write sites
+    /// are many (the GQL evaluator alone mutates through eighteen of them) and a
+    /// missed one is invisible: the engine happily builds a graph it then refuses
+    /// to read back, since the codec ingestion path *does* validate. Catching it
+    /// here means every write path — GQL, Gremlin, the algorithms' `writeProperty`,
+    /// and anything added later — is covered by one check that a new caller cannot
+    /// forget.
+    ///
+    /// The watermark advances even when a name is rejected. The transaction is
+    /// rolled back so nothing REFERENCES the bad name, but interning is not undone,
+    /// and re-reporting a dangling dictionary entry on every later commit would
+    /// wedge the graph. A dangling name is inert: serialization walks each
+    /// element's own properties, never the dictionary.
+    fn validate_new_names(&mut self) -> CodeResult<()> {
+        let marks = self.names_checked;
+        let lens = [
+            self.labels.strings.len(),
+            self.etype.strings.len(),
+            self.props.keys.strings.len(),
+            self.edge_props.keys.strings.len(),
+        ];
+
+        self.names_checked = lens;
+
+        for name in self.labels.strings[marks[0]..].iter() {
+            validate_label(name)?;
+        }
+        for name in self.etype.strings[marks[1]..].iter() {
+            validate_label(name)?;
+        }
+        for name in self.props.keys.strings[marks[2]..].iter() {
+            validate_prop_key(name)?;
+        }
+        for name in self.edge_props.keys.strings[marks[3]..].iter() {
+            validate_prop_key(name)?;
+        }
+
+        Ok(())
+    }
+
     /// Close the current frame. An inner commit just decrements depth. The
     /// outermost commit runs the deferred constraint checks against the fully
     /// staged graph — on failure it rolls the whole transaction back via the undo
@@ -174,6 +218,13 @@ impl Graph {
         self.tx_depth -= 1;
         if self.tx_depth > 0 {
             return Ok(()); // an inner commit — the outermost frame finalizes
+        }
+        // Names first: a malformed one makes the graph unserializable-and-
+        // reloadable, so it is not worth running the (more expensive) per-element
+        // constraint checks against a graph that is already invalid.
+        if let Err(e) = self.validate_new_names() {
+            self.apply_undo_and_reset();
+            return Err(TxCommitError::MalformedName(e));
         }
         if let Err(e) = self.run_deferred_checks() {
             self.apply_undo_and_reset();

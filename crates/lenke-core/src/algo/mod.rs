@@ -218,6 +218,16 @@ type PendingWrites = Option<(String, Vec<(u32, Value)>)>;
 /// Dispatch by name to the pure `&Graph -> Vec<(vertex, Value)>` algorithm, returning
 /// the result column name alongside. Read-only. Unknown `name` → `Err`.
 fn dispatch(graph: &Graph, name: &str, cfg: &AlgoConfig) -> Result<AlgoOutput, String> {
+    // `writeProperty` reaches the store without passing through a query, so it
+    // never meets the commit-time name check that covers the GQL/Gremlin write
+    // paths. An empty key here built a graph the engine could serialize but not
+    // read back — `graphFromNdjson` rejects an empty key — so reject it up front.
+    // Checked here rather than in a caller because both the sync (`run_columns`)
+    // and off-thread (`compute_parts`) paths funnel through this one function.
+    if let Some(prop) = &cfg.write_property {
+        crate::graph::validate_prop_key(prop).map_err(|e| e.message.clone())?;
+    }
+
     Ok(match name {
         "degree" => ("degree", degree::degree(graph, cfg)),
         "connectedComponents" => ("componentId", components::connected_components(graph, cfg)),
@@ -232,7 +242,31 @@ fn dispatch(graph: &Graph, name: &str, cfg: &AlgoConfig) -> Result<AlgoOutput, S
         "personalizedPagerank" => ("score", pagerank::personalized_pagerank(graph, cfg)),
         "betweenness" => ("centrality", centrality::betweenness(graph, cfg)),
         "closeness" => ("centrality", centrality::closeness(graph, cfg)),
-        "shortestPath" => ("distance", shortest_path::shortest_path(graph, cfg)),
+        "shortestPath" => {
+            // Dijkstra (and A*) require NON-NEGATIVE weights. With a negative edge
+            // the relaxation can keep finding a cheaper path forever, so a negative
+            // cycle never terminates — and a negative self-loop is enough: one node
+            // and one edge hung the engine indefinitely. The precondition was
+            // documented on `dijkstra` but never enforced, which turned a caller's
+            // mistake into an unbounded spin instead of an error. Rejected for ANY
+            // negative weight, not just a cycle: Dijkstra can also settle a vertex
+            // too early and return a silently wrong distance, so "no cycle, so it
+            // terminated" is luck rather than a correct answer.
+            if let Some(k) = cfg.weight_property.as_deref() {
+                // NaN is rejected alongside negatives: it makes every relaxation
+                // comparison false and strands the search just as effectively.
+                if edge_weights(graph, k)
+                    .iter()
+                    .any(|w| w.is_nan() || *w < 0.0)
+                {
+                    return Err(format!(
+                        "shortestPath `weightProperty` ({k}) must hold non-negative numbers — Dijkstra does not admit negative weights"
+                    ));
+                }
+            }
+
+            ("distance", shortest_path::shortest_path(graph, cfg))
+        }
         "neighborAggregate" => (
             "vector",
             neighbor_aggregate::neighbor_aggregate(graph, cfg)?,
@@ -1267,5 +1301,101 @@ mod tests {
             r#"{"source":"3","target":"1","weightProperty":"w","algorithm":"astar"}"#,
         )
         .is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Negative weights are REJECTED, not run.
+    //
+    // Dijkstra's precondition was documented on `dijkstra` and never enforced, so
+    // a graph that violated it did not fail — it spun forever. A negative
+    // self-loop (ONE node, ONE edge) was enough to hang the engine, reachable
+    // from the public `shortestPath` API and from GQL `CALL shortest_path`.
+    // Found by the randomized algorithm differential, whose weight corpus
+    // includes negatives.
+    // -----------------------------------------------------------------------
+
+    fn weighted(edges: &[(&str, &str, f64)]) -> Graph {
+        let mut lines: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|id| format!(r#"{{"type":"node","id":"{id}","labels":["P"],"properties":{{}}}}"#))
+            .collect();
+        for (i, (from, to, w)) in edges.iter().enumerate() {
+            lines.push(format!(
+                r#"{{"type":"edge","id":"e{i}","labels":["R"],"from":"{from}","to":"{to}","properties":{{"w":{w}}}}}"#
+            ));
+        }
+        ndjson::decode(&lines.join("\n")).expect("fixture decodes")
+    }
+
+    fn sp(graph: &Graph, weighted_by: Option<&str>) -> Result<AlgoOutput, String> {
+        let cfg = AlgoConfig::from_json(&match weighted_by {
+            Some(k) => format!(r#"{{"source":"a","weightProperty":"{k}"}}"#),
+            None => r#"{"source":"a"}"#.to_string(),
+        })
+        .expect("config parses");
+        dispatch(graph, "shortestPath", &cfg)
+    }
+
+    #[test]
+    fn negative_self_loop_is_rejected_not_run_forever() {
+        // The minimal hang: one node, one edge.
+        let g = weighted(&[("a", "a", -1.0)]);
+
+        assert!(
+            sp(&g, Some("w")).is_err(),
+            "a negative self-loop must be rejected"
+        );
+    }
+
+    #[test]
+    fn negative_cycle_is_rejected() {
+        let g = weighted(&[("a", "b", -1.0), ("b", "a", 0.0)]);
+
+        assert!(
+            sp(&g, Some("w")).is_err(),
+            "a negative cycle must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_single_negative_edge_is_rejected_even_without_a_cycle() {
+        // This one terminated before the fix and returned -1. Dijkstra can settle a
+        // vertex before a cheaper negative path reaches it, so an acyclic negative
+        // graph terminating is luck, not a correct answer.
+        let g = weighted(&[("a", "b", -1.0)]);
+
+        assert!(sp(&g, Some("w")).is_err());
+    }
+
+    #[test]
+    fn the_rejection_names_the_property() {
+        let g = weighted(&[("a", "b", -1.0)]);
+        let err = sp(&g, Some("w")).expect_err("should reject");
+
+        assert!(err.contains("weightProperty"), "got: {err}");
+        assert!(
+            err.contains('w'),
+            "the offending key should be named: {err}"
+        );
+    }
+
+    #[test]
+    fn non_negative_weights_still_run() {
+        let g = weighted(&[("a", "b", 1.0), ("b", "c", 2.5), ("a", "c", 0.0)]);
+
+        assert!(sp(&g, Some("w")).is_ok());
+        // And zero weights (the value a missing property takes) are fine.
+        let z = weighted(&[("a", "b", 0.0)]);
+
+        assert!(sp(&z, Some("w")).is_ok());
+    }
+
+    #[test]
+    fn an_unweighted_run_ignores_negative_weights_entirely() {
+        // BFS has no such precondition, so the guard must not fire without
+        // `weightProperty`.
+        let g = weighted(&[("a", "b", -5.0)]);
+
+        assert!(sp(&g, None).is_ok());
     }
 }

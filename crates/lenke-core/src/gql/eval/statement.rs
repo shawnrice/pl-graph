@@ -1201,6 +1201,8 @@ pub(super) fn tx_commit_error(e: TxCommitError) -> CodeError {
         // A graph-level invariant carries its own error verbatim — a
         // `ConstraintViolation` for a `false` result cell, or an evaluation fault.
         TxCommitError::Invariant(e) => e,
+        // A malformed label / edge type / property key introduced by a write.
+        TxCommitError::MalformedName(e) => e,
         TxCommitError::NoTx => {
             CodeError::new(ErrorCode::InvalidGraphOp, "commit called with no open transaction")
         }

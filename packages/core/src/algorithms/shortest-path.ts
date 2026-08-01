@@ -1,3 +1,5 @@
+import { ErrorCode, LenkeError } from '@lenke/errors';
+
 import type { Edge } from '../core/Edge.js';
 import type { Graph } from '../core/Graph.js';
 import type { Vertex } from '../core/Vertex.js';
@@ -204,6 +206,28 @@ export const computeGen = function* (
   // Unknown/absent source → no reachable set.
   if (srcIdx === undefined) {
     return [];
+  }
+
+  // Dijkstra (and A*) require NON-NEGATIVE weights. With a negative edge the
+  // relaxation can keep finding a cheaper path forever, so a negative cycle never
+  // terminates — and a negative self-loop is enough: one node and one edge hung
+  // the engine indefinitely. Rejected for ANY negative weight, not just a cycle,
+  // because Dijkstra can also settle a vertex too early and return a silently
+  // wrong distance; a negative-but-acyclic graph terminating is luck, not a
+  // correct answer. Mirrors the native guard in `algo/mod.rs`.
+  if (weightProperty !== undefined) {
+    for (const edge of graph.edges) {
+      const w = edge.getProperty(weightProperty);
+
+      // NaN is rejected alongside negatives: it makes every relaxation
+      // comparison false and strands the search just as effectively.
+      if (typeof w === 'number' && (Number.isNaN(w) || w < 0)) {
+        throw new LenkeError(
+          `shortestPath \`weightProperty\` (${weightProperty}) must hold non-negative numbers — Dijkstra does not admit negative weights`,
+          { code: ErrorCode.InvalidValue },
+        );
+      }
+    }
   }
 
   const weightOf = (edge: Edge): number => {

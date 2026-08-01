@@ -78,3 +78,89 @@ describe('shortest path', () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// Negative weights are REJECTED, not run.
+//
+// Dijkstra's precondition was documented and never enforced, so a graph that
+// violated it did not fail — it spun forever. A negative self-loop (ONE node,
+// ONE edge) was enough to hang the engine. Found by the randomized algorithm
+// differential, whose weight corpus includes negatives; the native engine hung
+// on the identical input and is guarded the same way.
+// ---------------------------------------------------------------------------
+
+describe('shortestPath rejects negative weights', () => {
+  const withEdges = (edges: [string, string, number][]): Graph => {
+    const g = new Graph();
+
+    for (const id of ['a', 'b', 'c']) {
+      g.addVertex({ id, labels: ['N'] });
+    }
+
+    for (const [from, to, w] of edges) {
+      g.addEdge({
+        from: g.getVertexById(from)!,
+        to: g.getVertexById(to)!,
+        labels: ['E'],
+        properties: { w },
+      });
+    }
+
+    return g;
+  };
+  const code = async (g: Graph, weightProperty?: string): Promise<string> => {
+    try {
+      await shortestPath(
+        { source: 'a', ...(weightProperty === undefined ? {} : { weightProperty }) },
+        g,
+      );
+
+      return 'ok';
+    } catch (e) {
+      return (e as { code?: string }).code ?? 'UNCODED';
+    }
+  };
+
+  test('a negative self-loop is rejected, not run forever', async () => {
+    // The minimal hang: one node, one edge.
+    expect(await code(withEdges([['a', 'a', -1]]), 'w')).toBe('E_INVALID_VALUE');
+  });
+
+  test('a negative cycle is rejected', async () => {
+    expect(
+      await code(
+        withEdges([
+          ['a', 'b', -1],
+          ['b', 'a', 0],
+        ]),
+        'w',
+      ),
+    ).toBe('E_INVALID_VALUE');
+  });
+
+  test('a single negative edge is rejected even without a cycle', async () => {
+    // This terminated before the fix and returned -1. Dijkstra can settle a
+    // vertex before a cheaper negative path reaches it, so an acyclic negative
+    // graph terminating is luck rather than a correct answer.
+    expect(await code(withEdges([['a', 'b', -1]]), 'w')).toBe('E_INVALID_VALUE');
+  });
+
+  test('non-negative weights still run, zero included', async () => {
+    expect(
+      await code(
+        withEdges([
+          ['a', 'b', 1],
+          ['b', 'c', 2.5],
+        ]),
+        'w',
+      ),
+    ).toBe('ok');
+    expect(await code(withEdges([['a', 'b', 0]]), 'w')).toBe('ok');
+  });
+
+  test('an unweighted run ignores negative weights entirely', async () => {
+    // BFS has no such precondition, so the guard must not fire without
+    // `weightProperty`.
+    expect(await code(withEdges([['a', 'b', -5]]))).toBe('ok');
+  });
+});

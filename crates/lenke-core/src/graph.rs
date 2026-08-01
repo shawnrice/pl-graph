@@ -1513,6 +1513,12 @@ pub struct Graph {
     /// that write's value-scope for CDC routing (`last_write_scope`). Content-derived
     /// scope extraction rides the touched set the commit already collects.
     last_touched: Vec<u32>,
+    /// How many interned names have already been checked for well-formedness
+    /// (`labels`, `etype`, vertex prop keys, edge prop keys). Dictionaries are
+    /// append-only and a valid name stays valid, so a commit only has to check
+    /// the tail added since the last one — usually nothing at all. See
+    /// [`Graph::validate_new_names`].
+    names_checked: [usize; 4],
     applying_undo: bool,
     /// Anti-resource-abuse ceiling on GQL operator-chain length, passed to the
     /// parser on each query (see `gql::parser::DEFAULT_MAX_CHAIN`). Defaults to
@@ -1591,6 +1597,7 @@ impl Clone for Graph {
             tx_touched: self.tx_touched.clone(),
             tx_touched_edges: self.tx_touched_edges.clone(),
             last_touched: self.last_touched.clone(),
+            names_checked: self.names_checked,
             applying_undo: self.applying_undo,
             config: self.config,
             tx_read_only: self.tx_read_only,
@@ -1666,6 +1673,11 @@ struct InvariantRule {
 pub enum TxCommitError {
     /// `commit_tx` was called with no open transaction.
     NoTx,
+    /// A write introduced a label / edge type / property key that is not
+    /// well-formed — an empty key or label, or a label carrying the GraphSON
+    /// `::` separator. Caught at commit so EVERY write path is covered by one
+    /// check, and rolled back like any other commit failure.
+    MalformedName(CodeError),
     /// A required-property constraint is unsatisfied on a touched vertex.
     Required,
     /// A type constraint is violated on a touched vertex.
@@ -2778,6 +2790,7 @@ impl Builder {
             n,
             live_n: n,
             v_live: vec![true; n],
+            names_checked: [0; 4],
             vid,
             labels,
             etype,

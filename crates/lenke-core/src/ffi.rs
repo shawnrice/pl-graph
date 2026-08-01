@@ -1155,7 +1155,12 @@ pub unsafe extern "C" fn lnk_algo(
     let rowset = match crate::algo::run(g, name, cfg) {
         Ok(rs) => rs,
         Err(msg) => {
-            crate::ffi_error::set_code(crate::error_codes::ErrorCode::Ffi, &msg);
+            // An algorithm only fails on its NAME or its CONFIG — an unknown
+            // algorithm, an unknown/!invalid config key, a malformed
+            // `writeProperty`. `Ffi` is for a fault in the boundary itself, so
+            // reporting it here threw away the one thing a caller could branch on
+            // and left every config mistake indistinguishable from a broken call.
+            crate::ffi_error::set_code(crate::error_codes::ErrorCode::InvalidValue, &msg);
             return std::ptr::null_mut();
         }
     };

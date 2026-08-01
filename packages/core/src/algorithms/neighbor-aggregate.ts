@@ -1,3 +1,5 @@
+import { ErrorCode, LenkeError } from '@lenke/errors';
+
 import type { Edge } from '../core/Edge.js';
 import type { Graph } from '../core/Graph.js';
 import type { Vertex } from '../core/Vertex.js';
@@ -55,7 +57,9 @@ type Contributor = { eidx: number; nbr: string };
 /** Validate `op` (raw so the message shows the offending value, not `never`). */
 const resolveOp = (raw: string): Op => {
   if (raw !== 'mean' && raw !== 'sum' && raw !== 'max' && raw !== 'min') {
-    throw new Error(`neighborAggregate \`op\` must be one of mean|sum|max|min, got '${raw}'`);
+    throw new LenkeError(`neighborAggregate \`op\` must be one of mean|sum|max|min, got '${raw}'`, {
+      code: ErrorCode.InvalidValue,
+    });
   }
 
   return raw;
@@ -64,7 +68,10 @@ const resolveOp = (raw: string): Op => {
 /** Validate `direction` into `[wantOut, wantIn]`. */
 const resolveDirs = (raw: string): [boolean, boolean] => {
   if (raw !== 'out' && raw !== 'in' && raw !== 'both') {
-    throw new Error(`neighborAggregate \`direction\` must be one of out|in|both, got '${raw}'`);
+    throw new LenkeError(
+      `neighborAggregate \`direction\` must be one of out|in|both, got '${raw}'`,
+      { code: ErrorCode.InvalidValue },
+    );
   }
 
   return [raw === 'out' || raw === 'both', raw === 'in' || raw === 'both'];
@@ -73,7 +80,9 @@ const resolveDirs = (raw: string): [boolean, boolean] => {
 /** Validate `norm` into a GCN flag. */
 const resolveGcn = (raw: string): boolean => {
   if (raw !== 'none' && raw !== 'gcn') {
-    throw new Error(`neighborAggregate \`norm\` must be one of none|gcn, got '${raw}'`);
+    throw new LenkeError(`neighborAggregate \`norm\` must be one of none|gcn, got '${raw}'`, {
+      code: ErrorCode.InvalidValue,
+    });
   }
 
   return raw === 'gcn';
@@ -109,8 +118,9 @@ const buildFeatures = (
     if (vec !== null && dim === undefined) {
       dim = vec.length;
     } else if (vec !== null && dim !== vec.length) {
-      throw new Error(
+      throw new LenkeError(
         `neighborAggregate feature vectors must all have the same length; found ${dim} and ${vec.length}`,
+        { code: ErrorCode.InvalidValue },
       );
     }
   }
@@ -175,7 +185,9 @@ export const computeGen = function* (
   const { feature, edgeLabel, direction = 'both', writeProperty, weightProperty } = config;
 
   if (feature === undefined) {
-    throw new Error('neighborAggregate requires a `feature` property');
+    throw new LenkeError('neighborAggregate requires a `feature` property', {
+      code: ErrorCode.InvalidValue,
+    });
   }
 
   const op = resolveOp(config.op ?? 'mean');
@@ -187,8 +199,9 @@ export const computeGen = function* (
   const weighted = weightProperty !== undefined;
 
   if ((weighted || gcn) && (op === 'max' || op === 'min')) {
-    throw new Error(
+    throw new LenkeError(
       'neighborAggregate `weightProperty`/`norm` apply only to op=sum|mean (max/min are scale-independent)',
+      { code: ErrorCode.InvalidValue },
     );
   }
 
