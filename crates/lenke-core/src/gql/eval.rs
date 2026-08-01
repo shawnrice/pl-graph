@@ -2977,10 +2977,17 @@ fn str_eq_vec(
     if !matches!(op, CompareOp::Eq | CompareOp::Ne) {
         return None;
     }
-    // Match the (prop, literal) pair in either operand order.
+    // Match the (prop, string scalar) pair in either operand order. The scalar is
+    // a literal OR a `$param` bound to a string: this used to accept only the
+    // literal, so `WHERE u.name = $n` — the parameterized, injection-safe way to
+    // write the SAME query — fell through to the per-row scalar path and cost 35x
+    // (29.6 us vs 1038 us over 20k rows; ~52 ns/row, flat in graph size, so the
+    // ratio only grows). `temporal_cmp_vec` below has always taken a param here;
+    // the two recognizers simply drifted.
     let (prop, lit) = match (left, right) {
-        (p @ CExpr::Prop { .. }, CExpr::Lit(Lit::Str(s)))
-        | (CExpr::Lit(Lit::Str(s)), p @ CExpr::Prop { .. }) => (p, s),
+        (p @ CExpr::Prop { .. }, other) | (other, p @ CExpr::Prop { .. }) => {
+            (p, scalar_str(other, ctx)?)
+        }
         _ => return None,
     };
     let CExpr::Prop { var_slot, key_ref } = prop else {
@@ -3006,6 +3013,21 @@ fn str_eq_vec(
         t.push(if is_eq { eq } else { !eq });
     }
     Some(VVec::Bool { t, valid })
+}
+
+/// Extract a row-independent string scalar from `e` — a string literal or a
+/// `$param` bound to one — else `None`. A param bound to anything else (number,
+/// null, list, temporal) must NOT reach the interned-id path: that path answers
+/// only string-vs-string, and cross-type comparison has its own semantics.
+fn scalar_str<'a>(e: &'a CExpr, ctx: &'a Ctx) -> Option<&'a str> {
+    match e {
+        CExpr::Lit(Lit::Str(s)) => Some(s),
+        CExpr::Param(s) => match ctx.params.get(*s) {
+            Some(Val::Str(v)) => Some(v),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Extract a row-independent temporal scalar from `e` — a temporal literal

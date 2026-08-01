@@ -38,6 +38,8 @@ mod tck_tests;
 mod temporal_differential;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vec_kernel_tests;
 
 pub use eval::{prepare, prepare_with_max_chain, run_invariant, Prepared};
 pub use lexer::SyntaxError;
