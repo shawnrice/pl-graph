@@ -44,7 +44,8 @@ import {
 
 import { createFfiBackend } from './src/backend-ffi.js';
 import { createWasmBackend } from './src/backend-wasm.js';
-import { graphFromFormat, graphFromNdjson, type Backend, type GraphFormat } from './src/graph.js';
+import type { Backend } from './src/backend.js';
+import { graphFromFormat, graphFromNdjson, type GraphFormat } from './src/graph.js';
 
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB = new URL(

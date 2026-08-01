@@ -19,7 +19,8 @@ import { existsSync } from 'node:fs';
 
 import { createFfiBackend } from './backend-ffi.js';
 import { createWasmBackend } from './backend-wasm.js';
-import { graphFromNdjson, type Backend } from './graph.js';
+import type { Backend } from './backend.js';
+import { graphFromNdjson } from './graph.js';
 
 const LIB = new URL('../../../crates/lenke-core/target/release/liblenke_core.so', import.meta.url)
   .pathname;

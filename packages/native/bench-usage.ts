@@ -31,7 +31,8 @@ import { deserialize as tsDeserialize } from '@lenke/serialization';
 
 import { createFfiBackend } from './src/backend-ffi.js';
 import { createWasmBackend } from './src/backend-wasm.js';
-import { graphFromNdjson, type Backend } from './src/graph.js';
+import type { Backend } from './src/backend.js';
+import { graphFromNdjson } from './src/graph.js';
 
 const LIB_EXTENSIONS: Partial<Record<NodeJS.Platform, string>> = { darwin: 'dylib', win32: 'dll' };
 const LIB = new URL(

@@ -19,8 +19,12 @@ const lib = dlopen(libPath, {
 });
 
 describe('lenke-core over bun:ffi', () => {
+  // Deliberately a hardcoded number: an ABI change that nobody meant to make
+  // should break this. Move it in the same commit as `lnk_abi_version` in
+  // ffi.rs — it went stale at 17 while the crate reached 18, and only CI's
+  // separate smoke step would have caught it.
   test('abi version probe', () => {
-    expect(lib.symbols.lnk_abi_version()).toBe(17);
+    expect(lib.symbols.lnk_abi_version()).toBe(18);
   });
 
   test('graph round-trips through the C ABI: load ndjson, read counts back', () => {
