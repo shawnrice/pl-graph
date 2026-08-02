@@ -547,6 +547,29 @@ fn lowered_ids<'a>(graph: &Graph, steps: &'a [Step]) -> Option<(Vec<u32>, &'a [S
         ids = crate::seek::expand(graph, &ids, *dir, etypes, crate::seek::SelfLoops::Twice);
     }
 
+    // A trailing edge step lands on the EDGE rather than its far end, turning the
+    // frontier into edge ids — which is what lets `outE(R).count()` and
+    // `outE(R).values(w)` answer from the IR too.
+    if !edges {
+        let (dir, labels, tail) = match rest {
+            [Step::OutE(l), t @ ..] => (crate::seek::Dir::Out, l, t),
+            [Step::InE(l), t @ ..] => (crate::seek::Dir::In, l, t),
+            [Step::BothE(l), t @ ..] => (crate::seek::Dir::Both, l, t),
+            _ => return Some((ids, rest, edges)),
+        };
+        let etypes: Vec<u32> = labels.iter().filter_map(|l| graph.etype.get(l)).collect();
+
+        if etypes.len() != labels.len() {
+            return Some((Vec::new(), tail, true));
+        }
+
+        return Some((
+            crate::seek::expand_edges(graph, &ids, dir, &etypes, crate::seek::SelfLoops::Twice),
+            tail,
+            true,
+        ));
+    }
+
     Some((ids, rest, edges))
 }
 
@@ -641,11 +664,54 @@ fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
         }
     }
 
+    // A trailing edge step lands on the EDGE rather than its far end, so
+    // `outE(R).count()` counts edges. It has to come before the count check
+    // because it consumes a step.
+    let mut edge_tail: Option<(crate::seek::Dir, Vec<u32>)> = None;
+
+    if !is_edge {
+        if let [nav @ (Step::OutE(l) | Step::InE(l) | Step::BothE(l)), tail @ ..] = rest {
+            let dir = match nav {
+                Step::OutE(_) => crate::seek::Dir::Out,
+                Step::InE(_) => crate::seek::Dir::In,
+                _ => crate::seek::Dir::Both,
+            };
+            let etypes: Vec<u32> = l.iter().filter_map(|n| graph.etype.get(n)).collect();
+
+            if etypes.len() != l.len() {
+                return Some(0.0);
+            }
+
+            edge_tail = Some((dir, etypes));
+            rest = tail;
+        }
+    }
+
     if !matches!(rest, [Step::Count(Scope::Global)]) {
         return None;
     }
 
     let mut ids = seek.scan(graph, &no_params, || universe(graph, is_edge));
+
+    if let Some((dir, etypes)) = edge_tail {
+        for (d, e) in &hops {
+            ids = crate::seek::expand(graph, &ids, *d, e, crate::seek::SelfLoops::Twice);
+        }
+
+        let edges =
+            crate::seek::expand_edges(graph, &ids, dir, &etypes, crate::seek::SelfLoops::Twice);
+
+        #[allow(clippy::cast_precision_loss)]
+        return Some(if distinct {
+            let mut seen: HashSet<u32> = HashSet::with_capacity(edges.len());
+            let mut e = edges;
+
+            e.retain(|&id| seen.insert(id));
+            e.len() as f64
+        } else {
+            edges.len() as f64
+        });
+    }
 
     // With a dedup the last hop has to be materialized to be deduplicated; without
     // one it can be counted in place.
@@ -2155,13 +2221,49 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         Step::OutE(labels) | Step::InE(labels) | Step::BothE(labels) => {
             let (out, inn) = dir_flags(step);
             let mut next = Vec::new();
+
             for t in &stream {
                 if let GVal::Node(v) = t.val {
-                    for a in adj_in_label_order(graph, v, out, inn, labels) {
-                        next.push(t.step(GVal::Edge(a.0)));
+                    // No label, or exactly one, streams straight through — the
+                    // `Vec` per source vertex in `adj_in_label_order` exists only
+                    // to emit in the ARGUMENTS' label order, and one argument has
+                    // no order to get wrong. Same fix the vertex steps already
+                    // had; the edge steps were missed.
+                    if labels.len() <= 1 {
+                        let want = labels.first().and_then(|l| graph.etype.get(l));
+
+                        // A label naming no type matches nothing — distinct from
+                        // no label, which matches every type.
+                        if labels.is_empty() || want.is_some() {
+                            let keep =
+                                move |a: &crate::graph::Adj| want.is_none_or(|w| a.etype == w);
+
+                            if out {
+                                next.extend(
+                                    graph
+                                        .out_adj(v)
+                                        .filter(keep)
+                                        .map(|a| t.step(GVal::Edge(a.eidx))),
+                                );
+                            }
+
+                            if inn {
+                                next.extend(
+                                    graph
+                                        .in_adj(v)
+                                        .filter(keep)
+                                        .map(|a| t.step(GVal::Edge(a.eidx))),
+                                );
+                            }
+                        }
+                    } else {
+                        for a in adj_in_label_order(graph, v, out, inn, labels) {
+                            next.push(t.step(GVal::Edge(a.0)));
+                        }
                     }
                 }
             }
+
             next
         }
 

@@ -1151,3 +1151,43 @@ fn a_repeat_with_until_or_emit_is_not_unrolled() {
     assert_eq!(with_until.len(), 1);
     assert_eq!(with_emit.len(), 1);
 }
+
+#[test]
+fn an_edge_terminal_agrees_with_the_walk() {
+    let mut graph = seeded();
+
+    for (t, label) in [
+        (g().v_ids(&[]).has_label(&["P"]).out_e(&["R"]), "outE R"),
+        (g().v_ids(&[]).has_label(&["Q"]).in_e(&["R"]), "inE R"),
+        (g().v_ids(&[]).has_label(&["P"]).both_e(&[]), "bothE any"),
+        (
+            g().v_ids(&[]).has_label(&["P"]).out(&["R"]).out_e(&["S"]),
+            "after a hop",
+        ),
+    ] {
+        // The edge steps land on the EDGE, not its far end, so the counted form
+        // must count edges — and agree with materializing them.
+        let walked = ids(&mut graph, t.clone()).len() as f64;
+
+        assert_eq!(count_of(&mut graph, t.count()), walked, "{label}");
+    }
+}
+
+#[test]
+fn an_unknown_edge_label_on_a_terminal_counts_nothing() {
+    let mut graph = seeded();
+
+    assert_eq!(
+        count_of(
+            &mut graph,
+            g().v_ids(&[]).has_label(&["P"]).out_e(&["Nope"]).count()
+        ),
+        0.0
+    );
+    assert!(
+        count_of(
+            &mut graph,
+            g().v_ids(&[]).has_label(&["P"]).out_e(&[]).count()
+        ) > 0.0
+    );
+}

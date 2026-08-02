@@ -1064,6 +1064,41 @@ pub fn expand(graph: &Graph, src: &[u32], dir: Dir, etypes: &[u32], loops: SelfL
     out
 }
 
+/// The EDGES incident to `src` along `etypes` (empty = any), flat.
+///
+/// `outE`/`inE`/`bothE` land on the edge itself rather than its far end, so the
+/// result is an edge-id frontier. Self-loops follow the same rule as [`expand`]:
+/// an undirected walk reaches one from both sides.
+#[must_use]
+pub fn expand_edges(
+    graph: &Graph,
+    src: &[u32],
+    dir: Dir,
+    etypes: &[u32],
+    loops: SelfLoops,
+) -> Vec<u32> {
+    let mut out = Vec::new();
+    let keep = |t: u32| etypes.is_empty() || etypes.contains(&t);
+    let drop_loop = dir == Dir::Both && loops == SelfLoops::Once;
+
+    for &v in src {
+        if dir != Dir::In {
+            out.extend(graph.out_adj(v).filter(|a| keep(a.etype)).map(|a| a.eidx));
+        }
+
+        if dir != Dir::Out {
+            out.extend(
+                graph
+                    .in_adj(v)
+                    .filter(|a| keep(a.etype) && !(drop_loop && a.nbr == v))
+                    .map(|a| a.eidx),
+            );
+        }
+    }
+
+    out
+}
+
 /// How many neighbours [`expand`] would produce, without producing them.
 ///
 /// The counting form allocates nothing at all — the whole expansion becomes a
