@@ -304,6 +304,44 @@ throws).
 Payoff: ~7-11% on map/record workloads and a 20% smaller value in every binding
 slot.
 
+## Where the remaining gap actually is
+
+Both engines now share the access path and the value type. What they do NOT
+share is EXECUTION, and that is where the cost is. Equivalent queries, same
+graph, same process, 50k vertices / 100k edges:
+
+| equivalent work    | GQL    | Gremlin   | ratio      |
+| ------------------ | ------ | --------- | ---------- |
+| count all by label | 0.1 us | 1409.6 us | **11747x** |
+| filter + count     | 137.9  | 2080.7    | **15x**    |
+| project one column | 698.8  | 6176.9    | **9x**     |
+| 1-hop count        | 374.0  | 8866.7    | **24x**    |
+
+None of that is semantic. GQL has machinery Gremlin has no access to:
+
+- a **count shortcut** that answers `count(*)` without materializing rows;
+- a **vectorized column gather** (`gather_num` / `gather_str` /
+  `gather_temporal`) instead of per-row dispatch;
+- **typed comparators** (`str_eq_vec`, `temporal_cmp_vec`) that compare packed
+  columns directly;
+- **columnar projection** that fills a `RowSet` without a `Val` per row.
+
+Gremlin walks `Vec<Trav>` one traverser at a time for all of it.
+
+The shape of the fix is the same one the access path used: recognize the
+COLUMNAR-ELIGIBLE PREFIX of a traversal — the leading run of element filters
+before anything that needs traverser identity — run it through the columnar
+machinery, and hand the result to the ordinary walk. `path()`, `simplePath()`,
+`sack()` and the rest keep the traverser semantics they require, because a
+prefix like `V().hasLabel(X).has(k, v)` has none.
+
+Two things to know before starting. The label BUCKET (`by_label`) is NOT a valid
+shortcut for `hasLabel`: it indexes a vertex under every label it carries, while
+Gremlin's `hasLabel` matches the FIRST label only, so a bucket count matches a
+`[A, B]` vertex on `hasLabel('B')` where the traversal does not. And the cheapest
+win in that list was not a fast path at all — `hasLabel` was allocating an
+`Arc<str>` per element to compare two integers (fixed, −17%).
+
 ## Not on the table
 
 Unifying the two surface languages. Users pick GQL or Gremlin, and the parallel
