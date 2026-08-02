@@ -451,95 +451,72 @@ pub(super) fn build_scan(
     // inline constraints are re-checked.
     if path.segments.is_empty() {
         let node = &path.start;
-        let seed = node_index_seed(graph, ctx, node, where_);
-        let mut ids = Vec::new();
         let needs_check = !node.props.is_empty() || node.where_.is_some();
 
-        // The seed-and-filter of an isolated node is the SHARED access path:
-        // seed from an index or a label bucket, then narrow. Routing through it
-        // replaced a bucket-cloning special case here, and means the selectivity
-        // rule (only seed from a label when the bucket is smaller than the live
-        // set) is decided in one place for both engines rather than twice.
-        //
-        // Only when the node's constraints are wholly lowered — no inline props,
-        // no node-local WHERE, and a label that is a flat id list. Anything
-        // richer (a negated or conjoined label, an arbitrary predicate) keeps the
-        // general loop below, which is where GQL's own evaluator belongs.
-        if !needs_check {
-            let lowered = node.label.as_ref().map_or(Some(Vec::new()), |l| {
-                seek_lower::lower_labels(l, ctx, false)
-            });
+        // The seed-and-filter of an isolated node is the SHARED access path —
+        // one loop for both engines. The seed, the cap, the label rule and the
+        // typed-column filters live in `crate::seek`; what is genuinely GQL —
+        // an arbitrary `WHERE` evaluated against a binding — arrives as the
+        // RESIDUAL closure, so this no longer needs a scan loop of its own.
+        let label_ids = node
+            .label
+            .as_ref()
+            .and_then(|l| seek_lower::lower_labels(l, ctx, false));
+        let mut seek = seek_lower::element_seek(
+            where_,
+            &seek_lower::inline_of(node),
+            graph,
+            ctx,
+            node.var_slot,
+            false,
+        );
 
-            if let Some(label_ids) = lowered {
-                let mut seek = seek_lower::element_seek(
-                    where_,
-                    &seek_lower::inline_of(node),
-                    graph,
-                    ctx,
-                    node.var_slot,
-                    false,
-                );
+        if let Some(ids) = label_ids.clone() {
+            seek.set_labels(crate::seek::LabelRule::Any, ids);
+        }
 
-                if node.label.is_some() {
-                    seek.set_labels(crate::seek::LabelRule::Any, label_ids);
-                }
+        let binds = seek_lower::GqlBindings(ctx.params);
+        let mut b = Binding(vec![None; scope_len.max(1)]);
+        // A label expression the IR cannot hold (`!A`, `A&B`, wildcard) stays
+        // here, as does every inline constraint and node-local WHERE.
+        let residual_label = label_ids.is_none();
+        // With nothing left over, hand the shared loop a no-op residual through
+        // `scan_capped` rather than a closure it must call per candidate. Same
+        // loop either way — but the trivial case monomorphizes to a constant and
+        // vanishes, and calling it per vertex cost 26% on a grouped aggregate.
+        let ids = if !residual_label && !needs_check {
+            seek.scan_capped(graph, &binds, cap, || graph.vertex_indices().collect())
+        } else {
+            seek.scan_with(
+                graph,
+                &binds,
+                cap,
+                || graph.vertex_indices().collect(),
+                |vi| {
+                    if residual_label && !matches_label(graph, ctx, vi, node.label.as_ref()) {
+                        return false;
+                    }
 
-                let binds = seek_lower::GqlBindings(ctx.params);
-
-                if seek.conj_is_empty() || seek.columnar(graph, &binds) {
-                    let ids =
-                        seek.scan_capped(graph, &binds, cap, || graph.vertex_indices().collect());
-
-                    let mut sc = ScanCols::new(scope_len);
-
-                    sc.n = ids.len();
+                    if !needs_check {
+                        return true;
+                    }
 
                     if let Some(slot) = node.var_slot {
-                        sc.slots[slot] = Some((Elem::Node, ids));
+                        b.set(slot, Val::Node(vi));
                     }
 
-                    return Some(sc);
-                }
-            }
-        }
-
-        let mut b = Binding(vec![None; scope_len.max(1)]);
-        let consider = |graph: &Graph, vi: u32, ids: &mut Vec<u32>, b: &mut Binding| -> bool {
-            if !matches_label(graph, ctx, vi, node.label.as_ref()) {
-                return true;
-            }
-            if needs_check {
-                if let Some(s) = node.var_slot {
-                    b.set(s, Val::Node(vi));
-                }
-                if !satisfies(
-                    graph,
-                    ctx,
-                    &Val::Node(vi),
-                    &node.props,
-                    node.where_.as_ref(),
-                    b,
-                ) {
-                    return true;
-                }
-            }
-            ids.push(vi);
-            cap.is_none_or(|c| ids.len() < c)
+                    satisfies(
+                        graph,
+                        ctx,
+                        &Val::Node(vi),
+                        &node.props,
+                        node.where_.as_ref(),
+                        &b,
+                    )
+                },
+            )
         };
-        match seed {
-            Some(cands) => {
-                for vi in cands {
-                    if graph.is_vertex_live(vi) && !consider(graph, vi, &mut ids, &mut b) {
-                        break;
-                    }
-                }
-            }
-            None => {
-                for_each_seed(graph, ctx, node.label.as_ref(), &mut |vi| {
-                    consider(graph, vi, &mut ids, &mut b)
-                });
-            }
-        }
+
         let mut sc = ScanCols::new(scope_len);
         sc.n = ids.len();
         if let Some(s) = node.var_slot {

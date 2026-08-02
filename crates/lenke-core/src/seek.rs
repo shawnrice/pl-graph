@@ -545,6 +545,29 @@ impl ElementSeek {
         cap: Option<usize>,
         universe: impl FnOnce() -> Vec<u32>,
     ) -> Vec<u32> {
+        self.scan_with(graph, param, cap, universe, |_| true)
+    }
+
+    /// As [`scan_capped`](Self::scan_capped), with a RESIDUAL predicate the
+    /// front end supplies for whatever the IR could not express.
+    ///
+    /// This is what lets one scan loop serve both engines. The seed, the cap, the
+    /// label rule and the column filters live here; the part that is genuinely
+    /// per-language — GQL's arbitrary `WHERE` over a binding, Gremlin's
+    /// predicates that are not a range — arrives as a closure. Neither engine
+    /// needs its own loop to get its own semantics.
+    ///
+    /// The residual runs LAST, after the cheap tests have already rejected most
+    /// candidates, and only until `cap` rows survive.
+    #[must_use]
+    pub fn scan_with(
+        &self,
+        graph: &Graph,
+        param: &impl Bindings,
+        cap: Option<usize>,
+        universe: impl FnOnce() -> Vec<u32>,
+        mut residual: impl FnMut(u32) -> bool,
+    ) -> Vec<u32> {
         let live = if self.edge {
             graph.edge_count()
         } else {
@@ -571,53 +594,56 @@ impl ElementSeek {
             },
         };
 
-        // With a cap, run every test per element and stop as soon as enough
-        // survive — a `retain` per predicate would filter the whole set first.
-        if let Some(c) = cap {
-            let tests: Vec<_> = self
-                .conj
-                .iter()
-                .filter_map(|p| {
-                    p.operand
-                        .resolve(param)
-                        .and_then(|k| column_matches(graph, &p.key, self.edge, p.op, &k))
-                })
-                .collect();
-            let labelled = self.labels.is_some() && !label_checked;
-            let mut out = Vec::with_capacity(c.min(ids.len()));
+        let labelled = self.labels.is_some() && !label_checked;
 
-            for id in ids {
-                if (!labelled || self.label_ok(graph, id)) && tests.iter().all(|t| t(id)) {
-                    out.push(id);
+        // Uncapped is the hot shape: narrow column-at-a-time in monomorphic
+        // loops, then run the residual over what survives. A capped scan takes
+        // the single-pass form below instead, because it has to stop early.
+        if cap.is_none() {
+            if labelled {
+                ids.retain(|&id| self.label_ok(graph, id));
+            }
 
-                    if out.len() == c {
-                        break;
-                    }
+            for p in &self.conj {
+                if let Some(k) = p.operand.resolve(param) {
+                    retain_matching(graph, &mut ids, &p.key, self.edge, p.op, &k);
                 }
             }
 
-            return out;
+            ids.retain(|&id| residual(id));
+
+            return ids;
         }
 
-        // Cheapest first: the label test reads one slice, a column test reads a
-        // value and a presence bit.
-        if self.labels.is_some() && !label_checked {
-            ids.retain(|&id| self.label_ok(graph, id));
+        // Capped: one pass, cheapest test first, stopping as soon as enough rows
+        // survive. The boxed tests cost a virtual call each, which is the right
+        // trade only because a cap keeps the row count small.
+        let tests: Vec<_> = self
+            .conj
+            .iter()
+            .filter_map(|p| {
+                p.operand
+                    .resolve(param)
+                    .and_then(|k| column_matches(graph, &p.key, self.edge, p.op, &k))
+            })
+            .collect();
+        let c = cap.unwrap_or(usize::MAX);
+        let mut out = Vec::with_capacity(c.min(ids.len()));
+
+        for id in ids.drain(..) {
+            if (!labelled || self.label_ok(graph, id))
+                && tests.iter().all(|t| t(id))
+                && residual(id)
+            {
+                out.push(id);
+
+                if out.len() == c {
+                    break;
+                }
+            }
         }
 
-        for p in &self.conj {
-            let Some(test) = p
-                .operand
-                .resolve(param)
-                .and_then(|k| column_matches(graph, &p.key, self.edge, p.op, &k))
-            else {
-                continue;
-            };
-
-            ids.retain(|&row| test(row));
-        }
-
-        ids
+        out
     }
 
     /// As [`resolve`](Self::resolve), plus which key (if any) the seed answers
@@ -817,6 +843,69 @@ fn type_agrees(graph: &Graph, key: &str, edge: bool, want: &IdxKey) -> bool {
             | (Column::Bool { .. }, IdxKey::Bool(_))
             | (Column::Temporal { .. }, IdxKey::Temporal(..))
     )
+}
+
+/// Drop every id whose column value fails `op want`, in a MONOMORPHIC loop.
+///
+/// `column_matches` returns a boxed closure, which costs a virtual call per
+/// element — fine for a capped scan of a few rows, 22% on a full one. Matching
+/// the column and the operator ONCE and then running a tight typed loop is what
+/// the hand-written GQL path did, and it is why routing through the shared layer
+/// has to do the same.
+///
+/// Returns `false` when the column cannot answer, leaving `ids` untouched so the
+/// caller can fall back.
+fn retain_matching(
+    graph: &Graph,
+    ids: &mut Vec<u32>,
+    key: &str,
+    edge: bool,
+    op: SeekOp,
+    want: &IdxKey,
+) -> bool {
+    let store = if edge {
+        &graph.edge_props
+    } else {
+        &graph.props
+    };
+    let Some(col) = store.keys.get(key).and_then(|k| store.cols.get(k as usize)) else {
+        return false;
+    };
+
+    macro_rules! by_op {
+        ($data:expr, $present:expr, $v:expr) => {{
+            let (data, present, v) = ($data, $present, $v);
+
+            match op {
+                SeekOp::Eq => ids.retain(|&i| present.get(i as usize) && data[i as usize] == v),
+                SeekOp::Lt => ids.retain(|&i| present.get(i as usize) && data[i as usize] < v),
+                SeekOp::Le => ids.retain(|&i| present.get(i as usize) && data[i as usize] <= v),
+                SeekOp::Gt => ids.retain(|&i| present.get(i as usize) && data[i as usize] > v),
+                SeekOp::Ge => ids.retain(|&i| present.get(i as usize) && data[i as usize] >= v),
+            }
+        }};
+    }
+
+    match (col, want) {
+        (Column::Num { data, present }, IdxKey::Num(n)) => by_op!(data, present, *n),
+        // Strings compare by INTERNED ID, so equality only — an ordering would
+        // need the dictionary text per row. A value never interned matches
+        // nothing, which is correct.
+        (Column::Str { data, present }, IdxKey::Str(t)) if op == SeekOp::Eq => {
+            match graph.strs.get(t) {
+                Some(w) => ids.retain(|&i| present.get(i as usize) && data[i as usize] == w),
+                None => ids.clear(),
+            }
+        }
+        (Column::Bool { data, present }, IdxKey::Bool(b)) if op == SeekOp::Eq => {
+            let b = *b;
+
+            ids.retain(|&i| present.get(i as usize) && data[i as usize] == b);
+        }
+        _ => return false,
+    }
+
+    true
 }
 
 /// Does the typed column hold a value at `row` satisfying `op key`?
