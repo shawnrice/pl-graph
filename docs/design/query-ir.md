@@ -439,6 +439,43 @@ lines in `lenke-core/src`): the shared layer was added, and the per-language
 layers above it cannot be deleted until the join/projection layer is shared too.
 The surface shrinks at the END of that work, not this one.
 
+## The one port that was measured and NOT taken
+
+Group variables in a parenthesized quantified unit — `((x)-[e]->(y)){1,4}` — were
+the last shape `build_scan` declined. They were ported: the blanket quantifier
+bail came out, `expand_scan` grew a value-column track beside its id columns, and
+a 26-query differential confirmed the columnar path returns the scalar matcher's
+rows row-for-row, order included. It is on `wip/columnar-group-vars`, not on this
+branch, because it measured slower (`layered_dense(6,6)`, forced both ways):
+
+```text
+                             columnar   scalar
+  -[:R]->{1,4} RETURN id        131 us    143 us   ← no group vars: a win
+  ((x)-[]->(y)){1,4} rows       365       286      1.28x slower
+  ((x)-[e]->(y)){1,4} + size    802       411      1.95x
+  … WHERE size(e) >= 2         1093       412      2.65x
+  ( (x)-[]->{1,2}(y) ){1,2}    1115       890      1.25x
+```
+
+The only row that wins is the abbreviated form, which already vectorizes here.
+Every shape that actually EXPOSES a group variable is worse, and structurally so:
+the columnar build keeps a `Val::List` per variable per trail alive in a column
+instead of dropping it at end of row, and no vectorized kernel reads a list
+column — `size(e)` and `e[0].amt` fall to `scalar_col`, which rebuilds a full
+`Binding` per row and DEEP-COPIES every list into it. (`Val::Map` already solved
+exactly this by `Arc`-ing its payload, with a comment saying why.)
+
+It was not taken because the trade it offers is not the one this effort is
+making. A slowdown is worth paying when it buys a shared path — but this is
+GQL-only columnar plumbing that Gremlin never touches, and it does not let the
+scalar matcher be deleted either, because 99% of the fallback is the join and
+projection layer (above). So it costs speed and buys neither sharing nor a
+deletion. The two candidate fixes are recorded on the branch: `Arc` the list
+payload the way `Val::Map` does (~170 sites, and it touches byte-identity paths),
+or add `size`/index kernels to `eval_vec` so the common group-variable
+expressions never bind a row at all. The second is the smaller one and would flip
+these rows; it is the prerequisite, not this port.
+
 ## The write path is already shared
 
 Audited because "one way of querying OR MUTATING" is the goal and mutation had
