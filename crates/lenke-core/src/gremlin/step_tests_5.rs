@@ -65,7 +65,7 @@ fn ids(t: Traversal) -> Vec<String> {
     t.run(&mut g)
         .iter()
         .map(|v| match v {
-            GVal::Vertex(i) => g.vid.text(*i).to_string(),
+            GVal::Node(i) => g.vid.text(*i).to_string(),
             GVal::Edge(e) => g.edge_id(*e).into_owned(),
             other => format!("{other:?}"),
         })
@@ -298,7 +298,7 @@ fn p5_dedup_select_cartesian_shape() {
         .map(|m| {
             let e = map_entries(m);
             let resolve = |g: &GVal| match g {
-                GVal::Vertex(_) => g.clone(),
+                GVal::Node(_) => g.clone(),
                 other => other.clone(),
             };
             // resolve to ids via a throwaway graph lookup
@@ -355,11 +355,7 @@ fn p5_dedup_via_oute_inv() {
 /// A `{key, value}` property object as the engine emits it.
 fn prop_obj(key: &str, value: GVal) -> GVal {
     // Owner is ignored by `GVal`'s PartialEq, so a placeholder is fine here.
-    GVal::Property {
-        owner: Box::new(GVal::Null),
-        key: key.into(),
-        value: Box::new(value),
-    }
+    GVal::property(GVal::Null, key.into(), value)
 }
 
 #[test]
@@ -598,7 +594,7 @@ fn sp_paths(t: Traversal) -> Vec<Vec<String>> {
             GVal::List(vs) => vs
                 .iter()
                 .map(|v| match v {
-                    GVal::Vertex(i) => g.vid.text(*i).to_string(),
+                    GVal::Node(i) => g.vid.text(*i).to_string(),
                     other => format!("{other:?}"),
                 })
                 .collect(),
@@ -769,7 +765,7 @@ fn p5_path_yields_full_accumulated_path() {
         GVal::List(vs) => vs
             .iter()
             .map(|v| match v {
-                GVal::Vertex(i) => gr.vid.text(*i).to_string(),
+                GVal::Node(i) => gr.vid.text(*i).to_string(),
                 other => format!("{other:?}"),
             })
             .collect(),
@@ -800,12 +796,12 @@ fn p5_simple_path_filters_revisits() {
     assert!(with_simple.len() < without.len());
 }
 
-// --- helper: resolve a GVal::Vertex to its id against a fresh modern graph ----
+// --- helper: resolve a GVal::Node to its id against a fresh modern graph ----
 // (the modern fixture is deterministic, so a re-decode maps dense ids back).
 fn vid(v: &GVal) -> String {
     let g = modern();
     match v {
-        GVal::Vertex(i) => g.vid.text(*i).to_string(),
+        GVal::Node(i) => g.vid.text(*i).to_string(),
         GVal::Edge(e) => g.edge_id(*e).into_owned(),
         other => format!("{other:?}"),
     }

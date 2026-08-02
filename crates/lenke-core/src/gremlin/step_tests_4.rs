@@ -672,7 +672,7 @@ fn p4_simplepath_path_acyclic() {
         };
         // Each path begins at v[1] and has 3 distinct vertices.
         assert_eq!(ids.len(), 3);
-        let first = matches!(&ids[0], GVal::Vertex(_));
+        let first = matches!(&ids[0], GVal::Node(_));
         assert!(first);
         let mut set = ids.clone();
         set.dedup();

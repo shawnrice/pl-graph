@@ -60,7 +60,7 @@ fn ids_of(t: super::Traversal) -> Vec<String> {
 
 fn gval_text(g: &Graph, v: &GVal) -> String {
     match v {
-        GVal::Vertex(i) => g.vid.text(*i).to_string(),
+        GVal::Node(i) => g.vid.text(*i).to_string(),
         GVal::Edge(e) => g.edge_id(*e).into_owned(),
         GVal::Str(s) => s.to_string(),
         GVal::Num(n) => format!("{n}"),
@@ -1002,7 +1002,7 @@ fn p6_addv_no_label() {
     let mut g0 = modern();
     let r = g().add_v(None).run(&mut g0);
     assert_eq!(r.len(), 1);
-    assert!(matches!(r[0], GVal::Vertex(_)));
+    assert!(matches!(r[0], GVal::Node(_)));
 }
 
 #[test]

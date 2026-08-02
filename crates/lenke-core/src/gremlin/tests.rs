@@ -1712,7 +1712,7 @@ fn sp_paths(t: super::Traversal) -> Vec<Vec<String>> {
             GVal::List(vs) => vs
                 .iter()
                 .map(|v| match v {
-                    GVal::Vertex(i) => g.vid.text(*i).to_string(),
+                    GVal::Node(i) => g.vid.text(*i).to_string(),
                     other => format!("{other:?}"),
                 })
                 .collect(),
@@ -2274,7 +2274,7 @@ fn results_json_escaping_and_structure() {
     // Graph elements serialize to the full `{id, labels, properties}` form (edge:
     // `{id, from, to, labels, properties}`) — byte-identical to GQL and the TS engine.
     assert_eq!(
-        results_json(vec![GVal::Vertex(0)]),
+        results_json(vec![GVal::Node(0)]),
         r#"[{"id":"1","labels":["PERSON"],"properties":{"age":29,"name":"marko"}}]"#
     );
     assert_eq!(

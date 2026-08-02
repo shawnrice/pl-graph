@@ -711,7 +711,7 @@ fn p3_unfold_fold_then_inject_setup() {
             let ids: Vec<String> = items
                 .iter()
                 .map(|v| match v {
-                    GVal::Vertex(i) => g.vid.text(*i).to_string(),
+                    GVal::Node(i) => g.vid.text(*i).to_string(),
                     other => format!("{other:?}"),
                 })
                 .collect();
@@ -740,7 +740,7 @@ fn p3_unfold_unfolds_one_level() {
     let ids: Vec<String> = r[3..]
         .iter()
         .map(|v| match v {
-            GVal::Vertex(i) => g.vid.text(*i).to_string(),
+            GVal::Node(i) => g.vid.text(*i).to_string(),
             other => format!("{other:?}"),
         })
         .collect();

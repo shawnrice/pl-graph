@@ -36,6 +36,8 @@ pub mod query;
 /// The shared index access path both query engines lower into.
 pub mod seek;
 pub mod temporal;
+/// The runtime value both query engines carry.
+pub mod value;
 
 // Composable capabilities — gated so a minimal (e.g. frontend wasm) build ships
 // only what it uses. See the `[features]` table in Cargo.toml.

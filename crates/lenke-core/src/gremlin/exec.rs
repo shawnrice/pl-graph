@@ -37,7 +37,12 @@ enum DedupKey {
 
 /// Build a hashable dedup key from a `GVal`, or `None` if it contains a `NaN`.
 fn dedup_key(v: &GVal) -> Option<DedupKey> {
+    // `Record`/`Path` are GQL-only (see `crate::value`); no traversal step can
+    // put one in a stream, so there is nothing to key them by.
     Some(match v {
+        // GQL-only (see `crate::value`); no traversal step can put one in a
+        // stream, so there is nothing to key them by.
+        GVal::Record(_) | GVal::Path(_) => return None,
         GVal::Null => DedupKey::Null,
         GVal::Bool(b) => DedupKey::Bool(*b),
         GVal::Num(n) => {
@@ -49,7 +54,7 @@ fn dedup_key(v: &GVal) -> Option<DedupKey> {
         }
         GVal::Str(s) => DedupKey::Str(s.clone()),
         GVal::Temporal(t) => DedupKey::Temporal(*t),
-        GVal::Vertex(id) => DedupKey::Vertex(*id),
+        GVal::Node(id) => DedupKey::Vertex(*id),
         GVal::Edge(id) => DedupKey::Edge(*id),
         GVal::List(xs) => DedupKey::List(xs.iter().map(dedup_key).collect::<Option<_>>()?),
         GVal::Map(kvs) => DedupKey::Map(
@@ -59,8 +64,8 @@ fn dedup_key(v: &GVal) -> Option<DedupKey> {
         ),
         // Owner-agnostic (like PartialEq / the TS engine): dedup a property
         // element by its key+value.
-        GVal::Property { key, value, .. } => {
-            DedupKey::List(vec![DedupKey::Str(key.clone()), dedup_key(value)?])
+        GVal::Property(p) => {
+            DedupKey::List(vec![DedupKey::Str(p.key.clone()), dedup_key(&p.value)?])
         }
     })
 }
@@ -329,7 +334,7 @@ fn index_seed(graph: &Graph, steps: &[Step]) -> Option<(Vec<Trav>, Vec<usize>)> 
                 Trav::root(if is_edge {
                     GVal::Edge(id)
                 } else {
-                    GVal::Vertex(id)
+                    GVal::Node(id)
                 })
             })
             .collect(),
@@ -470,7 +475,7 @@ fn write_gval(out: &mut String, graph: &Graph, v: &GVal) {
         // An element serializes to the full `{id, labels, properties}` (edge:
         // `{id, from, to, labels, properties}`) form — byte-identical to GQL and the
         // TS engine, via the shared canonical `Value::Map`.
-        GVal::Vertex(i) => push_result_value(out, &crate::gql::eval::node_result_value(graph, *i)),
+        GVal::Node(i) => push_result_value(out, &crate::gql::eval::node_result_value(graph, *i)),
         GVal::Edge(i) => push_result_value(out, &crate::gql::eval::edge_result_value(graph, *i)),
         GVal::List(items) => {
             out.push('[');
@@ -504,13 +509,17 @@ fn write_gval(out: &mut String, graph: &Graph, v: &GVal) {
         }
         // A property element serializes as `{"key":…,"value":…}` (TinkerPop's
         // property shape); its owner back-reference is internal and not emitted.
-        GVal::Property { key, value, .. } => {
+        GVal::Property(p) => {
             out.push_str("{\"key\":");
-            push_json_str(out, key);
+            push_json_str(out, &p.key);
             out.push_str(",\"value\":");
-            write_gval(out, graph, value);
+            write_gval(out, graph, &p.value);
             out.push('}');
         }
+        // GQL-only (see `crate::value`). Unreachable from a traversal, and
+        // rendering `null` keeps the writer total rather than panicking if some
+        // future step ever does carry one.
+        GVal::Record(_) | GVal::Path(_) => out.push_str("null"),
     }
 }
 
@@ -845,15 +854,15 @@ fn shortest_path_step(
         verts
             .into_iter()
             .filter(|&v| {
-                !run_steps(graph, ctx, &plan.steps, vec![Trav::root(GVal::Vertex(v))]).is_empty()
+                !run_steps(graph, ctx, &plan.steps, vec![Trav::root(GVal::Node(v))]).is_empty()
             })
             .collect()
     });
     let mut next = Vec::new();
     for t in &stream {
-        if let GVal::Vertex(src) = t.val {
+        if let GVal::Node(src) = t.val {
             for path in shortest_paths_from(graph, src, targets.as_ref(), out, inn) {
-                next.push(t.with(GVal::List(path.into_iter().map(GVal::Vertex).collect())));
+                next.push(t.with(GVal::List(path.into_iter().map(GVal::Node).collect())));
             }
         }
     }
@@ -937,7 +946,7 @@ fn gval_to_value(v: &GVal) -> Value {
 
 fn prop(graph: &Graph, v: &GVal, key: &str) -> GVal {
     match v {
-        GVal::Vertex(i) => value_to_gval(graph.props.value(*i as usize, key, &graph.strs)),
+        GVal::Node(i) => value_to_gval(graph.props.value(*i as usize, key, &graph.strs)),
         GVal::Edge(e) => value_to_gval(graph.edge_props.value(*e as usize, key, &graph.strs)),
         _ => GVal::Null,
     }
@@ -957,7 +966,7 @@ fn element_props_map(graph: &Graph, v: &GVal) -> GVal {
 
 /// A self-describing vertex record for a subgraph cap: `{ id, labels, properties }`.
 fn subgraph_vertex(graph: &Graph, v: u32) -> GVal {
-    let gv = GVal::Vertex(v);
+    let gv = GVal::Node(v);
     let labels: Vec<GVal> = graph
         .vertex_labels(v)
         .iter()
@@ -976,8 +985,8 @@ fn subgraph_vertex(graph: &Graph, v: u32) -> GVal {
 /// A self-describing edge record: `{ id, label, outV, inV, properties }`.
 fn subgraph_edge(graph: &Graph, e: u32) -> GVal {
     let ge = GVal::Edge(e);
-    let outv = GVal::Vertex(graph.e_src[e as usize]);
-    let inv = GVal::Vertex(graph.e_dst[e as usize]);
+    let outv = GVal::Node(graph.e_src[e as usize]);
+    let inv = GVal::Node(graph.e_dst[e as usize]);
     GVal::Map(vec![
         (GVal::Str(Arc::from("id")), elem_id(graph, &ge)),
         (
@@ -1000,7 +1009,7 @@ fn present_keys(graph: &Graph, v: &GVal) -> Vec<String> {
         return vec![k.to_string()];
     }
     let (store, idx) = match v {
-        GVal::Vertex(i) => (&graph.props, *i as usize),
+        GVal::Node(i) => (&graph.props, *i as usize),
         GVal::Edge(e) => (&graph.edge_props, *e as usize),
         _ => return Vec::new(),
     };
@@ -1017,7 +1026,7 @@ fn present_keys(graph: &Graph, v: &GVal) -> Vec<String> {
 /// drops a present null). Property elements / non-elements: not applicable.
 fn prop_present(graph: &Graph, v: &GVal, key: &str) -> bool {
     match v {
-        GVal::Vertex(i) => graph.props.is_present(*i as usize, key),
+        GVal::Node(i) => graph.props.is_present(*i as usize, key),
         GVal::Edge(e) => graph.edge_props.is_present(*e as usize, key),
         _ => false,
     }
@@ -1025,7 +1034,7 @@ fn prop_present(graph: &Graph, v: &GVal, key: &str) -> bool {
 
 fn elem_id(graph: &Graph, v: &GVal) -> GVal {
     match v {
-        GVal::Vertex(i) => GVal::Str(graph.vid.arc(*i)),
+        GVal::Node(i) => GVal::Str(graph.vid.arc(*i)),
         // Every edge has an id (assigned external id, else canonical `e{index}`).
         GVal::Edge(e) => GVal::Str(Arc::from(graph.edge_id(*e).as_ref())),
         // A non-element has no id → NULL, exactly as its sibling `elem_label`
@@ -1039,7 +1048,7 @@ fn elem_id(graph: &Graph, v: &GVal) -> GVal {
 
 fn elem_label(graph: &Graph, v: &GVal) -> GVal {
     match v {
-        GVal::Vertex(i) => match graph.vertex_labels(*i).first() {
+        GVal::Node(i) => match graph.vertex_labels(*i).first() {
             Some(&lid) => GVal::Str(graph.labels.arc(lid)),
             None => GVal::Null,
         },
@@ -1372,11 +1381,18 @@ fn gval_type_rank(v: &GVal) -> u8 {
         GVal::Num(_) => 2,
         GVal::Str(_) => 3,
         GVal::Temporal(_) => 4,
-        GVal::Vertex(_) => 5,
+        GVal::Node(_) => 5,
         GVal::Edge(_) => 6,
         GVal::List(_) => 7,
         GVal::Map(_) => 8,
-        GVal::Property { .. } => 9,
+        GVal::Property(_) => 9,
+        // GQL-only variants (`Val` and `GVal` are one type — see
+        // `crate::value`). A traversal cannot produce them, but the order must
+        // stay TOTAL for every inhabitant of the type or `sort_by` can panic,
+        // and under `panic = "abort"` that takes the host down. Ranking them
+        // past everything Gremlin can make is both cheap and safe.
+        GVal::Record(_) => 10,
+        GVal::Path(_) => 11,
     }
 }
 
@@ -1401,7 +1417,7 @@ fn gcmp_total(a: &GVal, b: &GVal) -> Ordering {
         (GVal::Num(x), GVal::Num(y)) => x.total_cmp(y),
         (GVal::Str(x), GVal::Str(y)) => x.as_ref().cmp(y.as_ref()),
         (GVal::Temporal(x), GVal::Temporal(y)) => x.cmp_total(y),
-        (GVal::Vertex(x), GVal::Vertex(y)) | (GVal::Edge(x), GVal::Edge(y)) => x.cmp(y),
+        (GVal::Node(x), GVal::Node(y)) | (GVal::Edge(x), GVal::Edge(y)) => x.cmp(y),
         (GVal::List(x), GVal::List(y)) => x
             .iter()
             .zip(y.iter())
@@ -1414,17 +1430,11 @@ fn gcmp_total(a: &GVal, b: &GVal) -> Ordering {
             .map(|((k1, v1), (k2, v2))| gcmp_total(k1, k2).then_with(|| gcmp_total(v1, v2)))
             .find(|o| *o != Ordering::Equal)
             .unwrap_or_else(|| x.len().cmp(&y.len())),
-        (
-            GVal::Property {
-                key: k1, value: v1, ..
-            },
-            GVal::Property {
-                key: k2, value: v2, ..
-            },
-        ) => k1
+        (GVal::Property(a), GVal::Property(b)) => a
+            .key
             .as_ref()
-            .cmp(k2.as_ref())
-            .then_with(|| gcmp_total(v1, v2)),
+            .cmp(b.key.as_ref())
+            .then_with(|| gcmp_total(&a.value, &b.value)),
         // Same rank ⟹ same variant (Null==Null falls here as Equal).
         _ => Ordering::Equal,
     }
@@ -1516,7 +1526,7 @@ fn eval_by(graph: &mut Graph, ctx: &mut Ctx, by: &By, value: &GVal) -> GVal {
     match by {
         By::Identity(_) => value.clone(),
         By::Key(key, _) => match value {
-            GVal::Vertex(_) | GVal::Edge(_) => prop(graph, value, key),
+            GVal::Node(_) | GVal::Edge(_) => prop(graph, value, key),
             // `by('k')` over a Map (`group`/`groupCount`/`project()` row) projects
             // the value at that key — e.g. `project('name','age').order().by('age')`.
             // Without this the whole Map reached the comparator ("cannot order …").
@@ -1616,9 +1626,9 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 ids.iter().filter_map(|id| graph.vid.get(id)).filter(|&v| graph.is_vertex_live(v)).collect()
             };
             if stream.is_empty() {
-                verts.into_iter().map(|v| Trav::root(GVal::Vertex(v))).collect()
+                verts.into_iter().map(|v| Trav::root(GVal::Node(v))).collect()
             } else {
-                stream.iter().flat_map(|t| verts.iter().map(move |&v| t.step(GVal::Vertex(v)))).collect()
+                stream.iter().flat_map(|t| verts.iter().map(move |&v| t.step(GVal::Node(v)))).collect()
             }
         }
         Step::E(ids) => {
@@ -1649,9 +1659,9 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             let (out, inn) = dir_flags(step);
             let mut next = Vec::new();
             for t in &stream {
-                if let GVal::Vertex(v) = t.val {
+                if let GVal::Node(v) = t.val {
                     for a in adj_in_label_order(graph, v, out, inn, labels) {
-                        next.push(t.step(GVal::Vertex(a.1)));
+                        next.push(t.step(GVal::Node(a.1)));
                     }
                 }
             }
@@ -1663,7 +1673,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             let (out, inn) = dir_flags(step);
             let mut next = Vec::new();
             for t in &stream {
-                if let GVal::Vertex(v) = t.val {
+                if let GVal::Node(v) = t.val {
                     for a in adj_in_label_order(graph, v, out, inn, labels) {
                         next.push(t.step(GVal::Edge(a.0)));
                     }
@@ -1674,15 +1684,15 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
 
         // --- edge → vertex ---
         Step::OutV => map_step(stream, |t| match t.val {
-            GVal::Edge(e) => vec![GVal::Vertex(graph.e_src[e as usize])],
+            GVal::Edge(e) => vec![GVal::Node(graph.e_src[e as usize])],
             _ => vec![],
         }),
         Step::InV => map_step(stream, |t| match t.val {
-            GVal::Edge(e) => vec![GVal::Vertex(graph.e_dst[e as usize])],
+            GVal::Edge(e) => vec![GVal::Node(graph.e_dst[e as usize])],
             _ => vec![],
         }),
         Step::BothV => map_step(stream, |t| match t.val {
-            GVal::Edge(e) => vec![GVal::Vertex(graph.e_src[e as usize]), GVal::Vertex(graph.e_dst[e as usize])],
+            GVal::Edge(e) => vec![GVal::Node(graph.e_src[e as usize]), GVal::Node(graph.e_dst[e as usize])],
             _ => vec![],
         }),
         Step::OtherV => {
@@ -1691,10 +1701,10 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 if let GVal::Edge(e) = t.val {
                     let (src, dst) = (graph.e_src[e as usize], graph.e_dst[e as usize]);
                     let from = t.path.iter().rev().nth(1).and_then(|g| match g {
-                        GVal::Vertex(v) => Some(*v),
+                        GVal::Node(v) => Some(*v),
                         _ => None,
                     });
-                    next.push(t.step(GVal::Vertex(if from == Some(src) { dst } else { src })));
+                    next.push(t.step(GVal::Node(if from == Some(src) { dst } else { src })));
                 }
             }
             next
@@ -1761,7 +1771,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             vec![GVal::Map(entries)]
         }),
         Step::ElementMap(keys) => map_step(stream, |t| {
-            if !matches!(t.val, GVal::Vertex(_) | GVal::Edge(_)) {
+            if !matches!(t.val, GVal::Node(_) | GVal::Edge(_)) {
                 return vec![];
             }
             let mut entries = vec![
@@ -1769,8 +1779,8 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 (GVal::Str(Arc::from("label")), elem_label(graph, &t.val)),
             ];
             if let GVal::Edge(e) = t.val {
-                let inv = GVal::Vertex(graph.e_dst[e as usize]);
-                let outv = GVal::Vertex(graph.e_src[e as usize]);
+                let inv = GVal::Node(graph.e_dst[e as usize]);
+                let outv = GVal::Node(graph.e_src[e as usize]);
                 entries.push((GVal::Str(Arc::from("IN")), GVal::Map(vec![(GVal::Str(Arc::from("id")), elem_id(graph, &inv)), (GVal::Str(Arc::from("label")), elem_label(graph, &inv))])));
                 entries.push((GVal::Str(Arc::from("OUT")), GVal::Map(vec![(GVal::Str(Arc::from("id")), elem_id(graph, &outv)), (GVal::Str(Arc::from("label")), elem_label(graph, &outv))])));
             }
@@ -1789,11 +1799,11 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 for k in ks {
                     if prop_present(graph, &t.val, &k) {
                         let v = prop(graph, &t.val, &k);
-                        next.push(t.step(GVal::Property {
-                            owner: Box::new(t.val.clone()),
-                            key: Arc::from(k.as_str()),
-                            value: Box::new(v),
-                        }));
+                        next.push(t.step(GVal::property(
+                            t.val.clone(),
+                            Arc::from(k.as_str()),
+                            v,
+                        )));
                     }
                 }
             }
@@ -2365,7 +2375,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             }
             // As a source (`g.addV()`), create one even with no incoming traverser.
             let base = if stream.is_empty() { vec![Trav::root(GVal::Null)] } else { stream };
-            base.iter().map(|t| t.with(GVal::Vertex(graph.add_vertex(&labels, vec![])))).collect()
+            base.iter().map(|t| t.with(GVal::Node(graph.add_vertex(&labels, vec![])))).collect()
         }
         Step::AddE { label, from, to } => {
             if crate::graph::validate_label(label).is_err() {
@@ -2409,7 +2419,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                     PropVal::Trav(plan) => sub_vals(graph, ctx, plan, &t).into_iter().next(),
                 };
                 let target = match &t.val {
-                    GVal::Vertex(i) => Some((true, *i)),
+                    GVal::Node(i) => Some((true, *i)),
                     GVal::Edge(e) => Some((false, *e)),
                     _ => None,
                 };
@@ -2432,7 +2442,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         Step::Drop => {
             for t in &stream {
                 match &t.val {
-                    GVal::Vertex(i) => {
+                    GVal::Node(i) => {
                         let _ = graph.remove_vertex(*i, true);
                     }
                     GVal::Edge(e) => {
@@ -2443,9 +2453,9 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                     // `property(k, null)` STORES a null (divergence from TinkerPop).
                     // The owner is carried on the element itself, so a `project`
                     // Map (not a Property) can never be mistaken for one.
-                    GVal::Property { owner, key, .. } => match **owner {
-                        GVal::Vertex(i) => graph.remove_vertex_prop(i, key),
-                        GVal::Edge(e) => graph.remove_edge_prop(e, key),
+                    GVal::Property(p) => match p.owner {
+                        GVal::Node(i) => graph.remove_vertex_prop(i, &p.key),
+                        GVal::Edge(e) => graph.remove_edge_prop(e, &p.key),
                         _ => {}
                     },
                     _ => {}
@@ -2791,7 +2801,7 @@ fn resolve_endpoint(graph: &mut Graph, ctx: &mut Ctx, ep: &Endpoint, t: &Trav) -
         Endpoint::Plan(plan) => sub_vals(graph, ctx, plan, t).into_iter().next()?,
     };
     match v {
-        GVal::Vertex(i) => Some(i),
+        GVal::Node(i) => Some(i),
         _ => None,
     }
 }
@@ -2799,7 +2809,7 @@ fn resolve_endpoint(graph: &mut Graph, ctx: &mut Ctx, ep: &Endpoint, t: &Trav) -
 /// The `value` field of a `{key, value}` property map (for `value`/`hasValue`).
 fn prop_value_field(v: &GVal) -> Option<GVal> {
     match v {
-        GVal::Property { value, .. } => Some((**value).clone()),
+        GVal::Property(p) => Some(p.value.clone()),
         GVal::Map(entries) => entries
             .iter()
             .find(|(k, _)| matches!(k, GVal::Str(s) if s.as_ref() == "value"))
@@ -2809,7 +2819,7 @@ fn prop_value_field(v: &GVal) -> Option<GVal> {
 }
 fn prop_key_field(v: &GVal) -> Option<GVal> {
     match v {
-        GVal::Property { key, .. } => Some(GVal::Str(key.clone())),
+        GVal::Property(p) => Some(GVal::Str(p.key.clone())),
         GVal::Map(entries) => entries
             .iter()
             .find(|(k, _)| matches!(k, GVal::Str(s) if s.as_ref() == "key"))
@@ -3114,10 +3124,10 @@ mod dedup_key_tests {
 
     #[test]
     fn element_and_value_keys() {
-        assert_eq!(dedup_key(&GVal::Vertex(7)), dedup_key(&GVal::Vertex(7)));
-        assert_ne!(dedup_key(&GVal::Vertex(7)), dedup_key(&GVal::Vertex(8)));
+        assert_eq!(dedup_key(&GVal::Node(7)), dedup_key(&GVal::Node(7)));
+        assert_ne!(dedup_key(&GVal::Node(7)), dedup_key(&GVal::Node(8)));
         // same id, different element kind → different key (a vertex isn't an edge).
-        assert_ne!(dedup_key(&GVal::Vertex(7)), dedup_key(&GVal::Edge(7)));
+        assert_ne!(dedup_key(&GVal::Node(7)), dedup_key(&GVal::Edge(7)));
         assert_eq!(
             dedup_key(&GVal::Str(Arc::from("x"))),
             dedup_key(&GVal::Str(Arc::from("x")))
@@ -3131,8 +3141,8 @@ mod dedup_key_tests {
         assert_ne!(dedup_key(&GVal::Null), dedup_key(&GVal::Bool(false)));
         // nested structure keys element-wise (incl. the -0.0/+0.0 collapse).
         assert_eq!(
-            dedup_key(&GVal::List(vec![GVal::Num(-0.0), GVal::Vertex(1)])),
-            dedup_key(&GVal::List(vec![GVal::Num(0.0), GVal::Vertex(1)])),
+            dedup_key(&GVal::List(vec![GVal::Num(-0.0), GVal::Node(1)])),
+            dedup_key(&GVal::List(vec![GVal::Num(0.0), GVal::Node(1)])),
         );
     }
 }

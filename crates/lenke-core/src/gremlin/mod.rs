@@ -12,8 +12,6 @@
 //! Closure-bearing steps (`map(fn)`/`filter(fn)`/…) are intentionally omitted:
 //! the data-plan model uses sub-traversals instead, which express the same logic.
 
-use std::sync::Arc;
-
 #[cfg(test)]
 mod divergence_tests;
 pub mod exec;
@@ -38,90 +36,13 @@ mod tests;
 pub use exec::{run, try_run};
 pub use parse::parse;
 
-/// A runtime traversal value. Graph elements are dense ids (like `gql::Val`);
-/// `List`/`Map` carry `fold`/`valueMap`/`group`/`select`/`path` results.
+/// The runtime value a traversal carries.
 ///
-/// `PartialEq` is hand-written (below) only so a `Property` compares by
-/// key+value, ignoring its owner back-reference — the owner is internal
-/// drop-routing metadata that is never observable (never serialized), matching
-/// the TS engine. Every other variant compares structurally as `derive` would.
-#[derive(Clone, Debug)]
-pub enum GVal {
-    Null,
-    Bool(bool),
-    Num(f64),
-    Str(Arc<str>),
-    /// An ISO temporal scalar (`DATE`/`LOCAL DATETIME`/`DURATION`).
-    Temporal(crate::temporal::Temporal),
-    Vertex(u32),
-    Edge(u32),
-    List(Vec<Self>),
-    /// Insertion-ordered key→value pairs (valueMap / group / select / project).
-    Map(Vec<(Self, Self)>),
-    /// A property element (from `.properties(k)`): its key/value plus a
-    /// back-reference to the owning `Vertex`/`Edge`. The owner is carried
-    /// EXPLICITLY (not recovered from the traverser path) so `.drop()` deletes
-    /// exactly this property and can never mistake a `project('key')` Map for a
-    /// property element. Serializes as `{key, value}` (TinkerPop's shape).
-    Property {
-        owner: Box<Self>,
-        key: Arc<str>,
-        value: Box<Self>,
-    },
-}
-
-impl PartialEq for GVal {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Null, Self::Null) => true,
-            (Self::Bool(a), Self::Bool(b)) => a == b,
-            (Self::Num(a), Self::Num(b)) => a == b, // f64: NaN != NaN, as derive would
-            (Self::Str(a), Self::Str(b)) => a == b,
-            (Self::Temporal(a), Self::Temporal(b)) => a == b,
-            (Self::Vertex(a), Self::Vertex(b)) => a == b,
-            (Self::Edge(a), Self::Edge(b)) => a == b,
-            (Self::List(a), Self::List(b)) => a == b,
-            (Self::Map(a), Self::Map(b)) => a == b,
-            // Owner ignored: a property element's observable identity is its
-            // key+value (the owner is internal drop-routing metadata).
-            (
-                Self::Property {
-                    key: k1, value: v1, ..
-                },
-                Self::Property {
-                    key: k2, value: v2, ..
-                },
-            ) => k1 == k2 && v1 == v2,
-            _ => false,
-        }
-    }
-}
-
-impl From<f64> for GVal {
-    fn from(n: f64) -> Self {
-        Self::Num(n)
-    }
-}
-impl From<i32> for GVal {
-    fn from(n: i32) -> Self {
-        Self::Num(n as f64)
-    }
-}
-impl From<bool> for GVal {
-    fn from(b: bool) -> Self {
-        Self::Bool(b)
-    }
-}
-impl From<&str> for GVal {
-    fn from(s: &str) -> Self {
-        Self::Str(Arc::from(s))
-    }
-}
-impl From<String> for GVal {
-    fn from(s: String) -> Self {
-        Self::Str(Arc::from(s.as_str()))
-    }
-}
+/// An alias of the shared [`crate::value::Value`] — GQL's `Val` is the same
+/// type. The variants Gremlin uses are `Null`, `Bool`, `Num`, `Str`, `Temporal`,
+/// `Node` (spelled `Vertex` in TinkerPop), `Edge`, `List`, `Map` and `Property`;
+/// `Record` and `Path` belong to GQL and never appear here.
+pub type GVal = crate::value::Value;
 
 /// A predicate (data, not a closure) used by `has`/`is`/`where`. Mirrors
 /// Gremlin's `P`/`TextP`.

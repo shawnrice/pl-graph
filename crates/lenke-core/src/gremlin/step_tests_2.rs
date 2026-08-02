@@ -66,7 +66,7 @@ fn map_sorted(g: &GVal) -> Vec<(String, GVal)> {
 fn ids(g: &Graph, r: &[GVal]) -> Vec<String> {
     r.iter()
         .map(|v| match v {
-            GVal::Vertex(i) => g.vid.text(*i).to_string(),
+            GVal::Node(i) => g.vid.text(*i).to_string(),
             GVal::Edge(e) => format!("e{e}"),
             other => format!("{other:?}"),
         })
