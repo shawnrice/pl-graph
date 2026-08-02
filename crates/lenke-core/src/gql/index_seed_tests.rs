@@ -949,3 +949,100 @@ fn a_repeated_variable_composes_with_a_filter() {
         vec![vec![n(2.0)]]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Var-length walks run vectorized. The walk itself is `reachable_each` — the
+// same one the scalar matcher drives — so bounds, path MODE and the zero-length
+// case cannot drift; what is new is the frontier fanning out around it.
+// ---------------------------------------------------------------------------
+
+fn chain() -> Graph {
+    crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"1","labels":["P"],"properties":{"k":"a"}}"#,
+            r#"{"type":"node","id":"2","labels":["P"],"properties":{"k":"b"}}"#,
+            r#"{"type":"node","id":"3","labels":["P"],"properties":{"k":"c"}}"#,
+            r#"{"type":"edge","id":"e1","labels":["R"],"from":"1","to":"2","properties":{}}"#,
+            r#"{"type":"edge","id":"e2","labels":["R"],"from":"2","to":"3","properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes")
+}
+
+fn ks(g: &mut Graph, q: &str) -> Vec<String> {
+    let mut out: Vec<String> = rows(g, q)
+        .into_iter()
+        .map(|r| match &r[0] {
+            Value::Str(s) => s.to_string(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+
+    out.sort();
+    out
+}
+
+#[test]
+fn a_var_length_walk_respects_its_bounds() {
+    let mut g = chain();
+
+    assert_eq!(
+        ks(&mut g, "MATCH (a:P {k:'a'})-[:R]->{1,1}(b) RETURN b.k AS x"),
+        vec!["b"]
+    );
+    assert_eq!(
+        ks(&mut g, "MATCH (a:P {k:'a'})-[:R]->{1,2}(b) RETURN b.k AS x"),
+        vec!["b", "c"]
+    );
+    assert_eq!(
+        ks(&mut g, "MATCH (a:P {k:'a'})-[:R]->{2,3}(b) RETURN b.k AS x"),
+        vec!["c"]
+    );
+    assert!(ks(&mut g, "MATCH (a:P {k:'a'})-[:R]->{3,4}(b) RETURN b.k AS x").is_empty());
+}
+
+#[test]
+fn a_star_walk_includes_the_zero_length_path() {
+    let mut g = chain();
+
+    // Zero hops is the start itself, so `b` binds to `a`.
+    assert_eq!(
+        ks(&mut g, "MATCH (a:P {k:'a'})-[:R]->*(b) RETURN b.k AS x"),
+        vec!["a", "b", "c"]
+    );
+}
+
+#[test]
+fn a_var_length_landing_still_applies_its_constraints() {
+    let mut g = chain();
+
+    // The label and inline constraint on the LANDING node are checked at every
+    // depth, not just the last — the walk reaches b and c, the filter keeps one.
+    assert_eq!(
+        ks(
+            &mut g,
+            "MATCH (a:P {k:'a'})-[:R]->{1,2}(b:P {k:'c'}) RETURN b.k AS x"
+        ),
+        vec!["c"]
+    );
+    assert!(ks(
+        &mut g,
+        "MATCH (a:P {k:'a'})-[:R]->{1,2}(b:Nope) RETURN b.k AS x"
+    )
+    .is_empty());
+}
+
+#[test]
+fn a_var_length_walk_composes_with_a_following_hop() {
+    let mut g = chain();
+
+    // The frontier must carry the walk's landings into the next segment.
+    assert_eq!(
+        ks(
+            &mut g,
+            "MATCH (a:P {k:'a'})-[:R]->{1,1}(b)-[:R]->(c) RETURN c.k AS x"
+        ),
+        vec!["c"]
+    );
+}

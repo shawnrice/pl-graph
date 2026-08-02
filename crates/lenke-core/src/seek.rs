@@ -1196,6 +1196,39 @@ impl Frontier {
         }
     }
 
+    /// Fan rows out to endpoints computed ELSEWHERE.
+    ///
+    /// `rows[k]` is the source row that produced `ends[k]`. Used where the
+    /// reachable set is not one adjacency step — a var-length walk, whose bounds
+    /// and repeated-element restriction live in the front end's own walker rather
+    /// than being re-derived here.
+    pub fn replicate(&mut self, rows: &[usize], ends: &[u32], slot: Option<usize>) {
+        let width = self.cols.len();
+        let mut new_cols: Vec<Option<Vec<u32>>> = (0..width)
+            .map(|s| {
+                (self.cols[s].is_some() || slot == Some(s)).then(|| Vec::with_capacity(rows.len()))
+            })
+            .collect();
+
+        for (k, &i) in rows.iter().enumerate() {
+            for (s, col) in new_cols.iter_mut().enumerate() {
+                let Some(col) = col else { continue };
+                let v = if slot == Some(s) {
+                    ends[k]
+                } else if let Some(prior) = &self.cols[s] {
+                    prior[i]
+                } else {
+                    continue;
+                };
+
+                col.push(v);
+            }
+        }
+
+        self.cols = new_cols;
+        self.endpoint = ends.to_vec();
+    }
+
     /// Fan every row out along `hop`, replicating bound columns.
     ///
     /// `cap` stops the build as soon as enough rows exist — only sound on the

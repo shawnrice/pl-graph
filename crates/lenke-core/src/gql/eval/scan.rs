@@ -462,7 +462,13 @@ pub(super) fn build_scan(
         }
         return Some(sc);
     }
-    if path.segments.iter().any(|s| s.rel.quantifier.is_some()) {
+    // A quantified segment runs vectorized only in the ABBREVIATED form
+    // (`-[:R]->{n,m}`) with an anonymous edge. A parenthesized unit exposes every
+    // variable inside it as the LIST of its per-repetition values, and the
+    // frontier holds one id per row, not a list — so those keep the matcher.
+    if path.segments.iter().any(|seg| {
+        seg.rel.quantifier.is_some() && (seg.unit.is_some() || seg.rel.var_slot.is_some())
+    }) {
         return None;
     }
     // Cardinality-based orientation: a label-only traversal seeds from its more
@@ -476,7 +482,11 @@ pub(super) fn build_scan(
     // Edge-first: a single segment with an indexed edge-property hint → seek the
     // matching edges and validate the surrounding (a)-[r]->(b) pattern, instead
     // of expanding every vertex's adjacency.
-    if path.segments.len() == 1 {
+    // …and never for a quantified segment: this builds ONE `(a)-[r]->(b)` row
+    // per seeded edge, so a `{n,m}` walk would silently collapse to a single hop.
+    // It has no quantifier guard of its own, which is why relaxing the one above
+    // sent var-length here instead of to the expansion below.
+    if path.segments.len() == 1 && path.segments[0].rel.quantifier.is_none() {
         // A *selective* edge seed (an indexed edge property) is always worth taking.
         // The `by_etype` fallback is not: it materializes every edge of the type,
         // O(E_type), which loses badly whenever an endpoint is index-seekable —
@@ -619,6 +629,71 @@ pub(super) fn expand_scan(
             kinds: &kinds,
             binding: Binding::with_len(scope_len.max(1)),
         };
+
+        // A quantified hop drives `reachable_each` — the SAME walker the scalar
+        // matcher uses — once per frontier row, and vectorizes only the fan-out
+        // around it. Its bounds, the path MODE's repeated-element restriction and
+        // the zero-length case are subtle enough that a second implementation
+        // diverged immediately when tried.
+        if let Some(q) = rel.quantifier {
+            let spec = crate::gql::eval::pathfind::WalkSpec {
+                q,
+                mode: path.mode,
+                want_path: false,
+            };
+            let mut ends: Vec<u32> = Vec::new();
+            let mut src: Vec<usize> = Vec::new();
+            let mut wb = Binding::with_len(scope_len.max(1));
+            let node_check = !node.props.is_empty() || node.where_.is_some();
+
+            for i in 0..frontier.rows() {
+                let from = frontier.endpoint()[i];
+
+                crate::gql::eval::pathfind::reachable_each(
+                    graph,
+                    ctx,
+                    &mut wb,
+                    from,
+                    rel,
+                    spec,
+                    &mut |b: &mut Binding, end: u32, _v: &[u32], _e: &[u32], _s: &[_]| {
+                        // The landing node's own label and constraints still apply.
+                        if !matches_label(graph, ctx, end, node.label.as_ref()) {
+                            return true;
+                        }
+
+                        if node_check {
+                            if let Some(slot) = node.var_slot {
+                                b.set(slot, Val::Node(end));
+                            }
+
+                            if !satisfies(
+                                graph,
+                                ctx,
+                                &Val::Node(end),
+                                &node.props,
+                                node.where_.as_ref(),
+                                b,
+                            ) {
+                                return true;
+                            }
+                        }
+
+                        ends.push(end);
+                        src.push(i);
+                        true
+                    },
+                );
+
+                if ends.len() as u64 > graph.limits().intermediate {
+                    ctx.set_fault(FAULT_INTERMEDIATE);
+                    return None;
+                }
+            }
+
+            frontier.replicate(&src, &ends, node.var_slot);
+            continue;
+        }
 
         if frontier
             .expand(
