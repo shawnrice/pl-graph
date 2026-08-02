@@ -432,6 +432,99 @@ pub(super) fn scan_is_hinted(
     }
 }
 
+/// Collect a driver-produced frame into columns.
+///
+/// `visit_pattern` owns the walk for path selectors and multi-segment path
+/// variables — choosing among many walks is exactly what it is for. What it
+/// hands back is one binding per row, so those rows become a `ScanCols` and the
+/// rest of the pipeline runs columnar rather than staying scalar to the end.
+fn driven_scan(
+    graph: &Graph,
+    ctx: &Ctx,
+    path: &CPath,
+    scope_len: usize,
+    where_: Option<&CExpr>,
+    cap: Option<usize>,
+) -> Option<ScanCols> {
+    let mut kinds: Vec<(usize, Elem)> = Vec::new();
+
+    if let Some(s) = path.start.var_slot {
+        kinds.push((s, Elem::Node));
+    }
+
+    for seg in &path.segments {
+        if let Some(s) = seg.rel.var_slot {
+            kinds.push((s, Elem::Edge));
+        }
+
+        if let Some(s) = seg.node.var_slot {
+            kinds.push((s, Elem::Node));
+        }
+    }
+
+    // A self-join names a slot twice; one column each.
+    let mut seen: HashSet<usize> = HashSet::new();
+
+    kinds.retain(|(s, _)| seen.insert(*s));
+
+    let mut cols: Vec<Vec<u32>> = kinds.iter().map(|_| Vec::new()).collect();
+    let mut paths: Vec<Val> = Vec::new();
+    let path_slot = path.path_var_slot;
+    let mut b = Binding::with_len(scope_len.max(1));
+    let mut n = 0usize;
+    let mut ragged = false;
+
+    crate::gql::eval::pathfind::visit_pattern(graph, ctx, path, where_, &mut b, &mut |bind| {
+        for (k, &(slot, kind)) in kinds.iter().enumerate() {
+            // A slot the driver left unbound cannot be columnized.
+            let id = match bind.get(slot) {
+                Some(Val::Node(i)) if kind == Elem::Node => *i,
+                Some(Val::Edge(e)) if kind == Elem::Edge => *e,
+                _ => {
+                    ragged = true;
+                    return false;
+                }
+            };
+
+            cols[k].push(id);
+        }
+
+        if let Some(s) = path_slot {
+            match bind.get(s) {
+                Some(v) => paths.push(v.clone()),
+                None => {
+                    ragged = true;
+                    return false;
+                }
+            }
+        }
+
+        n += 1;
+        cap.is_none_or(|c| n < c)
+    });
+
+    // Any row the driver could not fully bind leaves the columns ragged. The
+    // scalar path handles those correctly, so hand back to it rather than
+    // emitting a short column beside full ones.
+    if ragged || cols.iter().any(|c| c.len() != n) || (path_slot.is_some() && paths.len() != n) {
+        return None;
+    }
+
+    let mut sc = ScanCols::new(scope_len);
+
+    sc.n = n;
+
+    for (k, &(slot, kind)) in kinds.iter().enumerate() {
+        sc.slots[slot] = Some((kind, std::mem::take(&mut cols[k])));
+    }
+
+    if let Some(slot) = path_slot {
+        sc.vals[slot] = Some(paths);
+    }
+
+    Some(sc)
+}
+
 pub(super) fn build_scan(
     graph: &Graph,
     ctx: &Ctx,
@@ -446,17 +539,21 @@ pub(super) fn build_scan(
     // is the scalar driver's job. A bound path VARIABLE is not — the walker can
     // hand back each walk's `(vertices, edges)`, and `ScanCols` already carries
     // `Val` columns beside the id ones, so the Path value rides along.
-    if path.selector != PathSelector::Walk {
-        return None;
-    }
+    // A path SELECTOR (`ANY SHORTEST`, `ALL SHORTEST`, `SHORTEST k`) and a path
+    // variable over a multi-segment pattern both need `visit_pattern` — it is the
+    // one entry point that knows which of many walks to keep. But what it hands
+    // back is still one binding per row, so the walk stays scalar while the frame
+    // becomes COLUMNS and everything downstream (projection, grouping,
+    // aggregation) runs vectorized over it instead of continuing scalar.
+    let needs_driver = path.selector != PathSelector::Walk
+        || (path.path_var_slot.is_some()
+            && !(path.segments.len() == 1
+                && path.segments[0].rel.quantifier.is_some()
+                && path.segments[0].unit.is_none()
+                && path.segments[0].rel.var_slot.is_none()));
 
-    if path.path_var_slot.is_some()
-        && !(path.segments.len() == 1
-            && path.segments[0].rel.quantifier.is_some()
-            && path.segments[0].unit.is_none()
-            && path.segments[0].rel.var_slot.is_none())
-    {
-        return None;
+    if needs_driver {
+        return driven_scan(graph, ctx, path, scope_len, where_, cap);
     }
     // Fast path: an isolated node is a tight scan. An index hint (inline `{k:v}`
     // eq or a WHERE comparison on the node) seeds just the candidate vertices;
