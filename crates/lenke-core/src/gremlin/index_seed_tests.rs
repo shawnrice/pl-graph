@@ -1025,3 +1025,68 @@ fn a_multi_key_values_is_not_taken_by_the_terminal() {
 
     assert_eq!(got.len(), 4, "two elements x two keys");
 }
+
+#[test]
+fn out_e_then_in_v_lowers_to_the_same_hop_as_out() {
+    let mut graph = seeded();
+
+    // `outE(L).inV()` IS `out(L)`: the edge step selects out-edges, the vertex
+    // step takes their far end. Two spellings, one IR node — so they must agree
+    // on rows AND on order.
+    assert_eq!(
+        ids(
+            &mut graph,
+            g().v_ids(&[]).has_label(&["P"]).out_e(&["R"]).in_v()
+        ),
+        ids(&mut graph, g().v_ids(&[]).has_label(&["P"]).out(&["R"]))
+    );
+    assert_eq!(
+        count_of(
+            &mut graph,
+            g().v_ids(&[])
+                .has_label(&["P"])
+                .out_e(&["R"])
+                .in_v()
+                .count()
+        ),
+        count_of(
+            &mut graph,
+            g().v_ids(&[]).has_label(&["P"]).out(&["R"]).count()
+        )
+    );
+    // …and the `in` direction.
+    assert_eq!(
+        ids(
+            &mut graph,
+            g().v_ids(&[]).has_label(&["Q"]).in_e(&["R"]).out_v()
+        ),
+        ids(&mut graph, g().v_ids(&[]).has_label(&["Q"]).in_(&["R"]))
+    );
+}
+
+#[test]
+fn an_edge_step_without_its_vertex_step_is_not_folded() {
+    let mut graph = seeded();
+
+    // `outE(R)` alone yields EDGES, not their far ends — folding it would change
+    // what the traversal returns.
+    let edges = ids(&mut graph, g().v_ids(&[]).has_label(&["P"]).out_e(&["R"]));
+
+    assert!(edges.iter().all(|s| s.starts_with('e')), "got {edges:?}");
+    assert_eq!(edges.len(), 1000);
+}
+
+#[test]
+fn both_e_then_other_v_is_not_folded() {
+    let mut graph = seeded();
+
+    // `otherV` reads the traverser PATH to know which end it arrived from, so it
+    // is not a pure function of the edge and must keep the per-step path.
+    let via_edges = ids(
+        &mut graph,
+        g().v_ids(&[]).has_label(&["P"]).both_e(&["R"]).other_v(),
+    );
+    let direct = ids(&mut graph, g().v_ids(&[]).has_label(&["P"]).both(&["R"]));
+
+    assert_eq!(via_edges, direct);
+}

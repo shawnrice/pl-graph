@@ -434,6 +434,46 @@ fn universe(graph: &Graph, is_edge: bool) -> Vec<u32> {
     }
 }
 
+/// One lowered navigation hop: a direction and the edge types to follow.
+///
+/// `None` for the types means a name that resolved to nothing — which matches
+/// nothing, and must not be confused with an EMPTY list, which means any type.
+type Hop = (crate::seek::Dir, Option<Vec<u32>>);
+
+/// Parse a chain of navigation steps into IR hops, returning what follows.
+///
+/// `outE(L).inV()` IS `out(L)` — the edge step selects out-edges and the vertex
+/// step takes their far end — so both spellings lower to the SAME hop. That is
+/// the point of having one IR: the optimization is not written twice, and the
+/// choice between the spellings stops mattering.
+///
+/// `bothE(L).otherV()` is deliberately NOT folded: `otherV` reads the traverser
+/// PATH to know which end it arrived from, so it is not a pure function of the
+/// edge.
+fn lower_hops<'a>(graph: &Graph, mut rest: &'a [Step]) -> (Vec<Hop>, &'a [Step]) {
+    let mut hops = Vec::new();
+
+    loop {
+        let (dir, labels, tail) = match rest {
+            [Step::Out(l), t @ ..] => (crate::seek::Dir::Out, l, t),
+            [Step::In(l), t @ ..] => (crate::seek::Dir::In, l, t),
+            [Step::Both(l), t @ ..] => (crate::seek::Dir::Both, l, t),
+            [Step::OutE(l), Step::InV, t @ ..] => (crate::seek::Dir::Out, l, t),
+            [Step::InE(l), Step::OutV, t @ ..] => (crate::seek::Dir::In, l, t),
+            _ => break,
+        };
+        let etypes: Vec<u32> = labels.iter().filter_map(|l| graph.etype.get(l)).collect();
+
+        // A type name that resolved to nothing matches nothing; an EMPTY list
+        // means "any type", so the two must not be confused. `None` carries the
+        // former so the caller can stop rather than expand everything.
+        hops.push((dir, (etypes.len() == labels.len()).then_some(etypes)));
+        rest = tail;
+    }
+
+    (hops, rest)
+}
+
 /// The element ids a lowered prefix plus expansion chain produces, and whatever
 /// steps are left over.
 ///
@@ -458,32 +498,25 @@ fn lowered_ids<'a>(graph: &Graph, steps: &'a [Step]) -> Option<(Vec<u32>, &'a [S
         return None;
     }
 
-    let mut ids = seek.scan(graph, &no_params, || universe(graph, is_edge));
-    let mut rest = &steps[read..];
-    let mut edges = is_edge;
-
-    while let [nav @ (Step::Out(labels) | Step::In(labels) | Step::Both(labels)), tail @ ..] = rest
+    if is_edge
+        && !matches!(
+            steps.get(read),
+            None | Some(Step::Values(_) | Step::Count(_))
+        )
     {
-        if edges {
-            return None; // edge-to-edge navigation is not this shape
-        }
+        return None; // edge-to-edge navigation is not this shape
+    }
 
-        let dir = match nav {
-            Step::Out(_) => crate::seek::Dir::Out,
-            Step::In(_) => crate::seek::Dir::In,
-            _ => crate::seek::Dir::Both,
+    let mut ids = seek.scan(graph, &no_params, || universe(graph, is_edge));
+    let (hops, rest) = lower_hops(graph, &steps[read..]);
+    let edges = is_edge && hops.is_empty();
+
+    for (dir, etypes) in &hops {
+        let Some(etypes) = etypes else {
+            return Some((Vec::new(), rest, edges));
         };
-        let etypes: Vec<u32> = labels.iter().filter_map(|l| graph.etype.get(l)).collect();
 
-        // A type name that resolved to nothing matches nothing; an EMPTY list
-        // means "any type", so the two must not be confused.
-        if etypes.len() != labels.len() {
-            return Some((Vec::new(), &[], edges));
-        }
-
-        ids = crate::seek::expand(graph, &ids, dir, &etypes);
-        rest = tail;
-        edges = false;
+        ids = crate::seek::expand(graph, &ids, *dir, etypes);
     }
 
     Some((ids, rest, edges))
@@ -550,31 +583,23 @@ fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
 
     // A CHAIN of expansions, then the count. Each hop keeps duplicates, because
     // each is its own traverser; only the last hop can skip materializing.
-    let mut rest = &steps[read..];
-    let mut hops: Vec<(crate::seek::Dir, Vec<u32>)> = Vec::new();
+    let (hops, mut rest) = lower_hops(graph, &steps[read..]);
 
-    while let [nav @ (Step::Out(labels) | Step::In(labels) | Step::Both(labels)), tail @ ..] = rest
-    {
-        if is_edge {
-            return None; // edge-to-edge navigation is not this shape
-        }
-
-        let dir = match nav {
-            Step::Out(_) => crate::seek::Dir::Out,
-            Step::In(_) => crate::seek::Dir::In,
-            _ => crate::seek::Dir::Both,
-        };
-        let etypes: Vec<u32> = labels.iter().filter_map(|l| graph.etype.get(l)).collect();
-
-        // A type name that resolved to nothing matches nothing; an EMPTY list
-        // means "any type", so the two must not be confused.
-        if etypes.len() != labels.len() {
-            return Some(0.0);
-        }
-
-        hops.push((dir, etypes));
-        rest = tail;
+    if is_edge && !hops.is_empty() {
+        return None;
     }
+
+    // An unresolvable type name mid-chain matches nothing.
+    let mut resolved = Vec::with_capacity(hops.len());
+
+    for (dir, etypes) in hops {
+        match etypes {
+            Some(e) => resolved.push((dir, e)),
+            None => return Some(0.0),
+        }
+    }
+
+    let hops = resolved;
 
     // An optional plain `dedup()` before the count. Only the argument-free form:
     // `dedup('a')` keys on tags and `dedup().by(..)` on a sub-traversal, neither
