@@ -487,3 +487,78 @@ fn a_temporal_has_seeks_the_temporal_index() {
         "a temporal must produce an index key"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The shared columnar filter (crate::seek). A `has` is only DROPPED from the
+// pipeline when the shared layer captured it in full — anything else must still
+// run, and losing one is silent.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_uncaptured_predicate_is_not_dropped() {
+    let mut graph = seeded();
+
+    // `neq` is not expressible as a seek or a column test, so it contributes
+    // nothing to the shared filter. Dropping its step along with the captured
+    // ones would silently widen the answer from 1 row to 1000.
+    let got = ids(
+        &mut graph,
+        g().v_ids(&[]).has("k", P::neq("key0005")).has_val("n", 7.0),
+    );
+
+    assert_eq!(got, vec!["p7", "q7"]);
+}
+
+#[test]
+fn a_columnar_filter_agrees_with_the_scan() {
+    let mut graph = seeded();
+
+    // `n` is indexed, `tag` is not — so the second spelling cannot seek and runs
+    // the ordinary path. Both must agree.
+    let seeded_form = ids(&mut graph, g().v_ids(&[]).has("n", P::gte(997.0)));
+    let scanned = ids(
+        &mut graph,
+        g().v_ids(&[]).has_val("tag", "t").has("n", P::gte(997.0)),
+    );
+
+    assert_eq!(seeded_form.len(), 6, "three P and three Q");
+    assert_eq!(scanned, vec!["p997", "p998", "p999"]);
+}
+
+#[test]
+fn a_missing_property_does_not_match_a_column_test() {
+    let mut graph = seeded();
+
+    // Only the P vertices carry `tag`. A column test reads `present` as well as
+    // the value; conflating them would match every Q too.
+    assert_eq!(
+        ids(&mut graph, g().v_ids(&[]).has_val("tag", "t")).len(),
+        1000
+    );
+}
+
+#[test]
+fn a_cross_type_comparison_keeps_the_per_step_path() {
+    let mut graph = seeded();
+
+    // `k` is a string column and the operand is a number. That is a TYPE FAULT in
+    // Gremlin, not "no rows" — the shared filter must decline it so the step that
+    // records the fault still runs.
+    let out = crate::gremlin::try_run(&mut graph, &g().v_ids(&[]).has("k", P::gt(5.0)).count());
+
+    assert!(out.is_err(), "a cross-type compare must still fault");
+}
+
+#[test]
+fn a_label_filter_composes_with_a_columnar_one() {
+    let mut graph = seeded();
+
+    // `hasLabel` is never absorbed, so it has to still run over the filtered set.
+    assert_eq!(
+        ids(
+            &mut graph,
+            g().v_ids(&[]).has_label(&["P"]).has("n", P::gte(998.0))
+        ),
+        vec!["p998", "p999"]
+    );
+}

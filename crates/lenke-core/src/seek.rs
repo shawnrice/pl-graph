@@ -32,7 +32,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::graph::{Graph, IdxKey, RangeBound};
+use crate::graph::{Column, Graph, IdxKey, RangeBound};
 
 /// How a parameter slot resolves to index keys.
 ///
@@ -312,6 +312,95 @@ impl ElementSeek {
             })
     }
 
+    /// Whether every conjunct can be answered straight from a typed column.
+    ///
+    /// Only then is [`scan`](Self::scan) equivalent to running the front end's
+    /// own filters — see [`column_matches`] for why the types must line up.
+    #[must_use]
+    pub fn columnar(&self, graph: &Graph, param: &impl Bindings) -> bool {
+        self.disj.is_empty()
+            && !self.conj.is_empty()
+            && self.conj.iter().all(|p| {
+                p.operand
+                    .resolve(param)
+                    .and_then(|k| column_matches(graph, &p.key, self.edge, p.op, &k))
+                    .is_some()
+            })
+    }
+
+    /// Whether every predicate compares types that can meaningfully be compared.
+    ///
+    /// `false` means DO NOT SEEK — see [`type_agrees`]. A seek would return the
+    /// right rows while suppressing a type fault the per-row path raises.
+    #[must_use]
+    pub fn types_agree(&self, graph: &Graph, param: &impl Bindings) -> bool {
+        let ok = |p: &KeyPredicate| {
+            p.operand
+                .resolve(param)
+                .is_none_or(|k| type_agrees(graph, &p.key, self.edge, &k))
+        };
+
+        self.conj.iter().all(ok)
+            && self.disj.iter().all(|d| match d {
+                Disjunction::Branches(b) => b.iter().flatten().all(ok),
+                Disjunction::AnyOfParam { .. } => true,
+            })
+    }
+
+    /// Whether every conjunct on `key` is answerable from a typed column.
+    ///
+    /// A caller that DROPS the filter the index answered must check this first.
+    /// A seek can return the right rows while the equivalent comparison would
+    /// have FAULTED — `has('k', gt(5))` on a string column is a type error in
+    /// Gremlin, but the range seek just yields nothing. Dropping the step then
+    /// loses the error, and the same query answers `0` with an index and throws
+    /// without one, which makes an index observable instead of a pure
+    /// optimization.
+    #[must_use]
+    pub fn answers_exactly(&self, graph: &Graph, param: &impl Bindings, key: &str) -> bool {
+        self.conj.iter().filter(|p| &*p.key == key).all(|p| {
+            p.operand
+                .resolve(param)
+                .and_then(|k| column_matches(graph, &p.key, self.edge, p.op, &k))
+                .is_some()
+        })
+    }
+
+    /// Every candidate satisfying EVERY conjunct: seeded from an index when one
+    /// applies, otherwise from `universe`, then filtered against the typed
+    /// columns.
+    ///
+    /// This is the part both engines can share ABOVE the seek. GQL reaches the
+    /// same answer through its columnar scan and Gremlin through a per-traverser
+    /// walk, and the walk measured 9-24x slower for identical work. One
+    /// implementation here means an optimization lands on both at once, which is
+    /// the point of the shared layer.
+    ///
+    /// Call only when [`columnar`](Self::columnar) holds.
+    #[must_use]
+    pub fn scan(
+        &self,
+        graph: &Graph,
+        param: &impl Bindings,
+        universe: impl FnOnce() -> Vec<u32>,
+    ) -> Vec<u32> {
+        let mut ids = self.resolve(graph, param).unwrap_or_else(universe);
+
+        for p in &self.conj {
+            let Some(test) = p
+                .operand
+                .resolve(param)
+                .and_then(|k| column_matches(graph, &p.key, self.edge, p.op, &k))
+            else {
+                continue;
+            };
+
+            ids.retain(|&row| test(row));
+        }
+
+        ids
+    }
+
     /// As [`resolve`](Self::resolve), plus which key (if any) the seed answers
     /// EXACTLY rather than as a superset.
     ///
@@ -476,6 +565,102 @@ fn idx_indexed(graph: &Graph, name: &str, edge: bool) -> bool {
         graph.edge_indexed(name)
     } else {
         graph.vertex_indexed(name)
+    }
+}
+
+/// Do the operand's type and the column's type agree?
+///
+/// Distinct from [`column_matches`], which also asks whether this layer can
+/// EVALUATE the comparison. Here the question is only whether comparing them is
+/// meaningful at all — because when it is not, the seek must be declined
+/// entirely rather than answered.
+///
+/// A range seek for a number against an all-string column returns an empty set,
+/// which is the right ROWS but skips the type FAULT that comparing them per-row
+/// would raise. The query then answers `0` with an index and throws without one,
+/// making the index observable. `Mixed` disagrees with everything: its rows can
+/// be of any type, so some of them would fault.
+fn type_agrees(graph: &Graph, key: &str, edge: bool, want: &IdxKey) -> bool {
+    let store = if edge {
+        &graph.edge_props
+    } else {
+        &graph.props
+    };
+    let Some(col) = store.keys.get(key).and_then(|k| store.cols.get(k as usize)) else {
+        // No such key: nothing to compare against, so nothing can fault.
+        return true;
+    };
+
+    matches!(
+        (col, want),
+        (Column::Num { .. }, IdxKey::Num(_))
+            | (Column::Str { .. }, IdxKey::Str(_))
+            | (Column::Bool { .. }, IdxKey::Bool(_))
+            | (Column::Temporal { .. }, IdxKey::Temporal(..))
+    )
+}
+
+/// Does the typed column hold a value at `row` satisfying `op key`?
+///
+/// Returns `None` when the column CANNOT answer — a missing key, an untyped
+/// (`Mixed`) column, or an operand whose type differs from the column's. That
+/// last one matters for more than speed: a cross-type comparison is a TYPE FAULT
+/// in Gremlin and three-valued UNKNOWN in GQL, and neither is expressible as a
+/// yes/no here. Declining lets the caller fall back to the path that gets those
+/// right, so this filter is only ever used where the answer is unambiguous.
+fn column_matches<'g>(
+    graph: &'g Graph,
+    key: &str,
+    edge: bool,
+    op: SeekOp,
+    want: &IdxKey,
+) -> Option<Box<dyn Fn(u32) -> bool + 'g>> {
+    let store = if edge {
+        &graph.edge_props
+    } else {
+        &graph.props
+    };
+    let col = store.cols.get(store.keys.get(key)? as usize)?;
+
+    match (col, want) {
+        (Column::Num { data, present }, IdxKey::Num(n)) => {
+            let n = *n;
+
+            Some(Box::new(move |row| {
+                let i = row as usize;
+
+                present.get(i)
+                    && match op {
+                        SeekOp::Eq => data[i] == n,
+                        SeekOp::Lt => data[i] < n,
+                        SeekOp::Le => data[i] <= n,
+                        SeekOp::Gt => data[i] > n,
+                        SeekOp::Ge => data[i] >= n,
+                    }
+            }))
+        }
+        // Strings compare by INTERNED ID, so only equality — an ordering would
+        // need the dictionary text per row, which is the slow path this exists to
+        // avoid. A value never interned matches nothing, which is correct.
+        (Column::Str { data, present }, IdxKey::Str(s)) if op == SeekOp::Eq => {
+            let want_id = graph.strs.get(s);
+
+            Some(Box::new(move |row| {
+                let i = row as usize;
+
+                present.get(i) && want_id.is_some_and(|w| data[i] == w)
+            }))
+        }
+        (Column::Bool { data, present }, IdxKey::Bool(b)) if op == SeekOp::Eq => {
+            let b = *b;
+
+            Some(Box::new(move |row| {
+                let i = row as usize;
+
+                present.get(i) && data[i] == b
+            }))
+        }
+        _ => None,
     }
 }
 

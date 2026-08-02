@@ -302,17 +302,65 @@ fn index_seed(graph: &Graph, steps: &[Step]) -> Option<(Vec<Trav>, Vec<usize>)> 
         _ => return None,
     };
     let mut seek = ElementSeek::same_kind(is_edge);
+    // Only steps whose predicate was captured IN FULL may be dropped later.
+    let mut captured: Vec<usize> = Vec::new();
 
-    for step in steps.iter().skip(1) {
+    for (i, step) in steps.iter().enumerate().skip(1) {
         match step {
-            Step::Has(key, pred) => lower_predicate(key, pred, &mut seek),
+            Step::Has(key, pred) => {
+                if lower_predicate(key, pred, &mut seek) {
+                    captured.push(i);
+                }
+            }
             Step::HasLabel(..) | Step::HasNot(..) => {}
             _ => break,
         }
     }
 
     // Gremlin values are already values — there are no parameter slots to bind.
-    let seeded = seek.resolve_seeded(graph, &(|_: usize| None))?;
+    let no_params = |_: usize| None;
+
+    // A type-mismatched comparison must reach the per-step path, which raises the
+    // fault. Seeding would answer the same ROWS and swallow the error, so an
+    // index would change whether the query throws.
+    if !seek.types_agree(graph, &no_params) {
+        return None;
+    }
+
+    // Every leading `has` answerable straight from a typed column: take the whole
+    // prefix through the SHARED columnar filter and drop those steps, instead of
+    // walking one traverser at a time. `V().has('age', gt(50)).count()` was 15x
+    // GQL's equivalent, and the difference was entirely this.
+    //
+    // `columnar` declines whenever a comparison could be cross-type, because that
+    // is a type FAULT here and three-valued UNKNOWN in GQL — neither survives a
+    // yes/no filter, so those keep the per-step path that gets them right.
+    if seek.columnar(graph, &no_params) {
+        let ids = seek.scan(graph, &no_params, || {
+            if is_edge {
+                (0..graph.e_src.len() as u32)
+                    .filter(|&e| graph.is_edge_live(e))
+                    .collect()
+            } else {
+                graph.vertex_indices().collect()
+            }
+        });
+
+        return Some((
+            ids.into_iter()
+                .map(|id| {
+                    Trav::root(if is_edge {
+                        GVal::Edge(id)
+                    } else {
+                        GVal::Node(id)
+                    })
+                })
+                .collect(),
+            captured,
+        ));
+    }
+
+    let seeded = seek.resolve_seeded(graph, &no_params)?;
     let answered: Vec<usize> = seeded.exact_key.map_or_else(Vec::new, |key| {
         steps
             .iter()
@@ -348,7 +396,11 @@ fn index_seed(graph: &Graph, steps: &[Step]) -> Option<(Vec<Trav>, Vec<usize>)> 
 /// intersection, the opposite of what it means), and `startsWith` is a prefix
 /// range, `>= prefix AND < prefix_upper`. That last one is the form GQL's
 /// `starts_with` still lacks and now stands to inherit for free.
-fn lower_predicate(key: &str, pred: &P, seek: &mut ElementSeek) {
+///
+/// Returns whether the predicate was captured IN FULL. A `false` means the seek
+/// only approximates it (or ignores it), so the step must still run — dropping
+/// it would silently lose the filter. `neq` and the text predicates land here.
+fn lower_predicate(key: &str, pred: &P, seek: &mut ElementSeek) -> bool {
     let key: Arc<str> = Arc::from(key);
     let lit = |v: &GVal| gval_to_idxkey(v).map(Operand::Lit);
     let mut one = |op: SeekOp, v: &GVal| {
@@ -373,7 +425,7 @@ fn lower_predicate(key: &str, pred: &P, seek: &mut ElementSeek) {
         }
         P::Outside(lo, hi) => {
             let (Some(lo), Some(hi)) = (lit(lo), lit(hi)) else {
-                return;
+                return false;
             };
 
             seek.push_branches(vec![
@@ -391,7 +443,7 @@ fn lower_predicate(key: &str, pred: &P, seek: &mut ElementSeek) {
         }
         P::Within(vs) => {
             let Some(values) = vs.iter().map(lit).collect::<Option<Vec<_>>>() else {
-                return;
+                return false;
             };
 
             // Deduped by the shared layer. The hand-rolled version was not, so
@@ -418,8 +470,10 @@ fn lower_predicate(key: &str, pred: &P, seek: &mut ElementSeek) {
         }
         // `neq`, `without`, `containing`, … enumerate a complement, which no
         // point or range seek covers.
-        _ => {}
+        _ => return false,
     }
+
+    true
 }
 
 /// Serialize traversal results to a JSON array string — the FFI carrier. Graph
