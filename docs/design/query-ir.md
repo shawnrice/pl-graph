@@ -235,12 +235,43 @@ downcasts to GQL and shares no algorithm: GQL binary-searches sorted string
 keys, Gremlin scans insertion-ordered any-value keys. Those are different data
 structures that happen to have the same shape.
 
-**Why the key is 40 bytes**, in case this is ever revisited: `Value` is sized by
-`Temporal`, which is sized by `Duration { months: i64, days: i64, secs: i64,
-nanos: u32 }` = 32 bytes. Boxing `Duration` would shrink `Value` and make the
-merged entry SMALLER than today's record — but `Temporal` is `Copy` and passed
-by value throughout, so that is a much larger change than the merge it would
-enable. That, not the key rules, is the thing actually holding this back.
+### Shrinking `Value` to make it free: also tried, also reverted
+
+`Value` is 40 bytes because `Temporal` is, and `Temporal` is 40 because of
+`Duration { months: i64, days: i64, secs: i64, nanos: u32 }` = 32. Every other
+temporal variant is ≤ 16. So boxing that one variant — the same trick that makes
+`Path` and `Property` free — projects to:
+
+|                             | Temporal | Value | record entry | merged entry |
+| --------------------------- | -------- | ----- | ------------ | ------------ |
+| today                       | 40       | 40    | 56           | 80           |
+| box `Duration`              | 24       | 32    | 48           | 64           |
+| + `List`/`Map` as `Arc<[]>` | 24       | 24    | 40           | **48**       |
+
+The bottom row is the one that would make the merge free — 48 against today's 56.
+
+Built on branch `slim-temporal`, commit `4861a79`. `Temporal` 40 → 24 and `Value`
+40 → 32 exactly as projected, 1639 tests pass, and the map workloads DID improve
+(construct record −7%, map equality filter −11%).
+
+It is still a clear loss, because durations pay for it:
+
+| duration workload | inline  | boxed   |           |
+| ----------------- | ------- | ------- | --------- |
+| project K         | 2.19 ms | 7.54 ms | **+244%** |
+| order by K        | 23.76   | 36.30   | +53%      |
+| top-k 20          | 3.03    | 5.13    | +69%      |
+| filter>p count    | 1.67    | 2.68    | +60%      |
+| min/max K         | 1.94    | 3.03    | +56%      |
+
+Reproduced across runs (7.54 / 7.18 against 2.19 / 2.22). The cause is
+structural rather than incidental: the temporal columns are packed SoA, so
+materializing a duration builds a fresh `Temporal` per row — and boxed, that is
+a heap ALLOCATION per row where it used to be a register copy. `Arc<Duration>`
+would make the clone cheap but not the construction, so it does not help either.
+
+**This is why `Temporal` is `Copy` and `Duration` is inline**, and it should stay
+that way. A −20% `Value` bought ~7% on maps and cost 3.3x on durations.
 
 ## Not on the table
 
