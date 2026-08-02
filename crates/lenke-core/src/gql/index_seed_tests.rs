@@ -843,6 +843,24 @@ fn equivalent_spellings_cost_the_same() {
                 "MATCH (u:P) WHERE u.n >= 0 AND u.k = 'key000005' RETURN count(*) AS c",
             ],
         ),
+        // Which comma pattern is written first must not decide which one drives
+        // the join. Before `pick_pattern`, the anchored-last spelling enumerated
+        // the unanchored pattern as the outer loop — measured 121,336x apart at
+        // 300k vertices, and unbounded (see docs/design/query-ir.md).
+        (
+            "pattern order, anchored by inline props",
+            &[
+                "MATCH (u:P {k: 'key000005'})-[:R]->(x), (x)-[:R]->(y) RETURN count(*) AS c",
+                "MATCH (x)-[:R]->(y), (u:P {k: 'key000005'})-[:R]->(x) RETURN count(*) AS c",
+            ],
+        ),
+        (
+            "pattern order, anchored by a clause WHERE",
+            &[
+                "MATCH (u:P)-[:R]->(x), (x)-[:R]->(y) WHERE u.k = 'key000005' RETURN count(*) AS c",
+                "MATCH (x)-[:R]->(y), (u:P)-[:R]->(x) WHERE u.k = 'key000005' RETURN count(*) AS c",
+            ],
+        ),
     ];
     let mut g = equiv_graph();
     let mut failures: Vec<String> = Vec::new();
