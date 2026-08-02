@@ -1695,10 +1695,33 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
 
         // --- filters ---
         Step::Has(key, pred) => stream.into_iter().filter(|t| p_matches(pred, &prop(graph, &t.val, key))).collect(),
-        Step::HasLabel(labels) => stream
-            .into_iter()
-            .filter(|t| matches!(elem_label(graph, &t.val), GVal::Str(ref s) if labels.iter().any(|l| l == s.as_ref())))
-            .collect(),
+        // Resolve the wanted labels to IDS once, then compare ids per element.
+        // This used to call `elem_label`, which builds an `Arc<str>` per element
+        // (a refcount bump plus a `GVal`) and string-compares it — on a 50k-vertex
+        // scan that is 50k allocations to answer a question about two integers.
+        //
+        // Semantics are unchanged and deliberately narrow: `hasLabel` here matches
+        // an element's FIRST label only (`vertex_labels(i).first()`), not any of
+        // them, so this compares that same one. It is also why the label BUCKET
+        // (`by_label`, which indexes a vertex under every label it carries) is NOT
+        // a valid shortcut — it would match a `[A, B]` vertex on `hasLabel('B')`
+        // where the traversal does not.
+        Step::HasLabel(labels) => {
+            let want: Vec<u32> = labels.iter().filter_map(|l| graph.labels.get(l)).collect();
+            let want_e: Vec<u32> = labels.iter().filter_map(|l| graph.etype.get(l)).collect();
+
+            stream
+                .into_iter()
+                .filter(|t| match &t.val {
+                    GVal::Node(i) => graph
+                        .vertex_labels(*i)
+                        .first()
+                        .is_some_and(|lid| want.contains(lid)),
+                    GVal::Edge(e) => want_e.contains(&graph.e_type[*e as usize]),
+                    _ => false,
+                })
+                .collect()
+        }
         Step::HasId(ids) => stream.into_iter().filter(|t| matches!(elem_id(graph, &t.val), GVal::Str(ref s) if ids.iter().any(|i| i == s.as_ref()))).collect(),
         Step::HasKey(keys) => stream
             .into_iter()
