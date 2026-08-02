@@ -2307,15 +2307,58 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
 
             next
         }
-        Step::ValueMap(keys) => map_step(stream, |t| {
-            let ks = if keys.is_empty() { present_keys(graph, &t.val) } else { keys.clone() };
-            let entries = ks
-                .into_iter()
-                .filter(|k| prop_present(graph, &t.val, k))
-                .map(|k| (GVal::Str(Arc::from(k.as_str())), prop(graph, &t.val, &k)))
+        Step::ValueMap(keys) => {
+            // Same shape as `values`: the key list was CLONED per traverser and
+            // every read hashed the key NAME, so a 200k stream paid 200k
+            // `Vec<String>` clones plus two dictionary lookups per property.
+            // Resolving the names — and the `Arc<str>` each becomes — once here
+            // leaves an array index per read.
+            let named: Vec<(Arc<str>, Option<u32>, Option<u32>)> = keys
+                .iter()
+                .map(|k| {
+                    (
+                        Arc::from(k.as_str()),
+                        graph.props.keys.get(k),
+                        graph.edge_props.keys.get(k),
+                    )
+                })
                 .collect();
-            vec![GVal::Map(entries)]
-        }),
+
+            map_step(stream, |t| {
+                let entries: Vec<(GVal, GVal)> = if keys.is_empty() {
+                    present_keys(graph, &t.val)
+                        .into_iter()
+                        .filter(|k| prop_present(graph, &t.val, k))
+                        .map(|k| (GVal::Str(Arc::from(k.as_str())), prop(graph, &t.val, &k)))
+                        .collect()
+                } else {
+                    named
+                        .iter()
+                        .filter_map(|(name, vk, ek)| {
+                            let (store, kid) = match (&t.val, vk, ek) {
+                                (GVal::Node(i), Some(k), _) => {
+                                    (&graph.props, (*i as usize, *k))
+                                }
+                                (GVal::Edge(e), _, Some(k)) => {
+                                    (&graph.edge_props, (*e as usize, *k))
+                                }
+                                _ => return None,
+                            };
+
+                            // Presence, not nullness: a stored null rides through.
+                            store.is_present_id(kid.0, kid.1).then(|| {
+                                (
+                                    GVal::Str(name.clone()),
+                                    value_to_gval(store.value_id(kid.0, kid.1, &graph.strs)),
+                                )
+                            })
+                        })
+                        .collect()
+                };
+
+                vec![GVal::Map(entries)]
+            })
+        }
         Step::PropertyMap(keys) => map_step(stream, |t| {
             let ks = if keys.is_empty() { present_keys(graph, &t.val) } else { keys.clone() };
             let entries = ks
@@ -3245,6 +3288,12 @@ fn apply_order(
         // Global: sort the traversers across the stream by their value.
         Scope::Global => {
             // Precompute sort keys (eval_by needs &mut; not usable in the comparator).
+            //
+            // A single-`by` fast path carrying the key as a bare `GVal` instead
+            // of a one-element `Vec` measured WORSE — 8.66 -> 11.10 ms on a 50k
+            // sort. The vector is an indirection, but it makes the sorted tuple
+            // SMALLER (24 bytes against 40) next to a ~104-byte `Trav`, and a
+            // sort moves those tuples far more often than it dereferences them.
             let mut keyed: Vec<(Vec<GVal>, Trav)> = stream
                 .into_iter()
                 .map(|t| {
