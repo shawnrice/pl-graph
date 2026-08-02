@@ -1560,10 +1560,10 @@ fn pattern_rank(p: &CPath, binding: &Binding) -> u8 {
 ///
 /// Ties keep the WRITTEN order (strict `<`), so a query whose patterns are all
 /// equally cheap to start runs, and emits rows, exactly as it did before.
-fn pick_pattern(patterns: &[CPath], done: &[bool], binding: &Binding) -> Option<usize> {
+fn pick_pattern(patterns: &[CPath], done: u64, binding: &Binding) -> Option<usize> {
     let mut best: Option<(u8, usize)> = None;
     for (i, p) in patterns.iter().enumerate() {
-        if done[i] {
+        if done & (1u64 << i) != 0 {
             continue;
         }
         let rank = pattern_rank(p, binding);
@@ -1590,34 +1590,66 @@ pub(super) fn visit_patterns(
     binding: &mut Binding,
     emit: &mut dyn FnMut(&mut Binding) -> bool,
 ) -> bool {
-    let mut done = vec![false; patterns.len()];
-    visit_remaining(graph, ctx, patterns, &mut done, where_, binding, emit)
+    // `done` is a u64 bitmask (see `pick_pattern`), so past 64 patterns there is
+    // nowhere to record progress. That is not a real query, but it still has to
+    // return the right rows — take them in written order, as this did before
+    // reordering existed.
+    if patterns.len() > 64 {
+        return visit_in_order(graph, ctx, patterns, 0, where_, binding, emit);
+    }
+    visit_remaining(graph, ctx, patterns, 0, where_, binding, emit)
+}
+
+fn visit_in_order(
+    graph: &Graph,
+    ctx: &Ctx,
+    patterns: &[CPath],
+    idx: usize,
+    where_: Option<&CExpr>,
+    binding: &mut Binding,
+    emit: &mut dyn FnMut(&mut Binding) -> bool,
+) -> bool {
+    let Some(pattern) = patterns.get(idx) else {
+        return finish(graph, ctx, where_, binding, emit);
+    };
+    visit_pattern(graph, ctx, pattern, where_, binding, &mut |b| {
+        visit_in_order(graph, ctx, patterns, idx + 1, where_, b, emit)
+    })
+}
+
+/// Apply the clause WHERE to a fully-extended binding and emit it.
+fn finish(
+    graph: &Graph,
+    ctx: &Ctx,
+    where_: Option<&CExpr>,
+    binding: &mut Binding,
+    emit: &mut dyn FnMut(&mut Binding) -> bool,
+) -> bool {
+    if let Some(w) = where_ {
+        let env = Env::new(graph, ctx, binding);
+        if as_truth(&eval(&env, w)) != Some(true) {
+            return true; // filtered out, keep going
+        }
+    }
+    emit(binding)
 }
 
 fn visit_remaining(
     graph: &Graph,
     ctx: &Ctx,
     patterns: &[CPath],
-    done: &mut Vec<bool>,
+    done: u64,
     where_: Option<&CExpr>,
     binding: &mut Binding,
     emit: &mut dyn FnMut(&mut Binding) -> bool,
 ) -> bool {
     let Some(idx) = pick_pattern(patterns, done, binding) else {
-        if let Some(w) = where_ {
-            let env = Env::new(graph, ctx, binding);
-            if as_truth(&eval(&env, w)) != Some(true) {
-                return true; // filtered out, keep going
-            }
-        }
-        return emit(binding);
+        return finish(graph, ctx, where_, binding, emit);
     };
-    done[idx] = true;
-    let cont = visit_pattern(graph, ctx, &patterns[idx], where_, binding, &mut |b| {
+    let done = done | (1u64 << idx);
+    visit_pattern(graph, ctx, &patterns[idx], where_, binding, &mut |b| {
         visit_remaining(graph, ctx, patterns, done, where_, b, emit)
-    });
-    done[idx] = false; // backtrack
-    cont
+    })
 }
 
 /// Reachability fast path for `EXISTS { (a)-[:T]->+/*(b …) }`: a single unbounded
