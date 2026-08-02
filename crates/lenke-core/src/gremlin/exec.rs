@@ -312,6 +312,26 @@ fn index_seed(graph: &Graph, steps: &[Step]) -> Option<(Vec<Trav>, Vec<usize>)> 
                     captured.push(i);
                 }
             }
+            // `hasLabel` lowers into the IR too, under the FIRST-label rule —
+            // TinkerPop reads `vertex_labels(i).first()`, unlike GQL's any-label
+            // `(n:Person)`. Carrying the rule as data is what lets the bucket
+            // seeding below serve both. Only the first `hasLabel` is taken: a
+            // second one intersects, which the flat id list cannot express, so it
+            // stays a step.
+            Step::HasLabel(labels) if seek.labels().is_none() => {
+                let ids: Vec<u32> = if is_edge {
+                    labels.iter().filter_map(|l| graph.etype.get(l)).collect()
+                } else {
+                    labels.iter().filter_map(|l| graph.labels.get(l)).collect()
+                };
+
+                // A name that resolved to nothing matches nothing, which the
+                // empty list already says — but only if EVERY name was unknown.
+                if ids.len() == labels.len() {
+                    seek.set_labels(crate::seek::LabelRule::First, ids);
+                    captured.push(i);
+                }
+            }
             Step::HasLabel(..) | Step::HasNot(..) => {}
             _ => break,
         }
@@ -335,7 +355,8 @@ fn index_seed(graph: &Graph, steps: &[Step]) -> Option<(Vec<Trav>, Vec<usize>)> 
     // `columnar` declines whenever a comparison could be cross-type, because that
     // is a type FAULT here and three-valued UNKNOWN in GQL — neither survives a
     // yes/no filter, so those keep the per-step path that gets them right.
-    if seek.columnar(graph, &no_params) {
+    // A label-only seek is always answerable — no column types involved.
+    if seek.columnar(graph, &no_params) || (seek.conj_is_empty() && seek.labels().is_some()) {
         let ids = seek.scan(graph, &no_params, || {
             if is_edge {
                 (0..graph.e_src.len() as u32)

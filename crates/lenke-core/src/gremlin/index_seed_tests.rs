@@ -562,3 +562,52 @@ fn a_label_filter_composes_with_a_columnar_one() {
         vec!["p998", "p999"]
     );
 }
+
+#[test]
+fn a_bucket_seeded_label_still_honours_the_first_label_rule() {
+    // `m0` carries [Q, P]: it IS in P's label bucket (buckets index every label)
+    // but its FIRST label is Q, so `hasLabel('P')` must not match it. Seeding
+    // from the bucket and forgetting to re-check is how that goes wrong, and the
+    // bucket seed only runs when the label is selective — which it is here.
+    let mut graph = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"p0","labels":["P"],"properties":{"n":1}}"#,
+            r#"{"type":"node","id":"m0","labels":["Q","P"],"properties":{"n":2}}"#,
+            r#"{"type":"node","id":"q0","labels":["Q"],"properties":{"n":3}}"#,
+            r#"{"type":"node","id":"r0","labels":["R"],"properties":{"n":4}}"#,
+            r#"{"type":"node","id":"r1","labels":["R"],"properties":{"n":5}}"#,
+            r#"{"type":"node","id":"r2","labels":["R"],"properties":{"n":6}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    assert_eq!(
+        ids(&mut graph, g().v_ids(&[]).has_label(&["P"])),
+        vec!["p0"]
+    );
+    assert_eq!(
+        ids(&mut graph, g().v_ids(&[]).has_label(&["Q"])),
+        vec!["m0", "q0"]
+    );
+    // …and composed with a column filter.
+    assert_eq!(
+        ids(
+            &mut graph,
+            g().v_ids(&[]).has_label(&["Q"]).has("n", P::gte(3.0))
+        ),
+        vec!["q0"]
+    );
+}
+
+#[test]
+fn an_unknown_label_matches_nothing() {
+    let mut graph = seeded();
+
+    assert!(ids(&mut graph, g().v_ids(&[]).has_label(&["Nope"])).is_empty());
+    assert!(ids(
+        &mut graph,
+        g().v_ids(&[]).has_label(&["Nope"]).has_val("n", 5.0)
+    )
+    .is_empty());
+}
