@@ -380,6 +380,10 @@ fn lower_prefix(graph: &Graph, steps: &[Step]) -> Option<(ElementSeek, Vec<usize
 /// An allowlist on purpose — see `TRACK_PATH`. A step missing from here only
 /// costs the path accumulation it would have had anyway; a step wrongly added
 /// would corrupt `path()`.
+///
+/// `Dedupe` qualifies only with an EMPTY `bys`: a `by()` modulator can hold a
+/// whole sub-traversal, and that sub-traversal may read the path. Its `labels`
+/// are fine either way — they read the tag map, not the path.
 fn path_free(step: &Step) -> bool {
     matches!(
         step,
@@ -407,7 +411,7 @@ fn path_free(step: &Step) -> bool {
             | Step::Mean(_)
             | Step::Min(_)
             | Step::Max(_)
-    )
+    ) || matches!(step, Step::Dedupe { bys, .. } if bys.is_empty())
 }
 
 /// Whether this traversal needs per-traverser path history at all.
@@ -479,11 +483,40 @@ fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
         rest = tail;
     }
 
+    // An optional plain `dedup()` before the count. Only the argument-free form:
+    // `dedup('a')` keys on tags and `dedup().by(..)` on a sub-traversal, neither
+    // of which is an element identity.
+    let mut distinct = false;
+
+    if let [Step::Dedupe { labels, bys }, tail @ ..] = rest {
+        if labels.is_empty() && bys.is_empty() {
+            distinct = true;
+            rest = tail;
+        }
+    }
+
     if !matches!(rest, [Step::Count(Scope::Global)]) {
         return None;
     }
 
     let mut ids = seek.scan(graph, &no_params, || universe(graph, is_edge));
+
+    // With a dedup the last hop has to be materialized to be deduplicated; without
+    // one it can be counted in place.
+    #[allow(clippy::cast_precision_loss)]
+    if distinct {
+        for (d, e) in &hops {
+            ids = crate::seek::expand(graph, &ids, *d, e);
+        }
+
+        // Element identity is the dense index, so distinctness is a set of u32 —
+        // no key projection, no per-traverser allocation.
+        let mut seen: HashSet<u32> = HashSet::with_capacity(ids.len());
+
+        ids.retain(|&id| seen.insert(id));
+
+        return Some(ids.len() as f64);
+    }
 
     #[allow(clippy::cast_precision_loss)]
     match hops.split_last() {
@@ -2884,6 +2917,31 @@ fn apply_dedupe(
     // else the tuple of `by` modulators (`dedup().by(...)`), else the
     // current value. A hash set on the hashable projection makes this
     // O(n); the old `Vec::contains` scan was O(n²).
+    // Plain `dedup()` over the current value is by far the commonest form, and it
+    // does not need the tuple shape: keying on the value directly drops a
+    // `Vec<GVal>` for the key, a clone of the value into it, and a `Vec<DedupKey>`
+    // for the projection — three allocations per traverser, 600k on a 200k
+    // stream, to deduplicate what is usually a single element id.
+    if labels.is_empty() && bys.is_empty() {
+        let mut seen: HashSet<DedupKey> = HashSet::with_capacity(stream.len());
+        let mut next = Vec::new();
+
+        for t in stream {
+            match dedup_key(&t.val) {
+                // No key (a NaN inside the value) is never a duplicate, matching
+                // the tuple path below.
+                None => next.push(t),
+                Some(k) => {
+                    if seen.insert(k) {
+                        next.push(t);
+                    }
+                }
+            }
+        }
+
+        return next;
+    }
+
     let mut seen: HashSet<Vec<DedupKey>> = HashSet::new();
     let mut next = Vec::new();
     for t in stream {

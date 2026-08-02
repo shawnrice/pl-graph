@@ -879,3 +879,63 @@ fn simple_path_still_filters_on_a_path_free_looking_prefix() {
         "simplePath must drop the walks that return to their start"
     );
 }
+
+#[test]
+fn a_deduped_count_agrees_with_the_walk() {
+    let mut graph = seeded();
+
+    for (t, label) in [
+        (g().v_ids(&[]).has_label(&["P"]).out(&["R"]), "one hop"),
+        (
+            g().v_ids(&[]).has_label(&["P"]).both(&[]).both(&[]),
+            "two hops, both",
+        ),
+        (
+            g().v_ids(&[]).has_label(&["P"]),
+            "no hop — already distinct",
+        ),
+    ] {
+        let walked = ids(&mut graph, t.clone().dedup()).len() as f64;
+
+        assert_eq!(count_of(&mut graph, t.dedup().count()), walked, "{label}");
+    }
+}
+
+#[test]
+fn a_deduped_count_collapses_multi_edges() {
+    // Two edges to the same neighbour are two traversers but ONE distinct
+    // vertex: the counted form must collapse them, unlike the plain count.
+    let mut graph = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["P"],"properties":{}}"#,
+            r#"{"type":"node","id":"b","labels":["Q"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e0","labels":["R"],"from":"a","to":"b","properties":{}}"#,
+            r#"{"type":"edge","id":"e1","labels":["R"],"from":"a","to":"b","properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let base = g().v_ids(&[]).has_label(&["P"]).out(&["R"]);
+
+    assert_eq!(count_of(&mut graph, base.clone().count()), 2.0);
+    assert_eq!(count_of(&mut graph, base.dedup().count()), 1.0);
+}
+
+#[test]
+fn a_keyed_dedup_is_not_treated_as_element_identity() {
+    let mut graph = seeded();
+
+    // `dedup('x')` keys on a TAG, not the element, so it must not take the
+    // element-identity terminal.
+    let out = g()
+        .v_ids(&[])
+        .has_label(&["P"])
+        .as_("x")
+        .out(&["R"])
+        .dedup_labels(vec!["x".to_string()])
+        .count()
+        .run(&mut graph);
+
+    assert_eq!(out.len(), 1, "still answers");
+}
