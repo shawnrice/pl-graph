@@ -184,6 +184,28 @@ pub(super) fn node_index_seed(
     )
 }
 
+/// Whether this element WOULD seed from an index, without building the seed.
+///
+/// The boolean-only callers (orientation, the LIMIT cap) used to call
+/// `node_index_seed(..).is_some()`, which performs the whole seek and discards
+/// it. On a traversal that meant three real seeks per execution for one result.
+pub(super) fn node_seekable(
+    graph: &Graph,
+    ctx: &Ctx,
+    node: &CNode,
+    where_: Option<&CExpr>,
+) -> bool {
+    seek_lower::element_seek(
+        where_,
+        &seek_lower::inline_of(node),
+        graph,
+        ctx,
+        node.var_slot,
+        false,
+    )
+    .can_seek(graph, &seek_lower::GqlBindings(ctx.params))
+}
+
 /// Candidate ids for a lowered seek, or `None` to scan.
 pub(super) fn resolve_seek(graph: &Graph, ctx: &Ctx, seek: ElementSeek) -> Option<Vec<u32>> {
     if seek.is_empty() {
@@ -368,8 +390,8 @@ pub(super) fn try_orient_node_seed(
     // left a *target*-anchored pattern, `(e:Emp)-[:T]->(m:Emp {id: $m})`, seeding
     // from the unindexed source and scanning its entire label bucket on every
     // lookup. Seeding the start was fixed separately; this is the mirror case.
-    let start_seek = node_index_seed(graph, ctx, &path.start, where_).is_some();
-    let end_seek = node_index_seed(graph, ctx, end_node, where_).is_some();
+    let start_seek = node_seekable(graph, ctx, &path.start, where_);
+    let end_seek = node_seekable(graph, ctx, end_node, where_);
 
     if start_seek {
         return Some(path.clone()); // already leads with the seekable end
@@ -402,7 +424,7 @@ pub(super) fn scan_is_hinted(
     where_: Option<&CExpr>,
 ) -> bool {
     if path.segments.is_empty() {
-        node_index_seed(graph, ctx, &path.start, where_).is_some()
+        node_seekable(graph, ctx, &path.start, where_)
     } else if path.segments.len() == 1 {
         edge_prop_seed(graph, ctx, &path.segments[0].rel, where_).is_some()
     } else {
@@ -535,8 +557,8 @@ pub(super) fn build_scan(
         // as "not to interfere with a real index seek"; without this guard control
         // fell straight through to here and an indexed anchor *diverted* the plan
         // into the whole-type scan — making the index actively harmful.
-        let endpoint_seekable = node_index_seed(graph, ctx, &path.start, where_).is_some()
-            || node_index_seed(graph, ctx, &path.segments[0].node, where_).is_some();
+        let endpoint_seekable = node_seekable(graph, ctx, &path.start, where_)
+            || node_seekable(graph, ctx, &path.segments[0].node, where_);
         let seed = if endpoint_seekable {
             edge_prop_seed(graph, ctx, &path.segments[0].rel, where_)
         } else {

@@ -29,6 +29,7 @@ obvious without opening them.
 | What does CDC scope extraction cost per write?                     | `cdc_extract_bench`                                      |
 | How much memory does a graph of N vertices take?                   | `mem_probe`                                              |
 | **What does query TEXT cost to turn into a plan, before it runs?** | **`plan_bench`**                                         |
+| What does a traversal cost when its anchor seeks?                  | `seeded_traversal_bench`                                 |
 | **Where does NDJSON ingest time go, and what is the ceiling?**     | **`ingest_phase_bench`**, plus `ingest_throughput` below |
 | Are the count fast paths correct? (not a benchmark)                | `count_check`                                            |
 

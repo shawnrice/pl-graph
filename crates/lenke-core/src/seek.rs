@@ -287,6 +287,31 @@ impl ElementSeek {
         self.resolve_seeded(graph, param).map(|s| s.ids)
     }
 
+    /// Would [`resolve`](Self::resolve) return a seed — WITHOUT building one.
+    ///
+    /// Several callers only need the boolean: the orientation chooser asks
+    /// whether each end of a pattern is seekable so it can lead with the better
+    /// one, and the LIMIT logic asks whether a scan became a seek. Each of those
+    /// used to call the full seek and drop the ids on the floor. A traversal
+    /// pattern therefore recognized and SEEKED three times and used one result,
+    /// at a cost proportional to the seed — a range returning 10k ids built 30k.
+    #[must_use]
+    pub fn can_seek(&self, graph: &Graph, param: &impl Bindings) -> bool {
+        let indexed = |k: &str| idx_indexed(graph, k, self.edge);
+
+        ranges(&self.conj, param)
+            .iter()
+            .any(|(key, _)| indexed(key))
+            || self.disj.iter().any(|d| match d {
+                Disjunction::AnyOfParam { key, slot } => {
+                    indexed(key) && param.list(*slot).is_some()
+                }
+                Disjunction::Branches(branches) => branches
+                    .iter()
+                    .all(|b| ranges(b, param).iter().any(|(key, _)| indexed(key))),
+            })
+    }
+
     /// As [`resolve`](Self::resolve), plus which key (if any) the seed answers
     /// EXACTLY rather than as a superset.
     ///
@@ -443,6 +468,14 @@ fn apply(rb: &mut RangeBound, op: SeekOp, key: IdxKey) {
         SeekOp::Le => rb.lte = Some(key),
         SeekOp::Gt => rb.gt = Some(key),
         SeekOp::Ge => rb.gte = Some(key),
+    }
+}
+
+fn idx_indexed(graph: &Graph, name: &str, edge: bool) -> bool {
+    if edge {
+        graph.edge_indexed(name)
+    } else {
+        graph.vertex_indexed(name)
     }
 }
 
