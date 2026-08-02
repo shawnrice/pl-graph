@@ -451,71 +451,9 @@ pub(super) fn build_scan(
     // inline constraints are re-checked.
     if path.segments.is_empty() {
         let node = &path.start;
-        let needs_check = !node.props.is_empty() || node.where_.is_some();
 
-        // The seed-and-filter of an isolated node is the SHARED access path —
-        // one loop for both engines. The seed, the cap, the label rule and the
-        // typed-column filters live in `crate::seek`; what is genuinely GQL —
-        // an arbitrary `WHERE` evaluated against a binding — arrives as the
-        // RESIDUAL closure, so this no longer needs a scan loop of its own.
-        let label_ids = node
-            .label
-            .as_ref()
-            .and_then(|l| seek_lower::lower_labels(l, ctx, false));
-        let mut seek = seek_lower::element_seek(
-            where_,
-            &seek_lower::inline_of(node),
-            graph,
-            ctx,
-            node.var_slot,
-            false,
-        );
-
-        if let Some(ids) = label_ids.clone() {
-            seek.set_labels(crate::seek::LabelRule::Any, ids);
-        }
-
-        let binds = seek_lower::GqlBindings(ctx.params);
-        let mut b = Binding(vec![None; scope_len.max(1)]);
-        // A label expression the IR cannot hold (`!A`, `A&B`, wildcard) stays
-        // here, as does every inline constraint and node-local WHERE.
-        let residual_label = label_ids.is_none();
-        // With nothing left over, hand the shared loop a no-op residual through
-        // `scan_capped` rather than a closure it must call per candidate. Same
-        // loop either way — but the trivial case monomorphizes to a constant and
-        // vanishes, and calling it per vertex cost 26% on a grouped aggregate.
-        let ids = if !residual_label && !needs_check {
-            seek.scan_capped(graph, &binds, cap, || graph.vertex_indices().collect())
-        } else {
-            seek.scan_with(
-                graph,
-                &binds,
-                cap,
-                || graph.vertex_indices().collect(),
-                |vi| {
-                    if residual_label && !matches_label(graph, ctx, vi, node.label.as_ref()) {
-                        return false;
-                    }
-
-                    if !needs_check {
-                        return true;
-                    }
-
-                    if let Some(slot) = node.var_slot {
-                        b.set(slot, Val::Node(vi));
-                    }
-
-                    satisfies(
-                        graph,
-                        ctx,
-                        &Val::Node(vi),
-                        &node.props,
-                        node.where_.as_ref(),
-                        &b,
-                    )
-                },
-            )
-        };
+        // One lowering for both scan shapes — see `seek_lower::scan_node`.
+        let ids = seek_lower::scan_node(graph, ctx, node, where_, scope_len, cap);
 
         let mut sc = ScanCols::new(scope_len);
         sc.n = ids.len();
@@ -574,65 +512,19 @@ pub(super) fn scan_start_seed(
     scope_len: usize,
     where_: Option<&CExpr>,
 ) -> Vec<u32> {
-    let start_check = !start.props.is_empty() || start.where_.is_some();
-    let mut sb = Binding(vec![None; scope_len.max(1)]);
-    let mut endpoint: Vec<u32> = Vec::new();
-    {
-        let mut keep = |vi: u32| -> bool {
-            if !matches_label(graph, ctx, vi, start.label.as_ref()) {
-                return true;
-            }
-            if start_check {
-                if let Some(s) = start.var_slot {
-                    sb.set(s, Val::Node(vi));
-                }
-                if !satisfies(
-                    graph,
-                    ctx,
-                    &Val::Node(vi),
-                    &start.props,
-                    start.where_.as_ref(),
-                    &sb,
-                ) {
-                    return true;
-                }
-            }
-            endpoint.push(vi);
-            true
-        };
-        // An indexed anchor pins the start to a handful of candidates — seek them
-        // rather than walking the whole label bucket. Without this a traversal
-        // from an indexed anchor costs O(label bucket) instead of O(degree):
-        // `(s:Employee {id:$x})-[:T]->(t)` scanned every Employee to reach one.
-        //
-        // A WHERE counts as an anchor, not just an inline `{k: lit}` /
-        // `{k: $param}` — both the node's own and the surrounding clause's.
-        //
-        // The clause WHERE used to be dropped here: this function never received
-        // it, so `(u:User {name:$n})-[:R]->(x)` seeked while the identical
-        // `(u:User)-[:R]->(x) WHERE u.name = $n` scanned the whole label bucket.
-        // Measured at 60x on a 5k-vertex graph, and the WHERE form is the one
-        // people write. Both forms already seeked when the node stood ALONE; only
-        // the traversal case lost it, which is what made it easy to miss.
-        //
-        // Taking a conjunct of the clause WHERE as a seed is sound because it must
-        // hold for every matching row, and `prop_index_hint` only descends
-        // conjunctions — a disjunction yields no hint rather than a wrong one.
-        // The full WHERE is still applied downstream, and the per-vertex label +
-        // props re-check below still runs, so the seek only ever *narrows* the
-        // candidate set.
-        match node_index_seed(graph, ctx, start, where_.or(start.where_.as_ref())) {
-            Some(cands) => {
-                for vi in cands {
-                    keep(vi);
-                }
-            }
-            None => {
-                for_each_seed(graph, ctx, start.label.as_ref(), &mut keep);
-            }
-        }
-    }
-    endpoint
+    // An indexed anchor pins the start to a handful of candidates rather than the
+    // whole label bucket: `(s:Employee {id:$x})-[:T]->(t)` used to scan every
+    // Employee to reach one. A clause WHERE counts as an anchor too, not just an
+    // inline `{k: lit}` — that was worth 60x, and only in the traversal case,
+    // which is what made it easy to miss.
+    seek_lower::scan_node(
+        graph,
+        ctx,
+        start,
+        where_.or(start.where_.as_ref()),
+        scope_len,
+        None,
+    )
 }
 
 /// Expand a traversal `path` from the given start-node `endpoint` ids into

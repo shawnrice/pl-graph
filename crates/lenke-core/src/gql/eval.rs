@@ -106,6 +106,10 @@ pub type Val = crate::value::Value;
 pub struct Binding(Vec<Option<Val>>);
 
 impl Binding {
+    /// An empty binding with room for `n` slots.
+    fn with_len(n: usize) -> Self {
+        Self(vec![None; n])
+    }
     fn get(&self, slot: usize) -> Option<&Val> {
         self.0.get(slot).and_then(|o| o.as_ref())
     }

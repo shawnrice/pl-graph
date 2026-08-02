@@ -295,3 +295,75 @@ pub(super) fn inline_of(node: &CNode) -> Vec<(&str, &CExpr)> {
         .map(|pc| (pc.key.as_str(), &pc.value))
         .collect()
 }
+
+/// Every vertex matching one pattern node, through the shared scan loop.
+///
+/// The single place GQL lowers "a node plus what constrains it" into
+/// [`crate::seek`]: the label (when it is a flat id list), the inline `{k: v}`
+/// constraints and the seekable part of `anchor` become IR, and whatever is left
+/// — an arbitrary predicate, a negated or conjoined label — becomes the residual
+/// closure. Both the isolated-node scan and the traversal start seed call this,
+/// which is what stops the lowering from being written twice.
+///
+/// `anchor` is the WHERE to seed from: the clause's for an isolated node, and for
+/// a traversal start the clause's OR the node's own — a conjunct of either must
+/// hold for every matching row, so seeding from it only narrows.
+pub(super) fn scan_node(
+    graph: &Graph,
+    ctx: &Ctx,
+    node: &CNode,
+    anchor: Option<&CExpr>,
+    scope_len: usize,
+    cap: Option<usize>,
+) -> Vec<u32> {
+    let label_ids = node
+        .label
+        .as_ref()
+        .and_then(|l| lower_labels(l, ctx, false));
+    let mut seek = element_seek(anchor, &inline_of(node), graph, ctx, node.var_slot, false);
+
+    if let Some(ids) = label_ids.clone() {
+        seek.set_labels(crate::seek::LabelRule::Any, ids);
+    }
+
+    let binds = GqlBindings(ctx.params);
+    let residual_label = label_ids.is_none();
+    let needs_check = !node.props.is_empty() || node.where_.is_some();
+
+    // Nothing left over: hand the shared loop a no-op residual it can
+    // monomorphize away rather than a closure to call per candidate.
+    if !residual_label && !needs_check {
+        return seek.scan_capped(graph, &binds, cap, || graph.vertex_indices().collect());
+    }
+
+    let mut b = super::Binding::with_len(scope_len.max(1));
+
+    seek.scan_with(
+        graph,
+        &binds,
+        cap,
+        || graph.vertex_indices().collect(),
+        |vi| {
+            if residual_label && !super::matches_label(graph, ctx, vi, node.label.as_ref()) {
+                return false;
+            }
+
+            if !needs_check {
+                return true;
+            }
+
+            if let Some(slot) = node.var_slot {
+                b.set(slot, super::Val::Node(vi));
+            }
+
+            super::satisfies(
+                graph,
+                ctx,
+                &super::Val::Node(vi),
+                &node.props,
+                node.where_.as_ref(),
+                &b,
+            )
+        },
+    )
+}
