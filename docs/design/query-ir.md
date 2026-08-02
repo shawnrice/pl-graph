@@ -342,6 +342,25 @@ Gremlin's `hasLabel` matches the FIRST label only, so a bucket count matches a
 win in that list was not a fast path at all — `hasLabel` was allocating an
 `Arc<str>` per element to compare two integers (fixed, −17%).
 
+## The write path is already shared
+
+Audited because "one way of querying OR MUTATING" is the goal and mutation had
+never been checked. It turns out to need nothing:
+
+- Both engines call the same primitives — `Graph::add_vertex`, `add_edge`,
+  `set_prop`, `remove_vertex`. There is one write API and always was.
+- Name validation AGREES. `validate_label` / `validate_prop_key` reject the same
+  inputs from either side (empty label, `::` in a label, empty property key),
+  and both accept `::` INSIDE a property key. Gremlin checks at the step, GQL at
+  commit via the `names_checked` watermark — two mechanisms, same verdict.
+- A property set to `null` is a PRESENT null in both, per the null-first-class
+  policy.
+
+The one difference is deliberate: `DELETE` on a vertex that still has edges is
+`InvalidGraphOp` in GQL — ISO wants `DETACH DELETE` — while TinkerPop's `drop()`
+cascades to the incident edges. Same class as the label rules and the self-loop
+rule: a language contract, carried as behaviour rather than reconciled.
+
 ## Not on the table
 
 Unifying the two surface languages. Users pick GQL or Gremlin, and the parallel
