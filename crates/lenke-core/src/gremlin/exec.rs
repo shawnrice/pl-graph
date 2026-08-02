@@ -2098,11 +2098,47 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         Step::Values(keys) => {
             let mut next = Vec::new();
 
+            // One key is the common shape, and `value`/`is_present` hash the key
+            // name on EVERY call — 400k dictionary lookups to read one property
+            // off a 200k stream. `value_id`/`is_present_id` are the same reads
+            // against an already-resolved column, so resolve it once here.
+            if let [only] = keys.as_slice() {
+                let vk = graph.props.keys.get(only);
+                let ek = graph.edge_props.keys.get(only);
+
+                for t in &stream {
+                    match (&t.val, vk, ek) {
+                        (GVal::Node(i), Some(k), _) => {
+                            let i = *i as usize;
+
+                            if graph.props.is_present_id(i, k) {
+                                let v = graph.props.value_id(i, k, &graph.strs);
+
+                                next.push(t.step(value_to_gval(v)));
+                            }
+                        }
+                        (GVal::Edge(e), _, Some(k)) => {
+                            let e = *e as usize;
+
+                            if graph.edge_props.is_present_id(e, k) {
+                                let v = graph.edge_props.value_id(e, k, &graph.strs);
+
+                                next.push(t.step(value_to_gval(v)));
+                            }
+                        }
+                        // A key the store never saw, or a non-element value:
+                        // nothing to read.
+                        _ => {}
+                    }
+                }
+
+                return next;
+            }
+
             for t in &stream {
-                // `values('name')` used to CLONE the key list per traverser — on a
-                // 200k-element stream that is 200k `Vec<String>` allocations to
-                // read a name the step already has. Only the no-argument form
-                // needs a per-element list, because the keys differ per element.
+                // `values()` with no argument needs a per-element key list,
+                // because the keys differ per element. It used to CLONE the
+                // argument list per traverser even when there was one.
                 if keys.is_empty() {
                     for k in present_keys(graph, &t.val) {
                         // Gate on PRESENCE, not value != Null: a present null
