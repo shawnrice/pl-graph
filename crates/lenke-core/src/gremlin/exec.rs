@@ -454,6 +454,34 @@ fn lower_hops<'a>(graph: &Graph, mut rest: &'a [Step]) -> (Vec<Hop>, &'a [Step])
     let mut hops = Vec::new();
 
     loop {
+        // `repeat(<hops>).times(n)` is those hops n times over. Only the plain
+        // counted form: `until` and `emit` decide PER TRAVERSER whether to stop
+        // or yield, which is a predicate over the stream rather than a fixed
+        // shape, and an unbounded `repeat` has no length to unroll.
+        if let [Step::Repeat {
+            body,
+            times: Some(n),
+            until: None,
+            emit: None,
+            ..
+        }, tail @ ..] = rest
+        {
+            let (inner, leftover) = lower_hops(graph, &body.steps);
+
+            // The body must be hops and NOTHING else — a filter or a projection
+            // inside it changes what each repetition yields.
+            if leftover.is_empty() && !inner.is_empty() {
+                for _ in 0..*n {
+                    hops.extend(inner.iter().cloned());
+                }
+
+                rest = tail;
+                continue;
+            }
+
+            break;
+        }
+
         let (dir, labels, tail) = match rest {
             [Step::Out(l), t @ ..] => (crate::seek::Dir::Out, l, t),
             [Step::In(l), t @ ..] => (crate::seek::Dir::In, l, t),

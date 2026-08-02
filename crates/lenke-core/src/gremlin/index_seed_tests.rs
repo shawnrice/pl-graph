@@ -6,7 +6,7 @@
 //! `#[ignore]`d timing test at the bottom is what catches a spelling that is
 //! merely *correct*, having quietly fallen back to a scan.
 
-use super::{g, GVal, P};
+use super::{g, GVal, __, P};
 use crate::graph::Graph;
 use crate::ndjson;
 
@@ -1089,4 +1089,65 @@ fn both_e_then_other_v_is_not_folded() {
     let direct = ids(&mut graph, g().v_ids(&[]).has_label(&["P"]).both(&["R"]));
 
     assert_eq!(via_edges, direct);
+}
+
+#[test]
+fn a_counted_repeat_of_hops_agrees_with_the_walk() {
+    let mut graph = seeded();
+
+    for (t, label) in [
+        (
+            g().v_ids(&[])
+                .has_label(&["P"])
+                .repeat(__().out(&["R"]))
+                .times(1),
+            "times(1)",
+        ),
+        (
+            g().v_ids(&[])
+                .has_label(&["P"])
+                .repeat(__().out(&["R"]))
+                .times(2),
+            "times(2)",
+        ),
+        (
+            g().v_ids(&[])
+                .has_label(&["P"])
+                .repeat(__().both(&[]))
+                .times(2),
+            "both twice",
+        ),
+    ] {
+        // `repeat(<hops>).times(n)` unrolls to those hops n times; the counted
+        // form must not diverge from actually walking them.
+        let walked = ids(&mut graph, t.clone()).len() as f64;
+
+        assert_eq!(count_of(&mut graph, t.count()), walked, "{label}");
+    }
+}
+
+#[test]
+fn a_repeat_with_until_or_emit_is_not_unrolled() {
+    let mut graph = seeded();
+
+    // `until` and `emit` decide per traverser whether to stop or yield, so the
+    // body is not a fixed number of hops. These must keep the stream path.
+    let with_until = g()
+        .v_ids(&[])
+        .has_label(&["P"])
+        .repeat(__().out(&["R"]))
+        .until(__().has_label(&["Q"]))
+        .count()
+        .run(&mut graph);
+    let with_emit = g()
+        .v_ids(&[])
+        .has_label(&["P"])
+        .repeat(__().out(&["R"]))
+        .times(2)
+        .emit(__().has_label(&["Q"]))
+        .count()
+        .run(&mut graph);
+
+    assert_eq!(with_until.len(), 1);
+    assert_eq!(with_emit.len(), 1);
 }

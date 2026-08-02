@@ -442,7 +442,20 @@ pub(super) fn build_scan(
 ) -> Option<ScanCols> {
     // A path selector (`ANY SHORTEST`) or a bound path variable is handled only by
     // the scalar driver — only it builds the Path value.
-    if path.selector != PathSelector::Walk || path.path_var_slot.is_some() {
+    // A path SELECTOR (`ANY SHORTEST`) picks which of many walks to keep, which
+    // is the scalar driver's job. A bound path VARIABLE is not — the walker can
+    // hand back each walk's `(vertices, edges)`, and `ScanCols` already carries
+    // `Val` columns beside the id ones, so the Path value rides along.
+    if path.selector != PathSelector::Walk {
+        return None;
+    }
+
+    if path.path_var_slot.is_some()
+        && !(path.segments.len() == 1
+            && path.segments[0].rel.quantifier.is_some()
+            && path.segments[0].unit.is_none()
+            && path.segments[0].rel.var_slot.is_none())
+    {
         return None;
     }
     // Fast path: an isolated node is a tight scan. An index hint (inline `{k:v}`
@@ -592,6 +605,8 @@ pub(super) fn expand_scan(
     // constraints, supplied as a `RowFilter`.
     let mut frontier = crate::seek::Frontier::seed(endpoint, path.start.var_slot, scope_len.max(1));
     let nseg = path.segments.len();
+    // A bound path variable is a `Val` column, not an id column.
+    let mut path_col: Option<(usize, Vec<Val>)> = None;
 
     for (si, seg) in path.segments.iter().enumerate() {
         let rel = &seg.rel;
@@ -636,13 +651,17 @@ pub(super) fn expand_scan(
         // the zero-length case are subtle enough that a second implementation
         // diverged immediately when tried.
         if let Some(q) = rel.quantifier {
+            let path_slot = path.path_var_slot;
             let spec = crate::gql::eval::pathfind::WalkSpec {
                 q,
                 mode: path.mode,
-                want_path: false,
+                // Rebuilding each trail is O(depth), so only ask for it when a
+                // path variable will actually hold the result.
+                want_path: path_slot.is_some(),
             };
             let mut ends: Vec<u32> = Vec::new();
             let mut src: Vec<usize> = Vec::new();
+            let mut paths: Vec<Val> = Vec::new();
             let mut wb = Binding::with_len(scope_len.max(1));
             let node_check = !node.props.is_empty() || node.where_.is_some();
 
@@ -679,6 +698,10 @@ pub(super) fn expand_scan(
                             }
                         }
 
+                        if path_slot.is_some() {
+                            paths.push(Val::path(_v.to_vec(), _e.to_vec()));
+                        }
+
                         ends.push(end);
                         src.push(i);
                         true
@@ -692,6 +715,11 @@ pub(super) fn expand_scan(
             }
 
             frontier.replicate(&src, &ends, node.var_slot);
+
+            if let Some(slot) = path_slot {
+                path_col = Some((slot, std::mem::take(&mut paths)));
+            }
+
             continue;
         }
 
@@ -725,6 +753,10 @@ pub(super) fn expand_scan(
         if taken.insert(s) {
             sc.slots[s] = Some((e, frontier.take_column(s).unwrap_or_default()));
         }
+    }
+
+    if let Some((slot, vals)) = path_col {
+        sc.vals[slot] = Some(vals);
     }
 
     Some(sc)
