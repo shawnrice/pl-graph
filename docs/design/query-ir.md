@@ -378,11 +378,35 @@ start is bound, instead of by where the user typed it. Doing that in the shared
 IR is the point of the exercise — it is one optimization that both languages
 would then be on the correct side of.
 
-**What gates it:** reordering the join changes the ROW ORDER of a multi-pattern
-`MATCH` with no `ORDER BY`. That order is documented as unspecified and the
-differential fuzzers compare unordered results as multisets, so it is permitted —
-but it is an observable change and in-repo tests that pin row order will need
-rewriting. That is a decision to take deliberately, not a side effect to slip in.
+**Fixed**, in both engines (`pattern_rank`/`pick_pattern` in
+`gql/eval/pathfind.rs`, `patternRank`/`pickPattern` in
+`gql/src/executor/clauses.ts`). Each pattern is ranked by what it costs to START:
+
+```text
+  0   a variable is already bound   — continues a binding, no fresh scan
+  1   start node has a label or inline props   — a restricted scan
+  2   otherwise                     — every vertex
+```
+
+Ties keep the WRITTEN order, which is what made this safe: the reorder only fires
+where a later pattern is strictly cheaper to start, and not one of the 1680 Rust
+or 481 TS tests changed its rows. All four byte-identity fuzzers pass. The row
+order of a multi-pattern `MATCH` without `ORDER BY` is unspecified anyway, but in
+practice nothing moved.
+
+After, native: both spellings 0.001 ms at every size — 121,336x becomes 1.01x.
+And the pure-TS engine, which had the same bug and where optimization wins
+usually do NOT reach:
+
+```text
+  A-nodes   anchor FIRST   anchor LAST (before)   after
+    3,000       0.045 ms              7.387 ms   0.060 ms
+   30,000       0.021 ms             76.893 ms   0.039 ms
+  100,000       0.019 ms            270.223 ms   0.035 ms
+```
+
+The two rank functions must agree or the engines emit rows in different orders,
+so they are deliberate mirrors and each says so at its definition.
 
 ## How much is left, measured
 
