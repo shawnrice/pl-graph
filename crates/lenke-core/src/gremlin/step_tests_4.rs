@@ -407,7 +407,7 @@ fn p4_project_with_fold_subtraversal() {
     assert_eq!(map_get(m, "name"), Some(&GVal::Str("marko".into())));
     assert_eq!(
         map_get(m, "friendsNames"),
-        Some(&GVal::List(vec![
+        Some(&GVal::list(vec![
             GVal::Str("vadas".into()),
             GVal::Str("josh".into())
         ]))
@@ -667,7 +667,7 @@ fn p4_simplepath_path_acyclic() {
     assert_eq!(r.len(), 4);
     for p in &r {
         let ids: Vec<GVal> = match p {
-            GVal::List(items) => items.clone(),
+            GVal::List(items) => items.to_vec(),
             _ => panic!(),
         };
         // Each path begins at v[1] and has 3 distinct vertices.
@@ -692,8 +692,8 @@ fn p4_index_software_names() {
     assert_eq!(
         r,
         vec![
-            GVal::List(vec![GVal::Str("lop".into()), GVal::Num(0.0)]),
-            GVal::List(vec![GVal::Str("ripple".into()), GVal::Num(1.0)]),
+            GVal::list(vec![GVal::Str("lop".into()), GVal::Num(0.0)]),
+            GVal::list(vec![GVal::Str("ripple".into()), GVal::Num(1.0)]),
         ]
     );
 }
@@ -704,10 +704,10 @@ fn p4_index_person_names() {
     assert_eq!(
         r,
         vec![
-            GVal::List(vec![GVal::Str("marko".into()), GVal::Num(0.0)]),
-            GVal::List(vec![GVal::Str("vadas".into()), GVal::Num(1.0)]),
-            GVal::List(vec![GVal::Str("josh".into()), GVal::Num(2.0)]),
-            GVal::List(vec![GVal::Str("peter".into()), GVal::Num(3.0)]),
+            GVal::list(vec![GVal::Str("marko".into()), GVal::Num(0.0)]),
+            GVal::list(vec![GVal::Str("vadas".into()), GVal::Num(1.0)]),
+            GVal::list(vec![GVal::Str("josh".into()), GVal::Num(2.0)]),
+            GVal::list(vec![GVal::Str("peter".into()), GVal::Num(3.0)]),
         ]
     );
 }

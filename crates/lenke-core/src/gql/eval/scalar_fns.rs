@@ -272,7 +272,7 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
                     out.push(Val::Node(v));
                 }
 
-                Val::List(out)
+                Val::list(out)
             }
             _ => Val::Null,
         },
@@ -322,7 +322,7 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
                     .map(|u| vstr(String::from_utf16_lossy(&[u])))
                     .collect(),
             ),
-            Some(v) if !is_nullish(v) => Val::List(vec![v.clone()]),
+            Some(v) if !is_nullish(v) => Val::list(vec![v.clone()]),
             _ => Val::Null,
         },
         // --- string predicates / measurement ---
@@ -384,7 +384,7 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
                 } else {
                     s.split(delim.as_str()).map(vstr).collect()
                 };
-                Val::List(parts)
+                Val::list(parts)
             }
             _ => Val::Null,
         },
@@ -420,9 +420,9 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
             // The element may be null (a first-class value); only a null LIST is
             // null-in → null-out.
             Some(Val::List(items)) => {
-                let mut v = items.clone();
+                let mut v = items.to_vec();
                 v.push(b.cloned().unwrap_or(Val::Null));
-                Val::List(v)
+                Val::list(v)
             }
             _ => Val::Null,
         },
@@ -433,31 +433,31 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
                 for v in x.iter().chain(y.iter()) {
                     push_unique(&mut out, v);
                 }
-                Val::List(out)
+                Val::list(out)
             }
             _ => Val::Null,
         },
         Intersection => match (a, b) {
             (Some(Val::List(x)), Some(Val::List(y))) => {
                 let mut out = Vec::new();
-                for v in x {
+                for v in x.iter() {
                     if y.iter().any(|w| val_eq(w, v)) {
                         push_unique(&mut out, v);
                     }
                 }
-                Val::List(out)
+                Val::list(out)
             }
             _ => Val::Null,
         },
         Difference => match (a, b) {
             (Some(Val::List(x)), Some(Val::List(y))) => {
                 let mut out = Vec::new();
-                for v in x {
+                for v in x.iter() {
                     if !y.iter().any(|w| val_eq(w, v)) {
                         push_unique(&mut out, v);
                     }
                 }
-                Val::List(out)
+                Val::list(out)
             }
             _ => Val::Null,
         },
@@ -480,9 +480,9 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
                     Some(Val::Str(s)) if s.eq_ignore_ascii_case("last") => Some(false),
                     _ => None,
                 };
-                let mut sorted = items.clone();
+                let mut sorted = items.to_vec();
                 sorted.sort_by(|x, y| compare_sort(x, y, descending, nulls_first));
-                Val::List(sorted)
+                Val::list(sorted)
             }
             _ => Val::Null,
         },
@@ -511,7 +511,7 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
                     let count = ((e - s) / st).floor() + 1.0;
                     if count.is_nan() || count <= 0.0 {
                         // A backwards span (or a NaN bound) yields no elements.
-                        Val::List(Vec::new())
+                        Val::list(Vec::new())
                     } else if count > graph.limits().range as f64 {
                         ctx.set_fault(FAULT_RANGE_BUDGET);
                         Val::Null
@@ -523,7 +523,7 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
                             out.push(Val::Num(i));
                             i += st;
                         }
-                        Val::List(out)
+                        Val::list(out)
                     }
                 }
             }

@@ -241,7 +241,7 @@ pub(super) fn run_linear_from(
                         eval(&env, list)
                     };
                     let elems = match listv {
-                        Val::List(items) => items,
+                        Val::List(items) => items.to_vec(),
                         Val::Null => Vec::new(),
                         scalar => vec![scalar],
                     };

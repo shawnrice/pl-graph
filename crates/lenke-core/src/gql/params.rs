@@ -191,7 +191,7 @@ impl Parser<'_> {
         if self.peek() == Some(b']') {
             self.pos += 1;
 
-            return Ok(Val::List(items));
+            return Ok(Val::list(items));
         }
 
         loop {
@@ -204,7 +204,7 @@ impl Parser<'_> {
                 Some(b']') => {
                     self.pos += 1;
 
-                    return Ok(Val::List(items));
+                    return Ok(Val::list(items));
                 }
                 _ => return Err(self.err("expected `,` or `]` in param list")),
             }

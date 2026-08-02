@@ -97,7 +97,7 @@ fn map_get_gval<'a>(m: &'a [(GVal, GVal)], key: &GVal) -> Option<&'a GVal> {
     m.iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
 
-fn list_of(g: &GVal) -> &Vec<GVal> {
+fn list_of(g: &GVal) -> &[GVal] {
     match g {
         GVal::List(items) => items,
         _ => panic!("expected list, got {g:?}"),
@@ -642,19 +642,19 @@ fn p6_group_by_self_ages() {
     let m = as_map(&out[0]);
     assert_eq!(
         map_get_gval(m, &GVal::Num(29.0)),
-        Some(&GVal::List(vec![GVal::Num(29.0)]))
+        Some(&GVal::list(vec![GVal::Num(29.0)]))
     );
     assert_eq!(
         map_get_gval(m, &GVal::Num(27.0)),
-        Some(&GVal::List(vec![GVal::Num(27.0)]))
+        Some(&GVal::list(vec![GVal::Num(27.0)]))
     );
     assert_eq!(
         map_get_gval(m, &GVal::Num(32.0)),
-        Some(&GVal::List(vec![GVal::Num(32.0)]))
+        Some(&GVal::list(vec![GVal::Num(32.0)]))
     );
     assert_eq!(
         map_get_gval(m, &GVal::Num(35.0)),
-        Some(&GVal::List(vec![GVal::Num(35.0)]))
+        Some(&GVal::list(vec![GVal::Num(35.0)]))
     );
 }
 
@@ -664,19 +664,19 @@ fn p6_group_name_keyed_by_age() {
     let m = as_map(&out[0]);
     assert_eq!(
         map_get_gval(m, &GVal::Num(29.0)),
-        Some(&GVal::List(vec![GVal::Str("marko".into())]))
+        Some(&GVal::list(vec![GVal::Str("marko".into())]))
     );
     assert_eq!(
         map_get_gval(m, &GVal::Num(27.0)),
-        Some(&GVal::List(vec![GVal::Str("vadas".into())]))
+        Some(&GVal::list(vec![GVal::Str("vadas".into())]))
     );
     assert_eq!(
         map_get_gval(m, &GVal::Num(32.0)),
-        Some(&GVal::List(vec![GVal::Str("josh".into())]))
+        Some(&GVal::list(vec![GVal::Str("josh".into())]))
     );
     assert_eq!(
         map_get_gval(m, &GVal::Num(35.0)),
-        Some(&GVal::List(vec![GVal::Str("peter".into())]))
+        Some(&GVal::list(vec![GVal::Str("peter".into())]))
     );
 }
 
@@ -687,14 +687,14 @@ fn p6_group_by_lang_missing_key_bucket() {
     let m = as_map(&out[0]);
     assert_eq!(
         map_get_gval(m, &GVal::Str("java".into())),
-        Some(&GVal::List(vec![
+        Some(&GVal::list(vec![
             GVal::Str("lop".into()),
             GVal::Str("ripple".into())
         ]))
     );
     assert_eq!(
         map_get_gval(m, &GVal::Null),
-        Some(&GVal::List(vec![
+        Some(&GVal::list(vec![
             GVal::Str("marko".into()),
             GVal::Str("vadas".into()),
             GVal::Str("josh".into()),
@@ -751,19 +751,19 @@ fn p6_group_by_age_valued_by_name() {
     let m = as_map(&out[0]);
     assert_eq!(
         map_get_gval(m, &GVal::Num(29.0)),
-        Some(&GVal::List(vec![GVal::Str("marko".into())]))
+        Some(&GVal::list(vec![GVal::Str("marko".into())]))
     );
     assert_eq!(
         map_get_gval(m, &GVal::Num(27.0)),
-        Some(&GVal::List(vec![GVal::Str("vadas".into())]))
+        Some(&GVal::list(vec![GVal::Str("vadas".into())]))
     );
     assert_eq!(
         map_get_gval(m, &GVal::Num(32.0)),
-        Some(&GVal::List(vec![GVal::Str("josh".into())]))
+        Some(&GVal::list(vec![GVal::Str("josh".into())]))
     );
     assert_eq!(
         map_get_gval(m, &GVal::Num(35.0)),
-        Some(&GVal::List(vec![GVal::Str("peter".into())]))
+        Some(&GVal::list(vec![GVal::Str("peter".into())]))
     );
 }
 
@@ -774,19 +774,19 @@ fn p6_group_by_name_valued_by_age() {
     let m = as_map(&out[0]);
     assert_eq!(
         map_get_gval(m, &GVal::Str("marko".into())),
-        Some(&GVal::List(vec![GVal::Num(29.0)]))
+        Some(&GVal::list(vec![GVal::Num(29.0)]))
     );
     assert_eq!(
         map_get_gval(m, &GVal::Str("vadas".into())),
-        Some(&GVal::List(vec![GVal::Num(27.0)]))
+        Some(&GVal::list(vec![GVal::Num(27.0)]))
     );
     assert_eq!(
         map_get_gval(m, &GVal::Str("josh".into())),
-        Some(&GVal::List(vec![GVal::Num(32.0)]))
+        Some(&GVal::list(vec![GVal::Num(32.0)]))
     );
     assert_eq!(
         map_get_gval(m, &GVal::Str("peter".into())),
-        Some(&GVal::List(vec![GVal::Num(35.0)]))
+        Some(&GVal::list(vec![GVal::Num(35.0)]))
     );
     // lop/ripple keys exist (value-by age is Null in our engine, not dropped).
     assert!(map_get_gval(m, &GVal::Str("lop".into())).is_some());

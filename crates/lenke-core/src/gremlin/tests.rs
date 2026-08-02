@@ -59,7 +59,7 @@ fn map_sorted(g: &GVal) -> Vec<(String, GVal)> {
 
 fn list_names(g: &GVal) -> Vec<String> {
     match g {
-        GVal::List(items) => names(items.clone()),
+        GVal::List(items) => names(items.to_vec()),
         _ => panic!("expected list, got {g:?}"),
     }
 }
@@ -1234,7 +1234,7 @@ fn cf_where_pred_and_order_local_column() {
     );
     match &by_keys[..] {
         // ripple's count (1) first, then lop's count (3).
-        [GVal::List(items)] => assert_eq!(items, &vec![GVal::Num(1.0), GVal::Num(3.0)]),
+        [GVal::List(items)] => assert_eq!(items.as_ref(), [GVal::Num(1.0), GVal::Num(3.0)]),
         other => panic!("expected one value list, got {other:?}"),
     }
 }
@@ -2245,12 +2245,12 @@ fn results_json_escaping_and_structure() {
 
     // Structure: empty containers, nesting, bool, null. (String-valued to keep
     // this test free of the number formatting that the refactor will change.)
-    assert_eq!(results_json(vec![GVal::List(vec![])]), "[[]]");
+    assert_eq!(results_json(vec![GVal::list(vec![])]), "[[]]");
     assert_eq!(results_json(vec![GVal::Map(vec![])]), "[{}]");
     assert_eq!(
-        results_json(vec![GVal::List(vec![
+        results_json(vec![GVal::list(vec![
             GVal::from("a"),
-            GVal::List(vec![GVal::from("z")]),
+            GVal::list(vec![GVal::from("z")]),
         ])]),
         r#"[["a",["z"]]]"#
     );

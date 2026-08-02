@@ -601,7 +601,7 @@ fn m_param_as_list_for_in() {
     let mut params = Params::new();
     params.insert(
         "names".to_string(),
-        Val::List(vec![Val::Str("marko".into()), Val::Str("josh".into())]),
+        Val::list(vec![Val::Str("marko".into()), Val::Str("josh".into())]),
     );
     let r = qp(
         &mut g,

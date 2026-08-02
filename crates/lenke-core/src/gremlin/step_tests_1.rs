@@ -206,13 +206,13 @@ fn p1_limit_equiv_range() {
 fn p1_limit_scope_local_slices() {
     // values('age').fold().limit(Scope.local, 2) → first two ages of the list.
     let r = qs("g.V().values('age').fold().limit(Scope.local, 2)");
-    assert_eq!(r, vec![GVal::List(vec![GVal::Num(29.0), GVal::Num(27.0)])]);
+    assert_eq!(r, vec![GVal::list(vec![GVal::Num(29.0), GVal::Num(27.0)])]);
 }
 
 #[test]
 fn p1_range_scope_local_slices() {
     let r = qs("g.V().values('age').fold().range(Scope.local, 1, 3)");
-    assert_eq!(r, vec![GVal::List(vec![GVal::Num(27.0), GVal::Num(32.0)])]);
+    assert_eq!(r, vec![GVal::list(vec![GVal::Num(27.0), GVal::Num(32.0)])]);
 }
 
 #[test]
@@ -226,7 +226,7 @@ fn p1_range_scope_local_open_ended() {
         .fold()
         .range_local(2, usize::MAX)
         .run(&mut g);
-    assert_eq!(r, vec![GVal::List(vec![GVal::Num(32.0), GVal::Num(35.0)])]);
+    assert_eq!(r, vec![GVal::list(vec![GVal::Num(32.0), GVal::Num(35.0)])]);
 }
 
 #[test]
@@ -248,11 +248,11 @@ fn p1_scope_local_on_min_max_mean_skip_tail() {
     );
     assert_eq!(
         qs("g.V().values('age').fold().skip(Scope.local, 2)"),
-        vec![GVal::List(vec![GVal::Num(32.0), GVal::Num(35.0)])]
+        vec![GVal::list(vec![GVal::Num(32.0), GVal::Num(35.0)])]
     );
     assert_eq!(
         qs("g.V().values('age').fold().tail(Scope.local, 2)"),
-        vec![GVal::List(vec![GVal::Num(32.0), GVal::Num(35.0)])]
+        vec![GVal::list(vec![GVal::Num(32.0), GVal::Num(35.0)])]
     );
 }
 
@@ -357,7 +357,7 @@ fn p1_side_effect_empty_subplan_passthrough() {
 fn p1_side_effect_aggregate_then_cap() {
     let r = qs("g.V().hasLabel('PERSON').sideEffect(aggregate('persons')).cap('persons')");
     let bag = match &r[0] {
-        GVal::List(items) => sorted(items.clone()),
+        GVal::List(items) => sorted(items.to_vec()),
         other => panic!("expected list, got {other:?}"),
     };
     // cap returns the vertices; project to ids via sorting their id strings.
@@ -385,7 +385,7 @@ fn p1_fold_basic() {
     let r = qs("g.V('1').out('KNOWS').values('name').fold()");
     assert_eq!(
         r,
-        vec![GVal::List(vec![
+        vec![GVal::list(vec![
             GVal::Str("vadas".into()),
             GVal::Str("josh".into())
         ])]

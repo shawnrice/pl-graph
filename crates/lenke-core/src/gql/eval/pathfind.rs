@@ -172,7 +172,7 @@ pub(super) fn bind_group_vars_flat(
     let mut bind = |binding: &mut Binding, slot: Option<usize>, list: Vec<Val>| {
         if let Some(s) = slot {
             restores.push((s, binding.get(s).cloned()));
-            binding.set(s, Val::List(list));
+            binding.set(s, Val::list(list));
         }
     };
     for p in 0..=k {

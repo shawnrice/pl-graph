@@ -281,7 +281,7 @@ fn p3_none_pred_empty_fold_passes() {
     // Vacuous truth over an empty fold.
     let r = qs("g.V().hasLabel('NOSUCH').values('age').fold().none(lt(0))");
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0], GVal::List(vec![]));
+    assert_eq!(r[0], GVal::list(vec![]));
 }
 
 // SKIPPED (none.test.ts): `toArray`/`toSet` runners and the `Scope`/
@@ -699,13 +699,13 @@ fn p3_unfold_fold_then_inject_setup() {
     let mut t = super::parse("g.V('1').out().fold()").unwrap();
     t.steps.push(Step::Inject(vec![
         GVal::Str("gremlin".into()),
-        GVal::List(vec![GVal::Num(1.23), GVal::Num(2.34)]),
+        GVal::list(vec![GVal::Num(1.23), GVal::Num(2.34)]),
     ]));
     let r = t.run(&mut g);
     // ['gremlin', [1.23,2.34], List[vadas, josh, lop]] — out() KNOWS-first.
     assert_eq!(r.len(), 3);
     assert_eq!(r[0], GVal::Str("gremlin".into()));
-    assert_eq!(r[1], GVal::List(vec![GVal::Num(1.23), GVal::Num(2.34)]));
+    assert_eq!(r[1], GVal::list(vec![GVal::Num(1.23), GVal::Num(2.34)]));
     match &r[2] {
         GVal::List(items) => {
             let ids: Vec<String> = items
@@ -728,7 +728,7 @@ fn p3_unfold_unfolds_one_level() {
     let mut t = super::parse("g.V('1').out().fold()").unwrap();
     t.steps.push(Step::Inject(vec![
         GVal::Str("gremlin".into()),
-        GVal::List(vec![GVal::Num(1.23), GVal::Num(2.34)]),
+        GVal::list(vec![GVal::Num(1.23), GVal::Num(2.34)]),
     ]));
     t.steps.push(Step::Unfold);
     let r = t.run(&mut g);
@@ -750,13 +750,13 @@ fn p3_unfold_unfolds_one_level() {
 #[test]
 fn p3_unfold_is_not_deep() {
     // inject(1, [2,3,[4,5,[6]]]) — without unfold: [1, [..]]; with: [1,2,3,[..]].
-    let nested = GVal::List(vec![
+    let nested = GVal::list(vec![
         GVal::Num(2.0),
         GVal::Num(3.0),
-        GVal::List(vec![
+        GVal::list(vec![
             GVal::Num(4.0),
             GVal::Num(5.0),
-            GVal::List(vec![GVal::Num(6.0)]),
+            GVal::list(vec![GVal::Num(6.0)]),
         ]),
     ]);
     let mut g = modern();
@@ -771,10 +771,10 @@ fn p3_unfold_is_not_deep() {
         .push(Step::Inject(vec![GVal::Num(1.0), nested.clone()]));
     t2.steps.push(Step::Unfold);
     let r2 = t2.run(&mut g);
-    let inner = GVal::List(vec![
+    let inner = GVal::list(vec![
         GVal::Num(4.0),
         GVal::Num(5.0),
-        GVal::List(vec![GVal::Num(6.0)]),
+        GVal::list(vec![GVal::Num(6.0)]),
     ]);
     assert_eq!(
         r2,

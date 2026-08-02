@@ -263,7 +263,7 @@ fn p5_mean_local_of_folded_list() {
 #[test]
 fn p5_sum_local_empty_fold_yields_null() {
     // inject([]).sum(Scope.local) — empty local fold → null.
-    let r = inject_src(vec![GVal::List(vec![])]).sum_local();
+    let r = inject_src(vec![GVal::list(vec![])]).sum_local();
     assert_eq!(q(r), vec![GVal::Null]);
 }
 
@@ -434,14 +434,14 @@ fn p5_inject_as_source_in_order() {
 fn p5_inject_preserves_arrays_no_unfold() {
     // inject([1,2,3],[4,5]) — lists stay as single values.
     let r = inject_src(vec![
-        GVal::List(vec![GVal::Num(1.0), GVal::Num(2.0), GVal::Num(3.0)]),
-        GVal::List(vec![GVal::Num(4.0), GVal::Num(5.0)]),
+        GVal::list(vec![GVal::Num(1.0), GVal::Num(2.0), GVal::Num(3.0)]),
+        GVal::list(vec![GVal::Num(4.0), GVal::Num(5.0)]),
     ]);
     assert_eq!(
         q(r),
         vec![
-            GVal::List(vec![GVal::Num(1.0), GVal::Num(2.0), GVal::Num(3.0)]),
-            GVal::List(vec![GVal::Num(4.0), GVal::Num(5.0)]),
+            GVal::list(vec![GVal::Num(1.0), GVal::Num(2.0), GVal::Num(3.0)]),
+            GVal::list(vec![GVal::Num(4.0), GVal::Num(5.0)]),
         ]
     );
 }
@@ -506,7 +506,7 @@ fn p5_valuemap_on_edges() {
 // ===== propertyMap.test.ts =====
 
 fn one_list(v: GVal) -> GVal {
-    GVal::List(vec![v])
+    GVal::list(vec![v])
 }
 
 // SKIPPED: `propertyMap()` (no keys) — same key-ordering divergence as values():

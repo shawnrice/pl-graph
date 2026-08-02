@@ -795,7 +795,7 @@ fn val_eq(a: &Val, b: &Val) -> bool {
         (Val::Node(x), Val::Node(y)) => x == y,
         (Val::Edge(x), Val::Edge(y)) => x == y,
         (Val::List(x), Val::List(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| val_eq(p, q))
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| val_eq(p, q))
         }
         // Records are equal iff they have the same fields (keys are canonical, so
         // positional) with recursively-equal values. ISO records support `=`/`<>`.
@@ -957,7 +957,7 @@ fn compare_vals(ctx: &Ctx, op: CompareOp, lv: &Val, rv: &Val) -> Val {
 fn in_list(v: &Val, list: &Val) -> Truth {
     let Val::List(items) = list else { return None };
     let mut saw_unknown = false;
-    for e in items {
+    for e in items.iter() {
         if is_nullish(v) || is_nullish(e) {
             saw_unknown = true;
             continue;
@@ -1030,7 +1030,7 @@ fn val_key(v: &Val, out: &mut String) {
         }
         Val::List(items) => {
             out.push('[');
-            for it in items {
+            for it in items.iter() {
                 val_key(it, out);
                 out.push(',');
             }
@@ -2030,7 +2030,7 @@ fn run(env: &Env, prog: &Program) -> Val {
                 Op::MakeList(n) => {
                     let at = st.len() - n;
                     let items = st.split_off(at);
-                    st.push(Val::List(items));
+                    st.push(Val::list(items));
                 }
                 Op::Arith(op) => {
                     let bv = st.pop().unwrap();
@@ -2239,7 +2239,7 @@ fn eval_aggregate(
         }
         AggFn::Min => fold_extreme(values, Ordering::Less),
         AggFn::Max => fold_extreme(values, Ordering::Greater),
-        AggFn::CollectList => Val::List(values),
+        AggFn::CollectList => Val::list(values),
         AggFn::PercentileCont => percentile(&values, frac.unwrap_or(0.0), true),
         AggFn::PercentileDisc => percentile(&values, frac.unwrap_or(0.0), false),
         AggFn::StddevPop | AggFn::StddevSamp => {

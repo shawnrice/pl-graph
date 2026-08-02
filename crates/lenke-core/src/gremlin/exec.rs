@@ -158,7 +158,7 @@ impl Trav {
             _ if list.is_empty() => None,
             Pop::First => Some(list[0].clone()),
             Pop::Last => Some(list[list.len() - 1].clone()),
-            Pop::All => Some(GVal::List(list.clone())),
+            Pop::All => Some(GVal::list(list.clone())),
         }
     }
 }
@@ -738,7 +738,7 @@ fn column_terminal(
 
     match tail {
         [] => Some(out),
-        [Step::Fold] => Some(vec![GVal::List(out)]),
+        [Step::Fold] => Some(vec![GVal::list(out)]),
         #[allow(clippy::cast_precision_loss)]
         [Step::Count(Scope::Global)] => Some(vec![GVal::Num(out.len() as f64)]),
         _ => None,
@@ -751,7 +751,7 @@ fn column_terminal(
 fn empty_column_terminal(tail: &[Step]) -> Option<Vec<GVal>> {
     match tail {
         [] | [Step::Count(Scope::Local)] => Some(Vec::new()),
-        [Step::Fold] => Some(vec![GVal::List(Vec::new())]),
+        [Step::Fold] => Some(vec![GVal::list(Vec::new())]),
         [Step::Count(Scope::Global)] => Some(vec![GVal::Num(0.0)]),
         [Step::Sum(Scope::Global) | Step::Mean(Scope::Global)] => Some(vec![GVal::Null]),
         [Step::Min(Scope::Global) | Step::Max(Scope::Global)] => Some(vec![GVal::Null]),
@@ -1801,7 +1801,7 @@ fn subgraph_vertex(graph: &Graph, v: u32) -> GVal {
         .collect();
     GVal::Map(vec![
         (GVal::Str(Arc::from("id")), GVal::Str(graph.vid.arc(v))),
-        (GVal::Str(Arc::from("labels")), GVal::List(labels)),
+        (GVal::Str(Arc::from("labels")), GVal::list(labels)),
         (
             GVal::Str(Arc::from("properties")),
             element_props_map(graph, &gv),
@@ -2421,7 +2421,7 @@ fn group_value(graph: &mut Graph, ctx: &mut Ctx, by: &By, members: Vec<Trav>) ->
             if is_reducing(&plan.steps) {
                 outs.into_iter().next().unwrap_or(GVal::Null)
             } else {
-                GVal::List(outs)
+                GVal::list(outs)
             }
         }
         _ => GVal::List(
@@ -2436,7 +2436,7 @@ fn group_value(graph: &mut Graph, ctx: &mut Ctx, by: &By, members: Vec<Trav>) ->
 /// Elements of a value for `Scope::local` (non-string iterables; else singleton).
 fn local_elems(v: &GVal) -> Vec<GVal> {
     match v {
-        GVal::List(items) => items.clone(),
+        GVal::List(items) => items.to_vec(),
         other => vec![other.clone()],
     }
 }
@@ -2782,7 +2782,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             let entries = ks
                 .into_iter()
                 .filter(|k| prop_present(graph, &t.val, k))
-                .map(|k| (GVal::Str(Arc::from(k.as_str())), GVal::List(vec![prop(graph, &t.val, &k)])))
+                .map(|k| (GVal::Str(Arc::from(k.as_str())), GVal::list(vec![prop(graph, &t.val, &k)])))
                 .collect();
             vec![GVal::Map(entries)]
         }),
@@ -2844,7 +2844,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 } else {
                     t.path.iter().enumerate().map(|(i, v)| eval_by(graph, ctx, &bys[i % bys.len()], v)).collect()
                 };
-                t.with(GVal::List(projected))
+                t.with(GVal::list(projected))
             })
             .collect(),
         Step::Project(keys, bys) => stream
@@ -2880,7 +2880,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         Step::Tail(n, Scope::Local) => map_step(stream, |t| {
             let e = local_elems(&t.val);
             let start = e.len().saturating_sub(*n);
-            vec![GVal::List(e[start..].to_vec())]
+            vec![GVal::list(e[start..].to_vec())]
         }),
         Step::Sample(n) => apply_sample(*n, stream),
 
@@ -3183,7 +3183,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                     (GVal::Str(Arc::from("edges")), elist),
                 ]))]
             } else {
-                vec![Trav::root(GVal::List(ctx.side.get(key).cloned().unwrap_or_default()))]
+                vec![Trav::root(GVal::list(ctx.side.get(key).cloned().unwrap_or_default()))]
             }
         }
         Step::Barrier => stream,
@@ -3287,7 +3287,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             for t in &stream {
                 match &t.val {
                     GVal::List(items) => {
-                        for it in items {
+                        for it in items.iter() {
                             next.push(t.step(it.clone()));
                         }
                     }
@@ -3296,7 +3296,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             }
             next
         }
-        Step::Index => stream.iter().enumerate().map(|(i, t)| t.with(GVal::List(vec![t.val.clone(), GVal::Num(i as f64)]))).collect(),
+        Step::Index => stream.iter().enumerate().map(|(i, t)| t.with(GVal::list(vec![t.val.clone(), GVal::Num(i as f64)]))).collect(),
         Step::Loops => map_step(stream, |t| vec![GVal::Num(t.loops as f64)]),
         Step::Constant(v) => map_step(stream, |_t| vec![v.clone()]),
         Step::Math { expr, bys } => {
@@ -3892,7 +3892,7 @@ fn slice_local(v: &GVal, start: usize, end: usize) -> GVal {
     let e = local_elems(v);
     let s = start.min(e.len());
     let en = end.min(e.len());
-    GVal::List(if s < en {
+    GVal::list(if s < en {
         e[s..en].to_vec()
     } else {
         Vec::new()
@@ -4161,7 +4161,7 @@ mod dedup_key_tests {
         // NaN != NaN, so a NaN is never a duplicate → no key (pass-through).
         assert!(dedup_key(&GVal::Num(f64::NAN)).is_none());
         // a NaN nested in a list/map makes the whole key un-hashable too.
-        assert!(dedup_key(&GVal::List(vec![GVal::Num(1.0), GVal::Num(f64::NAN)])).is_none());
+        assert!(dedup_key(&GVal::list(vec![GVal::Num(1.0), GVal::Num(f64::NAN)])).is_none());
         assert!(dedup_key(&GVal::Map(vec![(
             GVal::Str(Arc::from("k")),
             GVal::Num(f64::NAN)
@@ -4188,8 +4188,8 @@ mod dedup_key_tests {
         assert_ne!(dedup_key(&GVal::Null), dedup_key(&GVal::Bool(false)));
         // nested structure keys element-wise (incl. the -0.0/+0.0 collapse).
         assert_eq!(
-            dedup_key(&GVal::List(vec![GVal::Num(-0.0), GVal::Node(1)])),
-            dedup_key(&GVal::List(vec![GVal::Num(0.0), GVal::Node(1)])),
+            dedup_key(&GVal::list(vec![GVal::Num(-0.0), GVal::Node(1)])),
+            dedup_key(&GVal::list(vec![GVal::Num(0.0), GVal::Node(1)])),
         );
     }
 }

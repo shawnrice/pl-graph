@@ -607,7 +607,7 @@ impl Agg {
                 }
             }
             AggFn::Min | AggFn::Max => self.extreme.unwrap_or(Val::Null),
-            AggFn::CollectList => Val::List(self.list),
+            AggFn::CollectList => Val::list(self.list),
             AggFn::PercentileCont => percentile(&self.list, self.frac, true),
             AggFn::PercentileDisc => percentile(&self.list, self.frac, false),
             AggFn::StddevPop => stddev_of(self.n, self.sum, self.sum_sq, false),

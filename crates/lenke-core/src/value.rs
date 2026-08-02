@@ -84,7 +84,11 @@ pub enum Value {
     /// A vertex handle by dense index. Gremlin spelled this `Vertex`.
     Node(u32),
     Edge(u32),
-    List(Vec<Self>),
+    /// `Arc`-ed, like [`Value::Record`] and for the same reason: a list is built
+    /// once and read many times, and the per-row `Binding` clone (GQL) and the
+    /// per-step `Trav::tags` clone (Gremlin) both used to DEEP-COPY it. Nothing
+    /// mutates a list through a pattern match, so there is no owner to lose.
+    List(Arc<[Self]>),
     /// ISO record — string keys, kept SORTED, `Arc`-boxed. GQL only.
     Record(Arc<[(Arc<str>, Self)]>),
     /// TinkerPop map — any-value keys, INSERTION ordered. Gremlin only.
@@ -159,6 +163,12 @@ impl Value {
                     .collect(),
             ),
         }
+    }
+
+    /// A list value. Takes the `Vec` callers naturally build and shares it.
+    #[must_use]
+    pub fn list(items: Vec<Self>) -> Self {
+        Self::List(items.into())
     }
 
     /// A path value, boxing the payload.

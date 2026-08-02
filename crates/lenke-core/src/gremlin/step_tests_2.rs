@@ -426,7 +426,7 @@ fn p2_cap_reads_bag() {
 #[test]
 fn p2_cap_empty_key() {
     let r = qs("g.V('1').cap('never-set')");
-    assert_eq!(r, vec![GVal::List(vec![])]);
+    assert_eq!(r, vec![GVal::list(vec![])]);
 }
 
 #[test]
