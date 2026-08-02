@@ -20,6 +20,7 @@ import type {
   CLinear,
   CMatch,
   CMerge,
+  CPath,
   CProp,
   CRemove,
   CSet,
@@ -525,10 +526,85 @@ export const runDelete = (
 // --- clause processing -------------------------------------------------------
 
 /**
+ * How much it costs to START this pattern, given what is already bound. Lower is
+ * better. Mirrors native `pattern_rank` in `gql/eval/pathfind.rs` exactly — the
+ * two must agree or the engines emit rows in different orders.
+ */
+const patternRank = (p: CPath, b: Binding): number => {
+  const bound = (v?: string) => v !== undefined && b.has(v);
+
+  if (
+    bound(p.start.variable) ||
+    p.segments.some((s) => bound(s.rel.variable) || bound(s.node.variable))
+  ) {
+    return 0; // continues an existing binding — no fresh scan at all
+  }
+
+  return p.start.label !== undefined || p.start.pred.props.length > 0 ? 1 : 2;
+};
+
+/** Position within `remaining` of the next pattern to extend into. */
+const pickPattern = (patterns: readonly CPath[], remaining: readonly number[], b: Binding) => {
+  let best = 0;
+  let bestRank = 3;
+
+  for (let i = 0; i < remaining.length; i++) {
+    const rank = patternRank(patterns[remaining[i]], b);
+
+    if (rank < bestRank) {
+      bestRank = rank;
+      best = i;
+    }
+
+    if (rank === 0) {
+      break; // can't do better than continuing an existing binding
+    }
+  }
+
+  return best;
+};
+
+/**
+ * Extend a binding through the remaining patterns, choosing at each step rather
+ * than following the order they were written.
+ *
+ * `remaining` is copied rather than mutated-and-restored: these are generators,
+ * so a shared mutable done-mask would be corrupted the moment a consumer
+ * interleaved two of them.
+ */
+const visitRemaining = function* (
+  graph: Graph,
+  patterns: readonly CPath[],
+  remaining: readonly number[],
+  binding: Binding,
+  params: Params,
+): Iterable<Binding> {
+  if (remaining.length === 0) {
+    yield binding;
+
+    return;
+  }
+
+  const pick = pickPattern(patterns, remaining, binding);
+  const rest = remaining.filter((_, i) => i !== pick);
+
+  for (const b of matchPattern(graph, patterns[remaining[pick]], binding, params)) {
+    yield* visitRemaining(graph, patterns, rest, b, params);
+  }
+};
+
+/**
  * Extend a binding through every pattern of a MATCH clause, then filter WHERE.
- * Fully lazy: each pattern is a `flatMap` over the prior stream, so a clause
- * that expands to millions of bindings never materializes them — they flow one
- * at a time to whatever consumes the result.
+ * Fully lazy: bindings flow one at a time to whatever consumes the result, so a
+ * clause that expands to millions of them never materializes them.
+ *
+ * Patterns are visited in the order [`pickPattern`] chooses. Running a pattern
+ * whose start is already bound before one that needs a fresh scan is what keeps
+ * two spellings of the same query from costing wildly different amounts — see
+ * `docs/design/query-ir.md`; the anchored and unanchored spellings measured
+ * 121,336x apart at 300k vertices before this existed. Ties keep the written
+ * order, so a query whose patterns are equally cheap to start emits rows exactly
+ * as it did before.
  */
 export const matchClauseBindings = (
   graph: Graph,
@@ -536,11 +612,18 @@ export const matchClauseBindings = (
   binding: Binding,
   params: Params,
 ): Iterable<Binding> => {
-  let stream: Iterable<Binding> = [binding];
-
-  for (const pattern of clause.patterns) {
-    stream = flatMap((b: Binding) => matchPattern(graph, pattern, b, params), stream);
-  }
+  // One pattern is the overwhelmingly common case and has nothing to choose
+  // between — keep it on the flat `flatMap` with no generator frame per row.
+  const stream: Iterable<Binding> =
+    clause.patterns.length === 1
+      ? flatMap((b: Binding) => matchPattern(graph, clause.patterns[0], b, params), [binding])
+      : visitRemaining(
+          graph,
+          clause.patterns,
+          clause.patterns.map((_, i) => i),
+          binding,
+          params,
+        );
 
   return clause.where === undefined
     ? stream

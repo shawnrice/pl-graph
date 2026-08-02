@@ -24,7 +24,7 @@ pub(super) fn any_match(
     let mut found = false;
     let mut work = binding.clone();
     work.resize(sub_len);
-    visit_patterns(graph, ctx, patterns, 0, where_, &mut work, &mut |_| {
+    visit_patterns(graph, ctx, patterns, where_, &mut work, &mut |_| {
         found = true;
         false
     });
@@ -98,7 +98,7 @@ pub(super) fn count_matches(
     let mut count = 0u64;
     let mut work = binding.clone();
     work.resize(sub_len);
-    visit_patterns(graph, ctx, patterns, 0, where_, &mut work, &mut |_| {
+    visit_patterns(graph, ctx, patterns, where_, &mut work, &mut |_| {
         count += 1;
         true
     });
@@ -140,7 +140,7 @@ pub(super) fn value_subquery(
     let mut work = binding.clone();
     work.resize(sub_len);
     let mut matches: Vec<Binding> = Vec::new();
-    visit_patterns(graph, ctx, patterns, 0, where_, &mut work, &mut |b| {
+    visit_patterns(graph, ctx, patterns, where_, &mut work, &mut |b| {
         matches.push(b.clone());
         // A non-aggregate scalar subquery is over the moment a second row appears
         // (it's already a cardinality error); an aggregate needs the full group.
@@ -215,18 +215,10 @@ pub(super) fn drive_matches(
     };
     binding.resize(*scope_len);
     let mut matched = false;
-    let cont = visit_patterns(
-        graph,
-        ctx,
-        patterns,
-        0,
-        where_.as_ref(),
-        binding,
-        &mut |b| {
-            matched = true;
-            drive_matches(graph, ctx, matches, idx + 1, b, sink)
-        },
-    );
+    let cont = visit_patterns(graph, ctx, patterns, where_.as_ref(), binding, &mut |b| {
+        matched = true;
+        drive_matches(graph, ctx, matches, idx + 1, b, sink)
+    });
     if !cont {
         return false;
     }

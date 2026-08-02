@@ -1525,18 +1525,85 @@ pub(super) fn visit_pattern(
     }
 }
 
+/// How much it costs to START this pattern, given what is already bound. Lower
+/// is better; see [`pick_pattern`].
+fn pattern_rank(p: &CPath, binding: &Binding) -> u8 {
+    let bound = |s: Option<usize>| s.is_some_and(|s| binding.bound(s));
+    let connected = bound(p.start.var_slot)
+        || p.segments
+            .iter()
+            .any(|CSegment { rel, node, .. }| bound(rel.var_slot) || bound(node.var_slot));
+    if connected {
+        return 0; // continues an existing binding — no fresh scan at all
+    }
+    let restricted = p.start.label.is_some() || !p.start.props.is_empty();
+    u8::from(!restricted) + 1 // 1 = restricted scan, 2 = every vertex
+}
+
+/// The next pattern to extend into, or `None` when all are done.
+///
+/// This is GQL's half of the rule Gremlin's `match()` has always had
+/// (`pick_runnable` in `gremlin/exec.rs`): run a pattern whose start is already
+/// bound before one that needs a fresh scan. Without it the join runs in the
+/// order the patterns were TYPED, and two spellings of one query cost wildly
+/// different amounts — a selective anchor written last is enumerated last, so
+/// the unanchored pattern becomes the outer loop:
+///
+/// ```text
+///   MATCH (x:S)-[:R]->(b), (b)-[:R]->(c) WHERE x.k = 'target'   -- constant
+///   MATCH (b)-[:R]->(c), (x:S)-[:R]->(b) WHERE x.k = 'target'   -- linear
+/// ```
+///
+/// Same single row. Measured before this function existed: 1,278x apart at 3k
+/// vertices, 121,336x at 300k, and growing — the anchored spelling is constant
+/// while the other scans the graph. `docs/design/query-ir.md` has the table.
+///
+/// Ties keep the WRITTEN order (strict `<`), so a query whose patterns are all
+/// equally cheap to start runs, and emits rows, exactly as it did before.
+fn pick_pattern(patterns: &[CPath], done: &[bool], binding: &Binding) -> Option<usize> {
+    let mut best: Option<(u8, usize)> = None;
+    for (i, p) in patterns.iter().enumerate() {
+        if done[i] {
+            continue;
+        }
+        let rank = pattern_rank(p, binding);
+        if best.is_none_or(|(r, _)| rank < r) {
+            best = Some((rank, i));
+        }
+        if rank == 0 {
+            break; // can't do better than continuing an existing binding
+        }
+    }
+    best.map(|(_, i)| i)
+}
+
 /// Extend a binding through every pattern (nested), filter by an optional WHERE,
 /// and emit each surviving binding. Returns `false` if `emit` asked to stop.
+///
+/// Patterns are visited in the order [`pick_pattern`] chooses, not the order they
+/// were written.
 pub(super) fn visit_patterns(
     graph: &Graph,
     ctx: &Ctx,
     patterns: &[CPath],
-    idx: usize,
     where_: Option<&CExpr>,
     binding: &mut Binding,
     emit: &mut dyn FnMut(&mut Binding) -> bool,
 ) -> bool {
-    if idx >= patterns.len() {
+    let mut done = vec![false; patterns.len()];
+    visit_remaining(graph, ctx, patterns, &mut done, where_, binding, emit)
+}
+
+fn visit_remaining(
+    graph: &Graph,
+    ctx: &Ctx,
+    patterns: &[CPath],
+    done: &mut Vec<bool>,
+    where_: Option<&CExpr>,
+    binding: &mut Binding,
+    emit: &mut dyn FnMut(&mut Binding) -> bool,
+) -> bool {
+    let Some(idx) = pick_pattern(patterns, done, binding) else {
         if let Some(w) = where_ {
             let env = Env::new(graph, ctx, binding);
             if as_truth(&eval(&env, w)) != Some(true) {
@@ -1544,10 +1611,13 @@ pub(super) fn visit_patterns(
             }
         }
         return emit(binding);
-    }
-    visit_pattern(graph, ctx, &patterns[idx], where_, binding, &mut |b| {
-        visit_patterns(graph, ctx, patterns, idx + 1, where_, b, emit)
-    })
+    };
+    done[idx] = true;
+    let cont = visit_pattern(graph, ctx, &patterns[idx], where_, binding, &mut |b| {
+        visit_remaining(graph, ctx, patterns, done, where_, b, emit)
+    });
+    done[idx] = false; // backtrack
+    cont
 }
 
 /// Reachability fast path for `EXISTS { (a)-[:T]->+/*(b …) }`: a single unbounded
