@@ -852,3 +852,60 @@ fn idx_range(graph: &Graph, name: &str, rb: &RangeBound, edge: bool) -> Option<V
 
 #[cfg(test)]
 mod tests;
+
+/// Which way an expansion walks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dir {
+    Out,
+    In,
+    Both,
+}
+
+/// Neighbours of `src` along `etypes` (empty = any type), flat.
+///
+/// One output vector for the whole expansion rather than one per source. The
+/// per-traverser walk allocated a `Vec` for EACH source vertex — 50k allocations
+/// to expand a 50k-vertex set — and then a traverser per neighbour on top.
+///
+/// Duplicates are kept: two edges between the same pair are two traversers in
+/// Gremlin and two rows in GQL, so de-duplicating here would silently change the
+/// answer.
+#[must_use]
+pub fn expand(graph: &Graph, src: &[u32], dir: Dir, etypes: &[u32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let keep = |t: u32| etypes.is_empty() || etypes.contains(&t);
+
+    for &v in src {
+        if dir != Dir::In {
+            out.extend(graph.out_adj(v).filter(|a| keep(a.etype)).map(|a| a.nbr));
+        }
+
+        if dir != Dir::Out {
+            out.extend(graph.in_adj(v).filter(|a| keep(a.etype)).map(|a| a.nbr));
+        }
+    }
+
+    out
+}
+
+/// How many neighbours [`expand`] would produce, without producing them.
+///
+/// The counting form allocates nothing at all — the whole expansion becomes a
+/// walk over the adjacency slices.
+#[must_use]
+pub fn expand_count(graph: &Graph, src: &[u32], dir: Dir, etypes: &[u32]) -> usize {
+    let keep = |t: u32| etypes.is_empty() || etypes.contains(&t);
+    let mut n = 0;
+
+    for &v in src {
+        if dir != Dir::In {
+            n += graph.out_adj(v).filter(|a| keep(a.etype)).count();
+        }
+
+        if dir != Dir::Out {
+            n += graph.in_adj(v).filter(|a| keep(a.etype)).count();
+        }
+    }
+
+    n
+}

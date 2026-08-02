@@ -686,3 +686,89 @@ fn a_cross_type_count_still_faults() {
         crate::gremlin::try_run(&mut graph, &g().v_ids(&[]).has("k", P::gt(5.0)).count()).is_err()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Expansion lowered into the IR. A counted expansion never materializes the
+// neighbours, so the risks are direction, edge-type filtering and multiplicity.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_counted_expansion_agrees_with_the_walk() {
+    let mut graph = seeded();
+
+    for (t, label) in [
+        (g().v_ids(&[]).has_label(&["P"]).out(&["R"]), "out R"),
+        (g().v_ids(&[]).has_label(&["Q"]).in_(&["R"]), "in R"),
+        (g().v_ids(&[]).has_label(&["P"]).both(&["R"]), "both R"),
+        (g().v_ids(&[]).has_label(&["P"]).out(&[]), "out any"),
+        (g().v_ids(&[]).has_label(&["P"]).both(&[]), "both any"),
+    ] {
+        // The walk materializes; the counted form must not disagree with it.
+        let walked = ids(&mut graph, t.clone()).len() as f64;
+
+        assert_eq!(count_of(&mut graph, t.count()), walked, "{label}");
+    }
+}
+
+#[test]
+fn a_counted_expansion_keeps_multi_edges() {
+    // Two edges between the same pair are two traversers, so the count is 2 —
+    // de-duplicating the expansion would silently answer 1.
+    let mut graph = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["P"],"properties":{}}"#,
+            r#"{"type":"node","id":"b","labels":["Q"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e0","labels":["R"],"from":"a","to":"b","properties":{}}"#,
+            r#"{"type":"edge","id":"e1","labels":["R"],"from":"a","to":"b","properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    assert_eq!(
+        count_of(
+            &mut graph,
+            g().v_ids(&[]).has_label(&["P"]).out(&["R"]).count()
+        ),
+        2.0
+    );
+}
+
+#[test]
+fn an_unknown_edge_label_expands_to_nothing() {
+    let mut graph = seeded();
+
+    // An unresolvable type name matches nothing. An EMPTY label list means "any
+    // type", so the two must not collapse into each other.
+    assert_eq!(
+        count_of(
+            &mut graph,
+            g().v_ids(&[]).has_label(&["P"]).out(&["Nope"]).count()
+        ),
+        0.0
+    );
+    assert!(
+        count_of(
+            &mut graph,
+            g().v_ids(&[]).has_label(&["P"]).out(&[]).count()
+        ) > 0.0
+    );
+}
+
+#[test]
+fn a_counted_expansion_respects_direction() {
+    let mut graph = seeded();
+
+    // R runs p{i} -> q{i+1}, S runs q{i} -> p{i}. Out and in are not symmetric.
+    let out_r = count_of(
+        &mut graph,
+        g().v_ids(&[]).has_label(&["P"]).out(&["R"]).count(),
+    );
+    let in_r = count_of(
+        &mut graph,
+        g().v_ids(&[]).has_label(&["P"]).in_(&["R"]).count(),
+    );
+
+    assert_eq!(out_r, 1000.0);
+    assert_eq!(in_r, 0.0, "no R edge points at a P");
+}

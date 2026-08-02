@@ -367,11 +367,8 @@ fn universe(graph: &Graph, is_edge: bool) -> Vec<u32> {
 fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
     let (seek, captured, read, is_edge) = lower_prefix(graph, steps)?;
 
-    // Nothing may sit between the filters and the count, and every filter in the
-    // run must have been captured.
-    if !matches!(steps.get(read), Some(Step::Count(Scope::Global))) || read + 1 != steps.len() {
-        return None;
-    }
+    // Every filter in the run must have been captured — an uncaptured one can
+    // only run over a stream.
     if captured.len() != read - 1 {
         return None;
     }
@@ -381,12 +378,39 @@ fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
     if !seek.types_agree(graph, &no_params) {
         return None;
     }
-    if !(seek.columnar(graph, &no_params) || (seek.conj_is_empty() && seek.labels().is_some())) {
+    if !(seek.columnar(graph, &no_params)
+        || (seek.conj_is_empty() && (seek.labels().is_some() || read == 1)))
+    {
         return None;
     }
 
+    let ids = || seek.scan(graph, &no_params, || universe(graph, is_edge));
+
     #[allow(clippy::cast_precision_loss)]
-    Some(seek.count(graph, &no_params, || universe(graph, is_edge)) as f64)
+    match &steps[read..] {
+        // `… count()`
+        [Step::Count(Scope::Global)] => Some(ids().len() as f64),
+        // `… out/in/both(labels).count()` — the expansion never materializes.
+        [nav @ (Step::Out(labels) | Step::In(labels) | Step::Both(labels)), Step::Count(Scope::Global)]
+            if !is_edge =>
+        {
+            let dir = match nav {
+                Step::Out(_) => crate::seek::Dir::Out,
+                Step::In(_) => crate::seek::Dir::In,
+                _ => crate::seek::Dir::Both,
+            };
+            let etypes: Vec<u32> = labels.iter().filter_map(|l| graph.etype.get(l)).collect();
+
+            // A type name that resolved to nothing matches nothing; an EMPTY
+            // list means "any type", so the two must not be confused.
+            if etypes.len() != labels.len() {
+                return Some(0.0);
+            }
+
+            Some(crate::seek::expand_count(graph, &ids(), dir, &etypes) as f64)
+        }
+        _ => None,
+    }
 }
 
 fn index_seed(graph: &Graph, steps: &[Step]) -> Option<(Vec<Trav>, Vec<usize>)> {
