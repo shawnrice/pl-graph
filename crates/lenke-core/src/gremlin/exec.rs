@@ -526,10 +526,25 @@ fn lowered_ids<'a>(graph: &Graph, steps: &'a [Step]) -> Option<(Vec<u32>, &'a [S
         return None;
     }
 
+    // From an EDGE frontier only a terminal may follow. `E().outE(R).inV()` would
+    // otherwise be read as a hop off the edge ids, which are vertex ids to
+    // `lower_hops` and to nothing else. An allowlist rather than a denylist: a
+    // step missing from here only declines to lower, a navigating step wrongly
+    // added walks the wrong adjacency and answers.
     if is_edge
         && !matches!(
             steps.get(read),
-            None | Some(Step::Values(_) | Step::Count(_))
+            None | Some(
+                Step::Values(_)
+                    | Step::Count(_)
+                    | Step::Id
+                    | Step::Label
+                    | Step::Fold
+                    | Step::Sum(_)
+                    | Step::Min(_)
+                    | Step::Max(_)
+                    | Step::Mean(_)
+            )
         )
     {
         return None; // edge-to-edge navigation is not this shape
@@ -573,16 +588,89 @@ fn lowered_ids<'a>(graph: &Graph, steps: &'a [Step]) -> Option<(Vec<u32>, &'a [S
     Some((ids, rest, edges))
 }
 
-/// `V()/E() … values(k)` answered from the IR: the column is read straight into
-/// the results, with no traverser built for any of the 200k rows it used to.
+/// The value a lowered frontier id IS, so a terminal can reuse the very
+/// projections the streaming path applies (`elem_id`, `elem_label`) instead of
+/// re-deriving them and drifting.
+fn frontier_val(id: u32, is_edge: bool) -> GVal {
+    if is_edge {
+        GVal::Edge(id)
+    } else {
+        GVal::Node(id)
+    }
+}
+
+/// `V()/E() … <terminal>` answered from the IR, with no traverser built for any
+/// of the 200k rows these used to allocate one for.
+///
+/// Every arm here must agree with running the same steps over a stream — the
+/// tests in `index_seed_tests` assert exactly that, terminal by terminal.
+///
+/// Over 20k vertices / 60k edges (`min` of 9, `tmp_terminal_bench`):
+///
+/// ```text
+///                                    stream    lowered
+///   V().hasLabel(P).id()             1012 us     110 us
+///   V().hasLabel(P).label()          1001         105
+///   V().id()                         1877         178
+///   V().out().id()                  10857         651
+///   E().id()                         9332        2590
+///   V().values(n).sum()               953          39
+///   V().values(n).min()               956          72
+///   E().values(w).sum()              2816         113
+///   V().out().values(n).sum()        3218         213
+///   V().values(n).is(gt).count()     1870          55
+///   V().hasLabel(P).fold()            330          53
+///   V().values(n).fold()             1877          84
+///   V().hasLabel(P).count(local)     1147          60
+/// ```
+///
+/// `E().id()` is the one row that stays expensive, and the lowering is not why:
+/// an edge id is materialized as an owned `String` and then re-allocated into an
+/// `Arc<str>` PER EDGE, which is 60k allocation pairs that the frontier walk
+/// cannot remove. Interning edge ids the way vertex ids already are is the
+/// change that would move it, and it is a storage change, not a planning one.
 fn try_values(graph: &Graph, steps: &[Step]) -> Option<Vec<GVal>> {
     let (ids, rest, is_edge) = lowered_ids(graph, steps)?;
-    let [Step::Values(keys)] = rest else {
-        return None;
-    };
+
+    match rest {
+        // `id()` / `label()` are pure per-element projections of the frontier —
+        // the same shape as `values(k)`, reading the id/label dictionaries
+        // instead of a property column.
+        [Step::Id] => Some(
+            ids.iter()
+                .map(|&id| elem_id(graph, &frontier_val(id, is_edge)))
+                .collect(),
+        ),
+        [Step::Label] => Some(
+            ids.iter()
+                .map(|&id| elem_label(graph, &frontier_val(id, is_edge)))
+                .collect(),
+        ),
+        [Step::Fold] => Some(vec![GVal::List(
+            ids.into_iter()
+                .map(|id| frontier_val(id, is_edge))
+                .collect(),
+        )]),
+        // `count(local)` counts a value's own elements, and a graph element is
+        // not iterable — `local_elems` wraps it in a singleton. So it is 1 per
+        // row, whatever the row is.
+        [Step::Count(Scope::Local)] => Some(vec![GVal::Num(1.0); ids.len()]),
+        [Step::Values(keys), tail @ ..] => column_terminal(graph, &ids, is_edge, keys, tail),
+        _ => None,
+    }
+}
+
+/// `values(k)` and whatever follows it, answered from the typed column.
+fn column_terminal(
+    graph: &Graph,
+    ids: &[u32],
+    is_edge: bool,
+    keys: &[String],
+    tail: &[Step],
+) -> Option<Vec<GVal>> {
     // One key only: `values()` needs a per-element key list, and a multi-key call
     // interleaves columns per element rather than reading one.
-    let [key] = keys.as_slice() else {
+    let [key] = keys else {
         return None;
     };
     let store = if is_edge {
@@ -590,12 +678,56 @@ fn try_values(graph: &Graph, steps: &[Step]) -> Option<Vec<GVal>> {
     } else {
         &graph.props
     };
-    let Some(kid) = store.keys.get(key) else {
-        return Some(Vec::new()); // no element ever carried this key
+    // Split an optional `is(P)` off the front. `is` filters the CURRENT value,
+    // which after `values(k)` is a column value — so there, and only there, it is
+    // a column predicate rather than a test on a graph element.
+    let (filter, tail) = match tail {
+        [Step::Is(p), t @ ..] => (Some(p), t),
+        t => (None, t),
     };
+    let Some(kid) = store.keys.get(key) else {
+        // No element ever carried this key, so `values(k)` emits nothing and
+        // every terminal folds the empty stream. `is` cannot change that.
+        return empty_column_terminal(tail);
+    };
+
+    // A homogeneous NUMBER column answers the filter and every numeric aggregate
+    // straight from `data`. Any other column type is left to the stream: a
+    // `Str`/`Bool`/`Temporal`/`Mixed` value under `sum()`/`mean()` is a type
+    // FAULT rather than a skipped row, and answering it here would make the
+    // lowering observable.
+    //
+    // NOT lowered: `min()`/`max()` over a `Str` column. It is well defined
+    // (`values('k').min()` is the lexicographic minimum) but a `Str` column holds
+    // INTERNED IDS, whose numeric order is insertion order and has nothing to do
+    // with the text — so every comparison needs a dictionary lookup, which is the
+    // per-value work the stream already does. There is no column read to win.
+    if let Some(crate::graph::Column::Num { data, present }) = store.cols.get(kid as usize) {
+        let mut nums: Vec<f64> = Vec::with_capacity(ids.len());
+
+        for &id in ids {
+            let i = id as usize;
+
+            if present.get(i) {
+                nums.push(data[i]);
+            }
+        }
+
+        if let Some(out) = num_column_terminal(&nums, filter, tail) {
+            return Some(out);
+        }
+
+        // Fall through: a shape the numeric path declined (a non-numeric `is`, a
+        // terminal it does not cover) may still be a plain projection below.
+    }
+
+    if filter.is_some() {
+        return None; // a filter this layer could not express has to run per value
+    }
+
     let mut out = Vec::with_capacity(ids.len());
 
-    for id in ids {
+    for &id in ids {
         let i = id as usize;
 
         // Gate on PRESENCE, not value != Null: a present null rides through.
@@ -604,7 +736,191 @@ fn try_values(graph: &Graph, steps: &[Step]) -> Option<Vec<GVal>> {
         }
     }
 
-    Some(out)
+    match tail {
+        [] => Some(out),
+        [Step::Fold] => Some(vec![GVal::List(out)]),
+        #[allow(clippy::cast_precision_loss)]
+        [Step::Count(Scope::Global)] => Some(vec![GVal::Num(out.len() as f64)]),
+        _ => None,
+    }
+}
+
+/// The terminals over a `values(k)` whose key no element carries — an EMPTY
+/// stream, which each aggregate folds its own way. `sum`/`mean`/`min`/`max` over
+/// nothing is `null`, not `0`.
+fn empty_column_terminal(tail: &[Step]) -> Option<Vec<GVal>> {
+    match tail {
+        [] | [Step::Count(Scope::Local)] => Some(Vec::new()),
+        [Step::Fold] => Some(vec![GVal::List(Vec::new())]),
+        [Step::Count(Scope::Global)] => Some(vec![GVal::Num(0.0)]),
+        [Step::Sum(Scope::Global) | Step::Mean(Scope::Global)] => Some(vec![GVal::Null]),
+        [Step::Min(Scope::Global) | Step::Max(Scope::Global)] => Some(vec![GVal::Null]),
+        _ => None,
+    }
+}
+
+/// A lowered `is(P)` over a number column: the test, plus whether a `NaN` would
+/// make the streaming path FAULT rather than answer.
+struct NumTest<'a> {
+    test: Box<dyn Fn(f64) -> bool + 'a>,
+    /// `cmp_or_fault` flags any comparison that returns no ordering, and
+    /// `partial_cmp` returns none for `NaN`. So an ORDERING predicate over a
+    /// column holding a `NaN` throws through the stream, and answering it from
+    /// the column would swallow that. Equality never orders, so it never faults.
+    faults_on_nan: bool,
+}
+
+/// `is(P)` after `values(k)` as a predicate over `f64` — `None` when it is not
+/// one, which is most of them.
+///
+/// Only where the answer is unambiguous. An ordering against a NON-number is a
+/// type fault in `cmp_or_fault`, so those decline outright rather than being
+/// answered as "no rows".
+fn num_test(p: &P) -> Option<NumTest<'_>> {
+    let n = |v: &GVal| match v {
+        GVal::Num(x) => Some(*x),
+        _ => None,
+    };
+    let eq = |test: Box<dyn Fn(f64) -> bool>| {
+        Some(NumTest {
+            test,
+            faults_on_nan: false,
+        })
+    };
+    let ord = |test: Box<dyn Fn(f64) -> bool>| {
+        Some(NumTest {
+            test,
+            faults_on_nan: true,
+        })
+    };
+
+    match p {
+        P::Eq(t) => {
+            let t = n(t)?;
+
+            eq(Box::new(move |x| x == t))
+        }
+        P::Neq(t) => {
+            let t = n(t)?;
+
+            eq(Box::new(move |x| x != t))
+        }
+        P::Gt(t) => {
+            let t = n(t)?;
+
+            ord(Box::new(move |x| x > t))
+        }
+        P::Gte(t) => {
+            let t = n(t)?;
+
+            ord(Box::new(move |x| x >= t))
+        }
+        P::Lt(t) => {
+            let t = n(t)?;
+
+            ord(Box::new(move |x| x < t))
+        }
+        P::Lte(t) => {
+            let t = n(t)?;
+
+            ord(Box::new(move |x| x <= t))
+        }
+        // Half-open, like `p_matches`: `>= lo` and `< hi`.
+        P::Between(lo, hi) => {
+            let (lo, hi) = (n(lo)?, n(hi)?);
+
+            ord(Box::new(move |x| x >= lo && x < hi))
+        }
+        P::Inside(lo, hi) => {
+            let (lo, hi) = (n(lo)?, n(hi)?);
+
+            ord(Box::new(move |x| x > lo && x < hi))
+        }
+        P::Outside(lo, hi) => {
+            let (lo, hi) = (n(lo)?, n(hi)?);
+
+            ord(Box::new(move |x| x < lo || x > hi))
+        }
+        // `within`/`without` test EQUALITY against each member, so a non-numeric
+        // member simply never matches a number — but requiring all-numeric keeps
+        // the reasoning local, and a mixed list is not a shape worth chasing.
+        P::Within(vs) => {
+            let vs: Vec<f64> = vs.iter().map(n).collect::<Option<_>>()?;
+
+            eq(Box::new(move |x| vs.contains(&x)))
+        }
+        P::Without(vs) => {
+            let vs: Vec<f64> = vs.iter().map(n).collect::<Option<_>>()?;
+
+            eq(Box::new(move |x| !vs.contains(&x)))
+        }
+        // `containing`, `regex`, `not(…)`, … are not a numeric range.
+        _ => None,
+    }
+}
+
+/// The numeric terminals over the present values of a number column.
+///
+/// `None` declines — a shape this path does not cover, or one where lowering it
+/// would change whether the query throws.
+#[allow(clippy::cast_precision_loss)]
+fn num_column_terminal(nums: &[f64], filter: Option<&P>, tail: &[Step]) -> Option<Vec<GVal>> {
+    let owned: Vec<f64>;
+    let nums: &[f64] = match filter {
+        None => nums,
+        Some(p) => {
+            let t = num_test(p)?;
+
+            if t.faults_on_nan && nums.iter().any(|x| x.is_nan()) {
+                return None; // the stream faults here; do not answer instead
+            }
+
+            owned = nums.iter().copied().filter(|&x| (t.test)(x)).collect();
+            &owned
+        }
+    };
+    // `fold_extreme` walks the stream keeping the first value that compares the
+    // wanted way, so a tie keeps the EARLIER one — which for `-0.0` vs `0.0` is
+    // observable. Reproduce the fold rather than calling `f64::min`.
+    let extreme = |want: Ordering| {
+        // A NaN makes `cmp_or_fault` flag a type fault mid-fold, so decline.
+        if nums.iter().any(|x| x.is_nan()) {
+            return None;
+        }
+
+        Some(nums.iter().fold(GVal::Null, |best, &x| match best {
+            GVal::Num(b) if x.partial_cmp(&b) != Some(want) => GVal::Num(b),
+            _ => GVal::Num(x),
+        }))
+    };
+    // An empty stream folds to a single `null` for every numeric aggregate — not
+    // to `0`, and not to no rows.
+    let fold = |f: &dyn Fn(&[f64]) -> f64| {
+        if nums.is_empty() {
+            GVal::Null
+        } else {
+            GVal::Num(f(nums))
+        }
+    };
+
+    match tail {
+        [] => Some(nums.iter().copied().map(GVal::Num).collect()),
+        [Step::Fold] => Some(vec![GVal::List(
+            nums.iter().copied().map(GVal::Num).collect(),
+        )]),
+        [Step::Count(Scope::Global)] => Some(vec![GVal::Num(nums.len() as f64)]),
+        [Step::Count(Scope::Local)] => Some(vec![GVal::Num(1.0); nums.len()]),
+        // Summed in FRONTIER order, which is the order the stream would have
+        // visited them in: floating-point addition is not associative, so a
+        // different order is a different answer and the TS engine's must match.
+        [Step::Sum(Scope::Global)] => Some(vec![fold(&|ns| ns.iter().sum())]),
+        [Step::Mean(Scope::Global)] => {
+            Some(vec![fold(&|ns| ns.iter().sum::<f64>() / ns.len() as f64)])
+        }
+        [Step::Min(Scope::Global)] => Some(vec![extreme(Ordering::Less)?]),
+        [Step::Max(Scope::Global)] => Some(vec![extreme(Ordering::Greater)?]),
+        _ => None,
+    }
 }
 
 /// `V()/E() … count()` answered from the IR, with no traverser built at all.

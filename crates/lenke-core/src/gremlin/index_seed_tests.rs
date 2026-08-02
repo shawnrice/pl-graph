@@ -1191,3 +1191,400 @@ fn an_unknown_edge_label_on_a_terminal_counts_nothing() {
         ) > 0.0
     );
 }
+
+// ---------------------------------------------------------------------------
+// The remaining terminals: `id()`, `label()`, the numeric aggregates over a
+// `values(k)`, the `is(P)` that filters them, `fold()` and `count(local)`.
+//
+// Every one is a pure optimisation, so the reference is the SAME steps run over
+// a stream. `identity()` is what forces that: it is a pass-through the terminal
+// lowering declines to read, so a traversal with one in front of the terminal
+// materializes where the bare one does not.
+// ---------------------------------------------------------------------------
+
+/// A terminal as a function, so one loop can run every aggregate over one shape.
+type Agg = fn(super::Traversal) -> super::Traversal;
+
+/// The same traversal, forced through the stream — the materialized reference.
+fn walked(graph: &mut Graph, t: super::Traversal) -> Vec<String> {
+    vals(graph, t.identity())
+}
+
+/// Prefixes that all reach the IR, each by a different route.
+fn prefixes() -> Vec<(super::Traversal, &'static str)> {
+    vec![
+        (g().v_ids(&[]), "everything"),
+        (g().v_ids(&[]).has_label(&["P"]), "label only"),
+        (g().v_ids(&[]).has("n", P::gte(996.0)), "range seek"),
+        (g().v_ids(&[]).has_val("k", "key0005"), "point seek"),
+        (g().v_ids(&[]).has_label(&["P"]).out(&["R"]), "after a hop"),
+        (
+            g().v_ids(&[]).has_label(&["P"]).out_e(&["R"]),
+            "edge frontier",
+        ),
+        (g().e_ids(&[]), "every edge"),
+    ]
+}
+
+/// The property key the frontier of `label` actually carries.
+fn key_for(label: &str) -> &'static str {
+    if label.contains("edge") {
+        "w"
+    } else {
+        "n"
+    }
+}
+
+#[test]
+fn an_id_terminal_matches_the_walk_exactly() {
+    let mut graph = seeded();
+
+    // Order is observable: `id()` follows traversal order, so the terminal has
+    // to produce the same SEQUENCE, not merely the same multiset.
+    for (t, label) in prefixes() {
+        let terminal = vals(&mut graph, t.clone().id());
+        let stream = walked(&mut graph, t.id());
+
+        assert!(!terminal.is_empty(), "[{label}] produced nothing");
+        assert_eq!(terminal, stream, "[{label}] id() disagreed with the walk");
+    }
+}
+
+#[test]
+fn a_label_terminal_matches_the_walk_exactly() {
+    let mut graph = seeded();
+
+    for (t, label) in prefixes() {
+        let terminal = vals(&mut graph, t.clone().label());
+        let stream = walked(&mut graph, t.label());
+
+        assert!(!terminal.is_empty(), "[{label}] produced nothing");
+        assert_eq!(
+            terminal, stream,
+            "[{label}] label() disagreed with the walk"
+        );
+    }
+}
+
+#[test]
+fn a_label_terminal_reports_only_the_first_label() {
+    let mut graph = crate::ndjson::decode(
+        r#"{"type":"node","id":"a","labels":["First","Second"],"properties":{}}"#,
+    )
+    .expect("fixture decodes");
+
+    // TinkerPop's `label()` is `vertex_labels(i).first()`, not "any label". A
+    // lowering that read the whole label list would return both.
+    assert_eq!(
+        vals(&mut graph, g().v_ids(&[]).label()),
+        vec!["First".to_string()]
+    );
+}
+
+#[test]
+fn an_id_terminal_after_a_hop_keeps_duplicates() {
+    let mut graph = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["P"],"properties":{}}"#,
+            r#"{"type":"node","id":"b","labels":["P"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e1","labels":["R"],"from":"a","to":"b","properties":{}}"#,
+            r#"{"type":"edge","id":"e2","labels":["R"],"from":"a","to":"b","properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    // Two edges between the same pair are two traversers, so `b` is reached
+    // twice. De-duplicating in the terminal would silently drop a row.
+    assert_eq!(
+        vals(&mut graph, g().v_ids(&["a"]).out(&["R"]).id()),
+        vec!["b".to_string(), "b".to_string()]
+    );
+}
+
+#[test]
+fn a_numeric_aggregate_agrees_with_the_walk() {
+    let mut graph = seeded();
+    let aggs: [(Agg, &str); 4] = [
+        (super::Traversal::sum, "sum"),
+        (super::Traversal::mean, "mean"),
+        (super::Traversal::min, "min"),
+        (super::Traversal::max, "max"),
+    ];
+
+    for (t, label) in prefixes() {
+        let key = key_for(label);
+
+        for (agg, name) in aggs {
+            let terminal = vals(&mut graph, agg(t.clone().values(&[key])));
+            let stream = vals(&mut graph, agg(t.clone().values(&[key]).identity()));
+
+            assert_eq!(terminal.len(), 1, "[{label}/{name}] not one row");
+            assert_eq!(terminal, stream, "[{label}/{name}] disagreed with the walk");
+        }
+    }
+}
+
+#[test]
+fn an_aggregate_over_a_non_numeric_column_still_faults() {
+    let mut graph = seeded();
+
+    // `k` is a string column. `sum()`/`mean()` over it is a type FAULT in the
+    // stream, so a lowering that answered `null` would make the IR observable.
+    for t in [
+        g().v_ids(&[]).has_label(&["P"]).values(&["k"]).sum(),
+        g().v_ids(&[]).has_label(&["P"]).values(&["k"]).mean(),
+    ] {
+        assert!(crate::gremlin::try_run(&mut graph, &t).is_err());
+    }
+
+    // `min`/`max` over strings is well defined and must still answer.
+    assert_eq!(
+        vals(
+            &mut graph,
+            g().v_ids(&[]).has_label(&["P"]).values(&["k"]).min()
+        ),
+        vec!["key0000".to_string()]
+    );
+}
+
+#[test]
+fn an_aggregate_over_an_absent_key_folds_the_empty_stream() {
+    let mut graph = seeded();
+    let none = || g().v_ids(&[]).has_label(&["P"]).values(&["nope"]);
+
+    // Nothing is not zero: TinkerPop folds an empty numeric aggregate to null.
+    assert_eq!(vals(&mut graph, none().sum()), vec!["Null".to_string()]);
+    assert_eq!(vals(&mut graph, none().mean()), vec!["Null".to_string()]);
+    assert_eq!(vals(&mut graph, none().min()), vec!["Null".to_string()]);
+    assert_eq!(vals(&mut graph, none().max()), vec!["Null".to_string()]);
+    assert_eq!(
+        vals(&mut graph, none().count()),
+        vec!["Num(0.0)".to_string()]
+    );
+    assert_eq!(
+        vals(&mut graph, none().fold()),
+        vec!["List([])".to_string()]
+    );
+
+    // And each agrees with the stream, which is where those rules are written.
+    for t in [none().sum(), none().mean(), none().min(), none().max()] {
+        let stream = vals(&mut graph, t.clone().identity());
+
+        assert_eq!(vals(&mut graph, t), stream);
+    }
+}
+
+#[test]
+fn an_aggregate_over_a_stored_null_agrees_with_the_walk() {
+    let mut graph = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["P"],"properties":{"n":3}}"#,
+            r#"{"type":"node","id":"b","labels":["P"],"properties":{"n":null}}"#,
+            r#"{"type":"node","id":"c","labels":["P"],"properties":{}}"#,
+            r#"{"type":"node","id":"d","labels":["P"],"properties":{"n":5}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    // A stored null makes the column heterogeneous, so the numeric path has to
+    // decline — and the stream's rule (nulls skipped, not summed as 0) has to
+    // survive that.
+    for t in [
+        g().v_ids(&[]).values(&["n"]).sum(),
+        g().v_ids(&[]).values(&["n"]).mean(),
+        g().v_ids(&[]).values(&["n"]).min(),
+        g().v_ids(&[]).values(&["n"]).max(),
+        g().v_ids(&[]).values(&["n"]).count(),
+    ] {
+        let stream = vals(&mut graph, t.clone().identity());
+
+        assert_eq!(vals(&mut graph, t), stream);
+    }
+}
+
+#[test]
+fn an_is_filter_after_values_matches_the_walk() {
+    let mut graph = seeded();
+    let aggs: [(Agg, &str); 5] = [
+        (super::Traversal::count, "count"),
+        (super::Traversal::sum, "sum"),
+        (super::Traversal::min, "min"),
+        (super::Traversal::max, "max"),
+        (super::Traversal::fold, "fold"),
+    ];
+
+    for (p, name) in [
+        (P::gt(500.0), "gt"),
+        (P::gte(500.0), "gte"),
+        (P::lt(500.0), "lt"),
+        (P::lte(500.0), "lte"),
+        (P::eq(500.0), "eq"),
+        (P::neq(500.0), "neq"),
+        (P::between(100.0, 200.0), "between"),
+        (P::inside(100.0, 200.0), "inside"),
+        (P::outside(100.0, 200.0), "outside"),
+        (P::within([1.0, 2.0, 3.0]), "within"),
+        (P::without([1.0, 2.0, 3.0]), "without"),
+    ] {
+        let t = || {
+            g().v_ids(&[])
+                .has_label(&["P"])
+                .values(&["n"])
+                .is(p.clone())
+        };
+
+        for (agg, aname) in aggs {
+            let terminal = vals(&mut graph, agg(t()));
+            let stream = vals(&mut graph, agg(t().identity()));
+
+            assert_eq!(terminal, stream, "[{name}/{aname}] disagreed with the walk");
+        }
+
+        assert_eq!(
+            vals(&mut graph, t()),
+            vals(&mut graph, t().identity()),
+            "[{name}] bare is() disagreed with the walk"
+        );
+    }
+}
+
+#[test]
+fn a_nan_in_the_column_keeps_the_ordering_terminals_on_the_stream() {
+    let mut graph = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["P"],"properties":{"n":3}}"#,
+            r#"{"type":"node","id":"b","labels":["P"],"properties":{"n":7}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    graph.set_vertex_prop(1, "n", crate::graph::Value::Num(f64::NAN));
+
+    // `partial_cmp` has no answer for a NaN, so `cmp_or_fault` flags a type
+    // fault: `min`/`max` and an ordering `is` THROW through the stream. Reading
+    // the column instead would answer where the query is supposed to fail.
+    for t in [
+        g().v_ids(&[]).values(&["n"]).min(),
+        g().v_ids(&[]).values(&["n"]).max(),
+        g().v_ids(&[]).values(&["n"]).is(P::gt(1.0)).count(),
+    ] {
+        assert!(crate::gremlin::try_run(&mut graph, &t).is_err());
+    }
+
+    // `sum`/`mean` do not order, so a NaN just propagates — both paths agree.
+    for t in [
+        g().v_ids(&[]).values(&["n"]).sum(),
+        g().v_ids(&[]).values(&["n"]).mean(),
+    ] {
+        let stream = vals(&mut graph, t.clone().identity());
+
+        assert_eq!(vals(&mut graph, t), stream);
+    }
+}
+
+#[test]
+fn an_is_filter_against_a_non_number_still_faults() {
+    let mut graph = seeded();
+
+    // Ordering a number against a string is a type fault. Answering it as "no
+    // rows" from the column would make the lowering observable.
+    assert!(crate::gremlin::try_run(
+        &mut graph,
+        &g().v_ids(&[])
+            .has_label(&["P"])
+            .values(&["n"])
+            .is(P::gt("x"))
+            .count()
+    )
+    .is_err());
+}
+
+#[test]
+fn an_is_filter_over_a_string_column_falls_back() {
+    let mut graph = seeded();
+
+    // The numeric path cannot express this; the stream still has to answer it.
+    for t in [
+        g().v_ids(&[])
+            .has_label(&["P"])
+            .values(&["k"])
+            .is(P::eq("key0005")),
+        g().v_ids(&[])
+            .has_label(&["P"])
+            .values(&["k"])
+            .is(P::containing("0005")),
+    ] {
+        assert_eq!(vals(&mut graph, t.clone()), vec!["key0005".to_string()]);
+        assert_eq!(vals(&mut graph, t.clone()), vals(&mut graph, t.identity()));
+    }
+}
+
+#[test]
+fn a_fold_terminal_matches_the_walk() {
+    let mut graph = seeded();
+
+    for (t, label) in prefixes() {
+        let key = key_for(label);
+        let terminal = vals(&mut graph, t.clone().fold());
+        let stream = walked(&mut graph, t.clone().fold());
+
+        assert_eq!(terminal.len(), 1, "[{label}] fold is one row");
+        assert_eq!(terminal, stream, "[{label}] fold() disagreed with the walk");
+
+        let vterminal = vals(&mut graph, t.clone().values(&[key]).fold());
+        let vstream = vals(&mut graph, t.values(&[key]).identity().fold());
+
+        assert_eq!(vterminal, vstream, "[{label}] values().fold() disagreed");
+    }
+}
+
+#[test]
+fn a_local_count_terminal_matches_the_walk() {
+    let mut graph = seeded();
+
+    for (t, label) in prefixes() {
+        let key = key_for(label);
+        let terminal = vals(&mut graph, t.clone().count_local());
+        let stream = walked(&mut graph, t.clone().count_local());
+
+        assert_eq!(terminal, stream, "[{label}] count(local) disagreed");
+
+        let vterminal = vals(&mut graph, t.clone().values(&[key]).count_local());
+        let vstream = vals(&mut graph, t.values(&[key]).identity().count_local());
+
+        assert_eq!(
+            vterminal, vstream,
+            "[{label}] values().count(local) disagreed"
+        );
+    }
+}
+
+#[test]
+fn a_values_count_matches_the_walk() {
+    let mut graph = seeded();
+
+    for (t, label) in prefixes() {
+        let key = key_for(label);
+        let terminal = vals(&mut graph, t.clone().values(&[key]).count());
+        let stream = vals(&mut graph, t.values(&[key]).identity().count());
+
+        assert_eq!(terminal, stream, "[{label}] values().count() disagreed");
+    }
+}
+
+#[test]
+fn an_edge_frontier_declines_a_navigating_step() {
+    let mut graph = seeded();
+
+    // `E().inV()` is not a projection off the edge ids — those are edge indices,
+    // and reading them as vertices would answer nonsense. The allowlist that
+    // guards the edge frontier has to reject it, so the stream answers instead.
+    let stream = vals(&mut graph, g().e_ids(&[]).in_v().id().identity());
+    let got = vals(&mut graph, g().e_ids(&[]).in_v().id());
+
+    assert_eq!(got, stream);
+    assert_eq!(got.len(), 2000, "one head per edge");
+}
