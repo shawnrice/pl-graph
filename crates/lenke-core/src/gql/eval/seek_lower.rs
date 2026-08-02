@@ -214,6 +214,39 @@ fn branches_of(
     Some(branches)
 }
 
+/// A label expression as a flat id list, when it is one.
+///
+/// Only `:A` and `:A|B` lower — a negation, conjunction or wildcard is not a set
+/// of ids and keeps GQL's own evaluator. Lowering what fits is the point; the
+/// rest is not a gap.
+///
+/// GQL's rule is ANY: `(n:Person)` matches a vertex carrying that label anywhere
+/// in its list, unlike Gremlin's first-label-only `hasLabel`. The IR carries the
+/// rule, so both share the seeding underneath.
+pub(super) fn lower_labels(
+    expr: &super::super::plan::CLabelExpr,
+    ctx: &Ctx,
+    edge: bool,
+) -> Option<Vec<u32>> {
+    use super::super::plan::CLabelExpr as L;
+
+    match expr {
+        L::Label(r) => {
+            let (v, e) = ctx.labels[*r];
+            // An unresolved name matches nothing — an EMPTY id list, not "no
+            // constraint".
+            Some(if edge { e } else { v }.map_or_else(Vec::new, |id| vec![id]))
+        }
+        L::Or(l, r) => {
+            let mut ids = lower_labels(l, ctx, edge)?;
+
+            ids.extend(lower_labels(r, ctx, edge)?);
+            Some(ids)
+        }
+        _ => None,
+    }
+}
+
 /// What a WHERE clause plus a pattern's inline `{k: v}` constraints say about
 /// one element variable.
 pub(super) fn element_seek(

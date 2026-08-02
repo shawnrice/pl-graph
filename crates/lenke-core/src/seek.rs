@@ -529,19 +529,79 @@ impl ElementSeek {
         param: &impl Bindings,
         universe: impl FnOnce() -> Vec<u32>,
     ) -> Vec<u32> {
+        self.scan_capped(graph, param, None, universe)
+    }
+
+    /// As [`scan`](Self::scan), stopping once `cap` rows survive every filter.
+    ///
+    /// The cap has to be pushed INTO the walk, not applied after it: truncating
+    /// a materialized result made `RETURN … LIMIT 100` over a large label 92x
+    /// slower, because the work is the scan, not the truncation.
+    #[must_use]
+    pub fn scan_capped(
+        &self,
+        graph: &Graph,
+        param: &impl Bindings,
+        cap: Option<usize>,
+        universe: impl FnOnce() -> Vec<u32>,
+    ) -> Vec<u32> {
         let live = if self.edge {
             graph.edge_count()
         } else {
             graph.vertex_count()
         };
-        let mut ids = self
-            .resolve(graph, param)
-            .or_else(|| self.label_seed(graph, live))
-            .unwrap_or_else(universe);
+        // Seeding from the buckets under the ANY rule already proves the label:
+        // a vertex is bucketed under every label it carries, so union membership
+        // IS "carries one of these". Re-checking is pure waste, and skipping it
+        // is what the hand-written GQL bucket path did — losing it cost 50% on a
+        // grouped aggregate. Under FIRST the buckets are only a superset, so the
+        // check stays.
+        let mut label_checked = false;
+        let mut ids = match self.resolve(graph, param) {
+            Some(seeded) => seeded,
+            None => match self.label_seed(graph, live) {
+                Some(bucketed) => {
+                    label_checked = self
+                        .labels
+                        .as_ref()
+                        .is_some_and(|f| f.rule == LabelRule::Any);
+                    bucketed
+                }
+                None => universe(),
+            },
+        };
+
+        // With a cap, run every test per element and stop as soon as enough
+        // survive — a `retain` per predicate would filter the whole set first.
+        if let Some(c) = cap {
+            let tests: Vec<_> = self
+                .conj
+                .iter()
+                .filter_map(|p| {
+                    p.operand
+                        .resolve(param)
+                        .and_then(|k| column_matches(graph, &p.key, self.edge, p.op, &k))
+                })
+                .collect();
+            let labelled = self.labels.is_some() && !label_checked;
+            let mut out = Vec::with_capacity(c.min(ids.len()));
+
+            for id in ids {
+                if (!labelled || self.label_ok(graph, id)) && tests.iter().all(|t| t(id)) {
+                    out.push(id);
+
+                    if out.len() == c {
+                        break;
+                    }
+                }
+            }
+
+            return out;
+        }
 
         // Cheapest first: the label test reads one slice, a column test reads a
         // value and a presence bit.
-        if self.labels.is_some() {
+        if self.labels.is_some() && !label_checked {
             ids.retain(|&id| self.label_ok(graph, id));
         }
 

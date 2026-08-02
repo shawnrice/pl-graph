@@ -455,39 +455,52 @@ pub(super) fn build_scan(
         let mut ids = Vec::new();
         let needs_check = !node.props.is_empty() || node.where_.is_some();
 
-        // Fast path: no index seed, no inline props/WHERE, and the label is either
-        // absent or a **bare** single label. Then bucket membership already implies
-        // the label (`matches_label` would be a redundant per-vertex re-check), so
-        // clone the live-vertex / label-bucket slice straight into the id column —
-        // skipping 1M closure calls + label scans. Anything richer (And/Or/Not
-        // label, inline constraints, index seed) falls through to the general loop.
-        // `Some(None)` = all live vertices; `Some(Some(slice))` = a label bucket;
-        // `None` = not fast-path-eligible (fall through to the general loop).
-        let fast_bucket: Option<Option<&[u32]>> = if seed.is_some() || needs_check {
-            None
-        } else {
-            match node.label.as_ref() {
-                None => Some(None),
-                Some(CLabelExpr::Label(r)) => Some(Some(match ctx.labels[*r].0 {
-                    Some(lid) => graph.vertices_with_label(lid),
-                    None => &[], // unknown label → no rows
-                })),
-                Some(_) => None, // And/Or/Not label needs the per-vertex re-check
+        // The seed-and-filter of an isolated node is the SHARED access path:
+        // seed from an index or a label bucket, then narrow. Routing through it
+        // replaced a bucket-cloning special case here, and means the selectivity
+        // rule (only seed from a label when the bucket is smaller than the live
+        // set) is decided in one place for both engines rather than twice.
+        //
+        // Only when the node's constraints are wholly lowered — no inline props,
+        // no node-local WHERE, and a label that is a flat id list. Anything
+        // richer (a negated or conjoined label, an arbitrary predicate) keeps the
+        // general loop below, which is where GQL's own evaluator belongs.
+        if !needs_check {
+            let lowered = node.label.as_ref().map_or(Some(Vec::new()), |l| {
+                seek_lower::lower_labels(l, ctx, false)
+            });
+
+            if let Some(label_ids) = lowered {
+                let mut seek = seek_lower::element_seek(
+                    where_,
+                    &seek_lower::inline_of(node),
+                    graph,
+                    ctx,
+                    node.var_slot,
+                    false,
+                );
+
+                if node.label.is_some() {
+                    seek.set_labels(crate::seek::LabelRule::Any, label_ids);
+                }
+
+                let binds = seek_lower::GqlBindings(ctx.params);
+
+                if seek.conj_is_empty() || seek.columnar(graph, &binds) {
+                    let ids =
+                        seek.scan_capped(graph, &binds, cap, || graph.vertex_indices().collect());
+
+                    let mut sc = ScanCols::new(scope_len);
+
+                    sc.n = ids.len();
+
+                    if let Some(slot) = node.var_slot {
+                        sc.slots[slot] = Some((Elem::Node, ids));
+                    }
+
+                    return Some(sc);
+                }
             }
-        };
-        if let Some(bucket) = fast_bucket {
-            let ids: Vec<u32> = match (bucket, cap) {
-                (Some(b), Some(c)) => b.iter().take(c).copied().collect(),
-                (Some(b), None) => b.to_vec(),
-                (None, Some(c)) => graph.vertex_indices().take(c).collect(),
-                (None, None) => graph.vertex_indices().collect(),
-            };
-            let mut sc = ScanCols::new(scope_len);
-            sc.n = ids.len();
-            if let Some(s) = node.var_slot {
-                sc.slots[s] = Some((Elem::Node, ids));
-            }
-            return Some(sc);
         }
 
         let mut b = Binding(vec![None; scope_len.max(1)]);
