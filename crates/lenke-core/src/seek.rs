@@ -1010,6 +1010,25 @@ pub enum Dir {
     Both,
 }
 
+/// How an UNDIRECTED expansion treats a self-loop.
+///
+/// A self-loop sits in both the out- and the in-index of its vertex, so walking
+/// `Both` reaches it from each side. The two languages disagree about whether
+/// that is one traversal or two, and both are right for their own model:
+///
+/// - GQL's `(a)-[:R]-(b)` matches the loop ONCE — it is one edge, matched once.
+/// - TinkerPop's `both()` yields it TWICE — one traverser per direction.
+///
+/// So the rule is data on the IR node, like [`LabelRule`]. Getting this wrong is
+/// silent: the row count is simply off by the number of self-loops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SelfLoops {
+    /// Emit a self-loop once from the out-side (GQL).
+    Once,
+    /// Emit it from both sides (TinkerPop).
+    Twice,
+}
+
 /// Neighbours of `src` along `etypes` (empty = any type), flat.
 ///
 /// One output vector for the whole expansion rather than one per source. The
@@ -1020,9 +1039,12 @@ pub enum Dir {
 /// Gremlin and two rows in GQL, so de-duplicating here would silently change the
 /// answer.
 #[must_use]
-pub fn expand(graph: &Graph, src: &[u32], dir: Dir, etypes: &[u32]) -> Vec<u32> {
+pub fn expand(graph: &Graph, src: &[u32], dir: Dir, etypes: &[u32], loops: SelfLoops) -> Vec<u32> {
     let mut out = Vec::new();
     let keep = |t: u32| etypes.is_empty() || etypes.contains(&t);
+    // Only an undirected walk can reach a loop twice; a directed one keeps it
+    // either way.
+    let drop_loop = dir == Dir::Both && loops == SelfLoops::Once;
 
     for &v in src {
         if dir != Dir::In {
@@ -1030,7 +1052,12 @@ pub fn expand(graph: &Graph, src: &[u32], dir: Dir, etypes: &[u32]) -> Vec<u32> 
         }
 
         if dir != Dir::Out {
-            out.extend(graph.in_adj(v).filter(|a| keep(a.etype)).map(|a| a.nbr));
+            out.extend(
+                graph
+                    .in_adj(v)
+                    .filter(|a| keep(a.etype) && !(drop_loop && a.nbr == v))
+                    .map(|a| a.nbr),
+            );
         }
     }
 
@@ -1042,8 +1069,15 @@ pub fn expand(graph: &Graph, src: &[u32], dir: Dir, etypes: &[u32]) -> Vec<u32> 
 /// The counting form allocates nothing at all — the whole expansion becomes a
 /// walk over the adjacency slices.
 #[must_use]
-pub fn expand_count(graph: &Graph, src: &[u32], dir: Dir, etypes: &[u32]) -> usize {
+pub fn expand_count(
+    graph: &Graph,
+    src: &[u32],
+    dir: Dir,
+    etypes: &[u32],
+    loops: SelfLoops,
+) -> usize {
     let keep = |t: u32| etypes.is_empty() || etypes.contains(&t);
+    let drop_loop = dir == Dir::Both && loops == SelfLoops::Once;
     let mut n = 0;
 
     for &v in src {
@@ -1052,7 +1086,10 @@ pub fn expand_count(graph: &Graph, src: &[u32], dir: Dir, etypes: &[u32]) -> usi
         }
 
         if dir != Dir::Out {
-            n += graph.in_adj(v).filter(|a| keep(a.etype)).count();
+            n += graph
+                .in_adj(v)
+                .filter(|a| keep(a.etype) && !(drop_loop && a.nbr == v))
+                .count();
         }
     }
 

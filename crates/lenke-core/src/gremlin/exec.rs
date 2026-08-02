@@ -516,7 +516,7 @@ fn lowered_ids<'a>(graph: &Graph, steps: &'a [Step]) -> Option<(Vec<u32>, &'a [S
             return Some((Vec::new(), rest, edges));
         };
 
-        ids = crate::seek::expand(graph, &ids, *dir, etypes);
+        ids = crate::seek::expand(graph, &ids, *dir, etypes, crate::seek::SelfLoops::Twice);
     }
 
     Some((ids, rest, edges))
@@ -624,7 +624,7 @@ fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
     #[allow(clippy::cast_precision_loss)]
     if distinct {
         for (d, e) in &hops {
-            ids = crate::seek::expand(graph, &ids, *d, e);
+            ids = crate::seek::expand(graph, &ids, *d, e, crate::seek::SelfLoops::Twice);
         }
 
         // Element identity is the dense index, so distinctness is a set of u32 —
@@ -643,10 +643,13 @@ fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
         // Walk every hop but the last, then COUNT the last without building it.
         Some(((dir, etypes), init)) => {
             for (d, e) in init {
-                ids = crate::seek::expand(graph, &ids, *d, e);
+                ids = crate::seek::expand(graph, &ids, *d, e, crate::seek::SelfLoops::Twice);
             }
 
-            Some(crate::seek::expand_count(graph, &ids, *dir, etypes) as f64)
+            Some(
+                crate::seek::expand_count(graph, &ids, *dir, etypes, crate::seek::SelfLoops::Twice)
+                    as f64,
+            )
         }
     }
 }

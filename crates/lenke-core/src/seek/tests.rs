@@ -236,3 +236,36 @@ fn a_contradiction_seeks_nothing_without_scanning() {
 
     assert_eq!(seek.resolve(&g, &no_params), Some(Vec::new()));
 }
+
+#[test]
+fn an_undirected_expansion_follows_the_self_loop_rule() {
+    let g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["P"],"properties":{}}"#,
+            r#"{"type":"node","id":"b","labels":["P"],"properties":{}}"#,
+            r#"{"type":"edge","id":"s","labels":["R"],"from":"a","to":"a","properties":{}}"#,
+            r#"{"type":"edge","id":"e","labels":["R"],"from":"a","to":"b","properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+    let a = vec![0u32];
+
+    use super::{expand, expand_count, Dir, SelfLoops};
+
+    // `a` has one self-loop and one ordinary edge. Undirected, TinkerPop reaches
+    // the loop from each side (2 + 1 = 3); GQL matches the edge once (1 + 1 = 2).
+    assert_eq!(expand_count(&g, &a, Dir::Both, &[], SelfLoops::Twice), 3);
+    assert_eq!(expand_count(&g, &a, Dir::Both, &[], SelfLoops::Once), 2);
+    assert_eq!(
+        expand(&g, &a, Dir::Both, &[], SelfLoops::Twice).len(),
+        expand_count(&g, &a, Dir::Both, &[], SelfLoops::Twice)
+    );
+
+    // A DIRECTED walk keeps the loop under either rule — it is only reachable
+    // from one side, so there is nothing to double-count.
+    for rule in [SelfLoops::Once, SelfLoops::Twice] {
+        assert_eq!(expand_count(&g, &a, Dir::Out, &[], rule), 2);
+        assert_eq!(expand_count(&g, &a, Dir::In, &[], rule), 1);
+    }
+}
