@@ -3625,7 +3625,15 @@ fn vectorized_linear(
             .collect();
         compact(sc, &keep);
     };
-    let mut sc = build_scan(graph, &ctx, &patterns[0], *scope_len, None, where_.as_ref())?;
+    let mut sc = build_scan(
+        graph,
+        &ctx,
+        &patterns[0],
+        *scope_len,
+        None,
+        where_.as_ref(),
+        None,
+    )?;
     if let Some(w) = where_ {
         filter(&mut sc, w);
     }

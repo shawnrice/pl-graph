@@ -460,6 +460,30 @@ pub enum Op {
 #[derive(Debug, Clone)]
 pub struct Program(pub Vec<Op>);
 
+impl Program {
+    /// Push every input slot this program READS into `out`.
+    ///
+    /// Returns `false` if the program contains an opaque [`Op::Tree`] — a
+    /// subquery or aggregate the flattener kept as an expression, whose slots
+    /// this cannot see. A caller using the result to SKIP work must then assume
+    /// every slot is read: under-reporting here would silently drop a column,
+    /// and a dropped group-variable column reads back as `null` rather than
+    /// failing.
+    #[must_use]
+    pub fn read_slots(&self, out: &mut Vec<usize>) -> bool {
+        for op in &self.0 {
+            match op {
+                Op::Var(s) => out.push(*s),
+                Op::Prop { var_slot, .. } => out.push(*var_slot),
+                Op::Tree(_) => return false,
+                _ => {}
+            }
+        }
+
+        true
+    }
+}
+
 fn emit(e: &CExpr, out: &mut Vec<Op>) {
     match e {
         CExpr::Lit(l) => out.push(Op::Const(l.clone())),

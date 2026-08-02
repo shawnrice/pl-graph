@@ -1519,7 +1519,7 @@ pub(super) fn vectorized_arrow(
     } else {
         cap
     };
-    let mut sc = build_scan(graph, ctx, path, *scope_len, cap, where_.as_ref())?;
+    let mut sc = build_scan(graph, ctx, path, *scope_len, cap, where_.as_ref(), None)?;
     if let Some(w) = where_ {
         let keep: Vec<bool> = eval_vec(graph, ctx, &sc, w)
             .into_truth()

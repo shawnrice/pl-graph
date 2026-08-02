@@ -2028,7 +2028,7 @@ pub(super) fn try_parallel_scan(
     let frags: Vec<Option<RowSet>> = start_ids
         .par_chunks(chunk)
         .map(|c| {
-            let mut sc = expand_scan(graph, &ctx, &oriented, *scope_len, c.to_vec(), None)?;
+            let mut sc = expand_scan(graph, &ctx, &oriented, *scope_len, c.to_vec(), None, None)?;
             if let Some(w) = w {
                 let keep: Vec<bool> = eval_vec(graph, &ctx, &sc, w)
                     .into_truth()

@@ -469,23 +469,33 @@ So the fix was not to decline the port. It was three shared changes underneath i
 3. **A `size()` kernel over a value column**, so the shape every group variable
    is actually read through never rebuilds a row binding at all.
 
-Measured after (`layered_dense(6,6)`, forced both ways, min of 7):
+4. **Group columns nothing reads are not built.** `Program::read_slots` collects
+   the input slots the projection, GROUP BY / ORDER BY keys, lifted aggregates and
+   clause WHERE actually read, and `build_scan` skips the rest. It returns
+   `false` — meaning "assume everything" — the moment it meets an opaque
+   `Op::Tree`, because this only ever SKIPS work and a missed slot would read
+   back as `null` rather than failing.
+
+   The trap: `CProjection::order_overlay` is EVERY input slot, populated whether
+   or not the query sorts (it exists so a sort key can name an input the
+   projection dropped). Folding it in unconditionally made the needed-set
+   universal and the elision a silent no-op — it measured as noise, which is
+   exactly how it would have shipped.
+
+Measured (`layered_dense(6,6)`, forced both ways, min of 7):
 
 ```text
-                                columnar   scalar   ratio    (was)
-  -[:R]->{1,4} (no group vars)    2131 us  2494 us   0.85x    0.92x
-  ((x)-[]->(y)){1,4} rows         5592     4074      1.37x    1.28x
-  ((x)-[e]->(y)){1,4} + size      5112     4458      1.15x    1.95x
-  … WHERE size(e) >= 2            6795     5248      1.29x    2.65x
+                                columnar   scalar   ratio   first attempt
+  -[:R]->{1,4} (no group vars)    2171 us  2433 us   0.89x       0.92x
+  ((x)-[]->(y)){1,4} rows         2310     4532      0.51x       1.28x
+  ((x)-[e]->(y)){1,4} + size      4210     4347      0.97x       1.95x
+  … WHERE size(e) >= 2            5122     5142      1.00x       2.65x
 ```
 
-Reading a group variable is now near parity, from 2-2.7x down. What is left is
-RETENTION: the two rows that don't read `x`/`y` at all still build their columns,
-because `build_scan` doesn't know what the projection references. The fix is to
-pass the referenced-slot set down and skip the rest — deliberately NOT done in a
-hurry, because a slot missed by that analysis makes a group variable silently
-null, which is the one kind of wrong answer the differential might not localize.
-`Op::Var`/`Op::Prop`/an opaque `Op::Tree` are the three cases it has to get right.
+Every shape is now at or better than the scalar matcher, where every shape that
+exposed a group variable had been 1.3-2.7x worse. The one that gains most is the
+one that binds group variables and reads none of them — which is the common case,
+because `((x)-[]->(y)){1,4}` is often written for the WALK, not for `x` and `y`.
 
 The lesson for the rest of this effort: "this is one language's problem" was
 wrong here, and the thing that made it wrong was reading the other engine's code

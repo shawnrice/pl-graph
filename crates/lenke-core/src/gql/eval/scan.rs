@@ -525,6 +525,13 @@ fn driven_scan(
     Some(sc)
 }
 
+/// Which slots the rest of the statement will READ, when that is known.
+///
+/// `None` means "assume everything". Only ever used to SKIP building a column,
+/// so an under-populated set would silently drop one — see
+/// [`crate::gql::plan::Program::read_slots`].
+pub(super) type Needed<'a> = Option<&'a [usize]>;
+
 pub(super) fn build_scan(
     graph: &Graph,
     ctx: &Ctx,
@@ -532,6 +539,7 @@ pub(super) fn build_scan(
     scope_len: usize,
     cap: Option<usize>,
     where_: Option<&CExpr>,
+    needed: Needed<'_>,
 ) -> Option<ScanCols> {
     // A path selector (`ANY SHORTEST`) or a bound path variable is handled only by
     // the scalar driver — only it builds the Path value.
@@ -591,7 +599,7 @@ pub(super) fn build_scan(
     // `try_parallel_scan`, so the serial and parallel paths seed identically.
     if let Some(oriented) = try_orient_node_seed(graph, ctx, path, where_) {
         let endpoint = scan_start_seed(graph, ctx, &oriented.start, scope_len, where_);
-        return expand_scan(graph, ctx, &oriented, scope_len, endpoint, cap);
+        return expand_scan(graph, ctx, &oriented, scope_len, endpoint, cap, needed);
     }
     // Edge-first: a single segment with an indexed edge-property hint → seek the
     // matching edges and validate the surrounding (a)-[r]->(b) pattern, instead
@@ -622,7 +630,7 @@ pub(super) fn build_scan(
     }
     // Seed the start-node endpoints, then expand the segments into columns.
     let endpoint = scan_start_seed(graph, ctx, &path.start, scope_len, where_);
-    expand_scan(graph, ctx, path, scope_len, endpoint, cap)
+    expand_scan(graph, ctx, path, scope_len, endpoint, cap, needed)
 }
 
 /// The filtered start-node endpoints for a traversal scan: every live vertex that
@@ -664,6 +672,7 @@ pub(super) fn expand_scan(
     scope_len: usize,
     endpoint: Vec<u32>,
     cap: Option<usize>,
+    needed: Needed<'_>,
 ) -> Option<ScanCols> {
     // A quantified unit's variables are GROUP variables — one list per row, held
     // as `Val` columns, not one element per row. They must not also be claimed
@@ -677,6 +686,20 @@ pub(super) fn expand_scan(
             unit.group_slots(&mut group_slots);
         }
     }
+
+    // Building a group variable's list costs an allocation per row per variable,
+    // and a query that binds `((x)-[e]->(y)){1,4}` but only returns the landing
+    // node reads none of them. Skip the columns nothing downstream will look at.
+    // `kinds` below still excludes every group slot, read or not — those slots are
+    // never element columns.
+    let built: Vec<usize> = match needed {
+        Some(n) => group_slots
+            .iter()
+            .copied()
+            .filter(|s| n.contains(s))
+            .collect(),
+        None => group_slots.clone(),
+    };
 
     // Bound slots and their element kind, in path order.
     let mut kinds: Vec<(usize, Elem)> = Vec::new();
@@ -773,6 +796,7 @@ pub(super) fn expand_scan(
             let mut seg_groups: Vec<usize> = Vec::new();
             if let Some(unit) = seg.unit.as_ref() {
                 unit.group_slots(&mut seg_groups);
+                seg_groups.retain(|s| built.contains(s));
             }
             let spec = crate::gql::eval::pathfind::WalkSpec {
                 q,
@@ -931,7 +955,7 @@ pub(super) fn expand_scan(
         sc.vals[slot] = Some(vals);
     }
 
-    for &s in &group_slots {
+    for &s in &built {
         if let Some(vals) = frontier.take_values(s) {
             sc.vals[s] = Some(vals);
         }
@@ -1890,6 +1914,56 @@ pub(super) fn vectorized_frame(
         return None;
     }
 
+    // Every input slot the rest of this statement reads: the projection items,
+    // the GROUP BY / ORDER BY keys, the lifted aggregates and the clause WHERE.
+    // `None` the moment any of them hides an opaque `Op::Tree` (a subquery or
+    // aggregate the flattener kept as an expression), because this is only used
+    // to SKIP building a column and a missed slot would read back as null.
+    let needed: Option<Vec<usize>> = (|| {
+        let mut out = Vec::new();
+
+        for it in proj.items.iter().chain(&proj.group_by) {
+            if !it.prog.read_slots(&mut out) {
+                return None;
+            }
+        }
+
+        for k in &proj.order_by {
+            if !crate::gql::plan::compile_program(&k.expr).read_slots(&mut out) {
+                return None;
+            }
+        }
+
+        for a in &proj.aggs {
+            if let Some(arg) = a.arg.as_ref() {
+                if !crate::gql::plan::compile_program(arg).read_slots(&mut out) {
+                    return None;
+                }
+            }
+        }
+
+        if let Some(w) = where_.as_ref() {
+            if !crate::gql::plan::compile_program(w).read_slots(&mut out) {
+                return None;
+            }
+        }
+
+        // `RETURN *` carries these across verbatim.
+        if proj.star {
+            out.extend(proj.star_cols.iter().copied());
+        }
+
+        // The ORDER BY overlay is EVERY input slot — it exists so a sort key can
+        // name an input the projection dropped. Only a query that actually sorts
+        // reads it; folding it in unconditionally made `needed` universal and the
+        // elision a no-op.
+        if !proj.order_by.is_empty() {
+            out.extend(proj.order_overlay.iter().copied());
+        }
+
+        Some(out)
+    })();
+
     // With no clause WHERE (and no aggregation/DISTINCT), a LIMIT lets us stop the
     // scan early — preserving the scalar path's streaming advantage for small
     // LIMITs. (DISTINCT/aggregation need every row before producing output.)
@@ -1905,7 +1979,15 @@ pub(super) fn vectorized_frame(
     } else {
         cap
     };
-    let mut sc = build_scan(graph, ctx, path, *scope_len, cap, where_.as_ref())?;
+    let mut sc = build_scan(
+        graph,
+        ctx,
+        path,
+        *scope_len,
+        cap,
+        where_.as_ref(),
+        needed.as_deref(),
+    )?;
 
     // Clause WHERE → keep mask (vectorized), compacting the row set.
     if let Some(w) = where_ {
