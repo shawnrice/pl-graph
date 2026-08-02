@@ -342,6 +342,37 @@ Gremlin's `hasLabel` matches the FIRST label only, so a bucket count matches a
 win in that list was not a fast path at all — `hasLabel` was allocating an
 `Arc<str>` per element to compare two integers (fixed, −17%).
 
+## How much is left, measured
+
+Every point where GQL declines the vectorized frame was labelled and the GQL
+suite run once. ~9300 bails, by reason:
+
+```text
+  2683  multi-pattern            MATCH (a)-[]->(b), (c)-[]->(d)  — a JOIN
+  2507  order+distinct/alias     ORDER BY an output alias; DISTINCT + ORDER BY
+  2489  agg-no-where             deliberate: scalar stream-folds, no materialize
+  1375  multi-clause-or-star     several MATCH clauses, or RETURN *
+   126  incoming-bindings        a prior WITH/INSERT already produced bindings
+    88  build_scan itself        ← the access path
+    51  path-variable            needs the Path value the columnar frame can't build
+     1  multiseg-limit-dfs       deliberate: DFS stops at the LIMIT, BFS can't
+```
+
+**The access path is done.** It accounts for 88 of ~9300 — under 1%. Everything
+else is a layer the IR never claimed: clause composition, joins, and projection.
+Two of the rows (`agg-no-where`, `multiseg-limit-dfs`) are not gaps at all —
+they are routing decisions where the scalar driver is genuinely faster, and each
+has its reasoning recorded at the branch.
+
+So "how much of the scan is left to port" has the answer _almost none_, and the
+next frontier is a different question: `multi-pattern` is a join, and Gremlin's
+`match()` step is the same join. That is where a shared IR would pay next.
+
+This is also why the code surface is currently +4.9% (53267 → 55866 non-test
+lines in `lenke-core/src`): the shared layer was added, and the per-language
+layers above it cannot be deleted until the join/projection layer is shared too.
+The surface shrinks at the END of that work, not this one.
+
 ## The write path is already shared
 
 Audited because "one way of querying OR MUTATING" is the goal and mutation had
