@@ -175,10 +175,57 @@ eight gaps found so far were access-path gaps, none were plan-shape gaps — for
 about a tenth of the cost. It is also the precondition: there is no point sharing
 an optimizer before sharing the thing it decides.
 
+## What the value merge changed about this note
+
+`Val` and `GVal` are now one type (`crate::value::Value`), which this note did
+not anticipate. The relevant correction is to the "traverser semantics" bullet
+above: that argument is about the EXECUTION MODEL, and it still holds. It was
+never an argument about the value carrier, and the carrier turned out to be
+cheap to merge —
+
+- eight of eleven variants were already identical;
+- `Record` (ISO, sorted string keys) and `Map` (TinkerPop, insertion-ordered,
+  any-value keys) are kept as separate variants, because merging THOSE would
+  impose one language's rules on the other;
+- boxing `Path` and `Property` made the union 40 bytes: Gremlin unchanged, GQL
+  17% smaller than before;
+- only six matches across both engines needed new arms.
+
+What it bought was not line count. It was a place for the conversions that both
+engines had been maintaining separately — and the first one moved,
+`Value::index_key`, had **already drifted**: Gremlin's copy had no `Temporal`
+arm, so `has('when', <date>)` scanned where the identical GQL predicate seeked.
+Neither disagreement could produce a failing test, because both were "correct
+but slower".
+
+The cost, recorded because it is a real one: the merged type carries a
+`PartialEq` (TinkerPop's), and GQL must not use it. That used to be enforced by
+`Val` having no such impl at all; now it is a convention.
+
+**Semantics did not merge and should not.** Ordering, null placement, equality
+and rendering stay per-language — see the table under "Not on the table".
+
 ## Not on the table
 
 Unifying the two surface languages. Users pick GQL or Gremlin, and the parallel
 names across them are intentional. Sharing an access path is invisible to both.
+
+Unifying the two total ORDERS. They are deliberately different contracts, not
+drift:
+
+| | GQL | Gremlin |
+| ------ | ---------------------------- | ------------------------------- |
+| ranks | Num, Str, Bool, Temporal | Null, Bool, Num, Str, Temporal |
+| null | sorts LARGEST | sorts FIRST |
+| NaN | Equal to every number | last (`total_cmp`) |
+
+GQL's is pinned byte-for-byte to TS `compareValues`; Gremlin's to TinkerPop.
+Injecting the comparator into a shared sort would share `slice::sort_by` and
+nothing else — GQL's `ORDER BY` is columnar with typed fast paths
+(`dense_sort_key`) that never call a comparator at all, plus `nulls_first`, which
+Gremlin has no concept of. The test for whether something is worth sharing is
+whether the SHARED part is the substance: for seeking it was, for ordering it is
+not.
 
 ## Related
 
