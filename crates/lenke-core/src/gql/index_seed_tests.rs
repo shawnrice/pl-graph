@@ -883,3 +883,69 @@ fn equivalent_spellings_cost_the_same() {
         failures.join("\n\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Self-joins. A pattern naming the same variable twice is an EQUALITY against
+// what the first occurrence bound; the frontier enforces it per row rather than
+// refusing the pattern.
+// ---------------------------------------------------------------------------
+
+fn cyc() -> Graph {
+    crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["P"],"properties":{"n":1}}"#,
+            r#"{"type":"node","id":"b","labels":["P"],"properties":{"n":2}}"#,
+            r#"{"type":"node","id":"c","labels":["P"],"properties":{"n":3}}"#,
+            r#"{"type":"edge","id":"e1","labels":["R"],"from":"a","to":"b","properties":{}}"#,
+            r#"{"type":"edge","id":"e2","labels":["R"],"from":"b","to":"a","properties":{}}"#,
+            r#"{"type":"edge","id":"e3","labels":["R"],"from":"b","to":"c","properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes")
+}
+
+#[test]
+fn a_repeated_variable_closes_the_cycle() {
+    let mut g = cyc();
+
+    // Only a<->b is a 2-cycle; b->c does not come back. Free endpoints would
+    // give 3, so a wrong equality shows up as a row count.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:P)-[:R]->(b:P)-[:R]->(a) RETURN count(*) AS c"
+        ),
+        vec![vec![n(2.0)]]
+    );
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:P)-[:R]->(b:P)-[:R]->(c:P) RETURN count(*) AS c"
+        ),
+        vec![vec![n(3.0)]]
+    );
+}
+
+#[test]
+fn a_repeated_variable_projects_the_bound_element() {
+    let mut g = cyc();
+    let mut got = rows(&mut g, "MATCH (a:P)-[:R]->(b:P)-[:R]->(a) RETURN a.n AS x");
+
+    got.sort_by(|l, r| cmp_val(&l[0], &r[0]));
+    // Both a and b start a 2-cycle; `a` must project the element it bound.
+    assert_eq!(got, vec![vec![n(1.0)], vec![n(2.0)]]);
+}
+
+#[test]
+fn a_repeated_variable_composes_with_a_filter() {
+    let mut g = cyc();
+
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:P)-[:R]->(b:P)-[:R]->(a) WHERE a.n = 1 RETURN b.n AS x"
+        ),
+        vec![vec![n(2.0)]]
+    );
+}

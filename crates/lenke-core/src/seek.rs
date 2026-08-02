@@ -1107,6 +1107,14 @@ pub struct Hop<'a> {
     /// Slots the traversed edge and the reached node bind, if named.
     pub rel_slot: Option<usize>,
     pub node_slot: Option<usize>,
+    /// Slots this hop RE-binds — already carrying a value from an earlier hop.
+    ///
+    /// A pattern may name the same variable twice (`(a)-[:R]->(b)-[:S]->(a)`), and
+    /// the second occurrence is not a new binding but an equality: the reached
+    /// element must be the one already bound. Without this the expansion has to
+    /// refuse the pattern entirely.
+    pub rejoin_rel: bool,
+    pub rejoin_node: bool,
 }
 
 /// What a front end checks per candidate that the IR could not express.
@@ -1236,15 +1244,37 @@ impl Frontier {
                 .filter(|a| !(drop_loop && a.nbr == v));
 
             for a in out.chain(inn).filter(|a| keep_type(a.etype)) {
+                // A re-bound slot is an EQUALITY, not a new binding: the element
+                // reached must be the one the earlier hop already put there.
+                if hop.rejoin_node {
+                    let Some(prior) = hop.node_slot.and_then(|s| self.cols[s].as_ref()) else {
+                        continue;
+                    };
+
+                    if prior[i] != a.nbr {
+                        continue;
+                    }
+                }
+
+                if hop.rejoin_rel {
+                    let Some(prior) = hop.rel_slot.and_then(|s| self.cols[s].as_ref()) else {
+                        continue;
+                    };
+
+                    if prior[i] != a.eidx {
+                        continue;
+                    }
+                }
+
                 if !f.keep(a.eidx, a.nbr) {
                     continue;
                 }
 
                 for (s, col) in new_cols.iter_mut().enumerate() {
                     let Some(col) = col else { continue };
-                    let v = if hop.rel_slot == Some(s) {
+                    let v = if hop.rel_slot == Some(s) && !hop.rejoin_rel {
                         a.eidx
-                    } else if hop.node_slot == Some(s) {
+                    } else if hop.node_slot == Some(s) && !hop.rejoin_node {
                         a.nbr
                     } else if let Some(prior) = &self.cols[s] {
                         prior[i]

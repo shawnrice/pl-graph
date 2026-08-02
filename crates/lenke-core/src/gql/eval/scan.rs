@@ -558,10 +558,21 @@ pub(super) fn expand_scan(
         }
     }
 
-    let mut seen = HashSet::new();
+    // A slot named twice (`(a)-[:R]->(b)-[:S]->(a)`) is a SELF-JOIN: the second
+    // occurrence is an equality against what the first bound, which the frontier
+    // enforces per row. This used to refuse the pattern and fall back.
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut rejoins: Vec<(bool, bool)> = Vec::with_capacity(path.segments.len());
 
-    if kinds.iter().any(|(s, _)| !seen.insert(*s)) {
-        return None; // a slot bound twice (self-join) — not vectorized
+    if let Some(s) = path.start.var_slot {
+        seen.insert(s);
+    }
+
+    for seg in &path.segments {
+        let rel_seen = seg.rel.var_slot.is_some_and(|s| !seen.insert(s));
+        let node_seen = seg.node.var_slot.is_some_and(|s| !seen.insert(s));
+
+        rejoins.push((rel_seen, node_seen));
     }
 
     // The fan-out, the column replication, the LIMIT stop and the
@@ -593,6 +604,8 @@ pub(super) fn expand_scan(
             loops: crate::seek::SelfLoops::Once,
             rel_slot: rel.var_slot,
             node_slot: node.var_slot,
+            rejoin_rel: rejoins[si].0,
+            rejoin_node: rejoins[si].1,
         };
         let mut filter = SegmentFilter {
             graph,
@@ -629,8 +642,14 @@ pub(super) fn expand_scan(
 
     sc.n = frontier.rows();
 
+    // `kinds` lists a self-joined slot TWICE, and a column can only be taken
+    // once — the second take would install an empty column beside full ones.
+    let mut taken: HashSet<usize> = HashSet::new();
+
     for &(s, e) in &kinds {
-        sc.slots[s] = Some((e, frontier.take_column(s).unwrap_or_default()));
+        if taken.insert(s) {
+            sc.slots[s] = Some((e, frontier.take_column(s).unwrap_or_default()));
+        }
     }
 
     Some(sc)
