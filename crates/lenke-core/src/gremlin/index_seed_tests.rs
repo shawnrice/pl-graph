@@ -1588,3 +1588,61 @@ fn an_edge_frontier_declines_a_navigating_step() {
     assert_eq!(got, stream);
     assert_eq!(got.len(), 2000, "one head per edge");
 }
+
+/// Cost of carrying `as(label)` tags through a traversal.
+///
+/// `Trav::tags` is cloned by every `step`/`with`, so a labelled traversal pays
+/// per hop. This is the Gremlin half of the same deep copy that made GQL's group
+/// variables slow — `select(Pop.all, 'x')` after a `repeat` IS a group variable.
+/// Run: `cargo test --release bench_tag_carry -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_tag_carry() {
+    let mut g = seeded();
+
+    type Build = fn() -> super::Traversal;
+
+    let build: &[(&str, Build)] = &[
+        ("untagged 2-hop", || {
+            super::g().V().out(&[]).out(&[]).count()
+        }),
+        ("as() then 2-hop", || {
+            super::g().V().as_("x").out(&[]).out(&[]).count()
+        }),
+        ("as() per hop", || {
+            super::g()
+                .V()
+                .as_("x")
+                .out(&[])
+                .as_("y")
+                .out(&[])
+                .as_("z")
+                .count()
+        }),
+        ("as() per hop + select all", || {
+            super::g()
+                .V()
+                .as_("x")
+                .out(&[])
+                .as_("x")
+                .out(&[])
+                .as_("x")
+                .select_pop(super::Pop::All, &["x"])
+                .count()
+        }),
+    ];
+
+    println!("\n{:<28} {:>10}", "traversal", "best");
+
+    for (name, mk) in build {
+        let mut best = f64::MAX;
+
+        for _ in 0..7 {
+            let t = std::time::Instant::now();
+            let _ = mk().run(&mut g);
+            best = best.min(t.elapsed().as_secs_f64() * 1e6);
+        }
+
+        println!("{name:<28} {best:>9.0}us");
+    }
+}

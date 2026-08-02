@@ -100,7 +100,12 @@ const SAMPLE_SEED: u32 = 0x9e37_79b9;
 struct Trav {
     val: GVal,
     path: Vec<GVal>,
-    tags: Vec<(String, Vec<GVal>)>,
+    /// `as(label)` bindings, label → the values that label took. COPY-ON-WRITE:
+    /// every `step`/`with` clones a traverser, and a labelled traversal
+    /// (`match()`, `select(Pop.all)`, `repeat(__.as('x')…)`) carries these
+    /// through every hop — deep-copying a `String` and a `Vec` per tag per step.
+    /// Sharing makes that a refcount bump; the few writers say `make_mut`.
+    tags: Arc<Vec<(String, Vec<GVal>)>>,
     loops: usize,
     /// The per-traverser sack (TinkerPop `sack()`). LAZY: `None` until a
     /// `sack(op)` write allocates it; a read before that returns the `withSack`
@@ -115,7 +120,7 @@ impl Trav {
         Self {
             path: vec![val.clone()],
             val,
-            tags: Vec::new(),
+            tags: Arc::new(Vec::new()),
             loops: 0,
             sack: None,
         }
@@ -1477,9 +1482,10 @@ fn match_start_label(patterns: &[MatchPattern]) -> String {
 /// `t` with `key` bound to a single `val` (match binds each label once).
 fn match_bind(t: &Trav, key: &str, val: GVal) -> Trav {
     let mut nt = t.clone();
-    match nt.tags.iter_mut().find(|(l, _)| l == key) {
+    let tags = Arc::make_mut(&mut nt.tags);
+    match tags.iter_mut().find(|(l, _)| l == key) {
         Some((_, list)) => *list = vec![val],
-        None => nt.tags.push((key.to_string(), vec![val])),
+        None => tags.push((key.to_string(), vec![val])),
     }
     nt
 }
@@ -3206,9 +3212,10 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             .into_iter()
             .map(|mut t| {
                 let val = t.val.clone();
-                match t.tags.iter_mut().find(|(l, _)| l == label) {
+                let tags = Arc::make_mut(&mut t.tags);
+                match tags.iter_mut().find(|(l, _)| l == label) {
                     Some((_, list)) => list.push(val),
-                    None => t.tags.push((label.clone(), vec![val])),
+                    None => tags.push((label.clone(), vec![val])),
                 }
                 t
             })
