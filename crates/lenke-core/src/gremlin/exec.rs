@@ -238,6 +238,10 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
     // A seeded plan drops the `V()`/`E()` it started from plus the filters the
     // index answered exactly. Every OTHER filter still runs, including any that
     // preceded them — the seed is only a superset with respect to those.
+    if let Some(n) = try_count(graph, &t.steps) {
+        return vec![GVal::Num(n)];
+    }
+
     match index_seed(graph, &t.steps) {
         Some((seed, answered)) if answered.is_empty() => run_steps(graph, ctx, &t.steps[1..], seed),
         Some((seed, answered)) => {
@@ -295,6 +299,96 @@ fn prefix_upper(s: &str) -> Option<String> {
 /// `between` in `gremlin_index_bench`. Only steps on the exact key are dropped;
 /// a `has` on any other key is still doing work, because the seed is only a
 /// superset with respect to those.
+/// Lower the leading `V()`/`E()` + element-filter run into the shared IR.
+///
+/// Returns the seek, which steps it captured in full, and how many leading steps
+/// it read. Split out so a TERMINAL (`count()`) can reuse the same lowering
+/// rather than re-deriving it.
+fn lower_prefix(graph: &Graph, steps: &[Step]) -> Option<(ElementSeek, Vec<usize>, usize, bool)> {
+    let is_edge = match steps.first()? {
+        Step::V(ids) if ids.is_empty() => false,
+        Step::E(ids) if ids.is_empty() => true,
+        _ => return None,
+    };
+    let mut seek = ElementSeek::same_kind(is_edge);
+    let mut captured: Vec<usize> = Vec::new();
+    let mut read = 1;
+
+    for (i, step) in steps.iter().enumerate().skip(1) {
+        match step {
+            Step::Has(key, pred) => {
+                if lower_predicate(key, pred, &mut seek) {
+                    captured.push(i);
+                }
+            }
+            Step::HasLabel(labels) if seek.labels().is_none() => {
+                let ids: Vec<u32> = if is_edge {
+                    labels.iter().filter_map(|l| graph.etype.get(l)).collect()
+                } else {
+                    labels.iter().filter_map(|l| graph.labels.get(l)).collect()
+                };
+
+                if ids.len() == labels.len() {
+                    seek.set_labels(crate::seek::LabelRule::First, ids);
+                    captured.push(i);
+                } else if !labels.is_empty() {
+                    // A name that resolved to nothing matches nothing; say so in
+                    // the IR rather than letting the step scan for it.
+                    seek.set_labels(crate::seek::LabelRule::First, Vec::new());
+                    captured.push(i);
+                }
+            }
+            Step::HasLabel(..) | Step::HasNot(..) => {}
+            _ => break,
+        }
+
+        read = i + 1;
+    }
+
+    Some((seek, captured, read, is_edge))
+}
+
+/// The whole live element set, when nothing narrows it.
+fn universe(graph: &Graph, is_edge: bool) -> Vec<u32> {
+    if is_edge {
+        (0..graph.e_src.len() as u32)
+            .filter(|&e| graph.is_edge_live(e))
+            .collect()
+    } else {
+        graph.vertex_indices().collect()
+    }
+}
+
+/// `V()/E() … count()` answered from the IR, with no traverser built at all.
+///
+/// The count was costing one `Trav` allocation per element purely to take a
+/// length afterwards. Every filter must be captured — an uncaptured one still
+/// has to run, and it can only run over a stream.
+fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
+    let (seek, captured, read, is_edge) = lower_prefix(graph, steps)?;
+
+    // Nothing may sit between the filters and the count, and every filter in the
+    // run must have been captured.
+    if !matches!(steps.get(read), Some(Step::Count(Scope::Global))) || read + 1 != steps.len() {
+        return None;
+    }
+    if captured.len() != read - 1 {
+        return None;
+    }
+
+    let no_params = |_: usize| None;
+
+    if !seek.types_agree(graph, &no_params) {
+        return None;
+    }
+    if !(seek.columnar(graph, &no_params) || (seek.conj_is_empty() && seek.labels().is_some())) {
+        return None;
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    Some(seek.count(graph, &no_params, || universe(graph, is_edge)) as f64)
+}
+
 fn index_seed(graph: &Graph, steps: &[Step]) -> Option<(Vec<Trav>, Vec<usize>)> {
     let is_edge = match steps.first()? {
         Step::V(ids) if ids.is_empty() => false,

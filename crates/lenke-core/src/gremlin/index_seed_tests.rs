@@ -611,3 +611,78 @@ fn an_unknown_label_matches_nothing() {
     )
     .is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// `count()` as an IR terminal — answered without building a traverser. The risk
+// is answering it when something in the pipeline still needs to run.
+// ---------------------------------------------------------------------------
+
+fn count_of(graph: &mut Graph, t: super::Traversal) -> f64 {
+    match t.run(graph).as_slice() {
+        [GVal::Num(n)] => *n,
+        other => panic!("expected one number, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_counted_filter_run_agrees_with_the_row_count() {
+    let mut graph = seeded();
+
+    for t in [
+        g().v_ids(&[]).has_label(&["P"]),
+        g().v_ids(&[]).has_val("n", 5.0),
+        g().v_ids(&[]).has_label(&["P"]).has("n", P::gte(998.0)),
+        g().v_ids(&[]).has("n", P::gte(0.0)),
+        g().e_ids(&[]).has_label(&["R"]),
+    ] {
+        let rows = ids(&mut graph, t.clone()).len() as f64;
+
+        assert_eq!(count_of(&mut graph, t.count()), rows);
+    }
+}
+
+#[test]
+fn a_count_after_an_uncaptured_filter_is_not_short_circuited() {
+    let mut graph = seeded();
+
+    // `neq` contributes nothing to the IR, so the count cannot be answered from
+    // it — the step still has to run. Answering early would report 2000.
+    // Both p5 and q5 carry key0005, so two are excluded, not one.
+    assert_eq!(
+        count_of(
+            &mut graph,
+            g().v_ids(&[]).has("k", P::neq("key0005")).count()
+        ),
+        1998.0
+    );
+}
+
+#[test]
+fn a_count_with_a_step_before_it_is_not_short_circuited() {
+    let mut graph = seeded();
+
+    // `dedup` sits between the filters and the count; the terminal only applies
+    // when nothing else does.
+    assert_eq!(
+        count_of(&mut graph, g().v_ids(&[]).has_label(&["P"]).dedup().count()),
+        1000.0
+    );
+    // A traversal after the filters is likewise not a counted prefix.
+    assert_eq!(
+        count_of(
+            &mut graph,
+            g().v_ids(&[]).has_label(&["P"]).out(&["R"]).count()
+        ),
+        1000.0
+    );
+}
+
+#[test]
+fn a_cross_type_count_still_faults() {
+    let mut graph = seeded();
+
+    // The terminal must not answer what the per-step path would have thrown on.
+    assert!(
+        crate::gremlin::try_run(&mut graph, &g().v_ids(&[]).has("k", P::gt(5.0)).count()).is_err()
+    );
+}
