@@ -373,6 +373,31 @@ instance of which returned the correct answer, so no correctness test could see
 it — but one level up, at the join rather than the predicate, and far larger than
 the 100-300x those cost.
 
+### A chained comma join IS one path
+
+`MATCH (a)-[r]->(b), (b)-[s]->(c)` and `MATCH (a)-[r]->(b)-[s]->(c)` are the same
+query. The second vectorizes; the first stayed on the scalar join purely because
+it arrived as two `CPath`s. `fuse_chain` splices them when each pattern after the
+first starts on the node the previous one ended on and adds nothing to it (no
+label, no inline props, no `WHERE` — a bare back-reference).
+
+```text
+  20k vertices, degree 3      before      after   one-path equivalent
+  (a)-[]->(b), (b)-[]->(c)   12.593 ms   0.094 ms       0.095 ms   134x
+  … , (c)-[]->(d)            40.615      0.117          0.118      347x
+```
+
+The comma spellings now cost what their chain equivalents cost, to the noise
+floor. Two things make it sound, both checked rather than assumed: the trail
+restriction (no repeated edge) applies to a QUANTIFIED walk, not a fixed-length
+path — on a self-loop both spellings return the same row with `r = s` — and the
+row ORDER is unchanged, because the scalar join nests pattern 2 inside pattern 1,
+which is exactly the order one fused path enumerates.
+
+Pinned in `equivalent_spellings_cost_the_same`.
+
+### Picking the pattern to drive
+
 The fix is the one Gremlin already has: choose the next pattern by whether its
 start is bound, instead of by where the user typed it. Doing that in the shared
 IR is the point of the exercise — it is one optimization that both languages

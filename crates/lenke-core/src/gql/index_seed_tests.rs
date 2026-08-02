@@ -854,6 +854,16 @@ fn equivalent_spellings_cost_the_same() {
                 "MATCH (x)-[:R]->(y), (u:P {k: 'key000005'})-[:R]->(x) RETURN count(*) AS c",
             ],
         ),
+        // A comma join that CHAINS is the same query as one path. Before
+        // `fuse_chain` the comma spelling stayed on the scalar join: 134x for two
+        // patterns, 347x for three.
+        (
+            "chained comma vs one path",
+            &[
+                "MATCH (u:P)-[:R]->(x)-[:R]->(y) WHERE u.k = 'key000005' RETURN count(*) AS c",
+                "MATCH (u:P)-[:R]->(x), (x)-[:R]->(y) WHERE u.k = 'key000005' RETURN count(*) AS c",
+            ],
+        ),
         (
             "pattern order, anchored by a clause WHERE",
             &[

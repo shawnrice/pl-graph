@@ -1844,6 +1844,51 @@ pub(super) fn vectorized_cols(
 /// and [`vectorized_rowset`]). Returns `None` (→ scalar driver) unless the shape
 /// qualifies: one fresh `MATCH` of a buildable (non-var-length, no self-join)
 /// path, no `RETURN *`.
+/// Fuse comma patterns that CHAIN into one path, or `None` if they don't.
+///
+/// Only the straightforward case: each pattern after the first must start on the
+/// node the previous one ended on, named by the same slot, and must add nothing
+/// to it — no label, no inline properties, no `WHERE`. A back-reference like the
+/// `(b)` in `…, (b)-[s]->(c)` is exactly that, and re-checking constraints the
+/// first pattern already applied is where a wrong fusion would hide.
+///
+/// Declines a path variable, a non-default selector or mode, since those change
+/// what a path MEANS rather than just where it starts.
+fn fuse_chain(patterns: &[CPath]) -> Option<CPath> {
+    if patterns.len() < 2 {
+        return None;
+    }
+
+    let plain = |p: &CPath| {
+        p.path_var_slot.is_none() && p.selector == PathSelector::Walk && p.mode == PathMode::Trail
+    };
+
+    if !patterns.iter().all(plain) {
+        return None;
+    }
+
+    let mut out = patterns[0].clone();
+
+    for next in &patterns[1..] {
+        let end = out
+            .segments
+            .last()
+            .map_or(out.start.var_slot, |s| s.node.var_slot)?;
+
+        if next.start.var_slot != Some(end)
+            || next.start.label.is_some()
+            || !next.start.props.is_empty()
+            || next.start.where_.is_some()
+        {
+            return None;
+        }
+
+        out.segments.extend(next.segments.iter().cloned());
+    }
+
+    Some(out)
+}
+
 pub(super) fn vectorized_frame(
     graph: &Graph,
     ctx: &Ctx,
@@ -1875,10 +1920,22 @@ pub(super) fn vectorized_frame(
     else {
         return None;
     };
-    if patterns.len() != 1 {
-        return None;
-    }
-    let path = &patterns[0];
+    // `MATCH (a)-[r]->(b), (b)-[s]->(c)` is a JOIN written as two patterns, and
+    // `MATCH (a)-[r]->(b)-[s]->(c)` is the same query written as one. Fuse the
+    // first into the second so the single-pattern frame answers both — the
+    // "collapse equivalent spellings into one shape" this IR is for.
+    //
+    // Sound because the trail restriction (no repeated edge) applies to a
+    // QUANTIFIED walk, not to a fixed-length path: on a self-loop both spellings
+    // return the same row with `r = s`, verified before this was written. And the
+    // row ORDER is unchanged — the scalar join nests pattern 2 inside pattern 1,
+    // which is exactly the order one fused path enumerates.
+    let fused = fuse_chain(patterns);
+    let path = match &fused {
+        Some(p) => p,
+        None if patterns.len() == 1 => &patterns[0],
+        None => return None,
+    };
 
     // A bound path variable needs the scalar driver — only it builds the Path
     // value (`all_walk`/`shortest_walk`); the vectorized frame yields columns.
