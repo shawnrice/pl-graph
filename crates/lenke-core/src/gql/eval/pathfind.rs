@@ -984,13 +984,7 @@ pub(super) fn emit_walk_end(
 ) -> bool {
     match_node_then(graph, ctx, b, end_node, end, &mut |b| {
         if let Some(s) = path_slot {
-            b.set(
-                s,
-                Val::Path {
-                    vertices: verts.to_vec(),
-                    edges: edges.to_vec(),
-                },
-            );
+            b.set(s, Val::path(verts.to_vec(), edges.to_vec()));
         }
         let keep = emit(b);
         if let Some(s) = path_slot {

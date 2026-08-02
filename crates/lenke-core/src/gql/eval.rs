@@ -87,35 +87,17 @@ use crate::error_codes::ErrorCode;
 use crate::graph::{Adj, Column, Graph, TxCommitError, Value};
 use crate::query::RowSet;
 
-/// A runtime value. Extends the core [`Value`] with graph-element handles
-/// (`Node`/`Edge` by dense index) so variables, identity (`a = b`), and
-/// `element_id` work before projection flattens elements to their ids.
-#[derive(Clone, Debug)]
-pub enum Val {
-    Null,
-    Bool(bool),
-    Num(f64),
-    /// Interned string: cloning is a refcount bump, not an allocation.
-    Str(Arc<str>),
-    /// An ISO temporal scalar (`DATE`/`LOCAL DATETIME`/`DURATION`).
-    Temporal(crate::temporal::Temporal),
-    List(Vec<Self>),
-    /// An ISO record / map: string field names → values, **keys kept sorted**
-    /// (the canonical invariant — equality is a slice compare, output is a
-    /// straight emit). Boxed in an `Arc` so a clone is a refcount bump, not a
-    /// deep copy — the per-row `Binding` clone stays cheap.
-    Map(Arc<[(Arc<str>, Self)]>),
-    Node(u32),
-    Edge(u32),
-    /// A walked path: interleaved vertices and edges (`vertices.len() ==
-    /// edges.len() + 1`). Bound by a `SHORTEST`/quantified path pattern.
-    /// Serializes to `{vertices, edges, length}` (length = hop count), the mirror
-    /// of the TS `Path` class.
-    Path {
-        vertices: Vec<u32>,
-        edges: Vec<u32>,
-    },
-}
+/// A runtime value.
+///
+/// An alias of the shared [`crate::value::Value`] — Gremlin's `GVal` is the same
+/// type. The variants GQL uses are `Null`, `Bool`, `Num`, `Str`, `Temporal`,
+/// `Node`, `Edge`, `List`, `Record` (the ISO record — Gremlin's insertion-ordered
+/// `Map` is a different variant) and `Path`; `Map` and `Property` belong to
+/// Gremlin and never appear here.
+///
+/// The type carries a `PartialEq`, and GQL MUST NOT use it: that one is
+/// TinkerPop's. ISO equality is three-valued and lives in [`compare_vals`].
+pub type Val = crate::value::Value;
 
 /// One candidate solution: variable slot → value. Slots are assigned per scope
 /// by the lowering pass, so access is an array index (not a name scan). `None` is
@@ -731,6 +713,10 @@ fn js_num(n: f64) -> String {
 /// JS `String(v)` for non-null values (concat/string fns guard nullish first).
 fn js_str(graph: &Graph, v: &Val) -> String {
     match v {
+        // Gremlin-only variants (`Val` and `GVal` are one type — see
+        // `crate::value`). No GQL expression can produce one; rendering them as
+        // null keeps this total rather than panicking.
+        Val::Map(_) | Val::Property(_) => "null".to_string(),
         Val::Null => "null".to_string(),
         Val::Bool(b) => b.to_string(),
         Val::Num(n) => js_num(*n),
@@ -753,7 +739,8 @@ fn js_str(graph: &Graph, v: &Val) -> String {
             })
             .collect::<Vec<_>>()
             .join(","),
-        Val::Path { vertices, edges } => {
+        Val::Path(p) => {
+            let (vertices, edges) = (&p.vertices, &p.edges);
             // Stringify like the interleaved element sequence (vertex, edge, …).
             let mut parts = Vec::with_capacity(vertices.len() + edges.len());
             for (i, &v) in vertices.iter().enumerate() {
@@ -768,7 +755,7 @@ fn js_str(graph: &Graph, v: &Val) -> String {
         }
         // A record stringifies to its canonical JSON object (via the shared result
         // serializer, so it's byte-identical to how the map serializes elsewhere).
-        Val::Map(_) => {
+        Val::Record(_) => {
             let mut s = String::new();
             crate::codec::push_value(&mut s, &val_to_value(graph, v));
             s
@@ -808,7 +795,7 @@ fn val_eq(a: &Val, b: &Val) -> bool {
         }
         // Records are equal iff they have the same fields (keys are canonical, so
         // positional) with recursively-equal values. ISO records support `=`/`<>`.
-        (Val::Map(x), Val::Map(y)) => {
+        (Val::Record(x), Val::Record(y)) => {
             x.len() == y.len()
                 && x.iter()
                     .zip(y.iter())
@@ -914,7 +901,7 @@ fn cmp_total(a: &Val, b: &Val) -> Ordering {
         // Records: keys are canonical (sorted), so compare field-by-field (key
         // then value), shorter-is-less. Gives ORDER BY / DISTINCT a total order
         // even though ISO defines no relational `<`/`>` on records.
-        (Val::Map(x), Val::Map(y)) => {
+        (Val::Record(x), Val::Record(y)) => {
             for ((k1, v1), (k2, v2)) in x.iter().zip(y.iter()) {
                 let kc = k1.cmp(k2);
                 if kc != Ordering::Equal {
@@ -1011,6 +998,9 @@ fn group_num_bits(n: f64) -> u64 {
 /// A canonical, hashable key for a value — grouping, DISTINCT, row keys.
 fn val_key(v: &Val, out: &mut String) {
     match v {
+        // Gremlin-only (see `crate::value`) — unreachable from GQL, and keyed
+        // like null so the function stays total.
+        Val::Map(_) | Val::Property(_) => out.push('N'),
         Val::Null => out.push('N'),
         Val::Bool(b) => {
             out.push('b');
@@ -1043,7 +1033,7 @@ fn val_key(v: &Val, out: &mut String) {
             out.push(']');
         }
         // Canonical (sorted) keys → a canonical grouping/DISTINCT key string.
-        Val::Map(pairs) => {
+        Val::Record(pairs) => {
             out.push('{');
             for (k, it) in pairs.iter() {
                 out.push_str(k);
@@ -1053,7 +1043,8 @@ fn val_key(v: &Val, out: &mut String) {
             }
             out.push('}');
         }
-        Val::Path { vertices, edges } => {
+        Val::Path(p) => {
+            let (vertices, edges) = (&p.vertices, &p.edges);
             // Structural: two paths are the same key iff they visit the same
             // vertices in the same order via the same edges (so `DISTINCT p` works).
             out.push('P');
@@ -1165,7 +1156,7 @@ fn value_to_val(v: &Value) -> Val {
         Value::List(items) => Val::List(items.iter().map(value_to_val).collect()),
         // A stored record/map reads back as a first-class runtime map (keys are
         // already canonical/sorted in the store).
-        Value::Map(pairs) => Val::Map(
+        Value::Map(pairs) => Val::Record(
             pairs
                 .iter()
                 .map(|(k, v)| (k.clone(), value_to_val(v)))
@@ -1298,6 +1289,8 @@ pub(crate) fn edge_result_value(graph: &Graph, i: u32) -> Value {
 
 fn val_to_value(graph: &Graph, v: &Val) -> Value {
     match v {
+        // Gremlin-only (see `crate::value`) — unreachable from GQL.
+        Val::Map(_) | Val::Property(_) => Value::Null,
         Val::Null => Value::Null,
         Val::Bool(b) => Value::Bool(*b),
         Val::Num(n) => Value::Num(*n),
@@ -1305,7 +1298,7 @@ fn val_to_value(graph: &Graph, v: &Val) -> Value {
         Val::Temporal(t) => Value::Temporal(*t),
         Val::List(items) => Value::List(items.iter().map(|x| val_to_value(graph, x)).collect()),
         // A runtime record → the result map (keys already canonical/sorted).
-        Val::Map(pairs) => Value::Map(
+        Val::Record(pairs) => Value::Map(
             pairs
                 .iter()
                 .map(|(k, v)| (k.clone(), val_to_value(graph, v)))
@@ -1351,7 +1344,8 @@ fn val_to_value(graph: &Graph, v: &Val) -> Value {
                 ),
             ])
         }
-        Val::Path { vertices, edges } => {
+        Val::Path(p) => {
+            let (vertices, edges) = (&p.vertices, &p.edges);
             // `{vertices, edges, length}` — the vertices/edges reuse the element
             // serialization above; `length` is the hop (edge) count. Mirrors the
             // TS `Path.toJSON()` byte-for-byte (field order, sorted labels/props).
@@ -1513,9 +1507,9 @@ fn value_is_typed_ty(v: &Val, ty: &TypeTest, not_null: bool) -> bool {
     }
     match ty {
         TypeTest::Scalar(category) => category_matches(v, category),
-        TypeTest::AnyRecord => matches!(v, Val::Map(_)),
+        TypeTest::AnyRecord => matches!(v, Val::Record(_)),
         TypeTest::Record(fields) => {
-            let Val::Map(pairs) = v else { return false };
+            let Val::Record(pairs) = v else { return false };
             // Closed: every present key must be a declared field.
             if pairs.iter().any(|(vk, _)| {
                 fields
@@ -1743,7 +1737,7 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
             prop_present(env.graph, env.ctx, &bound, *key_ref)
         }
         CExpr::List(items) => Val::List(items.iter().map(|e| eval(env, e)).collect()),
-        // ISO record constructor → a canonical `Val::Map`: fields inserted in
+        // ISO record constructor → a canonical `Val::Record`: fields inserted in
         // sorted-key order, a duplicate field name taking the last value.
         CExpr::Record(fields) => {
             let mut out: Vec<(Arc<str>, Val)> = Vec::with_capacity(fields.len());
@@ -1754,7 +1748,7 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
                     Err(i) => out.insert(i, (k.clone(), v)),
                 }
             }
-            Val::Map(out.into())
+            Val::Record(out.into())
         }
         CExpr::Index { base, index } => {
             // ISO GQL list subscript `base[index]`: 0-based, out of range → null,
@@ -1773,7 +1767,7 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
                     }
                     _ => Val::Null,
                 },
-                Val::Map(pairs) => match &idx_v {
+                Val::Record(pairs) => match &idx_v {
                     Val::Str(k) => map_get(&pairs, k),
                     _ => Val::Null,
                 },
@@ -1789,7 +1783,7 @@ fn eval(env: &Env, expr: &CExpr) -> Val {
             // field by name; a Node/Edge base reads the stored property via
             // `prop_of`; anything else → null, matching the bare `Prop` path.
             let base_v = eval(env, base);
-            if let Val::Map(pairs) = &base_v {
+            if let Val::Record(pairs) = &base_v {
                 map_get(pairs, name)
             } else {
                 prop_of(env.graph, env.ctx, &base_v, *key_ref)
@@ -4011,10 +4005,7 @@ mod path_value_tests {
     #[test]
     fn path_serializes_to_vertices_edges_length() {
         let g = ndjson::decode(NDJSON).unwrap();
-        let path = Val::Path {
-            vertices: vec![0, 1, 2],
-            edges: vec![0, 1],
-        };
+        let path = Val::path(vec![0, 1, 2], vec![0, 1]);
 
         let mut rs = RowSet::new(vec!["p".to_string()]);
         rs.push_row([val_to_value(&g, &path)]);
@@ -4037,18 +4028,9 @@ mod path_value_tests {
     /// The DISTINCT/grouping key is structural: same vertices + edges → same key.
     #[test]
     fn path_val_key_is_structural() {
-        let same_a = Val::Path {
-            vertices: vec![0, 1, 2],
-            edges: vec![0, 1],
-        };
-        let same_b = Val::Path {
-            vertices: vec![0, 1, 2],
-            edges: vec![0, 1],
-        };
-        let diff = Val::Path {
-            vertices: vec![0, 1],
-            edges: vec![0],
-        };
+        let same_a = Val::path(vec![0, 1, 2], vec![0, 1]);
+        let same_b = Val::path(vec![0, 1, 2], vec![0, 1]);
+        let diff = Val::path(vec![0, 1], vec![0]);
 
         let key = |v: &Val| {
             let mut s = String::new();

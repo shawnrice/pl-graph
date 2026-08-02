@@ -288,7 +288,7 @@ pub enum CExpr {
     /// A field access on a stored record: `n.meta.city` (or `n.meta['city']`).
     /// The `Prop`-rooted `Field`/`Index` chain is collapsed here at plan time so
     /// eval navigates the stored `Value` in place and materializes ONLY the leaf,
-    /// instead of cloning the whole `meta` map into a `Val::Map` first. `descent`
+    /// instead of cloning the whole `meta` map into a `Val::Record` first. `descent`
     /// is the field-name path after the root property.
     PropField {
         var_slot: usize,

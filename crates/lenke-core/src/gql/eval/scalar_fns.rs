@@ -165,7 +165,7 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
             Some(Val::List(items)) => Val::Num(items.len() as f64),
             Some(Val::Str(s)) => Val::Num(s.encode_utf16().count() as f64),
             // `length`/`path_length` over a path: the hop (edge) count.
-            Some(Val::Path { edges, .. }) => Val::Num(edges.len() as f64),
+            Some(Val::Path(p)) => Val::Num(p.edges.len() as f64),
             _ => Val::Null,
         },
         Left => match (a, b) {
@@ -247,19 +247,22 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
         // --- path functions (ISO GQL) — vertices/edges kept as live element
         // handles, so each still serializes richly and supports property reads.
         PathNodes => match a {
-            Some(Val::Path { vertices, .. }) => {
+            Some(Val::Path(p)) => {
+                let vertices = &p.vertices;
                 Val::List(vertices.iter().map(|&v| Val::Node(v)).collect())
             }
             _ => Val::Null,
         },
         PathEdges => match a {
-            Some(Val::Path { edges, .. }) => {
+            Some(Val::Path(p)) => {
+                let edges = &p.edges;
                 Val::List(edges.iter().map(|&e| Val::Edge(e)).collect())
             }
             _ => Val::Null,
         },
         PathElements => match a {
-            Some(Val::Path { vertices, edges }) => {
+            Some(Val::Path(p)) => {
+                let (vertices, edges) = (&p.vertices, &p.edges);
                 let mut out = Vec::with_capacity(vertices.len() + edges.len());
                 for (i, &v) in vertices.iter().enumerate() {
                     if i > 0 {
