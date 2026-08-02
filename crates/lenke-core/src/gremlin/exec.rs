@@ -269,6 +269,10 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
         return vec![GVal::Num(n)];
     }
 
+    if let Some(vals) = try_values(graph, &t.steps) {
+        return vals;
+    }
+
     match index_seed(graph, &t.steps) {
         Some((seed, answered)) if answered.is_empty() => run_steps(graph, ctx, &t.steps[1..], seed),
         Some((seed, answered)) => {
@@ -428,6 +432,95 @@ fn universe(graph: &Graph, is_edge: bool) -> Vec<u32> {
     } else {
         graph.vertex_indices().collect()
     }
+}
+
+/// The element ids a lowered prefix plus expansion chain produces, and whatever
+/// steps are left over.
+///
+/// Shared by the terminals so each does not re-derive the walk.
+fn lowered_ids<'a>(graph: &Graph, steps: &'a [Step]) -> Option<(Vec<u32>, &'a [Step], bool)> {
+    let (seek, captured, read, is_edge) = lower_prefix(graph, steps)?;
+
+    // Every filter in the run must have been captured — an uncaptured one can
+    // only run over a stream.
+    if captured.len() != read - 1 {
+        return None;
+    }
+
+    let no_params = |_: usize| None;
+
+    if !seek.types_agree(graph, &no_params) {
+        return None;
+    }
+    if !(seek.columnar(graph, &no_params)
+        || (seek.conj_is_empty() && (seek.labels().is_some() || read == 1)))
+    {
+        return None;
+    }
+
+    let mut ids = seek.scan(graph, &no_params, || universe(graph, is_edge));
+    let mut rest = &steps[read..];
+    let mut edges = is_edge;
+
+    while let [nav @ (Step::Out(labels) | Step::In(labels) | Step::Both(labels)), tail @ ..] = rest
+    {
+        if edges {
+            return None; // edge-to-edge navigation is not this shape
+        }
+
+        let dir = match nav {
+            Step::Out(_) => crate::seek::Dir::Out,
+            Step::In(_) => crate::seek::Dir::In,
+            _ => crate::seek::Dir::Both,
+        };
+        let etypes: Vec<u32> = labels.iter().filter_map(|l| graph.etype.get(l)).collect();
+
+        // A type name that resolved to nothing matches nothing; an EMPTY list
+        // means "any type", so the two must not be confused.
+        if etypes.len() != labels.len() {
+            return Some((Vec::new(), &[], edges));
+        }
+
+        ids = crate::seek::expand(graph, &ids, dir, &etypes);
+        rest = tail;
+        edges = false;
+    }
+
+    Some((ids, rest, edges))
+}
+
+/// `V()/E() … values(k)` answered from the IR: the column is read straight into
+/// the results, with no traverser built for any of the 200k rows it used to.
+fn try_values(graph: &Graph, steps: &[Step]) -> Option<Vec<GVal>> {
+    let (ids, rest, is_edge) = lowered_ids(graph, steps)?;
+    let [Step::Values(keys)] = rest else {
+        return None;
+    };
+    // One key only: `values()` needs a per-element key list, and a multi-key call
+    // interleaves columns per element rather than reading one.
+    let [key] = keys.as_slice() else {
+        return None;
+    };
+    let store = if is_edge {
+        &graph.edge_props
+    } else {
+        &graph.props
+    };
+    let Some(kid) = store.keys.get(key) else {
+        return Some(Vec::new()); // no element ever carried this key
+    };
+    let mut out = Vec::with_capacity(ids.len());
+
+    for id in ids {
+        let i = id as usize;
+
+        // Gate on PRESENCE, not value != Null: a present null rides through.
+        if store.is_present_id(i, kid) {
+            out.push(value_to_gval(store.value_id(i, kid, &graph.strs)));
+        }
+    }
+
+    Some(out)
 }
 
 /// `V()/E() … count()` answered from the IR, with no traverser built at all.

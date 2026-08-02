@@ -939,3 +939,89 @@ fn a_keyed_dedup_is_not_treated_as_element_identity() {
 
     assert_eq!(out.len(), 1, "still answers");
 }
+
+// ---------------------------------------------------------------------------
+// `values(k)` as an IR terminal — the column is read straight into the results.
+// The risks are ORDER, presence, and taking the terminal when it should not.
+// ---------------------------------------------------------------------------
+
+fn vals(graph: &mut Graph, t: super::Traversal) -> Vec<String> {
+    t.run(graph)
+        .iter()
+        .map(|v| match v {
+            GVal::Str(s) => s.to_string(),
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn a_values_terminal_matches_the_walk_exactly() {
+    let mut graph = seeded();
+
+    // Order is observable — `values()` follows traversal order, so the terminal
+    // must produce the same SEQUENCE, not merely the same multiset.
+    //
+    // `dedup()` after the filters is the reference: it blocks the terminal (the
+    // tail is no longer a bare `values`) while leaving the rows and their order
+    // unchanged, since the elements are already distinct.
+    for (t, label) in [
+        (g().v_ids(&[]).has_label(&["P"]), "label only"),
+        (g().v_ids(&[]).has("n", P::gte(996.0)), "range"),
+        (g().v_ids(&[]).has_label(&["P"]).out(&["R"]), "after a hop"),
+        (g().v_ids(&[]).has_val("k", "key0005"), "point seek"),
+    ] {
+        let terminal = vals(&mut graph, t.clone().values(&["k"]));
+        let walked = vals(&mut graph, t.dedup().values(&["k"]));
+
+        assert!(!terminal.is_empty(), "[{label}] produced nothing");
+        assert_eq!(
+            terminal, walked,
+            "[{label}] terminal disagreed with the walk"
+        );
+    }
+}
+
+#[test]
+fn a_values_terminal_skips_absent_and_keeps_present_null() {
+    let mut graph = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["P"],"properties":{"k":"x"}}"#,
+            r#"{"type":"node","id":"b","labels":["P"],"properties":{}}"#,
+            r#"{"type":"node","id":"c","labels":["P"],"properties":{"k":null}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    // `b` has no `k` and is skipped; `c` has a PRESENT null and rides through.
+    assert_eq!(
+        vals(&mut graph, g().v_ids(&[]).has_label(&["P"]).values(&["k"])),
+        vec!["x".to_string(), "Null".to_string()]
+    );
+}
+
+#[test]
+fn a_values_terminal_on_an_unknown_key_is_empty() {
+    let mut graph = seeded();
+
+    assert!(vals(
+        &mut graph,
+        g().v_ids(&[]).has_label(&["P"]).values(&["nope"])
+    )
+    .is_empty());
+}
+
+#[test]
+fn a_multi_key_values_is_not_taken_by_the_terminal() {
+    let mut graph = seeded();
+
+    // Two keys interleave per element; the terminal reads one column, so this
+    // must fall back to the walk rather than dropping a column.
+    let got = vals(
+        &mut graph,
+        g().v_ids(&[]).has("n", P::gte(999.0)).values(&["k", "n"]),
+    );
+
+    assert_eq!(got.len(), 4, "two elements x two keys");
+}
