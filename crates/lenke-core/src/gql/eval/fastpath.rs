@@ -2015,7 +2015,7 @@ pub(super) fn try_parallel_scan(
     // wouldn't orient (an index / edge-property seek), so serial and parallel seed
     // from the identical end and produce the identical row order.
     let oriented = try_orient_node_seed(graph, &ctx, path, where_.as_ref())?;
-    let start_ids = scan_start_seed(graph, &ctx, &oriented.start, *scope_len, where_);
+    let start_ids = scan_start_seed(graph, &ctx, &oriented.start, *scope_len, where_.as_ref());
     const MIN_SEEDS: usize = 8_192;
     if start_ids.len() < MIN_SEEDS {
         return None;

@@ -756,7 +756,7 @@ pub(super) struct ProjAccum<'p> {
 }
 
 impl<'p> ProjAccum<'p> {
-    fn new(proj: &'p CProjection, ctx: &Ctx) -> Self {
+    pub(super) fn new(proj: &'p CProjection, ctx: &Ctx) -> Self {
         let topk = !proj.aggregating
             && !proj.order_by.is_empty()
             && proj.limit.is_some()
@@ -840,7 +840,7 @@ impl<'p> ProjAccum<'p> {
 
     /// Accept one input binding. Returns `false` to request a stop (streamable
     /// LIMIT: non-aggregating, no ORDER BY, enough rows collected).
-    fn accept(&mut self, graph: &Graph, ctx: &Ctx, binding: &Binding) -> bool {
+    pub(super) fn accept(&mut self, graph: &Graph, ctx: &Ctx, binding: &Binding) -> bool {
         let proj = self.proj;
         if self.topk {
             // Sort key from the input alone (output slots absent + input overlay),
@@ -955,7 +955,7 @@ impl<'p> ProjAccum<'p> {
         true
     }
 
-    fn finish(mut self, graph: &Graph, ctx: &Ctx) -> Vec<Binding> {
+    pub(super) fn finish(mut self, graph: &Graph, ctx: &Ctx) -> Vec<Binding> {
         let proj = self.proj;
         if proj.aggregating {
             if !self.grouped {
@@ -1030,7 +1030,7 @@ impl<'p> ProjAccum<'p> {
     /// caller gates to the aggregating, non-topk, non-DISTINCT-agg case. Merging
     /// chunks in seed order reproduces the serial first-seen group order exactly.
     #[cfg(feature = "parallel-query")]
-    fn merge(&mut self, mut other: Self) {
+    pub(super) fn merge(&mut self, mut other: Self) {
         if let Some((rep, other_aggs)) = other.global.take() {
             match &mut self.global {
                 Some((_, aggs)) => {
