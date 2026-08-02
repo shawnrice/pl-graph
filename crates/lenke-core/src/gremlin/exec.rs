@@ -384,32 +384,52 @@ fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
         return None;
     }
 
-    let ids = || seek.scan(graph, &no_params, || universe(graph, is_edge));
+    // A CHAIN of expansions, then the count. Each hop keeps duplicates, because
+    // each is its own traverser; only the last hop can skip materializing.
+    let mut rest = &steps[read..];
+    let mut hops: Vec<(crate::seek::Dir, Vec<u32>)> = Vec::new();
+
+    while let [nav @ (Step::Out(labels) | Step::In(labels) | Step::Both(labels)), tail @ ..] = rest
+    {
+        if is_edge {
+            return None; // edge-to-edge navigation is not this shape
+        }
+
+        let dir = match nav {
+            Step::Out(_) => crate::seek::Dir::Out,
+            Step::In(_) => crate::seek::Dir::In,
+            _ => crate::seek::Dir::Both,
+        };
+        let etypes: Vec<u32> = labels.iter().filter_map(|l| graph.etype.get(l)).collect();
+
+        // A type name that resolved to nothing matches nothing; an EMPTY list
+        // means "any type", so the two must not be confused.
+        if etypes.len() != labels.len() {
+            return Some(0.0);
+        }
+
+        hops.push((dir, etypes));
+        rest = tail;
+    }
+
+    if !matches!(rest, [Step::Count(Scope::Global)]) {
+        return None;
+    }
+
+    let mut ids = seek.scan(graph, &no_params, || universe(graph, is_edge));
 
     #[allow(clippy::cast_precision_loss)]
-    match &steps[read..] {
-        // `… count()`
-        [Step::Count(Scope::Global)] => Some(ids().len() as f64),
-        // `… out/in/both(labels).count()` — the expansion never materializes.
-        [nav @ (Step::Out(labels) | Step::In(labels) | Step::Both(labels)), Step::Count(Scope::Global)]
-            if !is_edge =>
-        {
-            let dir = match nav {
-                Step::Out(_) => crate::seek::Dir::Out,
-                Step::In(_) => crate::seek::Dir::In,
-                _ => crate::seek::Dir::Both,
-            };
-            let etypes: Vec<u32> = labels.iter().filter_map(|l| graph.etype.get(l)).collect();
-
-            // A type name that resolved to nothing matches nothing; an EMPTY
-            // list means "any type", so the two must not be confused.
-            if etypes.len() != labels.len() {
-                return Some(0.0);
+    match hops.split_last() {
+        // No expansion: the filtered set itself.
+        None => Some(ids.len() as f64),
+        // Walk every hop but the last, then COUNT the last without building it.
+        Some(((dir, etypes), init)) => {
+            for (d, e) in init {
+                ids = crate::seek::expand(graph, &ids, *d, e);
             }
 
-            Some(crate::seek::expand_count(graph, &ids(), dir, &etypes) as f64)
+            Some(crate::seek::expand_count(graph, &ids, *dir, etypes) as f64)
         }
-        _ => None,
     }
 }
 
@@ -1834,13 +1854,51 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         Step::Out(labels) | Step::In(labels) | Step::Both(labels) => {
             let (out, inn) = dir_flags(step);
             let mut next = Vec::new();
+
             for t in &stream {
                 if let GVal::Node(v) = t.val {
-                    for a in adj_in_label_order(graph, v, out, inn, labels) {
-                        next.push(t.step(GVal::Node(a.1)));
+                    // No label, or exactly ONE, needs no intermediate: stream
+                    // adjacency straight through. The per-vertex `Vec` in
+                    // `adj_in_label_order` exists only to emit results in the
+                    // ARGUMENTS' label order, and one argument has no order to
+                    // get wrong — so `out('KNOWS')`, much the commonest shape,
+                    // was paying an allocation per source vertex for nothing.
+                    if labels.len() <= 1 {
+                        let want = labels.first().and_then(|l| graph.etype.get(l));
+
+                        // A label that names no type matches nothing — distinct
+                        // from no label at all, which matches every type.
+                        if labels.is_empty() || want.is_some() {
+                            let keep = move |a: &crate::graph::Adj| {
+                                want.is_none_or(|w| a.etype == w)
+                            };
+
+                            if out {
+                                next.extend(
+                                    graph
+                                        .out_adj(v)
+                                        .filter(keep)
+                                        .map(|a| t.step(GVal::Node(a.nbr))),
+                                );
+                            }
+
+                            if inn {
+                                next.extend(
+                                    graph
+                                        .in_adj(v)
+                                        .filter(keep)
+                                        .map(|a| t.step(GVal::Node(a.nbr))),
+                                );
+                            }
+                        }
+                    } else {
+                        for a in adj_in_label_order(graph, v, out, inn, labels) {
+                            next.push(t.step(GVal::Node(a.1)));
+                        }
                     }
                 }
             }
+
             next
         }
 

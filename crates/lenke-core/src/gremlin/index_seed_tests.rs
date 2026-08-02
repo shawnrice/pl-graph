@@ -772,3 +772,54 @@ fn a_counted_expansion_respects_direction() {
     assert_eq!(out_r, 1000.0);
     assert_eq!(in_r, 0.0, "no R edge points at a P");
 }
+
+#[test]
+fn a_chained_counted_expansion_agrees_with_the_walk() {
+    let mut graph = seeded();
+
+    for (t, label) in [
+        (
+            g().v_ids(&[]).has_label(&["P"]).out(&["R"]).out(&["S"]),
+            "R then S",
+        ),
+        (
+            g().v_ids(&[]).has_label(&["P"]).out(&[]).out(&[]),
+            "any then any",
+        ),
+        (
+            g().v_ids(&[])
+                .has_label(&["P"])
+                .out(&["R"])
+                .out(&["S"])
+                .out(&["R"]),
+            "three hops",
+        ),
+        (
+            g().v_ids(&[]).has_label(&["P"]).both(&[]).both(&[]),
+            "both twice",
+        ),
+    ] {
+        // Every intermediate hop keeps duplicates, since each is its own
+        // traverser — collapsing one would undercount the next.
+        let walked = ids(&mut graph, t.clone()).len() as f64;
+
+        assert_eq!(count_of(&mut graph, t.count()), walked, "{label}");
+    }
+}
+
+#[test]
+fn an_unknown_label_mid_chain_stops_the_count() {
+    let mut graph = seeded();
+
+    assert_eq!(
+        count_of(
+            &mut graph,
+            g().v_ids(&[])
+                .has_label(&["P"])
+                .out(&["R"])
+                .out(&["Nope"])
+                .count()
+        ),
+        0.0
+    );
+}
