@@ -33,6 +33,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::graph::{Column, Graph, IdxKey, RangeBound};
+use crate::value::Value;
 
 /// How a parameter slot resolves to index keys.
 ///
@@ -1189,6 +1190,12 @@ impl RowFilter for KeepAll {
 /// once.
 pub struct Frontier {
     cols: Vec<Option<Vec<u32>>>,
+    /// Value columns, for slots whose per-row binding is not a single element.
+    /// A GQL group variable is the list of one repetition's values, and a Gremlin
+    /// `select(Pop.all, 'x')` after a `repeat` is the same list — the frontier has
+    /// to fan these out exactly like the id columns, or a later hop leaves them
+    /// short and every row past the first reads off the end.
+    vals: Vec<Option<Vec<Value>>>,
     endpoint: Vec<u32>,
 }
 
@@ -1206,7 +1213,13 @@ impl Frontier {
             cols[s] = Some(endpoint.clone());
         }
 
-        Self { cols, endpoint }
+        let vals = (0..width.max(1)).map(|_| None).collect();
+
+        Self {
+            cols,
+            vals,
+            endpoint,
+        }
     }
 
     #[must_use]
@@ -1222,6 +1235,19 @@ impl Frontier {
     /// Take a bound column out of the frontier.
     pub fn take_column(&mut self, slot: usize) -> Option<Vec<u32>> {
         self.cols.get_mut(slot).and_then(Option::take)
+    }
+
+    /// Install a value column, aligned with the CURRENT rows. Later hops fan it
+    /// out with the id columns.
+    pub fn set_values(&mut self, slot: usize, vals: Vec<Value>) {
+        if slot < self.vals.len() {
+            self.vals[slot] = Some(vals);
+        }
+    }
+
+    /// Take a value column back out.
+    pub fn take_values(&mut self, slot: usize) -> Option<Vec<Value>> {
+        self.vals.get_mut(slot).and_then(Option::take)
     }
 
     /// Mark a slot as carrying values, so later hops replicate it.
@@ -1245,6 +1271,14 @@ impl Frontier {
             })
             .collect();
 
+        let mut new_vals: Vec<Option<Vec<Value>>> = (0..width)
+            .map(|s| {
+                self.vals[s]
+                    .as_ref()
+                    .map(|_| Vec::with_capacity(rows.len()))
+            })
+            .collect();
+
         for (k, &i) in rows.iter().enumerate() {
             for (s, col) in new_cols.iter_mut().enumerate() {
                 let Some(col) = col else { continue };
@@ -1258,9 +1292,18 @@ impl Frontier {
 
                 col.push(v);
             }
+
+            for (s, col) in new_vals.iter_mut().enumerate() {
+                let (Some(col), Some(prior)) = (col, &self.vals[s]) else {
+                    continue;
+                };
+
+                col.push(prior[i].clone());
+            }
         }
 
         self.cols = new_cols;
+        self.vals = new_vals;
         self.endpoint = ends.to_vec();
     }
 
@@ -1292,6 +1335,9 @@ impl Frontier {
             new_cols[s] = Some(Vec::new());
         }
 
+        let mut new_vals: Vec<Option<Vec<Value>>> = (0..width)
+            .map(|s| self.vals[s].as_ref().map(|_| Vec::new()))
+            .collect();
         let mut new_endpoint: Vec<u32> = Vec::new();
         let keep_type = |t: u32| hop.etypes.is_none_or(|e| e.contains(&t));
         let drop_loop = hop.dir == Dir::Both && hop.loops == SelfLoops::Once;
@@ -1354,6 +1400,14 @@ impl Frontier {
                     col.push(v);
                 }
 
+                for (s, col) in new_vals.iter_mut().enumerate() {
+                    let (Some(col), Some(prior)) = (col, &self.vals[s]) else {
+                        continue;
+                    };
+
+                    col.push(prior[i].clone());
+                }
+
                 new_endpoint.push(a.nbr);
 
                 if cap.is_some_and(|c| new_endpoint.len() >= c) {
@@ -1367,6 +1421,7 @@ impl Frontier {
         }
 
         self.cols = new_cols;
+        self.vals = new_vals;
         self.endpoint = new_endpoint;
         Ok(())
     }

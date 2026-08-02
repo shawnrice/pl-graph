@@ -5708,6 +5708,276 @@ fn quantified_subpath_group_variables() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Quantified segments through the VECTORIZED scan. `expand_scan` drives the same
+// walker (`reachable_each_unit`) and the same group binder (`bind_group_vars`) the
+// scalar matcher uses, once per frontier row, and reads the bound group variables
+// off into `Val::List` value columns. These pin what the columnar build must
+// reproduce: the per-repetition ORDER inside each list, and row-for-row agreement
+// with the scalar driver on every quantified shape.
+// ---------------------------------------------------------------------------
+
+/// a→b→c→d→e with a distinct `amt` per edge, so a group list's ORDER is observable
+/// (a set-equal but mis-ordered list would still fail).
+fn stepped_chain() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"id":"a","bal":1.0}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"id":"b","bal":2.0}}"#,
+        r#"{"type":"node","id":"c","labels":["N"],"properties":{"id":"c","bal":3.0}}"#,
+        r#"{"type":"node","id":"d","labels":["N"],"properties":{"id":"d","bal":4.0}}"#,
+        r#"{"type":"node","id":"e","labels":["N"],"properties":{"id":"e","bal":5.0}}"#,
+        r#"{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{"amt":11.0}}"#,
+        r#"{"type":"edge","id":"e2","from":"b","to":"c","labels":["R"],"properties":{"amt":22.0}}"#,
+        r#"{"type":"edge","id":"e3","from":"c","to":"d","labels":["R"],"properties":{"amt":33.0}}"#,
+        r#"{"type":"edge","id":"e4","from":"d","to":"e","labels":["R"],"properties":{"amt":44.0}}"#,
+    ])
+}
+
+/// Run `query` under the vectorized scan and again under the scalar matcher, assert
+/// the two agree row-for-row (order included — both enumerate seeds then trails in
+/// the same order), and return the rows.
+fn vec_eq_scalar(g: &mut Graph, query: &str) -> Vec<Vec<Value>> {
+    let on = super::eval::with_vec_override(true, || rows(g, query));
+    let off = super::eval::with_vec_override(false, || rows(g, query));
+    assert_eq!(on, off, "vectorized != scalar for `{query}`");
+    on
+}
+
+/// Every repetition's value lands in its group variable's list, IN WALK ORDER —
+/// rep `i`'s source at `x[i]`, its edge at `e[i]`, its target at `y[i]` — and the
+/// vectorized column build agrees with the scalar matcher.
+#[test]
+fn group_variables_bind_each_repetition_in_order() {
+    let mut g = stepped_chain();
+    // Three reps of a one-hop unit from `a`: a→b→c→d.
+    // x = [a,b,c], y = [b,c,d], e = [e1,e2,e3] (amts 11, 22, 33).
+    assert_eq!(
+        vec_eq_scalar(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){3} (t) \
+             RETURN t.id AS tid, size(x) AS nx, size(e) AS ne, size(y) AS ny, \
+             x[0].id AS x0, x[1].id AS x1, x[2].id AS x2, \
+             y[0].id AS y0, y[1].id AS y1, y[2].id AS y2, \
+             e[0].amt AS a0, e[1].amt AS a1, e[2].amt AS a2",
+        ),
+        vec![vec![
+            s("d"),
+            n(3.0),
+            n(3.0),
+            n(3.0),
+            s("a"),
+            s("b"),
+            s("c"),
+            s("b"),
+            s("c"),
+            s("d"),
+            n(11.0),
+            n(22.0),
+            n(33.0),
+        ]],
+    );
+    // A TWO-hop unit: each rep contributes one value per element position, so the
+    // mid node `m` strides by 2 over the walk while `y` takes every other target.
+    // rep1 = a→b→c (m=b, y=c), rep2 = c→d→e (m=d, y=e).
+    assert_eq!(
+        vec_eq_scalar(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e1:R]->(m)-[e2:R]->(y)){2} (t) \
+             RETURN t.id AS tid, x[0].id AS x0, x[1].id AS x1, \
+             m[0].id AS m0, m[1].id AS m1, y[0].id AS y0, y[1].id AS y1, \
+             e1[0].amt AS p0, e2[0].amt AS q0, e1[1].amt AS p1, e2[1].amt AS q1",
+        ),
+        vec![vec![
+            s("e"),
+            s("a"),
+            s("c"),
+            s("b"),
+            s("d"),
+            s("c"),
+            s("e"),
+            n(11.0),
+            n(22.0),
+            n(33.0),
+            n(44.0),
+        ]],
+    );
+}
+
+/// Growing repetition counts: the SAME variable is a list of length 1, 2, 3 … on
+/// successive rows, so the value column really is per-row (not a shape frozen by
+/// the first row the builder saw).
+#[test]
+fn group_variable_list_length_tracks_each_row_repetition_count() {
+    let mut g = stepped_chain();
+    assert_eq!(
+        vec_eq_scalar(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){1,4} (t) \
+             RETURN t.id AS tid, size(e) AS ne, e[0].amt AS first, \
+             y[size(y) - 1].id AS last ORDER BY size(e)",
+        ),
+        vec![
+            vec![s("b"), n(1.0), n(11.0), s("b")],
+            vec![s("c"), n(2.0), n(11.0), s("c")],
+            vec![s("d"), n(3.0), n(11.0), s("d")],
+            vec![s("e"), n(4.0), n(11.0), s("e")],
+        ],
+    );
+    // `{0,n}` — the zero-repetition match binds every group variable to an EMPTY
+    // list (the endpoint is the seed itself), on the same column as the longer rows.
+    assert_eq!(
+        vec_eq_scalar(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){0,2} (t) \
+             RETURN t.id AS tid, size(x) AS nx, size(e) AS ne ORDER BY size(e)",
+        ),
+        vec![
+            vec![s("a"), n(0.0), n(0.0)],
+            vec![s("b"), n(1.0), n(1.0)],
+            vec![s("c"), n(2.0), n(2.0)],
+        ],
+    );
+}
+
+/// A nested quantifier's group variables nest one list level per enclosing
+/// quantifier — the columnar build stores whatever `bind_group_vars` produced, so
+/// the nesting survives unchanged into the value column.
+#[test]
+fn nested_quantifier_group_variables_vectorize() {
+    let mut g = stepped_chain();
+    // `( (x)-[e:R]->{2,2}(y) ){2}`: two outer reps of two inner hops. `x`/`y` sit at
+    // the OUTER unit's depth (flat lists); `e` is inside the inner quantifier, so it
+    // is a list of lists — one inner list per outer rep.
+    assert_eq!(
+        vec_eq_scalar(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ( (x)-[e:R]->{2,2}(y) ){2} (t) \
+             RETURN t.id AS tid, x[0].id AS x0, x[1].id AS x1, \
+             y[0].id AS y0, y[1].id AS y1, \
+             size(e) AS ne, size(e[0]) AS ne0, e[0][0].amt AS a00, e[1][1].amt AS a11",
+        ),
+        vec![vec![
+            s("e"),
+            s("a"),
+            s("c"),
+            s("c"),
+            s("e"),
+            n(2.0),
+            n(2.0),
+            n(11.0),
+            n(44.0),
+        ]],
+    );
+}
+
+/// Group-variable columns survive a `WITH` (the vectorized pipeline carries value
+/// columns forward) and can be filtered/aggregated past it.
+#[test]
+fn group_variables_carry_through_a_with() {
+    let mut g = stepped_chain();
+    assert_eq!(
+        vec_eq_scalar(
+            &mut g,
+            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){1,3} (t) \
+             WITH e AS hops, t WHERE size(hops) >= 2 \
+             RETURN t.id AS tid, size(hops) AS n, hops[1].amt AS amt2 ORDER BY size(hops)",
+        ),
+        vec![vec![s("c"), n(2.0), n(22.0)], vec![s("d"), n(3.0), n(22.0)],],
+    );
+}
+
+/// The abbreviated `-[e]->{n,m}` form does NOT expose `e` at the trail end (the
+/// matcher binds it per hop, for that hop's own predicate only) — so it stays NULL,
+/// in the vectorized build exactly as in the scalar one. This is the one quantified
+/// edge variable the columnar path must NOT turn into a column.
+#[test]
+fn abbreviated_quantified_edge_variable_stays_unbound() {
+    let mut g = stepped_chain();
+    assert_eq!(
+        vec_eq_scalar(
+            &mut g,
+            "MATCH (s:N {id:'a'})-[e:R]->{2}(t) RETURN t.id AS tid, e AS e",
+        ),
+        vec![vec![s("c"), Value::Null]],
+    );
+}
+
+/// The vectorized and scalar drivers must agree on every quantified shape the
+/// columnar builder now accepts — bounds, path mode, per-repetition `WHERE`,
+/// endpoint constraints, a quantified segment in the middle of a longer path, an
+/// anonymous endpoint, and the self-join shapes the builder declines (which must
+/// fall back cleanly rather than produce different rows).
+#[test]
+fn vectorized_quantified_scan_agrees_with_the_scalar_matcher() {
+    let mut g = stepped_chain();
+    // Every ORDER BY names an INPUT expression (`t.id`), never an output alias:
+    // sorting by an alias routes the whole query to the materialized-column path,
+    // which would silently stop exercising the columnar build this test is about.
+    for q in [
+        // Abbreviated form, every bound shape.
+        "MATCH (s:N {id:'a'})-[:R]->{1,3}(t) RETURN t.id AS id ORDER BY t.id",
+        "MATCH (s:N {id:'a'})-[:R]->{0,2}(t) RETURN t.id AS id ORDER BY t.id",
+        "MATCH (s:N {id:'a'})-[:R]->{2}(t) RETURN t.id AS id",
+        "MATCH (s:N)-[:R]->{1,2}(t:N) RETURN s.id AS a, t.id AS b ORDER BY s.id, t.id",
+        // Undirected + inbound repetition.
+        "MATCH (s:N {id:'c'})-[:R]-{1,2}(t) RETURN t.id AS id ORDER BY t.id",
+        "MATCH (s:N {id:'c'})<-[:R]-{1,2}(t) RETURN t.id AS id ORDER BY t.id",
+        // Parenthesized unit with group variables.
+        "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){1,3} (t) \
+         RETURN t.id AS id, size(e) AS ne, x[0].id AS x0 ORDER BY size(e)",
+        // Per-repetition WHERE over the unit's own variables.
+        "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt <= 33.0){1,4} (t) \
+         RETURN t.id AS id, size(e) AS ne ORDER BY size(e)",
+        // Endpoint label / inline props / WHERE on the landing node.
+        "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){1,4} (t:N {id:'d'}) RETURN size(e) AS ne",
+        "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){1,4} (t WHERE t.bal > 3.0) \
+         RETURN t.id AS id ORDER BY t.id",
+        // Anonymous endpoint, anonymous unit variables.
+        "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){2} RETURN size(e) AS ne",
+        "MATCH (s:N {id:'a'}) (()-[:R]->()){2} (t) RETURN t.id AS id",
+        // A quantified segment surrounded by fixed hops (columns replicate on both
+        // sides of the repetition).
+        "MATCH (s:N {id:'a'})-[f:R]->(m) ((x)-[e:R]->(y)){1,2} (t) \
+         RETURN m.id AS mid, t.id AS tid, size(e) AS ne ORDER BY t.id, size(e)",
+        "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){1,2} (m)-[f:R]->(t) \
+         RETURN t.id AS tid, size(e) AS ne ORDER BY t.id",
+        // Two quantified segments in one path.
+        "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){1,2} (m) ((p)-[r:R]->(qq)){1,2} (t) \
+         RETURN t.id AS tid, size(e) AS ne, size(r) AS nr \
+         ORDER BY t.id, size(e), size(r)",
+        // Nested quantifier.
+        "MATCH (s:N {id:'a'}) ( (x)-[e:R]->{1,2}(y) ){1,2} (t) \
+         RETURN t.id AS tid, size(x) AS nx ORDER BY t.id, size(x)",
+        // Non-default path modes (routed to the scalar driver, kept here so the
+        // corpus covers them if that ever changes).
+        "MATCH WALK (s:N {id:'a'})-[:R]->{1,3}(t) RETURN t.id AS id ORDER BY t.id",
+        "MATCH ACYCLIC (s:N {id:'a'}) ((x)-[e:R]->(y)){1,3} (t) \
+         RETURN t.id AS id ORDER BY t.id",
+        // Clause WHERE over a group variable + aggregation over the repetition.
+        "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){1,4} (t) WHERE size(e) = 2 \
+         RETURN t.id AS id",
+        "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){1,4} (t) WHERE t.bal > 2.0 \
+         RETURN count(*) AS c",
+        // LIMIT — the vectorized build may stop the walk early; same prefix either way.
+        "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){1,4} (t) RETURN t.id AS id LIMIT 2",
+        // A group-variable column carried into a following clause: an expanding
+        // MATCH, an OPTIONAL MATCH (its new slots become nullable value columns
+        // beside the list columns), a WITH, and DISTINCT over a list-derived value.
+        "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){1,2} (t) MATCH (t)-[f:R]->(u) \
+         RETURN u.id AS id, size(e) AS ne ORDER BY u.id",
+        "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){1,2} (t) OPTIONAL MATCH (t)-[f:R]->(u) \
+         RETURN t.id AS tid, size(e) AS ne ORDER BY t.id",
+        "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){1,4} (t) WITH size(e) AS ne \
+         RETURN DISTINCT ne ORDER BY ne",
+        // Shapes the columnar builder declines (a slot bound twice): must still
+        // agree, via the scalar fallback.
+        "MATCH (s:N {id:'a'}) ((s)-[e:R]->(y)){2} (t) RETURN t.id AS id",
+        "MATCH (s:N {id:'a'}) ((x)-[e:R]->(x)){1,2} (t) RETURN t.id AS id ORDER BY t.id",
+    ] {
+        vec_eq_scalar(&mut g, q);
+    }
+}
+
 /// A layered graph: `layers` ranks of `width` nodes each, every node fully
 /// connected to the next rank (dense fan-out). Rank-0 node 0 is `src`.
 fn layered_dense(layers: usize, width: usize) -> Graph {
@@ -5803,6 +6073,18 @@ fn bench_var_length_matcher() {
             "nest_grpvar",
             "MATCH (s:N {id:'n0'}) ( (x)-[:R]->{1,2}(y) ){1,2} (t) RETURN count(size(x)) AS c",
         ),
+        // ROW-returning shapes: these choose between the columnar build (`expand_scan`
+        // drives the walker per frontier row into columns) and the scalar streaming
+        // driver, which the `count(*)` rows above cannot distinguish. See
+        // `bench_quantified_vec_vs_scalar` for the side-by-side.
+        (
+            "rows_abbrev",
+            "MATCH (s:N {id:'n0'})-[:R]->{1,4}(x) RETURN x.id AS id",
+        ),
+        (
+            "rows_grpvar",
+            "MATCH (s:N {id:'n0'}) ((x)-[e:R]->(y)){1,4} (t) RETURN t.id AS id, size(e) AS ne",
+        ),
     ];
     for (label, q) in cases {
         for _ in 0..5 {
@@ -5815,6 +6097,82 @@ fn bench_var_length_matcher() {
         }
         let el = t.elapsed();
         eprintln!("bench {label}: {iters} iters, {:?}/iter", el / iters);
+    }
+}
+
+/// The routing question for a quantified segment: columnar build (`expand_scan`)
+/// vs the scalar streaming driver, same query, same fixture, forced both ways.
+///
+/// Measured on `layered_dense(6, 6)` (100 iters, repeated — the ordering is stable
+/// run to run, the absolute numbers move ~10%):
+///
+/// ```text
+///                            columnar   scalar
+///   -[:R]->{1,4}  RETURN id     131µs     143µs   ← no group variables: a win
+///   ((x)-[]->(y)){1,4} rows     365µs     286µs
+///   ((x)-[e]->(y)){1,4} +size   802µs     411µs
+///   … WHERE size(e) >= 2       1093µs     412µs
+///   ( (x)-[]->{1,2}(y) ){1,2}  1115µs     890µs
+/// ```
+///
+/// A quantified segment that exposes NO group variables vectorizes at or better
+/// than the scalar walker. One that DOES is 1.3-2.7x worse, and the reason is
+/// structural, not a missing tune-up: `bind_group_vars` allocates a `Val::List` per
+/// variable per trail in BOTH drivers, but the columnar build keeps every one of
+/// them live in a column instead of dropping it at the end of the row, and no
+/// vectorized kernel reads a list column — `size(e)`, `e[0].amt` and friends all
+/// fall to `scalar_col`, which rebuilds a full `Binding` per row and DEEP-COPIES
+/// every list into it (`Val::List(Vec<Val>)`; `Val::Map` already solved exactly this
+/// by boxing its payload in an `Arc`).
+///
+/// So the two candidate fixes are (a) an `Arc`-ed list payload, so binding a list
+/// column is a refcount bump like a map, and (b) list kernels in `eval_vec` for
+/// `size`/index, so the common group-variable expressions never bind at all.
+/// Narrowing the per-row bind to the slots an expression actually reads helps but
+/// is not sufficient on its own (it removes 2 of 3 copies here, not the retention).
+#[test]
+#[ignore]
+fn bench_quantified_vec_vs_scalar() {
+    let mut g = layered_dense(6, 6);
+    let cases = [
+        (
+            "abbrev_rows",
+            "MATCH (s:N {id:'n0'})-[:R]->{1,4}(x) RETURN x.id AS id",
+        ),
+        (
+            "subpath_row",
+            "MATCH (s:N {id:'n0'}) ((x)-[:R]->(y)){1,4} (t) RETURN t.id AS id",
+        ),
+        (
+            "groupvar   ",
+            "MATCH (s:N {id:'n0'}) ((x)-[e:R]->(y)){1,4} (t) RETURN t.id AS id, size(e) AS ne",
+        ),
+        (
+            "groupvar_wh",
+            "MATCH (s:N {id:'n0'}) ((x)-[e:R]->(y)){1,4} (t) WHERE size(e) >= 2 RETURN t.id AS id",
+        ),
+        (
+            "nested_gv  ",
+            "MATCH (s:N {id:'n0'}) ( (x)-[:R]->{1,2}(y) ){1,2} (t) RETURN t.id AS id, size(x) AS nx",
+        ),
+    ];
+    for (label, q) in cases {
+        for columnar in [true, false] {
+            super::eval::with_vec_override(columnar, || {
+                for _ in 0..5 {
+                    let _ = rows(&mut g, q);
+                }
+                let iters = 100;
+                let t = std::time::Instant::now();
+                for _ in 0..iters {
+                    let _ = rows(&mut g, q);
+                }
+                eprintln!(
+                    "bench {label} columnar={columnar}: {:?}/iter",
+                    t.elapsed() / iters
+                );
+            });
+        }
     }
 }
 
@@ -10325,4 +10683,58 @@ fn a_page_statement_takes_a_dynamic_bound() {
         .execute(&mut g, &Params::new())
         .unwrap_err();
     assert_eq!(err.code, crate::error_codes::ErrorCode::MissingParameter);
+}
+
+/// Columnar vs scalar for a quantified unit that exposes GROUP variables.
+///
+/// The port was first measured 1.25-2.65x SLOWER here, which is why it was held
+/// back; the cause was `Val::List` deep-copying on every per-row `Binding` clone.
+/// Run: `cargo test --release bench_quantified_group_vars -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_quantified_group_vars() {
+    let mut g = layered_dense(6, 6);
+    let cases: &[(&str, &str)] = &[
+        (
+            "-[:R]->{1,4} (no group vars)",
+            "MATCH (a:N)-[:R]->{1,4}(b) RETURN element_id(b) AS i",
+        ),
+        (
+            "((x)-[]->(y)){1,4} rows",
+            "MATCH (a:N)((x)-[]->(y)){1,4}(b) RETURN element_id(b) AS i",
+        ),
+        (
+            "((x)-[e]->(y)){1,4} + size",
+            "MATCH (a:N)((x)-[e]->(y)){1,4}(b) RETURN size(e) AS n",
+        ),
+        (
+            "… WHERE size(e) >= 2",
+            "MATCH (a:N)((x)-[e]->(y)){1,4}(b) WHERE size(e) >= 2 RETURN element_id(b) AS i",
+        ),
+    ];
+
+    println!(
+        "\n{:<30} {:>10} {:>10} {:>8}",
+        "query", "columnar", "scalar", "ratio"
+    );
+
+    for (name, q) in cases {
+        let mut best = [f64::MAX; 2];
+
+        for (k, on) in [true, false].iter().enumerate() {
+            for _ in 0..7 {
+                let t = std::time::Instant::now();
+                let n = super::eval::with_vec_override(*on, || rows(&mut g, q).len());
+                assert!(n > 0, "[{name}] produced no rows");
+                best[k] = best[k].min(t.elapsed().as_secs_f64() * 1e6);
+            }
+        }
+
+        println!(
+            "{name:<30} {:>9.0}us {:>9.0}us {:>7.2}x",
+            best[0],
+            best[1],
+            best[0] / best[1]
+        );
+    }
 }

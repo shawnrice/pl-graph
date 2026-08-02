@@ -572,13 +572,17 @@ pub(super) fn build_scan(
         }
         return Some(sc);
     }
-    // A quantified segment runs vectorized only in the ABBREVIATED form
-    // (`-[:R]->{n,m}`) with an anonymous edge. A parenthesized unit exposes every
-    // variable inside it as the LIST of its per-repetition values, and the
-    // frontier holds one id per row, not a list — so those keep the matcher.
-    if path.segments.iter().any(|seg| {
-        seg.rel.quantifier.is_some() && (seg.unit.is_some() || seg.rel.var_slot.is_some())
-    }) {
+    // The ABBREVIATED form's edge variable (`-[e]->{n,m}`) still keeps the
+    // matcher: it binds `e` per HOP and unbinds it again, so there is no
+    // per-repetition value for a column to hold — it must read back as NULL, and
+    // the frontier has nowhere to say that. A parenthesized unit is different:
+    // every variable it exposes IS a per-repetition list, and `bind_group_vars`
+    // already builds exactly that, so those vectorize (see `expand_scan`).
+    if path
+        .segments
+        .iter()
+        .any(|seg| seg.rel.quantifier.is_some() && seg.unit.is_none() && seg.rel.var_slot.is_some())
+    {
         return None;
     }
     // Cardinality-based orientation: a label-only traversal seeds from its more
@@ -661,6 +665,19 @@ pub(super) fn expand_scan(
     endpoint: Vec<u32>,
     cap: Option<usize>,
 ) -> Option<ScanCols> {
+    // A quantified unit's variables are GROUP variables — one list per row, held
+    // as `Val` columns, not one element per row. They must not also be claimed
+    // here as element columns: a segment carrying a unit still reports its edge
+    // on `seg.rel.var_slot`, and registering that slot would install an empty id
+    // column beside the real list one, which then wins in `scalar_col`.
+    let mut group_slots: Vec<usize> = Vec::new();
+
+    for seg in &path.segments {
+        if let Some(unit) = seg.unit.as_ref() {
+            unit.group_slots(&mut group_slots);
+        }
+    }
+
     // Bound slots and their element kind, in path order.
     let mut kinds: Vec<(usize, Elem)> = Vec::new();
 
@@ -669,11 +686,11 @@ pub(super) fn expand_scan(
     }
 
     for seg in &path.segments {
-        if let Some(s) = seg.rel.var_slot {
+        if let Some(s) = seg.rel.var_slot.filter(|s| !group_slots.contains(s)) {
             kinds.push((s, Elem::Edge));
         }
 
-        if let Some(s) = seg.node.var_slot {
+        if let Some(s) = seg.node.var_slot.filter(|s| !group_slots.contains(s)) {
             kinds.push((s, Elem::Node));
         }
     }
@@ -749,30 +766,36 @@ pub(super) fn expand_scan(
         // diverged immediately when tried.
         if let Some(q) = rel.quantifier {
             let path_slot = path.path_var_slot;
+            // A parenthesized unit's group variables are per-repetition LISTS.
+            // `bind_group_vars` already builds them for the scalar matcher, so
+            // this asks for the same thing and reads the result straight out of
+            // the binding into a column — one list per row, no second binder.
+            let mut seg_groups: Vec<usize> = Vec::new();
+            if let Some(unit) = seg.unit.as_ref() {
+                unit.group_slots(&mut seg_groups);
+            }
             let spec = crate::gql::eval::pathfind::WalkSpec {
                 q,
                 mode: path.mode,
                 // Rebuilding each trail is O(depth), so only ask for it when a
-                // path variable will actually hold the result.
-                want_path: path_slot.is_some(),
+                // path variable or a group variable will actually hold it.
+                want_path: path_slot.is_some() || !seg_groups.is_empty(),
             };
             let mut ends: Vec<u32> = Vec::new();
             let mut src: Vec<usize> = Vec::new();
             let mut paths: Vec<Val> = Vec::new();
+            let mut groups: Vec<Vec<Val>> = vec![Vec::new(); seg_groups.len()];
             let mut wb = Binding::with_len(scope_len.max(1));
             let node_check = !node.props.is_empty() || node.where_.is_some();
 
             for i in 0..frontier.rows() {
                 let from = frontier.endpoint()[i];
-
-                crate::gql::eval::pathfind::reachable_each(
-                    graph,
-                    ctx,
-                    &mut wb,
-                    from,
-                    rel,
-                    spec,
-                    &mut |b: &mut Binding, end: u32, _v: &[u32], _e: &[u32], _s: &[_]| {
+                let mut on_end =
+                    |b: &mut Binding,
+                     end: u32,
+                     v: &[u32],
+                     e: &[u32],
+                     steps: &[crate::gql::eval::pathfind::StepRec]| {
                         // The landing node's own label and constraints still apply.
                         if !matches_label(graph, ctx, end, node.label.as_ref()) {
                             return true;
@@ -795,15 +818,63 @@ pub(super) fn expand_scan(
                             }
                         }
 
+                        if let Some(unit) = seg.unit.as_ref() {
+                            if !seg_groups.is_empty() {
+                                // A FLAT unit gets empty `steps` on purpose — it binds
+                                // from the walk directly, which is the hot path and
+                                // avoids a per-hop allocation. Only a nested unit
+                                // needs the structured records. Same split the scalar
+                                // matcher makes; picking one binder for both would
+                                // silently bind nothing for every flat unit.
+                                let restores = if unit.is_flat() {
+                                    crate::gql::eval::pathfind::bind_group_vars_flat(b, unit, v, e)
+                                } else {
+                                    crate::gql::eval::pathfind::bind_group_vars(b, unit, steps)
+                                };
+
+                                for (col, slot) in groups.iter_mut().zip(&seg_groups) {
+                                    col.push(b.take(*slot).unwrap_or(Val::Null));
+                                }
+
+                                for (slot, prev) in restores {
+                                    match prev {
+                                        Some(v) => b.set(slot, v),
+                                        None => b.unset(slot),
+                                    }
+                                }
+                            }
+                        }
+
                         if path_slot.is_some() {
-                            paths.push(Val::path(_v.to_vec(), _e.to_vec()));
+                            paths.push(Val::path(v.to_vec(), e.to_vec()));
                         }
 
                         ends.push(end);
                         src.push(i);
                         true
-                    },
-                );
+                    };
+
+                if let Some(unit) = seg.unit.as_ref() {
+                    crate::gql::eval::pathfind::reachable_each_unit(
+                        graph,
+                        ctx,
+                        &mut wb,
+                        from,
+                        unit,
+                        spec,
+                        &mut on_end,
+                    );
+                } else {
+                    crate::gql::eval::pathfind::reachable_each(
+                        graph,
+                        ctx,
+                        &mut wb,
+                        from,
+                        rel,
+                        spec,
+                        &mut on_end,
+                    );
+                }
 
                 if ends.len() as u64 > graph.limits().intermediate {
                     ctx.set_fault(FAULT_INTERMEDIATE);
@@ -812,6 +883,10 @@ pub(super) fn expand_scan(
             }
 
             frontier.replicate(&src, &ends, node.var_slot);
+
+            for (slot, col) in seg_groups.iter().zip(groups) {
+                frontier.set_values(*slot, col);
+            }
 
             if let Some(slot) = path_slot {
                 path_col = Some((slot, std::mem::take(&mut paths)));
@@ -854,6 +929,12 @@ pub(super) fn expand_scan(
 
     if let Some((slot, vals)) = path_col {
         sc.vals[slot] = Some(vals);
+    }
+
+    for &s in &group_slots {
+        if let Some(vals) = frontier.take_values(s) {
+            sc.vals[s] = Some(vals);
+        }
     }
 
     Some(sc)

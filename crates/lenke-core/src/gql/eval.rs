@@ -127,6 +127,13 @@ impl Binding {
             self.0[slot] = None;
         }
     }
+    /// Move a slot's value OUT, leaving it unbound. For a consumer that owns the
+    /// value from here on — the scan reading a quantified subpath's group-variable
+    /// `Val::List` off the binding into its column — so the list is not deep-cloned
+    /// only for the binding's copy to be dropped on the next line.
+    fn take(&mut self, slot: usize) -> Option<Val> {
+        self.0.get_mut(slot).and_then(Option::take)
+    }
     fn resize(&mut self, len: usize) {
         self.0.resize(len, None);
     }
@@ -3329,6 +3336,45 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> VVec {
                     VVec::Bool { t, valid }
                 }
             }
+        }
+        // `size(x)` over a carried VALUE column — the shape every group variable
+        // is read through (`size(e)`, and the predicate `size(e) >= 2`). Without
+        // this it falls to `scalar_col`, which rebuilds a whole `Binding` per row
+        // just to count a list, which was most of why the columnar path lost to
+        // the scalar matcher on quantified units.
+        CExpr::Scalar { func, args }
+            if *func == ScalarFn::Size
+                && matches!(&args[0], CExpr::Var(s) if sc.val_slot(*s).is_some()) =>
+        {
+            let CExpr::Var(slot) = &args[0] else {
+                unreachable!("guarded above")
+            };
+            let vals = sc.val_slot(*slot).expect("guarded above");
+            let mut d = Vec::with_capacity(n);
+            let mut valid = Vec::with_capacity(n);
+
+            for v in vals {
+                match v {
+                    Val::List(items) => {
+                        d.push(items.len() as f64);
+                        valid.push(true);
+                    }
+                    Val::Str(s) => {
+                        d.push(s.encode_utf16().count() as f64);
+                        valid.push(true);
+                    }
+                    Val::Path(p) => {
+                        d.push(p.edges.len() as f64);
+                        valid.push(true);
+                    }
+                    _ => {
+                        d.push(f64::NAN);
+                        valid.push(false);
+                    }
+                }
+            }
+
+            VVec::Num { d, valid }
         }
         CExpr::Scalar { func, args } if args.len() == 1 && unary_math(*func).is_some() => {
             let f = unary_math(*func).unwrap();

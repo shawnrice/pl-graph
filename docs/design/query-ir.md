@@ -439,42 +439,57 @@ lines in `lenke-core/src`): the shared layer was added, and the per-language
 layers above it cannot be deleted until the join/projection layer is shared too.
 The surface shrinks at the END of that work, not this one.
 
-## The one port that was measured and NOT taken
+## Group variables: the port that was wrong to decline
 
-Group variables in a parenthesized quantified unit — `((x)-[e]->(y)){1,4}` — were
-the last shape `build_scan` declined. They were ported: the blanket quantifier
-bail came out, `expand_scan` grew a value-column track beside its id columns, and
-a 26-query differential confirmed the columnar path returns the scalar matcher's
-rows row-for-row, order included. It is on `wip/columnar-group-vars`, not on this
-branch, because it measured slower (`layered_dense(6,6)`, forced both ways):
+Group variables in a parenthesized quantified unit — `((x)-[e]->(y)){1,4}` —
+were the last shape `build_scan` declined, and the first attempt at them measured
+1.25-2.65x SLOWER than the scalar matcher. That was nearly written off as
+"GQL-only plumbing Gremlin never touches". It is not:
 
 ```text
-                             columnar   scalar
-  -[:R]->{1,4} RETURN id        131 us    143 us   ← no group vars: a win
-  ((x)-[]->(y)){1,4} rows       365       286      1.28x slower
-  ((x)-[e]->(y)){1,4} + size    802       411      1.95x
-  … WHERE size(e) >= 2         1093       412      2.65x
-  ( (x)-[]->{1,2}(y) ){1,2}    1115       890      1.25x
+  GQL      MATCH (a)((x)-[e]->(y)){1,4}(b)          x, e, y are per-rep LISTS
+  Gremlin  repeat(__.as('x').out()).times(4)
+             .select(Pop.all, 'x')                  the SAME per-rep list
 ```
 
-The only row that wins is the abbreviated form, which already vectorizes here.
-Every shape that actually EXPOSES a group variable is worse, and structurally so:
-the columnar build keeps a `Val::List` per variable per trail alive in a column
-instead of dropping it at end of row, and no vectorized kernel reads a list
-column — `size(e)` and `e[0].amt` fall to `scalar_col`, which rebuilds a full
-`Binding` per row and DEEP-COPIES every list into it. (`Val::Map` already solved
-exactly this by `Arc`-ing its payload, with a comment saying why.)
+`Trav::tags` is `Vec<(String, Vec<GVal>)>` and `Pop::All` hands back
+`GVal::List(list.clone())`. It is the same operation, written twice — GQL-only
+because of who wrote it, not because the logic differs. And the SLOWNESS was
+shared too: both engines deep-copied those lists on their hot paths, GQL in
+`scalar_col`'s per-row `Binding` rebuild and Gremlin in `Trav::step`'s per-step
+`tags` clone.
 
-It was not taken because the trade it offers is not the one this effort is
-making. A slowdown is worth paying when it buys a shared path — but this is
-GQL-only columnar plumbing that Gremlin never touches, and it does not let the
-scalar matcher be deleted either, because 99% of the fallback is the join and
-projection layer (above). So it costs speed and buys neither sharing nor a
-deletion. The two candidate fixes are recorded on the branch: `Arc` the list
-payload the way `Val::Map` does (~170 sites, and it touches byte-identity paths),
-or add `size`/index kernels to `eval_vec` so the common group-variable
-expressions never bind a row at all. The second is the smaller one and would flip
-these rows; it is the prerequisite, not this port.
+So the fix was not to decline the port. It was three shared changes underneath it:
+
+1. **`Value::List` is `Arc<[Self]>`**, like `Value::Record` already was. Cloning
+   a list is a refcount bump in BOTH engines now.
+2. **`Frontier` carries value columns**, not just id columns. A group variable is
+   one list per row and has to fan out with the ids — without that, a later hop
+   leaves the column short and every row past the first reads off the end.
+3. **A `size()` kernel over a value column**, so the shape every group variable
+   is actually read through never rebuilds a row binding at all.
+
+Measured after (`layered_dense(6,6)`, forced both ways, min of 7):
+
+```text
+                                columnar   scalar   ratio    (was)
+  -[:R]->{1,4} (no group vars)    2131 us  2494 us   0.85x    0.92x
+  ((x)-[]->(y)){1,4} rows         5592     4074      1.37x    1.28x
+  ((x)-[e]->(y)){1,4} + size      5112     4458      1.15x    1.95x
+  … WHERE size(e) >= 2            6795     5248      1.29x    2.65x
+```
+
+Reading a group variable is now near parity, from 2-2.7x down. What is left is
+RETENTION: the two rows that don't read `x`/`y` at all still build their columns,
+because `build_scan` doesn't know what the projection references. The fix is to
+pass the referenced-slot set down and skip the rest — deliberately NOT done in a
+hurry, because a slot missed by that analysis makes a group variable silently
+null, which is the one kind of wrong answer the differential might not localize.
+`Op::Var`/`Op::Prop`/an opaque `Op::Tree` are the three cases it has to get right.
+
+The lesson for the rest of this effort: "this is one language's problem" was
+wrong here, and the thing that made it wrong was reading the other engine's code
+rather than reasoning about the feature. Same as the join-order bug below.
 
 ## The write path is already shared
 

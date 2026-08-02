@@ -659,6 +659,27 @@ impl CUnit {
             })
     }
 
+    /// Every slot this unit binds as a group variable, in a stable order.
+    ///
+    /// Exactly the slots [`CUnit::exposes`] answers `true` for, enumerated — the
+    /// columnar scan needs to know WHICH columns a repetition produces, not just
+    /// that it produces some.
+    pub fn group_slots(&self, out: &mut Vec<usize>) {
+        out.extend(self.start_slot);
+        for e in &self.elems {
+            match e {
+                CElem::Hop(h) => {
+                    out.extend(h.rel.var_slot);
+                    out.extend(h.target_slot);
+                }
+                CElem::Sub(s) => {
+                    out.extend(s.target_slot);
+                    s.unit.group_slots(out);
+                }
+            }
+        }
+    }
+
     /// Whether every element is a plain `Hop` (no nested `Sub`). A flat unit has a fixed
     /// `k` hops per rep, so its group variables can be bound by the cheap `k`-stride over
     /// the flat walk — the hot path — instead of the general structured binder.
