@@ -118,6 +118,49 @@ impl Value {
         }
     }
 
+    /// A stored [`crate::graph::Value`] as a runtime value.
+    ///
+    /// Every arm but one is the same for both engines, and the one that differs
+    /// is the reason `Record` and `Map` are separate variants: GQL reads a
+    /// stored map as an ISO record (keys already canonical/sorted in the store),
+    /// Gremlin as a TinkerPop map so it flows through `valueMap`/`select`/
+    /// `order(local)` like any other map. `as_record` picks.
+    ///
+    /// Shared because the two copies of this had already drifted once — see
+    /// [`Value::index_key`] — and six identical arms is exactly the surface that
+    /// drift hides in.
+    #[must_use]
+    pub fn from_stored(v: &crate::graph::Value, as_record: bool) -> Self {
+        use crate::graph::Value as Stored;
+
+        match v {
+            Stored::Null => Self::Null,
+            Stored::Bool(b) => Self::Bool(*b),
+            Stored::Num(n) => Self::Num(*n),
+            // Shared `Arc` — a refcount bump, not an allocation.
+            Stored::Str(s) => Self::Str(s.clone()),
+            Stored::Temporal(t) => Self::Temporal(*t),
+            Stored::List(items) => Self::List(
+                items
+                    .iter()
+                    .map(|x| Self::from_stored(x, as_record))
+                    .collect(),
+            ),
+            Stored::Map(pairs) if as_record => Self::Record(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Self::from_stored(v, as_record)))
+                    .collect(),
+            ),
+            Stored::Map(pairs) => Self::Map(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (Self::Str(k.clone()), Self::from_stored(v, as_record)))
+                    .collect(),
+            ),
+        }
+    }
+
     /// A path value, boxing the payload.
     #[must_use]
     pub fn path(vertices: Vec<u32>, edges: Vec<u32>) -> Self {

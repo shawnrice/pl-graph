@@ -1147,22 +1147,7 @@ fn value_row_key(row: &[Value]) -> String {
 // --- property / label access -------------------------------------------------
 
 fn value_to_val(v: &Value) -> Val {
-    match v {
-        Value::Null => Val::Null,
-        Value::Bool(b) => Val::Bool(*b),
-        Value::Num(n) => Val::Num(*n),
-        Value::Str(s) => Val::Str(s.clone()), // shared Arc — refcount bump, no alloc
-        Value::Temporal(t) => Val::Temporal(*t),
-        Value::List(items) => Val::List(items.iter().map(value_to_val).collect()),
-        // A stored record/map reads back as a first-class runtime map (keys are
-        // already canonical/sorted in the store).
-        Value::Map(pairs) => Val::Record(
-            pairs
-                .iter()
-                .map(|(k, v)| (k.clone(), value_to_val(v)))
-                .collect(),
-        ),
-    }
+    Val::from_stored(v, true)
 }
 
 /// Set one field of a graph-algorithm config from a CALL config-map entry, keyed

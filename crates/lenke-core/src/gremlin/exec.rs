@@ -893,22 +893,7 @@ fn match_step(
 // --- value helpers ----------------------------------------------------------
 
 fn value_to_gval(v: Value) -> GVal {
-    match v {
-        Value::Null => GVal::Null,
-        Value::Bool(b) => GVal::Bool(b),
-        Value::Num(n) => GVal::Num(n),
-        Value::Str(s) => GVal::Str(s),
-        Value::Temporal(t) => GVal::Temporal(t),
-        Value::List(items) => GVal::List(items.into_iter().map(value_to_gval).collect()),
-        // A stored record/map reads back as a `GVal::Map` (string keys), so it
-        // flows through `valueMap`/`select`/`order(local)` like any Gremlin map.
-        Value::Map(pairs) => GVal::Map(
-            pairs
-                .into_iter()
-                .map(|(k, v)| (GVal::Str(k), value_to_gval(v)))
-                .collect(),
-        ),
-    }
+    GVal::from_stored(&v, false)
 }
 
 fn gval_to_value(v: &GVal) -> Value {
