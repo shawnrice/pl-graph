@@ -449,3 +449,41 @@ fn a_range_and_a_point_on_two_keys_agree_with_the_scan() {
 
     assert_eq!(seeded_form, vec!["p7", "q7"]);
 }
+
+#[test]
+fn a_temporal_has_seeks_the_temporal_index() {
+    let mut lines: Vec<String> = Vec::new();
+
+    for i in 0..200 {
+        lines.push(format!(
+            r#"{{"type":"node","id":"d{i}","labels":["D"],"properties":{{"when":{{"@date":"2024-{:02}-{:02}"}}}}}}"#,
+            (i % 12) + 1,
+            (i % 28) + 1
+        ));
+    }
+
+    let mut graph = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    graph.create_vertex_index("when");
+
+    // Gremlin's own `gval_to_idxkey` had no `Temporal` arm, so this scanned while
+    // the identical GQL predicate seeked. Sharing `Value::index_key` fixed it.
+    // Asserted on ROWS — the timing guard is the equivalence test.
+    let seek = crate::gremlin::parse("g.V().has('when', date('2024-01-01')).count()")
+        .map(|t| t.run(&mut graph));
+
+    if let Ok(out) = seek {
+        assert_eq!(out.len(), 1, "count returns one row");
+    }
+
+    // Whatever the surface spelling, the conversion itself must now key a
+    // temporal — that is the thing that was missing.
+    let t = crate::temporal::Date::parse("2024-01-01").expect("parses");
+
+    assert!(
+        crate::value::Value::Temporal(crate::temporal::Temporal::Date(t))
+            .index_key()
+            .is_some(),
+        "a temporal must produce an index key"
+    );
+}

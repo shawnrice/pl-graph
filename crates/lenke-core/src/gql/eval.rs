@@ -3437,15 +3437,10 @@ fn lit_to_idxkey(lit: &Lit) -> Option<crate::graph::IdxKey> {
 }
 
 /// A runtime value as an index key (nulls/lists/elements aren't indexable).
+/// A runtime value as an index key — see [`Value::index_key`], which both
+/// engines now share.
 fn val_to_idxkey(v: &Val) -> Option<crate::graph::IdxKey> {
-    use crate::graph::IdxKey;
-    match v {
-        Val::Str(s) => Some(IdxKey::Str(s.as_ref().into())),
-        Val::Num(n) => Some(IdxKey::Num(*n)),
-        Val::Bool(b) => Some(IdxKey::Bool(*b)),
-        Val::Temporal(t) => t.index_key().map(|(k, key)| IdxKey::Temporal(k, key)),
-        _ => None,
-    }
+    v.index_key()
 }
 
 /// The index key an expression contributes to a seek: an inline literal, or a

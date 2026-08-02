@@ -257,13 +257,11 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
     .collect()
 }
 
+/// A traversal value as an index key — see [`GVal::index_key`], which both
+/// engines now share. Gaining the shared version is what gave Gremlin temporal
+/// index seeking: this copy had no `Temporal` arm.
 fn gval_to_idxkey(v: &GVal) -> Option<IdxKey> {
-    match v {
-        GVal::Str(s) => Some(IdxKey::Str(s.clone())),
-        GVal::Num(n) => Some(IdxKey::Num(*n)),
-        GVal::Bool(b) => Some(IdxKey::Bool(*b)),
-        _ => None,
-    }
+    v.index_key()
 }
 
 /// The smallest string strictly greater than every string with prefix `s`

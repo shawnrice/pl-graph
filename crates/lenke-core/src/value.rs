@@ -96,6 +96,28 @@ pub enum Value {
 }
 
 impl Value {
+    /// This value as a property-index key, or `None` if no index can hold it.
+    ///
+    /// One function for both engines, which is the first thing the merged type
+    /// bought. The two copies had already drifted: Gremlin's had no `Temporal`
+    /// arm, so `has('when', DATE '…')` could not seek a temporal index while the
+    /// same predicate in GQL could. GQL's rebuilt the `Arc<str>` (`as_ref().into()`)
+    /// where a clone is a refcount bump.
+    #[must_use]
+    pub fn index_key(&self) -> Option<crate::graph::IdxKey> {
+        use crate::graph::IdxKey;
+
+        match self {
+            Self::Str(s) => Some(IdxKey::Str(s.clone())),
+            Self::Num(n) => Some(IdxKey::Num(*n)),
+            Self::Bool(b) => Some(IdxKey::Bool(*b)),
+            Self::Temporal(t) => t.index_key().map(|(k, key)| IdxKey::Temporal(k, key)),
+            // Null, lists, records, maps, element handles, paths and property
+            // elements are not indexable.
+            _ => None,
+        }
+    }
+
     /// A path value, boxing the payload.
     #[must_use]
     pub fn path(vertices: Vec<u32>, edges: Vec<u32>) -> Self {
