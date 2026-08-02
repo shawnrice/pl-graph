@@ -3,7 +3,9 @@
 //! expand it edge-first, and run vectorized grouping/aggregation over the result
 //! (fused_global_agg / vectorized_aggregate / fold_group_agg_cols). Extracted from
 //! the evaluator (`super`); shares its context/helpers via `use super::*`.
+use super::seek_lower;
 use super::*;
+use crate::seek::ElementSeek;
 
 /// Scatter the frame's bound element slots into binding `b` at row `ri`: each
 /// bound slot becomes the Node/Edge id sitting at that row. Value/scalar slots are
@@ -42,39 +44,6 @@ fn prop_col<'a>(
     };
     Some((kid.and_then(|k| store.cols.get(k as usize)), ids))
 }
-
-// --- vertex/edge-agnostic index seeks (dispatched by an `edge` flag) ---------
-pub(super) fn idx_indexed(graph: &Graph, name: &str, edge: bool) -> bool {
-    if edge {
-        graph.edge_indexed(name)
-    } else {
-        graph.vertex_indexed(name)
-    }
-}
-pub(super) fn idx_eq(
-    graph: &Graph,
-    name: &str,
-    k: &crate::graph::IdxKey,
-    edge: bool,
-) -> Option<Vec<u32>> {
-    if edge {
-        graph.edges_by_prop(name, k).map(<[u32]>::to_vec)
-    } else {
-        graph.vertices_by_prop(name, k).map(<[u32]>::to_vec)
-    }
-}
-pub(super) fn idx_range(
-    graph: &Graph,
-    name: &str,
-    rb: &crate::graph::RangeBound,
-    edge: bool,
-) -> Option<Vec<u32>> {
-    if edge {
-        graph.edges_by_prop_range(name, rb)
-    } else {
-        graph.vertices_by_prop_range(name, rb)
-    }
-}
 /// The property name a `Prop` key-ref resolves to (vertex or edge store).
 pub(super) fn prop_name<'a>(
     graph: &'a Graph,
@@ -102,258 +71,95 @@ pub(super) fn flip_compare(op: CompareOp) -> CompareOp {
     }
 }
 
-/// An index seek from a WHERE comparison `var.key OP <literal>` where `var` is at
-/// `want_slot` (`None` = any), against the vertex or edge index. An `AND` of two
-/// same-var/same-key comparisons coalesces into one tight range seek; else the
-/// first usable conjunct. Returns candidate element ids.
-pub(super) fn prop_index_hint(
+/// An as-of / overlap seek from an edge RI-tree INTERVAL index.
+///
+/// Deliberately not an `ElementSeek`: it is a different structure with its own
+/// selectivity rule (compare the axes by `*_len` and stab the most selective
+/// ONE — never materialize and intersect both, which measured worse than a
+/// scan). Folding it into the shared layer would mean teaching that layer
+/// about temporal axes, so it stays a pre-check ahead of the ordinary path.
+///
+/// This was briefly lost when the seeds moved to the shared layer, and no test
+/// caught it: the index is a pure performance feature, so the fallback returns
+/// identical rows. It showed up only as 1.00x vs scan in `bench_temporal_index`,
+/// where it should be ~27x.
+pub(super) fn interval_index_seed(
     graph: &Graph,
     ctx: &Ctx,
     e: &CExpr,
     want_slot: Option<usize>,
-    edge: bool,
 ) -> Option<Vec<u32>> {
-    use crate::graph::RangeBound;
+    let CExpr::And(items) = e else {
+        return None;
+    };
     let slot_ok = |s: usize| want_slot.is_none_or(|w| w == s);
-    match e {
-        CExpr::Compare { op, left, right } => {
-            // Handles a bare `var.key` AND a nested `var.a.b` (dotted-path index).
-            //
-            // Either ORDER: `$x = u.key` is the same predicate as `u.key = $x`,
-            // and only the left side used to be inspected, so writing the
-            // constant first silently cost a full scan — measured at 107x on a
-            // 20k graph. Flipping the operator with the operands keeps a range
-            // correct: `$x < u.n` means `u.n > $x`, not `u.n < $x`.
-            let (vslot, path, key, op) = match prop_path(left, graph, ctx, edge) {
-                Some((vslot, path)) => (vslot, path, expr_to_idxkey(right, ctx)?, *op),
-                None => {
-                    let (vslot, path) = prop_path(right, graph, ctx, edge)?;
 
-                    (vslot, path, expr_to_idxkey(left, ctx)?, flip_compare(*op))
-                }
+    // Contender B: an as-of over an edge RI-tree interval index (`lo_key <= $v
+    // AND hi_key > $v`, same var, same probe) seeds from `stab($v)` — the small
+    // "active at v" set directly — instead of the BTreeMap seeks A would pick.
+    // Same recognizer style, different seek; falls through to A when no interval
+    // index covers the pair. The stab is inclusive of `hi == v`, a superset the
+    // final `WHERE hi > v` then verifies.
+    let probe = |name: &str, want_lo: bool| -> Option<(usize, i128)> {
+        items.iter().find_map(|it| {
+            let (s, kref, op, key) = cmp_bound(it, ctx)?;
+            let ok = if want_lo {
+                matches!(op, CompareOp::Le | CompareOp::Lt)
+            } else {
+                matches!(op, CompareOp::Gt | CompareOp::Ge)
             };
-            let op = &op;
-
-            if !slot_ok(vslot) {
+            if !ok || !slot_ok(s) || prop_name(graph, ctx, kref, true)? != name {
                 return None;
             }
-            if !idx_indexed(graph, &path, edge) {
-                return None;
+            match key {
+                crate::graph::IdxKey::Temporal(_, q) => Some((s, q)),
+                _ => None,
             }
-            if *op == CompareOp::Eq {
-                return idx_eq(graph, &path, &key, edge);
-            }
-            let mut rb = RangeBound::default();
-            apply_bound(&mut rb, *op, key);
-            idx_range(graph, &path, &rb, edge)
-        }
-        // `var.key IN [...]` — a union of point seeks, one per list element.
-        //
-        // This had no arm at all, so an IN-list scanned even on an indexed key:
-        // measured at 147k statements/sec for `= $n` against 220 for `IN $ns`
-        // over twenty values on a 20k-vertex graph, where twenty seeks should
-        // have cost a fraction of one scan. It also made the natural batching fix
-        // for a hot write loop — one IN statement instead of N statements —
-        // slower than the loop it replaced whenever an index existed.
-        //
-        // `NOT IN` is deliberately not seekable: its matches are everything the
-        // list does NOT name, which no point seek enumerates.
-        CExpr::In {
-            expr,
-            list,
-            negated: false,
-        } => {
-            let (vslot, path) = prop_path(expr, graph, ctx, edge)?;
-
-            if !slot_ok(vslot) || !idx_indexed(graph, &path, edge) {
-                return None;
-            }
-
-            // Only a constant list can seed — a literal one, or a parameter
-            // holding a list. Anything computed per row is unknown here.
-            let keys: Vec<crate::graph::IdxKey> = match list.as_ref() {
-                CExpr::List(items) => items
-                    .iter()
-                    .map(|it| expr_to_idxkey(it, ctx))
-                    .collect::<Option<_>>()?,
-                CExpr::Param(slot) => match ctx.params.get(*slot)? {
-                    Val::List(items) => items.iter().map(val_to_idxkey).collect::<Option<_>>()?,
-                    single => vec![val_to_idxkey(single)?],
-                },
-                _ => return None,
-            };
-            // An empty IN matches nothing, and an empty candidate set says so
-            // exactly — falling through to `None` would scan instead.
-            let mut out: Vec<u32> = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-
-            for k in &keys {
-                // A key absent from the index contributes nothing rather than
-                // aborting the seek — `idx_eq` returning `None` means "no index",
-                // which cannot happen here since `idx_indexed` already held.
-                for id in idx_eq(graph, &path, k, edge)? {
-                    // Dedup: a repeated value in the list would otherwise yield
-                    // the same element twice, and duplicate candidates become
-                    // duplicate ROWS — a wrong answer, not just wasted work.
-                    if seen.insert(id) {
-                        out.push(id);
-                    }
-                }
-            }
-
-            Some(out)
-        }
-        // A disjunction seeds only when EVERY branch does — the union of the
-        // branches' candidates is the candidate set, and one unseekable branch
-        // means its matches are missing from that union entirely. That is a wrong
-        // answer rather than a slow one, so a single `None` abandons the whole
-        // seek.
-        //
-        // `u.k = $a OR u.k = $b` is the same predicate as `u.k IN [$a, $b]`,
-        // which seeks; spelled as a disjunction it scanned, 220x slower on a 20k
-        // graph.
-        CExpr::Or(items) => {
-            let mut out: Vec<u32> = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-
-            for it in items {
-                // Branches may address different keys — `a.x = 1 OR a.y = 2` is
-                // fine, both seeks are over the same element space — but a branch
-                // on a DIFFERENT variable is not: its candidates identify another
-                // element, so unioning them is meaningless. `slot_ok` is threaded
-                // through the recursion and rejects that.
-                for id in prop_index_hint(graph, ctx, it, want_slot, edge)? {
-                    // The branches can overlap; a duplicate candidate becomes a
-                    // duplicate ROW.
-                    if seen.insert(id) {
-                        out.push(id);
-                    }
-                }
-            }
-
-            Some(out)
-        }
-        CExpr::And(items) => {
-            // Contender B: an as-of over an edge RI-tree interval index (`lo_key <= $v
-            // AND hi_key > $v`, same var, same probe) seeds from `stab($v)` — the small
-            // "active at v" set directly — instead of the BTreeMap seeks A would pick.
-            // Same recognizer style, different seek; falls through to A when no interval
-            // index covers the pair. The stab is inclusive of `hi == v`, a superset the
-            // final `WHERE hi > v` then verifies.
-            if edge {
-                let probe = |name: &str, want_lo: bool| -> Option<(usize, i128)> {
-                    items.iter().find_map(|it| {
-                        let (s, kref, op, key) = cmp_bound(it, ctx)?;
-                        let ok = if want_lo {
-                            matches!(op, CompareOp::Le | CompareOp::Lt)
-                        } else {
-                            matches!(op, CompareOp::Gt | CompareOp::Ge)
-                        };
-                        if !ok || !slot_ok(s) || prop_name(graph, ctx, kref, true)? != name {
-                            return None;
-                        }
-                        match key {
-                            crate::graph::IdxKey::Temporal(_, q) => Some((s, q)),
-                            _ => None,
-                        }
-                    })
-                };
-                // Each edge interval index whose `lo_key ≤/< qlo AND hi_key >/≥ qhi` pair
-                // is present in the conjunction can seed a candidate SUPERSET (a point stab
-                // when qlo==qhi, else a window-normalized overlap — min/max is essential, or
-                // `overlap(qhi,qlo)` on a contains shape would be min>max → empty → a silent
-                // miss). For the bitemporal 4-way we DON'T intersect the axes: one axis is
-                // often non-selective — e.g. "believed now" (`tt=∞`) matches ~every version,
-                // so materializing its stab and intersecting is O(all rows) and can lose to
-                // a scan. Instead compare axes' sizes CHEAPLY via *_len (no materialization),
-                // seed from the MOST SELECTIVE axis only, and let the final WHERE verify the
-                // rest. (An enum: stab point, or overlap window.)
-                enum Probe {
-                    Stab(i128),
-                    Overlap(i128, i128),
-                }
-                let mut best: Option<(usize, Probe, usize)> = None; // (index, probe, size)
-                for (n, (lo_key, hi_key)) in graph.edge_interval_index_specs().iter().enumerate() {
-                    let (Some((slo, qlo)), Some((shi, qhi))) =
-                        (probe(lo_key, true), probe(hi_key, false))
-                    else {
-                        continue;
-                    };
-                    if slo != shi {
-                        continue;
-                    }
-                    let (pr, len) = if qlo == qhi {
-                        (Probe::Stab(qlo), graph.edge_interval_stab_len_nth(n, qlo))
-                    } else {
-                        let (d1, d2) = (qlo.min(qhi), qlo.max(qhi));
-                        (
-                            Probe::Overlap(d1, d2),
-                            graph.edge_interval_overlap_len_nth(n, d1, d2),
-                        )
-                    };
-                    if best.as_ref().is_none_or(|(_, _, b)| len < *b) {
-                        best = Some((n, pr, len));
-                    }
-                }
-                if let Some((n, pr, _)) = best {
-                    return Some(match pr {
-                        Probe::Stab(q) => graph.edge_interval_stab_nth(n, q),
-                        Probe::Overlap(d1, d2) => graph.edge_interval_overlap_nth(n, d1, d2),
-                    });
-                }
-            }
-            // Group every indexed single-column comparison by (var slot, key ref) and
-            // fold all comparisons on that key into one tight `RangeBound`; then SEEK
-            // each group and INTERSECT the candidate sets across groups, driven from
-            // the smallest. A conjunction ANDs necessary conditions, so the true
-            // matches lie in every group's seek — the intersection is a correct
-            // candidate superset (the final WHERE re-verifies, so extra rows are
-            // dropped and none are missed). One group reproduces the old same-key
-            // band seek (`x>=a AND x<=b`); two groups make an interval-containment
-            // as-of (`vf<=v AND vt>v`) a real seek instead of only the first column;
-            // four groups do the bitemporal 4-way.
-            let mut groups: std::collections::HashMap<(usize, usize), RangeBound> =
-                std::collections::HashMap::new();
-            for it in items {
-                let Some((s, kref, op, key)) = cmp_bound(it, ctx) else {
-                    continue;
-                };
-                if !slot_ok(s) || matches!(op, CompareOp::Ne) {
-                    continue;
-                }
-                match prop_name(graph, ctx, kref, edge) {
-                    Some(name) if idx_indexed(graph, name, edge) => {
-                        apply_bound(groups.entry((s, kref)).or_default(), op, key);
-                    }
-                    _ => {}
-                }
-            }
-            // Return the MOST SELECTIVE single group's seek (smallest candidate set);
-            // the final WHERE verifies the remaining conjuncts. Blind intersection of
-            // the groups was measured to TANK on a low-selectivity conjunct — building
-            // and probing two ~200k halves costs more than the scan it replaces — so
-            // pick the best column instead of AND-ing them. (Getting the small "active
-            // at v" set *without* materializing the huge halves is exactly the RI-tree's
-            // job; this is the non-structure baseline it must beat.) The old code
-            // picked the *first* usable conjunct, which is why an as-of seeded on the
-            // non-selective `vf`; choosing by result size fixes that.
-            if let Some(best) = groups
-                .iter()
-                .filter_map(|((_, kref), rb)| {
-                    idx_range(graph, prop_name(graph, ctx, *kref, edge)?, rb, edge)
-                })
-                .min_by_key(Vec::len)
-            {
-                return Some(best);
-            }
-            // No indexed conjunct grouped (e.g. only dotted paths) — try the first
-            // usable single conjunct via the recursive single-Compare path.
-            items
-                .iter()
-                .find_map(|it| prop_index_hint(graph, ctx, it, want_slot, edge))
-        }
-        _ => None,
+        })
+    };
+    // Each edge interval index whose `lo_key ≤/< qlo AND hi_key >/≥ qhi` pair
+    // is present in the conjunction can seed a candidate SUPERSET (a point stab
+    // when qlo==qhi, else a window-normalized overlap — min/max is essential, or
+    // `overlap(qhi,qlo)` on a contains shape would be min>max → empty → a silent
+    // miss). For the bitemporal 4-way we DON'T intersect the axes: one axis is
+    // often non-selective — e.g. "believed now" (`tt=∞`) matches ~every version,
+    // so materializing its stab and intersecting is O(all rows) and can lose to
+    // a scan. Instead compare axes' sizes CHEAPLY via *_len (no materialization),
+    // seed from the MOST SELECTIVE axis only, and let the final WHERE verify the
+    // rest. (An enum: stab point, or overlap window.)
+    enum Probe {
+        Stab(i128),
+        Overlap(i128, i128),
     }
+    let mut best: Option<(usize, Probe, usize)> = None; // (index, probe, size)
+    for (n, (lo_key, hi_key)) in graph.edge_interval_index_specs().iter().enumerate() {
+        let (Some((slo, qlo)), Some((shi, qhi))) = (probe(lo_key, true), probe(hi_key, false))
+        else {
+            continue;
+        };
+        if slo != shi {
+            continue;
+        }
+        let (pr, len) = if qlo == qhi {
+            (Probe::Stab(qlo), graph.edge_interval_stab_len_nth(n, qlo))
+        } else {
+            let (d1, d2) = (qlo.min(qhi), qlo.max(qhi));
+            (
+                Probe::Overlap(d1, d2),
+                graph.edge_interval_overlap_len_nth(n, d1, d2),
+            )
+        };
+        if best.as_ref().is_none_or(|(_, _, b)| len < *b) {
+            best = Some((n, pr, len));
+        }
+    }
+    if let Some((n, pr, _)) = best {
+        return Some(match pr {
+            Probe::Stab(q) => graph.edge_interval_stab_nth(n, q),
+            Probe::Overlap(d1, d2) => graph.edge_interval_overlap_nth(n, d1, d2),
+        });
+    }
+    None
 }
 
 /// Candidate vertices for a single-node scan: an indexed inline `{key: lit}`
@@ -364,15 +170,50 @@ pub(super) fn node_index_seed(
     node: &CNode,
     where_: Option<&CExpr>,
 ) -> Option<Vec<u32>> {
-    for pc in &node.props {
-        if graph.vertex_indexed(&pc.key) {
-            // Inline `{key: lit}` OR `{key: $param}` — both resolve to a seek.
-            if let Some(k) = expr_to_idxkey(&pc.value, ctx) {
-                return graph.vertices_by_prop(&pc.key, &k).map(<[u32]>::to_vec);
-            }
+    // Inline `{k: v}` and a clause `WHERE u.k = v` now lower to the SAME
+    // structure, so they cannot take different paths. Previously the inline form
+    // returned on the FIRST indexed constraint and the WHERE form went through a
+    // separate recogniser; the two only agreed by coincidence.
+    seeded(
+        graph,
+        ctx,
+        where_,
+        &seek_lower::inline_of(node),
+        node.var_slot,
+        false,
+    )
+}
+
+/// Candidate ids for a lowered seek, or `None` to scan.
+pub(super) fn resolve_seek(graph: &Graph, ctx: &Ctx, seek: ElementSeek) -> Option<Vec<u32>> {
+    if seek.is_empty() {
+        return None;
+    }
+
+    seek.resolve(graph, &seek_lower::GqlBindings(ctx.params))
+}
+
+/// A seek for one element: the edge interval index first (it answers a shape the
+/// ordinary property indexes answer badly), then the shared access path.
+fn seeded(
+    graph: &Graph,
+    ctx: &Ctx,
+    where_: Option<&CExpr>,
+    inline: &[(&str, &CExpr)],
+    var_slot: Option<usize>,
+    edge: bool,
+) -> Option<Vec<u32>> {
+    if edge {
+        if let Some(ids) = where_.and_then(|w| interval_index_seed(graph, ctx, w, var_slot)) {
+            return Some(ids);
         }
     }
-    where_.and_then(|w| prop_index_hint(graph, ctx, w, node.var_slot, false))
+
+    resolve_seek(
+        graph,
+        ctx,
+        seek_lower::element_seek(where_, inline, graph, ctx, var_slot, edge),
+    )
 }
 
 /// Candidate edges for a single-segment pattern: an indexed inline `[r {key:lit}]`
@@ -408,16 +249,14 @@ pub(super) fn edge_prop_seed(
     rel: &CRel,
     where_: Option<&CExpr>,
 ) -> Option<Vec<u32>> {
-    for pc in &rel.props {
-        if graph.edge_indexed(&pc.key) {
-            if let CExpr::Lit(lit) = &pc.value {
-                if let Some(k) = lit_to_idxkey(lit) {
-                    return graph.edges_by_prop(&pc.key, &k).map(<[u32]>::to_vec);
-                }
-            }
-        }
-    }
-    where_.and_then(|w| prop_index_hint(graph, ctx, w, rel.var_slot, true))
+    seeded(
+        graph,
+        ctx,
+        where_,
+        &seek_lower::inline_of_rel(rel),
+        rel.var_slot,
+        true,
+    )
 }
 
 pub(super) fn edge_index_seed(

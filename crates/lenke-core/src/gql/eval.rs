@@ -3527,23 +3527,12 @@ fn cmp_bound(e: &CExpr, ctx: &Ctx) -> Option<(usize, usize, CompareOp, crate::gr
     None
 }
 
-/// Apply one comparison to a range bound (`Eq` clamps both ends).
-fn apply_bound(rb: &mut crate::graph::RangeBound, op: CompareOp, k: crate::graph::IdxKey) {
-    match op {
-        CompareOp::Gt => rb.gt = Some(k),
-        CompareOp::Ge => rb.gte = Some(k),
-        CompareOp::Lt => rb.lt = Some(k),
-        CompareOp::Le => rb.lte = Some(k),
-        CompareOp::Eq => {
-            rb.gte = Some(k.clone());
-            rb.lte = Some(k);
-        }
-        CompareOp::Ne => {}
-    }
-}
 
 // --- index-seeded scanning, expansion, and vectorized aggregation ---
 mod scan;
+mod seek_lower;
+#[cfg(test)]
+mod seek_lower_tests;
 use scan::*;
 
 // Query-shape fast-paths (count / grouped / parallel shortcuts).
@@ -3837,6 +3826,17 @@ pub fn prepare(text: &str) -> Result<Prepared, SyntaxError> {
 /// Like [`prepare`] but with a caller-supplied operator-chain ceiling (see
 /// `parser::DEFAULT_MAX_CHAIN`) — the prepared-statement analogue of
 /// `parse_with_max_chain`, honouring the native `maxOperatorChain` option.
+/// The lowered plan alone, for tests that inspect plan structure rather than
+/// run it — notably the seek-lowering collapse tests.
+#[cfg(test)]
+pub(crate) fn prepare_plan(text: &str) -> Result<super::plan::CQuery, SyntaxError> {
+    Ok(lower(&super::parser::parse_query_with_max_chain(
+        text,
+        super::parser::DEFAULT_MAX_CHAIN,
+    )?)
+    .0)
+}
+
 pub fn prepare_with_max_chain(text: &str, max_chain: usize) -> Result<Prepared, SyntaxError> {
     let query = super::parser::parse_query_with_max_chain(text, max_chain)?;
     let (plan, param_names) = lower(&query);

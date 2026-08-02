@@ -34,6 +34,30 @@ use std::sync::Arc;
 
 use crate::graph::{Graph, IdxKey, RangeBound};
 
+/// How a parameter slot resolves to index keys.
+///
+/// Two methods rather than one because `IN $p` needs the whole LIST, and a
+/// scalar-only resolver would quietly treat a bound list as a single value —
+/// seeking one wrong key instead of unioning several right ones. `None` from
+/// either means "no index can answer this", which makes the predicate
+/// unseekable rather than wrong.
+pub trait Bindings {
+    fn scalar(&self, slot: usize) -> Option<IdxKey>;
+
+    /// A slot holding a list. The default treats a scalar as a one-element
+    /// list, matching `IN $p` where `$p` was bound to a single value.
+    fn list(&self, slot: usize) -> Option<Vec<IdxKey>> {
+        self.scalar(slot).map(|k| vec![k])
+    }
+}
+
+/// So a test (or any front end with no list params) can pass a plain closure.
+impl<F: Fn(usize) -> Option<IdxKey>> Bindings for F {
+    fn scalar(&self, slot: usize) -> Option<IdxKey> {
+        self(slot)
+    }
+}
+
 /// A comparison a property index can answer. Deliberately NOT the parser's
 /// operator set: `<>` cannot seek (it is the complement of a point, which is
 /// most of the index), and neither can `IS NULL`.
@@ -63,23 +87,42 @@ impl SeekOp {
 }
 
 /// Where a compared value comes from. `Param` is resolved at execution.
-#[derive(Clone, Debug)]
+///
+/// `PartialEq` is what lets a test assert that two spellings collapsed to the
+/// SAME structure, which is a stronger statement than their costing the same.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Operand {
     Lit(IdxKey),
     Param(usize),
 }
 
 impl Operand {
-    fn resolve(&self, param: &impl Fn(usize) -> Option<IdxKey>) -> Option<IdxKey> {
+    fn resolve(&self, param: &impl Bindings) -> Option<IdxKey> {
         match self {
             Self::Lit(k) => Some(k.clone()),
-            Self::Param(slot) => param(*slot),
+            Self::Param(slot) => param.scalar(*slot),
         }
     }
 }
 
+/// One branch of an `OR` — its own conjunction of predicates.
+pub type Branch = Vec<KeyPredicate>;
+/// One `OR`: a union over branches. Named because the alternative is a
+/// `Vec<Vec<Vec<KeyPredicate>>>` whose levels nobody can keep straight.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Disjunction {
+    /// Branches known when the query was planned.
+    Branches(Vec<Branch>),
+    /// `key IN $p`, where `$p` holds a list. The VALUES are not known at plan
+    /// time and neither is how many there are, so this expands to one equality
+    /// branch per element at resolve time. Without it, an `IN` over a parameter
+    /// could only ever be recognized during execution, which is the thing this
+    /// layer exists to stop doing.
+    AnyOfParam { key: Arc<str>, slot: usize },
+}
+
 /// One `key OP value` a front end recognized.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct KeyPredicate {
     /// Property name, dotted for a nested path (`meta.city`) — the same string
     /// the index was declared under.
@@ -94,7 +137,7 @@ pub struct KeyPredicate {
 /// methods, which normalize as they go so equivalent spellings become the same
 /// structure. The recogniser above them never has to know that `u.k = $a OR
 /// u.k = $b` and `u.k IN [$a, $b]` are the same predicate.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ElementSeek {
     /// Which store to seek: edges have their own indexes and key ids.
     pub edge: bool,
@@ -102,10 +145,16 @@ pub struct ElementSeek {
     /// SUPERSET and the caller re-verifies. That is what lets the most selective
     /// one be chosen freely.
     conj: Vec<KeyPredicate>,
-    /// Disjunctive — `IN` lists and folded `OR`s of equalities on one key. Every
-    /// branch must be seekable or the whole disjunction is not: missing one
-    /// branch loses rows, unlike missing a conjunct.
-    disj: Vec<(Arc<str>, Vec<Operand>)>,
+    /// Disjunctive: outer is `OR`, each inner branch is that branch's own
+    /// conjunction. `IN` lists lower to one single-predicate branch per value,
+    /// and an `OR` whose branches address DIFFERENT keys (`a.x = 1 OR a.y = 2`)
+    /// is the same structure — both are a union over the same element space.
+    ///
+    /// Every branch must be seekable or that disjunction is not: missing a
+    /// branch loses rows, unlike missing a conjunct. Several disjunctions can
+    /// coexist — `(a OR b) AND (c OR d)` — and each is independently a valid
+    /// candidate superset, so they compete on size like the conjuncts do.
+    disj: Vec<Disjunction>,
 }
 
 impl ElementSeek {
@@ -127,6 +176,16 @@ impl ElementSeek {
         }
     }
 
+    /// A seek over the same store as `edge` says.
+    #[must_use]
+    pub fn same_kind(edge: bool) -> Self {
+        if edge {
+            Self::edge()
+        } else {
+            Self::node()
+        }
+    }
+
     /// True when nothing seekable was recognized — the caller should scan.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -135,25 +194,74 @@ impl ElementSeek {
 
     /// A `key OP value` conjunct.
     pub fn push(&mut self, key: Arc<str>, op: SeekOp, operand: Operand) {
-        self.conj.push(KeyPredicate { key, op, operand });
+        self.conj_push(KeyPredicate { key, op, operand });
+    }
+
+    /// An already-built conjunct.
+    pub fn conj_push(&mut self, p: KeyPredicate) {
+        self.conj.push(p);
+    }
+
+    /// This seek as the branches of an enclosing `OR`, or `None` if it cannot be
+    /// expressed as one — which makes the enclosing disjunction unseekable.
+    ///
+    /// A plain conjunction is ONE branch. A lone disjunction flattens into the
+    /// enclosing one, so `(a OR b) OR c` becomes `a OR b OR c` rather than a
+    /// union containing a union. Anything else (a conjunction mixed with a
+    /// disjunction) would need a distributive expansion that can blow up in
+    /// size, and the honest answer there is to scan.
+    #[must_use]
+    pub fn into_branches(self) -> Option<Vec<Branch>> {
+        match (self.conj.is_empty(), self.disj.len()) {
+            (false, 0) => Some(vec![self.conj]),
+            (true, 1) => match self.disj.into_iter().next()? {
+                Disjunction::Branches(b) => Some(b),
+                // A symbolic `IN $p` cannot be flattened without its values.
+                Disjunction::AnyOfParam { .. } => None,
+            },
+            _ => None,
+        }
     }
 
     /// A disjunction of equalities on ONE key — an `IN` list, or an `OR` of
     /// equalities the front end folded together.
-    ///
-    /// A singleton collapses to a conjunct: `u.k IN [$a]` is `u.k = $a`, and
-    /// leaving it as a one-branch union would take a different code path for a
-    /// predicate that is character-for-character equivalent. That is exactly the
-    /// class of divergence this module exists to remove.
-    ///
-    /// An EMPTY list is not a no-op — `u.k IN []` matches nothing — so it is
-    /// kept, and resolves to an empty candidate set rather than a scan.
     pub fn push_any_of(&mut self, key: Arc<str>, values: Vec<Operand>) {
-        if let [only] = values.as_slice() {
-            self.push(key, SeekOp::Eq, only.clone());
+        self.push_branches(
+            values
+                .into_iter()
+                .map(|v| {
+                    vec![KeyPredicate {
+                        key: key.clone(),
+                        op: SeekOp::Eq,
+                        operand: v,
+                    }]
+                })
+                .collect(),
+        );
+    }
+
+    /// A general disjunction: outer `OR`, each branch its own conjunction.
+    ///
+    /// A single branch collapses into the conjunction: `u.k IN [$a]` IS
+    /// `u.k = $a`, and leaving it as a one-branch union would take a different
+    /// code path for a predicate that is character-for-character equivalent.
+    /// That is precisely the class of divergence this module exists to remove —
+    /// after this, the two spellings are the same `ElementSeek`, not merely two
+    /// structures that happen to cost the same.
+    ///
+    /// An EMPTY disjunction is not a no-op — `u.k IN []` matches nothing — so it
+    /// is kept, and resolves to an empty candidate set rather than to a scan.
+    pub fn push_branches(&mut self, branches: Vec<Branch>) {
+        if let [only] = branches.as_slice() {
+            self.conj.extend(only.iter().cloned());
         } else {
-            self.disj.push((key, values));
+            self.disj.push(Disjunction::Branches(branches));
         }
+    }
+
+    /// `key IN $slot`, where the parameter holds the list. Expanded at resolve.
+    pub fn push_any_of_param(&mut self, key: Arc<str>, slot: usize) {
+        self.disj.push(Disjunction::AnyOfParam { key, slot });
     }
 
     /// Candidate element ids, or `None` to scan.
@@ -165,11 +273,7 @@ impl ElementSeek {
     /// The result is a SUPERSET for conjunctions — the caller still applies the
     /// full predicate — and exact for a lone disjunction.
     #[must_use]
-    pub fn resolve(
-        &self,
-        graph: &Graph,
-        param: &impl Fn(usize) -> Option<IdxKey>,
-    ) -> Option<Vec<u32>> {
+    pub fn resolve(&self, graph: &Graph, param: &impl Bindings) -> Option<Vec<u32>> {
         // Take the SMALLEST candidate set among the seekable options rather than
         // the first. A conjunction ANDs necessary conditions, so every candidate
         // set is a valid superset and the smallest is the cheapest correct one.
@@ -185,14 +289,14 @@ impl ElementSeek {
             }
         };
 
-        for (key, rb) in self.ranges(param) {
-            if let Some(ids) = idx_range(graph, &key, &rb, self.edge) {
+        for (key, rb) in ranges(&self.conj, param) {
+            if let Some(ids) = seek_bound(graph, &key, &rb, self.edge) {
                 keep(ids);
             }
         }
 
-        for (key, values) in &self.disj {
-            if let Some(ids) = self.union_of(graph, key, values, param) {
+        for d in &self.disj {
+            if let Some(ids) = self.union(graph, d, param) {
                 keep(ids);
             }
         }
@@ -200,15 +304,70 @@ impl ElementSeek {
         best
     }
 
-    /// Conjuncts folded into one tight [`RangeBound`] per key.
-    ///
-    /// `x >= 5 AND x <= 9` is one bounded seek, not two; and the caller gets
-    /// `5 <= x AND 9 >= x` as the same thing, because the operand order was
-    /// normalized away before it ever reached here.
-    fn ranges(&self, param: &impl Fn(usize) -> Option<IdxKey>) -> Vec<(Arc<str>, RangeBound)> {
-        let mut out: Vec<(Arc<str>, RangeBound)> = Vec::new();
+    /// The best candidate set for ONE conjunction — the smallest seekable one,
+    /// or `None` if nothing in it can seek.
+    fn best_of(
+        &self,
+        graph: &Graph,
+        preds: &[KeyPredicate],
+        param: &impl Bindings,
+    ) -> Option<Vec<u32>> {
+        ranges(preds, param)
+            .into_iter()
+            .filter_map(|(key, rb)| seek_bound(graph, &key, &rb, self.edge))
+            .min_by_key(Vec::len)
+    }
 
-        for p in &self.conj {
+    /// A disjunction seeds only when EVERY branch does — one unseekable branch
+    /// means rows outside the union, so the union is no longer a superset.
+    fn union(&self, graph: &Graph, d: &Disjunction, param: &impl Bindings) -> Option<Vec<u32>> {
+        let owned: Vec<Branch>;
+        let branches: &[Branch] = match d {
+            Disjunction::Branches(b) => b,
+            Disjunction::AnyOfParam { key, slot } => {
+                owned = param
+                    .list(*slot)?
+                    .into_iter()
+                    .map(|k| {
+                        vec![KeyPredicate {
+                            key: key.clone(),
+                            op: SeekOp::Eq,
+                            operand: Operand::Lit(k),
+                        }]
+                    })
+                    .collect();
+                &owned
+            }
+        };
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut out = Vec::new();
+
+        for branch in branches {
+            // Branches overlap freely, and a repeated value is a repeated
+            // branch: `IN ['a','a']` is `= 'a'`. The seed is a candidate LIST,
+            // so a duplicate becomes a duplicate ROW — a wrong answer, not just
+            // wasted work.
+            for id in self.best_of(graph, branch, param)? {
+                if seen.insert(id) {
+                    out.push(id);
+                }
+            }
+        }
+
+        Some(out)
+    }
+}
+
+/// Conjuncts folded into one tight [`RangeBound`] per key.
+///
+/// `x >= 5 AND x <= 9` is one bounded seek, not two; and `5 <= x AND 9 >= x`
+/// arrives as the same thing, because the operand order was normalized away
+/// before it ever reached here.
+fn ranges(preds: &[KeyPredicate], param: &impl Bindings) -> Vec<(Arc<str>, RangeBound)> {
+    let mut out: Vec<(Arc<str>, RangeBound)> = Vec::new();
+
+    {
+        for p in preds {
             let Some(key) = p.operand.resolve(param) else {
                 continue; // unbindable value ⇒ this conjunct simply cannot seek
             };
@@ -222,38 +381,9 @@ impl ElementSeek {
 
             apply(&mut slot.1, p.op, key);
         }
-
-        out
     }
 
-    /// A disjunction seeds only when EVERY branch does — one unseekable branch
-    /// means rows outside the union, so the union is no longer a superset.
-    fn union_of(
-        &self,
-        graph: &Graph,
-        key: &str,
-        values: &[Operand],
-        param: &impl Fn(usize) -> Option<IdxKey>,
-    ) -> Option<Vec<u32>> {
-        if !idx_indexed(graph, key, self.edge) {
-            return None;
-        }
-
-        let mut seen: HashSet<u32> = HashSet::new();
-        let mut out = Vec::new();
-
-        for v in values {
-            // A repeated value must not produce a repeated row: `IN ['a','a']`
-            // is `= 'a'`, and the seed is a candidate LIST, not a set.
-            for id in idx_eq(graph, key, &v.resolve(param)?, self.edge)? {
-                if seen.insert(id) {
-                    out.push(id);
-                }
-            }
-        }
-
-        Some(out)
-    }
+    out
 }
 
 /// Fold one comparison into an accumulating range.
@@ -270,15 +400,18 @@ fn apply(rb: &mut RangeBound, op: SeekOp, key: IdxKey) {
     }
 }
 
-pub(crate) fn idx_indexed(graph: &Graph, name: &str, edge: bool) -> bool {
-    if edge {
-        graph.edge_indexed(name)
-    } else {
-        graph.vertex_indexed(name)
+/// A folded bound as a seek. An exact point uses the POINT lookup rather than a
+/// degenerate one-element range — `k = 'x'` is by far the most common predicate
+/// there is, and routing it through the range machinery would make every
+/// equality pay for a scan it does not need.
+fn seek_bound(graph: &Graph, name: &str, rb: &RangeBound, edge: bool) -> Option<Vec<u32>> {
+    match (&rb.gte, &rb.lte, &rb.gt, &rb.lt) {
+        (Some(lo), Some(hi), None, None) if lo == hi => idx_eq(graph, name, lo, edge),
+        _ => idx_range(graph, name, rb, edge),
     }
 }
 
-pub(crate) fn idx_eq(graph: &Graph, name: &str, k: &IdxKey, edge: bool) -> Option<Vec<u32>> {
+fn idx_eq(graph: &Graph, name: &str, k: &IdxKey, edge: bool) -> Option<Vec<u32>> {
     if edge {
         graph.edges_by_prop(name, k).map(<[u32]>::to_vec)
     } else {
@@ -286,7 +419,7 @@ pub(crate) fn idx_eq(graph: &Graph, name: &str, k: &IdxKey, edge: bool) -> Optio
     }
 }
 
-pub(crate) fn idx_range(
+fn idx_range(
     graph: &Graph,
     name: &str,
     rb: &RangeBound,
