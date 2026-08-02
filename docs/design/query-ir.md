@@ -205,6 +205,43 @@ The cost, recorded because it is a real one: the merged type carries a
 **Semantics did not merge and should not.** Ordering, null placement, equality
 and rendering stay per-language — see the table under "Not on the table".
 
+## Merging `Record` and `Map`: tried, measured, reverted
+
+The obvious next step after unifying the value type, and the reasoning against it
+was originally "semantics" — which was wrong. Both order choices are
+implementation conveniences (TS reached for a JS `Map`, Rust wanted sorted keys
+for dedup and columnar work), and neither order is observable in the wire format:
+Gremlin **sorts map keys on output** to match `serde_json::Map`, and stringifies
+every key at the boundary.
+
+So it was built. Branch `merge-record-map`, commit `000b680`: one
+`Map(Arc<[(Value, Value)]>)` variant, GQL keeping its sorted-string-key
+invariant by construction, Gremlin keeping insertion order. All 1639 tests pass —
+it WORKS. The blocker is cost, not correctness.
+
+**Key width.** `(Arc<str>, Value)` is 56 bytes; `(Value, Value)` is 80. Measured
+on `map_bench`:
+
+| workload              | separate | merged  | delta    |
+| --------------------- | -------- | ------- | -------- |
+| construct record/row  | 5184.8   | 6993.2  | **+35%** |
+| read whole stored map | 5157.8   | 7072.5  | **+37%** |
+| order by map          | 12363.7  | 14390.4 | +16%     |
+| map equality filter   | 16414.8  | 18945.1 | +15%     |
+| nested field access   | 3480.6   | 3444.2  | −1%      |
+
+And it buys nothing to offset that. The merge ADDED seven `as_key_str()`
+downcasts to GQL and shares no algorithm: GQL binary-searches sorted string
+keys, Gremlin scans insertion-ordered any-value keys. Those are different data
+structures that happen to have the same shape.
+
+**Why the key is 40 bytes**, in case this is ever revisited: `Value` is sized by
+`Temporal`, which is sized by `Duration { months: i64, days: i64, secs: i64,
+nanos: u32 }` = 32 bytes. Boxing `Duration` would shrink `Value` and make the
+merged entry SMALLER than today's record — but `Temporal` is `Copy` and passed
+by value throughout, so that is a much larger change than the merge it would
+enable. That, not the key rules, is the thing actually holding this back.
+
 ## Not on the table
 
 Unifying the two surface languages. Users pick GQL or Gremlin, and the parallel
@@ -213,11 +250,11 @@ names across them are intentional. Sharing an access path is invisible to both.
 Unifying the two total ORDERS. They are deliberately different contracts, not
 drift:
 
-| | GQL | Gremlin |
-| ------ | ---------------------------- | ------------------------------- |
+|       | GQL                      | Gremlin                        |
+| ----- | ------------------------ | ------------------------------ |
 | ranks | Num, Str, Bool, Temporal | Null, Bool, Num, Str, Temporal |
-| null | sorts LARGEST | sorts FIRST |
-| NaN | Equal to every number | last (`total_cmp`) |
+| null  | sorts LARGEST            | sorts FIRST                    |
+| NaN   | Equal to every number    | last (`total_cmp`)             |
 
 GQL's is pinned byte-for-byte to TS `compareValues`; Gremlin's to TinkerPop.
 Injecting the comparator into a shared sort would share `slice::sort_by` and
