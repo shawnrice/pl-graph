@@ -3527,7 +3527,6 @@ fn cmp_bound(e: &CExpr, ctx: &Ctx) -> Option<(usize, usize, CompareOp, crate::gr
     None
 }
 
-
 // --- index-seeded scanning, expansion, and vectorized aggregation ---
 mod scan;
 mod seek_lower;

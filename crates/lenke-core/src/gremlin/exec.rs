@@ -12,8 +12,9 @@ use std::sync::Arc;
 use super::{
     By, Column, Endpoint, GVal, Order, Pop, PropVal, SackOp, Scope, Step, Token, Traversal, P,
 };
-use crate::graph::{Graph, IdxKey, RangeBound, Value};
+use crate::graph::{Graph, IdxKey, Value};
 use crate::jsonfmt::{push_json_str, push_num};
+use crate::seek::{ElementSeek, KeyPredicate, Operand, SeekOp};
 
 /// A hashable projection of a [`GVal`] for O(1) dedup. Mirrors `GVal`'s derived
 /// structural equality, with the two `f64` details handled so it matches
@@ -228,17 +229,17 @@ pub fn try_run(graph: &mut Graph, t: &Traversal) -> crate::error::CodeResult<Vec
 
 fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
     take_type_fault(); // reset any leftover flag from a prior run on this thread
-                       // Index seeding: `V().has(key, pred)` on an indexed key seeds from the
-                       // property index (skipping the full label scan + the now-satisfied `has`).
-                       // A seeded plan drops the `V()`/`E()` it started from and the one `has` the
-                       // index fully answered, keeping every other step — including any filters that
-                       // preceded that `has`, which still have to run over the seed.
+
+    // A seeded plan drops the `V()`/`E()` it started from plus the filters the
+    // index answered exactly. Every OTHER filter still runs, including any that
+    // preceded them — the seed is only a superset with respect to those.
     match index_seed(graph, &t.steps) {
-        Some((seed, at)) => {
+        Some((seed, answered)) if answered.is_empty() => run_steps(graph, ctx, &t.steps[1..], seed),
+        Some((seed, answered)) => {
             let rest: Vec<Step> = t.steps[1..]
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| i + 1 != at)
+                .filter(|(i, _)| !answered.contains(&(i + 1)))
                 .map(|(_, step)| step.clone())
                 .collect();
 
@@ -274,139 +275,148 @@ fn prefix_upper(s: &str) -> Option<String> {
     None
 }
 
-/// If the plan opens with `V()` / `E()` and a `has(key, pred)` on an indexed key
-/// follows — not necessarily IMMEDIATELY — return the seeded elements and the
-/// index of the `has` that produced them, which the caller then drops from the
-/// pipeline because the index has fully satisfied it. `None` ⇒ fall back to scan.
+/// Candidate elements for a traversal that opens with `V()` / `E()` followed by
+/// element filters, via the shared access path in [`crate::seek`].
 ///
-/// The seekable `has` used to have to be step 1 exactly, so
-/// `V().hasLabel('P').has('k', v)` scanned while `V().has('k', v).hasLabel('P')`
-/// seeked — 207x on a 20k-vertex graph, and label-first is the idiomatic
-/// TinkerPop order. `E().hasLabel('R').has('w', 5)` was 553x.
+/// Only pure element-filter steps are read. `hasLabel` / `has` / `hasNot` narrow
+/// the current element set without changing what a traverser IS, so seeding from
+/// any of them and re-running the rest over the seed gives the same answer. A
+/// navigating step (`out`, `values`, …) rebinds the traverser, so a `has` after
+/// one addresses a different element entirely and must stop the search.
 ///
-/// Only pure element-filter steps may sit in between. `hasLabel` / `has` /
-/// `hasNot` narrow the current element set without changing what a traverser
-/// IS, so seeding from a later `has` and re-running them over the seed gives the
-/// same answer. A navigating step (`out`, `values`, …) rebinds the traverser, so
-/// a `has` after one addresses a different element entirely and must not seed
-/// the start.
-fn index_seed(graph: &Graph, steps: &[Step]) -> Option<(Vec<Trav>, usize)> {
+/// Returns the seed and how many leading steps the caller may skip: the
+/// `V()`/`E()` always, plus any `has` on the key the index answered EXACTLY.
+///
+/// Re-applying that `has` would be a no-op filter, but not a free one — it is a
+/// second pass over the whole seed, which measured a clean 2x on `range` and
+/// `between` in `gremlin_index_bench`. Only steps on the exact key are dropped;
+/// a `has` on any other key is still doing work, because the seed is only a
+/// superset with respect to those.
+fn index_seed(graph: &Graph, steps: &[Step]) -> Option<(Vec<Trav>, Vec<usize>)> {
     let is_edge = match steps.first()? {
         Step::V(ids) if ids.is_empty() => false,
         Step::E(ids) if ids.is_empty() => true,
         _ => return None,
     };
-    let indexed = |k: &str| {
-        if is_edge {
-            graph.edge_indexed(k)
-        } else {
-            graph.vertex_indexed(k)
-        }
-    };
-    // The first seekable `has` in the leading run of element filters.
-    let mut at = None;
+    let mut seek = ElementSeek::same_kind(is_edge);
 
-    for (i, step) in steps.iter().enumerate().skip(1) {
+    for step in steps.iter().skip(1) {
         match step {
-            Step::Has(k, _) if indexed(k) => {
-                at = Some(i);
-                break;
-            }
-            // Not seekable itself, but harmless to look past.
-            Step::Has(..) | Step::HasLabel(..) | Step::HasNot(..) => {}
-            // Anything else rebinds or consumes the traverser.
-            _ => return None,
+            Step::Has(key, pred) => lower_predicate(key, pred, &mut seek),
+            Step::HasLabel(..) | Step::HasNot(..) => {}
+            _ => break,
         }
     }
 
-    let at = at?;
-    let (key, pred) = match &steps[at] {
-        Step::Has(k, p) => (k, p),
-        _ => return None,
-    };
-    let eq = |k: &IdxKey| {
-        if is_edge {
-            graph.edges_by_prop(key, k)
-        } else {
-            graph.vertices_by_prop(key, k)
+    // Gremlin values are already values — there are no parameter slots to bind.
+    let seeded = seek.resolve_seeded(graph, &(|_: usize| None))?;
+    let answered: Vec<usize> = seeded.exact_key.map_or_else(Vec::new, |key| {
+        steps
+            .iter()
+            .enumerate()
+            .skip(1)
+            .take_while(|(_, s)| matches!(s, Step::Has(..) | Step::HasLabel(..) | Step::HasNot(..)))
+            .filter(|(_, s)| matches!(s, Step::Has(k, _) if **k == *key))
+            .map(|(i, _)| i)
+            .collect()
+    });
+
+    Some((
+        seeded
+            .ids
+            .into_iter()
+            .map(|id| {
+                Trav::root(if is_edge {
+                    GVal::Edge(id)
+                } else {
+                    GVal::Vertex(id)
+                })
+            })
+            .collect(),
+        answered,
+    ))
+}
+
+/// One `has(key, P)` as constraints on the shared access path.
+///
+/// This is where Gremlin's predicate vocabulary meets a plain index: `between`
+/// is two bounds on one key, `outside` is a UNION of two half-open ranges (a
+/// disjunction, not a range — as a conjunction it would be the empty
+/// intersection, the opposite of what it means), and `startsWith` is a prefix
+/// range, `>= prefix AND < prefix_upper`. That last one is the form GQL's
+/// `starts_with` still lacks and now stands to inherit for free.
+fn lower_predicate(key: &str, pred: &P, seek: &mut ElementSeek) {
+    let key: Arc<str> = Arc::from(key);
+    let lit = |v: &GVal| gval_to_idxkey(v).map(Operand::Lit);
+    let mut one = |op: SeekOp, v: &GVal| {
+        if let Some(o) = lit(v) {
+            seek.push(key.clone(), op, o);
         }
     };
-    let rng = |b: RangeBound| {
-        if is_edge {
-            graph.edges_by_prop_range(key, &b)
-        } else {
-            graph.vertices_by_prop_range(key, &b)
+
+    match pred {
+        P::Eq(v) => one(SeekOp::Eq, v),
+        P::Gt(v) => one(SeekOp::Gt, v),
+        P::Gte(v) => one(SeekOp::Ge, v),
+        P::Lt(v) => one(SeekOp::Lt, v),
+        P::Lte(v) => one(SeekOp::Le, v),
+        P::Between(lo, hi) => {
+            one(SeekOp::Ge, lo);
+            one(SeekOp::Lt, hi);
         }
-    };
-    let ids: Vec<u32> = match pred {
-        P::Eq(v) => eq(&gval_to_idxkey(v)?)?.to_vec(),
-        P::Within(vs) => {
-            let mut out = Vec::new();
-            for v in vs {
-                if let Some(k) = gval_to_idxkey(v) {
-                    if let Some(s) = eq(&k) {
-                        out.extend_from_slice(s);
-                    }
-                }
-            }
-            out
+        P::Inside(lo, hi) => {
+            one(SeekOp::Gt, lo);
+            one(SeekOp::Lt, hi);
         }
-        P::Gt(v) => rng(RangeBound {
-            gt: gval_to_idxkey(v),
-            ..Default::default()
-        })?,
-        P::Gte(v) => rng(RangeBound {
-            gte: gval_to_idxkey(v),
-            ..Default::default()
-        })?,
-        P::Lt(v) => rng(RangeBound {
-            lt: gval_to_idxkey(v),
-            ..Default::default()
-        })?,
-        P::Lte(v) => rng(RangeBound {
-            lte: gval_to_idxkey(v),
-            ..Default::default()
-        })?,
-        P::Between(lo, hi) => rng(RangeBound {
-            gte: gval_to_idxkey(lo),
-            lt: gval_to_idxkey(hi),
-            ..Default::default()
-        })?,
-        P::Inside(lo, hi) => rng(RangeBound {
-            gt: gval_to_idxkey(lo),
-            lt: gval_to_idxkey(hi),
-            ..Default::default()
-        })?,
         P::Outside(lo, hi) => {
-            let mut out = rng(RangeBound {
-                lt: gval_to_idxkey(lo),
-                ..Default::default()
-            })?;
-            out.extend(rng(RangeBound {
-                gt: gval_to_idxkey(hi),
-                ..Default::default()
-            })?);
-            out
+            let (Some(lo), Some(hi)) = (lit(lo), lit(hi)) else {
+                return;
+            };
+
+            seek.push_branches(vec![
+                vec![KeyPredicate {
+                    key: key.clone(),
+                    op: SeekOp::Lt,
+                    operand: lo,
+                }],
+                vec![KeyPredicate {
+                    key,
+                    op: SeekOp::Gt,
+                    operand: hi,
+                }],
+            ]);
+        }
+        P::Within(vs) => {
+            let Some(values) = vs.iter().map(lit).collect::<Option<Vec<_>>>() else {
+                return;
+            };
+
+            // Deduped by the shared layer. The hand-rolled version was not, so
+            // `within('a', 'a')` returned the element twice — a duplicate
+            // candidate becomes a duplicate ROW, which is a wrong answer.
+            seek.push_any_of(key, values);
         }
         P::StartsWith(prefix) => {
-            let lo = Some(IdxKey::Str(prefix.as_str().into()));
-            let hi = prefix_upper(prefix).map(|u| IdxKey::Str(u.as_str().into()));
-            rng(RangeBound {
-                gte: lo,
-                lt: hi,
-                ..Default::default()
-            })?
+            seek.push(
+                key.clone(),
+                SeekOp::Ge,
+                Operand::Lit(IdxKey::Str(prefix.as_str().into())),
+            );
+
+            // No upper bound when the prefix is all-maximal: everything at or
+            // after it starts with it.
+            if let Some(upper) = prefix_upper(prefix) {
+                seek.push(
+                    key,
+                    SeekOp::Lt,
+                    Operand::Lit(IdxKey::Str(upper.as_str().into())),
+                );
+            }
         }
-        _ => return None,
-    };
-    let mk = |id: u32| {
-        if is_edge {
-            GVal::Edge(id)
-        } else {
-            GVal::Vertex(id)
-        }
-    };
-    Some((ids.into_iter().map(|id| Trav::root(mk(id))).collect(), at))
+        // `neq`, `without`, `containing`, … enumerate a complement, which no
+        // point or range seek covers.
+        _ => {}
+    }
 }
 
 /// Serialize traversal results to a JSON array string — the FFI carrier. Graph

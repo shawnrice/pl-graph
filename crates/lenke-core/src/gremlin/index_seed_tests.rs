@@ -22,7 +22,7 @@ fn seeded() -> Graph {
 
     for i in 0..1000 {
         lines.push(format!(
-            r#"{{"type":"node","id":"p{i}","labels":["P"],"properties":{{"k":"key{i:04}","n":{i},"tag":"t"}}}}"#
+            r#"{{"type":"node","id":"p{i}","labels":["P"],"properties":{{"k":"key{i:04}","n":{i},"tag":"t","dupe":"d"}}}}"#
         ));
         lines.push(format!(
             r#"{{"type":"node","id":"q{i}","labels":["Q"],"properties":{{"k":"key{i:04}","n":{i}}}}}"#
@@ -40,6 +40,9 @@ fn seeded() -> Graph {
 
     graph.create_vertex_index("k");
     graph.create_vertex_index("n");
+    // Low-cardinality on purpose: 1000 P vertices carry it, so seeding from it
+    // instead of the selective key costs 500x.
+    graph.create_vertex_index("dupe");
     graph.create_edge_index("w");
 
     graph
@@ -355,4 +358,94 @@ fn equivalent_gremlin_spellings_cost_the_same() {
     }
 
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Inherited from the shared access path (crate::seek) — behaviours Gremlin's
+// own recogniser did not have before it lowered into that layer.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_repeated_value_in_within_yields_one_row() {
+    let mut graph = seeded();
+
+    // The hand-rolled seed concatenated one point lookup per value with no
+    // dedup, so a repeated value returned the element TWICE — a duplicate
+    // candidate becomes a duplicate row, which is a wrong answer rather than
+    // slow one. The shared layer dedups.
+    assert_eq!(
+        ids(
+            &mut graph,
+            g().v_ids(&[]).has("k", P::within(["key0005", "key0005"]))
+        ),
+        vec!["p5", "q5"]
+    );
+}
+
+#[test]
+fn the_more_selective_of_two_filters_seeds() {
+    let mut graph = seeded();
+
+    // Both keys are indexed. `n` matches 2 elements and `dupe` matches 1000, so
+    // seeding from `dupe` costs 500x. Gremlin used to take the FIRST seekable
+    // `has` while GQL took the most selective — the drift the shared layer
+    // removes. Only the rows are asserted here; `equivalent_gremlin_spellings_
+    // cost_the_same` is what pins the cost.
+    assert_eq!(
+        ids(
+            &mut graph,
+            g().v_ids(&[]).has_val("dupe", "d").has_val("n", 5.0)
+        ),
+        vec!["p5"]
+    );
+    assert_eq!(
+        ids(
+            &mut graph,
+            g().v_ids(&[]).has_val("n", 5.0).has_val("dupe", "d")
+        ),
+        vec!["p5"]
+    );
+}
+
+#[test]
+fn outside_is_a_union_not_an_empty_intersection() {
+    let mut graph = seeded();
+
+    // `outside(lo, hi)` is `< lo OR > hi`. Lowered as a conjunction it would be
+    // an empty range — the exact opposite of what it means.
+    let got = ids(
+        &mut graph,
+        g().v_ids(&[])
+            .has_label(&["P"])
+            .has("n", P::outside(2.0, 996.0)),
+    );
+
+    assert_eq!(got, vec!["p0", "p1", "p997", "p998", "p999"]);
+}
+
+#[test]
+fn starts_with_seeks_a_prefix_range() {
+    let mut graph = seeded();
+
+    assert_eq!(
+        ids(
+            &mut graph,
+            g().v_ids(&[])
+                .has_label(&["P"])
+                .has("k", P::starts_with("key099"))
+        ),
+        vec!["p990", "p991", "p992", "p993", "p994", "p995", "p996", "p997", "p998", "p999"]
+    );
+}
+
+#[test]
+fn a_range_and_a_point_on_two_keys_agree_with_the_scan() {
+    let mut graph = seeded();
+
+    let seeded_form = ids(
+        &mut graph,
+        g().v_ids(&[]).has("n", P::gte(5.0)).has_val("k", "key0007"),
+    );
+
+    assert_eq!(seeded_form, vec!["p7", "q7"]);
 }

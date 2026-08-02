@@ -105,6 +105,16 @@ impl Operand {
     }
 }
 
+/// A resolved seek: the candidate ids, and which key they answer exactly.
+#[derive(Clone, Debug)]
+pub struct Seeded {
+    pub ids: Vec<u32>,
+    /// The key whose constraints the seed satisfies exactly, so a caller may
+    /// drop the filter that produced them. `None` ⇒ treat the seed as a
+    /// superset and re-apply everything.
+    pub exact_key: Option<Arc<str>>,
+}
+
 /// One branch of an `OR` — its own conjunction of predicates.
 pub type Branch = Vec<KeyPredicate>;
 /// One `OR`: a union over branches. Named because the alternative is a
@@ -274,6 +284,24 @@ impl ElementSeek {
     /// full predicate — and exact for a lone disjunction.
     #[must_use]
     pub fn resolve(&self, graph: &Graph, param: &impl Bindings) -> Option<Vec<u32>> {
+        self.resolve_seeded(graph, param).map(|s| s.ids)
+    }
+
+    /// As [`resolve`](Self::resolve), plus which key (if any) the seed answers
+    /// EXACTLY rather than as a superset.
+    ///
+    /// A caller that re-applies the full predicate — GQL does — can ignore it.
+    /// One that drops the filter the index satisfied needs it: re-filtering a
+    /// large range seed is a second pass over the whole seed, which measured a
+    /// clean 2x on `range` and `between` in `gremlin_index_bench`.
+    ///
+    /// Conservative by construction. A conjunction seeks one key with every
+    /// bound on that key folded in, so that key is exact. A disjunction is exact
+    /// only when every branch is a single predicate on one shared key — anything
+    /// else may have taken a per-branch superset, and calling it exact would
+    /// drop a filter that is still doing work.
+    #[must_use]
+    pub fn resolve_seeded(&self, graph: &Graph, param: &impl Bindings) -> Option<Seeded> {
         // Take the SMALLEST candidate set among the seekable options rather than
         // the first. A conjunction ANDs necessary conditions, so every candidate
         // set is a valid superset and the smallest is the cheapest correct one.
@@ -282,22 +310,22 @@ impl ElementSeek {
         //
         // Intersecting them instead was measured to LOSE: building and probing
         // two ~200k halves costs more than the scan it replaces.
-        let mut best: Option<Vec<u32>> = None;
-        let mut keep = |candidate: Vec<u32>| {
-            if best.as_ref().is_none_or(|b| candidate.len() < b.len()) {
-                best = Some(candidate);
+        let mut best: Option<Seeded> = None;
+        let mut keep = |ids: Vec<u32>, exact_key: Option<Arc<str>>| {
+            if best.as_ref().is_none_or(|b| ids.len() < b.ids.len()) {
+                best = Some(Seeded { ids, exact_key });
             }
         };
 
         for (key, rb) in ranges(&self.conj, param) {
             if let Some(ids) = seek_bound(graph, &key, &rb, self.edge) {
-                keep(ids);
+                keep(ids, Some(key));
             }
         }
 
         for d in &self.disj {
             if let Some(ids) = self.union(graph, d, param) {
-                keep(ids);
+                keep(ids, one_key_of(d));
             }
         }
 
@@ -386,6 +414,24 @@ fn ranges(preds: &[KeyPredicate], param: &impl Bindings) -> Vec<(Arc<str>, Range
     out
 }
 
+/// The single key a disjunction constrains, when every branch is one predicate
+/// on that same key — an `IN` list or a folded `OR` of equalities. `None` for a
+/// branch that constrains several keys, where the union may be a superset.
+fn one_key_of(d: &Disjunction) -> Option<Arc<str>> {
+    match d {
+        Disjunction::AnyOfParam { key, .. } => Some(key.clone()),
+        Disjunction::Branches(branches) => {
+            let mut keys = branches.iter().map(|b| match b.as_slice() {
+                [only] => Some(&only.key),
+                _ => None,
+            });
+            let first = keys.next()??.clone();
+
+            keys.all(|k| k == Some(&first)).then_some(first)
+        }
+    }
+}
+
 /// Fold one comparison into an accumulating range.
 fn apply(rb: &mut RangeBound, op: SeekOp, key: IdxKey) {
     match op {
@@ -419,12 +465,7 @@ fn idx_eq(graph: &Graph, name: &str, k: &IdxKey, edge: bool) -> Option<Vec<u32>>
     }
 }
 
-fn idx_range(
-    graph: &Graph,
-    name: &str,
-    rb: &RangeBound,
-    edge: bool,
-) -> Option<Vec<u32>> {
+fn idx_range(graph: &Graph, name: &str, rb: &RangeBound, edge: bool) -> Option<Vec<u32>> {
     if edge {
         graph.edges_by_prop_range(name, rb)
     } else {
