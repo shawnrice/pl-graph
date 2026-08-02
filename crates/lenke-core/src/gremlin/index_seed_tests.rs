@@ -823,3 +823,59 @@ fn an_unknown_label_mid_chain_stops_the_count() {
         0.0
     );
 }
+
+// ---------------------------------------------------------------------------
+// Lazy path accumulation. `Trav::step` skips cloning the path when no step in
+// the run reads it — decided from an ALLOWLIST, so anything unrecognized keeps
+// accumulating. These pin the boundary: a traversal that LOOKS path-free but
+// ends in a path consumer must still have its path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_path_consuming_step_still_gets_its_path() {
+    let mut graph = seeded();
+
+    // Every step before `path()` is on the allowlist, so the decision rests
+    // entirely on `path()` itself being off it.
+    let out = g()
+        .v_ids(&[])
+        .has_label(&["P"])
+        .has_val("k", "key0005")
+        .out(&["R"])
+        .path()
+        .run(&mut graph);
+
+    match out.as_slice() {
+        [GVal::List(hops)] => assert_eq!(hops.len(), 2, "start vertex then neighbour"),
+        other => panic!("expected one path of two hops, got {other:?}"),
+    }
+}
+
+#[test]
+fn simple_path_still_filters_on_a_path_free_looking_prefix() {
+    let mut graph = seeded();
+
+    // `simplePath` reads the path to reject repeats. If accumulation had been
+    // skipped, every traverser would carry an empty path and none would be
+    // rejected.
+    let with_filter = g()
+        .v_ids(&[])
+        .has_label(&["P"])
+        .both(&[])
+        .both(&[])
+        .simple_path()
+        .count()
+        .run(&mut graph);
+    let without = g()
+        .v_ids(&[])
+        .has_label(&["P"])
+        .both(&[])
+        .both(&[])
+        .count()
+        .run(&mut graph);
+
+    assert_ne!(
+        with_filter, without,
+        "simplePath must drop the walks that return to their start"
+    );
+}
