@@ -273,6 +273,37 @@ would make the clone cheap but not the construction, so it does not help either.
 **This is why `Temporal` is `Copy` and `Duration` is inline**, and it should stay
 that way. A −20% `Value` bought ~7% on maps and cost 3.3x on durations.
 
+Two facts underpin it, both checked: a `Temporal` is NEVER mutated (no
+`&mut Temporal` exists in the crate), and there is nothing to reference — the
+columns are packed SoA, so `TemporalCol::get(i)` ASSEMBLES a `Temporal` from two
+to four parallel arrays. Construction, not copying, is the hot operation, which
+is exactly the wrong place to add an allocation.
+
+### The version that would work, if the semantics are acceptable
+
+Narrowing rather than boxing keeps `Copy`, so construction stays a register copy
+and the duration regression never happens:
+
+```text
+  Duration { months: i32, days: i32, nanos: i64 }   16 bytes, still Copy
+  Temporal  40 -> 24        Value  40 -> 32        record entry  56 -> 48
+```
+
+It costs a SEMANTIC change and so is not something to do quietly: folding
+`secs: i64` + `nanos: u32` into one `i64` of nanoseconds caps a duration's
+seconds component at ±292 years rather than ±292 billion. Months (`i32`, ±178M
+years) and days (`i32`, ±5.8M years) are stored separately and unaffected, so
+only an enormous SECONDS count is truncated (`PT9999999999S`).
+
+No alternative avoids it: keeping `secs: i64 + nanos: u32` leaves 4 bytes for
+months and days together, forcing days down to ±89 years — worse. It also
+changes the stored representation, so it needs codec work, a fuzzer pass for
+byte-identity, and an overflow policy (the precedent is that date overflow
+throws).
+
+Payoff: ~7-11% on map/record workloads and a 20% smaller value in every binding
+slot.
+
 ## Not on the table
 
 Unifying the two surface languages. Users pick GQL or Gremlin, and the parallel
