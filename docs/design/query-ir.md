@@ -342,6 +342,48 @@ Gremlin's `hasLabel` matches the FIRST label only, so a bucket count matches a
 win in that list was not a fast path at all — `hasLabel` was allocating an
 `Arc<str>` per element to compare two integers (fixed, −17%).
 
+## The join is the next frontier, and it has a real bug
+
+`multi-pattern` is the largest remaining bail, and probing it turned up the
+biggest cost asymmetry found in this whole effort.
+
+GQL's comma-pattern join (`visit_patterns`, `gql/eval/pathfind.rs`) recurses
+through patterns in **written order**. Gremlin's `match()` (`match_solve`) calls
+`pick_runnable` — it picks a pattern whose start is already bound. So Gremlin has
+an optimization GQL does not, and the two spellings of one query cost wildly
+different amounts:
+
+```text
+MATCH (x:S)-[:R]->(b), (b)-[:R]->(c) WHERE x.k = 'target'   -- anchor FIRST
+MATCH (b)-[:R]->(c), (x:S)-[:R]->(b) WHERE x.k = 'target'   -- anchor LAST
+
+  A-nodes   anchor FIRST   anchor LAST      ratio
+    3,000       0.000 ms      0.618 ms     1,278x
+   30,000       0.001 ms      6.203 ms    12,356x
+  300,000       0.001 ms     62.286 ms   121,336x
+```
+
+Both return the same single row. `anchor FIRST` is CONSTANT — it seeks the
+selective anchor and expands from it. `anchor LAST` is LINEAR in the graph: the
+unanchored pattern is enumerated as the outer loop and the anchor only prunes
+afterwards. The ratio is unbounded, growing with the graph.
+
+This is the `equivalent_spellings_cost_the_same` class from CLAUDE.md — every
+instance of which returned the correct answer, so no correctness test could see
+it — but one level up, at the join rather than the predicate, and far larger than
+the 100-300x those cost.
+
+The fix is the one Gremlin already has: choose the next pattern by whether its
+start is bound, instead of by where the user typed it. Doing that in the shared
+IR is the point of the exercise — it is one optimization that both languages
+would then be on the correct side of.
+
+**What gates it:** reordering the join changes the ROW ORDER of a multi-pattern
+`MATCH` with no `ORDER BY`. That order is documented as unspecified and the
+differential fuzzers compare unordered results as multisets, so it is permitted —
+but it is an observable change and in-repo tests that pin row order will need
+rewriting. That is a decision to take deliberately, not a side effect to slip in.
+
 ## How much is left, measured
 
 Every point where GQL declines the vectorized frame was labelled and the GQL
