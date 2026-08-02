@@ -1095,3 +1095,181 @@ pub fn expand_count(
 
     n
 }
+
+/// One expansion step: which way, along which edge types, binding which slots.
+pub struct Hop<'a> {
+    pub dir: Dir,
+    /// `None` means ANY edge type. `Some(&[])` means NONE — a type name that
+    /// resolved to nothing. Collapsing those two turns a typo into a full
+    /// expansion, which is how `[:NONEXISTENT]` started matching every edge.
+    pub etypes: Option<&'a [u32]>,
+    pub loops: SelfLoops,
+    /// Slots the traversed edge and the reached node bind, if named.
+    pub rel_slot: Option<usize>,
+    pub node_slot: Option<usize>,
+}
+
+/// What a front end checks per candidate that the IR could not express.
+///
+/// Two methods rather than one closure so the per-ROW work stays per row: GQL
+/// binds every already-known slot once before walking a vertex's neighbours, and
+/// folding that into the per-neighbour check would repeat it for the whole
+/// degree.
+pub trait RowFilter {
+    /// Called once per source row, before its neighbours. `cols` is the frontier
+    /// as it stands, so prior slots can be read at `row`.
+    fn row(&mut self, cols: &[Option<Vec<u32>>], row: usize) {
+        let _ = (cols, row);
+    }
+
+    /// Keep this `(edge, neighbour)`?
+    fn keep(&mut self, eidx: u32, nbr: u32) -> bool;
+}
+
+/// A `RowFilter` that keeps everything — for a hop with nothing left over.
+pub struct KeepAll;
+
+impl RowFilter for KeepAll {
+    fn keep(&mut self, _: u32, _: u32) -> bool {
+        true
+    }
+}
+
+/// The frontier of a multi-hop expansion: one id column per bound slot, plus the
+/// element each row currently sits on.
+///
+/// This is the shape both engines were maintaining separately. GQL carried a
+/// column per bound pattern variable and replicated them as rows fanned out;
+/// Gremlin's lowered prefix carried a single flat id list, which is the same
+/// structure with one column. Sharing it means the fan-out, the column
+/// replication, the LIMIT stop and the intermediate-size ceiling are written
+/// once.
+pub struct Frontier {
+    cols: Vec<Option<Vec<u32>>>,
+    endpoint: Vec<u32>,
+}
+
+/// The frontier grew past the configured ceiling — see [`Frontier::expand`].
+#[derive(Debug)]
+pub struct TooWide;
+
+impl Frontier {
+    /// Start from `endpoint`, binding it to `slot` if the start is named.
+    #[must_use]
+    pub fn seed(endpoint: Vec<u32>, slot: Option<usize>, width: usize) -> Self {
+        let mut cols: Vec<Option<Vec<u32>>> = (0..width.max(1)).map(|_| None).collect();
+
+        if let Some(s) = slot {
+            cols[s] = Some(endpoint.clone());
+        }
+
+        Self { cols, endpoint }
+    }
+
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.endpoint.len()
+    }
+
+    #[must_use]
+    pub fn endpoint(&self) -> &[u32] {
+        &self.endpoint
+    }
+
+    /// Take a bound column out of the frontier.
+    pub fn take_column(&mut self, slot: usize) -> Option<Vec<u32>> {
+        self.cols.get_mut(slot).and_then(Option::take)
+    }
+
+    /// Mark a slot as carrying values, so later hops replicate it.
+    pub fn bind(&mut self, slot: usize) {
+        if self.cols[slot].is_none() {
+            self.cols[slot] = Some(Vec::new());
+        }
+    }
+
+    /// Fan every row out along `hop`, replicating bound columns.
+    ///
+    /// `cap` stops the build as soon as enough rows exist — only sound on the
+    /// LAST hop, where no later filter can drop them. `budget` bounds the
+    /// intermediate result: the cross-product of partial matches reaches billions
+    /// on a dense graph, and it is checked INSIDE the build so a single runaway
+    /// layer caps rather than materializing first.
+    pub fn expand<F: RowFilter + ?Sized>(
+        &mut self,
+        graph: &Graph,
+        hop: &Hop<'_>,
+        budget: u64,
+        cap: Option<usize>,
+        f: &mut F,
+    ) -> Result<(), TooWide> {
+        let width = self.cols.len();
+        let mut new_cols: Vec<Option<Vec<u32>>> = (0..width)
+            .map(|s| self.cols[s].as_ref().map(|_| Vec::new()))
+            .collect();
+
+        if let Some(s) = hop.rel_slot {
+            new_cols[s] = Some(Vec::new());
+        }
+
+        if let Some(s) = hop.node_slot {
+            new_cols[s] = Some(Vec::new());
+        }
+
+        let mut new_endpoint: Vec<u32> = Vec::new();
+        let keep_type = |t: u32| hop.etypes.is_none_or(|e| e.contains(&t));
+        let drop_loop = hop.dir == Dir::Both && hop.loops == SelfLoops::Once;
+
+        'rows: for i in 0..self.endpoint.len() {
+            let v = self.endpoint[i];
+
+            f.row(&self.cols, i);
+
+            let out = (hop.dir != Dir::In)
+                .then(|| graph.out_adj(v))
+                .into_iter()
+                .flatten();
+            let inn = (hop.dir != Dir::Out)
+                .then(|| graph.in_adj(v))
+                .into_iter()
+                .flatten()
+                .filter(|a| !(drop_loop && a.nbr == v));
+
+            for a in out.chain(inn).filter(|a| keep_type(a.etype)) {
+                if !f.keep(a.eidx, a.nbr) {
+                    continue;
+                }
+
+                for (s, col) in new_cols.iter_mut().enumerate() {
+                    let Some(col) = col else { continue };
+                    let v = if hop.rel_slot == Some(s) {
+                        a.eidx
+                    } else if hop.node_slot == Some(s) {
+                        a.nbr
+                    } else if let Some(prior) = &self.cols[s] {
+                        prior[i]
+                    } else {
+                        // Bound by a LATER hop — no value in this row yet.
+                        continue;
+                    };
+
+                    col.push(v);
+                }
+
+                new_endpoint.push(a.nbr);
+
+                if cap.is_some_and(|c| new_endpoint.len() >= c) {
+                    break 'rows;
+                }
+
+                if new_endpoint.len() as u64 > budget {
+                    return Err(TooWide);
+                }
+            }
+        }
+
+        self.cols = new_cols;
+        self.endpoint = new_endpoint;
+        Ok(())
+    }
+}

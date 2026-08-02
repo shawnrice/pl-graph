@@ -538,161 +538,194 @@ pub(super) fn expand_scan(
     ctx: &Ctx,
     path: &CPath,
     scope_len: usize,
-    mut endpoint: Vec<u32>,
+    endpoint: Vec<u32>,
     cap: Option<usize>,
 ) -> Option<ScanCols> {
     // Bound slots and their element kind, in path order.
     let mut kinds: Vec<(usize, Elem)> = Vec::new();
+
     if let Some(s) = path.start.var_slot {
         kinds.push((s, Elem::Node));
     }
+
     for seg in &path.segments {
         if let Some(s) = seg.rel.var_slot {
             kinds.push((s, Elem::Edge));
         }
+
         if let Some(s) = seg.node.var_slot {
             kinds.push((s, Elem::Node));
         }
     }
+
     let mut seen = HashSet::new();
+
     if kinds.iter().any(|(s, _)| !seen.insert(*s)) {
         return None; // a slot bound twice (self-join) — not vectorized
     }
 
-    // Per-bound-slot columns built so far; `endpoint` is the current last-node id
-    // per row (tracked even for anonymous nodes, to expand the next segment).
-    let mut cols: Vec<Option<Vec<u32>>> = (0..scope_len.max(1)).map(|_| None).collect();
-    for &(s, _) in &kinds {
-        cols[s] = Some(Vec::new());
-    }
-
-    // Which slots are populated so far. A later segment's rel/node slots are in
-    // `kinds` (and pre-allocated in `cols`) but their columns stay empty until
-    // that segment runs, so the per-row copy loops below must skip them.
-    let mut bound = vec![false; scope_len.max(1)];
-    if let Some(s) = path.start.var_slot {
-        bound[s] = true;
-        cols[s] = Some(endpoint.clone()); // start col = the seeded endpoints
-    }
-
-    // Expand each segment: every frontier row fans out to its matching neighbors,
-    // replicating the already-bound columns and appending this segment's ids.
+    // The fan-out, the column replication, the LIMIT stop and the
+    // intermediate-size ceiling are the SHARED `Frontier` — the same structure
+    // Gremlin's lowered prefix carries with a single column. What stays here is
+    // the part that is GQL: the per-segment label test and inline/WHERE
+    // constraints, supplied as a `RowFilter`.
+    let mut frontier = crate::seek::Frontier::seed(endpoint, path.start.var_slot, scope_len.max(1));
     let nseg = path.segments.len();
-    let mut nb = Binding(vec![None; scope_len.max(1)]);
+
     for (si, seg) in path.segments.iter().enumerate() {
         let rel = &seg.rel;
         let node = &seg.node;
-        let rel_check = !rel.props.is_empty() || rel.where_.is_some();
-        let node_check = !node.props.is_empty() || node.where_.is_some();
-        let need_bind = rel_check || node_check;
-        let is_last = si + 1 == nseg;
-        let mut new_cols: Vec<Option<Vec<u32>>> = (0..scope_len.max(1)).map(|_| None).collect();
-        for &(s, _) in &kinds {
-            new_cols[s] = Some(Vec::new());
-        }
-        let mut new_endpoint: Vec<u32> = Vec::new();
-        'rows: for i in 0..endpoint.len() {
-            // Prior slots are constant across this row's neighbors — set them once.
-            if need_bind {
-                for &(s, knd) in &kinds {
-                    if !bound[s] || Some(s) == rel.var_slot || Some(s) == node.var_slot {
-                        continue;
-                    }
-                    if let Some(col) = &cols[s] {
-                        let v = match knd {
-                            Elem::Node => Val::Node(col[i]),
-                            Elem::Edge => Val::Edge(col[i]),
-                        };
-                        nb.set(s, v);
-                    }
-                }
-            }
-            for (eidx, nbr) in expand(graph, ctx, endpoint[i], rel.direction, rel.label.as_ref()) {
-                if !matches_label(graph, ctx, nbr, node.label.as_ref()) {
-                    continue;
-                }
-                if need_bind {
-                    if let Some(s) = rel.var_slot {
-                        nb.set(s, Val::Edge(eidx));
-                    }
-                    if let Some(s) = node.var_slot {
-                        nb.set(s, Val::Node(nbr));
-                    }
-                    if rel_check
-                        && !satisfies(
-                            graph,
-                            ctx,
-                            &Val::Edge(eidx),
-                            &rel.props,
-                            rel.where_.as_ref(),
-                            &nb,
-                        )
-                    {
-                        continue;
-                    }
-                    if node_check
-                        && !satisfies(
-                            graph,
-                            ctx,
-                            &Val::Node(nbr),
-                            &node.props,
-                            node.where_.as_ref(),
-                            &nb,
-                        )
-                    {
-                        continue;
-                    }
-                }
-                for &(s, _) in &kinds {
-                    let v = if Some(s) == rel.var_slot {
-                        eidx
-                    } else if Some(s) == node.var_slot {
-                        nbr
-                    } else if bound[s] {
-                        cols[s].as_ref().unwrap()[i]
-                    } else {
-                        // Slot bound by a later segment — not present in this row yet.
-                        continue;
-                    };
-                    new_cols[s].as_mut().unwrap().push(v);
-                }
-                new_endpoint.push(nbr);
-                // No WHERE ⇒ every built row survives, so a LIMIT can stop here.
-                if is_last && cap.is_some_and(|c| new_endpoint.len() >= c) {
-                    break 'rows;
-                }
-                // Bound the frontier before it takes the host down. The cross-product
-                // of partial matches can reach billions of rows on a dense graph, and
-                // only the *last* segment's LIMIT prunes early. Checked here inside the
-                // build — not after the segment — so a single layer that would jump to
-                // a billion rows caps at the ceiling instead of materializing the whole
-                // layer first. Faults (surfaced as `E_RESOURCE_EXHAUSTED` at the row
-                // boundary) and bails; returning drops `new_cols`/`new_endpoint`, so
-                // the memory is released rather than continuing to grow.
-                if new_endpoint.len() as u64 > graph.limits().intermediate {
-                    ctx.set_fault(FAULT_INTERMEDIATE);
-                    return None;
-                }
-            }
-        }
+        // Only the LAST segment may stop early: an earlier one's rows can still
+        // be dropped by a later segment, so capping there would lose matches.
+        let hop_cap = (si + 1 == nseg).then_some(cap).flatten();
+        let etypes = rel
+            .label
+            .as_ref()
+            .and_then(|l| seek_lower::lower_labels(l, ctx, true));
+        let hop = crate::seek::Hop {
+            dir: match rel.direction {
+                Direction::Out => crate::seek::Dir::Out,
+                Direction::In => crate::seek::Dir::In,
+                Direction::Both => crate::seek::Dir::Both,
+            },
+            etypes: etypes.as_deref(),
+            // GQL matches an undirected self-loop ONCE — see `SelfLoops`.
+            loops: crate::seek::SelfLoops::Once,
+            rel_slot: rel.var_slot,
+            node_slot: node.var_slot,
+        };
+        let mut filter = SegmentFilter {
+            graph,
+            ctx,
+            rel,
+            node,
+            // An edge-type expression the IR cannot hold stays a per-edge test.
+            residual_type: etypes.is_none(),
+            rel_check: !rel.props.is_empty() || rel.where_.is_some(),
+            node_check: !node.props.is_empty() || node.where_.is_some(),
+            kinds: &kinds,
+            binding: Binding::with_len(scope_len.max(1)),
+        };
 
-        // This segment's rel/node columns are now populated for every row.
-        if let Some(s) = rel.var_slot {
-            bound[s] = true;
+        if frontier
+            .expand(
+                graph,
+                &hop,
+                graph.limits().intermediate,
+                hop_cap,
+                &mut filter,
+            )
+            .is_err()
+        {
+            // Surfaced as `E_RESOURCE_EXHAUSTED` at the row boundary. Returning
+            // drops the partial frontier, so the memory is released rather than
+            // continuing to grow.
+            ctx.set_fault(FAULT_INTERMEDIATE);
+            return None;
         }
-        if let Some(s) = node.var_slot {
-            bound[s] = true;
-        }
-        cols = new_cols;
-        endpoint = new_endpoint;
     }
 
     let mut sc = ScanCols::new(scope_len);
-    sc.n = endpoint.len();
+
+    sc.n = frontier.rows();
+
     for &(s, e) in &kinds {
-        sc.slots[s] = Some((e, cols[s].take().unwrap()));
+        sc.slots[s] = Some((e, frontier.take_column(s).unwrap_or_default()));
     }
+
     Some(sc)
+}
+
+/// The per-segment part of an expansion that is GQL rather than IR: the node's
+/// label, an edge-type expression too rich to lower, and the inline / `WHERE`
+/// constraints on either end.
+struct SegmentFilter<'a> {
+    graph: &'a Graph,
+    ctx: &'a Ctx<'a>,
+    rel: &'a CRel,
+    node: &'a CNode,
+    residual_type: bool,
+    rel_check: bool,
+    node_check: bool,
+    kinds: &'a [(usize, Elem)],
+    binding: Binding,
+}
+
+impl crate::seek::RowFilter for SegmentFilter<'_> {
+    fn row(&mut self, cols: &[Option<Vec<u32>>], row: usize) {
+        if !(self.rel_check || self.node_check) {
+            return;
+        }
+
+        // Slots already known are constant across this row's neighbours, so bind
+        // them once rather than per neighbour.
+        for &(s, kind) in self.kinds {
+            if Some(s) == self.rel.var_slot || Some(s) == self.node.var_slot {
+                continue;
+            }
+
+            if let Some(col) = cols.get(s).and_then(Option::as_ref) {
+                if let Some(&id) = col.get(row) {
+                    self.binding.set(
+                        s,
+                        match kind {
+                            Elem::Node => Val::Node(id),
+                            Elem::Edge => Val::Edge(id),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    fn keep(&mut self, eidx: u32, nbr: u32) -> bool {
+        if self.residual_type {
+            if let Some(l) = self.rel.label.as_ref() {
+                if !eval_label_edge(self.ctx, self.graph.e_type[eidx as usize], l) {
+                    return false;
+                }
+            }
+        }
+
+        if !matches_label(self.graph, self.ctx, nbr, self.node.label.as_ref()) {
+            return false;
+        }
+
+        if !(self.rel_check || self.node_check) {
+            return true;
+        }
+
+        if let Some(s) = self.rel.var_slot {
+            self.binding.set(s, Val::Edge(eidx));
+        }
+
+        if let Some(s) = self.node.var_slot {
+            self.binding.set(s, Val::Node(nbr));
+        }
+
+        if self.rel_check
+            && !satisfies(
+                self.graph,
+                self.ctx,
+                &Val::Edge(eidx),
+                &self.rel.props,
+                self.rel.where_.as_ref(),
+                &self.binding,
+            )
+        {
+            return false;
+        }
+
+        !self.node_check
+            || satisfies(
+                self.graph,
+                self.ctx,
+                &Val::Node(nbr),
+                &self.node.props,
+                self.node.where_.as_ref(),
+                &self.binding,
+            )
+    }
 }
 
 /// Edge-first build for a single segment `(a)-[r]->(b)` seeded from the edge
