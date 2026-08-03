@@ -1922,6 +1922,15 @@ fn present_keys(graph: &Graph, v: &GVal) -> Vec<String> {
         .collect()
 }
 
+/// REJECTED, measured: keeping the column id through this and reading via
+/// `value_id` — `present_keys` walks the store BY ID and then returns names, so
+/// every caller hashes each name straight back to the id it just discarded,
+/// twice (`prop_present`, then `prop`). Removing that was 79.6 ms -> 79.2-82.6 ms
+/// on a no-argument `valueMap()` over 50k x 12 properties: neutral. The cost of
+/// `valueMap` is building a `GVal::Map` — an `Arc` key and a boxed value per
+/// entry, 600k of them — not the lookups. Optimize the map construction, not the
+/// key resolution.
+///
 /// Is property `key` present on element `v`? A stored null counts as present, so
 /// projection steps gate inclusion on this (not `prop(...) != Null`, which also
 /// drops a present null). Property elements / non-elements: not applicable.

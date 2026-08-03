@@ -555,6 +555,33 @@ after a `WITH` (handled by `vectorized_linear`, a different columnar entry), pat
 variables (the columnar frame cannot build a `Path` value), and
 `multiseg-limit-dfs` (deliberate — DFS stops at the LIMIT, BFS cannot).
 
+### Audit: which "contracts" were real
+
+The conclusion above first claimed the two engines cannot share more because
+their EXECUTION MODELS differ. Re-auditing each claimed contract against the
+specs rather than against the existing code, that was too strong — one of them
+was not a contract at all, and another was self-imposed.
+
+| claimed                                           | verdict                                                                                                                                                                                                                                              |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `out('a','b')` emits in label-argument order      | **NOT a contract.** TinkerPop specifies no order; TinkerGraph groups only because it stores `Map<label, Set<Edge>>`. This repo already records adjacency order as unspecified. Deleted, −172 lines, six steps now on `crate::seek::adj`.             |
+| 63% of traversals need per-traverser path history | **Self-imposed.** Only FIVE steps read `Trav::path`. `path_free` was an allowlist, so everything unlisted paid by default, and a looping shape could never be listed at all. Now derived + recursive: 63% → 34%, `repeat(out())` 2.3x, `union` 2.5x. |
+| `hasLabel` matches only the FIRST label           | **Real, and consistent.** TinkerPop's model is one label per vertex, `addV` takes one, and `label()` returns the first — so `hasLabel` matching the first agrees with the rest of the surface. Multi-label vertices only arise from GQL or import.   |
+| The two total orders                              | **Real.** GQL's is pinned to TS `compareValues` (null largest, NaN equal to every number), Gremlin's to TinkerPop (null first, NaN last).                                                                                                            |
+| `DELETE` vs cascading `drop()`                    | **Real.** ISO requires `DETACH DELETE` to remove a connected vertex; TinkerPop's `drop()` cascades.                                                                                                                                                  |
+| `Record` (sorted) vs `Map` (insertion-ordered)    | **Real** as data models, though map KEY order is separately documented as unspecified. Merging them measured +35% and was rejected earlier.                                                                                                          |
+
+So the honest revision: the traverser stream is genuinely different **where a step
+reads path, tags or sack** — and that is now 34% of traversals, not 63%. The
+adjacency walk underneath was never model-specific, just duplicated. The lesson
+is that "this is how the engine works" and "this is what the language requires"
+had been conflated, and only reading the spec separates them.
+
+**Rejected, measured**: keeping the resolved column id through `valueMap()`
+instead of hashing each name back (79.6 ms → 79.2-82.6 ms, neutral). The cost of
+`valueMap` is building a `GVal::Map` — an `Arc` key and boxed value per entry —
+not the key lookups. Recorded next to `present_keys`.
+
 ### If this is kept
 
 The branch is worth keeping for the speed and the cross-engine bug class it
