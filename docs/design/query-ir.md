@@ -458,6 +458,111 @@ usually do NOT reach:
 The two rank functions must agree or the engines emit rows in different orders,
 so they are deliberate mirrors and each says so at its definition.
 
+## The experiment, concluded
+
+The question was: can GQL and Gremlin compile to one IR, so an optimization is
+written once and both get it, and the two per-language execution layers can be
+deleted? Here is what actually happened.
+
+### It works, and it found bugs neither engine's tests could
+
+Sharing the seek and the expansion is real. `crate::seek` (1437 lines) and
+`crate::value` (234) are the shared layer, and both front ends lower into them.
+The payoff was not mainly speed — it was that putting the two engines side by
+side made one engine's missing optimization VISIBLE:
+
+- Gremlin's `match()` had always picked a pattern whose start was bound;
+  both GQL engines joined comma patterns in written order. **121,336x** apart at
+  300k vertices, and 270 ms vs 0.019 ms in pure-TS. Fixed in both.
+- Gremlin's `Trav::tags` and GQL's group variables are the SAME per-repetition
+  list (`select(Pop.all,'x')` is `((x)-[e]->(y)){1,4}`), and both deep-copied it.
+  One `Arc` fixed both.
+- `Value::index_key` had drifted: Gremlin's copy had no `Temporal` arm, so
+  `has('when', DATE '…')` could not seek a temporal index while the same GQL
+  predicate could. Merging the type fixed it.
+
+None of these were findable from inside one engine. That is the strongest
+argument the experiment produced.
+
+### The speed result
+
+GQL, `gql_bench`, interleaved against the pre-IR baseline to cancel drift:
+
+```text
+  var-length 1..2               1500.0us     37.1us   40.4x
+  with carry then match        14550.0us   5070.0us    2.9x
+  edge prop filter              1310.0us    707.4us    1.85x
+  project over join             1620.0us    997.9us    1.62x
+  with then match expand        1560.0us   1140.0us    1.37x
+  scan + filter count            137.8us    107.3us    1.28x
+  1-hop join count               497.7us    568.0us    0.88x  ← slower
+  [b] scan+count+pred            149.8us    183.5us    0.82x  ← slower
+```
+
+Plus, off this benchmark: comma-pattern fusion 134x/347x, adjacent `MATCH`
+clauses 37x/169x, disconnected cross products 38,000x, `ORDER BY` an output alias
+2.2x (5.6x with a LIMIT), a carried numeric column 2.4-5.8x. Gremlin: 16 lowered
+terminals at 3.6-34x, two-hop count 71x, `as()`-tag carry up to 1.5x.
+
+The two regressions are the honest cost. Both are the shared path being slower
+than the bespoke one it replaced on a shape where the bespoke one had nothing to
+do. `[b] scan+count+pred` has a diagnosis: the clause `WHERE` is lowered into the
+seek's conjuncts AND applied again as a mask afterwards. `ElementSeek::
+answers_exactly` exists to report "the seek already settled this predicate" and
+is **never called** — wiring it through `build_scan` is the fix.
+
+### The surface result: it did NOT shrink
+
+This is the goal that was not met.
+
+```text
+  non-test Rust in lenke-core/src:  53267 -> 57122   (+3855, +7.2%)
+```
+
+The shared layer was ADDED (+1671) and the per-language layers were only partly
+deleted. One duplicate expander did go — `expand_frame`, a third copy of the
+fan-out loop reached only through `vectorized_linear`, is now a seed plus a call
+into `expand_scan` (−119 lines). But `gremlin/exec.rs` grew +1074 for the
+lowering that lets Gremlin reach the shared path at all, and `scan.rs` +539.
+
+The reason is structural, and worth stating plainly: **the two engines have
+different execution models.** GQL's is columnar — a frame of columns, filtered
+and projected in bulk. Gremlin's is a traverser stream, where each traverser
+carries its own path, tags and sack. The shared IR covers what they genuinely
+have in common — WHERE to start (`ElementSeek`) and HOW to fan out
+(`Frontier`) — but a Gremlin step that reads `t.path` cannot be a column
+operation without changing what TinkerPop promises. Measured: of ~1100 Gremlin
+traversals in the suite, 33% lower fully onto the shared columnar path, 24% seed
+through the shared IR then stream, and 43% are pure stream.
+
+So the layers cannot both be deleted. What CAN be deleted — and was — is
+duplicate implementations of the same operation. What cannot is one engine's
+execution model.
+
+### Where GQL now runs
+
+Instrumenting row production across the GQL suite, baseline vs now:
+
+```text
+             columnar     scalar    columnar share
+  baseline      28082       9826       74.1%
+  now           30870       7172       81.1%
+```
+
+Scalar row production fell 27%. The remaining scalar work is: `agg-no-where`
+(deliberate — the scalar driver stream-folds without materializing), a `MATCH`
+after a `WITH` (handled by `vectorized_linear`, a different columnar entry), path
+variables (the columnar frame cannot build a `Path` value), and
+`multiseg-limit-dfs` (deliberate — DFS stops at the LIMIT, BFS cannot).
+
+### If this is kept
+
+The branch is worth keeping for the speed and the cross-engine bug class it
+exposes, NOT for the surface reduction it was meant to deliver. Anyone continuing
+should know the surface only starts shrinking when a whole per-language path can
+be deleted, and that requires the two execution models to converge — which is a
+much larger question than sharing an IR.
+
 ## The next one: a carrying WITH costs 4.8x
 
 The remaining fallbacks after the join work are `incoming-bindings` — a `MATCH`
