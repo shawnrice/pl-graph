@@ -245,6 +245,14 @@ pub(super) fn rel_type_set(ctx: &Ctx, label: Option<&CLabelExpr>) -> Option<Opti
 }
 
 /// True if edge type `etype` is admitted by a `rel_type_set` result.
+/// REJECTED, measured: routing these shortcuts' adjacency walks through the
+/// shared `crate::seek::adj`. It is the right call for the STREAMING steps, where
+/// it removed a real out/in branch at no cost — but here it was 1.6x on `1-hop
+/// join count` (532-561us -> 863-875us) and 1.5x on `[e] 2-hop join count`
+/// (2.26ms -> 3.41ms). `adj` chains a filtered out-iterator with a filtered
+/// in-iterator so one call serves either direction; in a tight counting loop that
+/// chain does not optimize away, and these shortcuts only ever want ONE side.
+/// Sharing an adjacency walk is not free everywhere it is possible.
 pub(super) fn etype_ok(set: &Option<Vec<u32>>, etype: u32) -> bool {
     set.as_ref().is_none_or(|v| v.contains(&etype))
 }
