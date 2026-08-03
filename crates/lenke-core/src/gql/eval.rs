@@ -1237,11 +1237,9 @@ fn apply_algo_config(
 /// returned node/edge's `properties` field serializes to. Keys are sorted so the
 /// object is deterministic (the columnar store has no per-element key order).
 fn props_map(store: &crate::graph::Properties, strs: &crate::graph::Dict, idx: usize) -> Value {
-    let mut props: Vec<(Arc<str>, Value)> = (0..store.keys.len() as u32)
-        .filter(|&kid| store.is_present_id(idx, kid))
-        // `keys.arc` shares the interned key Arc (refcount bump) instead of
-        // `Arc::from(text)` allocating a fresh copy per key on every element.
-        .map(|kid| (store.keys.arc(kid), store.value_id(idx, kid, strs)))
+    let mut props: Vec<(Arc<str>, Value)> = store
+        .present_keys(idx)
+        .map(|(kid, key)| (key, store.value_id(idx, kid, strs)))
         .collect();
     props.sort_by(|a, b| a.0.cmp(&b.0));
     Value::Map(props)

@@ -1868,7 +1868,7 @@ fn element_props_map(graph: &Graph, v: &GVal) -> GVal {
     // a present null rides through as a `Null` value (not dropped).
     let entries: Vec<(GVal, GVal)> = present_keys(graph, v)
         .into_iter()
-        .map(|k| (GVal::Str(Arc::from(k.as_str())), prop(graph, v, &k)))
+        .map(|k| (GVal::Str(k.clone()), prop(graph, v, &k)))
         .collect();
     GVal::Map(entries)
 }
@@ -1934,12 +1934,7 @@ fn present_key_ids(graph: &Graph, v: &GVal) -> Vec<(u32, Arc<str>)> {
         _ => return Vec::new(),
     };
 
-    (0..store.keys.len() as u32)
-        // Presence, not value: a stored null is a present property (first-class
-        // value — divergence from TinkerPop, which has no null property values).
-        .filter(|&kid| store.is_present_id(idx, kid))
-        .map(|kid| (kid, Arc::from(store.keys.text(kid))))
-        .collect()
+    store.present_keys(idx).collect()
 }
 
 /// The value of the already-resolved column `kid` on `v`. See
@@ -1958,23 +1953,56 @@ fn prop_by_id(graph: &Graph, v: &GVal, kid: u32) -> GVal {
     }
 }
 
-fn present_keys(graph: &Graph, v: &GVal) -> Vec<String> {
+/// The `(column id, key)` pairs a projection step should emit for `v`: every
+/// PRESENT property when `keys` is empty, else the named ones that are present.
+///
+/// The projection steps used to establish this three times per key —
+/// `present_keys` (which already knew the id and the presence), then
+/// `prop_present` (hash + presence again), then `prop` (hash again). Resolving
+/// once and reading by id via `prop_by_id` is worth 1.2x on `valueMap()`.
+fn projected_keys(graph: &Graph, v: &GVal, keys: &[String]) -> Vec<(u32, Arc<str>)> {
+    if keys.is_empty() {
+        return present_key_ids(graph, v);
+    }
+
+    // A property element exposes only its own key, whatever was asked for.
+    if let Some(GVal::Str(own)) = prop_key_field(v) {
+        return keys
+            .iter()
+            .filter(|k| ***k == *own)
+            .map(|k| (u32::MAX, Arc::from(k.as_str())))
+            .collect();
+    }
+
+    let (store, idx) = match v {
+        GVal::Node(i) => (&graph.props, *i as usize),
+        GVal::Edge(e) => (&graph.edge_props, *e as usize),
+        _ => return Vec::new(),
+    };
+
+    keys.iter()
+        .filter_map(|k| store.keys.get(k).map(|kid| (kid, k)))
+        .filter(|(kid, _)| store.is_present_id(idx, *kid))
+        .map(|(kid, k)| (kid, Arc::from(k.as_str())))
+        .collect()
+}
+
+fn present_keys(graph: &Graph, v: &GVal) -> Vec<Arc<str>> {
     // A property element (from `properties()`) exposes its own single key, so
     // `hasKey`/`hasNot` filter a property stream by the property's key field.
     if let Some(GVal::Str(k)) = prop_key_field(v) {
-        return vec![k.to_string()];
+        return vec![k];
     }
     let (store, idx) = match v {
         GVal::Node(i) => (&graph.props, *i as usize),
         GVal::Edge(e) => (&graph.edge_props, *e as usize),
         _ => return Vec::new(),
     };
-    (0..store.keys.len() as u32)
-        // Presence, not value: a stored null is a present property (first-class
-        // value — divergence from TinkerPop, which has no null property values).
-        .filter(|&kid| store.is_present_id(idx, kid))
-        .map(|kid| store.keys.text(kid).to_string())
-        .collect()
+
+    // `Arc<str>`, not `String`: these keys go straight back out as `GVal::Str`,
+    // so allocating an owned copy per key per element only to re-intern it was
+    // pure waste — and the dictionary already holds the Arc.
+    store.present_keys(idx).map(|(_, k)| k).collect()
 }
 
 /// Is property `key` present on element `v`? A stored null counts as present, so
@@ -2704,14 +2732,14 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             .into_iter()
             .filter(|t| {
                 let present = present_keys(graph, &t.val);
-                keys.iter().any(|k| present.iter().any(|p| p == k))
+                keys.iter().any(|k| present.iter().any(|p| &**p == k.as_str()))
             })
             .collect(),
         Step::HasNot(keys) => stream
             .into_iter()
             .filter(|t| {
                 let present = present_keys(graph, &t.val);
-                !keys.iter().any(|k| present.iter().any(|p| p == k))
+                !keys.iter().any(|k| present.iter().any(|p| &**p == k.as_str()))
             })
             .collect(),
         Step::HasValue(vals) => stream.into_iter().filter(|t| prop_value_field(&t.val).is_some_and(|v| vals.contains(&v))).collect(),
@@ -2836,11 +2864,11 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             })
         }
         Step::PropertyMap(keys) => map_step(stream, |t| {
-            let ks = if keys.is_empty() { present_keys(graph, &t.val) } else { keys.clone() };
+            let ks: Vec<Arc<str>> = if keys.is_empty() { present_keys(graph, &t.val) } else { keys.iter().map(|k| Arc::from(k.as_str())).collect() };
             let entries = ks
                 .into_iter()
                 .filter(|k| prop_present(graph, &t.val, k))
-                .map(|k| (GVal::Str(Arc::from(k.as_str())), GVal::list(vec![prop(graph, &t.val, &k)])))
+                .map(|k| (GVal::Str(k.clone()), GVal::list(vec![prop(graph, &t.val, &k)])))
                 .collect();
             vec![GVal::Map(entries)]
         }),
@@ -2858,24 +2886,20 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 entries.push((GVal::Str(Arc::from("IN")), GVal::Map(vec![(GVal::Str(Arc::from("id")), elem_id(graph, &inv)), (GVal::Str(Arc::from("label")), elem_label(graph, &inv))])));
                 entries.push((GVal::Str(Arc::from("OUT")), GVal::Map(vec![(GVal::Str(Arc::from("id")), elem_id(graph, &outv)), (GVal::Str(Arc::from("label")), elem_label(graph, &outv))])));
             }
-            let ks = if keys.is_empty() { present_keys(graph, &t.val) } else { keys.clone() };
-            for k in ks {
-                if prop_present(graph, &t.val, &k) {
-                    entries.push((GVal::Str(Arc::from(k.as_str())), prop(graph, &t.val, &k)));
-                }
+            for (kid, k) in projected_keys(graph, &t.val, keys) {
+                entries.push((GVal::Str(k), prop_by_id(graph, &t.val, kid)));
             }
             vec![GVal::Map(entries)]
         }),
         Step::Properties(keys) => {
             let mut next = Vec::new();
             for t in &stream {
-                let ks = if keys.is_empty() { present_keys(graph, &t.val) } else { keys.clone() };
-                for k in ks {
-                    if prop_present(graph, &t.val, &k) {
-                        let v = prop(graph, &t.val, &k);
+                for (kid, k) in projected_keys(graph, &t.val, keys) {
+                    {
+                        let v = prop_by_id(graph, &t.val, kid);
                         next.push(t.step(GVal::property(
                             t.val.clone(),
-                            Arc::from(k.as_str()),
+                            k.clone(),
                             v,
                         )));
                     }

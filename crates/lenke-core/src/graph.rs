@@ -846,6 +846,21 @@ impl Properties {
         })
     }
 
+    /// Every property PRESENT on element `idx`, as `(column id, interned key)`.
+    ///
+    /// The one enumeration; it had been written out three times. The key `Arc` is
+    /// shared from the dictionary rather than rebuilt — `Arc::from(keys.text(kid))`
+    /// allocates a fresh copy per key per element, which one of the three copies
+    /// was doing.
+    ///
+    /// Presence, not value: a stored null IS a present property here (first-class
+    /// null, a deliberate divergence from TinkerPop).
+    pub fn present_keys(&self, idx: usize) -> impl Iterator<Item = (u32, Arc<str>)> + '_ {
+        (0..self.keys.len() as u32)
+            .filter(move |&kid| self.is_present_id(idx, kid))
+            .map(|kid| (kid, self.keys.arc(kid)))
+    }
+
     /// [`is_present`](Self::is_present) for an already-resolved key id.
     pub fn is_present_id(&self, idx: usize, kid: u32) -> bool {
         match self.cols.get(kid as usize) {
