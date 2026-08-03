@@ -539,8 +539,8 @@ fn project_name_and_created_count() {
                 GVal::Map(e) => e,
                 _ => panic!(),
             };
-            let name = s(&m[0].1);
-            let created = match m[1].1 {
+            let name = s(&m.values()[0]);
+            let created = match m.values()[1] {
                 GVal::Num(n) => n,
                 _ => panic!(),
             };
@@ -573,9 +573,9 @@ fn project_marko_degrees() {
         GVal::Map(e) => e,
         _ => panic!(),
     };
-    assert_eq!(s(&m[0].1), "1");
-    assert_eq!(m[1].1, GVal::Num(3.0)); // out-degree
-    assert_eq!(m[2].1, GVal::Num(0.0)); // in-degree
+    assert_eq!(s(&m.values()[0]), "1");
+    assert_eq!(m.values()[1], GVal::Num(3.0)); // out-degree
+    assert_eq!(m.values()[2], GVal::Num(0.0)); // in-degree
 }
 
 // ===== select / as =====
@@ -638,8 +638,8 @@ fn select_by_name() {
         GVal::Map(e) => e,
         _ => panic!(),
     };
-    assert_eq!(s(&m[0].1), "marko");
-    assert_eq!(s(&m[1].1), "lop");
+    assert_eq!(s(&m.values()[0]), "marko");
+    assert_eq!(s(&m.values()[1]), "lop");
 }
 
 #[test]
@@ -801,8 +801,11 @@ fn value_map_of_marko() {
         GVal::Map(e) => e,
         _ => panic!(),
     };
-    assert!(m.contains(&(GVal::Str("name".into()), GVal::Str("marko".into()))));
-    assert!(m.contains(&(GVal::Str("age".into()), GVal::Num(29.0))));
+    assert_eq!(
+        m.get(&GVal::Str("name".into())),
+        Some(&GVal::Str("marko".into()))
+    );
+    assert_eq!(m.get(&GVal::Str("age".into())), Some(&GVal::Num(29.0)));
 }
 
 #[test]
@@ -942,7 +945,7 @@ fn property_set_to_null_is_stored_and_visible_not_removed() {
         .has("name", P::eq("marko"))
         .value_map(&["nick"])
         .run(&mut g0);
-    assert_eq!(vm, vec![GVal::Map(vec![(GVal::from("nick"), GVal::Null)])]);
+    assert_eq!(vm, vec![GVal::map(vec![(GVal::from("nick"), GVal::Null)])]);
 }
 
 #[test]
@@ -1310,7 +1313,7 @@ fn parse_nested_traversals() {
         GVal::Map(e) => e,
         _ => panic!(),
     };
-    assert_eq!(m[0].1, GVal::Num(3.0));
+    assert_eq!(m.values()[0], GVal::Num(3.0));
 }
 
 #[test]
@@ -1320,8 +1323,8 @@ fn parse_select_and_as() {
         GVal::Map(e) => e,
         _ => panic!(),
     };
-    assert_eq!(s(&m[0].1), "marko");
-    assert_eq!(s(&m[1].1), "lop");
+    assert_eq!(s(&m.values()[0]), "marko");
+    assert_eq!(s(&m.values()[1]), "lop");
 }
 
 #[test]
@@ -2252,7 +2255,7 @@ fn results_json_escaping_and_structure() {
     // Structure: empty containers, nesting, bool, null. (String-valued to keep
     // this test free of the number formatting that the refactor will change.)
     assert_eq!(results_json(vec![GVal::list(vec![])]), "[[]]");
-    assert_eq!(results_json(vec![GVal::Map(vec![])]), "[{}]");
+    assert_eq!(results_json(vec![GVal::map(vec![])]), "[{}]");
     assert_eq!(
         results_json(vec![GVal::list(vec![
             GVal::from("a"),
@@ -2269,7 +2272,7 @@ fn results_json_escaping_and_structure() {
     // Map keys sorted lexicographically (serde BTreeMap); string values so the
     // ordering is the only thing under test here.
     assert_eq!(
-        results_json(vec![GVal::Map(vec![
+        results_json(vec![GVal::map(vec![
             (GVal::from("zzz"), GVal::from("z")),
             (GVal::from("age"), GVal::from("a")),
             (GVal::from("name"), GVal::from("m")),
@@ -2305,7 +2308,7 @@ fn results_json_numbers() {
     assert_eq!(results_json(vec![GVal::Num(f64::INFINITY)]), "[null]");
     // Non-string map key is stringified via the same number formatting.
     assert_eq!(
-        results_json(vec![GVal::Map(vec![(GVal::Num(5.0), GVal::from("v"))])]),
+        results_json(vec![GVal::map(vec![(GVal::Num(5.0), GVal::from("v"))])]),
         r#"[{"5":"v"}]"#
     );
 }
@@ -2442,7 +2445,7 @@ fn gremlin_reads_a_stored_map_property() {
                 })
                 .collect();
             assert_eq!(keys, vec!["city".to_string(), "zip".to_string()]);
-            assert!(matches!(&pairs[0].1, GVal::Str(s) if s.as_ref() == "NYC"));
+            assert!(matches!(&pairs.values()[0], GVal::Str(s) if s.as_ref() == "NYC"));
         }
         other => panic!("expected one GVal::Map, got {other:?}"),
     }

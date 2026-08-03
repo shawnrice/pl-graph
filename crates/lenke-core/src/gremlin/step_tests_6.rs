@@ -80,21 +80,21 @@ fn paths_text(t: super::Traversal) -> Vec<Vec<String>> {
         .collect()
 }
 
-fn as_map(g: &GVal) -> &Vec<(GVal, GVal)> {
+fn as_map(g: &GVal) -> &crate::value::MapVal {
     match g {
         GVal::Map(e) => e,
         _ => panic!("expected map, got {g:?}"),
     }
 }
 
-fn map_get<'a>(m: &'a [(GVal, GVal)], key: &str) -> Option<&'a GVal> {
+fn map_get<'a>(m: &'a crate::value::MapVal, key: &str) -> Option<&'a GVal> {
     m.iter()
         .find(|(k, _)| matches!(k, GVal::Str(s) if s.as_ref() == key))
         .map(|(_, v)| v)
 }
 
-fn map_get_gval<'a>(m: &'a [(GVal, GVal)], key: &GVal) -> Option<&'a GVal> {
-    m.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+fn map_get_gval<'a>(m: &'a crate::value::MapVal, key: &GVal) -> Option<&'a GVal> {
+    m.get(key)
 }
 
 fn list_of(g: &GVal) -> &[GVal] {
@@ -584,14 +584,14 @@ fn p6_tree_josh_software_names() {
     assert_eq!(out.len(), 1);
     let root = as_map(&out[0]);
     assert_eq!(root.len(), 1); // josh
-    let josh_children = as_map(&root[0].1);
+    let josh_children = as_map(&root.values()[0]);
     assert_eq!(josh_children.len(), 2); // two software vertices
     let mut names: Vec<String> = josh_children
         .iter()
         .map(|(_, sub)| {
             let child = as_map(sub);
             assert_eq!(child.len(), 1);
-            s(&child[0].0)
+            s(&child.keys()[0])
         })
         .collect();
     names.sort();
@@ -604,7 +604,7 @@ fn p6_tree_marko_created() {
     assert_eq!(out.len(), 1);
     let root = as_map(&out[0]);
     assert_eq!(root.len(), 1); // marko
-    let marko_children = as_map(&root[0].1);
+    let marko_children = as_map(&root.values()[0]);
     assert_eq!(marko_children.len(), 1); // marko → lop
 }
 
@@ -616,10 +616,10 @@ fn p6_tree_by_name() {
     let root = as_map(&out[0]);
     let root_keys: Vec<String> = root.iter().map(|(k, _)| s(k)).collect();
     assert_eq!(root_keys, vec!["marko"]);
-    let marko_children = as_map(&root[0].1);
+    let marko_children = as_map(&root.values()[0]);
     let child_keys: Vec<String> = marko_children.iter().map(|(k, _)| s(k)).collect();
     assert_eq!(child_keys, vec!["josh"]);
-    let josh_children = as_map(&marko_children[0].1);
+    let josh_children = as_map(&marko_children.values()[0]);
     let mut gc: Vec<String> = josh_children.iter().map(|(k, _)| s(k)).collect();
     gc.sort();
     assert_eq!(gc, vec!["lop", "ripple"]);

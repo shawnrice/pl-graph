@@ -1641,7 +1641,7 @@ fn match_solve(
                     .map(|v| (GVal::Str(Arc::from(l.as_str())), v.clone()))
             })
             .collect();
-        out.push(t.with(GVal::Map(bindings)));
+        out.push(t.with(GVal::map(bindings)));
         return;
     }
     let Some(idx) = pick_runnable(patterns, done, &t) else {
@@ -1870,7 +1870,7 @@ fn element_props_map(graph: &Graph, v: &GVal) -> GVal {
         .into_iter()
         .map(|k| (GVal::Str(k.clone()), prop(graph, v, &k)))
         .collect();
-    GVal::Map(entries)
+    GVal::map(entries)
 }
 
 /// A self-describing vertex record for a subgraph cap: `{ id, labels, properties }`.
@@ -1881,7 +1881,7 @@ fn subgraph_vertex(graph: &Graph, v: u32) -> GVal {
         .iter()
         .map(|&l| GVal::Str(graph.labels.arc(l)))
         .collect();
-    GVal::Map(vec![
+    GVal::map(vec![
         (GVal::Str(Arc::from("id")), GVal::Str(graph.vid.arc(v))),
         (GVal::Str(Arc::from("labels")), GVal::list(labels)),
         (
@@ -1896,7 +1896,7 @@ fn subgraph_edge(graph: &Graph, e: u32) -> GVal {
     let ge = GVal::Edge(e);
     let outv = GVal::Node(graph.e_src[e as usize]);
     let inv = GVal::Node(graph.e_dst[e as usize]);
-    GVal::Map(vec![
+    GVal::map(vec![
         (GVal::Str(Arc::from("id")), elem_id(graph, &ge)),
         (
             GVal::Str(Arc::from("label")),
@@ -1924,6 +1924,39 @@ fn prop_by_id(graph: &Graph, v: &GVal, kid: u32) -> GVal {
         GVal::Node(i) => GVal::from_column(&graph.props, kid, *i as usize, &graph.strs, false),
         GVal::Edge(e) => GVal::from_column(&graph.edge_props, kid, *e as usize, &graph.strs, false),
         _ => GVal::Null,
+    }
+}
+
+/// One key vector, reused across every element of a projection whose shape
+/// matches.
+///
+/// A `valueMap()` over 50k vertices built 50k key vectors and cloned a key `Arc`
+/// per entry — 600k atomic refcount bumps on twelve hot cache lines. Sharing
+/// makes it one bump per element. Rebuilt whenever an element's key set differs,
+/// so a heterogeneous stream stays correct (just no cheaper than before).
+struct SharedKeys {
+    keys: Arc<Vec<GVal>>,
+    ids: Vec<u32>,
+}
+
+impl SharedKeys {
+    fn empty() -> Self {
+        Self {
+            keys: Arc::new(Vec::new()),
+            ids: Vec::new(),
+        }
+    }
+
+    fn of(ks: &[(u32, Arc<str>)]) -> Self {
+        Self {
+            keys: Arc::new(ks.iter().map(|(_, k)| GVal::Str(k.clone())).collect()),
+            ids: ks.iter().map(|(kid, _)| *kid).collect(),
+        }
+    }
+
+    /// Same columns, in the same order, as the last element's.
+    fn matches(&self, ks: &[(u32, Arc<str>)]) -> bool {
+        self.ids.len() == ks.len() && self.ids.iter().zip(ks).all(|(a, (b, _))| a == b)
     }
 }
 
@@ -2826,6 +2859,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         }
         Step::ValueMap(keys) => {
             let mut ks: Vec<(u32, Arc<str>)> = Vec::new();
+            let mut shared = SharedKeys::empty();
             // Same shape as `values`: the key list was CLONED per traverser and
             // every read hashed the key NAME, so a 200k stream paid 200k
             // `Vec<String>` clones plus two dictionary lookups per property.
@@ -2843,14 +2877,28 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 .collect();
 
             map_step(stream, move |t| {
-                let entries: Vec<(GVal, GVal)> = if keys.is_empty() {
+                if keys.is_empty() {
                     projected_keys_into(graph, &t.val, keys, &mut ks);
 
-                    ks.iter()
-                        .map(|(kid, k)| (GVal::Str(k.clone()), prop_by_id(graph, &t.val, *kid)))
-                        .collect()
-                } else {
-                    named
+                    // Every element with the same key set SHARES one key vector:
+                    // the `Arc` is cloned once per element instead of one key
+                    // `Arc` per entry. Rebuilt only when the shape changes.
+                    if !shared.matches(&ks) {
+                        shared = SharedKeys::of(&ks);
+                    }
+
+                    let vals = ks
+                        .iter()
+                        .map(|(kid, _)| prop_by_id(graph, &t.val, *kid))
+                        .collect();
+
+                    return vec![GVal::Map(crate::value::MapVal::with_keys(
+                        shared.keys.clone(),
+                        vals,
+                    ))];
+                }
+
+                let entries: Vec<(GVal, GVal)> = named
                         .iter()
                         .filter_map(|(name, vk, ek)| {
                             let (store, kid) = match (&t.val, vk, ek) {
@@ -2871,10 +2919,9 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                                 )
                             })
                         })
-                        .collect()
-                };
+                        .collect();
 
-                vec![GVal::Map(entries)]
+                vec![GVal::map(entries)]
             })
         }
         Step::PropertyMap(keys) => map_step(stream, |t| {
@@ -2884,7 +2931,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 .filter(|k| prop_present(graph, &t.val, k))
                 .map(|k| (GVal::Str(k.clone()), GVal::list(vec![prop(graph, &t.val, &k)])))
                 .collect();
-            vec![GVal::Map(entries)]
+            vec![GVal::map(entries)]
         }),
         Step::ElementMap(keys) => {
             let mut ks: Vec<(u32, Arc<str>)> = Vec::new();
@@ -2900,8 +2947,8 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             if let GVal::Edge(e) = t.val {
                 let inv = GVal::Node(graph.e_dst[e as usize]);
                 let outv = GVal::Node(graph.e_src[e as usize]);
-                entries.push((GVal::Str(Arc::from("IN")), GVal::Map(vec![(GVal::Str(Arc::from("id")), elem_id(graph, &inv)), (GVal::Str(Arc::from("label")), elem_label(graph, &inv))])));
-                entries.push((GVal::Str(Arc::from("OUT")), GVal::Map(vec![(GVal::Str(Arc::from("id")), elem_id(graph, &outv)), (GVal::Str(Arc::from("label")), elem_label(graph, &outv))])));
+                entries.push((GVal::Str(Arc::from("IN")), GVal::map(vec![(GVal::Str(Arc::from("id")), elem_id(graph, &inv)), (GVal::Str(Arc::from("label")), elem_label(graph, &inv))])));
+                entries.push((GVal::Str(Arc::from("OUT")), GVal::map(vec![(GVal::Str(Arc::from("id")), elem_id(graph, &outv)), (GVal::Str(Arc::from("label")), elem_label(graph, &outv))])));
             }
             projected_keys_into(graph, &t.val, keys, &mut ks);
             entries.reserve(ks.len());
@@ -2910,7 +2957,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 entries.push((GVal::Str(k.clone()), prop_by_id(graph, &t.val, *kid)));
             }
 
-            vec![GVal::Map(entries)]
+            vec![GVal::map(entries)]
             })
         }
         Step::Properties(keys) => {
@@ -2965,7 +3012,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                         (GVal::Str(Arc::from(k.as_str())), v)
                     })
                     .collect();
-                t.with(GVal::Map(entries))
+                t.with(GVal::map(entries))
             })
             .collect(),
         Step::Tree(bys) => apply_tree(graph, ctx, bys, stream),
@@ -3032,7 +3079,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 .into_iter()
                 .map(|(k, members)| (k, group_value(graph, ctx, &val_by, members)))
                 .collect();
-            vec![Trav::root(GVal::Map(entries))]
+            vec![Trav::root(GVal::map(entries))]
         }
         Step::GroupCount(bys) => {
             let by = bys.first().cloned().unwrap_or(By::Identity(None));
@@ -3056,7 +3103,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                     }
                 }
             }
-            vec![Trav::root(GVal::Map(entries.into_iter().map(|(k, n)| (k, GVal::Num(n))).collect()))]
+            vec![Trav::root(GVal::map(entries.into_iter().map(|(k, n)| (k, GVal::Num(n))).collect()))]
         }
 
         // --- combinators ---
@@ -3282,7 +3329,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 let (verts, edges) = (verts.clone(), edges.clone());
                 let vlist = GVal::List(verts.iter().map(|v| subgraph_vertex(graph, *v)).collect());
                 let elist = GVal::List(edges.iter().map(|e| subgraph_edge(graph, *e)).collect());
-                vec![Trav::root(GVal::Map(vec![
+                vec![Trav::root(GVal::map(vec![
                     (GVal::Str(Arc::from("vertices")), vlist),
                     (GVal::Str(Arc::from("edges")), elist),
                 ]))]
@@ -3379,7 +3426,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                             (GVal::Str(Arc::from(l.as_str())), eval_by(graph, ctx, &by_at(i), vals[i].as_ref().unwrap()))
                         })
                         .collect();
-                    next.push(t.with(GVal::Map(entries)));
+                    next.push(t.with(GVal::map(entries)));
                 }
             }
             next
@@ -3634,7 +3681,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
 /// level (by the `by`-projected step values, or the raw values by default).
 fn apply_tree(graph: &mut Graph, ctx: &mut Ctx, bys: &[By], stream: Vec<Trav>) -> Vec<Trav> {
     // Build a nested map from each traverser's path.
-    let mut root: Vec<(GVal, GVal)> = Vec::new();
+    let mut root = crate::value::MapVal::from_pairs(Vec::new());
     for t in &stream {
         let keys: Vec<GVal> = t
             .path
@@ -3788,7 +3835,7 @@ fn apply_order(
                             })
                             .collect();
                         es.sort_by(|(ka, _), (kb, _)| cmp_keys(ka, kb));
-                        GVal::Map(es.into_iter().map(|(_, e)| e).collect())
+                        GVal::map(es.into_iter().map(|(_, e)| e).collect())
                     }
                     GVal::List(items) => {
                         let mut xs: Vec<(Vec<GVal>, GVal)> = items
@@ -4067,22 +4114,19 @@ fn local_extreme(v: &GVal, want: Ordering) -> GVal {
 }
 
 /// Insert a key chain into a nested tree map (for `tree()`).
-fn insert_tree(node: &mut Vec<(GVal, GVal)>, keys: &[GVal]) {
+fn insert_tree(node: &mut crate::value::MapVal, keys: &[GVal]) {
     let Some((head, rest)) = keys.split_first() else {
         return;
     };
-    let child = match node.iter_mut().find(|(k, _)| k == head) {
-        Some((_, GVal::Map(m))) => m,
-        Some(_) => return,
-        None => {
-            node.push((head.clone(), GVal::Map(Vec::new())));
-            match &mut node.last_mut().unwrap().1 {
-                GVal::Map(m) => m,
-                _ => unreachable!(),
-            }
-        }
-    };
-    insert_tree(child, rest);
+
+    if node.get_mut(head).is_none() {
+        node.push(head.clone(), GVal::map(Vec::new()));
+    }
+
+    // A key present but NOT a map is a mixed tree level; leave it alone.
+    if let Some(GVal::Map(child)) = node.get_mut(head) {
+        insert_tree(child, rest);
+    }
 }
 
 /// The `repeat()` modulators, bundled so `run_repeat` stays under the arg limit:
@@ -4243,7 +4287,7 @@ mod dedup_key_tests {
         assert!(dedup_key(&GVal::Num(f64::NAN)).is_none());
         // a NaN nested in a list/map makes the whole key un-hashable too.
         assert!(dedup_key(&GVal::list(vec![GVal::Num(1.0), GVal::Num(f64::NAN)])).is_none());
-        assert!(dedup_key(&GVal::Map(vec![(
+        assert!(dedup_key(&GVal::map(vec![(
             GVal::Str(Arc::from("k")),
             GVal::Num(f64::NAN)
         )]))

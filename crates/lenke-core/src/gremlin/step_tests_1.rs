@@ -76,7 +76,7 @@ fn map_get_num(r: &[GVal], key: &GVal) -> Option<f64> {
     match r.first() {
         Some(GVal::Map(entries)) => entries
             .iter()
-            .find(|(k, _)| k == key)
+            .find(|(k, _)| *k == key)
             .map(|(_, v)| match v {
                 GVal::Num(n) => *n,
                 other => panic!("expected num value, got {other:?}"),

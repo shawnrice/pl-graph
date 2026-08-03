@@ -58,6 +58,114 @@ pub struct PathVal {
     pub edges: Vec<u32>,
 }
 
+/// A TinkerPop map: insertion-ordered, any value permitted as a key.
+///
+/// Keys are held SEPARATELY from values, and `Arc`-shared, because the maps that
+/// dominate are projections — every element of a `valueMap()` / `elementMap()` /
+/// `project()` stream has the SAME keys. Storing pairs meant cloning each key per
+/// element: 600k atomic refcount bumps on twelve hot cache lines to project 50k
+/// vertices, where one bump per element will do.
+///
+/// `keys.len() == vals.len()` is an invariant; the constructors are the only way
+/// to build one.
+#[derive(Clone, Debug)]
+pub struct MapVal {
+    /// `Arc<Vec<_>>` rather than `Arc<[_]>`: a few maps are BUILT incrementally
+    /// (`tree()` grows one as it walks paths), and a shared slice cannot grow.
+    /// `Arc::make_mut` copies only when the keys are actually shared.
+    keys: Arc<Vec<Value>>,
+    vals: Vec<Value>,
+}
+
+impl MapVal {
+    /// Independent keys — the general case (`group()`, where every map differs).
+    #[must_use]
+    pub fn from_pairs(pairs: Vec<(Value, Value)>) -> Self {
+        let mut keys = Vec::with_capacity(pairs.len());
+        let mut vals = Vec::with_capacity(pairs.len());
+
+        for (k, v) in pairs {
+            keys.push(k);
+            vals.push(v);
+        }
+
+        Self {
+            keys: Arc::new(keys),
+            vals,
+        }
+    }
+
+    /// Keys shared with other maps — a projection over a stream.
+    ///
+    /// # Panics
+    /// If `keys` and `vals` differ in length.
+    #[must_use]
+    pub fn with_keys(keys: Arc<Vec<Value>>, vals: Vec<Value>) -> Self {
+        assert_eq!(
+            keys.len(),
+            vals.len(),
+            "a map's keys and values must pair up"
+        );
+
+        Self { keys, vals }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.vals.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.vals.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&Value, &Value)> {
+        self.keys.iter().zip(&self.vals)
+    }
+
+    /// The value for `key`, by TinkerPop equality.
+    #[must_use]
+    pub fn get(&self, key: &Value) -> Option<&Value> {
+        self.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
+    }
+
+    #[must_use]
+    pub fn keys(&self) -> &[Value] {
+        &self.keys
+    }
+
+    /// Append an entry. Clones the key vector only if it is shared.
+    pub fn push(&mut self, key: Value, val: Value) {
+        Arc::make_mut(&mut self.keys).push(key);
+        self.vals.push(val);
+    }
+
+    /// The value for `key`, mutably — for the few maps built incrementally.
+    pub fn get_mut(&mut self, key: &Value) -> Option<&mut Value> {
+        let i = self.keys.iter().position(|k| k == key)?;
+
+        self.vals.get_mut(i)
+    }
+
+    #[must_use]
+    pub fn values(&self) -> &[Value] {
+        &self.vals
+    }
+
+    /// Owned pairs, for the few callers that rebuild a map.
+    #[must_use]
+    pub fn into_pairs(self) -> Vec<(Value, Value)> {
+        self.keys.iter().cloned().zip(self.vals).collect()
+    }
+}
+
+impl PartialEq for MapVal {
+    fn eq(&self, other: &Self) -> bool {
+        self.keys.len() == other.keys.len() && self.iter().zip(other.iter()).all(|(a, b)| a == b)
+    }
+}
+
 /// A Gremlin property element from `.properties(k)`.
 ///
 /// The owner is carried EXPLICITLY rather than recovered from the traverser
@@ -92,7 +200,7 @@ pub enum Value {
     /// ISO record — string keys, kept SORTED, `Arc`-boxed. GQL only.
     Record(Arc<[(Arc<str>, Self)]>),
     /// TinkerPop map — any-value keys, INSERTION ordered. Gremlin only.
-    Map(Vec<(Self, Self)>),
+    Map(MapVal),
     /// GQL only.
     Path(Box<PathVal>),
     /// Gremlin only.
@@ -156,13 +264,20 @@ impl Value {
                     .map(|(k, v)| (k.clone(), Self::from_stored(v, as_record)))
                     .collect(),
             ),
-            Stored::Map(pairs) => Self::Map(
+            Stored::Map(pairs) => Self::map(
                 pairs
                     .iter()
                     .map(|(k, v)| (Self::Str(k.clone()), Self::from_stored(v, as_record)))
                     .collect(),
             ),
         }
+    }
+
+    /// A map from independent key/value pairs. See [`MapVal`] for when the keys
+    /// can be shared instead.
+    #[must_use]
+    pub fn map(pairs: Vec<(Self, Self)>) -> Self {
+        Self::Map(MapVal::from_pairs(pairs))
     }
 
     /// A list value. Takes the `Vec` callers naturally build and shares it.

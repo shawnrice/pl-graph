@@ -270,7 +270,7 @@ fn order_local_sorts_a_folded_list() {
 fn group_reducing_value_by_folds_the_group() {
     let entries = |out: &[GVal]| -> Vec<(GVal, GVal)> {
         match out.first() {
-            Some(GVal::Map(e)) => e.clone(),
+            Some(GVal::Map(e)) => e.clone().into_pairs(),
             other => panic!("expected a Map, got {other:?}"),
         }
     };
