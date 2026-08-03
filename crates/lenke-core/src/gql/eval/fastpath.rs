@@ -205,13 +205,27 @@ pub(super) fn try_count_edges(
     }
 
     let mut count: usize = 0;
+    // An edge is bucketed under EVERY label it carries, so `[:X|Y]` over an edge
+    // labelled [X, Y] reaches it from both buckets. Summing bucket LENGTHS then
+    // counts it twice — `[:X|Y]` returned 3 for two edges. Only possible since
+    // edges became multi-label, and only when more than one type is asked for.
+    let mut seen: HashSet<u32> = HashSet::new();
+    let dedup = tids.len() > 1 && graph.has_multi_label_edges();
+
     for tid in tids {
         let bucket = graph.edges_with_etype(tid);
         if unlabeled {
-            count += bucket.len(); // every edge of this type is one match
+            count += if dedup {
+                bucket.iter().filter(|&&e| seen.insert(e)).count()
+            } else {
+                bucket.len() // every edge of this type is one match
+            };
             continue;
         }
         for &eid in bucket {
+            if dedup && !seen.insert(eid) {
+                continue;
+            }
             let src = graph.e_src[eid as usize];
             let dst = graph.e_dst[eid as usize];
             // Out: `a` is the source, `b` the destination; In reverses them.

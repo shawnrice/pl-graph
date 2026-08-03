@@ -1533,6 +1533,27 @@ impl Graph {
         &self.vlabels[v as usize]
     }
     /// Does vertex `v` carry label id `l`?
+    /// REJECTED, measured: the edge treatment — a dense `v_label0` first label
+    /// plus this list for the rest, and an `extra_mask` Bloom filter over labels
+    /// that appear as non-first.
+    ///
+    /// It does not transfer. Edges already HAD a dense first label (every
+    /// adjacency entry mirrors it), so the split cost no storage and the Bloom
+    /// filter only avoided touching a NEW sparse side table — which is why one
+    /// multi-label edge could otherwise cost 2.4x. A vertex has no such dense
+    /// label, so the same shape means a net-new parallel array, a second source
+    /// of truth to keep in sync across every label mutation, and:
+    ///
+    /// ```text
+    ///   (a:P)-[:R]->(b:Q), 200k vertices     check costs
+    ///   single-label vertices                0.28 ms -> 0.19   dense hits
+    ///   half the vertices multi-label        0.36    -> 0.42   dense always misses
+    /// ```
+    ///
+    /// It helps only when the label asked for happens to be stored first, and
+    /// costs a wasted compare when it is not. Multi-label vertices measured ~2%
+    /// against single-label ones here, so there is no pathology to fix — unlike
+    /// edges, where there was.
     pub fn has_label(&self, v: u32, l: u32) -> bool {
         self.vlabels[v as usize].contains(&l)
     }

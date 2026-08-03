@@ -11112,3 +11112,67 @@ fn a_capped_scan_does_not_bound_its_seed_when_a_filter_follows() {
     let plain = "MATCH (n:Person) RETURN n.nm LIMIT 3";
     assert_eq!(rows(&mut g, plain).len(), 3);
 }
+
+/// A label DISJUNCTION over multi-label elements must not double-count.
+///
+/// An element is bucketed under every label it carries, so `[:X|Y]` reaches an
+/// edge labelled `[X, Y]` from both buckets. Three separate paths unioned those
+/// buckets and each returned it twice — `label_seed`, GQL's `etype_label_seed`,
+/// and `try_count_edges` summing bucket LENGTHS. The vertex side had always
+/// deduped for exactly this reason; edges only started needing it when they
+/// stopped being single-label.
+///
+/// The whole composite is here — "walk the FROM edges labelled X or Y to any
+/// vertex labelled W or Z" — because that is one operation over two element
+/// kinds, and each kind had its own copy of the rule.
+#[test]
+fn a_label_disjunction_over_multi_label_elements_counts_each_once() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{}}"#,
+            // `b` carries BOTH target labels, so the node side is exercised too.
+            r#"{"type":"node","id":"b","labels":["W","Z"],"properties":{}}"#,
+            r#"{"type":"node","id":"c","labels":["Z"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["X","Y"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e1","from":"a","to":"c","labels":["Y"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let n = |g: &mut Graph, q: &str| match rows(g, q).first().and_then(|r| r.first()) {
+        Some(Value::Num(x)) => *x,
+        other => panic!("expected a count, got {other:?}"),
+    };
+
+    // Each label alone.
+    assert_eq!(n(&mut g, "MATCH ()-[:X]->() RETURN count(*) AS c"), 1.0);
+    assert_eq!(n(&mut g, "MATCH ()-[:Y]->() RETURN count(*) AS c"), 2.0);
+
+    // The disjunction: two edges, not three.
+    assert_eq!(n(&mut g, "MATCH ()-[:X|Y]->() RETURN count(*) AS c"), 2.0);
+
+    // …and the same through the NAMED-edge form, which takes a different path.
+    assert_eq!(
+        rows(&mut g, "MATCH ()-[e:X|Y]->() RETURN element_id(e) AS i").len(),
+        2
+    );
+
+    // Vertex disjunction over a vertex carrying both.
+    assert_eq!(n(&mut g, "MATCH (v:W|Z) RETURN count(*) AS c"), 2.0);
+
+    // The composite: FROM-edges labelled X or Y, to vertices labelled W or Z.
+    assert_eq!(
+        n(&mut g, "MATCH ()-[:X|Y]->(:W|Z) RETURN count(*) AS c"),
+        2.0
+    );
+
+    // A residual label test over an edge must see PAST its first label.
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH ()-[e]->() WHERE e IS LABELED Y RETURN count(*) AS c"
+        ),
+        2.0
+    );
+}

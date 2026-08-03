@@ -1603,35 +1603,52 @@ fn prop_field_of(env: &Env, var_slot: usize, root_key_ref: usize, descent: &[Arc
     value_to_val(&store.field_at(idx, kid, &segs, &env.graph.strs))
 }
 
-fn eval_label_node(graph: &Graph, ctx: &Ctx, vi: u32, expr: &CLabelExpr) -> bool {
+/// Evaluate a label expression against ONE element, vertex or edge.
+///
+/// A vertex and an edge differ in having `from`/`to`, not in how labels work:
+/// both carry a SET of them, both answer "is any of these mine", and both
+/// support the same `:A&B`, `:A|B`, `!:A` algebra. They had two evaluators, and
+/// the edge one took a single `u32` — the shape of the old single-label edge —
+/// so `[:A|B]` on an edge carrying both A and B consulted only its first label.
+fn eval_label(graph: &Graph, ctx: &Ctx, el: ElemRef, expr: &CLabelExpr) -> bool {
     match expr {
-        CLabelExpr::Label(r) => ctx.labels[*r].0.is_some_and(|lid| graph.has_label(vi, lid)),
-        CLabelExpr::Wildcard => !graph.vertex_labels(vi).is_empty(),
-        CLabelExpr::Not(e) => !eval_label_node(graph, ctx, vi, e),
-        CLabelExpr::And(l, r) => {
-            eval_label_node(graph, ctx, vi, l) && eval_label_node(graph, ctx, vi, r)
-        }
-        CLabelExpr::Or(l, r) => {
-            eval_label_node(graph, ctx, vi, l) || eval_label_node(graph, ctx, vi, r)
-        }
+        CLabelExpr::Label(r) => match el {
+            ElemRef::Node(vi) => ctx.labels[*r].0.is_some_and(|lid| graph.has_label(vi, lid)),
+            ElemRef::Edge(ei) => ctx.labels[*r]
+                .1
+                .is_some_and(|tid| graph.edge_has_label(ei, tid)),
+        },
+        CLabelExpr::Wildcard => match el {
+            ElemRef::Node(vi) => !graph.vertex_labels(vi).is_empty(),
+            // An edge always has at least one label (possibly the empty one).
+            ElemRef::Edge(_) => true,
+        },
+        CLabelExpr::Not(e) => !eval_label(graph, ctx, el, e),
+        CLabelExpr::And(l, r) => eval_label(graph, ctx, el, l) && eval_label(graph, ctx, el, r),
+        CLabelExpr::Or(l, r) => eval_label(graph, ctx, el, l) || eval_label(graph, ctx, el, r),
     }
 }
 
-fn eval_label_edge(ctx: &Ctx, etype: u32, expr: &CLabelExpr) -> bool {
-    match expr {
-        CLabelExpr::Label(r) => ctx.labels[*r].1 == Some(etype),
-        CLabelExpr::Wildcard => true, // an edge always has exactly one type
-        CLabelExpr::Not(e) => !eval_label_edge(ctx, etype, e),
-        CLabelExpr::And(l, r) => eval_label_edge(ctx, etype, l) && eval_label_edge(ctx, etype, r),
-        CLabelExpr::Or(l, r) => eval_label_edge(ctx, etype, l) || eval_label_edge(ctx, etype, r),
-    }
+/// Which element a label expression is being asked about.
+#[derive(Clone, Copy)]
+enum ElemRef {
+    Node(u32),
+    Edge(u32),
+}
+
+fn eval_label_node(graph: &Graph, ctx: &Ctx, vi: u32, expr: &CLabelExpr) -> bool {
+    eval_label(graph, ctx, ElemRef::Node(vi), expr)
+}
+
+fn eval_label_edge_at(graph: &Graph, ctx: &Ctx, ei: u32, expr: &CLabelExpr) -> bool {
+    eval_label(graph, ctx, ElemRef::Edge(ei), expr)
 }
 
 /// `IS LABELED` over a runtime element value.
 fn labels_match(graph: &Graph, ctx: &Ctx, el: &Val, expr: &CLabelExpr) -> bool {
     match el {
         Val::Node(vi) => eval_label_node(graph, ctx, *vi, expr),
-        Val::Edge(ei) => eval_label_edge(ctx, graph.e_type[*ei as usize], expr),
+        Val::Edge(ei) => eval_label_edge_at(graph, ctx, *ei, expr),
         _ => false,
     }
 }
@@ -2446,7 +2463,7 @@ fn expand<'a>(
                 .flatten()
                 .filter(move |a| !both || a.nbr != v),
         )
-        .filter(move |a| label.is_none_or(|e| eval_label_edge(ctx, a.etype, e)))
+        .filter(move |a| label.is_none_or(|e| eval_label_edge_at(graph, ctx, a.eidx, e)))
         .map(|a| (a.eidx, a.nbr))
 }
 

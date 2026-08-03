@@ -253,6 +253,15 @@ pub(super) fn etype_label_seed(graph: &Graph, ctx: &Ctx, expr: &CLabelExpr) -> O
                 .1
                 .map_or_else(Vec::new, |t| graph.edges_with_etype(t).to_vec()),
         ),
+        // NOTE: this union is NOT deduped. An edge is bucketed under every label
+        // it carries, so `[:X|Y]` over an edge labelled [X, Y] would take it from
+        // both sides — the double-count that had to be fixed in
+        // `try_count_edges` and `ElementSeek::label_seed`. It is left alone here
+        // because no query reaches this branch: instrumenting it across the
+        // disjunction tests and the `edge_first_build` shapes produced zero hits,
+        // so a dedup would be code no test can exercise. If a change routes a
+        // multi-type seed through here, dedup it — and `a_label_disjunction_over_
+        // multi_label_elements_counts_each_once` is where to assert it.
         CLabelExpr::Or(l, r) => {
             let mut a = etype_label_seed(graph, ctx, l)?;
             a.extend(etype_label_seed(graph, ctx, r)?);
@@ -1078,7 +1087,7 @@ impl crate::seek::RowFilter for SegmentFilter<'_> {
     fn keep(&mut self, eidx: u32, nbr: u32) -> bool {
         if self.residual_type {
             if let Some(l) = self.rel.label.as_ref() {
-                if !eval_label_edge(self.ctx, self.graph.e_type[eidx as usize], l) {
+                if !eval_label_edge_at(self.graph, self.ctx, eidx, l) {
                     return false;
                 }
             }
@@ -1164,7 +1173,7 @@ pub(super) fn edge_first_build(
         if !rel
             .label
             .as_ref()
-            .is_none_or(|lbl| eval_label_edge(ctx, graph.e_type[ei], lbl))
+            .is_none_or(|lbl| eval_label_edge_at(graph, ctx, ei as u32, lbl))
         {
             continue;
         }

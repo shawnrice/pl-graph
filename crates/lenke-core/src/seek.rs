@@ -288,17 +288,29 @@ impl ElementSeek {
 
             let want = take.unwrap_or(total).min(total);
             let mut out = Vec::with_capacity(want);
+            // An edge is bucketed under EVERY label it carries, so two of the
+            // wanted labels can name the SAME edge — `[:X|Y]` over an edge
+            // labelled [X, Y] returned it twice. Exactly the case the vertex
+            // branch below has always deduped; edges only started needing it when
+            // they became multi-label. Skipped entirely when one label is asked
+            // for, or when no edge carries a second.
+            let dedup = f.ids.len() > 1 && graph.has_multi_label_edges();
+            let mut seen: HashSet<u32> = if dedup {
+                HashSet::with_capacity(want)
+            } else {
+                HashSet::new()
+            };
 
             for &t in &f.ids {
-                let room = want - out.len();
+                for &e in graph.edges_with_etype(t) {
+                    if out.len() >= want {
+                        break;
+                    }
 
-                if room == 0 {
-                    break;
+                    if !dedup || seen.insert(e) {
+                        out.push(e);
+                    }
                 }
-
-                let src = graph.edges_with_etype(t);
-
-                out.extend_from_slice(&src[..room.min(src.len())]);
             }
 
             return Some(out);
