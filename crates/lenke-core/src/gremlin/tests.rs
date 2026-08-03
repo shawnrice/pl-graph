@@ -123,15 +123,21 @@ fn e_by_id_resolves_directly_in_id_order() {
     assert_eq!(ids, vec!["e-b", "e-a"]);
 }
 
+/// The builder form of [`p1_out_label_order_does_not_group_the_result`] — see
+/// that test for why label-argument grouping is not a contract.
 #[test]
-fn out_multi_label_order_matters() {
-    assert_eq!(
-        ordered(q(g()
-            .v_ids(&["1"])
-            .out(&["CREATED", "KNOWS"])
-            .values(&["name"]))),
-        vec!["lop", "vadas", "josh"]
-    );
+fn out_multi_label_returns_the_same_set_either_order() {
+    let one = names(q(g()
+        .v_ids(&["1"])
+        .out(&["CREATED", "KNOWS"])
+        .values(&["name"])));
+    let other = names(q(g()
+        .v_ids(&["1"])
+        .out(&["KNOWS", "CREATED"])
+        .values(&["name"])));
+
+    assert_eq!(one, other);
+    assert_eq!(one, vec!["josh", "lop", "vadas"]);
 }
 
 #[test]

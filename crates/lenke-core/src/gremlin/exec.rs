@@ -1616,7 +1616,15 @@ fn shortest_paths_from(
         let mut next = Vec::new();
         for &v in &frontier {
             let d = dist[&v];
-            for (_, n) in adj_in_label_order(graph, v, out, inn, &[]) {
+            for n in crate::seek::adj(
+                graph,
+                v,
+                seek_dir(out, inn),
+                &[],
+                crate::seek::SelfLoops::Twice,
+            )
+            .map(|a| a.nbr)
+            {
                 match dist.get(&n).copied() {
                     None => {
                         dist.insert(n, d + 1);
@@ -2487,52 +2495,21 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             }
         }
 
-        // --- vertex → vertex (multi-label emits in label-arg order) ---
+        // --- vertex → vertex ---
         Step::Out(labels) | Step::In(labels) | Step::Both(labels) => {
             let (out, inn) = dir_flags(step);
+            let dir = seek_dir(out, inn);
+            let Some(etypes) = resolve_etypes(graph, labels) else {
+                return Vec::new(); // a label naming no type matches nothing
+            };
             let mut next = Vec::new();
 
             for t in &stream {
                 if let GVal::Node(v) = t.val {
-                    // No label, or exactly ONE, needs no intermediate: stream
-                    // adjacency straight through. The per-vertex `Vec` in
-                    // `adj_in_label_order` exists only to emit results in the
-                    // ARGUMENTS' label order, and one argument has no order to
-                    // get wrong — so `out('KNOWS')`, much the commonest shape,
-                    // was paying an allocation per source vertex for nothing.
-                    if labels.len() <= 1 {
-                        let want = labels.first().and_then(|l| graph.etype.get(l));
-
-                        // A label that names no type matches nothing — distinct
-                        // from no label at all, which matches every type.
-                        if labels.is_empty() || want.is_some() {
-                            let keep = move |a: &crate::graph::Adj| {
-                                want.is_none_or(|w| a.etype == w)
-                            };
-
-                            if out {
-                                next.extend(
-                                    graph
-                                        .out_adj(v)
-                                        .filter(keep)
-                                        .map(|a| t.step(GVal::Node(a.nbr))),
-                                );
-                            }
-
-                            if inn {
-                                next.extend(
-                                    graph
-                                        .in_adj(v)
-                                        .filter(keep)
-                                        .map(|a| t.step(GVal::Node(a.nbr))),
-                                );
-                            }
-                        }
-                    } else {
-                        for a in adj_in_label_order(graph, v, out, inn, labels) {
-                            next.push(t.step(GVal::Node(a.1)));
-                        }
-                    }
+                    next.extend(
+                        crate::seek::adj(graph, v, dir, &etypes, crate::seek::SelfLoops::Twice)
+                            .map(|a| t.step(GVal::Node(a.nbr))),
+                    );
                 }
             }
 
@@ -2542,47 +2519,18 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         // --- vertex → edge ---
         Step::OutE(labels) | Step::InE(labels) | Step::BothE(labels) => {
             let (out, inn) = dir_flags(step);
+            let dir = seek_dir(out, inn);
+            let Some(etypes) = resolve_etypes(graph, labels) else {
+                return Vec::new();
+            };
             let mut next = Vec::new();
 
             for t in &stream {
                 if let GVal::Node(v) = t.val {
-                    // No label, or exactly one, streams straight through — the
-                    // `Vec` per source vertex in `adj_in_label_order` exists only
-                    // to emit in the ARGUMENTS' label order, and one argument has
-                    // no order to get wrong. Same fix the vertex steps already
-                    // had; the edge steps were missed.
-                    if labels.len() <= 1 {
-                        let want = labels.first().and_then(|l| graph.etype.get(l));
-
-                        // A label naming no type matches nothing — distinct from
-                        // no label, which matches every type.
-                        if labels.is_empty() || want.is_some() {
-                            let keep =
-                                move |a: &crate::graph::Adj| want.is_none_or(|w| a.etype == w);
-
-                            if out {
-                                next.extend(
-                                    graph
-                                        .out_adj(v)
-                                        .filter(keep)
-                                        .map(|a| t.step(GVal::Edge(a.eidx))),
-                                );
-                            }
-
-                            if inn {
-                                next.extend(
-                                    graph
-                                        .in_adj(v)
-                                        .filter(keep)
-                                        .map(|a| t.step(GVal::Edge(a.eidx))),
-                                );
-                            }
-                        }
-                    } else {
-                        for a in adj_in_label_order(graph, v, out, inn, labels) {
-                            next.push(t.step(GVal::Edge(a.0)));
-                        }
-                    }
+                    next.extend(
+                        crate::seek::adj(graph, v, dir, &etypes, crate::seek::SelfLoops::Twice)
+                            .map(|a| t.step(GVal::Edge(a.eidx))),
+                    );
                 }
             }
 
@@ -3788,55 +3736,31 @@ fn apply_sack_op(op: SackOp, current: &GVal, projected: &GVal) -> GVal {
     }
 }
 
-/// Collect a vertex's adjacency as `(eidx, nbr)`. With labels, emit per label in
-/// argument order (Gremlin `out('A','B')` yields all A-edges then all B-edges);
-/// without, adjacency order (out then in for `both`), deduped across both for
-/// `both` with no labels is not required (TinkerPop both yields each edge once
-/// per direction — matches iterating out then in).
-fn adj_in_label_order(
-    graph: &Graph,
-    v: u32,
-    out: bool,
-    inn: bool,
-    labels: &[String],
-) -> Vec<(u32, u32)> {
-    let mut res = Vec::new();
-    // No label filter (the common out()/in()/both()): stream adjacency straight
-    // into `res` — out-edges then in-edges, each in adjacency order — skipping the
-    // two intermediate per-direction Vecs and the copy the labeled path needs.
-    if labels.is_empty() {
-        if out {
-            res.extend(graph.out_adj(v).map(|a| (a.eidx, a.nbr)));
-        }
-
-        if inn {
-            res.extend(graph.in_adj(v).map(|a| (a.eidx, a.nbr)));
-        }
-
-        return res;
+/// `(out, inn)` flags as the shared [`crate::seek::Dir`].
+fn seek_dir(out: bool, inn: bool) -> crate::seek::Dir {
+    match (out, inn) {
+        (true, true) => crate::seek::Dir::Both,
+        (false, true) => crate::seek::Dir::In,
+        _ => crate::seek::Dir::Out,
     }
-    // Labeled: materialize each direction once (it is re-scanned per label so the
-    // result comes out in the arguments' label order), then filter by edge type.
-    let outs: Vec<(u32, u32, u32)> = if out {
-        graph.out_adj(v).map(|a| (a.eidx, a.nbr, a.etype)).collect()
-    } else {
-        Vec::new()
-    };
-    let ins: Vec<(u32, u32, u32)> = if inn {
-        graph.in_adj(v).map(|a| (a.eidx, a.nbr, a.etype)).collect()
-    } else {
-        Vec::new()
-    };
-    let collect_dir = |adjs: &[(u32, u32, u32)], dst: &mut Vec<(u32, u32)>| {
-        for lbl in labels {
-            if let Some(id) = graph.etype.get(lbl) {
-                dst.extend(adjs.iter().filter(|a| a.2 == id).map(|a| (a.0, a.1)));
-            }
-        }
-    };
-    collect_dir(&outs, &mut res);
-    collect_dir(&ins, &mut res);
-    res
+}
+
+/// Label names as edge-type ids: `Some(ids)` to match those types, `Some(empty)`
+/// to match ANY, `None` to match nothing.
+///
+/// An unknown label contributes no edges but does not void the others —
+/// `both('KNOWS','CREATED','BLAH')` still walks KNOWS and CREATED. Only when
+/// labels were given and NONE resolve does the step match nothing, which is
+/// distinct from no labels at all matching everything. Conflating those two made
+/// `[:NONEXISTENT]` match every edge, three times, in three places.
+fn resolve_etypes(graph: &Graph, labels: &[String]) -> Option<Vec<u32>> {
+    if labels.is_empty() {
+        return Some(Vec::new()); // no filter: any type
+    }
+
+    let ids: Vec<u32> = labels.iter().filter_map(|l| graph.etype.get(l)).collect();
+
+    (!ids.is_empty()).then_some(ids)
 }
 
 fn dir_flags(step: &Step) -> (bool, bool) {

@@ -127,12 +127,28 @@ fn p1_out_all_labels_like_none() {
     assert_eq!(a, b);
 }
 
+/// Multi-label `out()` returns the same SET whichever order the labels are
+/// given in. It does not group by label argument.
+///
+/// It used to: `adj_in_label_order` materialized a `Vec` per direction per source
+/// vertex and re-scanned it once per label so that `out('CREATED','KNOWS')`
+/// emitted the CREATED edges first. Nothing requires that. TinkerPop specifies no
+/// order for `out()`; TinkerGraph appears to group by argument only because it
+/// stores `Map<label, Set<Edge>>`, which the TS engine mirrors and the native CSR
+/// store does not — and this repo's policy already records adjacency order as
+/// unspecified and native-vs-TS divergence there as expected. Paying a per-vertex
+/// allocation to imitate another engine's storage layout bought nothing, and cost
+/// a second adjacency walk outside `crate::seek`.
 #[test]
-fn p1_out_label_order_matters() {
-    assert_eq!(
-        ordered(qs("g.V('1').out('CREATED','KNOWS').values('name')")),
-        vec!["lop", "vadas", "josh"]
-    );
+fn p1_out_label_order_does_not_group_the_result() {
+    let mut a = ordered(qs("g.V('1').out('CREATED','KNOWS').values('name')"));
+    let mut b = ordered(qs("g.V('1').out('KNOWS','CREATED').values('name')"));
+
+    a.sort();
+    b.sort();
+
+    assert_eq!(a, b);
+    assert_eq!(a, vec!["josh", "lop", "vadas"]);
 }
 
 #[test]

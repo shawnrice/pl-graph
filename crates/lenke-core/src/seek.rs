@@ -1089,6 +1089,42 @@ pub enum SelfLoops {
     Twice,
 }
 
+/// Every incident edge of `v` whose type is in `etypes` (empty = any), in
+/// ADJACENCY order: out-edges then in-edges, each in storage order.
+///
+/// The one adjacency walk both engines use. Gremlin previously had a second,
+/// `adj_in_label_order`, which materialized a `Vec` per direction per source
+/// vertex and re-scanned it once per label argument so that
+/// `out('a','b')` emitted all the `a` edges before all the `b` edges. That order
+/// is NOT contractual — `docs/` records adjacency order as unspecified, and the
+/// native and TS engines already disagree on it (CSR order vs label buckets) —
+/// so paying for it was buying nothing.
+pub fn adj<'a>(
+    graph: &'a Graph,
+    v: u32,
+    dir: Dir,
+    etypes: &'a [u32],
+    loops: SelfLoops,
+) -> impl Iterator<Item = crate::graph::Adj> + 'a {
+    let keep = move |t: u32| etypes.is_empty() || etypes.contains(&t);
+    // Only an undirected walk can reach a self-loop twice; a directed one keeps
+    // it either way.
+    let drop_loop = dir == Dir::Both && loops == SelfLoops::Once;
+
+    let outs = (dir != Dir::In)
+        .then(|| graph.out_adj(v))
+        .into_iter()
+        .flatten()
+        .filter(move |a| keep(a.etype));
+    let ins = (dir != Dir::Out)
+        .then(|| graph.in_adj(v))
+        .into_iter()
+        .flatten()
+        .filter(move |a| keep(a.etype) && !(drop_loop && a.nbr == v));
+
+    outs.chain(ins)
+}
+
 /// Neighbours of `src` along `etypes` (empty = any type), flat.
 ///
 /// One output vector for the whole expansion rather than one per source. The
