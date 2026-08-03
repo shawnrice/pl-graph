@@ -532,6 +532,17 @@ fn driven_scan(
 /// [`crate::gql::plan::Program::read_slots`].
 pub(super) type Needed<'a> = Option<&'a [usize]>;
 
+/// Everything about how an expansion STARTS, beside its endpoints: the LIMIT cap,
+/// the slots downstream will read, and any columns an earlier clause already
+/// bound. Grouped because they travel together through [`expand_scan`].
+pub(super) struct SeedFrom<'a> {
+    pub cap: Option<usize>,
+    pub needed: Needed<'a>,
+    /// Columns from the frame this expansion continues (a mid-pipeline `MATCH`
+    /// after a `WITH`), or `None` for a fresh scan.
+    pub carry: Option<&'a ScanCols>,
+}
+
 pub(super) fn build_scan(
     graph: &Graph,
     ctx: &Ctx,
@@ -599,7 +610,18 @@ pub(super) fn build_scan(
     // `try_parallel_scan`, so the serial and parallel paths seed identically.
     if let Some(oriented) = try_orient_node_seed(graph, ctx, path, where_) {
         let endpoint = scan_start_seed(graph, ctx, &oriented.start, scope_len, where_);
-        return expand_scan(graph, ctx, &oriented, scope_len, endpoint, cap, needed);
+        return expand_scan(
+            graph,
+            ctx,
+            &oriented,
+            scope_len,
+            endpoint,
+            SeedFrom {
+                cap,
+                needed,
+                carry: None,
+            },
+        );
     }
     // Edge-first: a single segment with an indexed edge-property hint → seek the
     // matching edges and validate the surrounding (a)-[r]->(b) pattern, instead
@@ -630,7 +652,18 @@ pub(super) fn build_scan(
     }
     // Seed the start-node endpoints, then expand the segments into columns.
     let endpoint = scan_start_seed(graph, ctx, &path.start, scope_len, where_);
-    expand_scan(graph, ctx, path, scope_len, endpoint, cap, needed)
+    expand_scan(
+        graph,
+        ctx,
+        path,
+        scope_len,
+        endpoint,
+        SeedFrom {
+            cap,
+            needed,
+            carry: None,
+        },
+    )
 }
 
 /// The filtered start-node endpoints for a traversal scan: every live vertex that
@@ -671,9 +704,9 @@ pub(super) fn expand_scan(
     path: &CPath,
     scope_len: usize,
     endpoint: Vec<u32>,
-    cap: Option<usize>,
-    needed: Needed<'_>,
+    seed: SeedFrom<'_>,
 ) -> Option<ScanCols> {
+    let SeedFrom { cap, needed, carry } = seed;
     // A quantified unit's variables are GROUP variables — one list per row, held
     // as `Val` columns, not one element per row. They must not also be claimed
     // here as element columns: a segment carrying a unit still reports its edge
@@ -741,6 +774,23 @@ pub(super) fn expand_scan(
     // the part that is GQL: the per-segment label test and inline/WHERE
     // constraints, supplied as a `RowFilter`.
     let mut frontier = crate::seek::Frontier::seed(endpoint, path.start.var_slot, scope_len.max(1));
+
+    // Columns an earlier clause already bound ride along, so the expansion fans
+    // them out with everything else. This is what lets a mid-pipeline `MATCH`
+    // (after a `WITH`) use the shared frontier instead of a second expander.
+    if let Some(src) = carry {
+        for s in 0..scope_len.max(1).min(src.slots.len()) {
+            if Some(s) == path.start.var_slot {
+                continue;
+            }
+
+            if let Some((_, ids)) = &src.slots[s] {
+                frontier.set_column(s, ids.clone());
+            } else if let Some(v) = &src.vals[s] {
+                frontier.set_values(s, v.clone());
+            }
+        }
+    }
     let nseg = path.segments.len();
     // A bound path variable is a `Val` column, not an id column.
     let mut path_col: Option<(usize, Vec<Val>)> = None;
@@ -948,6 +998,25 @@ pub(super) fn expand_scan(
     for &(s, e) in &kinds {
         if taken.insert(s) {
             sc.slots[s] = Some((e, frontier.take_column(s).unwrap_or_default()));
+        }
+    }
+
+    // …and the carried ones, fanned out by the same hops.
+    if let Some(src) = carry {
+        for s in 0..sc.slots.len().min(src.slots.len()) {
+            if !taken.insert(s) {
+                continue;
+            }
+
+            if let Some((e, _)) = &src.slots[s] {
+                if let Some(ids) = frontier.take_column(s) {
+                    sc.slots[s] = Some((*e, ids));
+                }
+            } else if src.vals[s].is_some() {
+                if let Some(v) = frontier.take_values(s) {
+                    sc.vals[s] = Some(v);
+                }
+            }
         }
     }
 
@@ -2683,60 +2752,23 @@ pub(super) fn expand_frame(
 ) -> Option<ScanCols> {
     let start = &path.start;
     let start_slot = start.var_slot?;
-    let start_ids: Vec<u32> = match sc.slot(start_slot) {
-        Some((Elem::Node, ids)) => ids.to_vec(), // start must be a bound node column
-        _ => return None,
+    let Some((Elem::Node, start_ids)) = sc.slot(start_slot) else {
+        return None; // the start must be an already-bound node column
     };
-    if path.segments.iter().any(|s| s.rel.quantifier.is_some()) {
-        return None;
-    }
-    // Segment-introduced slots must be fresh (not already bound) — no self-join.
-    let mut seen = HashSet::new();
-    for seg in &path.segments {
-        for s in [seg.rel.var_slot, seg.node.var_slot].into_iter().flatten() {
-            if !seen.insert(s) || sc.slot(s).is_some() || sc.val_slot(s).is_some() {
-                return None;
-            }
-        }
-    }
-    let width = scope_len.max(sc.slots.len());
+    let mut cur = sc.clone();
+    let mut endpoint = start_ids.to_vec();
 
-    // cur = the frame widened to `width`; endpoint = each row's start vertex.
-    let mut cur = ScanCols::new(width);
-    cur.n = sc.n;
-    for s in 0..sc.slots.len() {
-        if let Some((e, ids)) = &sc.slots[s] {
-            cur.slots[s] = Some((*e, ids.clone()));
-        } else if let Some(v) = &sc.vals[s] {
-            cur.vals[s] = Some(v.clone());
-        }
-    }
-    let mut endpoint = start_ids;
-
-    // Sets a binding from `cur` at row `i` (for inline WHERE/props referencing
-    // frame variables during constraint checks).
-    let bind_row = |b: &mut Binding, cur: &ScanCols, i: usize| {
-        for s in 0..cur.slots.len() {
-            if let Some((e, ids)) = &cur.slots[s] {
-                b.set(
-                    s,
-                    match e {
-                        Elem::Node => Val::Node(ids[i]),
-                        Elem::Edge => Val::Edge(ids[i]),
-                    },
-                );
-            } else if let Some(v) = &cur.vals[s] {
-                b.set(s, v[i].clone());
-            }
-        }
-    };
-
-    // The restated start node may add label/props/WHERE — filter rows by them.
+    // The RESTATED start node may add a label / inline props / WHERE. Apply them
+    // here, before the shared expansion, because `expand_scan` seeds its start
+    // from a scan and so checks those at seed time — there is no seed to check
+    // when the start is a column that already exists.
     if start.label.is_some() || !start.props.is_empty() || start.where_.is_some() {
-        let mut b = Binding(vec![None; width]);
+        let width = scope_len.max(sc.slots.len());
+        let mut b = Binding::with_len(width);
         let mut keep = vec![false; cur.n];
+
         for i in 0..cur.n {
-            bind_row(&mut b, &cur, i);
+            bind_frame_row(&mut b, &cur, i);
             keep[i] = matches_label(graph, ctx, endpoint[i], start.label.as_ref())
                 && satisfies(
                     graph,
@@ -2747,74 +2779,26 @@ pub(super) fn expand_frame(
                     &b,
                 );
         }
-        endpoint = endpoint
-            .iter()
-            .zip(&keep)
-            .filter_map(|(&v, &k)| k.then_some(v))
-            .collect();
+
+        endpoint.retain({
+            let mut it = keep.iter();
+            move |_| *it.next().unwrap_or(&false)
+        });
         compact(&mut cur, &keep);
     }
 
-    let mut nb = Binding(vec![None; width]);
-    for seg in &path.segments {
-        let rel = &seg.rel;
-        let node = &seg.node;
-        let rel_check = !rel.props.is_empty() || rel.where_.is_some();
-        let node_check = !node.props.is_empty() || node.where_.is_some();
-        let need_bind = rel_check || node_check;
-        // Pre-init the next frame's columns: new rel/node slots + carried columns.
-        let mut nxt = ScanCols::new(width);
-        for s in 0..width {
-            if Some(s) == rel.var_slot {
-                nxt.slots[s] = Some((Elem::Edge, Vec::new()));
-            } else if Some(s) == node.var_slot {
-                nxt.slots[s] = Some((Elem::Node, Vec::new()));
-            } else if let Some((e, _)) = &cur.slots[s] {
-                nxt.slots[s] = Some((*e, Vec::new()));
-            } else if cur.vals[s].is_some() {
-                nxt.vals[s] = Some(Vec::new());
-            }
-        }
-        let mut nxt_end: Vec<u32> = Vec::new();
-        for i in 0..cur.n {
-            if need_bind {
-                bind_row(&mut nb, &cur, i);
-            }
-            for (eidx, nbr) in expand(graph, ctx, endpoint[i], rel.direction, rel.label.as_ref()) {
-                if !seg_edge_accepts(
-                    graph,
-                    ctx,
-                    seg,
-                    eidx,
-                    nbr,
-                    SegChecks {
-                        need_bind,
-                        rel_check,
-                        node_check,
-                    },
-                    &mut nb,
-                ) {
-                    continue;
-                }
-                for s in 0..width {
-                    if Some(s) == rel.var_slot {
-                        nxt.slots[s].as_mut().unwrap().1.push(eidx);
-                    } else if Some(s) == node.var_slot {
-                        nxt.slots[s].as_mut().unwrap().1.push(nbr);
-                    } else if let Some((_, ids)) = &cur.slots[s] {
-                        nxt.slots[s].as_mut().unwrap().1.push(ids[i]);
-                    } else if let Some(v) = &cur.vals[s] {
-                        nxt.vals[s].as_mut().unwrap().push(v[i].clone());
-                    }
-                }
-                nxt_end.push(nbr);
-            }
-        }
-        nxt.n = nxt_end.len();
-        cur = nxt;
-        endpoint = nxt_end;
-    }
-    Some(cur)
+    expand_scan(
+        graph,
+        ctx,
+        path,
+        scope_len.max(sc.slots.len()),
+        endpoint,
+        SeedFrom {
+            cap: None,
+            needed: None,
+            carry: Some(&cur),
+        },
+    )
 }
 
 /// OPTIONAL single-segment expansion as a columnar frame transform: like

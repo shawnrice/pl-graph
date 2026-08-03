@@ -1237,6 +1237,15 @@ impl Frontier {
         self.cols.get_mut(slot).and_then(Option::take)
     }
 
+    /// Install an id column, aligned with the CURRENT rows — a slot bound before
+    /// this frontier existed (a `WITH` that carried an element forward). Later
+    /// hops fan it out like any other bound column.
+    pub fn set_column(&mut self, slot: usize, ids: Vec<u32>) {
+        if slot < self.cols.len() {
+            self.cols[slot] = Some(ids);
+        }
+    }
+
     /// Install a value column, aligned with the CURRENT rows. Later hops fan it
     /// out with the id columns.
     pub fn set_values(&mut self, slot: usize, vals: Vec<Value>) {

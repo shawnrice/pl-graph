@@ -2675,6 +2675,7 @@ enum Elem {
 /// and a single-node scan (`n` slot) look the same — just more slots — and a
 /// pipeline `WITH` can carry elements forward as fast columns while adding
 /// computed value columns beside them.
+#[derive(Clone)]
 struct ScanCols {
     n: usize,
     slots: Vec<Option<(Elem, Vec<u32>)>>,
