@@ -1911,32 +1911,6 @@ fn subgraph_edge(graph: &Graph, e: u32) -> GVal {
     ])
 }
 
-/// Every present property of `v` as `(column id, name)`.
-///
-/// `present_keys` walks the store BY ID and then throws the id away, returning
-/// names — so every caller hashed each name straight back to the id it had just
-/// discarded, twice over (`prop_present`, then `prop`). This keeps it.
-///
-/// Measured NEUTRAL on a no-argument `valueMap()` over 50k x 12 properties (79.6
-/// ms before, 79.2-82.6 after). It is here because deriving a value, discarding
-/// it and re-deriving it twice is worth removing on its own; the timing says only
-/// that `valueMap`'s cost is elsewhere — building a `GVal::Map`, an `Arc` key and
-/// a boxed value per entry, 600k of them. That is the thing to optimize next, and
-/// it is why this is not the win it looks like.
-fn present_key_ids(graph: &Graph, v: &GVal) -> Vec<(u32, Arc<str>)> {
-    if let Some(GVal::Str(k)) = prop_key_field(v) {
-        return vec![(u32::MAX, k)]; // a property element exposes only its own key
-    }
-
-    let (store, idx) = match v {
-        GVal::Node(i) => (&graph.props, *i as usize),
-        GVal::Edge(e) => (&graph.edge_props, *e as usize),
-        _ => return Vec::new(),
-    };
-
-    store.present_keys(idx).collect()
-}
-
 /// The value of the already-resolved column `kid` on `v`. See
 /// [`present_key_ids`]; `u32::MAX` means "a property element's own value".
 fn prop_by_id(graph: &Graph, v: &GVal, kid: u32) -> GVal {
@@ -1961,30 +1935,68 @@ fn prop_by_id(graph: &Graph, v: &GVal, kid: u32) -> GVal {
 /// `prop_present` (hash + presence again), then `prop` (hash again). Resolving
 /// once and reading by id via `prop_by_id` is worth 1.2x on `valueMap()`.
 fn projected_keys(graph: &Graph, v: &GVal, keys: &[String]) -> Vec<(u32, Arc<str>)> {
+    let mut out = Vec::new();
+
+    projected_keys_into(graph, v, keys, &mut out);
+
+    out
+}
+
+/// [`projected_keys`] into a caller-owned buffer, so a projection step over a
+/// long stream allocates one scratch vector instead of one per element.
+fn projected_keys_into(graph: &Graph, v: &GVal, keys: &[String], out: &mut Vec<(u32, Arc<str>)>) {
+    out.clear();
+
     if keys.is_empty() {
-        return present_key_ids(graph, v);
+        let (store, idx) = match v {
+            GVal::Node(i) => (&graph.props, *i as usize),
+            GVal::Edge(e) => (&graph.edge_props, *e as usize),
+            _ => {
+                if let Some(GVal::Str(k)) = prop_key_field(v) {
+                    out.push((u32::MAX, k));
+                }
+
+                return;
+            }
+        };
+
+        if let Some(GVal::Str(k)) = prop_key_field(v) {
+            out.push((u32::MAX, k));
+
+            return;
+        }
+
+        out.extend(store.present_keys(idx));
+
+        return;
     }
 
-    // A property element exposes only its own key, whatever was asked for.
-    if let Some(GVal::Str(own)) = prop_key_field(v) {
-        return keys
-            .iter()
-            .filter(|k| ***k == *own)
-            .map(|k| (u32::MAX, Arc::from(k.as_str())))
-            .collect();
+    out.extend(projected_keys_named(graph, v, keys));
+}
+
+fn projected_keys_named(graph: &Graph, v: &GVal, keys: &[String]) -> Vec<(u32, Arc<str>)> {
+    {
+        // A property element exposes only its own key, whatever was asked for.
+        if let Some(GVal::Str(own)) = prop_key_field(v) {
+            return keys
+                .iter()
+                .filter(|k| ***k == *own)
+                .map(|k| (u32::MAX, Arc::from(k.as_str())))
+                .collect();
+        }
+
+        let (store, idx) = match v {
+            GVal::Node(i) => (&graph.props, *i as usize),
+            GVal::Edge(e) => (&graph.edge_props, *e as usize),
+            _ => return Vec::new(),
+        };
+
+        keys.iter()
+            .filter_map(|k| store.keys.get(k).map(|kid| (kid, k)))
+            .filter(|(kid, _)| store.is_present_id(idx, *kid))
+            .map(|(kid, k)| (kid, Arc::from(k.as_str())))
+            .collect()
     }
-
-    let (store, idx) = match v {
-        GVal::Node(i) => (&graph.props, *i as usize),
-        GVal::Edge(e) => (&graph.edge_props, *e as usize),
-        _ => return Vec::new(),
-    };
-
-    keys.iter()
-        .filter_map(|k| store.keys.get(k).map(|kid| (kid, k)))
-        .filter(|(kid, _)| store.is_present_id(idx, *kid))
-        .map(|(kid, k)| (kid, Arc::from(k.as_str())))
-        .collect()
 }
 
 fn present_keys(graph: &Graph, v: &GVal) -> Vec<Arc<str>> {
@@ -2813,6 +2825,7 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             next
         }
         Step::ValueMap(keys) => {
+            let mut ks: Vec<(u32, Arc<str>)> = Vec::new();
             // Same shape as `values`: the key list was CLONED per traverser and
             // every read hashed the key NAME, so a 200k stream paid 200k
             // `Vec<String>` clones plus two dictionary lookups per property.
@@ -2829,11 +2842,12 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 })
                 .collect();
 
-            map_step(stream, |t| {
+            map_step(stream, move |t| {
                 let entries: Vec<(GVal, GVal)> = if keys.is_empty() {
-                    present_key_ids(graph, &t.val)
-                        .into_iter()
-                        .map(|(kid, k)| (GVal::Str(k), prop_by_id(graph, &t.val, kid)))
+                    projected_keys_into(graph, &t.val, keys, &mut ks);
+
+                    ks.iter()
+                        .map(|(kid, k)| (GVal::Str(k.clone()), prop_by_id(graph, &t.val, *kid)))
                         .collect()
                 } else {
                     named
@@ -2872,7 +2886,10 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 .collect();
             vec![GVal::Map(entries)]
         }),
-        Step::ElementMap(keys) => map_step(stream, |t| {
+        Step::ElementMap(keys) => {
+            let mut ks: Vec<(u32, Arc<str>)> = Vec::new();
+
+            map_step(stream, move |t| {
             if !matches!(t.val, GVal::Node(_) | GVal::Edge(_)) {
                 return vec![];
             }
@@ -2886,11 +2903,16 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 entries.push((GVal::Str(Arc::from("IN")), GVal::Map(vec![(GVal::Str(Arc::from("id")), elem_id(graph, &inv)), (GVal::Str(Arc::from("label")), elem_label(graph, &inv))])));
                 entries.push((GVal::Str(Arc::from("OUT")), GVal::Map(vec![(GVal::Str(Arc::from("id")), elem_id(graph, &outv)), (GVal::Str(Arc::from("label")), elem_label(graph, &outv))])));
             }
-            for (kid, k) in projected_keys(graph, &t.val, keys) {
-                entries.push((GVal::Str(k), prop_by_id(graph, &t.val, kid)));
+            projected_keys_into(graph, &t.val, keys, &mut ks);
+            entries.reserve(ks.len());
+
+            for (kid, k) in &ks {
+                entries.push((GVal::Str(k.clone()), prop_by_id(graph, &t.val, *kid)));
             }
+
             vec![GVal::Map(entries)]
-        }),
+            })
+        }
         Step::Properties(keys) => {
             let mut next = Vec::new();
             for t in &stream {
@@ -3958,7 +3980,7 @@ fn slice_local(v: &GVal, start: usize, end: usize) -> GVal {
     })
 }
 
-fn map_step(stream: Vec<Trav>, f: impl Fn(&Trav) -> Vec<GVal>) -> Vec<Trav> {
+fn map_step(stream: Vec<Trav>, mut f: impl FnMut(&Trav) -> Vec<GVal>) -> Vec<Trav> {
     let mut next = Vec::new();
     for t in &stream {
         for v in f(t) {
