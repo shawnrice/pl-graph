@@ -10827,3 +10827,48 @@ fn fusing_merges_every_constraint_on_the_shared_node() {
         assert_eq!(fused, plain, "fusion changed the result of `{q}`");
     }
 }
+
+/// `DISTINCT` combined with `ORDER BY` must agree with the scalar driver.
+///
+/// The columnar path dedups on the projected row and then sorts, while the
+/// scalar one dedups in scan order — so they only agree if the sort is total
+/// enough to pin the result. Every case here is compared against the scalar
+/// driver row-for-row, including the ties.
+#[test]
+fn distinct_with_order_by_agrees_with_the_scalar_driver() {
+    let lines: Vec<String> = (0..40)
+        .map(|i| {
+            format!(
+                r#"{{"type":"node","id":"n{i}","labels":["N"],"properties":{{"d":"d{}","v":{},"s":"s{}"}}}}"#,
+                i % 5,
+                i % 7,
+                i % 3
+            )
+        })
+        .collect();
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    let queries = [
+        "MATCH (n:N) RETURN DISTINCT n.d ORDER BY n.d",
+        "MATCH (n:N) RETURN DISTINCT n.d AS a ORDER BY a",
+        "MATCH (n:N) RETURN DISTINCT n.d AS a ORDER BY a DESC",
+        "MATCH (n:N) RETURN DISTINCT n.d, n.v ORDER BY n.d, n.v",
+        "MATCH (n:N) RETURN DISTINCT n.d, n.v ORDER BY n.v DESC, n.d",
+        "MATCH (n:N) RETURN DISTINCT n.v AS a ORDER BY a LIMIT 3",
+        "MATCH (n:N) RETURN DISTINCT n.v AS a ORDER BY a SKIP 2 LIMIT 3",
+        "MATCH (n:N) RETURN DISTINCT n.s AS a ORDER BY a",
+        // a computed alias, so the dedup key is not a raw column
+        "MATCH (n:N) RETURN DISTINCT n.v * 2 AS a ORDER BY a",
+    ];
+
+    for q in queries {
+        let vec_on = super::eval::with_vec_override(true, || rows(&mut g, q));
+        let scalar = super::eval::with_vec_override(false, || rows(&mut g, q));
+
+        assert!(!vec_on.is_empty(), "`{q}` produced no rows — inert test");
+        assert_eq!(
+            vec_on, scalar,
+            "vectorized DISTINCT+ORDER BY differs for `{q}`"
+        );
+    }
+}

@@ -1974,9 +1974,6 @@ pub(super) fn vectorized_frame(
     // OUTPUT aliases projects first and sorts the projected columns (see
     // `vectorized_rowset`). DISTINCT + ORDER BY stays scalar.
     let has_order = !proj.order_by.is_empty();
-    if has_order && proj.distinct {
-        return None;
-    }
     let CClause::Match {
         optional: false,
         patterns,
@@ -2195,10 +2192,9 @@ pub(super) fn project_frame_cols(
     proj: &CProjection,
 ) -> Option<Vec<Vec<Val>>> {
     let has_order = !proj.order_by.is_empty();
-    // Aggregating + ORDER BY is handled inside `vectorized_aggregate` (it sorts the
-    // group rows, resolving output aliases + aggregates); DISTINCT + ORDER BY
-    // stays scalar.
-    if has_order && proj.distinct {
+    // Aggregating + ORDER BY is handled inside `vectorized_aggregate` (it sorts
+    // the group rows, resolving output aliases + aggregates).
+    if proj.aggregating && has_order && proj.distinct {
         return None;
     }
     if proj.aggregating {
@@ -2235,12 +2231,13 @@ pub(super) fn project_frame_cols(
         // columns" property the input-keyed path has. That is the right trade
         // here and only here: this shape was 100% scalar before, so it is a win
         // against the scalar driver even having materialized.
-        let out_cols: Option<Vec<Vec<Val>>> = proj.order_needs_output.then(|| {
-            proj.items
-                .iter()
-                .map(|item| eval_vec(graph, ctx, sc, &item.expr).into_vals())
-                .collect()
-        });
+        let out_cols: Option<Vec<Vec<Val>>> =
+            (proj.order_needs_output || proj.distinct).then(|| {
+                proj.items
+                    .iter()
+                    .map(|item| eval_vec(graph, ctx, sc, &item.expr).into_vals())
+                    .collect()
+            });
 
         if let Some(cols) = out_cols.as_ref() {
             for (i, c) in cols.iter().enumerate() {
@@ -2304,12 +2301,31 @@ pub(super) fn project_frame_cols(
             }
             i.cmp(&j)
         };
-        let start = proj.skip_val(ctx).min(sc.n);
+        // DISTINCT + ORDER BY: dedup on the projected row, THEN sort. Which
+        // duplicate survives is irrelevant — they are the same row by definition
+        // — so this does not need the scan-order first-seen rule the unsorted
+        // DISTINCT path keeps.
+        let mut idx: Vec<usize> = if proj.distinct {
+            let cols = out_cols.as_ref().expect("distinct forces out_cols above");
+            let mut seen: FxHashSet<String> = FxHashSet::default();
+            (0..sc.n)
+                .filter(|&i| {
+                    let mut key = String::new();
+                    for c in cols {
+                        val_key(&c[i], &mut key);
+                        key.push('\u{1}');
+                    }
+                    seen.insert(key)
+                })
+                .collect()
+        } else {
+            (0..sc.n).collect()
+        };
+        let start = proj.skip_val(ctx).min(idx.len());
         let end = proj
             .limit_val(ctx)
-            .map(|l| (start + l).min(sc.n))
-            .unwrap_or(sc.n);
-        let mut idx: Vec<usize> = (0..sc.n).collect();
+            .map(|l| (start + l).min(idx.len()))
+            .unwrap_or(idx.len());
         // Partial sort for a LIMIT: partition the top `end` rows out in O(n), then
         // fully sort just that window — instead of an O(n log n) sort of every row
         // to keep only a small prefix. No LIMIT ⇒ a full sort (all rows returned).
