@@ -1464,7 +1464,20 @@ impl Frontier {
             .map(|s| self.vals[s].as_ref().map(|_| Vec::new()))
             .collect();
         let mut new_endpoint: Vec<u32> = Vec::new();
-        let keep_type = |t: u32| hop.etypes.is_none_or(|e| e.contains(&t));
+        // The edge-label rule, once — `hop.etypes` is `None` for ANY type and
+        // `Some(&[])` for none. Testing `a.etype` alone is only an edge's FIRST
+        // label, which silently dropped every multi-label edge whose match was on
+        // a later one.
+        // `adj_keeps` reads an EMPTY type list as "any type"; here `Some(&[])`
+        // means NONE — a name that resolved to nothing. Delegating the empty case
+        // made `[:NONEXISTENT]` match every edge, which is the fourth time that
+        // exact conflation has been written in this codebase.
+        let need_extra = graph.etypes_need_extra_lookup(hop.etypes.unwrap_or(&[]));
+        let keep_type = |a: &crate::graph::Adj| match hop.etypes {
+            None => true,
+            Some([]) => false,
+            Some(ids) => adj_keeps(graph, a, ids, need_extra),
+        };
         let drop_loop = hop.dir == Dir::Both && hop.loops == SelfLoops::Once;
 
         'rows: for i in 0..self.endpoint.len() {
@@ -1482,7 +1495,7 @@ impl Frontier {
                 .flatten()
                 .filter(|a| !(drop_loop && a.nbr == v));
 
-            for a in out.chain(inn).filter(|a| keep_type(a.etype)) {
+            for a in out.chain(inn).filter(|a| keep_type(a)) {
                 // A re-bound slot is an EQUALITY, not a new binding: the element
                 // reached must be the one the earlier hop already put there.
                 if hop.rejoin_node {

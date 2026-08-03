@@ -11236,3 +11236,55 @@ fn the_count_shortcuts_see_every_edge_label() {
         );
     }
 }
+
+/// EVERY `count(*)` shortcut must agree with the general matcher on a graph with
+/// a multi-label edge.
+///
+/// There are eight of them, each triggered by a different query shape, and each
+/// carried its own edge-type test. Checking them one at a time is how the
+/// two-hop one stayed wrong; this drives every shape and compares against the
+/// scalar driver, which never used the first-label shorthand.
+#[test]
+fn every_count_shortcut_agrees_on_multi_label_edges() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{"k":1}}"#,
+            r#"{"type":"node","id":"b","labels":["N"],"properties":{"k":2}}"#,
+            r#"{"type":"node","id":"c","labels":["M"],"properties":{"k":3}}"#,
+            r#"{"type":"node","id":"d","labels":["N"],"properties":{"k":4}}"#,
+            // Each of these has Y as a NON-first label, so any shortcut testing
+            // only `e_type` sees a different graph than the matcher does.
+            r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["X","Y"],"properties":{"w":1}}"#,
+            r#"{"type":"edge","id":"e1","from":"b","to":"c","labels":["X","Y"],"properties":{"w":2}}"#,
+            r#"{"type":"edge","id":"e2","from":"b","to":"d","labels":["Y"],"properties":{"w":3}}"#,
+            r#"{"type":"edge","id":"e3","from":"c","to":"d","labels":["Z","Y"],"properties":{"w":4}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    // One query per shortcut shape, all over the non-first label `Y`.
+    let queries = [
+        "MATCH (n:N) RETURN count(*) AS c",
+        "MATCH ()-[:Y]->() RETURN count(*) AS c",
+        "MATCH (a:N)-[:Y]->(b) RETURN count(*) AS c",
+        "MATCH (a:N)-[:Y]->(b)-[:Y]->(c) RETURN count(*) AS c",
+        "MATCH (a)-[:Y]->(b), (b)-[:Y]->(c) RETURN count(*) AS c",
+        "MATCH (a:N)-[:Y]->{1,2}(b) RETURN count(*) AS c",
+        "MATCH (a:N)-[:Y]->(b) RETURN count(DISTINCT b) AS c",
+        "MATCH (a:N) WHERE EXISTS { (a)-[:Y]->() } RETURN count(*) AS c",
+        "MATCH (a:N)-[:Y]->{1,3}(b) RETURN count(DISTINCT b) AS c",
+        "MATCH (a)-[:X|Y]->(b) RETURN count(*) AS c",
+        "MATCH (a:N)-[e:Y]->(b) WHERE e.w > 1 RETURN count(*) AS c",
+    ];
+
+    for q in queries {
+        let fast = rows(&mut g, q);
+        let general = super::eval::with_vec_override(false, || rows(&mut g, q));
+
+        assert_eq!(
+            fast, general,
+            "a count shortcut disagrees with the matcher on `{q}`"
+        );
+    }
+}
