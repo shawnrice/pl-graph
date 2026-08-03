@@ -282,7 +282,15 @@ impl ElementSeek {
     /// on a fixture where one label covers 96% of the graph. A label is only a
     /// useful seed when it is selective, which is a decision the IR can make once
     /// for both engines rather than each guessing.
-    fn label_seed(&self, graph: &Graph, live: usize) -> Option<Vec<u32>> {
+    /// Seed ids from the label buckets, or `None` if that is no narrower than the
+    /// whole universe.
+    ///
+    /// `take` bounds how many are collected. A capped scan with nothing left to
+    /// filter — `MATCH (n:Person) RETURN n.name LIMIT 100` — needs 100 ids, not
+    /// the 50,000 in the bucket; materializing the bucket first made that query
+    /// 2.7x slower than the hand-written path it replaced. `None` means collect
+    /// them all, which is required whenever a later test can still reject rows.
+    fn label_seed(&self, graph: &Graph, live: usize, take: Option<usize>) -> Option<Vec<u32>> {
         let f = self.labels.as_ref()?;
 
         if self.edge {
@@ -292,10 +300,19 @@ impl ElementSeek {
                 return None;
             }
 
-            let mut out = Vec::with_capacity(total);
+            let want = take.unwrap_or(total).min(total);
+            let mut out = Vec::with_capacity(want);
 
             for &t in &f.ids {
-                out.extend_from_slice(graph.edges_with_etype(t));
+                let room = want - out.len();
+
+                if room == 0 {
+                    break;
+                }
+
+                let src = graph.edges_with_etype(t);
+
+                out.extend_from_slice(&src[..room.min(src.len())]);
             }
 
             return Some(out);
@@ -311,18 +328,30 @@ impl ElementSeek {
             return None;
         }
 
+        let want = take.unwrap_or(total).min(total);
+
         // One label cannot produce a duplicate, so the common case skips the set.
         if let [only] = f.ids.as_slice() {
-            return Some(graph.vertices_with_label(*only).to_vec());
+            let src = graph.vertices_with_label(*only);
+
+            return Some(src[..want.min(src.len())].to_vec());
         }
 
-        let mut out = Vec::with_capacity(total);
-        let mut seen = HashSet::with_capacity(total);
+        let mut out = Vec::with_capacity(want);
+        let mut seen = HashSet::with_capacity(want);
 
         for &l in &f.ids {
+            if out.len() >= want {
+                break;
+            }
+
             // A vertex is bucketed under EVERY label it carries, so two labels
             // can name the same vertex.
             for &v in graph.vertices_with_label(l) {
+                if out.len() >= want {
+                    break;
+                }
+
                 if seen.insert(v) {
                     out.push(v);
                 }
@@ -546,7 +575,11 @@ impl ElementSeek {
         cap: Option<usize>,
         universe: impl FnOnce() -> Vec<u32>,
     ) -> Vec<u32> {
-        self.scan_with(graph, param, cap, universe, |_| true)
+        // The residual here is constant-true, so nothing after the seed can
+        // reject a row and the seed itself may stop at `cap`. That is ONLY true
+        // on this path — `scan_with`'s caller-supplied residual can reject, so it
+        // passes `None` and takes the whole bucket.
+        self.scan_inner(graph, param, cap, cap, universe, |_| true)
     }
 
     /// As [`scan_capped`](Self::scan_capped), with a RESIDUAL predicate the
@@ -567,6 +600,20 @@ impl ElementSeek {
         param: &impl Bindings,
         cap: Option<usize>,
         universe: impl FnOnce() -> Vec<u32>,
+        residual: impl FnMut(u32) -> bool,
+    ) -> Vec<u32> {
+        // `seed_take` is None: the residual can reject a candidate, so a seed cut
+        // short at `cap` could return fewer rows than exist.
+        self.scan_inner(graph, param, cap, None, universe, residual)
+    }
+
+    fn scan_inner(
+        &self,
+        graph: &Graph,
+        param: &impl Bindings,
+        cap: Option<usize>,
+        seed_cap: Option<usize>,
+        universe: impl FnOnce() -> Vec<u32>,
         mut residual: impl FnMut(u32) -> bool,
     ) -> Vec<u32> {
         let live = if self.edge {
@@ -580,10 +627,22 @@ impl ElementSeek {
         // is what the hand-written GQL bucket path did — losing it cost 50% on a
         // grouped aggregate. Under FIRST the buckets are only a superset, so the
         // check stays.
+        // Bounding the SEED is only sound when nothing after it can reject a row.
+        // The caller establishes that there is no residual (`seed_cap` is only set
+        // by `scan_capped`); the remaining conditions are local: no conjunct left
+        // to test, and a bucket that already PROVES the label rather than merely
+        // over-approximating it.
+        let seed_take = seed_cap.filter(|_| {
+            self.conj.is_empty()
+                && self
+                    .labels
+                    .as_ref()
+                    .is_some_and(|f| f.rule == LabelRule::Any)
+        });
         let mut label_checked = false;
         let mut ids = match self.resolve(graph, param) {
             Some(seeded) => seeded,
-            None => match self.label_seed(graph, live) {
+            None => match self.label_seed(graph, live, seed_take) {
                 Some(bucketed) => {
                     label_checked = self
                         .labels

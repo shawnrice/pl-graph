@@ -11072,3 +11072,43 @@ fn crossing_disconnected_patterns_agrees_with_the_scalar_driver() {
         assert_eq!(vec_on, scalar, "engines disagree on `{q}`");
     }
 }
+
+/// A capped scan may only bound its SEED when nothing after the seed can reject
+/// a row.
+///
+/// `label_seed` collects at most `cap` ids so `MATCH (n:Person) … LIMIT 100`
+/// need not materialize a 50,000-id bucket. That is only sound with no conjunct
+/// and no residual: here the matching rows are at the END of the bucket, so a
+/// seed bounded to the limit would find none of them and return zero rows.
+#[test]
+fn a_capped_scan_does_not_bound_its_seed_when_a_filter_follows() {
+    // 200 people; only the LAST five carry age 99, so any bounded seed misses them.
+    let lines: Vec<String> = (0..200)
+        .map(|i| {
+            let age = if i >= 195 { 99 } else { 30 };
+            format!(
+                r#"{{"type":"node","id":"p{i}","labels":["Person"],"properties":{{"age":{age},"nm":"n{i}"}}}}"#
+            )
+        })
+        .collect();
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    let q = "MATCH (n:Person) WHERE n.age = 99 RETURN n.nm LIMIT 3";
+    assert_eq!(
+        rows(&mut g, q).len(),
+        3,
+        "a bounded seed lost the matching rows"
+    );
+
+    // Same with an inline property rather than a clause WHERE.
+    let inline = "MATCH (n:Person {age: 99}) RETURN n.nm LIMIT 3";
+    assert_eq!(
+        rows(&mut g, inline).len(),
+        3,
+        "a bounded seed lost the matching rows"
+    );
+
+    // And the shape the bound EXISTS for: no filter, so bounding is sound.
+    let plain = "MATCH (n:Person) RETURN n.nm LIMIT 3";
+    assert_eq!(rows(&mut g, plain).len(), 3);
+}

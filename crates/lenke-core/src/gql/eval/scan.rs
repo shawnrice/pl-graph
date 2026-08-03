@@ -2125,7 +2125,12 @@ fn cross_frames(a: &ScanCols, b: &ScanCols, budget: u64) -> Option<ScanCols> {
 /// `MATCH (a)-[]->(b), (c)-[]->(d)`. That is not a join to be spliced; it is a
 /// different operation, and `cross_frames` performs it.
 fn fuse_groups(patterns: &[CPath]) -> Option<Vec<CPath>> {
-    if patterns.is_empty() || !fusion_enabled() {
+    // One pattern has nothing to group, and returning `None` lets the caller
+    // BORROW it. Building a one-element Vec here clones the whole `CPath` —
+    // labels, props, `WHERE` trees — on every execution. Invisible on a 500us
+    // join; 2.7x on `RETURN n.name LIMIT 100`, where the query is 1.6us and a
+    // couple of allocations are the whole cost.
+    if patterns.len() < 2 || !fusion_enabled() {
         return None;
     }
 
@@ -2325,7 +2330,19 @@ pub(super) fn vectorized_frame(
     // `None` the moment any of them hides an opaque `Op::Tree` (a subquery or
     // aggregate the flattener kept as an expression), because this is only used
     // to SKIP building a column and a missed slot would read back as null.
+    // Only a parenthesized quantified unit produces group columns, and `needed`
+    // exists solely to skip building the ones nothing reads. Computing it
+    // otherwise is pure overhead — it COMPILES the sort keys and clause WHERE on
+    // every execution, which measured 2.7x on `RETURN n.name LIMIT 100` (1.6us,
+    // where a few allocations are the whole query).
     let needed: Option<Vec<usize>> = (|| {
+        if !patterns
+            .iter()
+            .any(|p| p.segments.iter().any(|s| s.unit.is_some()))
+        {
+            return None;
+        }
+
         let mut out = Vec::new();
 
         for it in proj.items.iter().chain(&proj.group_by) {
