@@ -36,13 +36,14 @@ pub fn peer_pressure(graph: &Graph, cfg: &AlgoConfig) -> Vec<(u32, Value)> {
             .map(|v| (v, Value::Str(graph.vid.arc(v))))
             .collect();
     };
-    let type_ok = |ty: u32| etype.is_none_or(|t| ty == t);
+    // ANY of the edge's labels — see `algo::edge_type_ok`.
+    let type_ok = |ei: usize| etype.is_none_or(|t| graph.edge_has_label(ei as u32, t));
 
     // Out-degree → each vertex's per-vote strength; in-degree → sizes the in-CSR.
     let mut out_degree = vec![0u32; slots];
     let mut in_degree = vec![0usize; slots];
     for ei in 0..graph.edge_slots() {
-        if graph.is_edge_live(ei as u32) && type_ok(graph.e_type[ei]) {
+        if graph.is_edge_live(ei as u32) && type_ok(ei) {
             out_degree[graph.e_src[ei] as usize] += 1;
             in_degree[graph.e_dst[ei] as usize] += 1;
         }
@@ -61,7 +62,7 @@ pub fn peer_pressure(graph: &Graph, cfg: &AlgoConfig) -> Vec<(u32, Value)> {
     let mut in_src = vec![0u32; in_off[slots]];
     let mut cursor = in_off[..slots].to_vec();
     for ei in 0..graph.edge_slots() {
-        if graph.is_edge_live(ei as u32) && type_ok(graph.e_type[ei]) {
+        if graph.is_edge_live(ei as u32) && type_ok(ei) {
             let dst = graph.e_dst[ei] as usize;
             in_src[cursor[dst]] = graph.e_src[ei];
             cursor[dst] += 1;

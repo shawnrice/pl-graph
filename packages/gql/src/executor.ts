@@ -2761,16 +2761,52 @@ export const relTypeNames = (label: LabelExpr | undefined): string[] | null | un
   return null;
 };
 
-/** The per-type `Set<Edge>` buckets for `types` (undefined = every type). */
-export const bucketsFor = (
+/**
+ * Every edge of `types` (undefined = every type) from a `Map<type, Set<Edge>>`
+ * index, each yielded ONCE.
+ *
+ * An edge carries a SET of types and the index buckets it under every one, so
+ * concatenating buckets sees a two-type edge twice — as a doubled count, a
+ * doubled neighbour, a doubled row. Native walks a single adjacency list and
+ * asks "does this edge carry any of these types", which is what this mirrors.
+ * Only one bucket can be in play → no dedupe, no allocation, which is the hot
+ * single-type case.
+ */
+export const edgesOfTypes = function* (
   byType: Map<string, Set<Edge>> | undefined,
   types: string[] | undefined,
-): (Set<Edge> | undefined)[] => {
+): Iterable<Edge> {
   if (!byType) {
-    return [];
+    return;
   }
 
-  return types ? types.map((t) => byType.get(t)) : [...byType.values()];
+  if (types !== undefined) {
+    if (types.length === 1) {
+      yield* byType.get(types[0]) ?? [];
+
+      return;
+    }
+  } else if (byType.size === 1) {
+    for (const set of byType.values()) {
+      yield* set;
+    }
+
+    return;
+  }
+
+  const seen = new Set<Edge>();
+
+  for (const set of types ? types.map((t) => byType.get(t)) : byType.values()) {
+    for (const e of set ?? []) {
+      if (seen.has(e)) {
+        continue;
+      }
+
+      seen.add(e);
+
+      yield e;
+    }
+  }
 };
 
 /** One-hop neighbours of `v` along `out` (or in) edges of the given `types` (all
@@ -2785,33 +2821,20 @@ export const outNeighbors = (
   const byType = (out ? graph.edgesFromByLabel : graph.edgesToByLabel).get(v.id);
   const acc: Vertex[] = [];
 
-  for (const set of bucketsFor(byType, types)) {
-    if (set) {
-      for (const e of set) {
-        acc.push(out ? e.to : e.from);
-      }
-    }
+  for (const e of edgesOfTypes(byType, types)) {
+    acc.push(out ? e.to : e.from);
   }
 
   return acc;
 };
 
-/** Count edges across `buckets` that pass `keep`. */
-export const countEdges = (
-  buckets: (Set<Edge> | undefined)[],
-  keep: (e: Edge) => boolean,
-): number => {
+/** Count the `edges` that pass `keep`. */
+export const countEdges = (edges: Iterable<Edge>, keep: (e: Edge) => boolean): number => {
   let n = 0;
 
-  for (const set of buckets) {
-    if (!set) {
-      continue;
-    }
-
-    for (const e of set) {
-      if (keep(e)) {
-        n += 1;
-      }
+  for (const e of edges) {
+    if (keep(e)) {
+      n += 1;
     }
   }
 

@@ -101,7 +101,7 @@ pub fn shortest_path(graph: &Graph, cfg: &AlgoConfig) -> Vec<(u32, Value)> {
     // A named-but-unknown edge type → only the source is reachable (no edges).
     let etype = cfg.etype(graph);
     let passes = |a: &Adj| match etype {
-        Some(Some(t)) => a.etype == t,
+        Some(Some(t)) => super::adj_type_ok(graph, Some(t), a),
         Some(None) => true,
         None => false,
     };

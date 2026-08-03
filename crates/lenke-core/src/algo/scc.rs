@@ -19,8 +19,9 @@ fn scc_reps(graph: &Graph, cfg: &AlgoConfig) -> Vec<u32> {
     // Some(None) = every type; Some(Some(t)) = one type; None = a named-but-unknown
     // type → no edges → every vertex is its own singleton component.
     let etype = cfg.etype(graph);
-    let type_ok = |ty: u32| match etype {
-        Some(Some(t)) => ty == t,
+    // ANY of the edge's labels — see `algo::edge_type_ok`.
+    let type_ok = |ei: usize| match etype {
+        Some(Some(t)) => graph.edge_has_label(ei as u32, t),
         Some(None) => true,
         None => false,
     };
@@ -29,7 +30,7 @@ fn scc_reps(graph: &Graph, cfg: &AlgoConfig) -> Vec<u32> {
     // built by two edge sweeps in insertion order — the same shape PageRank uses.
     let mut adj_off = vec![0usize; slots + 1];
     for ei in 0..graph.edge_slots() {
-        if graph.is_edge_live(ei as u32) && type_ok(graph.e_type[ei]) {
+        if graph.is_edge_live(ei as u32) && type_ok(ei) {
             adj_off[graph.e_src[ei] as usize + 1] += 1;
         }
     }
@@ -39,7 +40,7 @@ fn scc_reps(graph: &Graph, cfg: &AlgoConfig) -> Vec<u32> {
     let mut adj_tgt = vec![0u32; adj_off[slots]];
     let mut cursor = adj_off[..slots].to_vec();
     for ei in 0..graph.edge_slots() {
-        if graph.is_edge_live(ei as u32) && type_ok(graph.e_type[ei]) {
+        if graph.is_edge_live(ei as u32) && type_ok(ei) {
             let src = graph.e_src[ei] as usize;
             adj_tgt[cursor[src]] = graph.e_dst[ei];
             cursor[src] += 1;
@@ -145,17 +146,15 @@ pub fn on_cycle(graph: &Graph, cfg: &AlgoConfig) -> Vec<(u32, Value)> {
 
     // Self-loops (v→v of the selected type) put a singleton on a 1-cycle too.
     let etype = cfg.etype(graph);
-    let type_ok = |ty: u32| match etype {
-        Some(Some(t)) => ty == t,
+    // ANY of the edge's labels — see `algo::edge_type_ok`.
+    let type_ok = |ei: usize| match etype {
+        Some(Some(t)) => graph.edge_has_label(ei as u32, t),
         Some(None) => true,
         None => false,
     };
     let mut self_loop = vec![false; slots];
     for ei in 0..graph.edge_slots() {
-        if graph.is_edge_live(ei as u32)
-            && type_ok(graph.e_type[ei])
-            && graph.e_src[ei] == graph.e_dst[ei]
-        {
+        if graph.is_edge_live(ei as u32) && type_ok(ei) && graph.e_src[ei] == graph.e_dst[ei] {
             self_loop[graph.e_src[ei] as usize] = true;
         }
     }

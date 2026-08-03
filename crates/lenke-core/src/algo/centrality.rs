@@ -42,8 +42,11 @@ fn build_csr(graph: &Graph, cfg: &AlgoConfig) -> OutCsr {
     // Some(None) = every type; Some(Some(t)) = one type; None = named-but-unknown
     // type → no edges match (the graph is treated as edgeless).
     let etype = cfg.etype(graph);
-    let type_ok = |ty: u32| match etype {
-        Some(Some(t)) => ty == t,
+    // ANY of the edge's labels — `e_type` alone is only its FIRST, which made
+    // every algorithm here see an edgeless graph when the filtered label was
+    // stored second.
+    let type_ok = |ei: usize| match etype {
+        Some(Some(t)) => graph.edge_has_label(ei as u32, t),
         Some(None) => true,
         None => false,
     };
@@ -55,7 +58,7 @@ fn build_csr(graph: &Graph, cfg: &AlgoConfig) -> OutCsr {
 
     let mut off = vec![0usize; slots + 1];
     for ei in 0..graph.edge_slots() {
-        if graph.is_edge_live(ei as u32) && type_ok(graph.e_type[ei]) {
+        if graph.is_edge_live(ei as u32) && type_ok(ei) {
             off[graph.e_src[ei] as usize + 1] += 1;
         }
     }
@@ -66,7 +69,7 @@ fn build_csr(graph: &Graph, cfg: &AlgoConfig) -> OutCsr {
     let mut w = vec![0f64; off[slots]];
     let mut cursor = off[..slots].to_vec();
     for ei in 0..graph.edge_slots() {
-        if !graph.is_edge_live(ei as u32) || !type_ok(graph.e_type[ei]) {
+        if !graph.is_edge_live(ei as u32) || !type_ok(ei) {
             continue;
         }
         let src = graph.e_src[ei] as usize;

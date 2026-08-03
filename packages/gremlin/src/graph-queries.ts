@@ -49,15 +49,32 @@ const iterByLabel = function* (
   yield* iterAllDeduped(byLabel);
 };
 
+// Named labels are a disjunction over ONE edge, not a bucket-per-name concat:
+// an edge carrying both `R` and `S` is in both buckets, so `outE('R','S')` has
+// to dedupe or it emits that edge twice. Native walks a single adjacency list
+// and asks "does this edge carry any of these types", which yields it once.
+// A single name can't collide with itself, so the common case stays allocation-free.
 const iterLabeled = function* (
   byLabel: Map<string, Set<Edge>>,
   labels: readonly string[],
 ): Iterable<Edge> {
-  for (const label of labels) {
-    const set = byLabel.get(label);
+  if (labels.length === 1) {
+    yield* byLabel.get(labels[0]) ?? [];
 
-    if (set) {
-      yield* set;
+    return;
+  }
+
+  const seen = new Set<Edge>();
+
+  for (const label of labels) {
+    for (const e of byLabel.get(label) ?? []) {
+      if (seen.has(e)) {
+        continue;
+      }
+
+      seen.add(e);
+
+      yield e;
     }
   }
 };

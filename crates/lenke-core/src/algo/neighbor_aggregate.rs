@@ -165,9 +165,10 @@ pub fn neighbor_aggregate(graph: &Graph, cfg: &AlgoConfig) -> Result<Vec<(u32, V
     }
     let d = dim.unwrap_or(0);
 
-    let etype_ok = |t: u32| match etype {
-        Some(None) => true,
-        Some(Some(id)) => t == id,
+    // ANY of the edge's labels. The adjacency entry carries the FIRST, so the
+    // common case is still one compare.
+    let etype_ok = |a: &crate::graph::Adj| match etype {
+        Some(inner) => crate::algo::adj_type_ok(graph, inner, a),
         None => false,
     };
 
@@ -178,7 +179,7 @@ pub fn neighbor_aggregate(graph: &Graph, cfg: &AlgoConfig) -> Result<Vec<(u32, V
         let mut contrib: Vec<(u32, u32)> = Vec::new();
         if want_out {
             for a in graph.out_adj(v) {
-                if etype_ok(a.etype) {
+                if etype_ok(&a) {
                     contrib.push((a.eidx, a.nbr));
                 }
             }
@@ -188,7 +189,7 @@ pub fn neighbor_aggregate(graph: &Graph, cfg: &AlgoConfig) -> Result<Vec<(u32, V
                 if want_out && a.nbr == v {
                     continue;
                 }
-                if etype_ok(a.etype) {
+                if etype_ok(&a) {
                     contrib.push((a.eidx, a.nbr));
                 }
             }

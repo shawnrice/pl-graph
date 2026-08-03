@@ -1359,7 +1359,20 @@ fn val_to_value(graph: &Graph, v: &Val) -> Value {
                 (k.to.clone(), Value::Str(graph.vid.arc(graph.e_dst[idx]))),
                 (
                     k.labels.clone(),
-                    Value::List(vec![Value::Str(graph.etype.arc(graph.e_type[idx]))]),
+                    // EVERY type the edge carries, sorted — the same shape as the
+                    // node arm above. Emitting only `e_type` (the first) silently
+                    // dropped the rest crossing the result boundary, so a
+                    // multi-type edge read back as single-type in both engines'
+                    // JSON while the TS mirror rendered all of them.
+                    Value::List({
+                        let mut labels: Vec<Arc<str>> = graph
+                            .edge_labels(*i)
+                            .into_iter()
+                            .map(|t| graph.etype.arc(t))
+                            .collect();
+                        labels.sort_unstable();
+                        labels.into_iter().map(Value::Str).collect()
+                    }),
                 ),
                 (
                     k.properties.clone(),

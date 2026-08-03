@@ -47,7 +47,7 @@ pub fn connected_components(graph: &Graph, cfg: &AlgoConfig) -> Vec<(u32, Value)
         // One flat sweep over the edge columns (contiguous) unions each edge's
         // endpoints — union-by-min is order-independent, so the forest is identical.
         for ei in 0..graph.edge_slots() {
-            if graph.is_edge_live(ei as u32) && etype.is_none_or(|t| graph.e_type[ei] == t) {
+            if graph.is_edge_live(ei as u32) && super::edge_type_ok(graph, etype, ei as u32) {
                 union(&mut parent, graph.e_src[ei], graph.e_dst[ei]);
             }
         }

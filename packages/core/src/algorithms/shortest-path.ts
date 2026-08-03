@@ -3,6 +3,7 @@ import { ErrorCode, LenkeError } from '@lenke/errors';
 import type { Edge } from '../core/Edge.js';
 import type { Graph } from '../core/Graph.js';
 import type { Vertex } from '../core/Vertex.js';
+import { incidentEdges } from './adjacency.js';
 import { type AlgorithmGen, defineAlgorithm, materializeVertices, YIELD_EVERY } from './async.js';
 import type { AlgorithmConfig, AlgorithmRow } from './types.js';
 
@@ -67,24 +68,7 @@ const heapPop = (heap: HeapItem[]): HeapItem => {
  * Yield each out-edge from a vertex's `edgesFromByLabel` entry, optionally
  * restricted to one edge type. The caller reads `edge.to` for the neighbour.
  */
-const outEdges = function* (
-  byLabel: Map<string, Set<Edge>> | undefined,
-  edgeLabel: string | undefined,
-): Iterable<Edge> {
-  if (byLabel === undefined) {
-    return;
-  }
-
-  const sets = edgeLabel === undefined ? byLabel.values() : [byLabel.get(edgeLabel)];
-
-  for (const set of sets) {
-    if (set === undefined) {
-      continue;
-    }
-
-    yield* set;
-  }
-};
+const outEdges = incidentEdges;
 
 /** Which incident edges to follow, from `config.direction` (default `out`, mirroring
  *  `degree`); `both` treats the graph as undirected. */

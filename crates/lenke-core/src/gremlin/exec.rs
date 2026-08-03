@@ -358,20 +358,20 @@ fn lower_prefix(graph: &Graph, steps: &[Step]) -> Option<(ElementSeek, Vec<usize
                 }
             }
             Step::HasLabel(labels) if seek.labels().is_none() => {
-                let ids: Vec<u32> = if is_edge {
-                    labels.iter().filter_map(|l| graph.etype.get(l)).collect()
-                } else {
-                    labels.iter().filter_map(|l| graph.labels.get(l)).collect()
-                };
-
-                if ids.len() == labels.len() {
-                    seek.set_labels(ids);
-                    captured.push(i);
-                } else if !labels.is_empty() {
-                    // A name that resolved to nothing matches nothing; say so in
-                    // the IR rather than letting the step scan for it.
-                    seek.set_labels(Vec::new());
-                    captured.push(i);
+                match resolve_element_labels(graph, labels, is_edge) {
+                    // Every name unknown → matches nothing; say so in the IR
+                    // rather than letting the step scan for it.
+                    None => {
+                        seek.set_labels(Vec::new());
+                        captured.push(i);
+                    }
+                    // An empty input means "any label", which is no filter at
+                    // all — leave the seek alone rather than pin it to nothing.
+                    Some(ids) if ids.is_empty() => {}
+                    Some(ids) => {
+                        seek.set_labels(ids);
+                        captured.push(i);
+                    }
                 }
             }
             Step::HasLabel(..) | Step::HasNot(..) => {}
@@ -555,12 +555,10 @@ fn lower_hops<'a>(graph: &Graph, mut rest: &'a [Step]) -> (Vec<Hop>, &'a [Step])
             [Step::InE(l), Step::OutV, t @ ..] => (crate::seek::Dir::In, l, t),
             _ => break,
         };
-        let etypes: Vec<u32> = labels.iter().filter_map(|l| graph.etype.get(l)).collect();
-
-        // A type name that resolved to nothing matches nothing; an EMPTY list
-        // means "any type", so the two must not be confused. `None` carries the
-        // former so the caller can stop rather than expand everything.
-        hops.push((dir, (etypes.len() == labels.len()).then_some(etypes)));
+        // `None` = every name was unknown, so this hop matches nothing; an EMPTY
+        // list means "any type". The two must not be confused, and a name that
+        // resolved to nothing among names that did just drops out.
+        hops.push((dir, resolve_etypes(graph, labels)));
         rest = tail;
     }
 
@@ -637,11 +635,9 @@ fn lowered_ids<'a>(graph: &Graph, steps: &'a [Step]) -> Option<(Vec<u32>, &'a [S
             [Step::BothE(l), t @ ..] => (crate::seek::Dir::Both, l, t),
             _ => return Some((ids, rest, edges)),
         };
-        let etypes: Vec<u32> = labels.iter().filter_map(|l| graph.etype.get(l)).collect();
-
-        if etypes.len() != labels.len() {
-            return Some((Vec::new(), tail, true));
-        }
+        let Some(etypes) = resolve_etypes(graph, labels) else {
+            return Some((Vec::new(), tail, true)); // every name unknown
+        };
 
         return Some((
             crate::seek::expand_edges(graph, &ids, dir, &etypes, crate::seek::SelfLoops::Twice),
@@ -1033,18 +1029,6 @@ fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
 
     let hops = resolved;
 
-    // An optional plain `dedup()` before the count. Only the argument-free form:
-    // `dedup('a')` keys on tags and `dedup().by(..)` on a sub-traversal, neither
-    // of which is an element identity.
-    let mut distinct = false;
-
-    if let [Step::Dedupe { labels, bys }, tail @ ..] = rest {
-        if labels.is_empty() && bys.is_empty() {
-            distinct = true;
-            rest = tail;
-        }
-    }
-
     // A trailing edge step lands on the EDGE rather than its far end, so
     // `outE(R).count()` counts edges. It has to come before the count check
     // because it consumes a step.
@@ -1057,13 +1041,30 @@ fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
                 Step::InE(_) => crate::seek::Dir::In,
                 _ => crate::seek::Dir::Both,
             };
-            let etypes: Vec<u32> = l.iter().filter_map(|n| graph.etype.get(n)).collect();
-
-            if etypes.len() != l.len() {
-                return Some(0.0);
-            }
+            let Some(etypes) = resolve_etypes(graph, l) else {
+                return Some(0.0); // every name unknown
+            };
 
             edge_tail = Some((dir, etypes));
+            rest = tail;
+        }
+    }
+
+    // An optional plain `dedup()` on what is being counted. Only the
+    // argument-free form: `dedup('a')` keys on tags and `dedup().by(..)` on a
+    // sub-traversal, neither of which is an element identity.
+    //
+    // This has to come AFTER the edge step, not before it. `bothE(T).dedup()`
+    // deduplicates the EDGES; `dedup().bothE(T)` deduplicates the vertices and
+    // then counts every incident edge from both ends, which is twice as many.
+    // Peeling the dedup first read the second as the first and halved the count.
+    // Leaving it in `rest` here means such a query simply fails the shape check
+    // below and falls back to the stream, which is the safe direction.
+    let mut distinct = false;
+
+    if let [Step::Dedupe { labels, bys }, tail @ ..] = rest {
+        if labels.is_empty() && bys.is_empty() {
+            distinct = true;
             rest = tail;
         }
     }
@@ -1153,15 +1154,11 @@ fn index_seed(graph: &Graph, steps: &[Step]) -> Option<(Vec<Trav>, Vec<usize>)> 
             // second one intersects, which the flat id list cannot express, so it
             // stays a step.
             Step::HasLabel(labels) if seek.labels().is_none() => {
-                let ids: Vec<u32> = if is_edge {
-                    labels.iter().filter_map(|l| graph.etype.get(l)).collect()
-                } else {
-                    labels.iter().filter_map(|l| graph.labels.get(l)).collect()
-                };
+                // `None` = every name unknown, which the empty id list says.
+                // A partially-resolving disjunction keeps the names that did.
+                let ids = resolve_element_labels(graph, labels, is_edge).unwrap_or_default();
 
-                // A name that resolved to nothing matches nothing, which the
-                // empty list already says — but only if EVERY name was unknown.
-                if ids.len() == labels.len() {
+                if !labels.is_empty() {
                     seek.set_labels(ids);
                     captured.push(i);
                 }
@@ -3952,13 +3949,37 @@ fn seek_dir(out: bool, inn: bool) -> crate::seek::Dir {
 /// distinct from no labels at all matching everything. Conflating those two made
 /// `[:NONEXISTENT]` match every edge, three times, in three places.
 fn resolve_etypes(graph: &Graph, labels: &[String]) -> Option<Vec<u32>> {
+    resolve_names(labels, |l| graph.etype.get(l))
+}
+
+/// Resolve a step's label names to ids under GREMLIN's disjunction rule, which
+/// every caller must use so the same query cannot mean two things.
+///
+/// Naming several labels is an OR over ONE element, so a name that resolves to
+/// nothing simply contributes nothing — `outE('R','NOPE')` is `outE('R')`, not
+/// "matches nothing". `None` is reserved for the case where EVERY name was
+/// unknown, and an EMPTY input list means "any", which `Some(vec![])` carries.
+/// Three call sites each required all names to resolve and so returned zero rows
+/// for `('R','NOPE')`, which no correctness test caught because the answer was
+/// merely empty rather than wrong-looking.
+fn resolve_names(labels: &[String], lookup: impl Fn(&str) -> Option<u32>) -> Option<Vec<u32>> {
     if labels.is_empty() {
-        return Some(Vec::new()); // no filter: any type
+        return Some(Vec::new()); // no filter: any
     }
 
-    let ids: Vec<u32> = labels.iter().filter_map(|l| graph.etype.get(l)).collect();
+    let ids: Vec<u32> = labels.iter().filter_map(|l| lookup(l)).collect();
 
     (!ids.is_empty()).then_some(ids)
+}
+
+/// `resolve_names` against vertex labels or edge types, for the steps that take
+/// either depending on what the traverser holds.
+fn resolve_element_labels(graph: &Graph, labels: &[String], is_edge: bool) -> Option<Vec<u32>> {
+    if is_edge {
+        resolve_names(labels, |l| graph.etype.get(l))
+    } else {
+        resolve_names(labels, |l| graph.labels.get(l))
+    }
 }
 
 fn dir_flags(step: &Step) -> (bool, bool) {

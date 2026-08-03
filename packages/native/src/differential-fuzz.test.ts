@@ -45,7 +45,13 @@ const NDJSON = [
   // noticing.
   '{"type":"node","id":"3","labels":["T","U"],"properties":{"n":5,"s":"m","x":2,"m":{"k":3,"j":"s"}}}',
   '{"type":"edge","id":"e1","labels":["E"],"from":"1","to":"2","properties":{"w":2}}',
-  '{"type":"edge","id":"e2","labels":["E"],"from":"2","to":"3","properties":{"w":5}}',
+  // ...and edge e2 carries TWO types, for the same reason on the edge side. The
+  // label indexes bucket an edge under every type it carries, so anything that
+  // sums or concatenates buckets — a `[:E|F]` count shortcut, a per-name
+  // adjacency walk — sees this edge twice while native sees it once. With every
+  // edge single-typed the two are indistinguishable, which is how the TS count
+  // shortcut double-counted for a long time with every fuzzer green.
+  '{"type":"edge","id":"e2","labels":["E","F"],"from":"2","to":"3","properties":{"w":5}}',
 ].join('\n');
 
 // --- seeded PRNG (mulberry32) -----------------------------------------------
@@ -390,6 +396,21 @@ const genQuery = (r: () => number): string => {
 
   if (p < 0.68) {
     return `MATCH (a:T)-[e:E]->(b:T) RETURN ${genExpr(r, 2)} AS x`;
+  }
+
+  if (p < 0.69) {
+    // A type disjunction over a graph holding a two-type edge: `E`, `F` and
+    // `E|F` all select edge e2, and it is ONE edge in every spelling. Routed
+    // through both the count shortcuts and plain enumeration.
+    const t = pick(r, ['E', 'F', 'E|F', 'F|E', 'E|ABSENT']);
+    const shape = pick(r, [
+      `MATCH ()-[:${t}]->() RETURN count(*) AS x`,
+      `MATCH (a:T)-[:${t}]->(b:T) RETURN count(*) AS x`,
+      `MATCH (a)-[:${t}]->(b)-[:${t}]->(c) RETURN count(*) AS x`,
+      `MATCH (a)-[e:${t}]->(b) RETURN e.w AS x ORDER BY x`,
+    ]);
+
+    return shape;
   }
 
   if (p < 0.72) {

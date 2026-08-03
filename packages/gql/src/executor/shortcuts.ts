@@ -30,7 +30,7 @@ import type {
   Row,
 } from '../executor.js';
 import {
-  bucketsFor,
+  edgesOfTypes,
   columnName,
   compileExpr,
   countEdges,
@@ -75,14 +75,24 @@ const buildOneHopCount = (
   const out = rel.direction === 'out';
 
   return (graph) => {
-    if (aLabel === undefined && bLabel === undefined && types) {
-      // Unlabeled endpoints → the bucket sizes. O(1) per type.
+    // Unlabeled endpoints → the bucket sizes. O(1) per type.
+    //
+    // Summing across types is only sound when no edge is in two of the buckets,
+    // which `multiTypeEdgeCount` rules out for the whole graph; one type can
+    // never collide with itself. Otherwise fall through to the deduping walk —
+    // a two-type edge is still ONE edge.
+    if (
+      aLabel === undefined &&
+      bLabel === undefined &&
+      types &&
+      (types.length === 1 || graph.multiTypeEdgeCount === 0)
+    ) {
       return rowOf(types.reduce((n, t) => n + (graph.edgesByLabel.get(t)?.size ?? 0), 0));
     }
 
     return rowOf(
       countEdges(
-        bucketsFor(graph.edgesByLabel, types),
+        edgesOfTypes(graph.edgesByLabel, types),
         (edge) =>
           matchesLabel(out ? edge.from : edge.to, aLabel) &&
           matchesLabel(out ? edge.to : edge.from, bLabel),
@@ -103,7 +113,7 @@ const side = (
 ): number => {
   const byType = (out ? graph.edgesFromByLabel : graph.edgesToByLabel).get(bId);
 
-  return countEdges(bucketsFor(byType, types), (edge) =>
+  return countEdges(edgesOfTypes(byType, types), (edge) =>
     matchesLabel(out ? edge.to : edge.from, far),
   );
 };

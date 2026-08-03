@@ -142,6 +142,12 @@ const MODERN = [
   '{"type":"edge","id":"10","from":"4","to":"5","labels":["CREATED"],"properties":{"weight":1.0}}',
   '{"type":"edge","id":"11","from":"4","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}',
   '{"type":"edge","id":"12","from":"6","to":"3","labels":["CREATED"],"properties":{"weight":0.2}}',
+  // TWO types, for the same reason as vertex 13. The label indexes bucket an
+  // edge under every type it carries, so `outE('KNOWS','CREATED')` walks one
+  // bucket per name and would emit this edge twice, while native makes one
+  // adjacency pass and emits it once. With every edge single-typed the two are
+  // indistinguishable.
+  '{"type":"edge","id":"14","from":"6","to":"1","labels":["KNOWS","CREATED"],"properties":{"weight":0.7}}',
 ].join('\n');
 
 const mulberry32 = (seed: number): (() => number) => {
@@ -166,29 +172,68 @@ const VALUES: unknown[] = ['marko', 'lop', 'java', 29, 0.4, 0, -1, '', 'nope'];
 const LABELS = ['PERSON', 'SOFTWARE', 'KNOWS', 'CREATED', 'NOPE'];
 const preds = [eq, gt, gte, lt, lte];
 
+// The edge types an adjacency step names. Naming several is a disjunction over
+// ONE edge, so edge 14 (KNOWS *and* CREATED) must still be walked once — the
+// case a single name can never expose.
+// An adjacency step naming two types that BOTH exist. `NOPE` resolves to
+// nothing, so `('KNOWS','NOPE')` selects exactly what `('KNOWS')` does, in the
+// same order — only a pair of real names makes the order unspecified.
+const MULTI_TYPE_STEP = /\b(?:out|in|both)E?\((?:'KNOWS',\s*'CREATED'|'CREATED',\s*'KNOWS')\)/;
+
+/**
+ * Sort a result list when its order is unspecified; otherwise leave it.
+ *
+ * Recursive, because `fold()` puts the whole result INSIDE a one-element list
+ * and the unspecified order is in there. Skipped entirely when the plan orders
+ * explicitly — `order()` fixes the order, and sorting would hide a real bug in
+ * it.
+ */
+const deepSort = (v: unknown): unknown => {
+  if (Array.isArray(v)) {
+    return [...v].map(deepSort).sort((a, b) => (JSON.stringify(a) < JSON.stringify(b) ? -1 : 1));
+  }
+
+  return v;
+};
+
+const canonOrder = (rows: unknown, unordered: boolean): unknown =>
+  unordered ? deepSort(rows) : rows;
+
+/**
+ * A step that takes a POSITIONAL slice of the stream. Over an unspecified order
+ * the two engines can slice different elements — `range(0,2)` of seven edges is
+ * two edges either way, but not the SAME two — so for those plans only the
+ * shape (how many rows, of what kind) is a contract, not the contents. Sorting
+ * cannot recover it: the slice already happened.
+ */
+const SLICING_STEP = /\.(?:limit|skip|range|tail)\(/;
+
+const etypes = (r: () => number): string[] =>
+  pick(r, [['KNOWS'], ['CREATED'], ['KNOWS', 'CREATED'], ['CREATED', 'KNOWS'], ['KNOWS', 'NOPE']]);
+
 // Steps that move the traverser, filter it, or reshape it — everything that can
 // cross the Groovy text boundary (no JS closures, no non-finite literals).
 const step = (r: () => number): unknown => {
   const p = r();
 
   if (p < 0.13) {
-    return out(pick(r, ['KNOWS', 'CREATED']));
+    return out(...etypes(r));
   }
 
   if (p < 0.22) {
-    return outE(pick(r, ['KNOWS', 'CREATED']));
+    return outE(...etypes(r));
   }
 
   if (p < 0.28) {
-    return inE(pick(r, ['KNOWS', 'CREATED']));
+    return inE(...etypes(r));
   }
 
   if (p < 0.33) {
-    return both(pick(r, ['KNOWS', 'CREATED']));
+    return both(...etypes(r));
   }
 
   if (p < 0.37) {
-    return bothE(pick(r, ['KNOWS', 'CREATED']));
+    return bothE(...etypes(r));
   }
 
   if (p < 0.41) {
@@ -313,6 +358,13 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
     labels: ['PERSON', 'SOFTWARE'],
     properties: { name: 'hybrid', age: 40, lang: 'rust' },
   });
+  tsGraph.addEdge({
+    id: '14',
+    from: tsGraph.getVertexById('6')!,
+    to: tsGraph.getVertexById('1')!,
+    labels: ['KNOWS', 'CREATED'],
+    properties: { weight: 0.7 },
+  });
   const SEED =
     process.env.FUZZ_SEED === undefined
       ? Math.floor(Math.random() * 0x1_0000_0000)
@@ -321,6 +373,7 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
 
   test(`${ITERATIONS} random traversals agree across the engines`, () => {
     const divergences: string[] = [];
+    let skippedUnordered = 0;
 
     for (let i = 0; i < ITERATIONS && divergences.length < 5; i++) {
       const r = mulberry32(SEED + i);
@@ -341,14 +394,39 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
           return `ERR ${(e as { code?: string }).code ?? 'throw'}`;
         }
       };
-      const ts = outcome(() => toArray(plan, tsGraph).map(canonJson));
-      const native = outcome(() => nativeRun(text));
+      // Naming two REAL edge types makes the per-vertex adjacency order
+      // unspecified: the TS engine walks a bucket per name, native makes one
+      // adjacency pass in insertion order, and neither is the contract (see the
+      // engines' "order is unspecified" rule — like SQL without ORDER BY). What
+      // IS the contract is WHICH elements come back and HOW MANY, so compare
+      // those shapes as a multiset. A duplicated multi-type edge still shows up.
+      const unordered = MULTI_TYPE_STEP.test(text) && !text.includes('.order(');
+
+      // A positional slice of an unspecified order picks an unspecified SUBSET,
+      // and every step after it inherits that — not just the order but which
+      // elements, and so the row count too. Nothing survives as a contract, so
+      // these are skipped rather than compared. Counted, not silent.
+      if (unordered && SLICING_STEP.test(text)) {
+        skippedUnordered += 1;
+
+        continue;
+      }
+
+      const ts = outcome(() => canonOrder(toArray(plan, tsGraph).map(canonJson), unordered));
+      const native = outcome(() => canonOrder(nativeRun(text), unordered));
 
       // Both failing is acceptable — each rejects the query. A divergence is one
       // side succeeding, or both succeeding with different results.
       if (ts !== native && !(ts.startsWith('ERR') && native.startsWith('ERR'))) {
         divergences.push(`[seed ${SEED + i}] ${text}\n    ts:     ${ts}\n    native: ${native}`);
       }
+    }
+
+    if (skippedUnordered > 0) {
+      console.log(
+        `  ${skippedUnordered}/${ITERATIONS} plans skipped: a positional slice over an ` +
+          'unspecified order has no comparable result',
+      );
     }
 
     const report = divergences.length

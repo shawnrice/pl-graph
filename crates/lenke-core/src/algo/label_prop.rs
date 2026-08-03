@@ -81,7 +81,7 @@ fn round(graph: &Graph, labels: &[u32], etype: Option<u32>, is_seed: &[bool]) ->
         counts.clear();
         for a in graph.out_adj(v).chain(graph.in_adj(v)) {
             let ok = match etype {
-                Some(t) => a.etype == t,
+                Some(t) => super::adj_type_ok(graph, Some(t), &a),
                 None => true,
             };
             if ok {

@@ -39,8 +39,9 @@ fn build_pull_graph(graph: &Graph, cfg: &AlgoConfig) -> PullGraph {
     // Some(None) = every type; Some(Some(t)) = one type; None = unknown type → no
     // edges (every vertex dangling → uniform 1/N).
     let etype = cfg.etype(graph);
-    let type_ok = |ty: u32| match etype {
-        Some(Some(t)) => ty == t,
+    // ANY of the edge's labels — see `algo::edge_type_ok`.
+    let type_ok = |ei: usize| match etype {
+        Some(Some(t)) => graph.edge_has_label(ei as u32, t),
         Some(None) => true,
         None => false,
     };
@@ -58,7 +59,7 @@ fn build_pull_graph(graph: &Graph, cfg: &AlgoConfig) -> PullGraph {
     // the per-source weighted sum's f64 order is part of the byte-identity contract).
     let mut out_strength = vec![0.0f64; slots];
     for ei in 0..graph.edge_slots() {
-        if graph.is_edge_live(ei as u32) && type_ok(graph.e_type[ei]) {
+        if graph.is_edge_live(ei as u32) && type_ok(ei) {
             out_strength[graph.e_src[ei] as usize] += weight_of(ei);
         }
     }
@@ -68,7 +69,7 @@ fn build_pull_graph(graph: &Graph, cfg: &AlgoConfig) -> PullGraph {
     // give the hot pull loop contiguous, cache-friendly reads and one allocation.
     let mut inc_off = vec![0usize; slots + 1];
     for ei in 0..graph.edge_slots() {
-        if graph.is_edge_live(ei as u32) && type_ok(graph.e_type[ei]) {
+        if graph.is_edge_live(ei as u32) && type_ok(ei) {
             inc_off[graph.e_dst[ei] as usize + 1] += 1;
         }
     }
@@ -79,7 +80,7 @@ fn build_pull_graph(graph: &Graph, cfg: &AlgoConfig) -> PullGraph {
     let mut inc_fac = vec![0.0f64; inc_off[slots]];
     let mut cursor = inc_off[..slots].to_vec();
     for ei in 0..graph.edge_slots() {
-        if !graph.is_edge_live(ei as u32) || !type_ok(graph.e_type[ei]) {
+        if !graph.is_edge_live(ei as u32) || !type_ok(ei) {
             continue;
         }
         let src = graph.e_src[ei];

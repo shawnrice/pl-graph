@@ -417,3 +417,262 @@ fn has_label_finds_a_vertex_by_any_of_its_labels() {
         2
     );
 }
+
+/// Naming several edge labels is a disjunction over ONE edge, not a walk per
+/// name — an edge labelled `[R, S]` must traverse ONCE under `outE('R','S')`.
+///
+/// The TS engine buckets an edge under every label it carries and walked one
+/// bucket per named label, so it emitted that edge twice while this engine (one
+/// adjacency pass, an any-of predicate) emitted it once. Same shape as the GQL
+/// `[:R|S]` double-count. Pinned on both sides.
+#[test]
+fn naming_several_edge_labels_traverses_a_multi_label_edge_once() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R","S"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let n = |t: super::Traversal, g: &mut crate::graph::Graph| t.count().run(g);
+    let one = vec![GVal::Num(1.0)];
+
+    // Every spelling that selects this edge selects it exactly once.
+    assert_eq!(n(super::g().v_ids(&["a"]).out_e(&["R"]), &mut g), one);
+    assert_eq!(n(super::g().v_ids(&["a"]).out_e(&["S"]), &mut g), one);
+    assert_eq!(n(super::g().v_ids(&["a"]).out_e(&[]), &mut g), one);
+    assert_eq!(
+        n(super::g().v_ids(&["a"]).out_e(&["R", "S"]), &mut g),
+        one,
+        "`outE('R','S')` walked the edge once per matching label"
+    );
+    assert_eq!(n(super::g().v_ids(&["a"]).out(&["R", "S"]), &mut g), one);
+
+    // ...in both directions, and for `both`, which sees it from each end once.
+    assert_eq!(n(super::g().v_ids(&["b"]).in_e(&["R", "S"]), &mut g), one);
+    assert_eq!(n(super::g().v_ids(&["a"]).both_e(&["R", "S"]), &mut g), one);
+    assert_eq!(n(super::g().v_ids(&["b"]).both_e(&["R", "S"]), &mut g), one);
+
+    // A name no edge carries contributes nothing rather than suppressing the rest.
+    assert_eq!(
+        n(super::g().v_ids(&["a"]).out_e(&["R", "ABSENT"]), &mut g),
+        one
+    );
+    assert_eq!(
+        n(super::g().v_ids(&["a"]).out_e(&["ABSENT"]), &mut g),
+        vec![GVal::Num(0.0)]
+    );
+}
+
+/// The TEXT form of a multi-name adjacency step must agree with the builder.
+///
+/// `outE('KNOWS','NOPE')` is a disjunction: the name that resolves to nothing
+/// contributes nothing, and the one that resolves still matches. Found by the
+/// gremlin differential fuzzer once its steps started naming more than one type
+/// — the builder-level test above passes, so anything wrong here is in parsing
+/// or lowering, not in the traversal.
+#[test]
+fn a_text_step_naming_an_unknown_type_alongside_a_real_one_still_matches() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let n = |src: &str, g: &mut crate::graph::Graph| {
+        super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` failed to parse: {e}"))
+            .run(g)
+    };
+    // Adding a name that resolves to nothing changes NOTHING — the reference is
+    // the same query without it, across every plan these take (a vertex start,
+    // an edge start, a chain of hops, a dedup, a projection instead of a count).
+    for (with_nope, plain) in [
+        ("g.V().outE('R','NOPE').count()", "g.V().outE('R').count()"),
+        ("g.V().outE('NOPE','R').count()", "g.V().outE('R').count()"),
+        ("g.V().out('R','NOPE').count()", "g.V().out('R').count()"),
+        ("g.V().inE('R','NOPE').count()", "g.V().inE('R').count()"),
+        (
+            "g.V().bothE('R','NOPE').count()",
+            "g.V().bothE('R').count()",
+        ),
+        ("g.V().both('R','NOPE').count()", "g.V().both('R').count()"),
+        (
+            "g.E().hasLabel('R','NOPE').count()",
+            "g.E().hasLabel('R').count()",
+        ),
+        (
+            "g.V().hasLabel('V','NOPE').count()",
+            "g.V().hasLabel('V').count()",
+        ),
+        (
+            "g.V().out('R','NOPE').out('R','NOPE').count()",
+            "g.V().out('R').out('R').count()",
+        ),
+        (
+            "g.V().outE('R','NOPE').dedup().count()",
+            "g.V().outE('R').dedup().count()",
+        ),
+        (
+            "g.V().outE('R','NOPE').inV().count()",
+            "g.V().outE('R').inV().count()",
+        ),
+        (
+            "g.V().hasLabel('V','NOPE').out('R','NOPE').count()",
+            "g.V().hasLabel('V').out('R').count()",
+        ),
+        // A count shortcut that disagrees with the stream it stands in for is
+        // the failure mode this whole family has, so pin enumeration too.
+        (
+            "g.V().outE('R','NOPE').values('w').fold()",
+            "g.V().outE('R').values('w').fold()",
+        ),
+        ("g.V().out('R','NOPE').fold()", "g.V().out('R').fold()"),
+    ] {
+        assert_eq!(
+            n(with_nope, &mut g),
+            n(plain, &mut g),
+            "`{with_nope}` disagrees with `{plain}`"
+        );
+    }
+
+    // ...and the plain spelling really does select something, so the pairs above
+    // cannot agree by both being empty.
+    assert_eq!(n("g.V().outE('R').count()", &mut g), vec![GVal::Num(1.0)]);
+
+    // A step naming ONLY unknown types still matches nothing.
+    for src in [
+        "g.V().outE('NOPE','ALSO_NOPE').count()",
+        "g.V().out('NOPE','ALSO_NOPE').count()",
+        "g.V().hasLabel('NOPE','ALSO_NOPE').count()",
+        "g.E().hasLabel('NOPE','ALSO_NOPE').count()",
+    ] {
+        assert_eq!(
+            n(src, &mut g),
+            vec![GVal::Num(0.0)],
+            "`{src}` matched something"
+        );
+    }
+}
+
+/// A returned edge carries EVERY type it has, sorted — like a returned vertex.
+///
+/// The result serialization emitted only `e_type`, an edge's first type, so a
+/// two-type edge read back as single-type through both engines' JSON while the
+/// TS mirror rendered both. Found by the gremlin differential fuzzer once its
+/// fixture held a multi-type edge. `label()` still returns ONE type: it has to.
+#[test]
+fn a_returned_edge_carries_every_type_it_has() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["S","R"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let json = |g: &mut crate::graph::Graph| {
+        let plan = super::parse::parse("g.E()").expect("parses");
+        let vals = plan.clone().run(g);
+        super::exec::results_to_json(g, &vals)
+    };
+
+    let rendered = json(&mut g);
+
+    assert!(
+        rendered.contains(r#""labels":["R","S"]"#),
+        "an edge lost a type crossing the result boundary: {rendered}"
+    );
+
+    // Removing one leaves the other, and the rendering follows.
+    g.remove_edge_label(0, "R");
+
+    let rendered = json(&mut g);
+
+    assert!(
+        rendered.contains(r#""labels":["S"]"#),
+        "a removed type still rendered: {rendered}"
+    );
+}
+
+/// A `dedup()` BEFORE an edge step deduplicates what precedes it, not the edges.
+///
+/// The count shortcut peeled an optional `dedup()` off the front of what
+/// remained and then applied it to the edges it counted, so
+/// `V().dedup().bothE(T).count()` — dedup the vertices, then count every
+/// incident edge from both ends — collapsed each edge to one. Found by the
+/// gremlin differential fuzzer; nothing about it is multi-type, the fuzzer had
+/// simply never put a `dedup()` in front of an edge step before.
+#[test]
+fn a_dedup_before_an_edge_step_does_not_deduplicate_the_edges() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#,
+            r#"{"type":"node","id":"c","labels":["V"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e1","from":"b","to":"c","labels":["R"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let n = |src: &str, g: &mut crate::graph::Graph| {
+        super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` failed to parse: {e}"))
+            .run(g)
+    };
+
+    // The reference is the same query without the count shortcut in play: a
+    // `fold()` materializes the stream, so its length is what the count must be.
+    for (counted, folded) in [
+        (
+            "g.V().dedup().bothE('R').count()",
+            "g.V().dedup().bothE('R').fold()",
+        ),
+        (
+            "g.V().dedup().outE('R').count()",
+            "g.V().dedup().outE('R').fold()",
+        ),
+        (
+            "g.V().dedup().inE('R').count()",
+            "g.V().dedup().inE('R').fold()",
+        ),
+        // ...and the form where the dedup really IS on the edges still dedupes.
+        (
+            "g.V().bothE('R').dedup().count()",
+            "g.V().bothE('R').dedup().fold()",
+        ),
+    ] {
+        let want = match n(folded, &mut g).as_slice() {
+            [GVal::List(items)] => items.len() as f64,
+            other => panic!("`{folded}` did not fold to a list: {other:?}"),
+        };
+
+        assert_eq!(
+            n(counted, &mut g),
+            vec![GVal::Num(want)],
+            "`{counted}` disagrees with the stream it stands in for"
+        );
+    }
+
+    // Each edge is incident to two vertices, so `bothE` over every vertex sees
+    // it twice — the number the dedup must NOT collapse.
+    assert_eq!(
+        n("g.V().dedup().bothE('R').count()", &mut g),
+        vec![GVal::Num(4.0)]
+    );
+    assert_eq!(
+        n("g.V().bothE('R').dedup().count()", &mut g),
+        vec![GVal::Num(2.0)]
+    );
+}

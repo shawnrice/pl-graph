@@ -138,6 +138,28 @@ impl AlgoConfig {
     }
 }
 
+/// Does edge `ei` pass an algorithm's edge-label filter?
+///
+/// `None` means every type. Otherwise ANY of the edge's labels may match — edges
+/// are multi-label, and every algorithm here tested `e_type[ei]`, which is only
+/// the FIRST. With the filtered label stored second, `degree` returned zero for
+/// every vertex: the algorithms saw an edgeless graph.
+#[must_use]
+pub fn edge_type_ok(graph: &Graph, etype: Option<u32>, ei: u32) -> bool {
+    etype.is_none_or(|t| graph.edge_has_label(ei, t))
+}
+
+/// The same test for an adjacency entry, which already carries the first label —
+/// so the common case is one compare and the rest is only consulted when some
+/// edge carries the wanted label as a secondary.
+#[must_use]
+pub fn adj_type_ok(graph: &Graph, etype: Option<u32>, a: &crate::graph::Adj) -> bool {
+    match etype {
+        None => true,
+        Some(t) => a.etype == t || graph.edge_has_label(a.eidx, t),
+    }
+}
+
 /// The accepted `CALL <algo>({...})` config keys — every field [`AlgoConfig`]
 /// carries. A `CALL` config map is validated against this set (unknown key →
 /// error), so a typo or a wrong key no longer silently no-ops. The order is fixed
@@ -1397,5 +1419,153 @@ mod tests {
         let g = weighted(&[("a", "b", -5.0)]);
 
         assert!(sp(&g, None).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod multi_label_edge_sweep {
+    //! EVERY algorithm, over an edge-label filter, on a multi-label graph.
+    //!
+    //! The reference is a metamorphic one: two graphs identical in every way
+    //! except whether the filtered label is stored FIRST or SECOND on each edge.
+    //! An algorithm that tests `e_type[ei] == t` — an edge's first label — sees a
+    //! different graph in the second case, so any such filter shows up as a
+    //! disagreement without needing a hand-computed expected answer per
+    //! algorithm.
+    //!
+    //! Written as a sweep rather than per-algorithm because checking these one at
+    //! a time is exactly how the same bug survived three passes in the query
+    //! engines.
+    use super::{run_with, AlgoConfig};
+    use crate::graph::Graph;
+
+    /// A fixed little graph; `first` decides whether the interesting label `R` is
+    /// each edge's first label or its second. `NOISE` is a label no query asks
+    /// for, present only to occupy the other slot.
+    fn build(first: bool) -> Graph {
+        let labels = |r_first: bool| {
+            if r_first {
+                r#"["R","NOISE"]"#
+            } else {
+                r#"["NOISE","R"]"#
+            }
+        };
+        let mut lines: Vec<String> = (0..8)
+            .map(|i| {
+                // `f` is a feature vector, read only by `neighborAggregate`.
+                format!(
+                    r#"{{"type":"node","id":"n{i}","labels":["V"],"properties":{{"f":[{i}.0]}}}}"#
+                )
+            })
+            .collect();
+
+        // A shape with a cycle, a branch and a tail, so components / SCC /
+        // centrality / pagerank all have something to distinguish.
+        for (i, (a, b)) in [(0, 1), (1, 2), (2, 0), (2, 3), (3, 4), (5, 6)]
+            .into_iter()
+            .enumerate()
+        {
+            lines.push(format!(
+                r#"{{"type":"edge","id":"e{i}","from":"n{a}","to":"n{b}","labels":{},"properties":{{"w":1.0}}}}"#,
+                labels(first)
+            ));
+        }
+
+        crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes")
+    }
+
+    #[test]
+    fn every_algorithm_filters_on_all_of_an_edges_labels() {
+        const ALGOS: &[&str] = &[
+            "degree",
+            "connectedComponents",
+            "stronglyConnectedComponents",
+            "onCycle",
+            "labelPropagation",
+            "peerPressure",
+            "pagerank",
+            "betweenness",
+            "closeness",
+        ];
+
+        for name in ALGOS {
+            let cfg = AlgoConfig {
+                edge_label: Some("R".to_string()),
+                ..AlgoConfig::default()
+            };
+
+            let mut first = build(true);
+            let mut second = build(false);
+            let a =
+                run_with(&mut first, name, &cfg).unwrap_or_else(|e| panic!("`{name}` failed: {e}"));
+            let b = run_with(&mut second, name, &cfg)
+                .unwrap_or_else(|e| panic!("`{name}` failed: {e}"));
+
+            assert_eq!(
+                a, b,
+                "`{name}` gives a different answer when `R` is an edge's SECOND \
+                 label — it is testing only the first"
+            );
+
+            // Agreement is worthless if the filter matched nothing on BOTH sides
+            // (two edgeless graphs agree perfectly). Pin that `R` really selects
+            // edges by checking it against a label no edge carries.
+            let none = AlgoConfig {
+                edge_label: Some("ABSENT".to_string()),
+                ..AlgoConfig::default()
+            };
+            let empty = run_with(&mut build(true), name, &none)
+                .unwrap_or_else(|e| panic!("`{name}` failed: {e}"));
+            assert_ne!(
+                a, empty,
+                "`{name}` on `R` matches its answer on a label no edge carries — \
+                 the sweep would agree vacuously"
+            );
+        }
+    }
+
+    /// The two algorithms the sweep above cannot reach: both need config beyond
+    /// an edge label, and both filtered on an adjacency entry's first label.
+    #[test]
+    fn configured_algorithms_filter_on_all_of_an_edges_labels() {
+        let cases: Vec<(&str, AlgoConfig)> = vec![
+            (
+                "neighborAggregate",
+                AlgoConfig {
+                    edge_label: Some("R".to_string()),
+                    feature: Some("f".to_string()),
+                    op: Some("sum".to_string()),
+                    ..AlgoConfig::default()
+                },
+            ),
+            (
+                "shortestPath",
+                AlgoConfig {
+                    edge_label: Some("R".to_string()),
+                    source: Some("n0".to_string()),
+                    target: Some("n4".to_string()),
+                    ..AlgoConfig::default()
+                },
+            ),
+        ];
+
+        for (name, cfg) in cases {
+            let (mut first, mut second) = (build(true), build(false));
+            let a =
+                run_with(&mut first, name, &cfg).unwrap_or_else(|e| panic!("`{name}` failed: {e}"));
+            let b = run_with(&mut second, name, &cfg)
+                .unwrap_or_else(|e| panic!("`{name}` failed: {e}"));
+            assert_eq!(
+                a, b,
+                "`{name}` gives a different answer when `R` is an edge's SECOND label"
+            );
+
+            let mut none = cfg.clone();
+            none.edge_label = Some("ABSENT".to_string());
+            let mut third = build(true);
+            let empty = run_with(&mut third, name, &none)
+                .unwrap_or_else(|e| panic!("`{name}` failed: {e}"));
+            assert_ne!(a, empty, "`{name}` on `R` matches a label no edge carries");
+        }
     }
 }

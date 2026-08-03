@@ -1,6 +1,7 @@
 import type { Edge } from '../core/Edge.js';
 import type { Graph } from '../core/Graph.js';
 import type { Vertex } from '../core/Vertex.js';
+import { incidentEdges } from './adjacency.js';
 import { type AlgorithmGen, defineAlgorithm, materializeVertices, YIELD_EVERY } from './async.js';
 import type { AlgorithmConfig, AlgorithmRow } from './types.js';
 
@@ -25,16 +26,8 @@ const collectNeighbours = (
     return;
   }
 
-  const sets = edgeLabel === undefined ? byLabel.values() : [byLabel.get(edgeLabel)];
-
-  for (const set of sets) {
-    if (set === undefined) {
-      continue;
-    }
-
-    for (const edge of set) {
-      out.push(index.get(edge[end].id)!);
-    }
+  for (const edge of incidentEdges(byLabel, edgeLabel)) {
+    out.push(index.get(edge[end].id)!);
   }
 };
 

@@ -23,9 +23,11 @@ pub fn degree(graph: &Graph, cfg: &AlgoConfig) -> Vec<(u32, Value)> {
         .vertex_indices()
         .map(|v| {
             let d = match dir {
-                "in" => count(graph.in_adj(v), etype),
-                "both" => count(graph.out_adj(v), etype) + count(graph.in_adj(v), etype),
-                _ => count(graph.out_adj(v), etype), // "out" (default)
+                "in" => count(graph, graph.in_adj(v), etype),
+                "both" => {
+                    count(graph, graph.out_adj(v), etype) + count(graph, graph.in_adj(v), etype)
+                }
+                _ => count(graph, graph.out_adj(v), etype), // "out" (default)
             };
             (v, Value::Num(d as f64))
         })
@@ -33,9 +35,15 @@ pub fn degree(graph: &Graph, cfg: &AlgoConfig) -> Vec<(u32, Value)> {
 }
 
 /// Count edges of the iterator, filtered to `etype` when a specific type is given.
-fn count(adj: impl Iterator<Item = Adj>, etype: Option<u32>) -> u64 {
+///
+/// ANY of the edge's labels counts. `Adj.etype` is only the FIRST, so a
+/// non-matching first label still has to consult the rest — see
+/// `algo::adj_type_ok`.
+fn count(graph: &Graph, adj: impl Iterator<Item = Adj>, etype: Option<u32>) -> u64 {
     match etype {
         None => adj.count() as u64,
-        Some(t) => adj.filter(|a| a.etype == t).count() as u64,
+        Some(t) => adj
+            .filter(|a| super::adj_type_ok(graph, Some(t), a))
+            .count() as u64,
     }
 }

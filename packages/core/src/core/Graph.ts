@@ -577,6 +577,21 @@ export class Graph {
   verticesByLabel: Map<string, Set<Vertex>>;
 
   edgesById: Map<string, Edge>;
+  /**
+   * How many edges carry more than one type.
+   *
+   * The label indexes bucket an edge under EVERY type it carries, so summing
+   * bucket sizes over several types counts a multi-type edge once per bucket.
+   * When this is `0` that can't happen, and a count shortcut may take the O(1)
+   * sum instead of walking and deduping. It mirrors native's `extra_etypes`
+   * emptiness check, which arms the same fast path there.
+   *
+   * Maintained at the four edge-level mutation points (add/remove an edge,
+   * add/remove one of its types) rather than inside the per-type index helper,
+   * which runs once per type and could not see the transition.
+   */
+  multiTypeEdgeCount = 0;
+
   edgesByLabel: Map<string, Set<Edge>>;
   edgesFromByLabel: Map<string, Map<string, Set<Edge>>>;
   edgesToByLabel: Map<string, Map<string, Set<Edge>>>;
@@ -1137,6 +1152,7 @@ export class Graph {
     this.edgesByLabel = new Map();
     this.elementLabels = new Map();
     this.elementProperties = new Map();
+    this.multiTypeEdgeCount = 0;
 
     // Keep declared indexes but drop their contents — `truncate` empties the
     // graph, not its schema.
@@ -1499,6 +1515,10 @@ export class Graph {
       this.indexEdgeLabel(label, edge);
     }
 
+    if (edge.labels.size > 1) {
+      this.multiTypeEdgeCount += 1;
+    }
+
     this.edgePropertyIndex.add(edge, edge.properties);
 
     // Capture the ID and re-resolve at replay, never the instance: a later write
@@ -1536,6 +1556,10 @@ export class Graph {
     this.cardinalityNoteOnRemove(edge);
 
     this.emit(new EmitterEvent('@graph/EdgeRemoved', edge));
+
+    if (edge.labels.size > 1) {
+      this.multiTypeEdgeCount -= 1;
+    }
 
     for (const label of edge.labels) {
       this.deIndexEdgeLabel(label, edge);
@@ -1590,6 +1614,12 @@ export class Graph {
     next.add(label);
     this.elementLabels.set(edge.id, next);
 
+    // 1 → 2 types: this edge is now in two buckets, so the O(1) sum is no
+    // longer safe anywhere in the process.
+    if (next.size === 2) {
+      this.multiTypeEdgeCount += 1;
+    }
+
     this.indexEdgeLabel(label, edge);
 
     // Re-resolve by id at replay — never capture the instance. A later write may
@@ -1619,6 +1649,12 @@ export class Graph {
     const next = new Set(this.elementLabels.get(edge.id) ?? []);
     next.delete(label);
     this.elementLabels.set(edge.id, next);
+
+    // 2 → 1 types: this edge is back in a single bucket, re-arming the O(1) sum
+    // once no other edge is multi-type.
+    if (next.size === 1) {
+      this.multiTypeEdgeCount -= 1;
+    }
 
     this.deIndexEdgeLabel(label, edge);
 
