@@ -10738,3 +10738,40 @@ fn bench_quantified_group_vars() {
         );
     }
 }
+
+/// Fusing comma patterns must not change the ROWS or their ORDER.
+///
+/// Fusion rewrites `MATCH (a)-[]->(b), (b)-[]->(c)` into one path. The rows are
+/// the same set by construction; the risk is ORDER, which nothing else in the
+/// suite pins for a multi-pattern MATCH — and which the TS engine, joining
+/// unfused, would then disagree with. Each case is run with fusion on and off
+/// and compared position-by-position.
+#[test]
+fn fusing_comma_patterns_preserves_rows_and_order() {
+    let mut g = layered_dense(4, 4);
+    let queries = [
+        // chains — fused
+        "MATCH (a:N)-[:R]->(b), (b)-[:R]->(c) RETURN element_id(a), element_id(b), element_id(c)",
+        "MATCH (a:N)-[:R]->(b), (b)-[:R]->(c), (c)-[:R]->(d) RETURN element_id(a), element_id(d)",
+        "MATCH (a:N)-[r:R]->(b), (b)-[s:R]->(c) RETURN element_id(r), element_id(s)",
+        // the shared node carries a constraint — must NOT fuse
+        "MATCH (a:N)-[:R]->(b), (b:N)-[:R]->(c) RETURN element_id(a), element_id(c)",
+        // converging: (c) points AT the shared node — the second pattern reverses
+        "MATCH (a:N)-[:R]->(b), (c)-[:R]->(b) RETURN element_id(a), element_id(c)",
+        // diverging: both patterns leave the SAME node — the first reverses
+        "MATCH (b)-[:R]->(a:N), (b)-[:R]->(c) RETURN element_id(a), element_id(c)",
+        "MATCH (b)-[:R]->(a:N), (b)-[:R]->(c), (c)-[:R]->(d) RETURN element_id(a), element_id(d)",
+        // disconnected — a cartesian product, never fusable
+        "MATCH (a:N)-[:R]->(b), (c:N)-[:R]->(d) RETURN element_id(a), element_id(c)",
+        // with a filter that references both patterns' variables
+        "MATCH (a:N)-[:R]->(b), (b)-[:R]->(c) WHERE a.id <> c.id RETURN element_id(a), element_id(c)",
+    ];
+
+    for q in queries {
+        let fused = rows(&mut g, q);
+        let plain = super::eval::without_fusion(|| rows(&mut g, q));
+
+        assert!(!fused.is_empty(), "`{q}` produced no rows — inert test");
+        assert_eq!(fused, plain, "fusion changed the result of `{q}`");
+    }
+}

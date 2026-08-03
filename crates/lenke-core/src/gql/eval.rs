@@ -598,6 +598,12 @@ thread_local! {
 /// Force the vectorized scan on/off for the current thread while `f` runs, then
 /// restore the previous setting — so a test can execute a query under both engines
 /// and compare. Test-only.
+/// Re-export for tests outside this module — see [`scan::without_fusion`].
+#[cfg(test)]
+pub(crate) fn without_fusion<T>(f: impl FnOnce() -> T) -> T {
+    scan::without_fusion(f)
+}
+
 #[cfg(test)]
 pub(crate) fn with_vec_override<T>(on: bool, f: impl FnOnce() -> T) -> T {
     let prev = VEC_OVERRIDE.with(|c| c.replace(Some(on)));

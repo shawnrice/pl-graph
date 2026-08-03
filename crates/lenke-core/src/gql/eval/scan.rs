@@ -1839,11 +1839,24 @@ pub(super) fn vectorized_cols(
     project_frame_cols(graph, ctx, &sc, proj)
 }
 
-/// Build (and WHERE-filter) the columnar frame for a single fresh `MATCH … RETURN`
-/// — the shared front half of the vectorized terminal paths ([`vectorized_cols`]
-/// and [`vectorized_rowset`]). Returns `None` (→ scalar driver) unless the shape
-/// qualifies: one fresh `MATCH` of a buildable (non-var-length, no self-join)
-/// path, no `RETURN *`.
+thread_local! {
+    static FUSE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn fusion_enabled() -> bool {
+    !FUSE_OFF.with(std::cell::Cell::get)
+}
+
+/// Run `f` with comma-pattern fusion disabled, then restore it — so a test can
+/// execute a query both ways and compare rows IN ORDER. Test-only.
+#[cfg(test)]
+pub(super) fn without_fusion<T>(f: impl FnOnce() -> T) -> T {
+    let prev = FUSE_OFF.with(|c| c.replace(true));
+    let out = f();
+    FUSE_OFF.with(|c| c.set(prev));
+    out
+}
+
 /// Fuse comma patterns that CHAIN into one path, or `None` if they don't.
 ///
 /// Only the straightforward case: each pattern after the first must start on the
@@ -1855,7 +1868,7 @@ pub(super) fn vectorized_cols(
 /// Declines a path variable, a non-default selector or mode, since those change
 /// what a path MEANS rather than just where it starts.
 fn fuse_chain(patterns: &[CPath]) -> Option<CPath> {
-    if patterns.len() < 2 {
+    if patterns.len() < 2 || !fusion_enabled() {
         return None;
     }
 
@@ -1875,20 +1888,54 @@ fn fuse_chain(patterns: &[CPath]) -> Option<CPath> {
             .last()
             .map_or(out.start.var_slot, |s| s.node.var_slot)?;
 
-        if next.start.var_slot != Some(end)
-            || next.start.label.is_some()
-            || !next.start.props.is_empty()
-            || next.start.where_.is_some()
-        {
-            return None;
-        }
+        // Either side may need walking backwards. `(a)-[]->(b), (c)-[]->(b)`
+        // converges on `b`, so the SECOND reverses; `(b)-[]->(a), (b)-[]->(c)`
+        // diverges from `b`, so the FIRST does. `reverse_path` flips each
+        // direction, binding the same edges and nodes from the other end.
+        // Reversing the ACCUMULATED path is not an option, though it would fuse
+        // the diverging shape `(b)-[]->(a), (b)-[]->(c)` into
+        // `(a)<-[]-(b)-[]->(c)`. A linear path can only be enumerated from an
+        // end, so that fused form drives from `a` while the join drives from `b`,
+        // and the rows come out in a different ORDER — same multiset, regrouped.
+        // `fusing_comma_patterns_preserves_rows_and_order` catches it; it was
+        // written before this was attempted, and is why it did not ship.
+        let joined = attach(next, end)?;
 
-        out.segments.extend(next.segments.iter().cloned());
+        out.segments.extend(joined.segments);
     }
 
     Some(out)
 }
 
+/// `p` oriented to start on slot `end`, either as written or reversed, or `None`
+/// if it does not join there.
+fn attach(p: &CPath, end: usize) -> Option<CPath> {
+    if joins_at(p, end) {
+        return Some(p.clone());
+    }
+
+    let flipped = (!p.segments.is_empty()).then(|| reverse_path(p))?;
+
+    joins_at(&flipped, end).then_some(flipped)
+}
+
+/// Does `p` start on slot `end`, adding nothing to that node?
+///
+/// The "adding nothing" half is what makes a fusion safe: a back-reference like
+/// the `(b)` in `…, (b)-[s]->(c)` carries no label, inline property or `WHERE`,
+/// so splicing it in cannot drop a constraint the fused path would then skip.
+fn joins_at(p: &CPath, end: usize) -> bool {
+    p.start.var_slot == Some(end)
+        && p.start.label.is_none()
+        && p.start.props.is_empty()
+        && p.start.where_.is_none()
+}
+
+/// Build (and WHERE-filter) the columnar frame for a single fresh `MATCH … RETURN`
+/// — the shared front half of the vectorized terminal paths ([`vectorized_cols`]
+/// and [`vectorized_rowset`]). Returns `None` (→ scalar driver) unless the shape
+/// qualifies: one fresh `MATCH` of a buildable (non-var-length, no self-join)
+/// path, no `RETURN *`.
 pub(super) fn vectorized_frame(
     graph: &Graph,
     ctx: &Ctx,
