@@ -171,6 +171,54 @@ impl Value {
         Self::List(items.into())
     }
 
+    /// Element `idx`'s value for the already-resolved column `kid`, read straight
+    /// off the typed column.
+    ///
+    /// Both engines wanted this and only one had it. GQL's `prop_of` read the
+    /// column directly — a string is a refcount bump, numbers and bools are
+    /// copied, nothing is boxed. Gremlin's `prop` went through
+    /// `Properties::value_id`, which builds a `graph::Value` first and then
+    /// converts, so every property read allocated an intermediate. The only thing
+    /// that ever differed between them is `as_record`, the same flag
+    /// [`Value::from_stored`] already takes: a stored map is an ISO record to GQL
+    /// and a TinkerPop map to Gremlin.
+    #[must_use]
+    pub fn from_column(
+        store: &crate::graph::Properties,
+        kid: u32,
+        idx: usize,
+        strs: &crate::graph::Dict,
+        as_record: bool,
+    ) -> Self {
+        use crate::graph::Column;
+
+        match store.cols.get(kid as usize) {
+            Some(Column::Num { data, present }) if present.get(idx) => Self::Num(data[idx]),
+            Some(Column::Bool { data, present }) if present.get(idx) => Self::Bool(data[idx]),
+            Some(Column::Str { data, present }) if present.get(idx) => {
+                Self::Str(strs.arc(data[idx]))
+            }
+            Some(Column::Temporal { data, present }) if present.get(idx) => {
+                Self::Temporal(data.get(idx))
+            }
+            // A typed vector column reconstructs the same list the boxed form
+            // would yield, via the zero-copy slice accessor.
+            Some(Column::Vec { .. }) => store
+                .vector_id(idx, kid)
+                .map(|v| Self::list(v.iter().map(|x| Self::Num(*x)).collect()))
+                .unwrap_or(Self::Null),
+            Some(Column::Mixed { data }) => data[idx]
+                .as_ref()
+                .map(|v| Self::from_stored(v, as_record))
+                .unwrap_or(Self::Null),
+            // A de-boxed record synthesizes its map (or reads an escapee).
+            Some(Column::Record { .. }) => {
+                Self::from_stored(&store.value_id(idx, kid, strs), as_record)
+            }
+            _ => Self::Null,
+        }
+    }
+
     /// A path value, boxing the payload.
     #[must_use]
     pub fn path(vertices: Vec<u32>, edges: Vec<u32>) -> Self {

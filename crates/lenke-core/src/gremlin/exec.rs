@@ -1846,11 +1846,19 @@ fn gval_to_value(v: &GVal) -> Value {
 }
 
 fn prop(graph: &Graph, v: &GVal, key: &str) -> GVal {
-    match v {
-        GVal::Node(i) => value_to_gval(graph.props.value(*i as usize, key, &graph.strs)),
-        GVal::Edge(e) => value_to_gval(graph.edge_props.value(*e as usize, key, &graph.strs)),
-        _ => GVal::Null,
-    }
+    // Resolve the name, then take the SHARED typed read — the same one GQL's
+    // `prop_of` uses. This used to go through `Properties::value`, which boxes a
+    // `graph::Value` and converts it, so every property read on the streamed path
+    // allocated an intermediate the columnar path never did.
+    let (store, idx) = match v {
+        GVal::Node(i) => (&graph.props, *i as usize),
+        GVal::Edge(e) => (&graph.edge_props, *e as usize),
+        _ => return GVal::Null,
+    };
+
+    store.keys.get(key).map_or(GVal::Null, |kid| {
+        GVal::from_column(store, kid, idx, &graph.strs, false)
+    })
 }
 
 /// A `{ key: value }` map of an element's present properties (a stored null is
@@ -1941,9 +1949,11 @@ fn prop_by_id(graph: &Graph, v: &GVal, kid: u32) -> GVal {
         return prop_value_field(v).unwrap_or(GVal::Null);
     }
 
+    // A stored map is a TinkerPop map here, not an ISO record — the one flag
+    // that ever differed between the engines' property reads.
     match v {
-        GVal::Node(i) => value_to_gval(graph.props.value_id(*i as usize, kid, &graph.strs)),
-        GVal::Edge(e) => value_to_gval(graph.edge_props.value_id(*e as usize, kid, &graph.strs)),
+        GVal::Node(i) => GVal::from_column(&graph.props, kid, *i as usize, &graph.strs, false),
+        GVal::Edge(e) => GVal::from_column(&graph.edge_props, kid, *e as usize, &graph.strs, false),
         _ => GVal::Null,
     }
 }

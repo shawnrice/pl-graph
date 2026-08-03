@@ -1551,28 +1551,9 @@ fn prop_of(graph: &Graph, ctx: &Ctx, bound: &Val, key_ref: usize) -> Val {
         _ => return Val::Null,
     };
     let Some(kid) = kid else { return Val::Null };
-    // Read the column directly: a string property is a refcount bump (Rc clone),
-    // not an allocation; numbers/bools are copied; Mixed converts.
-    match store.cols.get(kid as usize) {
-        Some(Column::Num { data, present }) if present.get(idx) => Val::Num(data[idx]),
-        Some(Column::Bool { data, present }) if present.get(idx) => Val::Bool(data[idx]),
-        Some(Column::Str { data, present }) if present.get(idx) => {
-            Val::Str(graph.strs.arc(data[idx]))
-        }
-        Some(Column::Temporal { data, present }) if present.get(idx) => {
-            Val::Temporal(data.get(idx))
-        }
-        // A typed vector column reconstructs the same list `value_to_val` would
-        // yield for the boxed form — via the zero-copy slice accessor.
-        Some(Column::Vec { .. }) => store
-            .vector_id(idx, kid)
-            .map(|s| Val::List(s.iter().map(|x| Val::Num(*x)).collect()))
-            .unwrap_or(Val::Null),
-        Some(Column::Mixed { data }) => data[idx].as_ref().map(value_to_val).unwrap_or(Val::Null),
-        // A de-boxed record synthesizes its map (or reads an escapee) via the store.
-        Some(Column::Record { .. }) => value_to_val(&store.value_id(idx, kid, &graph.strs)),
-        _ => Val::Null,
-    }
+
+    // A stored map is an ISO record here — see `Val::from_column`.
+    Val::from_column(store, kid, idx, &graph.strs, true)
 }
 
 /// Read `element.root.field.field…` — a field access on a stored record — WITHOUT
