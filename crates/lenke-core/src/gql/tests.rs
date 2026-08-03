@@ -11037,3 +11037,38 @@ fn a_carried_column_is_typed_only_when_uniformly_numeric() {
         "a carried column with nulls disagrees with the scalar driver"
     );
 }
+
+/// A clause whose patterns share NO variable is a cross product, and the
+/// columnar cross must match the scalar join row-for-row.
+///
+/// The first version of `cross_frames` crossed any groups that failed to CHAIN,
+/// which silently included shapes that share a variable elsewhere (diverging, or
+/// joining mid-path) — it returned the full product, 8 rows where the join gives
+/// 2. The disjointness check is what makes it sound, so the shapes that must NOT
+/// cross are tested here beside the ones that must.
+#[test]
+fn crossing_disconnected_patterns_agrees_with_the_scalar_driver() {
+    let mut g = layered_dense(4, 4);
+    let queries = [
+        // genuinely disconnected — crosses
+        "MATCH (a:N)-[:R]->(b), (c:N)-[:R]->(d) RETURN element_id(a), element_id(c)",
+        "MATCH (a:N)-[:R]->(b), (c:N)-[:R]->(d) WHERE a.id < c.id RETURN element_id(a), element_id(c)",
+        "MATCH (a:N)-[:R]->(b), (c:N)-[:R]->(d), (e:N)-[:R]->(f) RETURN count(*) AS n",
+        // shares a variable but does not chain — must NOT cross
+        "MATCH (b)-[:R]->(a:N), (b)-[:R]->(c) RETURN element_id(a), element_id(c)",
+        "MATCH (a:N)-[:R]->(b), (c)-[:R]->(b) RETURN element_id(a), element_id(c)",
+        // chains — fuses, never reaches the cross
+        "MATCH (a:N)-[:R]->(b), (b)-[:R]->(c) RETURN element_id(a), element_id(c)",
+        // disconnected AND ordered
+        "MATCH (a:N)-[:R]->(b), (c:N)-[:R]->(d) RETURN element_id(a) AS x, element_id(c) AS y \
+         ORDER BY x, y LIMIT 12",
+    ];
+
+    for q in queries {
+        let vec_on = super::eval::with_vec_override(true, || rows(&mut g, q));
+        let scalar = super::eval::with_vec_override(false, || rows(&mut g, q));
+
+        assert!(!vec_on.is_empty(), "`{q}` produced no rows — inert test");
+        assert_eq!(vec_on, scalar, "engines disagree on `{q}`");
+    }
+}

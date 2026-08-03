@@ -1974,8 +1974,158 @@ pub(super) fn without_fusion<T>(f: impl FnOnce() -> T) -> T {
 ///
 /// Declines a path variable, a non-default selector or mode, since those change
 /// what a path MEANS rather than just where it starts.
-fn fuse_chain(patterns: &[CPath]) -> Option<CPath> {
-    if patterns.len() < 2 || !fusion_enabled() {
+/// Every binding slot `p` names, in path order.
+fn path_slots(p: &CPath, out: &mut Vec<usize>) {
+    out.extend(p.start.var_slot);
+
+    for seg in &p.segments {
+        out.extend(seg.rel.var_slot);
+        out.extend(seg.node.var_slot);
+
+        if let Some(unit) = seg.unit.as_ref() {
+            unit.group_slots(out);
+        }
+    }
+}
+
+/// A clause whose patterns fall into several disconnected groups: build each
+/// group's frame, cross them, then apply the clause `WHERE` to the product.
+///
+/// The `WHERE` runs LAST, on the crossed rows, which is where the scalar join
+/// applies it too — it is checked once every pattern has bound. Filtering a group
+/// early would be a real optimization and is deliberately not done here: a
+/// predicate over one group's variables alone is not distinguished yet, and
+/// getting that wrong silently drops rows.
+fn crossed_frame(
+    graph: &Graph,
+    ctx: &Ctx,
+    groups: &[CPath],
+    where_: &Option<CExpr>,
+    scope_len: usize,
+    proj: &CProjection,
+) -> Option<ScanCols> {
+    // Only a group that shares NO variable with another may be crossed. Groups
+    // split whenever a pattern does not attach at the accumulated END, which also
+    // catches shapes that DO share a variable elsewhere — diverging
+    // (`(b)-[]->(a), (b)-[]->(c)`) or joining mid-path. Crossing those would drop
+    // the equality the shared name asserts and return the full product, which is
+    // exactly what happened the first time this was written: 8 rows where the
+    // join gives 2.
+    let mut slots: Vec<usize> = Vec::new();
+
+    for g in groups {
+        let before = slots.len();
+
+        path_slots(g, &mut slots);
+
+        if slots[..before].iter().any(|a| slots[before..].contains(a)) {
+            return None;
+        }
+    }
+
+    // A cap can't early-stop a cross product: the LAST group's rows are the inner
+    // loop, so stopping there would truncate every outer row's pairing.
+    let mut acc: Option<ScanCols> = None;
+
+    for g in groups {
+        let one = build_scan(graph, ctx, g, scope_len, None, where_.as_ref(), None)?;
+
+        acc = Some(match acc {
+            None => one,
+            Some(prev) => cross_frames(&prev, &one, graph.limits().intermediate)?,
+        });
+    }
+
+    let mut sc = acc?;
+
+    if let Some(w) = where_ {
+        let keep: Vec<bool> = eval_vec(graph, ctx, &sc, w)
+            .into_truth()
+            .iter()
+            .map(|t| *t == Some(true))
+            .collect();
+
+        compact(&mut sc, &keep);
+    }
+
+    let _ = proj;
+
+    Some(sc)
+}
+
+/// The CROSS PRODUCT of two frames: every row of `a` paired with every row of
+/// `b`.
+///
+/// `a`'s columns repeat each value `b.n` times and `b`'s tile, which is exactly
+/// the order the scalar join produces — it nests pattern 2 inside pattern 1 —
+/// so this is a drop-in for a clause whose patterns share no variable.
+///
+/// `budget` bounds the result the way an expansion's does: `n * m` reaches
+/// billions on two large scans, and a cartesian product is usually a mistake, so
+/// it must cap rather than materialize.
+fn cross_frames(a: &ScanCols, b: &ScanCols, budget: u64) -> Option<ScanCols> {
+    let n = a.n.checked_mul(b.n)?;
+
+    if n as u64 > budget {
+        return None;
+    }
+
+    let width = a.slots.len().max(b.slots.len());
+    let mut out = ScanCols::new(width);
+
+    out.n = n;
+
+    for s in 0..width {
+        // `a` repeats: each of its values held for a whole pass of `b`.
+        if let Some((e, ids)) = a.slots.get(s).and_then(Option::as_ref) {
+            out.slots[s] = Some((
+                *e,
+                ids.iter()
+                    .flat_map(|&v| std::iter::repeat_n(v, b.n))
+                    .collect(),
+            ));
+        } else if let Some(v) = a.vals.get(s).and_then(Option::as_ref) {
+            out.vals[s] = Some(
+                v.iter()
+                    .flat_map(|x| std::iter::repeat_n(x.clone(), b.n))
+                    .collect(),
+            );
+        // `b` tiles: its whole column once per row of `a`.
+        } else if let Some((e, ids)) = b.slots.get(s).and_then(Option::as_ref) {
+            let mut col = Vec::with_capacity(n);
+            for _ in 0..a.n {
+                col.extend_from_slice(ids);
+            }
+            out.slots[s] = Some((*e, col));
+        } else if let Some(v) = b.vals.get(s).and_then(Option::as_ref) {
+            let mut col = Vec::with_capacity(n);
+            for _ in 0..a.n {
+                col.extend_from_slice(v);
+            }
+            out.vals[s] = Some(col);
+        }
+    }
+
+    Some(out)
+}
+
+/// Split `patterns` into the fewest paths that cover them: each consecutive run
+/// that CHAINS is spliced into one, and a pattern that joins nowhere starts a new
+/// group. `None` if any pattern is not plain enough to fuse at all.
+///
+/// Splicing is what makes `MATCH (a)-[]->(b), (b)-[]->(c)` cost the same as
+/// `MATCH (a)-[]->(b)-[]->(c)`: each pattern after the first must start on the
+/// node the previous ended on, in either direction (`reverse_path` flips one when
+/// they converge), and whatever that shared node constrains is carried across by
+/// `merge_node`. A path variable, a non-default selector or mode declines — those
+/// change what a path MEANS, not just where it starts.
+///
+/// One group means the whole clause is a single path. Several means the clause is
+/// a CROSS PRODUCT of those paths — patterns that share no variable, like
+/// `MATCH (a)-[]->(b), (c)-[]->(d)`. That is not a join to be spliced; it is a
+/// different operation, and `cross_frames` performs it.
+fn fuse_groups(patterns: &[CPath]) -> Option<Vec<CPath>> {
+    if patterns.is_empty() || !fusion_enabled() {
         return None;
     }
 
@@ -1987,9 +2137,23 @@ fn fuse_chain(patterns: &[CPath]) -> Option<CPath> {
         return None;
     }
 
+    let mut groups: Vec<CPath> = Vec::new();
     let mut out = patterns[0].clone();
 
     for next in &patterns[1..] {
+        let Some(end) = out
+            .segments
+            .last()
+            .map_or(out.start.var_slot, |s| s.node.var_slot)
+        else {
+            groups.push(std::mem::replace(&mut out, next.clone()));
+            continue;
+        };
+
+        if attach(next, end).is_none() {
+            groups.push(std::mem::replace(&mut out, next.clone()));
+            continue;
+        }
         let end = out
             .segments
             .last()
@@ -2006,7 +2170,7 @@ fn fuse_chain(patterns: &[CPath]) -> Option<CPath> {
         // and the rows come out in a different ORDER — same multiset, regrouped.
         // `fusing_comma_patterns_preserves_rows_and_order` catches it; it was
         // written before this was attempted, and is why it did not ship.
-        let joined = attach(next, end)?;
+        let joined = attach(next, end).expect("checked just above");
 
         // The shared node may be constrained on BOTH sides —
         // `(a)-[]->(b:N), (b:M {k: 1})-[]->(c)`. They name one variable, so the
@@ -2016,7 +2180,9 @@ fn fuse_chain(patterns: &[CPath]) -> Option<CPath> {
         out.segments.extend(joined.segments);
     }
 
-    Some(out)
+    groups.push(out);
+
+    Some(groups)
 }
 
 /// The node the accumulated path currently ends on.
@@ -2110,9 +2276,12 @@ pub(super) fn vectorized_frame(
     // return the same row with `r = s`, verified before this was written. And the
     // row ORDER is unchanged — the scalar join nests pattern 2 inside pattern 1,
     // which is exactly the order one fused path enumerates.
-    let fused = fuse_chain(patterns);
-    let path = match &fused {
-        Some(p) => p,
+    let groups = fuse_groups(patterns);
+    let path = match groups.as_deref() {
+        Some([one]) => one,
+        // Patterns that share no variable: build each group's frame and cross
+        // them. Handled below, after the shape checks that apply to any of them.
+        Some(_) => return crossed_frame(graph, ctx, groups.as_deref()?, where_, *scope_len, proj),
         None if patterns.len() == 1 => &patterns[0],
         None => return None,
     };
