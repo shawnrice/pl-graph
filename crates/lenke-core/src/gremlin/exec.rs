@@ -2767,7 +2767,8 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                     // engine is `step.labels.some((l) => v.labels.has(l))`, and a
                     // vertex labelled [A, B] must be found by `hasLabel('B')`.
                     GVal::Node(i) => graph.vertex_labels(*i).iter().any(|lid| want.contains(lid)),
-                    GVal::Edge(e) => want_e.contains(&graph.e_type[*e as usize]),
+                    // ANY of the edge's labels — edges are multi-label too.
+                    GVal::Edge(e) => want_e.iter().any(|&w| graph.edge_has_label(*e, w)),
                     _ => false,
                 })
                 .collect()

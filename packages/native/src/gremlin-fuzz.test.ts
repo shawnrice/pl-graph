@@ -131,6 +131,11 @@ const MODERN = [
   '{"type":"node","id":"6","labels":["PERSON"],"properties":{"name":"peter","age":35}}',
   '{"type":"node","id":"3","labels":["SOFTWARE"],"properties":{"name":"lop","lang":"java"}}',
   '{"type":"node","id":"5","labels":["SOFTWARE"],"properties":{"name":"ripple","lang":"java"}}',
+  // TWO labels. Every other vertex here carries exactly one, under which
+  // "match any label" and "match the first label" are indistinguishable — which
+  // is why this fuzzer ran for a long time without noticing that native's
+  // `hasLabel` matched only the first and the TS engine matched any.
+  '{"type":"node","id":"13","labels":["PERSON","SOFTWARE"],"properties":{"name":"hybrid","age":40,"lang":"rust"}}',
   '{"type":"edge","id":"7","from":"1","to":"2","labels":["KNOWS"],"properties":{"weight":0.5}}',
   '{"type":"edge","id":"8","from":"1","to":"4","labels":["KNOWS"],"properties":{"weight":1.0}}',
   '{"type":"edge","id":"9","from":"1","to":"3","labels":["CREATED"],"properties":{"weight":0.4}}',
@@ -155,6 +160,9 @@ const pick = <T>(r: () => number, xs: readonly T[]): T => xs[Math.floor(r() * xs
 
 const KEYS = ['name', 'age', 'lang', 'weight', 'missing'];
 const VALUES: unknown[] = ['marko', 'lop', 'java', 29, 0.4, 0, -1, '', 'nope'];
+// 'NOPE' names nothing (must match nothing, not everything); the rest are real,
+// and vertex 13 carries PERSON *and* SOFTWARE so a label filter has to consider
+// both of a vertex's labels rather than just the first.
 const LABELS = ['PERSON', 'SOFTWARE', 'KNOWS', 'CREATED', 'NOPE'];
 const preds = [eq, gt, gte, lt, lte];
 
@@ -291,7 +299,20 @@ const nativeRun = (text: string): unknown[] => {
 };
 
 suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
+  // ONE fixture for both engines. The TS side used to build from
+  // `createTestTinkerGraph()` while the native side decoded `MODERN`, so the two
+  // definitions could drift and any drift read as a divergence — which is
+  // exactly what happened when the multi-label vertex was added to only one of
+  // them. `createTestTinkerGraph` is the canonical TinkerPop Modern graph and is
+  // shared with the conformance suite, so the extra vertex is added HERE rather
+  // than to it.
   const tsGraph = createTestTinkerGraph();
+
+  tsGraph.addVertex({
+    id: '13',
+    labels: ['PERSON', 'SOFTWARE'],
+    properties: { name: 'hybrid', age: 40, lang: 'rust' },
+  });
   const SEED =
     process.env.FUZZ_SEED === undefined
       ? Math.floor(Math.random() * 0x1_0000_0000)

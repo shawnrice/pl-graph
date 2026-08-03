@@ -132,14 +132,25 @@ fn parse_line(line: &str) -> CodeResult<Option<Rec<'_>>> {
         Some("edge") => {
             let src = j.get("from").map(as_id).unwrap_or_default();
             let dst = j.get("to").map(as_id).unwrap_or_default();
-            let etype = match j
+            // Edges are MULTI-label, like vertices. This used to take only
+            // `.first()` and silently drop the rest, so a two-label edge
+            // round-tripped as one and `[:SECOND]` matched nothing — while the
+            // TS engine, whose `Edge.labels` is a `Set`, kept both.
+            let mut names = j
                 .get("labels")
                 .and_then(Json::as_array)
-                .and_then(<[Json]>::first)
-            {
-                Some(Json::Str(s)) => s.clone(),
-                _ => Cow::Borrowed(""),
-            };
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| match x {
+                            Json::Str(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+                .into_iter();
+            let etype = names.next().unwrap_or(Cow::Borrowed(""));
+            let extra_labels: Vec<Cow<'_, str>> = names.collect();
             // Optional external edge id (absent ⇒ id-less, stays lazy).
             let id = match j.get("id") {
                 Some(Json::Str(s)) => Some(s.clone()),
@@ -149,6 +160,7 @@ fn parse_line(line: &str) -> CodeResult<Option<Rec<'_>>> {
                 src,
                 dst,
                 etype,
+                extra_labels,
                 props: props_of(&j)?,
                 id,
             })
@@ -257,7 +269,14 @@ pub fn append(graph: &mut Graph, text: &str) -> CodeResult<MergeReport> {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect();
-            let ei = graph.add_edge(from, to, &e.etype, eprops);
+            let ei = if e.extra_labels.is_empty() {
+                graph.add_edge(from, to, &e.etype, eprops)
+            } else {
+                let mut names: Vec<&str> = vec![&e.etype];
+
+                names.extend(e.extra_labels.iter().map(std::convert::AsRef::as_ref));
+                graph.add_edge_labelled(from, to, &names, eprops)
+            };
             if let Some(id) = &e.id {
                 graph.set_edge_id(ei, id);
             }
@@ -464,7 +483,15 @@ pub fn encode(g: &Graph) -> String {
         out.push_str(",\"to\":");
         push_json_str(&mut out, g.vid.text(g.e_dst[i]));
         out.push_str(",\"labels\":[");
-        push_json_str(&mut out, g.etype.text(g.e_type[i]));
+
+        for (k, lid) in g.edge_labels(i as u32).into_iter().enumerate() {
+            if k > 0 {
+                out.push(',');
+            }
+
+            push_json_str(&mut out, g.etype.text(lid));
+        }
+
         out.push_str("],\"properties\":");
         push_props(&mut out, &g.edge_props, &g.strs, i);
         out.push_str("}\n");

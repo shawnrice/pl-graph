@@ -243,7 +243,8 @@ impl ElementSeek {
         };
 
         if self.edge {
-            return f.ids.contains(&graph.e_type[id as usize]);
+            // ANY of the edge's labels — edges are multi-label like vertices.
+            return f.ids.iter().any(|&t| graph.edge_has_label(id, t));
         }
 
         // ANY of the element's labels. Both languages want this: ISO GQL's
@@ -1069,6 +1070,24 @@ pub enum SelfLoops {
     Twice,
 }
 
+/// Does adjacency entry `a` match `etypes` (empty = any type)?
+///
+/// The ONE edge-label rule, shared by the per-vertex iterator and the bulk
+/// expansions. `need_extra` is [`Graph::etypes_need_extra_lookup`], hoisted by
+/// the caller: an edge's FIRST label is mirrored here, so only a query for a
+/// label that some edge carries as a SECOND one can need the sparse lookup.
+///
+/// A free function rather than a method on the iterator because the bulk
+/// expansions cannot afford `adj`'s chained-iterator form — routing them through
+/// it measured ~1.4x on a plain `out()` count, the same way it did for GQL's
+/// count shortcuts.
+#[inline]
+pub fn adj_keeps(graph: &Graph, a: &crate::graph::Adj, etypes: &[u32], need_extra: bool) -> bool {
+    etypes.is_empty()
+        || etypes.contains(&a.etype)
+        || (need_extra && etypes.iter().any(|&t| graph.edge_has_label(a.eidx, t)))
+}
+
 /// Every incident edge of `v` whose type is in `etypes` (empty = any), in
 /// ADJACENCY order: out-edges then in-edges, each in storage order.
 ///
@@ -1086,7 +1105,14 @@ pub fn adj<'a>(
     etypes: &'a [u32],
     loops: SelfLoops,
 ) -> impl Iterator<Item = crate::graph::Adj> + 'a {
-    let keep = move |t: u32| etypes.is_empty() || etypes.contains(&t);
+    // An edge's FIRST label is mirrored into its adjacency entry, so the common
+    // filter is one `u32` compare. A miss falls through to the edge's other
+    // labels ONLY when one of the labels asked for is actually carried as a
+    // secondary somewhere — decided once here, not per edge. Testing merely
+    // "does the graph hold any multi-label edge?" cost 2.4x on every traversal
+    // as soon as a single edge gained a second label.
+    let need_extra = graph.etypes_need_extra_lookup(etypes);
+    let keep = move |a: &crate::graph::Adj| adj_keeps(graph, a, etypes, need_extra);
     // Only an undirected walk can reach a self-loop twice; a directed one keeps
     // it either way.
     let drop_loop = dir == Dir::Both && loops == SelfLoops::Once;
@@ -1095,12 +1121,12 @@ pub fn adj<'a>(
         .then(|| graph.out_adj(v))
         .into_iter()
         .flatten()
-        .filter(move |a| keep(a.etype));
+        .filter(move |a| keep(a));
     let ins = (dir != Dir::Out)
         .then(|| graph.in_adj(v))
         .into_iter()
         .flatten()
-        .filter(move |a| keep(a.etype) && !(drop_loop && a.nbr == v));
+        .filter(move |a| keep(a) && !(drop_loop && a.nbr == v));
 
     outs.chain(ins)
 }
@@ -1117,21 +1143,22 @@ pub fn adj<'a>(
 #[must_use]
 pub fn expand(graph: &Graph, src: &[u32], dir: Dir, etypes: &[u32], loops: SelfLoops) -> Vec<u32> {
     let mut out = Vec::new();
-    let keep = |t: u32| etypes.is_empty() || etypes.contains(&t);
+    let need_extra = graph.etypes_need_extra_lookup(etypes);
+    let keep = |a: &crate::graph::Adj| adj_keeps(graph, a, etypes, need_extra);
     // Only an undirected walk can reach a loop twice; a directed one keeps it
     // either way.
     let drop_loop = dir == Dir::Both && loops == SelfLoops::Once;
 
     for &v in src {
         if dir != Dir::In {
-            out.extend(graph.out_adj(v).filter(|a| keep(a.etype)).map(|a| a.nbr));
+            out.extend(graph.out_adj(v).filter(|a| keep(a)).map(|a| a.nbr));
         }
 
         if dir != Dir::Out {
             out.extend(
                 graph
                     .in_adj(v)
-                    .filter(|a| keep(a.etype) && !(drop_loop && a.nbr == v))
+                    .filter(|a| keep(a) && !(drop_loop && a.nbr == v))
                     .map(|a| a.nbr),
             );
         }
@@ -1154,19 +1181,20 @@ pub fn expand_edges(
     loops: SelfLoops,
 ) -> Vec<u32> {
     let mut out = Vec::new();
-    let keep = |t: u32| etypes.is_empty() || etypes.contains(&t);
+    let need_extra = graph.etypes_need_extra_lookup(etypes);
+    let keep = |a: &crate::graph::Adj| adj_keeps(graph, a, etypes, need_extra);
     let drop_loop = dir == Dir::Both && loops == SelfLoops::Once;
 
     for &v in src {
         if dir != Dir::In {
-            out.extend(graph.out_adj(v).filter(|a| keep(a.etype)).map(|a| a.eidx));
+            out.extend(graph.out_adj(v).filter(|a| keep(a)).map(|a| a.eidx));
         }
 
         if dir != Dir::Out {
             out.extend(
                 graph
                     .in_adj(v)
-                    .filter(|a| keep(a.etype) && !(drop_loop && a.nbr == v))
+                    .filter(|a| keep(a) && !(drop_loop && a.nbr == v))
                     .map(|a| a.eidx),
             );
         }
@@ -1187,19 +1215,20 @@ pub fn expand_count(
     etypes: &[u32],
     loops: SelfLoops,
 ) -> usize {
-    let keep = |t: u32| etypes.is_empty() || etypes.contains(&t);
+    let need_extra = graph.etypes_need_extra_lookup(etypes);
+    let keep = |a: &crate::graph::Adj| adj_keeps(graph, a, etypes, need_extra);
     let drop_loop = dir == Dir::Both && loops == SelfLoops::Once;
     let mut n = 0;
 
     for &v in src {
         if dir != Dir::In {
-            n += graph.out_adj(v).filter(|a| keep(a.etype)).count();
+            n += graph.out_adj(v).filter(|a| keep(a)).count();
         }
 
         if dir != Dir::Out {
             n += graph
                 .in_adj(v)
-                .filter(|a| keep(a.etype) && !(drop_loop && a.nbr == v))
+                .filter(|a| keep(a) && !(drop_loop && a.nbr == v))
                 .count();
         }
     }

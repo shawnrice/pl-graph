@@ -462,6 +462,7 @@ pub fn decode(input: &str) -> Graph {
                 etype: labels.into_iter().next().unwrap_or_default(),
                 props,
                 id: None, // the .pg textual format has no edge-id slot
+                extra_labels: Vec::new(),
             });
         } else {
             let id = parse_id(tokens[0]);

@@ -365,6 +365,7 @@ impl Graph {
             Undo::VLabelAdd(vi, name) => self.remove_vertex_label(vi, &name),
             Undo::VLabelRemove(vi, name) => self.add_vertex_label(vi, &name),
             Undo::EType(ei, name) => self.add_edge_label(ei, &name),
+            Undo::ETypeRemove(ei, name) => self.remove_edge_label(ei, &name),
             Undo::DeleteVertex { vi, labels } => self.untombstone_vertex(vi, &labels),
             Undo::DeleteEdge { ei, eid } => self.untombstone_edge(ei, eid),
         }
@@ -653,8 +654,56 @@ impl Graph {
         etype: &str,
         props: Vec<(String, Value)>,
     ) -> u32 {
+        self.add_edge_labelled(from, to, &[etype], props)
+    }
+
+    /// Add an edge carrying SEVERAL labels — the general form.
+    ///
+    /// Edges are multi-label like vertices, matching the TS engine, where
+    /// `Edge.labels` has always been a `Set<string>`. The first label is stored
+    /// densely (every adjacency entry carries a copy, and the hot filter is one
+    /// `u32` compare); the rest go in the sparse `e_extra`, so a single-label
+    /// edge costs exactly what it did.
+    ///
+    /// An empty label list is not representable — an edge must have at least
+    /// one — so it interns the empty string, which is what the single-label form
+    /// did with `""` before.
+    pub fn add_edge_labelled(
+        &mut self,
+        from: u32,
+        to: u32,
+        labels: &[&str],
+        props: Vec<(String, Value)>,
+    ) -> u32 {
         let ei = self.e_src.len() as u32;
-        let tid = self.etype.intern(etype);
+        let mut ids: Vec<u32> = Vec::with_capacity(labels.len().max(1));
+
+        for l in labels
+            .iter()
+            .copied()
+            .chain(labels.is_empty().then_some(""))
+        {
+            let id = self.etype.intern(l);
+
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+
+        let tid = ids[0];
+
+        if ids.len() > 1 {
+            self.e_extra.insert(ei, ids[1..].to_vec());
+            self.extra_etypes.extend(ids[1..].iter().copied());
+            self.refresh_extra_mask();
+        }
+
+        // Every label buckets the edge, exactly as a vertex is bucketed under
+        // each of its labels — so a bucket seed for ANY of them finds it.
+        for &extra in &ids[1..] {
+            self.by_etype.entry(extra).or_default().push(ei);
+        }
+
         self.e_src.push(from);
         self.e_dst.push(to);
         self.e_type.push(tid);
@@ -685,7 +734,15 @@ impl Graph {
         // Topology change: drop the CSR snapshot, bump the global version and type.
         self.invalidate_csr();
         self.bump();
-        self.touch(etype);
+
+        for l in labels
+            .iter()
+            .copied()
+            .chain(labels.is_empty().then_some(""))
+        {
+            self.touch(l);
+        }
+
         self.record_undo(Undo::InsertEdge(ei));
         // Both endpoints' degree changed — note them for the commit-time
         // cardinality recheck (no-op unless inside a transaction with a
@@ -833,8 +890,130 @@ impl Graph {
         }
     }
 
-    /// An edge carries a single type; relabelling replaces it (last wins).
+    /// ADD a label to an edge, keeping the ones it already has.
+    ///
+    /// Edges are multi-label, like vertices — this used to REPLACE the type
+    /// (last wins), which is the single-label model and diverged from the TS
+    /// engine, where `Edge.labels` is a `Set<string>`.
+    ///
+    /// The first label stays dense in `e_type` (every adjacency entry mirrors
+    /// it); the rest live in the sparse `e_extra`. Adding the SECOND label to an
+    /// edge is therefore the moment `has_multi_label_edges` flips on, and
+    /// removing it is the moment it flips back — both directions are covered by
+    /// `edge_label_transitions_keep_the_fast_path_correct`.
     pub fn add_edge_label(&mut self, ei: u32, name: &str) {
+        let tid = self.etype.intern(name);
+
+        if self.edge_has_label(ei, tid) {
+            return; // already carried; adding twice is a no-op
+        }
+
+        if self.tx_active() {
+            self.record_undo(Undo::ETypeRemove(ei, name.to_string()));
+        }
+
+        self.e_extra.entry(ei).or_default().push(tid);
+        self.extra_etypes.insert(tid);
+        self.refresh_extra_mask();
+
+        if self.is_edge_live(ei) {
+            self.by_etype.entry(tid).or_default().push(ei);
+        }
+
+        self.bump();
+        self.touch(name);
+    }
+
+    /// Remove ONE label from an edge.
+    ///
+    /// Removing the first label promotes an extra into its place, which means
+    /// rewriting `e_type` and every adjacency mirror — the same work the old
+    /// replace-the-type path did. Removing the LAST remaining label leaves the
+    /// edge with the empty type, which is what an unlabelled edge has always
+    /// been. When the last EXTRA goes the map entry is dropped, so the
+    /// single-label fast path re-arms.
+    pub fn remove_edge_label(&mut self, ei: u32, name: &str) {
+        let Some(tid) = self.etype.get(name) else {
+            return; // a name no edge carries
+        };
+
+        if !self.edge_has_label(ei, tid) {
+            return;
+        }
+
+        if self.tx_active() {
+            self.record_undo(Undo::EType(ei, name.to_string()));
+        }
+
+        if self.e_type[ei as usize] == tid {
+            // Promote an extra, or fall back to the empty type.
+            let promoted = self
+                .e_extra
+                .get_mut(&ei)
+                .and_then(|extra| (!extra.is_empty()).then(|| extra.remove(0)));
+
+            let next = match promoted {
+                Some(next) => next,
+                None => self.etype.intern(""),
+            };
+
+            self.set_first_edge_label(ei, next);
+        } else if let Some(extra) = self.e_extra.get_mut(&ei) {
+            extra.retain(|&x| x != tid);
+        }
+
+        // An emptied extras list must LEAVE the map: `has_multi_label_edges`
+        // reads `e_extra.is_empty()`, so a stale empty entry would keep every
+        // adjacency filter on the slow path forever.
+        if self.e_extra.get(&ei).is_some_and(Vec::is_empty) {
+            self.e_extra.remove(&ei);
+        }
+
+        // `extra_etypes` is what keeps the adjacency filter cheap, so a label
+        // that is no longer anyone's extra must LEAVE it — otherwise every query
+        // for that label stays on the slow path for good. Recomputed rather than
+        // refcounted: removals are rare and the map is small.
+        if self.e_extra.is_empty() {
+            self.extra_etypes.clear();
+        } else if !self.e_extra.values().any(|v| v.contains(&tid)) {
+            self.extra_etypes.remove(&tid);
+        }
+
+        self.refresh_extra_mask();
+
+        if let Some(bucket) = self.by_etype.get_mut(&tid) {
+            bucket.retain(|&x| x != ei);
+        }
+
+        self.invalidate_csr();
+        self.bump();
+        self.touch(name);
+    }
+
+    /// Replace an edge's FIRST label, updating both adjacency mirrors.
+    fn set_first_edge_label(&mut self, ei: u32, tid: u32) {
+        let i = ei as usize;
+
+        self.e_type[i] = tid;
+
+        let (src, dst) = (self.e_src[i] as usize, self.e_dst[i] as usize);
+
+        for a in self.out[src].iter_mut().filter(|a| a.eidx == ei) {
+            a.etype = tid;
+        }
+
+        for a in self.in_[dst].iter_mut().filter(|a| a.eidx == ei) {
+            a.etype = tid;
+        }
+
+        if self.is_edge_live(ei) {
+            self.by_etype.entry(tid).or_default().push(ei);
+        }
+    }
+
+    /// Replace an edge's whole label set with one label (the old single-label
+    /// `add_edge_label` behaviour), used by the codecs and `SET` on a type.
+    pub fn set_edge_label(&mut self, ei: u32, name: &str) {
         let tid = self.etype.intern(name);
         let i = ei as usize;
         // Move the edge between type buckets when its type actually changes.
@@ -870,11 +1049,6 @@ impl Graph {
             self.touch(name);
         }
     }
-    pub fn remove_edge_label(&mut self, ei: u32, _name: &str) {
-        // Single-type edges: removing the label clears the type to empty.
-        self.add_edge_label(ei, "");
-    }
-
     /// Delete an edge (tombstone + unlink from both endpoints' adjacency).
     pub fn remove_edge(&mut self, ei: u32) {
         let i = ei as usize;

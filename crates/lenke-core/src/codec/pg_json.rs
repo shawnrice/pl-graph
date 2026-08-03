@@ -161,6 +161,7 @@ pub fn decode(input: &str) -> CodeResult<Graph> {
                     etype: etype.into(),
                     props: json_props(o.get("properties"))?,
                     id: o.get("id").map(json_id),
+                    extra_labels: Vec::new(),
                 });
             }
         }

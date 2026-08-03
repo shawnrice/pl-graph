@@ -854,6 +854,7 @@ pub fn decode(input: &str) -> CodeResult<Graph> {
                 etype: etype.into(),
                 props: crate::graph::owned_props(props_from_row(row, &prop_cols, 4)),
                 id: id.map(Into::into),
+                extra_labels: Vec::new(),
             });
         }
     }

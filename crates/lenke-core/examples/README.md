@@ -204,3 +204,10 @@ literal alike). The same family of gap as the clause-WHERE one, still open.
 - **Transactions** are not covered from JS. `perf_bench` shows `set_prop` inside
   a transaction at ~2.5x the cost of outside one on the Rust core; the TS
   equivalent is unmeasured.
+
+- `edge_label_transition_bench` — what does ONE multi-label edge cost the whole
+  graph? `edge_has_label` short-circuits on `e_extra.is_empty()`, so a single
+  multi-label edge anywhere disarms that fast path for every traversal. Answers
+  whether the sparse side table is the right shape, and would catch a regression
+  that made the multi-label case scale with graph size rather than with the
+  number of multi-label edges.

@@ -685,6 +685,29 @@ fn xor3(a: Truth, b: Truth) -> Truth {
 }
 
 /// JS `Number(v)` for the cases that matter; `None` only for nullish.
+/// JS-style numeric coercion. `None` means "no value" (null), which callers skip.
+///
+/// WHERE THIS IS REACHABLE — it is not the general numeric conversion, and
+/// arithmetic does NOT go through it:
+///
+/// ```text
+///   MATCH (n) RETURN sum(n.b)        1.0    booleans coerce (true=1, false=0)
+///   MATCH (n) RETURN sum(n.s)        10.5   strings parse ("3.5" + "7")
+///   MATCH (n) RETURN avg(n.b)        0.5
+///   RETURN left('abcdef', true)      'a'    a numeric ARGUMENT to a string fn
+///   RETURN round('3.7')              4.0
+///   RETURN true + 0                  ERROR  arithmetic requires a number
+///   RETURN '3' + 0                   ERROR
+///   MATCH (n) RETURN min(n.s)        '3.5'  min/max use the total ORDER, not this
+/// ```
+///
+/// So: the aggregate accumulator (`matcher::step`), `VVec::into_num`, and the
+/// numeric arguments of `Left`/`Right`/`Range`/`Round`/`Sign`/`Substring`.
+///
+/// This is where GQL and Gremlin genuinely differ, and only here: on the same
+/// data `g.V().values('b').sum()` is a TYPE ERROR in Gremlin (`strict_num`,
+/// matching TinkerPop) where `sum(n.b)` is 1.0 here. Both engines agree on
+/// numbers. Do not "unify" the two — the divergence is the contract.
 fn num_of(v: &Val) -> Option<f64> {
     match v {
         Val::Null => None,

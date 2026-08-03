@@ -2204,3 +2204,118 @@ fn dict_clone_keeps_lookups_working() {
         assert_eq!(c.get(&format!("v{i}")), Some(i));
     }
 }
+
+#[cfg(test)]
+mod edge_labels {
+    //! Edges are MULTI-label, like vertices. The first label is dense (mirrored
+    //! into every adjacency entry); the rest are sparse, so a single-label graph
+    //! pays nothing — which puts all the risk on the crossings between the two.
+    use crate::graph::*;
+
+    /// An edge crossing between single- and multi-label, in both directions.
+    ///
+    /// `edge_has_label` short-circuits on `e_extra.is_empty()` so that a graph with
+    /// no multi-label edge pays nothing — which makes the CROSSINGS the dangerous
+    /// part, not either steady state. Going up, the flag must arm the moment a
+    /// second label lands. Coming down, the map entry must be REMOVED rather than
+    /// left empty, or every adjacency filter stays on the slow path for the rest of
+    /// the graph's life while still answering correctly — a silent performance
+    /// cliff no correctness test would catch.
+    #[test]
+    fn edge_label_transitions_keep_the_fast_path_correct() {
+        let mut g = crate::ndjson::decode(
+            &[
+                r#"{"type":"node","id":"a","labels":["N"],"properties":{}}"#,
+                r#"{"type":"node","id":"b","labels":["N"],"properties":{}}"#,
+                r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("fixture decodes");
+        let (a, b) = (g.vid.get("a").unwrap(), g.vid.get("b").unwrap());
+        let e = 0u32;
+
+        let has = |g: &Graph, name: &str| g.etype.get(name).is_some_and(|t| g.edge_has_label(e, t));
+
+        // --- single label: the fast path is armed ---
+        assert!(!g.has_multi_label_edges());
+        assert!(has(&g, "R"));
+        assert!(!has(&g, "S"));
+        assert_eq!(g.edge_labels(e).len(), 1);
+
+        // --- single -> multi ---
+        g.add_edge_label(e, "S");
+        assert!(
+            g.has_multi_label_edges(),
+            "second label must arm the slow path"
+        );
+        assert!(has(&g, "R") && has(&g, "S"));
+        assert_eq!(g.edge_labels(e).len(), 2);
+
+        // Adding a label it already carries changes nothing.
+        g.add_edge_label(e, "S");
+        assert_eq!(g.edge_labels(e).len(), 2);
+
+        // --- multi -> single: drop the EXTRA ---
+        g.remove_edge_label(e, "S");
+        assert!(
+            !g.has_multi_label_edges(),
+            "removing the last extra must re-arm the fast path, not leave an empty entry"
+        );
+        assert!(has(&g, "R") && !has(&g, "S"));
+        assert_eq!(g.edge_labels(e).len(), 1);
+
+        // --- multi -> single: drop the FIRST, promoting an extra ---
+        g.add_edge_label(e, "S");
+        g.remove_edge_label(e, "R");
+        assert!(
+            !g.has_multi_label_edges(),
+            "one label left: fast path re-armed"
+        );
+        assert!(has(&g, "S") && !has(&g, "R"));
+        assert_eq!(g.edge_labels(e), vec![g.etype.get("S").unwrap()]);
+
+        // The promoted label must also reach the ADJACENCY mirrors, which is what
+        // every traversal filters on — not just `e_type`.
+        let s = g.etype.get("S").unwrap();
+        assert!(g.out_adj(a).any(|x| x.eidx == e && x.etype == s));
+        assert!(g.in_adj(b).any(|x| x.eidx == e && x.etype == s));
+
+        // --- removing the last label leaves the empty type, as an unlabelled edge ---
+        g.remove_edge_label(e, "S");
+        assert!(!g.has_multi_label_edges());
+        assert_eq!(g.edge_labels(e).len(), 1);
+        assert!(!has(&g, "S"));
+    }
+
+    /// A bucket seed must find an edge by ANY of its labels.
+    #[test]
+    fn an_edge_is_bucketed_under_every_label_it_carries() {
+        let mut g = crate::ndjson::decode(
+            &[
+                r#"{"type":"node","id":"a","labels":["N"],"properties":{}}"#,
+                r#"{"type":"node","id":"b","labels":["N"],"properties":{}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("fixture decodes");
+        let (a, b) = (g.vid.get("a").unwrap(), g.vid.get("b").unwrap());
+        let e = g.add_edge_labelled(a, b, &["R", "S"], vec![]);
+
+        for name in ["R", "S"] {
+            let t = g.etype.get(name).expect("interned");
+
+            assert!(
+                g.edges_with_etype(t).contains(&e),
+                "edge missing from the `{name}` bucket"
+            );
+        }
+
+        // …and leaves it when the label does.
+        g.remove_edge_label(e, "S");
+
+        let s = g.etype.get("S").expect("interned");
+
+        assert!(!g.edges_with_etype(s).contains(&e));
+    }
+}

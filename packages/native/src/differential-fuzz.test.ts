@@ -38,7 +38,14 @@ const suite = existsSync(LIB) ? describe : describe.skip;
 const NDJSON = [
   '{"type":"node","id":"1","labels":["T"],"properties":{"n":3,"s":"a","x":-1,"m":{"k":1,"j":"q"}}}',
   '{"type":"node","id":"2","labels":["T"],"properties":{"n":7,"s":"z","x":4,"m":{"k":2,"j":"r"}}}',
+  // Vertex 3 carries TWO labels, so `(n:T)` and `(n:U)` must BOTH find it. With
+  // every vertex single-labelled, "match any label" and "match the first label"
+  // are indistinguishable, and a label bug hides — which is how native's Gremlin
+  // `hasLabel` matched only the first label for a long time without any fuzzer
+  // noticing.
+  '{"type":"node","id":"3","labels":["T","U"],"properties":{"n":5,"s":"m","x":2,"m":{"k":3,"j":"s"}}}',
   '{"type":"edge","id":"e1","labels":["E"],"from":"1","to":"2","properties":{"w":2}}',
+  '{"type":"edge","id":"e2","labels":["E"],"from":"2","to":"3","properties":{"w":5}}',
 ].join('\n');
 
 // --- seeded PRNG (mulberry32) -----------------------------------------------

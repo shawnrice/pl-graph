@@ -326,6 +326,7 @@ pub fn decode(input: &str) -> CodeResult<Graph> {
                 etype: etype.into(),
                 props,
                 id,
+                extra_labels: Vec::new(),
             });
         }
     }

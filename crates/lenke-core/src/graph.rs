@@ -1513,7 +1513,30 @@ pub struct Graph {
     /// edges (parallel arrays); `e_live` tombstones deletions
     pub e_src: Vec<u32>,
     pub e_dst: Vec<u32>,
+    /// Each edge's FIRST label. Kept dense and single-valued because every
+    /// adjacency entry carries a copy and the hot filter is one `u32` compare.
     pub e_type: Vec<u32>,
+    /// Labels BEYOND the first, for the rare edge that carries more than one.
+    /// Sparse on purpose: an edge with a single label — almost all of them —
+    /// costs nothing, and while this is empty the adjacency filter is exactly
+    /// what it was. See `edge_has_label`.
+    e_extra: HashMap<u32, Vec<u32>>,
+    /// Which label ids appear on an edge as something OTHER than its first.
+    ///
+    /// The adjacency filter mirrors each edge's first label, so a query for a
+    /// label that is never a second label can never need the sparse lookup — and
+    /// that is nearly every query, even in a graph that does hold multi-label
+    /// edges. Testing the whole graph instead ("does ANY edge have extras?") cost
+    /// 2.4x on every traversal the moment one edge gained a second label.
+    extra_etypes: HashSet<u32>,
+    /// `extra_etypes` as a 64-bit Bloom filter (`1 << (tid % 64)`).
+    ///
+    /// The adjacency filter asks "could this label be someone's SECOND?" once
+    /// per vertex, so the test has to be a couple of instructions — a `HashSet`
+    /// probe there cost 0.26 ms over 50k vertices, which was most of the
+    /// multi-label overhead. A false positive only means falling through to the
+    /// exact check, which is correct anyway.
+    extra_mask: u64,
     /// inverted index: edge type id -> live edges. The edge analogue of
     /// `by_label`; seeds `()-[:T]->()` patterns from the type directly instead
     /// of scanning every edge. Always on (same as `by_label`), maintained by the
@@ -1706,6 +1729,9 @@ impl Clone for Graph {
             e_src: self.e_src.clone(),
             e_dst: self.e_dst.clone(),
             e_type: self.e_type.clone(),
+            e_extra: self.e_extra.clone(),
+            extra_etypes: self.extra_etypes.clone(),
+            extra_mask: self.extra_mask,
             by_etype: self.by_etype.clone(),
             eid_fwd: self.eid_fwd.clone(),
             eid_rev: self.eid_rev.clone(),
@@ -1767,8 +1793,10 @@ enum Undo {
     VLabelAdd(u32, String),
     /// A label removed from a vertex — undo by re-adding it.
     VLabelRemove(u32, String),
-    /// An edge type replaced (edges carry a single type) — restore the prior type name.
+    /// A label REMOVED from an edge — undo by re-adding it.
     EType(u32, String),
+    /// A label ADDED to an edge — undo by removing it.
+    ETypeRemove(u32, String),
     /// A deleted vertex — undo by un-tombstoning the slot and restoring its labels
     /// (its incident edges are restored by their own `DeleteEdge` inverses, which
     /// were recorded during the delete cascade and so replay after this one).
@@ -2035,6 +2063,67 @@ pub struct RangeBound {
 }
 
 impl Graph {
+    /// Every label id on edge `ei` — its first, then any extras.
+    ///
+    /// Edges are multi-label like vertices. The TS engine has always modelled
+    /// them that way (`Edge.labels` is a `Set<string>`); native stored a single
+    /// `e_type` and silently DROPPED the rest on import, so a two-label edge
+    /// round-tripped as one and `[:SECOND]` matched nothing.
+    #[must_use]
+    pub fn edge_labels(&self, ei: u32) -> Vec<u32> {
+        let mut out = vec![self.e_type[ei as usize]];
+
+        if let Some(extra) = self.e_extra.get(&ei) {
+            out.extend_from_slice(extra);
+        }
+
+        out
+    }
+
+    /// Does edge `ei` carry label `tid`?
+    ///
+    /// The `is_empty` check is what keeps the adjacency filter free: with no
+    /// multi-label edge anywhere — the overwhelming case — this is exactly the
+    /// single `u32` compare it replaced, and the map is never consulted.
+    #[must_use]
+    pub fn edge_has_label(&self, ei: u32, tid: u32) -> bool {
+        self.e_type[ei as usize] == tid
+            || (!self.e_extra.is_empty()
+                && self
+                    .e_extra
+                    .get(&ei)
+                    .is_some_and(|extra| extra.contains(&tid)))
+    }
+
+    /// Whether ANY edge carries more than one label. Callers that filter
+    /// adjacency by type use this to keep their fast path.
+    #[must_use]
+    pub fn has_multi_label_edges(&self) -> bool {
+        !self.e_extra.is_empty()
+    }
+
+    /// Could a query for any of `etypes` need to look past an edge's FIRST
+    /// label? False for every label that is never carried as a secondary one,
+    /// which keeps the adjacency filter at a single `u32` compare.
+    #[must_use]
+    pub fn etypes_need_extra_lookup(&self, etypes: &[u32]) -> bool {
+        self.extra_mask != 0
+            && etypes
+                .iter()
+                .any(|t| self.extra_mask & Self::etype_bit(*t) != 0)
+    }
+
+    const fn etype_bit(tid: u32) -> u64 {
+        1u64 << (tid % 64)
+    }
+
+    /// Rebuild the Bloom filter from `extra_etypes`.
+    pub(crate) fn refresh_extra_mask(&mut self) {
+        self.extra_mask = self
+            .extra_etypes
+            .iter()
+            .fold(0, |m, &t| m | Self::etype_bit(t));
+    }
     // --- reads -------------------------------------------------------------
 
     pub fn vertex_count(&self) -> usize {
@@ -2752,7 +2841,12 @@ pub struct NodeRec<'a> {
 pub struct EdgeRec<'a> {
     pub src: Cow<'a, str>,
     pub dst: Cow<'a, str>,
+    /// The edge's FIRST label. Edges are multi-label; the rest are in
+    /// `extra_labels`, kept separate so the many callers that build a
+    /// single-label edge are unchanged.
     pub etype: Cow<'a, str>,
+    /// Labels beyond the first — usually empty.
+    pub extra_labels: Vec<Cow<'a, str>>,
     pub props: Vec<(Cow<'a, str>, Value)>,
     /// Optional external string id. The dense edge index is the edge's canonical
     /// identity; this is an opt-in overlay (set by codecs that carry edge ids) so
@@ -2786,6 +2880,29 @@ impl EdgeRec<'static> {
             src: Cow::Owned(src),
             dst: Cow::Owned(dst),
             etype: Cow::Owned(etype),
+            extra_labels: Vec::new(),
+            props: owned_props(props),
+            id: id.map(Cow::Owned),
+        }
+    }
+
+    /// An owned record carrying SEVERAL labels.
+    #[must_use]
+    pub fn owned_labelled(
+        src: String,
+        dst: String,
+        labels: Vec<String>,
+        props: Vec<(String, Value)>,
+        id: Option<String>,
+    ) -> Self {
+        let mut it = labels.into_iter();
+        let first = it.next().unwrap_or_default();
+
+        Self {
+            src: Cow::Owned(src),
+            dst: Cow::Owned(dst),
+            etype: Cow::Owned(first),
+            extra_labels: it.map(Cow::Owned).collect(),
             props: owned_props(props),
             id: id.map(Cow::Owned),
         }
@@ -3029,6 +3146,31 @@ impl Builder<'_> {
                 )
             })
             .collect();
+        // Labels beyond the first, for the rare multi-label edge. Built here so
+        // the bulk path matches `add_edge_labelled`: every label buckets the
+        // edge, and `extra_etypes` is what keeps the adjacency filter cheap.
+        let mut e_extra: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut extra_etypes: HashSet<u32> = HashSet::new();
+
+        for (ei, ed) in kept_edges.iter().enumerate() {
+            if ed.extra_labels.is_empty() {
+                continue;
+            }
+
+            let first = resolved[ei].2;
+            let ids: Vec<u32> = ed
+                .extra_labels
+                .iter()
+                .map(|l| etype.intern(l))
+                .filter(|&t| t != first)
+                .collect();
+
+            if !ids.is_empty() {
+                extra_etypes.extend(ids.iter().copied());
+                e_extra.insert(ei as u32, ids);
+            }
+        }
+
         let mut out_deg = vec![0u32; n];
         let mut in_deg = vec![0u32; n];
         let mut etype_count: Vec<u32> = Vec::new();
@@ -3061,6 +3203,12 @@ impl Builder<'_> {
             e_dst[i] = d;
             e_type[i] = t;
             by_etype.entry(t).or_default().push(i as u32);
+
+            // …and under every OTHER label it carries, so a bucket seed for any
+            // of them finds it — the same rule a vertex's label buckets follow.
+            for &x in e_extra.get(&(i as u32)).into_iter().flatten() {
+                by_etype.entry(x).or_default().push(i as u32);
+            }
             out[s as usize].push(Adj {
                 eidx: i as u32,
                 nbr: d,
@@ -3097,6 +3245,9 @@ impl Builder<'_> {
             e_src,
             e_dst,
             e_type,
+            e_extra,
+            extra_mask: extra_etypes.iter().fold(0, |m, &t| m | (1u64 << (t % 64))),
+            extra_etypes,
             by_etype,
             eid_fwd,
             eid_rev,
