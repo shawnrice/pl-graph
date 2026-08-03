@@ -11176,3 +11176,63 @@ fn a_label_disjunction_over_multi_label_elements_counts_each_once() {
         2.0
     );
 }
+
+/// The `count(*)` shortcuts must see PAST an edge's first label.
+///
+/// They tested `a.etype` — an edge's FIRST label — which was the whole story
+/// until edges became multi-label. `MATCH (a)-[:Y]->(b)-[:Y]->(c)` over an edge
+/// labelled [X, Y] then answered 0 where the answer is 1: a wrong count, from a
+/// path taken only when the shape qualifies for a shortcut, so the general
+/// matcher answered correctly and nothing disagreed.
+#[test]
+fn the_count_shortcuts_see_every_edge_label() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{}}"#,
+            r#"{"type":"node","id":"b","labels":["N"],"properties":{}}"#,
+            r#"{"type":"node","id":"c","labels":["N"],"properties":{}}"#,
+            // FIRST label X, second Y — a `[:Y]` shortcut must still find it.
+            r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["X","Y"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e1","from":"b","to":"c","labels":["Y"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let n = |g: &mut Graph, q: &str| match rows(g, q).first().and_then(|r| r.first()) {
+        Some(Value::Num(x)) => *x,
+        other => panic!("expected a count, got {other:?}"),
+    };
+
+    // try_count_edges
+    assert_eq!(
+        n(&mut g, "MATCH (a:N)-[:Y]->(b:N) RETURN count(*) AS c"),
+        2.0
+    );
+    assert_eq!(
+        n(&mut g, "MATCH (a:N)-[:X]->(b:N) RETURN count(*) AS c"),
+        1.0
+    );
+
+    // try_count_two_hop — the one that answered 0
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH (a:N)-[:Y]->(b:N)-[:Y]->(c:N) RETURN count(*) AS c"
+        ),
+        1.0
+    );
+
+    // …and each shortcut agrees with the general matcher, which never used the
+    // first-label shorthand.
+    for q in [
+        "MATCH (a:N)-[:Y]->(b:N) RETURN count(*) AS c",
+        "MATCH (a:N)-[:Y]->(b:N)-[:Y]->(c:N) RETURN count(*) AS c",
+    ] {
+        assert_eq!(
+            rows(&mut g, q),
+            super::eval::with_vec_override(false, || rows(&mut g, q)),
+            "shortcut disagrees with the general matcher on `{q}`"
+        );
+    }
+}

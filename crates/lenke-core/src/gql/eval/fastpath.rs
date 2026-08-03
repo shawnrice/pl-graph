@@ -184,20 +184,23 @@ pub(super) fn try_count_edges(
                 .and_then(seed_label)
                 .and_then(|r| ctx.labels[r].0)
                 .map_or(&[], |lid| graph.vertices_with_label(lid));
-            let mut count: usize = 0;
-            for &v in seeds {
-                // The bucket is only a *superset* for a conjunct label — re-validate.
-                if !matches_label(graph, &ctx, v, seed_lbl) {
-                    continue;
-                }
-                let hit =
-                    |a: &Adj| tids.contains(&a.etype) && matches_label(graph, &ctx, a.nbr, far_lbl);
-                count += if v_is_src {
-                    graph.out_adj(v).filter(hit).count()
-                } else {
-                    graph.in_adj(v).filter(hit).count()
-                };
-            }
+            // The multi-label fallback is selected ONCE, not tested per edge:
+            // a graph whose edges are all single-label runs the identical closure
+            // it always did. Carrying the test inline measured 1.18x on this
+            // query even when it was always false — and wrapping it in the shared
+            // `etype_hit` (an `Option` match plus a call) measured 1.55x.
+            let seen_first = |a: &Adj| tids.contains(&a.etype);
+            let seen_any = |a: &Adj| tids.iter().any(|&t| graph.edge_has_label(a.eidx, t));
+            let near = |v: u32| matches_label(graph, &ctx, v, seed_lbl);
+            let far = |v: u32| matches_label(graph, &ctx, v, far_lbl);
+
+            let count = if graph.etypes_need_extra_lookup(&tids) {
+                count_incident(graph, seeds, v_is_src, near, |a| seen_any(a) && far(a.nbr))
+            } else {
+                count_incident(graph, seeds, v_is_src, near, |a| {
+                    seen_first(a) && far(a.nbr)
+                })
+            };
             let mut rs = RowSet::new(proj.out_names.clone());
             rs.push_row(std::iter::once(Value::Num(count as f64)));
             return Some(rs);
@@ -267,6 +270,67 @@ pub(super) fn rel_type_set(ctx: &Ctx, label: Option<&CLabelExpr>) -> Option<Opti
 /// in-iterator so one call serves either direction; in a tight counting loop that
 /// chain does not optimize away, and these shortcuts only ever want ONE side.
 /// Sharing an adjacency walk is not free everywhere it is possible.
+/// Incident edges of `b` on one side passing `hit`. Generic so each caller's
+/// predicate monomorphizes — see `count_incident`.
+fn count_one_side<H: Fn(&Adj) -> bool>(graph: &Graph, b: u32, out_side: bool, hit: H) -> u64 {
+    if out_side {
+        graph.out_adj(b).filter(|a| hit(a)).count() as u64
+    } else {
+        graph.in_adj(b).filter(|a| hit(a)).count() as u64
+    }
+}
+
+/// Sum, over `seeds` passing `near`, the incident edges passing `hit`.
+///
+/// Generic in the predicate so each caller's version monomorphizes: the
+/// multi-label fallback is chosen once by the caller rather than tested per edge.
+fn count_incident<N, H>(graph: &Graph, seeds: &[u32], out_side: bool, near: N, hit: H) -> usize
+where
+    N: Fn(u32) -> bool,
+    H: Fn(&Adj) -> bool,
+{
+    let mut n = 0;
+
+    for &v in seeds {
+        // A label bucket is only a SUPERSET for a conjunct label — re-validate.
+        if !near(v) {
+            continue;
+        }
+
+        n += if out_side {
+            graph.out_adj(v).filter(|a| hit(a)).count()
+        } else {
+            graph.in_adj(v).filter(|a| hit(a)).count()
+        };
+    }
+
+    n
+}
+
+/// Does adjacency entry `a` match this shortcut's edge-type filter?
+///
+/// Wraps the ONE edge-label rule (`seek::adj_keeps`) in this module's convention:
+/// `None` means any type, `Some(&[])` means none. Testing `a.etype` alone — which
+/// is only an edge's FIRST label — made `MATCH (a)-[:Y]->(b)-[:Y]->(c)` answer 0
+/// where the answer is 1, once edges became multi-label.
+///
+/// `need_extra` is [`Graph::etypes_need_extra_lookup`], hoisted per query: an
+/// edge's first label is mirrored into its adjacency entry, so only a query for a
+/// label some edge carries as a SECOND one ever looks further.
+pub(super) fn etype_hit(graph: &Graph, set: &Option<Vec<u32>>, a: &Adj, need_extra: bool) -> bool {
+    match set {
+        None => true,
+        Some(ids) if ids.is_empty() => false,
+        Some(ids) => crate::seek::adj_keeps(graph, a, ids, need_extra),
+    }
+}
+
+/// Whether any of `set`'s types is carried as a non-first edge label.
+pub(super) fn set_needs_extra(graph: &Graph, set: &Option<Vec<u32>>) -> bool {
+    set.as_ref()
+        .is_some_and(|ids| graph.etypes_need_extra_lookup(ids))
+}
+
 pub(super) fn etype_ok(set: &Option<Vec<u32>>, etype: u32) -> bool {
     set.as_ref().is_none_or(|v| v.contains(&etype))
 }
@@ -350,13 +414,21 @@ pub(super) fn try_count_two_hop(
     let count_side = |b: u32, out_side: bool, tset: &Option<Vec<u32>>, far: Option<&CLabelExpr>| {
         // `out_adj`/`in_adj` are distinct opaque iterator types, so branch the whole
         // count rather than the iterator binding.
-        let keep =
+        //
+        // The multi-label fallback is chosen ONCE per side, not tested per edge —
+        // routing this through the shared `etype_hit` (an `Option` match plus a
+        // call, per edge) measured 1.24x on `[e] 2-hop join count`.
+        let first_only =
             |adj: &Adj| etype_ok(tset, adj.etype) && matches_label(graph, &ctx, adj.nbr, far);
-        if out_side {
-            graph.out_adj(b).filter(keep).count() as u64
-        } else {
-            graph.in_adj(b).filter(keep).count() as u64
+        let any_label = |adj: &Adj| {
+            etype_hit(graph, tset, adj, true) && matches_label(graph, &ctx, adj.nbr, far)
+        };
+
+        if set_needs_extra(graph, tset) {
+            return count_one_side(graph, b, out_side, any_label);
         }
+
+        count_one_side(graph, b, out_side, first_only)
     };
     let to_a_out = seg1.rel.direction == Direction::In; // In ⇒ a via b's out-edges
     let from_c_out = seg2.rel.direction == Direction::Out; // Out ⇒ c via b's out-edges
@@ -660,24 +732,30 @@ pub(super) fn try_count_varlen_1_2(
 
     let ctx = resolve_ctx(graph, plan, params);
     let tset = rel_type_set(&ctx, rel.label.as_ref())?;
+    let need_extra_tset = set_needs_extra(graph, &tset);
     let la = path.start.label.as_ref(); // the `a` end
     let lb = seg.node.label.as_ref(); // the `b` end
+    let need_extra = need_extra_tset;
     let out_to_lb = |x: u32| -> u64 {
         graph
             .out_adj(x)
-            .filter(|a| etype_ok(&tset, a.etype) && matches_label(graph, &ctx, a.nbr, lb))
+            .filter(|a| {
+                etype_hit(graph, &tset, a, need_extra) && matches_label(graph, &ctx, a.nbr, lb)
+            })
             .count() as u64
     };
     let in_from_la = |x: u32| -> u64 {
         graph
             .in_adj(x)
-            .filter(|a| etype_ok(&tset, a.etype) && matches_label(graph, &ctx, a.nbr, la))
+            .filter(|a| {
+                etype_hit(graph, &tset, a, need_extra) && matches_label(graph, &ctx, a.nbr, la)
+            })
             .count() as u64
     };
     let self_loops = |x: u32| -> u64 {
         graph
             .out_adj(x)
-            .filter(|a| etype_ok(&tset, a.etype) && a.nbr == x)
+            .filter(|a| etype_hit(graph, &tset, a, need_extra) && a.nbr == x)
             .count() as u64
     };
     // Per middle-vertex `x`: (length-1 from x as `a`, length-2 through x, self-loop
@@ -839,6 +917,7 @@ pub(super) fn try_grouped_varlen_1_2(
 
     let ctx = resolve_ctx(graph, plan, params);
     let tset = rel_type_set(&ctx, rel.label.as_ref())?;
+    let need_extra_tset = set_needs_extra(graph, &tset);
     let la = path.start.label.as_ref();
     let lb = seg.node.label.as_ref();
     let n = graph.n;
@@ -847,7 +926,9 @@ pub(super) fn try_grouped_varlen_1_2(
     let into: Vec<u64> = par_map(n, |x| {
         graph
             .in_adj(x)
-            .filter(|a| etype_ok(&tset, a.etype) && matches_label(graph, &ctx, a.nbr, la))
+            .filter(|a| {
+                etype_hit(graph, &tset, a, need_extra_tset) && matches_label(graph, &ctx, a.nbr, la)
+            })
             .count() as u64
     });
 
@@ -870,7 +951,7 @@ pub(super) fn try_grouped_varlen_1_2(
         if hi >= 2 {
             let l2: i64 = graph
                 .in_adj(b)
-                .filter(|a| etype_ok(&tset, a.etype))
+                .filter(|a| etype_hit(graph, &tset, a, need_extra_tset))
                 .map(|a| into[a.nbr as usize] as i64)
                 .sum();
             m += l2;
@@ -878,7 +959,7 @@ pub(super) fn try_grouped_varlen_1_2(
                 // Trail correction: a→b→b reusing the same self-loop edge.
                 let sl = graph
                     .out_adj(b)
-                    .filter(|a| etype_ok(&tset, a.etype) && a.nbr == b)
+                    .filter(|a| etype_hit(graph, &tset, a, need_extra_tset) && a.nbr == b)
                     .count() as i64;
                 m -= sl;
             }
@@ -1058,7 +1139,9 @@ pub(super) fn try_grouped_2hop(
 
     let ctx = resolve_ctx(graph, plan, params);
     let t1 = rel_type_set(&ctx, seg1.rel.label.as_ref())?;
+    let need_extra_t1 = set_needs_extra(graph, &t1);
     let t2 = rel_type_set(&ctx, seg2.rel.label.as_ref())?;
+    let need_extra_t2 = set_needs_extra(graph, &t2);
     let la = path.start.label.as_ref();
     let lb = seg1.node.label.as_ref();
     let lc = seg2.node.label.as_ref();
@@ -1071,7 +1154,9 @@ pub(super) fn try_grouped_2hop(
         }
         graph
             .in_adj(b)
-            .filter(|e| etype_ok(&t1, e.etype) && matches_label(graph, &ctx, e.nbr, la))
+            .filter(|e| {
+                etype_hit(graph, &t1, e, need_extra_t1) && matches_label(graph, &ctx, e.nbr, la)
+            })
             .count() as u64
     });
     // Per endpoint `c` (matching Lc): Σ over T2-edges b→c of into[b] (walk count).
@@ -1081,7 +1166,7 @@ pub(super) fn try_grouped_2hop(
         }
         graph
             .in_adj(c)
-            .filter(|e| etype_ok(&t2, e.etype))
+            .filter(|e| etype_hit(graph, &t2, e, need_extra_t2))
             .map(|e| into[e.nbr as usize] as i64)
             .sum()
     });
@@ -1239,6 +1324,7 @@ pub(super) fn try_count_distinct_endpoint(
 
     let ctx = resolve_ctx(graph, plan, params);
     let tset = rel_type_set(&ctx, rel.label.as_ref())?;
+    let need_extra_tset = set_needs_extra(graph, &tset);
     let la = path.start.label.as_ref();
     let lb = seg.node.label.as_ref();
     // A distinct endpoint `n`: matches `Lb` and has ≥1 `T`-edge from an `La` start.
@@ -1246,11 +1332,9 @@ pub(super) fn try_count_distinct_endpoint(
         if !matches_label(graph, &ctx, n, lb) {
             return 0;
         }
-        u64::from(
-            graph
-                .in_adj(n)
-                .any(|e| etype_ok(&tset, e.etype) && matches_label(graph, &ctx, e.nbr, la)),
-        )
+        u64::from(graph.in_adj(n).any(|e| {
+            etype_hit(graph, &tset, &e, need_extra_tset) && matches_label(graph, &ctx, e.nbr, la)
+        }))
     };
     // Candidate endpoints: the `Lb` bucket, else every live vertex.
     let candidates: Vec<u32> = match lb.and_then(seed_label) {
@@ -1358,6 +1442,7 @@ pub(super) fn try_count_semi_join(
     let la = outer.start.label.as_ref();
     let lb = seg.node.label.as_ref();
     let tset = rel_type_set(&ctx, rel.label.as_ref())?;
+    let need_extra_tset = set_needs_extra(graph, &tset);
     // `Lb` must seed a bucket; only reverse-seed when it's smaller than `La`.
     let lb_bucket: &[u32] = lb
         .and_then(seed_label)
@@ -1379,8 +1464,9 @@ pub(super) fn try_count_semi_join(
         if !matches_label(graph, &ctx, b, lb) {
             continue; // conjunct label: the bucket is only a superset
         }
-        let keep =
-            |adj: &Adj| etype_ok(&tset, adj.etype) && matches_label(graph, &ctx, adj.nbr, la);
+        let keep = |adj: &Adj| {
+            etype_hit(graph, &tset, adj, need_extra_tset) && matches_label(graph, &ctx, adj.nbr, la)
+        };
         if out_side {
             for adj in graph.out_adj(b).filter(keep) {
                 preds.insert(adj.nbr);
