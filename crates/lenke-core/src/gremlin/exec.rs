@@ -1903,6 +1903,51 @@ fn subgraph_edge(graph: &Graph, e: u32) -> GVal {
     ])
 }
 
+/// Every present property of `v` as `(column id, name)`.
+///
+/// `present_keys` walks the store BY ID and then throws the id away, returning
+/// names — so every caller hashed each name straight back to the id it had just
+/// discarded, twice over (`prop_present`, then `prop`). This keeps it.
+///
+/// Measured NEUTRAL on a no-argument `valueMap()` over 50k x 12 properties (79.6
+/// ms before, 79.2-82.6 after). It is here because deriving a value, discarding
+/// it and re-deriving it twice is worth removing on its own; the timing says only
+/// that `valueMap`'s cost is elsewhere — building a `GVal::Map`, an `Arc` key and
+/// a boxed value per entry, 600k of them. That is the thing to optimize next, and
+/// it is why this is not the win it looks like.
+fn present_key_ids(graph: &Graph, v: &GVal) -> Vec<(u32, Arc<str>)> {
+    if let Some(GVal::Str(k)) = prop_key_field(v) {
+        return vec![(u32::MAX, k)]; // a property element exposes only its own key
+    }
+
+    let (store, idx) = match v {
+        GVal::Node(i) => (&graph.props, *i as usize),
+        GVal::Edge(e) => (&graph.edge_props, *e as usize),
+        _ => return Vec::new(),
+    };
+
+    (0..store.keys.len() as u32)
+        // Presence, not value: a stored null is a present property (first-class
+        // value — divergence from TinkerPop, which has no null property values).
+        .filter(|&kid| store.is_present_id(idx, kid))
+        .map(|kid| (kid, Arc::from(store.keys.text(kid))))
+        .collect()
+}
+
+/// The value of the already-resolved column `kid` on `v`. See
+/// [`present_key_ids`]; `u32::MAX` means "a property element's own value".
+fn prop_by_id(graph: &Graph, v: &GVal, kid: u32) -> GVal {
+    if kid == u32::MAX {
+        return prop_value_field(v).unwrap_or(GVal::Null);
+    }
+
+    match v {
+        GVal::Node(i) => value_to_gval(graph.props.value_id(*i as usize, kid, &graph.strs)),
+        GVal::Edge(e) => value_to_gval(graph.edge_props.value_id(*e as usize, kid, &graph.strs)),
+        _ => GVal::Null,
+    }
+}
+
 fn present_keys(graph: &Graph, v: &GVal) -> Vec<String> {
     // A property element (from `properties()`) exposes its own single key, so
     // `hasKey`/`hasNot` filter a property stream by the property's key field.
@@ -1922,15 +1967,6 @@ fn present_keys(graph: &Graph, v: &GVal) -> Vec<String> {
         .collect()
 }
 
-/// REJECTED, measured: keeping the column id through this and reading via
-/// `value_id` — `present_keys` walks the store BY ID and then returns names, so
-/// every caller hashes each name straight back to the id it just discarded,
-/// twice (`prop_present`, then `prop`). Removing that was 79.6 ms -> 79.2-82.6 ms
-/// on a no-argument `valueMap()` over 50k x 12 properties: neutral. The cost of
-/// `valueMap` is building a `GVal::Map` — an `Arc` key and a boxed value per
-/// entry, 600k of them — not the lookups. Optimize the map construction, not the
-/// key resolution.
-///
 /// Is property `key` present on element `v`? A stored null counts as present, so
 /// projection steps gate inclusion on this (not `prop(...) != Null`, which also
 /// drops a present null). Property elements / non-elements: not applicable.
@@ -2767,10 +2803,9 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
 
             map_step(stream, |t| {
                 let entries: Vec<(GVal, GVal)> = if keys.is_empty() {
-                    present_keys(graph, &t.val)
+                    present_key_ids(graph, &t.val)
                         .into_iter()
-                        .filter(|k| prop_present(graph, &t.val, k))
-                        .map(|k| (GVal::Str(Arc::from(k.as_str())), prop(graph, &t.val, &k)))
+                        .map(|(kid, k)| (GVal::Str(k), prop_by_id(graph, &t.val, kid)))
                         .collect()
                 } else {
                     named

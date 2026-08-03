@@ -577,10 +577,13 @@ adjacency walk underneath was never model-specific, just duplicated. The lesson
 is that "this is how the engine works" and "this is what the language requires"
 had been conflated, and only reading the spec separates them.
 
-**Rejected, measured**: keeping the resolved column id through `valueMap()`
-instead of hashing each name back (79.6 ms → 79.2-82.6 ms, neutral). The cost of
-`valueMap` is building a `GVal::Map` — an `Arc` key and boxed value per entry —
-not the key lookups. Recorded next to `present_keys`.
+**Kept though neutral**: `present_key_ids` keeps the column id `present_keys`
+derives and discards, so `valueMap()` stops hashing each name back to the id it
+just had — twice per key per element. Measured 79.6 ms → 79.2-82.6 ms over 50k ×
+12 properties: no change. Kept anyway, because deriving a value, throwing it away
+and re-deriving it twice is worth removing on its own. What the timing DOES say is
+that `valueMap`'s cost is building a `GVal::Map` — an `Arc` key and a boxed value
+per entry, 600k of them — so that is the thing to optimize next.
 
 ### If this is kept
 
