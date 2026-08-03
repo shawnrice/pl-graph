@@ -10936,3 +10936,44 @@ fn bench_element_projection() {
         );
     }
 }
+
+/// Multi-clause `MATCH` must bind the same rows, in the same order, whichever
+/// engine runs it.
+///
+/// Consecutive `MATCH`es arrive at the frame ALREADY merged into one clause with
+/// several patterns, so these exercise the comma-fusion path via a spelling that
+/// does not use commas — plus the shapes that must not merge (`OPTIONAL`) and
+/// must not fuse (a cartesian product).
+#[test]
+fn multi_clause_match_agrees_with_the_scalar_driver() {
+    let mut g = layered_dense(4, 4);
+    let queries = [
+        "MATCH (a:N)-[:R]->(b) MATCH (b)-[:R]->(c) RETURN element_id(a), element_id(c)",
+        "MATCH (a:N)-[:R]->(b) MATCH (b)-[:R]->(c) MATCH (c)-[:R]->(d) \
+         RETURN element_id(a), element_id(d)",
+        // a WHERE on the FIRST clause, which flattening moves after the second
+        "MATCH (a:N)-[:R]->(b) WHERE a.id <> 'n0' MATCH (b)-[:R]->(c) \
+         RETURN element_id(a), element_id(c)",
+        // a WHERE on each clause
+        "MATCH (a:N)-[:R]->(b) WHERE a.id <> 'n0' MATCH (b)-[:R]->(c) WHERE c.id <> 'n15' \
+         RETURN element_id(a), element_id(c)",
+        // clauses that do NOT share a variable — a cartesian product
+        "MATCH (a:N)-[:R]->(b) MATCH (c:N)-[:R]->(d) RETURN element_id(a), element_id(c)",
+        // OPTIONAL must not flatten — it is a left join
+        "MATCH (a:N)-[:R]->(b) OPTIONAL MATCH (b)-[:NONE]->(c) \
+         RETURN element_id(a), element_id(c)",
+        // mixed with a comma pattern in one of the clauses
+        "MATCH (a:N)-[:R]->(b), (b)-[:R]->(c) MATCH (c)-[:R]->(d) \
+         RETURN element_id(a), element_id(d)",
+        "MATCH (a:N)-[:R]->(b) MATCH (b)-[:R]->(c) ORDER BY element_id(c) LIMIT 5 \
+         RETURN element_id(a), element_id(c)",
+    ];
+
+    for q in queries {
+        let vec_on = super::eval::with_vec_override(true, || rows(&mut g, q));
+        let scalar = super::eval::with_vec_override(false, || rows(&mut g, q));
+
+        assert!(!vec_on.is_empty(), "`{q}` produced no rows — inert test");
+        assert_eq!(vec_on, scalar, "engines disagree on `{q}`");
+    }
+}

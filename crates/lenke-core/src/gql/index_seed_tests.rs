@@ -854,6 +854,15 @@ fn equivalent_spellings_cost_the_same() {
                 "MATCH (x)-[:R]->(y), (u:P {k: 'key000005'})-[:R]->(x) RETURN count(*) AS c",
             ],
         ),
+        // Consecutive MATCH clauses are the same join as comma patterns.
+        (
+            "two MATCH vs comma",
+            &[
+                "MATCH (u:P)-[:R]->(x), (x)-[:R]->(y) WHERE u.k = 'key000005' RETURN count(*) AS c",
+                "MATCH (u:P)-[:R]->(x) MATCH (x)-[:R]->(y) WHERE u.k = 'key000005' RETURN count(*) AS c",
+                "MATCH (u:P)-[:R]->(x) WHERE u.k = 'key000005' MATCH (x)-[:R]->(y) RETURN count(*) AS c",
+            ],
+        ),
         // `RETURN *` names every input variable, so it is the explicit list.
         (
             "RETURN * vs the explicit list",

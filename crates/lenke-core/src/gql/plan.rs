@@ -2248,9 +2248,84 @@ impl Lowerer {
                             // Decorrelate safe correlated inline subqueries into flat MATCH+WITH first.
         let clauses = decorrelate_clauses(&l.clauses);
         CLinear {
-            clauses: clauses.iter().map(|c| self.clause(c)).collect(),
+            clauses: fold_filters_into_matches(clauses.iter().map(|c| self.clause(c)).collect()),
         }
     }
+}
+
+/// Merge adjacent plain `MATCH` clauses, and fold a `FILTER` into the `MATCH`
+/// before it.
+///
+/// `MATCH p1 MATCH p2 WHERE w` and `MATCH p1, p2 WHERE w` are the same query, and
+/// they were 35x apart (3.478 ms vs 0.096 ms on 20k vertices, degree 3) purely
+/// because the comma spelling arrived as ONE clause with two patterns — which
+/// `fuse_chain` splices into a single path — while the two-clause spelling did
+/// not, and every multi-clause shape refuses the vectorized frame.
+///
+/// Sound because it is where the work already happened: the executor DEFERS
+/// consecutive `MATCH`es and materializes them together at the next barrier, so
+/// merging them changes nothing about which rows are produced or in what order.
+/// A clause `WHERE` is checked once every pattern in its clause has bound, which
+/// is also where a following `FILTER` ran.
+///
+/// `OPTIONAL MATCH` is left alone on both counts: it is a left join, so merging
+/// it into a plain match would drop the null-extended rows, and a `WHERE` folded
+/// onto it would remove them.
+fn fold_filters_into_matches(clauses: Vec<CClause>) -> Vec<CClause> {
+    let mut out: Vec<CClause> = Vec::with_capacity(clauses.len());
+
+    for c in clauses {
+        // Adjacent plain MATCHes become one clause with both pattern lists.
+        if let CClause::Match {
+            optional: false,
+            patterns,
+            where_,
+            scope_len,
+            ..
+        } = &c
+        {
+            if let Some(CClause::Match {
+                optional: false,
+                patterns: prev_pats,
+                where_: prev_where,
+                where_prog: prev_prog,
+                scope_len: prev_scope,
+            }) = out.last_mut()
+            {
+                prev_pats.extend(patterns.iter().cloned());
+                *prev_scope = (*prev_scope).max(*scope_len);
+                *prev_where = match (prev_where.take(), where_.clone()) {
+                    (Some(a), Some(b)) => Some(CExpr::And(vec![a, b])),
+                    (a, b) => a.or(b),
+                };
+                *prev_prog = prev_where.as_ref().map(compile_program);
+                continue;
+            }
+        }
+
+        let CClause::Filter { pred, prog } = c else {
+            out.push(c);
+            continue;
+        };
+
+        match out.last_mut() {
+            Some(CClause::Match {
+                optional: false,
+                where_,
+                where_prog,
+                ..
+            }) => {
+                *where_ = Some(match where_.take() {
+                    Some(prev) => CExpr::And(vec![prev, pred]),
+                    None => pred,
+                });
+                *where_prog = where_.as_ref().map(compile_program);
+            }
+            _ => out.push(CClause::Filter { pred, prog }),
+        }
+    }
+
+    out
 }
 
 /// A compiled VALIDATOR predicate: the lowered boolean expression plus the

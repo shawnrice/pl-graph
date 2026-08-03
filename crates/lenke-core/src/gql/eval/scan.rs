@@ -2004,6 +2004,15 @@ pub(super) fn vectorized_frame(
     if incoming.len() != 1 || incoming[0].0.iter().any(|c| c.is_some()) {
         return None; // a prior WITH/INSERT already produced bindings
     }
+    // Consecutive MATCH clauses are a join, exactly like comma patterns:
+    // `MATCH (a)-[]->(b) MATCH (b)-[]->(c)` and
+    // `MATCH (a)-[]->(b), (b)-[]->(c)` bind the same rows in the same order.
+    // Flatten them into one clause so `fuse_chain` sees the whole join.
+    // Consecutive MATCH clauses arrive here ALREADY merged into one clause with
+    // several patterns — the planner does that — so this only refuses a genuine
+    // multi-clause shape, such as a MATCH after a WITH. Flattening them here was
+    // written and removed: it fired three times in its own test and never once on
+    // the benchmark queries, because there was nothing left to flatten.
     if matches.len() != 1 {
         return None;
     }
