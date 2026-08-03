@@ -854,6 +854,11 @@ fn equivalent_spellings_cost_the_same() {
                 "MATCH (x)-[:R]->(y), (u:P {k: 'key000005'})-[:R]->(x) RETURN count(*) AS c",
             ],
         ),
+        // `RETURN *` names every input variable, so it is the explicit list.
+        (
+            "RETURN * vs the explicit list",
+            &["MATCH (u:P) RETURN u", "MATCH (u:P) RETURN *"],
+        ),
         // Sorting by an output alias is the same query as sorting by the
         // expression it names. Before the columnar path projected first, the
         // alias spelling was scalar: 2.2x, and 5.6x with a LIMIT.

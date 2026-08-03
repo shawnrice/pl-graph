@@ -1828,6 +1828,41 @@ pub(super) fn vectorized_aggregate(
 /// elements to ids) or into carried `Binding`s for a `WITH` (preserving element
 /// handles). Returns `None` (→ scalar driver) unless the shape qualifies: one
 /// fresh `MATCH` of a buildable (non-var-length, no self-join) path, no `RETURN *`.
+/// `RETURN *` rewritten as an explicit item list, or `None` if it isn't a star.
+///
+/// A star projection carries every input slot across in scope order — which is
+/// `RETURN a, b, c` with the names filled in. `proj.items` is EMPTY for a star,
+/// so every path that projects through `items` (the sort, DISTINCT, the terminal
+/// column build) would emit nothing; desugaring here means none of them needs a
+/// star case at all.
+fn desugar_star(proj: &CProjection) -> Option<CProjection> {
+    if !proj.star {
+        return None;
+    }
+
+    let items = proj
+        .star_cols
+        .iter()
+        .zip(&proj.out_names)
+        .map(|(&slot, name)| {
+            let expr = CExpr::Var(slot);
+
+            CReturnItem {
+                prog: crate::gql::plan::compile_program(&expr),
+                expr,
+                name: name.clone(),
+                is_agg: false,
+            }
+        })
+        .collect();
+
+    Some(CProjection {
+        star: false,
+        items,
+        ..proj.clone()
+    })
+}
+
 pub(super) fn vectorized_cols(
     graph: &Graph,
     ctx: &Ctx,
@@ -1835,6 +1870,9 @@ pub(super) fn vectorized_cols(
     matches: &[&CClause],
     proj: &CProjection,
 ) -> Option<Vec<Vec<Val>>> {
+    if let Some(p) = desugar_star(proj) {
+        return vectorized_cols(graph, ctx, incoming, matches, &p);
+    }
     let sc = vectorized_frame(graph, ctx, incoming, matches, proj)?;
     project_frame_cols(graph, ctx, &sc, proj)
 }
@@ -1966,7 +2004,7 @@ pub(super) fn vectorized_frame(
     if incoming.len() != 1 || incoming[0].0.iter().any(|c| c.is_some()) {
         return None; // a prior WITH/INSERT already produced bindings
     }
-    if matches.len() != 1 || proj.star {
+    if matches.len() != 1 {
         return None;
     }
     // ORDER BY: an aggregate sorts its group rows internally ([`vectorized_aggregate`],
@@ -2136,6 +2174,9 @@ pub(super) fn vectorized_rowset(
     matches: &[&CClause],
     proj: &CProjection,
 ) -> Option<RowSet> {
+    if let Some(p) = desugar_star(proj) {
+        return vectorized_rowset(graph, ctx, incoming, matches, &p);
+    }
     if proj.aggregating || proj.distinct || !proj.order_by.is_empty() {
         return None;
     }

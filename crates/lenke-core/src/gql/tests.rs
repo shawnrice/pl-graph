@@ -10872,3 +10872,67 @@ fn distinct_with_order_by_agrees_with_the_scalar_driver() {
         );
     }
 }
+
+/// Columnar vs scalar for a projection that returns ELEMENTS rather than values.
+///
+/// `RETURN *` was measured 23x faster than the equivalent `RETURN v`, which is
+/// the wrong way round: star took the scalar driver and the explicit spelling
+/// took the columnar frame.
+/// Run: `cargo test --release bench_element_projection -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_element_projection() {
+    let lines: Vec<String> = (0..200_000)
+        .map(|i| {
+            format!(
+                r#"{{"type":"node","id":"v{i}","labels":["V"],"properties":{{"n":{}}}}}"#,
+                i % 1000
+            )
+        })
+        .chain((0..200_000).map(|i| {
+            format!(
+                r#"{{"type":"edge","id":"e{i}","labels":["R"],"from":"v{i}","to":"v{}","properties":{{}}}}"#,
+                (i + 1) % 200_000
+            )
+        }))
+        .collect();
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    let cases: &[(&str, &str)] = &[
+        ("RETURN v (element)", "MATCH (v:V) RETURN v"),
+        ("RETURN * (same query)", "MATCH (v:V) RETURN *"),
+        ("RETURN v.n (value)", "MATCH (v:V) RETURN v.n"),
+        ("RETURN a, b", "MATCH (a:V)-[:R]->(b) RETURN a, b"),
+        ("RETURN a.n, b.n", "MATCH (a:V)-[:R]->(b) RETURN a.n, b.n"),
+    ];
+
+    println!(
+        "\n{:<24} {:>10} {:>10} {:>8}",
+        "query", "columnar", "scalar", "ratio"
+    );
+
+    for (name, q) in cases {
+        let mut best = [f64::MAX; 2];
+
+        for (k, on) in [true, false].iter().enumerate() {
+            let plan = super::parse(q).expect("parses");
+            let params = super::eval::Params::new();
+
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                let n = super::eval::with_vec_override(*on, || {
+                    plan.execute(&mut g, &params).expect("executes").nrows
+                });
+                assert!(n > 0);
+                best[k] = best[k].min(t.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+
+        println!(
+            "{name:<24} {:>9.2}ms {:>9.2}ms {:>7.2}x",
+            best[0],
+            best[1],
+            best[0] / best[1]
+        );
+    }
+}
