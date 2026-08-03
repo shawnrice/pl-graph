@@ -10977,3 +10977,63 @@ fn multi_clause_match_agrees_with_the_scalar_driver() {
         assert_eq!(vec_on, scalar, "engines disagree on `{q}`");
     }
 }
+
+/// A carried value column only becomes a TYPED numeric column when every cell is
+/// numeric — a mixed one must keep its cross-type behaviour.
+///
+/// `typed_val_col` exists so `WITH a.n AS m … WHERE b.n > m` drives the same
+/// typed kernels a property column does (5.8x on arithmetic). Coercing a mixed
+/// column with `num_of` would have turned a string into "not a number" and
+/// quietly yielded no-match, where ordering a number against a string is
+/// specified to RAISE. These pin both halves.
+#[test]
+fn a_carried_column_is_typed_only_when_uniformly_numeric() {
+    let lines: Vec<String> = (0..6)
+        .map(|i| {
+            format!(r#"{{"type":"node","id":"n{i}","labels":["N"],"properties":{{"v":{i}}}}}"#)
+        })
+        .chain((0..6).map(|i| {
+            format!(
+                r#"{{"type":"edge","id":"e{i}","labels":["R"],"from":"n{i}","to":"n{}","properties":{{}}}}"#,
+                (i + 1) % 6
+            )
+        }))
+        .collect();
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    // Uniformly numeric: takes the typed path, and still answers correctly.
+    let typed =
+        "MATCH (a:N) WITH a, a.v AS m MATCH (a)-[:R]->(b) WHERE b.v > m RETURN count(*) AS c";
+    assert_eq!(
+        rows(&mut g, typed),
+        super::eval::with_vec_override(false, || rows(&mut g, typed)),
+        "typed carried column disagrees with the scalar driver"
+    );
+
+    // A carried STRING compared to a number keeps whatever cross-type behaviour
+    // the general path has — the point is that the two engines still AGREE, which
+    // is what coercing the column with `num_of` would have broken. (Here they
+    // agree on no-match rather than a raise; that is the engine's existing rule,
+    // not something this test asserts a preference about.)
+    let mixed =
+        "MATCH (a:N) WITH a, 'x' AS m MATCH (a)-[:R]->(b) WHERE b.v > m RETURN count(*) AS c";
+    assert_eq!(
+        super::eval::with_vec_override(true, || exec_err(&mut g, mixed)),
+        super::eval::with_vec_override(false, || exec_err(&mut g, mixed)),
+        "engines disagree on whether a number-vs-carried-string comparison raises"
+    );
+    assert_eq!(
+        super::eval::with_vec_override(true, || rows(&mut g, mixed)),
+        super::eval::with_vec_override(false, || rows(&mut g, mixed)),
+        "engines disagree on a number-vs-carried-string comparison"
+    );
+
+    // A carried NULL is numeric-shaped (invalid), not a reason to fall back.
+    let nulled = "MATCH (a:N) WITH a, CASE WHEN a.v > 2 THEN a.v ELSE null END AS m \
+                  MATCH (a)-[:R]->(b) WHERE b.v > m RETURN count(*) AS c";
+    assert_eq!(
+        rows(&mut g, nulled),
+        super::eval::with_vec_override(false, || rows(&mut g, nulled)),
+        "a carried column with nulls disagrees with the scalar driver"
+    );
+}

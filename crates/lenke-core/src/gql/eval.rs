@@ -3208,6 +3208,39 @@ fn temporal_agg(graph: &Graph, ctx: &Ctx, sc: &ScanCols, spec: &CAgg) -> Option<
     Some(acc.map_or(Val::Null, |d| Val::Temporal(T::Duration(d))))
 }
 
+/// A carried value column as a TYPED `VVec` when every cell allows it, else
+/// `Gen`.
+///
+/// A `WITH` that carries a computed value (`a.n AS m`) hands the frame a `Val`
+/// column, and `m` then reads back as `Gen` — the untyped path, where every
+/// comparison boxes and dispatches per row. When the column is uniformly numeric
+/// (or boolean) it can drive the same typed kernels a property column does.
+///
+/// Deliberately all-or-nothing. Coercing a MIXED column with `num_of` would turn
+/// a string into "not a number" and quietly yield no-match, where comparing a
+/// number against a string is specified to raise — see the cross-type rules in
+/// `compare_vals`. A column with one string in it stays `Gen` and keeps that.
+fn typed_val_col(vs: &[Val]) -> VVec {
+    let mut d = Vec::with_capacity(vs.len());
+    let mut valid = Vec::with_capacity(vs.len());
+
+    for v in vs {
+        match v {
+            Val::Num(x) => {
+                d.push(*x);
+                valid.push(true);
+            }
+            Val::Null => {
+                d.push(f64::NAN);
+                valid.push(false);
+            }
+            _ => return VVec::Gen(vs.to_vec()),
+        }
+    }
+
+    VVec::Num { d, valid }
+}
+
 fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> VVec {
     let n = sc.n;
     let gen = |e: &CExpr| VVec::Gen(scalar_col(graph, ctx, sc, e));
@@ -3228,7 +3261,7 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> VVec {
         // binding rebuild); an element column becomes a column of element handles.
         CExpr::Var(slot) => {
             if let Some(v) = sc.val_slot(*slot) {
-                VVec::Gen(v.to_vec())
+                typed_val_col(v)
             } else if let Some((elem, ids)) = sc.slot(*slot) {
                 VVec::Gen(
                     ids.iter()
