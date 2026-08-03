@@ -394,6 +394,40 @@ fn lower_prefix(graph: &Graph, steps: &[Step]) -> Option<(ElementSeek, Vec<usize
 /// whole sub-traversal, and that sub-traversal may read the path. Its `labels`
 /// are fine either way — they read the tag map, not the path.
 fn path_free(step: &Step) -> bool {
+    // Steps that carry sub-traversals are path-free exactly when their bodies
+    // are: `repeat(out())` needs no history, `repeat(simplePath())` does.
+    // Recursing here is what lets the common looping shapes off the path tax at
+    // all — as a flat list they could never be listed, so every one of them paid.
+    let subs: &[&Traversal] = match step {
+        Step::Where(t)
+        | Step::Not(t)
+        | Step::Optional(t)
+        | Step::Local(t)
+        | Step::Map(t)
+        | Step::FlatMap(t)
+        | Step::SideEffect(t) => &[t],
+        Step::And(ts) | Step::Or(ts) | Step::Union(ts) | Step::Coalesce(ts) => {
+            return ts.iter().all(|t| t.steps.iter().all(path_free));
+        }
+        Step::Choose { test, then_, else_ } => {
+            return [Some(test), Some(then_), else_.as_ref()]
+                .into_iter()
+                .flatten()
+                .all(|t| t.steps.iter().all(path_free));
+        }
+        Step::Repeat { body, until, .. } => {
+            return [Some(body), until.as_ref()]
+                .into_iter()
+                .flatten()
+                .all(|t| t.steps.iter().all(path_free));
+        }
+        _ => &[],
+    };
+
+    if let [t] = subs {
+        return t.steps.iter().all(path_free);
+    }
+
     matches!(
         step,
         Step::V(_)
@@ -420,6 +454,32 @@ fn path_free(step: &Step) -> bool {
             | Step::Mean(_)
             | Step::Min(_)
             | Step::Max(_)
+            // Only FIVE steps actually read `Trav::path`: OtherV (which vertex did
+            // we come from), SimplePath / CyclicPath (repeat check), Path (emits
+            // it) and Sack. Everything below was paying a per-traverser path
+            // clone for history nothing was going to read — 63% of the suite's
+            // traversals tracked paths, and this is why.
+            | Step::Order(..)
+            | Step::Fold
+            | Step::Unfold
+            | Step::Range(..)
+            | Step::Tail(..)
+            | Step::Is(_)
+            | Step::WherePred(_)
+            | Step::Group(..)
+            | Step::GroupCount(..)
+            | Step::Project(..)
+            | Step::ValueMap(..)
+            | Step::PropertyMap(..)
+            | Step::Properties(..)
+            | Step::ElementMap(..)
+            | Step::Value
+            | Step::Constant(_)
+            | Step::Barrier
+            | Step::Sample(_)
+            | Step::Aggregate(_)
+            | Step::Store(_)
+            | Step::Cap(_)
     ) || matches!(step, Step::Dedupe { bys, .. } if bys.is_empty())
 }
 

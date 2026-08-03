@@ -1646,3 +1646,55 @@ fn bench_tag_carry() {
         println!("{name:<28} {best:>9.0}us");
     }
 }
+
+/// `needs_path` must stay true for a traversal whose PATH-reading step is nested
+/// inside a container.
+///
+/// Only five steps read `Trav::path` — `OtherV`, `SimplePath`, `CyclicPath`,
+/// `Path`, `Sack` — so `path_free` recurses into `repeat`/`union`/`choose`/… to
+/// let the common looping shapes off the per-traverser path clone (2.3x on
+/// `repeat(out()).times(2)`). The recursion is the risky half: a body that DOES
+/// read the path must still force tracking, or the outer traversal loses the
+/// history the inner step depends on.
+#[test]
+fn a_path_reading_step_inside_a_container_still_tracks_the_path() {
+    let mut g = seeded();
+
+    // `simplePath` inside `repeat` prunes revisits; without path history it
+    // cannot, and the walk returns more rows.
+    let pruned = super::g()
+        .V()
+        .repeat(super::__().both(&[]).simple_path())
+        .times(3)
+        .count()
+        .run(&mut g);
+    let unpruned = super::g()
+        .V()
+        .repeat(super::__().both(&[]))
+        .times(3)
+        .count()
+        .run(&mut g);
+
+    assert_ne!(
+        pruned, unpruned,
+        "simplePath nested in repeat did not prune — the path was not tracked"
+    );
+
+    // `path()` inside `union` must still produce real paths.
+    let paths = super::g()
+        .V()
+        .limit(3)
+        .union(vec![
+            super::__().out(&[]).path(),
+            super::__().in_(&[]).path(),
+        ])
+        .run(&mut g);
+
+    assert!(
+        paths.iter().any(|v| match v {
+            GVal::List(items) => items.len() > 1,
+            _ => false,
+        }),
+        "path() nested in union produced no multi-element path"
+    );
+}
