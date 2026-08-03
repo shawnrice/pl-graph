@@ -458,6 +458,51 @@ usually do NOT reach:
 The two rank functions must agree or the engines emit rows in different orders,
 so they are deliberate mirrors and each says so at its definition.
 
+## The next one: a carrying WITH costs 4.8x
+
+The remaining fallbacks after the join work are `incoming-bindings` — a `MATCH`
+that follows a `WITH` or `INSERT`. The vectorized frame refuses outright:
+
+```rust
+if incoming.len() != 1 || incoming[0].0.iter().any(|c| c.is_some()) {
+    return None; // a prior WITH/INSERT already produced bindings
+}
+```
+
+Most of that shape is already fine, because the `WITH`'s own `MATCH` vectorizes
+and what follows is a small expansion. One is not:
+
+```text
+  50k vertices, degree 3                                       best
+  MATCH (a:V)-[:R]->(b) WHERE b.n > a.n RETURN count(*)       2.373 ms
+  MATCH (a:V) WITH a, a.n AS m
+    MATCH (a)-[:R]->(b) WHERE b.n > m RETURN count(*)        11.297 ms   4.8x
+```
+
+Same answer. Carrying a value through a `WITH` — instead of reading it from the
+element in place — costs 4.8x, because everything after the `WITH` runs scalar.
+
+**Two ways to fix it, and why the obvious one is the wrong one.**
+
+_Inline the pass-through `WITH`_ at the AST level: substitute `m` → `a.n` in the
+following clauses and turn its `WHERE` into a `FILTER`. Tempting, because
+`decorrelate_clauses` already rewrites clauses by NAME before lowering, which is
+far easier than slot surgery. But it needs a total substituter over the `Expr`
+tree, and a variant it forgets leaves `m` unbound — which reads as `null` and
+returns a wrong answer silently. That is the same failure mode that made
+`Program::read_slots` report "assume everything" on an opaque `Op::Tree`, and it
+is worth the same caution.
+
+_Seed the frame from the incoming bindings_ instead. No expression rewriting at
+all: build the `Frontier` from the incoming rows' value for the pattern's start
+slot, carry their other bound slots as columns (`Frontier` gained value columns
+for the group-variable work, so this now has somewhere to put a non-element
+binding), and expand as usual. It needs a `set_column` beside `set_values` and a
+new entry beside `build_scan`. When it does not apply it fails to BUILD, which is
+loud, rather than producing a row with a null in it.
+
+The second is the one to write.
+
 ## How much is left, measured
 
 Every point where GQL declines the vectorized frame was labelled and the GQL
