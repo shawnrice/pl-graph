@@ -200,14 +200,8 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
             (Some(x), _) => x.clone(),
             _ => Val::Null,
         },
-        ElementId => match a {
-            Some(Val::Node(i)) => Val::Str(graph.vid.arc(*i)),
-            // The edge's external id — an explicit id (set at INSERT / loaded from
-            // NDJSON) shadows the canonical `e{index}`. Previously hardcoded to
-            // `e{i}`, which ignored an assigned id and diverged from `toNdjson`.
-            Some(Val::Edge(i)) => vstr(graph.edge_id(*i).into_owned()),
-            _ => Val::Null,
-        },
+        // Shared with Gremlin's `id()` — see `Val::element_id` for why one copy.
+        ElementId => a.map_or(Val::Null, |v| Val::element_id(graph, v)),
         // --- graph functions --- (label/key order is unspecified → sorted for
         // deterministic, cross-engine-identical output)
         Labels => match a {

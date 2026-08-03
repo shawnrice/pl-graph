@@ -1989,17 +1989,7 @@ fn prop_present(graph: &Graph, v: &GVal, key: &str) -> bool {
 }
 
 fn elem_id(graph: &Graph, v: &GVal) -> GVal {
-    match v {
-        GVal::Node(i) => GVal::Str(graph.vid.arc(*i)),
-        // Every edge has an id (assigned external id, else canonical `e{index}`).
-        GVal::Edge(e) => GVal::Str(Arc::from(graph.edge_id(*e).as_ref())),
-        // A non-element has no id → NULL, exactly as its sibling `elem_label`
-        // does and as the TS engine does. This used to pass the value THROUGH,
-        // so `path().id()` handed the paths back untouched instead of nulls, and
-        // a following `sum()` then faulted on them where TS summed nulls. Found
-        // by the Gremlin differential fuzzer.
-        _ => GVal::Null,
-    }
+    GVal::element_id(graph, v)
 }
 
 fn elem_label(graph: &Graph, v: &GVal) -> GVal {

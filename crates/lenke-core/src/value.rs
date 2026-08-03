@@ -219,6 +219,26 @@ impl Value {
         }
     }
 
+    /// An element's EXTERNAL id, the string a user sees — or `Null` for anything
+    /// that is not an element.
+    ///
+    /// Both engines needed this and both wrote it out. That duplication has
+    /// already cost one wrong answer: Gremlin's copy used to pass a non-element
+    /// value THROUGH instead of nulling it, so `path().id()` handed back the paths
+    /// untouched and a following `sum()` faulted where the TS engine summed nulls.
+    /// The Gremlin differential fuzzer found it; GQL's copy was correct all along.
+    ///
+    /// An edge's assigned id shadows the canonical `e{index}` — a distinction GQL's
+    /// copy also had to be corrected for, separately.
+    #[must_use]
+    pub fn element_id(graph: &crate::graph::Graph, v: &Self) -> Self {
+        match v {
+            Self::Node(i) => Self::Str(graph.vid.arc(*i)),
+            Self::Edge(e) => Self::Str(Arc::from(graph.edge_id(*e).as_ref())),
+            _ => Self::Null,
+        }
+    }
+
     /// A path value, boxing the payload.
     #[must_use]
     pub fn path(vertices: Vec<u32>, edges: Vec<u32>) -> Self {
