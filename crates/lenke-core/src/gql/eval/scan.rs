@@ -1901,10 +1901,36 @@ fn fuse_chain(patterns: &[CPath]) -> Option<CPath> {
         // written before this was attempted, and is why it did not ship.
         let joined = attach(next, end)?;
 
+        // The shared node may be constrained on BOTH sides —
+        // `(a)-[]->(b:N), (b:M {k: 1})-[]->(c)`. They name one variable, so the
+        // node must satisfy both; MERGE them onto the fused node rather than
+        // declining. Dropping either would silently widen the match.
+        merge_node(end_node_mut(&mut out), &joined.start);
         out.segments.extend(joined.segments);
     }
 
     Some(out)
+}
+
+/// The node the accumulated path currently ends on.
+fn end_node_mut(p: &mut CPath) -> &mut CNode {
+    match p.segments.last_mut() {
+        Some(seg) => &mut seg.node,
+        None => &mut p.start,
+    }
+}
+
+/// Conjoin `from`'s constraints onto `into` — the two name the same variable.
+fn merge_node(into: &mut CNode, from: &CNode) {
+    into.label = match (into.label.take(), from.label.clone()) {
+        (Some(a), Some(b)) => Some(CLabelExpr::And(Box::new(a), Box::new(b))),
+        (a, b) => a.or(b),
+    };
+    into.props.extend(from.props.iter().cloned());
+    into.where_ = match (into.where_.take(), from.where_.clone()) {
+        (Some(a), Some(b)) => Some(CExpr::And(vec![a, b])),
+        (a, b) => a.or(b),
+    };
 }
 
 /// `p` oriented to start on slot `end`, either as written or reversed, or `None`
@@ -1919,16 +1945,10 @@ fn attach(p: &CPath, end: usize) -> Option<CPath> {
     joins_at(&flipped, end).then_some(flipped)
 }
 
-/// Does `p` start on slot `end`, adding nothing to that node?
-///
-/// The "adding nothing" half is what makes a fusion safe: a back-reference like
-/// the `(b)` in `…, (b)-[s]->(c)` carries no label, inline property or `WHERE`,
-/// so splicing it in cannot drop a constraint the fused path would then skip.
+/// Does `p` start on slot `end`? Whatever that node constrains is carried across
+/// by [`merge_node`], so a constrained back-reference joins like a bare one.
 fn joins_at(p: &CPath, end: usize) -> bool {
     p.start.var_slot == Some(end)
-        && p.start.label.is_none()
-        && p.start.props.is_empty()
-        && p.start.where_.is_none()
 }
 
 /// Build (and WHERE-filter) the columnar frame for a single fresh `MATCH … RETURN`

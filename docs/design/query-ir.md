@@ -394,7 +394,32 @@ path — on a self-loop both spellings return the same row with `r = s` — and 
 row ORDER is unchanged, because the scalar join nests pattern 2 inside pattern 1,
 which is exactly the order one fused path enumerates.
 
-Pinned in `equivalent_spellings_cost_the_same`.
+A constrained shared node fuses too — `(a)-[]->(b:N), (b:M {k: 1})-[]->(c)` names
+ONE variable, so the node must satisfy both sides and `merge_node` conjoins them
+(`CLabelExpr::And`, concatenated props, `CExpr::And` on the node `WHERE`).
+
+**What does NOT fuse, and why it barely matters.** Instrumenting the declines:
+
+```text
+  2188  disconnected cartesian   the patterns share no variable at all
+    12  diverging / mid-join     shares a variable, but not at an END
+```
+
+Diverging — `(b)-[]->(a), (b)-[]->(c)` — would splice to `(a)<-[]-(b)-[]->(c)`,
+which is the right rows, but a linear path can only be enumerated from an END, so
+the fused form drives from `a` while the join drives from `b` and the rows come
+out regrouped (same multiset, different order). That was attempted and backed
+out; at 12 occurrences it buys nothing to accept an order change for. The
+remaining 2188 are cartesian products, which have no shared variable and so are
+not a fusion problem at all — cross-producting two columnar frames is a different
+operation, and one worth doing separately if it ever matters.
+
+Pinned in `equivalent_spellings_cost_the_same`, and guarded by two differential
+tests that run each shape with fusion on and off and compare row-by-row. The
+second exists because the first could not discriminate: its fixture gives every
+node the same single label and has no inline node `WHERE`, so deleting the label
+conjunction or the `where_` merge left it green. Both mutations now fail two
+tests.
 
 ### Picking the pattern to drive
 

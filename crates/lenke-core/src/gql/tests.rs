@@ -10754,8 +10754,14 @@ fn fusing_comma_patterns_preserves_rows_and_order() {
         "MATCH (a:N)-[:R]->(b), (b)-[:R]->(c) RETURN element_id(a), element_id(b), element_id(c)",
         "MATCH (a:N)-[:R]->(b), (b)-[:R]->(c), (c)-[:R]->(d) RETURN element_id(a), element_id(d)",
         "MATCH (a:N)-[r:R]->(b), (b)-[s:R]->(c) RETURN element_id(r), element_id(s)",
-        // the shared node carries a constraint — must NOT fuse
-        "MATCH (a:N)-[:R]->(b), (b:N)-[:R]->(c) RETURN element_id(a), element_id(c)",
+        // the shared node is constrained on BOTH sides — the constraints merge.
+        // The inline property is what makes this discriminating: every node here
+        // is an `N`, so a dropped label would not change the answer, but a
+        // dropped `{id: …}` would return far more rows.
+        "MATCH (a:N)-[:R]->(b), (b:N {id: 'n5'})-[:R]->(c) RETURN element_id(a), element_id(c)",
+        "MATCH (a:N)-[:R]->(b {id: 'n5'}), (b)-[:R]->(c) RETURN element_id(a), element_id(c)",
+        "MATCH (a:N)-[:R]->(b {id: 'n5'}), (b {id: 'n5'})-[:R]->(c) RETURN element_id(a), element_id(c)",
+        "MATCH (a:N)-[:R]->(b), (b)-[:R]->(c) WHERE b.id = 'n5' RETURN element_id(a), element_id(c)",
         // converging: (c) points AT the shared node — the second pattern reverses
         "MATCH (a:N)-[:R]->(b), (c)-[:R]->(b) RETURN element_id(a), element_id(c)",
         // diverging: both patterns leave the SAME node — the first reverses
@@ -10765,6 +10771,52 @@ fn fusing_comma_patterns_preserves_rows_and_order() {
         "MATCH (a:N)-[:R]->(b), (c:N)-[:R]->(d) RETURN element_id(a), element_id(c)",
         // with a filter that references both patterns' variables
         "MATCH (a:N)-[:R]->(b), (b)-[:R]->(c) WHERE a.id <> c.id RETURN element_id(a), element_id(c)",
+    ];
+
+    for q in queries {
+        let fused = rows(&mut g, q);
+        let plain = super::eval::without_fusion(|| rows(&mut g, q));
+
+        assert!(!fused.is_empty(), "`{q}` produced no rows — inert test");
+        assert_eq!(fused, plain, "fusion changed the result of `{q}`");
+    }
+}
+
+/// The shared node's constraints must all survive a fusion.
+///
+/// Split from `fusing_comma_patterns_preserves_rows_and_order` because that
+/// test's fixture cannot discriminate them: every node there carries the single
+/// label `N`, so a dropped label conjunction changes nothing, and it has no
+/// inline node `WHERE`. Deleting the label merge or the `where_` merge left that
+/// test green. This fixture gives nodes two labels and uses inline `WHERE`, so
+/// each branch of `merge_node` has a case that fails without it.
+#[test]
+fn fusing_merges_every_constraint_on_the_shared_node() {
+    let lines: Vec<String> = (0..8)
+        .map(|i| {
+            // Half the nodes are `N` only, half are both `N` and `M`.
+            let labels = if i % 2 == 0 { r#"["N"]"# } else { r#"["N","M"]"# };
+            format!(
+                r#"{{"type":"node","id":"n{i}","labels":{labels},"properties":{{"v":{i}}}}}"#
+            )
+        })
+        .chain((0..8).map(|i| {
+            format!(
+                r#"{{"type":"edge","id":"e{i}","labels":["R"],"from":"n{i}","to":"n{}","properties":{{}}}}"#,
+                (i + 1) % 8
+            )
+        }))
+        .collect();
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    let queries = [
+        // two DIFFERENT labels on the shared node — only the `N`+`M` nodes qualify
+        "MATCH (a:N)-[:R]->(b:N), (b:M)-[:R]->(c) RETURN element_id(a), element_id(c)",
+        // an inline node WHERE on each side
+        "MATCH (a:N)-[:R]->(b WHERE b.v > 2), (b WHERE b.v < 6)-[:R]->(c) \
+         RETURN element_id(a), element_id(c)",
+        // label on one side, inline WHERE on the other
+        "MATCH (a:N)-[:R]->(b:M), (b WHERE b.v > 2)-[:R]->(c) RETURN element_id(a), element_id(c)",
     ];
 
     for q in queries {
