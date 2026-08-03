@@ -854,6 +854,23 @@ fn equivalent_spellings_cost_the_same() {
                 "MATCH (x)-[:R]->(y), (u:P {k: 'key000005'})-[:R]->(x) RETURN count(*) AS c",
             ],
         ),
+        // Sorting by an output alias is the same query as sorting by the
+        // expression it names. Before the columnar path projected first, the
+        // alias spelling was scalar: 2.2x, and 5.6x with a LIMIT.
+        (
+            "ORDER BY alias vs input expr",
+            &[
+                "MATCH (u:P) RETURN u.n AS a ORDER BY u.n LIMIT 20",
+                "MATCH (u:P) RETURN u.n AS a ORDER BY a LIMIT 20",
+            ],
+        ),
+        (
+            "ORDER BY alias, no limit",
+            &[
+                "MATCH (u:P) RETURN u.k AS a ORDER BY u.k",
+                "MATCH (u:P) RETURN u.k AS a ORDER BY a",
+            ],
+        ),
         // A comma join that CHAINS is the same query as one path. Before
         // `fuse_chain` the comma spelling stayed on the scalar join: 134x for two
         // patterns, 347x for three.

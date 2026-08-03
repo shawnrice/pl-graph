@@ -1970,11 +1970,11 @@ pub(super) fn vectorized_frame(
         return None;
     }
     // ORDER BY: an aggregate sorts its group rows internally ([`vectorized_aggregate`],
-    // which resolves output aliases + aggregates), so it's allowed. A non-aggregate
-    // sort only vectorizes when the keys read input vars (not output aliases);
-    // DISTINCT + ORDER BY stays scalar.
+    // which resolves output aliases + aggregates). A non-aggregate sort over
+    // OUTPUT aliases projects first and sorts the projected columns (see
+    // `vectorized_rowset`). DISTINCT + ORDER BY stays scalar.
     let has_order = !proj.order_by.is_empty();
-    if has_order && (proj.distinct || (!proj.aggregating && proj.order_needs_output)) {
+    if has_order && proj.distinct {
         return None;
     }
     let CClause::Match {
@@ -2196,9 +2196,9 @@ pub(super) fn project_frame_cols(
 ) -> Option<Vec<Vec<Val>>> {
     let has_order = !proj.order_by.is_empty();
     // Aggregating + ORDER BY is handled inside `vectorized_aggregate` (it sorts the
-    // group rows, resolving output aliases + aggregates); DISTINCT + ORDER BY and a
-    // non-aggregate sort over output aliases stay scalar.
-    if has_order && (proj.distinct || (!proj.aggregating && proj.order_needs_output)) {
+    // group rows, resolving output aliases + aggregates); DISTINCT + ORDER BY
+    // stays scalar.
+    if has_order && proj.distinct {
         return None;
     }
     if proj.aggregating {
@@ -2223,6 +2223,28 @@ pub(super) fn project_frame_cols(
                 sort_sc.slots[proj.out_len + j] = Some((*elem, ids.clone()));
             } else if let Some(vals) = &sc.vals[islot] {
                 sort_sc.vals[proj.out_len + j] = Some(vals.clone());
+            }
+        }
+
+        // `RETURN a.x AS n ORDER BY n` sorts by an OUTPUT column, which does not
+        // exist yet — sort scope slots 0..out_len are empty above. Project first,
+        // install the results there, and window the projected columns afterwards
+        // instead of re-evaluating.
+        //
+        // This gives up the "a small LIMIT never materializes the full output
+        // columns" property the input-keyed path has. That is the right trade
+        // here and only here: this shape was 100% scalar before, so it is a win
+        // against the scalar driver even having materialized.
+        let out_cols: Option<Vec<Vec<Val>>> = proj.order_needs_output.then(|| {
+            proj.items
+                .iter()
+                .map(|item| eval_vec(graph, ctx, sc, &item.expr).into_vals())
+                .collect()
+        });
+
+        if let Some(cols) = out_cols.as_ref() {
+            for (i, c) in cols.iter().enumerate() {
+                sort_sc.vals[i] = Some(c.clone());
             }
         }
         // Fast path: a single temporal ORDER BY key sorts packed Copy temporals via
@@ -2296,7 +2318,19 @@ pub(super) fn project_frame_cols(
             idx.truncate(end);
         }
         idx.sort_by(cmp);
-        let sub = gather_rows(sc, &idx[start..end.min(idx.len())]);
+        let window = &idx[start..end.min(idx.len())];
+
+        // Already projected above to make the sort keys resolvable — take the
+        // window out of those columns rather than evaluating a second time.
+        if let Some(cols) = out_cols {
+            return Some(
+                cols.into_iter()
+                    .map(|c| window.iter().map(|&i| c[i].clone()).collect())
+                    .collect(),
+            );
+        }
+
+        let sub = gather_rows(sc, window);
         return Some(
             proj.items
                 .iter()
