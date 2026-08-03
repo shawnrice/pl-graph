@@ -323,7 +323,7 @@ pub(super) fn scan_node(
     let mut seek = element_seek(anchor, &inline_of(node), graph, ctx, node.var_slot, false);
 
     if let Some(ids) = label_ids.clone() {
-        seek.set_labels(crate::seek::LabelRule::Any, ids);
+        seek.set_labels(ids);
     }
 
     let binds = GqlBindings(ctx.params);

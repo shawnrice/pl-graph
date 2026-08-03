@@ -365,12 +365,12 @@ fn lower_prefix(graph: &Graph, steps: &[Step]) -> Option<(ElementSeek, Vec<usize
                 };
 
                 if ids.len() == labels.len() {
-                    seek.set_labels(crate::seek::LabelRule::First, ids);
+                    seek.set_labels(ids);
                     captured.push(i);
                 } else if !labels.is_empty() {
                     // A name that resolved to nothing matches nothing; say so in
                     // the IR rather than letting the step scan for it.
-                    seek.set_labels(crate::seek::LabelRule::First, Vec::new());
+                    seek.set_labels(Vec::new());
                     captured.push(i);
                 }
             }
@@ -1162,7 +1162,7 @@ fn index_seed(graph: &Graph, steps: &[Step]) -> Option<(Vec<Trav>, Vec<usize>)> 
                 // A name that resolved to nothing matches nothing, which the
                 // empty list already says — but only if EVERY name was unknown.
                 if ids.len() == labels.len() {
-                    seek.set_labels(crate::seek::LabelRule::First, ids);
+                    seek.set_labels(ids);
                     captured.push(i);
                 }
             }
@@ -2763,10 +2763,10 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
             stream
                 .into_iter()
                 .filter(|t| match &t.val {
-                    GVal::Node(i) => graph
-                        .vertex_labels(*i)
-                        .first()
-                        .is_some_and(|lid| want.contains(lid)),
+                    // ANY of the vertex's labels, not just the first — the TS
+                    // engine is `step.labels.some((l) => v.labels.has(l))`, and a
+                    // vertex labelled [A, B] must be found by `hasLabel('B')`.
+                    GVal::Node(i) => graph.vertex_labels(*i).iter().any(|lid| want.contains(lid)),
                     GVal::Edge(e) => want_e.contains(&graph.e_type[*e as usize]),
                     _ => false,
                 })

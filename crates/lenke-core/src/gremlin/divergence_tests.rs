@@ -357,3 +357,63 @@ fn id_of_a_real_element_still_reports_it() {
     assert_eq!(ids.len(), 2);
     assert!(ids.iter().all(|v| matches!(v, GVal::Str(_))), "got {ids:?}");
 }
+
+/// A multi-label vertex must be reachable by EVERY label it carries, in both
+/// engines.
+///
+/// Native once matched only the FIRST label in `hasLabel`, so a vertex labelled
+/// `[Q, P]` was found by the TS engine's `hasLabel('P')` and not by this one.
+/// That is a byte-identity divergence, and no fuzzer caught it because none of
+/// them generates a vertex with more than one label — which is also why this test
+/// is here rather than left to them.
+///
+/// `label()` still returns the FIRST label in both engines: it has to return one.
+#[test]
+fn has_label_finds_a_vertex_by_any_of_its_labels() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["A"],"properties":{}}"#,
+            r#"{"type":"node","id":"ab","labels":["A","B"],"properties":{}}"#,
+            r#"{"type":"node","id":"b","labels":["B"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let ids = |t: super::Traversal, g: &mut crate::graph::Graph| {
+        let mut v: Vec<String> = t
+            .id()
+            .run(g)
+            .iter()
+            .map(|x| match x {
+                GVal::Str(s) => s.to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        v.sort();
+        v
+    };
+
+    assert_eq!(
+        ids(super::g().V().has_label(&["A"]), &mut g),
+        vec!["a", "ab"]
+    );
+    assert_eq!(
+        ids(super::g().V().has_label(&["B"]), &mut g),
+        vec!["ab", "b"]
+    );
+
+    // The GQL side of the same graph agrees — this is the pair that diverged.
+    let rows = crate::gql::parse("MATCH (n:B) RETURN count(*) AS c")
+        .expect("parses")
+        .execute(&mut g, &crate::gql::eval::Params::new())
+        .expect("executes");
+
+    assert_eq!(rows.nrows, 1);
+
+    // `label()` is still first-label-only, in both engines.
+    assert_eq!(
+        super::g().V().has_label(&["B"]).label().run(&mut g).len(),
+        2
+    );
+}

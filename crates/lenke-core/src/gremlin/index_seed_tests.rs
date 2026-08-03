@@ -563,12 +563,24 @@ fn a_label_filter_composes_with_a_columnar_one() {
     );
 }
 
+/// `hasLabel` matches ANY of a vertex's labels, seeded or not.
+///
+/// This test used to assert the opposite — that only the FIRST label counts —
+/// which was native's behaviour and nothing else's. The TS engine is
+/// `step.labels.some((l) => v.labels.has(l))`, so a vertex labelled [Q, P] is
+/// found by `hasLabel('P')` there and was not here: a byte-identity divergence
+/// the fuzzers missed because they do not generate multi-label vertices.
+///
+/// TinkerPop has one label per vertex, so it says nothing about this; lenke
+/// stores many, and "the first" was an arbitrary choice dressed up as a contract.
+/// Note `label()` still returns the first — it has to return ONE — which is also
+/// what TS does.
+///
+/// A consequence worth keeping: under this rule bucket membership IS the answer,
+/// since a vertex is bucketed under every label it carries, so a bucket-seeded
+/// scan needs no re-check (`label_checked` in `seek::scan_with`).
 #[test]
-fn a_bucket_seeded_label_still_honours_the_first_label_rule() {
-    // `m0` carries [Q, P]: it IS in P's label bucket (buckets index every label)
-    // but its FIRST label is Q, so `hasLabel('P')` must not match it. Seeding
-    // from the bucket and forgetting to re-check is how that goes wrong, and the
-    // bucket seed only runs when the label is selective — which it is here.
+fn has_label_matches_any_of_a_vertexs_labels() {
     let mut graph = crate::ndjson::decode(
         &[
             r#"{"type":"node","id":"p0","labels":["P"],"properties":{"n":1}}"#,
@@ -582,9 +594,10 @@ fn a_bucket_seeded_label_still_honours_the_first_label_rule() {
     )
     .expect("fixture decodes");
 
+    // `m0` carries [Q, P] — found by BOTH.
     assert_eq!(
         ids(&mut graph, g().v_ids(&[]).has_label(&["P"])),
-        vec!["p0"]
+        vec!["m0", "p0"]
     );
     assert_eq!(
         ids(&mut graph, g().v_ids(&[]).has_label(&["Q"])),

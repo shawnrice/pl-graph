@@ -116,23 +116,9 @@ pub struct Seeded {
     pub exact_key: Option<Arc<str>>,
 }
 
-/// How a language decides whether an element carries a label.
-///
-/// The two engines genuinely disagree, so the rule is DATA in the IR rather than
-/// a fork in the code — which is what lets one implementation serve both.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum LabelRule {
-    /// ANY of the element's labels matches — ISO GQL's `(n:Person)`.
-    Any,
-    /// Only the element's FIRST label counts — TinkerPop's `hasLabel`, which
-    /// reads `vertex_labels(i).first()`.
-    First,
-}
-
 /// A label constraint on one element variable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LabelFilter {
-    pub rule: LabelRule,
     /// Vertex-label ids, or edge-type ids when the seek is over edges. An empty
     /// list matches nothing (the name resolved to no id).
     pub ids: Vec<u32>,
@@ -245,8 +231,8 @@ impl ElementSeek {
     }
 
     /// Constrain to elements carrying one of `ids`, under `rule`.
-    pub fn set_labels(&mut self, rule: LabelRule, ids: Vec<u32>) {
-        self.labels = Some(LabelFilter { rule, ids });
+    pub fn set_labels(&mut self, ids: Vec<u32>) {
+        self.labels = Some(LabelFilter { ids });
     }
 
     /// Does this element satisfy the label constraint?
@@ -260,13 +246,12 @@ impl ElementSeek {
             return f.ids.contains(&graph.e_type[id as usize]);
         }
 
-        match f.rule {
-            LabelRule::Any => f.ids.iter().any(|&l| graph.has_label(id, l)),
-            LabelRule::First => graph
-                .vertex_labels(id)
-                .first()
-                .is_some_and(|l| f.ids.contains(l)),
-        }
+        // ANY of the element's labels. Both languages want this: ISO GQL's
+        // `(n:Person)` by definition, and Gremlin's `hasLabel` because the TS
+        // engine is `labels.some(...)`. Native once matched only the FIRST label,
+        // which was a byte-identity divergence dressed up as a TinkerPop
+        // contract — TinkerPop has one label per vertex and says nothing here.
+        f.ids.iter().any(|&l| graph.has_label(id, l))
     }
 
     /// Candidates from the label buckets, when a label constraint is the only
@@ -632,22 +617,17 @@ impl ElementSeek {
         // by `scan_capped`); the remaining conditions are local: no conjunct left
         // to test, and a bucket that already PROVES the label rather than merely
         // over-approximating it.
-        let seed_take = seed_cap.filter(|_| {
-            self.conj.is_empty()
-                && self
-                    .labels
-                    .as_ref()
-                    .is_some_and(|f| f.rule == LabelRule::Any)
-        });
+        // A bucket seed already PROVES the label — a vertex is bucketed under
+        // every label it carries, so union membership IS "carries one of these".
+        // Nothing after it can reject on the label, which is both why the seed
+        // may stop at the cap and why the re-check below is skipped.
+        let seed_take = seed_cap.filter(|_| self.conj.is_empty() && self.labels.is_some());
         let mut label_checked = false;
         let mut ids = match self.resolve(graph, param) {
             Some(seeded) => seeded,
             None => match self.label_seed(graph, live, seed_take) {
                 Some(bucketed) => {
-                    label_checked = self
-                        .labels
-                        .as_ref()
-                        .is_some_and(|f| f.rule == LabelRule::Any);
+                    label_checked = true;
                     bucketed
                 }
                 None => universe(),
