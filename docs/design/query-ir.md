@@ -638,10 +638,68 @@ loud, rather than producing a row with a null in it.
 
 The second is the one to write.
 
+## The carrying WITH: re-measured, and the 4.8x is already gone
+
+The section above proposed seeding the frame from the incoming bindings. It was
+written and measured, and it is **neutral** — reverted, with the numbers recorded
+at the refusal site in `vectorized_frame`.
+
+The reason is that the premise expired. `vectorized_linear` is a SECOND columnar
+pipeline that takes the whole `MATCH … WITH … MATCH … RETURN` shape before
+`vectorized_frame` is ever reached, and **every** shape in `with_carry_bench`
+hits it. The entry that was added fired 4 times in the entire GQL suite.
+
+```text
+  50k vertices, degree 3, min of 7           plain    with WITH    ratio
+  count, compare to a carried scalar       1.830ms      3.078ms    1.68x
+  rows, compare to a carried scalar        2.315ms      3.817ms    1.65x
+  carry the element only                   0.366ms      1.338ms    3.66x
+  carry through a filtering WITH           0.970ms      0.809ms    0.83x   ← faster
+```
+
+Not 4.8x. And the last row is FASTER with the `WITH`, because filtering before
+the expansion is a smaller join.
+
+What remains is the cost of the `WITH` **barrier** — materializing the
+intermediate binding table — not a fall back to the scalar driver. Re-seeding a
+frame that was just materialized cannot recover it; the fix is to not materialize
+at the barrier at all, which is separate work. `with_carry_bench` is the harness
+for whoever takes it.
+
+The lesson is the same one this note keeps recording: the measurement was stale
+and the code had moved underneath it. **Re-measure before porting to a number.**
+
 ## How much is left, measured
 
-Every point where GQL declines the vectorized frame was labelled and the GQL
-suite run once. ~9300 bails, by reason:
+Re-measurable: `cargo test --release --features bailprobe -- --test-threads=1
+--include-ignored --nocapture gql::` prints a tally of which shapes decline the
+columnar frame, keyed by `scan.rs` line. The feature is off by default and costs
+nothing when off. It exists because these numbers were derived once by hand,
+removed, and then had to be derived again from scratch.
+
+**2026-08-03** — the join and ORDER BY work has absorbed most of the old list.
+`multi-pattern` (2683) and `order+distinct/alias` (2507) are **gone entirely**:
+
+```text
+  2513  agg-no-where       deliberate: scalar stream-folds, no materialize
+  1465  multi-clause       several MATCH clauses
+   119  incoming-bindings  a prior WITH/INSERT already produced bindings
+    74  path-variable      needs the Path value the columnar frame can't build
+     2  non-Match clause
+     2  scan-shape
+```
+
+Neither `multi-clause` nor `incoming-bindings` is the carrying-`WITH` shape —
+that one is handled by `vectorized_linear`, above this function entirely.
+
+One caution about the harness, learned the hard way: the tally is process-wide
+and `libtest` runs in NAME order under `--test-threads=1`, so the dump test has
+to sort LAST or it reports a partial count. It did not at first, and two runs
+disagreed by 900 before the cause was found. Its name starts `zzz_` for that
+reason. Confirm a tally is real by running it twice.
+
+The original measurement, for comparison. Every point where GQL declines the
+vectorized frame was labelled and the GQL suite run once. ~9300 bails, by reason:
 
 ```text
   2683  multi-pattern            MATCH (a)-[]->(b), (c)-[]->(d)  — a JOIN

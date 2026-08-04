@@ -2238,6 +2238,65 @@ fn joins_at(p: &CPath, end: usize) -> bool {
     p.start.var_slot == Some(end)
 }
 
+// ---- Which shapes decline the columnar frame, and how often ----
+//
+// Off by default and free when off. It exists because this tally was derived
+// once by hand, removed, and then had to be derived from scratch a second time —
+// by which point the numbers in the design note were stale and the biggest entry
+// on the list had already been fixed. Re-measure with:
+//
+//   cargo test --release --features bailprobe -- \
+//       --test-threads=1 --include-ignored --nocapture gql::
+//
+// `--test-threads=1` because the tally is process-wide, and `gql::` so the run
+// is one engine's suite rather than everything. The dump test is named `zzz_…`
+// so it sorts LAST — libtest runs in name order, and a dump that sorts early
+// reports a partial tally.
+#[cfg(feature = "bailprobe")]
+pub mod bailprobe {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static TALLY: OnceLock<Mutex<BTreeMap<u32, u64>>> = OnceLock::new();
+
+    pub fn hit(line: u32) {
+        *TALLY
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap()
+            .entry(line)
+            .or_default() += 1;
+    }
+
+    pub fn dump() -> String {
+        let m = TALLY
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap();
+        let mut v: Vec<(u32, u64)> = m.iter().map(|(a, b)| (*a, *b)).collect();
+        v.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        v.iter()
+            .map(|(l, n)| format!("{n:>6}  scan.rs:{l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+#[cfg(feature = "bailprobe")]
+macro_rules! bail {
+    () => {{
+        crate::gql::eval::scan::bailprobe::hit(line!());
+        return None;
+    }};
+}
+#[cfg(not(feature = "bailprobe"))]
+macro_rules! bail {
+    () => {
+        return None
+    };
+}
+
 /// Build (and WHERE-filter) the columnar frame for a single fresh `MATCH … RETURN`
 /// — the shared front half of the vectorized terminal paths ([`vectorized_cols`]
 /// and [`vectorized_rowset`]). Returns `None` (→ scalar driver) unless the shape
@@ -2250,8 +2309,24 @@ pub(super) fn vectorized_frame(
     matches: &[&CClause],
     proj: &CProjection,
 ) -> Option<ScanCols> {
+    // A prior `WITH`/`INSERT` already produced bindings.
+    //
+    // REJECTED (measured neutral): seeding the frame from those bindings and
+    // continuing through `expand_frame`, which is what the design note proposed
+    // for the "carrying a `WITH` costs 4.8x" finding. It was written and
+    // measured: 1.70x vs 1.72x, 3.47x vs 3.55x — noise. The reason is that the
+    // 4.8x is already gone. `vectorized_linear` is a SECOND columnar pipeline
+    // that takes the whole `MATCH … WITH … MATCH … RETURN` shape before this
+    // function is ever reached, and every shape in `with_carry_bench` hits it.
+    // The entry added here fired 4 times in the entire GQL suite.
+    //
+    // What remains (1.7x on a carried scalar, 3.5x on a carried element) is the
+    // cost of the `WITH` BARRIER — materializing the intermediate binding table —
+    // not a fall back to the scalar driver. Fixing that means not materializing
+    // at the barrier, which is a different piece of work; re-seeding a frame that
+    // was just materialized cannot recover it.
     if incoming.len() != 1 || incoming[0].0.iter().any(|c| c.is_some()) {
-        return None; // a prior WITH/INSERT already produced bindings
+        bail!();
     }
     // Consecutive MATCH clauses are a join, exactly like comma patterns:
     // `MATCH (a)-[]->(b) MATCH (b)-[]->(c)` and
@@ -2263,8 +2338,9 @@ pub(super) fn vectorized_frame(
     // written and removed: it fired three times in its own test and never once on
     // the benchmark queries, because there was nothing left to flatten.
     if matches.len() != 1 {
-        return None;
+        bail!();
     }
+
     // ORDER BY: an aggregate sorts its group rows internally ([`vectorized_aggregate`],
     // which resolves output aliases + aggregates). A non-aggregate sort over
     // OUTPUT aliases projects first and sorts the projected columns (see
@@ -2278,7 +2354,7 @@ pub(super) fn vectorized_frame(
         ..
     } = matches[0]
     else {
-        return None;
+        bail!();
     };
     // `MATCH (a)-[r]->(b), (b)-[s]->(c)` is a JOIN written as two patterns, and
     // `MATCH (a)-[r]->(b)-[s]->(c)` is the same query written as one. Fuse the
@@ -2304,7 +2380,7 @@ pub(super) fn vectorized_frame(
     // value (`all_walk`/`shortest_walk`); the vectorized frame yields columns.
     // (A selector / non-default mode already routes here via the run_part guard.)
     if path.path_var_slot.is_some() {
-        return None;
+        bail!();
     }
 
     // A pure aggregate over a traversal with no WHERE stays scalar: the scalar
@@ -2312,7 +2388,7 @@ pub(super) fn vectorized_frame(
     // per-row expression to vectorize. With a WHERE, the batched build + masked
     // count can pay for itself.
     if !path.segments.is_empty() && proj.aggregating && where_.is_none() {
-        return None;
+        bail!();
     }
 
     // A multi-segment pattern with a LIMIT and a plain projection is answered far
@@ -2331,7 +2407,7 @@ pub(super) fn vectorized_frame(
         && !has_order
         && proj.limit_val(ctx).is_some()
     {
-        return None;
+        bail!();
     }
 
     // Every input slot the rest of this statement reads: the projection items,

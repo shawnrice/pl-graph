@@ -11378,3 +11378,20 @@ fn labels_of_an_edge_agrees_with_the_pattern_matcher() {
         vec![vec![Value::Num(2.0)]]
     );
 }
+
+/// Prints which shapes declined the columnar frame during this run, and how
+/// often. See the `bailprobe` module in `eval/scan.rs` for the command.
+///
+/// The `zzz_` prefix is load-bearing: the tally is process-wide and `libtest`
+/// runs tests in NAME order under `--test-threads=1`, so a dump that sorts early
+/// reports a partial count. It did, and the partial numbers went into the design
+/// note before the discrepancy between two runs gave it away.
+#[cfg(feature = "bailprobe")]
+#[test]
+#[ignore]
+fn zzz_bailprobe_dump() {
+    println!(
+        "\n=== columnar-frame declines ===\n{}\n",
+        crate::gql::eval::scan::bailprobe::dump()
+    );
+}
