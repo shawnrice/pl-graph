@@ -833,10 +833,10 @@ fn column_terminal(
 /// corner: a value with NO key (a `NaN` inside it) is never a duplicate, so it
 /// rides through every time.
 ///
-/// That corner is UNREACHABLE from here and kept only so the two cannot drift: a
-/// stored property is never `NaN` (it is normalized to null at every entry
-/// point), so a value read off a column always has a key. A test cannot cover
-/// it, which is why this says so rather than pretending.
+/// That corner IS reachable. A NaN cannot be ingested — it is normalized to null
+/// at every entry point — but it can be COMPUTED into a property from inside the
+/// graph: `SET x = sqrt(-1)`, `asin(2)`, `acos(2)`, `power(-1, 0.5)` all store
+/// one. This was documented as unreachable and was not.
 fn distinct_values(values: impl Iterator<Item = GVal>) -> Vec<GVal> {
     let mut seen: HashSet<DedupKey> = HashSet::new();
     let mut out = Vec::new();
@@ -1080,9 +1080,7 @@ fn num_column_terminal(nums: &[f64], filter: Option<&P>, tail: &[Step]) -> Optio
         // `-0.0` and `0.0` are ONE key: they are equal, `dedup_key` collapses
         // them, and grouping agrees with equality everywhere else in both
         // engines. Keying on `to_bits` alone would split them and show two `0`s.
-        // A `NaN` cannot appear — a stored property is normalized to null on the
-        // way in — but the fold above already declines on one, so this never
-        // sees a column it would key wrongly.
+        // A `NaN` is the opposite case and is never keyed at all — see below.
         [Step::Dedupe { labels, bys }]
         | [Step::Dedupe { labels, bys }, Step::Count(Scope::Global)]
             if labels.is_empty() && bys.is_empty() =>
@@ -1091,7 +1089,11 @@ fn num_column_terminal(nums: &[f64], filter: Option<&P>, tail: &[Step]) -> Optio
             let mut distinct: Vec<f64> = Vec::new();
 
             for &x in nums {
-                if seen.insert((x + 0.0).to_bits()) {
+                // A `NaN` has NO dedup key, so it is never a duplicate — the
+                // stream keeps every one. Keying on its bits would collapse them
+                // all into one, which is what this did until a stored NaN turned
+                // out to be reachable (`SET x = sqrt(-1)`).
+                if x.is_nan() || seen.insert((x + 0.0).to_bits()) {
                     distinct.push(x);
                 }
             }

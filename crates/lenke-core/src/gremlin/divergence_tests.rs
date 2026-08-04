@@ -911,9 +911,10 @@ fn a_map_renders_in_insertion_order_so_order_local_is_observable() {
 /// Both keep FIRST-SEEN order. `barrier()` forces the stream path — a step that
 /// reorders would compare two different questions.
 ///
-/// The keyless corner (`dedup_key` returning `None`, for a `NaN`) is NOT covered
-/// and cannot be: a stored property is normalized to null on the way in, so a
-/// value read off a column always has a key.
+/// The keyless corner (`dedup_key` returning `None`, for a `NaN`) IS covered
+/// below. A NaN cannot be INGESTED — every entry point normalizes it to null —
+/// but it can be COMPUTED into a property from inside the graph, which this
+/// engine documented as impossible and is not.
 #[test]
 fn a_lowered_dedup_matches_the_streamed_one() {
     let mut lines: Vec<String> = Vec::new();
@@ -1006,5 +1007,72 @@ fn a_lowered_dedup_matches_the_streamed_one() {
         run("g.V().values('z').dedup().count()", &mut z),
         vec![GVal::Num(2.0)],
         "`-0.0` and `0.0` are one value, so this is 0 and 1.5"
+    );
+}
+
+/// A NaN can be COMPUTED into a stored property, and then every column terminal
+/// has to treat it the way the stream does.
+///
+/// It cannot be ingested — `NaN` is normalized to null at every entry point —
+/// so "a stored property is never NaN" reads as true and is not: `SET x =
+/// sqrt(-1)` stores one, as do `asin(2)`, `acos(2)` and `power(-1, 0.5)`.
+///
+/// It matters most for `dedup`, because a NaN has NO dedup key and so is never a
+/// duplicate — the stream keeps every one. The lowered numeric path keys on raw
+/// bits, which collapsed them all into one: `dedup().count()` was 1 where the
+/// stream said 2.
+#[test]
+fn a_computed_nan_column_matches_the_stream_in_every_terminal() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"m":-1}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"m":-1}}"#,
+            r#"{"type":"node","id":"c","labels":["V"],"properties":{"m":4}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    // Compute the column: two NaNs (sqrt of a negative) and one real number.
+    crate::gql::prepare("MATCH (a:V) SET a.x = sqrt(a.m)")
+        .expect("plans")
+        .execute(&mut g, &crate::gql::eval::Params::new())
+        .expect("runs");
+
+    let run = |src: &str, g: &mut crate::graph::Graph| {
+        super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(g)
+    };
+
+    for tail in [
+        "count()",
+        "sum()",
+        "mean()",
+        "min()",
+        "max()",
+        "fold()",
+        "dedup()",
+        "dedup().count()",
+        "groupCount()",
+        "is(gt(0)).count()",
+        "order()",
+    ] {
+        let lowered = run(&format!("g.V().values('x').{tail}"), &mut g);
+        let streamed = run(&format!("g.V().values('x').barrier().{tail}"), &mut g);
+
+        assert_eq!(
+            format!("{lowered:?}"),
+            format!("{streamed:?}"),
+            "`values('x').{tail}` over a NaN column disagrees with the stream"
+        );
+    }
+
+    // The one that actually broke: each NaN is its own value, so three rows
+    // deduplicate to three, not to two.
+    assert_eq!(
+        run("g.V().values('x').dedup().count()", &mut g),
+        vec![GVal::Num(3.0)],
+        "a NaN is never a duplicate, so both survive alongside the real number"
     );
 }
