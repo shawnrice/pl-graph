@@ -25,6 +25,7 @@ use crate::gql::ast::Lit;
 use crate::gql::ast::{Direction, PathMode, PathSelector};
 use crate::gql::plan::{CExpr, CLabelExpr, CNode, CPath, CPropConstraint, CRel, CSegment};
 use crate::gremlin::{GVal, Step, P};
+#[cfg(feature = "bailprobe")]
 use crate::pipeline::{OpClass, Route};
 
 /// A compiled prefix: the pattern, the interning tables its refs index into, and
@@ -202,6 +203,27 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
         return None;
     }
 
+    // Decline unless some node PAST the start is constrained.
+    //
+    // That is exactly the condition under which planning can contribute: the
+    // planner's whole job here is to seed the selective end, and when the only
+    // constraints sit on the start, the selective end IS the start and written
+    // order already seeds it. Compiling anyway costs a full pattern scan and a
+    // multi-slot frame to arrive at the plan the step list already had —
+    // measured 1.28x on `V().hasLabel(P).out(KNOWS).values(name)`, where the
+    // caller's own expand does the same walk with no frame at all.
+    //
+    // Note this asks about NODES, not the edge type: both paths already push a
+    // type down into the adjacency, so a typed hop is not something to orient
+    // toward.
+    let can_orient = segments
+        .iter()
+        .any(|s| s.node.label.is_some() || !s.node.props.is_empty());
+
+    if !can_orient {
+        return None;
+    }
+
     Some(Compiled {
         path: CPath {
             start,
@@ -220,10 +242,21 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
 
 /// Classify a Gremlin step for [`crate::pipeline`].
 ///
+/// NOT load-bearing at runtime, and behind the probe feature for that reason.
+/// The boundary analysis was written to be the first routing decision, and then
+/// offering the planned ids to the column terminals turned out to subsume it:
+/// "try the column path, else stream" answers the same question without asking
+/// it, because a terminal that wants a column is exactly a boundary. It stays
+/// because the classification is what measures the corpus — 55% Stream, 18%
+/// Columnar, 26% Decline — and because the general case it was written for is
+/// still coming: a boundary whose tail `column_paths` declines currently streams,
+/// where a frame would serve it better.
+///
 /// The per-language half of the routing decision: only this engine knows what
 /// its steps do, and only the shared rule knows what to do about it. The
 /// question each answer is about is MEMORY — does this step need every row at
 /// once — not what the step is called.
+#[cfg(feature = "bailprobe")]
 pub(super) fn class_of(step: &Step) -> OpClass {
     match step {
         // A row in, zero or more out. Filters, hops, and per-row projections.
@@ -283,6 +316,7 @@ pub(super) fn class_of(step: &Step) -> OpClass {
 }
 
 /// The route this traversal should take, and where its first boundary is.
+#[cfg(feature = "bailprobe")]
 pub(super) fn shape(steps: &[Step]) -> (Route, Option<usize>) {
     let classes: Vec<OpClass> = steps.iter().map(class_of).collect();
 

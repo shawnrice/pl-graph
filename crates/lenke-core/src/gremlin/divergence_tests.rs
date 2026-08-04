@@ -1291,3 +1291,49 @@ fn a_planned_pattern_matches_the_streamed_traversal() {
         );
     }
 }
+
+/// Planning is for the traversals whose selective end is NOT where written
+/// order would seed.
+///
+/// Both sides of this are invisible to a result comparison — the rows are the
+/// same either way, only the cost differs — so it takes its own test. Compiling
+/// a start-only-constrained traversal cost 1.28x on
+/// `V().hasLabel(P).out(KNOWS).values(name)`: a full pattern scan and a
+/// multi-slot frame, to arrive at the seed the step list already named.
+#[test]
+fn only_a_constraint_past_the_start_is_worth_planning() {
+    let compiles = |src: &str| {
+        let t = super::parse::parse(src).unwrap_or_else(|e| panic!("`{src}` parses: {e}"));
+
+        super::pattern::compile(&t.steps).is_some()
+    };
+
+    for q in [
+        // Nothing past the start to orient toward — written order already seeds
+        // the only constrained end.
+        "g.V().hasLabel('P').out('R')",
+        "g.V().has('k', 1).out('R')",
+        "g.V().hasLabel('P').has('k', 1).out('R').out('S')",
+        // Nothing constrained anywhere.
+        "g.V().out('R')",
+        "g.V().out('R').out('S')",
+        // A typed hop is not something to orient TOWARD: both paths push the
+        // type into the adjacency already.
+        "g.V().hasLabel('P').out('KNOWS')",
+    ] {
+        assert!(
+            !compiles(q),
+            "`{q}` has nothing past the start to orient to"
+        );
+    }
+
+    for q in [
+        "g.V().out('R').hasLabel('W')",
+        "g.V().out('R').has('k', 3)",
+        "g.V().hasLabel('P').out('R').hasLabel('Q')",
+        // The constraint is on the SECOND hop's node, two segments out.
+        "g.V().out('R').out('S').hasLabel('P')",
+    ] {
+        assert!(compiles(q), "`{q}` has a far constraint worth orienting to");
+    }
+}

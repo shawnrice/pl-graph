@@ -264,6 +264,15 @@ pub fn try_run(graph: &mut Graph, t: &Traversal) -> crate::error::CodeResult<Vec
 }
 
 fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
+    #[cfg(feature = "bailprobe")]
+    {
+        let (r, b) = super::pattern::shape(&t.steps);
+        crate::gql::eval::scan::bailprobe::hit_step(format!(
+            "ROUTE {r:?} boundary={}",
+            b.map_or_else(|| "none".to_string(), |i| format!("{i}"))
+        ));
+    }
+
     take_type_fault(); // reset any leftover flag from a prior run on this thread
     TRACK_PATH.with(|c| c.set(needs_path(&t.steps)));
 
@@ -272,10 +281,6 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
     // preceded them — the seed is only a superset with respect to those.
     if let Some(n) = try_count(graph, &t.steps) {
         return vec![GVal::Num(n)];
-    }
-
-    if let Some(vals) = try_values(graph, &t.steps) {
-        return vals;
     }
 
     // A linear prefix of filters and hops IS a pattern; plan it as one. A filter
@@ -298,14 +303,15 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
             ) {
                 let rest = &t.steps[c.consumed..];
 
-                // Is there a point downstream where every row has to exist at
-                // once? If so the rows are materialized whatever runs them, so
-                // keep the COLUMN and let the boundary work on it. If not,
-                // streaming is the cheaper shape and a `LIMIT` can stop early.
-                if super::pattern::shape(rest).0 == crate::pipeline::Route::Columnar {
-                    if let Some(out) = column_paths(graph, &ids, false, rest) {
-                        return out;
-                    }
+                // The column terminals, offered the ORIENTED ids. This has to
+                // come before `try_values` rather than after it: that path
+                // re-derives the frontier from `lower_hops`, which expands every
+                // vertex because it has no way to know a filter downstream makes
+                // the far end the selective one. It then fails on the tail and
+                // throws the work away — 0.36ms of it, where the planned scan
+                // that replaces it costs 0.013ms.
+                if let Some(out) = column_paths(graph, &ids, false, rest) {
+                    return out;
                 }
 
                 let seeded: Vec<Trav> = ids
@@ -319,6 +325,10 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
                     .collect();
             }
         }
+    }
+
+    if let Some(vals) = try_values(graph, &t.steps) {
+        return vals;
     }
 
     match index_seed(graph, &t.steps) {
