@@ -11,8 +11,11 @@
 //! optional external id round-trips (emitted only when assigned, read on decode);
 //! `undirected` is always emitted `false` and ignored on decode (directed core).
 
+use std::borrow::Cow;
+
 use crate::codec::{
-    element_props, json_id, json_props, json_str_array, node_labels, push_json_str, push_value,
+    edge_types, element_props, json_id, json_props, json_str_array, node_labels, push_json_str,
+    push_value,
 };
 use crate::error::{CodeError, CodeResult};
 use crate::error_codes::ErrorCode;
@@ -79,7 +82,12 @@ pub fn encode(g: &Graph) -> String {
         out.push_str(",\"to\":");
         push_json_str(&mut out, g.vid.text(g.e_dst[i]));
         out.push_str(",\"undirected\":false,\"labels\":[");
-        push_json_str(&mut out, g.etype.text(g.e_type[i]));
+        for (k, t) in edge_types(g, i as u32).iter().enumerate() {
+            if k > 0 {
+                out.push(',');
+            }
+            push_json_str(&mut out, t);
+        }
         out.push_str("],\"properties\":");
         push_props(&mut out, &element_props(&g.edge_props, &g.strs, i));
         out.push('}');
@@ -147,21 +155,17 @@ pub fn decode(input: &str) -> CodeResult<Graph> {
                 if !matches!(o.get("id"), None | Some(Json::Str(_)) | Some(Json::Num(_))) {
                     return Err(shape("edge 'id' must be a string or number"));
                 }
-                // The core edge carries one type — take the first label.
-                let etype = o
-                    .get("labels")
-                    .and_then(Json::as_array)
-                    .and_then(<[Json]>::first)
-                    .and_then(Json::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                // Edges are MULTI-type, like nodes: keep every label, not just
+                // the first. `json_str_array` is what the node arm above uses.
+                let mut names = json_str_array(o.get("labels")).into_iter();
+                let etype = names.next().unwrap_or(Cow::Borrowed(""));
                 b.edges.push(EdgeRec {
                     src: o.get("from").map(json_id).unwrap_or_default(),
                     dst: o.get("to").map(json_id).unwrap_or_default(),
-                    etype: etype.into(),
+                    etype,
                     props: json_props(o.get("properties"))?,
                     id: o.get("id").map(json_id),
-                    extra_labels: Vec::new(),
+                    extra_labels: names.collect(),
                 });
             }
         }

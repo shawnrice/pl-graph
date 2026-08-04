@@ -17,7 +17,7 @@ use crate::json::{self, Json};
 
 use std::borrow::Cow;
 
-use crate::codec::{element_props, is_intish, node_labels, push_json_str, push_num};
+use crate::codec::{edge_types, element_props, is_intish, node_labels, push_json_str, push_num};
 use crate::error::{CodeError, CodeResult};
 use crate::error_codes::ErrorCode;
 use crate::graph::{Builder, EdgeRec, Graph, NodeRec, Value};
@@ -215,7 +215,8 @@ pub fn encode(g: &Graph) -> String {
         push_json_str(&mut out, &g.edge_id(i as u32));
         out.push(',');
         out.push_str("\"label\":");
-        push_json_str(&mut out, g.etype.text(g.e_type[i]));
+        // A multi-type edge is `::`-joined, exactly as a multi-label vertex is.
+        push_json_str(&mut out, &edge_types(g, i as u32).join(LABEL_SEP));
         out.push_str(",\"inV\":");
         push_json_str(&mut out, g.vid.text(g.e_dst[i]));
         out.push_str(",\"outV\":");
@@ -306,11 +307,18 @@ pub fn decode(input: &str) -> CodeResult<Graph> {
                 .ok_or_else(|| shape("each edge must have an @value object"))?;
             let src = e.get("outV").map(crate::codec::json_id).unwrap_or_default();
             let dst = e.get("inV").map(crate::codec::json_id).unwrap_or_default();
-            // single type — split the `::` convention and take the first.
+            // Edges are MULTI-type: keep every `::`-joined piece, as the vertex
+            // arm above does. An empty label is no type at all, not one blank.
             let Some(Json::Str(label)) = e.get("label") else {
                 return Err(shape("edge @value.label must be a string"));
             };
-            let etype = label.split(LABEL_SEP).next().unwrap_or("").to_string();
+            let mut names = if label.is_empty() {
+                Vec::new()
+            } else {
+                label.split(LABEL_SEP).map(str::to_string).collect()
+            }
+            .into_iter();
+            let etype = names.next().unwrap_or_default();
             let mut props = Vec::new();
             if let Some(pmap) = e.get("properties").and_then(Json::as_object) {
                 for (k, entry) in pmap {
@@ -326,7 +334,7 @@ pub fn decode(input: &str) -> CodeResult<Graph> {
                 etype: etype.into(),
                 props,
                 id,
-                extra_labels: Vec::new(),
+                extra_labels: names.map(Into::into).collect(),
             });
         }
     }

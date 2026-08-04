@@ -17,7 +17,7 @@
 //! (use PG-JSON / GraphSON / CSV to round-trip an assigned edge id). An edge's
 //! single type is its first `:Label`.
 
-use crate::codec::{element_props, node_labels};
+use crate::codec::{edge_types, element_props, node_labels};
 use std::borrow::Cow;
 
 use crate::graph::{Builder, EdgeRec, Graph, NodeRec, Value};
@@ -170,10 +170,11 @@ pub fn encode(g: &Graph) -> String {
         }
         let from = g.vid.text(g.e_src[i]);
         let to = g.vid.text(g.e_dst[i]);
-        let etype = g.etype.text(g.e_type[i]);
+        // Every type, as repeated `:label` tokens — the same slot a multi-label
+        // node uses.
         lines.push(element_line(
             &[from, to],
-            &[etype],
+            &edge_types(g, i as u32),
             &element_props(&g.edge_props, &g.strs, i),
         ));
     }
@@ -456,13 +457,15 @@ pub fn decode(input: &str) -> Graph {
             let from = parse_id(tokens[0]);
             let to = parse_id(tokens[1]);
             let (labels, props) = parse_labels_props(&tokens[2..]);
+            // Edges are MULTI-type: every `:label` token counts, as on a node.
+            let mut names = labels.into_iter();
             b.edges.push(EdgeRec {
                 src: from,
                 dst: to,
-                etype: labels.into_iter().next().unwrap_or_default(),
+                etype: names.next().unwrap_or_default(),
                 props,
                 id: None, // the .pg textual format has no edge-id slot
-                extra_labels: Vec::new(),
+                extra_labels: names.collect(),
             });
         } else {
             let id = parse_id(tokens[0]);

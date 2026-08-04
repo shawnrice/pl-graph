@@ -58,12 +58,18 @@ fn normalize(g: &Graph) -> String {
         if !g.is_edge_live(i as u32) {
             continue;
         }
+        // Sorted, like the vertex arm — an edge carries a type SET, and which
+        // one is stored first is not part of what a codec has to preserve.
+        let mut types = crate::codec::edge_types(g, i as u32);
+        types.sort_unstable();
         let props = prop_repr(&element_props(&g.edge_props, &g.strs, i));
         lines.push(format!(
+            // `:A` for one type, `:A,B` for several — so every single-type line
+            // is byte-identical to what the shared golden already pins.
             "E {}->{} :{} {{{}}}",
             g.vid.text(g.e_src[i]),
             g.vid.text(g.e_dst[i]),
-            g.etype.text(g.e_type[i]),
+            types.join(","),
             props
         ));
     }

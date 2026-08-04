@@ -789,7 +789,8 @@ pub fn encode_edges(g: &Graph) -> String {
         let id = guard_field(&eid);
         let from = guard_field(g.vid.text(g.e_src[*i]));
         let to = guard_field(g.vid.text(g.e_dst[*i]));
-        let etype = guard_element(escape_element(g.etype.text(g.e_type[*i])));
+        // Every type, `;`-joined — the same cell shape as a node's `:LABEL`.
+        let etype = join_labels(crate::codec::edge_types(g, *i as u32));
 
         out.push('\n');
         write_row(&mut out, &[&id, &from, &to, &etype], &keys, &types, bag);
@@ -844,17 +845,16 @@ pub fn decode(input: &str) -> CodeResult<Graph> {
                 .map(|s| unguard_field(&s));
             let src = unguard_field(row.get(1).map(|c| c.text.as_str()).unwrap_or(""));
             let dst = unguard_field(row.get(2).map(|c| c.text.as_str()).unwrap_or(""));
-            let etype = split_labels(row.get(3).map(|c| c.text.as_str()).unwrap_or(""))
-                .into_iter()
-                .next()
-                .unwrap_or_default();
+            // Edges are MULTI-type: `:TYPE` is a `;`-joined SET, like `:LABEL`.
+            let mut names =
+                split_labels(row.get(3).map(|c| c.text.as_str()).unwrap_or("")).into_iter();
             b.edges.push(EdgeRec {
                 src: src.into(),
                 dst: dst.into(),
-                etype: etype.into(),
+                etype: names.next().unwrap_or_default().into(),
                 props: crate::graph::owned_props(props_from_row(row, &prop_cols, 4)),
                 id: id.map(Into::into),
-                extra_labels: Vec::new(),
+                extra_labels: names.map(Into::into).collect(),
             });
         }
     }

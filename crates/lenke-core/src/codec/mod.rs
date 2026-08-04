@@ -71,6 +71,19 @@ pub(crate) fn node_labels(g: &Graph, vi: u32) -> Vec<&str> {
         .collect()
 }
 
+/// Every type an edge carries, in storage order — the edge-side `node_labels`.
+///
+/// Edges are multi-type, and each format below already has a label-SET slot it
+/// uses for vertices (a JSON array, a `::`-joined string, repeated `:label`
+/// tokens, a `;`-joined cell). Writing `e_type` alone into that slot dropped
+/// every type but the first on the way out, in all four.
+pub(crate) fn edge_types(g: &Graph, ei: u32) -> Vec<&str> {
+    g.edge_labels(ei)
+        .into_iter()
+        .map(|t| g.etype.text(t))
+        .collect()
+}
+
 /// True if a float is an exact integer value — GraphSON `g:Int64` vs `g:Double`,
 /// CSV `integer` vs `float`. Mirrors JS `Number.isInteger`.
 pub(crate) fn is_intish(x: f64) -> bool {
@@ -383,5 +396,150 @@ mod tests {
         .unwrap();
         assert!(serialize(&plain, "csv").is_ok());
         assert!(serialize(&plain, "pg-text").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod multi_label_edge_sweep {
+    //! EVERY codec, round-tripping an edge that carries more than one type.
+    //!
+    //! Vertices have been multi-label since the start and every format here
+    //! already carries a label SET for them — a JSON array, a `::`-joined
+    //! string, repeated `:label` tokens, a `;`-joined cell. Edges used the same
+    //! slot but wrote only `e_type`, the first, so a two-type edge silently
+    //! became single-type on the way out. The TS mirrors emit all of them, which
+    //! made this a cross-engine divergence too; the codec fuzzer missed it
+    //! because it never built a multi-type edge.
+    //!
+    //! Written as a sweep because checking one format at a time is what let the
+    //! same omission sit in four of them.
+    use crate::codec::{deserialize, serialize};
+
+    const FORMATS: &[&str] = &["ndjson", "pg-json", "pg-text", "graphson", "csv"];
+
+    fn fixture() -> crate::graph::Graph {
+        crate::ndjson::decode(
+            &[
+                r#"{"type":"node","id":"a","labels":["V","W"],"properties":{}}"#,
+                r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#,
+                r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R","S"],"properties":{"w":1.0}}"#,
+                r#"{"type":"edge","id":"e1","from":"b","to":"a","labels":["T"],"properties":{}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("fixture decodes")
+    }
+
+    /// An edge's types, sorted, so the assertion does not depend on which one
+    /// happens to be stored first.
+    fn types(g: &crate::graph::Graph, ei: u32) -> Vec<String> {
+        let mut out: Vec<String> = g
+            .edge_labels(ei)
+            .into_iter()
+            .map(|t| g.etype.text(t).to_string())
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn every_codec_round_trips_all_of_an_edges_types() {
+        let g = fixture();
+
+        for fmt in FORMATS {
+            let text =
+                serialize(&g, fmt).unwrap_or_else(|e| panic!("`{fmt}` encode failed: {e:?}"));
+            let back =
+                deserialize(&text, fmt).unwrap_or_else(|e| panic!("`{fmt}` decode failed: {e:?}"));
+
+            assert_eq!(back.edge_count(), 2, "`{fmt}` lost an edge:\n{text}");
+            assert_eq!(
+                types(&back, 0),
+                vec!["R".to_string(), "S".to_string()],
+                "`{fmt}` dropped a type from a two-type edge:\n{text}"
+            );
+            assert_eq!(
+                types(&back, 1),
+                vec!["T".to_string()],
+                "`{fmt}` changed a single-type edge:\n{text}"
+            );
+        }
+    }
+
+    /// Encoding is idempotent through the round trip, so nothing is added either
+    /// — a decoder that duplicated a type would grow the output each pass.
+    #[test]
+    fn a_multi_type_edge_re_encodes_identically() {
+        let g = fixture();
+
+        for fmt in FORMATS {
+            let once = serialize(&g, fmt).expect("encodes");
+            let twice =
+                serialize(&deserialize(&once, fmt).expect("decodes"), fmt).expect("encodes");
+
+            assert_eq!(once, twice, "`{fmt}` is not stable across a round trip");
+        }
+    }
+}
+
+#[cfg(test)]
+mod separator_in_a_label {
+    //! GraphSON joins a label SET into one `::`-separated string, so a label
+    //! that CONTAINS `::` would be torn in two on the way back. The ingestion
+    //! gate rejects it — and now has to reject it on EDGES too, since an edge's
+    //! types go through that same join.
+    use crate::codec::deserialize;
+
+    fn err_of(doc: &str) -> String {
+        match deserialize(doc, "ndjson") {
+            Ok(_) => String::from("accepted"),
+            Err(e) => format!("{:?}", e.code),
+        }
+    }
+
+    #[test]
+    fn a_type_containing_the_graphson_separator_is_rejected_on_edges_too() {
+        let node = r#"{"type":"node","id":"a","labels":["V"],"properties":{}}"#;
+        let node_b = r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#;
+
+        // The vertex side, which has always been checked.
+        assert_eq!(
+            err_of(r#"{"type":"node","id":"a","labels":["has::sep"],"properties":{}}"#),
+            "InvalidValue"
+        );
+
+        // An edge's FIRST type...
+        assert_eq!(
+            err_of(&[
+                node,
+                node_b,
+                r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["has::sep"],"properties":{}}"#,
+            ]
+            .join("\n")),
+            "InvalidValue"
+        );
+
+        // ...and any of the rest, which only became reachable once edges kept
+        // more than one.
+        assert_eq!(
+            err_of(&[
+                node,
+                node_b,
+                r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R","has::sep"],"properties":{}}"#,
+            ]
+            .join("\n")),
+            "InvalidValue"
+        );
+
+        // A plain multi-type edge is still fine.
+        assert_eq!(
+            err_of(&[
+                node,
+                node_b,
+                r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R","S"],"properties":{}}"#,
+            ]
+            .join("\n")),
+            "accepted"
+        );
     }
 }
