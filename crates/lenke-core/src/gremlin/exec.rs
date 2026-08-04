@@ -284,7 +284,6 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
     }
 
     take_type_fault(); // reset any leftover flag from a prior run on this thread
-    TRACK_PATH.with(|c| c.set(needs_path(&t.steps)));
 
     // A linear prefix of filters and hops IS a pattern; plan it as one. A filter
     // AFTER the hop cannot inform a left-to-right walk, so the whole vertex set
@@ -292,8 +291,12 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
     // against the identical `MATCH ()-[:R]->(b:W)`. The planner picks the
     // selective end and seeds THERE.
     //
-    // Path tracking bars it: the frontier keeps no history, and what comes back
-    // is a fresh root per surviving endpoint.
+    // Path tracking in the REST bars it: the frontier keeps no history, and what
+    // comes back is a fresh root per surviving endpoint. Path tracking in the
+    // consumed PREFIX does not — the pattern answers structurally what the path
+    // was being kept for. `bothE().otherV()` is the case: "the end I did not come
+    // from" is a question about history only while walking step by step, and the
+    // frontier a `Both` segment returns is the far end by construction.
     //
     // FIRST, ahead of `try_count` and `try_values`, because both of those
     // re-derive the frontier by expanding left to right and have no way to know
@@ -304,8 +307,12 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
     // Safe to put first only because `compile` declines unless a node PAST the
     // start is constrained. That is exactly the case these two get wrong; with
     // the constraints on the start they still run, unchanged, below.
-    if !TRACK_PATH.with(Cell::get) {
-        if let Some(c) = super::pattern::compile(&t.steps) {
+    if let Some(c) = super::pattern::compile(&t.steps) {
+        let rest = &t.steps[c.consumed..];
+
+        if !needs_path(rest) {
+            TRACK_PATH.with(|x| x.set(false));
+
             if let Some(ids) = crate::gql::eval::plan_pattern_ids(
                 graph,
                 &c.path,
@@ -313,17 +320,16 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
                 &c.key_names,
                 c.scope_len,
                 c.end_slot,
+                c.end_is_edge,
             ) {
-                let rest = &t.steps[c.consumed..];
-
                 // The column terminals, offered the ORIENTED ids.
-                if let Some(out) = column_paths(graph, &ids, false, rest) {
+                if let Some(out) = column_paths(graph, &ids, c.end_is_edge, rest) {
                     return out;
                 }
 
                 let seeded: Vec<Trav> = ids
                     .into_iter()
-                    .map(|id| Trav::root(GVal::Node(id)))
+                    .map(|id| Trav::root(frontier_val(id, c.end_is_edge)))
                     .collect();
 
                 return run_steps(graph, ctx, rest, seeded)
@@ -333,6 +339,8 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
             }
         }
     }
+
+    TRACK_PATH.with(|c| c.set(needs_path(&t.steps)));
 
     // A seeded plan drops the `V()`/`E()` it started from plus the filters the
     // index answered exactly. Every OTHER filter still runs, including any that
@@ -509,6 +517,15 @@ fn path_free(step: &Step) -> bool {
             | Step::OutE(..)
             | Step::InE(..)
             | Step::BothE(..)
+            // An edge knows its OWN endpoints: `InV`/`OutV`/`BothV` read `e_dst`
+            // and `e_src` and never touch `Trav::path`. Only `OtherV` does, since
+            // "the end I did not come from" is a question about history. Leaving
+            // the other three out taxed every `outE().inV()` traversal with a
+            // per-traverser path clone for history nothing reads — 50.5ms on a
+            // 150k-edge count, against 0.113ms for the identical `out('R')`.
+            | Step::InV
+            | Step::OutV
+            | Step::BothV
             | Step::Values(..)
             | Step::Count(_)
             | Step::Limit(..)

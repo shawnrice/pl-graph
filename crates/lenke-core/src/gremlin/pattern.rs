@@ -34,8 +34,10 @@ pub(super) struct Compiled {
     pub path: CPath,
     pub label_names: Vec<String>,
     pub key_names: Vec<String>,
-    /// Slot the last node binds to — the traverser's value after the prefix.
+    /// Slot the last element binds to — the traverser's value after the prefix.
     pub end_slot: usize,
+    /// Whether that slot holds an EDGE (`outE('R')` with no landing step).
+    pub end_is_edge: bool,
     pub scope_len: usize,
     pub consumed: usize,
 }
@@ -105,17 +107,22 @@ fn lit_of(v: &GVal) -> Option<Lit> {
 /// `where_` on the node, but `has('k', gt(5))` over a string column faults in
 /// Gremlin and is unknown in GQL, so translating it would change which queries
 /// throw — the divergence `ElementSeek::columnar` already declines to avoid.
-fn absorb_filters(steps: &[Step], node: &mut CNode, it: &mut Interner) -> usize {
+fn absorb_filters(
+    steps: &[Step],
+    label: &mut Option<CLabelExpr>,
+    props: &mut Vec<CPropConstraint>,
+    it: &mut Interner,
+) -> usize {
     let mut n = 0;
 
     for step in steps {
         match step {
-            Step::HasLabel(names) if node.label.is_none() => match label_expr(names, it) {
-                Some(e) => node.label = Some(e),
+            Step::HasLabel(names) if label.is_none() => match label_expr(names, it) {
+                Some(e) => *label = Some(e),
                 None => break,
             },
             Step::Has(key, P::Eq(v)) => match lit_of(v) {
-                Some(l) => node.props.push(CPropConstraint {
+                Some(l) => props.push(CPropConstraint {
                     key: key.clone(),
                     key_ref: it.key(key),
                     value: CExpr::Lit(l),
@@ -131,12 +138,55 @@ fn absorb_filters(steps: &[Step], node: &mut CNode, it: &mut Interner) -> usize 
     n
 }
 
+/// The same, for a node.
+fn absorb_node(steps: &[Step], node: &mut CNode, it: &mut Interner) -> usize {
+    absorb_filters(steps, &mut node.label, &mut node.props, it)
+}
+
+/// The direction and type names of an EDGE hop, or `None` if it is not one.
+///
+/// `outE('R').inV()` is `out('R')` and `MATCH ()-[:R]->(b)` — the same pattern
+/// written with the edge named. Spelled apart it can also STOP on the edge, and
+/// that is the shape a vertex hop cannot express at all.
+fn edge_hop_of(step: &Step) -> Option<(Direction, &[String])> {
+    match step {
+        Step::OutE(l) => Some((Direction::Out, l)),
+        Step::InE(l) => Some((Direction::In, l)),
+        _ => None,
+    }
+}
+
+/// Whether `step` moves from an edge to the FAR endpoint of a hop in `dir`.
+///
+/// Only the far end continues the pattern. `outE().outV()` walks back to the
+/// vertex it came from, and `bothE().bothV()` emits both ends — neither is
+/// another segment, so both decline rather than compile into a pattern that
+/// means something else.
+///
+/// `bothE().otherV()` is absent for the same reason `both()` is — see `hop_of`.
+fn lands_far(dir: Direction, step: &Step) -> bool {
+    matches!(
+        (dir, step),
+        (Direction::Out, Step::InV) | (Direction::In, Step::OutV)
+    )
+}
+
 /// The direction and type names of a hop step, or `None` if it is not one.
+///
+/// `both()` is absent, and this is the second thing on this page that a
+/// self-loop decides. Gremlin's `both()` traverses a loop TWICE — it is an
+/// out-edge and an in-edge of the same vertex — where the IR's `Both` segment
+/// yields it once. Measured 4 rows against 3 on one self-loop, with `out()` and
+/// `in()` agreeing exactly on the same fixture.
+///
+/// Neither engine is wrong; undirected traversal is a per-language contract, the
+/// same category as ordering and equality. So the shared segment cannot carry
+/// Gremlin's `both()` and the compiler declines it, rather than GQL's
+/// `MATCH (a)-[:R]-(b)` being changed to double-count a loop.
 fn hop_of(step: &Step) -> Option<(Direction, &[String])> {
     match step {
         Step::Out(l) => Some((Direction::Out, l)),
         Step::In(l) => Some((Direction::In, l)),
-        Step::Both(l) => Some((Direction::Both, l)),
         _ => None,
     }
 }
@@ -163,40 +213,77 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
         props: Vec::new(),
         where_: None,
     };
-    let taken = absorb_filters(rest, &mut start, &mut it);
+    let taken = absorb_node(rest, &mut start, &mut it);
     consumed += taken;
 
     let mut segments: Vec<CSegment> = Vec::new();
     let mut slot = 0;
+    // Set when the traversal STOPS on an edge (`outE('R').has('w', 1)`), which is
+    // the one shape a vertex hop cannot spell. The loop then has to end: there is
+    // no next segment to start from an edge.
+    let mut ends_on_edge = false;
 
-    while let Some((dir, types)) = steps.get(consumed).and_then(hop_of) {
+    while let Some(step) = steps.get(consumed) {
+        // A vertex hop is an edge hop with its landing already applied.
+        let (dir, types, spelled_apart) = match (hop_of(step), edge_hop_of(step)) {
+            (Some((d, t)), _) => (d, t, false),
+            (_, Some((d, t))) => (d, t, true),
+            _ => break,
+        };
+
         consumed += 1;
         slot += 1;
 
+        let mut rel = CRel {
+            var_slot: None,
+            label: if types.is_empty() {
+                None
+            } else {
+                label_expr(types, &mut it)?.into()
+            },
+            direction: dir,
+            props: Vec::new(),
+            where_: None,
+            quantifier: None,
+        };
         let mut node = CNode {
-            var_slot: Some(slot),
+            var_slot: None,
             label: None,
             props: Vec::new(),
             where_: None,
         };
 
-        consumed += absorb_filters(&steps[consumed..], &mut node, &mut it);
+        if spelled_apart {
+            // Filters here constrain the EDGE — `outE('R').has('w', 1)`.
+            consumed += absorb_filters(&steps[consumed..], &mut rel.label, &mut rel.props, &mut it);
+
+            match steps.get(consumed) {
+                Some(v) if lands_far(dir, v) => consumed += 1,
+                // Stopping on the edge, or on a landing that is not the far end.
+                // The latter declines: `outE().outV()` returns to where it came
+                // from and `bothE().bothV()` emits both ends, so neither is the
+                // segment this would compile it into.
+                Some(Step::InV | Step::OutV | Step::OtherV | Step::BothV) => return None,
+                _ => ends_on_edge = true,
+            }
+        }
+
+        if ends_on_edge {
+            rel.var_slot = Some(slot);
+        } else {
+            node.var_slot = Some(slot);
+            consumed += absorb_node(&steps[consumed..], &mut node, &mut it);
+        }
+
         segments.push(CSegment {
-            rel: CRel {
-                var_slot: None,
-                label: if types.is_empty() {
-                    None
-                } else {
-                    label_expr(types, &mut it)?.into()
-                },
-                direction: dir,
-                props: Vec::new(),
-                where_: None,
-                quantifier: None,
-            },
+            rel,
             node,
             unit: None,
         });
+
+        if ends_on_edge {
+            break;
+        }
     }
 
     if segments.is_empty() {
@@ -216,9 +303,12 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
     // Note this asks about NODES, not the edge type: both paths already push a
     // type down into the adjacency, so a typed hop is not something to orient
     // toward.
+    // An edge PROPERTY counts too: the planner can seed from an edge property
+    // index, which a left-to-right walk has no way to reach. An edge TYPE does
+    // not — both paths already push that into the adjacency.
     let can_orient = segments
         .iter()
-        .any(|s| s.node.label.is_some() || !s.node.props.is_empty());
+        .any(|s| s.node.label.is_some() || !s.node.props.is_empty() || !s.rel.props.is_empty());
 
     if !can_orient {
         return None;
@@ -235,6 +325,7 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
         label_names: it.labels,
         key_names: it.keys,
         end_slot: slot,
+        end_is_edge: ends_on_edge,
         scope_len: slot + 1,
         consumed,
     })

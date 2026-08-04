@@ -205,6 +205,22 @@ fn main() {
             "try_count_semi_join",
         ),
         (
+            // The edge spelled apart. `outE('R').inV()` IS `out('R')`, so this is
+            // the same question as "far-end label decides the seed" written the
+            // other way — and the two Gremlin spellings must not diverge.
+            "far-end label, edge spelled apart",
+            "MATCH ()-[:R]->(b:W) RETURN count(*) AS c",
+            "g.V().outE('R').inV().hasLabel('W').count()",
+            "try_orient_node_seed",
+        ),
+        (
+            // Stopping ON the edge, which no vertex hop expresses.
+            "edges filtered by their own property",
+            "MATCH ()-[r:R]->() WHERE r.w = 1 RETURN count(*) AS c",
+            "g.V().outE('R').has('w', 1).count()",
+            "the edge property seek",
+        ),
+        (
             "distinct property values",
             "MATCH (a:V) RETURN count(DISTINCT a.n) AS c",
             "g.V().hasLabel('V').values('n').dedup().count()",

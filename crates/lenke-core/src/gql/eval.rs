@@ -3612,6 +3612,7 @@ pub(crate) fn plan_pattern_ids(
     key_names: &[String],
     scope_len: usize,
     want_slot: usize,
+    want_edge: bool,
 ) -> Option<Vec<u32>> {
     let ctx = Ctx {
         params: &[],
@@ -3636,8 +3637,10 @@ pub(crate) fn plan_pattern_ids(
         return None;
     }
 
+    let want = if want_edge { Elem::Edge } else { Elem::Node };
+
     match sc.slot(want_slot) {
-        Some((Elem::Node, ids)) => Some(ids.to_vec()),
+        Some((kind, ids)) if kind == want => Some(ids.to_vec()),
         _ => None,
     }
 }

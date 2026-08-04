@@ -1229,8 +1229,22 @@ fn a_planned_pattern_matches_the_streamed_traversal() {
         let t = if i % 3 == 0 { "R" } else { "S" };
 
         lines.push(format!(
-            r#"{{"type":"edge","id":"e{i}","from":"n{i}","to":"n{}","labels":["{t}"],"properties":{{}}}}"#,
-            (i * 7 + 1) % 60
+            r#"{{"type":"edge","id":"e{i}","from":"n{i}","to":"n{}","labels":["{t}"],"properties":{{"w":{}}}}}"#,
+            (i * 7 + 1) % 60,
+            i % 3
+        ));
+    }
+
+    // SELF-LOOPS, deliberately. A `Both` segment and `bothE().otherV()` agree on
+    // every ordinary edge and are the two places a direction equivalence can come
+    // apart: "the end I did not come from" has no answer on a loop, and both ends
+    // of one are the same vertex. Without these the fixture cannot tell a correct
+    // `both` lowering from one that double-counts.
+    for (i, v) in [(59, 0), (60, 4), (61, 8)] {
+        let t = if v == 4 { "S" } else { "R" };
+
+        lines.push(format!(
+            r#"{{"type":"edge","id":"e{i}","from":"n{v}","to":"n{v}","labels":["{t}"],"properties":{{"w":1}}}}"#
         ));
     }
 
@@ -1280,6 +1294,36 @@ fn a_planned_pattern_matches_the_streamed_traversal() {
         "g.V().out('R').has('k', within(1, 2))",
         "g.V().hasLabel('P').has('k', gte(4)).out('S')",
         "g.V().out('R').has('k', gt(3)).hasLabel('W')",
+        // Edge hops. `outE('R').inV()` IS `out('R')` — the same pattern with the
+        // edge named — and spelled apart it can also stop ON the edge, which no
+        // vertex hop expresses.
+        "g.V().outE('R').inV().hasLabel('W')",
+        "g.V().outE('R').inV().has('k', 3)",
+        "g.V().inE('S').outV().hasLabel('P')",
+        "g.V().bothE('R').otherV().hasLabel('W')",
+        "g.V().outE('R','S').inV().hasLabel('W')",
+        "g.V().outE().inV().hasLabel('W')",
+        "g.V().outE('NOPE').inV().hasLabel('W')",
+        // Stopping on the edge, with and without an edge filter.
+        "g.V().outE('R')",
+        "g.V().outE('R').has('w', 1)",
+        "g.V().bothE('S').has('w', 0)",
+        // An edge filter that does NOT end there.
+        "g.V().outE('R').has('w', 1).inV().hasLabel('W')",
+        // Two segments, the second ending on an edge.
+        "g.V().out('R').outE('S').has('w', 0)",
+        "g.V().outE('R').inV().outE('S').has('w', 1)",
+        // Landings that are NOT the far end: `outV()` walks back to where the
+        // edge came from and `bothV()` emits both ends. Neither is the segment a
+        // pattern would compile them into, so both must decline to the stream.
+        "g.V().outE('R').outV()",
+        "g.V().outE('R').outV().hasLabel('W')",
+        "g.V().inE('S').inV().hasLabel('P')",
+        "g.V().bothE('R').bothV().hasLabel('W')",
+        "g.V().outE('R').bothV()",
+        // A non-equality edge filter stays out, same as on a node.
+        "g.V().outE('R').has('w', gt(0))",
+        "g.V().outE('R').has('w', gt(0)).inV().hasLabel('W')",
     ] {
         // `barrier()` after `V()` keeps the same rows and defeats the compile.
         let streamed = q.replacen("g.V()", "g.V().barrier()", 1);
@@ -1333,6 +1377,14 @@ fn only_a_constraint_past_the_start_is_worth_planning() {
         "g.V().hasLabel('P').out('R').hasLabel('Q')",
         // The constraint is on the SECOND hop's node, two segments out.
         "g.V().out('R').out('S').hasLabel('P')",
+        // Edge hops: `outE('R').inV().hasLabel('W')` is `out('R').hasLabel('W')`
+        // with the edge named, and an edge PROPERTY is worth orienting to on its
+        // own because the planner can seek an edge property index.
+        "g.V().outE('R').inV().hasLabel('W')",
+        "g.V().inE('R').outV().has('k', 3)",
+        "g.V().outE('R').has('w', 1)",
+        "g.V().outE('R').has('w', 1).inV()",
+        "g.V().out('R').outE('S').has('w', 0)",
     ] {
         assert!(compiles(q), "`{q}` has a far constraint worth orienting to");
     }
@@ -1458,5 +1510,91 @@ fn a_lowered_count_matches_the_streamed_one() {
         ["[Num(11.0)]", "[Num(9.0)]", "[Num(3.0)]"].map(String::from),
         "fixture no longer separates count / dedup / dedup-by, so the arms \
          above would agree by accident"
+    );
+}
+
+/// Why an UNDIRECTED hop does not lower, stated as a number.
+///
+/// Gremlin's `both('R')` and GQL's `MATCH (a)-[:R]-(b)` agree on every ordinary
+/// edge, which is what makes them look like one operation. On a SELF-LOOP they
+/// do not: Gremlin traverses the loop twice, because it is an out-edge and an
+/// in-edge of the same vertex, and GQL yields it once. Over a two-vertex graph
+/// with one loop that is 4 against 3.
+///
+/// Neither is wrong — undirected traversal is a per-language contract, the same
+/// category as ordering and equality — so the shared segment cannot carry
+/// `both()`, and `pattern::hop_of` declines it. `bothE().otherV()` goes with it.
+///
+/// This is the same shape of finding as `->{2,2}` against a fixed two-segment
+/// chain: a translation that agrees only on loop-free graphs is a
+/// mistranslation, and the way to stop one being written again is to make the
+/// disagreement a test rather than a comment.
+#[test]
+fn an_undirected_hop_counts_a_self_loop_differently_in_each_language() {
+    let grem = |src: &str, g: &mut crate::graph::Graph| {
+        format!(
+            "{:?}",
+            super::parse::parse(src)
+                .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+                .run(g)
+        )
+    };
+    let gql = |src: &str, g: &mut crate::graph::Graph| {
+        format!(
+            "{:?}",
+            crate::gql::prepare(src)
+                .unwrap_or_else(|e| panic!("`{src}` plans: {e}"))
+                .execute(g, &crate::gql::eval::Params::new())
+                .unwrap_or_else(|e| panic!("`{src}` runs: {e}"))
+                .rows()
+                .next()
+                .map(<[_]>::to_vec)
+        )
+    };
+    let fixture = |loops: bool| {
+        let mut l = vec![
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{}}"#.to_string(),
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#.to_string(),
+            r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R"],"properties":{}}"#
+                .to_string(),
+        ];
+
+        if loops {
+            l.push(
+                r#"{"type":"edge","id":"e1","from":"a","to":"a","labels":["R"],"properties":{}}"#
+                    .to_string(),
+            );
+        }
+
+        crate::ndjson::decode(&l.join(
+            "
+",
+        ))
+        .expect("fixture decodes")
+    };
+
+    let mut looped = fixture(true);
+
+    assert_eq!(grem("g.V().both('R').count()", &mut looped), "[Num(4.0)]");
+    assert_eq!(
+        gql("MATCH (a)-[:R]-(b) RETURN count(*) AS c", &mut looped),
+        "Some([Num(3.0)])"
+    );
+
+    // The DIRECTED spellings agree on the same graph, which is what narrows the
+    // finding to undirected traversal rather than to self-loops generally.
+    assert_eq!(grem("g.V().out('R').count()", &mut looped), "[Num(2.0)]");
+    assert_eq!(
+        gql("MATCH (a)-[:R]->(b) RETURN count(*) AS c", &mut looped),
+        "Some([Num(2.0)])"
+    );
+
+    // Without the loop the undirected spellings agree — the trap.
+    let mut plain = fixture(false);
+
+    assert_eq!(grem("g.V().both('R').count()", &mut plain), "[Num(2.0)]");
+    assert_eq!(
+        gql("MATCH (a)-[:R]-(b) RETURN count(*) AS c", &mut plain),
+        "Some([Num(2.0)])"
     );
 }
