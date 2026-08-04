@@ -18,6 +18,7 @@ pub mod exec;
 #[cfg(test)]
 mod index_seed_tests;
 pub mod parse;
+mod pattern;
 #[cfg(test)]
 mod step_tests_1;
 #[cfg(test)]

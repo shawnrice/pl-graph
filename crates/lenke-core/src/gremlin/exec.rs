@@ -278,6 +278,37 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
         return vals;
     }
 
+    // A linear prefix of filters and hops IS a pattern; plan it as one. A filter
+    // AFTER the hop cannot inform a left-to-right walk, so the whole vertex set
+    // gets expanded before anything is discarded — 138x on `out(R).hasLabel(W)`
+    // against the identical `MATCH ()-[:R]->(b:W)`. The planner picks the
+    // selective end and seeds THERE.
+    //
+    // Path tracking bars it: the frontier keeps no history, and what comes back
+    // is a fresh root per surviving endpoint.
+    if !TRACK_PATH.with(Cell::get) {
+        if let Some(c) = super::pattern::compile(&t.steps) {
+            if let Some(ids) = crate::gql::eval::plan_pattern_ids(
+                graph,
+                &c.path,
+                &c.label_names,
+                &c.key_names,
+                c.scope_len,
+                c.end_slot,
+            ) {
+                let seeded: Vec<Trav> = ids
+                    .into_iter()
+                    .map(|id| Trav::root(GVal::Node(id)))
+                    .collect();
+
+                return run_steps(graph, ctx, &t.steps[c.consumed..], seeded)
+                    .into_iter()
+                    .map(|t| t.val)
+                    .collect();
+            }
+        }
+    }
+
     match index_seed(graph, &t.steps) {
         Some((seed, answered)) => {
             let rest: Vec<Step> = t.steps[1..]

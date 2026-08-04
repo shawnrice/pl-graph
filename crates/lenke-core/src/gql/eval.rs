@@ -3592,6 +3592,56 @@ fn cmp_bound(e: &CExpr, ctx: &Ctx) -> Option<(usize, usize, CompareOp, crate::gr
     None
 }
 
+/// Plan a PATTERN and hand back the ids bound at one slot.
+///
+/// The shared service behind "which end should this be seeded from" — the whole
+/// planner, reachable without a GQL query around it. `build_scan` already picks
+/// the selective end (`try_orient_node_seed`), seeds it from an index when one
+/// applies, and applies each segment's label and property constraints during the
+/// expansion. Written left-to-right and executed step by step, the same pattern
+/// costs 138x on this benchmark when the deciding filter sits at the FAR end.
+///
+/// `label_names` / `key_names` are the interning tables the pattern's refs index
+/// into — the caller builds them while compiling, exactly as `CQuery` does.
+/// Returns `None` when the shape is one the planner declines, and the caller
+/// should run it its own way.
+pub(crate) fn plan_pattern_ids(
+    graph: &Graph,
+    path: &crate::gql::plan::CPath,
+    label_names: &[String],
+    key_names: &[String],
+    scope_len: usize,
+    want_slot: usize,
+) -> Option<Vec<u32>> {
+    let ctx = Ctx {
+        params: &[],
+        prop_keys: key_names
+            .iter()
+            .map(|n| (graph.props.keys.get(n), graph.edge_props.keys.get(n)))
+            .collect(),
+        labels: label_names
+            .iter()
+            .map(|n| (graph.labels.get(n), graph.etype.get(n)))
+            .collect(),
+        label_names,
+        unknown_fns: &[],
+        fault: AtomicU8::new(FAULT_NONE),
+        edge_marks_pool: MarksPool::default(),
+    };
+    let sc = scan::build_scan(graph, &ctx, path, scope_len, None, None, None)?;
+
+    // A recorded data exception cannot be returned from here; decline so the
+    // caller's own path runs and surfaces it.
+    if ctx.fault.load(AtomOrdering::Relaxed) != FAULT_NONE {
+        return None;
+    }
+
+    match sc.slot(want_slot) {
+        Some((Elem::Node, ids)) => Some(ids.to_vec()),
+        _ => None,
+    }
+}
+
 // --- index-seeded scanning, expansion, and vectorized aggregation ---
 // `pub` only under `bailprobe`, so the dump test can reach the tally without the
 // module being public in a normal build.

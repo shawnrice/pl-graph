@@ -956,7 +956,6 @@ disagree. The shared layer has to carry the CHOICE.
    traversal's labels and keys are known at compile time, so the context is
    synthesizable.
 
-
 1. **Make the boundary a handoff, not a cliff.** Consume the longest lowerable
    PREFIX into a frontier, then hand that frontier to the fallback for the rest.
    This is the change that converts every future lowering from "helps queries

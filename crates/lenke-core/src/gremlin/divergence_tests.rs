@@ -1193,3 +1193,101 @@ fn a_lowered_order_matches_the_streamed_one() {
         );
     }
 }
+
+/// A traversal PLANNED as a pattern answers exactly what the streamed one does.
+///
+/// `g.V().out('R').hasLabel('W')` is `MATCH ()-[:R]->(b:W)`, so it is handed to
+/// the planner — which seeds the SELECTIVE end and walks the adjacency
+/// backwards, instead of expanding every vertex and discarding most of the rows.
+/// That reorders the work completely, so every shape it accepts is checked
+/// against the same traversal forced through the stream.
+///
+/// `barrier()` right after `V()` is what forces it: it defeats the pattern
+/// compile (the prefix no longer starts with a hop) without reordering anything.
+/// Results compare as multisets because seeding the far end visits endpoints in
+/// a different order, which is unspecified — the ROWS are the contract.
+#[test]
+fn a_planned_pattern_matches_the_streamed_traversal() {
+    let mut lines: Vec<String> = Vec::new();
+
+    for i in 0..60 {
+        let l = match i % 4 {
+            0 => r#"["P","W"]"#,
+            1 => r#"["P"]"#,
+            2 => r#"["Q"]"#,
+            _ => r#"["P","Q"]"#,
+        };
+
+        lines.push(format!(
+            r#"{{"type":"node","id":"n{i}","labels":{l},"properties":{{"k":{},"s":"v{}"}}}}"#,
+            i % 7,
+            i % 3
+        ));
+    }
+
+    for i in 0..59 {
+        let t = if i % 3 == 0 { "R" } else { "S" };
+
+        lines.push(format!(
+            r#"{{"type":"edge","id":"e{i}","from":"n{i}","to":"n{}","labels":["{t}"],"properties":{{}}}}"#,
+            (i * 7 + 1) % 60
+        ));
+    }
+
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    let rows = |src: &str, g: &mut crate::graph::Graph| {
+        let mut v: Vec<String> = super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(g)
+            .iter()
+            .map(|x| format!("{x:?}"))
+            .collect();
+        v.sort();
+        v
+    };
+
+    for q in [
+        "g.V().out('R')",
+        // The shape this exists for: the deciding filter is at the FAR end.
+        "g.V().out('R').hasLabel('W')",
+        "g.V().out('R').has('k', 3)",
+        "g.V().out('R').hasLabel('W').has('k', 0)",
+        // Filters at the near end, at both ends, and across two hops.
+        "g.V().hasLabel('P').out('R')",
+        "g.V().hasLabel('P').out('R').hasLabel('Q')",
+        "g.V().hasLabel('P').has('k',1).out('S').has('s','v0')",
+        "g.V().out('R').out('S')",
+        "g.V().out('R').out('S').hasLabel('P')",
+        "g.V().both('R').both('S')",
+        // Every direction, an untyped hop, a type disjunction, and names that
+        // resolve to nothing at either end.
+        "g.V().in('S')",
+        "g.V().both('R')",
+        "g.V().out()",
+        "g.V().out('R','S')",
+        "g.V().out('NOPE')",
+        "g.V().out('R').hasLabel('NOPE')",
+        // NON-equality predicates must stay OUT of the pattern. `has(k, gt(3))`
+        // over a string column is a type FAULT in Gremlin and three-valued
+        // unknown in GQL, so folding it into a `CPropConstraint` would both
+        // change which queries throw and — since a constraint is an EQUALITY —
+        // silently answer `k = 3`. The compiler stops at one, leaving it to the
+        // stream; these shapes are what proves it.
+        "g.V().out('R').has('k', gt(3))",
+        "g.V().out('R').has('k', lt(3))",
+        "g.V().out('R').has('k', neq(3))",
+        "g.V().out('R').has('k', within(1, 2))",
+        "g.V().hasLabel('P').has('k', gte(4)).out('S')",
+        "g.V().out('R').has('k', gt(3)).hasLabel('W')",
+    ] {
+        // `barrier()` after `V()` keeps the same rows and defeats the compile.
+        let streamed = q.replacen("g.V()", "g.V().barrier()", 1);
+
+        assert_eq!(
+            rows(q, &mut g),
+            rows(&streamed, &mut g),
+            "`{q}` planned as a pattern disagrees with the streamed traversal"
+        );
+    }
+}
