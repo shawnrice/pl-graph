@@ -911,12 +911,57 @@ a `Vec<Trav>` stream; GQL declines to a scalar `Binding` loop. `Trav` is
 SAME value type, since `Val ≡ GVal` already merged. One is the other plus
 per-traverser state.
 
+### The equivalence is the PATTERN, not the step
+
+Looking for `g.V()` on its own was the wrong seam — nobody writes it. The shapes
+people write are `g.V().out('R')` and `MATCH (a)-[:R]->(b)`, and those are the
+SAME QUERY. A Gremlin linear prefix of filters and hops IS a `CPath`: leading
+`hasLabel`/`has` are the start `CNode`, each `out(T)` is a `CSegment`, and a
+`hasLabel` AFTER the hop is that segment's end-node constraint.
+
+Reading them as steps hides what it costs to not plan them together:
+
+```text
+                                    GQL       Gremlin
+  selective end at the START      0.004ms     0.002ms      equal
+  selective end at the FAR end    0.004ms     6.199ms      1550x
+  property filter on the far end  0.067ms     7.751ms       116x
+```
+
+`g.V().out('R').hasLabel('W')` is `MATCH ()-[:R]->(b:W)`. GQL plans the whole
+pattern, sees the selective end is `b`, and seeds THERE — walking the adjacency
+backwards. Gremlin executes in written order, so a filter after the hop cannot
+inform the seed and 50k vertices get expanded to 150k rows first.
+
+That is not a missing shortcut. It is the planner Gremlin never had, and GQL's
+`try_orient_node_seed` already is.
+
+### And the routing is per-SHAPE, not per-language
+
+The inverse case is just as real. `MATCH ()-[:R]->{2,2}()` is 17.7ms where
+Gremlin's `repeat(out('R')).times(2)` is 1.1ms — 16x the other way — and 2945 of
+GQL's declines are `agg-no-where`, which is GQL DELIBERATELY choosing to stream
+because the scalar fold beats materializing.
+
+So the goal is not "lower Gremlin onto the columnar frame". Each model wins on
+different shapes, and today each engine hard-codes its own routing and they
+disagree. The shared layer has to carry the CHOICE.
+
 ### The plan
+
+0. **Compile a Gremlin linear prefix into the pattern IR and plan it.** This is
+   the 138x above, and it is the change that makes every later one cheaper: once
+   both engines hand the planner a pattern, everything the planner learns lands
+   on both. `Ctx` is built from a `CQuery`'s interned name lists, and a Gremlin
+   traversal's labels and keys are known at compile time, so the context is
+   synthesizable.
+
 
 1. **Make the boundary a handoff, not a cliff.** Consume the longest lowerable
    PREFIX into a frontier, then hand that frontier to the fallback for the rest.
    This is the change that converts every future lowering from "helps queries
-   that lower end-to-end" to "helps every query containing it".
+   that lower end-to-end" to "helps every query containing it". It follows step
+   0 rather than preceding it: the prefix worth consuming is a PATTERN.
 
 2. **Then merge the two fallbacks.** A `Binding` is a `Trav` without the
    traverser state; a slot-indexed binding is strictly better than name-keyed

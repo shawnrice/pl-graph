@@ -155,6 +155,26 @@ fn main() {
             "try_grouped_2hop",
         ),
         (
+            // The pattern-level equivalence, and the biggest gap on this page.
+            // GQL plans the WHOLE pattern and orients — seeds the selective end
+            // and walks its adjacency backwards. Gremlin executes steps in
+            // written order, so a filter that lands AFTER the hop cannot inform
+            // the seed and the whole vertex set gets expanded first.
+            //
+            // Same question either way: `g.V().out(R).hasLabel(W)` IS
+            // `MATCH ()-[:R]->(b:W)`.
+            "far-end label decides the seed",
+            "MATCH ()-[:R]->(b:W) RETURN count(*) AS c",
+            "g.V().out('R').hasLabel('W').count()",
+            "try_orient_node_seed",
+        ),
+        (
+            "far-end property decides the seed",
+            "MATCH ()-[:R]->(b) WHERE b.n = 7 RETURN count(*) AS c",
+            "g.V().out('R').has('n', 7).count()",
+            "try_orient_node_seed + the property index",
+        ),
+        (
             "sum a property over a label",
             "MATCH (a:V) RETURN sum(a.n) AS s",
             "g.V().hasLabel('V').values('n').sum()",
