@@ -1084,8 +1084,13 @@ impl Graph {
         }
         self.e_live[i] = false;
         self.live_e -= 1;
-        if let Some(bucket) = self.by_etype.get_mut(&self.e_type[i]) {
-            bucket.retain(|&x| x != ei);
+        // EVERY type the edge carried, not just `e_type`. `by_etype` is what
+        // `edges_with_etype_name` scans, so a bucket left holding a dead edge
+        // makes a later constraint declare validate against it.
+        for tid in self.edge_labels(ei) {
+            if let Some(bucket) = self.by_etype.get_mut(&tid) {
+                bucket.retain(|&x| x != ei);
+            }
         }
         // Drop any external id overlay for this edge.
         if let Some(old) = self.eid_fwd.remove(&ei) {

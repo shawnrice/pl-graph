@@ -148,7 +148,32 @@ char_length/character_length, `||`, left/lower/right/trim/upper).
 | GF11 | Advanced aggregates: binary set    |  ✅   | `percentile_cont`/`percentile_disc`.                                                                                                                                |
 | GA05 | Cast specification (`CAST`)        |  ✅   |                                                                                                                                                                     |
 | G100 | `ELEMENT_ID` function              |  ✅   | `element_id(x)`.                                                                                                                                                    |
+| —    | `labels()` / `type()`              |  ❓   | **Not verified — see the note below.** Neither appears to be an ISO function at all; both are Cypher inheritances lenke ships.                                      |
 | GA06 | Value type predicates (`IS TYPED`) |  ✅   | `x IS [NOT] TYPED <type> [NOT NULL]`, both engines. Null conforms to nullable types; INTEGER = whole number (f64 model). `::` alias + parameterized types deferred. |
+
+> **`labels()` and `type()` are UNVERIFIED and we do not currently believe they
+> are conformant.** No free source we have consulted shows either as an ISO GQL
+> function. The standard's label facilities appear to be the `IS LABELED`
+> predicate (G111) and pattern label expressions; its only element-level function
+> appears to be `ELEMENT_ID` (G100). Two secondary derivations agree that
+> `labels` has no production — the
+> [opengql grammar](https://github.com/opengql/grammar) and Microsoft Fabric's
+> Annex D conformance table — but **neither is the spec text**, and per the
+> reliability lesson in [references.md](./references.md) a secondary source is
+> not a primary reproduction. `element_type()` likewise appears nowhere.
+>
+> lenke ships both as **Cypher inheritances**, with `labels()` widened to accept
+> an edge (returning its type set) to match the two vendors that ship it —
+> Spanner's `LABELS(GRAPH_ELEMENT) -> ARRAY<STRING>` and Fabric's
+> `labels(node_or_edge)`. That is a defensible vendor-consensus choice, not a
+> conformance claim.
+>
+> **To verify** (deliberately not scheduled): resolve `labels`/`type`/
+> `element_type` against a primary reproduction of 39075 — the Neo4j `.adoc`
+> sources this checklist already uses for Feature IDs, or the spec text itself.
+> If ISO does define them, re-check the argument domain: an ISO `labels()` that
+> is node-only would make lenke's edge form an extension, which by the repo's own
+> convention would need the leading-underscore sigil.
 
 ### Query composition & clauses
 

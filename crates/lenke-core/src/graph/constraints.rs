@@ -759,12 +759,12 @@ impl Graph {
             Some(ids) => ids
                 .iter()
                 .copied()
-                .filter(|&e| self.is_edge_live(e) && self.e_type[e as usize] == tid)
+                .filter(|&e| self.is_edge_live(e) && self.edge_has_label(e, tid))
                 .collect(),
             None => (0..self.e_src.len() as u32)
                 .filter(|&e| {
                     self.is_edge_live(e)
-                        && self.e_type[e as usize] == tid
+                        && self.edge_has_label(e, tid)
                         && self.edge_props.value(e as usize, key, &self.strs) == *value
                 })
                 .collect(),
@@ -780,7 +780,7 @@ impl Graph {
             let mut with_type = ids
                 .iter()
                 .copied()
-                .filter(|&e| self.is_edge_live(e) && self.e_type[e as usize] == tid);
+                .filter(|&e| self.is_edge_live(e) && self.edge_has_label(e, tid));
             if let (Some(a), Some(b)) = (with_type.next(), with_type.next()) {
                 return Some((a, b));
             }
@@ -788,15 +788,20 @@ impl Graph {
         None
     }
 
-    /// The single type name an edge carries (empty vec for a type-less edge) — the
-    /// edge analogue of a vertex's label list (an edge has exactly one type).
+    /// EVERY type name an edge carries (empty vec for a type-less edge) — the
+    /// edge analogue of a vertex's label list.
+    ///
+    /// This decides which constraints apply to an edge at all: it feeds
+    /// `edge_missing_required` on the write path and `check_validators_edge`.
+    /// Returning only `e_type`, the first, let a two-type edge escape every
+    /// constraint declared on its second — silently, since an unenforced
+    /// constraint just never fires.
     pub(crate) fn edge_type_names(&self, ei: u32) -> Vec<String> {
-        let name = self.etype.text(self.e_type[ei as usize]).to_string();
-        if name.is_empty() {
-            Vec::new()
-        } else {
-            vec![name]
-        }
+        self.edge_labels(ei)
+            .into_iter()
+            .map(|t| self.etype.text(t).to_string())
+            .filter(|n| !n.is_empty())
+            .collect()
     }
 
     /// A live edge's present properties as `(key, value)` pairs — the shape the edge

@@ -2319,3 +2319,185 @@ mod edge_labels {
         assert!(!g.edges_with_etype(s).contains(&e));
     }
 }
+
+#[cfg(test)]
+mod multi_type_edge_constraints {
+    //! A constraint declared on edge type `T` binds every edge that CARRIES `T`,
+    //! not only edges whose FIRST type is `T`.
+    //!
+    //! That is already the vertex rule: a label constraint binds every vertex
+    //! carrying the label. These paths tested `e_type[ei]`, so a two-type edge
+    //! escaped every constraint on its second type — silently, because an
+    //! unenforced constraint simply never fires.
+    use crate::graph::{Graph, Value};
+
+    /// Two nodes and one edge whose types are given in order, so the same graph
+    /// can be built with the interesting type first or second.
+    fn graph_with(types: &str, k: f64) -> Graph {
+        crate::ndjson::decode(
+            &[
+                r#"{"type":"node","id":"a","labels":["V"],"properties":{}}"#.to_string(),
+                r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#.to_string(),
+                format!(
+                    r#"{{"type":"edge","id":"e0","from":"a","to":"b","labels":{types},"properties":{{"k":{k}}}}}"#
+                ),
+            ]
+            .join("\n"),
+        )
+        .expect("fixture decodes")
+    }
+
+    #[test]
+    fn the_type_names_of_an_edge_are_all_of_them() {
+        // `edge_type_names` decides which constraints apply at all: it feeds both
+        // `edge_missing_required` (transactions) and `check_validators_edge`.
+        let g = graph_with(r#"["R","S"]"#, 1.0);
+        let mut names = g.edge_type_names(0);
+        names.sort();
+
+        assert_eq!(names, vec!["R".to_string(), "S".to_string()]);
+    }
+
+    #[test]
+    fn a_required_constraint_binds_an_edges_second_type() {
+        for types in [r#"["S","R"]"#, r#"["R","S"]"#] {
+            let g = graph_with(types, 1.0);
+            let et = g.edge_type_names(0);
+
+            // Declaring is fine — the edge HAS `k`.
+            let mut g2 = graph_with(types, 1.0);
+            g2.create_edge_required_constraint("S", "k")
+                .expect("existing edge satisfies it");
+
+            // ...and an edge with these types and no `k` would violate it,
+            // whichever position `S` sits in.
+            assert!(
+                g2.edge_missing_required(&et, &[]).is_some(),
+                "an edge with types {types} escaped a required constraint on `S`"
+            );
+            assert!(g2
+                .edge_missing_required(&et, &[("k".to_string(), Value::Num(2.0))])
+                .is_none());
+
+            // A declare against data that violates it still fails either way.
+            let mut g3 = crate::ndjson::decode(
+                &[
+                    r#"{"type":"node","id":"a","labels":["V"],"properties":{}}"#.to_string(),
+                    r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#.to_string(),
+                    format!(
+                        r#"{{"type":"edge","id":"e0","from":"a","to":"b","labels":{types},"properties":{{}}}}"#
+                    ),
+                ]
+                .join("\n"),
+            )
+            .expect("decodes");
+            assert!(
+                g3.create_edge_required_constraint("S", "k").is_err(),
+                "an existing edge with types {types} hid from the declare-time check"
+            );
+
+            drop(g);
+        }
+    }
+
+    #[test]
+    fn a_unique_constraint_binds_an_edges_second_type() {
+        for types in [r#"["S","R"]"#, r#"["R","S"]"#] {
+            let mut g = graph_with(types, 1.0);
+            g.create_edge_unique_constraint("S", "k").expect("declares");
+            let et = g.edge_type_names(0);
+
+            // A second edge with the same `k` collides with the stored one.
+            assert!(
+                g.edge_unique_conflict(&et, &[("k".to_string(), Value::Num(1.0))], None)
+                    .is_some(),
+                "a duplicate hid behind types {types}"
+            );
+
+            // The stored edge itself is excluded, and a different value is free.
+            assert!(g
+                .edge_unique_conflict(&et, &[("k".to_string(), Value::Num(1.0))], Some(0))
+                .is_none());
+            assert!(g
+                .edge_unique_conflict(&et, &[("k".to_string(), Value::Num(9.0))], None)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn declaring_unique_sees_a_duplicate_hidden_in_a_second_type() {
+        // Two edges sharing `k=1`, one carrying `S` first and one second — the
+        // declare-time scan has to see both as `S` edges.
+        let mut g = crate::ndjson::decode(
+            &[
+                r#"{"type":"node","id":"a","labels":["V"],"properties":{}}"#,
+                r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#,
+                r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["S"],"properties":{"k":1}}"#,
+                r#"{"type":"edge","id":"e1","from":"b","to":"a","labels":["R","S"],"properties":{"k":1}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("decodes");
+
+        assert!(
+            g.create_edge_unique_constraint("S", "k").is_err(),
+            "a duplicate whose `S` is a SECOND type was invisible at declare time"
+        );
+    }
+}
+
+#[cfg(test)]
+mod multi_type_edge_buckets {
+    //! Deleting an edge has to unbucket it from EVERY type it carried.
+    //!
+    //! `by_etype` is bucketed per type, and `edges_with_etype_name` reads it —
+    //! it is what the declare-time required/type constraint checks scan. Removing
+    //! only `e_type`'s bucket left a dead edge visible under its other types, so a
+    //! constraint declared afterwards would validate against a deleted edge.
+    use crate::graph::Graph;
+
+    fn fixture() -> Graph {
+        crate::ndjson::decode(
+            &[
+                r#"{"type":"node","id":"a","labels":["V"],"properties":{}}"#,
+                r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#,
+                r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R","S"],"properties":{}}"#,
+            ]
+            .join("\n"),
+        )
+        .expect("fixture decodes")
+    }
+
+    #[test]
+    fn deleting_an_edge_unbuckets_every_type_it_carried() {
+        let mut g = fixture();
+
+        assert_eq!(g.edges_with_etype_name("R").map(<[u32]>::len), Some(1));
+        assert_eq!(g.edges_with_etype_name("S").map(<[u32]>::len), Some(1));
+
+        g.remove_edge(0);
+
+        assert_eq!(
+            g.edges_with_etype_name("R").map(<[u32]>::len),
+            Some(0),
+            "a deleted edge stayed in its FIRST type's bucket"
+        );
+        assert_eq!(
+            g.edges_with_etype_name("S").map(<[u32]>::len),
+            Some(0),
+            "a deleted edge stayed in its SECOND type's bucket"
+        );
+    }
+
+    #[test]
+    fn a_constraint_declared_after_a_delete_does_not_see_the_dead_edge() {
+        let mut g = fixture();
+        g.remove_edge(0);
+
+        // The dead edge has no `k`, so if the scan still saw it this would fail.
+        g.create_edge_required_constraint("S", "k")
+            .expect("a deleted edge must not block a declare");
+        g.create_edge_required_constraint("R", "k")
+            .expect("a deleted edge must not block a declare");
+    }
+}

@@ -1049,13 +1049,14 @@ export const UNHANDLED = Symbol('unhandled');
 // Graph functions — label/key order sorted for cross-engine parity.
 export const callGraphFn = (name: string, a: unknown): unknown => {
   switch (name) {
-    // `labels` is not an ISO GQL function at all — the standard interrogates
-    // labels with the `IS LABELED` predicate. It is a Cypher inheritance that
-    // vendors added, and the two that ship it take an ELEMENT, not just a node:
-    // Spanner's `LABELS(GRAPH_ELEMENT) -> ARRAY<STRING>` and Fabric's
-    // `labels(node_or_edge)` "labels of a node or edge as a list of strings".
-    // Neither returns null for an edge; both return a length-1 list, because
-    // neither has multi-label edges. This engine does, so it returns the set —
+    // NOT VERIFIED CONFORMANT — see docs/conformance/gql-feature-checklist.md.
+    // No free source consulted shows `labels` as an ISO function at all (the
+    // standard appears to use the `IS LABELED` predicate), so this is a Cypher
+    // inheritance rather than a conformance claim. It takes an ELEMENT because
+    // the two vendors that ship it do: Spanner's
+    // `LABELS(GRAPH_ELEMENT) -> ARRAY<STRING>` and Fabric's
+    // `labels(node_or_edge)`. Both return a length-1 list for an edge since
+    // neither has multi-label edges; this engine does, so it returns the set —
     // the natural generalization, and the only accessor for it.
     case 'labels':
       return isVertex(a) || isEdge(a) ? [...a.labels].sort() : null;
