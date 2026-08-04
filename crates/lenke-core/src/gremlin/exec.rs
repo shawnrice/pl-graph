@@ -1482,14 +1482,24 @@ fn write_gval(out: &mut String, graph: &Graph, v: &GVal) {
             out.push(']');
         }
         GVal::Map(entries) => {
-            // Match serde_json::Map (a BTreeMap): keys sorted lexicographically.
-            // The sync live-query layer diffs cells by `JSON.stringify`
-            // byte-equality, so this canonical order is load-bearing.
-            let mut pairs: Vec<(String, &GVal)> = entries
+            // INSERTION order, which is what the map was built in.
+            //
+            // This used to sort lexicographically to match `serde_json::Map` (a
+            // BTreeMap), for the sync live-query layer, which diffs cells by
+            // `JSON.stringify` byte-equality. That needs a DETERMINISTIC order,
+            // not a sorted one — and every map here is built from a `Vec`, never
+            // from a `HashMap` iteration, so insertion order already is one.
+            //
+            // Sorting made this the odd renderer out three ways: GQL's
+            // `codec::push_value` and this module's own `push_result_value` both
+            // preserve insertion order, and the TS engine does too — so the same
+            // `groupCount()` came back key-sorted natively and first-seen in TS.
+            // It also made `order(local)` on a map unobservable, since the sort
+            // undid it on the way out.
+            let pairs: Vec<(String, &GVal)> = entries
                 .iter()
                 .map(|(k, val)| (map_key(graph, k), val))
                 .collect();
-            pairs.sort_by(|a, b| a.0.cmp(&b.0));
             out.push('{');
             for (i, (k, val)) in pairs.iter().enumerate() {
                 if i > 0 {

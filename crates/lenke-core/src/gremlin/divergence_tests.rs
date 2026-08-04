@@ -854,3 +854,54 @@ fn a_lowered_group_count_matches_the_streamed_one() {
 
     assert_eq!(counted, 51.0, "every present `n` is tallied exactly once");
 }
+
+/// A map renders in INSERTION order, which makes `order(local)` on it
+/// observable and matches every other map renderer in the codebase.
+///
+/// Serializing sorted lexicographically (to mirror `serde_json::Map`) undid the
+/// sort the user had just asked for, so `order(local).by(keys, desc)` came back
+/// key-ascending — a step that silently did nothing. It also disagreed with
+/// GQL's `codec::push_value`, with this module's own `push_result_value`, and
+/// with the TS engine, whose maps have always been insertion-ordered.
+#[test]
+fn a_map_renders_in_insertion_order_so_order_local_is_observable() {
+    let lines: Vec<String> = (0..12)
+        .map(|i| {
+            format!(
+                r#"{{"type":"node","id":"n{i}","labels":["V"],"properties":{{"n":{}}}}}"#,
+                i % 4
+            )
+        })
+        .collect();
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    let json = |src: &str, g: &mut crate::graph::Graph| {
+        let vals = super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(g);
+
+        super::exec::results_to_json(g, &vals)
+    };
+
+    // First-seen order is vertex order: 0, 1, 2, 3.
+    assert_eq!(
+        json("g.V().values('n').groupCount()", &mut g),
+        r#"[{"0":3,"1":3,"2":3,"3":3}]"#
+    );
+
+    // ...and `order(local)` actually reorders it. Under the old output sort both
+    // of these came back key-ascending, whatever was asked for.
+    assert_eq!(
+        json(
+            "g.V().values('n').groupCount().order(local).by(keys, desc)",
+            &mut g
+        ),
+        r#"[{"3":3,"2":3,"1":3,"0":3}]"#
+    );
+
+    // A map whose insertion order is NOT sorted stays that way.
+    assert_eq!(
+        json("g.V().has('n', 3).values('n').groupCount()", &mut g),
+        r#"[{"3":3}]"#
+    );
+}

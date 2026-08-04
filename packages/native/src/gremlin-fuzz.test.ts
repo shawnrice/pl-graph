@@ -182,34 +182,6 @@ const preds = [eq, gt, gte, lt, lte];
 const MULTI_TYPE_STEP = /\b(?:out|in|both)E?\((?:'KNOWS',\s*'CREATED'|'CREATED',\s*'KNOWS')\)/;
 
 /**
- * Sort object keys, recursively, before comparing.
- *
- * A map's key order is UNSPECIFIED — the same rule as row order without an
- * ORDER BY. The two engines land on different orders for a real reason: native
- * sorts lexicographically when serializing, deliberately, to match
- * `serde_json::Map`'s BTreeMap, while the TS engine keeps insertion order. So
- * `groupCount()` returns the same tally in a different key order, and comparing
- * the raw JSON would report that as a divergence forever.
- *
- * This does NOT hide a wrong tally: the counts still have to match key for key.
- */
-const sortMapKeys = (v: unknown): unknown => {
-  if (Array.isArray(v)) {
-    return v.map(sortMapKeys);
-  }
-
-  if (v !== null && typeof v === 'object') {
-    return Object.fromEntries(
-      Object.entries(v as Record<string, unknown>)
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([k, val]) => [k, sortMapKeys(val)]),
-    );
-  }
-
-  return v;
-};
-
-/**
  * Sort a result list when its order is unspecified; otherwise leave it.
  *
  * Recursive, because `fold()` puts the whole result INSIDE a one-element list
@@ -220,6 +192,19 @@ const sortMapKeys = (v: unknown): unknown => {
 const deepSort = (v: unknown): unknown => {
   if (Array.isArray(v)) {
     return [...v].map(deepSort).sort((a, b) => (JSON.stringify(a) < JSON.stringify(b) ? -1 : 1));
+  }
+
+  // A map's keys are in FIRST-SEEN order, so when the stream that filled it had
+  // no defined order neither do they — `groupCount()` after a multi-type step
+  // returns the same tally keyed in a different sequence. Canonicalized only
+  // here, for that reason: with a defined input order the two engines agree on
+  // map key order exactly, and that comparison stays strict.
+  if (v !== null && typeof v === 'object') {
+    return Object.fromEntries(
+      Object.entries(v as Record<string, unknown>)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, val]) => [k, deepSort(val)]),
+    );
   }
 
   return v;
@@ -439,7 +424,7 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
 
       const outcome = (run: () => unknown): string => {
         try {
-          return JSON.stringify(sortMapKeys(run()));
+          return JSON.stringify(run());
         } catch (e) {
           return `ERR ${(e as { code?: string }).code ?? 'throw'}`;
         }

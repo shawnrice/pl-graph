@@ -2269,15 +2269,20 @@ fn results_json_escaping_and_structure() {
     );
     assert_eq!(results_json(vec![GVal::Null]), "[null]");
 
-    // Map keys sorted lexicographically (serde BTreeMap); string values so the
-    // ordering is the only thing under test here.
+    // Map keys in INSERTION order — the order the map was built in.
+    //
+    // This used to sort lexicographically, to match `serde_json::Map`. The sync
+    // layer that needed it wants a DETERMINISTIC order, not a sorted one, and
+    // every map is built from a `Vec`. Sorting made this renderer disagree with
+    // GQL's, with this module's own `push_result_value`, and with the TS engine,
+    // and it silently undid `order(local)` on a map.
     assert_eq!(
         results_json(vec![GVal::map(vec![
             (GVal::from("zzz"), GVal::from("z")),
             (GVal::from("age"), GVal::from("a")),
             (GVal::from("name"), GVal::from("m")),
         ])]),
-        r#"[{"age":"a","name":"m","zzz":"z"}]"#
+        r#"[{"zzz":"z","age":"a","name":"m"}]"#
     );
 
     // Graph elements serialize to the full `{id, labels, properties}` form (edge:
