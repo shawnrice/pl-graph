@@ -809,8 +809,50 @@ fn column_terminal(
         [Step::GroupCount(bys)] if is_identity_by(bys) => {
             Some(vec![GVal::map(tally_group_count(out.into_iter()))])
         }
+        // ...and the same for `dedup()`, which was 21.7x against GQL's columnar
+        // DISTINCT for exactly the same reason: a traverser per value, built to
+        // read the value back out.
+        [Step::Dedupe { labels, bys }] if labels.is_empty() && bys.is_empty() => {
+            Some(distinct_values(out.into_iter()))
+        }
+        #[allow(clippy::cast_precision_loss)]
+        [Step::Dedupe { labels, bys }, Step::Count(Scope::Global)]
+            if labels.is_empty() && bys.is_empty() =>
+        {
+            Some(vec![GVal::Num(
+                distinct_values(out.into_iter()).len() as f64
+            )])
+        }
         _ => None,
     }
+}
+
+/// Distinct values in FIRST-SEEN order — the whole of a plain `dedup()`.
+///
+/// Keyed by [`dedup_key`], the same rule `apply_dedupe` uses, including its
+/// corner: a value with NO key (a `NaN` inside it) is never a duplicate, so it
+/// rides through every time.
+///
+/// That corner is UNREACHABLE from here and kept only so the two cannot drift: a
+/// stored property is never `NaN` (it is normalized to null at every entry
+/// point), so a value read off a column always has a key. A test cannot cover
+/// it, which is why this says so rather than pretending.
+fn distinct_values(values: impl Iterator<Item = GVal>) -> Vec<GVal> {
+    let mut seen: HashSet<DedupKey> = HashSet::new();
+    let mut out = Vec::new();
+
+    for v in values {
+        match dedup_key(&v) {
+            None => out.push(v),
+            Some(k) => {
+                if seen.insert(k) {
+                    out.push(v);
+                }
+            }
+        }
+    }
+
+    out
 }
 
 /// Tally values into `(value, count)` pairs in FIRST-SEEN order — the whole of
@@ -1030,6 +1072,37 @@ fn num_column_terminal(nums: &[f64], filter: Option<&P>, tail: &[Step]) -> Optio
         }
         [Step::Min(Scope::Global)] => Some(vec![extreme(Ordering::Less)?]),
         [Step::Max(Scope::Global)] => Some(vec![extreme(Ordering::Greater)?]),
+        // Distinctness on the RAW BITS, so a numeric column never boxes a `GVal`
+        // just to hash it — the same thing GQL's columnar DISTINCT does. Going
+        // through `GVal` first left this 7.2x behind GQL after the generic
+        // lowering had already taken it from 21.7x.
+        //
+        // `-0.0` and `0.0` are ONE key: they are equal, `dedup_key` collapses
+        // them, and grouping agrees with equality everywhere else in both
+        // engines. Keying on `to_bits` alone would split them and show two `0`s.
+        // A `NaN` cannot appear — a stored property is normalized to null on the
+        // way in — but the fold above already declines on one, so this never
+        // sees a column it would key wrongly.
+        [Step::Dedupe { labels, bys }]
+        | [Step::Dedupe { labels, bys }, Step::Count(Scope::Global)]
+            if labels.is_empty() && bys.is_empty() =>
+        {
+            let mut seen: HashSet<u64> = HashSet::with_capacity(nums.len());
+            let mut distinct: Vec<f64> = Vec::new();
+
+            for &x in nums {
+                if seen.insert((x + 0.0).to_bits()) {
+                    distinct.push(x);
+                }
+            }
+
+            #[allow(clippy::cast_precision_loss)]
+            Some(if matches!(tail, [_, Step::Count(Scope::Global)]) {
+                vec![GVal::Num(distinct.len() as f64)]
+            } else {
+                distinct.into_iter().map(GVal::Num).collect()
+            })
+        }
         _ => None,
     }
 }

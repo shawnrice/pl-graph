@@ -905,3 +905,106 @@ fn a_map_renders_in_insertion_order_so_order_local_is_observable() {
         r#"[{"3":3}]"#
     );
 }
+
+/// `dedup()` over a lowered column matches the same query through the stream.
+///
+/// Both keep FIRST-SEEN order. `barrier()` forces the stream path — a step that
+/// reorders would compare two different questions.
+///
+/// The keyless corner (`dedup_key` returning `None`, for a `NaN`) is NOT covered
+/// and cannot be: a stored property is normalized to null on the way in, so a
+/// value read off a column always has a key.
+#[test]
+fn a_lowered_dedup_matches_the_streamed_one() {
+    let mut lines: Vec<String> = Vec::new();
+
+    for i in 0..40 {
+        // Repeating values, a gap (no `n` at all), and a present null — which is
+        // a value like any other here, not an absence.
+        let props = match i % 8 {
+            0 => String::from("{}"),
+            1 => String::from(r#"{"n":null}"#),
+            _ => format!(r#"{{"n":{}}}"#, i % 5),
+        };
+
+        lines.push(format!(
+            r#"{{"type":"node","id":"n{i}","labels":["V"],"properties":{props}}}"#
+        ));
+    }
+
+    for i in 0..39 {
+        lines.push(format!(
+            r#"{{"type":"edge","id":"e{i}","from":"n{i}","to":"n{}","labels":["R"],"properties":{{}}}}"#,
+            i + 1
+        ));
+    }
+
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    let run = |src: &str, g: &mut crate::graph::Graph| {
+        super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(g)
+    };
+
+    for (lowered, streamed) in [
+        (
+            "g.V().values('n').dedup()",
+            "g.V().values('n').barrier().dedup()",
+        ),
+        (
+            "g.V().values('n').dedup().count()",
+            "g.V().values('n').barrier().dedup().count()",
+        ),
+        (
+            "g.V().hasLabel('V').values('n').dedup().count()",
+            "g.V().hasLabel('V').values('n').barrier().dedup().count()",
+        ),
+        (
+            "g.V().out('R').values('n').dedup()",
+            "g.V().out('R').values('n').barrier().dedup()",
+        ),
+        (
+            "g.V().values('missing').dedup().count()",
+            "g.V().values('missing').barrier().dedup().count()",
+        ),
+    ] {
+        assert_eq!(
+            run(lowered, &mut g),
+            run(streamed, &mut g),
+            "`{lowered}` disagrees with the same query through the stream"
+        );
+    }
+
+    // ...and it is actually distinct: values cycle 0..4 with a present null, so
+    // five numbers plus the null.
+    assert_eq!(
+        run("g.V().values('n').dedup().count()", &mut g),
+        vec![GVal::Num(6.0)]
+    );
+
+    // A pure NUMBER column takes a separate raw-bits path, so it needs its own
+    // check — including that `-0.0` and `0.0` are ONE value, which keying on
+    // `to_bits` alone would split into two zeroes.
+    let mut z = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"z":0}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"z":-0.0}}"#,
+            r#"{"type":"node","id":"c","labels":["V"],"properties":{"z":1.5}}"#,
+            r#"{"type":"node","id":"d","labels":["V"],"properties":{"z":1.5}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    assert_eq!(
+        run("g.V().values('z').dedup()", &mut z),
+        run("g.V().values('z').barrier().dedup()", &mut z),
+        "the numeric dedup disagrees with the stream"
+    );
+    assert_eq!(
+        run("g.V().values('z').dedup().count()", &mut z),
+        vec![GVal::Num(2.0)],
+        "`-0.0` and `0.0` are one value, so this is 0 and 1.5"
+    );
+}

@@ -154,6 +154,42 @@ fn main() {
             "g.V().out('R').values('n').groupCount()",
             "try_grouped_2hop",
         ),
+        (
+            "sum a property over a label",
+            "MATCH (a:V) RETURN sum(a.n) AS s",
+            "g.V().hasLabel('V').values('n').sum()",
+            "the columnar aggregate",
+        ),
+        (
+            "sum a property over a hop",
+            "MATCH ()-[:R]->(b) RETURN sum(b.n) AS s",
+            "g.V().out('R').values('n').sum()",
+            "the columnar aggregate",
+        ),
+        (
+            "top-k by a property",
+            "MATCH (a:V) RETURN a.n AS x ORDER BY x DESC LIMIT 5",
+            "g.V().hasLabel('V').values('n').order().by(desc).limit(5)",
+            "the ORDER BY + LIMIT top-k",
+        ),
+        (
+            "rows of a filtered hop",
+            "MATCH (a:V)-[:R]->(b) WHERE a.n > 900 RETURN b.n AS x",
+            "g.V().hasLabel('V').has('n', gt(900)).out('R').values('n')",
+            "the columnar frame",
+        ),
+        (
+            "does any edge of a type exist",
+            "MATCH (a:V) WHERE EXISTS { (a)-[:R]->() } RETURN count(*) AS c",
+            "g.V().hasLabel('V').where(outE('R')).count()",
+            "try_count_semi_join",
+        ),
+        (
+            "distinct property values",
+            "MATCH (a:V) RETURN count(DISTINCT a.n) AS c",
+            "g.V().hasLabel('V').values('n').dedup().count()",
+            "the columnar DISTINCT",
+        ),
     ];
 
     println!(
