@@ -2498,6 +2498,21 @@ pub(super) fn vectorized_frame(
     )?;
 
     // Clause WHERE → keep mask (vectorized), compacting the row set.
+    //
+    // This re-applies a predicate the scan has usually ALREADY applied — the
+    // clause WHERE is lowered into the seek by `seek_lower::scan_node`. Skipping
+    // it when the seek answered exactly was written and measured: `scan_node`
+    // reporting completeness (every conjunct lowered, `columnar()` for
+    // answerable-from-a-typed-column) and this pass skipped on it. The flag fired
+    // on 6303 of 6303 evaluations in `gql_bench` — and gained 2.5%.
+    //
+    // So the second pass is not the cost: `eval_vec` over a typed column is
+    // genuinely cheap. Reverted rather than carry a signature change through four
+    // functions plus a flag whose wrong value silently drops a filter, for a gain
+    // under the noise floor. `[b] scan+count+pred` remains 1.23x against main and
+    // is NOT explained by this, by the residual pass (also measured, also
+    // neutral), or by `Val::from_column` (measured, neutral — LTO already inlines
+    // it).
     if let Some(w) = where_ {
         let keep: Vec<bool> = eval_vec(graph, ctx, &sc, w)
             .into_truth()
