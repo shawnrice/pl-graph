@@ -64,3 +64,22 @@ pub mod ndjson;
 
 #[cfg(test)]
 mod fuzz_tests;
+
+/// The decline tallies, dumped after everything else has run.
+///
+/// At the CRATE ROOT and named `zzz_` because the tallies are process-wide and
+/// libtest runs in NAME order under `--test-threads=1`. Inside `gql::tests` this
+/// sorted before every `gremlin::` test and reported the Gremlin map as empty.
+#[cfg(all(test, feature = "bailprobe"))]
+mod zzz_probe {
+    #[test]
+    #[ignore]
+    fn dump() {
+        println!(
+            "\n=== GQL: shapes that declined the columnar frame ===\n{}\n\n\
+             === GREMLIN: steps that ran through the stream ===\n{}\n",
+            crate::gql::eval::scan::bailprobe::dump(),
+            crate::gql::eval::scan::bailprobe::dump_steps()
+        );
+    }
+}

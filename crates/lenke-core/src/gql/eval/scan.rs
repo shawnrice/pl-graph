@@ -2269,6 +2269,32 @@ pub mod bailprobe {
             .or_default() += 1;
     }
 
+    static STEPS: OnceLock<Mutex<BTreeMap<String, u64>>> = OnceLock::new();
+
+    /// Tally a Gremlin step that ran through the STREAM — the other engine's
+    /// decline, counted the same way so the two maps are comparable.
+    pub fn hit_step(name: String) {
+        *STEPS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap()
+            .entry(name)
+            .or_default() += 1;
+    }
+
+    pub fn dump_steps() -> String {
+        let m = STEPS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap();
+        let mut v: Vec<(String, u64)> = m.iter().map(|(a, b)| (a.clone(), *b)).collect();
+        v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        v.iter()
+            .map(|(s, n)| format!("{n:>7}  {s}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     pub fn dump() -> String {
         let m = TALLY
             .get_or_init(|| Mutex::new(BTreeMap::new()))

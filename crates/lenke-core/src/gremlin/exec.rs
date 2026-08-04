@@ -279,7 +279,6 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
     }
 
     match index_seed(graph, &t.steps) {
-        Some((seed, answered)) if answered.is_empty() => run_steps(graph, ctx, &t.steps[1..], seed),
         Some((seed, answered)) => {
             let rest: Vec<Step> = t.steps[1..]
                 .iter()
@@ -287,7 +286,6 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
                 .filter(|(i, _)| !answered.contains(&(i + 1)))
                 .map(|(_, step)| step.clone())
                 .collect();
-
             run_steps(graph, ctx, &rest, seed)
         }
         None => run_steps(graph, ctx, &t.steps, Vec::new()),
@@ -1706,9 +1704,21 @@ fn map_key(graph: &Graph, k: &GVal) -> String {
 
 fn run_steps(graph: &mut Graph, ctx: &mut Ctx, steps: &[Step], mut stream: Vec<Trav>) -> Vec<Trav> {
     for step in steps {
+        #[cfg(feature = "bailprobe")]
+        crate::gql::eval::scan::bailprobe::hit_step(step_name(step));
+
         stream = apply(graph, ctx, step, stream);
     }
     stream
+}
+
+/// The step's variant name, for the decline tally. Debug's first token is the
+/// variant, which is all this needs.
+#[cfg(feature = "bailprobe")]
+fn step_name(step: &Step) -> String {
+    let d = format!("{step:?}");
+
+    d.split(['(', ' ', '{']).next().unwrap_or("?").to_string()
 }
 
 /// Run a sub-plan from a single seed value; collect its output values.

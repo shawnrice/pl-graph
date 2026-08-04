@@ -879,6 +879,64 @@ the exact thing the interned-id representation avoids) or deciding a predicate i
 non-columnar before building the seek, which cannot be known until it is built.
 Neither is worth 2us against 65x.
 
+## Why this is slow, measured — and the plan that fixes it
+
+Both engines were instrumented the same way (`--features bailprobe`, one tally
+per engine, dumped from a crate-root `zzz_probe` so it runs after everything).
+The two maps say the same thing.
+
+```text
+  GQL — clauses that declined the columnar frame      GREMLIN — steps that streamed
+    2945  agg-no-where (a deliberate routing choice)     6174  total step-executions
+    1465  multi-clause  (the JOIN layer)                 5163  of those the IR ALREADY lowers  (83%)
+     119  incoming-bindings                              2093  HasLabel   573 Values   562 V
+      74  path-variable                                   483  Out        200 Count    191 Is
+```
+
+**83% of the Gremlin steps that stream are steps the IR already knows how to
+lower.** They stream because lowering is ALL-OR-NOTHING per query: one step the
+shortcut cannot match sends the whole traversal to the fallback and takes every
+lowerable step with it. GQL has the identical shape one level up — a decline
+sends the whole clause to the scalar driver.
+
+That is why adding shapes one at a time feels slow, and the feeling is correct.
+Each new shape only pays off on queries where EVERY step is lowerable, so its
+marginal value is small while the all-or-nothing gate dominates. Twelve
+operations were lowered over this branch and the streamed-step count barely
+moved.
+
+**There are two fallbacks, and they are the same fallback.** Gremlin declines to
+a `Vec<Trav>` stream; GQL declines to a scalar `Binding` loop. `Trav` is
+`{val, path, tags, loops, sack}` and `Binding` is `Vec<Option<Val>>` — over the
+SAME value type, since `Val ≡ GVal` already merged. One is the other plus
+per-traverser state.
+
+### The plan
+
+1. **Make the boundary a handoff, not a cliff.** Consume the longest lowerable
+   PREFIX into a frontier, then hand that frontier to the fallback for the rest.
+   This is the change that converts every future lowering from "helps queries
+   that lower end-to-end" to "helps every query containing it".
+
+2. **Then merge the two fallbacks.** A `Binding` is a `Trav` without the
+   traverser state; a slot-indexed binding is strictly better than name-keyed
+   tags, and Gremlin's `as()` labels can compile to slots the way GQL's variables
+   already do. One row-at-a-time driver, with the per-language part being only
+   the step/clause interpretation.
+
+3. **Then the join layer** — `multi-clause` (1465) and Gremlin's `match()` are
+   the same operation, and it is the layer that has to be shared before either
+   per-language matcher can be deleted. The surface is +12% (47824 -> 53563
+   non-test lines) and will not come down until then.
+
+**A first attempt at step 1 is recorded as not-yet-working.** Extending
+`index_seed`'s existing partial lowering to also consume leading hops fired 6
+times across the whole benchmark, because `index_seed` declines a bare `V()` —
+there is nothing to seed — so `g.V().out('R')…`, the commonest shape there is,
+never reaches it. The handoff has to start from the universe, not from a seed,
+which means restructuring `run_collect` rather than extending `index_seed`. It
+also cloned the seed on every bail. Reverted; the instrument stayed.
+
 ## Desugaring vs mistranslation
 
 The IR's premise is that equivalent spellings should lower to one shape. That
