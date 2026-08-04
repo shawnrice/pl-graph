@@ -892,6 +892,23 @@ fn tally_group_count(values: impl Iterator<Item = GVal>) -> Vec<(GVal, GVal)> {
         .collect()
 }
 
+/// The effective sort direction of an `order()` over the CURRENT value, or
+/// `None` when the `by` list projects something else (a key, a token, a
+/// sub-traversal) and so cannot be answered from the column alone.
+///
+/// A `by` carries its own direction and overrides the step's — `order().by(desc)`
+/// is `bys = [Identity(Some(Desc))]` with `desc = false`, while `order(desc)` is
+/// the reverse — so the two have to be combined the way `apply_order` does.
+fn order_dir(bys: &[By], desc: bool) -> Option<Order> {
+    let fallback = if desc { Order::Desc } else { Order::Asc };
+
+    match bys {
+        [] => Some(fallback),
+        [By::Identity(d)] => Some(d.unwrap_or(fallback)),
+        _ => None,
+    }
+}
+
 /// Whether a `by` list is the argument-free form — the only one the lowered
 /// `groupCount` answers, since anything else evaluates a sub-traversal per row.
 fn is_identity_by(bys: &[By]) -> bool {
@@ -1072,6 +1089,46 @@ fn num_column_terminal(nums: &[f64], filter: Option<&P>, tail: &[Step]) -> Optio
         }
         [Step::Min(Scope::Global)] => Some(vec![extreme(Ordering::Less)?]),
         [Step::Max(Scope::Global)] => Some(vec![extreme(Ordering::Greater)?]),
+        // A sorted prefix off the column, with no traverser built to sort. The
+        // stream keys each `Trav` into a `Vec<GVal>`, sorts ~104-byte tuples, then
+        // discards all but `n` — 7.6x against GQL's ORDER BY + LIMIT top-k.
+        //
+        // Declines on a NaN, like `extreme` above: `cmp_or_fault` RECORDS a type
+        // fault for an incomparable pair, so answering here would swallow the
+        // error the stream raises. And a NaN column is reachable (`SET x =
+        // sqrt(-1)`), so this is not a theoretical guard.
+        //
+        // The direction goes into the COMPARATOR rather than reversing the
+        // result, which is what `apply_order` does. On a pure number column the
+        // two are indistinguishable — the only tie that could betray the
+        // difference is `-0.0` against `0.0`, and those are `==` as a `GVal` and
+        // both render as `0`, which a mutation test confirmed. It is written this
+        // way because it mirrors the step it stands in for, not because a test
+        // can currently tell.
+        [Step::Order(bys, desc, Scope::Global), rest @ ..]
+            if order_dir(bys, *desc).is_some()
+                && matches!(rest, [] | [Step::Limit(_, Scope::Global)])
+                && !nums.iter().any(|x| x.is_nan()) =>
+        {
+            let descending = order_dir(bys, *desc) == Some(Order::Desc);
+            let mut sorted: Vec<f64> = nums.to_vec();
+
+            sorted.sort_by(|a, b| {
+                let o = a.partial_cmp(b).unwrap_or(Ordering::Equal);
+
+                if descending {
+                    o.reverse()
+                } else {
+                    o
+                }
+            });
+
+            if let [Step::Limit(n, Scope::Global)] = rest {
+                sorted.truncate(*n);
+            }
+
+            Some(sorted.into_iter().map(GVal::Num).collect())
+        }
         // Distinctness on the RAW BITS, so a numeric column never boxes a `GVal`
         // just to hash it — the same thing GQL's columnar DISTINCT does. Going
         // through `GVal` first left this 7.2x behind GQL after the generic

@@ -1076,3 +1076,81 @@ fn a_computed_nan_column_matches_the_stream_in_every_terminal() {
         "a NaN is never a duplicate, so both survive alongside the real number"
     );
 }
+
+/// A lowered `order()` over a column matches the stream — direction, ties, and
+/// the type fault a NaN raises.
+///
+/// Three things have to hold and each has its own way of going wrong. The
+/// direction can come from the step (`order(desc)`) or from the modulator
+/// (`order().by(desc)`), and a `by` overrides the step. The sort is STABLE, so
+/// equal keys keep INPUT order — observable because `-0.0` and `0.0` compare
+/// equal and render differently, and because reversing the RESULT instead of the
+/// comparator would flip them. And a NaN makes the stream record a type fault,
+/// so the lowered path must decline rather than answer.
+#[test]
+fn a_lowered_order_matches_the_streamed_one() {
+    let vals = [3.0_f64, -0.0, 1.0, 0.0, 3.0, -2.5, 1.0];
+    let lines: Vec<String> = vals
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            format!(r#"{{"type":"node","id":"n{i}","labels":["V"],"properties":{{"n":{v}}}}}"#)
+        })
+        .collect();
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    let run = |src: &str, g: &mut crate::graph::Graph| {
+        super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(g)
+    };
+
+    for tail in [
+        "order()",
+        "order().by(asc)",
+        "order().by(desc)",
+        "order().limit(3)",
+        "order().by(desc).limit(3)",
+        "order().by(desc).limit(0)",
+        "order().by(asc).limit(100)",
+    ] {
+        assert_eq!(
+            run(&format!("g.V().values('n').{tail}"), &mut g),
+            run(&format!("g.V().values('n').barrier().{tail}"), &mut g),
+            "`values('n').{tail}` disagrees with the stream"
+        );
+    }
+
+    // The prefix is actually sorted, and the LIMIT takes the smallest.
+    assert_eq!(
+        run("g.V().values('n').order().limit(3)", &mut g),
+        vec![GVal::Num(-2.5), GVal::Num(-0.0), GVal::Num(0.0)]
+    );
+
+    // A NaN column declines to the stream, which raises the type fault — so both
+    // spellings agree there too, rather than one answering and one throwing.
+    let mut nan = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"m":-1}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"m":9}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    crate::gql::prepare("MATCH (a:V) SET a.x = sqrt(a.m)")
+        .expect("plans")
+        .execute(&mut nan, &crate::gql::eval::Params::new())
+        .expect("runs");
+
+    for tail in ["order()", "order().by(desc).limit(1)"] {
+        assert_eq!(
+            format!("{:?}", run(&format!("g.V().values('x').{tail}"), &mut nan)),
+            format!(
+                "{:?}",
+                run(&format!("g.V().values('x').barrier().{tail}"), &mut nan)
+            ),
+            "`values('x').{tail}` over a NaN column disagrees with the stream"
+        );
+    }
+}
