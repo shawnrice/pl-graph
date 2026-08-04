@@ -1472,39 +1472,13 @@ fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
         });
     }
 
-    // With a dedup the last hop has to be materialized to be deduplicated; without
-    // one it can be counted in place.
+    // The STREAM route for a reducing terminal, shared with GQL — see
+    // `seek::walk_count`. A `dedup` makes the last hop Buffering and it says so;
+    // everything before still streams.
     #[allow(clippy::cast_precision_loss)]
-    if distinct {
-        for (d, e) in &hops {
-            ids = crate::seek::expand(graph, &ids, *d, e, crate::seek::SelfLoops::Twice);
-        }
-
-        // Element identity is the dense index, so distinctness is a set of u32 —
-        // no key projection, no per-traverser allocation.
-        let mut seen: HashSet<u32> = HashSet::with_capacity(ids.len());
-
-        ids.retain(|&id| seen.insert(id));
-
-        return Some(ids.len() as f64);
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    match hops.split_last() {
-        // No expansion: the filtered set itself.
-        None => Some(ids.len() as f64),
-        // Walk every hop but the last, then COUNT the last without building it.
-        Some(((dir, etypes), init)) => {
-            for (d, e) in init {
-                ids = crate::seek::expand(graph, &ids, *d, e, crate::seek::SelfLoops::Twice);
-            }
-
-            Some(
-                crate::seek::expand_count(graph, &ids, *dir, etypes, crate::seek::SelfLoops::Twice)
-                    as f64,
-            )
-        }
-    }
+    Some(
+        crate::seek::walk_count(graph, &ids, &hops, crate::seek::SelfLoops::Twice, distinct) as f64,
+    )
 }
 
 fn index_seed(graph: &Graph, steps: &[Step]) -> Option<(Vec<Trav>, Vec<usize>)> {

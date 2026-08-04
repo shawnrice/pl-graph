@@ -1269,6 +1269,68 @@ pub fn expand_edges(
     out
 }
 
+/// The STREAM route for a reducing terminal: count a walk without building it.
+///
+/// Walk every hop but the last, then count the last in place. The rows are never
+/// materialized because nothing needs them all at once — which is what
+/// [`crate::pipeline::OpClass::Reducing`] means, and the reason a frame is pure
+/// cost here.
+///
+/// Shared because it is one operation in two languages. Gremlin reached it as
+/// `g.V().hasLabel('V').has('n', gt(900)).out('R').count()` and GQL wrote the
+/// same question as `MATCH (a:V)-[:R]->(b) WHERE a.n > 900 RETURN count(*)` and
+/// built a frame of 14,850 pairs to count them: the hop cost 0.026ms one way and
+/// 0.144ms the other, 5.5x, for identical work on identical storage.
+///
+/// `distinct` materializes the LAST hop, because deduplicating means holding the
+/// endpoints — a `DISTINCT` is [`crate::pipeline::OpClass::Buffering`] and this
+/// is the one place the two routes meet. Everything before it still streams.
+///
+/// `hops` is `(direction, edge-type ids)` per segment; an EMPTY type list means
+/// any type. A hop with a filter on its node or edge cannot come here — the rows
+/// have to exist to be filtered — so the caller lowers only bare hops.
+#[must_use]
+pub fn walk_count(
+    graph: &Graph,
+    seed: &[u32],
+    hops: &[(Dir, Vec<u32>)],
+    loops: SelfLoops,
+    distinct: bool,
+) -> usize {
+    let Some(((dir, etypes), init)) = hops.split_last() else {
+        // No expansion: the seeded set itself. Still subject to `distinct`, since
+        // a seed can repeat an id.
+        return if distinct {
+            distinct_len(seed)
+        } else {
+            seed.len()
+        };
+    };
+
+    // Borrowed until something expands, so a single-segment walk — the common
+    // one — never copies the seed.
+    let mut cur: std::borrow::Cow<'_, [u32]> = std::borrow::Cow::Borrowed(seed);
+
+    for (d, e) in init {
+        cur = std::borrow::Cow::Owned(expand(graph, &cur, *d, e, loops));
+    }
+
+    if distinct {
+        return distinct_len(&expand(graph, &cur, *dir, etypes, loops));
+    }
+
+    expand_count(graph, &cur, *dir, etypes, loops)
+}
+
+/// Distinct count over dense ids. Element identity IS the index, so this needs no
+/// key projection — the reason a `DISTINCT` over elements is cheap where a
+/// `DISTINCT` over values is not.
+fn distinct_len(ids: &[u32]) -> usize {
+    let mut seen = crate::fxhash::FxHashSet::default();
+
+    ids.iter().filter(|&&id| seen.insert(id)).count()
+}
+
 /// How many neighbours [`expand`] would produce, without producing them.
 ///
 /// The counting form allocates nothing at all — the whole expansion becomes a

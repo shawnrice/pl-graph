@@ -1437,6 +1437,19 @@ pub(super) fn run_part(
         if let Some(rs) = try_count_distinct_reachable(linear, graph, plan, params) {
             return Ok(rs);
         }
+        // The STREAM route: a pure `count(*)` over bare hops needs no rows at all,
+        // so it walks and counts in place rather than building a frame —
+        // `seek::walk_count`, shared with Gremlin.
+        //
+        // LAST of the count shortcuts, not first. Every one above answers a
+        // narrower shape by a cheaper method — the degree product settles a
+        // two-hop count in O(E) without visiting a row — and putting this ahead
+        // of them took `MATCH ()-[:R]->()-[:R]->() RETURN count(*)` from 0.72ms
+        // to 1.14ms by walking what arithmetic had already answered. Narrower and
+        // cheaper goes first; this is the general case they leave behind.
+        if let Some(rs) = try_count_streamed(linear, graph, plan, params) {
+            return Ok(rs);
+        }
     }
     // Unbounded var-length with a DISTINCT result → BFS the reachable set instead of
     // enumerating trails (which is exponential and hits the trail budget / faults).

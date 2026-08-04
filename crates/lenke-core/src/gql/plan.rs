@@ -1276,53 +1276,58 @@ fn extract_aggs(expr: CExpr, aggs: &mut Vec<CAgg>) -> CExpr {
     }
 }
 
-/// Does a lowered expression reference any variable/property slot below `n`?
-/// Used to tell whether an ORDER BY key reads an output column (slot < out_len).
-fn refs_slot_below(expr: &CExpr, n: usize) -> bool {
+/// Does a lowered expression reference any variable/property slot matching `f`?
+///
+/// The one traversal over `CExpr`'s slot references. Two questions are asked of
+/// it: "does an ORDER BY key read an output column" (slot < out_len) and "does a
+/// WHERE say anything about a slot other than the one being seeded" — the second
+/// because a fast path that seeds and filters ONE element must decline a
+/// predicate about any other, or it silently drops the predicate.
+pub(crate) fn refs_slot(expr: &CExpr, f: &dyn Fn(usize) -> bool) -> bool {
     match expr {
-        CExpr::Var(s) => *s < n,
-        CExpr::Prop { var_slot, .. } | CExpr::PropField { var_slot, .. } => *var_slot < n,
-        CExpr::List(items) => items.iter().any(|e| refs_slot_below(e, n)),
-        CExpr::Record(fields) => fields.iter().any(|(_, e)| refs_slot_below(e, n)),
-        CExpr::Index { base, index } => refs_slot_below(base, n) || refs_slot_below(index, n),
-        CExpr::Field { base, .. } => refs_slot_below(base, n),
-        CExpr::Neg(e) | CExpr::Not(e) => refs_slot_below(e, n),
+        CExpr::Var(s) => f(*s),
+        CExpr::Prop { var_slot, .. } | CExpr::PropField { var_slot, .. } => f(*var_slot),
+        CExpr::List(items) => items.iter().any(|e| refs_slot(e, f)),
+        CExpr::Record(fields) => fields.iter().any(|(_, e)| refs_slot(e, f)),
+        CExpr::Index { base, index } => refs_slot(base, f) || refs_slot(index, f),
+        CExpr::Field { base, .. } => refs_slot(base, f),
+        CExpr::Neg(e) | CExpr::Not(e) => refs_slot(e, f),
         CExpr::IsNull { expr, .. }
         | CExpr::IsTruth { expr, .. }
         | CExpr::IsLabeled { expr, .. }
-        | CExpr::IsTyped { expr, .. } => refs_slot_below(expr, n),
+        | CExpr::IsTyped { expr, .. } => refs_slot(expr, f),
         CExpr::Arith { head, tail } => {
-            refs_slot_below(head, n) || tail.iter().any(|(_, e)| refs_slot_below(e, n))
+            refs_slot(head, f) || tail.iter().any(|(_, e)| refs_slot(e, f))
         }
         CExpr::Concat(items) | CExpr::And(items) | CExpr::Or(items) | CExpr::Xor(items) => {
-            items.iter().any(|e| refs_slot_below(e, n))
+            items.iter().any(|e| refs_slot(e, f))
         }
-        CExpr::Compare { left, right, .. } => refs_slot_below(left, n) || refs_slot_below(right, n),
-        CExpr::In { expr, list, .. } => refs_slot_below(expr, n) || refs_slot_below(list, n),
+        CExpr::Compare { left, right, .. } => refs_slot(left, f) || refs_slot(right, f),
+        CExpr::In { expr, list, .. } => refs_slot(expr, f) || refs_slot(list, f),
         CExpr::Case {
             subject,
             whens,
             else_,
         } => {
-            subject.as_deref().is_some_and(|e| refs_slot_below(e, n))
+            subject.as_deref().is_some_and(|e| refs_slot(e, f))
                 || whens
                     .iter()
-                    .any(|(w, t)| refs_slot_below(w, n) || refs_slot_below(t, n))
-                || else_.as_deref().is_some_and(|e| refs_slot_below(e, n))
+                    .any(|(w, t)| refs_slot(w, f) || refs_slot(t, f))
+                || else_.as_deref().is_some_and(|e| refs_slot(e, f))
         }
-        CExpr::Scalar { args, .. } => args.iter().any(|e| refs_slot_below(e, n)),
-        CExpr::GraphPred { args, .. } => args.iter().any(|e| refs_slot_below(e, n)),
-        CExpr::Aggregate { arg, .. } => arg.as_deref().is_some_and(|e| refs_slot_below(e, n)),
+        CExpr::Scalar { args, .. } => args.iter().any(|e| refs_slot(e, f)),
+        CExpr::GraphPred { args, .. } => args.iter().any(|e| refs_slot(e, f)),
+        CExpr::Aggregate { arg, .. } => arg.as_deref().is_some_and(|e| refs_slot(e, f)),
         // `PROPERTY_EXISTS(v, k)` resolves the element in slot `var_slot`, exactly
         // like `Prop` — so an ORDER BY over `PROPERTY_EXISTS(<output col>, …)` reads
         // an output slot and must NOT take the input-scope vectorized fast path.
-        CExpr::PropertyExists { var_slot, .. } => *var_slot < n,
+        CExpr::PropertyExists { var_slot, .. } => f(*var_slot),
         // `LET x = e IN body`: the binding exprs read the enclosing scope (which may
         // include an output column < n); the body may too. The LET-bound slots are
         // fresh (≥ n), so a body ref to one is harmless — and a false positive only
         // makes the fast path more conservative, never wrong.
         CExpr::LetIn { bindings, body } => {
-            bindings.iter().any(|(_, e)| refs_slot_below(e, n)) || refs_slot_below(body, n)
+            bindings.iter().any(|(_, e)| refs_slot(e, f)) || refs_slot(body, f)
         }
         // A correlated subquery can read an output column through its patterns /
         // WHERE / RETURN correlation, which `refs_slot_below` can't see (they live in
@@ -1332,6 +1337,11 @@ fn refs_slot_below(expr: &CExpr, n: usize) -> bool {
         // Lits / params / aggref reference no input slot.
         _ => false,
     }
+}
+
+/// Does `expr` reference any variable/property slot below `n`?
+fn refs_slot_below(expr: &CExpr, n: usize) -> bool {
+    refs_slot(expr, &|s| s < n)
 }
 
 /// The default output column name (from the source AST, which still has names).

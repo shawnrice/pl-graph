@@ -11345,6 +11345,129 @@ fn every_count_shortcut_agrees_on_multi_label_edges() {
     }
 }
 
+/// The STREAM route for `count(*)` agrees with the matcher on every shape it takes.
+///
+/// `try_count_streamed` answers a pure count over bare hops by walking and
+/// counting in place — `seek::walk_count`, the same function Gremlin's
+/// `.count()` uses. Nothing is materialized, which is the point and also the
+/// risk: a predicate that never gets a row to reject is a predicate that does
+/// not run. The seed is filtered by `scan_node`, and `scan_node` filters the
+/// START and nothing else.
+///
+/// That is not a hypothetical. `(a)-[:R]->(b) WHERE b.n = 7` has a bare `b` — no
+/// label, no inline prop — and a WHERE about it, and the first version counted
+/// every row the predicate excludes. Three suite tests caught it; the shapes
+/// below are the ones that should have.
+#[test]
+fn the_streamed_count_agrees_with_the_matcher() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{"k":1}}"#,
+            r#"{"type":"node","id":"b","labels":["N","W"],"properties":{"k":7}}"#,
+            r#"{"type":"node","id":"c","labels":["M"],"properties":{"k":3}}"#,
+            r#"{"type":"node","id":"d","labels":["N"],"properties":{"k":7}}"#,
+            // Non-first label `Y`, so a shortcut reading only `e_type` sees a
+            // different graph than the matcher does.
+            r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["X","Y"],"properties":{"w":1}}"#,
+            r#"{"type":"edge","id":"e1","from":"b","to":"c","labels":["X","Y"],"properties":{"w":2}}"#,
+            r#"{"type":"edge","id":"e2","from":"b","to":"d","labels":["Y"],"properties":{"w":3}}"#,
+            r#"{"type":"edge","id":"e3","from":"c","to":"d","labels":["Z","Y"],"properties":{"w":4}}"#,
+            // A SELF-LOOP, because an undirected hop counts one differently in
+            // each language and the walk must keep GQL's answer.
+            r#"{"type":"edge","id":"e4","from":"b","to":"b","labels":["Y"],"properties":{"w":5}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    for q in [
+        // The shape this exists for: a filtered start, then bare hops.
+        "MATCH (a:N)-[:Y]->(b) WHERE a.k = 1 RETURN count(*) AS c",
+        "MATCH (a:N)-[:Y]->(b)-[:Y]->(c) WHERE a.k = 1 RETURN count(*) AS c",
+        "MATCH (a)-[:Y]->(b) WHERE a.k > 1 RETURN count(*) AS c",
+        "MATCH (a:N)-[:Y]->(b) RETURN count(*) AS c",
+        // Untyped, disjoint, and a type that resolves to nothing.
+        "MATCH (a:N)-[]->(b) RETURN count(*) AS c",
+        "MATCH (a:N)-[:X|Y]->(b) RETURN count(*) AS c",
+        "MATCH (a:N)-[:NOPE]->(b) RETURN count(*) AS c",
+        // Undirected, over the self-loop.
+        "MATCH (a:N)-[:Y]-(b) RETURN count(*) AS c",
+        "MATCH (a)-[:Y]-(b) RETURN count(*) AS c",
+        "MATCH (a)-[:Y]-(b)-[:Y]-(c) RETURN count(*) AS c",
+        // Reverse direction.
+        "MATCH (a:N)<-[:Y]-(b) RETURN count(*) AS c",
+        // A WHERE about a slot the walk never binds a row for. Every one of these
+        // must DECLINE — the walk has no row to test — and still be right.
+        "MATCH (a)-[:Y]->(b) WHERE b.k = 7 RETURN count(*) AS c",
+        "MATCH (a:N)-[:Y]->(b) WHERE a.k = 1 AND b.k = 7 RETURN count(*) AS c",
+        "MATCH (a)-[e:Y]->(b) WHERE e.w > 1 RETURN count(*) AS c",
+        "MATCH (a)-[:Y]->(b)-[:Y]->(c) WHERE c.k = 7 RETURN count(*) AS c",
+        "MATCH (a)-[:Y]->(b) WHERE a.k = 1 OR b.k = 7 RETURN count(*) AS c",
+        // Constrained SEGMENTS, which also decline: a filter needs a row.
+        "MATCH (a:N)-[:Y]->(b:W) RETURN count(*) AS c",
+        "MATCH (a:N)-[:Y]->(b {k: 7}) RETURN count(*) AS c",
+        "MATCH (a:N)-[:Y {w: 3}]->(b) RETURN count(*) AS c",
+        // Not a pure count, so not a reducing terminal.
+        "MATCH (a:N)-[:Y]->(b) RETURN count(DISTINCT b) AS c",
+        "MATCH (a:N)-[:Y]->(b) RETURN b.k AS k, count(*) AS c",
+        "MATCH (a:N)-[:Y]->(b) RETURN count(*) AS c ORDER BY c",
+    ] {
+        let fast = rows(&mut g, q);
+        let general = super::eval::with_vec_override(false, || rows(&mut g, q));
+
+        assert_eq!(
+            fast, general,
+            "the streamed count disagrees with the matcher on `{q}`"
+        );
+    }
+}
+
+/// The seeded start of a streamed count is filtered; the far end is not reached.
+///
+/// Stated as numbers rather than as agreement, so the test says what the shapes
+/// above only imply: a WHERE about the far end changes the answer, which is why
+/// the walk must decline it rather than ignore it.
+#[test]
+fn a_streamed_count_declines_a_predicate_it_cannot_apply() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{"n":1}}"#,
+            r#"{"type":"node","id":"b","labels":["N"],"properties":{"n":7}}"#,
+            r#"{"type":"node","id":"c","labels":["N"],"properties":{"n":9}}"#,
+            r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e1","from":"a","to":"c","labels":["R"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    // Both edges leave `a`, so a start filter keeps both …
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a)-[:R]->(b) WHERE a.n = 1 RETURN count(*) AS c"
+        ),
+        vec![vec![Value::Num(2.0)]]
+    );
+
+    // … and a far-end filter keeps ONE. A walk that dropped the predicate would
+    // answer 2 here, and nothing about the query's shape would look wrong.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a)-[:R]->(b) WHERE b.n = 7 RETURN count(*) AS c"
+        ),
+        vec![vec![Value::Num(1.0)]]
+    );
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a)-[:R]->(b) WHERE a.n = 1 AND b.n = 7 RETURN count(*) AS c"
+        ),
+        vec![vec![Value::Num(1.0)]]
+    );
+}
+
 /// `labels()` takes an ELEMENT — a node or an edge — and returns its label set.
 ///
 /// ISO GQL does not define `labels()` at all: the standard interrogates labels

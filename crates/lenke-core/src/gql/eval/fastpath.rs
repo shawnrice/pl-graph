@@ -33,6 +33,122 @@ fn is_bare_count_star(proj: &CProjection) -> bool {
         }
 }
 
+/// `MATCH (a:L)-[:T]->(b)-[:U]->(c) [WHERE <on a>] RETURN count(*)` — the STREAM
+/// route, shared with Gremlin via [`crate::seek::walk_count`].
+///
+/// Nothing here needs every row at once, so nothing should build them. The start
+/// is seeded and filtered through the shared scan; each segment after it is a
+/// bare hop, walked with the last one COUNTED in place rather than expanded.
+///
+/// This is the same operation as `g.V().hasLabel('L').has(…).out('T').count()`,
+/// which Gremlin has answered this way all along. GQL built a columnar frame of
+/// every `(a, b)` pair and counted its rows: 0.144ms against 0.026ms for the hop
+/// on a 50k/150k graph, 5.5x, on identical storage.
+///
+/// Declines the moment a segment constrains anything — a filter needs the rows to
+/// exist before it can drop them, which is the frame's job. Only the START may be
+/// constrained, because it is seeded rather than walked to.
+pub(super) fn try_count_streamed(
+    linear: &CLinear,
+    graph: &Graph,
+    plan: &CQuery,
+    params: &[Val],
+) -> Option<RowSet> {
+    let [CClause::Match {
+        optional: false,
+        patterns,
+        where_,
+        scope_len,
+        ..
+    }, CClause::Return(proj)] = linear.clauses.as_slice()
+    else {
+        return None;
+    };
+    let [path] = patterns.as_slice() else {
+        return None;
+    };
+
+    // A reducing terminal and nothing else: no DISTINCT, ORDER BY, paging or
+    // grouping. `is_bare_count_star` is exactly that test.
+    if !is_bare_count_star(proj) || path.segments.is_empty() {
+        return None;
+    }
+
+    // No selector / quantifier / bound path variable — those are walks with their
+    // own semantics, not a plain chain.
+    if path.path_var_slot.is_some()
+        || path.selector != PathSelector::Walk
+        || path.mode != PathMode::Trail
+    {
+        return None;
+    }
+
+    // `scan_node` seeds and filters the START and nothing else, so a WHERE that
+    // says anything about another slot would be silently DROPPED. A bare segment
+    // node still BINDS a slot — `(a)-[:R]->(b) WHERE b.n = 7` constrains `b`
+    // without giving it a label or an inline prop — so "every segment is bare" is
+    // not the same as "no other slot is named", and reading it that way counted
+    // rows the WHERE excludes.
+    let start_slot = path.start.var_slot;
+
+    if where_
+        .as_ref()
+        .is_some_and(|w| crate::gql::plan::refs_slot(w, &|s| Some(s) != start_slot))
+    {
+        return None;
+    }
+
+    let ctx = resolve_ctx(graph, plan, params);
+    let mut hops: Vec<(crate::seek::Dir, Vec<u32>)> = Vec::with_capacity(path.segments.len());
+
+    for seg in &path.segments {
+        // Every hop must be BARE. A constrained node or edge needs the rows built
+        // to be filtered, and a re-bound variable is an equality against a row
+        // that does not exist here.
+        if seg.rel.quantifier.is_some()
+            || !seg.rel.props.is_empty()
+            || seg.rel.where_.is_some()
+            || !seg.node.props.is_empty()
+            || seg.node.where_.is_some()
+            || seg.node.label.is_some()
+        {
+            return None;
+        }
+
+        // An edge-type expression the IR cannot hold (`!T`, wildcard) would have
+        // to be re-tested per edge, which the counting expansion cannot do.
+        let etypes = match &seg.rel.label {
+            None => Vec::new(),
+            Some(l) => super::seek_lower::lower_labels(l, &ctx, true)?,
+        };
+
+        hops.push((
+            match seg.rel.direction {
+                Direction::Out => crate::seek::Dir::Out,
+                Direction::In => crate::seek::Dir::In,
+                Direction::Both => crate::seek::Dir::Both,
+            },
+            etypes,
+        ));
+    }
+
+    // The start, seeded and filtered through the SAME lowering the frame uses.
+    let seed =
+        super::seek_lower::scan_node(graph, &ctx, &path.start, where_.as_ref(), *scope_len, None);
+
+    if ctx.fault.load(AtomOrdering::Relaxed) != FAULT_NONE {
+        return None;
+    }
+
+    let n = crate::seek::walk_count(graph, &seed, &hops, crate::seek::SelfLoops::Once, false);
+
+    let mut rs = RowSet::new(proj.out_names.clone());
+
+    rs.push_row(std::iter::once(Value::Num(n as f64)));
+
+    Some(rs)
+}
+
 pub(super) fn try_count_star(
     linear: &CLinear,
     graph: &Graph,
