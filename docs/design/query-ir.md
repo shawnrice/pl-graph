@@ -833,6 +833,52 @@ The one difference is deliberate: `DELETE` on a vertex that still has edges is
 cascades to the incident edges. Same class as the label rules and the self-loop
 rule: a language contract, carried as behaviour rather than reconciled.
 
+## What the shared seek costs, and what it buys
+
+Measured branch-vs-main, both built from source, min of repeated interleaved
+runs. The whole point of recording it is that the trade is real in both
+directions.
+
+**It costs a fixed setup on predicates the columnar filter cannot answer.**
+`column_matches` handles a string column only by INTERNED ID, so equality only —
+an ordering would need the dictionary text per row, which is the slow path it
+exists to avoid — and it declines whenever a disjunction is present. So a string
+RANGE (`startsWith`, which lowers to `Ge prefix` + `Lt prefix⁺`) and a
+multi-value `within` both build an `ElementSeek`, validate it, and are then
+declined by `columnar()`, after which the per-step path runs anyway. The
+construction is discarded work:
+
+```text
+  gremlin_index_bench, with index      main    branch
+  eq point lookup                     0.3us     0.4us
+  within (3 values)                   0.6us     1.0us
+  startsWith 'name999'                3.1us     5.2us
+```
+
+Reproducible over 6 reps with tight spreads — this is not noise.
+
+**What it buys is much larger, and lands on the shape people actually serve.**
+From `bench:usage`, native, operations per second:
+
+```text
+                              no index                with index
+                          main      branch        main      branch
+  point lookup           24.5k       51.4k      170.1k      170.8k
+  2-hop recommendation    1.1k       46.0k      133.3k      125.0k
+  keyed dedup lookup       599       39.2k       39.6k       78.1k
+  permission check         304         314      109.1k      105.4k
+```
+
+42x and 65x on the UNINDEXED reads — the column that matters most, because it is
+what a deployment sees before anyone has tuned it, and where a planner regression
+shows up first. Against that, indexed reads are flat to −6%.
+
+So the setup cost is left in place deliberately. Closing it means either teaching
+`column_matches` string ordering (it would have to read the dictionary per row —
+the exact thing the interned-id representation avoids) or deciding a predicate is
+non-columnar before building the seek, which cannot be known until it is built.
+Neither is worth 2us against 65x.
+
 ## Desugaring vs mistranslation
 
 The IR's premise is that equivalent spellings should lower to one shape. That
