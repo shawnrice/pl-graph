@@ -1105,3 +1105,143 @@ fn a_var_length_walk_composes_with_a_following_hop() {
         vec!["c"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// An ANONYMOUS element takes no seed from a predicate about another variable.
+//
+// `MATCH ()-[:R]->(b) WHERE b.n = 7` seeded the anonymous START from `b.n = 7`
+// and walked out of the vertices that happened to have `n = 7` THEMSELVES,
+// returning 0 rows where the answer is 150. The whole suite passed: the naming
+// of a pattern element is orthogonal to what the query means, so every existing
+// test named the element it constrained and none of them crossed the two.
+//
+// The invariant is one line — naming an element cannot change the answer — so
+// each of these runs the anonymous spelling against the named one rather than
+// against a hard-coded count.
+// ---------------------------------------------------------------------------
+
+/// `a-b-c` where the middle and the end share a property value the start lacks.
+fn crossed() -> Graph {
+    let mut lines = String::new();
+
+    for (id, k, n) in [
+        ("a", "start", 1.0),
+        ("b", "mid", 7.0),
+        ("c", "end", 7.0),
+        ("d", "other", 7.0),
+        ("e", "far", 2.0),
+    ] {
+        lines.push_str(&format!(
+            r#"{{"type":"node","id":"{id}","labels":["P"],"properties":{{"k":"{k}","n":{n}}}}}"#
+        ));
+        lines.push('\n');
+    }
+
+    // d has n = 7 but is NOT reachable, so a seed that confuses the two ends is
+    // visible as a wrong ROW, not only as a wrong count.
+    for (i, (from, to)) in [("a", "b"), ("b", "c"), ("d", "e")].iter().enumerate() {
+        lines.push_str(&format!(
+            r#"{{"type":"edge","id":"r{i}","from":"{from}","to":"{to}","labels":["R"],"properties":{{}}}}"#
+        ));
+        lines.push('\n');
+    }
+
+    crate::ndjson::decode(&lines).expect("fixture decodes")
+}
+
+#[test]
+fn an_anonymous_start_is_not_seeded_from_the_far_end() {
+    let mut g = crossed();
+
+    assert_eq!(
+        rows(&mut g, "MATCH ()-[:R]->(b) WHERE b.n = 7 RETURN b.k AS x"),
+        rows(&mut g, "MATCH (a)-[:R]->(b) WHERE b.n = 7 RETURN b.k AS x"),
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH ()-[:R]->(b) WHERE b.n = 7 RETURN b.k AS x"),
+        vec![vec![s("mid")], vec![s("end")]],
+    );
+}
+
+#[test]
+fn an_anonymous_end_is_not_seeded_from_the_start() {
+    let mut g = crossed();
+
+    // The mirror image, which did NOT reproduce the defect and is here anyway:
+    // only the START of a traversal is scanned through `seek_lower::scan_node`,
+    // and the end arrives by expanding the adjacency, so there is no seed on
+    // that side to confuse. That asymmetry is the thing worth pinning — it is
+    // why the bug had exactly one spelling.
+    //
+    // Both `mid` (b→c) and `other` (d→e) have `n = 7` and an out-edge, which is
+    // the point — `other` is the vertex a start/end mix-up drops.
+    assert_eq!(
+        rows(&mut g, "MATCH (a)-[:R]->() WHERE a.n = 7 RETURN a.k AS x"),
+        rows(&mut g, "MATCH (a)-[:R]->(z) WHERE a.n = 7 RETURN a.k AS x"),
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH (a)-[:R]->() WHERE a.n = 7 RETURN a.k AS x"),
+        vec![vec![s("mid")], vec![s("other")]],
+    );
+}
+
+#[test]
+fn an_anonymous_element_takes_no_seed_in_any_predicate_form() {
+    let mut g = crossed();
+
+    // Each form reaches a different arm of the lowering: `compare` in both
+    // operand orders, the `IN` list, and the disjunction that pushes branches.
+    for (anon, named) in [
+        (
+            "MATCH ()-[:R]->(b) WHERE b.n = 7 RETURN b.k AS x",
+            "MATCH (a)-[:R]->(b) WHERE b.n = 7 RETURN b.k AS x",
+        ),
+        (
+            "MATCH ()-[:R]->(b) WHERE 7 = b.n RETURN b.k AS x",
+            "MATCH (a)-[:R]->(b) WHERE 7 = b.n RETURN b.k AS x",
+        ),
+        (
+            "MATCH ()-[:R]->(b) WHERE b.n IN [7] RETURN b.k AS x",
+            "MATCH (a)-[:R]->(b) WHERE b.n IN [7] RETURN b.k AS x",
+        ),
+        (
+            "MATCH ()-[:R]->(b) WHERE b.n >= 7 RETURN b.k AS x",
+            "MATCH (a)-[:R]->(b) WHERE b.n >= 7 RETURN b.k AS x",
+        ),
+        (
+            "MATCH ()-[:R]->(b) WHERE b.n = 7 OR b.n = 2 RETURN b.k AS x",
+            "MATCH (a)-[:R]->(b) WHERE b.n = 7 OR b.n = 2 RETURN b.k AS x",
+        ),
+        (
+            "MATCH ()-[:R]->(b) WHERE b.k = 'end' RETURN b.k AS x",
+            "MATCH (a)-[:R]->(b) WHERE b.k = 'end' RETURN b.k AS x",
+        ),
+    ] {
+        assert_eq!(
+            rows(&mut g, anon),
+            rows(&mut g, named),
+            "naming the start changed the answer for `{anon}`"
+        );
+        assert!(
+            !rows(&mut g, anon).is_empty(),
+            "`{anon}` matched nothing, so it proves nothing"
+        );
+    }
+}
+
+#[test]
+fn an_anonymous_element_still_seeds_from_its_own_indexed_constraint() {
+    let mut g = crossed();
+
+    // The fix must not cost the seed an anonymous element is genuinely entitled
+    // to: an INLINE constraint carries no variable to disagree about, so it
+    // applies whether or not the element is named.
+    assert_eq!(
+        rows(&mut g, "MATCH ({k:'mid'})-[:R]->(b) RETURN b.k AS x"),
+        vec![vec![s("end")]],
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH (a)-[:R]->({n:7}) RETURN a.k AS x"),
+        vec![vec![s("start")], vec![s("mid")]],
+    );
+}

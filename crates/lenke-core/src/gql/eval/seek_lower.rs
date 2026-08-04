@@ -94,6 +94,16 @@ fn prop_path(e: &CExpr, graph: &Graph, ctx: &Ctx, edge: bool) -> Option<(usize, 
 /// `$x = u.k` is `u.k = $x`, and `5 <= u.n` is `u.n >= 5` — flipping the
 /// operator along with the operands. Reading only the left side is what made
 /// constant-first spellings cost 107x.
+///
+/// A `want_slot` of `None` is an ANONYMOUS element, and takes nothing. It reads
+/// as "no slot to match against", which is not the same as "any slot" — every
+/// caller passes an element's own `var_slot`, so `None` means the element has no
+/// name, and a predicate naming a variable therefore cannot be about it.
+/// Accepting one anyway seeded a node from a constraint on a DIFFERENT variable:
+/// `MATCH ()-[:R]->(b) WHERE b.n = 7` seeded the anonymous start from `b.n = 7`,
+/// walked out of the 50 vertices that happened to have `n = 7` themselves, and
+/// returned 0 rows where the answer is 150. Silently wrong and 26x faster for it,
+/// which is why no benchmark caught it.
 fn compare(
     op: CompareOp,
     left: &CExpr,
@@ -112,7 +122,7 @@ fn compare(
         }
     };
 
-    if want_slot.is_some_and(|w| w != slot) {
+    if want_slot != Some(slot) {
         return None;
     }
 
@@ -163,7 +173,7 @@ fn collect(
                 return;
             };
 
-            if want_slot.is_some_and(|w| w != slot) {
+            if want_slot != Some(slot) {
                 return;
             }
 
