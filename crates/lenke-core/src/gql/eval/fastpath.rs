@@ -320,7 +320,21 @@ where
 /// `need_extra` is [`Graph::etypes_need_extra_lookup`], hoisted per query: an
 /// edge's first label is mirrored into its adjacency entry, so only a query for a
 /// label some edge carries as a SECOND one ever looks further.
+#[inline]
 pub(super) fn etype_hit(graph: &Graph, set: &Option<Vec<u32>>, a: &Adj, need_extra: bool) -> bool {
+    // The common case takes the pre-multi-label path VERBATIM. When `need_extra`
+    // is false no edge carries any of these types as a non-first label, so the
+    // first-label test is already complete — and this is the whole per-edge cost
+    // for a graph with no multi-label edges, which is nearly every graph.
+    //
+    // Falling into the match below instead cost 1.15-1.25x on the var-length and
+    // grouped shortcuts at 1M/8M: an `Option` discriminant and an emptiness check
+    // here, then `adj_keeps` re-checking emptiness and branching on `need_extra`
+    // again — four tests per edge to reach the one `contains` that decides it.
+    if !need_extra {
+        return etype_ok(set, a.etype);
+    }
+
     match set {
         None => true,
         Some(ids) if ids.is_empty() => false,
