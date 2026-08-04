@@ -196,3 +196,71 @@ describe('the count shortcut tracks edges crossing the one-type boundary', () =>
     expect(both(g)).toBe(0);
   });
 });
+
+/**
+ * `labels()` takes an ELEMENT — a node or an edge — and returns its label set.
+ *
+ * ISO GQL does not define `labels()` at all: the standard interrogates labels
+ * with the `IS LABELED` predicate, and its only element function is
+ * `element_id`. `labels` is a Cypher inheritance vendors added, and the two that
+ * ship it define it over an element rather than just a node — Spanner's
+ * `LABELS(GRAPH_ELEMENT) -> ARRAY<STRING>` and Fabric's `labels(node_or_edge)`
+ * "the labels of a node or edge as a list of strings". Both return a length-1
+ * list for an edge because neither has multi-label edges; this engine does, so
+ * it returns the whole set.
+ */
+describe('labels() of an edge is its type set', () => {
+  const mixed = (): Graph => {
+    const g = new Graph();
+
+    g.addVertex({ id: 'a', labels: ['W', 'V'], properties: {} });
+    g.addVertex({ id: 'b', labels: ['V'], properties: {} });
+    g.addEdge({
+      id: 'e0',
+      from: g.getVertexById('a')!,
+      to: g.getVertexById('b')!,
+      labels: ['S', 'R'],
+    });
+    g.addEdge({ id: 'e1', from: g.getVertexById('b')!, to: g.getVertexById('a')!, labels: ['T'] });
+
+    return g;
+  };
+  const ask = (src: string): unknown[] => query(mixed(), src);
+
+  test('an edge reports every type, sorted', () => {
+    expect(ask('MATCH ()-[e]->() RETURN labels(e) AS x ORDER BY x')).toEqual([
+      { x: ['R', 'S'] },
+      { x: ['T'] },
+    ]);
+  });
+
+  test('a single-type edge still gets a one-element list', () => {
+    expect(ask('MATCH ()-[e:T]->() RETURN labels(e) AS x')).toEqual([{ x: ['T'] }]);
+  });
+
+  test('the node arm is unchanged', () => {
+    expect(ask('MATCH (n) RETURN labels(n) AS x ORDER BY x')).toEqual([
+      { x: ['V'] },
+      { x: ['V', 'W'] },
+    ]);
+  });
+
+  test('type() stays singular', () => {
+    // openCypher's `type(relationship) -> String` cannot express a set, so it
+    // reports the first type. `labels(e)` is the accessor for all of them.
+    expect(ask('MATCH ()-[e:R]->() RETURN type(e) AS x')).toEqual([{ x: 'S' }]);
+  });
+
+  test('neither function accepts a non-element', () => {
+    expect(ask('MATCH (n) RETURN labels(n.missing) AS x LIMIT 1')).toEqual([{ x: null }]);
+    expect(ask('MATCH (n) RETURN type(n) AS x LIMIT 1')).toEqual([{ x: null }]);
+  });
+
+  test('labels() agrees with the pattern matcher', () => {
+    for (const t of ['R', 'S']) {
+      expect(ask(`MATCH ()-[e:${t}]->() RETURN labels(e) AS x`)).toEqual([{ x: ['R', 'S'] }]);
+    }
+
+    expect(ask('MATCH ()-[e:S]->() RETURN size(labels(e)) AS x')).toEqual([{ x: 2 }]);
+  });
+});

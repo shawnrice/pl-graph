@@ -398,6 +398,28 @@ const genQuery = (r: () => number): string => {
     return `MATCH (a:T)-[e:E]->(b:T) RETURN ${genExpr(r, 2)} AS x`;
   }
 
+  if (p < 0.685) {
+    // The GRAPH functions, over a fixture holding a multi-label node AND a
+    // multi-type edge. `labels` is not an ISO GQL function — it is a Cypher
+    // inheritance the vendors who ship it define over an ELEMENT (Spanner's
+    // `LABELS(GRAPH_ELEMENT)`, Fabric's `labels(node_or_edge)`), so it has to
+    // agree across the two engines on edges as well as nodes. Nothing here was
+    // fuzzed before: the generator called no graph function at all.
+    const shape = pick(r, [
+      'MATCH (n:T) RETURN labels(n) AS x, n.n AS t ORDER BY t',
+      'MATCH ()-[e]->() RETURN labels(e) AS x ORDER BY x',
+      'MATCH ()-[e]->() RETURN type(e) AS x ORDER BY x',
+      'MATCH ()-[e]->() RETURN size(labels(e)) AS x ORDER BY x',
+      'MATCH (n:T) RETURN property_names(n) AS x, n.n AS t ORDER BY t',
+      'MATCH ()-[e]->() RETURN element_id(e) IS NOT NULL AS x ORDER BY x',
+      // The set is what `IS LABELED` and a `[:...]` pattern agree with.
+      'MATCH ()-[e:E]->() RETURN labels(e) AS x ORDER BY x',
+      'MATCH ()-[e:F]->() RETURN labels(e) AS x ORDER BY x',
+    ]);
+
+    return shape;
+  }
+
   if (p < 0.69) {
     // A type disjunction over a graph holding a two-type edge: `E`, `F` and
     // `E|F` all select edge e2, and it is ONE edge in every spelling. Routed

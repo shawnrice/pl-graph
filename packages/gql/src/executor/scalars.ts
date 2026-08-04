@@ -1049,8 +1049,20 @@ export const UNHANDLED = Symbol('unhandled');
 // Graph functions — label/key order sorted for cross-engine parity.
 export const callGraphFn = (name: string, a: unknown): unknown => {
   switch (name) {
+    // `labels` is not an ISO GQL function at all — the standard interrogates
+    // labels with the `IS LABELED` predicate. It is a Cypher inheritance that
+    // vendors added, and the two that ship it take an ELEMENT, not just a node:
+    // Spanner's `LABELS(GRAPH_ELEMENT) -> ARRAY<STRING>` and Fabric's
+    // `labels(node_or_edge)` "labels of a node or edge as a list of strings".
+    // Neither returns null for an edge; both return a length-1 list, because
+    // neither has multi-label edges. This engine does, so it returns the set —
+    // the natural generalization, and the only accessor for it.
     case 'labels':
-      return isVertex(a) ? [...a.labels].sort() : null;
+      return isVertex(a) || isEdge(a) ? [...a.labels].sort() : null;
+    // `type` stays SINGULAR: it is openCypher's `type(relationship) -> String`,
+    // which cannot express a set. It reports an edge's first type, exactly as
+    // Gremlin's `label()` reports a multi-label vertex's first label — both have
+    // to return one. `labels(e)` is how you get all of them.
     case 'type':
       return isEdge(a) ? ([...a.labels][0] ?? '') : null;
     // `property_names` is the ISO GQL name; `keys` is the openCypher spelling.

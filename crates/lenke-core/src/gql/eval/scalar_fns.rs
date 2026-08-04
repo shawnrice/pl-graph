@@ -204,18 +204,35 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
         ElementId => a.map_or(Val::Null, |v| Val::element_id(graph, v)),
         // --- graph functions --- (label/key order is unspecified → sorted for
         // deterministic, cross-engine-identical output)
-        Labels => match a {
-            Some(Val::Node(i)) => {
-                let mut ls: Vec<String> = graph
+        // `labels` is not an ISO GQL function at all — the standard interrogates
+        // labels with the `IS LABELED` predicate. It is a Cypher inheritance that
+        // vendors added, and the two that ship it take an ELEMENT, not just a
+        // node: Spanner's `LABELS(GRAPH_ELEMENT) -> ARRAY<STRING>` and Fabric's
+        // `labels(node_or_edge)` "labels of a node or edge as a list of strings".
+        // Neither returns null for an edge; both return a length-1 list, because
+        // neither has multi-label edges. This engine does, so it returns the set
+        // — the natural generalization, and the only accessor for it.
+        Labels => {
+            let mut ls: Vec<String> = match a {
+                Some(Val::Node(i)) => graph
                     .vertex_labels(*i)
                     .iter()
                     .map(|&l| graph.labels.text(l).to_string())
-                    .collect();
-                ls.sort_unstable();
-                Val::List(ls.into_iter().map(vstr).collect())
-            }
-            _ => Val::Null,
-        },
+                    .collect(),
+                Some(Val::Edge(e)) => graph
+                    .edge_labels(*e)
+                    .into_iter()
+                    .map(|t| graph.etype.text(t).to_string())
+                    .collect(),
+                _ => return Val::Null,
+            };
+            ls.sort_unstable();
+            Val::List(ls.into_iter().map(vstr).collect())
+        }
+        // `type` stays SINGULAR: it is openCypher's `type(relationship) -> String`,
+        // which cannot express a set. It reports an edge's first type, exactly as
+        // Gremlin's `label()` reports a multi-label vertex's first label — both
+        // have to return one. `labels(e)` is how you get all of them.
         Type => match a {
             Some(Val::Edge(e)) => vstr(graph.etype.text(graph.e_type[*e as usize]).to_string()),
             _ => Val::Null,

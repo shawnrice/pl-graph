@@ -11288,3 +11288,93 @@ fn every_count_shortcut_agrees_on_multi_label_edges() {
         );
     }
 }
+
+/// `labels()` takes an ELEMENT — a node or an edge — and returns its label set.
+///
+/// ISO GQL does not define `labels()` at all: the standard interrogates labels
+/// with the `IS LABELED` predicate, and its only element function is
+/// `element_id`. `labels` is a Cypher inheritance vendors added, and the two
+/// that ship it define it over an element, not just a node — Spanner's
+/// `LABELS(GRAPH_ELEMENT) -> ARRAY<STRING>` and Fabric's `labels(node_or_edge)`
+/// "the labels of a node or edge as a list of strings". Both return a length-1
+/// list for an edge because neither has multi-label edges; this engine does, so
+/// it returns the whole set. Returning NULL, as this did, made it the only
+/// implementation that does.
+#[test]
+fn labels_of_an_edge_is_its_type_set() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["W","V"],"properties":{}}"#,
+        r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["S","R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e1","from":"b","to":"a","labels":["T"],"properties":{}}"#,
+    ]);
+
+    // Sorted, like the node arm — which type is stored first is not observable.
+    assert_eq!(
+        rows(&mut g, "MATCH ()-[e]->() RETURN labels(e) AS x ORDER BY x"),
+        vec![
+            vec![Value::List(vec![s("R"), s("S")])],
+            vec![Value::List(vec![s("T")])],
+        ]
+    );
+
+    // A single-type edge still gets a one-element LIST, not a bare string.
+    assert_eq!(
+        rows(&mut g, "MATCH ()-[e:T]->() RETURN labels(e) AS x"),
+        vec![vec![Value::List(vec![s("T")])]]
+    );
+
+    // The node arm is unchanged.
+    assert_eq!(
+        rows(&mut g, "MATCH (n) RETURN labels(n) AS x ORDER BY x"),
+        vec![
+            vec![Value::List(vec![s("V")])],
+            vec![Value::List(vec![s("V"), s("W")])],
+        ]
+    );
+
+    // `type` stays SINGULAR — it is openCypher's `type(relationship) -> String`,
+    // which cannot express a set, so it reports the first type. `labels(e)` is
+    // the accessor for all of them.
+    assert_eq!(
+        rows(&mut g, "MATCH ()-[e:R]->() RETURN type(e) AS x"),
+        vec![vec![s("S")]]
+    );
+
+    // Neither function accepts a non-element.
+    assert_eq!(
+        rows(&mut g, "MATCH (n) RETURN labels(n.missing) AS x LIMIT 1"),
+        vec![vec![Value::Null]]
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH (n) RETURN type(n) AS x LIMIT 1"),
+        vec![vec![Value::Null]]
+    );
+}
+
+/// `labels(e)` agrees with the pattern matcher: every type it reports selects
+/// that edge, and `size()` of it counts them.
+#[test]
+fn labels_of_an_edge_agrees_with_the_pattern_matcher() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["V"],"properties":{}}"#,
+        r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R","S"],"properties":{}}"#,
+    ]);
+
+    for t in ["R", "S"] {
+        assert_eq!(
+            rows(
+                &mut g,
+                &format!("MATCH ()-[e:{t}]->() RETURN labels(e) AS x")
+            ),
+            vec![vec![Value::List(vec![s("R"), s("S")])]],
+            "`[:{t}]` selected the edge but `labels` disagreed"
+        );
+    }
+
+    assert_eq!(
+        rows(&mut g, "MATCH ()-[e]->() RETURN size(labels(e)) AS x"),
+        vec![vec![Value::Num(2.0)]]
+    );
+}
