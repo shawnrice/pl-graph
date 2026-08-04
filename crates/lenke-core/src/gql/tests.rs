@@ -4670,6 +4670,14 @@ fn tx_keywords_start_insert_commit_persists() {
 fn traversal_anchored_on_the_target_is_independent_of_graph_size() {
     use std::time::Instant;
 
+    /// Repetitions to take the minimum over. This is a SCALING assertion, so the
+    /// bound was never the problem — the SAMPLE was: one timing of ~1.5ms
+    /// compared against a 6x ratio is below this repo's noise floor. All three of
+    /// these passed 60 consecutive runs on an idle box and failed 5 of 12 with it
+    /// loaded. The minimum over reps is the closest thing to an interference-free
+    /// run, which is the number the assertion actually wants.
+    const REPS: usize = 9;
+
     let mut g = ndjson::decode("").unwrap();
     g.create_vertex_index("id");
     q(&mut g, "INSERT (:Emp {id: 'BOSS'})");
@@ -4697,11 +4705,19 @@ fn traversal_anchored_on_the_target_is_independent_of_graph_size() {
         for _ in 0..20 {
             q(g, probe);
         }
-        let t = Instant::now();
-        for _ in 0..200 {
-            q(g, probe);
+        let mut best = f64::INFINITY;
+
+        for _ in 0..REPS {
+            let t = Instant::now();
+
+            for _ in 0..200 {
+                q(g, probe);
+            }
+
+            best = best.min(t.elapsed().as_secs_f64());
         }
-        t.elapsed().as_secs_f64()
+
+        best
     };
 
     grow_to(&mut g, 2_000, 0);
@@ -4713,8 +4729,9 @@ fn traversal_anchored_on_the_target_is_independent_of_graph_size() {
     assert!(
         ratio < 6.0,
         "target-anchored traversal scaled with graph size: 16x more vertices cost \
-         {ratio:.1}x more time ({small:.4}s -> {large:.4}s). The plan is seeding the \
-         unindexed source instead of orienting toward the seekable target."
+         {ratio:.1}x more time ({small:.4}s -> {large:.4}s, min of {REPS}). The plan \
+         is seeding the unindexed source instead of orienting toward the seekable \
+         target."
     );
 }
 
@@ -4726,12 +4743,16 @@ fn traversal_anchored_on_the_target_is_independent_of_graph_size() {
 /// completely, which is why the read-only benches never saw it.
 ///
 /// `Graph::adj` now serves a single vertex from the `out`/`in_` delta and only
-/// repacks once `CSR_WARM_READS` reads accumulate. Same 16x-spread / 6x-bound
+/// repacks once `CSR_WARM_READS` reads accumulate. Same 16x vertex spread, but
 /// construction as the sibling test below. Regression: an ingest that reads as it
 /// writes repacked the whole CSR on the first read after each write.
 #[test]
 fn interleaved_write_and_traverse_is_independent_of_graph_size() {
     use std::time::Instant;
+
+    /// Repetitions to take the minimum over. Enough that a loaded box is very
+    /// unlikely to interfere with EVERY rep; cheap because each is ~1ms.
+    const REPS: usize = 9;
 
     let mut g = ndjson::decode("").unwrap();
     g.create_vertex_index("id");
@@ -4757,15 +4778,35 @@ fn interleaved_write_and_traverse_is_independent_of_graph_size() {
             "MATCH (s:Emp {id: 'e0'})-[r:IN_DEPT]->(t) RETURN t.id AS x",
         );
     };
+    // MIN of several reps, not one sample. This is a scaling assertion, so the
+    // bound was never the problem — the SAMPLE was: one timing of ~1ms compared
+    // against a 6x ratio is below the noise floor this repo already warns about.
+    // It passed 60 consecutive runs on an idle box and failed 2 of 8 with the box
+    // loaded (7.4x, 9.4x). The minimum over reps is the closest thing to an
+    // interference-free run, which is the number this assertion actually wants.
+    //
+    // Counting CSR repacks instead was tried and is INERT: the cycle's write is a
+    // PROPERTY write, which does not invalidate the snapshot, so the count is 0
+    // or 1 whatever the traversal does — it stayed 1 under a mutation that made
+    // every read repack, and 0 under one that invalidated on every write.
     let time = |g: &mut Graph| {
         for i in 0..20 {
             cycle(g, i);
         }
-        let t = Instant::now();
-        for i in 0..100 {
-            cycle(g, i);
+
+        let mut best = f64::INFINITY;
+
+        for _ in 0..REPS {
+            let t = Instant::now();
+
+            for i in 0..100 {
+                cycle(g, i);
+            }
+
+            best = best.min(t.elapsed().as_secs_f64());
         }
-        t.elapsed().as_secs_f64()
+
+        best
     };
 
     grow_to(&mut g, 2_000, 0);
@@ -4777,8 +4818,9 @@ fn interleaved_write_and_traverse_is_independent_of_graph_size() {
     assert!(
         ratio < 6.0,
         "interleaved write+traverse scaled with graph size: 16x more vertices cost \
-         {ratio:.1}x more time ({small:.4}s -> {large:.4}s). A read after a write is \
-         rebuilding the whole CSR snapshot instead of reading the adjacency delta."
+         {ratio:.1}x more time ({small:.4}s -> {large:.4}s, min of {REPS}). A read \
+         after a write is rebuilding the whole CSR snapshot instead of reading the \
+         adjacency delta."
     );
 }
 
@@ -4795,6 +4837,11 @@ fn interleaved_write_and_traverse_is_independent_of_graph_size() {
 #[test]
 fn traversal_from_indexed_anchor_is_independent_of_edge_type_size() {
     use std::time::Instant;
+
+    /// See the note on `REPS` in `traversal_anchored_on_the_target_…`: one ~1.5ms
+    /// sample against a 6x ratio is below the noise floor, so take the minimum
+    /// over reps instead of widening the bound.
+    const REPS: usize = 9;
 
     // One probe vertex with exactly ONE outgoing edge, whatever else exists.
     let mut g = ndjson::decode("").unwrap();
@@ -4824,11 +4871,19 @@ fn traversal_from_indexed_anchor_is_independent_of_edge_type_size() {
         for _ in 0..20 {
             q(g, probe);
         }
-        let t = Instant::now();
-        for _ in 0..200 {
-            q(g, probe);
+        let mut best = f64::INFINITY;
+
+        for _ in 0..REPS {
+            let t = Instant::now();
+
+            for _ in 0..200 {
+                q(g, probe);
+            }
+
+            best = best.min(t.elapsed().as_secs_f64());
         }
-        t.elapsed().as_secs_f64()
+
+        best
     };
 
     grow_to(&mut g, 2_000, 0);
@@ -4840,8 +4895,9 @@ fn traversal_from_indexed_anchor_is_independent_of_edge_type_size() {
     assert!(
         ratio < 6.0,
         "one-edge traversal scaled with edge-type population: 16x more edges cost \
-         {ratio:.1}x more time ({small:.4}s -> {large:.4}s). The planner is scanning \
-         the by_etype bucket instead of seeking the indexed anchor's adjacency."
+         {ratio:.1}x more time ({small:.4}s -> {large:.4}s, min of {REPS}). The \
+         planner is scanning the by_etype bucket instead of seeking the indexed \
+         anchor's adjacency."
     );
 }
 
