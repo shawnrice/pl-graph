@@ -100,8 +100,13 @@ pub fn shortest_path(graph: &Graph, cfg: &AlgoConfig) -> Vec<(u32, Value)> {
     };
     // A named-but-unknown edge type → only the source is reachable (no edges).
     let etype = cfg.etype(graph);
+    // Whether any edge carries the wanted type as a NON-first label, resolved
+    // once. When it does not — which is every graph with single-type edges — the
+    // adjacency entry alone decides and `graph` is never dereferenced in the
+    // walk. Consulting it per edge instead cost 1.08x on a 1M/8M BFS.
+    let need_extra = matches!(etype, Some(Some(t)) if graph.etypes_need_extra_lookup(&[t]));
     let passes = |a: &Adj| match etype {
-        Some(Some(t)) => super::adj_type_ok(graph, Some(t), a),
+        Some(Some(t)) => a.etype == t || (need_extra && graph.edge_has_label(a.eidx, t)),
         Some(None) => true,
         None => false,
     };
