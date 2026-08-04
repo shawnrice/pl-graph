@@ -765,3 +765,92 @@ fn the_edge_type_count_agrees_with_enumerating_the_edges() {
         check(t, &mut g);
     }
 }
+
+/// `groupCount()` over a lowered column must equal the same query through the
+/// stream — same pairs, same COUNTS, same first-seen ORDER.
+///
+/// The lowered path tallies a property column directly; the stream path builds
+/// one traverser per value and tallies those. Two implementations of an
+/// observably-ordered map is two chances to disagree, so they now share
+/// `tally_group_count` and this pins that they do. A step the lowering declines
+/// forces the stream path on an otherwise identical query — `barrier()`, which
+/// is `stream => stream`, because anything that REORDERS (`order()`) changes
+/// first-seen order and so compares two different questions.
+#[test]
+fn a_lowered_group_count_matches_the_streamed_one() {
+    let mut lines: Vec<String> = Vec::new();
+
+    for i in 0..60 {
+        // Deliberately skewed and repeating, with a gap: vertex 7k carries no
+        // `n` at all, so PRESENCE (not null-ness) decides what is tallied.
+        let props = if i % 7 == 0 {
+            String::from("{}")
+        } else {
+            format!(r#"{{"n":{}}}"#, i % 5)
+        };
+
+        lines.push(format!(
+            r#"{{"type":"node","id":"n{i}","labels":["V"],"properties":{props}}}"#
+        ));
+    }
+
+    for i in 0..59 {
+        lines.push(format!(
+            r#"{{"type":"edge","id":"e{i}","from":"n{i}","to":"n{}","labels":["R"],"properties":{{}}}}"#,
+            i + 1
+        ));
+    }
+
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    let run = |src: &str, g: &mut crate::graph::Graph| {
+        super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(g)
+    };
+
+    for (lowered, streamed) in [
+        // A plain column tally.
+        (
+            "g.V().values('n').groupCount()",
+            "g.V().values('n').barrier().groupCount()",
+        ),
+        // ...behind a label filter, and behind a hop.
+        (
+            "g.V().hasLabel('V').values('n').groupCount()",
+            "g.V().hasLabel('V').values('n').barrier().groupCount()",
+        ),
+        (
+            "g.V().out('R').values('n').groupCount()",
+            "g.V().out('R').values('n').barrier().groupCount()",
+        ),
+        // A key no element carries tallies nothing.
+        (
+            "g.V().values('missing').groupCount()",
+            "g.V().values('missing').barrier().groupCount()",
+        ),
+    ] {
+        let a = run(lowered, &mut g);
+        let b = run(streamed, &mut g);
+
+        assert_eq!(
+            a, b,
+            "`{lowered}` disagrees with the same query through the stream"
+        );
+    }
+
+    // ...and the tally is actually right, not merely self-consistent. 60 vertices,
+    // every 7th without `n` (9 of them: 0,7,…,56), the rest cycling 0..4.
+    let counted = match run("g.V().values('n').groupCount()", &mut g).as_slice() {
+        [GVal::Map(pairs)] => pairs
+            .iter()
+            .map(|(_, v)| match v {
+                GVal::Num(n) => *n,
+                other => panic!("a count is a number, got {other:?}"),
+            })
+            .sum::<f64>(),
+        other => panic!("groupCount did not return a map: {other:?}"),
+    };
+
+    assert_eq!(counted, 51.0, "every present `n` is tallied exactly once");
+}

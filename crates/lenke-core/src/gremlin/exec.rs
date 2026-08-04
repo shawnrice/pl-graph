@@ -802,8 +802,58 @@ fn column_terminal(
         [Step::Fold] => Some(vec![GVal::list(out)]),
         #[allow(clippy::cast_precision_loss)]
         [Step::Count(Scope::Global)] => Some(vec![GVal::Num(out.len() as f64)]),
+        // Tally the column straight into the map. The stream path builds one
+        // `Trav` per value first — with its path and tags — purely to read the
+        // value back out and count it, which is the whole of an 11x gap against
+        // the equivalent GQL grouped count.
+        [Step::GroupCount(bys)] if is_identity_by(bys) => {
+            Some(vec![GVal::map(tally_group_count(out.into_iter()))])
+        }
         _ => None,
     }
+}
+
+/// Tally values into `(value, count)` pairs in FIRST-SEEN order — the whole of
+/// `groupCount()`.
+///
+/// Shared by the stream step and the lowered column path so the two cannot
+/// drift: the map's order is observable, and a second implementation is a second
+/// chance to get it wrong. The `DedupKey` index makes it O(1) per value; a value
+/// with no index key (one that cannot be hashed) falls back to a scan, which is
+/// what the stream version always did.
+fn tally_group_count(values: impl Iterator<Item = GVal>) -> Vec<(GVal, GVal)> {
+    let mut entries: Vec<(GVal, f64)> = Vec::new();
+    let mut index: HashMap<DedupKey, usize> = HashMap::new();
+
+    for key in values {
+        let dk = dedup_key(&key);
+        let existing = match &dk {
+            Some(dk) => index.get(dk).copied(),
+            None => entries.iter().position(|(k, _)| *k == key),
+        };
+
+        match existing {
+            Some(i) => entries[i].1 += 1.0,
+            None => {
+                if let Some(dk) = dk {
+                    index.insert(dk, entries.len());
+                }
+
+                entries.push((key, 1.0));
+            }
+        }
+    }
+
+    entries
+        .into_iter()
+        .map(|(k, n)| (k, GVal::Num(n)))
+        .collect()
+}
+
+/// Whether a `by` list is the argument-free form — the only one the lowered
+/// `groupCount` answers, since anything else evaluates a sub-traversal per row.
+fn is_identity_by(bys: &[By]) -> bool {
+    bys.first().is_none_or(|b| matches!(b, By::Identity(None)))
 }
 
 /// The terminals over a `values(k)` whose key no element carries — an EMPTY
@@ -3121,27 +3171,9 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         }
         Step::GroupCount(bys) => {
             let by = bys.first().cloned().unwrap_or(By::Identity(None));
-            let mut entries: Vec<(GVal, f64)> = Vec::new();
-            // O(1) key->slot index beside the insertion-ordered Vec (see Group above).
-            let mut index: HashMap<DedupKey, usize> = HashMap::new();
-            for t in &stream {
-                let key = eval_by(graph, ctx, &by, &t.val);
-                let dk = dedup_key(&key);
-                let existing = match &dk {
-                    Some(dk) => index.get(dk).copied(),
-                    None => entries.iter().position(|(k, _)| *k == key),
-                };
-                match existing {
-                    Some(i) => entries[i].1 += 1.0,
-                    None => {
-                        if let Some(dk) = dk {
-                            index.insert(dk, entries.len());
-                        }
-                        entries.push((key, 1.0));
-                    }
-                }
-            }
-            vec![Trav::root(GVal::map(entries.into_iter().map(|(k, n)| (k, GVal::Num(n))).collect()))]
+            let keys = stream.iter().map(|t| eval_by(graph, ctx, &by, &t.val));
+
+            vec![Trav::root(GVal::map(tally_group_count(keys)))]
         }
 
         // --- combinators ---

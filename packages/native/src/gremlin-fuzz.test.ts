@@ -24,6 +24,7 @@ import {
   bothE,
   count,
   dedupe,
+  groupCount,
   eq,
   fold,
   gt,
@@ -181,6 +182,34 @@ const preds = [eq, gt, gte, lt, lte];
 const MULTI_TYPE_STEP = /\b(?:out|in|both)E?\((?:'KNOWS',\s*'CREATED'|'CREATED',\s*'KNOWS')\)/;
 
 /**
+ * Sort object keys, recursively, before comparing.
+ *
+ * A map's key order is UNSPECIFIED — the same rule as row order without an
+ * ORDER BY. The two engines land on different orders for a real reason: native
+ * sorts lexicographically when serializing, deliberately, to match
+ * `serde_json::Map`'s BTreeMap, while the TS engine keeps insertion order. So
+ * `groupCount()` returns the same tally in a different key order, and comparing
+ * the raw JSON would report that as a divergence forever.
+ *
+ * This does NOT hide a wrong tally: the counts still have to match key for key.
+ */
+const sortMapKeys = (v: unknown): unknown => {
+  if (Array.isArray(v)) {
+    return v.map(sortMapKeys);
+  }
+
+  if (v !== null && typeof v === 'object') {
+    return Object.fromEntries(
+      Object.entries(v as Record<string, unknown>)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, val]) => [k, sortMapKeys(val)]),
+    );
+  }
+
+  return v;
+};
+
+/**
  * Sort a result list when its order is unspecified; otherwise leave it.
  *
  * Recursive, because `fold()` puts the whole result INSIDE a one-element list
@@ -334,6 +363,15 @@ const terminal = (r: () => number): unknown[] => {
     return [dedupe(), count()];
   }
 
+  if (p < 0.9) {
+    // `groupCount()` was not generated at all, and its map is ORDER-observable
+    // (first-seen), so a tally that agreed on the counts and not on the order
+    // would have gone unnoticed. Native answers it two ways — straight off a
+    // property column when the prefix lowers, otherwise through the stream — so
+    // this has to cross-check both against the TS engine.
+    return [values(pick(r, KEYS)), groupCount()];
+  }
+
   return [];
 };
 
@@ -401,7 +439,7 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
 
       const outcome = (run: () => unknown): string => {
         try {
-          return JSON.stringify(run());
+          return JSON.stringify(sortMapKeys(run()));
         } catch (e) {
           return `ERR ${(e as { code?: string }).code ?? 'throw'}`;
         }
