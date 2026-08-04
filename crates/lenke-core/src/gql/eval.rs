@@ -1657,6 +1657,26 @@ fn eval_label_edge_at(graph: &Graph, ctx: &Ctx, ei: u32, expr: &CLabelExpr) -> b
     eval_label(graph, ctx, ElemRef::Edge(ei), expr)
 }
 
+/// [`eval_label`] for an edge reached through its ADJACENCY entry, which already
+/// carries the first type — so the common `[:T]` case is a register compare
+/// rather than a random read into `e_type`. Same answer as the index form: a
+/// second label still matches.
+fn eval_label_adj(graph: &Graph, ctx: &Ctx, a: &crate::graph::Adj, expr: &CLabelExpr) -> bool {
+    match expr {
+        CLabelExpr::Label(r) => ctx.labels[*r]
+            .1
+            .is_some_and(|tid| graph.edge_type_matches(a.etype, a.eidx, tid)),
+        CLabelExpr::Wildcard => true, // an edge always carries at least one label
+        CLabelExpr::Not(e) => !eval_label_adj(graph, ctx, a, e),
+        CLabelExpr::And(l, r) => {
+            eval_label_adj(graph, ctx, a, l) && eval_label_adj(graph, ctx, a, r)
+        }
+        CLabelExpr::Or(l, r) => {
+            eval_label_adj(graph, ctx, a, l) || eval_label_adj(graph, ctx, a, r)
+        }
+    }
+}
+
 /// `IS LABELED` over a runtime element value.
 fn labels_match(graph: &Graph, ctx: &Ctx, el: &Val, expr: &CLabelExpr) -> bool {
     match el {
@@ -2476,7 +2496,7 @@ fn expand<'a>(
                 .flatten()
                 .filter(move |a| !both || a.nbr != v),
         )
-        .filter(move |a| label.is_none_or(|e| eval_label_edge_at(graph, ctx, a.eidx, e)))
+        .filter(move |a| label.is_none_or(|e| eval_label_adj(graph, ctx, a, e)))
         .map(|a| (a.eidx, a.nbr))
 }
 

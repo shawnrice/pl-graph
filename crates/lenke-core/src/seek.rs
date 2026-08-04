@@ -327,7 +327,16 @@ impl ElementSeek {
             .map(|&l| graph.vertices_with_label(l).len())
             .sum();
 
-        if total >= live {
+        // A bucket no smaller than the live set is not a SELECTIVE seed — but it
+        // is still the cheaper one, because declining here hands the caller the
+        // whole universe AND an obligation to re-check the label per vertex.
+        // Copying the bucket is one memcpy; the re-check is a pointer chase per
+        // row. Declining when `total >= live` cost 2.26x on
+        // `MATCH (n:Person) RETURN sum(n.age)` over a fixture where every vertex
+        // is a Person — invisible at 52k, where this was validated, and plain at
+        // 1M. Only a MULTI-label ask still declines: there the dedup set is a
+        // real cost the re-check may beat.
+        if total >= live && f.ids.len() > 1 {
             return None;
         }
 

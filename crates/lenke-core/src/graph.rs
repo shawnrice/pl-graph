@@ -2095,6 +2095,25 @@ impl Graph {
                     .is_some_and(|extra| extra.contains(&tid)))
     }
 
+    /// As [`edge_has_label`](Self::edge_has_label), for a caller that ALREADY
+    /// knows the edge's first type — every adjacency entry mirrors it.
+    ///
+    /// `edge_has_label` starts with `e_type[ei]`, a random read into a separate
+    /// array; from an `Adj` that value is already in a register, and the extras
+    /// only have to be consulted when the graph has any. Walking adjacency
+    /// through the index form instead cost 4.3x on a per-row correlated
+    /// `COUNT { (a)-[:T]->(n) }` over 8M edges — a cache miss per edge to learn
+    /// something the caller had.
+    #[must_use]
+    pub fn edge_type_matches(&self, first: u32, ei: u32, tid: u32) -> bool {
+        first == tid
+            || (!self.e_extra.is_empty()
+                && self
+                    .e_extra
+                    .get(&ei)
+                    .is_some_and(|extra| extra.contains(&tid)))
+    }
+
     /// Whether ANY edge carries more than one label. Callers that filter
     /// adjacency by type use this to keep their fast path.
     #[must_use]
