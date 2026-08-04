@@ -821,8 +821,8 @@ pub(super) fn expand_scan(
                 Direction::Both => crate::seek::Dir::Both,
             },
             etypes: etypes.as_deref(),
-            // GQL matches an undirected self-loop ONCE — see `SelfLoops`.
-            loops: crate::seek::SelfLoops::Once,
+            // Per-language: GQL once, Gremlin twice. See `Ctx::loops`.
+            loops: ctx.loops,
             rel_slot: rel.var_slot,
             node_slot: node.var_slot,
             rejoin_rel: rejoins[si].0,

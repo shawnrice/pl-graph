@@ -152,6 +152,7 @@ fn edge_hop_of(step: &Step) -> Option<(Direction, &[String])> {
     match step {
         Step::OutE(l) => Some((Direction::Out, l)),
         Step::InE(l) => Some((Direction::In, l)),
+        Step::BothE(l) => Some((Direction::Both, l)),
         _ => None,
     }
 }
@@ -163,30 +164,32 @@ fn edge_hop_of(step: &Step) -> Option<(Direction, &[String])> {
 /// another segment, so both decline rather than compile into a pattern that
 /// means something else.
 ///
-/// `bothE().otherV()` is absent for the same reason `both()` is — see `hop_of`.
+/// `bothE().otherV()` is here for the same reason `both()` is — see `hop_of`.
 fn lands_far(dir: Direction, step: &Step) -> bool {
     matches!(
         (dir, step),
-        (Direction::Out, Step::InV) | (Direction::In, Step::OutV)
+        (Direction::Out, Step::InV) | (Direction::In, Step::OutV) | (Direction::Both, Step::OtherV)
     )
 }
 
 /// The direction and type names of a hop step, or `None` if it is not one.
 ///
-/// `both()` is absent, and this is the second thing on this page that a
-/// self-loop decides. Gremlin's `both()` traverses a loop TWICE — it is an
-/// out-edge and an in-edge of the same vertex — where the IR's `Both` segment
-/// yields it once. Measured 4 rows against 3 on one self-loop, with `out()` and
-/// `in()` agreeing exactly on the same fixture.
+/// `both()` is here, and briefly was not. Gremlin traverses a self-loop TWICE —
+/// it is an out-edge and an in-edge of the same vertex — where GQL's
+/// `MATCH (a)-[:R]-(b)` yields it once: 4 rows against 3 on a two-vertex graph
+/// with one loop. That looked like a reason the shared segment could not carry
+/// an undirected hop at all.
 ///
-/// Neither engine is wrong; undirected traversal is a per-language contract, the
-/// same category as ordering and equality. So the shared segment cannot carry
-/// Gremlin's `both()` and the compiler declines it, rather than GQL's
-/// `MATCH (a)-[:R]-(b)` being changed to double-count a loop.
+/// It is not. `crate::seek::SelfLoops` had already parameterized exactly this,
+/// with the two variants named for the two languages; nothing had plumbed it, so
+/// `build_scan` said `Once` unconditionally. The policy now rides on `Ctx::loops`
+/// and the planner service asks for `Twice`, which is what a per-language
+/// contract should look like — carried, not a reason to decline.
 fn hop_of(step: &Step) -> Option<(Direction, &[String])> {
     match step {
         Step::Out(l) => Some((Direction::Out, l)),
         Step::In(l) => Some((Direction::In, l)),
+        Step::Both(l) => Some((Direction::Both, l)),
         _ => None,
     }
 }
@@ -269,6 +272,18 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
         }
 
         if ends_on_edge {
+            // An UNDIRECTED hop that stops on the edge declines. Everywhere else
+            // the self-loop difference is a property of the EXPANSION, and
+            // `Ctx::loops` carries it; here the planner does not expand at all —
+            // it enumerates the edges a seed selects, and an enumeration visits
+            // each edge once whatever its direction. `bothE('R').has('w', 1)`
+            // yields a loop twice in the stream and once from the plan, and there
+            // is no policy to set: "how many times does an enumeration list one
+            // row" is not a question with two answers.
+            if dir == Direction::Both {
+                return None;
+            }
+
             rel.var_slot = Some(slot);
         } else {
             node.var_slot = Some(slot);

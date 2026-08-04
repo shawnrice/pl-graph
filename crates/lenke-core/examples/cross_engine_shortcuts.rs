@@ -221,6 +221,16 @@ fn main() {
             "the edge property seek",
         ),
         (
+            // Undirected, where the two languages genuinely differ on a
+            // self-loop — so the shared segment has to CARRY the difference
+            // rather than assume one. The fixture has none, so the answers match
+            // and only the cost is in question.
+            "far-end label over an undirected hop",
+            "MATCH ()-[:R]-(b:W) RETURN count(*) AS c",
+            "g.V().both('R').hasLabel('W').count()",
+            "try_orient_node_seed",
+        ),
+        (
             "distinct property values",
             "MATCH (a:V) RETURN count(DISTINCT a.n) AS c",
             "g.V().hasLabel('V').values('n').dedup().count()",

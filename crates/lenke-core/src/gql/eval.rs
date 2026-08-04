@@ -148,6 +148,16 @@ struct Ctx<'a> {
     /// boundary and converts it to a `CodeError`. Atomic so the parallel (rayon)
     /// vectorized path can record faults safely.
     fault: AtomicU8,
+    /// How an UNDIRECTED hop treats a self-loop. GQL yields it once; Gremlin
+    /// yields it twice, because a loop is an out-edge AND an in-edge of the same
+    /// vertex. Measured 3 rows against 4 on a two-vertex graph with one loop.
+    ///
+    /// It lives here rather than on `CPath` because it is a property of the
+    /// LANGUAGE asking, not of the pattern — the same `CPath` means both things
+    /// depending on who compiled it. `crate::seek` already parameterized this;
+    /// nothing had plumbed it, so `build_scan` said `Once` unconditionally and
+    /// Gremlin's `both()` could not use the shared segment at all.
+    loops: crate::seek::SelfLoops,
     /// Pool of reusable per-edge trail-mark buffers for `reachable_each` (var-length
     /// TRAIL walk): `buf[eidx]` == "this edge is on the current trail." Pooled rather
     /// than `HashSet`-per-call to get O(1) index ops without re-allocating each call.
@@ -375,6 +385,7 @@ fn resolve_ctx<'a>(graph: &Graph, plan: &'a CQuery, params: &'a [Val]) -> Ctx<'a
         unknown_fns: &plan.unknown_fns,
         fault: AtomicU8::new(FAULT_NONE),
         edge_marks_pool: MarksPool::default(),
+        loops: crate::seek::SelfLoops::Once,
     }
 }
 
@@ -443,6 +454,7 @@ pub fn eval_predicate(graph: &Graph, pred: &CPredicate, element: Val) -> CodeRes
         unknown_fns: &pred.unknown_fns,
         fault: AtomicU8::new(FAULT_NONE),
         edge_marks_pool: MarksPool::default(),
+        loops: crate::seek::SelfLoops::Once,
     };
     let mut binding = Binding::default();
     binding.set(0, element);
@@ -3628,6 +3640,8 @@ pub(crate) fn plan_pattern_ids(
         unknown_fns: &[],
         fault: AtomicU8::new(FAULT_NONE),
         edge_marks_pool: MarksPool::default(),
+        // Gremlin's contract, not GQL's — a loop is an out-edge AND an in-edge.
+        loops: crate::seek::SelfLoops::Twice,
     };
     let sc = scan::build_scan(graph, &ctx, path, scope_len, None, None, None)?;
 

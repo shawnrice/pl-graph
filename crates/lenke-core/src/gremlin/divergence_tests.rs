@@ -1235,11 +1235,12 @@ fn a_planned_pattern_matches_the_streamed_traversal() {
         ));
     }
 
-    // SELF-LOOPS, deliberately. A `Both` segment and `bothE().otherV()` agree on
-    // every ordinary edge and are the two places a direction equivalence can come
-    // apart: "the end I did not come from" has no answer on a loop, and both ends
-    // of one are the same vertex. Without these the fixture cannot tell a correct
-    // `both` lowering from one that double-counts.
+    // SELF-LOOPS, deliberately. An undirected hop is where the two languages
+    // genuinely differ — Gremlin walks a loop twice, GQL once — so without one
+    // in the fixture nothing here can tell a correct `both` lowering from one
+    // that silently adopts GQL's count. That is exactly what happened: `both()`
+    // lowered from the first version of the compiler and answered 3 where the
+    // answer is 4, and every test passed.
     for (i, v) in [(59, 0), (60, 4), (61, 8)] {
         let t = if v == 4 { "S" } else { "R" };
 
@@ -1274,6 +1275,21 @@ fn a_planned_pattern_matches_the_streamed_traversal() {
         "g.V().out('R').out('S')",
         "g.V().out('R').out('S').hasLabel('P')",
         "g.V().both('R').both('S')",
+        // UNDIRECTED hops with a far-end constraint, so they actually COMPILE.
+        // Without one they decline and the fixture's self-loops never reach the
+        // lowering — which is how `both()` returned 3 where the answer is 4 for
+        // as long as it did. Gremlin walks a loop twice, GQL once, and the shared
+        // segment now carries the difference through `Ctx::loops`.
+        "g.V().both('R').hasLabel('W')",
+        "g.V().both('R').has('k', 3)",
+        "g.V().hasLabel('P').both('R').hasLabel('W')",
+        "g.V().out('R').both('S').hasLabel('W')",
+        "g.V().both('R').both('S').hasLabel('P')",
+        "g.V().bothE('R').otherV().has('k', 3)",
+        // Undirected AND stopping on the edge: declines, because the planner
+        // enumerates rather than expands there. Still asserted, for the answer.
+        "g.V().bothE('R').has('w', 1)",
+        "g.V().bothE('S').has('w', 0)",
         // Every direction, an untyped hop, a type disjunction, and names that
         // resolve to nothing at either end.
         "g.V().in('S')",
@@ -1385,6 +1401,13 @@ fn only_a_constraint_past_the_start_is_worth_planning() {
         "g.V().outE('R').has('w', 1)",
         "g.V().outE('R').has('w', 1).inV()",
         "g.V().out('R').outE('S').has('w', 0)",
+        // UNDIRECTED hops lower, because `Ctx::loops` carries Gremlin's
+        // self-loop contract into the shared segment. These are the shapes that
+        // silently returned GQL's count until it did.
+        "g.V().both('R').hasLabel('W')",
+        "g.V().both('R').has('k', 3)",
+        "g.V().hasLabel('P').both('R').hasLabel('W')",
+        "g.V().bothE('R').otherV().hasLabel('W')",
     ] {
         assert!(compiles(q), "`{q}` has a far constraint worth orienting to");
     }
@@ -1513,7 +1536,7 @@ fn a_lowered_count_matches_the_streamed_one() {
     );
 }
 
-/// Why an UNDIRECTED hop does not lower, stated as a number.
+/// What an UNDIRECTED hop means in each language, stated as a number.
 ///
 /// Gremlin's `both('R')` and GQL's `MATCH (a)-[:R]-(b)` agree on every ordinary
 /// edge, which is what makes them look like one operation. On a SELF-LOOP they
@@ -1522,13 +1545,16 @@ fn a_lowered_count_matches_the_streamed_one() {
 /// with one loop that is 4 against 3.
 ///
 /// Neither is wrong — undirected traversal is a per-language contract, the same
-/// category as ordering and equality — so the shared segment cannot carry
-/// `both()`, and `pattern::hop_of` declines it. `bothE().otherV()` goes with it.
+/// category as ordering and equality. What that does NOT mean is that the shared
+/// segment cannot carry it: `crate::seek::SelfLoops` had already parameterized
+/// exactly this, with its two variants named for the two languages, and nothing had
+/// plumbed it. `Ctx::loops` now does, so `both()` lowers and each language keeps its
+/// own answer.
 ///
-/// This is the same shape of finding as `->{2,2}` against a fixed two-segment
-/// chain: a translation that agrees only on loop-free graphs is a
-/// mistranslation, and the way to stop one being written again is to make the
-/// disagreement a test rather than a comment.
+/// The finding this pins is that the two answers differ at all — which is what makes
+/// a lowering that adopts the wrong one invisible. `both()` lowered from the first
+/// version of the pattern compiler and returned 3 where Gremlin's answer is 4, and
+/// every test passed, because no fixture had a self-loop.
 #[test]
 fn an_undirected_hop_counts_a_self_loop_differently_in_each_language() {
     let grem = |src: &str, g: &mut crate::graph::Graph| {
