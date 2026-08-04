@@ -33,6 +33,7 @@ obvious without opening them.
 | **Where does NDJSON ingest time go, and what is the ceiling?**               | **`ingest_phase_bench`**, plus `ingest_throughput` below |
 | Are the count fast paths correct? (not a benchmark)                          | `count_check`                                            |
 | **Does a `MATCH` after a `WITH` cost more than the same query without one?** | **`with_carry_bench`**                                   |
+| **Which graph questions does one engine shortcut and the other enumerate?**  | **`cross_engine_shortcuts`**                             |
 
 ## Benchmarks that live as ignored tests
 
