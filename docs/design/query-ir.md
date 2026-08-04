@@ -660,14 +660,39 @@ hits it. The entry that was added fired 4 times in the entire GQL suite.
 Not 4.8x. And the last row is FASTER with the `WITH`, because filtering before
 the expansion is a smaller join.
 
-What remains is the cost of the `WITH` **barrier** — materializing the
-intermediate binding table — not a fall back to the scalar driver. Re-seeding a
-frame that was just materialized cannot recover it; the fix is to not materialize
-at the barrier at all, which is separate work. `with_carry_bench` is the harness
-for whoever takes it.
+**The claim first written here — that what remains is the barrier materializing
+an intermediate binding table — was WRONG on both counts, and is corrected
+below.** There is no binding table: `with_frame` is `ScanCols -> ScanCols`, so
+the pipeline is columnar end to end. And the barrier costs nothing.
 
-The lesson is the same one this note keeps recording: the measurement was stale
-and the code had moved underneath it. **Re-measure before porting to a number.**
+The discriminating measurement is two spellings that differ only in what the
+`WITH` carries:
+
+```text
+  plain, no WITH                       1.756ms
+  WITH a          (element only)       1.761ms   <- 1.01x, the barrier is FREE
+  WITH a, a.n AS m (computed value)    3.095ms   <- 1.76x
+```
+
+So the whole gap is the carried COMPUTED column. A carried element is a
+`Vec<u32>` the expansion replicates by index; a carried computed value is
+evaluated into a materialized `Val` column over every row of the intermediate
+frame and then replicated through the expansion — 50k evaluations fanned out to
+150k `Val`s, where the plain spelling reads `a.n` off the element column once, at
+the end.
+
+The lever is therefore not the clause boundary but **carrying `a.n AS m` lazily**
+— as the expression it is, over an element already in the frame — instead of
+materializing it eagerly. That is a narrower and better-defined change than
+either idea originally on this page. Note it is NOT the rejected "inline the
+pass-through `WITH`" either: nothing is substituted in the `Expr` tree, so no
+variant can be forgotten and read as `null`.
+
+Two lessons, one of them expensive. The measurement was stale and the code had
+moved underneath it — **re-measure before porting to a number**. And the first
+diagnosis of the residual was asserted from reading the code rather than from an
+experiment that could have refuted it; one pair of queries differing in exactly
+one thing settled in a minute what a plausible story had gotten backwards.
 
 ## How much is left, measured
 

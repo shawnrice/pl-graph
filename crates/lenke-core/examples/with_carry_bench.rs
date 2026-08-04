@@ -3,10 +3,31 @@
 //!
 //! Carrying a value through a `WITH` — instead of reading it off the element in
 //! place — used to drop everything after the `WITH` to the scalar driver, which
-//! measured 4.8x on the pair below. Each pair here is two spellings of ONE
-//! question, so the answer must match and the times should too. This is the
-//! `equivalent_spellings_cost_the_same` idea applied to clause composition
-//! rather than to predicates.
+//! measured 4.8x. That is long fixed: `vectorized_linear` keeps the whole
+//! `MATCH … WITH … MATCH … RETURN` shape columnar, calling the same `build_scan`
+//! / `with_frame` / `expand_frame` / `project_frame_cols` the single-clause path
+//! does. Each pair here is two spellings of ONE question, so the answer must
+//! match and the times should too — the `equivalent_spellings_cost_the_same`
+//! idea applied to clause composition rather than to predicates.
+//!
+//! **What the remaining gap is.** Not the barrier. Measured on the two pairs
+//! below, which differ only in what the `WITH` carries:
+//!
+//! ```text
+//!   plain, no WITH                       1.756ms
+//!   WITH a          (element only)       1.761ms   <- the barrier is FREE
+//!   WITH a, a.n AS m (computed value)    3.095ms   <- 1.76x
+//! ```
+//!
+//! A carried ELEMENT is a `Vec<u32>` column the expansion replicates by index. A
+//! carried COMPUTED value is evaluated into a materialized `Val` column over
+//! every row of the intermediate frame, then replicated through the expansion —
+//! here 50k evaluations fanned out to 150k `Val`s, where the plain spelling reads
+//! `a.n` off the element column once, at the end.
+//!
+//! So the lever is not the clause boundary; it is carrying `a.n AS m` lazily (as
+//! the expression it is, over an element already in the frame) instead of
+//! materializing it eagerly.
 //!
 //! Run: `cargo run --release --example with_carry_bench`
 
@@ -86,7 +107,20 @@ fn main() {
             "MATCH (a:V) WITH a, a.n AS m MATCH (a)-[:R]->(b) WHERE b.n > m RETURN b.n AS x",
         ),
         (
-            "carry the element only",
+            // The discriminating pair: same query, same WHERE, the only
+            // difference being whether the `WITH` carries a COMPUTED value or
+            // just the element. If the barrier itself cost anything, this would
+            // be slower than the plain spelling. It is not — see below.
+            "carry the element, read the prop late",
+            "MATCH (a:V)-[:R]->(b) WHERE b.n > a.n RETURN count(*) AS c",
+            "MATCH (a:V) WITH a MATCH (a)-[:R]->(b) WHERE b.n > a.n RETURN count(*) AS c",
+        ),
+        (
+            // NOTE: the plain side here takes a count SHORTCUT (no WHERE), so
+            // this row compares "shortcut" against "no shortcut", not the cost of
+            // a `WITH`. Kept because that contrast is worth seeing, but do not
+            // read its ratio as WITH overhead.
+            "carry the element (plain side shortcuts)",
             "MATCH (a:V)-[:R]->(b) RETURN count(*) AS c",
             "MATCH (a:V) WITH a MATCH (a)-[:R]->(b) RETURN count(*) AS c",
         ),
