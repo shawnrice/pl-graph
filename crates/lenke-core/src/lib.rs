@@ -31,6 +31,8 @@ mod interval_index;
 // load a graph; only the `gql`-only minimal wasm bundle omits it.
 #[cfg(feature = "ndjson")]
 pub mod algo;
+/// One fast hash for both engines — see the module docs.
+pub(crate) mod fxhash;
 pub mod graph;
 pub mod query;
 /// The shared index access path both query engines lower into.

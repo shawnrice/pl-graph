@@ -853,6 +853,45 @@ fn a_lowered_group_count_matches_the_streamed_one() {
     };
 
     assert_eq!(counted, 51.0, "every present `n` is tallied exactly once");
+
+    // A pure NUMBER column takes a raw-bits tally, so it needs its own check.
+    // `-0.0` and `0.0` are ONE key here and that IS observable: merged they are a
+    // single entry counting 2, split they are two entries counting 1 each — and
+    // both render as `0`, so only the counts show it.
+    let mut z = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"z":0}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"z":-0.0}}"#,
+            r#"{"type":"node","id":"c","labels":["V"],"properties":{"z":2.5}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    assert_eq!(
+        run("g.V().values('z').groupCount()", &mut z),
+        run("g.V().values('z').barrier().groupCount()", &mut z),
+        "the numeric tally disagrees with the stream"
+    );
+
+    match run("g.V().values('z').groupCount()", &mut z).as_slice() {
+        [GVal::Map(pairs)] => {
+            let counts: Vec<f64> = pairs
+                .iter()
+                .map(|(_, v)| match v {
+                    GVal::Num(n) => *n,
+                    other => panic!("a count is a number, got {other:?}"),
+                })
+                .collect();
+
+            assert_eq!(
+                counts,
+                vec![2.0, 1.0],
+                "`-0.0` and `0.0` are one key, so the first entry counts both"
+            );
+        }
+        other => panic!("groupCount did not return a map: {other:?}"),
+    }
 }
 
 /// A map renders in INSERTION order, which makes `order(local)` on it

@@ -838,7 +838,7 @@ fn column_terminal(
 /// graph: `SET x = sqrt(-1)`, `asin(2)`, `acos(2)`, `power(-1, 0.5)` all store
 /// one. This was documented as unreachable and was not.
 fn distinct_values(values: impl Iterator<Item = GVal>) -> Vec<GVal> {
-    let mut seen: HashSet<DedupKey> = HashSet::new();
+    let mut seen: crate::fxhash::FxHashSet<DedupKey> = crate::fxhash::FxHashSet::default();
     let mut out = Vec::new();
 
     for v in values {
@@ -865,7 +865,7 @@ fn distinct_values(values: impl Iterator<Item = GVal>) -> Vec<GVal> {
 /// what the stream version always did.
 fn tally_group_count(values: impl Iterator<Item = GVal>) -> Vec<(GVal, GVal)> {
     let mut entries: Vec<(GVal, f64)> = Vec::new();
-    let mut index: HashMap<DedupKey, usize> = HashMap::new();
+    let mut index: crate::fxhash::FxHashMap<DedupKey, usize> = crate::fxhash::FxHashMap::default();
 
     for key in values {
         let dk = dedup_key(&key);
@@ -1089,6 +1089,37 @@ fn num_column_terminal(nums: &[f64], filter: Option<&P>, tail: &[Step]) -> Optio
         }
         [Step::Min(Scope::Global)] => Some(vec![extreme(Ordering::Less)?]),
         [Step::Max(Scope::Global)] => Some(vec![extreme(Ordering::Greater)?]),
+        // Tally on the RAW BITS, so a number column never builds a `DedupKey` to
+        // hash — the same move the dedup below makes. Keys stay in FIRST-SEEN
+        // order, which a map's order is.
+        //
+        // A NaN has no dedup key and is therefore never equal to anything, so the
+        // generic path gives each its own entry. Bits would merge them, so a NaN
+        // column declines to it — and that column is reachable (`SET x =
+        // sqrt(-1)`).
+        [Step::GroupCount(bys)] if is_identity_by(bys) && !nums.iter().any(|x| x.is_nan()) => {
+            let mut index: crate::fxhash::FxHashMap<u64, usize> =
+                crate::fxhash::FxHashMap::default();
+            let mut entries: Vec<(f64, f64)> = Vec::new();
+
+            for &x in nums {
+                // `-0.0` and `0.0` are ONE key — see the dedup below.
+                match index.get(&(x + 0.0).to_bits()) {
+                    Some(&i) => entries[i].1 += 1.0,
+                    None => {
+                        index.insert((x + 0.0).to_bits(), entries.len());
+                        entries.push((x, 1.0));
+                    }
+                }
+            }
+
+            Some(vec![GVal::map(
+                entries
+                    .into_iter()
+                    .map(|(k, n)| (GVal::Num(k), GVal::Num(n)))
+                    .collect(),
+            )])
+        }
         // A sorted prefix off the column, with no traverser built to sort. The
         // stream keys each `Trav` into a `Vec<GVal>`, sorts ~104-byte tuples, then
         // discards all but `n` — 7.6x against GQL's ORDER BY + LIMIT top-k.
@@ -1142,7 +1173,8 @@ fn num_column_terminal(nums: &[f64], filter: Option<&P>, tail: &[Step]) -> Optio
         | [Step::Dedupe { labels, bys }, Step::Count(Scope::Global)]
             if labels.is_empty() && bys.is_empty() =>
         {
-            let mut seen: HashSet<u64> = HashSet::with_capacity(nums.len());
+            let mut seen: crate::fxhash::FxHashSet<u64> =
+                crate::fxhash::FxHashSet::with_capacity_and_hasher(nums.len(), Default::default());
             let mut distinct: Vec<f64> = Vec::new();
 
             for &x in nums {
