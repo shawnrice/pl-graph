@@ -268,20 +268,23 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
     {
         let (r, b) = super::pattern::shape(&t.steps);
         crate::gql::eval::scan::bailprobe::hit_step(format!(
-            "ROUTE {r:?} boundary={}",
-            b.map_or_else(|| "none".to_string(), |i| format!("{i}"))
+            "ROUTE {r:?} {}",
+            if r == crate::pipeline::Route::Decline {
+                t.steps
+                    .iter()
+                    .find(|s| super::pattern::class_of(s) == crate::pipeline::OpClass::Opaque)
+                    .map_or_else(
+                        || "?".to_string(),
+                        |s| format!("on {s:?}").chars().take(28).collect(),
+                    )
+            } else {
+                b.map_or_else(|| "boundary=none".to_string(), |i| format!("boundary={i}"))
+            }
         ));
     }
 
     take_type_fault(); // reset any leftover flag from a prior run on this thread
     TRACK_PATH.with(|c| c.set(needs_path(&t.steps)));
-
-    // A seeded plan drops the `V()`/`E()` it started from plus the filters the
-    // index answered exactly. Every OTHER filter still runs, including any that
-    // preceded them — the seed is only a superset with respect to those.
-    if let Some(n) = try_count(graph, &t.steps) {
-        return vec![GVal::Num(n)];
-    }
 
     // A linear prefix of filters and hops IS a pattern; plan it as one. A filter
     // AFTER the hop cannot inform a left-to-right walk, so the whole vertex set
@@ -291,6 +294,16 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
     //
     // Path tracking bars it: the frontier keeps no history, and what comes back
     // is a fresh root per surviving endpoint.
+    //
+    // FIRST, ahead of `try_count` and `try_values`, because both of those
+    // re-derive the frontier by expanding left to right and have no way to know
+    // a filter downstream makes the FAR end the selective one. They then fail on
+    // the tail and throw the work away — `out('R').hasLabel('W').count()` spent
+    // 0.70ms in `try_count` doing that, against 0.044ms for the identical GQL.
+    //
+    // Safe to put first only because `compile` declines unless a node PAST the
+    // start is constrained. That is exactly the case these two get wrong; with
+    // the constraints on the start they still run, unchanged, below.
     if !TRACK_PATH.with(Cell::get) {
         if let Some(c) = super::pattern::compile(&t.steps) {
             if let Some(ids) = crate::gql::eval::plan_pattern_ids(
@@ -303,13 +316,7 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
             ) {
                 let rest = &t.steps[c.consumed..];
 
-                // The column terminals, offered the ORIENTED ids. This has to
-                // come before `try_values` rather than after it: that path
-                // re-derives the frontier from `lower_hops`, which expands every
-                // vertex because it has no way to know a filter downstream makes
-                // the far end the selective one. It then fails on the tail and
-                // throws the work away — 0.36ms of it, where the planned scan
-                // that replaces it costs 0.013ms.
+                // The column terminals, offered the ORIENTED ids.
                 if let Some(out) = column_paths(graph, &ids, false, rest) {
                     return out;
                 }
@@ -325,6 +332,13 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
                     .collect();
             }
         }
+    }
+
+    // A seeded plan drops the `V()`/`E()` it started from plus the filters the
+    // index answered exactly. Every OTHER filter still runs, including any that
+    // preceded them — the seed is only a superset with respect to those.
+    if let Some(n) = try_count(graph, &t.steps) {
+        return vec![GVal::Num(n)];
     }
 
     if let Some(vals) = try_values(graph, &t.steps) {
@@ -781,6 +795,33 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
         // not iterable — `local_elems` wraps it in a singleton. So it is 1 per
         // row, whatever the row is.
         [Step::Count(Scope::Local)] => Some(vec![GVal::Num(1.0); ids.len()]),
+        // The frontier is one traverser per id, multiplicity included, so a
+        // global count is its length. Reaching this by BUILDING 15,000 `Trav`s
+        // and folding them was 0.59ms of the 0.70ms that
+        // `out('R').hasLabel('W').count()` cost, against 0.044ms for the same
+        // question in GQL — the planning was already done, and the answer was
+        // the length of the thing it returned.
+        [Step::Count(Scope::Global)] => Some(vec![GVal::Num(ids.len() as f64)]),
+        // Element identity is the id, so a `dedup()` over the frontier is a
+        // distinct-id count and needs no values at all. `labels`/`bys` empty is
+        // the bare form; `dedup().by(k)` keys on a property and does not.
+        //
+        // That guard is belt-and-braces today: `path_free` already calls a
+        // `Dedupe` with a non-empty `bys` path-BOUND, since a `by()` modulator
+        // can hold a sub-traversal that reads the path, so `needs_path` sets
+        // `TRACK_PATH` and the pattern branch never runs. Written out anyway
+        // because the guard is what makes THIS arm correct on its own terms, and
+        // a mutation that drops it survives the tests for a reason that lives in
+        // another function.
+        [Step::Dedupe { labels, bys }, Step::Count(Scope::Global)]
+            if labels.is_empty() && bys.is_empty() =>
+        {
+            let mut seen = crate::fxhash::FxHashSet::default();
+
+            Some(vec![GVal::Num(
+                ids.iter().filter(|&&id| seen.insert(id)).count() as f64,
+            )])
+        }
         [Step::Values(keys), tail @ ..] => column_terminal(graph, &ids, is_edge, keys, tail),
         _ => None,
     }

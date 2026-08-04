@@ -1337,3 +1337,126 @@ fn only_a_constraint_past_the_start_is_worth_planning() {
         assert!(compiles(q), "`{q}` has a far constraint worth orienting to");
     }
 }
+
+/// `count()` and `dedup().count()` over a PLANNED frontier, against the stream.
+///
+/// Both read the answer straight off the id list rather than building a
+/// traverser per element — `out('R').hasLabel('W').count()` spent 0.59ms of its
+/// 0.70ms constructing 15,000 `Trav`s to fold them away. The risk in reading an
+/// answer off the frontier instead of running the step is that the frontier is
+/// not what the step would have seen, so every shape here is asserted against
+/// `barrier()`, which keeps the same rows and defeats the compile.
+#[test]
+fn a_lowered_count_matches_the_streamed_one() {
+    // Explicit, because a generated one was too weak to discriminate: nine `W`
+    // nodes carrying only THREE distinct `k` values, reached with fan-in. So
+    // `count` (11), `dedup().count()` (9) and `dedup().by('k').count()` (3) are
+    // three different numbers, and an arm that confuses them shows up.
+    let mut lines: Vec<String> = Vec::new();
+
+    for i in 0..4 {
+        lines.push(format!(
+            r#"{{"type":"node","id":"s{i}","labels":["S"],"properties":{{"k":{}}}}}"#,
+            100 + i
+        ));
+    }
+
+    for i in 0..9 {
+        lines.push(format!(
+            r#"{{"type":"node","id":"w{i}","labels":["P","W"],"properties":{{"k":{}}}}}"#,
+            i % 3
+        ));
+    }
+
+    // w0 and w1 are each reached twice — without that, `count` and
+    // `dedup().count()` agree by accident.
+    let r_edges = [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (1, 0),
+        (1, 3),
+        (1, 4),
+        (2, 1),
+        (2, 5),
+        (3, 6),
+        (3, 7),
+        (3, 8),
+    ];
+
+    for (i, (from, to)) in r_edges.iter().enumerate() {
+        lines.push(format!(
+            r#"{{"type":"edge","id":"r{i}","from":"s{from}","to":"w{to}","labels":["R"],"properties":{{}}}}"#
+        ));
+    }
+
+    // A second hop, also with fan-in, for the two-segment shapes.
+    for i in 0..9 {
+        lines.push(format!(
+            r#"{{"type":"edge","id":"t{i}","from":"w{i}","to":"w{}","labels":["S"],"properties":{{}}}}"#,
+            (i + 1) % 4
+        ));
+    }
+
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    let val = |src: &str, g: &mut crate::graph::Graph| {
+        format!(
+            "{:?}",
+            super::parse::parse(src)
+                .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+                .run(g)
+        )
+    };
+
+    for q in [
+        "g.V().out('R').hasLabel('W').count()",
+        "g.V().out('R').hasLabel('W').dedup().count()",
+        "g.V().out('R').has('k', 1).count()",
+        "g.V().out('R').has('k', 1).dedup().count()",
+        // Two hops, so the duplicates compound.
+        "g.V().out('R').out('S').hasLabel('W').count()",
+        "g.V().out('R').out('S').hasLabel('W').dedup().count()",
+        // Matching nothing must count 0, not decline into a wrong answer.
+        "g.V().out('R').hasLabel('NOPE').count()",
+        "g.V().out('R').hasLabel('NOPE').dedup().count()",
+        // `dedup().by(k)` keys on a PROPERTY, not on element identity, so the
+        // bare-dedup arm must not take it. Several elements share each `k`.
+        //
+        // These pin the ANSWER, not the arm: a `by()` makes the traversal
+        // path-bound, so `TRACK_PATH` keeps the pattern branch out and they
+        // never reach `column_paths` at all. Dropping the arm's own
+        // `bys.is_empty()` guard therefore does NOT fail this test — verified.
+        "g.V().out('R').hasLabel('W').dedup().by('k').count()",
+        "g.V().out('R').has('k', 1).dedup().by('k').count()",
+        "g.V().out('R').out('S').hasLabel('W').dedup().by('k').count()",
+        // `count(local)` is per row and must stay per row.
+        "g.V().out('R').hasLabel('W').count(local)",
+    ] {
+        let streamed = q.replacen("g.V()", "g.V().barrier()", 1);
+
+        assert_eq!(
+            val(q, &mut g),
+            val(&streamed, &mut g),
+            "`{q}` answered from the frontier disagrees with the streamed traversal"
+        );
+    }
+
+    // The fixture has to actually exercise the differences, or each arm is
+    // asserting against itself. All three must be distinct numbers.
+    let counts = [
+        val("g.V().out('R').hasLabel('W').count()", &mut g),
+        val("g.V().out('R').hasLabel('W').dedup().count()", &mut g),
+        val(
+            "g.V().out('R').hasLabel('W').dedup().by('k').count()",
+            &mut g,
+        ),
+    ];
+
+    assert_eq!(
+        counts,
+        ["[Num(11.0)]", "[Num(9.0)]", "[Num(3.0)]"].map(String::from),
+        "fixture no longer separates count / dedup / dedup-by, so the arms \
+         above would agree by accident"
+    );
+}
