@@ -209,7 +209,19 @@ const canonOrder = (rows: unknown, unordered: boolean): unknown =>
 const SLICING_STEP = /\.(?:limit|skip|range|tail)\(/;
 
 const etypes = (r: () => number): string[] =>
-  pick(r, [['KNOWS'], ['CREATED'], ['KNOWS', 'CREATED'], ['CREATED', 'KNOWS'], ['KNOWS', 'NOPE']]);
+  pick(r, [
+    ['KNOWS'],
+    ['CREATED'],
+    ['KNOWS', 'CREATED'],
+    ['CREATED', 'KNOWS'],
+    ['KNOWS', 'NOPE'],
+    // EVERY name unknown. Distinct from the mixed case: the count shortcut takes
+    // a different branch for "matches nothing", and it used to take it before
+    // confirming the traversal was a count at all — so `g.V().outE('NOPE')` came
+    // back as the NUMBER 0 rather than an empty stream. Nothing generated this.
+    ['NOPE'],
+    ['NOPE', 'ALSO_NOPE'],
+  ]);
 
 // Steps that move the traverser, filter it, or reshape it — everything that can
 // cross the Groovy text boundary (no JS closures, no non-finite literals).

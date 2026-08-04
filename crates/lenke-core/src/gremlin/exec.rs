@@ -1017,13 +1017,18 @@ fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
         return None;
     }
 
-    // An unresolvable type name mid-chain matches nothing.
+    // A type name that resolves to nothing makes the whole run empty — but that
+    // is only THIS function's answer to give once the traversal is confirmed to
+    // end in `count()`. Returning `Some(0.0)` here, before the shape check below,
+    // answered `g.V().outE('NOPE')` — which has no `count()` at all — with the
+    // NUMBER 0 instead of an empty stream. Record it and decide at the end.
+    let mut matches_nothing = false;
     let mut resolved = Vec::with_capacity(hops.len());
 
     for (dir, etypes) in hops {
         match etypes {
             Some(e) => resolved.push((dir, e)),
-            None => return Some(0.0),
+            None => matches_nothing = true,
         }
     }
 
@@ -1041,9 +1046,11 @@ fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
                 Step::InE(_) => crate::seek::Dir::In,
                 _ => crate::seek::Dir::Both,
             };
-            let Some(etypes) = resolve_etypes(graph, l) else {
-                return Some(0.0); // every name unknown
-            };
+            // Every name unknown — empty, but only once the shape is confirmed.
+            let etypes = resolve_etypes(graph, l).unwrap_or_else(|| {
+                matches_nothing = true;
+                Vec::new()
+            });
 
             edge_tail = Some((dir, etypes));
             rest = tail;
@@ -1071,6 +1078,39 @@ fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
 
     if !matches!(rest, [Step::Count(Scope::Global)]) {
         return None;
+    }
+
+    // Confirmed a `count()`, so an unresolvable type can now answer it.
+    if matches_nothing {
+        return Some(0.0);
+    }
+
+    // Every edge of the named types, counted from the type buckets instead of
+    // walked — BEFORE the seed scan, which would otherwise materialize the whole
+    // vertex universe just to walk off it again.
+    //
+    // Reachable when the traverser is still that whole universe (no filter
+    // captured, no hop taken): each such edge is then the out-edge of exactly one
+    // seeded vertex, so the bucket length IS the answer.
+    //
+    // `Both` is excluded: it sees an edge from BOTH endpoints, so the count is not
+    // the bucket length — the same reason GQL's `try_count_edges` bails on an
+    // undirected segment. A `dedup()` is a no-op here (an edge appears once per
+    // adjacency entry either way), so it does not have to be excluded.
+    if let Some((dir, etypes)) = edge_tail.as_ref() {
+        if hops.is_empty()
+            && !etypes.is_empty()
+            // Nothing at all: `is_empty` covers only PROPERTY predicates, so the
+            // label test is separate. Without it a `hasLabel(…)` before the step
+            // was ignored and the whole type bucket counted.
+            && seek.is_empty()
+            && seek.labels().is_none()
+            && !is_edge
+            && matches!(dir, crate::seek::Dir::Out | crate::seek::Dir::In)
+        {
+            #[allow(clippy::cast_precision_loss)]
+            return Some(crate::seek::count_edges_of_types(graph, etypes) as f64);
+        }
     }
 
     let mut ids = seek.scan(graph, &no_params, || universe(graph, is_edge));

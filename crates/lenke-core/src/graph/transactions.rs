@@ -1006,8 +1006,17 @@ impl Graph {
             a.etype = tid;
         }
 
+        // Only if it is not already there. This promotes an EXISTING secondary
+        // type to first, and the edge was already bucketed under it — pushing
+        // again duplicated it, which is invisible to any reader that walks the
+        // bucket and wrong for any reader that takes its LENGTH. Both engines'
+        // edge-type count shortcuts take the length.
         if self.is_edge_live(ei) {
-            self.by_etype.entry(tid).or_default().push(ei);
+            let bucket = self.by_etype.entry(tid).or_default();
+
+            if !bucket.contains(&ei) {
+                bucket.push(ei);
+            }
         }
     }
 

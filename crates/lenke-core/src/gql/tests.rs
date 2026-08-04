@@ -11395,3 +11395,52 @@ fn zzz_bailprobe_dump() {
         crate::gql::eval::scan::bailprobe::dump()
     );
 }
+
+/// The GQL edge-type count reads the same buckets Gremlin's `.count()` now does,
+/// so it must survive the same mutations.
+///
+/// Promoting a secondary type to first (by removing the first) re-pushed the
+/// edge into a bucket it was already in. Walking the bucket hid it; taking its
+/// LENGTH — which both engines' edge-type count shortcuts do — counted the edge
+/// twice. Found by lowering the Gremlin count onto the shared primitive and
+/// checking it against enumeration.
+#[test]
+fn the_edge_type_count_survives_label_mutation() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["V"],"properties":{}}"#,
+        r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R","S"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e1","from":"b","to":"a","labels":["S"],"properties":{}}"#,
+    ]);
+
+    // The count shortcut (unlabeled endpoints) and the enumeration it stands in
+    // for must agree at every step.
+    let both = |g: &mut Graph, t: &str| {
+        let counted = rows(g, &format!("MATCH ()-[:{t}]->() RETURN count(*) AS c"));
+        let listed = rows(g, &format!("MATCH ()-[e:{t}]->(x) RETURN x.missing AS c"));
+
+        assert_eq!(
+            counted,
+            vec![vec![Value::Num(listed.len() as f64)]],
+            "`[:{t}]` count disagrees with enumerating it"
+        );
+    };
+
+    both(&mut g, "R");
+    both(&mut g, "S");
+    both(&mut g, "R|S");
+
+    // Remove the FIRST type, promoting `S`.
+    g.remove_edge_label(0, "R");
+
+    both(&mut g, "R");
+    both(&mut g, "S");
+    both(&mut g, "R|S");
+
+    // Add it back, then delete an edge entirely.
+    g.add_edge_label(0, "R");
+    both(&mut g, "R|S");
+    g.remove_edge(1);
+    both(&mut g, "S");
+    both(&mut g, "R|S");
+}

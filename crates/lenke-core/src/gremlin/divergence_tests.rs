@@ -676,3 +676,92 @@ fn a_dedup_before_an_edge_step_does_not_deduplicate_the_edges() {
         vec![GVal::Num(2.0)]
     );
 }
+
+/// `g.V().outE(T).count()` reads the edge-type buckets instead of walking every
+/// vertex's adjacency — and must agree with the walk in every case.
+///
+/// The shortcut is only valid when the traverser is still the whole vertex
+/// universe and no hop has been taken, because only then is each edge the
+/// out-edge of exactly one seeded vertex. Every row below is checked against
+/// `fold()` — the same traversal materialized — so the reference is the
+/// enumeration the shortcut replaces, not a hand-computed number.
+#[test]
+fn the_edge_type_count_agrees_with_enumerating_the_edges() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V","W"],"properties":{}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#,
+            r#"{"type":"node","id":"c","labels":["V"],"properties":{}}"#,
+            // A self-loop, a parallel pair, a two-type edge, and an unrelated type.
+            r#"{"type":"edge","id":"e0","from":"a","to":"a","labels":["R"],"properties":{"w":1}}"#,
+            r#"{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{"w":2}}"#,
+            r#"{"type":"edge","id":"e2","from":"a","to":"b","labels":["R"],"properties":{"w":3}}"#,
+            r#"{"type":"edge","id":"e3","from":"b","to":"c","labels":["R","S"],"properties":{"w":4}}"#,
+            r#"{"type":"edge","id":"e4","from":"c","to":"a","labels":["S"],"properties":{"w":5}}"#,
+            r#"{"type":"edge","id":"e5","from":"c","to":"b","labels":["OTHER"],"properties":{"w":6}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let run = |src: &str, g: &mut crate::graph::Graph| {
+        super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(g)
+    };
+
+    // `count()` must equal the number of rows the same traversal yields. The
+    // reference is the bare traversal drained — the enumeration the shortcut
+    // replaces — not a hand-computed number.
+    let check = |traversal: &str, g: &mut crate::graph::Graph| {
+        let enumerated = run(&format!("g.{traversal}"), g).len() as f64;
+        let counted = run(&format!("g.{traversal}.count()"), g);
+
+        assert_eq!(
+            counted,
+            vec![GVal::Num(enumerated)],
+            "`{traversal}.count()` disagrees with enumerating it"
+        );
+    };
+
+    for t in [
+        // The shortcut's own shape, in both directions.
+        "V().outE('R')",
+        "V().inE('R')",
+        "V().outE('S')",
+        "V().outE('OTHER')",
+        "V().outE('NOPE')",
+        // A multi-type ask: e3 carries R AND S, and is still ONE edge.
+        "V().outE('R','S')",
+        "V().outE('S','R')",
+        "V().outE('R','NOPE')",
+        // `both` sees an edge from each endpoint — the shortcut must NOT fire.
+        "V().bothE('R')",
+        "V().bothE('R','S')",
+        // A filter before the step: no longer the whole universe.
+        "V().hasLabel('W').outE('R')",
+        "V().hasLabel('V').outE('R')",
+        "V().has('missing', 1).outE('R')",
+        // A hop before the step: no longer one seeded vertex per edge.
+        "V().out('R').outE('R')",
+        "V().out('R').inE('R')",
+        // An edge start, and a dedup.
+        "E().hasLabel('R')",
+        "V().outE('R').dedup()",
+        "V().bothE('R').dedup()",
+    ] {
+        check(t, &mut g);
+    }
+
+    // A deleted edge leaves its buckets, so the shortcut cannot count it.
+    g.remove_edge(1); // e1: a -> b
+    for t in ["V().outE('R')", "V().outE('R','S')", "V().bothE('R')"] {
+        check(t, &mut g);
+    }
+
+    // ...and so does one that loses the type it was counted under.
+    g.remove_edge_label(3, "R"); // e3 keeps only S
+    for t in ["V().outE('R')", "V().outE('S')", "V().outE('R','S')"] {
+        check(t, &mut g);
+    }
+}

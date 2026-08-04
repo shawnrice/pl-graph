@@ -215,16 +215,19 @@ pub(super) fn try_count_edges(
     let mut seen: HashSet<u32> = HashSet::new();
     let dedup = tids.len() > 1 && graph.has_multi_label_edges();
 
+    // Unlabeled endpoints: every edge of the named types is one match, so the
+    // whole answer is the bucket lengths. Shared with Gremlin's `.count()`, which
+    // was walking every vertex's adjacency for the identical question.
+    if unlabeled {
+        let mut rs = RowSet::new(proj.out_names.clone());
+        rs.push_row(std::iter::once(Value::Num(
+            crate::seek::count_edges_of_types(graph, &tids) as f64,
+        )));
+        return Some(rs);
+    }
+
     for tid in tids {
         let bucket = graph.edges_with_etype(tid);
-        if unlabeled {
-            count += if dedup {
-                bucket.iter().filter(|&&e| seen.insert(e)).count()
-            } else {
-                bucket.len() // every edge of this type is one match
-            };
-            continue;
-        }
         for &eid in bucket {
             if dedup && !seen.insert(eid) {
                 continue;
