@@ -808,6 +808,37 @@ The one difference is deliberate: `DELETE` on a vertex that still has edges is
 cascades to the incident edges. Same class as the label rules and the self-loop
 rule: a language contract, carried as behaviour rather than reconciled.
 
+## Desugaring vs mistranslation
+
+The IR's premise is that equivalent spellings should lower to one shape. That
+only works if "equivalent" is proved rather than assumed, because the two
+failure modes look identical from the outside: a fast path that fires and a
+rewrite that changes the query both return an answer, quickly.
+
+**A desugaring preserves meaning by definition.** `RETURN *` into an explicit
+item list, `MATCH (a)-[]->(b), (b)-[]->(c)` into one fused path, consecutive
+`MATCH` clauses into one — each was checked, and each is the same query written
+differently. Those belong in the IR.
+
+**A rewrite that changes meaning is not a desugaring, it is a mistranslation**,
+and calling it one is how it gets waved through. `MATCH ()-[:R]->{2,2}()` costs
+24x its explicit two-segment spelling, which reads exactly like a missing
+desugaring. It is not one: a quantified walk is a TRAIL (no repeated edge) and a
+fixed chain is not, so a self-loop traversed twice is a row for the chain and no
+row for `{2,2}` — measured 5 vs 4. Rewriting one into the other would produce a
+different query that happens to agree on loop-free graphs, which is the worst
+kind of wrong: right on every fixture anyone would think to write.
+
+The test to apply before merging two paths is not "do these look like the same
+question" but "name a graph where they differ". If you cannot, write one and
+check. `->{2,2}` needs its own fixed-length-trail shortcut, not a rewrite.
+
+The same distinction decides how much to share. `count_edges_of_types` is shared
+because "count the edges of type T with nothing constraining them" is ONE
+operation in both languages. `crate::seek::adj` was NOT shared into the count
+shortcuts, because there the shared thing was only the loop, and it cost 1.5-1.6x
+(b1e5610). Share the operation; leave the implementation alone.
+
 ## Not on the table
 
 Unifying the two surface languages. Users pick GQL or Gremlin, and the parallel

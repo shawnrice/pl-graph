@@ -120,13 +120,17 @@ fn main() {
             // two-hop rows while `times(2)` counts only two, so the loose
             // spelling made this pair two different questions.
             //
-            // NOT the same as `()-[:R]->()-[:R]->()`, however tempting: a
-            // QUANTIFIED walk is a trail (no repeated edge) and a fixed chain is
-            // not, so a self-loop traversed twice is counted by the chain and
-            // excluded by `{2,2}`. Measured on a 3-edge graph with one self-loop:
-            // 5 rows vs 4. Desugaring `{n,n}` into n segments would be a wrong
-            // answer, so the 24x gap between these two GQL spellings is a missing
-            // SHORTCUT for a fixed-length trail, not a missing desugaring.
+            // `->{2,2}` is also NOT the same query as `()-[:R]->()-[:R]->()`,
+            // however tempting the 24x between them looks. A QUANTIFIED walk is a
+            // trail (no repeated edge); a fixed chain is not. A self-loop
+            // traversed twice is one row for the chain and no row for `{2,2}` —
+            // measured 5 vs 4 on a 3-edge graph with one self-loop.
+            //
+            // So they are not two spellings of one question and there is nothing
+            // here to desugar: a desugaring preserves meaning by definition, and
+            // rewriting `{n,n}` into n segments would MISTRANSLATE it into a
+            // different query that happens to agree on loop-free graphs. The 24x
+            // is a missing SHORTCUT for a fixed-length trail.
             "count of a fixed 2-hop walk",
             "MATCH ()-[:R]->{2,2}() RETURN count(*) AS c",
             "g.V().repeat(out('R')).times(2).count()",
