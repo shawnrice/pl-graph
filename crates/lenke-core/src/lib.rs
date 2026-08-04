@@ -34,6 +34,8 @@ pub mod algo;
 /// One fast hash for both engines — see the module docs.
 pub(crate) mod fxhash;
 pub mod graph;
+/// Is there a point where every row must exist at once? — see the module docs.
+pub mod pipeline;
 pub mod query;
 /// The shared index access path both query engines lower into.
 pub mod seek;

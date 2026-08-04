@@ -296,12 +296,24 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
                 c.scope_len,
                 c.end_slot,
             ) {
+                let rest = &t.steps[c.consumed..];
+
+                // Is there a point downstream where every row has to exist at
+                // once? If so the rows are materialized whatever runs them, so
+                // keep the COLUMN and let the boundary work on it. If not,
+                // streaming is the cheaper shape and a `LIMIT` can stop early.
+                if super::pattern::shape(rest).0 == crate::pipeline::Route::Columnar {
+                    if let Some(out) = column_paths(graph, &ids, false, rest) {
+                        return out;
+                    }
+                }
+
                 let seeded: Vec<Trav> = ids
                     .into_iter()
                     .map(|id| Trav::root(GVal::Node(id)))
                     .collect();
 
-                return run_steps(graph, ctx, &t.steps[c.consumed..], seeded)
+                return run_steps(graph, ctx, rest, seeded)
                     .into_iter()
                     .map(|t| t.val)
                     .collect();
@@ -721,6 +733,20 @@ fn frontier_val(id: u32, is_edge: bool) -> GVal {
 /// change that would move it, and it is a storage change, not a planning one.
 fn try_values(graph: &Graph, steps: &[Step]) -> Option<Vec<GVal>> {
     let (ids, rest, is_edge) = lowered_ids(graph, steps)?;
+
+    column_paths(graph, &ids, is_edge, rest)
+}
+
+/// The terminals answerable from a materialized frontier, given the ids.
+///
+/// Split out of [`try_values`] so the PATTERN planner can reach it too. Without
+/// that the two lowerings did not compose: planning
+/// `out('R').hasLabel('W').values('n').dedup()` as a pattern got the right seed
+/// and then built a traverser per row anyway, throwing away the column the
+/// boundary wanted. Which route to take is [`crate::pipeline`]'s answer — a
+/// boundary means the rows are materialized regardless, so the column is free.
+fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Option<Vec<GVal>> {
+    let ids = ids.to_vec();
 
     match rest {
         // `id()` / `label()` are pure per-element projections of the frontier —

@@ -25,6 +25,7 @@ use crate::gql::ast::Lit;
 use crate::gql::ast::{Direction, PathMode, PathSelector};
 use crate::gql::plan::{CExpr, CLabelExpr, CNode, CPath, CPropConstraint, CRel, CSegment};
 use crate::gremlin::{GVal, Step, P};
+use crate::pipeline::{OpClass, Route};
 
 /// A compiled prefix: the pattern, the interning tables its refs index into, and
 /// how many steps were consumed.
@@ -215,4 +216,78 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
         scope_len: slot + 1,
         consumed,
     })
+}
+
+/// Classify a Gremlin step for [`crate::pipeline`].
+///
+/// The per-language half of the routing decision: only this engine knows what
+/// its steps do, and only the shared rule knows what to do about it. The
+/// question each answer is about is MEMORY — does this step need every row at
+/// once — not what the step is called.
+pub(super) fn class_of(step: &Step) -> OpClass {
+    match step {
+        // A row in, zero or more out. Filters, hops, and per-row projections.
+        Step::V(_)
+        | Step::E(_)
+        | Step::Has(..)
+        | Step::HasLabel(..)
+        | Step::HasNot(..)
+        | Step::HasKey(..)
+        | Step::HasId(..)
+        | Step::HasValue(..)
+        | Step::Is(_)
+        | Step::Out(..)
+        | Step::In(..)
+        | Step::Both(..)
+        | Step::OutE(..)
+        | Step::InE(..)
+        | Step::BothE(..)
+        | Step::InV
+        | Step::OutV
+        | Step::OtherV
+        | Step::BothV
+        | Step::Values(..)
+        | Step::Id
+        | Step::Label
+        | Step::Value
+        | Step::Properties(..)
+        | Step::Constant(_)
+        | Step::Identity
+        | Step::None(..)
+        | Step::Limit(..)
+        | Step::Skip(..)
+        | Step::Range(..)
+        | Step::Unfold => OpClass::Streaming,
+
+        // Consumes every row, emits one, holds no buffer to do it. A streaming
+        // fold beats materializing a frame first.
+        Step::Count(_) | Step::Sum(_) | Step::Mean(_) | Step::Min(_) | Step::Max(_) => {
+            OpClass::Reducing
+        }
+
+        // Cannot emit until every row exists. THE boundary — the rows are being
+        // materialized whatever runs them, so a column is free at this point.
+        Step::Order(..)
+        | Step::Dedupe { .. }
+        | Step::Group(..)
+        | Step::GroupCount(..)
+        | Step::Fold
+        | Step::Tail(..)
+        | Step::Sample(_)
+        | Step::Barrier => OpClass::Buffering,
+
+        // Carries per-row state the shared layer cannot model: a path, a sack, a
+        // tag, a branch, or a sub-traversal that could contain any of them.
+        _ => OpClass::Opaque,
+    }
+}
+
+/// The route this traversal should take, and where its first boundary is.
+pub(super) fn shape(steps: &[Step]) -> (Route, Option<usize>) {
+    let classes: Vec<OpClass> = steps.iter().map(class_of).collect();
+
+    (
+        crate::pipeline::route(&classes),
+        crate::pipeline::first_boundary(&classes),
+    )
 }
