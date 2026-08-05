@@ -752,6 +752,74 @@ lines in `lenke-core/src`): the shared layer was added, and the per-language
 layers above it cannot be deleted until the join/projection layer is shared too.
 The surface shrinks at the END of that work, not this one.
 
+### 2026-08-05 — the tally was reading one line wrong
+
+`multi-clause 1465` above is wrong, and it mattered: it was the largest
+apparently-fixable entry and it shaped the plan. The bail it counts is
+
+```rust
+if matches.len() != 1 { bail!() }
+```
+
+which fails for `!= 1` — and 1462 of the 1465 are matches.len() == **0**, not
+several. They are statements with no `MATCH` at all: `RETURN 1 + 1`, a `LET`, a
+`FOR`, the whole scalar-function conformance suite. There is no pattern to plan
+and nothing to lower. Only **3** are a genuine multi-clause shape, and those
+involve `OPTIONAL MATCH`.
+
+Splitting the two apart, what GQL actually declines is:
+
+```text
+  2135  agg-no-where       deliberate: the walk or the scalar fold beats a frame
+  1462  no-MATCH-clause    nothing to plan
+   119  incoming-bindings  a prior WITH/INSERT already produced bindings
+    74  path-variable      needs the Path value the columnar frame can't build
+     3  multi-clause       genuine, and OPTIONAL
+```
+
+So GQL is essentially fully lowered, and had been for a while behind a
+mislabelled counter. The lesson is narrow and worth keeping: a decline tally
+keyed by line number tells you WHERE, never WHY, and `!= 1` covers two cases
+that mean opposite things.
+
+### The Gremlin side, measured the same way
+
+`pattern::compile` now tallies its own declines by reason (same feature flag).
+Read over the suite, they are almost all CORRECT declines rather than gaps:
+
+```text
+  ~700  no hop; stopped at Values/Has/Barrier/Id/Count/…
+        a bare-node query — `g.V().hasLabel('P').values('name')` — which has no
+        pattern to plan; the caller's own seeding path answers it
+   339  nothing past the start is constrained
+        the orientation gate, by design: when the only constraints sit on the
+        start, written order already seeds the selective end and planning would
+        cost a frame to arrive at the same walk
+   198  V(ids) seeded start          a point lookup is already maximally selective
+   153  start is not V()             an `E()` or `inject()` source
+    18  undirected hop ending on the edge
+```
+
+`Repeat` was the one real gap on that list and is now lowered — a
+`repeat(<hops>).times(n)` is n segments, which is exact because a Gremlin repeat
+is a WALK. That was 128x on `repeat(out('R')).times(2).hasLabel('W').count()`,
+and it now costs what the written-out spelling costs.
+
+### What this means for the surface
+
+The +4.9% figure above is the honest one and it has not come down. The reason is
+now clearer than "the join layer is not shared yet": the per-language paths that
+remain are the ones the pattern compiler correctly declines. `try_count`,
+`try_values`, `lower_prefix` and `index_seed` serve bare-node and id-seeded
+shapes, and measurements say the planned path is ~1.3x SLOWER for those — it
+materializes a frame to answer what a straight expand answers without one. That
+is not a porting gap. It is `pipeline::route` being right: no boundary, so
+stream.
+
+Deleting them therefore needs the STREAM route to be as good as the walk, not
+more lowering. `seek::walk_count` is the first piece of that — one function, two
+engines, and `try_count`'s own copy is gone.
+
 ## Group variables: the port that was wrong to decline
 
 Group variables in a parenthesized quantified unit — `((x)-[e]->(y)){1,4}` —

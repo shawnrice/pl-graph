@@ -265,6 +265,14 @@ macro_rules! decline {
     };
 }
 
+/// REJECTED (measured neutral): declining before `absorb_node` when the step
+/// list contains no hop at all. Most traversals that reach here have none —
+/// `g.V().has('k', 1).values('n')` is a bare-node scan and those are ~700 of the
+/// declines — and absorbing first CLONES each property key into a constraint for
+/// a pattern about to be thrown away. On `gremlin_index_bench`, whose whole cost
+/// is an index seek run thousands of times, it changed nothing: 1.0us against
+/// 1.0us, 5.2 against 5.2. The clone is real and is not what those queries spend
+/// their time on.
 pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
     let [Step::V(ids), rest @ ..] = steps else {
         decline!("start is not V()");

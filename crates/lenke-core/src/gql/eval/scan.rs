@@ -2441,10 +2441,19 @@ fn joins_at(p: &CPath, end: usize) -> bool {
 //   cargo test --release --features bailprobe -- \
 //       --test-threads=1 --include-ignored --nocapture gql::
 //
-// `--test-threads=1` because the tally is process-wide, and `gql::` so the run
-// is one engine's suite rather than everything. The dump test is named `zzz_…`
-// so it sorts LAST — libtest runs in name order, and a dump that sorts early
-// reports a partial tally.
+// `--test-threads=1` because the tally is process-wide. Drop the `gql::` filter
+// to get the Gremlin side too: `gremlin::pattern::compile` tallies its own
+// declines BY REASON through the same channel (`PATTERN …`), and `run_collect`
+// tallies the route each traversal takes (`ROUTE …`). The dump test is named
+// `zzz_…` so it sorts LAST — libtest runs in name order, and a dump that sorts
+// early reports a partial tally, so a `gql::`-filtered run prints nothing at all.
+//
+// Read the reasons, not just the counts. This tally is keyed by LINE for the GQL
+// side, and a line number says where a bail is, never what it means: `matches
+// .len() != 1` was read as "several MATCH clauses" and counted 1465, of which
+// 1462 were matches.len() == ZERO — statements with no MATCH to plan. That
+// mislabel was the largest apparently-fixable entry on the list and shaped the
+// plan for a while. The Gremlin side is keyed by reason for this reason.
 #[cfg(feature = "bailprobe")]
 pub mod bailprobe {
     use std::collections::BTreeMap;

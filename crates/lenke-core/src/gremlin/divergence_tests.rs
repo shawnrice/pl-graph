@@ -1794,3 +1794,162 @@ fn dropping_the_path_never_changes_an_answer() {
         );
     }
 }
+
+/// Median-of-5 seconds for one run of `src`.
+fn grem_time(g: &mut Graph, src: &str) -> f64 {
+    let plan = super::parse::parse(src).unwrap_or_else(|e| panic!("`{src}` parses: {e}"));
+    let mut best = f64::MAX;
+
+    for _ in 0..5 {
+        let t = std::time::Instant::now();
+        let out = plan.clone().run(g);
+        let secs = t.elapsed().as_secs_f64();
+
+        std::hint::black_box(out.len());
+        if secs < best {
+            best = secs;
+        }
+    }
+
+    best
+}
+
+/// Traversals that mean the same thing must cost the same.
+///
+/// The Gremlin counterpart of `gql::index_seed_tests::
+/// equivalent_spellings_cost_the_same`, and it exists because every lowering
+/// this engine gained arrived as a spelling that was 100x off its twin while
+/// returning identical rows — which no correctness test can catch:
+///
+///   `outE('R').inV()`            was 455x `out('R')`, a missing `path_free` entry
+///   `as('a').out('R')…`          was 188x the untagged spelling
+///   `repeat(out('R')).times(2)`  was 128x the written-out two hops
+///
+/// Each of those was found by hand, one at a time, after the fact. Grouped here,
+/// the next one fails a test instead.
+///
+/// Ignored like its GQL twin: it is timing-sensitive and the ratios need a
+/// quiet machine. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "timing-sensitive; run with --ignored --nocapture"]
+fn equivalent_traversals_cost_the_same() {
+    // Generous, and still 30x tighter than every gap above. This is a bound on
+    // "one spelling plans and the other enumerates", not a microbenchmark.
+    const MAX_RATIO: f64 = 4.0;
+
+    let mut lines = String::new();
+
+    for i in 0..20_000usize {
+        let l = if i % 10 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{}}}}}\n",
+            i % 97
+        ));
+    }
+
+    let mut e = 0;
+
+    for i in 0..20_000usize {
+        for d in 0..3usize {
+            lines.push_str(&format!(
+                "{{\"type\":\"edge\",\"id\":\"e{e}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{\"w\":{d}}}}}\n",
+                (i * 31 + d * 7 + 1) % 20_000
+            ));
+            e += 1;
+        }
+    }
+
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+    let groups: &[(&str, &[&str])] = &[
+        (
+            "a far-end label decides the seed",
+            &[
+                "g.V().out('R').hasLabel('W').count()",
+                "g.V().outE('R').inV().hasLabel('W').count()",
+                "g.V().as('a').out('R').hasLabel('W').count()",
+                "g.V().out('R').as('b').hasLabel('W').count()",
+                "g.V().repeat(__.out('R')).times(1).hasLabel('W').count()",
+            ],
+        ),
+        (
+            "two hops to a labelled end",
+            &[
+                "g.V().out('R').out('R').hasLabel('W').count()",
+                "g.V().repeat(__.out('R')).times(2).hasLabel('W').count()",
+                "g.V().outE('R').inV().outE('R').inV().hasLabel('W').count()",
+            ],
+        ),
+        (
+            "values off a far-end-filtered hop",
+            &[
+                "g.V().out('R').hasLabel('W').values('n')",
+                "g.V().outE('R').inV().hasLabel('W').values('n')",
+                "g.V().as('a').out('R').hasLabel('W').values('n')",
+            ],
+        ),
+        (
+            "a far-end property decides the seed",
+            &[
+                "g.V().out('R').has('n', 7).count()",
+                "g.V().outE('R').inV().has('n', 7).count()",
+                "g.V().repeat(__.out('R')).times(1).has('n', 7).count()",
+            ],
+        ),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+
+    for (name, queries) in groups {
+        let expect = {
+            let mut v: Vec<String> = super::parse::parse(queries[0])
+                .expect("parses")
+                .run(&mut g)
+                .iter()
+                .map(|x| format!("{x:?}"))
+                .collect();
+            v.sort();
+            v
+        };
+
+        for q in *queries {
+            let mut got: Vec<String> = super::parse::parse(q)
+                .unwrap_or_else(|e| panic!("`{q}` parses: {e}"))
+                .run(&mut g)
+                .iter()
+                .map(|x| format!("{x:?}"))
+                .collect();
+            got.sort();
+
+            assert_eq!(
+                got, expect,
+                "[{name}] `{q}` disagreed with `{}`",
+                queries[0]
+            );
+        }
+
+        let times: Vec<f64> = queries.iter().map(|q| grem_time(&mut g, q)).collect();
+        let fastest = times.iter().copied().fold(f64::MAX, f64::min);
+
+        for (q, t) in queries.iter().zip(&times) {
+            let ratio = t / fastest;
+
+            println!("  {ratio:>6.1}x  [{name}] {q}");
+
+            if ratio > MAX_RATIO {
+                failures.push(format!(
+                    "[{name}] {ratio:.0}x slower than the best spelling in its group:\n    {q}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "\ntraversals that mean the same thing but do not cost the same:\n\n{}\n",
+        failures.join("\n\n")
+    );
+}

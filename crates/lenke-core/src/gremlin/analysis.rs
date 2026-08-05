@@ -264,6 +264,15 @@ pub(super) struct Shape {
 }
 
 /// Read a step list once and answer every question about it.
+///
+/// REJECTED (measured neutral): a second, allocation-free entry point returning
+/// just `(needs_path, reads_tags)`, so the executor would not build the
+/// `Vec<OpClass>` it never reads. The reasoning was that `run_collect` asks
+/// those two questions on every execution and `gremlin_index_bench` runs a point
+/// lookup thousands of times. It moved nothing — `within (3 values)` 1.0us
+/// against 1.0us, `startsWith` 5.2 against 5.2, `eq point lookup` 0.4 against
+/// 0.3 — so the allocation was not the cost, and a second entry point is exactly
+/// the shape that let `path_free` and `reads_tags` drift apart to begin with.
 pub(super) fn analyze(steps: &[Step]) -> Shape {
     let mut classes = Vec::with_capacity(steps.len());
     let mut needs_path = false;
