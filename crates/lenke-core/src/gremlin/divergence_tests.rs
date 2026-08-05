@@ -1327,6 +1327,17 @@ fn a_planned_pattern_matches_the_streamed_traversal() {
         "g.V().out('R').has('k', within(1, 2))",
         "g.V().hasLabel('P').has('k', gte(4)).out('S')",
         "g.V().out('R').has('k', gt(3)).hasLabel('W')",
+        // Navigating OFF an edge frontier. `lowered_ids` guards this with an
+        // allowlist of what may follow one, because `lower_hops` would otherwise
+        // read the hop as an expansion of EDGE ids through the VERTEX adjacency
+        // — the right shape of answer, off the wrong array. Nothing tested it
+        // until a mutation that admitted `out` to that list broke nothing.
+        "g.E().out('R')",
+        "g.E().in('R')",
+        "g.E().hasLabel('R').out('R')",
+        "g.E().outV().out('R')",
+        "g.E().out('R').count()",
+        "g.E().out('R').values('k')",
         // Edge hops. `outE('R').inV()` IS `out('R')` — the same pattern with the
         // edge named — and spelled apart it can also stop ON the edge, which no
         // vertex hop expresses.
@@ -1418,8 +1429,17 @@ fn a_planned_pattern_matches_the_streamed_traversal() {
         "g.V().outE('R').has('w', gt(0))",
         "g.V().outE('R').has('w', gt(0)).inV().hasLabel('W')",
     ] {
-        // `barrier()` after `V()` keeps the same rows and defeats the compile.
-        let streamed = q.replacen("g.V()", "g.V().barrier()", 1);
+        // `barrier()` after the source keeps the same rows and defeats the
+        // compile. It has to match the SOURCE — keying on `g.V()` alone left
+        // every `g.E()` shape compared against itself, which is a pass that
+        // looks exactly like a real one. The assert below is the cheap guard.
+        let streamed = if q.starts_with("g.E()") {
+            q.replacen("g.E()", "g.E().barrier()", 1)
+        } else {
+            q.replacen("g.V()", "g.V().barrier()", 1)
+        };
+
+        assert_ne!(streamed, q, "the oracle did not rewrite `{q}`");
 
         assert_eq!(
             rows(q, &mut g),
@@ -1878,6 +1898,9 @@ fn reading_the_frontier_agrees_with_streaming_it() {
         ".limit(5).id()",
         ".dedup().label()",
         ".limit(3).fold()",
+        ".groupCount()",
+        ".dedup().groupCount()",
+        ".limit(5).groupCount()",
         // Degenerate bounds.
         ".limit(0)",
         ".skip(1000)",
@@ -1891,11 +1914,22 @@ fn reading_the_frontier_agrees_with_streaming_it() {
             // An EDGE frontier takes the same arms.
             "g.V().hasLabel('P').outE('R')",
             "g.V().hasLabel('P')",
+            // An `E()` SOURCE reaches them through `lowered_ids`, whose allowlist
+            // decides what may follow an edge frontier — every arm added after
+            // that list was written was unreachable from here.
+            "g.E()",
+            "g.E().hasLabel('R')",
         ] {
             let q = format!("{base}{tail}");
             // `barrier()` stops the prefix lowering, so the same question runs
             // down the stream instead.
-            let slow = q.replacen("g.V()", "g.V().barrier()", 1);
+            let slow = if q.starts_with("g.E()") {
+                q.replacen("g.E()", "g.E().barrier()", 1)
+            } else {
+                q.replacen("g.V()", "g.V().barrier()", 1)
+            };
+
+            assert_ne!(slow, q, "the oracle did not rewrite `{q}`");
 
             assert_eq!(
                 rows(&q, &mut g),

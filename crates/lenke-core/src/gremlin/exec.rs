@@ -707,6 +707,18 @@ fn lowered_ids<'a>(graph: &Graph, steps: &'a [Step]) -> Option<(Vec<u32>, &'a [S
                     | Step::Min(_)
                     | Step::Max(_)
                     | Step::Mean(_)
+                    // Terminals and pagers `column_paths` has since learned. The
+                    // list guards against a NAVIGATING step being read as a hop
+                    // off edge ids; none of these navigates. Left out, they made
+                    // every arm added since unreachable from an `E()` source —
+                    // `g.E().groupCount()` still streamed at 50x its own base
+                    // after the arm for it existed.
+                    | Step::GroupCount(_)
+                    | Step::Dedupe { .. }
+                    | Step::Limit(..)
+                    | Step::Skip(..)
+                    | Step::Range(..)
+                    | Step::Tail(..)
             )
         )
     {
@@ -875,6 +887,13 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
             )])
         }
         [Step::Values(keys), tail @ ..] => column_terminal(graph, &ids, is_edge, keys, tail),
+        // Tally the frontier straight into the map. Element identity IS the id,
+        // so this is the same count the `dedup` arm's set does, kept per id — and
+        // the stream built a `Trav` per element to read the element back out and
+        // count it, which is 34x on a 150k-edge frontier.
+        [Step::GroupCount(bys)] if is_identity_by(bys) => Some(vec![GVal::map(tally_group_count(
+            ids.into_iter().map(|id| frontier_val(id, is_edge)),
+        ))]),
         // The frontier ITSELF. There was no arm for it, so
         // `g.V().hasLabel('V').out('R')` — a traversal with no terminal at all —
         // built a `Trav` per element to hand back the elements: 5.2ms for 150k,
