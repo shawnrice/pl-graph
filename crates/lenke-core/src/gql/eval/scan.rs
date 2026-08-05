@@ -835,10 +835,39 @@ pub(super) fn build_scan(
         // into the whole-type scan — making the index actively harmful.
         let endpoint_seekable = node_seekable(graph, ctx, &path.start, where_)
             || node_seekable(graph, ctx, &path.segments[0].node, where_);
-        let seed = if endpoint_seekable {
-            edge_prop_seed(graph, ctx, &path.segments[0].rel, where_)
+        let rel = &path.segments[0].rel;
+        // Inline edge constraints with NO index behind them are the case the
+        // type-bucket fallback serves worst: it materializes every edge of the
+        // type, O(E), and the constraints then throw most of them away — while a
+        // node-seeded expansion applies the same constraints DURING the walk and
+        // never builds the vector. Measured on 50k vertices / 150k edges with no
+        // index on `w`, `MATCH ()-[r:R {w: 1}]->() RETURN count(*)`: 2.84ms
+        // seeding 150000 edges here, 1.33ms expanding from the nodes.
+        //
+        // `try_orient_node_seed` above declines this shape (it treats any written
+        // edge property as evidence that this branch has a selective seed), so
+        // falling through lands on the plain start-seeded expansion at the bottom
+        // — which is the one that wins.
+        //
+        // Relaxing that guard instead was tried and REJECTED: it is provably a
+        // no-op for gql_bench (all 202 evaluations take the same branch either
+        // way, checked) and still cost 11% on `edge prop filter` and 12% on
+        // `with then match expand`, because trimming a term changed the
+        // function's inlining — forcing `#[inline(never)]` on the ORIGINAL
+        // reproduced the same slowdown, and `#[inline]` on the new one did not
+        // recover it. This branch is the narrower place to say it.
+        //
+        // Even here, `with then match expand` reads 7% slower and the condition
+        // below NEVER fires in that benchmark (instrumented: zero firings), so no
+        // plan changed. Under the 10% floor, and recorded rather than chased.
+        let unselective_inline =
+            !rel.props.is_empty() && edge_prop_seed(graph, ctx, rel, where_).is_none();
+        let seed = if unselective_inline {
+            None
+        } else if endpoint_seekable {
+            edge_prop_seed(graph, ctx, rel, where_)
         } else {
-            edge_index_seed(graph, ctx, &path.segments[0].rel, where_)
+            edge_index_seed(graph, ctx, rel, where_)
         };
         if let Some(edges) = seed {
             return edge_first_build(graph, ctx, path, scope_len, &edges);
@@ -1022,6 +1051,28 @@ pub(super) fn expand_scan(
             residual_type: etypes.is_none(),
             rel_check: !rel.props.is_empty() || rel.where_.is_some(),
             node_check: !node.props.is_empty() || node.where_.is_some(),
+            rel_consts: rel
+                .where_
+                .is_none()
+                .then(|| crate::gql::eval::const_props(graph, ctx, &rel.props))
+                .flatten(),
+            node_consts: node
+                .where_
+                .is_none()
+                .then(|| crate::gql::eval::const_props(graph, ctx, &node.props))
+                .flatten(),
+            rel_eqs: rel
+                .where_
+                .is_none()
+                .then(|| crate::gql::eval::const_props(graph, ctx, &rel.props))
+                .flatten()
+                .and_then(|c| const_eqs(&graph.edge_props, &graph.strs, ctx, &c, true)),
+            node_eqs: node
+                .where_
+                .is_none()
+                .then(|| crate::gql::eval::const_props(graph, ctx, &node.props))
+                .flatten()
+                .and_then(|c| const_eqs(&graph.props, &graph.strs, ctx, &c, false)),
             kinds: &kinds,
             binding: Binding::with_len(scope_len.max(1)),
         };
@@ -1230,6 +1281,84 @@ pub(super) fn expand_scan(
 /// The per-segment part of an expansion that is GQL rather than IR: the node's
 /// label, an edge-type expression too rich to lower, and the inline / `WHERE`
 /// constraints on either end.
+/// One inline `{k: v}` equality with its COLUMN already resolved.
+///
+/// `satisfies_const` still has to find the column per candidate —
+/// `store.cols.get(kid)` plus the type match — and that is per NEIGHBOUR, so per
+/// edge traversed. Hoisting it is what closes the rest of the gap between the
+/// inline spelling and the `WHERE` spelling, which filters the built frame with
+/// one dispatch for the whole column.
+///
+/// Only the two column types worth specializing; anything else keeps the general
+/// path rather than growing a second copy of the equality rules here.
+enum ConstEq<'a> {
+    Num {
+        data: &'a [f64],
+        present: &'a crate::graph::BitSet,
+        want: f64,
+    },
+    /// Interned ids compare as `u32`. `want` is `None` when the string is not in
+    /// the dictionary at all — then nothing can equal it, and the row is dropped
+    /// without touching the column.
+    Str {
+        data: &'a [u32],
+        present: &'a crate::graph::BitSet,
+        want: Option<u32>,
+    },
+}
+
+impl ConstEq<'_> {
+    fn holds(&self, idx: usize) -> bool {
+        match self {
+            Self::Num {
+                data,
+                present,
+                want,
+            } => present.get(idx) && data[idx] == *want,
+            Self::Str {
+                data,
+                present,
+                want,
+            } => want.is_some_and(|w| present.get(idx) && data[idx] == w),
+        }
+    }
+}
+
+/// Resolve every constraint against `store`, or `None` if any one of them is not
+/// a plain typed equality this can answer.
+fn const_eqs<'a>(
+    store: &'a crate::graph::Properties,
+    strs: &crate::graph::Dict,
+    ctx: &Ctx,
+    consts: &[(usize, Val)],
+    edge: bool,
+) -> Option<Vec<ConstEq<'a>>> {
+    consts
+        .iter()
+        .map(|(key_ref, want)| {
+            let kid = if edge {
+                ctx.prop_keys[*key_ref].1
+            } else {
+                ctx.prop_keys[*key_ref].0
+            }?;
+
+            match (store.cols.get(kid as usize)?, want) {
+                (crate::graph::Column::Num { data, present }, Val::Num(w)) => Some(ConstEq::Num {
+                    data,
+                    present,
+                    want: *w,
+                }),
+                (crate::graph::Column::Str { data, present }, Val::Str(w)) => Some(ConstEq::Str {
+                    data,
+                    present,
+                    want: strs.get(w),
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 struct SegmentFilter<'a> {
     graph: &'a Graph,
     ctx: &'a Ctx<'a>,
@@ -1238,6 +1367,14 @@ struct SegmentFilter<'a> {
     residual_type: bool,
     rel_check: bool,
     node_check: bool,
+    /// Inline constraints with their values already evaluated — see
+    /// [`crate::gql::eval::const_props`]. `None` when a value reads a slot, or
+    /// when there is a WHERE beside the props, either of which needs the row.
+    rel_consts: Option<Vec<(usize, Val)>>,
+    node_consts: Option<Vec<(usize, Val)>>,
+    /// The same constraints with their columns resolved — the hot form.
+    rel_eqs: Option<Vec<ConstEq<'a>>>,
+    node_eqs: Option<Vec<ConstEq<'a>>>,
     kinds: &'a [(usize, Elem)],
     binding: Binding,
 }
@@ -1294,28 +1431,56 @@ impl crate::seek::RowFilter for SegmentFilter<'_> {
             self.binding.set(s, Val::Node(nbr));
         }
 
-        if self.rel_check
-            && !satisfies(
-                self.graph,
-                self.ctx,
-                &Val::Edge(eidx),
-                &self.rel.props,
-                self.rel.where_.as_ref(),
-                &self.binding,
-            )
-        {
-            return false;
+        if self.rel_check {
+            if let Some(eqs) = &self.rel_eqs {
+                if !eqs.iter().all(|e| e.holds(eidx as usize)) {
+                    return false;
+                }
+            } else {
+                let ok = match &self.rel_consts {
+                    Some(consts) => crate::gql::eval::satisfies_const(
+                        self.graph,
+                        self.ctx,
+                        &Val::Edge(eidx),
+                        consts,
+                    ),
+                    None => satisfies(
+                        self.graph,
+                        self.ctx,
+                        &Val::Edge(eidx),
+                        &self.rel.props,
+                        self.rel.where_.as_ref(),
+                        &self.binding,
+                    ),
+                };
+
+                if !ok {
+                    return false;
+                }
+            }
         }
 
-        !self.node_check
-            || satisfies(
+        if !self.node_check {
+            return true;
+        }
+
+        if let Some(eqs) = &self.node_eqs {
+            return eqs.iter().all(|e| e.holds(nbr as usize));
+        }
+
+        match &self.node_consts {
+            Some(consts) => {
+                crate::gql::eval::satisfies_const(self.graph, self.ctx, &Val::Node(nbr), consts)
+            }
+            None => satisfies(
                 self.graph,
                 self.ctx,
                 &Val::Node(nbr),
                 &self.node.props,
                 self.node.where_.as_ref(),
                 &self.binding,
-            )
+            ),
+        }
     }
 }
 

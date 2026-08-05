@@ -2419,6 +2419,43 @@ fn bind_slot(binding: &mut Binding, slot: Option<usize>, value: &Val) -> Option<
     }
 }
 
+/// The inline `{k: v}` constraints of an element, with every value that does not
+/// read a slot ALREADY EVALUATED.
+///
+/// `satisfies` evaluates `pc.value` per candidate. For the overwhelmingly common
+/// `{k: <literal>}` that re-boxes a constant once per neighbour traversed, which
+/// is per EDGE — and it made the inline spelling of a query cost 1.8x the `WHERE`
+/// spelling of the same query, because a clause WHERE is applied to the built
+/// frame columnar instead. Measured on 50k vertices / 150k edges:
+/// `MATCH ()-[:R]->(b {n: 7}) RETURN count(*)` 2.88ms against 1.60ms for
+/// `WHERE b.n = 7`, same plan, same answer.
+///
+/// `None` for a constraint whose value reads a slot (`{k: a.x}` in a comma
+/// join) — those genuinely differ per row and keep the general path.
+fn const_props(graph: &Graph, ctx: &Ctx, props: &[CPropConstraint]) -> Option<Vec<(usize, Val)>> {
+    // The SAME evaluator, run once instead of per neighbour — not a second one.
+    // An expression that reads no slot reads no element either, so the empty
+    // binding it sees is the only binding it could have wanted.
+    let binding = Binding::default();
+    let env = Env::new(graph, ctx, &binding);
+
+    props
+        .iter()
+        .map(|pc| {
+            (!crate::gql::plan::refs_slot(&pc.value, &|_| true))
+                .then(|| (pc.key_ref, eval(&env, &pc.value)))
+        })
+        .collect()
+}
+
+/// Whether `element` satisfies pre-evaluated inline constraints. The hot form of
+/// [`satisfies`] — no `Env`, no per-neighbour expression evaluation.
+fn satisfies_const(graph: &Graph, ctx: &Ctx, element: &Val, consts: &[(usize, Val)]) -> bool {
+    consts
+        .iter()
+        .all(|(key_ref, want)| val_eq(&prop_of(graph, ctx, element, *key_ref), want))
+}
+
 fn satisfies(
     graph: &Graph,
     ctx: &Ctx,

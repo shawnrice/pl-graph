@@ -12320,3 +12320,197 @@ fn the_alias_rewrite_leaves_alone_what_it_cannot_prove() {
         "RETURN * with an ORDER BY"
     );
 }
+
+/// An inline `{k: v}` constraint answers exactly what the general path answers,
+/// including every case the column-resolved shortcut must NOT take.
+///
+/// The shortcut resolves the property column and the wanted value once per
+/// segment instead of per neighbour, and then compares raw column entries — an
+/// `f64` or an interned `u32`. That is only equality for the shapes it accepts,
+/// so what matters is the cases it declines: a value that reads a slot, a
+/// heterogeneous column, a key the store has never seen, a string absent from
+/// the dictionary, and a type that does not line up with its column.
+#[test]
+fn an_inline_constraint_agrees_with_the_general_path() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["P"],"properties":{"n":7,"s":"x","mix":1}}"#,
+        r#"{"type":"node","id":"b","labels":["P"],"properties":{"n":0,"s":"y","mix":"one"}}"#,
+        r#"{"type":"node","id":"c","labels":["P"],"properties":{"n":7,"s":"x"}}"#,
+        r#"{"type":"node","id":"d","labels":["P"],"properties":{"other":1}}"#,
+        r#"{"type":"edge","id":"e0","labels":["R"],"from":"a","to":"b","properties":{"w":7,"t":"k"}}"#,
+        r#"{"type":"edge","id":"e1","labels":["R"],"from":"b","to":"c","properties":{"w":0,"t":"j"}}"#,
+        r#"{"type":"edge","id":"e2","labels":["R"],"from":"c","to":"d","properties":{"w":7}}"#,
+    ]);
+
+    for query in [
+        // The shapes the shortcut takes.
+        "MATCH ()-[:R]->(b {n: 7}) RETURN count(*) AS c",
+        "MATCH ()-[:R]->(b {s: 'x'}) RETURN count(*) AS c",
+        "MATCH ()-[r:R {w: 7}]->() RETURN count(*) AS c",
+        "MATCH ()-[r:R {t: 'k'}]->() RETURN count(*) AS c",
+        // Two constraints on one element.
+        "MATCH ()-[:R]->(b {n: 7, s: 'x'}) RETURN count(*) AS c",
+        // On BOTH ends of the hop at once.
+        "MATCH ()-[r:R {w: 7}]->(b {n: 0}) RETURN count(*) AS c",
+        // A string the dictionary has never seen matches nothing — and must not
+        // be read as "no constraint".
+        "MATCH ()-[:R]->(b {s: 'nope'}) RETURN count(*) AS c",
+        // An absent property. Zero, not a match against null.
+        "MATCH ()-[:R]->(b {other: 1}) RETURN count(*) AS c",
+        // A key NO element carries, so the store has no column for it.
+        "MATCH ()-[:R]->(b {missing: 1}) RETURN count(*) AS c",
+        // A HETEROGENEOUS column (number on one node, string on another) is
+        // boxed, so the typed shortcut declines and the general path answers.
+        "MATCH ()-[:R]->(b {mix: 1}) RETURN count(*) AS c",
+        "MATCH ()-[:R]->(b {mix: 'one'}) RETURN count(*) AS c",
+        // A type that does not line up with its column.
+        "MATCH ()-[:R]->(b {n: 'seven'}) RETURN count(*) AS c",
+        "MATCH ()-[:R]->(b {s: 7}) RETURN count(*) AS c",
+        // Signed zero is one value, whichever way it is written.
+        "MATCH ()-[:R]->(b {n: -0.0}) RETURN count(*) AS c",
+        // Null is never equal to anything, including an absent property.
+        "MATCH ()-[:R]->(b {n: null}) RETURN count(*) AS c",
+        // The rows themselves, not just a count — the shortcut decides which
+        // neighbours survive, so the SET has to match too.
+        "MATCH (a)-[:R]->(b {n: 7}) RETURN a.s AS x, b.s AS y ORDER BY x, y",
+    ] {
+        assert_eq!(
+            rows(&mut g, query),
+            super::eval::with_vec_override(false, || rows(&mut g, query)),
+            "the expansion filter disagreed with the scalar driver on `{query}`"
+        );
+    }
+
+    // The counts themselves, so the test cannot pass by both paths being wrong.
+    assert_eq!(
+        rows(&mut g, "MATCH ()-[:R]->(b {n: 7}) RETURN count(*) AS c"),
+        vec![vec![n(1.0)]],
+        "only c has n = 7 at the far end of an R edge"
+    );
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH ()-[:R]->(b {s: 'nope'}) RETURN count(*) AS c"
+        ),
+        vec![vec![n(0.0)]],
+        "a string absent from the dictionary matches nothing"
+    );
+    assert_eq!(
+        rows(&mut g, "MATCH ()-[r:R {w: 7}]->() RETURN count(*) AS c"),
+        vec![vec![n(2.0)]],
+        "two R edges carry w = 7"
+    );
+}
+
+/// A constraint whose value READS A SLOT is not constant, and keeps the general
+/// path — it genuinely differs per row.
+///
+/// The shortcut evaluates the value once per segment. That is only sound while
+/// the value cannot change between rows, so this is the case that would break
+/// silently if the check were dropped: every row would be compared against the
+/// first row's value.
+#[test]
+fn an_inline_constraint_that_reads_a_slot_is_evaluated_per_row() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["P"],"properties":{"n":1}}"#,
+        r#"{"type":"node","id":"b","labels":["P"],"properties":{"n":2}}"#,
+        r#"{"type":"node","id":"c","labels":["P"],"properties":{"n":1}}"#,
+        r#"{"type":"edge","id":"e0","labels":["R"],"from":"a","to":"b","properties":{}}"#,
+        r#"{"type":"edge","id":"e1","labels":["R"],"from":"a","to":"c","properties":{}}"#,
+        r#"{"type":"edge","id":"e2","labels":["R"],"from":"b","to":"c","properties":{}}"#,
+    ]);
+
+    // `{n: a.n}` is a correlated equality: b must carry the SAME n as a. Only
+    // a→c (1 = 1) qualifies; a→b (1 vs 2) and b→c (2 vs 1) do not.
+    let query = "MATCH (a:P)-[:R]->(b {n: a.n}) RETURN count(*) AS c";
+
+    assert_eq!(rows(&mut g, query), vec![vec![n(1.0)]]);
+    assert_eq!(
+        rows(&mut g, query),
+        super::eval::with_vec_override(false, || rows(&mut g, query)),
+        "a per-row constraint disagreed with the scalar driver"
+    );
+
+    // A PARAM is constant across rows, so it does take the shortcut — with the
+    // param's value, not a placeholder.
+    let mut params = Params::new();
+    params.insert("v".to_string(), super::eval::Val::Num(1.0));
+
+    assert_eq!(
+        qp(
+            &mut g,
+            "MATCH ()-[:R]->(b {n: $v}) RETURN count(*) AS c",
+            params
+        ),
+        vec![vec![n(2.0)]],
+        "two R edges land on a node with n = 1"
+    );
+}
+
+/// An inline edge constraint with no index behind it seeds from the NODES, not
+/// from the edge-type bucket.
+///
+/// The bucket fallback materializes every edge of the type and then throws most
+/// of them away; the node-seeded expansion applies the same constraint during
+/// the walk and never builds the vector. On 50k vertices / 150k edges that was
+/// 2.84ms against 1.33ms — and it reached Gremlin too, since
+/// `g.V().outE('R').has('w', 1)` compiles to exactly this pattern.
+///
+/// The rows are what this asserts: changing which end a pattern seeds from is
+/// the classic way to silently drop or duplicate matches.
+#[test]
+fn an_unindexed_inline_edge_constraint_still_matches_every_row() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["P"],"properties":{"k":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["P"],"properties":{"k":"b"}}"#,
+        r#"{"type":"node","id":"c","labels":["P"],"properties":{"k":"c"}}"#,
+        r#"{"type":"edge","id":"e0","labels":["R"],"from":"a","to":"b","properties":{"w":1}}"#,
+        r#"{"type":"edge","id":"e1","labels":["R"],"from":"a","to":"c","properties":{"w":2}}"#,
+        r#"{"type":"edge","id":"e2","labels":["R"],"from":"b","to":"c","properties":{"w":1}}"#,
+        // A SELF LOOP carrying the constraint — one row, not two, and easy to
+        // lose when the seed side changes.
+        r#"{"type":"edge","id":"e3","labels":["R"],"from":"c","to":"c","properties":{"w":1}}"#,
+        // Another type entirely, which the constraint must not reach.
+        r#"{"type":"edge","id":"e4","labels":["S"],"from":"a","to":"b","properties":{"w":1}}"#,
+    ]);
+
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (x)-[r:R {w: 1}]->(y) RETURN x.k AS a, y.k AS b ORDER BY a, b"
+        ),
+        vec![
+            vec![Value::Str("a".into()), Value::Str("b".into())],
+            vec![Value::Str("b".into()), Value::Str("c".into())],
+            vec![Value::Str("c".into()), Value::Str("c".into())],
+        ]
+    );
+
+    // The same query with an INDEX on the key takes the edge seek instead, and
+    // has to answer identically — the two seeds are the equivalent spellings
+    // here, chosen by what the store happens to carry.
+    let unindexed = rows(
+        &mut g,
+        "MATCH (x)-[r:R {w: 1}]->(y) RETURN x.k AS a ORDER BY a",
+    );
+
+    g.create_edge_index("w");
+
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (x)-[r:R {w: 1}]->(y) RETURN x.k AS a ORDER BY a"
+        ),
+        unindexed,
+        "an index changed the answer, not just the plan"
+    );
+
+    // And the scalar driver agrees with both.
+    assert_eq!(
+        super::eval::with_vec_override(false, || rows(
+            &mut g,
+            "MATCH (x)-[r:R {w: 1}]->(y) RETURN x.k AS a ORDER BY a"
+        )),
+        unindexed
+    );
+}
