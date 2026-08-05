@@ -1337,6 +1337,35 @@ fn a_planned_pattern_matches_the_streamed_traversal() {
         "g.V().inE('S').inV().hasLabel('P')",
         "g.V().bothE('R').bothV().hasLabel('W')",
         "g.V().outE('R').bothV()",
+        // `as(x)` is a var_slot like any other. It filters nothing, so it can sit
+        // anywhere among the filters; stopping the prefix at one is what made
+        // `V().as('a').out('R').hasLabel('W')` decline with zero segments.
+        "g.V().as('a').out('R').hasLabel('W')",
+        "g.V().out('R').as('b').hasLabel('W')",
+        "g.V().out('R').hasLabel('W').as('b')",
+        "g.V().as('a').out('R').as('b').hasLabel('W')",
+        "g.V().as('a').hasLabel('P').out('R').hasLabel('W')",
+        "g.V().hasLabel('P').as('a').out('R').as('b').has('k', 3)",
+        "g.V().as('a').out('R').as('b').out('S').as('c').hasLabel('P')",
+        "g.V().outE('R').as('e').inV().hasLabel('W')",
+        "g.V().outE('R').as('e').inV().as('b').hasLabel('W')",
+        // The tag READ back, which is the whole point of binding it.
+        "g.V().as('a').out('R').hasLabel('W').select('a')",
+        "g.V().as('a').out('R').as('b').hasLabel('W').select('a','b')",
+        "g.V().as('a').out('R').hasLabel('W').select('a').values('k')",
+        "g.V().as('a').out('R').as('b').hasLabel('W').select('a','b').count()",
+        "g.V().outE('R').as('e').inV().hasLabel('W').select('e')",
+        "g.V().as('a').out('R').as('b').out('S').hasLabel('P').select('a','b')",
+        // Two labels on ONE element, and a label reused later.
+        "g.V().as('a').as('x').out('R').hasLabel('W').select('a','x')",
+        // `dedup(labels)` keys on TAGS, so the tags have to be there.
+        "g.V().as('a').out('R').hasLabel('W').dedup('a')",
+        "g.V().as('a').out('R').as('b').hasLabel('W').dedup('a','b')",
+        // A `by()` body runs on a FRESH root (see `eval_by`), so `by(__.path())`
+        // yields the selected value's own one-element path — not the outer
+        // traverser's. Pinned because it reads like it should do the opposite.
+        "g.V().as('a').out('R').hasLabel('W').select('a').by(__.path())",
+        "g.V().as('a').out('R').hasLabel('W').select('a').by(__.values('k'))",
         // A non-equality edge filter stays out, same as on a node.
         "g.V().outE('R').has('w', gt(0))",
         "g.V().outE('R').has('w', gt(0)).inV().hasLabel('W')",
@@ -1393,6 +1422,12 @@ fn only_a_constraint_past_the_start_is_worth_planning() {
         "g.V().hasLabel('P').out('R').hasLabel('Q')",
         // The constraint is on the SECOND hop's node, two segments out.
         "g.V().out('R').out('S').hasLabel('P')",
+        // `as(x)` binds a slot and no longer stops the prefix.
+        "g.V().as('a').out('R').hasLabel('W')",
+        "g.V().out('R').as('b').hasLabel('W')",
+        "g.V().as('a').out('R').as('b').hasLabel('W')",
+        "g.V().as('a').out('R').as('b').hasLabel('W').select('a','b')",
+        "g.V().outE('R').as('e').inV().hasLabel('W')",
         // Edge hops: `outE('R').inV().hasLabel('W')` is `out('R').hasLabel('W')`
         // with the edge named, and an edge PROPERTY is worth orienting to on its
         // own because the planner can seek an edge property index.

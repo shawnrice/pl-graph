@@ -38,6 +38,13 @@ pub(super) struct Compiled {
     pub end_slot: usize,
     /// Whether that slot holds an EDGE (`outE('R')` with no landing step).
     pub end_is_edge: bool,
+    /// `as(label)` bindings the prefix absorbed: label → (slot, is_edge).
+    ///
+    /// A tag IS a slot. Gremlin accumulates a LIST per label because a label
+    /// under `repeat()` is visited once per iteration, and `select(Pop.all)`
+    /// reads all of them — but a linear prefix visits each label exactly once, so
+    /// the list has one entry and a `var_slot` carries it exactly.
+    pub tags: Vec<(String, usize, bool)>,
     pub scope_len: usize,
     pub consumed: usize,
 }
@@ -112,11 +119,17 @@ fn absorb_filters(
     label: &mut Option<CLabelExpr>,
     props: &mut Vec<CPropConstraint>,
     it: &mut Interner,
+    tags: &mut Vec<String>,
 ) -> usize {
     let mut n = 0;
 
     for step in steps {
         match step {
+            // `as(x)` names the element the prefix is standing on. It filters
+            // nothing, so it can sit anywhere among the filters without changing
+            // what they mean — and stopping the scan at one is what made
+            // `V().as('a').out('R').hasLabel('W')` decline with zero segments.
+            Step::As(name) => tags.push(name.clone()),
             Step::HasLabel(names) if label.is_none() => match label_expr(names, it) {
                 Some(e) => *label = Some(e),
                 None => break,
@@ -139,8 +152,13 @@ fn absorb_filters(
 }
 
 /// The same, for a node.
-fn absorb_node(steps: &[Step], node: &mut CNode, it: &mut Interner) -> usize {
-    absorb_filters(steps, &mut node.label, &mut node.props, it)
+fn absorb_node(
+    steps: &[Step],
+    node: &mut CNode,
+    it: &mut Interner,
+    tags: &mut Vec<String>,
+) -> usize {
+    absorb_filters(steps, &mut node.label, &mut node.props, it, tags)
 }
 
 /// The direction and type names of an EDGE hop, or `None` if it is not one.
@@ -222,11 +240,26 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
         props: Vec::new(),
         where_: None,
     };
-    let taken = absorb_node(rest, &mut start, &mut it);
+    // Slots are handed out only to elements something READS: a tagged one, or
+    // the last, which is the traverser's value. An intermediate node the pattern
+    // merely walks through costs a column carried and replicated on every
+    // fan-out, for nothing.
+    let mut next_slot = 0usize;
+    let mut tags: Vec<(String, usize, bool)> = Vec::new();
+    let mut start_tags: Vec<String> = Vec::new();
+    let taken = absorb_node(rest, &mut start, &mut it, &mut start_tags);
+
     consumed += taken;
 
+    if !start_tags.is_empty() {
+        let s = next_slot;
+
+        next_slot += 1;
+        start.var_slot = Some(s);
+        tags.extend(start_tags.into_iter().map(|n| (n, s, false)));
+    }
+
     let mut segments: Vec<CSegment> = Vec::new();
-    let mut slot = 0;
     // Set when the traversal STOPS on an edge (`outE('R').has('w', 1)`), which is
     // the one shape a vertex hop cannot spell. The loop then has to end: there is
     // no next segment to start from an edge.
@@ -241,8 +274,9 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
         };
 
         consumed += 1;
-        slot += 1;
 
+        let mut rel_tags: Vec<String> = Vec::new();
+        let mut node_tags: Vec<String> = Vec::new();
         let mut rel = CRel {
             var_slot: None,
             label: if types.is_empty() {
@@ -264,7 +298,13 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
 
         if spelled_apart {
             // Filters here constrain the EDGE — `outE('R').has('w', 1)`.
-            consumed += absorb_filters(&steps[consumed..], &mut rel.label, &mut rel.props, &mut it);
+            consumed += absorb_filters(
+                &steps[consumed..],
+                &mut rel.label,
+                &mut rel.props,
+                &mut it,
+                &mut rel_tags,
+            );
 
             match steps.get(consumed) {
                 Some(v) if lands_far(dir, v) => consumed += 1,
@@ -289,11 +329,27 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
             if dir == Direction::Both {
                 return None;
             }
-
-            rel.var_slot = Some(slot);
         } else {
-            node.var_slot = Some(slot);
-            consumed += absorb_node(&steps[consumed..], &mut node, &mut it);
+            consumed += absorb_node(&steps[consumed..], &mut node, &mut it, &mut node_tags);
+        }
+
+        // The edge binds when it is tagged or when the traversal stops on it; the
+        // node binds when it is tagged, and unconditionally at the end (fixed up
+        // after the loop, once "the end" is known).
+        if ends_on_edge || !rel_tags.is_empty() {
+            let s = next_slot;
+
+            next_slot += 1;
+            rel.var_slot = Some(s);
+            tags.extend(rel_tags.into_iter().map(|n| (n, s, true)));
+        }
+
+        if !ends_on_edge && !node_tags.is_empty() {
+            let s = next_slot;
+
+            next_slot += 1;
+            node.var_slot = Some(s);
+            tags.extend(node_tags.into_iter().map(|n| (n, s, false)));
         }
 
         segments.push(CSegment {
@@ -335,6 +391,26 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
         return None;
     }
 
+    // The traverser's value after the prefix is the last element. If the walk
+    // ended on a node it may not have been bound yet — nothing tagged it — so
+    // bind it now.
+    // `ends_on_edge` is the loop's own record of where the walk stopped. It
+    // cannot be inferred from which slots are bound: `outE('R').as('e').inV()`
+    // binds the EDGE (it is tagged) and still lands on the node.
+    let last = segments.last_mut()?;
+    let end_is_edge = ends_on_edge;
+
+    if !end_is_edge && last.node.var_slot.is_none() {
+        last.node.var_slot = Some(next_slot);
+        next_slot += 1;
+    }
+
+    let end_slot = if end_is_edge {
+        last.rel.var_slot?
+    } else {
+        last.node.var_slot?
+    };
+
     Some(Compiled {
         path: CPath {
             start,
@@ -345,9 +421,10 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
         },
         label_names: it.labels,
         key_names: it.keys,
-        end_slot: slot,
-        end_is_edge: ends_on_edge,
-        scope_len: slot + 1,
+        end_slot,
+        end_is_edge,
+        tags,
+        scope_len: next_slot.max(1),
         consumed,
     })
 }

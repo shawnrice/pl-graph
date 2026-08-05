@@ -3617,15 +3617,20 @@ fn cmp_bound(e: &CExpr, ctx: &Ctx) -> Option<(usize, usize, CompareOp, crate::gr
 /// into — the caller builds them while compiling, exactly as `CQuery` does.
 /// Returns `None` when the shape is one the planner declines, and the caller
 /// should run it its own way.
+/// Plan a compiled pattern and hand back the requested slots as parallel columns.
+///
+/// One column per `(slot, is_edge)`, all the same length: row `i` of each is one
+/// match. That is what makes an `as(label)` in a Gremlin prefix a `var_slot` like
+/// any other — the tag's value for a row is its column's entry, so a label that
+/// used to stop the prefix dead now rides through the planner with it.
 pub(crate) fn plan_pattern_ids(
     graph: &Graph,
     path: &crate::gql::plan::CPath,
     label_names: &[String],
     key_names: &[String],
     scope_len: usize,
-    want_slot: usize,
-    want_edge: bool,
-) -> Option<Vec<u32>> {
+    want: &[(usize, bool)],
+) -> Option<Vec<Vec<u32>>> {
     let ctx = Ctx {
         params: &[],
         prop_keys: key_names
@@ -3651,12 +3656,19 @@ pub(crate) fn plan_pattern_ids(
         return None;
     }
 
-    let want = if want_edge { Elem::Edge } else { Elem::Node };
+    want.iter()
+        .map(|&(slot, is_edge)| {
+            let kind = if is_edge { Elem::Edge } else { Elem::Node };
 
-    match sc.slot(want_slot) {
-        Some((kind, ids)) if kind == want => Some(ids.to_vec()),
-        _ => None,
-    }
+            match sc.slot(slot) {
+                Some((k, ids)) if k == kind => Some(ids.to_vec()),
+                // A slot the scan never bound, or bound to the other kind. The
+                // columns are parallel per ROW, so one missing means the whole
+                // request is unanswerable — not that one column is empty.
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 // --- index-seeded scanning, expansion, and vectorized aggregation ---

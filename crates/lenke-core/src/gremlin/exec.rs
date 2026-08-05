@@ -313,23 +313,62 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
         if !needs_path(rest) {
             TRACK_PATH.with(|x| x.set(false));
 
-            if let Some(ids) = crate::gql::eval::plan_pattern_ids(
+            // The end slot first, then one column per `as(label)`. All parallel:
+            // row `i` of each is one match, so a tag's value for a row is its
+            // column's entry.
+            let tagged = !c.tags.is_empty() && reads_tags(rest);
+            let mut want = vec![(c.end_slot, c.end_is_edge)];
+
+            if tagged {
+                want.extend(c.tags.iter().map(|(_, slot, is_edge)| (*slot, *is_edge)));
+            }
+
+            if let Some(cols) = crate::gql::eval::plan_pattern_ids(
                 graph,
                 &c.path,
                 &c.label_names,
                 &c.key_names,
                 c.scope_len,
-                c.end_slot,
-                c.end_is_edge,
+                &want,
             ) {
-                // The column terminals, offered the ORIENTED ids.
-                if let Some(out) = column_paths(graph, &ids, c.end_is_edge, rest) {
+                let ids = &cols[0];
+
+                // The column terminals, offered the ORIENTED ids. Only when the
+                // prefix bound no tags: a terminal reading one column cannot also
+                // carry the others, and a dropped tag is a `select` that silently
+                // finds nothing.
+                //
+                // Defensive, not load-bearing: every terminal `column_paths`
+                // accepts — count, dedup, fold, group-count, limit, min/max/mean,
+                // order, sum — reads the column and nothing else, so removing this
+                // guard fails no test today. It is what makes the arm correct on
+                // its own terms rather than by what happens to be listed above it.
+                if let Some(out) = column_paths(graph, ids, c.end_is_edge, rest) {
                     return out;
                 }
 
-                let seeded: Vec<Trav> = ids
-                    .into_iter()
-                    .map(|id| Trav::root(frontier_val(id, c.end_is_edge)))
+                let seeded: Vec<Trav> = (0..ids.len())
+                    .map(|i| {
+                        let mut t = Trav::root(frontier_val(ids[i], c.end_is_edge));
+
+                        if tagged {
+                            // A linear prefix visits each label exactly once, so
+                            // each list has exactly one entry — which is what
+                            // makes a Gremlin tag and a GQL slot the same thing
+                            // here. Under `repeat()` it would not be.
+                            t.tags = Arc::new(
+                                c.tags
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(k, (name, _, is_edge))| {
+                                        (name.clone(), vec![frontier_val(cols[k + 1][i], *is_edge)])
+                                    })
+                                    .collect(),
+                            );
+                        }
+
+                        t
+                    })
                     .collect();
 
                 return run_steps(graph, ctx, rest, seeded)
@@ -562,7 +601,67 @@ fn path_free(step: &Step) -> bool {
             | Step::Aggregate(_)
             | Step::Store(_)
             | Step::Cap(_)
+            // `select` reads the TAG map and the current value, never
+            // `Trav::path` — and neither can its `by()` bodies, because
+            // `eval_by` runs each on a FRESH `Trav::root(value)`. So
+            // `select('a').by(__.path())` yields the selected value's own
+            // one-element path, not the outer traverser's, and recursing into
+            // the bodies here would be dead logic.
+            //
+            // Leaving `select` out taxed every labelled traversal with a
+            // per-traverser path clone, and — since the pattern branch declines
+            // whenever the REST needs a path — kept `as(x)` from ever reaching
+            // the planner.
+            | Step::Select { .. }
+            // `as(x)` WRITES a tag from the current value; it reads no history.
+            // Leaving it out taxed every labelled traversal with a per-traverser
+            // path clone — `as('a').out('R').hasLabel('W').count()` cost 21.4ms
+            // where the untagged spelling cost 0.10ms, and almost all of that was
+            // the clone rather than the tag.
+            | Step::As(_)
     ) || matches!(step, Step::Dedupe { bys, .. } if bys.is_empty())
+}
+
+/// Whether any of these steps could READ an `as(label)` tag.
+///
+/// Conservative by construction: a `by()` or a sub-traversal can hold a
+/// `select`, so anything carrying one counts. What it lets through is the plain
+/// terminal chain — `count`, `values`, `fold`, `id`, `label`, a filter — which is
+/// the case worth getting right, because binding a tag nothing reads costs a
+/// materialized column per label AND a per-row tag map to put it in.
+///
+/// `as(x).out(R).hasLabel(W).count()` built 15,000 tag maps for a count that
+/// never looks at one: 1.50ms, against 0.097ms once the tags are left unbound.
+fn reads_tags(steps: &[Step]) -> bool {
+    steps.iter().any(|s| match s {
+        Step::Select { .. }
+        | Step::WhereKey(..)
+        | Step::Match(_)
+        | Step::ShortestPath { .. }
+        | Step::Tree(_)
+        | Step::Path(_) => true,
+        Step::Dedupe { labels, bys } => !labels.is_empty() || !bys.is_empty(),
+        // Anything that can carry a sub-traversal, which can carry a `select`.
+        Step::Where(_)
+        | Step::Not(_)
+        | Step::Optional(_)
+        | Step::Local(_)
+        | Step::Map(_)
+        | Step::FlatMap(_)
+        | Step::SideEffect(_)
+        | Step::And(_)
+        | Step::Or(_)
+        | Step::Union(_)
+        | Step::Coalesce(_)
+        | Step::Choose { .. }
+        | Step::Repeat { .. } => true,
+        Step::Order(bys, ..)
+        | Step::Group(bys)
+        | Step::GroupCount(bys)
+        | Step::Project(_, bys)
+        | Step::Math { bys, .. } => !bys.is_empty(),
+        _ => false,
+    })
 }
 
 /// Whether this traversal needs per-traverser path history at all.
