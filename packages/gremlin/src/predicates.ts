@@ -80,6 +80,37 @@ const cmpOrd = (x: number | string, y: number | string): number => {
  * and `min()` never picks one. Mirrors the Rust `gcmp_total`.
  */
 export const compareTotal = (a: unknown, b: unknown): number => {
+  // NULLS FIRST, and two nulls equal. `compareValues` has no null arm at all —
+  // it falls through to `cannot order null with null` — so ordering a stream
+  // with one missing property THREW here while the Rust core sorted it, which is
+  // a byte-identity break on an ordinary traversal (`values('k').order()` over a
+  // vertex that lacks `k`, or anything after `path().id()`).
+  //
+  // First, not last: that is TinkerPop's, verbatim from
+  // `GremlinValueComparator.ORDERABILITY` —
+  //
+  //     // nulls first
+  //     if (f == null || s == null)
+  //         return f == s ? 0 : f == null ? -1 : 1;
+  //
+  // and it is what `gval_type_rank` already does by ranking `Null` at 0. GQL
+  // sorts nulls LAST, which is the ISO contract for a different language; the
+  // two do not have to agree and here they must not.
+  //
+  // The PREDICATE comparator keeps throwing, which is also TinkerPop: it splits
+  // Comparability ("throws type errors … for cross-type comparison (including
+  // nulltype)") from Orderability. That split is exactly this pair of functions.
+  if (a === null || a === undefined || b === null || b === undefined) {
+    const aNull = a === null || a === undefined;
+    const bNull = b === null || b === undefined;
+
+    if (aNull && bNull) {
+      return 0;
+    }
+
+    return aNull ? -1 : 1;
+  }
+
   if (typeof a === 'number' && typeof b === 'number') {
     const aNaN = Number.isNaN(a);
     const bNaN = Number.isNaN(b);

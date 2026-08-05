@@ -176,10 +176,18 @@ const preds = [eq, gt, gte, lt, lte];
 // The edge types an adjacency step names. Naming several is a disjunction over
 // ONE edge, so edge 14 (KNOWS *and* CREATED) must still be walked once — the
 // case a single name can never expose.
-// An adjacency step naming two types that BOTH exist. `NOPE` resolves to
-// nothing, so `('KNOWS','NOPE')` selects exactly what `('KNOWS')` does, in the
-// same order — only a pair of real names makes the order unspecified.
-const MULTI_TYPE_STEP = /\b(?:out|in|both)E?\((?:'KNOWS',\s*'CREATED'|'CREATED',\s*'KNOWS')\)/;
+// An adjacency step naming TWO OR MORE types, whether or not they all exist.
+//
+// It used to require a pair of real names, on the reasoning that `NOPE` resolves
+// to nothing so `('KNOWS','NOPE')` "selects exactly what `('KNOWS')` does, in
+// the same order". The selection is the same; the ORDER is not. What decides the
+// order is how many names the step was GIVEN — the TS engine walks a bucket per
+// name while native makes one adjacency pass — and that is true of a name that
+// matches nothing just as much as one that matches. Measured:
+// `g.V().both('KNOWS','NOPE').hasLabel('PERSON').fold()` returned the same six
+// vertices from each engine in different orders, a false divergence that made
+// this suite red about one run in fifty.
+const MULTI_TYPE_STEP = /\b(?:out|in|both)E?\('[^']*'(?:,\s*'[^']*')+\)/;
 
 /**
  * Sort a result list when its order is unspecified; otherwise leave it.
@@ -221,6 +229,26 @@ const canonOrder = (rows: unknown, unordered: boolean): unknown =>
  * cannot recover it: the slice already happened.
  */
 const SLICING_STEP = /\.(?:limit|skip|range|tail)\(/;
+
+/**
+ * Whether a positional slice happens BEFORE any `order()` — the case where the
+ * slice's unspecified subset is what gets ordered, so ordering settles the
+ * sequence without settling which rows are in it.
+ *
+ * An `order()` that comes FIRST does make the slice deterministic, and those
+ * plans stay compared.
+ */
+const slicedBeforeOrdering = (text: string): boolean => {
+  const slice = text.search(SLICING_STEP);
+
+  if (slice < 0) {
+    return false;
+  }
+
+  const ordered = text.indexOf('.order(');
+
+  return ordered < 0 || slice < ordered;
+};
 
 const etypes = (r: () => number): string[] =>
   pick(r, [
@@ -444,13 +472,22 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
       // engines' "order is unspecified" rule — like SQL without ORDER BY). What
       // IS the contract is WHICH elements come back and HOW MANY, so compare
       // those shapes as a multiset. A duplicated multi-type edge still shows up.
-      const unordered = MULTI_TYPE_STEP.test(text) && !text.includes('.order(');
+      const multiType = MULTI_TYPE_STEP.test(text);
+      const unordered = multiType && !text.includes('.order(');
 
       // A positional slice of an unspecified order picks an unspecified SUBSET,
       // and every step after it inherits that — not just the order but which
       // elements, and so the row count too. Nothing survives as a contract, so
       // these are skipped rather than compared. Counted, not silent.
-      if (unordered && SLICING_STEP.test(text)) {
+      //
+      // A later `order()` does NOT rescue it, which is why this asks about the
+      // slice's POSITION rather than reusing `unordered` (that flag is switched
+      // off by an `order()` anywhere in the text). Sorting an unspecified subset
+      // gives a specified order over the wrong elements:
+      // `outE('CREATED','KNOWS').skip(2).order().by(desc)` returned one edge from
+      // each engine and they were DIFFERENT edges — a false divergence, and the
+      // reason this suite went red about one run in fifteen.
+      if (multiType && slicedBeforeOrdering(text)) {
         skippedUnordered += 1;
 
         continue;

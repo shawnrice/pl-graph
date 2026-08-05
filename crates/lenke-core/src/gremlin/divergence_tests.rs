@@ -2690,3 +2690,70 @@ fn an_edge_source_plan_is_gated_on_the_order_being_unobservable() {
     // better, and the pattern branch runs first.
     assert_eq!(compiled("g.E().has('w', 1).count()"), None);
 }
+
+/// `order()` places NULLS FIRST and never faults on them.
+///
+/// TinkerPop splits Comparability from Orderability, and only the first rejects
+/// a null. `GremlinValueComparator.ORDERABILITY` is explicit:
+///
+/// ```text
+///   // nulls first
+///   if (f == null || s == null)
+///       return f == s ? 0 : f == null ? -1 : 1;
+/// ```
+///
+/// This engine has the same split — `gcmp` for predicates, `gcmp_total` for
+/// `order()`, where `gval_type_rank` puts `Null` at 0 — but the TS engine used
+/// its PREDICATE comparator for sorting too, and that one has no null arm, so it
+/// threw "cannot order null with null" where this sorted. Any traversal that
+/// orders a stream with a missing property hit it; the gremlin differential
+/// fuzzer found it through `path().id().order()`.
+///
+/// Nulls FIRST, not last. Nulls-last is the ISO contract GQL follows, and
+/// ordering is a per-language contract — the two deliberately disagree.
+#[test]
+fn ordering_places_nulls_first_without_faulting() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"n":3}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"n":1}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    // `path().id()` is null for every row (a path is not an element), unioned
+    // with real numbers so the PLACEMENT is observable and not just the absence
+    // of a fault.
+    let mixed = "g.V().union(__.values('n'), __.path().id())";
+
+    assert_eq!(
+        format!(
+            "{:?}",
+            super::parse::parse(&format!("{mixed}.order()"))
+                .unwrap()
+                .run(&mut g)
+        ),
+        "[Null, Null, Num(1.0), Num(3.0)]"
+    );
+
+    // Descending reverses the comparator, so the nulls go to the end — they are
+    // the bottom of one total order, not pinned to an end like GQL's nulls.
+    assert_eq!(
+        format!(
+            "{:?}",
+            super::parse::parse(&format!("{mixed}.order().by(desc)"))
+                .unwrap()
+                .run(&mut g)
+        ),
+        "[Num(3.0), Num(1.0), Null, Null]"
+    );
+
+    // And it is not a fault — `run` would swallow one, so ask `try_run`.
+    let t = super::parse::parse(&format!("{mixed}.order()")).unwrap();
+
+    assert!(
+        crate::gremlin::try_run(&mut g, &t).is_ok(),
+        "ordering a null must not fault"
+    );
+}
