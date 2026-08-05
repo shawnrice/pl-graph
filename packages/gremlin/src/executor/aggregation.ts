@@ -2,7 +2,7 @@ import type { Graph } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
 import type { By } from '../ast.js';
-import { compareValues } from '../predicates.js';
+import { compareTotal } from '../predicates.js';
 import {
   evalBy,
   extend,
@@ -68,7 +68,7 @@ export const aggregateComparable = function* (
       best = t.value;
       sawNonNull = true;
     } else {
-      const c = compareValues(t.value, best);
+      const c = compareTotal(t.value, best);
 
       if (kind === 'min' ? c < 0 : c > 0) {
         best = t.value;
@@ -149,7 +149,7 @@ const reduceComparable = (items: readonly unknown[], kind: 'min' | 'max'): unkno
       continue;
     }
 
-    const c = compareValues(x, best);
+    const c = compareTotal(x, best);
 
     if (kind === 'min' ? c < 0 : c > 0) {
       best = x;
@@ -177,7 +177,7 @@ const sortByBys = <T>(
   }));
   keyed.sort((a, b) => {
     for (let i = 0; i < bys.length; i++) {
-      const c = compareValues(a.keys[i], b.keys[i]) * (dirs[i] === 'desc' ? -1 : 1);
+      const c = compareTotal(a.keys[i], b.keys[i]) * (dirs[i] === 'desc' ? -1 : 1);
 
       if (c !== 0) {
         return c;
@@ -242,7 +242,7 @@ export const orderLocalStep = function* (
 
       keyed.sort((a, b) => {
         for (let i = 0; i < bys.length; i++) {
-          const c = compareValues(a.keys[i], b.keys[i]) * (dirs[i] === 'desc' ? -1 : 1);
+          const c = compareTotal(a.keys[i], b.keys[i]) * (dirs[i] === 'desc' ? -1 : 1);
 
           if (c !== 0) {
             return c;

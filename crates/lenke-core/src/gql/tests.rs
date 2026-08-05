@@ -11443,6 +11443,82 @@ fn every_count_shortcut_agrees_on_multi_label_edges() {
     }
 }
 
+/// A computed NaN sorts LAST, and it is the sort that has to say so.
+///
+/// The fast-vs-boxed comparison next door is an internal-consistency oracle: it
+/// passes whenever the two paths agree, including when both are wrong. This
+/// pins the answer itself.
+///
+/// It was wrong. `cmp_total` compared a NaN Equal to every number while the
+/// numbers stayed ordered among themselves — not a total order — so
+/// `ORDER BY x DESC` returned `NaN, 2, NaN, 3`: every adjacent pair compared
+/// Equal, and the stable sort left the rows where it found them. The TS engine
+/// scrambled the same input differently (`null, 3, 2, null`), because its
+/// comparator fell through to `x < y` / `x > y`, both false, giving 0. We own
+/// the comparator and not the sort ALGORITHM, so only a TOTAL order makes the
+/// two agree. It was also the one input that could ABORT the process: Rust's
+/// sort detects the inconsistency and panics.
+///
+/// NaN is the GREATEST value, not an absolute-last like null, so DESC puts it
+/// first — matching `Double.compareTo` and SQL float order.
+#[test]
+fn a_computed_nan_sorts_last() {
+    let lines: Vec<String> = [-1, 4, -9, 9]
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            format!(r#"{{"type":"node","id":"n{i}","labels":["P"],"properties":{{"m":{m}}}}}"#)
+        })
+        .collect();
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    for (query, want) in [
+        (
+            "MATCH (n:P) RETURN sqrt(n.m) AS x ORDER BY x",
+            "[[Num(2.0)], [Num(3.0)], [Num(NaN)], [Num(NaN)]]",
+        ),
+        (
+            "MATCH (n:P) RETURN sqrt(n.m) AS x ORDER BY x DESC",
+            "[[Num(NaN)], [Num(NaN)], [Num(3.0)], [Num(2.0)]]",
+        ),
+        // A LIMIT takes the top-k path, which must read the same order.
+        (
+            "MATCH (n:P) RETURN sqrt(n.m) AS x ORDER BY x LIMIT 2",
+            "[[Num(2.0)], [Num(3.0)]]",
+        ),
+        (
+            "MATCH (n:P) RETURN sqrt(n.m) AS x ORDER BY x DESC LIMIT 2",
+            "[[Num(NaN)], [Num(NaN)]]",
+        ),
+        // Both halves of the NaN split in one query. `nullif` compares with
+        // PREDICATE equality, where NaN = NaN is UNKNOWN, so the NaN rows are
+        // NOT nulled while the real numbers are. Then the SORT uses the total
+        // order, where NaN == NaN and is greatest — so under DESC the surviving
+        // NaNs come first and the nulls stay last, null placement being absolute
+        // rather than direction-relative.
+        (
+            "MATCH (n:P) RETURN nullif(sqrt(n.m), sqrt(n.m)) AS x ORDER BY x DESC",
+            "[[Num(NaN)], [Num(NaN)], [Null], [Null]]",
+        ),
+    ] {
+        assert_eq!(
+            format!("{:?}", rows(&mut g, query)),
+            want,
+            "`{query}` did not sort a computed NaN last"
+        );
+
+        // The scalar driver has to agree — it is a different comparator call site.
+        assert_eq!(
+            format!(
+                "{:?}",
+                super::eval::with_vec_override(false, || rows(&mut g, query))
+            ),
+            want,
+            "the scalar driver disagreed on `{query}`"
+        );
+    }
+}
+
 /// A merged multi-pattern first clause agrees with the scalar driver.
 ///
 /// `vectorized_linear` used to refuse any first `MATCH` with more than one

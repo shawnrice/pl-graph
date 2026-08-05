@@ -243,6 +243,61 @@ pub enum Value {
     Map(Vec<(Arc<str>, Self)>),
 }
 
+impl Value {
+    /// Whether this value holds a NaN or ±Infinity, anywhere — including nested
+    /// inside a list or map. The read side of [`Self::finite_only`].
+    #[must_use]
+    pub fn has_non_finite(&self) -> bool {
+        match self {
+            Self::Num(n) => !n.is_finite(),
+            Self::List(xs) => xs.iter().any(Self::has_non_finite),
+            Self::Map(fs) => fs.iter().any(|(_, v)| v.has_non_finite()),
+            _ => false,
+        }
+    }
+
+    /// Replace every non-finite number with [`Self::Null`], recursing into lists
+    /// and maps. Returns `self` untouched — no walk past the check, no
+    /// allocation — when there is nothing to replace, which is every ordinary
+    /// write.
+    ///
+    /// NaN and ±Infinity are not values in the LPG numeric model. Every *codec*
+    /// entry point already says so (`codec::json_to_value`, `ndjson`, `csv`,
+    /// `pg_text`) and states why: storing a real non-finite "would silently
+    /// corrupt count/sum/min/max/`IS NULL`/comparisons and diverge from TS".
+    /// `Column::Num` goes further and uses NaN as its own ABSENT sentinel, so a
+    /// stored NaN aliases the one bit pattern the column reserves.
+    ///
+    /// The *computed*-write paths did not honor it. `SET n.k = sqrt(-1)` stored
+    /// a live NaN in native while the TS engine stored null — measured on every
+    /// shape: INSERT properties, SET on a vertex and on an edge, `exp(1000)`
+    /// for the ±Infinity side, and nested one level inside a list and a map. A
+    /// byte-identity divergence the differential fuzzer does not reach, because
+    /// it fuzzes reads. (Non-finite *literals* were never a hole: `1e400` is
+    /// rejected by the lexer and `x/0` throws.)
+    ///
+    /// A stored NaN was also the one input that could ABORT the process: it
+    /// makes `gql::eval::cmp_total` non-total — NaN compares Equal to every
+    /// number while the numbers stay ordered among themselves — and Rust's sort
+    /// detects that and panics. Coercing at the write removes the input rather
+    /// than papering over the comparator; ordering NaN last would fix the sort
+    /// but break byte-identity, since the TS comparator treats NaN as unordered
+    /// too (measured: the differential fuzzer failed on every seed).
+    #[must_use]
+    pub fn finite_only(self) -> Self {
+        if !self.has_non_finite() {
+            return self;
+        }
+
+        match self {
+            Self::Num(_) => Self::Null,
+            Self::List(xs) => Self::List(xs.into_iter().map(Self::finite_only).collect()),
+            Self::Map(fs) => Self::Map(fs.into_iter().map(|(k, v)| (k, v.finite_only())).collect()),
+            other => other,
+        }
+    }
+}
+
 /// A typed property column. Length == its store's element count.
 #[derive(Clone, Debug)]
 pub enum Column {

@@ -1463,8 +1463,22 @@ fn an_is_filter_after_values_matches_the_walk() {
     }
 }
 
+/// The lowered column terminals are safe because a numeric column CANNOT hold a
+/// NaN — not because they each handle one.
+///
+/// They read `Column::Num` straight out of the store and answer `min`/`max`/an
+/// ordering `is` from it, skipping the stream's comparator entirely. That is
+/// only sound while the column has no NaN in it, and the store now guarantees
+/// that: every write coerces a non-finite to null (`Value::finite_only`), so the
+/// question the fast paths skip cannot arise. `Column::Num` already relied on
+/// this in the other direction, using NaN as its own ABSENT sentinel.
+///
+/// Before that coercion the guarantee did not hold — `SET x = sqrt(-1)` stored a
+/// live NaN — and this test used to construct one and assert each terminal
+/// declined. Asserting the invariant is the stronger statement: it is what makes
+/// the declines unnecessary.
 #[test]
-fn a_nan_in_the_column_keeps_the_ordering_terminals_on_the_stream() {
+fn a_numeric_column_cannot_hold_a_nan() {
     let mut graph = crate::ndjson::decode(
         &[
             r#"{"type":"node","id":"a","labels":["P"],"properties":{"n":3}}"#,
@@ -1474,27 +1488,47 @@ fn a_nan_in_the_column_keeps_the_ordering_terminals_on_the_stream() {
     )
     .expect("fixture decodes");
 
+    // Every route into the store, including the one a query cannot take.
     graph.set_vertex_prop(1, "n", crate::graph::Value::Num(f64::NAN));
+    graph.set_vertex_prop(0, "n", crate::graph::Value::Num(f64::INFINITY));
 
-    // `partial_cmp` has no answer for a NaN, so `cmp_or_fault` flags a type
-    // fault: `min`/`max` and an ordering `is` THROW through the stream. Reading
-    // the column instead would answer where the query is supposed to fail.
-    for t in [
-        g().v_ids(&[]).values(&["n"]).min(),
-        g().v_ids(&[]).values(&["n"]).max(),
-        g().v_ids(&[]).values(&["n"]).is(P::gt(1.0)).count(),
-    ] {
-        assert!(crate::gremlin::try_run(&mut graph, &t).is_err());
+    // The coerced null DE-BOXES the column to `Mixed`, exactly as an explicit
+    // `SET n = null` does — measured, same result for both — so a computed
+    // non-finite costs what writing a null costs and nothing more. Check the
+    // invariant against whichever representation it landed in.
+    match graph.props.col("n") {
+        Some(crate::graph::Column::Num { data, present }) => {
+            for (i, x) in data.iter().enumerate() {
+                assert!(
+                    !present.get(i) || x.is_finite(),
+                    "row {i} of a live numeric column holds {x}"
+                );
+            }
+        }
+        Some(crate::graph::Column::Mixed { data }) => {
+            for (i, v) in data.iter().enumerate() {
+                assert!(
+                    !matches!(v, Some(crate::graph::Value::Num(x)) if !x.is_finite()),
+                    "row {i} of a boxed column holds {v:?}"
+                );
+            }
+        }
+        other => panic!("`n` is not a value column: {other:?}"),
     }
 
-    // `sum`/`mean` do not order, so a NaN just propagates — both paths agree.
+    // And it reads back as null, not as an absent property with a stale value.
     for t in [
-        g().v_ids(&[]).values(&["n"]).sum(),
-        g().v_ids(&[]).values(&["n"]).mean(),
+        g().v_ids(&[]).values(&["n"]).count(),
+        g().v_ids(&[]).values(&["n"]).min(),
+        g().v_ids(&[]).values(&["n"]).max(),
     ] {
         let stream = vals(&mut graph, t.clone().identity());
 
-        assert_eq!(vals(&mut graph, t), stream);
+        assert_eq!(
+            vals(&mut graph, t),
+            stream,
+            "the column disagreed with the walk"
+        );
     }
 }
 

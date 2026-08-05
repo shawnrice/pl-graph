@@ -63,6 +63,39 @@ const cmpOrd = (x: number | string, y: number | string): number => {
  * throws (mirroring TinkerPop's `ClassCastException`) rather than coercing to a
  * misleading boolean. Returns a negative / zero / positive number.
  */
+/**
+ * The SORT/aggregate comparator — a genuine total order, where `compareValues`
+ * is the PREDICATE one and is deliberately partial.
+ *
+ * The two must not be the same function. `compareValues` returns `NaN` for a
+ * NaN operand so that `is(gt(0))` filters it, which is right for a predicate;
+ * but `Array.prototype.sort` reads a `NaN` comparator result as 0, making the
+ * order non-total. We own the comparator and not the sort ALGORITHM (V8's
+ * `Array.sort` is not Rust's `slice::sort_by`), so that let the algorithm leak:
+ * `values('m').math('sqrt _').order()` over ten values returned them scattered
+ * here (`[NaN,2,NaN,3,4,NaN,5,NaN,1,NaN]`) while native returned every NaN
+ * first — same input, two different answers.
+ *
+ * NaN is the GREATEST value and equals itself, either sign, so `max()` keeps it
+ * and `min()` never picks one. Mirrors the Rust `gcmp_total`.
+ */
+export const compareTotal = (a: unknown, b: unknown): number => {
+  if (typeof a === 'number' && typeof b === 'number') {
+    const aNaN = Number.isNaN(a);
+    const bNaN = Number.isNaN(b);
+
+    if (aNaN || bNaN) {
+      if (aNaN && bNaN) {
+        return 0;
+      }
+
+      return aNaN ? 1 : -1;
+    }
+  }
+
+  return compareValues(a, b);
+};
+
 export const compareValues = (a: unknown, b: unknown): number => {
   if (typeof a === 'number' && typeof b === 'number') {
     // NaN is unordered: in JS every comparison with NaN is false, so a NaN

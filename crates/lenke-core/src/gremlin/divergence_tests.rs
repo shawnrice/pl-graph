@@ -1049,87 +1049,156 @@ fn a_lowered_dedup_matches_the_streamed_one() {
     );
 }
 
-/// A NaN can be COMPUTED into a stored property, and then every column terminal
-/// has to treat it the way the stream does.
+/// A computed non-finite never reaches storage — it is coerced to null at the
+/// write, in every shape that can produce one.
 ///
-/// It cannot be ingested — `NaN` is normalized to null at every entry point —
-/// so "a stored property is never NaN" reads as true and is not: `SET x =
-/// sqrt(-1)` stores one, as do `asin(2)`, `acos(2)` and `power(-1, 0.5)`.
+/// The codecs always said so ("storing a real non-finite would silently corrupt
+/// count/sum/min/max/`IS NULL` and diverge from TS"), and `Column::Num` goes
+/// further by using NaN as its own ABSENT sentinel. The *computed*-write paths
+/// did not honor it: every one of these stored a live NaN in native while the
+/// TS engine stored null. The differential fuzzer cannot see it because it
+/// fuzzes reads.
 ///
-/// It matters most for `dedup`, because a NaN has NO dedup key and so is never a
-/// duplicate — the stream keeps every one. The lowered numeric path keys on raw
-/// bits, which collapsed them all into one: `dedup().count()` was 1 where the
-/// stream said 2.
+/// This is also what keeps the lowered column terminals safe. They read
+/// `Column::Num` directly, so "a numeric column never holds a NaN" is the
+/// premise under which their ordering fast paths are allowed to skip the
+/// NaN-vs-number question entirely.
 #[test]
-fn a_computed_nan_column_matches_the_stream_in_every_terminal() {
-    let mut g = crate::ndjson::decode(
-        &[
-            r#"{"type":"node","id":"a","labels":["V"],"properties":{"m":-1}}"#,
-            r#"{"type":"node","id":"b","labels":["V"],"properties":{"m":-1}}"#,
-            r#"{"type":"node","id":"c","labels":["V"],"properties":{"m":4}}"#,
-        ]
-        .join("\n"),
-    )
-    .expect("fixture decodes");
-
-    // Compute the column: two NaNs (sqrt of a negative) and one real number.
-    crate::gql::prepare("MATCH (a:V) SET a.x = sqrt(a.m)")
-        .expect("plans")
-        .execute(&mut g, &crate::gql::eval::Params::new())
-        .expect("runs");
-
-    let run = |src: &str, g: &mut crate::graph::Graph| {
-        super::parse::parse(src)
-            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
-            .run(g)
+fn a_computed_non_finite_never_reaches_storage() {
+    let gql = |g: &mut crate::graph::Graph, src: &str| {
+        crate::gql::prepare(src)
+            .unwrap_or_else(|e| panic!("`{src}` plans: {e}"))
+            .execute(g, &crate::gql::eval::Params::new())
+            .unwrap_or_else(|e| panic!("`{src}` runs: {e}"));
     };
 
-    for tail in [
-        "count()",
-        "sum()",
-        "mean()",
-        "min()",
-        "max()",
-        "fold()",
-        "dedup()",
-        "dedup().count()",
-        "groupCount()",
-        "is(gt(0)).count()",
-        "order()",
-        // COMPOSED tails, which peel one step and recurse. Each peel has to keep
-        // the NaN rule its direct arm has: `dedup` never keys a NaN (so every one
-        // survives) and `order` DECLINES on one (so the stream raises the fault
-        // rather than this swallowing it).
-        "dedup().limit(2)",
-        "dedup().count()",
-        "dedup().limit(2).count()",
-        "limit(2).count()",
-        "skip(1).count()",
-        "tail(2)",
-        "tail(2).count()",
-        "range(0, 2).count()",
-        "limit(2).fold()",
-        "dedup().order()",
-        "order().count()",
-        "order().by(desc).count()",
-        "order().limit(2).count()",
+    for (setup, write, read, want) in [
+        // NaN, every element the write paths can touch.
+        (
+            "",
+            "INSERT (:V {x: sqrt(-1)})",
+            "MATCH (n:V) RETURN n.x",
+            "[[Null]]",
+        ),
+        (
+            "INSERT (:V {x: 1})",
+            "MATCH (n:V) SET n.x = sqrt(-1)",
+            "MATCH (n:V) RETURN n.x",
+            "[[Null]]",
+        ),
+        (
+            "INSERT (:A)-[:R {w: 1}]->(:B)",
+            "MATCH ()-[e:R]->() SET e.w = sqrt(-1)",
+            "MATCH ()-[e:R]->() RETURN e.w",
+            "[[Null]]",
+        ),
+        // ±Infinity is the same rule. (`1e400` cannot get this far — the lexer
+        // rejects the literal — and `x / 0` throws, so `exp` is the way in.)
+        (
+            "INSERT (:V {x: 1})",
+            "MATCH (n:V) SET n.x = exp(1000)",
+            "MATCH (n:V) RETURN n.x",
+            "[[Null]]",
+        ),
+        // NESTED, which a scalar-only check would miss.
+        (
+            "",
+            "INSERT (:V {x: [sqrt(-1), 2]})",
+            "MATCH (n:V) RETURN n.x",
+            "[[List([Null, Num(2.0)])]]",
+        ),
+        (
+            "INSERT (:V {x: 1})",
+            "MATCH (n:V) SET n.x = {a: sqrt(-1)}",
+            "MATCH (n:V) RETURN n.x",
+            "[[Map([(\"a\", Null)])]]",
+        ),
     ] {
-        let lowered = run(&format!("g.V().values('x').{tail}"), &mut g);
-        let streamed = run(&format!("g.V().values('x').barrier().{tail}"), &mut g);
+        let mut g = crate::ndjson::decode("").expect("an empty graph decodes");
 
-        assert_eq!(
-            format!("{lowered:?}"),
-            format!("{streamed:?}"),
-            "`values('x').{tail}` over a NaN column disagrees with the stream"
-        );
+        if !setup.is_empty() {
+            gql(&mut g, setup);
+        }
+
+        gql(&mut g, write);
+
+        let got = crate::gql::prepare(read)
+            .expect("plans")
+            .execute(&mut g, &crate::gql::eval::Params::new())
+            .expect("runs");
+        let got: Vec<Vec<_>> = got.rows().map(<[_]>::to_vec).collect();
+
+        assert_eq!(format!("{got:?}"), want, "`{write}` stored a non-finite");
     }
 
-    // The one that actually broke: each NaN is its own value, so three rows
-    // deduplicate to three, not to two.
+    // The graph API is the same boundary — the FFI reaches it without a query.
+    let mut g =
+        crate::ndjson::decode(r#"{"type":"node","id":"a","labels":["P"],"properties":{"n":3}}"#)
+            .expect("fixture decodes");
+
+    g.set_vertex_prop(0, "n", crate::graph::Value::Num(f64::NAN));
+
     assert_eq!(
-        run("g.V().values('x').dedup().count()", &mut g),
-        vec![GVal::Num(3.0)],
-        "a NaN is never a duplicate, so both survive alongside the real number"
+        g.props.value(0, "n", &g.strs),
+        crate::graph::Value::Null,
+        "the graph setter stored a NaN"
+    );
+}
+
+/// A NaN can still be COMPUTED into a stream — `math()` makes one — and there it
+/// obeys the sort/aggregate policy: a TOTAL order with NaN greatest.
+///
+/// Both halves matter and each broke differently. `order()` disagreed across
+/// engines (native put every NaN first, because `f64::total_cmp` is sign-aware
+/// and `sqrt(-1)` is a NEGATIVE NaN; TS left them scattered, because its sort
+/// comparator returned `NaN`, which `Array.sort` reads as 0). And `min()`
+/// returned a NaN in native, because the partial comparator answers `None`
+/// against one — never the wanted ordering — so whichever NaN arrived first held
+/// `best` forever.
+#[test]
+fn a_computed_nan_sorts_last_and_never_wins_min() {
+    let lines: Vec<String> = [-1, 4, -9, 9, 16, -4, 25, -16, 1, -25]
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            format!(r#"{{"type":"node","id":"v{i}","labels":["V"],"properties":{{"m":{m}}}}}"#)
+        })
+        .collect();
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    let run = |src: &str, g: &mut crate::graph::Graph| {
+        format!(
+            "{:?}",
+            super::parse::parse(src)
+                .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+                .run(g)
+        )
+    };
+
+    // Five NaNs and five reals. NaN LAST under ASC...
+    assert_eq!(
+        run("g.V().values('m').math('sqrt _').order()", &mut g),
+        "[Num(1.0), Num(2.0), Num(3.0), Num(4.0), Num(5.0), \
+         Num(NaN), Num(NaN), Num(NaN), Num(NaN), Num(NaN)]"
+    );
+
+    // ...and FIRST under DESC, because NaN is the greatest VALUE rather than an
+    // absolute-last like null. Reversing the comparator is all it takes.
+    assert_eq!(
+        run("g.V().values('m').math('sqrt _').order().by(desc)", &mut g),
+        "[Num(NaN), Num(NaN), Num(NaN), Num(NaN), Num(NaN), \
+         Num(5.0), Num(4.0), Num(3.0), Num(2.0), Num(1.0)]"
+    );
+
+    // The same order, read by the aggregates: greatest means `max` keeps it and
+    // `min` never picks it.
+    assert_eq!(
+        run("g.V().values('m').math('sqrt _').max()", &mut g),
+        "[Num(NaN)]"
+    );
+    assert_eq!(
+        run("g.V().values('m').math('sqrt _').min()", &mut g),
+        "[Num(1.0)]"
     );
 }
 

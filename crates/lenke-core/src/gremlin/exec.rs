@@ -3014,8 +3014,7 @@ fn gval_type_rank(v: &GVal) -> u8 {
 /// input. It AGREES with `gcmp` on every comparable pair (numbers by value, same-
 /// kind temporals chronologically, …), so a homogeneous stream sorts identically;
 /// for incomparable pairs (cross-type, NaN, cross-kind temporal) it falls back to a
-/// deterministic order (type-rank, then a within-type total order — `f64::total_cmp`
-/// puts NaN last). `order()` still records a type fault for those pairs via
+/// deterministic order (type-rank, then a within-type total order, NaN last). `order()` still records a type fault for those pairs via
 /// `cmp_or_fault`, so `try_run` surfaces the error and this tie-break order is never
 /// observed there; it only makes the infallible `run` path deterministic.
 fn gcmp_total(a: &GVal, b: &GVal) -> Ordering {
@@ -3025,7 +3024,20 @@ fn gcmp_total(a: &GVal, b: &GVal) -> Ordering {
     }
     match (a, b) {
         (GVal::Bool(x), GVal::Bool(y)) => x.cmp(y),
-        (GVal::Num(x), GVal::Num(y)) => x.total_cmp(y),
+        // NaN LAST and NaN == NaN, either sign — the settled sort/aggregate
+        // policy. `total_cmp` alone does NOT give that: it is sign-aware, so a
+        // NEGATIVE NaN sorts before -inf, and `sqrt(-1)` produces exactly that
+        // on x86. Measured, `values('m').math('sqrt _').order()` put the NaNs
+        // FIRST here while the TS engine (whose sort comparator returned NaN,
+        // which `Array.sort` reads as 0) left them scattered — same input, two
+        // different answers. `total_cmp` still handles the finite pairs, so
+        // `-0.0 < 0.0` is unchanged.
+        (GVal::Num(x), GVal::Num(y)) => match (x.is_nan(), y.is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => x.total_cmp(y),
+        },
         (GVal::Str(x), GVal::Str(y)) => x.as_ref().cmp(y.as_ref()),
         (GVal::Temporal(x), GVal::Temporal(y)) => x.cmp_total(y),
         (GVal::Node(x), GVal::Node(y)) | (GVal::Edge(x), GVal::Edge(y)) => x.cmp(y),
@@ -4738,7 +4750,20 @@ fn fold_extreme(stream: Vec<Trav>, want: Ordering) -> Vec<Trav> {
         best = Some(match best {
             None => t.val,
             Some(b) => {
-                if cmp_or_fault(&t.val, &b) == Some(want) {
+                // `gcmp_total`, not `cmp_or_fault`: min/max are AGGREGATES, and
+                // the settled policy gives those a total order (NaN greatest,
+                // NaN == NaN) while predicates stay partial. Under the partial
+                // comparator a NaN was STICKY — `partial_cmp` answers None
+                // against it, which is never `want`, so whichever NaN arrived
+                // first held `best` forever and `min()` returned it. Measured
+                // over `math('sqrt _')` output: native NaN, TS 1.
+                //
+                // Cross-type pairs still fault: `cmp_or_fault` is called for the
+                // side effect, and its answer is only used to keep the previous
+                // behavior where it HAD one.
+                let faultable = cmp_or_fault(&t.val, &b);
+
+                if faultable.unwrap_or_else(|| gcmp_total(&t.val, &b)) == want {
                     t.val
                 } else {
                     b

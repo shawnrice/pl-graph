@@ -883,7 +883,29 @@ fn cmp_total(a: &Val, b: &Val) -> Ordering {
         return ra.cmp(&rb);
     }
     match (a, b) {
-        (Val::Num(x), Val::Num(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        // NaN is the GREATEST value and equals itself. Not an absolute-last like
+        // null: it is an ordinary member of the total order sitting at the top,
+        // so DESC puts it first and `max()` keeps it, matching Java's
+        // `Double.compareTo` and SQL's float order.
+        //
+        // This has to be TOTAL. We own the comparator but not the sort
+        // ALGORITHM (V8 `Array.sort` is not Rust's `slice::sort_by`), so an
+        // "unordered" NaN — Equal to every number while the numbers stay ordered
+        // among themselves — lets the algorithm leak: `RETURN sqrt(n.m) AS v
+        // ORDER BY v DESC` returned `NaN, 2, NaN, 3` in native against
+        // `null, 3, 2, null` in TS, because every adjacent pair compared Equal
+        // and native's stable sort left the row order alone. It is also the one
+        // input that could ABORT the process — Rust's sort detects the
+        // inconsistency (`a == b`, `b < c`, `a == c`) and panics.
+        //
+        // Reachable through a projection (`sqrt(-1)`), not through storage: a
+        // stored non-finite is coerced to null at the write (`Value::finite_only`).
+        (Val::Num(x), Val::Num(y)) => match (x.is_nan(), y.is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        },
         (Val::Str(x), Val::Str(y)) => x.cmp(y),
         (Val::Bool(x), Val::Bool(y)) => x.cmp(y),
         (Val::Temporal(x), Val::Temporal(y)) => x.cmp_total(y),

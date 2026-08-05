@@ -613,6 +613,14 @@ impl Graph {
         labels: &[String],
         props: Vec<(String, Value)>,
     ) -> u32 {
+        // NaN/±Infinity are not values in the LPG numeric model, and every codec
+        // entry point already coerces them. This is the *computed*-write side of
+        // the same contract — see `Value::finite_only`. Free when there is
+        // nothing to coerce, which is every ordinary write.
+        let props: Vec<(String, Value)> = props
+            .into_iter()
+            .map(|(k, v)| (k, v.finite_only()))
+            .collect();
         let vi = self.vid.intern(id);
         debug_assert_eq!(vi as usize, self.n, "add_vertex_with_id expects a fresh id");
         self.v_live.push(true);
@@ -675,6 +683,14 @@ impl Graph {
         labels: &[&str],
         props: Vec<(String, Value)>,
     ) -> u32 {
+        // NaN/±Infinity are not values in the LPG numeric model, and every codec
+        // entry point already coerces them. This is the *computed*-write side of
+        // the same contract — see `Value::finite_only`. Free when there is
+        // nothing to coerce, which is every ordinary write.
+        let props: Vec<(String, Value)> = props
+            .into_iter()
+            .map(|(k, v)| (k, v.finite_only()))
+            .collect();
         let ei = self.e_src.len() as u32;
         let mut ids: Vec<u32> = Vec::with_capacity(labels.len().max(1));
 
@@ -772,6 +788,12 @@ impl Graph {
     }
 
     pub fn set_vertex_prop(&mut self, vi: u32, key: &str, v: Value) {
+        // NaN/±Infinity are not values in the LPG numeric model, and every codec
+        // entry point already coerces them. This is the *computed*-write side of
+        // the same contract — see `Value::finite_only`. Free when there is
+        // nothing to coerce, which is every ordinary write.
+        let v = v.finite_only();
+
         if self.tx_active() {
             let prior = if self.props.is_present(vi as usize, key) {
                 Some(self.props.value(vi as usize, key, &self.strs))
@@ -812,6 +834,12 @@ impl Graph {
         self.touch(key);
     }
     pub fn set_edge_prop(&mut self, ei: u32, key: &str, v: Value) {
+        // NaN/±Infinity are not values in the LPG numeric model, and every codec
+        // entry point already coerces them. This is the *computed*-write side of
+        // the same contract — see `Value::finite_only`. Free when there is
+        // nothing to coerce, which is every ordinary write.
+        let v = v.finite_only();
+
         if self.tx_active() {
             let prior = if self.edge_props.is_present(ei as usize, key) {
                 Some(self.edge_props.value(ei as usize, key, &self.strs))

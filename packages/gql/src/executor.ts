@@ -1476,6 +1476,34 @@ const compareValues = (a: unknown, b: unknown): number => {
     return compareCodePoints(x, y);
   }
 
+  // NaN is the GREATEST value and equals itself. Not an absolute-last like null:
+  // it is an ordinary member of the total order sitting at the top, so DESC puts
+  // it first and `max()` keeps it — Java's `Double.compareTo` and SQL's float
+  // order. Mirrors the Rust `cmp_total`.
+  //
+  // Without this, both `x < y` and `x > y` are false and the fallthrough returns
+  // 0, making the comparator NON-total. We own the comparator but not the sort
+  // ALGORITHM (V8 `Array.sort` is not Rust's `slice::sort_by`), so that let the
+  // algorithm leak: `RETURN sqrt(n.m) AS v ORDER BY v DESC` returned
+  // `null, 3, 2, null` here against `NaN, 2, NaN, 3` in native, for the same
+  // input. Every other type in this function already commits to a total order;
+  // numbers were the one that fell through.
+  //
+  // Reachable through a projection (`sqrt(-1)`), not through storage: a stored
+  // non-finite is coerced to null at the write.
+  if (typeof x === 'number' && typeof y === 'number') {
+    const xNaN = Number.isNaN(x);
+    const yNaN = Number.isNaN(y);
+
+    if (xNaN || yNaN) {
+      if (xNaN && yNaN) {
+        return 0;
+      }
+
+      return xNaN ? 1 : -1;
+    }
+  }
+
   if (x < y) {
     return -1;
   }
