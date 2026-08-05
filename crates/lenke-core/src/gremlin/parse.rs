@@ -9,7 +9,7 @@
 //! predicate (`gt(30)`, `within('a','b')`), a token (`T.label`, `Order.desc`,
 //! `Pop.first`, `Scope.local`), or a nested traversal (`__.out().count()`).
 
-use super::{Column, GVal, Order, Pop, Step, Token, Traversal, __, P};
+use super::{Column, GVal, Order, Pop, Scope, Step, Token, Traversal, __, P};
 use crate::temporal::{Date, DateTime, Duration, Temporal, Time, ZonedDateTime, ZonedTime};
 
 // --- lexer ------------------------------------------------------------------
@@ -726,8 +726,33 @@ impl Parser {
                 }
             }
             "fold" => t.fold(),
-            "order" if scope_local(&args) => t.order_local(),
-            "order" => t.order(),
+            "order" => {
+                // `order()` takes a Scope in TinkerPop and the direction goes in
+                // the modulator, but `order(desc)` is written often enough that
+                // the parser already turned `desc` into an `Arg::Order` — and
+                // then this arm DROPPED it, so the traversal sorted ascending
+                // and said nothing. Honor it, and refuse anything else rather
+                // than ignore that too.
+                let scope = if scope_local(&args) {
+                    Scope::Local
+                } else {
+                    Scope::Global
+                };
+                let mut dir = Order::Asc;
+
+                for a in &args {
+                    match a {
+                        Arg::Order(d) => dir = *d,
+                        Arg::Str(s) if s == "Scope.local" || s == "Scope.global" => {}
+                        _ => return Err(
+                            "order: expected a scope (local/global) and/or a direction (asc/desc)"
+                                .into(),
+                        ),
+                    }
+                }
+
+                t.order_dir(dir, scope)
+            }
             "group" => t.group(),
             "groupCount" => t.group_count(),
             // combinators

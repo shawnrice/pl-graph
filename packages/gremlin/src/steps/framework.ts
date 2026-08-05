@@ -82,6 +82,9 @@ const ORDER_TO_DIR: ReadonlyMap<symbol, 'asc' | 'desc'> = new Map([
   [Order.desc, 'desc'],
 ]);
 
+/** The direction an `Order` symbol names, or `undefined` if it is not one. */
+export const orderDirOf = (s: symbol): 'asc' | 'desc' | undefined => ORDER_TO_DIR.get(s);
+
 // TinkerPop `Operator` merge functions for `sack(op).by(...)`: `newSack =
 // op(currentSack, projectedValue)`. `assign` replaces; the rest fold numerically.
 export const Operator = {

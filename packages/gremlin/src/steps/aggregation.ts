@@ -2,6 +2,7 @@ import {
   appendStep,
   type ByableStep,
   makeByable,
+  orderDirOf,
   scopeTokenOf,
   type Step,
   type StepFn,
@@ -39,7 +40,7 @@ export function mean(scope?: symbol): StepFn {
 // `order(Scope.local)` sorts WITHIN each traverser's value (a group Map's
 // entries by value, or a list's elements) instead of across the stream — e.g.
 // `groupCount().by(x).order(Scope.local).by(Order.desc)` for a top-N ranking.
-export function order(scope: symbol): ByableStep<Extract<Step, { kind: 'order' }>>;
+export function order(scopeOrDir: symbol): ByableStep<Extract<Step, { kind: 'order' }>>;
 export function order(config?: {
   key?: string;
   desc?: boolean;
@@ -47,8 +48,23 @@ export function order(config?: {
 export function order(
   arg: symbol | { key?: string; desc?: boolean } = {},
 ): ByableStep<Extract<Step, { kind: 'order' }>> {
-  const scope = typeof arg === 'symbol' ? scopeTokenOf(arg) : undefined;
-  const config = typeof arg === 'symbol' ? {} : arg;
+  // `order(desc)` is a superset — TinkerPop's `order()` takes only a Scope and
+  // the direction belongs in the modulator — accepted because it is written, and
+  // because the Rust core accepts it. There it used to PARSE the direction and
+  // then drop it, sorting ascending in silence; here it threw "Expected
+  // Scope.local or Scope.global". Both now sort descending.
+  const sym = typeof arg === 'symbol' ? arg : undefined;
+  const dir = sym === undefined ? undefined : orderDirOf(sym);
+  // Only a non-direction symbol is asked to be a scope, so an unknown one still
+  // throws "Expected Scope.local or Scope.global".
+  const scope = sym !== undefined && dir === undefined ? scopeTokenOf(sym) : undefined;
+  let config: { key?: string; desc?: boolean };
+
+  if (sym === undefined) {
+    config = arg as { key?: string; desc?: boolean };
+  } else {
+    config = dir === undefined ? {} : { desc: dir === 'desc' };
+  }
 
   return makeByable<Extract<Step, { kind: 'order' }>>((bys) => ({
     kind: 'order',

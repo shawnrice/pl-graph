@@ -2459,3 +2459,66 @@ fn equivalent_traversals_cost_the_same() {
         failures.join("\n\n")
     );
 }
+
+/// `order(desc)` sorts descending, and an argument `order` cannot honor is an
+/// error rather than a shrug.
+///
+/// TinkerPop's `order()` takes a `Scope`, not an `Order` — the direction belongs
+/// in the modulator, `order().by(desc)`. But `order(desc)` gets written, the
+/// lexer already turned `desc` into an `Arg::Order`, and the step arm then
+/// DROPPED every argument: the traversal sorted ASCENDING and reported nothing.
+/// Accepting the direction is a superset; dropping it was a wrong answer.
+///
+/// The TS engine threw `Expected Scope.local or Scope.global` here, so the two
+/// engines disagreed about the same traversal. Both now sort descending.
+#[test]
+fn an_order_direction_argument_is_honored() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"m":-1}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"m":4}}"#,
+            r#"{"type":"node","id":"c","labels":["V"],"properties":{"m":9}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let run = |src: &str, g: &mut crate::graph::Graph| {
+        format!(
+            "{:?}",
+            super::parse::parse(src)
+                .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+                .run(g)
+        )
+    };
+
+    let asc = "[Num(-1.0), Num(4.0), Num(9.0)]";
+    let desc = "[Num(9.0), Num(4.0), Num(-1.0)]";
+
+    for (src, want) in [
+        ("g.V().values('m').order()", asc),
+        ("g.V().values('m').order(asc)", asc),
+        ("g.V().values('m').order(desc)", desc),
+        // The canonical spelling, which always worked — asserted alongside so
+        // the two cannot drift apart.
+        ("g.V().values('m').order().by(desc)", desc),
+        // A scope argument still means a scope, not a direction.
+        ("g.V().values('m').order(Scope.local)", asc),
+    ] {
+        assert_eq!(run(src, &mut g), want, "`{src}`");
+    }
+
+    // `local` sorts WITHIN the traverser's value, so it needs a list to be
+    // observable at all — and it still takes a direction.
+    assert_eq!(
+        run("g.V().values('m').fold().order(local)", &mut g),
+        "[List([Num(-1.0), Num(4.0), Num(9.0)])]"
+    );
+
+    // Anything `order` cannot act on is rejected. Ignoring an argument is how
+    // the direction went missing in the first place.
+    assert!(
+        super::parse::parse("g.V().values('m').order('bogus')").is_err(),
+        "an argument order cannot honor must not be silently dropped"
+    );
+}

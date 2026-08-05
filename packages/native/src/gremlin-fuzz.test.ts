@@ -409,6 +409,7 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
   test(`${ITERATIONS} random traversals agree across the engines`, () => {
     const divergences: string[] = [];
     let skippedUnordered = 0;
+    let skippedUnbuildable = 0;
 
     for (let i = 0; i < ITERATIONS && divergences.length < 5; i++) {
       const r = mulberry32(SEED + i);
@@ -419,7 +420,15 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
         plan = genPlan(r);
         text = planToGremlin(plan);
       } catch {
-        continue; // a kind that cannot cross the text boundary — by design
+        // A kind that cannot cross the text boundary — by design. COUNTED,
+        // because this also swallows a step the builder simply refuses to
+        // construct, and those two are indistinguishable here. `order(desc)`
+        // threw for years ("Expected Scope.local or Scope.global"), so every
+        // plan the generator gave a direction to was dropped and the step was
+        // never compared against native at all.
+        skippedUnbuildable += 1;
+
+        continue;
       }
 
       const outcome = (run: () => unknown): string => {
@@ -455,6 +464,12 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
       if (ts !== native && !(ts.startsWith('ERR') && native.startsWith('ERR'))) {
         divergences.push(`[seed ${SEED + i}] ${text}\n    ts:     ${ts}\n    native: ${native}`);
       }
+    }
+
+    if (skippedUnbuildable > 0) {
+      console.log(
+        `  ${skippedUnbuildable}/${ITERATIONS} plans skipped: could not be built or emitted as text`,
+      );
     }
 
     if (skippedUnordered > 0) {

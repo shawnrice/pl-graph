@@ -696,6 +696,15 @@ impl Traversal {
     pub fn order_local(self) -> Self {
         self.push(Step::Order(vec![], false, Scope::Local))
     }
+    /// `order(desc)` / `order(local, asc)` — a direction with no `by` modulator.
+    ///
+    /// TinkerPop's `order()` takes only a `Scope`, so the direction canonically
+    /// goes in the modulator (`order().by(desc)`). Accepting it here is a
+    /// superset, added because the argument was being PARSED and then dropped:
+    /// `order(desc)` sorted ASCENDING and reported nothing.
+    pub fn order_dir(self, dir: Order, scope: Scope) -> Self {
+        self.push(Step::Order(vec![], dir == Order::Desc, scope))
+    }
     pub fn order_by(self, key: &str, dir: Order) -> Self {
         self.push(Step::Order(
             vec![By::Key(key.to_string(), Some(dir))],
