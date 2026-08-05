@@ -210,18 +210,68 @@ fn hop_of(step: &Step) -> Option<(Direction, &[String])> {
     }
 }
 
+/// A body that is NOTHING but hops, as `(direction, edge-type expression)` pairs.
+///
+/// Nothing but hops, because a filter or a projection inside the body changes
+/// what each repetition yields — the repetitions are only interchangeable while
+/// each one is a bare traversal step.
+fn plain_hops(steps: &[Step], it: &mut Interner) -> Option<Vec<(Direction, Option<CLabelExpr>)>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+
+    while i < steps.len() {
+        let (dir, types) = match (hop_of(&steps[i]), edge_hop_of(&steps[i])) {
+            (Some((d, t)), _) => {
+                i += 1;
+                (d, t)
+            }
+            // Spelled apart, the landing step is part of the hop.
+            (_, Some((d, t))) if steps.get(i + 1).is_some_and(|v| lands_far(d, v)) => {
+                i += 2;
+                (d, t)
+            }
+            _ => return None,
+        };
+
+        out.push((
+            dir,
+            if types.is_empty() {
+                None
+            } else {
+                Some(label_expr(types, it)?)
+            },
+        ));
+    }
+
+    (!out.is_empty()).then_some(out)
+}
+
 /// Compile the longest prefix of `steps` that is a plain pattern.
 ///
 /// Requires a bare `V()` start (an id-seeded one is already a point lookup) and
 /// at least one hop — with none the caller's own seeding path is what runs, and
 /// this would only add a translation.
+#[cfg(feature = "bailprobe")]
+macro_rules! decline {
+    ($why:expr) => {{
+        crate::gql::eval::scan::bailprobe::hit_step(format!("PATTERN {}", $why));
+        return None;
+    }};
+}
+#[cfg(not(feature = "bailprobe"))]
+macro_rules! decline {
+    ($why:expr) => {
+        return None
+    };
+}
+
 pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
     let [Step::V(ids), rest @ ..] = steps else {
-        return None;
+        decline!("start is not V()");
     };
 
     if !ids.is_empty() {
-        return None;
+        decline!("V(ids) seeded start");
     }
 
     let mut it = Interner::default();
@@ -264,6 +314,76 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
     let mut ends_on_edge = false;
 
     while let Some(step) = steps.get(consumed) {
+        // `repeat(<hops>).times(n)` IS those hops n times over, so it is n
+        // segments. Exact for Gremlin because a repeat is a WALK — an edge may be
+        // traversed twice — which is what n plain segments mean. (GQL's `{n,n}`
+        // is a TRAIL and therefore is NOT this; see `try_count_varlen_upto_2`.)
+        //
+        // `until`/`emit` decide PER TRAVERSER whether to stop or to yield, which
+        // is a predicate over the stream rather than a fixed shape, and an
+        // unbounded repeat has no length to unroll. `lower_hops` unrolls under
+        // exactly these conditions; this is the same rule, one layer up.
+        if let Step::Repeat {
+            body,
+            times: Some(n),
+            until: None,
+            emit: None,
+            ..
+        } = step
+        {
+            // Not `?`: the decline is TALLIED, which is the whole point of
+            // knowing which shapes the compiler turns away.
+            let hops = match plain_hops(&body.steps, &mut it) {
+                Some(h) => h,
+                None => decline!("repeat body is not plain hops"),
+            };
+
+            if *n == 0 || hops.is_empty() {
+                decline!("repeat of nothing");
+            }
+
+            consumed += 1;
+
+            for _ in 0..*n {
+                for (dir, label) in &hops {
+                    segments.push(CSegment {
+                        rel: CRel {
+                            var_slot: None,
+                            label: label.clone(),
+                            direction: *dir,
+                            props: Vec::new(),
+                            where_: None,
+                            quantifier: None,
+                        },
+                        node: CNode {
+                            var_slot: None,
+                            label: None,
+                            props: Vec::new(),
+                            where_: None,
+                        },
+                        unit: None,
+                    });
+                }
+            }
+
+            // Filters after the repeat constrain where it LANDED, exactly as they
+            // would after the equivalent written-out hop.
+            let mut node_tags: Vec<String> = Vec::new();
+            let last = segments.last_mut()?;
+
+            consumed += absorb_node(&steps[consumed..], &mut last.node, &mut it, &mut node_tags);
+
+            if !node_tags.is_empty() {
+                let slot = next_slot;
+
+                next_slot += 1;
+                last.node.var_slot = Some(slot);
+                tags.extend(node_tags.into_iter().map(|n| (n, slot, false)));
+            }
+
+            continue;
+        }
+
         // A vertex hop is an edge hop with its landing already applied.
         let (dir, types, spelled_apart) = match (hop_of(step), edge_hop_of(step)) {
             (Some((d, t)), _) => (d, t, false),
@@ -310,7 +430,9 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
                 // The latter declines: `outE().outV()` returns to where it came
                 // from and `bothE().bothV()` emits both ends, so neither is the
                 // segment this would compile it into.
-                Some(Step::InV | Step::OutV | Step::OtherV | Step::BothV) => return None,
+                Some(Step::InV | Step::OutV | Step::OtherV | Step::BothV) => {
+                    decline!("landing step is not the far end")
+                }
                 _ => ends_on_edge = true,
             }
         }
@@ -325,7 +447,7 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
             // is no policy to set: "how many times does an enumeration list one
             // row" is not a question with two answers.
             if dir == Direction::Both {
-                return None;
+                decline!("undirected hop ending on the edge");
             }
         } else {
             consumed += absorb_node(&steps[consumed..], &mut node, &mut it, &mut node_tags);
@@ -362,7 +484,12 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
     }
 
     if segments.is_empty() {
-        return None;
+        decline!(format!(
+            "no hop; stopped at {}",
+            steps
+                .get(consumed)
+                .map_or_else(|| "end".to_string(), step_kind)
+        ));
     }
 
     // Decline unless some node PAST the start is constrained.
@@ -386,7 +513,7 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
         .any(|s| s.node.label.is_some() || !s.node.props.is_empty() || !s.rel.props.is_empty());
 
     if !can_orient {
-        return None;
+        decline!("nothing past the start is constrained");
     }
 
     // The traverser's value after the prefix is the last element. If the walk
@@ -425,4 +552,14 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
         scope_len: next_slot.max(1),
         consumed,
     })
+}
+
+/// The variant name of a step, for the decline tally.
+#[cfg(feature = "bailprobe")]
+fn step_kind(step: &Step) -> String {
+    format!("{step:?}")
+        .split(|c: char| !c.is_alphanumeric())
+        .next()
+        .unwrap_or("?")
+        .to_string()
 }

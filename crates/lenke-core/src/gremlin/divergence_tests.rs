@@ -1337,6 +1337,30 @@ fn a_planned_pattern_matches_the_streamed_traversal() {
         "g.V().inE('S').inV().hasLabel('P')",
         "g.V().bothE('R').bothV().hasLabel('W')",
         "g.V().outE('R').bothV()",
+        // `repeat(<hops>).times(n)` is n segments. The fixture's self-loops are
+        // what make this mean something: a repeat is a WALK, so traversing one
+        // twice is a row, where GQL's `{2,2}` trail would drop it.
+        "g.V().repeat(__.out('R')).times(2).hasLabel('W')",
+        "g.V().repeat(__.out('R')).times(1).hasLabel('W')",
+        "g.V().repeat(__.out('R')).times(3).hasLabel('W')",
+        "g.V().repeat(__.out('R')).times(2).has('k', 3)",
+        "g.V().hasLabel('P').repeat(__.out('R')).times(2).hasLabel('W')",
+        "g.V().repeat(__.out('R').out('S')).times(2).hasLabel('W')",
+        "g.V().out('S').repeat(__.out('R')).times(2).hasLabel('W')",
+        "g.V().repeat(__.out('R')).times(2).out('S').hasLabel('W')",
+        "g.V().repeat(__.outE('R').inV()).times(2).hasLabel('W')",
+        "g.V().repeat(__.out()).times(2).hasLabel('W')",
+        "g.V().repeat(__.out('R')).times(2).as('b').hasLabel('W').select('b')",
+        // A repeat the pattern must NOT unroll: a per-traverser predicate, an
+        // unbounded walk, or a body that is more than hops.
+        "g.V().repeat(__.out('R')).until(__.hasLabel('W'))",
+        "g.V().repeat(__.out('R')).times(2).emit().hasLabel('W')",
+        "g.V().repeat(__.out('R').hasLabel('P')).times(2).hasLabel('W')",
+        "g.V().repeat(__.out('R').simplePath()).times(2).hasLabel('W')",
+        "g.V().repeat(__.both('R')).times(2).hasLabel('W')",
+        "g.V().repeat(__.outE('R')).times(2).hasLabel('W')",
+        "g.V().repeat(__.outE('R').outV()).times(2).hasLabel('W')",
+        "g.V().as('x').as('x').out('R').hasLabel('W')",
         // `as(x)` is a var_slot like any other. It filters nothing, so it can sit
         // anywhere among the filters; stopping the prefix at one is what made
         // `V().as('a').out('R').hasLabel('W')` decline with zero segments.
@@ -1429,6 +1453,11 @@ fn only_a_constraint_past_the_start_is_worth_planning() {
         "g.V().hasLabel('P').out('R').hasLabel('Q')",
         // The constraint is on the SECOND hop's node, two segments out.
         "g.V().out('R').out('S').hasLabel('P')",
+        // `repeat(<hops>).times(n)` unrolls to n segments.
+        "g.V().repeat(__.out('R')).times(2).hasLabel('W')",
+        "g.V().repeat(__.out('R').out('S')).times(2).hasLabel('W')",
+        "g.V().repeat(__.outE('R').inV()).times(2).has('k', 3)",
+        "g.V().repeat(__.out('R')).times(2).as('b').hasLabel('W')",
         // `as(x)` binds a slot and no longer stops the prefix.
         "g.V().as('a').out('R').hasLabel('W')",
         "g.V().out('R').as('b').hasLabel('W')",
