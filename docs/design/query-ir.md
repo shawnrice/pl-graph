@@ -805,6 +805,24 @@ Read over the suite, they are almost all CORRECT declines rather than gaps:
 is a WALK. That was 128x on `repeat(out('R')).times(2).hasLabel('W').count()`,
 and it now costs what the written-out spelling costs.
 
+### One regression left unchased, and why
+
+`gremlin_index_bench`'s indexed rows read 1.3-1.7x against main — `within (3
+values)` at 1.0us where main is 0.6us, `startsWith` at 5.2us where main is 3.2.
+Those are the FASTEST queries in the suite and the ratio is 0.4us and 2us of
+fixed cost.
+
+It is not the pattern branch: disabling `pattern::compile` entirely leaves the
+numbers identical (1.0us, 5.2us, 22.4us — every row unchanged). Two candidate
+per-execution costs were measured and rejected — the `Vec<OpClass>` the analysis
+allocates, and the property-key clones `compile` makes before discovering there
+is no hop — and neither moved anything.
+
+So it predates the pattern work and would need its own bisect over 100+ commits
+to attribute 400ns. Left alone deliberately, and written down so it is not
+rediscovered as new. The same bench is 25-30x FASTER on `range` and `between`
+against main, which is the trade.
+
 ### What this means for the surface
 
 The +4.9% figure above is the honest one and it has not come down. The reason is
