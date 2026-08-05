@@ -713,16 +713,33 @@ fn lowered_ids<'a>(graph: &Graph, steps: &'a [Step]) -> Option<(Vec<u32>, &'a [S
         return None; // edge-to-edge navigation is not this shape
     }
 
-    let mut ids = seek.scan(graph, &no_params, || universe(graph, is_edge));
+    let ids = seek.scan(graph, &no_params, || universe(graph, is_edge));
     let (hops, rest) = lower_hops(graph, &steps[read..]);
     let edges = is_edge && hops.is_empty();
 
-    for (dir, etypes) in &hops {
-        let Some(etypes) = etypes else {
-            return Some((Vec::new(), rest, edges));
-        };
+    // The shared streaming walk. This engine's `Hop` spells the type set the
+    // OPPOSITE way round from `seek::Hop` — here `None` matches nothing and
+    // `Some(vec![])` is any — so the mapping is explicit, as at the other
+    // boundary (`try_count`).
+    let seek_hops: Vec<(crate::seek::Dir, Option<Vec<u32>>)> = hops
+        .iter()
+        .map(|(d, e)| {
+            (
+                *d,
+                match e {
+                    None => Some(Vec::new()),        // matches nothing
+                    Some(v) if v.is_empty() => None, // any type
+                    Some(v) => Some(v.clone()),
+                },
+            )
+        })
+        .collect();
+    let ids = crate::seek::walk_ids(graph, &ids, &seek_hops, crate::seek::SelfLoops::Twice);
 
-        ids = crate::seek::expand(graph, &ids, *dir, etypes, crate::seek::SelfLoops::Twice);
+    // A hop that matched nothing empties the frontier, and the caller reads the
+    // remaining steps from `rest` either way.
+    if ids.is_empty() && hops.iter().any(|(_, e)| e.is_none()) {
+        return Some((Vec::new(), rest, edges));
     }
 
     // A trailing edge step lands on the EDGE rather than its far end, turning the
@@ -862,6 +879,16 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
     }
 }
 
+/// A slice of a numeric column, as `GVal`s.
+fn page(nums: &[f64], skip: usize, take: usize) -> Vec<GVal> {
+    nums.iter()
+        .skip(skip)
+        .take(take)
+        .copied()
+        .map(GVal::Num)
+        .collect()
+}
+
 /// `values(k)` and whatever follows it, answered from the typed column.
 fn column_terminal(
     graph: &Graph,
@@ -940,6 +967,18 @@ fn column_terminal(
 
     match tail {
         [] => Some(out),
+        // See the numeric arms: paging over a column is a slice.
+        [Step::Limit(n, Scope::Global)] => {
+            out.truncate(*n);
+            Some(out)
+        }
+        [Step::Skip(n, Scope::Global)] => Some(out.split_off((*n).min(out.len()))),
+        [Step::Range(lo, hi, Scope::Global)] => {
+            let mut v = out.split_off((*lo).min(out.len()));
+
+            v.truncate(hi.saturating_sub(*lo));
+            Some(v)
+        }
         [Step::Fold] => Some(vec![GVal::list(out)]),
         #[allow(clippy::cast_precision_loss)]
         [Step::Count(Scope::Global)] => Some(vec![GVal::Num(out.len() as f64)]),
@@ -1216,6 +1255,17 @@ fn num_column_terminal(nums: &[f64], filter: Option<&P>, tail: &[Step]) -> Optio
 
     match tail {
         [] => Some(nums.iter().copied().map(GVal::Num).collect()),
+        // PAGING over a column is a slice. It had no arm here and none in the
+        // generic tail either, so `values('n').limit(5)` declined BOTH and the
+        // traversal streamed every row it was about to throw away: 32.8ms,
+        // against 1.2ms for the same query with no limit at all. A limit made it
+        // 28x slower than no limit.
+        //
+        // `Scope::Local` is a different question — it pages WITHIN each value —
+        // and is not this.
+        [Step::Limit(n, Scope::Global)] => Some(page(nums, 0, *n)),
+        [Step::Skip(n, Scope::Global)] => Some(page(nums, *n, usize::MAX)),
+        [Step::Range(lo, hi, Scope::Global)] => Some(page(nums, *lo, hi.saturating_sub(*lo))),
         [Step::Fold] => Some(vec![GVal::List(
             nums.iter().copied().map(GVal::Num).collect(),
         )]),

@@ -1795,6 +1795,105 @@ fn dropping_the_path_never_changes_an_answer() {
     }
 }
 
+/// Paging a column agrees with paging the stream.
+///
+/// `values(k).limit(n)` had no arm in either column terminal, so it declined
+/// both and streamed every row it was about to discard — 32.8ms against 1.2ms
+/// for the same query with NO limit. A limit made it 28x slower than no limit,
+/// which is the shape of a missing arm rather than a slow one.
+///
+/// The oracle is `.identity()` before the paging step: it changes nothing and
+/// makes the tail a shape neither terminal recognizes, so the same question runs
+/// down both paths.
+#[test]
+fn paging_a_column_agrees_with_paging_the_stream() {
+    let mut lines: Vec<String> = Vec::new();
+
+    for i in 0..40 {
+        // A gap in `n` and a gap in `s`, at different indices: paging counts
+        // VALUES, and `values(k)` skips the elements that lack `k`.
+        let mut props = Vec::new();
+
+        if i % 5 != 0 {
+            props.push(format!(r#""n":{}"#, i % 7));
+        }
+        if i % 4 != 0 {
+            props.push(format!(r#""s":"v{}""#, i % 3));
+        }
+
+        lines.push(format!(
+            r#"{{"type":"node","id":"n{i}","labels":["P"],"properties":{{{}}}}}"#,
+            props.join(",")
+        ));
+    }
+
+    for i in 0..39 {
+        lines.push(format!(
+            r#"{{"type":"edge","id":"e{i}","from":"n{i}","to":"n{}","labels":["R"],"properties":{{}}}}"#,
+            (i * 7 + 1) % 40
+        ));
+    }
+
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    let rows = |src: &str, g: &mut crate::graph::Graph| {
+        format!(
+            "{:?}",
+            super::parse::parse(src)
+                .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+                .run(g)
+        )
+    };
+
+    for (col, page) in [("n", "limit(5)"), ("s", "limit(5)")].into_iter().chain([
+        ("n", "skip(5)"),
+        ("s", "skip(5)"),
+        ("n", "range(2, 7)"),
+        ("s", "range(2, 7)"),
+        // Degenerate bounds: zero, past the end, and an empty window.
+        ("n", "limit(0)"),
+        ("n", "skip(1000)"),
+        ("n", "range(5, 5)"),
+        ("n", "range(1000, 1001)"),
+        ("s", "limit(0)"),
+        ("s", "skip(1000)"),
+        // More than the column holds.
+        ("n", "limit(1000)"),
+    ]) {
+        for src in [
+            format!("g.V().values('{col}').{page}"),
+            format!("g.V().hasLabel('P').out('R').values('{col}').{page}"),
+            // A key nothing carries: the column is empty and paging it is still
+            // whatever paging an empty stream is.
+            format!("g.V().values('nope').{page}"),
+        ] {
+            let slow = src.replace(&format!(".{page}"), &format!(".identity().{page}"));
+
+            assert_ne!(slow, src, "the oracle did not rewrite `{src}`");
+            assert_eq!(
+                rows(&src, &mut g),
+                rows(&slow, &mut g),
+                "`{src}` paged from the column disagrees with paging the stream"
+            );
+        }
+    }
+
+    // `local` pages WITHIN each value and must not take the column arm.
+    for src in [
+        "g.V().values('n').limit(local, 5)",
+        "g.V().values('n').range(local, 0, 2)",
+    ] {
+        let slow = src.replace(".limit(local", ".identity().limit(local");
+        let slow = slow.replace(".range(local", ".identity().range(local");
+
+        assert_eq!(
+            rows(src, &mut g),
+            rows(&slow, &mut g),
+            "`{src}` local paging"
+        );
+    }
+}
+
 /// `where(<one hop>)` answered from the adjacency agrees with running the body.
 ///
 /// The oracle is `.identity()` appended to the body: it means exactly the same

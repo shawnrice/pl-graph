@@ -1269,6 +1269,55 @@ pub fn expand_edges(
     out
 }
 
+/// Walk `seed` through `hops`, borrowing until something actually expands.
+///
+/// THE streaming walk: a frontier in, a frontier out, no frame and no pairing.
+/// Both engines had their own copy of this loop — `walk_count`'s prefix,
+/// `streamed_frame`'s, and Gremlin's `lowered_ids` — differing only in what they
+/// did with the result.
+///
+/// `hops` follows [`Hop::etypes`]: `None` is ANY type, `Some(&[])` is NONE, and
+/// a hop that matches nothing makes the whole walk empty.
+fn walk<'a>(
+    graph: &Graph,
+    seed: &'a [u32],
+    hops: &[(Dir, Option<Vec<u32>>)],
+    loops: SelfLoops,
+) -> std::borrow::Cow<'a, [u32]> {
+    if hops
+        .iter()
+        .any(|(_, e)| e.as_ref().is_some_and(Vec::is_empty))
+    {
+        return std::borrow::Cow::Owned(Vec::new());
+    }
+
+    // Borrowed until something expands, so a walk of no hops — and the LAST hop
+    // of a count, which is counted rather than built — never copies the seed.
+    let mut cur: std::borrow::Cow<'_, [u32]> = std::borrow::Cow::Borrowed(seed);
+    // `expand` reads an empty list as ANY, which is what `None` means here.
+    let any: &[u32] = &[];
+
+    for (d, e) in hops {
+        cur = std::borrow::Cow::Owned(expand(graph, &cur, *d, e.as_deref().unwrap_or(any), loops));
+    }
+
+    cur
+}
+
+/// The frontier a walk lands on.
+///
+/// The STREAM route for a terminal that wants the ROWS rather than a fold — the
+/// sibling of [`walk_count`], and what a per-language expansion loop was doing.
+#[must_use]
+pub fn walk_ids(
+    graph: &Graph,
+    seed: &[u32],
+    hops: &[(Dir, Option<Vec<u32>>)],
+    loops: SelfLoops,
+) -> Vec<u32> {
+    walk(graph, seed, hops, loops).into_owned()
+}
+
 /// The STREAM route for a reducing terminal: count a walk without building it.
 ///
 /// Walk every hop but the last, then count the last in place. The rows are never
@@ -1309,7 +1358,8 @@ pub fn walk_count(
     distinct: bool,
 ) -> usize {
     // A hop whose type name resolved to nothing matches nothing, so the whole
-    // walk does.
+    // walk does. `walk` checks this for the hops it takes; the LAST one is not
+    // one of them, so it is checked here.
     if hops
         .iter()
         .any(|(_, e)| e.as_ref().is_some_and(Vec::is_empty))
@@ -1327,19 +1377,9 @@ pub fn walk_count(
         };
     };
 
-    // Borrowed until something expands, so a single-segment walk — the common
-    // one — never copies the seed.
-    let mut cur: std::borrow::Cow<'_, [u32]> = std::borrow::Cow::Borrowed(seed);
-
-    // `expand` reads an empty list as ANY, which is what `None` means here; the
-    // `Some(&[])` case returned above.
-    let any: &[u32] = &[];
-
-    for (d, e) in init {
-        cur = std::borrow::Cow::Owned(expand(graph, &cur, *d, e.as_deref().unwrap_or(any), loops));
-    }
-
-    let last = etypes.as_deref().unwrap_or(any);
+    // Every hop but the last, through the shared walk; the last is COUNTED.
+    let cur = walk(graph, seed, init, loops);
+    let last = etypes.as_deref().unwrap_or(&[]);
 
     if distinct {
         return distinct_len(&expand(graph, &cur, *dir, last, loops));

@@ -668,7 +668,8 @@ pub(super) fn streamed_frame(
         return None;
     }
 
-    let mut hops: Vec<(crate::seek::Dir, Vec<u32>)> = Vec::with_capacity(path.segments.len());
+    let mut hops: Vec<(crate::seek::Dir, Option<Vec<u32>>)> =
+        Vec::with_capacity(path.segments.len());
 
     for seg in &path.segments {
         if seg.unit.is_some()
@@ -683,21 +684,12 @@ pub(super) fn streamed_frame(
             return None;
         }
 
-        // `lower_labels` returns an EMPTY list for a name that resolved to
-        // nothing, and `expand` reads an empty list as "any type". Decline rather
-        // than walk — the frame answers it correctly, and conflating the two made
-        // `MATCH (a)-[r:NONEXISTENT]->(b)` return every edge in the graph.
+        // `None` is ANY type here and `Some(vec![])` is a name that resolved to
+        // NOTHING — the walk reads it that way and yields nothing, where a bare
+        // `Vec` would have read empty as "any" and returned every edge.
         let etypes = match &seg.rel.label {
-            None => Vec::new(),
-            Some(l) => {
-                let ids = seek_lower::lower_labels(l, ctx, true)?;
-
-                if ids.is_empty() {
-                    return None;
-                }
-
-                ids
-            }
+            None => None,
+            Some(l) => Some(seek_lower::lower_labels(l, ctx, true)?),
         };
 
         hops.push((
@@ -733,9 +725,9 @@ pub(super) fn streamed_frame(
         };
     }
 
-    for (dir, etypes) in &hops {
-        ids = crate::seek::expand(graph, &ids, *dir, etypes, ctx.loops);
-    }
+    // The shared streaming walk — the same one `walk_count` folds over and
+    // Gremlin's lowered prefix drives.
+    let ids = crate::seek::walk_ids(graph, &ids, &hops, ctx.loops);
 
     let mut out = ScanCols::new(scope_len);
 
