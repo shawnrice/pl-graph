@@ -820,7 +820,26 @@ pub(super) fn try_count_comma_join(
 ///   only when `x` matches both endpoints' labels (it is the `a` *and* the `b`).
 ///
 /// Other quantifiers/directions fall through to the enumerating parallel count.
-pub(super) fn try_count_varlen_1_2(
+/// Which lengths a quantifier asks for, or `None` if this pass cannot answer it.
+///
+/// Out of line because inlining it cost 0.37ms — 14% — on
+/// `MATCH (n:Person) RETURN min(n.age), max(n.age)`, a query with no segments
+/// that declines this shortcut on its second line. Adding two arms to a match in
+/// the middle of a long function was enough; `#[inline(never)]` on a three-line
+/// helper keeps the caller's codegen where it was.
+#[inline(never)]
+fn varlen_terms(q: Option<crate::gql::ast::Quantifier>) -> Option<(bool, bool)> {
+    let q = q?;
+
+    match (q.min, q.max) {
+        (1, Some(1)) => Some((true, false)),
+        (2, Some(2)) => Some((false, true)),
+        (1, Some(2)) => Some((true, true)),
+        _ => None,
+    }
+}
+
+pub(super) fn try_count_varlen_upto_2(
     linear: &CLinear,
     graph: &Graph,
     plan: &CQuery,
@@ -845,7 +864,15 @@ pub(super) fn try_count_varlen_1_2(
     if !is_bare_count_star(proj) {
         return None;
     }
-    // The one relationship: `{1,2}`, directed Out, anonymous, no inline props/WHERE.
+    // A parenthesized UNIT repeats a whole sub-pattern, not one relationship, so
+    // its degrees are not this pass's degrees. Previously safe by accident: the
+    // only quantifier accepted was `{1,2}`, and the unit test that would have
+    // caught it writes `{1}` — which the narrower ranges now match.
+    if seg.unit.is_some() {
+        return None;
+    }
+
+    // The one relationship: directed Out, anonymous, no inline props/WHERE.
     let rel = &seg.rel;
     if rel.var_slot.is_some()
         || !rel.props.is_empty()
@@ -854,10 +881,16 @@ pub(super) fn try_count_varlen_1_2(
     {
         return None;
     }
-    match rel.quantifier {
-        Some(q) if q.min == 1 && q.max == Some(2) => {}
-        _ => return None,
-    }
+    // Which of the two lengths this quantifier asks for. The terms below are
+    // computed together — one pass over the vertices gives the length-1 count,
+    // the length-2 count and the trail correction — so a quantifier that wants
+    // only one of them costs exactly the same as the one that wants both.
+    //
+    // Refusing all but `{1,2}` left `{2,2}` walking the general trail machinery
+    // at 16.3ms, where `{1,2}` — which does strictly MORE work — answered in
+    // 0.97ms. A shortcut that covers the wider range and not the narrower one is
+    // the "equivalent spellings" trap with the spellings inverted.
+    let (want_1, want_2) = varlen_terms(rel.quantifier)?;
     // Start / endpoint: no inline props/WHERE (labels are fine, applied below).
     if !path.start.props.is_empty()
         || path.start.where_.is_some()
@@ -923,7 +956,9 @@ pub(super) fn try_count_varlen_1_2(
         .iter()
         .map(|&x| contribution(x))
         .fold((0, 0, 0), add);
-    let count = l1 + l2 - corr;
+    // `corr` is the length-2 term's correction — the `a→a→a` walks that reuse a
+    // self-loop and so are not TRAILS — so it travels with `l2`, never with `l1`.
+    let count = u64::from(want_1) * l1 + u64::from(want_2) * (l2 - corr);
 
     let mut rs = RowSet::new(proj.out_names.clone());
     rs.push_row(std::iter::once(Value::Num(count as f64)));
@@ -1037,7 +1072,7 @@ pub(super) fn try_grouped_varlen_1_2(
     // Every non-agg item is a group key over `b`; the one agg item is a bare count.
     let key_items = proj.group_keys();
     if key_items.is_empty() {
-        return None; // a global count uses `try_count_varlen_1_2`
+        return None; // a global count uses `try_count_varlen_upto_2`
     }
     for it in &key_items {
         if !expr_refs_only_slot(&it.expr, b_slot) {

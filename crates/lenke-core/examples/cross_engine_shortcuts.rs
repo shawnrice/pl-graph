@@ -121,7 +121,7 @@ fn main() {
             // spelling made this pair two different questions.
             //
             // `->{2,2}` is also NOT the same query as `()-[:R]->()-[:R]->()`,
-            // however tempting the 24x between them looks. A QUANTIFIED walk is a
+            // however tempting the gap between them looks. A QUANTIFIED walk is a
             // trail (no repeated edge); a fixed chain is not. A self-loop
             // traversed twice is one row for the chain and no row for `{2,2}` —
             // measured 5 vs 4 on a 3-edge graph with one self-loop.
@@ -129,12 +129,16 @@ fn main() {
             // So they are not two spellings of one question and there is nothing
             // here to desugar: a desugaring preserves meaning by definition, and
             // rewriting `{n,n}` into n segments would MISTRANSLATE it into a
-            // different query that happens to agree on loop-free graphs. The 24x
-            // is a missing SHORTCUT for a fixed-length trail.
+            // different query that happens to agree on loop-free graphs.
+            //
+            // The gap WAS a missing shortcut, and is now `try_count_varlen_upto_2`
+            // — the degree-product pass already computed the length-2 count and
+            // its trail correction for `{1,2}` and simply refused to answer the
+            // narrower range. 16.3ms to 1.03ms.
             "count of a fixed 2-hop walk",
             "MATCH ()-[:R]->{2,2}() RETURN count(*) AS c",
             "g.V().repeat(out('R')).times(2).count()",
-            "try_count_varlen_1_2 (does not fire: it covers {1,2})",
+            "try_count_varlen_upto_2",
         ),
         (
             "distinct endpoints of a hop",

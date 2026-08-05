@@ -525,7 +525,7 @@ fn count_star_alias() {
     assert_eq!(r, vec![vec![n(4.0)]]);
 }
 
-/// The var-length `{1,2}` count fast path (`try_count_varlen_1_2`, degree products)
+/// The var-length `{1,2}` count fast path (`try_count_varlen_upto_2`, degree products)
 /// must equal a brute-force trail enumeration, including the tricky cases: parallel
 /// edges (two `a→b`), self-loops (`a→a`, `b→b`, which the degree product would
 /// double-count as an invalid edge-reusing `a→a→a` without the correction), and a
@@ -588,6 +588,104 @@ fn varlen_1_2_count_matches_trail_enumeration() {
     // Independent hand-computed anchors.
     assert_eq!(brute(&|_| true), 17);
     assert_eq!(brute(&|v| v == 0), 9);
+}
+
+/// The SAME degree-product pass answers `{1,1}` and `{2,2}`, not only `{1,2}`.
+///
+/// One pass gives the length-1 count, the length-2 count and the trail
+/// correction, so a quantifier wanting one of them costs what the one wanting
+/// both costs. Refusing the narrower ranges left `{2,2}` on the general trail
+/// machinery at 16.3ms while `{1,2}` — strictly more work — answered in 0.97ms.
+///
+/// Brute-forced per LENGTH here, because the interesting term is the correction:
+/// `corr` removes the `a→a→a` walks that reuse a self-loop, so it belongs to the
+/// length-2 count and must not be subtracted from the length-1 one. The fixture
+/// has two self-loops and a pair of parallel edges for exactly that reason.
+#[test]
+fn varlen_fixed_lengths_match_trail_enumeration() {
+    let lines = [
+        r#"{"type":"node","id":"a","labels":["Person","VIP"],"properties":{}}"#,
+        r#"{"type":"node","id":"b","labels":["Person"],"properties":{}}"#,
+        r#"{"type":"node","id":"c","labels":["Person"],"properties":{}}"#,
+        r#"{"type":"edge","from":"a","to":"b","labels":["KNOWS"],"properties":{}}"#,
+        r#"{"type":"edge","from":"a","to":"b","labels":["KNOWS"],"properties":{}}"#,
+        r#"{"type":"edge","from":"b","to":"c","labels":["KNOWS"],"properties":{}}"#,
+        r#"{"type":"edge","from":"b","to":"b","labels":["KNOWS"],"properties":{}}"#,
+        r#"{"type":"edge","from":"a","to":"a","labels":["KNOWS"],"properties":{}}"#,
+        r#"{"type":"edge","from":"c","to":"a","labels":["KNOWS"],"properties":{}}"#,
+    ];
+    let mut g = ndjson::decode(&lines.join("\n")).unwrap();
+    let edges: [(u32, u32); 6] = [(0, 1), (0, 1), (1, 2), (1, 1), (0, 0), (2, 0)];
+
+    let len1 = |src_ok: &dyn Fn(u32) -> bool| -> u64 {
+        edges.iter().filter(|(s, _)| src_ok(*s)).count() as u64
+    };
+    // Ordered edge pairs sharing a midpoint, each edge used at most once.
+    let len2 = |src_ok: &dyn Fn(u32) -> bool| -> u64 {
+        let mut c = 0;
+
+        for (i, &(s, m)) in edges.iter().enumerate() {
+            if !src_ok(s) {
+                continue;
+            }
+
+            for (j, &(s2, _)) in edges.iter().enumerate() {
+                if i != j && s2 == m {
+                    c += 1;
+                }
+            }
+        }
+
+        c
+    };
+    let count_of = |g: &mut Graph, query: &str| -> u64 {
+        match q(g, query).1[0][0] {
+            Value::Num(v) => v as u64,
+            ref other => panic!("expected numeric count, got {other:?}"),
+        }
+    };
+
+    for (src_ok, pat) in [(&|_: u32| true, "(x)"), (&|v: u32| v == 0, "(x:VIP)")]
+        as [(&dyn Fn(u32) -> bool, &str); 2]
+    {
+        assert_eq!(
+            count_of(
+                &mut g,
+                &format!("MATCH {pat}-[:KNOWS]->{{1,1}}(y) RETURN count(*) AS c")
+            ),
+            len1(src_ok),
+            "`{pat}` length-1"
+        );
+        assert_eq!(
+            count_of(
+                &mut g,
+                &format!("MATCH {pat}-[:KNOWS]->{{2,2}}(y) RETURN count(*) AS c")
+            ),
+            len2(src_ok),
+            "`{pat}` length-2"
+        );
+        // And the two still sum to the range that was already covered.
+        assert_eq!(
+            count_of(
+                &mut g,
+                &format!("MATCH {pat}-[:KNOWS]->{{1,2}}(y) RETURN count(*) AS c")
+            ),
+            len1(src_ok) + len2(src_ok),
+            "`{pat}` the range is the sum of its lengths"
+        );
+    }
+
+    // Hand-computed anchors, so a brute force that drifts is caught too. The
+    // length-2 count is 11 and NOT 13: two of the fifteen midpoint-sharing pairs
+    // reuse a self-loop.
+    assert_eq!((len1(&|_| true), len2(&|_| true)), (6, 11));
+    assert_eq!((len1(&|v| v == 0), len2(&|v| v == 0)), (3, 6));
+
+    // `{1,1}` is one hop, so it must agree with the unquantified spelling.
+    assert_eq!(
+        count_of(&mut g, "MATCH (x)-[:KNOWS]->{1,1}(y) RETURN count(*) AS c"),
+        count_of(&mut g, "MATCH (x)-[:KNOWS]->(y) RETURN count(*) AS c"),
+    );
 }
 
 /// A numeric `score` present on some nodes, absent on others — so the column

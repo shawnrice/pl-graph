@@ -1403,8 +1403,9 @@ pub(super) fn run_part(
         if let Some(rs) = try_count_two_hop(linear, graph, plan, params) {
             return Ok(rs);
         }
-        // Var-length `{1,2}` count via degree products (O(V+E), no trail enumeration).
-        if let Some(rs) = try_count_varlen_1_2(linear, graph, plan, params) {
+        // Var-length `{1,1}` / `{2,2}` / `{1,2}` count via degree products
+        // (O(V+E), no trail enumeration).
+        if let Some(rs) = try_count_varlen_upto_2(linear, graph, plan, params) {
             return Ok(rs);
         }
         // Var-length `{lo,hi≤2}` count GROUPED by an endpoint value — guarded
