@@ -191,6 +191,13 @@ fn main() {
             "the columnar aggregate",
         ),
         (
+            // Read this row with the fixture in mind: `n` takes only 1000
+            // distinct values over 50k vertices, so the top-k partition is
+            // almost all TIES. Over 50k DISTINCT values the two engines measure
+            // 0.98ms against 0.96ms — the same. The gap here is how each breaks
+            // ties, and GQL breaks them deterministically (the comparator falls
+            // through to the row index, so ties resolve to scan order); that is
+            // a deliberate cost, not a missing shortcut.
             "top-k by a property",
             "MATCH (a:V) RETURN a.n AS x ORDER BY x DESC LIMIT 5",
             "g.V().hasLabel('V').values('n').order().by(desc).limit(5)",
@@ -219,6 +226,10 @@ fn main() {
         ),
         (
             // Stopping ON the edge, which no vertex hop expresses.
+            // An edge PROPERTY counts toward the orientation gate — the planner
+            // can seed an edge property index where a left-to-right walk cannot
+            // — and it pays even with no index on the fixture: 2.85ms here
+            // against 7.68ms when the gate ignores `rel.props`.
             "edges filtered by their own property",
             "MATCH ()-[r:R]->() WHERE r.w = 1 RETURN count(*) AS c",
             "g.V().outE('R').has('w', 1).count()",
