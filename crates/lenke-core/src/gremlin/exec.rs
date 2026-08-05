@@ -3539,11 +3539,23 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         // the loss is the larger ratio. Reverted rather than kept for the half
         // that won.
         //
-        // The real cost is elsewhere: 151ms for 150k edges is ~1us each, and
-        // eight allocations do not take a microsecond. A `Trav` per element and
-        // a `Vec` of boxed pairs per map are the next suspects, and `column_paths`
-        // has no arm for either map step — building them off the frontier would
-        // skip the traverser entirely.
+        // ALSO REJECTED (measured WORSE): sizing the outer map once.
+        // `vec![a, b]` takes capacity 2, the two endpoint entries grow it to 4,
+        // and `reserve(ks.len())` grows it again — three reallocations per edge,
+        // which looks like the obvious other half of the same problem. Replacing
+        // all three with one `Vec::with_capacity` measured 158.9ms -> 203.9ms
+        // (1.28x) on edges and 16.2 -> 18.8 (1.16x) on vertices, interleaved,
+        // min of 3.
+        //
+        // So: two independent attempts to remove allocations from this step, both
+        // SLOWER, one of them 1.28x. Whatever the ~800ns per edge is, it is not
+        // the allocation count — which is what both attempts assumed. The next
+        // person should profile this rather than reason about it, and should know
+        // that reasoning about it has now failed twice.
+        //
+        // Still untried and still plausible: `column_paths` has no arm for either
+        // map step, so building them off the frontier would skip the `Trav`
+        // entirely — a different axis from the two above.
         Step::ElementMap(keys) => {
             let mut ks: Vec<(u32, Arc<str>)> = Vec::new();
 
