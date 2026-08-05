@@ -830,16 +830,23 @@ impl CProjection {
     /// is the standard's design rather than an inconsistency:
     ///
     /// ```text
-    ///   primitiveResultStatement : returnStatement orderByAndPageStatement?
-    ///   returnStatementBody      : … returnItemList groupByClause?
+    ///   <primitive result statement> ::= <return statement> [ <order by and page statement> ]
+    ///   <return statement body>      ::= … <return item list> [ <group by clause> ]
+    ///   <grouping element>           ::= <binding variable reference>
+    ///   <sort key>                   ::= <aggregating value expression>
     /// ```
     ///
-    /// `GROUP BY` sits INSIDE the return body, so it groups the INPUT bindings —
-    /// its grouping element is a `bindingVariableReference`, a name that must
-    /// already be bound. `ORDER BY` is a SEPARATE statement applied after the
-    /// projection, and its sort key is a full `expression`, so an output column
-    /// is in scope there. Computing a grouping key is spelled `LET k = … GROUP
-    /// BY k` (which is how the ISO examples do it), not `RETURN … AS k GROUP BY k`.
+    /// (ISO/IEC 39075's grammar is published free as a digital artifact —
+    /// `https://standards.iso.org/iso-iec/39075/ed-1/en/ISO_IEC_39075(en).bnf.txt`
+    /// — even though the standard text is not.)
+    ///
+    /// `GROUP BY` sits INSIDE the return body, so it groups the INPUT bindings,
+    /// and a grouping element is a plain bound NAME — not an expression, not an
+    /// output column. `ORDER BY` is a SEPARATE statement applied after the
+    /// return statement, and its sort key is a full value expression, so an
+    /// output column is in scope there. Computing a grouping key is therefore
+    /// spelled `LET k = … GROUP BY k` — the way the ISO examples do it, and the
+    /// only way available, since the grammar admits no expression here at all.
     ///
     /// An unbound name used to read as NULL here — see
     /// [`CQuery::unbound_group_keys`], which now faults instead.
