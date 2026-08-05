@@ -1832,6 +1832,70 @@ fn dropping_the_path_never_changes_an_answer() {
     }
 }
 
+/// An edge's id is the stored one, assigned or synthesized.
+///
+/// `element_id` rebuilt it with `Arc::from(graph.edge_id(e).as_ref())` — a fresh
+/// allocation of a string that is ALREADY an `Arc<str>` in `eid_fwd`. A vertex
+/// id has always been a refcount bump, which is why `g.E().id()` cost 47ns an
+/// edge where `g.V().id()` cost 9ns a vertex. Handing the `Arc` back directly is
+/// 2.4x, and this pins that it is the same string either way — including the
+/// SYNTHESIZED `e{n}` form, which has no stored `Arc` to hand back.
+#[test]
+fn an_edge_id_is_the_stored_one_however_it_is_read() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["P"],"properties":{}}"#,
+            r#"{"type":"node","id":"b","labels":["P"],"properties":{}}"#,
+            // An ASSIGNED id, a canonical-looking assigned id, and one with no id
+            // at all — the third gets `e{n}` synthesized on demand.
+            r#"{"type":"edge","id":"pay-1","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e7","from":"b","to":"a","labels":["R"],"properties":{}}"#,
+            r#"{"type":"edge","from":"a","to":"a","labels":["R"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let ids = |src: &str, g: &mut crate::graph::Graph| {
+        let mut v: Vec<String> = super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(g)
+            .iter()
+            .map(|x| format!("{x:?}"))
+            .collect();
+        v.sort();
+        v
+    };
+
+    let direct = ids("g.E().id()", &mut g);
+
+    // The same ids the graph reports, and the same ones the stream produces.
+    assert_eq!(direct, ids("g.E().barrier().id()", &mut g));
+    assert_eq!(
+        direct,
+        vec![
+            r#"Str("e2")"#.to_string(),
+            r#"Str("e7")"#.to_string(),
+            r#"Str("pay-1")"#.to_string(),
+        ]
+    );
+
+    // And they round-trip: each id finds its edge again.
+    for id in ["pay-1", "e7", "e2"] {
+        assert_eq!(
+            ids(&format!("g.E('{id}').id()"), &mut g),
+            vec![format!(r#"Str("{id}")"#)],
+            "`{id}` did not resolve back to its edge"
+        );
+    }
+
+    // `elementMap` reads the same accessor, nested for the endpoints.
+    assert_eq!(
+        ids("g.E().elementMap()", &mut g),
+        ids("g.E().barrier().elementMap()", &mut g)
+    );
+}
+
 /// Reading the FRONTIER agrees with streaming it.
 ///
 /// `column_paths` had no arm for an empty tail, so a traversal with no terminal

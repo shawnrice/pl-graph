@@ -349,7 +349,7 @@ impl Value {
     pub fn element_id(graph: &crate::graph::Graph, v: &Self) -> Self {
         match v {
             Self::Node(i) => Self::Str(graph.vid.arc(*i)),
-            Self::Edge(e) => Self::Str(Arc::from(graph.edge_id(*e).as_ref())),
+            Self::Edge(e) => Self::Str(graph.edge_id_arc(*e)),
             _ => Self::Null,
         }
     }

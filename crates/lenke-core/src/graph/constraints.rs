@@ -1580,6 +1580,24 @@ impl Graph {
     /// synthetic id is computed on demand, so the id overlay stays lazy and the
     /// load path pays nothing. Used by codecs (which always emit it) and the
     /// engines' `id()` step.
+    /// [`Graph::edge_id`] as an `Arc<str>`, without copying a stored one.
+    ///
+    /// An assigned id is ALREADY an `Arc<str>`; handing it back through `Cow` and
+    /// rebuilding it with `Arc::from` allocates a fresh copy of a string that is
+    /// already refcounted. A vertex id goes through `vid.arc(i)` and is a
+    /// refcount bump, which is why `g.E().id()` cost 47ns an edge where
+    /// `g.V().id()` cost 9ns a vertex.
+    ///
+    /// The SYNTHESIZED form still allocates: `e{n}` for an id-less edge does not
+    /// exist until someone asks for it.
+    #[must_use]
+    pub fn edge_id_arc(&self, eidx: u32) -> std::sync::Arc<str> {
+        match self.eid_fwd.get(&eidx) {
+            Some(s) => s.clone(),
+            None => std::sync::Arc::from(format!("e{eidx}").as_str()),
+        }
+    }
+
     pub fn edge_id(&self, eidx: u32) -> std::borrow::Cow<'_, str> {
         match self.eid_fwd.get(&eidx) {
             Some(s) => std::borrow::Cow::Borrowed(s.as_ref()),
