@@ -879,14 +879,74 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
     }
 }
 
-/// A slice of a numeric column, as `GVal`s.
-fn page(nums: &[f64], skip: usize, take: usize) -> Vec<GVal> {
-    nums.iter()
-        .skip(skip)
-        .take(take)
-        .copied()
-        .map(GVal::Num)
-        .collect()
+/// One column-expressible step peeled off the tail, then the arms above again.
+///
+/// The arms answer a fixed list of tail SHAPES, so their COMPOSITIONS fell
+/// through even though each part was covered — `values('n').dedup().limit(5)`,
+/// `.limit(5).count()` and `.order().by(desc).count()` each streamed the whole
+/// traversal at 24-58x the cost of the same query with the composed step
+/// removed. Adding another arm per combination is how the list got holes in it;
+/// peeling one step and recursing closes them all, and each peel keeps the
+/// semantics its direct arm has.
+///
+/// Only stream/buffer steps peel. A reducing terminal is what the arms above
+/// are, so it ends the recursion there rather than here.
+fn composed_num_terminal(nums: &[f64], tail: &[Step]) -> Option<Vec<GVal>> {
+    let (cur, rest): (Vec<f64>, &[Step]) = match tail {
+        [Step::Limit(n, Scope::Global), t @ ..] => (nums.iter().copied().take(*n).collect(), t),
+        [Step::Skip(n, Scope::Global), t @ ..] => (nums.iter().copied().skip(*n).collect(), t),
+        [Step::Range(lo, hi, Scope::Global), t @ ..] => (
+            nums.iter()
+                .copied()
+                .skip(*lo)
+                .take(hi.saturating_sub(*lo))
+                .collect(),
+            t,
+        ),
+        // `tail(n)` is the LAST n, which is a slice like the others.
+        [Step::Tail(n, Scope::Global), t @ ..] => {
+            (nums[nums.len().saturating_sub(*n)..].to_vec(), t)
+        }
+        // Same NaN rule as the direct `Dedupe` arm: a NaN has no key, so it is
+        // never a duplicate and every one survives.
+        [Step::Dedupe { labels, bys }, t @ ..] if labels.is_empty() && bys.is_empty() => {
+            let mut seen: crate::fxhash::FxHashSet<u64> =
+                crate::fxhash::FxHashSet::with_capacity_and_hasher(nums.len(), Default::default());
+            let mut distinct: Vec<f64> = Vec::new();
+
+            for &x in nums {
+                if x.is_nan() || seen.insert((x + 0.0).to_bits()) {
+                    distinct.push(x);
+                }
+            }
+
+            (distinct, t)
+        }
+        // Same NaN DECLINE as the direct `Order` arm: `cmp_or_fault` records a
+        // type fault for an incomparable pair, so answering here would swallow
+        // the error the stream raises.
+        [Step::Order(bys, desc, Scope::Global), t @ ..]
+            if order_dir(bys, *desc).is_some() && !nums.iter().any(|x| x.is_nan()) =>
+        {
+            let descending = order_dir(bys, *desc) == Some(Order::Desc);
+            let mut sorted: Vec<f64> = nums.to_vec();
+
+            sorted.sort_by(|a, b| {
+                let o = a.partial_cmp(b).unwrap_or(Ordering::Equal);
+
+                if descending {
+                    o.reverse()
+                } else {
+                    o
+                }
+            });
+
+            (sorted, t)
+        }
+        _ => return None,
+    };
+
+    num_column_terminal(&cur, None, rest)
 }
 
 /// `values(k)` and whatever follows it, answered from the typed column.
@@ -965,6 +1025,15 @@ fn column_terminal(
         }
     }
 
+    gval_column_terminal(out, tail)
+}
+
+/// The tail of a `values(k)` over a NON-numeric column.
+///
+/// Split out so it can recurse: like the numeric arms, these answer a fixed list
+/// of tail SHAPES, so their compositions — `values('s').dedup().limit(5)`,
+/// `.tail(5)` — fell through even though each part was covered.
+fn gval_column_terminal(mut out: Vec<GVal>, tail: &[Step]) -> Option<Vec<GVal>> {
     match tail {
         [] => Some(out),
         // See the numeric arms: paging over a column is a slice.
@@ -1002,6 +1071,29 @@ fn column_terminal(
             Some(vec![GVal::Num(
                 distinct_values(out.into_iter()).len() as f64
             )])
+        }
+        // Peel one column-expressible step and let the arms above answer the
+        // rest — see `composed_num_terminal` for why this is a peel rather than
+        // one more arm per combination.
+        [Step::Limit(n, Scope::Global), t @ ..] => {
+            out.truncate(*n);
+            gval_column_terminal(out, t)
+        }
+        [Step::Skip(n, Scope::Global), t @ ..] => {
+            gval_column_terminal(out.split_off((*n).min(out.len())), t)
+        }
+        [Step::Range(lo, hi, Scope::Global), t @ ..] => {
+            let mut v = out.split_off((*lo).min(out.len()));
+
+            v.truncate(hi.saturating_sub(*lo));
+            gval_column_terminal(v, t)
+        }
+        // `tail(n)` is the LAST n.
+        [Step::Tail(n, Scope::Global), t @ ..] => {
+            gval_column_terminal(out.split_off(out.len().saturating_sub(*n)), t)
+        }
+        [Step::Dedupe { labels, bys }, t @ ..] if labels.is_empty() && bys.is_empty() => {
+            gval_column_terminal(distinct_values(out.into_iter()), t)
         }
         _ => None,
     }
@@ -1255,17 +1347,7 @@ fn num_column_terminal(nums: &[f64], filter: Option<&P>, tail: &[Step]) -> Optio
 
     match tail {
         [] => Some(nums.iter().copied().map(GVal::Num).collect()),
-        // PAGING over a column is a slice. It had no arm here and none in the
-        // generic tail either, so `values('n').limit(5)` declined BOTH and the
-        // traversal streamed every row it was about to throw away: 32.8ms,
-        // against 1.2ms for the same query with no limit at all. A limit made it
-        // 28x slower than no limit.
-        //
-        // `Scope::Local` is a different question — it pages WITHIN each value —
-        // and is not this.
-        [Step::Limit(n, Scope::Global)] => Some(page(nums, 0, *n)),
-        [Step::Skip(n, Scope::Global)] => Some(page(nums, *n, usize::MAX)),
-        [Step::Range(lo, hi, Scope::Global)] => Some(page(nums, *lo, hi.saturating_sub(*lo))),
+
         [Step::Fold] => Some(vec![GVal::List(
             nums.iter().copied().map(GVal::Num).collect(),
         )]),
@@ -1385,7 +1467,8 @@ fn num_column_terminal(nums: &[f64], filter: Option<&P>, tail: &[Step]) -> Optio
                 distinct.into_iter().map(GVal::Num).collect()
             })
         }
-        _ => None,
+        // Anything else: peel one column step and let these arms answer the rest.
+        _ => composed_num_terminal(nums, tail),
     }
 }
 

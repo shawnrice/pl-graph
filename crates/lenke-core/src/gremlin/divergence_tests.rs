@@ -1096,6 +1096,23 @@ fn a_computed_nan_column_matches_the_stream_in_every_terminal() {
         "groupCount()",
         "is(gt(0)).count()",
         "order()",
+        // COMPOSED tails, which peel one step and recurse. Each peel has to keep
+        // the NaN rule its direct arm has: `dedup` never keys a NaN (so every one
+        // survives) and `order` DECLINES on one (so the stream raises the fault
+        // rather than this swallowing it).
+        "dedup().limit(2)",
+        "dedup().count()",
+        "dedup().limit(2).count()",
+        "limit(2).count()",
+        "skip(1).count()",
+        "tail(2)",
+        "tail(2).count()",
+        "range(0, 2).count()",
+        "limit(2).fold()",
+        "dedup().order()",
+        "order().count()",
+        "order().by(desc).count()",
+        "order().limit(2).count()",
     ] {
         let lowered = run(&format!("g.V().values('x').{tail}"), &mut g);
         let streamed = run(&format!("g.V().values('x').barrier().{tail}"), &mut g);
@@ -1845,7 +1862,7 @@ fn paging_a_column_agrees_with_paging_the_stream() {
         )
     };
 
-    for (col, page) in [("n", "limit(5)"), ("s", "limit(5)")].into_iter().chain([
+    for (col, page) in [("n", "tail(5)"), ("s", "tail(5)")].into_iter().chain([
         ("n", "skip(5)"),
         ("s", "skip(5)"),
         ("n", "range(2, 7)"),
@@ -1876,6 +1893,46 @@ fn paging_a_column_agrees_with_paging_the_stream() {
                 "`{src}` paged from the column disagrees with paging the stream"
             );
         }
+    }
+
+    // COMPOSITIONS. Each part had an arm; the combination had none, so it
+    // streamed the whole traversal — `values('n').order().by(desc).count()` cost
+    // 58x the same query without the count. The terminal peels one step and
+    // recurses, so these are the shapes that peel more than once.
+    for src in [
+        "g.V().values('n').dedup().limit(5)",
+        "g.V().values('n').limit(5).count()",
+        "g.V().values('n').order().by(desc).count()",
+        "g.V().values('n').order().limit(3).count()",
+        "g.V().values('n').skip(2).limit(3)",
+        "g.V().values('n').limit(10).skip(2).count()",
+        "g.V().values('n').tail(5).count()",
+        "g.V().values('n').dedup().count()",
+        "g.V().values('n').dedup().order().limit(2)",
+        "g.V().values('n').range(2, 9).dedup().count()",
+        "g.V().values('n').order().by(desc).limit(4).sum()",
+        "g.V().values('n').limit(6).fold()",
+        "g.V().values('n').dedup().limit(3).max()",
+        "g.V().values('s').dedup().limit(5)",
+        "g.V().values('s').limit(5).count()",
+        "g.V().values('s').tail(5).count()",
+        "g.V().values('s').skip(2).limit(3)",
+        "g.V().values('s').range(1, 8).dedup().count()",
+        "g.V().hasLabel('P').out('R').values('n').dedup().limit(4).count()",
+    ] {
+        // `.identity()` right after `values(...)`: the tail now STARTS with a
+        // step neither terminal recognizes, so nothing composes and the whole
+        // thing streams — the same question down the other path.
+        let slow = src
+            .replace("values('n')", "values('n').identity()")
+            .replace("values('s')", "values('s').identity()");
+
+        assert_ne!(slow, src, "the oracle did not rewrite `{src}`");
+        assert_eq!(
+            rows(src, &mut g),
+            rows(&slow, &mut g),
+            "`{src}` composed off the column disagrees with the stream"
+        );
     }
 
     // `local` pages WITHIN each value and must not take the column arm.
