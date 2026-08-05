@@ -211,7 +211,13 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
     let mut it = Interner::default();
     let mut consumed = 1;
     let mut start = CNode {
-        var_slot: Some(0),
+        // UNBOUND, deliberately. The start is filtered — its label and inline
+        // constraints seed the scan — but nothing downstream reads it: the
+        // traverser's value after the prefix is the LAST element, and the planner
+        // service asks for that slot alone. Binding it anyway made `build_scan`
+        // carry a second id column through every hop and replicate it on every
+        // fan-out, for a column discarded on return.
+        var_slot: None,
         label: None,
         props: Vec::new(),
         where_: None,
