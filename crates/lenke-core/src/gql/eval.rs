@@ -3731,6 +3731,35 @@ fn vectorized_linear(
     }
 
     let ctx = resolve_ctx(graph, plan, params);
+
+    // The WALK, for the shape this function exists to catch: a plain
+    // `MATCH … RETURN <aggregate>`. With no middle clause the frame is built only
+    // to be folded, so when the fold reads one slot the join that pairs it with
+    // the others is work thrown away — `RETURN sum(b.n)` over a hop was 1.16ms
+    // against 0.50ms walked. Only when `mid` is empty: a later stage can read a
+    // slot this frame would not carry.
+    //
+    // The `segments` test is not redundant with the one inside — it keeps the
+    // CALL off the bare-node aggregate path, which cannot use a walk and is hot.
+    // Calling unconditionally and declining inside cost 1.14x on
+    // `MATCH (n:Person) RETURN min(n.age), max(n.age)` over 1M vertices, measured
+    // in isolation and traced to confirm the walk never fired: the callee always
+    // returned `None`, so this is codegen, and neither `#[inline]` nor
+    // `#[inline(never)]` moved it. A guard the callee repeats anyway is a cheaper
+    // answer than understanding LLVM's.
+    if mid.is_empty() && !patterns[0].segments.is_empty() {
+        if let Some(sc) = streamed_frame(
+            graph,
+            &ctx,
+            &patterns[0],
+            where_.as_ref(),
+            *scope_len,
+            last_proj,
+        ) {
+            return finish_linear(graph, &ctx, sc, last_proj);
+        }
+    }
+
     let filter = |sc: &mut ScanCols, w: &CExpr| {
         let keep: Vec<bool> = eval_vec(graph, &ctx, sc, w)
             .into_truth()
@@ -3788,19 +3817,30 @@ fn vectorized_linear(
             _ => return None,
         }
     }
-    let proj = last_proj;
-    let cols = project_frame_cols(graph, &ctx, &sc, proj)?;
+    finish_linear(graph, &ctx, sc, last_proj)
+}
+
+/// Project a finished frame to the statement's rows.
+///
+/// Split out so the walk can hand its one-column frame to exactly the same
+/// projection the joined frame goes through — the whole point of producing a
+/// frame rather than answering a shape.
+fn finish_linear(graph: &Graph, ctx: &Ctx, sc: ScanCols, proj: &CProjection) -> Option<RowSet> {
+    let cols = project_frame_cols(graph, ctx, &sc, proj)?;
     let nrows = cols.first().map_or(0, |c| c.len());
     let mut rs = RowSet::new(proj.out_names.clone());
+
     for i in 0..nrows {
         rs.push_row(cols.iter().map(|c| val_to_value(graph, &c[i])));
     }
+
     // A data exception during vectorized eval can't return `Err` from here; fall
     // back to the scalar path (this query shape is read-only, so re-running is
     // safe), which re-evaluates and surfaces the `CodeError`.
     if ctx.faulted() {
         return None;
     }
+
     Some(rs)
 }
 

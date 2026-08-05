@@ -99,7 +99,8 @@ pub(super) fn try_count_streamed(
     }
 
     let ctx = resolve_ctx(graph, plan, params);
-    let mut hops: Vec<(crate::seek::Dir, Vec<u32>)> = Vec::with_capacity(path.segments.len());
+    let mut hops: Vec<(crate::seek::Dir, Option<Vec<u32>>)> =
+        Vec::with_capacity(path.segments.len());
 
     for seg in &path.segments {
         // Every hop must be BARE. A constrained node or edge needs the rows built
@@ -117,9 +118,12 @@ pub(super) fn try_count_streamed(
 
         // An edge-type expression the IR cannot hold (`!T`, wildcard) would have
         // to be re-tested per edge, which the counting expansion cannot do.
+        //
+        // `None` here is ANY type and `Some(vec![])` is a name that resolved to
+        // nothing — `walk_count` reads it that way and answers 0.
         let etypes = match &seg.rel.label {
-            None => Vec::new(),
-            Some(l) => super::seek_lower::lower_labels(l, &ctx, true)?,
+            None => None,
+            Some(l) => Some(super::seek_lower::lower_labels(l, &ctx, true)?),
         };
 
         hops.push((

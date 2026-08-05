@@ -1286,17 +1286,37 @@ pub fn expand_edges(
 /// endpoints — a `DISTINCT` is [`crate::pipeline::OpClass::Buffering`] and this
 /// is the one place the two routes meet. Everything before it still streams.
 ///
-/// `hops` is `(direction, edge-type ids)` per segment; an EMPTY type list means
-/// any type. A hop with a filter on its node or edge cannot come here — the rows
-/// have to exist to be filtered — so the caller lowers only bare hops.
+/// `hops` is `(direction, edge types)` per segment, under [`Hop::etypes`]'s
+/// convention: `None` is ANY type, `Some(&[])` is NONE — a name that resolved to
+/// nothing. Those two must not be collapsed, and taking a bare `Vec` here did
+/// collapse them: GQL's `lower_labels` returns an empty list for an unresolved
+/// name, `expand` reads an empty list as "any", and `MATCH (a)-[:NONEXISTENT]->(b)`
+/// counted every edge in the graph. That is the fifth time this exact conflation
+/// has been written here, which is why the signature now refuses it.
+///
+/// (Gremlin's own `Hop` alias spells the same distinction the other way round —
+/// `None` for nothing, `Some(vec![])` for any — so its call site maps between
+/// them explicitly.)
+///
+/// A hop with a filter on its node or edge cannot come here — the rows have to
+/// exist to be filtered — so the caller lowers only bare hops.
 #[must_use]
 pub fn walk_count(
     graph: &Graph,
     seed: &[u32],
-    hops: &[(Dir, Vec<u32>)],
+    hops: &[(Dir, Option<Vec<u32>>)],
     loops: SelfLoops,
     distinct: bool,
 ) -> usize {
+    // A hop whose type name resolved to nothing matches nothing, so the whole
+    // walk does.
+    if hops
+        .iter()
+        .any(|(_, e)| e.as_ref().is_some_and(Vec::is_empty))
+    {
+        return 0;
+    }
+
     let Some(((dir, etypes), init)) = hops.split_last() else {
         // No expansion: the seeded set itself. Still subject to `distinct`, since
         // a seed can repeat an id.
@@ -1311,15 +1331,21 @@ pub fn walk_count(
     // one — never copies the seed.
     let mut cur: std::borrow::Cow<'_, [u32]> = std::borrow::Cow::Borrowed(seed);
 
+    // `expand` reads an empty list as ANY, which is what `None` means here; the
+    // `Some(&[])` case returned above.
+    let any: &[u32] = &[];
+
     for (d, e) in init {
-        cur = std::borrow::Cow::Owned(expand(graph, &cur, *d, e, loops));
+        cur = std::borrow::Cow::Owned(expand(graph, &cur, *d, e.as_deref().unwrap_or(any), loops));
     }
+
+    let last = etypes.as_deref().unwrap_or(any);
 
     if distinct {
-        return distinct_len(&expand(graph, &cur, *dir, etypes, loops));
+        return distinct_len(&expand(graph, &cur, *dir, last, loops));
     }
 
-    expand_count(graph, &cur, *dir, etypes, loops)
+    expand_count(graph, &cur, *dir, last, loops)
 }
 
 /// Distinct count over dense ids. Element identity IS the index, so this needs no

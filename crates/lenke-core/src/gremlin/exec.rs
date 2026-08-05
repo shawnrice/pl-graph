@@ -1364,7 +1364,15 @@ fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
 
     for (dir, etypes) in hops {
         match etypes {
-            Some(e) => resolved.push((dir, e)),
+            // This engine's `Hop` spells the type set the OPPOSITE way round from
+            // `seek::Hop`, which `walk_count` follows: here `Some(vec![])` is any
+            // type and `None` matches nothing; there `None` is any and
+            // `Some(&[])` matches nothing. Mapped explicitly rather than passed
+            // through, because the two readings differ only on the empty case and
+            // agree everywhere else — which is how the same conflation has landed
+            // five times.
+            Some(e) if e.is_empty() => resolved.push((dir, None)),
+            Some(e) => resolved.push((dir, Some(e))),
             None => matches_nothing = true,
         }
     }
@@ -1453,8 +1461,16 @@ fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
     let mut ids = seek.scan(graph, &no_params, || universe(graph, is_edge));
 
     if let Some((dir, etypes)) = edge_tail {
+        // `None` is ANY here — see the mapping above; a hop that matched nothing
+        // set `matches_nothing` and returned already.
         for (d, e) in &hops {
-            ids = crate::seek::expand(graph, &ids, *d, e, crate::seek::SelfLoops::Twice);
+            ids = crate::seek::expand(
+                graph,
+                &ids,
+                *d,
+                e.as_deref().unwrap_or(&[]),
+                crate::seek::SelfLoops::Twice,
+            );
         }
 
         let edges =

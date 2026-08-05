@@ -11345,6 +11345,99 @@ fn every_count_shortcut_agrees_on_multi_label_edges() {
     }
 }
 
+/// The one-slot WALK agrees with the joined frame on every shape it takes.
+///
+/// `streamed_frame` replaces the join with a frontier walk when the only slot
+/// anything reads is the one the walk lands on. The rows must be identical to the
+/// frame's projection onto that slot — `expand` emits one endpoint per traversed
+/// edge, so multiplicity is preserved — and every terminal then runs unchanged.
+/// This asserts that against `with_vec_override(false, …)`, which takes the
+/// matcher instead.
+///
+/// The fixture has a self-loop (an undirected hop counts it once in GQL), a
+/// non-first edge label (a walk reading only `e_type` sees a different graph than
+/// the matcher does), repeated property values (so DISTINCT and GROUP BY have
+/// something to collapse) and fan-in (so multiplicity is observable at all).
+#[test]
+fn the_walked_frame_agrees_with_the_joined_one() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{"k":1,"s":"p"}}"#,
+            r#"{"type":"node","id":"b","labels":["N","W"],"properties":{"k":7,"s":"q"}}"#,
+            r#"{"type":"node","id":"c","labels":["M"],"properties":{"k":3,"s":"p"}}"#,
+            r#"{"type":"node","id":"d","labels":["N"],"properties":{"k":7,"s":"q"}}"#,
+            r#"{"type":"node","id":"e","labels":["N"],"properties":{}}"#,
+            r#"{"type":"edge","id":"r0","from":"a","to":"b","labels":["X","Y"],"properties":{"w":1}}"#,
+            r#"{"type":"edge","id":"r1","from":"a","to":"c","labels":["Y"],"properties":{"w":2}}"#,
+            r#"{"type":"edge","id":"r2","from":"b","to":"d","labels":["Y"],"properties":{"w":3}}"#,
+            r#"{"type":"edge","id":"r3","from":"c","to":"d","labels":["Z","Y"],"properties":{"w":4}}"#,
+            r#"{"type":"edge","id":"r4","from":"e","to":"d","labels":["Y"],"properties":{"w":5}}"#,
+            r#"{"type":"edge","id":"r5","from":"b","to":"b","labels":["Y"],"properties":{"w":6}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    for q in [
+        // Plain rows off the landing slot — the shape the walk exists for.
+        "MATCH (a:N)-[:Y]->(b) RETURN b.k AS x",
+        "MATCH (a:N)-[:Y]->(b) WHERE a.k = 1 RETURN b.k AS x",
+        "MATCH (a)-[:Y]->(b) WHERE a.k > 1 RETURN b.s AS x",
+        "MATCH (a:N)-[:Y]->(b)-[:Y]->(c) RETURN c.k AS x",
+        // A property that is ABSENT on some rows, so the null path is exercised.
+        "MATCH (a)-[:Y]->(b) RETURN b.k AS x",
+        // Aggregates: one fold, and one per group.
+        "MATCH (a:N)-[:Y]->(b) RETURN sum(b.k) AS s",
+        "MATCH (a:N)-[:Y]->(b) RETURN count(*) AS c",
+        "MATCH (a:N)-[:Y]->(b) RETURN avg(b.k) AS s",
+        "MATCH (a:N)-[:Y]->(b) RETURN min(b.k) AS lo, max(b.k) AS hi",
+        "MATCH (a)-[:Y]->(b) RETURN b.k AS k, count(*) AS c",
+        "MATCH (a)-[:Y]->(b) RETURN b.s AS s, sum(b.k) AS t",
+        // The boundaries: DISTINCT, ORDER BY, paging.
+        "MATCH (a)-[:Y]->(b) RETURN DISTINCT b.k AS x",
+        "MATCH (a)-[:Y]->(b) RETURN b.k AS x ORDER BY x",
+        "MATCH (a)-[:Y]->(b) RETURN b.k AS x ORDER BY x DESC LIMIT 2",
+        "MATCH (a)-[:Y]->(b) RETURN b.k AS x LIMIT 3",
+        "MATCH (a)-[:Y]->(b) RETURN b.k AS x OFFSET 2",
+        "MATCH (a)-[:Y]->(b) RETURN count(DISTINCT b.k) AS c",
+        // Undirected, over the self-loop; GQL counts it once.
+        "MATCH (a:N)-[:Y]-(b) RETURN b.k AS x",
+        "MATCH (a)-[:Y]-(b) RETURN count(*) AS c",
+        // Reverse, untyped, disjoint, and a type that resolves to nothing.
+        "MATCH (a:N)<-[:Y]-(b) RETURN b.k AS x",
+        "MATCH (a:N)-[]->(b) RETURN b.k AS x",
+        "MATCH (a:N)-[:X|Y]->(b) RETURN b.k AS x",
+        "MATCH (a)-[:NONEXISTENT]->(b) RETURN b.k AS x",
+        "MATCH (a)-[r:NONEXISTENT]->(b) RETURN count(*) AS c",
+        // Reads a slot the walk does not carry — must DECLINE, and be right.
+        "MATCH (a:N)-[:Y]->(b) RETURN a.k AS x",
+        "MATCH (a:N)-[:Y]->(b) RETURN a.k AS x, b.k AS y",
+        "MATCH (a:N)-[r:Y]->(b) RETURN r.w AS w",
+        "MATCH (a:N)-[:Y]->(b) RETURN b.k AS x ORDER BY a.k",
+        "MATCH (a:N)-[:Y]->(b) RETURN a.k AS k, count(*) AS c",
+        "MATCH (a:N)-[:Y]->(b) RETURN *",
+        // Constrained segments — a filter needs a row, so these decline too.
+        "MATCH (a:N)-[:Y]->(b:W) RETURN b.k AS x",
+        "MATCH (a:N)-[:Y]->(b {k: 7}) RETURN b.k AS x",
+        "MATCH (a:N)-[:Y {w: 3}]->(b) RETURN b.k AS x",
+        "MATCH (a)-[:Y]->(b) WHERE b.k = 7 RETURN b.k AS x",
+        // Multi-segment with a LIMIT stays depth-first — the walk would hold every
+        // k-path to return a handful.
+        "MATCH (a)-[:Y]->(b)-[:Y]->(c) RETURN c.k AS x LIMIT 2",
+        // Var-length and bound path variables are different walks entirely.
+        "MATCH (a:N)-[:Y]->{1,2}(b) RETURN b.k AS x",
+        "MATCH p = (a:N)-[:Y]->{1,2}(b) RETURN b.k AS x",
+    ] {
+        let walked = rows(&mut g, q);
+        let joined = super::eval::with_vec_override(false, || rows(&mut g, q));
+
+        assert_eq!(
+            walked, joined,
+            "the walked frame disagrees with the matcher on `{q}`"
+        );
+    }
+}
+
 /// The STREAM route for `count(*)` agrees with the matcher on every shape it takes.
 ///
 /// `try_count_streamed` answers a pure count over bare hops by walking and

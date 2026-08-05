@@ -552,6 +552,199 @@ pub(super) struct SeedFrom<'a> {
     pub carry: Option<&'a ScanCols>,
 }
 
+/// A frame carrying only the LAST slot, walked rather than joined.
+///
+/// The middle ground between the columnar frame and a row-at-a-time stream. A
+/// frame materializes a column per bound slot and pairs them per row; a walk
+/// materializes the frontier and nothing else. When the only slot anything reads
+/// is the one the walk lands on, the pairing is work whose result is discarded —
+/// `MATCH (a:V)-[:R]->(b) WHERE a.n > 900 RETURN b.n` built 14,850 `(a, b)` pairs
+/// to project `b`.
+///
+/// The rows are IDENTICAL to the frame's projection onto that slot: `expand`
+/// emits one endpoint per traversed edge, so multiplicity is preserved and no
+/// downstream terminal can tell the difference. Every one of them — rows,
+/// aggregates, GROUP BY, ORDER BY — works unchanged, which is the reason to
+/// produce a frame here rather than answer any single shape.
+///
+/// This is what Gremlin's `try_values` has always done: expand to ids, gather the
+/// column. Two tight loops over `u32` and `f64`, no per-row binding at all — the
+/// distinction that matters is not stream-vs-columnar but how many columns the
+/// pairing has to carry.
+///
+/// Declines unless the walk can carry the whole meaning: every segment bare (a
+/// filter needs a row to reject), and the clause WHERE about the start alone,
+/// which is applied HERE because the caller's re-application reads a start column
+/// this frame does not have.
+pub(super) fn streamed_frame(
+    graph: &Graph,
+    ctx: &Ctx,
+    path: &CPath,
+    where_: Option<&CExpr>,
+    scope_len: usize,
+    proj: &CProjection,
+) -> Option<ScanCols> {
+    if path.segments.is_empty()
+        || path.path_var_slot.is_some()
+        || path.selector != PathSelector::Walk
+        || path.mode != PathMode::Trail
+    {
+        return None;
+    }
+
+    let last = path.segments.last()?.node.var_slot?;
+
+    // What the PROJECTION reads — deliberately not the caller's `needed`, which
+    // folds in the clause WHERE. The WHERE is applied here, over the seed, so its
+    // slots are not slots this frame has to carry; counting them made every
+    // filtered shape decline and the walk never fire at all.
+    let mut reads = Vec::new();
+
+    for it in proj.items.iter().chain(&proj.group_by) {
+        if !it.prog.read_slots(&mut reads) {
+            return None;
+        }
+    }
+
+    for k in &proj.order_by {
+        if !crate::gql::plan::compile_program(&k.expr).read_slots(&mut reads) {
+            return None;
+        }
+    }
+
+    for a in &proj.aggs {
+        if let Some(arg) = a.arg.as_ref() {
+            if !crate::gql::plan::compile_program(arg).read_slots(&mut reads) {
+                return None;
+            }
+        }
+    }
+
+    if proj.star {
+        reads.extend(proj.star_cols.iter().copied());
+    }
+
+    // The overlay is every input slot, so a sort key can name one the projection
+    // dropped. Only a sorting query reads it.
+    if !proj.order_by.is_empty() {
+        reads.extend(proj.order_overlay.iter().copied());
+    }
+
+    if reads.iter().any(|s| *s != last) {
+        return None;
+    }
+
+    // A multi-segment chain with a LIMIT stays with the scalar depth-first
+    // driver, which stops the instant the limit fills AT EVERY LEVEL. The walk is
+    // breadth-first: `expand` emits one row per traversed edge, so after k hops it
+    // holds every k-path — the cross-product the equivalent bail below was written
+    // for, "millions of rows to return a handful, and on a large graph an OOM".
+    //
+    // Measured on 50k vertices at degree 6, `RETURN … LIMIT 5`:
+    //
+    //   two hops    0.001ms guarded, 5.462ms walked
+    //   three hops  0.001ms guarded, 73.700ms walked
+    //
+    // — the growth the cross-product argument predicts, and the reason this is
+    // not left to a correctness test: the ROWS are identical either way, so
+    // removing this guard fails nothing.
+    //
+    // Aggregation, DISTINCT and ORDER BY genuinely need every row, so they still
+    // walk.
+    if path.segments.len() >= 2
+        && !proj.aggregating
+        && !proj.distinct
+        && proj.order_by.is_empty()
+        && proj.limit.is_some()
+    {
+        return None;
+    }
+
+    let start_slot = path.start.var_slot;
+
+    // The clause WHERE is applied here, over the seeded start, so it may not say
+    // anything about a slot the walk does not bind.
+    if where_.is_some_and(|w| crate::gql::plan::refs_slot(w, &|s| Some(s) != start_slot)) {
+        return None;
+    }
+
+    let mut hops: Vec<(crate::seek::Dir, Vec<u32>)> = Vec::with_capacity(path.segments.len());
+
+    for seg in &path.segments {
+        if seg.unit.is_some()
+            || seg.rel.quantifier.is_some()
+            || seg.rel.var_slot.is_some_and(|s| reads.contains(&s))
+            || !seg.rel.props.is_empty()
+            || seg.rel.where_.is_some()
+            || !seg.node.props.is_empty()
+            || seg.node.where_.is_some()
+            || seg.node.label.is_some()
+        {
+            return None;
+        }
+
+        // `lower_labels` returns an EMPTY list for a name that resolved to
+        // nothing, and `expand` reads an empty list as "any type". Decline rather
+        // than walk — the frame answers it correctly, and conflating the two made
+        // `MATCH (a)-[r:NONEXISTENT]->(b)` return every edge in the graph.
+        let etypes = match &seg.rel.label {
+            None => Vec::new(),
+            Some(l) => {
+                let ids = seek_lower::lower_labels(l, ctx, true)?;
+
+                if ids.is_empty() {
+                    return None;
+                }
+
+                ids
+            }
+        };
+
+        hops.push((
+            match seg.rel.direction {
+                Direction::Out => crate::seek::Dir::Out,
+                Direction::In => crate::seek::Dir::In,
+                Direction::Both => crate::seek::Dir::Both,
+            },
+            etypes,
+        ));
+    }
+
+    let mut ids = seek_lower::scan_node(graph, ctx, &path.start, where_, scope_len, None);
+
+    // The seed carries the start; filter it before walking, since the caller's
+    // pass cannot.
+    if let Some(w) = where_ {
+        let mut start_frame = ScanCols::new(scope_len);
+
+        start_frame.n = ids.len();
+        start_frame.slots[start_slot?] = Some((Elem::Node, ids));
+
+        let keep: Vec<bool> = eval_vec(graph, ctx, &start_frame, w)
+            .into_truth()
+            .iter()
+            .map(|t| *t == Some(true))
+            .collect();
+
+        compact(&mut start_frame, &keep);
+        ids = match start_frame.slots[start_slot?].take() {
+            Some((_, v)) => v,
+            None => return None,
+        };
+    }
+
+    for (dir, etypes) in &hops {
+        ids = crate::seek::expand(graph, &ids, *dir, etypes, ctx.loops);
+    }
+
+    let mut out = ScanCols::new(scope_len);
+
+    out.n = ids.len();
+    out.slots[last] = Some((Elem::Node, ids));
+
+    Some(out)
+}
+
 pub(super) fn build_scan(
     graph: &Graph,
     ctx: &Ctx,
@@ -2409,6 +2602,15 @@ pub(super) fn vectorized_frame(
         bail!();
     }
 
+    // The WALK: one materialized column instead of a whole frame, when the only
+    // slot anything reads is the one it lands on. Ahead of both bails below —
+    // it beats the scalar stream-fold they defer to (`RETURN sum(b.n)` over a hop
+    // was 1.16ms scalar against 0.50ms walked) and it applies the clause WHERE
+    // itself, so it must return before the re-application at the end.
+    if let Some(sc) = streamed_frame(graph, ctx, path, where_.as_ref(), *scope_len, proj) {
+        return Some(sc);
+    }
+
     // A pure aggregate over a traversal with no WHERE stays scalar: the scalar
     // engine stream-folds the join without materializing it, and there's no
     // per-row expression to vectorize. With a WHERE, the batched build + masked
@@ -2447,10 +2649,29 @@ pub(super) fn vectorized_frame(
     // every execution, which measured 2.7x on `RETURN n.name LIMIT 100` (1.6us,
     // where a few allocations are the whole query).
     let needed: Option<Vec<usize>> = (|| {
-        if !patterns
+        // Two consumers, so two reasons to compute it. Group columns cost an
+        // allocation per row per variable; a bare-hop chain can skip the whole
+        // JOIN when only its landing slot is read (`streamed_frame`). The gate
+        // stays a cheap structural test either way — computing this eagerly
+        // COMPILES the sort keys and clause WHERE on every execution, which
+        // measured 2.7x on `RETURN n.name LIMIT 100`.
+        let quantified = patterns
             .iter()
-            .any(|p| p.segments.iter().any(|s| s.unit.is_some()))
-        {
+            .any(|p| p.segments.iter().any(|s| s.unit.is_some()));
+        let walkable = patterns.len() == 1
+            && !patterns[0].segments.is_empty()
+            && patterns[0].path_var_slot.is_none()
+            && patterns[0].segments.iter().all(|s| {
+                s.unit.is_none()
+                    && s.rel.quantifier.is_none()
+                    && s.rel.props.is_empty()
+                    && s.rel.where_.is_none()
+                    && s.node.props.is_empty()
+                    && s.node.where_.is_none()
+                    && s.node.label.is_none()
+            });
+
+        if !quantified && !walkable {
             return None;
         }
 
