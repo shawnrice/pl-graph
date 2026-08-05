@@ -2928,8 +2928,17 @@ pub(super) fn project_frame_cols(
             dense_sort_key(graph, ctx, &sort_sc, &s.expr)
                 .map(|(k, v)| (k, v, s.descending, s.nulls_first))
         });
+        // A NUMERIC key, the same idea one type over: a flat `f64` array instead
+        // of the boxed comparator.
+        let num_key: Option<NumSortCol> = (dense_key.is_none())
+            .then(|| {
+                single.and_then(|s| {
+                    num_sort_key(graph, ctx, &sort_sc, &s.expr).map(|k| (k, s.descending))
+                })
+            })
+            .flatten();
         // Duration (no dense key): compare Copy temporals via `cmp_total`.
-        let temporal_key: Option<TypedSortCol> = (dense_key.is_none())
+        let temporal_key: Option<TypedSortCol> = (dense_key.is_none() && num_key.is_none())
             .then(|| {
                 single.and_then(|s| {
                     temporal_sort_key(graph, ctx, &sort_sc, &s.expr)
@@ -2938,14 +2947,15 @@ pub(super) fn project_frame_cols(
             })
             .flatten();
         // Only the generic path needs the `Vec<Val>` keycols.
-        let keycols: Vec<Vec<Val>> = if dense_key.is_some() || temporal_key.is_some() {
-            Vec::new()
-        } else {
-            proj.order_by
-                .iter()
-                .map(|s| eval_vec(graph, ctx, &sort_sc, &s.expr).into_vals())
-                .collect()
-        };
+        let keycols: Vec<Vec<Val>> =
+            if dense_key.is_some() || num_key.is_some() || temporal_key.is_some() {
+                Vec::new()
+            } else {
+                proj.order_by
+                    .iter()
+                    .map(|s| eval_vec(graph, ctx, &sort_sc, &s.expr).into_vals())
+                    .collect()
+            };
         // Total-order comparator: the ORDER BY keys, then the original row index as
         // a final tiebreak. The index tiebreak makes ties resolve to scan order —
         // identical to the previous *stable* full sort — while allowing an unstable
@@ -2960,6 +2970,14 @@ pub(super) fn project_frame_cols(
                     *descending,
                     *nulls_first,
                 );
+                return if o != Ordering::Equal { o } else { i.cmp(&j) };
+            }
+            if let Some((key, descending)) = &num_key {
+                // No NaN reaches here — `num_sort_key` declines a column holding
+                // one — so this is a plain comparison.
+                let o = key[i].partial_cmp(&key[j]).unwrap_or(Ordering::Equal);
+                let o = if *descending { o.reverse() } else { o };
+
                 return if o != Ordering::Equal { o } else { i.cmp(&j) };
             }
             if let Some((key, descending, nulls_first)) = &temporal_key {

@@ -11443,6 +11443,113 @@ fn every_count_shortcut_agrees_on_multi_label_edges() {
     }
 }
 
+/// The unboxed numeric sort agrees with the boxed one.
+///
+/// `ORDER BY` cost 9-18x the same query without one, and the comparator was why:
+/// `compare_sort` over two boxed `Val`s does two `is_nullish` matches, two
+/// `type_rank` calls and a `Vec` index, where Gremlin compares `f64`. Extracting
+/// a flat `f64` key is 1.9x on 150k rows.
+///
+/// Everything that could differ is a tie, a null or a NaN, so all three are in
+/// the fixture: ties must resolve to SCAN ORDER (the index tiebreak, matching
+/// the stable boxed sort), a null must make the unboxed path DECLINE rather than
+/// guess a placement, and a NaN must sort LAST — it is a value, the greatest
+/// one, not a null.
+///
+/// The NaN has to be COMPUTED into the projection. A stored one is no longer
+/// reachable: every write coerces a non-finite to null.
+#[test]
+fn the_unboxed_numeric_sort_agrees_with_the_boxed_one() {
+    let mut lines: Vec<String> = Vec::new();
+
+    for i in 0..40 {
+        // Heavy duplication, so most comparisons are TIES.
+        let mut props = format!(r#""k":{}"#, i % 5);
+
+        // Some rows carry no `m` at all — a null key, which the unboxed path
+        // must DECLINE rather than guess a placement for.
+        if i % 3 != 0 {
+            props.push_str(&format!(r#","m":{}"#, i % 7));
+        }
+
+        lines.push(format!(
+            r#"{{"type":"node","id":"n{i}","labels":["P"],"properties":{{{props}}}}}"#
+        ));
+    }
+
+    for i in 0..39 {
+        lines.push(format!(
+            r#"{{"type":"edge","id":"e{i}","from":"n{i}","to":"n{}","labels":["R"],"properties":{{}}}}"#,
+            (i * 7 + 1) % 40
+        ));
+    }
+
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    // A third column that is numeric on most rows and NULL on a few — `sqrt(-1)`
+    // computes a NaN and the write coerces it, which is the only way a null
+    // lands in the middle of an otherwise numeric column.
+    let _ = q(
+        &mut g,
+        "MATCH (n:P) WHERE n.k = 2 SET n.z = sqrt(-1) RETURN count(*) AS c",
+    );
+    let _ = q(
+        &mut g,
+        "MATCH (n:P) WHERE n.k <> 2 SET n.z = n.k RETURN count(*) AS c",
+    );
+
+    for query in [
+        // Ties everywhere, both directions, alias and property spellings.
+        "MATCH (n:P) RETURN n.k AS x ORDER BY x",
+        "MATCH (n:P) RETURN n.k AS x ORDER BY x DESC",
+        "MATCH (n:P) RETURN n.k AS x ORDER BY n.k",
+        "MATCH (n:P)-[:R]->(b) RETURN b.k AS x ORDER BY x",
+        "MATCH (n:P)-[:R]->(b) RETURN b.k AS x ORDER BY x DESC",
+        // Paging over the sorted result.
+        "MATCH (n:P) RETURN n.k AS x ORDER BY x LIMIT 5",
+        "MATCH (n:P) RETURN n.k AS x ORDER BY x DESC LIMIT 5",
+        "MATCH (n:P) RETURN n.k AS x ORDER BY x OFFSET 5",
+        "MATCH (n:P) RETURN n.k AS x ORDER BY x OFFSET 3 LIMIT 4",
+        "MATCH (n:P) RETURN n.k AS x ORDER BY x LIMIT 0",
+        // A NULL key: the unboxed path declines, the boxed one places nulls.
+        "MATCH (n:P) RETURN n.m AS x ORDER BY x",
+        "MATCH (n:P) RETURN n.m AS x ORDER BY x DESC",
+        "MATCH (n:P) RETURN n.m AS x ORDER BY x LIMIT 5",
+        // Nulls interleaved with numbers in one column.
+        "MATCH (n:P) RETURN n.z AS x ORDER BY x",
+        "MATCH (n:P) RETURN n.z AS x ORDER BY x DESC",
+        "MATCH (n:P) RETURN n.z AS x ORDER BY x LIMIT 6",
+        // A COMPUTED NaN, which is a value and not a null — the unboxed path
+        // declines it and the boxed comparator sorts it last.
+        "MATCH (n:P) RETURN sqrt(n.k - 2) AS x ORDER BY x",
+        "MATCH (n:P) RETURN sqrt(n.k - 2) AS x ORDER BY x DESC",
+        "MATCH (n:P) RETURN sqrt(n.k - 2) AS x ORDER BY x LIMIT 6",
+        "MATCH (n:P) RETURN sqrt(n.k - 2) AS x, n.k AS y ORDER BY x",
+        // Carrying another column along, so the PERMUTATION is observable and
+        // not just the sorted key.
+        "MATCH (n:P) RETURN n.k AS x, n.m AS y ORDER BY x",
+        "MATCH (n:P) RETURN n.k AS x, n.m AS y ORDER BY x DESC LIMIT 7",
+        // Two keys — the unboxed path takes only a single key.
+        "MATCH (n:P) RETURN n.k AS x, n.m AS y ORDER BY x, y",
+        // A non-numeric key stays boxed.
+        "MATCH (n:P) RETURN n.k AS x ORDER BY x, n.k",
+    ] {
+        // Compared as DEBUG STRINGS, not values: `NaN != NaN` under `PartialEq`,
+        // so `assert_eq!` on rows holding one fails while printing two identical
+        // lists. The projections above compute NaNs on purpose.
+        let fast = format!("{:?}", rows(&mut g, query));
+        let boxed = format!(
+            "{:?}",
+            super::eval::with_vec_override(false, || rows(&mut g, query))
+        );
+
+        assert_eq!(
+            fast, boxed,
+            "the unboxed numeric sort disagrees with the boxed one on `{query}`"
+        );
+    }
+}
+
 /// A computed NaN sorts LAST, and it is the sort that has to say so.
 ///
 /// The fast-vs-boxed comparison next door is an internal-consistency oracle: it

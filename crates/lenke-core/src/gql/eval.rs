@@ -2836,6 +2836,7 @@ fn temporal_sort_key(
 /// A single-key **dense** ORDER BY sort column: packed `i128` keys + a presence
 /// flag per row, plus the key's `descending` and `nulls_first` spec.
 type DenseSortCol = (Vec<i128>, Vec<bool>, bool, Option<bool>);
+type NumSortCol = (Vec<f64>, bool);
 /// A single-key **typed** ORDER BY sort column (Duration): `Option<Temporal>` per
 /// row (absent → `None`), plus `descending` and `nulls_first`.
 type TypedSortCol = (Vec<Option<crate::temporal::Temporal>>, bool, Option<bool>);
@@ -2881,6 +2882,81 @@ fn dense_sort_key(
 /// (same null placement + direction) but on `(i128 key, present)` — a plain integer
 /// compare, no `Val`, no `cmp_total` dispatch.
 #[inline]
+/// A single NUMERIC sort key as a flat `f64` array, or `None`.
+///
+/// The sibling of [`dense_sort_key`], which does this for instants. `ORDER BY`
+/// costs 9-18x the same query without one and ~9x the Gremlin spelling, and the
+/// comparator is why: `compare_sort` over two boxed `Val`s does two `is_nullish`
+/// matches, two `type_rank` calls and a `Vec` index, where Gremlin compares
+/// `f64`.
+///
+/// The key is usually an OUTPUT ALIAS — `RETURN b.n AS x ORDER BY x` compiles to
+/// `Var(0)` — so that form matters more than the property form and is checked
+/// first.
+///
+/// Declines on ANY null, and on any NaN.
+///
+/// Null placement is absolute (independent of ASC/DESC) and getting it subtly
+/// wrong here reorders rows silently.
+///
+/// NaN is the more interesting one. `cmp_total` compares it EQUAL to every
+/// number, which is not a total order — `a == b`, `b < c` and `a == c` can all
+/// hold — and Rust's sort detects that and ABORTS. That is a live latent panic
+/// on the scalar path, reachable through `ORDER BY` over a column holding a
+/// stored NaN (`SET z = sqrt(-1)` makes one), and it is NOT fixable here:
+/// ordering NaN last makes the comparator total but breaks byte-identity with
+/// the TS engine, which treats the comparison as unordered too — measured, the
+/// differential fuzzer failed on every seed. Aligning the two is a cross-engine
+/// decision, not a local one.
+///
+/// So this path declines a NaN rather than inherit the problem, exactly as
+/// Gremlin's `order` column arm does.
+fn num_sort_key(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> Option<Vec<f64>> {
+    let vals: Option<&[Val]> = match e {
+        CExpr::Var(slot) => sc.val_slot(*slot),
+        _ => None,
+    };
+
+    if let Some(vals) = vals {
+        let mut out = Vec::with_capacity(vals.len());
+
+        for v in vals {
+            match v {
+                Val::Num(n) if !n.is_nan() => out.push(*n),
+                _ => return None,
+            }
+        }
+
+        return Some(out);
+    }
+
+    // The property form: `ORDER BY a.n` rather than the alias over it.
+    let CExpr::Prop { var_slot, key_ref } = e else {
+        return None;
+    };
+    let (elem, ids) = sc.slot(*var_slot)?;
+    let (store, kid) = match elem {
+        Elem::Node => (&graph.props, ctx.prop_keys[*key_ref].0),
+        Elem::Edge => (&graph.edge_props, ctx.prop_keys[*key_ref].1),
+    };
+    let Some(Column::Num { data, present }) = kid.and_then(|k| store.cols.get(k as usize)) else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(ids.len());
+
+    for &vi in ids {
+        let i = vi as usize;
+
+        if !present.get(i) || data[i].is_nan() {
+            return None; // a null or a NaN: see above
+        }
+
+        out.push(data[i]);
+    }
+
+    Some(out)
+}
+
 fn dense_compare_sort(
     a: i128,
     a_present: bool,
