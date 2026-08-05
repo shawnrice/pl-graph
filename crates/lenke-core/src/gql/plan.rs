@@ -826,26 +826,23 @@ impl CProjection {
     /// The grouping keys: explicit `GROUP BY` items if present, else the
     /// non-aggregate output items (implicit grouping).
     ///
-    /// OPEN — `GROUP BY` does not resolve an OUTPUT ALIAS, and silently groups
-    /// everything into one. `ORDER BY` does resolve one (5f028be), so the two
-    /// clauses disagree about what a bare name in them means:
+    /// `GROUP BY` does NOT resolve an output alias and `ORDER BY` does, which
+    /// is the standard's design rather than an inconsistency:
     ///
     /// ```text
-    ///   RETURN n.t AS t, count(*) AS c GROUP BY n.t   →  [x, 3], [y, 2]   correct
-    ///   RETURN n.t AS t, count(*) AS c GROUP BY t     →  [x, 5]           one group
-    ///   RETURN n.t AS u, count(*) AS c GROUP BY u     →  [x, 5]           same
+    ///   primitiveResultStatement : returnStatement orderByAndPageStatement?
+    ///   returnStatementBody      : … returnItemList groupByClause?
     /// ```
     ///
-    /// The surviving row takes the FIRST row's value, which is what grouping by
-    /// a constant looks like. Not a cross-engine divergence — the TS engine
-    /// returns the same three answers, byte for byte — so the fuzzers cannot see
-    /// it, and it is not new.
+    /// `GROUP BY` sits INSIDE the return body, so it groups the INPUT bindings —
+    /// its grouping element is a `bindingVariableReference`, a name that must
+    /// already be bound. `ORDER BY` is a SEPARATE statement applied after the
+    /// projection, and its sort key is a full `expression`, so an output column
+    /// is in scope there. Computing a grouping key is spelled `LET k = … GROUP
+    /// BY k` (which is how the ISO examples do it), not `RETURN … AS k GROUP BY k`.
     ///
-    /// Deciding it needs the ISO grammar, not a patch: if `GROUP BY <alias>` is
-    /// not legal GQL then the fix is to REJECT it at plan time (a wrong answer
-    /// becoming an error), and if it is legal the fix is to resolve it the way
-    /// `ORDER BY` already does. Either way it lands in both engines together.
-    /// Found while checking NaN ordering (7855bfb).
+    /// An unbound name used to read as NULL here — see
+    /// [`CQuery::unbound_group_keys`], which now faults instead.
     pub fn group_keys(&self) -> Vec<&CReturnItem> {
         if self.group_by.is_empty() {
             self.items.iter().filter(|i| !i.is_agg).collect()
@@ -1066,6 +1063,18 @@ pub struct CQuery {
     /// Names of unknown/unimplemented functions the query references — surfaced
     /// in the `UnknownFunction` error when one faults.
     pub unknown_fns: Vec<String>,
+    /// Names a `GROUP BY` referenced that no clause binds.
+    ///
+    /// ISO GQL's `groupingElement` is a `bindingVariableReference` — a bare name
+    /// that must already be BOUND. An unbound one lowered to the `UNBOUND` slot,
+    /// which reads as NULL, so every row keyed the same and the query silently
+    /// returned ONE group holding the first row's values. `GROUP BY zzz` did it
+    /// as readily as `GROUP BY <a RETURN alias>`.
+    ///
+    /// Collected at plan time and raised at execute, like `unknown_fns` and for
+    /// the same reason: the lowering has no error channel, and a wrong answer is
+    /// worse than a late error.
+    pub unbound_group_keys: Vec<String>,
 }
 
 /// Collapse a field access on a stored-property base into a single `PropField`
@@ -1388,6 +1397,26 @@ struct Lowerer {
     /// message when one of them faults at execute time (they eval to a fault,
     /// not a value).
     unknown_fns: Vec<String>,
+    /// Names a `GROUP BY` referenced that are not bound — see
+    /// [`CQuery::unbound_group_keys`].
+    unbound_group_keys: Vec<String>,
+}
+
+/// The variable a grouping element references, when it does not resolve.
+///
+/// ISO GQL's `groupingElement` is a `bindingVariableReference` — a bare name —
+/// and we additionally accept the property spelling `GROUP BY n.t`, so those two
+/// shapes are what this checks. A grouping key built out of a larger expression
+/// (`GROUP BY foo(zzz)`) is well outside the grammar and is NOT checked here; it
+/// keeps the old read-as-NULL behaviour.
+fn unbound_group_name(e: &Expr, scope: &[String]) -> Option<String> {
+    let name = match e {
+        Expr::Var(n) => n,
+        Expr::Prop { variable, .. } => variable,
+        _ => return None,
+    };
+
+    (!scope.iter().any(|s| s == name)).then(|| name.clone())
 }
 
 /// Intern `name` into `table`, returning its ref index.
@@ -1936,6 +1965,24 @@ impl Lowerer {
             .group_by
             .iter()
             .map(|e| {
+                // ISO GQL's `groupingElement` is a `bindingVariableReference`,
+                // so every name here has to be BOUND already. An unbound one
+                // lowers to the `UNBOUND` slot and reads as NULL, which keys
+                // every row the same and silently collapses the result to one
+                // group — recorded so the execute entry can fault instead.
+                //
+                // The common way to hit it is a RETURN alias: `RETURN n.t AS t
+                // … GROUP BY t` reads as grouping by `t`, but the alias names an
+                // OUTPUT column and `GROUP BY` runs over the INPUT bindings.
+                // (`ORDER BY` is a separate statement applied AFTER the return
+                // body, which is why an alias does resolve there — the two
+                // clauses differ by design, not by accident.)
+                if let Some(name) = unbound_group_name(e, &self.scope) {
+                    if !self.unbound_group_keys.contains(&name) {
+                        self.unbound_group_keys.push(name);
+                    }
+                }
+
                 let expr = self.expr(e);
                 let prog = compile_program(&expr);
                 CReturnItem {
@@ -2384,6 +2431,7 @@ pub fn lower_predicate(var: &str, e: &Expr) -> CPredicate {
         keys: Vec::new(),
         labels: Vec::new(),
         unknown_fns: Vec::new(),
+        unbound_group_keys: Vec::new(),
     };
     let expr = l.expr(e);
     CPredicate {
@@ -2688,6 +2736,7 @@ fn try_decorrelate(c: &CallInline, outer: &[String]) -> Option<(MatchClause, Wit
         keys: Vec::new(),
         labels: Vec::new(),
         unknown_fns: Vec::new(),
+        unbound_group_keys: Vec::new(),
     };
     let cproj = probe.projection(proj, true);
     // A GLOBAL-aggregate body (all items aggregate, no inner grouping key) yields
@@ -2753,6 +2802,7 @@ pub fn lower(query: &Query) -> (CQuery, Vec<String>) {
         keys: Vec::new(),
         labels: Vec::new(),
         unknown_fns: Vec::new(),
+        unbound_group_keys: Vec::new(),
     };
     let parts = query.parts.iter().map(|p| l.linear(p)).collect();
     let cquery = CQuery {
@@ -2761,6 +2811,7 @@ pub fn lower(query: &Query) -> (CQuery, Vec<String>) {
         key_names: l.keys,
         label_names: l.labels,
         unknown_fns: l.unknown_fns,
+        unbound_group_keys: l.unbound_group_keys,
     };
     (cquery, l.params)
 }

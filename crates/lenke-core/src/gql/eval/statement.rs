@@ -1270,6 +1270,34 @@ pub(super) fn check_unknown_fns(unknown_fns: &[String]) -> CodeResult<()> {
     ))
 }
 
+/// Fault on a `GROUP BY` naming something no clause binds.
+///
+/// ISO GQL's `groupingElement` is a `bindingVariableReference`, so the name has
+/// to be bound already. An unbound one used to read as NULL, which keys every
+/// row the same: the query silently returned ONE group holding the first row's
+/// values instead of the grouping the reader asked for.
+///
+/// The message names `LET`/`WITH` because the usual way in is a RETURN alias —
+/// `RETURN n.t AS t … GROUP BY t` — and the fix is to bind the value BEFORE the
+/// projection, which is how the ISO examples spell it.
+pub(super) fn check_unbound_group_keys(unbound: &[String]) -> CodeResult<()> {
+    if unbound.is_empty() {
+        return Ok(());
+    }
+
+    let names = unbound.join(", ");
+
+    Err(CodeError::new(
+        ErrorCode::UnknownFunction,
+        format!(
+            "GROUP BY references an unbound variable: {names}. GROUP BY groups the \
+             INPUT bindings, so it cannot see a RETURN alias (ORDER BY, which runs \
+             after the projection, can). Bind it first — `LET {names} = …` or \
+             `WITH … AS {names}` — or group by the property directly."
+        ),
+    ))
+}
+
 /// Push every `CCount::Param` slot referenced by a projection anywhere in the
 /// clause list — including nested CALL-subquery bodies — into `out`.
 pub(super) fn collect_count_param_slots(clauses: &[CClause], out: &mut Vec<usize>) {
@@ -1323,6 +1351,7 @@ pub(super) fn run_cquery_body(
     params: &[Val],
 ) -> CodeResult<RowSet> {
     check_unknown_fns(&plan.unknown_fns)?;
+    check_unbound_group_keys(&plan.unbound_group_keys)?;
     check_count_params(plan, params)?;
     if has_nested_aggregate(plan) {
         return Err(CodeError::new(
@@ -1570,6 +1599,7 @@ pub(super) fn run_cquery_arrow(
     params: &[Val],
 ) -> CodeResult<Vec<u8>> {
     check_unknown_fns(&plan.unknown_fns)?;
+    check_unbound_group_keys(&plan.unbound_group_keys)?;
     if has_nested_aggregate(plan) {
         return Err(CodeError::new(
             ErrorCode::Unsupported,

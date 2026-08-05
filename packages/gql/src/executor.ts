@@ -1668,6 +1668,17 @@ type CProjection = {
   aggregating: boolean;
   /** The non-aggregate item closures, used to build each group's key. */
   groupKeys: readonly CompiledExpr[];
+  /**
+   * The variable each EXPLICIT `GROUP BY` element references, for the bare-name
+   * and `n.key` spellings — checked against the binding before grouping.
+   *
+   * ISO GQL's `groupingElement` is a `bindingVariableReference`, so the name has
+   * to be bound already. An unbound one reads as null here, which keys every row
+   * the same and silently returns ONE group holding the first row's values.
+   * There is no compile-time scope in this engine, so the binding — which IS the
+   * scope — is what we check, once, rather than per row.
+   */
+  groupKeyNames: readonly string[];
   /** ISO HAVING — a post-aggregation predicate on each group (SELECT only). */
   having?: CompiledExpr;
   orderBy: readonly CSortItem[];
@@ -1694,6 +1705,35 @@ const noteCountParam = (v: CountValue | undefined): void => {
   }
 };
 
+/**
+ * Fault on a `GROUP BY` naming something the binding does not carry.
+ *
+ * Unbound reads as null, which keys every row the same: the query silently
+ * returned ONE group holding the first row's values instead of the grouping the
+ * reader asked for. `GROUP BY zzz` did it as readily as `GROUP BY <a RETURN
+ * alias>` — and the alias is the common way in, because `RETURN n.t AS t … GROUP
+ * BY t` reads as if it should work. It cannot: `GROUP BY` sits INSIDE the return
+ * body and groups the input bindings, while `ORDER BY` is a separate statement
+ * applied after the projection, which is why an alias resolves there. The two
+ * clauses differ by design.
+ *
+ * Mirrors the Rust `check_unbound_group_keys`, which asks the same question
+ * against the lowering scope.
+ */
+const assertGroupKeysBound = (names: readonly string[], binding: Binding): void => {
+  for (const name of names) {
+    if (!binding.has(name)) {
+      throw new LenkeError(
+        `GROUP BY references an unbound variable: ${name}. GROUP BY groups the ` +
+          `INPUT bindings, so it cannot see a RETURN alias (ORDER BY, which runs ` +
+          `after the projection, can). Bind it first — \`LET ${name} = …\` or ` +
+          `\`WITH … AS ${name}\` — or group by the property directly.`,
+        { code: ErrorCode.UnknownFunction },
+      );
+    }
+  }
+};
+
 const compileProjection = (projection: Projection): CProjection => {
   const items: CReturnItem[] = projection.items.map((i) => ({
     name: i.alias ?? columnName(i.expr),
@@ -1713,6 +1753,18 @@ const compileProjection = (projection: Projection): CProjection => {
     groupByExprs.length > 0
       ? groupByExprs.map((e) => compileExpr(e))
       : items.filter((i) => !i.isAgg).map((i) => i.fn);
+  // Only the shapes ISO allows (a bare name) plus the property spelling we accept
+  // on top of it. A grouping key built from a larger expression is outside the
+  // grammar and is not checked.
+  const groupKeyNames = groupByExprs
+    .map((e) => {
+      if (e.kind === 'var') {
+        return e.name;
+      }
+
+      return e.kind === 'prop' ? e.variable : undefined;
+    })
+    .filter((n): n is string => n !== undefined);
   // ORDER BY keys are evaluated against the projected output overlaid on the
   // input binding (see `applyProjection`), so output aliases resolve even inside
   // an expression — `ORDER BY n + 2` uses the column `n`, not the input variable.
@@ -1736,6 +1788,7 @@ const compileProjection = (projection: Projection): CProjection => {
     items,
     aggregating,
     groupKeys,
+    groupKeyNames,
     ...(having ? { having } : {}),
     orderBy,
     orderNeedsOutput,
@@ -1931,6 +1984,8 @@ export const applyProjection = (
     const groups = new Map<string, Binding[]>();
 
     for (const b of bindings) {
+      assertGroupKeysBound(proj.groupKeyNames, b);
+
       const key = JSON.stringify(
         proj.groupKeys.map((fn) => valueKey(fn({ binding: b, params, graph }))),
       );

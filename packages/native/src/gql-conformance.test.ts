@@ -164,7 +164,7 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
     expect(ts).toBe(`[{"c":1}]`);
     // The group holds every row, and its key renders as a plain `0`.
     const [gts, gnative] = both(
-      `MATCH (n:Person) RETURN (n.age - 30) * 0 AS k, count(*) AS c GROUP BY k`,
+      `MATCH (n:Person) LET k = (n.age - 30) * 0 RETURN k, count(*) AS c GROUP BY k`,
     );
 
     expect(gts).toBe(gnative);
@@ -3066,7 +3066,7 @@ suite('signed zero is one grouping key, nested or not', () => {
     for (const q of [
       // `0 * -1` is -0 and `0 * 4` is 0 — ONE group, and it renders as `0`.
       `MATCH (n:T) RETURN count(DISTINCT {b: (0 * n.x)}) AS x`,
-      `MATCH (n:T) RETURN (0 * n.x) AS k, count(*) AS c GROUP BY k`,
+      `MATCH (n:T) LET k = (0 * n.x) RETURN k, count(*) AS c GROUP BY k`,
       `MATCH (n:T) RETURN count(DISTINCT {a: 1, b: (0 * n.x)}) AS x`,
       `MATCH (n:T) RETURN count(DISTINCT {b: [0 * n.x]}) AS x`,
       `MATCH (n:T) RETURN count(DISTINCT (0 * n.x)) AS x`,

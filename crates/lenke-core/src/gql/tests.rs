@@ -10467,12 +10467,26 @@ fn distinct_collapses_signed_zero_but_not_ordinary_values() {
         vec![vec![n(1.0)]]
     );
     // And a GROUP BY over the same values yields one group holding both rows.
+    //
+    // Bound with `LET` so the grouping is REAL. Spelled `RETURN … AS k … GROUP BY
+    // k` this asserted nothing: `GROUP BY` cannot see a RETURN alias, the key read
+    // as NULL, and every row landed in one group whatever the values were — so the
+    // -0.0/0.0 question it exists to ask was never put.
     assert_eq!(
         rows(
             &mut g,
-            "MATCH (n:T) RETURN CASE WHEN n.n = 3 THEN 0.0 ELSE -0.0 END AS k, count(*) AS c GROUP BY k"
+            "MATCH (n:T) LET k = CASE WHEN n.n = 3 THEN 0.0 ELSE -0.0 END RETURN k, count(*) AS c GROUP BY k"
         ),
         vec![vec![n(0.0), n(2.0)]]
+    );
+    // The same shape over values that are genuinely different must NOT collapse —
+    // otherwise the assertion above still passes when grouping is broken.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (n:T) LET k = CASE WHEN n.n = 3 THEN 1.0 ELSE 2.0 END RETURN k, count(*) AS c GROUP BY k ORDER BY k"
+        ),
+        vec![vec![n(1.0), n(1.0)], vec![n(2.0), n(1.0)]]
     );
     // Infinities stay distinct from each other and from NaN.
     assert_eq!(
@@ -12091,5 +12105,78 @@ fn the_vectorized_extreme_agrees_with_the_scalar_one_on_a_nan() {
 
         assert_eq!(vectorized, want, "the vectorized fold on `{query}`");
         assert_eq!(scalar, want, "the scalar fold on `{query}`");
+    }
+}
+
+/// `GROUP BY` names a BOUND variable, and an unbound one faults rather than
+/// silently collapsing the result.
+///
+/// ISO GQL's `groupingElement` is a `bindingVariableReference`. An unbound name
+/// lowered to the `UNBOUND` slot, which reads as NULL — so every row keyed the
+/// same and the query returned ONE group holding the first row's values. It
+/// returned that for `GROUP BY zzz` as readily as for a RETURN alias, and a
+/// caller could not tell either from a real answer.
+#[test]
+fn a_group_by_must_name_a_bound_variable() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["P"],"properties":{"t":"x"}}"#,
+        r#"{"type":"node","id":"b","labels":["P"],"properties":{"t":"x"}}"#,
+        r#"{"type":"node","id":"c","labels":["P"],"properties":{"t":"y"}}"#,
+    ]);
+
+    for query in [
+        // A RETURN alias is an OUTPUT column; `GROUP BY` runs over the INPUT
+        // bindings, so it cannot see one. This is the spelling people write.
+        "MATCH (n:P) RETURN n.t AS t, count(*) AS c GROUP BY t",
+        // A name that exists nowhere — the same fault, which is the point: the
+        // old behaviour could not tell these apart from a correct query.
+        "MATCH (n:P) RETURN n.t AS t, count(*) AS c GROUP BY zzz",
+        // The property spelling has to check its VARIABLE too.
+        "MATCH (n:P) RETURN n.t AS t, count(*) AS c GROUP BY zzz.t",
+    ] {
+        let err = crate::gql::prepare(query)
+            .expect("plans")
+            .execute(&mut g, &crate::gql::eval::Params::new())
+            .expect_err("an unbound GROUP BY key must fault");
+
+        assert_eq!(
+            err.code,
+            crate::error_codes::ErrorCode::UnknownFunction,
+            "on `{query}`"
+        );
+        assert!(
+            err.message.contains("unbound variable"),
+            "the message must name the problem: {}",
+            err.message
+        );
+    }
+}
+
+/// Every spelling that DOES bind the key groups the same way.
+///
+/// `LET` is how ISO spells it (a grouping element must already be a binding
+/// variable, so a computed key has to be bound before the projection); `WITH`
+/// is the same thing across a clause boundary; the property form is our
+/// superset. All three have to agree, and none of them may agree with the
+/// broken one — hence the count assertion, which a collapsed grouping fails.
+#[test]
+fn the_bound_group_by_spellings_agree() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["P"],"properties":{"t":"x"}}"#,
+        r#"{"type":"node","id":"b","labels":["P"],"properties":{"t":"x"}}"#,
+        r#"{"type":"node","id":"c","labels":["P"],"properties":{"t":"y"}}"#,
+    ]);
+
+    let want = vec![
+        vec![Value::Str("x".into()), n(2.0)],
+        vec![Value::Str("y".into()), n(1.0)],
+    ];
+
+    for query in [
+        "MATCH (n:P) LET t = n.t RETURN t, count(*) AS c GROUP BY t ORDER BY t",
+        "MATCH (n:P) WITH n.t AS t RETURN t, count(*) AS c GROUP BY t ORDER BY t",
+        "MATCH (n:P) RETURN n.t AS t, count(*) AS c GROUP BY n.t ORDER BY t",
+    ] {
+        assert_eq!(rows(&mut g, query), want, "on `{query}`");
     }
 }

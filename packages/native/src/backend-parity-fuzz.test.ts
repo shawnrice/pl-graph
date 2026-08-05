@@ -103,7 +103,9 @@ const expr = (r: () => number, d: number): string => {
 const genQuery = (r: () => number): string => {
   const shapes = [
     () => `MATCH (n:P) RETURN ${pick(r, AGG)}(${expr(r, 2)}) AS x`,
-    () => `MATCH (n:P) RETURN ${expr(r, 1)} AS k, count(*) AS c GROUP BY k ORDER BY k, c`,
+    // `LET`-bound key: a RETURN alias is not a grouping element, and spelling it
+    // that way keyed every row null — one group per query, whatever the expression.
+    () => `MATCH (n:P) LET k = ${expr(r, 1)} RETURN k, count(*) AS c GROUP BY k ORDER BY k, c`,
     () => `MATCH (n:P) WHERE ${expr(r, 2)} RETURN n.n AS x ORDER BY x`,
     () => `MATCH (n:P) ORDER BY n.n LIMIT 2 RETURN ${expr(r, 2)} AS x, n.n AS t`,
     () => `MATCH (a:P)-[e:R]->(b) RETURN ${expr(r, 2)} AS x`,

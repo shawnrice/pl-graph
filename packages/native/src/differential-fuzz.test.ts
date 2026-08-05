@@ -367,8 +367,14 @@ const genQuery = (r: () => number): string => {
   }
 
   // Grouped aggregate — exercises GROUP BY keying over a fuzzed key.
+  //
+  // The key is bound with `LET`, which is both what ISO requires (a grouping
+  // element is a binding-variable reference, so it cannot be a RETURN alias or a
+  // bare expression) and what makes this fuzz anything: spelled `RETURN <expr>
+  // AS k … GROUP BY k` the key read as null, so EVERY generated query collapsed
+  // to one group whatever the expression evaluated to.
   if (p < 0.34) {
-    return `MATCH (n:T) RETURN ${genExpr(r, 1)} AS k, count(*) AS c GROUP BY k ORDER BY k, c`;
+    return `MATCH (n:T) LET k = ${genExpr(r, 1)} RETURN k, count(*) AS c GROUP BY k ORDER BY k, c`;
   }
 
   if (p < 0.42) {
