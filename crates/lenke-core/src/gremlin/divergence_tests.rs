@@ -321,33 +321,74 @@ fn repeat_emit_loops_predicate_offset() {
     );
 }
 
+/// `id()` / `label()` on a PATH is an error, and one raised from the PLAN.
+///
+/// This reverses what this test used to assert. It required null, on the
+/// grounds that the TS engine returned null too — which it did, so the engines
+/// agreed with each other and with nothing else. TinkerPop types
+/// `IdStep<S extends Element>` and does `traverser.get().id()`, so on a path the
+/// erased generic gives a bare `ClassCastException` ("ImmutablePath cannot be
+/// cast to ...Element"). A path has no id and no label; answering null said it
+/// had one, and it was null.
+///
+/// Raised from the step list before any walk, because it is a property of the
+/// plan: `path().id()` cannot succeed on any graph, so there is nothing to
+/// evaluate. `DataException`, not `Syntax` (the traversal parses) and not
+/// `InvalidValue` (a path is a perfectly good value that has no id) — the same
+/// code the TS engine raises from the same check.
 #[test]
-fn id_of_a_non_element_is_null() {
-    // `id()` used to pass a non-element THROUGH unchanged, so `path().id()` handed
-    // the paths back instead of nulls — and a following numeric step then faulted
-    // on them where the TS engine summed nulls. Its sibling `label()` already
-    // returned null here, and so does the TS engine. Found by the Gremlin
-    // differential fuzzer.
-    let ids = q(g().E().path().id());
-    assert_eq!(ids.len(), 6);
-    assert!(
-        ids.iter().all(|v| matches!(v, GVal::Null)),
-        "path().id() must be null, got {ids:?}"
-    );
+fn id_of_a_path_faults_from_the_plan() {
+    let mut graph = modern();
 
-    // The sibling accessor agrees — that symmetry is the actual invariant.
-    assert_eq!(ids, q(g().E().path().label()));
+    for t in [g().E().path().id(), g().E().path().label()] {
+        let err = super::try_run(&mut graph, &t).expect_err("a path has no id or label");
+
+        assert_eq!(err.code, crate::error_codes::ErrorCode::DataException);
+        assert!(
+            err.message.contains("not an element"),
+            "the message must say why: {}",
+            err.message
+        );
+    }
+
+    // Through steps that hand the value on unchanged, the path is still a path.
+    assert!(super::try_run(&mut graph, &g().E().path().limit(2).id()).is_err());
+
+    // But `unfold()` turns it into its ELEMENTS, and those do have ids — so the
+    // check must not simply look for a later `id()`.
+    let unfolded = super::try_run(&mut graph, &g().E().path().unfold().id())
+        .expect("elements of a path have ids");
+
+    assert!(
+        unfolded.iter().all(|v| matches!(v, GVal::Str(_))),
+        "got {unfolded:?}"
+    );
 }
 
+/// The fault reaches the caller through whatever follows it.
+///
+/// This test previously asserted the OPPOSITE — that summing the ids of paths
+/// was an all-null fold and explicitly "not a fault" — which is the decision
+/// reversed above. A terminal downstream must not swallow it: the plan is
+/// unsatisfiable whatever `sum()` would have done with the nulls.
 #[test]
-fn summing_the_ids_of_non_elements_is_an_all_null_fold_not_a_fault() {
-    // The shape the fuzzer hit. `try_run` (not the `q` helper) on purpose: `run`
-    // SWALLOWS a data fault, so summing the un-nulled paths would still have
-    // looked fine here — and that fault is exactly what this rules out.
+fn a_plan_fault_survives_the_steps_after_it() {
     let mut graph = modern();
-    let out = super::try_run(&mut graph, &g().E().path().id().sum());
 
-    assert!(matches!(out.as_deref(), Ok([GVal::Null])), "got {out:?}");
+    for t in [
+        g().E().path().id().sum(),
+        g().E().path().id().count(),
+        g().E().path().id().fold(),
+    ] {
+        assert_eq!(
+            super::try_run(&mut graph, &t).map(|_| ()).unwrap_err().code,
+            crate::error_codes::ErrorCode::DataException
+        );
+    }
+
+    // `run` is infallible and cannot say why, so it yields nothing rather than
+    // an answer that was never computable.
+    assert!(super::run(&mut graph, &g().E().path().id().sum()).is_empty());
 }
 
 #[test]

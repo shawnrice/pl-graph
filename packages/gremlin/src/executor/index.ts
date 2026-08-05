@@ -9,6 +9,7 @@
 // `aggregation.ts`, etc.) for the step-impl generators.
 
 import type { Graph } from '@lenke/core';
+import { ErrorCode, LenkeError } from '@lenke/errors';
 
 import type { Plan, Step } from '../ast.js';
 import { applyStep } from './dispatch.js';
@@ -17,12 +18,75 @@ import { newContext, planReadsPath, type Traverser, unwrap } from './runtime.js'
 import { applySource } from './sources.js';
 
 /**
+ * Fault on a plan that is invalid whatever the data.
+ *
+ * `path().id()` cannot succeed on any graph: a path is not an Element, so it has
+ * no id and no label. TinkerPop types `IdStep<S extends Element>` and does
+ * `traverser.get().id()`, which on a path is a bare `ClassCastException` once
+ * the generic is erased ("ImmutablePath cannot be cast to ...Element"). Both
+ * engines used to return null instead — agreeing with each other, and with
+ * nothing else.
+ *
+ * Checked on the STEP LIST rather than per traverser, so it costs one scan and
+ * no walk. That is also what makes it expressible here at all: at RUNTIME a path
+ * is a plain array, indistinguishable from what `fold()` produces, but the
+ * `path` STEP is not.
+ *
+ * `DataException` — an ISO data exception covers "a type mismatch in an
+ * operation", which is what this is. Not a syntax error: the traversal parses
+ * fine. Not `InvalidValue`: that means a value outside the LPG property-value
+ * model, and a path is a perfectly good value that simply has no id. The Rust
+ * core raises the same code from the same check.
+ *
+ * Only through steps that pass the traverser's value on UNCHANGED — `unfold()`
+ * turns a path into its elements, and `id()` on those is fine, so a scan that
+ * merely looked for a later `id()` would reject working traversals.
+ */
+const assertPlanIsSatisfiable = (plan: Plan): void => {
+  // The step KINDS, which are not always the step names — `limit()` builds a
+  // `take` and `dedup()` builds a `dedupe`.
+  const passesValueThrough = new Set([
+    'take',
+    'skip',
+    'range',
+    'tail',
+    'sample',
+    'dedupe',
+    'order',
+    'barrier',
+    'as',
+    'identity',
+  ]);
+
+  for (let i = 0; i < plan.steps.length; i++) {
+    if (plan.steps[i].kind !== 'path') {
+      continue;
+    }
+
+    for (const later of plan.steps.slice(i + 1)) {
+      if (later.kind === 'id' || later.kind === 'label') {
+        throw new LenkeError(`${later.kind}() is not defined on a path: a path is not an element`, {
+          code: ErrorCode.DataException,
+        });
+      }
+
+      if (!passesValueThrough.has(later.kind)) {
+        break;
+      }
+    }
+  }
+};
+
+/**
  * Run a plan against a graph. Always returns an `Iterable<unknown>` —
  * terminal steps (`count`, `fold`, `toList`) yield exactly one value; other
  * steps yield zero or more. This matches Gremlin's "every step is a stream"
  * model and keeps `pipe(count(), is(gt(5)))` composable.
  */
 export const run = (plan: Plan, graph: Graph): Iterable<unknown> => {
+  // Before anything runs: a plan that cannot succeed on any graph.
+  assertPlanIsSatisfiable(plan);
+
   // Decide once whether any step observes the path; if not, traversers skip
   // path bookkeeping for the whole run (see planReadsPath / startTraverser).
   const ctx = newContext(planReadsPath(plan));

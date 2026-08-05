@@ -78,19 +78,6 @@ where applicable.
 by `by()`, and `by()` supports comparator/token forms. The gremlin test package
 has no skipped tests.)
 
-> **OPEN divergence — `id()` / `label()` on a PATH.** `g.V().path().id()` returns
-> `[null, null]` in the Rust core and throws `E_INVALID_VALUE` in the TS engine.
-> A `Path` is not an Element, so TinkerPop rejects the step; TS matches it and
-> native silently answers.
->
-> Pre-existing (reproduced at HEAD, unrelated to any recent change) and the
-> reason the gremlin differential fuzzer goes red INTERMITTENTLY — it seeds from
-> a random value unless `FUZZ_SEED` is set, and only some seeds generate the
-> shape. `FUZZ_SEED=1442096709 bun test src/gremlin-fuzz.test.ts` reproduces it.
->
-> Not a lowering question: the fix is deciding that a type-mismatched accessor
-> faults in both engines, and making native raise it.
-
 > **Known limitation — `order().by()` over Map/projection rows (BUG A).** The
 > `by('<key>')` / `.by(select('<key>'))` modulators only project a property off a
 > `Vertex`/`Edge`. Over `project()` rows (plain objects) or `group`/`groupCount`

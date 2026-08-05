@@ -245,7 +245,74 @@ struct Ctx {
 /// Run a traversal against `graph`, returning the final traversers' values.
 /// Infallible: a runaway `repeat()` stops at the budget and returns its partial
 /// frontier. Use [`try_run`] to surface that as a `ResourceExhausted` error.
+/// A traversal that is invalid whatever the data, and the fault it carries.
+///
+/// Checked against the STEP LIST before anything runs, because it is a property
+/// of the plan rather than of any value: `path().id()` cannot succeed on any
+/// graph. The alternative — evaluating and faulting per traverser — pays for a
+/// walk that was never going to produce an answer.
+///
+/// Only `path()` reaching an element accessor, and only through steps that hand
+/// the traverser's value on UNCHANGED. Anything else stops the scan and reports
+/// nothing: a false positive here rejects a working query, which is worse than
+/// the null this replaces. `unfold()` is the reason the scan cannot simply look
+/// for a later `id()` — it turns a path into its elements, and `id()` on those
+/// is perfectly good.
+pub(super) fn plan_fault(steps: &[Step]) -> Option<(crate::error_codes::ErrorCode, &'static str)> {
+    // Value-preserving: reorders, drops or renames traversers, never rewrites
+    // the value one carries.
+    let passes_value_through = |s: &Step| {
+        matches!(
+            s,
+            Step::Limit(..)
+                | Step::Skip(..)
+                | Step::Range(..)
+                | Step::Tail(..)
+                | Step::Sample(_)
+                | Step::Dedupe { .. }
+                | Step::Order(..)
+                | Step::Barrier
+                | Step::As(_)
+                | Step::Identity
+        )
+    };
+
+    for (i, step) in steps.iter().enumerate() {
+        if !matches!(step, Step::Path(_)) {
+            continue;
+        }
+
+        for later in &steps[i + 1..] {
+            match later {
+                Step::Id => {
+                    return Some((
+                        crate::error_codes::ErrorCode::DataException,
+                        "id() is not defined on a path: a path is not an element",
+                    ));
+                }
+                Step::Label => {
+                    return Some((
+                        crate::error_codes::ErrorCode::DataException,
+                        "label() is not defined on a path: a path is not an element",
+                    ));
+                }
+                s if passes_value_through(s) => {}
+                // The value stopped being the path; nothing more to say about it.
+                _ => break,
+            }
+        }
+    }
+
+    None
+}
+
 pub fn run(graph: &mut Graph, t: &Traversal) -> Vec<GVal> {
+    // Invalid whatever the data — no rows, and no walk to find that out. `run` is
+    // infallible, so it cannot report WHY; `try_run` does.
+    if plan_fault(&t.steps).is_some() {
+        return Vec::new();
+    }
+
     let mut ctx = Ctx::default();
     run_collect(graph, &mut ctx, t)
 }
@@ -253,6 +320,11 @@ pub fn run(graph: &mut Graph, t: &Traversal) -> Vec<GVal> {
 /// Like [`run`], but reports a `repeat()` budget overrun as `ResourceExhausted`
 /// instead of silently returning a partial result.
 pub fn try_run(graph: &mut Graph, t: &Traversal) -> crate::error::CodeResult<Vec<GVal>> {
+    // Before anything runs: a plan that cannot succeed on any graph.
+    if let Some((code, msg)) = plan_fault(&t.steps) {
+        return Err(crate::error::CodeError::new(code, msg));
+    }
+
     let mut ctx = Ctx::default();
     let vals = run_collect(graph, &mut ctx, t);
     if ctx.over_budget {
