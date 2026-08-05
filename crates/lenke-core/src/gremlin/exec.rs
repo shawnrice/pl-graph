@@ -617,6 +617,28 @@ fn lower_hops<'a>(graph: &Graph, mut rest: &'a [Step]) -> (Vec<Hop>, &'a [Step])
     (hops, rest)
 }
 
+/// A `where()` body that is exactly ONE hop, as the adjacency question it asks.
+///
+/// One hop and nothing else. A body with anything after the hop is asking
+/// something about where it LANDED, which the adjacency cannot answer, and a
+/// body with several hops needs the intermediate frontier.
+///
+/// `None` from `resolve_etypes` means every named type was unknown, so the hop
+/// matches nothing — and this returns `None` too rather than encode it, because
+/// "no such edge" is a different answer from "any edge" and the caller's slow
+/// path gets it right without help. (`Some(vec![])` is ANY type: see
+/// `resolve_names`.)
+fn semi_join_hop(graph: &Graph, steps: &[Step]) -> Option<(crate::seek::Dir, Option<Vec<u32>>)> {
+    let (dir, labels) = match steps {
+        [Step::Out(l)] | [Step::OutE(l)] => (crate::seek::Dir::Out, l),
+        [Step::In(l)] | [Step::InE(l)] => (crate::seek::Dir::In, l),
+        [Step::Both(l)] | [Step::BothE(l)] => (crate::seek::Dir::Both, l),
+        _ => return None,
+    };
+
+    Some((dir, Some(resolve_etypes(graph, labels)?)))
+}
+
 /// The element ids a lowered prefix plus expansion chain produces, and whatever
 /// steps are left over.
 ///
@@ -3446,7 +3468,40 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         }
 
         // --- combinators ---
-        Step::Where(sub) => stream.into_iter().filter(|t| sub_nonempty(graph, ctx, sub, t)).collect(),
+        // `where(<one hop>)` is a SEMI-JOIN — "does this vertex have such an
+        // edge" — and answering it by running the sub-traversal builds a
+        // one-element stream, a `Trav`, and an output `Vec` per vertex to look at
+        // its first entry. The adjacency knows without any of that.
+        //
+        // GQL spells the same question `WHERE EXISTS { (a)-[:R]->() }` and has
+        // answered it from the adjacency for a while (`try_count_semi_join`);
+        // this is the same shortcut on the same storage.
+        Step::Where(sub) => match semi_join_hop(graph, &sub.steps) {
+            Some((dir, etypes)) => stream
+                .into_iter()
+                .filter(|t| match t.val {
+                    GVal::Node(v) => crate::seek::adj(
+                        graph,
+                        v,
+                        dir,
+                        etypes.as_deref().unwrap_or(&[]),
+                        // Either rule answers this identically: the question is
+                        // whether such an edge EXISTS, and a self-loop is seen at
+                        // least once whether it is yielded once or twice. Gremlin's
+                        // rule anyway, so the line reads the same as the rest.
+                        crate::seek::SelfLoops::Twice,
+                    )
+                    .next()
+                    .is_some(),
+                    // Not a vertex: the hop yields nothing, so the filter drops it.
+                    _ => false,
+                })
+                .collect(),
+            None => stream
+                .into_iter()
+                .filter(|t| sub_nonempty(graph, ctx, sub, t))
+                .collect(),
+        },
         Step::WhereKey(start, pred, bys) => {
             let Some(GVal::Str(end_label)) = pred.rhs() else {
                 return stream; // non-comparison predicate; nothing to compare against

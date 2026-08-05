@@ -1795,6 +1795,88 @@ fn dropping_the_path_never_changes_an_answer() {
     }
 }
 
+/// `where(<one hop>)` answered from the adjacency agrees with running the body.
+///
+/// The oracle is `.identity()` appended to the body: it means exactly the same
+/// thing and makes the body two steps, which the shortcut refuses — so each pair
+/// is the same question asked of both paths. (`barrier()` cannot serve here; it
+/// defeats the PATTERN compile, not this.)
+#[test]
+fn a_single_hop_where_agrees_with_running_it() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{"k":1}}"#,
+            r#"{"type":"node","id":"b","labels":["N","W"],"properties":{"k":2}}"#,
+            r#"{"type":"node","id":"c","labels":["M"],"properties":{"k":3}}"#,
+            r#"{"type":"node","id":"d","labels":["N"],"properties":{"k":4}}"#,
+            r#"{"type":"edge","id":"r0","from":"a","to":"b","labels":["X","Y"],"properties":{}}"#,
+            r#"{"type":"edge","id":"r1","from":"b","to":"c","labels":["Y"],"properties":{}}"#,
+            r#"{"type":"edge","id":"r2","from":"c","to":"a","labels":["Z"],"properties":{}}"#,
+            // A self-loop, since `both()` sees one from both sides.
+            r#"{"type":"edge","id":"r3","from":"d","to":"d","labels":["Y"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let rows = |src: &str, g: &mut crate::graph::Graph| {
+        let mut v: Vec<String> = super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(g)
+            .iter()
+            .map(|x| format!("{x:?}"))
+            .collect();
+        v.sort();
+        v
+    };
+
+    for body in [
+        // Every direction, in both the vertex and the edge spelling — for
+        // EXISTENCE the two ask the same question.
+        "__.out('Y')",
+        "__.outE('Y')",
+        "__.in('Y')",
+        "__.inE('Y')",
+        "__.both('Y')",
+        "__.bothE('Y')",
+        // Untyped, a disjunction, and a type that resolves to NOTHING — which
+        // must match nothing rather than everything, the conflation this
+        // codebase has written five times.
+        "__.out()",
+        "__.outE()",
+        "__.out('X','Y')",
+        "__.out('NOPE')",
+        "__.outE('NOPE')",
+        "__.out('NOPE','Y')",
+        // Bodies the shortcut must refuse: something after the hop, several
+        // hops, or a filter.
+        "__.out('Y').hasLabel('W')",
+        "__.out('Y').out('Y')",
+        "__.out('Y').has('k', 2)",
+        "__.not(__.out('Y'))",
+    ] {
+        for q in [
+            format!("g.V().where({body})"),
+            format!("g.V().hasLabel('N').where({body}).values('k')"),
+            format!("g.V().where({body}).count()"),
+            // A non-vertex traverser: the hop yields nothing, so the filter drops
+            // it — the shortcut has to agree about that too.
+            format!("g.E().where({body})"),
+        ] {
+            let slow = q.replace(
+                &format!("where({body})"),
+                &format!("where({body}.identity())"),
+            );
+
+            assert_eq!(
+                rows(&q, &mut g),
+                rows(&slow, &mut g),
+                "`{q}` disagrees with running the body"
+            );
+        }
+    }
+}
+
 /// Median-of-5 seconds for one run of `src`.
 fn grem_time(g: &mut Graph, src: &str) -> f64 {
     let plan = super::parse::parse(src).unwrap_or_else(|e| panic!("`{src}` parses: {e}"));
