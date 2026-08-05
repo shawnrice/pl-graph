@@ -875,6 +875,42 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
             )])
         }
         [Step::Values(keys), tail @ ..] => column_terminal(graph, &ids, is_edge, keys, tail),
+        // The frontier ITSELF. There was no arm for it, so
+        // `g.V().hasLabel('V').out('R')` — a traversal with no terminal at all —
+        // built a `Trav` per element to hand back the elements: 5.2ms for 150k,
+        // where reading them off the frontier is the same list.
+        [] => Some(
+            ids.into_iter()
+                .map(|id| frontier_val(id, is_edge))
+                .collect(),
+        ),
+        // Peel one frontier-expressible step and let the arms above answer the
+        // rest — the same shape as the column terminals, for the same reason:
+        // `dedup()` had an arm only when followed by `count()`, so `dedup()`
+        // alone and `dedup().limit(5)` both streamed.
+        [Step::Limit(n, Scope::Global), t @ ..] => {
+            column_paths(graph, &ids[..(*n).min(ids.len())], is_edge, t)
+        }
+        [Step::Skip(n, Scope::Global), t @ ..] => {
+            column_paths(graph, &ids[(*n).min(ids.len())..], is_edge, t)
+        }
+        [Step::Range(lo, hi, Scope::Global), t @ ..] => {
+            let lo = (*lo).min(ids.len());
+
+            column_paths(graph, &ids[lo..(*hi).clamp(lo, ids.len())], is_edge, t)
+        }
+        [Step::Tail(n, Scope::Global), t @ ..] => {
+            column_paths(graph, &ids[ids.len().saturating_sub(*n)..], is_edge, t)
+        }
+        // Element identity IS the dense id, so distinctness needs no key
+        // projection and no boxing — the same thing the `dedup().count()` arm
+        // above does, now available to everything that follows it.
+        [Step::Dedupe { labels, bys }, t @ ..] if labels.is_empty() && bys.is_empty() => {
+            let mut seen = crate::fxhash::FxHashSet::default();
+            let distinct: Vec<u32> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+
+            column_paths(graph, &distinct, is_edge, t)
+        }
         _ => None,
     }
 }

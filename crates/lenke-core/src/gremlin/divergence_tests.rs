@@ -1812,6 +1812,100 @@ fn dropping_the_path_never_changes_an_answer() {
     }
 }
 
+/// Reading the FRONTIER agrees with streaming it.
+///
+/// `column_paths` had no arm for an empty tail, so a traversal with no terminal
+/// — `g.V().hasLabel('V').out('R')` — built a `Trav` per element to hand the
+/// elements back: 5.2ms for 150k where reading them off the frontier is 0.5ms.
+/// `dedup()` had an arm only when followed by `count()`, so `dedup()` alone and
+/// `dedup().limit(5)` streamed too.
+///
+/// Compared UNSORTED, unlike most of this file: `limit`/`skip`/`tail` decide
+/// WHICH elements come back, so frontier order is part of the answer here rather
+/// than incidental to it.
+#[test]
+fn reading_the_frontier_agrees_with_streaming_it() {
+    let mut lines: Vec<String> = Vec::new();
+
+    for i in 0..60 {
+        let l = if i % 4 == 0 {
+            r#"["P","W"]"#
+        } else {
+            r#"["P"]"#
+        };
+
+        lines.push(format!(
+            r#"{{"type":"node","id":"n{i}","labels":{l},"properties":{{"k":{}}}}}"#,
+            i % 7
+        ));
+    }
+
+    // Fan-in, so the frontier carries DUPLICATES and `dedup` has work to do.
+    for i in 0..59 {
+        lines.push(format!(
+            r#"{{"type":"edge","id":"e{i}","from":"n{i}","to":"n{}","labels":["R"],"properties":{{"w":{}}}}}"#,
+            (i * 5 + 1) % 20,
+            i % 3
+        ));
+    }
+
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+    let rows = |src: &str, g: &mut crate::graph::Graph| {
+        format!(
+            "{:?}",
+            super::parse::parse(src)
+                .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+                .run(g)
+        )
+    };
+
+    for tail in [
+        "",
+        ".limit(5)",
+        ".skip(5)",
+        ".range(2, 7)",
+        ".tail(5)",
+        ".dedup()",
+        ".dedup().limit(5)",
+        ".dedup().count()",
+        ".limit(10).dedup()",
+        ".dedup().tail(3)",
+        ".skip(2).limit(3)",
+        ".range(1, 9).dedup().count()",
+        ".limit(5).values('k')",
+        ".dedup().values('k').sum()",
+        ".tail(4).values('k').fold()",
+        ".limit(5).id()",
+        ".dedup().label()",
+        ".limit(3).fold()",
+        // Degenerate bounds.
+        ".limit(0)",
+        ".skip(1000)",
+        ".range(5, 5)",
+        ".range(1000, 1001)",
+        ".tail(1000)",
+        ".limit(1000)",
+    ] {
+        for base in [
+            "g.V().hasLabel('P').out('R')",
+            // An EDGE frontier takes the same arms.
+            "g.V().hasLabel('P').outE('R')",
+            "g.V().hasLabel('P')",
+        ] {
+            let q = format!("{base}{tail}");
+            // `barrier()` stops the prefix lowering, so the same question runs
+            // down the stream instead.
+            let slow = q.replacen("g.V()", "g.V().barrier()", 1);
+
+            assert_eq!(
+                rows(&q, &mut g),
+                rows(&slow, &mut g),
+                "`{q}` read off the frontier disagrees with the stream"
+            );
+        }
+    }
+}
+
 /// Paging a column agrees with paging the stream.
 ///
 /// `values(k).limit(n)` had no arm in either column terminal, so it declined
