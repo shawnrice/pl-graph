@@ -3526,6 +3526,24 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 .collect();
             vec![GVal::map(entries)]
         }),
+        // REJECTED (mixed, net unclear): interning the constant map keys. Every
+        // `Arc::from("id")` here ALLOCATES, and they are built per element —
+        // `elementMap()` over a 150k-edge frontier makes ~1.2M of them for eight
+        // constant strings — so caching them in `LazyLock<Arc<str>>` statics and
+        // cloning the refcount looks obviously right.
+        //
+        // Interleaved, min of 3: `g.E().elementMap()` 165.8ms -> 151.6ms (0.91x)
+        // and `g.V().elementMap()` 16.8ms -> 19.9ms (1.19x WORSE). A vertex map
+        // has three keys where an edge map has eight, so the allocation is a
+        // smaller share of it — but that explains a smaller GAIN, not a loss, and
+        // the loss is the larger ratio. Reverted rather than kept for the half
+        // that won.
+        //
+        // The real cost is elsewhere: 151ms for 150k edges is ~1us each, and
+        // eight allocations do not take a microsecond. A `Trav` per element and
+        // a `Vec` of boxed pairs per map are the next suspects, and `column_paths`
+        // has no arm for either map step — building them off the frontier would
+        // skip the traverser entirely.
         Step::ElementMap(keys) => {
             let mut ks: Vec<(u32, Arc<str>)> = Vec::new();
 
