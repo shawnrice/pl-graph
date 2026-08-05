@@ -324,7 +324,13 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
     if let Some(c) = super::pattern::compile(&t.steps) {
         let rest = &t.steps[c.consumed..];
 
-        if !needs_path(rest) {
+        // A REORDERING plan (only the `g.E()` desugar) is usable just where the
+        // sequence cannot be observed. `g.E()` visits edges in id order while the
+        // plan walks adjacency, and the TS engine keeps the streamed order, so
+        // taking it for `g.E().inV().hasLabel('P')` returned the right three
+        // vertices in the wrong sequence — caught by the gremlin differential
+        // fuzzer, which generates an `E()` source one time in five.
+        if !needs_path(rest) && (!c.reorders || super::pattern::order_insensitive(rest)) {
             TRACK_PATH.with(|x| x.set(FORCE_PATH.with(Cell::get)));
 
             // The end slot first, then one column per `as(label)`. All parallel:

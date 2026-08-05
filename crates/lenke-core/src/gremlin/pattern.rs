@@ -24,7 +24,7 @@
 use crate::gql::ast::Lit;
 use crate::gql::ast::{Direction, PathMode, PathSelector};
 use crate::gql::plan::{CExpr, CLabelExpr, CNode, CPath, CPropConstraint, CRel, CSegment};
-use crate::gremlin::{GVal, Step, P};
+use crate::gremlin::{GVal, Scope, Step, P};
 
 /// A compiled prefix: the pattern, the interning tables its refs index into, and
 /// how many steps were consumed.
@@ -45,6 +45,46 @@ pub(super) struct Compiled {
     pub tags: Vec<(String, usize, bool)>,
     pub scope_len: usize,
     pub consumed: usize,
+    /// Whether the plan enumerates in a DIFFERENT order than the streamed
+    /// traversal would.
+    ///
+    /// Set only by the `g.E()` desugar. `g.E()` visits edges in id order and the
+    /// plan walks each vertex's adjacency instead — the same rows, a different
+    /// sequence. A `count()` cannot tell; `g.E().inV().hasLabel('P')` can, and the
+    /// TS engine keeps the streamed order, so taking this branch there would
+    /// break byte-identity. The caller must check
+    /// [`order_insensitive`] before using a reordering plan.
+    ///
+    /// A `V()` prefix never sets it: the streamed traversal walks vertex by
+    /// vertex too, which is why those lower with the order intact.
+    pub reorders: bool,
+}
+
+/// Whether `rest` can observe the ORDER of the rows handed to it.
+///
+/// Deliberately a short allowlist rather than a "does it look ordered" test: a
+/// wrong answer here is a silently reordered result, and the shapes worth
+/// reordering for are the reducing terminals. `fold`, `limit`, `range`, `tail`
+/// and a bare projection all read the sequence, so none of them are here.
+pub(super) fn order_insensitive(rest: &[Step]) -> bool {
+    let reducing = |s: &Step| {
+        matches!(
+            s,
+            Step::Count(Scope::Global)
+                | Step::Sum(Scope::Global)
+                | Step::Min(Scope::Global)
+                | Step::Max(Scope::Global)
+                | Step::Mean(Scope::Global)
+        )
+    };
+
+    match rest {
+        [t] => reducing(t),
+        // `dedup()` keeps FIRST-seen, so which duplicate survives depends on the
+        // order — but a count of the survivors does not.
+        [Step::Dedupe { labels, bys }, t] if labels.is_empty() && bys.is_empty() => reducing(t),
+        _ => false,
+    }
 }
 
 #[derive(Default)]
@@ -274,6 +314,47 @@ macro_rules! decline {
 /// 1.0us, 5.2 against 5.2. The clone is real and is not what those queries spend
 /// their time on.
 pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
+    // `g.E()` IS `g.V().outE()`: every edge appears exactly once as an out-edge
+    // of its source, self-loops included, so the two enumerate the same multiset
+    // with the traverser on the edge either way. Only the ORDER differs — edge id
+    // against source-vertex adjacency — and an unordered result does not promise
+    // one (the same rule that lets the V() prefix reorder today).
+    //
+    // Desugaring rather than teaching the loop a second start shape is what makes
+    // every capability the prefix already has — edge filters, `as()` tags,
+    // landing steps, `repeat()` — apply to an edge source for free. It is also
+    // why this is a rewrite and not a copy: there is one prefix compiler.
+    if let [Step::E(ids), rest @ ..] = steps {
+        if !ids.is_empty() {
+            decline!("E(ids) seeded start");
+        }
+
+        let mut desugared = Vec::with_capacity(rest.len() + 2);
+
+        desugared.push(Step::V(Vec::new()));
+        desugared.push(Step::OutE(Vec::new()));
+        desugared.extend_from_slice(rest);
+
+        let mut compiled = compile(&desugared)?;
+
+        // Only worth it if the traversal LEAVES the edge. A prefix that stops on
+        // the edge is already answered from the edge property column directly
+        // (`column_terminal`), and the pattern branch runs BEFORE that — so
+        // compiling this shape would take a fast path away rather than add one.
+        // Measured: `g.E().has('w', 1).count()` 0.18ms from the column, 1.30ms
+        // planned as `()-[r {w: 1}]->()`.
+        if compiled.end_is_edge {
+            decline!("E() start that stays on the edge");
+        }
+
+        // Two synthetic steps stood in for one real one, and `consumed` indexes
+        // the CALLER's list.
+        compiled.consumed -= 1;
+        compiled.reorders = true;
+
+        return Some(compiled);
+    }
+
     let [Step::V(ids), rest @ ..] = steps else {
         decline!("start is not V()");
     };
@@ -559,6 +640,7 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
         tags,
         scope_len: next_slot.max(1),
         consumed,
+        reorders: false,
     })
 }
 

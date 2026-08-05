@@ -92,6 +92,23 @@ fn time_gremlin(g: &mut Graph, q: &str) -> (f64, String) {
     (best, answer)
 }
 
+/// OPEN, deliberately deferred: the three rows that still read 2-3x are all
+/// SUB-100-MICROSECOND label questions —
+///
+/// ```text
+///   count of a label                 0.000ms  0.000ms  3.2x
+///   far-end label decides the seed   0.043ms  0.095ms  2.2x
+///   far-end label, edge spelled apart 0.043ms 0.096ms  2.2x
+/// ```
+///
+/// — so the ratio is large and the absolute gap is ~50us. GQL answers the first
+/// from a label-bucket length (`try_count_star`, O(1)) and the other two by
+/// orienting onto the smaller label end; Gremlin reaches the same oriented plan
+/// but pays a fixed setup per query that dominates at this size.
+///
+/// Worth returning to for the per-query overhead itself, which is what these
+/// measure — not for the plans, which already agree. Everything with real
+/// absolute cost in this table is now within 10%.
 fn main() {
     let mut g = fixture();
 
@@ -171,6 +188,16 @@ fn main() {
             "MATCH ()-[:R]->(b:W) RETURN count(*) AS c",
             "g.V().out('R').hasLabel('W').count()",
             "try_orient_node_seed",
+        ),
+        (
+            // An EDGE-SOURCE traversal. `g.E()` desugars to `g.V().outE()`, which
+            // is what lets it reach the planner at all — declined it made one
+            // traverser per edge and filtered afterwards, at 23.2ms against
+            // 0.07ms for the GQL spelling of the same question.
+            "edge source, far-end label",
+            "MATCH ()-[:R]->(b:W) RETURN count(*) AS c",
+            "g.E().hasLabel('R').inV().hasLabel('W').count()",
+            "try_orient_node_seed (via the E() desugar)",
         ),
         (
             "far-end property decides the seed",

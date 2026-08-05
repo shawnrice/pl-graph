@@ -2522,3 +2522,171 @@ fn an_order_direction_argument_is_honored() {
         "an argument order cannot honor must not be silently dropped"
     );
 }
+
+/// An edge-source traversal answers what the same walk answers, step for step.
+///
+/// `g.E()` lowers by DESUGARING to `g.V().outE()` — every edge appears exactly
+/// once as an out-edge of its source — which is what lets an edge source reach
+/// the planner at all. `g.E().hasLabel('R').inV().hasLabel('W').count()` went
+/// from 23.2ms to 0.11ms on 50k vertices / 150k edges, because the declined form
+/// made one traverser per edge and filtered afterwards.
+///
+/// A rewrite that changes which end a walk starts from is the classic way to
+/// drop or duplicate rows, so every shape here is checked against the SAME
+/// traversal behind a `barrier()`, which defeats the pattern compiler.
+#[test]
+fn an_edge_source_traversal_matches_the_streamed_walk() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V","W"],"properties":{"n":1}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"n":2}}"#,
+            r#"{"type":"node","id":"c","labels":["V","W"],"properties":{"n":3}}"#,
+            r#"{"type":"edge","id":"e0","labels":["R"],"from":"a","to":"b","properties":{"w":1}}"#,
+            r#"{"type":"edge","id":"e1","labels":["R"],"from":"b","to":"c","properties":{"w":2}}"#,
+            // A SELF LOOP. `g.E()` yields it once and `outE()` yields it once —
+            // the equivalence turns on that, and Gremlin counts a loop TWICE for
+            // an UNDIRECTED hop, so the two rules must not be confused.
+            r#"{"type":"edge","id":"e2","labels":["R"],"from":"c","to":"c","properties":{"w":3}}"#,
+            // A second type, and a MULTI-LABEL edge, so `hasLabel` has to do real work.
+            r#"{"type":"edge","id":"e3","labels":["S"],"from":"a","to":"c","properties":{"w":4}}"#,
+            r#"{"type":"edge","id":"e4","labels":["R","S"],"from":"b","to":"a","properties":{"w":5}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let run = |src: &str, g: &mut crate::graph::Graph| {
+        format!(
+            "{:?}",
+            super::parse::parse(src)
+                .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+                .run(g)
+        )
+    };
+    // As a MULTISET. `g.E()` enumerates in edge-id order and `g.V().outE()` walks
+    // each vertex's adjacency, so the two visit the same edges in different
+    // orders — and an unordered result does not promise one (the engines' rule,
+    // like SQL without ORDER BY). What has to match is which rows come back and
+    // how many, which is exactly what sorting the rendered values compares.
+    let bag = |src: &str, g: &mut crate::graph::Graph| {
+        let mut out: Vec<String> = super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(g)
+            .iter()
+            .map(|v| format!("{v:?}"))
+            .collect();
+
+        out.sort();
+        out
+    };
+
+    for tail in [
+        // The shape the lowering exists for.
+        "hasLabel('R').inV().hasLabel('W').count()",
+        "hasLabel('R').inV().count()",
+        "hasLabel('R').inV().values('n')",
+        "hasLabel('R').inV().dedup().count()",
+        // An edge FILTER before the landing.
+        "hasLabel('R').has('w', 1).inV().count()",
+        "has('w', 3).inV().values('n')",
+        // Multi-label edges must be found by either of their labels.
+        "hasLabel('S').inV().count()",
+        // A landing that is NOT the far end — declines, and must still answer.
+        "hasLabel('R').outV().count()",
+        "hasLabel('R').bothV().count()",
+        // Tags across the landing.
+        "hasLabel('R').as('x').inV().select('x').count()",
+        // Continuing to hop after the landing.
+        "hasLabel('R').inV().out('R').count()",
+        // Staying ON the edge — deliberately NOT lowered, the edge column is
+        // better — but it still has to agree.
+        "hasLabel('R').count()",
+        "hasLabel('R').values('w')",
+        "has('w', 1).count()",
+    ] {
+        // Against the SAME traversal with the compiler defeated: same query, so
+        // the rows must match exactly, order included.
+        assert_eq!(
+            run(&format!("g.E().{tail}"), &mut g),
+            run(&format!("g.E().barrier().{tail}"), &mut g),
+            "`g.E().{tail}` disagrees with the same walk behind a barrier"
+        );
+
+        // And against the spelling it desugars TO — as a multiset, that being a
+        // different traversal with its own enumeration order.
+        assert_eq!(
+            bag(&format!("g.E().{tail}"), &mut g),
+            bag(&format!("g.V().outE().{tail}"), &mut g),
+            "`g.E().{tail}` disagrees with `g.V().outE().{tail}`"
+        );
+    }
+
+    // The counts themselves, so the comparisons above cannot all be wrong
+    // together. Four R edges (e0, e1, e2 the loop, e4 multi-labelled); their far
+    // ends are b, c, c, a — three of which are W (c, c, a).
+    assert_eq!(run("g.E().hasLabel('R').count()", &mut g), "[Num(4.0)]");
+    assert_eq!(
+        run("g.E().hasLabel('R').inV().hasLabel('W').count()", &mut g),
+        "[Num(3.0)]"
+    );
+    // The self loop is ONE edge, so one row — not two.
+    assert_eq!(run("g.E().has('w', 3).inV().count()", &mut g), "[Num(1.0)]");
+}
+
+/// The `g.E()` plan is taken exactly where the row ORDER cannot be observed.
+///
+/// The walk comparisons next door check that the answers agree; this checks that
+/// the gate is where it should be. Without it, `g.E().inV().hasLabel('PERSON')`
+/// returned the right three vertices in adjacency order where the streamed
+/// traversal — and the TS engine — return them in edge-id order. The gremlin
+/// differential fuzzer caught it, generating an `E()` source one time in five.
+#[test]
+fn an_edge_source_plan_is_gated_on_the_order_being_unobservable() {
+    let compiled = |src: &str| {
+        let t = super::parse::parse(src).unwrap_or_else(|e| panic!("`{src}` parses: {e}"));
+        super::pattern::compile(&t.steps).map(|c| {
+            let rest_is_safe = super::pattern::order_insensitive(&t.steps[c.consumed..]);
+
+            (c.reorders, rest_is_safe)
+        })
+    };
+
+    // Reordering, and the tail cannot tell — the shape the lowering exists for.
+    assert_eq!(
+        compiled("g.E().hasLabel('R').inV().hasLabel('W').count()"),
+        Some((true, true))
+    );
+    assert_eq!(
+        compiled("g.E().hasLabel('R').inV().hasLabel('W').dedup().count()"),
+        Some((true, true))
+    );
+
+    // Reordering, and the tail CAN tell. Compiled, but the gate refuses it.
+    assert_eq!(
+        compiled("g.E().hasLabel('R').inV().hasLabel('W').values('n')"),
+        Some((true, false))
+    );
+    assert_eq!(
+        compiled("g.E().hasLabel('R').inV().hasLabel('W').fold()"),
+        Some((true, false))
+    );
+    assert_eq!(
+        compiled("g.E().hasLabel('R').inV().hasLabel('W').limit(2).count()"),
+        Some((true, false))
+    );
+
+    // A `V()` source never reorders, so its tail is unrestricted — this is what
+    // keeps the gate from costing the shapes that were already lowered.
+    assert_eq!(
+        compiled("g.V().out('R').hasLabel('W').values('n')"),
+        Some((false, false))
+    );
+    assert_eq!(
+        compiled("g.V().out('R').hasLabel('W').count()"),
+        Some((false, true))
+    );
+
+    // Staying on the edge is declined outright: the edge column answers it
+    // better, and the pattern branch runs first.
+    assert_eq!(compiled("g.E().has('w', 1).count()"), None);
+}
