@@ -812,6 +812,30 @@ impl<'p> ProjAccum<'p> {
         out
     }
 
+    /// OPEN: an `ORDER BY` costs 9-18x the same query without one, and ~9x the
+    /// Gremlin spelling of it.
+    ///
+    ///   MATCH (a:V)-[:R]->(b) RETURN b.n AS x                1.16ms
+    ///   … ORDER BY x                                        21.4ms   (150k rows)
+    ///   g.V().hasLabel('V').out('R').values('n').order()     2.3ms
+    ///
+    /// Two hypotheses measured and REJECTED, so the next person starts past them:
+    ///
+    /// - Sorting the ROWS rather than an index. Each row is a `(Binding,
+    ///   Vec<Val>)` — 48 bytes moved per swap where an index moves 8, and the
+    ///   vectorized path does sort indices. Rewritten to sort an index and
+    ///   permute once: 21.2ms against 21.4ms. The swaps are not the cost.
+    /// - The `projected.clone()` below, elided when `order_overlay` is empty.
+    ///   It is never empty for a traversal: the overlay is every input var not
+    ///   shadowed by an output NAME, so `MATCH (a)-[:R]->(b) RETURN b.n AS x`
+    ///   carries both `a` and `b` whether the sort key names them or not.
+    ///   Measured 20.7ms against 21.4ms — the branch never fires.
+    ///
+    /// What is left is that clone plus the per-row key `Vec`, one of each per
+    /// row, and removing them needs the sort scope to stop being a materialized
+    /// `Binding` — an `Env` that can see the projected row and an overlay
+    /// without joining them first. That is a bigger change than either of the
+    /// above and is why it is written down rather than done.
     fn sort_keys(
         &self,
         graph: &Graph,
