@@ -825,6 +825,27 @@ pub struct CProjection {
 impl CProjection {
     /// The grouping keys: explicit `GROUP BY` items if present, else the
     /// non-aggregate output items (implicit grouping).
+    ///
+    /// OPEN — `GROUP BY` does not resolve an OUTPUT ALIAS, and silently groups
+    /// everything into one. `ORDER BY` does resolve one (5f028be), so the two
+    /// clauses disagree about what a bare name in them means:
+    ///
+    /// ```text
+    ///   RETURN n.t AS t, count(*) AS c GROUP BY n.t   →  [x, 3], [y, 2]   correct
+    ///   RETURN n.t AS t, count(*) AS c GROUP BY t     →  [x, 5]           one group
+    ///   RETURN n.t AS u, count(*) AS c GROUP BY u     →  [x, 5]           same
+    /// ```
+    ///
+    /// The surviving row takes the FIRST row's value, which is what grouping by
+    /// a constant looks like. Not a cross-engine divergence — the TS engine
+    /// returns the same three answers, byte for byte — so the fuzzers cannot see
+    /// it, and it is not new.
+    ///
+    /// Deciding it needs the ISO grammar, not a patch: if `GROUP BY <alias>` is
+    /// not legal GQL then the fix is to REJECT it at plan time (a wrong answer
+    /// becoming an error), and if it is legal the fix is to resolve it the way
+    /// `ORDER BY` already does. Either way it lands in both engines together.
+    /// Found while checking NaN ordering (7855bfb).
     pub fn group_keys(&self) -> Vec<&CReturnItem> {
         if self.group_by.is_empty() {
             self.items.iter().filter(|i| !i.is_agg).collect()

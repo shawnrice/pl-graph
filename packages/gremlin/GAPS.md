@@ -78,6 +78,20 @@ where applicable.
 by `by()`, and `by()` supports comparator/token forms. The gremlin test package
 has no skipped tests.)
 
+> **Known limitation — `order(desc)` is a silent no-op.** The direction has to
+> go in the modulator: `order().by(desc)` sorts descending, `order(desc)` sorts
+> ASCENDING and reports nothing. Measured on both engines, with and without a
+> NaN in the column — `g.V().values('m').order(desc)` returned `[-1, 4, 9]`.
+>
+> TinkerPop's `order()` takes a **Scope** (`local`/`global`), not an `Order`, so
+> `order(desc)` is not a valid traversal to begin with and rejecting it is the
+> likely fix — but it currently parses, which makes it a wrong answer rather than
+> an error. Same family as BUG A below: an argument the parser accepts and the
+> executor drops.
+>
+> Found while checking NaN ordering (7855bfb); not fixed there because it is a
+> parser/step-arity question with no NaN content.
+
 > **Known limitation — `order().by()` over Map/projection rows (BUG A).** The
 > `by('<key>')` / `.by(select('<key>'))` modulators only project a property off a
 > `Vertex`/`Edge`. Over `project()` rows (plain objects) or `group`/`groupCount`
