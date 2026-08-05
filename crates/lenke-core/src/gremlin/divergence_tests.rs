@@ -1659,3 +1659,102 @@ fn an_undirected_hop_counts_a_self_loop_differently_in_each_language() {
         "Some([Num(2.0)])"
     );
 }
+
+/// Dropping the traverser path never changes an answer.
+///
+/// `path_free` is an allowlist, and an allowlist is a claim: this step neither
+/// reads `Trav::path` nor nests something that might. Nothing tested the claim.
+/// The planned-vs-streamed comparison CANNOT — it runs the same step list twice,
+/// so both spellings reach the same wrong conclusion and agree with each other.
+///
+/// `with_forced_path` is the oracle that can: run the traversal again with the
+/// accumulation pinned on. If the answers differ, the analysis dropped a path
+/// something reads, and the step that allowed it does not belong in the list.
+///
+/// Every shape below reaches the allowlist through a DIFFERENT arm — a bare
+/// terminal, a `by()` modulator, a nested sub-traversal, a repeat body, and the
+/// two steps this round added (`as` and `select`).
+#[test]
+fn dropping_the_path_never_changes_an_answer() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["N","W"],"properties":{"k":1}}"#,
+            r#"{"type":"node","id":"b","labels":["N"],"properties":{"k":2}}"#,
+            r#"{"type":"node","id":"c","labels":["N","W"],"properties":{"k":1}}"#,
+            r#"{"type":"node","id":"d","labels":["M"],"properties":{"k":3}}"#,
+            r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R"],"properties":{"w":1}}"#,
+            r#"{"type":"edge","id":"e1","from":"b","to":"c","labels":["R"],"properties":{"w":2}}"#,
+            r#"{"type":"edge","id":"e2","from":"c","to":"d","labels":["S"],"properties":{"w":3}}"#,
+            r#"{"type":"edge","id":"e3","from":"a","to":"c","labels":["S"],"properties":{"w":4}}"#,
+            r#"{"type":"edge","id":"e4","from":"c","to":"c","labels":["R"],"properties":{"w":5}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let rows = |src: &str, g: &mut crate::graph::Graph| {
+        let mut v: Vec<String> = super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(g)
+            .iter()
+            .map(|x| format!("{x:?}"))
+            .collect();
+        v.sort();
+        v
+    };
+
+    for q in [
+        // Steps that genuinely read the path: these must AGREE because the
+        // analysis keeps the path for them, and they are what proves the oracle
+        // is wired up at all.
+        "g.V().out('R').path()",
+        "g.V().out('R').out('R').simplePath()",
+        "g.V().out('R').out('R').cyclicPath()",
+        "g.V().bothE('R').otherV()",
+        "g.V().repeat(__.out('R')).times(2).path()",
+        // The allowlist's own entries, one per arm.
+        "g.V().out('R').hasLabel('W')",
+        "g.V().out('R').values('k')",
+        "g.V().out('R').count()",
+        "g.V().out('R').dedup().count()",
+        "g.V().out('R').order().by('k')",
+        "g.V().out('R').fold()",
+        "g.V().hasLabel('N').groupCount().by('k')",
+        "g.V().hasLabel('N').group().by('k').by('k')",
+        "g.V().hasLabel('N').project('x').by('k')",
+        "g.V().out('R').limit(2).values('k')",
+        "g.V().out('R').aggregate('s').cap('s')",
+        // `as` and `select`, added to the allowlist this round.
+        "g.V().as('a').out('R').hasLabel('W').select('a')",
+        "g.V().as('a').out('R').as('b').select('a','b')",
+        "g.V().as('a').out('R').hasLabel('W').select('a').by('k')",
+        "g.V().as('a').out('R').hasLabel('W').select('a').by(__.path())",
+        "g.V().as('a').out('R').hasLabel('W').dedup('a')",
+        "g.V().as('a').out('R').select('a').by(__.out('S').count())",
+        // `dedup().by(<sub>)` — the modulator, like every other, runs on a fresh
+        // root, so it cannot read the outer path either.
+        "g.V().out('R').dedup().by(__.path())",
+        "g.V().out('R').dedup().by(__.out('S').count())",
+        "g.V().out('R').dedup().by('k').values('k')",
+        // Sub-traversals, which the allowlist admits only when their bodies are
+        // path-free — so each of these is really a test of the recursion.
+        "g.V().where(__.out('R')).values('k')",
+        "g.V().not(__.out('R')).values('k')",
+        "g.V().union(__.out('R'), __.out('S')).values('k')",
+        "g.V().choose(__.hasLabel('W'), __.out('R'), __.out('S')).values('k')",
+        "g.V().coalesce(__.out('R'), __.out('S')).values('k')",
+        "g.V().local(__.out('R')).values('k')",
+        "g.V().repeat(__.out('R')).times(2).values('k')",
+        // A sub-traversal that DOES read the path — the recursion must keep it.
+        "g.V().where(__.out('R').simplePath()).values('k')",
+        "g.V().local(__.out('R').path()).count()",
+        "g.V().repeat(__.out('R').simplePath()).times(2).count()",
+    ] {
+        assert_eq!(
+            rows(q, &mut g),
+            super::exec::with_forced_path(|| rows(q, &mut g)),
+            "`{q}` answers differently once the path is kept, so `path_free` \
+             dropped history it reads"
+        );
+    }
+}

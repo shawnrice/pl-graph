@@ -195,6 +195,16 @@ thread_local! {
     /// return the wrong thing rather than fail.
     static TRACK_PATH: Cell<bool> = const { Cell::new(true) };
 
+    /// Test-only: pin `TRACK_PATH` on, whatever the analysis concludes.
+    ///
+    /// The oracle for `path_free` itself. Comparing a traversal against a
+    /// `barrier()`ed spelling cannot catch an error here — both share the step
+    /// list, so both reach the same wrong conclusion and agree. Running the SAME
+    /// traversal with the accumulation forced on can: if dropping the path
+    /// changes an answer, the step that allowed it does not belong in the
+    /// allowlist.
+    static FORCE_PATH: Cell<bool> = const { Cell::new(false) };
+
     /// Set when evaluation hits a type error — ordering genuinely incomparable
     /// types (a number vs a string, an element vs a scalar) or feeding a
     /// non-number into a numeric aggregate (`sum`/`mean`). TinkerPop raises a
@@ -311,7 +321,7 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
         let rest = &t.steps[c.consumed..];
 
         if !needs_path(rest) {
-            TRACK_PATH.with(|x| x.set(false));
+            TRACK_PATH.with(|x| x.set(FORCE_PATH.with(Cell::get)));
 
             // The end slot first, then one column per `as(label)`. All parallel:
             // row `i` of each is one match, so a tag's value for a row is its
@@ -379,7 +389,7 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
         }
     }
 
-    TRACK_PATH.with(|c| c.set(needs_path(&t.steps)));
+    TRACK_PATH.with(|c| c.set(needs_path(&t.steps) || FORCE_PATH.with(Cell::get)));
 
     // A seeded plan drops the `V()`/`E()` it started from plus the filters the
     // index answered exactly. Every OTHER filter still runs, including any that
@@ -496,15 +506,30 @@ fn lower_prefix(graph: &Graph, steps: &[Step]) -> Option<(ElementSeek, Vec<usize
     Some((seek, captured, read, is_edge))
 }
 
+/// Run `f` with the traverser path accumulated regardless of the analysis.
+///
+/// See `FORCE_PATH`. The mirror of `gql::eval::with_vec_override`: a static
+/// decision needs a switch that turns it off, or nothing tests the decision.
+#[cfg(test)]
+pub(super) fn with_forced_path<T>(f: impl FnOnce() -> T) -> T {
+    let prev = FORCE_PATH.with(|c| c.replace(true));
+    let out = f();
+
+    FORCE_PATH.with(|c| c.set(prev));
+    out
+}
+
 /// Steps that neither READ the traverser path nor nest a sub-traversal.
 ///
 /// An allowlist on purpose — see `TRACK_PATH`. A step missing from here only
 /// costs the path accumulation it would have had anyway; a step wrongly added
 /// would corrupt `path()`.
 ///
-/// `Dedupe` qualifies only with an EMPTY `bys`: a `by()` modulator can hold a
-/// whole sub-traversal, and that sub-traversal may read the path. Its `labels`
-/// are fine either way — they read the tag map, not the path.
+/// `Dedupe` qualifies whatever its modulators say. Its `labels` read the tag map,
+/// and its `by()` bodies run on a fresh `Trav::root(value)` in `eval_by` — the
+/// same reason `select` qualifies. It used to require an EMPTY `bys`, on the
+/// grounds that a modulator "may read the path"; a modulator cannot, and the
+/// requirement cost every `dedup().by(k)` traversal a per-traverser path clone.
 fn path_free(step: &Step) -> bool {
     // Steps that carry sub-traversals are path-free exactly when their bodies
     // are: `repeat(out())` needs no history, `repeat(simplePath())` does.
@@ -619,7 +644,7 @@ fn path_free(step: &Step) -> bool {
             // where the untagged spelling cost 0.10ms, and almost all of that was
             // the clone rather than the tag.
             | Step::As(_)
-    ) || matches!(step, Step::Dedupe { bys, .. } if bys.is_empty())
+    ) || matches!(step, Step::Dedupe { .. })
 }
 
 /// Whether any of these steps could READ an `as(label)` tag.
