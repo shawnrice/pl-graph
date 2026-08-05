@@ -2765,10 +2765,11 @@ pub(super) fn vectorized_frame(
     // So the second pass is not the cost: `eval_vec` over a typed column is
     // genuinely cheap. Reverted rather than carry a signature change through four
     // functions plus a flag whose wrong value silently drops a filter, for a gain
-    // under the noise floor. `[b] scan+count+pred` remains 1.23x against main and
-    // is NOT explained by this, by the residual pass (also measured, also
-    // neutral), or by `Val::from_column` (measured, neutral — LTO already inlines
-    // it).
+    // under the noise floor. `[b] scan+count+pred` remains 1.2-1.3x against main
+    // across runs — re-measured 2026-08-05 at 1.31x on a quiet machine — and is
+    // NOT explained by this, by the residual pass (also measured, also neutral),
+    // or by `Val::from_column` (measured, neutral — LTO already inlines it).
+    // Three hypotheses, three disproofs; it is still open.
     if let Some(w) = where_ {
         let keep: Vec<bool> = eval_vec(graph, ctx, &sc, w)
             .into_truth()

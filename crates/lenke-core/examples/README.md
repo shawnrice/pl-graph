@@ -34,6 +34,28 @@ obvious without opening them.
 | Are the count fast paths correct? (not a benchmark)                          | `count_check`                                            |
 | **Does a `MATCH` after a `WITH` cost more than the same query without one?** | **`with_carry_bench`**                                   |
 | **Which graph questions does one engine shortcut and the other enumerate?**  | **`cross_engine_shortcuts`**                             |
+| **Which query shapes DECLINE the shared IR, and why?**                       | **not an example — see below**                           |
+
+### Which shapes decline the shared IR
+
+Not a benchmark and not an example: a process-wide tally behind the `bailprobe`
+feature, off by default and free when off.
+
+```
+cargo test --release --features bailprobe -- --test-threads=1 --include-ignored --nocapture
+```
+
+`--test-threads=1` because the tally is process-wide, and no name filter — the
+dump test sorts last (`zzz_…`) so a filtered run prints nothing. It reports three
+things: which GQL shapes declined the columnar frame (by `scan.rs` line), why
+`gremlin::pattern::compile` declined (by REASON), and which route each traversal
+took.
+
+Read the Gremlin side first — it is keyed by reason, and the GQL side is keyed by
+line. A line number says where a bail is, never what it means: `matches.len()
+!= 1` was read as "several MATCH clauses" and counted 1465, of which 1462 were
+matches.len() == ZERO. That mislabel was the largest apparently-fixable entry and
+shaped the plan for a while.
 
 ## Benchmarks that live as ignored tests
 

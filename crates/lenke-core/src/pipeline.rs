@@ -28,6 +28,28 @@
 //!
 //! Each engine classifies its OWN operations — that part is irreducibly
 //! per-language — and the routing rule below is shared.
+//!
+//! # What actually uses this, as of 2026-08-05
+//!
+//! Only Gremlin classifies, in `gremlin::analysis::facts`, and only the probe
+//! and that module's tests read the `Route` it produces. The executor does not
+//! branch on it. That is worth stating plainly rather than leaving the module to
+//! imply otherwise:
+//!
+//! - Offering the planned ids to Gremlin's COLUMN TERMINALS answers the boundary
+//!   question without asking it — a terminal that wants a column IS a boundary —
+//!   so "try the column path, else stream" subsumed the routing at the one site
+//!   that would have branched on it.
+//! - GQL has no classifier. Routing it by boundary alone was written and
+//!   measured: `MATCH (a:V)-[:R]->(b) WHERE a.n > 900 RETURN b.n` went from
+//!   0.317ms to 8.176ms, because declining the frame does NOT reach a streaming
+//!   executor — GQL's fallback is a per-row binding-table interpreter. The
+//!   distinction that mattered turned out to be how many COLUMNS the join has to
+//!   carry, not stream-versus-columnar; see `scan::streamed_frame`.
+//!
+//! What IS shared is the Reducing route itself: [`crate::seek::walk_count`] walks
+//! every hop but the last and counts the last in place, and both engines call it.
+//! That is the piece this classification was pointing at, arrived at directly.
 
 /// How an operation treats the rows flowing through it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

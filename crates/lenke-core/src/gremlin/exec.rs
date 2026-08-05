@@ -617,6 +617,32 @@ fn lower_hops<'a>(graph: &Graph, mut rest: &'a [Step]) -> (Vec<Hop>, &'a [Step])
     (hops, rest)
 }
 
+/// Does this traverser have an edge matching `hop`?
+///
+/// A non-vertex traverser has none: the hop would yield nothing, so the
+/// existence test is false — and `not()` therefore KEEPS it, which is what
+/// running the body does too.
+fn has_adj(graph: &Graph, t: &Trav, hop: &(crate::seek::Dir, Option<Vec<u32>>)) -> bool {
+    let (dir, etypes) = hop;
+
+    match t.val {
+        GVal::Node(v) => crate::seek::adj(
+            graph,
+            v,
+            *dir,
+            etypes.as_deref().unwrap_or(&[]),
+            // Either rule answers this identically: the question is whether such
+            // an edge EXISTS, and a self-loop is seen at least once whether it is
+            // yielded once or twice. Gremlin's rule anyway, so the line reads the
+            // same as the rest.
+            crate::seek::SelfLoops::Twice,
+        )
+        .next()
+        .is_some(),
+        _ => false,
+    }
+}
+
 /// A `where()` body that is exactly ONE hop, as the adjacency question it asks.
 ///
 /// One hop and nothing else. A body with anything after the hop is asking
@@ -3477,25 +3503,9 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         // answered it from the adjacency for a while (`try_count_semi_join`);
         // this is the same shortcut on the same storage.
         Step::Where(sub) => match semi_join_hop(graph, &sub.steps) {
-            Some((dir, etypes)) => stream
+            Some(hop) => stream
                 .into_iter()
-                .filter(|t| match t.val {
-                    GVal::Node(v) => crate::seek::adj(
-                        graph,
-                        v,
-                        dir,
-                        etypes.as_deref().unwrap_or(&[]),
-                        // Either rule answers this identically: the question is
-                        // whether such an edge EXISTS, and a self-loop is seen at
-                        // least once whether it is yielded once or twice. Gremlin's
-                        // rule anyway, so the line reads the same as the rest.
-                        crate::seek::SelfLoops::Twice,
-                    )
-                    .next()
-                    .is_some(),
-                    // Not a vertex: the hop yields nothing, so the filter drops it.
-                    _ => false,
-                })
+                .filter(|t| has_adj(graph, t, &hop))
                 .collect(),
             None => stream
                 .into_iter()
@@ -3544,7 +3554,18 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         }
         Step::And(plans) => stream.into_iter().filter(|t| plans.iter().all(|p| sub_nonempty(graph, ctx, p, t))).collect(),
         Step::Or(plans) => stream.into_iter().filter(|t| plans.iter().any(|p| sub_nonempty(graph, ctx, p, t))).collect(),
-        Step::Not(sub) => stream.into_iter().filter(|t| !sub_nonempty(graph, ctx, sub, t)).collect(),
+        // `not(<one hop>)` is the same adjacency question, negated: "has no such
+        // edge". Same shortcut, same reason.
+        Step::Not(sub) => match semi_join_hop(graph, &sub.steps) {
+            Some(hop) => stream
+                .into_iter()
+                .filter(|t| !has_adj(graph, t, &hop))
+                .collect(),
+            None => stream
+                .into_iter()
+                .filter(|t| !sub_nonempty(graph, ctx, sub, t))
+                .collect(),
+        },
         Step::Union(plans) => {
             let mut next = Vec::new();
             for t in &stream {

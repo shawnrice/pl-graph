@@ -1857,16 +1857,23 @@ fn a_single_hop_where_agrees_with_running_it() {
     ] {
         for q in [
             format!("g.V().where({body})"),
+            // `not()` asks the same question, negated — including for a
+            // non-vertex traverser, which HAS no such edge and so survives it.
+            format!("g.V().not({body})"),
+            format!("g.E().not({body})"),
+            format!("g.V().hasLabel('N').not({body}).values('k')"),
             format!("g.V().hasLabel('N').where({body}).values('k')"),
             format!("g.V().where({body}).count()"),
             // A non-vertex traverser: the hop yields nothing, so the filter drops
             // it — the shortcut has to agree about that too.
             format!("g.E().where({body})"),
         ] {
-            let slow = q.replace(
-                &format!("where({body})"),
-                &format!("where({body}.identity())"),
-            );
+            // Rewrite the BODY, not the step, so `not(…)` gets the same oracle
+            // as `where(…)`. Keying on `where(` compared every `not` shape
+            // against ITSELF — a vacuous pass that reads exactly like a real one.
+            let slow = q.replace(&format!("({body})"), &format!("({body}.identity())"));
+
+            assert_ne!(slow, q, "the oracle did not rewrite `{q}`");
 
             assert_eq!(
                 rows(&q, &mut g),
