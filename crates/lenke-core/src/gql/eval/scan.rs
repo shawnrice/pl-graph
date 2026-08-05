@@ -2887,25 +2887,35 @@ pub(super) fn project_frame_cols(
         }
 
         // `RETURN a.x AS n ORDER BY n` sorts by an OUTPUT column, which does not
-        // exist yet — sort scope slots 0..out_len are empty above. Project first,
-        // install the results there, and window the projected columns afterwards
-        // instead of re-evaluating.
+        // exist yet — sort scope slots 0..out_len are empty above. Project first
+        // and install the results there so the sort keys resolve.
+        //
+        // Installed by MOVE. Cloning the columns in cost 112us of the 400us that
+        // separated `ORDER BY a` from `ORDER BY u.k` over 20k rows, for nothing:
+        // the only other reader is DISTINCT, which reads them back out of the
+        // sort scope just as well.
         //
         // This gives up the "a small LIMIT never materializes the full output
         // columns" property the input-keyed path has. That is the right trade
         // here and only here: this shape was 100% scalar before, so it is a win
         // against the scalar driver even having materialized.
-        let out_cols: Option<Vec<Vec<Val>>> =
-            (proj.order_needs_output || proj.distinct).then(|| {
-                proj.items
+        // Only the columns a sort key actually READS — the rest are projected
+        // once, from the window, at the end. `RETURN u.k AS a, u.n AS b ORDER BY
+        // a` needs `a` here and nothing else; projecting `b` too cost a full
+        // column for a value the sort never looks at.
+        //
+        // DISTINCT is the exception: it keys on the whole projected row, so it
+        // needs all of them.
+        if proj.order_needs_output || proj.distinct {
+            for (i, item) in proj.items.iter().enumerate() {
+                let read_by_sort = proj
+                    .order_by
                     .iter()
-                    .map(|item| eval_vec(graph, ctx, sc, &item.expr).into_vals())
-                    .collect()
-            });
+                    .any(|s| crate::gql::plan::refs_slot(&s.expr, &|slot| slot == i));
 
-        if let Some(cols) = out_cols.as_ref() {
-            for (i, c) in cols.iter().enumerate() {
-                sort_sc.vals[i] = Some(c.clone());
+                if proj.distinct || read_by_sort {
+                    sort_sc.vals[i] = Some(eval_vec(graph, ctx, sc, &item.expr).into_vals());
+                }
             }
         }
         // REJECTED (measured neutral): the same dense treatment for a NUMERIC key
@@ -3007,12 +3017,20 @@ pub(super) fn project_frame_cols(
         // — so this does not need the scan-order first-seen rule the unsorted
         // DISTINCT path keeps.
         let mut idx: Vec<usize> = if proj.distinct {
-            let cols = out_cols.as_ref().expect("distinct forces out_cols above");
+            // Read back out of the sort scope, where the projection above put
+            // them (DISTINCT forces `projected_cols`).
+            let cols: Vec<&[Val]> = (0..proj.items.len())
+                .map(|i| {
+                    sort_sc.vals[i]
+                        .as_deref()
+                        .expect("distinct forces the projection above")
+                })
+                .collect();
             let mut seen: FxHashSet<String> = FxHashSet::default();
             (0..sc.n)
                 .filter(|&i| {
                     let mut key = String::new();
-                    for c in cols {
+                    for c in &cols {
                         val_key(&c[i], &mut key);
                         key.push('\u{1}');
                     }
@@ -3037,16 +3055,15 @@ pub(super) fn project_frame_cols(
         idx.sort_by(cmp);
         let window = &idx[start..end.min(idx.len())];
 
-        // Already projected above to make the sort keys resolvable — take the
-        // window out of those columns rather than evaluating a second time.
-        if let Some(cols) = out_cols {
-            return Some(
-                cols.into_iter()
-                    .map(|c| window.iter().map(|&i| c[i].clone()).collect())
-                    .collect(),
-            );
-        }
-
+        // REJECTED (measured): windowing the columns projected above — "they are
+        // already computed, so take the window out of them rather than evaluate a
+        // second time". It is 2.7x SLOWER than evaluating again: 175us against
+        // gather 8us + project 57us, over 20k rows. `window` is in SORTED order,
+        // so indexing the columns by it is a random-access gather over 40-byte
+        // boxed `Val`s, while `gather_rows` permutes a `Vec<u32>` and the
+        // re-projection then reads the property column densely. Re-evaluating
+        // wins outright, and it also restores the LIMIT property: only the window
+        // is ever projected.
         let sub = gather_rows(sc, window);
         return Some(
             proj.items

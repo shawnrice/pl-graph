@@ -885,6 +885,22 @@ fn equivalent_spellings_cost_the_same() {
                 "MATCH (u:P) RETURN u.k AS a ORDER BY a",
             ],
         ),
+        // A second output column the sort never reads must not be dragged along.
+        (
+            "ORDER BY alias, extra column",
+            &[
+                "MATCH (u:P) RETURN u.k AS a, u.n AS b ORDER BY u.k",
+                "MATCH (u:P) RETURN u.k AS a, u.n AS b ORDER BY a",
+            ],
+        ),
+        // A dotted alias is a column like any other.
+        (
+            "ORDER BY a dotted alias",
+            &[
+                "MATCH (u:P) RETURN u.m.city AS a ORDER BY u.m.city",
+                "MATCH (u:P) RETURN u.m.city AS a ORDER BY a",
+            ],
+        ),
         // A comma join that CHAINS is the same query as one path. Before
         // `fuse_chain` the comma spelling stayed on the scalar join: 134x for two
         // patterns, 347x for three.

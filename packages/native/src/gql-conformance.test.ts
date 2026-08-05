@@ -3014,14 +3014,48 @@ suite('ORDER BY + LIMIT projects only the emitted rows', () => {
   });
 
   test('a sort key that READS the output still projects every row', () => {
-    // The sort key is the projected column, so every row must be projected to
-    // sort at all — both engines fault. Same for an alias of the input column.
+    // The sort key IS the projected column and nothing else defines it, so every
+    // row must be projected to sort at all — and the faulting one is among them.
     for (const q of [
       `MATCH (n:T) RETURN 1/(n.n - 7) AS x ORDER BY x LIMIT 1`,
-      `MATCH (n:T) RETURN 1/(n.n - 7) AS x, n.n AS t ORDER BY t LIMIT 1`,
+      // No LIMIT: every row is emitted, so every row is projected regardless.
+      `MATCH (n:T) RETURN 1/(n.n - 7) AS x, n.n AS t ORDER BY t`,
     ]) {
       expect(() => tsQuery(tsGraph, q)).toThrow();
       expect(() => nativeGraph.query(q)).toThrow();
+    }
+  });
+
+  test('ordering by a column alias is the same plan as ordering by the column', () => {
+    // `ORDER BY t` where the projection says `n.n AS t` is `ORDER BY n.n`, and
+    // both engines now rewrite it to exactly that. It matters beyond speed: the
+    // rewritten key reads no output column, so `ORDER BY … LIMIT` keeps its
+    // top-k and projects ONLY the emitted rows.
+    //
+    // That is observable here. `1/(n.n - 7)` faults on one row; with a LIMIT that
+    // does not reach it, the fault does not happen. Before the rewrite the alias
+    // spelling threw and the column spelling did not — two spellings of one query
+    // disagreeing about whether it is an error.
+    for (const [alias, column] of [
+      [
+        `MATCH (n:T) RETURN 1/(n.n - 7) AS x, n.n AS t ORDER BY t LIMIT 1`,
+        `MATCH (n:T) RETURN 1/(n.n - 7) AS x, n.n AS t ORDER BY n.n LIMIT 1`,
+      ],
+      [
+        `MATCH (n:T) RETURN n.n AS t ORDER BY t DESC LIMIT 2`,
+        `MATCH (n:T) RETURN n.n AS t ORDER BY n.n DESC LIMIT 2`,
+      ],
+      [
+        `MATCH (n:T) RETURN n.s AS t ORDER BY t SKIP 1 LIMIT 1`,
+        `MATCH (n:T) RETURN n.s AS t ORDER BY n.s SKIP 1 LIMIT 1`,
+      ],
+    ]) {
+      const [tsAlias, nativeAlias] = both(alias);
+      const [tsColumn, nativeColumn] = both(column);
+
+      expect(tsAlias).toBe(tsColumn);
+      expect(nativeAlias).toBe(nativeColumn);
+      expect(tsAlias).toBe(nativeAlias);
     }
   });
 

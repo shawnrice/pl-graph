@@ -1409,6 +1409,58 @@ struct Lowerer {
     unbound_group_keys: Vec<String>,
 }
 
+/// `ORDER BY <alias>` rewritten as the expression the alias names, in SORT
+/// scope — or `None` when the alias is not a plain column of an input variable.
+///
+/// The sort scope is `[output columns …, input vars not shadowed by an output
+/// NAME …]`, so an item's input slot has to be remapped to `out_len + <its
+/// position in the overlay>`. An input variable SHADOWED by an output name is
+/// not in the overlay at all (`RETURN u.k AS u ORDER BY u`), and then there is
+/// nothing to rewrite to — hence the `position` returning `None`.
+fn alias_definition(
+    sort_expr: &CExpr,
+    items: &[CReturnItem],
+    out_len: usize,
+    order_overlay: &[usize],
+) -> Option<CExpr> {
+    let CExpr::Var(out_slot) = sort_expr else {
+        return None;
+    };
+
+    let item = items.get(*out_slot).filter(|_| *out_slot < out_len)?;
+
+    // An aggregate is defined over the GROUP, not over one input row; there is no
+    // input expression to sort by.
+    if item.is_agg {
+        return None;
+    }
+
+    let sorted = |input_slot: usize| {
+        order_overlay
+            .iter()
+            .position(|&o| o == input_slot)
+            .map(|j| out_len + j)
+    };
+
+    match &item.expr {
+        CExpr::Var(s) => Some(CExpr::Var(sorted(*s)?)),
+        CExpr::Prop { var_slot, key_ref } => Some(CExpr::Prop {
+            var_slot: sorted(*var_slot)?,
+            key_ref: *key_ref,
+        }),
+        CExpr::PropField {
+            var_slot,
+            root_key_ref,
+            descent,
+        } => Some(CExpr::PropField {
+            var_slot: sorted(*var_slot)?,
+            root_key_ref: *root_key_ref,
+            descent: descent.clone(),
+        }),
+        _ => None,
+    }
+}
+
 /// The variable a grouping element references, when it does not resolve.
 ///
 /// ISO GQL's `groupingElement` is a `bindingVariableReference` — a bare name —
@@ -2028,6 +2080,33 @@ impl Lowerer {
                 expr: extract_aggs(self.expr(&s.expr), &mut aggs),
                 descending: s.descending,
                 nulls_first: s.nulls_first,
+            })
+            .collect();
+
+        // `ORDER BY <alias>` IS `ORDER BY <the expression the alias names>` — the
+        // same query, and it must not be a slower plan. Substituting makes the
+        // two spellings the SAME plan rather than two that agree: on 20k rows
+        // `RETURN u.k AS a ORDER BY a` cost 1.77x `ORDER BY u.k`, and with a
+        // LIMIT it lost top-k entirely (`ProjAccum::topk` requires
+        // `!order_needs_output`), which is where the 2.0x came from.
+        //
+        // Only the DIRECT column shapes are substituted — `RETURN u.k AS a`,
+        // `RETURN u.m.city AS a`, `RETURN u AS a`. A computed alias
+        // (`toUpper(u.k) AS a`) is left alone: substituting it would evaluate the
+        // expression twice, once for the output and once per comparison, which is
+        // the trade the input spelling already makes but is not obviously right
+        // to impose here.
+        let order_by: Vec<CSortItem> = order_by
+            .into_iter()
+            .map(|s| {
+                let sub = (!p.star)
+                    .then(|| alias_definition(&s.expr, &items, out_len, &order_overlay))
+                    .flatten();
+
+                match sub {
+                    Some(expr) => CSortItem { expr, ..s },
+                    None => s,
+                }
             })
             .collect();
 

@@ -1706,6 +1706,50 @@ const noteCountParam = (v: CountValue | undefined): void => {
 };
 
 /**
+ * `ORDER BY <alias>` rewritten as the expression the alias names — or
+ * `undefined` when the alias is not a plain column of an input variable.
+ *
+ * `ORDER BY a` IS `ORDER BY n.age` when the projection says `n.age AS a`, and it
+ * must not be a different plan. Left alone it read an OUTPUT column, which
+ * forces `orderNeedsOutput` and gives up the top-k — so the alias spelling both
+ * ran slower (measured 1.8x in the Rust core over 20k rows) and, with a LIMIT,
+ * projected every row where its twin projected only the emitted ones. That
+ * second difference was observable: a faulting projection threw for one spelling
+ * and not the other.
+ *
+ * Only the DIRECT column shapes are substituted, and never across a shadowed
+ * name — if the item's variable is itself an output name, the sort scope
+ * resolves that name to the output column and there is nothing to rewrite to.
+ * Mirrors the Rust `alias_definition`.
+ */
+const aliasDefinition = (
+  sortExpr: Expr,
+  projection: Projection,
+  outNames: ReadonlySet<string>,
+): Expr | undefined => {
+  if (sortExpr.kind !== 'var' || projection.star) {
+    return undefined;
+  }
+
+  const item = projection.items.find((i) => (i.alias ?? columnName(i.expr)) === sortExpr.name);
+
+  // An aggregate is defined over the GROUP, not over any one input row.
+  if (item === undefined || hasAggregate(item.expr)) {
+    return undefined;
+  }
+
+  if (item.expr.kind === 'var') {
+    return outNames.has(item.expr.name) ? undefined : item.expr;
+  }
+
+  if (item.expr.kind === 'prop') {
+    return outNames.has(item.expr.variable) ? undefined : item.expr;
+  }
+
+  return undefined;
+};
+
+/**
  * Fault on a `GROUP BY` naming something the binding does not carry.
  *
  * Unbound reads as null, which keys every row the same: the query silently
@@ -1768,15 +1812,21 @@ const compileProjection = (projection: Projection): CProjection => {
   // ORDER BY keys are evaluated against the projected output overlaid on the
   // input binding (see `applyProjection`), so output aliases resolve even inside
   // an expression — `ORDER BY n + 2` uses the column `n`, not the input variable.
-  const orderBy: CSortItem[] = (projection.orderBy ?? []).map((s) => ({
+  const outNames = new Set(items.map((i) => i.name));
+  const sortKeys = (projection.orderBy ?? []).map((s) => ({
+    ...s,
+    expr: aliasDefinition(s.expr, projection, outNames) ?? s.expr,
+  }));
+  const orderBy: CSortItem[] = sortKeys.map((s) => ({
     fn: compileExpr(s.expr),
     descending: s.descending,
     nullsFirst: s.nullsFirst,
   }));
   // Does a sort key read an output column? With `RETURN *` every in-scope
   // variable IS carried to the output, so any variable reference counts.
-  const outNames = new Set(items.map((i) => i.name));
-  const orderNeedsOutput = (projection.orderBy ?? []).some((s) => {
+  // Asked of the REWRITTEN keys: `ORDER BY a` where `a` is `n.age` reads no
+  // output column once it is spelled `ORDER BY n.age`, which is the point.
+  const orderNeedsOutput = sortKeys.some((s) => {
     const refs = freePredicateVars(s.expr);
 
     return projection.star ? refs.size > 0 : [...refs].some((n) => outNames.has(n));

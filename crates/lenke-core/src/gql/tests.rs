@@ -12180,3 +12180,143 @@ fn the_bound_group_by_spellings_agree() {
         assert_eq!(rows(&mut g, query), want, "on `{query}`");
     }
 }
+
+/// `ORDER BY <alias>` answers exactly what `ORDER BY <what the alias names>`
+/// answers — it is now the same PLAN, so this checks the rewrite did not change
+/// the query on the way.
+///
+/// The rewrite substitutes a sort key that is a bare output alias with the
+/// expression that alias names, remapped into the sort scope. It fires only for
+/// the direct column shapes, and the cases below are the ones where "the same
+/// values" could stop being true: a shadowed name, an aggregate, a group key, a
+/// computed alias, nulls, and `RETURN *`.
+#[test]
+fn ordering_by_an_alias_matches_ordering_by_what_it_names() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["P"],"properties":{"k":"m","n":3,"m":{"city":"z"}}}"#,
+        r#"{"type":"node","id":"b","labels":["P"],"properties":{"k":"a","n":1,"m":{"city":"y"}}}"#,
+        r#"{"type":"node","id":"c","labels":["P"],"properties":{"k":"z","n":3,"m":{"city":"x"}}}"#,
+        // No `k`, no `m` — a NULL sort key, whose placement is absolute.
+        r#"{"type":"node","id":"d","labels":["P"],"properties":{"n":2}}"#,
+    ]);
+
+    // Each pair means the same thing; the alias spelling is the rewritten one.
+    for (alias, named) in [
+        (
+            "MATCH (u:P) RETURN u.k AS a ORDER BY a",
+            "MATCH (u:P) RETURN u.k AS a ORDER BY u.k",
+        ),
+        (
+            "MATCH (u:P) RETURN u.k AS a ORDER BY a DESC",
+            "MATCH (u:P) RETURN u.k AS a ORDER BY u.k DESC",
+        ),
+        // Nulls: placement is absolute, so it must survive the rewrite in BOTH
+        // directions and under an explicit NULLS FIRST.
+        (
+            "MATCH (u:P) RETURN u.k AS a ORDER BY a NULLS FIRST",
+            "MATCH (u:P) RETURN u.k AS a ORDER BY u.k NULLS FIRST",
+        ),
+        // A dotted column.
+        (
+            "MATCH (u:P) RETURN u.m.city AS a ORDER BY a",
+            "MATCH (u:P) RETURN u.m.city AS a ORDER BY u.m.city",
+        ),
+        // The whole element as the alias.
+        (
+            "MATCH (u:P) RETURN u AS a ORDER BY a",
+            "MATCH (u:P) RETURN u AS a ORDER BY u",
+        ),
+        // A second column the sort does not read is still projected.
+        (
+            "MATCH (u:P) RETURN u.k AS a, u.n AS b ORDER BY a",
+            "MATCH (u:P) RETURN u.k AS a, u.n AS b ORDER BY u.k",
+        ),
+        // Ties in the key: the rewrite must not disturb which row wins them.
+        (
+            "MATCH (u:P) RETURN u.n AS a, u.k AS b ORDER BY a",
+            "MATCH (u:P) RETURN u.n AS a, u.k AS b ORDER BY u.n",
+        ),
+        // Paging over the sorted result.
+        (
+            "MATCH (u:P) RETURN u.k AS a ORDER BY a LIMIT 2",
+            "MATCH (u:P) RETURN u.k AS a ORDER BY u.k LIMIT 2",
+        ),
+        (
+            "MATCH (u:P) RETURN u.k AS a ORDER BY a OFFSET 1 LIMIT 2",
+            "MATCH (u:P) RETURN u.k AS a ORDER BY u.k OFFSET 1 LIMIT 2",
+        ),
+        // DISTINCT keys on the projected row and still needs every column.
+        (
+            "MATCH (u:P) RETURN DISTINCT u.n AS a ORDER BY a",
+            "MATCH (u:P) RETURN DISTINCT u.n AS a ORDER BY u.n",
+        ),
+        // AGGREGATING: the alias is a GROUP KEY, so every row in a group shares
+        // it — substituting reads it off the group's binding instead.
+        (
+            "MATCH (u:P) RETURN u.n AS a, count(*) AS c GROUP BY u.n ORDER BY a",
+            "MATCH (u:P) RETURN u.n AS a, count(*) AS c GROUP BY u.n ORDER BY u.n",
+        ),
+    ] {
+        assert_eq!(
+            rows(&mut g, alias),
+            rows(&mut g, named),
+            "`{alias}` disagreed with `{named}`"
+        );
+
+        // And the scalar driver, which is a different sort site entirely.
+        assert_eq!(
+            super::eval::with_vec_override(false, || rows(&mut g, alias)),
+            rows(&mut g, named),
+            "the scalar driver disagreed on `{alias}`"
+        );
+    }
+}
+
+/// The shapes the alias rewrite must NOT touch, each for its own reason.
+///
+/// These are where "the alias names an input expression" stops holding, and
+/// substituting anyway would sort by something the query did not ask for.
+#[test]
+fn the_alias_rewrite_leaves_alone_what_it_cannot_prove() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["P"],"properties":{"k":"m","n":3}}"#,
+        r#"{"type":"node","id":"b","labels":["P"],"properties":{"k":"a","n":1}}"#,
+        r#"{"type":"node","id":"c","labels":["P"],"properties":{"k":"z","n":1}}"#,
+    ]);
+
+    // An alias that SHADOWS the input variable it is derived from. The input `u`
+    // is not in the sort scope at all, so there is nothing to rewrite to — and
+    // `ORDER BY u` here means the output column, the strings, not the element.
+    assert_eq!(
+        rows(&mut g, "MATCH (u:P) RETURN u.k AS u ORDER BY u"),
+        rows(&mut g, "MATCH (u:P) RETURN u.k AS x ORDER BY x"),
+        "a shadowing alias must still sort by the OUTPUT column"
+    );
+
+    // An AGGREGATE alias is defined over the group, not over any one input row.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (u:P) RETURN u.n AS a, count(*) AS c GROUP BY u.n ORDER BY c DESC, a"
+        ),
+        vec![vec![n(1.0), n(2.0)], vec![n(3.0), n(1.0)],],
+        "ordering by an aggregate alias"
+    );
+
+    // A COMPUTED alias is left unsubstituted on purpose — it must still answer.
+    assert_eq!(
+        rows(&mut g, "MATCH (u:P) RETURN upper(u.k) AS a ORDER BY a"),
+        rows(
+            &mut g,
+            "MATCH (u:P) RETURN upper(u.k) AS a ORDER BY upper(u.k)"
+        ),
+        "a computed alias"
+    );
+
+    // `RETURN *` has no item list to substitute FROM.
+    assert_eq!(
+        rows(&mut g, "MATCH (u:P) RETURN * ORDER BY u.n, u.k"),
+        rows(&mut g, "MATCH (u:P) RETURN u AS u ORDER BY u.n, u.k"),
+        "RETURN * with an ORDER BY"
+    );
+}
