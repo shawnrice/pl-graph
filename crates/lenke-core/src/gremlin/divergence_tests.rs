@@ -1358,6 +1358,13 @@ fn a_planned_pattern_matches_the_streamed_traversal() {
         "g.V().as('a').out('R').as('b').out('S').hasLabel('P').select('a','b')",
         // Two labels on ONE element, and a label reused later.
         "g.V().as('a').as('x').out('R').hasLabel('W').select('a','x')",
+        // `where(eq('a'))` and `math('a + b')` resolve a LABEL against the tag
+        // map exactly as `select` does. Both were missing from the tag list while
+        // being listed correctly for paths, so a lowered prefix dropped the
+        // bindings out from under them and they matched nothing.
+        "g.V().as('a').out('R').hasLabel('W').where(eq('a'))",
+        "g.V().as('a').out('R').hasLabel('W').where(neq('a'))",
+        "g.V().as('a').out('R').as('b').hasLabel('W').where('a', neq('b'))",
         // `dedup(labels)` keys on TAGS, so the tags have to be there.
         "g.V().as('a').out('R').hasLabel('W').dedup('a')",
         "g.V().as('a').out('R').as('b').hasLabel('W').dedup('a','b')",

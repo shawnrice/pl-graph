@@ -276,19 +276,23 @@ pub fn try_run(graph: &mut Graph, t: &Traversal) -> crate::error::CodeResult<Vec
 fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
     #[cfg(feature = "bailprobe")]
     {
-        let (r, b) = super::pattern::shape(&t.steps);
+        let shape = super::analysis::analyze(&t.steps);
+
         crate::gql::eval::scan::bailprobe::hit_step(format!(
-            "ROUTE {r:?} {}",
-            if r == crate::pipeline::Route::Decline {
+            "ROUTE {:?} {}",
+            shape.route,
+            if shape.route == crate::pipeline::Route::Decline {
                 t.steps
                     .iter()
-                    .find(|s| super::pattern::class_of(s) == crate::pipeline::OpClass::Opaque)
+                    .find(|s| super::analysis::facts(s).class == crate::pipeline::OpClass::Opaque)
                     .map_or_else(
                         || "?".to_string(),
                         |s| format!("on {s:?}").chars().take(28).collect(),
                     )
             } else {
-                b.map_or_else(|| "boundary=none".to_string(), |i| format!("boundary={i}"))
+                shape
+                    .first_boundary
+                    .map_or_else(|| "boundary=none".to_string(), |i| format!("boundary={i}"))
             }
         ));
     }
@@ -519,179 +523,21 @@ pub(super) fn with_forced_path<T>(f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// Steps that neither READ the traverser path nor nest a sub-traversal.
+/// Whether this traversal needs per-traverser path history at all.
 ///
-/// An allowlist on purpose — see `TRACK_PATH`. A step missing from here only
-/// costs the path accumulation it would have had anyway; a step wrongly added
-/// would corrupt `path()`.
-///
-/// `Dedupe` qualifies whatever its modulators say. Its `labels` read the tag map,
-/// and its `by()` bodies run on a fresh `Trav::root(value)` in `eval_by` — the
-/// same reason `select` qualifies. It used to require an EMPTY `bys`, on the
-/// grounds that a modulator "may read the path"; a modulator cannot, and the
-/// requirement cost every `dedup().by(k)` traversal a per-traverser path clone.
-fn path_free(step: &Step) -> bool {
-    // Steps that carry sub-traversals are path-free exactly when their bodies
-    // are: `repeat(out())` needs no history, `repeat(simplePath())` does.
-    // Recursing here is what lets the common looping shapes off the path tax at
-    // all — as a flat list they could never be listed, so every one of them paid.
-    let subs: &[&Traversal] = match step {
-        Step::Where(t)
-        | Step::Not(t)
-        | Step::Optional(t)
-        | Step::Local(t)
-        | Step::Map(t)
-        | Step::FlatMap(t)
-        | Step::SideEffect(t) => &[t],
-        Step::And(ts) | Step::Or(ts) | Step::Union(ts) | Step::Coalesce(ts) => {
-            return ts.iter().all(|t| t.steps.iter().all(path_free));
-        }
-        Step::Choose { test, then_, else_ } => {
-            return [Some(test), Some(then_), else_.as_ref()]
-                .into_iter()
-                .flatten()
-                .all(|t| t.steps.iter().all(path_free));
-        }
-        Step::Repeat { body, until, .. } => {
-            return [Some(body), until.as_ref()]
-                .into_iter()
-                .flatten()
-                .all(|t| t.steps.iter().all(path_free));
-        }
-        _ => &[],
-    };
-
-    if let [t] = subs {
-        return t.steps.iter().all(path_free);
-    }
-
-    matches!(
-        step,
-        Step::V(_)
-            | Step::E(_)
-            | Step::Has(..)
-            | Step::HasLabel(..)
-            | Step::HasNot(..)
-            | Step::HasKey(..)
-            | Step::HasId(..)
-            | Step::HasValue(..)
-            | Step::Out(..)
-            | Step::In(..)
-            | Step::Both(..)
-            | Step::OutE(..)
-            | Step::InE(..)
-            | Step::BothE(..)
-            // An edge knows its OWN endpoints: `InV`/`OutV`/`BothV` read `e_dst`
-            // and `e_src` and never touch `Trav::path`. Only `OtherV` does, since
-            // "the end I did not come from" is a question about history. Leaving
-            // the other three out taxed every `outE().inV()` traversal with a
-            // per-traverser path clone for history nothing reads — 50.5ms on a
-            // 150k-edge count, against 0.113ms for the identical `out('R')`.
-            | Step::InV
-            | Step::OutV
-            | Step::BothV
-            | Step::Values(..)
-            | Step::Count(_)
-            | Step::Limit(..)
-            | Step::Skip(..)
-            | Step::Id
-            | Step::Label
-            | Step::Sum(_)
-            | Step::Mean(_)
-            | Step::Min(_)
-            | Step::Max(_)
-            // Only FIVE steps actually read `Trav::path`: OtherV (which vertex did
-            // we come from), SimplePath / CyclicPath (repeat check), Path (emits
-            // it) and Sack. Everything below was paying a per-traverser path
-            // clone for history nothing was going to read — 63% of the suite's
-            // traversals tracked paths, and this is why.
-            | Step::Order(..)
-            | Step::Fold
-            | Step::Unfold
-            | Step::Range(..)
-            | Step::Tail(..)
-            | Step::Is(_)
-            | Step::WherePred(_)
-            | Step::Group(..)
-            | Step::GroupCount(..)
-            | Step::Project(..)
-            | Step::ValueMap(..)
-            | Step::PropertyMap(..)
-            | Step::Properties(..)
-            | Step::ElementMap(..)
-            | Step::Value
-            | Step::Constant(_)
-            | Step::Barrier
-            | Step::Sample(_)
-            | Step::Aggregate(_)
-            | Step::Store(_)
-            | Step::Cap(_)
-            // `select` reads the TAG map and the current value, never
-            // `Trav::path` — and neither can its `by()` bodies, because
-            // `eval_by` runs each on a FRESH `Trav::root(value)`. So
-            // `select('a').by(__.path())` yields the selected value's own
-            // one-element path, not the outer traverser's, and recursing into
-            // the bodies here would be dead logic.
-            //
-            // Leaving `select` out taxed every labelled traversal with a
-            // per-traverser path clone, and — since the pattern branch declines
-            // whenever the REST needs a path — kept `as(x)` from ever reaching
-            // the planner.
-            | Step::Select { .. }
-            // `as(x)` WRITES a tag from the current value; it reads no history.
-            // Leaving it out taxed every labelled traversal with a per-traverser
-            // path clone — `as('a').out('R').hasLabel('W').count()` cost 21.4ms
-            // where the untagged spelling cost 0.10ms, and almost all of that was
-            // the clone rather than the tag.
-            | Step::As(_)
-    ) || matches!(step, Step::Dedupe { .. })
+/// One walk, in `super::analysis` — the same walk that answers whether anything
+/// reads a tag and where the pipeline boundaries are. Three separate lists is
+/// how `where(eq('a'))` came to be listed as tag-free while being listed
+/// correctly for paths.
+fn needs_path(steps: &[Step]) -> bool {
+    super::analysis::analyze(steps).needs_path
 }
 
 /// Whether any of these steps could READ an `as(label)` tag.
 ///
-/// Conservative by construction: a `by()` or a sub-traversal can hold a
-/// `select`, so anything carrying one counts. What it lets through is the plain
-/// terminal chain — `count`, `values`, `fold`, `id`, `label`, a filter — which is
-/// the case worth getting right, because binding a tag nothing reads costs a
-/// materialized column per label AND a per-row tag map to put it in.
-///
-/// `as(x).out(R).hasLabel(W).count()` built 15,000 tag maps for a count that
-/// never looks at one: 1.50ms, against 0.097ms once the tags are left unbound.
+/// See `needs_path`: same walk, same declaration site.
 fn reads_tags(steps: &[Step]) -> bool {
-    steps.iter().any(|s| match s {
-        Step::Select { .. }
-        | Step::WhereKey(..)
-        | Step::Match(_)
-        | Step::ShortestPath { .. }
-        | Step::Tree(_)
-        | Step::Path(_) => true,
-        Step::Dedupe { labels, bys } => !labels.is_empty() || !bys.is_empty(),
-        // Anything that can carry a sub-traversal, which can carry a `select`.
-        Step::Where(_)
-        | Step::Not(_)
-        | Step::Optional(_)
-        | Step::Local(_)
-        | Step::Map(_)
-        | Step::FlatMap(_)
-        | Step::SideEffect(_)
-        | Step::And(_)
-        | Step::Or(_)
-        | Step::Union(_)
-        | Step::Coalesce(_)
-        | Step::Choose { .. }
-        | Step::Repeat { .. } => true,
-        Step::Order(bys, ..)
-        | Step::Group(bys)
-        | Step::GroupCount(bys)
-        | Step::Project(_, bys)
-        | Step::Math { bys, .. } => !bys.is_empty(),
-        _ => false,
-    })
-}
-
-/// Whether this traversal needs per-traverser path history at all.
-fn needs_path(steps: &[Step]) -> bool {
-    !steps.iter().all(path_free)
+    super::analysis::analyze(steps).reads_tags
 }
 
 /// The whole live element set, when nothing narrows it.

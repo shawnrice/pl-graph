@@ -12,6 +12,7 @@
 //! Closure-bearing steps (`map(fn)`/`filter(fn)`/…) are intentionally omitted:
 //! the data-plan model uses sub-traversals instead, which express the same logic.
 
+mod analysis;
 #[cfg(test)]
 mod divergence_tests;
 pub mod exec;
