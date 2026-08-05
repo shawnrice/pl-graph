@@ -11443,6 +11443,67 @@ fn every_count_shortcut_agrees_on_multi_label_edges() {
     }
 }
 
+/// A merged multi-pattern first clause agrees with the scalar driver.
+///
+/// `vectorized_linear` used to refuse any first `MATCH` with more than one
+/// pattern, which sent the WHOLE pipeline to the scalar driver. Since ac0d6c2
+/// merges adjacent `MATCH`es at plan time — and an inline `CALL` desugars to
+/// exactly that, `[Match, Match, With, Return]` — the refusal fired on shapes
+/// people write, and cost 4.1x on the CALL form.
+///
+/// Fusing first makes those shapes reach the pipeline, which means a class of
+/// queries changed which engine answers them. This asserts the answers did not.
+#[test]
+fn a_fused_multi_pattern_pipeline_agrees_with_the_scalar_driver() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["P"],"properties":{"k":1,"s":"x"}}"#,
+            r#"{"type":"node","id":"b","labels":["P","W"],"properties":{"k":2,"s":"y"}}"#,
+            r#"{"type":"node","id":"c","labels":["P"],"properties":{"k":2,"s":"x"}}"#,
+            r#"{"type":"node","id":"d","labels":["Q"],"properties":{"k":3}}"#,
+            r#"{"type":"edge","id":"r0","from":"a","to":"b","labels":["R"],"properties":{"w":1}}"#,
+            r#"{"type":"edge","id":"r1","from":"a","to":"c","labels":["R"],"properties":{"w":2}}"#,
+            r#"{"type":"edge","id":"r2","from":"b","to":"d","labels":["R"],"properties":{"w":3}}"#,
+            r#"{"type":"edge","id":"r3","from":"c","to":"b","labels":["S"],"properties":{"w":4}}"#,
+            r#"{"type":"edge","id":"r4","from":"b","to":"b","labels":["R"],"properties":{"w":5}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    for q in [
+        // The shape that regressed, and the two spellings that merge into it.
+        "MATCH (p:P) CALL (p) { MATCH (p)-[:R]->(f) RETURN f.k AS fk } RETURN count(*) AS c",
+        "MATCH (p:P) MATCH (p)-[:R]->(f) WITH f.k AS fk RETURN count(*) AS c",
+        "MATCH (p:P), (p)-[:R]->(f) WITH f.k AS fk RETURN count(*) AS c",
+        // Carrying the projection forward rather than counting it.
+        "MATCH (p:P) MATCH (p)-[:R]->(f) WITH f.k AS fk RETURN fk ORDER BY fk",
+        "MATCH (p:P) MATCH (p)-[:R]->(f) WITH DISTINCT f.k AS fk RETURN fk ORDER BY fk",
+        "MATCH (p:P) MATCH (p)-[:R]->(f) WITH f.k AS fk WHERE fk > 1 RETURN count(*) AS c",
+        "MATCH (p:P) MATCH (p)-[:R]->(f) WITH f AS f2 MATCH (f2)-[:R]->(g) RETURN count(*) AS c",
+        // A three-way merge, and one where the second pattern extends the first.
+        "MATCH (p:P) MATCH (p)-[:R]->(f) MATCH (f)-[:R]->(g) WITH g.k AS gk RETURN count(*) AS c",
+        "MATCH (p:P)-[:R]->(f) MATCH (f)-[:S]->(h) WITH h.k AS hk RETURN count(*) AS c",
+        // Aggregates and grouping over the merged shape.
+        "MATCH (p:P) MATCH (p)-[:R]->(f) WITH f.k AS fk RETURN sum(fk) AS s",
+        "MATCH (p:P) MATCH (p)-[:R]->(f) RETURN f.k AS fk, count(*) AS c ORDER BY fk",
+        // Patterns that share NO variable are a cross product, which this
+        // pipeline must still decline rather than get wrong.
+        "MATCH (p:P), (q:Q) WITH p.k AS pk, q.k AS qk RETURN count(*) AS c",
+        "MATCH (p:P) MATCH (q:Q) WITH p.k AS pk RETURN count(*) AS c",
+        // OPTIONAL must not merge at all.
+        "MATCH (p:P) OPTIONAL MATCH (p)-[:S]->(f) WITH f.k AS fk RETURN count(*) AS c",
+    ] {
+        let fused = rows(&mut g, q);
+        let scalar = super::eval::with_vec_override(false, || rows(&mut g, q));
+
+        assert_eq!(
+            fused, scalar,
+            "the fused pipeline disagrees with the scalar driver on `{q}`"
+        );
+    }
+}
+
 /// The one-slot WALK agrees with the joined frame on every shape it takes.
 ///
 /// `streamed_frame` replaces the join with a frontier walk when the only slot

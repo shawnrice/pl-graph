@@ -2326,7 +2326,7 @@ fn cross_frames(a: &ScanCols, b: &ScanCols, budget: u64) -> Option<ScanCols> {
 /// a CROSS PRODUCT of those paths — patterns that share no variable, like
 /// `MATCH (a)-[]->(b), (c)-[]->(d)`. That is not a join to be spliced; it is a
 /// different operation, and `cross_frames` performs it.
-fn fuse_groups(patterns: &[CPath]) -> Option<Vec<CPath>> {
+pub(super) fn fuse_groups(patterns: &[CPath]) -> Option<Vec<CPath>> {
     // One pattern has nothing to group, and returning `None` lets the caller
     // BORROW it. Building a one-element Vec here clones the whole `CPath` —
     // labels, props, `WHERE` trees — on every execution. Invisible on a 500us
@@ -2896,6 +2896,25 @@ pub(super) fn project_frame_cols(
                 sort_sc.vals[i] = Some(c.clone());
             }
         }
+        // REJECTED (measured neutral): the same dense treatment for a NUMERIC key
+        // — a flat `f64` array instead of the boxed `Val` comparator, mirroring
+        // the temporal one below. It was written for both spellings, the property
+        // and the output alias, and moved nothing: 6.54ms vs 6.61ms on
+        // `WITH a.n AS x RETURN x ORDER BY x DESC`, 17.0ms vs 16.6ms with an
+        // aggregate beside it, over 50k rows.
+        //
+        // The reason is that the shape it was aimed at never arrives here.
+        // `MATCH (a:V) RETURN a.n AS x ORDER BY x DESC` is a plain non-aggregating
+        // `MATCH … RETURN`, which `vectorized_linear` declines by design, so the
+        // SCALAR matcher sorts it — and that path has its own top-k (matcher.rs).
+        // A full sort of 50k numbers there costs 6.4ms against Gremlin's 1.0ms,
+        // which is a real gap and is NOT in this function.
+        //
+        // Also worth recording: at top-k the two engines already agree — 0.98ms
+        // against 0.96ms for `ORDER BY … LIMIT 5` over 50k distinct values. The
+        // 2x on `cross_engine_shortcuts` is that fixture having only 1000
+        // distinct values, not a difference in the selection.
+        //
         // Fast path: a single temporal ORDER BY key sorts packed Copy temporals via
         // `cmp_total`, skipping the `Val` keycol + dispatch. Falls through to the
         // generic `Vec<Val>` sort for multi-key / non-temporal / mixed keys (that

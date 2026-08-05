@@ -3717,6 +3717,20 @@ fn vectorized_linear(
     else {
         return None;
     };
+    // Several patterns are a JOIN, and a join that shares a variable FUSES into
+    // one path — which is what `vectorized_frame` already does. Refusing them
+    // outright cost 4.1x on `MATCH (p:Person) CALL (p) { MATCH (p)-[:KNOWS]->(f)
+    // RETURN f.name AS friend } RETURN count(*)`: the inline CALL desugars to
+    // `[Match, Match, With, Return]`, ac0d6c2 merged the two MATCHes into one
+    // clause with two patterns — correctly, and it is 0.121ms when the RETURN is
+    // terminal — and this test then declined the whole pipeline to the scalar
+    // driver for the rest.
+    // Patterns sharing no variable fuse to SEVERAL groups — a cross product,
+    // which this pipeline does not build — and the length check below turns those
+    // away for free.
+    let fused = fuse_groups(patterns);
+    let patterns: &[CPath] = fused.as_deref().unwrap_or(patterns);
+
     if patterns.len() != 1 {
         return None;
     }
