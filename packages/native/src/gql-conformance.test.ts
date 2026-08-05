@@ -106,15 +106,20 @@ suite('GQL differential: rich RETURN results (TS vs native)', () => {
   });
 
   test('min/max over a computed NaN agrees across engines (vectorized == scalar)', () => {
-    // sqrt(age-30): marko(29)→NaN, vadas(27)→NaN, josh(32)→~1.41. A first-seen NaN
-    // sticks under cmp_total/compareValues (min/max is a reduce), so both are NaN →
-    // null. The vectorized Rust fold once used f64::min/max, which DROP NaN → ~1.41,
-    // diverging from the scalar path and from TS. Now all three agree.
+    // sqrt(age-30): marko(29)→NaN, vadas(27)→NaN, josh(32)→~1.41. NaN is the
+    // GREATEST value in the sort/aggregate order, so `max` keeps it (rendered
+    // null, JSON having no NaN) and `min` never picks one.
+    //
+    // Three folds have to say that and each was wrong differently: the comparators
+    // used a PARTIAL order, under which a first-seen NaN stuck (both ends NaN);
+    // the vectorized Rust column fold used f64::min/max, which DROP a NaN (both
+    // ends ~1.41); and the grouped fold used partial_cmp, sticking again. Nothing
+    // tells a caller which one ran, so they have to agree.
     const [ts, native] = both(
       `MATCH (n:Person) RETURN min(sqrt(n.age - 30)) AS lo, max(sqrt(n.age - 30)) AS hi`,
     );
     expect(ts).toBe(native);
-    expect(ts).toBe(`[{"lo":null,"hi":null}]`);
+    expect(ts).toBe(`[{"lo":1.4142135623730951,"hi":null}]`);
   });
 
   test('sum/avg over a mixed numeric+temporal group faults in both engines', () => {

@@ -1779,16 +1779,23 @@ pub(super) fn fused_global_agg(
     let mut sum = 0.0f64;
     let mut n = 0usize;
     let mut ext: Option<f64> = None;
-    let is_min = spec.func == AggFn::Min;
+    let want = if spec.func == AggFn::Min {
+        Ordering::Less
+    } else {
+        Ordering::Greater
+    };
     let mut fold = |x: f64| {
         sum += x;
         n += 1;
         ext = Some(match ext {
+            // `num_total_cmp`, not `f64::min`/`max`: those DROP a NaN, so `max`
+            // would return the largest real number where the sort/aggregate
+            // policy makes NaN the greatest value and `max` keeps it.
             Some(e) => {
-                if is_min {
-                    e.min(x)
+                if num_total_cmp(x, e) == want {
+                    x
                 } else {
-                    e.max(x)
+                    e
                 }
             }
             None => x,
@@ -1931,20 +1938,23 @@ pub(super) fn fold_group_agg_cols(
                         if valid[i] {
                             let g = gid_of_row[i];
                             m[g] = Some(match m[g] {
-                                // First-seen semantics matching the scalar `cmp_total`
-                                // path (and the TS `reduce`): replace only on a STRICT
-                                // partial_cmp result, so a NaN (partial_cmp → None)
-                                // never displaces a real extreme, and a first-seen NaN
-                                // sticks. `f64::min/max` instead silently drop NaN, so
-                                // the vectorized and scalar min/max disagreed on a
-                                // computed NaN (e.g. `min(sqrt(x))` with some x < 0).
+                                // The same TOTAL order the scalar `cmp_total` path
+                                // uses — NaN greatest, NaN == NaN — so `max` keeps a
+                                // NaN and `min` never picks one.
+                                //
+                                // This was `partial_cmp`, which answers None against a
+                                // NaN: never the wanted ordering, so a first-seen NaN
+                                // STUCK and `min(sqrt(x))` returned it. (`f64::min/max`
+                                // is the opposite error — it drops NaN, so `max` misses
+                                // one.) The vectorized and scalar paths have to agree
+                                // here; nothing tells a caller which one answered.
                                 Some(x) => {
                                     let want = if is_min {
                                         Ordering::Less
                                     } else {
                                         Ordering::Greater
                                     };
-                                    if d[i].partial_cmp(&x) == Some(want) {
+                                    if num_total_cmp(d[i], x) == want {
                                         d[i]
                                     } else {
                                         x

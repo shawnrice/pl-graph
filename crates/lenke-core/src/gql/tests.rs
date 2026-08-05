@@ -12041,3 +12041,55 @@ fn the_edge_type_count_survives_label_mutation() {
     both(&mut g, "S");
     both(&mut g, "R|S");
 }
+
+/// The vectorized min/max fold and the scalar one agree on a computed NaN.
+///
+/// Nothing tells a caller which path answered, so a NaN rule that lives in only
+/// one of them is a wrong answer half the time. Each fold had its OWN, and each
+/// was wrong in a different direction: the ungrouped column fold used
+/// `f64::min`/`max`, which silently DROP a NaN, so `max` returned the largest
+/// real number; the grouped fold used `partial_cmp`, which answers None against
+/// a NaN — never the wanted ordering — so a first-seen NaN STUCK and `min`
+/// returned it. Both now call `num_total_cmp`, the one definition.
+///
+/// The policy: NaN is the greatest value, so `max` keeps it and `min` never
+/// picks one — unless every value is a NaN, when there is nothing else to pick.
+#[test]
+fn the_vectorized_extreme_agrees_with_the_scalar_one_on_a_nan() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["P"],"properties":{"age":29,"t":"x"}}"#,
+        r#"{"type":"node","id":"b","labels":["P"],"properties":{"age":27,"t":"x"}}"#,
+        r#"{"type":"node","id":"c","labels":["P"],"properties":{"age":32,"t":"x"}}"#,
+        r#"{"type":"node","id":"d","labels":["P"],"properties":{"age":28,"t":"y"}}"#,
+        r#"{"type":"node","id":"e","labels":["P"],"properties":{"age":36,"t":"y"}}"#,
+    ]);
+
+    for (query, want) in [
+        // Ungrouped: two NaNs and one real.
+        (
+            "MATCH (n:P) WHERE n.t = 'x' RETURN min(sqrt(n.age - 30)) AS lo, max(sqrt(n.age - 30)) AS hi",
+            "[[Num(1.4142135623730951), Num(NaN)]]",
+        ),
+        // GROUPED, which is a SECOND fold with its own history: group 'x' mixes
+        // NaNs with a real, group 'y' does too.
+        (
+            "MATCH (n:P) RETURN n.t AS t, min(sqrt(n.age - 30)) AS lo, max(sqrt(n.age - 30)) AS hi GROUP BY n.t ORDER BY t",
+            "[[Str(\"x\"), Num(1.4142135623730951), Num(NaN)], [Str(\"y\"), Num(2.449489742783178), Num(NaN)]]",
+        ),
+        // EVERY value a NaN: there is no real extreme to prefer, so both ends
+        // are the NaN rather than null.
+        (
+            "MATCH (n:P) WHERE n.age < 30 RETURN min(sqrt(n.age - 40)) AS lo, max(sqrt(n.age - 40)) AS hi",
+            "[[Num(NaN), Num(NaN)]]",
+        ),
+    ] {
+        let vectorized = format!("{:?}", rows(&mut g, query));
+        let scalar = format!(
+            "{:?}",
+            super::eval::with_vec_override(false, || rows(&mut g, query))
+        );
+
+        assert_eq!(vectorized, want, "the vectorized fold on `{query}`");
+        assert_eq!(scalar, want, "the scalar fold on `{query}`");
+    }
+}

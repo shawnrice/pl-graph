@@ -859,6 +859,22 @@ fn type_rank(v: &Val) -> u8 {
     }
 }
 
+/// The numeric half of [`cmp_total`], on raw `f64` — for the vectorized paths,
+/// which fold a numeric column without ever boxing a `Val`.
+///
+/// One definition, because the two paths answer the same queries and nothing
+/// tells a caller which one ran. They drifted twice from having their own: the
+/// column fold used `f64::min`/`max`, which DROP a NaN, and the grouped fold
+/// used `partial_cmp`, under which a NaN sticks.
+pub(super) fn num_total_cmp(x: f64, y: f64) -> Ordering {
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+    }
+}
+
 /// A TOTAL order across value types, used by ORDER BY / min / max / list_sort so
 /// a mixed-type column sorts deterministically (unlike `val_cmp`, which is
 /// partial). Byte-for-byte identical to the TS `compareValues`: null sorts
@@ -900,12 +916,7 @@ fn cmp_total(a: &Val, b: &Val) -> Ordering {
         //
         // Reachable through a projection (`sqrt(-1)`), not through storage: a
         // stored non-finite is coerced to null at the write (`Value::finite_only`).
-        (Val::Num(x), Val::Num(y)) => match (x.is_nan(), y.is_nan()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => Ordering::Greater,
-            (false, true) => Ordering::Less,
-            (false, false) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-        },
+        (Val::Num(x), Val::Num(y)) => num_total_cmp(*x, *y),
         (Val::Str(x), Val::Str(y)) => x.cmp(y),
         (Val::Bool(x), Val::Bool(y)) => x.cmp(y),
         (Val::Temporal(x), Val::Temporal(y)) => x.cmp_total(y),
