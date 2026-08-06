@@ -710,7 +710,16 @@ fn value_key(v: &Value, out: &mut String) {
             let _ = write!(out, "b{}", *b as u8);
         }
         Value::Num(x) => {
-            let _ = write!(out, "n{:016x}", x.to_bits());
+            // `-0.0` and `0.0` are ONE key, matching the main engine — which
+            // normalizes here for the reason recorded on `group_num_bits`:
+            // grouping agrees with equality everywhere else, and two groups whose
+            // rendered values are both `0` is a distinction no result can show.
+            //
+            // This copy kept the raw bits, so `RETURN DISTINCT u.z` over a `0.0`
+            // and a `-0.0` gave two rows here and one there. That matters
+            // precisely because this engine exists to be COMPARED against the
+            // other one.
+            let _ = write!(out, "n{:016x}", crate::value::group_key_bits(*x));
         }
         Value::Str(s) => {
             let _ = write!(out, "s{s}");
@@ -1498,5 +1507,50 @@ mod tests {
                         .all(|(k, w)| got.get(k.as_ref()).is_some_and(|g| json_matches(g, w)))
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod signed_zero_agreement {
+    /// The fingerprint engine and the real one must agree about grouping, since
+    /// agreeing is the whole reason this engine exists.
+    ///
+    /// `-0.0` and `0.0` are ONE key. This engine keyed on raw bits and gave two
+    /// rows where `gql` gave one — a divergence between two implementations in
+    /// one crate, on a decision that had been settled and applied to only one of
+    /// them.
+    #[test]
+    fn signed_zeros_are_one_group_in_both_engines() {
+        let lines = [
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{"z":0.0}}"#,
+            r#"{"type":"node","id":"b","labels":["N"],"properties":{"z":-0.0}}"#,
+        ]
+        .join("\n");
+        let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+        // Both signs really are stored; without that this test proves nothing.
+        let kid = g.props.keys.get("z").expect("the key exists");
+        let bits: Vec<u64> = (0..2)
+            .map(
+                |i| match crate::value::Value::from_column(&g.props, kid, i, &g.strs, false) {
+                    crate::value::Value::Num(x) => x.to_bits(),
+                    other => panic!("expected a number, got {other:?}"),
+                },
+            )
+            .collect();
+
+        assert_ne!(bits[0], bits[1], "both zero signs must reach the column");
+
+        let q = "MATCH (u:N) RETURN DISTINCT u.z";
+
+        assert_eq!(super::parse(q).expect("parses").run_rows(&g).nrows, 1);
+        assert_eq!(
+            crate::gql::parse(q)
+                .expect("parses")
+                .execute(&mut g, &crate::gql::eval::Params::new())
+                .expect("runs")
+                .nrows,
+            1
+        );
     }
 }

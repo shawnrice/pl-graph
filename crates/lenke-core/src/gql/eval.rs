@@ -1024,32 +1024,6 @@ fn in_list(v: &Val, list: &Val) -> Truth {
     }
 }
 
-/// The bit pattern a number groups / dedups by, canonicalized so that grouping
-/// agrees with equality.
-///
-/// Two values need collapsing. **NaN**: the engine's total order treats NaN ==
-/// NaN, but the RAW bits differ by sign and payload depending on which operation
-/// produced it — `ln(-1)` and `x / NaN` do not agree — which split one logical
-/// value into several groups. **Signed zero**: `-0.0 == 0.0` is true, and this
-/// engine normalizes the distinction absolutely everywhere else — `=`, `IN`,
-/// ORDER BY, `sign()`, the result JSON, `to_string`, and the property index all
-/// treat them as one value, and `1 / ±0` faults rather than yielding ±∞. Keeping
-/// them apart HERE alone produced two DISTINCT groups whose rendered values were
-/// both `0` — indistinguishable in the output, so readable only as a bug. The
-/// Gremlin engine's `dedup_key` already collapsed them; this brings GQL in line.
-fn group_num_bits(n: f64) -> u64 {
-    if n.is_nan() {
-        return f64::NAN.to_bits();
-    }
-    // Signed zero, BRANCHLESSLY: IEEE 754 gives `-0.0 + 0.0 == +0.0` under the
-    // default rounding mode, while `x + 0.0 == x` exactly for every other finite
-    // or infinite x. So one add does the normalization with no compare and no
-    // branch — the historical reason for keeping -0 apart here was the cost of
-    // that check, and this removes the cost rather than the correctness. (Rust
-    // does not assume fast-math, so the add is never optimized away.)
-    (n + 0.0).to_bits()
-}
-
 /// A canonical, hashable key for a value — grouping, DISTINCT, row keys.
 fn val_key(v: &Val, out: &mut String) {
     match v {
@@ -1062,7 +1036,7 @@ fn val_key(v: &Val, out: &mut String) {
             out.push(if *b { '1' } else { '0' });
         }
         Val::Num(n) => {
-            let _ = write!(out, "n{:016x}", group_num_bits(*n));
+            let _ = write!(out, "n{:016x}", crate::value::group_key_bits(*n));
         }
         Val::Str(s) => {
             // Raw byte push (same bytes as `write!("s{s}")`, without the fmt
@@ -1130,7 +1104,9 @@ fn group_val_eq(a: &Val, b: &Val) -> bool {
     match (a, b) {
         (Val::Null, Val::Null) => true,
         (Val::Bool(x), Val::Bool(y)) => x == y,
-        (Val::Num(x), Val::Num(y)) => group_num_bits(*x) == group_num_bits(*y),
+        (Val::Num(x), Val::Num(y)) => {
+            crate::value::group_key_bits(*x) == crate::value::group_key_bits(*y)
+        }
         (Val::Str(x), Val::Str(y)) => x == y,
         (Val::Node(x), Val::Node(y)) => x == y,
         (Val::Edge(x), Val::Edge(y)) => x == y,
@@ -1162,7 +1138,7 @@ fn value_key(v: &Value, out: &mut String) {
             out.push(if *b { '1' } else { '0' });
         }
         Value::Num(n) => {
-            let _ = write!(out, "n{:016x}", group_num_bits(*n));
+            let _ = write!(out, "n{:016x}", crate::value::group_key_bits(*n));
         }
         Value::Str(s) => {
             let _ = write!(out, "s{s}");

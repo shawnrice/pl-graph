@@ -1815,7 +1815,13 @@ pub(super) fn raw_bits_of(
         // group with 0, and a stored NaN with any other NaN.
         Some(Column::Num { data, present }) => Some(
             (0..sc.n)
-                .map(|i| bits(i, present, group_num_bits(data[ids[i] as usize])))
+                .map(|i| {
+                    bits(
+                        i,
+                        present,
+                        crate::value::group_key_bits(data[ids[i] as usize]),
+                    )
+                })
                 .collect(),
         ),
         Some(Column::Bool { data, present }) => Some(

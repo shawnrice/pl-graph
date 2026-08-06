@@ -874,6 +874,33 @@ impl<'a> Col<'a> {
     }
 }
 
+/// A number's bits as a GROUPING key: `NaN` canonicalized, and `-0.0` folded
+/// into `0.0`.
+///
+/// Grouping agrees with equality, which is what makes this right. Two values need
+/// the collapse. **NaN**: the total order treats `NaN == NaN`, but the raw bits
+/// differ by sign and payload depending on which operation produced it — `ln(-1)`
+/// and `x / NaN` do not agree — which split one logical value into several
+/// groups. **Signed zero**: `-0.0 == 0.0` is true and the engines normalize the
+/// distinction absolutely everywhere else (`=`, `IN`, ORDER BY, `sign()`, the
+/// result JSON, `to_string`, the property index; `1 / ±0` faults rather than
+/// yielding ±∞), so keeping them apart HERE alone produced two groups whose
+/// rendered values were both `0` — a distinction no result could display.
+///
+/// Branchless, and deliberately: IEEE 754 gives `-0.0 + 0.0 == +0.0` under the
+/// default rounding mode while `x + 0.0 == x` exactly for every other finite or
+/// infinite `x`, so one add normalizes with no compare. The historical reason for
+/// keeping `-0` apart was the cost of that check; this removes the cost rather
+/// than the correctness. (Rust never assumes fast-math, so the add stands.)
+#[must_use]
+pub fn group_key_bits(n: f64) -> u64 {
+    if n.is_nan() {
+        return f64::NAN.to_bits();
+    }
+
+    (n + 0.0).to_bits()
+}
+
 /// First-seen grouping: one entry per distinct key, in the order the keys first
 /// appear, with a caller-chosen accumulator per group.
 ///
