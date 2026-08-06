@@ -2240,42 +2240,16 @@ fn num_column_terminal(nums: &[f64], filter: Option<&P>, tail: &[Step]) -> Optio
 }
 
 fn index_seed(graph: &Graph, steps: &[Step]) -> Option<(Vec<Trav>, Vec<usize>)> {
-    let is_edge = match steps.first()? {
-        Step::V(ids) if ids.is_empty() => false,
-        Step::E(ids) if ids.is_empty() => true,
-        _ => return None,
-    };
-    let mut seek = ElementSeek::same_kind(is_edge);
-    // Only steps whose predicate was captured IN FULL may be dropped later.
-    let mut captured: Vec<usize> = Vec::new();
-
-    for (i, step) in steps.iter().enumerate().skip(1) {
-        match step {
-            Step::Has(key, pred) => {
-                if lower_predicate(key, pred, &mut seek) {
-                    captured.push(i);
-                }
-            }
-            // `hasLabel` lowers into the IR too, under the FIRST-label rule —
-            // TinkerPop reads `vertex_labels(i).first()`, unlike GQL's any-label
-            // `(n:Person)`. Carrying the rule as data is what lets the bucket
-            // seeding below serve both. Only the first `hasLabel` is taken: a
-            // second one intersects, which the flat id list cannot express, so it
-            // stays a step.
-            Step::HasLabel(labels) if seek.labels().is_none() => {
-                // `None` = every name unknown, which the empty id list says.
-                // A partially-resolving disjunction keeps the names that did.
-                let ids = resolve_element_labels(graph, labels, is_edge).unwrap_or_default();
-
-                if !labels.is_empty() {
-                    seek.set_labels(ids);
-                    captured.push(i);
-                }
-            }
-            Step::HasLabel(..) | Step::HasNot(..) => {}
-            _ => break,
-        }
-    }
+    // ONE prefix lowering, shared with the columnar route. This used to be a
+    // second copy of `lower_prefix`'s loop — the same match, the same arms, the
+    // same `captured` bookkeeping — and the copies drifted the moment either was
+    // touched: `has(k)`, `hasNot(k)`, `not(has(k, v))` and `or(…)` were taught to
+    // one of them and the stream-seeding path silently kept scanning for all four.
+    //
+    // That is the whole argument for a single lowering in one line of code: the
+    // second copy does not announce itself, it just quietly answers a slower
+    // question.
+    let (seek, captured, _read, is_edge) = lower_prefix(graph, steps)?;
 
     // Gremlin values are already values — there are no parameter slots to bind.
     let no_params = |_: usize| None;
