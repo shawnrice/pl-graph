@@ -2184,11 +2184,7 @@ pub(super) fn vectorized_aggregate(
     let mut b = Binding(vec![None; sc.cols.len()]);
     if proj.order_by.is_empty() {
         // No ORDER BY: emit groups in first-seen order, applying SKIP/LIMIT directly.
-        let start = proj.skip_val(ctx).min(ngroups);
-        let end = proj
-            .limit_val(ctx)
-            .map(|l| (start + l).min(ngroups))
-            .unwrap_or(ngroups);
+        let (start, end) = proj.window(ctx, ngroups);
         let mut out: Vec<Vec<Val>> = vec![Vec::with_capacity(end - start); proj.items.len()];
         for g in start..end {
             bind_rep(&mut b, g);
@@ -2258,11 +2254,7 @@ pub(super) fn vectorized_aggregate(
         }
         i.cmp(&j)
     };
-    let start = proj.skip_val(ctx).min(ngroups);
-    let end = proj
-        .limit_val(ctx)
-        .map(|l| (start + l).min(ngroups))
-        .unwrap_or(ngroups);
+    let (start, end) = proj.window(ctx, ngroups);
     let mut idx: Vec<usize> = (0..ngroups).collect();
     // Partial sort for a LIMIT: quickselect the smallest `end`, then sort only those.
     if end >= 1 && end < idx.len() {
@@ -3174,11 +3166,7 @@ pub(super) fn project_frame_cols(
         } else {
             (0..sc.n).collect()
         };
-        let start = proj.skip_val(ctx).min(idx.len());
-        let end = proj
-            .limit_val(ctx)
-            .map(|l| (start + l).min(idx.len()))
-            .unwrap_or(idx.len());
+        let (start, end) = proj.window(ctx, idx.len());
         // Partial sort for a LIMIT: partition the top `end` rows out in O(n), then
         // fully sort just that window — instead of an O(n log n) sort of every row
         // to keep only a small prefix. No LIMIT ⇒ a full sort (all rows returned).
@@ -3214,11 +3202,7 @@ pub(super) fn project_frame_cols(
     if proj.distinct {
         let all_items: Vec<&CReturnItem> = proj.items.iter().collect();
         if let Some((_, rep_row, ngroups)) = group_ids(graph, ctx, sc, &all_items) {
-            let start = proj.skip_val(ctx).min(ngroups);
-            let end = proj
-                .limit_val(ctx)
-                .map(|l| (start + l).min(ngroups))
-                .unwrap_or(ngroups);
+            let (start, end) = proj.window(ctx, ngroups);
             let mut out: Vec<Vec<Val>> = vec![Vec::with_capacity(end - start); proj.items.len()];
             let mut b = Binding(vec![None; sc.cols.len()]);
             for &ri in &rep_row[start..end] {
@@ -3274,11 +3258,7 @@ pub(super) fn project_frame_cols(
         )
     } else {
         // Window each column to the SKIP/LIMIT row range (no ORDER BY ⇒ scan order).
-        let start = proj.skip_val(ctx).min(sc.n);
-        let end = proj
-            .limit_val(ctx)
-            .map(|l| (start + l).min(sc.n))
-            .unwrap_or(sc.n);
+        let (start, end) = proj.window(ctx, sc.n);
         for c in &mut cols {
             c.truncate(end);
             c.drain(0..start);

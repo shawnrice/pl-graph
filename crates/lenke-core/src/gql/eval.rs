@@ -416,6 +416,20 @@ impl CProjection {
         }
     }
 
+    /// The `[start, end)` row window this projection's SKIP/LIMIT selects out of
+    /// `n` rows, both clamped.
+    ///
+    /// Written out inline at five sites, each recomputing the same clamp — and
+    /// `n` is not always the row count: a grouped projection windows over GROUPS
+    /// and a sorted one over the sorted index, which is exactly the sort of
+    /// difference an open-coded clamp hides.
+    fn window(&self, ctx: &Ctx, n: usize) -> (usize, usize) {
+        let start = self.skip_val(ctx).min(n);
+        let end = self.limit_val(ctx).map_or(n, |l| (start + l).min(n));
+
+        (start, end)
+    }
+
     /// Effective `LIMIT`, resolving a dynamic `$param` bound; `None` if absent.
     fn limit_val(&self, ctx: &Ctx) -> Option<usize> {
         match &self.limit {
