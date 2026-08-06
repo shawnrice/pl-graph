@@ -1820,26 +1820,18 @@ fn column_terminal(
 /// corner: a value with NO key (a `NaN` inside it) is never a duplicate, so it
 /// rides through every time.
 ///
-/// That corner IS reachable. A NaN cannot be ingested — it is normalized to null
-/// at every entry point — but it can be COMPUTED into a property from inside the
-/// graph: `SET x = sqrt(-1)`, `asin(2)`, `acos(2)`, `power(-1, 0.5)` all store
-/// one. This was documented as unreachable and was not.
+/// Where that corner is reachable from has CHANGED, and the comment here said
+/// the old thing for a while. A NaN cannot be stored by any route any more —
+/// ingest normalized it to null, and the write path now applies the same rule to
+/// a computed value, so `SET x = sqrt(-1)` and its three companions all store
+/// null (pinned by `a_nan_cannot_be_stored_by_any_route`). It is still reachable
+/// in a COMPUTED column — `RETURN sqrt(-1)` is `Num(NaN)` — which is why the rule
+/// stays; it just no longer arrives from the property store.
 fn distinct_values(values: impl Iterator<Item = GVal>) -> Vec<GVal> {
-    let mut seen: crate::fxhash::FxHashSet<DedupKey> = crate::fxhash::FxHashSet::default();
-    let mut out = Vec::new();
-
-    for v in values {
-        match dedup_key(&v) {
-            None => out.push(v),
-            Some(k) => {
-                if seen.insert(k) {
-                    out.push(v);
-                }
-            }
-        }
-    }
-
-    out
+    group_by(values, || (), |(), _| ())
+        .into_iter()
+        .map(|(v, ())| v)
+        .collect()
 }
 
 /// Tally values into `(value, count)` pairs in FIRST-SEEN order — the whole of
@@ -1871,34 +1863,14 @@ fn tally_group_count(values: impl Iterator<Item = GVal>) -> Vec<(GVal, GVal)> {
 fn group_by<A>(
     keys: impl Iterator<Item = GVal>,
     init: impl Fn() -> A,
-    add: impl Fn(&mut A, usize),
+    mut add: impl FnMut(&mut A, usize),
 ) -> Vec<(GVal, A)> {
-    let mut entries: Vec<(GVal, A)> = Vec::new();
-    let mut index: crate::fxhash::FxHashMap<DedupKey, usize> = crate::fxhash::FxHashMap::default();
+    let keys: Vec<GVal> = keys.collect();
 
-    for (i, key) in keys.enumerate() {
-        let dk = dedup_key(&key);
-        let existing = match &dk {
-            Some(dk) => index.get(dk).copied(),
-            None => entries.iter().position(|(k, _)| *k == key),
-        };
-
-        match existing {
-            Some(at) => add(&mut entries[at].1, i),
-            None => {
-                if let Some(dk) = dk {
-                    index.insert(dk, entries.len());
-                }
-
-                let mut a = init();
-
-                add(&mut a, i);
-                entries.push((key, a));
-            }
-        }
-    }
-
-    entries
+    crate::value::group_first_seen(keys.len(), |i| dedup_key(&keys[i]), init, &mut add, None)
+        .into_iter()
+        .map(|(rep, a)| (keys[rep].clone(), a))
+        .collect()
 }
 
 /// The effective sort direction of an `order()` over the CURRENT value, or
@@ -2107,8 +2079,9 @@ fn num_column_terminal(graph: &Graph, nums: &[f64], tail: &[Step]) -> Option<Vec
         //
         // Declines on a NaN, like `extreme` above: `cmp_or_fault` RECORDS a type
         // fault for an incomparable pair, so answering here would swallow the
-        // error the stream raises. A NaN column is reachable (`SET x = sqrt(-1)`),
-        // so this is not a theoretical guard.
+        // error the stream raises. Not reachable from the property STORE any more
+        // (a non-finite write is normalized to null), but a computed column still
+        // holds one, so the guard stays — see `distinct_values`.
         //
         // The direction goes into the COMPARATOR rather than reversing the result,
         // mirroring `apply_order`. On a pure number column the two are

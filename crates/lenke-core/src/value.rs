@@ -707,6 +707,76 @@ impl<'a> Col<'a> {
     }
 }
 
+/// First-seen grouping: one entry per distinct key, in the order the keys first
+/// appear, with a caller-chosen accumulator per group.
+///
+/// Returns `(representative row, accumulator)` — the representative being the
+/// FIRST row of the group, which is what makes `DISTINCT` and `dedup()` well
+/// defined about which duplicate survives.
+///
+/// # The key is the parameter, as always
+///
+/// Grouping identity is a language contract and the two engines disagree: GQL
+/// keys a composite row on `val_key`, Gremlin on `dedup_key`, and a number column
+/// keys on raw bits with signed zeros collapsed. The BUCKETING is the same in
+/// every case, and was written four times.
+///
+/// `key(i)` returning `None` means row `i` has NO key: it is equal to nothing,
+/// including another keyless row, so each gets a group of its own.
+///
+/// That is GREMLIN's NaN rule — a NaN is never a duplicate — and NOT GQL's, which
+/// keys a NaN like any other value and puts them in one group (`RETURN DISTINCT
+/// sqrt(-1) + 0` is one row). Both are reachable only through a COMPUTED column:
+/// a NaN cannot be stored, since every write normalizes a non-finite number to
+/// null. So a mutation that merges keyless rows survives the suite today, and
+/// this is the note that says why rather than a test that cannot fail.
+///
+/// `cap` stops once that many groups exist. `DISTINCT … LIMIT 5` over a large
+/// frame does not need the sixth group, and pushing the bound in here is the
+/// difference between an early exit and a full pass.
+pub fn group_first_seen<K: Eq + std::hash::Hash, A>(
+    n: usize,
+    mut key: impl FnMut(usize) -> Option<K>,
+    init: impl Fn() -> A,
+    mut add: impl FnMut(&mut A, usize),
+    cap: Option<usize>,
+) -> Vec<(usize, A)> {
+    let mut groups: Vec<(usize, A)> = Vec::new();
+    let mut index: crate::fxhash::FxHashMap<K, usize> = crate::fxhash::FxHashMap::default();
+
+    for i in 0..n {
+        match key(i) {
+            Some(k) => match index.get(&k) {
+                Some(&g) => add(&mut groups[g].1, i),
+                None => {
+                    if cap.is_some_and(|c| groups.len() >= c) {
+                        break;
+                    }
+
+                    index.insert(k, groups.len());
+
+                    let mut a = init();
+
+                    add(&mut a, i);
+                    groups.push((i, a));
+                }
+            },
+            None => {
+                if cap.is_some_and(|c| groups.len() >= c) {
+                    break;
+                }
+
+                let mut a = init();
+
+                add(&mut a, i);
+                groups.push((i, a));
+            }
+        }
+    }
+
+    groups
+}
+
 /// Keep the `cap` smallest by `cmp`, in order — an ORDER BY with a LIMIT.
 ///
 /// Quickselect partitions at `cap` in O(n) and only the kept prefix is sorted, so

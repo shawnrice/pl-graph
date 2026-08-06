@@ -12761,3 +12761,70 @@ fn counting_edges_under_a_relationship_where() {
         3
     );
 }
+
+/// DISTINCT windows over DISTINCT rows, not over scanned rows — so `SKIP 2` drops
+/// the first two distinct values, not the first two rows.
+///
+/// An expression item keeps this on the GENERIC dedup path (the `group_ids` fast
+/// path takes only direct property columns), which is the one where the skip, the
+/// limit and the dedup are interleaved in a single pass.
+#[test]
+fn distinct_with_skip_and_limit_windows_over_distinct_rows() {
+    let mut lines = Vec::new();
+
+    // Values 0,0,0,1,1,1,2,2,2,… so every distinct value spans three rows.
+    for i in 0..30usize {
+        lines.push(format!(
+            r#"{{"type":"node","id":"n{i}","labels":["N"],"properties":{{"n":{}}}}}"#,
+            i / 3
+        ));
+    }
+
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let mut g = graph_of(&refs);
+    let nums = |g: &mut Graph, q: &str| -> Vec<f64> {
+        rows(g, q)
+            .iter()
+            .map(|r| match r[0] {
+                Value::Num(x) => x,
+                _ => f64::NAN,
+            })
+            .collect()
+    };
+
+    let all = "MATCH (u:N) RETURN DISTINCT u.n + 0 AS v ORDER BY u.n + 0";
+
+    assert_eq!(nums(&mut g, all).len(), 10);
+    // No ORDER BY: scan order, which for this fixture is 0..9 ascending.
+    assert_eq!(
+        nums(&mut g, "MATCH (u:N) RETURN DISTINCT u.n + 0 AS v"),
+        (0..10).map(f64::from).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        nums(&mut g, "MATCH (u:N) RETURN DISTINCT u.n + 0 AS v LIMIT 3"),
+        vec![0.0, 1.0, 2.0]
+    );
+    // SKIP counts DISTINCT rows: 2 skipped means the third distinct value first,
+    // not the third scanned row (which is still 0).
+    assert_eq!(
+        nums(&mut g, "MATCH (u:N) RETURN DISTINCT u.n + 0 AS v SKIP 2"),
+        (2..10).map(f64::from).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        nums(
+            &mut g,
+            "MATCH (u:N) RETURN DISTINCT u.n + 0 AS v SKIP 2 LIMIT 3"
+        ),
+        vec![2.0, 3.0, 4.0]
+    );
+    // Past the end, and exactly at it.
+    assert_eq!(
+        nums(
+            &mut g,
+            "MATCH (u:N) RETURN DISTINCT u.n + 0 AS v SKIP 9 LIMIT 5"
+        ),
+        vec![9.0]
+    );
+    assert!(nums(&mut g, "MATCH (u:N) RETURN DISTINCT u.n + 0 AS v SKIP 10").is_empty());
+    assert!(nums(&mut g, "MATCH (u:N) RETURN DISTINCT u.n + 0 AS v LIMIT 0").is_empty());
+}

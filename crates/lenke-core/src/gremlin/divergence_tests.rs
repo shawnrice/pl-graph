@@ -4600,3 +4600,75 @@ fn ordering_a_numeric_column_matches_the_boxed_sort() {
 
     same_via_stream(&mut mixed, "g.V().order().by('n').id()");
 }
+
+/// A NaN cannot be STORED, by any route.
+///
+/// It is normalized to null on ingest, and — since the write path started
+/// applying that same rule to computed values — on write too. The four functions
+/// here are the ones a comment on `distinct_values` named as the way a NaN got
+/// into a column, back when they did.
+///
+/// This is pinned because two guards depend on knowing which way it is: the
+/// numeric column arms DECLINE when a NaN is present, and `dedup` treats a NaN as
+/// never-a-duplicate. Both are still right — a COMPUTED column holds NaNs
+/// (`RETURN sqrt(-1)` is `Num(NaN)`) even though a stored one cannot — but a
+/// comment claiming the storage route is open would send the next person looking
+/// for a case that no longer exists.
+#[test]
+fn a_nan_cannot_be_stored_by_any_route() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"n":0}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"n":0}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    for f in ["sqrt(-1)", "asin(2)", "acos(2)", "power(-1, 0.5)"] {
+        let set = format!("MATCH (u:V) SET u.z = {f} RETURN count(*) AS c");
+
+        crate::gql::parse(&set)
+            .expect("parses")
+            .execute(&mut g, &crate::gql::eval::Params::new())
+            .expect("runs");
+
+        let read = crate::gql::parse("MATCH (u:V) RETURN u.z AS z")
+            .expect("parses")
+            .execute(&mut g, &crate::gql::eval::Params::new())
+            .expect("runs");
+
+        for row in read.rows() {
+            assert!(
+                matches!(row[0], crate::graph::Value::Null),
+                "`{f}` stored something that is not null: {:?}",
+                row[0]
+            );
+        }
+    }
+    // The Gremlin write path agrees.
+    super::parse::parse("g.V().property('m', __.math('0/0'))")
+        .expect("parses")
+        .run(&mut g);
+
+    assert!(
+        super::parse::parse("g.V().values('m')")
+            .expect("parses")
+            .run(&mut g)
+            .iter()
+            .all(|v| matches!(v, GVal::Null)),
+        "a computed NaN reached a stored column through Gremlin"
+    );
+    // But a COMPUTED column still holds one, which is why the guards stay.
+    let computed = crate::gql::parse("MATCH (u:V) RETURN sqrt(-1) AS z")
+        .expect("parses")
+        .execute(&mut g, &crate::gql::eval::Params::new())
+        .expect("runs");
+
+    assert!(
+        computed
+            .rows()
+            .all(|r| matches!(r[0], crate::graph::Value::Num(x) if x.is_nan())),
+        "a computed NaN stopped being a NaN"
+    );
+}

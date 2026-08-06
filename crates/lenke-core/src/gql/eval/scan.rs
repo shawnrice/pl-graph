@@ -3236,30 +3236,37 @@ pub(super) fn project_frame_cols(
     // row-chunks for a large frame).
     let mut cols: Vec<Vec<Val>> = par_project(graph, ctx, sc, &proj.items);
     if proj.distinct {
-        // Generic DISTINCT (expression / non-typed items): keep the first
-        // occurrence of each row in scan order, dedup on a composite cell key.
-        // FxHash: membership only; the kept order comes from the scan, not the set.
-        let mut seen: FxHashSet<String> = FxHashSet::default();
+        // Generic DISTINCT (expression / non-typed items): the first occurrence of
+        // each row in scan order, keyed on a composite of its cells. The bucketing
+        // is `group_first_seen`, shared — what is GQL's here is the KEY, `val_key`
+        // over every projected cell.
+        //
+        // The cap is `skip + limit` GROUPS rather than rows, because the window is
+        // taken over distinct rows: stopping at `limit` alone would cut the window
+        // short whenever a SKIP precedes it.
         let skip = proj.skip_val(ctx);
-        let mut seen_count = 0usize;
-        let mut kept: Vec<usize> = Vec::new();
-        for i in 0..sc.n {
-            let mut key = String::new();
-            for c in &cols {
-                val_key(&c[i], &mut key);
-                key.push('\u{1}');
-            }
-            if !seen.insert(key) {
-                continue;
-            }
-            if seen_count >= skip {
-                if proj.limit_val(ctx).is_some_and(|l| kept.len() >= l) {
-                    break;
+        let cap = proj.limit_val(ctx).map(|l| skip + l);
+        let kept: Vec<usize> = crate::value::group_first_seen(
+            sc.n,
+            |i| {
+                let mut key = String::new();
+
+                for c in &cols {
+                    val_key(&c[i], &mut key);
+                    key.push('\u{1}');
                 }
-                kept.push(i);
-            }
-            seen_count += 1;
-        }
+
+                Some(key)
+            },
+            || (),
+            |(), _| (),
+            cap,
+        )
+        .into_iter()
+        .skip(skip)
+        .map(|(rep, ())| rep)
+        .collect();
+
         Some(
             cols.iter()
                 .map(|c| kept.iter().map(|&i| c[i].clone()).collect())
