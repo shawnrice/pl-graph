@@ -15,7 +15,6 @@ use std::borrow::Cow;
 
 use crate::codec::{
     edge_types, element_props, json_id, json_props, json_str_array, node_labels, push_json_str,
-    push_value,
 };
 use crate::error::{CodeError, CodeResult};
 use crate::error_codes::ErrorCode;
@@ -31,7 +30,7 @@ fn push_props(out: &mut String, props: &[(&str, crate::graph::Value)]) {
         }
         push_json_str(out, k);
         out.push(':');
-        push_value(out, v);
+        crate::jsonfmt::push_value(out, v);
     }
     out.push('}');
 }

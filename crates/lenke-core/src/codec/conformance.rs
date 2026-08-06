@@ -8,7 +8,7 @@
 //! with the same `ErrorCode`. Keeping the fixture shared is what stops the two
 //! engines' accepted-input / output behaviour from drifting apart.
 
-use crate::codec::{deserialize, element_props, node_labels, push_value, serialize};
+use crate::codec::{deserialize, element_props, node_labels, serialize};
 use crate::graph::{Graph, Value};
 use crate::json::{self, Json};
 
@@ -19,7 +19,7 @@ const CORPUS: &str = include_str!("../../../../conformance/codec-corpus.json");
 /// `JSON.stringify` (numbers via the shared JS-compatible formatter).
 fn value_repr(v: &Value) -> String {
     let mut s = String::new();
-    push_value(&mut s, v);
+    crate::jsonfmt::push_value(&mut s, v);
     s
 }
 

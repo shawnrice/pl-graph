@@ -779,7 +779,7 @@ fn js_str(graph: &Graph, v: &Val) -> String {
         // serializer, so it's byte-identical to how the map serializes elsewhere).
         Val::Record(_) => {
             let mut s = String::new();
-            crate::codec::push_value(&mut s, &val_to_value(graph, v));
+            crate::jsonfmt::push_value(&mut s, &val_to_value(graph, v));
             s
         }
     }

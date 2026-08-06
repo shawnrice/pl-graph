@@ -2401,7 +2401,7 @@ fn push_result_value(out: &mut String, v: &Value) {
             }
             out.push('}');
         }
-        other => crate::codec::push_value(out, other),
+        other => crate::jsonfmt::push_value(out, other),
     }
 }
 

@@ -90,6 +90,56 @@ pub(crate) fn push_num(out: &mut String, x: f64) {
     }
 }
 
+/// Emit a core [`Value`] as a JSON value.
+///
+/// The one writer for every serde-free JSON surface: NDJSON, the pg-json codec,
+/// and the query RowSet each had a byte-identical copy of this — `ndjson` and
+/// `codec` matched character for character, and `query.rs` differed only in
+/// having inlined [`push_num`].
+///
+/// A non-finite number has no JSON form and becomes `null` (in `push_num`), and
+/// a map's keys arrive already canonical (sorted) from the store, so they are
+/// emitted in order.
+pub(crate) fn push_value(out: &mut String, v: &crate::graph::Value) {
+    use crate::graph::Value;
+
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Num(x) => push_num(out, *x),
+        Value::Str(s) => push_json_str(out, s),
+        Value::Temporal(t) => out.push_str(&t.json_tagged()),
+        Value::List(a) => {
+            out.push('[');
+
+            for (i, e) in a.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+
+                push_value(out, e);
+            }
+
+            out.push(']');
+        }
+        Value::Map(pairs) => {
+            out.push('{');
+
+            for (i, (k, e)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+
+                push_json_str(out, k);
+                out.push(':');
+                push_value(out, e);
+            }
+
+            out.push('}');
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

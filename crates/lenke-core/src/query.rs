@@ -193,56 +193,12 @@ impl RowSet {
                 if ci > 0 {
                     out.push(',');
                 }
-                push_json_value(&mut out, cell);
+                crate::jsonfmt::push_value(&mut out, cell);
             }
             out.push(']');
         }
         out.push_str("]}");
         out
-    }
-}
-
-/// Emit a core [`Value`] as JSON. Non-finite numbers (NaN/±Inf) have no JSON
-/// form, so they serialize as null — matching how a JS engine would surface an
-/// absent/undefined numeric cell.
-fn push_json_value(out: &mut String, v: &Value) {
-    match v {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Num(x) => {
-            if x.is_finite() {
-                // ECMA-262 `Number::toString` (exponential for very large/small
-                // magnitudes, -0 → "0") so every numeric result cell matches JS
-                // `JSON.stringify` / the TS engine — Rust's Display never does that.
-                out.push_str(&crate::jsonfmt::js_number(*x));
-            } else {
-                out.push_str("null");
-            }
-        }
-        Value::Str(s) => crate::jsonfmt::push_json_str(out, s),
-        Value::Temporal(t) => out.push_str(&t.json_tagged()),
-        Value::List(items) => {
-            out.push('[');
-            for (i, e) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                push_json_value(out, e);
-            }
-            out.push(']');
-        }
-        Value::Map(pairs) => {
-            out.push('{');
-            for (i, (k, val)) in pairs.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                crate::jsonfmt::push_json_str(out, k);
-                out.push(':');
-                push_json_value(out, val);
-            }
-            out.push('}');
-        }
     }
 }
 

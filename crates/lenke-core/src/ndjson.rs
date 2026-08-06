@@ -360,40 +360,6 @@ pub fn decode_serial(text: &str) -> CodeResult<Graph> {
     Ok(g)
 }
 
-fn push_value(out: &mut String, v: &Value) {
-    match v {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Num(x) => push_num(out, *x),
-        Value::Str(s) => push_json_str(out, s),
-        Value::Temporal(t) => out.push_str(&t.json_tagged()),
-        Value::List(a) => {
-            out.push('[');
-            for (i, e) in a.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                push_value(out, e);
-            }
-            out.push(']');
-        }
-        // A record/map property → a JSON object. Keys are already canonical
-        // (sorted) from the store, so emit in order.
-        Value::Map(pairs) => {
-            out.push('{');
-            for (i, (k, e)) in pairs.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                push_json_str(out, k);
-                out.push(':');
-                push_value(out, e);
-            }
-            out.push('}');
-        }
-    }
-}
-
 /// Is property `col` present at element `idx`?
 fn col_present(col: &Column, idx: usize) -> bool {
     match col {
@@ -428,10 +394,12 @@ fn push_props(out: &mut String, store: &Properties, strs: &Dict, idx: usize) {
             Column::Num { data, .. } => push_num(out, data[idx]),
             Column::Str { data, .. } => push_json_str(out, strs.text(data[idx])),
             Column::Bool { data, .. } => out.push_str(if data[idx] { "true" } else { "false" }),
-            Column::Temporal { data, .. } => push_value(out, &Value::Temporal(data.get(idx))),
+            Column::Temporal { data, .. } => {
+                crate::jsonfmt::push_value(out, &Value::Temporal(data.get(idx)))
+            }
             // Reconstruct the list and reuse the `push_value` path, so a vector column
             // encodes byte-for-byte identically to the same list boxed in `Mixed`.
-            Column::Vec { data, dim, .. } => push_value(
+            Column::Vec { data, dim, .. } => crate::jsonfmt::push_value(
                 out,
                 &Value::List(
                     data[idx * *dim..idx * *dim + *dim]
@@ -440,10 +408,12 @@ fn push_props(out: &mut String, store: &Properties, strs: &Dict, idx: usize) {
                         .collect(),
                 ),
             ),
-            Column::Mixed { data } => push_value(out, data[idx].as_ref().unwrap()),
+            Column::Mixed { data } => crate::jsonfmt::push_value(out, data[idx].as_ref().unwrap()),
             // Synthesize the record (or read an escapee) and reuse `push_value`, so a
             // de-boxed record encodes byte-for-byte identically to a boxed map.
-            Column::Record { .. } => push_value(out, &store.value_id(idx, kid as u32, strs)),
+            Column::Record { .. } => {
+                crate::jsonfmt::push_value(out, &store.value_id(idx, kid as u32, strs))
+            }
         }
     }
     out.push('}');

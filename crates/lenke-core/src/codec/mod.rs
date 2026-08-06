@@ -98,40 +98,6 @@ pub(crate) fn is_intish(x: f64) -> bool {
 // (gremlin, ndjson, codecs) escapes strings and formats numbers identically.
 pub(crate) use crate::jsonfmt::{push_json_str, push_num};
 
-/// Emit a core [`Value`] as a plain JSON value (used by pg-json).
-pub(crate) fn push_value(out: &mut String, v: &Value) {
-    match v {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Num(x) => push_num(out, *x),
-        Value::Str(s) => push_json_str(out, s),
-        Value::Temporal(t) => out.push_str(&t.json_tagged()),
-        Value::List(a) => {
-            out.push('[');
-            for (i, e) in a.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                push_value(out, e);
-            }
-            out.push(']');
-        }
-        // A record/map → a JSON object; keys are already canonical (sorted).
-        Value::Map(pairs) => {
-            out.push('{');
-            for (i, (k, e)) in pairs.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                push_json_str(out, k);
-                out.push(':');
-                push_value(out, e);
-            }
-            out.push('}');
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // JSON scalar parse (shared by pg-json; graphson has its own typed decode)
 // ---------------------------------------------------------------------------
