@@ -451,6 +451,68 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
                     return out;
                 }
 
+                // `select(labels)` over tags this prefix bound is a ZIP of the
+                // columns just returned — the planner already computed exactly
+                // what it is about to look up.
+                //
+                // Streamed, it costs two things per ROW: a linear scan of the
+                // tag list comparing `String`s, and a fresh `Arc<str>` for each
+                // label to key the map with. Over 20k rows and two labels that
+                // was 22.8ms, against 0.416ms for the same prefix without the
+                // `select`. Here the keys are made once and the values are
+                // column reads.
+                //
+                // `Pop::All` yields a LIST per label rather than the value, and
+                // a `by()` evaluates a modulator per row — neither is a zip, so
+                // both keep the stream.
+                if let [Step::Select { labels, pop, bys }, after @ ..] = rest {
+                    let bound: Option<Vec<usize>> = (!matches!(pop, Pop::All) && bys.is_empty())
+                        .then(|| {
+                            labels
+                                .iter()
+                                .map(|l| c.tags.iter().position(|(name, _, _)| name == l))
+                                .collect::<Option<Vec<_>>>()
+                        })
+                        .flatten();
+
+                    if let Some(at) = bound {
+                        // Every label resolved, so `select` drops nothing and a
+                        // bare count is the row count — no maps to build.
+                        if matches!(after, [Step::Count(Scope::Global)]) {
+                            return vec![GVal::Num(ids.len() as f64)];
+                        }
+
+                        let keys: Vec<GVal> = labels
+                            .iter()
+                            .map(|l| GVal::Str(Arc::from(l.as_str())))
+                            .collect();
+                        let picked: Vec<Trav> = (0..ids.len())
+                            .map(|i| {
+                                let val = |k: usize| {
+                                    let (_, _, is_edge) = &c.tags[at[k]];
+
+                                    frontier_val(cols[at[k] + 1][i], *is_edge)
+                                };
+
+                                Trav::root(if labels.len() == 1 {
+                                    val(0)
+                                } else {
+                                    GVal::map(
+                                        (0..labels.len())
+                                            .map(|k| (keys[k].clone(), val(k)))
+                                            .collect(),
+                                    )
+                                })
+                            })
+                            .collect();
+
+                        return run_steps(graph, ctx, after, picked)
+                            .into_iter()
+                            .map(|t| t.val)
+                            .collect();
+                    }
+                }
+
                 let seeded: Vec<Trav> = (0..ids.len())
                     .map(|i| {
                         let mut t = Trav::root(frontier_val(ids[i], c.end_is_edge));
@@ -1109,6 +1171,79 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
 
             column_paths(graph, &distinct, is_edge, t)
         }
+        // `dedup().by(k)` keys on a PROPERTY, so distinctness is over the column
+        // rather than over identity — FIRST-SEEN wins, which is what the stream
+        // does and what makes the surviving element well defined.
+        //
+        // Only the identity form had an arm, so keying on a property built a
+        // traverser and a `DedupKey` per element: `dedup().by('n')` over 20k cost
+        // 2.22ms against 0.116ms for the GQL spelling.
+        [Step::Dedupe { labels, bys }, t @ ..] if labels.is_empty() => {
+            let key = single_key_by(bys)?;
+            let mut seen: crate::fxhash::FxHashSet<DedupKey> = crate::fxhash::FxHashSet::default();
+            let mut kept: Vec<u32> = Vec::new();
+
+            for &id in ids {
+                // A key with no dedup key of its own (a NaN) is never a
+                // duplicate — the same rule the boxed path follows.
+                match dedup_key(&prop(graph, &frontier_val(id, is_edge), key)) {
+                    Some(k) => {
+                        if seen.insert(k) {
+                            kept.push(id);
+                        }
+                    }
+                    None => kept.push(id),
+                }
+            }
+
+            column_paths(graph, &kept, is_edge, t)
+        }
+        // `order().by(k)` sorts the frontier by a property column. The sort is
+        // STABLE, so ties keep frontier order — which is what the streamed sort
+        // does, and observable through a following `limit`.
+        //
+        // A `by()` carrying no direction sorts ascending; `order_dir` reads the
+        // direction from the step or the modulator, exactly as the stream does.
+        [Step::Order(bys, desc, Scope::Global), t @ ..] if single_key_by_any_dir(bys).is_some() => {
+            let (key, by_dir) = single_key_by_any_dir(bys)?;
+            // The direction can come from the STEP (`order(desc)`) or the
+            // MODULATOR (`by('age', desc)`), and the modulator wins — the same
+            // precedence `order_dir` gives the identity form, which does not read
+            // a `By::Key` at all.
+            let descending =
+                by_dir.unwrap_or(if *desc { Order::Desc } else { Order::Asc }) == Order::Desc;
+            let keys: Vec<GVal> = ids
+                .iter()
+                .map(|&id| prop(graph, &frontier_val(id, is_edge), key))
+                .collect();
+            // The stream FAULTS on a pair it cannot order — a NaN, or two
+            // different types — so answering here would swallow the error. A
+            // shared type rank means every pair is comparable.
+            let rank = keys.first().map(gval_type_rank);
+
+            if keys
+                .iter()
+                .any(|k| Some(gval_type_rank(k)) != rank || matches!(k, GVal::Num(n) if n.is_nan()))
+            {
+                return None;
+            }
+
+            let mut idx: Vec<usize> = (0..ids.len()).collect();
+
+            idx.sort_by(|&i, &j| {
+                let o = gcmp_total(&keys[i], &keys[j]);
+
+                if descending {
+                    o.reverse()
+                } else {
+                    o
+                }
+            });
+
+            let sorted: Vec<u32> = idx.into_iter().map(|i| ids[i]).collect();
+
+            column_paths(graph, &sorted, is_edge, t)
+        }
         _ => None,
     }
 }
@@ -1425,6 +1560,18 @@ fn order_dir(bys: &[By], desc: bool) -> Option<Order> {
 fn single_key_by(bys: &[By]) -> Option<&str> {
     match bys {
         [By::Key(k, None)] => Some(k.as_str()),
+        _ => None,
+    }
+}
+
+/// The property key of a lone `by('k')`, whatever direction it carries.
+///
+/// [`single_key_by`] refuses a direction because a tally is not sorted; an
+/// `order()` wants exactly the opposite — the direction is the point, and
+/// `order_dir` reads it.
+fn single_key_by_any_dir(bys: &[By]) -> Option<(&str, Option<Order>)> {
+    match bys {
+        [By::Key(k, d)] => Some((k.as_str(), *d)),
         _ => None,
     }
 }

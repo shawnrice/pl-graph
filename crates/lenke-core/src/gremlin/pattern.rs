@@ -655,7 +655,14 @@ fn compile_inner(steps: &[Step], forced: bool) -> Option<Compiled> {
         .iter()
         .any(|s| s.node.label.is_some() || !s.node.props.is_empty() || !s.rel.props.is_empty());
 
-    if !can_orient && !forced {
+    // TAGS change the comparison. The decline below reasons that the caller's own
+    // expand "does the same walk with no frame at all" — true when the traverser
+    // carries only its value, and false the moment an `as()` is in play: the
+    // streamed walk then carries an `Arc<Vec<(String, Vec<GVal>)>>` per row and
+    // clones it at every step, where the planner hands back one parallel column
+    // per tag. `V().as('a').out('R').as('b').select('a','b').count()` over 20k
+    // cost 23.4ms streamed against 0.000ms for the GQL spelling.
+    if !can_orient && !forced && tags.is_empty() {
         decline!("nothing past the start is constrained");
     }
 

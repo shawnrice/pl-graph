@@ -3210,3 +3210,93 @@ fn a_chain_shaped_match_agrees_with_the_solver() {
         vec!["Str(\"josh\")", "Str(\"marko\")"]
     );
 }
+
+/// A keyed `dedup`/`order` and a `select` over tags answer what the stream
+/// answers.
+///
+/// All three read something the planner ALREADY produced and were re-deriving
+/// it per row. Over 20k vertices: `dedup().by('n')` 2.22ms -> 0.52ms (it built a
+/// traverser and a `DedupKey` per element), `order().by('n').limit(5)` 2.58ms ->
+/// 1.06ms, and `as('a')…as('b').select('a','b').count()` 23.4ms -> 0.40ms — that
+/// last one looked each label up by string scan per row and allocated a fresh
+/// `Arc<str>` per label per row, to key a map a `count()` never reads.
+///
+/// `barrier()` defeats the column path, so each pair is the same question twice.
+#[test]
+fn keyed_terminals_and_select_match_the_stream() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["P"],"properties":{"n":2,"s":"x"}}"#,
+            r#"{"type":"node","id":"b","labels":["P"],"properties":{"n":1,"s":"y"}}"#,
+            r#"{"type":"node","id":"c","labels":["P"],"properties":{"n":2,"s":"x"}}"#,
+            // No `n` — a NULL key, which sorts and dedups like any other value.
+            r#"{"type":"node","id":"d","labels":["P"],"properties":{"s":"z"}}"#,
+            r#"{"type":"edge","id":"e0","labels":["R"],"from":"a","to":"b","properties":{}}"#,
+            r#"{"type":"edge","id":"e1","labels":["R"],"from":"a","to":"c","properties":{}}"#,
+            r#"{"type":"edge","id":"e2","labels":["R"],"from":"b","to":"d","properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let run = |src: &str, g: &mut crate::graph::Graph| {
+        format!(
+            "{:?}",
+            super::parse::parse(src)
+                .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+                .run(g)
+        )
+    };
+
+    for tail in [
+        // dedup keyed on a property: FIRST-SEEN survives, which is observable.
+        "dedup().by('n').values('s')",
+        "dedup().by('n').count()",
+        "dedup().by('s').values('s')",
+        // A key some element lacks.
+        "dedup().by('nope').count()",
+        // order keyed on a property, both directions and both spellings of them.
+        "order().by('n').values('s')",
+        "order().by('n', desc).values('s')",
+        "order().by('s').values('s')",
+        // Ties keep frontier order — visible through the limit.
+        "order().by('n').limit(2).values('s')",
+        "order().by('n', desc).limit(2).values('s')",
+        // A MIXED-TYPE key faults in the stream, so the column path must decline
+        // rather than order it.
+        "order().by('mix').count()",
+        // select over tags the prefix bound.
+        "as('a').out('R').as('b').select('a','b').count()",
+        "as('a').out('R').as('b').select('b').values('s')",
+        "as('a').out('R').as('b').select('a','b')",
+        // A label the prefix never bound drops every row.
+        "as('a').out('R').as('b').select('a','zz').count()",
+        // `Pop.all` yields a list per label, which is not a zip.
+        "as('a').out('R').as('b').select(Pop.all, 'a').count()",
+    ] {
+        assert_eq!(
+            run(&format!("g.V().{tail}"), &mut g),
+            run(&format!("g.V().barrier().{tail}"), &mut g),
+            "`{tail}` disagrees with the stream"
+        );
+    }
+
+    // The answers themselves, so the pairs cannot agree by both being wrong.
+    // n = 2, 1, 2, null → first-seen keeps a (2), b (1), d (null).
+    assert_eq!(
+        run("g.V().dedup().by('n').values('s')", &mut g),
+        "[Str(\"x\"), Str(\"y\"), Str(\"z\")]"
+    );
+    // Ascending by n with the null: nulls rank first in Gremlin's order.
+    assert_eq!(
+        run("g.V().order().by('n').values('s')", &mut g),
+        "[Str(\"z\"), Str(\"y\"), Str(\"x\"), Str(\"x\")]"
+    );
+    assert_eq!(
+        run(
+            "g.V().as('a').out('R').as('b').select('a','b').count()",
+            &mut g
+        ),
+        "[Num(3.0)]"
+    );
+}
