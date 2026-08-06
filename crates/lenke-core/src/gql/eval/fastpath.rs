@@ -231,7 +231,8 @@ pub(super) fn try_count_edges(
     let [CClause::Match {
         optional: false,
         patterns,
-        where_: None,
+        where_,
+        scope_len,
         ..
     }, CClause::Return(proj)] = linear.clauses.as_slice()
     else {
@@ -265,6 +266,39 @@ pub(super) fn try_count_edges(
     // The relationship must name its type(s): `:T` or `:A|B`.
     let rel_label = seg.rel.label.as_ref()?;
     let ctx = resolve_ctx(graph, plan, params);
+
+    // A WHERE that talks ONLY about the relationship is a filter on the edge set,
+    // so the answer is still "how many edges", and the shared seek can narrow the
+    // type bucket the way Gremlin's `E().hasLabel(T).has(k, v)` does. Anything
+    // that mentions an endpoint is a filter on the PATTERN and is not this.
+    if let Some(w) = where_ {
+        if seg.rel.var_slot.is_none()
+            || crate::gql::plan::refs_slot(w, &|s| Some(s) != seg.rel.var_slot)
+        {
+            return None;
+        }
+        // Both ends must be free. A constrained end filters edges by something
+        // this count never looks at, and two ends BOUND TO THE SAME NAME is a
+        // self-loop test, which is a filter on the edge that is not in the seek.
+        if path.start.label.is_some()
+            || !path.start.props.is_empty()
+            || path.start.where_.is_some()
+            || seg.node.label.is_some()
+            || !seg.node.props.is_empty()
+            || seg.node.where_.is_some()
+            || (path.start.var_slot.is_some() && path.start.var_slot == seg.node.var_slot)
+        {
+            return None;
+        }
+
+        let n = crate::gql::eval::seek_lower::scan_edge(graph, &ctx, &seg.rel, Some(w), *scope_len)
+            .len();
+        let mut rs = RowSet::new(proj.out_names.clone());
+
+        rs.push_row(std::iter::once(Value::Num(n as f64)));
+
+        return Some(rs);
+    }
     let mut tids = Vec::new();
     if !collect_etype_ids(&ctx, rel_label, &mut tids) {
         return None;

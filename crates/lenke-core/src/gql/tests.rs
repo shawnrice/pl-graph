@@ -12608,3 +12608,156 @@ fn the_reverse_semi_join_agrees_with_the_general_path() {
         vec![vec![n(2.0)]]
     );
 }
+
+/// Counting edges under a WHERE that talks only about the relationship.
+///
+/// The shortcut answers straight from the candidate set, so it is only correct
+/// when the seek IS the predicate. Every case here where it is not — a
+/// comparison the columns cannot run, half of an AND, a constrained endpoint —
+/// has to fall back rather than count candidates.
+#[test]
+fn counting_edges_under_a_relationship_where() {
+    let lines = [
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{}}"#,
+        r#"{"type":"node","id":"b","labels":["M"],"properties":{}}"#,
+        r#"{"type":"node","id":"c","labels":["N"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R"],"properties":{"w":1,"s":"x"}}"#,
+        r#"{"type":"edge","id":"e1","from":"b","to":"c","labels":["R"],"properties":{"w":2,"s":"y"}}"#,
+        r#"{"type":"edge","id":"e2","from":"c","to":"a","labels":["R"],"properties":{"w":1}}"#,
+        // a self-loop, and an edge of another type
+        r#"{"type":"edge","id":"e3","from":"a","to":"a","labels":["R"],"properties":{"w":1}}"#,
+        r#"{"type":"edge","id":"e4","from":"a","to":"b","labels":["S"],"properties":{"w":1}}"#,
+    ];
+    let mut g = graph_of(&lines);
+    let n = |g: &mut Graph, q: &str| -> i64 {
+        match rows(g, q)[0][0] {
+            Value::Num(x) => x as i64,
+            _ => -1,
+        }
+    };
+
+    // The lowered shape: three R edges have w = 1.
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH ()-[r:R]->() WHERE r.w = 1 RETURN count(*) AS c"
+        ),
+        3
+    );
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH ()-[r:R]->() WHERE r.w > 1 RETURN count(*) AS c"
+        ),
+        1
+    );
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH ()-[r:R]->() WHERE r.s = 'x' RETURN count(*) AS c"
+        ),
+        1
+    );
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH ()-[r:R]->() WHERE r.w IN [1, 2] RETURN count(*) AS c"
+        ),
+        4
+    );
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH ()-[r:R]->() WHERE r.w = 1 OR r.w = 2 RETURN count(*) AS c"
+        ),
+        4
+    );
+    // Type sets, and a type nothing carries.
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH ()-[r:R|S]->() WHERE r.w = 1 RETURN count(*) AS c"
+        ),
+        4
+    );
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH ()-[r:NOPE]->() WHERE r.w = 1 RETURN count(*) AS c"
+        ),
+        0
+    );
+
+    // Predicates the columns cannot run. These must NOT be read off the
+    // candidate set — `<>` and `IS NULL` lower to nothing at all, so the seek
+    // would be every edge of the type.
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH ()-[r:R]->() WHERE r.w <> 1 RETURN count(*) AS c"
+        ),
+        1
+    );
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH ()-[r:R]->() WHERE r.s IS NULL RETURN count(*) AS c"
+        ),
+        2
+    );
+    // HALF of an AND lowers; the other half decides the answer.
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH ()-[r:R]->() WHERE r.w = 1 AND r.s IS NULL RETURN count(*) AS c"
+        ),
+        2
+    );
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH ()-[r:R]->() WHERE r.w = 1 AND r.s = 'x' RETURN count(*) AS c"
+        ),
+        1
+    );
+
+    // A WHERE that reaches an ENDPOINT is a filter on the pattern, not the edge.
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH (u)-[r:R]->() WHERE r.w = 1 AND u:M RETURN count(*) AS c"
+        ),
+        0
+    );
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH ()-[r:R]->(v:N) WHERE r.w = 1 RETURN count(*) AS c"
+        ),
+        2
+    );
+    // Both ends bound to the SAME name is a self-loop test, which the edge set
+    // knows nothing about.
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH (u)-[r:R]->(u) WHERE r.w = 1 RETURN count(*) AS c"
+        ),
+        1
+    );
+    // An inline constraint on the relationship means the same as the WHERE.
+    assert_eq!(
+        n(&mut g, "MATCH ()-[r:R {w: 1}]->() RETURN count(*) AS c"),
+        3
+    );
+
+    // A deleted edge is not a candidate.
+    rows(&mut g, "MATCH ()-[r:R]->() WHERE r.w = 2 DELETE r");
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH ()-[r:R]->() WHERE r.w > 0 RETURN count(*) AS c"
+        ),
+        3
+    );
+}

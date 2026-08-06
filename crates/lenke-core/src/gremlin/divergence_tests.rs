@@ -3442,11 +3442,11 @@ fn a_multi_hop_semi_join_agrees_with_running_the_body() {
 ///
 /// ```text
 ///   MATCH (u:V) RETURN u.n              0.121   vs 0.028    4.4x   GQL
-///   filter on an edge property          0.666   vs 0.149    4.5x   GQL
 /// ```
 ///
-/// Both remaining gaps are GQL paying for a frame it then transposes, where the
-/// Gremlin side reads one column. Neither is a missing shortcut.
+/// That one is GQL paying for a frame it then transposes where the Gremlin side
+/// reads one column — not a missing shortcut, and the smallest of the set in
+/// absolute terms (0.1ms over 20k rows).
 #[test]
 #[ignore = "timing"]
 fn cross_language_cost_probe() {
@@ -4493,4 +4493,60 @@ fn a_stored_null_satisfies_every_negated_comparison() {
     );
     // And it IS present, so presence and negation disagree about it on purpose.
     assert_eq!(count_of(&mut g, "g.V().has('n').count()"), 2.0);
+}
+
+/// What a NEGATIVE `has(k, …)` predicate does with an element that lacks `k`.
+///
+/// TinkerPop's rule is uniform: `has(k, P)` filters out an element without `k`
+/// whatever `P` is, because there is no value for the predicate to be applied to.
+/// This engine is NOT uniform, and this test pins which is which rather than
+/// leaving it to be discovered:
+///
+/// ```text
+///                          here   TinkerPop
+///   neq(v)                  keeps   drops
+///   without(v)              keeps   drops
+///   outside(lo, hi)         drops   drops
+///   notContaining(s)        drops   drops
+/// ```
+///
+/// The TS engine gives the same five answers, so the two are consistent with each
+/// other and no differential fuzzer can see any of this. That is also why it is
+/// not fixed here: `neq` and `without` returning fewer rows is a behavior change
+/// to both engines, and it is a decision, not a bug fix to one side.
+///
+/// `not(__.has(k, v))` is a different question and DOES keep such an element in
+/// both this engine and TinkerPop — see
+/// `a_negated_has_includes_elements_without_the_key`.
+#[test]
+fn a_negative_predicate_does_not_treat_a_missing_key_uniformly() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"n":3,"s":"xy"}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"n":4,"s":"zz"}}"#,
+            // no properties at all
+            r#"{"type":"node","id":"c","labels":["V"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    // KEEPS `c`. TinkerPop answers 1 for both of these.
+    assert_eq!(count_of(&mut g, "g.V().has('n', neq(3)).count()"), 2.0);
+    assert_eq!(count_of(&mut g, "g.V().has('n', without(3)).count()"), 2.0);
+    // DROPS `c`, which is what TinkerPop does for all four.
+    assert_eq!(
+        count_of(&mut g, "g.V().has('n', outside(2, 4)).count()"),
+        0.0
+    );
+    assert_eq!(
+        count_of(&mut g, "g.V().has('s', notContaining('x')).count()"),
+        1.0
+    );
+    // The positive predicates agree with TinkerPop and with each other.
+    assert_eq!(
+        count_of(&mut g, "g.V().has('n', within(3, 4)).count()"),
+        2.0
+    );
+    assert_eq!(count_of(&mut g, "g.V().has('n', gt(0)).count()"), 2.0);
 }

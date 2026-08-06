@@ -140,6 +140,14 @@ fn compare(
 /// bounds a valid superset. Disjunction is all-or-nothing: an `OR` with one
 /// unreadable branch contributes NOTHING, since a union missing a branch is no
 /// longer a superset and would drop rows.
+/// Returns whether the WHOLE of `e` is now represented in `out`.
+///
+/// A seek is a superset filter, so a caller that re-checks the expression anyway
+/// can ignore this. A caller that does NOT — one answering straight from the
+/// candidate set, like the edge-count shortcut — has to know, because "we lowered
+/// part of it" and "we lowered it" produce different answers and look identical
+/// from outside. `false` is always the safe reply, and is what every arm that
+/// recognizes nothing gives.
 fn collect(
     e: &CExpr,
     graph: &Graph,
@@ -147,22 +155,38 @@ fn collect(
     want_slot: Option<usize>,
     edge: bool,
     out: &mut ElementSeek,
-) {
+) -> bool {
     match e {
         CExpr::Compare { op, left, right } => {
             if let Some(p) = compare(*op, left, right, graph, ctx, want_slot, edge) {
                 out.conj_push(p);
+
+                return true;
             }
+
+            false
         }
         CExpr::And(items) => {
+            // Every conjunct, not merely some: an `AND` is fully lowered only if
+            // each half is. Folded rather than `all()` so a false one does not
+            // stop the rest from CONTRIBUTING — a partial lowering is still a
+            // better candidate set, it just is not the last word.
+            let mut whole = true;
+
             for it in items {
-                collect(it, graph, ctx, want_slot, edge, out);
+                whole &= collect(it, graph, ctx, want_slot, edge, out);
             }
+
+            whole
         }
         CExpr::Or(items) => {
             if let Some(branches) = branches_of(items, graph, ctx, want_slot, edge) {
                 out.push_branches(branches);
+
+                return true;
             }
+
+            false
         }
         CExpr::In {
             expr,
@@ -170,11 +194,11 @@ fn collect(
             negated: false,
         } => {
             let Some((slot, key)) = prop_path(expr, graph, ctx, edge) else {
-                return;
+                return false;
             };
 
             if want_slot != Some(slot) {
-                return;
+                return false;
             }
 
             let key: Arc<str> = Arc::from(key.as_str());
@@ -182,21 +206,27 @@ fn collect(
             match list.as_ref() {
                 CExpr::List(items) => {
                     let Some(values) = items.iter().map(operand).collect::<Option<Vec<_>>>() else {
-                        return; // a computed element ⇒ not a constant list
+                        return false; // a computed element ⇒ not a constant list
                     };
 
                     out.push_any_of(key, values);
+
+                    true
                 }
                 // The list lives in a parameter; its length is unknown until
                 // execution, so the disjunction stays symbolic.
-                CExpr::Param(slot) => out.push_any_of_param(key, *slot),
-                _ => {}
+                CExpr::Param(slot) => {
+                    out.push_any_of_param(key, *slot);
+
+                    true
+                }
+                _ => false,
             }
         }
         // `NOT IN` / `<>` / `IS NULL` and everything else: no seek. Deliberately
         // silent — these are not gaps, they are predicates whose matches no point
         // or range seek enumerates.
-        _ => {}
+        _ => false,
     }
 }
 
@@ -267,6 +297,20 @@ pub(super) fn element_seek(
     want_slot: Option<usize>,
     edge: bool,
 ) -> ElementSeek {
+    element_seek_whole(where_, inline, graph, ctx, want_slot, edge).0
+}
+
+/// [`element_seek`], plus whether `where_` is wholly represented in it — see
+/// [`collect`]. An inline constraint is always lowered when its value is a
+/// literal, so the flag is about the WHERE alone.
+pub(super) fn element_seek_whole(
+    where_: Option<&CExpr>,
+    inline: &[(&str, &CExpr)],
+    graph: &Graph,
+    ctx: &Ctx,
+    want_slot: Option<usize>,
+    edge: bool,
+) -> (ElementSeek, bool) {
     let mut out = ElementSeek::same_kind(edge);
 
     // `MATCH (u:P {k: $x})` is `MATCH (u:P) WHERE u.k = $x`. Same structure, so
@@ -283,11 +327,17 @@ pub(super) fn element_seek(
         }
     }
 
-    if let Some(w) = where_ {
-        collect(w, graph, ctx, want_slot, edge, &mut out);
+    let mut whole = true;
+
+    for (_, value) in inline {
+        whole &= operand(value).is_some();
     }
 
-    out
+    if let Some(w) = where_ {
+        whole &= collect(w, graph, ctx, want_slot, edge, &mut out);
+    }
+
+    (out, whole)
 }
 
 /// The inline constraints of a relationship.
@@ -318,6 +368,65 @@ pub(super) fn inline_of(node: &CNode) -> Vec<(&str, &CExpr)> {
 /// `anchor` is the WHERE to seed from: the clause's for an isolated node, and for
 /// a traversal start the clause's OR the node's own — a conjunct of either must
 /// hold for every matching row, so seeding from it only narrows.
+/// The edge twin of [`scan_node`]: every edge of `rel`'s type(s) satisfying
+/// `anchor`, through the same shared seek.
+///
+/// The vertex side has had this since the seek existed and the edge side never
+/// did, so `MATCH ()-[r:R]->() WHERE r.w = 1 RETURN count(*)` walked the whole
+/// pattern where `g.E().hasLabel('R').has('w', 1).count()` seeded the type bucket
+/// and narrowed a column — 0.649ms against 0.178ms for the same question.
+///
+/// The caller is responsible for the ENDPOINTS: this answers about edges alone,
+/// so it is only the whole answer when nothing constrains either end.
+///
+/// `anchor` is re-checked per surviving candidate, ALWAYS. A seek is a superset
+/// filter — whatever it could not lower simply did not narrow — so treating it as
+/// exact answers a different question. It did: the first version of this skipped
+/// the re-check when the relationship had no inline constraints of its own, and
+/// `WHERE r.vf <= DATE '…' AND r.vt > DATE '…'` counted every edge of the type,
+/// because those temporal comparisons are not ones the columns can run. An
+/// existing interval-index test caught it.
+pub(super) fn scan_edge(
+    graph: &Graph,
+    ctx: &Ctx,
+    rel: &super::super::plan::CRel,
+    anchor: Option<&CExpr>,
+    scope_len: usize,
+) -> Vec<u32> {
+    let (mut seek, whole) =
+        element_seek_whole(anchor, &inline_of_rel(rel), graph, ctx, rel.var_slot, true);
+
+    if let Some(ids) = rel.label.as_ref().and_then(|l| lower_labels(l, ctx, true)) {
+        seek.set_labels(ids);
+    }
+
+    let binds = GqlBindings(ctx.params);
+    let universe = || {
+        (0..graph.edge_slots() as u32)
+            .filter(|&e| graph.is_edge_live(e))
+            .collect()
+    };
+
+    // Skip the re-check only when the seek IS the predicate — every conjunct
+    // lowered, and every one of them runnable as a column test.
+    if rel.props.is_empty() && rel.where_.is_none() && whole && seek.columnar(graph, &binds) {
+        return seek.scan(graph, &binds, universe);
+    }
+
+    let mut b = super::Binding::with_len(scope_len.max(1));
+
+    seek.scan_with(graph, &binds, None, universe, |ei| {
+        let v = super::Val::Edge(ei);
+
+        if let Some(slot) = rel.var_slot {
+            b.set(slot, v.clone());
+        }
+
+        super::satisfies(graph, ctx, &v, &rel.props, rel.where_.as_ref(), &b)
+            && anchor.is_none_or(|w| super::satisfies(graph, ctx, &v, &[], Some(w), &b))
+    })
+}
+
 pub(super) fn scan_node(
     graph: &Graph,
     ctx: &Ctx,
