@@ -76,6 +76,20 @@ cargo test --release <name> -- --ignored --nocapture
 | `bench_temporal_index`                  | Bitemporal index bake-off over an SCD-2 org.                                                                                             |
 | `bench_allen_relations`                 | All thirteen Allen relations over a batch of edge versions.                                                                              |
 | `bench_var_length_matcher`              | The whole var-length matcher surface.                                                                                                    |
+| `cross_language_cost_probe`             | The same QUESTION in GQL and in Gremlin, priced side by side — where does one engine have a shortcut the other lacks?                    |
+
+`cross_language_cost_probe` is the odd one out: the other rows price ONE engine
+against the machine, and it prices the two engines against each other. That is a
+different question, and the one that finds missing lowerings — an engine that
+enumerates something the other plans shows a 3-150x ratio on the pair, and the
+slower side names the arm that is missing. Add a pair to it whenever a question
+is expressible in both languages.
+
+Read its ratios skeptically, though. `MATCH (u:V) RETURN u` renders every element
+where `g.V()` returns handles the boundary renders later, so the pair reads as
+168x and there is no gap at all — against `elementMap()`, which does the same
+work, GQL is 1.9x FASTER. Ask both sides for the same thing before believing the
+number.
 
 ## Things worth knowing before trusting a number
 

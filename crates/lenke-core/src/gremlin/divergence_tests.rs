@@ -3417,9 +3417,45 @@ fn a_multi_hop_semi_join_agrees_with_running_the_body() {
     );
 }
 
+/// The same QUESTION in both languages, priced side by side.
+///
+/// Not a gate — `equivalent_traversals_cost_the_same` and
+/// `equivalent_spellings_cost_the_same` are the gates, and each compares
+/// spellings WITHIN one language. This compares ACROSS them, which is a different
+/// question and the one that found every lowering in this area: where one engine
+/// has a shortcut for something the other enumerates, the pair shows a 3-150x
+/// ratio and the slower side names the missing arm.
+///
+/// Run it with:
+///
+/// ```text
+/// cargo test --release -- --ignored --nocapture cross_language_cost_probe
+/// ```
+///
+/// Read the ratios, not the times — the fixture is 20k vertices / 60k edges and
+/// the absolute numbers move with the machine. And read them SKEPTICALLY: a
+/// `RETURN u` that renders every element against a `g.V()` that returns handles
+/// the boundary renders later reads as 168x and is not a gap at all. Ask both
+/// sides for the same thing before believing the ratio.
+///
+/// Open gaps as of this writing:
+///
+/// ```text
+///   group().by(k).by(values(v).sum())   6.599ms vs 0.594   11.1x   Gremlin
+///   not(has(k, v))                      2.131   vs 0.104   20.4x   Gremlin
+///   MATCH (u:V) RETURN u.n              0.121   vs 0.028    4.4x   GQL
+///   filter on an edge property          0.666   vs 0.149    4.5x   GQL
+/// ```
+///
+/// The grouped sum is a lowering with a SEMANTIC question in front of it: an
+/// element missing the key still forms a group under `by(k)` but contributes
+/// nothing to `values(v).sum()`, and a column arm has to answer both the same way
+/// the stream does. `not(has(k, v))` cannot lower as it stands — an element with
+/// no `k` satisfies it, and the range disjunction that would stand in for a
+/// negated equality excludes exactly those.
 #[test]
 #[ignore = "timing"]
-fn zzz_lower_probe() {
+fn cross_language_cost_probe() {
     let mut lines = String::new();
 
     for i in 0..20_000usize {

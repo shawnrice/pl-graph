@@ -1187,6 +1187,79 @@ Gremlin has no concept of. The test for whether something is worth sharing is
 whether the SHARED part is the substance: for seeking it was, for ordering it is
 not.
 
+## 2026-08-06 — priced across the languages, not within one
+
+The gates that existed (`equivalent_spellings_cost_the_same`,
+`equivalent_traversals_cost_the_same`) each compare spellings WITHIN one
+language. Asking the same QUESTION in both and comparing is a different test, and
+it turned out to be the one that finds missing lowerings: where one engine plans
+something the other enumerates, the pair reads 3-150x and the slower side names
+the arm that is missing. That probe is now
+`gremlin::divergence_tests::cross_language_cost_probe`, indexed with the
+benchmarks.
+
+Eight things it found, all now closed:
+
+| Question                              | Was     | Is    | Which side |
+| ------------------------------------- | ------- | ----- | ---------- |
+| `EXISTS { (a)-[:R]->()-[:R]->(b) … }` | 7.121ms | 0.065 | GQL        |
+| `out(T).count()`                      | 0.103   | 0.000 | Gremlin    |
+| `or(has(k,v), has(k,w))`              | 3.189   | 0.080 | Gremlin    |
+| `has(k)` (presence)                   | 1.107   | 0.014 | Gremlin    |
+| `project('a','b').by('a').by('b')`    | 4.239   | 0.743 | Gremlin    |
+| `order().by(k, desc).limit(10)`       | 1.015   | 0.276 | Gremlin    |
+| `elementMap()`                        | 8.630   | 2.943 | Gremlin    |
+| `E().hasLabel(T).limit(1).count()`    | 0.125   | 0.036 | Gremlin    |
+
+What is worth recording is the SHAPE of them. Six of the eight were not missing
+algorithms — the algorithm was already written, shared, and reachable from the
+other engine only. The bucket identity behind `out(T).count()` was already
+`seek::count_edges_of_types`, used by the `outE(T)` spelling. The quickselect
+behind a top-k was already in GQL's projection. `MapVal::with_keys` existed
+because "every element of a `project()` stream has the SAME keys", and
+`valueMap` used it while `project` did not. `scan_capped` had stopped early since
+it was written and the Gremlin side never asked.
+
+So the lesson the earlier sections of this note reached from the other direction
+holds: the value of the shared layer is not that it is faster, it is that a fix
+lands once and both engines get it. Two of these prove the second half directly —
+relaxing `columnar()` so a disjunction may FILTER and not only SEED made the GQL
+spelling of `k = 3 OR k = 9` 1.9x faster with no change to the GQL front end at
+all, and `seek::reach_back` was extracted from Gremlin's `where(__.out(T))` and
+immediately answered GQL's multi-hop `EXISTS`.
+
+Two additions to the IR itself, both predicates it could not previously spell:
+
+- **Presence** (`has(k)` / `hasNot(k)`). Every column already carried a `present`
+  bitmap and every `SeekOp` tested it. It never seeds — absence has no value to
+  look up — so it narrows only, which is why `is_empty()` counts it (a
+  bucket-length shortcut would be wrong) and `conj_is_empty()` does not (it is
+  not a reason to refuse to lower). Presence is NOT "is not null" here: a stored
+  null is present.
+- **A disjunction that filters.** The branches existed; running them was the
+  missing half.
+
+Three traps worth carrying forward, each of which cost a wrong step before it was
+caught:
+
+- **A pairing test can be vacuous.** Comparing a lowered spelling against a
+  streamed one catches a broken column arm and CANNOT catch a broken shared
+  helper — both sides move together. Break the arm and watch the test fail before
+  believing it.
+- **A fixture can hide the guard it was written for.** The test that a LIMIT past
+  a hop does not cap the scan passed with the guard removed, because the edges
+  were spread evenly enough that capping and not capping agreed.
+- **The probe measures engines, not work.** `RETURN u` renders every element;
+  `g.V()` returns handles that render at the boundary. That pair reads 168x and
+  is not a gap — against `elementMap()`, GQL is 1.9x faster.
+
+Left open, with numbers, in the probe's own doc comment: `group().by(k).by(
+values(v).sum())` at 11.1x (a lowering with a semantic question in front of it —
+an element missing the key still forms a group but contributes nothing to the
+sum), `not(has(k,v))` at 20.4x (cannot lower as it stands: an element with no `k`
+satisfies it, and a range disjunction standing in for a negated equality excludes
+exactly those), and two GQL-side gaps around 4x.
+
 ## Related
 
 `starts_with` still scans in GQL, and that one is genuinely different: a missing
