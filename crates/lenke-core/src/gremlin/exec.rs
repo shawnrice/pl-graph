@@ -5129,63 +5129,75 @@ fn apply_dedupe(
     bys: &[By],
     stream: Vec<Trav>,
 ) -> Vec<Trav> {
-    // Key on: the tuple of values tagged at `labels` (`dedup('a','b')`),
-    // else the tuple of `by` modulators (`dedup().by(...)`), else the
-    // current value. A hash set on the hashable projection makes this
-    // O(n); the old `Vec::contains` scan was O(n²).
-    // Plain `dedup()` over the current value is by far the commonest form, and it
-    // does not need the tuple shape: keying on the value directly drops a
-    // `Vec<GVal>` for the key, a clone of the value into it, and a `Vec<DedupKey>`
-    // for the projection — three allocations per traverser, 600k on a 200k
-    // stream, to deduplicate what is usually a single element id.
-    if labels.is_empty() && bys.is_empty() {
-        let mut seen: HashSet<DedupKey> = HashSet::with_capacity(stream.len());
-        let mut next = Vec::new();
+    // Key on: the tuple of values tagged at `labels` (`dedup('a','b')`), else the
+    // tuple of `by` modulators (`dedup().by(...)`), else the current value.
+    //
+    // The BUCKETING is `group_first_seen`, shared with the column path and with
+    // GQL's DISTINCT — including its rule that a value with no key (a `NaN`
+    // inside it) is never a duplicate. Only the key differs, and the plain form
+    // keeps a key shape of its own: it is by far the commonest, and the tuple
+    // shape costs a `Vec<GVal>`, a clone of the value into it, and a
+    // `Vec<DedupKey>` per traverser — three allocations, 600k on a 200k stream,
+    // to deduplicate what is usually a single element id.
+    let reps: Vec<usize> = if labels.is_empty() && bys.is_empty() {
+        crate::value::group_first_seen(
+            stream.len(),
+            |i| dedup_key(&stream[i].val),
+            || (),
+            |(), _| (),
+            None,
+        )
+    } else {
+        // Evaluated up front because a `by()` modulator needs `&mut Graph`, which
+        // the key closure cannot also hold while indexing the stream. Same
+        // expressions, same order, same count as evaluating them inline.
+        let keys: Vec<Option<Vec<DedupKey>>> = stream
+            .iter()
+            .map(|t| {
+                let key: Vec<GVal> = if labels.is_empty() {
+                    bys.iter()
+                        .map(|by| eval_by(graph, ctx, by, &t.val))
+                        .collect()
+                } else {
+                    labels
+                        .iter()
+                        .map(|l| t.recall(l, Pop::Last).unwrap_or(GVal::Null))
+                        .collect()
+                };
 
-        for t in stream {
-            match dedup_key(&t.val) {
-                // No key (a NaN inside the value) is never a duplicate, matching
-                // the tuple path below.
-                None => next.push(t),
-                Some(k) => {
-                    if seen.insert(k) {
-                        next.push(t);
-                    }
-                }
-            }
-        }
+                key.iter().map(dedup_key).collect()
+            })
+            .collect();
 
-        return next;
+        let mut keys = keys.into_iter();
+
+        crate::value::group_first_seen(
+            stream.len(),
+            // `group_first_seen` visits rows 0..n once, in order, so handing the
+            // key over by MOVE is sound and saves a clone per traverser — a
+            // `DedupKey` is not `Clone` in any case.
+            |_| keys.next().expect("one key per row, visited in order"),
+            || (),
+            |(), _| (),
+            None,
+        )
+    }
+    .into_iter()
+    .map(|(rep, ())| rep)
+    .collect();
+
+    // `reps` is ascending, so this keeps first-seen order without a sort.
+    let mut keep = vec![false; stream.len()];
+
+    for r in reps {
+        keep[r] = true;
     }
 
-    let mut seen: HashSet<Vec<DedupKey>> = HashSet::new();
-    let mut next = Vec::new();
-    for t in stream {
-        let key: Vec<GVal> = if !labels.is_empty() {
-            labels
-                .iter()
-                .map(|l| t.recall(l, Pop::Last).unwrap_or(GVal::Null))
-                .collect()
-        } else if bys.is_empty() {
-            vec![t.val.clone()]
-        } else {
-            bys.iter()
-                .map(|by| eval_by(graph, ctx, by, &t.val))
-                .collect()
-        };
-        match key.iter().map(dedup_key).collect::<Option<Vec<DedupKey>>>() {
-            // A NaN anywhere in the key is never equal to anything (NaN !=
-            // NaN), so it can't be a duplicate — pass it straight through,
-            // exactly as the old structural `Vec::contains` scan did.
-            None => next.push(t),
-            Some(dk) => {
-                if seen.insert(dk) {
-                    next.push(t);
-                }
-            }
-        }
-    }
-    next
+    stream
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(t, k)| k.then_some(t))
+        .collect()
 }
 
 /// `order(...)`: sort the stream (Global) or, for `Scope::Local`, within each

@@ -898,6 +898,10 @@ impl<'a> Col<'a> {
 /// null. So a mutation that merges keyless rows survives the suite today, and
 /// this is the note that says why rather than a test that cannot fail.
 ///
+/// `key` is called exactly ONCE per row, for rows `0..n` in ascending order, up
+/// to wherever `cap` stops it. That is part of the contract, not an accident of
+/// the loop: a caller with keys it cannot clone hands them over by move.
+///
 /// `cap` stops once that many groups exist. `DISTINCT … LIMIT 5` over a large
 /// frame does not need the sixth group, and pushing the bound in here is the
 /// difference between an early exit and a full pass.
