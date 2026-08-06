@@ -244,6 +244,66 @@ pub enum Value {
 }
 
 impl Value {
+    /// Append a canonical, hashable key for this value — the identity a GROUP BY
+    /// or DISTINCT compares rows by.
+    ///
+    /// One builder, because a grouping key is a DECISION and there were two: this
+    /// existed in `query.rs` and in `gql/eval.rs`, differing only in the byte they
+    /// wrote for a null. They had already diverged once on something that mattered
+    /// — one normalized signed zeros and one did not — so the second difference
+    /// was the warning rather than the bug.
+    ///
+    /// Each variant is TAGGED, so a string can never collide with the sentinel of
+    /// another type, and the caller separates cells itself.
+    pub(crate) fn push_group_key(&self, out: &mut String) {
+        use std::fmt::Write as _;
+
+        match self {
+            Self::Null => out.push('N'),
+            Self::Bool(b) => {
+                out.push('b');
+                out.push(if *b { '1' } else { '0' });
+            }
+            // Signed zeros are one key and NaN is canonical — see
+            // `value::group_key_bits`, which owns that rule for both engines.
+            Self::Num(x) => {
+                let _ = write!(out, "n{:016x}", crate::value::group_key_bits(*x));
+            }
+            Self::Str(s) => {
+                out.push('s');
+                out.push_str(s);
+            }
+            Self::Temporal(t) => {
+                let _ = write!(out, "t{}{}", t.tag(), t.format());
+            }
+            Self::List(items) => {
+                out.push('[');
+
+                for it in items {
+                    it.push_group_key(out);
+                    out.push(',');
+                }
+
+                out.push(']');
+            }
+            // Keys arrive canonical (sorted) from the store, so the key is too.
+            Self::Map(pairs) => {
+                out.push('{');
+
+                for (k, val) in pairs {
+                    out.push_str(k);
+                    out.push('=');
+                    val.push_group_key(out);
+                    out.push(',');
+                }
+
+                out.push('}');
+            }
+        }
+    }
+}
+
+impl Value {
     /// Whether this value holds a NaN or ±Infinity, anywhere — including nested
     /// inside a list or map. The read side of [`Self::finite_only`].
     #[must_use]

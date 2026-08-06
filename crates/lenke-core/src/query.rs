@@ -655,58 +655,10 @@ fn item_name(it: &RetItem) -> String {
     }
 }
 
-/// A canonical, hashable key for a `Value` — used to group/dedup rows. Floats
-/// key by their bit pattern so distinct NaNs and ±0 stay distinguishable, and a
-/// type tag prevents cross-type collisions (e.g. `1` the number vs `"1"`).
-fn value_key(v: &Value, out: &mut String) {
-    use std::fmt::Write;
-    match v {
-        Value::Null => out.push('0'),
-        Value::Bool(b) => {
-            let _ = write!(out, "b{}", *b as u8);
-        }
-        Value::Num(x) => {
-            // `-0.0` and `0.0` are ONE key, matching the main engine — which
-            // normalizes here for the reason recorded on `group_num_bits`:
-            // grouping agrees with equality everywhere else, and two groups whose
-            // rendered values are both `0` is a distinction no result can show.
-            //
-            // This copy kept the raw bits, so `RETURN DISTINCT u.z` over a `0.0`
-            // and a `-0.0` gave two rows here and one there. That matters
-            // precisely because this engine exists to be COMPARED against the
-            // other one.
-            let _ = write!(out, "n{:016x}", crate::value::group_key_bits(*x));
-        }
-        Value::Str(s) => {
-            let _ = write!(out, "s{s}");
-        }
-        Value::Temporal(t) => {
-            let _ = write!(out, "t{}{}", t.tag(), t.format());
-        }
-        Value::List(items) => {
-            out.push('[');
-            for it in items {
-                value_key(it, out);
-                out.push(',');
-            }
-            out.push(']');
-        }
-        Value::Map(pairs) => {
-            out.push('{');
-            for (k, val) in pairs {
-                let _ = write!(out, "{k}=");
-                value_key(val, out);
-                out.push(',');
-            }
-            out.push('}');
-        }
-    }
-}
-
 fn row_key(cells: &[Value]) -> String {
     let mut s = String::new();
     for c in cells {
-        value_key(c, &mut s);
+        c.push_group_key(&mut s);
         s.push('\u{1}');
     }
     s

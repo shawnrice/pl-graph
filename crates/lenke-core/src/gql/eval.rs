@@ -1129,47 +1129,10 @@ fn row_key(b: &Binding) -> String {
     s
 }
 
-/// Canonical key for an output [`Value`] cell (DISTINCT / set-op identity).
-fn value_key(v: &Value, out: &mut String) {
-    match v {
-        Value::Null => out.push('N'),
-        Value::Bool(b) => {
-            out.push('b');
-            out.push(if *b { '1' } else { '0' });
-        }
-        Value::Num(n) => {
-            let _ = write!(out, "n{:016x}", crate::value::group_key_bits(*n));
-        }
-        Value::Str(s) => {
-            let _ = write!(out, "s{s}");
-        }
-        Value::Temporal(t) => {
-            let _ = write!(out, "t{}{}", t.tag(), t.format());
-        }
-        Value::List(items) => {
-            out.push('[');
-            for it in items {
-                value_key(it, out);
-                out.push(',');
-            }
-            out.push(']');
-        }
-        Value::Map(pairs) => {
-            out.push('{');
-            for (k, val) in pairs {
-                let _ = write!(out, "{k}=");
-                value_key(val, out);
-                out.push(',');
-            }
-            out.push('}');
-        }
-    }
-}
-
 fn value_row_key(row: &[Value]) -> String {
     let mut s = String::new();
     for cell in row {
-        value_key(cell, &mut s);
+        cell.push_group_key(&mut s);
         s.push('\u{1}');
     }
     s
