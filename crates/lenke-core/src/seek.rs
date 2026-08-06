@@ -533,25 +533,6 @@ impl ElementSeek {
             })
     }
 
-    /// Whether every conjunct on `key` is answerable from a typed column.
-    ///
-    /// A caller that DROPS the filter the index answered must check this first.
-    /// A seek can return the right rows while the equivalent comparison would
-    /// have FAULTED — `has('k', gt(5))` on a string column is a type error in
-    /// Gremlin, but the range seek just yields nothing. Dropping the step then
-    /// loses the error, and the same query answers `0` with an index and throws
-    /// without one, which makes an index observable instead of a pure
-    /// optimization.
-    #[must_use]
-    pub fn answers_exactly(&self, graph: &Graph, param: &impl Bindings, key: &str) -> bool {
-        self.conj.iter().filter(|p| &*p.key == key).all(|p| {
-            p.operand
-                .resolve(param)
-                .and_then(|k| column_matches(graph, &p.key, self.edge, p.op, &k))
-                .is_some()
-        })
-    }
-
     /// Every candidate satisfying EVERY conjunct: seeded from an index when one
     /// applies, otherwise from `universe`, then filtered against the typed
     /// columns.

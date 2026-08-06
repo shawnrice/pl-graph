@@ -286,33 +286,6 @@ impl ArrowColumn {
         }
     }
 
-    /// Build a Utf8 column from already-rendered strings (one per row, `None` =
-    /// null). Lets the engine flatten element/string columns once, in place.
-    pub fn utf8_from(strings: impl Iterator<Item = Option<String>>) -> Self {
-        let mut offsets = vec![0i32];
-        let mut bytes = Vec::new();
-        let mut valid = Vec::new();
-        let mut any_null = false;
-        for s in strings {
-            match s {
-                Some(s) => {
-                    bytes.extend_from_slice(s.as_bytes());
-                    valid.push(true);
-                }
-                None => {
-                    any_null = true;
-                    valid.push(false);
-                }
-            }
-            offsets.push(bytes.len() as i32);
-        }
-        Self::Utf8 {
-            offsets,
-            bytes,
-            valid: if any_null { Some(valid) } else { None },
-        }
-    }
-
     fn valid_mask(&self) -> &Option<Vec<bool>> {
         match self {
             Self::Num { valid, .. }

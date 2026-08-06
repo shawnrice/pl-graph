@@ -1048,44 +1048,6 @@ impl Graph {
         }
     }
 
-    /// Replace an edge's whole label set with one label (the old single-label
-    /// `add_edge_label` behaviour), used by the codecs and `SET` on a type.
-    pub fn set_edge_label(&mut self, ei: u32, name: &str) {
-        let tid = self.etype.intern(name);
-        let i = ei as usize;
-        // Move the edge between type buckets when its type actually changes.
-        let old = self.e_type[i];
-        // Capture the prior type name (for the rollback inverse) before it changes.
-        if old != tid && self.tx_active() {
-            let old_name = self.etype.text(old).to_string();
-            self.record_undo(Undo::EType(ei, old_name));
-        }
-        if old != tid {
-            if let Some(bucket) = self.by_etype.get_mut(&old) {
-                bucket.retain(|&x| x != ei);
-            }
-            if self.is_edge_live(ei) {
-                self.by_etype.entry(tid).or_default().push(ei);
-            }
-        }
-        self.e_type[i] = tid;
-        let (src, dst) = (self.e_src[i] as usize, self.e_dst[i] as usize);
-        for a in self.out[src].iter_mut().filter(|a| a.eidx == ei) {
-            a.etype = tid;
-        }
-        for a in self.in_[dst].iter_mut().filter(|a| a.eidx == ei) {
-            a.etype = tid;
-        }
-        if old != tid {
-            // Both the old and new type's membership changed; the etype stored in
-            // the adjacency slots changed too, so the CSR snapshot is stale.
-            let old_name = self.etype.text(old).to_string();
-            self.invalidate_csr();
-            self.bump();
-            self.touch(&old_name);
-            self.touch(name);
-        }
-    }
     /// Delete an edge (tombstone + unlink from both endpoints' adjacency).
     pub fn remove_edge(&mut self, ei: u32) {
         let i = ei as usize;

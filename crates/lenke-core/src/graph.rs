@@ -2959,28 +2959,6 @@ impl EdgeRec<'static> {
             id: id.map(Cow::Owned),
         }
     }
-
-    /// An owned record carrying SEVERAL labels.
-    #[must_use]
-    pub fn owned_labelled(
-        src: String,
-        dst: String,
-        labels: Vec<String>,
-        props: Vec<(String, Value)>,
-        id: Option<String>,
-    ) -> Self {
-        let mut it = labels.into_iter();
-        let first = it.next().unwrap_or_default();
-
-        Self {
-            src: Cow::Owned(src),
-            dst: Cow::Owned(dst),
-            etype: Cow::Owned(first),
-            extra_labels: it.map(Cow::Owned).collect(),
-            props: owned_props(props),
-            id: id.map(Cow::Owned),
-        }
-    }
 }
 
 #[derive(Default)]

@@ -2966,3 +2966,74 @@ fn a_keyed_group_count_matches_the_streamed_fold() {
         "[Map(MapVal { keys: [Num(1.0), Num(2.0), Null], vals: [Num(2.0), Num(1.0), Num(1.0)] })]"
     );
 }
+
+/// Every temporal constructor this dialect spells parses through the ONE shared
+/// dispatch, and an unknown one still names itself.
+///
+/// `parse_temporal_literal` used to repeat `Temporal::parse`'s six arms — six
+/// chances for the dialects to disagree about which constructors exist or how
+/// each parses, in a codebase where a temporal has to decode identically
+/// everywhere. Only the SPELLING differs now: Gremlin writes `time(…)` where
+/// the shared tag is `localtime`.
+#[test]
+fn every_temporal_constructor_parses_through_the_shared_dispatch() {
+    let mut g =
+        crate::ndjson::decode(r#"{"type":"node","id":"a","labels":["V"],"properties":{"n":1}}"#)
+            .expect("fixture decodes");
+
+    // `inject` carries the literal straight through, so what comes back IS what
+    // the constructor parsed.
+    for (src, want) in [
+        (
+            "date('2020-01-02')",
+            "[Temporal(Date(Date { days: 18263 }))]",
+        ),
+        (
+            "time('01:02:03')",
+            "[Temporal(Time(Time { secs: 3723, nanos: 0 }))]",
+        ),
+        (
+            "duration('P1D')",
+            "[Temporal(Duration(Duration { months: 0, days: 1, secs: 0, nanos: 0 }))]",
+        ),
+    ] {
+        assert_eq!(
+            format!(
+                "{:?}",
+                super::parse::parse(&format!("g.inject({src})"))
+                    .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+                    .run(&mut g)
+            ),
+            want,
+            "`{src}`"
+        );
+    }
+
+    // The remaining three round-trip through their own formatter, which is the
+    // check that matters for them: the value survives the shared parse.
+    for src in [
+        "datetime('2020-01-02T03:04:05')",
+        "zoned_time('01:02:03+01:00')",
+        "zoned_datetime('2020-01-02T03:04:05+01:00')",
+    ] {
+        let out = super::parse::parse(&format!("g.inject({src})"))
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(&mut g);
+
+        assert!(
+            matches!(out.as_slice(), [GVal::Temporal(_)]),
+            "`{src}` gave {out:?}"
+        );
+    }
+
+    // A malformed value reports the PARSER's message, not a constructor error.
+    let bad = super::parse::parse("g.inject(date('not-a-date'))");
+
+    assert!(bad.is_err(), "a malformed date must not parse");
+
+    // An unknown constructor still names itself rather than reporting a parse
+    // failure for a kind that does not exist.
+    let unknown = super::parse::parse("g.inject(fortnight('P14D'))");
+
+    assert!(unknown.is_err(), "an unknown constructor must not parse");
+}

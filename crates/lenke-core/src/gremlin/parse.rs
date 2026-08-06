@@ -10,7 +10,7 @@
 //! `Pop.first`, `Scope.local`), or a nested traversal (`__.out().count()`).
 
 use super::{Column, GVal, Order, Pop, Scope, Step, Token, Traversal, __, P};
-use crate::temporal::{Date, DateTime, Duration, Temporal, Time, ZonedDateTime, ZonedTime};
+use crate::temporal::Temporal;
 
 // --- lexer ------------------------------------------------------------------
 
@@ -187,15 +187,23 @@ const TEMPORAL_CTORS: &[&str] = &[
 /// Build a [`Temporal`] from a constructor name and its string argument, reusing
 /// the per-kind parsers so the accepted syntax matches GQL exactly.
 fn parse_temporal_literal(ctor: &str, lit: &str) -> Result<Temporal, String> {
-    match ctor {
-        "date" => Date::parse(lit).map(Temporal::Date),
-        "datetime" => DateTime::parse(lit).map(Temporal::DateTime),
-        "time" => Time::parse(lit).map(Temporal::Time),
-        "duration" => Duration::parse(lit).map(Temporal::Duration),
-        "zoned_time" => ZonedTime::parse(lit).map(Temporal::ZonedTime),
-        "zoned_datetime" => ZonedDateTime::parse(lit).map(Temporal::ZonedDateTime),
-        other => Err(format!("unknown temporal constructor '{other}'")),
-    }
+    // `Temporal::parse` is the one dispatch — the codecs and the GQL parser go
+    // through it too. This used to repeat the six arms, which is six chances for
+    // the dialects to disagree about which constructors exist or how each one
+    // parses, in a codebase where a temporal must decode identically everywhere.
+    //
+    // Only the SPELLING is Gremlin's: this dialect writes `time(…)` where the
+    // shared tag is `localtime`, so the name is mapped rather than the parser
+    // duplicated.
+    let tag = match ctor {
+        "time" => "localtime",
+        other => other,
+    };
+
+    Temporal::parse(tag, lit).map_err(|e| match ctor {
+        "date" | "datetime" | "time" | "duration" | "zoned_time" | "zoned_datetime" => e,
+        other => format!("unknown temporal constructor '{other}'"),
+    })
 }
 
 struct Parser {
