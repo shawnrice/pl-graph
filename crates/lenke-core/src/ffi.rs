@@ -403,14 +403,9 @@ pub unsafe extern "C" fn lnk_create_unique_constraint(
     key_ptr: *const u8,
     key_len: usize,
 ) -> i32 {
-    let (Some(g), Some(label), Some(key)) = (
-        // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-        unsafe { graph_mut(g) },
-        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-        unsafe { in_str(label_ptr, label_len) },
-        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-        unsafe { in_str(key_ptr, key_len) },
-    ) else {
+    // SAFETY: forwards this fn's # Safety contract for the handle and each ptr/len.
+    let Some((g, label, key)) = (unsafe { in_g2(g, label_ptr, label_len, key_ptr, key_len) })
+    else {
         return -1;
     };
     match g.create_unique_constraint(label, key) {
@@ -434,14 +429,9 @@ pub unsafe extern "C" fn lnk_create_required_constraint(
     key_ptr: *const u8,
     key_len: usize,
 ) -> i32 {
-    let (Some(g), Some(label), Some(key)) = (
-        // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-        unsafe { graph_mut(g) },
-        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-        unsafe { in_str(label_ptr, label_len) },
-        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-        unsafe { in_str(key_ptr, key_len) },
-    ) else {
+    // SAFETY: forwards this fn's # Safety contract for the handle and each ptr/len.
+    let Some((g, label, key)) = (unsafe { in_g2(g, label_ptr, label_len, key_ptr, key_len) })
+    else {
         return -1;
     };
     match g.create_required_constraint(label, key) {
@@ -467,16 +457,12 @@ pub unsafe extern "C" fn lnk_create_type_constraint(
     type_ptr: *const u8,
     type_len: usize,
 ) -> i32 {
-    let (Some(g), Some(label), Some(key), Some(ty)) = (
-        // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-        unsafe { graph_mut(g) },
-        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-        unsafe { in_str(label_ptr, label_len) },
-        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-        unsafe { in_str(key_ptr, key_len) },
-        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-        unsafe { in_str(type_ptr, type_len) },
-    ) else {
+    // SAFETY: forwards this fn's # Safety contract for the handle and each ptr/len.
+    let Some((g, label, key, ty)) = (unsafe {
+        in_g3(
+            g, label_ptr, label_len, key_ptr, key_len, type_ptr, type_len,
+        )
+    }) else {
         return -1;
     };
     match g.create_type_constraint(label, key, ty) {
@@ -503,14 +489,9 @@ pub unsafe extern "C" fn lnk_create_edge_unique_constraint(
     key_ptr: *const u8,
     key_len: usize,
 ) -> i32 {
-    let (Some(g), Some(etype), Some(key)) = (
-        // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-        unsafe { graph_mut(g) },
-        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-        unsafe { in_str(etype_ptr, etype_len) },
-        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-        unsafe { in_str(key_ptr, key_len) },
-    ) else {
+    // SAFETY: forwards this fn's # Safety contract for the handle and each ptr/len.
+    let Some((g, etype, key)) = (unsafe { in_g2(g, etype_ptr, etype_len, key_ptr, key_len) })
+    else {
         return -1;
     };
     match g.create_edge_unique_constraint(etype, key) {
@@ -534,14 +515,9 @@ pub unsafe extern "C" fn lnk_create_edge_required_constraint(
     key_ptr: *const u8,
     key_len: usize,
 ) -> i32 {
-    let (Some(g), Some(etype), Some(key)) = (
-        // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-        unsafe { graph_mut(g) },
-        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-        unsafe { in_str(etype_ptr, etype_len) },
-        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-        unsafe { in_str(key_ptr, key_len) },
-    ) else {
+    // SAFETY: forwards this fn's # Safety contract for the handle and each ptr/len.
+    let Some((g, etype, key)) = (unsafe { in_g2(g, etype_ptr, etype_len, key_ptr, key_len) })
+    else {
         return -1;
     };
     match g.create_edge_required_constraint(etype, key) {
@@ -567,16 +543,12 @@ pub unsafe extern "C" fn lnk_create_edge_type_constraint(
     type_ptr: *const u8,
     type_len: usize,
 ) -> i32 {
-    let (Some(g), Some(etype), Some(key), Some(ty)) = (
-        // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-        unsafe { graph_mut(g) },
-        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-        unsafe { in_str(etype_ptr, etype_len) },
-        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-        unsafe { in_str(key_ptr, key_len) },
-        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-        unsafe { in_str(type_ptr, type_len) },
-    ) else {
+    // SAFETY: forwards this fn's # Safety contract for the handle and each ptr/len.
+    let Some((g, etype, key, ty)) = (unsafe {
+        in_g3(
+            g, etype_ptr, etype_len, key_ptr, key_len, type_ptr, type_len,
+        )
+    }) else {
         return -1;
     };
     match g.create_edge_type_constraint(etype, key, ty) {
@@ -608,14 +580,9 @@ pub unsafe extern "C" fn lnk_create_cardinality_constraint(
     min: u32,
     max: i64,
 ) -> i32 {
-    let (Some(g), Some(label), Some(etype)) = (
-        // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-        unsafe { graph_mut(g) },
-        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-        unsafe { in_str(label_ptr, label_len) },
-        // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-        unsafe { in_str(etype_ptr, etype_len) },
-    ) else {
+    // SAFETY: forwards this fn's # Safety contract for the handle and each ptr/len.
+    let Some((g, label, etype)) = (unsafe { in_g2(g, label_ptr, label_len, etype_ptr, etype_len) })
+    else {
         return -1;
     };
     let max_opt = if max < 0 { None } else { Some(max as u32) };
@@ -784,9 +751,8 @@ pub unsafe extern "C" fn lnk_drop_vertex_index(
     name_len: usize,
 ) -> i32 {
     // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-    let (Some(g), Some(name)) = (unsafe { graph_mut(g) }, unsafe {
-        in_str(name_ptr, name_len)
-    }) else {
+    // SAFETY: forwards this fn's # Safety contract for the handle and the ptr/len.
+    let Some((g, name)) = (unsafe { in_g1(g, name_ptr, name_len) }) else {
         return -1;
     };
     match g.drop_vertex_index(name) {
@@ -806,9 +772,8 @@ pub unsafe extern "C" fn lnk_drop_edge_index(
     name_len: usize,
 ) -> i32 {
     // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-    let (Some(g), Some(name)) = (unsafe { graph_mut(g) }, unsafe {
-        in_str(name_ptr, name_len)
-    }) else {
+    // SAFETY: forwards this fn's # Safety contract for the handle and the ptr/len.
+    let Some((g, name)) = (unsafe { in_g1(g, name_ptr, name_len) }) else {
         return -1;
     };
     match g.drop_edge_index(name) {
@@ -926,7 +891,8 @@ pub unsafe extern "C" fn lnk_query(
     out_checksum: *mut u64,
 ) -> i32 {
     // SAFETY: g is the caller-supplied handle, and the ptr/len the caller-supplied buffer, that this fn's # Safety contract requires be valid (or null -> None).
-    let (Some(g), Some(q)) = (unsafe { graph_ref(g) }, unsafe { in_str(q_ptr, q_len) }) else {
+    // SAFETY: forwards this fn's # Safety contract for the handle and the ptr/len.
+    let Some((g, q)) = (unsafe { in_r1(g, q_ptr, q_len) }) else {
         return -1;
     };
     let parsed = match query::parse(q) {
@@ -960,7 +926,8 @@ pub unsafe extern "C" fn lnk_query_batch(
     out_checksum: *mut u64,
 ) -> i64 {
     // SAFETY: g is the caller-supplied handle, and the ptr/len the caller-supplied buffer, that this fn's # Safety contract requires be valid (or null -> None).
-    let (Some(g), Some(text)) = (unsafe { graph_ref(g) }, unsafe { in_str(q_ptr, q_len) }) else {
+    // SAFETY: forwards this fn's # Safety contract for the handle and the ptr/len.
+    let Some((g, text)) = (unsafe { in_r1(g, q_ptr, q_len) }) else {
         return -1;
     };
     let mut i = 0isize;
@@ -990,6 +957,65 @@ pub unsafe extern "C" fn lnk_query_batch(
 /// # Safety
 /// `p_ptr` is either null or valid for `p_len` bytes of UTF-8.
 #[cfg(feature = "gql")]
+/// A graph handle plus one decoded string, or `None` if either is null / not
+/// UTF-8.
+///
+/// # Safety
+/// `g` is null or a live, aligned, uniquely-borrowed `Graph` for `'a`; the
+/// ptr/len is null or a valid readable range for `'a`.
+unsafe fn in_g1<'a>(g: *mut Graph, p: *const u8, l: usize) -> Option<(&'a mut Graph, &'a str)> {
+    // SAFETY: forwards this fn's contract to each accessor; both yield None for null.
+    unsafe { Some((graph_mut(g)?, in_str(p, l)?)) }
+}
+
+/// [`in_g1`] for a read-only handle.
+///
+/// # Safety
+/// As [`in_g1`], except `g` need only be shared-borrowable.
+unsafe fn in_r1<'a>(g: *const Graph, p: *const u8, l: usize) -> Option<(&'a Graph, &'a str)> {
+    // SAFETY: forwards this fn's contract to each accessor; both yield None for null.
+    unsafe { Some((graph_ref(g)?, in_str(p, l)?)) }
+}
+
+/// [`in_g1`] with two strings.
+///
+/// # Safety
+/// As [`in_g1`], for each ptr/len.
+unsafe fn in_g2<'a>(
+    g: *mut Graph,
+    p1: *const u8,
+    l1: usize,
+    p2: *const u8,
+    l2: usize,
+) -> Option<(&'a mut Graph, &'a str, &'a str)> {
+    // SAFETY: forwards this fn's contract to each accessor; both yield None for null.
+    unsafe { Some((graph_mut(g)?, in_str(p1, l1)?, in_str(p2, l2)?)) }
+}
+
+/// [`in_g1`] with three strings.
+///
+/// # Safety
+/// As [`in_g1`], for each ptr/len.
+unsafe fn in_g3<'a>(
+    g: *mut Graph,
+    p1: *const u8,
+    l1: usize,
+    p2: *const u8,
+    l2: usize,
+    p3: *const u8,
+    l3: usize,
+) -> Option<(&'a mut Graph, &'a str, &'a str, &'a str)> {
+    // SAFETY: forwards this fn's contract to each accessor; all yield None for null.
+    unsafe {
+        Some((
+            graph_mut(g)?,
+            in_str(p1, l1)?,
+            in_str(p2, l2)?,
+            in_str(p3, l3)?,
+        ))
+    }
+}
+
 /// The opening every query entry point shares: reset the error slot, reject a
 /// null graph or query pointer, decode the query text, and resolve the handle.
 ///
@@ -1676,9 +1702,8 @@ pub unsafe extern "C" fn lnk_write_ndjson(
     path_len: usize,
 ) -> i64 {
     // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-    let (Some(g), Some(path)) = (unsafe { graph_ref(g) }, unsafe {
-        in_str(path_ptr, path_len)
-    }) else {
+    // SAFETY: forwards this fn's # Safety contract for the handle and the ptr/len.
+    let Some((g, path)) = (unsafe { in_r1(g, path_ptr, path_len) }) else {
         return -1;
     };
     let bytes = crate::ndjson::encode(g).into_bytes();
