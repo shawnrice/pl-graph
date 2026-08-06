@@ -990,6 +990,45 @@ pub unsafe extern "C" fn lnk_query_batch(
 /// # Safety
 /// `p_ptr` is either null or valid for `p_len` bytes of UTF-8.
 #[cfg(feature = "gql")]
+/// The opening every query entry point shares: reset the error slot, reject a
+/// null graph or query pointer, decode the query text, and resolve the handle.
+///
+/// `None` means the error slot is ALREADY SET and the caller returns null. Four
+/// entry points wrote these same twenty lines each — `lnk_query_rows`,
+/// `lnk_query_arrow`, `lnk_query_arrow_ipc`, `lnk_gremlin_json` — including the
+/// SAFETY comments, which is the part that makes a copy expensive: an unsafe
+/// block is only as reviewable as the comment beside it, and there were four to
+/// keep in step.
+///
+/// # Safety
+/// The callers' contract, unchanged: `g` is null or points to a live, aligned,
+/// uniquely-borrowed `Graph` for `'a`, and `q_ptr`/`q_len` is null or a valid
+/// readable range for `'a`.
+unsafe fn query_entry<'a>(
+    g: *mut Graph,
+    q_ptr: *const u8,
+    q_len: usize,
+) -> Option<(&'a mut Graph, &'a str)> {
+    crate::ffi_error::begin();
+
+    if g.is_null() || q_ptr.is_null() {
+        crate::ffi_error::set_code(ErrorCode::Ffi, "null graph or query pointer");
+        return None;
+    }
+
+    // SAFETY: the ptr/len is the caller-supplied buffer this fn's # Safety
+    // contract requires be a valid readable range (or null -> None).
+    let Some(q) = (unsafe { in_str(q_ptr, q_len) }) else {
+        crate::ffi_error::set_code(ErrorCode::Ffi, "query bytes are not valid UTF-8");
+        return None;
+    };
+    // SAFETY: g is the caller-supplied handle this fn's # Safety contract
+    // requires be a valid graph (null was rejected above).
+    let g = unsafe { graph_mut(g) }?;
+
+    Some((g, q))
+}
+
 unsafe fn decode_params(p_ptr: *const u8, p_len: usize) -> Result<crate::gql::eval::Params, ()> {
     if p_ptr.is_null() || p_len == 0 {
         return Ok(crate::gql::eval::Params::new());
@@ -1041,25 +1080,12 @@ pub unsafe extern "C" fn lnk_query_rows(
     p_len: usize,
     out_len: *mut usize,
 ) -> *mut u8 {
-    crate::ffi_error::begin();
-    if g.is_null() || q_ptr.is_null() {
-        crate::ffi_error::set_code(ErrorCode::Ffi, "null graph or query pointer");
+    // SAFETY: forwards this fn's # Safety contract for `g` and `q_ptr`/`q_len`.
+    let Some((g, q)) = (unsafe { query_entry(g, q_ptr, q_len) }) else {
         return std::ptr::null_mut();
-    }
-    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-    let q = match unsafe { in_str(q_ptr, q_len) } {
-        Some(s) => s,
-        None => {
-            crate::ffi_error::set_code(ErrorCode::Ffi, "query bytes are not valid UTF-8");
-            return std::ptr::null_mut();
-        }
     };
     // SAFETY: p_ptr/p_len is the caller-supplied params buffer this fn's # Safety contract requires be null or a valid readable range.
     let Ok(params) = (unsafe { decode_params(p_ptr, p_len) }) else {
-        return std::ptr::null_mut();
-    };
-    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-    let Some(g) = (unsafe { graph_mut(g) }) else {
         return std::ptr::null_mut();
     };
     // Route to the full GQL engine (the complete ISO-subset port). A parse
@@ -1198,25 +1224,12 @@ pub unsafe extern "C" fn lnk_query_arrow(
     p_len: usize,
     out_len: *mut usize,
 ) -> *mut u8 {
-    crate::ffi_error::begin();
-    if g.is_null() || q_ptr.is_null() {
-        crate::ffi_error::set_code(ErrorCode::Ffi, "null graph or query pointer");
+    // SAFETY: forwards this fn's # Safety contract for `g` and `q_ptr`/`q_len`.
+    let Some((g, q)) = (unsafe { query_entry(g, q_ptr, q_len) }) else {
         return std::ptr::null_mut();
-    }
-    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-    let q = match unsafe { in_str(q_ptr, q_len) } {
-        Some(s) => s,
-        None => {
-            crate::ffi_error::set_code(ErrorCode::Ffi, "query bytes are not valid UTF-8");
-            return std::ptr::null_mut();
-        }
     };
     // SAFETY: p_ptr/p_len is the caller-supplied params buffer this fn's # Safety contract requires be null or a valid readable range.
     let Ok(params) = (unsafe { decode_params(p_ptr, p_len) }) else {
-        return std::ptr::null_mut();
-    };
-    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-    let Some(g) = (unsafe { graph_mut(g) }) else {
         return std::ptr::null_mut();
     };
     // The error rides the last-error channel, never this return pointer — so the
@@ -1276,25 +1289,12 @@ pub unsafe extern "C" fn lnk_query_arrow_ipc(
     file: u32,
     out_len: *mut usize,
 ) -> *mut u8 {
-    crate::ffi_error::begin();
-    if g.is_null() || q_ptr.is_null() {
-        crate::ffi_error::set_code(ErrorCode::Ffi, "null graph or query pointer");
+    // SAFETY: forwards this fn's # Safety contract for `g` and `q_ptr`/`q_len`.
+    let Some((g, q)) = (unsafe { query_entry(g, q_ptr, q_len) }) else {
         return std::ptr::null_mut();
-    }
-    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-    let q = match unsafe { in_str(q_ptr, q_len) } {
-        Some(s) => s,
-        None => {
-            crate::ffi_error::set_code(ErrorCode::Ffi, "query bytes are not valid UTF-8");
-            return std::ptr::null_mut();
-        }
     };
     // SAFETY: p_ptr/p_len is the caller-supplied params buffer this fn's # Safety contract requires be null or a valid readable range.
     let Ok(params) = (unsafe { decode_params(p_ptr, p_len) }) else {
-        return std::ptr::null_mut();
-    };
-    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-    let Some(g) = (unsafe { graph_mut(g) }) else {
         return std::ptr::null_mut();
     };
     let parsed = match crate::gql::parse_with_max_chain(q, g.max_operator_chain()) {
@@ -1512,21 +1512,8 @@ pub unsafe extern "C" fn lnk_gremlin_json(
     q_len: usize,
     out_len: *mut usize,
 ) -> *mut u8 {
-    crate::ffi_error::begin();
-    if g.is_null() || q_ptr.is_null() {
-        crate::ffi_error::set_code(ErrorCode::Ffi, "null graph or query pointer");
-        return std::ptr::null_mut();
-    }
-    // SAFETY: the ptr/len here is the caller-supplied buffer this fn's # Safety contract requires be a valid readable range (or null -> None).
-    let q = match unsafe { in_str(q_ptr, q_len) } {
-        Some(s) => s,
-        None => {
-            crate::ffi_error::set_code(ErrorCode::Ffi, "query bytes are not valid UTF-8");
-            return std::ptr::null_mut();
-        }
-    };
-    // SAFETY: g is the caller-supplied handle this fn's # Safety contract requires be a valid graph (or null -> None).
-    let Some(g) = (unsafe { graph_mut(g) }) else {
+    // SAFETY: forwards this fn's # Safety contract for `g` and `q_ptr`/`q_len`.
+    let Some((g, q)) = (unsafe { query_entry(g, q_ptr, q_len) }) else {
         return std::ptr::null_mut();
     };
     let plan = match crate::gremlin::parse(q) {
@@ -1698,5 +1685,97 @@ pub unsafe extern "C" fn lnk_write_ndjson(
     match std::fs::write(path, &bytes) {
         Ok(()) => bytes.len() as i64,
         Err(_) => -1,
+    }
+}
+
+#[cfg(test)]
+mod entry_guards {
+    use super::*;
+
+    /// Read back whatever the last call put in the error slot.
+    fn last_error() -> String {
+        let mut len = 0usize;
+        // SAFETY: `len` is a live writable local; the call returns an owned buffer.
+        let p = unsafe { crate::ffi_error::lnk_last_error_json(&raw mut len) };
+
+        if p.is_null() {
+            return String::new();
+        }
+
+        // SAFETY: the buffer came from the call above with exactly `len` bytes.
+        let s = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, len) }).into_owned();
+
+        // SAFETY: returning the same pointer/len the call handed out.
+        unsafe { lnk_free_buf(p, len) };
+        s
+    }
+
+    /// The prologue every query entry point shares rejects a null handle and
+    /// non-UTF-8 query bytes, returns null, and SAYS WHY.
+    ///
+    /// One helper now owns both paths for all four entry points, so a mistake in
+    /// it is a mistake in every one of them — and nothing covered it before.
+    #[test]
+    fn a_query_entry_rejects_a_null_graph_and_bad_utf8() {
+        let mut out_len = 0usize;
+        let q = b"MATCH (n) RETURN count(*) AS c";
+
+        // Null graph.
+        // SAFETY: a null handle is explicitly part of the contract.
+        let r = unsafe {
+            lnk_query_rows(
+                std::ptr::null_mut(),
+                q.as_ptr(),
+                q.len(),
+                std::ptr::null(),
+                0,
+                &raw mut out_len,
+            )
+        };
+
+        assert!(r.is_null());
+        assert!(
+            last_error().contains("null graph or query pointer"),
+            "a null graph must say so"
+        );
+
+        // A real graph, but query bytes that are not UTF-8.
+        let mut g = crate::ndjson::decode("").expect("an empty graph decodes");
+        let bad = [0xffu8, 0xfe, 0xfd];
+        // SAFETY: `bad` is a live readable range; `g` is a live graph.
+        let r = unsafe {
+            lnk_query_rows(
+                &raw mut g,
+                bad.as_ptr(),
+                bad.len(),
+                std::ptr::null(),
+                0,
+                &raw mut out_len,
+            )
+        };
+
+        assert!(r.is_null());
+        assert!(
+            last_error().contains("not valid UTF-8"),
+            "non-UTF-8 query bytes must say so"
+        );
+
+        // And a well-formed call still works, so the guard is not just refusing
+        // everything.
+        // SAFETY: both buffers are live readable ranges and `g` is a live graph.
+        let r = unsafe {
+            lnk_query_rows(
+                &raw mut g,
+                q.as_ptr(),
+                q.len(),
+                std::ptr::null(),
+                0,
+                &raw mut out_len,
+            )
+        };
+
+        assert!(!r.is_null(), "a valid query must still answer");
+        // SAFETY: returning the buffer the call handed out.
+        unsafe { lnk_free_buf(r, out_len) };
     }
 }
