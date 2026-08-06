@@ -12568,6 +12568,22 @@ fn the_reverse_semi_join_agrees_with_the_general_path() {
         // Nothing selective about `b` — the forward test is cheaper and this
         // declines.
         "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:R]->(b) } RETURN count(*) AS c",
+        // CHAINS. Run forward per row these are O(rows · degree^hops) exactly
+        // where no walk exists; backwards they are a level per hop.
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:R]->()-[:R]->(b) WHERE b.n = 7 } RETURN count(*) AS c",
+        "MATCH (a:P) WHERE NOT EXISTS { MATCH (a)-[:R]->()-[:R]->(b) WHERE b.n = 7 } RETURN count(*) AS c",
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:R]->()-[:R]->()-[:R]->(b) WHERE b.n = 7 } RETURN count(*) AS c",
+        // Mixed directions along the chain, so reversing has to flip each hop.
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:R]->()<-[:R]-(b) WHERE b.n = 7 } RETURN count(*) AS c",
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)<-[:R]-()-[:R]->(b) WHERE b.n = 7 } RETURN count(*) AS c",
+        // Different types per hop, and a type nothing carries.
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:S]->()-[:R]->(b) WHERE b.n = 7 } RETURN count(*) AS c",
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:NOPE]->()-[:R]->(b) WHERE b.n = 7 } RETURN count(*) AS c",
+        // An INTERMEDIATE node that is constrained — a backward walk keeps no
+        // rows to filter, so this must decline.
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:R]->(m:W)-[:R]->(b) WHERE b.n = 7 } RETURN count(*) AS c",
+        // The far end bound by an inline prop rather than a WHERE.
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:R]->()-[:R]->(b {n: 7}) } RETURN count(*) AS c",
     ] {
         assert_eq!(
             rows(&mut g, query),

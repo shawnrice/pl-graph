@@ -1328,6 +1328,66 @@ pub fn walk_ids(
 /// `None` for nothing, `Some(vec![])` for any — so its call site maps between
 /// them explicitly.)
 ///
+/// The vertices from which a chain of hops reaches `far` — a semi-join, walked
+/// BACKWARDS.
+///
+/// `EXISTS { (a)-[:T]->()-[:T]->(b) … }` and `where(__.out('T').out('T'))` are
+/// one question, and neither asks WHICH walk — only whether one exists. Run
+/// forward per row it is `O(rows · degree^hops)`: bounded by finding a single
+/// walk, but that bound is the whole tree exactly when no walk exists, which is
+/// the rows the caller is about to discard. Backwards it is
+/// `O(degree · |level|)` per hop and visits each vertex once per level.
+///
+/// `far` is the far end the caller already narrowed — the language's own filter
+/// on the last node, which is the part that is NOT shared. Everything after it
+/// is: both engines walk the same adjacency the same way.
+///
+/// Returns a per-vertex-slot bitmap; index it with a vertex id.
+#[must_use]
+pub fn reach_back(
+    graph: &Graph,
+    hops: &[(Dir, Option<Vec<u32>>)],
+    far: Vec<bool>,
+    loops: SelfLoops,
+) -> Vec<bool> {
+    let mut level = far;
+
+    for (dir, etypes) in hops.iter().rev() {
+        // THIS module's convention, the one `walk` and `walk_count` use: `None`
+        // is ANY type and `Some(&[])` is NO type. Gremlin's `resolve_etypes` is
+        // the INVERSE of it, so its caller converts — getting that backwards
+        // turns "matches nothing" into "matches everything", which is not a
+        // subtle wrong answer.
+        if etypes.as_ref().is_some_and(Vec::is_empty) {
+            return vec![false; level.len()];
+        }
+
+        let etypes = etypes.as_deref().unwrap_or(&[]);
+        let mut prev = vec![false; level.len()];
+
+        for (v, reached) in level.iter().enumerate() {
+            if !reached {
+                continue;
+            }
+
+            // The hop is `x -dir-> v`, so walk `v` the other way to find `x`.
+            let back = match dir {
+                Dir::Out => Dir::In,
+                Dir::In => Dir::Out,
+                Dir::Both => Dir::Both,
+            };
+
+            for a in adj(graph, v as u32, back, etypes, loops) {
+                prev[a.nbr as usize] = true;
+            }
+        }
+
+        level = prev;
+    }
+
+    level
+}
+
 /// A hop with a filter on its node or edge cannot come here — the rows have to
 /// exist to be filtered — so the caller lowers only bare hops.
 #[must_use]

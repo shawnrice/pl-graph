@@ -806,51 +806,33 @@ fn semi_join_test<'a>(graph: &'a Graph, steps: &[Step]) -> Option<Box<dyn Fn(u32
 /// above. `where` keeps the members, `not` keeps everyone else, and neither
 /// needs to know WHICH walk.
 fn semi_join_reach(graph: &Graph, chain: &[SemiJoin]) -> Vec<bool> {
-    let n = graph.vertex_slots();
     let last = chain.last().expect("a chain has at least one hop");
-    // The far end: everything the landed test admits.
-    let mut level: Vec<bool> = (0..n)
+    // The far end is the part that is NOT shared: the landed test is Gremlin's.
+    let far: Vec<bool> = (0..graph.vertex_slots())
         .map(|v| {
             let v = v as u32;
 
             graph.is_vertex_live(v) && landed_ok(graph, last, v)
         })
         .collect();
+    // Gremlin's type-set convention is the INVERSE of `seek`'s: `resolve_etypes`
+    // gives `None` for "every name was unknown" (matches nothing) and
+    // `Some(&[])` for "no names given" (any type), where `seek` reads `None` as
+    // ANY. `semi_join_chain` has already declined the `None` case, so what is
+    // left maps by turning Gremlin's empty-means-any into `seek`'s none-means-any.
+    let hops: Vec<(crate::seek::Dir, Option<Vec<u32>>)> = chain
+        .iter()
+        .map(|h| {
+            let etypes = match h.etypes.as_deref() {
+                None | Some([]) => None,
+                Some(ids) => Some(ids.to_vec()),
+            };
 
-    for hop in chain.iter().rev() {
-        let mut prev = vec![false; n];
+            (h.dir, etypes)
+        })
+        .collect();
 
-        for (v, reached) in level.iter().enumerate() {
-            if !reached {
-                continue;
-            }
-
-            // Predecessors: the hop is `x -dir-> v`, so walk `v` the other way.
-            for a in crate::seek::adj(
-                graph,
-                v as u32,
-                flip_dir(hop.dir),
-                hop.etypes.as_deref().unwrap_or(&[]),
-                crate::seek::SelfLoops::Twice,
-            ) {
-                prev[a.nbr as usize] = true;
-            }
-        }
-
-        level = prev;
-    }
-
-    level
-}
-
-/// A hop direction reversed, for walking a chain backwards. `Both` is its own
-/// reverse.
-fn flip_dir(d: crate::seek::Dir) -> crate::seek::Dir {
-    match d {
-        crate::seek::Dir::Out => crate::seek::Dir::In,
-        crate::seek::Dir::In => crate::seek::Dir::Out,
-        crate::seek::Dir::Both => crate::seek::Dir::Both,
-    }
+    crate::seek::reach_back(graph, &hops, far, crate::seek::SelfLoops::Twice)
 }
 
 /// Whether vertex `v` satisfies a hop's landed test.
