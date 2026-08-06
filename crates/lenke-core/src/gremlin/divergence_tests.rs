@@ -3526,6 +3526,16 @@ fn zzz_lower_probe() {
             "g.V().hasLabel('V').elementMap()",
         ),
         (
+            "the edges, rendered",
+            "MATCH ()-[r:R]->() RETURN r",
+            "g.E().hasLabel('R').elementMap()",
+        ),
+        (
+            "does any edge of a type exist",
+            "MATCH ()-[:R]->() RETURN 1 AS x LIMIT 1",
+            "g.E().hasLabel('R').limit(1).count()",
+        ),
+        (
             "a property of a filtered scan",
             "MATCH (u:V) WHERE u.n > 50 RETURN u.n AS n",
             "g.V().hasLabel('V').has('n', gt(50)).values('n')",
@@ -3824,4 +3834,109 @@ fn projected_rows_share_keys_without_sharing_values() {
         names.len(),
         "rows shared a value vector: {names:?}"
     );
+}
+
+// --- a leading LIMIT bounds the scan, and only where it may ------------------
+
+/// A capped scan must return the same ids, in the same order, as scanning
+/// everything and slicing — including when a property filter is what decides
+/// which rows survive, since the cap counts SURVIVORS rather than candidates.
+#[test]
+fn a_capped_scan_agrees_with_scanning_and_slicing() {
+    let mut lines = String::new();
+
+    for i in 0..200usize {
+        let l = if i % 5 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{}}}}}\n",
+            i % 7
+        ));
+    }
+    for i in 0..200usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"edge\",\"id\":\"e{i}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{\"w\":{}}}}}\n",
+            (i * 7 + 1) % 200,
+            i % 3
+        ));
+    }
+
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+    let run = |g: &mut Graph, src: &str| -> Vec<String> {
+        super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(g)
+            .iter()
+            .map(|v| format!("{v:?}"))
+            .collect()
+    };
+
+    for source in [
+        "g.V().hasLabel('V')",
+        "g.V().hasLabel('W')",
+        "g.V().has('n', 3)",
+        "g.E().hasLabel('R')",
+        "g.E().has('w', 1)",
+    ] {
+        let all = run(&mut g, &format!("{source}.id()"));
+
+        for k in [0usize, 1, 5, 40, 1000] {
+            assert_eq!(
+                run(&mut g, &format!("{source}.limit({k}).id()")),
+                all[..k.min(all.len())].to_vec(),
+                "{source}.limit({k}) disagreed with the full scan"
+            );
+        }
+        assert_eq!(
+            run(&mut g, &format!("{source}.range(3, 11).id()")),
+            all[3..11.min(all.len())].to_vec()
+        );
+        // Neither of these bounds the scan from the top; both must still be right.
+        assert_eq!(
+            run(&mut g, &format!("{source}.skip(190).id()")),
+            all[190.min(all.len())..].to_vec()
+        );
+        assert_eq!(
+            run(&mut g, &format!("{source}.tail(3).id()")),
+            all[all.len() - 3..].to_vec()
+        );
+        // The count of a capped scan is the cap, not the bucket.
+        assert_eq!(
+            run(&mut g, &format!("{source}.limit(1).count()")),
+            vec!["Num(1.0)".to_string()]
+        );
+    }
+}
+
+/// A hop between the source and the LIMIT means the cap is not the scan's — the
+/// frontier it bounds is the one AFTER the walk.
+#[test]
+fn a_limit_past_a_hop_does_not_cap_the_scan() {
+    let mut lines = String::new();
+
+    // Every edge leaves the LAST vertex. A scan capped at 3 would keep the first
+    // three, which have no out-edges at all, and answer 0 where the right answer
+    // is 3 — the fixture has to put the edges where a wrongly capped scan cannot
+    // reach them, or capping and not capping agree by luck.
+    for i in 0..4usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{{}}}}\n"
+        ));
+    }
+    for (i, (a, b)) in [(3, 0), (3, 1), (3, 2), (3, 3)].iter().enumerate() {
+        lines.push_str(&format!(
+            "{{\"type\":\"edge\",\"id\":\"e{i}\",\"from\":\"n{a}\",\"to\":\"n{b}\",\"labels\":[\"R\"],\"properties\":{{}}}}\n"
+        ));
+    }
+
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    // Four edges, so four traversers land; the limit takes three of them.
+    assert_eq!(count_of(&mut g, "g.V().out('R').limit(3).count()"), 3.0);
+    assert_eq!(count_of(&mut g, "g.V().out('R').limit(10).count()"), 4.0);
+    assert_eq!(count_of(&mut g, "g.V().out('R').range(1, 3).count()"), 2.0);
 }

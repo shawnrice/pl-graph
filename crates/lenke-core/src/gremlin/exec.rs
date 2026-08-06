@@ -1080,14 +1080,39 @@ fn lowered_ids<'a>(graph: &Graph, steps: &'a [Step]) -> Option<(Vec<u32>, &'a [S
                     | Step::Skip(..)
                     | Step::Range(..)
                     | Step::Tail(..)
+                    // The map steps, added with their arms. An edge map is the
+                    // expensive one — eight keys where a vertex has three, and
+                    // the endpoint stubs on top — so leaving them out would have
+                    // kept exactly the case the arm was written for.
+                    | Step::ElementMap(_)
+                    | Step::Project(..)
             )
         )
     {
         return None; // edge-to-edge navigation is not this shape
     }
 
-    let ids = seek.scan(graph, &no_params, || universe(graph, is_edge));
     let (hops, rest) = lower_hops(graph, &steps[read..]);
+    // A LIMIT with nothing between it and the source bounds the SCAN, not just
+    // its output. `g.E().hasLabel('R').limit(1).count()` — is there an edge of
+    // this type at all — built the whole 60k-edge frontier and then took one of
+    // it. `scan_capped` stops as soon as that many rows SURVIVE the filters,
+    // which is the same rows in the same order, since both take the buckets in
+    // bucket order.
+    //
+    // Only with no hop in between (a hop off a truncated frontier is a different
+    // frontier) and only for the forms that bound from the TOP — `tail(n)` is the
+    // LAST n and `skip(n)` needs everything it skips.
+    let cap = match rest {
+        _ if !hops.is_empty() => None,
+        [Step::Limit(n, Scope::Global), ..] => Some(*n),
+        [Step::Range(_, hi, Scope::Global), ..] => Some(*hi),
+        _ => None,
+    };
+    let ids = match cap {
+        Some(c) => seek.scan_capped(graph, &no_params, Some(c), || universe(graph, is_edge)),
+        None => seek.scan(graph, &no_params, || universe(graph, is_edge)),
+    };
     let edges = is_edge && hops.is_empty();
 
     // The shared streaming walk. This engine's `Hop` spells the type set the
