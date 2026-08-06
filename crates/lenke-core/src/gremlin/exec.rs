@@ -1756,19 +1756,12 @@ fn column_terminal(
 /// `.tail(5)` — fell through even though each part was covered.
 fn gval_column_terminal(mut out: Vec<GVal>, tail: &[Step]) -> Option<Vec<GVal>> {
     match tail {
+        // The peel arms below each end here, so a paging step that IS the whole
+        // tail needs no arm of its own — `[Limit(n)]` is `[Limit(n), t @ ..]` with
+        // `t` empty, and was written out separately for every pager and for
+        // `dedup` and `dedup().count()` besides. Five arms saying what four
+        // already said.
         [] => Some(out),
-        // See the numeric arms: paging over a column is a slice.
-        [Step::Limit(n, Scope::Global)] => {
-            out.truncate(*n);
-            Some(out)
-        }
-        [Step::Skip(n, Scope::Global)] => Some(out.split_off((*n).min(out.len()))),
-        [Step::Range(lo, hi, Scope::Global)] => {
-            let mut v = out.split_off((*lo).min(out.len()));
-
-            v.truncate(hi.saturating_sub(*lo));
-            Some(v)
-        }
         [Step::Fold] => Some(vec![GVal::list(out)]),
         #[allow(clippy::cast_precision_loss)]
         [Step::Count(Scope::Global)] => Some(vec![GVal::Num(out.len() as f64)]),
@@ -1778,20 +1771,6 @@ fn gval_column_terminal(mut out: Vec<GVal>, tail: &[Step]) -> Option<Vec<GVal>> 
         // the equivalent GQL grouped count.
         [Step::GroupCount(bys)] if is_identity_by(bys) => {
             Some(vec![GVal::map(tally_group_count(out.into_iter()))])
-        }
-        // ...and the same for `dedup()`, which was 21.7x against GQL's columnar
-        // DISTINCT for exactly the same reason: a traverser per value, built to
-        // read the value back out.
-        [Step::Dedupe { labels, bys }] if labels.is_empty() && bys.is_empty() => {
-            Some(distinct_values(out.into_iter()))
-        }
-        #[allow(clippy::cast_precision_loss)]
-        [Step::Dedupe { labels, bys }, Step::Count(Scope::Global)]
-            if labels.is_empty() && bys.is_empty() =>
-        {
-            Some(vec![GVal::Num(
-                distinct_values(out.into_iter()).len() as f64
-            )])
         }
         // Peel one column-expressible step and let the arms above answer the
         // rest — see `composed_num_terminal` for why this is a peel rather than
