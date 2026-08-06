@@ -3312,3 +3312,107 @@ fn keyed_terminals_and_select_match_the_stream() {
         "[Num(3.0)]"
     );
 }
+
+/// A MULTI-HOP `where`/`not` body walked backwards agrees with running it.
+///
+/// One hop probes an adjacency; several had no adjacency to probe, so the body
+/// ran per traverser and built a traverser per intermediate —
+/// `g.V().where(__.out('R').out('R')).count()` cost 5.1ms over 20k vertices.
+/// Backwards it is one level per hop and no tree: 0.881ms, and 0.169ms once a
+/// property narrows the far end.
+///
+/// Forward-per-row is bounded by finding ONE walk, but that bound is the whole
+/// `degree^hops` tree exactly when no walk exists — which is the rows a `where`
+/// discards and a `not` keeps. So the two must agree precisely there, which is
+/// what the isolated and dead-ended vertices in this fixture are for.
+#[test]
+fn a_multi_hop_semi_join_agrees_with_running_the_body() {
+    let mut g = crate::ndjson::decode(
+        &[
+            // A 3-chain: a -> b -> c -> d, so `a` has 3 hops, `b` has 2, `c` 1.
+            r#"{"type":"node","id":"a","labels":["P"],"properties":{"n":1}}"#,
+            r#"{"type":"node","id":"b","labels":["P"],"properties":{"n":2}}"#,
+            r#"{"type":"node","id":"c","labels":["P","W"],"properties":{"n":3}}"#,
+            r#"{"type":"node","id":"d","labels":["P"],"properties":{"n":7}}"#,
+            // Isolated: no walk of any length.
+            r#"{"type":"node","id":"e","labels":["P"],"properties":{"n":7}}"#,
+            // A SELF LOOP, which has a walk of every length.
+            r#"{"type":"node","id":"f","labels":["P"],"properties":{"n":1}}"#,
+            r#"{"type":"edge","id":"r0","labels":["R"],"from":"a","to":"b","properties":{}}"#,
+            r#"{"type":"edge","id":"r1","labels":["R"],"from":"b","to":"c","properties":{}}"#,
+            r#"{"type":"edge","id":"r2","labels":["R"],"from":"c","to":"d","properties":{}}"#,
+            r#"{"type":"edge","id":"r3","labels":["R"],"from":"f","to":"f","properties":{}}"#,
+            // Another type, so a typed chain is not just "any edge".
+            r#"{"type":"edge","id":"s0","labels":["S"],"from":"a","to":"d","properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let run = |src: &str, g: &mut crate::graph::Graph| {
+        format!(
+            "{:?}",
+            super::parse::parse(src)
+                .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+                .run(g)
+        )
+    };
+
+    for body in [
+        "__.out('R').out('R')",
+        "__.out('R').out('R').out('R')",
+        "__.in('R').in('R')",
+        "__.both('R').both('R')",
+        // Mixed directions, where flipping the chain has to flip each hop.
+        "__.out('R').in('R')",
+        "__.in('R').out('R')",
+        // A landed test on the far end only.
+        "__.out('R').out('R').hasLabel('W')",
+        "__.out('R').out('R').has('n', 7)",
+        "__.out('R').out('R').has('n', 999)",
+        // An UNKNOWN edge type matches nothing, and must not read as "any".
+        "__.out('NOPE').out('R')",
+        "__.out('R').out('NOPE')",
+        // Mixed known and unknown on one hop is still the known one.
+        "__.out('R', 'NOPE').out('R')",
+        // Typed differently per hop.
+        "__.out('S').out('R')",
+        // The edge-spelled form of a hop.
+        "__.outE('R').inV().outE('R').inV()",
+        // `repeat` unrolls to the same chain.
+        "__.repeat(__.out('R')).times(2)",
+        // Bodies the chain cannot take, which must still answer.
+        "__.out('R').has('n', gt(1)).out('R')",
+        "__.out('R').count()",
+    ] {
+        for shape in [
+            format!("g.V().where({body}).values('n')"),
+            format!("g.V().not({body}).values('n')"),
+            format!("g.V().where({body}).count()"),
+        ] {
+            let streamed = shape.replacen("g.V()", "g.V().barrier()", 1);
+
+            assert_eq!(
+                run(&shape, &mut g),
+                run(&streamed, &mut g),
+                "`{shape}` disagrees with running the body"
+            );
+        }
+    }
+
+    // The answers themselves. Two hops of R exist from `a` (a→b→c) and from `f`
+    // (its own loop, twice); `b` reaches c→d; `c`, `d`, `e` do not.
+    assert_eq!(
+        run("g.V().where(__.out('R').out('R')).values('n')", &mut g),
+        "[Num(1.0), Num(2.0), Num(1.0)]"
+    );
+    // An unknown type reaches nothing at all.
+    assert_eq!(
+        run("g.V().where(__.out('NOPE').out('R')).count()", &mut g),
+        "[Num(0.0)]"
+    );
+    assert_eq!(
+        run("g.V().not(__.out('NOPE').out('R')).count()", &mut g),
+        "[Num(6.0)]"
+    );
+}

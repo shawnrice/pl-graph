@@ -2227,6 +2227,11 @@ impl Graph {
     pub fn edge_slots(&self) -> usize {
         self.e_src.len()
     }
+    /// Total vertex slots (including tombstoned) — the size a per-vertex bitmap
+    /// has to be. `vertex_count` is the LIVE count and indexes nothing.
+    pub fn vertex_slots(&self) -> usize {
+        self.n
+    }
     pub fn is_vertex_live(&self, v: u32) -> bool {
         self.v_live.get(v as usize).copied().unwrap_or(false)
     }

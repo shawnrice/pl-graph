@@ -769,6 +769,163 @@ fn lower_hops<'a>(graph: &Graph, mut rest: &'a [Step]) -> (Vec<Hop>, &'a [Step])
     (hops, rest)
 }
 
+/// A `where()`/`not()` body as a per-vertex test, or `None` when the adjacency
+/// cannot answer it.
+///
+/// ONE hop probes the adjacency per row and short-circuits on the first
+/// neighbour; SEVERAL walk the chain backwards ONCE and test membership. The
+/// split is about what each costs: the probe touches only the rows asked about,
+/// and the backward pass costs a level per hop but never explores a tree.
+fn semi_join_test<'a>(graph: &'a Graph, steps: &[Step]) -> Option<Box<dyn Fn(u32) -> bool + 'a>> {
+    if let Some(hop) = semi_join_hop(graph, steps) {
+        return Some(Box::new(move |id| {
+            has_adj(graph, &Trav::root(GVal::Node(id)), &hop)
+        }));
+    }
+
+    let reach = semi_join_reach(graph, &semi_join_chain(graph, steps)?);
+
+    Some(Box::new(move |id| {
+        reach.get(id as usize).copied().unwrap_or(false)
+    }))
+}
+
+/// The vertices from which a chain of hops has at least one walk, computed
+/// BACKWARDS.
+///
+/// A body of several hops has no single adjacency to probe, so `where(…)` ran
+/// the sub-traversal per traverser and built a traverser per intermediate:
+/// `g.V().where(__.out('R').out('R')).count()` cost 5.1ms over 20k vertices with
+/// two out-edges each.
+///
+/// Running it FORWARD per row is O(rows · degree^hops) — bounded by finding one
+/// walk, but the bound is the whole tree when no walk exists, which is exactly
+/// the rows a `where` discards. Backwards it is O(degree · |level|) per hop and
+/// visits each vertex once per level: start from the vertices that satisfy the
+/// LAST hop's landed test, then repeatedly take the predecessors under the hop
+/// above. `where` keeps the members, `not` keeps everyone else, and neither
+/// needs to know WHICH walk.
+fn semi_join_reach(graph: &Graph, chain: &[SemiJoin]) -> Vec<bool> {
+    let n = graph.vertex_slots();
+    let last = chain.last().expect("a chain has at least one hop");
+    // The far end: everything the landed test admits.
+    let mut level: Vec<bool> = (0..n)
+        .map(|v| {
+            let v = v as u32;
+
+            graph.is_vertex_live(v) && landed_ok(graph, last, v)
+        })
+        .collect();
+
+    for hop in chain.iter().rev() {
+        let mut prev = vec![false; n];
+
+        for (v, reached) in level.iter().enumerate() {
+            if !reached {
+                continue;
+            }
+
+            // Predecessors: the hop is `x -dir-> v`, so walk `v` the other way.
+            for a in crate::seek::adj(
+                graph,
+                v as u32,
+                flip_dir(hop.dir),
+                hop.etypes.as_deref().unwrap_or(&[]),
+                crate::seek::SelfLoops::Twice,
+            ) {
+                prev[a.nbr as usize] = true;
+            }
+        }
+
+        level = prev;
+    }
+
+    level
+}
+
+/// A hop direction reversed, for walking a chain backwards. `Both` is its own
+/// reverse.
+fn flip_dir(d: crate::seek::Dir) -> crate::seek::Dir {
+    match d {
+        crate::seek::Dir::Out => crate::seek::Dir::In,
+        crate::seek::Dir::In => crate::seek::Dir::Out,
+        crate::seek::Dir::Both => crate::seek::Dir::Both,
+    }
+}
+
+/// Whether vertex `v` satisfies a hop's landed test.
+fn landed_ok(graph: &Graph, hop: &SemiJoin, v: u32) -> bool {
+    let label_ok = match &hop.landed {
+        None => true,
+        Some(want) => graph.vertex_labels(v).iter().any(|lid| want.contains(lid)),
+    };
+
+    label_ok
+        && match &hop.prop {
+            None => true,
+            Some((kid, want)) => {
+                GVal::from_column(&graph.props, *kid, v as usize, &graph.strs, false) == *want
+            }
+        }
+}
+
+/// A `where()`/`not()` body of SEVERAL hops, as the chain it walks.
+///
+/// One hop keeps [`semi_join_hop`]: probing an adjacency per row short-circuits
+/// on the first neighbour and touches nothing else, where the backward pass
+/// always costs a level per hop.
+fn semi_join_chain(graph: &Graph, steps: &[Step]) -> Option<Vec<SemiJoin>> {
+    let (hops, rest) = lower_hops(graph, steps);
+
+    // Each hop is a full backward pass over the reached level, so a LONG chain
+    // costs depth × O(V+E) whether or not any walk exists. `lower_hops` unrolls
+    // `repeat(…).times(n)`, so `n` is user input and this is the only thing
+    // bounding it — without the cap a large `times` turned a bounded stream walk
+    // (which has `REPEAT_BUDGET`) into an unbounded one here.
+    //
+    // Past a few hops the reached level is usually most of the graph anyway, so
+    // the backward pass stops paying and the streamed body is the honest answer.
+    const MAX_CHAIN: usize = 8;
+
+    if hops.len() < 2 || hops.len() > MAX_CHAIN {
+        return None;
+    }
+
+    // The landed test rides on the LAST hop; the rest are bare.
+    let (landed, prop) = match rest {
+        [] => (None, None),
+        [Step::HasLabel(names)] => (
+            Some(names.iter().filter_map(|l| graph.labels.get(l)).collect()),
+            None,
+        ),
+        [Step::Has(key, P::Eq(v))] => (None, Some((graph.props.keys.get(key)?, v.clone()))),
+        _ => return None,
+    };
+    // `None` from `resolve_etypes` means every name was unknown, so the hop
+    // matches NOTHING — and the walk below spells "any type" as an empty slice,
+    // which is the opposite answer. Decline rather than encode it; the stream
+    // gets it right without help, exactly as `semi_join_hop` decides.
+    if hops.iter().any(|(_, e)| e.is_none()) {
+        return None;
+    }
+
+    let mut chain: Vec<SemiJoin> = hops
+        .into_iter()
+        .map(|(dir, etypes)| SemiJoin {
+            dir,
+            etypes,
+            landed: None,
+            prop: None,
+        })
+        .collect();
+    let last = chain.last_mut()?;
+
+    last.landed = landed;
+    last.prop = prop;
+
+    Some(chain)
+}
+
 /// Does this traverser have an edge matching `hop`?
 ///
 /// A non-vertex traverser has none: the hop would yield nothing, so the
@@ -1154,22 +1311,14 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
         // Only from a VERTEX frontier: `has_adj` walks a vertex's adjacency, and
         // an edge id read as one would walk whatever vertex shares its number.
         [Step::Where(sub), t @ ..] if !is_edge => {
-            let hop = semi_join_hop(graph, &sub.steps)?;
-            let kept: Vec<u32> = ids
-                .iter()
-                .copied()
-                .filter(|&id| has_adj(graph, &Trav::root(GVal::Node(id)), &hop))
-                .collect();
+            let keep = semi_join_test(graph, &sub.steps)?;
+            let kept: Vec<u32> = ids.iter().copied().filter(|&id| keep(id)).collect();
 
             column_paths(graph, &kept, is_edge, t)
         }
         [Step::Not(sub), t @ ..] if !is_edge => {
-            let hop = semi_join_hop(graph, &sub.steps)?;
-            let kept: Vec<u32> = ids
-                .iter()
-                .copied()
-                .filter(|&id| !has_adj(graph, &Trav::root(GVal::Node(id)), &hop))
-                .collect();
+            let keep = semi_join_test(graph, &sub.steps)?;
+            let kept: Vec<u32> = ids.iter().copied().filter(|&id| !keep(id)).collect();
 
             column_paths(graph, &kept, is_edge, t)
         }

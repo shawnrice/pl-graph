@@ -187,7 +187,13 @@ const preds = [eq, gt, gte, lt, lte];
 // `g.V().both('KNOWS','NOPE').hasLabel('PERSON').fold()` returned the same six
 // vertices from each engine in different orders, a false divergence that made
 // this suite red about one run in fifty.
-const MULTI_TYPE_STEP = /\b(?:out|in|both)E?\('[^']*'(?:,\s*'[^']*')+\)/;
+// A `both`/`bothE` step of ANY arity belongs here too, and for the same reason
+// one step over: it walks TWO directions, and the engines disagree about which
+// comes first (native makes one adjacency pass, out-edges then in-edges; the TS
+// engine walks its own). `both('CREATED').values('name').groupCount()` returned
+// the same three counts from each engine keyed in different FIRST-SEEN order —
+// a false divergence, and one that needs no second type name to appear.
+const MULTI_TYPE_STEP = /\b(?:out|in|both)E?\('[^']*'(?:,\s*'[^']*')+\)|\bbothE?\(/;
 
 /**
  * Sort a result list when its order is unspecified; otherwise leave it.
