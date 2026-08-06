@@ -367,6 +367,50 @@ impl Value {
     }
 }
 
+/// The extreme of `values` under `cmp` — `min`/`max` for both languages.
+///
+/// Nulls are skipped: neither language's `min`/`max` considers one a candidate
+/// (GQL filters them upstream, TinkerPop ignores them), so the rule is the same
+/// and lives here once.
+///
+/// `cmp` is NOT. Ordering is a per-language contract — GQL's `cmp_total` puts
+/// nulls last and NaN greatest, Gremlin's raises a type fault on a cross-type
+/// pair before falling back to `gcmp_total` — so the comparator is the argument
+/// and the FOLD is shared. That split is the whole point: it was three copies of
+/// this loop, and the third had drifted.
+///
+/// The drift: `min(local)` used `cmp_or_fault(..) == Some(want)` with no total
+/// fallback, so a NaN answered `None`, never matched `want`, and whichever NaN
+/// arrived first held `best` forever. `math('sqrt _').min()` gave 2.0 and
+/// `math('sqrt _').fold().min(local)` gave NaN — the same question, two scopes,
+/// two answers.
+pub fn fold_extreme(
+    values: impl IntoIterator<Item = Value>,
+    want: std::cmp::Ordering,
+    mut cmp: impl FnMut(&Value, &Value) -> std::cmp::Ordering,
+) -> Value {
+    let mut best: Option<Value> = None;
+
+    for v in values {
+        if matches!(v, Value::Null) {
+            continue;
+        }
+
+        best = Some(match best {
+            None => v,
+            Some(b) => {
+                if cmp(&v, &b) == want {
+                    v
+                } else {
+                    b
+                }
+            }
+        });
+    }
+
+    best.unwrap_or(Value::Null)
+}
+
 /// TinkerPop equality — see the module docs. NOT ISO equality.
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {

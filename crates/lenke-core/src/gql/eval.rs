@@ -2380,16 +2380,11 @@ fn percentile(values: &[Val], frac: f64, cont: bool) -> Val {
 }
 
 fn fold_extreme(values: Vec<Val>, want: Ordering) -> Val {
-    let mut it = values.into_iter();
-    let Some(mut acc) = it.next() else {
-        return Val::Null;
-    };
-    for v in it {
-        if cmp_total(&v, &acc) == want {
-            acc = v;
-        }
-    }
-    acc
+    // The fold is shared; the COMPARATOR is the per-language part. `cmp_total`
+    // orders nulls last and NaN greatest, which is GQL's contract and not
+    // Gremlin's. Nulls are already filtered out of `values` upstream, so the
+    // shared skip is a no-op here.
+    crate::value::fold_extreme(values, want, cmp_total)
 }
 
 // --- scalar functions (dispatched on the resolved enum) ---

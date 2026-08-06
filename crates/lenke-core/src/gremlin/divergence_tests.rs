@@ -3037,3 +3037,79 @@ fn every_temporal_constructor_parses_through_the_shared_dispatch() {
 
     assert!(unknown.is_err(), "an unknown constructor must not parse");
 }
+
+/// `min`/`max` answer the same whatever the SCOPE, and a NaN never wins a `min`.
+///
+/// There were three copies of the fold-to-an-extreme loop — Gremlin's global,
+/// Gremlin's `local`, and GQL's — and the third had drifted. `local` compared
+/// with `cmp_or_fault(..) == Some(want)` and nothing else, so a NaN answered
+/// `None`, never matched `want`, and whichever NaN arrived first held the
+/// extreme forever:
+///
+/// ```text
+///   math('sqrt _').min()                 2.0
+///   math('sqrt _').fold().min(local)     NaN
+/// ```
+///
+/// One question, two scopes, two answers. The fold is shared now
+/// (`crate::value::fold_extreme`) and only the comparator is per-language, so
+/// the scopes cannot disagree again.
+#[test]
+fn an_extreme_is_the_same_in_every_scope() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"m":-1}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"m":4}}"#,
+            r#"{"type":"node","id":"c","labels":["V"],"properties":{"m":9}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let run = |src: &str, g: &mut crate::graph::Graph| {
+        format!(
+            "{:?}",
+            super::parse::parse(src)
+                .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+                .run(g)
+        )
+    };
+
+    // `sqrt(-1)` is a NaN; the other two are 2 and 3.
+    let nums = "g.V().values('m').math('sqrt _')";
+
+    // NaN is the GREATEST value, so `min` never picks it and `max` always does —
+    // in BOTH scopes.
+    assert_eq!(run(&format!("{nums}.min()"), &mut g), "[Num(2.0)]");
+    assert_eq!(
+        run(&format!("{nums}.fold().min(local)"), &mut g),
+        "[Num(2.0)]"
+    );
+    assert_eq!(run(&format!("{nums}.max()"), &mut g), "[Num(NaN)]");
+    assert_eq!(
+        run(&format!("{nums}.fold().max(local)"), &mut g),
+        "[Num(NaN)]"
+    );
+
+    // Without a NaN the two scopes already agreed; asserted so a future change
+    // cannot fix one and break the other.
+    let plain = "g.V().values('m')";
+
+    assert_eq!(run(&format!("{plain}.min()"), &mut g), "[Num(-1.0)]");
+    assert_eq!(
+        run(&format!("{plain}.fold().min(local)"), &mut g),
+        "[Num(-1.0)]"
+    );
+    assert_eq!(run(&format!("{plain}.max()"), &mut g), "[Num(9.0)]");
+    assert_eq!(
+        run(&format!("{plain}.fold().max(local)"), &mut g),
+        "[Num(9.0)]"
+    );
+
+    // An empty fold is null, not an error, in both scopes.
+    assert_eq!(run("g.V().values('nope').min()", &mut g), "[Null]");
+    assert_eq!(
+        run("g.V().values('nope').fold().min(local)", &mut g),
+        "[Null]"
+    );
+}

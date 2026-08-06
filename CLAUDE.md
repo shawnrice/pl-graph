@@ -96,3 +96,17 @@ storage, ordering or codecs needs the fuzzers, not just the unit tests:
 cd packages/native && FUZZ_SEED=<n> bun test src/codec-fuzz.test.ts \
   src/differential-fuzz.test.ts src/write-fuzz.test.ts src/injection-fuzz.test.ts
 ```
+
+`backend-parity-fuzz` compares the wasm build against the FFI build, and
+**neither `bun run build` nor `cargo build` rebuilds the wasm** — only
+`cd packages/native && bun run build:wasm` does. A stale `lenke_core.wasm`
+turns that fuzzer into a comparison between your change and an old copy of
+itself: it reports failures you did not cause and passes you did not earn.
+Found with the artifact two days behind the `.so`, after chasing a `max()`
+"divergence" that was the previous build. Rebuild it before trusting that
+suite, and check the timestamps if it says something surprising:
+
+```
+stat -c '%y %n' crates/lenke-core/target/release/liblenke_core.so \
+  crates/lenke-core/target/wasm32-unknown-unknown/release/lenke_core.wasm
+```

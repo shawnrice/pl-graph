@@ -1098,6 +1098,73 @@ operation in both languages. `crate::seek::adj` was NOT shared into the count
 shortcuts, because there the shared thing was only the loop, and it cost 1.5-1.6x
 (b1e5610). Share the operation; leave the implementation alone.
 
+## Where the sharing stops, and what would move it
+
+**2026-08-05.** Four routes were tried in one sitting, each aimed at making
+Gremlin share more of the IR so its own code could be deleted. All four are
+recorded at the code they would have changed; this is the shape they have in
+common, because the next attempt will hit the same two walls.
+
+The census first, so the target is concrete. Counting which branch answers each
+traversal across the whole suite:
+
+```text
+  try_count  71    try_values 365    pattern column 156    streamed 790
+```
+
+The old Gremlin path answers 436 against the pattern path's 156. It is the only
+large consolidation left, and every route into it is blocked by one of two
+things.
+
+**Wall 1 — the specialized path beats the general one, for its shape.**
+
+Routing unconstrained hops through the shared planner: 0.578ms to produce the
+ids for `()-[:R]->(b)` where the old path does the whole `V.out(R).count()` in
+0.188ms. Adding a walk route to the shared entry (`seek::walk_ids`, skipping the
+frame) got it to 0.276ms — still short, and end to end every shape regressed
+(0.188 -> 0.284, 0.353 -> 0.415). What remains is not the frame: it is `compile`
+plus a `Ctx` plus a materialized id column, against a path that walks and counts
+in place.
+
+This is not a Gremlin-vs-GQL fact. GQL does the same thing to itself: a plain
+`MATCH … RETURN` deliberately stays on the SCALAR entry so `LIMIT n` keeps its
+row-by-row early-out, and never touches the columnar projection at all. Both
+engines are collections of shape-specialized paths. Merging two such collections
+produces one general path that is slower than either.
+
+**Wall 2 — the semantics diverge exactly where the code looks the same.**
+
+Every apparent duplicate turned out to be two different contracts:
+
+- `fold_extreme` — TinkerPop's `min`/`max` skip nulls; GQL's order them.
+- `dedup_key` vs `val_key` — a hashable enum where a NaN is never a duplicate,
+  against a string key where NaNs group.
+- the numeric column fold — GQL folds DURING the gather over three id tiers,
+  Gremlin folds a materialized slice.
+- `order()` — nulls first (TinkerPop), nulls last (ISO).
+
+Merging any of them means picking one language's answer for both.
+
+**What moves it: policy on the IR, not in the code.**
+
+There is already a worked example in the tree. `Ctx::loops`
+(`SelfLoops::Once`/`Twice`) is a per-language semantic — GQL counts a self-loop
+once on an undirected hop, Gremlin twice — expressed as a FLAG the shared walk
+reads. That single flag is what let `both()` lower at all; before it, the
+divergence looked like a reason the two could not share the hop.
+
+Everything in Wall 2 is the same shape of problem and has the same answer: a
+`NullPolicy` on an aggregate, a NaN rule on a grouping key, a null placement on
+a sort. Each one that becomes IR data instead of engine code makes the
+corresponding pair mergeable. `Value::finite_only` and `num_total_cmp` were both
+extracted this way and now have one definition each.
+
+Wall 1 does not yield to that, and should not be forced. The honest form of the
+goal is not "one path runs both languages" — it is "every per-language SEMANTIC
+lives in the IR, and each engine keeps the shape-specialized paths its own
+workloads need". The first is a slower engine; the second is what makes a fix
+land once.
+
 ## Not on the table
 
 Unifying the two surface languages. Users pick GQL or Gremlin, and the parallel

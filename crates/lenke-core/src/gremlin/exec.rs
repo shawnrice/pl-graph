@@ -4920,58 +4920,28 @@ fn local_num(v: &GVal, f: impl Fn(&[f64]) -> f64) -> GVal {
     }
 }
 
-fn fold_extreme(stream: Vec<Trav>, want: Ordering) -> Vec<Trav> {
-    let mut best: Option<GVal> = None;
-    for t in stream {
-        if matches!(t.val, GVal::Null) {
-            continue; // TinkerPop min/max ignore nulls
-        }
-        best = Some(match best {
-            None => t.val,
-            Some(b) => {
-                // `gcmp_total`, not `cmp_or_fault`: min/max are AGGREGATES, and
-                // the settled policy gives those a total order (NaN greatest,
-                // NaN == NaN) while predicates stay partial. Under the partial
-                // comparator a NaN was STICKY — `partial_cmp` answers None
-                // against it, which is never `want`, so whichever NaN arrived
-                // first held `best` forever and `min()` returned it. Measured
-                // over `math('sqrt _')` output: native NaN, TS 1.
-                //
-                // Cross-type pairs still fault: `cmp_or_fault` is called for the
-                // side effect, and its answer is only used to keep the previous
-                // behavior where it HAD one.
-                let faultable = cmp_or_fault(&t.val, &b);
+/// TinkerPop's ordering for an aggregate: a cross-type pair is a type FAULT,
+/// and everything else falls back to the total order.
+///
+/// `cmp_or_fault` is called for the side effect — that is what makes
+/// `min()` over a number and a string raise — and its answer is used only where
+/// it HAS one. A NaN gives it none, and the total order settles that (NaN
+/// greatest), which is why a NaN neither sticks nor wins a `min`.
+fn agg_cmp(a: &GVal, b: &GVal) -> Ordering {
+    cmp_or_fault(a, b).unwrap_or_else(|| gcmp_total(a, b))
+}
 
-                if faultable.unwrap_or_else(|| gcmp_total(&t.val, &b)) == want {
-                    t.val
-                } else {
-                    b
-                }
-            }
-        });
-    }
+fn fold_extreme(stream: Vec<Trav>, want: Ordering) -> Vec<Trav> {
     // No non-null value (empty or all-null) → a single null, matching TS.
-    vec![Trav::root(best.unwrap_or(GVal::Null))]
+    vec![Trav::root(crate::value::fold_extreme(
+        stream.into_iter().map(|t| t.val),
+        want,
+        agg_cmp,
+    ))]
 }
 
 fn local_extreme(v: &GVal, want: Ordering) -> GVal {
-    let mut best: Option<GVal> = None;
-    for e in local_elems(v) {
-        if matches!(e, GVal::Null) {
-            continue; // ignore nulls, like min/max
-        }
-        best = Some(match best {
-            None => e,
-            Some(b) => {
-                if cmp_or_fault(&e, &b) == Some(want) {
-                    e
-                } else {
-                    b
-                }
-            }
-        });
-    }
-    best.unwrap_or(GVal::Null)
+    crate::value::fold_extreme(local_elems(v), want, agg_cmp)
 }
 
 /// Insert a key chain into a nested tree map (for `tree()`).
