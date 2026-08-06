@@ -700,23 +700,29 @@ fn lower_hops<'a>(graph: &Graph, mut rest: &'a [Step]) -> (Vec<Hop>, &'a [Step])
 /// A non-vertex traverser has none: the hop would yield nothing, so the
 /// existence test is false — and `not()` therefore KEEPS it, which is what
 /// running the body does too.
-fn has_adj(graph: &Graph, t: &Trav, hop: &(crate::seek::Dir, Option<Vec<u32>>)) -> bool {
-    let (dir, etypes) = hop;
-
+fn has_adj(graph: &Graph, t: &Trav, hop: &SemiJoin) -> bool {
     match t.val {
         GVal::Node(v) => crate::seek::adj(
             graph,
             v,
-            *dir,
-            etypes.as_deref().unwrap_or(&[]),
+            hop.dir,
+            hop.etypes.as_deref().unwrap_or(&[]),
             // Either rule answers this identically: the question is whether such
             // an edge EXISTS, and a self-loop is seen at least once whether it is
             // yielded once or twice. Gremlin's rule anyway, so the line reads the
             // same as the rest.
             crate::seek::SelfLoops::Twice,
         )
-        .next()
-        .is_some(),
+        // Short-circuits on the first neighbour that passes, which is the point:
+        // the body is an existence test, so a high-degree vertex with an early
+        // match costs one edge rather than its whole adjacency.
+        .any(|a| match &hop.landed {
+            None => true,
+            Some(want) => graph
+                .vertex_labels(a.nbr)
+                .iter()
+                .any(|lid| want.contains(lid)),
+        }),
         _ => false,
     }
 }
@@ -732,15 +738,54 @@ fn has_adj(graph: &Graph, t: &Trav, hop: &(crate::seek::Dir, Option<Vec<u32>>)) 
 /// "no such edge" is a different answer from "any edge" and the caller's slow
 /// path gets it right without help. (`Some(vec![])` is ANY type: see
 /// `resolve_names`.)
-fn semi_join_hop(graph: &Graph, steps: &[Step]) -> Option<(crate::seek::Dir, Option<Vec<u32>>)> {
-    let (dir, labels) = match steps {
-        [Step::Out(l)] | [Step::OutE(l)] => (crate::seek::Dir::Out, l),
-        [Step::In(l)] | [Step::InE(l)] => (crate::seek::Dir::In, l),
-        [Step::Both(l)] | [Step::BothE(l)] => (crate::seek::Dir::Both, l),
+fn semi_join_hop(graph: &Graph, steps: &[Step]) -> Option<SemiJoin> {
+    // A VERTEX hop can carry a label test on where it landed; an EDGE hop cannot,
+    // because `outE('R').hasLabel('W')` tests the EDGE's label, not a vertex's.
+    // Both spellings answer a bare existence question identically (an out-edge
+    // exists exactly when an out-neighbour does), which is why they share the
+    // arms below — but only the vertex form may take the tail.
+    let (dir, labels, vertex_hop, tail) = match steps {
+        [Step::Out(l), tail @ ..] => (crate::seek::Dir::Out, l, true, tail),
+        [Step::In(l), tail @ ..] => (crate::seek::Dir::In, l, true, tail),
+        [Step::Both(l), tail @ ..] => (crate::seek::Dir::Both, l, true, tail),
+        [Step::OutE(l), tail @ ..] => (crate::seek::Dir::Out, l, false, tail),
+        [Step::InE(l), tail @ ..] => (crate::seek::Dir::In, l, false, tail),
+        [Step::BothE(l), tail @ ..] => (crate::seek::Dir::Both, l, false, tail),
+        _ => return None,
+    };
+    let etypes = Some(resolve_etypes(graph, labels)?);
+    // `hasLabel` on the landed VERTEX, which the adjacency can answer per
+    // neighbour.
+    //
+    // `Option`, not a bare `Vec`: an unknown name resolves to nothing —
+    // Gremlin's disjunction rule — so `hasLabel('NOPE')` is an EMPTY id list that
+    // must match no vertex, while NO `hasLabel` at all must match every one. A
+    // `Vec` alone spells both as empty and would have turned `hasLabel('NOPE')`
+    // into "any vertex", which is the opposite answer.
+    let landed = match tail {
+        [] => None,
+        [Step::HasLabel(names)] if vertex_hop => {
+            Some(names.iter().filter_map(|l| graph.labels.get(l)).collect())
+        }
+        // Anything else asks something the adjacency cannot answer on its own.
         _ => return None,
     };
 
-    Some((dir, Some(resolve_etypes(graph, labels)?)))
+    Some(SemiJoin {
+        dir,
+        etypes,
+        landed,
+    })
+}
+
+/// The adjacency question a `where()` / `not()` body asks, when it is one the
+/// adjacency can answer.
+struct SemiJoin {
+    dir: crate::seek::Dir,
+    etypes: Option<Vec<u32>>,
+    /// Label ids the landed vertex must carry ONE of. `None` = no label test;
+    /// `Some(vec![])` = a test no vertex can pass.
+    landed: Option<Vec<u32>>,
 }
 
 /// The element ids a lowered prefix plus expansion chain produces, and whatever
@@ -972,6 +1017,23 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
         [Step::GroupCount(bys)] if is_identity_by(bys) => Some(vec![GVal::map(tally_group_count(
             ids.into_iter().map(|id| frontier_val(id, is_edge)),
         ))]),
+        // `groupCount().by(k)` tallies a PROPERTY of each element, which is the
+        // same fold one column over — `prop` is the shared typed read the
+        // columnar path uses, so this never boxes an intermediate either.
+        //
+        // Only the identity form had an arm, so keying on a property built a
+        // `Trav` per element to run `eval_by` over: `out('R').groupCount().by('n')`
+        // cost 14.3ms over 150k against 1.26ms for the GQL spelling.
+        //
+        // A `by()` carrying an ORDER is a different step (it sorts the result),
+        // and a sub-traversal `by()` can read the path, so both stay on the
+        // stream — `single_key_by` accepts neither.
+        [Step::GroupCount(bys)] if let Some(key) = single_key_by(bys) => {
+            Some(vec![GVal::map(tally_group_count(
+                ids.into_iter()
+                    .map(|id| prop(graph, &frontier_val(id, is_edge), key)),
+            ))])
+        }
         // The frontier ITSELF. There was no arm for it, so
         // `g.V().hasLabel('V').out('R')` — a traversal with no terminal at all —
         // built a `Trav` per element to hand back the elements: 5.2ms for 150k,
@@ -985,6 +1047,38 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
         // rest — the same shape as the column terminals, for the same reason:
         // `dedup()` had an arm only when followed by `count()`, so `dedup()`
         // alone and `dedup().limit(5)` both streamed.
+        // A `where()` / `not()` whose body the ADJACENCY can answer is a filter on
+        // the frontier, so it peels like the paging steps do — the column stays a
+        // column and never becomes a stream.
+        //
+        // The stream form already short-circuits per vertex; what it cannot avoid
+        // is BUILDING one traverser per candidate first.
+        // `g.V().hasLabel('V').where(__.out('R').hasLabel('W')).count()` spent
+        // 2.67ms doing that over 50k vertices against 0.34ms for the GQL spelling
+        // of the same question, which counts a column throughout.
+        //
+        // Only from a VERTEX frontier: `has_adj` walks a vertex's adjacency, and
+        // an edge id read as one would walk whatever vertex shares its number.
+        [Step::Where(sub), t @ ..] if !is_edge => {
+            let hop = semi_join_hop(graph, &sub.steps)?;
+            let kept: Vec<u32> = ids
+                .iter()
+                .copied()
+                .filter(|&id| has_adj(graph, &Trav::root(GVal::Node(id)), &hop))
+                .collect();
+
+            column_paths(graph, &kept, is_edge, t)
+        }
+        [Step::Not(sub), t @ ..] if !is_edge => {
+            let hop = semi_join_hop(graph, &sub.steps)?;
+            let kept: Vec<u32> = ids
+                .iter()
+                .copied()
+                .filter(|&id| !has_adj(graph, &Trav::root(GVal::Node(id)), &hop))
+                .collect();
+
+            column_paths(graph, &kept, is_edge, t)
+        }
         [Step::Limit(n, Scope::Global), t @ ..] => {
             column_paths(graph, &ids[..(*n).min(ids.len())], is_edge, t)
         }
@@ -1316,6 +1410,18 @@ fn order_dir(bys: &[By], desc: bool) -> Option<Order> {
 
 /// Whether a `by` list is the argument-free form — the only one the lowered
 /// `groupCount` answers, since anything else evaluates a sub-traversal per row.
+/// The property key of a lone `by('k')` with no ordering, or `None`.
+///
+/// One `by()`, a bare key, no `Order`. A second modulator means the step does
+/// something else with it, and an `Order` makes the result sorted rather than
+/// tallied — neither is the fold below.
+fn single_key_by(bys: &[By]) -> Option<&str> {
+    match bys {
+        [By::Key(k, None)] => Some(k.as_str()),
+        _ => None,
+    }
+}
+
 fn is_identity_by(bys: &[By]) -> bool {
     bys.first().is_none_or(|b| matches!(b, By::Identity(None)))
 }

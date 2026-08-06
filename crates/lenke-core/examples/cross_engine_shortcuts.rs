@@ -200,6 +200,29 @@ fn main() {
             "try_orient_node_seed (via the E() desugar)",
         ),
         (
+            // A semi-join whose body is a hop PLUS a test on where it landed —
+            // the shape people write. The body reads the adjacency and the
+            // result stays a column; streamed, both cost 9.9ms.
+            "does a neighbour with a label exist",
+            "MATCH (a:V) WHERE EXISTS { MATCH (a)-[:R]->(b:W) } RETURN count(*) AS c",
+            "g.V().hasLabel('V').where(__.out('R').hasLabel('W')).count()",
+            "try_count_semi_join",
+        ),
+        (
+            "and does one NOT exist",
+            "MATCH (a:V) WHERE NOT EXISTS { MATCH (a)-[:R]->(b:W) } RETURN count(*) AS c",
+            "g.V().hasLabel('V').not(__.out('R').hasLabel('W')).count()",
+            "try_count_semi_join",
+        ),
+        (
+            // Tallying a PROPERTY off the frontier, where only the identity form
+            // had a column arm before.
+            "tally a hop by an endpoint property",
+            "MATCH ()-[:R]->(b) RETURN b.n AS k, count(*) AS c GROUP BY b.n",
+            "g.V().out('R').groupCount().by('n')",
+            "try_grouped_2hop",
+        ),
+        (
             "far-end property decides the seed",
             "MATCH ()-[:R]->(b) WHERE b.n = 7 RETURN count(*) AS c",
             "g.V().out('R').has('n', 7).count()",

@@ -2798,3 +2798,171 @@ fn ordering_places_nulls_first_without_faulting() {
         "ordering a null must not fault"
     );
 }
+
+/// A `where()` / `not()` the adjacency can answer filters the FRONTIER, and
+/// answers what running the body answers.
+///
+/// The body used to have to be one bare hop. A hop plus `hasLabel` on where it
+/// landed — the shape people write — fell to the stream, and so did the whole
+/// traversal around it: `g.V().hasLabel('V').where(__.out('R').hasLabel('W'))
+/// .count()` cost 9.9ms over 50k vertices against 0.33ms for the GQL spelling.
+/// Now the body reads the adjacency and the result stays a column, at 1.2ms.
+///
+/// `barrier()` defeats the column path, so each pair below is the same question
+/// asked twice, once lowered and once streamed.
+#[test]
+fn a_semi_join_over_the_frontier_matches_the_streamed_body() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"n":1}}"#,
+            // Multi-label, so `hasLabel` has to look past the first.
+            r#"{"type":"node","id":"b","labels":["X","W"],"properties":{"n":2}}"#,
+            r#"{"type":"node","id":"c","labels":["V","W"],"properties":{"n":3}}"#,
+            // No out-edges at all — the `not()` side.
+            r#"{"type":"node","id":"d","labels":["V"],"properties":{"n":4}}"#,
+            r#"{"type":"edge","id":"e0","labels":["R"],"from":"a","to":"b","properties":{}}"#,
+            r#"{"type":"edge","id":"e1","labels":["R"],"from":"a","to":"d","properties":{}}"#,
+            r#"{"type":"edge","id":"e2","labels":["S"],"from":"c","to":"b","properties":{}}"#,
+            // A SELF LOOP: `c` reaches a W (itself) without leaving.
+            r#"{"type":"edge","id":"e3","labels":["R"],"from":"c","to":"c","properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let run = |src: &str, g: &mut crate::graph::Graph| {
+        format!(
+            "{:?}",
+            super::parse::parse(src)
+                .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+                .run(g)
+        )
+    };
+
+    for body in [
+        // The shape the lowering exists for.
+        "__.out('R').hasLabel('W')",
+        "__.in('R').hasLabel('W')",
+        "__.both('R').hasLabel('W')",
+        // A bare hop still works — that arm predates this.
+        "__.out('R')",
+        "__.out('S')",
+        // An UNKNOWN label matches no vertex. It must not read as "no label
+        // test": an unknown name resolves to an empty id list, and empty is also
+        // what "no test at all" looks like.
+        "__.out('R').hasLabel('NOPE')",
+        // Mixed known and unknown — the known one still selects.
+        "__.out('R').hasLabel('W', 'NOPE')",
+        // An unknown EDGE type reaches nothing.
+        "__.out('NOPE').hasLabel('W')",
+        // An EDGE hop: `hasLabel` here tests the EDGE's label, not a vertex's, so
+        // the vertex-label shortcut must not claim it.
+        "__.outE('R').hasLabel('R')",
+        "__.outE('R').hasLabel('S')",
+        // Bodies the adjacency cannot answer, which must still work.
+        "__.out('R').has('n', 2)",
+        "__.out('R').out('R')",
+        "__.out('R').hasLabel('W').hasLabel('X')",
+    ] {
+        for shape in [
+            format!("g.V().where({body}).count()"),
+            format!("g.V().not({body}).count()"),
+            // The identities, not just the counts — the filter decides WHICH
+            // rows survive, and a count can agree by accident.
+            format!("g.V().where({body}).values('n')"),
+            format!("g.V().not({body}).values('n')"),
+            // Filtered frontier, then more column work.
+            format!("g.V().hasLabel('V').where({body}).dedup().count()"),
+        ] {
+            let streamed = shape.replacen("g.V()", "g.V().barrier()", 1);
+
+            assert_eq!(
+                run(&shape, &mut g),
+                run(&streamed, &mut g),
+                "`{shape}` disagrees with the streamed body"
+            );
+        }
+    }
+
+    // The answers themselves, so the pairs above cannot agree by both being
+    // wrong. `a` reaches b (W); `c` reaches itself (W) through the loop.
+    assert_eq!(
+        run("g.V().where(__.out('R').hasLabel('W')).values('n')", &mut g),
+        "[Num(1.0), Num(3.0)]"
+    );
+    // An unknown label selects nobody — the bug this test exists for.
+    assert_eq!(
+        run("g.V().where(__.out('R').hasLabel('NOPE')).count()", &mut g),
+        "[Num(0.0)]"
+    );
+    assert_eq!(
+        run("g.V().not(__.out('R').hasLabel('NOPE')).count()", &mut g),
+        "[Num(4.0)]"
+    );
+}
+
+/// `groupCount().by(k)` tallies a property off the frontier and agrees with the
+/// streamed fold — including the KEY ORDER, which is first-seen and observable.
+///
+/// Only `groupCount()` on the element itself had a column arm, so keying on a
+/// property built a traverser per element to run the modulator over:
+/// `g.V().out('R').groupCount().by('n')` cost 14.3ms over 150k rows against
+/// 1.26ms for the GQL spelling. Now 4.6ms.
+#[test]
+fn a_keyed_group_count_matches_the_streamed_fold() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"n":1,"s":"x"}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"n":2,"s":"y"}}"#,
+            r#"{"type":"node","id":"c","labels":["V"],"properties":{"n":1,"s":"x"}}"#,
+            // No `n` and no `s` — a NULL key, which is a group like any other.
+            r#"{"type":"node","id":"d","labels":["V"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e0","labels":["R"],"from":"a","to":"b","properties":{"w":5}}"#,
+            r#"{"type":"edge","id":"e1","labels":["R"],"from":"a","to":"c","properties":{"w":5}}"#,
+            r#"{"type":"edge","id":"e2","labels":["R"],"from":"b","to":"d","properties":{"w":7}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let run = |src: &str, g: &mut crate::graph::Graph| {
+        format!(
+            "{:?}",
+            super::parse::parse(src)
+                .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+                .run(g)
+        )
+    };
+
+    for shape in [
+        "g.V().groupCount().by('n')",
+        "g.V().groupCount().by('s')",
+        // A key NO element carries — every group is null.
+        "g.V().groupCount().by('missing')",
+        "g.V().out('R').groupCount().by('n')",
+        "g.V().hasLabel('V').out('R').groupCount().by('n')",
+        // An EDGE frontier keys off edge properties.
+        "g.V().outE('R').groupCount().by('w')",
+        // The identity form, which had the only arm before — asserted alongside
+        // so the two cannot drift.
+        "g.V().groupCount()",
+        // A `by()` carrying an ORDER sorts rather than tallies, so it must NOT
+        // take the arm — and must still answer.
+        "g.V().groupCount().by('n').order(local)",
+    ] {
+        let streamed = shape.replacen("g.V()", "g.V().barrier()", 1);
+
+        assert_eq!(
+            run(shape, &mut g),
+            run(&streamed, &mut g),
+            "`{shape}` disagrees with the streamed fold"
+        );
+    }
+
+    // The tally itself, key order included: first-seen, so 1 before 2 before the
+    // null that `d` contributes.
+    assert_eq!(
+        run("g.V().groupCount().by('n')", &mut g),
+        "[Map(MapVal { keys: [Num(1.0), Num(2.0), Null], vals: [Num(2.0), Num(1.0), Num(1.0)] })]"
+    );
+}
