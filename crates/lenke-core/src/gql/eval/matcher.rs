@@ -894,9 +894,11 @@ impl<'p> ProjAccum<'p> {
             self.rows.push((binding.clone(), keys));
             if self.cap >= 1 && self.rows.len() >= self.cap * 2 {
                 let cap = self.cap;
-                self.rows
-                    .select_nth_unstable_by(cap - 1, |a, b| cmp_keyed(a, b, &proj.order_by));
-                self.rows.truncate(cap);
+
+                crate::value::retain_smallest(&mut self.rows, cap, |a, b| {
+                    cmp_keyed(a, b, &proj.order_by)
+                });
+
                 self.threshold = Some(self.rows[cap - 1].1.clone());
             }
             return true;
@@ -1015,10 +1017,9 @@ impl<'p> ProjAccum<'p> {
         } else if self.topk {
             // Trim to the top-k input bindings, then project only those.
             if self.cap >= 1 && self.rows.len() > self.cap {
-                let cap = self.cap;
-                self.rows
-                    .select_nth_unstable_by(cap - 1, |a, b| cmp_keyed(a, b, &proj.order_by));
-                self.rows.truncate(cap);
+                crate::value::retain_smallest(&mut self.rows, self.cap, |a, b| {
+                    cmp_keyed(a, b, &proj.order_by)
+                });
             }
             let buf = std::mem::take(&mut self.rows);
             self.rows = buf

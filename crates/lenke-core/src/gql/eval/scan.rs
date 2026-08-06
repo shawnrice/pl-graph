@@ -2264,12 +2264,9 @@ pub(super) fn vectorized_aggregate(
     };
     let (start, end) = proj.window(ctx, ngroups);
     let mut idx: Vec<usize> = (0..ngroups).collect();
-    // Partial sort for a LIMIT: quickselect the smallest `end`, then sort only those.
-    if end >= 1 && end < idx.len() {
-        idx.select_nth_unstable_by(end - 1, cmp);
-        idx.truncate(end);
-    }
-    idx.sort_by(cmp);
+    // Partial sort for a LIMIT — `keep_smallest`, shared with the scalar
+    // projection and with Gremlin's `order()`.
+    crate::value::keep_smallest(&mut idx, Some(end), cmp);
     let sel = &idx[start.min(idx.len())..end.min(idx.len())];
     let mut out: Vec<Vec<Val>> = vec![Vec::with_capacity(sel.len()); proj.items.len()];
     for &gi in sel {
@@ -3183,14 +3180,10 @@ pub(super) fn project_frame_cols(
             (0..sc.n).collect()
         };
         let (start, end) = proj.window(ctx, idx.len());
-        // Partial sort for a LIMIT: partition the top `end` rows out in O(n), then
-        // fully sort just that window — instead of an O(n log n) sort of every row
-        // to keep only a small prefix. No LIMIT ⇒ a full sort (all rows returned).
-        if end >= 1 && end < idx.len() {
-            idx.select_nth_unstable_by(end - 1, cmp);
-            idx.truncate(end);
-        }
-        idx.sort_by(cmp);
+        // Partition the top `end` rows out in O(n), then sort just that window,
+        // instead of an O(n log n) sort of every row to keep a small prefix. No
+        // LIMIT ⇒ `end` is the row count and it is a full sort.
+        crate::value::keep_smallest(&mut idx, Some(end), cmp);
         let window = &idx[start..end.min(idx.len())];
 
         // REJECTED (measured): windowing the columns projected above — "they are

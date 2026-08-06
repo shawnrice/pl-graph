@@ -886,17 +886,32 @@ pub fn keep_smallest<T>(
     mut cmp: impl FnMut(&T, &T) -> std::cmp::Ordering,
 ) {
     if let Some(cap) = cap {
-        if cap == 0 {
-            items.clear();
-            return;
-        }
-        if cap < items.len() {
-            items.select_nth_unstable_by(cap - 1, &mut cmp);
-            items.truncate(cap);
-        }
+        retain_smallest(items, cap, &mut cmp);
     }
 
     items.sort_by(cmp);
+}
+
+/// The `cap` smallest by `cmp`, in NO particular order — the partition half of
+/// [`keep_smallest`], for a caller that will sort later or not at all.
+///
+/// A streaming top-k wants exactly this: it trims its buffer whenever it grows
+/// past a threshold, and sorting on every trim would be the cost the trimming
+/// exists to avoid.
+pub fn retain_smallest<T>(
+    items: &mut Vec<T>,
+    cap: usize,
+    cmp: impl FnMut(&T, &T) -> std::cmp::Ordering,
+) {
+    if cap == 0 {
+        items.clear();
+        return;
+    }
+
+    if cap < items.len() {
+        items.select_nth_unstable_by(cap - 1, cmp);
+        items.truncate(cap);
+    }
 }
 
 /// TinkerPop equality — see the module docs. NOT ISO equality.
