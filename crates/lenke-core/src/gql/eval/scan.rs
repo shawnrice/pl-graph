@@ -2948,44 +2948,6 @@ pub(super) fn vectorized_frame(
     Some(sc)
 }
 
-/// Terminal `MATCH … RETURN` straight to a [`RowSet`], skipping the intermediate
-/// `Vec<Val>` columns: each item is evaluated as a `VVec`, then rows are
-/// transposed reading `Value`s directly out of the typed buffers — a numeric
-/// column goes `f64 → Value::Num` with no `Val` boxing pass, halving the
-/// materialization for a numeric projection. Only the **plain** (non-aggregating,
-/// non-DISTINCT, non-ORDER-BY) shape qualifies; the others reorder/dedup and need
-/// the materialized-column path. `None` ⇒ caller falls back to `vectorized_cols`.
-pub(super) fn vectorized_rowset(
-    graph: &Graph,
-    ctx: &Ctx,
-    incoming: &[Binding],
-    matches: &[&CClause],
-    proj: &CProjection,
-) -> Option<RowSet> {
-    if let Some(p) = desugar_star(proj) {
-        return vectorized_rowset(graph, ctx, incoming, matches, &p);
-    }
-    if proj.aggregating || proj.distinct || !proj.order_by.is_empty() {
-        return None;
-    }
-    let sc = vectorized_frame(graph, ctx, incoming, matches, proj)?;
-    let vvs: Vec<VVec> = proj
-        .items
-        .iter()
-        .map(|it| eval_vec(graph, ctx, &sc, &it.expr))
-        .collect();
-    let start = proj.skip_val(ctx).min(sc.n);
-    let end = proj
-        .limit_val(ctx)
-        .map(|l| (start + l).min(sc.n))
-        .unwrap_or(sc.n);
-    let mut rs = RowSet::with_capacity(proj.out_names.clone(), end.saturating_sub(start));
-    for i in start..end {
-        rs.push_row(vvs.iter().map(|vv| vv.value_at(i, graph)));
-    }
-    Some(rs)
-}
-
 /// Transpose every row of an already-built (and WHERE-filtered) frame `sc` into a
 /// [`RowSet`] via the plain projection — no SKIP/LIMIT (the parallel driver applies
 /// those globally after concatenating chunk fragments). The `Val`-boxing-free

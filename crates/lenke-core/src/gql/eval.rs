@@ -2665,30 +2665,6 @@ impl VVec {
         }
     }
 
-    /// The `i`-th value as a core output [`Value`], read straight from the typed
-    /// buffer — a numeric/bool column skips `Val` boxing entirely (`f64` →
-    /// `Value::Num`); a `Gen` column converts its per-row `Val`. Used by the fused
-    /// terminal transpose to avoid materializing an intermediate `Vec<Val>` column.
-    fn value_at(&self, i: usize, graph: &Graph) -> Value {
-        match self {
-            Self::Num { d, valid } => {
-                if valid[i] {
-                    Value::Num(d[i])
-                } else {
-                    Value::Null
-                }
-            }
-            Self::Bool { t, valid } => {
-                if valid[i] {
-                    Value::Bool(t[i])
-                } else {
-                    Value::Null
-                }
-            }
-            Self::Gen(vs) => val_to_value(graph, &vs[i]),
-        }
-    }
-
     /// Final per-row output values (for projection cells).
     fn into_vals(self) -> Vec<Val> {
         match self {
@@ -4037,12 +4013,10 @@ fn project_to_rows(
         return RowSet::new(proj.out_names.clone());
     }
     if use_vec() {
-        // Plain projection: transpose straight from the typed `VVec`s to the
-        // RowSet (no intermediate `Vec<Val>` columns / second conversion pass).
-        if let Some(rs) = vectorized_rowset(graph, ctx, incoming, matches, proj) {
-            return rs;
-        }
-        // Aggregating / ORDER BY / DISTINCT: materialized columns, then transpose.
+        // ONE frame entry. `vectorized_rowset` used to sit ahead of this as a
+        // faster specialization for the non-aggregating, non-DISTINCT,
+        // non-ORDER-BY case — the same "recognize a narrower shape and answer it
+        // separately" pattern as the count ladder, one level down.
         if let Some(cols) = vectorized_cols(graph, ctx, incoming, matches, proj) {
             // Terminal output: flatten element handles to their ids.
             let nrows = cols.first().map_or(0, |c| c.len());
