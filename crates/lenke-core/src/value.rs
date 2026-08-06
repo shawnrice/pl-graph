@@ -887,11 +887,31 @@ impl<'a> Col<'a> {
 /// yielding ±∞), so keeping them apart HERE alone produced two groups whose
 /// rendered values were both `0` — a distinction no result could display.
 ///
-/// Branchless, and deliberately: IEEE 754 gives `-0.0 + 0.0 == +0.0` under the
-/// default rounding mode while `x + 0.0 == x` exactly for every other finite or
-/// infinite `x`, so one add normalizes with no compare. The historical reason for
-/// keeping `-0` apart was the cost of that check; this removes the cost rather
-/// than the correctness. (Rust never assumes fast-math, so the add stands.)
+/// Branchless: IEEE 754 gives `-0.0 + 0.0 == +0.0` under the default rounding
+/// mode while `x + 0.0 == x` exactly for every other finite or infinite `x`, so
+/// one add normalizes with no compare. (Rust never assumes fast-math, so the add
+/// is not optimized away.)
+///
+/// # The normalization is free — measured, because it keeps being asked
+///
+/// The historical reason for keeping `-0` apart was the cost of the check. There
+/// is no cost. Over 4M values, monomorphized, min of 9, repeated three times:
+///
+/// ```text
+///   raw to_bits             0.095 - 0.108 ns/value
+///   normalized (n + 0.0)    0.097 - 0.103
+///   add only, no NaN arm    0.093 - 0.103
+///   branch on zero          0.096 - 0.104
+/// ```
+///
+/// All four are the same number: the loop vectorizes and one add disappears into
+/// it. An earlier attempt at this measurement put the variants behind `&dyn Fn`
+/// and reported the branchy one at 1.8x — that was the virtual call, which costs
+/// an order of magnitude more than the thing being measured. If this is measured
+/// again, monomorphize it.
+///
+/// In context it is further beyond invisible: `val_key` formats sixteen hex
+/// digits through `core::fmt` per value right after this.
 #[must_use]
 pub fn group_key_bits(n: f64) -> u64 {
     if n.is_nan() {
