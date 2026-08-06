@@ -4550,3 +4550,53 @@ fn a_negative_predicate_does_not_treat_a_missing_key_uniformly() {
     );
     assert_eq!(count_of(&mut g, "g.V().has('n', gt(0)).count()"), 2.0);
 }
+
+/// Sorting a numeric column on the raw `f64` has to give the same order as
+/// sorting the boxed values, tie for tie.
+///
+/// It does by construction — `gcmp_total`'s non-NaN numeric arm IS `total_cmp`,
+/// and the arm declines a column with a NaN in it before reaching either. The
+/// case worth pinning anyway is `-0.0`, which `total_cmp` orders BEFORE `0.0`
+/// while equality calls them equal: if the fast path had used `partial_cmp` the
+/// two would tie, the index tie-break would put them in frontier order, and a
+/// `limit` across that boundary would return a different row.
+#[test]
+fn ordering_a_numeric_column_matches_the_boxed_sort() {
+    let mut lines = String::new();
+
+    // Duplicates so ties are everywhere, and both zeroes, and both infinities.
+    for (i, v) in [
+        "1", "-0.0", "0.0", "3", "1", "-1", "1e308", "-1e308", "0.0", "-0.0", "2", "2",
+    ]
+    .iter()
+    .enumerate()
+    {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{{\"n\":{v}}}}}\n"
+        ));
+    }
+
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    for spelling in ["order().by('n')", "order().by('n', desc)"] {
+        same_via_stream(&mut g, &format!("g.V().{spelling}.id()"));
+        same_via_stream(&mut g, &format!("g.V().{spelling}.values('n')"));
+
+        for k in [1usize, 2, 5, 11, 12, 50] {
+            same_via_stream(&mut g, &format!("g.V().{spelling}.limit({k}).id()"));
+        }
+        same_via_stream(&mut g, &format!("g.V().{spelling}.range(2, 6).id()"));
+        same_via_stream(&mut g, &format!("g.V().{spelling}.tail(3).id()"));
+    }
+    // A column that is NOT all numbers keeps the boxed comparator.
+    let mut mixed = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"n":"s"}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"n":"t"}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    same_via_stream(&mut mixed, "g.V().order().by('n').id()");
+}

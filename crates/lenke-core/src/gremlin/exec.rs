@@ -1553,12 +1553,48 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
             // this replaced did implicitly. Quickselect is UNSTABLE, so without
             // it two equal keys could partition either way and a `limit(10)` over
             // a tied boundary would return a different ten than the TS engine.
-            crate::value::keep_smallest(&mut idx, cap, |&i, &j| {
-                let o = gcmp_total(&keys[i], &keys[j]);
-                let o = if descending { o.reverse() } else { o };
+            // `partial_cmp`, NOT `total_cmp`, and this is the one place it shows:
+            // `total_cmp` orders `-0.0` BEFORE `0.0` while every other spelling of
+            // this sort calls them EQUAL, so a tie across that boundary returned a
+            // different row. The stream reaches the total order only as a FALLBACK
+            // for a pair its partial comparator cannot order (`cmp_or_fault(…)
+            // .unwrap_or_else(|| gcmp_total(…))`), and this arm has already
+            // declined every such pair — mixed ranks and NaN — so the partial
+            // comparator answers all of them.
+            //
+            // The boxed path below now takes the same two steps for the same
+            // reason. It used `gcmp_total` directly and had the `-0.0` bug before
+            // this commit added a numeric path at all.
+            //
+            // A homogeneous NUMBER column then sorts on the raw `f64` — the trick
+            // `column_terminal` uses for the aggregates, in the one other arm that
+            // compares a whole column.
+            let nums: Option<Vec<f64>> = (rank == Some(gval_type_rank(&GVal::Num(0.0))))
+                .then(|| {
+                    keys.iter()
+                        .map(|k| match k {
+                            GVal::Num(n) => Some(*n),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .flatten();
 
-                o.then(i.cmp(&j))
-            });
+            match &nums {
+                Some(ns) => crate::value::keep_smallest(&mut idx, cap, |&i, &j| {
+                    let o = ns[i].partial_cmp(&ns[j]).unwrap_or(Ordering::Equal);
+                    let o = if descending { o.reverse() } else { o };
+
+                    o.then(i.cmp(&j))
+                }),
+                None => crate::value::keep_smallest(&mut idx, cap, |&i, &j| {
+                    let o =
+                        gcmp(&keys[i], &keys[j]).unwrap_or_else(|| gcmp_total(&keys[i], &keys[j]));
+                    let o = if descending { o.reverse() } else { o };
+
+                    o.then(i.cmp(&j))
+                }),
+            }
 
             let sorted: Vec<u32> = idx.into_iter().map(|i| ids[i]).collect();
 
