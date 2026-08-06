@@ -314,6 +314,22 @@ macro_rules! decline {
 /// 1.0us, 5.2 against 5.2. The clone is real and is not what those queries spend
 /// their time on.
 pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
+    compile_inner(steps, false)
+}
+
+/// [`compile`] without the orientation decline, for a rewritten `match(…)`.
+///
+/// That decline reasons about what the ALTERNATIVE costs: when only the start is
+/// constrained, a left-to-right walk already seeds the selective end, so a frame
+/// buys nothing and costs 1.28x. A `match` has no such alternative — it falls to
+/// a backtracking solver with no planner behind it, which measured 3.6ms against
+/// 0.000ms for the same question in GQL. Anything the planner does is better than
+/// that, including nothing.
+pub(super) fn compile_chain(steps: &[Step]) -> Option<Compiled> {
+    compile_inner(steps, true)
+}
+
+fn compile_inner(steps: &[Step], forced: bool) -> Option<Compiled> {
     // `g.E()` IS `g.V().outE()`: every edge appears exactly once as an out-edge
     // of its source, self-loops included, so the two enumerate the same multiset
     // with the traverser on the edge either way. Only the ORDER differs — edge id
@@ -335,7 +351,7 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
         desugared.push(Step::OutE(Vec::new()));
         desugared.extend_from_slice(rest);
 
-        let mut compiled = compile(&desugared)?;
+        let mut compiled = compile_inner(&desugared, forced)?;
 
         // Only worth it if the traversal LEAVES the edge. A prefix that stops on
         // the edge is already answered from the edge property column directly
@@ -639,7 +655,7 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
         .iter()
         .any(|s| s.node.label.is_some() || !s.node.props.is_empty() || !s.rel.props.is_empty());
 
-    if !can_orient {
+    if !can_orient && !forced {
         decline!("nothing past the start is constrained");
     }
 

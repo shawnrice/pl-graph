@@ -223,6 +223,16 @@ fn main() {
             "try_grouped_2hop",
         ),
         (
+            // Gremlin's ONLY join. It had no planner — a backtracking solver that
+            // runs each pattern's sub-traversal per binding — so an indexed
+            // anchor was scanned. Rewritten as the linear chain it describes, it
+            // reaches the same planner GQL's join does.
+            "a join anchored on an indexed key",
+            "MATCH (a:V)-[:R]->(b) WHERE a.n = 7 RETURN count(*) AS c",
+            "g.V().match(__.as('a').has('n', 7), __.as('a').out('R').as('b')).count()",
+            "the whole planner, via the match rewrite",
+        ),
+        (
             "far-end property decides the seed",
             "MATCH ()-[:R]->(b) WHERE b.n = 7 RETURN count(*) AS c",
             "g.V().out('R').has('n', 7).count()",

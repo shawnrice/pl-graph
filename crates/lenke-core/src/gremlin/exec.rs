@@ -393,6 +393,18 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
     // Safe to put first only because `compile` declines unless a node PAST the
     // start is constrained. That is exactly the case these two get wrong; with
     // the constraints on the start they still run, unchanged, below.
+    // `g.V().match(…)` over a chain of patterns IS a linear traversal, and the
+    // planner can have it. Only straight off `V()`: `match` seeds its start tag
+    // from the INCOMING traverser, so a restricted stream ahead of it is a
+    // constraint the rewritten pattern does not carry.
+    if let [Step::V(ids), Step::Match(plans), rest @ ..] = t.steps.as_slice() {
+        if ids.is_empty() && !needs_path(rest) {
+            if let Some(out) = match_via_pattern(graph, ctx, plans, rest) {
+                return out;
+            }
+        }
+    }
+
     if let Some(c) = super::pattern::compile(&t.steps) {
         let rest = &t.steps[c.consumed..];
 
@@ -2554,6 +2566,162 @@ fn shortest_path_step(
         }
     }
     next
+}
+
+/// `match(…)` rewritten as the LINEAR traversal it describes, or `None` when it
+/// describes something a chain cannot say.
+///
+/// `match` is Gremlin's only join, and it is solved by backtracking with no
+/// planner behind it — no orientation, no index seed. On 20k vertices with an
+/// INDEXED anchor, `match(as('a').has('k', …), as('a').out('R').as('b')).count()`
+/// cost 3.755ms against 0.000ms for the GQL spelling of the same question, which
+/// seeks the index; unanchored, 12.7ms against 0.075ms. The patterns people
+/// write are overwhelmingly a chain, and a chain is exactly what
+/// `pattern::compile` already turns into a `CPath` with a slot per `as()`.
+///
+/// So this does not implement a join. It rewrites the chain-shaped subset into
+/// the traversal that means the same thing and lets the SHARED planner have it —
+/// `match(as('a').out('R').as('b'), as('b').has('n', 1))` is
+/// `as('a').out('R').as('b').has('n', 1)`.
+///
+/// Declines anything that is not a chain: a negated pattern (`not(…)`), a branch
+/// (two patterns leaving the same tag), a pattern that starts from a tag nothing
+/// binds, or one whose steps `compile` will not take. Those keep the solver.
+/// Run a chain-shaped `match(…)` through the shared planner.
+///
+/// The rewritten chain binds one slot per `as()`, which is what the planner
+/// already hands back as parallel columns — row `i` of each column is one
+/// solution. `match` emits the BINDING MAP as its value (TinkerPop) and carries
+/// the same bindings as tags for a following `select`, so both come from those
+/// columns.
+fn match_via_pattern(
+    graph: &mut Graph,
+    ctx: &mut Ctx,
+    plans: &[Traversal],
+    rest: &[Step],
+) -> Option<Vec<GVal>> {
+    let steps = linearize_match(plans)?;
+    let c = super::pattern::compile_chain(&steps)?;
+
+    // The whole chain, or the leftovers are constraints that would be dropped.
+    if c.consumed != steps.len() || c.tags.is_empty() {
+        return None;
+    }
+
+    let want: Vec<(usize, bool)> = c
+        .tags
+        .iter()
+        .map(|(_, slot, is_edge)| (*slot, *is_edge))
+        .collect();
+    let cols = crate::gql::eval::plan_pattern_ids(
+        graph,
+        &c.path,
+        &c.label_names,
+        &c.key_names,
+        c.scope_len,
+        &want,
+    )?;
+    let n = cols.first().map_or(0, Vec::len);
+
+    // A bare `count()` looks at neither the binding map nor the tags, and
+    // building 20k of each to take a length is most of what the shape costs.
+    if matches!(rest, [Step::Count(Scope::Global)]) {
+        return Some(vec![GVal::Num(n as f64)]);
+    }
+
+    let seeded: Vec<Trav> = (0..n)
+        .map(|i| {
+            let bound: Vec<(String, Vec<GVal>)> = c
+                .tags
+                .iter()
+                .enumerate()
+                .map(|(k, (name, _, is_edge))| {
+                    (name.clone(), vec![frontier_val(cols[k][i], *is_edge)])
+                })
+                .collect();
+            let map: Vec<(GVal, GVal)> = bound
+                .iter()
+                .map(|(name, vs)| (GVal::Str(Arc::from(name.as_str())), vs[0].clone()))
+                .collect();
+            let mut t = Trav::root(GVal::map(map));
+
+            t.tags = Arc::new(bound);
+            t
+        })
+        .collect();
+
+    Some(
+        run_steps(graph, ctx, rest, seeded)
+            .into_iter()
+            .map(|t| t.val)
+            .collect(),
+    )
+}
+
+fn linearize_match(plans: &[Traversal]) -> Option<Vec<Step>> {
+    let patterns: Vec<MatchPattern> = plans.iter().map(parse_pattern).collect();
+
+    if patterns.is_empty() || patterns.iter().any(|p| p.negated) {
+        return None;
+    }
+
+    let seed = match_start_label(&patterns);
+
+    if seed.is_empty() {
+        return None;
+    }
+
+    let mut used = vec![false; patterns.len()];
+    // Leads with the source the rewritten chain runs from — `compile` starts at
+    // `V()`, and the match's own source is every vertex (the caller checks that
+    // nothing has narrowed the incoming stream).
+    let mut steps = vec![Step::V(Vec::new()), Step::As(seed.clone())];
+    let mut here = seed;
+
+    loop {
+        // FILTERS at the current tag first — they are free to reorder among
+        // themselves and narrow the frontier before it fans out.
+        let mut moved = false;
+
+        for (i, p) in patterns.iter().enumerate() {
+            if !used[i] && p.end_key.is_none() && p.start_key == here {
+                used[i] = true;
+                moved = true;
+                steps.extend(p.inner.steps.iter().cloned());
+            }
+        }
+
+        // Then the one hop that leaves it. TWO would be a branch, which a chain
+        // cannot express — decline rather than pick one and silently drop the
+        // other.
+        let leaving: Vec<usize> = patterns
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| !used[*i] && p.end_key.is_some() && p.start_key == here)
+            .map(|(i, _)| i)
+            .collect();
+
+        match leaving.as_slice() {
+            [] => {
+                if !moved {
+                    break;
+                }
+            }
+            [i] => {
+                let p = &patterns[*i];
+
+                used[*i] = true;
+                steps.extend(p.inner.steps.iter().cloned());
+                here = p.end_key.clone()?;
+                steps.push(Step::As(here.clone()));
+            }
+            _ => return None,
+        }
+    }
+
+    // Every pattern has to be on the chain. One left over is a constraint this
+    // rewrite would silently drop.
+    used.iter().all(|&u| u).then_some(steps)
 }
 
 fn match_step(

@@ -3113,3 +3113,100 @@ fn an_extreme_is_the_same_in_every_scope() {
         "[Null]"
     );
 }
+
+/// A chain-shaped `match(…)` answers what the backtracking solver answers.
+///
+/// `match` is Gremlin's only join and it had no planner: it picks a runnable
+/// pattern and runs its sub-traversal per binding, so an INDEXED anchor is
+/// scanned rather than sought. On 20k vertices,
+/// `match(as('a').has('k', <indexed>), as('a').out('R').as('b')).count()` cost
+/// 3.755ms against 0.000ms for the GQL spelling of the same question — 9842x.
+///
+/// The patterns people write are a chain, and a chain is a linear traversal:
+/// `match(as('a').out('R').as('b'), as('b').has('n', 1))` IS
+/// `as('a').out('R').as('b').has('n', 1)`. Rewriting it that way hands the whole
+/// thing to the shared planner. 0.002ms after, and 12.7ms -> 0.281ms unanchored.
+///
+/// `identity()` ahead of the match defeats the rewrite (it fires only directly
+/// off `V()`), so each pair below is the same question asked both ways.
+#[test]
+fn a_chain_shaped_match_agrees_with_the_solver() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["P"],"properties":{"name":"marko","age":29}}"#,
+            r#"{"type":"node","id":"b","labels":["P"],"properties":{"name":"vadas","age":27}}"#,
+            r#"{"type":"node","id":"c","labels":["S"],"properties":{"name":"lop","age":29}}"#,
+            r#"{"type":"node","id":"d","labels":["P"],"properties":{"name":"josh","age":32}}"#,
+            r#"{"type":"edge","id":"e0","labels":["CREATED"],"from":"a","to":"c","properties":{}}"#,
+            r#"{"type":"edge","id":"e1","labels":["CREATED"],"from":"d","to":"c","properties":{}}"#,
+            r#"{"type":"edge","id":"e2","labels":["KNOWS"],"from":"a","to":"b","properties":{}}"#,
+            r#"{"type":"edge","id":"e3","labels":["KNOWS"],"from":"a","to":"d","properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    // As a MULTISET: the rewrite enumerates in planner order and the solver in
+    // backtracking order, and `match` promises neither (the step tests sort too).
+    let bag = |src: &str, g: &mut crate::graph::Graph| {
+        let mut out: Vec<String> = super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(g)
+            .iter()
+            .map(|v| format!("{v:?}"))
+            .collect();
+
+        out.sort();
+        out
+    };
+
+    for tail in [
+        // Chains the rewrite takes.
+        "match(__.as('a').out('KNOWS').as('b')).count()",
+        "match(__.as('a').out('KNOWS').as('b')).select('a','b').by('name')",
+        "match(__.as('a').out('CREATED').as('b'), __.as('b').has('name','lop')).select('a').by('name')",
+        "match(__.as('a').has('name','marko'), __.as('a').out('KNOWS').as('b')).select('b').by('name')",
+        // A filter BEFORE the hop, and one after — both attach at their tag.
+        "match(__.as('a').has('age',29), __.as('a').out('CREATED').as('b'), __.as('b').has('age',29)).select('a','b').by('name')",
+        // The binding MAP itself, which is the step's own value.
+        "match(__.as('a').out('KNOWS').as('b'))",
+        // Longer chain.
+        "match(__.as('a').out('KNOWS').as('b'), __.as('b').out('CREATED').as('c')).select('a','c').by('name')",
+        // Shapes the rewrite DECLINES and the solver keeps — they must still answer.
+        // A branch: two patterns leaving `a`.
+        "match(__.as('a').out('KNOWS').as('b'), __.as('a').out('CREATED').as('c')).select('b','c').by('name')",
+        // A negated pattern.
+        "match(__.as('a').out('KNOWS').as('b'), __.not(__.as('b').has('name','vadas'))).select('b').by('name')",
+        // An inner the pattern compiler will not take.
+        "match(__.as('a').out('KNOWS').count().as('b')).select('b')",
+    ] {
+        let rewritten = format!("g.V().{tail}");
+        // `identity()` is a step, so the `[V, Match, …]` shape no longer holds
+        // and the solver runs.
+        let solved = format!("g.V().identity().{tail}");
+
+        assert_eq!(
+            bag(&rewritten, &mut g),
+            bag(&solved, &mut g),
+            "`{tail}` disagrees with the solver"
+        );
+    }
+
+    // The answers themselves, so the pairs cannot agree by both being wrong.
+    // marko KNOWS vadas and josh.
+    assert_eq!(
+        bag(
+            "g.V().match(__.as('a').out('KNOWS').as('b')).select('b').by('name')",
+            &mut g
+        ),
+        vec!["Str(\"josh\")", "Str(\"vadas\")"]
+    );
+    // Both creators of lop.
+    assert_eq!(
+        bag(
+            "g.V().match(__.as('a').out('CREATED').as('b'), __.as('b').has('name','lop')).select('a').by('name')",
+            &mut g
+        ),
+        vec!["Str(\"josh\")", "Str(\"marko\")"]
+    );
+}
