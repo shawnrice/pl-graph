@@ -3416,3 +3416,289 @@ fn a_multi_hop_semi_join_agrees_with_running_the_body() {
         "[Num(6.0)]"
     );
 }
+
+#[test]
+#[ignore = "timing"]
+fn zzz_lower_probe() {
+    let mut lines = String::new();
+
+    for i in 0..20_000usize {
+        let l = if i % 10 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{},\"k\":\"key{i:06}\"}}}}\n",
+            i % 97
+        ));
+    }
+
+    let mut e = 0;
+
+    for i in 0..20_000usize {
+        for d in 0..3usize {
+            lines.push_str(&format!(
+                "{{\"type\":\"edge\",\"id\":\"e{e}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{\"w\":{d}}}}}\n",
+                (i * 31 + d * 7 + 1) % 20_000
+            ));
+            e += 1;
+        }
+    }
+
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    let pairs: &[(&str, &str, &str)] = &[
+        (
+            "any edge of a type exists",
+            "MATCH ()-[:R]->() RETURN 1 AS x LIMIT 1",
+            "g.E().hasLabel('R').limit(1).count()",
+        ),
+        (
+            "tally a hop by an endpoint property",
+            "MATCH ()-[:R]->(b) RETURN b.n AS k, count(*) AS c GROUP BY b.n",
+            "g.V().out('R').groupCount().by('n')",
+        ),
+        (
+            "top-k by a property",
+            "MATCH (u:V) RETURN u.n AS n ORDER BY u.n DESC LIMIT 10",
+            "g.V().hasLabel('V').order().by('n', desc).limit(10).values('n')",
+        ),
+        (
+            "count of a 2-hop",
+            "MATCH ()-[:R]->()-[:R]->() RETURN count(*) AS c",
+            "g.V().out('R').out('R').count()",
+        ),
+        (
+            "a join anchored on an indexed key",
+            "MATCH (u:V)-[:R]->(x) WHERE u.k = 'key000005' RETURN count(*) AS c",
+            "g.V().hasLabel('V').has('k', 'key000005').out('R').count()",
+        ),
+        (
+            "distinct far ends of a hop",
+            "MATCH ()-[:R]->(b) RETURN count(DISTINCT b) AS c",
+            "g.V().out('R').dedup().count()",
+        ),
+        (
+            "sum a property over a hop",
+            "MATCH ()-[:R]->(b) RETURN sum(b.n) AS s",
+            "g.V().out('R').values('n').sum()",
+        ),
+        (
+            "max a property over all vertices",
+            "MATCH (u:V) RETURN max(u.n) AS m",
+            "g.V().hasLabel('V').values('n').max()",
+        ),
+        (
+            "count vertices by label",
+            "MATCH (u:W) RETURN count(*) AS c",
+            "g.V().hasLabel('W').count()",
+        ),
+        (
+            "tally by label of the far end",
+            "MATCH ()-[:R]->(b) RETURN count(*) AS c",
+            "g.V().out('R').count()",
+        ),
+        (
+            "edge property tally",
+            "MATCH ()-[r:R]->() RETURN r.w AS w, count(*) AS c GROUP BY r.w",
+            "g.E().hasLabel('R').groupCount().by('w')",
+        ),
+        (
+            "values of a property, all vertices",
+            "MATCH (u:V) RETURN u.n AS n",
+            "g.V().hasLabel('V').values('n')",
+        ),
+    ];
+
+    println!();
+
+    for (name, gq, gr) in pairs {
+        let tg = {
+            let plan = crate::gql::parse(gq).unwrap_or_else(|e| panic!("`{gq}`: {e}"));
+            let mut best = f64::MAX;
+
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                let rs = plan
+                    .execute(&mut g, &crate::gql::eval::Params::new())
+                    .unwrap_or_else(|e| panic!("`{gq}`: {e}"));
+                let secs = t.elapsed().as_secs_f64();
+
+                std::hint::black_box(rs.rows().count());
+                if secs < best {
+                    best = secs;
+                }
+            }
+
+            best
+        };
+        let tr = grem_time(&mut g, gr);
+        let (slow, ratio) = if tg > tr {
+            ("GQL ", tg / tr)
+        } else {
+            ("GREM", tr / tg)
+        };
+
+        println!(
+            "PROBE {ratio:>6.1}x {slow} slower  gql {:>8.3}ms  grem {:>8.3}ms  [{name}]",
+            tg * 1e3,
+            tr * 1e3
+        );
+    }
+}
+
+// --- `out(T).count()` counts the type bucket, and only when that IS the count --
+
+/// A fixture whose shape makes every exclusion visible: a self-loop, a vertex
+/// with no edges, two edge types, and a labelled subset.
+fn bucket_fixture() -> Graph {
+    let mut lines = String::new();
+
+    for (i, l) in [r#"["V","W"]"#, r#"["V"]"#, r#"["V"]"#, r#"["V"]"#]
+        .iter()
+        .enumerate()
+    {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{i}}}}}\n"
+        ));
+    }
+    // n0->n1, n1->n2, n2->n2 (a self-loop), n0->n2 of the OTHER type. n3 is
+    // isolated.
+    for (i, (from, to, t)) in [(0, 1, "R"), (1, 2, "R"), (2, 2, "R"), (0, 2, "S")]
+        .iter()
+        .enumerate()
+    {
+        lines.push_str(&format!(
+            "{{\"type\":\"edge\",\"id\":\"e{i}\",\"from\":\"n{from}\",\"to\":\"n{to}\",\"labels\":[\"{t}\"],\"properties\":{{}}}}\n"
+        ));
+    }
+
+    crate::ndjson::decode(&lines).expect("fixture decodes")
+}
+
+fn count_of(g: &mut Graph, src: &str) -> f64 {
+    one_num(
+        super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(g),
+    )
+}
+
+/// `out(T).count()` is the size of the T bucket — one traverser per edge.
+#[test]
+fn counting_a_bare_hop_is_the_edge_bucket() {
+    let mut g = bucket_fixture();
+
+    assert_eq!(count_of(&mut g, "g.V().out('R').count()"), 3.0);
+    assert_eq!(count_of(&mut g, "g.V().in('R').count()"), 3.0);
+    assert_eq!(count_of(&mut g, "g.V().out('S').count()"), 1.0);
+    assert_eq!(count_of(&mut g, "g.V().out('R','S').count()"), 4.0);
+}
+
+/// The self-loop is ONE out-edge of one vertex, so the bucket length is right;
+/// `both()` sees it from both ends and the bucket length is not, which is why
+/// that direction takes the walk.
+#[test]
+fn an_undirected_hop_count_is_not_the_bucket_length() {
+    let mut g = bucket_fixture();
+
+    // n0-n1, n1-n2, n2-n2 seen from each end: 2 + 2 + 2.
+    assert_eq!(count_of(&mut g, "g.V().both('R').count()"), 6.0);
+}
+
+/// A filter before the hop means the traversers are not the whole universe, so
+/// the shortcut must not fire. Both of these once counted the bucket.
+#[test]
+fn a_filtered_hop_count_is_not_the_bucket_length() {
+    let mut g = bucket_fixture();
+
+    // Only n0 is a W, and it has one R out-edge.
+    assert_eq!(
+        count_of(&mut g, "g.V().hasLabel('W').out('R').count()"),
+        1.0
+    );
+    assert_eq!(count_of(&mut g, "g.V().has('n', 1).out('R').count()"), 1.0);
+}
+
+/// `dedup()` after the hop counts distinct FAR ENDS, which is a different
+/// question from how many edges there are: n1 and n2 are each landed on twice
+/// across `R`'s three edges — n2 by `n1->n2` and by its own self-loop.
+#[test]
+fn a_deduped_hop_count_is_not_the_bucket_length() {
+    let mut g = bucket_fixture();
+
+    assert_eq!(count_of(&mut g, "g.V().out('R').dedup().count()"), 2.0);
+}
+
+/// A type no edge carries is zero, not "any type".
+#[test]
+fn counting_a_hop_of_an_unknown_type_is_zero() {
+    let mut g = bucket_fixture();
+
+    assert_eq!(count_of(&mut g, "g.V().out('NOPE').count()"), 0.0);
+    assert_eq!(count_of(&mut g, "g.V().out('NOPE','R').count()"), 3.0);
+}
+
+/// A second hop is not a bucket length — it depends on the far ends' degrees.
+#[test]
+fn counting_two_hops_is_not_the_bucket_length() {
+    let mut g = bucket_fixture();
+
+    // n0->n1->n2, n1->n2->n2, n2->n2->n2.
+    assert_eq!(count_of(&mut g, "g.V().out('R').out('R').count()"), 3.0);
+}
+
+// --- ORDER BY + LIMIT partitions, and ties keep their input order -----------
+
+/// A top-k must return the same rows in the same order as the full sort it
+/// replaces, INCLUDING across a tie at the boundary — quickselect is unstable,
+/// so a comparator that stops at the key would be free to return either of two
+/// equal-keyed elements and the two engines would disagree.
+#[test]
+fn a_limited_order_agrees_with_the_full_sort() {
+    let mut lines = String::new();
+
+    // Every key appears four times, so every limit lands mid-tie.
+    for i in 0..40usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{{\"n\":{}}}}}\n",
+            i % 10
+        ));
+    }
+
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+    let ids = |g: &mut Graph, src: &str| -> Vec<String> {
+        super::parse::parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(g)
+            .iter()
+            .map(|v| format!("{v:?}"))
+            .collect()
+    };
+
+    for (dir, spelling) in [("", "order().by('n')"), ("desc", "order().by('n', desc)")] {
+        let full = ids(&mut g, &format!("g.V().{spelling}.id()"));
+
+        for k in [1usize, 3, 7, 40, 100] {
+            let got = ids(&mut g, &format!("g.V().{spelling}.limit({k}).id()"));
+
+            assert_eq!(
+                got,
+                full[..k.min(full.len())].to_vec(),
+                "limit({k}) after {spelling} {dir} disagreed with the full sort"
+            );
+        }
+        // `range` bounds it from the top the same way; `tail` does not, and takes
+        // the full sort.
+        assert_eq!(
+            ids(&mut g, &format!("g.V().{spelling}.range(5, 9).id()")),
+            full[5..9].to_vec()
+        );
+        assert_eq!(
+            ids(&mut g, &format!("g.V().{spelling}.tail(3).id()")),
+            full[full.len() - 3..].to_vec()
+        );
+    }
+}

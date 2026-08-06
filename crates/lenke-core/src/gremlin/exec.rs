@@ -1265,12 +1265,9 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
         // A `by()` carrying an ORDER is a different step (it sorts the result),
         // and a sub-traversal `by()` can read the path, so both stay on the
         // stream — `single_key_by` accepts neither.
-        [Step::GroupCount(bys)] if let Some(key) = single_key_by(bys) => {
-            Some(vec![GVal::map(tally_group_count(
-                ids.iter()
-                    .map(|&id| prop(graph, &frontier_val(id, is_edge), key)),
-            ))])
-        }
+        [Step::GroupCount(bys)] if let Some(key) = single_key_by(bys) => Some(vec![GVal::map(
+            tally_group_count(prop_column(graph, ids, is_edge, key).into_iter()),
+        )]),
         // The frontier ITSELF. There was no arm for it, so
         // `g.V().hasLabel('V').out('R')` — a traversal with no terminal at all —
         // built a `Trav` per element to hand back the elements: 5.2ms for 150k,
@@ -1336,13 +1333,14 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
         // 2.22ms against 0.116ms for the GQL spelling.
         [Step::Dedupe { labels, bys }, t @ ..] if labels.is_empty() => {
             let key = single_key_by(bys)?;
+            let keys = prop_column(graph, ids, is_edge, key);
             let mut seen: crate::fxhash::FxHashSet<DedupKey> = crate::fxhash::FxHashSet::default();
             let mut kept: Vec<u32> = Vec::new();
 
-            for &id in ids {
+            for (i, &id) in ids.iter().enumerate() {
                 // A key with no dedup key of its own (a NaN) is never a
                 // duplicate — the same rule the boxed path follows.
-                match dedup_key(&prop(graph, &frontier_val(id, is_edge), key)) {
+                match dedup_key(&keys[i]) {
                     Some(k) => {
                         if seen.insert(k) {
                             kept.push(id);
@@ -1368,10 +1366,7 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
             // a `By::Key` at all.
             let descending =
                 by_dir.unwrap_or(if *desc { Order::Desc } else { Order::Asc }) == Order::Desc;
-            let keys: Vec<GVal> = ids
-                .iter()
-                .map(|&id| prop(graph, &frontier_val(id, is_edge), key))
-                .collect();
+            let keys = prop_column(graph, ids, is_edge, key);
             // The stream FAULTS on a pair it cannot order — a NaN, or two
             // different types — so answering here would swallow the error. A
             // shared type rank means every pair is comparable.
@@ -1386,14 +1381,30 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
 
             let mut idx: Vec<usize> = (0..ids.len()).collect();
 
-            idx.sort_by(|&i, &j| {
-                let o = gcmp_total(&keys[i], &keys[j]);
+            // A LIMIT right after the sort bounds how much of it is needed, so
+            // partition to that and sort only the part that survives — the shared
+            // rule, and the one GQL's ORDER BY already followed. `by(desc)` over
+            // 20k vertices was a full sort at 1.015ms whether the traversal asked
+            // for ten rows or all of them.
+            //
+            // Only a LIMIT or a RANGE bounds it from the TOP. `tail(n)` is the
+            // last n — a bottom-k, which this partition would answer with the
+            // wrong end — and anything else may consume the whole sorted run.
+            let cap = match t {
+                [Step::Limit(n, Scope::Global), ..] => Some(*n),
+                [Step::Range(_, hi, Scope::Global), ..] => Some(*hi),
+                _ => None,
+            };
 
-                if descending {
-                    o.reverse()
-                } else {
-                    o
-                }
+            // Ties break on the input position, which is what the stable sort
+            // this replaced did implicitly. Quickselect is UNSTABLE, so without
+            // it two equal keys could partition either way and a `limit(10)` over
+            // a tied boundary would return a different ten than the TS engine.
+            crate::value::keep_smallest(&mut idx, cap, |&i, &j| {
+                let o = gcmp_total(&keys[i], &keys[j]);
+                let o = if descending { o.reverse() } else { o };
+
+                o.then(i.cmp(&j))
             });
 
             let sorted: Vec<u32> = idx.into_iter().map(|i| ids[i]).collect();
@@ -2155,6 +2166,26 @@ fn try_count(graph: &Graph, steps: &[Step]) -> Option<f64> {
         {
             #[allow(clippy::cast_precision_loss)]
             return Some(crate::seek::count_edges_of_types(graph, etypes) as f64);
+        }
+    }
+
+    // The SAME identity one step further along: `out(T).count()` lands one
+    // traverser on the far end of every T edge, so the bucket length is again the
+    // answer. Only the vertex-step spelling was missing it — `outE(T).count()`
+    // took the branch above while `out(T).count()` walked all 20k vertices and
+    // 60k adjacency entries to arrive at the number the bucket already holds:
+    // 0.103ms against GQL's 0.001ms for `MATCH ()-[:R]->() RETURN count(*)`.
+    //
+    // Same three exclusions as above, for the same reasons — `Both` double-counts
+    // an edge, a captured filter or label means the traversers are not the whole
+    // universe — plus one this arm needs and that one does not: `dedup()` here
+    // deduplicates the far-end VERTICES, which is a different question entirely.
+    if edge_tail.is_none() && !distinct && !is_edge && seek.is_empty() && seek.labels().is_none() {
+        if let [(dir, Some(etypes))] = hops.as_slice() {
+            if !etypes.is_empty() && matches!(dir, crate::seek::Dir::Out | crate::seek::Dir::In) {
+                #[allow(clippy::cast_precision_loss)]
+                return Some(crate::seek::count_edges_of_types(graph, etypes) as f64);
+            }
         }
     }
 
@@ -3101,6 +3132,32 @@ fn prop(graph: &Graph, v: &GVal, key: &str) -> GVal {
     store.keys.get(key).map_or(GVal::Null, |kid| {
         GVal::from_column(store, kid, idx, &graph.strs, false)
     })
+}
+
+/// One property read across a whole frontier, resolving the NAME once.
+///
+/// `prop` takes a `&str` and so hashes it into the key table per element. That is
+/// the right shape for a stream, where each traverser may be a different kind of
+/// thing, and the wrong one for the column arms — `order().by(k)`,
+/// `dedup().by(k)`, `groupCount().by(k)` — which read the same key off 20k
+/// elements of the same kind. The same hoist took a semi-join from 4.52ms to
+/// 3.72ms when the hash was the only difference between the two.
+///
+/// Values are IDENTICAL to `prop`'s, element for element, including the `Null`
+/// for an absent key and for an id that is neither node nor edge.
+fn prop_column(graph: &Graph, ids: &[u32], is_edge: bool, key: &str) -> Vec<GVal> {
+    let store = if is_edge {
+        &graph.edge_props
+    } else {
+        &graph.props
+    };
+    let Some(kid) = store.keys.get(key) else {
+        return vec![GVal::Null; ids.len()];
+    };
+
+    ids.iter()
+        .map(|&id| GVal::from_column(store, kid, id as usize, &graph.strs, false))
+        .collect()
 }
 
 /// A `{ key: value }` map of an element's present properties (a stored null is

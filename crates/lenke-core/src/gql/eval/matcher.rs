@@ -1029,16 +1029,15 @@ impl<'p> ProjAccum<'p> {
         if !proj.order_by.is_empty() {
             let cmp =
                 |a: &(Binding, Vec<Val>), b: &(Binding, Vec<Val>)| cmp_keyed(a, b, &proj.order_by);
-            // ORDER BY + LIMIT: partition the smallest `cap` with quickselect
-            // (O(n)), then sort only those — instead of a full O(n log n) sort.
-            let n = self.rows.len();
-            if let Some(cap) = proj.limit_val(ctx).map(|l| proj.skip_val(ctx) + l) {
-                if cap >= 1 && cap < n {
-                    self.rows.select_nth_unstable_by(cap - 1, cmp);
-                    self.rows.truncate(cap);
-                }
-            }
-            self.rows.sort_by(cmp);
+            // ORDER BY + LIMIT partitions before it sorts — see `keep_smallest`,
+            // which is this rule, shared with Gremlin's `order()`.
+            //
+            // A LIMIT 0 keeps nothing, and the helper reads that from the cap
+            // rather than from a `>= 1` guard here: the guard let a zero cap fall
+            // through to the full sort, which was correct only because the
+            // `truncate` below caught it afterwards.
+            let cap = proj.limit_val(ctx).map(|l| proj.skip_val(ctx) + l);
+            crate::value::keep_smallest(&mut self.rows, cap, cmp);
         }
         let start = proj.skip_val(ctx);
         let mut rows: Vec<Binding> = self.rows.into_iter().map(|(b, _)| b).skip(start).collect();
