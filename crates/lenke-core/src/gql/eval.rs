@@ -2461,8 +2461,13 @@ fn for_each_seed(
     }
 }
 
-/// Expand one segment from `v` as `(edge index, neighbor)` — a lazy iterator
-/// (no intermediate `Vec`), so a short-circuiting consumer stops walking early.
+/// Every incident edge of `v` in `direction` whose label expression matches, as
+/// `(edge index, far end)`.
+///
+/// The WALK is `seek::adj_where` — shared, so the self-loop rule (a loop sits in
+/// both indexes, and an undirected read would yield it twice) lives in one place
+/// rather than being restated here. What stays GQL's is the FILTER: a boolean
+/// label expression, which `adj` cannot take because it wants a flat type set.
 fn expand<'a>(
     graph: &'a Graph,
     ctx: &'a Ctx,
@@ -2470,23 +2475,16 @@ fn expand<'a>(
     direction: Direction,
     label: Option<&'a CLabelExpr>,
 ) -> impl Iterator<Item = (u32, u32)> + 'a {
-    let out = matches!(direction, Direction::Out | Direction::Both).then(|| graph.out_adj(v));
-    let inn = matches!(direction, Direction::In | Direction::Both).then(|| graph.in_adj(v));
-    // A self-loop sits in both the out- and in-index of `v`, so an undirected
-    // (`Both`) walk would yield it twice — once per side. The out-side already
-    // emits it; drop it from the in-side (`a.nbr == v` ⇔ the far end is also `v`,
-    // i.e. a self-loop). Directed In/Out keep it. The `!both` guard short-circuits
-    // so directed traversal pays nothing.
-    let both = matches!(direction, Direction::Both);
-    out.into_iter()
-        .flatten()
-        .chain(
-            inn.into_iter()
-                .flatten()
-                .filter(move |a| !both || a.nbr != v),
-        )
-        .filter(move |a| label.is_none_or(|e| eval_label_adj(graph, ctx, a, e)))
-        .map(|a| (a.eidx, a.nbr))
+    let dir = match direction {
+        Direction::Out => crate::seek::Dir::Out,
+        Direction::In => crate::seek::Dir::In,
+        Direction::Both => crate::seek::Dir::Both,
+    };
+
+    crate::seek::adj_where(graph, v, dir, crate::seek::SelfLoops::Once, move |a| {
+        label.is_none_or(|e| eval_label_adj(graph, ctx, a, e))
+    })
+    .map(|a| (a.eidx, a.nbr))
 }
 
 /// Try to match `node` at vertex `vi`, extending `binding` in place and invoking

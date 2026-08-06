@@ -1362,23 +1362,45 @@ pub fn adj<'a>(
     // "does the graph hold any multi-label edge?" cost 2.4x on every traversal
     // as soon as a single edge gained a second label.
     let need_extra = graph.etypes_need_extra_lookup(etypes);
-    let keep = move |a: &crate::graph::Adj| adj_keeps(graph, a, etypes, need_extra);
+
+    adj_where(graph, v, dir, loops, move |a| {
+        adj_keeps(graph, a, etypes, need_extra)
+    })
+}
+
+/// [`adj`] with an arbitrary predicate instead of a type set.
+///
+/// The WALK is here and the FILTER is the caller's: which indexes to read for a
+/// direction, in what order, and the self-loop rule — a loop sits in both the
+/// out- and in-index of its vertex, so an undirected walk that read both would
+/// yield it twice.
+///
+/// That rule is the reason this exists as its own function. GQL had a second copy
+/// of the whole walk, self-loop comment and all, for one reason: its label filter
+/// is a boolean EXPRESSION (`!A`, `A&B`, wildcards) rather than a flat type set,
+/// so it could not call `adj`. That is a difference in the predicate, and a
+/// predicate is a parameter.
+pub fn adj_where<'a>(
+    graph: &'a Graph,
+    v: u32,
+    dir: Dir,
+    loops: SelfLoops,
+    keep: impl Fn(&crate::graph::Adj) -> bool + 'a,
+) -> impl Iterator<Item = crate::graph::Adj> + 'a {
     // Only an undirected walk can reach a self-loop twice; a directed one keeps
     // it either way.
     let drop_loop = dir == Dir::Both && loops == SelfLoops::Once;
-
     let outs = (dir != Dir::In)
         .then(|| graph.out_adj(v))
         .into_iter()
-        .flatten()
-        .filter(move |a| keep(a));
+        .flatten();
     let ins = (dir != Dir::Out)
         .then(|| graph.in_adj(v))
         .into_iter()
         .flatten()
-        .filter(move |a| keep(a) && !(drop_loop && a.nbr == v));
+        .filter(move |a| !(drop_loop && a.nbr == v));
 
-    outs.chain(ins)
+    outs.chain(ins).filter(move |a| keep(a))
 }
 
 /// Neighbours of `src` along `etypes` (empty = any type), flat.
