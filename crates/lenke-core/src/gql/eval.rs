@@ -34,6 +34,13 @@ use crate::arrow::ArrowColumn;
 use crate::error::{CodeError, CodeResult};
 use crate::error_codes::ErrorCode;
 use crate::graph::{Column, Graph, TxCommitError, Value};
+use crate::value::Col as SharedCol;
+
+/// GQL's value columns always own their data: an element FRONTIER — the one
+/// borrowing variant — is not something this engine puts in a value column, it
+/// keeps element columns in `ScanCols` slots. So the shared type appears here
+/// with its lifetime already discharged.
+type Col = SharedCol<'static>;
 use crate::query::RowSet;
 
 /// A runtime value.
@@ -662,7 +669,7 @@ fn xor3(a: Truth, b: Truth) -> Truth {
 ///   MATCH (n) RETURN min(n.s)        '3.5'  min/max use the total ORDER, not this
 /// ```
 ///
-/// So: the aggregate accumulator (`matcher::step`), `VVec::into_num`, and the
+/// So: the aggregate accumulator (`matcher::step`), `Col::into_num`, and the
 /// numeric arguments of `Left`/`Right`/`Range`/`Round`/`Sign`/`Substring`.
 ///
 /// This is where GQL and Gremlin genuinely differ, and only here: on the same
@@ -1735,7 +1742,7 @@ fn concat_step(env: &Env, lv: Val, rv: Val) -> Val {
 /// vectorized evaluator. Both operands are already known to be numeric columns
 /// (a general column falls back to scalar in the caller). Preserves the
 /// division/modulo-by-zero fault scan and NaN-avoiding validity mask.
-fn arith_vec_step(ctx: &Ctx, op: ArithOp, l: VVec, r: VVec, n: usize) -> VVec {
+fn arith_vec_step(ctx: &Ctx, op: ArithOp, l: Col, r: Col, n: usize) -> Col {
     let (ld, lv) = l.into_num();
     let (rd, rv) = r.into_num();
     if matches!(op, ArithOp::Div | ArithOp::Mod) {
@@ -1762,7 +1769,10 @@ fn arith_vec_step(ctx: &Ctx, op: ArithOp, l: VVec, r: VVec, n: usize) -> VVec {
         });
     }
     let valid = (0..n).map(|i| lv[i] && rv[i]).collect();
-    VVec::Num { d, valid }
+    Col::Num {
+        d,
+        valid: Some(valid),
+    }
 }
 
 fn eval(env: &Env, expr: &CExpr) -> Val {
@@ -2562,33 +2572,35 @@ fn match_node_then<C: FnMut(&mut Binding) -> bool + ?Sized>(
 mod pathfind;
 use pathfind::*;
 
-// Match execution: drive matches, aggregate, project to rows.
 mod matcher;
 use matcher::*;
 
-// --- vectorized (batched) node scan -----------------------------------------
-//
-// One operation across the whole matched row set instead of per row. A column
-// of evaluated values; numeric data is a flat `Vec<f64>` with a validity mask
-// so arithmetic/comparison loops stay branch-light and autovectorizable. Three
-// representations: numeric, three-valued boolean, and a `Gen` escape hatch for
-// anything outside the numeric subset (strings, CASE, identity, subqueries),
-// evaluated per row by the scalar `eval` for just that column.
-enum VVec {
-    Num { d: Vec<f64>, valid: Vec<bool> },
-    Bool { t: Vec<bool>, valid: Vec<bool> },
-    Gen(Vec<Val>),
-}
-
-impl VVec {
+/// The operations on a [`Col`] that carry GQL's SEMANTICS rather than its
+/// structure: numeric coercion and three-valued truth are this language's rules,
+/// and Gremlin's differ. The shared type deliberately does not have them — see
+/// its docs for the split.
+impl SharedCol<'_> {
     /// Coerce to numeric (`num_of` semantics): invalid where the source is null.
+    ///
+    /// Materializes the mask when the column has none. A column built here always
+    /// has one; an all-valid column comes from the other engine, where a row with
+    /// no value is dropped rather than nulled.
     fn into_num(self) -> (Vec<f64>, Vec<bool>) {
         match self {
-            Self::Num { d, valid } => (d, valid),
-            Self::Bool { t, valid } => (
-                t.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect(),
-                valid,
-            ),
+            Self::Elems { ids, .. } => (vec![f64::NAN; ids.len()], vec![false; ids.len()]),
+            Self::Num { d, valid } => {
+                let n = d.len();
+
+                (d, valid.unwrap_or_else(|| vec![true; n]))
+            }
+            Self::Bool { t, valid } => {
+                let n = t.len();
+
+                (
+                    t.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect(),
+                    valid.unwrap_or_else(|| vec![true; n]),
+                )
+            }
             Self::Gen(vs) => {
                 let mut d = Vec::with_capacity(vs.len());
                 let mut valid = Vec::with_capacity(vs.len());
@@ -2611,18 +2623,16 @@ impl VVec {
 
     /// Per-row Kleene truth (for WHERE and boolean connectives).
     fn into_truth(self) -> Vec<Truth> {
+        let ok = |valid: &Option<Vec<bool>>, i: usize| valid.as_ref().is_none_or(|v| v[i]);
+
         match self {
-            Self::Bool { t, valid } => t
-                .iter()
-                .zip(&valid)
-                .map(|(&b, &v)| v.then_some(b))
-                .collect(),
-            Self::Num { d, valid } => d
-                .iter()
-                .zip(&valid)
-                .map(|(&x, &v)| v.then_some(x != 0.0 && !x.is_nan()))
+            Self::Bool { t, valid } => (0..t.len()).map(|i| ok(&valid, i).then(|| t[i])).collect(),
+            Self::Num { d, valid } => (0..d.len())
+                .map(|i| ok(&valid, i).then(|| d[i] != 0.0 && !d[i].is_nan()))
                 .collect(),
             Self::Gen(vs) => vs.iter().map(as_truth).collect(),
+            // An element is not a truth value in this language.
+            Self::Elems { ids, .. } => vec![None; ids.len()],
         }
     }
 
@@ -2631,7 +2641,9 @@ impl VVec {
     /// → ids) and infers the physical type. This is the boxing-free result path.
     #[cfg(feature = "arrow")]
     fn into_arrow(self, graph: &Graph) -> ArrowColumn {
-        let opt = |v: Vec<bool>| if v.iter().all(|&b| b) { None } else { Some(v) };
+        // Arrow's convention is the same as this column's: no mask means no nulls.
+        // A mask that happens to be all-true is dropped rather than carried.
+        let opt = |v: Option<Vec<bool>>| v.filter(|v| !v.iter().all(|&b| b));
         match self {
             Self::Num { d, valid } => ArrowColumn::Num {
                 data: d,
@@ -2645,40 +2657,18 @@ impl VVec {
                 let values: Vec<Value> = vals.iter().map(|v| val_to_value(graph, v)).collect();
                 ArrowColumn::from_values(values.iter())
             }
-        }
-    }
+            // GQL keeps element columns in `ScanCols` slots, never in a value
+            // column — but the shared type can hold one, so say what it would be
+            // rather than leave the match open.
+            elems @ Self::Elems { .. } => {
+                let values: Vec<Value> = elems
+                    .into_vals()
+                    .iter()
+                    .map(|v| val_to_value(graph, v))
+                    .collect();
 
-    /// Keep only rows `[start, end)` (for SKIP/LIMIT on a typed column). Only the
-    /// Arrow fast path slices typed columns; the RowSet path slices `ScanCols`.
-    #[cfg(feature = "arrow")]
-    fn slice(self, start: usize, end: usize) -> Self {
-        match self {
-            Self::Num { d, valid } => Self::Num {
-                d: d[start..end].to_vec(),
-                valid: valid[start..end].to_vec(),
-            },
-            Self::Bool { t, valid } => Self::Bool {
-                t: t[start..end].to_vec(),
-                valid: valid[start..end].to_vec(),
-            },
-            Self::Gen(v) => Self::Gen(v[start..end].to_vec()),
-        }
-    }
-
-    /// Final per-row output values (for projection cells).
-    fn into_vals(self) -> Vec<Val> {
-        match self {
-            Self::Num { d, valid } => d
-                .iter()
-                .zip(&valid)
-                .map(|(&x, &v)| if v { Val::Num(x) } else { Val::Null })
-                .collect(),
-            Self::Bool { t, valid } => t
-                .iter()
-                .zip(&valid)
-                .map(|(&b, &v)| if v { Val::Bool(b) } else { Val::Null })
-                .collect(),
-            Self::Gen(vs) => vs,
+                ArrowColumn::from_values(values.iter())
+            }
         }
     }
 }
@@ -2757,9 +2747,9 @@ impl ScanCols {
     }
 }
 
-/// Gather a numeric `Column` at `ids` into a `VVec::Num` (+ validity mask), or
+/// Gather a numeric `Column` at `ids` into a `Col::Num` (+ validity mask), or
 /// `None` if the column isn't numeric (caller then falls back to per-row `Gen`).
-fn gather_num(col: Option<&Column>, ids: &[u32]) -> Option<VVec> {
+fn gather_num(col: Option<&Column>, ids: &[u32]) -> Option<Col> {
     match col {
         Some(Column::Num { data, present }) => {
             let mut d = Vec::with_capacity(ids.len());
@@ -2769,19 +2759,22 @@ fn gather_num(col: Option<&Column>, ids: &[u32]) -> Option<VVec> {
                 d.push(data[i]);
                 valid.push(present.get(i));
             }
-            Some(VVec::Num { d, valid })
+            Some(Col::Num {
+                d,
+                valid: Some(valid),
+            })
         }
         _ => None,
     }
 }
 
-/// Gather a `Column::Str` at `ids` into a `VVec::Gen` of `Val::Str` (shared Arc
+/// Gather a `Column::Str` at `ids` into a `Col::Gen` of `Val::Str` (shared Arc
 /// clones; absent → `Null`) — the string analogue of [`gather_num`]. Replaces the
 /// per-row `Binding` rebuild + `eval` dispatch of `scalar_col` with a tight
 /// interner-clone loop, so projecting/sorting a string column stays cheap.
-fn gather_str(col: Option<&Column>, ids: &[u32], strs: &crate::graph::Dict) -> Option<VVec> {
+fn gather_str(col: Option<&Column>, ids: &[u32], strs: &crate::graph::Dict) -> Option<Col> {
     match col {
-        Some(Column::Str { data, present }) => Some(VVec::Gen(
+        Some(Column::Str { data, present }) => Some(Col::Gen(
             ids.iter()
                 .map(|&vi| {
                     let i = vi as usize;
@@ -2797,14 +2790,14 @@ fn gather_str(col: Option<&Column>, ids: &[u32], strs: &crate::graph::Dict) -> O
     }
 }
 
-/// Gather a `Column::Temporal` at `ids` into a `VVec::Gen` of `Val::Temporal`
+/// Gather a `Column::Temporal` at `ids` into a `Col::Gen` of `Val::Temporal`
 /// (absent → `Null`) — the temporal analogue of [`gather_str`]. Reconstructs each
 /// value straight from the packed per-type arrays in a tight loop, replacing the
 /// per-row `Binding` rebuild + `eval` dispatch of `scalar_col` — so projecting or
 /// ordering a temporal column engages the vectorized scan instead of falling back.
-fn gather_temporal(col: Option<&Column>, ids: &[u32]) -> Option<VVec> {
+fn gather_temporal(col: Option<&Column>, ids: &[u32]) -> Option<Col> {
     match col {
-        Some(Column::Temporal { data, present }) => Some(VVec::Gen(
+        Some(Column::Temporal { data, present }) => Some(Col::Gen(
             ids.iter()
                 .map(|&vi| {
                     let i = vi as usize;
@@ -3100,7 +3093,7 @@ fn str_eq_vec(
     op: CompareOp,
     left: &CExpr,
     right: &CExpr,
-) -> Option<VVec> {
+) -> Option<Col> {
     if !matches!(op, CompareOp::Eq | CompareOp::Ne) {
         return None;
     }
@@ -3139,7 +3132,10 @@ fn str_eq_vec(
         let eq = p && Some(data[i]) == lit_id;
         t.push(if is_eq { eq } else { !eq });
     }
-    Some(VVec::Bool { t, valid })
+    Some(Col::Bool {
+        t,
+        valid: Some(valid),
+    })
 }
 
 /// Extract a row-independent string scalar from `e` — a string literal or a
@@ -3184,7 +3180,7 @@ fn temporal_cmp_vec(
     op: CompareOp,
     left: &CExpr,
     right: &CExpr,
-) -> Option<VVec> {
+) -> Option<Col> {
     let (prop, scalar, prop_left) = match (left, right) {
         (p @ CExpr::Prop { .. }, other) => (p, scalar_temporal(other, ctx)?, true),
         (other, p @ CExpr::Prop { .. }) => (p, scalar_temporal(other, ctx)?, false),
@@ -3224,7 +3220,7 @@ fn temporal_cmp_vec(
         };
         // Both operands present: `compare_vals` yields Bool (Eq/Ne, or an ordered
         // pair) or Null (UNKNOWN — an unordered/cross-kind `< > <= >=`). Map Null to
-        // an invalid slot, exactly what `VVec::Gen`+`into_truth` would produce.
+        // an invalid slot, exactly what `Col::Gen`+`into_truth` would produce.
         match compare_vals(ctx, op, lv, rv) {
             Val::Bool(b) => {
                 t.push(b);
@@ -3236,7 +3232,10 @@ fn temporal_cmp_vec(
             }
         }
     }
-    Some(VVec::Bool { t, valid })
+    Some(Col::Bool {
+        t,
+        valid: Some(valid),
+    })
 }
 
 /// `min`/`max` over a typed temporal column, folded via the canonical total order
@@ -3338,7 +3337,7 @@ fn temporal_agg(graph: &Graph, ctx: &Ctx, sc: &ScanCols, spec: &CAgg) -> Option<
     Some(acc.map_or(Val::Null, |d| Val::Temporal(T::Duration(d))))
 }
 
-/// A carried value column as a TYPED `VVec` when every cell allows it, else
+/// A carried value column as a TYPED `Col` when every cell allows it, else
 /// `Gen`.
 ///
 /// A `WITH` that carries a computed value (`a.n AS m`) hands the frame a `Val`
@@ -3350,7 +3349,7 @@ fn temporal_agg(graph: &Graph, ctx: &Ctx, sc: &ScanCols, spec: &CAgg) -> Option<
 /// a string into "not a number" and quietly yield no-match, where comparing a
 /// number against a string is specified to raise — see the cross-type rules in
 /// `compare_vals`. A column with one string in it stays `Gen` and keeps that.
-fn typed_val_col(vs: &[Val]) -> VVec {
+fn typed_val_col(vs: &[Val]) -> Col {
     let mut d = Vec::with_capacity(vs.len());
     let mut valid = Vec::with_capacity(vs.len());
 
@@ -3364,28 +3363,31 @@ fn typed_val_col(vs: &[Val]) -> VVec {
                 d.push(f64::NAN);
                 valid.push(false);
             }
-            _ => return VVec::Gen(vs.to_vec()),
+            _ => return Col::Gen(vs.to_vec()),
         }
     }
 
-    VVec::Num { d, valid }
+    Col::Num {
+        d,
+        valid: Some(valid),
+    }
 }
 
-fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> VVec {
+fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> Col {
     let n = sc.n;
-    let gen = |e: &CExpr| VVec::Gen(scalar_col(graph, ctx, sc, e));
+    let gen = |e: &CExpr| Col::Gen(scalar_col(graph, ctx, sc, e));
     match e {
-        CExpr::Lit(Lit::Num(x)) => VVec::Num {
+        CExpr::Lit(Lit::Num(x)) => Col::Num {
             d: vec![*x; n],
-            valid: vec![true; n],
+            valid: None,
         },
-        CExpr::Lit(Lit::Bool(b)) => VVec::Bool {
+        CExpr::Lit(Lit::Bool(b)) => Col::Bool {
             t: vec![*b; n],
-            valid: vec![true; n],
+            valid: None,
         },
-        CExpr::Lit(Lit::Null) => VVec::Num {
+        CExpr::Lit(Lit::Null) => Col::Num {
             d: vec![f64::NAN; n],
-            valid: vec![false; n],
+            valid: Some(vec![false; n]),
         },
         // A bare variable: a carried value column is taken directly (no per-row
         // binding rebuild); an element column becomes a column of element handles.
@@ -3393,7 +3395,7 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> VVec {
             if let Some(v) = sc.val_slot(*slot) {
                 typed_val_col(v)
             } else if let Some((elem, ids)) = sc.slot(*slot) {
-                VVec::Gen(
+                Col::Gen(
                     ids.iter()
                         .map(|&i| match elem {
                             Elem::Node => Val::Node(i),
@@ -3402,7 +3404,7 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> VVec {
                         .collect(),
                 )
             } else {
-                VVec::Gen(vec![Val::Null; n])
+                Col::Gen(vec![Val::Null; n])
             }
         }
         CExpr::Prop { var_slot, key_ref } => match sc.slot(*var_slot) {
@@ -3429,31 +3431,34 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> VVec {
         CExpr::Neg(x) => {
             let v = eval_vec(graph, ctx, sc, x);
             // A non-numeric operand → scalar fallback, which raises the type error.
-            if matches!(v, VVec::Gen(_)) {
+            if matches!(v, Col::Gen(_)) {
                 gen(e)
             } else {
                 let (mut d, valid) = v.into_num();
                 for v in &mut d {
                     *v = -*v;
                 }
-                VVec::Num { d, valid }
+                Col::Num {
+                    d,
+                    valid: Some(valid),
+                }
             }
         }
         CExpr::Arith { head, tail } => {
             // n-ary left-associative fold, column at a time. A non-numeric operand
             // (general column, incl. temporal, OR a boolean) → scalar fallback for
             // the whole node, which raises the ISO type error / does temporal
-            // arithmetic per-row rather than coercing to NaN. A Bool VVec must fall
+            // arithmetic per-row rather than coercing to NaN. A Bool Col must fall
             // back too: `into_num` would coerce it to 0/1 (valid), but the scalar
             // `arith_num` faults on a boolean — and the TS engine throws — so
             // `true + 1` over rows must fault, not compute 2.
             let mut acc = eval_vec(graph, ctx, sc, head);
-            if matches!(acc, VVec::Gen(_) | VVec::Bool { .. }) {
+            if matches!(acc, Col::Gen(_) | Col::Bool { .. }) {
                 return gen(e);
             }
             for (op, rhs) in tail {
                 let r = eval_vec(graph, ctx, sc, rhs);
-                if matches!(r, VVec::Gen(_) | VVec::Bool { .. }) {
+                if matches!(r, Col::Gen(_) | Col::Bool { .. }) {
                     return gen(e);
                 }
                 acc = arith_vec_step(ctx, *op, acc, r, n);
@@ -3476,15 +3481,13 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> VVec {
             // Bool/Bool); otherwise the comparison is over strings/identity or is
             // cross-type → scalar fallback.
             match (&l, &r) {
-                (VVec::Gen(_), _) | (_, VVec::Gen(_)) => gen(e),
+                (Col::Gen(_), _) | (_, Col::Gen(_)) => gen(e),
                 // A boolean compared with a number is cross-type: the numeric path
                 // below would wrongly coerce true/false to 1/0 (so `1 = true` passed
                 // a WHERE). Route to the scalar evaluator, which gives the LPG
                 // cross-type result (eq → false, order → null) — matching the
                 // const-folded and property-vs-bool paths and the TS engine.
-                (VVec::Num { .. }, VVec::Bool { .. }) | (VVec::Bool { .. }, VVec::Num { .. }) => {
-                    gen(e)
-                }
+                (Col::Num { .. }, Col::Bool { .. }) | (Col::Bool { .. }, Col::Num { .. }) => gen(e),
                 _ => {
                     let (ld, lv) = l.into_num();
                     let (rd, rv) = r.into_num();
@@ -3503,7 +3506,10 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> VVec {
                             CompareOp::Ge => a >= b,
                         });
                     }
-                    VVec::Bool { t, valid }
+                    Col::Bool {
+                        t,
+                        valid: Some(valid),
+                    }
                 }
             }
         }
@@ -3544,7 +3550,10 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> VVec {
                 }
             }
 
-            VVec::Num { d, valid }
+            Col::Num {
+                d,
+                valid: Some(valid),
+            }
         }
         CExpr::Scalar { func, args } if args.len() == 1 && unary_math(*func).is_some() => {
             let f = unary_math(*func).unwrap();
@@ -3552,7 +3561,10 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> VVec {
             for v in &mut d {
                 *v = f(*v);
             }
-            VVec::Num { d, valid }
+            Col::Num {
+                d,
+                valid: Some(valid),
+            }
         }
         CExpr::Not(x) => {
             let tr = eval_vec(graph, ctx, sc, x).into_truth();
@@ -3594,17 +3606,14 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> VVec {
                 .iter()
                 .map(|&v| if *negated { v } else { !v })
                 .collect();
-            VVec::Bool {
-                t,
-                valid: vec![true; n],
-            }
+            Col::Bool { t, valid: None }
         }
         _ => gen(e),
     }
 }
 
-/// Build a `VVec::Bool` from a Kleene-truth stream (`None` → invalid/UNKNOWN).
-fn kleene_vec(it: impl Iterator<Item = Truth>) -> VVec {
+/// Build a `Col::Bool` from a Kleene-truth stream (`None` → invalid/UNKNOWN).
+fn kleene_vec(it: impl Iterator<Item = Truth>) -> Col {
     let mut t = Vec::new();
     let mut valid = Vec::new();
     for tr in it {
@@ -3619,7 +3628,10 @@ fn kleene_vec(it: impl Iterator<Item = Truth>) -> VVec {
             }
         }
     }
-    VVec::Bool { t, valid }
+    Col::Bool {
+        t,
+        valid: Some(valid),
+    }
 }
 
 /// Materialize the matched rows of a fixed-length path into columns. An isolated

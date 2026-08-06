@@ -411,6 +411,143 @@ pub fn fold_extreme(
     best.unwrap_or(Value::Null)
 }
 
+/// A COLUMN of runtime values — the unit a lowered query carries from one step
+/// to the next, in either language.
+///
+/// Both engines arrived at this independently and kept their own: GQL's `VVec`
+/// was `Num`/`Bool`/`Gen`, Gremlin's `Col` was `Elems`/`Nums`/`Vals`. They are
+/// the same idea — a column, unboxed when its type allows — and now that `Val`
+/// and `GVal` are one type there is nothing left keeping them apart. The union
+/// carries every variant either had: an element frontier, unboxed numbers,
+/// unboxed booleans, and anything else boxed.
+///
+/// # What lives here and what does not
+///
+/// The STRUCTURE is shared: how long a column is, how it is sliced, how it
+/// materializes. Anything carrying a language's SEMANTICS is not — grouping
+/// identity, ordering, and three-valued truth differ between GQL and Gremlin by
+/// contract, so those stay with their engine and take this as an argument. It is
+/// the same split [`fold_extreme`] and [`keep_smallest`] already make: the
+/// traversal is shared, the comparator is a parameter.
+///
+/// # Validity
+///
+/// `valid: None` means every row is valid, which is not the same as an all-true
+/// mask — it is the absence of one. Gremlin's `values(k)` DROPS a row whose key
+/// is missing, so its columns never need a mask; GQL's projection KEEPS the row
+/// with a null in it, so its columns usually do. Making the mask optional is what
+/// lets one type serve both without Gremlin allocating a mask per column it will
+/// never read.
+#[derive(Clone, Debug)]
+pub enum Col<'a> {
+    /// Graph elements by dense index — a frontier. Borrowed where it can be, so
+    /// a paging step over one does not copy it.
+    Elems {
+        ids: std::borrow::Cow<'a, [u32]>,
+        is_edge: bool,
+    },
+    Num {
+        d: Vec<f64>,
+        valid: Option<Vec<bool>>,
+    },
+    Bool {
+        t: Vec<bool>,
+        valid: Option<Vec<bool>>,
+    },
+    /// Anything the typed variants cannot hold, boxed.
+    Gen(Vec<Value>),
+}
+
+impl<'a> Col<'a> {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Elems { ids, .. } => ids.len(),
+            Self::Num { d, .. } => d.len(),
+            Self::Bool { t, .. } => t.len(),
+            Self::Gen(v) => v.len(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Is row `i` a value rather than a null? An element is always one, and an
+    /// absent mask means every row is.
+    #[must_use]
+    pub fn valid_at(&self, i: usize) -> bool {
+        match self {
+            Self::Elems { .. } => true,
+            Self::Num { valid, .. } | Self::Bool { valid, .. } => {
+                valid.as_ref().is_none_or(|v| v[i])
+            }
+            Self::Gen(v) => !matches!(v[i], Value::Null),
+        }
+    }
+
+    /// `self[lo..hi]`, clamped to the column. Borrowed ids stay borrowed.
+    #[must_use]
+    pub fn page(self, lo: usize, hi: usize) -> Self {
+        let n = self.len();
+        let lo = lo.min(n);
+        let hi = hi.clamp(lo, n);
+        let cut = |v: Option<Vec<bool>>| v.map(|v| v[lo..hi].to_vec());
+
+        match self {
+            Self::Elems { ids, is_edge } => Self::Elems {
+                ids: match ids {
+                    std::borrow::Cow::Borrowed(s) => std::borrow::Cow::Borrowed(&s[lo..hi]),
+                    std::borrow::Cow::Owned(v) => std::borrow::Cow::Owned(v[lo..hi].to_vec()),
+                },
+                is_edge,
+            },
+            Self::Num { d, valid } => Self::Num {
+                d: d[lo..hi].to_vec(),
+                valid: cut(valid),
+            },
+            Self::Bool { t, valid } => Self::Bool {
+                t: t[lo..hi].to_vec(),
+                valid: cut(valid),
+            },
+            Self::Gen(v) => Self::Gen(v[lo..hi].to_vec()),
+        }
+    }
+
+    /// The column as boxed values, one per row. An invalid row is a `Null`.
+    #[must_use]
+    pub fn into_vals(self) -> Vec<Value> {
+        let boxed = |n: usize, valid: Option<Vec<bool>>, f: &dyn Fn(usize) -> Value| {
+            (0..n)
+                .map(|i| {
+                    if valid.as_ref().is_none_or(|v| v[i]) {
+                        f(i)
+                    } else {
+                        Value::Null
+                    }
+                })
+                .collect()
+        };
+
+        match self {
+            Self::Elems { ids, is_edge } => ids
+                .iter()
+                .map(|&id| {
+                    if is_edge {
+                        Value::Edge(id)
+                    } else {
+                        Value::Node(id)
+                    }
+                })
+                .collect(),
+            Self::Num { d, valid } => boxed(d.len(), valid, &|i| Value::Num(d[i])),
+            Self::Bool { t, valid } => boxed(t.len(), valid, &|i| Value::Bool(t[i])),
+            Self::Gen(v) => v,
+        }
+    }
+}
+
 /// Keep the `cap` smallest by `cmp`, in order — an ORDER BY with a LIMIT.
 ///
 /// Quickselect partitions at `cap` in O(n) and only the kept prefix is sorted, so

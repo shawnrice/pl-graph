@@ -1456,7 +1456,7 @@ pub(super) fn run_part(
 
 /// Typed Arrow fast path: a single fresh `MATCH` + plain `RETURN` (no WITH /
 /// aggregate / DISTINCT / ORDER BY / `*`). Produces Arrow columns straight from
-/// the vectorized `VVec`s, so numeric/bool columns skip the `Val`→`Value` boxing
+/// the vectorized `Col`s, so numeric/bool columns skip the `Val`→`Value` boxing
 /// the RowSet path would do. Returns `(columns, nrows)` or `None` to fall back.
 #[cfg(feature = "arrow")]
 pub(super) fn vectorized_arrow(
@@ -1517,7 +1517,7 @@ pub(super) fn vectorized_arrow(
         .iter()
         .map(|it| {
             eval_vec(graph, ctx, &sc, &it.expr)
-                .slice(start, end)
+                .page(start, end)
                 .into_arrow(graph)
         })
         .collect();

@@ -2047,13 +2047,13 @@ pub(super) fn fold_group_agg_cols(
             let arg = spec.arg.as_ref()?;
             let av = eval_vec(graph, ctx, sc, arg);
             // min/max compare by value; only correct here for numeric columns.
-            if matches!(spec.func, AggFn::Min | AggFn::Max) && !matches!(av, VVec::Num { .. }) {
+            if matches!(spec.func, AggFn::Min | AggFn::Max) && !matches!(av, Col::Num { .. }) {
                 return None;
             }
             // Temporal (gathered → `Gen`) sum/avg can't go through the numeric fold
             // (it would NaN → null); bail to the scalar accumulator, which sums
             // DURATIONs and faults on avg / non-summable kinds.
-            if matches!(spec.func, AggFn::Sum | AggFn::Avg) && matches!(av, VVec::Gen(_)) {
+            if matches!(spec.func, AggFn::Sum | AggFn::Avg) && matches!(av, Col::Gen(_)) {
                 return None;
             }
             let (d, valid) = av.into_num();
@@ -2959,7 +2959,7 @@ pub(super) fn project_scan_rows(
     sc: &ScanCols,
     proj: &CProjection,
 ) -> RowSet {
-    let vvs: Vec<VVec> = proj
+    let vvs: Vec<Col> = proj
         .items
         .iter()
         .map(|it| eval_vec(graph, ctx, sc, &it.expr))

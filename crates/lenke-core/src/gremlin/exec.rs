@@ -15,6 +15,7 @@ use super::{
 use crate::graph::{Graph, IdxKey, Value};
 use crate::jsonfmt::{push_json_str, push_num};
 use crate::seek::{ElementSeek, KeyPredicate, Operand, SeekOp};
+use crate::value::Col;
 
 /// A hashable projection of a [`GVal`] for O(1) dedup. Mirrors `GVal`'s derived
 /// structural equality, with the two `f64` details handled so it matches
@@ -1220,67 +1221,14 @@ fn frontier_val(id: u32, is_edge: bool) -> GVal {
     }
 }
 
-/// A materialized column — what a lowered traversal carries from one step to the
-/// next.
+/// The per-language half of [`crate::value::Col`].
 ///
-/// There used to be three interpreters over this, one per representation:
-/// `column_paths` over element ids, `gval_column_terminal` over boxed values and
-/// `num_column_terminal` over raw `f64`. They dispatched on the SAME step list
-/// and re-implemented the same ten operations — fold, count, dedup, paging,
-/// group-count, order — once per representation, so a terminal taught to one was
-/// missing from the others until someone noticed.
-///
-/// One interpreter dispatches on the step; this type dispatches on the
-/// representation. `Nums` earns its place by keeping numbers unboxed, which is a
-/// storage decision and not a second code path.
-enum Col<'a> {
-    /// Graph elements by dense index — a frontier.
-    Elems {
-        ids: std::borrow::Cow<'a, [u32]>,
-        is_edge: bool,
-    },
-    /// Values, as `values(k)` / `id()` / `label()` produce them.
-    Vals(Vec<GVal>),
-    /// A homogeneous number column, unboxed.
-    Nums(Vec<f64>),
-}
-
-impl<'a> Col<'a> {
-    fn len(&self) -> usize {
-        match self {
-            Self::Elems { ids, .. } => ids.len(),
-            Self::Vals(v) => v.len(),
-            Self::Nums(n) => n.len(),
-        }
-    }
-
-    /// `self[lo..hi]`, clamped. Borrowed ids stay borrowed, which is what keeps a
-    /// paging step off the frontier from copying it.
-    fn page(self, lo: usize, hi: usize) -> Self {
-        match self {
-            Self::Elems { ids, is_edge } => {
-                let lo = lo.min(ids.len());
-                let hi = hi.clamp(lo, ids.len());
-
-                Self::Elems {
-                    ids: match ids {
-                        std::borrow::Cow::Borrowed(s) => std::borrow::Cow::Borrowed(&s[lo..hi]),
-                        std::borrow::Cow::Owned(v) => std::borrow::Cow::Owned(v[lo..hi].to_vec()),
-                    },
-                    is_edge,
-                }
-            }
-            Self::Vals(mut v) => {
-                v.truncate(hi.min(v.len()));
-                Self::Vals(v.split_off(lo.min(v.len())))
-            }
-            Self::Nums(mut n) => {
-                n.truncate(hi.min(n.len()));
-                Self::Nums(n.split_off(lo.min(n.len())))
-            }
-        }
-    }
-
+/// The shared type carries the structure — how long a column is, how it pages,
+/// how it materializes. What is left here is what carries TinkerPop's semantics:
+/// identity for `dedup` and the tally for `groupCount` are this language's rules
+/// and GQL's differ, so they stay on this side and the shared type does not
+/// pretend to know them.
+impl Col<'_> {
     /// Distinct in FIRST-SEEN order.
     ///
     /// Each representation has its own notion of identity and they are NOT
@@ -1300,30 +1248,22 @@ impl<'a> Col<'a> {
                     is_edge,
                 }
             }
-            Self::Nums(n) => {
+            Self::Num { d: n, .. } => {
                 let mut seen: crate::fxhash::FxHashSet<u64> =
                     crate::fxhash::FxHashSet::with_capacity_and_hasher(n.len(), Default::default());
 
-                Self::Nums(
-                    n.into_iter()
+                Self::Num {
+                    d: n.into_iter()
                         .filter(|&x| x.is_nan() || seen.insert((x + 0.0).to_bits()))
                         .collect(),
-                )
+                    valid: None,
+                }
             }
-            Self::Vals(v) => Self::Vals(distinct_values(v.into_iter())),
-        }
-    }
-
-    /// The column as boxed values — the answer when nothing follows.
-    fn into_gvals(self, graph: &Graph) -> Vec<GVal> {
-        let _ = graph;
-
-        match self {
-            Self::Elems { ids, is_edge } => {
-                ids.iter().map(|&id| frontier_val(id, is_edge)).collect()
-            }
-            Self::Vals(v) => v,
-            Self::Nums(n) => n.into_iter().map(GVal::Num).collect(),
+            Self::Gen(v) => Self::Gen(distinct_values(v.into_iter())),
+            // Gremlin never builds a boolean column — `values(k)` over a bool
+            // property boxes — so this routes through the boxed rule rather than
+            // inventing a second one.
+            other => Self::Gen(distinct_values(other.into_vals().into_iter())),
         }
     }
 
@@ -1334,8 +1274,8 @@ impl<'a> Col<'a> {
     /// reproduce, so it declines rather than merge them.
     fn group_count(self) -> Option<Vec<(GVal, GVal)>> {
         match self {
-            Self::Nums(n) if n.iter().any(|x| x.is_nan()) => None,
-            Self::Nums(n) => {
+            Self::Num { d, .. } if d.iter().any(|x| x.is_nan()) => None,
+            Self::Num { d: n, .. } => {
                 let mut index: crate::fxhash::FxHashMap<u64, usize> =
                     crate::fxhash::FxHashMap::default();
                 let mut entries: Vec<(f64, f64)> = Vec::new();
@@ -1360,7 +1300,8 @@ impl<'a> Col<'a> {
             Self::Elems { ids, is_edge } => Some(tally_group_count(
                 ids.iter().map(|&id| frontier_val(id, is_edge)),
             )),
-            Self::Vals(v) => Some(tally_group_count(v.into_iter())),
+            Self::Gen(v) => Some(tally_group_count(v.into_iter())),
+            other => Some(tally_group_count(other.into_vals().into_iter())),
         }
     }
 }
@@ -1378,8 +1319,8 @@ fn col_terminal(graph: &Graph, col: Col, tail: &[Step]) -> Option<Vec<GVal>> {
     #[allow(clippy::cast_precision_loss)]
     match tail {
         // Nothing follows: the column IS the answer.
-        [] => Some(col.into_gvals(graph)),
-        [Step::Fold] => Some(vec![GVal::list(col.into_gvals(graph))]),
+        [] => Some(col.into_vals()),
+        [Step::Fold] => Some(vec![GVal::list(col.into_vals())]),
         // One traverser per entry, so a global count is the length and a local
         // count is 1 per row (an element and a scalar are both non-iterable).
         [Step::Count(Scope::Global)] => Some(vec![GVal::Num(col.len() as f64)]),
@@ -1404,8 +1345,15 @@ fn col_terminal(graph: &Graph, col: Col, tail: &[Step]) -> Option<Vec<GVal>> {
         // What only one representation can answer.
         _ => match col {
             Col::Elems { ids, is_edge } => elem_terminal(graph, &ids, is_edge, tail),
-            Col::Nums(nums) => num_column_terminal(graph, &nums, tail),
-            Col::Vals(_) => None,
+            // The unboxed numeric arms need a column with no nulls in it. A
+            // masked one is GQL's shape (a projection keeps the row and nulls the
+            // cell); Gremlin's `values(k)` drops the row instead, so its number
+            // columns never carry a mask and these arms are reachable.
+            Col::Num {
+                d: nums,
+                valid: None,
+            } => num_column_terminal(graph, &nums, tail),
+            _ => None,
         },
     }
 }
@@ -1833,7 +1781,14 @@ fn column_terminal(
             nums.retain(|&x| (t.test)(x));
         }
 
-        if let Some(out) = col_terminal(graph, Col::Nums(nums), tail) {
+        if let Some(out) = col_terminal(
+            graph,
+            Col::Num {
+                d: nums,
+                valid: None,
+            },
+            tail,
+        ) {
             return Some(out);
         }
 
@@ -1856,7 +1811,7 @@ fn column_terminal(
         }
     }
 
-    col_terminal(graph, Col::Vals(out), tail)
+    col_terminal(graph, Col::Gen(out), tail)
 }
 
 /// Distinct values in FIRST-SEEN order — the whole of a plain `dedup()`.
@@ -2180,7 +2135,14 @@ fn num_column_terminal(graph: &Graph, nums: &[f64], tail: &[Step]) -> Option<Vec
                 }
             });
 
-            col_terminal(graph, Col::Nums(sorted), t)
+            col_terminal(
+                graph,
+                Col::Num {
+                    d: sorted,
+                    valid: None,
+                },
+                t,
+            )
         }
         // Everything else is either generic — `col_terminal` tried those before
         // reaching here — or not a column question at all.
