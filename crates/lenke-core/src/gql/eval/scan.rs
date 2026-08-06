@@ -13,15 +13,43 @@ use crate::seek::ElementSeek;
 /// representative row from the columnar frame (grouped aggregation, sort binding).
 #[inline]
 fn bind_frame_row(b: &mut Binding, sc: &ScanCols, ri: usize) {
-    for (slot, col) in sc.slots.iter().enumerate() {
-        if let Some((elem, ids)) = col {
+    for (slot, col) in sc.cols.iter().enumerate() {
+        if let Some(Col::Elems { ids, is_edge }) = col {
             b.set(
                 slot,
-                match elem {
-                    Elem::Node => Val::Node(ids[ri]),
-                    Elem::Edge => Val::Edge(ids[ri]),
+                if *is_edge {
+                    Val::Edge(ids[ri])
+                } else {
+                    Val::Node(ids[ri])
                 },
             );
+        }
+    }
+}
+
+/// [`bind_frame_row`] plus the frame's COMPUTED columns.
+///
+/// The two are separate because they do different things, and until the frame's
+/// two column vectors became one that was easy to miss: the element loop was
+/// written out twice, once here and once there, and only one of the copies also
+/// bound a computed column. Whether the other SHOULD is a live question — a slot
+/// holding one reads as unbound from `bind_frame_row`, so an ORDER BY or GROUP BY
+/// over a bound path variable sees null — but it is a behavior question, not a
+/// refactor, so this preserves both callers exactly as they were.
+#[inline]
+pub(super) fn bind_frame_row_with_vals(b: &mut Binding, sc: &ScanCols, ri: usize) {
+    for (slot, col) in sc.cols.iter().enumerate() {
+        match col {
+            Some(Col::Elems { ids, is_edge }) => b.set(
+                slot,
+                if *is_edge {
+                    Val::Edge(ids[ri])
+                } else {
+                    Val::Node(ids[ri])
+                },
+            ),
+            Some(Col::Gen(vals)) => b.set(slot, vals[ri].clone()),
+            _ => {}
         }
     }
 }
@@ -524,11 +552,11 @@ fn driven_scan(
     sc.n = n;
 
     for (k, &(slot, kind)) in kinds.iter().enumerate() {
-        sc.slots[slot] = Some((kind, std::mem::take(&mut cols[k])));
+        sc.set_elems(slot, kind, std::mem::take(&mut cols[k]));
     }
 
     if let Some(slot) = path_slot {
-        sc.vals[slot] = Some(paths);
+        sc.set_vals(slot, paths);
     }
 
     Some(sc)
@@ -710,7 +738,7 @@ pub(super) fn streamed_frame(
         let mut start_frame = ScanCols::new(scope_len);
 
         start_frame.n = ids.len();
-        start_frame.slots[start_slot?] = Some((Elem::Node, ids));
+        start_frame.set_elems(start_slot?, Elem::Node, ids);
 
         let keep: Vec<bool> = eval_vec(graph, ctx, &start_frame, w)
             .into_truth()
@@ -719,7 +747,7 @@ pub(super) fn streamed_frame(
             .collect();
 
         compact(&mut start_frame, &keep);
-        ids = match start_frame.slots[start_slot?].take() {
+        ids = match start_frame.take_slot(start_slot?) {
             Some((_, v)) => v,
             None => return None,
         };
@@ -732,7 +760,7 @@ pub(super) fn streamed_frame(
     let mut out = ScanCols::new(scope_len);
 
     out.n = ids.len();
-    out.slots[last] = Some((Elem::Node, ids));
+    out.set_elems(last, Elem::Node, ids);
 
     Some(out)
 }
@@ -781,7 +809,7 @@ pub(super) fn build_scan(
         let mut sc = ScanCols::new(scope_len);
         sc.n = ids.len();
         if let Some(s) = node.var_slot {
-            sc.slots[s] = Some((Elem::Node, ids));
+            sc.set_elems(s, Elem::Node, ids);
         }
         return Some(sc);
     }
@@ -1002,15 +1030,15 @@ pub(super) fn expand_scan(
     // them out with everything else. This is what lets a mid-pipeline `MATCH`
     // (after a `WITH`) use the shared frontier instead of a second expander.
     if let Some(src) = carry {
-        for s in 0..scope_len.max(1).min(src.slots.len()) {
+        for s in 0..scope_len.max(1).min(src.cols.len()) {
             if Some(s) == path.start.var_slot {
                 continue;
             }
 
-            if let Some((_, ids)) = &src.slots[s] {
-                frontier.set_column(s, ids.clone());
-            } else if let Some(v) = &src.vals[s] {
-                frontier.set_values(s, v.clone());
+            if let Some((_, ids)) = src.slot(s) {
+                frontier.set_column(s, ids.to_vec());
+            } else if let Some(v) = src.val_slot(s) {
+                frontier.set_values(s, v.to_vec());
             }
         }
     }
@@ -1242,36 +1270,36 @@ pub(super) fn expand_scan(
 
     for &(s, e) in &kinds {
         if taken.insert(s) {
-            sc.slots[s] = Some((e, frontier.take_column(s).unwrap_or_default()));
+            sc.set_elems(s, e, frontier.take_column(s).unwrap_or_default());
         }
     }
 
     // …and the carried ones, fanned out by the same hops.
     if let Some(src) = carry {
-        for s in 0..sc.slots.len().min(src.slots.len()) {
+        for s in 0..sc.cols.len().min(src.cols.len()) {
             if !taken.insert(s) {
                 continue;
             }
 
-            if let Some((e, _)) = &src.slots[s] {
+            if let Some((e, _)) = src.slot(s) {
                 if let Some(ids) = frontier.take_column(s) {
-                    sc.slots[s] = Some((*e, ids));
+                    sc.set_elems(s, e, ids);
                 }
-            } else if src.vals[s].is_some() {
+            } else if src.val_slot(s).is_some() {
                 if let Some(v) = frontier.take_values(s) {
-                    sc.vals[s] = Some(v);
+                    sc.set_vals(s, v);
                 }
             }
         }
     }
 
     if let Some((slot, vals)) = path_col {
-        sc.vals[slot] = Some(vals);
+        sc.set_vals(slot, vals);
     }
 
     for &s in &built {
         if let Some(vals) = frontier.take_values(s) {
-            sc.vals[s] = Some(vals);
+            sc.set_vals(s, vals);
         }
     }
 
@@ -1597,13 +1625,13 @@ pub(super) fn edge_first_build(
     let mut sc = ScanCols::new(scope_len);
     sc.n = nrows;
     if let Some(s) = start.var_slot {
-        sc.slots[s] = Some((Elem::Node, a_ids));
+        sc.set_elems(s, Elem::Node, a_ids);
     }
     if let Some(s) = rel.var_slot {
-        sc.slots[s] = Some((Elem::Edge, r_ids));
+        sc.set_elems(s, Elem::Edge, r_ids);
     }
     if let Some(s) = node.var_slot {
-        sc.slots[s] = Some((Elem::Node, b_ids));
+        sc.set_elems(s, Elem::Node, b_ids);
     }
     Some(sc)
 }
@@ -1611,13 +1639,19 @@ pub(super) fn edge_first_build(
 /// Build a new row set holding only rows `idx`, in that order (for ORDER BY: the
 /// sorted window — gathers the few output rows instead of projecting all of `sc`).
 pub(super) fn gather_rows(sc: &ScanCols, idx: &[usize]) -> ScanCols {
-    let mut out = ScanCols::new(sc.slots.len());
+    let mut out = ScanCols::new(sc.cols.len());
     out.n = idx.len();
-    for (s, col) in sc.slots.iter().enumerate() {
-        if let Some((elem, ids)) = col {
-            out.slots[s] = Some((*elem, idx.iter().map(|&i| ids[i]).collect()));
-        } else if let Some(vals) = &sc.vals[s] {
-            out.vals[s] = Some(idx.iter().map(|&i| vals[i].clone()).collect());
+    for (s, col) in sc.cols.iter().enumerate() {
+        match col {
+            Some(Col::Elems { ids, is_edge }) => out.set_elems(
+                s,
+                if *is_edge { Elem::Edge } else { Elem::Node },
+                idx.iter().map(|&i| ids[i]).collect(),
+            ),
+            Some(Col::Gen(vals)) => {
+                out.set_vals(s, idx.iter().map(|&i| vals[i].clone()).collect());
+            }
+            _ => {}
         }
     }
     out
@@ -1627,13 +1661,13 @@ pub(super) fn gather_rows(sc: &ScanCols, idx: &[usize]) -> ScanCols {
 /// split a large frame into chunks for parallel column evaluation.
 #[cfg(feature = "parallel-query")]
 pub(super) fn slice_rows(sc: &ScanCols, lo: usize, hi: usize) -> ScanCols {
-    let mut out = ScanCols::new(sc.slots.len());
+    let mut out = ScanCols::new(sc.cols.len());
     out.n = hi - lo;
-    for s in 0..sc.slots.len() {
-        if let Some((e, ids)) = &sc.slots[s] {
-            out.slots[s] = Some((*e, ids[lo..hi].to_vec()));
+    for s in 0..sc.cols.len() {
+        if let Some((e, ids)) = sc.slot(s) {
+            out.set_elems(s, e, ids[lo..hi].to_vec());
         } else if let Some(v) = &sc.vals[s] {
-            out.vals[s] = Some(v[lo..hi].to_vec());
+            out.set_vals(s, v[lo..hi].to_vec());
         }
     }
     out
@@ -1704,29 +1738,8 @@ pub(super) fn par_project(
 
 /// Drop the rows where `keep[i]` is false, compacting every slot column in place.
 pub(super) fn compact(sc: &mut ScanCols, keep: &[bool]) {
-    for (_, v) in sc.slots.iter_mut().flatten() {
-        let mut w = 0;
-        for i in 0..v.len() {
-            if keep[i] {
-                v[w] = v[i];
-                w += 1;
-            }
-        }
-        v.truncate(w);
-    }
-    for v in sc.vals.iter_mut().flatten() {
-        let mut w = 0;
-        #[allow(
-            clippy::needless_range_loop,
-            reason = "bound by the column length; `i` indexes the keep mask and is the swap target"
-        )]
-        for i in 0..v.len() {
-            if keep[i] {
-                v.swap(w, i);
-                w += 1;
-            }
-        }
-        v.truncate(w);
+    for c in sc.cols.iter_mut().flatten() {
+        c.retain_rows(keep);
     }
     sc.n = keep.iter().filter(|&&k| k).count();
 }
@@ -2160,7 +2173,7 @@ pub(super) fn vectorized_aggregate(
         }
     };
 
-    let mut b = Binding(vec![None; sc.slots.len()]);
+    let mut b = Binding(vec![None; sc.cols.len()]);
     if proj.order_by.is_empty() {
         // No ORDER BY: emit groups in first-seen order, applying SKIP/LIMIT directly.
         let start = proj.skip_val(ctx).min(ngroups);
@@ -2439,40 +2452,27 @@ fn cross_frames(a: &ScanCols, b: &ScanCols, budget: u64) -> Option<ScanCols> {
         return None;
     }
 
-    let width = a.slots.len().max(b.slots.len());
+    let width = a.cols.len().max(b.cols.len());
     let mut out = ScanCols::new(width);
 
     out.n = n;
 
+    // Four cases collapse to two: which SIDE the slot came from decides how it is
+    // laid out, and the column knows how to repeat or tile itself whatever it
+    // holds. This used to be a branch per (side, representation) pair, and the
+    // pair that tiled a value column was the one that had to be written twice.
     for s in 0..width {
-        // `a` repeats: each of its values held for a whole pass of `b`.
-        if let Some((e, ids)) = a.slots.get(s).and_then(Option::as_ref) {
-            out.slots[s] = Some((
-                *e,
-                ids.iter()
-                    .flat_map(|&v| std::iter::repeat_n(v, b.n))
-                    .collect(),
-            ));
-        } else if let Some(v) = a.vals.get(s).and_then(Option::as_ref) {
-            out.vals[s] = Some(
-                v.iter()
-                    .flat_map(|x| std::iter::repeat_n(x.clone(), b.n))
-                    .collect(),
-            );
-        // `b` tiles: its whole column once per row of `a`.
-        } else if let Some((e, ids)) = b.slots.get(s).and_then(Option::as_ref) {
-            let mut col = Vec::with_capacity(n);
-            for _ in 0..a.n {
-                col.extend_from_slice(ids);
-            }
-            out.slots[s] = Some((*e, col));
-        } else if let Some(v) = b.vals.get(s).and_then(Option::as_ref) {
-            let mut col = Vec::with_capacity(n);
-            for _ in 0..a.n {
-                col.extend_from_slice(v);
-            }
-            out.vals[s] = Some(col);
-        }
+        let col = if let Some(c) = a.cols.get(s).and_then(Option::as_ref) {
+            // `a` repeats: each of its rows held for a whole pass of `b`.
+            c.clone().repeat_each(b.n)
+        } else if let Some(c) = b.cols.get(s).and_then(Option::as_ref) {
+            // `b` tiles: its whole column once per row of `a`.
+            c.clone().tile(a.n)
+        } else {
+            continue;
+        };
+
+        out.cols[s] = Some(col);
     }
 
     Some(out)
@@ -3005,10 +3005,10 @@ pub(super) fn project_frame_cols(
         let mut sort_sc = ScanCols::new(proj.out_len + proj.order_overlay.len());
         sort_sc.n = sc.n;
         for (j, &islot) in proj.order_overlay.iter().enumerate() {
-            if let Some((elem, ids)) = &sc.slots[islot] {
-                sort_sc.slots[proj.out_len + j] = Some((*elem, ids.clone()));
-            } else if let Some(vals) = &sc.vals[islot] {
-                sort_sc.vals[proj.out_len + j] = Some(vals.clone());
+            if let Some((elem, ids)) = sc.slot(islot) {
+                sort_sc.set_elems(proj.out_len + j, elem, ids.to_vec());
+            } else if let Some(vals) = sc.val_slot(islot) {
+                sort_sc.set_vals(proj.out_len + j, vals.to_vec());
             }
         }
 
@@ -3040,7 +3040,7 @@ pub(super) fn project_frame_cols(
                     .any(|s| crate::gql::plan::refs_slot(&s.expr, &|slot| slot == i));
 
                 if proj.distinct || read_by_sort {
-                    sort_sc.vals[i] = Some(eval_vec(graph, ctx, sc, &item.expr).into_vals());
+                    sort_sc.set_vals(i, eval_vec(graph, ctx, sc, &item.expr).into_vals());
                 }
             }
         }
@@ -3147,8 +3147,8 @@ pub(super) fn project_frame_cols(
             // them (DISTINCT forces `projected_cols`).
             let cols: Vec<&[Val]> = (0..proj.items.len())
                 .map(|i| {
-                    sort_sc.vals[i]
-                        .as_deref()
+                    sort_sc
+                        .val_slot(i)
                         .expect("distinct forces the projection above")
                 })
                 .collect();
@@ -3212,7 +3212,7 @@ pub(super) fn project_frame_cols(
                 .map(|l| (start + l).min(ngroups))
                 .unwrap_or(ngroups);
             let mut out: Vec<Vec<Val>> = vec![Vec::with_capacity(end - start); proj.items.len()];
-            let mut b = Binding(vec![None; sc.slots.len()]);
+            let mut b = Binding(vec![None; sc.cols.len()]);
             for &ri in &rep_row[start..end] {
                 bind_frame_row(&mut b, sc, ri);
                 let env = Env::new(graph, ctx, &b);
@@ -3300,15 +3300,15 @@ pub(super) fn with_frame(
     for (i, item) in proj.items.iter().enumerate() {
         if let CExpr::Var(slot) = &item.expr {
             if let Some((elem, ids)) = sc.slot(*slot) {
-                out.slots[i] = Some((elem, ids.to_vec())); // carry element column forward
+                out.set_elems(i, elem, ids.to_vec()); // carry element column forward
                 continue;
             }
             if let Some(vals) = sc.val_slot(*slot) {
-                out.vals[i] = Some(vals.to_vec()); // carry a prior computed column
+                out.set_vals(i, vals.to_vec()); // carry a prior computed column
                 continue;
             }
         }
-        out.vals[i] = Some(eval_vec(graph, ctx, sc, &item.expr).into_vals());
+        out.set_vals(i, eval_vec(graph, ctx, sc, &item.expr).into_vals());
     }
     Some(out)
 }
@@ -3345,12 +3345,12 @@ pub(super) fn with_frame_aggregate(
                 // group's representative row. (Bare element keys ⇒ `ngroups` is the
                 // real group count, so every `rep_row` entry is a live row.)
                 if let Some((elem, ids)) = sc.slot(*slot) {
-                    out.slots[i] = Some((elem, rep_row.iter().map(|&ri| ids[ri]).collect()));
+                    out.set_elems(i, elem, rep_row.iter().map(|&ri| ids[ri]).collect());
                     continue;
                 }
                 // A bare carried value column (a key from an upstream WITH): gather.
                 if let Some(vals) = sc.val_slot(*slot) {
-                    out.vals[i] = Some(rep_row.iter().map(|&ri| vals[ri].clone()).collect());
+                    out.set_vals(i, rep_row.iter().map(|&ri| vals[ri].clone()).collect());
                     continue;
                 }
             }
@@ -3363,7 +3363,7 @@ pub(super) fn with_frame_aggregate(
             .iter()
             .map(|_| Vec::with_capacity(ngroups))
             .collect();
-        let mut b = Binding(vec![None; sc.slots.len()]);
+        let mut b = Binding(vec![None; sc.cols.len()]);
         for g in 0..ngroups {
             // Rebind the representative row's element slots so a computed group key
             // (`p.age`) or an aggregate expr that references a key resolves.
@@ -3384,7 +3384,7 @@ pub(super) fn with_frame_aggregate(
             }
         }
         for (k, &i) in need_eval.iter().enumerate() {
-            out.vals[i] = Some(std::mem::take(&mut cols[k]));
+            out.set_vals(i, std::mem::take(&mut cols[k]));
         }
     }
 
@@ -3488,7 +3488,7 @@ pub(super) fn expand_frame(
     // from a scan and so checks those at seed time — there is no seed to check
     // when the start is a column that already exists.
     if start.label.is_some() || !start.props.is_empty() || start.where_.is_some() {
-        let width = scope_len.max(sc.slots.len());
+        let width = scope_len.max(sc.cols.len());
         let mut b = Binding::with_len(width);
         let mut keep = vec![false; cur.n];
 
@@ -3516,7 +3516,7 @@ pub(super) fn expand_frame(
         graph,
         ctx,
         path,
-        scope_len.max(sc.slots.len()),
+        scope_len.max(sc.cols.len()),
         endpoint,
         SeedFrom {
             cap: None,
@@ -3572,7 +3572,7 @@ pub(super) fn expand_frame_optional(
             return None;
         }
     }
-    let width = scope_len.max(sc.slots.len());
+    let width = scope_len.max(sc.cols.len());
     let rel_check = !rel.props.is_empty() || rel.where_.is_some();
     let node_check = !node.props.is_empty() || node.where_.is_some();
     let need_bind = rel_check || node_check;
@@ -3582,12 +3582,12 @@ pub(super) fn expand_frame_optional(
     let mut out = ScanCols::new(width);
     for s in 0..width {
         if Some(s) == rel.var_slot || Some(s) == node.var_slot {
-            out.vals[s] = Some(Vec::new());
-        } else if s < sc.slots.len() {
-            if let Some((e, _)) = &sc.slots[s] {
-                out.slots[s] = Some((*e, Vec::new()));
-            } else if sc.vals[s].is_some() {
-                out.vals[s] = Some(Vec::new());
+            out.set_vals(s, Vec::new());
+        } else if s < sc.cols.len() {
+            if let Some((e, _)) = sc.slot(s) {
+                out.set_elems(s, e, Vec::new());
+            } else if sc.val_slot(s).is_some() {
+                out.set_vals(s, Vec::new());
             }
         }
     }
@@ -3596,16 +3596,31 @@ pub(super) fn expand_frame_optional(
     // rel/node value columns take `rv`/`nv` (both `Val::Null` for the no-match fill).
     let push = |out: &mut ScanCols, i: usize, rv: &Val, nv: &Val| {
         for s in 0..width {
-            if Some(s) == rel.var_slot {
-                out.vals[s].as_mut().unwrap().push(rv.clone());
+            let v = if Some(s) == rel.var_slot {
+                rv.clone()
             } else if Some(s) == node.var_slot {
-                out.vals[s].as_mut().unwrap().push(nv.clone());
-            } else if s < sc.slots.len() {
-                if let Some((_, ids)) = &sc.slots[s] {
-                    out.slots[s].as_mut().unwrap().1.push(ids[i]);
-                } else if let Some(v) = &sc.vals[s] {
-                    out.vals[s].as_mut().unwrap().push(v[i].clone());
+                nv.clone()
+            } else if s < sc.cols.len() {
+                match sc.cols[s].as_ref() {
+                    Some(c) => match c {
+                        Col::Elems { ids, is_edge } => {
+                            if *is_edge {
+                                Val::Edge(ids[i])
+                            } else {
+                                Val::Node(ids[i])
+                            }
+                        }
+                        Col::Gen(vals) => vals[i].clone(),
+                        _ => continue,
+                    },
+                    None => continue,
                 }
+            } else {
+                continue;
+            };
+
+            if let Some(c) = out.cols[s].as_mut() {
+                c.push_val(&v);
             }
         }
     };
@@ -3614,8 +3629,8 @@ pub(super) fn expand_frame_optional(
     let mut nrows = 0usize;
     for i in 0..sc.n {
         if need_bind {
-            for s in 0..sc.slots.len() {
-                if let Some((e, ids)) = &sc.slots[s] {
+            for s in 0..sc.cols.len() {
+                if let Some((e, ids)) = sc.slot(s) {
                     nb.set(
                         s,
                         match e {
@@ -3623,7 +3638,7 @@ pub(super) fn expand_frame_optional(
                             Elem::Edge => Val::Edge(ids[i]),
                         },
                     );
-                } else if let Some(v) = &sc.vals[s] {
+                } else if let Some(v) = sc.val_slot(s) {
                     nb.set(s, v[i].clone());
                 }
             }

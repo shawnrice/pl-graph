@@ -515,6 +515,165 @@ impl<'a> Col<'a> {
         }
     }
 
+    /// Append one row.
+    ///
+    /// An element column takes the id out of a `Node`/`Edge`; a typed column
+    /// takes the value and marks the row invalid when it is a `Null`, allocating
+    /// the mask at that point rather than up front — a column of a thousand
+    /// numbers and one null pays for the mask once, and one with no nulls never
+    /// pays at all.
+    pub fn push_val(&mut self, v: &Value) {
+        match self {
+            Self::Elems { ids, .. } => match v {
+                Value::Node(i) | Value::Edge(i) => ids.to_mut().push(*i),
+                // Not an element: an element column cannot hold it, and silently
+                // dropping the row would misalign every other column.
+                _ => panic!("pushed a non-element into an element column"),
+            },
+            Self::Num { d, valid } => {
+                let n = d.len();
+
+                match v {
+                    Value::Num(x) => {
+                        d.push(*x);
+
+                        if let Some(m) = valid {
+                            m.push(true);
+                        }
+                    }
+                    _ => {
+                        d.push(f64::NAN);
+                        valid.get_or_insert_with(|| vec![true; n]).push(false);
+                    }
+                }
+            }
+            Self::Bool { t, valid } => {
+                let n = t.len();
+
+                match v {
+                    Value::Bool(b) => {
+                        t.push(*b);
+
+                        if let Some(m) = valid {
+                            m.push(true);
+                        }
+                    }
+                    _ => {
+                        t.push(false);
+                        valid.get_or_insert_with(|| vec![true; n]).push(false);
+                    }
+                }
+            }
+            Self::Gen(vs) => vs.push(v.clone()),
+        }
+    }
+
+    /// Each row held for `k` consecutive output rows — the LEFT side of a cross
+    /// product.
+    #[must_use]
+    pub fn repeat_each(self, k: usize) -> Self {
+        self.rebuild(&|n| (0..n).flat_map(|i| std::iter::repeat_n(i, k)).collect())
+    }
+
+    /// The whole column laid down `k` times — the RIGHT side of a cross product.
+    #[must_use]
+    pub fn tile(self, k: usize) -> Self {
+        self.rebuild(&|n| (0..k).flat_map(|_| 0..n).collect())
+    }
+
+    /// Rebuild the column by taking rows in the order `order(len)` gives.
+    ///
+    /// One gather for every reshaping — cross products, sorts, group
+    /// representatives — so a new one costs an index list rather than a match arm
+    /// per representation.
+    #[must_use]
+    fn rebuild(self, order: &dyn Fn(usize) -> Vec<usize>) -> Self {
+        let idx = order(self.len());
+        let pick =
+            |valid: Option<Vec<bool>>| valid.map(|v| idx.iter().map(|&i| v[i]).collect::<Vec<_>>());
+
+        match self {
+            Self::Elems { ids, is_edge } => Self::Elems {
+                ids: std::borrow::Cow::Owned(idx.iter().map(|&i| ids[i]).collect()),
+                is_edge,
+            },
+            Self::Num { d, valid } => Self::Num {
+                d: idx.iter().map(|&i| d[i]).collect(),
+                valid: pick(valid),
+            },
+            Self::Bool { t, valid } => Self::Bool {
+                t: idx.iter().map(|&i| t[i]).collect(),
+                valid: pick(valid),
+            },
+            Self::Gen(v) => Self::Gen(idx.iter().map(|&i| v[i].clone()).collect()),
+        }
+    }
+
+    /// Drop the rows where `keep[i]` is false, in place.
+    ///
+    /// The validity mask is compacted with the data, which is the kind of thing
+    /// that goes wrong when a column is two parallel vectors and only one of them
+    /// is a column's business.
+    pub fn retain_rows(&mut self, keep: &[bool]) {
+        fn mask(valid: &mut Option<Vec<bool>>, keep: &[bool]) {
+            if let Some(v) = valid {
+                let mut i = 0;
+
+                v.retain(|_| {
+                    let k = keep[i];
+
+                    i += 1;
+                    k
+                });
+            }
+        }
+
+        match self {
+            Self::Elems { ids, .. } => {
+                let mut i = 0;
+
+                ids.to_mut().retain(|_| {
+                    let k = keep[i];
+
+                    i += 1;
+                    k
+                });
+            }
+            Self::Num { d, valid } => {
+                let mut i = 0;
+
+                d.retain(|_| {
+                    let k = keep[i];
+
+                    i += 1;
+                    k
+                });
+                mask(valid, keep);
+            }
+            Self::Bool { t, valid } => {
+                let mut i = 0;
+
+                t.retain(|_| {
+                    let k = keep[i];
+
+                    i += 1;
+                    k
+                });
+                mask(valid, keep);
+            }
+            Self::Gen(v) => {
+                let mut i = 0;
+
+                v.retain(|_| {
+                    let k = keep[i];
+
+                    i += 1;
+                    k
+                });
+            }
+        }
+    }
+
     /// The column as boxed values, one per row. An invalid row is a `Null`.
     #[must_use]
     pub fn into_vals(self) -> Vec<Value> {

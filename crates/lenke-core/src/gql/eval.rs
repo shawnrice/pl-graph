@@ -2722,28 +2722,65 @@ enum Elem {
 #[derive(Clone)]
 struct ScanCols {
     n: usize,
-    slots: Vec<Option<(Elem, Vec<u32>)>>,
-    /// Computed value columns, parallel to `slots` (set only post-projection).
-    vals: Vec<Option<Vec<Val>>>,
+    /// One column per binding slot, whatever kind it is.
+    ///
+    /// This was TWO vectors indexed by the same slot — `slots` for element
+    /// columns and `vals` for computed ones — which is the same duality
+    /// `value::Col` exists to remove, one level up. A slot could be set in
+    /// either, so every reader had to know which to look in, and a computed
+    /// column had to be `Vec<Val>` even when it held nothing but numbers.
+    cols: Vec<Option<Col>>,
 }
 
 impl ScanCols {
     fn new(scope_len: usize) -> Self {
-        let w = scope_len.max(1);
         Self {
             n: 0,
-            slots: (0..w).map(|_| None).collect(),
-            vals: (0..w).map(|_| None).collect(),
+            cols: (0..scope_len.max(1)).map(|_| None).collect(),
         }
     }
+
+    /// The slot's ELEMENT column, if that is what it holds.
     fn slot(&self, s: usize) -> Option<(Elem, &[u32])> {
-        self.slots
-            .get(s)
-            .and_then(|o| o.as_ref())
-            .map(|(e, v)| (*e, v.as_slice()))
+        match self.cols.get(s).and_then(|o| o.as_ref()) {
+            Some(Col::Elems { ids, is_edge }) => {
+                Some((if *is_edge { Elem::Edge } else { Elem::Node }, ids.as_ref()))
+            }
+            _ => None,
+        }
     }
+
+    /// The slot's computed VALUE column, if that is what it holds.
     fn val_slot(&self, s: usize) -> Option<&[Val]> {
-        self.vals.get(s).and_then(|o| o.as_deref())
+        match self.cols.get(s).and_then(|o| o.as_ref()) {
+            Some(Col::Gen(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    fn set_elems(&mut self, s: usize, kind: Elem, ids: Vec<u32>) {
+        self.cols[s] = Some(Col::Elems {
+            ids: std::borrow::Cow::Owned(ids),
+            is_edge: kind == Elem::Edge,
+        });
+    }
+
+    /// Take the slot's element column, leaving it unset.
+    fn take_slot(&mut self, s: usize) -> Option<(Elem, Vec<u32>)> {
+        match self.cols.get_mut(s)?.take() {
+            Some(Col::Elems { ids, is_edge }) => Some((
+                if is_edge { Elem::Edge } else { Elem::Node },
+                ids.into_owned(),
+            )),
+            other => {
+                self.cols[s] = other;
+                None
+            }
+        }
+    }
+
+    fn set_vals(&mut self, s: usize, vals: Vec<Val>) {
+        self.cols[s] = Some(Col::Gen(vals));
     }
 }
 
@@ -3038,19 +3075,7 @@ fn scalar_col(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> Vec<Val> {
     // per-row subqueries (EXISTS / COUNT / pattern) and other non-vectorizable exprs land,
     // so this is often the heaviest per-row work in a projection or WHERE.
     let bind_and_eval = |b: &mut Binding, i: usize| -> Val {
-        for (slot, col) in sc.slots.iter().enumerate() {
-            if let Some((elem, ids)) = col {
-                b.set(
-                    slot,
-                    match elem {
-                        Elem::Node => Val::Node(ids[i]),
-                        Elem::Edge => Val::Edge(ids[i]),
-                    },
-                );
-            } else if let Some(vals) = &sc.vals[slot] {
-                b.set(slot, vals[i].clone());
-            }
-        }
+        bind_frame_row_with_vals(b, sc, i);
         eval(&Env::new(graph, ctx, b), e)
     };
 
@@ -3071,7 +3096,7 @@ fn scalar_col(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> Vec<Val> {
         }
     }
 
-    let mut b = Binding(vec![None; sc.slots.len()]);
+    let mut b = Binding(vec![None; sc.cols.len()]);
     (0..sc.n).map(|i| bind_and_eval(&mut b, i)).collect()
 }
 
