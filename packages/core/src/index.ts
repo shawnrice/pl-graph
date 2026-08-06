@@ -3,12 +3,15 @@ export {
   DEFAULT_CONFIG,
   Edge,
   Graph,
+  isEdgeShaped,
   isElement,
+  isVertexShaped,
   Path,
   PropertyIndex,
   Vertex,
 } from './core/index.js';
 export { isRecord, LenkeRecord } from './core/index.js';
+export { mathSign } from './numeric.js';
 export { validateLabel, validatePropertyKey, validatePropertyValue } from './core/index.js';
 
 export type {

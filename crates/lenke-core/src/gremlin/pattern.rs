@@ -572,6 +572,21 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
         }
     }
 
+    // REJECTED too, and for a different reason than the one below: letting a
+    // HOPLESS prefix compile costs almost nothing, and buys nothing either.
+    //
+    // Perf is roughly neutral — `plan_pattern_ids` on a segment-less pattern is
+    // 5us, against the 144us `V.hasLabel(V).values(n)` spends reading the
+    // properties. Measured over two alternating rounds, most shapes were neutral
+    // or slightly faster (`dedup().count()` 0.519ms -> 0.492ms, `id()` 0.415ms ->
+    // 0.402ms) and two were not: an indexed `has('n', 7).count()` went 0.032ms ->
+    // 0.040ms and `.values('n')` 0.034ms -> 0.042ms, the fixed `compile` + `Ctx`
+    // setup showing up against a query too small to hide it.
+    //
+    // The reason not to is that it removes no code. `try_values` would stop
+    // seeing hopless shapes, but it still needs `lower_prefix` to seed the ones
+    // WITH hops and `lower_hops` to walk them, so nothing can be deleted and the
+    // setup is paid for nothing.
     if segments.is_empty() {
         decline!(format!(
             "no hop; stopped at {}",

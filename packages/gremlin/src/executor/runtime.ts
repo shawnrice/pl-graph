@@ -9,6 +9,7 @@
 // `./dispatch.ts`). Those depend on each other recursively, so they stay
 // adjacent.
 
+import { isEdgeShaped, isVertexShaped } from '@lenke/core';
 import type { Edge, Graph, Vertex } from '@lenke/core';
 
 import type { By, Plan, Step } from '../ast.js';
@@ -169,11 +170,11 @@ export const incLoops = <T>(t: Traverser<T>): Traverser<T> => ({
 
 // ---------- Type guards ----------
 
-export const isVertex = (x: unknown): x is Vertex =>
-  typeof x === 'object' && x !== null && 'id' in x && !('from' in x);
+// The structural guards live in `@lenke/core`: both engines ask this question of
+// the values in their streams, and it has to have ONE answer.
+export const isVertex = (x: unknown): x is Vertex => isVertexShaped(x);
 
-export const isEdge = (x: unknown): x is Edge =>
-  typeof x === 'object' && x !== null && 'from' in x && 'to' in x;
+export const isEdge = (x: unknown): x is Edge => isEdgeShaped(x);
 
 export const firstLabel = (s: ReadonlySet<string>): string | undefined => {
   for (const l of s) {

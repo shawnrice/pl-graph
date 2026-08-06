@@ -6,6 +6,7 @@
 // first-appearance order, cycling — so `math('a + b').by('age')` sums the `age`
 // of the values tagged `a` and `b`.
 
+import { mathSign } from '@lenke/core';
 import type { Graph } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
@@ -52,17 +53,6 @@ const MATH_CONSTS: Record<string, number> = {
 
 // `math()` `signum`: -1 | 0 | 1 with NaN passing through. Matches the GQL `sign`
 // kernel (NOT `Math.sign`, whose signed-zero result diverges) and native.
-const mathSign = (x: number): number => {
-  if (Number.isNaN(x)) {
-    return Number.NaN;
-  }
-
-  if (x > 0) {
-    return 1;
-  }
-
-  return x < 0 ? -1 : 0;
-};
 
 // Dispatch a `math()` function call. `b` is defined for the 2-arg forms. Every
 // op is the SAME underlying primitive the GQL kernel uses (`Math.sin`/`**`/…),

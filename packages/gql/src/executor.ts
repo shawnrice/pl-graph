@@ -1,4 +1,4 @@
-import { DEFAULT_CONFIG } from '@lenke/core';
+import { DEFAULT_CONFIG, isEdgeShaped, isVertexShaped } from '@lenke/core';
 import type { Edge, Graph, Path, Vertex } from '@lenke/core';
 import {
   type AlgorithmName,
@@ -2993,11 +2993,14 @@ const compileLinear = (linear: LinearQuery): CLinear => {
 
 // --- write clauses -----------------------------------------------------------
 
-export const isEdge = (v: unknown): v is Edge =>
-  typeof v === 'object' && v !== null && 'from' in v && 'to' in v;
+export const isEdge = (v: unknown): v is Edge => isEdgeShaped(v);
 export const isElement = (v: unknown): v is Vertex | Edge =>
   typeof v === 'object' && v !== null && 'id' in v;
-export const isVertex = (v: unknown): v is Vertex => isElement(v) && !isEdge(v);
+// The structural guards live in `@lenke/core`: both engines ask this question of
+// the values in their streams, and it has to have ONE answer. This used to read
+// "an element that is not an edge", which called `{id, from}` with no `to` a
+// vertex where the Gremlin engine did not.
+export const isVertex = (v: unknown): v is Vertex => isVertexShaped(v);
 
 // Statement execution: writes, clause processing, set ops (see executor/clauses.ts).
 import {

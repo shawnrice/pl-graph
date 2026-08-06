@@ -19,6 +19,7 @@ import {
   ZonedDateTime,
   ZonedTime,
 } from '@lenke/core';
+import { mathSign } from '@lenke/core';
 import type { GraphLimits, Temporal } from '@lenke/core';
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
@@ -480,20 +481,10 @@ export const str = (v: unknown): string => {
 // around `Math.abs` to match the native engine bit-for-bit.
 export const roundHalfAway = (v: number): number => Math.sign(v) * Math.round(Math.abs(v));
 
-// ISO GQL `sign` → -1 | 0 | 1 (NaN passes through). NOT `Math.sign`, whose
-// signed-zero result (`Math.sign(-0) === -0`) and Rust's `f64::signum`
-// (`+1` for `0.0`) both diverge; this explicit form matches across engines.
-export const mathSign = (x: number): number => {
-  if (Number.isNaN(x)) {
-    return Number.NaN;
-  }
-
-  if (x > 0) {
-    return 1;
-  }
-
-  return x < 0 ? -1 : 0;
-};
+// `sign` lives in `@lenke/core`: the Gremlin engine needs the same one, and the
+// whole reason it is hand-written rather than `Math.sign` is cross-engine
+// agreement.
+export { mathSign };
 
 /** ISO unary string value functions: one string in, a value out. */
 export const UNARY_STR: Record<string, (s: string) => unknown> = {
