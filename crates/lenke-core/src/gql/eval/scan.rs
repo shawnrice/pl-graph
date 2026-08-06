@@ -1699,11 +1699,15 @@ pub(super) fn par_project(
     ctx: &Ctx,
     sc: &ScanCols,
     items: &[CReturnItem],
-) -> Vec<Vec<Val>> {
+) -> Vec<Col> {
+    // Columns stay COLUMNS. `eval_vec` already produces one, and boxing it here
+    // meant everything downstream — the window, DISTINCT, the row build — worked
+    // on `Vec<Val>` and could not use any of the shared column operations. A
+    // projection of numbers now reaches the output still unboxed.
     let serial = || {
         items
             .iter()
-            .map(|it| eval_vec(graph, ctx, sc, &it.expr).into_vals())
+            .map(|it| eval_vec(graph, ctx, sc, &it.expr))
             .collect()
     };
     #[cfg(feature = "parallel-query")]
@@ -1720,23 +1724,27 @@ pub(super) fn par_project(
                     .map(|c| (c * chunk, ((c + 1) * chunk).min(sc.n)))
                     .filter(|&(lo, hi)| lo < hi)
                     .collect();
-                let parts: Vec<Vec<Vec<Val>>> = ranges
+                let mut parts: Vec<Vec<Col>> = ranges
                     .par_iter()
                     .map(|&(lo, hi)| {
                         let sub = slice_rows(sc, lo, hi);
                         items
                             .iter()
-                            .map(|it| eval_vec(graph, ctx, &sub, &it.expr).into_vals())
+                            .map(|it| eval_vec(graph, ctx, &sub, &it.expr))
                             .collect()
                     })
                     .collect();
-                let mut cols: Vec<Vec<Val>> =
-                    (0..items.len()).map(|_| Vec::with_capacity(sc.n)).collect();
-                for mut part in parts {
-                    for (j, c) in part.drain(..).enumerate() {
-                        cols[j].extend(c); // moves Vals (no clone), preserves order
+                // Chunks agree on representation by construction — same
+                // expression, same frame — so `append` keeps a number column a
+                // number column across the join.
+                let mut cols = parts.remove(0);
+
+                for part in parts {
+                    for (j, c) in part.into_iter().enumerate() {
+                        cols[j].append(c);
                     }
                 }
+
                 return cols;
             }
         }
@@ -2320,7 +2328,7 @@ pub(super) fn vectorized_cols(
     incoming: &[Binding],
     matches: &[&CClause],
     proj: &CProjection,
-) -> Option<Vec<Vec<Val>>> {
+) -> Option<Vec<Col>> {
     if let Some(p) = desugar_star(proj) {
         return vectorized_cols(graph, ctx, incoming, matches, &p);
     }
@@ -2980,7 +2988,7 @@ pub(super) fn project_frame_cols(
     ctx: &Ctx,
     sc: &ScanCols,
     proj: &CProjection,
-) -> Option<Vec<Vec<Val>>> {
+) -> Option<Vec<Col>> {
     let has_order = !proj.order_by.is_empty();
     // Aggregating + ORDER BY is handled inside `vectorized_aggregate` (it sorts
     // the group rows, resolving output aliases + aggregates).
@@ -2993,7 +3001,15 @@ pub(super) fn project_frame_cols(
         if proj.having.is_some() {
             return None;
         }
-        return vectorized_aggregate(graph, ctx, sc, proj);
+        // An aggregate produces one row per group, so there is no column-scale
+        // win in keeping it typed — `Col::Gen` wraps what it already built, at no
+        // cost, so both halves of this function return the same thing.
+        return Some(
+            vectorized_aggregate(graph, ctx, sc, proj)?
+                .into_iter()
+                .map(Col::Gen)
+                .collect(),
+        );
     }
 
     // ORDER BY (input-keyed): evaluate the sort keys as columns, sort row indices,
@@ -3190,7 +3206,7 @@ pub(super) fn project_frame_cols(
         return Some(
             proj.items
                 .iter()
-                .map(|item| eval_vec(graph, ctx, &sub, &item.expr).into_vals())
+                .map(|item| eval_vec(graph, ctx, &sub, &item.expr))
                 .collect(),
         );
     }
@@ -3212,13 +3228,13 @@ pub(super) fn project_frame_cols(
                     out[item_idx].push(eval(&env, &item.expr));
                 }
             }
-            return Some(out);
+            return Some(out.into_iter().map(Col::Gen).collect());
         }
     }
 
     // Non-aggregating projection: evaluate each item as a column (parallel over
     // row-chunks for a large frame).
-    let mut cols: Vec<Vec<Val>> = par_project(graph, ctx, sc, &proj.items);
+    let mut cols: Vec<Col> = par_project(graph, ctx, sc, &proj.items);
     if proj.distinct {
         // Generic DISTINCT (expression / non-typed items): the first occurrence of
         // each row in scan order, keyed on a composite of its cells. The bucketing
@@ -3236,7 +3252,7 @@ pub(super) fn project_frame_cols(
                 let mut key = String::new();
 
                 for c in &cols {
-                    val_key(&c[i], &mut key);
+                    c.with_val_at(i, |v| val_key(v, &mut key));
                     key.push('\u{1}');
                 }
 
@@ -3253,17 +3269,15 @@ pub(super) fn project_frame_cols(
 
         Some(
             cols.iter()
-                .map(|c| kept.iter().map(|&i| c[i].clone()).collect())
+                .map(|c| Col::Gen(kept.iter().map(|&i| c.val_at(i)).collect()))
                 .collect(),
         )
     } else {
-        // Window each column to the SKIP/LIMIT row range (no ORDER BY ⇒ scan order).
+        // Window each column to the SKIP/LIMIT row range (no ORDER BY ⇒ scan
+        // order) — `Col::page`, the same slice Gremlin's paging steps take.
         let (start, end) = proj.window(ctx, sc.n);
-        for c in &mut cols {
-            c.truncate(end);
-            c.drain(0..start);
-        }
-        Some(cols)
+
+        Some(cols.drain(..).map(|c| c.page(start, end)).collect())
     }
 }
 

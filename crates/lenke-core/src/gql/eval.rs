@@ -4025,7 +4025,10 @@ fn finish_linear(graph: &Graph, ctx: &Ctx, sc: ScanCols, proj: &CProjection) -> 
     let mut rs = RowSet::new(proj.out_names.clone());
 
     for i in 0..nrows {
-        rs.push_row(cols.iter().map(|c| val_to_value(graph, &c[i])));
+        rs.push_row(
+            cols.iter()
+                .map(|c| c.with_val_at(i, |v| val_to_value(graph, v))),
+        );
     }
 
     // A data exception during vectorized eval can't return `Err` from here; fall
@@ -4073,7 +4076,10 @@ fn project_to_rows(
             let nrows = cols.first().map_or(0, |c| c.len());
             let mut rs = RowSet::new(proj.out_names.clone());
             for i in 0..nrows {
-                rs.push_row(cols.iter().map(|c| val_to_value(graph, &c[i])));
+                rs.push_row(
+                    cols.iter()
+                        .map(|c| c.with_val_at(i, |v| val_to_value(graph, v))),
+                );
             }
             return rs;
         }

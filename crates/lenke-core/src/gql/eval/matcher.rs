@@ -1102,7 +1102,7 @@ pub(super) fn project_matches(
             // handles (a carried node stays `Val::Node`, not flattened to an id).
             let nrows = cols.first().map_or(0, |c| c.len());
             return (0..nrows)
-                .map(|i| Binding(cols.iter().map(|c| Some(c[i].clone())).collect()))
+                .map(|i| Binding(cols.iter().map(|c| Some(c.val_at(i))).collect()))
                 .collect();
         }
     }
