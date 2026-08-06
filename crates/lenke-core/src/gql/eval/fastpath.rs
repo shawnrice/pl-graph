@@ -1579,9 +1579,6 @@ pub(super) fn try_count_semi_join(
         },
         _ => return None,
     };
-    if inner_where.is_some() {
-        return None;
-    }
     let [inner] = inner_patterns.as_slice() else {
         return None;
     };
@@ -1595,8 +1592,6 @@ pub(super) fn try_count_semi_join(
         || !inner.start.props.is_empty()
         || inner.start.where_.is_some()
         || seg.node.var_slot == Some(a_slot)
-        || !seg.node.props.is_empty()
-        || seg.node.where_.is_some()
     {
         return None;
     }
@@ -1610,21 +1605,55 @@ pub(super) fn try_count_semi_join(
         return None;
     }
 
+    // A correlated inner WHERE reads `a`, and this seeds from `b` — so it cannot
+    // be applied while walking backwards. Only a constraint purely on `b`.
+    let b_slot = seg.node.var_slot;
+
+    if inner_where
+        .as_ref()
+        .is_some_and(|w| crate::gql::plan::refs_slot(w, &|s| Some(s) != b_slot))
+    {
+        return None;
+    }
+
     let ctx = resolve_ctx(graph, plan, params);
     let la = outer.start.label.as_ref();
-    let lb = seg.node.label.as_ref();
     let tset = rel_type_set(&ctx, rel.label.as_ref())?;
     let need_extra_tset = set_needs_extra(graph, &tset);
-    // `Lb` must seed a bucket; only reverse-seed when it's smaller than `La`.
-    let lb_bucket: &[u32] = lb
-        .and_then(seed_label)
-        .and_then(|r| ctx.labels[r].0)
-        .map_or(&[], |lid| graph.vertices_with_label(lid));
     let la_card = match la.and_then(seed_label).and_then(|r| ctx.labels[r].0) {
         Some(lid) => graph.vertices_with_label(lid).len(),
         None => graph.vertex_count(),
     };
-    if lb.is_none() || lb_bucket.len() >= la_card {
+    // Seed `b` through the SHARED node scan rather than a label bucket. The
+    // bucket was the only seed this understood, so `EXISTS { (a)-[:R]->(b) WHERE
+    // b.n = 7 }` — a constraint that makes `b` far MORE selective, which is
+    // exactly what a reverse join wants — declined and fell to testing all 20k
+    // outer rows: 3.7ms, against 0.646ms for the Gremlin spelling of the same
+    // question. `scan_node` seeks an index when one applies, scans when not, and
+    // re-checks whatever it could not lower, so the set is exact.
+    //
+    // The node carries the inner WHERE so the residual applies it; the same
+    // expression is the seek anchor.
+    let b_node = crate::gql::plan::CNode {
+        where_: inner_where
+            .as_deref()
+            .cloned()
+            .or_else(|| seg.node.where_.clone()),
+        ..seg.node.clone()
+    };
+    let scope_len = b_slot.map_or(1, |s| s + 1);
+    let b_candidates = crate::gql::eval::seek_lower::scan_node(
+        graph,
+        &ctx,
+        &b_node,
+        inner_where.as_deref(),
+        scope_len,
+        None,
+    );
+    let lb_bucket: &[u32] = &b_candidates;
+    // Only reverse-seed when `b` is the smaller end; otherwise the forward test
+    // is the cheaper one and this would be a pessimization.
+    if lb_bucket.len() >= la_card {
         return None;
     }
 
@@ -1633,9 +1662,7 @@ pub(super) fn try_count_semi_join(
     let out_side = rel.direction == Direction::In;
     let mut preds: FxHashSet<u32> = FxHashSet::default();
     for &b in lb_bucket {
-        if !matches_label(graph, &ctx, b, lb) {
-            continue; // conjunct label: the bucket is only a superset
-        }
+        // `scan_node` already applied the label, the inline props and the WHERE.
         let keep = |adj: &Adj| {
             etype_hit(graph, &tset, adj, need_extra_tset) && matches_label(graph, &ctx, adj.nbr, la)
         };

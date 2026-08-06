@@ -790,12 +790,23 @@ fn has_adj(graph: &Graph, t: &Trav, hop: &SemiJoin) -> bool {
         // Short-circuits on the first neighbour that passes, which is the point:
         // the body is an existence test, so a high-degree vertex with an early
         // match costs one edge rather than its whole adjacency.
-        .any(|a| match &hop.landed {
-            None => true,
-            Some(want) => graph
-                .vertex_labels(a.nbr)
-                .iter()
-                .any(|lid| want.contains(lid)),
+        .any(|a| {
+            let label_ok = match &hop.landed {
+                None => true,
+                Some(want) => graph
+                    .vertex_labels(a.nbr)
+                    .iter()
+                    .any(|lid| want.contains(lid)),
+            };
+
+            label_ok
+                && match &hop.prop {
+                    None => true,
+                    Some((kid, want)) => {
+                        GVal::from_column(&graph.props, *kid, a.nbr as usize, &graph.strs, false)
+                            == *want
+                    }
+                }
         }),
         _ => false,
     }
@@ -836,12 +847,22 @@ fn semi_join_hop(graph: &Graph, steps: &[Step]) -> Option<SemiJoin> {
     // must match no vertex, while NO `hasLabel` at all must match every one. A
     // `Vec` alone spells both as empty and would have turned `hasLabel('NOPE')`
     // into "any vertex", which is the opposite answer.
-    let landed = match tail {
-        [] => None,
-        [Step::HasLabel(names)] if vertex_hop => {
-            Some(names.iter().filter_map(|l| graph.labels.get(l)).collect())
+    // What the landed vertex must satisfy. ONE test, and only the two the
+    // adjacency can answer per neighbour — anything else asks something it
+    // cannot, and the stream keeps it.
+    //
+    // A property key is resolved to its column id HERE, not per neighbour:
+    // hashing the name once per edge walked made the shortcut SLOWER than the
+    // stream it replaced, 4.52ms against 3.72ms over 20k vertices.
+    let (landed, prop) = match tail {
+        [] => (None, None),
+        [Step::HasLabel(names)] if vertex_hop => (
+            Some(names.iter().filter_map(|l| graph.labels.get(l)).collect()),
+            None,
+        ),
+        [Step::Has(key, P::Eq(v))] if vertex_hop => {
+            (None, Some((graph.props.keys.get(key)?, v.clone())))
         }
-        // Anything else asks something the adjacency cannot answer on its own.
         _ => return None,
     };
 
@@ -849,6 +870,7 @@ fn semi_join_hop(graph: &Graph, steps: &[Step]) -> Option<SemiJoin> {
         dir,
         etypes,
         landed,
+        prop,
     })
 }
 
@@ -860,6 +882,9 @@ struct SemiJoin {
     /// Label ids the landed vertex must carry ONE of. `None` = no label test;
     /// `Some(vec![])` = a test no vertex can pass.
     landed: Option<Vec<u32>>,
+    /// An equality the landed vertex's property must satisfy, with the key
+    /// already resolved to its column id.
+    prop: Option<(u32, GVal)>,
 }
 
 /// The element ids a lowered prefix plus expansion chain produces, and whatever

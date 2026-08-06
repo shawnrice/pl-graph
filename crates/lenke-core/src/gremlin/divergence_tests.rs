@@ -2846,6 +2846,18 @@ fn a_semi_join_over_the_frontier_matches_the_streamed_body() {
         "__.both('R').hasLabel('W')",
         // A bare hop still works — that arm predates this.
         "__.out('R')",
+        // A property EQUALITY on the landed vertex, the sibling of the label
+        // test. Streamed it cost 3.71ms over 20k vertices against 0.646ms here.
+        "__.out('R').has('n', 2)",
+        "__.in('R').has('n', 2)",
+        "__.both('R').has('n', 2)",
+        // A value nothing carries, and a key nothing carries.
+        "__.out('R').has('n', 999)",
+        "__.out('R').has('nope', 1)",
+        // A RANGE is `P`'s business, not the adjacency's — it must decline.
+        "__.out('R').has('n', gt(1))",
+        // On an EDGE hop `has` reads the EDGE's property, not a vertex's.
+        "__.outE('R').has('w', 1)",
         "__.out('S')",
         // An UNKNOWN label matches no vertex. It must not read as "no label
         // test": an unknown name resolves to an empty id list, and empty is also

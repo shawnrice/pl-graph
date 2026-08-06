@@ -12514,3 +12514,81 @@ fn an_unindexed_inline_edge_constraint_still_matches_every_row() {
         unindexed
     );
 }
+
+/// The reverse semi-join agrees with the general path, including on everything
+/// it must decline.
+///
+/// `try_count_semi_join` answers `count(*)` over `[NOT] EXISTS { (a)-[:T]->(b) }`
+/// by seeding `b` and walking BACK, instead of testing every `a`. It only
+/// understood a label bucket as the seed — so `EXISTS { (a)-[:R]->(b) WHERE
+/// b.n = 7 }`, a constraint that makes `b` far more selective and is exactly
+/// what a reverse join wants, declined and tested all 20k outer rows: 3.7ms,
+/// against 0.037ms once it seeds through the shared node scan.
+///
+/// `with_vec_override(false, …)` turns the shortcut off, so each query below is
+/// answered twice by two different machines.
+#[test]
+fn the_reverse_semi_join_agrees_with_the_general_path() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["P"],"properties":{"n":7,"s":"x"}}"#,
+        r#"{"type":"node","id":"b","labels":["P","W"],"properties":{"n":7,"s":"y"}}"#,
+        r#"{"type":"node","id":"c","labels":["P"],"properties":{"n":1,"s":"x"}}"#,
+        r#"{"type":"node","id":"d","labels":["Q"],"properties":{"n":7}}"#,
+        // No `n` at all.
+        r#"{"type":"node","id":"e","labels":["P"],"properties":{"s":"z"}}"#,
+        r#"{"type":"edge","id":"r0","labels":["R"],"from":"a","to":"b","properties":{}}"#,
+        r#"{"type":"edge","id":"r1","labels":["R"],"from":"a","to":"c","properties":{}}"#,
+        r#"{"type":"edge","id":"r2","labels":["R"],"from":"c","to":"d","properties":{}}"#,
+        r#"{"type":"edge","id":"r3","labels":["S"],"from":"e","to":"b","properties":{}}"#,
+        // A SELF LOOP, which the shortcut refuses (it would count `a` as its own
+        // predecessor).
+        r#"{"type":"edge","id":"r4","labels":["R"],"from":"e","to":"e","properties":{}}"#,
+    ]);
+
+    for query in [
+        // The shape the seed now reaches.
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:R]->(b) WHERE b.n = 7 } RETURN count(*) AS c",
+        "MATCH (a:P) WHERE NOT EXISTS { MATCH (a)-[:R]->(b) WHERE b.n = 7 } RETURN count(*) AS c",
+        // The inline spelling of the same constraint.
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:R]->(b {n: 7}) } RETURN count(*) AS c",
+        // A label AND a where.
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:R]->(b:W) WHERE b.n = 7 } RETURN count(*) AS c",
+        // A key no element carries, and one that matches nothing.
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:R]->(b) WHERE b.missing = 1 } RETURN count(*) AS c",
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:R]->(b) WHERE b.n = 999 } RETURN count(*) AS c",
+        // NOT seekable — a range, which `scan_node` scans and residual-filters.
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:R]->(b) WHERE b.n > 1 } RETURN count(*) AS c",
+        // The other direction.
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)<-[:R]-(b) WHERE b.n = 7 } RETURN count(*) AS c",
+        // A CORRELATED inner where reads `a`, which a backward walk cannot apply
+        // — it has to decline and still answer.
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:R]->(b) WHERE b.n = a.n } RETURN count(*) AS c",
+        // No outer label: `a` is every vertex.
+        "MATCH (a) WHERE EXISTS { MATCH (a)-[:R]->(b) WHERE b.n = 7 } RETURN count(*) AS c",
+        // Nothing selective about `b` — the forward test is cheaper and this
+        // declines.
+        "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:R]->(b) } RETURN count(*) AS c",
+    ] {
+        assert_eq!(
+            rows(&mut g, query),
+            super::eval::with_vec_override(false, || rows(&mut g, query)),
+            "the reverse semi-join disagrees with the general path on `{query}`"
+        );
+    }
+
+    // The answers themselves, so the pairs cannot agree by both being wrong.
+    // `a` reaches `b` (n = 7) and `c` reaches `d` (n = 7); `b` has no out-R and
+    // `e` only loops to itself, which has no `n`.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:P) WHERE EXISTS { MATCH (a)-[:R]->(b) WHERE b.n = 7 } RETURN count(*) AS c"
+        ),
+        vec![vec![n(2.0)]]
+    );
+    // Four P vertices, so three do not.
+    assert_eq!(
+        rows(&mut g, "MATCH (a:P) WHERE NOT EXISTS { MATCH (a)-[:R]->(b) WHERE b.n = 7 } RETURN count(*) AS c"),
+        vec![vec![n(2.0)]]
+    );
+}
