@@ -126,6 +126,10 @@ pub struct LabelFilter {
 
 /// One branch of an `OR` — its own conjunction of predicates.
 pub type Branch = Vec<KeyPredicate>;
+
+/// One branch of a disjunction, compiled to column tests — every one must hold
+/// for that branch to match.
+type BranchTests<'g> = Vec<Box<dyn Fn(u32) -> bool + 'g>>;
 /// One `OR`: a union over branches. Named because the alternative is a
 /// `Vec<Vec<Vec<KeyPredicate>>>` whose levels nobody can keep straight.
 #[derive(Clone, Debug, PartialEq)]
@@ -179,6 +183,22 @@ pub struct ElementSeek {
     /// and keep their own evaluator — lowering what fits is the point, not
     /// lowering everything.
     labels: Option<LabelFilter>,
+    /// Key PRESENCE, conjunctive like [`Self::conj`]: `(key, must_be_present)`.
+    ///
+    /// Every column already carries a `present` bitmap and every [`SeekOp`] tests
+    /// it, so this is the one predicate the IR could not spell despite the
+    /// storage supporting it directly. Gremlin's `has(k)` / `hasKey(k)` /
+    /// `hasNot(k)` are exactly it.
+    ///
+    /// Presence is NOT "is not null" — a stored null is PRESENT in this engine
+    /// (see the null-as-a-value model). GQL's `IS NOT NULL` is a value test and
+    /// does not lower here; `IS NULL` over an absent key is true, which presence
+    /// alone cannot answer.
+    ///
+    /// It never SEEDS. An index maps values to elements and absence has no value
+    /// to look up, so this only ever narrows candidates a bucket or another
+    /// predicate produced.
+    presence: Vec<(Arc<str>, bool)>,
 }
 
 impl ElementSeek {
@@ -189,6 +209,7 @@ impl ElementSeek {
             conj: Vec::new(),
             disj: Vec::new(),
             labels: None,
+            presence: Vec::new(),
         }
     }
 
@@ -199,6 +220,7 @@ impl ElementSeek {
             conj: Vec::new(),
             disj: Vec::new(),
             labels: None,
+            presence: Vec::new(),
         }
     }
 
@@ -212,15 +234,23 @@ impl ElementSeek {
         }
     }
 
-    /// True when no PROPERTY predicate was recognized — the caller should scan.
+    /// True when this constrains NOTHING about an element's properties — the
+    /// caller should scan, and a shortcut that answers from a bucket alone is
+    /// entitled to.
     ///
-    /// A label filter may still be present; this is deliberately the same test as
-    /// [`conj_is_empty`](Self::conj_is_empty). "Nothing at all" is
+    /// A label filter may still be present. "Nothing at all" is
     /// `is_empty() && labels().is_none()` — reading this as the latter let a
     /// `hasLabel(…)` be silently ignored by a count shortcut.
+    ///
+    /// This counts PRESENCE and [`conj_is_empty`](Self::conj_is_empty) does not,
+    /// which is the one place the two differ. A presence test narrows, so a
+    /// bucket-length answer would be wrong; but it also never seeds, so it is not
+    /// a reason to refuse to lower. The two questions are "may I skip the scan
+    /// entirely" and "did anything here give me a seed", and a presence test
+    /// answers them differently.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.conj.is_empty() && self.disj.is_empty()
+        self.conj.is_empty() && self.disj.is_empty() && self.presence.is_empty()
     }
 
     /// The label constraint, if one was lowered.
@@ -229,10 +259,113 @@ impl ElementSeek {
         self.labels.as_ref()
     }
 
-    /// True when no property predicate was lowered (a label may still be).
+    /// True when nothing here can produce a SEED (a label may still). Presence
+    /// deliberately does not count — see [`is_empty`](Self::is_empty).
     #[must_use]
     pub fn conj_is_empty(&self) -> bool {
         self.conj.is_empty() && self.disj.is_empty()
+    }
+
+    /// Narrow `ids` to those satisfying every disjunction — each an OR of
+    /// branches, each branch an AND of comparisons.
+    ///
+    /// A disjunction used to be a SEED and nothing else: `resolve` unions the
+    /// branches' index lookups, and if there was no index to look up, the
+    /// disjunction was silently not applied at all. That is why [`columnar`] has
+    /// always refused to call a seek with one "equivalent to the front end's own
+    /// filters" — it was not, and every caller that asked had to fall back to
+    /// running the query the slow way.
+    ///
+    /// Applying it here makes the seek exact whether or not an index answered it,
+    /// which is what lets the gate relax. Re-applying a disjunction that DID seed
+    /// is redundant, not wrong: it selects the same elements a second time.
+    ///
+    /// A branch whose operand does not resolve, or whose comparison the column
+    /// cannot run, makes that branch match NOTHING here — so the disjunction is
+    /// only applied when [`columnar`] has established that every branch resolves.
+    fn retain_disj(&self, graph: &Graph, param: &impl Bindings, ids: &mut Vec<u32>) {
+        for d in &self.disj {
+            if let Some(tests) = self.disj_tests(graph, param, d) {
+                ids.retain(|&id| tests.iter().any(|b| b.iter().all(|t| t(id))));
+            }
+        }
+    }
+
+    /// One disjunction compiled to per-branch column tests, or `None` when it
+    /// cannot be run column-at-a-time.
+    ///
+    /// A branch that lost a comparison on the way in would match TOO MUCH, so an
+    /// incomplete lowering drops the whole disjunction rather than applying a
+    /// widened version of it. Dropping is safe in both directions: the caller
+    /// only treats the seek as exact when [`columnar`](Self::columnar) agreed,
+    /// and that asks the same question this does.
+    fn disj_tests<'g>(
+        &self,
+        graph: &'g Graph,
+        param: &impl Bindings,
+        d: &Disjunction,
+    ) -> Option<Vec<BranchTests<'g>>> {
+        let branches: Vec<Branch> = match d {
+            Disjunction::Branches(bs) => bs.clone(),
+            Disjunction::AnyOfParam { key, slot } => param
+                .list(*slot)?
+                .into_iter()
+                .map(|v| {
+                    vec![KeyPredicate {
+                        key: key.clone(),
+                        op: SeekOp::Eq,
+                        operand: Operand::Lit(v),
+                    }]
+                })
+                .collect(),
+        };
+        let tests: Vec<Vec<_>> = branches
+            .iter()
+            .map(|b| {
+                b.iter()
+                    .filter_map(|p| {
+                        p.operand
+                            .resolve(param)
+                            .and_then(|k| column_matches(graph, &p.key, self.edge, p.op, &k))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        tests
+            .iter()
+            .zip(&branches)
+            .all(|(t, b)| t.len() == b.len())
+            .then_some(tests)
+    }
+
+    /// Narrow `ids` to those whose presence tests all hold.
+    ///
+    /// A key the store has never seen has no column, so nothing carries it:
+    /// everything fails a `must be present` and everything passes a `must be
+    /// absent`.
+    fn retain_present(&self, graph: &Graph, ids: &mut Vec<u32>) {
+        let store = if self.edge {
+            &graph.edge_props
+        } else {
+            &graph.props
+        };
+
+        for (key, want) in &self.presence {
+            // `is_present_id` rather than a `present` bitmap directly: a `Mixed`
+            // column has none (presence is `Some`), and a `Record` column counts
+            // an escaped value as present. Reading the bitmap would have been
+            // right for the four packed shapes and wrong for the other two.
+            match store.keys.get(key) {
+                Some(kid) => ids.retain(|&i| store.is_present_id(i as usize, kid) == *want),
+                // No column at all: nothing carries the key.
+                None if *want => {
+                    ids.clear();
+                    return;
+                }
+                None => {}
+            }
+        }
     }
 
     /// Constrain to elements carrying one of `ids`, under `rule`.
@@ -378,6 +511,11 @@ impl ElementSeek {
         self.conj_push(KeyPredicate { key, op, operand });
     }
 
+    /// Require `key` to be present (or, with `want` false, absent).
+    pub fn push_presence(&mut self, key: Arc<str>, want: bool) {
+        self.presence.push((key, want));
+    }
+
     /// An already-built conjunct.
     pub fn conj_push(&mut self, p: KeyPredicate) {
         self.conj.push(p);
@@ -504,13 +642,26 @@ impl ElementSeek {
     /// own filters — see [`column_matches`] for why the types must line up.
     #[must_use]
     pub fn columnar(&self, graph: &Graph, param: &impl Bindings) -> bool {
-        self.disj.is_empty()
-            && !self.conj.is_empty()
-            && self.conj.iter().all(|p| {
-                p.operand
-                    .resolve(param)
-                    .and_then(|k| column_matches(graph, &p.key, self.edge, p.op, &k))
-                    .is_some()
+        let runs = |p: &KeyPredicate| {
+            p.operand
+                .resolve(param)
+                .and_then(|k| column_matches(graph, &p.key, self.edge, p.op, &k))
+                .is_some()
+        };
+
+        (!self.conj.is_empty() || !self.disj.is_empty())
+            && self.conj.iter().all(runs)
+            // A disjunction used to disqualify a seek outright, because it was a
+            // SEED and nothing more — with no index it simply did not apply. Now
+            // `retain_disj` runs it column-at-a-time like the conjuncts, so the
+            // question is the same one: can every comparison in it run.
+            //
+            // `AnyOfParam` holds values that do not exist until the parameters are
+            // bound, so the branches cannot be checked here. It keeps the old
+            // answer.
+            && self.disj.iter().all(|d| match d {
+                Disjunction::Branches(bs) => bs.iter().all(|b| b.iter().all(runs)),
+                Disjunction::AnyOfParam { .. } => false,
             })
     }
 
@@ -658,6 +809,8 @@ impl ElementSeek {
                 }
             }
 
+            self.retain_present(graph, &mut ids);
+            self.retain_disj(graph, param, &mut ids);
             ids.retain(|&id| residual(id));
 
             return ids;
@@ -675,12 +828,41 @@ impl ElementSeek {
                     .and_then(|k| column_matches(graph, &p.key, self.edge, p.op, &k))
             })
             .collect();
+        // Presence resolves to a key id once and then tests per element, like the
+        // conjuncts above it. A key with no column fails every `present` test, so
+        // an unresolvable one becomes a test that always says no rather than a
+        // test that is skipped.
+        let store = if self.edge {
+            &graph.edge_props
+        } else {
+            &graph.props
+        };
+        let presence: Vec<(Option<u32>, bool)> = self
+            .presence
+            .iter()
+            .map(|(k, want)| (store.keys.get(k), *want))
+            .collect();
+        // The disjunctions, in the same per-element form. Leaving them out of this
+        // path was invisible while a disjunction disqualified the seek outright;
+        // now that `columnar` accepts one, a capped scan that ignored it would
+        // return the wrong rows rather than merely too many.
+        let disj: Vec<_> = self
+            .disj
+            .iter()
+            .filter_map(|d| self.disj_tests(graph, param, d))
+            .collect();
         let c = cap.unwrap_or(usize::MAX);
         let mut out = Vec::with_capacity(c.min(ids.len()));
 
         for id in ids.drain(..) {
             if (!labelled || self.label_ok(graph, id))
                 && tests.iter().all(|t| t(id))
+                && disj
+                    .iter()
+                    .all(|d| d.iter().any(|b| b.iter().all(|t| t(id))))
+                && presence.iter().all(|(kid, want)| {
+                    kid.is_some_and(|k| store.is_present_id(id as usize, k)) == *want
+                })
                 && residual(id)
             {
                 out.push(id);

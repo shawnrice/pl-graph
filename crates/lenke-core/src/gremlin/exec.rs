@@ -652,7 +652,40 @@ fn lower_prefix(graph: &Graph, steps: &[Step]) -> Option<(ElementSeek, Vec<usize
                     }
                 }
             }
-            Step::HasLabel(..) | Step::HasNot(..) => {}
+            // `or(has(k, v), has(k, w))` is the shape the seek's BRANCHES were
+            // built for — an outer union of inner conjunctions, the same
+            // structure `within(v, w)` and GQL's `k = $a OR k = $b` already
+            // lower to. Run per traverser it is a sub-traversal each, which over
+            // 20k vertices was 3.182ms against 0.154ms for the GQL spelling.
+            //
+            // Deliberately narrow: ONE comparison per branch, built here rather
+            // than through `lower_predicate`. A conjunct that fails to lower is
+            // harmless (the seed is a superset and the step re-checks), but a
+            // BRANCH that fails to lower LOSES ROWS, and capturing the step means
+            // there is no step left to re-check. Anything else declines.
+            Step::Or(plans) => {
+                if let Some(branches) = or_branches(plans) {
+                    seek.push_branches(branches);
+                    captured.push(i);
+                }
+            }
+            // Key PRESENCE, which the shared seek can now spell. `hasKey` takes
+            // several names and means ANY of them — a disjunction, not a
+            // conjunction — so only the single-key form lowers. The rest fall
+            // through UNCAPTURED, which makes the whole run decline, as before.
+            Step::HasKey(keys) => {
+                if let [k] = keys.as_slice() {
+                    seek.push_presence(Arc::from(k.as_str()), true);
+                    captured.push(i);
+                }
+            }
+            Step::HasNot(keys) => {
+                if let [k] = keys.as_slice() {
+                    seek.push_presence(Arc::from(k.as_str()), false);
+                    captured.push(i);
+                }
+            }
+            Step::HasLabel(..) => {}
             _ => break,
         }
 
@@ -2426,6 +2459,38 @@ fn index_seed(graph: &Graph, steps: &[Step]) -> Option<(Vec<Trav>, Vec<usize>)> 
 /// Returns whether the predicate was captured IN FULL. A `false` means the seek
 /// only approximates it (or ignores it), so the step must still run — dropping
 /// it would silently lose the filter. `neq` and the text predicates land here.
+/// Each branch of an `or()` as a one-comparison conjunction, or `None` if any of
+/// them is anything else.
+///
+/// See the call site for why this is stricter than the conjunctive lowering: a
+/// missing conjunct widens a candidate set that is re-checked anyway, a missing
+/// branch drops rows nothing will bring back.
+fn or_branches(plans: &[Traversal]) -> Option<Vec<Vec<KeyPredicate>>> {
+    let mut branches = Vec::with_capacity(plans.len());
+
+    for plan in plans {
+        let [Step::Has(key, pred)] = plan.steps.as_slice() else {
+            return None;
+        };
+        let (op, v) = match pred {
+            P::Eq(v) => (SeekOp::Eq, v),
+            P::Gt(v) => (SeekOp::Gt, v),
+            P::Gte(v) => (SeekOp::Ge, v),
+            P::Lt(v) => (SeekOp::Lt, v),
+            P::Lte(v) => (SeekOp::Le, v),
+            _ => return None,
+        };
+
+        branches.push(vec![KeyPredicate {
+            key: Arc::from(key.as_str()),
+            op,
+            operand: Operand::Lit(gval_to_idxkey(v)?),
+        }]);
+    }
+
+    (!branches.is_empty()).then_some(branches)
+}
+
 fn lower_predicate(key: &str, pred: &P, seek: &mut ElementSeek) -> bool {
     let key: Arc<str> = Arc::from(key);
     let lit = |v: &GVal| gval_to_idxkey(v).map(Operand::Lit);

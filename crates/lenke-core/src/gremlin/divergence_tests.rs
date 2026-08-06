@@ -3545,6 +3545,66 @@ fn zzz_lower_probe() {
             "MATCH (u:V) RETURN u.k AS k",
             "g.V().hasLabel('V').values('k')",
         ),
+        (
+            "a range predicate",
+            "MATCH (u:V) WHERE u.n >= 20 AND u.n < 60 RETURN count(*) AS c",
+            "g.V().hasLabel('V').has('n', between(20, 60)).count()",
+        ),
+        (
+            "an OR of two equalities",
+            "MATCH (u:V) WHERE u.n = 3 OR u.n = 9 RETURN count(*) AS c",
+            "g.V().hasLabel('V').or(__.has('n', 3), __.has('n', 9)).count()",
+        ),
+        (
+            "a negated predicate",
+            "MATCH (u:V) WHERE NOT u.n = 3 RETURN count(*) AS c",
+            "g.V().hasLabel('V').not(__.has('n', 3)).count()",
+        ),
+        (
+            "does the key exist at all",
+            "MATCH (u:V) WHERE u.n IS NOT NULL RETURN count(*) AS c",
+            "g.V().hasLabel('V').has('n').count()",
+        ),
+        (
+            "a string prefix scan",
+            "MATCH (u:V) WHERE u.k = 'key000005' RETURN count(*) AS c",
+            "g.V().hasLabel('V').has('k', 'key000005').count()",
+        ),
+        (
+            "filter on the far end of a hop",
+            "MATCH ()-[:R]->(b) WHERE b.n = 7 RETURN count(*) AS c",
+            "g.V().out('R').has('n', 7).count()",
+        ),
+        (
+            "filter on an edge property",
+            "MATCH ()-[r:R]->() WHERE r.w = 1 RETURN count(*) AS c",
+            "g.E().hasLabel('R').has('w', 1).count()",
+        ),
+        (
+            "sum over a grouped hop",
+            "MATCH ()-[:R]->(b) RETURN b.n AS k, sum(b.n) AS s GROUP BY b.n",
+            "g.V().out('R').group().by('n').by(__.values('n').sum())",
+        ),
+        (
+            "the degree of every vertex",
+            "MATCH (u:V) RETURN u.k AS k, count(*) AS c GROUP BY u.k",
+            "g.V().hasLabel('V').groupCount().by('k')",
+        ),
+        (
+            "order by a property, no limit",
+            "MATCH (u:V) RETURN u.n AS n ORDER BY u.n",
+            "g.V().hasLabel('V').order().by('n').values('n')",
+        ),
+        (
+            "distinct property values",
+            "MATCH (u:V) RETURN DISTINCT u.n AS n",
+            "g.V().hasLabel('V').values('n').dedup()",
+        ),
+        (
+            "count of a hop from a narrow seed",
+            "MATCH (u:V)-[:R]->(x) WHERE u.k = 'key000005' RETURN count(*) AS c",
+            "g.V().has('k', 'key000005').out('R').count()",
+        ),
     ];
 
     println!();
@@ -3939,4 +3999,204 @@ fn a_limit_past_a_hop_does_not_cap_the_scan() {
     assert_eq!(count_of(&mut g, "g.V().out('R').limit(3).count()"), 3.0);
     assert_eq!(count_of(&mut g, "g.V().out('R').limit(10).count()"), 4.0);
     assert_eq!(count_of(&mut g, "g.V().out('R').range(1, 3).count()"), 2.0);
+}
+
+// --- key presence lowers into the shared seek --------------------------------
+
+/// n0 carries `a` and `b`; n1 carries `a` only; n2 carries a STORED NULL under
+/// `a`; n3 carries nothing. Edges mirror it under `w`.
+fn presence_fixture() -> Graph {
+    let lines = [
+        r#"{"type":"node","id":"n0","labels":["V"],"properties":{"a":1,"b":2}}"#,
+        r#"{"type":"node","id":"n1","labels":["V"],"properties":{"a":3}}"#,
+        r#"{"type":"node","id":"n2","labels":["V"],"properties":{"a":null}}"#,
+        r#"{"type":"node","id":"n3","labels":["V"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e0","from":"n0","to":"n1","labels":["R"],"properties":{"w":1}}"#,
+        r#"{"type":"edge","id":"e1","from":"n1","to":"n2","labels":["R"],"properties":{}}"#,
+    ]
+    .join("\n");
+
+    crate::ndjson::decode(&lines).expect("fixture decodes")
+}
+
+/// A stored null is PRESENT — the engine's null model is a value, not an
+/// absence, so `has('a')` counts it and `hasNot('a')` does not. Getting this
+/// backwards is the whole risk of lowering presence into the columns, since the
+/// packed columns flag it exactly and a naive "is it null" test would not.
+#[test]
+fn a_stored_null_is_present() {
+    let mut g = presence_fixture();
+
+    assert_eq!(count_of(&mut g, "g.V().has('a').count()"), 3.0);
+    assert_eq!(count_of(&mut g, "g.V().hasNot('a').count()"), 1.0);
+    // And it is still a null when read.
+    let vals = super::parse::parse("g.V().has('a').values('a')")
+        .expect("parses")
+        .run(&mut g);
+
+    assert!(
+        vals.iter().any(|v| matches!(v, GVal::Null)),
+        "the stored null did not survive: {vals:?}"
+    );
+}
+
+#[test]
+fn presence_narrows_the_same_rows_the_stream_would() {
+    let mut g = presence_fixture();
+
+    assert_eq!(count_of(&mut g, "g.V().has('b').count()"), 1.0);
+    assert_eq!(count_of(&mut g, "g.V().hasNot('b').count()"), 3.0);
+    // A key no element carries: nothing has it, everything lacks it.
+    assert_eq!(count_of(&mut g, "g.V().has('zz').count()"), 0.0);
+    assert_eq!(count_of(&mut g, "g.V().hasNot('zz').count()"), 4.0);
+    // Edges have their own store.
+    assert_eq!(count_of(&mut g, "g.E().has('w').count()"), 1.0);
+    assert_eq!(count_of(&mut g, "g.E().hasNot('w').count()"), 1.0);
+    // Composed with a label and with a value predicate.
+    assert_eq!(
+        count_of(&mut g, "g.V().hasLabel('V').has('a').count()"),
+        3.0
+    );
+    assert_eq!(count_of(&mut g, "g.V().has('a').has('b').count()"), 1.0);
+    assert_eq!(count_of(&mut g, "g.V().has('a', 3).has('b').count()"), 0.0);
+    assert_eq!(count_of(&mut g, "g.V().hasNot('b').has('a').count()"), 2.0);
+}
+
+/// `hasKey('a','b')` means EITHER key — a disjunction the presence list cannot
+/// express, so it must decline to lower rather than read as "both".
+#[test]
+fn a_multi_key_presence_test_is_any_of_them() {
+    let mut g = presence_fixture();
+
+    assert_eq!(count_of(&mut g, "g.V().hasKey('a','b').count()"), 3.0);
+    assert_eq!(count_of(&mut g, "g.V().hasKey('a').count()"), 3.0);
+    assert_eq!(count_of(&mut g, "g.V().hasKey('b').count()"), 1.0);
+    assert_eq!(count_of(&mut g, "g.V().hasNot('a','b').count()"), 1.0);
+}
+
+/// The paging cap and presence compose: the cap counts SURVIVORS.
+#[test]
+fn a_capped_scan_counts_rows_that_survive_presence() {
+    let mut g = presence_fixture();
+
+    assert_eq!(count_of(&mut g, "g.V().has('a').limit(2).count()"), 2.0);
+    assert_eq!(count_of(&mut g, "g.V().has('b').limit(2).count()"), 1.0);
+    assert_eq!(count_of(&mut g, "g.V().hasNot('a').limit(5).count()"), 1.0);
+}
+
+// --- an `or()` of comparisons lowers into the seek's branches ----------------
+
+/// The disjunction has to hold with NO index to answer it — it used to be a seed
+/// and nothing else, so an unindexed one simply did not apply. These fixtures
+/// have no index at all, which is the case that would have silently returned
+/// every row.
+#[test]
+fn an_or_of_comparisons_narrows_without_an_index() {
+    let mut lines = String::new();
+
+    for i in 0..60usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{{\"n\":{},\"s\":\"s{}\"}}}}\n",
+            i % 10,
+            i % 4
+        ));
+    }
+
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    // 6 vertices per residue class.
+    assert_eq!(count_of(&mut g, "g.V().or(__.has('n', 3)).count()"), 6.0);
+    assert_eq!(
+        count_of(&mut g, "g.V().or(__.has('n', 3), __.has('n', 9)).count()"),
+        12.0
+    );
+    // The same value twice is still that value's rows, once each.
+    assert_eq!(
+        count_of(&mut g, "g.V().or(__.has('n', 3), __.has('n', 3)).count()"),
+        6.0
+    );
+    // Different keys, and a mix of ops.
+    assert_eq!(
+        count_of(
+            &mut g,
+            "g.V().or(__.has('n', 0), __.has('s', 's1')).count()"
+        ),
+        21.0
+    );
+    assert_eq!(
+        count_of(
+            &mut g,
+            "g.V().or(__.has('n', lt(2)), __.has('n', gte(8))).count()"
+        ),
+        24.0
+    );
+    // Composed with a conjunct and a label: the AND of the two.
+    assert_eq!(
+        count_of(
+            &mut g,
+            "g.V().hasLabel('V').has('s', 's1').or(__.has('n', 3), __.has('n', 9)).count()"
+        ),
+        // n=3 lands on i=3,13,23,33,43,53 and n=9 on i=9,…,59; three of each also
+        // carry s1 (i % 4 == 1).
+        6.0
+    );
+    // And with the cap, which applies the disjunction on a different code path.
+    assert_eq!(
+        count_of(
+            &mut g,
+            "g.V().or(__.has('n', 3), __.has('n', 9)).limit(5).count()"
+        ),
+        5.0
+    );
+    assert_eq!(
+        count_of(
+            &mut g,
+            "g.V().or(__.has('n', 3), __.has('n', 9)).limit(50).count()"
+        ),
+        12.0
+    );
+}
+
+/// A branch that is not a single comparison must decline to lower rather than be
+/// dropped — dropping a BRANCH loses rows, and capturing the step leaves nothing
+/// to re-check.
+#[test]
+fn an_or_of_anything_else_still_answers() {
+    let mut lines = String::new();
+
+    for i in 0..20usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{{\"n\":{}}}}}\n",
+            i % 5
+        ));
+    }
+    for i in 0..20usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"edge\",\"id\":\"e{i}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{}}}}\n",
+            (i + 1) % 20
+        ));
+    }
+
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    // A branch with two comparisons in it (an AND inside the OR).
+    assert_eq!(
+        count_of(
+            &mut g,
+            "g.V().or(__.has('n', 1).has('n', 1), __.has('n', 2)).count()"
+        ),
+        8.0
+    );
+    // A branch that walks.
+    assert_eq!(
+        count_of(&mut g, "g.V().or(__.out('R'), __.has('n', 0)).count()"),
+        20.0
+    );
+    // A branch that is a label test.
+    assert_eq!(
+        count_of(&mut g, "g.V().or(__.hasLabel('V'), __.has('n', 0)).count()"),
+        20.0
+    );
+    // An empty `or()` matches nothing, as TinkerPop's does.
+    assert_eq!(count_of(&mut g, "g.V().or().count()"), 0.0);
 }
