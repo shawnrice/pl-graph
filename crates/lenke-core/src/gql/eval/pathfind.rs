@@ -920,41 +920,6 @@ pub(super) fn reachable_each(
     reachable_each_unit(graph, ctx, binding, from, &unit, spec, on_end)
 }
 
-/// Collect every trail endpoint into a `Vec` (eager). For callers that genuinely
-/// consume the whole set (e.g. grouped-count replay); short-circuiting consumers
-/// (`EXISTS`/`LIMIT`) use `reachable_each` directly so they can stop early.
-pub(super) fn reachable(
-    graph: &Graph,
-    ctx: &Ctx,
-    from: u32,
-    rel: &CRel,
-    q: Quantifier,
-    mode: PathMode,
-) -> Vec<u32> {
-    let mut ends: Vec<u32> = Vec::new();
-    // Endpoint-only collector for predicate-free var-length segments (the count
-    // replay path). Patterns carrying a per-hop predicate are routed to the general
-    // matcher upstream, so the throwaway binding here never drives a filter.
-    let mut scratch = Binding::default();
-    reachable_each(
-        graph,
-        ctx,
-        &mut scratch,
-        from,
-        rel,
-        WalkSpec {
-            q,
-            mode,
-            want_path: false,
-        },
-        &mut |_b, e, _, _, _| {
-            ends.push(e);
-            true
-        },
-    );
-    ends
-}
-
 /// `ANY SHORTEST` over a single quantified segment `(start)-[rel q]->(end)`: from
 /// the already-matched `seed` (bound to `start`), find one fewest-hop path to each
 /// reachable vertex that matches `end`, bind it to the path variable (if named),

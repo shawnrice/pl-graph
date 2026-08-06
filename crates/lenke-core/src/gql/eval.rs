@@ -33,7 +33,7 @@ use super::plan::{
 use crate::arrow::ArrowColumn;
 use crate::error::{CodeError, CodeResult};
 use crate::error_codes::ErrorCode;
-use crate::graph::{Adj, Column, Graph, TxCommitError, Value};
+use crate::graph::{Column, Graph, TxCommitError, Value};
 use crate::query::RowSet;
 
 /// A runtime value.
