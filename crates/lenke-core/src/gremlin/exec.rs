@@ -1220,6 +1220,196 @@ fn frontier_val(id: u32, is_edge: bool) -> GVal {
     }
 }
 
+/// A materialized column — what a lowered traversal carries from one step to the
+/// next.
+///
+/// There used to be three interpreters over this, one per representation:
+/// `column_paths` over element ids, `gval_column_terminal` over boxed values and
+/// `num_column_terminal` over raw `f64`. They dispatched on the SAME step list
+/// and re-implemented the same ten operations — fold, count, dedup, paging,
+/// group-count, order — once per representation, so a terminal taught to one was
+/// missing from the others until someone noticed.
+///
+/// One interpreter dispatches on the step; this type dispatches on the
+/// representation. `Nums` earns its place by keeping numbers unboxed, which is a
+/// storage decision and not a second code path.
+enum Col<'a> {
+    /// Graph elements by dense index — a frontier.
+    Elems {
+        ids: std::borrow::Cow<'a, [u32]>,
+        is_edge: bool,
+    },
+    /// Values, as `values(k)` / `id()` / `label()` produce them.
+    Vals(Vec<GVal>),
+    /// A homogeneous number column, unboxed.
+    Nums(Vec<f64>),
+}
+
+impl<'a> Col<'a> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Elems { ids, .. } => ids.len(),
+            Self::Vals(v) => v.len(),
+            Self::Nums(n) => n.len(),
+        }
+    }
+
+    /// `self[lo..hi]`, clamped. Borrowed ids stay borrowed, which is what keeps a
+    /// paging step off the frontier from copying it.
+    fn page(self, lo: usize, hi: usize) -> Self {
+        match self {
+            Self::Elems { ids, is_edge } => {
+                let lo = lo.min(ids.len());
+                let hi = hi.clamp(lo, ids.len());
+
+                Self::Elems {
+                    ids: match ids {
+                        std::borrow::Cow::Borrowed(s) => std::borrow::Cow::Borrowed(&s[lo..hi]),
+                        std::borrow::Cow::Owned(v) => std::borrow::Cow::Owned(v[lo..hi].to_vec()),
+                    },
+                    is_edge,
+                }
+            }
+            Self::Vals(mut v) => {
+                v.truncate(hi.min(v.len()));
+                Self::Vals(v.split_off(lo.min(v.len())))
+            }
+            Self::Nums(mut n) => {
+                n.truncate(hi.min(n.len()));
+                Self::Nums(n.split_off(lo.min(n.len())))
+            }
+        }
+    }
+
+    /// Distinct in FIRST-SEEN order.
+    ///
+    /// Each representation has its own notion of identity and they are NOT
+    /// interchangeable: an element is its id, a number is its bit pattern with
+    /// `-0.0` and `0.0` collapsed, a value is its [`dedup_key`]. A `NaN` has no
+    /// key at all in either value form, so every one survives — keying on bits
+    /// alone would merge them, and a stored `NaN` is reachable.
+    fn dedup(self) -> Self {
+        match self {
+            Self::Elems { ids, is_edge } => {
+                let mut seen = crate::fxhash::FxHashSet::default();
+
+                Self::Elems {
+                    ids: std::borrow::Cow::Owned(
+                        ids.iter().copied().filter(|id| seen.insert(*id)).collect(),
+                    ),
+                    is_edge,
+                }
+            }
+            Self::Nums(n) => {
+                let mut seen: crate::fxhash::FxHashSet<u64> =
+                    crate::fxhash::FxHashSet::with_capacity_and_hasher(n.len(), Default::default());
+
+                Self::Nums(
+                    n.into_iter()
+                        .filter(|&x| x.is_nan() || seen.insert((x + 0.0).to_bits()))
+                        .collect(),
+                )
+            }
+            Self::Vals(v) => Self::Vals(distinct_values(v.into_iter())),
+        }
+    }
+
+    /// The column as boxed values — the answer when nothing follows.
+    fn into_gvals(self, graph: &Graph) -> Vec<GVal> {
+        let _ = graph;
+
+        match self {
+            Self::Elems { ids, is_edge } => {
+                ids.iter().map(|&id| frontier_val(id, is_edge)).collect()
+            }
+            Self::Vals(v) => v,
+            Self::Nums(n) => n.into_iter().map(GVal::Num).collect(),
+        }
+    }
+
+    /// `groupCount()` over the column's own values, FIRST-SEEN order.
+    ///
+    /// `None` for a number column holding a `NaN`: the generic tally gives each
+    /// `NaN` its own entry (no dedup key), which the bit-keyed fold below cannot
+    /// reproduce, so it declines rather than merge them.
+    fn group_count(self) -> Option<Vec<(GVal, GVal)>> {
+        match self {
+            Self::Nums(n) if n.iter().any(|x| x.is_nan()) => None,
+            Self::Nums(n) => {
+                let mut index: crate::fxhash::FxHashMap<u64, usize> =
+                    crate::fxhash::FxHashMap::default();
+                let mut entries: Vec<(f64, f64)> = Vec::new();
+
+                for x in n {
+                    match index.get(&(x + 0.0).to_bits()) {
+                        Some(&i) => entries[i].1 += 1.0,
+                        None => {
+                            index.insert((x + 0.0).to_bits(), entries.len());
+                            entries.push((x, 1.0));
+                        }
+                    }
+                }
+
+                Some(
+                    entries
+                        .into_iter()
+                        .map(|(k, c)| (GVal::Num(k), GVal::Num(c)))
+                        .collect(),
+                )
+            }
+            Self::Elems { ids, is_edge } => Some(tally_group_count(
+                ids.iter().map(|&id| frontier_val(id, is_edge)),
+            )),
+            Self::Vals(v) => Some(tally_group_count(v.into_iter())),
+        }
+    }
+}
+
+/// The ONE interpreter over a lowered column.
+///
+/// The step list is matched here and nowhere else. Arms that mean the same thing
+/// whatever the column holds — paging, `dedup`, `count`, `fold`, an identity
+/// `groupCount` — are written once against [`Col`]; the two representations that
+/// have arms of their OWN (elements can be projected and walked, numbers can be
+/// summed) get them at the bottom, and everything recurses back through here so a
+/// tail keeps reaching every arm rather than only the ones its representation's
+/// old interpreter happened to carry.
+fn col_terminal(graph: &Graph, col: Col, tail: &[Step]) -> Option<Vec<GVal>> {
+    #[allow(clippy::cast_precision_loss)]
+    match tail {
+        // Nothing follows: the column IS the answer.
+        [] => Some(col.into_gvals(graph)),
+        [Step::Fold] => Some(vec![GVal::list(col.into_gvals(graph))]),
+        // One traverser per entry, so a global count is the length and a local
+        // count is 1 per row (an element and a scalar are both non-iterable).
+        [Step::Count(Scope::Global)] => Some(vec![GVal::Num(col.len() as f64)]),
+        [Step::Count(Scope::Local)] => Some(vec![GVal::Num(1.0); col.len()]),
+        [Step::GroupCount(bys)] if is_identity_by(bys) => Some(vec![GVal::map(col.group_count()?)]),
+        // Peel one column-expressible step and let the arms answer the rest.
+        // Writing a terminal arm per COMBINATION is how the old lists got holes in
+        // them: `dedup()` had an arm only when followed by `count()`, so
+        // `dedup().limit(5)` streamed.
+        [Step::Dedupe { labels, bys }, t @ ..] if labels.is_empty() && bys.is_empty() => {
+            col_terminal(graph, col.dedup(), t)
+        }
+        [Step::Limit(n, Scope::Global), t @ ..] => col_terminal(graph, col.page(0, *n), t),
+        [Step::Skip(n, Scope::Global), t @ ..] => col_terminal(graph, col.page(*n, usize::MAX), t),
+        [Step::Range(lo, hi, Scope::Global), t @ ..] => col_terminal(graph, col.page(*lo, *hi), t),
+        // `tail(n)` is the LAST n — a slice like the others, from the other end.
+        [Step::Tail(n, Scope::Global), t @ ..] => {
+            let lo = col.len().saturating_sub(*n);
+
+            col_terminal(graph, col.page(lo, usize::MAX), t)
+        }
+        // What only one representation can answer.
+        _ => match col {
+            Col::Elems { ids, is_edge } => elem_terminal(graph, &ids, is_edge, tail),
+            Col::Nums(nums) => num_column_terminal(graph, &nums, tail),
+            Col::Vals(_) => None,
+        },
+    }
+}
+
 /// `V()/E() … <terminal>` answered from the IR, with no traverser built for any
 /// of the 200k rows these used to allocate one for.
 ///
@@ -1265,6 +1455,19 @@ fn try_values(graph: &Graph, steps: &[Step]) -> Option<Vec<GVal>> {
 /// boundary wanted. Which route to take is [`crate::pipeline`]'s answer — a
 /// boundary means the rows are materialized regardless, so the column is free.
 fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Option<Vec<GVal>> {
+    col_terminal(
+        graph,
+        Col::Elems {
+            ids: std::borrow::Cow::Borrowed(ids),
+            is_edge,
+        },
+        rest,
+    )
+}
+
+/// The arms only an ELEMENT column can answer: projections of an element, a walk
+/// off it, and the keyed modulators that read a property column.
+fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Option<Vec<GVal>> {
     // Borrowed. This used to copy the whole id column on entry — 50k `u32` for a
     // query whose answer is `ids.len()` — and it copied again on every peel, so a
     // `dedup().limit(2).count()` paid for three.
@@ -1282,9 +1485,6 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
                 .map(|&id| elem_label(graph, &frontier_val(id, is_edge)))
                 .collect(),
         ),
-        [Step::Fold] => Some(vec![GVal::List(
-            ids.iter().map(|&id| frontier_val(id, is_edge)).collect(),
-        )]),
         // `group().by(k).by(values(v).<reduce>())` off the frontier: two resolved
         // columns and one bucketing pass, where the stream buckets TRAVERSERS and
         // then runs a sub-traversal per group. 6.599ms over 20k vertices against
@@ -1367,14 +1567,12 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
         // `count(local)` counts a value's own elements, and a graph element is
         // not iterable — `local_elems` wraps it in a singleton. So it is 1 per
         // row, whatever the row is.
-        [Step::Count(Scope::Local)] => Some(vec![GVal::Num(1.0); ids.len()]),
         // The frontier is one traverser per id, multiplicity included, so a
         // global count is its length. Reaching this by BUILDING 15,000 `Trav`s
         // and folding them was 0.59ms of the 0.70ms that
         // `out('R').hasLabel('W').count()` cost, against 0.044ms for the same
         // question in GQL — the planning was already done, and the answer was
         // the length of the thing it returned.
-        [Step::Count(Scope::Global)] => Some(vec![GVal::Num(ids.len() as f64)]),
         // Element identity is the id, so a `dedup()` over the frontier is a
         // distinct-id count and needs no values at all. `labels`/`bys` empty is
         // the bare form; `dedup().by(k)` keys on a property and does not.
@@ -1386,23 +1584,11 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
         // because the guard is what makes THIS arm correct on its own terms, and
         // a mutation that drops it survives the tests for a reason that lives in
         // another function.
-        [Step::Dedupe { labels, bys }, Step::Count(Scope::Global)]
-            if labels.is_empty() && bys.is_empty() =>
-        {
-            let mut seen = crate::fxhash::FxHashSet::default();
-
-            Some(vec![GVal::Num(
-                ids.iter().filter(|&&id| seen.insert(id)).count() as f64,
-            )])
-        }
         [Step::Values(keys), tail @ ..] => column_terminal(graph, ids, is_edge, keys, tail),
         // Tally the frontier straight into the map. Element identity IS the id,
         // so this is the same count the `dedup` arm's set does, kept per id — and
         // the stream built a `Trav` per element to read the element back out and
         // count it, which is 34x on a 150k-edge frontier.
-        [Step::GroupCount(bys)] if is_identity_by(bys) => Some(vec![GVal::map(tally_group_count(
-            ids.iter().map(|&id| frontier_val(id, is_edge)),
-        ))]),
         // `groupCount().by(k)` tallies a PROPERTY of each element, which is the
         // same fold one column over — `prop` is the shared typed read the
         // columnar path uses, so this never boxes an intermediate either.
@@ -1421,7 +1607,6 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
         // `g.V().hasLabel('V').out('R')` — a traversal with no terminal at all —
         // built a `Trav` per element to hand back the elements: 5.2ms for 150k,
         // where reading them off the frontier is the same list.
-        [] => Some(ids.iter().map(|&id| frontier_val(id, is_edge)).collect()),
         // Peel one frontier-expressible step and let the arms above answer the
         // rest — the same shape as the column terminals, for the same reason:
         // `dedup()` had an arm only when followed by `count()`, so `dedup()`
@@ -1450,29 +1635,9 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
 
             column_paths(graph, &kept, is_edge, t)
         }
-        [Step::Limit(n, Scope::Global), t @ ..] => {
-            column_paths(graph, &ids[..(*n).min(ids.len())], is_edge, t)
-        }
-        [Step::Skip(n, Scope::Global), t @ ..] => {
-            column_paths(graph, &ids[(*n).min(ids.len())..], is_edge, t)
-        }
-        [Step::Range(lo, hi, Scope::Global), t @ ..] => {
-            let lo = (*lo).min(ids.len());
-
-            column_paths(graph, &ids[lo..(*hi).clamp(lo, ids.len())], is_edge, t)
-        }
-        [Step::Tail(n, Scope::Global), t @ ..] => {
-            column_paths(graph, &ids[ids.len().saturating_sub(*n)..], is_edge, t)
-        }
         // Element identity IS the dense id, so distinctness needs no key
         // projection and no boxing — the same thing the `dedup().count()` arm
         // above does, now available to everything that follows it.
-        [Step::Dedupe { labels, bys }, t @ ..] if labels.is_empty() && bys.is_empty() => {
-            let mut seen = crate::fxhash::FxHashSet::default();
-            let distinct: Vec<u32> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
-
-            column_paths(graph, &distinct, is_edge, t)
-        }
         // `dedup().by(k)` keys on a PROPERTY, so distinctness is over the column
         // rather than over identity — FIRST-SEEN wins, which is what the stream
         // does and what makes the surviving element well defined.
@@ -1600,76 +1765,6 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
     }
 }
 
-/// One column-expressible step peeled off the tail, then the arms above again.
-///
-/// The arms answer a fixed list of tail SHAPES, so their COMPOSITIONS fell
-/// through even though each part was covered — `values('n').dedup().limit(5)`,
-/// `.limit(5).count()` and `.order().by(desc).count()` each streamed the whole
-/// traversal at 24-58x the cost of the same query with the composed step
-/// removed. Adding another arm per combination is how the list got holes in it;
-/// peeling one step and recursing closes them all, and each peel keeps the
-/// semantics its direct arm has.
-///
-/// Only stream/buffer steps peel. A reducing terminal is what the arms above
-/// are, so it ends the recursion there rather than here.
-fn composed_num_terminal(nums: &[f64], tail: &[Step]) -> Option<Vec<GVal>> {
-    let (cur, rest): (Vec<f64>, &[Step]) = match tail {
-        [Step::Limit(n, Scope::Global), t @ ..] => (nums.iter().copied().take(*n).collect(), t),
-        [Step::Skip(n, Scope::Global), t @ ..] => (nums.iter().copied().skip(*n).collect(), t),
-        [Step::Range(lo, hi, Scope::Global), t @ ..] => (
-            nums.iter()
-                .copied()
-                .skip(*lo)
-                .take(hi.saturating_sub(*lo))
-                .collect(),
-            t,
-        ),
-        // `tail(n)` is the LAST n, which is a slice like the others.
-        [Step::Tail(n, Scope::Global), t @ ..] => {
-            (nums[nums.len().saturating_sub(*n)..].to_vec(), t)
-        }
-        // Same NaN rule as the direct `Dedupe` arm: a NaN has no key, so it is
-        // never a duplicate and every one survives.
-        [Step::Dedupe { labels, bys }, t @ ..] if labels.is_empty() && bys.is_empty() => {
-            let mut seen: crate::fxhash::FxHashSet<u64> =
-                crate::fxhash::FxHashSet::with_capacity_and_hasher(nums.len(), Default::default());
-            let mut distinct: Vec<f64> = Vec::new();
-
-            for &x in nums {
-                if x.is_nan() || seen.insert((x + 0.0).to_bits()) {
-                    distinct.push(x);
-                }
-            }
-
-            (distinct, t)
-        }
-        // Same NaN DECLINE as the direct `Order` arm: `cmp_or_fault` records a
-        // type fault for an incomparable pair, so answering here would swallow
-        // the error the stream raises.
-        [Step::Order(bys, desc, Scope::Global), t @ ..]
-            if order_dir(bys, *desc).is_some() && !nums.iter().any(|x| x.is_nan()) =>
-        {
-            let descending = order_dir(bys, *desc) == Some(Order::Desc);
-            let mut sorted: Vec<f64> = nums.to_vec();
-
-            sorted.sort_by(|a, b| {
-                let o = a.partial_cmp(b).unwrap_or(Ordering::Equal);
-
-                if descending {
-                    o.reverse()
-                } else {
-                    o
-                }
-            });
-
-            (sorted, t)
-        }
-        _ => return None,
-    };
-
-    num_column_terminal(&cur, None, rest)
-}
-
 /// `values(k)` and whatever follows it, answered from the typed column.
 fn column_terminal(
     graph: &Graph,
@@ -1723,12 +1818,27 @@ fn column_terminal(
             }
         }
 
-        if let Some(out) = num_column_terminal(&nums, filter, tail) {
+        // `is(P)` over a number column NARROWS THE COLUMN, so it is applied here
+        // rather than inside the terminals: every arm downstream then sees a
+        // column that is already filtered, instead of each having to know about a
+        // pending predicate. This is what let the numeric terminals stop being a
+        // separate interpreter.
+        if let Some(p) = filter {
+            let t = num_test(p)?;
+
+            if t.faults_on_nan && nums.iter().any(|x| x.is_nan()) {
+                return None; // the stream faults here; do not answer instead
+            }
+
+            nums.retain(|&x| (t.test)(x));
+        }
+
+        if let Some(out) = col_terminal(graph, Col::Nums(nums), tail) {
             return Some(out);
         }
 
-        // Fall through: a shape the numeric path declined (a non-numeric `is`, a
-        // terminal it does not cover) may still be a plain projection below.
+        // Fall through: a shape the column arms declined may still be a plain
+        // projection below.
     }
 
     if filter.is_some() {
@@ -1746,57 +1856,7 @@ fn column_terminal(
         }
     }
 
-    gval_column_terminal(out, tail)
-}
-
-/// The tail of a `values(k)` over a NON-numeric column.
-///
-/// Split out so it can recurse: like the numeric arms, these answer a fixed list
-/// of tail SHAPES, so their compositions — `values('s').dedup().limit(5)`,
-/// `.tail(5)` — fell through even though each part was covered.
-fn gval_column_terminal(mut out: Vec<GVal>, tail: &[Step]) -> Option<Vec<GVal>> {
-    match tail {
-        // The peel arms below each end here, so a paging step that IS the whole
-        // tail needs no arm of its own — `[Limit(n)]` is `[Limit(n), t @ ..]` with
-        // `t` empty, and was written out separately for every pager and for
-        // `dedup` and `dedup().count()` besides. Five arms saying what four
-        // already said.
-        [] => Some(out),
-        [Step::Fold] => Some(vec![GVal::list(out)]),
-        #[allow(clippy::cast_precision_loss)]
-        [Step::Count(Scope::Global)] => Some(vec![GVal::Num(out.len() as f64)]),
-        // Tally the column straight into the map. The stream path builds one
-        // `Trav` per value first — with its path and tags — purely to read the
-        // value back out and count it, which is the whole of an 11x gap against
-        // the equivalent GQL grouped count.
-        [Step::GroupCount(bys)] if is_identity_by(bys) => {
-            Some(vec![GVal::map(tally_group_count(out.into_iter()))])
-        }
-        // Peel one column-expressible step and let the arms above answer the
-        // rest — see `composed_num_terminal` for why this is a peel rather than
-        // one more arm per combination.
-        [Step::Limit(n, Scope::Global), t @ ..] => {
-            out.truncate(*n);
-            gval_column_terminal(out, t)
-        }
-        [Step::Skip(n, Scope::Global), t @ ..] => {
-            gval_column_terminal(out.split_off((*n).min(out.len())), t)
-        }
-        [Step::Range(lo, hi, Scope::Global), t @ ..] => {
-            let mut v = out.split_off((*lo).min(out.len()));
-
-            v.truncate(hi.saturating_sub(*lo));
-            gval_column_terminal(v, t)
-        }
-        // `tail(n)` is the LAST n.
-        [Step::Tail(n, Scope::Global), t @ ..] => {
-            gval_column_terminal(out.split_off(out.len().saturating_sub(*n)), t)
-        }
-        [Step::Dedupe { labels, bys }, t @ ..] if labels.is_empty() && bys.is_empty() => {
-            gval_column_terminal(distinct_values(out.into_iter()), t)
-        }
-        _ => None,
-    }
+    col_terminal(graph, Col::Vals(out), tail)
 }
 
 /// Distinct values in FIRST-SEEN order — the whole of a plain `dedup()`.
@@ -2052,21 +2112,7 @@ fn num_test(p: &P) -> Option<NumTest<'_>> {
 /// `None` declines — a shape this path does not cover, or one where lowering it
 /// would change whether the query throws.
 #[allow(clippy::cast_precision_loss)]
-fn num_column_terminal(nums: &[f64], filter: Option<&P>, tail: &[Step]) -> Option<Vec<GVal>> {
-    let owned: Vec<f64>;
-    let nums: &[f64] = match filter {
-        None => nums,
-        Some(p) => {
-            let t = num_test(p)?;
-
-            if t.faults_on_nan && nums.iter().any(|x| x.is_nan()) {
-                return None; // the stream faults here; do not answer instead
-            }
-
-            owned = nums.iter().copied().filter(|&x| (t.test)(x)).collect();
-            &owned
-        }
-    };
+fn num_column_terminal(graph: &Graph, nums: &[f64], tail: &[Step]) -> Option<Vec<GVal>> {
     // `fold_extreme` walks the stream keeping the first value that compares the
     // wanted way, so a tie keeps the EARLIER one — which for `-0.0` vs `0.0` is
     // observable. Reproduce the fold rather than calling `f64::min`.
@@ -2092,13 +2138,6 @@ fn num_column_terminal(nums: &[f64], filter: Option<&P>, tail: &[Step]) -> Optio
     };
 
     match tail {
-        [] => Some(nums.iter().copied().map(GVal::Num).collect()),
-
-        [Step::Fold] => Some(vec![GVal::List(
-            nums.iter().copied().map(GVal::Num).collect(),
-        )]),
-        [Step::Count(Scope::Global)] => Some(vec![GVal::Num(nums.len() as f64)]),
-        [Step::Count(Scope::Local)] => Some(vec![GVal::Num(1.0); nums.len()]),
         // Summed in FRONTIER order, which is the order the stream would have
         // visited them in: floating-point addition is not associative, so a
         // different order is a different answer and the TS engine's must match.
@@ -2108,57 +2147,25 @@ fn num_column_terminal(nums: &[f64], filter: Option<&P>, tail: &[Step]) -> Optio
         }
         [Step::Min(Scope::Global)] => Some(vec![extreme(Ordering::Less)?]),
         [Step::Max(Scope::Global)] => Some(vec![extreme(Ordering::Greater)?]),
-        // Tally on the RAW BITS, so a number column never builds a `DedupKey` to
-        // hash — the same move the dedup below makes. Keys stay in FIRST-SEEN
-        // order, which a map's order is.
-        //
-        // A NaN has no dedup key and is therefore never equal to anything, so the
-        // generic path gives each its own entry. Bits would merge them, so a NaN
-        // column declines to it — and that column is reachable (`SET x =
-        // sqrt(-1)`).
-        [Step::GroupCount(bys)] if is_identity_by(bys) && !nums.iter().any(|x| x.is_nan()) => {
-            let mut index: crate::fxhash::FxHashMap<u64, usize> =
-                crate::fxhash::FxHashMap::default();
-            let mut entries: Vec<(f64, f64)> = Vec::new();
-
-            for &x in nums {
-                // `-0.0` and `0.0` are ONE key — see the dedup below.
-                match index.get(&(x + 0.0).to_bits()) {
-                    Some(&i) => entries[i].1 += 1.0,
-                    None => {
-                        index.insert((x + 0.0).to_bits(), entries.len());
-                        entries.push((x, 1.0));
-                    }
-                }
-            }
-
-            Some(vec![GVal::map(
-                entries
-                    .into_iter()
-                    .map(|(k, n)| (GVal::Num(k), GVal::Num(n)))
-                    .collect(),
-            )])
-        }
-        // A sorted prefix off the column, with no traverser built to sort. The
-        // stream keys each `Trav` into a `Vec<GVal>`, sorts ~104-byte tuples, then
-        // discards all but `n` — 7.6x against GQL's ORDER BY + LIMIT top-k.
+        // A sorted column, with no traverser built to sort it. The stream keys
+        // each `Trav` into a `Vec<GVal>` and sorts ~104-byte tuples.
         //
         // Declines on a NaN, like `extreme` above: `cmp_or_fault` RECORDS a type
         // fault for an incomparable pair, so answering here would swallow the
-        // error the stream raises. And a NaN column is reachable (`SET x =
-        // sqrt(-1)`), so this is not a theoretical guard.
+        // error the stream raises. A NaN column is reachable (`SET x = sqrt(-1)`),
+        // so this is not a theoretical guard.
         //
-        // The direction goes into the COMPARATOR rather than reversing the
-        // result, which is what `apply_order` does. On a pure number column the
-        // two are indistinguishable — the only tie that could betray the
-        // difference is `-0.0` against `0.0`, and those are `==` as a `GVal` and
-        // both render as `0`, which a mutation test confirmed. It is written this
-        // way because it mirrors the step it stands in for, not because a test
-        // can currently tell.
-        [Step::Order(bys, desc, Scope::Global), rest @ ..]
-            if order_dir(bys, *desc).is_some()
-                && matches!(rest, [] | [Step::Limit(_, Scope::Global)])
-                && !nums.iter().any(|x| x.is_nan()) =>
+        // The direction goes into the COMPARATOR rather than reversing the result,
+        // mirroring `apply_order`. On a pure number column the two are
+        // indistinguishable — the only tie that could betray the difference is
+        // `-0.0` against `0.0`, which are `==` as a `GVal` and both render as `0`.
+        //
+        // This USED to be two arms: one that took `[Order]` or `[Order, Limit]`
+        // and truncated, and one in `composed_num_terminal` that peeled `Order`
+        // and recursed. The peel subsumes the other and reaches every tail, not
+        // two of them.
+        [Step::Order(bys, desc, Scope::Global), t @ ..]
+            if order_dir(bys, *desc).is_some() && !nums.iter().any(|x| x.is_nan()) =>
         {
             let descending = order_dir(bys, *desc) == Some(Order::Desc);
             let mut sorted: Vec<f64> = nums.to_vec();
@@ -2173,48 +2180,11 @@ fn num_column_terminal(nums: &[f64], filter: Option<&P>, tail: &[Step]) -> Optio
                 }
             });
 
-            if let [Step::Limit(n, Scope::Global)] = rest {
-                sorted.truncate(*n);
-            }
-
-            Some(sorted.into_iter().map(GVal::Num).collect())
+            col_terminal(graph, Col::Nums(sorted), t)
         }
-        // Distinctness on the RAW BITS, so a numeric column never boxes a `GVal`
-        // just to hash it — the same thing GQL's columnar DISTINCT does. Going
-        // through `GVal` first left this 7.2x behind GQL after the generic
-        // lowering had already taken it from 21.7x.
-        //
-        // `-0.0` and `0.0` are ONE key: they are equal, `dedup_key` collapses
-        // them, and grouping agrees with equality everywhere else in both
-        // engines. Keying on `to_bits` alone would split them and show two `0`s.
-        // A `NaN` is the opposite case and is never keyed at all — see below.
-        [Step::Dedupe { labels, bys }]
-        | [Step::Dedupe { labels, bys }, Step::Count(Scope::Global)]
-            if labels.is_empty() && bys.is_empty() =>
-        {
-            let mut seen: crate::fxhash::FxHashSet<u64> =
-                crate::fxhash::FxHashSet::with_capacity_and_hasher(nums.len(), Default::default());
-            let mut distinct: Vec<f64> = Vec::new();
-
-            for &x in nums {
-                // A `NaN` has NO dedup key, so it is never a duplicate — the
-                // stream keeps every one. Keying on its bits would collapse them
-                // all into one, which is what this did until a stored NaN turned
-                // out to be reachable (`SET x = sqrt(-1)`).
-                if x.is_nan() || seen.insert((x + 0.0).to_bits()) {
-                    distinct.push(x);
-                }
-            }
-
-            #[allow(clippy::cast_precision_loss)]
-            Some(if matches!(tail, [_, Step::Count(Scope::Global)]) {
-                vec![GVal::Num(distinct.len() as f64)]
-            } else {
-                distinct.into_iter().map(GVal::Num).collect()
-            })
-        }
-        // Anything else: peel one column step and let these arms answer the rest.
-        _ => composed_num_terminal(nums, tail),
+        // Everything else is either generic — `col_terminal` tried those before
+        // reaching here — or not a column question at all.
+        _ => None,
     }
 }
 
