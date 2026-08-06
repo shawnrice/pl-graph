@@ -2979,7 +2979,7 @@ pub(super) fn vectorized_rowset(
         .limit_val(ctx)
         .map(|l| (start + l).min(sc.n))
         .unwrap_or(sc.n);
-    let mut rs = RowSet::new(proj.out_names.clone());
+    let mut rs = RowSet::with_capacity(proj.out_names.clone(), end.saturating_sub(start));
     for i in start..end {
         rs.push_row(vvs.iter().map(|vv| vv.value_at(i, graph)));
     }
@@ -3002,8 +3002,7 @@ pub(super) fn project_scan_rows(
         .iter()
         .map(|it| eval_vec(graph, ctx, sc, &it.expr))
         .collect();
-    let mut rs = RowSet::new(proj.out_names.clone());
-    rs.data.reserve(sc.n * proj.items.len().max(1));
+    let mut rs = RowSet::with_capacity(proj.out_names.clone(), sc.n);
     for i in 0..sc.n {
         rs.push_row(vvs.iter().map(|vv| vv.value_at(i, graph)));
     }

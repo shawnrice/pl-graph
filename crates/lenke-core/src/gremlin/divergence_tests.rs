@@ -3510,6 +3510,31 @@ fn zzz_lower_probe() {
             "MATCH (u:V) RETURN u.n AS n",
             "g.V().hasLabel('V').values('n')",
         ),
+        (
+            "two properties, all vertices",
+            "MATCH (u:V) RETURN u.n AS n, u.k AS k",
+            "g.V().hasLabel('V').project('n','k').by('n').by('k')",
+        ),
+        (
+            "the elements themselves",
+            "MATCH (u:V) RETURN u",
+            "g.V().hasLabel('V')",
+        ),
+        (
+            "the elements, rendered",
+            "MATCH (u:V) RETURN u",
+            "g.V().hasLabel('V').elementMap()",
+        ),
+        (
+            "a property of a filtered scan",
+            "MATCH (u:V) WHERE u.n > 50 RETURN u.n AS n",
+            "g.V().hasLabel('V').has('n', gt(50)).values('n')",
+        ),
+        (
+            "a string property, all vertices",
+            "MATCH (u:V) RETURN u.k AS k",
+            "g.V().hasLabel('V').values('k')",
+        ),
     ];
 
     println!();
@@ -3701,4 +3726,102 @@ fn a_limited_order_agrees_with_the_full_sort() {
             full[full.len() - 3..].to_vec()
         );
     }
+}
+
+// --- the map steps off a frontier agree with the map steps over a stream ------
+
+/// `fold().unfold()` means the same thing and takes the STREAM: the fold makes
+/// the frontier a single list value, so the column route ends there and the steps
+/// after it run per traverser. Pairing the two spellings is how these tests stay
+/// non-vacuous — checked by breaking each column arm and watching them fail.
+fn same_via_stream(g: &mut Graph, src: &str) {
+    let column = super::parse::parse(src)
+        .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+        .run(g);
+    let (head, tail) = src.split_once('.').expect("a traversal has a step");
+    let streamed_src = format!("{head}.{}", tail.replacen('.', ".fold().unfold().", 1));
+    let streamed = super::parse::parse(&streamed_src)
+        .unwrap_or_else(|e| panic!("`{streamed_src}` parses: {e}"))
+        .run(g);
+
+    assert_eq!(
+        format!("{column:?}"),
+        format!("{streamed:?}"),
+        "`{src}` disagreed with its streamed spelling `{streamed_src}`"
+    );
+    assert!(!column.is_empty(), "`{src}` returned nothing to compare");
+}
+
+#[test]
+fn element_map_off_a_frontier_matches_the_stream() {
+    let mut g = modern();
+
+    same_via_stream(&mut g, "g.V().elementMap()");
+    same_via_stream(&mut g, "g.V().elementMap('name')");
+    // An edge map carries the IN/OUT endpoint stubs as well.
+    same_via_stream(&mut g, "g.E().elementMap()");
+    same_via_stream(&mut g, "g.V().hasLabel('PERSON').elementMap('name','age')");
+    // A key nothing carries is absent, not null.
+    same_via_stream(&mut g, "g.V().elementMap('nope')");
+}
+
+#[test]
+fn project_off_a_frontier_matches_the_stream() {
+    let mut g = modern();
+
+    same_via_stream(&mut g, "g.V().project('name').by('name')");
+    same_via_stream(&mut g, "g.V().project('name','age').by('name').by('age')");
+    // Fewer `by()`s than keys: the rest project the element itself.
+    same_via_stream(&mut g, "g.V().project('self','name').by().by('name')");
+    same_via_stream(&mut g, "g.V().project('self')");
+    // A key nothing carries.
+    same_via_stream(&mut g, "g.V().project('nope').by('nope')");
+    // A sub-traversal `by()` is not a column and stays on the stream — the two
+    // spellings must still agree, which is what says the guard declines rather
+    // than mis-reads it.
+    same_via_stream(&mut g, "g.V().project('out').by(__.out().count())");
+    same_via_stream(&mut g, "g.V().project('id').by(__.id())");
+    same_via_stream(
+        &mut g,
+        "g.E().project('label','weight').by(__.label()).by('weight')",
+    );
+}
+
+/// The maps a `project()` builds share ONE key vector, and sharing must not let
+/// one row's write reach another's — `MapVal::push` is copy-on-write for exactly
+/// this. (`tree()` grows a map it was handed; nothing else does.)
+#[test]
+fn projected_rows_share_keys_without_sharing_values() {
+    let mut g = modern();
+    let rows = super::parse::parse("g.V().project('name','age').by('name').by('age')")
+        .expect("parses")
+        .run(&mut g);
+
+    assert_eq!(rows.len(), 6);
+
+    for r in &rows {
+        let GVal::Map(m) = r else {
+            panic!("expected a map, got {r:?}");
+        };
+
+        assert_eq!(m.keys().len(), 2);
+        assert_eq!(m.len(), 2);
+    }
+    // Distinct values behind the shared keys.
+    let names: Vec<String> = rows
+        .iter()
+        .map(|r| match r {
+            GVal::Map(m) => format!("{:?}", m.values()[0]),
+            _ => unreachable!(),
+        })
+        .collect();
+    let mut uniq = names.clone();
+    uniq.sort();
+    uniq.dedup();
+
+    assert_eq!(
+        uniq.len(),
+        names.len(),
+        "rows shared a value vector: {names:?}"
+    );
 }

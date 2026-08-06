@@ -1215,6 +1215,57 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
         [Step::Fold] => Some(vec![GVal::List(
             ids.iter().map(|&id| frontier_val(id, is_edge)).collect(),
         )]),
+        // `project('a','b').by('a').by('b')` off the frontier: one resolved column
+        // per key, zipped into maps that all share one key vector. The stream form
+        // re-resolves each property NAME per element per key — `prop` takes a
+        // `&str` — which over 20k vertices and two keys is 40k hash lookups.
+        //
+        // Only the modulators that are a plain property or the element itself. A
+        // sub-traversal `by()` can read the path and a token `by()` projects
+        // something that is not a column, so both stay on the stream.
+        [Step::Project(keys, bys)] if !keys.is_empty() && projectable_bys(keys, bys) => {
+            let shared: Arc<Vec<GVal>> = Arc::new(
+                keys.iter()
+                    .map(|k| GVal::Str(Arc::from(k.as_str())))
+                    .collect(),
+            );
+            let cols: Vec<Vec<GVal>> = (0..keys.len())
+                .map(|i| match bys.get(i) {
+                    Some(By::Key(k, _)) => prop_column(graph, ids, is_edge, k),
+                    _ => ids.iter().map(|&id| frontier_val(id, is_edge)).collect(),
+                })
+                .collect();
+
+            Some(
+                (0..ids.len())
+                    .map(|i| {
+                        GVal::Map(crate::value::MapVal::with_keys(
+                            shared.clone(),
+                            cols.iter().map(|c| c[i].clone()).collect(),
+                        ))
+                    })
+                    .collect(),
+            )
+        }
+        // `elementMap()` off the frontier. The note on the step itself records two
+        // attempts to make it cheaper by removing allocations, both measured
+        // WORSE, and names this as the remaining untried axis: build the maps from
+        // the ids and the `Trav` per element never exists at all. 20k vertices
+        // cost 8.630ms through the stream.
+        //
+        // The key scratch is hoisted here for the same reason the step hoists it
+        // into its closure — one refill per element, not one allocation.
+        [Step::ElementMap(keys)] => {
+            let mut ks: Vec<(u32, Arc<str>)> = Vec::new();
+
+            Some(
+                ids.iter()
+                    .filter_map(|&id| {
+                        element_map_of(graph, &frontier_val(id, is_edge), keys, &mut ks)
+                    })
+                    .collect(),
+            )
+        }
         // `count(local)` counts a value's own elements, and a graph element is
         // not iterable — `local_elems` wraps it in a singleton. So it is 1 per
         // row, whatever the row is.
@@ -3172,6 +3223,69 @@ fn element_props_map(graph: &Graph, v: &GVal) -> GVal {
     GVal::map(entries)
 }
 
+/// Can `project()`'s modulators be read as columns off a frontier?
+///
+/// A missing `by()` is the element itself, which is a column; a `By::Key` is a
+/// property column. Anything else — a sub-traversal, a token, a `Column` — is
+/// not, and the step keeps its stream form for those.
+fn projectable_bys(keys: &[String], bys: &[By]) -> bool {
+    bys.len() <= keys.len()
+        && bys
+            .iter()
+            .all(|b| matches!(b, By::Key(..) | By::Identity(None)))
+}
+
+/// TinkerPop's `elementMap()` for one element: `{ id, label, ...props }`, plus
+/// `IN`/`OUT` endpoint stubs for an edge. `None` for anything that is not an
+/// element, which the stream drops.
+///
+/// `ks` is scratch the caller owns across a whole frontier — `projected_keys_into`
+/// refills it per element rather than allocating a key vector each time.
+fn element_map_of(
+    graph: &Graph,
+    val: &GVal,
+    keys: &[String],
+    ks: &mut Vec<(u32, Arc<str>)>,
+) -> Option<GVal> {
+    if !matches!(val, GVal::Node(_) | GVal::Edge(_)) {
+        return None;
+    }
+
+    let mut entries = vec![
+        (GVal::Str(Arc::from("id")), elem_id(graph, val)),
+        (GVal::Str(Arc::from("label")), elem_label(graph, val)),
+    ];
+
+    if let GVal::Edge(e) = val {
+        let inv = GVal::Node(graph.e_dst[*e as usize]);
+        let outv = GVal::Node(graph.e_src[*e as usize]);
+
+        entries.push((
+            GVal::Str(Arc::from("IN")),
+            GVal::map(vec![
+                (GVal::Str(Arc::from("id")), elem_id(graph, &inv)),
+                (GVal::Str(Arc::from("label")), elem_label(graph, &inv)),
+            ]),
+        ));
+        entries.push((
+            GVal::Str(Arc::from("OUT")),
+            GVal::map(vec![
+                (GVal::Str(Arc::from("id")), elem_id(graph, &outv)),
+                (GVal::Str(Arc::from("label")), elem_label(graph, &outv)),
+            ]),
+        ));
+    }
+
+    projected_keys_into(graph, val, keys, ks);
+    entries.reserve(ks.len());
+
+    for (kid, k) in ks.iter() {
+        entries.push((GVal::Str(k.clone()), prop_by_id(graph, val, *kid)));
+    }
+
+    Some(GVal::map(entries))
+}
+
 /// A self-describing vertex record for a subgraph cap: `{ id, labels, properties }`.
 fn subgraph_vertex(graph: &Graph, v: u32) -> GVal {
     let gv = GVal::Node(v);
@@ -4278,28 +4392,9 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
         Step::ElementMap(keys) => {
             let mut ks: Vec<(u32, Arc<str>)> = Vec::new();
 
-            map_step(stream, move |t| {
-            if !matches!(t.val, GVal::Node(_) | GVal::Edge(_)) {
-                return vec![];
-            }
-            let mut entries = vec![
-                (GVal::Str(Arc::from("id")), elem_id(graph, &t.val)),
-                (GVal::Str(Arc::from("label")), elem_label(graph, &t.val)),
-            ];
-            if let GVal::Edge(e) = t.val {
-                let inv = GVal::Node(graph.e_dst[e as usize]);
-                let outv = GVal::Node(graph.e_src[e as usize]);
-                entries.push((GVal::Str(Arc::from("IN")), GVal::map(vec![(GVal::Str(Arc::from("id")), elem_id(graph, &inv)), (GVal::Str(Arc::from("label")), elem_label(graph, &inv))])));
-                entries.push((GVal::Str(Arc::from("OUT")), GVal::map(vec![(GVal::Str(Arc::from("id")), elem_id(graph, &outv)), (GVal::Str(Arc::from("label")), elem_label(graph, &outv))])));
-            }
-            projected_keys_into(graph, &t.val, keys, &mut ks);
-            entries.reserve(ks.len());
-
-            for (kid, k) in &ks {
-                entries.push((GVal::Str(k.clone()), prop_by_id(graph, &t.val, *kid)));
-            }
-
-            vec![GVal::map(entries)]
+            map_step(stream, move |t| match element_map_of(graph, &t.val, keys, &mut ks) {
+                Some(m) => vec![m],
+                None => vec![],
             })
         }
         Step::Properties(keys) => {
@@ -4340,23 +4435,35 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 t.with(GVal::list(projected))
             })
             .collect(),
-        Step::Project(keys, bys) => stream
-            .iter()
-            .map(|t| {
-                let entries = keys
-                    .iter()
-                    .enumerate()
-                    .map(|(i, k)| {
-                        let v = match bys.get(i) {
+        // `project('a','b')` names the SAME columns for every element, which is the
+        // case `MapVal::with_keys` exists for — one shared key vector and a
+        // refcount bump per element, instead of an `Arc::from(&str)` ALLOCATION per
+        // key per element. Two keys over 20k vertices was 40k allocations and
+        // 4.239ms; `valueMap` already shared its keys this way.
+        Step::Project(keys, bys) => {
+            let shared: Arc<Vec<GVal>> = Arc::new(
+                keys.iter()
+                    .map(|k| GVal::Str(Arc::from(k.as_str())))
+                    .collect(),
+            );
+
+            stream
+                .iter()
+                .map(|t| {
+                    let vals = (0..keys.len())
+                        .map(|i| match bys.get(i) {
                             Some(by) => eval_by(graph, ctx, by, &t.val),
                             None => t.val.clone(),
-                        };
-                        (GVal::Str(Arc::from(k.as_str())), v)
-                    })
-                    .collect();
-                t.with(GVal::map(entries))
-            })
-            .collect(),
+                        })
+                        .collect();
+
+                    t.with(GVal::Map(crate::value::MapVal::with_keys(
+                        shared.clone(),
+                        vals,
+                    )))
+                })
+                .collect()
+        }
         Step::Tree(bys) => apply_tree(graph, ctx, bys, stream),
 
         // --- cardinality ---

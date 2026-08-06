@@ -113,6 +113,22 @@ impl RowSet {
             nrows: 0,
         }
     }
+    /// Same, with room for `nrows` rows already reserved.
+    ///
+    /// The flat buffer is the point of this type — one amortized allocation
+    /// rather than one per row — but "amortized" still means a doubling growth
+    /// that copies the whole buffer log(n) times, and a `Value` is 40 bytes. A
+    /// 20k-row projection was moving 800KB through several of those reallocs on
+    /// the way to a size it knew before it started.
+    pub fn with_capacity(cols: Vec<String>, nrows: usize) -> Self {
+        let n = cols.len();
+
+        Self {
+            cols,
+            data: Vec::with_capacity(nrows.saturating_mul(n)),
+            nrows: 0,
+        }
+    }
     pub fn ncols(&self) -> usize {
         self.cols.len()
     }
