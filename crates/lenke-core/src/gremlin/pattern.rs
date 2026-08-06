@@ -581,6 +581,29 @@ pub(super) fn compile(steps: &[Step]) -> Option<Compiled> {
         ));
     }
 
+    // REJECTED, measured twice, so the next attempt starts past it: routing the
+    // UNCONSTRAINED shapes through here as well, to make `try_count`/`try_values`
+    // deletable. They answer 436 traversals across the suite against this path's
+    // 156, so deleting them is the only large consolidation left — and it costs
+    // more than it saves.
+    //
+    // Directly, on 50k vertices with one out-edge each, asking `plan_pattern_ids`
+    // for the far end of `()-[:R]->(b)`: 0.578ms through the frame, against
+    // 0.188ms for the old path's whole `V.out(R).count()`. Adding a walk route to
+    // `plan_pattern_ids` — `seek::walk_ids`, the walk both engines already share,
+    // skipping the frame entirely — brought that to 0.276ms, still short.
+    //
+    // End to end with this decline relaxed and that walk route in place:
+    //
+    //   V.out(R)              0.304ms -> 0.360ms
+    //   V.out(R).count()      0.188ms -> 0.284ms
+    //   V.out(R).values(n)    0.353ms -> 0.415ms
+    //
+    // What is left is not the frame: it is `compile` plus a `Ctx` plus a
+    // materialized id column, where the old path walks and counts in place
+    // (`seek::walk_count`). A pattern that HAS something to plan earns that
+    // setup back; one that does not cannot.
+    //
     // Decline unless some node PAST the start is constrained.
     //
     // That is exactly the condition under which planning can contribute: the

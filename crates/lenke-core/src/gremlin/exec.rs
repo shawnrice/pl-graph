@@ -957,8 +957,9 @@ fn try_values(graph: &Graph, steps: &[Step]) -> Option<Vec<GVal>> {
 /// boundary wanted. Which route to take is [`crate::pipeline`]'s answer — a
 /// boundary means the rows are materialized regardless, so the column is free.
 fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Option<Vec<GVal>> {
-    let ids = ids.to_vec();
-
+    // Borrowed. This used to copy the whole id column on entry — 50k `u32` for a
+    // query whose answer is `ids.len()` — and it copied again on every peel, so a
+    // `dedup().limit(2).count()` paid for three.
     match rest {
         // `id()` / `label()` are pure per-element projections of the frontier —
         // the same shape as `values(k)`, reading the id/label dictionaries
@@ -974,9 +975,7 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
                 .collect(),
         ),
         [Step::Fold] => Some(vec![GVal::List(
-            ids.into_iter()
-                .map(|id| frontier_val(id, is_edge))
-                .collect(),
+            ids.iter().map(|&id| frontier_val(id, is_edge)).collect(),
         )]),
         // `count(local)` counts a value's own elements, and a graph element is
         // not iterable — `local_elems` wraps it in a singleton. So it is 1 per
@@ -1009,13 +1008,13 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
                 ids.iter().filter(|&&id| seen.insert(id)).count() as f64,
             )])
         }
-        [Step::Values(keys), tail @ ..] => column_terminal(graph, &ids, is_edge, keys, tail),
+        [Step::Values(keys), tail @ ..] => column_terminal(graph, ids, is_edge, keys, tail),
         // Tally the frontier straight into the map. Element identity IS the id,
         // so this is the same count the `dedup` arm's set does, kept per id — and
         // the stream built a `Trav` per element to read the element back out and
         // count it, which is 34x on a 150k-edge frontier.
         [Step::GroupCount(bys)] if is_identity_by(bys) => Some(vec![GVal::map(tally_group_count(
-            ids.into_iter().map(|id| frontier_val(id, is_edge)),
+            ids.iter().map(|&id| frontier_val(id, is_edge)),
         ))]),
         // `groupCount().by(k)` tallies a PROPERTY of each element, which is the
         // same fold one column over — `prop` is the shared typed read the
@@ -1030,19 +1029,15 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
         // stream — `single_key_by` accepts neither.
         [Step::GroupCount(bys)] if let Some(key) = single_key_by(bys) => {
             Some(vec![GVal::map(tally_group_count(
-                ids.into_iter()
-                    .map(|id| prop(graph, &frontier_val(id, is_edge), key)),
+                ids.iter()
+                    .map(|&id| prop(graph, &frontier_val(id, is_edge), key)),
             ))])
         }
         // The frontier ITSELF. There was no arm for it, so
         // `g.V().hasLabel('V').out('R')` — a traversal with no terminal at all —
         // built a `Trav` per element to hand back the elements: 5.2ms for 150k,
         // where reading them off the frontier is the same list.
-        [] => Some(
-            ids.into_iter()
-                .map(|id| frontier_val(id, is_edge))
-                .collect(),
-        ),
+        [] => Some(ids.iter().map(|&id| frontier_val(id, is_edge)).collect()),
         // Peel one frontier-expressible step and let the arms above answer the
         // rest — the same shape as the column terminals, for the same reason:
         // `dedup()` had an arm only when followed by `count()`, so `dedup()`
