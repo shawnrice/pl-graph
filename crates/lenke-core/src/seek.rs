@@ -199,6 +199,20 @@ pub struct ElementSeek {
     /// to look up, so this only ever narrows candidates a bucket or another
     /// predicate produced.
     presence: Vec<(Arc<str>, bool)>,
+    /// NEGATED comparisons, conjunctive: each holds when the element does NOT
+    /// satisfy it — `NOT (the key is present AND the comparison holds)`.
+    ///
+    /// That reading is the point, and it is why this is its own list rather than
+    /// an inverted [`SeekOp`]. Gremlin's `not(has(k, v))` is satisfied by an
+    /// element with no `k` AT ALL, so `k != v` as a comparison would drop exactly
+    /// the rows the traversal asks for. A STORED NULL is the same case one step
+    /// in: it is present and satisfies no comparison, so it satisfies every
+    /// negation of one — where a `<` OR `>` disjunction standing in for a negated
+    /// equality would drop it.
+    ///
+    /// Like [`Self::presence`] it never seeds: an index finds the elements that
+    /// DO match a value, and there is no lookup for "everything else".
+    negated: Vec<KeyPredicate>,
 }
 
 impl ElementSeek {
@@ -210,6 +224,7 @@ impl ElementSeek {
             disj: Vec::new(),
             labels: None,
             presence: Vec::new(),
+            negated: Vec::new(),
         }
     }
 
@@ -221,6 +236,7 @@ impl ElementSeek {
             disj: Vec::new(),
             labels: None,
             presence: Vec::new(),
+            negated: Vec::new(),
         }
     }
 
@@ -250,7 +266,10 @@ impl ElementSeek {
     /// answers them differently.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.conj.is_empty() && self.disj.is_empty() && self.presence.is_empty()
+        self.conj.is_empty()
+            && self.disj.is_empty()
+            && self.presence.is_empty()
+            && self.negated.is_empty()
     }
 
     /// The label constraint, if one was lowered.
@@ -337,6 +356,29 @@ impl ElementSeek {
             .zip(&branches)
             .all(|(t, b)| t.len() == b.len())
             .then_some(tests)
+    }
+
+    /// Narrow `ids` to those satisfying every NEGATED comparison — for each, the
+    /// element must not carry the key, or must carry it and fail the test.
+    ///
+    /// A comparison that cannot run column-at-a-time is SKIPPED rather than
+    /// inverted: a negation applied to a widened test excludes rows, which is the
+    /// direction that loses answers. [`columnar`](Self::columnar) asks the same
+    /// question before any caller treats this seek as exact.
+    fn retain_negated(&self, graph: &Graph, param: &impl Bindings, ids: &mut Vec<u32>) {
+        for p in &self.negated {
+            let Some(test) = p
+                .operand
+                .resolve(param)
+                .and_then(|k| column_matches(graph, &p.key, self.edge, p.op, &k))
+            else {
+                continue;
+            };
+
+            // `column_matches` already tests presence, so `!test(id)` is exactly
+            // "absent, or present and not matching".
+            ids.retain(|&id| !test(id));
+        }
     }
 
     /// Narrow `ids` to those whose presence tests all hold.
@@ -516,6 +558,12 @@ impl ElementSeek {
         self.presence.push((key, want));
     }
 
+    /// Require that `p` does NOT hold — including for an element that does not
+    /// carry the key at all. See [`Self::negated`].
+    pub fn push_negated(&mut self, p: KeyPredicate) {
+        self.negated.push(p);
+    }
+
     /// An already-built conjunct.
     pub fn conj_push(&mut self, p: KeyPredicate) {
         self.conj.push(p);
@@ -649,8 +697,10 @@ impl ElementSeek {
                 .is_some()
         };
 
-        (!self.conj.is_empty() || !self.disj.is_empty())
+        (!self.conj.is_empty() || !self.disj.is_empty() || !self.negated.is_empty())
             && self.conj.iter().all(runs)
+            // A negation is only exact if the thing being negated can run.
+            && self.negated.iter().all(runs)
             // A disjunction used to disqualify a seek outright, because it was a
             // SEED and nothing more — with no index it simply did not apply. Now
             // `retain_disj` runs it column-at-a-time like the conjuncts, so the
@@ -810,6 +860,7 @@ impl ElementSeek {
             }
 
             self.retain_present(graph, &mut ids);
+            self.retain_negated(graph, param, &mut ids);
             self.retain_disj(graph, param, &mut ids);
             ids.retain(|&id| residual(id));
 
@@ -851,12 +902,22 @@ impl ElementSeek {
             .iter()
             .filter_map(|d| self.disj_tests(graph, param, d))
             .collect();
+        let negated: Vec<_> = self
+            .negated
+            .iter()
+            .filter_map(|p| {
+                p.operand
+                    .resolve(param)
+                    .and_then(|k| column_matches(graph, &p.key, self.edge, p.op, &k))
+            })
+            .collect();
         let c = cap.unwrap_or(usize::MAX);
         let mut out = Vec::with_capacity(c.min(ids.len()));
 
         for id in ids.drain(..) {
             if (!labelled || self.label_ok(graph, id))
                 && tests.iter().all(|t| t(id))
+                && negated.iter().all(|t| !t(id))
                 && disj
                     .iter()
                     .all(|d| d.iter().any(|b| b.iter().all(|t| t(id))))

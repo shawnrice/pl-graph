@@ -652,6 +652,22 @@ fn lower_prefix(graph: &Graph, steps: &[Step]) -> Option<(ElementSeek, Vec<usize
                     }
                 }
             }
+            // `not(has(k, v))` — satisfied by an element with no `k` at all,
+            // which is why the seek grew a NEGATED list rather than an inverted
+            // comparison. `k != v` as a comparison drops exactly those rows.
+            //
+            // (TinkerPop distinguishes this from `has(k, neq(v))`, which requires
+            // the key to exist. This engine does not — see the `P::Neq` arm in
+            // `lower_predicate`, where that divergence is recorded.)
+            //
+            // Run per traverser it is a sub-traversal each: 2.131ms over 20k
+            // vertices against 0.104ms for the GQL spelling.
+            Step::Not(sub) => {
+                if let Some(p) = single_comparison(&sub.steps) {
+                    seek.push_negated(p);
+                    captured.push(i);
+                }
+            }
             // `or(has(k, v), has(k, w))` is the shape the seek's BRANCHES were
             // built for — an outer union of inner conjunctions, the same
             // structure `within(v, w)` and GQL's `k = $a OR k = $b` already
@@ -2509,6 +2525,31 @@ fn index_seed(graph: &Graph, steps: &[Step]) -> Option<(Vec<Trav>, Vec<usize>)> 
 /// Returns whether the predicate was captured IN FULL. A `false` means the seek
 /// only approximates it (or ignores it), so the step must still run — dropping
 /// it would silently lose the filter. `neq` and the text predicates land here.
+/// A sub-traversal that is exactly one property comparison, as a `KeyPredicate`.
+///
+/// Built here rather than through `lower_predicate` for the same reason
+/// `or_branches` is: this is used where a MISSING predicate changes the answer
+/// rather than merely widening a candidate set, so it has to be all-or-nothing.
+fn single_comparison(steps: &[Step]) -> Option<KeyPredicate> {
+    let [Step::Has(key, pred)] = steps else {
+        return None;
+    };
+    let (op, v) = match pred {
+        P::Eq(v) => (SeekOp::Eq, v),
+        P::Gt(v) => (SeekOp::Gt, v),
+        P::Gte(v) => (SeekOp::Ge, v),
+        P::Lt(v) => (SeekOp::Lt, v),
+        P::Lte(v) => (SeekOp::Le, v),
+        _ => return None,
+    };
+
+    Some(KeyPredicate {
+        key: Arc::from(key.as_str()),
+        op,
+        operand: Operand::Lit(gval_to_idxkey(v)?),
+    })
+}
+
 /// Each branch of an `or()` as a one-comparison conjunction, or `None` if any of
 /// them is anything else.
 ///
@@ -2519,23 +2560,7 @@ fn or_branches(plans: &[Traversal]) -> Option<Vec<Vec<KeyPredicate>>> {
     let mut branches = Vec::with_capacity(plans.len());
 
     for plan in plans {
-        let [Step::Has(key, pred)] = plan.steps.as_slice() else {
-            return None;
-        };
-        let (op, v) = match pred {
-            P::Eq(v) => (SeekOp::Eq, v),
-            P::Gt(v) => (SeekOp::Gt, v),
-            P::Gte(v) => (SeekOp::Ge, v),
-            P::Lt(v) => (SeekOp::Lt, v),
-            P::Lte(v) => (SeekOp::Le, v),
-            _ => return None,
-        };
-
-        branches.push(vec![KeyPredicate {
-            key: Arc::from(key.as_str()),
-            op,
-            operand: Operand::Lit(gval_to_idxkey(v)?),
-        }]);
+        branches.push(vec![single_comparison(&plan.steps)?]);
     }
 
     (!branches.is_empty()).then_some(branches)
@@ -2551,6 +2576,32 @@ fn lower_predicate(key: &str, pred: &P, seek: &mut ElementSeek) -> bool {
     };
 
     match pred {
+        // KNOWN DIVERGENCE from TinkerPop, and NOT introduced here — this lowers
+        // what both of this project's engines already do.
+        //
+        // TinkerPop's `has(k, neq(v))` is a predicate on a value, so the key must
+        // EXIST and then differ: an element with no `k` is filtered out. Its
+        // framing is that if you have no sister, "is your sister older than 30" is
+        // no and "is your sister younger than 30" is also no. `not(has(k, v))` is
+        // the OTHER reading and does keep such an element.
+        //
+        // Here the two spellings mean the same thing: both are `NOT (present AND
+        // equal)`, so an element with no `k` satisfies both. The Rust and TS
+        // engines agree with each other on it, which is why no fuzzer sees it, and
+        // making it a `presence` + `negated` pair — which is what TinkerPop's
+        // reading is, exactly — would have quietly changed the answer on one side
+        // only. Left as it is; changing it is a decision about both engines.
+        P::Neq(v) => {
+            let Some(o) = lit(v) else {
+                return false;
+            };
+
+            seek.push_negated(KeyPredicate {
+                key,
+                op: SeekOp::Eq,
+                operand: o,
+            });
+        }
         P::Eq(v) => one(SeekOp::Eq, v),
         P::Gt(v) => one(SeekOp::Gt, v),
         P::Gte(v) => one(SeekOp::Ge, v),

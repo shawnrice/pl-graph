@@ -3441,14 +3441,12 @@ fn a_multi_hop_semi_join_agrees_with_running_the_body() {
 /// Open gaps as of this writing:
 ///
 /// ```text
-///   not(has(k, v))                      2.131   vs 0.104   20.4x   Gremlin
 ///   MATCH (u:V) RETURN u.n              0.121   vs 0.028    4.4x   GQL
 ///   filter on an edge property          0.666   vs 0.149    4.5x   GQL
 /// ```
 ///
-/// `not(has(k, v))` cannot lower as it stands — an element with no `k` satisfies
-/// it, and the range disjunction that would stand in for a negated equality
-/// excludes exactly those.
+/// Both remaining gaps are GQL paying for a frame it then transposes, where the
+/// Gremlin side reads one column. Neither is a missing shortcut.
 #[test]
 #[ignore = "timing"]
 fn cross_language_cost_probe() {
@@ -3591,6 +3589,11 @@ fn cross_language_cost_probe() {
             "a negated predicate",
             "MATCH (u:V) WHERE NOT u.n = 3 RETURN count(*) AS c",
             "g.V().hasLabel('V').not(__.has('n', 3)).count()",
+        ),
+        (
+            "a not-equal predicate",
+            "MATCH (u:V) WHERE u.n <> 3 RETURN count(*) AS c",
+            "g.V().hasLabel('V').has('n', neq(3)).count()",
         ),
         (
             "does the key exist at all",
@@ -4368,4 +4371,126 @@ fn a_grouped_count_is_not_a_column_fold() {
     same_via_stream(&mut g, "g.V().group().by('k')");
     // A value-by that walks.
     same_via_stream(&mut g, "g.V().group().by('k').by(__.out('R').count())");
+}
+
+// --- a negated comparison lowers, and it is not a not-equal ------------------
+
+/// `not(has(k, v))` is satisfied by an element that does not carry `k` at all.
+/// TinkerPop's framing: if you have no sister, "is your sister older than 30" is
+/// no and "is your sister younger than 30" is also no — so such an element fails
+/// every `has(k, …)` and therefore satisfies every `not(has(k, …))`.
+///
+/// The fixture needs an element missing the key, or the assertion means nothing —
+/// and it must NOT contain a stored null, which promotes the column to `Mixed`
+/// and makes the whole seek decline to the stream. That was the first version of
+/// this test: it asserted the right numbers, and the numbers came from the path
+/// it was written to check the OTHER one against.
+#[test]
+fn a_negated_has_includes_elements_without_the_key() {
+    let lines = [
+        r#"{"type":"node","id":"n0","labels":["V"],"properties":{"n":3}}"#,
+        r#"{"type":"node","id":"n1","labels":["V"],"properties":{"n":4}}"#,
+        r#"{"type":"node","id":"n2","labels":["V"],"properties":{"n":5}}"#,
+        // no `n` at all
+        r#"{"type":"node","id":"n3","labels":["V"],"properties":{"other":1}}"#,
+        r#"{"type":"node","id":"n4","labels":["V"],"properties":{}}"#,
+    ]
+    .join("\n");
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    // n1, n2 (present and not 3) PLUS n3, n4 (no key at all).
+    assert_eq!(count_of(&mut g, "g.V().not(__.has('n', 3)).count()"), 4.0);
+    // In THIS engine `neq` reads the same way — see the divergence recorded on
+    // the `P::Neq` arm of `lower_predicate`. TinkerPop gives 2 here, and the TS
+    // engine gives 4 like this one, so the two spellings are interchangeable here
+    // and are not in TinkerPop.
+    assert_eq!(count_of(&mut g, "g.V().has('n', neq(3)).count()"), 4.0);
+    assert_eq!(count_of(&mut g, "g.V().has('n', 3).count()"), 1.0);
+
+    // Every ordering comparison, negated; n3/n4 are in all of them.
+    assert_eq!(
+        count_of(&mut g, "g.V().not(__.has('n', gt(3))).count()"),
+        3.0
+    );
+    assert_eq!(
+        count_of(&mut g, "g.V().not(__.has('n', gte(4))).count()"),
+        3.0
+    );
+    assert_eq!(
+        count_of(&mut g, "g.V().not(__.has('n', lt(5))).count()"),
+        3.0
+    );
+    assert_eq!(
+        count_of(&mut g, "g.V().not(__.has('n', lte(3))).count()"),
+        4.0
+    );
+    // A key nothing carries: the negation keeps everything.
+    assert_eq!(count_of(&mut g, "g.V().not(__.has('zz', 1)).count()"), 5.0);
+    assert_eq!(count_of(&mut g, "g.V().has('zz', neq(1)).count()"), 5.0);
+    // Presence AND the negation is the pair that DOES exclude a missing key, and
+    // it is what TinkerPop's `neq` means. Spelled out, it works here too.
+    assert_eq!(
+        count_of(&mut g, "g.V().has('n').not(__.has('n', 3)).count()"),
+        2.0
+    );
+    // Two negations, and the scan cap (a different code path in the seek).
+    assert_eq!(
+        count_of(
+            &mut g,
+            "g.V().not(__.has('n', 3)).not(__.has('n', 4)).count()"
+        ),
+        3.0
+    );
+    // The CAPPED scan path. A count alone cannot see whether the cap applied the
+    // negation — `limit(2)` of five candidates and `limit(2)` of four matches are
+    // both 2 — so this asks WHICH rows, and asks for a limit above the match
+    // count as well.
+    assert_eq!(
+        super::parse::parse("g.V().not(__.has('n', 3)).limit(2).id()")
+            .expect("parses")
+            .run(&mut g)
+            .iter()
+            .map(|v| format!("{v:?}"))
+            .collect::<Vec<_>>(),
+        vec!["Str(\"n1\")", "Str(\"n2\")"]
+    );
+    assert_eq!(
+        count_of(&mut g, "g.V().not(__.has('n', 3)).limit(5).count()"),
+        4.0
+    );
+    // Labels compose with it, which is the shape that actually lowers in the
+    // benchmark.
+    assert_eq!(
+        count_of(&mut g, "g.V().hasLabel('V').not(__.has('n', 3)).count()"),
+        4.0
+    );
+}
+
+/// A STORED NULL is present and satisfies no comparison, so it satisfies every
+/// negation of one. A NaN would be the same case, and cannot arise: every write
+/// entry point coerces a non-finite number to null, so there is no NaN in a
+/// column to test against.
+#[test]
+fn a_stored_null_satisfies_every_negated_comparison() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"n":1}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"n":null}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    // `a` matches each comparison and is excluded; the stored null never does.
+    assert_eq!(count_of(&mut g, "g.V().not(__.has('n', 1)).count()"), 1.0);
+    assert_eq!(
+        count_of(&mut g, "g.V().not(__.has('n', gt(0))).count()"),
+        1.0
+    );
+    assert_eq!(
+        count_of(&mut g, "g.V().not(__.has('n', lt(9))).count()"),
+        1.0
+    );
+    // And it IS present, so presence and negation disagree about it on purpose.
+    assert_eq!(count_of(&mut g, "g.V().has('n').count()"), 2.0);
 }
