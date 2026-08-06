@@ -31,11 +31,19 @@ fn bind_frame_row(b: &mut Binding, sc: &ScanCols, ri: usize) {
 ///
 /// The two are separate because they do different things, and until the frame's
 /// two column vectors became one that was easy to miss: the element loop was
-/// written out twice, once here and once there, and only one of the copies also
-/// bound a computed column. Whether the other SHOULD is a live question — a slot
-/// holding one reads as unbound from `bind_frame_row`, so an ORDER BY or GROUP BY
-/// over a bound path variable sees null — but it is a behavior question, not a
-/// refactor, so this preserves both callers exactly as they were.
+/// written out twice, once here and once there, and only one copy also bound a
+/// computed column.
+///
+/// The difference is NOT observable today, and the reason is worth writing down
+/// because it is not obvious: the only thing that sets a computed column is a
+/// bound path variable, and `vectorized_frame` declines outright when there is
+/// one (only the scalar driver builds a `Path`). So `bind_frame_row` never meets
+/// one. Checked rather than assumed — `ORDER BY path_length(p)` and `GROUP BY p`
+/// over `p = (x)-[:R]->{1,2}(y)` both answer correctly, on the scalar path.
+///
+/// It becomes reachable the moment the frame learns to carry a path, so the two
+/// callers keep the behavior they had rather than being quietly unified into
+/// whichever one someone reads first.
 #[inline]
 pub(super) fn bind_frame_row_with_vals(b: &mut Binding, sc: &ScanCols, ri: usize) {
     for (slot, col) in sc.cols.iter().enumerate() {
