@@ -1273,6 +1273,34 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
         [Step::Fold] => Some(vec![GVal::List(
             ids.iter().map(|&id| frontier_val(id, is_edge)).collect(),
         )]),
+        // `group().by(k).by(values(v).<reduce>())` off the frontier: two resolved
+        // columns and one bucketing pass, where the stream buckets TRAVERSERS and
+        // then runs a sub-traversal per group. 6.599ms over 20k vertices against
+        // 0.594ms for the GQL spelling.
+        //
+        // Only the four reducers that SKIP nulls, and deliberately not `count()`:
+        // `prop_column` reads an absent key and a stored null as the same
+        // `GVal::Null`, which is exactly right for these — TinkerPop 3.5's rule is
+        // that `sum`/`mean`/`min`/`max` "ignore null values when other numbers are
+        // present" — and wrong for a count, where an absent key contributes
+        // nothing and a stored null contributes one.
+        //
+        // Members are folded in FRONTIER order, which is the order the stream
+        // visits them: float addition is not associative, so a different order is
+        // a different sum and the TS engine's has to match.
+        [Step::Group(bys)] if let Some((kkey, vkey, red)) = grouped_reduce(bys) => {
+            let vals = prop_column(graph, ids, is_edge, vkey);
+            let entries = group_by(
+                prop_column(graph, ids, is_edge, kkey).into_iter(),
+                Vec::new,
+                |m: &mut Vec<usize>, i| m.push(i),
+            )
+            .into_iter()
+            .map(|(k, members)| (k, red.apply(members.iter().map(|&i| &vals[i]))))
+            .collect();
+
+            Some(vec![GVal::map(entries)])
+        }
         // `project('a','b').by('a').by('b')` off the frontier: one resolved column
         // per key, zipped into maps that all share one key vector. The stream form
         // re-resolves each property NAME per element per key — `prop` takes a
@@ -1781,10 +1809,32 @@ fn distinct_values(values: impl Iterator<Item = GVal>) -> Vec<GVal> {
 /// with no index key (one that cannot be hashed) falls back to a scan, which is
 /// what the stream version always did.
 fn tally_group_count(values: impl Iterator<Item = GVal>) -> Vec<(GVal, GVal)> {
-    let mut entries: Vec<(GVal, f64)> = Vec::new();
+    group_by(values, || 0.0f64, |n, _| *n += 1.0)
+        .into_iter()
+        .map(|(k, n)| (k, GVal::Num(n)))
+        .collect()
+}
+
+/// Bucket by key, keeping FIRST-SEEN order, accumulating whatever the caller
+/// wants per group.
+///
+/// The order is pinned — it is what both engines return for a grouped result —
+/// so this is the one place it is decided. A key with no dedup key of its own (a
+/// NaN) falls back to a linear scan by equality, the same rule `dedup` follows.
+///
+/// The accumulator is a parameter because materializing the MEMBERS of every
+/// group is not free and the tally does not need them: collecting a
+/// `Vec<usize>` per group so a count could read its length measured 1.068ms ->
+/// 1.48ms on 20k distinct keys. One bucketing routine, two accumulators.
+fn group_by<A>(
+    keys: impl Iterator<Item = GVal>,
+    init: impl Fn() -> A,
+    add: impl Fn(&mut A, usize),
+) -> Vec<(GVal, A)> {
+    let mut entries: Vec<(GVal, A)> = Vec::new();
     let mut index: crate::fxhash::FxHashMap<DedupKey, usize> = crate::fxhash::FxHashMap::default();
 
-    for key in values {
+    for (i, key) in keys.enumerate() {
         let dk = dedup_key(&key);
         let existing = match &dk {
             Some(dk) => index.get(dk).copied(),
@@ -1792,21 +1842,21 @@ fn tally_group_count(values: impl Iterator<Item = GVal>) -> Vec<(GVal, GVal)> {
         };
 
         match existing {
-            Some(i) => entries[i].1 += 1.0,
+            Some(at) => add(&mut entries[at].1, i),
             None => {
                 if let Some(dk) = dk {
                     index.insert(dk, entries.len());
                 }
 
-                entries.push((key, 1.0));
+                let mut a = init();
+
+                add(&mut a, i);
+                entries.push((key, a));
             }
         }
     }
 
     entries
-        .into_iter()
-        .map(|(k, n)| (k, GVal::Num(n)))
-        .collect()
 }
 
 /// The effective sort direction of an `order()` over the CURRENT value, or
@@ -3311,6 +3361,56 @@ fn element_props_map(graph: &Graph, v: &GVal) -> GVal {
         .map(|k| (GVal::Str(k.clone()), prop(graph, v, &k)))
         .collect();
     GVal::map(entries)
+}
+
+/// The numeric reducers a grouped value-`by()` can be answered as a column fold.
+#[derive(Clone, Copy)]
+enum GroupReduce {
+    Sum,
+    Mean,
+    Min,
+    Max,
+}
+
+impl GroupReduce {
+    /// Reduce one group's values. Shares the stream's rules for both halves:
+    /// [`reduce_nums`] for the numeric folds, `value::fold_extreme` for the
+    /// extremes — the same two functions the `sum()` / `max()` steps call.
+    fn apply<'a>(self, vals: impl Iterator<Item = &'a GVal>) -> GVal {
+        match self {
+            Self::Sum => reduce_nums(vals, &|ns| ns.iter().sum()),
+            #[allow(clippy::cast_precision_loss)]
+            Self::Mean => reduce_nums(vals, &|ns| ns.iter().sum::<f64>() / ns.len() as f64),
+            Self::Min => crate::value::fold_extreme(vals.cloned(), Ordering::Less, agg_cmp),
+            Self::Max => crate::value::fold_extreme(vals.cloned(), Ordering::Greater, agg_cmp),
+        }
+    }
+}
+
+/// `group().by(k).by(__.values(v).<reduce>())`, or `None` for anything else.
+///
+/// Both modulators must be present: a `group()` with no value-`by()` collects the
+/// ELEMENTS of each group, which is not a column fold.
+fn grouped_reduce(bys: &[By]) -> Option<(&str, &str, GroupReduce)> {
+    let [By::Key(kkey, _), By::Traversal(plan, _)] = bys else {
+        return None;
+    };
+    let [Step::Values(vkeys), reducer] = plan.steps.as_slice() else {
+        return None;
+    };
+    // `values('a','b')` reads several keys per element; one column is not it.
+    let [vkey] = vkeys.as_slice() else {
+        return None;
+    };
+    let red = match reducer {
+        Step::Sum(Scope::Global) => GroupReduce::Sum,
+        Step::Mean(Scope::Global) => GroupReduce::Mean,
+        Step::Min(Scope::Global) => GroupReduce::Min,
+        Step::Max(Scope::Global) => GroupReduce::Max,
+        _ => return None,
+    };
+
+    Some((kkey.as_str(), vkey.as_str(), red))
 }
 
 /// Can `project()`'s modulators be read as columns off a frontier?
@@ -5626,13 +5726,32 @@ fn has_dup(path: &[GVal]) -> bool {
 }
 
 fn fold_num(stream: Vec<Trav>, f: impl Fn(&[f64]) -> f64) -> Vec<Trav> {
-    let ns: Vec<f64> = stream.iter().filter_map(|t| strict_num(&t.val)).collect();
+    vec![Trav::root(reduce_nums(stream.iter().map(|t| &t.val), &f))]
+}
+
+/// What a numeric reducing barrier folds a run of values to.
+///
+/// Non-numbers and nulls are skipped, so a run with any number in it reduces
+/// over the numbers — which is TinkerPop 3.5's rule for `sum`/`mean`/`min`/`max`
+/// ("ignore null values when other numbers are present").
+///
+/// KNOWN DIVERGENCE, and deliberate on this engine's part: TinkerPop's rule for
+/// a run with NO number in it (empty, or all null) is that the traversal yields
+/// nothing — `hasNext()` is false. This engine yields a single `null` instead,
+/// and the TS engine does too, so the two are consistent with each other and not
+/// with TinkerPop. Changing it is a breaking change to both, not a bug fix to
+/// one.
+///
+/// Order matters and is the caller's: floating-point addition is not
+/// associative, so summing a group in a different order is a different answer,
+/// and the TS engine's order has to match.
+fn reduce_nums<'a>(vals: impl Iterator<Item = &'a GVal>, f: &dyn Fn(&[f64]) -> f64) -> GVal {
+    let ns: Vec<f64> = vals.filter_map(strict_num).collect();
+
     if ns.is_empty() {
-        // No numeric values (empty stream or all null) → a single null result,
-        // matching the TS engine's `sum`/`mean`.
-        vec![Trav::root(GVal::Null)]
+        GVal::Null
     } else {
-        vec![Trav::root(GVal::Num(f(&ns)))]
+        GVal::Num(f(&ns))
     }
 }
 

@@ -3441,18 +3441,14 @@ fn a_multi_hop_semi_join_agrees_with_running_the_body() {
 /// Open gaps as of this writing:
 ///
 /// ```text
-///   group().by(k).by(values(v).sum())   6.599ms vs 0.594   11.1x   Gremlin
 ///   not(has(k, v))                      2.131   vs 0.104   20.4x   Gremlin
 ///   MATCH (u:V) RETURN u.n              0.121   vs 0.028    4.4x   GQL
 ///   filter on an edge property          0.666   vs 0.149    4.5x   GQL
 /// ```
 ///
-/// The grouped sum is a lowering with a SEMANTIC question in front of it: an
-/// element missing the key still forms a group under `by(k)` but contributes
-/// nothing to `values(v).sum()`, and a column arm has to answer both the same way
-/// the stream does. `not(has(k, v))` cannot lower as it stands — an element with
-/// no `k` satisfies it, and the range disjunction that would stand in for a
-/// negated equality excludes exactly those.
+/// `not(has(k, v))` cannot lower as it stands — an element with no `k` satisfies
+/// it, and the range disjunction that would stand in for a negated equality
+/// excludes exactly those.
 #[test]
 #[ignore = "timing"]
 fn cross_language_cost_probe() {
@@ -4235,4 +4231,141 @@ fn an_or_of_anything_else_still_answers() {
     );
     // An empty `or()` matches nothing, as TinkerPop's does.
     assert_eq!(count_of(&mut g, "g.V().or().count()"), 0.0);
+}
+
+// --- a grouped numeric fold off the frontier ---------------------------------
+
+/// Every case where "read two columns and bucket them" could differ from
+/// "bucket the traversers and run a sub-traversal per group": a group key that is
+/// absent, a value that is absent, a STORED null on either side, a group with no
+/// number in it at all, and a NaN key (which has no dedup key and falls back to a
+/// linear scan).
+fn grouped_fold_fixture() -> Graph {
+    let lines = [
+        r#"{"type":"node","id":"n0","labels":["V"],"properties":{"k":"a","v":1}}"#,
+        r#"{"type":"node","id":"n1","labels":["V"],"properties":{"k":"a","v":2}}"#,
+        r#"{"type":"node","id":"n2","labels":["V"],"properties":{"k":"b","v":10}}"#,
+        // the key, no value
+        r#"{"type":"node","id":"n3","labels":["V"],"properties":{"k":"b"}}"#,
+        // no key, a value
+        r#"{"type":"node","id":"n4","labels":["V"],"properties":{"v":100}}"#,
+        // neither
+        r#"{"type":"node","id":"n5","labels":["V"],"properties":{}}"#,
+        // a stored null key
+        r#"{"type":"node","id":"n6","labels":["V"],"properties":{"k":null,"v":7}}"#,
+        // a group whose every value is a stored null
+        r#"{"type":"node","id":"n7","labels":["V"],"properties":{"k":"z","v":null}}"#,
+        r#"{"type":"node","id":"n8","labels":["V"],"properties":{"k":"z","v":null}}"#,
+        // a value that is not a number at all
+        r#"{"type":"node","id":"n9","labels":["V"],"properties":{"k":"s","v":"text"}}"#,
+        r#"{"type":"node","id":"n10","labels":["V"],"properties":{"k":"s","v":4}}"#,
+        // A group whose sum DEPENDS on the order it is folded in. At 1e16 the
+        // gap between representable doubles is 2, so `1e16 + 1 + 1` keeps losing
+        // the 1 and stays 1e16, while `1 + 1 + 1e16` carries a 2 in and gives
+        // 1.0000000000000002e16. Without a group like this every sum here is
+        // exact in either direction, and a fold that visited members backwards
+        // passed the test.
+        r#"{"type":"node","id":"n11","labels":["V"],"properties":{"k":"f","v":1e16}}"#,
+        r#"{"type":"node","id":"n12","labels":["V"],"properties":{"k":"f","v":1}}"#,
+        r#"{"type":"node","id":"n13","labels":["V"],"properties":{"k":"f","v":1}}"#,
+        r#"{"type":"edge","id":"e0","from":"n0","to":"n1","labels":["R"],"properties":{"ek":"x","ev":3}}"#,
+        r#"{"type":"edge","id":"e1","from":"n1","to":"n2","labels":["R"],"properties":{"ek":"x","ev":4}}"#,
+        r#"{"type":"edge","id":"e2","from":"n2","to":"n0","labels":["R"],"properties":{"ek":"y"}}"#,
+    ]
+    .join("\n");
+
+    crate::ndjson::decode(&lines).expect("fixture decodes")
+}
+
+#[test]
+fn a_grouped_fold_off_a_frontier_matches_the_stream() {
+    let mut g = grouped_fold_fixture();
+
+    for reduce in ["sum", "max", "min", "mean"] {
+        same_via_stream(
+            &mut g,
+            &format!("g.V().group().by('k').by(__.values('v').{reduce}())"),
+        );
+        same_via_stream(
+            &mut g,
+            &format!("g.E().group().by('ek').by(__.values('ev').{reduce}())"),
+        );
+        // Grouping BY the value and folding the key, so the absent side swaps.
+        same_via_stream(
+            &mut g,
+            &format!("g.V().group().by('v').by(__.values('v').{reduce}())"),
+        );
+    }
+}
+
+/// The rules the fold has to reproduce, spelled out rather than only compared —
+/// a pairing test says the two agree, not that either is right.
+#[test]
+fn a_grouped_fold_skips_nulls_and_keys_absences_as_null() {
+    let mut g = grouped_fold_fixture();
+    let entries = |g: &mut Graph, src: &str| -> Vec<(String, String)> {
+        match super::parse::parse(src).expect("parses").run(g).as_slice() {
+            [GVal::Map(m)] => m
+                .iter()
+                .map(|(k, v)| (format!("{k:?}"), format!("{v:?}")))
+                .collect(),
+            other => panic!("expected one map, got {other:?}"),
+        }
+    };
+    let got = entries(&mut g, "g.V().group().by('k').by(__.values('v').sum())");
+
+    assert_eq!(
+        got,
+        vec![
+            // 1 + 2
+            ("Str(\"a\")".into(), "Num(3.0)".into()),
+            // n3 has the key and no value: the group exists, the value is skipped.
+            ("Str(\"b\")".into(), "Num(10.0)".into()),
+            // An ABSENT key and a STORED NULL key are the same group, which is
+            // TinkerPop 3.5's rule for the first (a missing property groups under
+            // null) and this engine's null model for the second. 100 + 7.
+            ("Null".into(), "Num(107.0)".into()),
+            // Every value in the group is a stored null: no number, so null —
+            // NOT zero. (TinkerPop yields no result at all here; see
+            // `reduce_nums`, which records the divergence.)
+            ("Str(\"z\")".into(), "Null".into()),
+            // A non-number is skipped like a null, leaving the one number.
+            ("Str(\"s\")".into(), "Num(4.0)".into()),
+            // Folded in FRONTIER order: 1e16 + 1 + 1 stays 1e16, where the
+            // other order gives 1.0000000000000002e16. Float addition is not
+            // associative, so the order is part of the answer.
+            ("Str(\"f\")".into(), "Num(1e16)".into()),
+        ]
+    );
+    // Groups come out in FIRST-SEEN order, which the vec above is asserting.
+    assert_eq!(
+        got.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        vec![
+            "Str(\"a\")",
+            "Str(\"b\")",
+            "Null",
+            "Str(\"z\")",
+            "Str(\"s\")",
+            "Str(\"f\")"
+        ]
+    );
+}
+
+/// `count()` as the value-`by()` must NOT take the column arm: a column read
+/// cannot tell an absent key from a stored null, and a count is the one reducer
+/// that has to. n7/n8 hold stored nulls, so the `z` group counts 2 either way —
+/// the case that discriminates is the null-KEY group, whose members are an absent
+/// key twice and a stored null once.
+#[test]
+fn a_grouped_count_is_not_a_column_fold() {
+    let mut g = grouped_fold_fixture();
+
+    same_via_stream(&mut g, "g.V().group().by('k').by(__.count())");
+    same_via_stream(&mut g, "g.V().group().by('k').by(__.values('v').count())");
+    // Two keys read per element is not one column.
+    same_via_stream(&mut g, "g.V().group().by('k').by(__.values('v','k').sum())");
+    // No value-by at all: the members themselves.
+    same_via_stream(&mut g, "g.V().group().by('k')");
+    // A value-by that walks.
+    same_via_stream(&mut g, "g.V().group().by('k').by(__.out('R').count())");
 }
