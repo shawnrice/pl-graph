@@ -619,6 +619,87 @@ impl<'a> Col<'a> {
         }
     }
 
+    /// Read a stored property column at `ids` into a runtime column.
+    ///
+    /// One gather, dispatching on what the STORAGE holds — which is the question
+    /// every caller was asking separately. GQL had three (`gather_num`,
+    /// `gather_str`, `gather_temporal`) chained with `or_else` so that a column
+    /// type nobody had written a gather for fell through to a per-row rebuild;
+    /// Gremlin had a fourth that boxed everything.
+    ///
+    /// Absent is NULL here, one row per id — the alignment a keyed modulator
+    /// needs (`order().by(k)`, `GROUP BY k`). A caller that wants absent rows
+    /// DROPPED instead — which is what `values(k)` means — filters afterwards.
+    ///
+    /// `None` for a column shape with no unboxed form — `Mixed`, `Vec`, `Record`
+    /// — because reading one is a per-LANGUAGE question: GQL takes a stored map
+    /// as an ISO record and Gremlin as a map. The caller falls back to its own
+    /// per-row read, which is what it did before this existed.
+    #[must_use]
+    pub fn from_property(
+        col: Option<&crate::graph::Column>,
+        ids: &[u32],
+        strs: &crate::graph::Dict,
+    ) -> Option<Self> {
+        use crate::graph::Column;
+
+        let masked = |present: &crate::graph::BitSet| {
+            let mut valid = Vec::with_capacity(ids.len());
+            let mut any_absent = false;
+
+            for &vi in ids {
+                let ok = present.get(vi as usize);
+
+                any_absent |= !ok;
+                valid.push(ok);
+            }
+
+            any_absent.then_some(valid)
+        };
+
+        Some(match col {
+            Some(Column::Num { data, present }) => Self::Num {
+                d: ids.iter().map(|&vi| data[vi as usize]).collect(),
+                valid: masked(present),
+            },
+            Some(Column::Bool { data, present }) => Self::Bool {
+                t: ids.iter().map(|&vi| data[vi as usize]).collect(),
+                valid: masked(present),
+            },
+            Some(Column::Str { data, present }) => Self::Gen(
+                ids.iter()
+                    .map(|&vi| {
+                        let i = vi as usize;
+
+                        if present.get(i) {
+                            Value::Str(strs.arc(data[i]))
+                        } else {
+                            Value::Null
+                        }
+                    })
+                    .collect(),
+            ),
+            Some(Column::Temporal { data, present }) => Self::Gen(
+                ids.iter()
+                    .map(|&vi| {
+                        let i = vi as usize;
+
+                        if present.get(i) {
+                            Value::Temporal(data.get(i))
+                        } else {
+                            Value::Null
+                        }
+                    })
+                    .collect(),
+            ),
+            // The key has no column at all: every row is a null, which no
+            // per-row read would improve on.
+            None => Self::Gen(vec![Value::Null; ids.len()]),
+            // `Mixed` / `Vec` / `Record`: the caller's own read.
+            Some(_) => return None,
+        })
+    }
+
     /// Row `i` as a value. Cheap for the typed variants; a `Str` is an `Arc`
     /// bump.
     #[must_use]

@@ -2798,72 +2798,6 @@ impl ScanCols {
     }
 }
 
-/// Gather a numeric `Column` at `ids` into a `Col::Num` (+ validity mask), or
-/// `None` if the column isn't numeric (caller then falls back to per-row `Gen`).
-fn gather_num(col: Option<&Column>, ids: &[u32]) -> Option<Col> {
-    match col {
-        Some(Column::Num { data, present }) => {
-            let mut d = Vec::with_capacity(ids.len());
-            let mut valid = Vec::with_capacity(ids.len());
-            for &vi in ids {
-                let i = vi as usize;
-                d.push(data[i]);
-                valid.push(present.get(i));
-            }
-            Some(Col::Num {
-                d,
-                valid: Some(valid),
-            })
-        }
-        _ => None,
-    }
-}
-
-/// Gather a `Column::Str` at `ids` into a `Col::Gen` of `Val::Str` (shared Arc
-/// clones; absent → `Null`) — the string analogue of [`gather_num`]. Replaces the
-/// per-row `Binding` rebuild + `eval` dispatch of `scalar_col` with a tight
-/// interner-clone loop, so projecting/sorting a string column stays cheap.
-fn gather_str(col: Option<&Column>, ids: &[u32], strs: &crate::graph::Dict) -> Option<Col> {
-    match col {
-        Some(Column::Str { data, present }) => Some(Col::Gen(
-            ids.iter()
-                .map(|&vi| {
-                    let i = vi as usize;
-                    if present.get(i) {
-                        Val::Str(strs.arc(data[i]))
-                    } else {
-                        Val::Null
-                    }
-                })
-                .collect(),
-        )),
-        _ => None,
-    }
-}
-
-/// Gather a `Column::Temporal` at `ids` into a `Col::Gen` of `Val::Temporal`
-/// (absent → `Null`) — the temporal analogue of [`gather_str`]. Reconstructs each
-/// value straight from the packed per-type arrays in a tight loop, replacing the
-/// per-row `Binding` rebuild + `eval` dispatch of `scalar_col` — so projecting or
-/// ordering a temporal column engages the vectorized scan instead of falling back.
-fn gather_temporal(col: Option<&Column>, ids: &[u32]) -> Option<Col> {
-    match col {
-        Some(Column::Temporal { data, present }) => Some(Col::Gen(
-            ids.iter()
-                .map(|&vi| {
-                    let i = vi as usize;
-                    if present.get(i) {
-                        Val::Temporal(data.get(i))
-                    } else {
-                        Val::Null
-                    }
-                })
-                .collect(),
-        )),
-        _ => None,
-    }
-}
-
 /// If `e` is a `Prop` over a typed `Column::Temporal` in `sc`, gather it as a
 /// column of `Option<Temporal>` (absent → `None`) for a typed ORDER BY — the sort
 /// then compares Copy temporals via `cmp_total`, skipping the `Val` wrapper +
@@ -3451,19 +3385,13 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> Col {
                 let col = ctx.prop_keys[*key_ref]
                     .0
                     .and_then(|k| graph.props.cols.get(k as usize));
-                gather_num(col, ids)
-                    .or_else(|| gather_str(col, ids, &graph.strs))
-                    .or_else(|| gather_temporal(col, ids))
-                    .unwrap_or_else(|| gen(e))
+                Col::from_property(col, ids, &graph.strs).unwrap_or_else(|| gen(e))
             }
             Some((Elem::Edge, ids)) => {
                 let col = ctx.prop_keys[*key_ref]
                     .1
                     .and_then(|k| graph.edge_props.cols.get(k as usize));
-                gather_num(col, ids)
-                    .or_else(|| gather_str(col, ids, &graph.strs))
-                    .or_else(|| gather_temporal(col, ids))
-                    .unwrap_or_else(|| gen(e))
+                Col::from_property(col, ids, &graph.strs).unwrap_or_else(|| gen(e))
             }
             None => gen(e),
         },

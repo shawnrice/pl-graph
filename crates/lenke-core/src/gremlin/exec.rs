@@ -1628,15 +1628,31 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
             // a `By::Key` at all.
             let descending =
                 by_dir.unwrap_or(if *desc { Order::Desc } else { Order::Asc }) == Order::Desc;
-            let keys = prop_column(graph, ids, is_edge, key);
+            // The gather already knows whether this property is a number column,
+            // so the sort does not have to ask the values one at a time. A
+            // `Col::Num` with no mask IS "every row present and numeric", which
+            // is exactly the condition the rank check below establishes for the
+            // boxed case — it used to be re-derived by unwrapping every `GVal`
+            // back into an `f64`.
+            let col = prop_col(graph, ids, is_edge, key);
+            // Take the numbers by MOVE and skip boxing entirely when they are
+            // usable; box only for the path that compares boxed values.
+            let (nums, keys): (Option<Vec<f64>>, Vec<GVal>) = match col {
+                Col::Num { d, valid: None } if !d.iter().any(|x| x.is_nan()) => {
+                    (Some(d), Vec::new())
+                }
+                other => (None, other.into_vals()),
+            };
+
             // The stream FAULTS on a pair it cannot order — a NaN, or two
             // different types — so answering here would swallow the error. A
             // shared type rank means every pair is comparable.
             let rank = keys.first().map(gval_type_rank);
 
-            if keys
-                .iter()
-                .any(|k| Some(gval_type_rank(k)) != rank || matches!(k, GVal::Num(n) if n.is_nan()))
+            if nums.is_none()
+                && keys.iter().any(|k| {
+                    Some(gval_type_rank(k)) != rank || matches!(k, GVal::Num(n) if n.is_nan())
+                })
             {
                 return None;
             }
@@ -1675,19 +1691,8 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
             // reason. It used `gcmp_total` directly and had the `-0.0` bug before
             // this commit added a numeric path at all.
             //
-            // A homogeneous NUMBER column then sorts on the raw `f64` — the trick
-            // `column_terminal` uses for the aggregates, in the one other arm that
-            // compares a whole column.
-            let nums: Option<Vec<f64>> = (rank == Some(gval_type_rank(&GVal::Num(0.0))))
-                .then(|| {
-                    keys.iter()
-                        .map(|k| match k {
-                            GVal::Num(n) => Some(*n),
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .flatten();
+            // A homogeneous NUMBER column sorts on the raw `f64`, which the
+            // gather above already handed over.
 
             match &nums {
                 Some(ns) => crate::value::keep_smallest(&mut idx, cap, |&i, &j| {
@@ -3082,18 +3087,37 @@ fn prop(graph: &Graph, v: &GVal, key: &str) -> GVal {
 /// Values are IDENTICAL to `prop`'s, element for element, including the `Null`
 /// for an absent key and for an id that is neither node nor edge.
 fn prop_column(graph: &Graph, ids: &[u32], is_edge: bool, key: &str) -> Vec<GVal> {
+    prop_col(graph, ids, is_edge, key).into_vals()
+}
+
+/// The same read, kept as a COLUMN.
+///
+/// `Col::from_property` is the shared gather — the one GQL's vectorized `Prop`
+/// also takes — so a numeric property arrives as unboxed `f64` here too, and the
+/// arms that only ever wanted numbers stop reconstructing them out of boxed
+/// values.
+///
+/// It declines the column shapes with no unboxed form, because reading a stored
+/// map is a per-language question: TinkerPop's is a MAP (`as_record` false),
+/// ISO's is a record. That is what the fallback below spells.
+fn prop_col<'a>(graph: &Graph, ids: &'a [u32], is_edge: bool, key: &str) -> Col<'a> {
     let store = if is_edge {
         &graph.edge_props
     } else {
         &graph.props
     };
     let Some(kid) = store.keys.get(key) else {
-        return vec![GVal::Null; ids.len()];
+        return Col::Gen(vec![GVal::Null; ids.len()]);
     };
+    let col = store.cols.get(kid as usize);
 
-    ids.iter()
-        .map(|&id| GVal::from_column(store, kid, id as usize, &graph.strs, false))
-        .collect()
+    Col::from_property(col, ids, &graph.strs).unwrap_or_else(|| {
+        Col::Gen(
+            ids.iter()
+                .map(|&id| GVal::from_column(store, kid, id as usize, &graph.strs, false))
+                .collect(),
+        )
+    })
 }
 
 /// A `{ key: value }` map of an element's present properties (a stored null is
