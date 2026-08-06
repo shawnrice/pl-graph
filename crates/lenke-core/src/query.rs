@@ -181,7 +181,7 @@ impl RowSet {
             if i > 0 {
                 out.push(',');
             }
-            push_json_str(&mut out, c);
+            crate::jsonfmt::push_json_str(&mut out, c);
         }
         out.push_str("],\"rows\":[");
         for (ri, r) in self.rows().enumerate() {
@@ -202,26 +202,6 @@ impl RowSet {
     }
 }
 
-/// Write a JSON string literal (with escaping) into `out`.
-fn push_json_str(out: &mut String, s: &str) {
-    use std::fmt::Write as _;
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-}
-
 /// Emit a core [`Value`] as JSON. Non-finite numbers (NaN/±Inf) have no JSON
 /// form, so they serialize as null — matching how a JS engine would surface an
 /// absent/undefined numeric cell.
@@ -239,7 +219,7 @@ fn push_json_value(out: &mut String, v: &Value) {
                 out.push_str("null");
             }
         }
-        Value::Str(s) => push_json_str(out, s),
+        Value::Str(s) => crate::jsonfmt::push_json_str(out, s),
         Value::Temporal(t) => out.push_str(&t.json_tagged()),
         Value::List(items) => {
             out.push('[');
@@ -257,7 +237,7 @@ fn push_json_value(out: &mut String, v: &Value) {
                 if i > 0 {
                     out.push(',');
                 }
-                push_json_str(out, k);
+                crate::jsonfmt::push_json_str(out, k);
                 out.push(':');
                 push_json_value(out, val);
             }

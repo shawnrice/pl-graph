@@ -54,8 +54,16 @@ pub mod gql;
 #[cfg(feature = "gremlin")]
 pub mod gremlin;
 // Shared JSON writer primitives (js_number + string escaper), used by every
-// serde-free JSON surface. gql hand-rolls its own tabular output and omits it.
-#[cfg(any(feature = "gremlin", feature = "ndjson"))]
+// serde-free JSON surface.
+//
+// UNGATED, and it has to be: `gql` reaches it from `query.rs`, `graph.rs` and the
+// FFI, so the old `gremlin|ndjson` gate did not describe who uses it. What the
+// gate produced instead was COPIES — `query.rs` and `ffi_error.rs` each grew a
+// private escaper — and the copies drifted, emitting `\u0008` where this one
+// emits `\b`, on the FFI result path, where JS `JSON.stringify` gives `\b`.
+//
+// It is ~140 lines of pure formatting with no dependencies, so nothing is saved
+// by gating it and one escaper is worth more than the bytes.
 mod jsonfmt;
 // The shared hand-rolled JSON *parser* — the read side of ndjson + the codecs
 // (which imply ndjson). gql/gremlin never parse JSON, so they omit it.

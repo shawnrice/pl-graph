@@ -12828,3 +12828,38 @@ fn distinct_with_skip_and_limit_windows_over_distinct_rows() {
     assert!(nums(&mut g, "MATCH (u:N) RETURN DISTINCT u.n + 0 AS v SKIP 10").is_empty());
     assert!(nums(&mut g, "MATCH (u:N) RETURN DISTINCT u.n + 0 AS v LIMIT 0").is_empty());
 }
+
+/// Control characters in a string cell serialize the way JS `JSON.stringify`
+/// does: the short escapes where JSON defines one, `\uXXXX` otherwise.
+///
+/// `RowSet::to_json` is the FFI query-result path, so these are the bytes the TS
+/// side sees. It used its own escaper until the crate's three copies were merged,
+/// and that copy had no `\b`/`\f` arms — it fell through to the
+/// control-character rule and emitted the long form. Same string, different
+/// bytes, on the one surface where the bytes are the contract.
+#[test]
+fn control_characters_serialize_the_way_javascript_does() {
+    let mut g =
+        graph_of(&[r#"{"type":"node","id":"a","labels":["N"],"properties":{"s":"x\by\fz"}}"#]);
+    let json = crate::gql::parse("MATCH (u:N) RETURN u.s AS s")
+        .expect("parses")
+        .execute(&mut g, &crate::gql::eval::Params::new())
+        .expect("runs")
+        .to_json();
+
+    assert_eq!(json, r#"{"columns":["s"],"rows":[["x\by\fz"]]}"#);
+
+    // A control character with no short escape keeps the `\u` form, which is
+    // also what JS does.
+    let mut g2 =
+        graph_of(&[r#"{"type":"node","id":"a","labels":["N"],"properties":{"s":"\u0001"}}"#]);
+
+    assert_eq!(
+        crate::gql::parse("MATCH (u:N) RETURN u.s AS s")
+            .expect("parses")
+            .execute(&mut g2, &crate::gql::eval::Params::new())
+            .expect("runs")
+            .to_json(),
+        r#"{"columns":["s"],"rows":[["\u0001"]]}"#
+    );
+}

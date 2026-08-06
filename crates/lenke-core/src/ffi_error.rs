@@ -22,12 +22,10 @@
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use std::cell::RefCell;
 #[cfg(feature = "_fallible-ffi")]
-use std::fmt::Write as _;
-
 #[cfg(feature = "_fallible-ffi")]
 use crate::error_codes::ErrorCode;
+use std::cell::RefCell;
 
 thread_local! {
     /// The calling thread's most recent failure, pre-rendered as a JSON report
@@ -55,7 +53,7 @@ pub(crate) fn set(code: ErrorCode, message: &str, details_json: &str) {
     report.push_str("{\"code\":\"");
     report.push_str(code.as_str());
     report.push_str("\",\"message\":");
-    push_json_str(&mut report, message);
+    crate::jsonfmt::push_json_str(&mut report, message);
     report.push_str(",\"details\":");
     report.push_str(details_json);
     report.push('}');
@@ -93,25 +91,4 @@ pub unsafe extern "C" fn lnk_last_error_json(out_len: *mut usize) -> *mut u8 {
         }
         None => std::ptr::null_mut(),
     }
-}
-
-/// Write a JSON string literal (escaped) into `out`. Local copy of the codec
-/// helper so the error path stays dependency-free across every feature combo.
-#[cfg(feature = "_fallible-ffi")]
-fn push_json_str(out: &mut String, s: &str) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
 }
