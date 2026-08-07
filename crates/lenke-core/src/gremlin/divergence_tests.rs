@@ -6252,8 +6252,36 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         // from, unchanged, and is covered elsewhere (`step_tests_2.rs`,
         // `tests.rs`).
         "g.V().outE('R').label()",
+        // `values(k).count()` — the count of rows whose key is NOT ABSENT, not
+        // `count(*)` over the frontier. `n` is dense (no absent rows, a sanity
+        // case with nothing to drop); `m` is absent on ~1/3 of rows, which is
+        // the case that actually discriminates a row-drop-then-count from a
+        // bare frontier count.
+        "g.V().out('R').hasLabel('W').values('n').count()",
+        "g.V().out('R').hasLabel('W').values('m').count()",
         "g.V().out('R').hasLabel('W').groupCount().by('n')",
         "g.V().out('R').hasLabel('W').groupCount().by('k')",
+        // `group().by(k).by(values(v).<reduce>())` — one row per group, a
+        // REDUCED VALUE in place of `groupCount`'s tally. `k` (unique per node)
+        // first: every group is a singleton, exercising the basic column-fold
+        // shape with nothing to actually reduce...
+        "g.V().out('R').hasLabel('W').group().by('k').by(__.values('n').sum())",
+        "g.V().out('R').hasLabel('W').group().by('k').by(__.values('n').min())",
+        "g.V().out('R').hasLabel('W').group().by('k').by(__.values('n').max())",
+        "g.V().out('R').hasLabel('W').group().by('k').by(__.values('n').mean())",
+        // ...then `n` (`i % 97`) as the key: real multi-member groups, so ties
+        // in the key, FIRST-SEEN group order, and the reducer's fold order
+        // (float addition is not associative) all have to agree, not just the
+        // final numbers.
+        "g.V().out('R').hasLabel('W').group().by('n').by(__.values('n').sum())",
+        "g.V().out('R').hasLabel('W').group().by('n').by(__.values('n').mean())",
+        // The VALUE side (`m`) absent on ~1/3 of rows: the reducer skips a
+        // `null` ARGUMENT, not a row — the group still has every member.
+        "g.V().out('R').hasLabel('W').group().by('n').by(__.values('m').sum())",
+        // The KEY side (`m`) absent on ~1/3 of rows: those rows group under a
+        // single NULL key rather than being dropped — same rule as
+        // `groupCount().by('m')` would use, exercised here for the reducer arm.
+        "g.V().out('R').hasLabel('W').group().by('m').by(__.values('n').sum())",
         // `n` (present on every row, i % 97 over 2000 nodes): many ties — the
         // frontier/scan-order tiebreak has to agree between the two routes,
         // not just the keys.
@@ -6325,4 +6353,107 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
             if expect_empty { "no" } else { "some" }
         );
     }
+}
+
+/// `exec.rs::elem_terminal`'s `[Step::Group(bys)]` arm (the one `to_gql`'s new
+/// `group().by(k).by(values(v).<reduce>())` arm was meant to replace) is still
+/// REACHABLE, empirically, not just by reasoning — so it must stay.
+///
+/// A non-DURATION temporal `v` is the witness: GQL's grouped `sum()` FAULTS on
+/// it (`FAULT_TEMPORAL_AGG`, `matcher.rs`), so `project_ids` sees
+/// `ctx.fault != FAULT_NONE` and returns `None` — the migration declines at
+/// RUN time even though `to_gql::tail` (a COMPILE-time check) accepted the
+/// shape. `elem_terminal`'s own arm uses the stream's `reduce_nums`/
+/// `strict_num`, which silently SKIPS a non-numeric value instead of
+/// faulting, so it still has to answer this query and disagree with GQL's
+/// aggregator on how the divergence is handled (fault vs. skip) — the exact
+/// case that keeps this arm alive.
+#[test]
+fn old_group_reduce_arm_is_still_reachable_on_a_temporal_fault() {
+    let doc = "{\"type\":\"node\",\"id\":\"1\",\"labels\":[\"V\"],\"properties\":{\"k\":\"a\",\"v\":{\"@date\":\"2020-01-01\"}}}\n\
+               {\"type\":\"node\",\"id\":\"2\",\"labels\":[\"V\"],\"properties\":{\"k\":\"a\",\"v\":{\"@date\":\"2020-01-02\"}}}\n";
+    let mut g = crate::ndjson::decode(doc).expect("fixture decodes");
+
+    super::exec::MIGRATED.with(|c| c.set(0));
+    let out = super::parse::parse("g.V().group().by('k').by(__.values('v').sum())")
+        .expect("parses")
+        .run(&mut g);
+    let took = super::exec::MIGRATED.with(std::cell::Cell::get);
+
+    // The migration route did NOT complete...
+    assert_eq!(
+        took, 0,
+        "expected the migration to decline on a temporal sum"
+    );
+    // ...and the OLD arm still answered correctly: a non-numeric value is
+    // skipped, not summed, leaving no number in the group.
+    assert_eq!(
+        out,
+        vec![GVal::map(vec![(
+            GVal::Str(std::sync::Arc::from("a")),
+            GVal::Null
+        )])]
+    );
+}
+
+/// A peelable step in front (`dedup()`) still reaches the NEW `to_gql` arm —
+/// `col_terminal_tagged` retries `to_gql::tail` on every recursive call,
+/// including after a peel, so the migration is not limited to the bare
+/// `group()` shape.
+#[test]
+fn new_group_reduce_arm_migrates_behind_a_peelable_step() {
+    let doc = "{\"type\":\"node\",\"id\":\"1\",\"labels\":[\"V\"],\"properties\":{\"k\":\"a\",\"n\":1}}\n\
+               {\"type\":\"node\",\"id\":\"2\",\"labels\":[\"V\"],\"properties\":{\"k\":\"a\",\"n\":2}}\n";
+    let mut g = crate::ndjson::decode(doc).expect("fixture decodes");
+
+    super::exec::MIGRATED.with(|c| c.set(0));
+    let out = super::parse::parse("g.V().dedup().group().by('k').by(__.values('n').sum())")
+        .expect("parses")
+        .run(&mut g);
+    let took = super::exec::MIGRATED.with(std::cell::Cell::get);
+
+    assert_eq!(took, 1, "expected the migration to fire behind dedup()");
+    assert_eq!(
+        out,
+        vec![GVal::map(vec![(
+            GVal::Str(std::sync::Arc::from("a")),
+            GVal::Num(3.0)
+        )])]
+    );
+}
+
+/// `values(k).count()` on a `Column::Mixed` property: a real TYPE conflict (a
+/// number and a string) forces the promotion, and `Mixed`'s `Vec<Option<Value>>`
+/// really does distinguish "never set" (`None`) from "stored null"
+/// (`Some(Value::Null)`) — unlike a typed column, where a null write just
+/// clears the same presence bit as absence (`Column::Num`'s "absent = NaN,
+/// also flagged in `present`" — one bit, not two states).
+///
+/// `GQL`'s `count(prop)` cannot make that distinction (both box to
+/// `Val::Null`), so it would undercount by one against Gremlin's "drop only
+/// the truly absent row" if it ever ran here — proving out why the arm's
+/// `absent_key`/`homogeneous_or_absent` check in `shape_projection` has to
+/// decline for `Mixed`, not just for the row-drop shapes.
+#[test]
+fn values_count_declines_on_a_mixed_column_with_a_stored_null() {
+    let doc = "{\"type\":\"node\",\"id\":\"1\",\"labels\":[\"V\"],\"properties\":{\"v\":1}}\n\
+               {\"type\":\"node\",\"id\":\"2\",\"labels\":[\"V\"],\"properties\":{\"v\":\"x\"}}\n\
+               {\"type\":\"node\",\"id\":\"3\",\"labels\":[\"V\"],\"properties\":{\"v\":null}}\n\
+               {\"type\":\"node\",\"id\":\"4\",\"labels\":[\"V\"],\"properties\":{}}\n";
+    let mut g = crate::ndjson::decode(doc).expect("fixture decodes");
+
+    let via_gql = super::parse::parse("g.V().values('v').count()")
+        .expect("parses")
+        .run(&mut g);
+
+    super::exec::MIGRATE_OFF.with(|c| c.set(true));
+    let streamed = super::parse::parse("g.V().values('v').count()")
+        .expect("parses")
+        .run(&mut g);
+    super::exec::MIGRATE_OFF.with(|c| c.set(false));
+
+    // 3 present rows (number, string, stored null); the 4th is truly absent
+    // and dropped.
+    assert_eq!(via_gql, vec![GVal::Num(3.0)]);
+    assert_eq!(via_gql, streamed);
 }

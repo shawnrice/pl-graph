@@ -429,10 +429,18 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
                         c.scope_len,
                         &t.proj,
                     ) {
-                        #[cfg(test)]
-                        MIGRATED.with(|m| m.set(m.get() + 1));
-
+                        // Counted only once the SHAPER has also succeeded. It used
+                        // to tick as soon as the projection returned, so a tail
+                        // that projected fine and then declined in
+                        // `shape_projection` (a `Mixed` column under
+                        // `values(k).count()`, a non-homogeneous `order` key) was
+                        // recorded as migrated while the old route produced the
+                        // answer — which would let the agreement test's "the route
+                        // fired" assertion pass on a case that fell through.
                         if let Some(out) = shape_projection_vals(graph, c.end_is_edge, &cols, &t) {
+                            #[cfg(test)]
+                            MIGRATED.with(|m| m.set(m.get() + 1));
+
                             return out;
                         }
                     }
@@ -2186,6 +2194,36 @@ thread_local! {
     pub static MIGRATED: Cell<usize> = const { Cell::new(0) };
 }
 
+/// Whether property `key`'s stored column is incapable of holding a STORED
+/// null next to an ABSENT row — the one fact both `order_key` and a
+/// `values(k).count()` need before trusting `Val::Null`/`GVal::Null` to mean
+/// only "the key was absent".
+///
+/// A `Num`/`Bool`/`Str`/`Temporal` column (or no column at all — nothing is
+/// stored, so nothing is ambiguous) is homogeneous by construction: TinkerPop
+/// null placement (`order().by`) and TinkerPop's null-vs-absent split
+/// (`values(k)`/`count()`) both collapse onto GQL's `Val::Null` exactly.
+/// `Mixed`/`Record`/`Vec` CAN hold a genuine stored null beside an absent row
+/// and nothing here can tell them apart, so callers DECLINE on `false` rather
+/// than guess.
+fn homogeneous_or_absent(graph: &Graph, is_edge: bool, key: &str) -> bool {
+    let store = if is_edge {
+        &graph.edge_props
+    } else {
+        &graph.props
+    };
+
+    matches!(
+        store.keys.get(key).and_then(|k| store.cols.get(k as usize)),
+        None | Some(
+            crate::graph::Column::Num { .. }
+                | crate::graph::Column::Bool { .. }
+                | crate::graph::Column::Str { .. }
+                | crate::graph::Column::Temporal { .. }
+        )
+    )
+}
+
 /// Turn GQL's projected columns into Gremlin values — the BOUNDARY where the two
 /// languages differ, kept out of the evaluator on purpose.
 ///
@@ -2204,27 +2242,9 @@ fn shape_projection(
     // compare the way Gremlin does. GQL's `cmp_total` never faults on a
     // mismatched pair — it total-orders by type rank — while Gremlin's
     // comparator records a TYPE FAULT for one (`order_by_mixed_type_property_
-    // faults_not_panics`). A `Num`/`Bool`/`Str`/`Temporal` column (or no
-    // column at all) is homogeneous by construction, so the two comparators
-    // agree on every pair it can hold; `Mixed`/`Record`/`Vec` can hold a pair
-    // that disagrees, so DECLINE rather than silently drop the fault.
+    // faults_not_panics`). DECLINE rather than silently drop the fault.
     if let Some(key) = &t.order_key {
-        let store = if is_edge {
-            &graph.edge_props
-        } else {
-            &graph.props
-        };
-        let homogeneous = matches!(
-            store.keys.get(key).and_then(|k| store.cols.get(k as usize)),
-            None | Some(
-                crate::graph::Column::Num { .. }
-                    | crate::graph::Column::Bool { .. }
-                    | crate::graph::Column::Str { .. }
-                    | crate::graph::Column::Temporal { .. }
-            )
-        );
-
-        if !homogeneous {
+        if !homogeneous_or_absent(graph, is_edge, key) {
             return None;
         }
     }
@@ -2232,6 +2252,19 @@ fn shape_projection(
     let col = cols.first()?;
 
     if t.shape == super::to_gql::Shape::Scalar {
+        // `values(k).count()`: the aggregate already skipped every `Null`
+        // argument itself (`AggValue::step`/`eval_aggregate`/`fused_global_agg`
+        // all treat a stored null and an absent read identically), which is
+        // exactly Gremlin's "drop the absent row before counting" ONLY when
+        // the column cannot hold a stored null beside an absent row — the
+        // same homogeneity `order_key` needs above, reused rather than
+        // re-derived so the two decline checks cannot drift.
+        if let Some(key) = &t.absent_key {
+            if !homogeneous_or_absent(graph, is_edge, key) {
+                return None;
+            }
+        }
+
         return Some(col.clone().into_owned());
     }
 
@@ -4150,7 +4183,7 @@ fn element_props_map(graph: &Graph, v: &GVal) -> GVal {
 
 /// The numeric reducers a grouped value-`by()` can be answered as a column fold.
 #[derive(Clone, Copy)]
-enum GroupReduce {
+pub(super) enum GroupReduce {
     Sum,
     Mean,
     Min,
@@ -4170,13 +4203,28 @@ impl GroupReduce {
             Self::Max => crate::value::fold_extreme(vals.cloned(), Ordering::Greater, agg_cmp),
         }
     }
+
+    /// This reducer as GQL's aggregate function of the same meaning — the
+    /// bridge `to_gql`'s migrated `group().by(k).by(values(v).<reduce>())` arm
+    /// uses, so the mapping is defined once beside the four variants it covers
+    /// rather than re-matched at the call site.
+    pub(super) fn as_agg_fn(self) -> crate::gql::plan::AggFn {
+        use crate::gql::plan::AggFn;
+
+        match self {
+            Self::Sum => AggFn::Sum,
+            Self::Mean => AggFn::Avg,
+            Self::Min => AggFn::Min,
+            Self::Max => AggFn::Max,
+        }
+    }
 }
 
 /// `group().by(k).by(__.values(v).<reduce>())`, or `None` for anything else.
 ///
 /// Both modulators must be present: a `group()` with no value-`by()` collects the
 /// ELEMENTS of each group, which is not a column fold.
-fn grouped_reduce(bys: &[By]) -> Option<(&str, &str, GroupReduce)> {
+pub(super) fn grouped_reduce(bys: &[By]) -> Option<(&str, &str, GroupReduce)> {
     let [By::Key(kkey, _), By::Traversal(plan, _)] = bys else {
         return None;
     };

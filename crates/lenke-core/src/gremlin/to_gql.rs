@@ -352,6 +352,109 @@ pub(super) fn tail(
                 order_key: None,
             })
         }
+        // `group().by(k).by(values(v).<sum|min|max|mean>())` — GROUP BY property
+        // `k`, with the reducer as an aggregate over property `v`, one row per
+        // group. The same shape as `groupCount().by(k)` below (`Shape::Map`),
+        // except the second column is a REDUCED VALUE instead of a per-group
+        // count. `exec::grouped_reduce` is the SAME guard the stream arm this
+        // replaces uses (`exec.rs::elem_terminal`'s `[Step::Group(bys)]` arm) —
+        // reused, not re-derived, so the two admissibility rules (which `by()`
+        // pairs, which reducers) cannot drift apart.
+        //
+        // `count()` is deliberately absent from `grouped_reduce`'s reducers, and
+        // this arm inherits that: `CExpr::Prop` reads an absent key and a stored
+        // null as the same `Val::Null`, which is exactly right for `sum`/`min`/
+        // `max`/`mean` (TinkerPop 3.5 "ignore null values when other numbers are
+        // present") and WRONG for a count, where an absent key contributes
+        // nothing and a stored null contributes one.
+        [Step::Group(bys)] if let Some((kkey, vkey, red)) = super::exec::grouped_reduce(bys) => {
+            let kr = key_ref(keys, kkey);
+            let vr = key_ref(keys, vkey);
+            let key_expr = CExpr::Prop {
+                var_slot: slot,
+                key_ref: kr,
+            };
+            let val_expr = CExpr::Prop {
+                var_slot: slot,
+                key_ref: vr,
+            };
+            let mut proj = blank(vec![
+                item(key_expr.clone(), "k", false),
+                item(CExpr::AggRef(0), "c", true),
+            ]);
+
+            proj.aggregating = true;
+            proj.group_by = vec![item(key_expr, "k", false)];
+            proj.aggs = vec![CAgg {
+                func: red.as_agg_fn(),
+                arg: Some(val_expr),
+                distinct: false,
+                star: false,
+                frac: None,
+            }];
+
+            Some(Tail {
+                proj,
+                shape: Shape::Map,
+                // The GROUP key tallies like `groupCount().by(k)` — an absent
+                // key groups under a NULL key rather than dropping the row. The
+                // VALUE argument's own absent/null rows are skipped by the
+                // aggregate itself (an `Agg` never drops a ROW, only an
+                // argument), so there is no row-drop for `absent_key` to do
+                // here either.
+                absent_key: None,
+                page: None,
+                order_key: None,
+            })
+        }
+        // `values(k).count()` — the count of rows whose key is NOT ABSENT.
+        // Gremlin's `values(k)` drops an absent row before `count()` ever sees
+        // it, so this is `count` over the SURVIVING rows, not `count(*)` over
+        // the frontier.
+        //
+        // GQL's `count(expr)` (non-star) already skips a `Null` argument the
+        // same way its `sum`/`min`/`max`/`avg` cousins do — every aggregate path
+        // (`AggValue::step` in `matcher.rs`, `eval_aggregate` in `eval.rs`,
+        // `fused_global_agg`'s "count(prop): number of present values" in
+        // `scan.rs`) filters on `is_nullish`/a presence mask before counting.
+        // For a column that cannot hold a STORED null next to an ABSENT row —
+        // `Num`/`Bool`/`Str`/`Temporal`, or no column at all — `Val::Null` can
+        // only mean "absent", so `count(prop)`'s skip and Gremlin's drop agree
+        // on every row. A `Mixed`/`Record` column CAN hold a genuine stored null
+        // beside an absent row and boxes both the same way, so `count(prop)`
+        // cannot tell "skip because absent" from "skip because a stored value
+        // happens to be null" — declines through `absent_key`'s homogeneity
+        // check in `shape_projection` (`homogeneous_or_absent`, the same check
+        // `order_key` already uses) rather than assume.
+        [Step::Values(ks), Step::Count(Scope::Global)] if ks.len() == 1 => {
+            let kr = key_ref(keys, &ks[0]);
+            let mut proj = blank(vec![item(CExpr::AggRef(0), "v", true)]);
+
+            proj.aggregating = true;
+            proj.aggs = vec![CAgg {
+                func: crate::gql::plan::AggFn::Count,
+                arg: Some(CExpr::Prop {
+                    var_slot: slot,
+                    key_ref: kr,
+                }),
+                distinct: false,
+                star: false,
+                frac: None,
+            }];
+
+            Some(Tail {
+                proj,
+                shape: Shape::Scalar,
+                // Not a row-drop here (an aggregate collapses to one row before
+                // any drop could apply) — `shape_projection` reads this as "the
+                // column `count(...)` read from", to decline when that column's
+                // type cannot be trusted to agree with Gremlin's absent/null
+                // split (see the arm's own comment above).
+                absent_key: Some(ks[0].clone()),
+                page: None,
+                order_key: None,
+            })
+        }
         // `values(k).<limit|skip|range>()` — a `[lo, hi)` window over the column,
         // taken AFTER the absent-key drop (see `Tail::page`). `page_of` maps each
         // step to the same `(lo, hi)` pair `Col::page` itself takes, so the three
