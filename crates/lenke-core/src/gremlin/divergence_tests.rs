@@ -6252,6 +6252,16 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         // from, unchanged, and is covered elsewhere (`step_tests_2.rs`,
         // `tests.rs`).
         "g.V().outE('R').label()",
+        // `id_label_prefix` — `id()`/`label()` followed by MORE steps, split
+        // the same way `values_prefix` splits `values(k)`: project the id/
+        // label column, hand the rest back to the column terminals.
+        "g.V().out('R').hasLabel('W').id().count()",
+        "g.V().out('R').hasLabel('W').id().dedup()",
+        "g.V().out('R').hasLabel('W').id().limit(5)",
+        "g.V().out('R').hasLabel('W').id().fold()",
+        "g.V().outE('R').label().count()",
+        "g.V().outE('R').label().dedup()",
+        "g.V().outE('R').label().groupCount()",
         // `values(k).count()` — the count of rows whose key is NOT ABSENT, not
         // `count(*)` over the frontier. `n` is dense (no absent rows, a sanity
         // case with nothing to drop); `m` is absent on ~1/3 of rows, which is
@@ -6571,6 +6581,129 @@ fn values_arm_reachability_probe() {
     }
 }
 
+/// Whether `exec.rs::elem_terminal`'s bare `[Step::Id]` / `[Step::Label]` arms
+/// are still reachable now that `id_label_prefix` widens the split
+/// `values_prefix` already does for `values(k)` — checked EMPIRICALLY, the same
+/// way as `values_arm_reachability_probe`.
+///
+/// `ID_LABEL_ARM_HIT` is a raw entry counter on those two arms themselves.
+#[test]
+fn id_label_arm_reachability_probe() {
+    let mut lines = String::new();
+    for i in 0..500usize {
+        let l = if i % 10 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{}}}}}\n",
+            i % 37
+        ));
+    }
+    for i in 0..500usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"edge\",\"id\":\"e{i}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{\"w\":{i}}}}}\n",
+            (i * 31 + 1) % 500
+        ));
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    let shapes: &[(&str, &str)] = &[
+        ("bare id(), vertex", "g.V().out('R').hasLabel('W').id()"),
+        ("bare id(), edge", "g.E().hasLabel('R').id()"),
+        ("bare label(), edge", "g.E().hasLabel('R').label()"),
+        // `label()` off a VERTEX has no `to_gql` equivalent at all (see
+        // `to_gql::tail`'s own comment) — `id_label_prefix` declines it too,
+        // so it must stay on the old arm every time.
+        (
+            "bare label(), vertex",
+            "g.V().out('R').hasLabel('W').label()",
+        ),
+        ("id().count()", "g.V().out('R').hasLabel('W').id().count()"),
+        ("id().dedup()", "g.V().out('R').hasLabel('W').id().dedup()"),
+        (
+            "label().groupCount(), edge",
+            "g.E().hasLabel('R').label().groupCount()",
+        ),
+        (
+            "dedup() in front of id()",
+            "g.V().out('R').hasLabel('W').dedup().id()",
+        ),
+        (
+            "barrier() in front of id()",
+            "g.V().out('R').hasLabel('W').barrier().id()",
+        ),
+        (
+            "limit() in front of id()",
+            "g.V().out('R').hasLabel('W').limit(2).id()",
+        ),
+        (
+            "tagged path (select) before id()",
+            "g.V().as('x').out('R').select('x').id()",
+        ),
+        (
+            "post-fold (fold().unfold()) before id()",
+            "g.V().out('R').hasLabel('W').fold().unfold().id()",
+        ),
+        ("id().limit()", "g.V().out('R').hasLabel('W').id().limit(5)"),
+        ("id().fold()", "g.V().out('R').hasLabel('W').id().fold()"),
+    ];
+
+    println!();
+    for (label, q) in shapes {
+        super::exec::MIGRATED.with(|c| c.set(0));
+        super::exec::ID_LABEL_ARM_HIT.with(|c| c.set(0));
+
+        let out = super::parse::parse(q)
+            .unwrap_or_else(|e| panic!("`{q}` parses: {e}"))
+            .run(&mut g);
+
+        let migrated = super::exec::MIGRATED.with(std::cell::Cell::get);
+        let old_arm = super::exec::ID_LABEL_ARM_HIT.with(std::cell::Cell::get);
+        let route = if migrated > 0 {
+            "MIGRATED"
+        } else if old_arm > 0 {
+            "OLD_ARM"
+        } else {
+            "NEITHER (third route / stream)"
+        };
+
+        println!(
+            "PROBE migrated={migrated} id_label_arm={old_arm} rows={} route={route} [{label}] {q}",
+            out.len()
+        );
+    }
+
+    // The reference-comparison switch: with the whole migration block gated
+    // off (`col_terminal_tagged`'s `!migrate_off()` guard covers BOTH the
+    // whole-tail attempt and the prefix split equally), the bare forms have
+    // to reach the old arm directly — `id_label_prefix` cannot change this,
+    // since it lives entirely inside the gated block.
+    println!();
+    super::exec::MIGRATE_OFF.with(|c| c.set(true));
+    for q in [
+        "g.V().out('R').hasLabel('W').id()",
+        "g.E().hasLabel('R').id()",
+        "g.E().hasLabel('R').label()",
+        "g.V().out('R').hasLabel('W').label()",
+    ] {
+        super::exec::ID_LABEL_ARM_HIT.with(|c| c.set(0));
+
+        let out = super::parse::parse(q)
+            .unwrap_or_else(|e| panic!("`{q}` parses: {e}"))
+            .run(&mut g);
+        let old_arm = super::exec::ID_LABEL_ARM_HIT.with(std::cell::Cell::get);
+
+        println!(
+            "PROBE MIGRATE_OFF id_label_arm={old_arm} rows={} [{q}]",
+            out.len()
+        );
+        assert!(old_arm > 0, "{q}: expected the old arm under MIGRATE_OFF");
+    }
+    super::exec::MIGRATE_OFF.with(|c| c.set(false));
+}
+
 /// The headline comparison for the Gremlin migration:
 /// `g.V().out('R').hasLabel('W').values('n')` against the identical GQL
 /// statement, and against `MIGRATE_OFF` (the `elem_terminal`/`column_terminal`
@@ -6661,4 +6794,263 @@ fn headline_query_timing_probe() {
         "PROBE headline: gremlin(migrated) {:>8.4}ms  gremlin(MIGRATE_OFF) {:>8.4}ms  gql(RowSet) {:>8.4}ms  [{q}]",
         best_migrated * 1e3, best_old * 1e3, best_gql * 1e3
     );
+}
+
+/// Investigation for the `where`/`not` filter-arm migration: can
+/// `where(__.out('R'))` be expressed as `CExpr::Exists` and answered through
+/// `gql::eval::project_ids`, the ONE seam the Gremlin migration is allowed to
+/// call without also editing `gql/eval.rs`?
+///
+/// No. `project_ids` builds its `Ctx` with `labels: Vec::new()` (it only
+/// resolves PROPERTY keys, via `key_names` — see its own body) because nothing
+/// that calls it has ever needed a LABEL. `exists_semi_join_vec`'s fast path
+/// happily accepts a labelled relationship (`rel.label`) — a typed hop is
+/// exactly the shape its own doc comment calls out as "the one shape that
+/// matters" — but reaching that label test means indexing `ctx.labels[r]`
+/// (`eval_label_adj`, `gql/eval.rs`), and an empty `Vec` has no index `0`.
+/// This is not a semantic decline (`None`); it is a PANIC, empirically
+/// reproduced here rather than assumed from reading the source, because a
+/// wrong reading here would silently ship a crash instead of a decline.
+///
+/// The fix — giving `project_ids` a `label_names` parameter and populating
+/// `ctx.labels` the way `plan_pattern_ids` already does two functions up —
+/// is a `gql/eval.rs` change, out of scope for a migration confined to
+/// `to_gql.rs`/`exec.rs`/`divergence_tests.rs`. So `to_gql::tail` must NEVER
+/// emit `CLabelExpr::Label` for a body reached through `project_ids`, which
+/// rules out both a typed hop (`out('R')`) and a landed `hasLabel(...)` test —
+/// exactly the shapes `elem_terminal`'s existing `Where`/`Not` arms exist to
+/// answer, via `semi_join_hop`/`semi_join_chain` (vertex-only, matching
+/// `exists_semi_join_vec`'s own restriction for a different reason: `has_adj`
+/// walks a vertex's adjacency).
+#[test]
+fn exists_via_project_ids_cannot_carry_a_label_ctx_has_none() {
+    use crate::gql::ast::{Direction, PathMode, PathSelector};
+    use crate::gql::plan::{
+        compile_program, CExpr, CLabelExpr, CNode, CPath, CProjection, CRel, CReturnItem, CSegment,
+    };
+
+    let g = modern();
+    // Every vertex: marko (id "1") has two KNOWS/CREATED out-edges, so the walk
+    // below is guaranteed to test the label predicate at least once rather than
+    // short-circuit past it on an empty adjacency.
+    let ids: Vec<u32> = g.vertex_indices().collect();
+
+    // `(u)-[:<ref 0>]->()` — precisely `where(__.out('R'))`'s shape, with the
+    // edge-type ref left unresolved (any ref is unresolvable against an empty
+    // `ctx.labels`, so which name it names is irrelevant to the point).
+    let expr = CExpr::Exists {
+        patterns: vec![CPath {
+            start: CNode {
+                var_slot: Some(0),
+                label: None,
+                props: Vec::new(),
+                where_: None,
+            },
+            segments: vec![CSegment {
+                rel: CRel {
+                    var_slot: None,
+                    label: Some(CLabelExpr::Label(0)),
+                    direction: Direction::Out,
+                    props: Vec::new(),
+                    where_: None,
+                    quantifier: None,
+                },
+                node: CNode {
+                    var_slot: None,
+                    label: None,
+                    props: Vec::new(),
+                    where_: None,
+                },
+                unit: None,
+            }],
+            path_var_slot: None,
+            selector: PathSelector::Walk,
+            mode: PathMode::Trail,
+        }],
+        where_: None,
+        sub_len: 0,
+    };
+    let item = CReturnItem {
+        prog: compile_program(&expr),
+        expr,
+        name: "v".to_string(),
+        is_agg: false,
+    };
+    let proj = CProjection {
+        star: false,
+        distinct: false,
+        aggregating: false,
+        group_by: Vec::new(),
+        aggs: Vec::new(),
+        out_len: 1,
+        star_cols: Vec::new(),
+        order_by: Vec::new(),
+        order_overlay: Vec::new(),
+        order_needs_output: false,
+        having: None,
+        skip: None,
+        limit: None,
+        out_names: vec!["v".to_string()],
+        items: vec![item],
+    };
+
+    // Resolved label names, which is what `project_ids` now takes. It used to
+    // build its `Ctx` with `labels: Vec::new()`, so this call PANICKED indexing
+    // `ctx.labels[0]` — a landmine rather than a decline, waiting for the first
+    // arm to project anything label-bearing.
+    let labels = vec!["KNOWS".to_string()];
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::gql::eval::project_ids(&g, &ids, false, &[], &labels, &proj)
+    }));
+
+    assert!(
+        result.is_ok(),
+        "project_ids must RESOLVE a label rather than panic on it — it takes \
+         `label_names` now, as `plan_pattern_ids` always has. This test asserted \
+         the PANIC when it was written, which is what identified the landmine; it \
+         pins the fix now."
+    );
+}
+
+/// Before/after for the `where`/`not` filter-arm migration this file's
+/// `exists_via_project_ids_cannot_carry_a_label_ctx_has_none` investigated and
+/// declined: `g.V().hasLabel('V').where(__.out('R')).count()` and its `not()`
+/// twin, against the equivalent `EXISTS`/`NOT EXISTS` GQL statement, on a
+/// 50k-vertex / 150k-edge fixture.
+///
+/// "After" is identical to "before" by construction — `exec.rs`'s
+/// `elem_terminal` `Where`/`Not` arms are UNCHANGED, because the migration
+/// this investigated cannot reach a typed hop (`out('R')`) without a
+/// `gql/eval.rs` change outside this task's file scope (see the test above).
+/// Run to VERIFY the claim that motivated the investigation — that GQL's
+/// vectorized `CExpr::Exists` is meaningfully faster than Gremlin's own
+/// `semi_join_hop`/`has_adj` path — rather than trust the cited numbers.
+///
+/// Run with:
+///
+/// ```text
+/// cargo test --release -- --ignored --nocapture where_not_typed_hop_timing_probe
+/// ```
+#[test]
+#[ignore = "timing"]
+fn where_not_typed_hop_timing_probe() {
+    const VERTICES: usize = 50_000;
+    const EDGES: usize = 150_000;
+
+    let mut lines = String::new();
+    for i in 0..VERTICES {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{{\"n\":{}}}}}\n",
+            i % 97
+        ));
+    }
+    for i in 0..EDGES {
+        lines.push_str(&format!(
+            "{{\"type\":\"edge\",\"id\":\"e{i}\",\"from\":\"n{}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{}}}}\n",
+            i % VERTICES,
+            (i * 31 + 1) % VERTICES,
+        ));
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "where (semi-join keep)",
+            "g.V().hasLabel('V').where(__.out('R')).count()",
+            "MATCH (u:V) WHERE EXISTS { (u)-[:R]->() } RETURN count(*) AS c",
+        ),
+        (
+            "not (semi-join drop)",
+            "g.V().hasLabel('V').not(__.out('R')).count()",
+            "MATCH (u:V) WHERE NOT EXISTS { (u)-[:R]->() } RETURN count(*) AS c",
+        ),
+    ];
+
+    println!();
+    for (label, gq, gqlq) in cases {
+        let mut best_gremlin = f64::MAX;
+        let mut last_out: Vec<GVal> = Vec::new();
+        for _ in 0..7 {
+            let t = std::time::Instant::now();
+            let out = super::parse::parse(gq).expect("parses").run(&mut g);
+            let secs = t.elapsed().as_secs_f64();
+            std::hint::black_box(&out);
+            last_out = out;
+            if secs < best_gremlin {
+                best_gremlin = secs;
+            }
+        }
+
+        let plan = crate::gql::parse(gqlq).unwrap_or_else(|e| panic!("`{gqlq}`: {e}"));
+        let mut best_gql = f64::MAX;
+        for _ in 0..7 {
+            let t = std::time::Instant::now();
+            let rs = plan
+                .execute(&mut g, &crate::gql::eval::Params::new())
+                .unwrap_or_else(|e| panic!("`{gqlq}`: {e}"));
+            let secs = t.elapsed().as_secs_f64();
+            std::hint::black_box(rs.rows().count());
+            if secs < best_gql {
+                best_gql = secs;
+            }
+        }
+
+        println!(
+            "PROBE where/not: gremlin {:>8.4}ms  gql {:>8.4}ms  ratio(gremlin/gql) {:>5.2}x  out={:?}  [{label}] {gq}",
+            best_gremlin * 1e3,
+            best_gql * 1e3,
+            best_gremlin / best_gql,
+            last_out,
+        );
+    }
+}
+
+/// `elem_terminal`'s `[Step::Where(sub), ..]` / `[Step::Not(sub), ..]` arms,
+/// empirically, across the shapes the migration investigation
+/// (`exists_via_project_ids_cannot_carry_a_label_ctx_has_none`) found it
+/// cannot reach: a typed hop, a landed `hasLabel`, a landed property test, and
+/// a multi-hop chain.
+///
+/// No route change was made here — this is not an agreement check against a
+/// replacement route, only confirmation that `WHERE_NOT_ARM_HIT` still fires
+/// for exactly the shapes it always has, since the migration this file
+/// investigated was never applied (evidenced by
+/// `exists_via_project_ids_cannot_carry_a_label_ctx_has_none` and
+/// `where_not_typed_hop_timing_probe`, above).
+#[test]
+fn where_not_arm_is_unchanged_and_still_reachable() {
+    let mut g = modern();
+
+    let shapes: &[(&str, &str)] = &[
+        ("typed hop (where)", "g.V().where(__.out('KNOWS')).count()"),
+        ("typed hop (not)", "g.V().not(__.out('KNOWS')).count()"),
+        (
+            "landed hasLabel",
+            "g.V().where(__.out().hasLabel('SOFTWARE')).count()",
+        ),
+        (
+            "landed property test",
+            "g.V().where(__.out().has('lang', eq('java'))).count()",
+        ),
+        ("multi-hop chain", "g.V().where(__.out().out()).count()"),
+        (
+            "edge frontier self predicate",
+            "g.E().where(__.hasLabel('KNOWS')).count()",
+        ),
+    ];
+
+    println!();
+    for (label, q) in shapes {
+        super::exec::WHERE_NOT_ARM_HIT.with(|c| c.set(0));
+        let out = super::parse::parse(q)
+            .unwrap_or_else(|e| panic!("`{q}` parses: {e}"))
+            .run(&mut g);
+        let hit = super::exec::WHERE_NOT_ARM_HIT.with(std::cell::Cell::get);
+        println!("PROBE where_not_arm_hit={hit} out={out:?} [{label}] {q}");
+        // The edge-frontier case is a self predicate that never reaches
+        // `has_adj` (`semi_join_test`'s vertex-only hop/chain branches are
+        // skipped for `is_edge`), but it still runs the SAME `[Step::Where]`
+        // arm in `elem_terminal` — `self_predicate` works for either kind.
+        assert!(hit > 0, "{q}: WHERE_NOT_ARM_HIT never fired");
+    }
 }

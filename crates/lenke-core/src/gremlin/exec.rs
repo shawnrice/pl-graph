@@ -1588,7 +1588,7 @@ fn col_terminal_tagged(
 
             if let Some(t) = super::to_gql::tail(0, *is_edge, &mut keys, tail) {
                 if let Some(cols) =
-                    crate::gql::eval::project_ids(graph, ids, *is_edge, &keys, &t.proj)
+                    crate::gql::eval::project_ids(graph, ids, *is_edge, &keys, &[], &t.proj)
                 {
                     if let Some(out) = shape_projection_vals(graph, *is_edge, &cols, &t) {
                         #[cfg(test)]
@@ -1600,28 +1600,34 @@ fn col_terminal_tagged(
             }
 
             // The arms above answer a WHOLE tail. This answers a PREFIX of one:
-            // `values(k)` and its optional `is(P)`, projected to a column, with
-            // whatever follows handed back to the terminals that already know how
-            // to fold a column.
+            // `values(k)` (and its optional `is(P)`), or a bare `id()`/`label()`,
+            // projected to a column, with whatever follows handed back to the
+            // terminals that already know how to fold a column.
             //
-            // It exists because `values(k).is(P).sum()` cannot be one projection.
-            // The `is` runs in the shaper — an `is(P)` over a non-number column is
-            // a type FAULT in Gremlin rather than a skipped row, and `num_test` is
-            // where that rule lives — while GQL folds an aggregate BEFORE the
-            // shaper ever sees the column, so a filter applied afterwards is too
-            // late. Splitting at the column instead of at the answer sidesteps
-            // that: project, drop, narrow, then let `col_terminal_tagged` do what
-            // it does for every other column.
+            // It exists because e.g. `values(k).is(P).sum()` cannot be one
+            // projection. The `is` runs in the shaper — an `is(P)` over a
+            // non-number column is a type FAULT in Gremlin rather than a skipped
+            // row, and `num_test` is where that rule lives — while GQL folds an
+            // aggregate BEFORE the shaper ever sees the column, so a filter
+            // applied afterwards is too late. Splitting at the column instead of
+            // at the answer sidesteps that: project, drop, narrow, then let
+            // `col_terminal_tagged` do what it does for every other column.
             //
             // This is what `column_terminal` was, minus its own property read —
             // which is why that function and `elem_terminal`'s
-            // `[Step::Values(keys), tail @ ..]` arm are deleted in the same commit.
-            if let Some((prefix, rest)) = values_prefix(tail) {
+            // `[Step::Values(keys), tail @ ..]` arm were deleted already.
+            // `id_label_prefix` widens the same split to `id()`/`label()`, which
+            // used to reach `elem_terminal`'s exact-match arms only when nothing
+            // followed and stream every other shape (`id().count()`,
+            // `label().groupCount()`, …).
+            if let Some((prefix, rest)) =
+                values_prefix(tail).or_else(|| id_label_prefix(tail, *is_edge))
+            {
                 let mut names = Vec::new();
 
                 if let Some(t) = super::to_gql::tail(0, *is_edge, &mut names, &prefix) {
                     if let Some(cols) =
-                        crate::gql::eval::project_ids(graph, ids, *is_edge, &names, &t.proj)
+                        crate::gql::eval::project_ids(graph, ids, *is_edge, &names, &[], &t.proj)
                     {
                         if let Some(next) = shape_projection(graph, *is_edge, &cols, &t) {
                             #[cfg(test)]
@@ -1891,7 +1897,9 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
         let mut keys = Vec::new();
 
         if let Some(t) = super::to_gql::tail(0, is_edge, &mut keys, rest) {
-            if let Some(cols) = crate::gql::eval::project_ids(graph, ids, is_edge, &keys, &t.proj) {
+            if let Some(cols) =
+                crate::gql::eval::project_ids(graph, ids, is_edge, &keys, &[], &t.proj)
+            {
                 #[cfg(test)]
                 MIGRATED.with(|m| m.set(m.get() + 1));
 
@@ -2239,6 +2247,29 @@ thread_local! {
     pub static COLUMN_TERMINAL_HIT: Cell<usize> = const { Cell::new(0) };
 }
 
+// How many times `elem_terminal`'s bare `[Step::Id]` / `[Step::Label]` arms
+// actually ran — the same "did the OLD route fire" question `COLUMN_TERMINAL_HIT`
+// answers for `values(k)`, now that `id_label_prefix` widens the split to cover
+// `id()`/`label()` followed by more steps. See `id_label_arm_reachability_probe`.
+#[cfg(test)]
+thread_local! {
+    pub static ID_LABEL_ARM_HIT: Cell<usize> = const { Cell::new(0) };
+}
+
+// How many times `elem_terminal`'s `[Step::Where(sub), ..]` / `[Step::Not(sub),
+// ..]` arms actually ran. Test-only probe for the investigation recorded in
+// `divergence_tests.rs`'s `exists_via_project_ids_cannot_carry_a_label_ctx_has_none`:
+// these arms answer a typed hop (`where(__.out('R'))`) by resolving the edge
+// TYPE through `resolve_etypes`/`SemiJoin`, which `to_gql::tail` cannot express
+// through `project_ids` (its `Ctx` never resolves a `CLabelExpr::Label`, so it
+// panics rather than declines) — so no migration was attempted, and this counter
+// exists only to confirm empirically that the arms are still exactly as
+// reachable as before, not to compare against a replacement route.
+#[cfg(test)]
+thread_local! {
+    pub static WHERE_NOT_ARM_HIT: Cell<usize> = const { Cell::new(0) };
+}
+
 /// Whether property `key`'s stored column is incapable of holding a STORED
 /// null next to an ABSENT row — the one fact both `order_key` and a
 /// `values(k).count()` need before trusting `Val::Null`/`GVal::Null` to mean
@@ -2291,6 +2322,27 @@ fn values_prefix(tail: &[Step]) -> Option<(Vec<Step>, &[Step])> {
             Some((vec![Step::Values(keys.clone()), Step::Is(p.clone())], more))
         }
         more => Some((vec![Step::Values(keys.clone())], more)),
+    }
+}
+
+/// Split a tail that STARTS with `id()` or `label()` into the part the
+/// projection answers and the part the column terminals answer — the same
+/// shape as [`values_prefix`], for the two other per-element projections
+/// `to_gql::tail` only covers as a WHOLE tail (`[Step::Id]` /
+/// `[Step::Label]` alone). A non-empty `rest` is what makes this a PREFIX
+/// rather than the whole-tail arm re-matching itself into an infinite loop —
+/// `id()`/`label()` with nothing after is already answered up there.
+///
+/// `label()` only splits on a known EDGE frontier, mirroring `to_gql::tail`'s
+/// own `[Step::Label]` guard: GQL's only vertex equivalent, `labels(n)`,
+/// answers a different question (every label, sorted, as a `List` — see that
+/// arm's comment), so a vertex `label()` keeps reaching `elem_terminal`'s own
+/// arm instead.
+fn id_label_prefix(tail: &[Step], is_edge: bool) -> Option<(Vec<Step>, &[Step])> {
+    match tail {
+        [Step::Id, rest @ ..] if !rest.is_empty() => Some((vec![Step::Id], rest)),
+        [Step::Label, rest @ ..] if is_edge && !rest.is_empty() => Some((vec![Step::Label], rest)),
+        _ => None,
     }
 }
 
@@ -2496,16 +2548,26 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
         // equivalent — see `to_gql::tail`'s comment), so a VERTEX `label()`
         // reaches this arm even with migration ON — the same probe on
         // `g.V().label()` confirms it every time.
-        [Step::Id] => Some(
-            ids.iter()
-                .map(|&id| elem_id(graph, &frontier_val(id, is_edge)))
-                .collect(),
-        ),
-        [Step::Label] => Some(
-            ids.iter()
-                .map(|&id| elem_label(graph, &frontier_val(id, is_edge)))
-                .collect(),
-        ),
+        [Step::Id] => {
+            #[cfg(test)]
+            ID_LABEL_ARM_HIT.with(|c| c.set(c.get() + 1));
+
+            Some(
+                ids.iter()
+                    .map(|&id| elem_id(graph, &frontier_val(id, is_edge)))
+                    .collect(),
+            )
+        }
+        [Step::Label] => {
+            #[cfg(test)]
+            ID_LABEL_ARM_HIT.with(|c| c.set(c.get() + 1));
+
+            Some(
+                ids.iter()
+                    .map(|&id| elem_label(graph, &frontier_val(id, is_edge)))
+                    .collect(),
+            )
+        }
         // `group().by(k).by(values(v).<reduce>())` off the frontier: two resolved
         // columns and one bucketing pass, where the stream buckets TRAVERSERS and
         // then runs a sub-traversal per group. 6.599ms over 20k vertices against
@@ -2573,6 +2635,26 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
         //
         // `otherV()` is deliberately absent: "the end I did not come from" is a
         // question about the PATH, and a column has none.
+        //
+        // These two arms were investigated for the same PREFIX-split treatment
+        // `values_prefix`/`id_label_prefix` give `values(k)`/`id()`/`label()`,
+        // and there is no `to_gql` split for them: `CExpr` (`gql/plan.rs`) has
+        // no variant that YIELDS an endpoint vertex from a bound edge value —
+        // its one edge-endpoint construct is `GraphPred`'s `SourceOf`/`DestOf`
+        // (`<node> IS SOURCE OF <edge>`), a BOOLEAN predicate consumed by
+        // `WHERE`, not a value producer a projection item could hold. Its own
+        // evaluator (`gql/eval.rs`) reads `graph.e_src`/`e_dst` directly rather
+        // than through any expression the projection layer exposes. The
+        // `ScalarFn` table (same file) has no `source`/`target`/`start_node`/
+        // `end_node` entry either — grepped for all of them, empty. GQL's own
+        // route to an edge's endpoints is the PATTERN itself
+        // (`MATCH (a)-[e]->(b)`), which binds `a`/`b` as separate pattern
+        // variables at compile time — not a postfix accessor on an already-
+        // bound edge value the way `outV()`/`inV()`/`bothV()` are, so there is
+        // no existing expression to route through here. Skipped rather than
+        // adding a new `CExpr` variant just to wrap `e_src`/`e_dst` — that
+        // would be materializing the ids under a different name, which the
+        // brief this arm was written against rules out.
         [Step::OutV | Step::InV, t @ ..] if is_edge => {
             let src = matches!(rest.first(), Some(Step::OutV));
             let ends: Vec<u32> = ids
@@ -2768,11 +2850,17 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
             let keep = semi_join_test(graph, &sub.steps, is_edge)?;
             let kept: Vec<u32> = ids.iter().copied().filter(|&id| keep(id)).collect();
 
+            #[cfg(test)]
+            WHERE_NOT_ARM_HIT.with(|c| c.set(c.get() + 1));
+
             column_paths(graph, &kept, is_edge, t)
         }
         [Step::Not(sub), t @ ..] => {
             let keep = semi_join_test(graph, &sub.steps, is_edge)?;
             let kept: Vec<u32> = ids.iter().copied().filter(|&id| !keep(id)).collect();
+
+            #[cfg(test)]
+            WHERE_NOT_ARM_HIT.with(|c| c.set(c.get() + 1));
 
             column_paths(graph, &kept, is_edge, t)
         }

@@ -3955,6 +3955,7 @@ pub(crate) fn project_ids(
     ids: &[u32],
     is_edge: bool,
     key_names: &[String],
+    label_names: &[String],
     proj: &crate::gql::plan::CProjection,
 ) -> Option<Vec<Col>> {
     let ctx = Ctx {
@@ -3963,8 +3964,17 @@ pub(crate) fn project_ids(
             .iter()
             .map(|n| (graph.props.keys.get(n), graph.edge_props.keys.get(n)))
             .collect(),
-        labels: Vec::new(),
-        label_names: &[],
+        // Resolved, not empty. `CLabelExpr::Label(r)` indexes `ctx.labels[r]`, so
+        // an empty vector PANICS rather than declining the moment any projected
+        // expression mentions a label — a landmine for every arm added after this
+        // one, and the reason the `where`/`not` migration could not even be
+        // attempted through here. `plan_pattern_ids` two functions up has always
+        // resolved them; this had no reason not to.
+        labels: label_names
+            .iter()
+            .map(|n| (graph.labels.get(n), graph.etype.get(n)))
+            .collect(),
+        label_names,
         unknown_fns: &[],
         fault: AtomicU8::new(FAULT_NONE),
         edge_marks_pool: MarksPool::default(),
