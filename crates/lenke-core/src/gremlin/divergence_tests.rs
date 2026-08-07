@@ -6059,3 +6059,45 @@ fn is_labeled_is_a_column_walk() {
         println!("LBL {best:>8.3}ms {rows:>6} rows  {q}");
     }
 }
+
+/// `select` over pattern tags, with a `by('k')` modulator and with `Pop.all`,
+/// must return exactly what the stream returns.
+///
+/// These two shapes used to decline to the stream and were the largest gaps left
+/// in `cross_language_cost_probe` — 79x and 83x against the identical question in
+/// GQL. Now they zip columns, so they need an agreement test of their own:
+/// `PATTERN_OFF` runs the same traversal without the pattern route, which is the
+/// streamed spelling.
+#[test]
+fn lowered_select_with_modulators_agrees_with_the_stream() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut g = modern();
+
+    for q in [
+        // by('k') — one label and several, and a tail after it
+        "g.V().as('x').out('KNOWS').select('x').by('name')",
+        "g.V().as('x').out('KNOWS').select('x').by('age')",
+        "g.V().as('x').out('KNOWS').as('y').select('x', 'y').by('name').by('name')",
+        "g.V().as('x').out('KNOWS').select('x').by('name').count()",
+        "g.V().as('x').out('KNOWS').select('x').by('name').dedup()",
+        // an absent key on some rows
+        "g.V().as('x').out('CREATED').select('x').by('lang')",
+        // Pop.all — a list per label
+        "g.V().as('x').out('KNOWS').select(all, 'x')",
+        "g.V().as('x').out('KNOWS').as('y').select(all, 'x', 'y')",
+        "g.V().as('x').out('KNOWS').select(all, 'x').count()",
+        // the bare form still works
+        "g.V().as('x').out('KNOWS').select('x')",
+        "g.V().as('x').out('KNOWS').as('y').select('x', 'y')",
+        // a by() this must NOT take: it carries an order
+        "g.V().as('x').out('KNOWS').select('x').by('name', desc)",
+    ] {
+        super::exec::PATTERN_OFF.store(false, Relaxed);
+        let lowered = super::parse::parse(q).expect("parses").run(&mut g);
+        super::exec::PATTERN_OFF.store(true, Relaxed);
+        let streamed = super::parse::parse(q).expect("parses").run(&mut g);
+        super::exec::PATTERN_OFF.store(false, Relaxed);
+
+        assert_eq!(lowered, streamed, "{q}");
+    }
+}

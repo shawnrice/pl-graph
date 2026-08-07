@@ -452,11 +452,47 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
                 // `select`. Here the keys are made once and the values are
                 // column reads.
                 //
-                // `Pop::All` yields a LIST per label rather than the value, and
-                // a `by()` evaluates a modulator per row — neither is a zip, so
-                // both keep the stream.
+                // A `by('k')` modulator is a PROPERTY READ off the tag's column —
+                // the same read the `project()` arm makes — so it zips like the
+                // bare form. It used to keep the stream, at 12.1ms against 0.153
+                // for the identical question in GQL: 79x, and the largest single
+                // gap left in `cross_language_cost_probe`.
+                //
+                // `Pop::All` yields a LIST per label instead of the value, and in
+                // THIS arm that list always has exactly one entry: the pattern
+                // planner compiles a linear prefix with no `repeat`, so an
+                // `as(name)` binds once per row. Guarded on the names being
+                // distinct so a prefix that bound one twice cannot silently lose a
+                // repetition. That was 12.9ms against 0.155 — 83x.
+                //
+                // A `by()` carrying an ORDER, a token, a Column selector or a
+                // sub-traversal is none of these, and still keeps the stream.
                 if let [Step::Select { labels, pop, bys }, after @ ..] = rest {
-                    let bound: Option<Vec<usize>> = (!matches!(pop, Pop::All) && bys.is_empty())
+                    let names_distinct = {
+                        let mut seen: Vec<&str> =
+                            c.tags.iter().map(|(n, _, _)| n.as_str()).collect();
+
+                        seen.sort_unstable();
+                        seen.dedup();
+                        seen.len() == c.tags.len()
+                    };
+                    // Every `by` must be a plain property key, and there must be
+                    // one per label (TinkerPop applies the LAST `by` to the extra
+                    // labels, which this does not model).
+                    let by_keys: Option<Vec<&str>> = if bys.is_empty() {
+                        Some(Vec::new())
+                    } else if bys.len() == labels.len() {
+                        bys.iter()
+                            .map(|b| match b {
+                                By::Key(k, None) => Some(k.as_str()),
+                                _ => None,
+                            })
+                            .collect()
+                    } else {
+                        None
+                    };
+                    let usable = by_keys.is_some() && (!matches!(pop, Pop::All) || names_distinct);
+                    let bound: Option<Vec<usize>> = usable
                         .then(|| {
                             labels
                                 .iter()
@@ -476,12 +512,36 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
                             .iter()
                             .map(|l| GVal::Str(Arc::from(l.as_str())))
                             .collect();
+                        let by_keys = by_keys.expect("guarded above");
+                        // One resolved column per label: the tag's elements, or
+                        // the property `by('k')` asks for off them.
+                        let per_label: Vec<Col<'_>> = (0..labels.len())
+                            .map(|k| {
+                                let (_, _, is_edge) = &c.tags[at[k]];
+                                let column = &cols[at[k] + 1];
+
+                                by_keys.get(k).map_or_else(
+                                    || Col::Elems {
+                                        ids: std::borrow::Cow::Borrowed(column),
+                                        is_edge: *is_edge,
+                                    },
+                                    |key| prop_col(graph, column, *is_edge, key),
+                                )
+                            })
+                            .collect();
+                        let all = matches!(pop, Pop::All);
                         let picked: Vec<Trav> = (0..ids.len())
                             .map(|i| {
                                 let val = |k: usize| {
-                                    let (_, _, is_edge) = &c.tags[at[k]];
+                                    let v = per_label[k].val_at(i);
 
-                                    frontier_val(cols[at[k] + 1][i], *is_edge)
+                                    // `select(all, …)` is a list per label, and in
+                                    // this arm the tag bound exactly once.
+                                    if all {
+                                        GVal::list(vec![v])
+                                    } else {
+                                        v
+                                    }
                                 };
 
                                 Trav::root(if labels.len() == 1 {
