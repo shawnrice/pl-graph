@@ -896,6 +896,7 @@ unsafe fn in_g1<'a>(g: *mut Graph, p: *const u8, l: usize) -> Option<(&'a mut Gr
 ///
 /// # Safety
 /// As [`in_g1`], except `g` need only be shared-borrowable.
+#[cfg(feature = "codecs")]
 unsafe fn in_r1<'a>(g: *const Graph, p: *const u8, l: usize) -> Option<(&'a Graph, &'a str)> {
     // SAFETY: forwards this fn's contract to each accessor; both yield None for null.
     unsafe { Some((graph_ref(g)?, in_str(p, l)?)) }
@@ -1385,6 +1386,10 @@ pub unsafe extern "C" fn lnk_prepared_query_rows(
 ///
 /// # Safety
 /// As [`lnk_prepared_query_rows`].
+// Gated like every other arrow entry point. Its siblings carry this and it did
+// not, so a build without `arrow` failed on `Prepared::execute_arrow` — the last
+// error in the `--no-default-features --features gql` configuration.
+#[cfg(feature = "arrow")]
 #[no_mangle]
 pub unsafe extern "C" fn lnk_prepared_query_arrow(
     p: *const crate::gql::Prepared,

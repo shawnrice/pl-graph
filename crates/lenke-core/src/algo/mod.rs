@@ -23,6 +23,7 @@
 //! == serial-native == serial-TS, verified by the differential conformance suite.
 
 use crate::graph::{Graph, Value};
+#[cfg(feature = "ndjson")]
 use crate::json;
 use crate::rowset::RowSet;
 
@@ -90,6 +91,7 @@ pub struct AlgoConfig {
 }
 
 impl AlgoConfig {
+    #[cfg(feature = "ndjson")]
     fn from_json(s: &str) -> Result<Self, ()> {
         if s.trim().is_empty() {
             return Ok(Self::default());
@@ -235,6 +237,7 @@ pub(super) fn edge_weights(graph: &Graph, key: &str) -> Vec<f64> {
 /// An algorithm's output: the result column name + `(dense vertex id, value)` rows.
 pub type AlgoOutput = (&'static str, Vec<(u32, Value)>);
 /// Pending `writeProperty` writes: the property key + per-vertex `(dense id, value)`s.
+#[cfg(feature = "ndjson")]
 type PendingWrites = Option<(String, Vec<(u32, Value)>)>;
 
 /// Dispatch by name to the pure `&Graph -> Vec<(vertex, Value)>` algorithm, returning
@@ -307,6 +310,7 @@ fn build_rowset(graph: &Graph, column: &str, results: &[(u32, Value)]) -> RowSet
     rs
 }
 
+#[cfg(feature = "ndjson")]
 /// Run algorithm `name` with a JSON `config`, optionally write each vertex's result
 /// to `config.writeProperty`, and return the result rows `(node, <result-column>)`
 /// where `node` is the external vertex id. Unknown `name` → `Err`.
@@ -346,6 +350,7 @@ pub fn run_columns(graph: &mut Graph, name: &str, cfg: &AlgoConfig) -> Result<Al
 /// result RowSet and return any pending `writeProperty` writes for the caller to
 /// apply back on the main thread (where `&mut Graph` is exclusive again). The whole
 /// computation touches only `&Graph`, so it is safe to run off the JS thread.
+#[cfg(feature = "ndjson")]
 pub fn compute_parts(
     graph: &Graph,
     name: &str,

@@ -78,7 +78,13 @@ bailprobe = []
 gql = ["_fallible-ffi"]
 # `gremlin`: the Gremlin traversal engine (heterogeneous JSON results). Its JSON
 # carrier is hand-rolled via `jsonfmt`, so it carries NO serde_json.
-gremlin = ["dep:regex", "_fallible-ffi"]
+#
+# Depends on `gql`, and that is real rather than incidental: `gremlin::pattern`
+# compiles a linear traversal prefix into GQL's pattern IR (`gql::plan::CPath`)
+# so Gremlin gets GQL's planner instead of a second one — worth 4-45x, and the
+# whole point of sharing an IR. Spelling the dependency here is what makes
+# `--no-default-features --features gremlin` build at all.
+gremlin = ["gql", "dep:regex", "_fallible-ffi"]
 # `ndjson`: the NDJSON load/snapshot codec (hand-rolled JSON, no serde_json).
 ndjson = ["_fallible-ffi"]
 # `codecs`: the extra serialization formats (pg-json/pg-text/graphson/csv); the

@@ -26,10 +26,13 @@ pub mod ffi_error;
 #[cfg(test)]
 mod fixtures;
 mod interval_index;
-// In-engine graph algorithms. Config is a JSON object, so this rides on the
-// shared JSON parser (the `ndjson` feature) — present in every build that can
-// load a graph; only the `gql`-only minimal wasm bundle omits it.
-#[cfg(feature = "ndjson")]
+// In-engine graph algorithms. The JSON-config entry points ride on the shared
+// JSON parser (the `ndjson` feature), but the algorithms themselves do not:
+// GQL's `CALL` builds an `AlgoConfig` straight from its own expressions and never
+// parses JSON. Gating the whole module on `ndjson` therefore broke the `gql`-only
+// build, which is the one configuration that omits it — six of that build's
+// errors were this one line.
+#[cfg(any(feature = "ndjson", feature = "gql"))]
 pub mod algo;
 /// One fast hash for both engines — see the module docs.
 pub(crate) mod fxhash;

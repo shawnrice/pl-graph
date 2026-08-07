@@ -1254,12 +1254,18 @@ fn elem_keys() -> &'static ElemKeys {
 /// engine) so `RETURN n` is useful, not a bare id.
 /// The canonical result `Value::Map` for a vertex (`{id, labels, properties}`) —
 /// exposed so the Gremlin engine serializes an element byte-identically to GQL.
+// Only `gremlin::pattern` reads this — it compiles a traversal into GQL's
+// pattern IR — so a `gql`-only build has no caller.
+#[cfg(feature = "gremlin")]
 pub(crate) fn node_result_value(graph: &Graph, i: u32) -> Value {
     val_to_value(graph, &Val::Node(i))
 }
 
 /// The canonical result `Value::Map` for an edge (`{id, from, to, labels,
 /// properties}`) — see [`node_result_value`].
+// Only `gremlin::pattern` reads this — it compiles a traversal into GQL's
+// pattern IR — so a `gql`-only build has no caller.
+#[cfg(feature = "gremlin")]
 pub(crate) fn edge_result_value(graph: &Graph, i: u32) -> Value {
     val_to_value(graph, &Val::Edge(i))
 }
@@ -3656,6 +3662,9 @@ fn cmp_bound(e: &CExpr, ctx: &Ctx) -> Option<(usize, usize, CompareOp, crate::gr
 /// match. That is what makes an `as(label)` in a Gremlin prefix a `var_slot` like
 /// any other — the tag's value for a row is its column's entry, so a label that
 /// used to stop the prefix dead now rides through the planner with it.
+// Only `gremlin::pattern` reads this — it compiles a traversal into GQL's
+// pattern IR — so a `gql`-only build has no caller.
+#[cfg(feature = "gremlin")]
 pub(crate) fn plan_pattern_ids(
     graph: &Graph,
     path: &crate::gql::plan::CPath,
