@@ -3847,6 +3847,58 @@ pub(crate) fn plan_pattern_ids(
         .collect()
 }
 
+/// Run a compiled PATTERN and project it, in one call, returning columns.
+///
+/// The seam the Gremlin migration is built on. `plan_pattern_ids` already builds
+/// a full `ScanCols` frame here and throws everything away but raw ids, leaving
+/// Gremlin to rebuild projection, aggregation, DISTINCT, ORDER BY and paging in
+/// terminals of its own. This keeps the frame and projects from it, so that
+/// second implementation has somewhere to go.
+///
+/// Returns `Vec<Col>` rather than a `RowSet`: the boxing and element RENDERING a
+/// row set does is why GQL prices 5.3x above Gremlin on `values(n)` and 173x on
+/// returning elements, and none of it is the algebra. The caller shapes the
+/// columns into its own value model — which is also where the per-language
+/// differences live (Gremlin drops an absent key where GQL nulls it, renders a
+/// stored map as a `Map` where GQL renders a `Record`).
+pub(crate) fn run_pattern_projection(
+    graph: &Graph,
+    path: &crate::gql::plan::CPath,
+    label_names: &[String],
+    key_names: &[String],
+    scope_len: usize,
+    proj: &crate::gql::plan::CProjection,
+) -> Option<Vec<Col>> {
+    let ctx = Ctx {
+        params: &[],
+        prop_keys: key_names
+            .iter()
+            .map(|n| (graph.props.keys.get(n), graph.edge_props.keys.get(n)))
+            .collect(),
+        labels: label_names
+            .iter()
+            .map(|n| (graph.labels.get(n), graph.etype.get(n)))
+            .collect(),
+        label_names,
+        unknown_fns: &[],
+        fault: AtomicU8::new(FAULT_NONE),
+        edge_marks_pool: MarksPool::default(),
+        // Gremlin's contract, not GQL's — a loop is an out-edge AND an in-edge.
+        loops: crate::seek::SelfLoops::Twice,
+    };
+    let sc = scan::build_scan(graph, &ctx, path, scope_len, None, None, None)?;
+    let out = project_frame_cols(graph, &ctx, &sc, proj)?;
+
+    // A recorded data exception cannot be returned from here, and answering a
+    // query that must fault would be worse than declining. The caller's own path
+    // runs and surfaces it.
+    if ctx.fault.load(AtomOrdering::Relaxed) != FAULT_NONE {
+        return None;
+    }
+
+    Some(out)
+}
+
 // --- index-seeded scanning, expansion, and vectorized aggregation ---
 mod scan;
 mod seek_lower;

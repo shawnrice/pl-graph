@@ -6094,9 +6094,9 @@ fn lowered_select_with_modulators_agrees_with_the_stream() {
     ] {
         super::exec::PATTERN_OFF.store(false, Relaxed);
         let lowered = super::parse::parse(q).expect("parses").run(&mut g);
-        super::exec::PATTERN_OFF.store(true, Relaxed);
+        super::exec::MIGRATE_OFF.store(true, Relaxed);
         let streamed = super::parse::parse(q).expect("parses").run(&mut g);
-        super::exec::PATTERN_OFF.store(false, Relaxed);
+        super::exec::MIGRATE_OFF.store(false, Relaxed);
 
         assert_eq!(lowered, streamed, "{q}");
     }
@@ -6180,4 +6180,75 @@ fn what_the_unvectorized_expressions_cost() {
             println!("EXPR {name:<18}    (unsupported syntax)");
         }
     }
+}
+
+/// The MIGRATION route — a Gremlin tail compiled to a GQL projection — must
+/// return exactly what the route it replaces returns.
+///
+/// Compared against `MIGRATE_OFF` (the column terminals, still on the pattern
+/// plan) and NOT against the stream: the pattern route enumerates in a different
+/// order by design (`the_pattern_route_reorders_rows`), so comparing against the
+/// stream drowns a real ordering bug in permitted ones. That is not theoretical —
+/// it is how `order().by(k)` looked correct at first glance, and it is why that
+/// step is still declined.
+///
+/// `migrated` asserts the route actually FIRED. Without it every row passes on an
+/// arm that silently declined, which has happened twice on this branch.
+#[test]
+fn the_migration_route_agrees_with_the_route_it_replaces() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut lines = String::new();
+    for i in 0..2_000usize {
+        let l = if i % 10 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{},\"k\":\"key{i:06}\"}}}}\n",
+            i % 97
+        ));
+    }
+    let mut e = 0;
+    for i in 0..2_000usize {
+        for d in 0..3usize {
+            lines.push_str(&format!(
+                "{{\"type\":\"edge\",\"id\":\"e{e}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{}}}}\n",
+                (i * 31 + d * 7 + 1) % 2_000
+            ));
+            e += 1;
+        }
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+    let mut bad = 0;
+    for q in [
+        "g.V().out('R').hasLabel('W').values('n')",
+        "g.V().out('R').hasLabel('W').values('n').sum()",
+        "g.V().out('R').hasLabel('W').values('n').min()",
+        "g.V().out('R').hasLabel('W').values('n').max()",
+        "g.V().out('R').hasLabel('W').values('n').mean()",
+        "g.V().out('R').hasLabel('W').values('n').dedup()",
+        "g.V().out('R').hasLabel('W').values('k')",
+        "g.V().out('R').hasLabel('W').order().by('n')",
+        "g.V().out('R').hasLabel('W').order().by('n').limit(5)",
+    ] {
+        super::exec::MIGRATED.store(0, Relaxed);
+        super::exec::PATTERN_OFF.store(false, Relaxed);
+        let via_gql = super::parse::parse(q).expect("parses").run(&mut g);
+        let took = super::exec::MIGRATED.load(Relaxed);
+
+        super::exec::MIGRATE_OFF.store(true, Relaxed);
+        let streamed = super::parse::parse(q).expect("parses").run(&mut g);
+        super::exec::MIGRATE_OFF.store(false, Relaxed);
+
+        assert_eq!(via_gql, streamed, "{q}");
+        // The two `order()` rows decline on purpose; everything else must have
+        // gone through the new route.
+        let expected = usize::from(!q.contains(".order("));
+
+        assert_eq!(took, expected, "{q}: migration route taken {took} times");
+        bad += usize::from(via_gql.is_empty());
+    }
+
+    assert_eq!(bad, 0, "every case returns rows");
 }

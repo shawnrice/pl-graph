@@ -407,6 +407,36 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
         if !needs_path(rest) && (!c.reorders || super::pattern::order_insensitive(rest)) {
             TRACK_PATH.with(|x| x.set(FORCE_PATH.with(Cell::get)));
 
+            // The MIGRATION route: compile the tail into a GQL projection and let
+            // GQL's own machinery run it, rather than Gremlin's terminals doing
+            // the same work again. First, because when it can express the tail it
+            // is the whole answer — no ids materialized, no second implementation
+            // consulted. Everything it cannot express returns `None` and the
+            // routes below run unchanged, which is what makes growing its
+            // vocabulary safe one step at a time.
+            //
+            // Tried only when the prefix bound no tags: a tag is read by a later
+            // `select`, which this does not compile yet.
+            if c.tags.is_empty() && !migrate_off() {
+                let mut keys = c.key_names.clone();
+
+                if let Some(t) = super::to_gql::tail(&c, &mut keys, rest) {
+                    if let Some(cols) = crate::gql::eval::run_pattern_projection(
+                        graph,
+                        &c.path,
+                        &c.label_names,
+                        &keys,
+                        c.scope_len,
+                        &t.proj,
+                    ) {
+                        #[cfg(test)]
+                        MIGRATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                        return shape_projection(&cols, t.shape);
+                    }
+                }
+            }
+
             // The end slot first, then one column per `as(label)`. All parallel:
             // row `i` of each is one match, so a tag's value for a row is its
             // column's entry.
@@ -2068,6 +2098,72 @@ fn fanout(graph: &Graph, ids: &[u32], is_edge: bool, steps: &[Step]) -> Option<F
     }
 
     Some(Fanout { vals, bounds })
+}
+
+/// Turns the migration route off, so a traversal can be run through the route it
+/// is REPLACING (the column terminals, still on the pattern plan) rather than
+/// through the stream. Comparing against the stream instead compares two
+/// different enumeration orders and reports permitted reordering as a failure.
+#[cfg(test)]
+pub static MIGRATE_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn migrate_off() -> bool {
+    #[cfg(test)]
+    {
+        MIGRATE_OFF.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// How many traversals the migration route answered — test-only, so the arms it
+/// replaces can be shown to be genuinely unreachable before they are deleted.
+#[cfg(test)]
+pub static MIGRATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Turn GQL's projected columns into Gremlin values — the BOUNDARY where the two
+/// languages differ, kept out of the evaluator on purpose.
+///
+/// Two differences show up here. A row whose property key was ABSENT is dropped
+/// by Gremlin and nulled by GQL, and the column's own validity mask says which is
+/// which (asking for `PROPERTY_EXISTS` as a second projected item is also correct
+/// and reads the column twice, at 3.6x). A stored map is a `Map` to Gremlin and a
+/// `Record` to GQL — the same `Value::from_stored` with `as_record` flipped.
+fn shape_projection(cols: &[Col<'_>], shape: super::to_gql::Shape) -> Vec<GVal> {
+    let Some(col) = cols.first() else {
+        return Vec::new();
+    };
+
+    match shape {
+        super::to_gql::Shape::Scalar => col.clone().into_vals(),
+        super::to_gql::Shape::Rows => {
+            let keep = col.valid_mask().map(<[bool]>::to_vec);
+            let mut out = col.clone().into_owned();
+
+            if let Some(mask) = keep {
+                out.retain_rows(&mask);
+            }
+
+            out.into_vals().into_iter().map(as_gremlin_shape).collect()
+        }
+    }
+}
+
+/// A stored map is a `Record` to GQL and a `Map` to Gremlin.
+fn as_gremlin_shape(v: GVal) -> GVal {
+    match v {
+        GVal::Record(fields) => GVal::map(
+            fields
+                .iter()
+                .map(|(k, val)| (GVal::Str(k.clone()), as_gremlin_shape(val.clone())))
+                .collect(),
+        ),
+        GVal::List(items) => GVal::list(items.iter().cloned().map(as_gremlin_shape).collect()),
+        other => other,
+    }
 }
 
 /// The arms only an ELEMENT column can answer: projections of an element, a walk
