@@ -57,6 +57,10 @@ pub(super) enum Shape {
     Maps { keys: Vec<String> },
     /// A single row holding a `List` of every value. Gremlin's `fold()`.
     List,
+    /// The projected column is a per-row BOOL selecting rows of the INPUT element
+    /// column — `where(…)` / `not(…)`. The shaper returns the surviving elements,
+    /// not the bools, so navigation can continue off them.
+    Retain { negated: bool },
 }
 
 pub(super) struct Tail {
@@ -169,6 +173,84 @@ fn page_of(step: &Step) -> Option<(usize, usize)> {
     }
 }
 
+/// The label's index in `label_names`, appending it if unseen — the same
+/// plan-time interning `key_ref` does for properties. `CLabelExpr::Label(r)`
+/// refers to a label by this index, and `project_ids` resolves the whole list
+/// once against the graph's dictionaries.
+fn label_ref(labels: &mut Vec<String>, name: &str) -> usize {
+    labels.iter().position(|n| n == name).unwrap_or_else(|| {
+        labels.push(name.to_string());
+        labels.len() - 1
+    })
+}
+
+/// A `where(…)`/`not(…)` body that is ONE adjacency hop, as a GQL `EXISTS`.
+///
+/// Mirrors the shapes `gql::eval::exists_semi_join_vec` can answer in bulk — a
+/// single untyped-or-typed hop off the bound slot, optionally landing on a label.
+/// Anything richer (a chain, a property test, an inner predicate) returns `None`
+/// and Gremlin's own `semi_join_hop` keeps it.
+fn exists_of(slot: usize, labels: &mut Vec<String>, body: &[Step]) -> Option<CExpr> {
+    use crate::gql::ast::Direction;
+    use crate::gql::plan::{CLabelExpr, CNode, CPath, CRel, CSegment};
+
+    let (dir, names, tail) = match body {
+        [Step::Out(l), t @ ..] => (Direction::Out, l, t),
+        [Step::In(l), t @ ..] => (Direction::In, l, t),
+        [Step::Both(l), t @ ..] => (Direction::Both, l, t),
+        _ => return None,
+    };
+    // One type only: a multi-name hop is a disjunction over edge types, which
+    // `CLabelExpr::Label` does not spell and `exists_semi_join_vec` would have to
+    // widen to accept.
+    let rel_label = match names.as_slice() {
+        [] => None,
+        [one] => Some(CLabelExpr::Label(label_ref(labels, one))),
+        _ => return None,
+    };
+    // An optional `hasLabel` on the LANDED node, same restriction.
+    let node_label = match tail {
+        [] => None,
+        [Step::HasLabel(ls)] => match ls.as_slice() {
+            [one] => Some(CLabelExpr::Label(label_ref(labels, one))),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let node = |label| CNode {
+        var_slot: None,
+        label,
+        props: Vec::new(),
+        where_: None,
+    };
+
+    Some(CExpr::Exists {
+        patterns: vec![CPath {
+            start: CNode {
+                var_slot: Some(slot),
+                ..node(None)
+            },
+            segments: vec![CSegment {
+                rel: CRel {
+                    var_slot: None,
+                    label: rel_label,
+                    direction: dir,
+                    props: Vec::new(),
+                    where_: None,
+                    quantifier: None,
+                },
+                node: node(node_label),
+                unit: None,
+            }],
+            path_var_slot: None,
+            selector: crate::gql::ast::PathSelector::Walk,
+            mode: crate::gql::ast::PathMode::Trail,
+        }],
+        where_: None,
+        sub_len: 0,
+    })
+}
+
 /// Which aggregate a Gremlin reducing terminal is, when it is one.
 fn reducer(step: &Step) -> Option<crate::gql::plan::AggFn> {
     use crate::gql::plan::AggFn;
@@ -195,9 +277,33 @@ pub(super) fn tail(
     slot: usize,
     is_edge: bool,
     keys: &mut Vec<String>,
+    labels: &mut Vec<String>,
     rest: &[Step],
 ) -> Option<Tail> {
     match rest {
+        // `where(body)` / `not(body)` — a per-row EXISTS over the bound slot,
+        // projected as a bool column the shaper uses to RETAIN input elements.
+        //
+        // Worth routing here rather than leaving to `semi_join_hop`: GQL's
+        // `exists_semi_join_vec` answers this as a bulk adjacency test and prices
+        // the same question 2.8-3.6x FASTER than Gremlin's own arm
+        // (`where_not_typed_hop_timing_probe`). A vertex frontier only — the arm
+        // this defers to walks a VERTEX's adjacency, and an edge id read as one
+        // walks whatever vertex shares its number.
+        [head @ (Step::Where(sub) | Step::Not(sub))] if !is_edge => {
+            let expr = exists_of(slot, labels, &sub.steps)?;
+
+            Some(Tail {
+                proj: blank(vec![item(expr, "keep", false)]),
+                shape: Shape::Retain {
+                    negated: matches!(head, Step::Not(_)),
+                },
+                absent_key: None,
+                page: None,
+                filter: None,
+                order_key: None,
+            })
+        }
         // `id()` — the element's external id. `element_id(n)` is GQL's own
         // scalar function, and `crate::value::Value::element_id` is the ONE
         // implementation both engines call — `exec::elem_id` here, `ElementId`

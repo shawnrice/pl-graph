@@ -6273,6 +6273,17 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         // absent-key drop has to happen BEFORE the predicate, and the validity
         // mask has to be cleared afterwards or the arm declines a column with
         // nothing missing).
+        // `where(…)`/`not(…)` — an EXISTS answered in bulk, retained as elements.
+        // Typed and untyped hops, both directions, a landed label, and a tail
+        // after the filter so the retained column keeps navigating.
+        "g.V().hasLabel('W').where(__.out('R')).count()",
+        "g.V().hasLabel('W').not(__.out('R')).count()",
+        "g.V().hasLabel('W').where(__.out()).count()",
+        "g.V().hasLabel('W').where(__.in('R')).count()",
+        "g.V().hasLabel('W').where(__.both('R')).count()",
+        "g.V().hasLabel('W').where(__.out('R')).values('n')",
+        "g.V().hasLabel('W').where(__.out('R')).dedup().count()",
+        "g.V().hasLabel('W').where(__.out().hasLabel('W')).count()",
         "g.V().out('R').hasLabel('W').values('n').is(gt(40))",
         "g.V().out('R').hasLabel('W').values('n').is(lt(10))",
         "g.V().out('R').hasLabel('W').values('n').is(gt(40)).limit(5)",
@@ -6360,7 +6371,11 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
 
         assert_eq!(via_gql, streamed, "{q}");
         // Every case here now goes through the new route, `order()` included.
-        assert_eq!(took, 1, "{q}: migration route taken {took} times");
+        // At least once. It used to be exactly once, but a tail can migrate in
+        // STAGES now — `where(__.out('R')).values('n')` takes the route twice, once
+        // for the filter and once for the projection, which is the prefix-split
+        // working rather than a fault.
+        assert!(took >= 1, "{q}: migration route never fired");
 
         // `limit(0)` and a `range` with `hi <= lo` are the only cases meant to page
         // to nothing — everything else should return rows, so an empty result
@@ -7011,46 +7026,131 @@ fn where_not_typed_hop_timing_probe() {
 /// cannot reach: a typed hop, a landed `hasLabel`, a landed property test, and
 /// a multi-hop chain.
 ///
-/// No route change was made here — this is not an agreement check against a
-/// replacement route, only confirmation that `WHERE_NOT_ARM_HIT` still fires
-/// for exactly the shapes it always has, since the migration this file
-/// investigated was never applied (evidenced by
-/// `exists_via_project_ids_cannot_carry_a_label_ctx_has_none` and
-/// `where_not_typed_hop_timing_probe`, above).
+/// Which `where(…)`/`not(…)` shapes still reach `elem_terminal`'s arms now that
+/// the migration answers most of them.
+///
+/// Written before that migration, when every shape reached the arm; it asserted
+/// exactly that. It now pins the BOUNDARY instead, which is the more useful thing
+/// to hold: a multi-hop body and an EDGE frontier are declined on purpose
+/// (`exists_of` takes one hop; the arm walks a VERTEX's adjacency, and an edge id
+/// read as one walks whatever vertex shares its number), so those still land here
+/// and the arms stay load-bearing.
 #[test]
-fn where_not_arm_is_unchanged_and_still_reachable() {
+fn where_not_arm_takes_only_what_the_migration_declines() {
     let mut g = modern();
 
-    let shapes: &[(&str, &str)] = &[
-        ("typed hop (where)", "g.V().where(__.out('KNOWS')).count()"),
-        ("typed hop (not)", "g.V().not(__.out('KNOWS')).count()"),
+    for (label, q, expect_arm) in [
+        (
+            "single typed hop",
+            "g.V().where(__.out('KNOWS')).count()",
+            false,
+        ),
+        (
+            "single hop, negated",
+            "g.V().not(__.out('KNOWS')).count()",
+            false,
+        ),
         (
             "landed hasLabel",
             "g.V().where(__.out().hasLabel('SOFTWARE')).count()",
+            false,
         ),
         (
-            "landed property test",
-            "g.V().where(__.out().has('lang', eq('java'))).count()",
+            "multi-hop chain",
+            "g.V().where(__.out().out()).count()",
+            true,
         ),
-        ("multi-hop chain", "g.V().where(__.out().out()).count()"),
         (
-            "edge frontier self predicate",
+            "edge frontier",
             "g.E().where(__.hasLabel('KNOWS')).count()",
+            true,
         ),
-    ];
-
-    println!();
-    for (label, q) in shapes {
+    ] {
         super::exec::WHERE_NOT_ARM_HIT.with(|c| c.set(0));
         let out = super::parse::parse(q)
             .unwrap_or_else(|e| panic!("`{q}` parses: {e}"))
             .run(&mut g);
         let hit = super::exec::WHERE_NOT_ARM_HIT.with(std::cell::Cell::get);
-        println!("PROBE where_not_arm_hit={hit} out={out:?} [{label}] {q}");
-        // The edge-frontier case is a self predicate that never reaches
-        // `has_adj` (`semi_join_test`'s vertex-only hop/chain branches are
-        // skipped for `is_edge`), but it still runs the SAME `[Step::Where]`
-        // arm in `elem_terminal` — `self_predicate` works for either kind.
-        assert!(hit > 0, "{q}: WHERE_NOT_ARM_HIT never fired");
+
+        assert_eq!(
+            hit > 0,
+            expect_arm,
+            "{label}: `{q}` arm-hit={hit}, expected {expect_arm} (rows {})",
+            out.len()
+        );
+    }
+}
+
+/// `where(…)`/`not(…)` migrated: a per-row `EXISTS` over the bound slot,
+/// answered by GQL's bulk adjacency test, retained as elements so navigation
+/// continues.
+///
+/// Worth doing rather than consolidating at parity — over 50k vertices / 150k
+/// edges, against the arm it replaces:
+///
+///   hasLabel(V).where(__.out(R)).count()   1.255ms -> 0.369   3.40x
+///   hasLabel(V).not(__.out(R)).count()     1.249   -> 0.348   3.58x
+///
+/// Gremlin's own arm walks the adjacency per candidate; GQL's `exists_semi_join_vec`
+/// does the same walk but without rebuilding a `SemiJoin` per row. The 9.3x that
+/// arm bought GQL is what Gremlin collects here.
+///
+/// Nine of eleven probed shapes migrate. The two that do not are declined on
+/// purpose and stay with Gremlin's arm: a multi-hop body (`where(__.out().out())`
+/// — `exists_of` takes one hop) and an EDGE frontier (`g.E().where(…)` — the arm
+/// this defers to walks a VERTEX's adjacency, and an edge id read as one walks
+/// whatever vertex shares its number).
+#[test]
+#[ignore = "probe"]
+fn where_not_migration_timing() {
+    let mut lines = String::new();
+    for i in 0..50_000usize {
+        let l = if i % 10 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{}}}}}\n",
+            i % 97
+        ));
+    }
+    let mut e = 0;
+    for i in 0..50_000usize {
+        for d in 0..3usize {
+            lines.push_str(&format!(
+                "{{\"type\":\"edge\",\"id\":\"e{e}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{}}}}\n",
+                (i * 31 + d * 7 + 1) % 50_000
+            ));
+            e += 1;
+        }
+    }
+    let mut big = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    for q in [
+        "g.V().hasLabel('V').where(__.out('R')).count()",
+        "g.V().hasLabel('V').not(__.out('R')).count()",
+    ] {
+        let (mut mig, mut old) = (f64::MAX, f64::MAX);
+        for _ in 0..7 {
+            super::exec::MIGRATE_OFF.with(|c| c.set(false));
+            let p = super::parse::parse(q).expect("parses");
+            let t = std::time::Instant::now();
+            let a = p.run(&mut big);
+            mig = mig.min(t.elapsed().as_secs_f64() * 1000.0);
+
+            super::exec::MIGRATE_OFF.with(|c| c.set(true));
+            let p2 = super::parse::parse(q).expect("parses");
+            let t2 = std::time::Instant::now();
+            let b = p2.run(&mut big);
+            old = old.min(t2.elapsed().as_secs_f64() * 1000.0);
+            super::exec::MIGRATE_OFF.with(|c| c.set(false));
+
+            assert_eq!(a, b, "{q}");
+        }
+        println!(
+            "TIME migrated {mig:.3}ms  old-arm {old:.3}ms  {:.2}x  {q}",
+            old / mig
+        );
     }
 }

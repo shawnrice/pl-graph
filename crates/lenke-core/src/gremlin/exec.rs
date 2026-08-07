@@ -419,12 +419,15 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
             // `select`, which this does not compile yet.
             if c.tags.is_empty() && !migrate_off() {
                 let mut keys = c.key_names.clone();
+                let mut labels = c.label_names.clone();
 
-                if let Some(t) = super::to_gql::tail(c.end_slot, c.end_is_edge, &mut keys, rest) {
+                if let Some(t) =
+                    super::to_gql::tail(c.end_slot, c.end_is_edge, &mut keys, &mut labels, rest)
+                {
                     if let Some(cols) = crate::gql::eval::run_pattern_projection(
                         graph,
                         &c.path,
-                        &c.label_names,
+                        &labels,
                         &keys,
                         c.scope_len,
                         &t.proj,
@@ -437,7 +440,9 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
                         // recorded as migrated while the old route produced the
                         // answer — which would let the agreement test's "the route
                         // fired" assertion pass on a case that fell through.
-                        if let Some(out) = shape_projection_vals(graph, c.end_is_edge, &cols, &t) {
+                        if let Some(out) =
+                            shape_projection_vals(graph, c.end_is_edge, &[], &cols, &t)
+                        {
                             #[cfg(test)]
                             MIGRATED.with(|m| m.set(m.get() + 1));
 
@@ -1585,12 +1590,13 @@ fn col_terminal_tagged(
     if !migrate_off() && tags.is_empty() {
         if let Col::Elems { ids, is_edge } = &col {
             let mut keys = Vec::new();
+            let mut labels = Vec::new();
 
-            if let Some(t) = super::to_gql::tail(0, *is_edge, &mut keys, tail) {
+            if let Some(t) = super::to_gql::tail(0, *is_edge, &mut keys, &mut labels, tail) {
                 if let Some(cols) =
-                    crate::gql::eval::project_ids(graph, ids, *is_edge, &keys, &[], &t.proj)
+                    crate::gql::eval::project_ids(graph, ids, *is_edge, &keys, &labels, &t.proj)
                 {
-                    if let Some(out) = shape_projection_vals(graph, *is_edge, &cols, &t) {
+                    if let Some(out) = shape_projection_vals(graph, *is_edge, ids, &cols, &t) {
                         #[cfg(test)]
                         MIGRATED.with(|m| m.set(m.get() + 1));
 
@@ -1620,16 +1626,19 @@ fn col_terminal_tagged(
             // used to reach `elem_terminal`'s exact-match arms only when nothing
             // followed and stream every other shape (`id().count()`,
             // `label().groupCount()`, …).
-            if let Some((prefix, rest)) =
-                values_prefix(tail).or_else(|| id_label_prefix(tail, *is_edge))
+            if let Some((prefix, rest)) = values_prefix(tail)
+                .or_else(|| id_label_prefix(tail, *is_edge))
+                .or_else(|| where_not_prefix(tail))
             {
                 let mut names = Vec::new();
+                let mut labels = Vec::new();
 
-                if let Some(t) = super::to_gql::tail(0, *is_edge, &mut names, &prefix) {
-                    if let Some(cols) =
-                        crate::gql::eval::project_ids(graph, ids, *is_edge, &names, &[], &t.proj)
-                    {
-                        if let Some(next) = shape_projection(graph, *is_edge, &cols, &t) {
+                if let Some(t) = super::to_gql::tail(0, *is_edge, &mut names, &mut labels, &prefix)
+                {
+                    if let Some(cols) = crate::gql::eval::project_ids(
+                        graph, ids, *is_edge, &names, &labels, &t.proj,
+                    ) {
+                        if let Some(next) = shape_projection(graph, *is_edge, ids, &cols, &t) {
                             #[cfg(test)]
                             MIGRATED.with(|m| m.set(m.get() + 1));
 
@@ -1895,15 +1904,16 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
     // makes the arm below deletable.
     if !migrate_off() {
         let mut keys = Vec::new();
+        let mut labels = Vec::new();
 
-        if let Some(t) = super::to_gql::tail(0, is_edge, &mut keys, rest) {
+        if let Some(t) = super::to_gql::tail(0, is_edge, &mut keys, &mut labels, rest) {
             if let Some(cols) =
-                crate::gql::eval::project_ids(graph, ids, is_edge, &keys, &[], &t.proj)
+                crate::gql::eval::project_ids(graph, ids, is_edge, &keys, &labels, &t.proj)
             {
                 #[cfg(test)]
                 MIGRATED.with(|m| m.set(m.get() + 1));
 
-                return shape_projection_vals(graph, is_edge, &cols, &t);
+                return shape_projection_vals(graph, is_edge, ids, &cols, &t);
             }
         }
     }
@@ -2305,6 +2315,17 @@ fn homogeneous_or_absent(graph: &Graph, is_edge: bool, key: &str) -> bool {
 ///
 /// One key only: `values()` with none needs a per-element key list, and a
 /// multi-key call interleaves columns per element rather than reading one.
+/// Split a leading `where(…)`/`not(…)` off a tail, so the filter can be answered
+/// as a projection and whatever follows handed to the terminals.
+fn where_not_prefix(tail: &[Step]) -> Option<(Vec<Step>, &[Step])> {
+    match tail {
+        [head @ (Step::Where(_) | Step::Not(_)), rest @ ..] if !rest.is_empty() => {
+            Some((vec![head.clone()], rest))
+        }
+        _ => None,
+    }
+}
+
 fn values_prefix(tail: &[Step]) -> Option<(Vec<Step>, &[Step])> {
     let [Step::Values(keys), rest @ ..] = tail else {
         return None;
@@ -2357,6 +2378,7 @@ fn id_label_prefix(tail: &[Step], is_edge: bool) -> Option<(Vec<Step>, &[Step])>
 fn shape_projection(
     graph: &Graph,
     is_edge: bool,
+    ids: &[u32],
     cols: &[Col<'_>],
     t: &super::to_gql::Tail,
 ) -> Option<Col<'static>> {
@@ -2372,6 +2394,39 @@ fn shape_projection(
     }
 
     let col = cols.first()?;
+
+    // `where(…)`/`not(…)`: the projected column is a per-row bool over the INPUT
+    // elements, so the answer is the surviving ELEMENTS — not the bools — or
+    // navigation could not continue off them.
+    if let super::to_gql::Shape::Retain { negated } = t.shape {
+        let Col::Bool { t: keep, valid } = col else {
+            return None;
+        };
+        // `EXISTS` is TRUE/FALSE per row, never unknown — a mask here would mean
+        // the projection answered something this cannot interpret.
+        if valid.is_some() {
+            return None;
+        }
+        // Retaining needs the INPUT ids, which only the routes that materialize a
+        // frontier can supply. The pattern route hands over no ids (its frame does
+        // the scanning), so it declines here rather than silently answering with a
+        // column of the wrong length.
+        if ids.len() != keep.len() {
+            return None;
+        }
+
+        let kept: Vec<u32> = ids
+            .iter()
+            .zip(keep.iter())
+            .filter(|(_, &k)| k != negated)
+            .map(|(&id, _)| id)
+            .collect();
+
+        return Some(Col::Elems {
+            ids: std::borrow::Cow::Owned(kept),
+            is_edge,
+        });
+    }
 
     if t.shape == super::to_gql::Shape::Scalar {
         // `values(k).count()`: the aggregate already skipped every `Null`
@@ -2505,10 +2560,11 @@ fn shape_projection(
 fn shape_projection_vals(
     graph: &Graph,
     is_edge: bool,
+    ids: &[u32],
     cols: &[Col<'_>],
     t: &super::to_gql::Tail,
 ) -> Option<Vec<GVal>> {
-    shape_projection(graph, is_edge, cols, t).map(Col::into_vals)
+    shape_projection(graph, is_edge, ids, cols, t).map(Col::into_vals)
 }
 
 /// A stored map is a `Record` to GQL and a `Map` to Gremlin.
