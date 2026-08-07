@@ -857,6 +857,21 @@ fn self_predicate<'a>(
                 return None;
             }
         }
+        // A LABEL test on the element itself is the same kind of question as a
+        // property one — `where(__.hasLabel(L))` / `not(__.hasLabel(L))` — and the
+        // seek already spells it. Only `self_predicate` was property-shaped.
+        //
+        // An empty name list is "any label", which is no filter at all; every
+        // name unknown is the empty id list, which matches nothing. Both are what
+        // `lower_prefix` does with a `hasLabel`, and the same rule has to hold
+        // here or the two disagree about a label nothing carries.
+        [Step::HasLabel(labels)] => {
+            if labels.is_empty() {
+                return None;
+            }
+
+            seek.set_labels(resolve_element_labels(graph, labels, is_edge).unwrap_or_default());
+        }
         _ => return None,
     }
 
@@ -865,7 +880,16 @@ fn self_predicate<'a>(
     // The same gate the seeding path uses: a comparison the column cannot run —
     // a cross-type one — is a type FAULT on the stream, and answering it here
     // would swallow the error.
-    if !seek.types_agree(graph, &no_params) || !seek.columnar(graph, &no_params) {
+    //
+    // The second half is the label-only case, and it is not optional: a seek
+    // holding nothing but a label constraint has no property predicate, so
+    // `columnar` says NO by definition. Without it the `hasLabel` arm above
+    // builds a perfectly good seek and then declines it — which is exactly what
+    // happened, and the measurement said 2.277ms before and after.
+    let answerable =
+        seek.columnar(graph, &no_params) || (seek.conj_is_empty() && seek.labels().is_some());
+
+    if !seek.types_agree(graph, &no_params) || !answerable {
         return None;
     }
 

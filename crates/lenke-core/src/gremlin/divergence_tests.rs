@@ -3661,6 +3661,11 @@ fn cross_language_cost_probe() {
             "g.V().hasLabel('V').as('x').select('x').count()",
         ),
         (
+            "not(hasLabel) on the element itself",
+            "MATCH (u:V) WHERE NOT u:W RETURN count(*) AS c",
+            "g.V().hasLabel('V').not(__.hasLabel('W')).count()",
+        ),
+        (
             "an unread as() tag",
             "MATCH (u:V) RETURN count(*) AS c",
             "g.V().hasLabel('V').as('x').count()",
@@ -5127,6 +5132,76 @@ fn select_off_a_tag_column_matches_the_stream() {
         "g.V().as('x').out('KNOWS').select('x').by('name').count()",
         // A label that was never bound: `select` drops every row.
         "g.V().as('x').select('zz').count()",
+    ] {
+        let (head, tail) = q.split_once('.').expect("a traversal has a step");
+        let streamed = format!("{head}.{}", tail.replacen('.', ".fold().unfold().", 1));
+        let a = super::parse::parse(q)
+            .unwrap_or_else(|e| panic!("`{q}`: {e}"))
+            .run(&mut g);
+        let b = super::parse::parse(&streamed)
+            .unwrap_or_else(|e| panic!("`{streamed}`: {e}"))
+            .run(&mut g);
+
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "`{q}` disagreed with its streamed spelling"
+        );
+    }
+}
+
+/// A LABEL test on the element itself is a column question, like a property one.
+///
+/// `where(__.hasLabel(L))` / `not(__.hasLabel(L))` — 2.277ms against 0.028.
+///
+/// It needed the label-only case added to the answerable gate as well as the arm:
+/// a seek holding nothing but a label has no property predicate, so `columnar`
+/// says no by definition, and the arm built a perfectly good seek and then threw
+/// it away. The measurement was identical before and after until that was fixed,
+/// which is the only reason it was noticed.
+#[test]
+fn a_label_self_predicate_matches_the_stream() {
+    let mut lines = String::new();
+
+    for i in 0..120usize {
+        let l = match i % 4 {
+            0 => r#"["V","W"]"#,
+            1 => r#"["V"]"#,
+            2 => r#"["W"]"#,
+            _ => r#"["V","X"]"#,
+        };
+
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{}}}}}\n",
+            i % 7
+        ));
+    }
+    for i in 0..40usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"edge\",\"id\":\"e{i}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{}}}}\n",
+            (i * 3 + 1) % 120
+        ));
+    }
+
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    for q in [
+        "g.V().where(__.hasLabel('W')).count()",
+        "g.V().not(__.hasLabel('W')).count()",
+        "g.V().hasLabel('V').not(__.hasLabel('W')).count()",
+        "g.V().where(__.hasLabel('W')).id()",
+        // Several names is a disjunction over ONE element.
+        "g.V().where(__.hasLabel('W','X')).count()",
+        "g.V().not(__.hasLabel('W','X')).count()",
+        // A label NOTHING carries: `where` keeps none, `not` keeps all. This is
+        // where an empty id list read as "no filter" would show.
+        "g.V().where(__.hasLabel('ZZ')).count()",
+        "g.V().not(__.hasLabel('ZZ')).count()",
+        // One real name and one unknown: the unknown drops out.
+        "g.V().where(__.hasLabel('W','ZZ')).count()",
+        // Edges have labels too.
+        "g.E().where(__.hasLabel('R')).count()",
+        "g.E().not(__.hasLabel('R')).count()",
     ] {
         let (head, tail) = q.split_once('.').expect("a traversal has a step");
         let streamed = format!("{head}.{}", tail.replacen('.', ".fold().unfold().", 1));
