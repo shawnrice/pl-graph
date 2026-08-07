@@ -5630,20 +5630,20 @@ fn arm_audit() {
         let (mut lo, mut st) = (f64::MAX, f64::MAX);
         let mut same = true;
         for _ in 0..5 {
-            super::exec::LOWERING_OFF.store(false, Relaxed);
+            super::exec::LOWERING_OFF.with(|c| c.set(false));
             let p = super::parse::parse(q).expect("parses");
             let t = std::time::Instant::now();
             let a = p.run(&mut g);
             lo = lo.min(t.elapsed().as_secs_f64() * 1000.0);
 
-            super::exec::LOWERING_OFF.store(true, Relaxed);
+            super::exec::LOWERING_OFF.with(|c| c.set(true));
             let p2 = super::parse::parse(q).expect("parses");
             let t2 = std::time::Instant::now();
             let b = p2.run(&mut g);
             st = st.min(t2.elapsed().as_secs_f64() * 1000.0);
             same &= a == b;
         }
-        super::exec::LOWERING_OFF.store(false, Relaxed);
+        super::exec::LOWERING_OFF.with(|c| c.set(false));
         println!(
             "{name:<22} {lo:>9.3}ms {st:>9.3}ms {:>6.1}x{}",
             st / lo,
@@ -5712,8 +5712,8 @@ fn route_audit() {
                 .iter()
                 .enumerate()
             {
-                super::exec::LOWERING_OFF.store(*lo, Relaxed);
-                super::exec::PATTERN_OFF.store(*po, Relaxed);
+                super::exec::LOWERING_OFF.with(|c| c.set(*lo));
+                super::exec::PATTERN_OFF.with(|c| c.set(*po));
                 let p = super::parse::parse(q).expect("parses");
                 let start = std::time::Instant::now();
                 let out = p.run(&mut g);
@@ -5724,8 +5724,8 @@ fn route_audit() {
                 }
             }
         }
-        super::exec::LOWERING_OFF.store(false, Relaxed);
-        super::exec::PATTERN_OFF.store(false, Relaxed);
+        super::exec::LOWERING_OFF.with(|c| c.set(false));
+        super::exec::PATTERN_OFF.with(|c| c.set(false));
         println!(
             "{q:<50} {:>8.3}ms {:>9.3}ms {:>8.3}ms{}",
             t[0],
@@ -5766,11 +5766,11 @@ fn the_pattern_route_reorders_rows() {
     let mut g = modern();
     let q = "g.V().out('CREATED').hasLabel('SOFTWARE').values('name')";
 
-    super::exec::PATTERN_OFF.store(false, Relaxed);
+    super::exec::PATTERN_OFF.with(|c| c.set(false));
     let planned = super::parse::parse(q).expect("parses").run(&mut g);
-    super::exec::PATTERN_OFF.store(true, Relaxed);
+    super::exec::PATTERN_OFF.with(|c| c.set(true));
     let walked = super::parse::parse(q).expect("parses").run(&mut g);
-    super::exec::PATTERN_OFF.store(false, Relaxed);
+    super::exec::PATTERN_OFF.with(|c| c.set(false));
 
     assert_ne!(planned, walked, "the planner is expected to reorder");
 
@@ -6092,11 +6092,11 @@ fn lowered_select_with_modulators_agrees_with_the_stream() {
         // a by() this must NOT take: it carries an order
         "g.V().as('x').out('KNOWS').select('x').by('name', desc)",
     ] {
-        super::exec::PATTERN_OFF.store(false, Relaxed);
+        super::exec::PATTERN_OFF.with(|c| c.set(false));
         let lowered = super::parse::parse(q).expect("parses").run(&mut g);
-        super::exec::MIGRATE_OFF.store(true, Relaxed);
+        super::exec::MIGRATE_OFF.with(|c| c.set(true));
         let streamed = super::parse::parse(q).expect("parses").run(&mut g);
-        super::exec::MIGRATE_OFF.store(false, Relaxed);
+        super::exec::MIGRATE_OFF.with(|c| c.set(false));
 
         assert_eq!(lowered, streamed, "{q}");
     }
@@ -6204,8 +6204,16 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         } else {
             r#"["V"]"#
         };
+        // `m` is present on two of every three vertices — `project()`'s
+        // absent-key row (a null in the map, NOT a dropped row, unlike
+        // `values(k)`).
+        let m = if i % 3 == 0 {
+            String::new()
+        } else {
+            format!(",\"m\":{}", i % 5)
+        };
         lines.push_str(&format!(
-            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{},\"k\":\"key{i:06}\"}}}}\n",
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{},\"k\":\"key{i:06}\"{m}}}}}\n",
             i % 97
         ));
     }
@@ -6233,15 +6241,24 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         "g.V().out('R').hasLabel('W').groupCount().by('k')",
         "g.V().out('R').hasLabel('W').order().by('n')",
         "g.V().out('R').hasLabel('W').order().by('n').limit(5)",
+        // `project()` — two keys, a numeric and a string property.
+        "g.V().out('R').hasLabel('W').project('n','k').by('n').by('k')",
+        // three keys, the third (`m`) absent on some rows — a null in the
+        // map, not a dropped row (unlike `values(k)`).
+        "g.V().out('R').hasLabel('W').project('n','k','m').by('n').by('k').by('m')",
+        // an explicit identity `by()` alongside a keyed one.
+        "g.V().out('R').hasLabel('W').project('v','n').by().by('n')",
+        // a MISSING `by()` (fewer bys than keys) defaults to identity too.
+        "g.V().out('R').hasLabel('W').project('v','n').by('n')",
     ] {
-        super::exec::MIGRATED.store(0, Relaxed);
-        super::exec::PATTERN_OFF.store(false, Relaxed);
+        super::exec::MIGRATED.with(|c| c.set(0));
+        super::exec::PATTERN_OFF.with(|c| c.set(false));
         let via_gql = super::parse::parse(q).expect("parses").run(&mut g);
-        let took = super::exec::MIGRATED.load(Relaxed);
+        let took = super::exec::MIGRATED.with(std::cell::Cell::get);
 
-        super::exec::MIGRATE_OFF.store(true, Relaxed);
+        super::exec::MIGRATE_OFF.with(|c| c.set(true));
         let streamed = super::parse::parse(q).expect("parses").run(&mut g);
-        super::exec::MIGRATE_OFF.store(false, Relaxed);
+        super::exec::MIGRATE_OFF.with(|c| c.set(false));
 
         assert_eq!(via_gql, streamed, "{q}");
         // The two `order()` rows decline on purpose; everything else must have

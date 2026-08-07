@@ -12974,20 +12974,20 @@ fn migration_route_cost() {
     ] {
         let (mut a, mut b) = (f64::MAX, f64::MAX);
         for _ in 0..7 {
-            crate::gremlin::exec::MIGRATE_OFF.store(false, Relaxed);
+            crate::gremlin::exec::MIGRATE_OFF.with(|c| c.set(false));
             let p = crate::gremlin::parse(q).expect("parses");
             let t = std::time::Instant::now();
             let x = p.run(&mut g);
             a = a.min(t.elapsed().as_secs_f64() * 1000.0);
 
-            crate::gremlin::exec::MIGRATE_OFF.store(true, Relaxed);
+            crate::gremlin::exec::MIGRATE_OFF.with(|c| c.set(true));
             let p2 = crate::gremlin::parse(q).expect("parses");
             let t2 = std::time::Instant::now();
             let y = p2.run(&mut g);
             b = b.min(t2.elapsed().as_secs_f64() * 1000.0);
             assert_eq!(x, y, "{q}");
         }
-        crate::gremlin::exec::MIGRATE_OFF.store(false, Relaxed);
+        crate::gremlin::exec::MIGRATE_OFF.with(|c| c.set(false));
         println!("{q:<52} {a:>9.3}ms {b:>9.3}ms {:>6.2}x", b / a);
     }
 }

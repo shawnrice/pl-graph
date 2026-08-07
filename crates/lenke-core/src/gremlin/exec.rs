@@ -430,7 +430,7 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
                         &t.proj,
                     ) {
                         #[cfg(test)]
-                        MIGRATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        MIGRATED.with(|m| m.set(m.get() + 1));
 
                         if let Some(out) = shape_projection_vals(graph, c.end_is_edge, &cols, &t) {
                             return out;
@@ -1562,6 +1562,37 @@ fn col_terminal_tagged(
     tags: &mut Vec<(String, Col<'static>)>,
     tail: &[Step],
 ) -> Option<Vec<GVal>> {
+    // The MIGRATION route: a tail compiled to a GQL projection, offered here
+    // rather than once at the entry.
+    //
+    // This function PEELS one step at a time and recurses — `dedup()`,
+    // `barrier()`, an unread `as()`, the pagers — so a traversal like
+    // `dedup().project(…)` reaches its terminal several levels down. Attempting
+    // the translation only at the entry meant any of those in front of a terminal
+    // bypassed the migration entirely, which a probe caught: `project(…)`
+    // migrated, `dedup().project(…)` did not. Offering it at every level costs one
+    // failed match per peel and needs no duplicate of the peeling logic — which is
+    // the alternative that was tempting and would have re-created the very
+    // duplication this migration exists to remove.
+    if !migrate_off() && tags.is_empty() {
+        if let Col::Elems { ids, is_edge } = &col {
+            let mut keys = Vec::new();
+
+            if let Some(t) = super::to_gql::tail(0, &mut keys, tail) {
+                if let Some(cols) =
+                    crate::gql::eval::project_ids(graph, ids, *is_edge, &keys, &t.proj)
+                {
+                    if let Some(out) = shape_projection_vals(graph, *is_edge, &cols, &t) {
+                        #[cfg(test)]
+                        MIGRATED.with(|m| m.set(m.get() + 1));
+
+                        return Some(out);
+                    }
+                }
+            }
+        }
+    }
+
     #[allow(clippy::cast_precision_loss)]
     match tail {
         // Nothing follows: the column IS the answer.
@@ -1748,13 +1779,22 @@ fn col_terminal_tagged(
 /// prices every arm with the query left exactly as written.
 /// `arm_audit` is the consumer; see its output before deleting any arm.
 #[cfg(test)]
-pub static LOWERING_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// THREAD-LOCAL, not a static: libtest runs tests in PARALLEL and these switches
+/// are flipped mid-test, so a process-global one lets an unrelated test observe a
+/// route being disabled and fail intermittently. That is not hypothetical — the
+/// migration agreement test flaked exactly once that way, passed standalone, and
+/// looked like a real divergence. A thread-local is per test.
+thread_local! {
+    pub static LOWERING_OFF: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Turns off ONLY the pattern route (`gremlin::pattern`), leaving the linear
 /// column path on, so the planner's own contribution can be priced apart from
 /// the column arms'. Test-only, like [`LOWERING_OFF`].
 #[cfg(test)]
-pub static PATTERN_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    pub static PATTERN_OFF: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Whether the column path is disabled for this run — always `false` outside
 /// tests, where it compiles to a constant the optimizer removes.
@@ -1762,7 +1802,7 @@ pub static PATTERN_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 fn lowering_off() -> bool {
     #[cfg(test)]
     {
-        LOWERING_OFF.load(std::sync::atomic::Ordering::Relaxed)
+        LOWERING_OFF.with(Cell::get)
     }
     #[cfg(not(test))]
     {
@@ -1776,7 +1816,7 @@ fn lowering_off() -> bool {
 fn pattern_off() -> bool {
     #[cfg(test)]
     {
-        PATTERN_OFF.load(std::sync::atomic::Ordering::Relaxed)
+        PATTERN_OFF.with(Cell::get)
     }
     #[cfg(not(test))]
     {
@@ -1811,7 +1851,7 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
         if let Some(t) = super::to_gql::tail(0, &mut keys, rest) {
             if let Some(cols) = crate::gql::eval::project_ids(graph, ids, is_edge, &keys, &t.proj) {
                 #[cfg(test)]
-                MIGRATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                MIGRATED.with(|m| m.set(m.get() + 1));
 
                 return shape_projection_vals(graph, is_edge, &cols, &t);
             }
@@ -2123,13 +2163,15 @@ fn fanout(graph: &Graph, ids: &[u32], is_edge: bool, steps: &[Step]) -> Option<F
 /// through the stream. Comparing against the stream instead compares two
 /// different enumeration orders and reports permitted reordering as a failure.
 #[cfg(test)]
-pub static MIGRATE_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    pub static MIGRATE_OFF: Cell<bool> = const { Cell::new(false) };
+}
 
 #[inline]
 fn migrate_off() -> bool {
     #[cfg(test)]
     {
-        MIGRATE_OFF.load(std::sync::atomic::Ordering::Relaxed)
+        MIGRATE_OFF.with(Cell::get)
     }
     #[cfg(not(test))]
     {
@@ -2140,7 +2182,9 @@ fn migrate_off() -> bool {
 /// How many traversals the migration route answered — test-only, so the arms it
 /// replaces can be shown to be genuinely unreachable before they are deleted.
 #[cfg(test)]
-pub static MIGRATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    pub static MIGRATED: Cell<usize> = const { Cell::new(0) };
+}
 
 /// Turn GQL's projected columns into Gremlin values — the BOUNDARY where the two
 /// languages differ, kept out of the evaluator on purpose.
@@ -2169,6 +2213,27 @@ fn shape_projection(
             .collect();
 
         return Some(Col::Gen(vec![GVal::map(entries)]));
+    }
+
+    // `project('a','b').by(…)…` — one `Map` per row, zipped from N resolved
+    // columns that all share one key vector (the SAME sharing the arm this
+    // replaces uses: `MapVal::with_keys` clones the `Arc`, not the keys).
+    if let super::to_gql::Shape::Maps { keys } = &t.shape {
+        let shared: Arc<Vec<GVal>> = Arc::new(
+            keys.iter()
+                .map(|k| GVal::Str(Arc::from(k.as_str())))
+                .collect(),
+        );
+        let rows = (0..col.len())
+            .map(|i| {
+                GVal::Map(crate::value::MapVal::with_keys(
+                    shared.clone(),
+                    cols.iter().map(|c| as_gremlin_shape(c.val_at(i))).collect(),
+                ))
+            })
+            .collect();
+
+        return Some(Col::Gen(rows));
     }
 
     let mut out = col.clone().into_owned();
@@ -4083,7 +4148,7 @@ fn grouped_reduce(bys: &[By]) -> Option<(&str, &str, GroupReduce)> {
 /// A missing `by()` is the element itself, which is a column; a `By::Key` is a
 /// property column. Anything else — a sub-traversal, a token, a `Column` — is
 /// not, and the step keeps its stream form for those.
-fn projectable_bys(keys: &[String], bys: &[By]) -> bool {
+pub(super) fn projectable_bys(keys: &[String], bys: &[By]) -> bool {
     bys.len() <= keys.len()
         && bys
             .iter()

@@ -35,14 +35,14 @@
 //! self-loop is two adjacencies not one (`Ctx::loops`, already a parameter).
 
 use crate::gql::plan::{compile_program, CAgg, CExpr, CProjection, CReturnItem};
-use crate::gremlin::{Scope, Step};
+use crate::gremlin::{By, Scope, Step};
 
 /// How the projected columns become Gremlin values.
 ///
 /// The columns are the same either way; what differs is the container, which is
 /// exactly the axis the two languages disagree on and the reason this is the
 /// caller's job rather than the evaluator's.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) enum Shape {
     /// One value per row, from column 0.
     Rows,
@@ -50,6 +50,9 @@ pub(super) enum Shape {
     Scalar,
     /// One `Map` from two columns: keys then counts. Gremlin's `groupCount`.
     Map,
+    /// One `Map` per row from N columns, all sharing one key vector. Gremlin's
+    /// `project(k1, k2, …)`.
+    Maps { keys: Vec<String> },
 }
 
 pub(super) struct Tail {
@@ -229,6 +232,44 @@ pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option
                 // A tally keys on the value, and an absent key tallies under a
                 // NULL key rather than dropping the row — TinkerPop 3.5, and what
                 // the arm this replaces does.
+                absent_key: None,
+            })
+        }
+        // `project('a','b').by('k1').by('k2')` — one resolved property column
+        // per key, zipped into one `Map` per row that all share one key
+        // vector (`Shape::Maps`, shaped in `exec::shape_projection`). Only the
+        // modulators that are a plain property or the element itself: a
+        // sub-traversal `by()` can read the path and a token `by()` projects
+        // something that is not a column, so both keep the stream form —
+        // `projectable_bys` is the SAME guard the arm this replaces uses, so
+        // the two cannot drift on which `by()`s are admissible.
+        //
+        // Unlike `values(k)`, an absent key is NOT dropped here — `project()`
+        // holds a `null` for it, so `absent_key` stays `None`.
+        [Step::Project(pkeys, bys)]
+            if !pkeys.is_empty() && super::exec::projectable_bys(pkeys, bys) =>
+        {
+            let items = (0..pkeys.len())
+                .map(|i| {
+                    let expr = match bys.get(i) {
+                        Some(By::Key(k, _)) => CExpr::Prop {
+                            var_slot: slot,
+                            key_ref: key_ref(keys, k),
+                        },
+                        // Missing `by()`, or an explicit `by()` (identity) —
+                        // both project the element itself.
+                        _ => CExpr::Var(slot),
+                    };
+
+                    item(expr, &format!("v{i}"), false)
+                })
+                .collect::<Vec<_>>();
+
+            Some(Tail {
+                proj: blank(items),
+                shape: Shape::Maps {
+                    keys: pkeys.clone(),
+                },
                 absent_key: None,
             })
         }
