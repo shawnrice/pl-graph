@@ -420,7 +420,7 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
             if c.tags.is_empty() && !migrate_off() {
                 let mut keys = c.key_names.clone();
 
-                if let Some(t) = super::to_gql::tail(&c, &mut keys, rest) {
+                if let Some(t) = super::to_gql::tail(c.end_slot, &mut keys, rest) {
                     if let Some(cols) = crate::gql::eval::run_pattern_projection(
                         graph,
                         &c.path,
@@ -432,7 +432,9 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
                         #[cfg(test)]
                         MIGRATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                        return shape_projection(&cols, t.shape);
+                        if let Some(out) = shape_projection_vals(graph, c.end_is_edge, &cols, &t) {
+                            return out;
+                        }
                     }
                 }
             }
@@ -1800,6 +1802,22 @@ fn try_values(graph: &Graph, steps: &[Step]) -> Option<Vec<GVal>> {
 /// boundary wanted. Which route to take is [`crate::pipeline`]'s answer — a
 /// boundary means the rows are materialized regardless, so the column is free.
 fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Option<Vec<GVal>> {
+    // The MIGRATION route, offered to the LINEAR lowering too — this is the entry
+    // both of Gremlin's routes share, so covering a tail here is what eventually
+    // makes the arm below deletable.
+    if !migrate_off() {
+        let mut keys = Vec::new();
+
+        if let Some(t) = super::to_gql::tail(0, &mut keys, rest) {
+            if let Some(cols) = crate::gql::eval::project_ids(graph, ids, is_edge, &keys, &t.proj) {
+                #[cfg(test)]
+                MIGRATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                return shape_projection_vals(graph, is_edge, &cols, &t);
+            }
+        }
+    }
+
     col_terminal(
         graph,
         Col::Elems {
@@ -2132,24 +2150,66 @@ pub static MIGRATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 /// which (asking for `PROPERTY_EXISTS` as a second projected item is also correct
 /// and reads the column twice, at 3.6x). A stored map is a `Map` to Gremlin and a
 /// `Record` to GQL — the same `Value::from_stored` with `as_record` flipped.
-fn shape_projection(cols: &[Col<'_>], shape: super::to_gql::Shape) -> Vec<GVal> {
-    let Some(col) = cols.first() else {
-        return Vec::new();
-    };
+fn shape_projection(
+    graph: &Graph,
+    is_edge: bool,
+    cols: &[Col<'_>],
+    t: &super::to_gql::Tail,
+) -> Option<Col<'static>> {
+    let col = cols.first()?;
 
-    match shape {
-        super::to_gql::Shape::Scalar => col.clone().into_vals(),
-        super::to_gql::Shape::Rows => {
-            let keep = col.valid_mask().map(<[bool]>::to_vec);
-            let mut out = col.clone().into_owned();
+    if t.shape == super::to_gql::Shape::Scalar {
+        return Some(col.clone().into_owned());
+    }
 
-            if let Some(mask) = keep {
-                out.retain_rows(&mask);
+    let mut out = col.clone().into_owned();
+
+    if let Some(key) = &t.absent_key {
+        let store = if is_edge {
+            &graph.edge_props
+        } else {
+            &graph.props
+        };
+
+        match store.keys.get(key).and_then(|k| store.cols.get(k as usize)) {
+            // `valid` mirrors the store's presence set exactly.
+            Some(crate::graph::Column::Num { .. } | crate::graph::Column::Bool { .. }) => {
+                if let Some(mask) = out.valid_mask().map(<[bool]>::to_vec) {
+                    out.retain_rows(&mask);
+                }
             }
-
-            out.into_vals().into_iter().map(as_gremlin_shape).collect()
+            // Boxed to null per absent row, and these cannot hold a STORED null —
+            // that would force `Mixed`.
+            Some(crate::graph::Column::Str { .. } | crate::graph::Column::Temporal { .. }) => {
+                if let Col::Gen(vals) = &mut out {
+                    vals.retain(|v| !matches!(v, GVal::Null));
+                }
+            }
+            // No column at all: no element carries the key, so `values(k)` is empty.
+            None => return Some(Col::Gen(Vec::new())),
+            // `Mixed`/`Record` can hold a stored null AND box an absence as one,
+            // and nothing here can tell them apart. Decline.
+            Some(_) => return None,
         }
     }
+
+    if let Col::Gen(vals) = &mut out {
+        for v in vals.iter_mut() {
+            *v = as_gremlin_shape(std::mem::replace(v, GVal::Null));
+        }
+    }
+
+    Some(out)
+}
+
+/// [`shape_projection`], as the values Gremlin hands back.
+fn shape_projection_vals(
+    graph: &Graph,
+    is_edge: bool,
+    cols: &[Col<'_>],
+    t: &super::to_gql::Tail,
+) -> Option<Vec<GVal>> {
+    shape_projection(graph, is_edge, cols, t).map(Col::into_vals)
 }
 
 /// A stored map is a `Record` to GQL and a `Map` to Gremlin.
@@ -2633,27 +2693,10 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
 /// `values(k)` and whatever follows it, answered from the typed column.
 /// The `values(k)` column, and whatever terminal follows it.
 ///
-/// Reads the property through the SHARED [`Col::from_property`] — the same
-/// constructor GQL's projection uses — instead of a reader of its own. This used
-/// to walk the store itself and only for a homogeneous NUMBER column; a
-/// `Str`/`Bool`/`Temporal` property fell to the stream for want of a reader, where
-/// the shared one has had them all along.
-///
-/// # Where the sharing stops, and why
-///
-/// Routing this through GQL's `CProjection` instead — `project_ids`, one level up
-/// — was implemented and REVERTED, with numbers. `values(k)` DROPS a row whose key
-/// is absent and KEEPS one whose stored value is null, which as a projection is
-/// `RETURN k, PROPERTY_EXISTS(elem, k)` with the presence column doing the
-/// dropping. It is expressible, it is correct, and it cost 11x: the presence
-/// column evaluates through the expression VM once per row, where `from_property`
-/// hands back a `valid` mask the store already had. Measured on the arm audit,
-/// `values(n)` went 29.1x over the stream to 2.5x.
-///
-/// The lesson generalizes past this arm: the two engines share the COLUMN
-/// primitives profitably, and sharing the expression layer above them is not free
-/// for a projection this simple. An isolated probe said 0.80x because it timed a
-/// one-item projection and the implementation needed two.
+/// The column now comes from GQL's projection through [`shape_projection`], which
+/// is the same read the migration route makes — so the drop-absent rule and the
+/// `Record`-to-`Map` conversion live in ONE place instead of here as well. What is
+/// left is the `is(P)` narrowing and handing the tail on.
 fn column_terminal(
     graph: &Graph,
     ids: &[u32],
@@ -2673,64 +2716,14 @@ fn column_terminal(
         [Step::Is(p), t @ ..] => (Some(p), t),
         t => (None, t),
     };
-    let store = if is_edge {
-        &graph.edge_props
-    } else {
-        &graph.props
-    };
-    let Some(kid) = store.keys.get(key) else {
-        // No element ever carried this key, so `values(k)` emits nothing and
-        // every terminal folds the empty stream. `is` cannot change that.
-        return empty_column_terminal(tail);
-    };
-
-    // `None` = a `Mixed`/`Vec`/`Record` column, which the shared constructor
-    // leaves to its caller; that read is below.
-    // A row whose key is ABSENT is DROPPED; one whose stored value is null rides
-    // through. How absence arrives depends on the column kind, so this asks the
-    // store rather than inferring it from the built column — a `Gen` full of
-    // nulls means "absent" from a `Str` column and could mean "stored null" if the
-    // shared constructor ever learns `Mixed`.
-    let stored = store.cols.get(kid as usize);
-    let mut col = match Col::from_property(stored, ids, &graph.strs) {
-        Some(mut c) => {
-            match stored {
-                // Typed: `valid` mirrors the store's presence set exactly.
-                Some(crate::graph::Column::Num { .. } | crate::graph::Column::Bool { .. }) => {
-                    if let Some(keep) = c.valid_mask().map(<[bool]>::to_vec) {
-                        c.retain_rows(&keep);
-                    }
-                }
-                // Boxed into `Gen` with a null per absent row, and these columns
-                // cannot hold a STORED null — one would force `Mixed` — so every
-                // null here is an absence.
-                Some(crate::graph::Column::Str { .. } | crate::graph::Column::Temporal { .. }) => {
-                    if let Col::Gen(vals) = &mut c {
-                        vals.retain(|v| !matches!(v, GVal::Null));
-                    }
-                }
-                // No column at all is handled by the `kid` lookup above; anything
-                // else the constructor declines and the per-row read below runs.
-                _ => return None,
-            }
-
-            c
-        }
-        None => {
-            let mut out = Vec::with_capacity(ids.len());
-
-            for &id in ids {
-                let i = id as usize;
-
-                // Gate on PRESENCE, not value != Null: a present null rides through.
-                if store.is_present_id(i, kid) {
-                    out.push(value_to_gval(store.value_id(i, kid, &graph.strs)));
-                }
-            }
-
-            Col::Gen(out)
-        }
-    };
+    let mut names = Vec::new();
+    let read = super::to_gql::tail(
+        0,
+        &mut names,
+        std::slice::from_ref(&Step::Values(vec![(*key).to_string()])),
+    )?;
+    let cols = crate::gql::eval::project_ids(graph, ids, is_edge, &names, &read.proj)?;
+    let mut col = shape_projection(graph, is_edge, &cols, &read)?;
 
     // `is(P)` over a number column NARROWS THE COLUMN, so it is applied here
     // rather than inside the terminals: every arm downstream then sees a column
@@ -2861,20 +2854,6 @@ fn single_key_by_any_dir(bys: &[By]) -> Option<(&str, Option<Order>)> {
 
 fn is_identity_by(bys: &[By]) -> bool {
     bys.first().is_none_or(|b| matches!(b, By::Identity(None)))
-}
-
-/// The terminals over a `values(k)` whose key no element carries — an EMPTY
-/// stream, which each aggregate folds its own way. `sum`/`mean`/`min`/`max` over
-/// nothing is `null`, not `0`.
-fn empty_column_terminal(tail: &[Step]) -> Option<Vec<GVal>> {
-    match tail {
-        [] | [Step::Count(Scope::Local)] => Some(Vec::new()),
-        [Step::Fold] => Some(vec![GVal::list(Vec::new())]),
-        [Step::Count(Scope::Global)] => Some(vec![GVal::Num(0.0)]),
-        [Step::Sum(Scope::Global) | Step::Mean(Scope::Global)] => Some(vec![GVal::Null]),
-        [Step::Min(Scope::Global) | Step::Max(Scope::Global)] => Some(vec![GVal::Null]),
-        _ => None,
-    }
 }
 
 /// A lowered `is(P)` over a number column: the test, plus whether a `NaN` would

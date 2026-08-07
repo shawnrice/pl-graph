@@ -3847,6 +3847,48 @@ pub(crate) fn plan_pattern_ids(
         .collect()
 }
 
+/// Project a bare element column — the frontier a Gremlin LINEAR lowering ends
+/// with, which reaches no pattern plan.
+///
+/// `ScanCols` is `{ n, cols }`, so an id column IS a one-slot frame. This is what
+/// lets the migration serve BOTH of Gremlin's routes: without it the column
+/// terminals stay alive for the linear one and nothing can be deleted.
+pub(crate) fn project_ids(
+    graph: &Graph,
+    ids: &[u32],
+    is_edge: bool,
+    key_names: &[String],
+    proj: &crate::gql::plan::CProjection,
+) -> Option<Vec<Col>> {
+    let ctx = Ctx {
+        params: &[],
+        prop_keys: key_names
+            .iter()
+            .map(|n| (graph.props.keys.get(n), graph.edge_props.keys.get(n)))
+            .collect(),
+        labels: Vec::new(),
+        label_names: &[],
+        unknown_fns: &[],
+        fault: AtomicU8::new(FAULT_NONE),
+        edge_marks_pool: MarksPool::default(),
+        loops: crate::seek::SelfLoops::Twice,
+    };
+    let sc = ScanCols {
+        n: ids.len(),
+        cols: vec![Some(Col::Elems {
+            ids: std::borrow::Cow::Owned(ids.to_vec()),
+            is_edge,
+        })],
+    };
+    let out = project_frame_cols(graph, &ctx, &sc, proj)?;
+
+    if ctx.fault.load(AtomOrdering::Relaxed) != FAULT_NONE {
+        return None;
+    }
+
+    Some(out)
+}
+
 /// Run a compiled PATTERN and project it, in one call, returning columns.
 ///
 /// The seam the Gremlin migration is built on. `plan_pattern_ids` already builds

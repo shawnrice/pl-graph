@@ -37,8 +37,6 @@
 use crate::gql::plan::{compile_program, CAgg, CExpr, CProjection, CReturnItem};
 use crate::gremlin::{Scope, Step};
 
-use super::pattern::Compiled;
-
 /// How the projected columns become Gremlin values.
 ///
 /// The columns are the same either way; what differs is the container, which is
@@ -55,6 +53,15 @@ pub(super) enum Shape {
 pub(super) struct Tail {
     pub proj: CProjection,
     pub shape: Shape,
+    /// The property `values(k)` read, when the output is that column.
+    ///
+    /// Gremlin DROPS a row whose key is absent and KEEPS one whose stored value is
+    /// null. A projection erases which column a null came from, so the shaper has
+    /// to re-ask the store: for a typed column the validity mask says exactly, a
+    /// `Str`/`Temporal` column boxes an absence as null and cannot hold a stored
+    /// one, and a `Mixed`/`Record` column can hold both — so that last case
+    /// DECLINES rather than guessing.
+    pub absent_key: Option<String>,
 }
 
 /// An empty projection to fill in — every field spelled once, here, so the arms
@@ -115,9 +122,7 @@ fn reducer(step: &Step) -> Option<crate::gql::plan::AggFn> {
 /// Compile the steps after a prefix into a projection over its end slot.
 ///
 /// `None` = not expressible; the caller keeps its existing route.
-pub(super) fn tail(c: &Compiled, keys: &mut Vec<String>, rest: &[Step]) -> Option<Tail> {
-    let slot = c.end_slot;
-
+pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option<Tail> {
     match rest {
         // `values(k)` — one value per row off the end of the prefix. The rows
         // whose key is absent are dropped by the CALLER, from the column's own
@@ -135,6 +140,7 @@ pub(super) fn tail(c: &Compiled, keys: &mut Vec<String>, rest: &[Step]) -> Optio
                     false,
                 )]),
                 shape: Shape::Rows,
+                absent_key: Some(ks[0].clone()),
             })
         }
         // `values(k).<sum|min|max|mean>()` — a global aggregate over that column.
@@ -161,6 +167,8 @@ pub(super) fn tail(c: &Compiled, keys: &mut Vec<String>, rest: &[Step]) -> Optio
             Some(Tail {
                 proj,
                 shape: Shape::Scalar,
+                // An aggregate SKIPS nulls itself; there is no row to drop.
+                absent_key: None,
             })
         }
         // `values(k).dedup()` — DISTINCT over the projected column.
@@ -182,6 +190,7 @@ pub(super) fn tail(c: &Compiled, keys: &mut Vec<String>, rest: &[Step]) -> Optio
             Some(Tail {
                 proj,
                 shape: Shape::Rows,
+                absent_key: Some(ks[0].clone()),
             })
         }
         // NOT YET: `order().by(k)`. It compiles, and it sorts WRONG — a sort key
