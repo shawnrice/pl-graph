@@ -2324,6 +2324,17 @@ fn shape_projection(
                 if let Some(mask) = out.valid_mask().map(<[bool]>::to_vec) {
                     out.retain_rows(&mask);
                 }
+
+                // Every surviving row is valid by construction — the invalid ones
+                // were just dropped — so clear the mask rather than carry an
+                // all-true one. Downstream arms that require an UNMASKED column
+                // (the `is(P)` narrowing below, the unboxed numeric terminals)
+                // would otherwise decline a column that has nothing missing, which
+                // is how `values(k).is(P)` kept reaching the old route on a
+                // property some elements lack.
+                if let Col::Num { valid, .. } | Col::Bool { valid, .. } = &mut out {
+                    *valid = None;
+                }
             }
             // Boxed to null per absent row, and these cannot hold a STORED null —
             // that would force `Mixed`.
@@ -2350,6 +2361,24 @@ fn shape_projection(
 
     // `limit`/`skip`/`range`: a window taken AFTER the absent-key drop above, not
     // as part of the GQL projection — see `Tail::page` for why.
+    // `is(P)` NARROWS the column, after the absent-key drop and before any
+    // window — the order `column_terminal` uses. A predicate over anything but a
+    // plain number column runs per value: a `Str`/`Bool`/`Temporal` under a
+    // numeric test is a type FAULT rather than a skipped row, and answering it
+    // here would make the lowering observable. Same rule, one copy.
+    if let Some(p) = &t.filter {
+        let Col::Num { d, valid: None } = &mut out else {
+            return None;
+        };
+        let test = num_test(p)?;
+
+        if test.faults_on_nan && d.iter().any(|x| x.is_nan()) {
+            return None; // the stream faults here; do not answer instead
+        }
+
+        d.retain(|&x| (test.test)(x));
+    }
+
     if let Some((lo, hi)) = t.page {
         out = out.page(lo, hi);
     }

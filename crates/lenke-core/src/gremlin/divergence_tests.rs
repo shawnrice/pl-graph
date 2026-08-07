@@ -6258,6 +6258,16 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         // the case that actually discriminates a row-drop-then-count from a
         // bare frontier count.
         "g.V().out('R').hasLabel('W').values('n').count()",
+        // `values(k).is(P)` — the narrowing arm, with and without a window, on a
+        // dense property and on one absent from a third of rows (where the
+        // absent-key drop has to happen BEFORE the predicate, and the validity
+        // mask has to be cleared afterwards or the arm declines a column with
+        // nothing missing).
+        "g.V().out('R').hasLabel('W').values('n').is(gt(40))",
+        "g.V().out('R').hasLabel('W').values('n').is(lt(10))",
+        "g.V().out('R').hasLabel('W').values('n').is(gt(40)).limit(5)",
+        "g.V().out('R').hasLabel('W').values('m').is(gt(40))",
+        "g.V().out('R').hasLabel('W').values('m').is(gt(40)).range(2, 6)",
         "g.V().out('R').hasLabel('W').values('m').count()",
         "g.V().out('R').hasLabel('W').groupCount().by('n')",
         "g.V().out('R').hasLabel('W').groupCount().by('k')",

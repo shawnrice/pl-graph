@@ -84,6 +84,18 @@ pub(super) struct Tail {
     /// `Limit`/`Skip`/`Range` arms call `Col::page` on what is left — so this
     /// mirrors that ordering exactly instead of the projection's.
     pub page: Option<(usize, usize)>,
+    /// An `is(P)` narrowing the projected VALUE column, applied by the caller
+    /// after the absent-key drop and before any window.
+    ///
+    /// Not put into the plan as a WHERE on the element, though `values(k).is(P)`
+    /// and `WHERE u.k P` select the same rows: an `is(P)` over a non-number column
+    /// is a type FAULT in Gremlin rather than a skipped row, and the shaper is
+    /// where that decision already lives (`num_test`, and its NaN rule). Keeping
+    /// it there means one implementation of the rule, not two that must agree.
+    ///
+    /// Aggregates therefore DECLINE this arm: GQL would fold the column before the
+    /// caller ever sees it, so a filter applied afterwards would be too late.
+    pub filter: Option<crate::gremlin::P>,
     /// The property `order().by(k)` sorts on, when the tail sorts.
     ///
     /// Gremlin's ORDERABILITY is narrower than GQL's: comparing two genuinely
@@ -204,6 +216,7 @@ pub(super) fn tail(
             shape: Shape::Rows,
             absent_key: None,
             page: None,
+            filter: None,
             order_key: None,
         }),
         // `label()` — the element's label, but ONLY for a known EDGE frontier.
@@ -236,6 +249,7 @@ pub(super) fn tail(
             shape: Shape::Rows,
             absent_key: None,
             page: None,
+            filter: None,
             order_key: None,
         }),
         // `values(k)` — one value per row off the end of the prefix. The rows
@@ -256,6 +270,7 @@ pub(super) fn tail(
                 shape: Shape::Rows,
                 absent_key: Some(ks[0].clone()),
                 page: None,
+                filter: None,
                 order_key: None,
             })
         }
@@ -286,6 +301,7 @@ pub(super) fn tail(
                 // An aggregate SKIPS nulls itself; there is no row to drop.
                 absent_key: None,
                 page: None,
+                filter: None,
                 order_key: None,
             })
         }
@@ -310,6 +326,7 @@ pub(super) fn tail(
                 shape: Shape::Rows,
                 absent_key: Some(ks[0].clone()),
                 page: None,
+                filter: None,
                 order_key: None,
             })
         }
@@ -349,6 +366,7 @@ pub(super) fn tail(
                 // the arm this replaces does.
                 absent_key: None,
                 page: None,
+                filter: None,
                 order_key: None,
             })
         }
@@ -404,6 +422,7 @@ pub(super) fn tail(
                 // here either.
                 absent_key: None,
                 page: None,
+                filter: None,
                 order_key: None,
             })
         }
@@ -452,6 +471,37 @@ pub(super) fn tail(
                 // split (see the arm's own comment above).
                 absent_key: Some(ks[0].clone()),
                 page: None,
+                filter: None,
+                order_key: None,
+            })
+        }
+        // `values(k).is(P)` — the projected column, NARROWED. Optionally paged,
+        // in that order: `column_terminal` applies its `is` before handing the tail
+        // on, so a window must see the filtered column, not the raw one.
+        //
+        // This is the shape that keeps `elem_terminal`'s `[Step::Values(keys),
+        // tail @ ..]` arm alive — `values_arm_reachability_probe` walks eight
+        // traversals and this is the only one that reaches it.
+        [Step::Values(ks), Step::Is(p), after @ ..]
+            if ks.len() == 1
+                && matches!(after, [] | [_] if after.first().is_none_or(|s| page_of(s).is_some())) =>
+        {
+            let kr = key_ref(keys, &ks[0]);
+            let page = after.first().and_then(page_of);
+
+            Some(Tail {
+                proj: blank(vec![item(
+                    CExpr::Prop {
+                        var_slot: slot,
+                        key_ref: kr,
+                    },
+                    "v",
+                    false,
+                )]),
+                shape: Shape::Rows,
+                absent_key: Some(ks[0].clone()),
+                page,
+                filter: Some(p.clone()),
                 order_key: None,
             })
         }
@@ -477,6 +527,7 @@ pub(super) fn tail(
                 shape: Shape::Rows,
                 absent_key: Some(ks[0].clone()),
                 page: Some((lo, hi)),
+                filter: None,
                 order_key: None,
             })
         }
@@ -498,6 +549,7 @@ pub(super) fn tail(
                 shape: Shape::List,
                 absent_key: Some(ks[0].clone()),
                 page: None,
+                filter: None,
                 order_key: None,
             })
         }
@@ -540,6 +592,7 @@ pub(super) fn tail(
                 // the row, and it does not page.
                 absent_key: None,
                 page: None,
+                filter: None,
                 order_key: None,
             })
         }
@@ -621,6 +674,7 @@ pub(super) fn tail(
                 // sorted, not filtered), unlike `values(k)`'s drop-on-absent.
                 absent_key: None,
                 page: None,
+                filter: None,
                 order_key: Some(k.clone()),
             })
         }
