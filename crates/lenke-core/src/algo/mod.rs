@@ -24,7 +24,7 @@
 
 use crate::graph::{Graph, Value};
 use crate::json;
-use crate::query::RowSet;
+use crate::rowset::RowSet;
 
 mod centrality;
 mod components;

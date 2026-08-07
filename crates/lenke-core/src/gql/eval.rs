@@ -41,7 +41,7 @@ use crate::value::Col as SharedCol;
 /// keeps element columns in `ScanCols` slots. So the shared type appears here
 /// with its lifetime already discharged.
 type Col = SharedCol<'static>;
-use crate::query::RowSet;
+use crate::rowset::RowSet;
 
 /// A runtime value.
 ///
@@ -4237,7 +4237,7 @@ impl super::ast::Query {
 mod path_value_tests {
     use super::*;
     use crate::ndjson;
-    use crate::query::RowSet;
+    use crate::rowset::RowSet;
 
     // a —KNOWS(e1)→ b —KNOWS(e2)→ c. Dense ids follow NDJSON insertion order, so
     // vertices are 0,1,2 and edges 0,1.

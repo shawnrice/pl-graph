@@ -37,7 +37,7 @@
 use std::fmt::Write as _;
 
 use crate::graph::Value;
-use crate::query::RowSet;
+use crate::rowset::RowSet;
 
 /// Arrow type tag (a minimal subset: every result cell maps to one of these).
 pub const T_FLOAT64: u32 = 1;

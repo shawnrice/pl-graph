@@ -17,7 +17,6 @@
 #[cfg(feature = "_fallible-ffi")]
 use crate::error_codes::ErrorCode;
 use crate::graph::Graph;
-use crate::query;
 
 // ---------- raw-pointer boundary shims ----------
 //
@@ -875,81 +874,6 @@ pub unsafe extern "C" fn lnk_last_write_scope(
     // SAFETY: index_keys_buf writes only through out_len, which this fn's # Safety contract requires be a valid, writable pointer.
     unsafe { index_keys_buf(&scope, out_len) }
 }
-
-/// Parse + run a GQL-subset query, writing the `(count, sum)` signature.
-/// Returns 0 on success, -1 on a parse/null error.
-///
-/// # Safety
-/// `g` valid; `q_ptr`/`q_len` valid UTF-8; out pointers writable.
-#[no_mangle]
-pub unsafe extern "C" fn lnk_query(
-    g: *const Graph,
-    q_ptr: *const u8,
-    q_len: usize,
-    out_count: *mut u64,
-    out_sum: *mut f64,
-    out_checksum: *mut u64,
-) -> i32 {
-    // SAFETY: g is the caller-supplied handle, and the ptr/len the caller-supplied buffer, that this fn's # Safety contract requires be valid (or null -> None).
-    // SAFETY: forwards this fn's # Safety contract for the handle and the ptr/len.
-    let Some((g, q)) = (unsafe { in_r1(g, q_ptr, q_len) }) else {
-        return -1;
-    };
-    let parsed = match query::parse(q) {
-        Ok(p) => p,
-        Err(_) => return -1,
-    };
-    let r = parsed.run(g);
-    // SAFETY: the caller's # Safety contract requires out_count be a valid, writable pointer.
-    unsafe { *out_count = r.count };
-    // SAFETY: the caller's # Safety contract requires out_sum be a valid, writable pointer.
-    unsafe { *out_sum = r.sum };
-    // SAFETY: the caller's # Safety contract requires out_checksum be a valid, writable pointer.
-    unsafe { *out_checksum = r.checksum };
-    0
-}
-
-/// Run many queries (newline-joined) in ONE crossing — amortizes the per-call
-/// FFI tax. Results are written into the caller's `count`/`sum`/`checksum`
-/// arrays (each sized to the query count). Returns the number run, or -1.
-///
-/// # Safety
-/// `g` valid; `q_ptr`/`q_len` valid UTF-8; out arrays sized to the number of
-/// newline-separated queries.
-#[no_mangle]
-pub unsafe extern "C" fn lnk_query_batch(
-    g: *const Graph,
-    q_ptr: *const u8,
-    q_len: usize,
-    out_count: *mut u64,
-    out_sum: *mut f64,
-    out_checksum: *mut u64,
-) -> i64 {
-    // SAFETY: g is the caller-supplied handle, and the ptr/len the caller-supplied buffer, that this fn's # Safety contract requires be valid (or null -> None).
-    // SAFETY: forwards this fn's # Safety contract for the handle and the ptr/len.
-    let Some((g, text)) = (unsafe { in_r1(g, q_ptr, q_len) }) else {
-        return -1;
-    };
-    let mut i = 0isize;
-    for line in text.split('\n') {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let r = match query::parse(line) {
-            Ok(p) => p.run(g),
-            Err(_) => return -1,
-        };
-        // SAFETY: index i < the run count, so out_count.offset(i) is in-bounds of the caller-provided output array (# Safety contract), and the slot is writable.
-        unsafe { *out_count.offset(i) = r.count };
-        // SAFETY: index i < the run count, so out_sum.offset(i) is in-bounds of the caller-provided output array (# Safety contract), and the slot is writable.
-        unsafe { *out_sum.offset(i) = r.sum };
-        // SAFETY: index i < the run count, so out_checksum.offset(i) is in-bounds of the caller-provided output array (# Safety contract), and the slot is writable.
-        unsafe { *out_checksum.offset(i) = r.checksum };
-        i += 1;
-    }
-    i as i64
-}
-
 /// Decode the optional params-JSON argument shared by the query entry points.
 /// A null/empty pointer means "no params". On a decode failure the last-error
 /// report is set and `Err(())` is returned.
@@ -1087,8 +1011,7 @@ unsafe fn decode_params(p_ptr: *const u8, p_len: usize) -> Result<crate::gql::ev
 /// already-parsed `$name` slots at execute time — they never touch the parser,
 /// which is the injection-safety contract of the whole params surface.
 ///
-/// This is the row-returning counterpart to `lnk_query` (which only yields the
-/// `(count, sum, checksum)` benchmark fingerprint). JSON is the carrier so the
+/// JSON is the carrier so the
 /// same symbol serves both bun:ffi and a future wasm-bindgen binding with one
 /// buffer crossing instead of per-cell marshalling. The graph handle is `*mut`
 /// because a query may mutate it (`INSERT`/`SET`/`REMOVE`/`DELETE`).

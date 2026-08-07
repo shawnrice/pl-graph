@@ -12863,3 +12863,45 @@ fn control_characters_serialize_the_way_javascript_does() {
         r#"{"columns":["s"],"rows":[["\u0001"]]}"#
     );
 }
+
+/// `-0.0` and `0.0` are ONE grouping key, and both signs really do reach the
+/// column.
+///
+/// Ported here 2026-08-07 from `query.rs`, which held it as an agreement test
+/// between the real engine and a second, hand-rolled one that existed to produce
+/// a benchmark fingerprint. That engine keyed on raw bits and gave two rows where
+/// this one gives one — two implementations in one crate disagreeing on a settled
+/// decision, which is the argument for having deleted it rather than fixing it
+/// again. The half that survives is the half about the engine users reach.
+///
+/// The `assert_ne!` on the bit patterns is load-bearing: without it the test
+/// passes just as well on a fixture where the two signs never both got stored.
+#[test]
+fn signed_zeros_are_one_group() {
+    let lines = [
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"z":0.0}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"z":-0.0}}"#,
+    ]
+    .join("\n");
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+    let kid = g.props.keys.get("z").expect("the key exists");
+    let bits: Vec<u64> = (0..2)
+        .map(
+            |i| match crate::value::Value::from_column(&g.props, kid, i, &g.strs, false) {
+                crate::value::Value::Num(x) => x.to_bits(),
+                other => panic!("expected a number, got {other:?}"),
+            },
+        )
+        .collect();
+
+    assert_ne!(bits[0], bits[1], "both zero signs must reach the column");
+
+    assert_eq!(
+        crate::gql::parse("MATCH (u:N) RETURN DISTINCT u.z")
+            .expect("parses")
+            .execute(&mut g, &crate::gql::eval::Params::new())
+            .expect("runs")
+            .nrows,
+        1
+    );
+}

@@ -1314,7 +1314,7 @@ impl Graph {
     /// boolean `false`. A `true`, a `null`, a non-boolean value (number/string/
     /// list/map/temporal), or an empty result set all HOLD. Byte-identical to the
     /// TS `invariantViolated` (`cell === false`).
-    fn invariant_violated(rows: &crate::query::RowSet) -> bool {
+    fn invariant_violated(rows: &crate::rowset::RowSet) -> bool {
         rows.data.iter().any(|v| matches!(v, Value::Bool(false)))
     }
 

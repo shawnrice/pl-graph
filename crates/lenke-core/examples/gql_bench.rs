@@ -181,23 +181,6 @@ fn main() {
         percall_us - prepared_us
     );
 
-    // Materialization overhead: the GQL engine builds a binding per matched row;
-    // the fingerprint engine folds during the walk (no per-row alloc). Same count.
-    let fq = "MATCH (a:Person) RETURN count(*)";
-    let fp = lenke_core::query::parse(fq).unwrap();
-    let t = Instant::now();
-    for _ in 0..200 {
-        let _ = fp.run(&g);
-    }
-    let fp_us = t.elapsed().as_secs_f64() * 1e6 / 200.0;
-    let (gql_us, _) = bench(&mut g, "MATCH (a:Person) RETURN count(*) AS c", 200);
-    println!("\ncount(*) over {N} Person — materialization overhead:");
-    println!("  fingerprint (no per-row alloc) : {fp_us:.1} us");
-    println!(
-        "  gql (binding per row)          : {gql_us:.1} us   ({:.1}x)",
-        gql_us / fp_us
-    );
-
     // Arrow result encoding: typed `execute_arrow` (numeric/bool columns kept as
     // f64/bool, no Val/Value boxing) vs the RowSet path (execute → to_arrow).
     println!("\nArrow result encoding (typed vs RowSet→arrow):");

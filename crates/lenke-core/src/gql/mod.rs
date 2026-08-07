@@ -5,7 +5,7 @@
 //! Layers mirror the TS source: [`ast`] (the contract), [`lexer`], [`parser`],
 //! the lowered IR in [`plan`], and the evaluator/executor in [`eval`].
 //!
-//! Two entry points, both returning a [`crate::query::RowSet`]:
+//! Two entry points, both returning a [`crate::rowset::RowSet`]:
 //! - [`prepare`] → a [`Prepared`] plan: lex + parse + lower once, then execute
 //!   many times with different params (slotted positionally) against any graph.
 //! - [`parse`] + [`Query::execute`] — the one-shot convenience (lowers each run).
