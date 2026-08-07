@@ -5557,7 +5557,6 @@ fn branch_lowering_cost_probe() {
 #[test]
 #[ignore = "probe"]
 fn arm_audit() {
-    use std::sync::atomic::Ordering::Relaxed;
     let mut lines = String::new();
     for i in 0..20_000usize {
         let l = if i % 10 == 0 {
@@ -5666,7 +5665,6 @@ fn arm_audit() {
 #[test]
 #[ignore = "probe"]
 fn route_audit() {
-    use std::sync::atomic::Ordering::Relaxed;
     let mut lines = String::new();
     for i in 0..50_000usize {
         let l = if i % 10 == 0 {
@@ -5762,7 +5760,6 @@ fn route_audit() {
 /// the rest. That is a perf-vs-agreement decision, not a fix to make quietly.
 #[test]
 fn the_pattern_route_reorders_rows() {
-    use std::sync::atomic::Ordering::Relaxed;
     let mut g = modern();
     let q = "g.V().out('CREATED').hasLabel('SOFTWARE').values('name')";
 
@@ -6070,7 +6067,6 @@ fn is_labeled_is_a_column_walk() {
 /// streamed spelling.
 #[test]
 fn lowered_select_with_modulators_agrees_with_the_stream() {
-    use std::sync::atomic::Ordering::Relaxed;
     let mut g = modern();
 
     for q in [
@@ -6196,7 +6192,6 @@ fn what_the_unvectorized_expressions_cost() {
 /// arm that silently declined, which has happened twice on this branch.
 #[test]
 fn the_migration_route_agrees_with_the_route_it_replaces() {
-    use std::sync::atomic::Ordering::Relaxed;
     let mut lines = String::new();
     for i in 0..2_000usize {
         let l = if i % 10 == 0 {

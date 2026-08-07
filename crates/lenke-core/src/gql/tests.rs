@@ -12935,8 +12935,6 @@ fn signed_zeros_are_one_group() {
 #[test]
 #[ignore = "probe"]
 fn migration_route_cost() {
-    use std::sync::atomic::Ordering::Relaxed;
-
     let mut lines = String::new();
     for i in 0..50_000usize {
         let l = if i % 10 == 0 {

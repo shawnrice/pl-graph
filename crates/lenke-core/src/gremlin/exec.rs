@@ -1740,6 +1740,60 @@ fn col_terminal_tagged(
     }
 }
 
+// Turns the whole column path off, so a query can be run BOTH ways and the
+// lowering priced against the stream it replaces.
+//
+// Test-only, and the reason it exists rather than a `fold().unfold()` trick:
+// that idiom forces the stream by giving `fold()` a tail, which cannot price the
+// `fold` or `unfold` arms themselves, and changes the result shape. A switch
+// prices every arm with the query left exactly as written.
+// `arm_audit` is the consumer; see its output before deleting any arm.
+#[cfg(test)]
+// THREAD-LOCAL, not a static: libtest runs tests in PARALLEL and these switches
+// are flipped mid-test, so a process-global one lets an unrelated test observe a
+// route being disabled and fail intermittently. That is not hypothetical — the
+// migration agreement test flaked exactly once that way, passed standalone, and
+// looked like a real divergence. A thread-local is per test.
+thread_local! {
+    pub static LOWERING_OFF: Cell<bool> = const { Cell::new(false) };
+}
+
+// Turns off ONLY the pattern route (`gremlin::pattern`), leaving the linear
+// column path on, so the planner's own contribution can be priced apart from
+// the column arms'. Test-only, like [`LOWERING_OFF`].
+#[cfg(test)]
+thread_local! {
+    pub static PATTERN_OFF: Cell<bool> = const { Cell::new(false) };
+}
+
+// Whether the column path is disabled for this run — always `false` outside
+// tests, where it compiles to a constant the optimizer removes.
+#[inline]
+fn lowering_off() -> bool {
+    #[cfg(test)]
+    {
+        LOWERING_OFF.with(Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+// Whether the pattern route is disabled for this run — always `false` outside
+// tests.
+#[inline]
+fn pattern_off() -> bool {
+    #[cfg(test)]
+    {
+        PATTERN_OFF.with(Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// `V()/E() … <terminal>` answered from the IR, with no traverser built for any
 /// of the 200k rows these used to allocate one for.
 ///
@@ -1770,60 +1824,6 @@ fn col_terminal_tagged(
 /// `Arc<str>` PER EDGE, which is 60k allocation pairs that the frontier walk
 /// cannot remove. Interning edge ids the way vertex ids already are is the
 /// change that would move it, and it is a storage change, not a planning one.
-/// Turns the whole column path off, so a query can be run BOTH ways and the
-/// lowering priced against the stream it replaces.
-///
-/// Test-only, and the reason it exists rather than a `fold().unfold()` trick:
-/// that idiom forces the stream by giving `fold()` a tail, which cannot price the
-/// `fold` or `unfold` arms themselves, and changes the result shape. A switch
-/// prices every arm with the query left exactly as written.
-/// `arm_audit` is the consumer; see its output before deleting any arm.
-#[cfg(test)]
-/// THREAD-LOCAL, not a static: libtest runs tests in PARALLEL and these switches
-/// are flipped mid-test, so a process-global one lets an unrelated test observe a
-/// route being disabled and fail intermittently. That is not hypothetical — the
-/// migration agreement test flaked exactly once that way, passed standalone, and
-/// looked like a real divergence. A thread-local is per test.
-thread_local! {
-    pub static LOWERING_OFF: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Turns off ONLY the pattern route (`gremlin::pattern`), leaving the linear
-/// column path on, so the planner's own contribution can be priced apart from
-/// the column arms'. Test-only, like [`LOWERING_OFF`].
-#[cfg(test)]
-thread_local! {
-    pub static PATTERN_OFF: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Whether the column path is disabled for this run — always `false` outside
-/// tests, where it compiles to a constant the optimizer removes.
-#[inline]
-fn lowering_off() -> bool {
-    #[cfg(test)]
-    {
-        LOWERING_OFF.with(Cell::get)
-    }
-    #[cfg(not(test))]
-    {
-        false
-    }
-}
-
-/// Whether the pattern route is disabled for this run — always `false` outside
-/// tests.
-#[inline]
-fn pattern_off() -> bool {
-    #[cfg(test)]
-    {
-        PATTERN_OFF.with(Cell::get)
-    }
-    #[cfg(not(test))]
-    {
-        false
-    }
-}
-
 fn try_values(graph: &Graph, steps: &[Step]) -> Option<Vec<GVal>> {
     if lowering_off() {
         return None;
@@ -2158,10 +2158,10 @@ fn fanout(graph: &Graph, ids: &[u32], is_edge: bool, steps: &[Step]) -> Option<F
     Some(Fanout { vals, bounds })
 }
 
-/// Turns the migration route off, so a traversal can be run through the route it
-/// is REPLACING (the column terminals, still on the pattern plan) rather than
-/// through the stream. Comparing against the stream instead compares two
-/// different enumeration orders and reports permitted reordering as a failure.
+// Turns the migration route off, so a traversal can be run through the route it
+// is REPLACING (the column terminals, still on the pattern plan) rather than
+// through the stream. Comparing against the stream instead compares two
+// different enumeration orders and reports permitted reordering as a failure.
 #[cfg(test)]
 thread_local! {
     pub static MIGRATE_OFF: Cell<bool> = const { Cell::new(false) };
@@ -2179,8 +2179,8 @@ fn migrate_off() -> bool {
     }
 }
 
-/// How many traversals the migration route answered — test-only, so the arms it
-/// replaces can be shown to be genuinely unreachable before they are deleted.
+// How many traversals the migration route answered — test-only, so the arms it
+// replaces can be shown to be genuinely unreachable before they are deleted.
 #[cfg(test)]
 thread_local! {
     pub static MIGRATED: Cell<usize> = const { Cell::new(0) };
