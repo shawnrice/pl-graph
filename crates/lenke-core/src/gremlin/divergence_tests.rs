@@ -6457,3 +6457,198 @@ fn values_count_declines_on_a_mixed_column_with_a_stored_null() {
     assert_eq!(via_gql, vec![GVal::Num(3.0)]);
     assert_eq!(via_gql, streamed);
 }
+
+/// Whether `exec.rs::elem_terminal`'s `[Step::Values(keys), tail @ ..]` arm —
+/// `column_terminal`, its ONE call site — is still reachable, checked
+/// EMPIRICALLY rather than by reasoning about the peel machinery.
+///
+/// `to_gql::tail` compiles a bare `values(k)` and several of its modulators
+/// (`dedup`, paging, `fold`, a reducer), and `col_terminal_tagged` retries
+/// that translation at EVERY peel (`dedup()`, `barrier()`, the pagers,
+/// an unread `as()`) — not just at the entry — so a peelable step in front of
+/// `values(k)` does not by itself keep this arm alive. What DOES: a tag read
+/// (`select` after `as`), which the whole-traversal migration declines up
+/// front (`run_collect`'s `c.tags.is_empty()` guard), and a frontier that is
+/// no longer `Col::Elems` by the time `values(k)` runs (`fold().unfold()`
+/// reboxes into `Col::Gen`, which the retry's `if let Col::Elems { .. } = &col`
+/// does not match).
+///
+/// `COLUMN_TERMINAL_HIT` is a raw entry counter on `column_terminal` itself —
+/// the same "did the OLD route actually run" question `MIGRATED` answers for
+/// the new one, kept separate so a case that fires NEITHER (declining to the
+/// stream entirely) is visible instead of silently passing.
+#[test]
+fn values_arm_reachability_probe() {
+    let mut lines = String::new();
+    for i in 0..500usize {
+        let l = if i % 10 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{}}}}}\n",
+            i % 37
+        ));
+    }
+    for i in 0..500usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"edge\",\"id\":\"e{i}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{\"w\":{i}}}}}\n",
+            (i * 31 + 1) % 500
+        ));
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    let shapes: &[(&str, &str)] = &[
+        (
+            "baseline (no peel)",
+            "g.V().out('R').hasLabel('W').values('n')",
+        ),
+        (
+            "dedup() in front",
+            "g.V().out('R').hasLabel('W').dedup().values('n')",
+        ),
+        (
+            "barrier() in front",
+            "g.V().out('R').hasLabel('W').barrier().values('n')",
+        ),
+        (
+            "limit() in front",
+            "g.V().out('R').hasLabel('W').limit(2).values('n')",
+        ),
+        (
+            "tagged path (select)",
+            "g.V().as('x').out('R').select('x').values('n')",
+        ),
+        (
+            "post-fold (fold().unfold())",
+            "g.V().out('R').hasLabel('W').fold().unfold().values('n')",
+        ),
+        ("edge frontier", "g.E().hasLabel('R').values('w')"),
+        // Not in the brief, but the case `to_gql::tail` genuinely cannot
+        // express: an `is(P)` filter chained straight off `values(k)`, which
+        // `column_terminal` handles ITSELF (splitting the predicate off
+        // before delegating the bare read) rather than through `to_gql::tail`.
+        (
+            "values().is() filter",
+            "g.V().out('R').hasLabel('W').values('n').is(gt(20))",
+        ),
+    ];
+
+    println!();
+    for (label, q) in shapes {
+        super::exec::MIGRATED.with(|c| c.set(0));
+        super::exec::COLUMN_TERMINAL_HIT.with(|c| c.set(0));
+
+        let out = super::parse::parse(q)
+            .unwrap_or_else(|e| panic!("`{q}` parses: {e}"))
+            .run(&mut g);
+
+        let migrated = super::exec::MIGRATED.with(std::cell::Cell::get);
+        let old_arm = super::exec::COLUMN_TERMINAL_HIT.with(std::cell::Cell::get);
+        let route = if migrated > 0 {
+            "MIGRATED"
+        } else if old_arm > 0 {
+            "OLD_ARM"
+        } else {
+            "NEITHER (third route / stream)"
+        };
+
+        println!(
+            "PROBE migrated={migrated} column_terminal={old_arm} rows={} route={route} [{label}] {q}",
+            out.len()
+        );
+    }
+}
+
+/// The headline comparison for the Gremlin migration:
+/// `g.V().out('R').hasLabel('W').values('n')` against the identical GQL
+/// statement, and against `MIGRATE_OFF` (the `elem_terminal`/`column_terminal`
+/// route the migration replaces).
+///
+/// Both Gremlin routes already avoid the `RowSet` box GQL's own text-execute
+/// path pays for: `column_terminal` calls `to_gql::tail` itself
+/// (unconditionally, not gated on `migrate_off`) for the bare `values(k)`
+/// read, so `MIGRATE_OFF` does not fall back to a naive stream here — it
+/// falls back to a route that already shares the same columnar machinery,
+/// which is why the two Gremlin numbers read close together while both beat
+/// the `RowSet` number.
+///
+/// Run with:
+///
+/// ```text
+/// cargo test --release -- --ignored --nocapture headline_query_timing_probe
+/// ```
+#[test]
+#[ignore = "timing"]
+fn headline_query_timing_probe() {
+    let mut lines = String::new();
+    for i in 0..150_000usize {
+        let l = if i % 10 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{}}}}}\n",
+            i % 97
+        ));
+    }
+    for i in 0..150_000usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"edge\",\"id\":\"e{i}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{}}}}\n",
+            (i * 31 + 1) % 150_000
+        ));
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    let q = "g.V().out('R').hasLabel('W').values('n')";
+    let gq = "MATCH ()-[:R]->(b:W) RETURN b.n AS n";
+
+    // migrated route (current default)
+    let mut best_migrated = f64::MAX;
+    for _ in 0..7 {
+        let t = std::time::Instant::now();
+        let out = super::parse::parse(q).expect("parses").run(&mut g);
+        let secs = t.elapsed().as_secs_f64();
+        std::hint::black_box(out.len());
+        if secs < best_migrated {
+            best_migrated = secs;
+        }
+    }
+
+    // MIGRATE_OFF: the route being replaced (elem_terminal/column_terminal)
+    super::exec::MIGRATE_OFF.with(|c| c.set(true));
+    let mut best_old = f64::MAX;
+    for _ in 0..7 {
+        let t = std::time::Instant::now();
+        let out = super::parse::parse(q).expect("parses").run(&mut g);
+        let secs = t.elapsed().as_secs_f64();
+        std::hint::black_box(out.len());
+        if secs < best_old {
+            best_old = secs;
+        }
+    }
+    super::exec::MIGRATE_OFF.with(|c| c.set(false));
+
+    // The identical GQL statement.
+    let mut best_gql = f64::MAX;
+    let plan = crate::gql::parse(gq).unwrap_or_else(|e| panic!("`{gq}`: {e}"));
+    for _ in 0..7 {
+        let t = std::time::Instant::now();
+        let rs = plan
+            .execute(&mut g, &crate::gql::eval::Params::new())
+            .unwrap_or_else(|e| panic!("`{gq}`: {e}"));
+        let secs = t.elapsed().as_secs_f64();
+        std::hint::black_box(rs.rows().count());
+        if secs < best_gql {
+            best_gql = secs;
+        }
+    }
+
+    println!();
+    println!(
+        "PROBE headline: gremlin(migrated) {:>8.4}ms  gremlin(MIGRATE_OFF) {:>8.4}ms  gql(RowSet) {:>8.4}ms  [{q}]",
+        best_migrated * 1e3, best_old * 1e3, best_gql * 1e3
+    );
+}

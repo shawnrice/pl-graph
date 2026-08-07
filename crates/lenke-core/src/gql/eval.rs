@@ -4026,16 +4026,12 @@ pub(crate) fn run_pattern_projection(
         loops: crate::seek::SelfLoops::Twice,
     };
     let sc = scan::build_scan(graph, &ctx, path, scope_len, None, None, None)?;
-    let out = project_frame_cols(graph, &ctx, &sc, proj)?;
 
-    // A recorded data exception cannot be returned from here, and answering a
-    // query that must fault would be worse than declining. The caller's own path
-    // runs and surfaces it.
-    if ctx.fault.load(AtomOrdering::Relaxed) != FAULT_NONE {
-        return None;
-    }
-
-    Some(out)
+    // The columnar exit `vectorized_linear` already threads a whole clause
+    // SEQUENCE through — shared rather than re-projecting and re-checking the
+    // fault flag here, which is exactly the second implementation this
+    // function's own doc comment says Gremlin should not have to keep.
+    finish_linear_cols(graph, &ctx, &sc, proj)
 }
 
 // --- index-seeded scanning, expansion, and vectorized aggregation ---

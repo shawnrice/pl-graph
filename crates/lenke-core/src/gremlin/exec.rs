@@ -2194,6 +2194,17 @@ thread_local! {
     pub static MIGRATED: Cell<usize> = const { Cell::new(0) };
 }
 
+// How many times `column_terminal` — `elem_terminal`'s
+// `[Step::Values(keys), tail @ ..]` arm, its one call site — actually ran.
+// Test-only probe for whether that arm is still reachable now that
+// `to_gql::tail` covers `values(k)` and `col_terminal_tagged` retries the
+// translation at every peel (`dedup()`, `barrier()`, the pagers): see
+// `values_arm_reachability_probe`.
+#[cfg(test)]
+thread_local! {
+    pub static COLUMN_TERMINAL_HIT: Cell<usize> = const { Cell::new(0) };
+}
+
 /// Whether property `key`'s stored column is incapable of holding a STORED
 /// null next to an ABSENT row — the one fact both `order_key` and a
 /// `values(k).count()` need before trusting `Val::Null`/`GVal::Null` to mean
@@ -2847,6 +2858,9 @@ fn column_terminal(
     keys: &[String],
     tail: &[Step],
 ) -> Option<Vec<GVal>> {
+    #[cfg(test)]
+    COLUMN_TERMINAL_HIT.with(|c| c.set(c.get() + 1));
+
     // One key only: `values()` needs a per-element key list, and a multi-key call
     // interleaves columns per element rather than reading one.
     let [key] = keys else {
