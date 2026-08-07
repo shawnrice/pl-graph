@@ -400,7 +400,13 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
     // constraint the rewritten pattern does not carry.
     if let [Step::V(ids), Step::Match(plans), rest @ ..] = t.steps.as_slice() {
         if ids.is_empty() && !needs_path(rest) {
-            if let Some(out) = match_via_pattern(graph, ctx, plans, rest) {
+            let patterned = if lowering_off() {
+                None
+            } else {
+                match_via_pattern(graph, ctx, plans, rest)
+            };
+
+            if let Some(out) = patterned {
                 return out;
             }
         }
@@ -1658,7 +1664,35 @@ fn col_terminal_tagged(
 /// `Arc<str>` PER EDGE, which is 60k allocation pairs that the frontier walk
 /// cannot remove. Interning edge ids the way vertex ids already are is the
 /// change that would move it, and it is a storage change, not a planning one.
+/// Turns the whole column path off, so a query can be run BOTH ways and the
+/// lowering priced against the stream it replaces.
+///
+/// Test-only, and the reason it exists rather than a `fold().unfold()` trick:
+/// that idiom forces the stream by giving `fold()` a tail, which cannot price the
+/// `fold` or `unfold` arms themselves, and changes the result shape. A switch
+/// prices every arm with the query left exactly as written.
+/// `arm_audit` is the consumer; see its output before deleting any arm.
+#[cfg(test)]
+pub static LOWERING_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the column path is disabled for this run — always `false` outside
+/// tests, where it compiles to a constant the optimizer removes.
+#[inline]
+fn lowering_off() -> bool {
+    #[cfg(test)]
+    {
+        LOWERING_OFF.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 fn try_values(graph: &Graph, steps: &[Step]) -> Option<Vec<GVal>> {
+    if lowering_off() {
+        return None;
+    }
     let (ids, rest, is_edge) = lowered_ids(graph, steps)?;
 
     column_paths(graph, &ids, is_edge, rest)

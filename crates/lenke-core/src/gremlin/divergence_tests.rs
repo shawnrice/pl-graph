@@ -5530,3 +5530,117 @@ fn branch_lowering_cost_probe() {
         }
     }
 }
+
+/// Every arm of the column path, priced against the stream it replaces.
+///
+/// The question this answers is "which of these lowerings actually matter?" —
+/// asked because the branch that added them grew the engine by thousands of
+/// lines, and an arm that buys nothing is pure cost. Run 2026-08-07 over 20k
+/// vertices / 60k edges, the answer was ALL of them: the worst is 1.9x
+/// (`where`/`not`, which the stream already short-circuits per vertex) and the
+/// rest run 2.1x to 353x. There is no dead lowering to remove here, and that is
+/// worth knowing before someone deletes one to save lines.
+///
+/// Add a row when adding an arm. A row near 1.0x means the arm is not paying for
+/// itself and should come out.
+#[test]
+#[ignore = "probe"]
+fn arm_audit() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut lines = String::new();
+    for i in 0..20_000usize {
+        let l = if i % 10 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{},\"k\":\"key{i:06}\"}}}}\n",
+            i % 97
+        ));
+    }
+    let mut e = 0;
+    for i in 0..20_000usize {
+        for d in 0..3usize {
+            lines.push_str(&format!(
+                "{{\"type\":\"edge\",\"id\":\"e{e}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{\"w\":{d}}}}}\n",
+                (i * 31 + d * 7 + 1) % 20_000
+            ));
+            e += 1;
+        }
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    let cases: &[(&str, &str)] = &[
+        ("[] bare frontier", "g.V().hasLabel('V')"),
+        ("Fold", "g.V().fold()"),
+        ("Count(Global)", "g.V().hasLabel('V').count()"),
+        ("Count(Local)", "g.V().hasLabel('V').count(local)"),
+        ("GroupCount identity", "g.V().groupCount()"),
+        ("Barrier/Identity", "g.V().identity().count()"),
+        ("As unread", "g.V().as('x').count()"),
+        ("As + select", "g.V().as('x').select('x')"),
+        ("Unfold", "g.V().values('n').unfold().count()"),
+        ("Limit", "g.V().limit(5)"),
+        ("Skip", "g.V().skip(5).count()"),
+        ("Range", "g.V().range(2, 7)"),
+        ("Tail", "g.V().tail(5)"),
+        ("Id", "g.V().id()"),
+        ("Label", "g.V().label()"),
+        (
+            "Group by+reduce",
+            "g.V().group().by('n').by(values('n').sum())",
+        ),
+        ("Project", "g.V().project('a', 'b').by('n').by('k')"),
+        ("OutV/InV", "g.E().inV()"),
+        ("BothV", "g.E().bothV()"),
+        ("ElementMap", "g.V().elementMap()"),
+        ("Values", "g.V().values('n')"),
+        ("GroupCount by key", "g.V().groupCount().by('n')"),
+        ("Union", "g.V().union(out('R'), values('n'))"),
+        ("Local", "g.V().local(out('R'))"),
+        ("Coalesce", "g.V().coalesce(out('R'), values('n'))"),
+        ("Optional", "g.V().optional(out('R'))"),
+        (
+            "Choose",
+            "g.V().choose(hasLabel('W'), out('R'), values('n'))",
+        ),
+        ("Where", "g.V().where(__.out('R')).count()"),
+        ("Not", "g.V().not(__.out('R')).count()"),
+        ("Dedupe", "g.V().values('n').dedup()"),
+        ("Order", "g.V().order().by('n').limit(10)"),
+    ];
+
+    println!(
+        "{:<22} {:>10} {:>10} {:>7}",
+        "arm", "lowered", "stream", "x"
+    );
+    for (name, q) in cases {
+        let (mut lo, mut st) = (f64::MAX, f64::MAX);
+        let mut same = true;
+        for _ in 0..5 {
+            super::exec::LOWERING_OFF.store(false, Relaxed);
+            let p = super::parse::parse(q).expect("parses");
+            let t = std::time::Instant::now();
+            let a = p.run(&mut g);
+            lo = lo.min(t.elapsed().as_secs_f64() * 1000.0);
+
+            super::exec::LOWERING_OFF.store(true, Relaxed);
+            let p2 = super::parse::parse(q).expect("parses");
+            let t2 = std::time::Instant::now();
+            let b = p2.run(&mut g);
+            st = st.min(t2.elapsed().as_secs_f64() * 1000.0);
+            same &= a == b;
+        }
+        super::exec::LOWERING_OFF.store(false, Relaxed);
+        println!(
+            "{name:<22} {lo:>9.3}ms {st:>9.3}ms {:>6.1}x{}",
+            st / lo,
+            if same {
+                ""
+            } else {
+                "   *** DIFFERENT RESULT ***"
+            }
+        );
+    }
+}

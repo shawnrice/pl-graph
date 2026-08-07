@@ -113,12 +113,6 @@ impl P {
     pub fn containing(s: &str) -> Self {
         Self::Containing(s.to_string())
     }
-    pub fn ending_with(s: &str) -> Self {
-        Self::EndingWith(s.to_string())
-    }
-    pub fn not_containing(s: &str) -> Self {
-        Self::NotContaining(s.to_string())
-    }
     pub fn regex(s: &str) -> Self {
         Self::Regex(s.to_string())
     }

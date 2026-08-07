@@ -126,35 +126,6 @@ impl Graph {
         None
     }
 
-    /// If setting `vi.key = value` would break a unique constraint on one of
-    /// `vi`'s labels, the offending `(label, existing vertex)`.
-    pub fn unique_conflict_on_set(
-        &self,
-        vi: u32,
-        key: &str,
-        value: &Value,
-    ) -> Option<(String, u32)> {
-        for (label, keys) in &self.v_unique {
-            if !keys.iter().any(|k| k == key) {
-                continue;
-            }
-            let Some(lid) = self.labels.get(label) else {
-                continue;
-            };
-            if !self.vlabels[vi as usize].contains(&lid) {
-                continue;
-            }
-            if let Some(existing) = self
-                .vertices_with_label_value(label, key, value)
-                .into_iter()
-                .find(|&v| v != vi)
-            {
-                return Some((label.clone(), existing));
-            }
-        }
-        None
-    }
-
     // --- required constraints -------------------------------------------------
     // Every live vertex carrying `label` must hold a present, non-null value for
     // each required `key`. Enforced in the write path (INSERT/SET/REMOVE) like
@@ -185,19 +156,9 @@ impl Graph {
         Ok(())
     }
 
-    /// Drop a required constraint. Idempotent.
-    pub fn drop_required_constraint(&mut self, label: &str, key: &str) {
-        keyset_drop(&mut self.v_required, label, key);
-    }
-
     /// Property keys required for `label` (sorted; empty if none).
     pub fn required_keys(&self, label: &str) -> &[String] {
         keyset_get(&self.v_required, label)
-    }
-
-    /// True iff `(label, key)` carries a required constraint.
-    pub fn has_required_constraint(&self, label: &str, key: &str) -> bool {
-        keyset_has(&self.v_required, label, key)
     }
 
     /// Every declared required constraint as sorted `(label, key)` pairs.
@@ -244,39 +205,6 @@ impl Graph {
             }
         }
         ks
-    }
-
-    /// True iff `key` is required by a label currently on vertex `vi` (so it can't
-    /// be removed or set to null).
-    pub fn is_required_key(&self, vi: u32, key: &str) -> bool {
-        let carries = |label: &str| {
-            self.labels
-                .get(label)
-                .is_some_and(|lid| self.vlabels[vi as usize].contains(&lid))
-        };
-        for (label, keys) in &self.v_required {
-            if keys.iter().any(|k| k == key) && carries(label) {
-                return true;
-            }
-        }
-        // A scalar `NOT NULL` type constraint makes the key required too.
-        for (label, keys) in &self.v_type_not_null {
-            if keys.contains(key) && carries(label) {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// If adding `label` to vertex `vi` would violate a required key the vertex
-    /// lacks (absent or null), that key; else `None`.
-    pub fn required_missing_for_label(&self, vi: u32, label: &str) -> Option<String> {
-        for key in self.effective_required_keys(label) {
-            if matches!(self.props.value(vi as usize, key, &self.strs), Value::Null) {
-                return Some(key.to_string());
-            }
-        }
-        None
     }
 
     // --- type constraints -----------------------------------------------------
@@ -552,11 +480,6 @@ impl Graph {
         Ok(())
     }
 
-    /// Drop an edge required constraint. Idempotent.
-    pub fn drop_edge_required_constraint(&mut self, etype: &str, key: &str) {
-        keyset_drop(&mut self.e_required, etype, key);
-    }
-
     /// Property keys required for edge type `etype` (sorted; empty if none).
     pub fn edge_required_keys(&self, etype: &str) -> &[String] {
         keyset_get(&self.e_required, etype)
@@ -697,17 +620,6 @@ impl Graph {
     /// The declared type for edge `(edge_type, key)`, or `None`.
     pub fn edge_type_constraint(&self, etype: &str, key: &str) -> Option<PropType> {
         self.e_type_constraints.get(etype)?.get(key).copied()
-    }
-
-    /// Every declared edge type constraint as sorted `(edge_type, key)` pairs.
-    pub fn edge_type_constraints(&self) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = self
-            .e_type_constraints
-            .iter()
-            .flat_map(|(t, ks)| ks.keys().map(move |k| (t.clone(), k.clone())))
-            .collect();
-        out.sort();
-        out
     }
 
     /// The first `(edge_type, key)` a new edge with these `etypes`/`props` would
@@ -1457,10 +1369,6 @@ impl Graph {
                 .unwrap_or(&[]),
         )
     }
-    /// Cardinality of a vertex equality seek (for cardinality-based seed selection).
-    pub fn count_by_prop(&self, key: &str, value: &IdxKey) -> Option<usize> {
-        Some(self.vidx.get(key)?.get(value).map_or(0, Vec::len))
-    }
     /// Range seek over vertices (union of buckets in `bound`, type-block bounded).
     pub fn vertices_by_prop_range(&self, key: &str, bound: &RangeBound) -> Option<Vec<u32>> {
         range_seek(self.vidx.get(key)?, bound)
@@ -1525,14 +1433,6 @@ impl Graph {
     pub fn in_adj(&self, v: u32) -> impl Iterator<Item = Adj> + '_ {
         self.adj(v, false).iter().copied()
     }
-    /// Out-neighbors of `v` whose edge type is `etype` (or all if `None`).
-    pub fn out_neighbors(&self, v: u32, etype: Option<u32>) -> impl Iterator<Item = u32> + '_ {
-        self.adj(v, true).iter().filter_map(move |a| match etype {
-            Some(t) if a.etype != t => None,
-            _ => Some(a.nbr),
-        })
-    }
-
     /// Labels carried by vertex `v`, as label ids.
     pub fn vertex_labels(&self, v: u32) -> &[u32] {
         &self.vlabels[v as usize]

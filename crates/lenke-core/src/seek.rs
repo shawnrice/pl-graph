@@ -1439,46 +1439,6 @@ pub fn expand(graph: &Graph, src: &[u32], dir: Dir, etypes: &[u32], loops: SelfL
     out
 }
 
-/// How many edges carry any of `etypes`, read from the type buckets — O(types),
-/// with no adjacency walk at all.
-///
-/// This is the whole answer to "count the edges of type T" when nothing
-/// constrains the endpoints or the edge itself: every such edge is a match
-/// exactly once. Walking adjacency to get the same number is O(E), which is
-/// what `g.V().outE(T).count()` was doing while `MATCH ()-[:T]->() RETURN
-/// count(*)` read the bucket length — the same graph question, 1485x apart.
-///
-/// An empty `etypes` means "no type named", NOT "any type" — the caller decides
-/// what any-type means, because the two engines' universes differ. The
-/// `Some(&[])`-vs-`None` conflation this avoids has shipped four times.
-///
-/// The dedup is only for a MULTI-type ask: an edge carrying two of the named
-/// types sits in two buckets and is still ONE edge. A single type cannot
-/// collide with itself, so the common case allocates nothing.
-///
-/// NOT the same as sharing the counting LOOP. Routing the count shortcuts'
-/// inner adjacency walk through [`adj`] was tried and is 1.5-1.6x SLOWER (see
-/// the note at `gql::eval::fastpath::etype_ok`): a chained out/in iterator pays
-/// for direction generality a counting loop never uses. What is shared here is
-/// the ALGORITHM — that this shape needs no walk — while each engine keeps its
-/// own tight loop for the shapes that do.
-#[must_use]
-pub fn count_edges_of_types(graph: &Graph, etypes: &[u32]) -> usize {
-    match etypes {
-        [] => 0,
-        [t] => graph.edges_with_etype(*t).len(),
-        many => {
-            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-
-            for &t in many {
-                seen.extend(graph.edges_with_etype(t).iter().copied());
-            }
-
-            seen.len()
-        }
-    }
-}
-
 /// The EDGES incident to `src` along `etypes` (empty = any), flat.
 ///
 /// `outE`/`inE`/`bothE` land on the edge itself rather than its far end, so the
@@ -1772,15 +1732,6 @@ pub trait RowFilter {
 
     /// Keep this `(edge, neighbour)`?
     fn keep(&mut self, eidx: u32, nbr: u32) -> bool;
-}
-
-/// A `RowFilter` that keeps everything — for a hop with nothing left over.
-pub struct KeepAll;
-
-impl RowFilter for KeepAll {
-    fn keep(&mut self, _: u32, _: u32) -> bool {
-        true
-    }
 }
 
 /// The frontier of a multi-hop expansion: one id column per bound slot, plus the
