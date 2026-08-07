@@ -400,7 +400,7 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
     // constraint the rewritten pattern does not carry.
     if let [Step::V(ids), Step::Match(plans), rest @ ..] = t.steps.as_slice() {
         if ids.is_empty() && !needs_path(rest) {
-            let patterned = if lowering_off() {
+            let patterned = if lowering_off() || pattern_off() {
                 None
             } else {
                 match_via_pattern(graph, ctx, plans, rest)
@@ -412,7 +412,13 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
         }
     }
 
-    if let Some(c) = super::pattern::compile(&t.steps) {
+    let compiled = if lowering_off() || pattern_off() {
+        None
+    } else {
+        super::pattern::compile(&t.steps)
+    };
+
+    if let Some(c) = compiled {
         let rest = &t.steps[c.consumed..];
 
         // A REORDERING plan (only the `g.E()` desugar) is usable just where the
@@ -1675,6 +1681,12 @@ fn col_terminal_tagged(
 #[cfg(test)]
 pub static LOWERING_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Turns off ONLY the pattern route (`gremlin::pattern`), leaving the linear
+/// column path on, so the planner's own contribution can be priced apart from
+/// the column arms'. Test-only, like [`LOWERING_OFF`].
+#[cfg(test)]
+pub static PATTERN_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Whether the column path is disabled for this run — always `false` outside
 /// tests, where it compiles to a constant the optimizer removes.
 #[inline]
@@ -1682,6 +1694,20 @@ fn lowering_off() -> bool {
     #[cfg(test)]
     {
         LOWERING_OFF.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// Whether the pattern route is disabled for this run — always `false` outside
+/// tests.
+#[inline]
+fn pattern_off() -> bool {
+    #[cfg(test)]
+    {
+        PATTERN_OFF.load(std::sync::atomic::Ordering::Relaxed)
     }
     #[cfg(not(test))]
     {

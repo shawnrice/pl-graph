@@ -5644,3 +5644,130 @@ fn arm_audit() {
         );
     }
 }
+
+/// The three Gremlin routes, priced apart: the PATTERN planner
+/// (`gremlin::pattern`, which compiles a linear prefix into GQL's pattern IR),
+/// the linear COLUMN path, and the stream.
+///
+/// Asked because three routes is two more than the branch set out to have, so
+/// each has to earn its place. `all` is everything on; `no pattern` leaves the
+/// column arms but takes the planner away; `stream` is both off.
+#[test]
+#[ignore = "probe"]
+fn route_audit() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut lines = String::new();
+    for i in 0..50_000usize {
+        let l = if i % 10 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{},\"k\":\"key{i:06}\"}}}}\n",
+            i % 97
+        ));
+    }
+    let mut e = 0;
+    for i in 0..50_000usize {
+        for d in 0..3usize {
+            lines.push_str(&format!(
+                "{{\"type\":\"edge\",\"id\":\"e{e}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{\"w\":{d}}}}}\n",
+                (i * 31 + d * 7 + 1) % 50_000
+            ));
+            e += 1;
+        }
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    println!(
+        "{:<50} {:>9} {:>11} {:>9}",
+        "traversal", "all", "no pattern", "stream"
+    );
+    for q in [
+        "g.V().hasLabel('V').out('R').hasLabel('W').count()",
+        "g.V().has('k', 'key000042').out('R').count()",
+        "g.V().hasLabel('W').out('R').hasLabel('W').count()",
+        "g.V().out('R').hasLabel('W').values('n')",
+        "g.V().hasLabel('V').as('a').out('R').select('a').count()",
+        "g.V().hasLabel('V').count()",
+        "g.V().values('n').sum()",
+    ] {
+        let mut t = [f64::MAX; 3];
+        let mut same = true;
+        let mut first: Option<Vec<GVal>> = None;
+        for _ in 0..5 {
+            for (k, (lo, po)) in [(false, false), (false, true), (true, true)]
+                .iter()
+                .enumerate()
+            {
+                super::exec::LOWERING_OFF.store(*lo, Relaxed);
+                super::exec::PATTERN_OFF.store(*po, Relaxed);
+                let p = super::parse::parse(q).expect("parses");
+                let start = std::time::Instant::now();
+                let out = p.run(&mut g);
+                t[k] = t[k].min(start.elapsed().as_secs_f64() * 1000.0);
+                match &first {
+                    None => first = Some(out),
+                    Some(f) => same &= *f == out,
+                }
+            }
+        }
+        super::exec::LOWERING_OFF.store(false, Relaxed);
+        super::exec::PATTERN_OFF.store(false, Relaxed);
+        println!(
+            "{q:<50} {:>8.3}ms {:>9.3}ms {:>8.3}ms{}",
+            t[0],
+            t[1],
+            t[2],
+            if same { "" } else { "  *** DIFFERENT ***" }
+        );
+    }
+}
+
+/// The PATTERN route reorders rows, and that is observable.
+///
+/// `gremlin::pattern` seeds at the selective end and walks the adjacency
+/// backwards — which is where its 32-45x comes from — so its rows come out
+/// grouped by the far end rather than in source order. Adding the post-hop filter
+/// is what turns the route on, and the order changes with it:
+///
+///   g.V().out('CREATED').values('name')                      lop ripple lop lop
+///   g.V().out('CREATED').hasLabel('SOFTWARE').values('name')  lop lop lop ripple
+///
+/// The TS engine, which has no planner, returns source order for both — so the
+/// two engines disagree on the sequence of an ordinary traversal, and under
+/// `fold()` that is a single row whose LIST differs. Confirmed through the real
+/// FFI, not just in-process.
+///
+/// This is PERMITTED: row order without an explicit `order()` is unspecified in
+/// both engines, like SQL without ORDER BY, and that is settled policy — the
+/// multiset is identical. It is pinned here because it looks exactly like a bug,
+/// because the trigger (a filter AFTER the hop) is not obvious, and because the
+/// engine already treats reordering as observable elsewhere: the `g.E()` desugar
+/// is admitted "just where the sequence cannot be observed". By that standard
+/// far-end seeding deserves the same guard, which would keep the win for
+/// order-insensitive shapes (`count()`, aggregates, `dedup()`) and give it up for
+/// the rest. That is a perf-vs-agreement decision, not a fix to make quietly.
+#[test]
+fn the_pattern_route_reorders_rows() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut g = modern();
+    let q = "g.V().out('CREATED').hasLabel('SOFTWARE').values('name')";
+
+    super::exec::PATTERN_OFF.store(false, Relaxed);
+    let planned = super::parse::parse(q).expect("parses").run(&mut g);
+    super::exec::PATTERN_OFF.store(true, Relaxed);
+    let walked = super::parse::parse(q).expect("parses").run(&mut g);
+    super::exec::PATTERN_OFF.store(false, Relaxed);
+
+    assert_ne!(planned, walked, "the planner is expected to reorder");
+
+    let key = |v: &Vec<GVal>| {
+        let mut k: Vec<String> = v.iter().map(|x| format!("{x:?}")).collect();
+        k.sort();
+        k
+    };
+
+    assert_eq!(key(&planned), key(&walked), "but only the sequence differs");
+}

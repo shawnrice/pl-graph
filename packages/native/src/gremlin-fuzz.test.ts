@@ -315,6 +315,42 @@ const zeroSliceFedByEarlyYield = (text: string): boolean => {
   return shield >= 0 && shield < slice;
 };
 
+/**
+ * An `order()` at the TOP level of the traversal — not one nested inside a
+ * sub-traversal.
+ *
+ * The distinction is load-bearing, and `text.includes('.order(')` got it wrong.
+ * A multi-type adjacency step has unspecified per-vertex order, and a following
+ * top-level `order()` settles it; an `order()` inside a BRANCH body does not,
+ * because it sorts only within that branch while a sibling branch's rows keep the
+ * unspecified order. `FUZZ_SEED=42` reported
+ * `union(out('KNOWS').out('CREATED','KNOWS'), order().by(desc).order()).fold()`
+ * as a divergence for exactly that reason: same twelve elements, three of them in
+ * a different sequence, and the nested `order()` had switched the multiset
+ * comparison off. Verified as NOT an engine difference — the lowered and streamed
+ * routes return the same rows in the same order, so the two engines simply walked
+ * a two-type adjacency differently, which is the case the flag exists for.
+ */
+const hasTopLevelOrder = (text: string): boolean => {
+  let depth = 0;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const c = text[i];
+
+    if (c === '(') {
+      if (depth === 0 && text.startsWith('.order(', i - 6)) {
+        return true;
+      }
+
+      depth += 1;
+    } else if (c === ')') {
+      depth -= 1;
+    }
+  }
+
+  return false;
+};
+
 const etypes = (r: () => number): string[] =>
   pick(r, [
     ['KNOWS'],
@@ -585,7 +621,7 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
       // IS the contract is WHICH elements come back and HOW MANY, so compare
       // those shapes as a multiset. A duplicated multi-type edge still shows up.
       const multiType = MULTI_TYPE_STEP.test(text);
-      const unordered = multiType && !text.includes('.order(');
+      const unordered = multiType && !hasTopLevelOrder(text);
 
       // A positional slice of an unspecified order picks an unspecified SUBSET,
       // and every step after it inherits that — not just the order but which
