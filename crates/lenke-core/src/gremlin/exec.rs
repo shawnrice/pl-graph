@@ -1683,6 +1683,297 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
     )
 }
 
+/// A sub-plan's output, grouped by the input row that produced it: row `i` owns
+/// `vals[bounds[i]..bounds[i + 1]]`.
+///
+/// This is what makes the BRANCH steps vectorizable. `union`, `coalesce`,
+/// `optional` and `choose` all run a body per incoming traverser and then decide
+/// PER TRAVERSER what to emit, so a column form has to know which output came
+/// from which input row. The stream gets that provenance for free by running one
+/// traverser at a time — `run_steps(…, vec![t.clone()])` — and pays a traverser
+/// per row per branch for it. Evaluating the body over the whole frontier once
+/// and carrying the owner row is the same work in bulk.
+struct Fanout {
+    vals: Vec<GVal>,
+    /// `rows + 1` ascending offsets into `vals`.
+    bounds: Vec<usize>,
+}
+
+impl Fanout {
+    fn row(&self, i: usize) -> &[GVal] {
+        &self.vals[self.bounds[i]..self.bounds[i + 1]]
+    }
+
+    /// Did row `i` produce anything? The question `coalesce`/`optional`/`choose`
+    /// each ask, and the whole reason emptiness is tracked per row.
+    fn hit(&self, i: usize) -> bool {
+        self.bounds[i] != self.bounds[i + 1]
+    }
+}
+
+/// Re-tighten a branch's output into an ELEMENT column when every row is the same
+/// kind of element, so a tail can keep navigating — `optional(out('R')).out('R')`
+/// stays on the column path instead of stopping at the branch. A mixed or scalar
+/// result stays boxed, which every arm below is happy with.
+fn col_of_branch(vals: Vec<GVal>) -> Col<'static> {
+    let is_edge = match vals.first() {
+        Some(GVal::Node(_)) => false,
+        Some(GVal::Edge(_)) => true,
+        _ => return Col::Gen(vals),
+    };
+    let mut ids = Vec::with_capacity(vals.len());
+
+    for v in &vals {
+        match v {
+            GVal::Node(i) if !is_edge => ids.push(*i),
+            GVal::Edge(i) if is_edge => ids.push(*i),
+            // Mixed kinds: an id vector cannot say which store each row reads.
+            _ => return Col::Gen(vals),
+        }
+    }
+
+    Col::Elems {
+        ids: std::borrow::Cow::Owned(ids),
+        is_edge,
+    }
+}
+
+/// Group ascending owner rows into `rows + 1` offsets — a counting pass, not a
+/// sort, because every transform in [`fanout`] either preserves row order or
+/// expands a row in place.
+fn fan_bounds(owners: &[u32], rows: usize) -> Vec<usize> {
+    let mut bounds = vec![0usize; rows + 1];
+
+    for &o in owners {
+        bounds[o as usize + 1] += 1;
+    }
+    for i in 0..rows {
+        bounds[i + 1] += bounds[i];
+    }
+
+    bounds
+}
+
+/// Run a branch body over an entire element frontier at once, keeping each
+/// output's originating row.
+///
+/// `None` declines and the stream re-runs the whole traversal, so an unhandled
+/// step is always safe — the usual property of this path, and the reason the
+/// vocabulary here can grow one step at a time.
+///
+/// The body is evaluated with the SAME per-traverser semantics the stream gives
+/// it, which is what makes a trailing `count()`/`fold()` a per-ROW reducer rather
+/// than a global one: `union(out('R').count(), …)` counts each vertex's own
+/// neighbours, because the stream hands the branch one traverser at a time.
+fn fanout(graph: &Graph, ids: &[u32], is_edge: bool, steps: &[Step]) -> Option<Fanout> {
+    let rows = ids.len();
+    let mut cur: Vec<u32> = ids.to_vec();
+    let mut cur_edge = is_edge;
+    // Owner row per surviving element, ASCENDING.
+    let mut owners: Vec<u32> = (0..u32::try_from(rows).ok()?).collect();
+    let mut rest = steps;
+
+    // --- element phase: walks and filters, element in and element out ---
+    loop {
+        let nav = match rest {
+            [s @ (Step::Out(l) | Step::In(l) | Step::Both(l)), t @ ..] if !cur_edge => {
+                Some((s, l, false, t))
+            }
+            [s @ (Step::OutE(l) | Step::InE(l) | Step::BothE(l)), t @ ..] if !cur_edge => {
+                Some((s, l, true, t))
+            }
+            _ => None,
+        };
+
+        if let Some((step, labels, to_edge, t)) = nav {
+            let (out, inn) = dir_flags(step);
+            let dir = seek_dir(out, inn);
+            let mut next = Vec::new();
+            let mut next_owners = Vec::new();
+
+            // `None` = every name was unknown, so the hop matches nothing. An
+            // EMPTY list means any type — the inverse of the `seek` convention,
+            // and the confusion that has shipped four times in `adj_keeps`
+            // callers, so this reads `resolve_etypes` rather than re-deriving it.
+            if let Some(etypes) = resolve_etypes(graph, labels) {
+                for (i, &v) in cur.iter().enumerate() {
+                    for a in crate::seek::adj(graph, v, dir, &etypes, crate::seek::SelfLoops::Twice)
+                    {
+                        next.push(if to_edge { a.eidx } else { a.nbr });
+                        next_owners.push(owners[i]);
+                    }
+                }
+            }
+
+            cur = next;
+            owners = next_owners;
+            cur_edge = to_edge;
+            rest = t;
+
+            continue;
+        }
+
+        // An edge frontier's endpoints: a gather off `e_src`/`e_dst`, not a walk.
+        // `otherV()` is absent for the same reason it is absent from the column
+        // terminals — it is a question about the PATH.
+        if let [s @ (Step::OutV | Step::InV), t @ ..] = rest {
+            if cur_edge {
+                let src = matches!(s, Step::OutV);
+
+                cur = cur
+                    .iter()
+                    .map(|&e| {
+                        if src {
+                            graph.e_src[e as usize]
+                        } else {
+                            graph.e_dst[e as usize]
+                        }
+                    })
+                    .collect();
+                cur_edge = false;
+                rest = t;
+
+                continue;
+            }
+        }
+
+        // Steps that do nothing to the rows. Same no-op the column terminals
+        // already peel — without it a body containing one declines whole, and
+        // `union(out('R'), identity())` fell back to the stream entirely.
+        if let [Step::Identity | Step::Barrier, t @ ..] = rest {
+            rest = t;
+
+            continue;
+        }
+
+        // A filter on the element itself. Every one of these keeps row order, so
+        // `owners` stays ascending and the grouping stays a counting pass.
+        if let [head, t @ ..] = rest {
+            if matches!(head, Step::Has(..) | Step::HasLabel(_)) {
+                if let Some(keep) = self_predicate(graph, std::slice::from_ref(head), cur_edge) {
+                    let mut next = Vec::with_capacity(cur.len());
+                    let mut next_owners = Vec::with_capacity(cur.len());
+
+                    for (i, &id) in cur.iter().enumerate() {
+                        if keep(id) {
+                            next.push(id);
+                            next_owners.push(owners[i]);
+                        }
+                    }
+
+                    cur = next;
+                    owners = next_owners;
+                    rest = t;
+
+                    continue;
+                }
+            }
+        }
+
+        // `where(…)` / `not(…)` whose body the adjacency can answer, the same
+        // semi-join the column terminals take.
+        if let [head @ (Step::Where(sub) | Step::Not(sub)), t @ ..] = rest {
+            if let Some(keep) = semi_join_test(graph, &sub.steps, cur_edge) {
+                let negated = matches!(head, Step::Not(_));
+                let mut next = Vec::with_capacity(cur.len());
+                let mut next_owners = Vec::with_capacity(cur.len());
+
+                for (i, &id) in cur.iter().enumerate() {
+                    if keep(id) != negated {
+                        next.push(id);
+                        next_owners.push(owners[i]);
+                    }
+                }
+
+                cur = next;
+                owners = next_owners;
+                rest = t;
+
+                continue;
+            }
+        }
+
+        break;
+    }
+
+    // --- projection phase: element column to value column ---
+    let mut vals: Vec<GVal> = match rest {
+        [Step::Id, t @ ..] => {
+            rest = t;
+            cur.iter()
+                .map(|&id| elem_id(graph, &frontier_val(id, cur_edge)))
+                .collect()
+        }
+        [Step::Label, t @ ..] => {
+            rest = t;
+            cur.iter()
+                .map(|&id| elem_label(graph, &frontier_val(id, cur_edge)))
+                .collect()
+        }
+        // `values(k)` DROPS a row whose key is absent, which is a row transform
+        // and so has to move `owners` with it. Presence is the gate, not
+        // "value != null": a stored null is a value and yields one.
+        [Step::Values(keys), t @ ..] if keys.len() == 1 => {
+            let key = &keys[0];
+            let vk = graph.props.keys.get(key);
+            let ek = graph.edge_props.keys.get(key);
+            let mut out = Vec::with_capacity(cur.len());
+            let mut next_owners = Vec::with_capacity(cur.len());
+
+            for (i, &id) in cur.iter().enumerate() {
+                let idx = id as usize;
+                let got = match (cur_edge, vk, ek) {
+                    (false, Some(k), _) if graph.props.is_present_id(idx, k) => {
+                        Some(value_to_gval(graph.props.value_id(idx, k, &graph.strs)))
+                    }
+                    (true, _, Some(k)) if graph.edge_props.is_present_id(idx, k) => Some(
+                        value_to_gval(graph.edge_props.value_id(idx, k, &graph.strs)),
+                    ),
+                    _ => None,
+                };
+
+                if let Some(v) = got {
+                    out.push(v);
+                    next_owners.push(owners[i]);
+                }
+            }
+
+            rest = t;
+            owners = next_owners;
+            out
+        }
+        _ => cur.iter().map(|&id| frontier_val(id, cur_edge)).collect(),
+    };
+
+    let mut bounds = fan_bounds(&owners, rows);
+
+    // --- reducer phase: a trailing barrier is PER ROW, and collapses each row
+    // to exactly one value, so the bounds become one-per-row ---
+    match rest {
+        [] => {}
+        [Step::Count(Scope::Global)] => {
+            #[allow(clippy::cast_precision_loss)]
+            let counts = (0..rows)
+                .map(|i| GVal::Num((bounds[i + 1] - bounds[i]) as f64))
+                .collect();
+
+            vals = counts;
+            bounds = (0..=rows).collect();
+        }
+        [Step::Fold] => {
+            let folded = (0..rows)
+                .map(|i| GVal::list(vals[bounds[i]..bounds[i + 1]].to_vec()))
+                .collect();
+
+            vals = folded;
+            bounds = (0..=rows).collect();
+        }
+        _ => return None,
+    }
+
+    Some(Fanout { vals, bounds })
+}
+
 /// The arms only an ELEMENT column can answer: projections of an element, a walk
 /// off it, and the keyed modulators that read a property column.
 fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Option<Vec<GVal>> {
@@ -1876,6 +2167,126 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
         // rest — the same shape as the column terminals, for the same reason:
         // `dedup()` had an arm only when followed by `count()`, so `dedup()`
         // alone and `dedup().limit(5)` both streamed.
+        // The BRANCH steps, as column control flow.
+        //
+        // Each runs a body per incoming traverser and decides per traverser what
+        // to emit, so [`fanout`] evaluates every body over the whole frontier once
+        // and keeps the owner row. What is left is the choosing, which is a pass
+        // over rows — no traverser is built for any of it.
+        //
+        // ORDER is the contract, and it is ROW-MAJOR: the stream loops
+        // `for t in stream { for p in plans { … } }`, so row 0's branches all come
+        // before row 1's. Emitting branch-major would return the same multiset in
+        // a different sequence, which is a byte-identity break that no count-based
+        // test would show.
+        //
+        // Declining is safe (the stream re-runs the traversal), and every body
+        // must lower or the whole step declines — a partly-lowered `union` would
+        // have to interleave two evaluators per row.
+        //
+        // Measured against the streamed spelling of the same question
+        // (`branch_lowering_cost_probe`, 20k vertices / 60k edges; the ratios hold
+        // at 200k/600k, 3.4-7.0x):
+        //
+        //   union(out(R), values(n))                 2.34ms   9.27   4.0x
+        //   union(out(R).count(), values(n))         1.14     6.88   6.0x
+        //   coalesce(out(R), values(n))              1.21     5.08   4.2x
+        //   optional(out(R))                         0.91     4.81   5.3x
+        //   choose(hasLabel(W), out(R), values(n))   1.02     4.74   4.6x
+        //   local(out(R))                            0.90     4.74   5.3x
+        //   union(out(R), out(R)).values(n)          1.94    12.04   6.2x
+        //   optional(out(R)).id()                    1.32     8.45   6.4x
+        //
+        // NOT covered, and it reads as if it were: a NAVIGATING tail after a
+        // branch — `optional(out(R)).out(R).count()` measures 1.0x, because
+        // nothing below `lowered_ids` walks a hop; `lower_hops` runs before the
+        // column terminals, not inside them. The tightening below is what lets the
+        // non-navigating tails land, and neutering it drops `optional(out(R)).id()`
+        // from 6.4x to 1.2x.
+        [Step::Union(plans), t @ ..] => {
+            let fans = plans
+                .iter()
+                .map(|p| fanout(graph, ids, is_edge, &p.steps))
+                .collect::<Option<Vec<_>>>()?;
+            let mut out = Vec::new();
+
+            for row in 0..ids.len() {
+                for f in &fans {
+                    out.extend_from_slice(f.row(row));
+                }
+            }
+
+            col_terminal(graph, col_of_branch(out), t)
+        }
+        // `local(b)` is the degenerate branch: one body, all of its rows, in row
+        // order. Same fanout, no choosing.
+        [Step::Local(sub), t @ ..] => {
+            let fan = fanout(graph, ids, is_edge, &sub.steps)?;
+            let mut out = Vec::new();
+
+            for row in 0..ids.len() {
+                out.extend_from_slice(fan.row(row));
+            }
+
+            col_terminal(graph, col_of_branch(out), t)
+        }
+        // The FIRST body that produces anything, per row. A row where none does
+        // drops out entirely.
+        [Step::Coalesce(plans), t @ ..] => {
+            let fans = plans
+                .iter()
+                .map(|p| fanout(graph, ids, is_edge, &p.steps))
+                .collect::<Option<Vec<_>>>()?;
+            let mut out = Vec::new();
+
+            for row in 0..ids.len() {
+                if let Some(f) = fans.iter().find(|f| f.hit(row)) {
+                    out.extend_from_slice(f.row(row));
+                }
+            }
+
+            col_terminal(graph, col_of_branch(out), t)
+        }
+        // `optional(b)` is `coalesce(b, identity)`: the body's rows, or the
+        // incoming element untouched when it produced none.
+        [Step::Optional(sub), t @ ..] => {
+            let fan = fanout(graph, ids, is_edge, &sub.steps)?;
+            let mut out = Vec::new();
+
+            for (row, &id) in ids.iter().enumerate() {
+                if fan.hit(row) {
+                    out.extend_from_slice(fan.row(row));
+                } else {
+                    out.push(frontier_val(id, is_edge));
+                }
+            }
+
+            col_terminal(graph, col_of_branch(out), t)
+        }
+        // `choose(test, then, else?)` routes each row by whether the TEST body
+        // produced anything. With no else the row passes through unchanged, which
+        // is the arity distinction the emitter also has to keep.
+        [Step::Choose { test, then_, else_ }, t @ ..] => {
+            let probe = fanout(graph, ids, is_edge, &test.steps)?;
+            let yes = fanout(graph, ids, is_edge, &then_.steps)?;
+            let no = match else_ {
+                Some(e) => Some(fanout(graph, ids, is_edge, &e.steps)?),
+                None => None,
+            };
+            let mut out = Vec::new();
+
+            for (row, &id) in ids.iter().enumerate() {
+                if probe.hit(row) {
+                    out.extend_from_slice(yes.row(row));
+                } else if let Some(f) = &no {
+                    out.extend_from_slice(f.row(row));
+                } else {
+                    out.push(frontier_val(id, is_edge));
+                }
+            }
+
+            col_terminal(graph, col_of_branch(out), t)
+        }
         // A `where()` / `not()` whose body the ADJACENCY can answer is a filter on
         // the frontier, so it peels like the paging steps do — the column stays a
         // column and never becomes a stream.

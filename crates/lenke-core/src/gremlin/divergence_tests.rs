@@ -5384,3 +5384,149 @@ fn a_zero_limit_does_not_cancel_an_upstream_side_effect() {
         assert_eq!(items.len(), 6, "{q}: the aggregate ran over every vertex");
     }
 }
+
+/// Every lowered BRANCH traversal must return exactly what the stream returns —
+/// same rows, same order.
+///
+/// `fold().unfold()` is the lever: `fold()` with a tail declines to lower, so the
+/// right-hand spelling runs the streamed interpreter over the same question while
+/// the left-hand one takes the column arms. Comparing an engine against ITSELF
+/// this way is what catches a lowering that is merely plausible.
+///
+/// ORDER is half the point. The stream is row-major
+/// (`for t in stream { for p in plans { … } }`), so row 0's branches precede
+/// row 1's; emitting branch-major returns the same multiset in a different
+/// sequence, and every count- or set-based assertion would pass anyway.
+#[test]
+fn lowered_branch_steps_agree_with_the_stream() {
+    let mut g = modern();
+
+    for q in [
+        // union: elements, values, mixed widths, and a per-row reducer
+        "g.V().union(out('KNOWS'), out('CREATED'))",
+        "g.V().union(out('KNOWS').values('name'), values('name'))",
+        "g.V().union(out('KNOWS').count(), out('CREATED').count())",
+        "g.V().union(values('name'), values('age'))",
+        "g.V().union(out('KNOWS'), identity())",
+        "g.V().union(out('KNOWS'), out('CREATED'), out())",
+        // A branch that matches NOTHING still has to hold its row slot.
+        "g.V().union(out('NOSUCH'), values('name'))",
+        "g.V().union(out('KNOWS').has('age', gt(30)), values('name'))",
+        // coalesce: first body that produces anything, per row
+        "g.V().coalesce(out('KNOWS'), out('CREATED'))",
+        "g.V().coalesce(values('age'), values('lang'))",
+        "g.V().coalesce(out('NOSUCH'), out('KNOWS'), values('name'))",
+        // optional: body rows, or the element itself
+        "g.V().optional(out('KNOWS'))",
+        "g.V().optional(out('KNOWS').values('name'))",
+        "g.V().optional(outE('KNOWS'))",
+        "g.V().optional(out('NOSUCH'))",
+        // choose: both arities, and the no-else passthrough
+        "g.V().choose(out('KNOWS'), values('name'), values('lang'))",
+        "g.V().choose(has('age', gt(30)), values('name'))",
+        "g.V().choose(hasLabel('PERSON'), out('KNOWS'), out('CREATED'))",
+        // a tail after the branch, so the result feeds the rest of the column path
+        "g.V().union(out('KNOWS'), out('CREATED')).count()",
+        "g.V().union(out('KNOWS'), out('CREATED')).dedup().count()",
+        "g.V().union(out('KNOWS'), out('CREATED')).limit(3)",
+        "g.V().hasLabel('PERSON').union(out('KNOWS').fold(), values('name').fold())",
+        // an edge frontier, and the endpoint gather inside a body
+        "g.E().union(inV(), outV())",
+        "g.E().optional(inV())",
+        // `local()`, the one-body case
+        "g.V().local(out('KNOWS'))",
+        "g.V().local(values('name'))",
+        "g.V().local(out('KNOWS').count())",
+        // a NAVIGATING tail off a branch result, which needs the tightening back
+        // into an element column
+        "g.V().optional(out('KNOWS')).out('CREATED')",
+        "g.V().union(out('KNOWS'), out('CREATED')).values('name')",
+        "g.V().local(out('KNOWS')).outE('CREATED')",
+        // a branch whose rows are a MIX of kinds stays boxed and must still agree
+        "g.V().union(out('KNOWS'), outE('CREATED'))",
+        "g.V().union(values('name'), out('KNOWS'))",
+        // an empty frontier must not index past the end of the bounds
+        "g.V().hasLabel('NOSUCH').union(out('KNOWS'), values('name'))",
+        "g.V().hasLabel('NOSUCH').optional(out('KNOWS'))",
+    ] {
+        let lowered = super::parse::parse(q).expect("parses").run(&mut g);
+        let streamed = super::parse::parse(&format!("{q}.fold().unfold()"))
+            .expect("parses")
+            .run(&mut g);
+
+        assert_eq!(lowered, streamed, "{q}");
+    }
+}
+
+/// What the branch steps cost lowered against the STREAM they replace, as an A/B
+/// of the same engine on the same question — `fold().unfold()` forces the
+/// streamed spelling, since `fold()` with a tail declines to lower.
+///
+/// Ignored (it builds an 80k-element fixture, and a 800k one when the sweep is
+/// widened). The numbers it produced are recorded on the branch arms in
+/// `gremlin/exec.rs`; re-run it after touching `fanout` or `col_of_branch`.
+#[test]
+#[ignore = "probe"]
+fn branch_lowering_cost_probe() {
+    // Both sizes were run; 20k is kept so the probe stays quick. The ratios were
+    // within a point of each other either side of the cache-resident boundary.
+    for n in [20_000usize] {
+        let mut lines = String::new();
+        for i in 0..n {
+            let l = if i % 10 == 0 {
+                r#"["V","W"]"#
+            } else {
+                r#"["V"]"#
+            };
+            lines.push_str(&format!(
+                "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{},\"k\":\"key{i:06}\"}}}}\n",
+                i % 97
+            ));
+        }
+        let mut e = 0;
+        for i in 0..n {
+            for d in 0..3usize {
+                lines.push_str(&format!(
+                    "{{\"type\":\"edge\",\"id\":\"e{e}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{\"w\":{d}}}}}\n",
+                    (i * 31 + d * 7 + 1) % n
+                ));
+                e += 1;
+            }
+        }
+        let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+        println!("\n=== {n} nodes / {} edges ({} elements)", n * 3, n * 4);
+        println!(
+            "{:<50} {:>10} {:>10} {:>7}",
+            "traversal", "lowered", "streamed", "x"
+        );
+        for q in [
+            "g.V().union(out('R'), values('n'))",
+            "g.V().union(out('R').count(), values('n'))",
+            "g.V().coalesce(out('R'), values('n'))",
+            "g.V().optional(out('R'))",
+            "g.V().choose(hasLabel('W'), out('R'), values('n'))",
+            "g.V().local(out('R'))",
+            "g.V().optional(out('R')).out('R').count()",
+            "g.V().union(out('R'), out('R')).values('n')",
+            "g.V().optional(out('R')).id()",
+            "g.V().local(out('R')).groupCount().by('n')",
+            "g.V().union(out('R'), out('R')).count()",
+        ] {
+            let streamed_q = format!("{q}.fold().unfold()");
+            let (mut lo, mut st) = (f64::MAX, f64::MAX);
+            for _ in 0..5 {
+                let p = super::parse::parse(q).expect("parses");
+                let t = std::time::Instant::now();
+                let a = p.run(&mut g);
+                lo = lo.min(t.elapsed().as_secs_f64() * 1000.0);
+                let p2 = super::parse::parse(&streamed_q).expect("parses");
+                let t2 = std::time::Instant::now();
+                let b = p2.run(&mut g);
+                st = st.min(t2.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(a, b, "{q}");
+            }
+            println!("{q:<50} {lo:>9.3}ms {st:>9.3}ms {:>6.1}x", st / lo);
+        }
+    }
+}

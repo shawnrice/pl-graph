@@ -77,6 +77,7 @@ cargo test --release <name> -- --ignored --nocapture
 | `bench_allen_relations`                 | All thirteen Allen relations over a batch of edge versions.                                                                              |
 | `bench_var_length_matcher`              | The whole var-length matcher surface.                                                                                                    |
 | `cross_language_cost_probe`             | The same QUESTION in GQL and in Gremlin, priced side by side — where does one engine have a shortcut the other lacks?                    |
+| `branch_lowering_cost_probe`            | A Gremlin branch step lowered vs the STREAM it replaces — the same engine A/B'd against itself via `fold().unfold()`.                    |
 
 `cross_language_cost_probe` is the odd one out: the other rows price ONE engine
 against the machine, and it prices the two engines against each other. That is a
