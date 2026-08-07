@@ -5968,3 +5968,52 @@ fn property_exists_is_a_column_read() {
         println!("PE {best:>8.3}ms  {rows:>6} rows  {q}");
     }
 }
+
+/// A `$param` is constant for the whole query, and used to be re-read through the
+/// scalar VM once per row.
+///
+/// Over 50k vertices, with and without the `eval_vec` arm:
+///
+///   WHERE u.n > $x RETURN count(*)   0.961ms -> 0.120   8.0x
+///   WHERE u.n > $x RETURN u.n        1.124   -> 0.292   3.8x
+///   RETURN u.n + $x                  2.300   -> 0.451   5.1x
+///   WHERE u.s = $s RETURN count(*)   0.054   -> 0.054   unchanged
+///
+/// The last row is the control: an equality on an INDEXED key is seeded, so it
+/// never reaches the column path and the arm cannot help it. Without that row the
+/// other three could be read as "params got faster" rather than "the column path
+/// stopped re-evaluating a constant".
+#[test]
+#[ignore = "probe"]
+fn a_param_is_broadcast_not_re_evaluated() {
+    let mut lines = String::new();
+    for i in 0..50_000usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{{\"n\":{},\"s\":\"v{}\"}}}}\n",
+            i % 97,
+            i % 7
+        ));
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+    let mut params = crate::gql::eval::Params::new();
+    params.insert("x".to_string(), crate::gql::eval::Val::Num(50.0));
+    params.insert("s".to_string(), crate::gql::eval::Val::Str("v3".into()));
+
+    for q in [
+        "MATCH (u:V) WHERE u.n > $x RETURN count(*) AS c",
+        "MATCH (u:V) WHERE u.n > $x RETURN u.n AS n",
+        "MATCH (u:V) RETURN u.n + $x AS n",
+        "MATCH (u:V) WHERE u.s = $s RETURN count(*) AS c",
+    ] {
+        let mut best = f64::MAX;
+        let mut rows = 0;
+        for _ in 0..9 {
+            let p = crate::gql::parse(q).expect("parses");
+            let t = std::time::Instant::now();
+            let rs = p.execute(&mut g, &params).expect("runs");
+            best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+            rows = rs.nrows;
+        }
+        println!("PARAM {best:>8.3}ms {rows:>6} rows  {q}");
+    }
+}

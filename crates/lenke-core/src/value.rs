@@ -644,6 +644,14 @@ impl<'a> Col<'a> {
     /// two languages disagree about a missing property, and taking the mask the
     /// store already built is what keeps the disagreement free — evaluating
     /// `PROPERTY_EXISTS` per row through the expression VM instead measured 11x.
+    ///
+    /// The mask SURVIVES `project_frame_cols`, which settles a question worth not
+    /// re-asking: routing Gremlin's `values(k)` through GQL's projection is at
+    /// parity (0.049ms against 0.043 over 50k, and 0.087 against 0.077 when a
+    /// third of the rows lack the key) as long as presence is read from HERE. Ask
+    /// for it as a second `PROPERTY_EXISTS` item instead and the same query costs
+    /// 3.6x, because the column gets read twice. Presence is a property of the
+    /// read, not a separate expression.
     pub fn valid_mask(&self) -> Option<&[bool]> {
         match self {
             Self::Num { valid, .. } | Self::Bool { valid, .. } => valid.as_deref(),

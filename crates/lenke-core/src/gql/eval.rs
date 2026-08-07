@@ -3307,6 +3307,28 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> Col {
         },
         // A bare variable: a carried value column is taken directly (no per-row
         // binding rebuild); an element column becomes a column of element handles.
+        // A `$param` is CONSTANT for the whole query, and without an arm here it
+        // reached `gen(e)` and ran the scalar VM once per row to re-read the same
+        // value — 50k evaluations of a lookup whose answer never changes. Bound
+        // once, broadcast.
+        //
+        // A param is also how every seeded query spells its constant
+        // (`WHERE u.k = $id`), so this is the hot side of the most common
+        // predicate shape there is.
+        CExpr::Param(slot) => match ctx.params.get(*slot) {
+            Some(Val::Num(x)) => Col::Num {
+                d: vec![*x; n],
+                valid: None,
+            },
+            Some(Val::Bool(b)) => Col::Bool {
+                t: vec![*b; n],
+                valid: None,
+            },
+            // Anything richer is broadcast as a boxed column: still one clone per
+            // row, but no VM dispatch and no re-lookup.
+            Some(v) => Col::Gen(vec![v.clone(); n]),
+            None => Col::Gen(vec![Val::Null; n]),
+        },
         CExpr::Var(slot) => {
             if let Some(v) = sc.val_slot(*slot) {
                 typed_val_col(v)
