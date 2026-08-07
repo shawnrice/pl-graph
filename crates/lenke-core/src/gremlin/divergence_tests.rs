@@ -3626,6 +3626,11 @@ fn cross_language_cost_probe() {
             "g.V().hasLabel('V').identity().values('n')",
         ),
         (
+            "where on an EDGE's own property",
+            "MATCH ()-[r:R]->() WHERE r.w = 1 RETURN count(*) AS c",
+            "g.E().hasLabel('R').where(__.values('w').is(1)).count()",
+        ),
+        (
             "filter on the far end of a hop",
             "MATCH ()-[:R]->(b) WHERE b.n = 7 RETURN count(*) AS c",
             "g.V().out('R').has('n', 7).count()",
@@ -4806,5 +4811,70 @@ fn an_identity_step_changes_nothing() {
             "`{with_noop}` differed from `{plain}`"
         );
         assert!(!a.is_empty(), "`{plain}` returned nothing to compare");
+    }
+}
+
+/// A `where`/`not` on an EDGE's own property is a column test too.
+///
+/// Two things kept it on the stream: `self_predicate` built a vertex-side seek,
+/// and the `E()` allowlist — which says what may follow an edge frontier without
+/// being read as a hop off edge ids — did not list the filters. A filter cannot
+/// navigate, so it belongs there.
+///
+/// The adjacency-shaped bodies must still DECLINE from an edge frontier, because
+/// `has_adj` walks a vertex's adjacency and an edge id read as one would walk
+/// whatever vertex shares its number. That is what the last cases check.
+#[test]
+fn a_where_on_an_edge_property_matches_the_stream() {
+    let mut lines = String::new();
+
+    for i in 0..60usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{{}}}}\n"
+        ));
+    }
+    for i in 0..60usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"edge\",\"id\":\"e{i}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{\"w\":{}}}}}\n",
+            (i * 7 + 1) % 60,
+            i % 4
+        ));
+    }
+    // An edge with no `w` at all.
+    lines.push_str(
+        r#"{"type":"edge","id":"ex","from":"n0","to":"n1","labels":["R"],"properties":{}}"#,
+    );
+    lines.push('\n');
+
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    for q in [
+        "g.E().where(__.values('w').is(1)).count()",
+        "g.E().not(__.values('w').is(1)).count()",
+        "g.E().where(__.has('w', gt(1))).count()",
+        "g.E().not(__.has('w', gt(1))).count()",
+        "g.E().hasLabel('R').where(__.values('w').is(0)).count()",
+        "g.E().where(__.values('w').is(1)).id()",
+        // A key no edge carries.
+        "g.E().where(__.values('zz').is(1)).count()",
+        "g.E().not(__.values('zz').is(1)).count()",
+        // Adjacency-shaped from an EDGE frontier: must decline, and still answer.
+        "g.E().where(__.out('R')).count()",
+        "g.E().not(__.out('R')).count()",
+    ] {
+        let (head, tail) = q.split_once('.').expect("a traversal has a step");
+        let streamed = format!("{head}.{}", tail.replacen('.', ".fold().unfold().", 1));
+        let a = super::parse::parse(q)
+            .unwrap_or_else(|e| panic!("`{q}`: {e}"))
+            .run(&mut g);
+        let b = super::parse::parse(&streamed)
+            .unwrap_or_else(|e| panic!("`{streamed}`: {e}"))
+            .run(&mut g);
+
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "`{q}` disagreed with its streamed spelling"
+        );
     }
 }

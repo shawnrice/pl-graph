@@ -825,13 +825,6 @@ fn lower_hops<'a>(graph: &Graph, mut rest: &'a [Step]) -> (Vec<Hop>, &'a [Step])
     (hops, rest)
 }
 
-/// A `where()`/`not()` body as a per-vertex test, or `None` when the adjacency
-/// cannot answer it.
-///
-/// ONE hop probes the adjacency per row and short-circuits on the first
-/// neighbour; SEVERAL walk the chain backwards ONCE and test membership. The
-/// split is about what each costs: the probe touches only the rows asked about,
-/// and the backward pass costs a level per hop but never explores a tree.
 /// A `where`/`not` body that tests the CURRENT element's own property, as a
 /// column test.
 ///
@@ -839,10 +832,15 @@ fn lower_hops<'a>(graph: &Graph, mut rest: &'a [Step]) -> (Vec<Hop>, &'a [Step])
 /// both lower to the same `ElementSeek` conjunct, so the answer comes from
 /// `column_matches` rather than from a traverser.
 ///
-/// Vertices only: `has_adj` and the frontier this feeds are vertex-side, and an
-/// edge id read as a vertex would test whatever vertex shares its number.
-fn self_predicate<'a>(graph: &'a Graph, steps: &[Step]) -> Option<Box<dyn Fn(u32) -> bool + 'a>> {
-    let mut seek = ElementSeek::node();
+/// Works for EITHER kind: a predicate on the element's own property is the same
+/// question for an edge, and `ElementSeek` already knows which store to read.
+/// That is what separates it from the hop forms, which are vertex-only.
+fn self_predicate<'a>(
+    graph: &'a Graph,
+    steps: &[Step],
+    is_edge: bool,
+) -> Option<Box<dyn Fn(u32) -> bool + 'a>> {
+    let mut seek = ElementSeek::same_kind(is_edge);
 
     match steps {
         [Step::Has(key, pred)] => {
@@ -871,8 +869,24 @@ fn self_predicate<'a>(graph: &'a Graph, steps: &[Step]) -> Option<Box<dyn Fn(u32
         return None;
     }
 
-    let ids = seek.scan(graph, &no_params, || graph.vertex_indices().collect());
-    let mut keep = vec![false; graph.vertex_slots()];
+    let universe = || {
+        if is_edge {
+            (0..graph.edge_slots() as u32)
+                .filter(|&e| graph.is_edge_live(e))
+                .collect()
+        } else {
+            graph.vertex_indices().collect()
+        }
+    };
+    let ids = seek.scan(graph, &no_params, universe);
+    let mut keep = vec![
+        false;
+        if is_edge {
+            graph.edge_slots()
+        } else {
+            graph.vertex_slots()
+        }
+    ];
 
     for id in ids {
         keep[id as usize] = true;
@@ -883,7 +897,20 @@ fn self_predicate<'a>(graph: &'a Graph, steps: &[Step]) -> Option<Box<dyn Fn(u32
     }))
 }
 
-fn semi_join_test<'a>(graph: &'a Graph, steps: &[Step]) -> Option<Box<dyn Fn(u32) -> bool + 'a>> {
+/// A `where()`/`not()` body as a per-element test, or `None` when the column and
+/// the adjacency together cannot answer it.
+///
+/// A predicate on the element ITSELF is a column test and works for either kind.
+/// The hop forms are vertex-only: ONE hop probes the adjacency per row and
+/// short-circuits on the first neighbour; SEVERAL walk the chain backwards ONCE
+/// and test membership. The split is about what each costs — the probe touches
+/// only the rows asked about, and the backward pass costs a level per hop but
+/// never explores a tree.
+fn semi_join_test<'a>(
+    graph: &'a Graph,
+    steps: &[Step],
+    is_edge: bool,
+) -> Option<Box<dyn Fn(u32) -> bool + 'a>> {
     // A property predicate on the element ITSELF, written as a sub-traversal:
     // `where(__.values('n').is(gt(5)))` and `where(__.has('n', gt(5)))` are the
     // same question, and neither walks anywhere. The column can answer it, so
@@ -892,8 +919,14 @@ fn semi_join_test<'a>(graph: &'a Graph, steps: &[Step]) -> Option<Box<dyn Fn(u32
     // This is one of the shapes that kept a traversal on the STREAM — the largest
     // single source of stream traffic is `where`/`not`, and the column layer only
     // understood the ones that hop.
-    if let Some(p) = self_predicate(graph, steps) {
+    if let Some(p) = self_predicate(graph, steps, is_edge) {
         return Some(p);
+    }
+
+    // The hop forms below ARE vertex-only: `has_adj` walks a vertex's adjacency,
+    // and an edge id read as one would walk whatever vertex shares its number.
+    if is_edge {
+        return None;
     }
 
     if let Some(hop) = semi_join_hop(graph, steps) {
@@ -1205,6 +1238,11 @@ fn lowered_ids<'a>(graph: &Graph, steps: &'a [Step]) -> Option<(Vec<u32>, &'a [S
                     // kept exactly the case the arm was written for.
                     | Step::ElementMap(_)
                     | Step::Project(..)
+                    // Filters, which cannot navigate anywhere by definition —
+                    // the column arm decides whether it can answer the body, and
+                    // declines an adjacency-shaped one from an edge frontier.
+                    | Step::Where(_)
+                    | Step::Not(_)
             )
         )
     {
@@ -1651,14 +1689,14 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
         //
         // Only from a VERTEX frontier: `has_adj` walks a vertex's adjacency, and
         // an edge id read as one would walk whatever vertex shares its number.
-        [Step::Where(sub), t @ ..] if !is_edge => {
-            let keep = semi_join_test(graph, &sub.steps)?;
+        [Step::Where(sub), t @ ..] => {
+            let keep = semi_join_test(graph, &sub.steps, is_edge)?;
             let kept: Vec<u32> = ids.iter().copied().filter(|&id| keep(id)).collect();
 
             column_paths(graph, &kept, is_edge, t)
         }
-        [Step::Not(sub), t @ ..] if !is_edge => {
-            let keep = semi_join_test(graph, &sub.steps)?;
+        [Step::Not(sub), t @ ..] => {
+            let keep = semi_join_test(graph, &sub.steps, is_edge)?;
             let kept: Vec<u32> = ids.iter().copied().filter(|&id| !keep(id)).collect();
 
             column_paths(graph, &kept, is_edge, t)
