@@ -6101,3 +6101,83 @@ fn lowered_select_with_modulators_agrees_with_the_stream() {
         assert_eq!(lowered, streamed, "{q}");
     }
 }
+
+/// What the expressions `eval_vec` does NOT vectorize actually cost, over 50k
+/// vertices. The list came from enumerating the 32 `CExpr` variants against the
+/// arms; this is what says which are worth an arm.
+///
+/// Measured 2026-08-07, against ~0.12ms for a vectorized count and ~0.165ms for a
+/// vectorized projection:
+///
+///   In                 0.70ms      PropField         1.40  (was 1.93)
+///   IsTyped            1.16        PropField filter  5.13
+///   Case               2.24        Concat            3.99
+///   List               4.40
+///
+/// `PropField` got an arm and moved 1.4x; the rest of ITS cost is `field_at`
+/// navigating the record, which no dispatch change reaches — and the filter form
+/// barely moved at all, so the WHERE path for a dotted key is not going through
+/// here. `Concat`, `List` and `Case` allocate per row by construction (a string, a
+/// list, a branch), so an arm would remove dispatch and nothing else. Recorded so
+/// the next person prices them before writing one.
+#[test]
+#[ignore = "probe"]
+fn what_the_unvectorized_expressions_cost() {
+    let mut lines = String::new();
+    for i in 0..50_000usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{{\"n\":{},\"s\":\"v{}\",\"meta\":{{\"city\":\"c{}\"}}}}}}\n",
+            i % 97,
+            i % 7,
+            i % 11
+        ));
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+    for (name, q) in [
+        (
+            "In",
+            "MATCH (u:V) WHERE u.n IN [1, 2, 3, 4, 5] RETURN count(*) AS c",
+        ),
+        ("PropField", "MATCH (u:V) RETURN u.meta.city AS c"),
+        (
+            "PropField filter",
+            "MATCH (u:V) WHERE u.meta.city = 'c3' RETURN count(*) AS c",
+        ),
+        ("Concat", "MATCH (u:V) RETURN u.s || 'x' AS c"),
+        (
+            "IsTyped",
+            "MATCH (u:V) WHERE u.n IS TYPED INTEGER RETURN count(*) AS c",
+        ),
+        (
+            "Case",
+            "MATCH (u:V) RETURN CASE WHEN u.n > 50 THEN 1 ELSE 0 END AS c",
+        ),
+        ("List", "MATCH (u:V) RETURN [u.n, u.n] AS c"),
+    ] {
+        let mut best = f64::MAX;
+        let mut rows = 0;
+        let mut ok = true;
+        for _ in 0..7 {
+            let Ok(p) = crate::gql::parse(q) else {
+                ok = false;
+                break;
+            };
+            let t = std::time::Instant::now();
+            match p.execute(&mut g, &crate::gql::eval::Params::new()) {
+                Ok(rs) => {
+                    best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+                    rows = rs.nrows;
+                }
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            println!("EXPR {name:<18} {best:>8.3}ms {rows:>6} rows");
+        } else {
+            println!("EXPR {name:<18}    (unsupported syntax)");
+        }
+    }
+}

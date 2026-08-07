@@ -3432,6 +3432,46 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> Col {
                 None => gen(e),
             }
         }
+        // `n.meta.city` — a de-boxed record field, read straight from its
+        // sub-column by `field_at`. Two costs disappear here: the VM dispatch, and
+        // the `Vec<&str>` of descent segments that the scalar form rebuilds PER
+        // ROW for a path that is fixed for the whole query.
+        CExpr::PropField {
+            var_slot,
+            root_key_ref,
+            descent,
+        } => {
+            let segs: Vec<&str> = descent.iter().map(std::convert::AsRef::as_ref).collect();
+            let read = |store: &crate::graph::Properties, kid: Option<u32>, ids: &[u32]| {
+                kid.map_or_else(
+                    // The key was never interned in this store, so every row is
+                    // null — same as the scalar form.
+                    || Col::Gen(vec![Val::Null; ids.len()]),
+                    |kid| {
+                        Col::Gen(
+                            ids.iter()
+                                .map(|&i| {
+                                    value_to_val(&store.field_at(
+                                        i as usize,
+                                        kid,
+                                        &segs,
+                                        &graph.strs,
+                                    ))
+                                })
+                                .collect(),
+                        )
+                    },
+                )
+            };
+
+            match sc.slot(*var_slot) {
+                Some((Elem::Node, ids)) => read(&graph.props, ctx.prop_keys[*root_key_ref].0, ids),
+                Some((Elem::Edge, ids)) => {
+                    read(&graph.edge_props, ctx.prop_keys[*root_key_ref].1, ids)
+                }
+                None => gen(e),
+            }
+        }
         CExpr::Neg(x) => {
             let v = eval_vec(graph, ctx, sc, x);
             // A non-numeric operand → scalar fallback, which raises the type error.
