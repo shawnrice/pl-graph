@@ -625,6 +625,27 @@ fn compile_inner(steps: &[Step], forced: bool) -> Option<Compiled> {
     // (`seek::walk_count`). A pattern that HAS something to plan earns that
     // setup back; one that does not cannot.
     //
+    // RE-TESTED 2026-08-07, after the tail began compiling to a GQL projection
+    // too, and the decline STILL pays. The rejection above was measured when
+    // `plan_pattern_ids` materialized ids for Gremlin's terminals to consume, so
+    // it was fair to ask whether keeping the frame end to end
+    // (`run_pattern_projection`) changed the answer. It does not — relaxing this
+    // decline, over 50k vertices with one out-edge each:
+    //
+    //   V().out(R).count()          0.209ms -> 0.565   2.7x WORSE
+    //   V().out(R)                  0.232   -> 0.587   2.5x
+    //   V().out(R).values(n)        0.302   -> 0.654   2.2x
+    //   V().out(R).values(n).sum()  0.279   -> 0.633   2.3x
+    //   V().out(R).dedup().count()  0.689   -> 1.066   1.5x
+    //
+    // This matters beyond the shapes above: it is the gate on deleting a
+    // CONTAINER rather than an arm. `elem_terminal`'s navigation
+    // (`OutV`/`InV`/`BothV`) and filter (`Where`/`Not`) arms exist only because
+    // the LINEAR route hands ids over MID-traversal, so they can never move into
+    // a tail translator — they would go if every prefix compiled as a pattern.
+    // At 1.5-2.7x, they do not go this way. The container survives; the tail arms
+    // are what the migration can take.
+    //
     // Decline unless some node PAST the start is constrained.
     //
     // That is exactly the condition under which planning can contribute: the

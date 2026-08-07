@@ -12989,3 +12989,59 @@ fn migration_route_cost() {
         println!("{q:<52} {a:>9.3}ms {b:>9.3}ms {:>6.2}x", b / a);
     }
 }
+
+/// Does the `pattern.rs` "nothing past the start is constrained" decline still
+/// cost more than it saves, now that the TAIL compiles to a GQL projection too?
+///
+/// It does. Measured 2026-08-07 by flipping the decline off, 50k vertices with one
+/// out-edge each — the numbers are on `pattern.rs` beside the decline itself:
+/// every shape got 1.5-2.7x WORSE.
+///
+/// The question mattered because this is the gate on deleting a CONTAINER rather
+/// than an arm. `elem_terminal`'s navigation (`OutV`/`InV`/`BothV`) and filter
+/// (`Where`/`Not`) arms exist only because the LINEAR route hands ids over
+/// MID-traversal, so they can never move into a tail translator; they would go if
+/// every prefix compiled as a pattern. At 1.5-2.7x they do not go that way.
+///
+/// So the migration's reach is bounded: it takes TAIL arms, and the container
+/// survives. Re-running this after a change to `build_scan`'s setup cost is the
+/// only thing that would reopen it.
+#[test]
+#[ignore = "probe"]
+fn the_unconstrained_prefix_decline_still_pays() {
+    let mut lines = String::new();
+    for i in 0..50_000usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{{\"n\":{}}}}}\n",
+            i % 97
+        ));
+    }
+    for i in 0..50_000usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"edge\",\"id\":\"e{i}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{}}}}\n",
+            (i * 31 + 1) % 50_000
+        ));
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    // These are the shapes the decline sends down the LINEAR route: nothing past
+    // the start is constrained, so `pattern::compile` refuses them today.
+    for q in [
+        "g.V().out('R').count()",
+        "g.V().out('R')",
+        "g.V().out('R').values('n')",
+        "g.V().out('R').values('n').sum()",
+        "g.V().out('R').dedup().count()",
+    ] {
+        let mut best = f64::MAX;
+        let mut rows = 0;
+        for _ in 0..7 {
+            let p = crate::gremlin::parse(q).expect("parses");
+            let t = std::time::Instant::now();
+            let out = p.run(&mut g);
+            best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+            rows = out.len();
+        }
+        println!("UNC {best:>8.3}ms {rows:>7} rows  {q}");
+    }
+}
