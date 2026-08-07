@@ -1862,6 +1862,26 @@ fn fan_bounds(owners: &[u32], rows: usize) -> Vec<usize> {
 /// it, which is what makes a trailing `count()`/`fold()` a per-ROW reducer rather
 /// than a global one: `union(out('R').count(), …)` counts each vertex's own
 /// neighbours, because the stream hands the branch one traverser at a time.
+/// Drop the rows `keep` rejects from an element column AND its owner column,
+/// together. Every filter in [`fanout`] is this, and each one written out was the
+/// same twelve lines with a different predicate.
+fn retain_owned(cur: &mut Vec<u32>, owners: &mut Vec<u32>, keep: impl Fn(u32) -> bool) {
+    let mask: Vec<bool> = cur.iter().map(|&id| keep(id)).collect();
+    let mut i = 0;
+
+    cur.retain(|_| {
+        i += 1;
+        mask[i - 1]
+    });
+
+    let mut j = 0;
+
+    owners.retain(|_| {
+        j += 1;
+        mask[j - 1]
+    });
+}
+
 fn fanout(graph: &Graph, ids: &[u32], is_edge: bool, steps: &[Step]) -> Option<Fanout> {
     let rows = ids.len();
     let mut cur: Vec<u32> = ids.to_vec();
@@ -1948,18 +1968,7 @@ fn fanout(graph: &Graph, ids: &[u32], is_edge: bool, steps: &[Step]) -> Option<F
         if let [head, t @ ..] = rest {
             if matches!(head, Step::Has(..) | Step::HasLabel(_)) {
                 if let Some(keep) = self_predicate(graph, std::slice::from_ref(head), cur_edge) {
-                    let mut next = Vec::with_capacity(cur.len());
-                    let mut next_owners = Vec::with_capacity(cur.len());
-
-                    for (i, &id) in cur.iter().enumerate() {
-                        if keep(id) {
-                            next.push(id);
-                            next_owners.push(owners[i]);
-                        }
-                    }
-
-                    cur = next;
-                    owners = next_owners;
+                    retain_owned(&mut cur, &mut owners, keep);
                     rest = t;
 
                     continue;
@@ -1972,18 +1981,8 @@ fn fanout(graph: &Graph, ids: &[u32], is_edge: bool, steps: &[Step]) -> Option<F
         if let [head @ (Step::Where(sub) | Step::Not(sub)), t @ ..] = rest {
             if let Some(keep) = semi_join_test(graph, &sub.steps, cur_edge) {
                 let negated = matches!(head, Step::Not(_));
-                let mut next = Vec::with_capacity(cur.len());
-                let mut next_owners = Vec::with_capacity(cur.len());
 
-                for (i, &id) in cur.iter().enumerate() {
-                    if keep(id) != negated {
-                        next.push(id);
-                        next_owners.push(owners[i]);
-                    }
-                }
-
-                cur = next;
-                owners = next_owners;
+                retain_owned(&mut cur, &mut owners, |id| keep(id) != negated);
                 rest = t;
 
                 continue;
@@ -2300,85 +2299,77 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
         // column terminals, not inside them. The tightening below is what lets the
         // non-navigating tails land, and neutering it drops `optional(out(R)).id()`
         // from 6.4x to 1.2x.
-        [Step::Union(plans), t @ ..] => {
-            let fans = plans
-                .iter()
-                .map(|p| fanout(graph, ids, is_edge, &p.steps))
-                .collect::<Option<Vec<_>>>()?;
-            let mut out = Vec::new();
-
-            for row in 0..ids.len() {
-                for f in &fans {
-                    out.extend_from_slice(f.row(row));
+        // All five are ONE operation: evaluate each body over the frontier, then
+        // pick per row. `union` takes every body, `coalesce` the first that hit,
+        // `optional` the body or the element, `choose` the test's branch, `local`
+        // the single body. They were five arms with the same eight lines in each.
+        [Step::Union(_)
+        | Step::Local(_)
+        | Step::Coalesce(_)
+        | Step::Optional(_)
+        | Step::Choose { .. }, t @ ..] => {
+            let head = rest.first().expect("matched at least one step");
+            // Bodies in evaluation order. `choose` puts its TEST first, so the
+            // picker below can read index 0 as the probe.
+            let bodies: Vec<&[Step]> = match head {
+                Step::Union(plans) | Step::Coalesce(plans) => {
+                    plans.iter().map(|p| p.steps.as_slice()).collect()
                 }
-            }
+                Step::Local(sub) | Step::Optional(sub) => vec![sub.steps.as_slice()],
+                Step::Choose { test, then_, else_ } => {
+                    let mut v = vec![test.steps.as_slice(), then_.steps.as_slice()];
 
-            col_terminal(graph, col_of_branch(out), t)
-        }
-        // `local(b)` is the degenerate branch: one body, all of its rows, in row
-        // order. Same fanout, no choosing.
-        [Step::Local(sub), t @ ..] => {
-            let fan = fanout(graph, ids, is_edge, &sub.steps)?;
-            let mut out = Vec::new();
+                    if let Some(e) = else_ {
+                        v.push(e.steps.as_slice());
+                    }
 
-            for row in 0..ids.len() {
-                out.extend_from_slice(fan.row(row));
-            }
-
-            col_terminal(graph, col_of_branch(out), t)
-        }
-        // The FIRST body that produces anything, per row. A row where none does
-        // drops out entirely.
-        [Step::Coalesce(plans), t @ ..] => {
-            let fans = plans
-                .iter()
-                .map(|p| fanout(graph, ids, is_edge, &p.steps))
-                .collect::<Option<Vec<_>>>()?;
-            let mut out = Vec::new();
-
-            for row in 0..ids.len() {
-                if let Some(f) = fans.iter().find(|f| f.hit(row)) {
-                    out.extend_from_slice(f.row(row));
+                    v
                 }
-            }
-
-            col_terminal(graph, col_of_branch(out), t)
-        }
-        // `optional(b)` is `coalesce(b, identity)`: the body's rows, or the
-        // incoming element untouched when it produced none.
-        [Step::Optional(sub), t @ ..] => {
-            let fan = fanout(graph, ids, is_edge, &sub.steps)?;
-            let mut out = Vec::new();
-
-            for (row, &id) in ids.iter().enumerate() {
-                if fan.hit(row) {
-                    out.extend_from_slice(fan.row(row));
-                } else {
-                    out.push(frontier_val(id, is_edge));
-                }
-            }
-
-            col_terminal(graph, col_of_branch(out), t)
-        }
-        // `choose(test, then, else?)` routes each row by whether the TEST body
-        // produced anything. With no else the row passes through unchanged, which
-        // is the arity distinction the emitter also has to keep.
-        [Step::Choose { test, then_, else_ }, t @ ..] => {
-            let probe = fanout(graph, ids, is_edge, &test.steps)?;
-            let yes = fanout(graph, ids, is_edge, &then_.steps)?;
-            let no = match else_ {
-                Some(e) => Some(fanout(graph, ids, is_edge, &e.steps)?),
-                None => None,
+                _ => unreachable!("guarded by the pattern above"),
             };
+            let fans = bodies
+                .iter()
+                .map(|b| fanout(graph, ids, is_edge, b))
+                .collect::<Option<Vec<_>>>()?;
             let mut out = Vec::new();
 
+            // ROW-MAJOR: the stream loops `for t in stream { for p in plans { … } }`,
+            // so row 0's bodies all come before row 1's. Emitting body-major returns
+            // the same multiset in a different sequence — a byte-identity break no
+            // count-based test would show.
             for (row, &id) in ids.iter().enumerate() {
-                if probe.hit(row) {
-                    out.extend_from_slice(yes.row(row));
-                } else if let Some(f) = &no {
-                    out.extend_from_slice(f.row(row));
-                } else {
-                    out.push(frontier_val(id, is_edge));
+                match head {
+                    Step::Union(_) | Step::Local(_) => {
+                        for f in &fans {
+                            out.extend_from_slice(f.row(row));
+                        }
+                    }
+                    Step::Coalesce(_) => {
+                        if let Some(f) = fans.iter().find(|f| f.hit(row)) {
+                            out.extend_from_slice(f.row(row));
+                        }
+                    }
+                    // The body's rows, or the incoming element untouched.
+                    Step::Optional(_) => {
+                        if fans[0].hit(row) {
+                            out.extend_from_slice(fans[0].row(row));
+                        } else {
+                            out.push(frontier_val(id, is_edge));
+                        }
+                    }
+                    // Routed by whether the TEST body produced anything. With no
+                    // else the row passes through — the arity distinction the
+                    // emitter also has to keep.
+                    Step::Choose { .. } => {
+                        if fans[0].hit(row) {
+                            out.extend_from_slice(fans[1].row(row));
+                        } else if let Some(f) = fans.get(2) {
+                            out.extend_from_slice(f.row(row));
+                        } else {
+                            out.push(frontier_val(id, is_edge));
+                        }
+                    }
+                    _ => unreachable!("guarded by the pattern above"),
                 }
             }
 
@@ -5408,58 +5399,65 @@ fn apply(graph: &mut Graph, ctx: &mut Ctx, step: &Step, stream: Vec<Trav>) -> Ve
                 .filter(|t| !sub_nonempty(graph, ctx, sub, t))
                 .collect(),
         },
-        Step::Union(plans) => {
+        // The five branch steps, which differ only in which body's rows a
+        // traverser keeps. Each runs its bodies on ONE traverser at a time — that
+        // is what makes a trailing `count()`/`fold()` inside a body per-row rather
+        // than global — so the loop is shared and only the choosing is not.
+        Step::Union(_) | Step::Coalesce(_) | Step::Optional(_) | Step::Local(_)
+        | Step::Choose { .. } => {
             let mut next = Vec::new();
-            for t in &stream {
-                for p in plans {
-                    next.extend(run_steps(graph, ctx, &p.steps, vec![t.clone()]));
+
+            for t in stream {
+                // Inlined rather than a closure: each call needs `&mut Graph`, so a
+                // closure holding it would keep the borrow across the match.
+                macro_rules! one {
+                    ($sub:expr) => {
+                        run_steps(graph, ctx, &$sub.steps, vec![t.clone()])
+                    };
                 }
-            }
-            next
-        }
-        Step::Coalesce(plans) => {
-            let mut next = Vec::new();
-            for t in &stream {
-                for p in plans {
-                    let r = run_steps(graph, ctx, &p.steps, vec![t.clone()]);
-                    if !r.is_empty() {
-                        next.extend(r);
-                        break;
+
+                match step {
+                    Step::Union(plans) => {
+                        for p in plans {
+                            next.extend(one!(p));
+                        }
                     }
+                    Step::Local(sub) => next.extend(one!(sub)),
+                    // The FIRST body that produces anything.
+                    Step::Coalesce(plans) => {
+                        for p in plans {
+                            let r = one!(p);
+
+                            if !r.is_empty() {
+                                next.extend(r);
+                                break;
+                            }
+                        }
+                    }
+                    // The body's rows, or the traverser itself.
+                    Step::Optional(sub) => {
+                        let r = one!(sub);
+
+                        if r.is_empty() {
+                            next.push(t);
+                        } else {
+                            next.extend(r);
+                        }
+                    }
+                    // Routed by the test; with no else the traverser passes through.
+                    Step::Choose { test, then_, else_ } => {
+                        if sub_nonempty(graph, ctx, test, &t) {
+                            next.extend(one!(then_));
+                        } else if let Some(e) = else_ {
+                            next.extend(one!(e));
+                        } else {
+                            next.push(t);
+                        }
+                    }
+                    _ => unreachable!("guarded by the pattern above"),
                 }
             }
-            next
-        }
-        Step::Optional(sub) => {
-            let mut next = Vec::new();
-            for t in stream {
-                let r = run_steps(graph, ctx, &sub.steps, vec![t.clone()]);
-                if r.is_empty() {
-                    next.push(t);
-                } else {
-                    next.extend(r);
-                }
-            }
-            next
-        }
-        Step::Local(sub) => {
-            let mut next = Vec::new();
-            for t in &stream {
-                next.extend(run_steps(graph, ctx, &sub.steps, vec![t.clone()]));
-            }
-            next
-        }
-        Step::Choose { test, then_, else_ } => {
-            let mut next = Vec::new();
-            for t in stream {
-                if sub_nonempty(graph, ctx, test, &t) {
-                    next.extend(run_steps(graph, ctx, &then_.steps, vec![t]));
-                } else if let Some(e) = else_ {
-                    next.extend(run_steps(graph, ctx, &e.steps, vec![t]));
-                } else {
-                    next.push(t);
-                }
-            }
+
             next
         }
         Step::Branch {
