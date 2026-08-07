@@ -5219,3 +5219,65 @@ fn a_label_self_predicate_matches_the_stream() {
         );
     }
 }
+
+/// `inject` inside a SUB-traversal, which the differential fuzzer does not reach.
+///
+/// It generates no `inject` and no `union`/`coalesce`/`choose` sub-traversals, so
+/// TS-vs-native agreement here rests on tests like this one. The expectations
+/// below were taken from the TS engine and match it value for value.
+///
+/// The semantics worth pinning: `inject` ADDS to the stream rather than replacing
+/// it, so a sub-traversal that injects also passes its incoming traverser
+/// through. That is why `coalesce(values('nope'), inject('fallback'))` yields the
+/// fallback AND the vertex — the `constant()` idiom is the one that yields only a
+/// fallback — and why `where(__.inject(1))` never filters anything, since a
+/// sub-traversal that always emits is always true.
+#[test]
+fn inject_inside_a_subtraversal_agrees_with_the_ts_engine() {
+    let mut g = modern();
+    let run = |g: &mut Graph, q: &str| -> Vec<String> {
+        super::parse::parse(q)
+            .unwrap_or_else(|e| panic!("`{q}`: {e}"))
+            .run(g)
+            .iter()
+            .map(|v| match v {
+                GVal::Str(s) => s.to_string(),
+                GVal::Num(n) => format!("{n}"),
+                GVal::Node(_) => "<vertex>".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    };
+
+    // The injected value, then the incoming vertex, then the other branch.
+    assert_eq!(
+        run(
+            &mut g,
+            "g.V().limit(1).union(__.inject('x'), __.values('name'))"
+        ),
+        vec!["x", "<vertex>", "marko"]
+    );
+    // 6 vertices: each yields the injection plus itself, plus 6 names.
+    assert_eq!(
+        run(
+            &mut g,
+            "g.V().union(__.inject('x'), __.values('name')).count()"
+        ),
+        vec!["18"]
+    );
+    // The fallback AND the vertex — `inject` is not `constant`.
+    assert_eq!(
+        run(
+            &mut g,
+            "g.V().limit(1).coalesce(__.values('nope'), __.inject('fallback'))"
+        ),
+        vec!["fallback", "<vertex>"]
+    );
+    // A sub-traversal that always emits is always true, so this filters nothing.
+    assert_eq!(
+        run(&mut g, "g.V().limit(1).where(__.inject(1)).count()"),
+        vec!["1"]
+    );
+    // `map` takes the FIRST result, which is the injected value.
+    assert_eq!(run(&mut g, "g.V().limit(1).map(__.inject('m'))"), vec!["m"]);
+}
