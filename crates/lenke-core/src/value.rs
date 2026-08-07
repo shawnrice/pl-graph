@@ -636,6 +636,21 @@ impl<'a> Col<'a> {
     /// as an ISO record and Gremlin as a map. The caller falls back to its own
     /// per-row read, which is what it did before this existed.
     #[must_use]
+    /// The validity mask, when the column carries one — `None` means every row
+    /// is valid, which is the common case and the reason the mask is optional.
+    ///
+    /// Read by Gremlin's `values(k)`, where an INVALID row means the key is
+    /// absent and the row is dropped rather than nulled. That is the one place the
+    /// two languages disagree about a missing property, and taking the mask the
+    /// store already built is what keeps the disagreement free — evaluating
+    /// `PROPERTY_EXISTS` per row through the expression VM instead measured 11x.
+    pub fn valid_mask(&self) -> Option<&[bool]> {
+        match self {
+            Self::Num { valid, .. } | Self::Bool { valid, .. } => valid.as_deref(),
+            Self::Elems { .. } | Self::Gen(_) => None,
+        }
+    }
+
     pub fn from_property(
         col: Option<&crate::graph::Column>,
         ids: &[u32],

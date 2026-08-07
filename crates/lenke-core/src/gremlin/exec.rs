@@ -2484,6 +2484,29 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
 }
 
 /// `values(k)` and whatever follows it, answered from the typed column.
+/// The `values(k)` column, and whatever terminal follows it.
+///
+/// Reads the property through the SHARED [`Col::from_property`] — the same
+/// constructor GQL's projection uses — instead of a reader of its own. This used
+/// to walk the store itself and only for a homogeneous NUMBER column; a
+/// `Str`/`Bool`/`Temporal` property fell to the stream for want of a reader, where
+/// the shared one has had them all along.
+///
+/// # Where the sharing stops, and why
+///
+/// Routing this through GQL's `CProjection` instead — `project_ids`, one level up
+/// — was implemented and REVERTED, with numbers. `values(k)` DROPS a row whose key
+/// is absent and KEEPS one whose stored value is null, which as a projection is
+/// `RETURN k, PROPERTY_EXISTS(elem, k)` with the presence column doing the
+/// dropping. It is expressible, it is correct, and it cost 11x: the presence
+/// column evaluates through the expression VM once per row, where `from_property`
+/// hands back a `valid` mask the store already had. Measured on the arm audit,
+/// `values(n)` went 29.1x over the stream to 2.5x.
+///
+/// The lesson generalizes past this arm: the two engines share the COLUMN
+/// primitives profitably, and sharing the expression layer above them is not free
+/// for a projection this simple. An isolated probe said 0.80x because it timed a
+/// one-item projection and the implementation needed two.
 fn column_terminal(
     graph: &Graph,
     ids: &[u32],
@@ -2496,11 +2519,6 @@ fn column_terminal(
     let [key] = keys else {
         return None;
     };
-    let store = if is_edge {
-        &graph.edge_props
-    } else {
-        &graph.props
-    };
     // Split an optional `is(P)` off the front. `is` filters the CURRENT value,
     // which after `values(k)` is a column value — so there, and only there, it is
     // a column predicate rather than a test on a graph element.
@@ -2508,80 +2526,88 @@ fn column_terminal(
         [Step::Is(p), t @ ..] => (Some(p), t),
         t => (None, t),
     };
+    let store = if is_edge {
+        &graph.edge_props
+    } else {
+        &graph.props
+    };
     let Some(kid) = store.keys.get(key) else {
         // No element ever carried this key, so `values(k)` emits nothing and
         // every terminal folds the empty stream. `is` cannot change that.
         return empty_column_terminal(tail);
     };
 
-    // A homogeneous NUMBER column answers the filter and every numeric aggregate
-    // straight from `data`. Any other column type is left to the stream: a
-    // `Str`/`Bool`/`Temporal`/`Mixed` value under `sum()`/`mean()` is a type
-    // FAULT rather than a skipped row, and answering it here would make the
-    // lowering observable.
-    //
-    // NOT lowered: `min()`/`max()` over a `Str` column. It is well defined
-    // (`values('k').min()` is the lexicographic minimum) but a `Str` column holds
-    // INTERNED IDS, whose numeric order is insertion order and has nothing to do
-    // with the text — so every comparison needs a dictionary lookup, which is the
-    // per-value work the stream already does. There is no column read to win.
-    if let Some(crate::graph::Column::Num { data, present }) = store.cols.get(kid as usize) {
-        let mut nums: Vec<f64> = Vec::with_capacity(ids.len());
-
-        for &id in ids {
-            let i = id as usize;
-
-            if present.get(i) {
-                nums.push(data[i]);
-            }
-        }
-
-        // `is(P)` over a number column NARROWS THE COLUMN, so it is applied here
-        // rather than inside the terminals: every arm downstream then sees a
-        // column that is already filtered, instead of each having to know about a
-        // pending predicate. This is what let the numeric terminals stop being a
-        // separate interpreter.
-        if let Some(p) = filter {
-            let t = num_test(p)?;
-
-            if t.faults_on_nan && nums.iter().any(|x| x.is_nan()) {
-                return None; // the stream faults here; do not answer instead
+    // `None` = a `Mixed`/`Vec`/`Record` column, which the shared constructor
+    // leaves to its caller; that read is below.
+    // A row whose key is ABSENT is DROPPED; one whose stored value is null rides
+    // through. How absence arrives depends on the column kind, so this asks the
+    // store rather than inferring it from the built column — a `Gen` full of
+    // nulls means "absent" from a `Str` column and could mean "stored null" if the
+    // shared constructor ever learns `Mixed`.
+    let stored = store.cols.get(kid as usize);
+    let mut col = match Col::from_property(stored, ids, &graph.strs) {
+        Some(mut c) => {
+            match stored {
+                // Typed: `valid` mirrors the store's presence set exactly.
+                Some(crate::graph::Column::Num { .. } | crate::graph::Column::Bool { .. }) => {
+                    if let Some(keep) = c.valid_mask().map(<[bool]>::to_vec) {
+                        c.retain_rows(&keep);
+                    }
+                }
+                // Boxed into `Gen` with a null per absent row, and these columns
+                // cannot hold a STORED null — one would force `Mixed` — so every
+                // null here is an absence.
+                Some(crate::graph::Column::Str { .. } | crate::graph::Column::Temporal { .. }) => {
+                    if let Col::Gen(vals) = &mut c {
+                        vals.retain(|v| !matches!(v, GVal::Null));
+                    }
+                }
+                // No column at all is handled by the `kid` lookup above; anything
+                // else the constructor declines and the per-row read below runs.
+                _ => return None,
             }
 
-            nums.retain(|&x| (t.test)(x));
+            c
+        }
+        None => {
+            let mut out = Vec::with_capacity(ids.len());
+
+            for &id in ids {
+                let i = id as usize;
+
+                // Gate on PRESENCE, not value != Null: a present null rides through.
+                if store.is_present_id(i, kid) {
+                    out.push(value_to_gval(store.value_id(i, kid, &graph.strs)));
+                }
+            }
+
+            Col::Gen(out)
+        }
+    };
+
+    // `is(P)` over a number column NARROWS THE COLUMN, so it is applied here
+    // rather than inside the terminals: every arm downstream then sees a column
+    // that is already filtered, instead of each having to know about a pending
+    // predicate. This is what let the numeric terminals stop being a separate
+    // interpreter.
+    if let Some(p) = filter {
+        let Col::Num { d, valid: None } = &mut col else {
+            // A predicate over anything but a plain number column runs per value:
+            // a `Str`/`Bool`/`Temporal` under a numeric test is a type FAULT
+            // rather than a skipped row, and answering it here would make the
+            // lowering observable.
+            return None;
+        };
+        let t = num_test(p)?;
+
+        if t.faults_on_nan && d.iter().any(|x| x.is_nan()) {
+            return None; // the stream faults here; do not answer instead
         }
 
-        if let Some(out) = col_terminal(
-            graph,
-            Col::Num {
-                d: nums,
-                valid: None,
-            },
-            tail,
-        ) {
-            return Some(out);
-        }
-
-        // Fall through: a shape the column arms declined may still be a plain
-        // projection below.
+        d.retain(|&x| (t.test)(x));
     }
 
-    if filter.is_some() {
-        return None; // a filter this layer could not express has to run per value
-    }
-
-    let mut out = Vec::with_capacity(ids.len());
-
-    for &id in ids {
-        let i = id as usize;
-
-        // Gate on PRESENCE, not value != Null: a present null rides through.
-        if store.is_present_id(i, kid) {
-            out.push(value_to_gval(store.value_id(i, kid, &graph.strs)));
-        }
-    }
-
-    col_terminal(graph, Col::Gen(out), tail)
+    col_terminal(graph, col, tail)
 }
 
 /// Distinct values in FIRST-SEEN order — the whole of a plain `dedup()`.
