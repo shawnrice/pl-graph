@@ -3641,6 +3641,26 @@ fn cross_language_cost_probe() {
             "g.E().hasLabel('R').inV().values('n')",
         ),
         (
+            "select over a hop (pattern tags)",
+            "MATCH (u:V)-[:R]->(x) RETURN count(*) AS c",
+            "g.V().as('x').out('R').select('x').count()",
+        ),
+        (
+            "select with a by() modulator",
+            "MATCH (u:V)-[:R]->(x) RETURN count(*) AS c",
+            "g.V().as('x').out('R').select('x').by('n').count()",
+        ),
+        (
+            "select with Pop.all",
+            "MATCH (u:V)-[:R]->(x) RETURN count(*) AS c",
+            "g.V().as('x').out('R').select(all, 'x').count()",
+        ),
+        (
+            "select with no hop at all",
+            "MATCH (u:V) RETURN count(*) AS c",
+            "g.V().hasLabel('V').as('x').select('x').count()",
+        ),
+        (
             "an unread as() tag",
             "MATCH (u:V) RETURN count(*) AS c",
             "g.V().hasLabel('V').as('x').count()",
@@ -5067,5 +5087,60 @@ fn an_unread_tag_is_free_and_a_read_one_still_works() {
             "`{q}` disagreed with its streamed spelling"
         );
         assert!(!a.is_empty(), "`{q}` returned nothing to compare");
+    }
+}
+
+/// `select` off a tag COLUMN, and the alignment that makes it valid.
+///
+/// A tag is a snapshot of the column at the point `as()` ran, so `select` is a
+/// column read — `V().hasLabel(L).as('x').select('x').count()` was 3.776ms and is
+/// 0.009. (`select` across a HOP was already columnar via the pattern planner;
+/// this is the hop-free case it declines.)
+///
+/// The snapshot is only valid while it stays ROW-ALIGNED with the current
+/// column, and every case below with a step between the `as` and the `select`
+/// exists because it was WRONG first: `as('x').limit(2).select('x')` returned six
+/// rows against the stream's two, because the page applied to the current column
+/// and not to the tag. Those steps now decline while a tag is live.
+#[test]
+fn select_off_a_tag_column_matches_the_stream() {
+    let mut g = modern();
+
+    for q in [
+        // No step in between: the column read.
+        "g.V().as('x').select('x').id()",
+        "g.V().hasLabel('PERSON').as('x').select('x').count()",
+        "g.V().as('x').select('x').values('name')",
+        // Two tags, and the map that selecting both builds.
+        "g.V().as('x').as('y').select('x','y').count()",
+        // A step BETWEEN the tag and the read — each of these was wrong.
+        "g.V().as('x').limit(2).select('x').id()",
+        "g.V().as('x').skip(2).select('x').id()",
+        "g.V().as('x').range(1,3).select('x').id()",
+        "g.V().as('x').tail(2).select('x').id()",
+        "g.V().as('x').dedup().select('x').id()",
+        "g.V().as('x').out('KNOWS').select('x').id()",
+        "g.V().as('x').order().by('name').select('x').id()",
+        "g.V().as('x').where(__.has('name','marko')).select('x').id()",
+        // The two spellings that are not a column read at all.
+        "g.V().as('x').select(all, 'x').count()",
+        "g.V().as('x').out('KNOWS').select('x').by('name').count()",
+        // A label that was never bound: `select` drops every row.
+        "g.V().as('x').select('zz').count()",
+    ] {
+        let (head, tail) = q.split_once('.').expect("a traversal has a step");
+        let streamed = format!("{head}.{}", tail.replacen('.', ".fold().unfold().", 1));
+        let a = super::parse::parse(q)
+            .unwrap_or_else(|e| panic!("`{q}`: {e}"))
+            .run(&mut g);
+        let b = super::parse::parse(&streamed)
+            .unwrap_or_else(|e| panic!("`{streamed}`: {e}"))
+            .run(&mut g);
+
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "`{q}` disagreed with its streamed spelling"
+        );
     }
 }

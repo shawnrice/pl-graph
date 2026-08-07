@@ -1433,6 +1433,30 @@ impl Col<'_> {
 /// tail keeps reaching every arm rather than only the ones its representation's
 /// old interpreter happened to carry.
 fn col_terminal(graph: &Graph, col: Col, tail: &[Step]) -> Option<Vec<GVal>> {
+    col_terminal_tagged(graph, col, &mut Vec::new(), tail)
+}
+
+/// [`col_terminal`] carrying the tags `as()` has bound.
+///
+/// A tag is a SNAPSHOT of the column at the point `as()` ran, so `select` is a
+/// column read rather than a per-traverser recall. The pattern planner already
+/// does this for tags it binds across a HOP — where the columns come out of the
+/// join — and this covers the case it declines, which is the one with no hop at
+/// all: `V().hasLabel(L).as('x').select('x')` was 3.776ms against 0.009 for the
+/// same count without the tag.
+///
+/// ALIGNMENT is the whole difficulty. A tag column is row-aligned with the
+/// current one, and stays that way only if every later step applies the same row
+/// transform to both. Rather than thread that through every arm, any step that
+/// CHANGES the rows declines while a tag is live — which is sound because the
+/// stream then re-runs the traversal from the start. Widening that is what lets
+/// more of `select` come off the stream later; it is not a correctness gap.
+fn col_terminal_tagged(
+    graph: &Graph,
+    col: Col,
+    tags: &mut Vec<(String, Col<'static>)>,
+    tail: &[Step],
+) -> Option<Vec<GVal>> {
     #[allow(clippy::cast_precision_loss)]
     match tail {
         // Nothing follows: the column IS the answer.
@@ -1447,8 +1471,10 @@ fn col_terminal(graph: &Graph, col: Col, tail: &[Step]) -> Option<Vec<GVal>> {
         // Writing a terminal arm per COMBINATION is how the old lists got holes in
         // them: `dedup()` had an arm only when followed by `count()`, so
         // `dedup().limit(5)` streamed.
-        [Step::Dedupe { labels, bys }, t @ ..] if labels.is_empty() && bys.is_empty() => {
-            col_terminal(graph, col.dedup(), t)
+        [Step::Dedupe { labels, bys }, t @ ..]
+            if labels.is_empty() && bys.is_empty() && tags.is_empty() =>
+        {
+            col_terminal_tagged(graph, col.dedup(), tags, t)
         }
         // Steps that do NOTHING to the values. `barrier()` synchronizes a stream
         // and a column is already materialized; `identity()` is identity in both.
@@ -1456,7 +1482,7 @@ fn col_terminal(graph: &Graph, col: Col, tail: &[Step]) -> Option<Vec<GVal>> {
         // no-op — but without an arm here, a traversal containing one fell off
         // the column path entirely and ran as a stream, which is 435 traversals
         // in the suite dropped by a step that does nothing.
-        [Step::Barrier | Step::Identity, t @ ..] => col_terminal(graph, col, t),
+        [Step::Barrier | Step::Identity, t @ ..] => col_terminal_tagged(graph, col, tags, t),
         // `as('a')` writes a tag onto every traverser. If nothing after it ever
         // READS a tag, that is work with no reader — the same test the pattern
         // planner already makes before it bothers carrying tag columns.
@@ -1469,12 +1495,58 @@ fn col_terminal(graph: &Graph, col: Col, tail: &[Step]) -> Option<Vec<GVal>> {
         // learns any of those steps, and because "correct for the reason stated"
         // is worth more than "correct because something else happens to fail
         // first".
-        [Step::As(_), t @ ..] if !reads_tags(t) => col_terminal(graph, col, t),
+        [Step::As(_), t @ ..] if !reads_tags(t) => col_terminal_tagged(graph, col, tags, t),
+        // A tag is a SNAPSHOT of the column here. Cheap for an element column —
+        // it is a `Vec<u32>` — and it is what makes `select` a column read.
+        [Step::As(name), t @ ..] => {
+            tags.push((name.clone(), col.clone().into_owned()));
+
+            col_terminal_tagged(graph, col, tags, t)
+        }
+        // `select` over tags this traversal bound. One label yields that column;
+        // several yield a map per row, sharing one key vector.
+        //
+        // `Pop::All` yields a LIST per label rather than the value, and a `by()`
+        // evaluates a modulator per row — neither is a column read, so both keep
+        // the stream. Same two exclusions the pattern planner's select makes.
+        [Step::Select { labels, pop, bys }, t @ ..]
+            if !matches!(pop, Pop::All) && bys.is_empty() && !tags.is_empty() =>
+        {
+            let picked: Vec<&Col<'static>> = labels
+                .iter()
+                .map(|l| tags.iter().rev().find(|(n, _)| n == l).map(|(_, c)| c))
+                .collect::<Option<Vec<_>>>()?;
+
+            // Every label resolved, so `select` drops no row.
+            let next = if let [one] = picked.as_slice() {
+                (*one).clone()
+            } else {
+                let keys: Arc<Vec<GVal>> = Arc::new(
+                    labels
+                        .iter()
+                        .map(|l| GVal::Str(Arc::from(l.as_str())))
+                        .collect(),
+                );
+
+                Col::Gen(
+                    (0..col.len())
+                        .map(|i| {
+                            GVal::Map(crate::value::MapVal::with_keys(
+                                keys.clone(),
+                                picked.iter().map(|c| c.val_at(i)).collect(),
+                            ))
+                        })
+                        .collect(),
+                )
+            };
+
+            col_terminal_tagged(graph, next, &mut Vec::new(), t)
+        }
         // `unfold()` expands a LIST into its elements and passes anything else
         // through. An element column and an unboxed scalar column can never hold
         // a list, so for those it is the identity above — only a boxed column can
         // actually flatten.
-        [Step::Unfold, t @ ..] => {
+        [Step::Unfold, t @ ..] if tags.is_empty() => {
             let next = match col {
                 Col::Gen(v) => Col::Gen(
                     v.into_iter()
@@ -1487,17 +1559,35 @@ fn col_terminal(graph: &Graph, col: Col, tail: &[Step]) -> Option<Vec<GVal>> {
                 other => other,
             };
 
-            col_terminal(graph, next, t)
+            col_terminal_tagged(graph, next, tags, t)
         }
-        [Step::Limit(n, Scope::Global), t @ ..] => col_terminal(graph, col.page(0, *n), t),
-        [Step::Skip(n, Scope::Global), t @ ..] => col_terminal(graph, col.page(*n, usize::MAX), t),
-        [Step::Range(lo, hi, Scope::Global), t @ ..] => col_terminal(graph, col.page(*lo, *hi), t),
+        [Step::Limit(n, Scope::Global), t @ ..] if tags.is_empty() => {
+            col_terminal_tagged(graph, col.page(0, *n), tags, t)
+        }
+        [Step::Skip(n, Scope::Global), t @ ..] if tags.is_empty() => {
+            col_terminal_tagged(graph, col.page(*n, usize::MAX), tags, t)
+        }
+        [Step::Range(lo, hi, Scope::Global), t @ ..] if tags.is_empty() => {
+            col_terminal_tagged(graph, col.page(*lo, *hi), tags, t)
+        }
         // `tail(n)` is the LAST n — a slice like the others, from the other end.
-        [Step::Tail(n, Scope::Global), t @ ..] => {
+        [Step::Tail(n, Scope::Global), t @ ..] if tags.is_empty() => {
             let lo = col.len().saturating_sub(*n);
 
-            col_terminal(graph, col.page(lo, usize::MAX), t)
+            col_terminal_tagged(graph, col.page(lo, usize::MAX), tags, t)
         }
+        // A tag is live and this is not a step kept aligned above. The handlers
+        // below know nothing about tags, so reaching them would drop the
+        // snapshot — decline, and the stream re-runs the traversal intact.
+        //
+        // Unlike the `tags.is_empty()` guards on the paging arms, which ARE
+        // load-bearing (removing the one on `limit` fails the tag test), this one
+        // is currently defensive: everything below either has no arm for the step
+        // or recurses through `column_paths`, which starts a FRESH tag scope — so
+        // a later `select` finds no tag and declines anyway. It becomes real the
+        // moment those handlers thread tags, and it says what the invariant is
+        // rather than leaving it to be re-derived.
+        _ if !tags.is_empty() => None,
         // What only one representation can answer.
         _ => match col {
             Col::Elems { ids, is_edge } => elem_terminal(graph, &ids, is_edge, tail),

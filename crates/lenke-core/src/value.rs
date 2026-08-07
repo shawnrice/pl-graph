@@ -700,6 +700,21 @@ impl<'a> Col<'a> {
         })
     }
 
+    /// The same column, owning its data — for a caller that must outlive the
+    /// borrow, such as a tag snapshot held across later steps.
+    #[must_use]
+    pub fn into_owned(self) -> Col<'static> {
+        match self {
+            Self::Elems { ids, is_edge } => Col::Elems {
+                ids: std::borrow::Cow::Owned(ids.into_owned()),
+                is_edge,
+            },
+            Self::Num { d, valid } => Col::Num { d, valid },
+            Self::Bool { t, valid } => Col::Bool { t, valid },
+            Self::Gen(v) => Col::Gen(v),
+        }
+    }
+
     /// Row `i` as a value. Cheap for the typed variants; a `Str` is an `Arc`
     /// bump.
     #[must_use]
