@@ -2588,32 +2588,6 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
     // query whose answer is `ids.len()` — and it copied again on every peel, so a
     // `dedup().limit(2).count()` paid for three.
     match rest {
-        // `id()` / `label()` are pure per-element projections of the frontier —
-        // the same shape as `values(k)`, reading the id/label dictionaries
-        // instead of a property column.
-        //
-        // Both arms stay, but for different reasons. `to_gql::tail` now covers
-        // `id()` for EITHER element kind (GQL's own `element_id()` shares the
-        // same `Value::element_id` this arm calls), so in normal operation this
-        // is reached only through `MIGRATE_OFF` — the divergence test's
-        // reference-comparison switch (`the_migration_route_agrees_with_the_
-        // route_it_replaces`), which depends on this arm staying put; probed
-        // empirically (`MIGRATE_OFF` on, `g.V().id()`/`g.E().id()`): reached
-        // every time, `to_gql::tail`'s own arm otherwise: never. `label()`
-        // migrates only off a known EDGE frontier (`type(e)` has no vertex
-        // equivalent — see `to_gql::tail`'s comment), so a VERTEX `label()`
-        // reaches this arm even with migration ON — the same probe on
-        // `g.V().label()` confirms it every time.
-        [Step::Id] => {
-            #[cfg(test)]
-            ID_LABEL_ARM_HIT.with(|c| c.set(c.get() + 1));
-
-            Some(
-                ids.iter()
-                    .map(|&id| elem_id(graph, &frontier_val(id, is_edge)))
-                    .collect(),
-            )
-        }
         [Step::Label] => {
             #[cfg(test)]
             ID_LABEL_ARM_HIT.with(|c| c.set(c.get() + 1));
@@ -2621,66 +2595,6 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
             Some(
                 ids.iter()
                     .map(|&id| elem_label(graph, &frontier_val(id, is_edge)))
-                    .collect(),
-            )
-        }
-        // `group().by(k).by(values(v).<reduce>())` off the frontier: two resolved
-        // columns and one bucketing pass, where the stream buckets TRAVERSERS and
-        // then runs a sub-traversal per group. 6.599ms over 20k vertices against
-        // 0.594ms for the GQL spelling.
-        //
-        // Only the four reducers that SKIP nulls, and deliberately not `count()`:
-        // `prop_column` reads an absent key and a stored null as the same
-        // `GVal::Null`, which is exactly right for these — TinkerPop 3.5's rule is
-        // that `sum`/`mean`/`min`/`max` "ignore null values when other numbers are
-        // present" — and wrong for a count, where an absent key contributes
-        // nothing and a stored null contributes one.
-        //
-        // Members are folded in FRONTIER order, which is the order the stream
-        // visits them: float addition is not associative, so a different order is
-        // a different sum and the TS engine's has to match.
-        [Step::Group(bys)] if let Some((kkey, vkey, red)) = grouped_reduce(bys) => {
-            let vals = prop_column(graph, ids, is_edge, vkey);
-            let entries = group_by(
-                prop_column(graph, ids, is_edge, kkey).into_iter(),
-                Vec::new,
-                |m: &mut Vec<usize>, i| m.push(i),
-            )
-            .into_iter()
-            .map(|(k, members)| (k, red.apply(members.iter().map(|&i| &vals[i]))))
-            .collect();
-
-            Some(vec![GVal::map(entries)])
-        }
-        // `project('a','b').by('a').by('b')` off the frontier: one resolved column
-        // per key, zipped into maps that all share one key vector. The stream form
-        // re-resolves each property NAME per element per key — `prop` takes a
-        // `&str` — which over 20k vertices and two keys is 40k hash lookups.
-        //
-        // Only the modulators that are a plain property or the element itself. A
-        // sub-traversal `by()` can read the path and a token `by()` projects
-        // something that is not a column, so both stay on the stream.
-        [Step::Project(keys, bys)] if !keys.is_empty() && projectable_bys(keys, bys) => {
-            let shared: Arc<Vec<GVal>> = Arc::new(
-                keys.iter()
-                    .map(|k| GVal::Str(Arc::from(k.as_str())))
-                    .collect(),
-            );
-            let cols: Vec<Vec<GVal>> = (0..keys.len())
-                .map(|i| match bys.get(i) {
-                    Some(By::Key(k, _)) => prop_column(graph, ids, is_edge, k),
-                    _ => ids.iter().map(|&id| frontier_val(id, is_edge)).collect(),
-                })
-                .collect();
-
-            Some(
-                (0..ids.len())
-                    .map(|i| {
-                        GVal::Map(crate::value::MapVal::with_keys(
-                            shared.clone(),
-                            cols.iter().map(|c| c[i].clone()).collect(),
-                        ))
-                    })
                     .collect(),
             )
         }
@@ -2905,15 +2819,6 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
         [Step::Where(sub), t @ ..] => {
             let keep = semi_join_test(graph, &sub.steps, is_edge)?;
             let kept: Vec<u32> = ids.iter().copied().filter(|&id| keep(id)).collect();
-
-            #[cfg(test)]
-            WHERE_NOT_ARM_HIT.with(|c| c.set(c.get() + 1));
-
-            column_paths(graph, &kept, is_edge, t)
-        }
-        [Step::Not(sub), t @ ..] => {
-            let keep = semi_join_test(graph, &sub.steps, is_edge)?;
-            let kept: Vec<u32> = ids.iter().copied().filter(|&id| !keep(id)).collect();
 
             #[cfg(test)]
             WHERE_NOT_ARM_HIT.with(|c| c.set(c.get() + 1));
@@ -4352,19 +4257,6 @@ pub(super) enum GroupReduce {
 }
 
 impl GroupReduce {
-    /// Reduce one group's values. Shares the stream's rules for both halves:
-    /// [`reduce_nums`] for the numeric folds, `value::fold_extreme` for the
-    /// extremes — the same two functions the `sum()` / `max()` steps call.
-    fn apply<'a>(self, vals: impl Iterator<Item = &'a GVal>) -> GVal {
-        match self {
-            Self::Sum => reduce_nums(vals, &|ns| ns.iter().sum()),
-            #[allow(clippy::cast_precision_loss)]
-            Self::Mean => reduce_nums(vals, &|ns| ns.iter().sum::<f64>() / ns.len() as f64),
-            Self::Min => crate::value::fold_extreme(vals.cloned(), Ordering::Less, agg_cmp),
-            Self::Max => crate::value::fold_extreme(vals.cloned(), Ordering::Greater, agg_cmp),
-        }
-    }
-
     /// This reducer as GQL's aggregate function of the same meaning — the
     /// bridge `to_gql`'s migrated `group().by(k).by(values(v).<reduce>())` arm
     /// uses, so the mapping is defined once beside the four variants it covers

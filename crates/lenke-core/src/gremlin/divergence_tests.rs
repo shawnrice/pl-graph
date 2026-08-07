@@ -6690,16 +6690,23 @@ fn id_label_arm_reachability_probe() {
         );
     }
 
-    // The reference-comparison switch: with the whole migration block gated
-    // off (`col_terminal_tagged`'s `!migrate_off()` guard covers BOTH the
-    // whole-tail attempt and the prefix split equally), the bare forms have
-    // to reach the old arm directly — `id_label_prefix` cannot change this,
-    // since it lives entirely inside the gated block.
-    println!();
+    // The `[Step::Id]` arm this used to assert under `MIGRATE_OFF` is DELETED.
+    //
+    // It was dead in normal operation and alive only as the reference route the
+    // switch compares against — which is circular: the arm existed for the test,
+    // and the test asserted the arm existed. Keeping production code (and wasm
+    // bytes) to serve a diagnostic is the trade this branch exists to remove, so
+    // the arm went and this assertion went with it. `MIGRATE_OFF` on an `id()`
+    // now falls through to the stream, which is a weaker reference but an honest
+    // one; the agreement test covers `id()` against it either way.
+    //
+    // `[Step::Label]` is a different case and SURVIVES: a VERTEX `label()` never
+    // migrates at all, because GQL's `labels(n)` is every label sorted as a List
+    // while Gremlin's is the first in insertion order. That arm answers real
+    // traffic, not a switch.
     super::exec::MIGRATE_OFF.with(|c| c.set(true));
+
     for q in [
-        "g.V().out('R').hasLabel('W').id()",
-        "g.E().hasLabel('R').id()",
         "g.E().hasLabel('R').label()",
         "g.V().out('R').hasLabel('W').label()",
     ] {
@@ -6708,14 +6715,14 @@ fn id_label_arm_reachability_probe() {
         let out = super::parse::parse(q)
             .unwrap_or_else(|e| panic!("`{q}` parses: {e}"))
             .run(&mut g);
-        let old_arm = super::exec::ID_LABEL_ARM_HIT.with(std::cell::Cell::get);
 
-        println!(
-            "PROBE MIGRATE_OFF id_label_arm={old_arm} rows={} [{q}]",
+        assert!(
+            super::exec::ID_LABEL_ARM_HIT.with(std::cell::Cell::get) > 0,
+            "{q}: the label arm must still answer (rows {})",
             out.len()
         );
-        assert!(old_arm > 0, "{q}: expected the old arm under MIGRATE_OFF");
     }
+
     super::exec::MIGRATE_OFF.with(|c| c.set(false));
 }
 
