@@ -34,8 +34,8 @@
 //! twice and costs 3.6x), a stored map renders as a `Map` not a `Record`, and a
 //! self-loop is two adjacencies not one (`Ctx::loops`, already a parameter).
 
-use crate::gql::plan::{compile_program, CAgg, CExpr, CProjection, CReturnItem};
-use crate::gremlin::{By, Scope, Step};
+use crate::gql::plan::{compile_program, CAgg, CCount, CExpr, CProjection, CReturnItem, CSortItem};
+use crate::gremlin::{By, Order, Scope, Step};
 
 /// How the projected columns become Gremlin values.
 ///
@@ -82,6 +82,21 @@ pub(super) struct Tail {
     /// `Limit`/`Skip`/`Range` arms call `Col::page` on what is left — so this
     /// mirrors that ordering exactly instead of the projection's.
     pub page: Option<(usize, usize)>,
+    /// The property `order().by(k)` sorts on, when the tail sorts.
+    ///
+    /// Gremlin's ORDERABILITY is narrower than GQL's: comparing two genuinely
+    /// incomparable non-null values (a number against a string on the same
+    /// schemaless key) is a recorded TYPE FAULT that `try_run` surfaces
+    /// (`order_by_mixed_type_property_faults_not_panics`), while GQL's `ORDER
+    /// BY` never faults — it total-orders by type rank instead
+    /// (`gql::eval::cmp_total`). A projection can't tell the caller which pairs
+    /// it compared, so the shaper re-asks the store: a `Num`/`Bool`/`Str`/
+    /// `Temporal` column (or no column at all) is homogeneous by construction,
+    /// so GQL's silent total order and Gremlin's fault-free comparator agree on
+    /// every pair — but `Mixed`/`Record`/`Vec` CAN hold an incomparable pair
+    /// GQL would happily rank and Gremlin must fault on, so that case DECLINES
+    /// rather than silently dropping the fault.
+    pub order_key: Option<String>,
 }
 
 /// An empty projection to fill in — every field spelled once, here, so the arms
@@ -176,6 +191,7 @@ pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option
                 shape: Shape::Rows,
                 absent_key: Some(ks[0].clone()),
                 page: None,
+                order_key: None,
             })
         }
         // `values(k).<sum|min|max|mean>()` — a global aggregate over that column.
@@ -205,6 +221,7 @@ pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option
                 // An aggregate SKIPS nulls itself; there is no row to drop.
                 absent_key: None,
                 page: None,
+                order_key: None,
             })
         }
         // `values(k).dedup()` — DISTINCT over the projected column.
@@ -228,6 +245,7 @@ pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option
                 shape: Shape::Rows,
                 absent_key: Some(ks[0].clone()),
                 page: None,
+                order_key: None,
             })
         }
         // `groupCount().by(k)` — GROUP BY the property, count each group. Both
@@ -266,6 +284,7 @@ pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option
                 // the arm this replaces does.
                 absent_key: None,
                 page: None,
+                order_key: None,
             })
         }
         // `values(k).<limit|skip|range>()` — a `[lo, hi)` window over the column,
@@ -290,6 +309,7 @@ pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option
                 shape: Shape::Rows,
                 absent_key: Some(ks[0].clone()),
                 page: Some((lo, hi)),
+                order_key: None,
             })
         }
         // `values(k).fold()` — one row holding a `List` of every value, after the
@@ -310,6 +330,7 @@ pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option
                 shape: Shape::List,
                 absent_key: Some(ks[0].clone()),
                 page: None,
+                order_key: None,
             })
         }
         // `project('a','b').by('k1').by('k2')` — one resolved property column
@@ -351,16 +372,90 @@ pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option
                 // the row, and it does not page.
                 absent_key: None,
                 page: None,
+                order_key: None,
             })
         }
-        // NOT YET: `order().by(k)`. It compiles, and it sorts WRONG — a sort key
-        // referencing an input slot has to be published through `order_overlay`
-        // (the scope ORDER BY resolves against), and without that GQL ordered by
-        // the output element instead. The symptom was subtle: the first rows
-        // matched and then a vertex with `n = 0` sorted after one with `n = 10`.
-        // Caught by comparing against the route this replaces rather than against
-        // the stream — the stream enumerates in a different order by design, which
-        // hides a real ordering bug among permitted ones.
+        // `order().by(k)` [`.limit(n)`] — ORDER BY the property, keep the
+        // ELEMENTS (unlike `values(k)`, the output item is the element itself).
+        //
+        // The sort key reads a property off the INPUT slot, which the output row
+        // does not carry (it carries the element, not the property) — so it has
+        // to be published through `order_overlay`, the extra scope ORDER BY
+        // resolves against (`CProjection::order_overlay`, `gql/plan.rs`). The
+        // FIRST attempt pointed the sort key straight at the raw input slot
+        // (`var_slot: slot`) and sorted WRONG: a vertex with `n = 0` sorted after
+        // one with `n = 10`. The reason is that `order_by` expressions are
+        // resolved against the SORT scope, not the input scope — slots
+        // `0..out_len` name an output column, `out_len..` name the overlay's
+        // input slots in order (mirrors what `plan.rs::projection` builds for a
+        // real `MATCH … RETURN … ORDER BY`: `sort_scope` = output columns, then
+        // `order_overlay`). With one output item (`out_len == 1`) and the
+        // property's only overlay entry at position 0, the sort key's slot is
+        // `out_len + 0`, not `slot`.
+        //
+        // Gremlin's null placement is the MINIMUM of the order, not a pinned end:
+        // it sorts first ascending and last descending, because `gcmp_total`
+        // ranks `Null` below every other value and the whole comparator then
+        // reverses for `desc` (`ordering_places_nulls_first_without_faulting`).
+        // GQL's `nulls_first` is the opposite shape — an ABSOLUTE placement,
+        // independent of `descending` (`compare_sort` in `gql/eval/statement.rs`)
+        // — so matching Gremlin's "first ascending, last descending" means
+        // flipping the flag WITH the direction: `Some(!descending)`, not the
+        // unconditional `Some(true)` a nulls-are-always-first reading suggests.
+        //
+        // The trailing `limit(n)` goes on `proj.limit`/`CCount::Lit`, NOT
+        // `Tail::page`, and that is a DELIBERATE choice, not the default for a
+        // paging step: `Tail::page` exists because `CProjection`'s own paging
+        // windows over the raw SCANNED rows, before Gremlin's absent-key drop —
+        // wrong when a drop is still to come. This arm's `absent_key` is always
+        // `None` (`order().by(k)` sorts an absent key to a null, it never drops
+        // the row), so there is no drop for a window to race, and with
+        // `order_by` non-empty `proj.window` slices the SORTED index, not the
+        // scan (`gql::eval::CProjection::window`'s doc: "a sorted one [windows]
+        // over the sorted index") — exactly `ORDER BY … LIMIT n`'s ISO meaning,
+        // and it keeps GQL's top-k partial-sort shortcut (`keep_smallest`)
+        // instead of a full sort + slice `Tail::page` would fall back to.
+        [Step::Order(bys, desc, Scope::Global), after @ ..]
+            if matches!(after, [] | [Step::Limit(_, Scope::Global)]) =>
+        {
+            let [By::Key(k, dir)] = bys.as_slice() else {
+                return None;
+            };
+            let kr = key_ref(keys, k);
+            let descending = dir.map_or(*desc, |d| d == Order::Desc);
+            let items = vec![item(CExpr::Var(slot), "v", false)];
+            let out_len = items.len();
+            let mut proj = blank(items);
+
+            proj.order_overlay = vec![slot];
+            proj.order_by = vec![CSortItem {
+                expr: CExpr::Prop {
+                    var_slot: out_len,
+                    key_ref: kr,
+                },
+                descending,
+                nulls_first: Some(!descending),
+            }];
+            // The key is entirely from the overlay (slot `out_len`, never < it),
+            // so `order_needs_output` stays false — matches what the planner
+            // computes via `refs_slot_below(&sort_expr, out_len)` for this shape.
+            proj.order_needs_output = false;
+
+            if let [Step::Limit(n, Scope::Global)] = after {
+                proj.limit = Some(CCount::Lit(*n));
+            }
+
+            Some(Tail {
+                proj,
+                shape: Shape::Rows,
+                // The row is KEPT with a null key, not dropped — `order().by(k)`
+                // reads the property like `eval_by`/`prop` do (absent → `Null`,
+                // sorted, not filtered), unlike `values(k)`'s drop-on-absent.
+                absent_key: None,
+                page: None,
+                order_key: Some(k.clone()),
+            })
+        }
         _ => None,
     }
 }

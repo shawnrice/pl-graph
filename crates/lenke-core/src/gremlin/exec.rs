@@ -2200,6 +2200,35 @@ fn shape_projection(
     cols: &[Col<'_>],
     t: &super::to_gql::Tail,
 ) -> Option<Col<'static>> {
+    // `order().by(k)` sorted a key GQL's `ORDER BY` cannot be trusted to
+    // compare the way Gremlin does. GQL's `cmp_total` never faults on a
+    // mismatched pair — it total-orders by type rank — while Gremlin's
+    // comparator records a TYPE FAULT for one (`order_by_mixed_type_property_
+    // faults_not_panics`). A `Num`/`Bool`/`Str`/`Temporal` column (or no
+    // column at all) is homogeneous by construction, so the two comparators
+    // agree on every pair it can hold; `Mixed`/`Record`/`Vec` can hold a pair
+    // that disagrees, so DECLINE rather than silently drop the fault.
+    if let Some(key) = &t.order_key {
+        let store = if is_edge {
+            &graph.edge_props
+        } else {
+            &graph.props
+        };
+        let homogeneous = matches!(
+            store.keys.get(key).and_then(|k| store.cols.get(k as usize)),
+            None | Some(
+                crate::graph::Column::Num { .. }
+                    | crate::graph::Column::Bool { .. }
+                    | crate::graph::Column::Str { .. }
+                    | crate::graph::Column::Temporal { .. }
+            )
+        );
+
+        if !homogeneous {
+            return None;
+        }
+    }
+
     let col = cols.first()?;
 
     if t.shape == super::to_gql::Shape::Scalar {

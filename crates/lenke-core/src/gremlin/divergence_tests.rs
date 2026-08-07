@@ -6185,8 +6185,10 @@ fn what_the_unvectorized_expressions_cost() {
 /// plan) and NOT against the stream: the pattern route enumerates in a different
 /// order by design (`the_pattern_route_reorders_rows`), so comparing against the
 /// stream drowns a real ordering bug in permitted ones. That is not theoretical —
-/// it is how `order().by(k)` looked correct at first glance, and it is why that
-/// step is still declined.
+/// it is how `order().by(k)` first looked correct: a sort key referencing the
+/// raw input slot instead of the `order_overlay` position it publishes through
+/// sorted wrong (`n = 0` after `n = 10`), and only comparing against the route
+/// it replaces (not the stream) caught it.
 ///
 /// `migrated` asserts the route actually FIRED. Without it every row passes on an
 /// arm that silently declined, which has happened twice on this branch.
@@ -6235,8 +6237,23 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         "g.V().out('R').hasLabel('W').values('k')",
         "g.V().out('R').hasLabel('W').groupCount().by('n')",
         "g.V().out('R').hasLabel('W').groupCount().by('k')",
+        // `n` (present on every row, i % 97 over 2000 nodes): many ties — the
+        // frontier/scan-order tiebreak has to agree between the two routes,
+        // not just the keys.
         "g.V().out('R').hasLabel('W').order().by('n')",
         "g.V().out('R').hasLabel('W').order().by('n').limit(5)",
+        "g.V().out('R').hasLabel('W').order().by('n', desc)",
+        "g.V().out('R').hasLabel('W').order().by('n', desc).limit(5)",
+        // `k` is a unique string per node: no ties, both directions.
+        "g.V().out('R').hasLabel('W').order().by('k')",
+        "g.V().out('R').hasLabel('W').order().by('k', desc)",
+        // `m` is absent on ~1/3 of the frontier (`i % 3 == 0`) — nulls-first
+        // ascending, nulls-last descending, with and without a LIMIT that
+        // lands inside the null run.
+        "g.V().out('R').hasLabel('W').order().by('m')",
+        "g.V().out('R').hasLabel('W').order().by('m', desc)",
+        "g.V().out('R').hasLabel('W').order().by('m').limit(5)",
+        "g.V().out('R').hasLabel('W').order().by('m', desc).limit(5)",
         // `project()` — two keys, a numeric and a string property.
         "g.V().out('R').hasLabel('W').project('n','k').by('n').by('k')",
         // three keys, the third (`m`) absent on some rows — a null in the
@@ -6277,11 +6294,8 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         super::exec::MIGRATE_OFF.with(|c| c.set(false));
 
         assert_eq!(via_gql, streamed, "{q}");
-        // The two `order()` rows decline on purpose; everything else must have
-        // gone through the new route.
-        let expected = usize::from(!q.contains(".order("));
-
-        assert_eq!(took, expected, "{q}: migration route taken {took} times");
+        // Every case here now goes through the new route, `order()` included.
+        assert_eq!(took, 1, "{q}: migration route taken {took} times");
 
         // `limit(0)` and a `range` with `hi <= lo` are the only cases meant to page
         // to nothing — everything else should return rows, so an empty result
