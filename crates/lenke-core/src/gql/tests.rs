@@ -12905,3 +12905,89 @@ fn signed_zeros_are_one_group() {
         1
     );
 }
+
+/// Is the MIGRATION route — a Gremlin tail compiled to a GQL projection — cheaper
+/// than the Gremlin terminals it replaces?
+///
+/// This is the question that decides whether the migration is worth finishing, and
+/// the answer is yes. Over 50k vertices / 150k edges, against `MIGRATE_OFF`:
+///
+///   values(n)                0.123ms  0.124   1.01x
+///   values(n).sum()          0.124    0.128   1.04x
+///   values(n).dedup()        0.182    0.164   0.90x
+///   groupCount().by(n)       0.190    1.189   6.27x
+///   values(k)                0.344    0.344   1.00x
+///
+/// Parity everywhere except grouping, where GQL's `GROUP BY` beats Gremlin's
+/// hand-rolled tally by 6x — one engine's optimization arriving in the other,
+/// which is the entire argument for doing this.
+///
+/// `dedup` is 0.90x — 11% SLOWER, which is at the noise floor this repo warns
+/// about but is the one row trending the wrong way. GQL's DISTINCT builds a hash
+/// per row where `Col::dedup` keys on a bit pattern. Re-measure it in isolation
+/// before finishing the migration; do not let it ride on "within noise".
+///
+/// An earlier note on `pattern.rs` REJECTED routing unconstrained prefixes here,
+/// measuring the frame at 0.578ms against 0.188 for the old path. That measurement
+/// predates this route: it was taken when `plan_pattern_ids` materialized ids and
+/// handed them to Gremlin's terminals, where `run_pattern_projection` keeps the
+/// frame and projects from it. The rejection deserves re-testing on those terms.
+#[test]
+#[ignore = "probe"]
+fn migration_route_cost() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let mut lines = String::new();
+    for i in 0..50_000usize {
+        let l = if i % 10 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{},\"k\":\"key{i:06}\"}}}}\n",
+            i % 97
+        ));
+    }
+    let mut e = 0;
+    for i in 0..50_000usize {
+        for d in 0..3usize {
+            lines.push_str(&format!(
+                "{{\"type\":\"edge\",\"id\":\"e{e}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{}}}}\n",
+                (i * 31 + d * 7 + 1) % 50_000
+            ));
+            e += 1;
+        }
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    println!(
+        "{:<52} {:>10} {:>10} {:>7}",
+        "traversal", "migrated", "terminals", "x"
+    );
+    for q in [
+        "g.V().out('R').hasLabel('W').values('n')",
+        "g.V().out('R').hasLabel('W').values('n').sum()",
+        "g.V().out('R').hasLabel('W').values('n').dedup()",
+        "g.V().out('R').hasLabel('W').groupCount().by('n')",
+        "g.V().out('R').hasLabel('W').values('k')",
+    ] {
+        let (mut a, mut b) = (f64::MAX, f64::MAX);
+        for _ in 0..7 {
+            crate::gremlin::exec::MIGRATE_OFF.store(false, Relaxed);
+            let p = crate::gremlin::parse(q).expect("parses");
+            let t = std::time::Instant::now();
+            let x = p.run(&mut g);
+            a = a.min(t.elapsed().as_secs_f64() * 1000.0);
+
+            crate::gremlin::exec::MIGRATE_OFF.store(true, Relaxed);
+            let p2 = crate::gremlin::parse(q).expect("parses");
+            let t2 = std::time::Instant::now();
+            let y = p2.run(&mut g);
+            b = b.min(t2.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(x, y, "{q}");
+        }
+        crate::gremlin::exec::MIGRATE_OFF.store(false, Relaxed);
+        println!("{q:<52} {a:>9.3}ms {b:>9.3}ms {:>6.2}x", b / a);
+    }
+}
