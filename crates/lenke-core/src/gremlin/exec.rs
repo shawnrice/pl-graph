@@ -1406,6 +1406,13 @@ fn col_terminal(graph: &Graph, col: Col, tail: &[Step]) -> Option<Vec<GVal>> {
         [Step::Dedupe { labels, bys }, t @ ..] if labels.is_empty() && bys.is_empty() => {
             col_terminal(graph, col.dedup(), t)
         }
+        // Steps that do NOTHING to the values. `barrier()` synchronizes a stream
+        // and a column is already materialized; `identity()` is identity in both.
+        // Both are `=> stream` in the step interpreter, so this is the same
+        // no-op — but without an arm here, a traversal containing one fell off
+        // the column path entirely and ran as a stream, which is 435 traversals
+        // in the suite dropped by a step that does nothing.
+        [Step::Barrier | Step::Identity, t @ ..] => col_terminal(graph, col, t),
         [Step::Limit(n, Scope::Global), t @ ..] => col_terminal(graph, col.page(0, *n), t),
         [Step::Skip(n, Scope::Global), t @ ..] => col_terminal(graph, col.page(*n, usize::MAX), t),
         [Step::Range(lo, hi, Scope::Global), t @ ..] => col_terminal(graph, col.page(*lo, *hi), t),

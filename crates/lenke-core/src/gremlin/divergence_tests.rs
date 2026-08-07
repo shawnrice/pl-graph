@@ -3616,6 +3616,16 @@ fn cross_language_cost_probe() {
             "g.V().hasLabel('V').not(__.values('n').is(gt(50))).count()",
         ),
         (
+            "a barrier in the middle",
+            "MATCH (u:V) RETURN count(*) AS c",
+            "g.V().hasLabel('V').barrier().count()",
+        ),
+        (
+            "identity in the middle",
+            "MATCH (u:V) RETURN u.n AS n",
+            "g.V().hasLabel('V').identity().values('n')",
+        ),
+        (
             "filter on the far end of a hop",
             "MATCH ()-[:R]->(b) WHERE b.n = 7 RETURN count(*) AS c",
             "g.V().out('R').has('n', 7).count()",
@@ -4740,5 +4750,61 @@ fn a_self_predicate_where_matches_the_stream() {
             count_of(&mut g, &streamed),
             "`{q}` disagreed with its streamed spelling"
         );
+    }
+}
+
+/// A step that does NOTHING must not change the answer or the route.
+///
+/// `barrier()` and `identity()` are `=> stream` in the step interpreter — pure
+/// identities. The column layer had no arm for them, so a traversal containing
+/// one fell off the columnar route entirely and ran as a stream: `barrier()`
+/// before a `count()` cost 0.838ms against 0.002, and `identity()` before
+/// `values()` 1.178ms against 0.036.
+///
+/// The rule this pins is the general one: inserting an identity step anywhere is
+/// not allowed to change what comes back.
+#[test]
+fn an_identity_step_changes_nothing() {
+    let mut g = modern();
+
+    for (plain, with_noop) in [
+        ("g.V().count()", "g.V().barrier().count()"),
+        ("g.V().count()", "g.V().identity().count()"),
+        ("g.V().values('name')", "g.V().barrier().values('name')"),
+        ("g.V().values('name')", "g.V().identity().values('name')"),
+        (
+            "g.V().out('KNOWS').id()",
+            "g.V().out('KNOWS').barrier().id()",
+        ),
+        (
+            "g.V().values('age').sum()",
+            "g.V().identity().values('age').sum()",
+        ),
+        (
+            "g.V().order().by('name').id()",
+            "g.V().barrier().order().by('name').id()",
+        ),
+        ("g.V().dedup().count()", "g.V().identity().dedup().count()"),
+        (
+            "g.V().groupCount().by('name')",
+            "g.V().barrier().groupCount().by('name')",
+        ),
+        // Two in a row, and one at the very end.
+        ("g.V().count()", "g.V().barrier().identity().count()"),
+        ("g.V().values('name')", "g.V().values('name').barrier()"),
+    ] {
+        let a = super::parse::parse(plain)
+            .unwrap_or_else(|e| panic!("`{plain}`: {e}"))
+            .run(&mut g);
+        let b = super::parse::parse(with_noop)
+            .unwrap_or_else(|e| panic!("`{with_noop}`: {e}"))
+            .run(&mut g);
+
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "`{with_noop}` differed from `{plain}`"
+        );
+        assert!(!a.is_empty(), "`{plain}` returned nothing to compare");
     }
 }
