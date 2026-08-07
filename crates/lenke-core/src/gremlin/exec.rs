@@ -660,10 +660,18 @@ fn lower_prefix(graph: &Graph, steps: &[Step]) -> Option<(ElementSeek, Vec<usize
             // Run per traverser it is a sub-traversal each: 2.131ms over 20k
             // vertices against 0.104ms for the GQL spelling.
             Step::Not(sub) => {
-                if let Some(p) = single_comparison(&sub.steps) {
-                    seek.push_negated(p);
-                    captured.push(i);
-                }
+                let Some(p) = single_comparison(&sub.steps) else {
+                    // LEAVE IT for the caller. Consuming a step this loop cannot
+                    // capture makes `captured.len() != read - 1`, which declines
+                    // the whole lowering — so a `not()` the seek could not take
+                    // sent the traversal to the stream even though the column arm
+                    // downstream handles it. Breaking keeps it in `rest`, where
+                    // that arm sees it.
+                    break;
+                };
+
+                seek.push_negated(p);
+                captured.push(i);
             }
             // `or(has(k, v), has(k, w))` is the shape the seek's BRANCHES were
             // built for — an outer union of inner conjunctions, the same
@@ -677,10 +685,12 @@ fn lower_prefix(graph: &Graph, steps: &[Step]) -> Option<(ElementSeek, Vec<usize
             // BRANCH that fails to lower LOSES ROWS, and capturing the step means
             // there is no step left to re-check. Anything else declines.
             Step::Or(plans) => {
-                if let Some(branches) = or_branches(plans) {
-                    seek.push_branches(branches);
-                    captured.push(i);
-                }
+                let Some(branches) = or_branches(plans) else {
+                    break; // same reason as `Not` above
+                };
+
+                seek.push_branches(branches);
+                captured.push(i);
             }
             // Key PRESENCE, which the shared seek can now spell. `hasKey` takes
             // several names and means ANY of them — a disjunction, not a
@@ -822,7 +832,70 @@ fn lower_hops<'a>(graph: &Graph, mut rest: &'a [Step]) -> (Vec<Hop>, &'a [Step])
 /// neighbour; SEVERAL walk the chain backwards ONCE and test membership. The
 /// split is about what each costs: the probe touches only the rows asked about,
 /// and the backward pass costs a level per hop but never explores a tree.
+/// A `where`/`not` body that tests the CURRENT element's own property, as a
+/// column test.
+///
+/// Two spellings mean the same thing — `has(k, P)` and `values(k).is(P)` — and
+/// both lower to the same `ElementSeek` conjunct, so the answer comes from
+/// `column_matches` rather than from a traverser.
+///
+/// Vertices only: `has_adj` and the frontier this feeds are vertex-side, and an
+/// edge id read as a vertex would test whatever vertex shares its number.
+fn self_predicate<'a>(graph: &'a Graph, steps: &[Step]) -> Option<Box<dyn Fn(u32) -> bool + 'a>> {
+    let mut seek = ElementSeek::node();
+
+    match steps {
+        [Step::Has(key, pred)] => {
+            if !lower_predicate(key, pred, &mut seek) {
+                return None;
+            }
+        }
+        [Step::Values(keys), Step::Is(pred)] => {
+            let [key] = keys.as_slice() else {
+                return None;
+            };
+
+            if !lower_predicate(key, pred, &mut seek) {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+
+    let no_params = |_: usize| None;
+
+    // The same gate the seeding path uses: a comparison the column cannot run —
+    // a cross-type one — is a type FAULT on the stream, and answering it here
+    // would swallow the error.
+    if !seek.types_agree(graph, &no_params) || !seek.columnar(graph, &no_params) {
+        return None;
+    }
+
+    let ids = seek.scan(graph, &no_params, || graph.vertex_indices().collect());
+    let mut keep = vec![false; graph.vertex_slots()];
+
+    for id in ids {
+        keep[id as usize] = true;
+    }
+
+    Some(Box::new(move |id| {
+        keep.get(id as usize).copied().unwrap_or(false)
+    }))
+}
+
 fn semi_join_test<'a>(graph: &'a Graph, steps: &[Step]) -> Option<Box<dyn Fn(u32) -> bool + 'a>> {
+    // A property predicate on the element ITSELF, written as a sub-traversal:
+    // `where(__.values('n').is(gt(5)))` and `where(__.has('n', gt(5)))` are the
+    // same question, and neither walks anywhere. The column can answer it, so
+    // there is no reason to build a traverser per candidate to find out.
+    //
+    // This is one of the shapes that kept a traversal on the STREAM — the largest
+    // single source of stream traffic is `where`/`not`, and the column layer only
+    // understood the ones that hop.
+    if let Some(p) = self_predicate(graph, steps) {
+        return Some(p);
+    }
+
     if let Some(hop) = semi_join_hop(graph, steps) {
         return Some(Box::new(move |id| {
             has_adj(graph, &Trav::root(GVal::Node(id)), &hop)
