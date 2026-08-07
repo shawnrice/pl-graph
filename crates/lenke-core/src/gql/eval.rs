@@ -3338,6 +3338,44 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> Col {
             }
             None => gen(e),
         },
+        // `PROPERTY_EXISTS(n, k)` — a presence test, which is a BITSET read per row
+        // and needs no value materialized at all. Without this arm it fell through
+        // to `gen(e)` and ran the scalar VM once per row; the store already holds
+        // the answer as a bit.
+        //
+        // Found from the Gremlin side: `values(k)` drops a row whose key is absent
+        // and keeps one whose stored value is null, which as a projection is
+        // `RETURN k, PROPERTY_EXISTS(elem, k)`. That spelling cost 11x against a
+        // direct column read, and this arm is the whole of the difference — so it
+        // is a GQL optimization that a Gremlin question found, which is the point
+        // of the two languages sharing a column layer.
+        CExpr::PropertyExists { var_slot, key_ref } => {
+            let present = |store: &crate::graph::Properties, kid: Option<u32>, ids: &[u32]| {
+                // `kid == None` means the key was never interned in this store, so
+                // no row carries it — matching the scalar `prop_present`.
+                let t = kid.map_or_else(
+                    || vec![false; ids.len()],
+                    |kid| {
+                        ids.iter()
+                            .map(|&i| store.is_present_id(i as usize, kid))
+                            .collect()
+                    },
+                );
+
+                Col::Bool { t, valid: None }
+            };
+
+            match sc.slot(*var_slot) {
+                Some((Elem::Node, ids)) => present(&graph.props, ctx.prop_keys[*key_ref].0, ids),
+                Some((Elem::Edge, ids)) => {
+                    present(&graph.edge_props, ctx.prop_keys[*key_ref].1, ids)
+                }
+                // A slot bound to something that is not an element: the scalar
+                // form yields NULL there, not false, so it cannot be answered
+                // with a bool column.
+                None => gen(e),
+            }
+        }
         CExpr::Neg(x) => {
             let v = eval_vec(graph, ctx, sc, x);
             // A non-numeric operand → scalar fallback, which raises the type error.

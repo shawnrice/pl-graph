@@ -5917,3 +5917,54 @@ fn the_two_languages_compute_the_same_values() {
     }
     println!("\nAGREE {agree}   DIFFER {differ}   SKIPPED {skipped}");
 }
+
+/// `PROPERTY_EXISTS` is a bitset read, and used to run the scalar VM per row.
+///
+/// Measured over 50k vertices, two thirds carrying the key, with and without the
+/// `eval_vec` arm:
+///
+///   WHERE property_exists(u, k) RETURN count(*)   0.849ms -> 0.109   7.8x
+///   RETURN property_exists(u, k)                  1.135   -> 0.413   2.7x
+///   WHERE property_exists(u, k) RETURN u.n        1.112   -> 0.374   3.0x
+///
+/// Found from the GREMLIN side: `values(k)` drops a row whose key is absent, which
+/// as a projection is `RETURN k, PROPERTY_EXISTS(elem, k)`, and that spelling cost
+/// 11x against a direct column read. The missing arm was the whole of it — so a
+/// Gremlin question turned up a GQL optimization, which is what sharing a column
+/// layer is for.
+#[test]
+#[ignore = "probe"]
+fn property_exists_is_a_column_read() {
+    let mut lines = String::new();
+    for i in 0..50_000usize {
+        // Two thirds carry `k`, so presence is a real filter rather than a constant.
+        let props = if i % 3 == 0 {
+            format!("{{\"n\":{}}}", i % 97)
+        } else {
+            format!("{{\"n\":{},\"k\":\"key{i:06}\"}}", i % 97)
+        };
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{props}}}\n"
+        ));
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    for q in [
+        "MATCH (u:V) WHERE property_exists(u, k) RETURN count(*) AS c",
+        "MATCH (u:V) RETURN property_exists(u, k) AS p",
+        "MATCH (u:V) WHERE property_exists(u, k) RETURN u.n AS n",
+    ] {
+        let mut best = f64::MAX;
+        let mut rows = 0;
+        for _ in 0..9 {
+            let p = crate::gql::parse(q).expect("parses");
+            let t = std::time::Instant::now();
+            let rs = p
+                .execute(&mut g, &crate::gql::eval::Params::new())
+                .expect("runs");
+            best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+            rows = rs.nrows;
+        }
+        println!("PE {best:>8.3}ms  {rows:>6} rows  {q}");
+    }
+}
