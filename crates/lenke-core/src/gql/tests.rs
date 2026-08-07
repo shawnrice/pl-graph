@@ -6056,6 +6056,162 @@ fn abbreviated_quantified_edge_variable_stays_unbound() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// `EXISTS { (u)-[:R]->() }` vectorizes as a bulk per-id adjacency test
+// (`exists_semi_join_vec`) instead of the scalar `any_match` running once per
+// row. Every case below runs through `vec_eq_scalar`, so the assertion is
+// against the SCALAR path's own answer (`any_match`, unaffected by this
+// change), not a hand-computed expectation — a shared bug in `expand` /
+// `matches_label` would still show up as a *different* scalar answer, since
+// `with_vec_override(false)` disables the columnar frame entirely.
+// ---------------------------------------------------------------------------
+
+/// `a` has one `R` out-edge and one `S` out-edge; `b` carries an extra label
+/// `W` so a far-end label constraint has something to distinguish. `d` has no
+/// out-edges at all (the no-match case). `e` is a self-loop. `p,q,r` form an
+/// `R` triangle so every vertex of that label matches (the all-match case).
+fn semi_join_fixture() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"a","labels":["V"],"properties":{"id":"a"}}"#,
+        r#"{"type":"node","id":"b","labels":["V","W"],"properties":{"id":"b"}}"#,
+        r#"{"type":"node","id":"c","labels":["V"],"properties":{"id":"c"}}"#,
+        r#"{"type":"node","id":"d","labels":["V"],"properties":{"id":"d"}}"#,
+        r#"{"type":"node","id":"e","labels":["V"],"properties":{"id":"e"}}"#,
+        r#"{"type":"node","id":"p","labels":["Tri"],"properties":{"id":"p"}}"#,
+        r#"{"type":"node","id":"q","labels":["Tri"],"properties":{"id":"q"}}"#,
+        r#"{"type":"node","id":"r","labels":["Tri"],"properties":{"id":"r"}}"#,
+        r#"{"type":"edge","id":"e1","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e2","from":"a","to":"c","labels":["S"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e3","from":"e","to":"e","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e4","from":"p","to":"q","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e5","from":"q","to":"r","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e6","from":"r","to":"p","labels":["R"],"properties":{}}"#,
+    ])
+}
+
+/// No matching neighbour: `d` has no out-edges of any type.
+#[test]
+fn exists_semi_join_vec_no_match() {
+    let mut g = semi_join_fixture();
+    assert_eq!(
+        vec_eq_scalar(
+            &mut g,
+            "MATCH (u:V) WHERE u.id = 'd' RETURN EXISTS { (u)-[:R]->() } AS r",
+        ),
+        vec![vec![b(false)]],
+    );
+}
+
+/// Some match, some don't: of `a,b,c,d,e`, only `a` (→b) and `e` (self-loop)
+/// have an `R` out-edge.
+#[test]
+fn exists_semi_join_vec_some_match() {
+    let mut g = semi_join_fixture();
+    assert_eq!(
+        vec_eq_scalar(
+            &mut g,
+            "MATCH (u:V) WHERE EXISTS { (u)-[:R]->() } RETURN count(*) AS c",
+        ),
+        vec![vec![n(2.0)]],
+    );
+}
+
+/// All match: every vertex of the `R` triangle has an out-edge.
+#[test]
+fn exists_semi_join_vec_all_match() {
+    let mut g = semi_join_fixture();
+    assert_eq!(
+        vec_eq_scalar(
+            &mut g,
+            "MATCH (u:Tri) WHERE EXISTS { (u)-[:R]->() } RETURN count(*) AS c",
+        ),
+        vec![vec![n(3.0)]],
+    );
+}
+
+/// A typed edge is not "any type": `a` has an `S` out-edge but no `Q`, and the
+/// untyped `-[]->` form matches either.
+#[test]
+fn exists_semi_join_vec_typed_edge_vs_any_type() {
+    let mut g = semi_join_fixture();
+    assert_eq!(
+        vec_eq_scalar(
+            &mut g,
+            "MATCH (u:V) WHERE u.id = 'a' RETURN \
+             EXISTS { (u)-[:R]->() } AS r, \
+             EXISTS { (u)-[:S]->() } AS s, \
+             EXISTS { (u)-[:Q]->() } AS q, \
+             EXISTS { (u)-[]->() } AS anyt",
+        ),
+        vec![vec![b(true), b(true), b(false), b(true)]],
+    );
+}
+
+/// A label constraint on the far end: `a`'s `R` neighbour `b` carries `W`, its
+/// `S` neighbour `c` does not.
+#[test]
+fn exists_semi_join_vec_far_end_label() {
+    let mut g = semi_join_fixture();
+    assert_eq!(
+        vec_eq_scalar(
+            &mut g,
+            "MATCH (u:V) WHERE u.id = 'a' RETURN \
+             EXISTS { (u)-[:R]->(:W) } AS r, \
+             EXISTS { (u)-[:S]->(:W) } AS s",
+        ),
+        vec![vec![b(true), b(false)]],
+    );
+}
+
+/// A property constraint on the far end (`const_props` — the constraint
+/// doesn't read a slot, so it pre-evaluates once rather than declining).
+#[test]
+fn exists_semi_join_vec_far_end_property() {
+    let mut g = semi_join_fixture();
+    assert_eq!(
+        vec_eq_scalar(
+            &mut g,
+            "MATCH (u:V) WHERE u.id = 'a' RETURN \
+             EXISTS { (u)-[:R]->({id: 'b'}) } AS hit, \
+             EXISTS { (u)-[:R]->({id: 'z'}) } AS miss",
+        ),
+        vec![vec![b(true), b(false)]],
+    );
+}
+
+/// A self-loop counts as its own out-neighbour — `expand` (shared with the
+/// scalar matcher) applies `SelfLoops::Once`, so this must be true, not an
+/// accidental false from a walk that skips the loop.
+#[test]
+fn exists_semi_join_vec_self_loop() {
+    let mut g = semi_join_fixture();
+    assert_eq!(
+        vec_eq_scalar(
+            &mut g,
+            "MATCH (u:V) WHERE u.id = 'e' RETURN \
+             EXISTS { (u)-[:R]->() } AS out, \
+             EXISTS { (u)<-[:R]-() } AS in_",
+        ),
+        vec![vec![b(true), b(true)]],
+    );
+}
+
+/// An edge type no edge in the graph carries matches NOTHING — not every
+/// vertex. This is the `seek`/Gremlin type-set inversion the brief calls out:
+/// getting it backwards would silently turn `NOPE` into "any type" and every
+/// row would read true.
+#[test]
+fn exists_semi_join_vec_unknown_edge_type_matches_nothing() {
+    let mut g = semi_join_fixture();
+    assert_eq!(
+        vec_eq_scalar(
+            &mut g,
+            "MATCH (u:V) WHERE EXISTS { (u)-[:NOPE]->() } RETURN count(*) AS c",
+        ),
+        vec![vec![n(0.0)]],
+    );
+}
+
 /// The vectorized and scalar drivers must agree on every quantified shape the
 /// columnar builder now accepts — bounds, path mode, per-repetition `WHERE`,
 /// endpoint constraints, a quantified segment in the middle of a longer path, an
@@ -13094,6 +13250,14 @@ fn the_unconstrained_prefix_decline_still_pays() {
 /// deleted shortcuts never covered this shape, so the gap is pre-existing and
 /// belongs to the missing `eval_vec` arm. (`MATCH (u:V) RETURN u.n` went the
 /// other way on this branch, 0.402ms -> 0.245.)
+///
+/// SUPERSEDED for the semi-join row, and by the fix this probe motivated: once
+/// `eval_vec` gained a vectorized `CExpr::Exists` arm, that row went 3.648ms ->
+/// 0.370, which is 3.4x FASTER than Gremlin's 1.274 rather than 2.9x slower. So
+/// all three shapes now favour the clause route or tie it, and the conclusion
+/// "the semi-join needs separate work before it can migrate" is answered rather
+/// than outstanding. Re-run this probe after touching the columnar exit; the
+/// numbers above the fold are the pre-fix ones and are kept for the contrast.
 #[test]
 #[ignore = "probe"]
 fn clause_sequence_columnar_exit_probe() {

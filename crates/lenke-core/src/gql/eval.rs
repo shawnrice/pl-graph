@@ -3652,8 +3652,105 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> Col {
                 .collect();
             Col::Bool { t, valid: None }
         }
+        // `EXISTS { (u)-[:R]->() }` — a semi-join, rooted at a slot the frame
+        // already holds. Without this arm every row fell to `gen(e)`, which binds
+        // a whole `Binding` and re-runs `any_match` — the general backtracking
+        // matcher — once PER ROW, even though `any_match`'s own fast paths
+        // (`exists_bidir`, `any_match_reachable`) both decline this exact shape
+        // (an unbound far end with no quantifier), so every row paid the general
+        // matcher's cost for a question that is just "does `u` have a matching
+        // out-edge?" — one bulk adjacency test per row, no binding, no recursion.
+        //
+        // `exists_semi_join_vec` declines anything the single-hop bulk test can't
+        // answer (a multi-segment/quantified pattern, a predicate on the edge, an
+        // inner WHERE, a root that isn't a frame element column); the caller falls
+        // to `gen(e)`, which still answers it correctly via the scalar `any_match`.
+        CExpr::Exists {
+            patterns,
+            where_: None,
+            sub_len: _,
+        } => exists_semi_join_vec(graph, ctx, sc, patterns).unwrap_or_else(|| gen(e)),
         _ => gen(e),
     }
+}
+
+/// The vectorized form of [`CExpr::Exists`]: a bulk per-id adjacency test over
+/// the frame's element column, for the one shape that matters — a single plain
+/// segment rooted at a slot the frame already holds (`(u)-[:R]->()`), optionally
+/// with a label and/or constant property constraint on the far end.
+///
+/// `None` declines to the scalar path (`gen`) for anything richer: a
+/// multi-segment or quantified pattern, a predicate on the edge itself or an
+/// inline far-end constraint that reads another slot, a WHERE inside the far
+/// node, or a root that the columnar frame doesn't hold as an element (an
+/// unbound root, or one carrying a computed value instead).
+///
+/// Deliberately reuses rather than re-derives the per-neighbour test: `expand`
+/// is the SAME walk `any_match`'s general matcher and its `any_match_reachable`
+/// fast path already call (itself `seek::adj_where`, the walk GQL shares with
+/// Gremlin), and `matches_label` / `const_props` + `satisfies_const` are the
+/// same label/inline-property test `match_node_then` runs per candidate. Only
+/// the OUTER loop — per row instead of per `any_match` call — is new; the
+/// semi-join logic itself lives in exactly the places it already lived.
+///
+/// `EXISTS` is three-valued in general, but a semi-join over an already-bound
+/// element column is not: `u` is a live node (never NULL in the frame — every
+/// other `eval_vec` arm that reads an element slot makes the same assumption,
+/// e.g. `CExpr::Var`, `CExpr::PropertyExists`), so every row has a definite
+/// TRUE/FALSE answer and the result column carries no `valid` mask, matching
+/// `any_match`'s own return type (`bool`, not `Option<bool>`).
+fn exists_semi_join_vec(
+    graph: &Graph,
+    ctx: &Ctx,
+    sc: &ScanCols,
+    patterns: &[CPath],
+) -> Option<Col> {
+    let [path] = patterns else { return None };
+    if path.path_var_slot.is_some() || !matches!(path.selector, PathSelector::Walk) {
+        return None;
+    }
+    let [seg] = path.segments.as_slice() else {
+        return None;
+    };
+    if seg.unit.is_some() {
+        return None;
+    }
+    let start = &path.start;
+    if start.label.is_some() || !start.props.is_empty() || start.where_.is_some() {
+        return None;
+    }
+    let rel = &seg.rel;
+    if rel.quantifier.is_some()
+        || rel.var_slot.is_some()
+        || !rel.props.is_empty()
+        || rel.where_.is_some()
+    {
+        return None;
+    }
+    let node = &seg.node;
+    if node.where_.is_some() {
+        return None;
+    }
+    let (elem, ids) = sc.slot(start.var_slot?)?;
+    if elem != Elem::Node {
+        return None;
+    }
+    // Pre-evaluated once (not per row, not per neighbour) — `None` means some
+    // constraint value reads a slot (`{k: a.x}`), which genuinely differs per
+    // row and keeps the general path.
+    let far_consts = const_props(graph, ctx, &node.props)?;
+
+    let t: Vec<bool> = ids
+        .iter()
+        .map(|&v| {
+            expand(graph, ctx, v, rel.direction, rel.label.as_ref()).any(|(_e, nbr)| {
+                matches_label(graph, ctx, nbr, node.label.as_ref())
+                    && satisfies_const(graph, ctx, &Val::Node(nbr), &far_consts)
+            })
+        })
+        .collect();
+
+    Some(Col::Bool { t, valid: None })
 }
 
 /// Build a `Col::Bool` from a Kleene-truth stream (`None` → invalid/UNKNOWN).
