@@ -53,6 +53,8 @@ pub(super) enum Shape {
     /// One `Map` per row from N columns, all sharing one key vector. Gremlin's
     /// `project(k1, k2, …)`.
     Maps { keys: Vec<String> },
+    /// A single row holding a `List` of every value. Gremlin's `fold()`.
+    List,
 }
 
 pub(super) struct Tail {
@@ -67,6 +69,19 @@ pub(super) struct Tail {
     /// one, and a `Mixed`/`Record` column can hold both — so that last case
     /// DECLINES rather than guessing.
     pub absent_key: Option<String>,
+    /// A `[lo, hi)` window (`limit`/`skip`/`range`), applied by the CALLER AFTER
+    /// `absent_key` has dropped its rows.
+    ///
+    /// It cannot live on `proj.skip`/`proj.limit`: `CProjection`'s own paging
+    /// windows over the SCANNED rows (`project_frame_cols` pages `sc.n`, the raw
+    /// frame, before any absent-row drop — that drop is Gremlin-only and happens
+    /// in the caller's `shape_projection`), so a window installed there would
+    /// include rows `values(k)` is about to drop and select the wrong slice. The
+    /// route this replaces pages AFTER the drop too — `column_terminal` shapes
+    /// the bare `values(k)` column first, then `col_terminal_tagged`'s
+    /// `Limit`/`Skip`/`Range` arms call `Col::page` on what is left — so this
+    /// mirrors that ordering exactly instead of the projection's.
+    pub page: Option<(usize, usize)>,
 }
 
 /// An empty projection to fill in — every field spelled once, here, so the arms
@@ -111,6 +126,20 @@ fn key_ref(keys: &mut Vec<String>, k: &str) -> usize {
     })
 }
 
+/// The `[lo, hi)` window a global paging step selects, in the same shape
+/// `Col::page(lo, hi)` takes — `limit(n)` is `[0, n)`, `skip(n)` is `[n, ∞)`
+/// (`usize::MAX` stands in for "to the end", exactly as `col_terminal_tagged`'s
+/// own `Skip` arm spells it), and `range(lo, hi)` is that pair verbatim. `Local`
+/// scope is a per-row slice of a LIST value, not a row window, and stays `None`.
+fn page_of(step: &Step) -> Option<(usize, usize)> {
+    match step {
+        Step::Limit(n, Scope::Global) => Some((0, *n)),
+        Step::Skip(n, Scope::Global) => Some((*n, usize::MAX)),
+        Step::Range(lo, hi, Scope::Global) => Some((*lo, *hi)),
+        _ => None,
+    }
+}
+
 /// Which aggregate a Gremlin reducing terminal is, when it is one.
 fn reducer(step: &Step) -> Option<crate::gql::plan::AggFn> {
     use crate::gql::plan::AggFn;
@@ -146,6 +175,7 @@ pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option
                 )]),
                 shape: Shape::Rows,
                 absent_key: Some(ks[0].clone()),
+                page: None,
             })
         }
         // `values(k).<sum|min|max|mean>()` — a global aggregate over that column.
@@ -174,6 +204,7 @@ pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option
                 shape: Shape::Scalar,
                 // An aggregate SKIPS nulls itself; there is no row to drop.
                 absent_key: None,
+                page: None,
             })
         }
         // `values(k).dedup()` — DISTINCT over the projected column.
@@ -196,6 +227,7 @@ pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option
                 proj,
                 shape: Shape::Rows,
                 absent_key: Some(ks[0].clone()),
+                page: None,
             })
         }
         // `groupCount().by(k)` — GROUP BY the property, count each group. Both
@@ -233,6 +265,51 @@ pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option
                 // NULL key rather than dropping the row — TinkerPop 3.5, and what
                 // the arm this replaces does.
                 absent_key: None,
+                page: None,
+            })
+        }
+        // `values(k).<limit|skip|range>()` — a `[lo, hi)` window over the column,
+        // taken AFTER the absent-key drop (see `Tail::page`). `page_of` maps each
+        // step to the same `(lo, hi)` pair `Col::page` itself takes, so the three
+        // spellings and their edge cases (`limit(0)`, `range` with `hi <= lo`, `hi`
+        // past the row count) all clamp exactly the way `col.page` already does —
+        // there is no separate clamp to keep in sync.
+        [Step::Values(ks), page_step] if ks.len() == 1 && page_of(page_step).is_some() => {
+            let kr = key_ref(keys, &ks[0]);
+            let (lo, hi) = page_of(page_step)?;
+
+            Some(Tail {
+                proj: blank(vec![item(
+                    CExpr::Prop {
+                        var_slot: slot,
+                        key_ref: kr,
+                    },
+                    "v",
+                    false,
+                )]),
+                shape: Shape::Rows,
+                absent_key: Some(ks[0].clone()),
+                page: Some((lo, hi)),
+            })
+        }
+        // `values(k).fold()` — one row holding a `List` of every value, after the
+        // same absent-key drop the bare form performs (a fold does not resurrect a
+        // dropped row; it just never sees one).
+        [Step::Values(ks), Step::Fold] if ks.len() == 1 => {
+            let kr = key_ref(keys, &ks[0]);
+
+            Some(Tail {
+                proj: blank(vec![item(
+                    CExpr::Prop {
+                        var_slot: slot,
+                        key_ref: kr,
+                    },
+                    "v",
+                    false,
+                )]),
+                shape: Shape::List,
+                absent_key: Some(ks[0].clone()),
+                page: None,
             })
         }
         // `project('a','b').by('k1').by('k2')` — one resolved property column
@@ -270,7 +347,10 @@ pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option
                 shape: Shape::Maps {
                     keys: pkeys.clone(),
                 },
+                // `project()` holds a NULL for an absent key rather than dropping
+                // the row, and it does not page.
                 absent_key: None,
+                page: None,
             })
         }
         // NOT YET: `order().by(k)`. It compiles, and it sorts WRONG — a sort key

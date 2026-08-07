@@ -6199,16 +6199,18 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         } else {
             r#"["V"]"#
         };
-        // `m` is present on two of every three vertices — `project()`'s
-        // absent-key row (a null in the map, NOT a dropped row, unlike
-        // `values(k)`).
+        // `m` is ABSENT on about a third of rows (`i % 3 == 0`), which two arms
+        // need for different reasons: `project()` must hold a NULL for it (not
+        // drop the row, unlike `values(k)`), and the paging/`fold()` arms must
+        // drop those rows BEFORE windowing or collecting. `n`, present on every
+        // row, exercises neither.
         let m = if i % 3 == 0 {
             String::new()
         } else {
-            format!(",\"m\":{}", i % 5)
+            format!(",\"m\":{}", i % 97)
         };
         lines.push_str(&format!(
-            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{},\"k\":\"key{i:06}\"{m}}}}}\n",
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{}{m},\"k\":\"key{i:06}\"}}}}\n",
             i % 97
         ));
     }
@@ -6223,7 +6225,6 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         }
     }
     let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
-    let mut bad = 0;
     for q in [
         "g.V().out('R').hasLabel('W').values('n')",
         "g.V().out('R').hasLabel('W').values('n').sum()",
@@ -6245,6 +6246,26 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         "g.V().out('R').hasLabel('W').project('v','n').by().by('n')",
         // a MISSING `by()` (fewer bys than keys) defaults to identity too.
         "g.V().out('R').hasLabel('W').project('v','n').by('n')",
+        // Paging and `fold()`, first over `n` (present on every row) so the
+        // window/list math is checked with no absent-row drop in play...
+        "g.V().out('R').hasLabel('W').values('n').limit(5)",
+        "g.V().out('R').hasLabel('W').values('n').limit(0)",
+        "g.V().out('R').hasLabel('W').values('n').skip(5)",
+        "g.V().out('R').hasLabel('W').values('n').range(3, 8)",
+        "g.V().out('R').hasLabel('W').values('n').range(8, 3)",
+        "g.V().out('R').hasLabel('W').values('n').range(0, 1000000)",
+        "g.V().out('R').hasLabel('W').values('n').fold()",
+        // ...then over `m` (absent on ~1/3 of rows), which is the one that catches
+        // a window taken over the SCANNED rows instead of the ones `values(m)`
+        // actually kept — `limit(0)`, a `range` with `hi <= lo`, and one past the
+        // end are the edge cases most likely to hide that off-by-a-window bug.
+        "g.V().out('R').hasLabel('W').values('m').limit(5)",
+        "g.V().out('R').hasLabel('W').values('m').limit(0)",
+        "g.V().out('R').hasLabel('W').values('m').skip(5)",
+        "g.V().out('R').hasLabel('W').values('m').range(3, 8)",
+        "g.V().out('R').hasLabel('W').values('m').range(8, 3)",
+        "g.V().out('R').hasLabel('W').values('m').range(0, 1000000)",
+        "g.V().out('R').hasLabel('W').values('m').fold()",
     ] {
         super::exec::MIGRATED.with(|c| c.set(0));
         super::exec::PATTERN_OFF.with(|c| c.set(false));
@@ -6261,8 +6282,16 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         let expected = usize::from(!q.contains(".order("));
 
         assert_eq!(took, expected, "{q}: migration route taken {took} times");
-        bad += usize::from(via_gql.is_empty());
-    }
 
-    assert_eq!(bad, 0, "every case returns rows");
+        // `limit(0)` and a `range` with `hi <= lo` are the only cases meant to page
+        // to nothing — everything else should return rows, so an empty result
+        // there is the bug this loop exists to catch.
+        let expect_empty = q.contains(".limit(0)") || q.contains(".range(8, 3)");
+        assert_eq!(
+            via_gql.is_empty(),
+            expect_empty,
+            "{q}: expected {} rows",
+            if expect_empty { "no" } else { "some" }
+        );
+    }
 }

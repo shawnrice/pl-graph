@@ -2259,8 +2259,10 @@ fn shape_projection(
                     vals.retain(|v| !matches!(v, GVal::Null));
                 }
             }
-            // No column at all: no element carries the key, so `values(k)` is empty.
-            None => return Some(Col::Gen(Vec::new())),
+            // No column at all: no element carries the key, so `values(k)` is empty
+            // — but NOT an early return, because `fold()` still owes one row
+            // holding an empty list (`Shape::List` below), not zero rows.
+            None => out = Col::Gen(Vec::new()),
             // `Mixed`/`Record` can hold a stored null AND box an absence as one,
             // and nothing here can tell them apart. Decline.
             Some(_) => return None,
@@ -2271,6 +2273,16 @@ fn shape_projection(
         for v in vals.iter_mut() {
             *v = as_gremlin_shape(std::mem::replace(v, GVal::Null));
         }
+    }
+
+    // `limit`/`skip`/`range`: a window taken AFTER the absent-key drop above, not
+    // as part of the GQL projection — see `Tail::page` for why.
+    if let Some((lo, hi)) = t.page {
+        out = out.page(lo, hi);
+    }
+
+    if t.shape == super::to_gql::Shape::List {
+        return Some(Col::Gen(vec![GVal::list(out.into_vals())]));
     }
 
     Some(out)
