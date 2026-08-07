@@ -4115,8 +4115,34 @@ fn vectorized_linear(
 /// Split out so the walk can hand its one-column frame to exactly the same
 /// projection the joined frame goes through — the whole point of producing a
 /// frame rather than answering a shape.
+/// The columnar half of [`finish_linear`]: a whole clause SEQUENCE, projected,
+/// stopping at the columns.
+///
+/// Split out for the Gremlin migration. `vectorized_linear` already threads one
+/// `ScanCols` from clause to clause and only boxes at the very end, so a caller
+/// that wants columns — Gremlin, whose value model is not a row set — needs the
+/// frame to stop one step earlier rather than a second pipeline of its own. The
+/// boxing and element RENDERING skipped here is the whole of GQL's 5.3x on
+/// `values(n)` and 173x on returning elements; none of it is the algebra.
+fn finish_linear_cols(
+    graph: &Graph,
+    ctx: &Ctx,
+    sc: &ScanCols,
+    proj: &CProjection,
+) -> Option<Vec<Col>> {
+    let cols = project_frame_cols(graph, ctx, sc, proj)?;
+
+    // A data exception during vectorized eval cannot return `Err` from here; the
+    // caller falls back to a path that re-evaluates and surfaces the `CodeError`.
+    if ctx.faulted() {
+        return None;
+    }
+
+    Some(cols)
+}
+
 fn finish_linear(graph: &Graph, ctx: &Ctx, sc: ScanCols, proj: &CProjection) -> Option<RowSet> {
-    let cols = project_frame_cols(graph, ctx, &sc, proj)?;
+    let cols = finish_linear_cols(graph, ctx, &sc, proj)?;
     let nrows = cols.first().map_or(0, |c| c.len());
     let mut rs = RowSet::new(proj.out_names.clone());
 
@@ -4125,13 +4151,6 @@ fn finish_linear(graph: &Graph, ctx: &Ctx, sc: ScanCols, proj: &CProjection) -> 
             cols.iter()
                 .map(|c| c.with_val_at(i, |v| val_to_value(graph, v))),
         );
-    }
-
-    // A data exception during vectorized eval can't return `Err` from here; fall
-    // back to the scalar path (this query shape is read-only, so re-running is
-    // safe), which re-evaluates and surfaces the `CodeError`.
-    if ctx.faulted() {
-        return None;
     }
 
     Some(rs)
