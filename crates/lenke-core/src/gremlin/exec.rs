@@ -5543,6 +5543,16 @@ fn apply_order(
             // `cmp_or_fault` records a type fault for an incomparable pair (so
             // `try_run` still errors); fall back to the TOTAL `gcmp_total` for the
             // ordering so `sort_by` never sees a non-total comparator and panics.
+            //
+            // The fault is DELIBERATE and includes ordering elements against each
+            // other: the TS engine raises "cannot order an element with an element"
+            // for `V().order()`, so both engines reject it and they agree. That is a
+            // shared deviation from TinkerPop 3.5, whose ORDERABILITY is total over
+            // elements — changing it is a two-engine decision, not a one-side fix.
+            // Swapping this to the non-faulting `gcmp` was tried and reverted: it
+            // makes native answer `g.V().order().count()` where TS throws, which is
+            // a NEW divergence. `order_over_mixed_types_faults` and
+            // `order_by_mixed_type_property_faults_not_panics` catch that.
             let mut o = cmp_or_fault(&ka[i], &kb[i]).unwrap_or_else(|| gcmp_total(&ka[i], &kb[i]));
             if dir == Order::Desc {
                 o = o.reverse();

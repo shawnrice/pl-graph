@@ -55,6 +55,12 @@ const mulberry32 = (seed: number): (() => number) => {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 };
+
+// Distinct `FUZZ_SEED`s must explore DISJOINT cases. `SEED + i` did not: seeds 1
+// and 2 differ in one case out of four hundred, so running eight seeds was ~1.02x
+// the coverage of running one, not 8x. Multiplying by a large odd constant gives
+// each base seed its own region while keeping a reported seed reproducible.
+const caseSeed = (base: number, i: number): number => base * 1_000_003 + i;
 const pick = <T>(r: () => number, xs: readonly T[]): T => xs[Math.floor(r() * xs.length)];
 
 const VALUES = [
@@ -205,7 +211,7 @@ suite('differential fuzz: write path (TS engine vs Rust core)', () => {
     const divergences: string[] = [];
 
     for (let i = 0; i < ITERATIONS && divergences.length < 5; i++) {
-      const r = mulberry32(SEED_COUNT + i);
+      const r = mulberry32(caseSeed(SEED_COUNT, i));
       const nat = graphFromNdjson(backend, SEED);
       const ts = tsDeserialize(SEED, 'ndjson', new Graph());
 

@@ -68,6 +68,12 @@ const mulberry32 = (seed: number): (() => number) => {
   };
 };
 
+// Distinct `FUZZ_SEED`s must explore DISJOINT cases. `SEED + i` did not: seeds 1
+// and 2 differ in one case out of four hundred, so running eight seeds was ~1.02x
+// the coverage of running one, not 8x. Multiplying by a large odd constant gives
+// each base seed its own region while keeping a reported seed reproducible.
+const caseSeed = (base: number, i: number): number => base * 1_000_003 + i;
+
 const pick = <T>(r: () => number, xs: readonly T[]): T => xs[Math.floor(r() * xs.length)];
 
 // Number literals: normal, signed-zero, extreme magnitudes (exponential threshold),
@@ -497,7 +503,7 @@ suite('differential fuzz: TS gql engine vs Rust core', () => {
     const divergences: string[] = [];
 
     for (let i = 0; i < ITERATIONS; i++) {
-      const q = genQuery(mulberry32(SEED + i));
+      const q = genQuery(mulberry32(caseSeed(SEED, i)));
       const ts = run('ts', q);
       const nat = run('native', q);
 
@@ -506,13 +512,15 @@ suite('differential fuzz: TS gql engine vs Rust core', () => {
       if (ts.ok && nat.ok) {
         if (ts.json !== nat.json) {
           divergences.push(
-            `[seed ${SEED + i}] ${q}\n    ts:     ${ts.json}\n    native: ${nat.json}`,
+            `[seed ${caseSeed(SEED, i)}] ${q}\n    ts:     ${ts.json}\n    native: ${nat.json}`,
           );
         }
       } else if (ts.ok !== nat.ok) {
         const tsSide = ts.ok ? `ok ${ts.json}` : `err ${(ts as { code: string }).code}`;
         const natSide = nat.ok ? `ok ${nat.json}` : `err ${(nat as { code: string }).code}`;
-        divergences.push(`[seed ${SEED + i}] ${q}\n    ts:     ${tsSide}\n    native: ${natSide}`);
+        divergences.push(
+          `[seed ${caseSeed(SEED, i)}] ${q}\n    ts:     ${tsSide}\n    native: ${natSide}`,
+        );
       }
 
       if (divergences.length >= 10) {

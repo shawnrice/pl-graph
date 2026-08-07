@@ -54,6 +54,12 @@ const mulberry32 = (seed: number): (() => number) => {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 };
+
+// Distinct `FUZZ_SEED`s must explore DISJOINT cases. `SEED + i` did not: seeds 1
+// and 2 differ in one case out of four hundred, so running eight seeds was ~1.02x
+// the coverage of running one, not 8x. Multiplying by a large odd constant gives
+// each base seed its own region while keeping a reported seed reproducible.
+const caseSeed = (base: number, i: number): number => base * 1_000_003 + i;
 const pick = <T>(r: () => number, xs: readonly T[]): T => xs[Math.floor(r() * xs.length)];
 
 const NUMS = ['0', '-0.0', '1', '-1', '3.14', '1e21', '1e-7', '1e100', '9007199254740992', '0.1'];
@@ -175,7 +181,7 @@ suite('backend parity: wasm agrees with ffi', () => {
     };
 
     for (let i = 0; i < ITERATIONS && divergences.length === 0; i++) {
-      const r = mulberry32(SEED_BASE + i);
+      const r = mulberry32(caseSeed(SEED_BASE, i));
       const q = genQuery(r);
 
       compare(`[seed ${SEED_BASE + i}] read: ${q}`, (g) => g.query(q));

@@ -264,6 +264,16 @@ const emitNestedStep = (step: Step): string | null => {
   switch (step.kind) {
     case 'union':
       return `union(${step.plans.map(emitSubPlan).join(', ')})`;
+    case 'coalesce':
+      return `coalesce(${step.plans.map(emitSubPlan).join(', ')})`;
+    case 'optional':
+      return `optional(${emitSubPlan(step.plan)})`;
+    // `choose(test, then)` and `choose(test, then, else)` — the arity IS the
+    // meaning, so an absent else must not become an empty sub-plan.
+    case 'choose':
+      return step.elsePlan === undefined
+        ? `choose(${emitSubPlan(step.test)}, ${emitSubPlan(step.thenPlan)})`
+        : `choose(${emitSubPlan(step.test)}, ${emitSubPlan(step.thenPlan)}, ${emitSubPlan(step.elsePlan)})`;
     case 'not':
       return `not(${emitSubPlan(step.plan)})`;
     case 'repeat': {

@@ -5281,3 +5281,106 @@ fn inject_inside_a_subtraversal_agrees_with_the_ts_engine() {
     // `map` takes the FIRST result, which is the injected value.
     assert_eq!(run(&mut g, "g.V().limit(1).map(__.inject('m'))"), vec!["m"]);
 }
+
+/// Ordering ELEMENTS against each other is a type fault, and BOTH engines agree.
+///
+/// Worth pinning because the agreement is not obvious and the cheap-looking "fix"
+/// is wrong. The sort comparator calls `cmp_or_fault`, so `g.V().order()` — no
+/// `by`, keys are the vertices themselves — raises E_INVALID_VALUE. That reads
+/// like a bug: TinkerPop 3.5's ORDERABILITY is total and orders elements by id,
+/// and `run()` returns correct rows while only the FALLIBLE path (the one the FFI
+/// uses) errors. It is not a bug on our side alone: the TS engine raises "cannot
+/// order an element with an element" for the same traversal. So the two engines
+/// agree, and it is a SHARED deviation from TinkerPop — changing it is a
+/// both-engines decision, not a one-side fix.
+///
+/// Swapping the comparator to the non-faulting `gcmp` was tried and reverted; it
+/// makes native answer `g.V().order().count()` where TS still throws.
+#[test]
+fn order_over_elements_faults_like_the_ts_engine() {
+    let mut g = modern();
+    for q in [
+        "g.V().order().count()",
+        "g.V().order().by(desc).count()",
+        "g.V().order().by(desc).id()",
+    ] {
+        let plan = super::parse::parse(q).expect("parses");
+        assert_eq!(
+            super::exec::try_run(&mut g, &plan).unwrap_err().code,
+            crate::error_codes::ErrorCode::InvalidValue,
+            "{q}"
+        );
+        // The infallible path is best-effort and must not panic.
+        let _ = super::parse::parse(q).expect("parses").run(&mut g);
+    }
+}
+
+/// The other half of the split still faults: an aggregate over genuinely
+/// incomparable values raises, which is TinkerPop and what TS does.
+#[test]
+fn aggregate_over_mixed_types_still_faults() {
+    let mut g = modern();
+    let plan = super::parse::parse("g.V().values('name').inject(1).min()").expect("parses");
+    assert!(
+        super::exec::try_run(&mut g, &plan).is_err(),
+        "min() over a string and a number should raise"
+    );
+}
+
+/// A `limit(0)` does NOT excuse the work above it: this engine is EAGER, so a
+/// side effect upstream of a zero-row slice still happens.
+///
+/// This is the one place the two engines genuinely disagree, and the fuzzer found
+/// it (`FUZZ_SEED=4`, only reachable after the seeding fix). The TS engine is
+/// lazy with a one-element pull-ahead — `limit(n)` pulls `n+1` — so its `limit(0)`
+/// normally still touches the upstream and agrees with us. It stops agreeing when
+/// that single pull can be satisfied WITHOUT reaching the upstream, which is
+/// exactly what an `inject` in between does: it yields an injected value first.
+///
+///     g.V().aggregate('x').limit(0).cap('x')            both → 6 vertices
+///     g.V().aggregate('x').inject(1).limit(1).cap('x')  both → 6 vertices
+///     g.V().aggregate('x').inject(1).limit(0).cap('x')  native → 6, TS → []
+///
+/// So it is not a `limit(0)` rule and not an error-path curiosity — it is
+/// lazy-vs-eager, observable on a perfectly valid query, narrowed to the case
+/// where injected values alone cover the pull-ahead. Deciding it means making
+/// native lazy or TS eager; both are architectural, so this pins what native does
+/// and the fuzzer skips the shape by name rather than either engine changing
+/// quietly.
+/// The same lazy-vs-eager split, shielded by a BRANCH rather than an `inject`.
+///
+/// Native evaluates every branch of a `union` even when a `limit(0)` downstream
+/// throws the rows away, so a fault in a LATER branch still surfaces. The TS
+/// engine yields the first branch's row to satisfy its one-element pull-ahead and
+/// never reaches the second, so it answers `[]`. Pinned so the eager behavior is
+/// deliberate rather than incidental; see
+/// `a_zero_limit_does_not_cancel_an_upstream_side_effect` for the full account.
+#[test]
+fn a_zero_limit_does_not_cancel_a_later_union_branch() {
+    let mut g = modern();
+    // `gte('lop')` compares a number against a string — a fault, in branch TWO.
+    let q = "g.V().union(out('KNOWS'), has('age', gte('lop')).label()).limit(0).values('age')";
+    let plan = super::parse::parse(q).expect("parses");
+    assert_eq!(
+        super::exec::try_run(&mut g, &plan).unwrap_err().code,
+        crate::error_codes::ErrorCode::InvalidValue,
+    );
+    // And the infallible path must not panic.
+    let _ = super::parse::parse(q).expect("parses").run(&mut g);
+}
+
+#[test]
+fn a_zero_limit_does_not_cancel_an_upstream_side_effect() {
+    let mut g = modern();
+    for q in [
+        "g.V().aggregate('x').limit(0).cap('x')",
+        "g.V().aggregate('x').inject(1).limit(0).cap('x')",
+    ] {
+        let plan = super::parse::parse(q).expect("parses");
+        let got = super::exec::try_run(&mut g, &plan).expect("no fault");
+        let GVal::List(items) = &got[0] else {
+            panic!("{q}: expected a list, got {got:?}");
+        };
+        assert_eq!(items.len(), 6, "{q}: the aggregate ran over every vertex");
+    }
+}

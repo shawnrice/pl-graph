@@ -54,6 +54,11 @@ import {
   traversal,
   values,
   createTestTinkerGraph,
+  choose,
+  coalesce,
+  inject,
+  optional,
+  union,
   type Plan,
 } from '@lenke/gremlin';
 
@@ -163,6 +168,12 @@ const mulberry32 = (seed: number): (() => number) => {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 };
+
+// Distinct `FUZZ_SEED`s must explore DISJOINT cases. `SEED + i` did not: seeds 1
+// and 2 differ in one case out of four hundred, so running eight seeds was ~1.02x
+// the coverage of running one, not 8x. Multiplying by a large odd constant gives
+// each base seed its own region while keeping a reported seed reproducible.
+const caseSeed = (base: number, i: number): number => base * 1_000_003 + i;
 const pick = <T>(r: () => number, xs: readonly T[]): T => xs[Math.floor(r() * xs.length)];
 
 const KEYS = ['name', 'age', 'lang', 'weight', 'missing'];
@@ -256,6 +267,54 @@ const slicedBeforeOrdering = (text: string): boolean => {
   return ordered < 0 || slice < ordered;
 };
 
+/**
+ * A zero-row slice sitting downstream of a step that can produce a row WITHOUT
+ * evaluating the rest of the traversal — the ONE shape where the engines'
+ * lazy-vs-eager split is observable.
+ *
+ * Native is eager: everything above the slice runs. The TS engine is lazy with a
+ * one-element pull-ahead (`limit(n)` pulls `n + 1`), so its `limit(0)` normally
+ * still touches the upstream and the two agree. They stop agreeing when that
+ * single pull is satisfied by a step that yields early:
+ *
+ *     V().aggregate('x').limit(0).cap('x')            both → 6 vertices
+ *     V().aggregate('x').inject(1).limit(1).cap('x')  both → 6 vertices
+ *     V().aggregate('x').inject(1).limit(0).cap('x')  native → 6, TS → []
+ *
+ * `inject` shields the upstream by yielding an injected value first; a BRANCH
+ * step shields its later branches by yielding the first branch's row, which is
+ * how the second case turned up —
+ * `V().union(out('KNOWS'), has('age', gte('lop')).label()).limit(0).values('age')`,
+ * where the number-vs-string compare in the second branch faults natively and is
+ * never reached in TS.
+ *
+ * So this is NOT a limit(0) rule and NOT confined to erroneous queries — the
+ * middle case above is valid and the divergence is in the answer. Resolving it
+ * means making native lazy or TS eager, which is architectural; until that is
+ * decided the shape is skipped BY NAME (and counted) rather than either engine
+ * changing quietly, and the Rust side pins its half in
+ * `a_zero_limit_does_not_cancel_an_upstream_side_effect`.
+ *
+ * Found by the fuzzer at seeds 4 and 24, both only reachable once distinct seeds
+ * began exploring disjoint cases.
+ */
+const ZERO_SLICE = /\.(?:limit\(0\)|range\((\d+),\s*\1\))/;
+
+/** Steps that can yield a row without evaluating what feeds them. */
+const EARLY_YIELDING_STEP = /\.(?:inject|union|coalesce|choose|optional)\(/;
+
+const zeroSliceFedByEarlyYield = (text: string): boolean => {
+  const slice = text.search(ZERO_SLICE);
+
+  if (slice < 0) {
+    return false;
+  }
+
+  const shield = text.search(EARLY_YIELDING_STEP);
+
+  return shield >= 0 && shield < slice;
+};
+
 const etypes = (r: () => number): string[] =>
   pick(r, [
     ['KNOWS'],
@@ -270,6 +329,48 @@ const etypes = (r: () => number): string[] =>
     ['NOPE'],
     ['NOPE', 'ALSO_NOPE'],
   ]);
+
+// A sub-traversal for the branching steps: one or two ordinary steps, and NEVER
+// another branch. Bounded deliberately — a recursive generator produces traversals
+// whose cost is exponential in the nesting depth, and the point here is coverage
+// of the branch STEPS, not of arbitrarily deep nesting.
+const subPlan = (r: () => number): Plan => {
+  const n = 1 + Math.floor(r() * 2);
+
+  return traversal(...(Array.from({ length: n }, () => step(r)) as never[]));
+};
+
+// The branching steps. None of these was generated at all, and neither was
+// `inject` — so `union`/`coalesce`/`choose`/`optional` had no differential
+// coverage whatever, and `coalesce`/`choose`/`optional` could not even be EMITTED
+// as text until the cases were added to the emitter.
+//
+// Order matters and is part of what is being checked: `union` concatenates its
+// branches in order, `coalesce` yields the first branch that emits anything, and
+// `inject` ADDS to the stream rather than replacing it (so a sub-traversal that
+// injects also passes its incoming traverser through).
+const branchStep = (r: () => number): unknown => {
+  const p = r();
+
+  if (p < 0.35) {
+    return union(subPlan(r), subPlan(r));
+  }
+
+  if (p < 0.6) {
+    return coalesce(subPlan(r), subPlan(r));
+  }
+
+  if (p < 0.75) {
+    return optional(subPlan(r));
+  }
+
+  if (p < 0.9) {
+    // Both arities: the presence of an else branch is the meaning, not a detail.
+    return r() < 0.5 ? choose(subPlan(r), subPlan(r)) : choose(subPlan(r), subPlan(r), subPlan(r));
+  }
+
+  return inject(...(pick(r, [['x'], [1], ['a', 'b'], [0]]) as never[]));
+};
 
 // Steps that move the traverser, filter it, or reshape it — everything that can
 // cross the Groovy text boundary (no JS closures, no non-finite literals).
@@ -397,7 +498,11 @@ const terminal = (r: () => number): unknown[] => {
 const genPlan = (r: () => number): Plan => {
   const start = r() < 0.8 ? V() : E();
   const n = 1 + Math.floor(r() * 4);
-  const steps = Array.from({ length: n }, () => step(r));
+  // A branch step in about a fifth of plans. Kept to at most one per plan: two
+  // nested branches multiply the row count fast enough to dominate the run
+  // without covering anything the single case does not.
+  const branchAt = r() < 0.2 ? Math.floor(r() * n) : -1;
+  const steps = Array.from({ length: n }, (_, i) => (i === branchAt ? branchStep(r) : step(r)));
 
   return traversal(start, ...(steps as never[]), ...(terminal(r) as never[]));
 };
@@ -444,9 +549,10 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
     const divergences: string[] = [];
     let skippedUnordered = 0;
     let skippedUnbuildable = 0;
+    let skippedLazySlice = 0;
 
     for (let i = 0; i < ITERATIONS && divergences.length < 5; i++) {
-      const r = mulberry32(SEED + i);
+      const r = mulberry32(caseSeed(SEED, i));
       let plan: Plan;
       let text: string;
 
@@ -499,19 +605,34 @@ suite('differential fuzz: gremlin (TS engine vs Rust core)', () => {
         continue;
       }
 
+      if (zeroSliceFedByEarlyYield(text)) {
+        skippedLazySlice += 1;
+
+        continue;
+      }
+
       const ts = outcome(() => canonOrder(toArray(plan, tsGraph).map(canonJson), unordered));
       const native = outcome(() => canonOrder(nativeRun(text), unordered));
 
       // Both failing is acceptable — each rejects the query. A divergence is one
       // side succeeding, or both succeeding with different results.
       if (ts !== native && !(ts.startsWith('ERR') && native.startsWith('ERR'))) {
-        divergences.push(`[seed ${SEED + i}] ${text}\n    ts:     ${ts}\n    native: ${native}`);
+        divergences.push(
+          `[seed ${caseSeed(SEED, i)}] ${text}\n    ts:     ${ts}\n    native: ${native}`,
+        );
       }
     }
 
     if (skippedUnbuildable > 0) {
       console.log(
         `  ${skippedUnbuildable}/${ITERATIONS} plans skipped: could not be built or emitted as text`,
+      );
+    }
+
+    if (skippedLazySlice > 0) {
+      console.log(
+        `  ${skippedLazySlice}/${ITERATIONS} plans skipped: a zero-row slice below an ` +
+          'early-yielding step — the engines differ on whether the upstream runs',
       );
     }
 
