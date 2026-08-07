@@ -3631,6 +3631,16 @@ fn cross_language_cost_probe() {
             "g.E().hasLabel('R').where(__.values('w').is(1)).count()",
         ),
         (
+            "edge endpoints off an E() frontier",
+            "MATCH ()-[:R]->(b) RETURN count(*) AS c",
+            "g.E().hasLabel('R').inV().count()",
+        ),
+        (
+            "edge endpoint values",
+            "MATCH ()-[:R]->(b) RETURN b.n AS n",
+            "g.E().hasLabel('R').inV().values('n')",
+        ),
+        (
             "filter on the far end of a hop",
             "MATCH ()-[:R]->(b) WHERE b.n = 7 RETURN count(*) AS c",
             "g.V().out('R').has('n', 7).count()",
@@ -4876,5 +4886,61 @@ fn a_where_on_an_edge_property_matches_the_stream() {
             format!("{b:?}"),
             "`{q}` disagreed with its streamed spelling"
         );
+    }
+}
+
+/// An edge frontier's endpoints, off the column.
+///
+/// `e_src`/`e_dst` are indexed BY EDGE, so `outV`/`inV`/`bothV` are gathers
+/// rather than walks — which is why they are safe after an `E()` source where a
+/// step that read an edge id as a vertex id would not be. 6.994ms -> 0.153 for
+/// `E().hasLabel(R).inV().count()`.
+///
+/// `otherV()` must still take the stream: "the end I did not come from" is a
+/// question about the PATH, and a column has none. The last cases check it still
+/// answers.
+#[test]
+fn edge_endpoints_off_a_column_match_the_stream() {
+    let lines = [
+        r#"{"type":"node","id":"a","labels":["V"],"properties":{"n":1}}"#,
+        r#"{"type":"node","id":"b","labels":["V"],"properties":{"n":2}}"#,
+        r#"{"type":"node","id":"c","labels":["V"],"properties":{"n":3}}"#,
+        r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e1","from":"b","to":"c","labels":["R"],"properties":{}}"#,
+        // a self-loop: both ends are the same vertex
+        r#"{"type":"edge","id":"e2","from":"c","to":"c","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e3","from":"a","to":"c","labels":["S"],"properties":{}}"#,
+    ];
+    let mut g = crate::ndjson::decode(&lines.join("\n")).expect("fixture decodes");
+
+    for q in [
+        "g.E().inV().id()",
+        "g.E().outV().id()",
+        "g.E().bothV().id()",
+        "g.E().hasLabel('R').inV().id()",
+        "g.E().hasLabel('R').outV().values('n')",
+        "g.E().inV().count()",
+        "g.E().bothV().count()",
+        "g.E().bothV().dedup().count()",
+        "g.E().inV().dedup().id()",
+        "g.E().hasLabel('R').inV().hasLabel('V').count()",
+        // Path-dependent: stays on the stream, must still be right.
+        "g.V().bothE('R').otherV().id()",
+    ] {
+        let (head, tail) = q.split_once('.').expect("a traversal has a step");
+        let streamed = format!("{head}.{}", tail.replacen('.', ".fold().unfold().", 1));
+        let a = super::parse::parse(q)
+            .unwrap_or_else(|e| panic!("`{q}`: {e}"))
+            .run(&mut g);
+        let b = super::parse::parse(&streamed)
+            .unwrap_or_else(|e| panic!("`{streamed}`: {e}"))
+            .run(&mut g);
+
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "`{q}` disagreed with its streamed spelling"
+        );
+        assert!(!a.is_empty(), "`{q}` returned nothing to compare");
     }
 }

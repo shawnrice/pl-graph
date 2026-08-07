@@ -1243,6 +1243,12 @@ fn lowered_ids<'a>(graph: &Graph, steps: &'a [Step]) -> Option<(Vec<u32>, &'a [S
                     // declines an adjacency-shaped one from an edge frontier.
                     | Step::Where(_)
                     | Step::Not(_)
+                    // The endpoint steps navigate, but they navigate CORRECTLY
+                    // from an edge frontier: they index `e_src`/`e_dst` by edge
+                    // id. `otherV` is not here — it needs the path.
+                    | Step::OutV
+                    | Step::InV
+                    | Step::BothV
             )
         )
     {
@@ -1609,6 +1615,53 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
                         ))
                     })
                     .collect(),
+            )
+        }
+        // An edge frontier's endpoints. `e_src`/`e_dst` are indexed BY EDGE, so
+        // this is a gather, not a walk — the reason these are safe to allow after
+        // an `E()` source where a step that read an edge id as a vertex id would
+        // not be.
+        //
+        // `otherV()` is deliberately absent: "the end I did not come from" is a
+        // question about the PATH, and a column has none.
+        [Step::OutV | Step::InV, t @ ..] if is_edge => {
+            let src = matches!(rest.first(), Some(Step::OutV));
+            let ends: Vec<u32> = ids
+                .iter()
+                .map(|&e| {
+                    if src {
+                        graph.e_src[e as usize]
+                    } else {
+                        graph.e_dst[e as usize]
+                    }
+                })
+                .collect();
+
+            col_terminal(
+                graph,
+                Col::Elems {
+                    ids: std::borrow::Cow::Owned(ends),
+                    is_edge: false,
+                },
+                t,
+            )
+        }
+        // Both ends, in the order the stream yields them: out first, then in.
+        [Step::BothV, t @ ..] if is_edge => {
+            let mut ends = Vec::with_capacity(ids.len() * 2);
+
+            for &e in ids {
+                ends.push(graph.e_src[e as usize]);
+                ends.push(graph.e_dst[e as usize]);
+            }
+
+            col_terminal(
+                graph,
+                Col::Elems {
+                    ids: std::borrow::Cow::Owned(ends),
+                    is_edge: false,
+                },
+                t,
             )
         }
         // `elementMap()` off the frontier. The note on the step itself records two
