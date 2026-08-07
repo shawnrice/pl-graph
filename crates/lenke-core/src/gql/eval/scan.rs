@@ -1674,7 +1674,7 @@ pub(super) fn slice_rows(sc: &ScanCols, lo: usize, hi: usize) -> ScanCols {
     for s in 0..sc.cols.len() {
         if let Some((e, ids)) = sc.slot(s) {
             out.set_elems(s, e, ids[lo..hi].to_vec());
-        } else if let Some(v) = &sc.vals[s] {
+        } else if let Some(v) = sc.val_slot(s) {
             out.set_vals(s, v[lo..hi].to_vec());
         }
     }
@@ -2890,7 +2890,7 @@ pub(super) fn project_scan_rows(
         .collect();
     let mut rs = RowSet::with_capacity(proj.out_names.clone(), sc.n);
     for i in 0..sc.n {
-        rs.push_row(vvs.iter().map(|vv| vv.value_at(i, graph)));
+        rs.push_row(vvs.iter().map(|vv| val_to_value(graph, &vv.val_at(i))));
     }
     rs
 }

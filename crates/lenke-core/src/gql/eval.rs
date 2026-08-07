@@ -2980,7 +2980,7 @@ fn scalar_col(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> Vec<Val> {
             return (0..sc.n)
                 .into_par_iter()
                 .map_init(
-                    || Binding(vec![None; sc.slots.len()]),
+                    || Binding(vec![None; sc.cols.len()]),
                     |b, i| bind_and_eval(b, i),
                 )
                 .collect();

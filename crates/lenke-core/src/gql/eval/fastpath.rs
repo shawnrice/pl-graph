@@ -6,15 +6,6 @@
 //! context/helpers via `use super::*`.
 use super::*;
 
-/// Map `f` over `0..n` into a `Vec`, across rayon threads when `parallel-query` is
-/// on (else serial). Used for the independent per-vertex degree passes in the
-/// grouped count shortcuts — the same `par_iter`/`iter` split the other shortcuts
-/// (`try_count_two_hop`, …) use, factored so the call sites stay `cfg`-free.
-#[cfg(feature = "parallel-query")]
-pub(super) fn par_map<T: Send>(n: usize, f: impl Fn(u32) -> T + Sync + Send) -> Vec<T> {
-    (0..n as u32).into_par_iter().map(f).collect()
-}
-
 /// Start vertices matching a bare seed node (label + inline props/WHERE), using a
 /// property index when the inline map / WHERE offers one, else a label scan.
 pub(super) fn reach_seed_vertices(
@@ -274,8 +265,19 @@ pub(super) fn try_parallel_count(
     if path.segments.is_empty() {
         return None;
     }
-    // The projection is exactly `count(*)` (mirrors `try_count_star`).
-    if !is_bare_count_star(proj) {
+    // The projection is exactly `count(*)` — one aggregate, one item referring to
+    // it, no DISTINCT and no argument. Spelled out rather than delegated: the
+    // helper this used to call was removed with the `try_count` family, and this
+    // arm only compiles under `parallel-query`, so nothing pointed at it.
+    let bare_count_star = proj.aggregating
+        && proj.aggs.len() == 1
+        && proj.items.len() == 1
+        && matches!(proj.items[0].expr, CExpr::AggRef(0))
+        && {
+            let a = &proj.aggs[0];
+            a.star && !a.distinct && a.arg.is_none() && matches!(a.func, AggFn::Count)
+        };
+    if !bare_count_star {
         return None;
     }
 

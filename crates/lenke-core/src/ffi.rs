@@ -896,7 +896,7 @@ unsafe fn in_g1<'a>(g: *mut Graph, p: *const u8, l: usize) -> Option<(&'a mut Gr
 ///
 /// # Safety
 /// As [`in_g1`], except `g` need only be shared-borrowable.
-#[cfg(feature = "codecs")]
+#[cfg(feature = "ndjson")]
 unsafe fn in_r1<'a>(g: *const Graph, p: *const u8, l: usize) -> Option<(&'a Graph, &'a str)> {
     // SAFETY: forwards this fn's contract to each accessor; both yield None for null.
     unsafe { Some((graph_ref(g)?, in_str(p, l)?)) }

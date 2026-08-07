@@ -73,6 +73,15 @@ _fallible-ffi = []
 
 
 # `gql`: the ISO-GQL engine (hand-rolled parser; carries NO serde_json).
+#
+# Every other feature depends on it, so it is the base of every configuration —
+# `gremlin` and `arrow` already said so and `ndjson`/`parallel` now do too. The
+# reason is `graph::constraints`, which is NOT optional: a validator predicate IS
+# a GQL predicate, parsed by `gql::parser::parse_predicate` and evaluated by
+# `gql::eval::eval_predicate`, so a graph that can enforce a constraint contains
+# the engine by construction. `ffi` and the crate root reach into it as well.
+# Spelling the dependency is what makes `--no-default-features --features ndjson`
+# (and `codecs`, and `parallel`) build at all; they were 26-47 errors each.
 gql = ["_fallible-ffi"]
 # `gremlin`: the Gremlin traversal engine (heterogeneous JSON results). Its JSON
 # carrier is hand-rolled via `jsonfmt`, so it carries NO serde_json.
@@ -84,7 +93,7 @@ gql = ["_fallible-ffi"]
 # `--no-default-features --features gremlin` build at all.
 gremlin = ["gql", "dep:regex", "_fallible-ffi"]
 # `ndjson`: the NDJSON load/snapshot codec (hand-rolled JSON, no serde_json).
-ndjson = ["_fallible-ffi"]
+ndjson = ["gql", "_fallible-ffi"]
 # `codecs`: the extra serialization formats (pg-json/pg-text/graphson/csv); the
 # combined dispatch also covers ndjson, so it implies it. Hand-rolled JSON — no serde.
 codecs = ["ndjson"]
@@ -93,7 +102,7 @@ codecs = ["ndjson"]
 arrow = ["gql"]
 
 # `parallel`: rayon for bulk ndjson decode (a load-time win, no tradeoff).
-parallel = ["dep:rayon"]
+parallel = ["gql", "dep:rayon"]
 # `parallel-query`: intra-query threading (parallel projection eval). Opt-in and
 # off by default — it trades throughput for single-query latency, so it's a
 # deliberate choice, not a default.
