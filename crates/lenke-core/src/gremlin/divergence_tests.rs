@@ -6017,3 +6017,45 @@ fn a_param_is_broadcast_not_re_evaluated() {
         println!("PARAM {best:>8.3}ms {rows:>6} rows  {q}");
     }
 }
+
+/// `IS LABELED` walks a label set per element — irreducible — but used to carry VM
+/// dispatch and `Val` boxing around it. Over 50k vertices, a third multi-labeled:
+///
+///   WHERE u IS LABELED W RETURN count(*)      1.033ms -> 0.184   5.6x
+///   RETURN u IS LABELED W                     1.336   -> 0.501   2.7x
+///   WHERE u IS NOT LABELED W RETURN u.n       1.313   -> 0.446   2.9x
+#[test]
+#[ignore = "probe"]
+fn is_labeled_is_a_column_walk() {
+    let mut lines = String::new();
+    for i in 0..50_000usize {
+        let l = if i % 3 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{}}}}}\n",
+            i % 97
+        ));
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+    for q in [
+        "MATCH (u:V) WHERE u IS LABELED W RETURN count(*) AS c",
+        "MATCH (u:V) RETURN u IS LABELED W AS w",
+        "MATCH (u:V) WHERE u IS NOT LABELED W RETURN u.n AS n",
+    ] {
+        let mut best = f64::MAX;
+        let mut rows = 0;
+        for _ in 0..9 {
+            let p = crate::gql::parse(q).expect("parses");
+            let t = std::time::Instant::now();
+            let rs = p
+                .execute(&mut g, &crate::gql::eval::Params::new())
+                .expect("runs");
+            best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+            rows = rs.nrows;
+        }
+        println!("LBL {best:>8.3}ms {rows:>6} rows  {q}");
+    }
+}

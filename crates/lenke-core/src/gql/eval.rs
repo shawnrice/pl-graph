@@ -3398,6 +3398,40 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> Col {
                 None => gen(e),
             }
         }
+        // `x IS [NOT] LABELED L`. The label walk is irreducibly per element — a
+        // label set is per element — but the VM dispatch and the `Val` boxing
+        // around it are not. Only when the operand is a bare variable bound to an
+        // element column; anything else has to be evaluated first and there is no
+        // column to read.
+        CExpr::IsLabeled {
+            expr,
+            label,
+            negated,
+        } if matches!(&**expr, CExpr::Var(_)) => {
+            let CExpr::Var(slot) = &**expr else {
+                unreachable!("guarded above")
+            };
+
+            match sc.slot(*slot) {
+                Some((Elem::Node, ids)) => Col::Bool {
+                    t: ids
+                        .iter()
+                        .map(|&i| eval_label_node(graph, ctx, i, label) != *negated)
+                        .collect(),
+                    valid: None,
+                },
+                Some((Elem::Edge, ids)) => Col::Bool {
+                    t: ids
+                        .iter()
+                        .map(|&i| eval_label_edge_at(graph, ctx, i, label) != *negated)
+                        .collect(),
+                    valid: None,
+                },
+                // Not an element column: the scalar form yields FALSE for a
+                // non-element, which this cannot know without the value.
+                None => gen(e),
+            }
+        }
         CExpr::Neg(x) => {
             let v = eval_vec(graph, ctx, sc, x);
             // A non-numeric operand → scalar fallback, which raises the type error.
