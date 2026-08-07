@@ -2162,6 +2162,15 @@ fn shape_projection(
         return Some(col.clone().into_owned());
     }
 
+    if t.shape == super::to_gql::Shape::Map {
+        let counts = cols.get(1)?;
+        let entries = (0..col.len())
+            .map(|i| (as_gremlin_shape(col.val_at(i)), counts.val_at(i)))
+            .collect();
+
+        return Some(Col::Gen(vec![GVal::map(entries)]));
+    }
+
     let mut out = col.clone().into_owned();
 
     if let Some(key) = &t.absent_key {
@@ -2393,24 +2402,6 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
         // a mutation that drops it survives the tests for a reason that lives in
         // another function.
         [Step::Values(keys), tail @ ..] => column_terminal(graph, ids, is_edge, keys, tail),
-        // Tally the frontier straight into the map. Element identity IS the id,
-        // so this is the same count the `dedup` arm's set does, kept per id — and
-        // the stream built a `Trav` per element to read the element back out and
-        // count it, which is 34x on a 150k-edge frontier.
-        // `groupCount().by(k)` tallies a PROPERTY of each element, which is the
-        // same fold one column over — `prop` is the shared typed read the
-        // columnar path uses, so this never boxes an intermediate either.
-        //
-        // Only the identity form had an arm, so keying on a property built a
-        // `Trav` per element to run `eval_by` over: `out('R').groupCount().by('n')`
-        // cost 14.3ms over 150k against 1.26ms for the GQL spelling.
-        //
-        // A `by()` carrying an ORDER is a different step (it sorts the result),
-        // and a sub-traversal `by()` can read the path, so both stay on the
-        // stream — `single_key_by` accepts neither.
-        [Step::GroupCount(bys)] if let Some(key) = single_key_by(bys) => Some(vec![GVal::map(
-            tally_group_count(prop_column(graph, ids, is_edge, key).into_iter()),
-        )]),
         // The frontier ITSELF. There was no arm for it, so
         // `g.V().hasLabel('V').out('R')` — a traversal with no terminal at all —
         // built a `Trav` per element to hand back the elements: 5.2ms for 150k,

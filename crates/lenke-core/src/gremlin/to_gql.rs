@@ -48,6 +48,8 @@ pub(super) enum Shape {
     Rows,
     /// A single row holding one value — a global aggregate.
     Scalar,
+    /// One `Map` from two columns: keys then counts. Gremlin's `groupCount`.
+    Map,
 }
 
 pub(super) struct Tail {
@@ -191,6 +193,43 @@ pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option
                 proj,
                 shape: Shape::Rows,
                 absent_key: Some(ks[0].clone()),
+            })
+        }
+        // `groupCount().by(k)` — GROUP BY the property, count each group. Both
+        // engines emit groups in FIRST-SEEN order, so the sequence matches without
+        // an ORDER BY. A `by()` carrying a direction sorts the result and is a
+        // different step; `single_key_by` refuses one and so does this.
+        [Step::GroupCount(bys)] => {
+            let [crate::gremlin::By::Key(k, None)] = bys.as_slice() else {
+                return None;
+            };
+            let kr = key_ref(keys, k);
+            let key_expr = CExpr::Prop {
+                var_slot: slot,
+                key_ref: kr,
+            };
+            let mut proj = blank(vec![
+                item(key_expr.clone(), "k", false),
+                item(CExpr::AggRef(0), "c", true),
+            ]);
+
+            proj.aggregating = true;
+            proj.group_by = vec![item(key_expr, "k", false)];
+            proj.aggs = vec![CAgg {
+                func: crate::gql::plan::AggFn::Count,
+                arg: None,
+                distinct: false,
+                star: true,
+                frac: None,
+            }];
+
+            Some(Tail {
+                proj,
+                shape: Shape::Map,
+                // A tally keys on the value, and an absent key tallies under a
+                // NULL key rather than dropping the row — TinkerPop 3.5, and what
+                // the arm this replaces does.
+                absent_key: None,
             })
         }
         // NOT YET: `order().by(k)`. It compiles, and it sorts WRONG — a sort key

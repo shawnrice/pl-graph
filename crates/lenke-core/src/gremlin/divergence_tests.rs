@@ -6229,6 +6229,8 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         "g.V().out('R').hasLabel('W').values('n').mean()",
         "g.V().out('R').hasLabel('W').values('n').dedup()",
         "g.V().out('R').hasLabel('W').values('k')",
+        "g.V().out('R').hasLabel('W').groupCount().by('n')",
+        "g.V().out('R').hasLabel('W').groupCount().by('k')",
         "g.V().out('R').hasLabel('W').order().by('n')",
         "g.V().out('R').hasLabel('W').order().by('n').limit(5)",
     ] {
