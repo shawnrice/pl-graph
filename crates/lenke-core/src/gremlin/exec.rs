@@ -1457,6 +1457,19 @@ fn col_terminal(graph: &Graph, col: Col, tail: &[Step]) -> Option<Vec<GVal>> {
         // the column path entirely and ran as a stream, which is 435 traversals
         // in the suite dropped by a step that does nothing.
         [Step::Barrier | Step::Identity, t @ ..] => col_terminal(graph, col, t),
+        // `as('a')` writes a tag onto every traverser. If nothing after it ever
+        // READS a tag, that is work with no reader — the same test the pattern
+        // planner already makes before it bothers carrying tag columns.
+        //
+        // The guard is NOT observable today and a mutation dropping it survives
+        // the suite. Every tag reader — `select`, `dedup('a')`, a tag `where` —
+        // has no column arm, so a traversal that reads one declines further down
+        // regardless and the stream re-runs it from the start with tags intact.
+        // It is kept because it stops being redundant the moment the column path
+        // learns any of those steps, and because "correct for the reason stated"
+        // is worth more than "correct because something else happens to fail
+        // first".
+        [Step::As(_), t @ ..] if !reads_tags(t) => col_terminal(graph, col, t),
         // `unfold()` expands a LIST into its elements and passes anything else
         // through. An element column and an unboxed scalar column can never hold
         // a list, so for those it is the identity above — only a boxed column can

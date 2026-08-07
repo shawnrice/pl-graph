@@ -3641,6 +3641,16 @@ fn cross_language_cost_probe() {
             "g.E().hasLabel('R').inV().values('n')",
         ),
         (
+            "an unread as() tag",
+            "MATCH (u:V) RETURN count(*) AS c",
+            "g.V().hasLabel('V').as('x').count()",
+        ),
+        (
+            "a READ as() tag",
+            "MATCH (u:V) RETURN count(*) AS c",
+            "g.V().hasLabel('V').as('x').select('x').count()",
+        ),
+        (
             "plain count (baseline)",
             "MATCH (u:V) RETURN count(*) AS c",
             "g.V().hasLabel('V').count()",
@@ -5011,5 +5021,51 @@ fn unfold_off_a_column_matches_the_stream() {
             format!("{b:?}"),
             "`{q}` disagreed with its streamed spelling"
         );
+    }
+}
+
+/// `as('x')` writes a tag onto every traverser. When nothing downstream READS a
+/// tag, that is work with no reader, and the column path can carry on — 2.128ms
+/// against 0.002 for a count behind an unread tag.
+///
+/// The other half is checked too — a traversal that DOES read one must still be
+/// right — but be clear about WHY it is right today: not because of the
+/// `reads_tags` guard, which a mutation can remove without failing anything, but
+/// because every tag reader (`select`, `dedup('a')`, a tag `where`) has no column
+/// arm and declines further down, so the stream re-runs the traversal from the
+/// start. The guard is what will keep it right when the column path learns those
+/// steps. Recorded here so nobody reads these cases as covering it.
+#[test]
+fn an_unread_tag_is_free_and_a_read_one_still_works() {
+    let mut g = modern();
+
+    for q in [
+        // Nothing reads the tag.
+        "g.V().as('x').count()",
+        "g.V().as('x').values('name')",
+        "g.V().as('x').out('KNOWS').id()",
+        "g.V().as('x').as('y').count()",
+        // Something does.
+        "g.V().as('x').select('x').id()",
+        "g.V().as('x').out('KNOWS').select('x').id()",
+        "g.V().as('x').out('KNOWS').as('y').select('x', 'y').count()",
+        "g.V().as('x').dedup('x').count()",
+        "g.V().as('x').where(__.select('x')).count()",
+    ] {
+        let (head, tail) = q.split_once('.').expect("a traversal has a step");
+        let streamed = format!("{head}.{}", tail.replacen('.', ".fold().unfold().", 1));
+        let a = super::parse::parse(q)
+            .unwrap_or_else(|e| panic!("`{q}`: {e}"))
+            .run(&mut g);
+        let b = super::parse::parse(&streamed)
+            .unwrap_or_else(|e| panic!("`{streamed}`: {e}"))
+            .run(&mut g);
+
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "`{q}` disagreed with its streamed spelling"
+        );
+        assert!(!a.is_empty(), "`{q}` returned nothing to compare");
     }
 }
