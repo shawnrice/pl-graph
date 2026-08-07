@@ -13045,3 +13045,212 @@ fn the_unconstrained_prefix_decline_still_pays() {
         println!("UNC {best:>8.3}ms {rows:>7} rows  {q}");
     }
 }
+
+/// INVESTIGATION PROBE for the "Gremlin as a clause sequence, not a
+/// prefix+tail split" question (see `docs/design/query-ir.md`).
+///
+/// Three shapes, GQL text parsed with `crate::gql::eval::prepare_plan` (parse +
+/// lower — the real pipeline, not a hand-built `CClause`) so the plan is
+/// guaranteed correct, timed three ways: (a) the Gremlin traversal as it runs
+/// today, (b) the equivalent GQL plan through `execute` (`RowSet`-boxing), (c)
+/// the same plan through whichever columnar exit (if any) the clause shape
+/// reaches — `vectorized_linear_cols` for the aggregate/WITH-chain shape,
+/// `vectorized_single_match_cols` for a plain single-`MATCH`+`RETURN`.
+///
+/// Measured 2026-08-07, 50k vertices / 150k edges, min of 7 (two runs, stable):
+///
+/// ```text
+/// case                       gremlin   gql/rows   gql/cols  cols-via
+/// seeded 1-hop count         0.061ms    0.061ms    0.061ms  linear (aggregate/WITH-chain)
+/// far-end label, values      0.153ms    0.245ms    0.119ms  single-match (plain projection)
+/// semi-join count (EXISTS)   1.245ms    3.583ms    3.606ms  linear (aggregate/WITH-chain)
+/// ```
+///
+/// Two different stories, not one:
+///
+/// - The plain-projection shape (`values(n)`) is exactly what the
+///   `RowSet`-boxing tax was theorized to cost: `gql/rows` is 1.6x SLOWER than
+///   Gremlin, and skipping the box (`gql/cols`) flips that into 1.29x FASTER —
+///   the columnar exit is the whole gap.
+/// - The EXISTS semi-join gets NO benefit from the columnar exit (3.583 vs
+///   3.606ms, noise-level) because `eval_vec` has no vectorized arm for
+///   `CExpr::Exists` (see `gql/eval.rs` — `eval_vec`'s `_ => gen(e)` catch-all
+///   falls through to a per-row scalar-VM re-evaluation of the sub-pattern for
+///   every candidate row). `RowSet` boxing was never the cost there; the
+///   per-shape count shortcuts that used to answer this (`try_count_semi_join`
+///   et al., named in the now-stale doc comment on
+///   `examples/cross_engine_shortcuts.rs`) are gone from `fastpath.rs` on this
+///   branch — retired in favor of the general planner — and nothing replaced
+///   them for a sub-pattern inside a filter. That is a real, separate gap: it
+///   would need `eval_vec` to gain an `Exists` arm, not a wider columnar exit.
+/// - The single-row aggregate (`count()`) shows parity all three ways — with
+///   one output row `RowSet` boxing is one allocation, not a cost worth
+///   chasing.
+///
+/// Checked separately, because `fastpath.rs` shrank from 2,065 lines to 600 on
+/// this branch and took a family of count/semi-join shortcuts with it: the
+/// semi-join row above is NOT a regression from that removal. Measured on `main`
+/// in a scratch worktree, the same query costs 3.549ms against 3.583 here — the
+/// deleted shortcuts never covered this shape, so the gap is pre-existing and
+/// belongs to the missing `eval_vec` arm. (`MATCH (u:V) RETURN u.n` went the
+/// other way on this branch, 0.402ms -> 0.245.)
+#[test]
+#[ignore = "probe"]
+fn clause_sequence_columnar_exit_probe() {
+    use crate::gql::eval::{vectorized_linear_cols, vectorized_single_match_cols, Val};
+
+    // Same shape as `migration_route_cost`'s fixture, so k/n/labels/degree line
+    // up with the three traversals below: 50k vertices (label V, every 10th
+    // also W), properties n (i%97, numeric) and k ("key{i:06}", a unique
+    // string key), 3 out-edges of type R each -> 150k edges.
+    let mut lines = String::new();
+    for i in 0..50_000usize {
+        let l = if i % 10 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{},\"k\":\"key{i:06}\"}}}}\n",
+            i % 97
+        ));
+    }
+    let mut e = 0;
+    for i in 0..50_000usize {
+        for d in 0..3usize {
+            lines.push_str(&format!(
+                "{{\"type\":\"edge\",\"id\":\"e{e}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{}}}}\n",
+                (i * 31 + d * 7 + 1) % 50_000
+            ));
+            e += 1;
+        }
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    const REPS: usize = 7;
+
+    fn as_num(v: &Val) -> f64 {
+        match v {
+            Val::Num(x) => *x,
+            other => panic!("expected a Num, got {other:?}"),
+        }
+    }
+    fn row_num(v: &Value) -> f64 {
+        match v {
+            Value::Num(x) => *x,
+            other => panic!("expected a Num, got {other:?}"),
+        }
+    }
+
+    // (name, gremlin, gql)
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "seeded 1-hop count",
+            "g.V().has('k','key000005').out('R').count()",
+            "MATCH (a)-[:R]->(b) WHERE a.k = 'key000005' RETURN count(*) AS c",
+        ),
+        (
+            "far-end label, values",
+            "g.V().out('R').hasLabel('W').values('n')",
+            "MATCH ()-[:R]->(b:W) RETURN b.n AS n",
+        ),
+        (
+            "semi-join count (EXISTS)",
+            "g.V().hasLabel('V').where(__.out('R')).count()",
+            "MATCH (a:V) WHERE EXISTS { MATCH (a)-[:R]->() } RETURN count(*) AS c",
+        ),
+    ];
+
+    println!(
+        "50000 vertices, degree 3, min of {REPS}\n\n{:<26} {:>10} {:>10} {:>10}  cols-via",
+        "case", "gremlin", "gql/rows", "gql/cols"
+    );
+
+    for (label, gq, gql) in cases {
+        // (a) Gremlin, as it runs today.
+        let gp = crate::gremlin::parse(gq).unwrap_or_else(|e| panic!("gremlin parses `{gq}`: {e}"));
+        let mut t_grem = f64::MAX;
+        let mut grem_out: Vec<Val> = Vec::new();
+        for _ in 0..REPS {
+            let t = std::time::Instant::now();
+            grem_out = gp.run(&mut g);
+            t_grem = t_grem.min(t.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        // (b) The equivalent GQL statement through `execute` (`RowSet`-boxed).
+        let prepared =
+            crate::gql::prepare(gql).unwrap_or_else(|e| panic!("gql prepares `{gql}`: {e}"));
+        let params = Params::new();
+        let mut t_rows = f64::MAX;
+        let mut rows_out = prepared.execute(&mut g, &params).expect("gql runs");
+        for _ in 0..REPS {
+            let t = std::time::Instant::now();
+            rows_out = prepared.execute(&mut g, &params).expect("gql runs");
+            t_rows = t_rows.min(t.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        // Answers, normalized for container shape: a Gremlin `count()` is one
+        // scalar, a GQL count is a one-row/one-column `RowSet`; `values(n)` is a
+        // Gremlin list in TRAVERSAL order against an unordered GQL row set
+        // (order is unspecified across both engines — see
+        // `docs/design/query-ir.md`), so sort both before comparing as
+        // multisets rather than sequences.
+        let mut grem_nums: Vec<f64> = grem_out.iter().map(as_num).collect();
+        let mut gql_nums: Vec<f64> = rows_out.rows().map(|r| row_num(&r[0])).collect();
+        grem_nums.sort_by(f64::total_cmp);
+        gql_nums.sort_by(f64::total_cmp);
+        assert_eq!(
+            grem_nums, gql_nums,
+            "{label}: gremlin `{gq}` and gql `{gql}` disagree"
+        );
+
+        // (c) The same lowered plan through whichever columnar exit the clause
+        // shape reaches, if any.
+        let plan = crate::gql::eval::prepare_plan(gql).expect("gql lowers");
+        let linear = &plan.parts[0];
+        let mut cols_via = "declined (scalar/general driver)";
+        let mut t_cols = f64::NAN;
+
+        if vectorized_linear_cols(linear, &g, &plan, &[]).is_some() {
+            cols_via = "linear (aggregate/WITH-chain)";
+            let mut best = f64::MAX;
+            let mut cols = None;
+            for _ in 0..REPS {
+                let t = std::time::Instant::now();
+                cols = vectorized_linear_cols(linear, &g, &plan, &[]);
+                best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            t_cols = best;
+            let cols = cols.expect("engaged above");
+            let mut nums: Vec<f64> = (0..cols.first().map_or(0, |c| c.len()))
+                .flat_map(|i| cols.iter().map(move |c| c.with_val_at(i, as_num)))
+                .collect();
+            nums.sort_by(f64::total_cmp);
+            assert_eq!(nums, gql_nums, "{label}: linear columnar exit disagrees");
+        } else if vectorized_single_match_cols(linear, &g, &plan, &[]).is_some() {
+            cols_via = "single-match (plain projection)";
+            let mut best = f64::MAX;
+            let mut cols = None;
+            for _ in 0..REPS {
+                let t = std::time::Instant::now();
+                cols = vectorized_single_match_cols(linear, &g, &plan, &[]);
+                best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            t_cols = best;
+            let cols = cols.expect("engaged above");
+            let mut nums: Vec<f64> = (0..cols.first().map_or(0, |c| c.len()))
+                .flat_map(|i| cols.iter().map(move |c| c.with_val_at(i, as_num)))
+                .collect();
+            nums.sort_by(f64::total_cmp);
+            assert_eq!(
+                nums, gql_nums,
+                "{label}: single-match columnar exit disagrees"
+            );
+        }
+
+        println!(
+            "{label:<26} {t_grem:>8.3}ms {t_rows:>8.3}ms {t_cols:>8.3}ms  {cols_via}   ({} rows)",
+            rows_out.nrows
+        );
+    }
+}

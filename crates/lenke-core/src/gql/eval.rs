@@ -4156,6 +4156,165 @@ fn finish_linear(graph: &Graph, ctx: &Ctx, sc: ScanCols, proj: &CProjection) -> 
     Some(rs)
 }
 
+/// Probe-only twin of [`vectorized_linear`] that exits through
+/// [`finish_linear_cols`] instead of [`finish_linear`], so a caller can measure
+/// the columnar frame WITHOUT paying `RowSet`'s per-row boxing and element
+/// rendering.
+///
+/// This is deliberately a duplicate of `vectorized_linear`'s body rather than a
+/// shared refactor: `vectorized_linear` has two `finish_linear(...)` exit
+/// points (the walk shortcut and the joined-frame tail), and threading a second
+/// exit shape through both without disturbing the hot path it already is would
+/// be exactly the "large refactor" the investigation was told not to do. Kept
+/// `#[cfg(test)]` because nothing outside the measurement in `gql/tests.rs`
+/// calls it — see `docs/design/query-ir.md` for the real migration, which would
+/// fold this back into one function once the direction is confirmed.
+#[cfg(test)]
+pub(crate) fn vectorized_linear_cols(
+    linear: &CLinear,
+    graph: &Graph,
+    plan: &CQuery,
+    params: &[Val],
+) -> Option<Vec<Col>> {
+    let (first, rest) = linear.clauses.split_first()?;
+    let CClause::Match {
+        optional: false,
+        patterns,
+        where_,
+        scope_len,
+        ..
+    } = first
+    else {
+        return None;
+    };
+    let fused = fuse_groups(patterns);
+    let patterns: &[CPath] = fused.as_deref().unwrap_or(patterns);
+
+    if patterns.len() != 1 {
+        return None;
+    }
+    let (last, mid) = rest.split_last()?;
+    let CClause::Return(last_proj) = last else {
+        return None;
+    };
+    let mid_ok = mid
+        .iter()
+        .all(|c| matches!(c, CClause::With { .. } | CClause::Match { .. }));
+    if !mid_ok {
+        return None;
+    }
+    if mid.is_empty() && !last_proj.aggregating {
+        return None;
+    }
+
+    let ctx = resolve_ctx(graph, plan, params);
+
+    if mid.is_empty() && !patterns[0].segments.is_empty() {
+        if let Some(sc) = streamed_frame(
+            graph,
+            &ctx,
+            &patterns[0],
+            where_.as_ref(),
+            *scope_len,
+            last_proj,
+        ) {
+            return finish_linear_cols(graph, &ctx, &sc, last_proj);
+        }
+    }
+
+    let filter = |sc: &mut ScanCols, w: &CExpr| {
+        let keep: Vec<bool> = eval_vec(graph, &ctx, sc, w)
+            .into_truth()
+            .iter()
+            .map(|t| *t == Some(true))
+            .collect();
+        compact(sc, &keep);
+    };
+    let mut sc = build_scan(
+        graph,
+        &ctx,
+        &patterns[0],
+        *scope_len,
+        None,
+        where_.as_ref(),
+        None,
+    )?;
+    if let Some(w) = where_ {
+        filter(&mut sc, w);
+    }
+    for c in mid {
+        match c {
+            CClause::With {
+                projection, where_, ..
+            } => {
+                sc = with_frame(graph, &ctx, &sc, projection)?;
+                if let Some(w) = where_ {
+                    filter(&mut sc, w);
+                }
+            }
+            CClause::Match {
+                patterns,
+                where_,
+                scope_len,
+                optional,
+                ..
+            } => {
+                if patterns.len() != 1 {
+                    return None;
+                }
+                if *optional {
+                    if where_.is_some() {
+                        return None;
+                    }
+                    sc = expand_frame_optional(graph, &ctx, &sc, &patterns[0], *scope_len)?;
+                } else {
+                    sc = expand_frame(graph, &ctx, &sc, &patterns[0], *scope_len)?;
+                    if let Some(w) = where_ {
+                        filter(&mut sc, w);
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    finish_linear_cols(graph, &ctx, &sc, last_proj)
+}
+
+/// Probe-only wrapper around [`vectorized_cols`] — the OTHER existing columnar
+/// exit, reached today only through `project_to_rows` (which boxes it into a
+/// `RowSet` a few lines after getting it). It answers a shape
+/// `vectorized_linear_cols` above deliberately declines: one fresh `MATCH`
+/// directly followed by a plain (non-aggregating) `RETURN`, no WITH — exactly
+/// `project_to_rows`'s single-pending-match case, reproduced here with the same
+/// `bindings`/`pending` shape it constructs, so this calls the real function,
+/// not a reimplementation of it. `#[cfg(test)]` for the same reason as its
+/// sibling above.
+#[cfg(test)]
+pub(crate) fn vectorized_single_match_cols(
+    linear: &CLinear,
+    graph: &Graph,
+    plan: &CQuery,
+    params: &[Val],
+) -> Option<Vec<Col>> {
+    let (first, rest) = linear.clauses.split_first()?;
+    if !matches!(first, CClause::Match { .. }) {
+        return None;
+    }
+    let [CClause::Return(proj)] = rest else {
+        return None;
+    };
+    let ctx = resolve_ctx(graph, plan, params);
+    let bindings = vec![Binding::default()];
+    let pending = vec![first];
+    let cols = vectorized_cols(graph, &ctx, &bindings, &pending, proj)?;
+
+    if ctx.faulted() {
+        return None;
+    }
+
+    Some(cols)
+}
+
 /// Project a terminal RETURN directly to output `Value` rows. For the common
 /// non-aggregating, non-ordered case this streams straight to one `Vec<Value>`
 /// per row — no intermediate `Binding` and no later Val→Value conversion (the
