@@ -347,29 +347,6 @@ pub fn try_run(graph: &mut Graph, t: &Traversal) -> crate::error::CodeResult<Vec
 }
 
 fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
-    #[cfg(feature = "bailprobe")]
-    {
-        let shape = super::analysis::analyze(&t.steps);
-
-        crate::gql::eval::scan::bailprobe::hit_step(format!(
-            "ROUTE {:?} {}",
-            shape.route,
-            if shape.route == crate::pipeline::Route::Decline {
-                t.steps
-                    .iter()
-                    .find(|s| super::analysis::facts(s).class == crate::pipeline::OpClass::Opaque)
-                    .map_or_else(
-                        || "?".to_string(),
-                        |s| format!("on {s:?}").chars().take(28).collect(),
-                    )
-            } else {
-                shape
-                    .first_boundary
-                    .map_or_else(|| "boundary=none".to_string(), |i| format!("boundary={i}"))
-            }
-        ));
-    }
-
     take_type_fault(); // reset any leftover flag from a prior run on this thread
 
     // A linear prefix of filters and hops IS a pattern; plan it as one. A filter
@@ -3279,21 +3256,9 @@ fn map_key(graph: &Graph, k: &GVal) -> String {
 
 fn run_steps(graph: &mut Graph, ctx: &mut Ctx, steps: &[Step], mut stream: Vec<Trav>) -> Vec<Trav> {
     for step in steps {
-        #[cfg(feature = "bailprobe")]
-        crate::gql::eval::scan::bailprobe::hit_step(step_name(step));
-
         stream = apply(graph, ctx, step, stream);
     }
     stream
-}
-
-/// The step's variant name, for the decline tally. Debug's first token is the
-/// variant, which is all this needs.
-#[cfg(feature = "bailprobe")]
-fn step_name(step: &Step) -> String {
-    let d = format!("{step:?}");
-
-    d.split(['(', ' ', '{']).next().unwrap_or("?").to_string()
 }
 
 /// Run a sub-plan from a single seed value; collect its output values.

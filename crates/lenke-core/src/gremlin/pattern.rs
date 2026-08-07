@@ -291,14 +291,9 @@ fn plain_hops(steps: &[Step], it: &mut Interner) -> Option<Vec<(Direction, Optio
 /// Requires a bare `V()` start (an id-seeded one is already a point lookup) and
 /// at least one hop — with none the caller's own seeding path is what runs, and
 /// this would only add a translation.
-#[cfg(feature = "bailprobe")]
-macro_rules! decline {
-    ($why:expr) => {{
-        crate::gql::eval::scan::bailprobe::hit_step(format!("PATTERN {}", $why));
-        return None;
-    }};
-}
-#[cfg(not(feature = "bailprobe"))]
+/// Decline the translation, naming the reason at the call site for the reader.
+/// The reason string is documentation, not a value — a traversal this cannot
+/// express simply streams.
 macro_rules! decline {
     ($why:expr) => {
         return None
@@ -604,12 +599,7 @@ fn compile_inner(steps: &[Step], forced: bool) -> Option<Compiled> {
     // WITH hops and `lower_hops` to walk them, so nothing can be deleted and the
     // setup is paid for nothing.
     if segments.is_empty() {
-        decline!(format!(
-            "no hop; stopped at {}",
-            steps
-                .get(consumed)
-                .map_or_else(|| "end".to_string(), step_kind)
-        ));
+        decline!("no hop, so the caller's own seeding path is what runs");
     }
 
     // REJECTED, measured twice, so the next attempt starts past it: routing the
@@ -703,14 +693,4 @@ fn compile_inner(steps: &[Step], forced: bool) -> Option<Compiled> {
         consumed,
         reorders: false,
     })
-}
-
-/// The variant name of a step, for the decline tally.
-#[cfg(feature = "bailprobe")]
-fn step_kind(step: &Step) -> String {
-    format!("{step:?}")
-        .split(|c: char| !c.is_alphanumeric())
-        .next()
-        .unwrap_or("?")
-        .to_string()
 }

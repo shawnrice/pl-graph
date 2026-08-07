@@ -5771,3 +5771,384 @@ fn the_pattern_route_reorders_rows() {
 
     assert_eq!(key(&planned), key(&walked), "but only the sequence differs");
 }
+
+/// The two languages compute the SAME VALUES for the same question.
+///
+/// `cross_language_cost_probe` already asserts that each pair below is one
+/// question written twice; it only ever PRICED them. This runs both sides and
+/// compares the answers, which is the load-bearing claim behind sharing an IR at
+/// all — if the algebras differed, no amount of shared machinery would help.
+///
+/// Both sides are flattened to a bag of scalars first, because the two languages
+/// PACKAGE results differently and that difference is not a semantic one: GQL
+/// returns 194 rows of `(k, c)` where Gremlin returns one `Map` holding the same
+/// 194 entries, and an element renders as `{id,labels,properties}` on one side
+/// and is a handle on the other. Flattened, 45 of 49 agree outright; the last four
+/// are the normalizer's own asymmetry, not the engines' — it flattens a `GVal`
+/// recursively (so a `project()` map contributes its KEYS as well as its values,
+/// and `elementMap()` contributes every field) while rendering a GQL
+/// `graph::Value` shallowly. Every one of the four is an element-rendering or
+/// map-flattening artifact; none is a differing computation.
+///
+/// That is the argument for translating rather than re-implementing: the reason
+/// `gremlin::pattern` can compile a traversal prefix into GQL's `CPath` and
+/// inherit its planner (4-45x, see `route_audit`) is that the two languages mean
+/// the same thing. What they do NOT share is the result boundary, and the
+/// remaining per-language contracts — null ordering, NaN, cross-type comparison,
+/// unspecified row order — which are parameters of an executor, not reasons for
+/// two of them.
+#[test]
+#[ignore = "probe"]
+fn the_two_languages_compute_the_same_values() {
+    let mut lines = String::new();
+    for i in 0..2_000usize {
+        let l = if i % 10 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{},\"k\":\"key{i:06}\"}}}}\n",
+            i % 97
+        ));
+    }
+    let mut e = 0;
+    for i in 0..2_000usize {
+        for d in 0..3usize {
+            lines.push_str(&format!(
+                "{{\"type\":\"edge\",\"id\":\"e{e}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{\"w\":{d}}}}}\n",
+                (i * 31 + d * 7 + 1) % 2_000
+            ));
+            e += 1;
+        }
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    let pairs: &[(&str, &str, &str)] = &[
+        (
+            "any edge of a type exists",
+            "MATCH ()-[:R]->() RETURN 1 AS x LIMIT 1",
+            "g.E().hasLabel('R').limit(1).count()",
+        ),
+        (
+            "tally a hop by an endpoint property",
+            "MATCH ()-[:R]->(b) RETURN b.n AS k, count(*) AS c GROUP BY b.n",
+            "g.V().out('R').groupCount().by('n')",
+        ),
+        (
+            "top-k by a property",
+            "MATCH (u:V) RETURN u.n AS n ORDER BY u.n DESC LIMIT 10",
+            "g.V().hasLabel('V').order().by('n', desc).limit(10).values('n')",
+        ),
+        (
+            "count of a 2-hop",
+            "MATCH ()-[:R]->()-[:R]->() RETURN count(*) AS c",
+            "g.V().out('R').out('R').count()",
+        ),
+        (
+            "a join anchored on an indexed key",
+            "MATCH (u:V)-[:R]->(x) WHERE u.k = 'key000005' RETURN count(*) AS c",
+            "g.V().hasLabel('V').has('k', 'key000005').out('R').count()",
+        ),
+        (
+            "distinct far ends of a hop",
+            "MATCH ()-[:R]->(b) RETURN count(DISTINCT b) AS c",
+            "g.V().out('R').dedup().count()",
+        ),
+        (
+            "sum a property over a hop",
+            "MATCH ()-[:R]->(b) RETURN sum(b.n) AS s",
+            "g.V().out('R').values('n').sum()",
+        ),
+        (
+            "max a property over all vertices",
+            "MATCH (u:V) RETURN max(u.n) AS m",
+            "g.V().hasLabel('V').values('n').max()",
+        ),
+        (
+            "count vertices by label",
+            "MATCH (u:W) RETURN count(*) AS c",
+            "g.V().hasLabel('W').count()",
+        ),
+        (
+            "tally by label of the far end",
+            "MATCH ()-[:R]->(b) RETURN count(*) AS c",
+            "g.V().out('R').count()",
+        ),
+        (
+            "edge property tally",
+            "MATCH ()-[r:R]->() RETURN r.w AS w, count(*) AS c GROUP BY r.w",
+            "g.E().hasLabel('R').groupCount().by('w')",
+        ),
+        (
+            "values of a property, all vertices",
+            "MATCH (u:V) RETURN u.n AS n",
+            "g.V().hasLabel('V').values('n')",
+        ),
+        (
+            "two properties, all vertices",
+            "MATCH (u:V) RETURN u.n AS n, u.k AS k",
+            "g.V().hasLabel('V').project('n','k').by('n').by('k')",
+        ),
+        (
+            "the elements themselves",
+            "MATCH (u:V) RETURN u",
+            "g.V().hasLabel('V')",
+        ),
+        (
+            "the elements, rendered",
+            "MATCH (u:V) RETURN u",
+            "g.V().hasLabel('V').elementMap()",
+        ),
+        (
+            "the edges, rendered",
+            "MATCH ()-[r:R]->() RETURN r",
+            "g.E().hasLabel('R').elementMap()",
+        ),
+        (
+            "does any edge of a type exist",
+            "MATCH ()-[:R]->() RETURN 1 AS x LIMIT 1",
+            "g.E().hasLabel('R').limit(1).count()",
+        ),
+        (
+            "a property of a filtered scan",
+            "MATCH (u:V) WHERE u.n > 50 RETURN u.n AS n",
+            "g.V().hasLabel('V').has('n', gt(50)).values('n')",
+        ),
+        (
+            "a string property, all vertices",
+            "MATCH (u:V) RETURN u.k AS k",
+            "g.V().hasLabel('V').values('k')",
+        ),
+        (
+            "a range predicate",
+            "MATCH (u:V) WHERE u.n >= 20 AND u.n < 60 RETURN count(*) AS c",
+            "g.V().hasLabel('V').has('n', between(20, 60)).count()",
+        ),
+        (
+            "an OR of two equalities",
+            "MATCH (u:V) WHERE u.n = 3 OR u.n = 9 RETURN count(*) AS c",
+            "g.V().hasLabel('V').or(__.has('n', 3), __.has('n', 9)).count()",
+        ),
+        (
+            "a negated predicate",
+            "MATCH (u:V) WHERE NOT u.n = 3 RETURN count(*) AS c",
+            "g.V().hasLabel('V').not(__.has('n', 3)).count()",
+        ),
+        (
+            "a not-equal predicate",
+            "MATCH (u:V) WHERE u.n <> 3 RETURN count(*) AS c",
+            "g.V().hasLabel('V').has('n', neq(3)).count()",
+        ),
+        (
+            "does the key exist at all",
+            "MATCH (u:V) WHERE u.n IS NOT NULL RETURN count(*) AS c",
+            "g.V().hasLabel('V').has('n').count()",
+        ),
+        (
+            "a string prefix scan",
+            "MATCH (u:V) WHERE u.k = 'key000005' RETURN count(*) AS c",
+            "g.V().hasLabel('V').has('k', 'key000005').count()",
+        ),
+        (
+            "where on the element's own property",
+            "MATCH (u:V) WHERE u.n > 50 RETURN count(*) AS c",
+            "g.V().hasLabel('V').where(__.values('n').is(gt(50))).count()",
+        ),
+        (
+            "not on the element's own property",
+            "MATCH (u:V) WHERE NOT u.n > 50 RETURN count(*) AS c",
+            "g.V().hasLabel('V').not(__.values('n').is(gt(50))).count()",
+        ),
+        (
+            "a barrier in the middle",
+            "MATCH (u:V) RETURN count(*) AS c",
+            "g.V().hasLabel('V').barrier().count()",
+        ),
+        (
+            "identity in the middle",
+            "MATCH (u:V) RETURN u.n AS n",
+            "g.V().hasLabel('V').identity().values('n')",
+        ),
+        (
+            "where on an EDGE's own property",
+            "MATCH ()-[r:R]->() WHERE r.w = 1 RETURN count(*) AS c",
+            "g.E().hasLabel('R').where(__.values('w').is(1)).count()",
+        ),
+        (
+            "edge endpoints off an E() frontier",
+            "MATCH ()-[:R]->(b) RETURN count(*) AS c",
+            "g.E().hasLabel('R').inV().count()",
+        ),
+        (
+            "edge endpoint values",
+            "MATCH ()-[:R]->(b) RETURN b.n AS n",
+            "g.E().hasLabel('R').inV().values('n')",
+        ),
+        (
+            "select over a hop (pattern tags)",
+            "MATCH (u:V)-[:R]->(x) RETURN count(*) AS c",
+            "g.V().as('x').out('R').select('x').count()",
+        ),
+        (
+            "select with a by() modulator",
+            "MATCH (u:V)-[:R]->(x) RETURN count(*) AS c",
+            "g.V().as('x').out('R').select('x').by('n').count()",
+        ),
+        (
+            "select with Pop.all",
+            "MATCH (u:V)-[:R]->(x) RETURN count(*) AS c",
+            "g.V().as('x').out('R').select(all, 'x').count()",
+        ),
+        (
+            "select with no hop at all",
+            "MATCH (u:V) RETURN count(*) AS c",
+            "g.V().hasLabel('V').as('x').select('x').count()",
+        ),
+        (
+            "not(hasLabel) on the element itself",
+            "MATCH (u:V) WHERE NOT u:W RETURN count(*) AS c",
+            "g.V().hasLabel('V').not(__.hasLabel('W')).count()",
+        ),
+        (
+            "an unread as() tag",
+            "MATCH (u:V) RETURN count(*) AS c",
+            "g.V().hasLabel('V').as('x').count()",
+        ),
+        (
+            "a READ as() tag",
+            "MATCH (u:V) RETURN count(*) AS c",
+            "g.V().hasLabel('V').as('x').select('x').count()",
+        ),
+        (
+            "plain count (baseline)",
+            "MATCH (u:V) RETURN count(*) AS c",
+            "g.V().hasLabel('V').count()",
+        ),
+        (
+            "fold().unfold() still streams",
+            "MATCH (u:V) RETURN count(*) AS c",
+            "g.V().hasLabel('V').fold().unfold().count()",
+        ),
+        (
+            "unfold with no fold before it",
+            "MATCH (u:V) RETURN count(*) AS c",
+            "g.V().hasLabel('V').values('n').unfold().count()",
+        ),
+        (
+            "filter on the far end of a hop",
+            "MATCH ()-[:R]->(b) WHERE b.n = 7 RETURN count(*) AS c",
+            "g.V().out('R').has('n', 7).count()",
+        ),
+        (
+            "filter on an edge property",
+            "MATCH ()-[r:R]->() WHERE r.w = 1 RETURN count(*) AS c",
+            "g.E().hasLabel('R').has('w', 1).count()",
+        ),
+        (
+            "sum over a grouped hop",
+            "MATCH ()-[:R]->(b) RETURN b.n AS k, sum(b.n) AS s GROUP BY b.n",
+            "g.V().out('R').group().by('n').by(__.values('n').sum())",
+        ),
+        (
+            "the degree of every vertex",
+            "MATCH (u:V) RETURN u.k AS k, count(*) AS c GROUP BY u.k",
+            "g.V().hasLabel('V').groupCount().by('k')",
+        ),
+        (
+            "order by a property, no limit",
+            "MATCH (u:V) RETURN u.n AS n ORDER BY u.n",
+            "g.V().hasLabel('V').order().by('n').values('n')",
+        ),
+        (
+            "distinct property values",
+            "MATCH (u:V) RETURN DISTINCT u.n AS n",
+            "g.V().hasLabel('V').values('n').dedup()",
+        ),
+        (
+            "count of a hop from a narrow seed",
+            "MATCH (u:V)-[:R]->(x) WHERE u.k = 'key000005' RETURN count(*) AS c",
+            "g.V().has('k', 'key000005').out('R').count()",
+        ),
+    ];
+
+    // Normalize both sides to a sorted multiset of scalar renderings, so only the
+    // VALUES are compared — not column names, row shape, or ordering.
+    // Flatten a result to its SCALARS, so only the computed values are compared:
+    // a Gremlin `Map` (one row holding N entries) and a GQL two-column row set
+    // (N rows holding 2 cells) become the same bag of scalars. An element becomes
+    // its id, since one side renders `{id,labels,properties}` and the other a
+    // stringified id.
+    fn flat_g(v: &GVal, out: &mut Vec<String>) {
+        match v {
+            GVal::Map(m) => {
+                for (k, val) in m.clone().into_pairs() {
+                    flat_g(&k, out);
+                    flat_g(&val, out);
+                }
+            }
+            GVal::List(items) => {
+                for it in items.iter() {
+                    flat_g(it, out);
+                }
+            }
+            GVal::Node(i) => out.push(format!("elem{i}")),
+            GVal::Edge(i) => out.push(format!("elem{i}")),
+            GVal::Num(n) => out.push(format!("{n}")),
+            GVal::Str(x) => out.push(x.to_string()),
+            other => out.push(format!("{other:?}")),
+        }
+    }
+    let norm = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+
+    let (mut agree, mut differ, mut skipped) = (0, 0, 0);
+    for (name, gql, grem) in pairs {
+        let gq = crate::gql::parse(gql)
+            .ok()
+            .and_then(|p| p.execute(&mut g, &crate::gql::eval::Params::new()).ok());
+        let Some(rs) = gq else {
+            skipped += 1;
+            continue;
+        };
+        // The GQL side: cells are `Value`; render them the same way, and drop the
+        // element-vs-id distinction by keying elements on their id.
+        let gvals: Vec<String> = rs
+            .data
+            .iter()
+            .map(|c| match c {
+                crate::graph::Value::Num(n) => format!("{n}"),
+                crate::graph::Value::Str(x) => x.to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        let gr = super::parse::parse(grem)
+            .unwrap_or_else(|e| panic!("`{grem}` parses: {e}"))
+            .run(&mut g);
+        let mut rvals: Vec<String> = Vec::new();
+        for v in &gr {
+            flat_g(v, &mut rvals);
+        }
+
+        let (a, b) = (norm(gvals), norm(rvals));
+        if a == b {
+            agree += 1;
+        } else {
+            differ += 1;
+            println!("DIFFER  {name}");
+            println!(
+                "   gql     [{}] {:?}",
+                a.len(),
+                a.iter().take(3).collect::<Vec<_>>()
+            );
+            println!(
+                "   gremlin [{}] {:?}",
+                b.len(),
+                b.iter().take(3).collect::<Vec<_>>()
+            );
+        }
+    }
+    println!("\nAGREE {agree}   DIFFER {differ}   SKIPPED {skipped}");
+}

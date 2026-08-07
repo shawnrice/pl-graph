@@ -3714,13 +3714,7 @@ pub(crate) fn plan_pattern_ids(
 }
 
 // --- index-seeded scanning, expansion, and vectorized aggregation ---
-// `pub` only under `bailprobe`, so the dump test can reach the tally without the
-// module being public in a normal build.
-#[cfg_attr(feature = "bailprobe", allow(unreachable_pub))]
-#[cfg(not(feature = "bailprobe"))]
 mod scan;
-#[cfg(feature = "bailprobe")]
-pub mod scan;
 mod seek_lower;
 #[cfg(test)]
 mod seek_lower_tests;

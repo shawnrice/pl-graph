@@ -71,8 +71,6 @@ full = ["gql", "gremlin", "ndjson", "codecs", "arrow", "parallel"]
 # arrow→gql and codecs→ndjson pull it in transitively.
 _fallible-ffi = []
 
-# TEMPORARY: tallies which shapes decline the columnar frame. Not in `full`.
-bailprobe = []
 
 # `gql`: the ISO-GQL engine (hand-rolled parser; carries NO serde_json).
 gql = ["_fallible-ffi"]

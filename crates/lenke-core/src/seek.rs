@@ -1528,7 +1528,8 @@ pub fn walk_ids(
 ///
 /// Walk every hop but the last, then count the last in place. The rows are never
 /// materialized because nothing needs them all at once — which is what
-/// [`crate::pipeline::OpClass::Reducing`] means, and the reason a frame is pure
+/// "reducing" means — consume every row, emit one, hold no buffer — and the
+/// reason a frame is pure
 /// cost here.
 ///
 /// Shared because it is one operation in two languages. Gremlin reached it as
@@ -1538,7 +1539,7 @@ pub fn walk_ids(
 /// 0.144ms the other, 5.5x, for identical work on identical storage.
 ///
 /// `distinct` materializes the LAST hop, because deduplicating means holding the
-/// endpoints — a `DISTINCT` is [`crate::pipeline::OpClass::Buffering`] and this
+/// endpoints — a `DISTINCT` cannot emit until every row exists, and this
 /// is the one place the two routes meet. Everything before it still streams.
 ///
 /// `hops` is `(direction, edge types)` per segment, under [`Hop::etypes`]'s

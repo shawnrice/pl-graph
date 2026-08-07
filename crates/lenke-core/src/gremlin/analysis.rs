@@ -38,7 +38,6 @@
 //! per-traverser path clone.
 
 use crate::gremlin::{Step, Traversal};
-use crate::pipeline::{OpClass, Route};
 
 /// What one step needs from the traverser, and what it does to the stream.
 #[derive(Clone, Copy)]
@@ -47,8 +46,6 @@ pub(super) struct Facts {
     pub path: bool,
     /// Reads the `as(label)` tag map.
     pub tags: bool,
-    /// How it treats the rows flowing through it.
-    pub class: OpClass,
 }
 
 impl Facts {
@@ -56,25 +53,21 @@ impl Facts {
     const STREAM: Self = Self {
         path: false,
         tags: false,
-        class: OpClass::Streaming,
     };
     /// Reads nothing; consumes every row and emits one, holding no buffer.
     const REDUCE: Self = Self {
         path: false,
         tags: false,
-        class: OpClass::Reducing,
     };
     /// Reads nothing; cannot emit until every row exists.
     const BUFFER: Self = Self {
         path: false,
         tags: false,
-        class: OpClass::Buffering,
     };
     /// Everything, which is what an unrecognized step gets.
     const OPAQUE: Self = Self {
         path: true,
         tags: true,
-        class: OpClass::Opaque,
     };
 
     const fn reads_tags(self) -> Self {
@@ -195,9 +188,6 @@ pub(super) fn facts(step: &Step) -> Facts {
         | Step::Repeat { .. } => Facts {
             path: false,
             tags: false,
-            // Opaque to the PIPELINE regardless of the body: the shared layer
-            // cannot model a per-row branch.
-            class: OpClass::Opaque,
         },
 
         // Everything else — sacks, mutations, the graph algorithms, anything
@@ -243,38 +233,23 @@ pub(super) fn carried(step: &Step) -> Vec<&Traversal> {
 /// What a whole traversal needs, from one walk over it.
 #[derive(Clone, Copy)]
 pub(super) struct Shape {
-    // `route` and `first_boundary` are read by the probe and by this module's
-    // tests, not by the executor — the same standing as `crate::pipeline::route`
-    // itself. Offering the planned ids to the column terminals answers the
-    // boundary question without asking it, because a terminal that wants a
-    // column IS a boundary. They are computed here anyway because the classes
-    // are already in hand, and because the general case they were written for is
-    // still open: a boundary whose tail `column_paths` declines still streams.
-    //
     /// Any step, at any depth, reads `Trav::path`.
     pub needs_path: bool,
     /// Any step, at any depth, reads the tag map.
     pub reads_tags: bool,
-    /// Which execution model the plan should take.
-    #[cfg_attr(not(feature = "bailprobe"), allow(dead_code))]
-    pub route: Route,
-    /// Index of the first step that has to see every row at once.
-    #[cfg_attr(not(feature = "bailprobe"), allow(dead_code))]
-    pub first_boundary: Option<usize>,
 }
 
 /// Read a step list once and answer every question about it.
 ///
 /// REJECTED (measured neutral): a second, allocation-free entry point returning
-/// just `(needs_path, reads_tags)`, so the executor would not build the
-/// `Vec<OpClass>` it never reads. The reasoning was that `run_collect` asks
+/// just `(needs_path, reads_tags)`, back when this also built a `Vec<OpClass>`
+/// the executor never read (that classification is gone). `run_collect` asks
 /// those two questions on every execution and `gremlin_index_bench` runs a point
 /// lookup thousands of times. It moved nothing — `within (3 values)` 1.0us
 /// against 1.0us, `startsWith` 5.2 against 5.2, `eq point lookup` 0.4 against
 /// 0.3 — so the allocation was not the cost, and a second entry point is exactly
 /// the shape that let `path_free` and `reads_tags` drift apart to begin with.
 pub(super) fn analyze(steps: &[Step]) -> Shape {
-    let mut classes = Vec::with_capacity(steps.len());
     let mut needs_path = false;
     let mut reads_tags = false;
 
@@ -283,7 +258,6 @@ pub(super) fn analyze(steps: &[Step]) -> Shape {
 
         needs_path |= f.path;
         reads_tags |= f.tags;
-        classes.push(f.class);
 
         // A carried body's needs are the outer traverser's needs.
         for sub in carried(step) {
@@ -297,8 +271,6 @@ pub(super) fn analyze(steps: &[Step]) -> Shape {
     Shape {
         needs_path,
         reads_tags,
-        route: crate::pipeline::route(&classes),
-        first_boundary: crate::pipeline::first_boundary(&classes),
     }
 }
 
@@ -306,7 +278,6 @@ pub(super) fn analyze(steps: &[Step]) -> Shape {
 mod tests {
     use super::{analyze, carried, facts};
     use crate::gremlin::{Step, Traversal};
-    use crate::pipeline::{OpClass, Route};
 
     fn t(src: &str) -> Traversal {
         crate::gremlin::parse(src).unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
@@ -334,11 +305,6 @@ mod tests {
 
             assert!(f.path, "{step:?} must be assumed to read the path");
             assert!(f.tags, "{step:?} must be assumed to read the tags");
-            assert_eq!(
-                f.class,
-                OpClass::Opaque,
-                "{step:?} must be assumed opaque to the pipeline"
-            );
         }
     }
 
@@ -414,30 +380,6 @@ mod tests {
             assert!(!shape.needs_path, "`{src}` reads no path");
             assert!(!shape.reads_tags, "`{src}` reads no tag");
         }
-    }
-
-    /// The pipeline half of the same walk.
-    #[test]
-    fn the_route_follows_the_boundaries() {
-        assert_eq!(
-            analyze(&t("g.V().out('R').count()").steps).route,
-            Route::Stream
-        );
-        assert_eq!(
-            analyze(&t("g.V().out('R').values('k')").steps).route,
-            Route::Stream
-        );
-
-        let ordered = analyze(&t("g.V().out('R').order().by('k')").steps);
-
-        assert_eq!(ordered.route, Route::Columnar);
-        assert_eq!(ordered.first_boundary, Some(2));
-
-        // An opaque step outranks a boundary: there is nothing to decide.
-        assert_eq!(
-            analyze(&t("g.V().out('R').order().by('k').sack(assign)").steps).route,
-            Route::Decline
-        );
     }
 
     /// `carried` returns the bodies seeded with the traverser, and nothing else.
