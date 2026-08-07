@@ -1598,6 +1598,40 @@ fn col_terminal_tagged(
                     }
                 }
             }
+
+            // The arms above answer a WHOLE tail. This answers a PREFIX of one:
+            // `values(k)` and its optional `is(P)`, projected to a column, with
+            // whatever follows handed back to the terminals that already know how
+            // to fold a column.
+            //
+            // It exists because `values(k).is(P).sum()` cannot be one projection.
+            // The `is` runs in the shaper — an `is(P)` over a non-number column is
+            // a type FAULT in Gremlin rather than a skipped row, and `num_test` is
+            // where that rule lives — while GQL folds an aggregate BEFORE the
+            // shaper ever sees the column, so a filter applied afterwards is too
+            // late. Splitting at the column instead of at the answer sidesteps
+            // that: project, drop, narrow, then let `col_terminal_tagged` do what
+            // it does for every other column.
+            //
+            // This is what `column_terminal` was, minus its own property read —
+            // which is why that function and `elem_terminal`'s
+            // `[Step::Values(keys), tail @ ..]` arm are deleted in the same commit.
+            if let Some((prefix, rest)) = values_prefix(tail) {
+                let mut names = Vec::new();
+
+                if let Some(t) = super::to_gql::tail(0, *is_edge, &mut names, &prefix) {
+                    if let Some(cols) =
+                        crate::gql::eval::project_ids(graph, ids, *is_edge, &names, &t.proj)
+                    {
+                        if let Some(next) = shape_projection(graph, *is_edge, &cols, &t) {
+                            #[cfg(test)]
+                            MIGRATED.with(|m| m.set(m.get() + 1));
+
+                            return col_terminal_tagged(graph, next, tags, rest);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2235,6 +2269,31 @@ fn homogeneous_or_absent(graph: &Graph, is_edge: bool, key: &str) -> bool {
     )
 }
 
+/// Split a tail that STARTS with `values(k)` (and an optional `is(P)`) into the
+/// part the projection answers and the part the column terminals answer.
+///
+/// One key only: `values()` with none needs a per-element key list, and a
+/// multi-key call interleaves columns per element rather than reading one.
+fn values_prefix(tail: &[Step]) -> Option<(Vec<Step>, &[Step])> {
+    let [Step::Values(keys), rest @ ..] = tail else {
+        return None;
+    };
+
+    if keys.len() != 1 {
+        return None;
+    }
+
+    // A tail that is EXACTLY the prefix is already answered by the whole-tail
+    // arms above; splitting it here would just recurse into an empty tail.
+    match rest {
+        [] => None,
+        [Step::Is(p), more @ ..] => {
+            Some((vec![Step::Values(keys.clone()), Step::Is(p.clone())], more))
+        }
+        more => Some((vec![Step::Values(keys.clone())], more)),
+    }
+}
+
 /// Turn GQL's projected columns into Gremlin values — the BOUNDARY where the two
 /// languages differ, kept out of the evaluator on purpose.
 ///
@@ -2573,27 +2632,6 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
                     .collect(),
             )
         }
-        // `count(local)` counts a value's own elements, and a graph element is
-        // not iterable — `local_elems` wraps it in a singleton. So it is 1 per
-        // row, whatever the row is.
-        // The frontier is one traverser per id, multiplicity included, so a
-        // global count is its length. Reaching this by BUILDING 15,000 `Trav`s
-        // and folding them was 0.59ms of the 0.70ms that
-        // `out('R').hasLabel('W').count()` cost, against 0.044ms for the same
-        // question in GQL — the planning was already done, and the answer was
-        // the length of the thing it returned.
-        // Element identity is the id, so a `dedup()` over the frontier is a
-        // distinct-id count and needs no values at all. `labels`/`bys` empty is
-        // the bare form; `dedup().by(k)` keys on a property and does not.
-        //
-        // That guard is belt-and-braces today: `path_free` already calls a
-        // `Dedupe` with a non-empty `bys` path-BOUND, since a `by()` modulator
-        // can hold a sub-traversal that reads the path, so `needs_path` sets
-        // `TRACK_PATH` and the pattern branch never runs. Written out anyway
-        // because the guard is what makes THIS arm correct on its own terms, and
-        // a mutation that drops it survives the tests for a reason that lives in
-        // another function.
-        [Step::Values(keys), tail @ ..] => column_terminal(graph, ids, is_edge, keys, tail),
         // The frontier ITSELF. There was no arm for it, so
         // `g.V().hasLabel('V').out('R')` — a traversal with no terminal at all —
         // built a `Trav` per element to hand back the elements: 5.2ms for 150k,
@@ -2871,70 +2909,6 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
         }
         _ => None,
     }
-}
-
-/// `values(k)` and whatever follows it, answered from the typed column.
-/// The `values(k)` column, and whatever terminal follows it.
-///
-/// The column now comes from GQL's projection through [`shape_projection`], which
-/// is the same read the migration route makes — so the drop-absent rule and the
-/// `Record`-to-`Map` conversion live in ONE place instead of here as well. What is
-/// left is the `is(P)` narrowing and handing the tail on.
-fn column_terminal(
-    graph: &Graph,
-    ids: &[u32],
-    is_edge: bool,
-    keys: &[String],
-    tail: &[Step],
-) -> Option<Vec<GVal>> {
-    #[cfg(test)]
-    COLUMN_TERMINAL_HIT.with(|c| c.set(c.get() + 1));
-
-    // One key only: `values()` needs a per-element key list, and a multi-key call
-    // interleaves columns per element rather than reading one.
-    let [key] = keys else {
-        return None;
-    };
-    // Split an optional `is(P)` off the front. `is` filters the CURRENT value,
-    // which after `values(k)` is a column value — so there, and only there, it is
-    // a column predicate rather than a test on a graph element.
-    let (filter, tail) = match tail {
-        [Step::Is(p), t @ ..] => (Some(p), t),
-        t => (None, t),
-    };
-    let mut names = Vec::new();
-    let read = super::to_gql::tail(
-        0,
-        is_edge,
-        &mut names,
-        std::slice::from_ref(&Step::Values(vec![(*key).to_string()])),
-    )?;
-    let cols = crate::gql::eval::project_ids(graph, ids, is_edge, &names, &read.proj)?;
-    let mut col = shape_projection(graph, is_edge, &cols, &read)?;
-
-    // `is(P)` over a number column NARROWS THE COLUMN, so it is applied here
-    // rather than inside the terminals: every arm downstream then sees a column
-    // that is already filtered, instead of each having to know about a pending
-    // predicate. This is what let the numeric terminals stop being a separate
-    // interpreter.
-    if let Some(p) = filter {
-        let Col::Num { d, valid: None } = &mut col else {
-            // A predicate over anything but a plain number column runs per value:
-            // a `Str`/`Bool`/`Temporal` under a numeric test is a type FAULT
-            // rather than a skipped row, and answering it here would make the
-            // lowering observable.
-            return None;
-        };
-        let t = num_test(p)?;
-
-        if t.faults_on_nan && d.iter().any(|x| x.is_nan()) {
-            return None; // the stream faults here; do not answer instead
-        }
-
-        d.retain(|&x| (t.test)(x));
-    }
-
-    col_terminal(graph, col, tail)
 }
 
 /// Distinct values in FIRST-SEEN order — the whole of a plain `dedup()`.
