@@ -3641,6 +3641,21 @@ fn cross_language_cost_probe() {
             "g.E().hasLabel('R').inV().values('n')",
         ),
         (
+            "plain count (baseline)",
+            "MATCH (u:V) RETURN count(*) AS c",
+            "g.V().hasLabel('V').count()",
+        ),
+        (
+            "fold().unfold() still streams",
+            "MATCH (u:V) RETURN count(*) AS c",
+            "g.V().hasLabel('V').fold().unfold().count()",
+        ),
+        (
+            "unfold with no fold before it",
+            "MATCH (u:V) RETURN count(*) AS c",
+            "g.V().hasLabel('V').values('n').unfold().count()",
+        ),
+        (
             "filter on the far end of a hop",
             "MATCH ()-[:R]->(b) WHERE b.n = 7 RETURN count(*) AS c",
             "g.V().out('R').has('n', 7).count()",
@@ -4942,5 +4957,59 @@ fn edge_endpoints_off_a_column_match_the_stream() {
             "`{q}` disagreed with its streamed spelling"
         );
         assert!(!a.is_empty(), "`{q}` returned nothing to compare");
+    }
+}
+
+/// `unfold()` off a column: a LIST expands to its elements, anything else passes
+/// through.
+///
+/// An element column and an unboxed scalar column can never hold a list, so for
+/// those it is the identity. Only a boxed column actually flattens.
+///
+/// Also pins the fact the OTHER tests in this file depend on: `fold()` with
+/// anything after it still declines to the stream, which is what makes
+/// `fold().unfold()` a reliable way to force the streamed spelling of a
+/// traversal. Measured: 1.192ms against 0.002 for the same count without it. If
+/// that ever stops being true, every `same_via_stream` pairing here quietly
+/// starts comparing the column path against itself.
+#[test]
+fn unfold_off_a_column_matches_the_stream() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"n":1,"xs":[1,2,3]}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"n":2,"xs":[]}}"#,
+            r#"{"type":"node","id":"c","labels":["V"],"properties":{"n":3}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    for q in [
+        // Identity cases: never a list.
+        "g.V().unfold().count()",
+        "g.V().values('n').unfold().count()",
+        "g.V().values('n').unfold().sum()",
+        "g.V().unfold().id()",
+        // A real stored list, including an EMPTY one (which contributes nothing).
+        "g.V().values('xs').unfold().count()",
+        "g.V().values('xs').unfold().sum()",
+        "g.V().values('xs').unfold().dedup().count()",
+        // Two in a row.
+        "g.V().values('n').unfold().unfold().count()",
+    ] {
+        let (head, tail) = q.split_once('.').expect("a traversal has a step");
+        let streamed = format!("{head}.{}", tail.replacen('.', ".fold().unfold().", 1));
+        let a = super::parse::parse(q)
+            .unwrap_or_else(|e| panic!("`{q}`: {e}"))
+            .run(&mut g);
+        let b = super::parse::parse(&streamed)
+            .unwrap_or_else(|e| panic!("`{streamed}`: {e}"))
+            .run(&mut g);
+
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "`{q}` disagreed with its streamed spelling"
+        );
     }
 }

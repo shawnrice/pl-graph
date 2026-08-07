@@ -1457,6 +1457,25 @@ fn col_terminal(graph: &Graph, col: Col, tail: &[Step]) -> Option<Vec<GVal>> {
         // the column path entirely and ran as a stream, which is 435 traversals
         // in the suite dropped by a step that does nothing.
         [Step::Barrier | Step::Identity, t @ ..] => col_terminal(graph, col, t),
+        // `unfold()` expands a LIST into its elements and passes anything else
+        // through. An element column and an unboxed scalar column can never hold
+        // a list, so for those it is the identity above — only a boxed column can
+        // actually flatten.
+        [Step::Unfold, t @ ..] => {
+            let next = match col {
+                Col::Gen(v) => Col::Gen(
+                    v.into_iter()
+                        .flat_map(|x| match x {
+                            GVal::List(items) => items.iter().cloned().collect::<Vec<_>>(),
+                            other => vec![other],
+                        })
+                        .collect(),
+                ),
+                other => other,
+            };
+
+            col_terminal(graph, next, t)
+        }
         [Step::Limit(n, Scope::Global), t @ ..] => col_terminal(graph, col.page(0, *n), t),
         [Step::Skip(n, Scope::Global), t @ ..] => col_terminal(graph, col.page(*n, usize::MAX), t),
         [Step::Range(lo, hi, Scope::Global), t @ ..] => col_terminal(graph, col.page(*lo, *hi), t),
