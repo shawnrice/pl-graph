@@ -420,7 +420,7 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
             if c.tags.is_empty() && !migrate_off() {
                 let mut keys = c.key_names.clone();
 
-                if let Some(t) = super::to_gql::tail(c.end_slot, &mut keys, rest) {
+                if let Some(t) = super::to_gql::tail(c.end_slot, c.end_is_edge, &mut keys, rest) {
                     if let Some(cols) = crate::gql::eval::run_pattern_projection(
                         graph,
                         &c.path,
@@ -1578,7 +1578,7 @@ fn col_terminal_tagged(
         if let Col::Elems { ids, is_edge } = &col {
             let mut keys = Vec::new();
 
-            if let Some(t) = super::to_gql::tail(0, &mut keys, tail) {
+            if let Some(t) = super::to_gql::tail(0, *is_edge, &mut keys, tail) {
                 if let Some(cols) =
                     crate::gql::eval::project_ids(graph, ids, *is_edge, &keys, &t.proj)
                 {
@@ -1848,7 +1848,7 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
     if !migrate_off() {
         let mut keys = Vec::new();
 
-        if let Some(t) = super::to_gql::tail(0, &mut keys, rest) {
+        if let Some(t) = super::to_gql::tail(0, is_edge, &mut keys, rest) {
             if let Some(cols) = crate::gql::eval::project_ids(graph, ids, is_edge, &keys, &t.proj) {
                 #[cfg(test)]
                 MIGRATED.with(|m| m.set(m.get() + 1));
@@ -2351,6 +2351,19 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
         // `id()` / `label()` are pure per-element projections of the frontier —
         // the same shape as `values(k)`, reading the id/label dictionaries
         // instead of a property column.
+        //
+        // Both arms stay, but for different reasons. `to_gql::tail` now covers
+        // `id()` for EITHER element kind (GQL's own `element_id()` shares the
+        // same `Value::element_id` this arm calls), so in normal operation this
+        // is reached only through `MIGRATE_OFF` — the divergence test's
+        // reference-comparison switch (`the_migration_route_agrees_with_the_
+        // route_it_replaces`), which depends on this arm staying put; probed
+        // empirically (`MIGRATE_OFF` on, `g.V().id()`/`g.E().id()`): reached
+        // every time, `to_gql::tail`'s own arm otherwise: never. `label()`
+        // migrates only off a known EDGE frontier (`type(e)` has no vertex
+        // equivalent — see `to_gql::tail`'s comment), so a VERTEX `label()`
+        // reaches this arm even with migration ON — the same probe on
+        // `g.V().label()` confirms it every time.
         [Step::Id] => Some(
             ids.iter()
                 .map(|&id| elem_id(graph, &frontier_val(id, is_edge)))
@@ -2816,6 +2829,7 @@ fn column_terminal(
     let mut names = Vec::new();
     let read = super::to_gql::tail(
         0,
+        is_edge,
         &mut names,
         std::slice::from_ref(&Step::Values(vec![(*key).to_string()])),
     )?;

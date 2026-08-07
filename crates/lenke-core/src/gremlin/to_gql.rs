@@ -34,7 +34,9 @@
 //! twice and costs 3.6x), a stored map renders as a `Map` not a `Record`, and a
 //! self-loop is two adjacencies not one (`Ctx::loops`, already a parameter).
 
-use crate::gql::plan::{compile_program, CAgg, CCount, CExpr, CProjection, CReturnItem, CSortItem};
+use crate::gql::plan::{
+    compile_program, CAgg, CCount, CExpr, CProjection, CReturnItem, CSortItem, ScalarFn,
+};
 use crate::gremlin::{By, Order, Scope, Step};
 
 /// How the projected columns become Gremlin values.
@@ -170,9 +172,72 @@ fn reducer(step: &Step) -> Option<crate::gql::plan::AggFn> {
 
 /// Compile the steps after a prefix into a projection over its end slot.
 ///
+/// `is_edge` is whatever the CALLER already knows about the frontier's element
+/// kind (`c.end_is_edge` off the pattern, or the `is_edge` a `Col::Elems` already
+/// carries) — every entry point has it in scope, so threading it in costs
+/// nothing new. `label()` is the one arm that needs it: it is not answerable at
+/// all for a vertex (see that arm's comment).
+///
 /// `None` = not expressible; the caller keeps its existing route.
-pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option<Tail> {
+pub(super) fn tail(
+    slot: usize,
+    is_edge: bool,
+    keys: &mut Vec<String>,
+    rest: &[Step],
+) -> Option<Tail> {
     match rest {
+        // `id()` — the element's external id. `element_id(n)` is GQL's own
+        // scalar function, and `crate::value::Value::element_id` is the ONE
+        // implementation both engines call — `exec::elem_id` here, `ElementId`
+        // in `gql/eval/scalar_fns.rs` (that arm's comment: "Shared with
+        // Gremlin's `id()`") — so the two renderings cannot drift, for either
+        // element kind.
+        [Step::Id] => Some(Tail {
+            proj: blank(vec![item(
+                CExpr::Scalar {
+                    func: ScalarFn::ElementId,
+                    args: vec![CExpr::Var(slot)],
+                },
+                "v",
+                false,
+            )]),
+            shape: Shape::Rows,
+            absent_key: None,
+            page: None,
+            order_key: None,
+        }),
+        // `label()` — the element's label, but ONLY for a known EDGE frontier.
+        //
+        // GQL's `type(e)` is openCypher's edge-type accessor, and its own doc
+        // comment in `scalar_fns.rs` says it directly: "type stays SINGULAR...
+        // exactly as Gremlin's label() reports a multi-label vertex's first
+        // label — both have to return one." For an edge that is exactly
+        // `exec::elem_label`'s rendering (`graph.etype.arc(e_type[e])`), so the
+        // two agree.
+        //
+        // For a VERTEX there is no equivalent. GQL's only other candidate,
+        // `labels(n)`, returns EVERY label — SORTED, as a `List` — while
+        // `exec::elem_label` reads `graph.vertex_labels(v).first()`, which is
+        // `Graph::vlabels`, a vector in INSERTION order, not sorted. For a
+        // vertex carrying more than one label those disagree in both VALUE
+        // (first-inserted vs. alphabetically-first) and TYPE (`Str`/`Null` vs.
+        // `List`) — not a close match, a different question. So this arm
+        // declines whenever `is_edge` is false, and the caller's existing
+        // `elem_terminal` arm (`exec.rs`) answers a vertex `label()` instead.
+        [Step::Label] if is_edge => Some(Tail {
+            proj: blank(vec![item(
+                CExpr::Scalar {
+                    func: ScalarFn::Type,
+                    args: vec![CExpr::Var(slot)],
+                },
+                "v",
+                false,
+            )]),
+            shape: Shape::Rows,
+            absent_key: None,
+            page: None,
+            order_key: None,
+        }),
         // `values(k)` — one value per row off the end of the prefix. The rows
         // whose key is absent are dropped by the CALLER, from the column's own
         // validity mask.
@@ -456,6 +521,30 @@ pub(super) fn tail(slot: usize, keys: &mut Vec<String>, rest: &[Step]) -> Option
                 order_key: Some(k.clone()),
             })
         }
+        // `elementMap(keys)` was investigated and has NO arm here — it cannot be
+        // expressed as a `CProjection` at all, for two independent reasons, not
+        // one repaired by the other:
+        //
+        // 1. Its key set is PER-ROW. `exec::element_map_of` (via
+        //    `projected_keys_into`) emits an entry only for a key that is
+        //    PRESENT on that element — `keys` empty means "every present key",
+        //    and even an explicit list SKIPS an absent one rather than nulling
+        //    it. A heterogeneous frontier (some elements missing `m`, say) then
+        //    yields maps with DIFFERENT key sets per row. `Shape::Maps` (the
+        //    container `project()` uses) requires one shared key vector for
+        //    every row — `CProjection::items` is a fixed list of N columns,
+        //    compiled once — so there is no way to compile "however many keys
+        //    this particular element happens to have" into it. `CExpr::Record`
+        //    has the same problem the other way: its field list is fixed at
+        //    COMPILE time, so it cannot omit a field only for the rows where the
+        //    key is absent.
+        // 2. An edge's map carries two NESTED maps (`IN`/`OUT`, each `{id,
+        //    label}` of an endpoint) that neither `Shape` nor any `CExpr` can
+        //    produce — nesting a `Maps`-shaped row inside a single cell of
+        //    another isn't a shape this IR has.
+        //
+        // Either alone would be enough to decline; both apply. `exec.rs`'s
+        // `[Step::ElementMap(keys)]` arm keeps this one.
         _ => None,
     }
 }

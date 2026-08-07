@@ -6235,6 +6235,23 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         "g.V().out('R').hasLabel('W').values('n').mean()",
         "g.V().out('R').hasLabel('W').values('n').dedup()",
         "g.V().out('R').hasLabel('W').values('k')",
+        // `id()` — GQL's `element_id(n)` calls the SAME `Value::element_id` this
+        // engine's `elem_id` already does (`scalar_fns.rs`'s own comment:
+        // "Shared with Gremlin's `id()`"), for either element kind, so both a
+        // vertex and an edge frontier are worth checking.
+        "g.V().out('R').hasLabel('W').id()",
+        "g.V().outE('R').id()",
+        // `label()` migrates ONLY off an EDGE frontier — GQL's `type(e)` mirrors
+        // `elem_label`'s single-value edge rendering exactly (both docs say so
+        // in matching words), but a VERTEX has no equivalent: `labels(n)`
+        // returns every label SORTED as a `List`, while `elem_label` reads the
+        // first-INSERTED one off `vertex_labels()`. `to_gql::tail`'s `[Step::
+        // Label]` arm declines whenever `is_edge` is false for exactly that
+        // reason, so only the edge form belongs in this loop — a vertex
+        // `label()` still takes the `elem_terminal` route this migrates away
+        // from, unchanged, and is covered elsewhere (`step_tests_2.rs`,
+        // `tests.rs`).
+        "g.V().outE('R').label()",
         "g.V().out('R').hasLabel('W').groupCount().by('n')",
         "g.V().out('R').hasLabel('W').groupCount().by('k')",
         // `n` (present on every row, i % 97 over 2000 nodes): many ties — the
