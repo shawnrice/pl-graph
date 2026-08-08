@@ -98,8 +98,46 @@ fn pull(plan: &Plan, store: &Store) -> Batch {
             batch.gather(&keep)
         }
         Plan::Aggregate { input, keys, aggs } => aggregate(&pull(input, store), store, keys, aggs),
+        Plan::OrderPage {
+            input,
+            keys,
+            skip,
+            limit,
+        } => order_page(&pull(input, store), store, keys, *skip, *limit),
         Plan::Project { input, .. } => pull(input, store),
     }
+}
+
+/// Sort the batch by `keys` (stable; ascending via `cmp_total`, descending its
+/// reverse), then keep the window `[skip, skip+limit)`. Reorders every slot
+/// together, so bound variables stay row-aligned.
+fn order_page(
+    batch: &Batch,
+    store: &Store,
+    keys: &[crate::ir::SortKey],
+    skip: Option<usize>,
+    limit: Option<usize>,
+) -> Batch {
+    let n = batch.rows();
+    let mut idx: Vec<usize> = (0..n).collect();
+    if !keys.is_empty() {
+        let key_cols: Vec<Col> = keys.iter().map(|k| eval(&k.expr, store, batch)).collect();
+        // Stable sort: equal keys keep input order, so the last key's ties fall
+        // back to arrival order deterministically.
+        idx.sort_by(|&a, &b| {
+            for (kc, k) in key_cols.iter().zip(keys) {
+                let ord = value::cmp_total(&kc.value_at(a), &kc.value_at(b));
+                let ord = if k.descending { ord.reverse() } else { ord };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+    let start = skip.unwrap_or(0).min(idx.len());
+    let end = limit.map_or(idx.len(), |l| start.saturating_add(l).min(idx.len()));
+    batch.gather(&idx[start..end])
 }
 
 /// Group `batch` by `keys` and compute `aggs` per group. Output slots are the key
@@ -756,5 +794,107 @@ mod tests {
         got.sort_by(|a, b| a.0.cmp(&b.0));
         // carol has no outgoing KNOWS, so she is absent from the expanded rows.
         assert_eq!(got, vec![("alice".into(), 2.0), ("bob".into(), 1.0)]);
+    }
+
+    // --- Order + Page ---
+
+    fn asc(slot: usize, key: &str) -> crate::ir::SortKey {
+        crate::ir::SortKey {
+            expr: prop(slot, key),
+            descending: false,
+        }
+    }
+    fn desc(slot: usize, key: &str) -> crate::ir::SortKey {
+        crate::ir::SortKey {
+            expr: prop(slot, key),
+            descending: true,
+        }
+    }
+
+    /// ORDER BY age ascending, then project name.
+    #[test]
+    fn order_by_ascending() {
+        let store = social();
+        let plan = scan("Person")
+            .order_page(vec![asc(0, "age")], None, None)
+            .project(vec![("name".into(), prop(0, "name"))]);
+        let out = run(&plan, &store);
+        // ages 30,25,40 -> bob(25), alice(30), carol(40)
+        assert_eq!(names_of(&out, 0), vec!["bob", "alice", "carol"]);
+    }
+
+    /// Descending reverses it.
+    #[test]
+    fn order_by_descending() {
+        let store = social();
+        let plan = scan("Person")
+            .order_page(vec![desc(0, "age")], None, None)
+            .project(vec![("name".into(), prop(0, "name"))]);
+        let out = run(&plan, &store);
+        assert_eq!(names_of(&out, 0), vec!["carol", "alice", "bob"]);
+    }
+
+    /// ORDER BY ... LIMIT is a top-k prefix of the sorted order.
+    #[test]
+    fn order_then_limit_is_top_k() {
+        let store = social();
+        let plan = scan("Person")
+            .order_page(vec![desc(0, "age")], None, Some(2))
+            .project(vec![("name".into(), prop(0, "name"))]);
+        let out = run(&plan, &store);
+        assert_eq!(names_of(&out, 0), vec!["carol", "alice"]); // two oldest
+    }
+
+    /// SKIP then LIMIT is a paging window over the sorted order.
+    #[test]
+    fn order_skip_limit_paging_window() {
+        let store = social();
+        let plan = scan("Person")
+            .order_page(vec![asc(0, "age")], Some(1), Some(1))
+            .project(vec![("name".into(), prop(0, "name"))]);
+        let out = run(&plan, &store);
+        // sorted bob,alice,carol; skip 1, take 1 -> alice
+        assert_eq!(names_of(&out, 0), vec!["alice"]);
+    }
+
+    /// Nulls sort LAST in ascending order (the value contract's policy).
+    #[test]
+    fn nulls_sort_last_ascending() {
+        let mut b = Builder::default();
+        b.node(&["P"], &[("name", s("has30")), ("age", n(30.0))]);
+        b.node(&["P"], &[("name", s("noage"))]); // null age
+        b.node(&["P"], &[("name", s("has10")), ("age", n(10.0))]);
+        let store = b.build();
+        let plan = scan("P")
+            .order_page(vec![asc(0, "age")], None, None)
+            .project(vec![("name".into(), prop(0, "name"))]);
+        let out = run(&plan, &store);
+        // 10, 30, then null last
+        assert_eq!(names_of(&out, 0), vec!["has10", "has30", "noage"]);
+    }
+
+    /// Multi-key: city ascending, then age descending within a city.
+    #[test]
+    fn multi_key_order() {
+        let mut b = Builder::default();
+        b.node(
+            &["P"],
+            &[("name", s("a")), ("city", s("nyc")), ("age", n(30.0))],
+        );
+        b.node(
+            &["P"],
+            &[("name", s("b")), ("city", s("sf")), ("age", n(40.0))],
+        );
+        b.node(
+            &["P"],
+            &[("name", s("c")), ("city", s("nyc")), ("age", n(50.0))],
+        );
+        let store = b.build();
+        let plan = scan("P")
+            .order_page(vec![asc(0, "city"), desc(0, "age")], None, None)
+            .project(vec![("name".into(), prop(0, "name"))]);
+        let out = run(&plan, &store);
+        // nyc: c(50) before a(30); then sf: b(40)
+        assert_eq!(names_of(&out, 0), vec!["c", "a", "b"]);
     }
 }

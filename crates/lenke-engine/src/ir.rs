@@ -72,6 +72,16 @@ pub struct Agg {
     pub name: String,
 }
 
+/// One ORDER BY key: an expression and a direction. Ascending uses the value
+/// contract's `cmp_total` (nulls last); descending reverses it (so nulls come
+/// first under DESC — the total order reversed, which is the honest default and
+/// the front-end can override once NULLS FIRST/LAST syntax lands).
+#[derive(Clone, Debug)]
+pub struct SortKey {
+    pub expr: Expr,
+    pub descending: bool,
+}
+
 /// A logical plan node. A plan is a tree; execution pulls a batch up through it.
 #[derive(Clone, Debug)]
 pub enum Plan {
@@ -98,6 +108,16 @@ pub enum Plan {
         input: Box<Plan>,
         keys: Vec<(String, Expr)>,
         aggs: Vec<Agg>,
+    },
+    /// Sort by `keys` (empty = no sort, pure paging), then keep the window
+    /// `[skip, skip+limit)`. Sorting is STABLE — equal keys keep input order — so
+    /// `keys` empty with a `limit` is a plain prefix. Runs before any Project, so
+    /// its keys may reference bound slots that the output does not carry.
+    OrderPage {
+        input: Box<Plan>,
+        keys: Vec<SortKey>,
+        skip: Option<usize>,
+        limit: Option<usize>,
     },
     /// Produce output columns: `(name, expr)` per column.
     Project {
@@ -131,6 +151,16 @@ impl Plan {
             input: Box::new(self),
             keys,
             aggs,
+        }
+    }
+
+    #[must_use]
+    pub fn order_page(self, keys: Vec<SortKey>, skip: Option<usize>, limit: Option<usize>) -> Self {
+        Self::OrderPage {
+            input: Box::new(self),
+            keys,
+            skip,
+            limit,
         }
     }
 
