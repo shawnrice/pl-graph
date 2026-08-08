@@ -1,0 +1,17 @@
+[package]
+name = "lenke-engine"
+version = "0.0.0"
+edition = "2021"
+description = "The from-scratch query engine: one neutral algebra, one columnar batch model. Independent of lenke-core; see docs/design/engine-from-scratch.md."
+license = "Apache-2.0"
+
+# Standalone crate on purpose — NOT part of any workspace with lenke-core, so the
+# existing engine's build/tooling is untouched. Build/test with:
+#   cargo test --manifest-path crates/lenke-engine/Cargo.toml
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
