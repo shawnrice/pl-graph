@@ -87,6 +87,19 @@ pub struct ZonedTime {
 
 /// The temporal value family, carried as one `Value`/`Val`/`GVal` variant so each
 /// exhaustive match gains a single arm.
+///
+/// **REJECTED: boxing `Duration` to shrink this.** `Duration` is the widest
+/// member, and boxing it takes `Temporal` 40 -> 24 bytes and `Value` 40 -> 32
+/// with it — a real saving on every stored property, since `Value` is the unit
+/// the columns are made of. It was implemented and measured on the
+/// `slim-temporal` branch (2026-08-02) and reverted; the branch was deleted
+/// 2026-08-08 after the merge, with its commit body EMPTY, so the numbers that
+/// justified reverting are gone and only the verdict survives.
+///
+/// Recorded here anyway, because the idea is an obvious one to have twice: the
+/// next attempt should re-measure rather than assume, and should price the
+/// indirection on the READ path (every temporal comparison and render would
+/// chase a pointer) against the 8 bytes per `Value`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Temporal {
     Date(Date),
