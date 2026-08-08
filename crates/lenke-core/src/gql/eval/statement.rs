@@ -1429,6 +1429,11 @@ pub(super) fn run_part(
     if let Some(res) = try_walk_count(linear, graph, plan, params) {
         return res;
     }
+    // A comma join off one start is a PRODUCT of its branches, not a cross
+    // product to enumerate.
+    if let Some(res) = try_count_comma_join(linear, graph, plan, params) {
+        return res;
+    }
     // …and the same fold, grouped: one row per GROUP instead of one per walk.
     if let Some(res) = try_grouped_walk_count(linear, graph, plan, params) {
         return res;

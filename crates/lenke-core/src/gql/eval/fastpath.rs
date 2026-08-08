@@ -1130,3 +1130,173 @@ fn bare_hops(path: &CPath, ctx: &Ctx) -> Option<(HopChain, Option<Quantifier>)> 
     }
     Some((hops, quant))
 }
+
+/// `MATCH (a)-[:R]->(b), (a)-[:R]->(c) … RETURN count(*)` — a comma join whose
+/// patterns all branch off the SAME start, counted as a PRODUCT instead of a
+/// cross product enumerated row by row.
+///
+/// Each branch is independent given the shared start, so for one seed the number
+/// of rows is `|b-candidates| · |c-candidates|` — no pair ever has to exist. Over
+/// a 1M/8M graph with a filter on each far end, that is a couple of adjacency
+/// walks per seed instead of the 8 × 8 pairs they generate.
+///
+/// This is what `try_count_comma_join` used to do. It comes back because the
+/// product is exact HERE and nowhere near obvious in general — the engine builds
+/// the full cross product across comma patterns, with no relationship-uniqueness
+/// rule between them (`(a)-[:R]->(b), (a)-[:R]->(c)` over a two-edge fan is 4
+/// rows, not 2), which is precisely what makes a multiplication right.
+///
+/// The `WHERE` is split into conjuncts and each is assigned to the branch whose
+/// far end it reads. A conjunct that reads TWO branches (`b.age > c.age`) is a
+/// correlation between them — the factors stop being independent and the product
+/// stops being the answer — so it declines. So does one that reads the start and
+/// a far end together, which is the same problem.
+pub(super) fn try_count_comma_join(
+    linear: &CLinear,
+    graph: &Graph,
+    plan: &CQuery,
+    params: &[Val],
+) -> Option<CodeResult<RowSet>> {
+    if !walk_count_enabled() {
+        return None;
+    }
+    let [CClause::Match {
+        optional: false,
+        patterns,
+        where_,
+        scope_len,
+        ..
+    }, CClause::Return(proj)] = linear.clauses.as_slice()
+    else {
+        return None;
+    };
+    if patterns.len() < 2 {
+        return None;
+    }
+    if !proj.aggregating
+        || proj.aggs.len() != 1
+        || proj.items.len() != 1
+        || !proj.group_by.is_empty()
+        || proj.limit.is_some()
+        || proj.skip.is_some()
+        || proj.having.is_some()
+        || proj.distinct
+        || !proj.order_by.is_empty()
+        || !matches!(proj.items[0].expr, CExpr::AggRef(0))
+    {
+        return None;
+    }
+    let agg = &proj.aggs[0];
+    if !(agg.star && !agg.distinct && agg.arg.is_none() && matches!(agg.func, AggFn::Count)) {
+        return None;
+    }
+
+    // Every pattern is ONE bare hop off the same start slot, landing on its own
+    // slot. The first pattern's start carries the seed constraint; the others
+    // must be the same variable and add nothing.
+    let start_slot = patterns[0].start.var_slot?;
+    let mut branches: Vec<(&CSegment, usize)> = Vec::new();
+    for (i, p) in patterns.iter().enumerate() {
+        if p.path_var_slot.is_some() || !matches!(p.selector, PathSelector::Walk) {
+            return None;
+        }
+        if p.start.var_slot != Some(start_slot) {
+            return None;
+        }
+        if i > 0
+            && (p.start.label.is_some() || !p.start.props.is_empty() || p.start.where_.is_some())
+        {
+            return None;
+        }
+        let [seg] = p.segments.as_slice() else {
+            return None;
+        };
+        if seg.unit.is_some() {
+            return None;
+        }
+        let rel = &seg.rel;
+        if rel.var_slot.is_some()
+            || !rel.props.is_empty()
+            || rel.where_.is_some()
+            || rel.quantifier.is_some()
+        {
+            return None;
+        }
+        let far = seg.node.var_slot?;
+        if far == start_slot || branches.iter().any(|(_, s)| *s == far) {
+            return None;
+        }
+        branches.push((seg, far));
+    }
+
+    // Split the WHERE and hand each conjunct to the branch it reads.
+    let mut per_branch: Vec<Vec<&CExpr>> = vec![Vec::new(); branches.len()];
+    if let Some(w) = where_.as_ref() {
+        for conj in conjuncts(w) {
+            // A conjunct belongs to branch `i` when it says nothing about ANY
+            // other slot — `refs_slot` is the one traversal over slot
+            // references, and asking it the negative question ("does this read
+            // something that is not my far end") is what makes a predicate about
+            // two branches decline instead of being silently assigned to one of
+            // them. `refs_only_endpoint` cannot answer this: it bottoms out at
+            // `Var`/`Prop`/`Lit`, so every COMPARISON reads as false.
+            let owner = branches
+                .iter()
+                .position(|(_, far)| !crate::gql::plan::refs_slot(conj, &|s| s != *far));
+            per_branch[owner?].push(conj);
+        }
+    }
+
+    let ctx = resolve_ctx(graph, plan, params);
+    let seeds = seek_lower::scan_node(graph, &ctx, &patterns[0].start, None, *scope_len, None);
+    if let Err(e) = ctx.check_fault() {
+        return Some(Err(e));
+    }
+
+    let width = (*scope_len).max(1);
+    let mut b = Binding(vec![None; width]);
+    let mut total: u64 = 0;
+    for &s in &seeds {
+        let mut product: u64 = 1;
+        for (i, (seg, far)) in branches.iter().enumerate() {
+            let node = &seg.node;
+            let mut n: u64 = 0;
+            for (_e, nbr) in expand(graph, &ctx, s, seg.rel.direction, seg.rel.label.as_ref()) {
+                if !matches_label(graph, &ctx, nbr, node.label.as_ref()) {
+                    continue;
+                }
+                b.set(*far, Val::Node(nbr));
+                if !satisfies(graph, &ctx, &Val::Node(nbr), &node.props, None, &b) {
+                    continue;
+                }
+                let env = Env::new(graph, &ctx, &b);
+                if per_branch[i]
+                    .iter()
+                    .any(|c| !where_keep(&env, Some(c), None))
+                {
+                    continue;
+                }
+                n += 1;
+            }
+            product = product.saturating_mul(n);
+            // A zero factor makes the whole product zero — skip the rest.
+            if product == 0 {
+                break;
+            }
+        }
+        total += product;
+    }
+    if let Err(e) = ctx.check_fault() {
+        return Some(Err(e));
+    }
+
+    Some(count_rows_any(proj, total))
+}
+
+/// The top-level AND conjuncts of a predicate, flattened.
+fn conjuncts(e: &CExpr) -> Vec<&CExpr> {
+    match e {
+        CExpr::And(parts) => parts.iter().flat_map(|p| conjuncts(p)).collect(),
+        other => vec![other],
+    }
+}

@@ -13694,3 +13694,99 @@ fn grouped_walk_count_emits_groups_in_first_seen_order() {
         vec![vec![s("first"), n(1.0)], vec![s("second"), n(1.0)]]
     );
 }
+
+/// A fan-out fixture for the comma-join product: `a` has three `R` neighbours
+/// with different ages, `m` has one, and `z` has none — so a branch factor can
+/// be 3, 1 or 0, and one seed contributes nothing.
+fn comma_join_fixture() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"a","labels":["P"],"properties":{"age":30}}"#,
+        r#"{"type":"node","id":"m","labels":["P"],"properties":{"age":70}}"#,
+        r#"{"type":"node","id":"z","labels":["P"],"properties":{"age":20}}"#,
+        r#"{"type":"node","id":"n1","labels":["Q"],"properties":{"age":70}}"#,
+        r#"{"type":"node","id":"n2","labels":["Q"],"properties":{"age":20}}"#,
+        r#"{"type":"node","id":"n3","labels":["R"],"properties":{"age":70}}"#,
+        r#"{"type":"edge","id":"j1","from":"a","to":"n1","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"j2","from":"a","to":"n2","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"j3","from":"a","to":"n3","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"j4","from":"m","to":"n1","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"j5","from":"a","to":"n1","labels":["S"],"properties":{}}"#,
+    ])
+}
+
+/// The product must equal the enumerated cross product on every shape it takes.
+#[test]
+fn the_comma_join_product_agrees_with_enumeration() {
+    let mut g = comma_join_fixture();
+    for q in [
+        // No filter: the plain fan-out product (3 × 3 + 1 × 1 + 0).
+        "MATCH (a:P)-[:R]->(b), (a)-[:R]->(c) RETURN count(*) AS n",
+        // One filter per branch — the shape the bench uses.
+        "MATCH (a:P)-[:R]->(b), (a)-[:R]->(c) WHERE b.age > 60 AND c.age < 25 RETURN count(*) AS n",
+        // A filter on only ONE branch; the other keeps its full factor.
+        "MATCH (a:P)-[:R]->(b), (a)-[:R]->(c) WHERE b.age > 60 RETURN count(*) AS n",
+        // Labels on the far ends instead of a WHERE.
+        "MATCH (a:P)-[:R]->(b:Q), (a)-[:R]->(c:R) RETURN count(*) AS n",
+        // Different edge types per branch, and a branch that matches nothing.
+        "MATCH (a:P)-[:R]->(b), (a)-[:S]->(c) RETURN count(*) AS n",
+        "MATCH (a:P)-[:R]->(b), (a)-[:NOPE]->(c) RETURN count(*) AS n",
+        // Three branches.
+        "MATCH (a:P)-[:R]->(b), (a)-[:R]->(c), (a)-[:R]->(d) RETURN count(*) AS n",
+        // Reversed and undirected branches.
+        "MATCH (a:P)-[:R]->(b), (a)<-[:R]-(c) RETURN count(*) AS n",
+        "MATCH (a:Q)<-[:R]-(b), (a)<-[:R]-(c) RETURN count(*) AS n",
+        // A seed narrowed by an inline constraint rather than a label alone.
+        "MATCH (a:P {age: 30})-[:R]->(b), (a)-[:R]->(c) RETURN count(*) AS n",
+    ] {
+        let product = rows(&mut g, q);
+        let enumerated = super::eval::without_walk_count(|| rows(&mut g, q));
+        assert_eq!(
+            product, enumerated,
+            "comma-join product != matcher for `{q}`"
+        );
+    }
+}
+
+/// A predicate that CORRELATES two branches breaks the independence the product
+/// assumes, and one that mixes a branch with the start does the same. Both must
+/// decline to the matcher rather than being assigned to a branch — a silent
+/// assignment would drop half the predicate and return a larger number.
+#[test]
+fn a_correlated_comma_join_declines_the_product() {
+    let mut g = comma_join_fixture();
+    for q in [
+        "MATCH (a:P)-[:R]->(b), (a)-[:R]->(c) WHERE b.age > c.age RETURN count(*) AS n",
+        "MATCH (a:P)-[:R]->(b), (a)-[:R]->(c) WHERE b.age > a.age RETURN count(*) AS n",
+        "MATCH (a:P)-[:R]->(b), (a)-[:R]->(c) WHERE b.age > 60 OR c.age < 25 RETURN count(*) AS n",
+    ] {
+        let taken = rows(&mut g, q);
+        let enumerated = super::eval::without_walk_count(|| rows(&mut g, q));
+        assert_eq!(
+            taken, enumerated,
+            "a correlated comma join must not multiply: `{q}`"
+        );
+    }
+}
+
+/// The hand-computed anchor: `a` fans out to three `R` neighbours and `m` to
+/// one, so the unfiltered product is 3·3 + 1·1 = 10, and `z` contributes 0.
+#[test]
+fn a_comma_join_product_counts_each_seeds_fan_out() {
+    let mut g = comma_join_fixture();
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:P)-[:R]->(b), (a)-[:R]->(c) RETURN count(*) AS n"
+        ),
+        vec![vec![n(10.0)]],
+    );
+    // With one `age > 60` neighbour and one `age < 25` neighbour, `a` gives
+    // 2 × 1 (n1 and n3 are over 60; n2 is under 25) and `m` gives 1 × 0.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (a:P)-[:R]->(b), (a)-[:R]->(c) WHERE b.age > 60 AND c.age < 25 RETURN count(*) AS n"
+        ),
+        vec![vec![n(2.0)]],
+    );
+}
