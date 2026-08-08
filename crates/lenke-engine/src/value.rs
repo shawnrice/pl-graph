@@ -75,10 +75,46 @@ pub fn equals(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// A canonical, hashable grouping key. This is DISTINCT from `equals`: grouping
+/// (GROUP BY, DISTINCT, `count(DISTINCT …)`) must treat two NaNs as the same
+/// group and `-0.0`/`0.0` as the same group — the opposite of predicate
+/// equality, where NaN equals nothing. Defining it here, once, is why the two
+/// never drift. A prefix byte keeps types apart so a number and a string that
+/// stringify alike cannot collide.
+#[must_use]
+pub fn group_key(v: &Value) -> String {
+    let mut s = String::new();
+    match v {
+        Value::Null => s.push('N'),
+        Value::Bool(b) => {
+            s.push('b');
+            s.push(if *b { '1' } else { '0' });
+        }
+        Value::Num(x) => {
+            s.push('n');
+            // Canonicalize: all NaNs to one bit pattern, and -0.0 to 0.0, so each
+            // groups with its kind.
+            let bits = if x.is_nan() {
+                f64::NAN.to_bits()
+            } else if *x == 0.0 {
+                0.0f64.to_bits()
+            } else {
+                x.to_bits()
+            };
+            s.push_str(&format!("{bits:016x}"));
+        }
+        Value::Str(t) => {
+            s.push('s');
+            s.push_str(t);
+        }
+    }
+    s
+}
+
 /// A deterministic total order over ANY pair of values — never panics. Used by
-/// sort, min/max, and (once it lands) grouping tiebreaks. Nulls sort last; NaN
-/// is the greatest number; `-0.0` and `0.0` tie. Distinct types order by rank so
-/// a mixed column still has one stable order.
+/// sort, min/max, and grouping tiebreaks. Nulls sort last; NaN is the greatest
+/// number; `-0.0` and `0.0` tie. Distinct types order by rank so a mixed column
+/// still has one stable order.
 #[must_use]
 pub fn cmp_total(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
@@ -138,6 +174,19 @@ mod tests {
         assert!(!equals(&n(1.0), &s("1"))); // cross-type is false, not an error
         assert!(equals(&Value::Null, &Value::Null));
         assert!(equals(&s("a"), &s("a")));
+    }
+
+    #[test]
+    fn group_key_is_the_inverse_of_equals_on_nan_and_zero() {
+        // Grouping is the OPPOSITE of predicate equality on exactly these cases:
+        // two NaNs share a group though NaN != NaN; -0 and 0 share a group.
+        assert_eq!(group_key(&n(f64::NAN)), group_key(&n(f64::NAN)));
+        assert_eq!(group_key(&n(0.0)), group_key(&n(-0.0)));
+        // …and it still separates the ordinary cases and keeps types apart.
+        assert_ne!(group_key(&n(1.0)), group_key(&n(2.0)));
+        assert_ne!(group_key(&n(1.0)), group_key(&s("1"))); // no cross-type collision
+        assert_ne!(group_key(&Value::Bool(true)), group_key(&n(1.0)));
+        assert_eq!(group_key(&Value::Null), group_key(&Value::Null));
     }
 
     #[test]

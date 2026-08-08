@@ -50,6 +50,28 @@ pub enum CompareOp {
     Ge,
 }
 
+/// An aggregate function. `Count` with no argument (`arg: None`, `distinct:
+/// false`) is `count(*)`; with an argument it counts non-null values; with
+/// `distinct` it counts non-null distinct values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggFn {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+/// One aggregate in an `Aggregate` operator: `func(arg)` (or `func(DISTINCT
+/// arg)`), output-named `name`. `arg` is `None` only for `count(*)`.
+#[derive(Clone, Debug)]
+pub struct Agg {
+    pub func: AggFn,
+    pub arg: Option<Expr>,
+    pub distinct: bool,
+    pub name: String,
+}
+
 /// A logical plan node. A plan is a tree; execution pulls a batch up through it.
 #[derive(Clone, Debug)]
 pub enum Plan {
@@ -68,6 +90,15 @@ pub enum Plan {
     },
     /// Keep rows where `pred` is TRUE (three-valued: FALSE and NULL drop).
     Filter { input: Box<Plan>, pred: Expr },
+    /// Group rows by the `(name, expr)` keys and compute `aggs` per group. With
+    /// no keys, the whole input is one group (a scalar aggregate). Output columns
+    /// are the key names followed by the aggregate names. Group order is
+    /// first-seen — the order each group's first row arrived.
+    Aggregate {
+        input: Box<Plan>,
+        keys: Vec<(String, Expr)>,
+        aggs: Vec<Agg>,
+    },
     /// Produce output columns: `(name, expr)` per column.
     Project {
         input: Box<Plan>,
@@ -91,6 +122,15 @@ impl Plan {
         Self::Filter {
             input: Box::new(self),
             pred,
+        }
+    }
+
+    #[must_use]
+    pub fn aggregate(self, keys: Vec<(String, Expr)>, aggs: Vec<Agg>) -> Self {
+        Self::Aggregate {
+            input: Box::new(self),
+            keys,
+            aggs,
         }
     }
 
