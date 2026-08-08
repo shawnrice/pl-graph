@@ -364,3 +364,56 @@ fn parallel_edges_are_one_distinct_endpoint() {
         2
     );
 }
+
+/// Collapsing the intermediate frontier must not change a DISTINCT walk count.
+///
+/// The fixture reaches `b` two ways, so the midpoint set and the midpoint
+/// MULTISET differ — which is the whole premise: a set of endpoints depends on
+/// which midpoints were reached, not on how often. The counting form must be
+/// left alone, and is checked here too so the optimization cannot leak into it.
+#[test]
+fn collapsing_the_midpoints_preserves_a_distinct_walk_count() {
+    use super::{Dir, SelfLoops};
+    let g = distinct_fixture();
+    let all: Vec<u32> = g.vertex_indices().collect();
+    let r = g.etype.get("R").expect("R exists");
+
+    for hops in [
+        vec![(Dir::Out, Some(vec![r]))],
+        vec![(Dir::Out, Some(vec![r])), (Dir::Out, Some(vec![r]))],
+        vec![(Dir::In, Some(vec![r])), (Dir::Out, Some(vec![r]))],
+        vec![
+            (Dir::Out, Some(vec![r])),
+            (Dir::Out, Some(vec![r])),
+            (Dir::Out, Some(vec![r])),
+        ],
+        vec![(Dir::Both, Some(vec![r])), (Dir::Both, Some(vec![r]))],
+    ] {
+        // Reference: expand every hop with multiplicity, then deduplicate the
+        // final endpoints — the definition the fast path has to preserve.
+        let mut cur: Vec<u32> = all.clone();
+        for (dir, et) in &hops {
+            cur = super::expand(
+                &g,
+                &cur,
+                *dir,
+                et.as_deref().unwrap_or(&[]),
+                SelfLoops::Once,
+            );
+        }
+        cur.sort_unstable();
+        let counted = cur.len();
+        cur.dedup();
+
+        assert_eq!(
+            super::walk_count(&g, &all, &hops, SelfLoops::Once, true),
+            cur.len(),
+            "distinct count for {hops:?}"
+        );
+        assert_eq!(
+            super::walk_count(&g, &all, &hops, SelfLoops::Once, false),
+            counted,
+            "the counting form must keep every arrival for {hops:?}"
+        );
+    }
+}

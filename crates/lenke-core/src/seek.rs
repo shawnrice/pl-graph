@@ -1649,10 +1649,38 @@ pub fn walk_count(
     let last = etypes.as_deref().unwrap_or(&[]);
 
     if distinct {
-        return distinct_expand_count(graph, &cur, *dir, last, loops);
+        // A SET does not depend on how many ways each midpoint was reached, so
+        // the intermediate frontier can be collapsed before the final hop is
+        // walked. Over a two-hop on 1M/8M that is 1M distinct midpoints instead
+        // of 8M arrivals, and the last hop then costs 8M edge visits rather than
+        // 64M — the same "multiplicity is not needed" argument the degree
+        // product in `gql::eval::fastpath` makes, one level earlier.
+        //
+        // Only sound under `distinct`: the counting form below needs every
+        // arrival, because each one is a different walk.
+        let mids = dedup_ids(&cur, graph.vertex_slots());
+        return distinct_expand_count(graph, &mids, *dir, last, loops);
     }
 
     expand_count(graph, &cur, *dir, last, loops)
+}
+
+/// Collapse dense ids to their SET, in first-appearance order, in place.
+///
+/// Order is preserved because the callers' results are order-sensitive further
+/// up even when this level's multiplicity is not, and a sort here would be both
+/// slower and a silent reordering.
+fn dedup_ids(ids: &[u32], slots: usize) -> Vec<u32> {
+    let mut seen = vec![0u64; slots.div_ceil(64)];
+    let mut out = Vec::with_capacity(ids.len().min(slots));
+    for &id in ids {
+        let (w, b) = (id as usize / 64, 1u64 << (id as usize % 64));
+        if seen[w] & b == 0 {
+            seen[w] |= b;
+            out.push(id);
+        }
+    }
+    out
 }
 
 /// Distinct count over dense ids. Element identity IS the index, so this needs no
