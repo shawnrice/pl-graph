@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::batch::{Batch, Col};
+use crate::batch::{Batch, Col, Lineage};
 use crate::ir::{Agg, AggFn, CompareOp, Dir, Expr, Plan};
 use crate::store::{Column, Store};
 use crate::value::{self, Value};
@@ -28,7 +28,11 @@ pub struct Rows {
 /// implicit column so partial plans stay runnable in tests.
 #[must_use]
 pub fn run(plan: &Plan, store: &Store) -> Rows {
-    let batch = pull(plan, store);
+    // Lineage is plan-global: if anything reads the path, the whole plan tracks
+    // it (Scan seeds, Expand extends); otherwise no operator builds a sidecar and
+    // the query pays nothing for lineage.
+    let track = needs_lineage(plan);
+    let batch = pull(plan, store, track);
     let n = batch.rows();
     match output_names(plan) {
         Some(names) => {
@@ -64,15 +68,54 @@ fn output_names(plan: &Plan) -> Option<Vec<String>> {
     }
 }
 
-/// Pull a batch up through a (non-terminal) plan node.
-fn pull(plan: &Plan, store: &Store) -> Batch {
+/// Whether any expression in the plan reads the path (`Expr::Path`) — the signal
+/// that lineage must be tracked. Computed once, for the whole plan.
+fn needs_lineage(plan: &Plan) -> bool {
+    fn reads_path(e: &Expr) -> bool {
+        match e {
+            Expr::Path => true,
+            Expr::Compare { left, right, .. } => reads_path(left) || reads_path(right),
+            Expr::Not(x) => reads_path(x),
+            Expr::And(a, b) | Expr::Or(a, b) => reads_path(a) || reads_path(b),
+            Expr::Slot(_) | Expr::Prop { .. } | Expr::Lit(_) => false,
+        }
+    }
+    match plan {
+        Plan::Scan { .. } => false,
+        Plan::Expand { input, .. }
+        | Plan::VarLength { input, .. }
+        | Plan::ShortestPath { input, .. }
+        | Plan::Distinct { input } => needs_lineage(input),
+        Plan::Filter { input, pred } => reads_path(pred) || needs_lineage(input),
+        Plan::Project { input, items } => {
+            items.iter().any(|(_, e)| reads_path(e)) || needs_lineage(input)
+        }
+        Plan::Aggregate { input, keys, aggs } => {
+            keys.iter().any(|(_, e)| reads_path(e))
+                || aggs.iter().any(|a| a.arg.as_ref().is_some_and(reads_path))
+                || needs_lineage(input)
+        }
+        Plan::OrderPage { input, keys, .. } => {
+            keys.iter().any(|k| reads_path(&k.expr)) || needs_lineage(input)
+        }
+        Plan::Join { left, right, .. } => needs_lineage(left) || needs_lineage(right),
+    }
+}
+
+/// Pull a batch up through a (non-terminal) plan node. `track` is the plan-global
+/// lineage decision: when true, row-producing operators build the path sidecar.
+fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
     match plan {
         Plan::Scan { label } => {
             let ids = match label {
                 Some(l) => store.nodes_with_label(l).to_vec(),
                 None => store.all_nodes(),
             };
-            Batch::single(Col::Nodes(ids))
+            let mut batch = Batch::single(Col::Nodes(ids.clone()));
+            if track {
+                batch.lineage = Some(Lineage::seed(&ids));
+            }
+            batch
         }
         Plan::Expand {
             input,
@@ -80,14 +123,14 @@ fn pull(plan: &Plan, store: &Store) -> Batch {
             dir,
             edge_label,
         } => expand(
-            &pull(input, store),
+            &pull(input, store, track),
             store,
             *from,
             *dir,
             edge_label.as_deref(),
         ),
         Plan::Filter { input, pred } => {
-            let batch = pull(input, store);
+            let batch = pull(input, store, track);
             let mask = eval(pred, store, &batch);
             let keep: Vec<usize> = match &mask {
                 Col::Bool(bs) => (0..bs.len()).filter(|&i| bs[i]).collect(),
@@ -106,7 +149,7 @@ fn pull(plan: &Plan, store: &Store) -> Batch {
             max,
             trail,
         } => var_length(
-            &pull(input, store),
+            &pull(input, store, track),
             store,
             *from,
             *dir,
@@ -122,30 +165,32 @@ fn pull(plan: &Plan, store: &Store) -> Batch {
             edge_label,
             max,
         } => shortest_path(
-            &pull(input, store),
+            &pull(input, store, track),
             store,
             *from,
             *dir,
             edge_label.as_deref(),
             *max,
         ),
-        Plan::Aggregate { input, keys, aggs } => aggregate(&pull(input, store), store, keys, aggs),
+        Plan::Aggregate { input, keys, aggs } => {
+            aggregate(&pull(input, store, track), store, keys, aggs)
+        }
         Plan::OrderPage {
             input,
             keys,
             skip,
             limit,
-        } => order_page(&pull(input, store), store, keys, *skip, *limit),
+        } => order_page(&pull(input, store, track), store, keys, *skip, *limit),
         Plan::Project { input, items } => {
             // Project produces a batch whose slots ARE the projected columns, so
             // an operator above it (Distinct, OrderPage) works on the output
             // values, not the pre-projection bindings.
-            let batch = pull(input, store);
+            let batch = pull(input, store, track);
             let cols = items.iter().map(|(_, e)| eval(e, store, &batch)).collect();
             Batch::of(cols)
         }
         Plan::Distinct { input } => {
-            let batch = pull(input, store);
+            let batch = pull(input, store, track);
             let n = batch.rows();
             let mut seen = std::collections::HashSet::new();
             let keep: Vec<usize> = (0..n)
@@ -162,7 +207,9 @@ fn pull(plan: &Plan, store: &Store) -> Batch {
                 .collect();
             batch.gather(&keep)
         }
-        Plan::Join { left, right, on } => hash_join(&pull(left, store), &pull(right, store), on),
+        Plan::Join { left, right, on } => {
+            hash_join(&pull(left, store, track), &pull(right, store, track), on)
+        }
     }
 }
 
@@ -367,7 +414,11 @@ fn expand(batch: &Batch, store: &Store, from: usize, dir: Dir, edge_label: Optio
     let empty = || {
         let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
         slots.push(Col::Nodes(vec![]));
-        Batch::of(slots)
+        let mut b = Batch::of(slots);
+        if batch.lineage.is_some() {
+            b.lineage = Some(Lineage::empty());
+        }
+        b
     };
     // Resolve the edge label to an interned id up front; an unknown label matches
     // nothing (not everything).
@@ -408,8 +459,15 @@ fn expand(batch: &Batch, store: &Store, from: usize, dir: Dir, edge_label: Optio
     }
 
     let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
-    slots.push(Col::Nodes(nbrs));
-    Batch::of(slots)
+    slots.push(Col::Nodes(nbrs.clone()));
+    let mut out = Batch::of(slots);
+    // Lineage strategy: when the input carried a path, extend each output row's
+    // path by the neighbour it landed on. This is the ONLY place Expand differs
+    // for lineage — the frontier work above is identical.
+    if let Some(lin) = &batch.lineage {
+        out.lineage = Some(lin.extend(&keep, &nbrs));
+    }
+    out
 }
 
 /// A quantified hop: for each input row, enumerate every path of length in
@@ -597,6 +655,16 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
         Expr::Slot(n) => batch.slot(*n).clone(),
         Expr::Lit(v) => broadcast(v.clone(), batch.rows()),
         Expr::Prop { slot, key } => read_property(store, batch.slot(*slot), key),
+        Expr::Path => match &batch.lineage {
+            // Each row's path as a List of node ids; NULL when the plan tracks no
+            // lineage (which `needs_lineage` prevents when Path is actually read).
+            Some(lin) => Col::Gen(
+                (0..batch.rows())
+                    .map(|i| Value::List(lin.path_at(i).to_vec()))
+                    .collect(),
+            ),
+            None => Col::Gen(vec![Value::Null; batch.rows()]),
+        },
         Expr::Not(inner) => {
             let c = eval(inner, store, batch);
             map_bool(&c, |b| b.map(|x| !x))
@@ -648,7 +716,8 @@ fn broadcast(v: Value, n: usize) -> Col {
         Value::Num(x) => Col::Num(vec![x; n]),
         Value::Bool(b) => Col::Bool(vec![b; n]),
         Value::Str(s) => Col::Str(vec![s; n]),
-        Value::Null => Col::Gen(vec![Value::Null; n]),
+        // Null and List have no unboxed column form.
+        other => Col::Gen(vec![other; n]),
     }
 }
 
@@ -1535,5 +1604,119 @@ mod tests {
         got.sort();
         // b(1), c(2); a is the source, not re-emitted despite the cycle back.
         assert_eq!(got, vec!["b", "c"]);
+    }
+
+    // --- Lineage (path) ---
+
+    /// A chain a->b->c. `RETURN path` over the 2-hop expand yields the hand-
+    /// computed path [a, b, c] (node ids), and the path grows one node per hop.
+    #[test]
+    fn path_is_the_hop_sequence() {
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[("name", s("a"))]);
+        let bb = b.node(&["N"], &[("name", s("b"))]);
+        let c = b.node(&["N"], &[("name", s("c"))]);
+        b.edge(a, bb, "R");
+        b.edge(bb, c, "R");
+        let store = b.build();
+        // (a)-[:R]->(x)-[:R]->(y) starting at a, RETURN path.
+        let plan = scan("N")
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
+            .expand(0, Dir::Out, Some("R"))
+            .expand(1, Dir::Out, Some("R"))
+            .project(vec![("p".into(), Expr::Path)]);
+        let out = run(&plan, &store);
+        assert_eq!(out.rows.len(), 1);
+        // path = [a, b, c] as node ids (a=0, b=1, c=2).
+        match &out.rows[0][0] {
+            Value::List(items) => {
+                let ids: Vec<f64> = items
+                    .iter()
+                    .map(|v| match v {
+                        Value::Num(x) => *x,
+                        other => panic!("path element not a node id: {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(ids, vec![f64::from(a), f64::from(bb), f64::from(c)]);
+            }
+            other => panic!("expected a path list, got {other:?}"),
+        }
+    }
+
+    /// A one-hop path is two nodes; the source's own path (length-0 walk via a
+    /// bare scan) is one node.
+    #[test]
+    fn path_length_grows_with_hops() {
+        let store = social();
+        // alice -KNOWS-> {bob, carol}; RETURN path per edge.
+        let plan = scan("Person")
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("alice"))))
+            .expand(0, Dir::Out, Some("KNOWS"))
+            .project(vec![("p".into(), Expr::Path)]);
+        let out = run(&plan, &store);
+        assert_eq!(out.rows.len(), 2); // alice->bob, alice->carol
+        for row in &out.rows {
+            match &row[0] {
+                Value::List(items) => assert_eq!(items.len(), 2), // [alice, neighbour]
+                other => panic!("expected path list, got {other:?}"),
+            }
+        }
+    }
+
+    /// GATING: a lineage-free plan builds NO sidecar (pays nothing). Only a plan
+    /// that reads Path tracks it. Checked at the batch level via `needs_lineage`
+    /// and the pulled batch's `lineage` field.
+    #[test]
+    fn lineage_free_plan_builds_no_sidecar() {
+        let store = social();
+        let plain = scan("Person")
+            .expand(0, Dir::Out, Some("KNOWS"))
+            .project(vec![("b".into(), prop(1, "name"))]);
+        assert!(!super::needs_lineage(&plain), "no Path read -> no lineage");
+        // The pulled batch (before the lineage-dropping Project) has no sidecar.
+        let inner = scan("Person").expand(0, Dir::Out, Some("KNOWS"));
+        assert!(super::pull(&inner, &store, false).lineage.is_none());
+
+        let with_path = scan("Person")
+            .expand(0, Dir::Out, Some("KNOWS"))
+            .project(vec![("p".into(), Expr::Path)]);
+        assert!(super::needs_lineage(&with_path), "Path read -> lineage");
+        // With track=true the expand carries a sidecar.
+        assert!(super::pull(&inner, &store, true).lineage.is_some());
+    }
+
+    /// Lineage survives a reorder: ORDER BY over a path-tracking plan keeps each
+    /// row's path aligned with its row.
+    #[test]
+    fn lineage_follows_a_reorder() {
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[("name", s("a")), ("age", n(1.0))]);
+        let bb = b.node(&["N"], &[("name", s("b")), ("age", n(3.0))]);
+        let c = b.node(&["N"], &[("name", s("c")), ("age", n(2.0))]);
+        b.edge(a, bb, "R");
+        b.edge(a, c, "R");
+        let store = b.build();
+        // a -> {b(age3), c(age2)}; order by the neighbour's age asc, RETURN path.
+        let plan = scan("N")
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
+            .expand(0, Dir::Out, Some("R"))
+            .order_page(vec![asc(1, "age")], None, None)
+            .project(vec![
+                ("last".into(), prop(1, "name")),
+                ("p".into(), Expr::Path),
+            ]);
+        let out = run(&plan, &store);
+        // sorted by neighbour age: c(2) then b(3). Each path ends at its own node.
+        assert_eq!(as_str(&out.rows[0][0]), "c");
+        assert_eq!(as_str(&out.rows[1][0]), "b");
+        let last_of = |row: &[Value]| match &row[1] {
+            Value::List(items) => match items.last() {
+                Some(Value::Num(x)) => *x,
+                other => panic!("path tail not a node: {other:?}"),
+            },
+            other => panic!("expected path, got {other:?}"),
+        };
+        assert_eq!(last_of(&out.rows[0]), f64::from(c)); // path for c ends at c
+        assert_eq!(last_of(&out.rows[1]), f64::from(bb)); // path for b ends at b
     }
 }

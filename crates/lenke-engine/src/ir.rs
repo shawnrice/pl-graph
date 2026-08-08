@@ -28,6 +28,10 @@ pub enum Expr {
     },
     /// A constant.
     Lit(Value),
+    /// The current row's PATH as a `Value::List` of node ids. Reading it is what
+    /// makes a plan require lineage (see `needs_lineage`); over a plan that does
+    /// not track lineage it is NULL.
+    Path,
     /// A comparison; `=`/`<>` use the value contract's `equals`, ordering uses
     /// `cmp_total`. NULL operands make the result NULL (three-valued).
     Compare {

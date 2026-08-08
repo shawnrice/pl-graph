@@ -73,17 +73,70 @@ impl Col {
     }
 }
 
-/// The lineage sidecar: path, tags, and sack, present only when required. The
-/// first slice never populates it; it exists so operators that will carry
-/// lineage have a home for it rather than a second batch type being introduced
-/// later.
+/// The lineage sidecar: the per-row path, present ONLY when the plan reads it.
+/// This is the design's heart — the same batch carries lineage or not, decided
+/// per plan, instead of a separate traverser type. Row `i`'s path is
+/// `values[offsets[i]..offsets[i+1]]` (Arrow-style list layout: `offsets` has
+/// `rows + 1` entries, `offsets[0] == 0`). Path elements are node ids as
+/// `Value::Num` for now (there is no dedicated node value yet); tags and sack
+/// join this struct when their operators do.
 #[derive(Clone, Debug, Default)]
 pub struct Lineage {
-    /// Per-row path, as a flat values buffer plus per-row end offsets
-    /// (Arrow-style list layout). Empty when no path is tracked.
-    pub path_values: Vec<Value>,
-    pub path_offsets: Vec<usize>,
-    // tags and sack join here as their operators land.
+    pub values: Vec<Value>,
+    pub offsets: Vec<usize>,
+}
+
+impl Lineage {
+    /// Seed one single-node path per node — what a lineage-tracking Scan produces.
+    #[must_use]
+    pub fn seed(nodes: &[u32]) -> Self {
+        Self {
+            values: nodes.iter().map(|&n| Value::Num(f64::from(n))).collect(),
+            offsets: (0..=nodes.len()).collect(),
+        }
+    }
+
+    /// An empty sidecar (zero rows) — for a lineage-tracking operator that
+    /// produced nothing.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            values: Vec::new(),
+            offsets: vec![0],
+        }
+    }
+
+    /// Row `i`'s path.
+    #[must_use]
+    pub fn path_at(&self, i: usize) -> &[Value] {
+        &self.values[self.offsets[i]..self.offsets[i + 1]]
+    }
+
+    /// Reorder/subset the paths by `idx` (parallel to a slot gather).
+    #[must_use]
+    pub fn gather(&self, idx: &[usize]) -> Self {
+        let mut values = Vec::new();
+        let mut offsets = vec![0usize];
+        for &i in idx {
+            values.extend_from_slice(self.path_at(i));
+            offsets.push(values.len());
+        }
+        Self { values, offsets }
+    }
+
+    /// One output path per `(keep[k], new_nodes[k])`: the input row `keep[k]`'s
+    /// path extended by `new_nodes[k]` — what a lineage-tracking Expand produces.
+    #[must_use]
+    pub fn extend(&self, keep: &[usize], new_nodes: &[u32]) -> Self {
+        let mut values = Vec::new();
+        let mut offsets = vec![0usize];
+        for (&k, &node) in keep.iter().zip(new_nodes) {
+            values.extend_from_slice(self.path_at(k));
+            values.push(Value::Num(f64::from(node)));
+            offsets.push(values.len());
+        }
+        Self { values, offsets }
+    }
 }
 
 /// One batch flowing between operators. A batch is a set of row-aligned SLOT
@@ -132,13 +185,15 @@ impl Batch {
         &self.slots[i]
     }
 
-    /// Gather every slot by the same row indices — the primitive Filter and
-    /// Expand use to keep/replicate rows while staying row-aligned.
+    /// Gather every slot AND the lineage by the same row indices — the primitive
+    /// Filter, OrderPage, and Distinct use to keep/reorder rows while staying
+    /// row-aligned. The lineage must be gathered too, or a reorder would
+    /// desynchronize paths from their rows.
     #[must_use]
     pub fn gather(&self, idx: &[usize]) -> Self {
         Self {
             slots: self.slots.iter().map(|c| c.gather(idx)).collect(),
-            lineage: self.lineage.clone(),
+            lineage: self.lineage.as_ref().map(|l| l.gather(idx)),
         }
     }
 }

@@ -31,6 +31,9 @@ pub enum Value {
     Bool(bool),
     Num(f64),
     Str(Arc<str>),
+    /// An ordered list of values — e.g. a path (its node ids). Added with the
+    /// lineage slice; every contract function below gains its arm.
+    List(Vec<Value>),
 }
 
 impl Value {
@@ -53,8 +56,9 @@ impl Value {
             Self::Bool(_) => 0,
             Self::Num(_) => 1,
             Self::Str(_) => 2,
+            Self::List(_) => 3,
             // Null sorts LAST — it is the greatest in the total order.
-            Self::Null => 3,
+            Self::Null => 4,
         }
     }
 }
@@ -71,6 +75,11 @@ pub fn equals(a: &Value, b: &Value) -> bool {
         // `==` on f64 is already NaN-unequal and treats -0.0 == 0.0.
         (Value::Num(x), Value::Num(y)) => x == y,
         (Value::Str(x), Value::Str(y)) => x == y,
+        // Lists are equal elementwise (same length, each pair equal). A NaN
+        // element still makes the lists unequal, as `equals` does per element.
+        (Value::List(x), Value::List(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| equals(p, q))
+        }
         _ => false,
     }
 }
@@ -107,6 +116,16 @@ pub fn group_key(v: &Value) -> String {
             s.push('s');
             s.push_str(t);
         }
+        Value::List(items) => {
+            // Length-prefixed element keys so `[a,b]` and `[ab]` cannot collide.
+            s.push('l');
+            s.push_str(&format!("{}:", items.len()));
+            for it in items {
+                let k = group_key(it);
+                s.push_str(&format!("{}:", k.len()));
+                s.push_str(&k);
+            }
+        }
     }
     s
 }
@@ -122,6 +141,13 @@ pub fn cmp_total(a: &Value, b: &Value) -> Ordering {
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Num(x), Value::Num(y)) => cmp_num_total(*x, *y),
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        // Lexicographic over elements; a shorter prefix sorts first.
+        (Value::List(x), Value::List(y)) => x
+            .iter()
+            .zip(y)
+            .map(|(p, q)| cmp_total(p, q))
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or_else(|| x.len().cmp(&y.len())),
         _ => a.rank().cmp(&b.rank()),
     }
 }
