@@ -417,3 +417,71 @@ fn collapsing_the_midpoints_preserves_a_distinct_walk_count() {
         );
     }
 }
+
+/// The weighted count must equal the enumerating one on every chain, and the
+/// fixture has the two things that break a degree product: a vertex reachable
+/// several ways (so multiplicity actually matters) and a self-loop (which
+/// `SelfLoops` treats differently per direction).
+#[test]
+fn a_weighted_walk_count_equals_the_enumerated_one() {
+    use super::{Dir, SelfLoops};
+    let g = distinct_fixture();
+    let all: Vec<u32> = g.vertex_indices().collect();
+    let r = g.etype.get("R").expect("R exists");
+    let st = g.etype.get("S").expect("S exists");
+
+    for hops in [
+        vec![(Dir::Out, Some(vec![r])), (Dir::Out, Some(vec![r]))],
+        vec![(Dir::In, Some(vec![r])), (Dir::In, Some(vec![r]))],
+        vec![(Dir::Out, Some(vec![r])), (Dir::In, Some(vec![r]))],
+        // Mixed types across the levels, and one that matches nothing.
+        vec![(Dir::Out, Some(vec![r])), (Dir::Out, Some(vec![st]))],
+        vec![(Dir::Out, Some(vec![st])), (Dir::Out, Some(vec![r]))],
+        // Three levels — the weighted form's whole point is that depth is linear.
+        vec![
+            (Dir::Out, Some(vec![r])),
+            (Dir::Out, Some(vec![r])),
+            (Dir::Out, Some(vec![r])),
+        ],
+        // Undirected, under both self-loop rules.
+        vec![(Dir::Both, Some(vec![r])), (Dir::Both, Some(vec![r]))],
+        // Any type at all.
+        vec![(Dir::Out, None), (Dir::Out, None)],
+    ] {
+        for loops in [SelfLoops::Once, SelfLoops::Twice] {
+            let weighted =
+                super::forcing_weighted_count(|| super::walk_count(&g, &all, &hops, loops, false));
+            let enumerated = super::walk_count(&g, &all, &hops, loops, false);
+            assert_eq!(weighted, enumerated, "{hops:?} under {loops:?}");
+
+            // …and against the definition, not just the other implementation.
+            let mut cur: Vec<u32> = all.clone();
+            for (dir, et) in &hops {
+                cur = super::expand(&g, &cur, *dir, et.as_deref().unwrap_or(&[]), loops);
+            }
+            assert_eq!(weighted, cur.len(), "{hops:?} under {loops:?} vs expansion");
+        }
+    }
+}
+
+/// A weighted count carries MULTIPLICITY, which is the thing a set-based
+/// shortcut would lose: `a` reaches `b` by two parallel edges, so two-hop walks
+/// through `b` are counted twice, not once.
+#[test]
+fn a_weighted_count_keeps_multiplicity() {
+    use super::{Dir, SelfLoops};
+    let g = distinct_fixture();
+    let r = g.etype.get("R").expect("R exists");
+    let a = g.vertex_indices().next().expect("a is first");
+    let hops = vec![(Dir::Out, Some(vec![r])), (Dir::Out, Some(vec![r]))];
+    // a→b twice and a→c once; from b there is no R out-edge, from c one (c→b).
+    // So the two-hop walks from `a` are c→b only: 1.
+    let weighted = super::forcing_weighted_count(|| {
+        super::walk_count(&g, &[a], &hops, SelfLoops::Once, false)
+    });
+    assert_eq!(weighted, 1);
+    assert_eq!(
+        weighted,
+        super::walk_count(&g, &[a], &hops, SelfLoops::Once, false)
+    );
+}

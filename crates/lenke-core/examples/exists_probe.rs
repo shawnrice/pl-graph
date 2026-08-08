@@ -142,15 +142,30 @@ fn main() {
     // questions than the table it claims to reproduce — `varlen_group` groups by
     // `b.city` (50 groups), not by a unique name (300k).
     for (name, q) in [
-        ("not_exists_hub", "MATCH (a:Person) WHERE NOT EXISTS { (a)-[:KNOWS]->(:Hub) } RETURN count(*) AS c"),
-        ("exists_semi", "MATCH (a:Person) WHERE EXISTS { (a)-[:KNOWS]->(:Hub) } RETURN count(*) AS c"),
-        ("varlen_group", "MATCH (a:Person)-[:KNOWS]->{1,2}(b) RETURN b.city AS city, count(*) AS n"),
-        ("varlen_all_1_2", "MATCH (a:Person)-[:KNOWS]->{1,2}(b) RETURN count(*) AS c"),
-        ("join_multi", "MATCH (a:Person)-[:KNOWS]->(b), (a)-[:KNOWS]->(c) WHERE b.age > 60 AND c.age < 25 RETURN count(*) AS c"),
-        ("gather_by_node", "MATCH (m:Person)-[:KNOWS]->(n) WITH n, sum(m.age) AS s RETURN count(*) AS c"),
-        ("distinct_2hop", "MATCH (a:Person)-[:KNOWS]->()-[:KNOWS]->(c) RETURN count(DISTINCT c) AS c"),
-        ("trav2_group", "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN c.city AS city, count(*) AS n"),
-        ("distinct_nbr", "MATCH (a:Person)-[:KNOWS]->(b) RETURN count(DISTINCT b) AS c"),
+        (
+            "gather_full",
+            "MATCH (m:Person)-[:KNOWS]->(n) WITH n, sum(m.age) AS s RETURN count(*) AS c",
+        ),
+        (
+            "gather_nosum",
+            "MATCH (m:Person)-[:KNOWS]->(n) WITH n RETURN count(*) AS c",
+        ),
+        (
+            "gather_distinct",
+            "MATCH (m:Person)-[:KNOWS]->(n) RETURN count(DISTINCT n) AS c",
+        ),
+        (
+            "gather_keepsum",
+            "MATCH (m:Person)-[:KNOWS]->(n) WITH n, sum(m.age) AS s RETURN sum(s) AS t",
+        ),
+        (
+            "asym_cnt_fwd",
+            "MATCH (a:Person)-[:KNOWS]->(b:Hub) RETURN count(*) AS c",
+        ),
+        (
+            "varlen12",
+            "MATCH (a:Person)-[:KNOWS]->{1,2}(b) RETURN count(*) AS c",
+        ),
     ] {
         let (ms, rows) = bench(&mut g, q);
         // The ANSWER, not just the row count — a "regression" that returns a

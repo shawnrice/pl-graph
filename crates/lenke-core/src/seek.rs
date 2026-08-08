@@ -1644,6 +1644,16 @@ pub fn walk_count(
         };
     };
 
+    // A count over SEVERAL hops does not need the walks enumerated: a frontier
+    // of 8M arrivals over 1M distinct midpoints asks the same adjacency
+    // question 8 times per midpoint. Carrying a COUNT PER VERTEX instead turns
+    // each level from O(walks) into O(E) — see `weighted_walk_count`.
+    if !distinct && !init.is_empty() {
+        if let Some(n) = weighted_walk_count(graph, seed, hops, loops) {
+            return n;
+        }
+    }
+
     // Every hop but the last, through the shared walk; the last is COUNTED.
     let cur = walk(graph, seed, init, loops);
     let last = etypes.as_deref().unwrap_or(&[]);
@@ -1663,6 +1673,143 @@ pub fn walk_count(
     }
 
     expand_count(graph, &cur, *dir, last, loops)
+}
+
+thread_local! {
+    static WEIGHTED_COUNT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn weighted_count_forced() -> bool {
+    WEIGHTED_COUNT.with(std::cell::Cell::get)
+}
+
+/// Run `f` with [`weighted_walk_count`]'s frontier floor removed. Test-only.
+///
+/// Without it the weighted path is unreachable from the suite — it needs a
+/// 65536-arrival frontier before it will allocate, and every fixture here is
+/// far smaller, so each test would exercise the enumerating path on both sides
+/// of its own comparison. This is the third cost model on this branch to hide
+/// its own fast path from the tests; the pattern is now assumed.
+#[cfg(test)]
+pub(crate) fn forcing_weighted_count<T>(f: impl FnOnce() -> T) -> T {
+    let prev = WEIGHTED_COUNT.with(|c| c.replace(true));
+    let out = f();
+    WEIGHTED_COUNT.with(|c| c.set(prev));
+    out
+}
+
+/// A multi-hop walk count carried as a COUNT PER VERTEX rather than a list of
+/// arrivals, or `None` when that would cost more than enumerating.
+///
+/// The frontier after one hop of a 1M/8M graph is 8M arrivals spread over 1M
+/// distinct midpoints, and expanding it asks each midpoint's adjacency question
+/// once per arrival — eight times over. Propagating `counts[v]` instead, a level
+/// costs one pass over the vertices plus one over their edges, whatever the
+/// multiplicity: `counts'[w] = Σ_{v→w} counts[v]`, and the last level folds to a
+/// total without building anything.
+///
+/// This is the degree product that `gql::eval::fastpath` uses for a GROUPED
+/// count, one layer down and general over depth, so a three-hop count pays 3·E
+/// rather than `degree³`. It lives in `seek`, so Gremlin's `.count()` over a
+/// multi-hop gets it too.
+///
+/// It counts WALKS, which is what the caller already documents and what the
+/// enumerating path it replaces produced — a repeated edge is not excluded here.
+///
+/// `None` when the seed set is small: the dense vectors are two `u64` per vertex
+/// slot, and a query that touches a handful of vertices in a million-vertex
+/// graph would spend more time clearing them than walking. The threshold is on
+/// the FRONTIER after the first hop rather than the seed count, because a
+/// thousand hub vertices can still fan out into millions of arrivals.
+fn weighted_walk_count(
+    graph: &Graph,
+    seed: &[u32],
+    hops: &[(Dir, Option<Vec<u32>>)],
+    loops: SelfLoops,
+) -> Option<usize> {
+    const DENSE_MIN: usize = 1 << 16;
+    let slots = graph.vertex_slots();
+    let min = if weighted_count_forced() {
+        0
+    } else {
+        DENSE_MIN
+    };
+    let (first, rest) = hops.split_first()?;
+    let any: &[u32] = &[];
+
+    // The first level is materialized, both to price the decision and because a
+    // walk that stays small never pays for the dense vectors at all.
+    let level1 = expand(
+        graph,
+        seed,
+        first.0,
+        first.1.as_deref().unwrap_or(any),
+        loops,
+    );
+    if level1.len() < min {
+        return None;
+    }
+
+    let mut counts = vec![0u64; slots];
+    for &v in &level1 {
+        counts[v as usize] += 1;
+    }
+    drop(level1);
+
+    let (last, mid) = rest.split_last()?;
+    let mut scratch = vec![0u64; slots];
+    for (dir, etypes) in mid {
+        scratch.fill(0);
+        let types = etypes.as_deref().unwrap_or(any);
+        let need_extra = graph.etypes_need_extra_lookup(types);
+        for (v, &n) in counts.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            for a in adj_filtered(graph, v as u32, *dir, types, loops, need_extra) {
+                scratch[a.nbr as usize] += n;
+            }
+        }
+        std::mem::swap(&mut counts, &mut scratch);
+    }
+
+    // The last level is a fold: how many edges leave each weighted vertex.
+    let types = last.1.as_deref().unwrap_or(any);
+    let need_extra = graph.etypes_need_extra_lookup(types);
+    let mut total = 0u64;
+    for (v, &n) in counts.iter().enumerate() {
+        if n == 0 {
+            continue;
+        }
+        let deg = adj_filtered(graph, v as u32, last.0, types, loops, need_extra).count() as u64;
+        total += n * deg;
+    }
+    Some(total as usize)
+}
+
+/// [`adj`] with the caller hoisting the multi-label lookup decision, which is a
+/// per-GRAPH property and must not be re-derived per vertex in a hot loop.
+fn adj_filtered<'a>(
+    graph: &'a Graph,
+    v: u32,
+    dir: Dir,
+    etypes: &'a [u32],
+    loops: SelfLoops,
+    need_extra: bool,
+) -> impl Iterator<Item = crate::graph::Adj> + 'a {
+    let drop_loop = dir == Dir::Both && loops == SelfLoops::Once;
+    let out = (dir != Dir::In)
+        .then(|| graph.out_adj(v))
+        .into_iter()
+        .flatten();
+    let inn = (dir != Dir::Out)
+        .then(|| graph.in_adj(v))
+        .into_iter()
+        .flatten()
+        .filter(move |a: &crate::graph::Adj| !(drop_loop && a.nbr == v));
+
+    out.chain(inn)
+        .filter(move |a| adj_keeps(graph, a, etypes, need_extra))
 }
 
 /// Collapse dense ids to their SET, in first-appearance order, in place.
