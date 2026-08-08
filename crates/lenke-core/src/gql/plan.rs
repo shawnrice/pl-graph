@@ -74,6 +74,15 @@ pub enum ScalarFn {
     /// stream instead.
     EdgeSource,
     EdgeTarget,
+    /// The element's FIRST label in INSERTION order — Gremlin's `label()`.
+    ///
+    /// Deliberately not a mode of `Labels`, because it is a different question:
+    /// `labels(n)` returns EVERY label, SORTED, as a `List`, which is the right
+    /// answer for a language whose elements carry a label SET. Gremlin's `label()`
+    /// is singular and takes the first one added. Both are correct for their own
+    /// language and they differ in value AND type on a multi-label vertex, so
+    /// collapsing them would force one of the two to be wrong.
+    FirstLabel,
     // Graph functions.
     Labels,
     Type,

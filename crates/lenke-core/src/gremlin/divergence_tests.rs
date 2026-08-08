@@ -6273,6 +6273,14 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         // absent-key drop has to happen BEFORE the predicate, and the validity
         // mask has to be cleared afterwards or the arm declines a column with
         // nothing missing).
+        // `label()` for both element kinds, and `bothV()` — which emits BOTH ends
+        // per edge, one input row to two output rows.
+        "g.V().label()",
+        "g.V().label().dedup()",
+        "g.E().label()",
+        "g.E().bothV()",
+        "g.E().bothV().count()",
+        "g.E().bothV().values('n')",
         // `outV()`/`inV()` off an EDGE frontier — a gather to the endpoint,
         // yielding an ELEMENT column so a tail keeps navigating off it.
         "g.E().inV()",
@@ -6609,129 +6617,41 @@ fn values_arm_reachability_probe() {
 /// `values_prefix` already does for `values(k)` — checked EMPIRICALLY, the same
 /// way as `values_arm_reachability_probe`.
 ///
-/// `ID_LABEL_ARM_HIT` is a raw entry counter on those two arms themselves.
+/// `id()` and `label()` migrate for BOTH element kinds, and the arms are gone.
+///
+/// This began as a reachability probe asserting `elem_terminal`'s `[Step::Id]` and
+/// `[Step::Label]` arms still fired, and shrank twice as they were deleted — first
+/// `Id`, then `Label` once `ScalarFn::FirstLabel` gave GQL Gremlin's singular,
+/// insertion-ordered label (distinct from `labels(n)`, which is the sorted SET and
+/// the right answer for a language whose elements carry one). What is left asserts
+/// the migration answers them, which is the invariant worth keeping now that
+/// nothing else can.
 #[test]
-fn id_label_arm_reachability_probe() {
-    let mut lines = String::new();
-    for i in 0..500usize {
-        let l = if i % 10 == 0 {
-            r#"["V","W"]"#
-        } else {
-            r#"["V"]"#
-        };
-        lines.push_str(&format!(
-            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{}}}}}\n",
-            i % 37
-        ));
-    }
-    for i in 0..500usize {
-        lines.push_str(&format!(
-            "{{\"type\":\"edge\",\"id\":\"e{i}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{\"w\":{i}}}}}\n",
-            (i * 31 + 1) % 500
-        ));
-    }
-    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
-
-    let shapes: &[(&str, &str)] = &[
-        ("bare id(), vertex", "g.V().out('R').hasLabel('W').id()"),
-        ("bare id(), edge", "g.E().hasLabel('R').id()"),
-        ("bare label(), edge", "g.E().hasLabel('R').label()"),
-        // `label()` off a VERTEX has no `to_gql` equivalent at all (see
-        // `to_gql::tail`'s own comment) — `id_label_prefix` declines it too,
-        // so it must stay on the old arm every time.
-        (
-            "bare label(), vertex",
-            "g.V().out('R').hasLabel('W').label()",
-        ),
-        ("id().count()", "g.V().out('R').hasLabel('W').id().count()"),
-        ("id().dedup()", "g.V().out('R').hasLabel('W').id().dedup()"),
-        (
-            "label().groupCount(), edge",
-            "g.E().hasLabel('R').label().groupCount()",
-        ),
-        (
-            "dedup() in front of id()",
-            "g.V().out('R').hasLabel('W').dedup().id()",
-        ),
-        (
-            "barrier() in front of id()",
-            "g.V().out('R').hasLabel('W').barrier().id()",
-        ),
-        (
-            "limit() in front of id()",
-            "g.V().out('R').hasLabel('W').limit(2).id()",
-        ),
-        (
-            "tagged path (select) before id()",
-            "g.V().as('x').out('R').select('x').id()",
-        ),
-        (
-            "post-fold (fold().unfold()) before id()",
-            "g.V().out('R').hasLabel('W').fold().unfold().id()",
-        ),
-        ("id().limit()", "g.V().out('R').hasLabel('W').id().limit(5)"),
-        ("id().fold()", "g.V().out('R').hasLabel('W').id().fold()"),
-    ];
-
-    println!();
-    for (label, q) in shapes {
-        super::exec::MIGRATED.with(|c| c.set(0));
-        super::exec::ID_LABEL_ARM_HIT.with(|c| c.set(0));
-
-        let out = super::parse::parse(q)
-            .unwrap_or_else(|e| panic!("`{q}` parses: {e}"))
-            .run(&mut g);
-
-        let migrated = super::exec::MIGRATED.with(std::cell::Cell::get);
-        let old_arm = super::exec::ID_LABEL_ARM_HIT.with(std::cell::Cell::get);
-        let route = if migrated > 0 {
-            "MIGRATED"
-        } else if old_arm > 0 {
-            "OLD_ARM"
-        } else {
-            "NEITHER (third route / stream)"
-        };
-
-        println!(
-            "PROBE migrated={migrated} id_label_arm={old_arm} rows={} route={route} [{label}] {q}",
-            out.len()
-        );
-    }
-
-    // The `[Step::Id]` arm this used to assert under `MIGRATE_OFF` is DELETED.
-    //
-    // It was dead in normal operation and alive only as the reference route the
-    // switch compares against — which is circular: the arm existed for the test,
-    // and the test asserted the arm existed. Keeping production code (and wasm
-    // bytes) to serve a diagnostic is the trade this branch exists to remove, so
-    // the arm went and this assertion went with it. `MIGRATE_OFF` on an `id()`
-    // now falls through to the stream, which is a weaker reference but an honest
-    // one; the agreement test covers `id()` against it either way.
-    //
-    // `[Step::Label]` is a different case and SURVIVES: a VERTEX `label()` never
-    // migrates at all, because GQL's `labels(n)` is every label sorted as a List
-    // while Gremlin's is the first in insertion order. That arm answers real
-    // traffic, not a switch.
-    super::exec::MIGRATE_OFF.with(|c| c.set(true));
+fn id_and_label_migrate_for_both_element_kinds() {
+    let mut g = modern();
 
     for q in [
-        "g.E().hasLabel('R').label()",
-        "g.V().out('R').hasLabel('W').label()",
+        "g.V().id()",
+        "g.E().id()",
+        "g.V().label()",
+        "g.E().label()",
+        "g.V().label().count()",
+        "g.E().id().dedup()",
     ] {
-        super::exec::ID_LABEL_ARM_HIT.with(|c| c.set(0));
+        super::exec::MIGRATED.with(|c| c.set(0));
 
-        let out = super::parse::parse(q)
+        let migrated = super::parse::parse(q)
             .unwrap_or_else(|e| panic!("`{q}` parses: {e}"))
             .run(&mut g);
+        let took = super::exec::MIGRATED.with(std::cell::Cell::get);
 
-        assert!(
-            super::exec::ID_LABEL_ARM_HIT.with(std::cell::Cell::get) > 0,
-            "{q}: the label arm must still answer (rows {})",
-            out.len()
-        );
+        super::exec::MIGRATE_OFF.with(|c| c.set(true));
+        let reference = super::parse::parse(q).expect("parses").run(&mut g);
+        super::exec::MIGRATE_OFF.with(|c| c.set(false));
+
+        assert_eq!(migrated, reference, "{q}");
+        assert!(took >= 1, "{q}: the migration route never fired");
     }
-
-    super::exec::MIGRATE_OFF.with(|c| c.set(false));
 }
 
 /// The headline comparison for the Gremlin migration:

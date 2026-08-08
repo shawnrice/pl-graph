@@ -3475,6 +3475,37 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> Col {
         // An edge's endpoint, as a bulk gather off `e_src`/`e_dst` — the reason
         // this variant exists at all (see `ScalarFn::EdgeSource`). Per-row through
         // the scalar VM it would be no better than the stream it replaces.
+        // The first label, per element — a dictionary read, not a set build. Left
+        // to `gen(e)` it runs the scalar VM per row for a lookup the column
+        // already indexes.
+        CExpr::Scalar { func, args }
+            if matches!(func, ScalarFn::FirstLabel)
+                && args.len() == 1
+                && matches!(args[0], CExpr::Var(_)) =>
+        {
+            let CExpr::Var(slot) = &args[0] else {
+                unreachable!("guarded above")
+            };
+
+            match sc.slot(*slot) {
+                Some((Elem::Node, ids)) => Col::Gen(
+                    ids.iter()
+                        .map(|&v| {
+                            graph
+                                .vertex_labels(v)
+                                .first()
+                                .map_or(Val::Null, |&lid| Val::Str(graph.labels.arc(lid)))
+                        })
+                        .collect(),
+                ),
+                Some((Elem::Edge, ids)) => Col::Gen(
+                    ids.iter()
+                        .map(|&e| Val::Str(graph.etype.arc(graph.e_type[e as usize])))
+                        .collect(),
+                ),
+                None => gen(e),
+            }
+        }
         CExpr::Scalar { func, args }
             if matches!(func, ScalarFn::EdgeSource | ScalarFn::EdgeTarget)
                 && args.len() == 1

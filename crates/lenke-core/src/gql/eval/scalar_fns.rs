@@ -204,6 +204,16 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
         ElementId => a.map_or(Val::Null, |v| Val::element_id(graph, v)),
         // An edge's endpoints, by direct gather. A non-edge yields NULL rather
         // than faulting, matching every other accessor here.
+        // Gremlin's `label()`: the FIRST label in insertion order, not the sorted
+        // set `Labels` returns. An edge has exactly one type, so both agree there.
+        FirstLabel => match a {
+            Some(Val::Node(i)) => graph
+                .vertex_labels(*i)
+                .first()
+                .map_or(Val::Null, |&lid| Val::Str(graph.labels.arc(lid))),
+            Some(Val::Edge(e)) => Val::Str(graph.etype.arc(graph.e_type[*e as usize])),
+            _ => Val::Null,
+        },
         EdgeSource => match a {
             Some(Val::Edge(e)) => Val::Node(graph.e_src[*e as usize]),
             _ => Val::Null,

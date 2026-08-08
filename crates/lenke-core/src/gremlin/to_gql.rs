@@ -57,6 +57,11 @@ pub(super) enum Shape {
     Maps { keys: Vec<String> },
     /// A single row holding a `List` of every value. Gremlin's `fold()`.
     List,
+    /// TWO element columns interleaved per row — `bothV()`, which emits both ends
+    /// of each edge. A projection cannot change the row count, so the shaper does
+    /// the widening: one input row, two output rows, OUT first then IN, the order
+    /// the stream yields them.
+    Interleave,
     /// The projected column is a per-row BOOL selecting rows of the INPUT element
     /// column — `where(…)` / `not(…)`. The shaper returns the surviving elements,
     /// not the bools, so navigation can continue off them.
@@ -343,10 +348,10 @@ pub(super) fn tail(
         // `List`) — not a close match, a different question. So this arm
         // declines whenever `is_edge` is false, and the caller's existing
         // `elem_terminal` arm (`exec.rs`) answers a vertex `label()` instead.
-        [Step::Label] if is_edge => Some(Tail {
+        [Step::Label] => Some(Tail {
             proj: blank(vec![item(
                 CExpr::Scalar {
-                    func: ScalarFn::Type,
+                    func: ScalarFn::FirstLabel,
                     args: vec![CExpr::Var(slot)],
                 },
                 "v",
@@ -431,6 +436,27 @@ pub(super) fn tail(
                 proj,
                 shape: Shape::Rows,
                 absent_key: Some(ks[0].clone()),
+                page: None,
+                filter: None,
+                order_key: None,
+            })
+        }
+        // `bothV()` — both ends per edge. The projection yields the two endpoint
+        // columns; `Shape::Interleave` zips them, since one row in and two out is
+        // a shape no `CProjection` expresses.
+        [Step::BothV] if is_edge => {
+            let end = |f| CExpr::Scalar {
+                func: f,
+                args: vec![CExpr::Var(slot)],
+            };
+
+            Some(Tail {
+                proj: blank(vec![
+                    item(end(crate::gql::plan::ScalarFn::EdgeSource), "out", false),
+                    item(end(crate::gql::plan::ScalarFn::EdgeTarget), "in", false),
+                ]),
+                shape: Shape::Interleave,
+                absent_key: None,
                 page: None,
                 filter: None,
                 order_key: None,

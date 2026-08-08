@@ -441,7 +441,7 @@ fn run_collect(graph: &mut Graph, ctx: &mut Ctx, t: &Traversal) -> Vec<GVal> {
                         // answer — which would let the agreement test's "the route
                         // fired" assertion pass on a case that fell through.
                         if let Some(out) =
-                            shape_projection_vals(graph, c.end_is_edge, &[], &cols, &t)
+                            shape_projection_vals(graph, c.end_is_edge, &[], cols, &t)
                         {
                             #[cfg(test)]
                             MIGRATED.with(|m| m.set(m.get() + 1));
@@ -1596,7 +1596,7 @@ fn col_terminal_tagged(
                 if let Some(cols) =
                     crate::gql::eval::project_ids(graph, ids, *is_edge, &keys, &labels, &t.proj)
                 {
-                    if let Some(out) = shape_projection_vals(graph, *is_edge, ids, &cols, &t) {
+                    if let Some(out) = shape_projection_vals(graph, *is_edge, ids, cols, &t) {
                         #[cfg(test)]
                         MIGRATED.with(|m| m.set(m.get() + 1));
 
@@ -1627,7 +1627,7 @@ fn col_terminal_tagged(
             // followed and stream every other shape (`id().count()`,
             // `label().groupCount()`, …).
             if let Some((prefix, rest)) = values_prefix(tail)
-                .or_else(|| id_label_prefix(tail, *is_edge))
+                .or_else(|| id_label_prefix(tail))
                 .or_else(|| where_not_prefix(tail))
                 .or_else(|| endpoint_prefix(tail, *is_edge))
             {
@@ -1639,7 +1639,7 @@ fn col_terminal_tagged(
                     if let Some(cols) = crate::gql::eval::project_ids(
                         graph, ids, *is_edge, &names, &labels, &t.proj,
                     ) {
-                        if let Some(next) = shape_projection(graph, *is_edge, ids, &cols, &t) {
+                        if let Some(next) = shape_projection(graph, *is_edge, ids, cols, &t) {
                             #[cfg(test)]
                             MIGRATED.with(|m| m.set(m.get() + 1));
 
@@ -1914,7 +1914,7 @@ fn column_paths(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Opt
                 #[cfg(test)]
                 MIGRATED.with(|m| m.set(m.get() + 1));
 
-                return shape_projection_vals(graph, is_edge, ids, &cols, &t);
+                return shape_projection_vals(graph, is_edge, ids, cols, &t);
             }
         }
     }
@@ -2322,7 +2322,9 @@ fn homogeneous_or_absent(graph: &Graph, is_edge: bool, key: &str) -> bool {
 /// answers as a projection and whatever follows keeps navigating.
 fn endpoint_prefix(tail: &[Step], is_edge: bool) -> Option<(Vec<Step>, &[Step])> {
     match tail {
-        [step @ (Step::OutV | Step::InV), rest @ ..] if is_edge && !rest.is_empty() => {
+        [step @ (Step::OutV | Step::InV | Step::BothV), rest @ ..]
+            if is_edge && !rest.is_empty() =>
+        {
             Some((vec![step.clone()], rest))
         }
         _ => None,
@@ -2371,10 +2373,10 @@ fn values_prefix(tail: &[Step]) -> Option<(Vec<Step>, &[Step])> {
 /// answers a different question (every label, sorted, as a `List` — see that
 /// arm's comment), so a vertex `label()` keeps reaching `elem_terminal`'s own
 /// arm instead.
-fn id_label_prefix(tail: &[Step], is_edge: bool) -> Option<(Vec<Step>, &[Step])> {
+fn id_label_prefix(tail: &[Step]) -> Option<(Vec<Step>, &[Step])> {
     match tail {
         [Step::Id, rest @ ..] if !rest.is_empty() => Some((vec![Step::Id], rest)),
-        [Step::Label, rest @ ..] if is_edge && !rest.is_empty() => Some((vec![Step::Label], rest)),
+        [Step::Label, rest @ ..] if !rest.is_empty() => Some((vec![Step::Label], rest)),
         _ => None,
     }
 }
@@ -2391,7 +2393,7 @@ fn shape_projection(
     graph: &Graph,
     is_edge: bool,
     ids: &[u32],
-    cols: &[Col<'_>],
+    cols: Vec<Col<'static>>,
     t: &super::to_gql::Tail,
 ) -> Option<Col<'static>> {
     // `order().by(k)` sorted a key GQL's `ORDER BY` cannot be trusted to
@@ -2405,13 +2407,39 @@ fn shape_projection(
         }
     }
 
-    let col = cols.first()?;
+    // `project('a','b').by(…)…` — one `Map` per row, zipped from N resolved
+    // columns that all share one key vector (the SAME sharing the arm this
+    // replaces uses: `MapVal::with_keys` clones the `Arc`, not the keys).
+    if let super::to_gql::Shape::Maps { keys } = &t.shape {
+        let shared: Arc<Vec<GVal>> = Arc::new(
+            keys.iter()
+                .map(|k| GVal::Str(Arc::from(k.as_str())))
+                .collect(),
+        );
+        let rows = (0..cols.first().map_or(0, Col::len))
+            .map(|i| {
+                GVal::Map(crate::value::MapVal::with_keys(
+                    shared.clone(),
+                    cols.iter().map(|c| as_gremlin_shape(c.val_at(i))).collect(),
+                ))
+            })
+            .collect();
+
+        return Some(Col::Gen(rows));
+    }
+
+    // Owned, and MOVED — not cloned. `col.clone().into_owned()` here bumped an
+    // `Arc` per row for a boxed column: `g.V().label()` measured 0.923ms against
+    // 0.323 for the arm it replaced, and the clone was all of it.
+    let mut it = cols.into_iter();
+    let col = it.next()?;
+    let second = it.next();
 
     // `where(…)`/`not(…)`: the projected column is a per-row bool over the INPUT
     // elements, so the answer is the surviving ELEMENTS — not the bools — or
     // navigation could not continue off them.
     if let super::to_gql::Shape::Retain { negated } = t.shape {
-        let Col::Bool { t: keep, valid } = col else {
+        let Col::Bool { t: keep, valid } = &col else {
             return None;
         };
         // `EXISTS` is TRUE/FALSE per row, never unknown — a mask here would mean
@@ -2440,6 +2468,25 @@ fn shape_projection(
         });
     }
 
+    // `bothV()`: OUT then IN per edge, which is the order the stream yields them.
+    if t.shape == super::to_gql::Shape::Interleave {
+        let (Col::Elems { ids: outs, .. }, Some(Col::Elems { ids: ins, .. })) = (&col, &second)
+        else {
+            return None;
+        };
+        let mut both = Vec::with_capacity(outs.len() * 2);
+
+        for (&o, &i) in outs.iter().zip(ins.iter()) {
+            both.push(o);
+            both.push(i);
+        }
+
+        return Some(Col::Elems {
+            ids: std::borrow::Cow::Owned(both),
+            is_edge: false,
+        });
+    }
+
     if t.shape == super::to_gql::Shape::Scalar {
         // `values(k).count()`: the aggregate already skipped every `Null`
         // argument itself (`AggValue::step`/`eval_aggregate`/`fused_global_agg`
@@ -2454,11 +2501,11 @@ fn shape_projection(
             }
         }
 
-        return Some(col.clone().into_owned());
+        return Some(col);
     }
 
     if t.shape == super::to_gql::Shape::Map {
-        let counts = cols.get(1)?;
+        let counts = second.as_ref()?;
         let entries = (0..col.len())
             .map(|i| (as_gremlin_shape(col.val_at(i)), counts.val_at(i)))
             .collect();
@@ -2466,28 +2513,7 @@ fn shape_projection(
         return Some(Col::Gen(vec![GVal::map(entries)]));
     }
 
-    // `project('a','b').by(…)…` — one `Map` per row, zipped from N resolved
-    // columns that all share one key vector (the SAME sharing the arm this
-    // replaces uses: `MapVal::with_keys` clones the `Arc`, not the keys).
-    if let super::to_gql::Shape::Maps { keys } = &t.shape {
-        let shared: Arc<Vec<GVal>> = Arc::new(
-            keys.iter()
-                .map(|k| GVal::Str(Arc::from(k.as_str())))
-                .collect(),
-        );
-        let rows = (0..col.len())
-            .map(|i| {
-                GVal::Map(crate::value::MapVal::with_keys(
-                    shared.clone(),
-                    cols.iter().map(|c| as_gremlin_shape(c.val_at(i))).collect(),
-                ))
-            })
-            .collect();
-
-        return Some(Col::Gen(rows));
-    }
-
-    let mut out = col.clone().into_owned();
+    let mut out = col;
 
     if let Some(key) = &t.absent_key {
         let store = if is_edge {
@@ -2573,7 +2599,7 @@ fn shape_projection_vals(
     graph: &Graph,
     is_edge: bool,
     ids: &[u32],
-    cols: &[Col<'_>],
+    cols: Vec<Col<'static>>,
     t: &super::to_gql::Tail,
 ) -> Option<Vec<GVal>> {
     shape_projection(graph, is_edge, ids, cols, t).map(Col::into_vals)
@@ -2600,34 +2626,6 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
     // query whose answer is `ids.len()` — and it copied again on every peel, so a
     // `dedup().limit(2).count()` paid for three.
     match rest {
-        [Step::Label] => {
-            #[cfg(test)]
-            ID_LABEL_ARM_HIT.with(|c| c.set(c.get() + 1));
-
-            Some(
-                ids.iter()
-                    .map(|&id| elem_label(graph, &frontier_val(id, is_edge)))
-                    .collect(),
-            )
-        }
-        // Both ends, in the order the stream yields them: out first, then in.
-        [Step::BothV, t @ ..] if is_edge => {
-            let mut ends = Vec::with_capacity(ids.len() * 2);
-
-            for &e in ids {
-                ends.push(graph.e_src[e as usize]);
-                ends.push(graph.e_dst[e as usize]);
-            }
-
-            col_terminal(
-                graph,
-                Col::Elems {
-                    ids: std::borrow::Cow::Owned(ends),
-                    is_edge: false,
-                },
-                t,
-            )
-        }
         // `elementMap()` off the frontier. The note on the step itself records two
         // attempts to make it cheaper by removing allocations, both measured
         // WORSE, and names this as the remaining untried axis: build the maps from
