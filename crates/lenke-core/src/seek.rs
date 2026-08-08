@@ -1649,7 +1649,7 @@ pub fn walk_count(
     let last = etypes.as_deref().unwrap_or(&[]);
 
     if distinct {
-        return distinct_len(&expand(graph, &cur, *dir, last, loops));
+        return distinct_expand_count(graph, &cur, *dir, last, loops);
     }
 
     expand_count(graph, &cur, *dir, last, loops)
@@ -1662,6 +1662,63 @@ fn distinct_len(ids: &[u32]) -> usize {
     let mut seen = crate::fxhash::FxHashSet::default();
 
     ids.iter().filter(|&&id| seen.insert(id)).count()
+}
+
+/// How many DISTINCT neighbours [`expand`] would produce, without producing
+/// them.
+///
+/// The obvious spelling — `distinct_len(&expand(…))` — materializes the whole
+/// last hop before deduplicating it, which over a two-hop on a 1M/8M graph is a
+/// 64M-element `Vec` (256MB) and 64M hash inserts to answer with a single
+/// number. `MATCH (a:Person)-[:KNOWS]->()-[:KNOWS]->(c) RETURN count(DISTINCT c)`
+/// spent 924ms there.
+///
+/// A vertex id is already a dense index, so the set is a BITMAP: one bit per
+/// vertex slot (128KB at 1M vertices — it stays in cache where the `Vec` could
+/// not), the count comes from the transition 0 → 1, and nothing is allocated per
+/// neighbour. This is the same reason `distinct_len` exists rather than a key
+/// projection: element identity IS the index. It just was not taken far enough.
+#[must_use]
+pub fn distinct_expand_count(
+    graph: &Graph,
+    src: &[u32],
+    dir: Dir,
+    etypes: &[u32],
+    loops: SelfLoops,
+) -> usize {
+    let need_extra = graph.etypes_need_extra_lookup(etypes);
+    let keep = |a: &crate::graph::Adj| adj_keeps(graph, a, etypes, need_extra);
+    let drop_loop = dir == Dir::Both && loops == SelfLoops::Once;
+    let slots = graph.vertex_slots();
+    let mut seen = vec![0u64; slots.div_ceil(64)];
+    let mut n = 0;
+    let mut mark = |nbr: u32, n: &mut usize| {
+        let (w, b) = (nbr as usize / 64, 1u64 << (nbr as usize % 64));
+        let word = &mut seen[w];
+        if *word & b == 0 {
+            *word |= b;
+            *n += 1;
+        }
+    };
+
+    for &v in src {
+        if dir != Dir::In {
+            for a in graph.out_adj(v).filter(|a| keep(a)) {
+                mark(a.nbr, &mut n);
+            }
+        }
+
+        if dir != Dir::Out {
+            for a in graph
+                .in_adj(v)
+                .filter(|a| keep(a) && !(drop_loop && a.nbr == v))
+            {
+                mark(a.nbr, &mut n);
+            }
+        }
+    }
+
+    n
 }
 
 /// How many neighbours [`expand`] would produce, without producing them.

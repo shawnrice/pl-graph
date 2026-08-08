@@ -269,3 +269,98 @@ fn an_undirected_expansion_follows_the_self_loop_rule() {
         assert_eq!(expand_count(&g, &a, Dir::In, &[], rule), 1);
     }
 }
+
+/// A graph whose adjacency makes the two DISTINCT-count spellings disagree if
+/// the bitmap is wrong: parallel edges to the same target (the duplicate a
+/// dedup must collapse), a self-loop (which `SelfLoops` treats differently per
+/// direction), and a vertex reachable from two different sources.
+fn distinct_fixture() -> Graph {
+    crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#,
+            r#"{"type":"node","id":"c","labels":["V"],"properties":{}}"#,
+            r#"{"type":"node","id":"d","labels":["V"],"properties":{}}"#,
+            // Two parallel a→b edges: two walks, ONE distinct endpoint.
+            r#"{"type":"edge","id":"p1","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+            r#"{"type":"edge","id":"p2","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+            r#"{"type":"edge","id":"p3","from":"a","to":"c","labels":["R"],"properties":{}}"#,
+            // `c` reaches `b` too, so `b` is reachable two ways.
+            r#"{"type":"edge","id":"p4","from":"c","to":"b","labels":["R"],"properties":{}}"#,
+            r#"{"type":"edge","id":"p5","from":"d","to":"d","labels":["R"],"properties":{}}"#,
+            r#"{"type":"edge","id":"p6","from":"a","to":"d","labels":["S"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes")
+}
+
+/// The bitmap distinct-count must equal deduplicating the materialized
+/// expansion — the spelling it replaced — for every direction and type filter.
+#[test]
+fn a_distinct_expansion_counts_what_deduplicating_it_would() {
+    use super::{Dir, SelfLoops};
+    let g = distinct_fixture();
+    let all: Vec<u32> = g.vertex_indices().collect();
+    let r = g.etype.get("R").expect("R exists");
+    let st = g.etype.get("S").expect("S exists");
+    let repeated: Vec<u32> = vec![all[0], all[0], all[0]];
+    let empty: Vec<u32> = Vec::new();
+
+    for (name, src, dir, etypes, loops) in [
+        (
+            "out R, all sources",
+            &all,
+            Dir::Out,
+            vec![r],
+            SelfLoops::Once,
+        ),
+        ("in R, all sources", &all, Dir::In, vec![r], SelfLoops::Once),
+        // `Both` with `SelfLoops::Once` drops the loop on the IN side, which the
+        // bitmap has to honour the same way the counting form does.
+        (
+            "both R, all sources",
+            &all,
+            Dir::Both,
+            vec![r],
+            SelfLoops::Once,
+        ),
+        ("both R, twice", &all, Dir::Both, vec![r], SelfLoops::Twice),
+        ("out, any type", &all, Dir::Out, vec![], SelfLoops::Once),
+        ("out S only", &all, Dir::Out, vec![st], SelfLoops::Once),
+        // A repeated source: the same neighbour arrives twice and still counts
+        // once.
+        (
+            "repeated source",
+            &repeated,
+            Dir::Out,
+            vec![r],
+            SelfLoops::Once,
+        ),
+        ("empty source", &empty, Dir::Out, vec![r], SelfLoops::Once),
+    ] {
+        let bitmap = super::distinct_expand_count(&g, src, dir, &etypes, loops);
+        let mut materialized = super::expand(&g, src, dir, &etypes, loops);
+        materialized.sort_unstable();
+        materialized.dedup();
+        assert_eq!(bitmap, materialized.len(), "{name}");
+    }
+}
+
+/// Parallel edges are the case a dedup exists for: `a` has two edges to `b` and
+/// one to `c`, so three walks and TWO distinct endpoints.
+#[test]
+fn parallel_edges_are_one_distinct_endpoint() {
+    use super::{Dir, SelfLoops};
+    let g = distinct_fixture();
+    let r = g.etype.get("R").expect("R exists");
+    let a = g.vertex_indices().next().expect("a is the first vertex");
+    assert_eq!(
+        super::expand_count(&g, &[a], Dir::Out, &[r], SelfLoops::Once),
+        3
+    );
+    assert_eq!(
+        super::distinct_expand_count(&g, &[a], Dir::Out, &[r], SelfLoops::Once),
+        2
+    );
+}
