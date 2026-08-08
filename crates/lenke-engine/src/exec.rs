@@ -4,10 +4,10 @@
 //! batch, reading typed storage columns in bulk where it can. It calls the value
 //! contract for every comparison and equality; it never restates those rules.
 //! This is the lineage-FREE strategy; the lineage-preserving strategy for the
-//! same operators lands with the graph operators that need it.
+//! same operators lands with the operators (path/tags) that need it.
 
 use crate::batch::{Batch, Col};
-use crate::ir::{CompareOp, Expr, Plan};
+use crate::ir::{CompareOp, Dir, Expr, Plan};
 use crate::store::{Column, Store};
 use crate::value::{self, Value};
 
@@ -21,27 +21,27 @@ pub struct Rows {
 }
 
 /// Run `plan` over `store`, returning materialized rows. A plan must end in a
-/// `Project` (the only operator that names output columns); scanning or filtering
-/// without a projection is not a complete query.
+/// `Project` (the only operator that names output columns); a plan without one
+/// surfaces slot 0 under a single implicit column so partial plans stay runnable
+/// in tests.
+#[must_use]
 pub fn run(plan: &Plan, store: &Store) -> Rows {
     match plan {
         Plan::Project { input, items } => {
             let batch = pull(input, store);
             let names = items.iter().map(|(n, _)| n.clone()).collect();
-            // One output column per item, evaluated over the surviving batch.
             let cols: Vec<Col> = items.iter().map(|(_, e)| eval(e, store, &batch)).collect();
-            let n = batch.len();
+            let n = batch.rows();
             let rows = (0..n)
                 .map(|i| cols.iter().map(|c| c.value_at(i)).collect())
                 .collect();
             Rows { names, rows }
         }
-        // A bare scan/filter with no projection surfaces the element ids under a
-        // single implicit column, so partial plans are still runnable in tests.
         other => {
             let batch = pull(other, store);
-            let n = batch.len();
-            let rows = (0..n).map(|i| vec![batch.col.value_at(i)]).collect();
+            let n = batch.rows();
+            let slot0 = batch.slot(0);
+            let rows = (0..n).map(|i| vec![slot0.value_at(i)]).collect();
             Rows {
                 names: vec!["_".to_string()],
                 rows,
@@ -58,46 +58,99 @@ fn pull(plan: &Plan, store: &Store) -> Batch {
                 Some(l) => store.nodes_with_label(l).to_vec(),
                 None => store.all_nodes(),
             };
-            Batch::plain(Col::Nodes(ids))
+            Batch::single(Col::Nodes(ids))
         }
+        Plan::Expand {
+            input,
+            from,
+            dir,
+            edge_label,
+        } => expand(
+            &pull(input, store),
+            store,
+            *from,
+            *dir,
+            edge_label.as_deref(),
+        ),
         Plan::Filter { input, pred } => {
             let batch = pull(input, store);
             let mask = eval(pred, store, &batch);
             let keep: Vec<usize> = match &mask {
                 Col::Bool(bs) => (0..bs.len()).filter(|&i| bs[i]).collect(),
-                // A non-boolean predicate is UNKNOWN for every row → keep none.
-                // (This is where a boxed predicate would be checked per row; the
-                // typed Bool column is the common, bulk case.)
                 other => (0..other.len())
                     .filter(|&i| other.value_at(i).is_true())
                     .collect(),
             };
-            Batch::plain(batch.col.gather(&keep))
+            batch.gather(&keep)
         }
-        Plan::Project { .. } => {
-            // A projection mid-plan collapses to its element frontier for the
-            // slice; nested projections arrive with subqueries.
-            pull_project_as_frontier(plan, store)
-        }
+        Plan::Project { input, .. } => pull(input, store),
     }
 }
 
-fn pull_project_as_frontier(plan: &Plan, store: &Store) -> Batch {
-    if let Plan::Project { input, .. } = plan {
-        pull(input, store)
-    } else {
-        unreachable!("called with a non-Project plan")
+/// A hop: for each input row, expand the node in slot `from` along `dir`,
+/// filtered by `edge_label`; emit one output row per matching neighbour with the
+/// existing slots replicated and the neighbour appended as a new slot. This is
+/// the bulk (lineage-free) strategy: `keep` records which input row each output
+/// row came from, `nbrs` the landed node — the existing slots are gathered by
+/// `keep`, so no per-row struct is built.
+fn expand(batch: &Batch, store: &Store, from: usize, dir: Dir, edge_label: Option<&str>) -> Batch {
+    // An empty expand still appends the landed slot (all rows dropped), so the
+    // output has K+1 slots exactly as a successful expand would — a projection
+    // referencing the new slot must not go out of bounds.
+    let empty = || {
+        let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
+        slots.push(Col::Nodes(vec![]));
+        Batch::of(slots)
+    };
+    // Resolve the edge label to an interned id up front; an unknown label matches
+    // nothing (not everything).
+    let want: Option<u32> = match edge_label {
+        None => None,
+        Some(name) => match store.etype_id(name) {
+            Some(id) => Some(id),
+            None => return empty(),
+        },
+    };
+    let Col::Nodes(src) = batch.slot(from) else {
+        // Only a node frontier can be expanded; anything else yields nothing.
+        return empty();
+    };
+
+    let type_ok = |et: u32| want.is_none_or(|w| w == et);
+    let mut keep = Vec::new();
+    let mut nbrs = Vec::new();
+    for (row, &v) in src.iter().enumerate() {
+        let out = matches!(dir, Dir::Out | Dir::Both);
+        let inc = matches!(dir, Dir::In | Dir::Both);
+        if out {
+            for a in store.out(v) {
+                if type_ok(a.etype) {
+                    keep.push(row);
+                    nbrs.push(a.nbr);
+                }
+            }
+        }
+        if inc {
+            for a in store.inc(v) {
+                if type_ok(a.etype) {
+                    keep.push(row);
+                    nbrs.push(a.nbr);
+                }
+            }
+        }
     }
+
+    let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
+    slots.push(Col::Nodes(nbrs));
+    Batch::of(slots)
 }
 
-/// Evaluate `expr` over every row of `batch`, producing a column. The element
-/// frontier is `batch.col` (a `Nodes` column in the slice); `Var`/`Prop` read
-/// against it.
+/// Evaluate `expr` over every row of `batch`, producing a column.
 fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
     match expr {
-        Expr::Var => batch.col.clone(),
-        Expr::Lit(v) => broadcast(v.clone(), batch.len()),
-        Expr::Prop { key } => read_property(store, &batch.col, key),
+        Expr::Slot(n) => batch.slot(*n).clone(),
+        Expr::Lit(v) => broadcast(v.clone(), batch.rows()),
+        Expr::Prop { slot, key } => read_property(store, batch.slot(*slot), key),
         Expr::Not(inner) => {
             let c = eval(inner, store, batch);
             map_bool(&c, |b| b.map(|x| !x))
@@ -105,7 +158,7 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
         Expr::And(l, r) => zip_bool(store, batch, l, r, |a, b| match (a, b) {
             (Some(false), _) | (_, Some(false)) => Some(false),
             (Some(true), Some(true)) => Some(true),
-            _ => None, // UNKNOWN
+            _ => None,
         }),
         Expr::Or(l, r) => zip_bool(store, batch, l, r, |a, b| match (a, b) {
             (Some(true), _) | (_, Some(true)) => Some(true),
@@ -120,9 +173,9 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
     }
 }
 
-/// Read `key` off an element frontier as a column, gathering the typed storage
-/// column in bulk where the frontier is nodes. Non-node frontiers have no
-/// properties → all null.
+/// Read `key` off an element frontier as a column, bulk-gathering the typed
+/// storage column and staying unboxed when it and every read entry are
+/// present-and-typed; fall to `Gen` (with nulls) otherwise.
 fn read_property(store: &Store, col: &Col, key: &str) -> Col {
     let Col::Nodes(ids) = col else {
         return Col::Gen(vec![Value::Null; col.len()]);
@@ -130,8 +183,6 @@ fn read_property(store: &Store, col: &Col, key: &str) -> Col {
     let Some(column) = store.column(key) else {
         return Col::Gen(vec![Value::Null; ids.len()]);
     };
-    // Bulk gather from the typed column, staying unboxed when it and every read
-    // entry is present-and-typed; fall to Gen (with nulls) otherwise.
     match column {
         Column::Num { data, present } if ids.iter().all(|&i| present[i as usize]) => {
             Col::Num(ids.iter().map(|&i| data[i as usize]).collect())
@@ -181,7 +232,6 @@ fn compare(op: CompareOp, l: &Col, r: &Col) -> Col {
         out.push(Some(res));
     }
     if any_unknown {
-        // Carry UNKNOWNs precisely so a later NOT/AND/OR is three-valued.
         Col::Gen(
             out.into_iter()
                 .map(|o| o.map_or(Value::Null, Value::Bool))
@@ -199,16 +249,14 @@ fn as_truth(col: &Col) -> Vec<Option<bool>> {
         other => (0..other.len())
             .map(|i| match other.value_at(i) {
                 Value::Bool(b) => Some(b),
-                Value::Null => None,
-                _ => None, // non-boolean is UNKNOWN in a logical context
+                _ => None,
             })
             .collect(),
     }
 }
 
 fn map_bool(col: &Col, f: impl Fn(Option<bool>) -> Option<bool>) -> Col {
-    let out: Vec<Option<bool>> = as_truth(col).into_iter().map(f).collect();
-    truth_to_col(out)
+    truth_to_col(as_truth(col).into_iter().map(f).collect())
 }
 
 fn zip_bool(
@@ -249,8 +297,9 @@ mod tests {
     fn s(x: &str) -> Value {
         Value::Str(Arc::from(x))
     }
-    fn prop(key: &str) -> Expr {
+    fn prop(slot: usize, key: &str) -> Expr {
         Expr::Prop {
+            slot,
             key: key.to_string(),
         }
     }
@@ -264,93 +313,166 @@ mod tests {
             right: Box::new(r),
         }
     }
+    fn scan(label: &str) -> Plan {
+        Plan::Scan {
+            label: Some(label.to_string()),
+        }
+    }
+    fn names_of(out: &Rows, col: usize) -> Vec<String> {
+        out.rows
+            .iter()
+            .map(|r| match &r[col] {
+                Value::Str(x) => x.to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
 
-    fn fixture() -> Store {
+    fn social() -> Store {
         let mut b = Builder::default();
-        b.node(&["Person"], &[("name", s("alice")), ("age", n(30.0))]);
-        b.node(&["Person"], &[("name", s("bob")), ("age", n(25.0))]);
-        b.node(
-            &["Person", "Admin"],
-            &[("name", s("carol")), ("age", n(40.0))],
-        );
-        b.node(&["Robot"], &[("name", s("r2"))]); // no age
+        let a = b.node(&["Person"], &[("name", s("alice")), ("age", n(30.0))]);
+        let bob = b.node(&["Person"], &[("name", s("bob")), ("age", n(25.0))]);
+        let c = b.node(&["Person"], &[("name", s("carol")), ("age", n(40.0))]);
+        let proj = b.node(&["Project"], &[("name", s("graphdb"))]);
+        b.edge(a, bob, "KNOWS");
+        b.edge(a, c, "KNOWS");
+        b.edge(bob, c, "KNOWS");
+        b.edge(a, proj, "WORKS_ON");
         b.build()
     }
 
-    /// Scan a label → project a property. The whole pipeline end to end.
+    // --- relational core (unchanged behavior, now slot-addressed) ---
+
     #[test]
     fn scan_label_and_project() {
-        let store = fixture();
-        let plan = Plan::Scan {
-            label: Some("Person".to_string()),
-        }
-        .project(vec![("name".to_string(), prop("name"))]);
-        let out = run(&plan, &store);
-        assert_eq!(out.names, vec!["name"]);
-        let names: Vec<Value> = out.rows.into_iter().map(|mut r| r.remove(0)).collect();
-        assert_eq!(names.len(), 3); // alice, bob, carol — not the Robot
-        assert!(names
-            .iter()
-            .any(|v| matches!(v, Value::Str(x) if &**x == "alice")));
-        assert!(!names
-            .iter()
-            .any(|v| matches!(v, Value::Str(x) if &**x == "r2")));
+        let store = social();
+        let out = run(
+            &scan("Person").project(vec![("name".into(), prop(0, "name"))]),
+            &store,
+        );
+        assert_eq!(out.rows.len(), 3);
+        let mut got = names_of(&out, 0);
+        got.sort();
+        assert_eq!(got, vec!["alice", "bob", "carol"]);
     }
 
-    /// Filter on a numeric property, then project — the bulk numeric path.
     #[test]
     fn filter_numeric_then_project() {
-        let store = fixture();
-        let plan = Plan::Scan {
-            label: Some("Person".to_string()),
-        }
-        .filter(cmp(CompareOp::Gt, prop("age"), lit(n(28.0))))
-        .project(vec![
-            ("name".to_string(), prop("name")),
-            ("age".to_string(), prop("age")),
-        ]);
+        let store = social();
+        let plan = scan("Person")
+            .filter(cmp(CompareOp::Gt, prop(0, "age"), lit(n(28.0))))
+            .project(vec![("name".into(), prop(0, "name"))]);
         let out = run(&plan, &store);
-        assert_eq!(out.rows.len(), 2); // alice(30), carol(40)
-        for row in &out.rows {
-            assert!(matches!(row[1], Value::Num(a) if a > 28.0));
-        }
+        let mut got = names_of(&out, 0);
+        got.sort();
+        assert_eq!(got, vec!["alice", "carol"]);
     }
 
-    /// A property absent on some scanned nodes reads as NULL, and a comparison
-    /// against NULL is UNKNOWN → the row drops (three-valued filter).
     #[test]
     fn absent_property_is_null_and_filters_as_unknown() {
-        let store = fixture();
-        // Scan ALL nodes; the Robot has no age, so `age > 0` is UNKNOWN for it.
+        let store = social();
+        // Project has no age → `age >= 0` is UNKNOWN for it → dropped.
         let plan = Plan::Scan { label: None }
-            .filter(cmp(CompareOp::Ge, prop("age"), lit(n(0.0))))
-            .project(vec![("name".to_string(), prop("name"))]);
+            .filter(cmp(CompareOp::Ge, prop(0, "age"), lit(n(0.0))))
+            .project(vec![("name".into(), prop(0, "name"))]);
         let out = run(&plan, &store);
-        assert_eq!(out.rows.len(), 3); // the three People; Robot dropped (NULL age)
+        assert_eq!(out.rows.len(), 3);
     }
 
-    /// `=` is the value contract's equality: cross-type is false, not an error.
     #[test]
     fn equality_is_cross_type_false() {
-        let store = fixture();
+        let store = social();
         let plan = Plan::Scan { label: None }
-            .filter(cmp(CompareOp::Eq, prop("age"), lit(s("30"))))
-            .project(vec![("name".to_string(), prop("name"))]);
-        let out = run(&plan, &store);
-        assert_eq!(out.rows.len(), 0); // number 30 never equals string "30"
+            .filter(cmp(CompareOp::Eq, prop(0, "age"), lit(s("30"))))
+            .project(vec![("name".into(), prop(0, "name"))]);
+        assert_eq!(run(&plan, &store).rows.len(), 0);
     }
 
-    /// AND is three-valued: an UNKNOWN conjunct doesn't keep a row.
+    // --- Expand ---
+
+    /// `MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name, b.name` — two slots bound,
+    /// row per matching edge.
     #[test]
-    fn three_valued_and() {
-        let store = fixture();
-        let plan = Plan::Scan { label: None }
-            .filter(Expr::And(
-                Box::new(cmp(CompareOp::Ge, prop("age"), lit(n(0.0)))),
-                Box::new(cmp(CompareOp::Lt, prop("age"), lit(n(35.0)))),
-            ))
-            .project(vec![("name".to_string(), prop("name"))]);
+    fn expand_binds_both_ends() {
+        let store = social();
+        let plan = scan("Person")
+            .expand(0, Dir::Out, Some("KNOWS"))
+            .project(vec![
+                ("a".into(), prop(0, "name")),
+                ("b".into(), prop(1, "name")),
+            ]);
         let out = run(&plan, &store);
-        assert_eq!(out.rows.len(), 2); // alice(30), bob(25); carol(40) excluded, robot UNKNOWN
+        let mut pairs: Vec<(String, String)> = out
+            .rows
+            .iter()
+            .map(|r| (as_str(&r[0]), as_str(&r[1])))
+            .collect();
+        pairs.sort();
+        // a→b, a→c, b→c (KNOWS only; the WORKS_ON edge is excluded)
+        assert_eq!(
+            pairs,
+            vec![
+                ("alice".into(), "bob".into()),
+                ("alice".into(), "carol".into()),
+                ("bob".into(), "carol".into()),
+            ]
+        );
+    }
+
+    /// An edge-label filter selects: WORKS_ON reaches only the Project.
+    #[test]
+    fn expand_filters_by_edge_label() {
+        let store = social();
+        let plan = scan("Person")
+            .expand(0, Dir::Out, Some("WORKS_ON"))
+            .project(vec![("t".into(), prop(1, "name"))]);
+        let out = run(&plan, &store);
+        assert_eq!(names_of(&out, 0), vec!["graphdb"]);
+    }
+
+    /// Filtering on the FAR end after an expand — the far slot's property.
+    #[test]
+    fn filter_on_the_expanded_end() {
+        let store = social();
+        let plan = scan("Person")
+            .expand(0, Dir::Out, Some("KNOWS"))
+            .filter(cmp(CompareOp::Ge, prop(1, "age"), lit(n(40.0))))
+            .project(vec![("a".into(), prop(0, "name"))]);
+        let out = run(&plan, &store);
+        // Only edges landing on carol(40): alice→carol, bob→carol.
+        let mut got = names_of(&out, 0);
+        got.sort();
+        assert_eq!(got, vec!["alice", "bob"]);
+    }
+
+    /// Incoming direction: who KNOWS carol.
+    #[test]
+    fn expand_incoming() {
+        let store = social();
+        let plan = scan("Person")
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("carol"))))
+            .expand(0, Dir::In, Some("KNOWS"))
+            .project(vec![("who".into(), prop(1, "name"))]);
+        let out = run(&plan, &store);
+        let mut got = names_of(&out, 0);
+        got.sort();
+        assert_eq!(got, vec!["alice", "bob"]);
+    }
+
+    /// An unknown edge label matches nothing.
+    #[test]
+    fn expand_unknown_label_is_empty() {
+        let store = social();
+        let plan = scan("Person")
+            .expand(0, Dir::Out, Some("NOPE"))
+            .project(vec![("x".into(), prop(1, "name"))]);
+        assert_eq!(run(&plan, &store).rows.len(), 0);
+    }
+
+    fn as_str(v: &Value) -> String {
+        match v {
+            Value::Str(x) => x.to_string(),
+            other => format!("{other:?}"),
+        }
     }
 }

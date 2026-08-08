@@ -86,27 +86,59 @@ pub struct Lineage {
     // tags and sack join here as their operators land.
 }
 
-/// One batch flowing between operators.
+/// One batch flowing between operators. A batch is a set of row-aligned SLOT
+/// columns — row `i` is the tuple `(slots[0][i], slots[1][i], …)`. Scan binds
+/// slot 0; each Expand appends a slot for the node it lands on; a multi-variable
+/// pattern like `(a)-[:R]->(b)` is two slots. This is the uniform binding the IR
+/// relies on — a GQL variable and a Gremlin `as()` label are both "slot N".
 #[derive(Clone, Debug)]
 pub struct Batch {
-    pub col: Col,
+    pub slots: Vec<Col>,
     pub lineage: Option<Lineage>,
 }
 
 impl Batch {
-    /// A lineage-free batch — the first slice's only constructor.
+    /// A one-slot, lineage-free batch (the output of a Scan).
     #[must_use]
-    pub fn plain(col: Col) -> Self {
-        Self { col, lineage: None }
+    pub fn single(col: Col) -> Self {
+        Self {
+            slots: vec![col],
+            lineage: None,
+        }
     }
 
+    /// A lineage-free batch of several slots.
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.col.len()
+    pub fn of(slots: Vec<Col>) -> Self {
+        Self {
+            slots,
+            lineage: None,
+        }
+    }
+
+    /// Row count (every slot has the same length).
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.slots.first().map_or(0, Col::len)
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.col.is_empty()
+        self.rows() == 0
+    }
+
+    #[must_use]
+    pub fn slot(&self, i: usize) -> &Col {
+        &self.slots[i]
+    }
+
+    /// Gather every slot by the same row indices — the primitive Filter and
+    /// Expand use to keep/replicate rows while staying row-aligned.
+    #[must_use]
+    pub fn gather(&self, idx: &[usize]) -> Self {
+        Self {
+            slots: self.slots.iter().map(|c| c.gather(idx)).collect(),
+            lineage: self.lineage.clone(),
+        }
     }
 }

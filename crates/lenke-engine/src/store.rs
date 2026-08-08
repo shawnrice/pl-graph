@@ -55,8 +55,17 @@ impl Column {
     }
 }
 
+/// One adjacency entry: the neighbour node and the edge's interned type id.
+#[derive(Clone, Copy, Debug)]
+pub struct Adj {
+    pub nbr: u32,
+    pub etype: u32,
+}
+
 /// The graph. Nodes are dense ids `0..node_count`. Labels and properties are
 /// looked up by name; a label bucket (`by_label`) is the seed for a scan.
+/// Adjacency is per-node out/in lists (a simple layout for now; a CSR pack is a
+/// later optimization that changes nothing above this module).
 #[derive(Default)]
 pub struct Store {
     node_count: usize,
@@ -64,12 +73,36 @@ pub struct Store {
     by_label: HashMap<String, Vec<u32>>,
     /// property name -> its typed column (length == node_count).
     props: HashMap<String, Column>,
+    /// edge-type name -> interned id, and the reverse.
+    etype_ids: HashMap<String, u32>,
+    /// per-node outgoing / incoming adjacency, indexed by node id.
+    out_adj: Vec<Vec<Adj>>,
+    in_adj: Vec<Vec<Adj>>,
 }
 
 impl Store {
     #[must_use]
     pub fn node_count(&self) -> usize {
         self.node_count
+    }
+
+    /// The interned id for an edge-type name, or `None` if no edge ever used it
+    /// (so a hop on it matches nothing).
+    #[must_use]
+    pub fn etype_id(&self, name: &str) -> Option<u32> {
+        self.etype_ids.get(name).copied()
+    }
+
+    /// A node's outgoing adjacency.
+    #[must_use]
+    pub fn out(&self, node: u32) -> &[Adj] {
+        self.out_adj.get(node as usize).map_or(&[], Vec::as_slice)
+    }
+
+    /// A node's incoming adjacency.
+    #[must_use]
+    pub fn inc(&self, node: u32) -> &[Adj] {
+        self.in_adj.get(node as usize).map_or(&[], Vec::as_slice)
     }
 
     /// Every node id — the scan universe when no label narrows it.
@@ -110,6 +143,8 @@ pub struct Builder {
     // Collected as (node, value) pairs per key, materialized into typed columns
     // at `build()` — so the builder stays simple and the store stays typed.
     props: HashMap<String, Vec<(u32, Value)>>,
+    etype_ids: HashMap<String, u32>,
+    edges: Vec<(u32, u32, u32)>, // (from, to, etype)
 }
 
 impl Builder {
@@ -129,6 +164,13 @@ impl Builder {
         id
     }
 
+    /// Add a directed edge `from -[label]-> to`.
+    pub fn edge(&mut self, from: u32, to: u32, label: &str) {
+        let next = self.etype_ids.len() as u32;
+        let etype = *self.etype_ids.entry(label.to_string()).or_insert(next);
+        self.edges.push((from, to, etype));
+    }
+
     #[must_use]
     pub fn build(self) -> Store {
         let n = self.node_count;
@@ -137,10 +179,19 @@ impl Builder {
             .into_iter()
             .map(|(k, pairs)| (k, materialize(pairs, n)))
             .collect();
+        let mut out_adj = vec![Vec::new(); n];
+        let mut in_adj = vec![Vec::new(); n];
+        for (from, to, etype) in self.edges {
+            out_adj[from as usize].push(Adj { nbr: to, etype });
+            in_adj[to as usize].push(Adj { nbr: from, etype });
+        }
         Store {
             node_count: n,
             by_label: self.by_label,
             props,
+            etype_ids: self.etype_ids,
+            out_adj,
+            in_adj,
         }
     }
 }
