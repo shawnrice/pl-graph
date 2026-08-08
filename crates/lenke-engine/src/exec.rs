@@ -22,38 +22,22 @@ pub struct Rows {
     pub rows: Vec<Vec<Value>>,
 }
 
-/// Run `plan` over `store`, returning materialized rows. A plan must end in a
-/// `Project` (the only operator that names output columns); a plan without one
-/// surfaces slot 0 under a single implicit column so partial plans stay runnable
-/// in tests.
+/// Run `plan` over `store`, returning materialized rows. Output column names come
+/// from the outermost naming operator (`Project` or `Aggregate`, seen through
+/// `Distinct`/`OrderPage`); a plan with none surfaces slot 0 under a single
+/// implicit column so partial plans stay runnable in tests.
 #[must_use]
 pub fn run(plan: &Plan, store: &Store) -> Rows {
-    match plan {
-        Plan::Project { input, items } => {
-            let batch = pull(input, store);
-            let names = items.iter().map(|(n, _)| n.clone()).collect();
-            let cols: Vec<Col> = items.iter().map(|(_, e)| eval(e, store, &batch)).collect();
-            let n = batch.rows();
-            let rows = (0..n)
-                .map(|i| cols.iter().map(|c| c.value_at(i)).collect())
-                .collect();
-            Rows { names, rows }
-        }
-        // Aggregate names its own output columns (keys then aggregates), so it is
-        // a valid terminal without a Project on top.
-        Plan::Aggregate { keys, aggs, .. } => {
-            let batch = pull(plan, store);
-            let mut names: Vec<String> = keys.iter().map(|(n, _)| n.clone()).collect();
-            names.extend(aggs.iter().map(|a| a.name.clone()));
-            let n = batch.rows();
+    let batch = pull(plan, store);
+    let n = batch.rows();
+    match output_names(plan) {
+        Some(names) => {
             let rows = (0..n)
                 .map(|i| batch.slots.iter().map(|c| c.value_at(i)).collect())
                 .collect();
             Rows { names, rows }
         }
-        other => {
-            let batch = pull(other, store);
-            let n = batch.rows();
+        None => {
             let slot0 = batch.slot(0);
             let rows = (0..n).map(|i| vec![slot0.value_at(i)]).collect();
             Rows {
@@ -61,6 +45,22 @@ pub fn run(plan: &Plan, store: &Store) -> Rows {
                 rows,
             }
         }
+    }
+}
+
+/// The output column names a plan produces, seen through row-shape-preserving
+/// operators (`Distinct`, `OrderPage`) down to the naming one. `None` means no
+/// explicit projection — the row is the raw slot-0 frontier.
+fn output_names(plan: &Plan) -> Option<Vec<String>> {
+    match plan {
+        Plan::Project { items, .. } => Some(items.iter().map(|(n, _)| n.clone()).collect()),
+        Plan::Aggregate { keys, aggs, .. } => {
+            let mut names: Vec<String> = keys.iter().map(|(n, _)| n.clone()).collect();
+            names.extend(aggs.iter().map(|a| a.name.clone()));
+            Some(names)
+        }
+        Plan::Distinct { input } | Plan::OrderPage { input, .. } => output_names(input),
+        _ => None,
     }
 }
 
@@ -104,7 +104,32 @@ fn pull(plan: &Plan, store: &Store) -> Batch {
             skip,
             limit,
         } => order_page(&pull(input, store), store, keys, *skip, *limit),
-        Plan::Project { input, .. } => pull(input, store),
+        Plan::Project { input, items } => {
+            // Project produces a batch whose slots ARE the projected columns, so
+            // an operator above it (Distinct, OrderPage) works on the output
+            // values, not the pre-projection bindings.
+            let batch = pull(input, store);
+            let cols = items.iter().map(|(_, e)| eval(e, store, &batch)).collect();
+            Batch::of(cols)
+        }
+        Plan::Distinct { input } => {
+            let batch = pull(input, store);
+            let n = batch.rows();
+            let mut seen = std::collections::HashSet::new();
+            let keep: Vec<usize> = (0..n)
+                .filter(|&i| {
+                    // Key the whole row across every slot, via the grouping
+                    // notion (NaN/-0 collapse) — never predicate equality.
+                    let mut k = String::new();
+                    for c in &batch.slots {
+                        k.push_str(&value::group_key(&c.value_at(i)));
+                        k.push('\u{1}');
+                    }
+                    seen.insert(k)
+                })
+                .collect();
+            batch.gather(&keep)
+        }
     }
 }
 
@@ -896,5 +921,73 @@ mod tests {
         let out = run(&plan, &store);
         // nyc: c(50) before a(30); then sf: b(40)
         assert_eq!(names_of(&out, 0), vec!["c", "a", "b"]);
+    }
+
+    // --- Distinct ---
+
+    /// `RETURN DISTINCT city` over nyc/sf/nyc -> two rows, first-seen order.
+    #[test]
+    fn distinct_dedups_projected_column() {
+        let mut b = Builder::default();
+        b.node(&["P"], &[("city", s("nyc"))]);
+        b.node(&["P"], &[("city", s("sf"))]);
+        b.node(&["P"], &[("city", s("nyc"))]);
+        let store = b.build();
+        let plan = scan("P")
+            .project(vec![("city".into(), prop(0, "city"))])
+            .distinct();
+        let out = run(&plan, &store);
+        assert_eq!(names_of(&out, 0), vec!["nyc", "sf"]);
+    }
+
+    /// DISTINCT is over the WHOLE projected row: (city, tier) tuples dedup, so a
+    /// repeated city with a different tier is NOT collapsed.
+    #[test]
+    fn distinct_is_over_the_whole_row() {
+        let mut b = Builder::default();
+        b.node(&["P"], &[("city", s("nyc")), ("tier", n(1.0))]);
+        b.node(&["P"], &[("city", s("nyc")), ("tier", n(2.0))]);
+        b.node(&["P"], &[("city", s("nyc")), ("tier", n(1.0))]); // dup of row 0
+        let store = b.build();
+        let plan = scan("P")
+            .project(vec![
+                ("city".into(), prop(0, "city")),
+                ("tier".into(), prop(0, "tier")),
+            ])
+            .distinct();
+        let out = run(&plan, &store);
+        assert_eq!(out.rows.len(), 2);
+        assert_eq!(num(&out.rows[0][1]), 1.0);
+        assert_eq!(num(&out.rows[1][1]), 2.0);
+    }
+
+    /// DISTINCT uses the grouping notion, not predicate equality: two NaNs
+    /// collapse to one row.
+    #[test]
+    fn distinct_collapses_nans() {
+        let mut b = Builder::default();
+        b.node(&["P"], &[("v", n(f64::NAN))]);
+        b.node(&["P"], &[("v", n(f64::NAN))]);
+        b.node(&["P"], &[("v", n(1.0))]);
+        let store = b.build();
+        let plan = scan("P")
+            .project(vec![("v".into(), prop(0, "v"))])
+            .distinct();
+        let out = run(&plan, &store);
+        assert_eq!(out.rows.len(), 2); // one NaN row + one 1.0 row
+    }
+
+    /// DISTINCT after Expand: the set of nodes reached by KNOWS from anyone.
+    #[test]
+    fn distinct_reached_set() {
+        let store = social();
+        let plan = scan("Person")
+            .expand(0, Dir::Out, Some("KNOWS"))
+            .project(vec![("who".into(), prop(1, "name"))])
+            .distinct();
+        let out = run(&plan, &store);
+        let mut got = names_of(&out, 0);
+        got.sort();
+        assert_eq!(got, vec!["bob", "carol"]);
     }
 }

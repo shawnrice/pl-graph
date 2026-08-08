@@ -124,6 +124,11 @@ pub enum Plan {
         input: Box<Plan>,
         items: Vec<(String, Expr)>,
     },
+    /// Deduplicate whole rows across every slot, keeping the first occurrence
+    /// (first-seen order). Rows are keyed by the value contract's `group_key`, so
+    /// two NaNs / two -0.0s collapse — the grouping notion, not predicate
+    /// equality. Placed above a Project, it is `RETURN DISTINCT …`.
+    Distinct { input: Box<Plan> },
 }
 
 impl Plan {
@@ -169,6 +174,13 @@ impl Plan {
         Self::Project {
             input: Box::new(self),
             items,
+        }
+    }
+
+    #[must_use]
+    pub fn distinct(self) -> Self {
+        Self::Distinct {
+            input: Box::new(self),
         }
     }
 }
