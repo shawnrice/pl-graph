@@ -16,6 +16,7 @@
 pub mod batch;
 pub mod exec;
 pub mod gql;
+pub mod gremlin;
 pub mod ir;
 pub mod store;
 pub mod value;
