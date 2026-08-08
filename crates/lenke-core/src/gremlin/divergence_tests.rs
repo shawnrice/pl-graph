@@ -5554,6 +5554,181 @@ fn branch_lowering_cost_probe() {
 ///
 /// Add a row when adding an arm. A row near 1.0x means the arm is not paying for
 /// itself and should come out.
+/// What does a DECLINE cost? The arms the migration shadows only run when it
+/// declines — a heterogeneously-typed key, which `homogeneous_or_absent` gates
+/// on. If the arm's advantage over the TOTAL stream were small on that path,
+/// the arm would be a deletable middle layer between the fast route and the
+/// stream. It is not: with `n` a string on 1 row in 97,
+///
+///     groupCount().by('n')   declines   arm 0.555ms   stream 2.585ms   4.65x
+///
+/// and the shapes that still migrate under heterogeneity (`values`, `project`,
+/// `id`) show the same 1.6-9.4x spread against the stream. A decline is narrow
+/// but not exotic — mixed property types are ordinary in a schemaless graph —
+/// so the arms stay.
+#[test]
+#[ignore = "probe"]
+fn decline_cost_audit() {
+    let mut lines = String::new();
+    for i in 0..20_000usize {
+        let l = if i % 10 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+        let n = if i % 97 == 0 {
+            format!("\"s{i}\"")
+        } else {
+            format!("{}", i % 97)
+        };
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{n},\"k\":\"key{i:06}\"}}}}\n"
+        ));
+    }
+    let mut e = 0;
+    for i in 0..20_000usize {
+        for d in 0..3usize {
+            lines.push_str(&format!(
+                "{{\"type\":\"edge\",\"id\":\"e{e}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{\"w\":{d}}}}}\n",
+                (i * 31 + d * 7 + 1) % 20_000
+            ));
+            e += 1;
+        }
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+    for q in [
+        "g.V().out('R').hasLabel('W').values('n')",
+        "g.V().out('R').hasLabel('W').values('n').count()",
+        "g.V().out('R').hasLabel('W').values('n').dedup()",
+        "g.V().out('R').hasLabel('W').groupCount().by('n')",
+        "g.V().out('R').hasLabel('W').project('n','k').by('n').by('k')",
+        "g.V().out('R').hasLabel('W').id()",
+        "g.V().outE('R').label()",
+    ] {
+        super::exec::MIGRATED.with(|c| c.set(0));
+        let (mut arm, mut stream) = (f64::MAX, f64::MAX);
+        let mut took = 0;
+        for _ in 0..5 {
+            let p = super::parse::parse(q).expect("parses");
+            let t = std::time::Instant::now();
+            let a = p.run(&mut g);
+            arm = arm.min(t.elapsed().as_secs_f64() * 1000.0);
+            took = super::exec::MIGRATED.with(std::cell::Cell::get);
+            super::exec::LOWERING_OFF.with(|c| c.set(true));
+            let p2 = super::parse::parse(q).expect("parses");
+            let t2 = std::time::Instant::now();
+            let b = p2.run(&mut g);
+            stream = stream.min(t2.elapsed().as_secs_f64() * 1000.0);
+            super::exec::LOWERING_OFF.with(|c| c.set(false));
+            // The stream enumerates in a different ORDER by design
+            // (`the_pattern_route_reorders_rows`), so compare counts.
+            assert_eq!(a.len(), b.len(), "{q}");
+        }
+        println!(
+            "DECLINE took={took} arm/mig {arm:>8.3}ms  stream {stream:>8.3}ms  {:.2}x  {q}",
+            stream / arm
+        );
+    }
+}
+
+/// Which column arms are SHADOWED by the migration, and which answer shapes it
+/// cannot reach? 13 of the 31 migrate; the other 18 sort into one principle:
+///
+/// **When the answer IS the frontier — the bare elements, a count of them,
+/// paging, `fold()`, an identity `groupCount()` — the arm reads it directly and
+/// GQL's `Ctx`/`ScanCols`/`eval_vec` setup is pure overhead.** Every shape the
+/// migration wins on (2-9x, `migration_arm_price_audit`) reads PROPERTIES,
+/// where the vectorized column path amortizes that setup.
+///
+/// That is why `order().by(k)` regressed when it was migrated
+/// (`order_by_key_declines_the_migration_on_purpose`) — it is a frontier
+/// answer wearing a property read. The remaining 18 are the migration's
+/// natural boundary, not a backlog. The five control-flow arms (`union`,
+/// `local`, `coalesce`, `optional`, `choose`) are a separate matter: they are
+/// branch steps, not projections.
+#[test]
+#[ignore = "probe"]
+fn arm_shadow_audit() {
+    let mut lines = String::new();
+    for i in 0..20_000usize {
+        let l = if i % 10 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{},\"k\":\"key{i:06}\"}}}}\n",
+            i % 97
+        ));
+    }
+    let mut e = 0;
+    for i in 0..20_000usize {
+        for d in 0..3usize {
+            lines.push_str(&format!(
+                "{{\"type\":\"edge\",\"id\":\"e{e}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{\"w\":{d}}}}}\n",
+                (i * 31 + d * 7 + 1) % 20_000
+            ));
+            e += 1;
+        }
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+    let cases: &[(&str, &str)] = &[
+        ("[] bare frontier", "g.V().hasLabel('V')"),
+        ("Fold", "g.V().fold()"),
+        ("Count(Global)", "g.V().hasLabel('V').count()"),
+        ("Count(Local)", "g.V().hasLabel('V').count(local)"),
+        ("GroupCount identity", "g.V().groupCount()"),
+        ("Barrier/Identity", "g.V().identity().count()"),
+        ("As unread", "g.V().as('x').count()"),
+        ("As + select", "g.V().as('x').select('x')"),
+        ("Unfold", "g.V().values('n').unfold().count()"),
+        ("Limit", "g.V().limit(5)"),
+        ("Skip", "g.V().skip(5).count()"),
+        ("Range", "g.V().range(2, 7)"),
+        ("Tail", "g.V().tail(5)"),
+        ("Id", "g.V().id()"),
+        ("Label", "g.V().label()"),
+        (
+            "Group by+reduce",
+            "g.V().group().by('n').by(values('n').sum())",
+        ),
+        ("Project", "g.V().project('a', 'b').by('n').by('k')"),
+        ("OutV/InV", "g.E().inV()"),
+        ("BothV", "g.E().bothV()"),
+        ("ElementMap", "g.V().elementMap()"),
+        ("Values", "g.V().values('n')"),
+        ("GroupCount by key", "g.V().groupCount().by('n')"),
+        ("Union", "g.V().union(out('R'), values('n'))"),
+        ("Local", "g.V().local(out('R'))"),
+        ("Coalesce", "g.V().coalesce(out('R'), values('n'))"),
+        ("Optional", "g.V().optional(out('R'))"),
+        (
+            "Choose",
+            "g.V().choose(hasLabel('W'), out('R'), values('n'))",
+        ),
+        ("Where", "g.V().where(__.out('R')).count()"),
+        ("Not", "g.V().not(__.out('R')).count()"),
+        ("Dedupe", "g.V().values('n').dedup()"),
+        ("Order", "g.V().order().by('n').limit(10)"),
+    ];
+    let (mut shadowed, mut only) = (0, 0);
+    for (name, q) in cases {
+        super::exec::MIGRATED.with(|c| c.set(0));
+        let Ok(p) = super::parse::parse(q) else {
+            continue;
+        };
+        let _ = p.run(&mut g);
+        let took = super::exec::MIGRATED.with(std::cell::Cell::get);
+        if took >= 1 {
+            shadowed += 1;
+        } else {
+            only += 1;
+            println!("ARMONLY {name:<28} {q}");
+        }
+    }
+    println!("SHADOW shadowed={shadowed} arm_only={only}");
+}
+
 #[test]
 #[ignore = "probe"]
 fn arm_audit() {
@@ -6192,13 +6367,13 @@ fn what_the_unvectorized_expressions_cost() {
 ///
 /// `migrated` asserts the route actually FIRED. Without it every row passes on an
 /// arm that silently declined, which has happened twice on this branch.
-/// Probe: price EVERY migrated arm against the route it replaced. A migration
+/// Price EVERY migrated arm against the route it replaced. A migration
 /// that is SLOWER than the arm it shadows is pure loss — the arm has to stay
 /// anyway, so the translation is lines and latency for nothing. Found
 /// `order().by(k)` at 2.7x that way.
 #[test]
 #[ignore = "probe"]
-fn zzz_migration_arm_price() {
+fn migration_arm_price_audit() {
     let mut lines = String::new();
     for i in 0..20_000usize {
         let l = if i % 10 == 0 {

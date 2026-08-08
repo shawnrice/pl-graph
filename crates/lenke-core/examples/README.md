@@ -78,6 +78,18 @@ cargo test --release <name> -- --ignored --nocapture
 | `bench_var_length_matcher`              | The whole var-length matcher surface.                                                                                                    |
 | `cross_language_cost_probe`             | The same QUESTION in GQL and in Gremlin, priced side by side — where does one engine have a shortcut the other lacks?                    |
 | `branch_lowering_cost_probe`            | A Gremlin branch step lowered vs the STREAM it replaces — the same engine A/B'd against itself via `fold().unfold()`.                    |
+| `arm_audit`                             | Does every Gremlin column arm pay for itself? Prices all 31 against the stream. A row near 1.0x is an arm that should come out.          |
+| `migration_arm_price_audit`             | Is a shape that migrated to the GQL IR actually FASTER than the arm it now shadows? Everything here should be well under 1.0x.           |
+| `arm_shadow_audit`                      | Which arms does the migration already cover, and which shapes can it not reach? Prints the arm-only list.                                |
+| `decline_cost_audit`                    | When the migration DECLINES, what does falling back cost? Decides whether a shadowed arm is a deletable middle layer.                    |
+
+The last four are one question asked from four sides — **is this layer earning
+its lines?** — and they answer it in an order worth keeping. `arm_audit` asks
+whether an arm beats the stream, `migration_arm_price_audit` whether the IR
+route beats the arm, `arm_shadow_audit` which arms the IR reaches at all, and
+`decline_cost_audit` what the fallback costs when it declines. An arm is only
+deletable if the last three agree, which so far has happened exactly once
+(`order().by(k)`, taken back out at 2.7x).
 
 `cross_language_cost_probe` is the odd one out: the other rows price ONE engine
 against the machine, and it prices the two engines against each other. That is a
