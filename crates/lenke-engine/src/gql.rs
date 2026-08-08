@@ -69,6 +69,8 @@ enum Tok {
     RParen,
     LBracket,
     RBracket,
+    LBrace,
+    RBrace,
     Colon,
     Dot,
     Comma,
@@ -102,6 +104,8 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             ')' => out.push(Tok::RParen),
             '[' => out.push(Tok::LBracket),
             ']' => out.push(Tok::RBracket),
+            '{' => out.push(Tok::LBrace),
+            '}' => out.push(Tok::RBrace),
             ':' => out.push(Tok::Colon),
             '.' => out.push(Tok::Dot),
             ',' => out.push(Tok::Comma),
@@ -235,22 +239,33 @@ impl Parser {
         }
     }
 
-    fn bind(&mut self, var: Option<String>) -> usize {
-        let slot = self.slots;
-        self.slots += 1;
-        if let Some(v) = var {
-            self.scope.insert(v, slot);
-        }
-        slot
-    }
-
     // query := MATCH pattern [WHERE expr]
     //          RETURN [DISTINCT] items [ORDER BY keys] [SKIP n] [LIMIT n]
     fn query(&mut self) -> Result<Plan, String> {
         if !self.eat_kw("MATCH") {
             return Err("expected MATCH".into());
         }
-        let mut plan = self.pattern()?;
+        // A comma-separated list of patterns, joined on shared variables. Each
+        // pattern parses in its OWN slot space; join maps a shared variable's
+        // left slot to its right slot, and the merged scope shifts the right
+        // pattern's slots by the left width (the Join operator's convention).
+        let (mut plan, mut scope, mut slots) = self.pattern()?;
+        while self.eat(&Tok::Comma) {
+            let (p2, s2, k2) = self.pattern()?;
+            let on: Vec<(usize, usize)> = s2
+                .iter()
+                .filter_map(|(v, &rslot)| scope.get(v).map(|&lslot| (lslot, rslot)))
+                .collect();
+            plan = Plan::join(plan, p2, on);
+            for (v, &rslot) in &s2 {
+                // Shared vars keep their left slot; new vars land at slots+rslot.
+                scope.entry(v.clone()).or_insert(slots + rslot);
+            }
+            slots += k2;
+        }
+        // Publish the merged scope for WHERE/RETURN/ORDER to resolve variables.
+        self.scope = scope;
+        self.slots = slots;
         if self.eat_kw("WHERE") {
             let pred = self.expr()?;
             plan = plan.filter(pred);
@@ -356,20 +371,63 @@ impl Parser {
         }
     }
 
-    // pattern := node ( rel node )*
-    fn pattern(&mut self) -> Result<Plan, String> {
+    // pattern := node ( rel [quantifier] node )*
+    // Parsed in its OWN slot space (0-based), returning (plan, var->slot, width);
+    // sharing across comma-patterns is resolved by name at join time.
+    fn pattern(&mut self) -> Result<(Plan, HashMap<String, usize>, usize), String> {
+        let mut scope: HashMap<String, usize> = HashMap::new();
+        let mut slots = 0usize;
         let (var, label) = self.node()?;
-        let slot = self.bind(var);
-        debug_assert_eq!(slot, 0, "the first node is slot 0");
+        if let Some(v) = var {
+            scope.insert(v, slots);
+        }
+        slots += 1;
         let mut plan = Plan::Scan { label };
         while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow)) {
             let (dir, edge) = self.rel()?;
+            let quant = self.opt_quantifier()?;
             let (v2, _lbl2) = self.node()?; // a hop's landing-node label is ignored for now
-            let from = slot_before_hop(&self.scope, self.slots);
-            self.bind(v2);
-            plan = plan.expand(from, dir, Some(&edge));
+            let from = slots - 1;
+            if let Some(v) = v2 {
+                scope.insert(v, slots);
+            }
+            slots += 1;
+            plan = match quant {
+                Some((min, max)) => plan.var_length(from, dir, Some(&edge), min, max, true),
+                None => plan.expand(from, dir, Some(&edge)),
+            };
         }
-        Ok(plan)
+        Ok((plan, scope, slots))
+    }
+
+    /// An optional `{n}` / `{n,m}` / `{n,}` quantifier after a relationship. An
+    /// open upper bound is capped at `MAX_VARLEN` hops for this subset.
+    fn opt_quantifier(&mut self) -> Result<Option<(u32, u32)>, String> {
+        if !self.eat(&Tok::LBrace) {
+            return Ok(None);
+        }
+        let min = self.u32_lit()?;
+        let max = if self.eat(&Tok::Comma) {
+            if matches!(self.peek(), Some(Tok::Num(_))) {
+                self.u32_lit()?
+            } else {
+                MAX_VARLEN // `{n,}` — open upper bound, capped
+            }
+        } else {
+            min // `{n}` — exact
+        };
+        self.expect(&Tok::RBrace)?;
+        if min > max {
+            return Err(format!("quantifier {{{min},{max}}} has min > max"));
+        }
+        Ok(Some((min, max)))
+    }
+
+    fn u32_lit(&mut self) -> Result<u32, String> {
+        match self.bump() {
+            Some(Tok::Num(n)) if n >= 0.0 && n.fract() == 0.0 => Ok(n as u32),
+            other => Err(format!("expected a non-negative integer, got {other:?}")),
+        }
     }
 
     // node := '(' [var] [':' Label] ')'
@@ -571,12 +629,9 @@ impl Parser {
     }
 }
 
-/// The slot the current hop expands FROM: the most recently bound node, i.e. the
-/// slot just before the one this hop will bind. With `slots` already counting the
-/// nodes bound so far and the new node not yet bound, that is `slots - 1`.
-fn slot_before_hop(_scope: &HashMap<String, usize>, slots: usize) -> usize {
-    slots - 1
-}
+/// An open `{n,}` upper bound is capped here (path enumeration is exponential;
+/// an unbounded quantifier needs the reachability form, not enumeration).
+const MAX_VARLEN: u32 = 32;
 
 /// A default output-column name for an un-aliased item.
 fn default_name(e: &Expr, idx: usize) -> String {
@@ -954,5 +1009,126 @@ mod tests {
     #[test]
     fn order_by_unknown_column_errors() {
         assert!(super::parse("MATCH (p:Person) RETURN p.name AS name ORDER BY age").is_err());
+    }
+
+    // --- part 3: comma-join and variable-length ---
+
+    #[test]
+    fn comma_join_shared_variable() {
+        use crate::ir::{Dir, Expr, Plan};
+        let store = social();
+        // (a)-[:KNOWS]->(b), (a)-[:WORKS_ON]->(c) sharing a. Only alice has both.
+        let left = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .expand(0, Dir::Out, Some("KNOWS"));
+        let right = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .expand(0, Dir::Out, Some("WORKS_ON"));
+        let hand = Plan::join(left, right, vec![(0, 0)]).project(vec![
+            (
+                "a".into(),
+                Expr::Prop {
+                    slot: 0,
+                    key: "name".into(),
+                },
+            ),
+            (
+                "b".into(),
+                Expr::Prop {
+                    slot: 1,
+                    key: "name".into(),
+                },
+            ),
+            (
+                "c".into(),
+                Expr::Prop {
+                    slot: 3,
+                    key: "name".into(),
+                },
+            ),
+        ]);
+        assert_same(
+            "MATCH (a:Person)-[:KNOWS]->(b), (a:Person)-[:WORKS_ON]->(c) \
+             RETURN a.name AS a, b.name AS b, c.name AS c",
+            &hand,
+            &store,
+        );
+        // hand-checked: alice KNOWS {bob,carol} x WORKS_ON {graphdb} = 2 rows.
+        let out = run(
+            &super::parse(
+                "MATCH (a:Person)-[:KNOWS]->(b), (a:Person)-[:WORKS_ON]->(c) RETURN c.name AS c",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert_eq!(out.rows.len(), 2);
+    }
+
+    #[test]
+    fn var_length_range() {
+        use crate::ir::{Dir, Expr, Plan};
+        let store = social();
+        // (a)-[:KNOWS]->{1,2}(b) from alice: b(len1)={bob,carol}, then len2 from
+        // those: bob->carol. Trail. Cross-check vs hand-built VarLength.
+        let hand = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .filter(Expr::Compare {
+            op: crate::ir::CompareOp::Eq,
+            left: Box::new(Expr::Prop {
+                slot: 0,
+                key: "name".into(),
+            }),
+            right: Box::new(Expr::Lit(Value::Str("alice".into()))),
+        })
+        .var_length(0, Dir::Out, Some("KNOWS"), 1, 2, true)
+        .project(vec![(
+            "b".into(),
+            Expr::Prop {
+                slot: 1,
+                key: "name".into(),
+            },
+        )]);
+        assert_same(
+            "MATCH (a:Person)-[:KNOWS]->{1,2}(b) WHERE a.name = 'alice' RETURN b.name AS b",
+            &hand,
+            &store,
+        );
+    }
+
+    #[test]
+    fn var_length_exact_and_open() {
+        let store = social();
+        // exact {2}: alice's 2-hop KNOWS endpoints = {carol} (alice->bob->carol).
+        let out = run(
+            &super::parse(
+                "MATCH (a:Person)-[:KNOWS]->{2}(b) WHERE a.name = 'alice' RETURN b.name AS b",
+            )
+            .unwrap(),
+            &store,
+        );
+        let mut got: Vec<String> = out
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Str(x) => x.to_string(),
+                _ => panic!(),
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["carol"]);
+
+        // open {1,} is accepted (capped) and reaches everyone reachable.
+        assert!(super::parse(
+            "MATCH (a:Person)-[:KNOWS]->{1,}(b) WHERE a.name = 'alice' RETURN b.name AS b"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn bad_quantifier_errors() {
+        assert!(super::parse("MATCH (a:Person)-[:KNOWS]->{3,1}(b) RETURN a.name AS a").is_err());
     }
 }
