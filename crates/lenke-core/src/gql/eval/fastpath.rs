@@ -896,51 +896,51 @@ pub(super) fn count_rows_any(proj: &CProjection, count: u64) -> CodeResult<RowSe
 }
 
 /// `RETURN <key over the endpoint>, count(*)` over bare hops — grouped without
-/// building a row per walk.
+/// enumerating a row per walk, and without even VISITING one.
 ///
-/// The counting shortcut above answers a SCALAR count; this is the same idea one
-/// step further, and it is what `try_grouped_2hop` and `try_grouped_varlen_1_2`
-/// used to do in two rungs. `MATCH (a:Person)-[:KNOWS]->{1,2}(b) RETURN b.city,
-/// count(*)` visits 72M walks over a 1M/8M graph to produce FIFTY rows; the
-/// enumerating path builds a binding and evaluates the key expression 72M times
-/// to do it.
+/// `MATCH (a:Person)-[:KNOWS]->{1,2}(b) RETURN b.city, count(*)` produces fifty
+/// rows out of 72M walks, and the enumerating path builds a binding and
+/// evaluates the key expression once per walk to get there.
 ///
-/// Instead: walk, and tally per ENDPOINT VERTEX into a dense `Vec<u64>`. The key
-/// expression then runs once per distinct endpoint rather than once per walk,
-/// and the fold into groups happens on that much smaller list.
+/// Two independent savings, and the second is the large one:
 ///
-/// **Group order is first-seen, and that is load-bearing** — the engine pins it
-/// (`GROUP BY` emits groups in the order their first row appeared), so a tally
-/// that emitted groups in vertex order would be a wrong answer that looks right.
-/// Two things keep it exact:
-///
-/// 1. The walk is DEPTH-FIRST per seed, the same order the matcher enumerates
-///    in — not a breadth-first frontier, which would emit every length-1 walk
-///    before any length-2 one and reorder the groups of a `{1,2}` pattern.
-/// 2. An endpoint is appended to `order` the first time its tally goes 0 → 1,
-///    so `order` is the endpoints in first-seen order; folding keys in that
-///    order puts each GROUP at the position of its first row.
-///
-/// Depth is capped at two hops. Not for want of generality — the DFS would
-/// extend — but because the trail correction does (see `try_walk_count`).
-///
-/// **Quantified patterns only, and that is a measured restriction, not a shape
-/// limitation.** The tally handles a plain `(a)-[:R]->(b)-[:R]->(c)` correctly,
-/// and it was enabled for it until the numbers were swept across sizes:
+/// 1. **The key runs once per distinct ENDPOINT, not once per walk** — a tally
+///    per endpoint vertex, folded into groups afterwards.
+/// 2. **The tally is a DEGREE PRODUCT, so it is O(E) rather than O(walks).** A
+///    length-2 walk is an arrival at a midpoint followed by a departure from it,
+///    so the number of walks ending at `c` is `Σ_m arrivals(m) · [edges m→c]`.
+///    Adding 1 per pair computes that same number `degree` times over; 8M edge
+///    visits do what 72M walk visits did.
 ///
 /// ```text
-///                       300k/8            1M/8
-/// trav2_group    391 -> 330  (1.18x)  1457 -> 1620  (0.90x)
-/// varlen_group  1210 -> 344  (3.5x)  11454 -> 1711  (6.7x)
+///                     enumerating      here      main (pre-IR)
+/// varlen_group          11453.84ms   295.23ms       430.14ms
+/// trav2_group            1457.27      185.30        413.68
 /// ```
 ///
-/// It INVERTS for the unquantified form: a win at 300k and a loss at 1M, where
-/// the dense `Vec<u64>` is 8MB and every walk writes into it at random. The
-/// var-length form wins at both sizes because the path it replaces is
-/// pathological there (159ns per walk against 23ns for the plain two-hop), so
-/// there is real ground to make up. For the plain hop there is not, and a
-/// 1.18x that becomes 0.90x one size up is not a win — it is a measurement
-/// taken at one size, which is the mistake this repo keeps a list of.
+/// **Group order is first-seen, the engine pins it, and the degree product does
+/// not know it** — it sums per midpoint in vertex order, which says nothing
+/// about which row came first. That is the constraint that blocked this shape
+/// for a long time, and the way through is to stop asking the counting pass for
+/// it:
+///
+/// - The count pass yields the group SET and its totals, in any order.
+/// - A second pass then walks in TRUE enumeration order — depth-first per seed,
+///   the order the matcher emits in — recording each group the first time it
+///   appears, and **stops as soon as it has seen them all**. That bound exists
+///   only because the first pass already counted the groups, and it is what
+///   makes the second pass nearly free: fifty groups turn up in the first
+///   handful of walks. The worst case, a group whose only row is the very last
+///   walk, degrades to the enumeration this replaces and no further.
+///
+/// `grouped_walk_count_emits_groups_in_first_seen_order` builds a fixture where
+/// vertex order and first-seen order disagree, which is the failure this would
+/// otherwise ship: a wrong answer that looks entirely reasonable.
+///
+/// Depth stops at two hops, for the same reason the scalar shortcut does — past
+/// that the trail correction stops being a subtraction (see `try_walk_count`).
+/// Here that correction is applied distributed: the product counts a self-loop
+/// at a seed once as a length-2 walk that reuses its edge, so it comes back off.
 pub(super) fn try_grouped_walk_count(
     linear: &CLinear,
     graph: &Graph,
@@ -1001,9 +1001,6 @@ pub(super) fn try_grouped_walk_count(
 
     let ctx = resolve_ctx(graph, plan, params);
     let (hops, quant) = bare_hops(path, &ctx)?;
-    // MEASURED: the tally only pays where the enumerating path is bad, and for a
-    // plain two-segment hop it is not. See the doc.
-    quant?;
     // See the doc: two hops is where the trail correction stops being exact.
     let depth_ok = match quant {
         None => hops.len() <= 2,
@@ -1019,17 +1016,13 @@ pub(super) fn try_grouped_walk_count(
     }
 
     let loops = crate::seek::SelfLoops::Once;
-    let mut tally = vec![0u64; graph.vertex_slots()];
-    let mut order: Vec<u32> = Vec::new();
-    let hit = |v: u32, tally: &mut Vec<u64>, order: &mut Vec<u32>| {
-        let t = &mut tally[v as usize];
-        if *t == 0 {
-            order.push(v);
+    let hop_at = |i: usize| -> &(crate::seek::Dir, Option<Vec<u32>>) {
+        if quant.is_some() {
+            &hops[0]
+        } else {
+            &hops[i]
         }
-        *t += 1;
     };
-
-    // Lengths to emit, in the order the matcher emits them per seed.
     let lengths: Vec<usize> = match quant {
         None => vec![hops.len()],
         Some(q) => (q.min.max(1)..=q.max?).map(|n| n as usize).collect(),
@@ -1037,60 +1030,144 @@ pub(super) fn try_grouped_walk_count(
     // A quantified repetition is edge-distinct; separate segments are not.
     let trail = quant.is_some();
 
-    for &s in &seeds {
-        for &len in &lengths {
-            let h0 = &hops[0];
-            let hop_at = |i: usize| -> &(crate::seek::Dir, Option<Vec<u32>>) {
-                if quant.is_some() {
-                    h0
-                } else {
-                    &hops[i]
-                }
-            };
-            if len == 1 {
-                let (d, t) = hop_at(0);
-                for a in crate::seek::adj(graph, s, *d, t.as_deref().unwrap_or(&[]), loops) {
-                    hit(a.nbr, &mut tally, &mut order);
-                }
-            } else {
-                let (d1, t1) = hop_at(0);
-                let (d2, t2) = hop_at(1);
+    // COUNTS, as a degree product — O(E), not O(walks).
+    //
+    // A length-2 walk is an arrival at a midpoint followed by a departure from
+    // it, and the count of walks ending at `c` is the sum over midpoints of
+    // `arrivals(m) · [edges m→c]`. Enumerating the pairs to add 1 each time
+    // computes the same number `degree` times over: 72M walks where 8M edge
+    // visits suffice.
+    let slots = graph.vertex_slots();
+    let mut tally = vec![0u64; slots];
+    for &len in &lengths {
+        let (d1, t1) = hop_at(0);
+        if len == 1 {
+            for &s in &seeds {
                 for a in crate::seek::adj(graph, s, *d1, t1.as_deref().unwrap_or(&[]), loops) {
-                    for b in
-                        crate::seek::adj(graph, a.nbr, *d2, t2.as_deref().unwrap_or(&[]), loops)
-                    {
-                        // The ONLY way a two-hop walk repeats an edge.
-                        if trail && b.eidx == a.eidx {
-                            continue;
-                        }
-                        hit(b.nbr, &mut tally, &mut order);
+                    tally[a.nbr as usize] += 1;
+                }
+            }
+            continue;
+        }
+        // Arrivals per midpoint, then one pass over each midpoint's departures.
+        let mut arrivals = vec![0u64; slots];
+        for &s in &seeds {
+            for a in crate::seek::adj(graph, s, *d1, t1.as_deref().unwrap_or(&[]), loops) {
+                arrivals[a.nbr as usize] += 1;
+            }
+        }
+        let (d2, t2) = hop_at(1);
+        for (m, &n) in arrivals.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            for b in crate::seek::adj(graph, m as u32, *d2, t2.as_deref().unwrap_or(&[]), loops) {
+                tally[b.nbr as usize] += n;
+            }
+        }
+        // The trail correction, distributed: the only length-2 walk that reuses
+        // an edge takes a SELF-LOOP twice, which the product above counted once
+        // for every self-loop sitting at a seed.
+        if trail {
+            for &s in &seeds {
+                for a in crate::seek::adj(graph, s, *d1, t1.as_deref().unwrap_or(&[]), loops) {
+                    if a.nbr == s {
+                        tally[s as usize] -= 1;
                     }
                 }
             }
         }
     }
 
-    // One key evaluation per DISTINCT endpoint, in first-seen order.
+    // GROUPS. The key runs once per distinct endpoint, and the fold is done
+    // twice for two different reasons: once over every touched endpoint to learn
+    // the group SET and its counts, and once in walk order to learn the group
+    // ORDER. See below for why the second pass is cheap.
     let mut b = Binding(vec![None; (*scope_len).max(end_slot + 1)]);
-    let mut keys: Vec<(String, Val, u64)> = Vec::new();
-    let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for &v in &order {
+    let key_of = |b: &mut Binding, v: u32| -> (String, Val) {
         b.set(end_slot, Val::Node(v));
-        let val = eval(&Env::new(graph, &ctx, &b), &proj.items[0].expr);
+        let val = eval(&Env::new(graph, &ctx, b), &proj.items[0].expr);
         let mut k = String::new();
         super::val_key(&val, &mut k);
-        let n = tally[v as usize];
-        match at.get(&k) {
-            Some(&i) => keys[i].2 += n,
-            None => {
-                at.insert(k.clone(), keys.len());
-                keys.push((k, val, n));
+        (k, val)
+    };
+    let mut totals: std::collections::HashMap<String, (Val, u64)> =
+        std::collections::HashMap::new();
+    for (v, &n) in tally.iter().enumerate() {
+        if n == 0 {
+            continue;
+        }
+        let (k, val) = key_of(&mut b, v as u32);
+        totals.entry(k).or_insert((val, 0)).1 += n;
+    }
+    if let Err(e) = ctx.check_fault() {
+        return Some(Err(e));
+    }
+
+    // ORDER is first-seen and the engine pins it, so the groups have to come out
+    // in the order their first ROW appeared — which the degree product, summing
+    // per midpoint in vertex order, does not know.
+    //
+    // Walk in enumeration order and stop as soon as every group has been seen.
+    // That bound is available only because the pass above already counted them,
+    // and it is what makes this cheap: a query with fifty groups finds them in
+    // the first handful of walks. The worst case — a group whose only row is the
+    // last walk — degrades to the enumeration this replaces, and no further.
+    let want = totals.len();
+    let mut order: Vec<String> = Vec::with_capacity(want);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut cached: Vec<Option<u32>> = vec![None; slots];
+    let note = |b: &mut Binding,
+                v: u32,
+                order: &mut Vec<String>,
+                seen: &mut std::collections::HashSet<String>,
+                cached: &mut Vec<Option<u32>>| {
+        if cached[v as usize].is_some() {
+            return;
+        }
+        cached[v as usize] = Some(0);
+        let (k, _) = key_of(b, v);
+        if seen.insert(k.clone()) {
+            order.push(k);
+        }
+    };
+    'outer: for &s in &seeds {
+        for &len in &lengths {
+            let (d1, t1) = hop_at(0);
+            for a in crate::seek::adj(graph, s, *d1, t1.as_deref().unwrap_or(&[]), loops) {
+                if len == 1 {
+                    note(&mut b, a.nbr, &mut order, &mut seen, &mut cached);
+                } else {
+                    let (d2, t2) = hop_at(1);
+                    for c in
+                        crate::seek::adj(graph, a.nbr, *d2, t2.as_deref().unwrap_or(&[]), loops)
+                    {
+                        if trail && c.eidx == a.eidx {
+                            continue;
+                        }
+                        note(&mut b, c.nbr, &mut order, &mut seen, &mut cached);
+                    }
+                }
+                if order.len() == want {
+                    break 'outer;
+                }
+            }
+            if order.len() == want {
+                break 'outer;
             }
         }
     }
     if let Err(e) = ctx.check_fault() {
         return Some(Err(e));
     }
+
+    let keys: Vec<(String, Val, u64)> = order
+        .into_iter()
+        .map(|k| {
+            let (val, n) = totals.remove(&k).expect("every ordered key was counted");
+            (k, val, n)
+        })
+        .collect();
 
     let mut rs = RowSet::new(proj.out_names.clone());
     for (_, val, n) in keys {
