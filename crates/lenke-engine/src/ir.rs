@@ -98,6 +98,23 @@ pub enum Plan {
         dir: Dir,
         edge_label: Option<String>,
     },
+    /// A quantified hop: from the element in `from`, reach nodes over `min..=max`
+    /// hops of `dir`/`edge_label`, appending EACH reached endpoint as one new
+    /// slot — one output row per matching path. `min == 0` includes the source
+    /// itself (a zero-length path). `trail` is EXPLICIT and load-bearing: when
+    /// true no edge may repeat within a single path (a trail); when false edges
+    /// may repeat (a walk). The two differ on a cycle/self-loop and must never be
+    /// conflated — a quantified repetition is a trail, a chain of separate fixed
+    /// Expands is a walk.
+    VarLength {
+        input: Box<Plan>,
+        from: usize,
+        dir: Dir,
+        edge_label: Option<String>,
+        min: u32,
+        max: u32,
+        trail: bool,
+    },
     /// Keep rows where `pred` is TRUE (three-valued: FALSE and NULL drop).
     Filter { input: Box<Plan>, pred: Expr },
     /// Group rows by the `(name, expr)` keys and compute `aggs` per group. With
@@ -155,6 +172,27 @@ impl Plan {
             from,
             dir,
             edge_label: edge_label.map(str::to_string),
+        }
+    }
+
+    #[must_use]
+    pub fn var_length(
+        self,
+        from: usize,
+        dir: Dir,
+        edge_label: Option<&str>,
+        min: u32,
+        max: u32,
+        trail: bool,
+    ) -> Self {
+        Self::VarLength {
+            input: Box::new(self),
+            from,
+            dir,
+            edge_label: edge_label.map(str::to_string),
+            min,
+            max,
+            trail,
         }
     }
 

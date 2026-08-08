@@ -55,11 +55,15 @@ impl Column {
     }
 }
 
-/// One adjacency entry: the neighbour node and the edge's interned type id.
+/// One adjacency entry: the neighbour node, the edge's interned type id, and the
+/// edge's identity (`eid`). A directed edge appears once in its source's `out`
+/// and once in its target's `in`, both with the SAME `eid` — so trail semantics
+/// (no edge reused within one path) can dedup on `eid` regardless of direction.
 #[derive(Clone, Copy, Debug)]
 pub struct Adj {
     pub nbr: u32,
     pub etype: u32,
+    pub eid: u32,
 }
 
 /// The graph. Nodes are dense ids `0..node_count`. Labels and properties are
@@ -181,9 +185,18 @@ impl Builder {
             .collect();
         let mut out_adj = vec![Vec::new(); n];
         let mut in_adj = vec![Vec::new(); n];
-        for (from, to, etype) in self.edges {
-            out_adj[from as usize].push(Adj { nbr: to, etype });
-            in_adj[to as usize].push(Adj { nbr: from, etype });
+        for (eid, (from, to, etype)) in self.edges.into_iter().enumerate() {
+            let eid = eid as u32;
+            out_adj[from as usize].push(Adj {
+                nbr: to,
+                etype,
+                eid,
+            });
+            in_adj[to as usize].push(Adj {
+                nbr: from,
+                etype,
+                eid,
+            });
         }
         Store {
             node_count: n,

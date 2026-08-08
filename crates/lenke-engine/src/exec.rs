@@ -97,6 +97,24 @@ fn pull(plan: &Plan, store: &Store) -> Batch {
             };
             batch.gather(&keep)
         }
+        Plan::VarLength {
+            input,
+            from,
+            dir,
+            edge_label,
+            min,
+            max,
+            trail,
+        } => var_length(
+            &pull(input, store),
+            store,
+            *from,
+            *dir,
+            edge_label.as_deref(),
+            *min,
+            *max,
+            *trail,
+        ),
         Plan::Aggregate { input, keys, aggs } => aggregate(&pull(input, store), store, keys, aggs),
         Plan::OrderPage {
             input,
@@ -378,6 +396,119 @@ fn expand(batch: &Batch, store: &Store, from: usize, dir: Dir, edge_label: Optio
     let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
     slots.push(Col::Nodes(nbrs));
     Batch::of(slots)
+}
+
+/// A quantified hop: for each input row, enumerate every path of length in
+/// `min..=max` from the node in `from`, and emit one output row per path with the
+/// reached endpoint appended as a new slot. `min == 0` emits the source itself.
+///
+/// `trail` chooses the semantics and nothing else does: true forbids reusing an
+/// edge within one path (a trail), false allows it (a walk). They diverge on a
+/// cycle/self-loop — pinned by the tests — and are never conflated with a chain
+/// of separate fixed `Expand`s (which is always a walk).
+#[allow(clippy::too_many_arguments)]
+fn var_length(
+    batch: &Batch,
+    store: &Store,
+    from: usize,
+    dir: Dir,
+    edge_label: Option<&str>,
+    min: u32,
+    max: u32,
+    trail: bool,
+) -> Batch {
+    let empty = || {
+        let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
+        slots.push(Col::Nodes(vec![]));
+        Batch::of(slots)
+    };
+    let want: Option<u32> = match edge_label {
+        None => None,
+        Some(name) => match store.etype_id(name) {
+            Some(id) => Some(id),
+            None => return empty(),
+        },
+    };
+    let Col::Nodes(src) = batch.slot(from) else {
+        return empty();
+    };
+
+    let mut keep = Vec::new();
+    let mut ends = Vec::new();
+    let mut used: Vec<u32> = Vec::new(); // edge ids on the current path (trail only)
+    for (row, &v) in src.iter().enumerate() {
+        varlen_dfs(
+            store, v, 0, min, max, dir, want, trail, &mut used, row, &mut keep, &mut ends,
+        );
+        debug_assert!(used.is_empty());
+    }
+
+    let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
+    slots.push(Col::Nodes(ends));
+    Batch::of(slots)
+}
+
+/// Depth-first path enumeration for `var_length`. Emits `(row, endpoint)` at
+/// every length in `min..=max` reached from the source, pushing straight into
+/// `keep`/`ends` (a recursion-friendly alternative to a closure). For a trail,
+/// `used` holds the edge ids on the current path and blocks reuse.
+#[allow(clippy::too_many_arguments)]
+fn varlen_dfs(
+    store: &Store,
+    v: u32,
+    len: u32,
+    min: u32,
+    max: u32,
+    dir: Dir,
+    want: Option<u32>,
+    trail: bool,
+    used: &mut Vec<u32>,
+    row: usize,
+    keep: &mut Vec<usize>,
+    ends: &mut Vec<u32>,
+) {
+    if len >= min {
+        keep.push(row);
+        ends.push(v);
+    }
+    if len == max {
+        return;
+    }
+    let mut adjs: Vec<crate::store::Adj> = Vec::new();
+    if matches!(dir, Dir::Out | Dir::Both) {
+        adjs.extend_from_slice(store.out(v));
+    }
+    if matches!(dir, Dir::In | Dir::Both) {
+        adjs.extend_from_slice(store.inc(v));
+    }
+    for a in adjs {
+        if want.is_some_and(|w| w != a.etype) {
+            continue;
+        }
+        if trail && used.contains(&a.eid) {
+            continue; // a trail may not reuse an edge
+        }
+        if trail {
+            used.push(a.eid);
+        }
+        varlen_dfs(
+            store,
+            a.nbr,
+            len + 1,
+            min,
+            max,
+            dir,
+            want,
+            trail,
+            used,
+            row,
+            keep,
+            ends,
+        );
+        if trail {
+            used.pop();
+        }
+    }
 }
 
 /// Evaluate `expr` over every row of `batch`, producing a column.
@@ -1117,5 +1248,119 @@ mod tests {
             .distinct();
         let out = run(&plan, &store);
         assert_eq!(names_of(&out, 0), vec!["alice"]);
+    }
+
+    // --- VarLength (quantified hops) ---
+
+    /// A linear chain a->b->c. `{1,2}` from a reaches b (len 1) and c (len 2):
+    /// two rows.
+    #[test]
+    fn varlen_chain_one_to_two() {
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[("name", s("a"))]);
+        let bb = b.node(&["N"], &[("name", s("b"))]);
+        let c = b.node(&["N"], &[("name", s("c"))]);
+        b.edge(a, bb, "R");
+        b.edge(bb, c, "R");
+        let store = b.build();
+        let plan = scan("N")
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
+            .var_length(0, Dir::Out, Some("R"), 1, 2, true)
+            .project(vec![("end".into(), prop(1, "name"))]);
+        let out = run(&plan, &store);
+        let mut got = names_of(&out, 0);
+        got.sort();
+        assert_eq!(got, vec!["b", "c"]);
+    }
+
+    /// `{0,2}` includes the source itself at length 0: a, b, c.
+    #[test]
+    fn varlen_zero_includes_source() {
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[("name", s("a"))]);
+        let bb = b.node(&["N"], &[("name", s("b"))]);
+        let c = b.node(&["N"], &[("name", s("c"))]);
+        b.edge(a, bb, "R");
+        b.edge(bb, c, "R");
+        let store = b.build();
+        let plan = scan("N")
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
+            .var_length(0, Dir::Out, Some("R"), 0, 2, true)
+            .project(vec![("end".into(), prop(1, "name"))]);
+        let out = run(&plan, &store);
+        let mut got = names_of(&out, 0);
+        got.sort();
+        assert_eq!(got, vec!["a", "b", "c"]); // a at length 0
+    }
+
+    /// THE trail-vs-walk discriminator: a single self-loop a->a. `{1,2}`:
+    /// - walk (trail=false) reuses the edge, so len1 AND len2 both reach a -> 2 rows;
+    /// - trail (trail=true) may not reuse it, so only len1 -> 1 row.
+    #[test]
+    fn varlen_trail_vs_walk_on_a_self_loop() {
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[("name", s("a"))]);
+        b.edge(a, a, "R"); // self-loop
+        let store = b.build();
+        let base = scan("N");
+
+        let walk = base
+            .clone()
+            .var_length(0, Dir::Out, Some("R"), 1, 2, false)
+            .project(vec![("end".into(), prop(1, "name"))]);
+        assert_eq!(run(&walk, &store).rows.len(), 2, "walk reuses the edge");
+
+        let trail = base
+            .var_length(0, Dir::Out, Some("R"), 1, 2, true)
+            .project(vec![("end".into(), prop(1, "name"))]);
+        assert_eq!(
+            run(&trail, &store).rows.len(),
+            1,
+            "trail may not reuse the edge"
+        );
+    }
+
+    /// A 2-cycle a<->b (two directed edges a->b, b->a). `{1,3}` as a TRAIL from a:
+    /// len1 a->b (edge0); len2 a->b->a (edge0,edge1); len3 a->b->a->b (edge0,
+    /// edge1, then edge0 again -> reused -> blocked). So endpoints b, a -> 2 rows.
+    /// As a WALK, len3 a->b->a->b is allowed -> endpoints b, a, b -> 3 rows.
+    #[test]
+    fn varlen_two_cycle_trail_bounds_edge_reuse() {
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[("name", s("a"))]);
+        let bb = b.node(&["N"], &[("name", s("b"))]);
+        b.edge(a, bb, "R"); // edge 0
+        b.edge(bb, a, "R"); // edge 1
+        let store = b.build();
+        let from_a = scan("N").filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))));
+
+        let trail = from_a
+            .clone()
+            .var_length(0, Dir::Out, Some("R"), 1, 3, true)
+            .project(vec![("end".into(), prop(1, "name"))]);
+        assert_eq!(run(&trail, &store).rows.len(), 2); // b (len1), a (len2)
+
+        let walk = from_a
+            .var_length(0, Dir::Out, Some("R"), 1, 3, false)
+            .project(vec![("end".into(), prop(1, "name"))]);
+        assert_eq!(run(&walk, &store).rows.len(), 3); // b, a, b
+    }
+
+    /// Exact length `{2,2}` emits only the 2-hop endpoints.
+    #[test]
+    fn varlen_exact_length() {
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[("name", s("a"))]);
+        let bb = b.node(&["N"], &[("name", s("b"))]);
+        let c = b.node(&["N"], &[("name", s("c"))]);
+        b.edge(a, bb, "R");
+        b.edge(bb, c, "R");
+        let store = b.build();
+        let plan = scan("N")
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
+            .var_length(0, Dir::Out, Some("R"), 2, 2, true)
+            .project(vec![("end".into(), prop(1, "name"))]);
+        let out = run(&plan, &store);
+        assert_eq!(names_of(&out, 0), vec!["c"]); // only the 2-hop endpoint
     }
 }
