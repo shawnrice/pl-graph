@@ -3472,6 +3472,50 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> Col {
                 None => gen(e),
             }
         }
+        // An edge's endpoint, as a bulk gather off `e_src`/`e_dst` — the reason
+        // this variant exists at all (see `ScalarFn::EdgeSource`). Per-row through
+        // the scalar VM it would be no better than the stream it replaces.
+        CExpr::Scalar { func, args }
+            if matches!(func, ScalarFn::EdgeSource | ScalarFn::EdgeTarget)
+                && args.len() == 1
+                && matches!(args[0], CExpr::Var(_)) =>
+        {
+            let CExpr::Var(slot) = &args[0] else {
+                unreachable!("guarded above")
+            };
+
+            match sc.slot(*slot) {
+                Some((Elem::Edge, ids)) => {
+                    let src = matches!(func, ScalarFn::EdgeSource);
+
+                    // An ELEMENT column, not a boxed one. Handing back
+                    // `Col::Gen(Val::Node(..))` is correct and costs 10x: the
+                    // caller loses the id vector, so every downstream arm that
+                    // wants elements has to re-tighten or fall back. Measured
+                    // `g.E().inV().count()` at 1.705ms boxed against 0.175
+                    // unboxed.
+                    Col::Elems {
+                        ids: std::borrow::Cow::Owned(
+                            ids.iter()
+                                .map(|&e| {
+                                    let i = e as usize;
+
+                                    if src {
+                                        graph.e_src[i]
+                                    } else {
+                                        graph.e_dst[i]
+                                    }
+                                })
+                                .collect(),
+                        ),
+                        is_edge: false,
+                    }
+                }
+                // Not an edge column: the scalar form yields NULL, which this
+                // cannot know without the value.
+                _ => gen(e),
+            }
+        }
         CExpr::Neg(x) => {
             let v = eval_vec(graph, ctx, sc, x);
             // A non-numeric operand → scalar fallback, which raises the type error.

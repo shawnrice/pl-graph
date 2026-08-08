@@ -6273,6 +6273,14 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         // absent-key drop has to happen BEFORE the predicate, and the validity
         // mask has to be cleared afterwards or the arm declines a column with
         // nothing missing).
+        // `outV()`/`inV()` off an EDGE frontier — a gather to the endpoint,
+        // yielding an ELEMENT column so a tail keeps navigating off it.
+        "g.E().inV()",
+        "g.E().outV()",
+        "g.E().inV().count()",
+        "g.E().outV().dedup().count()",
+        "g.E().inV().values('n')",
+        "g.E().hasLabel('R').outV().values('n').sum()",
         // `where(…)`/`not(…)` — an EXISTS answered in bulk, retained as elements.
         // Typed and untyped hops, both directions, a landed label, and a tail
         // after the filter so the retained column keeps navigating.

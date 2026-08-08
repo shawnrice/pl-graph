@@ -436,6 +436,29 @@ pub(super) fn tail(
                 order_key: None,
             })
         }
+        // `outV()` / `inV()` off an EDGE frontier — a gather to the endpoint,
+        // yielding an ELEMENT column so navigation continues off it. `bothV()` is
+        // NOT here: it emits BOTH ends per edge, which is a row-count change no
+        // projection expresses (one input row, two output rows).
+        [step @ (Step::OutV | Step::InV)] if is_edge => {
+            let expr = CExpr::Scalar {
+                func: if matches!(step, Step::OutV) {
+                    crate::gql::plan::ScalarFn::EdgeSource
+                } else {
+                    crate::gql::plan::ScalarFn::EdgeTarget
+                },
+                args: vec![CExpr::Var(slot)],
+            };
+
+            Some(Tail {
+                proj: blank(vec![item(expr, "v", false)]),
+                shape: Shape::Rows,
+                absent_key: None,
+                page: None,
+                filter: None,
+                order_key: None,
+            })
+        }
         // `groupCount().by(k)` — GROUP BY the property, count each group. Both
         // engines emit groups in FIRST-SEEN order, so the sequence matches without
         // an ORDER BY. A `by()` carrying a direction sorts the result and is a

@@ -1629,6 +1629,7 @@ fn col_terminal_tagged(
             if let Some((prefix, rest)) = values_prefix(tail)
                 .or_else(|| id_label_prefix(tail, *is_edge))
                 .or_else(|| where_not_prefix(tail))
+                .or_else(|| endpoint_prefix(tail, *is_edge))
             {
                 let mut names = Vec::new();
                 let mut labels = Vec::new();
@@ -2317,6 +2318,17 @@ fn homogeneous_or_absent(graph: &Graph, is_edge: bool, key: &str) -> bool {
 /// multi-key call interleaves columns per element rather than reading one.
 /// Split a leading `where(…)`/`not(…)` off a tail, so the filter can be answered
 /// as a projection and whatever follows handed to the terminals.
+/// Split a leading `outV()`/`inV()` off an EDGE frontier, so the endpoint gather
+/// answers as a projection and whatever follows keeps navigating.
+fn endpoint_prefix(tail: &[Step], is_edge: bool) -> Option<(Vec<Step>, &[Step])> {
+    match tail {
+        [step @ (Step::OutV | Step::InV), rest @ ..] if is_edge && !rest.is_empty() => {
+            Some((vec![step.clone()], rest))
+        }
+        _ => None,
+    }
+}
+
 fn where_not_prefix(tail: &[Step]) -> Option<(Vec<Step>, &[Step])> {
     match tail {
         [head @ (Step::Where(_) | Step::Not(_)), rest @ ..] if !rest.is_empty() => {
@@ -2596,55 +2608,6 @@ fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Op
                 ids.iter()
                     .map(|&id| elem_label(graph, &frontier_val(id, is_edge)))
                     .collect(),
-            )
-        }
-        // An edge frontier's endpoints. `e_src`/`e_dst` are indexed BY EDGE, so
-        // this is a gather, not a walk — the reason these are safe to allow after
-        // an `E()` source where a step that read an edge id as a vertex id would
-        // not be.
-        //
-        // `otherV()` is deliberately absent: "the end I did not come from" is a
-        // question about the PATH, and a column has none.
-        //
-        // These two arms were investigated for the same PREFIX-split treatment
-        // `values_prefix`/`id_label_prefix` give `values(k)`/`id()`/`label()`,
-        // and there is no `to_gql` split for them: `CExpr` (`gql/plan.rs`) has
-        // no variant that YIELDS an endpoint vertex from a bound edge value —
-        // its one edge-endpoint construct is `GraphPred`'s `SourceOf`/`DestOf`
-        // (`<node> IS SOURCE OF <edge>`), a BOOLEAN predicate consumed by
-        // `WHERE`, not a value producer a projection item could hold. Its own
-        // evaluator (`gql/eval.rs`) reads `graph.e_src`/`e_dst` directly rather
-        // than through any expression the projection layer exposes. The
-        // `ScalarFn` table (same file) has no `source`/`target`/`start_node`/
-        // `end_node` entry either — grepped for all of them, empty. GQL's own
-        // route to an edge's endpoints is the PATTERN itself
-        // (`MATCH (a)-[e]->(b)`), which binds `a`/`b` as separate pattern
-        // variables at compile time — not a postfix accessor on an already-
-        // bound edge value the way `outV()`/`inV()`/`bothV()` are, so there is
-        // no existing expression to route through here. Skipped rather than
-        // adding a new `CExpr` variant just to wrap `e_src`/`e_dst` — that
-        // would be materializing the ids under a different name, which the
-        // brief this arm was written against rules out.
-        [Step::OutV | Step::InV, t @ ..] if is_edge => {
-            let src = matches!(rest.first(), Some(Step::OutV));
-            let ends: Vec<u32> = ids
-                .iter()
-                .map(|&e| {
-                    if src {
-                        graph.e_src[e as usize]
-                    } else {
-                        graph.e_dst[e as usize]
-                    }
-                })
-                .collect();
-
-            col_terminal(
-                graph,
-                Col::Elems {
-                    ids: std::borrow::Cow::Owned(ends),
-                    is_edge: false,
-                },
-                t,
             )
         }
         // Both ends, in the order the stream yields them: out first, then in.

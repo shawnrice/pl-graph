@@ -64,6 +64,16 @@ pub enum ScalarFn {
     Coalesce,
     Nullif,
     ElementId,
+    /// An edge's source / target endpoint vertex.
+    ///
+    /// Added for the Gremlin migration: `outV()`/`inV()` are a postfix accessor
+    /// on a bound EDGE, and GQL previously reached endpoints only through the
+    /// PATTERN (`MATCH (a)-[e]->(b)`), so a traversal that had already bound the
+    /// edge had no way to name them. They are a direct gather off `e_src`/`e_dst`,
+    /// which is why the arms that needed them cost 115-165x when they fell to the
+    /// stream instead.
+    EdgeSource,
+    EdgeTarget,
     // Graph functions.
     Labels,
     Type,

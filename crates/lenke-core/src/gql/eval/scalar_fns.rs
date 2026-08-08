@@ -202,6 +202,16 @@ pub(super) fn call_scalar(graph: &Graph, ctx: &Ctx, func: ScalarFn, args: &[Val]
         },
         // Shared with Gremlin's `id()` — see `Val::element_id` for why one copy.
         ElementId => a.map_or(Val::Null, |v| Val::element_id(graph, v)),
+        // An edge's endpoints, by direct gather. A non-edge yields NULL rather
+        // than faulting, matching every other accessor here.
+        EdgeSource => match a {
+            Some(Val::Edge(e)) => Val::Node(graph.e_src[*e as usize]),
+            _ => Val::Null,
+        },
+        EdgeTarget => match a {
+            Some(Val::Edge(e)) => Val::Node(graph.e_dst[*e as usize]),
+            _ => Val::Null,
+        },
         // --- graph functions --- (label/key order is unspecified → sorted for
         // deterministic, cross-engine-identical output)
         // NOT VERIFIED CONFORMANT — see docs/conformance/gql-feature-checklist.md.
