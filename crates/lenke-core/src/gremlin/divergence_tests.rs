@@ -6192,6 +6192,138 @@ fn what_the_unvectorized_expressions_cost() {
 ///
 /// `migrated` asserts the route actually FIRED. Without it every row passes on an
 /// arm that silently declined, which has happened twice on this branch.
+/// Probe: price EVERY migrated arm against the route it replaced. A migration
+/// that is SLOWER than the arm it shadows is pure loss — the arm has to stay
+/// anyway, so the translation is lines and latency for nothing. Found
+/// `order().by(k)` at 2.7x that way.
+#[test]
+#[ignore = "probe"]
+fn zzz_migration_arm_price() {
+    let mut lines = String::new();
+    for i in 0..20_000usize {
+        let l = if i % 10 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+        let m = if i % 3 == 0 {
+            String::new()
+        } else {
+            format!(",\"m\":{}", i % 97)
+        };
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{}{m},\"k\":\"key{i:06}\"}}}}\n",
+            i % 97
+        ));
+    }
+    let mut e = 0;
+    for i in 0..20_000usize {
+        for d in 0..3usize {
+            lines.push_str(&format!(
+                "{{\"type\":\"edge\",\"id\":\"e{e}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{}}}}\n",
+                (i * 31 + d * 7 + 1) % 20_000
+            ));
+            e += 1;
+        }
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+    let mut out: Vec<(f64, String)> = Vec::new();
+    for q in [
+        "g.V().out('R').hasLabel('W').values('n')",
+        "g.V().out('R').hasLabel('W').values('n').sum()",
+        "g.V().out('R').hasLabel('W').values('n').min()",
+        "g.V().out('R').hasLabel('W').values('n').max()",
+        "g.V().out('R').hasLabel('W').values('n').mean()",
+        "g.V().out('R').hasLabel('W').values('n').dedup()",
+        "g.V().out('R').hasLabel('W').values('k')",
+        "g.V().out('R').hasLabel('W').id()",
+        "g.V().outE('R').id()",
+        "g.V().outE('R').label()",
+        "g.V().out('R').hasLabel('W').id().count()",
+        "g.V().out('R').hasLabel('W').id().dedup()",
+        "g.V().out('R').hasLabel('W').id().limit(5)",
+        "g.V().out('R').hasLabel('W').id().fold()",
+        "g.V().outE('R').label().count()",
+        "g.V().outE('R').label().dedup()",
+        "g.V().outE('R').label().groupCount()",
+        "g.V().out('R').hasLabel('W').values('n').count()",
+        "g.V().label()",
+        "g.V().label().dedup()",
+        "g.E().label()",
+        "g.E().bothV()",
+        "g.E().bothV().count()",
+        "g.E().bothV().values('n')",
+        "g.E().inV()",
+        "g.E().outV()",
+        "g.E().inV().count()",
+        "g.E().outV().dedup().count()",
+        "g.E().inV().values('n')",
+        "g.E().hasLabel('R').outV().values('n').sum()",
+        "g.V().hasLabel('W').where(__.out('R')).count()",
+        "g.V().hasLabel('W').not(__.out('R')).count()",
+        "g.V().hasLabel('W').where(__.out()).count()",
+        "g.V().hasLabel('W').where(__.in('R')).count()",
+        "g.V().hasLabel('W').where(__.both('R')).count()",
+        "g.V().hasLabel('W').where(__.out('R')).values('n')",
+        "g.V().hasLabel('W').where(__.out('R')).dedup().count()",
+        "g.V().hasLabel('W').where(__.out().hasLabel('W')).count()",
+        "g.V().out('R').hasLabel('W').values('n').is(gt(40))",
+        "g.V().out('R').hasLabel('W').values('n').is(lt(10))",
+        "g.V().out('R').hasLabel('W').values('n').is(gt(40)).limit(5)",
+        "g.V().out('R').hasLabel('W').values('m').is(gt(40))",
+        "g.V().out('R').hasLabel('W').values('m').is(gt(40)).range(2, 6)",
+        "g.V().out('R').hasLabel('W').values('m').count()",
+        "g.V().out('R').hasLabel('W').groupCount().by('n')",
+        "g.V().out('R').hasLabel('W').groupCount().by('k')",
+        "g.V().out('R').hasLabel('W').group().by('k').by(__.values('n').sum())",
+        "g.V().out('R').hasLabel('W').group().by('k').by(__.values('n').min())",
+        "g.V().out('R').hasLabel('W').group().by('k').by(__.values('n').max())",
+        "g.V().out('R').hasLabel('W').group().by('k').by(__.values('n').mean())",
+        "g.V().out('R').hasLabel('W').group().by('n').by(__.values('n').sum())",
+        "g.V().out('R').hasLabel('W').group().by('n').by(__.values('n').mean())",
+        "g.V().out('R').hasLabel('W').group().by('n').by(__.values('m').sum())",
+        "g.V().out('R').hasLabel('W').group().by('m').by(__.values('n').sum())",
+        "g.V().out('R').hasLabel('W').project('n','k').by('n').by('k')",
+        "g.V().out('R').hasLabel('W').project('n','k','m').by('n').by('k').by('m')",
+        "g.V().out('R').hasLabel('W').project('v','n').by().by('n')",
+        "g.V().out('R').hasLabel('W').project('v','n').by('n')",
+        "g.V().out('R').hasLabel('W').values('n').limit(5)",
+        "g.V().out('R').hasLabel('W').values('n').limit(0)",
+        "g.V().out('R').hasLabel('W').values('n').skip(5)",
+        "g.V().out('R').hasLabel('W').values('n').range(3, 8)",
+        "g.V().out('R').hasLabel('W').values('n').range(8, 3)",
+        "g.V().out('R').hasLabel('W').values('n').range(0, 1000000)",
+        "g.V().out('R').hasLabel('W').values('n').fold()",
+        "g.V().out('R').hasLabel('W').values('m').limit(5)",
+        "g.V().out('R').hasLabel('W').values('m').limit(0)",
+        "g.V().out('R').hasLabel('W').values('m').skip(5)",
+        "g.V().out('R').hasLabel('W').values('m').range(3, 8)",
+        "g.V().out('R').hasLabel('W').values('m').range(8, 3)",
+        "g.V().out('R').hasLabel('W').values('m').range(0, 1000000)",
+        "g.V().out('R').hasLabel('W').values('m').fold()",
+    ] {
+        let (mut mig, mut arm) = (f64::MAX, f64::MAX);
+        for _ in 0..5 {
+            let p = super::parse::parse(q).expect("parses");
+            let t = std::time::Instant::now();
+            let a = p.run(&mut g);
+            mig = mig.min(t.elapsed().as_secs_f64() * 1000.0);
+            super::exec::MIGRATE_OFF.with(|c| c.set(true));
+            let p2 = super::parse::parse(q).expect("parses");
+            let t2 = std::time::Instant::now();
+            let b = p2.run(&mut g);
+            arm = arm.min(t2.elapsed().as_secs_f64() * 1000.0);
+            super::exec::MIGRATE_OFF.with(|c| c.set(false));
+            assert_eq!(a, b, "{q}");
+        }
+        out.push((mig / arm, format!("{mig:>8.3}ms mig {arm:>8.3}ms arm  {q}")));
+    }
+    out.sort_by(|a, b| b.0.partial_cmp(&a.0).expect("finite"));
+    for (r, line) in out {
+        println!("PRICE {r:>6.2}x  {line}");
+    }
+}
+
 #[test]
 fn the_migration_route_agrees_with_the_route_it_replaces() {
     let mut lines = String::new();
@@ -6329,23 +6461,8 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         // single NULL key rather than being dropped — same rule as
         // `groupCount().by('m')` would use, exercised here for the reducer arm.
         "g.V().out('R').hasLabel('W').group().by('m').by(__.values('n').sum())",
-        // `n` (present on every row, i % 97 over 2000 nodes): many ties — the
-        // frontier/scan-order tiebreak has to agree between the two routes,
-        // not just the keys.
-        "g.V().out('R').hasLabel('W').order().by('n')",
-        "g.V().out('R').hasLabel('W').order().by('n').limit(5)",
-        "g.V().out('R').hasLabel('W').order().by('n', desc)",
-        "g.V().out('R').hasLabel('W').order().by('n', desc).limit(5)",
-        // `k` is a unique string per node: no ties, both directions.
-        "g.V().out('R').hasLabel('W').order().by('k')",
-        "g.V().out('R').hasLabel('W').order().by('k', desc)",
-        // `m` is absent on ~1/3 of the frontier (`i % 3 == 0`) — nulls-first
-        // ascending, nulls-last descending, with and without a LIMIT that
-        // lands inside the null run.
-        "g.V().out('R').hasLabel('W').order().by('m')",
-        "g.V().out('R').hasLabel('W').order().by('m', desc)",
-        "g.V().out('R').hasLabel('W').order().by('m').limit(5)",
-        "g.V().out('R').hasLabel('W').order().by('m', desc).limit(5)",
+        // `order().by(k)` is NOT here on purpose — see
+        // `order_by_key_declines_the_migration_on_purpose`.
         // `project()` — two keys, a numeric and a string property.
         "g.V().out('R').hasLabel('W').project('n','k').by('n').by('k')",
         // three keys, the third (`m`) absent on some rows — a null in the
@@ -6386,7 +6503,7 @@ fn the_migration_route_agrees_with_the_route_it_replaces() {
         super::exec::MIGRATE_OFF.with(|c| c.set(false));
 
         assert_eq!(via_gql, streamed, "{q}");
-        // Every case here now goes through the new route, `order()` included.
+        // Every case here goes through the new route.
         // At least once. It used to be exactly once, but a tail can migrate in
         // STAGES now — `where(__.out('R')).values('n')` takes the route twice, once
         // for the filter and once for the projection, which is the prefix-split
@@ -7268,5 +7385,50 @@ fn where_not_migration_timing() {
             "TIME migrated {mig:.3}ms  old-arm {old:.3}ms  {:.2}x  {q}",
             old / mig
         );
+    }
+}
+
+/// `order().by(k)` [`.limit(n)`] was migrated to a GQL `ORDER BY` and then taken
+/// BACK OUT, because the translation was correct and 2-2.8x SLOWER than the
+/// `elem_terminal` arm it shadowed — which had to stay regardless, since
+/// `order().by(k).count()` and every other tail shape still decline to it.
+///
+/// Measured at 50k vertices, min of 5, migration on vs `MIGRATE_OFF`:
+///
+/// | query                      | migrated | arm     |       |
+/// |----------------------------|----------|---------|-------|
+/// | `order().by('n')`          | 2.236ms  | 0.840ms | 2.66x |
+/// | `order().by('n').limit(50)`| 0.338ms  | 0.173ms | 1.96x |
+///
+/// The arm gathers the key into a raw `f64` column and partial-sorts it
+/// (`keep_smallest` for the top-k case); the GQL route pays a `Ctx`, a
+/// `ScanCols`, an `eval_vec`, and an `order_overlay` sort scope to reach the
+/// same comparator. That setup amortizes when a projection follows and does not
+/// when the answer IS the sorted elements.
+///
+/// This test pins the decline so the arm cannot be shadowed again by accident.
+/// Correctness of `order().by(k)` itself is covered by the 23 cases in
+/// `tests.rs`/`step_tests_4.rs`, not here.
+#[test]
+fn order_by_key_declines_the_migration_on_purpose() {
+    let mut lines = String::new();
+    for i in 0..200usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{{\"n\":{}}}}}\n",
+            i % 7
+        ));
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+    for (q, want) in [
+        ("g.V().order().by('n')", 200),
+        ("g.V().order().by('n').limit(5)", 5),
+        ("g.V().order().by('n', desc)", 200),
+        ("g.V().order().by('n', desc).limit(5)", 5),
+    ] {
+        super::exec::MIGRATED.with(|c| c.set(0));
+        let rows = super::parse::parse(q).expect("parses").run(&mut g);
+        let took = super::exec::MIGRATED.with(std::cell::Cell::get);
+        assert_eq!(took, 0, "{q}: migrated again — read this test's doc first");
+        assert_eq!(rows.len(), want, "{q}");
     }
 }

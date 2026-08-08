@@ -2282,7 +2282,7 @@ thread_local! {
 }
 
 /// Whether property `key`'s stored column is incapable of holding a STORED
-/// null next to an ABSENT row — the one fact both `order_key` and a
+/// null next to an ABSENT row — the one fact a
 /// `values(k).count()` need before trusting `Val::Null`/`GVal::Null` to mean
 /// only "the key was absent".
 ///
@@ -2396,17 +2396,6 @@ fn shape_projection(
     cols: Vec<Col<'static>>,
     t: &super::to_gql::Tail,
 ) -> Option<Col<'static>> {
-    // `order().by(k)` sorted a key GQL's `ORDER BY` cannot be trusted to
-    // compare the way Gremlin does. GQL's `cmp_total` never faults on a
-    // mismatched pair — it total-orders by type rank — while Gremlin's
-    // comparator records a TYPE FAULT for one (`order_by_mixed_type_property_
-    // faults_not_panics`). DECLINE rather than silently drop the fault.
-    if let Some(key) = &t.order_key {
-        if !homogeneous_or_absent(graph, is_edge, key) {
-            return None;
-        }
-    }
-
     // `project('a','b').by(…)…` — one `Map` per row, zipped from N resolved
     // columns that all share one key vector (the SAME sharing the arm this
     // replaces uses: `MapVal::with_keys` clones the `Arc`, not the keys).
@@ -2621,6 +2610,28 @@ fn as_gremlin_shape(v: GVal) -> GVal {
 
 /// The arms only an ELEMENT column can answer: projections of an element, a walk
 /// off it, and the keyed modulators that read a property column.
+///
+/// This container went 234 lines / 11 arms -> 128 / 3 as each arm found a GQL
+/// spelling. **The last three are not one more push away — each has a reason on
+/// record, and two of them are measurements, not missing translations:**
+///
+/// - `Order` — translating it to a GQL `ORDER BY` WORKS and is 1.96-2.66x
+///   SLOWER (`order_by_key_declines_the_migration_on_purpose` carries the
+///   table). The arm gathers the key into a raw `f64` column and partial-sorts;
+///   the GQL route pays a `Ctx`, a `ScanCols` and an `eval_vec` to reach the
+///   same comparator, which amortizes only when a projection follows.
+/// - `Dedupe` — same shape, measured 1.63-2.00x slower migrated, and the
+///   migration cost +35 executable lines to get there.
+/// - `Where` — not a translation at all. `semi_join_reach` sweeps reachability
+///   BACKWARDS from the frontier; GQL's `exists_semi_join_vec` takes a single
+///   segment, so the multi-hop form has no spelling to migrate INTO. Teaching
+///   GQL the sweep is an algorithm, and the arm survives on edge frontiers
+///   regardless.
+///
+/// Everything else that CAN migrate already does, and profitably: a sweep of all
+/// 60 migrated shapes against the arms they replaced (`zzz_migration_arm_price`)
+/// puts every one between 0.11x and 0.53x of the arm's time. `order().by(k)` was
+/// the sole shadowing loss and it has been taken back out.
 fn elem_terminal(graph: &Graph, ids: &[u32], is_edge: bool, rest: &[Step]) -> Option<Vec<GVal>> {
     // Borrowed. This used to copy the whole id column on entry — 50k `u32` for a
     // query whose answer is `ids.len()` — and it copied again on every peel, so a
