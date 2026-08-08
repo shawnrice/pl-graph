@@ -129,6 +129,22 @@ pub enum Plan {
     /// two NaNs / two -0.0s collapse — the grouping notion, not predicate
     /// equality. Placed above a Project, it is `RETURN DISTINCT …`.
     Distinct { input: Box<Plan> },
+    /// Hash-join two sub-plans on shared bound variables. `on` lists
+    /// `(left_slot, right_slot)` equalities — for `MATCH (a)-[:R]->(b),
+    /// (a)-[:S]->(c)` sharing `a`, that is `[(a_left, a_right)]`.
+    ///
+    /// Slot convention: output slots are ALL of `left`'s slots followed by ALL of
+    /// `right`'s. The shared variable is addressed by its LEFT slot; its right
+    /// copy is present but inert (the front-end simply points the variable at the
+    /// left slot). This keeps the layout trivially predictable — right slot `j`
+    /// becomes output slot `left.len() + j` — at the cost of a duplicated column.
+    /// The join key is bound-variable identity (a node/edge), so it is
+    /// unambiguous and `group_key`-hashed like everything else.
+    Join {
+        left: Box<Plan>,
+        right: Box<Plan>,
+        on: Vec<(usize, usize)>,
+    },
 }
 
 impl Plan {
@@ -181,6 +197,16 @@ impl Plan {
     pub fn distinct(self) -> Self {
         Self::Distinct {
             input: Box::new(self),
+        }
+    }
+
+    /// A hash join (associated, not chained, since it is binary).
+    #[must_use]
+    pub fn join(left: Self, right: Self, on: Vec<(usize, usize)>) -> Self {
+        Self::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            on,
         }
     }
 }

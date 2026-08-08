@@ -130,7 +130,47 @@ fn pull(plan: &Plan, store: &Store) -> Batch {
                 .collect();
             batch.gather(&keep)
         }
+        Plan::Join { left, right, on } => hash_join(&pull(left, store), &pull(right, store), on),
     }
+}
+
+/// Hash-join two batches on `(left_slot, right_slot)` key equalities. Output is
+/// every left slot gathered by the matched left rows, followed by every right
+/// slot gathered by the matched right rows — so right slot `j` lands at output
+/// slot `left.len() + j`. Keys are `group_key`-hashed (bound-variable identity),
+/// consistent with grouping/distinct.
+fn join_key(batch: &Batch, slots: impl Iterator<Item = usize>, row: usize) -> String {
+    let mut k = String::new();
+    for s in slots {
+        k.push_str(&value::group_key(&batch.slot(s).value_at(row)));
+        k.push('\u{1}');
+    }
+    k
+}
+
+fn hash_join(lb: &Batch, rb: &Batch, on: &[(usize, usize)]) -> Batch {
+    // Index the right side by its join key.
+    let mut index: HashMap<String, Vec<usize>> = HashMap::new();
+    for j in 0..rb.rows() {
+        let k = join_key(rb, on.iter().map(|&(_, r)| r), j);
+        index.entry(k).or_default().push(j);
+    }
+    // Probe with the left side, emitting one combined row per match (a shared key
+    // with several matches on each side fans out to their product).
+    let mut keep_l = Vec::new();
+    let mut keep_r = Vec::new();
+    for i in 0..lb.rows() {
+        let k = join_key(lb, on.iter().map(|&(l, _)| l), i);
+        if let Some(js) = index.get(&k) {
+            for &j in js {
+                keep_l.push(i);
+                keep_r.push(j);
+            }
+        }
+    }
+    let mut slots: Vec<Col> = lb.slots.iter().map(|c| c.gather(&keep_l)).collect();
+    slots.extend(rb.slots.iter().map(|c| c.gather(&keep_r)));
+    Batch::of(slots)
 }
 
 /// Sort the batch by `keys` (stable; ascending via `cmp_total`, descending its
@@ -989,5 +1029,93 @@ mod tests {
         let mut got = names_of(&out, 0);
         got.sort();
         assert_eq!(got, vec!["bob", "carol"]);
+    }
+
+    // --- Join (multi-pattern / shared variable) ---
+
+    /// `MATCH (a)-[:KNOWS]->(b), (a)-[:WORKS_ON]->(c)` sharing `a`. Left slots
+    /// [a,b], right slots [a,c]; join on left a (0) == right a (0); output slots
+    /// [a, b, a', c]. Only alice has a WORKS_ON, so only her KNOWS rows survive.
+    #[test]
+    fn join_shared_start_variable() {
+        let store = social();
+        let left = scan("Person").expand(0, Dir::Out, Some("KNOWS"));
+        let right = scan("Person").expand(0, Dir::Out, Some("WORKS_ON"));
+        let plan = Plan::join(left, right, vec![(0, 0)]).project(vec![
+            ("a".into(), prop(0, "name")),
+            ("b".into(), prop(1, "name")),
+            ("c".into(), prop(3, "name")), // right slot 1 -> output slot 2+1=3
+        ]);
+        let out = run(&plan, &store);
+        let mut pairs: Vec<(String, String, String)> = out
+            .rows
+            .iter()
+            .map(|r| (as_str(&r[0]), as_str(&r[1]), as_str(&r[2])))
+            .collect();
+        pairs.sort();
+        // alice KNOWS {bob,carol}, WORKS_ON {graphdb}: 2x1 = 2 rows. bob has no
+        // WORKS_ON, so bob->carol drops.
+        assert_eq!(
+            pairs,
+            vec![
+                ("alice".into(), "bob".into(), "graphdb".into()),
+                ("alice".into(), "carol".into(), "graphdb".into()),
+            ]
+        );
+    }
+
+    /// The join fans out to the PRODUCT per shared key: a person with 2 R and 2 S
+    /// neighbours yields 4 combined rows.
+    #[test]
+    fn join_is_product_per_shared_key() {
+        let mut b = Builder::default();
+        let a = b.node(&["P"], &[("name", s("a"))]);
+        let r1 = b.node(&["P"], &[("name", s("r1"))]);
+        let r2 = b.node(&["P"], &[("name", s("r2"))]);
+        let s1 = b.node(&["P"], &[("name", s("s1"))]);
+        let s2 = b.node(&["P"], &[("name", s("s2"))]);
+        b.edge(a, r1, "R");
+        b.edge(a, r2, "R");
+        b.edge(a, s1, "S");
+        b.edge(a, s2, "S");
+        let store = b.build();
+        let left = scan("P").expand(0, Dir::Out, Some("R"));
+        let right = scan("P").expand(0, Dir::Out, Some("S"));
+        let plan = Plan::join(left, right, vec![(0, 0)]).project(vec![
+            ("r".into(), prop(1, "name")),
+            ("s".into(), prop(3, "name")),
+        ]);
+        let out = run(&plan, &store);
+        assert_eq!(out.rows.len(), 4); // {r1,r2} x {s1,s2}
+        let mut pairs: Vec<(String, String)> = out
+            .rows
+            .iter()
+            .map(|r| (as_str(&r[0]), as_str(&r[1])))
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("r1".into(), "s1".into()),
+                ("r1".into(), "s2".into()),
+                ("r2".into(), "s1".into()),
+                ("r2".into(), "s2".into()),
+            ]
+        );
+    }
+
+    /// A left key with no right match drops (inner join).
+    #[test]
+    fn join_drops_unmatched() {
+        let store = social();
+        // Everyone with a KNOWS edge, joined to everyone with a WORKS_ON edge on
+        // the SAME person. Only alice has both, so bob (KNOWS only) drops.
+        let left = scan("Person").expand(0, Dir::Out, Some("KNOWS"));
+        let right = scan("Person").expand(0, Dir::Out, Some("WORKS_ON"));
+        let plan = Plan::join(left, right, vec![(0, 0)])
+            .project(vec![("a".into(), prop(0, "name"))])
+            .distinct();
+        let out = run(&plan, &store);
+        assert_eq!(names_of(&out, 0), vec!["alice"]);
     }
 }
