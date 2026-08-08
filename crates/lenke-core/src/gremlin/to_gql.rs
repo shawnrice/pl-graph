@@ -195,6 +195,20 @@ fn label_ref(labels: &mut Vec<String>, name: &str) -> usize {
 /// single untyped-or-typed hop off the bound slot, optionally landing on a label.
 /// Anything richer (a chain, a property test, an inner predicate) returns `None`
 /// and Gremlin's own `semi_join_hop` keeps it.
+///
+/// A CHAIN was tried and REVERTED, because building one here is not the hard part.
+/// `CPath` holds a `Vec<CSegment>`, so `where(__.out().out())` compiles fine — and
+/// then `exists_semi_join_vec` declines it (`let [seg] = path.segments`), the
+/// projection falls to the per-row scalar matcher, and the shaper rejects the
+/// boxed bool it gets back. The whole thing was inert: `migrated=0` on every
+/// chained shape, with Gremlin's arm still answering.
+///
+/// Making it real means teaching GQL what `semi_join_reach` already does — a
+/// BACKWARDS reachability sweep over the whole graph from the far end, not a walk
+/// per candidate row. That is a genuinely better algorithm than a naive chain
+/// walk, so a half-migration here would be slower than what it replaced. And it
+/// would free nothing: `[Step::Where]` also answers an EDGE frontier and a landed
+/// property test, so the arm stays either way.
 fn exists_of(slot: usize, labels: &mut Vec<String>, body: &[Step]) -> Option<CExpr> {
     use crate::gql::ast::Direction;
     use crate::gql::plan::{CLabelExpr, CNode, CPath, CRel, CSegment};
