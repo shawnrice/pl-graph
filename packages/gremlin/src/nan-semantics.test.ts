@@ -11,7 +11,7 @@ import type { Plan, Predicate } from './ast.js';
 import { run } from './executor.js';
 import { createTestTinkerGraph } from './fixtures/createTestTinkerGraph.js';
 import { between, gt, gte, inside, lt, lte, outside } from './predicates.js';
-import { dedupe, inject, is } from './steps.js';
+import { dedupe, inject, is, max, min, order } from './steps.js';
 import { traversal } from './traversal.js';
 
 // inject() is a literal source and never reads the graph, but `run` wants one.
@@ -47,6 +47,31 @@ describe('NaN is filtered by every ordering predicate (JS: NaN compares false)',
   test('outside drops NaN', () => {
     // outside(2, 2): value < 2 || value > 2 — keeps 1 and 3, drops NaN.
     expect(over(outside(2, 2))).toEqual([1, 3]);
+  });
+});
+
+describe('order()/min()/max() use a total order (NaN last, deterministic)', () => {
+  // order/min/max use `compareOrder` (NaN sorts last, NaN === NaN) — a TOTAL
+  // order, so the result is deterministic and identical to the Rust engine (a
+  // total comparator makes the sort algorithm irrelevant). This is the language
+  // rule (TinkerPop's `Double.compare` / SQL), distinct from the predicate path
+  // above, where NaN stays JS-unordered and is filtered.
+
+  test('min() never picks the NaN (largest) → smallest real value', () => {
+    // NaN leading, to prove position-independence (no "sticky first" quirk).
+    expect(arr(traversal(inject(Number.NaN, 3, 1), min()))).toEqual([1]);
+  });
+
+  test('max() keeps the NaN — it is the largest (like JS Math.max)', () => {
+    const r = arr(traversal(inject(3, Number.NaN, 1), max()));
+    expect(r).toHaveLength(1);
+    expect(Number.isNaN(r[0])).toBe(true);
+  });
+
+  test('order() sorts the NaN last, deterministically', () => {
+    expect(
+      arr(traversal(inject(3, Number.NaN, 1), order())).map((x) => (Number.isNaN(x) ? 'NaN' : x)),
+    ).toEqual([1, 3, 'NaN']);
   });
 });
 

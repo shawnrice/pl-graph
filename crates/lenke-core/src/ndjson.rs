@@ -1239,4 +1239,18 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn numeric_id_beyond_2p53_matches_js_json_parse() {
+        // A numeric id >= 2^53 truncates to the SAME string JS `JSON.parse` +
+        // `String(id)` yields (9007199254740993 -> 9007199254740992). This is
+        // intentional and cross-engine-consistent: the graph's number model is
+        // f64, and the TS engine loses the same precision at `JSON.parse`, so a
+        // numeric id past the safe-integer range would never round-trip through
+        // the client anyway. Use a *string* id for exact large values.
+        let line = r#"{"type":"node","id":9007199254740993,"labels":["N"],"properties":{}}"#;
+        let g = decode(line).unwrap();
+        assert!(g.vid.get("9007199254740992").is_some());
+        assert!(g.vid.get("9007199254740993").is_none());
+    }
 }
