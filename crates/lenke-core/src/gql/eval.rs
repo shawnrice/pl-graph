@@ -4069,6 +4069,10 @@ pub(crate) fn without_walk_count<T>(f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Re-exported for the tests in `gql::tests`, which live outside this module.
+#[cfg(test)]
+pub(crate) use scan::forcing_dense_group_keys;
+
 /// Build a `Col::Bool` from a Kleene-truth stream (`None` → invalid/UNKNOWN).
 fn kleene_vec(it: impl Iterator<Item = Truth>) -> Col {
     let mut t = Vec::new();

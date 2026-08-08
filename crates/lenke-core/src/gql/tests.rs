@@ -13790,3 +13790,73 @@ fn a_comma_join_product_counts_each_seeds_fan_out() {
         vec![vec![n(2.0)]],
     );
 }
+
+/// The dense group-key table and the hashing path must produce the same groups,
+/// in the same ORDER, on every key they both accept.
+///
+/// `forcing_dense_group_keys` is what makes this test mean anything: the table
+/// has a 65536-row floor, so without the force every case here would take the
+/// hashing path on both sides of the comparison.
+#[test]
+fn dense_and_hashed_group_keys_agree_in_order() {
+    let mut g = graph_of(&[
+        // `city` repeats so groups have several members; `tag` is absent on some
+        // nodes so the NULL group is exercised; ids are deliberately arranged so
+        // vertex order and first-seen order differ.
+        r#"{"type":"node","id":"a","labels":["P"],"properties":{"city":"zed","n":1}}"#,
+        r#"{"type":"node","id":"b","labels":["P"],"properties":{"city":"amy","n":2,"tag":"t"}}"#,
+        r#"{"type":"node","id":"c","labels":["P"],"properties":{"city":"zed","n":3}}"#,
+        r#"{"type":"node","id":"d","labels":["P"],"properties":{"city":"amy","n":4,"tag":"t"}}"#,
+        r#"{"type":"node","id":"e","labels":["P"],"properties":{"city":"mid","n":5}}"#,
+        r#"{"type":"edge","id":"g1","from":"a","to":"c","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"g2","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"g3","from":"b","to":"d","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"g4","from":"c","to":"e","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"g5","from":"e","to":"a","labels":["R"],"properties":{}}"#,
+    ]);
+    for q in [
+        // Group by the ELEMENT — the key the dense table exists for, and the one
+        // the PageRank-shaped gather uses.
+        "MATCH (m:P)-[:R]->(n) WITH n, sum(m.n) AS s RETURN count(*) AS c",
+        "MATCH (m:P)-[:R]->(n) RETURN n AS n, count(*) AS c",
+        "MATCH (m:P)-[:R]->(n) RETURN n AS n, sum(m.n) AS s",
+        // Group by an interned STRING id, which is dense too.
+        "MATCH (m:P)-[:R]->(n) RETURN n.city AS city, count(*) AS c",
+        // A key ABSENT on some rows keeps its own NULL group, and the reserved
+        // slot must not collide with id 0.
+        "MATCH (m:P)-[:R]->(n) RETURN n.tag AS tag, count(*) AS c",
+        // A NUMERIC key is not dense (`group_key_bits` spreads over the u64
+        // range) — it must decline to hashing and still be right.
+        "MATCH (m:P)-[:R]->(n) RETURN n.n AS n, count(*) AS c",
+        // Several aggregates over one key.
+        "MATCH (m:P)-[:R]->(n) RETURN n.city AS city, count(*) AS c, min(m.n) AS lo, max(m.n) AS hi",
+        // Two keys — the refinement path, which the dense table does not take.
+        "MATCH (m:P)-[:R]->(n) RETURN n.city AS city, n.tag AS tag, count(*) AS c",
+    ] {
+        let dense = super::eval::forcing_dense_group_keys(|| rows(&mut g, q));
+        let hashed = rows(&mut g, q);
+        assert_eq!(dense, hashed, "dense group keys != hashed for `{q}`");
+    }
+}
+
+/// Group order is FIRST-SEEN, and the dense table assigns group ids by array
+/// SLOT — so it would be very easy for it to emit groups in id order instead.
+///
+/// The fixture is built so the two disagree: `"amy"` is interned first (it is
+/// the source node's own city, seen at insert time) and so has the LOWER string
+/// id, but the first edge lands on `"zed"`. First-seen order is zed, amy; slot
+/// order is amy, zed.
+#[test]
+fn a_dense_group_key_still_emits_first_seen_order() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["P"],"properties":{"city":"amy"}}"#,
+        r#"{"type":"node","id":"b","labels":["P"],"properties":{"city":"zed"}}"#,
+        r#"{"type":"node","id":"c","labels":["P"],"properties":{"city":"amy"}}"#,
+        r#"{"type":"edge","id":"g1","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"g2","from":"a","to":"c","labels":["R"],"properties":{}}"#,
+    ]);
+    let q = "MATCH (m:P)-[:R]->(n) RETURN n.city AS city, count(*) AS c";
+    let dense = super::eval::forcing_dense_group_keys(|| rows(&mut g, q));
+    assert_eq!(dense, rows(&mut g, q));
+    assert_eq!(dense, vec![vec![s("zed"), n(1.0)], vec![s("amy"), n(1.0)]]);
+}

@@ -1833,6 +1833,59 @@ pub(super) fn raw_bits_of(
     }
 }
 
+/// How wide a direct-index table the raw key bits need, or `None` if indexing
+/// them would cost more than hashing them.
+///
+/// Two ways to lose, and both have been measured elsewhere in this file: a key
+/// that is not dense (`f64` bits — `group_key_bits` spreads over the whole u64
+/// range) would ask for an impossible allocation, and a small row count cannot
+/// amortize even a modest one. The `1 << 23` ceiling is 64MB of `usize`, and the
+/// `n` floor keeps the table off queries that would not notice the hashing.
+fn dense_key_width(col: &[Option<u64>], n: usize) -> Option<usize> {
+    const MAX_WIDTH: u64 = 1 << 23;
+    const MIN_ROWS: usize = 1 << 16;
+    if n < MIN_ROWS && !dense_group_keys_forced() {
+        return None;
+    }
+    let mut max = 0u64;
+    for v in col.iter().flatten() {
+        if *v > max {
+            max = *v;
+        }
+        if max >= MAX_WIDTH {
+            return None;
+        }
+    }
+    // +1 for the reserved NULL slot, +1 because `max` is an index.
+    Some(max as usize + 2)
+}
+
+/// The general single-key grouping: hash the raw bits, numbering groups by first
+/// appearance in row order.
+fn group_by_hashing(
+    col: Vec<Option<u64>>,
+    mut gid_of_row: Vec<usize>,
+    n: usize,
+) -> (Vec<usize>, Vec<usize>, usize) {
+    let mut map: FxHashMap<Option<u64>, usize> = FxHashMap::default();
+    let mut next = 0usize;
+    for i in 0..n {
+        let g = *map.entry(col[i]).or_insert_with(|| {
+            let g = next;
+            next += 1;
+            g
+        });
+        gid_of_row[i] = g;
+    }
+    let mut rep_row = vec![usize::MAX; next];
+    for (i, &g) in gid_of_row.iter().enumerate() {
+        if rep_row[g] == usize::MAX {
+            rep_row[g] = i;
+        }
+    }
+    (gid_of_row, rep_row, next)
+}
+
 /// Assign a dense group id per row by grouping on `key_items`. Multi-key grouping
 /// is done by *refinement*: start with one group, then split each current group
 /// by each key column's value in turn. Because the final pass numbers groups in
@@ -1850,6 +1903,44 @@ pub(super) fn group_ids(
     let n = sc.n;
     let mut gid_of_row = vec![0usize; n];
     let mut ngroups = 1; // global group (overwritten once any key column refines)
+
+    // ONE key whose raw bits are a dense small integer — an element id, or an
+    // interned string id — is a direct array index, not a hash lookup. That is
+    // the PageRank/CC-shaped gather (`MATCH (m)-[:R]->(n) WITH n, sum(m.age)`),
+    // where the map below does 8M inserts to produce 1M groups and the hashing
+    // is most of the query: 337ms against 35ms for a dense tally.
+    //
+    // Group numbering stays first-appearance in row order — the same rule the
+    // refinement path uses and the same one the scalar engine's order depends
+    // on — because the id is assigned on first sight while scanning rows in
+    // order. Slot 0 is reserved for the NULL group so an absent key keeps its
+    // own group without a second structure.
+    if let [item] = key_items {
+        let col = key_raw_col(graph, ctx, sc, item)?;
+        if let Some(width) = dense_key_width(&col, n) {
+            let mut at = vec![usize::MAX; width];
+            let mut next = 0usize;
+            for i in 0..n {
+                let slot = col[i].map_or(0, |b| b as usize + 1);
+                let g = &mut at[slot];
+                if *g == usize::MAX {
+                    *g = next;
+                    next += 1;
+                }
+                gid_of_row[i] = *g;
+            }
+            let mut rep_row = vec![usize::MAX; next];
+            for (i, &g) in gid_of_row.iter().enumerate() {
+                if rep_row[g] == usize::MAX {
+                    rep_row[g] = i;
+                }
+            }
+            return Some((gid_of_row, rep_row, next));
+        }
+        // Fall through to the hashing path with the column already computed.
+        return Some(group_by_hashing(col, gid_of_row, n));
+    }
+
     for &item in key_items {
         let col = key_raw_col(graph, ctx, sc, item)?;
         // FxHash, not SipHash: this refines groups by hashing a short key per row —
@@ -2341,6 +2432,30 @@ pub(super) fn vectorized_cols(
 
 thread_local! {
     static FUSE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Drop `dense_key_width`'s row floor. Test-only — see
+    /// [`forcing_dense_group_keys`].
+    static DENSE_KEYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn dense_group_keys_forced() -> bool {
+    DENSE_KEYS.with(std::cell::Cell::get)
+}
+
+/// Run `f` with the dense group-key table's ROW FLOOR removed, so a test can
+/// exercise it on a graph small enough to reason about. Test-only.
+///
+/// Without this the direct-index path is unreachable from the suite: it needs
+/// 65536 rows before it will allocate a table, and every grouping test in this
+/// file is orders of magnitude smaller — so they all measure the hashing path
+/// and would pass whatever the dense one computed. Group ORDER is the thing at
+/// risk (both paths must number groups by first appearance in row order), and
+/// order is exactly what a small fixture is good at pinning.
+#[cfg(test)]
+pub(crate) fn forcing_dense_group_keys<T>(f: impl FnOnce() -> T) -> T {
+    let prev = DENSE_KEYS.with(|c| c.replace(true));
+    let out = f();
+    DENSE_KEYS.with(|c| c.set(prev));
+    out
 }
 
 fn fusion_enabled() -> bool {
