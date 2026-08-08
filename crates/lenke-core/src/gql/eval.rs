@@ -3860,6 +3860,15 @@ fn exists_semi_join_vec(
     // row and keeps the general path.
     let far_consts = const_props(graph, ctx, &node.props)?;
 
+    // A NARROW far end is answered backwards: mark the far set, sweep the
+    // adjacency once into a per-vertex bitmap, and the per-row test becomes a
+    // bitmap read. See `semi_join_back`.
+    if let Some(reached) = semi_join_back(graph, ctx, seg, ids.len()) {
+        let t: Vec<bool> = ids.iter().map(|&v| reached[v as usize]).collect();
+
+        return Some(Col::Bool { t, valid: None });
+    }
+
     let t: Vec<bool> = ids
         .iter()
         .map(|&v| {
@@ -3871,6 +3880,170 @@ fn exists_semi_join_vec(
         .collect();
 
     Some(Col::Bool { t, valid: None })
+}
+
+/// `EXISTS { (u)-[:R]->(far) }` answered BACKWARDS, when the far end is narrow
+/// enough to pay for it. Returns a per-vertex-slot bitmap (index it with a
+/// vertex id), or `None` to leave the caller on its per-row forward test.
+///
+/// Forward, the test is `O(rows · degree)` — and the whole degree is walked
+/// exactly on the rows where no neighbour matches, which for a selective far end
+/// is nearly all of them. `MATCH (a:Person) WHERE EXISTS { (a)-[:KNOWS]->(:Hub) }
+/// RETURN count(*)` over 1M vertices / 8M edges walked all 8M edges to answer a
+/// question about the 1000 `Hub`s: 505ms. Seeded from the `Hub` bucket and swept
+/// backwards it is `O(|far| · degree + |V|)`: 0.25ms.
+///
+/// This is the same `seek::reach_back` Gremlin's `where(__.out('T'))` uses, and
+/// the reason it is worth having in ONE place: the two languages are asking one
+/// question. It sits inside `exists_semi_join_vec` rather than beside it as
+/// another shape recognizer, so it serves every `EXISTS` over a bound element
+/// column — a filter, a projection, a `count(*)` — instead of one spelling of
+/// one query.
+///
+/// Three things have to hold, and all three are about not paying more than the
+/// forward walk it replaces:
+///
+/// 1. **The edge type must lower to ids.** `expand` filters edges through a
+///    label EXPRESSION per edge; `reach_back` takes a resolved id list. Anything
+///    `lower_labels` cannot lower (a negation, a variable) stays forward.
+/// 2. **The far end must be constrained.** With no label and no properties the
+///    far set is every vertex, so the sweep marks the whole graph and answers a
+///    question the forward walk answers on the first edge.
+/// 3. **The far set must be SMALL** — see the cap below.
+fn semi_join_back(graph: &Graph, ctx: &Ctx, seg: &CSegment, rows: usize) -> Option<Vec<bool>> {
+    let mode = SEMI_BACK.with(std::cell::Cell::get);
+    if mode == SemiBack::Off {
+        return None;
+    }
+
+    let rel = &seg.rel;
+    let node = &seg.node;
+
+    // (2) — an unconstrained far end.
+    if node.label.is_none() && node.props.is_empty() {
+        return None;
+    }
+
+    // (1) — and an edge label that resolved to NOTHING (`Some(&[])`) is left
+    // alone on purpose: it means "matches nothing", `reach_back` would return an
+    // all-false map correctly, but so does the forward walk, and routing it here
+    // would put an untested branch on a query that is already instant.
+    let etypes = match rel.label.as_ref() {
+        None => None,
+        Some(l) => {
+            let ids = seek_lower::lower_labels(l, ctx, true)?;
+            if ids.is_empty() {
+                return None;
+            }
+            Some(ids)
+        }
+    };
+
+    // (3) — the break-even. Forward costs one adjacency walk per row; backward
+    // costs one per far-end seed, plus a `|V|` bitmap to build and a `rows` pass
+    // to read it. Degree cancels out of both walk terms, so the seed count is
+    // what decides it, and `avg_deg` only has to be right enough to price the
+    // bitmap against a walk. A graph with no edges never gets here (the caller's
+    // pattern has a segment), so the divisor is safe.
+    let verts = graph.vertex_slots();
+    let cap = if mode == SemiBack::Force {
+        usize::MAX - 1
+    } else {
+        let avg_deg = (graph.edge_count() as f64 / graph.vertex_count().max(1) as f64).max(1.0);
+        let budget = rows as f64 - (verts + rows) as f64 / avg_deg;
+        if budget <= 0.0 {
+            return None;
+        }
+        budget as usize
+    };
+
+    // The cap is what keeps the DECISION from costing more than the thing it is
+    // deciding about. Scanning a far end that turns out to be half the graph, to
+    // then conclude the forward walk was cheaper, would be the expensive half of
+    // both plans. `scan_node` stops at the cap, so a wide far end costs `cap`
+    // and no more — and hitting the cap IS the "not narrow enough" answer.
+    // `scan_node`'s scope only has to be wide enough to hold the far node's own
+    // slot while it checks that node's inline props — the caller has already
+    // refused a far `WHERE`, and `const_props` has already refused a constraint
+    // that reads any OTHER slot, so nothing else can be read out of it.
+    let scope = node.var_slot.map_or(1, |s| s + 1);
+    let seeds = seek_lower::scan_node(graph, ctx, node, None, scope, Some(cap + 1));
+    if seeds.len() > cap {
+        return None;
+    }
+
+    let mut far = vec![false; verts];
+    for v in seeds {
+        far[v as usize] = true;
+    }
+
+    let dir = match rel.direction {
+        Direction::Out => crate::seek::Dir::Out,
+        Direction::In => crate::seek::Dir::In,
+        Direction::Both => crate::seek::Dir::Both,
+    };
+
+    // `SelfLoops::Once` — the same convention `expand` walks with. `Twice` is
+    // Gremlin's, and using it here would make `(a)-[:R]->(a)` a different
+    // question than the forward path answers.
+    Some(crate::seek::reach_back(
+        graph,
+        &[(dir, etypes)],
+        far,
+        crate::seek::SelfLoops::Once,
+    ))
+}
+
+/// Which way `semi_join_back` is allowed to answer. `Auto` is the only value
+/// outside tests.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SemiBack {
+    /// Decide on the cost model.
+    Auto,
+    /// Never sweep backwards — the forward walk, for a test to compare against.
+    Off,
+    /// Sweep backwards whenever the SHAPE allows, skipping the cost model.
+    ///
+    /// This exists because the cost model makes the fast route untestable. Its
+    /// break-even needs `rows` to exceed `(|V| + rows) / avg_degree`, which no
+    /// unit-test graph does — on the eight-vertex `semi_join_fixture` the budget
+    /// comes out NEGATIVE, so every test written against it would silently
+    /// measure the forward walk and pass no matter what the sweep did. Forcing
+    /// the shape decision without the size decision is what makes the two routes
+    /// comparable on a graph small enough to reason about.
+    Force,
+}
+
+thread_local! {
+    static SEMI_BACK: std::cell::Cell<SemiBack> = const { std::cell::Cell::new(SemiBack::Auto) };
+}
+
+/// Run `f` with the backward semi-join sweep disabled, so a test can execute the
+/// same query both ways and compare. Test-only.
+///
+/// The two routes have to agree ROW FOR ROW, not just in the count: the backward
+/// one answers from a bitmap and the forward one from a walk, and the ways they
+/// can disagree — a self-loop counted once or twice, an edge type that resolved
+/// to nothing read as "any", a `Both` hop reversed — all produce a plausible
+/// number.
+#[cfg(test)]
+pub(crate) fn without_backward_semi_join<T>(f: impl FnOnce() -> T) -> T {
+    with_semi_back(SemiBack::Off, f)
+}
+
+/// Run `f` with the backward sweep forced on for every shape that allows it.
+/// Test-only — see [`SemiBack::Force`].
+#[cfg(test)]
+pub(crate) fn forcing_backward_semi_join<T>(f: impl FnOnce() -> T) -> T {
+    with_semi_back(SemiBack::Force, f)
+}
+
+#[cfg(test)]
+fn with_semi_back<T>(mode: SemiBack, f: impl FnOnce() -> T) -> T {
+    let prev = SEMI_BACK.with(|c| c.replace(mode));
+    let out = f();
+    SEMI_BACK.with(|c| c.set(prev));
+    out
 }
 
 /// Build a `Col::Bool` from a Kleene-truth stream (`None` → invalid/UNKNOWN).

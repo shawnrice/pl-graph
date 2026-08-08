@@ -13418,3 +13418,100 @@ fn clause_sequence_columnar_exit_probe() {
         );
     }
 }
+
+/// A fixture with the shapes a BACKWARD semi-join sweep can get wrong, all in a
+/// graph small enough to check by hand: a self-loop (`e`), a directed triangle
+/// (`p→q→r→p`), a multi-label far end (`b` is `V,W`), two edge types on the same
+/// source (`a-R->b`, `a-S->c`), and a vertex with no edges at all (`d`).
+fn back_semi_fixture() -> Graph {
+    semi_join_fixture()
+}
+
+/// The two routes must agree ROW FOR ROW on every shape the sweep accepts.
+///
+/// `forcing_backward_semi_join` is what makes this test mean anything: the cost
+/// model would decline all of these on an eight-vertex graph, so without the
+/// force this would compare the forward walk against itself and pass no matter
+/// what the sweep computed.
+#[test]
+fn a_backward_semi_join_agrees_with_the_forward_walk() {
+    let mut g = back_semi_fixture();
+    for q in [
+        // Labeled far end — the shape the sweep exists for.
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R]->(:W) } RETURN u.id AS id",
+        "MATCH (u:V) WHERE NOT EXISTS { (u)-[:R]->(:W) } RETURN u.id AS id",
+        // The far end is the SOURCE's own label, so the self-loop at `e` and
+        // every triangle edge qualify — a hop reversed the wrong way shows up
+        // here as the triangle answering backwards.
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R]->(:V) } RETURN u.id AS id",
+        "MATCH (u:Tri) WHERE EXISTS { (u)-[:R]->(:Tri) } RETURN u.id AS id",
+        // Reversed direction, and undirected — `Both` must not become `Out`.
+        "MATCH (u:V) WHERE EXISTS { (u)<-[:R]-(:V) } RETURN u.id AS id",
+        "MATCH (u:Tri) WHERE EXISTS { (u)<-[:R]-(:Tri) } RETURN u.id AS id",
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R]-(:V) } RETURN u.id AS id",
+        // An inline property constraint instead of a label, and both together.
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R]->({id: 'b'}) } RETURN u.id AS id",
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R]->(:W {id: 'b'}) } RETURN u.id AS id",
+        // A constraint that matches NOTHING: an empty far set must sweep to an
+        // all-false map, not to "unconstrained".
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R]->(:W {id: 'zzz'}) } RETURN u.id AS id",
+        // An edge type that does not exist matches nothing — the conflation this
+        // module has written five times reads it as ANY type instead.
+        "MATCH (u:V) WHERE EXISTS { (u)-[:NOPE]->(:W) } RETURN u.id AS id",
+        // A type UNION lowers to two ids; `S` only reaches `c`, `R` only `b`.
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R|S]->(:V) } RETURN u.id AS id",
+        // EXISTS as a projected value, not a filter — same column, different
+        // consumer.
+        "MATCH (u:V) RETURN u.id AS id, EXISTS { (u)-[:R]->(:W) } AS r",
+        // …and folded, which is the shape the whole thing was slow for.
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R]->(:W) } RETURN count(*) AS c",
+    ] {
+        let back = super::eval::forcing_backward_semi_join(|| rows(&mut g, q));
+        let fwd = super::eval::without_backward_semi_join(|| rows(&mut g, q));
+        assert_eq!(back, fwd, "backward != forward for `{q}`");
+    }
+}
+
+/// The self-loop is the case the two `SelfLoops` conventions disagree about:
+/// GQL walks it ONCE and Gremlin twice, and `reach_back` takes that as a
+/// parameter. `e-[:R]->e` means `e` reaches a `:V`, exactly once.
+#[test]
+fn a_backward_semi_join_walks_a_self_loop_once() {
+    let mut g = back_semi_fixture();
+    let q = "MATCH (u:V) WHERE EXISTS { (u)-[:R]->(:V) } RETURN u.id AS id";
+    let back = super::eval::forcing_backward_semi_join(|| rows(&mut g, q));
+    // `a→b` and the `e→e` loop; `b`, `c`, `d` have no `R` out-edge to a `:V`.
+    assert_eq!(back, vec![vec![s("a")], vec![s("e")]]);
+}
+
+/// An UNCONSTRAINED far end declines the sweep — with no label and no property
+/// the far set is every vertex, so the sweep would mark the whole graph to
+/// answer what the forward walk answers on the first edge. The answer must stay
+/// right either way.
+#[test]
+fn an_unconstrained_far_end_stays_on_the_forward_walk() {
+    let mut g = back_semi_fixture();
+    let q = "MATCH (u:V) WHERE EXISTS { (u)-[:R]->() } RETURN u.id AS id";
+    let forced = super::eval::forcing_backward_semi_join(|| rows(&mut g, q));
+    let fwd = super::eval::without_backward_semi_join(|| rows(&mut g, q));
+    assert_eq!(
+        forced, fwd,
+        "an unconstrained far end must not change the answer"
+    );
+    assert_eq!(forced, vec![vec![s("a")], vec![s("e")]]);
+}
+
+/// The cost model declines a far end that is not narrower than the outer set.
+/// Forcing the sweep must not change the ANSWER — only which route computes it —
+/// so a graph where every vertex is a valid far end is still correct both ways.
+#[test]
+fn a_wide_far_end_agrees_with_the_narrow_route() {
+    let mut g = back_semi_fixture();
+    // Every `:V` is a far-end candidate here, so the far set is as wide as the
+    // outer set — the case the `cap` exists to turn away.
+    let q = "MATCH (u:V) WHERE EXISTS { (u)-[:R]->(:V) } RETURN count(*) AS c";
+    let auto = rows(&mut g, q);
+    let forced = super::eval::forcing_backward_semi_join(|| rows(&mut g, q));
+    assert_eq!(auto, forced);
+    assert_eq!(auto, vec![vec![n(2.0)]]);
+}
