@@ -13515,3 +13515,121 @@ fn a_wide_far_end_agrees_with_the_narrow_route() {
     assert_eq!(auto, forced);
     assert_eq!(auto, vec![vec![n(2.0)]]);
 }
+
+/// A graph built so that WALK and TRAIL counts differ: two self-loops, parallel
+/// edges, and a cycle back to the start. `try_walk_count` folds walks and GQL
+/// counts trails, so every assertion here is really about the correction.
+fn trail_vs_walk_fixture() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"k":1}}"#,
+        r#"{"type":"node","id":"b","labels":["N"],"properties":{"k":2}}"#,
+        r#"{"type":"node","id":"c","labels":["M"],"properties":{"k":3}}"#,
+        r#"{"type":"edge","id":"x1","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"x2","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"x3","from":"b","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"x4","from":"a","to":"a","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"x5","from":"b","to":"c","labels":["S"],"properties":{}}"#,
+    ])
+}
+
+/// The counting shortcut must agree with the enumerating matcher on every shape
+/// it accepts — most of all the two-hop ones, where a walk may take one edge
+/// twice and a trail may not.
+#[test]
+fn the_walk_count_shortcut_agrees_with_enumeration() {
+    let mut g = trail_vs_walk_fixture();
+    for q in [
+        // One hop: walks and trails are the same, with and without DISTINCT.
+        "MATCH (a)-[:R]->(b) RETURN count(*) AS c",
+        "MATCH (a:N)-[:R]->(b) RETURN count(*) AS c",
+        "MATCH (a)-[:R]->(b) RETURN count(DISTINCT b) AS c",
+        "MATCH (a)<-[:R]-(b) RETURN count(*) AS c",
+        "MATCH (a)-[:R]-(b) RETURN count(*) AS c",
+        // Two hops — the self-loops at `a` and `b` make walks exceed trails.
+        "MATCH (a)-[:R]->()-[:R]->(c) RETURN count(*) AS c",
+        "MATCH (a:N)-[:R]->()-[:R]->(c) RETURN count(*) AS c",
+        "MATCH (a)<-[:R]-()<-[:R]-(c) RETURN count(*) AS c",
+        // Mixed types across the hops: the same edge can only be reused when it
+        // matches BOTH, which `S` does not.
+        "MATCH (a)-[:R]->()-[:S]->(c) RETURN count(*) AS c",
+        "MATCH (a)-[:R|S]->()-[:R]->(c) RETURN count(*) AS c",
+        // Quantified, which decomposes into the fixed lengths and corrects each.
+        "MATCH (a)-[:R]->{1,2}(b) RETURN count(*) AS c",
+        "MATCH (a:N)-[:R]->{1,2}(b) RETURN count(*) AS c",
+        "MATCH (a)-[:R]->{2,2}(b) RETURN count(*) AS c",
+        // A seed the shortcut narrows through `scan_node`, not by filtering rows.
+        "MATCH (a:N {k: 1})-[:R]->()-[:R]->(c) RETURN count(*) AS c",
+        // An edge type that resolves to nothing counts nothing.
+        "MATCH (a)-[:NOPE]->()-[:R]->(c) RETURN count(*) AS c",
+    ] {
+        let shortcut = rows(&mut g, q);
+        let enumerated = super::eval::without_walk_count(|| rows(&mut g, q));
+        assert_eq!(
+            shortcut, enumerated,
+            "walk-count shortcut != matcher for `{q}`"
+        );
+    }
+}
+
+/// The two spellings of a two-hop count DIFFERENT things, and the shortcut has
+/// to keep that difference rather than tidy it up.
+///
+/// `R` edges: `x1`,`x2` (a→b), `x3` (b→b), `x4` (a→a).
+///
+/// As separate segments the engine counts WALKS — an edge may repeat:
+/// x1→x3, x2→x3, x3→x3, x4→x1, x4→x2, x4→x4 = 6.
+///
+/// Quantified, it counts TRAILS — x3→x3 and x4→x4 are the same edge twice and
+/// drop out = 4.
+#[test]
+fn a_quantified_two_hop_excludes_the_edge_taken_twice() {
+    let mut g = trail_vs_walk_fixture();
+    let walks = rows(&mut g, "MATCH (a)-[:R]->()-[:R]->(c) RETURN count(*) AS c");
+    let trails = rows(&mut g, "MATCH (a)-[:R]->{2,2}(c) RETURN count(*) AS c");
+    assert_eq!(walks, vec![vec![n(6.0)]], "separate segments count walks");
+    assert_eq!(
+        trails,
+        vec![vec![n(4.0)]],
+        "a quantified repetition counts trails"
+    );
+    // …and both agree with the matcher that enumerates.
+    assert_eq!(
+        walks,
+        super::eval::without_walk_count(|| rows(
+            &mut g,
+            "MATCH (a)-[:R]->()-[:R]->(c) RETURN count(*) AS c"
+        ))
+    );
+    assert_eq!(
+        trails,
+        super::eval::without_walk_count(|| rows(
+            &mut g,
+            "MATCH (a)-[:R]->{2,2}(c) RETURN count(*) AS c"
+        ))
+    );
+}
+
+/// `count(DISTINCT <endpoint>)` over separate segments is the walk-reachable
+/// SET, which `walk_count` deduplicates itself. From `a` and `b` over two `R`
+/// hops that set is `{a, b}`: `b` via x1→x3, and `a` via x4→x4.
+#[test]
+fn a_distinct_two_hop_count_is_the_reachable_set() {
+    let mut g = trail_vs_walk_fixture();
+    let q = "MATCH (a)-[:R]->()-[:R]->(c) RETURN count(DISTINCT c) AS c";
+    let shortcut = rows(&mut g, q);
+    let enumerated = super::eval::without_walk_count(|| rows(&mut g, q));
+    assert_eq!(shortcut, enumerated);
+    assert_eq!(shortcut, vec![vec![n(2.0)]]);
+}
+
+/// A quantified repetition with `DISTINCT` declines the shortcut — the lengths
+/// would be summed, and an endpoint reachable at both would be counted twice.
+/// The answer still has to be right.
+#[test]
+fn a_distinct_quantified_count_stays_on_the_matcher() {
+    let mut g = trail_vs_walk_fixture();
+    let q = "MATCH (a)-[:R]->{1,2}(c) RETURN count(DISTINCT c) AS c";
+    let shortcut = rows(&mut g, q);
+    let enumerated = super::eval::without_walk_count(|| rows(&mut g, q));
+    assert_eq!(shortcut, enumerated);
+}

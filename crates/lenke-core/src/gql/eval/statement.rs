@@ -1422,6 +1422,13 @@ pub(super) fn run_part(
     if let Some(res) = try_reachable_distinct(linear, graph, plan, params) {
         return res;
     }
+    // A count over BARE hops needs no rows at all — walk and fold in place
+    // (`seek::walk_count`, the same fold Gremlin's `.count()` uses). Tried ahead
+    // of everything below because those all build the rows this never needs:
+    // even the parallel counter enumerates, it just does so on more cores.
+    if let Some(res) = try_walk_count(linear, graph, plan, params) {
+        return res;
+    }
     // Intra-query parallel count over a traversal (opt-in `parallel-query`). Tried
     // before the vectorized pipeline: for a pure `count(*)` over a multi-hop or
     // filtered traversal the vectorized path *materializes* every intermediate row

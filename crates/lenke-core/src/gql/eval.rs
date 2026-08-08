@@ -4046,6 +4046,29 @@ fn with_semi_back<T>(mode: SemiBack, f: impl FnOnce() -> T) -> T {
     out
 }
 
+thread_local! {
+    static WALK_COUNT_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn walk_count_enabled() -> bool {
+    !WALK_COUNT_OFF.with(std::cell::Cell::get)
+}
+
+/// Run `f` with the counting shortcut off, so a test can compare it against the
+/// matcher that enumerates. Test-only.
+///
+/// Worth having as its own switch rather than trusting the numbers: the
+/// shortcut never builds a row, so anything it gets wrong comes back as a
+/// PLAUSIBLE count. The first version counted walks where GQL counts trails and
+/// was out by exactly the number of self-loops.
+#[cfg(test)]
+pub(crate) fn without_walk_count<T>(f: impl FnOnce() -> T) -> T {
+    let prev = WALK_COUNT_OFF.with(|c| c.replace(true));
+    let out = f();
+    WALK_COUNT_OFF.with(|c| c.set(prev));
+    out
+}
+
 /// Build a `Col::Bool` from a Kleene-truth stream (`None` → invalid/UNKNOWN).
 fn kleene_vec(it: impl Iterator<Item = Truth>) -> Col {
     let mut t = Vec::new();

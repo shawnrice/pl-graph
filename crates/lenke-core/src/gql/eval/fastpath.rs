@@ -89,6 +89,9 @@ pub(super) fn try_reachable_distinct(
     plan: &CQuery,
     params: &[Val],
 ) -> Option<CodeResult<RowSet>> {
+    if !walk_count_enabled() {
+        return None;
+    }
     let [CClause::Match {
         optional: false,
         patterns,
@@ -597,4 +600,297 @@ pub(super) fn try_parallel_scan(
     }
     rs.apply_skip_limit(proj.skip_val(&ctx), proj.limit_val(&ctx));
     Some(Ok(rs))
+}
+
+/// `count(*)` and `count(DISTINCT <end>)` over a path of BARE hops, answered by
+/// walking and counting in place instead of materializing a row per match.
+///
+/// This is the one idea the fifteen-rung `try_count_*` ladder was fifteen
+/// spellings of: **a count does not need its rows.** `seek::walk_count` folds
+/// the walk as it goes — it is the same function Gremlin's `.count()` uses, and
+/// it takes `distinct` as a parameter, so one call covers three shapes that used
+/// to be three rungs (`try_count_streamed`, `try_count_two_hop`,
+/// `try_count_distinct_endpoint`) plus the var-length one (`try_count_varlen_
+/// upto_2`) that was a fourth.
+///
+/// ```text
+/// varlen_all_1_2   MATCH (a:Person)-[:KNOWS]->{1,2}(b) RETURN count(*)
+/// distinct_2hop    MATCH (a:Person)-[:KNOWS]->()-[:KNOWS]->(c)
+///                    RETURN count(DISTINCT c)
+/// distinct_nbr     MATCH (a:Person)-[:KNOWS]->(b) RETURN count(DISTINCT b)
+/// ```
+///
+/// **Bare is the whole precondition, and it is not a formality.** `walk_count`
+/// never produces a row, so a predicate here would be a predicate that never
+/// runs — and it would not fail loudly, it would return a bigger number. Only
+/// the START may be constrained, because `scan_node` applies that constraint
+/// while building the seed set (and seeds from an index when one exists). Every
+/// hop after it must be a plain typed hop onto an unconstrained node, and the
+/// MATCH's own `WHERE` must be absent.
+///
+/// A quantified hop `->{n,m}` is the sum of the fixed walks of each length in
+/// `n..=m`, which is why it needs no separate rung: `{1,2}` is `walk_count` at
+/// one hop plus `walk_count` at two. With `DISTINCT` that decomposition would be
+/// WRONG — the same endpoint reachable at both lengths would be counted twice —
+/// so the two features are not combined here.
+///
+/// **The two spellings of a two-hop are not the same question**, which is the
+/// thing to know before touching this:
+///
+/// ```text
+/// MATCH (a)-[:R]->()-[:R]->(c)   counts WALKS  — an edge may repeat
+/// MATCH (a)-[:R]->{2,2}(c)       counts TRAILS — an edge may not
+/// ```
+///
+/// A quantified repetition is edge-distinct and separate segments are not. That
+/// is this engine's existing behaviour, pinned by
+/// `varlen_fixed_lengths_match_trail_enumeration` on one side and
+/// `the_walk_count_shortcut_agrees_with_enumeration` on the other; the shortcut
+/// matches the matcher rather than picking a side. (Cypher applies relationship
+/// uniqueness across the whole `MATCH`, so the unquantified spelling is a
+/// deliberate-looking divergence — but it is a PRE-EXISTING one, and a counting
+/// shortcut is the wrong place to change it.)
+///
+/// So `walk_count` is exact for the unquantified form at any depth, `DISTINCT`
+/// included. For the QUANTIFIED form it over-counts, and the first version of
+/// this shipped that as a silently larger number. Over two hops the only way to
+/// reuse an edge is to take the same one twice, which requires it to be a
+/// SELF-LOOP (`target(e) == source(e)`, since the midpoint has to be both) — so
+///
+/// ```text
+/// trails(2) = walks(2) − (self-loops at a seed matching BOTH hops)
+/// ```
+///
+/// which `self_loop_overcount` computes exactly, and
+/// `varlen_fixed_lengths_match_trail_enumeration` /
+/// `varlen_1_2_count_matches_trail_enumeration` check against brute force (13
+/// walks vs 11 trails; 19 vs 17 — two self-loops either way).
+///
+/// At THREE hops the correction is no longer a subtraction: `a→b, b→a, a→b`
+/// repeats an edge with no self-loop anywhere, so inclusion-exclusion starts.
+/// Nothing here goes past two hops, and that is the reason rather than an
+/// arbitrary cap.
+pub(super) fn try_walk_count(
+    linear: &CLinear,
+    graph: &Graph,
+    plan: &CQuery,
+    params: &[Val],
+) -> Option<CodeResult<RowSet>> {
+    if !walk_count_enabled() {
+        return None;
+    }
+    let [CClause::Match {
+        optional: false,
+        patterns,
+        where_: None,
+        scope_len,
+        ..
+    }, CClause::Return(proj)] = linear.clauses.as_slice()
+    else {
+        return None;
+    };
+    let [path] = patterns.as_slice() else {
+        return None;
+    };
+    if path.segments.is_empty() || path.path_var_slot.is_some() {
+        return None;
+    }
+    if !matches!(path.selector, PathSelector::Walk) {
+        return None;
+    }
+
+    // The projection is exactly one `count`, referred to once, with no other
+    // output column — `RETURN count(*), a.name` needs the rows this never
+    // builds.
+    if !proj.aggregating || proj.aggs.len() != 1 || proj.items.len() != 1 {
+        return None;
+    }
+    if !matches!(proj.items[0].expr, CExpr::AggRef(0)) {
+        return None;
+    }
+    // No grouping, no paging, no HAVING, no DISTINCT on the projection itself,
+    // no ORDER BY — all of them need the rows or the groups this never builds.
+    // (A `LIMIT` over one aggregate row is harmless but not worth the branch.)
+    if !proj.group_by.is_empty()
+        || proj.limit.is_some()
+        || proj.skip.is_some()
+        || proj.having.is_some()
+        || proj.distinct
+        || !proj.order_by.is_empty()
+    {
+        return None;
+    }
+    let agg = &proj.aggs[0];
+    if !matches!(agg.func, AggFn::Count) {
+        return None;
+    }
+
+    // `count(*)`, or `count(DISTINCT x)` where `x` is the path's LAST node —
+    // the endpoint `walk_count`'s own `distinct` deduplicates. Anything else
+    // (a distinct count of an intermediate node, or of a property) is a
+    // different question.
+    let last_slot = path.segments.last()?.node.var_slot;
+    let distinct = if agg.star && !agg.distinct && agg.arg.is_none() {
+        false
+    } else if agg.distinct && !agg.star {
+        match agg.arg.as_ref()? {
+            CExpr::Var(s) if Some(*s) == last_slot => true,
+            _ => return None,
+        }
+    } else {
+        return None;
+    };
+
+    // Every hop bare, and its type lowered to ids. A quantified hop is allowed
+    // only as the ONLY segment, since summing lengths across several quantified
+    // segments is a product, not a sum.
+    let ctx = resolve_ctx(graph, plan, params);
+    let mut hops: Vec<(crate::seek::Dir, Option<Vec<u32>>)> = Vec::new();
+    let mut quant: Option<Quantifier> = None;
+    for (i, seg) in path.segments.iter().enumerate() {
+        if seg.unit.is_some() {
+            return None;
+        }
+        let rel = &seg.rel;
+        if rel.var_slot.is_some() || !rel.props.is_empty() || rel.where_.is_some() {
+            return None;
+        }
+        if let Some(q) = rel.quantifier.as_ref() {
+            if path.segments.len() != 1 {
+                return None;
+            }
+            quant = Some(*q);
+        }
+        // The landing node carries no filter — see the doc: a filter here is one
+        // that never runs.
+        let node = &seg.node;
+        if node.label.is_some() || !node.props.is_empty() || node.where_.is_some() {
+            return None;
+        }
+        // …and no node may be re-bound to a slot the walk cannot check. A slot
+        // that repeats is a self-join (`(a)-[:R]->(a)`), which is a filter by
+        // another name.
+        if let Some(s) = node.var_slot {
+            if Some(s) == path.start.var_slot {
+                return None;
+            }
+            if path.segments[..i]
+                .iter()
+                .any(|prev| prev.node.var_slot == Some(s))
+            {
+                return None;
+            }
+        }
+
+        let etypes = match rel.label.as_ref() {
+            None => None,
+            Some(l) => Some(seek_lower::lower_labels(l, &ctx, true)?),
+        };
+        let dir = match rel.direction {
+            Direction::Out => crate::seek::Dir::Out,
+            Direction::In => crate::seek::Dir::In,
+            Direction::Both => crate::seek::Dir::Both,
+        };
+        hops.push((dir, etypes));
+    }
+
+    let seeds = seek_lower::scan_node(graph, &ctx, &path.start, None, *scope_len, None);
+    if let Err(e) = ctx.check_fault() {
+        return Some(Err(e));
+    }
+
+    // `SelfLoops::Once` — GQL's convention, the one `expand` walks with.
+    let loops = crate::seek::SelfLoops::Once;
+
+    // Walks become trails by subtracting the repeats, and only a length-2 walk
+    // has a repeat this cheap to find. `DISTINCT` cannot be corrected by
+    // subtraction at all — it is a SET, and an endpoint reachable only by
+    // reusing an edge has to leave the set, not decrement a counter — so it is
+    // confined to one hop, where walks and trails are the same thing.
+    let count: u64 = match quant {
+        // Separate segments are WALKS in this engine — no correction, and
+        // `DISTINCT` is just the walk-reachable endpoint set, at any depth.
+        None => crate::seek::walk_count(graph, &seeds, &hops, loops, distinct) as u64,
+        Some(q) => {
+            // A quantified hop with DISTINCT would double-count an endpoint
+            // reachable at two different lengths.
+            if distinct {
+                return None;
+            }
+            let hop = hops.first()?.clone();
+            let max = q.max?;
+            // Past two the trail correction stops being a subtraction — see the
+            // doc. `{1,3}` and beyond keep the general enumeration.
+            if max > 2 || q.min > max {
+                return None;
+            }
+            let mut total = 0u64;
+            for len in q.min.max(1)..=max {
+                let chain = vec![hop.clone(); len as usize];
+                let walks = crate::seek::walk_count(graph, &seeds, &chain, loops, false) as u64;
+                total += if len == 2 {
+                    walks - self_loop_overcount(graph, &seeds, &chain)?
+                } else {
+                    walks
+                };
+            }
+            total
+        }
+    };
+
+    Some(count_rows_any(proj, count))
+}
+
+/// How many length-2 WALKS are not trails: the ones that take a single edge
+/// twice. That needs the edge to leave and re-enter the same vertex, so it is
+/// exactly the self-loops sitting at a seed and matching BOTH hops.
+///
+/// `None` declines — `Dir::Both` yields a self-loop under a different rule than
+/// the two directed cases (once or twice, depending on `SelfLoops`), and getting
+/// that wrong would show up as a count off by the number of self-loops rather
+/// than as anything obviously broken.
+fn self_loop_overcount(
+    graph: &Graph,
+    seeds: &[u32],
+    hops: &[(crate::seek::Dir, Option<Vec<u32>>)],
+) -> Option<u64> {
+    let [(d1, t1), (d2, t2)] = hops else {
+        return None;
+    };
+    if matches!(d1, crate::seek::Dir::Both) || matches!(d2, crate::seek::Dir::Both) {
+        return None;
+    }
+
+    // `adj` has already applied hop ONE's type filter (and it reads every label
+    // an edge carries, not just the primary one), so only hop two is left to
+    // check — against the same `edge_labels` the walk itself uses.
+    let hop2_ok = |eidx: u32| -> bool {
+        match t2 {
+            None => true,
+            Some(ids) => graph.edge_labels(eidx).iter().any(|l| ids.contains(l)),
+        }
+    };
+
+    let mut n = 0u64;
+    for &s in seeds {
+        for a in crate::seek::adj(
+            graph,
+            s,
+            *d1,
+            t1.as_deref().unwrap_or(&[]),
+            crate::seek::SelfLoops::Once,
+        ) {
+            if a.nbr == s && hop2_ok(a.eidx) {
+                n += 1;
+            }
+        }
+    }
+    Some(n)
+}
+
+/// Build the single-row `count` result for a projection.
+pub(super) fn count_rows_any(proj: &CProjection, count: u64) -> CodeResult<RowSet> {
+    let mut rs = RowSet::new(proj.out_names.clone());
+    rs.push_row(std::iter::once(Value::Num(count as f64)));
+    Ok(rs)
 }
