@@ -620,6 +620,25 @@ pub(super) fn try_parallel_scan(
 /// distinct_nbr     MATCH (a:Person)-[:KNOWS]->(b) RETURN count(DISTINCT b)
 /// ```
 ///
+/// **REJECTED (measured): extending this to a LABELLED landing node.** The
+/// refusal below looks like the reason `MATCH (a:Person)-[:KNOWS]->(b:Hub)
+/// RETURN count(*)` is 1.9x main, and it is not. An arm that seeds from the
+/// smaller of the two label buckets and tests the other end per edge was
+/// written and measured against the general path:
+///
+/// ```text
+///              with the arm   without
+/// 200k/8          0.018ms      0.020
+/// 1M/8            0.198        0.195
+/// ```
+///
+/// Nothing, at either size — the planner already orients this shape to the
+/// small end, so the arm reimplements an existing decision at the same speed
+/// for ~150 lines. What is actually left is the per-edge label test on the far
+/// side: 8000 random `vlabels` lookups over a million vertices, cache-miss
+/// bound, which both routes pay. Beating it needs the label check to stop being
+/// a random read (a per-label bitset), not another seeding rule.
+///
 /// **Bare is the whole precondition, and it is not a formality.** `walk_count`
 /// never produces a row, so a predicate here would be a predicate that never
 /// runs — and it would not fail loudly, it would return a bigger number. Only
