@@ -18,10 +18,11 @@ export const unionStep = function* (
   stream: Iterable<Traverser<unknown>>,
   plans: readonly Plan[],
   graph: Graph,
+  ctx: RunContext,
 ): Iterable<Traverser<unknown>> {
   for (const t of stream) {
     for (const plan of plans) {
-      yield* applyPlanToStream(plan, [t], graph);
+      yield* applyPlanToStream(plan, [t], graph, ctx);
     }
   }
 };
@@ -30,10 +31,11 @@ export const coalesceStep = function* (
   stream: Iterable<Traverser<unknown>>,
   plans: readonly Plan[],
   graph: Graph,
+  ctx: RunContext,
 ): Iterable<Traverser<unknown>> {
   for (const t of stream) {
     for (const plan of plans) {
-      const out = [...applyPlanToStream(plan, [t], graph)];
+      const out = [...applyPlanToStream(plan, [t], graph, ctx)];
 
       if (out.length > 0) {
         yield* out;
@@ -47,9 +49,10 @@ export const optionalStep = function* (
   stream: Iterable<Traverser<unknown>>,
   plan: Plan,
   graph: Graph,
+  ctx: RunContext,
 ): Iterable<Traverser<unknown>> {
   for (const t of stream) {
-    const out = [...applyPlanToStream(plan, [t], graph)];
+    const out = [...applyPlanToStream(plan, [t], graph, ctx)];
 
     if (out.length > 0) {
       yield* out;
@@ -65,12 +68,13 @@ export const chooseStep = function* (
   thenPlan: Plan,
   elsePlan: Plan | undefined,
   graph: Graph,
+  ctx: RunContext,
 ): Iterable<Traverser<unknown>> {
   for (const t of stream) {
-    const branch = hasAny(applyPlanToStream(test, [t], graph)) ? thenPlan : elsePlan;
+    const branch = hasAny(applyPlanToStream(test, [t], graph, ctx)) ? thenPlan : elsePlan;
 
     if (branch) {
-      yield* applyPlanToStream(branch, [t], graph);
+      yield* applyPlanToStream(branch, [t], graph, ctx);
     } else {
       // Per TinkerPop spec: if test fails and no elsePlan, traverser passes
       // through unchanged (identity behavior).
@@ -230,12 +234,13 @@ export const branchStep = function* (
   options: readonly { match: unknown; plan: Plan }[],
   defaultPlan: Plan | undefined,
   graph: Graph,
+  ctx: RunContext,
 ): Iterable<Traverser<unknown>> {
   for (const t of stream) {
     let testResult: unknown = undefined;
     let sawResult = false;
 
-    for (const r of applyPlanToStream(test, [t], graph)) {
+    for (const r of applyPlanToStream(test, [t], graph, ctx)) {
       testResult = r.value;
       sawResult = true;
       break;
@@ -255,7 +260,7 @@ export const branchStep = function* (
     const target = matched ?? defaultPlan;
 
     if (target) {
-      yield* applyPlanToStream(target, [t], graph);
+      yield* applyPlanToStream(target, [t], graph, ctx);
     }
   }
 };

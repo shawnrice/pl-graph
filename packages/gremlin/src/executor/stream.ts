@@ -10,9 +10,10 @@ export const mapStep = function* (
   stream: Iterable<Traverser<unknown>>,
   plan: Plan,
   graph: Graph,
+  ctx: RunContext,
 ): Iterable<Traverser<unknown>> {
   for (const t of stream) {
-    for (const r of applyPlanToStream(plan, [t], graph)) {
+    for (const r of applyPlanToStream(plan, [t], graph, ctx)) {
       yield r;
       break;
     }
@@ -24,9 +25,10 @@ export const flatMapStep = function* (
   stream: Iterable<Traverser<unknown>>,
   plan: Plan,
   graph: Graph,
+  ctx: RunContext,
 ): Iterable<Traverser<unknown>> {
   for (const t of stream) {
-    yield* applyPlanToStream(plan, [t], graph);
+    yield* applyPlanToStream(plan, [t], graph, ctx);
   }
 };
 

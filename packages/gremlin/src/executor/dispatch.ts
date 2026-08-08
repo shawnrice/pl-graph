@@ -351,7 +351,7 @@ export const applyStep = (
       // Three AST shapes share kind 'where'; TS narrows on which fields are set:
       // a sub-plan, a two-key compare (`startKey`), or a current-vs-label predicate.
       if ('plan' in step) {
-        return whereSubPlanStep(stream, step.plan, graph);
+        return whereSubPlanStep(stream, step.plan, graph, ctx);
       }
 
       return 'startKey' in step
@@ -360,31 +360,31 @@ export const applyStep = (
 
     case 'and':
       return filterTraverser(stream, (t) =>
-        step.plans.every((p) => hasAny(applyPlanToStream(p, [t], graph))),
+        step.plans.every((p) => hasAny(applyPlanToStream(p, [t], graph, ctx))),
       );
 
     case 'or':
       return filterTraverser(stream, (t) =>
-        step.plans.some((p) => hasAny(applyPlanToStream(p, [t], graph))),
+        step.plans.some((p) => hasAny(applyPlanToStream(p, [t], graph, ctx))),
       );
 
     case 'not':
-      return filterTraverser(stream, (t) => !hasAny(applyPlanToStream(step.plan, [t], graph)));
+      return filterTraverser(stream, (t) => !hasAny(applyPlanToStream(step.plan, [t], graph, ctx)));
 
     case 'union':
-      return unionStep(stream, step.plans, graph);
+      return unionStep(stream, step.plans, graph, ctx);
 
     case 'coalesce':
-      return coalesceStep(stream, step.plans, graph);
+      return coalesceStep(stream, step.plans, graph, ctx);
 
     case 'optional':
-      return optionalStep(stream, step.plan, graph);
+      return optionalStep(stream, step.plan, graph, ctx);
 
     case 'choose':
-      return chooseStep(stream, step.test, step.thenPlan, step.elsePlan, graph);
+      return chooseStep(stream, step.test, step.thenPlan, step.elsePlan, graph, ctx);
 
     case 'filter':
-      return whereSubPlanStep(stream, step.plan, graph);
+      return whereSubPlanStep(stream, step.plan, graph, ctx);
 
     case 'hasNot':
       return filterStream(stream, (v) => {
@@ -570,13 +570,13 @@ export const applyStep = (
       return treeStep(stream, step.bys, graph, ctx);
 
     case 'branch':
-      return branchStep(stream, step.test, step.options, step.default, graph);
+      return branchStep(stream, step.test, step.options, step.default, graph, ctx);
 
     case 'flatMap':
-      return flatMapStep(stream, step.plan, graph);
+      return flatMapStep(stream, step.plan, graph, ctx);
 
     case 'map':
-      return mapStep(stream, step.plan, graph);
+      return mapStep(stream, step.plan, graph, ctx);
 
     case 'mapFn':
       return mapTraverser(stream, (v, t) => step.fn(v, closureView(t, ctx)));

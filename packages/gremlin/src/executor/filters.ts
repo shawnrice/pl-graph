@@ -23,9 +23,10 @@ export const whereSubPlanStep = function* (
   stream: Iterable<Traverser<unknown>>,
   plan: Plan,
   graph: Graph,
+  ctx: RunContext,
 ): Iterable<Traverser<unknown>> {
   for (const t of stream) {
-    if (hasAny(applyPlanToStream(plan, [t], graph))) {
+    if (hasAny(applyPlanToStream(plan, [t], graph, ctx))) {
       yield t;
     }
   }
