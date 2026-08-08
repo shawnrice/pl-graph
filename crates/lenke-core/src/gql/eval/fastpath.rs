@@ -843,7 +843,17 @@ pub(super) fn try_walk_count(
             if max > 2 || q.min > max {
                 return None;
             }
-            let mut total = 0u64;
+            // `{0,n}` includes the ZERO-length walk: every seed is its own
+            // endpoint. Writing the range as `min.max(1)..=max` silently drops
+            // that term, which is a smaller count that looks entirely
+            // reasonable — `{0,2}` came out 15 where the matcher says 19.
+            // `{0,0}` is left to the matcher: it is the whole answer rather
+            // than a term of it, and the matcher's own reading of it is not
+            // obviously right (`a_zero_bound_quantifier_matches_the_matcher`).
+            if max == 0 {
+                return None;
+            }
+            let mut total = if q.min == 0 { seeds.len() as u64 } else { 0 };
             for len in q.min.max(1)..=max {
                 let chain = vec![hop.clone(); len as usize];
                 let walks = crate::seek::walk_count(graph, &seeds, &chain, loops, false) as u64;
@@ -1042,6 +1052,12 @@ pub(super) fn try_grouped_walk_count(
             &hops[i]
         }
     };
+    // `{0,n}` includes the ZERO-length walk — every seed is its own endpoint.
+    // See `try_walk_count` for why that term cannot be folded into the range.
+    let zero_len = quant.is_some_and(|q| q.min == 0);
+    if quant.is_some_and(|q| q.max == Some(0)) {
+        return None;
+    }
     let lengths: Vec<usize> = match quant {
         None => vec![hops.len()],
         Some(q) => (q.min.max(1)..=q.max?).map(|n| n as usize).collect(),
@@ -1058,6 +1074,11 @@ pub(super) fn try_grouped_walk_count(
     // visits suffice.
     let slots = graph.vertex_slots();
     let mut tally = vec![0u64; slots];
+    if zero_len {
+        for &s in &seeds {
+            tally[s as usize] += 1;
+        }
+    }
     for &len in &lengths {
         let (d1, t1) = hop_at(0);
         if len == 1 {
@@ -1151,6 +1172,12 @@ pub(super) fn try_grouped_walk_count(
         }
     };
     'outer: for &s in &seeds {
+        if zero_len {
+            note(&mut b, s, &mut order, &mut seen, &mut cached);
+            if order.len() == want {
+                break 'outer;
+            }
+        }
         for &len in &lengths {
             let (d1, t1) = hop_at(0);
             for a in crate::seek::adj(graph, s, *d1, t1.as_deref().unwrap_or(&[]), loops) {

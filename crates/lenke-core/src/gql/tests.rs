@@ -14009,3 +14009,53 @@ fn a_semi_join_count_with_more_than_the_exists_declines() {
         assert_eq!(taken, counted, "`{q}`");
     }
 }
+
+/// A `{0,n}` quantifier includes the ZERO-length walk — every seed is its own
+/// endpoint — and the counting shortcuts have to carry that term.
+///
+/// Writing the length range as `min.max(1)..=max` drops it, which is a smaller
+/// count that looks entirely reasonable: `{0,2}` over this graph came out 15
+/// where the matcher (and the TS engine) say 19. Only the cross-engine
+/// conformance suite caught it, and only after a full CI run — no Rust test
+/// covered a zero bound.
+///
+/// `{0,0}` is deliberately NOT asserted against a hand-computed number here.
+/// The matcher answers it as though it were `{0,1}`, which is questionable on
+/// its own, so the shortcuts decline it and inherit whatever the matcher does
+/// rather than disagree with it. That is a separate question from this one.
+#[test]
+fn a_zero_bound_quantifier_matches_the_matcher() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"1","labels":["Person"],"properties":{"city":"A"}}"#,
+        r#"{"type":"node","id":"2","labels":["Person"],"properties":{"city":"B"}}"#,
+        r#"{"type":"node","id":"3","labels":["Person"],"properties":{"city":"A"}}"#,
+        r#"{"type":"node","id":"4","labels":["City"],"properties":{"city":"C"}}"#,
+        r#"{"type":"edge","id":"10","from":"1","to":"2","labels":["KNOWS"]}"#,
+        r#"{"type":"edge","id":"11","from":"2","to":"3","labels":["KNOWS"]}"#,
+        r#"{"type":"edge","id":"12","from":"3","to":"1","labels":["KNOWS"]}"#,
+        r#"{"type":"edge","id":"13","from":"1","to":"3","labels":["KNOWS"]}"#,
+        r#"{"type":"edge","id":"14","from":"1","to":"1","labels":["KNOWS"]}"#,
+        r#"{"type":"edge","id":"15","from":"2","to":"4","labels":["KNOWS"]}"#,
+    ]);
+    for q in [
+        "MATCH (a)-[:KNOWS]->{0,2}(b) RETURN count(*) AS n",
+        "MATCH (a)-[:KNOWS]->{0,1}(b) RETURN count(*) AS n",
+        "MATCH (a)-[:KNOWS]->{0,0}(b) RETURN count(*) AS n",
+        "MATCH (a)-[:KNOWS]->{0,2}(b) RETURN b.city AS c, count(*) AS n",
+        "MATCH (a)-[:KNOWS]->{0,1}(b) RETURN b.city AS c, count(*) AS n",
+        "MATCH (a:Person)-[:KNOWS]->{0,2}(b) RETURN b.city AS c, count(*) AS n",
+        "MATCH (a)-[:KNOWS]->{0,2}(b) RETURN count(DISTINCT b) AS n",
+    ] {
+        let shortcut = rows(&mut g, q);
+        let matcher = super::eval::without_walk_count(|| rows(&mut g, q));
+        assert_eq!(
+            shortcut, matcher,
+            "zero-bound shortcut != matcher for `{q}`"
+        );
+    }
+    // The hand-computed anchor: 4 zero-length + 6 one-hop + 9 two-hop trails.
+    assert_eq!(
+        rows(&mut g, "MATCH (a)-[:KNOWS]->{0,2}(b) RETURN count(*) AS n"),
+        vec![vec![n(19.0)]],
+    );
+}
