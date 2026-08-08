@@ -7607,3 +7607,49 @@ fn order_by_key_declines_the_migration_on_purpose() {
         assert_eq!(rows.len(), want, "{q}");
     }
 }
+
+/// A concrete anchor for the `by(__.path())` modulator case — the one that
+/// regressed when `Trav::root` stopped seeding a one-element path
+/// unconditionally.
+///
+/// `dropping_the_path_never_changes_an_answer` covers it by comparing the
+/// analysis-driven run against `with_forced_path`, but that is a two-mode
+/// comparison and would pass VACUOUSLY if both modes broke together. This pins
+/// the value by hand: `select('a').by(__.path())` runs `__.path()` on a FRESH
+/// root seeded with the selected vertex, so each row's path is a single-element
+/// list `[a]`, whatever the OUTER traversal's path decision. The outer query is
+/// path-free (nothing reads its history), so `TRACK_PATH` is off for it — the
+/// modulator's own analysis has to turn it back on for its sub-run.
+#[test]
+fn a_by_path_modulator_keeps_its_own_fresh_path() {
+    let mut g = crate::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["N"],"properties":{"k":1}}"#,
+            r#"{"type":"node","id":"b","labels":["N","W"],"properties":{"k":2}}"#,
+            r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+    // `a -R-> b(:W)`; select('a').by(__.path()) → the fresh path of `a`, i.e.
+    // a one-element list holding node `a`.
+    let out = super::parse::parse("g.V().as('a').out('R').hasLabel('W').select('a').by(__.path())")
+        .expect("parses")
+        .run(&mut g);
+    assert_eq!(out.len(), 1, "one W endpoint");
+    // The single result is a Path (rendered as a one-element list of `a`), not
+    // an empty path.
+    let rendered = format!("{:?}", out[0]);
+    assert!(
+        rendered.contains("Node(") && !rendered.contains("[]"),
+        "expected a one-element fresh path, got {rendered}"
+    );
+    // And it agrees with the path-forced run, so the modulator scoping matches
+    // the always-track baseline.
+    let forced = super::exec::with_forced_path(|| {
+        super::parse::parse("g.V().as('a').out('R').hasLabel('W').select('a').by(__.path())")
+            .expect("parses")
+            .run(&mut g)
+    });
+    assert_eq!(format!("{out:?}"), format!("{forced:?}"));
+}

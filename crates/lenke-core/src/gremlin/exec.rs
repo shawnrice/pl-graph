@@ -118,8 +118,16 @@ struct Trav {
 
 impl Trav {
     fn root(val: GVal) -> Self {
+        // See `TRACK_PATH`: a run whose analysis found no path/tag reader never
+        // records path, so the root starts empty rather than allocating a
+        // one-element `Vec` per seed. `step`/`with` keep it empty from here.
+        let path = if TRACK_PATH.with(Cell::get) {
+            vec![val.clone()]
+        } else {
+            Vec::new()
+        };
         Self {
-            path: vec![val.clone()],
+            path,
             val,
             tags: Arc::new(Vec::new()),
             loops: 0,
@@ -129,15 +137,15 @@ impl Trav {
     /// A successor that moved to `val` (extends path, keeps tags/loops/sack).
     fn step(&self, val: GVal) -> Self {
         // See `TRACK_PATH`: skipped entirely when no step in this run reads it.
-        let mut path = if TRACK_PATH.with(Cell::get) {
-            self.path.clone()
+        // The flag is read ONCE — this is the per-traverser-per-step hot path
+        // (millions of calls on an edge-heavy traversal).
+        let path = if TRACK_PATH.with(Cell::get) {
+            let mut p = self.path.clone();
+            p.push(val.clone());
+            p
         } else {
             Vec::new()
         };
-
-        if TRACK_PATH.with(Cell::get) {
-            path.push(val.clone());
-        }
         Self {
             val,
             path,
@@ -148,8 +156,16 @@ impl Trav {
     }
     /// Same traverser with a replaced value, keeping the existing path tail.
     fn with(&self, val: GVal) -> Self {
-        let mut path = self.path.clone();
-        path.push(val.clone());
+        // When path is not tracked `self.path` is already empty, so the clone is
+        // a no-op — but gating it keeps the intent explicit and avoids the
+        // per-call `push` on the untracked path.
+        let path = if TRACK_PATH.with(Cell::get) {
+            let mut p = self.path.clone();
+            p.push(val.clone());
+            p
+        } else {
+            Vec::new()
+        };
         Self {
             val,
             path,
@@ -4978,10 +4994,24 @@ fn eval_by(graph: &mut Graph, ctx: &mut Ctx, by: &By, value: &GVal) -> GVal {
             ),
             _ => value.clone(),
         },
-        By::Traversal(plan, _) => sub_vals(graph, ctx, plan, &Trav::root(value.clone()))
-            .into_iter()
-            .next()
-            .unwrap_or(GVal::Null),
+        By::Traversal(plan, _) => {
+            // A `by(...)` modulator runs on a FRESH root, so it cannot see the
+            // OUTER path — which is why `analysis::carried` excludes it and the
+            // outer `TRACK_PATH` may be false. But the modulator can have its OWN
+            // path reader (`by(__.path())`), whose fresh root must track path
+            // regardless of the outer decision. Scope `TRACK_PATH` to this
+            // sub-plan's own analysis for the duration, then restore — without it
+            // `by(__.path())` returned an empty path once `root()` stopped
+            // seeding one unconditionally.
+            let prev = TRACK_PATH.with(Cell::get);
+            TRACK_PATH.with(|c| c.set(needs_path(&plan.steps) || FORCE_PATH.with(Cell::get)));
+            let out = sub_vals(graph, ctx, plan, &Trav::root(value.clone()))
+                .into_iter()
+                .next()
+                .unwrap_or(GVal::Null);
+            TRACK_PATH.with(|c| c.set(prev));
+            out
+        }
     }
 }
 
