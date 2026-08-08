@@ -1720,3 +1720,62 @@ mod tests {
         assert_eq!(last_of(&out.rows[1]), f64::from(bb)); // path for b ends at b
     }
 }
+
+#[cfg(test)]
+mod perf {
+    use crate::opt::optimize;
+    use crate::store::{Builder, Store};
+    use crate::value::Value;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn build(nodes: usize, deg: usize) -> Store {
+        let mut b = Builder::default();
+        for i in 0..nodes {
+            b.node(
+                &["Person"],
+                &[
+                    ("name", Value::Str(Arc::from(format!("n{i}").as_str()))),
+                    ("age", Value::Num((i % 100) as f64)),
+                ],
+            );
+        }
+        for i in 0..nodes {
+            for d in 0..deg {
+                b.edge(i as u32, ((i * 7 + d * 13 + 1) % nodes) as u32, "R");
+            }
+        }
+        b.build()
+    }
+
+    #[test]
+    #[ignore = "perf probe"]
+    fn zzz_perf() {
+        let (nodes, deg) = (200_000usize, 4usize);
+        let t = Instant::now();
+        let store = build(nodes, deg);
+        eprintln!(
+            "PERF build {nodes} nodes / {} edges: {:?}",
+            nodes * deg,
+            t.elapsed()
+        );
+        for q in [
+            "MATCH (p:Person) WHERE p.age > 90 RETURN p.name",
+            "MATCH (a:Person)-[:R]->(b) RETURN count(*) AS c",
+            "MATCH (a:Person)-[:R]->(b) RETURN b.name AS who, count(*) AS c",
+            "MATCH (a:Person)-[:R]->()-[:R]->(c) RETURN count(DISTINCT c) AS c",
+            "MATCH (a:Person)-[:R]->(b)-[:R]->(c) RETURN count(*) AS c",
+        ] {
+            let plan = optimize(super::super::gql::parse(q).unwrap());
+            let mut best = f64::MAX;
+            let mut rows = 0;
+            for _ in 0..5 {
+                let t = Instant::now();
+                let out = super::run(&plan, &store);
+                best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+                rows = out.rows.len();
+            }
+            eprintln!("PERF {best:>9.2} ms  rows {rows:>8}  {q}");
+        }
+    }
+}
