@@ -14,8 +14,36 @@
 
 use std::collections::HashMap;
 
-use crate::ir::{CompareOp, Dir, Expr, Plan};
+use crate::ir::{AggFn, CompareOp, Dir, Expr, Plan};
 use crate::value::Value;
+
+/// A parsed RETURN item: a keyed expression (a grouping key / plain projection)
+/// or an aggregate.
+enum RetItem {
+    Key(String, Expr),
+    Agg(crate::ir::Agg),
+}
+
+impl RetItem {
+    fn name(&self) -> String {
+        match self {
+            Self::Key(n, _) => n.clone(),
+            Self::Agg(a) => a.name.clone(),
+        }
+    }
+}
+
+/// Map an aggregate function name (case-insensitive) to its `AggFn`.
+fn agg_fn(name: &str) -> Option<AggFn> {
+    Some(match name.to_ascii_uppercase().as_str() {
+        "COUNT" => AggFn::Count,
+        "SUM" => AggFn::Sum,
+        "MIN" => AggFn::Min,
+        "MAX" => AggFn::Max,
+        "AVG" => AggFn::Avg,
+        _ => return None,
+    })
+}
 
 /// Parse a GQL query into a plan, or an error message.
 pub fn parse(query: &str) -> Result<Plan, String> {
@@ -44,6 +72,7 @@ enum Tok {
     Colon,
     Dot,
     Comma,
+    Star,
     Minus,
     RArrow, // ->
     LArrow, // <-
@@ -76,6 +105,7 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             ':' => out.push(Tok::Colon),
             '.' => out.push(Tok::Dot),
             ',' => out.push(Tok::Comma),
+            '*' => out.push(Tok::Star),
             '=' => out.push(Tok::Eq),
             '-' => {
                 if b.get(i + 1) == Some(&'>') {
@@ -214,7 +244,8 @@ impl Parser {
         slot
     }
 
-    // query := MATCH pattern [WHERE expr] RETURN items
+    // query := MATCH pattern [WHERE expr]
+    //          RETURN [DISTINCT] items [ORDER BY keys] [SKIP n] [LIMIT n]
     fn query(&mut self) -> Result<Plan, String> {
         if !self.eat_kw("MATCH") {
             return Err("expected MATCH".into());
@@ -227,8 +258,102 @@ impl Parser {
         if !self.eat_kw("RETURN") {
             return Err("expected RETURN".into());
         }
+        let distinct = self.eat_kw("DISTINCT");
         let items = self.return_items()?;
-        Ok(plan.project(items))
+
+        // Aggregate iff any item is an aggregate; the non-aggregate items are the
+        // implicit GROUP BY keys. Otherwise a plain projection.
+        let has_agg = items.iter().any(|it| matches!(it, RetItem::Agg(_)));
+        let out_names: Vec<String> = items.iter().map(RetItem::name).collect();
+        plan = if has_agg {
+            let keys = items
+                .iter()
+                .filter_map(|it| match it {
+                    RetItem::Key(name, e) => Some((name.clone(), e.clone())),
+                    RetItem::Agg(_) => None,
+                })
+                .collect();
+            let aggs = items
+                .iter()
+                .filter_map(|it| match it {
+                    RetItem::Agg(a) => Some(a.clone()),
+                    RetItem::Key(..) => None,
+                })
+                .collect();
+            plan.aggregate(keys, aggs)
+        } else {
+            let proj = items
+                .into_iter()
+                .map(|it| match it {
+                    RetItem::Key(name, e) => (name, e),
+                    RetItem::Agg(_) => unreachable!("no aggregates on this branch"),
+                })
+                .collect();
+            plan.project(proj)
+        };
+
+        if distinct {
+            plan = plan.distinct();
+        }
+
+        // ORDER BY / SKIP / LIMIT, over the OUTPUT columns (referenced by name),
+        // so it composes above aggregation and DISTINCT alike.
+        let keys = if self.eat_kw("ORDER") {
+            if !self.eat_kw("BY") {
+                return Err("expected BY after ORDER".into());
+            }
+            self.sort_keys(&out_names)?
+        } else {
+            Vec::new()
+        };
+        let skip = if self.eat_kw("SKIP") {
+            Some(self.usize_lit()?)
+        } else {
+            None
+        };
+        let limit = if self.eat_kw("LIMIT") {
+            Some(self.usize_lit()?)
+        } else {
+            None
+        };
+        if !keys.is_empty() || skip.is_some() || limit.is_some() {
+            plan = plan.order_page(keys, skip, limit);
+        }
+        Ok(plan)
+    }
+
+    // sort keys := name [ASC|DESC] ( ',' name [ASC|DESC] )*
+    // Each `name` is an OUTPUT column (by alias); it maps to that output slot.
+    fn sort_keys(&mut self, out_names: &[String]) -> Result<Vec<crate::ir::SortKey>, String> {
+        let mut keys = Vec::new();
+        loop {
+            let name = self.ident()?;
+            let slot = out_names
+                .iter()
+                .position(|n| n == &name)
+                .ok_or_else(|| format!("ORDER BY `{name}` is not an output column"))?;
+            let descending = if self.eat_kw("DESC") {
+                true
+            } else {
+                self.eat_kw("ASC"); // optional, default ascending
+                false
+            };
+            keys.push(crate::ir::SortKey {
+                expr: Expr::Slot(slot),
+                descending,
+            });
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(keys)
+    }
+
+    fn usize_lit(&mut self) -> Result<usize, String> {
+        match self.bump() {
+            Some(Tok::Num(n)) if n >= 0.0 && n.fract() == 0.0 => Ok(n as usize),
+            other => Err(format!("expected a non-negative integer, got {other:?}")),
+        }
     }
 
     // pattern := node ( rel node )*
@@ -289,22 +414,65 @@ impl Parser {
         }
     }
 
-    // items := item ( ',' item )*   ;   item := expr [AS name]
-    fn return_items(&mut self) -> Result<Vec<(String, Expr)>, String> {
+    // items := item ( ',' item )*
+    // item  := aggregate [AS name] | expr [AS name]
+    fn return_items(&mut self) -> Result<Vec<RetItem>, String> {
         let mut items = Vec::new();
         loop {
-            let e = self.expr()?;
-            let name = if self.eat_kw("AS") {
-                self.ident()?
+            let idx = items.len();
+            let item = if let Some(func) = self.peek_agg() {
+                let (agg_arg, distinct) = self.aggregate_call()?;
+                let name = if self.eat_kw("AS") {
+                    self.ident()?
+                } else {
+                    format!("col{idx}")
+                };
+                RetItem::Agg(crate::ir::Agg {
+                    func,
+                    arg: agg_arg,
+                    distinct,
+                    name,
+                })
             } else {
-                default_name(&e, items.len())
+                let e = self.expr()?;
+                let name = if self.eat_kw("AS") {
+                    self.ident()?
+                } else {
+                    default_name(&e, idx)
+                };
+                RetItem::Key(name, e)
             };
-            items.push((name, e));
+            items.push(item);
             if !self.eat(&Tok::Comma) {
                 break;
             }
         }
         Ok(items)
+    }
+
+    /// If the next tokens are `aggName (` return the aggregate function.
+    fn peek_agg(&self) -> Option<AggFn> {
+        if let Some(Tok::Ident(s)) = self.peek() {
+            if self.toks.get(self.pos + 1) == Some(&Tok::LParen) {
+                return agg_fn(s);
+            }
+        }
+        None
+    }
+
+    // aggregate_call := aggName '(' ( '*' | [DISTINCT] expr ) ')'
+    // returns (arg, distinct); arg is None only for `count(*)`.
+    fn aggregate_call(&mut self) -> Result<(Option<Expr>, bool), String> {
+        self.pos += 1; // the aggregate name (already validated by peek_agg)
+        self.expect(&Tok::LParen)?;
+        if self.eat(&Tok::Star) {
+            self.expect(&Tok::RParen)?;
+            return Ok((None, false));
+        }
+        let distinct = self.eat_kw("DISTINCT");
+        let arg = self.expr()?;
+        self.expect(&Tok::RParen)?;
+        Ok((Some(arg), distinct))
     }
 
     // Expression precedence: OR < AND < NOT < comparison < primary.
@@ -633,5 +801,158 @@ mod tests {
         assert!(super::parse("MATCH (p:Person) RETURN q.name").is_err()); // unknown var
         assert!(super::parse("RETURN 1").is_err()); // no MATCH
         assert!(super::parse("MATCH (p:Person) WHERE p.age > RETURN p.name").is_err());
+    }
+
+    // --- part 2: aggregation, DISTINCT, ORDER/SKIP/LIMIT ---
+
+    fn num(v: &Value) -> f64 {
+        match v {
+            Value::Num(x) => *x,
+            other => panic!("expected number, got {other:?}"),
+        }
+    }
+    fn col(rows: &Rows, r: usize, name: &str) -> Value {
+        let i = rows.names.iter().position(|n| n == name).expect("column");
+        rows.rows[r][i].clone()
+    }
+
+    #[test]
+    fn scalar_count_star() {
+        let store = social();
+        let out = run(
+            &super::parse("MATCH (p:Person) RETURN count(*) AS c").unwrap(),
+            &store,
+        );
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(num(&col(&out, 0, "c")), 3.0);
+    }
+
+    #[test]
+    fn group_count_by_property() {
+        let store = social();
+        // group people by age bucket... simpler: count Persons by their own name
+        // (each unique) is 1 each — instead group by a shared value. Use KNOWS
+        // out-degree: (a)-[:KNOWS]->(b) grouped by a.name.
+        let out = run(
+            &super::parse("MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name AS who, count(*) AS deg")
+                .unwrap(),
+            &store,
+        );
+        let mut got: Vec<(String, f64)> = out
+            .rows
+            .iter()
+            .map(|r| match (&r[0], &r[1]) {
+                (Value::Str(w), Value::Num(d)) => (w.to_string(), *d),
+                _ => panic!("shape"),
+            })
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got, vec![("alice".into(), 2.0), ("bob".into(), 1.0)]);
+    }
+
+    #[test]
+    fn sum_min_max_avg_match_hand_built() {
+        use crate::ir::{Agg, AggFn, Expr, Plan};
+        let store = social();
+        let hand = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .aggregate(
+            vec![],
+            vec![
+                Agg {
+                    func: AggFn::Sum,
+                    arg: Some(Expr::Prop {
+                        slot: 0,
+                        key: "age".into(),
+                    }),
+                    distinct: false,
+                    name: "s".into(),
+                },
+                Agg {
+                    func: AggFn::Avg,
+                    arg: Some(Expr::Prop {
+                        slot: 0,
+                        key: "age".into(),
+                    }),
+                    distinct: false,
+                    name: "a".into(),
+                },
+            ],
+        );
+        assert_same(
+            "MATCH (p:Person) RETURN sum(p.age) AS s, avg(p.age) AS a",
+            &hand,
+            &store,
+        );
+    }
+
+    #[test]
+    fn return_distinct() {
+        let store = social();
+        // distinct set of nodes reachable by KNOWS: {bob, carol}
+        let out = run(
+            &super::parse("MATCH (a:Person)-[:KNOWS]->(b) RETURN DISTINCT b.name AS who").unwrap(),
+            &store,
+        );
+        let mut got: Vec<String> = out
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Str(x) => x.to_string(),
+                _ => panic!(),
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["bob", "carol"]);
+    }
+
+    #[test]
+    fn order_by_limit_top_k() {
+        let store = social();
+        // oldest two people by age desc: carol(40), alice(30)
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) RETURN p.name AS name, p.age AS age ORDER BY age DESC LIMIT 2",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert_eq!(out.rows.len(), 2);
+        assert_eq!(num(&col(&out, 0, "age")), 40.0);
+        assert_eq!(num(&col(&out, 1, "age")), 30.0);
+    }
+
+    #[test]
+    fn order_by_skip_limit_window() {
+        let store = social();
+        // ascending age: bob(25), alice(30), carol(40); skip 1 limit 1 -> alice
+        let out = run(
+            &super::parse("MATCH (p:Person) RETURN p.name AS name, p.age AS age ORDER BY age ASC SKIP 1 LIMIT 1").unwrap(),
+            &store,
+        );
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(num(&col(&out, 0, "age")), 30.0);
+    }
+
+    #[test]
+    fn order_by_aggregate_alias() {
+        let store = social();
+        // out-degree desc: alice(2) then bob(1)
+        let out = run(
+            &super::parse(
+                "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name AS who, count(*) AS deg ORDER BY deg DESC",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert_eq!(out.rows.len(), 2);
+        assert_eq!(num(&col(&out, 0, "deg")), 2.0);
+        assert_eq!(num(&col(&out, 1, "deg")), 1.0);
+    }
+
+    #[test]
+    fn order_by_unknown_column_errors() {
+        assert!(super::parse("MATCH (p:Person) RETURN p.name AS name ORDER BY age").is_err());
     }
 }
