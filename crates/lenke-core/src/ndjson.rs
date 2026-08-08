@@ -643,6 +643,44 @@ mod tests {
         assert_eq!(g.etype.text(g.e_type[0]), "R");
     }
 
+    /// First-wins duplicate detection is derived from the interning pass rather
+    /// than a second hash table: `intern` hands out dense ids in order of FIRST
+    /// occurrence, so a node is the first to carry its id exactly when the id it
+    /// interned to equals the count of distinct ids seen before it.
+    ///
+    /// That invariant is about ORDER OF FIRST OCCURRENCE, not adjacency, so the
+    /// case worth pinning is duplicates that are separated by other ids — a
+    /// version that compared against "the previous id" instead of the running
+    /// distinct count passes the adjacent test above and fails this one.
+    #[test]
+    fn interleaved_duplicate_ids_are_still_first_wins() {
+        // a b a c b a — three distinct, first occurrences at positions 0, 1, 3.
+        let g = decode(
+            "{\"type\":\"node\",\"id\":\"a\",\"labels\":[\"A1\"],\"properties\":{\"n\":1}}\n\
+             {\"type\":\"node\",\"id\":\"b\",\"labels\":[\"B1\"],\"properties\":{\"n\":2}}\n\
+             {\"type\":\"node\",\"id\":\"a\",\"labels\":[\"A2\"],\"properties\":{\"n\":9}}\n\
+             {\"type\":\"node\",\"id\":\"c\",\"labels\":[\"C1\"],\"properties\":{\"n\":3}}\n\
+             {\"type\":\"node\",\"id\":\"b\",\"labels\":[\"B2\"],\"properties\":{\"n\":8}}\n\
+             {\"type\":\"node\",\"id\":\"a\",\"labels\":[\"A3\"],\"properties\":{\"n\":7}}",
+        )
+        .unwrap();
+        assert_eq!(g.n, 3);
+        for (id, label, n) in [("a", "A1", 1.0), ("b", "B1", 2.0), ("c", "C1", 3.0)] {
+            let v = g.vid.get(id).unwrap_or_else(|| panic!("{id} exists"));
+            let labels: Vec<&str> = g
+                .vertex_labels(v)
+                .iter()
+                .map(|&l| g.labels.text(l))
+                .collect();
+            assert_eq!(labels, vec![label], "{id} keeps its FIRST labels");
+            assert_eq!(
+                g.props.value(v as usize, "n", &g.strs),
+                Value::Num(n),
+                "{id} keeps its FIRST properties"
+            );
+        }
+    }
+
     // ===== decode characterization =====
     //
     // Assert the exact `Value` that `decode` parses each JSON property into, so
