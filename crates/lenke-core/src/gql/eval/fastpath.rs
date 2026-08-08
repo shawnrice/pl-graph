@@ -1396,3 +1396,298 @@ fn conjuncts(e: &CExpr) -> Vec<&CExpr> {
         other => vec![other],
     }
 }
+
+/// `MATCH … WITH <endpoint>, <aggregates> RETURN count(*)` — the number of
+/// GROUPS, which does not depend on what the aggregates computed.
+///
+/// This is the PageRank/CC-shaped gather as a benchmark writes it: group 8M
+/// edges by their endpoint, aggregate over the sources, then ask how many
+/// groups there were. The grouping is the answer; the aggregate is dead.
+///
+/// So it is dead-value elimination, with the usual guard — an aggregate may be
+/// dropped only if nothing can OBSERVE it, and in this engine an aggregate has
+/// exactly one observable effect besides its value: it can FAULT.
+///
+/// - `count`, `min` and `max` never fault. `min`/`max` fold through `cmp_total`,
+///   which is a total order by construction.
+/// - `sum` and `avg` fault on a temporal or a list value
+///   (`FAULT_NONNUMERIC_AGG`, `FAULT_TEMPORAL_AGG`). They are safe exactly when
+///   the argument's stored column cannot hold one — a typed `Num`, `Str` or
+///   `Bool` column. A `Mixed` column, or anything else, declines.
+///
+/// With that established the answer is the number of distinct endpoints, which
+/// `walk_count` already computes with a bitmap:
+///
+/// ```text
+/// gather_by_node   145.16ms -> 17.4   (main 35.28)
+/// ```
+///
+/// **What this does NOT speed up, and it is worth being plain about it:** the
+/// shape where the aggregate is actually READ — `WITH n, sum(m.age) AS s RETURN
+/// sum(s)` — still materializes a row per edge, and that is the shape the
+/// benchmark's name is really about. This makes the benchmark fast by not doing
+/// arithmetic nobody asked for, which is a real and general optimization but a
+/// narrower one than the row it lands on suggests. A streaming grouped fold,
+/// which would fix both, is the next thing here.
+pub(super) fn try_count_groups(
+    linear: &CLinear,
+    graph: &Graph,
+    plan: &CQuery,
+    params: &[Val],
+) -> Option<CodeResult<RowSet>> {
+    if !walk_count_enabled() {
+        return None;
+    }
+    let [CClause::Match {
+        optional: false,
+        patterns,
+        where_: None,
+        scope_len,
+        ..
+    }, CClause::With {
+        projection: with,
+        where_: None,
+        ..
+    }, CClause::Return(out)] = linear.clauses.as_slice()
+    else {
+        return None;
+    };
+    let [path] = patterns.as_slice() else {
+        return None;
+    };
+    if path.segments.is_empty() || path.path_var_slot.is_some() {
+        return None;
+    }
+    if !matches!(path.selector, PathSelector::Walk) {
+        return None;
+    }
+
+    // The outer projection is exactly `count(*)`.
+    if !out.aggregating
+        || out.aggs.len() != 1
+        || out.items.len() != 1
+        || !out.group_by.is_empty()
+        || out.limit.is_some()
+        || out.skip.is_some()
+        || out.having.is_some()
+        || out.distinct
+        || !out.order_by.is_empty()
+        || !matches!(out.items[0].expr, CExpr::AggRef(0))
+    {
+        return None;
+    }
+    let outer = &out.aggs[0];
+    if !(outer.star && !outer.distinct && outer.arg.is_none() && matches!(outer.func, AggFn::Count))
+    {
+        return None;
+    }
+
+    // The WITH groups by the path's endpoint and nothing else, with no paging,
+    // ordering, HAVING or DISTINCT of its own — each of which would change how
+    // many groups survive.
+    if !with.aggregating
+        || !with.group_by.is_empty()
+        || with.limit.is_some()
+        || with.skip.is_some()
+        || with.having.is_some()
+        || with.distinct
+        || !with.order_by.is_empty()
+    {
+        return None;
+    }
+    let end_slot = path.segments.last()?.node.var_slot?;
+    let mut keys = with.items.iter().filter(|i| !i.is_agg);
+    let key = keys.next()?;
+    if keys.next().is_some() || !matches!(key.expr, CExpr::Var(s) if s == end_slot) {
+        return None;
+    }
+
+    let ctx = resolve_ctx(graph, plan, params);
+    for agg in &with.aggs {
+        if !agg_cannot_fault(graph, &ctx, agg) {
+            return None;
+        }
+    }
+
+    let (hops, quant) = bare_hops(path, &ctx)?;
+    // A quantified pattern reaches the same endpoint at several lengths, and the
+    // distinct count would have to union them rather than sum.
+    if quant.is_some() {
+        return None;
+    }
+
+    let seeds = seek_lower::scan_node(graph, &ctx, &path.start, None, *scope_len, None);
+    if let Err(e) = ctx.check_fault() {
+        return Some(Err(e));
+    }
+    let n = crate::seek::walk_count(graph, &seeds, &hops, crate::seek::SelfLoops::Once, true);
+
+    Some(count_rows_any(out, n as u64))
+}
+
+/// Whether an aggregate can be dropped without losing an error — see
+/// [`try_count_groups`]. Conservative: an argument this cannot type declines.
+fn agg_cannot_fault(graph: &Graph, ctx: &Ctx, agg: &CAgg) -> bool {
+    match agg.func {
+        // `count` counts; `min`/`max` fold through `cmp_total`, a total order.
+        AggFn::Count | AggFn::Min | AggFn::Max => true,
+        // `sum`/`avg` fault on a temporal or a list, so they are safe exactly
+        // when the stored column cannot hold one.
+        AggFn::Sum | AggFn::Avg => {
+            let Some(CExpr::Prop { key_ref, .. }) = agg.arg.as_ref() else {
+                return false;
+            };
+            let Some(kid) = ctx.prop_keys[*key_ref].0 else {
+                // The key does not exist on any vertex, so every value is absent
+                // and the fold sees nothing to fault on.
+                return true;
+            };
+            matches!(
+                graph.props.cols.get(kid as usize),
+                Some(Column::Num { .. } | Column::Str { .. } | Column::Bool { .. })
+            )
+        }
+        _ => false,
+    }
+}
+
+/// `MATCH (a:L) WHERE [NOT] EXISTS { (a)-[:R]->(far) } RETURN count(*)` — count
+/// the mask, do not build rows to count them.
+///
+/// The backward sweep already answers this as a per-vertex bitmap (see
+/// `semi_join_back`), and the columnar path then spends three passes over a
+/// million rows turning that bitmap into a number: a `Col::Bool` of a million
+/// bools, a filter, and a count. Testing the bit while walking the seeds is one
+/// pass and no allocation.
+///
+/// ```text
+/// not_exists_hub   2.91ms -> 0.30   (main 0.25)
+/// exists_semi      1.11   -> 0.13   (main 0.25)
+/// ```
+///
+/// `NOT` is a negation of the same mask rather than its own path — the sweep
+/// computes "reaches", and the two polarities differ only in which answer is
+/// kept, which is also why neither can be right if the other is wrong.
+pub(super) fn try_count_semi_join(
+    linear: &CLinear,
+    graph: &Graph,
+    plan: &CQuery,
+    params: &[Val],
+) -> Option<CodeResult<RowSet>> {
+    if !walk_count_enabled() {
+        return None;
+    }
+    let [CClause::Match {
+        optional: false,
+        patterns,
+        where_: Some(pred),
+        scope_len,
+        ..
+    }, CClause::Return(proj)] = linear.clauses.as_slice()
+    else {
+        return None;
+    };
+    let [path] = patterns.as_slice() else {
+        return None;
+    };
+    // A BARE node: the pattern contributes no rows of its own, so the count is
+    // exactly how many seeds pass the predicate.
+    if !path.segments.is_empty() || path.path_var_slot.is_some() {
+        return None;
+    }
+    if !proj.aggregating
+        || proj.aggs.len() != 1
+        || proj.items.len() != 1
+        || !proj.group_by.is_empty()
+        || proj.limit.is_some()
+        || proj.skip.is_some()
+        || proj.having.is_some()
+        || proj.distinct
+        || !proj.order_by.is_empty()
+        || !matches!(proj.items[0].expr, CExpr::AggRef(0))
+    {
+        return None;
+    }
+    let agg = &proj.aggs[0];
+    if !(agg.star && !agg.distinct && agg.arg.is_none() && matches!(agg.func, AggFn::Count)) {
+        return None;
+    }
+
+    // `EXISTS { … }` or `NOT EXISTS { … }`, and nothing else — any further
+    // conjunct is a predicate the mask does not carry.
+    let (want, inner) = match pred {
+        CExpr::Exists { patterns, .. } => (true, patterns),
+        CExpr::Not(e) => match e.as_ref() {
+            CExpr::Exists { patterns, .. } => (false, patterns),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let [inner_path] = inner.as_slice() else {
+        return None;
+    };
+    if inner_path.path_var_slot.is_some() || !matches!(inner_path.selector, PathSelector::Walk) {
+        return None;
+    }
+    let [seg] = inner_path.segments.as_slice() else {
+        return None;
+    };
+    if seg.unit.is_some() || seg.rel.quantifier.is_some() {
+        return None;
+    }
+    // The subquery's root must be the outer variable itself, unconstrained —
+    // the same precondition `exists_semi_join_vec` checks before it reads the
+    // frame's element column.
+    let start = &inner_path.start;
+    if start.var_slot != path.start.var_slot
+        || start.label.is_some()
+        || !start.props.is_empty()
+        || start.where_.is_some()
+    {
+        return None;
+    }
+    let rel = &seg.rel;
+    if rel.var_slot.is_some() || !rel.props.is_empty() || rel.where_.is_some() {
+        return None;
+    }
+    if seg.node.where_.is_some() {
+        return None;
+    }
+
+    let ctx = resolve_ctx(graph, plan, params);
+    // A bare label seeds from its BUCKET, borrowed — `scan_node` would copy a
+    // million ids into a `Vec` to then read each one once. Anything richer (an
+    // inline constraint, a WHERE, an index seek) goes through `scan_node`, which
+    // is where that logic belongs.
+    let bare_label = path.start.props.is_empty() && path.start.where_.is_none();
+    let bucket = if bare_label {
+        path.start
+            .label
+            .as_ref()
+            .and_then(seed_label)
+            .and_then(|r| ctx.labels[r].0)
+            .map(|lid| graph.vertices_with_label(lid))
+    } else {
+        None
+    };
+    let owned;
+    let seeds: &[u32] = match bucket {
+        Some(b) => b,
+        None => {
+            owned = seek_lower::scan_node(graph, &ctx, &path.start, None, *scope_len, None);
+            &owned
+        }
+    };
+    if let Err(e) = ctx.check_fault() {
+        return Some(Err(e));
+    }
+    // Declines unless the far end is narrow enough to sweep — the same cost
+    // model, so this arm never makes a query slower than the columnar one.
+    let reached = semi_join_back(graph, &ctx, seg, seeds.len())?;
+    let n = seeds
+        .iter()
+        .filter(|&&v| reached[v as usize] == want)
+        .count();
+
+    Some(count_rows_any(proj, n as u64))
+}

@@ -1569,6 +1569,54 @@ pub fn walk_ids(
 /// is: both engines walk the same adjacency the same way.
 ///
 /// Returns a per-vertex-slot bitmap; index it with a vertex id.
+/// [`reach_back`] seeded from the far end as a LIST rather than a bitmap.
+///
+/// The bitmap form has to scan every vertex slot to find the ones that are set,
+/// which for a selective far end is the whole cost: a thousand `Hub`s in a
+/// million-vertex graph means a million iterations to find a thousand starts,
+/// twice (once to build the bitmap, once to read it). Callers that already know
+/// the far set as a list — which is how they built the bitmap — should hand it
+/// over instead.
+#[must_use]
+pub fn reach_back_from(
+    graph: &Graph,
+    hops: &[(Dir, Option<Vec<u32>>)],
+    far: &[u32],
+    loops: SelfLoops,
+) -> Vec<bool> {
+    let slots = graph.vertex_slots();
+    let Some(((dir, etypes), init)) = hops.split_last() else {
+        // No hops: the far set itself.
+        let mut level = vec![false; slots];
+        for &v in far {
+            level[v as usize] = true;
+        }
+        return level;
+    };
+    if etypes.as_ref().is_some_and(Vec::is_empty) {
+        return vec![false; slots];
+    }
+    let types = etypes.as_deref().unwrap_or(&[]);
+    let back = match dir {
+        Dir::Out => Dir::In,
+        Dir::In => Dir::Out,
+        Dir::Both => Dir::Both,
+    };
+
+    // The sparse level, walked from the list.
+    let mut level = vec![false; slots];
+    for &v in far {
+        for a in adj(graph, v, back, types, loops) {
+            level[a.nbr as usize] = true;
+        }
+    }
+    // Any remaining hops are dense — by then the level has spread.
+    if init.is_empty() {
+        return level;
+    }
+    reach_back(graph, init, level, loops)
+}
+
 #[must_use]
 pub fn reach_back(
     graph: &Graph,

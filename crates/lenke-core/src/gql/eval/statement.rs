@@ -1429,6 +1429,15 @@ pub(super) fn run_part(
     if let Some(res) = try_walk_count(linear, graph, plan, params) {
         return res;
     }
+    // `count(*)` filtered by a semi-join counts the MASK, not rows.
+    if let Some(res) = try_count_semi_join(linear, graph, plan, params) {
+        return res;
+    }
+    // `count(*)` over a grouped WITH is the number of GROUPS, which the
+    // aggregates do not affect.
+    if let Some(res) = try_count_groups(linear, graph, plan, params) {
+        return res;
+    }
     // A comma join off one start is a PRODUCT of its branches, not a cross
     // product to enumerate.
     if let Some(res) = try_count_comma_join(linear, graph, plan, params) {

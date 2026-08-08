@@ -3972,24 +3972,22 @@ fn semi_join_back(graph: &Graph, ctx: &Ctx, seg: &CSegment, rows: usize) -> Opti
         return None;
     }
 
-    let mut far = vec![false; verts];
-    for v in seeds {
-        far[v as usize] = true;
-    }
-
     let dir = match rel.direction {
         Direction::Out => crate::seek::Dir::Out,
         Direction::In => crate::seek::Dir::In,
         Direction::Both => crate::seek::Dir::Both,
     };
 
+    // Seeded from the far end as a LIST: the bitmap form would scan every vertex
+    // slot to rediscover the handful of seeds just written into it.
+    //
     // `SelfLoops::Once` — the same convention `expand` walks with. `Twice` is
     // Gremlin's, and using it here would make `(a)-[:R]->(a)` a different
     // question than the forward path answers.
-    Some(crate::seek::reach_back(
+    Some(crate::seek::reach_back_from(
         graph,
         &[(dir, etypes)],
-        far,
+        &seeds,
         crate::seek::SelfLoops::Once,
     ))
 }

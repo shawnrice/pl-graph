@@ -13860,3 +13860,152 @@ fn a_dense_group_key_still_emits_first_seen_order() {
     assert_eq!(dense, rows(&mut g, q));
     assert_eq!(dense, vec![vec![s("zed"), n(1.0)], vec![s("amy"), n(1.0)]]);
 }
+
+/// A fixture for the count-of-groups shortcut: `age` is a plain number column
+/// (so `sum` over it cannot fault) while `tags` holds a LIST on one node, which
+/// is exactly what makes `sum` fault — the case the shortcut must refuse to
+/// skip.
+fn group_count_fixture() -> Graph {
+    graph_of(&[
+        r#"{"type":"node","id":"a","labels":["P"],"properties":{"age":30,"tags":[1,2]}}"#,
+        r#"{"type":"node","id":"b","labels":["P"],"properties":{"age":40,"tags":7}}"#,
+        r#"{"type":"node","id":"c","labels":["P"],"properties":{"age":50,"tags":8}}"#,
+        r#"{"type":"node","id":"d","labels":["P"],"properties":{"age":60,"tags":9}}"#,
+        r#"{"type":"edge","id":"h1","from":"a","to":"b","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"h2","from":"a","to":"c","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"h3","from":"b","to":"c","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"h4","from":"c","to":"d","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"h5","from":"d","to":"b","labels":["R"],"properties":{}}"#,
+    ])
+}
+
+/// Counting the groups without computing the aggregates must give the same
+/// answer as computing them.
+#[test]
+fn the_group_count_shortcut_agrees_with_the_aggregating_path() {
+    let mut g = group_count_fixture();
+    for q in [
+        "MATCH (m:P)-[:R]->(n) WITH n, sum(m.age) AS s RETURN count(*) AS c",
+        "MATCH (m:P)-[:R]->(n) WITH n, avg(m.age) AS s RETURN count(*) AS c",
+        "MATCH (m:P)-[:R]->(n) WITH n, min(m.age) AS lo RETURN count(*) AS c",
+        "MATCH (m:P)-[:R]->(n) WITH n, max(m.age) AS hi RETURN count(*) AS c",
+        "MATCH (m:P)-[:R]->(n) WITH n, count(*) AS k RETURN count(*) AS c",
+        "MATCH (m:P)-[:R]->(n) WITH n, count(DISTINCT m) AS k RETURN count(*) AS c",
+        // Several aggregates at once, and one over the ENDPOINT rather than the
+        // start.
+        "MATCH (m:P)-[:R]->(n) WITH n, sum(m.age) AS s, max(n.age) AS hi RETURN count(*) AS c",
+        // Two hops, and a seed narrowed by an inline constraint.
+        "MATCH (m:P)-[:R]->()-[:R]->(n) WITH n, sum(m.age) AS s RETURN count(*) AS c",
+        "MATCH (m:P {age: 30})-[:R]->(n) WITH n, sum(m.age) AS s RETURN count(*) AS c",
+        // `min`/`max` over a MIXED column never fault, so they are still safe.
+        "MATCH (m:P)-[:R]->(n) WITH n, min(m.tags) AS lo RETURN count(*) AS c",
+    ] {
+        let shortcut = rows(&mut g, q);
+        let computed = super::eval::without_walk_count(|| rows(&mut g, q));
+        assert_eq!(
+            shortcut, computed,
+            "group-count shortcut != aggregating path for `{q}`"
+        );
+    }
+}
+
+/// An aggregate that would FAULT may not be skipped, however dead its value is.
+/// `sum` over a column holding a list raises `E_INVALID_VALUE`, and dropping it
+/// would silently turn that error into a count.
+#[test]
+fn a_faulting_aggregate_is_not_skipped() {
+    let mut g = group_count_fixture();
+    let q = "MATCH (m:P)-[:R]->(n) WITH n, sum(m.tags) AS s RETURN count(*) AS c";
+    let plan = parse(q).expect("parses");
+    assert!(
+        plan.execute(&mut g, &Params::new()).is_err(),
+        "summing a list must still fault, not be optimized away"
+    );
+    // …and the same query without the list values is fine, so the fixture is
+    // testing the VALUE and not the shape.
+    assert_eq!(
+        rows(
+            &mut g,
+            "MATCH (m:P)-[:R]->(n) WITH n, sum(m.age) AS s RETURN count(*) AS c"
+        ),
+        super::eval::without_walk_count(|| rows(
+            &mut g,
+            "MATCH (m:P)-[:R]->(n) WITH n, sum(m.age) AS s RETURN count(*) AS c"
+        )),
+    );
+}
+
+/// Anything that changes WHICH groups survive keeps the aggregating path: a
+/// filter on the WITH, a HAVING, paging, or an outer projection that reads more
+/// than the count.
+#[test]
+fn a_filtered_group_count_stays_on_the_aggregating_path() {
+    let mut g = group_count_fixture();
+    for q in [
+        "MATCH (m:P)-[:R]->(n) WITH n, sum(m.age) AS s WHERE s > 40 RETURN count(*) AS c",
+        "MATCH (m:P)-[:R]->(n) WITH n, sum(m.age) AS s LIMIT 2 RETURN count(*) AS c",
+        "MATCH (m:P)-[:R]->(n) WITH n, sum(m.age) AS s RETURN count(*) AS c, sum(s) AS t",
+        "MATCH (m:P)-[:R]->(n) WITH n, sum(m.age) AS s RETURN sum(s) AS t",
+        // Grouped by a PROPERTY of the endpoint, not the endpoint — a different
+        // number of groups.
+        "MATCH (m:P)-[:R]->(n) WITH n.age AS a, sum(m.age) AS s RETURN count(*) AS c",
+    ] {
+        let taken = rows(&mut g, q);
+        let computed = super::eval::without_walk_count(|| rows(&mut g, q));
+        assert_eq!(taken, computed, "`{q}`");
+    }
+}
+
+/// Counting the semi-join MASK must agree with filtering rows and counting
+/// those, in both polarities and for every far-end constraint the sweep takes.
+///
+/// Forced, because the cost model declines an eight-vertex graph — without it
+/// both sides of every comparison would be the columnar path.
+#[test]
+fn the_semi_join_count_agrees_with_counting_rows() {
+    let mut g = back_semi_fixture();
+    for q in [
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R]->(:W) } RETURN count(*) AS c",
+        "MATCH (u:V) WHERE NOT EXISTS { (u)-[:R]->(:W) } RETURN count(*) AS c",
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R]->(:V) } RETURN count(*) AS c",
+        "MATCH (u:Tri) WHERE EXISTS { (u)-[:R]->(:Tri) } RETURN count(*) AS c",
+        // Reversed and undirected.
+        "MATCH (u:V) WHERE EXISTS { (u)<-[:R]-(:V) } RETURN count(*) AS c",
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R]-(:V) } RETURN count(*) AS c",
+        // An inline property far end, and one that matches nothing (so the count
+        // is 0 for EXISTS and every seed for NOT EXISTS).
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R]->({id: 'b'}) } RETURN count(*) AS c",
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R]->(:W {id: 'zzz'}) } RETURN count(*) AS c",
+        "MATCH (u:V) WHERE NOT EXISTS { (u)-[:R]->(:W {id: 'zzz'}) } RETURN count(*) AS c",
+        // An edge type that resolves to nothing.
+        "MATCH (u:V) WHERE EXISTS { (u)-[:NOPE]->(:W) } RETURN count(*) AS c",
+        // A type union.
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R|S]->(:V) } RETURN count(*) AS c",
+    ] {
+        let masked = super::eval::forcing_backward_semi_join(|| rows(&mut g, q));
+        let counted = super::eval::without_walk_count(|| rows(&mut g, q));
+        assert_eq!(masked, counted, "semi-join count != row count for `{q}`");
+    }
+}
+
+/// The mask carries the EXISTS and nothing else, so a predicate with anything
+/// beside it — another conjunct, a disjunction, a constrained subquery root —
+/// must keep the general path rather than count a mask that answers a different
+/// question.
+#[test]
+fn a_semi_join_count_with_more_than_the_exists_declines() {
+    let mut g = back_semi_fixture();
+    for q in [
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R]->(:W) } AND u.id <> 'a' RETURN count(*) AS c",
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R]->(:W) } OR u.id = 'd' RETURN count(*) AS c",
+        "MATCH (u:V) WHERE NOT (EXISTS { (u)-[:R]->(:W) } AND u.id <> 'a') RETURN count(*) AS c",
+        // Two hops inside the subquery: `semi_join_back` takes one segment.
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R]->()-[:R]->(:V) } RETURN count(*) AS c",
+        // A count that is not `count(*)`.
+        "MATCH (u:V) WHERE EXISTS { (u)-[:R]->(:W) } RETURN count(DISTINCT u) AS c",
+    ] {
+        let taken = super::eval::forcing_backward_semi_join(|| rows(&mut g, q));
+        let counted = super::eval::without_walk_count(|| rows(&mut g, q));
+        assert_eq!(taken, counted, "`{q}`");
+    }
+}
