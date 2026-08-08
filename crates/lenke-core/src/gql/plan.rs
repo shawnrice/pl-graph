@@ -83,6 +83,28 @@ pub enum ScalarFn {
     /// language and they differ in value AND type on a multi-label vertex, so
     /// collapsing them would force one of the two to be wrong.
     FirstLabel,
+    /// Gremlin's `elementMap([keys...])`: `{id, label, ...present props}`, an
+    /// edge's map additionally nesting `IN`/`OUT` endpoint stubs. One `Val`
+    /// per row, built whole — not decomposed into `CProjection` columns.
+    ///
+    /// Investigated twice as inexpressible in this IR, for two reasons that
+    /// both turned out to be about the WRONG shape rather than the whole
+    /// question: (1) the key set is PER ROW (present keys only, no null for
+    /// an absent one), which no FIXED-at-compile-time `CProjection` item list
+    /// or `CExpr::Record` field list can hold; (2) an edge's map nests
+    /// `IN`/`OUT` submaps, which no `Shape` composes from separate columns.
+    /// Both are true of decomposing the map into columns — and irrelevant to
+    /// returning the WHOLE map as one opaque `Val::Map` per row, exactly as
+    /// `EdgeSource`/`EdgeTarget` and `FirstLabel` each added a direct,
+    /// single-value answer instead of trying to express their question
+    /// through the pattern/projection machinery built for a different one.
+    ///
+    /// `args` is `[element, key_lit, key_lit, …]` — the element expression
+    /// (always `CExpr::Var`, so `eval_vec` can index straight into the
+    /// element column) followed by zero or more `CExpr::Lit(Lit::Str(_))`,
+    /// one per explicit `elementMap(keys...)` argument. Empty means "every
+    /// present key".
+    ElementMap,
     // Graph functions.
     Labels,
     Type,

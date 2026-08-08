@@ -2357,7 +2357,9 @@ fn fold_extreme(values: Vec<Val>, want: Ordering) -> Val {
 }
 
 // --- scalar functions (dispatched on the resolved enum) ---
-mod scalar_fns;
+// `pub(crate)` for one function: `element_map_val`, which the Gremlin STREAM's
+// `elementMap` step now shares rather than keeping a second copy of.
+pub(crate) mod scalar_fns;
 use scalar_fns::*;
 
 // --- pattern matching --------------------------------------------------------
@@ -3505,6 +3507,49 @@ fn eval_vec(graph: &Graph, ctx: &Ctx, sc: &ScanCols, e: &CExpr) -> Col {
                 ),
                 None => gen(e),
             }
+        }
+        // Gremlin's `elementMap([keys...])`, per element — `element_map_val`
+        // builds the WHOLE map (id/label/IN-OUT/props) as one `Val` per row;
+        // vectorizing here is the loop over ids, not a different builder (see
+        // `ScalarFn::ElementMap`'s doc for why one opaque value per row is the
+        // shape that makes this expressible at all).
+        CExpr::Scalar { func, args }
+            if matches!(func, ScalarFn::ElementMap)
+                && !args.is_empty()
+                && matches!(args[0], CExpr::Var(_))
+                && args[1..]
+                    .iter()
+                    .all(|a| matches!(a, CExpr::Lit(Lit::Str(_)))) =>
+        {
+            let CExpr::Var(slot) = &args[0] else {
+                unreachable!("guarded above")
+            };
+            let keys: Vec<&str> = args[1..]
+                .iter()
+                .map(|a| match a {
+                    CExpr::Lit(Lit::Str(s)) => s.as_str(),
+                    _ => unreachable!("guarded above"),
+                })
+                .collect();
+            let (is_edge, ids) = match sc.slot(*slot) {
+                Some((Elem::Node, ids)) => (false, ids),
+                Some((Elem::Edge, ids)) => (true, ids),
+                None => return gen(e),
+            };
+
+            Col::Gen(
+                ids.iter()
+                    .map(|&id| {
+                        let v = if is_edge {
+                            Val::Edge(id)
+                        } else {
+                            Val::Node(id)
+                        };
+
+                        element_map_val(graph, v, &keys)
+                    })
+                    .collect(),
+            )
         }
         CExpr::Scalar { func, args }
             if matches!(func, ScalarFn::EdgeSource | ScalarFn::EdgeTarget)

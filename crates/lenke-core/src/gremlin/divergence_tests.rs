@@ -6654,6 +6654,187 @@ fn id_and_label_migrate_for_both_element_kinds() {
     }
 }
 
+/// `elementMap()`, migrated: `ScalarFn::ElementMap` (`plan.rs`) + one shared
+/// builder (`element_map_val`, `gql/eval/scalar_fns.rs`) used by both the
+/// scalar fallback and `eval_vec`'s vectorized arm.
+///
+/// Checked with `MIGRATE_OFF` set — turning off the migrated route for every
+/// shape below and re-running found `exec.rs`'s `elem_terminal`
+/// `[Step::ElementMap(keys)]` arm dead (see `element_map_arm_is_provably_dead`
+/// for the empirical check that ran BEFORE it was deleted), so `MIGRATE_OFF`
+/// here now falls all the way to the raw per-traverser stream rather than a
+/// dedicated arm. Kept anyway as a second, independent check alongside
+/// `element_map_off_a_frontier_matches_the_stream`'s `fold().unfold()` forced
+/// stream — `elementMap()` is a strict one-row-in-one-row-out map with no
+/// branching, so it cannot hit the reordering trap `MIGRATE_OFF` normally
+/// guards against ("the pattern route reorders by design and comparing
+/// against the stream hid a real ordering bug once" — not a risk here, but
+/// still not the comparison to reach for on a step that COULD reorder).
+/// Every shape that motivated the earlier "cannot express this" writeup is
+/// here: bare vertex, bare edge (the `IN`/`OUT` nesting), an explicit key
+/// list (narrows the fields), a key nothing carries (must be ABSENT, not a
+/// null field), and `dedup()`/`barrier()`/`limit()` peeled in front (the
+/// `col_terminal_tagged` retry-at-every-level path, not just the bare
+/// terminal).
+#[test]
+fn element_map_migrates_across_shapes() {
+    let mut g = modern();
+
+    for q in [
+        "g.V().elementMap()",
+        "g.E().elementMap()",
+        "g.V().elementMap('name')",
+        "g.V().hasLabel('PERSON').elementMap('name','age')",
+        "g.V().elementMap('nope')",
+        "g.E().elementMap('weight')",
+        "g.V().dedup().elementMap()",
+        "g.V().barrier().elementMap()",
+        "g.V().limit(2).elementMap()",
+        "g.E().limit(2).elementMap()",
+    ] {
+        super::exec::MIGRATED.with(|c| c.set(0));
+
+        let migrated = super::parse::parse(q)
+            .unwrap_or_else(|e| panic!("`{q}` parses: {e}"))
+            .run(&mut g);
+        let took = super::exec::MIGRATED.with(std::cell::Cell::get);
+
+        super::exec::MIGRATE_OFF.with(|c| c.set(true));
+        let reference = super::parse::parse(q).expect("parses").run(&mut g);
+        super::exec::MIGRATE_OFF.with(|c| c.set(false));
+
+        assert_eq!(migrated, reference, "{q}");
+        assert!(took >= 1, "{q}: the migration route never fired");
+    }
+}
+
+/// Ran BEFORE `exec.rs`'s `elem_terminal` `[Step::ElementMap(keys)]` arm was
+/// deleted, the same empirical way `values_arm_reachability_probe` and
+/// `where_not_arm_takes_only_what_the_migration_declines` check their own
+/// arms: every shape the migration's own doc comment worried about (a
+/// per-row key set, an edge's nested `IN`/`OUT`), across a bare frontier, an
+/// explicit key list, an absent key, and the peel-in-front shapes
+/// `col_terminal_tagged` retries the translation for. EVERY shape below
+/// migrated (`took >= 1`), which is what justified deleting the arm in the
+/// same change that added this test.
+///
+/// Kept as a permanent guard, now that the arm is gone: if any shape here
+/// ever stops migrating, `col_terminal_tagged` falls all the way to the raw
+/// stream (there is no dedicated arm left to catch it quietly), which is a
+/// real perf regression worth this test failing loudly for.
+#[test]
+fn element_map_arm_is_provably_dead() {
+    let mut g = modern();
+
+    for q in [
+        "g.V().elementMap()",
+        "g.E().elementMap()",
+        "g.V().elementMap('name')",
+        "g.V().hasLabel('PERSON').elementMap('name','age')",
+        "g.V().elementMap('nope')",
+        "g.E().elementMap('weight')",
+        "g.V().dedup().elementMap()",
+        "g.V().barrier().elementMap()",
+        "g.V().limit(2).elementMap()",
+        "g.E().limit(2).elementMap()",
+        "g.V().skip(1).elementMap()",
+        "g.V().range(0, 2).elementMap()",
+    ] {
+        super::exec::MIGRATED.with(|c| c.set(0));
+
+        let _ = super::parse::parse(q)
+            .unwrap_or_else(|e| panic!("`{q}` parses: {e}"))
+            .run(&mut g);
+        let took = super::exec::MIGRATED.with(std::cell::Cell::get);
+
+        assert!(took >= 1, "{q}: the migration route never fired");
+    }
+}
+
+/// `elementMap()` before/after the migration, on a 50k-vertex / 150k-edge
+/// fixture, min-of-7: `MIGRATE_OFF` — now the raw per-traverser stream, since
+/// `exec.rs`'s `elem_terminal` `[Step::ElementMap(keys)]` arm it used to fall
+/// to is deleted (see `element_map_arm_is_provably_dead`) — against the
+/// migrated `ScalarFn::ElementMap` route.
+///
+/// Run with:
+///
+/// ```text
+/// cargo test --release -- --ignored --nocapture element_map_arm_timing_probe
+/// ```
+#[test]
+#[ignore = "timing"]
+fn element_map_arm_timing_probe() {
+    const VERTICES: usize = 50_000;
+    const EDGES: usize = 150_000;
+
+    let mut lines = String::new();
+    for i in 0..VERTICES {
+        // `name` on 9 of every 10 vertices — the rest exercise the
+        // absent-key skip on a bare `elementMap()`.
+        let extra = if i % 10 == 0 {
+            String::new()
+        } else {
+            format!(",\"name\":\"n{i}\"")
+        };
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{{\"n\":{}{extra}}}}}\n",
+            i % 97
+        ));
+    }
+    for i in 0..EDGES {
+        lines.push_str(&format!(
+            "{{\"type\":\"edge\",\"id\":\"e{i}\",\"from\":\"n{}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{\"weight\":{}}}}}\n",
+            i % VERTICES,
+            (i * 31 + 1) % VERTICES,
+            i % 11,
+        ));
+    }
+    let mut g = crate::ndjson::decode(&lines).expect("fixture decodes");
+
+    let cases: &[(&str, &str)] = &[
+        ("vertex, every key", "g.V().elementMap()"),
+        ("edge, every key (IN/OUT nesting)", "g.E().elementMap()"),
+        ("vertex, explicit key", "g.V().elementMap('n')"),
+    ];
+
+    println!();
+    for (label, q) in cases {
+        let mut best_migrated = f64::MAX;
+        let mut last_len = 0;
+        for _ in 0..7 {
+            let t = std::time::Instant::now();
+            let out = super::parse::parse(q).expect("parses").run(&mut g);
+            let secs = t.elapsed().as_secs_f64();
+            std::hint::black_box(out.len());
+            last_len = out.len();
+            if secs < best_migrated {
+                best_migrated = secs;
+            }
+        }
+
+        super::exec::MIGRATE_OFF.with(|c| c.set(true));
+        let mut best_old = f64::MAX;
+        for _ in 0..7 {
+            let t = std::time::Instant::now();
+            let out = super::parse::parse(q).expect("parses").run(&mut g);
+            let secs = t.elapsed().as_secs_f64();
+            std::hint::black_box(out.len());
+            if secs < best_old {
+                best_old = secs;
+            }
+        }
+        super::exec::MIGRATE_OFF.with(|c| c.set(false));
+
+        println!(
+            "PROBE elementMap: migrated {:>8.4}ms  old(elem_terminal) {:>8.4}ms  ratio(old/migrated) {:>5.2}x  rows={last_len}  [{label}] {q}",
+            best_migrated * 1e3,
+            best_old * 1e3,
+            best_old / best_migrated,
+        );
+    }
+}
+
 /// The headline comparison for the Gremlin migration:
 /// `g.V().out('R').hasLabel('W').values('n')` against the identical GQL
 /// statement, and against `MIGRATE_OFF` (the `elem_terminal`/`column_terminal`

@@ -847,30 +847,56 @@ pub(super) fn tail(
                 order_key: Some(k.clone()),
             })
         }
-        // `elementMap(keys)` was investigated and has NO arm here — it cannot be
-        // expressed as a `CProjection` at all, for two independent reasons, not
-        // one repaired by the other:
+        // `elementMap(keys)` — the whole `{id, label, ...}` map, one `Val` per
+        // row.
         //
-        // 1. Its key set is PER-ROW. `exec::element_map_of` (via
-        //    `projected_keys_into`) emits an entry only for a key that is
-        //    PRESENT on that element — `keys` empty means "every present key",
-        //    and even an explicit list SKIPS an absent one rather than nulling
-        //    it. A heterogeneous frontier (some elements missing `m`, say) then
-        //    yields maps with DIFFERENT key sets per row. `Shape::Maps` (the
-        //    container `project()` uses) requires one shared key vector for
-        //    every row — `CProjection::items` is a fixed list of N columns,
-        //    compiled once — so there is no way to compile "however many keys
-        //    this particular element happens to have" into it. `CExpr::Record`
-        //    has the same problem the other way: its field list is fixed at
-        //    COMPILE time, so it cannot omit a field only for the rows where the
-        //    key is absent.
-        // 2. An edge's map carries two NESTED maps (`IN`/`OUT`, each `{id,
-        //    label}` of an endpoint) that neither `Shape` nor any `CExpr` can
-        //    produce — nesting a `Maps`-shaped row inside a single cell of
-        //    another isn't a shape this IR has.
+        // This was investigated and declined once, for two reasons that were
+        // both real about the `CProjection`/`CExpr::Record` DECOMPOSITION route
+        // and irrelevant to this one:
         //
-        // Either alone would be enough to decline; both apply. `exec.rs`'s
-        // `[Step::ElementMap(keys)]` arm keeps this one.
+        // 1. The key set is PER-ROW: `exec::element_map_of` emits an entry only
+        //    for a key PRESENT on that element, so a heterogeneous frontier
+        //    yields maps with different key sets. `Shape::Maps` needs one shared
+        //    key vector for every row and `CExpr::Record`'s field list is fixed
+        //    at compile time — neither can hold "however many keys this element
+        //    happens to have". But nothing here tries to: the key set is decided
+        //    once, per element, INSIDE `element_map_val` (`scalar_fns.rs`), at
+        //    the same place `element_map_of` decides it for the stream. The
+        //    `CProjection` carries one opaque column, not the map's fields.
+        // 2. An edge's map nests `IN`/`OUT` submaps, which no `Shape` composes
+        //    from separate columns — also moot for the same reason: the nesting
+        //    happens inside the one `Val::Map` `element_map_val` returns, not
+        //    across columns.
+        //
+        // The precedent is `ScalarFn::EdgeSource`/`EdgeTarget` and `FirstLabel`:
+        // each answers its question directly rather than trying to express it
+        // through machinery built for a MATCH pattern's columns.
+        [Step::ElementMap(keys)] => {
+            let mut args = vec![CExpr::Var(slot)];
+
+            args.extend(
+                keys.iter()
+                    .map(|k| CExpr::Lit(crate::gql::ast::Lit::Str(k.clone()))),
+            );
+
+            Some(Tail {
+                proj: blank(vec![item(
+                    CExpr::Scalar {
+                        func: ScalarFn::ElementMap,
+                        args,
+                    },
+                    "v",
+                    false,
+                )]),
+                shape: Shape::Rows,
+                // The map is never dropped for an absent key — an explicit key
+                // list just narrows its fields (`element_map_val`'s own rule).
+                absent_key: None,
+                page: None,
+                filter: None,
+                order_key: None,
+            })
+        }
         _ => None,
     }
 }
