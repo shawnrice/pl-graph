@@ -1,247 +1,254 @@
 # The engine, from scratch
 
-This is the design for the query engine as it would be built knowing what we know
-now — not a migration of the current code. The current engine is not the
-foundation here; it is the **oracle**. It, plus the six differential fuzzers,
-defines the behavior the new engine must reproduce, which is what lets us build
-fresh without flying blind (see "Build sequence").
+This is a self-contained design for the query engine, built from the ground up.
+It does not reference or depend on any existing implementation — read it as if
+nothing has been written yet.
 
-Everything the current system supports is in scope: two query languages (GQL,
-Gremlin), the graph store (multi-label nodes/edges, typed columnar properties,
-temporal, interned strings, CSR adjacency), property and interval indexes,
-pattern matching, hops, filters, projection, aggregation/grouping, ordering,
-paging, joins, var-length and shortest paths, path tracking, tags, sack,
-side-effects, the graph-algorithm library, transactions, mutations/upsert, and
-Arrow egress. The sync engine sits above the core and is out of scope for the
-core design (it consumes the engine; it does not change it).
+Scope: two query languages (GQL and Gremlin), a graph store (multi-label
+nodes/edges, typed properties, temporal values, interned strings, adjacency),
+property and interval indexes, pattern matching, hops, filters, projection,
+aggregation and grouping, ordering, paging, joins, variable-length and shortest
+paths, path tracking, tags, sack, side-effects, a graph-algorithm library,
+transactions, mutations and upsert, and columnar (Arrow) egress.
 
-The point of building fresh is to escape the two things that produced the
-accidental complexity: **two execution models** (row `Trav`/`apply` and columnar
-`Col`) that reimplement every hot step twice, and **two hand-written engines**
-(Rust and TS) kept byte-identical by fuzzing. This design collapses the first to
-one model, and forces a real decision on the second.
+Two design commitments shape everything below:
 
-## The foundational fork: one engine, or two? (this is #3, and it is first)
+- **One neutral algebra.** Both languages compile into a single language-agnostic
+  IR. Everything beneath the front-end is blind to which language it came from.
+- **One execution model.** A single columnar batch model, where path/tag/sack
+  lineage is an optional per-operator strategy — not a second, separate engine.
 
-Building fresh, the very first decision is whether there is one engine or two,
-because it determines whether a byte-identity problem exists at all.
+## Two implementations, one design
 
-- **Two hand-written engines (today).** Rust + a pure-TS engine, kept
-  byte-identical by six differential fuzzers. This is the single largest source
-  of the bugs this codebase keeps fixing — the sync `BigInt` throw, the NaN
-  ordering divergence, walk-vs-trail, the `by(__.path())` scoping bug were all
-  "two engines drifted." It taxes every feature twice, forever.
-- **One engine, Rust → WASM (recommended).** The pure-TS engine is deleted, and
-  with it all six differential fuzzers and the byte-identity invariant. TS
-  callers use the WASM build. Cost: ~600 KB brotli in the bundle, WASM startup,
-  and no pure-JS-only environments (some edge/RN/SSR targets).
+The engine ships as **two implementations of this one design — one in Rust, one
+in TypeScript.** Both are first-class. They are not kept in lockstep byte-identity
+by continuous fuzzing; they are kept in **agreement**, which is a looser and more
+maintainable coupling, and the neutral IR is what makes it tractable:
 
-**Recommendation: one engine, Rust → WASM** — _if_ the product can tolerate WASM.
-It deletes roughly half the surface and the entire class of drift bugs. The
-pure-TS engine exists for reach (bundle size, no-WASM runtimes), not speed (Rust
-is 1.5–4× it). This is the one genuinely product-level call in this document, and
-it should be made before anything else, because it changes the value contract,
-the test strategy, and the size of the whole effort.
+- **The IR and its execution semantics are the specification.** Both engines
+  implement the _same_ algebra. Agreement is therefore structural — it follows
+  from both implementing one spec — rather than enforced by two hand-written
+  engines chasing each other.
+- **A single language-agnostic conformance suite** (query → expected result)
+  runs against both. It is the shared source of truth; a divergence is a
+  conformance failure in CI, not a subtle byte-drift discovered later.
+- **Order that is genuinely unspecified stays unspecified.** Where results are
+  set-based (row order, adjacency order, map-key order absent an `ORDER BY`), the
+  spec says "unordered" and the conformance compares as sets. The two engines do
+  not have to make identical arbitrary choices — only agree on what is actually
+  defined. This is where lockstep byte-identity overreaches, and dropping it is
+  the point.
+- Differential testing between the two implementations is a periodic check, not a
+  per-commit gate.
 
-**If two engines are required**, the rest of this design is unchanged — you
-implement the same IR, optimizer, and batch model twice and keep the fuzzers. The
-win is smaller (you keep _one thing_ twice instead of _two things and a bridge_
-twice), but the architecture is the same. Everything below assumes one engine;
-where two changes something, it is noted.
+The design is implementable in both: value columns are typed arrays
+(`Float64Array` and friends in TS), lineage sidecars are offset+value buffers.
+Nothing in the batch model requires a systems language.
 
 ## The core idea: one batch model, lineage as an operator strategy
 
-The current engine has two whole worlds — `Trav` (a row carrying value + path +
-tags + sack) run by the `apply` interpreter, and `Col` (a bare value column) run
-by the columnar path — with a translation layer and decline machinery between
-them. They exist as two worlds only because they were built separately. From
-scratch there is one:
+A naive engine has two temptations that pull apart: a _row_ model that carries a
+traverser (value + path + tags + sack) so it can answer path/tag queries, and a
+_columnar_ model that carries bare value columns so it can go fast. Built
+separately, these become two whole worlds with a bridge between them. Built
+together, they are one:
 
 **One batch type.** A batch is a columnar block of elements: a value column
-(unboxed where the type allows), plus an _optional lineage sidecar_ — path as an
-Arrow-style list column (values buffer + offsets), tags as named columns, sack as
-a column. Lineage columns are present only when the plan needs them.
+(unboxed where the type allows), plus an _optional lineage sidecar_ — path as a
+list column (a values buffer + per-row offsets), tags as named columns, sack as a
+column. The lineage columns exist only when the plan needs them.
 
-**One operator set, each operator with two strategies.** An operator (hop,
-filter, project, aggregate, dedup, …) has a **bulk strategy** — the fast
-columnar/set algorithm (`walk_count`, backward `reach_back`, degree products,
-bitset dedup) — and a **lineage-preserving strategy** — the per-element form that
-also extends the path/tag/sack sidecar. Both operate on the _same_ batch, share
-the _same_ storage access and value contract, and live in the _same_ function.
-The strategy is chosen by whether the plan requires lineage above this operator.
+**One operator set; each operator has two strategies.** An operator (hop, filter,
+project, aggregate, dedup, …) has:
 
-This is the columnar-traverser idea, and it works from scratch precisely because
-there is no `apply` to relocate: you write each operator once, with a conditional
-on lineage, over one batch type. There is no `Trav`-vs-`Col` type split, no
-second interpreter, no translation, no decline path. The per-element logic still
-exists (path tracking is inherently per-element), but it is a branch inside one
-operator, not a parallel universe.
+- a **bulk strategy** — the fast set/columnar algorithm: count without
+  enumerating, a backward reachability sweep for a selective `EXISTS`, a
+  degree-product for a grouped count, bitset deduplication; and
+- a **lineage-preserving strategy** — the per-element form that also extends the
+  path/tag/sack sidecar.
 
-Why this is correct and not a fantasy: the reason path and bulk-collapse are
-"opposed" is that a bulk op (count, reach, degree-product) _produces no
-per-element result to attach a path to_. But an operator only needs the
-lineage-preserving strategy when a consumer above it reads lineage — and a
-consumer that reads lineage is, by definition, enumerating, so the bulk strategy
-was never applicable there anyway. The lineage requirement is exactly the signal
-for which strategy is valid. There is no case where you need both.
+Both run over the _same_ batch, share the _same_ storage access and value
+contract, and live in the _same_ function. The strategy is chosen by whether the
+plan requires lineage above this operator.
+
+**Why this is one model and not two in disguise.** There is no separate
+interpreter and no translation layer, because there is only one batch type and
+one operator set — the per-element path is a branch inside each operator, not a
+parallel world. And it is _correct_ to choose per operator, because path and
+bulk-collapse are only "opposed" in that a bulk op (count, reach, degree-product)
+produces no per-element result to attach a path to. But an operator needs the
+lineage strategy exactly when a consumer above it reads lineage — and such a
+consumer is enumerating, so the bulk strategy was never valid there anyway. The
+lineage requirement is precisely the signal for which strategy applies. No query
+needs both for the same operator.
 
 ## The layers
 
 ```
 GQL text ─▶ GQL front-end ─┐
-                           ├─▶ LOGICAL IR ─▶ optimizer ─▶ physical plan ─▶ BATCH EXECUTION ─▶ storage
-Gremlin text ▶ Grem front-end                (rewrite      (strategy per      (one batch type;
-                           ┘                   rules)        operator from      operators run bulk
-                                     │                       lineage need)      or lineage strategy)
-                                     └──────────────── VALUE CONTRACT ───────────────────────┘
+                           ├─▶ NEUTRAL IR ─▶ optimizer ─▶ physical plan ─▶ BATCH EXECUTION ─▶ storage
+Gremlin text ▶ Grem front-end               (rewrite      (strategy per      (one batch type;
+                           ┘                  rules)        operator, from     bulk or lineage
+                                     │                      lineage need)      strategy per op)
+                                     └──────────────── VALUE CONTRACT ──────────────────────┘
 ```
 
-### Storage — kept, because it is driven by physics
+### Value contract — representation and semantics, defined once
 
-Columnar typed property store, interned strings, CSR adjacency, SoA temporal,
-property and interval (RI-tree) indexes, multi-label nodes and edges. A
-from-scratch design lands here anyway — this shape is forced by cache locality
-and columnar access, not by history. The current storage is mature and correct;
-it is ported, not redesigned. This is the honest part where "from scratch" means
-"the same, deliberately."
+One module owns both the value representation (a single numeric type — f64;
+interned string ids; temporal; bool; list; map/record; null as a first-class
+stored value) **and** its semantics: total order, equality, coercion rules, null
+policy, NaN policy. Storage columns and runtime batches share the same
+representation and the same comparators. There is exactly one place that answers
+"how do two values compare," "are these equal," "what does summing a
+non-number do," "where does NaN sort." Every operator and the storage layer
+consult it; none restate it.
 
-### Value contract — one module, representation and semantics together
+This module is the natural seam between the two implementations — it is small,
+total, and the thing most worth having a shared conformance suite pin exactly.
 
-The value model (f64 numeric, interned string ids, temporal, bool, list,
-map/record, null-as-a-stored-value) **and** its semantics — total order,
-equality, coercion, null policy, NaN policy — are one module, defined once. The
-storage columns and the runtime batch share the same representation and the same
-comparators. Every place that today re-states NaN handling or equality (eval,
-aggregation, sort, seek) instead consults the contract.
+### Storage — columnar, because the physics demands it
 
-With one engine this module exists once. With two, it is the one module you
-mirror, and the fuzzers guard exactly it — which is where most drift lived.
+Typed columnar property store; interned strings; adjacency in a
+compressed-sparse-row layout; temporal values in per-type struct-of-arrays;
+property indexes and interval (relationship-tree) indexes for temporal/range
+queries; multi-label nodes and edges. This shape is forced by cache locality and
+bulk scan speed, not by taste — a from-scratch design arrives here on the merits.
+The batch model reads directly from these columns, so a value column in a batch
+is often a borrow of a storage column, not a copy.
 
-### Logical IR — a language-neutral graph-relational algebra
+### Neutral IR — a language-agnostic graph-relational algebra
 
-One algebra, designed so neither language's concepts leak in. Operators:
+One algebra, designed so that neither language's surface concepts leak into it.
 
-- **Relational:** Scan (label bucket or universe), Filter, Project, Aggregate
-  (group keys + aggregate functions), Join, Order, Page, Distinct.
-- **Graph:** Expand (a hop: direction + edge-type set + optional per-hop node/edge
-  predicate), VarLength (quantified expansion, with trail-vs-walk as an explicit
-  flag — the `{2,2}` trap is a property of the node, not a spelling), ShortestPath,
-  AlgorithmCall.
-- **Effects:** Insert/Set/Remove/Delete/Merge, and the side-effecting collectors
-  (aggregate-to-bag/store/subgraph/sack).
+- **Relational operators:** Scan (a label bucket, an index range, or the
+  universe), Filter, Project, Aggregate (group keys + aggregate functions), Join,
+  Order, Page, Distinct.
+- **Graph operators:** Expand (one hop: direction, edge-type set, optional
+  per-hop node/edge predicate), VarLength (quantified expansion, carrying
+  trail-vs-walk as an explicit flag so the two are never conflated), ShortestPath,
+  AlgorithmCall (the graph-algorithm library entered as a first-class operator).
+- **Effect operators:** Insert, Set, Remove, Delete, Merge/upsert, and the
+  side-effecting collectors (aggregate-to-a-named-bag, store, subgraph, sack).
 
-Every node carries a **lineage requirement**: does any consumer above it read
-path, tags, or sack. This is computed once, on the built IR — the generalization
-of today's `needs_path`/`reads_tags`, promoted from a retrofit gate to a
-first-class plan property that the physical planner reads.
+Binding is uniform: a GQL variable and a Gremlin `as()` label are both "bind slot
+N." A path is a lineage annotation on the plan, not a step in it. Every operator
+carries a **lineage requirement** — whether any consumer above it reads path,
+tags, or sack — computed once on the built IR and read later by the physical
+planner to pick each operator's strategy.
 
-Binding is uniform: GQL variables and Gremlin `as()` tags both become "bind slot
-N." A path is a lineage annotation, not a step. The IR does not know which
-language produced it.
+The IR does not know which language produced it, and nothing below the front-end
+branches on the source language.
 
 ### Front-ends — thin, and the only language-aware code
 
-GQL parser → lower to IR. Gremlin parser → lower to IR. Each language's _contract
-quirks_ — GQL's NaN-as-no-value in predicates vs Gremlin's filtering; GQL trail
-semantics vs Gremlin's; row-order and group-order conventions — are encoded as
-**IR attributes**, not as forks in the executor. The executor is language-blind;
-the front-end is the only place a language concept exists.
+A GQL parser lowers to the IR. A Gremlin parser lowers to the IR. Each language's
+genuine contract differences — GQL treating NaN as no-value inside a predicate
+versus Gremlin filtering it; trail semantics; the group/row ordering a language
+guarantees — are encoded as **attributes on IR nodes**, not as forks in the
+executor. The executor is language-blind; the front-end is the single place any
+language concept exists.
+
+This is the property that pays off most: a lexer/parser per language, each a thin
+compiler into the shared algebra, and one engine underneath.
 
 ### Optimizer — rewrite rules on the IR, written once
 
-A fixed rule set applied to fixpoint (an ordered pass to start; a cost model only
-when a rule genuinely needs cardinality — e.g. seed-side selection). Each rule is
-a pure, meaning-preserving IR→IR function, tested in isolation, and it fires on
-the normalized IR regardless of surface spelling or source language. The wins
-this codebase hand-rolled as fastpaths are the rules:
+A fixed set of meaning-preserving IR→IR rewrite rules, applied to a fixpoint (an
+ordered pass to begin; a cost model added only when a rule genuinely needs
+cardinality — e.g. choosing which end of a pattern to seed from). Each rule is a
+pure function of the IR, tested in isolation, and fires on the _normalized_ IR —
+so it applies to every surface spelling in both languages at once. The
+optimizations that a naive engine would hand-write per shape are, here, rules:
 
-- aggregate pushdown (count without enumerate)
-- semi-join reordering (selective EXISTS sweeps backward)
-- group-by-aggregate as degree product
-- duplicate-elimination pushdown (distinct as bitmap / frontier collapse)
-- comma-join as a product of independent branches
-- predicate pushdown, constant folding, seed-side selection
+- predicate pushdown and constant folding,
+- aggregate pushdown (count without enumerating),
+- semi-join reordering (a selective `EXISTS` evaluated from the narrow end
+  backward),
+- group-by-aggregate as a degree product,
+- duplicate-elimination pushdown (distinct as a membership bitset / frontier
+  collapse),
+- a comma-join off a shared start as a product of independent branches,
+- seed-side selection.
 
-This is the layer whose _absence_ caused the fastpath ladder — the same idea
-implemented eight times because a shape recognizer matched syntax, not meaning. A
-rule on the IR cannot have that failure mode.
+Because a rule matches the algebra, not the syntax, there is no way for a
+differently-worded-but-equivalent query to miss it. A conformance group asserts,
+per rule, that equivalent spellings produce the same result _and_ cost within a
+factor of each other.
 
-### Physical execution — batches, strategy chosen by lineage
+### Physical planning and execution — batches, strategy from lineage
 
-The physical planner lowers each logical operator to its execution, choosing the
-bulk or lineage-preserving strategy from the lineage requirement. Execution is
-the batch engine: pull (or push) batches through the operator pipeline, vectorized
-where lineage-free, per-element (still over the batch) where lineage is required.
-One batch type, one operator set, one value contract, one storage.
+The physical planner lowers each logical operator to its execution and chooses
+the bulk or lineage-preserving strategy from the operator's lineage requirement.
+Execution pulls batches through the operator pipeline: vectorized where no lineage
+is required, per-element (still over the one batch type) where it is. One batch
+type, one operator set, one value contract, one storage — no second engine to
+fall back to.
 
-## What sits above the core (ported, not redesigned)
+## The graph-algorithm library, transactions, egress
 
-- **Graph-algorithm library** (degree, WCC, label-prop, PageRank, shortest-path,
-  centrality): calls into the batch engine / `seek`; the byte-identity summation
-  rules become value-contract rules. Ported.
-- **Transactions** (undo-log, deferred constraint checks, event buffering) and
-  **constraints/validation**: a layer wrapping mutation execution. Ported.
-- **Arrow egress**: the batch type _is_ already columnar and Arrow-shaped, so
-  egress is close to free — arguably better than today, where it re-encodes.
-- **Sync engine** (CDC, demand-fill, retry): sits entirely above; consumes the
-  engine unchanged.
+- **Algorithms** (degree, connected components, label propagation, PageRank,
+  shortest path, centrality) are `AlgorithmCall` operators over the batch engine.
+  Their determinism rules (e.g. a fixed summation order for reproducibility) are
+  value-contract rules, so both implementations get them for free.
+- **Transactions** (an undo log, deferred constraint checks, buffered events) and
+  **constraints/validation** wrap mutation execution as a layer above the
+  operators.
+- **Columnar egress** is nearly free: the batch type is already columnar, so
+  emitting Arrow is a framing of buffers the engine already holds, not a
+  re-encode.
 
-## Build sequence — grow against the oracle, then swap
+## Build order
 
-The existing engine and the six differential fuzzers are an **executable spec**.
-That is what makes building fresh safe.
+A self-contained order for constructing the engine; the two implementations
+proceed against the shared conformance suite, which is written first as the
+specification.
 
-1. **New engine as a separate crate/module**, not wired into the product. The old
-   engine keeps shipping untouched throughout.
-2. **Value contract + storage first** (storage largely ported). Establish the
-   batch type and the value semantics; conformance-test the value contract
-   against the old engine's semantics directly.
-3. **Grow operator by operator.** For each logical operator, implement both
-   strategies, then run the _existing fuzzer corpus_ new-vs-old and require the
-   new engine to match the old (the old is the oracle). Add the operator's rules
-   as they come.
-4. **Both front-ends lower to the IR.** GQL and Gremlin conformance suites run
-   against the new engine; must match the old.
-5. **Soak: run the full fuzzer suite + all conformance tests against the new
-   engine until it passes everything the old one did.** Only now is it proven.
-6. **Swap.** New engine becomes the product engine; the old one runs in parallel
-   as an oracle for a soak period, then is deleted. If #3 chose one engine, the
-   entire pure-TS engine and the six fuzzers are deleted at this step — the
-   largest single reduction in the effort.
+1. **Value contract + storage.** The foundation both implementations share; pin
+   the value contract with conformance tests before anything reads it.
+2. **The batch type and a first operator (Scan → Filter → Project).** Establish
+   the one-batch, two-strategy shape end to end on the simplest pipeline.
+3. **Operators, in dependency order:** Expand, Aggregate/group, Order/Page,
+   Distinct, Join, VarLength, ShortestPath, the effect operators. Each lands with
+   both strategies and its conformance cases.
+4. **Optimizer rules,** added as their operators exist; each with its
+   equivalent-spellings conformance group.
+5. **Front-ends:** GQL and Gremlin parsers lowering to the IR; the full
+   per-language conformance suites run against the engine.
+6. **Algorithms, transactions, egress** as the layers above.
 
-At no point does the product ship the unproven engine, and the swap is gated on
-"reproduces everything the oracle does." This is the safety the migration plan
-was reaching for, achieved without letting the old code's structure dictate the
-new one's.
+Both the Rust and TS implementations follow this order and are checked against the
+same conformance suite at each step; periodic differential runs between them catch
+anything the suite misses.
 
-## Honest assessment
+## What this design buys, honestly
 
-- **Does it get smaller?** The row/column duality collapses to one model, which
-  removes `apply` (~1,100 lines), the `Col`/`Trav` split, `to_gql`, and the
-  decline machinery — replaced by one operator set that is larger per-operator
-  (two strategies) but singular. Plausibly meaningfully smaller; the certain win
-  is one world instead of two-plus-a-bridge. If #3 chooses one engine, the whole
-  pure-TS engine and six fuzzers go too — that is the large, certain reduction.
-- **What it definitely fixes:** the fastpath-ladder bug class (optimizations are
-  rules on the IR), the per-language asymmetry (one executor), the drift bugs (if
-  #3 chooses one engine, there is nothing to drift), and the scattered value
-  policy.
-- **What it costs:** a real rebuild. Storage and algorithms port cheaply; the IR,
-  optimizer, and batch engine are new construction. The oracle+fuzzer strategy
-  makes it safe but not fast — this is a multi-phase effort measured in the same
-  order as the original build, discounted by everything already learned and by
-  the storage/algorithm layers porting largely intact.
-- **The one thing that must be decided by a human first:** #3. Everything
-  downstream — the value contract's shape, the test strategy, the total size —
-  turns on it.
+- **No fastpath ladder.** Optimizations are rules on the algebra, so one idea is
+  written once and cannot be missed by a reworded query or a second language.
+- **No per-language execution asymmetry.** One executor beneath two thin
+  front-ends; a fix or a speedup lands for both languages at once.
+- **No two-execution-model duplication.** One batch model with a per-operator
+  lineage strategy, instead of a row interpreter and a columnar path with a
+  bridge between them.
+- **Agreement without lockstep.** Two implementations of one specified algebra,
+  kept in step by a shared conformance suite rather than continuous byte-identity
+  fuzzing — the coupling is looser and the drift surface is smaller.
+- **One place for value semantics,** which is where cross-implementation
+  disagreements otherwise breed.
+
+The irreducible costs remain and are not hidden: two languages need two parsers,
+two implementations need the work done twice (bounded by a shared spec and a
+shared conformance suite, not by lockstep), and path-carrying queries are
+genuinely per-element work no columnar trick removes — they are simply the
+lineage strategy of the same operators, not a separate world.
 
 ## Open decisions
 
-1. **#3: one engine (Rust→WASM) or two.** The foundational fork. Recommended:
-   one, if the product tolerates WASM. Needs the product constraints (bundle
-   budget, required no-WASM runtimes) to settle.
-2. **Optimizer ambition.** Ordered fixpoint pass first; cost-based (Cascades)
-   only when a rule needs cardinality. Recommend starting simple.
-3. **Batch width / execution model** (pull vs push, batch size). An
-   implementation choice to settle early with a microbenchmark against the
-   oracle's numbers, not by argument.
+1. **Optimizer ambition.** Ordered fixpoint pass first; a cost-based optimizer
+   only when a rule needs cardinality estimates. Recommend starting simple.
+2. **Execution model** (pull vs push; batch width). Settle early with a
+   microbenchmark, not by argument.
+3. **How much the two implementations share by generation vs by hand.** The value
+   contract and the conformance suite are shared artifacts; whether any operator
+   logic is generated from one source or written twice against the spec is a
+   build-tooling choice to make once the operator shape is stable.
