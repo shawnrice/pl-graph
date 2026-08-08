@@ -6,7 +6,7 @@
 //! This is the lineage-FREE strategy; the lineage-preserving strategy for the
 //! same operators lands with the operators (path/tags) that need it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::batch::{Batch, Col};
 use crate::ir::{Agg, AggFn, CompareOp, Dir, Expr, Plan};
@@ -114,6 +114,20 @@ fn pull(plan: &Plan, store: &Store) -> Batch {
             *min,
             *max,
             *trail,
+        ),
+        Plan::ShortestPath {
+            input,
+            from,
+            dir,
+            edge_label,
+            max,
+        } => shortest_path(
+            &pull(input, store),
+            store,
+            *from,
+            *dir,
+            edge_label.as_deref(),
+            *max,
         ),
         Plan::Aggregate { input, keys, aggs } => aggregate(&pull(input, store), store, keys, aggs),
         Plan::OrderPage {
@@ -509,6 +523,72 @@ fn varlen_dfs(
             used.pop();
         }
     }
+}
+
+/// Shortest-path reach: a BFS from each input row's source node, emitting each
+/// reachable target ONCE at its shortest distance (the first BFS reach), with the
+/// target appended as a new slot. ANY-shortest — one representative per target,
+/// not every shortest path. The source is not emitted; `max` caps hop distance.
+#[allow(clippy::too_many_arguments)]
+fn shortest_path(
+    batch: &Batch,
+    store: &Store,
+    from: usize,
+    dir: Dir,
+    edge_label: Option<&str>,
+    max: Option<u32>,
+) -> Batch {
+    let empty = || {
+        let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
+        slots.push(Col::Nodes(vec![]));
+        Batch::of(slots)
+    };
+    let want: Option<u32> = match edge_label {
+        None => None,
+        Some(name) => match store.etype_id(name) {
+            Some(id) => Some(id),
+            None => return empty(),
+        },
+    };
+    let Col::Nodes(src) = batch.slot(from) else {
+        return empty();
+    };
+
+    let mut keep = Vec::new();
+    let mut ends = Vec::new();
+    for (row, &start) in src.iter().enumerate() {
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(start);
+        let mut q: VecDeque<(u32, u32)> = VecDeque::new();
+        q.push_back((start, 0));
+        while let Some((v, d)) = q.pop_front() {
+            if max.is_some_and(|m| d >= m) {
+                continue; // reached the hop cap; do not expand further
+            }
+            let mut adjs: Vec<crate::store::Adj> = Vec::new();
+            if matches!(dir, Dir::Out | Dir::Both) {
+                adjs.extend_from_slice(store.out(v));
+            }
+            if matches!(dir, Dir::In | Dir::Both) {
+                adjs.extend_from_slice(store.inc(v));
+            }
+            for a in adjs {
+                if want.is_some_and(|w| w != a.etype) {
+                    continue;
+                }
+                // First reach = shortest reach (BFS), and only the first is kept.
+                if visited.insert(a.nbr) {
+                    keep.push(row);
+                    ends.push(a.nbr);
+                    q.push_back((a.nbr, d + 1));
+                }
+            }
+        }
+    }
+
+    let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
+    slots.push(Col::Nodes(ends));
+    Batch::of(slots)
 }
 
 /// Evaluate `expr` over every row of `batch`, producing a column.
@@ -1362,5 +1442,98 @@ mod tests {
             .project(vec![("end".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         assert_eq!(names_of(&out, 0), vec!["c"]); // only the 2-hop endpoint
+    }
+
+    // --- ShortestPath ---
+
+    /// A diamond a->b, a->c, b->d, c->d. Shortest from a: b(1), c(1), d(2). `d` is
+    /// reachable two ways at distance 2 but emitted ONCE (ANY-shortest).
+    #[test]
+    fn shortest_path_diamond_reaches_each_once() {
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[("name", s("a"))]);
+        let bb = b.node(&["N"], &[("name", s("b"))]);
+        let c = b.node(&["N"], &[("name", s("c"))]);
+        let d = b.node(&["N"], &[("name", s("d"))]);
+        b.edge(a, bb, "R");
+        b.edge(a, c, "R");
+        b.edge(bb, d, "R");
+        b.edge(c, d, "R");
+        let store = b.build();
+        let plan = scan("N")
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
+            .shortest_path(0, Dir::Out, Some("R"), None)
+            .project(vec![("t".into(), prop(1, "name"))]);
+        let out = run(&plan, &store);
+        let mut got = names_of(&out, 0);
+        got.sort();
+        assert_eq!(got, vec!["b", "c", "d"]); // d once, not twice
+    }
+
+    /// The source is not emitted, and a direct edge wins over a longer path: with
+    /// a->c direct AND a->b->c, c is reached at distance 1, once.
+    #[test]
+    fn shortest_path_takes_the_short_route() {
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[("name", s("a"))]);
+        let bb = b.node(&["N"], &[("name", s("b"))]);
+        let c = b.node(&["N"], &[("name", s("c"))]);
+        b.edge(a, bb, "R");
+        b.edge(bb, c, "R");
+        b.edge(a, c, "R"); // direct shortcut
+        let store = b.build();
+        let plan = scan("N")
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
+            .shortest_path(0, Dir::Out, Some("R"), None)
+            .project(vec![("t".into(), prop(1, "name"))]);
+        let out = run(&plan, &store);
+        let mut got = names_of(&out, 0);
+        got.sort();
+        assert_eq!(got, vec!["b", "c"]); // both at distance 1; source a not emitted
+    }
+
+    /// `max` caps the hop distance: on a chain a->b->c->d with max 2, d (distance
+    /// 3) is unreachable.
+    #[test]
+    fn shortest_path_respects_max_hops() {
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[("name", s("a"))]);
+        let bb = b.node(&["N"], &[("name", s("b"))]);
+        let c = b.node(&["N"], &[("name", s("c"))]);
+        let d = b.node(&["N"], &[("name", s("d"))]);
+        b.edge(a, bb, "R");
+        b.edge(bb, c, "R");
+        b.edge(c, d, "R");
+        let store = b.build();
+        let plan = scan("N")
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
+            .shortest_path(0, Dir::Out, Some("R"), Some(2))
+            .project(vec![("t".into(), prop(1, "name"))]);
+        let out = run(&plan, &store);
+        let mut got = names_of(&out, 0);
+        got.sort();
+        assert_eq!(got, vec!["b", "c"]); // d (distance 3) beyond the cap
+    }
+
+    /// A cycle does not loop forever — each node is reached once.
+    #[test]
+    fn shortest_path_terminates_on_a_cycle() {
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[("name", s("a"))]);
+        let bb = b.node(&["N"], &[("name", s("b"))]);
+        let c = b.node(&["N"], &[("name", s("c"))]);
+        b.edge(a, bb, "R");
+        b.edge(bb, c, "R");
+        b.edge(c, a, "R"); // cycle back
+        let store = b.build();
+        let plan = scan("N")
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
+            .shortest_path(0, Dir::Out, Some("R"), None)
+            .project(vec![("t".into(), prop(1, "name"))]);
+        let out = run(&plan, &store);
+        let mut got = names_of(&out, 0);
+        got.sort();
+        // b(1), c(2); a is the source, not re-emitted despite the cycle back.
+        assert_eq!(got, vec!["b", "c"]);
     }
 }

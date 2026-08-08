@@ -115,6 +115,18 @@ pub enum Plan {
         max: u32,
         trail: bool,
     },
+    /// Shortest-path reach: BFS from the element in `from` along `dir`/
+    /// `edge_label`, emitting EACH reachable target once at its shortest distance
+    /// (ANY-shortest — one representative per target, not every shortest path),
+    /// with the target appended as a new slot. `max` caps the hop distance
+    /// (`None` = unbounded); the source itself is not emitted.
+    ShortestPath {
+        input: Box<Plan>,
+        from: usize,
+        dir: Dir,
+        edge_label: Option<String>,
+        max: Option<u32>,
+    },
     /// Keep rows where `pred` is TRUE (three-valued: FALSE and NULL drop).
     Filter { input: Box<Plan>, pred: Expr },
     /// Group rows by the `(name, expr)` keys and compute `aggs` per group. With
@@ -193,6 +205,23 @@ impl Plan {
             min,
             max,
             trail,
+        }
+    }
+
+    #[must_use]
+    pub fn shortest_path(
+        self,
+        from: usize,
+        dir: Dir,
+        edge_label: Option<&str>,
+        max: Option<u32>,
+    ) -> Self {
+        Self::ShortestPath {
+            input: Box::new(self),
+            from,
+            dir,
+            edge_label: edge_label.map(str::to_string),
+            max,
         }
     }
 
