@@ -2529,7 +2529,11 @@ export const satisfies = (
   const env: EvalEnv = { binding, params, graph };
 
   for (const { key, value } of pred.props) {
-    if (propOf(element, key) !== value(env)) {
+    // Structural equality — the SAME notion `=` uses (`structuralEq`), so an
+    // inline `{tags: [1, 2]}` constraint matches a stored list exactly as
+    // `WHERE n.tags = [1, 2]` does. JS reference `!==` here made a list-valued
+    // inline constraint never match (a fresh array is never `===` the stored one).
+    if (!structuralEq(propOf(element, key), value(env))) {
       return false;
     }
   }

@@ -1217,11 +1217,16 @@ export const runLinearClauses = (
 
 // --- set operations ----------------------------------------------------------
 
-/** Stable key for a result row; graph-element columns key by id. */
-export const rowKeyOf = (row: Row): string =>
-  Object.entries(row)
-    .map(([k, v]) => `${k}=${valueKey(v)}`)
-    .join('');
+/**
+ * Stable key for a result row; graph-element columns key by id. Keyed by column
+ * POSITION, not name: ISO set operations (`UNION`/`EXCEPT`/`INTERSECT`) compare
+ * rows positionally, so differently-aliased parts (`… AS a` vs `… AS b`) are the
+ * same row when their values line up — the result adopts the left part's names.
+ * The `\x01` separator avoids adjacent-value collisions (`1,2` vs `12`). This
+ * matches the Rust engine, which is already positional here. DISTINCT is
+ * unaffected: a single query's rows all carry the same columns.
+ */
+export const rowKeyOf = (row: Row): string => Object.values(row).map(valueKey).join('\x01');
 
 export const distinctRows = (rows: readonly Row[]): Row[] => {
   const seen = new Set<string>();
