@@ -14,6 +14,7 @@ obvious without opening them.
 | If you are asking…                                                           | Run                                                      |
 | ---------------------------------------------------------------------------- | -------------------------------------------------------- |
 | Is a query shape slow? Which of the four perf levers moved?                  | `perf_bench`                                             |
+| Which counts still enumerate since the shortcut ladder came out?             | `exists_probe`                                           |
 | How do query shapes scale with graph size?                                   | `scale_bench`                                            |
 | What does an individual GQL query shape cost?                                | `gql_bench`                                              |
 | Same, for Gremlin traversals                                                 | `gremlin_bench`                                          |
