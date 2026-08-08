@@ -7,11 +7,27 @@
 //! layer. Independent of `lenke-core` — this is the new engine, grown against the
 //! existing one and its conformance suite as an oracle, not built on it.
 //!
-//! Status: first vertical slice — Scan → Filter → Project executing end to end.
-//! Graph operators (Expand, VarLength, ShortestPath), aggregation, ordering,
-//! effects, the optimizer rules, the lineage-preserving operator strategy, and
-//! the GQL/Gremlin front-ends land in subsequent slices, in the build order the
-//! design lays out.
+//! Status: the design's build order is complete for its subset.
+//! - [`value`] — the value contract: representation + semantics (order, equality,
+//!   coercion, null/NaN, grouping) in one place.
+//! - [`store`] — typed columnar store (unboxed property columns, label buckets,
+//!   adjacency with edge ids).
+//! - [`batch`] — the one batch type (slot columns) + an optional lineage sidecar.
+//! - [`ir`] — the neutral, language-agnostic algebra.
+//! - [`exec`] — Scan, Filter, Project, Expand, Aggregate/group-by, OrderPage,
+//!   Distinct, Join, VarLength (trail vs walk), ShortestPath, and the
+//!   lineage-preserving strategy (path carried only when the plan reads it).
+//! - [`gql`] — GQL front-end: MATCH (single/multi-hop, directed/undirected/
+//!   var-length, comma-join), WHERE, RETURN with aggregation, DISTINCT,
+//!   ORDER/SKIP/LIMIT.
+//! - [`gremlin`] — Gremlin front-end over the SAME IR; the payoff test proves a
+//!   GQL query and its Gremlin equivalent produce identical rows.
+//! - [`opt`] — rewrite-rule optimizer (predicate pushdown, filter-merge) that
+//!   fires on plans from either language.
+//!
+//! Deferred within the subset (documented at their sites): tags/sack lineage
+//! (only path is carried); lineage through Join/VarLength/ShortestPath; a
+//! cost-based optimizer; right-side join pushdown.
 
 pub mod batch;
 pub mod exec;
