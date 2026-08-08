@@ -55,15 +55,20 @@ describe('an edge in two label buckets is still one edge', () => {
 
   test('label propagation sees each neighbour once', async () => {
     const g = twoLabelChain();
-    const all = (await labelPropagation({}, g)).map((r) => r.communityId);
+    const all = (await labelPropagation({}, g)).map((r) => r.label);
+
+    // The row property is `label` (`LabelRow = AlgorithmRow<'label', string>`).
+    // This read `r.communityId` until 2026-08-08, which is not a property of
+    // that type: every element was `undefined`, so the comparisons below held
+    // trivially and the test asserted nothing. `bun test` could not see it —
+    // only `tsc` could, which is why it survived until a CI run.
+    expect(all.every((l) => typeof l === 'string')).toBe(true);
 
     // Every edge is both `R` and `NOISE`, so filtering on either must give the
     // same communities as not filtering at all. A doubled neighbour list would
     // still converge, but the tie-breaks it takes on the way differ.
-    expect(all).toEqual((await labelPropagation({ edgeLabel: 'R' }, g)).map((r) => r.communityId));
-    expect(all).toEqual(
-      (await labelPropagation({ edgeLabel: 'NOISE' }, g)).map((r) => r.communityId),
-    );
+    expect(all).toEqual((await labelPropagation({ edgeLabel: 'R' }, g)).map((r) => r.label));
+    expect(all).toEqual((await labelPropagation({ edgeLabel: 'NOISE' }, g)).map((r) => r.label));
   });
 
   test('shortest path does not walk a two-label edge twice', async () => {
