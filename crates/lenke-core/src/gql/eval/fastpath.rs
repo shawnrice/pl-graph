@@ -922,9 +922,25 @@ pub(super) fn count_rows_any(proj: &CProjection, count: u64) -> CodeResult<RowSe
 ///    order puts each GROUP at the position of its first row.
 ///
 /// Depth is capped at two hops. Not for want of generality — the DFS would
-/// extend — but because the trail correction does (see `try_walk_count`), and
-/// because the tally's win comes from walks per endpoint being large, which is
-/// already true at two.
+/// extend — but because the trail correction does (see `try_walk_count`).
+///
+/// **Quantified patterns only, and that is a measured restriction, not a shape
+/// limitation.** The tally handles a plain `(a)-[:R]->(b)-[:R]->(c)` correctly,
+/// and it was enabled for it until the numbers were swept across sizes:
+///
+/// ```text
+///                       300k/8            1M/8
+/// trav2_group    391 -> 330  (1.18x)  1457 -> 1620  (0.90x)
+/// varlen_group  1210 -> 344  (3.5x)  11454 -> 1711  (6.7x)
+/// ```
+///
+/// It INVERTS for the unquantified form: a win at 300k and a loss at 1M, where
+/// the dense `Vec<u64>` is 8MB and every walk writes into it at random. The
+/// var-length form wins at both sizes because the path it replaces is
+/// pathological there (159ns per walk against 23ns for the plain two-hop), so
+/// there is real ground to make up. For the plain hop there is not, and a
+/// 1.18x that becomes 0.90x one size up is not a win — it is a measurement
+/// taken at one size, which is the mistake this repo keeps a list of.
 pub(super) fn try_grouped_walk_count(
     linear: &CLinear,
     graph: &Graph,
@@ -985,6 +1001,9 @@ pub(super) fn try_grouped_walk_count(
 
     let ctx = resolve_ctx(graph, plan, params);
     let (hops, quant) = bare_hops(path, &ctx)?;
+    // MEASURED: the tally only pays where the enumerating path is bad, and for a
+    // plain two-segment hop it is not. See the doc.
+    quant?;
     // See the doc: two hops is where the trail correction stops being exact.
     let depth_ok = match quant {
         None => hops.len() <= 2,
