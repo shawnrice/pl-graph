@@ -894,3 +894,239 @@ pub(super) fn count_rows_any(proj: &CProjection, count: u64) -> CodeResult<RowSe
     rs.push_row(std::iter::once(Value::Num(count as f64)));
     Ok(rs)
 }
+
+/// `RETURN <key over the endpoint>, count(*)` over bare hops — grouped without
+/// building a row per walk.
+///
+/// The counting shortcut above answers a SCALAR count; this is the same idea one
+/// step further, and it is what `try_grouped_2hop` and `try_grouped_varlen_1_2`
+/// used to do in two rungs. `MATCH (a:Person)-[:KNOWS]->{1,2}(b) RETURN b.city,
+/// count(*)` visits 72M walks over a 1M/8M graph to produce FIFTY rows; the
+/// enumerating path builds a binding and evaluates the key expression 72M times
+/// to do it.
+///
+/// Instead: walk, and tally per ENDPOINT VERTEX into a dense `Vec<u64>`. The key
+/// expression then runs once per distinct endpoint rather than once per walk,
+/// and the fold into groups happens on that much smaller list.
+///
+/// **Group order is first-seen, and that is load-bearing** — the engine pins it
+/// (`GROUP BY` emits groups in the order their first row appeared), so a tally
+/// that emitted groups in vertex order would be a wrong answer that looks right.
+/// Two things keep it exact:
+///
+/// 1. The walk is DEPTH-FIRST per seed, the same order the matcher enumerates
+///    in — not a breadth-first frontier, which would emit every length-1 walk
+///    before any length-2 one and reorder the groups of a `{1,2}` pattern.
+/// 2. An endpoint is appended to `order` the first time its tally goes 0 → 1,
+///    so `order` is the endpoints in first-seen order; folding keys in that
+///    order puts each GROUP at the position of its first row.
+///
+/// Depth is capped at two hops. Not for want of generality — the DFS would
+/// extend — but because the trail correction does (see `try_walk_count`), and
+/// because the tally's win comes from walks per endpoint being large, which is
+/// already true at two.
+pub(super) fn try_grouped_walk_count(
+    linear: &CLinear,
+    graph: &Graph,
+    plan: &CQuery,
+    params: &[Val],
+) -> Option<CodeResult<RowSet>> {
+    if !walk_count_enabled() {
+        return None;
+    }
+    let [CClause::Match {
+        optional: false,
+        patterns,
+        where_: None,
+        scope_len,
+        ..
+    }, CClause::Return(proj)] = linear.clauses.as_slice()
+    else {
+        return None;
+    };
+    let [path] = patterns.as_slice() else {
+        return None;
+    };
+    if path.segments.is_empty() || path.path_var_slot.is_some() {
+        return None;
+    }
+    if !matches!(path.selector, PathSelector::Walk) {
+        return None;
+    }
+
+    // Exactly `RETURN <key>, count(*)` — one grouping item and one bare count,
+    // in that order, with no paging, ordering, HAVING or DISTINCT on top.
+    if !proj.aggregating
+        || proj.aggs.len() != 1
+        || proj.items.len() != 2
+        || !proj.group_by.is_empty()
+        || proj.limit.is_some()
+        || proj.skip.is_some()
+        || proj.having.is_some()
+        || proj.distinct
+        || !proj.order_by.is_empty()
+    {
+        return None;
+    }
+    let agg = &proj.aggs[0];
+    if !(agg.star && !agg.distinct && agg.arg.is_none() && matches!(agg.func, AggFn::Count)) {
+        return None;
+    }
+    if proj.items[0].is_agg || !matches!(proj.items[1].expr, CExpr::AggRef(0)) {
+        return None;
+    }
+
+    // The key must read the path's LAST node and nothing else — that is what
+    // makes it computable from an endpoint id alone.
+    let end_slot = path.segments.last()?.node.var_slot?;
+    if !refs_only_endpoint(&proj.items[0].expr, end_slot) {
+        return None;
+    }
+
+    let ctx = resolve_ctx(graph, plan, params);
+    let (hops, quant) = bare_hops(path, &ctx)?;
+    // See the doc: two hops is where the trail correction stops being exact.
+    let depth_ok = match quant {
+        None => hops.len() <= 2,
+        Some(q) => hops.len() == 1 && q.max.is_some_and(|m| m <= 2) && q.min <= q.max?,
+    };
+    if !depth_ok {
+        return None;
+    }
+
+    let seeds = seek_lower::scan_node(graph, &ctx, &path.start, None, *scope_len, None);
+    if let Err(e) = ctx.check_fault() {
+        return Some(Err(e));
+    }
+
+    let loops = crate::seek::SelfLoops::Once;
+    let mut tally = vec![0u64; graph.vertex_slots()];
+    let mut order: Vec<u32> = Vec::new();
+    let hit = |v: u32, tally: &mut Vec<u64>, order: &mut Vec<u32>| {
+        let t = &mut tally[v as usize];
+        if *t == 0 {
+            order.push(v);
+        }
+        *t += 1;
+    };
+
+    // Lengths to emit, in the order the matcher emits them per seed.
+    let lengths: Vec<usize> = match quant {
+        None => vec![hops.len()],
+        Some(q) => (q.min.max(1)..=q.max?).map(|n| n as usize).collect(),
+    };
+    // A quantified repetition is edge-distinct; separate segments are not.
+    let trail = quant.is_some();
+
+    for &s in &seeds {
+        for &len in &lengths {
+            let h0 = &hops[0];
+            let hop_at = |i: usize| -> &(crate::seek::Dir, Option<Vec<u32>>) {
+                if quant.is_some() {
+                    h0
+                } else {
+                    &hops[i]
+                }
+            };
+            if len == 1 {
+                let (d, t) = hop_at(0);
+                for a in crate::seek::adj(graph, s, *d, t.as_deref().unwrap_or(&[]), loops) {
+                    hit(a.nbr, &mut tally, &mut order);
+                }
+            } else {
+                let (d1, t1) = hop_at(0);
+                let (d2, t2) = hop_at(1);
+                for a in crate::seek::adj(graph, s, *d1, t1.as_deref().unwrap_or(&[]), loops) {
+                    for b in
+                        crate::seek::adj(graph, a.nbr, *d2, t2.as_deref().unwrap_or(&[]), loops)
+                    {
+                        // The ONLY way a two-hop walk repeats an edge.
+                        if trail && b.eidx == a.eidx {
+                            continue;
+                        }
+                        hit(b.nbr, &mut tally, &mut order);
+                    }
+                }
+            }
+        }
+    }
+
+    // One key evaluation per DISTINCT endpoint, in first-seen order.
+    let mut b = Binding(vec![None; (*scope_len).max(end_slot + 1)]);
+    let mut keys: Vec<(String, Val, u64)> = Vec::new();
+    let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for &v in &order {
+        b.set(end_slot, Val::Node(v));
+        let val = eval(&Env::new(graph, &ctx, &b), &proj.items[0].expr);
+        let mut k = String::new();
+        super::val_key(&val, &mut k);
+        let n = tally[v as usize];
+        match at.get(&k) {
+            Some(&i) => keys[i].2 += n,
+            None => {
+                at.insert(k.clone(), keys.len());
+                keys.push((k, val, n));
+            }
+        }
+    }
+    if let Err(e) = ctx.check_fault() {
+        return Some(Err(e));
+    }
+
+    let mut rs = RowSet::new(proj.out_names.clone());
+    for (_, val, n) in keys {
+        rs.push_row([val_to_value(graph, &val), Value::Num(n as f64)]);
+    }
+    Some(Ok(rs))
+}
+
+/// A chain of hops as `seek` takes them: `(direction, edge types)`, where the
+/// types are `None` for ANY and `Some(&[])` for NONE.
+type HopChain = Vec<(crate::seek::Dir, Option<Vec<u32>>)>;
+
+/// The `(direction, edge types)` chain of a path whose hops are all BARE, plus
+/// its quantifier if it has one. `None` if anything on the way is filtered — see
+/// `try_walk_count`'s doc for why a filter here is one that never runs.
+fn bare_hops(path: &CPath, ctx: &Ctx) -> Option<(HopChain, Option<Quantifier>)> {
+    let mut hops = Vec::new();
+    let mut quant = None;
+    for (i, seg) in path.segments.iter().enumerate() {
+        if seg.unit.is_some() {
+            return None;
+        }
+        let rel = &seg.rel;
+        if rel.var_slot.is_some() || !rel.props.is_empty() || rel.where_.is_some() {
+            return None;
+        }
+        if let Some(q) = rel.quantifier.as_ref() {
+            if path.segments.len() != 1 {
+                return None;
+            }
+            quant = Some(*q);
+        }
+        let node = &seg.node;
+        if node.label.is_some() || !node.props.is_empty() || node.where_.is_some() {
+            return None;
+        }
+        if let Some(s) = node.var_slot {
+            if Some(s) == path.start.var_slot
+                || path.segments[..i]
+                    .iter()
+                    .any(|prev| prev.node.var_slot == Some(s))
+            {
+                return None;
+            }
+        }
+        let etypes = match rel.label.as_ref() {
+            None => None,
+            Some(l) => Some(seek_lower::lower_labels(l, ctx, true)?),
+        };
+        let dir = match rel.direction {
+            Direction::Out => crate::seek::Dir::Out,
+            Direction::In => crate::seek::Dir::In,
+            Direction::Both => crate::seek::Dir::Both,
+        };
+        hops.push((dir, etypes));
+    }
+    Some((hops, quant))
+}

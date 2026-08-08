@@ -1429,6 +1429,10 @@ pub(super) fn run_part(
     if let Some(res) = try_walk_count(linear, graph, plan, params) {
         return res;
     }
+    // …and the same fold, grouped: one row per GROUP instead of one per walk.
+    if let Some(res) = try_grouped_walk_count(linear, graph, plan, params) {
+        return res;
+    }
     // Intra-query parallel count over a traversal (opt-in `parallel-query`). Tried
     // before the vectorized pipeline: for a pure `count(*)` over a multi-hop or
     // filtered traversal the vectorized path *materializes* every intermediate row

@@ -13633,3 +13633,64 @@ fn a_distinct_quantified_count_stays_on_the_matcher() {
     let enumerated = super::eval::without_walk_count(|| rows(&mut g, q));
     assert_eq!(shortcut, enumerated);
 }
+
+/// The grouped counting shortcut must agree with the enumerating path, and
+/// agree IN ORDER — `GROUP BY` emits groups in the order their first row
+/// appeared, so a tally that folded in vertex order would be a wrong answer
+/// that looks completely reasonable.
+#[test]
+fn the_grouped_walk_count_agrees_with_enumeration_in_order() {
+    let mut g = trail_vs_walk_fixture();
+    for q in [
+        "MATCH (a)-[:R]->(b) RETURN b.k AS k, count(*) AS n",
+        "MATCH (a:N)-[:R]->(b) RETURN b.k AS k, count(*) AS n",
+        "MATCH (a)<-[:R]-(b) RETURN b.k AS k, count(*) AS n",
+        "MATCH (a)-[:R]-(b) RETURN b.k AS k, count(*) AS n",
+        "MATCH (a)-[:R]->()-[:R]->(c) RETURN c.k AS k, count(*) AS n",
+        "MATCH (a)-[:R]->()-[:S]->(c) RETURN c.k AS k, count(*) AS n",
+        "MATCH (a)-[:R]->{1,2}(b) RETURN b.k AS k, count(*) AS n",
+        "MATCH (a)-[:R]->{2,2}(b) RETURN b.k AS k, count(*) AS n",
+        "MATCH (a:N {k: 1})-[:R]->()-[:R]->(c) RETURN c.k AS k, count(*) AS n",
+        // The key is the ELEMENT, not a property of it.
+        "MATCH (a)-[:R]->(b) RETURN b AS b, count(*) AS n",
+        // A key that is an expression over the endpoint, and one that is
+        // constant — both still read only the endpoint slot.
+        "MATCH (a)-[:R]->(b) RETURN b.k + 1 AS k, count(*) AS n",
+        // A missing property groups under NULL rather than dropping the row.
+        "MATCH (a)-[:R]->(b) RETURN b.nope AS k, count(*) AS n",
+    ] {
+        let shortcut = rows(&mut g, q);
+        let enumerated = super::eval::without_walk_count(|| rows(&mut g, q));
+        assert_eq!(
+            shortcut, enumerated,
+            "grouped shortcut != matcher for `{q}`"
+        );
+    }
+}
+
+/// Group order is FIRST-SEEN, and the fixture is built so vertex order and
+/// first-seen order disagree: `z` sorts last by id but is the first endpoint
+/// reached from the first seed, so it must be the first group.
+#[test]
+fn grouped_walk_count_emits_groups_in_first_seen_order() {
+    let mut g = graph_of(&[
+        r#"{"type":"node","id":"a","labels":["N"],"properties":{"g":"first"}}"#,
+        r#"{"type":"node","id":"m","labels":["N"],"properties":{"g":"second"}}"#,
+        r#"{"type":"node","id":"z","labels":["N"],"properties":{"g":"first"}}"#,
+        // `a`'s only edge lands on `z` (the LAST vertex), so first-seen order is
+        // z's group, then m's.
+        r#"{"type":"edge","id":"q1","from":"a","to":"z","labels":["R"],"properties":{}}"#,
+        r#"{"type":"edge","id":"q2","from":"a","to":"m","labels":["R"],"properties":{}}"#,
+    ]);
+    let q = "MATCH (a:N)-[:R]->(b) RETURN b.g AS g, count(*) AS n";
+    let shortcut = rows(&mut g, q);
+    assert_eq!(
+        shortcut,
+        super::eval::without_walk_count(|| rows(&mut g, q)),
+        "the shortcut must not reorder groups"
+    );
+    assert_eq!(
+        shortcut,
+        vec![vec![s("first"), n(1.0)], vec![s("second"), n(1.0)]]
+    );
+}

@@ -1025,7 +1025,7 @@ fn in_list(v: &Val, list: &Val) -> Truth {
 }
 
 /// A canonical, hashable key for a value — grouping, DISTINCT, row keys.
-fn val_key(v: &Val, out: &mut String) {
+pub(super) fn val_key(v: &Val, out: &mut String) {
     match v {
         // Gremlin-only (see `crate::value`) — unreachable from GQL, and keyed
         // like null so the function stays total.
