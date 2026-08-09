@@ -1340,8 +1340,8 @@ mod tests {
         let query = "INSERT (a:Person {name: 'x', age: 1})-[:KNOWS]->(b:Person {name: 'y'})";
         let mut st_p = Builder::default().build();
         let mut st_h = Builder::default().build();
-        execute(&super::parse(query).unwrap(), &mut st_p);
-        execute(&hand, &mut st_h);
+        execute(&super::parse(query).unwrap(), &mut st_p).unwrap();
+        execute(&hand, &mut st_h).unwrap();
         let probe = "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name AS a, b.name AS b, a.age AS age";
         let pp = super::parse(probe).unwrap();
         assert_eq!(bag(&run(&pp, &st_p)), bag(&run(&pp, &st_h)));
@@ -1357,7 +1357,8 @@ mod tests {
         execute(
             &super::parse("INSERT (a:P {name: 'a'}), (a)-[:R]->(b:P {name: 'b'})").unwrap(),
             &mut store,
-        );
+        )
+        .unwrap();
         let edge = run(
             &super::parse("MATCH (x:P)-[:R]->(y) RETURN x.name AS x, y.name AS y").unwrap(),
             &store,
@@ -1413,8 +1414,8 @@ mod tests {
         let query = "MATCH (p:Person) WHERE p.name = 'alice' SET p.age = 41 REMOVE p.name";
         let mut st_p = social();
         let mut st_h = social();
-        execute(&super::parse(query).unwrap(), &mut st_p);
-        execute(&hand, &mut st_h);
+        execute(&super::parse(query).unwrap(), &mut st_p).unwrap();
+        execute(&hand, &mut st_h).unwrap();
         // Compare the whole Person table (age + name) between the two stores.
         let probe = "MATCH (p:Person) RETURN p.age AS age, p.name AS name";
         let pp = super::parse(probe).unwrap();
@@ -1430,7 +1431,8 @@ mod tests {
         execute(
             &super::parse("MATCH (p:Person) WHERE p.name = 'alice' SET p.age = 100").unwrap(),
             &mut store,
-        );
+        )
+        .unwrap();
         let out = run(
             &super::parse("MATCH (p:Person) RETURN p.name AS name, p.age AS age").unwrap(),
             &store,
@@ -1464,13 +1466,15 @@ mod tests {
         execute(
             &super::parse("MATCH (p:Person) WHERE p.name = 'alice' SET p.age = null").unwrap(),
             &mut store,
-        );
+        )
+        .unwrap();
         assert!(store.has_prop(0, "age")); // present…
         assert!(store.prop(0, "age").is_null()); // …but null
         execute(
             &super::parse("MATCH (p:Person) WHERE p.age = 25 REMOVE p.age").unwrap(),
             &mut store,
-        );
+        )
+        .unwrap();
         // bob (age 25) had age removed → absent
         assert!(!store.has_prop(1, "age"));
     }

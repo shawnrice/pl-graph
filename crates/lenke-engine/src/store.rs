@@ -7,7 +7,7 @@
 //! the whole point of the columnar model, present from the first slice rather
 //! than retrofitted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::value::Value;
@@ -273,6 +273,10 @@ pub struct Store {
     /// the active transaction's undo log, or `None` outside a transaction
     /// (autocommit — mutations apply directly and record nothing).
     undo: Option<Vec<Undo>>,
+    /// declared unique constraints as `(label, keys)` — at most one live node per
+    /// label may carry a given key tuple. Enforced by the write statements, not
+    /// the store primitives (which stay infallible for rollback).
+    unique: Vec<(String, Vec<String>)>,
 }
 
 impl Store {
@@ -337,6 +341,65 @@ impl Store {
     #[must_use]
     pub fn column(&self, key: &str) -> Option<&Column> {
         self.props.get(key)
+    }
+
+    // --- Unique constraints ----------------------------------------------
+    //
+    // A unique constraint declares that at most one live node with `label` may
+    // carry a given tuple of `keys` values. Enforced by the write STATEMENTS
+    // (execute) after a mutation, not by the store primitives — those stay
+    // infallible so rollback can always run. Key equality uses the value
+    // contract's grouping (`group_key_into`), so two absent/NULL keys collide
+    // (consistent with lenke's first-class-null policy, not SQL's distinct NULLs).
+
+    /// Declare a unique constraint on `(label, keys)`. Errors if the CURRENT data
+    /// already violates it (you cannot declare a constraint the graph breaks).
+    pub fn create_unique_constraint(&mut self, label: &str, keys: &[&str]) -> Result<(), String> {
+        let keys: Vec<String> = keys.iter().map(|s| (*s).to_string()).collect();
+        self.check_label_unique(label, &keys)?;
+        self.unique.push((label.to_string(), keys));
+        Ok(())
+    }
+
+    /// Check every unique constraint on `label` against the live nodes; `Err`
+    /// names the first violated one. Write statements call this after mutating a
+    /// constrained label.
+    pub fn check_unique_for_label(&self, label: &str) -> Result<(), String> {
+        for (l, keys) in &self.unique {
+            if l == label {
+                self.check_label_unique(l, keys)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The keys of a unique constraint on `label` all of which appear in `have` —
+    /// the `_MERGE` conflict-target inference. `None` if no such constraint.
+    #[must_use]
+    pub fn unique_keys_for(&self, label: &str, have: &[String]) -> Option<Vec<String>> {
+        self.unique
+            .iter()
+            .filter(|(l, _)| l == label)
+            .map(|(_, keys)| keys)
+            .find(|keys| keys.iter().all(|k| have.contains(k)))
+            .cloned()
+    }
+
+    fn check_label_unique(&self, label: &str, keys: &[String]) -> Result<(), String> {
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        for &id in self.nodes_with_label(label) {
+            let mut buf = Vec::new();
+            for k in keys {
+                crate::value::group_key_into(&self.prop(id, k), &mut buf);
+            }
+            if !seen.insert(buf) {
+                return Err(format!(
+                    "E_UNIQUE: unique constraint on {label}({}) violated",
+                    keys.join(", ")
+                ));
+            }
+        }
+        Ok(())
     }
 
     // --- Mutation ---------------------------------------------------------
@@ -790,6 +853,7 @@ impl Builder {
             next_eid: edge_count,
             deleted: vec![false; n],
             undo: None,
+            unique: Vec::new(),
         }
     }
 }
@@ -1087,6 +1151,53 @@ mod tests {
         st.commit();
         assert_eq!(st.node_count(), 1);
         assert!(matches!(st.prop(a, "name"), Value::Str(x) if &*x == "a"));
+    }
+
+    // --- Unique constraints ---
+
+    /// A unique constraint on already-conforming data is accepted; check passes.
+    #[test]
+    fn unique_constraint_accepts_conforming_data() {
+        let mut st = Builder::default().build();
+        st.add_node(&["User"], &[("email", s("a@x"))]);
+        st.add_node(&["User"], &[("email", s("b@x"))]);
+        assert!(st.create_unique_constraint("User", &["email"]).is_ok());
+        assert!(st.check_unique_for_label("User").is_ok());
+    }
+
+    /// Declaring a constraint the data already violates errors.
+    #[test]
+    fn unique_constraint_rejects_existing_duplicate() {
+        let mut st = Builder::default().build();
+        st.add_node(&["User"], &[("email", s("dup"))]);
+        st.add_node(&["User"], &[("email", s("dup"))]);
+        assert!(st.create_unique_constraint("User", &["email"]).is_err());
+    }
+
+    /// After a constraint, a duplicate added at the store level is detected by the
+    /// check (the store primitive itself stays infallible; enforcement is the
+    /// caller's, as the write statements do).
+    #[test]
+    fn unique_check_detects_new_duplicate() {
+        let mut st = Builder::default().build();
+        st.add_node(&["User"], &[("email", s("x"))]);
+        st.create_unique_constraint("User", &["email"]).unwrap();
+        st.add_node(&["User"], &[("email", s("x"))]); // primitive allows it
+        assert!(st.check_unique_for_label("User").is_err()); // check catches it
+    }
+
+    /// Conflict-target inference: the constraint keys are returned when the
+    /// pattern's key set covers them.
+    #[test]
+    fn unique_keys_for_infers_target() {
+        let mut st = Builder::default().build();
+        st.create_unique_constraint("User", &["email"]).unwrap();
+        assert_eq!(
+            st.unique_keys_for("User", &["email".into(), "name".into()]),
+            Some(vec!["email".into()])
+        );
+        assert_eq!(st.unique_keys_for("User", &["name".into()]), None);
+        assert_eq!(st.unique_keys_for("Other", &["email".into()]), None);
     }
 
     /// `transaction` commits on `Ok` and rolls back on `Err`.

@@ -93,13 +93,15 @@ pub fn run(plan: &Plan, store: &Store) -> Rows {
 /// Run a plan that MAY write, against a mutable store. A write plan (`Insert`)
 /// mutates the store and returns no rows; any other plan is a pure read and is
 /// dispatched to [`run`] over a shared borrow. This is the entry point for
-/// statements that can mutate; read-only callers can keep using [`run`]. Not
-/// `#[must_use]`: a write statement's result is empty and commonly ignored.
-pub fn execute(plan: &Plan, store: &mut Store) -> Rows {
+/// statements that can mutate; read-only callers can keep using [`run`]. Returns
+/// `Err` when a write violates a constraint (the write is rolled back); reads and
+/// successful writes are `Ok` (a write's result is the empty row set).
+pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
     match plan {
         Plan::Insert { nodes, edges } => {
-            // Create the nodes first, remembering each spec's assigned id, then
-            // the edges among them. No RETURN yet, so the result is empty.
+            // In a transaction so a constraint violation rolls the whole INSERT
+            // back rather than leaving a partial write.
+            store.begin();
             let mut ids = Vec::with_capacity(nodes.len());
             for spec in nodes {
                 let labels: Vec<&str> = spec.labels.iter().map(String::as_str).collect();
@@ -113,10 +115,21 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Rows {
             for e in edges {
                 store.add_edge(ids[e.from], ids[e.to], &e.etype);
             }
-            Rows {
-                names: Vec::new(),
-                rows: Vec::new(),
+            // Enforce unique constraints on every label this INSERT touched.
+            let mut labels: Vec<&str> = nodes
+                .iter()
+                .flat_map(|s| s.labels.iter().map(String::as_str))
+                .collect();
+            labels.sort_unstable();
+            labels.dedup();
+            for l in labels {
+                if let Err(e) = store.check_unique_for_label(l) {
+                    store.rollback();
+                    return Err(e);
+                }
             }
+            store.commit();
+            Ok(empty_rows())
         }
         Plan::Update { input, ops } => {
             // Read phase: run the match and compute every (node, key, value?) to
@@ -157,12 +170,17 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Rows {
                     Applied::Remove(node, key) => store.remove_prop(node, &key),
                 }
             }
-            Rows {
-                names: Vec::new(),
-                rows: Vec::new(),
-            }
+            Ok(empty_rows())
         }
-        _ => run(plan, store),
+        _ => Ok(run(plan, store)),
+    }
+}
+
+/// The empty result a write statement returns (no columns, no rows).
+fn empty_rows() -> Rows {
+    Rows {
+        names: Vec::new(),
+        rows: Vec::new(),
     }
 }
 
@@ -1612,7 +1630,7 @@ mod tests {
                 etype: "R".into(),
             }],
         };
-        let out = execute(&plan, &mut store);
+        let out = execute(&plan, &mut store).unwrap();
         assert_eq!(out.rows.len(), 0); // a write returns no rows
         assert_eq!(store.node_count(), 2);
         assert_eq!(store.nodes_with_label("P"), &[0, 1]);
@@ -1641,12 +1659,60 @@ mod tests {
                 },
             ],
         };
-        execute(&plan, &mut store);
+        execute(&plan, &mut store).unwrap();
         // every Person got seen=1 and lost age
         for id in 0..3u32 {
             assert!(matches!(store.prop(id, "seen"), Value::Num(x) if x == 1.0));
             assert!(store.prop(id, "age").is_null());
         }
+    }
+
+    /// INSERT enforces unique constraints: the second insert of the same key
+    /// errors and is rolled back (the graph keeps exactly the first node).
+    #[test]
+    fn insert_enforces_unique_constraint() {
+        use crate::ir::{InsertNode, Plan};
+        let mut store = Builder::default().build();
+        store.create_unique_constraint("User", &["email"]).unwrap();
+        let ins = |email: &str| Plan::Insert {
+            nodes: vec![InsertNode {
+                labels: vec!["User".into()],
+                props: vec![("email".into(), s(email))],
+            }],
+            edges: vec![],
+        };
+        assert!(execute(&ins("a@x"), &mut store).is_ok());
+        let err = execute(&ins("a@x"), &mut store); // duplicate
+        assert!(err.is_err());
+        // rolled back: still exactly one User, and node_count did not grow.
+        assert_eq!(store.node_count(), 1);
+        assert_eq!(store.nodes_with_label("User").len(), 1);
+        // a different key still inserts fine.
+        assert!(execute(&ins("b@x"), &mut store).is_ok());
+        assert_eq!(store.node_count(), 2);
+    }
+
+    /// A single INSERT that creates two colliding nodes is rejected atomically.
+    #[test]
+    fn insert_rejects_intra_statement_duplicate() {
+        use crate::ir::{InsertNode, Plan};
+        let mut store = Builder::default().build();
+        store.create_unique_constraint("User", &["email"]).unwrap();
+        let plan = Plan::Insert {
+            nodes: vec![
+                InsertNode {
+                    labels: vec!["User".into()],
+                    props: vec![("email".into(), s("same"))],
+                },
+                InsertNode {
+                    labels: vec!["User".into()],
+                    props: vec![("email".into(), s("same"))],
+                },
+            ],
+            edges: vec![],
+        };
+        assert!(execute(&plan, &mut store).is_err());
+        assert_eq!(store.node_count(), 0); // both rolled back
     }
 
     /// A deleted node is absent from a label scan through the query path — build

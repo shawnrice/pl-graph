@@ -49,7 +49,14 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
       writes in a read pass then apply; `MATCH … WHERE … (SET k=expr | REMOVE k)+`;
       SET null stores a present null, REMOVE deletes — the null policy. Node
       properties only; edge props await B5. RETURN-after-update deferred.)
-- [ ] B3. GQL `MERGE` / `_MERGE` keyed upsert.
+- [x] B3a. Unique-constraint primitive: `create_unique_constraint(label, keys)` +
+      INSERT-time enforcement (a plain INSERT that violates it errors, rolled back
+      via the txn). `execute` now returns `Result<Rows,String>`. Key equality uses
+      group semantics (NULL keys collide — matches null-first-class, not SQL). B3b
+      helpers `unique_keys_for`/enforcement seam ready.
+- [ ] B3b. GQL `_MERGE` keyed upsert (sigil convention): node form, key inferred
+      from the unique constraint, default clobber / `_ON_CREATE` / `_ON_UPDATE`
+      [WHERE] / `_ON_UPDATE_NOTHING`. Edge form + multi-hop (v2) deferred.
 - [ ] B4. Gremlin `addV`/`addE`/`property`/`drop`.
 - [ ] B5. Relationship variables + edge properties (discovered in B1): bind an
       edge as a slot in `Expand`; store edge properties keyed by `eid`; read
