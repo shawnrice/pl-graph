@@ -169,13 +169,17 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
         ),
         Plan::Filter { input, pred } => {
             let batch = pull(input, store, track);
-            let mask = eval(pred, store, &batch);
-            let keep: Vec<usize> = match &mask {
-                Col::Bool(bs) => (0..bs.len()).filter(|&i| bs[i]).collect(),
-                other => (0..other.len())
-                    .filter(|&i| other.value_at(i).is_true())
-                    .collect(),
-            };
+            // Fast path: `<prop> <cmp> <literal>` reads storage in one pass to
+            // keep-indices; otherwise evaluate the predicate as a full column.
+            let keep: Vec<usize> = try_filter_keep(pred, store, &batch).unwrap_or_else(|| {
+                let mask = eval(pred, store, &batch);
+                match &mask {
+                    Col::Bool(bs) => (0..bs.len()).filter(|&i| bs[i]).collect(),
+                    other => (0..other.len())
+                        .filter(|&i| other.value_at(i).is_true())
+                        .collect(),
+                }
+            });
             batch.gather(&keep)
         }
         Plan::VarLength {
@@ -1214,6 +1218,67 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
     }
 }
 
+/// `op` with its operands swapped — used to normalize `literal <cmp> prop` to
+/// `prop <cmp> literal`. Equality is symmetric; the orderings mirror.
+fn flip_op(op: CompareOp) -> CompareOp {
+    match op {
+        CompareOp::Eq => CompareOp::Eq,
+        CompareOp::Ne => CompareOp::Ne,
+        CompareOp::Lt => CompareOp::Gt,
+        CompareOp::Gt => CompareOp::Lt,
+        CompareOp::Le => CompareOp::Ge,
+        CompareOp::Ge => CompareOp::Le,
+    }
+}
+
+/// One-pass predicate for the common `<prop> <cmp> <literal>` (either operand
+/// order) over a node frontier: read the storage property per row and emit the
+/// kept row indices, without building a full value column AND a full boolean mask
+/// as intermediates. Every comparison goes through the value contract, so results
+/// match the general path exactly: an absent property is NULL → UNKNOWN → dropped,
+/// a NULL literal makes every comparison UNKNOWN → all dropped, and cross-type is
+/// the contract's `equals`/`cmp_total`. `None` if the predicate is not this shape.
+fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usize>> {
+    let Expr::Compare { op, left, right } = pred else {
+        return None;
+    };
+    let (slot, key, op, lit) = match (left.as_ref(), right.as_ref()) {
+        (Expr::Prop { slot, key }, Expr::Lit(v)) => (*slot, key, *op, v),
+        (Expr::Lit(v), Expr::Prop { slot, key }) => (*slot, key, flip_op(*op), v),
+        _ => return None,
+    };
+    let Col::Nodes(ids) = batch.slot(slot) else {
+        return None;
+    };
+    // A NULL literal makes every comparison UNKNOWN — no row is kept.
+    if lit.is_null() {
+        return Some(Vec::new());
+    }
+    let column = store.column(key);
+    let mut keep = Vec::new();
+    for (row, &id) in ids.iter().enumerate() {
+        let v = match column {
+            Some(c) => c.read(id as usize),
+            None => continue, // property absent everywhere → UNKNOWN → dropped
+        };
+        if v.is_null() {
+            continue;
+        }
+        let hit = match op {
+            CompareOp::Eq => value::equals(&v, lit),
+            CompareOp::Ne => !value::equals(&v, lit),
+            CompareOp::Lt => value::cmp_total(&v, lit).is_lt(),
+            CompareOp::Le => value::cmp_total(&v, lit).is_le(),
+            CompareOp::Gt => value::cmp_total(&v, lit).is_gt(),
+            CompareOp::Ge => value::cmp_total(&v, lit).is_ge(),
+        };
+        if hit {
+            keep.push(row);
+        }
+    }
+    Some(keep)
+}
+
 /// Read `key` off an element frontier as a column, bulk-gathering the typed
 /// storage column and staying unboxed when it and every read entry are
 /// present-and-typed; fall to `Gen` (with nulls) otherwise.
@@ -1428,6 +1493,20 @@ mod tests {
             .filter(cmp(CompareOp::Eq, prop(0, "age"), lit(s("30"))))
             .project(vec![("name".into(), prop(0, "name"))]);
         assert_eq!(run(&plan, &store).rows.len(), 0);
+    }
+
+    /// Reversed operand order (`literal < prop`) must match `prop > literal` —
+    /// exercises the fused filter's operand flip. `28 < age` → alice(30),carol(40).
+    #[test]
+    fn filter_literal_on_left_flips() {
+        let store = social();
+        let plan = scan("Person")
+            .filter(cmp(CompareOp::Lt, lit(n(28.0)), prop(0, "age")))
+            .project(vec![("name".into(), prop(0, "name"))]);
+        let out = run(&plan, &store);
+        let mut got = names_of(&out, 0);
+        got.sort();
+        assert_eq!(got, vec!["alice", "carol"]);
     }
 
     // --- Expand ---

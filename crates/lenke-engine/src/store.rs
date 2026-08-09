@@ -43,7 +43,10 @@ impl Column {
         }
     }
 
-    fn read(&self, i: usize) -> Value {
+    /// Read node `i`'s value from this column (NULL if absent). The per-node
+    /// accessor operators use when they hold a `&Column` directly.
+    #[must_use]
+    pub fn read(&self, i: usize) -> Value {
         let idx = i;
         match self {
             Self::Num { data, present } if present[idx] => Value::Num(data[idx]),
