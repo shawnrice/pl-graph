@@ -265,9 +265,14 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       dates, secs+nanos for datetimes, cross-kind→NULL). Ported from lenke-core.
       2 tests. Duration arithmetic (instant ± duration, duration ± duration,
       duration × int, with overflow faults) → G1f.
-- [ ] G1f. Temporal arithmetic: instant ± duration (add_months clamped, then
-      days, then time; date-overflow throws), duration ± duration (component-wise),
-      duration × integer — wired into the `+`/`-`/`*` operator via value.rs.
+- [x] G1f. Temporal arithmetic (completes G1): instant ± duration (calendar
+      months clamped to the new month's length, then days, then time; zoned forms
+      apply it to the local wall clock; date-overflow THROWS), instant − instant =
+      the exact span, duration ± duration (component-wise), duration × integer
+      (non-integer → NULL). Wired into the Arith `+`/`-`/`*` eval (temporal path
+      when either operand is temporal; numeric path unchanged); all rules in the
+      temporal module. 2 tests (month-clamp leap/non-leap, span, dur sum/scale,
+      overflow throw).
 - [ ] G2. Map/record values (storage, dotted-path, construction, access).
 - [ ] F5c. Gremlin multi-label select('a','b') (a Map value — needs G2) and
       order(local) (within-list sort — needs list ops). Relocated from F5b; placed

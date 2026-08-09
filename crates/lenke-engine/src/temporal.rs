@@ -1,7 +1,7 @@
-//! ISO/IEC 39075 temporal values — this engine's zone-less subset: `DATE`,
-//! `LOCAL TIME`, `LOCAL DATETIME`. Ported faithfully from `lenke-core`'s
-//! `temporal.rs` so the two engines AGREE (same ISO-8601 wire form, same order);
-//! the ZONED variants and `DURATION` join in a later slice.
+//! ISO/IEC 39075 temporal values — all six kinds: `DATE`, `LOCAL TIME`,
+//! `LOCAL DATETIME`, `ZONED TIME`, `ZONED DATETIME`, `DURATION`. Ported faithfully
+//! from `lenke-core`'s `temporal.rs` so the two engines AGREE (same ISO-8601 wire
+//! form, same order, same calendar arithmetic).
 //!
 //! Dependency-free: the calendar math is Howard Hinnant's civil-from-days
 //! algorithm and the ISO-8601 parse/format is hand-rolled, so the wire form is a
@@ -77,6 +77,21 @@ pub struct ZonedTime {
 }
 
 const SECS_PER_DAY: i64 = 86_400;
+const NANOS_PER_SEC: i64 = 1_000_000_000;
+
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// Days in month `m` (1..=12) of proleptic-Gregorian year `y`.
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap(y) => 29,
+        _ => 28,
+    }
+}
 
 // --- civil calendar (Hinnant) ------------------------------------------------
 
@@ -271,6 +286,22 @@ impl Date {
     pub fn format(&self) -> String {
         let (y, m, d) = civil_from_days(i64::from(self.days));
         format!("{}-{m:02}-{d:02}", fmt_year(y))
+    }
+
+    /// Add `months` (calendar), CLAMPING the day to the new month's length
+    /// (`Jan 31 + 1 month → Feb 28/29`), then `extra_days` as plain days. `None`
+    /// when the result leaves the representable (`i32` day) range — the arithmetic
+    /// layer turns that into a thrown fault, not a silent wrap.
+    fn add_calendar(&self, months: i64, extra_days: i64) -> Option<Self> {
+        let (y, m, d) = civil_from_days(i64::from(self.days));
+        let total = y * 12 + (i64::from(m) - 1) + months;
+        let ny = total.div_euclid(12);
+        let nm = u32::try_from(total.rem_euclid(12) + 1).expect("1..=12");
+        let nd = d.min(days_in_month(ny, nm));
+        let base = days_from_civil(ny, i64::from(nm), i64::from(nd));
+        i32::try_from(base + extra_days)
+            .ok()
+            .map(|days| Self { days })
     }
 }
 
@@ -497,6 +528,58 @@ impl Duration {
         (self.months, self.days, self.secs, self.nanos)
     }
 
+    /// Negate the whole span, keeping `nanos` in `[0, 1e9)`.
+    #[must_use]
+    pub fn negate(&self) -> Self {
+        let (secs, nanos) = if self.nanos == 0 {
+            (-self.secs, 0)
+        } else {
+            (-self.secs - 1, 1_000_000_000 - self.nanos)
+        };
+        Self {
+            months: -self.months,
+            days: -self.days,
+            secs,
+            nanos,
+        }
+    }
+
+    /// Component-wise sum of two (nominal) durations, nanos carrying into secs.
+    /// `None` on i64 overflow or leaving the f64-safe range.
+    #[must_use]
+    pub fn add(&self, o: &Self) -> Option<Self> {
+        let mut secs = self.secs.checked_add(o.secs)?;
+        let mut nanos = i64::from(self.nanos) + i64::from(o.nanos);
+        if nanos >= NANOS_PER_SEC {
+            nanos -= NANOS_PER_SEC;
+            secs = secs.checked_add(1)?;
+        }
+        Self {
+            months: self.months.checked_add(o.months)?,
+            days: self.days.checked_add(o.days)?,
+            secs,
+            nanos: u32::try_from(nanos).expect("0..1e9 after carry"),
+        }
+        .representable()
+    }
+
+    /// Scale every component by an integer factor (nanos carry into secs). `None`
+    /// on i64 overflow or leaving the f64-safe range.
+    #[must_use]
+    pub fn scale(&self, n: i64) -> Option<Self> {
+        let total_nanos = i64::from(self.nanos).checked_mul(n)?;
+        Some(Self {
+            months: self.months.checked_mul(n)?,
+            days: self.days.checked_mul(n)?,
+            secs: self
+                .secs
+                .checked_mul(n)?
+                .checked_add(total_nanos.div_euclid(NANOS_PER_SEC))?,
+            nanos: u32::try_from(total_nanos.rem_euclid(NANOS_PER_SEC)).expect("0..1e9"),
+        })
+        .and_then(Self::representable)
+    }
+
     fn representable(self) -> Option<Self> {
         if self.months.unsigned_abs() >= Self::MAX_SAFE
             || self.days.unsigned_abs() >= Self::MAX_SAFE
@@ -646,6 +729,76 @@ impl Temporal {
             (Self::ZonedDateTime(a), Self::ZonedDateTime(b)) => a.cmp(b),
             (Self::Duration(a), Self::Duration(b)) => a.total_key().cmp(&b.total_key()),
             _ => self.kind_rank().cmp(&other.kind_rank()),
+        }
+    }
+
+    /// `self + duration` for a date/time/datetime (and their zoned forms): apply
+    /// calendar months (clamped), then days, then the sub-day part. A bare `Time`
+    /// wraps within the day (months/days ignored); a zoned value applies it to the
+    /// LOCAL wall clock, then re-anchors to UTC keeping the offset. `None` when the
+    /// result leaves the representable date range, or when `self` is a duration.
+    #[must_use]
+    pub fn add_duration(&self, d: &Duration) -> Option<Self> {
+        match self {
+            Self::Date(date) => date.add_calendar(d.months, d.days).map(Self::Date),
+            Self::Time(t) => {
+                let carry_nanos = i64::from(t.nanos) + i64::from(d.nanos);
+                let secs = i64::from(t.secs) + d.secs + carry_nanos.div_euclid(NANOS_PER_SEC);
+                Some(Self::Time(Time {
+                    secs: u32::try_from(secs.rem_euclid(SECS_PER_DAY)).expect("0..86_400"),
+                    nanos: u32::try_from(carry_nanos.rem_euclid(NANOS_PER_SEC)).expect("0..1e9"),
+                }))
+            }
+            Self::DateTime(dt) => {
+                let days0 = dt.secs.div_euclid(SECS_PER_DAY);
+                let tod = dt.secs.rem_euclid(SECS_PER_DAY);
+                let date = Date {
+                    days: i32::try_from(days0).ok()?,
+                }
+                .add_calendar(d.months, d.days)?;
+                let mut secs = i64::from(date.days) * SECS_PER_DAY + tod + d.secs;
+                let mut nanos = i64::from(dt.nanos) + i64::from(d.nanos);
+                if nanos >= NANOS_PER_SEC {
+                    nanos -= NANOS_PER_SEC;
+                    secs += 1;
+                }
+                Some(Self::DateTime(DateTime {
+                    secs,
+                    nanos: u32::try_from(nanos).expect("0..1e9 after carry"),
+                }))
+            }
+            Self::ZonedDateTime(zdt) => {
+                let local = DateTime {
+                    secs: zdt.secs + i64::from(zdt.offset) * 60,
+                    nanos: zdt.nanos,
+                };
+                let Self::DateTime(nl) = Self::DateTime(local).add_duration(d)? else {
+                    return None;
+                };
+                Some(Self::ZonedDateTime(ZonedDateTime {
+                    secs: nl.secs - i64::from(zdt.offset) * 60,
+                    nanos: nl.nanos,
+                    offset: zdt.offset,
+                }))
+            }
+            Self::ZonedTime(zt) => {
+                let local_secs =
+                    (i64::from(zt.secs) + i64::from(zt.offset) * 60).rem_euclid(SECS_PER_DAY);
+                let local = Time {
+                    secs: u32::try_from(local_secs).expect("0..86_400"),
+                    nanos: zt.nanos,
+                };
+                let Self::Time(nt) = Self::Time(local).add_duration(d)? else {
+                    return None;
+                };
+                let utc = (i64::from(nt.secs) - i64::from(zt.offset) * 60).rem_euclid(SECS_PER_DAY);
+                Some(Self::ZonedTime(ZonedTime {
+                    secs: u32::try_from(utc).expect("0..86_400"),
+                    nanos: nt.nanos,
+                    offset: zt.offset,
+                }))
+            }
+            Self::Duration(_) => None,
         }
     }
 }

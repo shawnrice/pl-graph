@@ -1878,21 +1878,32 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
         }
         Expr::Arith { op, left, right } => {
             // f64 math via the value contract's `as_num` (finite Num only); any
-            // NULL / non-numeric / non-finite operand OR result yields NULL.
+            // NULL / non-numeric / non-finite operand OR result yields NULL. When
+            // either operand is a temporal, `temporal_arith` takes over (and may
+            // THROW on a result out of the representable range).
             use crate::ir::ArithOp::{Add, Div, Mul, Rem, Sub};
             let l = eval(left, store, batch)?;
             let r = eval(right, store, batch)?;
             let n = l.len().min(r.len());
-            let out: Vec<Value> = (0..n)
-                .map(
-                    |i| match (value::as_num(&l.value_at(i)), value::as_num(&r.value_at(i))) {
-                        (Some(a), Some(b)) => {
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let a = l.value_at(i);
+                let b = r.value_at(i);
+                let v = if matches!(a, Value::Temporal(_)) || matches!(b, Value::Temporal(_)) {
+                    if a.is_null() || b.is_null() {
+                        Value::Null
+                    } else {
+                        temporal_arith(*op, &a, &b)?
+                    }
+                } else {
+                    match (value::as_num(&a), value::as_num(&b)) {
+                        (Some(x), Some(y)) => {
                             let res = match op {
-                                Add => a + b,
-                                Sub => a - b,
-                                Mul => a * b,
-                                Div => a / b,
-                                Rem => a % b,
+                                Add => x + y,
+                                Sub => x - y,
+                                Mul => x * y,
+                                Div => x / y,
+                                Rem => x % y,
                             };
                             if res.is_finite() {
                                 Value::Num(res)
@@ -1901,9 +1912,10 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                             }
                         }
                         _ => Value::Null,
-                    },
-                )
-                .collect();
+                    }
+                };
+                out.push(v);
+            }
             Col::Gen(out)
         }
         Expr::Call { name, args } => {
@@ -2261,6 +2273,46 @@ fn duration_between(a: crate::temporal::Temporal, b: crate::temporal::Temporal) 
             }))
         }
         _ => Value::Null,
+    }
+}
+
+/// Temporal `+`/`-`/`*` when either operand is temporal: instant ± duration
+/// (anchored — months clamped, then days, then time), instant − instant (the
+/// exact span), duration ± duration (component-wise), duration × integer. An
+/// undefined combination is `Ok(Null)`; a result outside the representable
+/// range is a THROWN fault (`Err`) — not a silent null. Ported from lenke-core.
+fn temporal_arith(op: crate::ir::ArithOp, lv: &Value, rv: &Value) -> Result<Value, String> {
+    use crate::ir::ArithOp::{Add, Mul, Sub};
+    use crate::temporal::Temporal as T;
+    use Value::Temporal as VT;
+    let dur = |r: Option<crate::temporal::Duration>| {
+        r.map(|d| VT(T::Duration(d)))
+            .ok_or_else(|| "E_INVALID_VALUE: duration component out of range".to_string())
+    };
+    let inst = |r: Option<T>| {
+        r.map(VT)
+            .ok_or_else(|| "E_INVALID_VALUE: temporal result out of range".to_string())
+    };
+    match (op, lv, rv) {
+        // duration ± duration (component-wise).
+        (Add, VT(T::Duration(a)), VT(T::Duration(b))) => dur(a.add(b)),
+        (Sub, VT(T::Duration(a)), VT(T::Duration(b))) => dur(a.add(&b.negate())),
+        // instant ± duration (either order for +; dur±dur already handled above).
+        (Add, VT(t), VT(T::Duration(d))) | (Add, VT(T::Duration(d)), VT(t)) => {
+            inst(t.add_duration(d))
+        }
+        (Sub, VT(t), VT(T::Duration(d))) => inst(t.add_duration(&d.negate())),
+        // instant − instant → the exact span from b to a (a − b).
+        (Sub, VT(a), VT(b)) => Ok(duration_between(*b, *a)),
+        // duration × INTEGER (either order); a non-integer factor is NULL.
+        (Mul, VT(T::Duration(d)), Value::Num(n)) | (Mul, Value::Num(n), VT(T::Duration(d))) => {
+            if n.is_finite() && n.fract() == 0.0 {
+                dur(d.scale(*n as i64))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        _ => Ok(Value::Null),
     }
 }
 

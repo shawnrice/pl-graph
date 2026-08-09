@@ -2386,6 +2386,55 @@ mod tests {
     }
 
     #[test]
+    fn temporal_arithmetic() {
+        let store = social();
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) RETURN \
+                 DATE '2024-01-31' + DURATION 'P1M' AS clamp_leap, \
+                 DATE '2023-01-31' + DURATION 'P1M' AS clamp, \
+                 DATE '2024-01-15' + DURATION 'P10D' AS plus_days, \
+                 DATETIME '2024-01-15T10:00:00' + DURATION 'PT3661S' AS dt_plus, \
+                 DATE '2024-04-20' - DATE '2024-01-15' AS span, \
+                 DURATION 'P1M' + DURATION 'P2D' AS dsum, \
+                 DURATION 'P2D' * 3 AS dscale",
+            )
+            .unwrap(),
+            &store,
+        );
+        let iso = |v: &Value| match v {
+            Value::Temporal(t) => t.format(),
+            o => panic!("expected Temporal, got {o:?}"),
+        };
+        assert_eq!(iso(&col(&out, 0, "clamp_leap")), "2024-02-29"); // Jan31+1M → Feb29 (leap)
+        assert_eq!(iso(&col(&out, 0, "clamp")), "2023-02-28"); // non-leap → Feb28
+        assert_eq!(iso(&col(&out, 0, "plus_days")), "2024-01-25");
+        assert_eq!(iso(&col(&out, 0, "dt_plus")), "2024-01-15T11:01:01"); // +1h1m1s
+        assert_eq!(iso(&col(&out, 0, "span")), "P96D"); // Jan15→Apr20, leap year
+        assert_eq!(iso(&col(&out, 0, "dsum")), "P1M2D");
+        assert_eq!(iso(&col(&out, 0, "dscale")), "P6D");
+
+        // A non-integer duration scale is NULL (no meaningful fractional month).
+        let out2 = run(
+            &super::parse("MATCH (p:Person) RETURN DURATION 'P2D' * 1.5 AS d").unwrap(),
+            &store,
+        );
+        assert!(col(&out2, 0, "d").is_null());
+    }
+
+    #[test]
+    fn temporal_arithmetic_overflow_throws() {
+        let store = social();
+        // Adding ~8.3M years leaves the representable i32-day date range: a THROWN
+        // fault (E_INVALID_VALUE via the fallible pipeline), not a silent null.
+        let plan =
+            super::parse("MATCH (p:Person) RETURN DATE '2024-01-01' + DURATION 'P100000000M' AS d")
+                .unwrap();
+        let err = crate::exec::try_run(&plan, &store).unwrap_err();
+        assert!(err.contains("E_INVALID_VALUE"), "got: {err}");
+    }
+
+    #[test]
     fn stored_dates_round_trip_and_filter() {
         let mut store = social();
         // Store birthdates on two Persons, then find those born before 2000.
