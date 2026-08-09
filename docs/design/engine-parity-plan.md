@@ -310,10 +310,10 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       a single-label select still projects the element, an unknown label errors.
       1 test (ordered map of node ids). order(local) → F5d.
 - [~] F5d. Gremlin `order(local)` (within-list/map sort) — DEFERRED: no Gremlin
-      step yet PRODUCES a per-row list/map to sort (no `fold`/`aggregate(local)`;
-      multi-select yields a Map, groupCount yields rows). `order(local)` would have
-      nothing to operate on, so it waits on a list-producing step (a future `fold`).
-      Not a blocker for parity of the currently-expressible surface.
+  step yet PRODUCES a per-row list/map to sort (no `fold`/`aggregate(local)`;
+  multi-select yields a Map, groupCount yields rows). `order(local)` would have
+  nothing to operate on, so it waits on a list-producing step (a future `fold`).
+  Not a blocker for parity of the currently-expressible surface.
 - [x] G3. Numeric edge-case parity audit against `value.rs`: confirmed agreement
       with lenke-core on the f64 model — `as_num` is finite-Num-only (NaN/Inf →
       None → arithmetic NULL), `-0.0 == 0.0`, NaN unequal under `equals` but
@@ -324,14 +324,32 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       is a single deterministic total order here (rank-based, never faults),
       whereas lenke-core's GQL raises E_INVALID_VALUE — a deliberate choice so
       sort/group/min-max stay total; equality already agrees (cross-type false).
-- [ ] G4. Interval/temporal edge index (relocated from D3; needs G1): RI-tree-style
-      as-of/overlap seek over temporal edge bounds.
-- [ ] G5. Edge-type index (relocated from D3): adjacency grouped by edge type for
-      O(matching-degree) type-filtered expand — an optimization, not correctness.
+- [~] G4. Interval/temporal edge index — DEFERRED. It is a result-INVARIANT
+      optimization with NO consumer yet: nothing produces an "edges overlapping
+      interval" seek (traversal is adjacency-driven + edge-prop post-filter; edges
+      have no columnar/interval store, only a boxed eid→value map). An RI-tree
+      foundation with no query path and no benchmark is premature — CLAUDE.md is
+      emphatic that such perf must be MEASURED. Revisit with an edge-temporal seek
+      query shape + planner rule (G4b) and a benchmark.
+- [~] G5. Edge-type index — DEFERRED. Also result-invariant perf: it would speed
+      type-filtered `expand`, but that is exactly the adjacency-change class
+      CLAUDE.md warns is "misjudged against wrong fixtures," and there is no
+      lenke-engine benchmark to justify it (or to catch an ingest/rollback
+      regression from maintaining a grouped/sorted adjacency). Revisit measured,
+      with a fixture that varies degree and edge:type ratio.
 
 ### Phase H — Semantics services
 
-- [ ] H1. Constraints / validators (commit-time checks).
+- [x] H1. Required-property constraint (validator): `create_required_constraint
+      (label, key)` — every live node with `label` must carry a PRESENT value for
+      `key` (present-null passes; only absence violates, per null-first-class).
+      Declaration errors on already-violating data; write statements (INSERT and
+      _MERGE) enforce it alongside unique and roll back on violation
+      (`E_REQUIRED`); it round-trips through the snapshot schema
+      (`{"schema":"required",…}`). 3 tests (store check/declare, INSERT reject +
+      rollback, snapshot survival). NOTE: like unique, SET/REMOVE-time re-check is
+      not yet wired (a REMOVE of a required key over a MATCH isn't caught) — a
+      shared follow-up when Update gets constraint enforcement.
 - [ ] H2. Events / CDC (observation-only notifications).
 - [ ] H3. Typed nodes (host-side schema validate-before-write).
 

@@ -127,7 +127,8 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
                     store.set_edge_prop(eid, k, v.clone());
                 }
             }
-            // Enforce unique constraints on every label this INSERT touched.
+            // Enforce unique AND required constraints on every label this INSERT
+            // touched (roll the whole INSERT back on the first violation).
             let mut labels: Vec<&str> = nodes
                 .iter()
                 .flat_map(|s| s.labels.iter().map(String::as_str))
@@ -135,7 +136,10 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
             labels.sort_unstable();
             labels.dedup();
             for l in labels {
-                if let Err(e) = store.check_unique_for_label(l) {
+                if let Err(e) = store
+                    .check_unique_for_label(l)
+                    .and_then(|()| store.check_required_for_label(l))
+                {
                     store.rollback();
                     return Err(e);
                 }
@@ -345,7 +349,10 @@ fn execute_merge(
         }
     }
 
-    if let Err(e) = store.check_unique_for_label(label) {
+    if let Err(e) = store
+        .check_unique_for_label(label)
+        .and_then(|()| store.check_required_for_label(label))
+    {
         store.rollback();
         return Err(e);
     }

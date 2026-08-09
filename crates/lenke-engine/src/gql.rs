@@ -2625,6 +2625,27 @@ mod tests {
     }
 
     #[test]
+    fn required_constraint_rejects_insert_without_the_key() {
+        let mut store = Builder::default().build();
+        store.create_required_constraint("User", "email").unwrap();
+        // INSERT carrying the required key succeeds.
+        crate::exec::execute(
+            &super::parse("INSERT (:User {email: 'a@x'})").unwrap(),
+            &mut store,
+        )
+        .unwrap();
+        // INSERT missing it is rejected and rolled back (node count unchanged).
+        let before = store.node_count();
+        let err = crate::exec::execute(
+            &super::parse("INSERT (:User {name: 'b'})").unwrap(),
+            &mut store,
+        )
+        .unwrap_err();
+        assert!(err.contains("E_REQUIRED"), "got: {err}");
+        assert_eq!(store.node_count(), before);
+    }
+
+    #[test]
     fn where_filter_and_alias() {
         use crate::ir::{CompareOp, Expr, Plan};
         let store = social();

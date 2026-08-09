@@ -63,19 +63,29 @@ pub fn to_ndjson(store: &Store) -> String {
     out
 }
 
-/// The store's SCHEMA as NDJSON — currently the unique constraints, one per line
-/// `{"schema":"unique","label":..,"keys":[..]}`. Sorted by (label, keys) for
+/// The store's SCHEMA as NDJSON — the unique and required constraints, one per
+/// line (`{"schema":"unique","label":..,"keys":[..]}` /
+/// `{"schema":"required","label":..,"key":..}`). Each group sorted for
 /// determinism. These lines lead a [`snapshot`] so they apply before the data.
 #[must_use]
 pub fn dump_schema(store: &Store) -> String {
-    let mut cs = store.unique_constraints();
-    cs.sort();
     let mut out = String::new();
-    for (label, keys) in cs {
+    let mut uniques = store.unique_constraints();
+    uniques.sort();
+    for (label, keys) in uniques {
         out.push_str("{\"schema\":\"unique\",\"label\":");
         encode_string(&mut out, &label);
         out.push_str(",\"keys\":");
         encode_str_array(&mut out, &keys);
+        out.push_str("}\n");
+    }
+    let mut required = store.required_constraints();
+    required.sort();
+    for (label, key) in required {
+        out.push_str("{\"schema\":\"required\",\"label\":");
+        encode_string(&mut out, &label);
+        out.push_str(",\"key\":");
+        encode_string(&mut out, &key);
         out.push_str("}\n");
     }
     out
@@ -225,6 +235,7 @@ pub fn from_ndjson(text: &str) -> Result<Store, String> {
     type NodeRec = (u32, Vec<String>, Vec<(String, Value)>);
     type EdgeRec = (u32, u32, String, Vec<(String, Value)>);
     let mut constraints: Vec<(String, Vec<String>)> = Vec::new();
+    let mut required: Vec<(String, String)> = Vec::new();
     let mut nodes: Vec<NodeRec> = Vec::new();
     let mut edges: Vec<EdgeRec> = Vec::new();
 
@@ -238,13 +249,20 @@ pub fn from_ndjson(text: &str) -> Result<Store, String> {
             return Err(err("expected a JSON object".into()));
         };
         if let Some(kind) = field(&fields, "schema") {
-            // Schema line (leads the snapshot). Only "unique" so far.
-            if json_string(kind).map_err(err)? != "unique" {
-                return Err(err("unknown schema kind".into()));
+            // Schema line (leads the snapshot): "unique" or "required".
+            match json_string(kind).map_err(err)?.as_str() {
+                "unique" => {
+                    let label = json_string(req(&fields, "label").map_err(err)?).map_err(err)?;
+                    let keys = json_str_array(req(&fields, "keys").map_err(err)?).map_err(err)?;
+                    constraints.push((label, keys));
+                }
+                "required" => {
+                    let label = json_string(req(&fields, "label").map_err(err)?).map_err(err)?;
+                    let key = json_string(req(&fields, "key").map_err(err)?).map_err(err)?;
+                    required.push((label, key));
+                }
+                _ => return Err(err("unknown schema kind".into())),
             }
-            let label = json_string(req(&fields, "label").map_err(err)?).map_err(err)?;
-            let keys = json_str_array(req(&fields, "keys").map_err(err)?).map_err(err)?;
-            constraints.push((label, keys));
         } else if let Some(id) = field(&fields, "id") {
             let file_id = json_u32(id).map_err(err)?;
             let labels = json_str_array(req(&fields, "labels").map_err(err)?).map_err(err)?;
@@ -267,6 +285,9 @@ pub fn from_ndjson(text: &str) -> Result<Store, String> {
     for (label, keys) in &constraints {
         let krefs: Vec<&str> = keys.iter().map(String::as_str).collect();
         store.create_unique_constraint(label, &krefs)?;
+    }
+    for (label, key) in &required {
+        store.create_required_constraint(label, key)?;
     }
     let mut remap: HashMap<u32, u32> = HashMap::new();
     for (file_id, labels, props) in &nodes {
@@ -547,13 +568,31 @@ impl JsonParser {
 
 #[cfg(test)]
 mod tests {
-    use super::{from_ndjson, to_ndjson};
+    use super::{from_ndjson, snapshot, to_ndjson};
     use crate::store::Builder;
     use crate::value::Value;
     use std::sync::Arc;
 
     fn s(x: &str) -> Value {
         Value::Str(Arc::from(x))
+    }
+
+    /// A required constraint survives a snapshot round trip: it dumps a schema
+    /// line and the reloaded store re-enforces it.
+    #[test]
+    fn required_constraint_survives_snapshot() {
+        let mut st = Builder::default().build();
+        st.add_node(&["User"], &[("email", s("a@x"))]);
+        st.create_required_constraint("User", "email").unwrap();
+        let snap = snapshot(&st);
+        assert!(
+            snap.contains("{\"schema\":\"required\",\"label\":\"User\",\"key\":\"email\"}"),
+            "schema was: {snap}"
+        );
+        let mut st2 = from_ndjson(&snap).unwrap();
+        // The reloaded constraint still bites: a User with no email violates it.
+        st2.add_node(&["User"], &[("name", s("b"))]);
+        assert!(st2.check_required_for_label("User").is_err());
     }
     fn n(x: f64) -> Value {
         Value::Num(x)

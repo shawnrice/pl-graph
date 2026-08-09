@@ -357,6 +357,11 @@ pub struct Store {
     /// label may carry a given key tuple. Enforced by the write statements, not
     /// the store primitives (which stay infallible for rollback).
     unique: Vec<(String, Vec<String>)>,
+    /// declared required-property constraints as `(label, key)` — every live node
+    /// with `label` must carry a PRESENT value for `key` (present-null counts, per
+    /// the null-first-class policy; only absence violates). Enforced by the write
+    /// statements, like `unique`.
+    required: Vec<(String, String)>,
     /// edge properties: key -> (eid -> value). Boxed (not columnar) — edges are a
     /// less hot path than node scans, and eids are sparse after deletes. A deleted
     /// edge's props are left behind (eids are never reused, so a dead eid is never
@@ -594,6 +599,49 @@ impl Store {
                 return Err(format!(
                     "E_UNIQUE: unique constraint on {label}({}) violated",
                     keys.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    // --- Required-property constraints ------------------------------------
+    //
+    // A required constraint declares that every live node with `label` carries a
+    // PRESENT value for `key` (present-null counts — only absence violates).
+    // Enforced by the write statements after a mutation, like `unique`.
+
+    /// The declared required constraints as `(label, key)` — for snapshot/schema.
+    #[must_use]
+    pub fn required_constraints(&self) -> Vec<(String, String)> {
+        self.required.clone()
+    }
+
+    /// Declare a required-property constraint on `(label, key)`. Errors if the
+    /// CURRENT data already violates it (a labelled node missing the property).
+    pub fn create_required_constraint(&mut self, label: &str, key: &str) -> Result<(), String> {
+        self.check_label_required(label, key)?;
+        self.required.push((label.to_string(), key.to_string()));
+        Ok(())
+    }
+
+    /// Check every required constraint on `label` against the live nodes; `Err`
+    /// names the first violated one. Write statements call this after mutating a
+    /// constrained label.
+    pub fn check_required_for_label(&self, label: &str) -> Result<(), String> {
+        for (l, key) in &self.required {
+            if l == label {
+                self.check_label_required(l, key)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_label_required(&self, label: &str, key: &str) -> Result<(), String> {
+        for &id in self.nodes_with_label(label) {
+            if !self.has_prop(id, key) {
+                return Err(format!(
+                    "E_REQUIRED: required constraint on {label}({key}) violated"
                 ));
             }
         }
@@ -1350,6 +1398,7 @@ impl Builder {
             deleted: vec![false; n],
             undo: None,
             unique: Vec::new(),
+            required: Vec::new(),
             edge_props: HashMap::new(),
             indexes: Vec::new(),
             ranges: Vec::new(),
@@ -1481,6 +1530,23 @@ mod tests {
             st.prop(1, "born"),
             Value::Temporal(Temporal::Time(_))
         ));
+    }
+
+    #[test]
+    fn required_constraint_declared_and_checked() {
+        let mut st = Builder::default().build();
+        st.add_node(&["User"], &[("email", s("a@x"))]);
+        // Every User has email → the constraint declares, and the check passes.
+        assert!(st.create_required_constraint("User", "email").is_ok());
+        assert!(st.check_required_for_label("User").is_ok());
+        // A User missing email → the check fails (present-null would pass; absence
+        // is the violation).
+        st.add_node(&["User"], &[("name", s("b"))]);
+        assert!(st.check_required_for_label("User").is_err());
+        // Declaring on already-violating data errors.
+        let mut st2 = Builder::default().build();
+        st2.add_node(&["User"], &[("name", s("x"))]);
+        assert!(st2.create_required_constraint("User", "email").is_err());
     }
 
     #[test]
