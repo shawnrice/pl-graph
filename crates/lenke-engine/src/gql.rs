@@ -1367,8 +1367,11 @@ impl Parser {
                     .get(&s)
                     .ok_or_else(|| format!("unknown variable `{s}`"))?;
                 if self.eat(&Tok::Dot) {
+                    // The FIRST `.key` stays a `Prop` (the shape the optimizer
+                    // seeks on); any further `.key` are record-field accesses on
+                    // the value it produced (e.g. `n.meta.city`).
                     let key = self.ident()?;
-                    Ok(Expr::Prop { slot, key })
+                    self.field_chain(Expr::Prop { slot, key })
                 } else {
                     Ok(Expr::Slot(slot))
                 }
@@ -2564,6 +2567,33 @@ mod tests {
             &hand,
             &store,
         );
+    }
+
+    #[test]
+    fn nested_field_access_on_a_stored_record() {
+        let mut store = social();
+        // Store a record property, then read nested fields via `n.rec.field`.
+        crate::exec::execute(
+            &super::parse(
+                "MATCH (p:Person) WHERE p.name = 'alice' \
+                 SET p.meta = {city: 'NYC', zip: 10001}",
+            )
+            .unwrap(),
+            &mut store,
+        )
+        .unwrap();
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) WHERE p.name = 'alice' \
+                 RETURN p.meta.city AS c, p.meta.zip AS z, p.meta.absent AS a",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert_eq!(out.rows.len(), 1);
+        assert!(crate::value::equals(&col(&out, 0, "c"), &s("NYC")));
+        assert_eq!(num(&col(&out, 0, "z")), 10001.0);
+        assert!(col(&out, 0, "a").is_null()); // absent nested field → NULL
     }
 
     #[test]

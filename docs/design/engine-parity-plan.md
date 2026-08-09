@@ -288,8 +288,13 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       entry too). 2 tests (positional Map contract, field access + nested + hand
       plan). Map has no producer yet — F5c (multi-select) is its first, now
       unblocked. NDJSON Map egress is best-effort (not a stored type).
-- [ ] G2c. Dotted-path property index: createIndex on a record field path +
-      planner seek {k.sub: $x} into it (the perf slice; the memory's 140x seek).
+- [x] G2c. Nested field access on a variable: `n.rec.field` (and deeper chains) —
+      the first `.key` stays a `Prop` (optimizer-seekable), further `.key` become
+      `Field` accesses on the value it produced. Completes record access (stored
+      record properties, not just `{lit}.field`). 1 test (stored record, nested
+      read + absent→NULL).
+- [ ] G2d. Dotted-path property index: createIndex on a record field path +
+      planner seek `n.k.sub = $x` into it (the perf slice; the memory's 140x seek).
 - [ ] F5c. Gremlin multi-label select('a','b') (a Map value — needs G2) and
       order(local) (within-list sort — needs list ops). Relocated from F5b; placed
       after G2 because it depends on the map/list value model.
