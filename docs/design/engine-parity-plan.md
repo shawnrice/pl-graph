@@ -82,7 +82,10 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
 
 ### Phase C — Persistence
 
-- [ ] C1. NDJSON egress (nodes + edges).
+- [x] C1. NDJSON egress (nodes + edges): dependency-free hand-rolled JSON writer
+      (`ndjson::to_ndjson`); one object per live node `{id,labels,props}` then per
+      edge `{from,to,type,props}`; deterministic (nodes by id, keys sorted);
+      NaN/Inf→null. Serializes only — value semantics stay in value.rs.
 - [ ] C2. NDJSON ingest.
 - [ ] C3. Schema/snapshot round-trip.
 

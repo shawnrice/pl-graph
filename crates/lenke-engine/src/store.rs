@@ -355,6 +355,46 @@ impl Store {
         self.props.get(key)
     }
 
+    // --- Enumeration (for egress / snapshot) -----------------------------
+
+    /// All node-property keys, sorted — a deterministic field order for dumps.
+    #[must_use]
+    pub fn prop_keys(&self) -> Vec<String> {
+        let mut k: Vec<String> = self.props.keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    /// All edge-property keys, sorted.
+    #[must_use]
+    pub fn edge_prop_keys(&self) -> Vec<String> {
+        let mut k: Vec<String> = self.edge_props.keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    /// The labels carried by node `id`, sorted.
+    #[must_use]
+    pub fn labels_of(&self, id: u32) -> Vec<String> {
+        let mut ls: Vec<String> = self
+            .by_label
+            .iter()
+            .filter(|(_, ids)| ids.contains(&id))
+            .map(|(l, _)| l.clone())
+            .collect();
+        ls.sort();
+        ls
+    }
+
+    /// The interned edge-type id's name (the reverse of `etype_id`).
+    #[must_use]
+    pub fn etype_name(&self, etype: u32) -> Option<String> {
+        self.etype_ids
+            .iter()
+            .find(|(_, &id)| id == etype)
+            .map(|(name, _)| name.clone())
+    }
+
     // --- Unique constraints ----------------------------------------------
     //
     // A unique constraint declares that at most one live node with `label` may
