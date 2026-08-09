@@ -181,6 +181,59 @@ impl Column {
             | Self::Gen { present, .. } => present[i] = false,
         }
     }
+
+    /// Drop the last node slot — the inverse of `push_absent`, used when a
+    /// transaction rolls back the node that a logged `add_node` appended.
+    fn pop_last(&mut self) {
+        match self {
+            Self::Num { data, present } => {
+                data.pop();
+                present.pop();
+            }
+            Self::Str { data, present } => {
+                data.pop();
+                present.pop();
+            }
+            Self::Bool { data, present } => {
+                data.pop();
+                present.pop();
+            }
+            Self::Gen { data, present } => {
+                data.pop();
+                present.pop();
+            }
+        }
+    }
+}
+
+/// One entry in a transaction's undo log — the inverse of a single mutation,
+/// captured with just enough prior state to reverse it exactly. Applied in
+/// reverse order on rollback, with logging disabled so undos do not re-log.
+enum Undo {
+    /// Undo `add_node`: pop the last (highest-id) node. Adds grow `node_count`
+    /// monotonically, so reverse-order undo always pops the current top.
+    AddNode,
+    /// Undo `add_edge`: delete the edge by its id from both endpoints.
+    AddEdge { u: u32, v: u32, eid: u32 },
+    /// Undo `set_prop`/`remove_prop`: restore the cell to its prior state.
+    RestoreCell {
+        node: u32,
+        key: String,
+        prev_present: bool,
+        prev_value: Value,
+    },
+    /// Undo `delete_edge`: re-insert the exact adjacency entries removed, each
+    /// tagged `(node, is_out, adj)` so it goes back to the right list.
+    RestoreEdge { entries: Vec<(u32, bool, Adj)> },
+    /// Undo `delete_node`: un-tombstone and restore its adjacency (both its own
+    /// lists and the neighbours' mirrors), label memberships, and properties.
+    RestoreNode {
+        id: u32,
+        out: Vec<Adj>,
+        inc: Vec<Adj>,
+        labels: Vec<String>,
+        props: Vec<(String, bool, Value)>,
+    },
 }
 
 /// One adjacency entry: the neighbour node, the edge's interned type id, and the
@@ -217,6 +270,9 @@ pub struct Store {
     /// dense and never reused) but is skipped by every scan and carries no edges
     /// or properties. `deleted.len() == node_count`.
     deleted: Vec<bool>,
+    /// the active transaction's undo log, or `None` outside a transaction
+    /// (autocommit — mutations apply directly and record nothing).
+    undo: Option<Vec<Undo>>,
 }
 
 impl Store {
@@ -308,7 +364,12 @@ impl Store {
             self.by_label.entry((*l).to_string()).or_default().push(id);
         }
         for (k, v) in props {
-            self.set_prop(id, k, v.clone());
+            // Apply the initial props directly; the single AddNode undo (which
+            // pops the whole node) reverses them, so they are not logged twice.
+            self.apply_set_prop(id, k, v.clone());
+        }
+        if let Some(log) = &mut self.undo {
+            log.push(Undo::AddNode);
         }
         id
     }
@@ -334,11 +395,40 @@ impl Store {
             etype,
             eid,
         });
+        if let Some(log) = &mut self.undo {
+            log.push(Undo::AddEdge {
+                u: from,
+                v: to,
+                eid,
+            });
+        }
+    }
+
+    /// Whether node `node` carries a present value for `key` (distinct from a
+    /// present `Null`, which `prop` cannot tell from absence).
+    #[must_use]
+    pub fn has_prop(&self, node: u32, key: &str) -> bool {
+        self.props
+            .get(key)
+            .is_some_and(|c| c.present_at(node as usize))
     }
 
     /// Set node `node`'s `key` to `value`, creating the column if new and
     /// promoting it to `Gen` if `value`'s type differs from the column's.
     pub fn set_prop(&mut self, node: u32, key: &str, value: Value) {
+        let rec = self.undo.is_some().then(|| Undo::RestoreCell {
+            node,
+            key: key.to_string(),
+            prev_present: self.has_prop(node, key),
+            prev_value: self.prop(node, key),
+        });
+        self.apply_set_prop(node, key, value);
+        if let (Some(rec), Some(log)) = (rec, self.undo.as_mut()) {
+            log.push(rec);
+        }
+    }
+
+    fn apply_set_prop(&mut self, node: u32, key: &str, value: Value) {
         let n = self.node_count;
         let col = self
             .props
@@ -353,6 +443,19 @@ impl Store {
     /// Remove node `node`'s `key` — it reads as NULL again. (Distinct from setting
     /// it to a stored `Null`; that distinction is a Phase-E concern.)
     pub fn remove_prop(&mut self, node: u32, key: &str) {
+        let rec = self.undo.is_some().then(|| Undo::RestoreCell {
+            node,
+            key: key.to_string(),
+            prev_present: self.has_prop(node, key),
+            prev_value: self.prop(node, key),
+        });
+        self.apply_remove_prop(node, key);
+        if let (Some(rec), Some(log)) = (rec, self.undo.as_mut()) {
+            log.push(rec);
+        }
+    }
+
+    fn apply_remove_prop(&mut self, node: u32, key: &str) {
         if let Some(col) = self.props.get_mut(key) {
             col.set_absent(node as usize);
         }
@@ -364,13 +467,32 @@ impl Store {
     /// was its source (so it is safe to call with the endpoints in either order,
     /// e.g. from a hop matched via incoming adjacency). A no-op if already gone.
     pub fn delete_edge(&mut self, u: u32, v: u32, eid: u32) {
+        let logging = self.undo.is_some();
+        let mut removed: Vec<(u32, bool, Adj)> = Vec::new();
         for node in [u, v] {
             if let Some(adj) = self.out_adj.get_mut(node as usize) {
+                if logging {
+                    removed.extend(
+                        adj.iter()
+                            .filter(|a| a.eid == eid)
+                            .map(|a| (node, true, *a)),
+                    );
+                }
                 adj.retain(|a| a.eid != eid);
             }
             if let Some(adj) = self.in_adj.get_mut(node as usize) {
+                if logging {
+                    removed.extend(
+                        adj.iter()
+                            .filter(|a| a.eid == eid)
+                            .map(|a| (node, false, *a)),
+                    );
+                }
                 adj.retain(|a| a.eid != eid);
             }
+        }
+        if let Some(log) = &mut self.undo {
+            log.push(Undo::RestoreEdge { entries: removed });
         }
     }
 
@@ -383,6 +505,24 @@ impl Store {
         if self.deleted[i] {
             return;
         }
+        // Capture the full prior state BEFORE mutating, if a transaction is open.
+        let (labels, props) = if self.undo.is_some() {
+            let labels = self
+                .by_label
+                .iter()
+                .filter(|(_, b)| b.contains(&id))
+                .map(|(k, _)| k.clone())
+                .collect();
+            let props = self
+                .props
+                .iter()
+                .map(|(k, c)| (k.clone(), c.present_at(i), c.read(i)))
+                .collect();
+            (labels, props)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         // Detach each incident edge's mirror entry on the neighbour, by eid.
         let out = std::mem::take(&mut self.out_adj[i]);
         for a in &out {
@@ -404,6 +544,178 @@ impl Store {
             col.set_absent(i);
         }
         self.deleted[i] = true;
+
+        if let Some(log) = &mut self.undo {
+            log.push(Undo::RestoreNode {
+                id,
+                out,
+                inc,
+                labels,
+                props,
+            });
+        }
+    }
+
+    // --- Transactions ----------------------------------------------------
+    //
+    // An undo log makes a group of mutations atomic. `begin` opens it; every
+    // mutation then records its inverse; `commit` discards the log (changes
+    // stand); `rollback` applies the inverses in reverse. `savepoint`/`rollback_to`
+    // give per-statement atomicity within a transaction (a statement rolls back
+    // to its savepoint on failure without abandoning the whole transaction).
+    // Constraint checks and event buffering are deferred to Phase H.
+
+    /// Open a transaction. Panics if one is already open (no nesting yet).
+    pub fn begin(&mut self) {
+        assert!(self.undo.is_none(), "nested transactions are not supported");
+        self.undo = Some(Vec::new());
+    }
+
+    /// Commit: the changes stand and the undo log is discarded.
+    pub fn commit(&mut self) {
+        self.undo = None;
+    }
+
+    /// Roll back every change since `begin`, in reverse, and close the
+    /// transaction. A no-op outside a transaction.
+    pub fn rollback(&mut self) {
+        if let Some(log) = self.undo.take() {
+            // `undo` is now None, so the inverse mutations below do not re-log.
+            for rec in log.into_iter().rev() {
+                self.apply_undo(rec);
+            }
+        }
+    }
+
+    /// A mark for per-statement atomicity: the current undo-log length. Zero
+    /// outside a transaction.
+    #[must_use]
+    pub fn savepoint(&self) -> usize {
+        self.undo.as_ref().map_or(0, Vec::len)
+    }
+
+    /// Undo every change recorded after `mark`, keeping the transaction open and
+    /// the changes up to `mark`. Used to roll back a single failed statement.
+    pub fn rollback_to(&mut self, mark: usize) {
+        if let Some(mut log) = self.undo.take() {
+            let mut undone = Vec::new();
+            while log.len() > mark {
+                undone.push(log.pop().expect("len > mark"));
+            }
+            // `undo` is None while applying, so these inverses do not re-log.
+            for rec in undone {
+                self.apply_undo(rec);
+            }
+            self.undo = Some(log);
+        }
+    }
+
+    /// Run `f` in a transaction: commit if it returns `Ok`, roll back if `Err`.
+    /// (Does not catch panics — an unwinding closure leaves the log un-applied;
+    /// panic-safety is a later concern.)
+    pub fn transaction<T, E>(
+        &mut self,
+        f: impl FnOnce(&mut Store) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.begin();
+        match f(self) {
+            Ok(v) => {
+                self.commit();
+                Ok(v)
+            }
+            Err(e) => {
+                self.rollback();
+                Err(e)
+            }
+        }
+    }
+
+    /// Apply one undo record. The caller has taken the log out (`self.undo` is
+    /// `None`), so the primitive mutations invoked here do not re-log.
+    fn apply_undo(&mut self, rec: Undo) {
+        match rec {
+            Undo::AddNode => self.pop_last_node(),
+            Undo::AddEdge { u, v, eid } => self.delete_edge(u, v, eid),
+            Undo::RestoreCell {
+                node,
+                key,
+                prev_present,
+                prev_value,
+            } => {
+                if prev_present {
+                    self.apply_set_prop(node, &key, prev_value);
+                } else {
+                    self.apply_remove_prop(node, &key);
+                }
+            }
+            Undo::RestoreEdge { entries } => {
+                for (node, is_out, adj) in entries {
+                    if is_out {
+                        self.out_adj[node as usize].push(adj);
+                    } else {
+                        self.in_adj[node as usize].push(adj);
+                    }
+                }
+            }
+            Undo::RestoreNode {
+                id,
+                out,
+                inc,
+                labels,
+                props,
+            } => {
+                let i = id as usize;
+                self.deleted[i] = false;
+                // Restore mirrors on OTHER nodes; self-loops live in id's own
+                // lists and are restored by the assignments below.
+                for a in &out {
+                    if a.nbr != id {
+                        self.in_adj[a.nbr as usize].push(Adj {
+                            nbr: id,
+                            etype: a.etype,
+                            eid: a.eid,
+                        });
+                    }
+                }
+                for a in &inc {
+                    if a.nbr != id {
+                        self.out_adj[a.nbr as usize].push(Adj {
+                            nbr: id,
+                            etype: a.etype,
+                            eid: a.eid,
+                        });
+                    }
+                }
+                self.out_adj[i] = out;
+                self.in_adj[i] = inc;
+                for l in labels {
+                    self.by_label.entry(l).or_default().push(id);
+                }
+                for (k, present, value) in props {
+                    if present {
+                        self.apply_set_prop(id, &k, value);
+                    } else {
+                        self.apply_remove_prop(id, &k);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pop the last (highest-id) node — the inverse of a logged `add_node`.
+    fn pop_last_node(&mut self) {
+        debug_assert!(self.node_count > 0);
+        let id = (self.node_count - 1) as u32;
+        for b in self.by_label.values_mut() {
+            b.retain(|&x| x != id);
+        }
+        for col in self.props.values_mut() {
+            col.pop_last();
+        }
+        self.out_adj.pop();
+        self.in_adj.pop();
+        self.deleted.pop();
+        self.node_count -= 1;
     }
 }
 
@@ -477,6 +789,7 @@ impl Builder {
             // Incremental edges continue the id sequence the build laid down.
             next_eid: edge_count,
             deleted: vec![false; n],
+            undo: None,
         }
     }
 }
@@ -661,5 +974,134 @@ mod tests {
         assert!(!st.is_alive(a));
         assert!(st.out(a).is_empty());
         assert!(st.inc(a).is_empty());
+    }
+
+    // --- Transactions ---
+
+    /// Commit keeps the changes; the log is discarded.
+    #[test]
+    fn commit_keeps_changes() {
+        let mut st = Builder::default().build();
+        st.begin();
+        let a = st.add_node(&["P"], &[("name", s("a"))]);
+        st.commit();
+        assert_eq!(st.node_count(), 1);
+        assert!(matches!(st.prop(a, "name"), Value::Str(x) if &*x == "a"));
+    }
+
+    /// Rolling back an `add_node` truly removes it: node_count returns to 0 and
+    /// the columns shrink back (not merely tombstoned).
+    #[test]
+    fn rollback_add_node_shrinks_back() {
+        let mut st = Builder::default().build();
+        st.begin();
+        st.add_node(&["P"], &[("name", s("a"))]);
+        st.add_node(&["P"], &[("name", s("b"))]);
+        assert_eq!(st.node_count(), 2);
+        st.rollback();
+        assert_eq!(st.node_count(), 0);
+        assert!(st.all_nodes().is_empty());
+        assert!(st.nodes_with_label("P").is_empty());
+    }
+
+    /// Rolling back `set_prop` restores the exact prior cell (present value).
+    #[test]
+    fn rollback_set_prop_restores_value() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[("age", n(30.0))]); // committed (autocommit)
+        st.begin();
+        st.set_prop(a, "age", n(99.0));
+        st.set_prop(a, "age", s("oops")); // also promotes column to Gen
+        assert!(matches!(st.prop(a, "age"), Value::Str(x) if &*x == "oops"));
+        st.rollback();
+        assert!(matches!(st.prop(a, "age"), Value::Num(x) if x == 30.0));
+    }
+
+    /// Rolling back a newly-set property (absent before) makes it absent again.
+    #[test]
+    fn rollback_new_prop_becomes_absent() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[]);
+        st.begin();
+        st.set_prop(a, "age", n(30.0));
+        st.rollback();
+        assert!(st.prop(a, "age").is_null());
+        assert!(!st.has_prop(a, "age"));
+    }
+
+    /// Rolling back `add_edge` removes it from both endpoints.
+    #[test]
+    fn rollback_add_edge() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&[], &[]);
+        let b = st.add_node(&[], &[]);
+        st.begin();
+        st.add_edge(a, b, "R");
+        st.rollback();
+        assert!(st.out(a).is_empty());
+        assert!(st.inc(b).is_empty());
+    }
+
+    /// Rolling back `delete_node` restores it fully: tombstone, adjacency (its own
+    /// lists AND the neighbours' mirrors), label membership, and properties.
+    /// Hand-traced on a→b, b→c: delete b, then roll back → identical to before.
+    #[test]
+    fn rollback_delete_node_restores_everything() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[("name", s("a"))]);
+        let b = st.add_node(&["P"], &[("name", s("b"))]);
+        let c = st.add_node(&["P"], &[("name", s("c"))]);
+        st.add_edge(a, b, "R");
+        st.add_edge(b, c, "R");
+        st.begin();
+        st.delete_node(b);
+        assert!(!st.is_alive(b));
+        st.rollback();
+
+        assert!(st.is_alive(b));
+        assert_eq!(st.nodes_with_label("P").len(), 3);
+        assert!(matches!(st.prop(b, "name"), Value::Str(x) if &*x == "b"));
+        // adjacency restored on all three nodes
+        assert_eq!(st.out(a).len(), 1); // a→b
+        assert_eq!(st.out(a)[0].nbr, b);
+        assert_eq!(st.out(b).len(), 1); // b→c
+        assert_eq!(st.out(b)[0].nbr, c);
+        assert_eq!(st.inc(b).len(), 1); // a→b mirror
+        assert_eq!(st.inc(c).len(), 1); // b→c mirror
+    }
+
+    /// `savepoint` + `rollback_to` give per-statement atomicity: the first
+    /// statement's writes survive, the second's are undone, the transaction stays
+    /// open, and the final commit keeps only the first.
+    #[test]
+    fn savepoint_rolls_back_one_statement() {
+        let mut st = Builder::default().build();
+        st.begin();
+        let a = st.add_node(&["P"], &[("name", s("a"))]); // statement 1
+        let mark = st.savepoint();
+        let b = st.add_node(&["P"], &[("name", s("b"))]); // statement 2
+        st.add_edge(a, b, "R");
+        st.rollback_to(mark); // undo statement 2 only
+        assert_eq!(st.node_count(), 1); // b popped
+        assert!(st.out(a).is_empty()); // edge gone
+        st.commit();
+        assert_eq!(st.node_count(), 1);
+        assert!(matches!(st.prop(a, "name"), Value::Str(x) if &*x == "a"));
+    }
+
+    /// `transaction` commits on `Ok` and rolls back on `Err`.
+    #[test]
+    fn transaction_commits_ok_rolls_back_err() {
+        let mut st = Builder::default().build();
+        let r: Result<u32, ()> = st.transaction(|s| Ok(s.add_node(&["P"], &[])));
+        assert!(r.is_ok());
+        assert_eq!(st.node_count(), 1);
+
+        let r: Result<(), &str> = st.transaction(|s| {
+            s.add_node(&["P"], &[]);
+            Err("boom")
+        });
+        assert_eq!(r, Err("boom"));
+        assert_eq!(st.node_count(), 1); // the aborted add was rolled back
     }
 }

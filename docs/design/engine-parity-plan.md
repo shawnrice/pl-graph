@@ -35,8 +35,9 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
 - [x] A2. Deletion: `delete_edge`, `delete_node` (tombstone + adjacency cleanup).
       (tombstone bitmap; dense ids never reused; mirrors detached by eid; scans
       skip via all_nodes/label buckets — no exec change needed.)
-- [ ] A3. Transactions: undo-log wrapper, `commit`/`rollback`, per-statement
-      atomicity.
+- [x] A3. Transactions: undo-log wrapper, `commit`/`rollback`, per-statement
+      atomicity. (each mutation records its inverse; begin/commit/rollback +
+      savepoint/rollback_to + transaction(); deferred checks & events = Phase H.)
 
 ### Phase B — Write statements in both languages
 
