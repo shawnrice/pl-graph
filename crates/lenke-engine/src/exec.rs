@@ -415,8 +415,8 @@ fn needs_lineage(plan: &Plan) -> bool {
                 branches.iter().any(|(c, v)| reads_path(c) || reads_path(v))
                     || otherwise.as_deref().is_some_and(reads_path)
             }
-            Expr::Cast { expr, .. } => reads_path(expr),
-            Expr::Slot(_) | Expr::Prop { .. } | Expr::Lit(_) => false,
+            Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => reads_path(expr),
+            Expr::Slot(_) | Expr::Prop { .. } | Expr::Lit(_) | Expr::PropertyExists { .. } => false,
         }
     }
     match plan {
@@ -1329,7 +1329,8 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
                 && otherwise.as_deref().is_none_or(|e| refs_only_slot(e, s))
         }
         Expr::Compare { left, right, .. } => refs_only_slot(left, s) && refs_only_slot(right, s),
-        Expr::Cast { expr, .. } => refs_only_slot(expr, s),
+        Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => refs_only_slot(expr, s),
+        Expr::PropertyExists { slot, .. } => *slot == s,
     }
 }
 
@@ -1380,6 +1381,14 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         Expr::Cast { target, expr } => Expr::Cast {
             target: *target,
             expr: go(expr),
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: go(expr),
+            negated: *negated,
+        },
+        Expr::PropertyExists { slot, key } => Expr::PropertyExists {
+            slot: if *slot == from { to } else { *slot },
+            key: key.clone(),
         },
     }
 }
@@ -1821,6 +1830,26 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             }
             Col::Gen(out)
         }
+        Expr::IsNull { expr, negated } => {
+            // A definite Bool per row (never NULL): `IS NULL` is TRUE exactly when
+            // the value is Null; `IS NOT NULL` flips it.
+            let col = eval(expr, store, batch)?;
+            Col::Bool(
+                (0..col.len())
+                    .map(|i| col.value_at(i).is_null() != *negated)
+                    .collect(),
+            )
+        }
+        Expr::PropertyExists { slot, key } => {
+            // Presence, not value: true iff the element carries a stored value for
+            // `key`. Only nodes carry the presence bitmap here (edge-property
+            // existence is deferred); a non-node slot has no property → FALSE.
+            let out: Vec<bool> = match batch.slot(*slot) {
+                Col::Nodes(ids) => ids.iter().map(|&id| store.has_prop(id, key)).collect(),
+                other => vec![false; other.len()],
+            };
+            Col::Bool(out)
+        }
     })
 }
 
@@ -2242,6 +2271,56 @@ mod tests {
         )]);
         let err = try_run(&plan, &store).unwrap_err();
         assert!(err.contains("E_INVALID_VALUE"), "got: {err}");
+    }
+
+    #[test]
+    fn is_null_projects_definite_bools() {
+        // A scan of all nodes: the three Persons carry `age`, the Project node
+        // does not. `age IS NULL` must be a definite Bool for EVERY row (never a
+        // Null/UNKNOWN), TRUE only where the value is absent.
+        let store = social();
+        let plan = Plan::Scan { label: None }.project(vec![(
+            "n".into(),
+            Expr::IsNull {
+                expr: Box::new(prop(0, "age")),
+                negated: false,
+            },
+        )]);
+        let out = run(&plan, &store);
+        // Every value is a concrete boolean — none is Null.
+        assert!(out.rows.iter().all(|r| matches!(r[0], Value::Bool(_))));
+        let trues = out
+            .rows
+            .iter()
+            .filter(|r| matches!(r[0], Value::Bool(true)))
+            .count();
+        assert_eq!(trues, 1); // only the Project node lacks `age`
+    }
+
+    #[test]
+    fn property_exists_separates_present_null_from_absent() {
+        // node 0: age present-null, node 1: age absent. PROPERTY_EXISTS is a
+        // presence test, so it is TRUE for the present-null and FALSE for absent —
+        // the distinction `IS NOT NULL` (both FALSE) cannot draw.
+        let mut b = Builder::default();
+        b.node(&["P"], &[("name", s("null"))]);
+        b.node(&["P"], &[("name", s("absent"))]);
+        let mut store = b.build();
+        store.set_prop(0, "age", Value::Null);
+
+        let exists = Plan::Scan {
+            label: Some("P".into()),
+        }
+        .project(vec![(
+            "e".into(),
+            Expr::PropertyExists {
+                slot: 0,
+                key: "age".into(),
+            },
+        )]);
+        let out = run(&exists, &store);
+        assert!(matches!(out.rows[0][0], Value::Bool(true))); // present-null
+        assert!(matches!(out.rows[1][0], Value::Bool(false))); // absent
     }
 
     #[test]

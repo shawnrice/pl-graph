@@ -172,7 +172,12 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
         (INTEGER/INT, FLOAT/…, STRING/…, BOOL/BOOLEAN). Throws E_INVALID_VALUE
         on failure, INTEGER truncates toward zero, null→null, broad conversions.
         9 tests (value table, per-row eval, fault via try_run, parse vs hand plan).
-- [ ] E6. 3VL completeness: `IS NULL`, property-exists, `AND`/`OR`/`NOT` gaps.
+- [x] E6. 3VL completeness: `<e> IS [NOT] NULL` (a definite Bool, never
+      UNKNOWN — value test) and `PROPERTY_EXISTS(<var>, <key>)` (presence test,
+      the one predicate that separates an absent property from a present-null).
+      IR `Expr::IsNull`/`PropertyExists`, eval + GQL parse, 4 tests (value-vs-
+      presence distinction cross-checked against hand plans). AND/OR/NOT already
+      complete from Phase E.
 
 ### Phase F — Query surface
 

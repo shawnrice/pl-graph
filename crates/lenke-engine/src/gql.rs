@@ -905,6 +905,18 @@ impl Parser {
     fn cmp_expr(&mut self) -> Result<Expr, String> {
         // Comparison operands are arithmetic expressions (arith binds tighter).
         let left = self.add_expr()?;
+        // Postfix `IS [NOT] NULL` — a definite null test, checked before the
+        // binary comparison operators (a value is one or the other, not both).
+        if self.eat_kw("IS") {
+            let negated = self.eat_kw("NOT");
+            if !self.eat_kw("NULL") {
+                return Err("expected NULL after IS [NOT]".into());
+            }
+            return Ok(Expr::IsNull {
+                expr: Box::new(left),
+                negated,
+            });
+        }
         let op = match self.peek() {
             Some(Tok::Eq) => CompareOp::Eq,
             Some(Tok::Ne) => CompareOp::Ne,
@@ -1034,6 +1046,11 @@ impl Parser {
                 if s.eq_ignore_ascii_case("cast") {
                     return self.cast_expr();
                 }
+                // PROPERTY_EXISTS(<var>, <key>) — the second arg is a bare
+                // property NAME, not an expression, so it can't ride `call`.
+                if s.eq_ignore_ascii_case("property_exists") {
+                    return self.property_exists_expr();
+                }
                 // A scalar function call `name(args…)`. (Aggregates are handled in
                 // return_items, never reached here.)
                 if self.peek() == Some(&Tok::LParen) {
@@ -1102,6 +1119,22 @@ impl Parser {
         };
         self.expect(&Tok::RParen)?;
         Ok(Expr::Cast { target, expr })
+    }
+
+    // property_exists := PROPERTY_EXISTS '(' var ',' key ')'. Both operands are
+    // bare names: the variable resolves to a slot, the key stays a literal
+    // property name. Presence-not-value — see `Expr::PropertyExists`.
+    fn property_exists_expr(&mut self) -> Result<Expr, String> {
+        self.expect(&Tok::LParen)?;
+        let var = self.ident()?;
+        let slot = *self
+            .scope
+            .get(&var)
+            .ok_or_else(|| format!("unknown variable `{var}`"))?;
+        self.expect(&Tok::Comma)?;
+        let key = self.ident()?;
+        self.expect(&Tok::RParen)?;
+        Ok(Expr::PropertyExists { slot, key })
     }
 
     // call := name '(' [ expr (',' expr)* ] ')'  — a scalar function.
@@ -1275,6 +1308,108 @@ mod tests {
         );
         // An unknown target type is a parse error, not a silent fallback.
         assert!(super::parse("MATCH (p:Person) RETURN CAST(p.age AS WIDGET) AS a").is_err());
+    }
+
+    /// A store with all three null states on `P.age`: present non-null, absent,
+    /// and present-null. These are what separate `IS NULL` (a value test) from
+    /// `PROPERTY_EXISTS` (a presence test).
+    fn null_states() -> Store {
+        let mut b = Builder::default();
+        b.node(&["P"], &[("name", s("has")), ("age", n(30.0))]);
+        b.node(&["P"], &[("name", s("absent"))]);
+        b.node(&["P"], &[("name", s("null"))]);
+        let mut st = b.build();
+        st.set_prop(2, "age", Value::Null); // node 2: present, but Null
+        st
+    }
+
+    /// The set of `name` values a query returns, sorted — order is unspecified.
+    fn names(store: &Store, query: &str) -> Vec<String> {
+        let out = run(&super::parse(query).unwrap(), store);
+        let mut got: Vec<String> = out
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Str(x) => x.to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        got.sort();
+        got
+    }
+
+    #[test]
+    fn is_null_is_a_value_test() {
+        use crate::ir::{Expr, Plan};
+        let st = null_states();
+        // IS NULL is TRUE for both absent and present-null; IS NOT NULL only for
+        // the present non-null. (A definite predicate — no row is UNKNOWN.)
+        assert_eq!(
+            names(&st, "MATCH (p:P) WHERE p.age IS NULL RETURN p.name"),
+            vec!["absent", "null"]
+        );
+        assert_eq!(
+            names(&st, "MATCH (p:P) WHERE p.age IS NOT NULL RETURN p.name"),
+            vec!["has"]
+        );
+        // Parse cross-check against the hand-built plan.
+        let hand = Plan::Scan {
+            label: Some("P".into()),
+        }
+        .filter(Expr::IsNull {
+            expr: Box::new(Expr::Prop {
+                slot: 0,
+                key: "age".into(),
+            }),
+            negated: false,
+        })
+        .project(vec![(
+            "name".into(),
+            Expr::Prop {
+                slot: 0,
+                key: "name".into(),
+            },
+        )]);
+        assert_same(
+            "MATCH (p:P) WHERE p.age IS NULL RETURN p.name AS name",
+            &hand,
+            &st,
+        );
+    }
+
+    #[test]
+    fn property_exists_is_a_presence_test() {
+        use crate::ir::{Expr, Plan};
+        let st = null_states();
+        // PROPERTY_EXISTS is TRUE wherever the value is PRESENT — including the
+        // present-null — and FALSE only for the absent node. This is the case
+        // `IS NOT NULL` cannot express: "null" appears here but not above.
+        assert_eq!(
+            names(
+                &st,
+                "MATCH (p:P) WHERE PROPERTY_EXISTS(p, age) RETURN p.name"
+            ),
+            vec!["has", "null"]
+        );
+        let hand = Plan::Scan {
+            label: Some("P".into()),
+        }
+        .filter(Expr::PropertyExists {
+            slot: 0,
+            key: "age".into(),
+        })
+        .project(vec![(
+            "name".into(),
+            Expr::Prop {
+                slot: 0,
+                key: "name".into(),
+            },
+        )]);
+        assert_same(
+            "MATCH (p:P) WHERE PROPERTY_EXISTS(p, age) RETURN p.name AS name",
+            &hand,
+            &st,
+        );
     }
 
     #[test]

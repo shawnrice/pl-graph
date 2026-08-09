@@ -77,6 +77,21 @@ pub enum Expr {
         target: CastTarget,
         expr: Box<Expr>,
     },
+    /// `<expr> IS [NOT] NULL`. A definite predicate — always TRUE or FALSE, never
+    /// UNKNOWN — which is the point of a 3VL null test: `NULL IS NULL` is TRUE,
+    /// not NULL. `negated` flips it to `IS NOT NULL`.
+    IsNull {
+        expr: Box<Expr>,
+        negated: bool,
+    },
+    /// `PROPERTY_EXISTS(<var>, <key>)`: true iff the element in `slot` carries a
+    /// *present* value for `key`, regardless of that value. This is the one
+    /// predicate that separates an absent property from a present `Null` (null is
+    /// a first-class stored value), which `<var>.<key> IS NOT NULL` cannot.
+    PropertyExists {
+        slot: usize,
+        key: String,
+    },
 }
 
 /// The target type of a `CAST`. The engine has one numeric type (`f64`), so
