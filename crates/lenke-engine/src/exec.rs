@@ -454,7 +454,10 @@ fn group_by<K: std::hash::Hash + Eq>(
 /// bumps, not a million heap allocations + copies. Lookups borrow `&str`, so a
 /// repeated string never touches the allocator.
 fn group_by_arc(keys: &[Arc<str>]) -> (Vec<u32>, Vec<usize>) {
-    let mut of: FnvMap<Arc<str>, u32> = FnvMap::default();
+    // Pre-size for the worst case (all-distinct) so the map never rehashes while
+    // filling — the rehash chain dominated an all-unique million-key merge.
+    let mut of: FnvMap<Arc<str>, u32> =
+        FnvMap::with_capacity_and_hasher(keys.len(), Default::default());
     let mut group_of = Vec::with_capacity(keys.len());
     let mut first_row = Vec::new();
     for (i, k) in keys.iter().enumerate() {
@@ -2357,6 +2360,7 @@ mod perf {
             "MATCH (p:Person) WHERE p.age > 90 RETURN p.name",
             "MATCH (a:Person)-[:R]->(b) RETURN count(*) AS c",
             "MATCH (a:Person)-[:R]->(b) RETURN b.name AS who, count(*) AS c",
+            "MATCH (a:Person)-[:R]->(b) RETURN b.age AS age, count(*) AS c",
             "MATCH (a:Person)-[:R]->()-[:R]->(c) RETURN count(DISTINCT c) AS c",
             "MATCH (a:Person)-[:R]->(b)-[:R]->(c) RETURN count(*) AS c",
         ] {
