@@ -2124,9 +2124,58 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             Value::List(v) => v.last().cloned().unwrap_or(Value::Null),
             _ => Value::Null,
         },
+        // Temporal component accessors (1 arg → number, or NULL when the component
+        // is undefined for that kind, e.g. year() of a time).
+        "year" | "month" | "day" | "hour" | "minute" | "second" => match &args[0] {
+            Value::Temporal(t) => date_part(name, *t).map_or(Value::Null, |n| Value::Num(n as f64)),
+            _ => Value::Null,
+        },
         // Path accessors (nodes/relationships/path_length/elements) are not scalar
         // Call functions — they read the lineage sidecar via `Expr::PathAccess`.
         _ => Value::Null, // parser rejects unknown names; defensive
+    }
+}
+
+/// Extract a calendar/clock component from a temporal value. `None` when the
+/// component is undefined for that kind (`year`/`month`/`day` of a time-only
+/// value, or `hour`/`minute`/`second` of a date). Zoned values decompose in their
+/// stored offset (the local wall clock), as they render; euclidean division so
+/// pre-epoch instants floor correctly. Ported from lenke-core for agreement.
+fn date_part(func: &str, t: crate::temporal::Temporal) -> Option<i64> {
+    use crate::temporal::{civil_from_days, Temporal};
+    const SPD: i64 = 86_400;
+    match func {
+        "year" | "month" | "day" => {
+            let days = match t {
+                Temporal::Date(x) => i64::from(x.days),
+                Temporal::DateTime(x) => x.secs.div_euclid(SPD),
+                Temporal::ZonedDateTime(x) => (x.secs + i64::from(x.offset) * 60).div_euclid(SPD),
+                _ => return None,
+            };
+            let (y, m, d) = civil_from_days(days);
+            Some(match func {
+                "year" => y,
+                "month" => i64::from(m),
+                _ => i64::from(d),
+            })
+        }
+        "hour" | "minute" | "second" => {
+            let tod = match t {
+                Temporal::Time(x) => i64::from(x.secs),
+                Temporal::DateTime(x) => x.secs.rem_euclid(SPD),
+                Temporal::ZonedTime(x) => {
+                    (i64::from(x.secs) + i64::from(x.offset) * 60).rem_euclid(SPD)
+                }
+                Temporal::ZonedDateTime(x) => (x.secs + i64::from(x.offset) * 60).rem_euclid(SPD),
+                _ => return None,
+            };
+            Some(match func {
+                "hour" => tod / 3600,
+                "minute" => (tod / 60) % 60,
+                _ => tod % 60,
+            })
+        }
+        _ => None,
     }
 }
 

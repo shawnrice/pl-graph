@@ -1495,7 +1495,8 @@ impl Parser {
         let arity_ok = match lname.as_str() {
             // 1 arg
             "abs" | "sign" | "floor" | "ceil" | "round" | "sqrt" | "upper" | "lower" | "trim"
-            | "length" | "size" | "head" | "last" => args.len() == 1,
+            | "length" | "size" | "head" | "last" | "year" | "month" | "day" | "hour"
+            | "minute" | "second" => args.len() == 1,
             // 2 args
             "starts_with" | "ends_with" | "contains" => args.len() == 2,
             // 3 args
@@ -2287,6 +2288,43 @@ mod tests {
         assert_eq!(iso(&col(&out, 0, "zt")), "13:45:00Z");
         // A malformed duration literal is a parse error.
         assert!(super::parse("MATCH (p:Person) RETURN DURATION 'nope' AS d").is_err());
+    }
+
+    #[test]
+    fn temporal_component_accessors() {
+        let store = social();
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) RETURN year(DATE '2024-03-15') AS y, \
+                 month(DATE '2024-03-15') AS mo, day(DATE '2024-03-15') AS d, \
+                 hour(TIME '13:45:06') AS h, minute(TIME '13:45:06') AS mi, \
+                 second(TIME '13:45:06') AS se, year(DATETIME '2020-07-04T09:30:00') AS dty",
+            )
+            .unwrap(),
+            &store,
+        );
+        for (name, want) in [
+            ("y", 2024.0),
+            ("mo", 3.0),
+            ("d", 15.0),
+            ("h", 13.0),
+            ("mi", 45.0),
+            ("se", 6.0),
+            ("dty", 2020.0),
+        ] {
+            assert_eq!(num(&col(&out, 0, name)), want, "{name}");
+        }
+        // A component undefined for the kind is NULL (year of a time, hour of a date).
+        let out2 = run(
+            &super::parse(
+                "MATCH (p:Person) RETURN year(TIME '01:02:03') AS y, \
+                 hour(DATE '2024-01-01') AS h",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert!(col(&out2, 0, "y").is_null());
+        assert!(col(&out2, 0, "h").is_null());
     }
 
     #[test]

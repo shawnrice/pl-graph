@@ -247,9 +247,14 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       kinds now parse/format/order via the temporal module; GQL literals DURATION
       '…' and two-word ZONED TIME/DATETIME '…'. 5 tests. (Duration/zoned relational
       `<` uses the total order like the rest of lenke-engine, not rel_cmp UNKNOWN.)
-- [ ] G1c. Temporal storage/codec: typed per-kind SoA `Column::Temporal` (de-box
-      from Gen), NDJSON temporal DECODE (round-trip the tagged form), and temporal
-      scalar functions.
+- [x] G1c. Temporal codec + accessors: NDJSON temporal DECODE (a single-key
+      {"@tag":"iso"} object round-trips back to `Value::Temporal`), and the six
+      component accessors year/month/day/hour/minute/second (ported `date_part`,
+      euclidean, zoned decomposed in their own offset; NULL when undefined for the
+      kind). 2 tests (store→NDJSON→store date round trip, all accessors + NULLs).
+- [ ] G1d. Typed per-kind SoA `Column::Temporal` storage (de-box temporals from
+      the Gen column — a perf/parity refinement; the Gen path is already correct)
+      + temporal constructors (date()/datetime()) and duration.between.
 - [ ] G2. Map/record values (storage, dotted-path, construction, access).
 - [ ] F5c. Gremlin multi-label select('a','b') (a Map value — needs G2) and
       order(local) (within-list sort — needs list ops). Relocated from F5b; placed

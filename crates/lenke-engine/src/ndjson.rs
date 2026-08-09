@@ -312,7 +312,29 @@ fn json_value(j: &Json) -> Result<Value, String> {
         Json::Num(x) => Value::Num(*x),
         Json::Str(s) => Value::Str(Arc::from(s.as_str())),
         Json::Arr(items) => Value::List(items.iter().map(json_value).collect::<Result<_, _>>()?),
-        Json::Obj(_) => return Err("an object is not a valid property value".into()),
+        // A single-key `{"@<tag>":"<iso>"}` object is a tagged temporal — the
+        // inverse of the egress in `encode_value`. Any other object shape is not a
+        // property value.
+        Json::Obj(fields) => {
+            if let [(key, Json::Str(s))] = fields.as_slice() {
+                if let Some(tag) = key.strip_prefix('@') {
+                    if matches!(
+                        tag,
+                        "date"
+                            | "localtime"
+                            | "datetime"
+                            | "zoned_time"
+                            | "zoned_datetime"
+                            | "duration"
+                    ) {
+                        return crate::temporal::Temporal::parse(tag, s)
+                            .map(Value::Temporal)
+                            .map_err(|e| format!("bad temporal value: {e}"));
+                    }
+                }
+            }
+            return Err("an object is not a valid property value".into());
+        }
     })
 }
 
@@ -512,6 +534,31 @@ mod tests {
              {\"id\":1,\"labels\":[\"P\"],\"props\":{\"name\":\"b\"}}\n\
              {\"from\":0,\"to\":1,\"type\":\"R\",\"props\":{\"weight\":0.5}}\n";
         assert_eq!(to_ndjson(&st), expected);
+    }
+
+    /// A temporal property survives an NDJSON round trip: it dumps to the tagged
+    /// form and decodes back to the same value.
+    #[test]
+    fn temporal_props_round_trip() {
+        use crate::temporal::{Date, Temporal};
+        let mut st = Builder::default().build();
+        st.add_node(
+            &["P"],
+            &[(
+                "born",
+                Value::Temporal(Temporal::Date(Date::parse("1990-05-01").unwrap())),
+            )],
+        );
+        let text = to_ndjson(&st);
+        assert!(
+            text.contains("\"born\":{\"@date\":\"1990-05-01\"}"),
+            "egress was: {text}"
+        );
+        let st2 = from_ndjson(&text).unwrap();
+        match st2.prop(0, "born") {
+            Value::Temporal(Temporal::Date(d)) => assert_eq!(d.format(), "1990-05-01"),
+            o => panic!("expected a Date after round trip, got {o:?}"),
+        }
     }
 
     /// A deleted node (and its edges) is absent from the dump.
