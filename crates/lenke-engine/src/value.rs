@@ -88,46 +88,64 @@ pub fn equals(a: &Value, b: &Value) -> bool {
 /// (GROUP BY, DISTINCT, `count(DISTINCT …)`) must treat two NaNs as the same
 /// group and `-0.0`/`0.0` as the same group — the opposite of predicate
 /// equality, where NaN equals nothing. Defining it here, once, is why the two
-/// never drift. A prefix byte keeps types apart so a number and a string that
-/// stringify alike cannot collide.
+/// never drift.
+///
+/// The key is raw bytes, not text: a leading type tag keeps types apart, and
+/// every value is self-delimiting (fixed width, or length-prefixed) so keys
+/// concatenate unambiguously — a multi-column group key is just the columns'
+/// bytes in order, with no separator. Hot callers append into a reused buffer
+/// via [`group_key_into`] to avoid a per-row allocation.
 #[must_use]
-pub fn group_key(v: &Value) -> String {
-    let mut s = String::new();
+pub fn group_key(v: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    group_key_into(v, &mut out);
+    out
+}
+
+/// The canonical bit pattern a number groups by: all NaNs collapse to one
+/// pattern, and `-0.0`/`0.0` collapse to `+0.0` — so each groups with its kind,
+/// the inverse of predicate equality. This is the ONE place that rule lives; a
+/// typed grouping fast path over an `f64` column keys on this instead of boxing
+/// each value through [`group_key_into`].
+#[must_use]
+pub fn num_group_bits(x: f64) -> u64 {
+    if x.is_nan() {
+        f64::NAN.to_bits()
+    } else if x == 0.0 {
+        0.0f64.to_bits()
+    } else {
+        x.to_bits()
+    }
+}
+
+/// Append `v`'s grouping key bytes to `out` — the allocation-free primitive
+/// [`group_key`] wraps. Grouping semantics (NaN canonicalization, `-0.0`/`0.0`
+/// collapse, type separation) live here and nowhere else.
+pub fn group_key_into(v: &Value, out: &mut Vec<u8>) {
     match v {
-        Value::Null => s.push('N'),
+        Value::Null => out.push(0),
         Value::Bool(b) => {
-            s.push('b');
-            s.push(if *b { '1' } else { '0' });
+            out.push(1);
+            out.push(u8::from(*b));
         }
         Value::Num(x) => {
-            s.push('n');
-            // Canonicalize: all NaNs to one bit pattern, and -0.0 to 0.0, so each
-            // groups with its kind.
-            let bits = if x.is_nan() {
-                f64::NAN.to_bits()
-            } else if *x == 0.0 {
-                0.0f64.to_bits()
-            } else {
-                x.to_bits()
-            };
-            s.push_str(&format!("{bits:016x}"));
+            out.push(2);
+            out.extend_from_slice(&num_group_bits(*x).to_le_bytes());
         }
         Value::Str(t) => {
-            s.push('s');
-            s.push_str(t);
+            out.push(3);
+            // Length-prefixed so a string's bytes cannot bleed into the next key.
+            out.extend_from_slice(&(t.len() as u64).to_le_bytes());
+            out.extend_from_slice(t.as_bytes());
         }
         Value::List(items) => {
-            // Length-prefixed element keys so `[a,b]` and `[ab]` cannot collide.
-            s.push('l');
-            s.push_str(&format!("{}:", items.len()));
+            out.push(4);
+            out.extend_from_slice(&(items.len() as u64).to_le_bytes());
             for it in items {
-                let k = group_key(it);
-                s.push_str(&format!("{}:", k.len()));
-                s.push_str(&k);
+                group_key_into(it, out);
             }
         }
     }
-    s
 }
 
 /// A deterministic total order over ANY pair of values — never panics. Used by

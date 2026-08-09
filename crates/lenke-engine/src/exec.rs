@@ -192,17 +192,23 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
         Plan::Distinct { input } => {
             let batch = pull(input, store, track);
             let n = batch.rows();
-            let mut seen = std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            let mut buf = Vec::new();
             let keep: Vec<usize> = (0..n)
                 .filter(|&i| {
                     // Key the whole row across every slot, via the grouping
-                    // notion (NaN/-0 collapse) — never predicate equality.
-                    let mut k = String::new();
+                    // notion (NaN/-0 collapse) — never predicate equality. The
+                    // buffer is reused across rows; only a NEW row allocates.
+                    buf.clear();
                     for c in &batch.slots {
-                        k.push_str(&value::group_key(&c.value_at(i)));
-                        k.push('\u{1}');
+                        value::group_key_into(&c.value_at(i), &mut buf);
                     }
-                    seen.insert(k)
+                    if seen.contains(buf.as_slice()) {
+                        false
+                    } else {
+                        seen.insert(buf.clone());
+                        true
+                    }
                 })
                 .collect();
             batch.gather(&keep)
@@ -218,18 +224,17 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
 /// slot gathered by the matched right rows — so right slot `j` lands at output
 /// slot `left.len() + j`. Keys are `group_key`-hashed (bound-variable identity),
 /// consistent with grouping/distinct.
-fn join_key(batch: &Batch, slots: impl Iterator<Item = usize>, row: usize) -> String {
-    let mut k = String::new();
+fn join_key(batch: &Batch, slots: impl Iterator<Item = usize>, row: usize) -> Vec<u8> {
+    let mut k = Vec::new();
     for s in slots {
-        k.push_str(&value::group_key(&batch.slot(s).value_at(row)));
-        k.push('\u{1}');
+        value::group_key_into(&batch.slot(s).value_at(row), &mut k);
     }
     k
 }
 
 fn hash_join(lb: &Batch, rb: &Batch, on: &[(usize, usize)]) -> Batch {
     // Index the right side by its join key.
-    let mut index: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut index: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
     for j in 0..rb.rows() {
         let k = join_key(rb, on.iter().map(|&(_, r)| r), j);
         index.entry(k).or_default().push(j);
@@ -288,34 +293,25 @@ fn order_page(
 /// columns (one value per group, taken from each group's first row) followed by
 /// the aggregate columns. Group order is first-seen: a group's index is the
 /// order its first row arrived, which is the order it is emitted.
+///
+/// Rows are labelled with a dense group id in a single pass ([`assign_groups`]),
+/// then each aggregate is a single streaming pass over that labelling — so an
+/// aggregate never materializes its group's rows, and `count(*)` is a tally, not
+/// a bucketed list of row indices.
 fn aggregate(batch: &Batch, store: &Store, keys: &[(String, Expr)], aggs: &[Agg]) -> Batch {
     let n = batch.rows();
     let key_cols: Vec<Col> = keys.iter().map(|(_, e)| eval(e, store, batch)).collect();
 
-    // Bucket rows into groups. With no keys the whole input is one group; with a
-    // scalar aggregate over EMPTY input that one group is still emitted (SQL:
-    // `count(*)` over nothing is 0, one row), which is why the empty case is
-    // handled explicitly rather than falling out of the loop.
-    let (rows_of, first_row): (Vec<Vec<usize>>, Vec<usize>) = if keys.is_empty() {
-        (vec![(0..n).collect()], vec![0])
+    // With no keys the whole input is one group, and a scalar aggregate over
+    // EMPTY input still emits that one group (SQL: `count(*)` over nothing is 0,
+    // one row) — hence n_groups is forced to 1 there. A GROUPED aggregate over
+    // empty input has no groups and emits zero rows, which falls out naturally.
+    let (group_of, first_row, n_groups) = if keys.is_empty() {
+        (vec![0u32; n], Vec::new(), 1)
     } else {
-        let mut of: HashMap<String, usize> = HashMap::new();
-        let mut rows_of: Vec<Vec<usize>> = Vec::new();
-        let mut first_row: Vec<usize> = Vec::new();
-        for i in 0..n {
-            let mut k = String::new();
-            for kc in &key_cols {
-                k.push_str(&value::group_key(&kc.value_at(i)));
-                k.push('\u{1}'); // separator: distinct keys never run together
-            }
-            let g = *of.entry(k).or_insert_with(|| {
-                rows_of.push(Vec::new());
-                first_row.push(i);
-                rows_of.len() - 1
-            });
-            rows_of[g].push(i);
-        }
-        (rows_of, first_row)
+        let (g, fr) = assign_groups(&key_cols, n);
+        let ng = fr.len();
+        (g, fr, ng)
     };
 
     // Key output columns: each key's value at its group's first row.
@@ -325,80 +321,205 @@ fn aggregate(batch: &Batch, store: &Store, keys: &[(String, Expr)], aggs: &[Agg]
         key_cols.iter().map(|c| c.gather(&first_row)).collect()
     };
 
-    // Aggregate output columns: fold each agg over each group's rows.
     for agg in aggs {
         let arg_col = agg.arg.as_ref().map(|e| eval(e, store, batch));
-        let out: Vec<Value> = rows_of
-            .iter()
-            .map(|rows| fold_agg(agg, arg_col.as_ref(), rows))
-            .collect();
-        slots.push(Col::Gen(out));
+        slots.push(Col::Gen(fold_grouped(
+            agg,
+            arg_col.as_ref(),
+            &group_of,
+            n_groups,
+        )));
     }
 
     Batch::of(slots)
 }
 
-/// Fold one aggregate over the rows of a single group. Null policy and ordering
-/// come from the value contract; nothing here restates them.
-fn fold_agg(agg: &Agg, arg_col: Option<&Col>, rows: &[usize]) -> Value {
-    // `count(*)` — no argument — is the group's row count.
-    if agg.func == AggFn::Count && agg.arg.is_none() {
-        return Value::Num(rows.len() as f64);
-    }
-    let Some(col) = arg_col else {
-        return Value::Null; // sum/min/max/avg with no argument is undefined
-    };
-    // The non-null argument values of this group.
-    let vals: Vec<Value> = rows
-        .iter()
-        .map(|&i| col.value_at(i))
-        .filter(|v| !v.is_null())
-        .collect();
-
-    match agg.func {
-        AggFn::Count => {
-            if agg.distinct {
-                let mut seen = std::collections::HashSet::new();
-                let n = vals
-                    .iter()
-                    .filter(|v| seen.insert(value::group_key(v)))
-                    .count();
-                Value::Num(n as f64)
-            } else {
-                Value::Num(vals.len() as f64)
-            }
+/// Assign a dense, first-seen group id to every row from its key columns.
+/// Returns `(group_of, first_row)`: `group_of[i]` is row `i`'s group,
+/// `first_row[g]` the row that opened group `g`. A single native key column is
+/// grouped on its raw type with no boxing; anything else falls back to a reused
+/// byte key ([`value::group_key_into`]). Both honor the one grouping contract.
+fn assign_groups(key_cols: &[Col], n: usize) -> (Vec<u32>, Vec<usize>) {
+    if let [only] = key_cols {
+        match only {
+            Col::Num(v) => return group_by(n, v.iter().map(|&x| value::num_group_bits(x))),
+            // Node ids are small non-negative integers: their id IS the key, and
+            // it matches `value_at` (which surfaces a node as `Num(id)`, whose
+            // group bits are the same integer).
+            Col::Nodes(v) => return group_by(n, v.iter().map(|&x| u64::from(x))),
+            Col::Bool(v) => return group_by(n, v.iter().map(|&b| u64::from(b))),
+            Col::Str(v) => return group_by_ref(n, v.iter().map(std::convert::AsRef::as_ref)),
+            Col::Gen(_) => {} // mixed: fall through to the byte-key path
         }
-        AggFn::Sum => sum(&vals),
-        AggFn::Avg => match sum(&vals) {
-            Value::Num(s) if !vals.is_empty() => Value::Num(s / vals.len() as f64),
-            _ => Value::Null,
-        },
-        AggFn::Min => vals
-            .into_iter()
-            .min_by(value::cmp_total)
-            .unwrap_or(Value::Null),
-        AggFn::Max => vals
-            .into_iter()
-            .max_by(value::cmp_total)
-            .unwrap_or(Value::Null),
     }
+    // General path: self-delimiting byte key per row, reused buffer, allocate
+    // only when a row opens a new group.
+    let mut of: HashMap<Vec<u8>, u32> = HashMap::new();
+    let mut group_of = Vec::with_capacity(n);
+    let mut first_row = Vec::new();
+    let mut buf = Vec::new();
+    for i in 0..n {
+        buf.clear();
+        for kc in key_cols {
+            value::group_key_into(&kc.value_at(i), &mut buf);
+        }
+        let g = match of.get(buf.as_slice()) {
+            Some(&g) => g,
+            None => {
+                let g = first_row.len() as u32;
+                of.insert(buf.clone(), g);
+                first_row.push(i);
+                g
+            }
+        };
+        group_of.push(g);
+    }
+    (group_of, first_row)
 }
 
-/// Sum the numeric values. An empty set sums to NULL (SQL), not 0 — only
-/// `count` is 0 over nothing. A non-numeric non-null value makes the sum NULL
-/// rather than coercing to NaN.
-fn sum(vals: &[Value]) -> Value {
-    if vals.is_empty() {
-        return Value::Null;
+/// Group by a per-row key of a `Hash + Eq` type (the typed fast path).
+fn group_by<K: std::hash::Hash + Eq>(
+    n: usize,
+    keys: impl Iterator<Item = K>,
+) -> (Vec<u32>, Vec<usize>) {
+    let mut of: HashMap<K, u32> = HashMap::new();
+    let mut group_of = Vec::with_capacity(n);
+    let mut first_row = Vec::new();
+    for (i, k) in keys.enumerate() {
+        let g = match of.get(&k) {
+            Some(&g) => g,
+            None => {
+                let g = first_row.len() as u32;
+                of.insert(k, g);
+                first_row.push(i);
+                g
+            }
+        };
+        group_of.push(g);
     }
-    let mut total = 0.0;
-    for v in vals {
-        match v {
-            Value::Num(x) => total += x,
-            _ => return Value::Null,
+    (group_of, first_row)
+}
+
+/// Group by a borrowed key (strings): the owned key is cloned only when a row
+/// opens a new group, so a million-row column over a thousand names clones a
+/// thousand `Arc`s, not a million.
+fn group_by_ref<'a>(n: usize, keys: impl Iterator<Item = &'a str>) -> (Vec<u32>, Vec<usize>) {
+    let mut of: HashMap<Box<str>, u32> = HashMap::new();
+    let mut group_of = Vec::with_capacity(n);
+    let mut first_row = Vec::new();
+    for (i, k) in keys.enumerate() {
+        let g = match of.get(k) {
+            Some(&g) => g,
+            None => {
+                let g = first_row.len() as u32;
+                of.insert(Box::from(k), g);
+                first_row.push(i);
+                g
+            }
+        };
+        group_of.push(g);
+    }
+    (group_of, first_row)
+}
+
+/// Fold one aggregate to one value per group in a single streaming pass over the
+/// group labelling. Null policy and ordering come from the value contract;
+/// nothing here restates them.
+fn fold_grouped(agg: &Agg, arg_col: Option<&Col>, group_of: &[u32], n_groups: usize) -> Vec<Value> {
+    // `count(*)` — no argument — is each group's row count: a pure tally.
+    if agg.func == AggFn::Count && agg.arg.is_none() {
+        let mut tally = vec![0f64; n_groups];
+        for &g in group_of {
+            tally[g as usize] += 1.0;
+        }
+        return tally.into_iter().map(Value::Num).collect();
+    }
+    let Some(col) = arg_col else {
+        return vec![Value::Null; n_groups]; // sum/min/max/avg with no argument
+    };
+
+    match agg.func {
+        AggFn::Count if agg.distinct => {
+            // Per-group distinct count. A dedicated set per group, keyed by the
+            // grouping bytes; a group entry is allocated only for a new value.
+            let mut sets: Vec<std::collections::HashSet<Vec<u8>>> = (0..n_groups)
+                .map(|_| std::collections::HashSet::new())
+                .collect();
+            let mut buf = Vec::new();
+            for (i, &g) in group_of.iter().enumerate() {
+                let v = col.value_at(i);
+                if v.is_null() {
+                    continue;
+                }
+                buf.clear();
+                value::group_key_into(&v, &mut buf);
+                let set = &mut sets[g as usize];
+                if !set.contains(buf.as_slice()) {
+                    set.insert(buf.clone());
+                }
+            }
+            sets.iter().map(|s| Value::Num(s.len() as f64)).collect()
+        }
+        AggFn::Count => {
+            // count(arg): non-null values per group.
+            let mut tally = vec![0f64; n_groups];
+            for (i, &g) in group_of.iter().enumerate() {
+                if !col.value_at(i).is_null() {
+                    tally[g as usize] += 1.0;
+                }
+            }
+            tally.into_iter().map(Value::Num).collect()
+        }
+        AggFn::Sum | AggFn::Avg => {
+            // total + count of non-null NUMERIC values; a non-null non-numeric
+            // poisons its group to NULL (never coerced to NaN), and an all-null
+            // (or empty) group is NULL — only count is 0 over nothing.
+            let mut total = vec![0f64; n_groups];
+            let mut cnt = vec![0u64; n_groups];
+            let mut poison = vec![false; n_groups];
+            for (i, &g) in group_of.iter().enumerate() {
+                match col.value_at(i) {
+                    Value::Null => {}
+                    Value::Num(x) => {
+                        total[g as usize] += x;
+                        cnt[g as usize] += 1;
+                    }
+                    _ => poison[g as usize] = true,
+                }
+            }
+            (0..n_groups)
+                .map(|g| {
+                    if poison[g] || cnt[g] == 0 {
+                        Value::Null
+                    } else if agg.func == AggFn::Sum {
+                        Value::Num(total[g])
+                    } else {
+                        Value::Num(total[g] / cnt[g] as f64)
+                    }
+                })
+                .collect()
+        }
+        AggFn::Min | AggFn::Max => {
+            let want_min = agg.func == AggFn::Min;
+            let mut best: Vec<Option<Value>> = vec![None; n_groups];
+            for (i, &g) in group_of.iter().enumerate() {
+                let v = col.value_at(i);
+                if v.is_null() {
+                    continue;
+                }
+                match &best[g as usize] {
+                    None => best[g as usize] = Some(v),
+                    Some(cur) => {
+                        let ord = value::cmp_total(&v, cur);
+                        if (want_min && ord.is_lt()) || (!want_min && ord.is_gt()) {
+                            best[g as usize] = Some(v);
+                        }
+                    }
+                }
+            }
+            best.into_iter().map(|o| o.unwrap_or(Value::Null)).collect()
         }
     }
-    Value::Num(total)
 }
 
 /// A hop: for each input row, expand the node in slot `from` along `dir`,
