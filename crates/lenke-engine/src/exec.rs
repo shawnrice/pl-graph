@@ -741,10 +741,24 @@ fn try_fused_count(
     let src = frontier_ids(inner, store)?; // ids feeding the final hop, w/ multiplicity
 
     if agg.arg.is_none() {
-        // count(*): number of final-hop paths = sum of matching degrees.
+        // count(*): number of final-hop paths = sum over sources of matching
+        // out-degree. When the sources come from an Expand they repeat (many paths
+        // reach the same node), and a node's degree is the same each time — so
+        // collapse to distinct nodes with multiplicity and walk each adjacency
+        // once, scaled. When they come from a Scan they are already distinct, so
+        // that dedup is pure overhead: sum degrees directly.
         let mut total = 0f64;
-        for &v in &src {
-            for_each_nbr(store, v, *dir, want, |_| total += 1.0);
+        if matches!(inner.as_ref(), Plan::Expand { .. }) {
+            let (distinct, mult) = distinct_with_mult(&src, store.node_count());
+            for (i, &v) in distinct.iter().enumerate() {
+                let mut deg = 0f64;
+                for_each_nbr(store, v, *dir, want, |_| deg += 1.0);
+                total += mult[i] * deg;
+            }
+        } else {
+            for &v in &src {
+                for_each_nbr(store, v, *dir, want, |_| total += 1.0);
+            }
         }
         return Some(scalar_num(total));
     }
@@ -757,22 +771,29 @@ fn try_fused_count(
         }
         // The distinct endpoints depend only on the SET of last-hop sources, not
         // their multiplicity: a source reached by many paths yields the same
-        // neighbours each time. Collapsing the (often hugely repeated) frontier to
-        // its distinct nodes first turns a per-path expansion into a per-node one
-        // — for a 2-hop that is millions of repeated sources down to the distinct
-        // intermediate nodes, and the final hop is walked once each.
+        // neighbours each time. When the sources come from an Expand they repeat,
+        // so collapse them to distinct nodes first — a 2-hop's millions of repeated
+        // intermediates down to the distinct nodes, each final hop walked once.
+        // Sources from a Scan are already distinct, so skip that pass.
         let nc = store.node_count();
-        let mut seen_src = vec![false; nc];
-        let mut distinct_src = Vec::new();
-        for &v in &src {
-            if !seen_src[v as usize] {
-                seen_src[v as usize] = true;
-                distinct_src.push(v);
+        let deduped;
+        let sources: &[u32] = if matches!(inner.as_ref(), Plan::Expand { .. }) {
+            let mut seen_src = vec![false; nc];
+            let mut distinct_src = Vec::new();
+            for &v in &src {
+                if !seen_src[v as usize] {
+                    seen_src[v as usize] = true;
+                    distinct_src.push(v);
+                }
             }
-        }
+            deduped = distinct_src;
+            &deduped
+        } else {
+            &src
+        };
         let mut seen = vec![false; nc];
         let mut cnt = 0f64;
-        for &v in &distinct_src {
+        for &v in sources {
             for_each_nbr(store, v, *dir, want, |nbr| {
                 if !seen[nbr as usize] {
                     seen[nbr as usize] = true;
@@ -789,6 +810,25 @@ fn try_fused_count(
 /// result.
 fn scalar_num(x: f64) -> Batch {
     Batch::of(vec![Col::Gen(vec![Value::Num(x)])])
+}
+
+/// Collapse a node-id multiset to (distinct ids in first-seen order, their
+/// multiplicities) via a direct-mapped array — node ids are dense, so no hashing.
+fn distinct_with_mult(nodes: &[u32], node_count_total: usize) -> (Vec<u32>, Vec<f64>) {
+    let mut group_of = vec![u32::MAX; node_count_total];
+    let mut distinct: Vec<u32> = Vec::new();
+    let mut mult: Vec<f64> = Vec::new();
+    for &id in nodes {
+        let slot = &mut group_of[id as usize];
+        if *slot == u32::MAX {
+            *slot = u32::try_from(distinct.len()).expect("distinct count fits in u32");
+            distinct.push(id);
+            mult.push(1.0);
+        } else {
+            mult[*slot as usize] += 1.0;
+        }
+    }
+    (distinct, mult)
 }
 
 /// Does `expr` reference no slot other than `s` (and never the path)? Literals
@@ -1653,6 +1693,30 @@ mod tests {
             .aggregate(vec![], vec![agg(AggFn::Count, None, false, "c")]);
         let out = run(&plan, &store);
         assert_eq!(num(&out.rows[0][0]), 1.0);
+    }
+
+    /// 2-hop `count(*)` where an intermediate is reached by MULTIPLE paths — the
+    /// dedup-with-multiplicity path must scale by how many times it was reached.
+    /// a→x, b→x (x reached twice), x→p, x→q. Length-2 walks: a→x→{p,q} and
+    /// b→x→{p,q} = 4 (x itself reaches p,q which are sinks).
+    #[test]
+    fn fused_count_star_two_hop_with_multiplicity() {
+        let mut bld = Builder::default();
+        let a = bld.node(&["P"], &[]);
+        let b = bld.node(&["P"], &[]);
+        let x = bld.node(&["P"], &[]);
+        let p = bld.node(&["P"], &[]);
+        let q = bld.node(&["P"], &[]);
+        bld.edge(a, x, "R");
+        bld.edge(b, x, "R");
+        bld.edge(x, p, "R");
+        bld.edge(x, q, "R");
+        let store = bld.build();
+        let plan = scan("P")
+            .expand(0, Dir::Out, Some("R"))
+            .expand(1, Dir::Out, Some("R"))
+            .aggregate(vec![], vec![agg(AggFn::Count, None, false, "c")]);
+        assert_eq!(num(&run(&plan, &store).rows[0][0]), 4.0);
     }
 
     /// `count(DISTINCT c)` over the two-hop chain: the distinct endpoints are
