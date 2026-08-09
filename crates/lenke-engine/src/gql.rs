@@ -1496,9 +1496,10 @@ impl Parser {
             // 1 arg
             "abs" | "sign" | "floor" | "ceil" | "round" | "sqrt" | "upper" | "lower" | "trim"
             | "length" | "size" | "head" | "last" | "year" | "month" | "day" | "hour"
-            | "minute" | "second" => args.len() == 1,
+            | "minute" | "second" | "date" | "local_time" | "datetime" | "local_datetime"
+            | "zoned_time" | "zoned_datetime" | "duration" => args.len() == 1,
             // 2 args
-            "starts_with" | "ends_with" | "contains" => args.len() == 2,
+            "starts_with" | "ends_with" | "contains" | "duration_between" => args.len() == 2,
             // 3 args
             "replace" => args.len() == 3,
             // 2 or 3 args
@@ -2325,6 +2326,63 @@ mod tests {
         );
         assert!(col(&out2, 0, "y").is_null());
         assert!(col(&out2, 0, "h").is_null());
+    }
+
+    #[test]
+    fn temporal_constructors_and_coercion() {
+        let store = social();
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) RETURN \
+                 date('2024-03-15') AS d1, \
+                 datetime('2024-03-15') AS d2, \
+                 date(DATETIME '2024-03-15T09:30:00') AS d3, \
+                 datetime(DATE '2024-03-15') AS d4, \
+                 local_time(DATETIME '2024-03-15T09:30:45') AS d5, \
+                 duration('P1Y2M') AS d6",
+            )
+            .unwrap(),
+            &store,
+        );
+        let iso = |v: &Value| match v {
+            Value::Temporal(t) => t.format(),
+            o => panic!("expected Temporal, got {o:?}"),
+        };
+        assert_eq!(iso(&col(&out, 0, "d1")), "2024-03-15"); // parse
+        assert_eq!(iso(&col(&out, 0, "d2")), "2024-03-15T00:00:00"); // date-str → midnight
+        assert_eq!(iso(&col(&out, 0, "d3")), "2024-03-15"); // datetime → date part
+        assert_eq!(iso(&col(&out, 0, "d4")), "2024-03-15T00:00:00"); // date → midnight
+        assert_eq!(iso(&col(&out, 0, "d5")), "09:30:45"); // datetime → time part
+        assert_eq!(iso(&col(&out, 0, "d6")), "P14M"); // 1Y2M canonical
+                                                      // A malformed constructor argument is NULL, not an error.
+        let out2 = run(
+            &super::parse("MATCH (p:Person) RETURN date('garbage') AS d").unwrap(),
+            &store,
+        );
+        assert!(col(&out2, 0, "d").is_null());
+    }
+
+    #[test]
+    fn duration_between_is_exact() {
+        let store = social();
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) RETURN \
+                 duration_between(DATE '2020-01-15', DATE '2020-04-20') AS a, \
+                 duration_between(DATETIME '2020-01-01T00:00:00', \
+                 DATETIME '2020-01-01T01:01:01') AS b, \
+                 duration_between(DATE '2020-01-01', DATETIME '2020-01-01T00:00:00') AS c",
+            )
+            .unwrap(),
+            &store,
+        );
+        let iso = |v: &Value| match v {
+            Value::Temporal(t) => t.format(),
+            o => panic!("expected Temporal, got {o:?}"),
+        };
+        assert_eq!(iso(&col(&out, 0, "a")), "P96D"); // 96 days (2020 is a leap year)
+        assert_eq!(iso(&col(&out, 0, "b")), "PT3661S"); // 1h1m1s
+        assert!(col(&out, 0, "c").is_null()); // cross-kind → NULL
     }
 
     #[test]

@@ -2130,6 +2130,18 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             Value::Temporal(t) => date_part(name, *t).map_or(Value::Null, |n| Value::Num(n as f64)),
             _ => Value::Null,
         },
+        // Temporal constructors: parse a string, or coerce between kinds.
+        "date" => temporal_ctor(&args[0], "date"),
+        "local_time" => temporal_ctor(&args[0], "localtime"),
+        "datetime" | "local_datetime" => temporal_ctor(&args[0], "datetime"),
+        "zoned_time" => temporal_ctor(&args[0], "zoned_time"),
+        "zoned_datetime" => temporal_ctor(&args[0], "zoned_datetime"),
+        "duration" => temporal_ctor(&args[0], "duration"),
+        // The exact span from a to b (b - a), in fixed units; cross-kind → NULL.
+        "duration_between" => match (&args[0], &args[1]) {
+            (Value::Temporal(x), Value::Temporal(y)) => duration_between(*x, *y),
+            _ => Value::Null,
+        },
         // Path accessors (nodes/relationships/path_length/elements) are not scalar
         // Call functions — they read the lineage sidecar via `Expr::PathAccess`.
         _ => Value::Null, // parser rejects unknown names; defensive
@@ -2176,6 +2188,79 @@ fn date_part(func: &str, t: crate::temporal::Temporal) -> Option<i64> {
             })
         }
         _ => None,
+    }
+}
+
+/// Temporal constructor: build a temporal of `kind` from a string (parsed) or
+/// coerce another temporal into it (`date(datetime)` → the date part,
+/// `datetime(date)` → midnight, `local_time(datetime)` → the time-of-day). A
+/// bare `YYYY-MM-DD` string to a datetime target coerces to midnight. Anything
+/// with no sensible conversion → NULL. Ported from lenke-core for agreement.
+fn temporal_ctor(v: &Value, kind: &str) -> Value {
+    use crate::temporal::{Date, DateTime, Temporal, Time};
+    const SPD: i64 = 86_400;
+    match v {
+        // A date-only string to a datetime target → midnight.
+        Value::Str(s) if kind == "datetime" && !s.contains(['T', ' ']) => Date::parse(s)
+            .map(|d| {
+                Value::Temporal(Temporal::DateTime(DateTime {
+                    secs: i64::from(d.days) * SPD,
+                    nanos: 0,
+                }))
+            })
+            .unwrap_or(Value::Null),
+        Value::Str(s) => Temporal::parse(kind, s)
+            .map(Value::Temporal)
+            .unwrap_or(Value::Null),
+        Value::Temporal(t) => match (kind, t) {
+            ("date", Temporal::Date(_))
+            | ("localtime", Temporal::Time(_))
+            | ("datetime", Temporal::DateTime(_))
+            | ("duration", Temporal::Duration(_)) => Value::Temporal(*t),
+            ("date", Temporal::DateTime(dt)) => Value::Temporal(Temporal::Date(Date {
+                days: dt.secs.div_euclid(SPD) as i32,
+            })),
+            ("localtime", Temporal::DateTime(dt)) => Value::Temporal(Temporal::Time(Time {
+                secs: u32::try_from(dt.secs.rem_euclid(SPD)).expect("0..86_400"),
+                nanos: dt.nanos,
+            })),
+            ("datetime", Temporal::Date(d)) => Value::Temporal(Temporal::DateTime(DateTime {
+                secs: i64::from(d.days) * SPD,
+                nanos: 0,
+            })),
+            _ => Value::Null, // e.g. duration(date) — no sensible conversion
+        },
+        _ => Value::Null,
+    }
+}
+
+/// The EXACT span from `a` to `b` (b − a), in fixed units only: whole days for
+/// two dates, seconds+nanos for two datetimes. Any cross-kind pair (or a
+/// duration operand) → NULL. Ported from lenke-core.
+fn duration_between(a: crate::temporal::Temporal, b: crate::temporal::Temporal) -> Value {
+    use crate::temporal::{Duration, Temporal};
+    match (a, b) {
+        (Temporal::Date(x), Temporal::Date(y)) => Value::Temporal(Temporal::Duration(Duration {
+            months: 0,
+            days: i64::from(y.days) - i64::from(x.days),
+            secs: 0,
+            nanos: 0,
+        })),
+        (Temporal::DateTime(x), Temporal::DateTime(y)) => {
+            let mut secs = y.secs - x.secs;
+            let mut nanos = i64::from(y.nanos) - i64::from(x.nanos);
+            if nanos < 0 {
+                nanos += 1_000_000_000;
+                secs -= 1;
+            }
+            Value::Temporal(Temporal::Duration(Duration {
+                months: 0,
+                days: 0,
+                secs,
+                nanos: u32::try_from(nanos).expect("0..1e9 after carry"),
+            }))
+        }
+        _ => Value::Null,
     }
 }
 

@@ -258,8 +258,16 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       one-kind-per-column model. Both the SET/add_node path (new_absent) and the
       Builder (materialize) build it; reads/egress/round-trip observably identical.
       1 store test (typed column + mixed-kind promotion).
-- [ ] G1e. Temporal constructors date()/datetime()/etc. and duration.between /
-      duration arithmetic (the remaining temporal scalar surface).
+- [x] G1e. Temporal constructors + duration_between: date()/local_time()/
+      datetime()(+local_datetime)/zoned_time()/zoned_datetime()/duration() parse a
+      string or coerce between kinds (date↔datetime midnight, datetime→time part,
+      date-str→midnight); duration_between(a,b) is the exact span (days for
+      dates, secs+nanos for datetimes, cross-kind→NULL). Ported from lenke-core.
+      2 tests. Duration arithmetic (instant ± duration, duration ± duration,
+      duration × int, with overflow faults) → G1f.
+- [ ] G1f. Temporal arithmetic: instant ± duration (add_months clamped, then
+      days, then time; date-overflow throws), duration ± duration (component-wise),
+      duration × integer — wired into the `+`/`-`/`*` operator via value.rs.
 - [ ] G2. Map/record values (storage, dotted-path, construction, access).
 - [ ] F5c. Gremlin multi-label select('a','b') (a Map value — needs G2) and
       order(local) (within-list sort — needs list ops). Relocated from F5b; placed
