@@ -375,9 +375,11 @@ fn needs_lineage(plan: &Plan) -> bool {
         }
     }
     match plan {
-        Plan::Scan { .. } | Plan::Insert { .. } | Plan::Merge { .. } | Plan::AddEdge { .. } => {
-            false
-        }
+        Plan::Scan { .. }
+        | Plan::IndexSeek { .. }
+        | Plan::Insert { .. }
+        | Plan::Merge { .. }
+        | Plan::AddEdge { .. } => false,
         Plan::Expand { input, .. }
         | Plan::VarLength { input, .. }
         | Plan::ShortestPath { input, .. }
@@ -420,6 +422,14 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
                 Some(l) => store.nodes_with_label(l).to_vec(),
                 None => store.all_nodes(),
             };
+            let mut batch = Batch::single(Col::Nodes(ids.clone()));
+            if track {
+                batch.lineage = Some(Lineage::seed(&ids));
+            }
+            batch
+        }
+        Plan::IndexSeek { label, key, value } => {
+            let ids = index_seek_ids(store, label, key, value);
             let mut batch = Batch::single(Col::Nodes(ids.clone()));
             if track {
                 batch.lineage = Some(Lineage::seed(&ids));
@@ -921,6 +931,34 @@ fn expand(
     out
 }
 
+/// The nodes with `label` whose property `key` equals `value` under predicate
+/// `=` — the rows an `IndexSeek` produces. Uses a property index when present
+/// (candidates intersected with the label), else scans the label and filters by
+/// `value::equals`. A NaN/NULL literal matches nothing (as `=` does).
+fn index_seek_ids(store: &Store, label: &str, key: &str, value: &Value) -> Vec<u32> {
+    if value.is_null() || matches!(value, Value::Num(x) if x.is_nan()) {
+        return Vec::new();
+    }
+    match store.index_lookup(key, value) {
+        Some(cands) => {
+            // group_key == equals for a finite, non-null value, so the index
+            // bucket is exact; just intersect with the label.
+            let in_label: std::collections::HashSet<u32> =
+                store.nodes_with_label(label).iter().copied().collect();
+            cands
+                .into_iter()
+                .filter(|id| in_label.contains(id))
+                .collect()
+        }
+        None => store
+            .nodes_with_label(label)
+            .iter()
+            .copied()
+            .filter(|&id| value::equals(&store.prop(id, key), value))
+            .collect(),
+    }
+}
+
 /// Visit each neighbour of `v` along `dir` matching edge type `want`, calling `f`
 /// with `(neighbour, eid)`. The one place Expand's adjacency walk is spelled —
 /// shared by the batch operator and the frontier executor so the two can never
@@ -947,7 +985,8 @@ fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: Option<u32>, mut f: impl 
 /// Join, VarLength, …). The frontier executor only handles such chains.
 fn chain_width(plan: &Plan) -> Option<usize> {
     match plan {
-        Plan::Scan { .. } => Some(1),
+        // A seek, like a scan, seeds a single-slot frontier.
+        Plan::Scan { .. } | Plan::IndexSeek { .. } => Some(1),
         // A bind_edge Expand appends TWO slots (edge then node), else one.
         Plan::Expand {
             input, bind_edge, ..
@@ -975,6 +1014,7 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
             Some(l) => store.nodes_with_label(l).to_vec(),
             None => store.all_nodes(),
         }),
+        Plan::IndexSeek { label, key, value } => Some(index_seek_ids(store, label, key, value)),
         Plan::Expand {
             input,
             from,
@@ -1925,6 +1965,112 @@ mod tests {
         let mut got = names_of(&out, 0);
         got.sort();
         assert_eq!(got, vec!["alice", "carol"]);
+    }
+
+    // --- Property index + IndexSeek (D1a) ---
+
+    /// A store with two labels sharing an `age` property (some age 30).
+    fn indexed_store() -> Store {
+        let mut st = Builder::default().build();
+        st.add_node(&["P"], &[("age", n(30.0)), ("name", s("a"))]);
+        st.add_node(&["P"], &[("age", n(25.0)), ("name", s("b"))]);
+        st.add_node(&["P"], &[("age", n(30.0)), ("name", s("c"))]);
+        st.add_node(&["Q"], &[("age", n(30.0)), ("name", s("d"))]); // other label
+        st
+    }
+
+    /// `IndexSeek` returns the SAME rows as `Scan + Filter(=)`, with and without
+    /// an index. P nodes with age 30 are a and c (d is a Q, excluded).
+    #[test]
+    fn index_seek_matches_scan_filter() {
+        let mut st = indexed_store();
+        let seek = Plan::IndexSeek {
+            label: "P".into(),
+            key: "age".into(),
+            value: n(30.0),
+        }
+        .project(vec![("name".into(), prop(0, "name"))]);
+        let filt = scan("P")
+            .filter(cmp(CompareOp::Eq, prop(0, "age"), lit(n(30.0))))
+            .project(vec![("name".into(), prop(0, "name"))]);
+
+        let mut want = names_of(&run(&filt, &st), 0);
+        want.sort();
+        assert_eq!(want, vec!["a", "c"]);
+        let mut got = names_of(&run(&seek, &st), 0);
+        got.sort();
+        assert_eq!(got, want); // no index yet (scan fallback)
+
+        st.create_index("age");
+        let mut got = names_of(&run(&seek, &st), 0);
+        got.sort();
+        assert_eq!(got, want); // index path, same rows
+    }
+
+    /// The index is maintained through set/remove/delete.
+    #[test]
+    fn index_maintained_on_writes() {
+        let mut st = indexed_store();
+        st.create_index("age");
+        let sorted = |st: &Store| {
+            let mut v = st.index_lookup("age", &n(30.0)).unwrap();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(sorted(&st), vec![0, 2, 3]); // any-label candidates
+        st.set_prop(0, "age", n(25.0)); // 0 leaves the 30 bucket
+        assert_eq!(sorted(&st), vec![2, 3]);
+        st.delete_node(2); // 2 gone
+        assert_eq!(sorted(&st), vec![3]);
+        st.remove_prop(3, "age"); // 3 loses the prop
+        assert!(st.index_lookup("age", &n(30.0)).unwrap().is_empty());
+    }
+
+    /// A transaction rollback restores the index (writes replay through the
+    /// primitives, which maintain it).
+    #[test]
+    fn index_consistent_after_rollback() {
+        let mut st = indexed_store();
+        st.create_index("age");
+        st.begin();
+        st.set_prop(0, "age", n(99.0));
+        st.delete_node(2);
+        st.rollback();
+        let mut v = st.index_lookup("age", &n(30.0)).unwrap();
+        v.sort_unstable();
+        assert_eq!(v, vec![0, 2, 3]);
+    }
+
+    /// A NaN / NULL seek value matches nothing (predicate `=` semantics), same as
+    /// the filter — even though those values live in a group_key bucket.
+    #[test]
+    fn index_seek_nan_and_null_match_nothing() {
+        let mut st = indexed_store();
+        st.create_index("age");
+        let seek = |v: Value| {
+            Plan::IndexSeek {
+                label: "P".into(),
+                key: "age".into(),
+                value: v,
+            }
+            .project(vec![("name".into(), prop(0, "name"))])
+        };
+        assert_eq!(run(&seek(n(f64::NAN)), &st).rows.len(), 0);
+        assert_eq!(run(&seek(Value::Null), &st).rows.len(), 0);
+    }
+
+    /// A scalar count over an IndexSeek is correct (the seek seeds like a scan).
+    #[test]
+    fn count_over_index_seek() {
+        let mut st = indexed_store();
+        st.create_index("age");
+        let plan = Plan::IndexSeek {
+            label: "P".into(),
+            key: "age".into(),
+            value: n(30.0),
+        }
+        .aggregate(vec![], vec![agg(AggFn::Count, None, false, "c")]);
+        assert_eq!(num(&run(&plan, &st).rows[0][0]), 2.0);
     }
 
     /// Reversed operand order (`literal < prop`) must match `prop > literal` —

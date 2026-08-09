@@ -289,6 +289,17 @@ pub struct Store {
     /// edge's props are left behind (eids are never reused, so a dead eid is never
     /// read); reclaiming them is a later tidy.
     edge_props: HashMap<String, HashMap<u32, Value>>,
+    /// hash indexes on a node property `key`: value's group-key bytes -> node ids
+    /// (any label; the seek intersects with the label). Maintained on writes
+    /// through the primitives, so a transaction rollback (which replays the
+    /// primitives) keeps them consistent.
+    indexes: Vec<Index>,
+}
+
+/// A hash index on one node property `key`.
+struct Index {
+    key: String,
+    map: HashMap<Vec<u8>, Vec<u32>>,
 }
 
 impl Store {
@@ -574,6 +585,13 @@ impl Store {
     }
 
     fn apply_set_prop(&mut self, node: u32, key: &str, value: Value) {
+        // Index upkeep: capture the old key BEFORE writing (reads first, then the
+        // column write, then the index write — distinct fields, no borrow clash).
+        let indexed = self.is_indexed(key);
+        let old_gk = (indexed && self.has_prop(node, key))
+            .then(|| crate::value::group_key(&self.prop(node, key)));
+        let new_gk = indexed.then(|| crate::value::group_key(&value));
+
         let n = self.node_count;
         let col = self
             .props
@@ -583,6 +601,13 @@ impl Store {
             *col = col.to_gen();
         }
         col.set(node as usize, value);
+
+        if let Some(gk) = old_gk {
+            self.index_bucket_remove(key, &gk, node);
+        }
+        if let Some(gk) = new_gk {
+            self.index_bucket_add(key, gk, node);
+        }
     }
 
     /// Remove node `node`'s `key` — it reads as NULL again. (Distinct from setting
@@ -601,8 +626,14 @@ impl Store {
     }
 
     fn apply_remove_prop(&mut self, node: u32, key: &str) {
+        // Drop the node from the index bucket for its OLD value, if indexed.
+        let old_gk = (self.is_indexed(key) && self.has_prop(node, key))
+            .then(|| crate::value::group_key(&self.prop(node, key)));
         if let Some(col) = self.props.get_mut(key) {
             col.set_absent(node as usize);
+        }
+        if let Some(gk) = old_gk {
+            self.index_bucket_remove(key, &gk, node);
         }
     }
 
@@ -643,6 +674,92 @@ impl Store {
             .insert(eid, value);
         if let (Some(rec), Some(log)) = (rec, self.undo.as_mut()) {
             log.push(rec);
+        }
+    }
+
+    // --- Property indexes ------------------------------------------------
+    //
+    // A hash index on a node property `key`, mapping a value's grouping bytes to
+    // the node ids carrying it. Built from current data on create and maintained
+    // by the mutation primitives (so rollback, which replays them, stays
+    // consistent). Index equality is grouping (group_key) — the seek layer maps
+    // that to predicate `=` (NaN/null match nothing) so results match a scan.
+
+    /// Create a hash index on node property `key` (idempotent). Builds from the
+    /// current live nodes that carry the property.
+    pub fn create_index(&mut self, key: &str) {
+        if self.indexes.iter().any(|i| i.key == key) {
+            return;
+        }
+        let mut map: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
+        if let Some(col) = self.props.get(key) {
+            for id in 0..self.node_count {
+                if !self.deleted[id] && col.present_at(id) {
+                    map.entry(crate::value::group_key(&col.read(id)))
+                        .or_default()
+                        .push(id as u32);
+                }
+            }
+        }
+        self.indexes.push(Index {
+            key: key.to_string(),
+            map,
+        });
+    }
+
+    #[must_use]
+    fn is_indexed(&self, key: &str) -> bool {
+        self.indexes.iter().any(|i| i.key == key)
+    }
+
+    /// Candidate node ids (ANY label) whose `key` groups equal to `value`, or
+    /// `None` if no index exists on `key`. Deleted ids are filtered out.
+    #[must_use]
+    pub fn index_lookup(&self, key: &str, value: &Value) -> Option<Vec<u32>> {
+        let idx = self.indexes.iter().find(|i| i.key == key)?;
+        let gk = crate::value::group_key(value);
+        Some(
+            idx.map
+                .get(&gk)
+                .map(|ids| {
+                    ids.iter()
+                        .copied()
+                        .filter(|&id| !self.deleted[id as usize])
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
+    }
+
+    fn index_bucket_add(&mut self, key: &str, gk: Vec<u8>, node: u32) {
+        if let Some(idx) = self.indexes.iter_mut().find(|i| i.key == key) {
+            idx.map.entry(gk).or_default().push(node);
+        }
+    }
+
+    fn index_bucket_remove(&mut self, key: &str, gk: &[u8], node: u32) {
+        if let Some(idx) = self.indexes.iter_mut().find(|i| i.key == key) {
+            if let Some(bucket) = idx.map.get_mut(gk) {
+                bucket.retain(|&x| x != node);
+            }
+        }
+    }
+
+    /// Remove node `id`'s entries from every index (used by delete/pop).
+    fn index_drop_node(&mut self, id: u32) {
+        let removals: Vec<(String, Vec<u8>)> = self
+            .indexes
+            .iter()
+            .filter(|ix| self.has_prop(id, &ix.key))
+            .map(|ix| {
+                (
+                    ix.key.clone(),
+                    crate::value::group_key(&self.prop(id, &ix.key)),
+                )
+            })
+            .collect();
+        for (k, gk) in removals {
+            self.index_bucket_remove(&k, &gk, id);
         }
     }
 
@@ -705,6 +822,8 @@ impl Store {
         if self.deleted[i] {
             return;
         }
+        // Drop the node from any property indexes (reads its props, still present).
+        self.index_drop_node(id);
         // Capture the full prior state BEFORE mutating, if a transaction is open.
         let (labels, props) = if self.undo.is_some() {
             let labels = self
@@ -916,6 +1035,8 @@ impl Store {
     fn pop_last_node(&mut self) {
         debug_assert!(self.node_count > 0);
         let id = (self.node_count - 1) as u32;
+        // Drop it from any indexes while its props still exist.
+        self.index_drop_node(id);
         for b in self.by_label.values_mut() {
             b.retain(|&x| x != id);
         }
@@ -1002,6 +1123,7 @@ impl Builder {
             undo: None,
             unique: Vec::new(),
             edge_props: HashMap::new(),
+            indexes: Vec::new(),
         }
     }
 }

@@ -38,6 +38,7 @@ fn map_children(plan: Plan) -> (Plan, bool) {
     match plan {
         // Leaves: no children to rewrite.
         p @ (Plan::Scan { .. }
+        | Plan::IndexSeek { .. }
         | Plan::Insert { .. }
         | Plan::Merge { .. }
         | Plan::AddEdge { .. }) => (p, false),
@@ -267,7 +268,7 @@ fn merge_max(a: Option<usize>, b: Option<usize>) -> Option<usize> {
 /// exist below an operator for pushdown legality.
 fn width(plan: &Plan) -> usize {
     match plan {
-        Plan::Scan { .. } => 1,
+        Plan::Scan { .. } | Plan::IndexSeek { .. } => 1,
         // Writes carry no output row.
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Merge { .. } | Plan::AddEdge { .. } => 0,
 
@@ -480,9 +481,11 @@ mod tests {
             Plan::Join { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)
             }
-            Plan::Scan { .. } | Plan::Insert { .. } | Plan::Merge { .. } | Plan::AddEdge { .. } => {
-                false
-            }
+            Plan::Scan { .. }
+            | Plan::IndexSeek { .. }
+            | Plan::Insert { .. }
+            | Plan::Merge { .. }
+            | Plan::AddEdge { .. } => false,
         }
     }
 

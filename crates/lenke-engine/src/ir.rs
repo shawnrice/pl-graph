@@ -92,6 +92,15 @@ pub enum Plan {
     /// Seed the frontier into slot 0: a label bucket, or the universe when
     /// `label` is None.
     Scan { label: Option<String> },
+    /// Seed slot 0 with the nodes carrying `label` whose property `key` equals
+    /// `value` under predicate `=`. Produces exactly the rows of
+    /// `Scan(label) + Filter(key = value)`; uses a property index when one exists,
+    /// otherwise scans the label. A NaN/NULL `value` matches nothing (as `=`).
+    IndexSeek {
+        label: String,
+        key: String,
+        value: Value,
+    },
     /// Hop from the element in `from` slot along `dir`/`edge_label`, appending the
     /// landed node as a new slot. Rows without a matching neighbour drop; rows
     /// with several fan out (one output row per neighbour), replicating the

@@ -99,7 +99,16 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
 
 ### Phase D — Indexes & planner seeding
 
-- [ ] D1. Property (hash) index + planner seek on `=` / inline `{k:v}` / `$param`.
+- D1. Property (hash) index + planner seek, split:
+  - [x] D1a. Store hash index (`create_index(key)`, key-only, maintained through
+        the mutation primitives so rollback stays consistent; `index_lookup`) + IR
+        `IndexSeek{label,key,value}` executed as index-or-scan with EXACT `=`
+        semantics (NaN/null match nothing; group_key == equals for finite non-null;
+        candidates intersect the label). NOTE: label-scoped index (true
+        O(candidates), avoiding the label HashSet build) is a perf follow-up.
+  - [ ] D1b. Optimizer rule: `Scan(label)+Filter(prop = lit)` → `IndexSeek`, for
+        BOTH spellings (`prop = v`, `v = prop`); same-rows-as-scan+filter test
+        (equivalent_spellings_cost_the_same).
 - [ ] D2. Range index + seek on `<,<=,>,>=` and `BETWEEN`.
 - [ ] D3. Edge-type index; interval/temporal index.
 
