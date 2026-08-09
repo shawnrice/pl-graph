@@ -118,6 +118,50 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Rows {
                 rows: Vec::new(),
             }
         }
+        Plan::Update { input, ops } => {
+            // Read phase: run the match and compute every (node, key, value?) to
+            // apply, into OWNED data — so the immutable borrow ends before the
+            // write phase mutates. Only node slots are updatable.
+            enum Applied {
+                Set(u32, String, Value),
+                Remove(u32, String),
+            }
+            let mut applied: Vec<Applied> = Vec::new();
+            {
+                let track = needs_lineage(input);
+                let batch = pull(input, store, track);
+                for op in ops {
+                    match op {
+                        crate::ir::SetOp::Set { slot, key, value } => {
+                            let vals = eval(value, store, &batch);
+                            if let Col::Nodes(ids) = batch.slot(*slot) {
+                                for (i, &id) in ids.iter().enumerate() {
+                                    applied.push(Applied::Set(id, key.clone(), vals.value_at(i)));
+                                }
+                            }
+                        }
+                        crate::ir::SetOp::Remove { slot, key } => {
+                            if let Col::Nodes(ids) = batch.slot(*slot) {
+                                for &id in ids {
+                                    applied.push(Applied::Remove(id, key.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Write phase: apply in row order (last write wins per node+key).
+            for a in applied {
+                match a {
+                    Applied::Set(node, key, value) => store.set_prop(node, &key, value),
+                    Applied::Remove(node, key) => store.remove_prop(node, &key),
+                }
+            }
+            Rows {
+                names: Vec::new(),
+                rows: Vec::new(),
+            }
+        }
         _ => run(plan, store),
     }
 }
@@ -169,6 +213,13 @@ fn needs_lineage(plan: &Plan) -> bool {
             keys.iter().any(|k| reads_path(&k.expr)) || needs_lineage(input)
         }
         Plan::Join { left, right, .. } => needs_lineage(left) || needs_lineage(right),
+        Plan::Update { input, ops } => {
+            needs_lineage(input)
+                || ops.iter().any(|op| match op {
+                    crate::ir::SetOp::Set { value, .. } => reads_path(value),
+                    crate::ir::SetOp::Remove { .. } => false,
+                })
+        }
     }
 }
 
@@ -178,8 +229,8 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
     match plan {
         // A write plan is never pulled (a read sub-plan cannot contain one); it
         // is run through `execute`. Yield an empty batch if it somehow reaches
-        // here so `run` on a bare Insert is a harmless no-op rather than a panic.
-        Plan::Insert { .. } => Batch::of(Vec::new()),
+        // here so `run` on a bare write is a harmless no-op rather than a panic.
+        Plan::Insert { .. } | Plan::Update { .. } => Batch::of(Vec::new()),
         Plan::Scan { label } => {
             let ids = match label {
                 Some(l) => store.nodes_with_label(l).to_vec(),
@@ -1568,6 +1619,34 @@ mod tests {
         assert_eq!(store.out(0).len(), 1);
         assert_eq!(store.out(0)[0].nbr, 1);
         assert!(matches!(store.prop(0, "name"), Value::Str(x) if &*x == "a"));
+    }
+
+    /// A hand-built `Update` plan sets and removes properties on matched nodes.
+    /// SET carol.age = 41; REMOVE alice.age — over a Person scan.
+    #[test]
+    fn execute_update_sets_and_removes() {
+        use crate::ir::SetOp;
+        let mut store = social();
+        let plan = Plan::Update {
+            input: Box::new(scan("Person")),
+            ops: vec![
+                SetOp::Set {
+                    slot: 0,
+                    key: "seen".into(),
+                    value: lit(n(1.0)),
+                },
+                SetOp::Remove {
+                    slot: 0,
+                    key: "age".into(),
+                },
+            ],
+        };
+        execute(&plan, &mut store);
+        // every Person got seen=1 and lost age
+        for id in 0..3u32 {
+            assert!(matches!(store.prop(id, "seen"), Value::Num(x) if x == 1.0));
+            assert!(store.prop(id, "age").is_null());
+        }
     }
 
     /// A deleted node is absent from a label scan through the query path — build

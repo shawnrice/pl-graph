@@ -220,6 +220,12 @@ impl Parser {
         }
     }
 
+    /// Whether the next token is the keyword `kw` (case-insensitive), without
+    /// consuming it.
+    fn peek_kw(&self, kw: &str) -> bool {
+        matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(kw))
+    }
+
     /// Consume the next token if it is an identifier equal (case-insensitive) to
     /// `kw` — the keyword test (keywords are not reserved, just matched here).
     fn eat_kw(&mut self, kw: &str) -> bool {
@@ -273,8 +279,17 @@ impl Parser {
             let pred = self.expr()?;
             plan = plan.filter(pred);
         }
+        // Write tail: MATCH … (SET … | REMOVE …)+  — updates the bound nodes and
+        // returns no rows. Otherwise the read tail (RETURN …).
+        if self.peek_kw("SET") || self.peek_kw("REMOVE") {
+            let ops = self.set_ops()?;
+            return Ok(Plan::Update {
+                input: Box::new(plan),
+                ops,
+            });
+        }
         if !self.eat_kw("RETURN") {
-            return Err("expected RETURN".into());
+            return Err("expected RETURN, SET, or REMOVE".into());
         }
         let distinct = self.eat_kw("DISTINCT");
         let items = self.return_items()?;
@@ -372,6 +387,52 @@ impl Parser {
             Some(Tok::Num(n)) if n >= 0.0 && n.fract() == 0.0 => Ok(n as usize),
             other => Err(format!("expected a non-negative integer, got {other:?}")),
         }
+    }
+
+    // set_ops := ( SET assign (',' assign)* | REMOVE ref (',' ref)* )+
+    // assign  := var '.' key '=' expr        ref := var '.' key
+    // Interleaved SET/REMOVE clauses accumulate in order (later writes win).
+    fn set_ops(&mut self) -> Result<Vec<crate::ir::SetOp>, String> {
+        let mut ops = Vec::new();
+        loop {
+            if self.eat_kw("SET") {
+                loop {
+                    let (slot, key) = self.slot_dot_key()?;
+                    self.expect(&Tok::Eq)?;
+                    let value = self.expr()?;
+                    ops.push(crate::ir::SetOp::Set { slot, key, value });
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+            } else if self.eat_kw("REMOVE") {
+                loop {
+                    let (slot, key) = self.slot_dot_key()?;
+                    ops.push(crate::ir::SetOp::Remove { slot, key });
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        if ops.is_empty() {
+            return Err("expected SET or REMOVE".into());
+        }
+        Ok(ops)
+    }
+
+    // A bound `var.key` reference (the target of a SET/REMOVE).
+    fn slot_dot_key(&mut self) -> Result<(usize, String), String> {
+        let var = self.ident()?;
+        let slot = *self
+            .scope
+            .get(&var)
+            .ok_or_else(|| format!("unknown variable `{var}`"))?;
+        self.expect(&Tok::Dot)?;
+        let key = self.ident()?;
+        Ok((slot, key))
     }
 
     // insert := INSERT insert_path ( ',' insert_path )*
@@ -1313,5 +1374,109 @@ mod tests {
     fn insert_errors() {
         assert!(super::parse("INSERT (a:P)-[:R]-(b:P)").is_err()); // undirected
         assert!(super::parse("INSERT (a:P {n: 1}), (a:P {n: 2})").is_err()); // redefine var
+    }
+
+    // --- part 5: SET / REMOVE (update statements) ---
+
+    /// Parsed SET/REMOVE matches the hand-built `Plan::Update`: run both onto
+    /// fresh copies and confirm the resulting property reads agree.
+    #[test]
+    fn update_parse_matches_hand_plan() {
+        use crate::exec::execute;
+        use crate::ir::{Expr, Plan, SetOp};
+        let hand = Plan::Update {
+            input: Box::new(
+                Plan::Scan {
+                    label: Some("Person".into()),
+                }
+                .filter(Expr::Compare {
+                    op: crate::ir::CompareOp::Eq,
+                    left: Box::new(Expr::Prop {
+                        slot: 0,
+                        key: "name".into(),
+                    }),
+                    right: Box::new(Expr::Lit(s("alice"))),
+                }),
+            ),
+            ops: vec![
+                SetOp::Set {
+                    slot: 0,
+                    key: "age".into(),
+                    value: Expr::Lit(n(41.0)),
+                },
+                SetOp::Remove {
+                    slot: 0,
+                    key: "name".into(),
+                },
+            ],
+        };
+        let query = "MATCH (p:Person) WHERE p.name = 'alice' SET p.age = 41 REMOVE p.name";
+        let mut st_p = social();
+        let mut st_h = social();
+        execute(&super::parse(query).unwrap(), &mut st_p);
+        execute(&hand, &mut st_h);
+        // Compare the whole Person table (age + name) between the two stores.
+        let probe = "MATCH (p:Person) RETURN p.age AS age, p.name AS name";
+        let pp = super::parse(probe).unwrap();
+        assert_eq!(bag(&run(&pp, &st_p)), bag(&run(&pp, &st_h)));
+    }
+
+    /// SET only touches WHERE-matched rows; others are unchanged (hand-computed:
+    /// only alice's age becomes 100).
+    #[test]
+    fn update_respects_where() {
+        use crate::exec::execute;
+        let mut store = social();
+        execute(
+            &super::parse("MATCH (p:Person) WHERE p.name = 'alice' SET p.age = 100").unwrap(),
+            &mut store,
+        );
+        let out = run(
+            &super::parse("MATCH (p:Person) RETURN p.name AS name, p.age AS age").unwrap(),
+            &store,
+        );
+        let mut got: Vec<(String, f64)> = out
+            .rows
+            .iter()
+            .map(|r| match (&r[0], &r[1]) {
+                (Value::Str(nm), Value::Num(a)) => (nm.to_string(), *a),
+                _ => panic!("shape"),
+            })
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("alice".into(), 100.0),
+                ("bob".into(), 25.0),
+                ("carol".into(), 40.0)
+            ]
+        );
+    }
+
+    /// The null policy: `SET x = null` STORES a present null (has_prop true, reads
+    /// null); `REMOVE x` makes it absent (has_prop false). Distinct operations.
+    #[test]
+    fn set_null_stores_remove_deletes() {
+        use crate::exec::execute;
+        let mut store = social();
+        // node 0 = alice. SET a present null on 'age', remove 'name'.
+        execute(
+            &super::parse("MATCH (p:Person) WHERE p.name = 'alice' SET p.age = null").unwrap(),
+            &mut store,
+        );
+        assert!(store.has_prop(0, "age")); // present…
+        assert!(store.prop(0, "age").is_null()); // …but null
+        execute(
+            &super::parse("MATCH (p:Person) WHERE p.age = 25 REMOVE p.age").unwrap(),
+            &mut store,
+        );
+        // bob (age 25) had age removed → absent
+        assert!(!store.has_prop(1, "age"));
+    }
+
+    #[test]
+    fn update_errors_on_unknown_var() {
+        assert!(super::parse("MATCH (p:Person) SET q.age = 1").is_err());
     }
 }

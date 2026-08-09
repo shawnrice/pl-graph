@@ -187,6 +187,25 @@ pub enum Plan {
         nodes: Vec<InsertNode>,
         edges: Vec<InsertEdge>,
     },
+    /// A write over the rows of a read sub-plan: for each matched row, apply the
+    /// `ops` (SET/REMOVE) to the bound nodes. Run through `exec::execute`, not
+    /// pulled; produces no rows (a RETURN after an update is a later slice).
+    Update { input: Box<Plan>, ops: Vec<SetOp> },
+}
+
+/// One property mutation in an `Update`: set a bound node's property to an
+/// expression evaluated per row, or remove it. `slot` is the bound node.
+#[derive(Clone, Debug)]
+pub enum SetOp {
+    Set {
+        slot: usize,
+        key: String,
+        value: Expr,
+    },
+    Remove {
+        slot: usize,
+        key: String,
+    },
 }
 
 /// A node to create in an `Insert`: its labels and inline `(key, value)`

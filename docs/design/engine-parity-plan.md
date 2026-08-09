@@ -45,7 +45,10 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
       leaf + mutable `exec::execute`; nodes with labels+inline props, directed
       typed edges, per-INSERT variable scoping. NOTE: edge PROPERTIES deferred —
       the store has no edge-property model yet; needs its own slice (see B-note).)
-- [ ] B2. GQL `SET` / `REMOVE`.
+- [x] B2. GQL `SET` / `REMOVE`. (`Plan::Update` over a read sub-plan; collect
+      writes in a read pass then apply; `MATCH … WHERE … (SET k=expr | REMOVE k)+`;
+      SET null stores a present null, REMOVE deletes — the null policy. Node
+      properties only; edge props await B5. RETURN-after-update deferred.)
 - [ ] B3. GQL `MERGE` / `_MERGE` keyed upsert.
 - [ ] B4. Gremlin `addV`/`addE`/`property`/`drop`.
 - [ ] B5. Relationship variables + edge properties (discovered in B1): bind an

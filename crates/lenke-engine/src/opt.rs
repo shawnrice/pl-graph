@@ -149,6 +149,16 @@ fn map_children(plan: Plan) -> (Plan, bool) {
             let (i, c) = rewrite(*input);
             (Plan::Distinct { input: Box::new(i) }, c)
         }
+        Plan::Update { input, ops } => {
+            let (i, c) = rewrite(*input);
+            (
+                Plan::Update {
+                    input: Box::new(i),
+                    ops,
+                },
+                c,
+            )
+        }
         Plan::Join { left, right, on } => {
             let (l, cl) = rewrite(*left);
             let (r, cr) = rewrite(*right);
@@ -251,7 +261,8 @@ fn merge_max(a: Option<usize>, b: Option<usize>) -> Option<usize> {
 fn width(plan: &Plan) -> usize {
     match plan {
         Plan::Scan { .. } => 1,
-        Plan::Insert { .. } => 0, // a write carries no output row
+        // Writes carry no output row.
+        Plan::Insert { .. } | Plan::Update { .. } => 0,
 
         Plan::Expand { input, .. }
         | Plan::VarLength { input, .. }
@@ -455,6 +466,7 @@ mod tests {
             | Plan::Aggregate { input, .. }
             | Plan::OrderPage { input, .. }
             | Plan::Project { input, .. }
+            | Plan::Update { input, .. }
             | Plan::Distinct { input } => plan_contains_filter(input),
             Plan::Join { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)
