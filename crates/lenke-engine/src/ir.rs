@@ -76,6 +76,14 @@ pub enum Expr {
     Record {
         fields: Vec<(String, Expr)>,
     },
+    /// Field access on an arbitrary base expression: `<base>.key`. `base` may be a
+    /// record/map value (→ the field) or an element frontier (→ its property) —
+    /// the general form of `Prop` (which is the slot-shortcut the optimizer sees).
+    /// Used for `{…}.k`, `(expr).k`, and chains.
+    Field {
+        base: Box<Expr>,
+        key: String,
+    },
     /// `CAST(<expr> AS <TYPE>)`. The coercion itself lives in `value::cast` (the
     /// single home for the conversion table); a failed conversion throws
     /// `E_INVALID_VALUE` (the read pipeline is fallible — see `exec::try_run`),

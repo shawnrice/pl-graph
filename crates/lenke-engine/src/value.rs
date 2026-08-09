@@ -44,6 +44,11 @@ pub enum Value {
     /// per-row binding clone is a refcount bump. Build via [`make_record`], which
     /// sorts and de-duplicates keys (last write wins).
     Record(Arc<[(Arc<str>, Value)]>),
+    /// A TinkerPop map (Gremlin): **any** value as a key, **insertion-ordered** —
+    /// `valueMap`/`project`/`select` preserve the order the traversal produced. So
+    /// equality and ordering are POSITIONAL (order-sensitive), unlike a `Record`.
+    /// `Arc`-boxed for a cheap per-row clone.
+    Map(Arc<Vec<(Value, Value)>>),
 }
 
 /// Build a [`Value::Record`] from `pairs`: duplicate keys collapse (last write
@@ -95,8 +100,9 @@ impl Value {
             Self::Temporal(_) => 3,
             Self::List(_) => 4,
             Self::Record(_) => 5,
+            Self::Map(_) => 6,
             // Null sorts LAST — it is the greatest in the total order.
-            Self::Null => 6,
+            Self::Null => 7,
         }
     }
 }
@@ -128,6 +134,14 @@ pub fn equals(a: &Value, b: &Value) -> bool {
                 && x.iter()
                     .zip(y.iter())
                     .all(|((k1, v1), (k2, v2))| k1 == k2 && equals(v1, v2))
+        }
+        // A Map compares POSITIONALLY (insertion order matters): same length, and
+        // each key/value pair equal in order.
+        (Value::Map(x), Value::Map(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|((k1, v1), (k2, v2))| equals(k1, k2) && equals(v1, v2))
         }
         _ => false,
     }
@@ -221,6 +235,7 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
                 Value::List(_) => return bad("list", "number"),
                 Value::Temporal(_) => return bad("temporal", "number"),
                 Value::Record(_) => return bad("record", "number"),
+                Value::Map(_) => return bad("map", "number"),
                 Value::Null => unreachable!("null handled above"),
             };
             if target == CastTarget::Integer {
@@ -250,6 +265,7 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
                 Value::Temporal(t) => t.format(),
                 Value::List(_) => return bad("list", "string"),
                 Value::Record(_) => return bad("record", "string"),
+                Value::Map(_) => return bad("map", "string"),
                 Value::Null => unreachable!("null handled above"),
             }
             .as_str(),
@@ -266,6 +282,7 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
             Value::List(_) => bad("list", "boolean"),
             Value::Temporal(_) => bad("temporal", "boolean"),
             Value::Record(_) => bad("record", "boolean"),
+            Value::Map(_) => bad("map", "boolean"),
             Value::Null => unreachable!("null handled above"),
         },
     }
@@ -337,6 +354,16 @@ pub fn group_key_into(v: &Value, out: &mut Vec<u8>) {
                 group_key_into(v, out);
             }
         }
+        Value::Map(pairs) => {
+            // Insertion order is significant, so the key is the pairs in order —
+            // each key's own group_key then its value's.
+            out.push(7);
+            out.extend_from_slice(&(pairs.len() as u64).to_le_bytes());
+            for (k, v) in pairs.iter() {
+                group_key_into(k, out);
+                group_key_into(v, out);
+            }
+        }
     }
 }
 
@@ -367,6 +394,13 @@ pub fn cmp_total(a: &Value, b: &Value) -> Ordering {
             .iter()
             .zip(y.iter())
             .map(|((k1, v1), (k2, v2))| k1.cmp(k2).then_with(|| cmp_total(v1, v2)))
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or_else(|| x.len().cmp(&y.len())),
+        // Maps: lexicographic over insertion-ordered (key, then value) pairs.
+        (Value::Map(x), Value::Map(y)) => x
+            .iter()
+            .zip(y.iter())
+            .map(|((k1, v1), (k2, v2))| cmp_total(k1, k2).then_with(|| cmp_total(v1, v2)))
             .find(|o| *o != Ordering::Equal)
             .unwrap_or_else(|| x.len().cmp(&y.len())),
         _ => a.rank().cmp(&b.rank()),
@@ -587,6 +621,29 @@ mod tests {
         assert!(record_field(f, "missing").is_null());
         assert_eq!(cmp_total(&Value::List(vec![]), &r1), Ordering::Less);
         assert_eq!(cmp_total(&r1, &Value::Null), Ordering::Less);
+    }
+
+    #[test]
+    fn map_is_positional_unlike_record() {
+        // A Map's equality and grouping are ORDER-SENSITIVE (insertion order),
+        // the opposite of a Record's sorted keys.
+        let m1 = Value::Map(Arc::new(vec![(s("a"), n(1.0)), (s("b"), n(2.0))]));
+        let m2 = Value::Map(Arc::new(vec![(s("a"), n(1.0)), (s("b"), n(2.0))]));
+        let reordered = Value::Map(Arc::new(vec![(s("b"), n(2.0)), (s("a"), n(1.0))]));
+        assert!(equals(&m1, &m2));
+        assert_eq!(group_key(&m1), group_key(&m2));
+        assert!(!equals(&m1, &reordered)); // order matters
+        assert_ne!(group_key(&m1), group_key(&reordered));
+        // Any-typed keys are permitted (unlike Record's string keys).
+        let numkey = Value::Map(Arc::new(vec![(n(1.0), s("x"))]));
+        assert!(equals(
+            &numkey,
+            &Value::Map(Arc::new(vec![(n(1.0), s("x"))]))
+        ));
+        // Cross-type rank: Record (5) < Map (6) < Null (7).
+        let rec = make_record(vec![(Arc::from("a"), n(1.0))]);
+        assert_eq!(cmp_total(&rec, &m1), Ordering::Less);
+        assert_eq!(cmp_total(&m1, &Value::Null), Ordering::Less);
     }
 
     #[test]

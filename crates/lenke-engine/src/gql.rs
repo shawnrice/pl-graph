@@ -1244,7 +1244,7 @@ impl Parser {
                 self.pos += 1;
                 let e = self.expr()?;
                 self.expect(&Tok::RParen)?;
-                Ok(e)
+                self.field_chain(e)
             }
             Some(Tok::LBracket) => {
                 // A list literal `[a, b, …]` (empty `[]` allowed). In expression
@@ -1280,7 +1280,7 @@ impl Parser {
                     }
                 }
                 self.expect(&Tok::RBrace)?;
-                Ok(Expr::Record { fields })
+                self.field_chain(Expr::Record { fields })
             }
             Some(Tok::Num(n)) => {
                 self.pos += 1;
@@ -1375,6 +1375,20 @@ impl Parser {
             }
             other => Err(format!("expected an expression, got {other:?}")),
         }
+    }
+
+    /// Consume trailing `.field` accessors on a non-variable base (a record/paren
+    /// expression), building nested `Expr::Field`. (A bare variable handles its
+    /// own single `.prop` in `primary`, keeping that the optimizer's `Prop` shape.)
+    fn field_chain(&mut self, mut base: Expr) -> Result<Expr, String> {
+        while self.eat(&Tok::Dot) {
+            let key = self.ident()?;
+            base = Expr::Field {
+                base: Box::new(base),
+                key,
+            };
+        }
+        Ok(base)
     }
 
     // case := CASE (WHEN expr THEN expr)+ [ELSE expr] END   (searched form)
@@ -2504,6 +2518,52 @@ mod tests {
             }
             o => panic!("expected a Record, got {o:?}"),
         }
+    }
+
+    #[test]
+    fn field_access_on_a_record_literal() {
+        use crate::ir::{Expr, Plan};
+        let store = social();
+        // `{lit}.field` and a chained `.outer.inner` on nested record literals.
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) WHERE p.name = 'alice' RETURN \
+                 {a: 1, b: 2}.b AS x, {outer: {inner: 7}}.outer.inner AS y, \
+                 {a: 1}.missing AS m",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert_eq!(num(&col(&out, 0, "x")), 2.0);
+        assert_eq!(num(&col(&out, 0, "y")), 7.0);
+        assert!(col(&out, 0, "m").is_null()); // absent field → NULL
+
+        // Cross-check `{a: 1}.a` against the hand-built Field(Record) plan.
+        let hand = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .filter(Expr::Compare {
+            op: crate::ir::CompareOp::Eq,
+            left: Box::new(Expr::Prop {
+                slot: 0,
+                key: "name".into(),
+            }),
+            right: Box::new(Expr::Lit(Value::Str("alice".into()))),
+        })
+        .project(vec![(
+            "x".into(),
+            Expr::Field {
+                base: Box::new(Expr::Record {
+                    fields: vec![("a".into(), Expr::Lit(Value::Num(1.0)))],
+                }),
+                key: "a".into(),
+            },
+        )]);
+        assert_same(
+            "MATCH (p:Person) WHERE p.name = 'alice' RETURN {a: 1}.a AS x",
+            &hand,
+            &store,
+        );
     }
 
     #[test]

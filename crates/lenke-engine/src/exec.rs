@@ -410,6 +410,7 @@ fn needs_lineage(plan: &Plan) -> bool {
             } => reads_path(a) || reads_path(b),
             Expr::Call { args, .. } | Expr::List { items: args } => args.iter().any(reads_path),
             Expr::Record { fields } => fields.iter().any(|(_, e)| reads_path(e)),
+            Expr::Field { base, .. } => reads_path(base),
             Expr::Case {
                 branches,
                 otherwise,
@@ -1366,6 +1367,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
             args.iter().all(|a| refs_only_slot(a, s))
         }
         Expr::Record { fields } => fields.iter().all(|(_, e)| refs_only_slot(e, s)),
+        Expr::Field { base, .. } => refs_only_slot(base, s),
         Expr::Case {
             branches,
             otherwise,
@@ -1424,6 +1426,10 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
                 .iter()
                 .map(|(k, e)| (k.clone(), remap_slot(e, from, to)))
                 .collect(),
+        },
+        Expr::Field { base, key } => Expr::Field {
+            base: go(base),
+            key: key.clone(),
         },
         Expr::Case {
             branches,
@@ -1824,6 +1830,12 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
         Expr::Slot(n) => batch.slot(*n).clone(),
         Expr::Lit(v) => broadcast(v.clone(), batch.rows()),
         Expr::Prop { slot, key } => read_property(store, batch.slot(*slot), key),
+        // `<base>.key` — evaluate the base to a column, then read the field/property
+        // from it (the general form of `Prop`).
+        Expr::Field { base, key } => {
+            let col = eval(base, store, batch)?;
+            read_property(store, &col, key)
+        }
         Expr::Path => match &batch.lineage {
             // Each row's path as a List of node ids; NULL when the plan tracks no
             // lineage (which `needs_lineage` prevents when Path is actually read).
@@ -2487,6 +2499,11 @@ fn read_property(store: &Store, col: &Col, key: &str) -> Col {
             (0..col.len())
                 .map(|i| match col.value_at(i) {
                     Value::Record(fields) => value::record_field(&fields, key),
+                    // A Map `.key` reads the entry under the string key `key`.
+                    Value::Map(pairs) => pairs
+                        .iter()
+                        .find(|(k, _)| matches!(k, Value::Str(s) if s.as_ref() == key))
+                        .map_or(Value::Null, |(_, v)| v.clone()),
                     _ => Value::Null,
                 })
                 .collect(),

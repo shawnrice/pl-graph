@@ -135,8 +135,8 @@ impl Column {
                 data: vec![*t; n],
                 present: vec![false; n],
             },
-            // Records (and null/list) have no typed column form yet — Gen.
-            Value::Null | Value::List(_) | Value::Record(_) => Self::Gen {
+            // Records/maps (and null/list) have no typed column form yet — Gen.
+            Value::Null | Value::List(_) | Value::Record(_) | Value::Map(_) => Self::Gen {
                 data: vec![Value::Null; n],
                 present: vec![false; n],
             },

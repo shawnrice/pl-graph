@@ -171,6 +171,25 @@ fn encode_value(out: &mut String, v: &Value) {
             }
             out.push('}');
         }
+        // A Gremlin map is not a STORED property type (no producer persists one);
+        // egress is best-effort as an object using each key's string form, so the
+        // arm is total. (It decodes back as a record, not a map — acceptable since
+        // maps are never written to a property.)
+        Value::Map(pairs) => {
+            out.push('{');
+            for (i, (k, v)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                match k {
+                    Value::Str(s) => encode_string(out, s),
+                    other => encode_string(out, &format!("{other:?}")),
+                }
+                out.push(':');
+                encode_value(out, v);
+            }
+            out.push('}');
+        }
     }
 }
 

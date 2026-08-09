@@ -281,10 +281,15 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       columns; absent field→NULL). NDJSON encode/decode (JSON object ↔ record,
       round-trips). Stored in Gen columns. 3 tests (contract, literal+field+hand
       plan, NDJSON round trip).
-- [ ] G2b. Record/map follow-ups: dotted-path property index (`{k:$x}` seek into
-      a record field), `{lit}.field` direct field access (Expr::Field), and the
-      Gremlin `Value::Map` (any-key, insertion-ordered) — which then unblocks F5c
-      (multi-label select).
+- [x] G2b. Gremlin `Value::Map` (any-key, INSERTION-ordered — positional
+      equality/grouping, unlike Record's sorted keys; value.rs contract + rank
+      Record<Map<Null) and `Expr::Field` for `{lit}.field` / `(expr).field` /
+      chains (the general form of Prop; reuses read_property, which now reads a Map
+      entry too). 2 tests (positional Map contract, field access + nested + hand
+      plan). Map has no producer yet — F5c (multi-select) is its first, now
+      unblocked. NDJSON Map egress is best-effort (not a stored type).
+- [ ] G2c. Dotted-path property index: createIndex on a record field path +
+      planner seek {k.sub: $x} into it (the perf slice; the memory's 140x seek).
 - [ ] F5c. Gremlin multi-label select('a','b') (a Map value — needs G2) and
       order(local) (within-list sort — needs list ops). Relocated from F5b; placed
       after G2 because it depends on the map/list value model.
