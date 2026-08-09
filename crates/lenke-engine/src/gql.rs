@@ -1302,9 +1302,28 @@ impl Parser {
                 if s.eq_ignore_ascii_case("exists") {
                     return self.exists_expr();
                 }
-                // Typed temporal literal `DATE '…'` / `TIME '…'` / `DATETIME '…'`:
-                // a temporal keyword directly followed by a string. (A bare `date`
-                // not followed by a string stays an ordinary variable/property.)
+                // Two-word zoned literal `ZONED TIME '…'` / `ZONED DATETIME '…'`.
+                if s.eq_ignore_ascii_case("zoned") {
+                    if let Some(Tok::Ident(kind)) = self.peek().cloned() {
+                        let ztag = match kind.to_ascii_uppercase().as_str() {
+                            "TIME" => Some("zoned_time"),
+                            "DATETIME" => Some("zoned_datetime"),
+                            _ => None,
+                        };
+                        if let Some(ztag) = ztag {
+                            if let Some(Tok::Str(lit)) = self.toks.get(self.pos + 1).cloned() {
+                                self.pos += 2; // consume TIME/DATETIME and the string
+                                let t = crate::temporal::Temporal::parse(ztag, &lit)
+                                    .map_err(|e| format!("invalid ZONED {kind} literal: {e}"))?;
+                                return Ok(Expr::Lit(Value::Temporal(t)));
+                            }
+                        }
+                    }
+                }
+                // Typed temporal literal `DATE '…'` / `TIME '…'` / `DATETIME '…'` /
+                // `DURATION '…'`: a temporal keyword directly followed by a string.
+                // (A bare `date` not followed by a string stays an ordinary
+                // variable/property.)
                 if let Some(tag) = temporal_tag(&s) {
                     if let Some(Tok::Str(lit)) = self.peek() {
                         let lit = lit.clone();
@@ -1559,6 +1578,7 @@ fn temporal_tag(kw: &str) -> Option<&'static str> {
         "DATE" => "date",
         "TIME" => "localtime",
         "DATETIME" => "datetime",
+        "DURATION" => "duration",
         _ => return None,
     })
 }
@@ -2244,6 +2264,29 @@ mod tests {
         );
         // A malformed literal is a parse error.
         assert!(super::parse("MATCH (p:Person) RETURN DATE '2024-13-01' AS d").is_err());
+    }
+
+    #[test]
+    fn duration_and_zoned_literals() {
+        let store = social();
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) RETURN DURATION 'P1Y2M' AS d, \
+                 ZONED DATETIME '2024-01-15T12:00:00+01:00' AS z, \
+                 ZONED TIME '13:45:00Z' AS zt",
+            )
+            .unwrap(),
+            &store,
+        );
+        let iso = |v: &Value| match v {
+            Value::Temporal(t) => t.format(),
+            o => panic!("expected Temporal, got {o:?}"),
+        };
+        assert_eq!(iso(&col(&out, 0, "d")), "P14M"); // 1Y2M = 14 months, canonical
+        assert_eq!(iso(&col(&out, 0, "z")), "2024-01-15T12:00:00+01:00");
+        assert_eq!(iso(&col(&out, 0, "zt")), "13:45:00Z");
+        // A malformed duration literal is a parse error.
+        assert!(super::parse("MATCH (p:Person) RETURN DURATION 'nope' AS d").is_err());
     }
 
     #[test]

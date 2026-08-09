@@ -241,9 +241,15 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       (equals same-kind, cmp_total chronological + cross-type rank Str<Temporal<
       List<Null, group_key by kind+ISO, cast→string); GQL typed literals DATE/TIME/
       DATETIME '…'; tagged-JSON egress. Stored in Gen columns for now. 8 tests.
-- [ ] G1b. Temporal completion: DURATION + ZONED TIME/DATETIME variants, typed
-      per-kind SoA `Column::Temporal` storage (de-box from Gen), NDJSON temporal
-      DECODE (round-trip the tagged form), and temporal scalar functions.
+- [x] G1b. Temporal value model complete: DURATION (months/days/secs/nanos kept
+      separate, canonical P..M..DT..S form, total-order-only) + ZONED TIME/DATETIME
+      (numeric offset preserved, split_offset, instant-then-offset order). All six
+      kinds now parse/format/order via the temporal module; GQL literals DURATION
+      '…' and two-word ZONED TIME/DATETIME '…'. 5 tests. (Duration/zoned relational
+      `<` uses the total order like the rest of lenke-engine, not rel_cmp UNKNOWN.)
+- [ ] G1c. Temporal storage/codec: typed per-kind SoA `Column::Temporal` (de-box
+      from Gen), NDJSON temporal DECODE (round-trip the tagged form), and temporal
+      scalar functions.
 - [ ] G2. Map/record values (storage, dotted-path, construction, access).
 - [ ] F5c. Gremlin multi-label select('a','b') (a Map value — needs G2) and
       order(local) (within-list sort — needs list ops). Relocated from F5b; placed

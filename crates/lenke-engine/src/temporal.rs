@@ -37,6 +37,45 @@ pub struct DateTime {
     pub nanos: u32,
 }
 
+/// An ISO-8601 calendar duration. Months and days are kept SEPARATE from seconds
+/// (a month is not a fixed number of seconds), matching the Cypher/GQL model.
+/// Relationally unordered (like SQL intervals), but given a deterministic TOTAL
+/// order for `ORDER BY` (lexicographic over the components).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Duration {
+    pub months: i64,
+    pub days: i64,
+    pub secs: i64,
+    /// 0..1_000_000_000
+    pub nanos: u32,
+}
+
+/// A datetime with a UTC offset. Stored as the UTC instant plus the offset it was
+/// written in — the offset is PRESERVED for round-trip and participates in
+/// identity/ordering (instant first, offset second). Fields ordered
+/// `secs, nanos, offset` so the derived `Ord` is instant-primary.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct ZonedDateTime {
+    /// UTC instant: seconds since 1970-01-01T00:00:00Z.
+    pub secs: i64,
+    /// 0..1_000_000_000
+    pub nanos: u32,
+    /// Offset from UTC in whole minutes (`Z` = 0), for round-trip rendering.
+    pub offset: i16,
+}
+
+/// A time of day with a UTC offset. Stored as the UTC seconds-of-day + the
+/// offset; ordered by UTC time-of-day then offset. No date component.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct ZonedTime {
+    /// UTC seconds-of-day, 0..86_400 (the wall clock minus the offset, wrapped).
+    pub secs: u32,
+    /// 0..1_000_000_000
+    pub nanos: u32,
+    /// Offset from UTC in whole minutes, for round-trip rendering.
+    pub offset: i16,
+}
+
 const SECS_PER_DAY: i64 = 86_400;
 
 // --- civil calendar (Hinnant) ------------------------------------------------
@@ -127,6 +166,84 @@ fn fmt_year(y: i64) -> String {
     } else {
         format!("{y:04}")
     }
+}
+
+/// Render a UTC offset (whole minutes) as `Z` (=0) or `±HH:MM`.
+fn fmt_offset(offset: i16) -> String {
+    if offset == 0 {
+        return "Z".to_string();
+    }
+    let sign = if offset < 0 { '-' } else { '+' };
+    let a = offset.unsigned_abs();
+    format!("{sign}{:02}:{:02}", a / 60, a % 60)
+}
+
+/// Split a trailing UTC offset (`Z` / `±HH:MM` / `±HHMM`) off `s`, returning the
+/// part before it and the offset in whole minutes. Errors if none is present (a
+/// ZONED value requires one). Only the tail is inspected, so a date's `-`
+/// separators are never mistaken for the offset sign.
+fn split_offset(s: &str) -> Result<(&str, i16), String> {
+    if let Some(rest) = s.strip_suffix('Z') {
+        return Ok((rest, 0));
+    }
+    let b = s.as_bytes();
+    let n = b.len();
+    for (width, colon) in [(6usize, true), (5usize, false)] {
+        if n < width {
+            continue;
+        }
+        let start = n - width;
+        let sign = b[start];
+        if sign != b'+' && sign != b'-' {
+            continue;
+        }
+        let Some(hh) = s.get(start + 1..start + 3) else {
+            continue;
+        };
+        let mm = if colon {
+            if b[start + 3] != b':' {
+                continue;
+            }
+            s.get(start + 4..start + 6)
+        } else {
+            s.get(start + 3..start + 5)
+        };
+        let Some(mm) = mm else {
+            continue;
+        };
+        if let (Ok(h), Ok(m)) = (hh.parse::<i16>(), mm.parse::<i16>()) {
+            if (0..=23).contains(&h) && (0..60).contains(&m) {
+                let mag = h * 60 + m;
+                return Ok((&s[..start], if sign == b'-' { -mag } else { mag }));
+            }
+        }
+    }
+    Err(format!("missing/invalid time-zone offset in '{s}'"))
+}
+
+/// Consume the pending numeric buffer as an integer for duration designator `d`.
+fn take_num(num: &mut String, d: char, whole: &str) -> Result<i64, String> {
+    if num.is_empty() {
+        return Err(format!("missing number before '{d}' in '{whole}'"));
+    }
+    let v = parse_int(num)?;
+    num.clear();
+    Ok(v)
+}
+
+/// Consume the pending buffer as `seconds[.fraction]` → (whole secs, nanos).
+fn take_secs(num: &mut String, whole: &str) -> Result<(i64, u32), String> {
+    if num.is_empty() {
+        return Err(format!("missing number before 'S' in '{whole}'"));
+    }
+    let (w, frac) = match num.split_once('.') {
+        Some((a, b)) => (a, Some(b.to_string())),
+        None => (num.as_str(), None),
+    };
+    let secs = parse_int(w)?;
+    let nanos = parse_frac(frac.as_deref())?;
+    num.clear();
+    Ok((secs, nanos))
 }
 
 // --- Date --------------------------------------------------------------------
@@ -228,15 +345,182 @@ impl Time {
     }
 }
 
+// --- ZonedDateTime -----------------------------------------------------------
+
+impl ZonedDateTime {
+    /// Parse `YYYY-MM-DDTHH:MM:SS[.frac](Z|±HH:MM)`. The wall clock is the
+    /// pre-offset datetime; the stored instant is that minus the offset.
+    ///
+    /// # Errors
+    /// A missing/invalid offset, or a malformed datetime part.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (dt_str, offset) = split_offset(s)?;
+        let local = DateTime::parse(dt_str)?;
+        Ok(Self {
+            secs: local.secs - i64::from(offset) * 60,
+            nanos: local.nanos,
+            offset,
+        })
+    }
+
+    #[must_use]
+    pub fn format(&self) -> String {
+        let local = DateTime {
+            secs: self.secs + i64::from(self.offset) * 60,
+            nanos: self.nanos,
+        };
+        format!("{}{}", local.format(), fmt_offset(self.offset))
+    }
+}
+
+// --- ZonedTime ---------------------------------------------------------------
+
+impl ZonedTime {
+    /// Parse `HH:MM:SS[.frac](Z|±HH:MM)`. The wall clock is the pre-offset time;
+    /// the stored UTC seconds-of-day is that minus the offset, wrapped into a day.
+    ///
+    /// # Errors
+    /// A missing/invalid offset, or a malformed time part.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (t_str, offset) = split_offset(s)?;
+        let (tod, nanos) = parse_time(t_str)?;
+        let utc = (tod - i64::from(offset) * 60).rem_euclid(SECS_PER_DAY);
+        Ok(Self {
+            secs: u32::try_from(utc).expect("rem_euclid keeps it in 0..86_400"),
+            nanos,
+            offset,
+        })
+    }
+
+    #[must_use]
+    pub fn format(&self) -> String {
+        let local = (i64::from(self.secs) + i64::from(self.offset) * 60).rem_euclid(SECS_PER_DAY);
+        let (h, m, s) = (local / 3600, (local % 3600) / 60, local % 60);
+        format!(
+            "{h:02}:{m:02}:{s:02}{}{}",
+            fmt_frac(self.nanos),
+            fmt_offset(self.offset)
+        )
+    }
+}
+
+// --- Duration ----------------------------------------------------------------
+
+impl Duration {
+    /// The float64-safe integer bound each component must stay under.
+    const MAX_SAFE: u64 = 1 << 53;
+
+    /// Parse ISO-8601 `PnYnMnWnDTnHnMnS` (years→months, weeks→days). Fractional
+    /// seconds allowed on the seconds field.
+    ///
+    /// # Errors
+    /// A malformed field, a dangling number, or a component outside the
+    /// float64-safe integer range.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let rest = s
+            .strip_prefix('P')
+            .ok_or_else(|| format!("duration must start with 'P': '{s}'"))?;
+        let (date_part, time_part) = match rest.split_once('T') {
+            Some((d, t)) => (d, Some(t)),
+            None => (rest, None),
+        };
+        let mut months = 0i64;
+        let mut days = 0i64;
+        let mut num = String::new();
+        for c in date_part.chars() {
+            match c {
+                '0'..='9' | '-' => num.push(c),
+                'Y' => months += take_num(&mut num, 'Y', s)? * 12,
+                'M' => months += take_num(&mut num, 'M', s)?,
+                'W' => days += take_num(&mut num, 'W', s)? * 7,
+                'D' => days += take_num(&mut num, 'D', s)?,
+                _ => return Err(format!("bad duration date field '{c}' in '{s}'")),
+            }
+        }
+        if !num.is_empty() {
+            return Err(format!("dangling number in duration '{s}'"));
+        }
+        let mut secs = 0i64;
+        let mut nanos = 0u32;
+        if let Some(tp) = time_part {
+            for c in tp.chars() {
+                match c {
+                    '0'..='9' | '-' | '.' => num.push(c),
+                    'H' => secs += take_num(&mut num, 'H', s)? * 3600,
+                    'M' => secs += take_num(&mut num, 'M', s)? * 60,
+                    'S' => {
+                        let (whole, frac) = take_secs(&mut num, s)?;
+                        secs += whole;
+                        nanos = frac;
+                    }
+                    _ => return Err(format!("bad duration time field '{c}' in '{s}'")),
+                }
+            }
+            if !num.is_empty() {
+                return Err(format!("dangling number in duration '{s}'"));
+            }
+        }
+        Self {
+            months,
+            days,
+            secs,
+            nanos,
+        }
+        .representable()
+        .ok_or_else(|| format!("duration component is not representable as float64: '{s}'"))
+    }
+
+    /// Canonical ISO-8601: `P<months>M<days>DT<secs>S`, each component omitted
+    /// when zero; all-zero renders `PT0S`. Total months / total days (no Y/W
+    /// split) so the form is deterministic and round-trips to itself.
+    #[must_use]
+    pub fn format(&self) -> String {
+        let mut out = String::from("P");
+        if self.months != 0 {
+            out.push_str(&format!("{}M", self.months));
+        }
+        if self.days != 0 {
+            out.push_str(&format!("{}D", self.days));
+        }
+        if self.secs != 0 || self.nanos != 0 {
+            out.push_str(&format!("T{}{}S", self.secs, fmt_frac(self.nanos)));
+        }
+        if out == "P" {
+            out.push_str("T0S");
+        }
+        out
+    }
+
+    /// Deterministic total order (NOT chronological — a month has no fixed
+    /// length): lexicographic over (months, days, secs, nanos). For `ORDER BY`.
+    fn total_key(&self) -> (i64, i64, i64, u32) {
+        (self.months, self.days, self.secs, self.nanos)
+    }
+
+    fn representable(self) -> Option<Self> {
+        if self.months.unsigned_abs() >= Self::MAX_SAFE
+            || self.days.unsigned_abs() >= Self::MAX_SAFE
+            || self.secs.unsigned_abs() >= Self::MAX_SAFE
+        {
+            None
+        } else {
+            Some(self)
+        }
+    }
+}
+
 // --- the value family --------------------------------------------------------
 
 /// The temporal value family, carried as one `Value::Temporal` variant so each
-/// exhaustive match gains a single arm. Zone-less subset for now.
+/// exhaustive match gains a single arm.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Temporal {
     Date(Date),
     Time(Time),
     DateTime(DateTime),
+    ZonedTime(ZonedTime),
+    ZonedDateTime(ZonedDateTime),
+    Duration(Duration),
 }
 
 impl Temporal {
@@ -247,6 +531,9 @@ impl Temporal {
             Self::Date(_) => "date",
             Self::Time(_) => "localtime",
             Self::DateTime(_) => "datetime",
+            Self::ZonedTime(_) => "zoned_time",
+            Self::ZonedDateTime(_) => "zoned_datetime",
+            Self::Duration(_) => "duration",
         }
     }
 
@@ -257,6 +544,9 @@ impl Temporal {
             Self::Date(d) => d.format(),
             Self::Time(t) => t.format(),
             Self::DateTime(dt) => dt.format(),
+            Self::ZonedTime(t) => t.format(),
+            Self::ZonedDateTime(dt) => dt.format(),
+            Self::Duration(du) => du.format(),
         }
     }
 
@@ -269,27 +559,38 @@ impl Temporal {
             "date" => Date::parse(s).map(Temporal::Date),
             "localtime" => Time::parse(s).map(Temporal::Time),
             "datetime" => DateTime::parse(s).map(Temporal::DateTime),
+            "zoned_time" => ZonedTime::parse(s).map(Temporal::ZonedTime),
+            "zoned_datetime" => ZonedDateTime::parse(s).map(Temporal::ZonedDateTime),
+            "duration" => Duration::parse(s).map(Temporal::Duration),
             _ => Err(format!("unknown temporal kind '{tag}'")),
         }
     }
 
-    /// Kind rank for the cross-kind total order (date < localtime < datetime).
+    /// Kind rank for the cross-kind total order (date < localtime < datetime <
+    /// zoned_time < zoned_datetime < duration).
     fn kind_rank(&self) -> u8 {
         match self {
             Self::Date(_) => 0,
             Self::Time(_) => 1,
             Self::DateTime(_) => 2,
+            Self::ZonedTime(_) => 3,
+            Self::ZonedDateTime(_) => 4,
+            Self::Duration(_) => 5,
         }
     }
 
     /// Deterministic TOTAL order over all temporals (for `ORDER BY`/min/max): by
-    /// kind, then chronologically within a kind.
+    /// kind, then chronologically within date/time/datetime and zoned kinds, and
+    /// lexicographically within duration.
     #[must_use]
     pub fn cmp_total(&self, other: &Self) -> Ordering {
         match (self, other) {
             (Self::Date(a), Self::Date(b)) => a.cmp(b),
             (Self::Time(a), Self::Time(b)) => a.cmp(b),
             (Self::DateTime(a), Self::DateTime(b)) => a.cmp(b),
+            (Self::ZonedTime(a), Self::ZonedTime(b)) => a.cmp(b),
+            (Self::ZonedDateTime(a), Self::ZonedDateTime(b)) => a.cmp(b),
+            (Self::Duration(a), Self::Duration(b)) => a.total_key().cmp(&b.total_key()),
             _ => self.kind_rank().cmp(&other.kind_rank()),
         }
     }
@@ -340,6 +641,65 @@ mod tests {
             DateTime::parse("2024-01-15 00:00:00").unwrap().format(),
             "2024-01-15T00:00:00"
         );
+    }
+
+    #[test]
+    fn duration_parse_and_canonical_format() {
+        // Years->months, weeks->days; the canonical form is total M / total D.
+        assert_eq!(
+            Duration::parse("P1Y2M3DT4H5M6S").unwrap().format(),
+            "P14M3DT14706S"
+        );
+        assert_eq!(Duration::parse("P1W").unwrap().format(), "P7D");
+        assert_eq!(Duration::parse("PT0S").unwrap().format(), "PT0S");
+        assert_eq!(Duration::parse("P0D").unwrap().format(), "PT0S"); // all-zero
+        assert_eq!(Duration::parse("PT1.5S").unwrap().format(), "PT1.5S");
+        assert!(Duration::parse("1Y").is_err()); // missing leading P
+        assert!(Duration::parse("P1X").is_err()); // bad field
+    }
+
+    #[test]
+    fn zoned_datetime_round_trip_and_offset_order() {
+        assert_eq!(
+            ZonedDateTime::parse("2024-01-15T12:00:00+01:00")
+                .unwrap()
+                .format(),
+            "2024-01-15T12:00:00+01:00"
+        );
+        assert_eq!(
+            ZonedDateTime::parse("2024-01-15T12:00:00Z")
+                .unwrap()
+                .format(),
+            "2024-01-15T12:00:00Z"
+        );
+        // Same UTC instant, different offset: ordered by instant then offset,
+        // so Z (0) sorts before +01:00 (+60).
+        let a = Temporal::ZonedDateTime(ZonedDateTime::parse("2024-01-15T12:00:00Z").unwrap());
+        let b = Temporal::ZonedDateTime(ZonedDateTime::parse("2024-01-15T13:00:00+01:00").unwrap());
+        assert_eq!(a.cmp_total(&b), Ordering::Less);
+        // A missing offset is an error (a ZONED value requires one).
+        assert!(ZonedDateTime::parse("2024-01-15T12:00:00").is_err());
+    }
+
+    #[test]
+    fn zoned_time_round_trip() {
+        assert_eq!(
+            ZonedTime::parse("13:45:00+02:00").unwrap().format(),
+            "13:45:00+02:00"
+        );
+        assert_eq!(ZonedTime::parse("13:45:00Z").unwrap().format(), "13:45:00Z");
+    }
+
+    #[test]
+    fn cross_kind_rank_spans_all_six() {
+        let d = Temporal::Date(Date::parse("2024-01-01").unwrap());
+        let du = Temporal::Duration(Duration::parse("P1D").unwrap());
+        // date (rank 0) < duration (rank 5).
+        assert_eq!(d.cmp_total(&du), Ordering::Less);
+        // Two durations order lexicographically by component.
+        let d1 = Temporal::Duration(Duration::parse("P1D").unwrap());
+        let d2 = Temporal::Duration(Duration::parse("P2D").unwrap());
+        assert_eq!(d1.cmp_total(&d2), Ordering::Less);
     }
 
     #[test]
