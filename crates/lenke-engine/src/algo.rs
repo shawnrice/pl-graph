@@ -3,13 +3,20 @@
 //! output is DETERMINISTIC and reproducible (the same rule lenke-core follows so
 //! the two engines agree). Deleted (tombstoned) nodes are skipped.
 //!
-//! This slice (I1a) is the deterministic, non-iterative trio — degree, weakly
-//! connected components (union-by-min), and BFS distances. The iterative
-//! algorithms (label propagation, PageRank) need a fixed summation/tiebreak order
-//! for byte-identity and land in I1b.
+//! Five algorithms: the non-iterative trio — degree, weakly connected components
+//! (union-by-min), and BFS distances — plus the iterative pair, PageRank and label
+//! propagation, whose f64 summation / tiebreak order is pinned (node-id and
+//! in-adjacency order) so their results are reproducible and match lenke-core.
 
 use crate::ir::Dir;
 use crate::store::Store;
+use std::collections::HashMap;
+
+/// PageRank defaults, matching lenke-core.
+pub const DEFAULT_DAMPING: f64 = 0.85;
+pub const DEFAULT_PAGERANK_ITERATIONS: u32 = 20;
+/// Label-propagation default round bound, matching lenke-core.
+pub const DEFAULT_LABEL_ITERATIONS: u32 = 10;
 
 /// Resolve an optional edge-type name to `Some(Some(id))` (a specific type),
 /// `Some(None)` (any type), or `None` (a named-but-unknown type → matches
@@ -145,6 +152,119 @@ pub fn bfs_distances(
         .collect()
 }
 
+/// PageRank (pull model): `pr'[v] = (1−d)/N + d·dangling/N + d·Σ_{u→v} pr[u]/outdeg[u]`,
+/// where `dangling = Σ pr[u]` over out-degree-0 nodes and `N` = live node count.
+/// Runs a FIXED `iterations` (no tolerance). Ported from lenke-core: the per-target
+/// pull sums its terms in `in_adj` order (== edge-insertion order for that target),
+/// and the dangling sum is in node-id order, so the accumulation is reproducible
+/// (and matches lenke-core bit-for-bit on the same graph). Unweighted. Returns
+/// `(node, rank)` in ascending-id order; a named-but-unknown edge type makes every
+/// node dangling → the uniform `1/N`.
+#[must_use]
+pub fn pagerank(
+    store: &Store,
+    edge_label: Option<&str>,
+    damping: f64,
+    iterations: u32,
+) -> Vec<(u32, f64)> {
+    let live = store.all_nodes();
+    let nf = live.len() as f64;
+    if live.is_empty() {
+        return Vec::new();
+    }
+    let Some(want) = want_etype(store, edge_label) else {
+        return live.into_iter().map(|v| (v, 1.0 / nf)).collect();
+    };
+    let slots = store.node_count();
+
+    // Out-degree per node (of the wanted type); a 0 marks a dangling node.
+    let mut outdeg = vec![0u32; slots];
+    for &u in &live {
+        let mut c = 0u32;
+        for_each_nbr(store, u, Dir::Out, want, |_| c += 1);
+        outdeg[u as usize] = c;
+    }
+
+    let mut pr = vec![0.0f64; slots];
+    for &v in &live {
+        pr[v as usize] = 1.0 / nf;
+    }
+
+    for _ in 0..iterations {
+        // Dangling mass, summed in node-id order (serial — the f64 order is pinned).
+        let mut dangling = 0.0;
+        for &u in &live {
+            if outdeg[u as usize] == 0 {
+                dangling += pr[u as usize];
+            }
+        }
+        let base = (1.0 - damping) / nf + damping * dangling / nf;
+        let mut next = vec![0.0f64; slots];
+        for &v in &live {
+            // Pull over incoming edges u→v (in `in_adj` order): each source u has
+            // this out-edge, so its out-degree is ≥ 1 (no divide-by-zero).
+            let mut sum = 0.0;
+            for_each_nbr(store, v, Dir::In, want, |u| {
+                sum += pr[u as usize] / f64::from(outdeg[u as usize]);
+            });
+            next[v as usize] = base + damping * sum;
+        }
+        pr = next;
+    }
+    live.into_iter().map(|v| (v, pr[v as usize])).collect()
+}
+
+/// Synchronous label propagation (community detection). Every node starts labelled
+/// with its own id; each round it adopts the label most common among its UNDIRECTED
+/// neighbours (out + in), ties broken by the SMALLEST label id. Rounds are
+/// synchronous (read the frozen snapshot, commit together) for a fixed `iterations`
+/// bound, stopping early once a round changes nothing. Returns `(node, label)` in
+/// ascending-id order; a named-but-unknown edge type keeps every node its own label.
+///
+/// (lenke-core carries labels as external-id STRINGS and breaks ties
+/// lexicographically; this engine has only dense node ids, so the tiebreak is the
+/// smallest id — the results agree whenever id order matches string order.)
+#[must_use]
+pub fn label_propagation(
+    store: &Store,
+    edge_label: Option<&str>,
+    iterations: u32,
+) -> Vec<(u32, u32)> {
+    let n = store.node_count();
+    let live = store.all_nodes();
+    let mut labels: Vec<u32> = (0..n as u32).collect();
+    if let Some(want) = want_etype(store, edge_label) {
+        for _ in 0..iterations {
+            let mut next = labels.clone();
+            for &v in &live {
+                let mut counts: HashMap<u32, u32> = HashMap::new();
+                for_each_nbr(store, v, Dir::Both, want, |u| {
+                    *counts.entry(labels[u as usize]).or_insert(0) += 1;
+                });
+                // Most-frequent label; tie → smallest label id. No neighbours → keep.
+                let mut best: Option<(u32, u32)> = None; // (label, count)
+                for (&lbl, &c) in &counts {
+                    let better = match best {
+                        None => true,
+                        Some((bl, bc)) => c > bc || (c == bc && lbl < bl),
+                    };
+                    if better {
+                        best = Some((lbl, c));
+                    }
+                }
+                if let Some((lbl, _)) = best {
+                    next[v as usize] = lbl;
+                }
+            }
+            if next == labels {
+                break; // converged
+            }
+            labels = next;
+        }
+    }
+    live.into_iter().map(|v| (v, labels[v as usize])).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +336,64 @@ mod tests {
         );
         // A deleted / out-of-range source reaches nothing.
         assert!(bfs_distances(&st, 9, Dir::Out, None).is_empty());
+    }
+
+    #[test]
+    fn label_propagation_converges_a_triangle() {
+        let st = triangle_plus_isolated();
+        // The undirected triangle collapses to one label (its smallest member id,
+        // 0); the isolated node keeps its own label (3).
+        assert_eq!(
+            label_propagation(&st, None, DEFAULT_LABEL_ITERATIONS),
+            vec![(0, 0), (1, 0), (2, 0), (3, 3)]
+        );
+        // No edges (unknown type) → every node keeps its own label.
+        assert_eq!(
+            label_propagation(&st, Some("NOPE"), DEFAULT_LABEL_ITERATIONS),
+            vec![(0, 0), (1, 1), (2, 2), (3, 3)]
+        );
+    }
+
+    #[test]
+    fn pagerank_two_cycle_is_uniform_and_sums_to_one() {
+        // a ↔ b (a→b, b→a): symmetric, no dangling → each rank is exactly 0.5.
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[]);
+        let bb = b.node(&["N"], &[]);
+        b.edge(a, bb, "R");
+        b.edge(bb, a, "R");
+        let st = b.build();
+        let pr = pagerank(&st, None, DEFAULT_DAMPING, DEFAULT_PAGERANK_ITERATIONS);
+        assert!((pr[0].1 - 0.5).abs() < 1e-12);
+        assert!((pr[1].1 - 0.5).abs() < 1e-12);
+        let total: f64 = pr.iter().map(|(_, r)| r).sum();
+        assert!((total - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pagerank_ranks_higher_in_degree_and_is_reproducible() {
+        // 0→2, 1→2, 0→1: node 2 (in-degree 2) outranks node 1 (in-degree 1), which
+        // outranks the source-only node 0.
+        let mut b = Builder::default();
+        let n0 = b.node(&["N"], &[]);
+        let n1 = b.node(&["N"], &[]);
+        let n2 = b.node(&["N"], &[]);
+        b.edge(n0, n2, "R");
+        b.edge(n1, n2, "R");
+        b.edge(n0, n1, "R");
+        let st = b.build();
+        let pr = pagerank(&st, None, DEFAULT_DAMPING, DEFAULT_PAGERANK_ITERATIONS);
+        assert!(pr[2].1 > pr[1].1, "hub should outrank {pr:?}");
+        assert!(
+            pr[1].1 > pr[0].1,
+            "middle should outrank the source-only {pr:?}"
+        );
+        let total: f64 = pr.iter().map(|(_, r)| r).sum();
+        assert!((total - 1.0).abs() < 1e-9);
+        // Deterministic: the same input gives a bit-identical result.
+        assert_eq!(
+            pr,
+            pagerank(&st, None, DEFAULT_DAMPING, DEFAULT_PAGERANK_ITERATIONS)
+        );
     }
 }

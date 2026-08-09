@@ -386,10 +386,16 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       `Vec<(node, result)>` in ascending-id order. 3 tests (triangle + isolated
       node: degrees, 2 components, BFS out/both). Rust API only — the GQL/Gremlin
       CALL surface is I3.
-- [ ] I1b. Iterative algorithms: label propagation + PageRank — need a fixed
-      summation/tiebreak order (sum in node-id order, deterministic damping +
-      iteration count) for reproducibility. Surface the parity question
-      (damping/iterations) before coding.
+- [x] I1b. Iterative algorithms (completes I1): PageRank (pull model, ported from
+      lenke-core — damping 0.85, 20 fixed iterations, dangling mass redistributed,
+      per-target pull summed in `in_adj`/edge-insertion order, dangling in node-id
+      order → mass-conserving and reproducible) and synchronous label propagation
+      (10-round bound, early-stop, undirected, tie → smallest label id). 3 tests:
+      label-prop collapses a triangle to its min-id label; PageRank on a 2-cycle is
+      exactly 0.5/0.5 summing to 1; PageRank ranks higher-in-degree higher, sums to
+      1, and is bit-reproducible. NOTE (J1): label-prop tiebreaks on the dense node
+      id (this engine has no external string ids) vs lenke-core's lexicographic
+      string tiebreak — they agree when id order matches string order.
 - [ ] I2. Arrow IPC egress.
 - [ ] I3. Named-procedure `CALL name(cfg) [YIELD col [AS a], …]` (relocated from
       F3): the ISO-conformant home for the I1 algorithms — the procedure catalog
