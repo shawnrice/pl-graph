@@ -17,6 +17,16 @@ use std::collections::HashMap;
 use crate::ir::{AggFn, CompareOp, Dir, Expr, Plan};
 use crate::value::Value;
 
+/// A parsed relationship pattern `-[var:Type {props}]->`: direction, edge type,
+/// an optional bound variable, and inline properties (a match filter in a
+/// pattern, edge properties to write in an INSERT).
+struct Rel {
+    dir: Dir,
+    etype: String,
+    var: Option<String>,
+    props: Vec<(String, Value)>,
+}
+
 /// A parsed RETURN item: a keyed expression (a grouping key / plain projection)
 /// or an aggregate.
 enum RetItem {
@@ -546,16 +556,21 @@ impl Parser {
     ) -> Result<(), String> {
         let mut prev = self.insert_node(nodes, var_to_idx)?;
         while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow)) {
-            let (dir, etype) = self.rel()?;
+            let rel = self.rel()?;
             let next = self.insert_node(nodes, var_to_idx)?;
-            let (from, to) = match dir {
+            let (from, to) = match rel.dir {
                 Dir::Out => (prev, next),
                 Dir::In => (next, prev),
                 Dir::Both => {
                     return Err("INSERT requires a directed relationship".into());
                 }
             };
-            edges.push(crate::ir::InsertEdge { from, to, etype });
+            edges.push(crate::ir::InsertEdge {
+                from,
+                to,
+                etype: rel.etype,
+                props: rel.props,
+            });
             prev = next;
         }
         Ok(())
@@ -647,18 +662,54 @@ impl Parser {
         slots += 1;
         let mut plan = Plan::Scan { label };
         while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow)) {
-            let (dir, edge) = self.rel()?;
+            let rel = self.rel()?;
             let quant = self.opt_quantifier()?;
             let (v2, _lbl2) = self.node()?; // a hop's landing-node label is ignored for now
             let from = slots - 1;
-            if let Some(v) = v2 {
-                scope.insert(v, slots);
+            // A relationship variable or inline edge properties require binding the
+            // edge as a slot (edge at `slots`, node at `slots+1`).
+            let bind = rel.var.is_some() || !rel.props.is_empty();
+            if let Some((min, max)) = quant {
+                if bind {
+                    return Err(
+                        "a relationship variable / edge properties on a variable-length \
+                         pattern are not supported"
+                            .into(),
+                    );
+                }
+                if let Some(v) = v2 {
+                    scope.insert(v, slots);
+                }
+                slots += 1;
+                plan = plan.var_length(from, rel.dir, Some(&rel.etype), min, max, true);
+            } else if bind {
+                let edge_slot = slots;
+                if let Some(rv) = &rel.var {
+                    scope.insert(rv.clone(), edge_slot);
+                }
+                if let Some(v) = v2 {
+                    scope.insert(v, slots + 1);
+                }
+                slots += 2;
+                plan = plan.expand_edge(from, rel.dir, Some(&rel.etype));
+                // Inline edge props are a match filter on the bound edge.
+                for (k, val) in rel.props {
+                    plan = plan.filter(Expr::Compare {
+                        op: CompareOp::Eq,
+                        left: Box::new(Expr::Prop {
+                            slot: edge_slot,
+                            key: k,
+                        }),
+                        right: Box::new(Expr::Lit(val)),
+                    });
+                }
+            } else {
+                if let Some(v) = v2 {
+                    scope.insert(v, slots);
+                }
+                slots += 1;
+                plan = plan.expand(from, rel.dir, Some(&rel.etype));
             }
-            slots += 1;
-            plan = match quant {
-                Some((min, max)) => plan.var_length(from, dir, Some(&edge), min, max, true),
-                None => plan.expand(from, dir, Some(&edge)),
-            };
         }
         Ok((plan, scope, slots))
     }
@@ -714,25 +765,43 @@ impl Parser {
     // rel := '-' '[' ':' R ']' '->'   (out)
     //      | '-' '[' ':' R ']' '-'    (both)
     //      | '<-' '[' ':' R ']' '-'   (in)
-    fn rel(&mut self) -> Result<(Dir, String), String> {
+    // rel := ('-' | '<-') '[' [var] ':' Type [ '{' props '}' ] ']' ('->' | '-')
+    // Captures an optional relationship VARIABLE and inline edge PROPERTIES.
+    fn rel(&mut self) -> Result<Rel, String> {
         let incoming = self.eat(&Tok::LArrow);
         if !incoming {
             self.expect(&Tok::Minus)?;
         }
         self.expect(&Tok::LBracket)?;
-        self.expect(&Tok::Colon)?;
-        let edge = self.ident()?;
-        self.expect(&Tok::RBracket)?;
-        if incoming {
-            self.expect(&Tok::Minus)?;
-            Ok((Dir::In, edge))
-        } else if self.eat(&Tok::RArrow) {
-            Ok((Dir::Out, edge))
-        } else if self.eat(&Tok::Minus) {
-            Ok((Dir::Both, edge))
+        let var = if matches!(self.peek(), Some(Tok::Ident(_))) {
+            Some(self.ident()?)
         } else {
-            Err(format!("malformed relationship at token {}", self.pos))
-        }
+            None
+        };
+        self.expect(&Tok::Colon)?;
+        let etype = self.ident()?;
+        let props = if matches!(self.peek(), Some(Tok::LBrace)) {
+            self.props()?
+        } else {
+            Vec::new()
+        };
+        self.expect(&Tok::RBracket)?;
+        let dir = if incoming {
+            self.expect(&Tok::Minus)?;
+            Dir::In
+        } else if self.eat(&Tok::RArrow) {
+            Dir::Out
+        } else if self.eat(&Tok::Minus) {
+            Dir::Both
+        } else {
+            return Err(format!("malformed relationship at token {}", self.pos));
+        };
+        Ok(Rel {
+            dir,
+            etype,
+            var,
+            props,
+        })
     }
 
     // items := item ( ',' item )*
@@ -1419,6 +1488,7 @@ mod tests {
                 from: 0,
                 to: 1,
                 etype: "KNOWS".into(),
+                props: vec![],
             }],
         };
         let query = "INSERT (a:Person {name: 'x', age: 1})-[:KNOWS]->(b:Person {name: 'y'})";
@@ -1657,6 +1727,141 @@ mod tests {
     fn merge_without_constraint_errors() {
         let mut st = Builder::default().build(); // no constraint
         assert!(merge(&mut st, "_MERGE (u:User {email: 'a'})").is_err());
+    }
+
+    // --- part 7: relationship variables & edge properties (B5c) ---
+
+    /// INSERT writes inline edge properties; a bound relationship variable reads
+    /// them back (`r.weight`) alongside the landed node (`b.name`).
+    #[test]
+    fn insert_edge_props_then_read_via_rel_var() {
+        use crate::exec::execute;
+        let mut st = Builder::default().build();
+        execute(
+            &super::parse("INSERT (a:P {name: 'a'})-[:R {weight: 0.5}]->(b:P {name: 'b'})")
+                .unwrap(),
+            &mut st,
+        )
+        .unwrap();
+        let out = run(
+            &super::parse("MATCH (a:P)-[r:R]->(b) RETURN r.weight AS w, b.name AS who").unwrap(),
+            &st,
+        );
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(num(&col(&out, 0, "w")), 0.5);
+        assert!(matches!(col(&out, 0, "who"), Value::Str(x) if &*x == "b"));
+    }
+
+    /// WHERE on an edge property filters edges: only the 0.5 edge passes `> 0.4`.
+    #[test]
+    fn where_on_edge_property() {
+        use crate::exec::execute;
+        let mut st = Builder::default().build();
+        execute(
+            &super::parse(
+                "INSERT (a:P {name: 'a'})-[:R {w: 0.5}]->(b:P {name: 'b'}), \
+                 (a)-[:R {w: 0.2}]->(c:P {name: 'c'})",
+            )
+            .unwrap(),
+            &mut st,
+        )
+        .unwrap();
+        let out = run(
+            &super::parse("MATCH (a:P)-[r:R]->(b) WHERE r.w > 0.4 RETURN b.name AS who").unwrap(),
+            &st,
+        );
+        let got: Vec<String> = out
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Str(x) => x.to_string(),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(got, vec!["b"]);
+    }
+
+    /// SET on a bound relationship writes an EDGE property.
+    #[test]
+    fn set_edge_property_via_rel_var() {
+        use crate::exec::execute;
+        let mut st = Builder::default().build();
+        execute(
+            &super::parse("INSERT (a:P {name: 'a'})-[:R {w: 1}]->(b:P {name: 'b'})").unwrap(),
+            &mut st,
+        )
+        .unwrap();
+        execute(
+            &super::parse("MATCH (a:P)-[r:R]->(b) SET r.w = 9").unwrap(),
+            &mut st,
+        )
+        .unwrap();
+        let out = run(
+            &super::parse("MATCH (a:P)-[r:R]->(b) RETURN r.w AS w").unwrap(),
+            &st,
+        );
+        assert_eq!(num(&col(&out, 0, "w")), 9.0);
+    }
+
+    /// An inline edge property in a MATCH pattern is a match filter on the edge.
+    #[test]
+    fn inline_edge_prop_is_a_match_filter() {
+        use crate::exec::execute;
+        let mut st = Builder::default().build();
+        execute(
+            &super::parse(
+                "INSERT (a:P {name: 'a'})-[:R {w: 0.5}]->(b:P {name: 'b'}), \
+                 (a)-[:R {w: 0.2}]->(c:P {name: 'c'})",
+            )
+            .unwrap(),
+            &mut st,
+        )
+        .unwrap();
+        let out = run(
+            &super::parse("MATCH (a:P)-[r:R {w: 0.5}]->(b) RETURN b.name AS who").unwrap(),
+            &st,
+        );
+        let got: Vec<String> = out
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Str(x) => x.to_string(),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(got, vec!["b"]);
+    }
+
+    /// A bound relationship read lowers to `expand_edge` — cross-check vs the hand
+    /// plan (edge at slot 1, node at slot 2).
+    #[test]
+    fn rel_var_read_matches_hand_plan() {
+        use crate::exec::execute;
+        use crate::ir::{Expr, Plan};
+        let mut st = Builder::default().build();
+        execute(
+            &super::parse("INSERT (a:P {name: 'a'})-[:R {w: 0.5}]->(b:P {name: 'b'})").unwrap(),
+            &mut st,
+        )
+        .unwrap();
+        let hand = Plan::Scan {
+            label: Some("P".into()),
+        }
+        .expand_edge(0, crate::ir::Dir::Out, Some("R"))
+        .project(vec![(
+            "w".into(),
+            Expr::Prop {
+                slot: 1,
+                key: "w".into(),
+            },
+        )]);
+        assert_same("MATCH (a:P)-[r:R]->(b) RETURN r.w AS w", &hand, &st);
+    }
+
+    /// A relationship variable on a variable-length pattern is rejected (deferred).
+    #[test]
+    fn rel_var_on_varlength_errors() {
+        assert!(super::parse("MATCH (a:P)-[r:R]->{1,2}(b) RETURN r.w AS w").is_err());
     }
 
     /// Parsed `_MERGE` matches the hand-built `Plan::Merge` (create + on_update):

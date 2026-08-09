@@ -113,7 +113,10 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
                 ids.push(store.add_node(&labels, &props));
             }
             for e in edges {
-                store.add_edge(ids[e.from], ids[e.to], &e.etype);
+                let eid = store.add_edge(ids[e.from], ids[e.to], &e.etype);
+                for (k, v) in &e.props {
+                    store.set_edge_prop(eid, k, v.clone());
+                }
             }
             // Enforce unique constraints on every label this INSERT touched.
             let mut labels: Vec<&str> = nodes
@@ -132,13 +135,16 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
             Ok(empty_rows())
         }
         Plan::Update { input, ops } => {
-            // Read phase: run the match and compute every (node, key, value?) to
-            // apply, into OWNED data — so the immutable borrow ends before the
-            // write phase mutates. Only node slots are updatable.
+            // Read phase: run the match and compute every write into OWNED data —
+            // so the immutable borrow ends before the write phase mutates. A slot
+            // may be a node frontier or (bound relationship) an edge frontier;
+            // SET/REMOVE dispatch on which, so `r.weight` writes an edge property.
             enum Applied {
                 Set(u32, String, Value),
                 Remove(u32, String),
                 Delete(u32),
+                SetEdge(u32, String, Value),
+                RemoveEdge(u32, String),
             }
             let mut applied: Vec<Applied> = Vec::new();
             {
@@ -148,20 +154,44 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
                     match op {
                         crate::ir::SetOp::Set { slot, key, value } => {
                             let vals = eval(value, store, &batch);
-                            if let Col::Nodes(ids) = batch.slot(*slot) {
-                                for (i, &id) in ids.iter().enumerate() {
-                                    applied.push(Applied::Set(id, key.clone(), vals.value_at(i)));
+                            match batch.slot(*slot) {
+                                Col::Nodes(ids) => {
+                                    for (i, &id) in ids.iter().enumerate() {
+                                        applied.push(Applied::Set(
+                                            id,
+                                            key.clone(),
+                                            vals.value_at(i),
+                                        ));
+                                    }
                                 }
+                                Col::Edges(eids) => {
+                                    for (i, &e) in eids.iter().enumerate() {
+                                        applied.push(Applied::SetEdge(
+                                            e,
+                                            key.clone(),
+                                            vals.value_at(i),
+                                        ));
+                                    }
+                                }
+                                _ => {}
                             }
                         }
-                        crate::ir::SetOp::Remove { slot, key } => {
-                            if let Col::Nodes(ids) = batch.slot(*slot) {
+                        crate::ir::SetOp::Remove { slot, key } => match batch.slot(*slot) {
+                            Col::Nodes(ids) => {
                                 for &id in ids {
                                     applied.push(Applied::Remove(id, key.clone()));
                                 }
                             }
-                        }
+                            Col::Edges(eids) => {
+                                for &e in eids {
+                                    applied.push(Applied::RemoveEdge(e, key.clone()));
+                                }
+                            }
+                            _ => {}
+                        },
                         crate::ir::SetOp::Delete { slot } => {
+                            // Edge deletion via drop() needs the endpoints (not just
+                            // the eid); deferred with Gremlin addE. Node delete here.
                             if let Col::Nodes(ids) = batch.slot(*slot) {
                                 for &id in ids {
                                     applied.push(Applied::Delete(id));
@@ -171,12 +201,14 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
                     }
                 }
             }
-            // Write phase: apply in op/row order (last write wins per node+key;
+            // Write phase: apply in op/row order (last write wins per element+key;
             // delete_node is idempotent for a node matched by several rows).
             for a in applied {
                 match a {
                     Applied::Set(node, key, value) => store.set_prop(node, &key, value),
                     Applied::Remove(node, key) => store.remove_prop(node, &key),
+                    Applied::SetEdge(eid, key, value) => store.set_edge_prop(eid, &key, value),
+                    Applied::RemoveEdge(eid, key) => store.remove_edge_prop(eid, &key),
                     Applied::Delete(node) => store.delete_node(node),
                 }
             }
@@ -1770,6 +1802,7 @@ mod tests {
                 from: 0,
                 to: 1,
                 etype: "R".into(),
+                props: vec![],
             }],
         };
         let out = execute(&plan, &mut store).unwrap();

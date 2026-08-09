@@ -256,12 +256,13 @@ pub struct InsertNode {
 }
 
 /// An edge to create in an `Insert`: a typed relationship from `nodes[from]` to
-/// `nodes[to]`.
+/// `nodes[to]`, with inline `(key, value)` properties.
 #[derive(Clone, Debug)]
 pub struct InsertEdge {
     pub from: usize,
     pub to: usize,
     pub etype: String,
+    pub props: Vec<(String, Value)>,
 }
 
 impl Plan {

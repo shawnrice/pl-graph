@@ -470,9 +470,10 @@ impl Store {
         id
     }
 
-    /// Add a directed edge `from -[label]-> to`. Interns the edge type if new and
-    /// assigns a fresh `eid` shared by the out and in adjacency entries.
-    pub fn add_edge(&mut self, from: u32, to: u32, label: &str) {
+    /// Add a directed edge `from -[label]-> to`; returns its `eid` (shared by the
+    /// out and in adjacency entries). Interns the edge type if new. The returned
+    /// eid lets the caller attach edge properties to the new edge.
+    pub fn add_edge(&mut self, from: u32, to: u32, label: &str) -> u32 {
         assert!(
             (from as usize) < self.node_count && (to as usize) < self.node_count,
             "edge endpoint out of range"
@@ -498,6 +499,7 @@ impl Store {
                 eid,
             });
         }
+        eid
     }
 
     /// Whether node `node` carries a present value for `key` (distinct from a

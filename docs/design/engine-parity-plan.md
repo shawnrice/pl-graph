@@ -71,8 +71,12 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
         frontier; edge slot at W, node at W+1); `Prop` on an edge slot reads
         `store.edge_prop`. `for_each_nbr` now yields `(nbr, eid)`; width/chain_width
         count +2 for a bound edge; node-only Expand unchanged (default false).
-  - [ ] B5c. Language surface: GQL `[r:T {props}]` binding + `r.key` in
-        RETURN/WHERE, edge props in INSERT/SET; Gremlin `addE`/edge `values`.
+  - [x] B5c. GQL edge language surface: `[r:T]` relationship-variable binding →
+        `expand_edge` (r at slot W, node W+1); `r.key` in RETURN/WHERE; inline
+        `[:T {props}]` = edge props in INSERT and a match filter in MATCH; SET/
+        REMOVE on a bound `r` writes edge props. Rel var on var-length rejected.
+  - [ ] B6. Gremlin `addE` (deferred from B4/B5c): needs vertex-reference
+        traversal (`V(id)`/`as`/`from`/`to`) + edge props. Its own slice.
 
 ### Phase C — Persistence
 
