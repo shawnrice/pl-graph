@@ -222,6 +222,13 @@ enum Undo {
         prev_present: bool,
         prev_value: Value,
     },
+    /// Undo `set_edge_prop`/`remove_edge_prop`: restore the edge cell (`None` =
+    /// was absent).
+    RestoreEdgeCell {
+        eid: u32,
+        key: String,
+        prev: Option<Value>,
+    },
     /// Undo `delete_edge`: re-insert the exact adjacency entries removed, each
     /// tagged `(node, is_out, adj)` so it goes back to the right list.
     RestoreEdge { entries: Vec<(u32, bool, Adj)> },
@@ -277,6 +284,11 @@ pub struct Store {
     /// label may carry a given key tuple. Enforced by the write statements, not
     /// the store primitives (which stay infallible for rollback).
     unique: Vec<(String, Vec<String>)>,
+    /// edge properties: key -> (eid -> value). Boxed (not columnar) — edges are a
+    /// less hot path than node scans, and eids are sparse after deletes. A deleted
+    /// edge's props are left behind (eids are never reused, so a dead eid is never
+    /// read); reclaiming them is a later tidy.
+    edge_props: HashMap<String, HashMap<u32, Value>>,
 }
 
 impl Store {
@@ -545,6 +557,61 @@ impl Store {
         }
     }
 
+    // --- Edge properties -------------------------------------------------
+    //
+    // Keyed by the edge's `eid` (shared by its out/in adjacency entries), so a
+    // property is one value per edge regardless of direction. Undo-logged like
+    // node properties.
+
+    /// Read edge `eid`'s `key` (NULL if absent).
+    #[must_use]
+    pub fn edge_prop(&self, eid: u32, key: &str) -> Value {
+        self.edge_props
+            .get(key)
+            .and_then(|m| m.get(&eid))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// Whether edge `eid` carries a present value for `key`.
+    #[must_use]
+    pub fn has_edge_prop(&self, eid: u32, key: &str) -> bool {
+        self.edge_props
+            .get(key)
+            .is_some_and(|m| m.contains_key(&eid))
+    }
+
+    /// Set edge `eid`'s `key` to `value`.
+    pub fn set_edge_prop(&mut self, eid: u32, key: &str, value: Value) {
+        let rec = self.undo.is_some().then(|| Undo::RestoreEdgeCell {
+            eid,
+            key: key.to_string(),
+            prev: self.edge_props.get(key).and_then(|m| m.get(&eid)).cloned(),
+        });
+        self.edge_props
+            .entry(key.to_string())
+            .or_default()
+            .insert(eid, value);
+        if let (Some(rec), Some(log)) = (rec, self.undo.as_mut()) {
+            log.push(rec);
+        }
+    }
+
+    /// Remove edge `eid`'s `key` (reads NULL again).
+    pub fn remove_edge_prop(&mut self, eid: u32, key: &str) {
+        let rec = self.undo.is_some().then(|| Undo::RestoreEdgeCell {
+            eid,
+            key: key.to_string(),
+            prev: self.edge_props.get(key).and_then(|m| m.get(&eid)).cloned(),
+        });
+        if let Some(m) = self.edge_props.get_mut(key) {
+            m.remove(&eid);
+        }
+        if let (Some(rec), Some(log)) = (rec, self.undo.as_mut()) {
+            log.push(rec);
+        }
+    }
+
     /// Delete the edge identified by `eid` between endpoints `u` and `v`. The eid
     /// is unique and shared by the edge's out/in entries; removing it from both
     /// endpoints' out AND in lists deletes the edge regardless of which endpoint
@@ -732,6 +799,16 @@ impl Store {
                     self.apply_remove_prop(node, &key);
                 }
             }
+            Undo::RestoreEdgeCell { eid, key, prev } => match prev {
+                Some(v) => {
+                    self.edge_props.entry(key).or_default().insert(eid, v);
+                }
+                None => {
+                    if let Some(m) = self.edge_props.get_mut(&key) {
+                        m.remove(&eid);
+                    }
+                }
+            },
             Undo::RestoreEdge { entries } => {
                 for (node, is_out, adj) in entries {
                     if is_out {
@@ -875,6 +952,7 @@ impl Builder {
             deleted: vec![false; n],
             undo: None,
             unique: Vec::new(),
+            edge_props: HashMap::new(),
         }
     }
 }
@@ -1172,6 +1250,42 @@ mod tests {
         st.commit();
         assert_eq!(st.node_count(), 1);
         assert!(matches!(st.prop(a, "name"), Value::Str(x) if &*x == "a"));
+    }
+
+    // --- Edge properties ---
+
+    /// Set / read / remove an edge property, keyed by the edge's eid.
+    #[test]
+    fn edge_property_set_read_remove() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&[], &[]);
+        let b = st.add_node(&[], &[]);
+        st.add_edge(a, b, "R");
+        let eid = st.out(a)[0].eid;
+        assert!(st.edge_prop(eid, "weight").is_null()); // absent
+        st.set_edge_prop(eid, "weight", n(0.5));
+        assert!(st.has_edge_prop(eid, "weight"));
+        assert!(matches!(st.edge_prop(eid, "weight"), Value::Num(x) if x == 0.5));
+        st.remove_edge_prop(eid, "weight");
+        assert!(!st.has_edge_prop(eid, "weight"));
+        assert!(st.edge_prop(eid, "weight").is_null());
+    }
+
+    /// An edge property write rolls back with the transaction.
+    #[test]
+    fn edge_property_rolls_back() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&[], &[]);
+        let b = st.add_node(&[], &[]);
+        st.add_edge(a, b, "R");
+        let eid = st.out(a)[0].eid;
+        st.set_edge_prop(eid, "weight", n(1.0)); // committed (autocommit)
+        st.begin();
+        st.set_edge_prop(eid, "weight", n(2.0));
+        st.set_edge_prop(eid, "fresh", s("x"));
+        st.rollback();
+        assert!(matches!(st.edge_prop(eid, "weight"), Value::Num(x) if x == 1.0)); // restored
+        assert!(!st.has_edge_prop(eid, "fresh")); // new key gone
     }
 
     // --- Unique constraints ---

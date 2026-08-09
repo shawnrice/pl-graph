@@ -62,10 +62,15 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
       Insert; property folds into addV or wraps a read traversal in Update;
       drop→node delete via new `SetOp::Delete`). Read-after-write is rejected.
       `addE` DEFERRED to B5 (needs V(id)/from/to vertex-refs + the edge model).
-- [ ] B5. Relationship variables + edge properties (discovered in B1): bind an
-      edge as a slot in `Expand`; store edge properties keyed by `eid`; read
-      `r.key`; accept inline edge props in INSERT/SET. Needed before edge-property
-      filters (Phase E) and `[r:T]->` projections.
+- B5. Relationship variables + edge properties (discovered in B1), split:
+  - [x] B5a. Store edge-property model: `set_edge_prop`/`edge_prop`/
+        `remove_edge_prop`/`has_edge_prop` keyed by `eid`, undo-logged
+        (RestoreEdgeCell). Boxed key→(eid→value) map, not columnar (edges are
+        cooler); dead-eid props linger on delete (safe — eids never reused).
+  - [ ] B5b. Bind the edge as a slot in `Expand` (a `Col::Edges` frontier); `Prop`
+        on an edge slot reads an edge property.
+  - [ ] B5c. Language surface: GQL `[r:T {props}]` binding + `r.key` in
+        RETURN/WHERE, edge props in INSERT/SET; Gremlin `addE`/edge `values`.
 
 ### Phase C — Persistence
 
