@@ -213,7 +213,10 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
             // Frontier fast path: a scalar count over an Expand chain need not
             // build the wide intermediate batch. Falls back to the general
             // aggregate for every shape it does not recognize.
-            if let Some(b) = try_fused_count(input, keys, aggs, store) {
+            if let Some(b) = try_fused_count(input, keys, aggs, store)
+                .or_else(|| try_node_grouped_count(input, keys, aggs, store))
+                .or_else(|| try_frontier_aggregate(input, keys, aggs, store))
+            {
                 b
             } else {
                 aggregate(&pull(input, store, track), store, keys, aggs)
@@ -765,6 +768,140 @@ fn try_fused_count(
 /// result.
 fn scalar_num(x: f64) -> Batch {
     Batch::of(vec![Col::Gen(vec![Value::Num(x)])])
+}
+
+/// Does `expr` reference no slot other than `s` (and never the path)? Literals
+/// and comparisons over slot `s` qualify; any other slot, or `Expr::Path`,
+/// disqualifies — the signal that the frontier alone is enough to evaluate it.
+fn refs_only_slot(expr: &Expr, s: usize) -> bool {
+    match expr {
+        Expr::Lit(_) => true,
+        Expr::Slot(n) => *n == s,
+        Expr::Prop { slot, .. } => *slot == s,
+        Expr::Path => false,
+        Expr::Not(x) => refs_only_slot(x, s),
+        Expr::And(a, b) | Expr::Or(a, b) => refs_only_slot(a, s) && refs_only_slot(b, s),
+        Expr::Compare { left, right, .. } => refs_only_slot(left, s) && refs_only_slot(right, s),
+    }
+}
+
+/// Rewrite every reference to slot `from` in `expr` to slot `to`. Used to retarget
+/// frontier-only expressions onto a one-slot frontier batch. Callers guarantee
+/// (via [`refs_only_slot`]) that no other slot appears.
+fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
+    let go = |e| Box::new(remap_slot(e, from, to));
+    match expr {
+        Expr::Slot(n) if *n == from => Expr::Slot(to),
+        Expr::Prop { slot, key } if *slot == from => Expr::Prop {
+            slot: to,
+            key: key.clone(),
+        },
+        Expr::Slot(_) | Expr::Prop { .. } | Expr::Lit(_) | Expr::Path => expr.clone(),
+        Expr::Not(x) => Expr::Not(go(x)),
+        Expr::And(a, b) => Expr::And(go(a), go(b)),
+        Expr::Or(a, b) => Expr::Or(go(a), go(b)),
+        Expr::Compare { op, left, right } => Expr::Compare {
+            op: *op,
+            left: go(left),
+            right: go(right),
+        },
+    }
+}
+
+/// `count(*)` grouped by a single property of the frontier node, computed by
+/// grouping on the integer node id FIRST, then merging node groups by the
+/// property value. The property is a function of the node, so two rows on the
+/// same node share a property value: grouping 8M rows by their (cheap) node id
+/// and reading/hashing the property for only the distinct nodes replaces millions
+/// of string hashes and `Arc` clones with integer ones. First-seen order is
+/// preserved because the distinct nodes are visited in first-appearance order, so
+/// a property value is first seen at the earliest node — hence earliest row —
+/// carrying it. `None` for any other shape (non-count aggregate, key that is not
+/// a lone frontier property), which falls through to the general frontier path.
+fn try_node_grouped_count(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    let [agg] = aggs else { return None };
+    if agg.func != AggFn::Count || agg.arg.is_some() {
+        return None;
+    }
+    let [(_, key_expr)] = keys else { return None };
+    let last = chain_width(input)? - 1;
+    let Expr::Prop { slot, key } = key_expr else {
+        return None;
+    };
+    if *slot != last {
+        return None;
+    }
+    let frontier = frontier_ids(input, store)?;
+    let n = frontier.len();
+
+    // Level 1: group by node id, tally per node, record each node's first row.
+    let (node_of, first) = group_by(n, frontier.iter().copied());
+    let mut node_count = vec![0f64; first.len()];
+    for &g in &node_of {
+        node_count[g as usize] += 1.0;
+    }
+    let rep_ids: Vec<u32> = first.iter().map(|&i| frontier[i]).collect();
+
+    // Read the grouping property for the DISTINCT nodes only.
+    let key_col = read_property(store, &Col::Nodes(rep_ids), key);
+
+    // Level 2: merge node groups by property value, summing their counts.
+    let (val_of, val_first) = assign_groups(std::slice::from_ref(&key_col), key_col.len());
+    let mut counts = vec![0f64; val_first.len()];
+    for (node_group, &vg) in val_of.iter().enumerate() {
+        counts[vg as usize] += node_count[node_group];
+    }
+    let key_out = key_col.gather(&val_first);
+    Some(Batch::of(vec![
+        key_out,
+        Col::Gen(counts.into_iter().map(Value::Num).collect()),
+    ]))
+}
+
+/// Run a grouped/scalar aggregate over a Scan/Expand chain WITHOUT materializing
+/// the earlier slots: when every key and aggregate argument reads only the
+/// frontier (last) slot, the chain's frontier is all the aggregate needs. The
+/// frontier ([`frontier_ids`]) is produced in the same row order the full batch
+/// would have, so first-seen group order — and every value — is identical to the
+/// general path; this only drops the wasted slot columns. `None` for any shape it
+/// does not handle (a filter/join in the chain, an expression over an earlier
+/// slot), which falls back to the general aggregate.
+fn try_frontier_aggregate(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    let last = chain_width(input)? - 1; // frontier slot index of the whole chain
+    let key_ok = keys.iter().all(|(_, e)| refs_only_slot(e, last));
+    let agg_ok = aggs
+        .iter()
+        .all(|a| a.arg.as_ref().is_none_or(|e| refs_only_slot(e, last)));
+    if !key_ok || !agg_ok {
+        return None;
+    }
+    let frontier = frontier_ids(input, store)?;
+    let batch = Batch::of(vec![Col::Nodes(frontier)]);
+    // Retarget the frontier-only expressions onto the one-slot frontier batch.
+    let keys: Vec<(String, Expr)> = keys
+        .iter()
+        .map(|(n, e)| (n.clone(), remap_slot(e, last, 0)))
+        .collect();
+    let aggs: Vec<Agg> = aggs
+        .iter()
+        .map(|a| Agg {
+            func: a.func,
+            arg: a.arg.as_ref().map(|e| remap_slot(e, last, 0)),
+            distinct: a.distinct,
+            name: a.name.clone(),
+        })
+        .collect();
+    Some(aggregate(&batch, store, &keys, &aggs))
 }
 
 /// A quantified hop: for each input row, enumerate every path of length in
@@ -1479,6 +1616,63 @@ mod tests {
             );
         let out = run(&plan, &store);
         assert_eq!(num(&out.rows[0][0]), 1.0);
+    }
+
+    /// Grouped count over an Expand chain (the frontier-mode aggregate). Group
+    /// the reached KNOWS neighbours by name: alice→{bob,carol}, bob→{carol}, so
+    /// the frontier is [bob, carol, carol] → bob:1, carol:2, first-seen order.
+    #[test]
+    fn frontier_grouped_count_matches() {
+        let store = social();
+        let plan = scan("Person").expand(0, Dir::Out, Some("KNOWS")).aggregate(
+            vec![("who".into(), prop(1, "name"))],
+            vec![agg(AggFn::Count, None, false, "c")],
+        );
+        let out = run(&plan, &store);
+        assert_eq!(as_str(&out.rows[0][0]), "bob");
+        assert_eq!(num(&out.rows[0][1]), 1.0);
+        assert_eq!(as_str(&out.rows[1][0]), "carol");
+        assert_eq!(num(&out.rows[1][1]), 2.0);
+    }
+
+    /// The node-grouped count path when DISTINCT nodes share a property value —
+    /// the level-2 merge must combine them. a→{b,c,d}; b,d are in nyc, c in sf.
+    /// Group reached neighbours by city: nyc:2 (b,d), sf:1, first-seen order.
+    #[test]
+    fn node_grouped_count_merges_shared_value() {
+        let mut b = Builder::default();
+        let a = b.node(&["P"], &[("name", s("a"))]);
+        let n1 = b.node(&["P"], &[("city", s("nyc"))]);
+        let n2 = b.node(&["P"], &[("city", s("sf"))]);
+        let n3 = b.node(&["P"], &[("city", s("nyc"))]);
+        b.edge(a, n1, "R");
+        b.edge(a, n2, "R");
+        b.edge(a, n3, "R");
+        let store = b.build();
+        let plan = scan("P").expand(0, Dir::Out, Some("R")).aggregate(
+            vec![("city".into(), prop(1, "city"))],
+            vec![agg(AggFn::Count, None, false, "c")],
+        );
+        let out = run(&plan, &store);
+        assert_eq!(as_str(&out.rows[0][0]), "nyc");
+        assert_eq!(num(&out.rows[0][1]), 2.0);
+        assert_eq!(as_str(&out.rows[1][0]), "sf");
+        assert_eq!(num(&out.rows[1][1]), 1.0);
+    }
+
+    /// A grouped SUM over the frontier's property, to exercise a non-count agg on
+    /// the frontier path: sum the neighbours' ages by name. bob(25) reached once;
+    /// carol(40) reached twice → 80.
+    #[test]
+    fn frontier_grouped_sum_matches() {
+        let store = social();
+        let plan = scan("Person").expand(0, Dir::Out, Some("KNOWS")).aggregate(
+            vec![("who".into(), prop(1, "name"))],
+            vec![agg(AggFn::Sum, Some(prop(1, "age")), false, "s")],
+        );
+        let out = run(&plan, &store);
+        assert_eq!(num(&out.rows[0][1]), 25.0); // bob
+        assert_eq!(num(&out.rows[1][1]), 80.0); // carol twice
     }
 
     /// An unknown final edge label fuses to zero rows.
