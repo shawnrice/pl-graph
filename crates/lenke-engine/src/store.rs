@@ -56,6 +56,131 @@ impl Column {
             _ => Value::Null,
         }
     }
+
+    /// The number of node slots this column holds (== `node_count`).
+    fn len(&self) -> usize {
+        match self {
+            Self::Num { present, .. }
+            | Self::Str { present, .. }
+            | Self::Bool { present, .. }
+            | Self::Gen { present, .. } => present.len(),
+        }
+    }
+
+    /// A fresh column sized for `n` nodes, all absent, whose type matches `v`'s —
+    /// or `Gen` for a value with no unboxed column form (`Null`, `List`).
+    fn new_absent(v: &Value, n: usize) -> Self {
+        match v {
+            Value::Num(_) => Self::Num {
+                data: vec![0.0; n],
+                present: vec![false; n],
+            },
+            Value::Str(_) => Self::Str {
+                data: vec![Arc::from(""); n],
+                present: vec![false; n],
+            },
+            Value::Bool(_) => Self::Bool {
+                data: vec![false; n],
+                present: vec![false; n],
+            },
+            Value::Null | Value::List(_) => Self::Gen {
+                data: vec![Value::Null; n],
+                present: vec![false; n],
+            },
+        }
+    }
+
+    /// Append one absent slot — what every existing column does when a node is
+    /// added, so all columns stay length `node_count`.
+    fn push_absent(&mut self) {
+        match self {
+            Self::Num { data, present } => {
+                data.push(0.0);
+                present.push(false);
+            }
+            Self::Str { data, present } => {
+                data.push(Arc::from(""));
+                present.push(false);
+            }
+            Self::Bool { data, present } => {
+                data.push(false);
+                present.push(false);
+            }
+            Self::Gen { data, present } => {
+                data.push(Value::Null);
+                present.push(false);
+            }
+        }
+    }
+
+    /// Whether this column can store `v` without a type change.
+    fn accepts(&self, v: &Value) -> bool {
+        matches!(
+            (self, v),
+            (Self::Num { .. }, Value::Num(_))
+                | (Self::Str { .. }, Value::Str(_))
+                | (Self::Bool { .. }, Value::Bool(_))
+                | (Self::Gen { .. }, _)
+        )
+    }
+
+    /// Rebuild as a `Gen` column preserving present values — the promotion a typed
+    /// column undergoes when a value of another type is written to it.
+    fn to_gen(&self) -> Self {
+        let n = self.len();
+        let mut data = vec![Value::Null; n];
+        let mut present = vec![false; n];
+        for i in 0..n {
+            if self.present_at(i) {
+                data[i] = self.read(i);
+                present[i] = true;
+            }
+        }
+        Self::Gen { data, present }
+    }
+
+    fn present_at(&self, i: usize) -> bool {
+        match self {
+            Self::Num { present, .. }
+            | Self::Str { present, .. }
+            | Self::Bool { present, .. }
+            | Self::Gen { present, .. } => present[i],
+        }
+    }
+
+    /// Set node `i` to `v`, marking it present. The caller guarantees the column
+    /// `accepts` `v` (promoting to `Gen` first if not).
+    fn set(&mut self, i: usize, v: Value) {
+        match (self, v) {
+            (Self::Num { data, present }, Value::Num(x)) => {
+                data[i] = x;
+                present[i] = true;
+            }
+            (Self::Str { data, present }, Value::Str(s)) => {
+                data[i] = s;
+                present[i] = true;
+            }
+            (Self::Bool { data, present }, Value::Bool(b)) => {
+                data[i] = b;
+                present[i] = true;
+            }
+            (Self::Gen { data, present }, v) => {
+                data[i] = v;
+                present[i] = true;
+            }
+            _ => unreachable!("column must accept the value (promote to Gen first)"),
+        }
+    }
+
+    /// Mark node `i` absent — a removed property reads as NULL again.
+    fn set_absent(&mut self, i: usize) {
+        match self {
+            Self::Num { present, .. }
+            | Self::Str { present, .. }
+            | Self::Bool { present, .. }
+            | Self::Gen { present, .. } => present[i] = false,
+        }
+    }
 }
 
 /// One adjacency entry: the neighbour node, the edge's interned type id, and the
@@ -85,6 +210,9 @@ pub struct Store {
     /// per-node outgoing / incoming adjacency, indexed by node id.
     out_adj: Vec<Vec<Adj>>,
     in_adj: Vec<Vec<Adj>>,
+    /// next edge id to hand out — monotonic, so an out/in pair shares one id and
+    /// ids stay unique across incremental writes.
+    next_eid: u32,
 }
 
 impl Store {
@@ -140,6 +268,80 @@ impl Store {
     pub fn column(&self, key: &str) -> Option<&Column> {
         self.props.get(key)
     }
+
+    // --- Mutation ---------------------------------------------------------
+    //
+    // The write path. Nodes get the next dense id; every existing property column
+    // grows one absent slot so all columns stay length `node_count`. Edges take a
+    // monotonic `eid` shared by their out/in entries. Properties are set into a
+    // typed column, promoting it to `Gen` on a type change. These are the store
+    // primitives the language write statements (Phase B) and transactions (A3)
+    // build on; they do not enforce constraints — that is a later, higher layer.
+
+    /// Add a node with `labels` and `(key, value)` properties; returns its id.
+    pub fn add_node(&mut self, labels: &[&str], props: &[(&str, Value)]) -> u32 {
+        let id = self.node_count as u32;
+        self.node_count += 1;
+        // Keep every existing column the same length as the node set.
+        for col in self.props.values_mut() {
+            col.push_absent();
+        }
+        self.out_adj.push(Vec::new());
+        self.in_adj.push(Vec::new());
+        for l in labels {
+            // ids are handed out increasing, so appending keeps the bucket sorted.
+            self.by_label.entry((*l).to_string()).or_default().push(id);
+        }
+        for (k, v) in props {
+            self.set_prop(id, k, v.clone());
+        }
+        id
+    }
+
+    /// Add a directed edge `from -[label]-> to`. Interns the edge type if new and
+    /// assigns a fresh `eid` shared by the out and in adjacency entries.
+    pub fn add_edge(&mut self, from: u32, to: u32, label: &str) {
+        assert!(
+            (from as usize) < self.node_count && (to as usize) < self.node_count,
+            "edge endpoint out of range"
+        );
+        let next = self.etype_ids.len() as u32;
+        let etype = *self.etype_ids.entry(label.to_string()).or_insert(next);
+        let eid = self.next_eid;
+        self.next_eid += 1;
+        self.out_adj[from as usize].push(Adj {
+            nbr: to,
+            etype,
+            eid,
+        });
+        self.in_adj[to as usize].push(Adj {
+            nbr: from,
+            etype,
+            eid,
+        });
+    }
+
+    /// Set node `node`'s `key` to `value`, creating the column if new and
+    /// promoting it to `Gen` if `value`'s type differs from the column's.
+    pub fn set_prop(&mut self, node: u32, key: &str, value: Value) {
+        let n = self.node_count;
+        let col = self
+            .props
+            .entry(key.to_string())
+            .or_insert_with(|| Column::new_absent(&value, n));
+        if !col.accepts(&value) {
+            *col = col.to_gen();
+        }
+        col.set(node as usize, value);
+    }
+
+    /// Remove node `node`'s `key` — it reads as NULL again. (Distinct from setting
+    /// it to a stored `Null`; that distinction is a Phase-E concern.)
+    pub fn remove_prop(&mut self, node: u32, key: &str) {
+        if let Some(col) = self.props.get_mut(key) {
+            col.set_absent(node as usize);
+        }
+    }
 }
 
 /// Builds a `Store`. Node ids are assigned in insertion order.
@@ -188,6 +390,7 @@ impl Builder {
             .collect();
         let mut out_adj = vec![Vec::new(); n];
         let mut in_adj = vec![Vec::new(); n];
+        let edge_count = self.edges.len() as u32;
         for (eid, (from, to, etype)) in self.edges.into_iter().enumerate() {
             let eid = eid as u32;
             out_adj[from as usize].push(Adj {
@@ -208,6 +411,8 @@ impl Builder {
             etype_ids: self.etype_ids,
             out_adj,
             in_adj,
+            // Incremental edges continue the id sequence the build laid down.
+            next_eid: edge_count,
         }
     }
 }
@@ -255,5 +460,87 @@ fn materialize(pairs: Vec<(u32, Value)>, n: usize) -> Column {
             present[i as usize] = true;
         }
         Column::Gen { data, present }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(x: &str) -> Value {
+        Value::Str(Arc::from(x))
+    }
+    fn n(x: f64) -> Value {
+        Value::Num(x)
+    }
+
+    /// Build an empty store, add two nodes and an edge, and read it all back —
+    /// hand-verified: ids 0 and 1, one out-edge 0→1 mirrored as an in-edge.
+    #[test]
+    fn add_nodes_and_edge_then_read_back() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[("name", s("a"))]);
+        let b = st.add_node(&["P"], &[("name", s("b"))]);
+        assert_eq!((a, b), (0, 1));
+        assert_eq!(st.node_count(), 2);
+        st.add_edge(a, b, "R");
+        assert_eq!(st.nodes_with_label("P"), &[0, 1]);
+        assert_eq!(st.out(a).len(), 1);
+        assert_eq!(st.out(a)[0].nbr, b);
+        assert_eq!(st.inc(b)[0].nbr, a);
+        assert_eq!(st.out(a)[0].eid, st.inc(b)[0].eid); // shared edge id
+        assert!(matches!(st.prop(a, "name"), Value::Str(x) if &*x == "a"));
+    }
+
+    /// Adding a node AFTER a property column exists extends that column with an
+    /// absent slot: the old node keeps its value, the new node reads NULL.
+    #[test]
+    fn add_node_extends_existing_columns() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[("age", n(30.0))]);
+        let b = st.add_node(&["P"], &[]); // no age
+        assert!(matches!(st.prop(a, "age"), Value::Num(x) if x == 30.0));
+        assert!(st.prop(b, "age").is_null());
+    }
+
+    /// Writing a value of a different type promotes the column to `Gen`; both the
+    /// old-typed and new value read back correctly.
+    #[test]
+    fn set_prop_promotes_on_type_change() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[("v", n(1.0))]);
+        let b = st.add_node(&["P"], &[("v", n(2.0))]);
+        st.set_prop(a, "v", s("two")); // Num column, Str value -> promote to Gen
+        assert!(matches!(st.prop(a, "v"), Value::Str(x) if &*x == "two"));
+        assert!(matches!(st.prop(b, "v"), Value::Num(x) if x == 2.0)); // preserved
+    }
+
+    /// `remove_prop` makes the property read NULL again; overwriting sets it.
+    #[test]
+    fn set_and_remove_prop() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[("age", n(30.0))]);
+        st.set_prop(a, "age", n(31.0));
+        assert!(matches!(st.prop(a, "age"), Value::Num(x) if x == 31.0));
+        st.remove_prop(a, "age");
+        assert!(st.prop(a, "age").is_null());
+    }
+
+    /// A repeated edge type interns once (same `etype`) but each edge gets a
+    /// distinct `eid`. Ids continue after a `build()`-created edge.
+    #[test]
+    fn edge_type_interns_once_ids_unique() {
+        let mut b = Builder::default();
+        let x = b.node(&["P"], &[]);
+        let y = b.node(&["P"], &[]);
+        b.edge(x, y, "R"); // eid 0 at build
+        let mut st = b.build();
+        st.add_edge(x, y, "R"); // eid 1, same type
+        st.add_edge(x, y, "S"); // eid 2, new type
+        assert_eq!(st.out(x).len(), 3);
+        let eids: Vec<u32> = st.out(x).iter().map(|a| a.eid).collect();
+        assert_eq!(eids, vec![0, 1, 2]); // continued, unique
+        assert_eq!(st.out(x)[0].etype, st.out(x)[1].etype); // R == R
+        assert_ne!(st.out(x)[1].etype, st.out(x)[2].etype); // R != S
     }
 }
