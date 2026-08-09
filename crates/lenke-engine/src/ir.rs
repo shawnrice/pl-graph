@@ -50,6 +50,13 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    /// A scalar function call `name(args…)` (name lowercased). Numeric functions
+    /// (abs/sign/floor/ceil/round/sqrt) are finite-or-null per arg; `coalesce`
+    /// returns the first non-null arg. NOT the aggregates (those are `Agg`).
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
 }
 
 /// A binary arithmetic operator.

@@ -350,6 +350,7 @@ fn max_slot(expr: &Expr) -> Option<usize> {
         | Expr::Arith {
             left: a, right: b, ..
         } => merge_max(max_slot(a), max_slot(b)),
+        Expr::Call { args, .. } => args.iter().fold(None, |acc, a| merge_max(acc, max_slot(a))),
         Expr::Compare { left, right, .. } => merge_max(max_slot(left), max_slot(right)),
     }
 }

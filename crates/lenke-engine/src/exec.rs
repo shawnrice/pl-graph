@@ -375,6 +375,7 @@ fn needs_lineage(plan: &Plan) -> bool {
             | Expr::Arith {
                 left: a, right: b, ..
             } => reads_path(a) || reads_path(b),
+            Expr::Call { args, .. } => args.iter().any(reads_path),
             Expr::Slot(_) | Expr::Prop { .. } | Expr::Lit(_) => false,
         }
     }
@@ -1261,6 +1262,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         | Expr::Arith {
             left: a, right: b, ..
         } => refs_only_slot(a, s) && refs_only_slot(b, s),
+        Expr::Call { args, .. } => args.iter().all(|a| refs_only_slot(a, s)),
         Expr::Compare { left, right, .. } => refs_only_slot(left, s) && refs_only_slot(right, s),
     }
 }
@@ -1289,6 +1291,10 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
             op: *op,
             left: go(left),
             right: go(right),
+        },
+        Expr::Call { name, args } => Expr::Call {
+            name: name.clone(),
+            args: args.iter().map(|a| remap_slot(a, from, to)).collect(),
         },
     }
 }
@@ -1666,6 +1672,62 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
                 .collect();
             Col::Gen(out)
         }
+        Expr::Call { name, args } => {
+            let cols: Vec<Col> = args.iter().map(|a| eval(a, store, batch)).collect();
+            let n = cols.iter().map(Col::len).min().unwrap_or(0);
+            if name == "coalesce" {
+                // First non-null argument per row, else NULL.
+                Col::Gen(
+                    (0..n)
+                        .map(|i| {
+                            cols.iter()
+                                .map(|c| c.value_at(i))
+                                .find(|v| !v.is_null())
+                                .unwrap_or(Value::Null)
+                        })
+                        .collect(),
+                )
+            } else {
+                // Unary numeric function (arity enforced at parse time).
+                let c = &cols[0];
+                Col::Gen(
+                    (0..n)
+                        .map(|i| scalar_num_fn(name, &c.value_at(i)))
+                        .collect(),
+                )
+            }
+        }
+    }
+}
+
+/// Apply a unary numeric scalar function. Finite-or-null: a NULL / non-numeric /
+/// non-finite argument OR result (e.g. `sqrt(-1)`) yields NULL. `sign(0)` is 0
+/// (unlike `f64::signum`); rounding is f64's round-half-away-from-zero.
+fn scalar_num_fn(name: &str, v: &Value) -> Value {
+    let Some(x) = value::as_num(v) else {
+        return Value::Null;
+    };
+    let r = match name {
+        "abs" => x.abs(),
+        "sign" => {
+            if x > 0.0 {
+                1.0
+            } else if x < 0.0 {
+                -1.0
+            } else {
+                0.0
+            }
+        }
+        "floor" => x.floor(),
+        "ceil" => x.ceil(),
+        "round" => x.round(),
+        "sqrt" => x.sqrt(),
+        _ => return Value::Null, // parser rejects unknown names; defensive
+    };
+    if r.is_finite() {
+        Value::Num(r)
+    } else {
+        Value::Null
     }
 }
 

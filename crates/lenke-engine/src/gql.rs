@@ -1008,6 +1008,11 @@ impl Parser {
                 if s.eq_ignore_ascii_case("null") {
                     return Ok(Expr::Lit(Value::Null));
                 }
+                // A scalar function call `name(args…)`. (Aggregates are handled in
+                // return_items, never reached here.)
+                if self.peek() == Some(&Tok::LParen) {
+                    return self.call(&s);
+                }
                 let slot = *self
                     .scope
                     .get(&s)
@@ -1021,6 +1026,37 @@ impl Parser {
             }
             other => Err(format!("expected an expression, got {other:?}")),
         }
+    }
+
+    // call := name '(' [ expr (',' expr)* ] ')'  — a scalar function.
+    // Validates the name and arity here so `eval` only sees well-formed calls.
+    fn call(&mut self, name: &str) -> Result<Expr, String> {
+        self.expect(&Tok::LParen)?;
+        let mut args = Vec::new();
+        if self.peek() != Some(&Tok::RParen) {
+            loop {
+                args.push(self.expr()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        let lname = name.to_ascii_lowercase();
+        match lname.as_str() {
+            "abs" | "sign" | "floor" | "ceil" | "round" | "sqrt" => {
+                if args.len() != 1 {
+                    return Err(format!("{lname}() takes exactly one argument"));
+                }
+            }
+            "coalesce" => {
+                if args.is_empty() {
+                    return Err("coalesce() takes at least one argument".into());
+                }
+            }
+            _ => return Err(format!("unknown function `{name}`")),
+        }
+        Ok(Expr::Call { name: lname, args })
     }
 }
 
@@ -1596,6 +1632,91 @@ mod tests {
             &store,
         );
         assert_eq!(num(&col(&out, 0, "x")), -30.0);
+    }
+
+    // --- part 3.6: scalar functions (E2) ---
+
+    /// Numeric functions compute; hand-checked on alice(age 30).
+    #[test]
+    fn scalar_numeric_functions() {
+        let store = social();
+        let q = "MATCH (p:Person) WHERE p.name = 'alice' \
+                 RETURN abs(-p.age) AS a, floor(p.age / 4) AS f, ceil(p.age / 4) AS c, \
+                        round(p.age / 4) AS r, sqrt(p.age - 5) AS s, sign(p.age - 100) AS g";
+        let out = run(&super::parse(q).unwrap(), &store);
+        assert_eq!(num(&col(&out, 0, "a")), 30.0); // abs(-30)
+        assert_eq!(num(&col(&out, 0, "f")), 7.0); // floor(7.5)
+        assert_eq!(num(&col(&out, 0, "c")), 8.0); // ceil(7.5)
+        assert_eq!(num(&col(&out, 0, "r")), 8.0); // round(7.5) -> 8
+        assert_eq!(num(&col(&out, 0, "s")), 5.0); // sqrt(25)
+        assert_eq!(num(&col(&out, 0, "g")), -1.0); // sign(30-100)
+    }
+
+    /// A numeric fn on a NULL/non-numeric/negative-sqrt argument yields NULL.
+    #[test]
+    fn scalar_fn_null_and_domain() {
+        let store = social();
+        // proj node has no age → abs(age) is NULL for it.
+        let out = run(
+            &super::parse("MATCH (n) RETURN abs(n.age) AS a").unwrap(),
+            &store,
+        );
+        assert_eq!(out.rows.iter().filter(|r| r[0].is_null()).count(), 1);
+        // sqrt of a negative is NULL (non-finite result).
+        let out = run(
+            &super::parse("MATCH (p:Person) WHERE p.name='alice' RETURN sqrt(0 - p.age) AS s")
+                .unwrap(),
+            &store,
+        );
+        assert!(col(&out, 0, "s").is_null());
+    }
+
+    /// `coalesce` returns the first non-null argument.
+    #[test]
+    fn coalesce_first_non_null() {
+        let store = social();
+        // proj has name but no age: coalesce(age, 99) = 99 for proj, real age else.
+        let out = run(
+            &super::parse("MATCH (n) WHERE n.name = 'graphdb' RETURN coalesce(n.age, 99) AS x")
+                .unwrap(),
+            &store,
+        );
+        assert_eq!(num(&col(&out, 0, "x")), 99.0);
+        let out = run(
+            &super::parse("MATCH (p:Person) WHERE p.name='alice' RETURN coalesce(p.age, 99) AS x")
+                .unwrap(),
+            &store,
+        );
+        assert_eq!(num(&col(&out, 0, "x")), 30.0);
+    }
+
+    /// Parsed `abs(p.age)` matches the hand-built Call plan.
+    #[test]
+    fn scalar_fn_parse_matches_hand() {
+        use crate::ir::{Expr, Plan};
+        let store = social();
+        let hand = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .project(vec![(
+            "a".into(),
+            Expr::Call {
+                name: "abs".into(),
+                args: vec![Expr::Prop {
+                    slot: 0,
+                    key: "age".into(),
+                }],
+            },
+        )]);
+        assert_same("MATCH (p:Person) RETURN abs(p.age) AS a", &hand, &store);
+    }
+
+    #[test]
+    fn scalar_fn_errors() {
+        assert!(super::parse("MATCH (p:Person) RETURN nope(p.age) AS x").is_err()); // unknown fn
+        assert!(super::parse("MATCH (p:Person) RETURN abs(p.age, 1) AS x").is_err()); // arity
+        assert!(super::parse("MATCH (p:Person) RETURN coalesce() AS x").is_err());
+        // arity
     }
 
     // --- part 4: INSERT (write statements) ---

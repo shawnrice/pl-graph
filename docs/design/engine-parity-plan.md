@@ -138,7 +138,12 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
       result → NULL) + GQL parser (new `+ / %` tokens; precedence add<mul<unary;
       unary `-x` desugars to `0 - x`). Gremlin inline arithmetic N/A (its subset
       has no arithmetic expressions — `math()`-style steps deferred).
-- [ ] E2. Scalar functions (abs, sqrt, floor/ceil/round, coalesce, …).
+- [x] E2. Scalar functions: IR `Expr::Call{name,args}` + GQL `name(args)` in
+      primary() (name/arity validated at parse; no collision with aggregates).
+      Deterministic numerics abs/sign/floor/ceil/round/sqrt (finite-or-null via
+      `value::as_num`; `sign(0)=0`) + variadic `coalesce` (first non-null). Every
+      Expr match got the Call arm. Transcendentals (exp/ln/sin/… + power last-ulp)
+      deferred to J1 per numeric-determinism.md.
 - [ ] E3. `CASE` / conditional.
 - [ ] E4. String & list functions.
 - [ ] E5. `CAST` + cross-type coercion semantics.
