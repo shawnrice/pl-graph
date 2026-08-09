@@ -173,7 +173,14 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
             *max,
         ),
         Plan::Aggregate { input, keys, aggs } => {
-            aggregate(&pull(input, store, track), store, keys, aggs)
+            // Frontier fast path: a scalar count over an Expand chain need not
+            // build the wide intermediate batch. Falls back to the general
+            // aggregate for every shape it does not recognize.
+            if let Some(b) = try_fused_count(input, keys, aggs, store) {
+                b
+            } else {
+                aggregate(&pull(input, store, track), store, keys, aggs)
+            }
         }
         Plan::OrderPage {
             input,
@@ -555,28 +562,13 @@ fn expand(batch: &Batch, store: &Store, from: usize, dir: Dir, edge_label: Optio
         return empty();
     };
 
-    let type_ok = |et: u32| want.is_none_or(|w| w == et);
     let mut keep = Vec::new();
     let mut nbrs = Vec::new();
     for (row, &v) in src.iter().enumerate() {
-        let out = matches!(dir, Dir::Out | Dir::Both);
-        let inc = matches!(dir, Dir::In | Dir::Both);
-        if out {
-            for a in store.out(v) {
-                if type_ok(a.etype) {
-                    keep.push(row);
-                    nbrs.push(a.nbr);
-                }
-            }
-        }
-        if inc {
-            for a in store.inc(v) {
-                if type_ok(a.etype) {
-                    keep.push(row);
-                    nbrs.push(a.nbr);
-                }
-            }
-        }
+        for_each_nbr(store, v, dir, want, |nbr| {
+            keep.push(row);
+            nbrs.push(nbr);
+        });
     }
 
     let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
@@ -589,6 +581,155 @@ fn expand(batch: &Batch, store: &Store, from: usize, dir: Dir, edge_label: Optio
         out.lineage = Some(lin.extend(&keep, &nbrs));
     }
     out
+}
+
+/// Visit each neighbour of `v` along `dir` matching edge type `want`. The one
+/// place Expand's adjacency walk is spelled — shared by the batch operator and
+/// the frontier executor so the two can never disagree on what an Expand reaches.
+fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: Option<u32>, mut f: impl FnMut(u32)) {
+    let type_ok = |et: u32| want.is_none_or(|w| w == et);
+    if matches!(dir, Dir::Out | Dir::Both) {
+        for a in store.out(v) {
+            if type_ok(a.etype) {
+                f(a.nbr);
+            }
+        }
+    }
+    if matches!(dir, Dir::In | Dir::Both) {
+        for a in store.inc(v) {
+            if type_ok(a.etype) {
+                f(a.nbr);
+            }
+        }
+    }
+}
+
+/// Slot count of a pure Scan/Expand chain; `None` for anything else (Filter,
+/// Join, VarLength, …). The frontier executor only handles such chains.
+fn chain_width(plan: &Plan) -> Option<usize> {
+    match plan {
+        Plan::Scan { .. } => Some(1),
+        Plan::Expand { input, .. } => Some(chain_width(input)? + 1),
+        _ => None,
+    }
+}
+
+/// The current node frontier of a pure Scan/Expand chain — the last slot's node
+/// ids, WITH multiplicity (one entry per path reaching the node) — produced
+/// without ever materializing the earlier slots. `None` if the plan is not such
+/// a chain. This is the batch model's payoff: when nothing above the chain reads
+/// an earlier slot, the chain need only carry its frontier.
+fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
+    match plan {
+        Plan::Scan { label } => Some(match label {
+            Some(l) => store.nodes_with_label(l).to_vec(),
+            None => store.all_nodes(),
+        }),
+        Plan::Expand {
+            input,
+            from,
+            dir,
+            edge_label,
+        } => {
+            // Must expand the CURRENT frontier (the last slot); a linear pattern
+            // always does, but a hand-built plan might not.
+            if *from + 1 != chain_width(input)? {
+                return None;
+            }
+            let src = frontier_ids(input, store)?;
+            let want = match edge_label {
+                None => None,
+                Some(name) => match store.etype_id(name) {
+                    Some(id) => Some(id),
+                    None => return Some(Vec::new()), // unknown label matches nothing
+                },
+            };
+            let mut out = Vec::new();
+            for &v in &src {
+                for_each_nbr(store, v, *dir, want, |nbr| out.push(nbr));
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Try to answer a scalar `count(*)` / `count(DISTINCT <last slot>)` sitting on
+/// an Expand of a Scan/Expand chain WITHOUT materializing the wide intermediate
+/// batch: the frontier feeding the final hop is produced by [`frontier_ids`],
+/// then `count(*)` sums the final hop's matching degree and `count(DISTINCT c)`
+/// marks endpoints in a bitset over node ids. Returns `None` (fall back to the
+/// general aggregate) for any shape it does not recognize — so it is an
+/// optimization, never a semantic fork.
+fn try_fused_count(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.func != AggFn::Count {
+        return None;
+    }
+    let Plan::Expand {
+        input: inner,
+        from,
+        dir,
+        edge_label,
+    } = input
+    else {
+        return None;
+    };
+    let w = chain_width(inner)?; // slot count feeding the final hop
+    if *from + 1 != w {
+        return None; // the final Expand must expand the current frontier
+    }
+    let want = match edge_label {
+        None => None,
+        Some(name) => match store.etype_id(name) {
+            Some(id) => Some(id),
+            None => return Some(scalar_num(0.0)), // unknown label: zero rows
+        },
+    };
+    let src = frontier_ids(inner, store)?; // ids feeding the final hop, w/ multiplicity
+
+    if agg.arg.is_none() {
+        // count(*): number of final-hop paths = sum of matching degrees.
+        let mut total = 0f64;
+        for &v in &src {
+            for_each_nbr(store, v, *dir, want, |_| total += 1.0);
+        }
+        return Some(scalar_num(total));
+    }
+    if agg.distinct {
+        // count(DISTINCT c) where c is the final (last) slot, index == w: distinct
+        // endpoints deduped in a bitset — no per-row hashing, no boxed values.
+        match agg.arg.as_ref() {
+            Some(Expr::Slot(s)) if *s == w => {}
+            _ => return None,
+        }
+        let mut seen = vec![false; store.node_count()];
+        let mut cnt = 0f64;
+        for &v in &src {
+            for_each_nbr(store, v, *dir, want, |nbr| {
+                if !seen[nbr as usize] {
+                    seen[nbr as usize] = true;
+                    cnt += 1.0;
+                }
+            });
+        }
+        return Some(scalar_num(cnt));
+    }
+    None // count(arg) non-distinct on the final slot: not fused (uncommon)
+}
+
+/// A one-row, one-column batch holding a single number — a scalar aggregate's
+/// result.
+fn scalar_num(x: f64) -> Batch {
+    Batch::of(vec![Col::Gen(vec![Value::Num(x)])])
 }
 
 /// A quantified hop: for each input row, enumerate every path of length in
@@ -1260,6 +1401,59 @@ mod tests {
         got.sort_by(|a, b| a.0.cmp(&b.0));
         // carol has no outgoing KNOWS, so she is absent from the expanded rows.
         assert_eq!(got, vec![("alice".into(), 2.0), ("bob".into(), 1.0)]);
+    }
+
+    /// Scalar `count(*)` over a single Expand — the frontier fast path. Hand
+    /// count of KNOWS edges: alice→{bob,carol}, bob→{carol} = 3.
+    #[test]
+    fn fused_count_star_one_hop() {
+        let store = social();
+        let plan = scan("Person")
+            .expand(0, Dir::Out, Some("KNOWS"))
+            .aggregate(vec![], vec![agg(AggFn::Count, None, false, "c")]);
+        let out = run(&plan, &store);
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(num(&out.rows[0][0]), 3.0);
+    }
+
+    /// Scalar `count(*)` over a two-hop chain. Hand count of length-2 KNOWS
+    /// walks: only alice→bob→carol (bob is the only reached node with an
+    /// outgoing KNOWS) = 1.
+    #[test]
+    fn fused_count_star_two_hop() {
+        let store = social();
+        let plan = scan("Person")
+            .expand(0, Dir::Out, Some("KNOWS"))
+            .expand(1, Dir::Out, Some("KNOWS"))
+            .aggregate(vec![], vec![agg(AggFn::Count, None, false, "c")]);
+        let out = run(&plan, &store);
+        assert_eq!(num(&out.rows[0][0]), 1.0);
+    }
+
+    /// `count(DISTINCT c)` over the two-hop chain: the distinct endpoints are
+    /// {carol} = 1, deduped in the bitset path.
+    #[test]
+    fn fused_count_distinct_endpoint() {
+        let store = social();
+        let plan = scan("Person")
+            .expand(0, Dir::Out, Some("KNOWS"))
+            .expand(1, Dir::Out, Some("KNOWS"))
+            .aggregate(
+                vec![],
+                vec![agg(AggFn::Count, Some(Expr::Slot(2)), true, "c")],
+            );
+        let out = run(&plan, &store);
+        assert_eq!(num(&out.rows[0][0]), 1.0);
+    }
+
+    /// An unknown final edge label fuses to zero rows.
+    #[test]
+    fn fused_count_unknown_label_is_zero() {
+        let store = social();
+        let plan = scan("Person")
+            .expand(0, Dir::Out, Some("NOPE"))
+            .aggregate(vec![], vec![agg(AggFn::Count, None, false, "c")]);
+        assert_eq!(num(&run(&plan, &store).rows[0][0]), 0.0);
     }
 
     // --- Order + Page ---
