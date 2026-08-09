@@ -274,17 +274,33 @@ impl Parser {
             "values" => {
                 let key = self.str_arg()?;
                 self.expect(&Tok::RParen)?;
-                plan.project(vec![(
+                let p = plan.project(vec![(
                     key.clone(),
                     Expr::Prop {
                         slot: self.current,
                         key,
                     },
-                )])
+                )]);
+                // The value stream is now the single output column — subsequent
+                // steps (where/min/max/…) address it at slot 0.
+                self.current = 0;
+                self.slots = 1;
+                p
+            }
+            "where" => {
+                // where(P.op(v)) / where(op(v)) — filter the current traverser's
+                // VALUE by a predicate (typically after values(...)).
+                let (op, val) = self.predicate_parts()?;
+                self.expect(&Tok::RParen)?;
+                plan.filter(Expr::Compare {
+                    op,
+                    left: Box::new(Expr::Slot(self.current)),
+                    right: Box::new(Expr::Lit(val)),
+                })
             }
             "count" => {
                 self.expect(&Tok::RParen)?;
-                plan.aggregate(
+                let p = plan.aggregate(
                     vec![],
                     vec![Agg {
                         func: AggFn::Count,
@@ -292,7 +308,33 @@ impl Parser {
                         distinct: false,
                         name: "count".into(),
                     }],
-                )
+                );
+                self.current = 0;
+                self.slots = 1;
+                p
+            }
+            "min" | "max" | "sum" | "mean" => {
+                self.expect(&Tok::RParen)?;
+                // Fold the current value stream to a single scalar. `mean` is the
+                // value contract's average (Avg); the rest are their namesakes.
+                let func = match lname.as_str() {
+                    "min" => AggFn::Min,
+                    "max" => AggFn::Max,
+                    "sum" => AggFn::Sum,
+                    _ => AggFn::Avg,
+                };
+                let p = plan.aggregate(
+                    vec![],
+                    vec![Agg {
+                        func,
+                        arg: Some(Expr::Slot(self.current)),
+                        distinct: false,
+                        name: lname.clone(),
+                    }],
+                );
+                self.current = 0;
+                self.slots = 1;
+                p
             }
             "dedup" => {
                 self.expect(&Tok::RParen)?;
@@ -461,15 +503,34 @@ impl Parser {
         }
     }
 
-    /// The second argument of `has('k', …)`: a literal (equality) or `P.op(val)`.
+    /// The second argument of `has('k', …)`: a literal (equality) or a predicate
+    /// `[P.]op(val)`, built as a comparison against property `key`.
     fn has_predicate(&mut self, key: String) -> Result<Expr, String> {
-        let left = Expr::Prop {
-            slot: self.current,
-            key,
-        };
+        let (op, val) = self.predicate_parts()?;
+        Ok(Expr::Compare {
+            op,
+            left: Box::new(Expr::Prop {
+                slot: self.current,
+                key,
+            }),
+            right: Box::new(Expr::Lit(val)),
+        })
+    }
+
+    /// Parse a Gremlin predicate argument into `(op, value)`. Accepts an optional
+    /// `P.` prefix, then either `op(literal)` (`gt`, `neq`, …) or a bare literal
+    /// (which means equality). Shared by `has(...)` and `where(...)` so both spell
+    /// a predicate the same way.
+    fn predicate_parts(&mut self) -> Result<(CompareOp, Value), String> {
         if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("P")) {
             self.pos += 1;
             self.expect(&Tok::Dot)?;
+        }
+        // An identifier immediately applied to `(` is an operator; anything else is
+        // a bare literal compared for equality.
+        if matches!(self.peek(), Some(Tok::Ident(_)))
+            && self.toks.get(self.pos + 1) == Some(&Tok::LParen)
+        {
             let op_name = self.ident()?;
             self.expect(&Tok::LParen)?;
             let val = self.literal()?;
@@ -481,20 +542,11 @@ impl Parser {
                 "gte" => CompareOp::Ge,
                 "lt" => CompareOp::Lt,
                 "lte" => CompareOp::Le,
-                other => return Err(format!("unsupported predicate P.{other}")),
+                other => return Err(format!("unsupported predicate `{other}`")),
             };
-            Ok(Expr::Compare {
-                op,
-                left: Box::new(left),
-                right: Box::new(Expr::Lit(val)),
-            })
+            Ok((op, val))
         } else {
-            let val = self.literal()?;
-            Ok(Expr::Compare {
-                op: CompareOp::Eq,
-                left: Box::new(left),
-                right: Box::new(Expr::Lit(val)),
-            })
+            Ok((CompareOp::Eq, self.literal()?))
         }
     }
 
@@ -776,5 +828,58 @@ mod tests {
             crate::exec::execute(&super::parse("g.V(0).addE('R').to(V(9))").unwrap(), &mut st)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn value_aggregates_fold_the_stream() {
+        let store = social();
+        // Person ages are 30, 25, 40.
+        for (step, want) in [("max", 40.0), ("min", 25.0), ("sum", 95.0)] {
+            let q = format!("g.V().hasLabel('Person').values('age').{step}()");
+            let out = gremlin_rows(&q, &store);
+            assert_eq!(out.rows.len(), 1, "{step}");
+            match out.rows[0][0] {
+                Value::Num(x) => assert_eq!(x, want, "{step}"),
+                ref o => panic!("{step}: expected Num, got {o:?}"),
+            }
+        }
+        // mean = 95 / 3.
+        let out = gremlin_rows("g.V().hasLabel('Person').values('age').mean()", &store);
+        match out.rows[0][0] {
+            Value::Num(x) => assert!((x - 95.0 / 3.0).abs() < 1e-9, "mean was {x}"),
+            ref o => panic!("mean: expected Num, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn where_filters_the_value_stream() {
+        let store = social();
+        // Ages > 28: 30 and 40. Both the bare and P.-prefixed spellings work.
+        for q in [
+            "g.V().hasLabel('Person').values('age').where(gt(28))",
+            "g.V().hasLabel('Person').values('age').where(P.gt(28))",
+        ] {
+            assert_eq!(
+                value_bag(&gremlin_rows(q, &store)),
+                vec!["Num(30.0);", "Num(40.0);"],
+                "{q}"
+            );
+        }
+    }
+
+    #[test]
+    fn has_accepts_a_bare_predicate() {
+        let store = social();
+        // has('age', gt(28)) (no P. prefix) now parses and agrees with P.gt(28).
+        let bare = gremlin_rows(
+            "g.V().hasLabel('Person').has('age', gt(28)).values('name')",
+            &store,
+        );
+        let with_p = gremlin_rows(
+            "g.V().hasLabel('Person').has('age', P.gt(28)).values('name')",
+            &store,
+        );
+        assert_eq!(value_bag(&bare), value_bag(&with_p));
+        assert_eq!(value_bag(&bare), vec!["Str(\"alice\");", "Str(\"carol\");"]);
     }
 }

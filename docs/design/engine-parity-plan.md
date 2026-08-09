@@ -220,7 +220,15 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       sidecar directly — `nodes`/`relationships`/`path_length`/`elements` — not
       scalar Call fns. 4 tests (relationships + elements over a chain, expand-level
       edge lineage, non-path-arg error).
-- [ ] F5. Gremlin step breadth (select, where(P), order(local), groupCount, …).
+- [x] F5a. Gremlin step breadth, part 1: value aggregates min/max/sum/mean (fold
+      the current value stream), where(P) (filter the current traverser by a
+      predicate), and a shared predicate parser so has(...) also accepts a bare
+      op like gt(28) (not just P.gt). values()/aggregates now retrack the current
+      slot. 3 tests. (Baseline already had V/addV/addE/hasLabel/has/out/in/both/
+      values/count/dedup/limit/range/order().by()/groupCount().by()/property/drop.)
+- [ ] F5b. Gremlin step breadth, part 2: as('x')/select('x'[,'y']) (step labels;
+      multi-select needs map values), order(local) (within-list ordering),
+      groupCount() with no by, and remaining P predicates (within/without).
 
 ### Phase G — Data model
 
