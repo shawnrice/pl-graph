@@ -2625,6 +2625,22 @@ mod tests {
     }
 
     #[test]
+    fn cdc_observes_a_committed_insert() {
+        use crate::store::Change;
+        let mut store = Builder::default().build();
+        crate::exec::execute(
+            &super::parse("INSERT (:P {name: 'a'}), (:P {name: 'b'})").unwrap(),
+            &mut store,
+        )
+        .unwrap();
+        // The INSERT is txn-wrapped, so its two node adds surface as CDC changes.
+        assert_eq!(
+            store.last_commit_changes(),
+            &[Change::NodeAdded(0), Change::NodeAdded(1)]
+        );
+    }
+
+    #[test]
     fn required_constraint_rejects_insert_without_the_key() {
         let mut store = Builder::default().build();
         store.create_required_constraint("User", "email").unwrap();

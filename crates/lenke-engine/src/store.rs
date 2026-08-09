@@ -282,6 +282,20 @@ impl Column {
 /// One entry in a transaction's undo log — the inverse of a single mutation,
 /// captured with just enough prior state to reverse it exactly. Applied in
 /// reverse order on rollback, with logging disabled so undos do not re-log.
+/// One change a committed transaction made — the unit of the observation-only CDC
+/// stream. Recorded alongside the undo log (1:1 with each mutation) and handed to
+/// observers AFTER commit, so it can never veto a write. Ids reference the store's
+/// dense node ids / monotonic edge ids.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Change {
+    NodeAdded(u32),
+    NodeDeleted(u32),
+    NodeProp { node: u32, key: String },
+    EdgeAdded(u32),
+    EdgeDeleted(u32),
+    EdgeProp { eid: u32, key: String },
+}
+
 enum Undo {
     /// Undo `add_node`: pop the last (highest-id) node. Adds grow `node_count`
     /// monotonically, so reverse-order undo always pops the current top.
@@ -353,6 +367,13 @@ pub struct Store {
     /// the active transaction's undo log, or `None` outside a transaction
     /// (autocommit — mutations apply directly and record nothing).
     undo: Option<Vec<Undo>>,
+    /// the active transaction's change list (observation-only CDC), `Some` exactly
+    /// when a transaction is open; moved to `last_commit` on commit, dropped on
+    /// rollback. Grows 1:1 with the undo log.
+    changes: Option<Vec<Change>>,
+    /// the change list of the MOST RECENT committed transaction — what an observer
+    /// reads after a write. Empty until the first commit.
+    last_commit: Vec<Change>,
     /// declared unique constraints as `(label, keys)` — at most one live node per
     /// label may carry a given key tuple. Enforced by the write statements, not
     /// the store primitives (which stay infallible for rollback).
@@ -680,6 +701,7 @@ impl Store {
         if let Some(log) = &mut self.undo {
             log.push(Undo::AddNode);
         }
+        self.record_change(Change::NodeAdded(id));
         id
     }
 
@@ -712,6 +734,7 @@ impl Store {
                 eid,
             });
         }
+        self.record_change(Change::EdgeAdded(eid));
         eid
     }
 
@@ -737,6 +760,10 @@ impl Store {
         if let (Some(rec), Some(log)) = (rec, self.undo.as_mut()) {
             log.push(rec);
         }
+        self.record_change(Change::NodeProp {
+            node,
+            key: key.to_string(),
+        });
     }
 
     fn apply_set_prop(&mut self, node: u32, key: &str, value: Value) {
@@ -782,6 +809,10 @@ impl Store {
         if let (Some(rec), Some(log)) = (rec, self.undo.as_mut()) {
             log.push(rec);
         }
+        self.record_change(Change::NodeProp {
+            node,
+            key: key.to_string(),
+        });
     }
 
     fn apply_remove_prop(&mut self, node: u32, key: &str) {
@@ -838,6 +869,10 @@ impl Store {
         if let (Some(rec), Some(log)) = (rec, self.undo.as_mut()) {
             log.push(rec);
         }
+        self.record_change(Change::EdgeProp {
+            eid,
+            key: key.to_string(),
+        });
     }
 
     // --- Property indexes ------------------------------------------------
@@ -1052,6 +1087,10 @@ impl Store {
         if let (Some(rec), Some(log)) = (rec, self.undo.as_mut()) {
             log.push(rec);
         }
+        self.record_change(Change::EdgeProp {
+            eid,
+            key: key.to_string(),
+        });
     }
 
     /// Delete the edge identified by `eid` between endpoints `u` and `v`. The eid
@@ -1087,6 +1126,7 @@ impl Store {
         if let Some(log) = &mut self.undo {
             log.push(Undo::RestoreEdge { entries: removed });
         }
+        self.record_change(Change::EdgeDeleted(eid));
     }
 
     /// Delete node `id`: tombstone it (its dense id is never reused), detach every
@@ -1149,6 +1189,9 @@ impl Store {
                 props,
             });
         }
+        // A node deletion cascades its incident edges; the CDC stream reports it as
+        // one NodeDeleted (the edges are implied), keeping 1:1 with the undo.
+        self.record_change(Change::NodeDeleted(id));
     }
 
     // --- Transactions ----------------------------------------------------
@@ -1164,21 +1207,41 @@ impl Store {
     pub fn begin(&mut self) {
         assert!(self.undo.is_none(), "nested transactions are not supported");
         self.undo = Some(Vec::new());
+        self.changes = Some(Vec::new());
     }
 
-    /// Commit: the changes stand and the undo log is discarded.
+    /// Commit: the changes stand, the undo log is discarded, and the transaction's
+    /// change list becomes the observable `last_commit` (CDC).
     pub fn commit(&mut self) {
         self.undo = None;
+        self.last_commit = self.changes.take().unwrap_or_default();
     }
 
     /// Roll back every change since `begin`, in reverse, and close the
-    /// transaction. A no-op outside a transaction.
+    /// transaction. A no-op outside a transaction. The change list is dropped (a
+    /// rolled-back transaction is observed to have changed nothing).
     pub fn rollback(&mut self) {
+        self.changes = None;
         if let Some(log) = self.undo.take() {
             // `undo` is now None, so the inverse mutations below do not re-log.
             for rec in log.into_iter().rev() {
                 self.apply_undo(rec);
             }
+        }
+    }
+
+    /// The change list of the most recent committed transaction — the
+    /// observation-only CDC stream. Read after a write; cannot veto it.
+    #[must_use]
+    pub fn last_commit_changes(&self) -> &[Change] {
+        &self.last_commit
+    }
+
+    /// Record a change into the active transaction's list (no-op outside a txn).
+    /// Grows 1:1 with the undo log, so `rollback_to` can truncate both by length.
+    fn record_change(&mut self, c: Change) {
+        if let Some(ch) = &mut self.changes {
+            ch.push(c);
         }
     }
 
@@ -1192,6 +1255,11 @@ impl Store {
     /// Undo every change recorded after `mark`, keeping the transaction open and
     /// the changes up to `mark`. Used to roll back a single failed statement.
     pub fn rollback_to(&mut self, mark: usize) {
+        // The change list grows 1:1 with the undo log, so it truncates to the same
+        // mark — the undone statement's changes vanish from the CDC stream too.
+        if let Some(ch) = &mut self.changes {
+            ch.truncate(mark);
+        }
         if let Some(mut log) = self.undo.take() {
             let mut undone = Vec::new();
             while log.len() > mark {
@@ -1397,6 +1465,8 @@ impl Builder {
             next_eid: edge_count,
             deleted: vec![false; n],
             undo: None,
+            changes: None,
+            last_commit: Vec::new(),
             unique: Vec::new(),
             required: Vec::new(),
             edge_props: HashMap::new(),
@@ -1530,6 +1600,51 @@ mod tests {
             st.prop(1, "born"),
             Value::Temporal(Temporal::Time(_))
         ));
+    }
+
+    #[test]
+    fn commit_records_the_change_list_rollback_records_nothing() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[]); // outside a txn → nothing observed
+        assert!(st.last_commit_changes().is_empty());
+
+        // A committed transaction publishes exactly its changes, in order.
+        st.begin();
+        let b = st.add_node(&["P"], &[("name", s("b"))]);
+        st.set_prop(a, "age", n(1.0));
+        let eid = st.add_edge(a, b, "R");
+        st.commit();
+        assert_eq!(
+            st.last_commit_changes(),
+            &[
+                Change::NodeAdded(b),
+                Change::NodeProp {
+                    node: a,
+                    key: "age".into(),
+                },
+                Change::EdgeAdded(eid),
+            ]
+        );
+
+        // A rolled-back transaction publishes nothing: `last_commit` still shows
+        // the previous COMMIT, unchanged (rollback is not an event).
+        let previous: Vec<Change> = st.last_commit_changes().to_vec();
+        st.begin();
+        st.set_prop(a, "age", n(2.0));
+        st.rollback();
+        assert_eq!(st.last_commit_changes(), previous.as_slice());
+    }
+
+    #[test]
+    fn cdc_reports_delete_as_one_node_deleted() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[]);
+        let b = st.add_node(&["P"], &[]);
+        st.add_edge(a, b, "R");
+        st.begin();
+        st.delete_node(a); // cascades the edge — reported as one NodeDeleted
+        st.commit();
+        assert_eq!(st.last_commit_changes(), &[Change::NodeDeleted(a)]);
     }
 
     #[test]

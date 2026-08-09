@@ -325,32 +325,42 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       whereas lenke-core's GQL raises E_INVALID_VALUE — a deliberate choice so
       sort/group/min-max stay total; equality already agrees (cross-type false).
 - [~] G4. Interval/temporal edge index — DEFERRED. It is a result-INVARIANT
-      optimization with NO consumer yet: nothing produces an "edges overlapping
-      interval" seek (traversal is adjacency-driven + edge-prop post-filter; edges
-      have no columnar/interval store, only a boxed eid→value map). An RI-tree
-      foundation with no query path and no benchmark is premature — CLAUDE.md is
-      emphatic that such perf must be MEASURED. Revisit with an edge-temporal seek
-      query shape + planner rule (G4b) and a benchmark.
+  optimization with NO consumer yet: nothing produces an "edges overlapping
+  interval" seek (traversal is adjacency-driven + edge-prop post-filter; edges
+  have no columnar/interval store, only a boxed eid→value map). An RI-tree
+  foundation with no query path and no benchmark is premature — CLAUDE.md is
+  emphatic that such perf must be MEASURED. Revisit with an edge-temporal seek
+  query shape + planner rule (G4b) and a benchmark.
 - [~] G5. Edge-type index — DEFERRED. Also result-invariant perf: it would speed
-      type-filtered `expand`, but that is exactly the adjacency-change class
-      CLAUDE.md warns is "misjudged against wrong fixtures," and there is no
-      lenke-engine benchmark to justify it (or to catch an ingest/rollback
-      regression from maintaining a grouped/sorted adjacency). Revisit measured,
-      with a fixture that varies degree and edge:type ratio.
+  type-filtered `expand`, but that is exactly the adjacency-change class
+  CLAUDE.md warns is "misjudged against wrong fixtures," and there is no
+  lenke-engine benchmark to justify it (or to catch an ingest/rollback
+  regression from maintaining a grouped/sorted adjacency). Revisit measured,
+  with a fixture that varies degree and edge:type ratio.
 
 ### Phase H — Semantics services
 
 - [x] H1. Required-property constraint (validator): `create_required_constraint
-      (label, key)` — every live node with `label` must carry a PRESENT value for
+    (label, key)` — every live node with `label` must carry a PRESENT value for
       `key` (present-null passes; only absence violates, per null-first-class).
       Declaration errors on already-violating data; write statements (INSERT and
-      _MERGE) enforce it alongside unique and roll back on violation
+      \_MERGE) enforce it alongside unique and roll back on violation
       (`E_REQUIRED`); it round-trips through the snapshot schema
       (`{"schema":"required",…}`). 3 tests (store check/declare, INSERT reject +
       rollback, snapshot survival). NOTE: like unique, SET/REMOVE-time re-check is
       not yet wired (a REMOVE of a required key over a MATCH isn't caught) — a
       shared follow-up when Update gets constraint enforcement.
-- [ ] H2. Events / CDC (observation-only notifications).
+- [x] H2. Events / CDC change-list core (observation-only): every mutation records
+      a `Change` (NodeAdded/Deleted, NodeProp, EdgeAdded/Deleted, EdgeProp) into the
+      open transaction, 1:1 with the undo log; `commit` publishes it as
+      `last_commit_changes()`, `rollback` discards it (not an event). Observation
+      only — read AFTER commit, cannot veto. A node delete cascades its edges but
+      reports one NodeDeleted. 4 tests (commit list + order, rollback-nothing,
+      delete cascade, INSERT observed). NOTE: only txn-wrapped statements
+      (INSERT/_MERGE) emit CDC; SET/REMOVE/drop await wrapping the Update path in a
+      txn (shared with the H1 SET/REMOVE-enforcement follow-up).
+- [ ] H2b. CDC value-scope routing: content-derived scope off the change list
+      (host scopeKey + client scopes, fail-open) — the per-room/tenant filter.
 - [ ] H3. Typed nodes (host-side schema validate-before-write).
 
 ### Phase I — Algorithms & egress
