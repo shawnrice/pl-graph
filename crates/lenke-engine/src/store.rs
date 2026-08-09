@@ -64,6 +64,14 @@ pub enum Column {
         data: Vec<bool>,
         present: Vec<bool>,
     },
+    /// A homogeneous temporal column: every present value is the SAME kind
+    /// (`kind`). A temporal of a DIFFERENT kind — or a non-temporal — written to it
+    /// promotes it to `Gen`, matching lenke-core's one-kind-per-column model.
+    Temporal {
+        kind: crate::temporal::TemporalKind,
+        data: Vec<crate::temporal::Temporal>,
+        present: Vec<bool>,
+    },
     Gen {
         data: Vec<Value>,
         present: Vec<bool>,
@@ -87,6 +95,7 @@ impl Column {
             Self::Num { data, present } if present[idx] => Value::Num(data[idx]),
             Self::Str { data, present } if present[idx] => Value::Str(data[idx].clone()),
             Self::Bool { data, present } if present[idx] => Value::Bool(data[idx]),
+            Self::Temporal { data, present, .. } if present[idx] => Value::Temporal(data[idx]),
             Self::Gen { data, present } if present[idx] => data[idx].clone(),
             _ => Value::Null,
         }
@@ -98,6 +107,7 @@ impl Column {
             Self::Num { present, .. }
             | Self::Str { present, .. }
             | Self::Bool { present, .. }
+            | Self::Temporal { present, .. }
             | Self::Gen { present, .. } => present.len(),
         }
     }
@@ -118,9 +128,14 @@ impl Column {
                 data: vec![false; n],
                 present: vec![false; n],
             },
-            // Temporals live in a Gen column for now; a typed Temporal column
-            // (de-boxed, per-kind) is a later slice.
-            Value::Null | Value::List(_) | Value::Temporal(_) => Self::Gen {
+            // A temporal seeds a homogeneous typed column of its kind; absent slots
+            // hold the value itself as a harmless placeholder (present-gated).
+            Value::Temporal(t) => Self::Temporal {
+                kind: t.kind(),
+                data: vec![*t; n],
+                present: vec![false; n],
+            },
+            Value::Null | Value::List(_) => Self::Gen {
                 data: vec![Value::Null; n],
                 present: vec![false; n],
             },
@@ -143,6 +158,14 @@ impl Column {
                 data.push(false);
                 present.push(false);
             }
+            Self::Temporal {
+                kind,
+                data,
+                present,
+            } => {
+                data.push(kind.zero());
+                present.push(false);
+            }
             Self::Gen { data, present } => {
                 data.push(Value::Null);
                 present.push(false);
@@ -150,15 +173,17 @@ impl Column {
         }
     }
 
-    /// Whether this column can store `v` without a type change.
+    /// Whether this column can store `v` without a type change. A temporal column
+    /// accepts only its OWN kind (a different kind promotes to `Gen`).
     fn accepts(&self, v: &Value) -> bool {
-        matches!(
-            (self, v),
+        match (self, v) {
             (Self::Num { .. }, Value::Num(_))
-                | (Self::Str { .. }, Value::Str(_))
-                | (Self::Bool { .. }, Value::Bool(_))
-                | (Self::Gen { .. }, _)
-        )
+            | (Self::Str { .. }, Value::Str(_))
+            | (Self::Bool { .. }, Value::Bool(_))
+            | (Self::Gen { .. }, _) => true,
+            (Self::Temporal { kind, .. }, Value::Temporal(t)) => t.kind() == *kind,
+            _ => false,
+        }
     }
 
     /// Rebuild as a `Gen` column preserving present values — the promotion a typed
@@ -181,6 +206,7 @@ impl Column {
             Self::Num { present, .. }
             | Self::Str { present, .. }
             | Self::Bool { present, .. }
+            | Self::Temporal { present, .. }
             | Self::Gen { present, .. } => present[i],
         }
     }
@@ -201,6 +227,10 @@ impl Column {
                 data[i] = b;
                 present[i] = true;
             }
+            (Self::Temporal { data, present, .. }, Value::Temporal(t)) => {
+                data[i] = t;
+                present[i] = true;
+            }
             (Self::Gen { data, present }, v) => {
                 data[i] = v;
                 present[i] = true;
@@ -215,6 +245,7 @@ impl Column {
             Self::Num { present, .. }
             | Self::Str { present, .. }
             | Self::Bool { present, .. }
+            | Self::Temporal { present, .. }
             | Self::Gen { present, .. } => present[i] = false,
         }
     }
@@ -232,6 +263,10 @@ impl Column {
                 present.pop();
             }
             Self::Bool { data, present } => {
+                data.pop();
+                present.pop();
+            }
+            Self::Temporal { data, present, .. } => {
                 data.pop();
                 present.pop();
             }
@@ -1301,6 +1336,20 @@ fn materialize(pairs: Vec<(u32, Value)>, n: usize) -> Column {
             }
         }
         Column::Bool { data, present }
+    } else if let Some(kind) = homogeneous_temporal_kind(&pairs) {
+        let mut data = vec![kind.zero(); n];
+        let mut present = vec![false; n];
+        for (i, v) in pairs {
+            if let Value::Temporal(t) = v {
+                data[i as usize] = t;
+                present[i as usize] = true;
+            }
+        }
+        Column::Temporal {
+            kind,
+            data,
+            present,
+        }
     } else {
         let mut data = vec![Value::Null; n];
         let mut present = vec![false; n];
@@ -1312,6 +1361,23 @@ fn materialize(pairs: Vec<(u32, Value)>, n: usize) -> Column {
     }
 }
 
+/// The single temporal kind shared by every pair, or `None` if any pair is
+/// non-temporal or the kinds are mixed (→ a `Gen` column).
+fn homogeneous_temporal_kind(pairs: &[(u32, Value)]) -> Option<crate::temporal::TemporalKind> {
+    let mut kind = None;
+    for (_, v) in pairs {
+        let Value::Temporal(t) = v else {
+            return None;
+        };
+        match kind {
+            None => kind = Some(t.kind()),
+            Some(k) if k == t.kind() => {}
+            Some(_) => return None, // mixed kinds fall back to Gen
+        }
+    }
+    kind
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1321,6 +1387,44 @@ mod tests {
     }
     fn n(x: f64) -> Value {
         Value::Num(x)
+    }
+
+    #[test]
+    fn temporal_props_use_a_typed_column_and_promote_on_mixed_kind() {
+        use crate::temporal::{Date, Temporal, TemporalKind, Time};
+        let d = |iso: &str| Value::Temporal(Temporal::Date(Date::parse(iso).unwrap()));
+        let mut b = Builder::default();
+        b.node(&["P"], &[("born", d("1990-01-01"))]);
+        b.node(&["P"], &[("born", d("2000-01-01"))]);
+        let mut st = b.build();
+        // Homogeneous Date props de-box into a typed Temporal column of kind Date.
+        assert!(matches!(
+            st.column("born"),
+            Some(Column::Temporal {
+                kind: TemporalKind::Date,
+                ..
+            })
+        ));
+        match st.prop(0, "born") {
+            Value::Temporal(Temporal::Date(x)) => assert_eq!(x.format(), "1990-01-01"),
+            o => panic!("expected a Date, got {o:?}"),
+        }
+        // Writing a DIFFERENT temporal kind promotes the column to Gen; both
+        // values still read back correctly.
+        st.set_prop(
+            1,
+            "born",
+            Value::Temporal(Temporal::Time(Time::parse("12:00:00").unwrap())),
+        );
+        assert!(matches!(st.column("born"), Some(Column::Gen { .. })));
+        assert!(matches!(
+            st.prop(0, "born"),
+            Value::Temporal(Temporal::Date(_))
+        ));
+        assert!(matches!(
+            st.prop(1, "born"),
+            Value::Temporal(Temporal::Time(_))
+        ));
     }
 
     /// Build an empty store, add two nodes and an edge, and read it all back —

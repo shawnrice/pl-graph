@@ -252,9 +252,14 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       component accessors year/month/day/hour/minute/second (ported `date_part`,
       euclidean, zoned decomposed in their own offset; NULL when undefined for the
       kind). 2 tests (store→NDJSON→store date round trip, all accessors + NULLs).
-- [ ] G1d. Typed per-kind SoA `Column::Temporal` storage (de-box temporals from
-      the Gen column — a perf/parity refinement; the Gen path is already correct)
-      + temporal constructors (date()/datetime()) and duration.between.
+- [x] G1d. Typed `Column::Temporal` storage: temporals de-box from the Gen column
+      into a homogeneous per-kind column (Vec<Temporal> + present bitmap); a
+      different-kind or non-temporal write promotes to Gen, matching lenke-core's
+      one-kind-per-column model. Both the SET/add_node path (new_absent) and the
+      Builder (materialize) build it; reads/egress/round-trip observably identical.
+      1 store test (typed column + mixed-kind promotion).
+- [ ] G1e. Temporal constructors date()/datetime()/etc. and duration.between /
+      duration arithmetic (the remaining temporal scalar surface).
 - [ ] G2. Map/record values (storage, dotted-path, construction, access).
 - [ ] F5c. Gremlin multi-label select('a','b') (a Map value — needs G2) and
       order(local) (within-list sort — needs list ops). Relocated from F5b; placed

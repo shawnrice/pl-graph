@@ -523,7 +523,61 @@ pub enum Temporal {
     Duration(Duration),
 }
 
+/// The discriminant of a [`Temporal`] (no payload) — used to type a homogeneous
+/// packed temporal storage column (a column holds exactly one kind).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TemporalKind {
+    Date,
+    Time,
+    DateTime,
+    ZonedTime,
+    ZonedDateTime,
+    Duration,
+}
+
+impl TemporalKind {
+    /// A canonical zero value of this kind — the placeholder an ABSENT slot in a
+    /// typed temporal column holds (never read; the presence bitmap gates it).
+    #[must_use]
+    pub fn zero(self) -> Temporal {
+        match self {
+            Self::Date => Temporal::Date(Date { days: 0 }),
+            Self::Time => Temporal::Time(Time { secs: 0, nanos: 0 }),
+            Self::DateTime => Temporal::DateTime(DateTime { secs: 0, nanos: 0 }),
+            Self::ZonedTime => Temporal::ZonedTime(ZonedTime {
+                secs: 0,
+                nanos: 0,
+                offset: 0,
+            }),
+            Self::ZonedDateTime => Temporal::ZonedDateTime(ZonedDateTime {
+                secs: 0,
+                nanos: 0,
+                offset: 0,
+            }),
+            Self::Duration => Temporal::Duration(Duration {
+                months: 0,
+                days: 0,
+                secs: 0,
+                nanos: 0,
+            }),
+        }
+    }
+}
+
 impl Temporal {
+    /// The discriminant (no payload), for typing a packed temporal column.
+    #[must_use]
+    pub fn kind(&self) -> TemporalKind {
+        match self {
+            Self::Date(_) => TemporalKind::Date,
+            Self::Time(_) => TemporalKind::Time,
+            Self::DateTime(_) => TemporalKind::DateTime,
+            Self::ZonedTime(_) => TemporalKind::ZonedTime,
+            Self::ZonedDateTime(_) => TemporalKind::ZonedDateTime,
+            Self::Duration(_) => TemporalKind::Duration,
+        }
+    }
+
     /// The kind tag used by codecs and the value key.
     #[must_use]
     pub fn tag(&self) -> &'static str {
