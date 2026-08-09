@@ -36,7 +36,8 @@ fn rewrite(plan: Plan) -> (Plan, bool) {
 /// Rebuild a node with its children individually rewritten.
 fn map_children(plan: Plan) -> (Plan, bool) {
     match plan {
-        p @ Plan::Scan { .. } => (p, false),
+        // Leaves: no children to rewrite.
+        p @ (Plan::Scan { .. } | Plan::Insert { .. }) => (p, false),
         Plan::Expand {
             input,
             from,
@@ -250,6 +251,8 @@ fn merge_max(a: Option<usize>, b: Option<usize>) -> Option<usize> {
 fn width(plan: &Plan) -> usize {
     match plan {
         Plan::Scan { .. } => 1,
+        Plan::Insert { .. } => 0, // a write carries no output row
+
         Plan::Expand { input, .. }
         | Plan::VarLength { input, .. }
         | Plan::ShortestPath { input, .. } => width(input) + 1,
@@ -456,7 +459,7 @@ mod tests {
             Plan::Join { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)
             }
-            Plan::Scan { .. } => false,
+            Plan::Scan { .. } | Plan::Insert { .. } => false,
         }
     }
 

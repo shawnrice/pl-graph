@@ -178,6 +178,32 @@ pub enum Plan {
         right: Box<Plan>,
         on: Vec<(usize, usize)>,
     },
+    /// A write: create `nodes` (each with labels and inline properties) and the
+    /// `edges` among them (`from`/`to` index into `nodes`). A leaf plan — it reads
+    /// no input and produces no rows; it is run through the mutable executor
+    /// (`exec::execute`), not pulled. Edge properties are a later slice (the store
+    /// has no edge-property model yet).
+    Insert {
+        nodes: Vec<InsertNode>,
+        edges: Vec<InsertEdge>,
+    },
+}
+
+/// A node to create in an `Insert`: its labels and inline `(key, value)`
+/// properties.
+#[derive(Clone, Debug)]
+pub struct InsertNode {
+    pub labels: Vec<String>,
+    pub props: Vec<(String, Value)>,
+}
+
+/// An edge to create in an `Insert`: a typed relationship from `nodes[from]` to
+/// `nodes[to]`.
+#[derive(Clone, Debug)]
+pub struct InsertEdge {
+    pub from: usize,
+    pub to: usize,
+    pub etype: String,
 }
 
 impl Plan {

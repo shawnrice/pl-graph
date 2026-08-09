@@ -90,6 +90,38 @@ pub fn run(plan: &Plan, store: &Store) -> Rows {
     }
 }
 
+/// Run a plan that MAY write, against a mutable store. A write plan (`Insert`)
+/// mutates the store and returns no rows; any other plan is a pure read and is
+/// dispatched to [`run`] over a shared borrow. This is the entry point for
+/// statements that can mutate; read-only callers can keep using [`run`]. Not
+/// `#[must_use]`: a write statement's result is empty and commonly ignored.
+pub fn execute(plan: &Plan, store: &mut Store) -> Rows {
+    match plan {
+        Plan::Insert { nodes, edges } => {
+            // Create the nodes first, remembering each spec's assigned id, then
+            // the edges among them. No RETURN yet, so the result is empty.
+            let mut ids = Vec::with_capacity(nodes.len());
+            for spec in nodes {
+                let labels: Vec<&str> = spec.labels.iter().map(String::as_str).collect();
+                let props: Vec<(&str, Value)> = spec
+                    .props
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.clone()))
+                    .collect();
+                ids.push(store.add_node(&labels, &props));
+            }
+            for e in edges {
+                store.add_edge(ids[e.from], ids[e.to], &e.etype);
+            }
+            Rows {
+                names: Vec::new(),
+                rows: Vec::new(),
+            }
+        }
+        _ => run(plan, store),
+    }
+}
+
 /// The output column names a plan produces, seen through row-shape-preserving
 /// operators (`Distinct`, `OrderPage`) down to the naming one. `None` means no
 /// explicit projection — the row is the raw slot-0 frontier.
@@ -119,7 +151,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         }
     }
     match plan {
-        Plan::Scan { .. } => false,
+        Plan::Scan { .. } | Plan::Insert { .. } => false,
         Plan::Expand { input, .. }
         | Plan::VarLength { input, .. }
         | Plan::ShortestPath { input, .. }
@@ -144,6 +176,10 @@ fn needs_lineage(plan: &Plan) -> bool {
 /// lineage decision: when true, row-producing operators build the path sidecar.
 fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
     match plan {
+        // A write plan is never pulled (a read sub-plan cannot contain one); it
+        // is run through `execute`. Yield an empty batch if it somehow reaches
+        // here so `run` on a bare Insert is a harmless no-op rather than a panic.
+        Plan::Insert { .. } => Batch::of(Vec::new()),
         Plan::Scan { label } => {
             let ids = match label {
                 Some(l) => store.nodes_with_label(l).to_vec(),
@@ -1501,6 +1537,37 @@ mod tests {
             .filter(cmp(CompareOp::Eq, prop(0, "age"), lit(s("30"))))
             .project(vec![("name".into(), prop(0, "name"))]);
         assert_eq!(run(&plan, &store).rows.len(), 0);
+    }
+
+    /// A hand-built `Insert` plan writes nodes and edges through `execute`.
+    #[test]
+    fn execute_insert_writes_store() {
+        use crate::ir::{InsertEdge, InsertNode};
+        let mut store = Builder::default().build();
+        let plan = Plan::Insert {
+            nodes: vec![
+                InsertNode {
+                    labels: vec!["P".into()],
+                    props: vec![("name".into(), s("a"))],
+                },
+                InsertNode {
+                    labels: vec!["P".into()],
+                    props: vec![],
+                },
+            ],
+            edges: vec![InsertEdge {
+                from: 0,
+                to: 1,
+                etype: "R".into(),
+            }],
+        };
+        let out = execute(&plan, &mut store);
+        assert_eq!(out.rows.len(), 0); // a write returns no rows
+        assert_eq!(store.node_count(), 2);
+        assert_eq!(store.nodes_with_label("P"), &[0, 1]);
+        assert_eq!(store.out(0).len(), 1);
+        assert_eq!(store.out(0)[0].nbr, 1);
+        assert!(matches!(store.prop(0, "name"), Value::Str(x) if &*x == "a"));
     }
 
     /// A deleted node is absent from a label scan through the query path — build

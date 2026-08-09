@@ -41,10 +41,17 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
 
 ### Phase B — Write statements in both languages
 
-- [ ] B1. GQL `INSERT` (node & edge patterns) → store writes.
+- [x] B1. GQL `INSERT` (node & edge patterns) → store writes. (`Plan::Insert`
+      leaf + mutable `exec::execute`; nodes with labels+inline props, directed
+      typed edges, per-INSERT variable scoping. NOTE: edge PROPERTIES deferred —
+      the store has no edge-property model yet; needs its own slice (see B-note).)
 - [ ] B2. GQL `SET` / `REMOVE`.
 - [ ] B3. GQL `MERGE` / `_MERGE` keyed upsert.
 - [ ] B4. Gremlin `addV`/`addE`/`property`/`drop`.
+- [ ] B5. Relationship variables + edge properties (discovered in B1): bind an
+      edge as a slot in `Expand`; store edge properties keyed by `eid`; read
+      `r.key`; accept inline edge props in INSERT/SET. Needed before edge-property
+      filters (Phase E) and `[r:T]->` projections.
 
 ### Phase C — Persistence
 

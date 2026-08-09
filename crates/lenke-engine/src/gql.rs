@@ -242,8 +242,11 @@ impl Parser {
     // query := MATCH pattern [WHERE expr]
     //          RETURN [DISTINCT] items [ORDER BY keys] [SKIP n] [LIMIT n]
     fn query(&mut self) -> Result<Plan, String> {
+        if self.eat_kw("INSERT") {
+            return self.insert();
+        }
         if !self.eat_kw("MATCH") {
-            return Err("expected MATCH".into());
+            return Err("expected MATCH or INSERT".into());
         }
         // A comma-separated list of patterns, joined on shared variables. Each
         // pattern parses in its OWN slot space; join maps a shared variable's
@@ -368,6 +371,121 @@ impl Parser {
         match self.bump() {
             Some(Tok::Num(n)) if n >= 0.0 && n.fract() == 0.0 => Ok(n as usize),
             other => Err(format!("expected a non-negative integer, got {other:?}")),
+        }
+    }
+
+    // insert := INSERT insert_path ( ',' insert_path )*
+    // Creates new nodes and the edges among them. Variables are scoped to this
+    // INSERT: first mention defines the node (labels + props), later mentions
+    // reference it (bare `(x)`). Edges must be directed and carry no properties
+    // yet (the store has no edge-property model).
+    fn insert(&mut self) -> Result<Plan, String> {
+        let mut nodes: Vec<crate::ir::InsertNode> = Vec::new();
+        let mut edges: Vec<crate::ir::InsertEdge> = Vec::new();
+        let mut var_to_idx: HashMap<String, usize> = HashMap::new();
+        loop {
+            self.insert_path(&mut nodes, &mut edges, &mut var_to_idx)?;
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(Plan::Insert { nodes, edges })
+    }
+
+    // insert_path := insert_node ( rel insert_node )*
+    fn insert_path(
+        &mut self,
+        nodes: &mut Vec<crate::ir::InsertNode>,
+        edges: &mut Vec<crate::ir::InsertEdge>,
+        var_to_idx: &mut HashMap<String, usize>,
+    ) -> Result<(), String> {
+        let mut prev = self.insert_node(nodes, var_to_idx)?;
+        while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow)) {
+            let (dir, etype) = self.rel()?;
+            let next = self.insert_node(nodes, var_to_idx)?;
+            let (from, to) = match dir {
+                Dir::Out => (prev, next),
+                Dir::In => (next, prev),
+                Dir::Both => {
+                    return Err("INSERT requires a directed relationship".into());
+                }
+            };
+            edges.push(crate::ir::InsertEdge { from, to, etype });
+            prev = next;
+        }
+        Ok(())
+    }
+
+    // insert_node := '(' [var] (':' Label)* [ '{' props '}' ] ')'
+    // Returns the node's index. A first mention with a known var defines it; a
+    // later bare mention references it.
+    fn insert_node(
+        &mut self,
+        nodes: &mut Vec<crate::ir::InsertNode>,
+        var_to_idx: &mut HashMap<String, usize>,
+    ) -> Result<usize, String> {
+        self.expect(&Tok::LParen)?;
+        let var = if matches!(self.peek(), Some(Tok::Ident(_))) {
+            Some(self.ident()?)
+        } else {
+            None
+        };
+        let mut labels = Vec::new();
+        while self.eat(&Tok::Colon) {
+            labels.push(self.ident()?);
+        }
+        let props = if matches!(self.peek(), Some(Tok::LBrace)) {
+            self.props()?
+        } else {
+            Vec::new()
+        };
+        self.expect(&Tok::RParen)?;
+
+        if let Some(v) = &var {
+            if let Some(&idx) = var_to_idx.get(v) {
+                // A reference to an already-defined node may not re-decorate it.
+                if !labels.is_empty() || !props.is_empty() {
+                    return Err(format!("variable `{v}` is already defined in this INSERT"));
+                }
+                return Ok(idx);
+            }
+        }
+        let idx = nodes.len();
+        nodes.push(crate::ir::InsertNode { labels, props });
+        if let Some(v) = var {
+            var_to_idx.insert(v, idx);
+        }
+        Ok(idx)
+    }
+
+    // props := '{' [ key ':' literal ( ',' key ':' literal )* ] '}'
+    fn props(&mut self) -> Result<Vec<(String, Value)>, String> {
+        self.expect(&Tok::LBrace)?;
+        let mut out = Vec::new();
+        if self.eat(&Tok::RBrace) {
+            return Ok(out);
+        }
+        loop {
+            let key = self.ident()?;
+            self.expect(&Tok::Colon)?;
+            out.push((key, self.literal_value()?));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(out)
+    }
+
+    // A literal property value: number, string, or the keyword true/false/null.
+    fn literal_value(&mut self) -> Result<Value, String> {
+        match self.bump() {
+            Some(Tok::Num(n)) => Ok(Value::Num(n)),
+            Some(Tok::Str(s)) => Ok(Value::Str(s.into())),
+            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("true") => Ok(Value::Bool(true)),
+            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("false") => Ok(Value::Bool(false)),
+            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("null") => Ok(Value::Null),
+            other => Err(format!("expected a literal value, got {other:?}")),
         }
     }
 
@@ -1130,5 +1248,70 @@ mod tests {
     #[test]
     fn bad_quantifier_errors() {
         assert!(super::parse("MATCH (a:Person)-[:KNOWS]->{3,1}(b) RETURN a.name AS a").is_err());
+    }
+
+    // --- part 4: INSERT (write statements) ---
+
+    /// Parsed INSERT matches the hand-built `Plan::Insert`: execute both onto
+    /// fresh stores and confirm they answer the same query identically (and that
+    /// the insert actually happened).
+    #[test]
+    fn insert_parse_matches_hand_plan() {
+        use crate::exec::execute;
+        use crate::ir::{InsertEdge, InsertNode, Plan};
+        let hand = Plan::Insert {
+            nodes: vec![
+                InsertNode {
+                    labels: vec!["Person".into()],
+                    props: vec![("name".into(), s("x")), ("age".into(), n(1.0))],
+                },
+                InsertNode {
+                    labels: vec!["Person".into()],
+                    props: vec![("name".into(), s("y"))],
+                },
+            ],
+            edges: vec![InsertEdge {
+                from: 0,
+                to: 1,
+                etype: "KNOWS".into(),
+            }],
+        };
+        let query = "INSERT (a:Person {name: 'x', age: 1})-[:KNOWS]->(b:Person {name: 'y'})";
+        let mut st_p = Builder::default().build();
+        let mut st_h = Builder::default().build();
+        execute(&super::parse(query).unwrap(), &mut st_p);
+        execute(&hand, &mut st_h);
+        let probe = "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name AS a, b.name AS b, a.age AS age";
+        let pp = super::parse(probe).unwrap();
+        assert_eq!(bag(&run(&pp, &st_p)), bag(&run(&pp, &st_h)));
+        assert_eq!(run(&pp, &st_p).rows.len(), 1); // the insert happened
+    }
+
+    /// A repeated variable references the same node, not a new one: `(a) … , (a)…`
+    /// creates ONE `a`.
+    #[test]
+    fn insert_reuses_variable() {
+        use crate::exec::execute;
+        let mut store = Builder::default().build();
+        execute(
+            &super::parse("INSERT (a:P {name: 'a'}), (a)-[:R]->(b:P {name: 'b'})").unwrap(),
+            &mut store,
+        );
+        let edge = run(
+            &super::parse("MATCH (x:P)-[:R]->(y) RETURN x.name AS x, y.name AS y").unwrap(),
+            &store,
+        );
+        assert_eq!(edge.rows.len(), 1);
+        let cnt = run(
+            &super::parse("MATCH (p:P) RETURN count(*) AS c").unwrap(),
+            &store,
+        );
+        assert_eq!(num(&col(&cnt, 0, "c")), 2.0); // a reused, not duplicated
+    }
+
+    #[test]
+    fn insert_errors() {
+        assert!(super::parse("INSERT (a:P)-[:R]-(b:P)").is_err()); // undirected
+        assert!(super::parse("INSERT (a:P {n: 1}), (a:P {n: 2})").is_err()); // redefine var
     }
 }
