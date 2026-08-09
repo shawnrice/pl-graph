@@ -202,6 +202,42 @@ fn seek_target(pred: &Expr) -> Option<(String, Value)> {
     }
 }
 
+/// A range comparison with its operands swapped — used to normalize
+/// `lit <op> prop` to `prop <op'> lit`.
+fn flip_range(op: CompareOp) -> CompareOp {
+    match op {
+        CompareOp::Lt => CompareOp::Gt,
+        CompareOp::Gt => CompareOp::Lt,
+        CompareOp::Le => CompareOp::Ge,
+        CompareOp::Ge => CompareOp::Le,
+        // Not range ops; range_seek_target never reaches here.
+        CompareOp::Eq | CompareOp::Ne => op,
+    }
+}
+
+/// If `pred` is a RANGE comparison (`<`,`<=`,`>`,`>=`) between slot-0's property
+/// and a literal — in either spelling — return `(key, op, value)` oriented with
+/// the property on the left (`prop <op> value`). Flipping the op for the
+/// `lit <op> prop` spelling is load-bearing: else `5 < n` never seeks.
+fn range_seek_target(pred: &Expr) -> Option<(String, CompareOp, Value)> {
+    let Expr::Compare { op, left, right } = pred else {
+        return None;
+    };
+    if !matches!(
+        op,
+        CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
+    ) {
+        return None;
+    }
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Prop { slot: 0, key }, Expr::Lit(v)) => Some((key.clone(), *op, v.clone())),
+        (Expr::Lit(v), Expr::Prop { slot: 0, key }) => {
+            Some((key.clone(), flip_range(*op), v.clone()))
+        }
+        _ => None,
+    }
+}
+
 /// The local rules, tried in order at a single node.
 fn apply_local(plan: Plan) -> (Plan, bool) {
     match plan {
@@ -248,27 +284,41 @@ fn apply_local(plan: Plan) -> (Plan, bool) {
                 },
                 true,
             ),
-            // index seed: `Filter(prop = literal) over Scan(label)` -> IndexSeek.
-            // A semantic no-op (IndexSeek yields exactly Scan+Filter(=) rows) that
-            // lets the executor seek an index. Both spellings of `=` are handled
-            // (see `seek_target`) so neither silently keeps scanning.
-            Plan::Scan { label: Some(l) } => match seek_target(&pred) {
-                Some((key, value)) => (
-                    Plan::IndexSeek {
-                        label: l,
-                        key,
-                        value,
-                    },
-                    true,
-                ),
-                None => (
-                    Plan::Filter {
-                        input: Box::new(Plan::Scan { label: Some(l) }),
-                        pred,
-                    },
-                    false,
-                ),
-            },
+            // index seed: `Filter(prop <op> literal) over Scan(label)` -> a seek.
+            // `=` seeds an IndexSeek, a range op a RangeSeek; both are semantic
+            // no-ops (the seek yields exactly Scan+Filter rows) and both spellings
+            // are handled (see `seek_target`/`range_seek_target`) so neither
+            // silently keeps scanning.
+            Plan::Scan { label: Some(l) } => {
+                if let Some((key, value)) = seek_target(&pred) {
+                    (
+                        Plan::IndexSeek {
+                            label: l,
+                            key,
+                            value,
+                        },
+                        true,
+                    )
+                } else if let Some((key, op, value)) = range_seek_target(&pred) {
+                    (
+                        Plan::RangeSeek {
+                            label: l,
+                            key,
+                            op,
+                            value,
+                        },
+                        true,
+                    )
+                } else {
+                    (
+                        Plan::Filter {
+                            input: Box::new(Plan::Scan { label: Some(l) }),
+                            pred,
+                        },
+                        false,
+                    )
+                }
+            }
             other => (
                 Plan::Filter {
                     input: Box::new(other),
@@ -426,16 +476,12 @@ mod tests {
     }
 
     /// A range filter is NOT seeded (that is D2); an unlabelled scan cannot seek.
+    /// An unlabelled scan cannot seek (IndexSeek/RangeSeek need a label), so its
+    /// filter is preserved. (A labelled range filter now seeds — see the range
+    /// seed test.)
     #[test]
-    fn non_eq_and_unlabelled_not_seeded() {
+    fn unlabelled_scan_not_seeded() {
         let store = social();
-        let range = Plan::Scan {
-            label: Some("Person".into()),
-        }
-        .filter(cmp(CompareOp::Gt, prop(0, "age"), Expr::Lit(n(28.0))))
-        .project(vec![("name".into(), prop(0, "name"))]);
-        assert!(plan_contains_filter(&assert_rows_preserved(&range, &store)));
-
         let unlabelled = Plan::Scan { label: None }
             .filter(cmp(CompareOp::Eq, prop(0, "name"), Expr::Lit(s("alice"))))
             .project(vec![("name".into(), prop(0, "name"))]);
@@ -443,6 +489,47 @@ mod tests {
             &unlabelled,
             &store
         )));
+    }
+
+    /// A range filter over a labelled scan seeds to a `RangeSeek`, for BOTH
+    /// spellings (`age > 28` and `28 < age`), which land the SAME target and
+    /// preserve rows (equivalent-spellings for ranges).
+    #[test]
+    fn range_filter_seeds_both_spellings() {
+        let store = social();
+        let plan_of = |pred| {
+            Plan::Scan {
+                label: Some("Person".into()),
+            }
+            .filter(pred)
+            .project(vec![("name".into(), prop(0, "name"))])
+        };
+        // age > 28  and  28 < age  are the same predicate, different spelling.
+        let a = plan_of(cmp(CompareOp::Gt, prop(0, "age"), Expr::Lit(n(28.0))));
+        let b = plan_of(cmp(CompareOp::Lt, Expr::Lit(n(28.0)), prop(0, "age")));
+        let oa = assert_rows_preserved(&a, &store);
+        let ob = assert_rows_preserved(&b, &store);
+
+        let target = |p: &Plan| -> (String, CompareOp, Value) {
+            let Plan::Project { input, .. } = p else {
+                panic!("expected Project, got {p:?}")
+            };
+            let Plan::RangeSeek { key, op, value, .. } = input.as_ref() else {
+                panic!("expected RangeSeek under Project, got {input:?}")
+            };
+            (key.clone(), *op, value.clone())
+        };
+        let (ka, opa, va) = target(&oa);
+        let (kb, opb, vb) = target(&ob);
+        assert_eq!(ka, "age");
+        assert_eq!(opa, CompareOp::Gt); // both normalize to prop > 28
+        assert_eq!((ka, opa), (kb, opb));
+        assert!(matches!(va, Value::Num(x) if x == 28.0));
+        assert!(matches!(vb, Value::Num(x) if x == 28.0));
+        // answer: alice(30), carol(40)
+        let mut got = bag(&run(&oa, &store));
+        got.sort();
+        assert_eq!(got, vec!["Str(\"alice\");", "Str(\"carol\");"]);
     }
 
     #[test]
@@ -495,11 +582,11 @@ mod tests {
     #[test]
     fn adjacent_filters_merge() {
         let store = social();
-        let plan = Plan::Scan {
-            label: Some("Person".into()),
-        }
-        .filter(cmp(CompareOp::Ge, prop(0, "age"), Expr::Lit(n(28.0))))
-        .filter(cmp(CompareOp::Le, prop(0, "age"), Expr::Lit(n(35.0))));
+        // Unlabelled scan so seeding (which needs a label) does not fire — this
+        // isolates the merge rule. social() is all-Person, so the rows match.
+        let plan = Plan::Scan { label: None }
+            .filter(cmp(CompareOp::Ge, prop(0, "age"), Expr::Lit(n(28.0))))
+            .filter(cmp(CompareOp::Le, prop(0, "age"), Expr::Lit(n(35.0))));
         let opt = assert_rows_preserved(&plan, &store);
         // And the answer: only alice(30) is in [28,35].
         assert_eq!(run(&opt, &store).rows.len(), 1);
@@ -521,14 +608,11 @@ mod tests {
         let store = social();
         // Two filters (slot 0) above an Expand: the driver must MERGE them and
         // then PUSH the merged filter below the Expand — two rules, to a fixpoint.
-        let plan = Plan::Scan {
-            label: Some("Person".into()),
-        }
-        // Two RANGE filters (non-seedable, so they merge rather than seed to
-        // IndexSeek — this test isolates merge + pushdown).
-        .expand(0, Dir::Out, Some("KNOWS"))
-        .filter(cmp(CompareOp::Le, prop(0, "age"), Expr::Lit(n(100.0))))
-        .filter(cmp(CompareOp::Ge, prop(0, "age"), Expr::Lit(n(0.0))));
+        // Unlabelled scan so seeding does not fire, isolating merge + pushdown.
+        let plan = Plan::Scan { label: None }
+            .expand(0, Dir::Out, Some("KNOWS"))
+            .filter(cmp(CompareOp::Le, prop(0, "age"), Expr::Lit(n(100.0))))
+            .filter(cmp(CompareOp::Ge, prop(0, "age"), Expr::Lit(n(0.0))));
         let opt = assert_rows_preserved(&plan, &store);
         match opt {
             Plan::Expand { input, .. } => match *input {
@@ -546,16 +630,14 @@ mod tests {
     fn pushdown_into_join_left() {
         let store = social();
         // A filter on a left-side slot pushes into the Join's left input.
-        let left = Plan::Scan {
-            label: Some("Person".into()),
-        }
-        .expand(0, Dir::Out, Some("KNOWS"));
+        // Unlabelled left scan so the pushed filter stays a Filter (not seeded),
+        // which is what this test checks.
+        let left = Plan::Scan { label: None }.expand(0, Dir::Out, Some("KNOWS"));
         let right = Plan::Scan {
             label: Some("Person".into()),
         }
         .expand(0, Dir::Out, Some("KNOWS"));
-        // left width is 2 (a, b); a filter on slot 0 (left's a) pushes left. A
-        // RANGE predicate (non-seedable) so it stays a Filter for this test.
+        // left width is 2 (a, b); a filter on slot 0 (left's a) pushes left.
         let plan = Plan::join(left, right, vec![(0, 0)]).filter(cmp(
             CompareOp::Ge,
             prop(0, "age"),

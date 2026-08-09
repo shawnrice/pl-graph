@@ -119,8 +119,12 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
         `RangeSeek{label,key,op,value}` executed index-or-scan, matching Filter's
         `cmp_total` ordering exactly (null operand drops; NaN greatest; cross-type
         by rank — this engine's total order, noted vs lenke-core's throw for J1).
-  - [ ] D2b. Optimizer rule: `Scan(label)+Filter(prop <op> lit)` → `RangeSeek`,
-        both spellings (`n > 5`, `5 < n`); BETWEEN as two range bounds.
+  - [x] D2b. Optimizer rule: `Scan(Some(label))+Filter(prop <op> lit)` → `RangeSeek`
+        for a range op, BOTH spellings via `flip_range` (`n > 5` and `5 < n`
+        normalize to `prop > 5`), same target + rows-preserved test. Composes with
+        pushdown. NOTE: BETWEEN / conjunction-splitting (seed one bound of an
+        `And`, keep the other as a Filter) deferred — GQL has no BETWEEN keyword
+        yet and `x>=lo AND x<=hi` is an And filter; a small follow-up.
 - [ ] D3. Edge-type index; interval/temporal index.
 
 ### Phase E — Expression & function surface
