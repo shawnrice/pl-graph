@@ -1076,7 +1076,9 @@ fn index_seek_ids(store: &Store, label: &str, key: &str, value: &Value) -> Vec<u
             .nodes_with_label(label)
             .iter()
             .copied()
-            .filter(|&id| value::equals(&store.prop(id, key), value))
+            // `key` may be a dotted record path — resolve it (plain keys read as
+            // `prop`), so the no-index fallback matches a dotted seek too.
+            .filter(|&id| value::equals(&store.prop_path(id, key), value))
             .collect(),
     }
 }

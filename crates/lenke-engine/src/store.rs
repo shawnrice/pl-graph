@@ -458,6 +458,15 @@ impl Store {
             .map_or(Value::Null, |c| c.read(node as usize))
     }
 
+    /// Read a node's value at a (possibly dotted) property PATH: the base property,
+    /// then descend record sub-fields. A plain key reads exactly like [`prop`]. The
+    /// scan-fallback twin of a dotted [`index_lookup`].
+    #[must_use]
+    pub fn prop_path(&self, node: u32, dotted_key: &str) -> Value {
+        let path: Vec<String> = dotted_key.split('.').map(String::from).collect();
+        resolve_path(&self.prop(node, &path[0]), &path[1..])
+    }
+
     /// The typed column for `key`, for a bulk gather. `None` = no such property.
     #[must_use]
     pub fn column(&self, key: &str) -> Option<&Column> {

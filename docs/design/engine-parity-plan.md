@@ -299,9 +299,12 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       Maintained through set/remove/delete (`reindex_node`) so rollback stays
       consistent; `index_lookup("meta.city", v)` returns candidates. 1 store test
       (build-from-data, maintenance on write, delete, no-index→None).
-- [ ] G2e. Planner seek for the dotted index: recognize `n.rec.sub = $x`
-      (Field{Prop} = lit, both spellings) → a dotted IndexSeek, with the scan
-      fallback resolving the path. Equivalent-spellings discipline.
+- [x] G2e. Planner seek for the dotted index: `seek_target` now recognizes a
+      dotted property PATH (`Field{Prop{0}}` chain, via `prop_path`) on either
+      side of `=`, seeding a dotted `IndexSeek`; the no-index scan fallback reads
+      the path with `store.prop_path`. Both spellings land the same target. 1 opt
+      test (seed shape + rows with index AND via the fallback). Completes the
+      dotted-path index end to end (the memory's 140x seek path).
 - [x] F5c. Gremlin multi-label `select('a','b')` builds an insertion-ordered
       `Value::Map` keyed by the labels (via a new `Expr::MapLit`, Gremlin-only);
       a single-label select still projects the element, an unknown label errors.

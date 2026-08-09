@@ -218,9 +218,22 @@ fn seek_target(pred: &Expr) -> Option<(String, Value)> {
     else {
         return None;
     };
-    match (left.as_ref(), right.as_ref()) {
-        (Expr::Prop { slot: 0, key }, Expr::Lit(v))
-        | (Expr::Lit(v), Expr::Prop { slot: 0, key }) => Some((key.clone(), v.clone())),
+    // One side must be a literal, the other a (possibly dotted) property PATH on
+    // slot 0. Both spellings; a dotted `n.rec.sub` seeds a dotted IndexSeek.
+    let (path_expr, v) = match (left.as_ref(), right.as_ref()) {
+        (e, Expr::Lit(v)) => (e, v),
+        (Expr::Lit(v), e) => (e, v),
+        _ => return None,
+    };
+    prop_path(path_expr).map(|k| (k, v.clone()))
+}
+
+/// The dotted property path an expression reads on slot 0, or `None` if it is not
+/// a slot-0 property/field chain. `n.age` → `"age"`, `n.meta.city` → `"meta.city"`.
+fn prop_path(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Prop { slot: 0, key } => Some(key.clone()),
+        Expr::Field { base, key } => Some(format!("{}.{key}", prop_path(base)?)),
         _ => None,
     }
 }
@@ -532,6 +545,76 @@ mod tests {
         assert!(matches!(&va, Value::Str(x) if &**x == "alice"));
         assert!(matches!(&vb, Value::Str(x) if &**x == "alice"));
         assert_eq!(bag(&run(&oa, &store)), vec!["Str(\"alice\");"]);
+    }
+
+    /// A dotted record-field equality `n.meta.city = 'NYC'` seeds a dotted
+    /// `IndexSeek` — both spellings land the SAME target — and gives the right
+    /// rows both WITH an index (index_lookup) and WITHOUT (the path-resolving scan
+    /// fallback).
+    #[test]
+    fn dotted_field_eq_seeds_index_both_spellings() {
+        use crate::value::make_record;
+        use std::sync::Arc;
+        let build = || {
+            let mut b = Builder::default();
+            b.node(
+                &["Person"],
+                &[
+                    ("name", s("alice")),
+                    ("meta", make_record(vec![(Arc::from("city"), s("NYC"))])),
+                ],
+            );
+            b.node(
+                &["Person"],
+                &[
+                    ("name", s("bob")),
+                    ("meta", make_record(vec![(Arc::from("city"), s("LA"))])),
+                ],
+            );
+            b.build()
+        };
+        let field = Expr::Field {
+            base: Box::new(prop(0, "meta")),
+            key: "city".into(),
+        };
+        let plan_of = |pred| {
+            Plan::Scan {
+                label: Some("Person".into()),
+            }
+            .filter(pred)
+            .project(vec![("name".into(), prop(0, "name"))])
+        };
+        let a = plan_of(cmp(CompareOp::Eq, field.clone(), Expr::Lit(s("NYC"))));
+        let b = plan_of(cmp(CompareOp::Eq, Expr::Lit(s("NYC")), field.clone()));
+
+        let mut store = build();
+        store.create_index("meta.city");
+        let oa = assert_rows_preserved(&a, &store);
+        let ob = assert_rows_preserved(&b, &store);
+
+        let target = |p: &Plan| -> (String, Value) {
+            let Plan::Project { input, .. } = p else {
+                panic!("expected Project, got {p:?}")
+            };
+            let Plan::IndexSeek { key, value, .. } = input.as_ref() else {
+                panic!("expected a (dotted) IndexSeek, got {input:?}")
+            };
+            (key.clone(), value.clone())
+        };
+        let (ka, va) = target(&oa);
+        let (kb, _) = target(&ob);
+        assert_eq!(ka, "meta.city");
+        assert_eq!(ka, kb); // both spellings, same dotted target
+        assert!(matches!(&va, Value::Str(x) if &**x == "NYC"));
+        assert_eq!(bag(&run(&oa, &store)), vec!["Str(\"alice\");"]);
+
+        // Same seed, NO index: the scan fallback resolves the path and matches.
+        let no_index = build();
+        let oc = optimize(a.clone());
+        assert!(
+            matches!(&oc, Plan::Project { input, .. } if matches!(input.as_ref(), Plan::IndexSeek { .. }))
+        );
+        assert_eq!(bag(&run(&oc, &no_index)), vec!["Str(\"alice\");"]);
     }
 
     /// A range filter is NOT seeded (that is D2); an unlabelled scan cannot seek.
