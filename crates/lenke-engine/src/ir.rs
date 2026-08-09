@@ -76,6 +76,12 @@ pub enum Expr {
     Record {
         fields: Vec<(String, Expr)>,
     },
+    /// A map literal producing a `Value::Map` (insertion-ordered, string keys).
+    /// Built by the Gremlin front-end for multi-label `select('a','b')`; GQL uses
+    /// `Record` instead. Values are expressions, evaluated per row.
+    MapLit {
+        entries: Vec<(String, Expr)>,
+    },
     /// Field access on an arbitrary base expression: `<base>.key`. `base` may be a
     /// record/map value (→ the field) or an element frontier (→ its property) —
     /// the general form of `Prop` (which is the slot-shortcut the optimizer sees).

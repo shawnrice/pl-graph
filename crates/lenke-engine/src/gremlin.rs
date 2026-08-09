@@ -410,20 +410,29 @@ impl Parser {
                 plan
             }
             "select" => {
-                let label = self.str_arg()?;
-                // Multi-label select yields a Map, which this engine has no value
-                // for yet — reject it rather than invent one.
-                if self.peek() == Some(&Tok::Comma) {
-                    return Err(
-                        "multi-label select(...) needs map values, which are not supported".into(),
-                    );
+                // One or more labels. A single label projects that element; two or
+                // more build an insertion-ordered Map keyed by the labels.
+                let mut labels = vec![self.str_arg()?];
+                while self.peek() == Some(&Tok::Comma) {
+                    self.pos += 1;
+                    labels.push(self.str_arg()?);
                 }
                 self.expect(&Tok::RParen)?;
-                let slot = *self
-                    .labels
-                    .get(&label)
-                    .ok_or_else(|| format!("select('{label}'): no step is labelled `{label}`"))?;
-                let p = plan.project(vec![(label.clone(), Expr::Slot(slot))]);
+                let slot_of = |l: &str| {
+                    self.labels
+                        .get(l)
+                        .copied()
+                        .ok_or_else(|| format!("select('{l}'): no step is labelled `{l}`"))
+                };
+                let p = if labels.len() == 1 {
+                    plan.project(vec![(labels[0].clone(), Expr::Slot(slot_of(&labels[0])?))])
+                } else {
+                    let entries = labels
+                        .iter()
+                        .map(|l| Ok((l.clone(), Expr::Slot(slot_of(l)?))))
+                        .collect::<Result<Vec<_>, String>>()?;
+                    plan.project(vec![("select".into(), Expr::MapLit { entries })])
+                };
                 self.current = 0;
                 self.slots = 1;
                 p
@@ -1018,9 +1027,32 @@ mod tests {
 
     #[test]
     fn select_errors() {
-        // An unknown label, and multi-label select (needs map values), both error.
+        // An unknown label errors — whether alone or inside a multi-select.
         assert!(super::parse("g.V().as('p').select('q')").is_err());
-        assert!(super::parse("g.V().as('a').out('R').as('b').select('a','b')").is_err());
+        assert!(super::parse("g.V().as('a').out('R').as('b').select('a','z')").is_err());
+    }
+
+    #[test]
+    fn multi_select_builds_an_ordered_map() {
+        let store = social();
+        // bob KNOWS carol only: select('p','f') is a Map {p: bob(1), f: carol(2)},
+        // insertion-ordered (p then f), values are the node ids.
+        let out = gremlin_rows(
+            "g.V().hasLabel('Person').has('name', 'bob').as('p').out('KNOWS').as('f') \
+             .select('p', 'f')",
+            &store,
+        );
+        assert_eq!(out.rows.len(), 1);
+        match &out.rows[0][0] {
+            Value::Map(pairs) => {
+                assert_eq!(pairs.len(), 2);
+                assert!(matches!(&pairs[0].0, Value::Str(s) if &**s == "p"));
+                assert!(matches!(&pairs[1].0, Value::Str(s) if &**s == "f"));
+                assert!(matches!(pairs[0].1, Value::Num(x) if x == 1.0)); // bob
+                assert!(matches!(pairs[1].1, Value::Num(x) if x == 2.0)); // carol
+            }
+            o => panic!("expected a Map, got {o:?}"),
+        }
     }
 
     #[test]

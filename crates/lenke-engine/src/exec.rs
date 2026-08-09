@@ -409,7 +409,9 @@ fn needs_lineage(plan: &Plan) -> bool {
                 left: a, right: b, ..
             } => reads_path(a) || reads_path(b),
             Expr::Call { args, .. } | Expr::List { items: args } => args.iter().any(reads_path),
-            Expr::Record { fields } => fields.iter().any(|(_, e)| reads_path(e)),
+            Expr::Record { fields } | Expr::MapLit { entries: fields } => {
+                fields.iter().any(|(_, e)| reads_path(e))
+            }
             Expr::Field { base, .. } => reads_path(base),
             Expr::Case {
                 branches,
@@ -1366,7 +1368,9 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         Expr::Call { args, .. } | Expr::List { items: args } => {
             args.iter().all(|a| refs_only_slot(a, s))
         }
-        Expr::Record { fields } => fields.iter().all(|(_, e)| refs_only_slot(e, s)),
+        Expr::Record { fields } | Expr::MapLit { entries: fields } => {
+            fields.iter().all(|(_, e)| refs_only_slot(e, s))
+        }
         Expr::Field { base, .. } => refs_only_slot(base, s),
         Expr::Case {
             branches,
@@ -1423,6 +1427,12 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         },
         Expr::Record { fields } => Expr::Record {
             fields: fields
+                .iter()
+                .map(|(k, e)| (k.clone(), remap_slot(e, from, to)))
+                .collect(),
+        },
+        Expr::MapLit { entries } => Expr::MapLit {
+            entries: entries
                 .iter()
                 .map(|(k, e)| (k.clone(), remap_slot(e, from, to)))
                 .collect(),
@@ -1975,6 +1985,23 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                             .map(|((k, _), c)| (Arc::from(k.as_str()), c.value_at(i)))
                             .collect();
                         value::make_record(pairs)
+                    })
+                    .collect(),
+            )
+        }
+        Expr::MapLit { entries } => {
+            // Per row, an insertion-ordered Value::Map with string keys.
+            let cols = eval_all(entries.iter().map(|(_, e)| e), store, batch)?;
+            let n = batch.rows();
+            Col::Gen(
+                (0..n)
+                    .map(|i| {
+                        let pairs = entries
+                            .iter()
+                            .zip(&cols)
+                            .map(|((k, _), c)| (Value::Str(Arc::from(k.as_str())), c.value_at(i)))
+                            .collect();
+                        Value::Map(Arc::new(pairs))
                     })
                     .collect(),
             )

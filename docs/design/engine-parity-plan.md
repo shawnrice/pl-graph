@@ -295,9 +295,11 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       read + absent→NULL).
 - [ ] G2d. Dotted-path property index: createIndex on a record field path +
       planner seek `n.k.sub = $x` into it (the perf slice; the memory's 140x seek).
-- [ ] F5c. Gremlin multi-label select('a','b') (a Map value — needs G2) and
-      order(local) (within-list sort — needs list ops). Relocated from F5b; placed
-      after G2 because it depends on the map/list value model.
+- [x] F5c. Gremlin multi-label `select('a','b')` builds an insertion-ordered
+      `Value::Map` keyed by the labels (via a new `Expr::MapLit`, Gremlin-only);
+      a single-label select still projects the element, an unknown label errors.
+      1 test (ordered map of node ids). order(local) → F5d.
+- [ ] F5d. Gremlin `order(local)` (within-list/map sort) — needs list-sort ops.
 - [ ] G3. Numeric edge-case parity audit against `value.rs`.
 - [ ] G4. Interval/temporal edge index (relocated from D3; needs G1): RI-tree-style
       as-of/overlap seek over temporal edge bounds.
