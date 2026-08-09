@@ -375,7 +375,7 @@ fn needs_lineage(plan: &Plan) -> bool {
             | Expr::Arith {
                 left: a, right: b, ..
             } => reads_path(a) || reads_path(b),
-            Expr::Call { args, .. } => args.iter().any(reads_path),
+            Expr::Call { args, .. } | Expr::List { items: args } => args.iter().any(reads_path),
             Expr::Case {
                 branches,
                 otherwise,
@@ -1269,7 +1269,9 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         | Expr::Arith {
             left: a, right: b, ..
         } => refs_only_slot(a, s) && refs_only_slot(b, s),
-        Expr::Call { args, .. } => args.iter().all(|a| refs_only_slot(a, s)),
+        Expr::Call { args, .. } | Expr::List { items: args } => {
+            args.iter().all(|a| refs_only_slot(a, s))
+        }
         Expr::Case {
             branches,
             otherwise,
@@ -1311,6 +1313,9 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         Expr::Call { name, args } => Expr::Call {
             name: name.clone(),
             args: args.iter().map(|a| remap_slot(a, from, to)).collect(),
+        },
+        Expr::List { items } => Expr::List {
+            items: items.iter().map(|a| remap_slot(a, from, to)).collect(),
         },
         Expr::Case {
             branches,
@@ -1713,6 +1718,16 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
                 .collect();
             Col::Gen(out)
         }
+        Expr::List { items } => {
+            // Per row, build a Value::List of each element's value.
+            let cols: Vec<Col> = items.iter().map(|e| eval(e, store, batch)).collect();
+            let n = batch.rows();
+            Col::Gen(
+                (0..n)
+                    .map(|i| Value::List(cols.iter().map(|c| c.value_at(i)).collect()))
+                    .collect(),
+            )
+        }
         Expr::Case {
             branches,
             otherwise,
@@ -1777,6 +1792,19 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         },
         // substring(s, start[, len]) — 0-based, char-indexed
         "substring" => substring(args),
+        // list (1 arg)
+        "size" => match &args[0] {
+            Value::List(v) => Value::Num(v.len() as f64),
+            _ => Value::Null,
+        },
+        "head" => match &args[0] {
+            Value::List(v) => v.first().cloned().unwrap_or(Value::Null),
+            _ => Value::Null,
+        },
+        "last" => match &args[0] {
+            Value::List(v) => v.last().cloned().unwrap_or(Value::Null),
+            _ => Value::Null,
+        },
         _ => Value::Null, // parser rejects unknown names; defensive
     }
 }

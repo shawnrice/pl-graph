@@ -64,6 +64,11 @@ pub enum Expr {
         branches: Vec<(Expr, Expr)>,
         otherwise: Option<Box<Expr>>,
     },
+    /// A list literal `[a, b, …]`. Evaluated per row into a `Value::List` — the
+    /// elements are expressions, so `[p.age, 1]` is not a constant.
+    List {
+        items: Vec<Expr>,
+    },
 }
 
 /// A binary arithmetic operator.

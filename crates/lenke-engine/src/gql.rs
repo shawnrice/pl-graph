@@ -988,6 +988,23 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 Ok(e)
             }
+            Some(Tok::LBracket) => {
+                // A list literal `[a, b, …]` (empty `[]` allowed). In expression
+                // position `[` always starts a list — rel-pattern brackets only
+                // occur inside `-[:R]-`, which the pattern parser handles.
+                self.pos += 1;
+                let mut items = Vec::new();
+                if self.peek() != Some(&Tok::RBracket) {
+                    loop {
+                        items.push(self.expr()?);
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Tok::RBracket)?;
+                Ok(Expr::List { items })
+            }
             Some(Tok::Num(n)) => {
                 self.pos += 1;
                 Ok(Expr::Lit(Value::Num(n)))
@@ -1079,7 +1096,7 @@ impl Parser {
         let arity_ok = match lname.as_str() {
             // 1 arg
             "abs" | "sign" | "floor" | "ceil" | "round" | "sqrt" | "upper" | "lower" | "trim"
-            | "length" => args.len() == 1,
+            | "length" | "size" | "head" | "last" => args.len() == 1,
             // 2 args
             "starts_with" | "ends_with" | "contains" => args.len() == 2,
             // 3 args
@@ -1926,6 +1943,60 @@ mod tests {
     fn string_fn_arity_errors() {
         assert!(super::parse("MATCH (p:Person) RETURN upper(p.name, 1) AS x").is_err());
         assert!(super::parse("MATCH (p:Person) RETURN replace(p.name, 'a') AS x").is_err());
+    }
+
+    // --- part 3.9: list literal + list functions (E4b) ---
+
+    /// A list literal can hold non-constant elements; size/head/last read it.
+    #[test]
+    fn list_literal_and_functions() {
+        let store = social();
+        let q = "MATCH (p:Person) WHERE p.name='alice' RETURN \
+                 size([p.age, 1, 2]) AS n, head([p.age, 1, 2]) AS h, last([p.age, 1, 2]) AS t";
+        let out = run(&super::parse(q).unwrap(), &store);
+        assert_eq!(num(&col(&out, 0, "n")), 3.0);
+        assert_eq!(num(&col(&out, 0, "h")), 30.0); // p.age (alice)
+        assert_eq!(num(&col(&out, 0, "t")), 2.0);
+    }
+
+    /// Empty list: size 0, head/last NULL. A list fn on a non-list is NULL.
+    #[test]
+    fn empty_list_and_non_list() {
+        let store = social();
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) WHERE p.name='alice' \
+                 RETURN size([]) AS z, head([]) AS h, size(p.age) AS bad",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert_eq!(num(&col(&out, 0, "z")), 0.0);
+        assert!(col(&out, 0, "h").is_null());
+        assert!(col(&out, 0, "bad").is_null()); // size of a number → NULL
+    }
+
+    /// Parsed `[p.age, 1]` matches the hand-built `Expr::List`.
+    #[test]
+    fn list_literal_parse_matches_hand() {
+        use crate::ir::{Expr, Plan};
+        let store = social();
+        let hand = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .project(vec![(
+            "xs".into(),
+            Expr::List {
+                items: vec![
+                    Expr::Prop {
+                        slot: 0,
+                        key: "age".into(),
+                    },
+                    Expr::Lit(n(1.0)),
+                ],
+            },
+        )]);
+        assert_same("MATCH (p:Person) RETURN [p.age, 1] AS xs", &hand, &store);
     }
 
     // --- part 4: INSERT (write statements) ---
