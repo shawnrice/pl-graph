@@ -7,10 +7,45 @@
 //! the whole point of the columnar model, present from the first slice rather
 //! than retrofitted.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::value::Value;
+
+/// A `Value` ordered by the value contract's total order (`cmp_total`) — the key
+/// type for a range index's `BTreeMap`. It DELEGATES to `cmp_total`; it does not
+/// restate ordering. `Eq` is "compares equal under `cmp_total`", so values the
+/// total order ties (two NaNs, `-0.0`/`0.0`) share a bucket, exactly as grouping
+/// does.
+#[derive(Clone)]
+struct OrdVal(Value);
+
+impl PartialEq for OrdVal {
+    fn eq(&self, other: &Self) -> bool {
+        crate::value::cmp_total(&self.0, &other.0) == Ordering::Equal
+    }
+}
+impl Eq for OrdVal {}
+impl PartialOrd for OrdVal {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrdVal {
+    fn cmp(&self, other: &Self) -> Ordering {
+        crate::value::cmp_total(&self.0, &other.0)
+    }
+}
+
+/// A range index on one node property `key`: values ordered by `cmp_total` ->
+/// node ids. Holds only NON-NULL present values (a null never passes a range
+/// predicate — the operand makes it UNKNOWN — so excluding it keeps the seek in
+/// step with a scan+filter).
+struct RangeIndex {
+    key: String,
+    map: BTreeMap<OrdVal, Vec<u32>>,
+}
 
 /// A typed property column, indexed by node id. `present[i]` is false where node
 /// `i` does not carry this property (reads as `Value::Null`). One variant per
@@ -294,6 +329,8 @@ pub struct Store {
     /// through the primitives, so a transaction rollback (which replays the
     /// primitives) keeps them consistent.
     indexes: Vec<Index>,
+    /// range indexes on a node property `key` (ordered by `cmp_total`).
+    ranges: Vec<RangeIndex>,
 }
 
 /// A hash index on one node property `key`.
@@ -585,12 +622,12 @@ impl Store {
     }
 
     fn apply_set_prop(&mut self, node: u32, key: &str, value: Value) {
-        // Index upkeep: capture the old key BEFORE writing (reads first, then the
-        // column write, then the index write — distinct fields, no borrow clash).
-        let indexed = self.is_indexed(key);
-        let old_gk = (indexed && self.has_prop(node, key))
-            .then(|| crate::value::group_key(&self.prop(node, key)));
-        let new_gk = indexed.then(|| crate::value::group_key(&value));
+        // Index upkeep: capture the OLD value before writing, and keep a copy of
+        // the new one for the index (reads first, then the column write, then the
+        // index writes — distinct fields, no borrow clash).
+        let indexed = self.is_indexed(key) || self.is_range_indexed(key);
+        let old = (indexed && self.has_prop(node, key)).then(|| self.prop(node, key));
+        let new_for_index = indexed.then(|| value.clone());
 
         let n = self.node_count;
         let col = self
@@ -602,11 +639,13 @@ impl Store {
         }
         col.set(node as usize, value);
 
-        if let Some(gk) = old_gk {
-            self.index_bucket_remove(key, &gk, node);
+        if let Some(old) = &old {
+            self.index_bucket_remove(key, &crate::value::group_key(old), node);
+            self.range_remove(key, old, node);
         }
-        if let Some(gk) = new_gk {
-            self.index_bucket_add(key, gk, node);
+        if let Some(nv) = new_for_index {
+            self.index_bucket_add(key, crate::value::group_key(&nv), node);
+            self.range_add(key, &nv, node);
         }
     }
 
@@ -626,14 +665,16 @@ impl Store {
     }
 
     fn apply_remove_prop(&mut self, node: u32, key: &str) {
-        // Drop the node from the index bucket for its OLD value, if indexed.
-        let old_gk = (self.is_indexed(key) && self.has_prop(node, key))
-            .then(|| crate::value::group_key(&self.prop(node, key)));
+        // Drop the node from the index(es) for its OLD value, if indexed.
+        let old = ((self.is_indexed(key) || self.is_range_indexed(key))
+            && self.has_prop(node, key))
+        .then(|| self.prop(node, key));
         if let Some(col) = self.props.get_mut(key) {
             col.set_absent(node as usize);
         }
-        if let Some(gk) = old_gk {
-            self.index_bucket_remove(key, &gk, node);
+        if let Some(old) = &old {
+            self.index_bucket_remove(key, &crate::value::group_key(old), node);
+            self.range_remove(key, old, node);
         }
     }
 
@@ -761,6 +802,100 @@ impl Store {
         for (k, gk) in removals {
             self.index_bucket_remove(&k, &gk, id);
         }
+        // Range indexes hold non-null values only.
+        let range_removals: Vec<(String, Value)> = self
+            .ranges
+            .iter()
+            .filter(|ix| self.has_prop(id, &ix.key))
+            .filter_map(|ix| {
+                let v = self.prop(id, &ix.key);
+                (!v.is_null()).then(|| (ix.key.clone(), v))
+            })
+            .collect();
+        for (k, v) in range_removals {
+            self.range_remove(&k, &v, id);
+        }
+    }
+
+    /// Create a range index on node property `key` (idempotent). Built from the
+    /// current live nodes carrying a NON-NULL value for it.
+    pub fn create_range_index(&mut self, key: &str) {
+        if self.ranges.iter().any(|i| i.key == key) {
+            return;
+        }
+        let mut map: BTreeMap<OrdVal, Vec<u32>> = BTreeMap::new();
+        if let Some(col) = self.props.get(key) {
+            for id in 0..self.node_count {
+                if !self.deleted[id] && col.present_at(id) {
+                    let v = col.read(id);
+                    if !v.is_null() {
+                        map.entry(OrdVal(v)).or_default().push(id as u32);
+                    }
+                }
+            }
+        }
+        self.ranges.push(RangeIndex {
+            key: key.to_string(),
+            map,
+        });
+    }
+
+    #[must_use]
+    fn is_range_indexed(&self, key: &str) -> bool {
+        self.ranges.iter().any(|i| i.key == key)
+    }
+
+    fn range_add(&mut self, key: &str, value: &Value, node: u32) {
+        if value.is_null() {
+            return;
+        }
+        if let Some(ix) = self.ranges.iter_mut().find(|i| i.key == key) {
+            ix.map.entry(OrdVal(value.clone())).or_default().push(node);
+        }
+    }
+
+    fn range_remove(&mut self, key: &str, value: &Value, node: u32) {
+        if value.is_null() {
+            return;
+        }
+        if let Some(ix) = self.ranges.iter_mut().find(|i| i.key == key) {
+            if let Some(bucket) = ix.map.get_mut(&OrdVal(value.clone())) {
+                bucket.retain(|&x| x != node);
+            }
+        }
+    }
+
+    /// Candidate node ids (ANY label) whose `key` satisfies `prop <op> value`
+    /// under `cmp_total`, or `None` if no range index exists on `key`. `op` is one
+    /// of `Lt`/`Le`/`Gt`/`Ge`. A null `value` matches nothing. Deleted filtered.
+    #[must_use]
+    pub fn range_lookup(
+        &self,
+        key: &str,
+        op: crate::ir::CompareOp,
+        value: &Value,
+    ) -> Option<Vec<u32>> {
+        use crate::ir::CompareOp::{Ge, Gt, Le, Lt};
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let ix = self.ranges.iter().find(|i| i.key == key)?;
+        if value.is_null() {
+            return Some(Vec::new());
+        }
+        let k = OrdVal(value.clone());
+        let bounds: (std::ops::Bound<OrdVal>, std::ops::Bound<OrdVal>) = match op {
+            Gt => (Excluded(k), Unbounded),
+            Ge => (Included(k), Unbounded),
+            Lt => (Unbounded, Excluded(k)),
+            Le => (Unbounded, Included(k)),
+            _ => return Some(Vec::new()), // not a range op
+        };
+        Some(
+            ix.map
+                .range(bounds)
+                .flat_map(|(_, ids)| ids.iter().copied())
+                .filter(|&id| !self.deleted[id as usize])
+                .collect(),
+        )
     }
 
     /// Remove edge `eid`'s `key` (reads NULL again).
@@ -1124,6 +1259,7 @@ impl Builder {
             unique: Vec::new(),
             edge_props: HashMap::new(),
             indexes: Vec::new(),
+            ranges: Vec::new(),
         }
     }
 }

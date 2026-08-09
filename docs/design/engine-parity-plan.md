@@ -112,7 +112,15 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
         seek target (equivalent-spellings invariant); ranges & unlabelled scans not
         seeded. Composes with pushdown (a pushed eq-filter over a labelled scan
         seeds too).
-- [ ] D2. Range index + seek on `<,<=,>,>=` and `BETWEEN`.
+- D2. Range index + seek on `<,<=,>,>=` and `BETWEEN`, split:
+  - [x] D2a. Store range index (`create_range_index`, BTreeMap keyed by `OrdVal`
+        = `cmp_total` order, non-null values only; maintained through the
+        primitives so rollback stays consistent; `range_lookup`) + IR
+        `RangeSeek{label,key,op,value}` executed index-or-scan, matching Filter's
+        `cmp_total` ordering exactly (null operand drops; NaN greatest; cross-type
+        by rank — this engine's total order, noted vs lenke-core's throw for J1).
+  - [ ] D2b. Optimizer rule: `Scan(label)+Filter(prop <op> lit)` → `RangeSeek`,
+        both spellings (`n > 5`, `5 < n`); BETWEEN as two range bounds.
 - [ ] D3. Edge-type index; interval/temporal index.
 
 ### Phase E — Expression & function surface

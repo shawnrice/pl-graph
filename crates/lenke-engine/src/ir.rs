@@ -101,6 +101,17 @@ pub enum Plan {
         key: String,
         value: Value,
     },
+    /// Seed slot 0 with the nodes carrying `label` whose property `key` satisfies
+    /// `key <op> value` for a range `op` (`Lt`/`Le`/`Gt`/`Ge`), under the value
+    /// contract's total order. Same rows as `Scan(label)+Filter(key <op> value)`;
+    /// uses a range index when one exists, else scans. A NULL `value` (or NULL
+    /// property) matches nothing (predicate UNKNOWN).
+    RangeSeek {
+        label: String,
+        key: String,
+        op: CompareOp,
+        value: Value,
+    },
     /// Hop from the element in `from` slot along `dir`/`edge_label`, appending the
     /// landed node as a new slot. Rows without a matching neighbour drop; rows
     /// with several fan out (one output row per neighbour), replicating the

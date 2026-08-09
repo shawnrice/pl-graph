@@ -377,6 +377,7 @@ fn needs_lineage(plan: &Plan) -> bool {
     match plan {
         Plan::Scan { .. }
         | Plan::IndexSeek { .. }
+        | Plan::RangeSeek { .. }
         | Plan::Insert { .. }
         | Plan::Merge { .. }
         | Plan::AddEdge { .. } => false,
@@ -430,6 +431,19 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
         }
         Plan::IndexSeek { label, key, value } => {
             let ids = index_seek_ids(store, label, key, value);
+            let mut batch = Batch::single(Col::Nodes(ids.clone()));
+            if track {
+                batch.lineage = Some(Lineage::seed(&ids));
+            }
+            batch
+        }
+        Plan::RangeSeek {
+            label,
+            key,
+            op,
+            value,
+        } => {
+            let ids = range_seek_ids(store, label, key, *op, value);
             let mut batch = Batch::single(Col::Nodes(ids.clone()));
             if track {
                 batch.lineage = Some(Lineage::seed(&ids));
@@ -959,6 +973,49 @@ fn index_seek_ids(store: &Store, label: &str, key: &str, value: &Value) -> Vec<u
     }
 }
 
+/// Whether `prop <op> value` holds under the value contract's total order — the
+/// exact test the `Filter` executor applies for a range comparison (a NULL
+/// operand is UNKNOWN → false). `op` must be a range op; `value` is non-null.
+fn range_pass(prop: &Value, op: CompareOp, value: &Value) -> bool {
+    if prop.is_null() {
+        return false;
+    }
+    let ord = value::cmp_total(prop, value);
+    match op {
+        CompareOp::Lt => ord.is_lt(),
+        CompareOp::Le => ord.is_le(),
+        CompareOp::Gt => ord.is_gt(),
+        CompareOp::Ge => ord.is_ge(),
+        CompareOp::Eq | CompareOp::Ne => false,
+    }
+}
+
+/// The nodes with `label` whose property `key` satisfies `key <op> value` — the
+/// rows a `RangeSeek` produces. Uses a range index when present (candidates
+/// intersected with the label), else scans and filters via `range_pass`. A NULL
+/// `value` matches nothing (predicate UNKNOWN), matching a scan+filter.
+fn range_seek_ids(store: &Store, label: &str, key: &str, op: CompareOp, value: &Value) -> Vec<u32> {
+    if value.is_null() {
+        return Vec::new();
+    }
+    match store.range_lookup(key, op, value) {
+        Some(cands) => {
+            let in_label: std::collections::HashSet<u32> =
+                store.nodes_with_label(label).iter().copied().collect();
+            cands
+                .into_iter()
+                .filter(|id| in_label.contains(id))
+                .collect()
+        }
+        None => store
+            .nodes_with_label(label)
+            .iter()
+            .copied()
+            .filter(|&id| range_pass(&store.prop(id, key), op, value))
+            .collect(),
+    }
+}
+
 /// Visit each neighbour of `v` along `dir` matching edge type `want`, calling `f`
 /// with `(neighbour, eid)`. The one place Expand's adjacency walk is spelled —
 /// shared by the batch operator and the frontier executor so the two can never
@@ -986,7 +1043,7 @@ fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: Option<u32>, mut f: impl 
 fn chain_width(plan: &Plan) -> Option<usize> {
     match plan {
         // A seek, like a scan, seeds a single-slot frontier.
-        Plan::Scan { .. } | Plan::IndexSeek { .. } => Some(1),
+        Plan::Scan { .. } | Plan::IndexSeek { .. } | Plan::RangeSeek { .. } => Some(1),
         // A bind_edge Expand appends TWO slots (edge then node), else one.
         Plan::Expand {
             input, bind_edge, ..
@@ -1015,6 +1072,12 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
             None => store.all_nodes(),
         }),
         Plan::IndexSeek { label, key, value } => Some(index_seek_ids(store, label, key, value)),
+        Plan::RangeSeek {
+            label,
+            key,
+            op,
+            value,
+        } => Some(range_seek_ids(store, label, key, *op, value)),
         Plan::Expand {
             input,
             from,
@@ -2057,6 +2120,85 @@ mod tests {
         };
         assert_eq!(run(&seek(n(f64::NAN)), &st).rows.len(), 0);
         assert_eq!(run(&seek(Value::Null), &st).rows.len(), 0);
+    }
+
+    /// `RangeSeek` returns the SAME rows as `Scan + Filter(<op>)` for every range
+    /// op, with and without a range index. Hand: ages 30,25,40 (a,b,c).
+    #[test]
+    fn range_seek_matches_scan_filter_all_ops() {
+        let mut st = indexed_store(); // P: a=30, b=25, c=30; Q: d=30
+        let ops = [
+            (CompareOp::Gt, 25.0, vec!["a", "c"]), // >25 → 30,30
+            (CompareOp::Ge, 30.0, vec!["a", "c"]), // >=30
+            (CompareOp::Lt, 30.0, vec!["b"]),      // <30 → 25
+            (CompareOp::Le, 25.0, vec!["b"]),      // <=25
+        ];
+        for indexed in [false, true] {
+            if indexed {
+                st.create_range_index("age");
+            }
+            for (op, v, want) in &ops {
+                let seek = Plan::RangeSeek {
+                    label: "P".into(),
+                    key: "age".into(),
+                    op: *op,
+                    value: n(*v),
+                }
+                .project(vec![("name".into(), prop(0, "name"))]);
+                let filt = scan("P")
+                    .filter(cmp(*op, prop(0, "age"), lit(n(*v))))
+                    .project(vec![("name".into(), prop(0, "name"))]);
+                let mut a = names_of(&run(&seek, &st), 0);
+                a.sort();
+                let mut b = names_of(&run(&filt, &st), 0);
+                b.sort();
+                assert_eq!(a, *want, "op {op:?} v {v}");
+                assert_eq!(a, b, "seek vs filter disagree for {op:?} {v}");
+            }
+        }
+    }
+
+    /// Range ordering is the value contract's total order: a NULL value matches
+    /// nothing, and (this engine's design) cross-type compares by rank, so a
+    /// string property is > a numeric literal — seek and filter agree on both.
+    #[test]
+    fn range_seek_null_and_cross_type_match_filter() {
+        let mut st = Builder::default().build();
+        st.add_node(&["P"], &[("v", n(10.0))]);
+        st.add_node(&["P"], &[("v", s("zzz"))]); // string > any number by rank
+        st.add_node(&["P"], &[]); // v absent → null
+        st.create_range_index("v");
+        let check = |st: &Store, op, val: Value| {
+            let seek = Plan::RangeSeek {
+                label: "P".into(),
+                key: "v".into(),
+                op,
+                value: val.clone(),
+            };
+            let filt = scan("P").filter(cmp(op, prop(0, "v"), lit(val)));
+            (run(&seek, st).rows.len(), run(&filt, st).rows.len())
+        };
+        // v > 5: 10 and "zzz" (string outranks number); null excluded → 2, agree.
+        assert_eq!(check(&st, CompareOp::Gt, n(5.0)), (2, 2));
+        // v > null: UNKNOWN for all → 0, agree.
+        assert_eq!(check(&st, CompareOp::Gt, Value::Null), (0, 0));
+    }
+
+    /// The range index is maintained through set/delete and a transaction rollback.
+    #[test]
+    fn range_index_maintained_and_rolls_back() {
+        let mut st = indexed_store();
+        st.create_range_index("age");
+        // Candidates > 25 across any label (index_lookup is any-label).
+        let cand = |st: &Store, v: f64| st.range_lookup("age", CompareOp::Gt, &n(v)).unwrap().len();
+        assert_eq!(cand(&st, 25.0), 3); // a,c (P,30) + d (Q,30)
+        st.set_prop(0, "age", n(10.0)); // a drops below 25
+        assert_eq!(cand(&st, 25.0), 2);
+        st.begin();
+        st.delete_node(2); // c gone
+        assert_eq!(cand(&st, 25.0), 1);
+        st.rollback();
+        assert_eq!(cand(&st, 25.0), 2); // restored
     }
 
     /// A scalar count over an IndexSeek is correct (the seek seeds like a scan).
