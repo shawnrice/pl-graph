@@ -195,7 +195,17 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       `extend_chain`; the start node must be a bound outer variable. 5 tests
       (correlated hop, inner WHERE, outer-correlated WHERE, NOT EXISTS, error),
       cross-checked against a hand plan.
-- [ ] F3. GQL `CALL` (named procedure + inline correlated subquery).
+- [x] F3. GQL `CALL (scope) { … }` — the inline correlated (lateral) subquery.
+      IR `Plan::CallInline{input,body,yields,outer_width}`; the body is a
+      `Plan::Row`-rooted pattern (reuses `extend_chain`) run over the outer rows,
+      emitting one row per sub-row (outer slots + yield exprs) — an inner lateral
+      join, so zero-match outer rows drop. Imports only the declared scope vars;
+      internal subquery vars don't survive. 5 tests (lateral join vs hand plan,
+      inner WHERE, yield correlated on outer, named-form-deferred + unbound errors).
+      The named-procedure form `CALL name(cfg) YIELD …` is RELOCATED to I3 — its
+      catalog IS the graph algorithms (I1), so it lands with them (same
+      dependency-driven move as D3 → G4/G5). OPTIONAL CALL and an aggregating
+      subquery body are deferred.
 - [ ] F4. Path values: `ANY SHORTEST p = …`, accessors (length/nodes/rels).
 - [ ] F5. Gremlin step breadth (select, where(P), order(local), groupCount, …).
 
@@ -219,6 +229,10 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
 
 - [ ] I1. Graph algorithms: degree, WCC, label-prop, PageRank, shortest-path.
 - [ ] I2. Arrow IPC egress.
+- [ ] I3. Named-procedure `CALL name(cfg) [YIELD col [AS a], …]` (relocated from
+      F3): the ISO-conformant home for the I1 algorithms — the procedure catalog
+      IS those algorithms, so it must land after them. `OPTIONAL CALL` keeps the
+      outer row (yields null-filled) when the call is empty.
 
 ### Phase J — Agreement
 

@@ -450,6 +450,11 @@ fn needs_lineage(plan: &Plan) -> bool {
             keys.iter().any(|k| reads_path(&k.expr)) || needs_lineage(input)
         }
         Plan::Join { left, right, .. } => needs_lineage(left) || needs_lineage(right),
+        // The subquery yields append columns; whether the OUTER plan needs a path
+        // depends on its input (a path read inside the subquery is not surfaced).
+        Plan::CallInline { input, yields, .. } => {
+            needs_lineage(input) || yields.iter().any(|(_, e)| reads_path(e))
+        }
         Plan::Update { input, ops } => {
             needs_lineage(input)
                 || ops.iter().any(|op| match op {
@@ -626,6 +631,29 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
         }
         Plan::Join { left, right, on } => {
             hash_join(&pull(left, store, track)?, &pull(right, store, track)?, on)
+        }
+        Plan::CallInline {
+            input,
+            body,
+            yields,
+            outer_width,
+        } => {
+            // Inline correlated (lateral) subquery: run `body` over the outer rows
+            // (it is rooted at `Plan::Row`, which yields them), then emit one row
+            // per sub-row — the outer slots the sub-row still carries, followed by
+            // the yield expressions. Outer rows with no sub-row drop out (inner
+            // lateral join). The subquery's internal variables are NOT surfaced.
+            let outer = pull(input, store, track)?;
+            let ow = *outer_width;
+            let sub = pull_body(body, store, &outer)?;
+            let mut out_slots: Vec<Col> = (0..ow).map(|i| sub.slot(i).clone()).collect();
+            for (_, e) in yields {
+                out_slots.push(eval(e, store, &sub)?);
+            }
+            let mut out = Batch::of(out_slots);
+            // Carry any path the sub-rows accumulated (present only under lineage).
+            out.lineage = sub.lineage;
+            out
         }
     })
 }

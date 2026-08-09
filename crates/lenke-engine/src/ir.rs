@@ -291,6 +291,20 @@ pub enum Plan {
         right: Box<Plan>,
         on: Vec<(usize, usize)>,
     },
+    /// `CALL (scope) { <subquery> }` — an inline correlated (lateral) subquery. For
+    /// each row of `input`, run `body` (a `Plan::Row`-rooted pattern that continues
+    /// from a scope variable) and emit one output row per sub-row: the `input`
+    /// row's first `outer_width` slots followed by the `yields` expressions
+    /// evaluated over the sub-row. An outer row with no sub-row is dropped (inner
+    /// lateral join); the `OPTIONAL` variant and an aggregating subquery are
+    /// deferred. Only the `yields` columns (not the subquery's internal variables)
+    /// survive into the outer scope.
+    CallInline {
+        input: Box<Plan>,
+        body: Box<Plan>,
+        yields: Vec<(String, Expr)>,
+        outer_width: usize,
+    },
     /// A write: create `nodes` (each with labels and inline properties) and the
     /// `edges` among them (`from`/`to` index into `nodes`). A leaf plan — it reads
     /// no input and produces no rows; it is run through the mutable executor

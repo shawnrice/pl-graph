@@ -181,6 +181,27 @@ fn map_children(plan: Plan) -> (Plan, bool) {
                 cl || cr,
             )
         }
+        // Optimize the outer `input`, but leave the correlated `body` alone: it is
+        // rooted at `Plan::Row` and evaluated by `pull_body`, which expects the raw
+        // Expand/Filter chain — a seed rule would rewrite it into an uneval-able
+        // shape.
+        Plan::CallInline {
+            input,
+            body,
+            yields,
+            outer_width,
+        } => {
+            let (i, c) = rewrite(*input);
+            (
+                Plan::CallInline {
+                    input: Box::new(i),
+                    body,
+                    yields,
+                    outer_width,
+                },
+                c,
+            )
+        }
     }
 }
 
@@ -404,6 +425,12 @@ fn width(plan: &Plan) -> usize {
         Plan::Project { items, .. } => items.len(),
         Plan::Aggregate { keys, aggs, .. } => keys.len() + aggs.len(),
         Plan::Join { left, right, .. } => width(left) + width(right),
+        // Outer slots kept, plus one column per yielded subquery expression.
+        Plan::CallInline {
+            outer_width,
+            yields,
+            ..
+        } => outer_width + yields.len(),
     }
 }
 
@@ -693,6 +720,7 @@ mod tests {
             | Plan::OrderPage { input, .. }
             | Plan::Project { input, .. }
             | Plan::Update { input, .. }
+            | Plan::CallInline { input, .. }
             | Plan::Distinct { input } => plan_contains_filter(input),
             Plan::Join { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)

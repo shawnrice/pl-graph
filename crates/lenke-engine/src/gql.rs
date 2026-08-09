@@ -306,6 +306,8 @@ impl Parser {
                 plan = self.with_clause(plan)?;
             } else if self.eat_kw("MATCH") {
                 plan = self.match_continue(plan)?;
+            } else if self.eat_kw("CALL") {
+                plan = self.call_inline(plan)?;
             } else {
                 break;
             }
@@ -798,6 +800,107 @@ impl Parser {
             plan = plan.filter(self.expr()?);
         }
         Ok(plan)
+    }
+
+    /// An inline correlated subquery `CALL (scope) { MATCH … [WHERE] RETURN … }`.
+    /// The subquery imports only the named `scope` variables, continues its pattern
+    /// from one of them, and its `RETURN` columns are appended to each outer row
+    /// (a lateral join). The named-procedure form (`CALL name(cfg) YIELD …`) is
+    /// deferred to the algorithms phase — its catalog is those procedures.
+    fn call_inline(&mut self, plan: Plan) -> Result<Plan, String> {
+        let outer_width = self.slots;
+        // The inline form opens with a `(scope)`; anything else (a bare name) is
+        // the deferred named-procedure call.
+        if !self.eat(&Tok::LParen) {
+            return Err("only the inline `CALL (scope) { … }` form is supported; \
+                        named-procedure CALL is deferred to the algorithms phase"
+                .into());
+        }
+        let mut scope_vars: Vec<String> = Vec::new();
+        if self.peek() != Some(&Tok::RParen) {
+            loop {
+                scope_vars.push(self.ident()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        if scope_vars.is_empty() {
+            return Err("CALL (…) needs at least one scope variable to correlate on".into());
+        }
+        for v in &scope_vars {
+            if !self.scope.contains_key(v) {
+                return Err(format!("CALL scope variable `{v}` is not bound"));
+            }
+        }
+
+        self.expect(&Tok::LBrace)?;
+        if !self.eat_kw("MATCH") {
+            return Err("a CALL subquery must begin with MATCH".into());
+        }
+        let (var, label) = self.node()?;
+        let Some(v) = var else {
+            return Err("a CALL subquery pattern must start from a scope variable".into());
+        };
+        if label.is_some() {
+            return Err(format!(
+                "scope variable `{v}` cannot be re-labeled inside a CALL subquery"
+            ));
+        }
+        if !scope_vars.contains(&v) {
+            return Err(format!(
+                "a CALL subquery must start from a scope variable; `{v}` is not in scope"
+            ));
+        }
+        let from = self.scope[&v];
+        // The sub-scope imports ONLY the declared scope variables (at their outer
+        // slots); body variables append from `outer_width` onward.
+        let mut sub_scope: HashMap<String, usize> = scope_vars
+            .iter()
+            .map(|s| (s.clone(), self.scope[s]))
+            .collect();
+        let mut sub_slots = outer_width;
+        let body = self.extend_chain(Plan::Row, &mut sub_scope, &mut sub_slots, from)?;
+
+        // Parse WHERE/RETURN against the sub-scope. A parse error discards the
+        // whole parser, so there is no need to restore scope on the error paths.
+        let outer_scope = std::mem::replace(&mut self.scope, sub_scope);
+        self.slots = sub_slots;
+        let body = if self.eat_kw("WHERE") {
+            body.filter(self.expr()?)
+        } else {
+            body
+        };
+        if !self.eat_kw("RETURN") {
+            return Err("a CALL subquery needs a RETURN".into());
+        }
+        let items = self.return_items()?;
+        if items.iter().any(|it| matches!(it, RetItem::Agg(_))) {
+            return Err("an aggregating RETURN inside CALL { … } is not supported".into());
+        }
+        let yields: Vec<(String, Expr)> = items
+            .into_iter()
+            .map(|it| match it {
+                RetItem::Key(name, e) => (name, e),
+                RetItem::Agg(_) => unreachable!("aggregates rejected above"),
+            })
+            .collect();
+        self.expect(&Tok::RBrace)?;
+
+        // Restore the outer scope and bind the yields as its new trailing columns;
+        // the subquery's internal variables do not survive.
+        self.scope = outer_scope;
+        for (i, (name, _)) in yields.iter().enumerate() {
+            self.scope.insert(name.clone(), outer_width + i);
+        }
+        self.slots = outer_width + yields.len();
+        Ok(Plan::CallInline {
+            input: Box::new(plan),
+            body: Box::new(body),
+            yields,
+            outer_width,
+        })
     }
 
     /// An optional `{n}` / `{n,m}` / `{n,}` quantifier after a relationship. An
@@ -1758,6 +1861,107 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("not in scope"), "got: {err}");
+    }
+
+    #[test]
+    fn call_inline_lateral_join() {
+        use crate::ir::{Dir, Expr, Plan};
+        let store = social();
+        // For each Person, expand KNOWS in a subquery and yield the friend's name
+        // — a lateral join. carol knows no one, so she drops out (inner join).
+        let call = Plan::CallInline {
+            input: Box::new(Plan::Scan {
+                label: Some("Person".into()),
+            }),
+            body: Box::new(Plan::Row.expand(0, Dir::Out, Some("KNOWS"))),
+            yields: vec![(
+                "friend".into(),
+                Expr::Prop {
+                    slot: 1,
+                    key: "name".into(),
+                },
+            )],
+            outer_width: 1,
+        };
+        let hand = call.project(vec![
+            (
+                "name".into(),
+                Expr::Prop {
+                    slot: 0,
+                    key: "name".into(),
+                },
+            ),
+            ("friend".into(), Expr::Slot(1)),
+        ]);
+        let q = "MATCH (p:Person) CALL (p) { MATCH (p)-[:KNOWS]->(x) RETURN x.name AS friend } \
+                 RETURN p.name AS name, friend";
+        assert_same(q, &hand, &store);
+        assert_eq!(
+            bag(&run(&super::parse(q).unwrap(), &store)),
+            vec![
+                "name=Str(\"alice\");friend=Str(\"bob\");",
+                "name=Str(\"alice\");friend=Str(\"carol\");",
+                "name=Str(\"bob\");friend=Str(\"carol\");",
+            ]
+        );
+    }
+
+    #[test]
+    fn call_inline_subquery_where() {
+        let store = social();
+        // The subquery's WHERE filters the reached node: only friends older than 30
+        // (carol) count. alice and bob both know carol; carol knows no one.
+        let q = "MATCH (p:Person) CALL (p) { MATCH (p)-[:KNOWS]->(x) WHERE x.age > 30 \
+                 RETURN x.name AS friend } RETURN p.name AS name, friend";
+        assert_eq!(
+            bag(&run(&super::parse(q).unwrap(), &store)),
+            vec![
+                "name=Str(\"alice\");friend=Str(\"carol\");",
+                "name=Str(\"bob\");friend=Str(\"carol\");",
+            ]
+        );
+    }
+
+    #[test]
+    fn call_inline_yield_correlates_on_outer() {
+        let store = social();
+        // The yield expression mixes the subquery node and the OUTER node: the age
+        // gap x.age - p.age. alice(30)->bob(25)=-5, alice->carol(40)=10,
+        // bob(25)->carol(40)=15. carol knows no one.
+        let q = "MATCH (p:Person) CALL (p) { MATCH (p)-[:KNOWS]->(x) \
+                 RETURN x.age - p.age AS gap } RETURN gap";
+        let out = run(&super::parse(q).unwrap(), &store);
+        let mut gaps: Vec<f64> = out
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Num(x) => x,
+                ref o => panic!("expected Num, got {o:?}"),
+            })
+            .collect();
+        gaps.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+        assert_eq!(gaps, vec![-5.0, 10.0, 15.0]);
+    }
+
+    #[test]
+    fn call_named_form_is_deferred() {
+        // The named-procedure form has no catalog yet (the algorithms it calls are
+        // a later phase); it is a clear error, not a silent no-op.
+        let err = super::parse("MATCH (p:Person) CALL foo() RETURN p.name AS name").unwrap_err();
+        assert!(
+            err.contains("named-procedure CALL is deferred"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn call_inline_unbound_scope_errors() {
+        let err = super::parse(
+            "MATCH (p:Person) CALL (z) { MATCH (z)-[:KNOWS]->(x) RETURN x.name AS f } \
+             RETURN p.name AS name",
+        )
+        .unwrap_err();
+        assert!(err.contains("not bound"), "got: {err}");
     }
 
     #[test]
