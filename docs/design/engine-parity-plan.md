@@ -293,8 +293,15 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       `Field` accesses on the value it produced. Completes record access (stored
       record properties, not just `{lit}.field`). 1 test (stored record, nested
       read + absent→NULL).
-- [ ] G2d. Dotted-path property index: createIndex on a record field path +
-      planner seek `n.k.sub = $x` into it (the perf slice; the memory's 140x seek).
+- [x] G2d. Store-side dotted-path hash index: `create_index("meta.city")` keys on
+      the value found by descending record fields (`resolve_path`); `Index` is now
+      path-based (a plain property is a length-1 path — behaviour unchanged).
+      Maintained through set/remove/delete (`reindex_node`) so rollback stays
+      consistent; `index_lookup("meta.city", v)` returns candidates. 1 store test
+      (build-from-data, maintenance on write, delete, no-index→None).
+- [ ] G2e. Planner seek for the dotted index: recognize `n.rec.sub = $x`
+      (Field{Prop} = lit, both spellings) → a dotted IndexSeek, with the scan
+      fallback resolving the path. Equivalent-spellings discipline.
 - [x] F5c. Gremlin multi-label `select('a','b')` builds an insertion-ordered
       `Value::Map` keyed by the labels (via a new `Expr::MapLit`, Gremlin-only);
       a single-label select still projects the element, an unknown label errors.

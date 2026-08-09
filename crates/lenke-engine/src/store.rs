@@ -371,10 +371,33 @@ pub struct Store {
     ranges: Vec<RangeIndex>,
 }
 
-/// A hash index on one node property `key`.
+/// A hash index on a node property PATH. `path` is `["age"]` for a plain property
+/// or `["meta", "city"]` for a dotted record-field path; the index keys on the
+/// value found by descending record fields (`resolve_path`). A plain index
+/// (length-1 path) behaves exactly as before.
 struct Index {
-    key: String,
+    path: Vec<String>,
     map: HashMap<Vec<u8>, Vec<u32>>,
+}
+
+impl Index {
+    /// The base (top-level) property whose column drives this index's upkeep.
+    fn base(&self) -> &str {
+        &self.path[0]
+    }
+}
+
+/// Descend record fields `sub` from `v`; an empty `sub` returns `v` (a plain
+/// index). A non-record along the way, or a missing field, resolves to `Null`.
+fn resolve_path(v: &Value, sub: &[String]) -> Value {
+    let mut cur = v.clone();
+    for k in sub {
+        cur = match &cur {
+            Value::Record(fields) => crate::value::record_field(fields, k),
+            _ => Value::Null,
+        };
+    }
+    cur
 }
 
 impl Store {
@@ -660,12 +683,13 @@ impl Store {
     }
 
     fn apply_set_prop(&mut self, node: u32, key: &str, value: Value) {
-        // Index upkeep: capture the OLD value before writing, and keep a copy of
-        // the new one for the index (reads first, then the column write, then the
-        // index writes — distinct fields, no borrow clash).
-        let indexed = self.is_indexed(key) || self.is_range_indexed(key);
-        let old = (indexed && self.has_prop(node, key)).then(|| self.prop(node, key));
-        let new_for_index = indexed.then(|| value.clone());
+        // Index upkeep: capture the OLD base value before writing, and a copy of
+        // the new one (reads first, then the column write, then the index writes —
+        // distinct fields, no borrow clash). A hash index may be dotted, so it is
+        // keyed by the BASE property `key`; the range index is single-key.
+        let care = self.index_on_base(key) || self.is_range_indexed(key);
+        let old = (care && self.has_prop(node, key)).then(|| self.prop(node, key));
+        let new_for_index = care.then(|| value.clone());
 
         let n = self.node_count;
         let col = self
@@ -677,13 +701,14 @@ impl Store {
         }
         col.set(node as usize, value);
 
-        if let Some(old) = &old {
-            self.index_bucket_remove(key, &crate::value::group_key(old), node);
-            self.range_remove(key, old, node);
-        }
         if let Some(nv) = new_for_index {
-            self.index_bucket_add(key, crate::value::group_key(&nv), node);
-            self.range_add(key, &nv, node);
+            self.reindex_node(key, node, old.as_ref(), Some(&nv));
+            if self.is_range_indexed(key) {
+                if let Some(old) = &old {
+                    self.range_remove(key, old, node);
+                }
+                self.range_add(key, &nv, node);
+            }
         }
     }
 
@@ -704,15 +729,17 @@ impl Store {
 
     fn apply_remove_prop(&mut self, node: u32, key: &str) {
         // Drop the node from the index(es) for its OLD value, if indexed.
-        let old = ((self.is_indexed(key) || self.is_range_indexed(key))
+        let old = ((self.index_on_base(key) || self.is_range_indexed(key))
             && self.has_prop(node, key))
         .then(|| self.prop(node, key));
         if let Some(col) = self.props.get_mut(key) {
             col.set_absent(node as usize);
         }
         if let Some(old) = &old {
-            self.index_bucket_remove(key, &crate::value::group_key(old), node);
-            self.range_remove(key, old, node);
+            self.reindex_node(key, node, Some(old), None);
+            if self.is_range_indexed(key) {
+                self.range_remove(key, old, node);
+            }
         }
     }
 
@@ -764,38 +791,43 @@ impl Store {
     // consistent). Index equality is grouping (group_key) — the seek layer maps
     // that to predicate `=` (NaN/null match nothing) so results match a scan.
 
-    /// Create a hash index on node property `key` (idempotent). Builds from the
-    /// current live nodes that carry the property.
+    /// Create a hash index on a node property PATH (idempotent). `key` is a plain
+    /// property (`age`) or a dotted record-field path (`meta.city`). Builds from
+    /// the current live nodes that carry the base property, keying on the resolved
+    /// (descended) value.
     pub fn create_index(&mut self, key: &str) {
-        if self.indexes.iter().any(|i| i.key == key) {
+        let path: Vec<String> = key.split('.').map(String::from).collect();
+        if self.indexes.iter().any(|i| i.path == path) {
             return;
         }
+        let sub = &path[1..];
         let mut map: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
-        if let Some(col) = self.props.get(key) {
+        if let Some(col) = self.props.get(&path[0]) {
             for id in 0..self.node_count {
                 if !self.deleted[id] && col.present_at(id) {
-                    map.entry(crate::value::group_key(&col.read(id)))
+                    let v = resolve_path(&col.read(id), sub);
+                    map.entry(crate::value::group_key(&v))
                         .or_default()
                         .push(id as u32);
                 }
             }
         }
-        self.indexes.push(Index {
-            key: key.to_string(),
-            map,
-        });
+        self.indexes.push(Index { path, map });
     }
 
+    /// Whether any hash index is driven by the base property `base` (so a write to
+    /// it must maintain that index).
     #[must_use]
-    fn is_indexed(&self, key: &str) -> bool {
-        self.indexes.iter().any(|i| i.key == key)
+    fn index_on_base(&self, base: &str) -> bool {
+        self.indexes.iter().any(|i| i.base() == base)
     }
 
-    /// Candidate node ids (ANY label) whose `key` groups equal to `value`, or
-    /// `None` if no index exists on `key`. Deleted ids are filtered out.
+    /// Candidate node ids (ANY label) whose property PATH `key` groups equal to
+    /// `value`, or `None` if no index exists on that path. Deleted ids filtered.
     #[must_use]
     pub fn index_lookup(&self, key: &str, value: &Value) -> Option<Vec<u32>> {
-        let idx = self.indexes.iter().find(|i| i.key == key)?;
+        let path: Vec<String> = key.split('.').map(String::from).collect();
+        let idx = self.indexes.iter().find(|i| i.path == path)?;
         let gk = crate::value::group_key(value);
         Some(
             idx.map
@@ -810,35 +842,49 @@ impl Store {
         )
     }
 
-    fn index_bucket_add(&mut self, key: &str, gk: Vec<u8>, node: u32) {
-        if let Some(idx) = self.indexes.iter_mut().find(|i| i.key == key) {
-            idx.map.entry(gk).or_default().push(node);
-        }
-    }
-
-    fn index_bucket_remove(&mut self, key: &str, gk: &[u8], node: u32) {
-        if let Some(idx) = self.indexes.iter_mut().find(|i| i.key == key) {
-            if let Some(bucket) = idx.map.get_mut(gk) {
-                bucket.retain(|&x| x != node);
+    /// Update every hash index whose BASE is `base` for a node whose base value
+    /// changed from `old` to `new` (`None` = absent on that side).
+    fn reindex_node(&mut self, base: &str, node: u32, old: Option<&Value>, new: Option<&Value>) {
+        let matching: Vec<usize> = self
+            .indexes
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.base() == base)
+            .map(|(j, _)| j)
+            .collect();
+        for j in matching {
+            let sub = self.indexes[j].path[1..].to_vec();
+            if let Some(old) = old {
+                let og = crate::value::group_key(&resolve_path(old, &sub));
+                if let Some(bucket) = self.indexes[j].map.get_mut(&og) {
+                    bucket.retain(|&x| x != node);
+                }
+            }
+            if let Some(new) = new {
+                let ng = crate::value::group_key(&resolve_path(new, &sub));
+                self.indexes[j].map.entry(ng).or_default().push(node);
             }
         }
     }
 
     /// Remove node `id`'s entries from every index (used by delete/pop).
     fn index_drop_node(&mut self, id: u32) {
-        let removals: Vec<(String, Vec<u8>)> = self
+        // For each hash index whose base the node carries, the group key of the
+        // node's resolved (descended) value — then drop it from that index.
+        let removals: Vec<(usize, Vec<u8>)> = self
             .indexes
             .iter()
-            .filter(|ix| self.has_prop(id, &ix.key))
-            .map(|ix| {
-                (
-                    ix.key.clone(),
-                    crate::value::group_key(&self.prop(id, &ix.key)),
-                )
+            .enumerate()
+            .filter(|(_, ix)| self.has_prop(id, ix.base()))
+            .map(|(j, ix)| {
+                let v = resolve_path(&self.prop(id, ix.base()), &ix.path[1..]);
+                (j, crate::value::group_key(&v))
             })
             .collect();
-        for (k, gk) in removals {
-            self.index_bucket_remove(&k, &gk, id);
+        for (j, gk) in removals {
+            if let Some(bucket) = self.indexes[j].map.get_mut(&gk) {
+                bucket.retain(|&x| x != id);
+            }
         }
         // Range indexes hold non-null values only.
         let range_removals: Vec<(String, Value)> = self
@@ -1426,6 +1472,34 @@ mod tests {
             st.prop(1, "born"),
             Value::Temporal(Temporal::Time(_))
         ));
+    }
+
+    #[test]
+    fn dotted_path_index_maintained_through_mutations() {
+        use crate::value::make_record;
+        let city = |c: &str| make_record(vec![(Arc::from("city"), s(c))]);
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[("meta", city("NYC"))]);
+        let b = st.add_node(&["P"], &[("meta", city("LA"))]);
+        let c = st.add_node(&["P"], &[("meta", city("NYC"))]);
+        // Built from existing data: index on the record sub-field `meta.city`.
+        st.create_index("meta.city");
+        let nyc = |st: &Store| {
+            let mut v = st.index_lookup("meta.city", &s("NYC")).unwrap();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(nyc(&st), vec![a, c]);
+        assert_eq!(st.index_lookup("meta.city", &s("LA")).unwrap(), vec![b]);
+
+        // Maintained on a write: change b's city to NYC.
+        st.set_prop(b, "meta", city("NYC"));
+        assert_eq!(nyc(&st), vec![a, b, c]);
+        // …and on delete.
+        st.delete_node(a);
+        assert_eq!(nyc(&st), vec![b, c]);
+        // No index on this path → None (distinct from an empty match).
+        assert!(st.index_lookup("meta.zip", &n(1.0)).is_none());
     }
 
     /// Build an empty store, add two nodes and an edge, and read it all back —
