@@ -1503,6 +1503,21 @@ mod tests {
         assert_eq!(run(&plan, &store).rows.len(), 0);
     }
 
+    /// A deleted node is absent from a label scan through the query path — build
+    /// the social graph, delete bob (id 1), and the Person scan yields alice+carol.
+    #[test]
+    fn scan_skips_deleted_node() {
+        let mut store = social();
+        store.delete_node(1); // bob
+        let out = run(
+            &scan("Person").project(vec![("name".into(), prop(0, "name"))]),
+            &store,
+        );
+        let mut got = names_of(&out, 0);
+        got.sort();
+        assert_eq!(got, vec!["alice", "carol"]);
+    }
+
     /// Reversed operand order (`literal < prop`) must match `prop > literal` —
     /// exercises the fused filter's operand flip. `28 < age` → alice(30),carol(40).
     #[test]

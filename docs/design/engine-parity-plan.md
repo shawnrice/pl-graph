@@ -28,30 +28,37 @@ second rewrite.
 Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
 
 ### Phase A — Mutation & transactions
+
 - [x] A1. Store mutation primitives: `add_node`, `add_edge`, `set_prop`,
-  `remove_prop`; edge-type interning; per-edge id counter. (columns grow with the
-  node set; typed columns promote to `Gen` on a type change; `eid` monotonic.)
-- [ ] A2. Deletion: `delete_edge`, `delete_node` (tombstone + adjacency cleanup).
+      `remove_prop`; edge-type interning; per-edge id counter. (columns grow with the
+      node set; typed columns promote to `Gen` on a type change; `eid` monotonic.)
+- [x] A2. Deletion: `delete_edge`, `delete_node` (tombstone + adjacency cleanup).
+      (tombstone bitmap; dense ids never reused; mirrors detached by eid; scans
+      skip via all_nodes/label buckets — no exec change needed.)
 - [ ] A3. Transactions: undo-log wrapper, `commit`/`rollback`, per-statement
-  atomicity.
+      atomicity.
 
 ### Phase B — Write statements in both languages
+
 - [ ] B1. GQL `INSERT` (node & edge patterns) → store writes.
 - [ ] B2. GQL `SET` / `REMOVE`.
 - [ ] B3. GQL `MERGE` / `_MERGE` keyed upsert.
 - [ ] B4. Gremlin `addV`/`addE`/`property`/`drop`.
 
 ### Phase C — Persistence
+
 - [ ] C1. NDJSON egress (nodes + edges).
 - [ ] C2. NDJSON ingest.
 - [ ] C3. Schema/snapshot round-trip.
 
 ### Phase D — Indexes & planner seeding
+
 - [ ] D1. Property (hash) index + planner seek on `=` / inline `{k:v}` / `$param`.
 - [ ] D2. Range index + seek on `<,<=,>,>=` and `BETWEEN`.
 - [ ] D3. Edge-type index; interval/temporal index.
 
 ### Phase E — Expression & function surface
+
 - [ ] E1. Arithmetic (`+ - * / %`, unary) in IR + eval + both parsers.
 - [ ] E2. Scalar functions (abs, sqrt, floor/ceil/round, coalesce, …).
 - [ ] E3. `CASE` / conditional.
@@ -60,6 +67,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
 - [ ] E6. 3VL completeness: `IS NULL`, property-exists, `AND`/`OR`/`NOT` gaps.
 
 ### Phase F — Query surface
+
 - [ ] F1. GQL `WITH` (chained query parts, carry + aggregate + filter).
 - [ ] F2. GQL `EXISTS { … }` subquery.
 - [ ] F3. GQL `CALL` (named procedure + inline correlated subquery).
@@ -67,23 +75,28 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
 - [ ] F5. Gremlin step breadth (select, where(P), order(local), groupCount, …).
 
 ### Phase G — Data model
+
 - [ ] G1. Temporal values + typed temporal columns.
 - [ ] G2. Map/record values (storage, dotted-path, construction, access).
 - [ ] G3. Numeric edge-case parity audit against `value.rs`.
 
 ### Phase H — Semantics services
+
 - [ ] H1. Constraints / validators (commit-time checks).
 - [ ] H2. Events / CDC (observation-only notifications).
 - [ ] H3. Typed nodes (host-side schema validate-before-write).
 
 ### Phase I — Algorithms & egress
+
 - [ ] I1. Graph algorithms: degree, WCC, label-prop, PageRank, shortest-path.
 - [ ] I2. Arrow IPC egress.
 
 ### Phase J — Agreement
+
 - [ ] J1. Conformance suite: run matched shapes on `lenke-engine` and
-  `lenke-core`, assert same results (agreement, not byte-identity).
+      `lenke-core`, assert same results (agreement, not byte-identity).
 
 ## Standing
+
 Update this file as slices land — tick the box and note the commit. The loop is
 done when every box is `[x]` and the conformance suite (J1) is green.

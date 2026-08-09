@@ -213,6 +213,10 @@ pub struct Store {
     /// next edge id to hand out — monotonic, so an out/in pair shares one id and
     /// ids stay unique across incremental writes.
     next_eid: u32,
+    /// tombstones, indexed by node id. A deleted node keeps its id slot (ids are
+    /// dense and never reused) but is skipped by every scan and carries no edges
+    /// or properties. `deleted.len() == node_count`.
+    deleted: Vec<bool>,
 }
 
 impl Store {
@@ -240,10 +244,20 @@ impl Store {
         self.in_adj.get(node as usize).map_or(&[], Vec::as_slice)
     }
 
-    /// Every node id — the scan universe when no label narrows it.
+    /// Every LIVE node id — the scan universe when no label narrows it. Deleted
+    /// ids are skipped (tombstoned), so a whole-graph scan never yields them.
     #[must_use]
     pub fn all_nodes(&self) -> Vec<u32> {
-        (0..self.node_count as u32).collect()
+        (0..self.node_count as u32)
+            .filter(|&i| !self.deleted[i as usize])
+            .collect()
+    }
+
+    /// Whether node `id` is live (not tombstoned). Scans that iterate the id space
+    /// directly consult this to skip deleted nodes.
+    #[must_use]
+    pub fn is_alive(&self, id: u32) -> bool {
+        !self.deleted[id as usize]
     }
 
     /// The node ids carrying `label`, or an empty slice for an unknown label
@@ -288,6 +302,7 @@ impl Store {
         }
         self.out_adj.push(Vec::new());
         self.in_adj.push(Vec::new());
+        self.deleted.push(false);
         for l in labels {
             // ids are handed out increasing, so appending keeps the bucket sorted.
             self.by_label.entry((*l).to_string()).or_default().push(id);
@@ -341,6 +356,54 @@ impl Store {
         if let Some(col) = self.props.get_mut(key) {
             col.set_absent(node as usize);
         }
+    }
+
+    /// Delete the edge identified by `eid` between endpoints `u` and `v`. The eid
+    /// is unique and shared by the edge's out/in entries; removing it from both
+    /// endpoints' out AND in lists deletes the edge regardless of which endpoint
+    /// was its source (so it is safe to call with the endpoints in either order,
+    /// e.g. from a hop matched via incoming adjacency). A no-op if already gone.
+    pub fn delete_edge(&mut self, u: u32, v: u32, eid: u32) {
+        for node in [u, v] {
+            if let Some(adj) = self.out_adj.get_mut(node as usize) {
+                adj.retain(|a| a.eid != eid);
+            }
+            if let Some(adj) = self.in_adj.get_mut(node as usize) {
+                adj.retain(|a| a.eid != eid);
+            }
+        }
+    }
+
+    /// Delete node `id`: tombstone it (its dense id is never reused), detach every
+    /// incident edge from the neighbour's mirror list, drop its adjacency, remove
+    /// it from every label bucket, and clear its properties. After this it is
+    /// absent from all scans and traversals. A no-op if already deleted.
+    pub fn delete_node(&mut self, id: u32) {
+        let i = id as usize;
+        if self.deleted[i] {
+            return;
+        }
+        // Detach each incident edge's mirror entry on the neighbour, by eid.
+        let out = std::mem::take(&mut self.out_adj[i]);
+        for a in &out {
+            self.in_adj[a.nbr as usize].retain(|m| m.eid != a.eid);
+        }
+        let inc = std::mem::take(&mut self.in_adj[i]);
+        for a in &inc {
+            self.out_adj[a.nbr as usize].retain(|m| m.eid != a.eid);
+        }
+        // A self-loop appears in both `out` and `inc`; its mirror was in this
+        // node's own lists, already emptied by the takes above — nothing dangling.
+
+        // Remove from every label bucket (no per-node label list yet, so sweep).
+        for bucket in self.by_label.values_mut() {
+            bucket.retain(|&x| x != id);
+        }
+        // Clear its properties.
+        for col in self.props.values_mut() {
+            col.set_absent(i);
+        }
+        self.deleted[i] = true;
     }
 }
 
@@ -413,6 +476,7 @@ impl Builder {
             in_adj,
             // Incremental edges continue the id sequence the build laid down.
             next_eid: edge_count,
+            deleted: vec![false; n],
         }
     }
 }
@@ -542,5 +606,60 @@ mod tests {
         assert_eq!(eids, vec![0, 1, 2]); // continued, unique
         assert_eq!(st.out(x)[0].etype, st.out(x)[1].etype); // R == R
         assert_ne!(st.out(x)[1].etype, st.out(x)[2].etype); // R != S
+    }
+
+    /// `delete_edge` removes the edge from both endpoints and is idempotent.
+    #[test]
+    fn delete_edge_detaches_both_sides() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&[], &[]);
+        let b = st.add_node(&[], &[]);
+        st.add_edge(a, b, "R");
+        let eid = st.out(a)[0].eid;
+        st.delete_edge(a, b, eid);
+        assert!(st.out(a).is_empty());
+        assert!(st.inc(b).is_empty());
+        st.delete_edge(a, b, eid); // no-op the second time
+        assert!(st.out(a).is_empty());
+    }
+
+    /// `delete_node` tombstones the node, detaches its edges from the neighbours'
+    /// mirror lists, clears its props, and drops it from scans. Hand-traced on
+    /// a→b, a→c, b→c: deleting b leaves a→c only, c with one incoming (from a).
+    #[test]
+    fn delete_node_tombstones_and_cleans_up() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[("name", s("a"))]);
+        let b = st.add_node(&["P"], &[("name", s("b"))]);
+        let c = st.add_node(&["P"], &[("name", s("c"))]);
+        st.add_edge(a, b, "R");
+        st.add_edge(a, c, "R");
+        st.add_edge(b, c, "R");
+        st.delete_node(b);
+
+        assert!(!st.is_alive(b));
+        assert_eq!(st.all_nodes(), vec![a, c]);
+        assert_eq!(st.nodes_with_label("P"), &[a, c]); // b removed from bucket
+        assert_eq!(st.out(a).len(), 1); // a→b gone, a→c stays
+        assert_eq!(st.out(a)[0].nbr, c);
+        assert_eq!(st.inc(c).len(), 1); // b→c gone, a→c stays
+        assert_eq!(st.inc(c)[0].nbr, a);
+        assert!(st.out(b).is_empty());
+        assert!(st.prop(b, "name").is_null()); // props cleared
+        assert!(!st.prop(a, "name").is_null()); // neighbour intact
+        st.delete_node(b); // idempotent
+        assert_eq!(st.all_nodes(), vec![a, c]);
+    }
+
+    /// A self-loop is detached without panicking when its node is deleted.
+    #[test]
+    fn delete_node_with_self_loop() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&[], &[]);
+        st.add_edge(a, a, "R");
+        st.delete_node(a);
+        assert!(!st.is_alive(a));
+        assert!(st.out(a).is_empty());
+        assert!(st.inc(a).is_empty());
     }
 }
