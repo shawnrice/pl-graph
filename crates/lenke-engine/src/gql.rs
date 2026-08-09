@@ -1131,6 +1131,11 @@ impl Parser {
                 if s.eq_ignore_ascii_case("property_exists") {
                     return self.property_exists_expr();
                 }
+                // EXISTS { <pattern> [WHERE <pred>] } — a correlated subquery, so
+                // it takes `{ … }`, not the `(args)` of a scalar call.
+                if s.eq_ignore_ascii_case("exists") {
+                    return self.exists_expr();
+                }
                 // A scalar function call `name(args…)`. (Aggregates are handled in
                 // return_items, never reached here.)
                 if self.peek() == Some(&Tok::LParen) {
@@ -1215,6 +1220,51 @@ impl Parser {
         let key = self.ident()?;
         self.expect(&Tok::RParen)?;
         Ok(Expr::PropertyExists { slot, key })
+    }
+
+    // exists := EXISTS '{' node ( rel [quant] node )* [WHERE pred] '}'
+    // A correlated existence check: the pattern's first node must be a variable
+    // already bound in the outer scope (the correlation), and the body extends
+    // from it. A trailing WHERE is a sub-pattern predicate over the body scope.
+    fn exists_expr(&mut self) -> Result<Expr, String> {
+        self.expect(&Tok::LBrace)?;
+        let outer_width = self.slots;
+        let (var, label) = self.node()?;
+        let Some(v) = var else {
+            return Err("EXISTS pattern must start from a bound variable".into());
+        };
+        if label.is_some() {
+            return Err(format!(
+                "bound variable `{v}` cannot be re-labeled inside EXISTS"
+            ));
+        }
+        let Some(&from) = self.scope.get(&v) else {
+            return Err(format!(
+                "EXISTS must start from a bound (correlated) variable; `{v}` is not in scope"
+            ));
+        };
+        // The body's sub-scope: the outer variables stay at their slots, slot
+        // `outer_width` is reserved for the provenance column the evaluator adds,
+        // and new body variables land at `outer_width + 1` onward.
+        let mut sub_scope = self.scope.clone();
+        let mut sub_slots = outer_width + 1;
+        let body = self.extend_chain(Plan::Row, &mut sub_scope, &mut sub_slots, from)?;
+        // An optional WHERE inside the braces, resolved against the body scope.
+        let body = if self.eat_kw("WHERE") {
+            let saved_scope = std::mem::replace(&mut self.scope, sub_scope);
+            let saved_slots = std::mem::replace(&mut self.slots, sub_slots);
+            let pred = self.expr()?;
+            self.scope = saved_scope;
+            self.slots = saved_slots;
+            body.filter(pred)
+        } else {
+            body
+        };
+        self.expect(&Tok::RBrace)?;
+        Ok(Expr::Exists {
+            body: Box::new(body),
+            outer_width,
+        })
     }
 
     // call := name '(' [ expr (',' expr)* ] ')'  — a scalar function.
@@ -1639,6 +1689,74 @@ mod tests {
         let err =
             super::parse("MATCH (a:Person) WITH a MATCH (z)-[:KNOWS]->(y) RETURN y.name AS name")
                 .unwrap_err();
+        assert!(err.contains("not in scope"), "got: {err}");
+    }
+
+    #[test]
+    fn exists_correlated_subpattern() {
+        use crate::ir::{Dir, Expr, Plan};
+        let store = social();
+        // Who has an outgoing KNOWS? alice (bob,carol) and bob (carol); carol has
+        // none. EXISTS is a definite predicate over the correlated node `p`.
+        let body = Plan::Row.expand(0, Dir::Out, Some("KNOWS"));
+        let hand = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .filter(Expr::Exists {
+            body: Box::new(body),
+            outer_width: 1,
+        })
+        .project(vec![(
+            "name".into(),
+            Expr::Prop {
+                slot: 0,
+                key: "name".into(),
+            },
+        )]);
+        let q = "MATCH (p:Person) WHERE EXISTS { (p)-[:KNOWS]->(x) } RETURN p.name AS name";
+        assert_same(q, &hand, &store);
+        assert_eq!(names(&store, q), vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn exists_with_inner_where_on_body_var() {
+        let store = social();
+        // The sub-pattern's WHERE filters the reached node: only a KNOWS target
+        // younger than 30 counts. alice knows bob(25) → yes; bob knows only
+        // carol(40) → no; carol knows no one → no. So only alice qualifies.
+        let q = "MATCH (p:Person) WHERE EXISTS { (p)-[:KNOWS]->(x) WHERE x.age < 30 } \
+                 RETURN p.name AS name";
+        assert_eq!(names(&store, q), vec!["alice"]);
+    }
+
+    #[test]
+    fn exists_where_correlates_on_the_outer_row() {
+        let store = social();
+        // The sub-WHERE references the OUTER node `p`: does p know someone older?
+        // alice(30) knows carol(40) → yes; bob(25) knows carol(40) → yes;
+        // carol(40) knows no one → no.
+        let q = "MATCH (p:Person) WHERE EXISTS { (p)-[:KNOWS]->(x) WHERE x.age > p.age } \
+                 RETURN p.name AS name";
+        assert_eq!(names(&store, q), vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn not_exists_negates_the_predicate() {
+        let store = social();
+        // EXISTS is a definite Bool, so NOT composes cleanly: the Persons with NO
+        // outgoing KNOWS. Only carol (alice and bob both know someone).
+        let q = "MATCH (p:Person) WHERE NOT EXISTS { (p)-[:KNOWS]->(x) } RETURN p.name AS name";
+        assert_eq!(names(&store, q), vec!["carol"]);
+    }
+
+    #[test]
+    fn exists_from_unbound_variable_errors() {
+        // The correlated start must be a bound variable — a fresh scan inside
+        // EXISTS is not this construct.
+        let err = super::parse(
+            "MATCH (p:Person) WHERE EXISTS { (z)-[:KNOWS]->(x) } RETURN p.name AS name",
+        )
+        .unwrap_err();
         assert!(err.contains("not in scope"), "got: {err}");
     }
 

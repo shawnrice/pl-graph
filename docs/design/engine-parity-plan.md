@@ -188,7 +188,13 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       from a carried node (shared `extend_chain`); an unbound continuation errors.
       4 tests (aggregate+HAVING, carry-into-MATCH, order+limit paging, error),
       cross-checked against hand plans.
-- [ ] F2. GQL `EXISTS { … }` subquery.
+- [x] F2. GQL `EXISTS { <pattern> [WHERE] }`: a correlated existence predicate
+      (definite Bool, composes under NOT). IR `Expr::Exists{body,outer_width}` +
+      `Plan::Row` (the correlated leaf); evaluated whole-batch with a provenance
+      column so survivors map back to their outer row (`pull_body`). Body reuses
+      `extend_chain`; the start node must be a bound outer variable. 5 tests
+      (correlated hop, inner WHERE, outer-correlated WHERE, NOT EXISTS, error),
+      cross-checked against a hand plan.
 - [ ] F3. GQL `CALL` (named procedure + inline correlated subquery).
 - [ ] F4. Path values: `ANY SHORTEST p = …`, accessors (length/nodes/rels).
 - [ ] F5. Gremlin step breadth (select, where(P), order(local), groupCount, …).

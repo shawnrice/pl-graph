@@ -92,6 +92,17 @@ pub enum Expr {
         slot: usize,
         key: String,
     },
+    /// `EXISTS { <pattern> [WHERE <pred>] }` — a correlated existence predicate. A
+    /// definite Bool per outer row: TRUE iff the sub-pattern, extended from an
+    /// outer-bound variable, matches at least once for that row. `body` is a
+    /// `Plan` rooted at `Plan::Row` (the outer rows). `outer_width` is the number
+    /// of outer slots — the body correlates on slots below it, so the predicate is
+    /// treated as referencing up to `outer_width - 1` (never pushed below the
+    /// operators that bind those variables).
+    Exists {
+        body: Box<Plan>,
+        outer_width: usize,
+    },
 }
 
 /// The target type of a `CAST`. The engine has one numeric type (`f64`), so
@@ -164,6 +175,11 @@ pub enum Plan {
     /// Seed the frontier into slot 0: a label bucket, or the universe when
     /// `label` is None.
     Scan { label: Option<String> },
+    /// The correlated current row — the leaf of an `EXISTS { … }` body. It is NOT
+    /// a stand-alone source: it yields whatever batch the enclosing `Expr::Exists`
+    /// feeds it (the outer rows plus a provenance column), so it only ever appears
+    /// inside a body evaluated by `exec::pull_body`, never in the main pipeline.
+    Row,
     /// Seed slot 0 with the nodes carrying `label` whose property `key` equals
     /// `value` under predicate `=`. Produces exactly the rows of
     /// `Scan(label) + Filter(key = value)`; uses a property index when one exists,

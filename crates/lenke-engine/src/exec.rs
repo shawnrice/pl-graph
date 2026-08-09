@@ -416,11 +416,18 @@ fn needs_lineage(plan: &Plan) -> bool {
                     || otherwise.as_deref().is_some_and(reads_path)
             }
             Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => reads_path(expr),
-            Expr::Slot(_) | Expr::Prop { .. } | Expr::Lit(_) | Expr::PropertyExists { .. } => false,
+            // An EXISTS body reads its OWN (sub-)path, never the outer one, and the
+            // seed is built without lineage — so it never forces outer tracking.
+            Expr::Slot(_)
+            | Expr::Prop { .. }
+            | Expr::Lit(_)
+            | Expr::PropertyExists { .. }
+            | Expr::Exists { .. } => false,
         }
     }
     match plan {
         Plan::Scan { .. }
+        | Plan::Row
         | Plan::IndexSeek { .. }
         | Plan::RangeSeek { .. }
         | Plan::Insert { .. }
@@ -462,6 +469,11 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
         // here so `run` on a bare write is a harmless no-op rather than a panic.
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Merge { .. } | Plan::AddEdge { .. } => {
             Batch::of(Vec::new())
+        }
+        // `Row` is the leaf of an EXISTS body and is only ever fed a batch by
+        // `pull_body`; reaching it through the main pipeline is a bug.
+        Plan::Row => {
+            return Err("Plan::Row is only valid inside an EXISTS body".into());
         }
         Plan::Scan { label } => {
             let ids = match label {
@@ -1331,6 +1343,10 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         Expr::Compare { left, right, .. } => refs_only_slot(left, s) && refs_only_slot(right, s),
         Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => refs_only_slot(expr, s),
         Expr::PropertyExists { slot, .. } => *slot == s,
+        // An EXISTS correlates on outer slots below `outer_width`; conservatively
+        // treat it as touching more than one, so it never rides the frontier-only
+        // aggregate fast path.
+        Expr::Exists { .. } => false,
     }
 }
 
@@ -1390,6 +1406,9 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
             slot: if *slot == from { to } else { *slot },
             key: key.clone(),
         },
+        // Never reached: `refs_only_slot` rejects EXISTS, so the frontier remap
+        // that calls this is never handed one. Clone rather than rewrite a body.
+        Expr::Exists { .. } => expr.clone(),
     }
 }
 
@@ -1849,6 +1868,86 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 other => vec![false; other.len()],
             };
             Col::Bool(out)
+        }
+        Expr::Exists { body, .. } => {
+            // Correlated existence: run the sub-pattern over ALL outer rows at once,
+            // tagging each with a unique provenance id so surviving sub-rows point
+            // back to the outer row they came from. An outer row is TRUE iff at
+            // least one sub-row carries its id.
+            let n = batch.rows();
+            let prov = batch.slots.len(); // provenance rides at the first free slot
+            let mut slots = batch.slots.clone();
+            slots.push(Col::Num((0..n).map(|i| i as f64).collect()));
+            // The body reads no path (EXISTS discards lineage), so seed without one.
+            let seed = Batch::of(slots);
+            let survivors = pull_body(body, store, &seed)?;
+            let mut hit = vec![false; n];
+            if let Col::Num(ids) = survivors.slot(prov) {
+                for &id in ids {
+                    let i = id as usize;
+                    if i < n {
+                        hit[i] = true;
+                    }
+                }
+            }
+            Col::Bool(hit)
+        }
+    })
+}
+
+/// Evaluate an `EXISTS` body against a correlated `seed` batch (the outer rows
+/// plus a provenance column). The body is a chain of the operators an EXISTS
+/// pattern can contain — `Expand`/`VarLength`/`Filter` — rooted at `Plan::Row`,
+/// which yields `seed`. Every operator gathers the whole input row, so the
+/// provenance column rides through untouched; the caller reads it off the result.
+fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> {
+    Ok(match plan {
+        Plan::Row => seed.clone(),
+        Plan::Expand {
+            input,
+            from,
+            dir,
+            edge_label,
+            bind_edge,
+        } => expand(
+            &pull_body(input, store, seed)?,
+            store,
+            *from,
+            *dir,
+            edge_label.as_deref(),
+            *bind_edge,
+        ),
+        Plan::VarLength {
+            input,
+            from,
+            dir,
+            edge_label,
+            min,
+            max,
+            trail,
+        } => var_length(
+            &pull_body(input, store, seed)?,
+            store,
+            *from,
+            *dir,
+            edge_label.as_deref(),
+            *min,
+            *max,
+            *trail,
+        ),
+        Plan::Filter { input, pred } => {
+            let b = pull_body(input, store, seed)?;
+            let mask = eval(pred, store, &b)?;
+            let keep: Vec<usize> = match &mask {
+                Col::Bool(bs) => (0..bs.len()).filter(|&i| bs[i]).collect(),
+                other => (0..other.len())
+                    .filter(|&i| other.value_at(i).is_true())
+                    .collect(),
+            };
+            b.gather(&keep)
+        }
+        other => {
+            return Err(format!("unsupported operator in EXISTS body: {other:?}"));
         }
     })
 }

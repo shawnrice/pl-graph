@@ -37,8 +37,10 @@ fn rewrite(plan: Plan) -> (Plan, bool) {
 /// Rebuild a node with its children individually rewritten.
 fn map_children(plan: Plan) -> (Plan, bool) {
     match plan {
-        // Leaves: no children to rewrite.
+        // Leaves: no children to rewrite. (`Row` only lives inside an EXISTS body,
+        // which the optimizer never descends into, but it is still a leaf.)
         p @ (Plan::Scan { .. }
+        | Plan::Row
         | Plan::IndexSeek { .. }
         | Plan::RangeSeek { .. }
         | Plan::Insert { .. }
@@ -366,6 +368,10 @@ fn max_slot(expr: &Expr) -> Option<usize> {
         Expr::Compare { left, right, .. } => merge_max(max_slot(left), max_slot(right)),
         Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => max_slot(expr),
         Expr::PropertyExists { slot, .. } => Some(*slot),
+        // EXISTS correlates on outer slots below `outer_width`; claim it reads up
+        // to the topmost, so the predicate is never pushed below an operator that
+        // binds a variable it might reference.
+        Expr::Exists { outer_width, .. } => outer_width.checked_sub(1),
     }
 }
 
@@ -381,6 +387,9 @@ fn merge_max(a: Option<usize>, b: Option<usize>) -> Option<usize> {
 fn width(plan: &Plan) -> usize {
     match plan {
         Plan::Scan { .. } | Plan::IndexSeek { .. } | Plan::RangeSeek { .. } => 1,
+        // `Row` never appears in an outer plan (it lives only in an EXISTS body,
+        // which pushdown does not traverse); width is meaningless here.
+        Plan::Row => 0,
         // Writes carry no output row.
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Merge { .. } | Plan::AddEdge { .. } => 0,
 
@@ -689,6 +698,7 @@ mod tests {
                 plan_contains_filter(left) || plan_contains_filter(right)
             }
             Plan::Scan { .. }
+            | Plan::Row
             | Plan::IndexSeek { .. }
             | Plan::RangeSeek { .. }
             | Plan::Insert { .. }
