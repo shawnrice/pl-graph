@@ -9,7 +9,8 @@
 //! ROWS are unchanged (run original vs optimized, compare as bags) and the plan
 //! SHAPE changed as intended.
 
-use crate::ir::{Expr, Plan};
+use crate::ir::{CompareOp, Expr, Plan};
+use crate::value::Value;
 
 /// Apply the rule set to a fixpoint (bounded, so a misbehaving rule cannot spin).
 #[must_use]
@@ -180,6 +181,26 @@ fn map_children(plan: Plan) -> (Plan, bool) {
     }
 }
 
+/// If `pred` is an equality between slot-0's property and a literal — in EITHER
+/// spelling (`prop = v` or `v = prop`) — return `(key, value)` for an index seek.
+/// Only `=` (not ranges), only slot 0 (the scanned node). Handling both spellings
+/// is the load-bearing part: a missed spelling silently keeps scanning.
+fn seek_target(pred: &Expr) -> Option<(String, Value)> {
+    let Expr::Compare {
+        op: CompareOp::Eq,
+        left,
+        right,
+    } = pred
+    else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Prop { slot: 0, key }, Expr::Lit(v))
+        | (Expr::Lit(v), Expr::Prop { slot: 0, key }) => Some((key.clone(), v.clone())),
+        _ => None,
+    }
+}
+
 /// The local rules, tried in order at a single node.
 fn apply_local(plan: Plan) -> (Plan, bool) {
     match plan {
@@ -226,6 +247,27 @@ fn apply_local(plan: Plan) -> (Plan, bool) {
                 },
                 true,
             ),
+            // index seed: `Filter(prop = literal) over Scan(label)` -> IndexSeek.
+            // A semantic no-op (IndexSeek yields exactly Scan+Filter(=) rows) that
+            // lets the executor seek an index. Both spellings of `=` are handled
+            // (see `seek_target`) so neither silently keeps scanning.
+            Plan::Scan { label: Some(l) } => match seek_target(&pred) {
+                Some((key, value)) => (
+                    Plan::IndexSeek {
+                        label: l,
+                        key,
+                        value,
+                    },
+                    true,
+                ),
+                None => (
+                    Plan::Filter {
+                        input: Box::new(Plan::Scan { label: Some(l) }),
+                        pred,
+                    },
+                    false,
+                ),
+            },
             other => (
                 Plan::Filter {
                     input: Box::new(other),
@@ -344,6 +386,64 @@ mod tests {
         opt
     }
 
+    /// `Scan(label) + Filter(prop = lit)` seeds to `IndexSeek` — for BOTH
+    /// spellings, which must land on the SAME seek target (the
+    /// equivalent-spellings-cost-the-same invariant) and preserve the rows.
+    #[test]
+    fn scan_filter_eq_seeds_index_both_spellings() {
+        let store = social();
+        let plan_of = |pred| {
+            Plan::Scan {
+                label: Some("Person".into()),
+            }
+            .filter(pred)
+            .project(vec![("name".into(), prop(0, "name"))])
+        };
+        let a = plan_of(cmp(CompareOp::Eq, prop(0, "name"), Expr::Lit(s("alice"))));
+        let b = plan_of(cmp(CompareOp::Eq, Expr::Lit(s("alice")), prop(0, "name")));
+
+        let oa = assert_rows_preserved(&a, &store);
+        let ob = assert_rows_preserved(&b, &store);
+
+        // Both spellings become Project{ IndexSeek{Person, name, "alice"} }.
+        let target = |p: &Plan| -> (String, String, Value) {
+            let Plan::Project { input, .. } = p else {
+                panic!("expected Project, got {p:?}")
+            };
+            let Plan::IndexSeek { label, key, value } = input.as_ref() else {
+                panic!("expected IndexSeek under Project, got {input:?}")
+            };
+            (label.clone(), key.clone(), value.clone())
+        };
+        let (la, ka, va) = target(&oa);
+        let (lb, kb, vb) = target(&ob);
+        assert_eq!((la.as_str(), ka.as_str()), ("Person", "name"));
+        assert_eq!((la, ka), (lb, kb)); // identical target for both spellings
+        assert!(matches!(&va, Value::Str(x) if &**x == "alice"));
+        assert!(matches!(&vb, Value::Str(x) if &**x == "alice"));
+        assert_eq!(bag(&run(&oa, &store)), vec!["Str(\"alice\");"]);
+    }
+
+    /// A range filter is NOT seeded (that is D2); an unlabelled scan cannot seek.
+    #[test]
+    fn non_eq_and_unlabelled_not_seeded() {
+        let store = social();
+        let range = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .filter(cmp(CompareOp::Gt, prop(0, "age"), Expr::Lit(n(28.0))))
+        .project(vec![("name".into(), prop(0, "name"))]);
+        assert!(plan_contains_filter(&assert_rows_preserved(&range, &store)));
+
+        let unlabelled = Plan::Scan { label: None }
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), Expr::Lit(s("alice"))))
+            .project(vec![("name".into(), prop(0, "name"))]);
+        assert!(plan_contains_filter(&assert_rows_preserved(
+            &unlabelled,
+            &store
+        )));
+    }
+
     #[test]
     fn pushdown_below_expand() {
         let store = social();
@@ -355,12 +455,14 @@ mod tests {
         .expand(0, Dir::Out, Some("KNOWS"))
         .filter(cmp(CompareOp::Eq, prop(0, "name"), Expr::Lit(s("alice"))));
         let opt = assert_rows_preserved(&plan, &store);
-        // Shape: Expand{ input: Filter{ Scan } }.
+        // Shape: Expand{ input: <pushed-down predicate> }. The pushed filter over
+        // Scan(label) then seeds to an IndexSeek — either form proves the
+        // predicate moved below the Expand.
         match opt {
             Plan::Expand { input, .. } => {
                 assert!(
-                    matches!(*input, Plan::Filter { .. }),
-                    "filter now below expand"
+                    matches!(*input, Plan::Filter { .. } | Plan::IndexSeek { .. }),
+                    "predicate now below expand (as Filter or IndexSeek)"
                 );
             }
             other => panic!("expected Expand at top, got {other:?}"),
@@ -421,8 +523,10 @@ mod tests {
         let plan = Plan::Scan {
             label: Some("Person".into()),
         }
+        // Two RANGE filters (non-seedable, so they merge rather than seed to
+        // IndexSeek — this test isolates merge + pushdown).
         .expand(0, Dir::Out, Some("KNOWS"))
-        .filter(cmp(CompareOp::Eq, prop(0, "name"), Expr::Lit(s("alice"))))
+        .filter(cmp(CompareOp::Le, prop(0, "age"), Expr::Lit(n(100.0))))
         .filter(cmp(CompareOp::Ge, prop(0, "age"), Expr::Lit(n(0.0))));
         let opt = assert_rows_preserved(&plan, &store);
         match opt {
@@ -449,11 +553,12 @@ mod tests {
             label: Some("Person".into()),
         }
         .expand(0, Dir::Out, Some("KNOWS"));
-        // left width is 2 (a, b); a filter on slot 0 (left's a) pushes left.
+        // left width is 2 (a, b); a filter on slot 0 (left's a) pushes left. A
+        // RANGE predicate (non-seedable) so it stays a Filter for this test.
         let plan = Plan::join(left, right, vec![(0, 0)]).filter(cmp(
-            CompareOp::Eq,
-            prop(0, "name"),
-            Expr::Lit(s("alice")),
+            CompareOp::Ge,
+            prop(0, "age"),
+            Expr::Lit(n(30.0)),
         ));
         let opt = assert_rows_preserved(&plan, &store);
         match opt {

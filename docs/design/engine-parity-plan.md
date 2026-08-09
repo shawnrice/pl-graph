@@ -106,9 +106,12 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
         semantics (NaN/null match nothing; group_key == equals for finite non-null;
         candidates intersect the label). NOTE: label-scoped index (true
         O(candidates), avoiding the label HashSet build) is a perf follow-up.
-  - [ ] D1b. Optimizer rule: `Scan(label)+Filter(prop = lit)` → `IndexSeek`, for
-        BOTH spellings (`prop = v`, `v = prop`); same-rows-as-scan+filter test
-        (equivalent_spellings_cost_the_same).
+  - [x] D1b. Optimizer rule: `Scan(Some(label))+Filter(prop = lit)` → `IndexSeek`
+        for BOTH spellings (`seek_target` matches `prop = v` and `v = prop`);
+        semantic no-op, rows preserved. Test asserts both spellings land the SAME
+        seek target (equivalent-spellings invariant); ranges & unlabelled scans not
+        seeded. Composes with pushdown (a pushed eq-filter over a labelled scan
+        seeds too).
 - [ ] D2. Range index + seek on `<,<=,>,>=` and `BETWEEN`.
 - [ ] D3. Edge-type index; interval/temporal index.
 
