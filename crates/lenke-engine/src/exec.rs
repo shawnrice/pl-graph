@@ -66,13 +66,22 @@ pub struct Rows {
 /// implicit column so partial plans stay runnable in tests.
 #[must_use]
 pub fn run(plan: &Plan, store: &Store) -> Rows {
+    try_run(plan, store).expect("read plan evaluation faulted")
+}
+
+/// The fallible core of [`run`]: an expression can fault at runtime (a failed
+/// `CAST` throws `E_INVALID_VALUE`), so the read pipeline threads a `Result`. A
+/// plan that never evaluates a fallible expression cannot error, which is why
+/// [`run`] can wrap this with `.expect` — the panic path is unreachable for such
+/// plans, and callers that may run user CASTs use `try_run` (or `execute`).
+pub fn try_run(plan: &Plan, store: &Store) -> Result<Rows, String> {
     // Lineage is plan-global: if anything reads the path, the whole plan tracks
     // it (Scan seeds, Expand extends); otherwise no operator builds a sidecar and
     // the query pays nothing for lineage.
     let track = needs_lineage(plan);
-    let batch = pull(plan, store, track);
+    let batch = pull(plan, store, track)?;
     let n = batch.rows();
-    match output_names(plan) {
+    Ok(match output_names(plan) {
         Some(names) => {
             let rows = (0..n)
                 .map(|i| batch.slots.iter().map(|c| c.value_at(i)).collect())
@@ -87,7 +96,7 @@ pub fn run(plan: &Plan, store: &Store) -> Rows {
                 rows,
             }
         }
-    }
+    })
 }
 
 /// Run a plan that MAY write, against a mutable store. A write plan (`Insert`)
@@ -149,11 +158,11 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
             let mut applied: Vec<Applied> = Vec::new();
             {
                 let track = needs_lineage(input);
-                let batch = pull(input, store, track);
+                let batch = pull(input, store, track)?;
                 for op in ops {
                     match op {
                         crate::ir::SetOp::Set { slot, key, value } => {
-                            let vals = eval(value, store, &batch);
+                            let vals = eval(value, store, &batch)?;
                             match batch.slot(*slot) {
                                 Col::Nodes(ids) => {
                                     for (i, &id) in ids.iter().enumerate() {
@@ -238,7 +247,7 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
             }
             Ok(empty_rows())
         }
-        _ => Ok(run(plan, store)),
+        _ => try_run(plan, store),
     }
 }
 
@@ -284,16 +293,31 @@ fn execute_merge(
             }
             MergeUpdate::Set { assigns, filter } => {
                 let batch = Batch::of(vec![Col::Nodes(vec![id])]);
-                let gate = filter.as_ref().is_none_or(|f| {
-                    matches!(eval(f, store, &batch).value_at(0), Value::Bool(true))
-                });
+                // Evaluate the gate and every assignment BEFORE mutating; a fault
+                // (e.g. a failed CAST) rolls the whole MERGE back rather than
+                // leaving the begun transaction open.
+                let gate = match filter.as_ref().map(|f| eval(f, store, &batch)).transpose() {
+                    Ok(g) => g.is_none_or(|c| matches!(c.value_at(0), Value::Bool(true))),
+                    Err(e) => {
+                        store.rollback();
+                        return Err(e);
+                    }
+                };
                 if gate {
-                    let writes: Vec<(String, Value)> = assigns
+                    let writes: Result<Vec<(String, Value)>, String> = assigns
                         .iter()
-                        .map(|(k, e)| (k.clone(), eval(e, store, &batch).value_at(0)))
+                        .map(|(k, e)| Ok((k.clone(), eval(e, store, &batch)?.value_at(0))))
                         .collect();
-                    for (k, v) in writes {
-                        store.set_prop(id, &k, v);
+                    match writes {
+                        Ok(writes) => {
+                            for (k, v) in writes {
+                                store.set_prop(id, &k, v);
+                            }
+                        }
+                        Err(e) => {
+                            store.rollback();
+                            return Err(e);
+                        }
                     }
                 }
             }
@@ -303,12 +327,20 @@ fn execute_merge(
                 props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
             let id = store.add_node(&[label], &props_ref);
             let batch = Batch::of(vec![Col::Nodes(vec![id])]);
-            let writes: Vec<(String, Value)> = on_create
+            let writes: Result<Vec<(String, Value)>, String> = on_create
                 .iter()
-                .map(|(k, e)| (k.clone(), eval(e, store, &batch).value_at(0)))
+                .map(|(k, e)| Ok((k.clone(), eval(e, store, &batch)?.value_at(0))))
                 .collect();
-            for (k, v) in writes {
-                store.set_prop(id, &k, v);
+            match writes {
+                Ok(writes) => {
+                    for (k, v) in writes {
+                        store.set_prop(id, &k, v);
+                    }
+                }
+                Err(e) => {
+                    store.rollback();
+                    return Err(e);
+                }
             }
         }
     }
@@ -422,8 +454,8 @@ fn needs_lineage(plan: &Plan) -> bool {
 
 /// Pull a batch up through a (non-terminal) plan node. `track` is the plan-global
 /// lineage decision: when true, row-producing operators build the path sidecar.
-fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
-    match plan {
+fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
+    Ok(match plan {
         // A write plan is never pulled (a read sub-plan cannot contain one); it
         // is run through `execute`. Yield an empty batch if it somehow reaches
         // here so `run` on a bare write is a harmless no-op rather than a panic.
@@ -469,7 +501,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
             edge_label,
             bind_edge,
         } => expand(
-            &pull(input, store, track),
+            &pull(input, store, track)?,
             store,
             *from,
             *dir,
@@ -477,18 +509,21 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
             *bind_edge,
         ),
         Plan::Filter { input, pred } => {
-            let batch = pull(input, store, track);
+            let batch = pull(input, store, track)?;
             // Fast path: `<prop> <cmp> <literal>` reads storage in one pass to
             // keep-indices; otherwise evaluate the predicate as a full column.
-            let keep: Vec<usize> = try_filter_keep(pred, store, &batch).unwrap_or_else(|| {
-                let mask = eval(pred, store, &batch);
-                match &mask {
-                    Col::Bool(bs) => (0..bs.len()).filter(|&i| bs[i]).collect(),
-                    other => (0..other.len())
-                        .filter(|&i| other.value_at(i).is_true())
-                        .collect(),
+            let keep: Vec<usize> = match try_filter_keep(pred, store, &batch) {
+                Some(keep) => keep,
+                None => {
+                    let mask = eval(pred, store, &batch)?;
+                    match &mask {
+                        Col::Bool(bs) => (0..bs.len()).filter(|&i| bs[i]).collect(),
+                        other => (0..other.len())
+                            .filter(|&i| other.value_at(i).is_true())
+                            .collect(),
+                    }
                 }
-            });
+            };
             batch.gather(&keep)
         }
         Plan::VarLength {
@@ -500,7 +535,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
             max,
             trail,
         } => var_length(
-            &pull(input, store, track),
+            &pull(input, store, track)?,
             store,
             *from,
             *dir,
@@ -516,7 +551,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
             edge_label,
             max,
         } => shortest_path(
-            &pull(input, store, track),
+            &pull(input, store, track)?,
             store,
             *from,
             *dir,
@@ -526,14 +561,16 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
         Plan::Aggregate { input, keys, aggs } => {
             // Frontier fast path: a scalar count over an Expand chain need not
             // build the wide intermediate batch. Falls back to the general
-            // aggregate for every shape it does not recognize.
+            // aggregate for every shape it does not recognize. (The fused paths
+            // never evaluate arbitrary expressions, so they cannot fault.)
             if let Some(b) = try_fused_count(input, keys, aggs, store)
                 .or_else(|| try_node_grouped_count(input, keys, aggs, store))
-                .or_else(|| try_frontier_aggregate(input, keys, aggs, store))
             {
                 b
+            } else if let Some(b) = try_frontier_aggregate(input, keys, aggs, store)? {
+                b
             } else {
-                aggregate(&pull(input, store, track), store, keys, aggs)
+                aggregate(&pull(input, store, track)?, store, keys, aggs)?
             }
         }
         Plan::OrderPage {
@@ -541,17 +578,17 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
             keys,
             skip,
             limit,
-        } => order_page(&pull(input, store, track), store, keys, *skip, *limit),
+        } => order_page(&pull(input, store, track)?, store, keys, *skip, *limit)?,
         Plan::Project { input, items } => {
             // Project produces a batch whose slots ARE the projected columns, so
             // an operator above it (Distinct, OrderPage) works on the output
             // values, not the pre-projection bindings.
-            let batch = pull(input, store, track);
-            let cols = items.iter().map(|(_, e)| eval(e, store, &batch)).collect();
+            let batch = pull(input, store, track)?;
+            let cols = eval_all(items.iter().map(|(_, e)| e), store, &batch)?;
             Batch::of(cols)
         }
         Plan::Distinct { input } => {
-            let batch = pull(input, store, track);
+            let batch = pull(input, store, track)?;
             let n = batch.rows();
             let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
             let mut buf = Vec::new();
@@ -575,9 +612,9 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
             batch.gather(&keep)
         }
         Plan::Join { left, right, on } => {
-            hash_join(&pull(left, store, track), &pull(right, store, track), on)
+            hash_join(&pull(left, store, track)?, &pull(right, store, track)?, on)
         }
-    }
+    })
 }
 
 /// Hash-join two batches on `(left_slot, right_slot)` key equalities. Output is
@@ -627,11 +664,11 @@ fn order_page(
     keys: &[crate::ir::SortKey],
     skip: Option<usize>,
     limit: Option<usize>,
-) -> Batch {
+) -> Result<Batch, String> {
     let n = batch.rows();
     let mut idx: Vec<usize> = (0..n).collect();
     if !keys.is_empty() {
-        let key_cols: Vec<Col> = keys.iter().map(|k| eval(&k.expr, store, batch)).collect();
+        let key_cols: Vec<Col> = eval_all(keys.iter().map(|k| &k.expr), store, batch)?;
         // Stable sort: equal keys keep input order, so the last key's ties fall
         // back to arrival order deterministically.
         idx.sort_by(|&a, &b| {
@@ -647,7 +684,7 @@ fn order_page(
     }
     let start = skip.unwrap_or(0).min(idx.len());
     let end = limit.map_or(idx.len(), |l| start.saturating_add(l).min(idx.len()));
-    batch.gather(&idx[start..end])
+    Ok(batch.gather(&idx[start..end]))
 }
 
 /// Group `batch` by `keys` and compute `aggs` per group. Output slots are the key
@@ -659,9 +696,14 @@ fn order_page(
 /// then each aggregate is a single streaming pass over that labelling — so an
 /// aggregate never materializes its group's rows, and `count(*)` is a tally, not
 /// a bucketed list of row indices.
-fn aggregate(batch: &Batch, store: &Store, keys: &[(String, Expr)], aggs: &[Agg]) -> Batch {
+fn aggregate(
+    batch: &Batch,
+    store: &Store,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+) -> Result<Batch, String> {
     let n = batch.rows();
-    let key_cols: Vec<Col> = keys.iter().map(|(_, e)| eval(e, store, batch)).collect();
+    let key_cols: Vec<Col> = eval_all(keys.iter().map(|(_, e)| e), store, batch)?;
 
     // With no keys the whole input is one group, and a scalar aggregate over
     // EMPTY input still emits that one group (SQL: `count(*)` over nothing is 0,
@@ -683,7 +725,11 @@ fn aggregate(batch: &Batch, store: &Store, keys: &[(String, Expr)], aggs: &[Agg]
     };
 
     for agg in aggs {
-        let arg_col = agg.arg.as_ref().map(|e| eval(e, store, batch));
+        let arg_col = agg
+            .arg
+            .as_ref()
+            .map(|e| eval(e, store, batch))
+            .transpose()?;
         slots.push(Col::Gen(fold_grouped(
             agg,
             arg_col.as_ref(),
@@ -692,7 +738,7 @@ fn aggregate(batch: &Batch, store: &Store, keys: &[(String, Expr)], aggs: &[Agg]
         )));
     }
 
-    Batch::of(slots)
+    Ok(Batch::of(slots))
 }
 
 /// Assign a dense, first-seen group id to every row from its key columns.
@@ -1433,16 +1479,21 @@ fn try_frontier_aggregate(
     keys: &[(String, Expr)],
     aggs: &[Agg],
     store: &Store,
-) -> Option<Batch> {
-    let last = chain_width(input)? - 1; // frontier slot index of the whole chain
+) -> Result<Option<Batch>, String> {
+    let Some(width) = chain_width(input) else {
+        return Ok(None);
+    };
+    let last = width - 1; // frontier slot index of the whole chain
     let key_ok = keys.iter().all(|(_, e)| refs_only_slot(e, last));
     let agg_ok = aggs
         .iter()
         .all(|a| a.arg.as_ref().is_none_or(|e| refs_only_slot(e, last)));
     if !key_ok || !agg_ok {
-        return None;
+        return Ok(None);
     }
-    let frontier = frontier_ids(input, store)?;
+    let Some(frontier) = frontier_ids(input, store) else {
+        return Ok(None);
+    };
     let batch = Batch::of(vec![Col::Nodes(frontier)]);
     // Retarget the frontier-only expressions onto the one-slot frontier batch.
     let keys: Vec<(String, Expr)> = keys
@@ -1458,7 +1509,7 @@ fn try_frontier_aggregate(
             name: a.name.clone(),
         })
         .collect();
-    Some(aggregate(&batch, store, &keys, &aggs))
+    Ok(Some(aggregate(&batch, store, &keys, &aggs)?))
 }
 
 /// A quantified hop: for each input row, enumerate every path of length in
@@ -1641,8 +1692,8 @@ fn shortest_path(
 }
 
 /// Evaluate `expr` over every row of `batch`, producing a column.
-fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
-    match expr {
+fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
+    Ok(match expr {
         Expr::Slot(n) => batch.slot(*n).clone(),
         Expr::Lit(v) => broadcast(v.clone(), batch.rows()),
         Expr::Prop { slot, key } => read_property(store, batch.slot(*slot), key),
@@ -1657,30 +1708,30 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
             None => Col::Gen(vec![Value::Null; batch.rows()]),
         },
         Expr::Not(inner) => {
-            let c = eval(inner, store, batch);
+            let c = eval(inner, store, batch)?;
             map_bool(&c, |b| b.map(|x| !x))
         }
         Expr::And(l, r) => zip_bool(store, batch, l, r, |a, b| match (a, b) {
             (Some(false), _) | (_, Some(false)) => Some(false),
             (Some(true), Some(true)) => Some(true),
             _ => None,
-        }),
+        })?,
         Expr::Or(l, r) => zip_bool(store, batch, l, r, |a, b| match (a, b) {
             (Some(true), _) | (_, Some(true)) => Some(true),
             (Some(false), Some(false)) => Some(false),
             _ => None,
-        }),
+        })?,
         Expr::Compare { op, left, right } => {
-            let l = eval(left, store, batch);
-            let r = eval(right, store, batch);
+            let l = eval(left, store, batch)?;
+            let r = eval(right, store, batch)?;
             compare(*op, &l, &r)
         }
         Expr::Arith { op, left, right } => {
             // f64 math via the value contract's `as_num` (finite Num only); any
             // NULL / non-numeric / non-finite operand OR result yields NULL.
             use crate::ir::ArithOp::{Add, Div, Mul, Rem, Sub};
-            let l = eval(left, store, batch);
-            let r = eval(right, store, batch);
+            let l = eval(left, store, batch)?;
+            let r = eval(right, store, batch)?;
             let n = l.len().min(r.len());
             let out: Vec<Value> = (0..n)
                 .map(
@@ -1708,7 +1759,7 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
         Expr::Call { name, args } => {
             // Evaluate each argument to a column, then dispatch per row. Arity is
             // validated at parse time, so `call_scalar` can index its args.
-            let cols: Vec<Col> = args.iter().map(|a| eval(a, store, batch)).collect();
+            let cols = eval_all(args, store, batch)?;
             let n = cols.iter().map(Col::len).min().unwrap_or(0);
             let out: Vec<Value> = (0..n)
                 .map(|i| {
@@ -1720,7 +1771,7 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
         }
         Expr::List { items } => {
             // Per row, build a Value::List of each element's value.
-            let cols: Vec<Col> = items.iter().map(|e| eval(e, store, batch)).collect();
+            let cols = eval_all(items, store, batch)?;
             let n = batch.rows();
             Col::Gen(
                 (0..n)
@@ -1732,15 +1783,12 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
             branches,
             otherwise,
         } => {
-            let conds: Vec<Col> = branches
-                .iter()
-                .map(|(c, _)| eval(c, store, batch))
-                .collect();
-            let vals: Vec<Col> = branches
-                .iter()
-                .map(|(_, v)| eval(v, store, batch))
-                .collect();
-            let else_col = otherwise.as_ref().map(|e| eval(e, store, batch));
+            let conds = eval_all(branches.iter().map(|(c, _)| c), store, batch)?;
+            let vals = eval_all(branches.iter().map(|(_, v)| v), store, batch)?;
+            let else_col = otherwise
+                .as_ref()
+                .map(|e| eval(e, store, batch))
+                .transpose()?;
             let n = batch.rows();
             let out: Vec<Value> = (0..n)
                 .map(|i| {
@@ -1755,7 +1803,16 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
                 .collect();
             Col::Gen(out)
         }
-    }
+    })
+}
+
+/// Evaluate several expressions to columns, short-circuiting on the first error.
+fn eval_all<'a>(
+    exprs: impl IntoIterator<Item = &'a Expr>,
+    store: &Store,
+    batch: &Batch,
+) -> Result<Vec<Col>, String> {
+    exprs.into_iter().map(|e| eval(e, store, batch)).collect()
 }
 
 /// Dispatch a scalar function over its already-evaluated argument row. Arity is
@@ -2036,11 +2093,11 @@ fn zip_bool(
     l: &Expr,
     r: &Expr,
     f: impl Fn(Option<bool>, Option<bool>) -> Option<bool>,
-) -> Col {
-    let lc = as_truth(&eval(l, store, batch));
-    let rc = as_truth(&eval(r, store, batch));
+) -> Result<Col, String> {
+    let lc = as_truth(&eval(l, store, batch)?);
+    let rc = as_truth(&eval(r, store, batch)?);
     let n = lc.len().min(rc.len());
-    truth_to_col((0..n).map(|i| f(lc[i], rc[i])).collect())
+    Ok(truth_to_col((0..n).map(|i| f(lc[i], rc[i])).collect()))
 }
 
 fn truth_to_col(out: Vec<Option<bool>>) -> Col {
@@ -3495,14 +3552,17 @@ mod tests {
         assert!(!super::needs_lineage(&plain), "no Path read -> no lineage");
         // The pulled batch (before the lineage-dropping Project) has no sidecar.
         let inner = scan("Person").expand(0, Dir::Out, Some("KNOWS"));
-        assert!(super::pull(&inner, &store, false).lineage.is_none());
+        assert!(super::pull(&inner, &store, false)
+            .unwrap()
+            .lineage
+            .is_none());
 
         let with_path = scan("Person")
             .expand(0, Dir::Out, Some("KNOWS"))
             .project(vec![("p".into(), Expr::Path)]);
         assert!(super::needs_lineage(&with_path), "Path read -> lineage");
         // With track=true the expand carries a sidecar.
-        assert!(super::pull(&inner, &store, true).lineage.is_some());
+        assert!(super::pull(&inner, &store, true).unwrap().lineage.is_some());
     }
 
     /// Lineage survives a reorder: ORDER BY over a path-tracking plan keeps each

@@ -147,7 +147,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
 - [x] E3. `CASE` / conditional: IR `Expr::Case{branches, otherwise}` + eval (first
       branch whose condition is literally TRUE — three-valued, FALSE/NULL skip —
       else ELSE, else NULL) + GQL searched form `CASE (WHEN e THEN e)+ [ELSE e]
-  END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
+END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       match. Simple form `CASE x WHEN v …` deferred (would desugar to `x = v`).
 - E4. String & list functions, split:
   - [x] E4a. String functions over `Expr::Call`: upper/lower/trim, length (char
@@ -158,7 +158,17 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
         non-constant elements ok; parsed in primary(); List arm added to every Expr
         match) + size/head/last via `call_scalar` (non-list → NULL; head/last of
         empty → NULL). NOTE: `list[i]` index access still deferred (own slice).
-- [ ] E5. `CAST` + cross-type coercion semantics.
+- E5. `CAST` + coercion. USER DECISION (2026-08-09): failed cast THROWS
+  `E_INVALID_VALUE`; `INTEGER` truncates toward zero (FLOAT/NUMBER keep the
+  fraction; all stored as f64); broad conversions (string↔number, →string,
+  number↔bool `0=false/nonzero=true`, string→bool `'true'/'false'`, null→null).
+  Split (throw needs a fallible read pipeline):
+  - [x] E5a. Make the read pipeline fallible: `eval`/`pull`/`aggregate`/
+        `order_page`/`try_frontier_aggregate` return `Result<_,String>`; added
+        `try_run`, `run` wraps it with `.expect`; `execute` uses `try_run` and
+        MERGE eval faults roll back. Pure refactor, all 190 tests green.
+  - [ ] E5b. `CAST(<expr> AS <TYPE>)`: IR `Expr::Cast` + `value::cast()` (the
+        coercion home, per the decision above); eval throws on failure.
 - [ ] E6. 3VL completeness: `IS NULL`, property-exists, `AND`/`OR`/`NOT` gaps.
 
 ### Phase F — Query surface
