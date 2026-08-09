@@ -377,12 +377,14 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
             from,
             dir,
             edge_label,
+            bind_edge,
         } => expand(
             &pull(input, store, track),
             store,
             *from,
             *dir,
             edge_label.as_deref(),
+            *bind_edge,
         ),
         Plan::Filter { input, pred } => {
             let batch = pull(input, store, track);
@@ -615,7 +617,7 @@ fn assign_groups(key_cols: &[Col], n: usize) -> (Vec<u32>, Vec<usize>) {
             // Node ids are small non-negative integers: their id IS the key, and
             // it matches `value_at` (which surfaces a node as `Num(id)`, whose
             // group bits are the same integer).
-            Col::Nodes(v) => return group_by(n, v.iter().map(|&x| u64::from(x))),
+            Col::Nodes(v) | Col::Edges(v) => return group_by(n, v.iter().map(|&x| u64::from(x))),
             Col::Bool(v) => return group_by(n, v.iter().map(|&b| u64::from(b))),
             Col::Str(v) => return group_by_arc(v),
             Col::Gen(_) => {} // mixed: fall through to the byte-key path
@@ -800,12 +802,22 @@ fn fold_grouped(agg: &Agg, arg_col: Option<&Col>, group_of: &[u32], n_groups: us
 /// the bulk (lineage-free) strategy: `keep` records which input row each output
 /// row came from, `nbrs` the landed node — the existing slots are gathered by
 /// `keep`, so no per-row struct is built.
-fn expand(batch: &Batch, store: &Store, from: usize, dir: Dir, edge_label: Option<&str>) -> Batch {
-    // An empty expand still appends the landed slot (all rows dropped), so the
-    // output has K+1 slots exactly as a successful expand would — a projection
-    // referencing the new slot must not go out of bounds.
+fn expand(
+    batch: &Batch,
+    store: &Store,
+    from: usize,
+    dir: Dir,
+    edge_label: Option<&str>,
+    bind_edge: bool,
+) -> Batch {
+    // An empty expand still appends the landed slot(s), so the output has the same
+    // shape a successful expand would (K+1 slots, or K+2 with the edge bound) — a
+    // projection referencing a new slot must not go out of bounds.
     let empty = || {
         let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
+        if bind_edge {
+            slots.push(Col::Edges(vec![]));
+        }
         slots.push(Col::Nodes(vec![]));
         let mut b = Batch::of(slots);
         if batch.lineage.is_some() {
@@ -829,41 +841,49 @@ fn expand(batch: &Batch, store: &Store, from: usize, dir: Dir, edge_label: Optio
 
     let mut keep = Vec::new();
     let mut nbrs = Vec::new();
+    let mut eids = Vec::new();
     for (row, &v) in src.iter().enumerate() {
-        for_each_nbr(store, v, dir, want, |nbr| {
+        for_each_nbr(store, v, dir, want, |nbr, eid| {
             keep.push(row);
             nbrs.push(nbr);
+            if bind_edge {
+                eids.push(eid);
+            }
         });
     }
 
     let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
-    slots.push(Col::Nodes(nbrs.clone()));
+    if bind_edge {
+        slots.push(Col::Edges(eids)); // edge slot at index W
+    }
+    slots.push(Col::Nodes(nbrs.clone())); // node slot at index W (or W+1)
     let mut out = Batch::of(slots);
     // Lineage strategy: when the input carried a path, extend each output row's
-    // path by the neighbour it landed on. This is the ONLY place Expand differs
-    // for lineage — the frontier work above is identical.
+    // path by the neighbour it landed on (the path is node ids; the edge slot is
+    // separate). This is the ONLY place Expand differs for lineage.
     if let Some(lin) = &batch.lineage {
         out.lineage = Some(lin.extend(&keep, &nbrs));
     }
     out
 }
 
-/// Visit each neighbour of `v` along `dir` matching edge type `want`. The one
-/// place Expand's adjacency walk is spelled — shared by the batch operator and
-/// the frontier executor so the two can never disagree on what an Expand reaches.
-fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: Option<u32>, mut f: impl FnMut(u32)) {
+/// Visit each neighbour of `v` along `dir` matching edge type `want`, calling `f`
+/// with `(neighbour, eid)`. The one place Expand's adjacency walk is spelled —
+/// shared by the batch operator and the frontier executor so the two can never
+/// disagree on what an Expand reaches.
+fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: Option<u32>, mut f: impl FnMut(u32, u32)) {
     let type_ok = |et: u32| want.is_none_or(|w| w == et);
     if matches!(dir, Dir::Out | Dir::Both) {
         for a in store.out(v) {
             if type_ok(a.etype) {
-                f(a.nbr);
+                f(a.nbr, a.eid);
             }
         }
     }
     if matches!(dir, Dir::In | Dir::Both) {
         for a in store.inc(v) {
             if type_ok(a.etype) {
-                f(a.nbr);
+                f(a.nbr, a.eid);
             }
         }
     }
@@ -874,7 +894,10 @@ fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: Option<u32>, mut f: impl 
 fn chain_width(plan: &Plan) -> Option<usize> {
     match plan {
         Plan::Scan { .. } => Some(1),
-        Plan::Expand { input, .. } => Some(chain_width(input)? + 1),
+        // A bind_edge Expand appends TWO slots (edge then node), else one.
+        Plan::Expand {
+            input, bind_edge, ..
+        } => Some(chain_width(input)? + if *bind_edge { 2 } else { 1 }),
         _ => None,
     }
 }
@@ -903,6 +926,7 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
             from,
             dir,
             edge_label,
+            ..
         } => {
             // Must expand the CURRENT frontier (the last slot); a linear pattern
             // always does, but a hand-built plan might not.
@@ -919,7 +943,7 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
             };
             let mut out = Vec::new();
             for &v in &src {
-                for_each_nbr(store, v, *dir, want, |nbr| out.push(nbr));
+                for_each_nbr(store, v, *dir, want, |nbr, _eid| out.push(nbr));
             }
             Some(out)
         }
@@ -952,6 +976,7 @@ fn try_fused_count(
         from,
         dir,
         edge_label,
+        ..
     } = input
     else {
         return None;
@@ -981,12 +1006,12 @@ fn try_fused_count(
             let (distinct, mult) = distinct_with_mult(&src, store.node_count());
             for (i, &v) in distinct.iter().enumerate() {
                 let mut deg = 0f64;
-                for_each_nbr(store, v, *dir, want, |_| deg += 1.0);
+                for_each_nbr(store, v, *dir, want, |_, _| deg += 1.0);
                 total += mult[i] * deg;
             }
         } else {
             for &v in &src {
-                for_each_nbr(store, v, *dir, want, |_| total += 1.0);
+                for_each_nbr(store, v, *dir, want, |_, _| total += 1.0);
             }
         }
         return Some(scalar_num(total));
@@ -1023,7 +1048,7 @@ fn try_fused_count(
         let mut seen = vec![false; nc];
         let mut cnt = 0f64;
         for &v in sources {
-            for_each_nbr(store, v, *dir, want, |nbr| {
+            for_each_nbr(store, v, *dir, want, |nbr, _| {
                 if !seen[nbr as usize] {
                     seen[nbr as usize] = true;
                     cnt += 1.0;
@@ -1127,6 +1152,7 @@ fn try_node_grouped_count(
         from,
         dir,
         edge_label,
+        ..
     } = input
     else {
         return None;
@@ -1157,7 +1183,7 @@ fn try_node_grouped_count(
     let mut rep_ids: Vec<u32> = Vec::new();
     let mut node_count: Vec<f64> = Vec::new();
     for &v in &src {
-        for_each_nbr(store, v, *dir, want, |nbr| {
+        for_each_nbr(store, v, *dir, want, |nbr, _| {
             let slot = &mut group_of[nbr as usize];
             if *slot == u32::MAX {
                 *slot = u32::try_from(rep_ids.len()).expect("group count fits in u32");
@@ -1508,6 +1534,10 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
 /// storage column and staying unboxed when it and every read entry are
 /// present-and-typed; fall to `Gen` (with nulls) otherwise.
 fn read_property(store: &Store, col: &Col, key: &str) -> Col {
+    // An edge slot reads an EDGE property (boxed map, keyed by eid).
+    if let Col::Edges(eids) = col {
+        return Col::Gen(eids.iter().map(|&e| store.edge_prop(e, key)).collect());
+    }
     let Col::Nodes(ids) = col else {
         return Col::Gen(vec![Value::Null; col.len()]);
     };
@@ -1935,6 +1965,63 @@ mod tests {
             .expand(0, Dir::Out, Some("NOPE"))
             .project(vec![("x".into(), prop(1, "name"))]);
         assert_eq!(run(&plan, &store).rows.len(), 0);
+    }
+
+    /// `expand_edge` binds the traversed edge as a slot: for `(a)-[r:R]->(b)` the
+    /// edge is slot 1 and the node slot 2, so `r.weight` reads an edge property and
+    /// `b.name` reads a node property.
+    #[test]
+    fn expand_edge_binds_edge_and_reads_edge_prop() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[("name", s("a"))]);
+        let b = st.add_node(&["P"], &[("name", s("b"))]);
+        st.add_edge(a, b, "R");
+        let eid = st.out(a)[0].eid;
+        st.set_edge_prop(eid, "weight", n(0.5));
+        let plan = scan("P").expand_edge(0, Dir::Out, Some("R")).project(vec![
+            ("w".into(), prop(1, "weight")), // edge slot
+            ("b".into(), prop(2, "name")),   // node slot
+        ]);
+        let out = run(&plan, &st);
+        assert_eq!(out.rows.len(), 1);
+        assert!(matches!(&out.rows[0][0], Value::Num(x) if *x == 0.5));
+        assert_eq!(as_str(&out.rows[0][1]), "b");
+    }
+
+    /// An edge slot with no such property reads NULL.
+    #[test]
+    fn expand_edge_absent_prop_is_null() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[]);
+        let b = st.add_node(&["P"], &[]);
+        st.add_edge(a, b, "R");
+        let plan = scan("P")
+            .expand_edge(0, Dir::Out, Some("R"))
+            .project(vec![("w".into(), prop(1, "weight"))]);
+        let out = run(&plan, &st);
+        assert_eq!(out.rows.len(), 1);
+        assert!(out.rows[0][0].is_null());
+    }
+
+    /// Filtering on an edge property keeps only matching edges. a→b (w=0.5),
+    /// a→c (w=0.2); `WHERE r.w > 0.4` → only b.
+    #[test]
+    fn filter_on_edge_property() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[("name", s("a"))]);
+        let b = st.add_node(&["P"], &[("name", s("b"))]);
+        let c = st.add_node(&["P"], &[("name", s("c"))]);
+        st.add_edge(a, b, "R");
+        let e1 = st.out(a)[0].eid;
+        st.add_edge(a, c, "R");
+        let e2 = st.out(a)[1].eid;
+        st.set_edge_prop(e1, "w", n(0.5));
+        st.set_edge_prop(e2, "w", n(0.2));
+        let plan = scan("P")
+            .expand_edge(0, Dir::Out, Some("R"))
+            .filter(cmp(CompareOp::Gt, prop(1, "w"), lit(n(0.4))))
+            .project(vec![("b".into(), prop(2, "name"))]);
+        assert_eq!(names_of(&run(&plan, &st), 0), vec!["b"]);
     }
 
     fn as_str(v: &Value) -> String {

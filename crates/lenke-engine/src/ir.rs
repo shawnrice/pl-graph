@@ -101,6 +101,11 @@ pub enum Plan {
         from: usize,
         dir: Dir,
         edge_label: Option<String>,
+        /// When true, also bind the traversed EDGE: the output appends the edge
+        /// slot (a `Col::Edges`) THEN the landed node slot — so for input width W,
+        /// the edge is slot W and the node slot W+1. When false (the default), only
+        /// the node slot is appended, exactly as before.
+        bind_edge: bool,
     },
     /// A quantified hop: from the element in `from`, reach nodes over `min..=max`
     /// hops of `dir`/`edge_label`, appending EACH reached endpoint as one new
@@ -267,6 +272,20 @@ impl Plan {
             from,
             dir,
             edge_label: edge_label.map(str::to_string),
+            bind_edge: false,
+        }
+    }
+
+    /// Like [`Self::expand`] but also binds the traversed edge as a slot (edge
+    /// slot then node slot). Used for `(a)-[r:T]->(b)` where `r` is read.
+    #[must_use]
+    pub fn expand_edge(self, from: usize, dir: Dir, edge_label: Option<&str>) -> Self {
+        Self::Expand {
+            input: Box::new(self),
+            from,
+            dir,
+            edge_label: edge_label.map(str::to_string),
+            bind_edge: true,
         }
     }
 

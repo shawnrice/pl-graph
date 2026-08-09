@@ -43,6 +43,7 @@ fn map_children(plan: Plan) -> (Plan, bool) {
             from,
             dir,
             edge_label,
+            bind_edge,
         } => {
             let (i, c) = rewrite(*input);
             (
@@ -51,6 +52,7 @@ fn map_children(plan: Plan) -> (Plan, bool) {
                     from,
                     dir,
                     edge_label,
+                    bind_edge,
                 },
                 c,
             )
@@ -197,12 +199,14 @@ fn apply_local(plan: Plan) -> (Plan, bool) {
                 from,
                 dir,
                 edge_label,
+                bind_edge,
             } if refs_below(&pred, width(&ein)) => (
                 Plan::Expand {
                     input: Box::new(Plan::Filter { input: ein, pred }),
                     from,
                     dir,
                     edge_label,
+                    bind_edge,
                 },
                 true,
             ),
@@ -264,9 +268,11 @@ fn width(plan: &Plan) -> usize {
         // Writes carry no output row.
         Plan::Insert { .. } | Plan::Update { .. } | Plan::Merge { .. } => 0,
 
-        Plan::Expand { input, .. }
-        | Plan::VarLength { input, .. }
-        | Plan::ShortestPath { input, .. } => width(input) + 1,
+        // A bind_edge Expand appends TWO slots (edge then node).
+        Plan::Expand {
+            input, bind_edge, ..
+        } => width(input) + if *bind_edge { 2 } else { 1 },
+        Plan::VarLength { input, .. } | Plan::ShortestPath { input, .. } => width(input) + 1,
         Plan::Filter { input, .. } | Plan::OrderPage { input, .. } | Plan::Distinct { input } => {
             width(input)
         }

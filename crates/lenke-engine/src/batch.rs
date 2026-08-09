@@ -17,6 +17,9 @@ use crate::value::Value;
 pub enum Col {
     /// A frontier of node ids.
     Nodes(Vec<u32>),
+    /// A frontier of edge ids (the traversed relationships), bound by an Expand
+    /// that also binds its edge. A `Prop` on an edge slot reads an edge property.
+    Edges(Vec<u32>),
     Num(Vec<f64>),
     Bool(Vec<bool>),
     Str(Vec<Arc<str>>),
@@ -28,7 +31,7 @@ impl Col {
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
-            Self::Nodes(v) => v.len(),
+            Self::Nodes(v) | Self::Edges(v) => v.len(),
             Self::Num(v) => v.len(),
             Self::Bool(v) => v.len(),
             Self::Str(v) => v.len(),
@@ -51,7 +54,7 @@ impl Col {
             // form only where a caller asked for a value column, never here — a
             // Nodes column is an element frontier, not a value. Callers that want
             // a value read a property off it instead.
-            Self::Nodes(v) => Value::Num(f64::from(v[i])),
+            Self::Nodes(v) | Self::Edges(v) => Value::Num(f64::from(v[i])),
             Self::Num(v) => Value::Num(v[i]),
             Self::Bool(v) => Value::Bool(v[i]),
             Self::Str(v) => Value::Str(v[i].clone()),
@@ -65,6 +68,7 @@ impl Col {
     pub fn gather(&self, idx: &[usize]) -> Self {
         match self {
             Self::Nodes(v) => Self::Nodes(idx.iter().map(|&i| v[i]).collect()),
+            Self::Edges(v) => Self::Edges(idx.iter().map(|&i| v[i]).collect()),
             Self::Num(v) => Self::Num(idx.iter().map(|&i| v[i]).collect()),
             Self::Bool(v) => Self::Bool(idx.iter().map(|&i| v[i]).collect()),
             Self::Str(v) => Self::Str(idx.iter().map(|&i| v[i].clone()).collect()),

@@ -67,8 +67,10 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
         `remove_edge_prop`/`has_edge_prop` keyed by `eid`, undo-logged
         (RestoreEdgeCell). Boxed key→(eid→value) map, not columnar (edges are
         cooler); dead-eid props linger on delete (safe — eids never reused).
-  - [ ] B5b. Bind the edge as a slot in `Expand` (a `Col::Edges` frontier); `Prop`
-        on an edge slot reads an edge property.
+  - [x] B5b. Bind the edge as a slot in `Expand` (opt-in `bind_edge` → `Col::Edges`
+        frontier; edge slot at W, node at W+1); `Prop` on an edge slot reads
+        `store.edge_prop`. `for_each_nbr` now yields `(nbr, eid)`; width/chain_width
+        count +2 for a bound edge; node-only Expand unchanged (default false).
   - [ ] B5c. Language surface: GQL `[r:T {props}]` binding + `r.key` in
         RETURN/WHERE, edge props in INSERT/SET; Gremlin `addE`/edge `values`.
 
