@@ -91,7 +91,11 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
       gapped (deletions), so nodes get fresh dense ids and edges are remapped.
       Round-trip is exact for a gap-free dump, stable from the first reload
       otherwise. Round-trip + hand-parse + remap + value-kinds + error tests.
-- [ ] C3. Schema/snapshot round-trip.
+- [x] C3. Schema/snapshot round-trip: `dump_schema` emits unique constraints as
+      leading `{"schema":"unique",…}` lines; `snapshot` = schema-then-data;
+      `load_snapshot`/`from_ndjson` apply schema BEFORE data (empty store, always
+      valid) so reloaded INSERT-enforcement matches. Round-trip preserves data AND
+      constraints (a reloaded constraint still rejects a violating INSERT).
 
 ### Phase D — Indexes & planner seeding
 

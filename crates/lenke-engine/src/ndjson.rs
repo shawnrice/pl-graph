@@ -63,6 +63,40 @@ pub fn to_ndjson(store: &Store) -> String {
     out
 }
 
+/// The store's SCHEMA as NDJSON — currently the unique constraints, one per line
+/// `{"schema":"unique","label":..,"keys":[..]}`. Sorted by (label, keys) for
+/// determinism. These lines lead a [`snapshot`] so they apply before the data.
+#[must_use]
+pub fn dump_schema(store: &Store) -> String {
+    let mut cs = store.unique_constraints();
+    cs.sort();
+    let mut out = String::new();
+    for (label, keys) in cs {
+        out.push_str("{\"schema\":\"unique\",\"label\":");
+        encode_string(&mut out, &label);
+        out.push_str(",\"keys\":");
+        encode_str_array(&mut out, &keys);
+        out.push_str("}\n");
+    }
+    out
+}
+
+/// A full snapshot: schema lines first, then the data (nodes + edges). Reloading
+/// with [`load_snapshot`] applies the schema before the data, so INSERT-time
+/// enforcement on the reloaded store matches the original.
+#[must_use]
+pub fn snapshot(store: &Store) -> String {
+    let mut out = dump_schema(store);
+    out.push_str(&to_ndjson(store));
+    out
+}
+
+/// Load a full snapshot (schema + data). Equivalent to [`from_ndjson`], which
+/// already recognizes schema lines; named for symmetry with [`snapshot`].
+pub fn load_snapshot(text: &str) -> Result<Store, String> {
+    from_ndjson(text)
+}
+
 /// Write a JSON object from `keys`, including only those a present value exists
 /// for (via `get`), in `keys` order.
 fn encode_object(out: &mut String, keys: &[String], get: impl Fn(&str) -> Option<Value>) {
@@ -149,6 +183,7 @@ pub fn from_ndjson(text: &str) -> Result<Store, String> {
     // Staged records: (file_id, labels, props) and (from, to, type, props).
     type NodeRec = (u32, Vec<String>, Vec<(String, Value)>);
     type EdgeRec = (u32, u32, String, Vec<(String, Value)>);
+    let mut constraints: Vec<(String, Vec<String>)> = Vec::new();
     let mut nodes: Vec<NodeRec> = Vec::new();
     let mut edges: Vec<EdgeRec> = Vec::new();
 
@@ -161,7 +196,15 @@ pub fn from_ndjson(text: &str) -> Result<Store, String> {
         let Json::Obj(fields) = parse_line(line).map_err(err)? else {
             return Err(err("expected a JSON object".into()));
         };
-        if let Some(id) = field(&fields, "id") {
+        if let Some(kind) = field(&fields, "schema") {
+            // Schema line (leads the snapshot). Only "unique" so far.
+            if json_string(kind).map_err(err)? != "unique" {
+                return Err(err("unknown schema kind".into()));
+            }
+            let label = json_string(req(&fields, "label").map_err(err)?).map_err(err)?;
+            let keys = json_str_array(req(&fields, "keys").map_err(err)?).map_err(err)?;
+            constraints.push((label, keys));
+        } else if let Some(id) = field(&fields, "id") {
             let file_id = json_u32(id).map_err(err)?;
             let labels = json_str_array(req(&fields, "labels").map_err(err)?).map_err(err)?;
             let props = json_props(req(&fields, "props").map_err(err)?).map_err(err)?;
@@ -173,11 +216,17 @@ pub fn from_ndjson(text: &str) -> Result<Store, String> {
             let props = json_props(req(&fields, "props").map_err(err)?).map_err(err)?;
             edges.push((from, to, etype, props));
         } else {
-            return Err(err("object has neither `id` nor `from`".into()));
+            return Err(err("object has no `schema`, `id`, or `from`".into()));
         }
     }
 
     let mut store = Store::default();
+    // Apply schema BEFORE data (the store is still empty, so declaration always
+    // succeeds) — so INSERT-time enforcement on the reloaded store matches.
+    for (label, keys) in &constraints {
+        let krefs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        store.create_unique_constraint(label, &krefs)?;
+    }
     let mut remap: HashMap<u32, u32> = HashMap::new();
     for (file_id, labels, props) in &nodes {
         let lrefs: Vec<&str> = labels.iter().map(String::as_str).collect();
@@ -584,6 +633,53 @@ mod tests {
     fn malformed_lines_error() {
         assert!(from_ndjson("{\"id\":0,\"labels\":[],\"props\":{}").is_err()); // missing }
         assert!(from_ndjson("not json").is_err());
-        assert!(from_ndjson("{\"nope\":1}").is_err()); // neither id nor from
+        assert!(from_ndjson("{\"nope\":1}").is_err()); // neither schema/id/from
+    }
+
+    // --- schema / snapshot (C3) ---
+
+    /// `dump_schema` emits one line per unique constraint, sorted by (label,keys).
+    #[test]
+    fn dump_schema_lines() {
+        let mut st = Builder::default().build();
+        st.create_unique_constraint("User", &["email"]).unwrap();
+        st.create_unique_constraint("Doc", &["id", "rev"]).unwrap();
+        let expected = "{\"schema\":\"unique\",\"label\":\"Doc\",\"keys\":[\"id\",\"rev\"]}\n\
+             {\"schema\":\"unique\",\"label\":\"User\",\"keys\":[\"email\"]}\n";
+        assert_eq!(super::dump_schema(&st), expected);
+    }
+
+    /// A snapshot is schema lines first, then the data.
+    #[test]
+    fn snapshot_is_schema_then_data() {
+        let mut st = Builder::default().build();
+        st.create_unique_constraint("P", &["k"]).unwrap();
+        st.add_node(&["P"], &[("k", n(1.0))]);
+        let expected = "{\"schema\":\"unique\",\"label\":\"P\",\"keys\":[\"k\"]}\n\
+             {\"id\":0,\"labels\":[\"P\"],\"props\":{\"k\":1}}\n";
+        assert_eq!(super::snapshot(&st), expected);
+    }
+
+    /// A full snapshot round-trips BOTH data and schema: reload is byte-identical,
+    /// and the reloaded constraint still rejects a violating INSERT.
+    #[test]
+    fn snapshot_round_trip_preserves_schema_and_data() {
+        use crate::exec::execute;
+        let mut st = Builder::default().build();
+        st.create_unique_constraint("User", &["email"]).unwrap();
+        let a = st.add_node(&["User"], &[("email", s("a@x")), ("name", s("A"))]);
+        let b = st.add_node(&["User"], &[("email", s("b@x"))]);
+        st.add_edge(a, b, "KNOWS");
+        let snap = super::snapshot(&st);
+
+        let mut st2 = super::load_snapshot(&snap).unwrap();
+        assert_eq!(super::snapshot(&st2), snap); // data + schema identical
+
+        // The constraint survived: a duplicate INSERT on the reloaded store errors.
+        let dup = crate::gql::parse("INSERT (:User {email: 'a@x'})").unwrap();
+        assert!(execute(&dup, &mut st2).is_err());
+        // …and a fresh email still inserts fine.
+        let ok = crate::gql::parse("INSERT (:User {email: 'c@x'})").unwrap();
+        assert!(execute(&ok, &mut st2).is_ok());
     }
 }

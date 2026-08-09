@@ -386,6 +386,13 @@ impl Store {
         ls
     }
 
+    /// The declared unique constraints as `(label, keys)` — for snapshot/schema
+    /// egress.
+    #[must_use]
+    pub fn unique_constraints(&self) -> Vec<(String, Vec<String>)> {
+        self.unique.clone()
+    }
+
     /// The interned edge-type id's name (the reverse of `etype_id`).
     #[must_use]
     pub fn etype_name(&self, etype: u32) -> Option<String> {
