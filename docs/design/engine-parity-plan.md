@@ -86,7 +86,11 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
       (`ndjson::to_ndjson`); one object per live node `{id,labels,props}` then per
       edge `{from,to,type,props}`; deterministic (nodes by id, keys sorted);
       NaN/Inf→null. Serializes only — value semantics stay in value.rs.
-- [ ] C2. NDJSON ingest.
+- [x] C2. NDJSON ingest (`ndjson::from_ndjson`): hand-rolled dependency-free JSON
+      parser; loads node then edge lines. Ids are NOT preserved — file ids may be
+      gapped (deletions), so nodes get fresh dense ids and edges are remapped.
+      Round-trip is exact for a gap-free dump, stable from the first reload
+      otherwise. Round-trip + hand-parse + remap + value-kinds + error tests.
 - [ ] C3. Schema/snapshot round-trip.
 
 ### Phase D — Indexes & planner seeding

@@ -12,6 +12,9 @@
 //! no JSON form and is written as `null`, consistent with the engine's
 //! NaN/Inf→null policy.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::store::Store;
 use crate::value::Value;
 
@@ -134,9 +137,299 @@ fn encode_string(out: &mut String, s: &str) {
     out.push('"');
 }
 
+/// Load a store from NDJSON in the [`to_ndjson`] format. Node lines
+/// (`{id,labels,props}`) come first, then edge lines (`{from,to,type,props}`).
+///
+/// The file's `id` values may have GAPS (a dump omits deleted nodes), so ids are
+/// NOT preserved: nodes are inserted in file order and get fresh dense ids, and
+/// edges are remapped through that file-id → new-id map. Consequently a dump of a
+/// graph with deletions re-densifies on load — round-trip is exact for a gap-free
+/// dump and STABLE from the first reload otherwise.
+pub fn from_ndjson(text: &str) -> Result<Store, String> {
+    // Staged records: (file_id, labels, props) and (from, to, type, props).
+    type NodeRec = (u32, Vec<String>, Vec<(String, Value)>);
+    type EdgeRec = (u32, u32, String, Vec<(String, Value)>);
+    let mut nodes: Vec<NodeRec> = Vec::new();
+    let mut edges: Vec<EdgeRec> = Vec::new();
+
+    for (lineno, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let err = |m: String| format!("line {}: {m}", lineno + 1);
+        let Json::Obj(fields) = parse_line(line).map_err(err)? else {
+            return Err(err("expected a JSON object".into()));
+        };
+        if let Some(id) = field(&fields, "id") {
+            let file_id = json_u32(id).map_err(err)?;
+            let labels = json_str_array(req(&fields, "labels").map_err(err)?).map_err(err)?;
+            let props = json_props(req(&fields, "props").map_err(err)?).map_err(err)?;
+            nodes.push((file_id, labels, props));
+        } else if field(&fields, "from").is_some() {
+            let from = json_u32(req(&fields, "from").map_err(err)?).map_err(err)?;
+            let to = json_u32(req(&fields, "to").map_err(err)?).map_err(err)?;
+            let etype = json_string(req(&fields, "type").map_err(err)?).map_err(err)?;
+            let props = json_props(req(&fields, "props").map_err(err)?).map_err(err)?;
+            edges.push((from, to, etype, props));
+        } else {
+            return Err(err("object has neither `id` nor `from`".into()));
+        }
+    }
+
+    let mut store = Store::default();
+    let mut remap: HashMap<u32, u32> = HashMap::new();
+    for (file_id, labels, props) in &nodes {
+        let lrefs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let prefs: Vec<(&str, Value)> =
+            props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        let new_id = store.add_node(&lrefs, &prefs);
+        remap.insert(*file_id, new_id);
+    }
+    for (from, to, etype, props) in &edges {
+        let f = *remap
+            .get(from)
+            .ok_or_else(|| format!("edge references unknown node id {from}"))?;
+        let t = *remap
+            .get(to)
+            .ok_or_else(|| format!("edge references unknown node id {to}"))?;
+        let eid = store.add_edge(f, t, etype);
+        for (k, v) in props {
+            store.set_edge_prop(eid, k, v.clone());
+        }
+    }
+    Ok(store)
+}
+
+// --- a tiny dependency-free JSON parser (one value per line) -----------------
+
+enum Json {
+    Null,
+    Bool(bool),
+    Num(f64),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>),
+}
+
+fn field<'a>(fields: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
+    fields.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+fn req<'a>(fields: &'a [(String, Json)], key: &str) -> Result<&'a Json, String> {
+    field(fields, key).ok_or_else(|| format!("missing field `{key}`"))
+}
+fn json_u32(j: &Json) -> Result<u32, String> {
+    match j {
+        Json::Num(n) if *n >= 0.0 && n.fract() == 0.0 => Ok(*n as u32),
+        _ => Err("expected a non-negative integer".into()),
+    }
+}
+fn json_string(j: &Json) -> Result<String, String> {
+    match j {
+        Json::Str(s) => Ok(s.clone()),
+        _ => Err("expected a string".into()),
+    }
+}
+fn json_str_array(j: &Json) -> Result<Vec<String>, String> {
+    match j {
+        Json::Arr(items) => items.iter().map(json_string).collect(),
+        _ => Err("expected an array of strings".into()),
+    }
+}
+fn json_props(j: &Json) -> Result<Vec<(String, Value)>, String> {
+    match j {
+        Json::Obj(fields) => fields
+            .iter()
+            .map(|(k, v)| Ok((k.clone(), json_value(v)?)))
+            .collect(),
+        _ => Err("expected an object".into()),
+    }
+}
+/// A JSON value as a property `Value`. There is no map type, so a nested object
+/// as a property value is rejected (the egress never emits one).
+fn json_value(j: &Json) -> Result<Value, String> {
+    Ok(match j {
+        Json::Null => Value::Null,
+        Json::Bool(b) => Value::Bool(*b),
+        Json::Num(x) => Value::Num(*x),
+        Json::Str(s) => Value::Str(Arc::from(s.as_str())),
+        Json::Arr(items) => Value::List(items.iter().map(json_value).collect::<Result<_, _>>()?),
+        Json::Obj(_) => return Err("an object is not a valid property value".into()),
+    })
+}
+
+/// Parse exactly one JSON value from `line` (trailing whitespace allowed).
+fn parse_line(line: &str) -> Result<Json, String> {
+    let mut p = JsonParser {
+        b: line.chars().collect(),
+        i: 0,
+    };
+    let v = p.value()?;
+    p.ws();
+    if p.i != p.b.len() {
+        return Err(format!("trailing input at char {}", p.i));
+    }
+    Ok(v)
+}
+
+struct JsonParser {
+    b: Vec<char>,
+    i: usize,
+}
+
+impl JsonParser {
+    fn ws(&mut self) {
+        while self.b.get(self.i).is_some_and(|c| c.is_whitespace()) {
+            self.i += 1;
+        }
+    }
+
+    fn value(&mut self) -> Result<Json, String> {
+        self.ws();
+        match self.b.get(self.i) {
+            Some('{') => self.object(),
+            Some('[') => self.array(),
+            Some('"') => Ok(Json::Str(self.string()?)),
+            Some('t') | Some('f') => self.boolean(),
+            Some('n') => self.keyword("null", Json::Null),
+            Some(c) if *c == '-' || c.is_ascii_digit() => self.number(),
+            other => Err(format!("unexpected {other:?} at char {}", self.i)),
+        }
+    }
+
+    fn object(&mut self) -> Result<Json, String> {
+        self.i += 1; // '{'
+        let mut out = Vec::new();
+        self.ws();
+        if self.b.get(self.i) == Some(&'}') {
+            self.i += 1;
+            return Ok(Json::Obj(out));
+        }
+        loop {
+            self.ws();
+            let key = self.string()?;
+            self.ws();
+            if self.b.get(self.i) != Some(&':') {
+                return Err(format!("expected ':' at char {}", self.i));
+            }
+            self.i += 1;
+            let val = self.value()?;
+            out.push((key, val));
+            self.ws();
+            match self.b.get(self.i) {
+                Some(',') => self.i += 1,
+                Some('}') => {
+                    self.i += 1;
+                    return Ok(Json::Obj(out));
+                }
+                _ => return Err(format!("expected ',' or '}}' at char {}", self.i)),
+            }
+        }
+    }
+
+    fn array(&mut self) -> Result<Json, String> {
+        self.i += 1; // '['
+        let mut out = Vec::new();
+        self.ws();
+        if self.b.get(self.i) == Some(&']') {
+            self.i += 1;
+            return Ok(Json::Arr(out));
+        }
+        loop {
+            out.push(self.value()?);
+            self.ws();
+            match self.b.get(self.i) {
+                Some(',') => self.i += 1,
+                Some(']') => {
+                    self.i += 1;
+                    return Ok(Json::Arr(out));
+                }
+                _ => return Err(format!("expected ',' or ']' at char {}", self.i)),
+            }
+        }
+    }
+
+    fn string(&mut self) -> Result<String, String> {
+        if self.b.get(self.i) != Some(&'"') {
+            return Err(format!("expected a string at char {}", self.i));
+        }
+        self.i += 1;
+        let mut s = String::new();
+        loop {
+            match self.b.get(self.i) {
+                None => return Err("unterminated string".into()),
+                Some('"') => {
+                    self.i += 1;
+                    return Ok(s);
+                }
+                Some('\\') => {
+                    self.i += 1;
+                    match self.b.get(self.i) {
+                        Some('"') => s.push('"'),
+                        Some('\\') => s.push('\\'),
+                        Some('/') => s.push('/'),
+                        Some('n') => s.push('\n'),
+                        Some('r') => s.push('\r'),
+                        Some('t') => s.push('\t'),
+                        Some('b') => s.push('\u{8}'),
+                        Some('f') => s.push('\u{c}'),
+                        Some('u') => {
+                            let hex: String =
+                                (1..=4).filter_map(|d| self.b.get(self.i + d)).collect();
+                            let cp = u32::from_str_radix(&hex, 16)
+                                .map_err(|_| "bad \\u escape".to_string())?;
+                            s.push(char::from_u32(cp).ok_or("bad code point")?);
+                            self.i += 4;
+                        }
+                        other => return Err(format!("bad escape {other:?}")),
+                    }
+                    self.i += 1;
+                }
+                Some(&c) => {
+                    s.push(c);
+                    self.i += 1;
+                }
+            }
+        }
+    }
+
+    fn number(&mut self) -> Result<Json, String> {
+        let start = self.i;
+        while self
+            .b
+            .get(self.i)
+            .is_some_and(|c| matches!(c, '0'..='9' | '-' | '+' | '.' | 'e' | 'E'))
+        {
+            self.i += 1;
+        }
+        let text: String = self.b[start..self.i].iter().collect();
+        text.parse::<f64>()
+            .map(Json::Num)
+            .map_err(|_| format!("bad number `{text}`"))
+    }
+
+    fn boolean(&mut self) -> Result<Json, String> {
+        if self.b.get(self.i) == Some(&'t') {
+            self.keyword("true", Json::Bool(true))
+        } else {
+            self.keyword("false", Json::Bool(false))
+        }
+    }
+
+    fn keyword(&mut self, word: &str, val: Json) -> Result<Json, String> {
+        for c in word.chars() {
+            if self.b.get(self.i) != Some(&c) {
+                return Err(format!("expected `{word}` at char {}", self.i));
+            }
+            self.i += 1;
+        }
+        Ok(val)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::to_ndjson;
+    use super::{from_ndjson, to_ndjson};
     use crate::store::Builder;
     use crate::value::Value;
     use std::sync::Arc;
@@ -212,5 +505,85 @@ mod tests {
     fn empty_store() {
         let st = Builder::default().build();
         assert_eq!(to_ndjson(&st), "");
+    }
+
+    // --- ingest / round-trip (C2) ---
+
+    /// dump → parse → dump is IDENTITY for a gap-free graph.
+    #[test]
+    fn round_trip_is_identity_gap_free() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[("name", s("a")), ("age", n(1.0))]);
+        let b = st.add_node(&["P", "Q"], &[("name", s("b"))]);
+        let e = st.add_edge(a, b, "R");
+        st.set_edge_prop(e, "weight", n(0.5));
+        let d1 = to_ndjson(&st);
+        let st2 = from_ndjson(&d1).unwrap();
+        assert_eq!(d1, to_ndjson(&st2));
+    }
+
+    /// Parsing a hand-written document reconstructs the graph exactly.
+    #[test]
+    fn parse_reconstructs_graph() {
+        let doc = "{\"id\":0,\"labels\":[\"P\"],\"props\":{\"age\":1,\"name\":\"a\"}}\n\
+                   {\"id\":1,\"labels\":[],\"props\":{}}\n\
+                   {\"from\":0,\"to\":1,\"type\":\"R\",\"props\":{\"weight\":0.5}}\n";
+        let st = from_ndjson(doc).unwrap();
+        assert_eq!(st.node_count(), 2);
+        assert_eq!(st.nodes_with_label("P"), &[0]);
+        assert!(matches!(st.prop(0, "name"), Value::Str(x) if &*x == "a"));
+        assert!(matches!(st.prop(0, "age"), Value::Num(x) if x == 1.0));
+        assert_eq!(st.out(0).len(), 1);
+        assert_eq!(st.out(0)[0].nbr, 1);
+        let eid = st.out(0)[0].eid;
+        assert!(matches!(st.edge_prop(eid, "weight"), Value::Num(x) if x == 0.5));
+    }
+
+    /// A dump with a deleted node has an id GAP; ingest remaps to dense ids
+    /// (edges follow the remap) and is stable from the first reload.
+    #[test]
+    fn gapped_ids_remap_and_stabilize() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[("name", s("a"))]);
+        let b = st.add_node(&["P"], &[("name", s("b"))]);
+        let c = st.add_node(&["P"], &[("name", s("c"))]);
+        st.add_edge(a, c, "R"); // 0 -> 2
+        st.delete_node(b); // gap at id 1
+        let d1 = to_ndjson(&st); // node ids 0 and 2
+        let st2 = from_ndjson(&d1).unwrap(); // remapped to 0, 1
+        assert_eq!(st2.node_count(), 2);
+        assert_eq!(st2.out(0).len(), 1);
+        assert!(matches!(st2.prop(st2.out(0)[0].nbr, "name"), Value::Str(x) if &*x == "c"));
+        // stable from here on
+        let d2 = to_ndjson(&st2);
+        let st3 = from_ndjson(&d2).unwrap();
+        assert_eq!(d2, to_ndjson(&st3));
+    }
+
+    /// Every value kind (escaped string, bool, null, list) round-trips.
+    #[test]
+    fn value_kinds_round_trip() {
+        let mut st = Builder::default().build();
+        st.add_node(
+            &[],
+            &[
+                ("q", s("a\"b\nc\ttab\\end")),
+                ("ok", Value::Bool(true)),
+                ("z", Value::Null),
+                ("xs", Value::List(vec![n(1.0), s("y"), Value::Bool(false)])),
+            ],
+        );
+        let d1 = to_ndjson(&st);
+        let st2 = from_ndjson(&d1).unwrap();
+        assert_eq!(d1, to_ndjson(&st2));
+        assert!(matches!(st2.prop(0, "q"), Value::Str(x) if &*x == "a\"b\nc\ttab\\end"));
+        assert!(matches!(st2.prop(0, "xs"), Value::List(v) if v.len() == 3));
+    }
+
+    #[test]
+    fn malformed_lines_error() {
+        assert!(from_ndjson("{\"id\":0,\"labels\":[],\"props\":{}").is_err()); // missing }
+        assert!(from_ndjson("not json").is_err());
+        assert!(from_ndjson("{\"nope\":1}").is_err()); // neither id nor from
     }
 }
