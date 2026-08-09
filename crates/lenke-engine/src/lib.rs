@@ -37,4 +37,5 @@ pub mod ir;
 pub mod ndjson;
 pub mod opt;
 pub mod store;
+pub mod temporal;
 pub mod value;

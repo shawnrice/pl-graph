@@ -19,18 +19,23 @@
 //!   front-end makes; `cmp_total` itself is total and never fails, because sorts
 //!   and grouping need a deterministic order over any mix.
 
+use crate::temporal::Temporal;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-/// A runtime value. The minimal set the first execution slice needs; temporal,
-/// list, and map/record join this enum as later slices land, and every addition
-/// gets its arm in the functions below — which is the point of one contract.
+/// A runtime value. Map/record values join this enum as later slices land, and
+/// every addition gets its arm in the functions below — which is the point of one
+/// contract.
 #[derive(Clone, Debug)]
 pub enum Value {
     Null,
     Bool(bool),
     Num(f64),
     Str(Arc<str>),
+    /// An ISO temporal value (`DATE`/`LOCAL TIME`/`LOCAL DATETIME`). Ordering and
+    /// equality delegate to [`Temporal`], keeping the rules there; this contract
+    /// only decides where temporals sit in the CROSS-type order (see `rank`).
+    Temporal(Temporal),
     /// An ordered list of values — e.g. a path (its node ids). Added with the
     /// lineage slice; every contract function below gains its arm.
     List(Vec<Value>),
@@ -56,9 +61,10 @@ impl Value {
             Self::Bool(_) => 0,
             Self::Num(_) => 1,
             Self::Str(_) => 2,
-            Self::List(_) => 3,
+            Self::Temporal(_) => 3,
+            Self::List(_) => 4,
             // Null sorts LAST — it is the greatest in the total order.
-            Self::Null => 4,
+            Self::Null => 5,
         }
     }
 }
@@ -75,6 +81,9 @@ pub fn equals(a: &Value, b: &Value) -> bool {
         // `==` on f64 is already NaN-unequal and treats -0.0 == 0.0.
         (Value::Num(x), Value::Num(y)) => x == y,
         (Value::Str(x), Value::Str(y)) => x == y,
+        // Same-kind temporals compare by their fields; cross-kind is false (a Date
+        // never equals a DateTime), which `Temporal`'s derived `==` already gives.
+        (Value::Temporal(x), Value::Temporal(y)) => x == y,
         // Lists are equal elementwise (same length, each pair equal). A NaN
         // element still makes the lists unequal, as `equals` does per element.
         (Value::List(x), Value::List(y)) => {
@@ -170,6 +179,7 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
                     .parse::<f64>()
                     .map_err(|_| format!("E_INVALID_VALUE: cannot cast string {s:?} to number"))?,
                 Value::List(_) => return bad("list", "number"),
+                Value::Temporal(_) => return bad("temporal", "number"),
                 Value::Null => unreachable!("null handled above"),
             };
             if target == CastTarget::Integer {
@@ -195,6 +205,8 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
                     }
                 }
                 Value::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
+                // A temporal casts to its ISO-8601 string.
+                Value::Temporal(t) => t.format(),
                 Value::List(_) => return bad("list", "string"),
                 Value::Null => unreachable!("null handled above"),
             }
@@ -210,6 +222,7 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
                 _ => bad(&format!("string {s:?}"), "boolean"),
             },
             Value::List(_) => bad("list", "boolean"),
+            Value::Temporal(_) => bad("temporal", "boolean"),
             Value::Null => unreachable!("null handled above"),
         },
     }
@@ -251,8 +264,20 @@ pub fn group_key_into(v: &Value, out: &mut Vec<u8>) {
             out.extend_from_slice(&(t.len() as u64).to_le_bytes());
             out.extend_from_slice(t.as_bytes());
         }
-        Value::List(items) => {
+        Value::Temporal(t) => {
             out.push(4);
+            // Two temporals group together iff they render identically AND are the
+            // same kind. The ISO string is canonical (equal temporals format the
+            // same); the kind tag keeps a Date and a Time that happen to render
+            // alike apart.
+            let iso = t.format();
+            out.extend_from_slice(t.tag().as_bytes());
+            out.push(0); // tag/value separator (tags are ascii, never contain NUL)
+            out.extend_from_slice(&(iso.len() as u64).to_le_bytes());
+            out.extend_from_slice(iso.as_bytes());
+        }
+        Value::List(items) => {
+            out.push(5);
             out.extend_from_slice(&(items.len() as u64).to_le_bytes());
             for it in items {
                 group_key_into(it, out);
@@ -272,6 +297,9 @@ pub fn cmp_total(a: &Value, b: &Value) -> Ordering {
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Num(x), Value::Num(y)) => cmp_num_total(*x, *y),
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        // Temporals order by kind then chronologically — the rule lives in
+        // `Temporal::cmp_total`; this only dispatches to it.
+        (Value::Temporal(x), Value::Temporal(y)) => x.cmp_total(y),
         // Lexicographic over elements; a shorter prefix sorts first.
         (Value::List(x), Value::List(y)) => x
             .iter()
@@ -445,6 +473,26 @@ mod tests {
             &b(false)
         ));
         assert!(cast(&s("yes"), CastTarget::Boolean).is_err());
+    }
+
+    #[test]
+    fn temporal_equality_and_order_in_the_contract() {
+        use crate::temporal::{Date, Temporal};
+        let d1 = Value::Temporal(Temporal::Date(Date::parse("2024-01-01").unwrap()));
+        let d1b = Value::Temporal(Temporal::Date(Date::parse("2024-01-01").unwrap()));
+        let d2 = Value::Temporal(Temporal::Date(Date::parse("2024-06-01").unwrap()));
+        // Same date is equal and groups together; different dates order chronologically.
+        assert!(equals(&d1, &d1b));
+        assert!(!equals(&d1, &d2));
+        assert_eq!(group_key(&d1), group_key(&d1b));
+        assert_ne!(group_key(&d1), group_key(&d2));
+        assert_eq!(cmp_total(&d1, &d2), Ordering::Less);
+        // A temporal never equals a string or a number (cross-type is false), and
+        // sits between Str and List/Null in the total order.
+        assert!(!equals(&d1, &s("2024-01-01")));
+        assert!(!equals(&d1, &n(0.0)));
+        assert_eq!(cmp_total(&s("z"), &d1), Ordering::Less); // Str(2) < Temporal(3)
+        assert_eq!(cmp_total(&d1, &Value::Null), Ordering::Less); // Temporal < Null(last)
     }
 
     #[test]

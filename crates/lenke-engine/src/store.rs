@@ -118,7 +118,9 @@ impl Column {
                 data: vec![false; n],
                 present: vec![false; n],
             },
-            Value::Null | Value::List(_) => Self::Gen {
+            // Temporals live in a Gen column for now; a typed Temporal column
+            // (de-boxed, per-kind) is a later slice.
+            Value::Null | Value::List(_) | Value::Temporal(_) => Self::Gen {
                 data: vec![Value::Null; n],
                 present: vec![false; n],
             },

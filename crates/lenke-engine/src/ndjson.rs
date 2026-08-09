@@ -139,6 +139,15 @@ fn encode_value(out: &mut String, v: &Value) {
             }
         }
         Value::Str(s) => encode_string(out, s),
+        // Tagged temporal: {"@date":"2024-01-15"} — the ISO string under a kind
+        // key, matching lenke-core's json_tagged form.
+        Value::Temporal(t) => {
+            out.push_str("{\"@");
+            out.push_str(t.tag());
+            out.push_str("\":");
+            encode_string(out, &t.format());
+            out.push('}');
+        }
         Value::List(items) => {
             out.push('[');
             for (i, it) in items.iter().enumerate() {

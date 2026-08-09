@@ -1302,6 +1302,18 @@ impl Parser {
                 if s.eq_ignore_ascii_case("exists") {
                     return self.exists_expr();
                 }
+                // Typed temporal literal `DATE '…'` / `TIME '…'` / `DATETIME '…'`:
+                // a temporal keyword directly followed by a string. (A bare `date`
+                // not followed by a string stays an ordinary variable/property.)
+                if let Some(tag) = temporal_tag(&s) {
+                    if let Some(Tok::Str(lit)) = self.peek() {
+                        let lit = lit.clone();
+                        self.pos += 1;
+                        let t = crate::temporal::Temporal::parse(tag, &lit)
+                            .map_err(|e| format!("invalid {s} literal: {e}"))?;
+                        return Ok(Expr::Lit(Value::Temporal(t)));
+                    }
+                }
                 // A scalar function call `name(args…)`. (Aggregates are handled in
                 // return_items, never reached here.)
                 if self.peek() == Some(&Tok::LParen) {
@@ -1538,6 +1550,17 @@ impl Parser {
         }
         default_name(e, idx)
     }
+}
+
+/// Map a temporal-literal keyword to its `Temporal` kind tag, or `None`. `TIME`
+/// and `DATETIME` are the LOCAL (zone-less) forms.
+fn temporal_tag(kw: &str) -> Option<&'static str> {
+    Some(match kw.to_ascii_uppercase().as_str() {
+        "DATE" => "date",
+        "TIME" => "localtime",
+        "DATETIME" => "datetime",
+        _ => return None,
+    })
 }
 
 /// Map a path-accessor function name to its `PathPart`, or `None` if it is not
@@ -2182,6 +2205,73 @@ mod tests {
         let err =
             super::parse("MATCH p = ANY SHORTEST (a)-[:LINK]->(b) RETURN a.name AS a").unwrap_err();
         assert!(err.contains("quantifier"), "got: {err}");
+    }
+
+    #[test]
+    fn temporal_literals_render_and_compare() {
+        let store = social();
+        // The three zone-less literals parse and round-trip to their ISO form.
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) RETURN DATE '2024-01-15' AS d, TIME '13:45:06' AS t, \
+                 DATETIME '2024-01-15T09:00:00' AS dt",
+            )
+            .unwrap(),
+            &store,
+        );
+        let iso = |v: &Value| match v {
+            Value::Temporal(t) => t.format(),
+            o => panic!("expected Temporal, got {o:?}"),
+        };
+        assert_eq!(iso(&col(&out, 0, "d")), "2024-01-15");
+        assert_eq!(iso(&col(&out, 0, "t")), "13:45:06");
+        assert_eq!(iso(&col(&out, 0, "dt")), "2024-01-15T09:00:00");
+
+        // Date ordering as a constant predicate: earlier < later keeps all rows,
+        // the reverse keeps none, and equality holds.
+        let count = |q: &str| run(&super::parse(q).unwrap(), &store).rows.len();
+        assert_eq!(
+            count("MATCH (p:Person) WHERE DATE '2024-01-01' < DATE '2024-06-01' RETURN p.name"),
+            3
+        );
+        assert_eq!(
+            count("MATCH (p:Person) WHERE DATE '2024-06-01' < DATE '2024-01-01' RETURN p.name"),
+            0
+        );
+        assert_eq!(
+            count("MATCH (p:Person) WHERE DATE '2024-01-01' = DATE '2024-01-01' RETURN p.name"),
+            3
+        );
+        // A malformed literal is a parse error.
+        assert!(super::parse("MATCH (p:Person) RETURN DATE '2024-13-01' AS d").is_err());
+    }
+
+    #[test]
+    fn stored_dates_round_trip_and_filter() {
+        let mut store = social();
+        // Store birthdates on two Persons, then find those born before 2000.
+        for (who, born) in [("alice", "1990-05-01"), ("bob", "2005-03-03")] {
+            let q = format!("MATCH (p:Person) WHERE p.name = '{who}' SET p.born = DATE '{born}'");
+            crate::exec::execute(&super::parse(&q).unwrap(), &mut store).unwrap();
+        }
+        // alice(1990) qualifies; bob(2005) does not; carol has no `born` (NULL,
+        // so the comparison is UNKNOWN and she is filtered out).
+        assert_eq!(
+            names(
+                &store,
+                "MATCH (p:Person) WHERE p.born < DATE '2000-01-01' RETURN p.name AS name"
+            ),
+            vec!["alice"]
+        );
+        // The stored date reads back as its ISO string.
+        let out = run(
+            &super::parse("MATCH (p:Person) WHERE p.name = 'alice' RETURN p.born AS born").unwrap(),
+            &store,
+        );
+        match &col(&out, 0, "born") {
+            Value::Temporal(t) => assert_eq!(t.format(), "1990-05-01"),
+            o => panic!("expected Temporal, got {o:?}"),
+        }
     }
 
     #[test]
