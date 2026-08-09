@@ -1701,29 +1701,17 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
             Col::Gen(out)
         }
         Expr::Call { name, args } => {
+            // Evaluate each argument to a column, then dispatch per row. Arity is
+            // validated at parse time, so `call_scalar` can index its args.
             let cols: Vec<Col> = args.iter().map(|a| eval(a, store, batch)).collect();
             let n = cols.iter().map(Col::len).min().unwrap_or(0);
-            if name == "coalesce" {
-                // First non-null argument per row, else NULL.
-                Col::Gen(
-                    (0..n)
-                        .map(|i| {
-                            cols.iter()
-                                .map(|c| c.value_at(i))
-                                .find(|v| !v.is_null())
-                                .unwrap_or(Value::Null)
-                        })
-                        .collect(),
-                )
-            } else {
-                // Unary numeric function (arity enforced at parse time).
-                let c = &cols[0];
-                Col::Gen(
-                    (0..n)
-                        .map(|i| scalar_num_fn(name, &c.value_at(i)))
-                        .collect(),
-                )
-            }
+            let out: Vec<Value> = (0..n)
+                .map(|i| {
+                    let row: Vec<Value> = cols.iter().map(|c| c.value_at(i)).collect();
+                    call_scalar(name, &row)
+                })
+                .collect();
+            Col::Gen(out)
         }
         Expr::Case {
             branches,
@@ -1753,6 +1741,82 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
             Col::Gen(out)
         }
     }
+}
+
+/// Dispatch a scalar function over its already-evaluated argument row. Arity is
+/// enforced by the parser, so indexing `args` here is safe. NULL / wrong-type
+/// arguments yield NULL (no coercion, no throw).
+fn call_scalar(name: &str, args: &[Value]) -> Value {
+    match name {
+        // variadic
+        "coalesce" => args
+            .iter()
+            .find(|v| !v.is_null())
+            .cloned()
+            .unwrap_or(Value::Null),
+        // numeric (1 arg)
+        "abs" | "sign" | "floor" | "ceil" | "round" | "sqrt" => scalar_num_fn(name, &args[0]),
+        // string (1 arg → string/number)
+        "upper" => str_map(&args[0], str::to_uppercase),
+        "lower" => str_map(&args[0], str::to_lowercase),
+        "trim" => str_map(&args[0], |s| s.trim().to_string()),
+        "length" => match &args[0] {
+            Value::Str(s) => Value::Num(s.chars().count() as f64),
+            _ => Value::Null,
+        },
+        // string predicates (2 args → bool)
+        "starts_with" => str_bool(&args[0], &args[1], |s, sub| s.starts_with(sub)),
+        "ends_with" => str_bool(&args[0], &args[1], |s, sub| s.ends_with(sub)),
+        "contains" => str_bool(&args[0], &args[1], |s, sub| s.contains(sub)),
+        // replace(s, from, to) (3 args → string)
+        "replace" => match (&args[0], &args[1], &args[2]) {
+            (Value::Str(s), Value::Str(f), Value::Str(t)) => {
+                Value::Str(s.replace(f.as_ref(), t).into())
+            }
+            _ => Value::Null,
+        },
+        // substring(s, start[, len]) — 0-based, char-indexed
+        "substring" => substring(args),
+        _ => Value::Null, // parser rejects unknown names; defensive
+    }
+}
+
+/// Map a string value through `f`; NULL/non-string yields NULL.
+fn str_map(v: &Value, f: impl Fn(&str) -> String) -> Value {
+    match v {
+        Value::Str(s) => Value::Str(f(s).into()),
+        _ => Value::Null,
+    }
+}
+
+/// A two-string predicate; NULL/non-string operand yields NULL.
+fn str_bool(a: &Value, b: &Value, f: impl Fn(&str, &str) -> bool) -> Value {
+    match (a, b) {
+        (Value::Str(s), Value::Str(sub)) => Value::Bool(f(s, sub)),
+        _ => Value::Null,
+    }
+}
+
+/// `substring(s, start[, len])` — 0-based, Unicode-char indexed. `start` clamps to
+/// `[0, len]`; a negative `start`/`len`, or a NULL/non-string/non-numeric arg,
+/// yields NULL. Omitted `len` runs to the end.
+fn substring(args: &[Value]) -> Value {
+    let (Value::Str(s), Some(start)) = (&args[0], value::as_num(&args[1])) else {
+        return Value::Null;
+    };
+    if start < 0.0 || start.fract() != 0.0 {
+        return Value::Null;
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let begin = (start as usize).min(chars.len());
+    let end = match args.get(2) {
+        None => chars.len(),
+        Some(lv) => match value::as_num(lv) {
+            Some(l) if l >= 0.0 && l.fract() == 0.0 => (begin + l as usize).min(chars.len()),
+            _ => return Value::Null,
+        },
+    };
+    Value::Str(chars[begin..end].iter().collect::<String>().into())
 }
 
 /// Apply a unary numeric scalar function. Finite-or-null: a NULL / non-numeric /

@@ -1076,18 +1076,24 @@ impl Parser {
         }
         self.expect(&Tok::RParen)?;
         let lname = name.to_ascii_lowercase();
-        match lname.as_str() {
-            "abs" | "sign" | "floor" | "ceil" | "round" | "sqrt" => {
-                if args.len() != 1 {
-                    return Err(format!("{lname}() takes exactly one argument"));
-                }
-            }
-            "coalesce" => {
-                if args.is_empty() {
-                    return Err("coalesce() takes at least one argument".into());
-                }
-            }
+        let arity_ok = match lname.as_str() {
+            // 1 arg
+            "abs" | "sign" | "floor" | "ceil" | "round" | "sqrt" | "upper" | "lower" | "trim"
+            | "length" => args.len() == 1,
+            // 2 args
+            "starts_with" | "ends_with" | "contains" => args.len() == 2,
+            // 3 args
+            "replace" => args.len() == 3,
+            // 2 or 3 args
+            "substring" => args.len() == 2 || args.len() == 3,
+            // variadic (≥1)
+            "coalesce" => !args.is_empty(),
             _ => return Err(format!("unknown function `{name}`")),
+        };
+        if !arity_ok {
+            return Err(format!(
+                "{lname}() called with the wrong number of arguments"
+            ));
         }
         Ok(Expr::Call { name: lname, args })
     }
@@ -1839,6 +1845,87 @@ mod tests {
         assert!(
             super::parse("MATCH (p:Person) RETURN CASE WHEN p.age >= 30 THEN 'x' AS y").is_err()
         ); // no END
+    }
+
+    // --- part 3.8: string functions (E4a) ---
+
+    /// upper/lower/trim/length/substring/replace on alice's name — hand-computed.
+    #[test]
+    fn string_functions() {
+        let store = social();
+        let q = "MATCH (p:Person) WHERE p.name = 'alice' RETURN \
+                 upper(p.name) AS u, length(p.name) AS l, substring(p.name, 1, 3) AS sub, \
+                 replace(p.name, 'a', 'A') AS rep";
+        let out = run(&super::parse(q).unwrap(), &store);
+        assert!(matches!(col(&out, 0, "u"), Value::Str(x) if &*x == "ALICE"));
+        assert_eq!(num(&col(&out, 0, "l")), 5.0); // "alice"
+        assert!(matches!(col(&out, 0, "sub"), Value::Str(x) if &*x == "lic")); // 0-based [1,4)
+        assert!(matches!(col(&out, 0, "rep"), Value::Str(x) if &*x == "Alice"));
+    }
+
+    /// String predicates return Bool; a non-string / null argument yields NULL.
+    #[test]
+    fn string_predicates_and_null() {
+        let store = social();
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) WHERE p.name='alice' \
+                 RETURN starts_with(p.name,'al') AS s, contains(p.name,'zz') AS c, upper(p.age) AS bad",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert!(matches!(col(&out, 0, "s"), Value::Bool(true)));
+        assert!(matches!(col(&out, 0, "c"), Value::Bool(false)));
+        assert!(col(&out, 0, "bad").is_null()); // upper of a number → NULL
+    }
+
+    /// substring past the end clamps; a negative index is NULL.
+    #[test]
+    fn substring_edges() {
+        let store = social();
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) WHERE p.name='alice' \
+                 RETURN substring(p.name, 3) AS tail, substring(p.name, 10) AS past",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert!(matches!(col(&out, 0, "tail"), Value::Str(x) if &*x == "ce")); // from idx 3
+        assert!(matches!(col(&out, 0, "past"), Value::Str(x) if x.is_empty())); // clamped
+        assert!(
+            super::parse("MATCH (p:Person) RETURN substring(p.name, -1) AS x")
+                .map(|pl| run(&pl, &store).rows[0][0].is_null())
+                .unwrap_or(false)
+        ); // negative start → NULL (parses; evals null)
+    }
+
+    /// Parsed `upper(p.name)` matches the hand-built Call.
+    #[test]
+    fn string_fn_parse_matches_hand() {
+        use crate::ir::{Expr, Plan};
+        let store = social();
+        let hand = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .project(vec![(
+            "u".into(),
+            Expr::Call {
+                name: "upper".into(),
+                args: vec![Expr::Prop {
+                    slot: 0,
+                    key: "name".into(),
+                }],
+            },
+        )]);
+        assert_same("MATCH (p:Person) RETURN upper(p.name) AS u", &hand, &store);
+    }
+
+    #[test]
+    fn string_fn_arity_errors() {
+        assert!(super::parse("MATCH (p:Person) RETURN upper(p.name, 1) AS x").is_err());
+        assert!(super::parse("MATCH (p:Person) RETURN replace(p.name, 'a') AS x").is_err());
     }
 
     // --- part 4: INSERT (write statements) ---

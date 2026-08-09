@@ -147,9 +147,15 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
 - [x] E3. `CASE` / conditional: IR `Expr::Case{branches, otherwise}` + eval (first
       branch whose condition is literally TRUE — three-valued, FALSE/NULL skip —
       else ELSE, else NULL) + GQL searched form `CASE (WHEN e THEN e)+ [ELSE e]
-      END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
+    END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       match. Simple form `CASE x WHEN v …` deferred (would desugar to `x = v`).
-- [ ] E4. String & list functions.
+- E4. String & list functions, split:
+  - [x] E4a. String functions over `Expr::Call`: upper/lower/trim, length (char
+        count), substring(s,start[,len]) (0-based, char-indexed, clamped),
+        replace, starts_with/ends_with/contains (→ Bool). NULL/wrong-type → NULL;
+        eval unified into `call_scalar`. Arity validated at parse.
+  - [ ] E4b. List functions + list literal `[a,b,…]` (needs a new `Expr::List`
+        node, evaluated per row): size/head/last.
 - [ ] E5. `CAST` + cross-type coercion semantics.
 - [ ] E6. 3VL completeness: `IS NULL`, property-exists, `AND`/`OR`/`NOT` gaps.
 
