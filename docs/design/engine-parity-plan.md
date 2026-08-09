@@ -309,8 +309,21 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       `Value::Map` keyed by the labels (via a new `Expr::MapLit`, Gremlin-only);
       a single-label select still projects the element, an unknown label errors.
       1 test (ordered map of node ids). order(local) → F5d.
-- [ ] F5d. Gremlin `order(local)` (within-list/map sort) — needs list-sort ops.
-- [ ] G3. Numeric edge-case parity audit against `value.rs`.
+- [~] F5d. Gremlin `order(local)` (within-list/map sort) — DEFERRED: no Gremlin
+      step yet PRODUCES a per-row list/map to sort (no `fold`/`aggregate(local)`;
+      multi-select yields a Map, groupCount yields rows). `order(local)` would have
+      nothing to operate on, so it waits on a list-producing step (a future `fold`).
+      Not a blocker for parity of the currently-expressible surface.
+- [x] G3. Numeric edge-case parity audit against `value.rs`: confirmed agreement
+      with lenke-core on the f64 model — `as_num` is finite-Num-only (NaN/Inf →
+      None → arithmetic NULL), `-0.0 == 0.0`, NaN unequal under `equals` but
+      greatest-and-self-equal under `cmp_total`, `num_group_bits` canonicalizes all
+      NaN payloads and signed zero, div/mod-by-zero and overflow → NULL. 4 tests
+      (as_num gate, NaN-payload/signed-zero grouping, non-finite arithmetic → NULL,
+      cross-type ordering). ONE recorded divergence (for J1): cross-type ORDERING
+      is a single deterministic total order here (rank-based, never faults),
+      whereas lenke-core's GQL raises E_INVALID_VALUE — a deliberate choice so
+      sort/group/min-max stay total; equality already agrees (cross-type false).
 - [ ] G4. Interval/temporal edge index (relocated from D3; needs G1): RI-tree-style
       as-of/overlap seek over temporal edge bounds.
 - [ ] G5. Edge-type index (relocated from D3): adjacency grouped by edge type for

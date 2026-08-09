@@ -3013,6 +3013,23 @@ mod tests {
         assert!(run(&plan, &store).rows[0][0].is_null());
     }
 
+    /// Every non-finite arithmetic RESULT collapses to NULL (the NaN/Inf policy):
+    /// modulo-by-zero (NaN), and a product that overflows f64 to Inf.
+    #[test]
+    fn arith_nonfinite_results_are_null() {
+        use crate::ir::ArithOp::{Mul, Rem};
+        let store = social();
+        let one = scan("Person").filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("alice"))));
+        // age % 0 → NaN → NULL
+        let m = one
+            .clone()
+            .project(vec![("x".into(), arith(Rem, prop(0, "age"), lit(n(0.0))))]);
+        assert!(run(&m, &store).rows[0][0].is_null());
+        // 1e308 * 1e308 → +Inf → NULL
+        let big = one.project(vec![("x".into(), arith(Mul, lit(n(1e308)), lit(n(1e308))))]);
+        assert!(run(&big, &store).rows[0][0].is_null());
+    }
+
     // --- Property index + IndexSeek (D1a) ---
 
     /// A store with two labels sharing an `age` property (some age 30).

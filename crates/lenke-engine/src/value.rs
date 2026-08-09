@@ -458,6 +458,48 @@ mod tests {
     }
 
     #[test]
+    fn as_num_is_a_finite_num_only() {
+        // The arithmetic gate: only a FINITE `Num` yields a number; NaN/Inf and any
+        // non-numeric value are `None`, so arithmetic on them produces NULL.
+        assert_eq!(as_num(&n(1.5)), Some(1.5));
+        assert_eq!(as_num(&n(0.0)), Some(0.0));
+        assert_eq!(as_num(&n(-0.0)), Some(-0.0));
+        assert_eq!(as_num(&n(f64::NAN)), None);
+        assert_eq!(as_num(&n(f64::INFINITY)), None);
+        assert_eq!(as_num(&n(f64::NEG_INFINITY)), None);
+        assert_eq!(as_num(&s("1")), None);
+        assert_eq!(as_num(&Value::Bool(true)), None);
+        assert_eq!(as_num(&Value::Null), None);
+    }
+
+    #[test]
+    fn num_group_bits_canonicalize_nan_and_signed_zero() {
+        // Every NaN — whatever the bit payload (quiet, signalling, sign) — groups
+        // the same; -0.0 folds to +0.0; distinct finite numbers stay distinct.
+        let quiet = f64::NAN;
+        let signalling = f64::from_bits(0x7ff0_0000_0000_0001);
+        let neg_nan = f64::from_bits(0xfff8_0000_0000_0000);
+        assert!(quiet.is_nan() && signalling.is_nan() && neg_nan.is_nan());
+        assert_eq!(num_group_bits(quiet), num_group_bits(signalling));
+        assert_eq!(num_group_bits(quiet), num_group_bits(neg_nan));
+        assert_eq!(num_group_bits(0.0), num_group_bits(-0.0));
+        assert_ne!(num_group_bits(1.0), num_group_bits(2.0));
+    }
+
+    #[test]
+    fn cross_type_ordering_is_total_never_a_throw() {
+        // DIVERGENCE (recorded for J1): lenke-engine's `cmp_total` is a single
+        // deterministic total order over ANY pair — cross-type orders by rank and
+        // never faults — whereas lenke-core's GQL ordering raises E_INVALID_VALUE
+        // on incompatible types. Chosen so sort/group/min-max are total here.
+        assert_eq!(cmp_total(&n(1.0), &s("a")), Ordering::Less); // Num(1) < Str(2)
+        assert_eq!(cmp_total(&Value::Bool(true), &n(0.0)), Ordering::Less); // Bool(0) < Num(1)
+        assert_eq!(cmp_total(&s("z"), &Value::Null), Ordering::Less); // Str(2) < Null(last)
+                                                                      // …and it is a strict total order: antisymmetric on the same pair.
+        assert_eq!(cmp_total(&s("a"), &n(1.0)), Ordering::Greater);
+    }
+
+    #[test]
     fn group_key_is_the_inverse_of_equals_on_nan_and_zero() {
         // Grouping is the OPPOSITE of predicate equality on exactly these cases:
         // two NaNs share a group though NaN != NaN; -0 and 0 share a group.
