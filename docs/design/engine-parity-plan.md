@@ -273,7 +273,18 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       when either operand is temporal; numeric path unchanged); all rules in the
       temporal module. 2 tests (month-clamp leap/non-leap, span, dur sum/scale,
       overflow throw).
-- [ ] G2. Map/record values (storage, dotted-path, construction, access).
+- [x] G2a. Record values (the ISO GQL `<record>`): `Value::Record` (sorted
+      string keys, Arc-boxed, canonicalized via `value::make_record` — last-wins
+      dedup) with all value.rs contract arms (equals/cmp_total/group_key,
+      cross-type rank List<Record<Null, cast→error). GQL `{k: expr, …}` literal
+      (`Expr::Record`) and field access `r.k` (extended `read_property` for record
+      columns; absent field→NULL). NDJSON encode/decode (JSON object ↔ record,
+      round-trips). Stored in Gen columns. 3 tests (contract, literal+field+hand
+      plan, NDJSON round trip).
+- [ ] G2b. Record/map follow-ups: dotted-path property index (`{k:$x}` seek into
+      a record field), `{lit}.field` direct field access (Expr::Field), and the
+      Gremlin `Value::Map` (any-key, insertion-ordered) — which then unblocks F5c
+      (multi-label select).
 - [ ] F5c. Gremlin multi-label select('a','b') (a Map value — needs G2) and
       order(local) (within-list sort — needs list ops). Relocated from F5b; placed
       after G2 because it depends on the map/list value model.

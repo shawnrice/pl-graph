@@ -409,6 +409,7 @@ fn needs_lineage(plan: &Plan) -> bool {
                 left: a, right: b, ..
             } => reads_path(a) || reads_path(b),
             Expr::Call { args, .. } | Expr::List { items: args } => args.iter().any(reads_path),
+            Expr::Record { fields } => fields.iter().any(|(_, e)| reads_path(e)),
             Expr::Case {
                 branches,
                 otherwise,
@@ -1364,6 +1365,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         Expr::Call { args, .. } | Expr::List { items: args } => {
             args.iter().all(|a| refs_only_slot(a, s))
         }
+        Expr::Record { fields } => fields.iter().all(|(_, e)| refs_only_slot(e, s)),
         Expr::Case {
             branches,
             otherwise,
@@ -1416,6 +1418,12 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         },
         Expr::List { items } => Expr::List {
             items: items.iter().map(|a| remap_slot(a, from, to)).collect(),
+        },
+        Expr::Record { fields } => Expr::Record {
+            fields: fields
+                .iter()
+                .map(|(k, e)| (k.clone(), remap_slot(e, from, to)))
+                .collect(),
         },
         Expr::Case {
             branches,
@@ -1941,6 +1949,24 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                     .collect(),
             )
         }
+        Expr::Record { fields } => {
+            // Per row, evaluate each field then canonicalize into a Value::Record
+            // (keys sorted, last-wins) via the value contract.
+            let cols = eval_all(fields.iter().map(|(_, e)| e), store, batch)?;
+            let n = batch.rows();
+            Col::Gen(
+                (0..n)
+                    .map(|i| {
+                        let pairs = fields
+                            .iter()
+                            .zip(&cols)
+                            .map(|((k, _), c)| (Arc::from(k.as_str()), c.value_at(i)))
+                            .collect();
+                        value::make_record(pairs)
+                    })
+                    .collect(),
+            )
+        }
         Expr::Case {
             branches,
             otherwise,
@@ -2455,7 +2481,16 @@ fn read_property(store: &Store, col: &Col, key: &str) -> Col {
         return Col::Gen(eids.iter().map(|&e| store.edge_prop(e, key)).collect());
     }
     let Col::Nodes(ids) = col else {
-        return Col::Gen(vec![Value::Null; col.len()]);
+        // A non-element column (e.g. a projected Record): `x.key` reads the record
+        // field; anything else has no property and reads NULL.
+        return Col::Gen(
+            (0..col.len())
+                .map(|i| match col.value_at(i) {
+                    Value::Record(fields) => value::record_field(&fields, key),
+                    _ => Value::Null,
+                })
+                .collect(),
+        );
     };
     let Some(column) = store.column(key) else {
         return Col::Gen(vec![Value::Null; ids.len()]);

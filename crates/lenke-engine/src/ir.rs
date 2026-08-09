@@ -69,6 +69,13 @@ pub enum Expr {
     List {
         items: Vec<Expr>,
     },
+    /// A record literal `{k: expr, …}` (ISO `<record>`). Per row it evaluates each
+    /// field to a `Value::Record` (keys sorted, duplicates last-wins — see
+    /// `value::make_record`). Field values are expressions, so `{a: p.age}` is not
+    /// a constant.
+    Record {
+        fields: Vec<(String, Expr)>,
+    },
     /// `CAST(<expr> AS <TYPE>)`. The coercion itself lives in `value::cast` (the
     /// single home for the conversion table); a failed conversion throws
     /// `E_INVALID_VALUE` (the read pipeline is fallible — see `exec::try_run`),

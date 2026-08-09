@@ -39,6 +39,37 @@ pub enum Value {
     /// An ordered list of values — e.g. a path (its node ids). Added with the
     /// lineage slice; every contract function below gains its arm.
     List(Vec<Value>),
+    /// An ISO `<record>`: string field names, **kept sorted** so equality is a
+    /// pairwise slice compare and the wire form is canonical. `Arc`-boxed so a
+    /// per-row binding clone is a refcount bump. Build via [`make_record`], which
+    /// sorts and de-duplicates keys (last write wins).
+    Record(Arc<[(Arc<str>, Value)]>),
+}
+
+/// Build a [`Value::Record`] from `pairs`: duplicate keys collapse (last write
+/// wins) and the fields are sorted by key, so two records with the same contents
+/// are byte-identical and equality is a slice compare. The ONE place a record is
+/// canonicalized.
+#[must_use]
+pub fn make_record(pairs: Vec<(Arc<str>, Value)>) -> Value {
+    let mut out: Vec<(Arc<str>, Value)> = Vec::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        if let Some(slot) = out.iter_mut().find(|(ek, _)| *ek == k) {
+            slot.1 = v; // last write wins
+        } else {
+            out.push((k, v));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Value::Record(out.into())
+}
+
+/// Look up `key` in a record's sorted fields; `Null` when absent.
+#[must_use]
+pub fn record_field(fields: &[(Arc<str>, Value)], key: &str) -> Value {
+    fields
+        .binary_search_by(|(k, _)| k.as_ref().cmp(key))
+        .map_or(Value::Null, |i| fields[i].1.clone())
 }
 
 impl Value {
@@ -63,8 +94,9 @@ impl Value {
             Self::Str(_) => 2,
             Self::Temporal(_) => 3,
             Self::List(_) => 4,
+            Self::Record(_) => 5,
             // Null sorts LAST — it is the greatest in the total order.
-            Self::Null => 5,
+            Self::Null => 6,
         }
     }
 }
@@ -88,6 +120,14 @@ pub fn equals(a: &Value, b: &Value) -> bool {
         // element still makes the lists unequal, as `equals` does per element.
         (Value::List(x), Value::List(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| equals(p, q))
+        }
+        // Records are equal iff the same sorted (key, value) fields — keys by
+        // string equality, values recursively. A NaN value makes them unequal.
+        (Value::Record(x), Value::Record(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|((k1, v1), (k2, v2))| k1 == k2 && equals(v1, v2))
         }
         _ => false,
     }
@@ -180,6 +220,7 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
                     .map_err(|_| format!("E_INVALID_VALUE: cannot cast string {s:?} to number"))?,
                 Value::List(_) => return bad("list", "number"),
                 Value::Temporal(_) => return bad("temporal", "number"),
+                Value::Record(_) => return bad("record", "number"),
                 Value::Null => unreachable!("null handled above"),
             };
             if target == CastTarget::Integer {
@@ -208,6 +249,7 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
                 // A temporal casts to its ISO-8601 string.
                 Value::Temporal(t) => t.format(),
                 Value::List(_) => return bad("list", "string"),
+                Value::Record(_) => return bad("record", "string"),
                 Value::Null => unreachable!("null handled above"),
             }
             .as_str(),
@@ -223,6 +265,7 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
             },
             Value::List(_) => bad("list", "boolean"),
             Value::Temporal(_) => bad("temporal", "boolean"),
+            Value::Record(_) => bad("record", "boolean"),
             Value::Null => unreachable!("null handled above"),
         },
     }
@@ -283,6 +326,17 @@ pub fn group_key_into(v: &Value, out: &mut Vec<u8>) {
                 group_key_into(it, out);
             }
         }
+        Value::Record(fields) => {
+            // Keys are sorted (canonical), so the byte key is stable: field count,
+            // then each (length-prefixed key, value key).
+            out.push(6);
+            out.extend_from_slice(&(fields.len() as u64).to_le_bytes());
+            for (k, v) in fields.iter() {
+                out.extend_from_slice(&(k.len() as u64).to_le_bytes());
+                out.extend_from_slice(k.as_bytes());
+                group_key_into(v, out);
+            }
+        }
     }
 }
 
@@ -305,6 +359,14 @@ pub fn cmp_total(a: &Value, b: &Value) -> Ordering {
             .iter()
             .zip(y)
             .map(|(p, q)| cmp_total(p, q))
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or_else(|| x.len().cmp(&y.len())),
+        // Records: lexicographic over sorted (key, then value) pairs; a shorter
+        // record sorts first. Deterministic total order for ORDER BY / grouping.
+        (Value::Record(x), Value::Record(y)) => x
+            .iter()
+            .zip(y.iter())
+            .map(|((k1, v1), (k2, v2))| k1.cmp(k2).then_with(|| cmp_total(v1, v2)))
             .find(|o| *o != Ordering::Equal)
             .unwrap_or_else(|| x.len().cmp(&y.len())),
         _ => a.rank().cmp(&b.rank()),
@@ -493,6 +555,38 @@ mod tests {
         assert!(!equals(&d1, &n(0.0)));
         assert_eq!(cmp_total(&s("z"), &d1), Ordering::Less); // Str(2) < Temporal(3)
         assert_eq!(cmp_total(&d1, &Value::Null), Ordering::Less); // Temporal < Null(last)
+    }
+
+    #[test]
+    fn record_canonicalizes_and_compares_by_contents() {
+        // make_record sorts keys and collapses duplicates (last write wins).
+        let r1 = make_record(vec![(Arc::from("b"), n(2.0)), (Arc::from("a"), n(1.0))]);
+        let Value::Record(f) = &r1 else {
+            panic!("not a record")
+        };
+        assert_eq!(f[0].0.as_ref(), "a");
+        assert_eq!(f[1].0.as_ref(), "b");
+        let dedup = make_record(vec![(Arc::from("k"), n(1.0)), (Arc::from("k"), n(2.0))]);
+        let Value::Record(g) = &dedup else {
+            panic!("not a record")
+        };
+        assert_eq!(g.len(), 1);
+        assert!(equals(&g[0].1, &n(2.0))); // last wins
+
+        // Equality / grouping are independent of insertion order (both canonical).
+        let r2 = make_record(vec![(Arc::from("a"), n(1.0)), (Arc::from("b"), n(2.0))]);
+        assert!(equals(&r1, &r2));
+        assert_eq!(group_key(&r1), group_key(&r2));
+        // A different value → not equal, different group.
+        let r3 = make_record(vec![(Arc::from("a"), n(9.0)), (Arc::from("b"), n(2.0))]);
+        assert!(!equals(&r1, &r3));
+        assert_ne!(group_key(&r1), group_key(&r3));
+
+        // Field lookup, and cross-type rank (List < Record < Null).
+        assert!(equals(&record_field(f, "a"), &n(1.0)));
+        assert!(record_field(f, "missing").is_null());
+        assert_eq!(cmp_total(&Value::List(vec![]), &r1), Ordering::Less);
+        assert_eq!(cmp_total(&r1, &Value::Null), Ordering::Less);
     }
 
     #[test]

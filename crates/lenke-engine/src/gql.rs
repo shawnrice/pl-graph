@@ -1263,6 +1263,25 @@ impl Parser {
                 self.expect(&Tok::RBracket)?;
                 Ok(Expr::List { items })
             }
+            Some(Tok::LBrace) => {
+                // A record literal `{k: expr, …}` (empty `{}` allowed). In
+                // expression position `{` always starts a record — inline node
+                // props `(a {k: v})` are handled by the pattern parser, not here.
+                self.pos += 1;
+                let mut fields = Vec::new();
+                if self.peek() != Some(&Tok::RBrace) {
+                    loop {
+                        let key = self.ident()?;
+                        self.expect(&Tok::Colon)?;
+                        fields.push((key, self.expr()?));
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Tok::RBrace)?;
+                Ok(Expr::Record { fields })
+            }
             Some(Tok::Num(n)) => {
                 self.pos += 1;
                 Ok(Expr::Lit(Value::Num(n)))
@@ -2432,6 +2451,59 @@ mod tests {
                 .unwrap();
         let err = crate::exec::try_run(&plan, &store).unwrap_err();
         assert!(err.contains("E_INVALID_VALUE"), "got: {err}");
+    }
+
+    #[test]
+    fn record_literal_and_field_access() {
+        use crate::ir::{CompareOp, Expr, Plan};
+        let store = social();
+        // Build a record from a matched node, carry it through WITH, read fields.
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) WHERE p.name = 'alice' \
+                 WITH {name: p.name, age: p.age} AS r RETURN r.name AS n, r.age AS a, \
+                 r.missing AS m",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert_eq!(out.rows.len(), 1);
+        assert!(crate::value::equals(&col(&out, 0, "n"), &s("alice")));
+        assert_eq!(num(&col(&out, 0, "a")), 30.0);
+        assert!(col(&out, 0, "m").is_null()); // absent field → NULL
+
+        // A returned record has its keys sorted (canonical), whatever the literal
+        // order; cross-checked against the hand-built Record plan.
+        let hand = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .filter(Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Expr::Prop {
+                slot: 0,
+                key: "name".into(),
+            }),
+            right: Box::new(Expr::Lit(Value::Str("alice".into()))),
+        })
+        .project(vec![(
+            "r".into(),
+            Expr::Record {
+                fields: vec![
+                    ("b".into(), Expr::Lit(Value::Num(2.0))),
+                    ("a".into(), Expr::Lit(Value::Num(1.0))),
+                ],
+            },
+        )]);
+        let q = "MATCH (p:Person) WHERE p.name = 'alice' RETURN {b: 2, a: 1} AS r";
+        assert_same(q, &hand, &store);
+        let out2 = run(&super::parse(q).unwrap(), &store);
+        match &col(&out2, 0, "r") {
+            Value::Record(f) => {
+                assert_eq!(f[0].0.as_ref(), "a"); // sorted
+                assert_eq!(f[1].0.as_ref(), "b");
+            }
+            o => panic!("expected a Record, got {o:?}"),
+        }
     }
 
     #[test]

@@ -158,6 +158,19 @@ fn encode_value(out: &mut String, v: &Value) {
             }
             out.push(']');
         }
+        // A record is a JSON object (keys already sorted, so deterministic).
+        Value::Record(fields) => {
+            out.push('{');
+            for (i, (k, v)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                encode_string(out, k);
+                out.push(':');
+                encode_value(out, v);
+            }
+            out.push('}');
+        }
     }
 }
 
@@ -333,7 +346,13 @@ fn json_value(j: &Json) -> Result<Value, String> {
                     }
                 }
             }
-            return Err("an object is not a valid property value".into());
+            // Any other object is a record: decode each field recursively, then
+            // canonicalize (sorted, last-wins) via the value contract.
+            let pairs = fields
+                .iter()
+                .map(|(k, v)| json_value(v).map(|v| (Arc::from(k.as_str()), v)))
+                .collect::<Result<Vec<_>, _>>()?;
+            crate::value::make_record(pairs)
         }
     })
 }
@@ -558,6 +577,36 @@ mod tests {
         match st2.prop(0, "born") {
             Value::Temporal(Temporal::Date(d)) => assert_eq!(d.format(), "1990-05-01"),
             o => panic!("expected a Date after round trip, got {o:?}"),
+        }
+    }
+
+    /// A record property survives an NDJSON round trip: it dumps to a JSON object
+    /// (keys sorted) and decodes back to the same record.
+    #[test]
+    fn record_props_round_trip() {
+        use crate::value::make_record;
+        let mut st = Builder::default().build();
+        st.add_node(
+            &["P"],
+            &[(
+                "meta",
+                make_record(vec![(Arc::from("y"), s("hi")), (Arc::from("x"), n(1.0))]),
+            )],
+        );
+        let text = to_ndjson(&st);
+        assert!(
+            text.contains("\"meta\":{\"x\":1,\"y\":\"hi\"}"),
+            "egress was: {text}"
+        );
+        let st2 = from_ndjson(&text).unwrap();
+        match st2.prop(0, "meta") {
+            Value::Record(f) => {
+                assert_eq!(f[0].0.as_ref(), "x");
+                assert!(crate::value::equals(&f[0].1, &n(1.0)));
+                assert_eq!(f[1].0.as_ref(), "y");
+                assert!(crate::value::equals(&f[1].1, &s("hi")));
+            }
+            o => panic!("expected a Record after round trip, got {o:?}"),
         }
     }
 

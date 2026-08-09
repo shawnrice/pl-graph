@@ -376,6 +376,9 @@ fn max_slot(expr: &Expr) -> Option<usize> {
         Expr::Call { args, .. } | Expr::List { items: args } => {
             args.iter().fold(None, |acc, a| merge_max(acc, max_slot(a)))
         }
+        Expr::Record { fields } => fields
+            .iter()
+            .fold(None, |acc, (_, e)| merge_max(acc, max_slot(e))),
         Expr::Case {
             branches,
             otherwise,
