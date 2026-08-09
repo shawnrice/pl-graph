@@ -752,9 +752,24 @@ fn try_fused_count(
             Some(Expr::Slot(s)) if *s == w => {}
             _ => return None,
         }
-        let mut seen = vec![false; store.node_count()];
-        let mut cnt = 0f64;
+        // The distinct endpoints depend only on the SET of last-hop sources, not
+        // their multiplicity: a source reached by many paths yields the same
+        // neighbours each time. Collapsing the (often hugely repeated) frontier to
+        // its distinct nodes first turns a per-path expansion into a per-node one
+        // — for a 2-hop that is millions of repeated sources down to the distinct
+        // intermediate nodes, and the final hop is walked once each.
+        let nc = store.node_count();
+        let mut seen_src = vec![false; nc];
+        let mut distinct_src = Vec::new();
         for &v in &src {
+            if !seen_src[v as usize] {
+                seen_src[v as usize] = true;
+                distinct_src.push(v);
+            }
+        }
+        let mut seen = vec![false; nc];
+        let mut cnt = 0f64;
+        for &v in &distinct_src {
             for_each_nbr(store, v, *dir, want, |nbr| {
                 if !seen[nbr as usize] {
                     seen[nbr as usize] = true;
