@@ -376,6 +376,13 @@ fn needs_lineage(plan: &Plan) -> bool {
                 left: a, right: b, ..
             } => reads_path(a) || reads_path(b),
             Expr::Call { args, .. } => args.iter().any(reads_path),
+            Expr::Case {
+                branches,
+                otherwise,
+            } => {
+                branches.iter().any(|(c, v)| reads_path(c) || reads_path(v))
+                    || otherwise.as_deref().is_some_and(reads_path)
+            }
             Expr::Slot(_) | Expr::Prop { .. } | Expr::Lit(_) => false,
         }
     }
@@ -1263,6 +1270,15 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
             left: a, right: b, ..
         } => refs_only_slot(a, s) && refs_only_slot(b, s),
         Expr::Call { args, .. } => args.iter().all(|a| refs_only_slot(a, s)),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            branches
+                .iter()
+                .all(|(c, v)| refs_only_slot(c, s) && refs_only_slot(v, s))
+                && otherwise.as_deref().is_none_or(|e| refs_only_slot(e, s))
+        }
         Expr::Compare { left, right, .. } => refs_only_slot(left, s) && refs_only_slot(right, s),
     }
 }
@@ -1295,6 +1311,18 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         Expr::Call { name, args } => Expr::Call {
             name: name.clone(),
             args: args.iter().map(|a| remap_slot(a, from, to)).collect(),
+        },
+        Expr::Case {
+            branches,
+            otherwise,
+        } => Expr::Case {
+            branches: branches
+                .iter()
+                .map(|(c, v)| (remap_slot(c, from, to), remap_slot(v, from, to)))
+                .collect(),
+            otherwise: otherwise
+                .as_ref()
+                .map(|e| Box::new(remap_slot(e, from, to))),
         },
     }
 }
@@ -1696,6 +1724,33 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
                         .collect(),
                 )
             }
+        }
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            let conds: Vec<Col> = branches
+                .iter()
+                .map(|(c, _)| eval(c, store, batch))
+                .collect();
+            let vals: Vec<Col> = branches
+                .iter()
+                .map(|(_, v)| eval(v, store, batch))
+                .collect();
+            let else_col = otherwise.as_ref().map(|e| eval(e, store, batch));
+            let n = batch.rows();
+            let out: Vec<Value> = (0..n)
+                .map(|i| {
+                    // First branch whose condition is literally TRUE (three-valued).
+                    conds
+                        .iter()
+                        .position(|c| matches!(c.value_at(i), Value::Bool(true)))
+                        .map(|bi| vals[bi].value_at(i))
+                        .or_else(|| else_col.as_ref().map(|c| c.value_at(i)))
+                        .unwrap_or(Value::Null)
+                })
+                .collect();
+            Col::Gen(out)
         }
     }
 }

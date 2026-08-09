@@ -351,6 +351,16 @@ fn max_slot(expr: &Expr) -> Option<usize> {
             left: a, right: b, ..
         } => merge_max(max_slot(a), max_slot(b)),
         Expr::Call { args, .. } => args.iter().fold(None, |acc, a| merge_max(acc, max_slot(a))),
+        Expr::Case {
+            branches,
+            otherwise,
+        } => {
+            let mut m = otherwise.as_deref().and_then(max_slot);
+            for (c, v) in branches {
+                m = merge_max(m, merge_max(max_slot(c), max_slot(v)));
+            }
+            m
+        }
         Expr::Compare { left, right, .. } => merge_max(max_slot(left), max_slot(right)),
     }
 }

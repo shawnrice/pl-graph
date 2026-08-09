@@ -144,7 +144,11 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
       `value::as_num`; `sign(0)=0`) + variadic `coalesce` (first non-null). Every
       Expr match got the Call arm. Transcendentals (exp/ln/sin/… + power last-ulp)
       deferred to J1 per numeric-determinism.md.
-- [ ] E3. `CASE` / conditional.
+- [x] E3. `CASE` / conditional: IR `Expr::Case{branches, otherwise}` + eval (first
+      branch whose condition is literally TRUE — three-valued, FALSE/NULL skip —
+      else ELSE, else NULL) + GQL searched form `CASE (WHEN e THEN e)+ [ELSE e]
+      END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
+      match. Simple form `CASE x WHEN v …` deferred (would desugar to `x = v`).
 - [ ] E4. String & list functions.
 - [ ] E5. `CAST` + cross-type coercion semantics.
 - [ ] E6. 3VL completeness: `IS NULL`, property-exists, `AND`/`OR`/`NOT` gaps.

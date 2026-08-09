@@ -1008,6 +1008,10 @@ impl Parser {
                 if s.eq_ignore_ascii_case("null") {
                     return Ok(Expr::Lit(Value::Null));
                 }
+                // Searched CASE.
+                if s.eq_ignore_ascii_case("case") {
+                    return self.case_expr();
+                }
                 // A scalar function call `name(args…)`. (Aggregates are handled in
                 // return_items, never reached here.)
                 if self.peek() == Some(&Tok::LParen) {
@@ -1026,6 +1030,35 @@ impl Parser {
             }
             other => Err(format!("expected an expression, got {other:?}")),
         }
+    }
+
+    // case := CASE (WHEN expr THEN expr)+ [ELSE expr] END   (searched form)
+    // WHEN/THEN/ELSE/END are contextual keywords. The simple form
+    // `CASE <e> WHEN <v> …` is deferred (would desugar to `WHEN e = v THEN …`).
+    fn case_expr(&mut self) -> Result<Expr, String> {
+        if !self.peek_kw("WHEN") {
+            return Err("only searched CASE (CASE WHEN … END) is supported".into());
+        }
+        let mut branches = Vec::new();
+        while self.eat_kw("WHEN") {
+            let cond = self.expr()?;
+            if !self.eat_kw("THEN") {
+                return Err("expected THEN in CASE".into());
+            }
+            branches.push((cond, self.expr()?));
+        }
+        let otherwise = if self.eat_kw("ELSE") {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
+        if !self.eat_kw("END") {
+            return Err("expected END to close CASE".into());
+        }
+        Ok(Expr::Case {
+            branches,
+            otherwise,
+        })
     }
 
     // call := name '(' [ expr (',' expr)* ] ')'  — a scalar function.
@@ -1717,6 +1750,95 @@ mod tests {
         assert!(super::parse("MATCH (p:Person) RETURN abs(p.age, 1) AS x").is_err()); // arity
         assert!(super::parse("MATCH (p:Person) RETURN coalesce() AS x").is_err());
         // arity
+    }
+
+    // --- part 3.7: CASE (E3) ---
+
+    /// Searched CASE picks the first true branch; ELSE otherwise. Ages 30/25/40:
+    /// >=40 → "old", >=30 → "mid", else "young".
+    #[test]
+    fn case_branch_selection() {
+        let store = social();
+        let q = "MATCH (p:Person) RETURN p.name AS name, \
+                 CASE WHEN p.age >= 40 THEN 'old' WHEN p.age >= 30 THEN 'mid' ELSE 'young' END AS band";
+        let out = run(&super::parse(q).unwrap(), &store);
+        let mut got: Vec<(String, String)> = out
+            .rows
+            .iter()
+            .map(|r| match (&r[0], &r[1]) {
+                (Value::Str(a), Value::Str(b)) => (a.to_string(), b.to_string()),
+                _ => panic!("shape"),
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("alice".into(), "mid".into()), // 30
+                ("bob".into(), "young".into()), // 25
+                ("carol".into(), "old".into()), // 40
+            ]
+        );
+    }
+
+    /// No ELSE and no matching branch → NULL; a NULL/false condition is skipped
+    /// (proj has no age, so `p.age >= 30` is UNKNOWN → skipped → NULL, no ELSE).
+    #[test]
+    fn case_no_else_and_null_condition() {
+        let store = social();
+        let out = run(
+            &super::parse("MATCH (n) RETURN CASE WHEN n.age >= 30 THEN 'y' END AS x").unwrap(),
+            &store,
+        );
+        // alice(30),carol(40) → 'y'; bob(25) → NULL; proj(no age) → NULL.
+        let ys = out
+            .rows
+            .iter()
+            .filter(|r| matches!(&r[0], Value::Str(s) if &**s == "y"))
+            .count();
+        let nulls = out.rows.iter().filter(|r| r[0].is_null()).count();
+        assert_eq!(ys, 2);
+        assert_eq!(nulls, 2);
+    }
+
+    /// Parsed CASE matches the hand-built `Expr::Case`.
+    #[test]
+    fn case_parse_matches_hand() {
+        use crate::ir::{CompareOp, Expr, Plan};
+        let store = social();
+        let cond = Expr::Compare {
+            op: CompareOp::Ge,
+            left: Box::new(Expr::Prop {
+                slot: 0,
+                key: "age".into(),
+            }),
+            right: Box::new(Expr::Lit(n(30.0))),
+        };
+        let hand = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .project(vec![(
+            "x".into(),
+            Expr::Case {
+                branches: vec![(cond, Expr::Lit(s("sr")))],
+                otherwise: Some(Box::new(Expr::Lit(s("jr")))),
+            },
+        )]);
+        assert_same(
+            "MATCH (p:Person) RETURN CASE WHEN p.age >= 30 THEN 'sr' ELSE 'jr' END AS x",
+            &hand,
+            &store,
+        );
+    }
+
+    #[test]
+    fn case_errors() {
+        assert!(
+            super::parse("MATCH (p:Person) RETURN CASE p.age WHEN 30 THEN 'x' END AS y").is_err()
+        ); // simple form deferred
+        assert!(
+            super::parse("MATCH (p:Person) RETURN CASE WHEN p.age >= 30 THEN 'x' AS y").is_err()
+        ); // no END
     }
 
     // --- part 4: INSERT (write statements) ---

@@ -57,6 +57,13 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// Searched `CASE`: the value of the FIRST branch whose condition is TRUE
+    /// (three-valued — only a literal TRUE selects; FALSE/NULL/UNKNOWN skip), else
+    /// `otherwise`, else NULL.
+    Case {
+        branches: Vec<(Expr, Expr)>,
+        otherwise: Option<Box<Expr>>,
+    },
 }
 
 /// A binary arithmetic operator.
