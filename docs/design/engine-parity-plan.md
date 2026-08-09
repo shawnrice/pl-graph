@@ -75,8 +75,10 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
         `expand_edge` (r at slot W, node W+1); `r.key` in RETURN/WHERE; inline
         `[:T {props}]` = edge props in INSERT and a match filter in MATCH; SET/
         REMOVE on a bound `r` writes edge props. Rel var on var-length rejected.
-  - [ ] B6. Gremlin `addE` (deferred from B4/B5c): needs vertex-reference
-        traversal (`V(id)`/`as`/`from`/`to`) + edge props. Its own slice.
+  - [x] B6. Gremlin `addE` (Plan::AddEdge leaf): `g.V(a).addE('T').to(V(b))` and
+        `g.addE('T').from(V(a)).to(V(b))`, with `.property(k,v)`; minimal `V(<id>)`
+        arg supported only as an addE anchor. Out-of-range/deleted endpoint errors;
+        missing to/from is a parse error. General `V(id)` read traversals deferred.
 
 ### Phase C — Persistence
 

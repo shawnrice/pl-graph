@@ -40,7 +40,7 @@ enum Tok {
 fn is_write(plan: &Plan) -> bool {
     matches!(
         plan,
-        Plan::Insert { .. } | Plan::Update { .. } | Plan::Merge { .. }
+        Plan::Insert { .. } | Plan::Update { .. } | Plan::Merge { .. } | Plan::AddEdge { .. }
     )
 }
 
@@ -158,8 +158,31 @@ impl Parser {
         let mut plan = match head.to_ascii_lowercase().as_str() {
             "v" => {
                 self.expect(&Tok::LParen)?;
+                // g.V(<id>) is supported ONLY as the anchor of an addE (other
+                // V(id) read traversals are deferred — the Scan has no by-id form).
+                if matches!(self.peek(), Some(Tok::Num(_))) {
+                    let from = self.u_id()?;
+                    self.expect(&Tok::RParen)?;
+                    self.expect(&Tok::Dot)?;
+                    let step = self.ident()?;
+                    if !step.eq_ignore_ascii_case("addE") {
+                        return Err("g.V(id) is only supported before addE()".into());
+                    }
+                    self.expect(&Tok::LParen)?;
+                    let etype = self.str_arg()?;
+                    self.expect(&Tok::RParen)?;
+                    self.finish_add_edge(Some(from), None, etype)?
+                } else {
+                    self.expect(&Tok::RParen)?;
+                    Plan::Scan { label: None }
+                }
+            }
+            "adde" => {
+                // g.addE('T').from(V(a)).to(V(b)).property(...)
+                self.expect(&Tok::LParen)?;
+                let etype = self.str_arg()?;
                 self.expect(&Tok::RParen)?;
-                Plan::Scan { label: None }
+                self.finish_add_edge(None, None, etype)?
             }
             "addv" => {
                 // addV('Label') creates one vertex; following property() steps
@@ -175,9 +198,6 @@ impl Parser {
                     edges: vec![],
                 }
             }
-            // addE needs vertex-reference traversal (V(id)/as/from/to) and the
-            // edge-property model — deferred to the edge slice (B5).
-            "adde" => return Err("g.addE(...) is deferred to the edge slice (B5)".into()),
             other => return Err(format!("expected V() or addV(...), got `{other}`")),
         };
         while self.peek() == Some(&Tok::Dot) {
@@ -348,6 +368,69 @@ impl Parser {
             other => return Err(format!("unsupported Gremlin step `{other}`")),
         };
         Ok(plan)
+    }
+
+    /// Parse the trailing `.from(V(id))` / `.to(V(id))` / `.property('k', v)`
+    /// modulators of an `addE` and build the edge write. `from`/`to` may already be
+    /// set (the `g.V(a).addE(...)` anchor sets `from`).
+    fn finish_add_edge(
+        &mut self,
+        mut from: Option<u32>,
+        mut to: Option<u32>,
+        etype: String,
+    ) -> Result<Plan, String> {
+        let mut props = Vec::new();
+        while self.peek() == Some(&Tok::Dot) {
+            self.pos += 1;
+            let step = self.ident()?;
+            self.expect(&Tok::LParen)?;
+            match step.to_ascii_lowercase().as_str() {
+                "from" => {
+                    from = Some(self.v_id_arg()?);
+                    self.expect(&Tok::RParen)?;
+                }
+                "to" => {
+                    to = Some(self.v_id_arg()?);
+                    self.expect(&Tok::RParen)?;
+                }
+                "property" => {
+                    let key = self.str_arg()?;
+                    self.expect(&Tok::Comma)?;
+                    let val = self.literal()?;
+                    self.expect(&Tok::RParen)?;
+                    props.push((key, val));
+                }
+                other => return Err(format!("unsupported addE modulator `{other}`")),
+            }
+        }
+        let from = from.ok_or("addE needs a from(V(id)) or a g.V(id) anchor")?;
+        let to = to.ok_or("addE needs a to(V(id))")?;
+        Ok(Plan::AddEdge {
+            from,
+            to,
+            etype,
+            props,
+        })
+    }
+
+    /// A `V(<id>)` argument (the numeric node id).
+    fn v_id_arg(&mut self) -> Result<u32, String> {
+        let v = self.ident()?;
+        if !v.eq_ignore_ascii_case("V") {
+            return Err(format!("expected V(id), got `{v}`"));
+        }
+        self.expect(&Tok::LParen)?;
+        let id = self.u_id()?;
+        self.expect(&Tok::RParen)?;
+        Ok(id)
+    }
+
+    /// A non-negative integer node id.
+    fn u_id(&mut self) -> Result<u32, String> {
+        match self.bump() {
+            Some(Tok::Num(n)) if n >= 0.0 && n.fract() == 0.0 => Ok(n as u32),
+            other => Err(format!("expected a node id, got {other:?}")),
+        }
     }
 
     /// Apply a `property('k', v)` step. On an `addV` (a one-node `Insert`) it
@@ -651,8 +734,47 @@ mod tests {
 
     #[test]
     fn write_step_errors() {
-        assert!(super::parse("g.addE('R')").is_err()); // deferred to B5
+        assert!(super::parse("g.addE('R')").is_err()); // no from/to
         assert!(super::parse("g.V().drop().count()").is_err()); // read after write
         assert!(super::parse("g.addV('P').out('R')").is_err()); // read after write
+    }
+
+    // --- addE (B6) ---
+
+    /// `g.V(a).addE('T').to(V(b)).property(...)` creates one edge with props.
+    #[test]
+    fn add_edge_anchored() {
+        let mut st = Builder::default().build();
+        let a = st.add_node(&["P"], &[]);
+        let b = st.add_node(&["P"], &[]);
+        exec("g.V(0).addE('R').to(V(1)).property('weight', 0.5)", &mut st);
+        assert_eq!(st.out(a).len(), 1);
+        assert_eq!(st.out(a)[0].nbr, b);
+        let eid = st.out(a)[0].eid;
+        assert!(matches!(st.edge_prop(eid, "weight"), Value::Num(x) if x == 0.5));
+    }
+
+    /// `g.addE('T').from(V(a)).to(V(b))` is the unanchored form.
+    #[test]
+    fn add_edge_from_to() {
+        let mut st = Builder::default().build();
+        st.add_node(&["P"], &[]);
+        st.add_node(&["P"], &[]);
+        exec("g.addE('R').from(V(0)).to(V(1))", &mut st);
+        assert_eq!(st.out(0).len(), 1);
+        assert_eq!(st.out(0)[0].nbr, 1);
+    }
+
+    #[test]
+    fn add_edge_errors() {
+        // Missing `to` is a parse error (finish_add_edge requires both endpoints).
+        assert!(super::parse("g.addE('R').from(V(0))").is_err());
+        // Out-of-range endpoint is a runtime error.
+        let mut st = Builder::default().build();
+        st.add_node(&["P"], &[]);
+        assert!(
+            crate::exec::execute(&super::parse("g.V(0).addE('R').to(V(9))").unwrap(), &mut st)
+                .is_err()
+        );
     }
 }

@@ -220,6 +220,24 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
             on_create,
             on_update,
         } => execute_merge(store, label, props, on_create, on_update),
+        Plan::AddEdge {
+            from,
+            to,
+            etype,
+            props,
+        } => {
+            let nc = u32::try_from(store.node_count()).unwrap_or(u32::MAX);
+            if *from >= nc || *to >= nc || !store.is_alive(*from) || !store.is_alive(*to) {
+                return Err(format!(
+                    "addE: endpoint out of range or deleted ({from} -> {to})"
+                ));
+            }
+            let eid = store.add_edge(*from, *to, etype);
+            for (k, v) in props {
+                store.set_edge_prop(eid, k, v.clone());
+            }
+            Ok(empty_rows())
+        }
         _ => Ok(run(plan, store)),
     }
 }
@@ -357,7 +375,9 @@ fn needs_lineage(plan: &Plan) -> bool {
         }
     }
     match plan {
-        Plan::Scan { .. } | Plan::Insert { .. } | Plan::Merge { .. } => false,
+        Plan::Scan { .. } | Plan::Insert { .. } | Plan::Merge { .. } | Plan::AddEdge { .. } => {
+            false
+        }
         Plan::Expand { input, .. }
         | Plan::VarLength { input, .. }
         | Plan::ShortestPath { input, .. }
@@ -392,7 +412,9 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
         // A write plan is never pulled (a read sub-plan cannot contain one); it
         // is run through `execute`. Yield an empty batch if it somehow reaches
         // here so `run` on a bare write is a harmless no-op rather than a panic.
-        Plan::Insert { .. } | Plan::Update { .. } | Plan::Merge { .. } => Batch::of(Vec::new()),
+        Plan::Insert { .. } | Plan::Update { .. } | Plan::Merge { .. } | Plan::AddEdge { .. } => {
+            Batch::of(Vec::new())
+        }
         Plan::Scan { label } => {
             let ids = match label {
                 Some(l) => store.nodes_with_label(l).to_vec(),

@@ -196,6 +196,15 @@ pub enum Plan {
     /// `ops` (SET/REMOVE) to the bound nodes. Run through `exec::execute`, not
     /// pulled; produces no rows (a RETURN after an update is a later slice).
     Update { input: Box<Plan>, ops: Vec<SetOp> },
+    /// Create ONE edge between two EXISTING nodes (Gremlin `addE`), with inline
+    /// properties. A leaf write; `from`/`to` are node ids. Distinct from
+    /// `Insert`'s edges, which reference nodes created in the same statement.
+    AddEdge {
+        from: u32,
+        to: u32,
+        etype: String,
+        props: Vec<(String, Value)>,
+    },
     /// Keyed upsert of ONE node (the `_MERGE` extension, spec
     /// docs/design/gql-extensions.md §2). The key is the subset of `props` named
     /// by a unique constraint on `label` (inferred at execution — the store holds

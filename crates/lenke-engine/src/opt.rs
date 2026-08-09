@@ -37,7 +37,10 @@ fn rewrite(plan: Plan) -> (Plan, bool) {
 fn map_children(plan: Plan) -> (Plan, bool) {
     match plan {
         // Leaves: no children to rewrite.
-        p @ (Plan::Scan { .. } | Plan::Insert { .. } | Plan::Merge { .. }) => (p, false),
+        p @ (Plan::Scan { .. }
+        | Plan::Insert { .. }
+        | Plan::Merge { .. }
+        | Plan::AddEdge { .. }) => (p, false),
         Plan::Expand {
             input,
             from,
@@ -266,7 +269,7 @@ fn width(plan: &Plan) -> usize {
     match plan {
         Plan::Scan { .. } => 1,
         // Writes carry no output row.
-        Plan::Insert { .. } | Plan::Update { .. } | Plan::Merge { .. } => 0,
+        Plan::Insert { .. } | Plan::Update { .. } | Plan::Merge { .. } | Plan::AddEdge { .. } => 0,
 
         // A bind_edge Expand appends TWO slots (edge then node).
         Plan::Expand {
@@ -477,7 +480,9 @@ mod tests {
             Plan::Join { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)
             }
-            Plan::Scan { .. } | Plan::Insert { .. } | Plan::Merge { .. } => false,
+            Plan::Scan { .. } | Plan::Insert { .. } | Plan::Merge { .. } | Plan::AddEdge { .. } => {
+                false
+            }
         }
     }
 
