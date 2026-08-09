@@ -6,12 +6,49 @@
 //! This is the lineage-FREE strategy; the lineage-preserving strategy for the
 //! same operators lands with the operators (path/tags) that need it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use crate::batch::{Batch, Col, Lineage};
 use crate::ir::{Agg, AggFn, CompareOp, Dir, Expr, Plan};
 use crate::store::{Column, Store};
 use crate::value::{self, Value};
+
+/// A fast, dependency-free hasher for the engine's INTERNAL grouping, distinct,
+/// and join maps. The default `HashMap` hasher (SipHash) is DoS-resistant, which
+/// these maps — built and dropped inside one operator over trusted, already-
+/// materialized keys — do not need; FNV-1a is several times faster on the short
+/// byte/integer keys grouping produces. It never escapes the executor, so hash
+/// quality only affects speed, never results.
+mod fnv {
+    use std::collections::{HashMap, HashSet};
+    use std::hash::{BuildHasherDefault, Hasher};
+
+    pub type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fnv>>;
+    pub type Set<K> = HashSet<K, BuildHasherDefault<Fnv>>;
+
+    pub struct Fnv(u64);
+
+    impl Default for Fnv {
+        fn default() -> Self {
+            Self(0xcbf2_9ce4_8422_2325) // FNV-1a 64-bit offset basis
+        }
+    }
+
+    impl Hasher for Fnv {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            let mut h = self.0;
+            for &b in bytes {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+            }
+            self.0 = h;
+        }
+    }
+}
+use fnv::{Map as FnvMap, Set as FnvSet};
 
 /// A materialized result: column names and rows of values. `Value` intentionally
 /// has no `PartialEq` (f64/NaN policy lives in the value contract, not a derive),
@@ -199,7 +236,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
         Plan::Distinct { input } => {
             let batch = pull(input, store, track);
             let n = batch.rows();
-            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
             let mut buf = Vec::new();
             let keep: Vec<usize> = (0..n)
                 .filter(|&i| {
@@ -241,7 +278,7 @@ fn join_key(batch: &Batch, slots: impl Iterator<Item = usize>, row: usize) -> Ve
 
 fn hash_join(lb: &Batch, rb: &Batch, on: &[(usize, usize)]) -> Batch {
     // Index the right side by its join key.
-    let mut index: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+    let mut index: FnvMap<Vec<u8>, Vec<usize>> = FnvMap::default();
     for j in 0..rb.rows() {
         let k = join_key(rb, on.iter().map(|&(_, r)| r), j);
         index.entry(k).or_default().push(j);
@@ -361,7 +398,7 @@ fn assign_groups(key_cols: &[Col], n: usize) -> (Vec<u32>, Vec<usize>) {
     }
     // General path: self-delimiting byte key per row, reused buffer, allocate
     // only when a row opens a new group.
-    let mut of: HashMap<Vec<u8>, u32> = HashMap::new();
+    let mut of: FnvMap<Vec<u8>, u32> = FnvMap::default();
     let mut group_of = Vec::with_capacity(n);
     let mut first_row = Vec::new();
     let mut buf = Vec::new();
@@ -389,7 +426,7 @@ fn group_by<K: std::hash::Hash + Eq>(
     n: usize,
     keys: impl Iterator<Item = K>,
 ) -> (Vec<u32>, Vec<usize>) {
-    let mut of: HashMap<K, u32> = HashMap::new();
+    let mut of: FnvMap<K, u32> = FnvMap::default();
     let mut group_of = Vec::with_capacity(n);
     let mut first_row = Vec::new();
     for (i, k) in keys.enumerate() {
@@ -411,7 +448,7 @@ fn group_by<K: std::hash::Hash + Eq>(
 /// opens a new group, so a million-row column over a thousand names clones a
 /// thousand `Arc`s, not a million.
 fn group_by_ref<'a>(n: usize, keys: impl Iterator<Item = &'a str>) -> (Vec<u32>, Vec<usize>) {
-    let mut of: HashMap<Box<str>, u32> = HashMap::new();
+    let mut of: FnvMap<Box<str>, u32> = FnvMap::default();
     let mut group_of = Vec::with_capacity(n);
     let mut first_row = Vec::new();
     for (i, k) in keys.enumerate() {
@@ -449,9 +486,7 @@ fn fold_grouped(agg: &Agg, arg_col: Option<&Col>, group_of: &[u32], n_groups: us
         AggFn::Count if agg.distinct => {
             // Per-group distinct count. A dedicated set per group, keyed by the
             // grouping bytes; a group entry is allocated only for a new value.
-            let mut sets: Vec<std::collections::HashSet<Vec<u8>>> = (0..n_groups)
-                .map(|_| std::collections::HashSet::new())
-                .collect();
+            let mut sets: Vec<FnvSet<Vec<u8>>> = (0..n_groups).map(|_| FnvSet::default()).collect();
             let mut buf = Vec::new();
             for (i, &g) in group_of.iter().enumerate() {
                 let v = col.value_at(i);
@@ -877,7 +912,7 @@ fn shortest_path(
     let mut keep = Vec::new();
     let mut ends = Vec::new();
     for (row, &start) in src.iter().enumerate() {
-        let mut visited = std::collections::HashSet::new();
+        let mut visited: FnvSet<u32> = FnvSet::default();
         visited.insert(start);
         let mut q: VecDeque<(u32, u32)> = VecDeque::new();
         q.push_back((start, 0));
