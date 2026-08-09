@@ -37,7 +37,7 @@ fn rewrite(plan: Plan) -> (Plan, bool) {
 fn map_children(plan: Plan) -> (Plan, bool) {
     match plan {
         // Leaves: no children to rewrite.
-        p @ (Plan::Scan { .. } | Plan::Insert { .. }) => (p, false),
+        p @ (Plan::Scan { .. } | Plan::Insert { .. } | Plan::Merge { .. }) => (p, false),
         Plan::Expand {
             input,
             from,
@@ -262,7 +262,7 @@ fn width(plan: &Plan) -> usize {
     match plan {
         Plan::Scan { .. } => 1,
         // Writes carry no output row.
-        Plan::Insert { .. } | Plan::Update { .. } => 0,
+        Plan::Insert { .. } | Plan::Update { .. } | Plan::Merge { .. } => 0,
 
         Plan::Expand { input, .. }
         | Plan::VarLength { input, .. }
@@ -471,7 +471,7 @@ mod tests {
             Plan::Join { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)
             }
-            Plan::Scan { .. } | Plan::Insert { .. } => false,
+            Plan::Scan { .. } | Plan::Insert { .. } | Plan::Merge { .. } => false,
         }
     }
 

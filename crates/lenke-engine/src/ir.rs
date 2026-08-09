@@ -191,6 +191,35 @@ pub enum Plan {
     /// `ops` (SET/REMOVE) to the bound nodes. Run through `exec::execute`, not
     /// pulled; produces no rows (a RETURN after an update is a later slice).
     Update { input: Box<Plan>, ops: Vec<SetOp> },
+    /// Keyed upsert of ONE node (the `_MERGE` extension, spec
+    /// docs/design/gql-extensions.md §2). The key is the subset of `props` named
+    /// by a unique constraint on `label` (inferred at execution — the store holds
+    /// the constraints); no applicable constraint is an error. Absent → create the
+    /// node with all `props`, then apply `on_create`. Present → apply `on_update`
+    /// (default: clobber the non-key payload to the pattern's values). The merged
+    /// node is bound at slot 0 for the `on_create`/`on_update` expressions.
+    Merge {
+        label: String,
+        props: Vec<(String, Value)>,
+        on_create: Vec<(String, Expr)>,
+        on_update: MergeUpdate,
+    },
+}
+
+/// The `_MERGE` update-path disposition when the node already exists.
+#[derive(Clone, Debug)]
+pub enum MergeUpdate {
+    /// Default (bare `_MERGE`): set every non-key payload property to the
+    /// pattern's value.
+    Clobber,
+    /// `_ON_UPDATE SET … [WHERE p]`: replaces the default — apply exactly these
+    /// assignments, gated by `filter` (false → no-op, not an error).
+    Set {
+        assigns: Vec<(String, Expr)>,
+        filter: Option<Expr>,
+    },
+    /// `_ON_UPDATE_NOTHING`: leave the existing node untouched.
+    Nothing,
 }
 
 /// One property mutation in an `Update`: set a bound node's property to an

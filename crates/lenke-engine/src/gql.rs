@@ -248,6 +248,9 @@ impl Parser {
     // query := MATCH pattern [WHERE expr]
     //          RETURN [DISTINCT] items [ORDER BY keys] [SKIP n] [LIMIT n]
     fn query(&mut self) -> Result<Plan, String> {
+        if self.eat_kw("_MERGE") {
+            return self.merge();
+        }
         if self.eat_kw("INSERT") {
             return self.insert();
         }
@@ -387,6 +390,87 @@ impl Parser {
             Some(Tok::Num(n)) if n >= 0.0 && n.fract() == 0.0 => Ok(n as usize),
             other => Err(format!("expected a non-negative integer, got {other:?}")),
         }
+    }
+
+    // merge := _MERGE '(' [var] ':' Label [ '{' props '}' ] ')'
+    //          [ _ON_CREATE SET assign_list ]
+    //          [ _ON_UPDATE SET assign_list [WHERE expr] | _ON_UPDATE_NOTHING ]
+    // The sigil'd container owns the upsert semantics; the pattern and SET/WHERE
+    // inside stay bare (they are standalone-valid GQL). See gql-extensions.md §1.
+    fn merge(&mut self) -> Result<Plan, String> {
+        self.expect(&Tok::LParen)?;
+        let var = if matches!(self.peek(), Some(Tok::Ident(_))) {
+            Some(self.ident()?)
+        } else {
+            None
+        };
+        // v1: exactly one label (the upsert target's).
+        self.expect(&Tok::Colon)?;
+        let label = self.ident()?;
+        let props = if matches!(self.peek(), Some(Tok::LBrace)) {
+            self.props()?
+        } else {
+            Vec::new()
+        };
+        self.expect(&Tok::RParen)?;
+
+        // Bind the merged node at slot 0 so _ON_CREATE/_ON_UPDATE SET and WHERE
+        // resolve `var.key`.
+        self.scope = HashMap::new();
+        if let Some(v) = &var {
+            self.scope.insert(v.clone(), 0);
+        }
+        self.slots = 1;
+
+        let on_create = if self.eat_kw("_ON_CREATE") {
+            if !self.eat_kw("SET") {
+                return Err("expected SET after _ON_CREATE".into());
+            }
+            self.assign_list()?
+        } else {
+            Vec::new()
+        };
+
+        let on_update = if self.eat_kw("_ON_UPDATE_NOTHING") {
+            crate::ir::MergeUpdate::Nothing
+        } else if self.eat_kw("_ON_UPDATE") {
+            if !self.eat_kw("SET") {
+                return Err("expected SET after _ON_UPDATE".into());
+            }
+            let assigns = self.assign_list()?;
+            let filter = if self.eat_kw("WHERE") {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            crate::ir::MergeUpdate::Set { assigns, filter }
+        } else {
+            crate::ir::MergeUpdate::Clobber
+        };
+
+        Ok(Plan::Merge {
+            label,
+            props,
+            on_create,
+            on_update,
+        })
+    }
+
+    // assign_list := var '.' key '=' expr ( ',' var '.' key '=' expr )*
+    // The `var` is the merged node (slot 0); its slot is inherent, so only the
+    // (key, value) pair is kept.
+    fn assign_list(&mut self) -> Result<Vec<(String, Expr)>, String> {
+        let mut out = Vec::new();
+        loop {
+            let (_slot, key) = self.slot_dot_key()?;
+            self.expect(&Tok::Eq)?;
+            let value = self.expr()?;
+            out.push((key, value));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     // set_ops := ( SET assign (',' assign)* | REMOVE ref (',' ref)* )+
@@ -1482,5 +1566,122 @@ mod tests {
     #[test]
     fn update_errors_on_unknown_var() {
         assert!(super::parse("MATCH (p:Person) SET q.age = 1").is_err());
+    }
+
+    // --- part 6: _MERGE (keyed upsert) ---
+
+    fn user_store() -> Store {
+        let mut st = Builder::default().build();
+        st.create_unique_constraint("User", &["email"]).unwrap();
+        st
+    }
+    fn merge(store: &mut Store, q: &str) -> Result<(), String> {
+        crate::exec::execute(&super::parse(q).unwrap(), store).map(|_| ())
+    }
+
+    /// Create path: absent key → node created with all pattern props.
+    #[test]
+    fn merge_creates_when_absent() {
+        let mut st = user_store();
+        merge(&mut st, "_MERGE (u:User {email: 'a', name: 'A'})").unwrap();
+        assert_eq!(st.nodes_with_label("User").len(), 1);
+        assert!(matches!(st.prop(0, "email"), Value::Str(x) if &*x == "a"));
+        assert!(matches!(st.prop(0, "name"), Value::Str(x) if &*x == "A"));
+    }
+
+    /// Idempotence + default clobber: a second _MERGE on the same key updates the
+    /// SAME node, clobbering the non-key payload to the new pattern value.
+    #[test]
+    fn merge_is_idempotent_and_clobbers_payload() {
+        let mut st = user_store();
+        merge(&mut st, "_MERGE (u:User {email: 'a', name: 'A'})").unwrap();
+        merge(&mut st, "_MERGE (u:User {email: 'a', name: 'B'})").unwrap();
+        assert_eq!(st.nodes_with_label("User").len(), 1); // no duplicate
+        assert!(matches!(st.prop(0, "name"), Value::Str(x) if &*x == "B")); // clobbered
+    }
+
+    /// `_ON_CREATE SET` fires only on create; `_ON_UPDATE SET` REPLACES the
+    /// default clobber (so the pattern payload is NOT re-clobbered on update).
+    #[test]
+    fn merge_on_create_and_on_update_dispositions() {
+        let mut st = user_store();
+        merge(
+            &mut st,
+            "_MERGE (u:User {email: 'a', name: 'A'}) _ON_CREATE SET u.created = true",
+        )
+        .unwrap();
+        assert!(matches!(st.prop(0, "created"), Value::Bool(true)));
+        // update with a new name, but _ON_UPDATE replaces the default: name stays
+        // 'A', only seen is written; created stays (on_create didn't re-fire).
+        merge(
+            &mut st,
+            "_MERGE (u:User {email: 'a', name: 'C'}) _ON_UPDATE SET u.seen = 1",
+        )
+        .unwrap();
+        assert!(matches!(st.prop(0, "name"), Value::Str(x) if &*x == "A")); // NOT clobbered
+        assert!(matches!(st.prop(0, "seen"), Value::Num(x) if x == 1.0));
+        assert!(matches!(st.prop(0, "created"), Value::Bool(true))); // survived
+    }
+
+    /// A WHERE-gated `_ON_UPDATE` whose predicate is false is a no-op (not an
+    /// error): the existing value is left untouched.
+    #[test]
+    fn merge_on_update_where_gate_false_is_noop() {
+        let mut st = user_store();
+        merge(&mut st, "_MERGE (u:User {email: 'a', name: 'A'})").unwrap();
+        merge(&mut st, "MATCH (u:User) SET u.version = 5").ok(); // seed a version
+                                                                 // incoming version 3 is not newer → gate false → name unchanged.
+        merge(
+            &mut st,
+            "_MERGE (u:User {email: 'a'}) _ON_UPDATE SET u.name = 'Z' WHERE u.version < 3",
+        )
+        .unwrap();
+        assert!(matches!(st.prop(0, "name"), Value::Str(x) if &*x == "A"));
+    }
+
+    /// `_ON_UPDATE_NOTHING` leaves the existing node untouched.
+    #[test]
+    fn merge_on_update_nothing() {
+        let mut st = user_store();
+        merge(&mut st, "_MERGE (u:User {email: 'a', name: 'A'})").unwrap();
+        merge(
+            &mut st,
+            "_MERGE (u:User {email: 'a', name: 'X'}) _ON_UPDATE_NOTHING",
+        )
+        .unwrap();
+        assert!(matches!(st.prop(0, "name"), Value::Str(x) if &*x == "A"));
+    }
+
+    /// `_MERGE` on a label with no applicable unique constraint errors.
+    #[test]
+    fn merge_without_constraint_errors() {
+        let mut st = Builder::default().build(); // no constraint
+        assert!(merge(&mut st, "_MERGE (u:User {email: 'a'})").is_err());
+    }
+
+    /// Parsed `_MERGE` matches the hand-built `Plan::Merge` (create + on_update):
+    /// run both onto fresh constrained stores, confirm identical resulting props.
+    #[test]
+    fn merge_parse_matches_hand_plan() {
+        use crate::exec::execute;
+        use crate::ir::{Expr, MergeUpdate, Plan};
+        let hand = Plan::Merge {
+            label: "User".into(),
+            props: vec![("email".into(), s("a")), ("name".into(), s("A"))],
+            on_create: vec![("created".into(), Expr::Lit(Value::Bool(true)))],
+            on_update: MergeUpdate::Set {
+                assigns: vec![("seen".into(), Expr::Lit(n(1.0)))],
+                filter: None,
+            },
+        };
+        let query = "_MERGE (u:User {email: 'a', name: 'A'}) _ON_CREATE SET u.created = true \
+                     _ON_UPDATE SET u.seen = 1";
+        let mut st_p = user_store();
+        let mut st_h = user_store();
+        execute(&super::parse(query).unwrap(), &mut st_p).unwrap();
+        execute(&hand, &mut st_h).unwrap();
+        let probe = "MATCH (u:User) RETURN u.email AS e, u.name AS nm, u.created AS c";
+        let pp = super::parse(probe).unwrap();
+        assert_eq!(bag(&run(&pp, &st_p)), bag(&run(&pp, &st_h)));
     }
 }

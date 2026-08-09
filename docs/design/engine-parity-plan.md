@@ -54,9 +54,11 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
       via the txn). `execute` now returns `Result<Rows,String>`. Key equality uses
       group semantics (NULL keys collide — matches null-first-class, not SQL). B3b
       helpers `unique_keys_for`/enforcement seam ready.
-- [ ] B3b. GQL `_MERGE` keyed upsert (sigil convention): node form, key inferred
-      from the unique constraint, default clobber / `_ON_CREATE` / `_ON_UPDATE`
-      [WHERE] / `_ON_UPDATE_NOTHING`. Edge form + multi-hop (v2) deferred.
+- [x] B3b. GQL `_MERGE` keyed upsert (sigil convention): node form, key inferred
+      from the unique constraint at execute time, default clobber / `_ON_CREATE` /
+      `_ON_UPDATE [WHERE]` / `_ON_UPDATE_NOTHING`, txn-wrapped. NOTE: key inference
+      + no-constraint error happen at execute (parser has no store) not parse —
+      still an error, just later. Params ($x), edge form, multi-hop v2 deferred.
 - [ ] B4. Gremlin `addV`/`addE`/`property`/`drop`.
 - [ ] B5. Relationship variables + edge properties (discovered in B1): bind an
       edge as a slot in `Expand`; store edge properties keyed by `eid`; read

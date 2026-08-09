@@ -172,8 +172,110 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
             }
             Ok(empty_rows())
         }
+        Plan::Merge {
+            label,
+            props,
+            on_create,
+            on_update,
+        } => execute_merge(store, label, props, on_create, on_update),
         _ => Ok(run(plan, store)),
     }
+}
+
+/// Execute a `_MERGE`: infer the key from a unique constraint, find the existing
+/// node by its key values, and take the create or update path. Runs in a
+/// transaction so a constraint violation (or a no-applicable-constraint error)
+/// leaves the store untouched.
+fn execute_merge(
+    store: &mut Store,
+    label: &str,
+    props: &[(String, Value)],
+    on_create: &[(String, Expr)],
+    on_update: &crate::ir::MergeUpdate,
+) -> Result<Rows, String> {
+    use crate::ir::MergeUpdate;
+    store.begin();
+    let have: Vec<String> = props.iter().map(|(k, _)| k.clone()).collect();
+    let key_keys = match store.infer_merge_key(label, &have) {
+        Ok(k) => k,
+        Err(e) => {
+            store.rollback();
+            return Err(e);
+        }
+    };
+    // The pattern's key-tuple bytes, and a finder that matches an existing node.
+    let want = key_bytes(&key_keys, |k| pattern_value(props, k));
+    let found = store
+        .nodes_with_label(label)
+        .iter()
+        .copied()
+        .find(|&id| key_bytes(&key_keys, |k| store.prop(id, k)) == want);
+
+    match found {
+        Some(id) => match on_update {
+            MergeUpdate::Nothing => {}
+            MergeUpdate::Clobber => {
+                // Set every non-key payload property to the pattern's value.
+                for (k, v) in props {
+                    if !key_keys.contains(k) {
+                        store.set_prop(id, k, v.clone());
+                    }
+                }
+            }
+            MergeUpdate::Set { assigns, filter } => {
+                let batch = Batch::of(vec![Col::Nodes(vec![id])]);
+                let gate = filter.as_ref().is_none_or(|f| {
+                    matches!(eval(f, store, &batch).value_at(0), Value::Bool(true))
+                });
+                if gate {
+                    let writes: Vec<(String, Value)> = assigns
+                        .iter()
+                        .map(|(k, e)| (k.clone(), eval(e, store, &batch).value_at(0)))
+                        .collect();
+                    for (k, v) in writes {
+                        store.set_prop(id, &k, v);
+                    }
+                }
+            }
+        },
+        None => {
+            let props_ref: Vec<(&str, Value)> =
+                props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            let id = store.add_node(&[label], &props_ref);
+            let batch = Batch::of(vec![Col::Nodes(vec![id])]);
+            let writes: Vec<(String, Value)> = on_create
+                .iter()
+                .map(|(k, e)| (k.clone(), eval(e, store, &batch).value_at(0)))
+                .collect();
+            for (k, v) in writes {
+                store.set_prop(id, &k, v);
+            }
+        }
+    }
+
+    if let Err(e) = store.check_unique_for_label(label) {
+        store.rollback();
+        return Err(e);
+    }
+    store.commit();
+    Ok(empty_rows())
+}
+
+/// The grouping-key bytes of `keys`, reading each key's value via `get`.
+fn key_bytes(keys: &[String], mut get: impl FnMut(&str) -> Value) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for k in keys {
+        value::group_key_into(&get(k), &mut buf);
+    }
+    buf
+}
+
+/// A pattern property's value by key (NULL if the pattern does not name it).
+fn pattern_value(props: &[(String, Value)], key: &str) -> Value {
+    props
+        .iter()
+        .find(|(k, _)| k == key)
+        .map_or(Value::Null, |(_, v)| v.clone())
 }
 
 /// The empty result a write statement returns (no columns, no rows).
@@ -213,7 +315,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         }
     }
     match plan {
-        Plan::Scan { .. } | Plan::Insert { .. } => false,
+        Plan::Scan { .. } | Plan::Insert { .. } | Plan::Merge { .. } => false,
         Plan::Expand { input, .. }
         | Plan::VarLength { input, .. }
         | Plan::ShortestPath { input, .. }
@@ -248,7 +350,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Batch {
         // A write plan is never pulled (a read sub-plan cannot contain one); it
         // is run through `execute`. Yield an empty batch if it somehow reaches
         // here so `run` on a bare write is a harmless no-op rather than a panic.
-        Plan::Insert { .. } | Plan::Update { .. } => Batch::of(Vec::new()),
+        Plan::Insert { .. } | Plan::Update { .. } | Plan::Merge { .. } => Batch::of(Vec::new()),
         Plan::Scan { label } => {
             let ids = match label {
                 Some(l) => store.nodes_with_label(l).to_vec(),

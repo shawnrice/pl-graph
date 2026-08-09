@@ -385,6 +385,27 @@ impl Store {
             .cloned()
     }
 
+    /// Infer the `_MERGE` conflict target: the one unique constraint on `label`
+    /// whose keys are all present in `have`. Errors if there is none (the merge
+    /// has no key) or more than one (ambiguous — the pattern must disambiguate).
+    pub fn infer_merge_key(&self, label: &str, have: &[String]) -> Result<Vec<String>, String> {
+        let covered: Vec<&Vec<String>> = self
+            .unique
+            .iter()
+            .filter(|(l, keys)| l == label && keys.iter().all(|k| have.contains(k)))
+            .map(|(_, keys)| keys)
+            .collect();
+        match covered.as_slice() {
+            [] => Err(format!(
+                "E_MERGE: _MERGE on `{label}` has no applicable unique constraint"
+            )),
+            [one] => Ok((*one).clone()),
+            _ => Err(format!(
+                "E_MERGE: _MERGE on `{label}` is ambiguous — the pattern touches several unique constraints"
+            )),
+        }
+    }
+
     fn check_label_unique(&self, label: &str, keys: &[String]) -> Result<(), String> {
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
         for &id in self.nodes_with_label(label) {
