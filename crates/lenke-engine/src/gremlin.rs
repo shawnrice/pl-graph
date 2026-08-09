@@ -36,6 +36,14 @@ enum Tok {
     Num(f64),
 }
 
+/// Whether a plan is a write (so read steps cannot chain after it).
+fn is_write(plan: &Plan) -> bool {
+    matches!(
+        plan,
+        Plan::Insert { .. } | Plan::Update { .. } | Plan::Merge { .. }
+    )
+}
+
 fn lex(s: &str) -> Result<Vec<Tok>, String> {
     let b: Vec<char> = s.chars().collect();
     let mut i = 0;
@@ -139,21 +147,39 @@ impl Parser {
         }
     }
 
-    // traversal := 'g' '.' 'V' '(' ')' ( '.' step )*
+    // traversal := 'g' '.' ( 'V' '(' ')' | 'addV' '(' Label ')' ) ( '.' step )*
     fn traversal(&mut self) -> Result<Plan, String> {
         let g = self.ident()?;
         if !g.eq_ignore_ascii_case("g") {
             return Err(format!("expected `g`, got `{g}`"));
         }
         self.expect(&Tok::Dot)?;
-        let v = self.ident()?;
-        if !v.eq_ignore_ascii_case("V") {
-            return Err("only g.V() traversals are supported".into());
-        }
-        self.expect(&Tok::LParen)?;
-        self.expect(&Tok::RParen)?;
-
-        let mut plan = Plan::Scan { label: None };
+        let head = self.ident()?;
+        let mut plan = match head.to_ascii_lowercase().as_str() {
+            "v" => {
+                self.expect(&Tok::LParen)?;
+                self.expect(&Tok::RParen)?;
+                Plan::Scan { label: None }
+            }
+            "addv" => {
+                // addV('Label') creates one vertex; following property() steps
+                // fold into it (see `apply_property`).
+                self.expect(&Tok::LParen)?;
+                let label = self.str_arg()?;
+                self.expect(&Tok::RParen)?;
+                Plan::Insert {
+                    nodes: vec![crate::ir::InsertNode {
+                        labels: vec![label],
+                        props: vec![],
+                    }],
+                    edges: vec![],
+                }
+            }
+            // addE needs vertex-reference traversal (V(id)/as/from/to) and the
+            // edge-property model — deferred to the edge slice (B5).
+            "adde" => return Err("g.addE(...) is deferred to the edge slice (B5)".into()),
+            other => return Err(format!("expected V() or addV(...), got `{other}`")),
+        };
         while self.peek() == Some(&Tok::Dot) {
             self.pos += 1;
             plan = self.step(plan)?;
@@ -167,7 +193,34 @@ impl Parser {
     fn step(&mut self, plan: Plan) -> Result<Plan, String> {
         let name = self.ident()?;
         self.expect(&Tok::LParen)?;
-        let plan = match name.to_ascii_lowercase().as_str() {
+        let lname = name.to_ascii_lowercase();
+
+        // --- write steps ---
+        if lname == "property" {
+            let key = self.str_arg()?;
+            self.expect(&Tok::Comma)?;
+            let val = self.literal()?;
+            self.expect(&Tok::RParen)?;
+            return Ok(self.apply_property(plan, key, val));
+        }
+        if lname == "drop" {
+            self.expect(&Tok::RParen)?;
+            if is_write(&plan) {
+                return Err("drop() cannot follow a write step".into());
+            }
+            // Delete the current elements of the traversal.
+            return Ok(Plan::Update {
+                input: Box::new(plan),
+                ops: vec![crate::ir::SetOp::Delete { slot: self.current }],
+            });
+        }
+        // A read step cannot follow a write step (addV/property/drop are terminal
+        // for reads).
+        if is_write(&plan) {
+            return Err(format!("step `{lname}` cannot follow a write step"));
+        }
+
+        let plan = match lname.as_str() {
             "haslabel" => {
                 let label = self.str_arg()?;
                 self.expect(&Tok::RParen)?;
@@ -295,6 +348,34 @@ impl Parser {
             other => return Err(format!("unsupported Gremlin step `{other}`")),
         };
         Ok(plan)
+    }
+
+    /// Apply a `property('k', v)` step. On an `addV` (a one-node `Insert`) it
+    /// folds into that node's properties; on a read traversal it wraps (or extends)
+    /// an `Update` that SETs the property on the current elements.
+    fn apply_property(&self, plan: Plan, key: String, val: Value) -> Plan {
+        match plan {
+            Plan::Insert { mut nodes, edges } if edges.is_empty() && nodes.len() == 1 => {
+                nodes[0].props.push((key, val));
+                Plan::Insert { nodes, edges }
+            }
+            Plan::Update { input, mut ops } => {
+                ops.push(crate::ir::SetOp::Set {
+                    slot: self.current,
+                    key,
+                    value: Expr::Lit(val),
+                });
+                Plan::Update { input, ops }
+            }
+            read => Plan::Update {
+                input: Box::new(read),
+                ops: vec![crate::ir::SetOp::Set {
+                    slot: self.current,
+                    key,
+                    value: Expr::Lit(val),
+                }],
+            },
+        }
     }
 
     /// The second argument of `has('k', …)`: a literal (equality) or `P.op(val)`.
@@ -503,8 +584,75 @@ mod tests {
     #[test]
     fn errors_not_panics() {
         assert!(super::parse("g.V(").is_err());
-        assert!(super::parse("g.E().values('x')").is_err()); // only V() supported
+        assert!(super::parse("g.E().values('x')").is_err()); // only V()/addV() supported
         assert!(super::parse("g.V().frobnicate()").is_err()); // unknown step
         assert!(super::parse("g.V().has('k')").is_err()); // has needs a value
+    }
+
+    // --- writes: addV / property / drop ---
+
+    fn exec(q: &str, store: &mut Store) {
+        crate::exec::execute(&super::parse(q).unwrap(), store).unwrap();
+    }
+
+    /// `g.addV('L').property(...)` creates one vertex with those properties.
+    #[test]
+    fn add_vertex_with_properties() {
+        let mut st = Builder::default().build();
+        exec(
+            "g.addV('Person').property('name', 'x').property('age', 1)",
+            &mut st,
+        );
+        assert_eq!(st.node_count(), 1);
+        assert_eq!(st.nodes_with_label("Person"), &[0]);
+        assert!(matches!(st.prop(0, "name"), Value::Str(v) if &*v == "x"));
+        assert!(matches!(st.prop(0, "age"), Value::Num(v) if v == 1.0));
+    }
+
+    /// `g.V()...property(k, v)` sets the property on the matched vertices only.
+    #[test]
+    fn property_step_sets_matched() {
+        let mut st = social();
+        exec(
+            "g.V().hasLabel('Person').has('name', 'alice').property('age', 99)",
+            &mut st,
+        );
+        assert!(matches!(st.prop(0, "age"), Value::Num(v) if v == 99.0)); // alice
+        assert!(matches!(st.prop(1, "age"), Value::Num(v) if v == 25.0)); // bob unchanged
+    }
+
+    /// `g.V()...drop()` deletes the matched vertices.
+    #[test]
+    fn drop_step_deletes_matched() {
+        let mut st = social();
+        exec(
+            "g.V().hasLabel('Person').has('name', 'bob').drop()",
+            &mut st,
+        );
+        assert!(!st.is_alive(1)); // bob
+        assert_eq!(st.nodes_with_label("Person"), &[0, 2]); // alice, carol
+    }
+
+    /// Cross-language agreement: a Gremlin `addV` and the equivalent GQL `INSERT`
+    /// produce the same graph.
+    #[test]
+    fn gremlin_and_gql_writes_agree() {
+        let mut g1 = Builder::default().build();
+        let mut g2 = Builder::default().build();
+        exec("g.addV('P').property('name', 'z')", &mut g1);
+        crate::exec::execute(
+            &crate::gql::parse("INSERT (:P {name: 'z'})").unwrap(),
+            &mut g2,
+        )
+        .unwrap();
+        let probe = crate::gql::parse("MATCH (p:P) RETURN p.name AS n").unwrap();
+        assert_eq!(value_bag(&run(&probe, &g1)), value_bag(&run(&probe, &g2)));
+    }
+
+    #[test]
+    fn write_step_errors() {
+        assert!(super::parse("g.addE('R')").is_err()); // deferred to B5
+        assert!(super::parse("g.V().drop().count()").is_err()); // read after write
+        assert!(super::parse("g.addV('P').out('R')").is_err()); // read after write
     }
 }

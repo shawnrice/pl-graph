@@ -138,6 +138,7 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
             enum Applied {
                 Set(u32, String, Value),
                 Remove(u32, String),
+                Delete(u32),
             }
             let mut applied: Vec<Applied> = Vec::new();
             {
@@ -160,14 +161,23 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
                                 }
                             }
                         }
+                        crate::ir::SetOp::Delete { slot } => {
+                            if let Col::Nodes(ids) = batch.slot(*slot) {
+                                for &id in ids {
+                                    applied.push(Applied::Delete(id));
+                                }
+                            }
+                        }
                     }
                 }
             }
-            // Write phase: apply in row order (last write wins per node+key).
+            // Write phase: apply in op/row order (last write wins per node+key;
+            // delete_node is idempotent for a node matched by several rows).
             for a in applied {
                 match a {
                     Applied::Set(node, key, value) => store.set_prop(node, &key, value),
                     Applied::Remove(node, key) => store.remove_prop(node, &key),
+                    Applied::Delete(node) => store.delete_node(node),
                 }
             }
             Ok(empty_rows())
@@ -337,7 +347,7 @@ fn needs_lineage(plan: &Plan) -> bool {
             needs_lineage(input)
                 || ops.iter().any(|op| match op {
                     crate::ir::SetOp::Set { value, .. } => reads_path(value),
-                    crate::ir::SetOp::Remove { .. } => false,
+                    crate::ir::SetOp::Remove { .. } | crate::ir::SetOp::Delete { .. } => false,
                 })
         }
     }

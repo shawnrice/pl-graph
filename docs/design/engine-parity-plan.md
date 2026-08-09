@@ -56,10 +56,12 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
       helpers `unique_keys_for`/enforcement seam ready.
 - [x] B3b. GQL `_MERGE` keyed upsert (sigil convention): node form, key inferred
       from the unique constraint at execute time, default clobber / `_ON_CREATE` /
-      `_ON_UPDATE [WHERE]` / `_ON_UPDATE_NOTHING`, txn-wrapped. NOTE: key inference
-      + no-constraint error happen at execute (parser has no store) not parse —
+      `_ON_UPDATE [WHERE]` / `_ON_UPDATE_NOTHING`, txn-wrapped. NOTE: key inference + no-constraint error happen at execute (parser has no store) not parse —
       still an error, just later. Params ($x), edge form, multi-hop v2 deferred.
-- [ ] B4. Gremlin `addV`/`addE`/`property`/`drop`.
+- [x] B4. Gremlin `addV`/`property`/`drop` over the same `execute` path (addV→
+      Insert; property folds into addV or wraps a read traversal in Update;
+      drop→node delete via new `SetOp::Delete`). Read-after-write is rejected.
+      `addE` DEFERRED to B5 (needs V(id)/from/to vertex-refs + the edge model).
 - [ ] B5. Relationship variables + edge properties (discovered in B1): bind an
       edge as a slot in `Expand`; store edge properties keyed by `eid`; read
       `r.key`; accept inline edge props in INSERT/SET. Needed before edge-property

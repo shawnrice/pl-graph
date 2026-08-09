@@ -235,6 +235,11 @@ pub enum SetOp {
         slot: usize,
         key: String,
     },
+    /// Delete the bound node in `slot` (Gremlin `drop()` on vertices; the future
+    /// GQL `DELETE`). Applied in op order alongside SET/REMOVE.
+    Delete {
+        slot: usize,
+    },
 }
 
 /// A node to create in an `Insert`: its labels and inline `(key, value)`
