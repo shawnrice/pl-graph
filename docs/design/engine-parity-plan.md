@@ -181,7 +181,13 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
 
 ### Phase F — Query surface
 
-- [ ] F1. GQL `WITH` (chained query parts, carry + aggregate + filter).
+- [x] F1. GQL `WITH` (chained query parts): projects/aggregates like RETURN,
+      rebinds scope to the carried columns (a bare variable keeps its name), rides
+      ORDER BY/SKIP/LIMIT, and a trailing WHERE is a post-projection (HAVING)
+      filter — matching lenke-core. A continuing MATCH extends the working table
+      from a carried node (shared `extend_chain`); an unbound continuation errors.
+      4 tests (aggregate+HAVING, carry-into-MATCH, order+limit paging, error),
+      cross-checked against hand plans.
 - [ ] F2. GQL `EXISTS { … }` subquery.
 - [ ] F3. GQL `CALL` (named procedure + inline correlated subquery).
 - [ ] F4. Path values: `ANY SHORTEST p = …`, accessors (length/nodes/rels).

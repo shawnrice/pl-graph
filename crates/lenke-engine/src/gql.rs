@@ -298,6 +298,18 @@ impl Parser {
             let pred = self.expr()?;
             plan = plan.filter(pred);
         }
+        // Chained query parts: a `WITH` projection boundary (which rebinds scope
+        // to its carried columns) or a continuing `MATCH` (which extends the
+        // working table from a carried variable). Loops until the tail clause.
+        loop {
+            if self.eat_kw("WITH") {
+                plan = self.with_clause(plan)?;
+            } else if self.eat_kw("MATCH") {
+                plan = self.match_continue(plan)?;
+            } else {
+                break;
+            }
+        }
         // Write tail: MATCH … (SET … | REMOVE …)+  — updates the bound nodes and
         // returns no rows. Otherwise the read tail (RETURN …).
         if self.peek_kw("SET") || self.peek_kw("REMOVE") {
@@ -308,41 +320,11 @@ impl Parser {
             });
         }
         if !self.eat_kw("RETURN") {
-            return Err("expected RETURN, SET, or REMOVE".into());
+            return Err("expected RETURN, SET, REMOVE, WITH, or MATCH".into());
         }
         let distinct = self.eat_kw("DISTINCT");
         let items = self.return_items()?;
-
-        // Aggregate iff any item is an aggregate; the non-aggregate items are the
-        // implicit GROUP BY keys. Otherwise a plain projection.
-        let has_agg = items.iter().any(|it| matches!(it, RetItem::Agg(_)));
-        let out_names: Vec<String> = items.iter().map(RetItem::name).collect();
-        plan = if has_agg {
-            let keys = items
-                .iter()
-                .filter_map(|it| match it {
-                    RetItem::Key(name, e) => Some((name.clone(), e.clone())),
-                    RetItem::Agg(_) => None,
-                })
-                .collect();
-            let aggs = items
-                .iter()
-                .filter_map(|it| match it {
-                    RetItem::Agg(a) => Some(a.clone()),
-                    RetItem::Key(..) => None,
-                })
-                .collect();
-            plan.aggregate(keys, aggs)
-        } else {
-            let proj = items
-                .into_iter()
-                .map(|it| match it {
-                    RetItem::Key(name, e) => (name, e),
-                    RetItem::Agg(_) => unreachable!("no aggregates on this branch"),
-                })
-                .collect();
-            plan.project(proj)
-        };
+        let (mut plan, out_names) = apply_items(plan, &items);
 
         if distinct {
             plan = plan.distinct();
@@ -665,15 +647,30 @@ impl Parser {
         if let Some(v) = var {
             scope.insert(v, slots);
         }
+        let from = slots;
         slots += 1;
-        let mut plan = Plan::Scan { label };
+        let plan = self.extend_chain(Plan::Scan { label }, &mut scope, &mut slots, from)?;
+        Ok((plan, scope, slots))
+    }
+
+    /// Parse the `( rel [quantifier] node )*` tail of a pattern, extending `plan`
+    /// (and `scope`/`slots`) hop by hop from the node in slot `from`. Shared by
+    /// the initial `pattern` (which starts from a fresh `Scan`) and a continuing
+    /// `MATCH` after `WITH` (which starts from a carried node's slot), so both
+    /// spell a hop identically.
+    fn extend_chain(
+        &mut self,
+        mut plan: Plan,
+        scope: &mut HashMap<String, usize>,
+        slots: &mut usize,
+        mut from: usize,
+    ) -> Result<Plan, String> {
         while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow)) {
             let rel = self.rel()?;
             let quant = self.opt_quantifier()?;
             let (v2, _lbl2) = self.node()?; // a hop's landing-node label is ignored for now
-            let from = slots - 1;
-            // A relationship variable or inline edge properties require binding the
-            // edge as a slot (edge at `slots`, node at `slots+1`).
+                                            // A relationship variable or inline edge properties require binding the
+                                            // edge as a slot (edge at `slots`, node at `slots+1`).
             let bind = rel.var.is_some() || !rel.props.is_empty();
             if let Some((min, max)) = quant {
                 if bind {
@@ -683,20 +680,23 @@ impl Parser {
                             .into(),
                     );
                 }
+                let node_slot = *slots;
                 if let Some(v) = v2 {
-                    scope.insert(v, slots);
+                    scope.insert(v, node_slot);
                 }
-                slots += 1;
+                *slots += 1;
                 plan = plan.var_length(from, rel.dir, Some(&rel.etype), min, max, true);
+                from = node_slot;
             } else if bind {
-                let edge_slot = slots;
+                let edge_slot = *slots;
                 if let Some(rv) = &rel.var {
                     scope.insert(rv.clone(), edge_slot);
                 }
+                let node_slot = *slots + 1;
                 if let Some(v) = v2 {
-                    scope.insert(v, slots + 1);
+                    scope.insert(v, node_slot);
                 }
-                slots += 2;
+                *slots += 2;
                 plan = plan.expand_edge(from, rel.dir, Some(&rel.etype));
                 // Inline edge props are a match filter on the bound edge.
                 for (k, val) in rel.props {
@@ -709,15 +709,95 @@ impl Parser {
                         right: Box::new(Expr::Lit(val)),
                     });
                 }
+                from = node_slot;
             } else {
+                let node_slot = *slots;
                 if let Some(v) = v2 {
-                    scope.insert(v, slots);
+                    scope.insert(v, node_slot);
                 }
-                slots += 1;
+                *slots += 1;
                 plan = plan.expand(from, rel.dir, Some(&rel.etype));
+                from = node_slot;
             }
         }
-        Ok((plan, scope, slots))
+        Ok(plan)
+    }
+
+    /// A continuing `MATCH` after `WITH`: it must start from a variable already
+    /// carried into scope and extends the working table from that node (rather
+    /// than scanning afresh). A fresh/disconnected subsequent pattern — one whose
+    /// first node is unbound — is not supported in this subset.
+    fn match_continue(&mut self, plan: Plan) -> Result<Plan, String> {
+        let (var, label) = self.node()?;
+        let Some(v) = var else {
+            return Err("a MATCH after WITH must start from a bound variable".into());
+        };
+        if label.is_some() {
+            return Err(format!(
+                "bound variable `{v}` cannot be re-labeled in a continuing MATCH"
+            ));
+        }
+        let Some(&from) = self.scope.get(&v) else {
+            return Err(format!(
+                "continuing MATCH must start from a carried variable; `{v}` is not in scope"
+            ));
+        };
+        // Move scope/slots out so `extend_chain` can borrow them while it also
+        // borrows `self` (the parser cursor); restore them afterwards.
+        let mut scope = std::mem::take(&mut self.scope);
+        let mut slots = self.slots;
+        let mut plan = self.extend_chain(plan, &mut scope, &mut slots, from)?;
+        self.scope = scope;
+        self.slots = slots;
+        if self.eat_kw("WHERE") {
+            plan = plan.filter(self.expr()?);
+        }
+        Ok(plan)
+    }
+
+    /// A `WITH` boundary: project/aggregate the working table (exactly as `RETURN`
+    /// would), then rebind scope so the carried output columns are a fresh slot
+    /// space (`name -> column index`) for the following part. `ORDER BY/SKIP/LIMIT`
+    /// ride the projection; a trailing `WHERE` is a post-projection (HAVING)
+    /// filter, matching lenke-core's `WITH … WHERE`.
+    fn with_clause(&mut self, plan: Plan) -> Result<Plan, String> {
+        let distinct = self.eat_kw("DISTINCT");
+        let items = self.return_items()?;
+        let (mut plan, out_names) = apply_items(plan, &items);
+        if distinct {
+            plan = plan.distinct();
+        }
+        let mut scope = HashMap::new();
+        for (i, name) in out_names.iter().enumerate() {
+            scope.insert(name.clone(), i);
+        }
+        self.scope = scope;
+        self.slots = out_names.len();
+        let keys = if self.eat_kw("ORDER") {
+            if !self.eat_kw("BY") {
+                return Err("expected BY after ORDER".into());
+            }
+            self.sort_keys(&out_names)?
+        } else {
+            Vec::new()
+        };
+        let skip = if self.eat_kw("SKIP") {
+            Some(self.usize_lit()?)
+        } else {
+            None
+        };
+        let limit = if self.eat_kw("LIMIT") {
+            Some(self.usize_lit()?)
+        } else {
+            None
+        };
+        if !keys.is_empty() || skip.is_some() || limit.is_some() {
+            plan = plan.order_page(keys, skip, limit);
+        }
+        if self.eat_kw("WHERE") {
+            plan = plan.filter(self.expr()?);
+        }
+        Ok(plan)
     }
 
     /// An optional `{n}` / `{n,m}` / `{n,}` quantifier after a relationship. An
@@ -834,7 +914,7 @@ impl Parser {
                 let name = if self.eat_kw("AS") {
                     self.ident()?
                 } else {
-                    default_name(&e, idx)
+                    self.item_name(&e, idx)
                 };
                 RetItem::Key(name, e)
             };
@@ -1179,6 +1259,58 @@ impl Parser {
 /// an unbounded quantifier needs the reachability form, not enumeration).
 const MAX_VARLEN: u32 = 32;
 
+/// Build the projection (or aggregation) a `RETURN`/`WITH` item list describes,
+/// attached above `plan`, and return it with the ordered output column names. An
+/// aggregate anywhere makes it an `Aggregate` whose non-aggregate items are the
+/// implicit GROUP BY keys; otherwise a plain `Project`. Shared by `RETURN` and
+/// `WITH` so the two build identical shapes.
+fn apply_items(plan: Plan, items: &[RetItem]) -> (Plan, Vec<String>) {
+    let has_agg = items.iter().any(|it| matches!(it, RetItem::Agg(_)));
+    let out_names: Vec<String> = items.iter().map(RetItem::name).collect();
+    let plan = if has_agg {
+        let keys = items
+            .iter()
+            .filter_map(|it| match it {
+                RetItem::Key(name, e) => Some((name.clone(), e.clone())),
+                RetItem::Agg(_) => None,
+            })
+            .collect();
+        let aggs = items
+            .iter()
+            .filter_map(|it| match it {
+                RetItem::Agg(a) => Some(a.clone()),
+                RetItem::Key(..) => None,
+            })
+            .collect();
+        plan.aggregate(keys, aggs)
+    } else {
+        let proj = items
+            .iter()
+            .map(|it| match it {
+                RetItem::Key(name, e) => (name.clone(), e.clone()),
+                RetItem::Agg(_) => unreachable!("no aggregates on this branch"),
+            })
+            .collect();
+        plan.project(proj)
+    };
+    (plan, out_names)
+}
+
+/// A default output-column name for an un-aliased item, resolving a bare variable
+/// reference (`Expr::Slot`) back to the variable's name — so `WITH a` / `RETURN a`
+/// carries the column under `a`, not `col0`. Falls back to `default_name` for
+/// anything not tied to a single bound name.
+impl Parser {
+    fn item_name(&self, e: &Expr, idx: usize) -> String {
+        if let Expr::Slot(n) = e {
+            if let Some((name, _)) = self.scope.iter().find(|(_, &slot)| slot == *n) {
+                return name.clone();
+            }
+        }
+        default_name(e, idx)
+    }
+}
+
 /// A default output-column name for an un-aliased item.
 fn default_name(e: &Expr, idx: usize) -> String {
     match e {
@@ -1410,6 +1542,104 @@ mod tests {
             &hand,
             &st,
         );
+    }
+
+    #[test]
+    fn with_aggregate_then_having_filter() {
+        use crate::ir::{AggFn, CompareOp, Dir, Expr, Plan};
+        let store = social();
+        // KNOWS out-degree: alice=2 (bob,carol), bob=1 (carol), carol=0. WITH
+        // aggregates the degree, then WHERE filters it (HAVING) — which a single
+        // RETURN cannot do. Only alice survives n >= 2.
+        let hand = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .expand(0, Dir::Out, Some("KNOWS"))
+        .aggregate(
+            vec![("a".into(), Expr::Slot(0))],
+            vec![crate::ir::Agg {
+                func: AggFn::Count,
+                arg: Some(Expr::Slot(1)),
+                distinct: false,
+                name: "n".into(),
+            }],
+        )
+        .filter(Expr::Compare {
+            op: CompareOp::Ge,
+            left: Box::new(Expr::Slot(1)),
+            right: Box::new(Expr::Lit(Value::Num(2.0))),
+        })
+        .project(vec![
+            (
+                "name".into(),
+                Expr::Prop {
+                    slot: 0,
+                    key: "name".into(),
+                },
+            ),
+            ("n".into(), Expr::Slot(1)),
+        ]);
+        let q = "MATCH (a:Person)-[:KNOWS]->(b) WITH a, count(b) AS n WHERE n >= 2 \
+                 RETURN a.name AS name, n";
+        assert_same(q, &hand, &store);
+        // And the concrete answer: alice with degree 2.
+        let out = run(&super::parse(q).unwrap(), &store);
+        assert_eq!(out.rows.len(), 1);
+        assert!(crate::value::equals(&col(&out, 0, "name"), &s("alice")));
+        assert_eq!(num(&col(&out, 0, "n")), 2.0);
+    }
+
+    #[test]
+    fn with_carries_a_node_into_a_continuing_match() {
+        use crate::ir::{CompareOp, Dir, Expr, Plan};
+        let store = social();
+        // Carry `a`, filter it (HAVING), then continue the pattern FROM `a`. Only
+        // alice(30)/carol(40) pass age>=30; alice KNOWS bob,carol and carol knows
+        // no one out, so the endpoints are bob and carol.
+        let hand = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .project(vec![("a".into(), Expr::Slot(0))])
+        .filter(Expr::Compare {
+            op: CompareOp::Ge,
+            left: Box::new(Expr::Prop {
+                slot: 0,
+                key: "age".into(),
+            }),
+            right: Box::new(Expr::Lit(Value::Num(30.0))),
+        })
+        .expand(0, Dir::Out, Some("KNOWS"))
+        .project(vec![(
+            "name".into(),
+            Expr::Prop {
+                slot: 1,
+                key: "name".into(),
+            },
+        )]);
+        let q = "MATCH (a:Person) WITH a WHERE a.age >= 30 \
+                 MATCH (a)-[:KNOWS]->(b) RETURN b.name AS name";
+        assert_same(q, &hand, &store);
+        assert_eq!(names(&store, q), vec!["bob", "carol"]);
+    }
+
+    #[test]
+    fn with_order_by_alias_and_limit_pages() {
+        let store = social();
+        // WITH projects age+name, pages by age DESC LIMIT 2 (carol 40, alice 30 —
+        // bob 25 is dropped), then RETURN name. The surviving set is {alice,carol}.
+        let q = "MATCH (p:Person) WITH p.age AS age, p.name AS name \
+                 ORDER BY age DESC LIMIT 2 RETURN name";
+        assert_eq!(names(&store, q), vec!["alice", "carol"]);
+    }
+
+    #[test]
+    fn continuing_match_from_unbound_variable_errors() {
+        // After `WITH a`, only `a` is in scope; a continuing MATCH from an unbound
+        // variable is a clear parse error, not a silent fresh scan.
+        let err =
+            super::parse("MATCH (a:Person) WITH a MATCH (z)-[:KNOWS]->(y) RETURN y.name AS name")
+                .unwrap_err();
+        assert!(err.contains("not in scope"), "got: {err}");
     }
 
     #[test]
