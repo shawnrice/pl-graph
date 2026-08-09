@@ -667,6 +667,14 @@ fn chain_width(plan: &Plan) -> Option<usize> {
 /// without ever materializing the earlier slots. `None` if the plan is not such
 /// a chain. This is the batch model's payoff: when nothing above the chain reads
 /// an earlier slot, the chain need only carry its frontier.
+///
+/// Rejected optimization: replacing this Vec with a streaming `for_each_frontier`
+/// callback (so the fused counts never build the intermediate at all). It had to
+/// pass the callback as `&mut dyn FnMut` — a generic bound blows monomorphization
+/// on the recursion — and the resulting per-node indirect call, nested one level
+/// per hop, cost MORE than building and rescanning the vector: at 1M/8 it moved
+/// 2-hop count(*) 40->64ms and count(DISTINCT) 54->62ms. The sequential Vec push
+/// is cheap; per-element dynamic dispatch over tens of millions of nodes is not.
 fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
     match plan {
         Plan::Scan { label } => Some(match label {
