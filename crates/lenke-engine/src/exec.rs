@@ -415,6 +415,7 @@ fn needs_lineage(plan: &Plan) -> bool {
                 branches.iter().any(|(c, v)| reads_path(c) || reads_path(v))
                     || otherwise.as_deref().is_some_and(reads_path)
             }
+            Expr::Cast { expr, .. } => reads_path(expr),
             Expr::Slot(_) | Expr::Prop { .. } | Expr::Lit(_) => false,
         }
     }
@@ -1328,6 +1329,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
                 && otherwise.as_deref().is_none_or(|e| refs_only_slot(e, s))
         }
         Expr::Compare { left, right, .. } => refs_only_slot(left, s) && refs_only_slot(right, s),
+        Expr::Cast { expr, .. } => refs_only_slot(expr, s),
     }
 }
 
@@ -1374,6 +1376,10 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
             otherwise: otherwise
                 .as_ref()
                 .map(|e| Box::new(remap_slot(e, from, to))),
+        },
+        Expr::Cast { target, expr } => Expr::Cast {
+            target: *target,
+            expr: go(expr),
         },
     }
 }
@@ -1803,6 +1809,18 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 .collect();
             Col::Gen(out)
         }
+        Expr::Cast { target, expr } => {
+            // Evaluate the input, then cast per row via the value contract. A
+            // failed conversion aborts the whole evaluation (E_INVALID_VALUE) —
+            // the read pipeline is fallible precisely so this can throw.
+            let col = eval(expr, store, batch)?;
+            let t = value::CastTarget::from(*target);
+            let mut out = Vec::with_capacity(col.len());
+            for i in 0..col.len() {
+                out.push(value::cast(&col.value_at(i), t)?);
+            }
+            Col::Gen(out)
+        }
     })
 }
 
@@ -2182,6 +2200,48 @@ mod tests {
         let mut got = names_of(&out, 0);
         got.sort();
         assert_eq!(got, vec!["alice", "bob", "carol"]);
+    }
+
+    #[test]
+    fn cast_projects_per_row() {
+        let store = social();
+        // Cast each Person's numeric age to INTEGER (identity here; the ages are
+        // already whole) — verifies the per-row Cast arm wires through Project.
+        let plan = scan("Person").project(vec![(
+            "a".into(),
+            Expr::Cast {
+                target: crate::ir::CastTarget::Integer,
+                expr: Box::new(prop(0, "age")),
+            },
+        )]);
+        let out = run(&plan, &store);
+        let mut got: Vec<f64> = out
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Num(x) => x,
+                ref o => panic!("expected Num, got {o:?}"),
+            })
+            .collect();
+        got.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+        assert_eq!(got, vec![25.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    fn cast_fault_surfaces_through_try_run() {
+        let store = social();
+        // "alice" has no numeric form → the CAST throws E_INVALID_VALUE, and the
+        // fallible `try_run` returns that Err (this is why the read pipeline
+        // threads Result at all; `run` would panic on the same plan).
+        let plan = scan("Person").project(vec![(
+            "n".into(),
+            Expr::Cast {
+                target: crate::ir::CastTarget::Integer,
+                expr: Box::new(prop(0, "name")),
+            },
+        )]);
+        let err = try_run(&plan, &store).unwrap_err();
+        assert!(err.contains("E_INVALID_VALUE"), "got: {err}");
     }
 
     #[test]

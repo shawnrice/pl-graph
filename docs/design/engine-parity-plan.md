@@ -167,8 +167,11 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
         `order_page`/`try_frontier_aggregate` return `Result<_,String>`; added
         `try_run`, `run` wraps it with `.expect`; `execute` uses `try_run` and
         MERGE eval faults roll back. Pure refactor, all 190 tests green.
-  - [ ] E5b. `CAST(<expr> AS <TYPE>)`: IR `Expr::Cast` + `value::cast()` (the
-        coercion home, per the decision above); eval throws on failure.
+  - [x] E5b. `CAST(<expr> AS <TYPE>)`: IR `Expr::Cast`/`CastTarget` +
+        `value::cast()` (the coercion home) + GQL `CAST(e AS TYPE)` parsing
+        (INTEGER/INT, FLOAT/…, STRING/…, BOOL/BOOLEAN). Throws E_INVALID_VALUE
+        on failure, INTEGER truncates toward zero, null→null, broad conversions.
+        9 tests (value table, per-row eval, fault via try_run, parse vs hand plan).
 - [ ] E6. 3VL completeness: `IS NULL`, property-exists, `AND`/`OR`/`NOT` gaps.
 
 ### Phase F — Query surface

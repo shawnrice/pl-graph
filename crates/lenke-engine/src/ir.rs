@@ -69,6 +69,26 @@ pub enum Expr {
     List {
         items: Vec<Expr>,
     },
+    /// `CAST(<expr> AS <TYPE>)`. The coercion itself lives in `value::cast` (the
+    /// single home for the conversion table); a failed conversion throws
+    /// `E_INVALID_VALUE` (the read pipeline is fallible — see `exec::try_run`),
+    /// while a NULL input casts to NULL for every target.
+    Cast {
+        target: CastTarget,
+        expr: Box<Expr>,
+    },
+}
+
+/// The target type of a `CAST`. The engine has one numeric type (`f64`), so
+/// `Integer` and `Float` both land in `Value::Num`; `Integer` differs only in
+/// truncating toward zero. The conversion table for each target is in
+/// `value::cast`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CastTarget {
+    Integer,
+    Float,
+    String,
+    Boolean,
 }
 
 /// A binary arithmetic operator.

@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use crate::ir::{AggFn, CompareOp, Dir, Expr, Plan};
+use crate::ir::{AggFn, CastTarget, CompareOp, Dir, Expr, Plan};
 use crate::value::Value;
 
 /// A parsed relationship pattern `-[var:Type {props}]->`: direction, edge type,
@@ -1029,6 +1029,11 @@ impl Parser {
                 if s.eq_ignore_ascii_case("case") {
                     return self.case_expr();
                 }
+                // CAST(<expr> AS <TYPE>) — parsed before the generic call form
+                // because of its `AS TYPE` tail.
+                if s.eq_ignore_ascii_case("cast") {
+                    return self.cast_expr();
+                }
                 // A scalar function call `name(args…)`. (Aggregates are handled in
                 // return_items, never reached here.)
                 if self.peek() == Some(&Tok::LParen) {
@@ -1076,6 +1081,27 @@ impl Parser {
             branches,
             otherwise,
         })
+    }
+
+    // cast := CAST '(' expr AS TYPE ')'. The engine has one numeric type, so
+    // INTEGER and its aliases map to `Integer` (truncating) and the float/number
+    // spellings to `Float`; the coercion table itself lives in `value::cast`.
+    fn cast_expr(&mut self) -> Result<Expr, String> {
+        self.expect(&Tok::LParen)?;
+        let expr = Box::new(self.expr()?);
+        if !self.eat_kw("AS") {
+            return Err("expected AS in CAST(expr AS TYPE)".into());
+        }
+        let ty = self.ident()?;
+        let target = match ty.to_ascii_uppercase().as_str() {
+            "INTEGER" | "INT" => CastTarget::Integer,
+            "FLOAT" | "DOUBLE" | "REAL" | "NUMBER" | "NUMERIC" => CastTarget::Float,
+            "STRING" | "VARCHAR" | "TEXT" | "CHAR" => CastTarget::String,
+            "BOOL" | "BOOLEAN" => CastTarget::Boolean,
+            other => return Err(format!("unknown CAST target type `{other}`")),
+        };
+        self.expect(&Tok::RParen)?;
+        Ok(Expr::Cast { target, expr })
     }
 
     // call := name '(' [ expr (',' expr)* ] ')'  — a scalar function.
@@ -1198,6 +1224,57 @@ mod tests {
             },
         )]);
         assert_same("MATCH (p:Person) RETURN p.name", &hand, &store);
+    }
+
+    #[test]
+    fn cast_parses_target_and_runs() {
+        use crate::ir::{CastTarget, Expr, Plan};
+        let store = social();
+        let hand = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .project(vec![(
+            "a".into(),
+            Expr::Cast {
+                target: CastTarget::String,
+                expr: Box::new(Expr::Prop {
+                    slot: 0,
+                    key: "age".into(),
+                }),
+            },
+        )]);
+        assert_same(
+            "MATCH (p:Person) RETURN CAST(p.age AS STRING) AS a",
+            &hand,
+            &store,
+        );
+    }
+
+    #[test]
+    fn cast_integer_alias_and_bad_type() {
+        use crate::ir::{CastTarget, Expr, Plan};
+        let store = social();
+        // The `INT` alias parses to the same `Integer` target as `INTEGER`.
+        let hand = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .project(vec![(
+            "a".into(),
+            Expr::Cast {
+                target: CastTarget::Integer,
+                expr: Box::new(Expr::Prop {
+                    slot: 0,
+                    key: "age".into(),
+                }),
+            },
+        )]);
+        assert_same(
+            "MATCH (p:Person) RETURN CAST(p.age AS INT) AS a",
+            &hand,
+            &store,
+        );
+        // An unknown target type is a parse error, not a silent fallback.
+        assert!(super::parse("MATCH (p:Person) RETURN CAST(p.age AS WIDGET) AS a").is_err());
     }
 
     #[test]

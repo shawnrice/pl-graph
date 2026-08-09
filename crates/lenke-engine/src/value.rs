@@ -114,6 +114,107 @@ pub fn as_num(v: &Value) -> Option<f64> {
     }
 }
 
+/// The target type of a `CAST`, mirrored from `ir::CastTarget` so the conversion
+/// table lives beside the rest of the value contract. Kept in sync by the
+/// `From<ir::CastTarget>` below — a new target forces an arm here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CastTarget {
+    Integer,
+    Float,
+    String,
+    Boolean,
+}
+
+impl From<crate::ir::CastTarget> for CastTarget {
+    fn from(t: crate::ir::CastTarget) -> Self {
+        match t {
+            crate::ir::CastTarget::Integer => Self::Integer,
+            crate::ir::CastTarget::Float => Self::Float,
+            crate::ir::CastTarget::String => Self::String,
+            crate::ir::CastTarget::Boolean => Self::Boolean,
+        }
+    }
+}
+
+/// Coerce `v` to `target`, the ONE home for the conversion table. Policy (fixed
+/// by the design decision): a failed conversion is `Err(E_INVALID_VALUE)` — the
+/// caller turns that into a thrown error — while a NULL input is NULL for every
+/// target. `INTEGER` truncates toward zero (still an `f64`, since the engine has
+/// one numeric type); `Float` is the identity on numbers. The set of accepted
+/// source→target pairs is deliberately broad: string↔number, anything→string,
+/// number↔bool (`0`/nonzero), and string→bool (`"true"`/`"false"`).
+///
+/// # Errors
+/// Returns `Err` with an `E_INVALID_VALUE` message when the source value has no
+/// conversion to `target` (a non-numeric string to a number, a non-`true`/`false`
+/// string to a boolean, a non-finite number to an integer, a list to a scalar).
+pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
+    // NULL casts to NULL for every target — the one rule that precedes the table.
+    if v.is_null() {
+        return Ok(Value::Null);
+    }
+    let bad = |from: &str, to: &str| Err(format!("E_INVALID_VALUE: cannot cast {from} to {to}"));
+    match target {
+        CastTarget::Integer | CastTarget::Float => {
+            let n = match v {
+                Value::Num(x) => *x,
+                Value::Bool(b) => {
+                    if *b {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                Value::Str(s) => s
+                    .trim()
+                    .parse::<f64>()
+                    .map_err(|_| format!("E_INVALID_VALUE: cannot cast string {s:?} to number"))?,
+                Value::List(_) => return bad("list", "number"),
+                Value::Null => unreachable!("null handled above"),
+            };
+            if target == CastTarget::Integer {
+                // Truncate toward zero. A non-finite value has no integer form.
+                if !n.is_finite() {
+                    return bad("non-finite number", "integer");
+                }
+                Ok(Value::Num(n.trunc()))
+            } else {
+                Ok(Value::Num(n))
+            }
+        }
+        CastTarget::String => Ok(Value::Str(Arc::from(
+            match v {
+                Value::Str(s) => return Ok(Value::Str(s.clone())),
+                // Numbers render as they do on egress (`f64::to_string`); a non-finite
+                // number has no textual form here.
+                Value::Num(x) => {
+                    if x.is_finite() {
+                        x.to_string()
+                    } else {
+                        return bad("non-finite number", "string");
+                    }
+                }
+                Value::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
+                Value::List(_) => return bad("list", "string"),
+                Value::Null => unreachable!("null handled above"),
+            }
+            .as_str(),
+        ))),
+        CastTarget::Boolean => match v {
+            Value::Bool(b) => Ok(Value::Bool(*b)),
+            // Numeric truthiness: zero is false, every other (incl. NaN) is true.
+            Value::Num(x) => Ok(Value::Bool(*x != 0.0)),
+            Value::Str(s) => match s.trim() {
+                "true" => Ok(Value::Bool(true)),
+                "false" => Ok(Value::Bool(false)),
+                _ => bad(&format!("string {s:?}"), "boolean"),
+            },
+            Value::List(_) => bad("list", "boolean"),
+            Value::Null => unreachable!("null handled above"),
+        },
+    }
+}
+
 /// The canonical bit pattern a number groups by: all NaNs collapse to one
 /// pattern, and `-0.0`/`0.0` collapse to `+0.0` — so each groups with its kind,
 /// the inverse of predicate equality. This is the ONE place that rule lives; a
@@ -243,6 +344,107 @@ mod tests {
         assert_ne!(group_key(&n(1.0)), group_key(&s("1"))); // no cross-type collision
         assert_ne!(group_key(&Value::Bool(true)), group_key(&n(1.0)));
         assert_eq!(group_key(&Value::Null), group_key(&Value::Null));
+    }
+
+    fn b(x: bool) -> Value {
+        Value::Bool(x)
+    }
+
+    #[test]
+    fn cast_null_is_null_for_every_target() {
+        for t in [
+            CastTarget::Integer,
+            CastTarget::Float,
+            CastTarget::String,
+            CastTarget::Boolean,
+        ] {
+            assert!(cast(&Value::Null, t).unwrap().is_null());
+        }
+    }
+
+    #[test]
+    fn cast_to_integer_truncates_toward_zero() {
+        // Positive and negative both truncate toward zero (not floor).
+        assert!(equals(
+            &cast(&n(3.9), CastTarget::Integer).unwrap(),
+            &n(3.0)
+        ));
+        assert!(equals(
+            &cast(&n(-3.9), CastTarget::Integer).unwrap(),
+            &n(-3.0)
+        ));
+        // Via a string, and via a bool.
+        assert!(equals(
+            &cast(&s("  7.5 "), CastTarget::Integer).unwrap(),
+            &n(7.0)
+        ));
+        assert!(equals(
+            &cast(&b(true), CastTarget::Integer).unwrap(),
+            &n(1.0)
+        ));
+        assert!(equals(
+            &cast(&b(false), CastTarget::Integer).unwrap(),
+            &n(0.0)
+        ));
+        // A non-finite number has no integer form → throw.
+        assert!(cast(&n(f64::NAN), CastTarget::Integer).is_err());
+        assert!(cast(&n(f64::INFINITY), CastTarget::Integer).is_err());
+        // A non-numeric string → throw.
+        assert!(cast(&s("nope"), CastTarget::Integer).is_err());
+    }
+
+    #[test]
+    fn cast_to_float_parses_and_identities() {
+        assert!(equals(&cast(&n(2.5), CastTarget::Float).unwrap(), &n(2.5)));
+        assert!(equals(
+            &cast(&s("2.5"), CastTarget::Float).unwrap(),
+            &n(2.5)
+        ));
+        assert!(equals(&cast(&b(true), CastTarget::Float).unwrap(), &n(1.0)));
+        assert!(cast(&s("x"), CastTarget::Float).is_err());
+    }
+
+    #[test]
+    fn cast_to_string_renders_scalars() {
+        assert!(equals(&cast(&n(3.0), CastTarget::String).unwrap(), &s("3")));
+        assert!(equals(
+            &cast(&b(true), CastTarget::String).unwrap(),
+            &s("true")
+        ));
+        assert!(equals(
+            &cast(&s("hi"), CastTarget::String).unwrap(),
+            &s("hi")
+        ));
+        // Non-finite numbers and lists have no textual form here → throw.
+        assert!(cast(&n(f64::NAN), CastTarget::String).is_err());
+        assert!(cast(&Value::List(vec![n(1.0)]), CastTarget::String).is_err());
+    }
+
+    #[test]
+    fn cast_to_boolean_uses_zero_and_true_false() {
+        assert!(equals(
+            &cast(&b(true), CastTarget::Boolean).unwrap(),
+            &b(true)
+        ));
+        // Numeric truthiness: 0 is false, everything else true.
+        assert!(equals(
+            &cast(&n(0.0), CastTarget::Boolean).unwrap(),
+            &b(false)
+        ));
+        assert!(equals(
+            &cast(&n(-2.0), CastTarget::Boolean).unwrap(),
+            &b(true)
+        ));
+        // Only the words true/false convert (trimmed); anything else throws.
+        assert!(equals(
+            &cast(&s(" true "), CastTarget::Boolean).unwrap(),
+            &b(true)
+        ));
+        assert!(equals(
+            &cast(&s("false"), CastTarget::Boolean).unwrap(),
+            &b(false)
+        ));
+        assert!(cast(&s("yes"), CastTarget::Boolean).is_err());
     }
 
     #[test]

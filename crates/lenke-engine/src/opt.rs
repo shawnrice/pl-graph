@@ -364,6 +364,7 @@ fn max_slot(expr: &Expr) -> Option<usize> {
             m
         }
         Expr::Compare { left, right, .. } => merge_max(max_slot(left), max_slot(right)),
+        Expr::Cast { expr, .. } => max_slot(expr),
     }
 }
 
