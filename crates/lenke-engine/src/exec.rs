@@ -7,6 +7,7 @@
 //! same operators lands with the operators (path/tags) that need it.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use crate::batch::{Batch, Col, Lineage};
 use crate::ir::{Agg, AggFn, CompareOp, Dir, Expr, Plan};
@@ -395,7 +396,7 @@ fn assign_groups(key_cols: &[Col], n: usize) -> (Vec<u32>, Vec<usize>) {
             // group bits are the same integer).
             Col::Nodes(v) => return group_by(n, v.iter().map(|&x| u64::from(x))),
             Col::Bool(v) => return group_by(n, v.iter().map(|&b| u64::from(b))),
-            Col::Str(v) => return group_by_ref(n, v.iter().map(std::convert::AsRef::as_ref)),
+            Col::Str(v) => return group_by_arc(v),
             Col::Gen(_) => {} // mixed: fall through to the byte-key path
         }
     }
@@ -447,19 +448,21 @@ fn group_by<K: std::hash::Hash + Eq>(
     (group_of, first_row)
 }
 
-/// Group by a borrowed key (strings): the owned key is cloned only when a row
-/// opens a new group, so a million-row column over a thousand names clones a
-/// thousand `Arc`s, not a million.
-fn group_by_ref<'a>(n: usize, keys: impl Iterator<Item = &'a str>) -> (Vec<u32>, Vec<usize>) {
-    let mut of: FnvMap<Box<str>, u32> = FnvMap::default();
-    let mut group_of = Vec::with_capacity(n);
+/// Group a string column keyed on the `Arc<str>` itself: a row that opens a new
+/// group stores a clone of the shared pointer (a refcount bump), NOT a freshly
+/// allocated `Box<str>` — so a million distinct strings cost a million refcount
+/// bumps, not a million heap allocations + copies. Lookups borrow `&str`, so a
+/// repeated string never touches the allocator.
+fn group_by_arc(keys: &[Arc<str>]) -> (Vec<u32>, Vec<usize>) {
+    let mut of: FnvMap<Arc<str>, u32> = FnvMap::default();
+    let mut group_of = Vec::with_capacity(keys.len());
     let mut first_row = Vec::new();
-    for (i, k) in keys.enumerate() {
-        let g = match of.get(k) {
+    for (i, k) in keys.iter().enumerate() {
+        let g = match of.get(k.as_ref()) {
             Some(&g) => g,
             None => {
                 let g = first_row.len() as u32;
-                of.insert(Box::from(k), g);
+                of.insert(Arc::clone(k), g);
                 first_row.push(i);
                 g
             }
@@ -811,11 +814,13 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
 /// `count(*)` grouped by a single property of the frontier node, computed by
 /// grouping on the integer node id FIRST, then merging node groups by the
 /// property value. The property is a function of the node, so two rows on the
-/// same node share a property value: grouping 8M rows by their (cheap) node id
-/// and reading/hashing the property for only the distinct nodes replaces millions
-/// of string hashes and `Arc` clones with integer ones. First-seen order is
-/// preserved because the distinct nodes are visited in first-appearance order, so
-/// a property value is first seen at the earliest node — hence earliest row —
+/// same node share a property value: counting 8M endpoints by their (cheap,
+/// dense) node id and reading/hashing the property for only the distinct nodes
+/// replaces millions of string hashes and `Arc` clones with a direct-mapped
+/// array index each. The final hop is fused into the count — endpoints are
+/// streamed straight into the array, never materialized as a column. First-seen
+/// order is preserved: the distinct nodes are visited in first-appearance order,
+/// so a property value is first seen at the earliest node — hence earliest row —
 /// carrying it. `None` for any other shape (non-count aggregate, key that is not
 /// a lone frontier property), which falls through to the general frontier path.
 fn try_node_grouped_count(
@@ -829,25 +834,55 @@ fn try_node_grouped_count(
         return None;
     }
     let [(_, key_expr)] = keys else { return None };
-    let last = chain_width(input)? - 1;
+    // The group node is the endpoint of a final Expand over a Scan/Expand chain.
+    let Plan::Expand {
+        input: inner,
+        from,
+        dir,
+        edge_label,
+    } = input
+    else {
+        return None;
+    };
+    let w = chain_width(inner)?;
+    if *from + 1 != w {
+        return None; // the final Expand must expand the current frontier
+    }
     let Expr::Prop { slot, key } = key_expr else {
         return None;
     };
-    if *slot != last {
-        return None;
+    if *slot != w {
+        return None; // key must read the endpoint (last) slot, index == w
     }
-    let frontier = frontier_ids(input, store)?;
-    let n = frontier.len();
+    let want = match edge_label {
+        None => None,
+        Some(name) => match store.etype_id(name) {
+            Some(id) => Some(id),
+            None => return Some(Batch::of(vec![Col::Nodes(vec![]), Col::Gen(vec![])])),
+        },
+    };
+    let src = frontier_ids(inner, store)?; // nodes feeding the final hop, w/ multiplicity
 
-    // Level 1: group by node id, tally per node, record each node's first row.
-    let (node_of, first) = group_by(n, frontier.iter().copied());
-    let mut node_count = vec![0f64; first.len()];
-    for &g in &node_of {
-        node_count[g as usize] += 1.0;
+    // Level 1: count per endpoint node id via a direct-mapped array (no hashing —
+    // node ids are dense), with the final hop fused in so endpoints never
+    // materialize. Distinct ids come out in first-seen order.
+    let mut group_of = vec![u32::MAX; store.node_count()];
+    let mut rep_ids: Vec<u32> = Vec::new();
+    let mut node_count: Vec<f64> = Vec::new();
+    for &v in &src {
+        for_each_nbr(store, v, *dir, want, |nbr| {
+            let slot = &mut group_of[nbr as usize];
+            if *slot == u32::MAX {
+                *slot = u32::try_from(rep_ids.len()).expect("group count fits in u32");
+                rep_ids.push(nbr);
+                node_count.push(1.0);
+            } else {
+                node_count[*slot as usize] += 1.0;
+            }
+        });
     }
-    let rep_ids: Vec<u32> = first.iter().map(|&i| frontier[i]).collect();
 
-    // Read the grouping property for the DISTINCT nodes only.
+    // Read the grouping property for the DISTINCT endpoint nodes only.
     let key_col = read_property(store, &Col::Nodes(rep_ids), key);
 
     // Level 2: merge node groups by property value, summing their counts.
