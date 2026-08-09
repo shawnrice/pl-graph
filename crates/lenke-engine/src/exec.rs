@@ -1716,11 +1716,20 @@ fn shortest_path(
         return empty();
     };
 
+    // When the input carries a path, reconstruct each shortest path (BFS
+    // predecessors) so `Expr::Path` — hence `nodes(p)`/`path_length(p)` — sees the
+    // whole node chain, not just the endpoint.
+    let track = batch.lineage.is_some();
+    let mut path_values: Vec<Value> = Vec::new();
+    let mut path_offsets: Vec<usize> = vec![0];
+
     let mut keep = Vec::new();
     let mut ends = Vec::new();
     for (row, &start) in src.iter().enumerate() {
         let mut visited: FnvSet<u32> = FnvSet::default();
         visited.insert(start);
+        // child -> parent, for reconstructing the shortest path back to `start`.
+        let mut pred: FnvMap<u32, u32> = FnvMap::default();
         let mut q: VecDeque<(u32, u32)> = VecDeque::new();
         q.push_back((start, 0));
         while let Some((v, d)) = q.pop_front() {
@@ -1742,6 +1751,24 @@ fn shortest_path(
                 if visited.insert(a.nbr) {
                     keep.push(row);
                     ends.push(a.nbr);
+                    if track {
+                        pred.insert(a.nbr, v);
+                        // Walk parents back to `start` (its pred is never set), then
+                        // append `start..target` to the input row's path prefix.
+                        let mut chain = vec![a.nbr];
+                        let mut cur = a.nbr;
+                        while cur != start {
+                            cur = pred[&cur];
+                            chain.push(cur);
+                        }
+                        chain.reverse(); // start .. target
+                        let in_path = batch.lineage.as_ref().expect("track").path_at(row);
+                        path_values.extend_from_slice(in_path); // ends at `start`
+                        for &node in &chain[1..] {
+                            path_values.push(Value::Num(f64::from(node)));
+                        }
+                        path_offsets.push(path_values.len());
+                    }
                     q.push_back((a.nbr, d + 1));
                 }
             }
@@ -1750,7 +1777,14 @@ fn shortest_path(
 
     let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
     slots.push(Col::Nodes(ends));
-    Batch::of(slots)
+    let mut out = Batch::of(slots);
+    if track {
+        out.lineage = Some(Lineage {
+            values: path_values,
+            offsets: path_offsets,
+        });
+    }
+    out
 }
 
 /// Evaluate `expr` over every row of `batch`, producing a column.
@@ -2034,6 +2068,16 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         },
         "last" => match &args[0] {
             Value::List(v) => v.last().cloned().unwrap_or(Value::Null),
+            _ => Value::Null,
+        },
+        // path accessors (1 arg): a path is a List of its node ids.
+        "nodes" => match &args[0] {
+            Value::List(_) => args[0].clone(), // the node chain itself
+            _ => Value::Null,
+        },
+        "path_length" => match &args[0] {
+            // Hops = nodes - 1; a single-node (or empty) path has length 0.
+            Value::List(v) => Value::Num(v.len().saturating_sub(1) as f64),
             _ => Value::Null,
         },
         _ => Value::Null, // parser rejects unknown names; defensive

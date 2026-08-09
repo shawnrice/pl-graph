@@ -206,7 +206,17 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       catalog IS the graph algorithms (I1), so it lands with them (same
       dependency-driven move as D3 → G4/G5). OPTIONAL CALL and an aggregating
       subquery body are deferred.
-- [ ] F4. Path values: `ANY SHORTEST p = …`, accessors (length/nodes/rels).
+- [x] F4. Path values: `MATCH p = ANY SHORTEST (a)-[:R]->*(b)` binds `p` to the
+      row's path (lineage); `shortest_path` now reconstructs the full node chain
+      via BFS predecessors, and accessors `nodes(p)` / `path_length(p)` read it.
+      Parser: `path_vars` resolve to `Expr::Path`; shared `query_tail`; `*`/`+`
+      quantifier (edge type required). 5 tests (length + hand plan, node-chain
+      reconstruction, two errors). `relationships(p)`/`elements(p)` need edge-level
+      lineage → F4b.
+- [ ] F4b. Edge-level path lineage: carry the traversed edge ids alongside the
+      node chain (Expand/VarLength/ShortestPath), enabling `relationships(p)` and
+      `elements(p)` (deferred from F4 — node-only lineage can't name edges
+      unambiguously in a multigraph).
 - [ ] F5. Gremlin step breadth (select, where(P), order(local), groupCount, …).
 
 ### Phase G — Data model

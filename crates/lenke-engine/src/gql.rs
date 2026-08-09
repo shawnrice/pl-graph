@@ -12,7 +12,7 @@
 //! / literal items with optional `AS alias`. Aggregation, ORDER/SKIP/LIMIT,
 //! DISTINCT, comma-joins, and variable-length join in later iterations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ir::{AggFn, CastTarget, CompareOp, Dir, Expr, Plan};
 use crate::value::Value;
@@ -63,6 +63,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         pos: 0,
         scope: HashMap::new(),
         slots: 0,
+        path_vars: HashSet::new(),
     };
     let plan = p.query()?;
     if p.pos != p.toks.len() {
@@ -204,6 +205,10 @@ struct Parser {
     scope: HashMap<String, usize>,
     /// number of bound slots so far (the next slot to assign).
     slots: usize,
+    /// Names bound to the current row's PATH (a `MATCH p = ANY SHORTEST …`). They
+    /// resolve to `Expr::Path` rather than a slot, since the path is the lineage
+    /// sidecar — one per row — not a batch column.
+    path_vars: HashSet<String>,
 }
 
 impl Parser {
@@ -273,6 +278,20 @@ impl Parser {
         if !self.eat_kw("MATCH") {
             return Err("expected MATCH or INSERT".into());
         }
+        // Named-path form: `MATCH p = ANY SHORTEST (a)-[:R]->*(b)`. The path
+        // variable binds to the row's path (lineage); the rest of the query
+        // (WHERE/WITH/RETURN) is shared with the ordinary pattern below.
+        if matches!(self.peek(), Some(Tok::Ident(_)))
+            && self.toks.get(self.pos + 1) == Some(&Tok::Eq)
+        {
+            let (mut plan, scope, slots) = self.shortest_path_binding()?;
+            self.scope = scope;
+            self.slots = slots;
+            if self.eat_kw("WHERE") {
+                plan = plan.filter(self.expr()?);
+            }
+            return self.query_tail(plan);
+        }
         // A comma-separated list of patterns, joined on shared variables. Each
         // pattern parses in its OWN slot space; join maps a shared variable's
         // left slot to its right slot, and the merged scope shifts the right
@@ -298,6 +317,14 @@ impl Parser {
             let pred = self.expr()?;
             plan = plan.filter(pred);
         }
+        self.query_tail(plan)
+    }
+
+    /// The clauses after the first `MATCH … [WHERE]`: chained parts
+    /// (`WITH`/continuing `MATCH`/`CALL`), then the write tail (`SET`/`REMOVE`) or
+    /// the read tail (`RETURN` + `ORDER BY`/`SKIP`/`LIMIT`). Shared by the ordinary
+    /// and the named-path (`ANY SHORTEST`) entry points.
+    fn query_tail(&mut self, mut plan: Plan) -> Result<Plan, String> {
         // Chained query parts: a `WITH` projection boundary (which rebinds scope
         // to its carried columns) or a continuing `MATCH` (which extends the
         // working table from a carried variable). Loops until the tail clause.
@@ -356,6 +383,42 @@ impl Parser {
             plan = plan.order_page(keys, skip, limit);
         }
         Ok(plan)
+    }
+
+    /// `p = ANY SHORTEST (a)-[:R]->*(b)` — the ANY-shortest named-path pattern.
+    /// Binds `p` to the row's path, `a` to slot 0 and `b` to slot 1, and plans a
+    /// `ShortestPath` hop. The `*`/`+` quantifier is unbounded (`{…}` shortest is
+    /// deferred); an edge type is required, as elsewhere in this subset.
+    fn shortest_path_binding(&mut self) -> Result<(Plan, HashMap<String, usize>, usize), String> {
+        let pname = self.ident()?;
+        self.expect(&Tok::Eq)?;
+        if !(self.eat_kw("ANY") && self.eat_kw("SHORTEST")) {
+            return Err(
+                "a named path requires `ANY SHORTEST` (other path selectors \
+                        are not supported)"
+                    .into(),
+            );
+        }
+        let mut scope: HashMap<String, usize> = HashMap::new();
+        let (va, la) = self.node()?;
+        if let Some(v) = va {
+            scope.insert(v, 0);
+        }
+        let rel = self.rel()?;
+        // The reachability quantifier: `*` or `+` (both unbounded here).
+        if !(self.eat(&Tok::Star) || self.eat(&Tok::Plus)) {
+            return Err(
+                "`ANY SHORTEST` requires a `*` or `+` quantifier on the relationship".into(),
+            );
+        }
+        let (vb, _lb) = self.node()?;
+        if let Some(v) = vb {
+            scope.insert(v, 1);
+        }
+        self.path_vars.insert(pname);
+        let plan =
+            Plan::Scan { label: la }.shortest_path(0, rel.dir, Some(rel.etype.as_str()), None);
+        Ok((plan, scope, 2))
     }
 
     // sort keys := name [ASC|DESC] ( ',' name [ASC|DESC] )*
@@ -1244,6 +1307,11 @@ impl Parser {
                 if self.peek() == Some(&Tok::LParen) {
                     return self.call(&s);
                 }
+                // A path variable resolves to the current row's path (lineage),
+                // not a slot — there is exactly one path per row.
+                if self.path_vars.contains(&s) {
+                    return Ok(Expr::Path);
+                }
                 let slot = *self
                     .scope
                     .get(&s)
@@ -1388,7 +1456,7 @@ impl Parser {
         let arity_ok = match lname.as_str() {
             // 1 arg
             "abs" | "sign" | "floor" | "ceil" | "round" | "sqrt" | "upper" | "lower" | "trim"
-            | "length" | "size" | "head" | "last" => args.len() == 1,
+            | "length" | "size" | "head" | "last" | "nodes" | "path_length" => args.len() == 1,
             // 2 args
             "starts_with" | "ends_with" | "contains" => args.len() == 2,
             // 3 args
@@ -1962,6 +2030,87 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("not bound"), "got: {err}");
+    }
+
+    /// A straight chain a→b→c→d over LINK edges (node ids 0,1,2,3). Shortest
+    /// paths have distinct, checkable lengths — unlike the dense `social()`.
+    fn chain() -> Store {
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[("name", s("a"))]);
+        let bb = b.node(&["N"], &[("name", s("b"))]);
+        let c = b.node(&["N"], &[("name", s("c"))]);
+        let d = b.node(&["N"], &[("name", s("d"))]);
+        b.edge(a, bb, "LINK");
+        b.edge(bb, c, "LINK");
+        b.edge(c, d, "LINK");
+        b.build()
+    }
+
+    #[test]
+    fn any_shortest_path_length() {
+        use crate::ir::{Dir, Expr, Plan};
+        let store = chain();
+        // Shortest LINK paths from `a`: b at 1 hop, c at 2, d at 3.
+        let q = "MATCH p = ANY SHORTEST (x)-[:LINK]->*(y) WHERE x.name = 'a' \
+                 RETURN y.name AS y, path_length(p) AS len";
+        assert_eq!(
+            bag(&run(&super::parse(q).unwrap(), &store)),
+            vec![
+                "y=Str(\"b\");len=Num(1.0);",
+                "y=Str(\"c\");len=Num(2.0);",
+                "y=Str(\"d\");len=Num(3.0);",
+            ]
+        );
+        // Parse cross-check against the hand-built ShortestPath plan (all sources).
+        let hand = Plan::Scan { label: None }
+            .shortest_path(0, Dir::Out, Some("LINK"), None)
+            .project(vec![(
+                "len".into(),
+                Expr::Call {
+                    name: "path_length".into(),
+                    args: vec![Expr::Path],
+                },
+            )]);
+        assert_same(
+            "MATCH p = ANY SHORTEST (x)-[:LINK]->*(y) RETURN path_length(p) AS len",
+            &hand,
+            &store,
+        );
+    }
+
+    #[test]
+    fn any_shortest_nodes_reconstructs_the_chain() {
+        let store = chain();
+        // The full path a→b→c→d is reconstructed (BFS predecessors), so nodes(p)
+        // is the node-id chain [0,1,2,3], not just the endpoint.
+        let q = "MATCH p = ANY SHORTEST (x)-[:LINK]->*(y) \
+                 WHERE x.name = 'a' AND y.name = 'd' RETURN nodes(p) AS ns";
+        let out = run(&super::parse(q).unwrap(), &store);
+        assert_eq!(out.rows.len(), 1);
+        let ids: Vec<f64> = match &out.rows[0][0] {
+            Value::List(items) => items
+                .iter()
+                .map(|v| match v {
+                    Value::Num(x) => *x,
+                    o => panic!("expected Num in path, got {o:?}"),
+                })
+                .collect(),
+            o => panic!("expected a List from nodes(p), got {o:?}"),
+        };
+        assert_eq!(ids, vec![0.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn named_path_requires_any_shortest() {
+        let err = super::parse("MATCH p = (a)-[:LINK]->(b) RETURN p").unwrap_err();
+        assert!(err.contains("ANY SHORTEST"), "got: {err}");
+    }
+
+    #[test]
+    fn any_shortest_requires_a_quantifier() {
+        let err =
+            super::parse("MATCH p = ANY SHORTEST (a)-[:LINK]->(b) RETURN a.name AS a").unwrap_err();
+        assert!(err.contains("quantifier"), "got: {err}");
     }
 
     #[test]
