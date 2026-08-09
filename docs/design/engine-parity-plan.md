@@ -341,7 +341,7 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
 ### Phase H — Semantics services
 
 - [x] H1. Required-property constraint (validator): `create_required_constraint
-  (label, key)` — every live node with `label` must carry a PRESENT value for
+(label, key)` — every live node with `label` must carry a PRESENT value for
       `key` (present-null passes; only absence violates, per null-first-class).
       Declaration errors on already-violating data; write statements (INSERT and
       \_MERGE) enforce it alongside unique and roll back on violation
@@ -378,7 +378,18 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
 
 ### Phase I — Algorithms & egress
 
-- [ ] I1. Graph algorithms: degree, WCC, label-prop, PageRank, shortest-path.
+- [x] I1a. Graph algorithms (deterministic trio): a new `algo` module over the
+      store — `degree` (out/in/both, optional edge type, dense-id order), weakly
+      connected components (`weakly_connected_components`, union-by-min so a
+      component's id is its smallest member, order-independent), and `bfs_distances`
+      (shortest hop distances from a source, order-independent). Each returns
+      `Vec<(node, result)>` in ascending-id order. 3 tests (triangle + isolated
+      node: degrees, 2 components, BFS out/both). Rust API only — the GQL/Gremlin
+      CALL surface is I3.
+- [ ] I1b. Iterative algorithms: label propagation + PageRank — need a fixed
+      summation/tiebreak order (sum in node-id order, deterministic damping +
+      iteration count) for reproducibility. Surface the parity question
+      (damping/iterations) before coding.
 - [ ] I2. Arrow IPC egress.
 - [ ] I3. Named-procedure `CALL name(cfg) [YIELD col [AS a], …]` (relocated from
       F3): the ISO-conformant home for the I1 algorithms — the procedure catalog
