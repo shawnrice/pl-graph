@@ -86,6 +86,9 @@ enum Tok {
     Comma,
     Star,
     Minus,
+    Plus,
+    Slash,
+    Percent,
     RArrow, // ->
     LArrow, // <-
     Eq,
@@ -120,6 +123,9 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             '.' => out.push(Tok::Dot),
             ',' => out.push(Tok::Comma),
             '*' => out.push(Tok::Star),
+            '+' => out.push(Tok::Plus),
+            '/' => out.push(Tok::Slash),
+            '%' => out.push(Tok::Percent),
             '=' => out.push(Tok::Eq),
             '-' => {
                 if b.get(i + 1) == Some(&'>') {
@@ -897,7 +903,8 @@ impl Parser {
     }
 
     fn cmp_expr(&mut self) -> Result<Expr, String> {
-        let left = self.primary()?;
+        // Comparison operands are arithmetic expressions (arith binds tighter).
+        let left = self.add_expr()?;
         let op = match self.peek() {
             Some(Tok::Eq) => CompareOp::Eq,
             Some(Tok::Ne) => CompareOp::Ne,
@@ -908,12 +915,68 @@ impl Parser {
             _ => return Ok(left),
         };
         self.pos += 1;
-        let right = self.primary()?;
+        let right = self.add_expr()?;
         Ok(Expr::Compare {
             op,
             left: Box::new(left),
             right: Box::new(right),
         })
+    }
+
+    // add_expr := mul_expr ( ('+' | '-') mul_expr )*
+    fn add_expr(&mut self) -> Result<Expr, String> {
+        let mut left = self.mul_expr()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Plus) => crate::ir::ArithOp::Add,
+                Some(Tok::Minus) => crate::ir::ArithOp::Sub,
+                _ => break,
+            };
+            self.pos += 1;
+            let right = self.mul_expr()?;
+            left = Expr::Arith {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    // mul_expr := unary ( ('*' | '/' | '%') unary )*
+    fn mul_expr(&mut self) -> Result<Expr, String> {
+        let mut left = self.unary()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Star) => crate::ir::ArithOp::Mul,
+                Some(Tok::Slash) => crate::ir::ArithOp::Div,
+                Some(Tok::Percent) => crate::ir::ArithOp::Rem,
+                _ => break,
+            };
+            self.pos += 1;
+            let right = self.unary()?;
+            left = Expr::Arith {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    // unary := '-' unary | primary. Unary minus desugars to `0 - x` so null/
+    // non-numeric propagation is the ordinary Arith rule.
+    fn unary(&mut self) -> Result<Expr, String> {
+        if self.eat(&Tok::Minus) {
+            let e = self.unary()?;
+            Ok(Expr::Arith {
+                op: crate::ir::ArithOp::Sub,
+                left: Box::new(Expr::Lit(Value::Num(0.0))),
+                right: Box::new(e),
+            })
+        } else {
+            self.primary()
+        }
     }
 
     // primary := '(' expr ')' | literal | var '.' key | var
@@ -1462,6 +1525,77 @@ mod tests {
     #[test]
     fn bad_quantifier_errors() {
         assert!(super::parse("MATCH (a:Person)-[:KNOWS]->{3,1}(b) RETURN a.name AS a").is_err());
+    }
+
+    // --- part 3.5: arithmetic (E1) ---
+
+    /// Precedence: `2 + 3 * 4` = 14 (multiply binds tighter).
+    #[test]
+    fn arithmetic_precedence() {
+        let store = social();
+        let out = run(
+            &super::parse("MATCH (p:Person) RETURN 2 + 3 * 4 AS x").unwrap(),
+            &store,
+        );
+        assert_eq!(num(&col(&out, 0, "x")), 14.0);
+    }
+
+    /// Parsed `p.age * 2 + 1` matches the hand-built nested Arith plan.
+    #[test]
+    fn arithmetic_parse_matches_hand() {
+        use crate::ir::{ArithOp, Expr, Plan};
+        let store = social();
+        let mul = Expr::Arith {
+            op: ArithOp::Mul,
+            left: Box::new(Expr::Prop {
+                slot: 0,
+                key: "age".into(),
+            }),
+            right: Box::new(Expr::Lit(n(2.0))),
+        };
+        let hand = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .project(vec![(
+            "x".into(),
+            Expr::Arith {
+                op: ArithOp::Add,
+                left: Box::new(mul),
+                right: Box::new(Expr::Lit(n(1.0))),
+            },
+        )]);
+        assert_same("MATCH (p:Person) RETURN p.age * 2 + 1 AS x", &hand, &store);
+    }
+
+    /// Arithmetic in WHERE: `p.age % 2 = 0` keeps even ages (alice 30, carol 40).
+    #[test]
+    fn arithmetic_in_where() {
+        let store = social();
+        let out = run(
+            &super::parse("MATCH (p:Person) WHERE p.age % 2 = 0 RETURN p.name AS name").unwrap(),
+            &store,
+        );
+        let mut got: Vec<String> = out
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Str(x) => x.to_string(),
+                _ => panic!(),
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["alice", "carol"]);
+    }
+
+    /// Unary minus: `-p.age` for alice(30) is -30.
+    #[test]
+    fn unary_minus() {
+        let store = social();
+        let out = run(
+            &super::parse("MATCH (p:Person) WHERE p.name = 'alice' RETURN -p.age AS x").unwrap(),
+            &store,
+        );
+        assert_eq!(num(&col(&out, 0, "x")), -30.0);
     }
 
     // --- part 4: INSERT (write statements) ---

@@ -370,7 +370,11 @@ fn needs_lineage(plan: &Plan) -> bool {
             Expr::Path => true,
             Expr::Compare { left, right, .. } => reads_path(left) || reads_path(right),
             Expr::Not(x) => reads_path(x),
-            Expr::And(a, b) | Expr::Or(a, b) => reads_path(a) || reads_path(b),
+            Expr::And(a, b)
+            | Expr::Or(a, b)
+            | Expr::Arith {
+                left: a, right: b, ..
+            } => reads_path(a) || reads_path(b),
             Expr::Slot(_) | Expr::Prop { .. } | Expr::Lit(_) => false,
         }
     }
@@ -1252,7 +1256,11 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         Expr::Prop { slot, .. } => *slot == s,
         Expr::Path => false,
         Expr::Not(x) => refs_only_slot(x, s),
-        Expr::And(a, b) | Expr::Or(a, b) => refs_only_slot(a, s) && refs_only_slot(b, s),
+        Expr::And(a, b)
+        | Expr::Or(a, b)
+        | Expr::Arith {
+            left: a, right: b, ..
+        } => refs_only_slot(a, s) && refs_only_slot(b, s),
         Expr::Compare { left, right, .. } => refs_only_slot(left, s) && refs_only_slot(right, s),
     }
 }
@@ -1273,6 +1281,11 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         Expr::And(a, b) => Expr::And(go(a), go(b)),
         Expr::Or(a, b) => Expr::Or(go(a), go(b)),
         Expr::Compare { op, left, right } => Expr::Compare {
+            op: *op,
+            left: go(left),
+            right: go(right),
+        },
+        Expr::Arith { op, left, right } => Expr::Arith {
             op: *op,
             left: go(left),
             right: go(right),
@@ -1622,6 +1635,36 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Col {
             let l = eval(left, store, batch);
             let r = eval(right, store, batch);
             compare(*op, &l, &r)
+        }
+        Expr::Arith { op, left, right } => {
+            // f64 math via the value contract's `as_num` (finite Num only); any
+            // NULL / non-numeric / non-finite operand OR result yields NULL.
+            use crate::ir::ArithOp::{Add, Div, Mul, Rem, Sub};
+            let l = eval(left, store, batch);
+            let r = eval(right, store, batch);
+            let n = l.len().min(r.len());
+            let out: Vec<Value> = (0..n)
+                .map(
+                    |i| match (value::as_num(&l.value_at(i)), value::as_num(&r.value_at(i))) {
+                        (Some(a), Some(b)) => {
+                            let res = match op {
+                                Add => a + b,
+                                Sub => a - b,
+                                Mul => a * b,
+                                Div => a / b,
+                                Rem => a % b,
+                            };
+                            if res.is_finite() {
+                                Value::Num(res)
+                            } else {
+                                Value::Null
+                            }
+                        }
+                        _ => Value::Null,
+                    },
+                )
+                .collect();
+            Col::Gen(out)
         }
     }
 }
@@ -2028,6 +2071,57 @@ mod tests {
         let mut got = names_of(&out, 0);
         got.sort();
         assert_eq!(got, vec!["alice", "carol"]);
+    }
+
+    // --- Arithmetic (E1) ---
+
+    fn arith(op: crate::ir::ArithOp, l: Expr, r: Expr) -> Expr {
+        Expr::Arith {
+            op,
+            left: Box::new(l),
+            right: Box::new(r),
+        }
+    }
+
+    /// `age * 2 + 1` for alice(30) = 61 — precedence honored in the hand plan.
+    #[test]
+    fn arith_eval_computes() {
+        use crate::ir::ArithOp::{Add, Mul};
+        let store = social();
+        let plan = scan("Person")
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("alice"))))
+            .project(vec![(
+                "x".into(),
+                arith(Add, arith(Mul, prop(0, "age"), lit(n(2.0))), lit(n(1.0))),
+            )]);
+        assert_eq!(num(&run(&plan, &store).rows[0][0]), 61.0);
+    }
+
+    /// A NULL / missing / non-numeric operand yields NULL — the Project node has no
+    /// `age`, so `age + 1` is NULL for exactly it.
+    #[test]
+    fn arith_null_propagates() {
+        use crate::ir::ArithOp::Add;
+        let store = social();
+        let plan = Plan::Scan { label: None }
+            .project(vec![("x".into(), arith(Add, prop(0, "age"), lit(n(1.0))))]);
+        let nulls = run(&plan, &store)
+            .rows
+            .iter()
+            .filter(|r| r[0].is_null())
+            .count();
+        assert_eq!(nulls, 1); // only the Project node lacks age
+    }
+
+    /// Division by zero is non-finite → NULL (the NaN/Inf → null policy).
+    #[test]
+    fn arith_div_by_zero_is_null() {
+        use crate::ir::ArithOp::Div;
+        let store = social();
+        let plan = scan("Person")
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("alice"))))
+            .project(vec![("x".into(), arith(Div, prop(0, "age"), lit(n(0.0))))]);
+        assert!(run(&plan, &store).rows[0][0].is_null());
     }
 
     // --- Property index + IndexSeek (D1a) ---

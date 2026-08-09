@@ -133,7 +133,11 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
 
 ### Phase E — Expression & function surface
 
-- [ ] E1. Arithmetic (`+ - * / %`, unary) in IR + eval + both parsers.
+- [x] E1. Arithmetic (`+ - * / %`, unary minus) — IR `Expr::Arith{op}` + eval
+      (finite-or-null via `value::as_num`; NULL/non-numeric/non-finite operand OR
+      result → NULL) + GQL parser (new `+ / %` tokens; precedence add<mul<unary;
+      unary `-x` desugars to `0 - x`). Gremlin inline arithmetic N/A (its subset
+      has no arithmetic expressions — `math()`-style steps deferred).
 - [ ] E2. Scalar functions (abs, sqrt, floor/ceil/round, coalesce, …).
 - [ ] E3. `CASE` / conditional.
 - [ ] E4. String & list functions.

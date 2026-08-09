@@ -102,6 +102,18 @@ pub fn group_key(v: &Value) -> Vec<u8> {
     out
 }
 
+/// A value's number for ARITHMETIC: a FINITE `Num` only. Non-finite (`NaN`/`Inf`)
+/// and non-numeric values return `None`, so arithmetic on them yields NULL — the
+/// engine's "NaN/Inf → null" numeric policy, defined here once. Callers combine
+/// two `as_num`s and re-check finiteness of the RESULT (e.g. `1/0`).
+#[must_use]
+pub fn as_num(v: &Value) -> Option<f64> {
+    match v {
+        Value::Num(x) if x.is_finite() => Some(*x),
+        _ => None,
+    }
+}
+
 /// The canonical bit pattern a number groups by: all NaNs collapse to one
 /// pattern, and `-0.0`/`0.0` collapse to `+0.0` — so each groups with its kind,
 /// the inverse of predicate equality. This is the ONE place that rule lives; a

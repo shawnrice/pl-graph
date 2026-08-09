@@ -345,7 +345,11 @@ fn max_slot(expr: &Expr) -> Option<usize> {
         Expr::Prop { slot, .. } => Some(*slot),
         Expr::Lit(_) | Expr::Path => None,
         Expr::Not(x) => max_slot(x),
-        Expr::And(a, b) | Expr::Or(a, b) => merge_max(max_slot(a), max_slot(b)),
+        Expr::And(a, b)
+        | Expr::Or(a, b)
+        | Expr::Arith {
+            left: a, right: b, ..
+        } => merge_max(max_slot(a), max_slot(b)),
         Expr::Compare { left, right, .. } => merge_max(max_slot(left), max_slot(right)),
     }
 }

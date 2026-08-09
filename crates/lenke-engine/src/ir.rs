@@ -42,6 +42,24 @@ pub enum Expr {
     Not(Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
+    /// Arithmetic `left <op> right`. `f64` math; a NULL, non-numeric, or
+    /// non-finite operand — or a non-finite result — yields NULL (via
+    /// `value::as_num` + a finiteness check). Unary minus desugars to `0 - x`.
+    Arith {
+        op: ArithOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+}
+
+/// A binary arithmetic operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
