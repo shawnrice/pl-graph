@@ -125,7 +125,11 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
         pushdown. NOTE: BETWEEN / conjunction-splitting (seed one bound of an
         `And`, keep the other as a Filter) deferred — GQL has no BETWEEN keyword
         yet and `x>=lo AND x<=hi` is an And filter; a small follow-up.
-- [ ] D3. Edge-type index; interval/temporal index.
+- D3. Edge-type index; interval/temporal index — RELOCATED. The interval index
+  is a bitemporal edge structure that needs temporal values (Phase G1), so it is
+  moved to G4 (after temporal). The edge-type index is a niche adjacency
+  optimization (expand already walks adjacency correctly) tracked as G5. Phase D's
+  correctness-relevant work (hash + range seek) is complete.
 
 ### Phase E — Expression & function surface
 
@@ -149,6 +153,10 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
 - [ ] G1. Temporal values + typed temporal columns.
 - [ ] G2. Map/record values (storage, dotted-path, construction, access).
 - [ ] G3. Numeric edge-case parity audit against `value.rs`.
+- [ ] G4. Interval/temporal edge index (relocated from D3; needs G1): RI-tree-style
+      as-of/overlap seek over temporal edge bounds.
+- [ ] G5. Edge-type index (relocated from D3): adjacency grouped by edge type for
+      O(matching-degree) type-filtered expand — an optimization, not correctness.
 
 ### Phase H — Semantics services
 
