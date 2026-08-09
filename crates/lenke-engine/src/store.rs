@@ -1237,6 +1237,42 @@ impl Store {
         &self.last_commit
     }
 
+    /// The DISTINCT content-derived scopes the last commit touched, plus a
+    /// fail-open flag. The scope of a NODE change is its `scope_key` property (the
+    /// host assigns what that means — e.g. `"room"`/`"tenant"`); a change with no
+    /// derivable scope (an edge change, or a deleted/absent node) sets the flag,
+    /// meaning "relevant to ALL clients." A subscriber to scope `S` treats the
+    /// commit as relevant iff `open || scopes contains S`. This is an OPTIMIZATION,
+    /// not a security boundary (fail-open): the host owns the scope-key authority
+    /// (the engine derives, it does not mint one). Scopes are `cmp_total`-sorted.
+    #[must_use]
+    pub fn touched_scopes(&self, scope_key: &str) -> (Vec<Value>, bool) {
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut scopes: Vec<Value> = Vec::new();
+        let mut open = false;
+        for ch in &self.last_commit {
+            let node = match ch {
+                Change::NodeAdded(n)
+                | Change::NodeProp { node: n, .. }
+                | Change::NodeDeleted(n) => Some(*n),
+                Change::EdgeAdded(_) | Change::EdgeDeleted(_) | Change::EdgeProp { .. } => None,
+            };
+            match node {
+                Some(n) => {
+                    let v = self.prop(n, scope_key);
+                    if v.is_null() {
+                        open = true; // absent/deleted scope → visible to all
+                    } else if seen.insert(crate::value::group_key(&v)) {
+                        scopes.push(v);
+                    }
+                }
+                None => open = true, // an edge change has no node scope → fail-open
+            }
+        }
+        scopes.sort_by(crate::value::cmp_total);
+        (scopes, open)
+    }
+
     /// Record a change into the active transaction's list (no-op outside a txn).
     /// Grows 1:1 with the undo log, so `rollback_to` can truncate both by length.
     fn record_change(&mut self, c: Change) {
@@ -1633,6 +1669,36 @@ mod tests {
         st.set_prop(a, "age", n(2.0));
         st.rollback();
         assert_eq!(st.last_commit_changes(), previous.as_slice());
+    }
+
+    #[test]
+    fn touched_scopes_are_the_distinct_rooms_a_commit_writes() {
+        let str_scopes = |scopes: &[Value]| -> Vec<String> {
+            scopes
+                .iter()
+                .map(|v| match v {
+                    Value::Str(x) => x.to_string(),
+                    o => format!("{o:?}"),
+                })
+                .collect()
+        };
+        let mut st = Builder::default().build();
+        st.begin();
+        st.add_node(&["Msg"], &[("room", s("A"))]);
+        st.add_node(&["Msg"], &[("room", s("B"))]);
+        st.add_node(&["Msg"], &[("room", s("A"))]); // duplicate room A
+        st.commit();
+        let (scopes, open) = st.touched_scopes("room");
+        assert_eq!(str_scopes(&scopes), vec!["A", "B"]); // distinct, sorted
+        assert!(!open); // every change was scopable
+
+        // A node with no `room` property → fail-open (visible to all).
+        st.begin();
+        st.add_node(&["Sys"], &[]);
+        st.commit();
+        let (scopes2, open2) = st.touched_scopes("room");
+        assert!(scopes2.is_empty());
+        assert!(open2);
     }
 
     #[test]

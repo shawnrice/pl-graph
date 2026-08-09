@@ -341,7 +341,7 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
 ### Phase H — Semantics services
 
 - [x] H1. Required-property constraint (validator): `create_required_constraint
-    (label, key)` — every live node with `label` must carry a PRESENT value for
+  (label, key)` — every live node with `label` must carry a PRESENT value for
       `key` (present-null passes; only absence violates, per null-first-class).
       Declaration errors on already-violating data; write statements (INSERT and
       \_MERGE) enforce it alongside unique and roll back on violation
@@ -357,11 +357,24 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       only — read AFTER commit, cannot veto. A node delete cascades its edges but
       reports one NodeDeleted. 4 tests (commit list + order, rollback-nothing,
       delete cascade, INSERT observed). NOTE: only txn-wrapped statements
-      (INSERT/_MERGE) emit CDC; SET/REMOVE/drop await wrapping the Update path in a
+      (INSERT/\_MERGE) emit CDC; SET/REMOVE/drop await wrapping the Update path in a
       txn (shared with the H1 SET/REMOVE-enforcement follow-up).
-- [ ] H2b. CDC value-scope routing: content-derived scope off the change list
-      (host scopeKey + client scopes, fail-open) — the per-room/tenant filter.
-- [ ] H3. Typed nodes (host-side schema validate-before-write).
+- [x] H2b. CDC value-scope routing (engine side): `touched_scopes(scope_key)`
+      derives the DISTINCT scopes a commit wrote from the change list — a node
+      change's scope is its `scope_key` property (host decides what that names);
+      an edge change or an absent/deleted-node scope sets a fail-OPEN flag
+      ("visible to all"). A subscriber to scope S treats the commit as relevant iff
+      `open || scopes∋S`. Optimization-not-boundary; the host owns the scope-key
+      authority (the engine derives, never mints). Scopes cmp_total-sorted. 1 test
+      (distinct rooms A/B, dedup, fail-open on an unscoped node).
+- [x] H3. Typed nodes — HOST-SIDE by design (not an engine capability). R-TYPED
+      is `defineNode` with a bring-your-own Standard Schema (Zod/Valibot/ArkType)
+      validating on the HOST before the write; a JS schema cannot be an engine
+      validator, and rebuilding a schema DSL in Rust would duplicate the host's
+      job. The ENGINE seam is already provided: H1 constraints (unique/required,
+      enforced + rolled back at write time) for the invariants the engine CAN
+      check, and the host validates-before-write for the rest. Done by delegation;
+      no engine code.
 
 ### Phase I — Algorithms & egress
 
