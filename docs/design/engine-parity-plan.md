@@ -213,10 +213,13 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       quantifier (edge type required). 5 tests (length + hand plan, node-chain
       reconstruction, two errors). `relationships(p)`/`elements(p)` need edge-level
       lineage → F4b.
-- [ ] F4b. Edge-level path lineage: carry the traversed edge ids alongside the
-      node chain (Expand/VarLength/ShortestPath), enabling `relationships(p)` and
-      `elements(p)` (deferred from F4 — node-only lineage can't name edges
-      unambiguously in a multigraph).
+- [x] F4b. Edge-level path lineage: `Lineage` now carries a parallel edge list
+      (edges/edge_offsets), populated by Expand (collects eids only when a bound
+      edge or lineage needs them — hot path unchanged) and ShortestPath (BFS
+      predecessor EDGE). Accessors are now `Expr::PathAccess{part}` reading the
+      sidecar directly — `nodes`/`relationships`/`path_length`/`elements` — not
+      scalar Call fns. 4 tests (relationships + elements over a chain, expand-level
+      edge lineage, non-path-arg error).
 - [ ] F5. Gremlin step breadth (select, where(P), order(local), groupCount, …).
 
 ### Phase G — Data model

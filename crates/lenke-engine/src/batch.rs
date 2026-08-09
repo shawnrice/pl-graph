@@ -84,10 +84,17 @@ impl Col {
 /// `rows + 1` entries, `offsets[0] == 0`). Path elements are node ids as
 /// `Value::Num` for now (there is no dedicated node value yet); tags and sack
 /// join this struct when their operators do.
+///
+/// A path of *k* nodes has *k − 1* edges, carried in a PARALLEL list
+/// (`edges`/`edge_offsets`) so `relationships(p)` / `elements(p)` can name the
+/// traversed relationships, not just the nodes. Edge ids are `Value::Num` too
+/// (no dedicated edge value yet). A single-node seed path has zero edges.
 #[derive(Clone, Debug, Default)]
 pub struct Lineage {
     pub values: Vec<Value>,
     pub offsets: Vec<usize>,
+    pub edges: Vec<Value>,
+    pub edge_offsets: Vec<usize>,
 }
 
 impl Lineage {
@@ -97,6 +104,8 @@ impl Lineage {
         Self {
             values: nodes.iter().map(|&n| Value::Num(f64::from(n))).collect(),
             offsets: (0..=nodes.len()).collect(),
+            edges: Vec::new(),
+            edge_offsets: vec![0; nodes.len() + 1], // each seed path has 0 edges
         }
     }
 
@@ -107,13 +116,21 @@ impl Lineage {
         Self {
             values: Vec::new(),
             offsets: vec![0],
+            edges: Vec::new(),
+            edge_offsets: vec![0],
         }
     }
 
-    /// Row `i`'s path.
+    /// Row `i`'s node path.
     #[must_use]
     pub fn path_at(&self, i: usize) -> &[Value] {
         &self.values[self.offsets[i]..self.offsets[i + 1]]
+    }
+
+    /// Row `i`'s edge path (the relationships traversed).
+    #[must_use]
+    pub fn edges_at(&self, i: usize) -> &[Value] {
+        &self.edges[self.edge_offsets[i]..self.edge_offsets[i + 1]]
     }
 
     /// Reorder/subset the paths by `idx` (parallel to a slot gather).
@@ -121,25 +138,45 @@ impl Lineage {
     pub fn gather(&self, idx: &[usize]) -> Self {
         let mut values = Vec::new();
         let mut offsets = vec![0usize];
+        let mut edges = Vec::new();
+        let mut edge_offsets = vec![0usize];
         for &i in idx {
             values.extend_from_slice(self.path_at(i));
             offsets.push(values.len());
+            edges.extend_from_slice(self.edges_at(i));
+            edge_offsets.push(edges.len());
         }
-        Self { values, offsets }
+        Self {
+            values,
+            offsets,
+            edges,
+            edge_offsets,
+        }
     }
 
-    /// One output path per `(keep[k], new_nodes[k])`: the input row `keep[k]`'s
-    /// path extended by `new_nodes[k]` — what a lineage-tracking Expand produces.
+    /// One output path per `(keep[k], new_nodes[k], new_edges[k])`: the input row
+    /// `keep[k]`'s path extended by the node reached over the edge traversed —
+    /// what a lineage-tracking Expand produces.
     #[must_use]
-    pub fn extend(&self, keep: &[usize], new_nodes: &[u32]) -> Self {
+    pub fn extend(&self, keep: &[usize], new_nodes: &[u32], new_edges: &[u32]) -> Self {
         let mut values = Vec::new();
         let mut offsets = vec![0usize];
-        for (&k, &node) in keep.iter().zip(new_nodes) {
+        let mut edges = Vec::new();
+        let mut edge_offsets = vec![0usize];
+        for (i, &k) in keep.iter().enumerate() {
             values.extend_from_slice(self.path_at(k));
-            values.push(Value::Num(f64::from(node)));
+            values.push(Value::Num(f64::from(new_nodes[i])));
             offsets.push(values.len());
+            edges.extend_from_slice(self.edges_at(k));
+            edges.push(Value::Num(f64::from(new_edges[i])));
+            edge_offsets.push(edges.len());
         }
-        Self { values, offsets }
+        Self {
+            values,
+            offsets,
+            edges,
+            edge_offsets,
+        }
     }
 }
 

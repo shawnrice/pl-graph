@@ -399,7 +399,8 @@ fn output_names(plan: &Plan) -> Option<Vec<String>> {
 fn needs_lineage(plan: &Plan) -> bool {
     fn reads_path(e: &Expr) -> bool {
         match e {
-            Expr::Path => true,
+            // Reading any part of the path needs the lineage, just like `Path`.
+            Expr::Path | Expr::PathAccess { .. } => true,
             Expr::Compare { left, right, .. } => reads_path(left) || reads_path(right),
             Expr::Not(x) => reads_path(x),
             Expr::And(a, b)
@@ -1016,6 +1017,10 @@ fn expand(
         return empty();
     };
 
+    // Collect edge ids only when something needs them — a bound edge slot or
+    // lineage — so the lineage-free hot path pushes nothing extra per neighbour.
+    let track = batch.lineage.is_some();
+    let need_eids = bind_edge || track;
     let mut keep = Vec::new();
     let mut nbrs = Vec::new();
     let mut eids = Vec::new();
@@ -1023,7 +1028,7 @@ fn expand(
         for_each_nbr(store, v, dir, want, |nbr, eid| {
             keep.push(row);
             nbrs.push(nbr);
-            if bind_edge {
+            if need_eids {
                 eids.push(eid);
             }
         });
@@ -1031,15 +1036,15 @@ fn expand(
 
     let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
     if bind_edge {
-        slots.push(Col::Edges(eids)); // edge slot at index W
+        slots.push(Col::Edges(eids.clone())); // edge slot at index W
     }
     slots.push(Col::Nodes(nbrs.clone())); // node slot at index W (or W+1)
     let mut out = Batch::of(slots);
     // Lineage strategy: when the input carried a path, extend each output row's
-    // path by the neighbour it landed on (the path is node ids; the edge slot is
-    // separate). This is the ONLY place Expand differs for lineage.
+    // path by the neighbour it landed on AND the edge it crossed, so both
+    // `nodes(p)` and `relationships(p)` are recoverable.
     if let Some(lin) = &batch.lineage {
-        out.lineage = Some(lin.extend(&keep, &nbrs));
+        out.lineage = Some(lin.extend(&keep, &nbrs, &eids));
     }
     out
 }
@@ -1349,7 +1354,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         Expr::Lit(_) => true,
         Expr::Slot(n) => *n == s,
         Expr::Prop { slot, .. } => *slot == s,
-        Expr::Path => false,
+        Expr::Path | Expr::PathAccess { .. } => false,
         Expr::Not(x) => refs_only_slot(x, s),
         Expr::And(a, b)
         | Expr::Or(a, b)
@@ -1389,7 +1394,9 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
             slot: to,
             key: key.clone(),
         },
-        Expr::Slot(_) | Expr::Prop { .. } | Expr::Lit(_) | Expr::Path => expr.clone(),
+        Expr::Slot(_) | Expr::Prop { .. } | Expr::Lit(_) | Expr::Path | Expr::PathAccess { .. } => {
+            expr.clone()
+        }
         Expr::Not(x) => Expr::Not(go(x)),
         Expr::And(a, b) => Expr::And(go(a), go(b)),
         Expr::Or(a, b) => Expr::Or(go(a), go(b)),
@@ -1722,14 +1729,18 @@ fn shortest_path(
     let track = batch.lineage.is_some();
     let mut path_values: Vec<Value> = Vec::new();
     let mut path_offsets: Vec<usize> = vec![0];
+    let mut path_edges: Vec<Value> = Vec::new();
+    let mut path_edge_offsets: Vec<usize> = vec![0];
 
     let mut keep = Vec::new();
     let mut ends = Vec::new();
     for (row, &start) in src.iter().enumerate() {
         let mut visited: FnvSet<u32> = FnvSet::default();
         visited.insert(start);
-        // child -> parent, for reconstructing the shortest path back to `start`.
+        // child -> parent, and child -> edge used to reach it, for reconstructing
+        // the shortest path (nodes AND relationships) back to `start`.
         let mut pred: FnvMap<u32, u32> = FnvMap::default();
+        let mut pred_edge: FnvMap<u32, u32> = FnvMap::default();
         let mut q: VecDeque<(u32, u32)> = VecDeque::new();
         q.push_back((start, 0));
         while let Some((v, d)) = q.pop_front() {
@@ -1753,21 +1764,31 @@ fn shortest_path(
                     ends.push(a.nbr);
                     if track {
                         pred.insert(a.nbr, v);
-                        // Walk parents back to `start` (its pred is never set), then
-                        // append `start..target` to the input row's path prefix.
+                        pred_edge.insert(a.nbr, a.eid);
+                        // Walk parents back to `start` (its pred is never set),
+                        // collecting the edge crossed at each step, then append
+                        // `start..target` (and its edges) to the input row's path.
                         let mut chain = vec![a.nbr];
+                        let mut edge_chain: Vec<u32> = Vec::new();
                         let mut cur = a.nbr;
                         while cur != start {
+                            edge_chain.push(pred_edge[&cur]);
                             cur = pred[&cur];
                             chain.push(cur);
                         }
                         chain.reverse(); // start .. target
-                        let in_path = batch.lineage.as_ref().expect("track").path_at(row);
-                        path_values.extend_from_slice(in_path); // ends at `start`
+                        edge_chain.reverse(); // e0 .. e(k-1)
+                        let lin = batch.lineage.as_ref().expect("track");
+                        path_values.extend_from_slice(lin.path_at(row)); // ends at start
                         for &node in &chain[1..] {
                             path_values.push(Value::Num(f64::from(node)));
                         }
                         path_offsets.push(path_values.len());
+                        path_edges.extend_from_slice(lin.edges_at(row));
+                        for &edge in &edge_chain {
+                            path_edges.push(Value::Num(f64::from(edge)));
+                        }
+                        path_edge_offsets.push(path_edges.len());
                     }
                     q.push_back((a.nbr, d + 1));
                 }
@@ -1782,6 +1803,8 @@ fn shortest_path(
         out.lineage = Some(Lineage {
             values: path_values,
             offsets: path_offsets,
+            edges: path_edges,
+            edge_offsets: path_edge_offsets,
         });
     }
     out
@@ -1803,6 +1826,37 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             ),
             None => Col::Gen(vec![Value::Null; batch.rows()]),
         },
+        Expr::PathAccess { part } => {
+            use crate::ir::PathPart;
+            match &batch.lineage {
+                Some(lin) => Col::Gen(
+                    (0..batch.rows())
+                        .map(|i| {
+                            let nodes = lin.path_at(i);
+                            let edges = lin.edges_at(i);
+                            match part {
+                                PathPart::Nodes => Value::List(nodes.to_vec()),
+                                PathPart::Relationships => Value::List(edges.to_vec()),
+                                // Hops == number of relationships.
+                                PathPart::Length => Value::Num(edges.len() as f64),
+                                PathPart::Elements => {
+                                    // n0, e0, n1, e1, …, nk
+                                    let mut items = Vec::with_capacity(nodes.len() + edges.len());
+                                    for (j, node) in nodes.iter().enumerate() {
+                                        items.push(node.clone());
+                                        if let Some(e) = edges.get(j) {
+                                            items.push(e.clone());
+                                        }
+                                    }
+                                    Value::List(items)
+                                }
+                            }
+                        })
+                        .collect(),
+                ),
+                None => Col::Gen(vec![Value::Null; batch.rows()]),
+            }
+        }
         Expr::Not(inner) => {
             let c = eval(inner, store, batch)?;
             map_bool(&c, |b| b.map(|x| !x))
@@ -2070,16 +2124,8 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             Value::List(v) => v.last().cloned().unwrap_or(Value::Null),
             _ => Value::Null,
         },
-        // path accessors (1 arg): a path is a List of its node ids.
-        "nodes" => match &args[0] {
-            Value::List(_) => args[0].clone(), // the node chain itself
-            _ => Value::Null,
-        },
-        "path_length" => match &args[0] {
-            // Hops = nodes - 1; a single-node (or empty) path has length 0.
-            Value::List(v) => Value::Num(v.len().saturating_sub(1) as f64),
-            _ => Value::Null,
-        },
+        // Path accessors (nodes/relationships/path_length/elements) are not scalar
+        // Call functions — they read the lineage sidecar via `Expr::PathAccess`.
         _ => Value::Null, // parser rejects unknown names; defensive
     }
 }
@@ -3827,6 +3873,46 @@ mod tests {
                 assert_eq!(ids, vec![f64::from(a), f64::from(bb), f64::from(c)]);
             }
             other => panic!("expected a path list, got {other:?}"),
+        }
+    }
+
+    /// Expand tracks the traversed EDGE in the lineage too: over a->b->c the
+    /// relationships accessor recovers edge ids [0, 1] (creation order), the
+    /// parallel of `path_is_the_hop_sequence` for edges.
+    #[test]
+    fn expand_lineage_tracks_edges() {
+        use crate::ir::PathPart;
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[("name", s("a"))]);
+        let bb = b.node(&["N"], &[("name", s("b"))]);
+        let c = b.node(&["N"], &[("name", s("c"))]);
+        b.edge(a, bb, "R"); // edge id 0
+        b.edge(bb, c, "R"); // edge id 1
+        let store = b.build();
+        let plan = scan("N")
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
+            .expand(0, Dir::Out, Some("R"))
+            .expand(1, Dir::Out, Some("R"))
+            .project(vec![(
+                "es".into(),
+                Expr::PathAccess {
+                    part: PathPart::Relationships,
+                },
+            )]);
+        let out = run(&plan, &store);
+        assert_eq!(out.rows.len(), 1);
+        match &out.rows[0][0] {
+            Value::List(items) => {
+                let eids: Vec<f64> = items
+                    .iter()
+                    .map(|v| match v {
+                        Value::Num(x) => *x,
+                        other => panic!("edge element not an id: {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(eids, vec![0.0, 1.0]);
+            }
+            other => panic!("expected an edge list, got {other:?}"),
         }
     }
 

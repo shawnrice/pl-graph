@@ -366,7 +366,7 @@ fn max_slot(expr: &Expr) -> Option<usize> {
     match expr {
         Expr::Slot(n) => Some(*n),
         Expr::Prop { slot, .. } => Some(*slot),
-        Expr::Lit(_) | Expr::Path => None,
+        Expr::Lit(_) | Expr::Path | Expr::PathAccess { .. } => None,
         Expr::Not(x) => max_slot(x),
         Expr::And(a, b)
         | Expr::Or(a, b)

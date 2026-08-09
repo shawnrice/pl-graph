@@ -92,6 +92,14 @@ pub enum Expr {
         slot: usize,
         key: String,
     },
+    /// A path accessor over the current row's path (the lineage sidecar):
+    /// `nodes(p)`, `relationships(p)`, `path_length(p)`, `elements(p)`. There is
+    /// one path per row, so it reads the sidecar directly rather than taking a
+    /// value — the parser validates that its argument is a path variable. NULL
+    /// (empty list / 0) when the plan tracks no lineage.
+    PathAccess {
+        part: PathPart,
+    },
     /// `EXISTS { <pattern> [WHERE <pred>] }` — a correlated existence predicate. A
     /// definite Bool per outer row: TRUE iff the sub-pattern, extended from an
     /// outer-bound variable, matches at least once for that row. `body` is a
@@ -115,6 +123,17 @@ pub enum CastTarget {
     Float,
     String,
     Boolean,
+}
+
+/// Which part of a path an accessor returns. `Length` is the hop count (= number
+/// of relationships); `Elements` interleaves nodes and relationships
+/// (`n0, e0, n1, …, nk`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathPart {
+    Nodes,
+    Relationships,
+    Length,
+    Elements,
 }
 
 /// A binary arithmetic operator.

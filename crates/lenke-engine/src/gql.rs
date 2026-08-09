@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{AggFn, CastTarget, CompareOp, Dir, Expr, Plan};
+use crate::ir::{AggFn, CastTarget, CompareOp, Dir, Expr, PathPart, Plan};
 use crate::value::Value;
 
 /// A parsed relationship pattern `-[var:Type {props}]->`: direction, edge type,
@@ -1453,10 +1453,18 @@ impl Parser {
         }
         self.expect(&Tok::RParen)?;
         let lname = name.to_ascii_lowercase();
+        // Path accessors read the lineage sidecar, not a value — route them to
+        // `Expr::PathAccess`. Their sole argument must be a path variable.
+        if let Some(part) = path_part(&lname) {
+            if !matches!(args.as_slice(), [Expr::Path]) {
+                return Err(format!("{lname}() takes a path variable"));
+            }
+            return Ok(Expr::PathAccess { part });
+        }
         let arity_ok = match lname.as_str() {
             // 1 arg
             "abs" | "sign" | "floor" | "ceil" | "round" | "sqrt" | "upper" | "lower" | "trim"
-            | "length" | "size" | "head" | "last" | "nodes" | "path_length" => args.len() == 1,
+            | "length" | "size" | "head" | "last" => args.len() == 1,
             // 2 args
             "starts_with" | "ends_with" | "contains" => args.len() == 2,
             // 3 args
@@ -1530,6 +1538,18 @@ impl Parser {
         }
         default_name(e, idx)
     }
+}
+
+/// Map a path-accessor function name to its `PathPart`, or `None` if it is not
+/// one — the four ISO path functions (NOT `vertices`/`edges`).
+fn path_part(name: &str) -> Option<PathPart> {
+    Some(match name {
+        "nodes" => PathPart::Nodes,
+        "relationships" => PathPart::Relationships,
+        "path_length" => PathPart::Length,
+        "elements" => PathPart::Elements,
+        _ => return None,
+    })
 }
 
 /// A default output-column name for an un-aliased item.
@@ -2048,7 +2068,7 @@ mod tests {
 
     #[test]
     fn any_shortest_path_length() {
-        use crate::ir::{Dir, Expr, Plan};
+        use crate::ir::{Dir, Expr, PathPart, Plan};
         let store = chain();
         // Shortest LINK paths from `a`: b at 1 hop, c at 2, d at 3.
         let q = "MATCH p = ANY SHORTEST (x)-[:LINK]->*(y) WHERE x.name = 'a' \
@@ -2066,9 +2086,8 @@ mod tests {
             .shortest_path(0, Dir::Out, Some("LINK"), None)
             .project(vec![(
                 "len".into(),
-                Expr::Call {
-                    name: "path_length".into(),
-                    args: vec![Expr::Path],
+                Expr::PathAccess {
+                    part: PathPart::Length,
                 },
             )]);
         assert_same(
@@ -2098,6 +2117,58 @@ mod tests {
             o => panic!("expected a List from nodes(p), got {o:?}"),
         };
         assert_eq!(ids, vec![0.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn any_shortest_relationships_are_the_traversed_edges() {
+        let store = chain();
+        // Edges are created a→b, b→c, c→d (ids 0,1,2). The shortest path a→d
+        // traverses all three, in order — relationships(p) recovers them.
+        let q = "MATCH p = ANY SHORTEST (x)-[:LINK]->*(y) \
+                 WHERE x.name = 'a' AND y.name = 'd' RETURN relationships(p) AS es";
+        let out = run(&super::parse(q).unwrap(), &store);
+        assert_eq!(out.rows.len(), 1);
+        let eids: Vec<f64> = match &out.rows[0][0] {
+            Value::List(items) => items
+                .iter()
+                .map(|v| match v {
+                    Value::Num(x) => *x,
+                    o => panic!("expected Num edge id, got {o:?}"),
+                })
+                .collect(),
+            o => panic!("expected a List from relationships(p), got {o:?}"),
+        };
+        assert_eq!(eids, vec![0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn any_shortest_elements_interleave_nodes_and_edges() {
+        let store = chain();
+        // elements(p) for a→d is n0,e0,n1,e1,n2,e2,n3 = 0,0,1,1,2,2,3 (node ids
+        // 0..3, edge ids 0..2). Nodes and edges are both Num here, so compare the
+        // flat sequence.
+        let q = "MATCH p = ANY SHORTEST (x)-[:LINK]->*(y) \
+                 WHERE x.name = 'a' AND y.name = 'd' RETURN elements(p) AS els";
+        let out = run(&super::parse(q).unwrap(), &store);
+        assert_eq!(out.rows.len(), 1);
+        let seq: Vec<f64> = match &out.rows[0][0] {
+            Value::List(items) => items
+                .iter()
+                .map(|v| match v {
+                    Value::Num(x) => *x,
+                    o => panic!("expected Num, got {o:?}"),
+                })
+                .collect(),
+            o => panic!("expected a List from elements(p), got {o:?}"),
+        };
+        assert_eq!(seq, vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn path_accessor_requires_a_path_variable() {
+        // A path accessor on a non-path expression is a clear parse error.
+        let err = super::parse("MATCH (a:Person) RETURN relationships(a.name) AS x").unwrap_err();
+        assert!(err.contains("path variable"), "got: {err}");
     }
 
     #[test]
