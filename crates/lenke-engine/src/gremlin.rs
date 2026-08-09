@@ -11,6 +11,7 @@
 
 use crate::ir::{Agg, AggFn, CompareOp, Dir, Expr, Plan, SortKey};
 use crate::value::Value;
+use std::collections::HashMap;
 
 pub fn parse(query: &str) -> Result<Plan, String> {
     let toks = lex(query)?;
@@ -19,6 +20,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         pos: 0,
         current: 0,
         slots: 1,
+        labels: HashMap::new(),
     };
     p.traversal()
 }
@@ -34,6 +36,26 @@ enum Tok {
     Ident(String),
     Str(String),
     Num(f64),
+}
+
+/// Build `left = v0 OR left = v1 OR …` — the membership test `within(v0, v1, …)`
+/// desugars to. An empty list is a constant FALSE (`1 = 0`), so `within()` and
+/// (negated) `without()` behave sensibly.
+fn or_of_equals(left: &Expr, vals: &[Value]) -> Expr {
+    let eq = |v: &Value| Expr::Compare {
+        op: CompareOp::Eq,
+        left: Box::new(left.clone()),
+        right: Box::new(Expr::Lit(v.clone())),
+    };
+    let mut it = vals.iter();
+    match it.next() {
+        None => Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Expr::Lit(Value::Num(1.0))),
+            right: Box::new(Expr::Lit(Value::Num(0.0))),
+        },
+        Some(first) => it.fold(eq(first), |acc, v| Expr::Or(Box::new(acc), Box::new(eq(v)))),
+    }
 }
 
 /// Whether a plan is a write (so read steps cannot chain after it).
@@ -109,6 +131,9 @@ struct Parser {
     current: usize,
     /// number of bound element slots.
     slots: usize,
+    /// `as('x')` step labels -> the slot bound when the label was set. `select('x')`
+    /// resolves through this.
+    labels: HashMap<String, usize>,
 }
 
 impl Parser {
@@ -288,15 +313,11 @@ impl Parser {
                 p
             }
             "where" => {
-                // where(P.op(v)) / where(op(v)) — filter the current traverser's
-                // VALUE by a predicate (typically after values(...)).
-                let (op, val) = self.predicate_parts()?;
+                // where(P.op(v)) / where(op(v)) / where(within(...)) — filter the
+                // current traverser's VALUE by a predicate (typically after values).
+                let pred = self.predicate_expr(Expr::Slot(self.current))?;
                 self.expect(&Tok::RParen)?;
-                plan.filter(Expr::Compare {
-                    op,
-                    left: Box::new(Expr::Slot(self.current)),
-                    right: Box::new(Expr::Lit(val)),
-                })
+                plan.filter(pred)
             }
             "count" => {
                 self.expect(&Tok::RParen)?;
@@ -381,31 +402,66 @@ impl Parser {
                     None,
                 )
             }
+            "as" => {
+                // Label the current slot; the plan is unchanged (select resolves it).
+                let label = self.str_arg()?;
+                self.expect(&Tok::RParen)?;
+                self.labels.insert(label, self.current);
+                plan
+            }
+            "select" => {
+                let label = self.str_arg()?;
+                // Multi-label select yields a Map, which this engine has no value
+                // for yet — reject it rather than invent one.
+                if self.peek() == Some(&Tok::Comma) {
+                    return Err(
+                        "multi-label select(...) needs map values, which are not supported".into(),
+                    );
+                }
+                self.expect(&Tok::RParen)?;
+                let slot = *self
+                    .labels
+                    .get(&label)
+                    .ok_or_else(|| format!("select('{label}'): no step is labelled `{label}`"))?;
+                let p = plan.project(vec![(label.clone(), Expr::Slot(slot))]);
+                self.current = 0;
+                self.slots = 1;
+                p
+            }
             "groupcount" => {
                 self.expect(&Tok::RParen)?;
-                self.expect(&Tok::Dot)?;
-                let by = self.ident()?;
-                if !by.eq_ignore_ascii_case("by") {
-                    return Err("groupCount() must be followed by by('k')".into());
-                }
-                self.expect(&Tok::LParen)?;
-                let key = self.str_arg()?;
-                self.expect(&Tok::RParen)?;
-                plan.aggregate(
-                    vec![(
+                // `groupCount()` groups by the current element; `groupCount().by('k')`
+                // groups by a property of it. The `.by(...)` modulator is optional.
+                let key_expr = if self.peek() == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
+                {
+                    self.expect(&Tok::Dot)?;
+                    self.ident()?; // `by`
+                    self.expect(&Tok::LParen)?;
+                    let key = self.str_arg()?;
+                    self.expect(&Tok::RParen)?;
+                    (
                         key.clone(),
                         Expr::Prop {
                             slot: self.current,
                             key,
                         },
-                    )],
+                    )
+                } else {
+                    ("key".to_string(), Expr::Slot(self.current))
+                };
+                let p = plan.aggregate(
+                    vec![key_expr],
                     vec![Agg {
                         func: AggFn::Count,
                         arg: None,
                         distinct: false,
                         name: "count".into(),
                     }],
-                )
+                );
+                self.current = 0;
+                self.slots = 2; // group key + count
+                p
             }
             other => return Err(format!("unsupported Gremlin step `{other}`")),
         };
@@ -503,25 +559,21 @@ impl Parser {
         }
     }
 
-    /// The second argument of `has('k', …)`: a literal (equality) or a predicate
-    /// `[P.]op(val)`, built as a comparison against property `key`.
+    /// The second argument of `has('k', …)`: a predicate against property `key`.
     fn has_predicate(&mut self, key: String) -> Result<Expr, String> {
-        let (op, val) = self.predicate_parts()?;
-        Ok(Expr::Compare {
-            op,
-            left: Box::new(Expr::Prop {
-                slot: self.current,
-                key,
-            }),
-            right: Box::new(Expr::Lit(val)),
-        })
+        let left = Expr::Prop {
+            slot: self.current,
+            key,
+        };
+        self.predicate_expr(left)
     }
 
-    /// Parse a Gremlin predicate argument into `(op, value)`. Accepts an optional
-    /// `P.` prefix, then either `op(literal)` (`gt`, `neq`, …) or a bare literal
-    /// (which means equality). Shared by `has(...)` and `where(...)` so both spell
-    /// a predicate the same way.
-    fn predicate_parts(&mut self) -> Result<(CompareOp, Value), String> {
+    /// Parse a Gremlin predicate argument and build the full comparison `Expr`
+    /// against `left`. Accepts an optional `P.` prefix, then one of:
+    /// `op(literal)` (`gt`, `neq`, …), `within(a, b, …)` / `without(a, b, …)`
+    /// (membership, an OR-of-equals and its negation), or a bare literal
+    /// (equality). Shared by `has(...)` and `where(...)`.
+    fn predicate_expr(&mut self, left: Expr) -> Result<Expr, String> {
         if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("P")) {
             self.pos += 1;
             self.expect(&Tok::Dot)?;
@@ -531,11 +583,22 @@ impl Parser {
         if matches!(self.peek(), Some(Tok::Ident(_)))
             && self.toks.get(self.pos + 1) == Some(&Tok::LParen)
         {
-            let op_name = self.ident()?;
+            let op_name = self.ident()?.to_ascii_lowercase();
             self.expect(&Tok::LParen)?;
+            // within/without take a value LIST and desugar to an OR-of-equals.
+            if op_name == "within" || op_name == "without" {
+                let vals = self.literal_list()?;
+                self.expect(&Tok::RParen)?;
+                let member = or_of_equals(&left, &vals);
+                return Ok(if op_name == "without" {
+                    Expr::Not(Box::new(member))
+                } else {
+                    member
+                });
+            }
             let val = self.literal()?;
             self.expect(&Tok::RParen)?;
-            let op = match op_name.to_ascii_lowercase().as_str() {
+            let op = match op_name.as_str() {
                 "eq" => CompareOp::Eq,
                 "neq" => CompareOp::Ne,
                 "gt" => CompareOp::Gt,
@@ -544,10 +607,33 @@ impl Parser {
                 "lte" => CompareOp::Le,
                 other => return Err(format!("unsupported predicate `{other}`")),
             };
-            Ok((op, val))
+            Ok(Expr::Compare {
+                op,
+                left: Box::new(left),
+                right: Box::new(Expr::Lit(val)),
+            })
         } else {
-            Ok((CompareOp::Eq, self.literal()?))
+            Ok(Expr::Compare {
+                op: CompareOp::Eq,
+                left: Box::new(left),
+                right: Box::new(Expr::Lit(self.literal()?)),
+            })
         }
+    }
+
+    /// A comma-separated list of literals (the arguments of `within`/`without`).
+    fn literal_list(&mut self) -> Result<Vec<Value>, String> {
+        let mut vals = Vec::new();
+        if self.peek() != Some(&Tok::RParen) {
+            loop {
+                vals.push(self.literal()?);
+                if self.peek() != Some(&Tok::Comma) {
+                    break;
+                }
+                self.pos += 1;
+            }
+        }
+        Ok(vals)
     }
 
     fn literal(&mut self) -> Result<Value, String> {
@@ -865,6 +951,76 @@ mod tests {
                 "{q}"
             );
         }
+    }
+
+    #[test]
+    fn as_labels_and_select_projects_it() {
+        let store = social();
+        // Label the source as `p`, hop, then select `p` back and read its name.
+        // KNOWS edges: alice->bob, alice->carol, bob->carol, so the sources are
+        // alice, alice, bob.
+        let q = "g.V().hasLabel('Person').as('p').out('KNOWS').select('p').values('name')";
+        assert_eq!(
+            value_bag(&gremlin_rows(q, &store)),
+            vec!["Str(\"alice\");", "Str(\"alice\");", "Str(\"bob\");"]
+        );
+    }
+
+    #[test]
+    fn within_and_without_membership() {
+        let store = social();
+        // within is an OR-of-equals; without is its negation.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').has('name', within('alice','carol')).values('age')",
+                &store
+            )),
+            vec!["Num(30.0);", "Num(40.0);"]
+        );
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').has('name', without('alice','carol')).values('age')",
+                &store
+            )),
+            vec!["Num(25.0);"]
+        );
+        // within also works in where(...) on the value stream.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').values('age').where(within(25, 40))",
+                &store
+            )),
+            vec!["Num(25.0);", "Num(40.0);"]
+        );
+    }
+
+    #[test]
+    fn bare_group_count_groups_by_the_current_element() {
+        let store = social();
+        // KNOWS targets are bob, carol, carol → {bob:1, carol:2}. Bare groupCount()
+        // over the name stream and the .by('name') form agree.
+        let want = vec!["Str(\"bob\");Num(1.0);", "Str(\"carol\");Num(2.0);"];
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').out('KNOWS').values('name').groupCount()",
+                &store
+            )),
+            want
+        );
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').out('KNOWS').groupCount().by('name')",
+                &store
+            )),
+            want
+        );
+    }
+
+    #[test]
+    fn select_errors() {
+        // An unknown label, and multi-label select (needs map values), both error.
+        assert!(super::parse("g.V().as('p').select('q')").is_err());
+        assert!(super::parse("g.V().as('a').out('R').as('b').select('a','b')").is_err());
     }
 
     #[test]

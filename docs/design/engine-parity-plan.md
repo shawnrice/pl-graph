@@ -226,14 +226,20 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       op like gt(28) (not just P.gt). values()/aggregates now retrack the current
       slot. 3 tests. (Baseline already had V/addV/addE/hasLabel/has/out/in/both/
       values/count/dedup/limit/range/order().by()/groupCount().by()/property/drop.)
-- [ ] F5b. Gremlin step breadth, part 2: as('x')/select('x'[,'y']) (step labels;
-      multi-select needs map values), order(local) (within-list ordering),
-      groupCount() with no by, and remaining P predicates (within/without).
+- [x] F5b. Gremlin step breadth, part 2: as('x') step labels + single-label
+      select('x') (projects the labelled slot), within(...)/without(...) membership
+      predicates (OR-of-equals and its negation, shared by has and where), and a
+      bare groupCount() (groups by the current element, .by('k') still optional).
+      4 tests. Multi-label select (a Map value) and order(local) (within-list sort)
+      → F5c, which depends on G2 maps / list ops.
 
 ### Phase G — Data model
 
 - [ ] G1. Temporal values + typed temporal columns.
 - [ ] G2. Map/record values (storage, dotted-path, construction, access).
+- [ ] F5c. Gremlin multi-label select('a','b') (a Map value — needs G2) and
+      order(local) (within-list sort — needs list ops). Relocated from F5b; placed
+      after G2 because it depends on the map/list value model.
 - [ ] G3. Numeric edge-case parity audit against `value.rs`.
 - [ ] G4. Interval/temporal edge index (relocated from D3; needs G1): RI-tree-style
       as-of/overlap seek over temporal edge bounds.
