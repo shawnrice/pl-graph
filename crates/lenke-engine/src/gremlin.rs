@@ -288,8 +288,30 @@ impl Parser {
                 plan.filter(pred)
             }
             "out" | "in" | "both" => {
-                let edge = self.str_arg()?;
+                // 0 args → ANY edge type (argless out()); 1 → that type. Multi-label
+                // out('A','B') is a follow-up (needs a union of hops).
+                let mut labels: Vec<String> = Vec::new();
+                if !matches!(self.peek(), Some(Tok::RParen)) {
+                    loop {
+                        labels.push(self.str_arg()?);
+                        if self.peek() == Some(&Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                }
                 self.expect(&Tok::RParen)?;
+                let edge_label: Option<&str> = match labels.len() {
+                    0 => None,
+                    1 => Some(labels[0].as_str()),
+                    _ => {
+                        return Err(
+                            "out()/in()/both() with multiple edge labels is not yet supported"
+                                .into(),
+                        )
+                    }
+                };
                 let dir = match name.to_ascii_lowercase().as_str() {
                     "out" => Dir::Out,
                     "in" => Dir::In,
@@ -298,7 +320,7 @@ impl Parser {
                 let from = self.current;
                 self.current = self.slots;
                 self.slots += 1;
-                plan.expand(from, dir, Some(&edge))
+                plan.expand(from, dir, edge_label)
             }
             "values" => {
                 let key = self.str_arg()?;
@@ -797,6 +819,33 @@ mod tests {
     fn gql_rows(q: &str, store: &Store) -> Rows {
         let plan = crate::gql::parse(q).unwrap_or_else(|e| panic!("parse gql `{q}`: {e}"));
         run(&plan, store)
+    }
+
+    /// Argless `out()`/`in()`/`both()` traverse edges of ANY type (matching core),
+    /// where a labelled hop is narrower — alice's WORKS_ON target only shows up
+    /// through the untyped hop.
+    #[test]
+    fn gremlin_argless_out_traverses_all_edge_types() {
+        let store = social();
+        let all = value_bag(&gremlin_rows(
+            "g.V().hasLabel('Person').out().values('name')",
+            &store,
+        ));
+        assert!(
+            all.iter().any(|r| r.contains("graphdb")),
+            "argless out() must follow WORKS_ON too: {all:?}"
+        );
+        let knows = value_bag(&gremlin_rows(
+            "g.V().hasLabel('Person').out('KNOWS').values('name')",
+            &store,
+        ));
+        assert!(
+            !knows.iter().any(|r| r.contains("graphdb")),
+            "typed out('KNOWS') must not: {knows:?}"
+        );
+        // in()/both() accept the argless form too.
+        assert!(super::parse("g.V().hasLabel('Person').in().values('name')").is_ok());
+        assert!(super::parse("g.V().hasLabel('Person').both().values('name')").is_ok());
     }
 
     /// THE PAYOFF: equivalent GQL and Gremlin queries lower to plans producing
