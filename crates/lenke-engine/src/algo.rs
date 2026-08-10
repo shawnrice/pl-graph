@@ -455,17 +455,38 @@ pub fn peer_pressure(store: &Store, edge_label: Option<&str>, iterations: u32) -
 /// is the unweighted default. Returns `(node, closeness)` in ascending-id order; a
 /// named-but-unknown edge type reaches only each source (every sum 0 → every 0).
 #[must_use]
-pub fn closeness(store: &Store, edge_label: Option<&str>) -> Vec<(u32, f64)> {
+pub fn closeness(
+    store: &Store,
+    edge_label: Option<&str>,
+    weight_property: Option<&str>,
+) -> Vec<(u32, f64)> {
     store
         .all_nodes()
         .into_iter()
         .map(|s| {
-            // `bfs_distances` yields reached nodes (incl. the source at 0) in
-            // ascending-id order — core sums finite distances in that same order.
-            let mut sum = 0.0f64;
-            for (_, d) in bfs_distances(store, s, Dir::Out, edge_label) {
-                sum += f64::from(d);
-            }
+            // Sum finite shortest-path distances in ascending-id order (core's
+            // vertex-insertion order). Unweighted → BFS hops; weighted → Dijkstra.
+            let sum = match weight_property {
+                None => {
+                    // `bfs_distances` yields reached nodes (incl. the source at 0),
+                    // ascending id — the same set/order core sums.
+                    let mut acc = 0.0f64;
+                    for (_, d) in bfs_distances(store, s, Dir::Out, edge_label) {
+                        acc += f64::from(d);
+                    }
+                    acc
+                }
+                Some(wk) => {
+                    let dist = dijkstra_dist(store, s, Dir::Out, edge_label, wk);
+                    let mut acc = 0.0f64;
+                    for d in dist {
+                        if d.is_finite() {
+                            acc += d;
+                        }
+                    }
+                    acc
+                }
+            };
             let c = if sum == 0.0 { 0.0 } else { 1.0 / sum };
             (s, c)
         })
@@ -744,13 +765,32 @@ fn dijkstra(
     edge_label: Option<&str>,
     weight: &str,
 ) -> Vec<(u32, f64)> {
-    // Negative/NaN weights make Dijkstra unsound — reject the whole run (core errs).
+    // Negative/NaN weights make Dijkstra unsound — reject the whole run (core errs
+    // here, only for shortestPath; closeness/betweenness run the SSSP unchecked).
     for eid in store.all_edges() {
         let w = edge_weight(store, eid, weight);
         if w.is_nan() || w < 0.0 {
             return Vec::new();
         }
     }
+    let dist = dijkstra_dist(store, src, dir, edge_label, weight);
+    (0..dist.len() as u32)
+        .filter(|&v| dist[v as usize].is_finite())
+        .map(|v| (v, dist[v as usize]))
+        .collect()
+}
+
+/// The weighted single-source distance vector (`f64::INFINITY` for unreachable) —
+/// core's weighted `sssp`. Shared by weighted `shortest_path` and `closeness`. No
+/// weight validation (the caller decides); relaxes incident edges in the configured
+/// direction in adjacency order, so the settled distances are byte-identical to core.
+fn dijkstra_dist(
+    store: &Store,
+    src: u32,
+    dir: Dir,
+    edge_label: Option<&str>,
+    weight: &str,
+) -> Vec<f64> {
     let n = store.node_count();
     let want = want_etype(store, edge_label);
     let type_ok = |et: u32| want.is_some_and(|inner| inner.is_none_or(|t| t == et));
@@ -789,10 +829,7 @@ fn dijkstra(
             }
         }
     }
-    (0..n as u32)
-        .filter(|&v| dist[v as usize].is_finite())
-        .map(|v| (v, dist[v as usize]))
-        .collect()
+    dist
 }
 
 /// The element-wise aggregation for [`neighbor_aggregate`].
@@ -1064,7 +1101,7 @@ pub fn run_procedure(
             let iters = num_of("iterations").map_or(DEFAULT_PAGERANK_ITERATIONS, |n| n as u32);
             pagerank(store, str_of("edgeType"), d, iters)
         }
-        "closeness" => closeness(store, str_of("edgeType")),
+        "closeness" => closeness(store, str_of("edgeType"), str_of("weightProperty")),
         "strongly_connected_components" => strongly_connected_components(store, str_of("edgeType"))
             .into_iter()
             .map(|(v, c)| (v, f64::from(c)))
@@ -1168,12 +1205,12 @@ mod tests {
         // distances 1 and 2, so Σ = 3 and closeness = 1/3. The isolated node reaches
         // nothing → sum 0 → closeness 0.
         assert_eq!(
-            closeness(&st, None),
+            closeness(&st, None, None),
             vec![(0, 1.0 / 3.0), (1, 1.0 / 3.0), (2, 1.0 / 3.0), (3, 0.0)]
         );
         // A named-but-unknown edge type reaches only each source → every closeness 0.
         assert_eq!(
-            closeness(&st, Some("NOPE")),
+            closeness(&st, Some("NOPE"), None),
             vec![(0, 0.0), (1, 0.0), (2, 0.0), (3, 0.0)]
         );
     }
@@ -1383,6 +1420,33 @@ mod tests {
         assert_eq!(
             peer_pressure(&sink, Some("NOPE"), DEFAULT_PEER_PRESSURE_ITERATIONS),
             vec![(0, 0), (1, 1), (2, 2), (3, 3)]
+        );
+    }
+
+    #[test]
+    fn closeness_weighted_uses_dijkstra_distances() {
+        // 0→1 (w=10), 0→2 (1), 2→1 (1). Weighted closeness of 0 sums the Dijkstra
+        // distances (0 + 2 + 1 = 3 → 1/3), differing from the unweighted hop sum
+        // (0 + 1 + 1 = 2 → 1/2). Node 2 reaches only 1 at cost 1 → 1/1; node 1 → 0.
+        let mut b = Builder::default();
+        b.node(&["N"], &[]);
+        b.node(&["N"], &[]);
+        b.node(&["N"], &[]);
+        let mut st = b.build();
+        let e0 = st.add_edge(0, 1, "R");
+        st.set_edge_prop(e0, "w", Value::Num(10.0));
+        let e1 = st.add_edge(0, 2, "R");
+        st.set_edge_prop(e1, "w", Value::Num(1.0));
+        let e2 = st.add_edge(2, 1, "R");
+        st.set_edge_prop(e2, "w", Value::Num(1.0));
+
+        assert_eq!(
+            closeness(&st, None, Some("w")),
+            vec![(0, 1.0 / 3.0), (1, 0.0), (2, 1.0)]
+        );
+        assert_eq!(
+            closeness(&st, None, None),
+            vec![(0, 1.0 / 2.0), (1, 0.0), (2, 1.0)]
         );
     }
 

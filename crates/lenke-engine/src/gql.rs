@@ -3343,6 +3343,31 @@ mod tests {
     }
 
     #[test]
+    fn call_closeness_weighted() {
+        // 0→1 (w=10), 0→2 (1), 2→1 (1): weighted closeness of 0 is 1/3 (Dijkstra
+        // sum 3), vs unweighted 1/2 (hop sum 2).
+        let mut bld = Builder::default();
+        bld.node(&["N"], &[]);
+        bld.node(&["N"], &[]);
+        bld.node(&["N"], &[]);
+        let mut store = bld.build();
+        let e0 = store.add_edge(0, 1, "R");
+        store.set_edge_prop(e0, "w", Value::Num(10.0));
+        let e1 = store.add_edge(0, 2, "R");
+        store.set_edge_prop(e1, "w", Value::Num(1.0));
+        let e2 = store.add_edge(2, 1, "R");
+        store.set_edge_prop(e2, "w", Value::Num(1.0));
+
+        let close0 = |q: &str| -> f64 { num(&run(&super::parse(q).unwrap(), &store).rows[0][1]) };
+        assert!(
+            (close0("CALL closeness({weightProperty: 'w'}) YIELD node, centrality") - 1.0 / 3.0)
+                .abs()
+                < 1e-12
+        );
+        assert!((close0("CALL closeness()") - 1.0 / 2.0).abs() < 1e-12);
+    }
+
+    #[test]
     fn call_personalized_pagerank_yields_score() {
         let store = triangle_store();
         let rows_of = |q: &str| -> Vec<(f64, f64)> {
