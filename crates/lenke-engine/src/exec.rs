@@ -1405,14 +1405,48 @@ fn index_seek_ids(store: &Store, label: &str, key: &str, value: &Value) -> Vec<u
                 .filter(|id| in_label.contains(id))
                 .collect()
         }
-        None => store
-            .nodes_with_label(label)
-            .iter()
-            .copied()
+        None => {
+            let ids = store.nodes_with_label(label);
+            // Typed fast paths for a plain (non-dotted) key: compare the raw column
+            // — a `&str`/`f64`/`bool` compare, no per-cell `Value` boxing or `Arc`
+            // clone. Equality semantics match `value::equals` (a present cell of the
+            // literal's type; a NULL cell — `present == false` — never equals).
+            if !key.contains('.') {
+                match (store.column(key), value) {
+                    (Some(Column::Str { data, present }), Value::Str(t)) => {
+                        let t: &str = t;
+                        return ids
+                            .iter()
+                            .copied()
+                            .filter(|&id| present[id as usize] && &*data[id as usize] == t)
+                            .collect();
+                    }
+                    (Some(Column::Num { data, present }), Value::Num(t)) => {
+                        let t = *t;
+                        return ids
+                            .iter()
+                            .copied()
+                            .filter(|&id| present[id as usize] && data[id as usize] == t)
+                            .collect();
+                    }
+                    (Some(Column::Bool { data, present }), Value::Bool(t)) => {
+                        let t = *t;
+                        return ids
+                            .iter()
+                            .copied()
+                            .filter(|&id| present[id as usize] && data[id as usize] == t)
+                            .collect();
+                    }
+                    _ => {}
+                }
+            }
             // `key` may be a dotted record path — resolve it (plain keys read as
             // `prop`), so the no-index fallback matches a dotted seek too.
-            .filter(|&id| value::equals(&store.prop_path(id, key), value))
-            .collect(),
+            ids.iter()
+                .copied()
+                .filter(|&id| value::equals(&store.prop_path(id, key), value))
+                .collect()
+        }
     }
 }
 
