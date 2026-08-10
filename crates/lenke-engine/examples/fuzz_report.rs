@@ -263,6 +263,7 @@ fn main() {
     let probes: &[(&str, Gen)] = &[
         ("baseline_scan_filter", p_baseline),
         ("element_map", p_element),
+        ("return_star", p_return_star),
         ("edge_props", p_edge_props),
         ("string_literal_eq", p_string_lit),
         ("str_infix", p_str_infix),
@@ -376,6 +377,18 @@ fn p_element(rng: &mut Rng) -> (String, bool) {
         format!("{} RETURN {v}.id AS a0, {v} AS a1 ORDER BY a0", pattern(v)),
         true,
     )
+}
+fn p_return_star(rng: &mut Rng) -> (String, bool) {
+    // RETURN * expands to the bound node bindings (element maps), in slot order,
+    // compared as a multiset. Node-only patterns for now — a pattern that binds an
+    // EDGE variable needs edge-element rendering (the next item); this probe grows to
+    // cover it then.
+    let w = if rng.chance(1, 2) {
+        format!(" WHERE n.a {} {}", cmp_op(rng), rng.pick(NUMS))
+    } else {
+        String::new()
+    };
+    (format!("MATCH (n:N){w} RETURN *"), false)
 }
 fn p_baseline(rng: &mut Rng) -> (String, bool) {
     let v = var(rng);

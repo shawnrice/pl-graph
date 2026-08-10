@@ -1211,6 +1211,24 @@ impl Parser {
     fn return_items(&mut self) -> Result<Vec<RetItem>, String> {
         let mut items = Vec::new();
         loop {
+            // `*` expands to EVERY bound variable, projected in slot (declaration)
+            // order — each column named after its variable. Composes with more items
+            // (`RETURN *, count(*)`).
+            if self.eat(&Tok::Star) {
+                let mut vars: Vec<(usize, String)> =
+                    self.scope.iter().map(|(k, &s)| (s, k.clone())).collect();
+                vars.sort_by_key(|&(s, _)| s);
+                if vars.is_empty() {
+                    return Err("RETURN * requires at least one bound variable".into());
+                }
+                for (slot, name) in vars {
+                    items.push(RetItem::Key(name, Expr::Slot(slot)));
+                }
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+                continue;
+            }
             let idx = items.len();
             let item = if let Some(func) = self.peek_agg() {
                 let (agg_arg, distinct) = self.aggregate_call()?;
@@ -3778,6 +3796,29 @@ mod tests {
             &store,
         );
         assert!(matches!(col(&neg, 0, "x"), Value::Str(s) if &*s == "alice"));
+    }
+
+    /// `RETURN *` projects every bound variable, in slot (declaration) order, each
+    /// column named for its variable.
+    #[test]
+    fn return_star_expands_bound_vars() {
+        let store = social();
+        // Two bound node vars → two columns, `a` then `b`, both node maps.
+        let out = run(
+            &super::parse("MATCH (a:Person {name:'alice'})-[:KNOWS]->(b) RETURN *").unwrap(),
+            &store,
+        );
+        assert_eq!(out.names, vec!["a".to_string(), "b".to_string()]);
+        assert!(out
+            .rows
+            .iter()
+            .all(|r| matches!(&r[0], Value::Map(_)) && matches!(&r[1], Value::Map(_))));
+        // `*` composes with an explicit item.
+        let out2 = run(
+            &super::parse("MATCH (n:Person) RETURN *, n.name AS nm").unwrap(),
+            &store,
+        );
+        assert_eq!(out2.names, vec!["n".to_string(), "nm".to_string()]);
     }
 
     /// `RETURN n` (a bare node binding) renders the element MAP core produces —
