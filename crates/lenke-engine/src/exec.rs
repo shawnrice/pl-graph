@@ -2148,6 +2148,11 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 } else {
                     match (value::as_num(&a), value::as_num(&b)) {
                         (Some(x), Some(y)) => {
+                            // Division / modulo by zero THROWS (matches lenke-core's
+                            // DataException), rather than producing IEEE Inf/NaN.
+                            if matches!(op, Div | Rem) && y == 0.0 {
+                                return Err("division by zero".into());
+                            }
                             let res = match op {
                                 Add => x + y,
                                 Sub => x - y,
@@ -3343,30 +3348,29 @@ mod tests {
         assert_eq!(nulls, 1); // only the Project node lacks age
     }
 
-    /// Division by zero is non-finite → NULL (the NaN/Inf → null policy).
+    /// Division / modulo by zero THROWS (matches lenke-core's DataException), via
+    /// the fallible read path — `try_run` surfaces the error (K3).
     #[test]
-    fn arith_div_by_zero_is_null() {
-        use crate::ir::ArithOp::Div;
-        let store = social();
-        let plan = scan("Person")
-            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("alice"))))
-            .project(vec![("x".into(), arith(Div, prop(0, "age"), lit(n(0.0))))]);
-        assert!(run(&plan, &store).rows[0][0].is_null());
-    }
-
-    /// Every non-finite arithmetic RESULT collapses to NULL (the NaN/Inf policy):
-    /// modulo-by-zero (NaN), and a product that overflows f64 to Inf.
-    #[test]
-    fn arith_nonfinite_results_are_null() {
-        use crate::ir::ArithOp::{Mul, Rem};
+    fn arith_div_or_mod_by_zero_throws() {
+        use crate::ir::ArithOp::{Div, Rem};
         let store = social();
         let one = scan("Person").filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("alice"))));
-        // age % 0 → NaN → NULL
-        let m = one
-            .clone()
-            .project(vec![("x".into(), arith(Rem, prop(0, "age"), lit(n(0.0))))]);
-        assert!(run(&m, &store).rows[0][0].is_null());
-        // 1e308 * 1e308 → +Inf → NULL
+        for op in [Div, Rem] {
+            let plan = one
+                .clone()
+                .project(vec![("x".into(), arith(op, prop(0, "age"), lit(n(0.0))))]);
+            let err = crate::exec::try_run(&plan, &store).unwrap_err();
+            assert!(err.contains("division by zero"), "op {op:?}: {err}");
+        }
+    }
+
+    /// A product that overflows f64 to Inf currently collapses to NULL (the
+    /// finite-or-null policy). NOTE: K4 revisits this to KEEP Inf like lenke-core.
+    #[test]
+    fn arith_overflow_is_null() {
+        use crate::ir::ArithOp::Mul;
+        let store = social();
+        let one = scan("Person").filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("alice"))));
         let big = one.project(vec![("x".into(), arith(Mul, lit(n(1e308)), lit(n(1e308))))]);
         assert!(run(&big, &store).rows[0][0].is_null());
     }
