@@ -588,7 +588,7 @@ the catalog (parser allow-list + eval). Grouped by family:
 - [x] K6. (DONE) cast fns to_integer/to_float/to_string/to_boolean (+aliases), NULL-on-failure, no bool→number coercion.  ORIG: Cast functions: `to_integer`/`tointeger`, `to_float`/`tofloat`,
       `to_string`/`tostring`, `to_boolean`/`toboolean` (engine has `CAST(x AS T)`
       only). (~3000/3000 for that probe.)
-- [ ] K7. `IN` list-membership operator (`x IN [a, b, c]`) — absent entirely.
+- [x] K7. (DONE) `[NOT] IN [list literal]` desugars to an OR-chain of equals (3VL falls out); dynamic (non-literal) IN deferred.  ORIG: `IN` list-membership operator (`x IN [a, b, c]`) — absent entirely.
 - [x] K8. (DONE) nullif.  ORIG: `nullif(a, b)` (engine has `coalesce`).
 - [x] K9. (DONE) math+constants: e,pi,exp,ln,log(base),power,mod,sin/cos/tan(+asin/acos/atan,sinh/cosh/tanh,cot),degrees,radians. NaN/Inf results still nulled until K4.  ORIG: Math fns + constants: `exp`, `ln`, `log`, `sin`/`cos`/`tan`
       (+`asin`/`acos`/`atan`, `sinh`/`cosh`/`tanh`/`cot`), `power`, `mod`, `e`,

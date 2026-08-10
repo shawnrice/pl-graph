@@ -44,6 +44,28 @@ impl RetItem {
 }
 
 /// Map an aggregate function name (case-insensitive) to its `AggFn`.
+/// `left IN [items]` desugared to `left = i0 OR left = i1 OR …`. An empty list is
+/// a constant FALSE (`1 = 0`), so `x IN []` never matches; a non-empty list keeps
+/// the `=` operator's three-valued semantics (a NULL element/operand → UNKNOWN).
+fn in_chain(left: &Expr, items: Vec<Expr>) -> Expr {
+    let eq = |item: Expr| Expr::Compare {
+        op: CompareOp::Eq,
+        left: Box::new(left.clone()),
+        right: Box::new(item),
+    };
+    let mut it = items.into_iter();
+    match it.next() {
+        None => Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Expr::Lit(crate::value::Value::Num(1.0))),
+            right: Box::new(Expr::Lit(crate::value::Value::Num(0.0))),
+        },
+        Some(first) => it.fold(eq(first), |acc, item| {
+            Expr::Or(Box::new(acc), Box::new(eq(item)))
+        }),
+    }
+}
+
 fn agg_fn(name: &str) -> Option<AggFn> {
     Some(match name.to_ascii_uppercase().as_str() {
         "COUNT" => AggFn::Count,
@@ -1229,6 +1251,24 @@ impl Parser {
                 negated,
             });
         }
+        // `left [NOT] IN <list literal>` — desugars to an OR-chain of equality
+        // tests, so its three-valued behavior falls out of the `=` operator (a
+        // NULL element or operand makes a non-match UNKNOWN, not false).
+        let saved = self.pos;
+        let negated_in = self.eat_kw("NOT");
+        if self.eat_kw("IN") {
+            let rhs = self.add_expr()?;
+            let Expr::List { items } = rhs else {
+                return Err("IN requires a list literal, e.g. `x IN [1, 2, 3]`".into());
+            };
+            let member = in_chain(&left, items);
+            return Ok(if negated_in {
+                Expr::Not(Box::new(member))
+            } else {
+                member
+            });
+        }
+        self.pos = saved; // the NOT (if any) was not part of a NOT IN
         let op = match self.peek() {
             Some(Tok::Eq) => CompareOp::Eq,
             Some(Tok::Ne) => CompareOp::Ne,

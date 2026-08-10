@@ -3430,6 +3430,44 @@ mod tests {
         assert_eq!(list_of("labels(x)"), dbg(&[s("M"), s("N")]));
     }
 
+    /// `IN` / `NOT IN` over a list literal (K7), desugared to an OR-chain of
+    /// equals — including three-valued behavior with a NULL in the list.
+    #[test]
+    fn in_operator() {
+        let mut b = Builder::default();
+        b.node(&["N"], &[("a", n(1.0))]);
+        b.node(&["N"], &[("a", n(2.0))]);
+        b.node(&["N"], &[("a", n(9.0))]);
+        b.node(&["N"], &[]); // a is NULL
+        let store = b.build();
+        let ids = |q: &str| -> Vec<String> {
+            let mut v = names_of(&run(&crate::gql::parse(q).unwrap(), &store), 0);
+            v.sort();
+            v
+        };
+        // a IN [1,2] → the 1 and 2 nodes.
+        assert_eq!(
+            ids("MATCH (n:N) WHERE n.a IN [1, 2] RETURN n.a AS a"),
+            vec!["Num(1.0)", "Num(2.0)"]
+        );
+        // NOT IN → the 9 node only (NULL-a is UNKNOWN, dropped, not returned).
+        assert_eq!(
+            ids("MATCH (n:N) WHERE n.a NOT IN [1, 2] RETURN n.a AS a"),
+            vec!["Num(9.0)"]
+        );
+        // A NULL element makes a non-match UNKNOWN → row drops (3VL): only the
+        // literal 1 matches; 2/9 are UNKNOWN (could equal the null), dropped.
+        assert_eq!(
+            ids("MATCH (n:N) WHERE n.a IN [1, null] RETURN n.a AS a"),
+            vec!["Num(1.0)"]
+        );
+        // Empty list → nobody matches.
+        assert_eq!(
+            ids("MATCH (n:N) WHERE n.a IN [] RETURN n.a AS a"),
+            Vec::<String>::new()
+        );
+    }
+
     // --- relational core (unchanged behavior, now slot-addressed) ---
 
     #[test]
