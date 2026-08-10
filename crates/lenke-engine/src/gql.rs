@@ -3333,6 +3333,37 @@ mod tests {
     }
 
     #[test]
+    fn call_neighbor_aggregate_yields_vector() {
+        // a(0)=[1,2], b(1)=[3,4]; a→b. OUT-sum at a folds b's vector; b has none.
+        let mut bld = Builder::default();
+        let vec = |xs: &[f64]| Value::List(xs.iter().map(|&x| Value::Num(x)).collect());
+        let a = bld.node(&["N"], &[("h", vec(&[1.0, 2.0]))]);
+        let b = bld.node(&["N"], &[("h", vec(&[3.0, 4.0]))]);
+        bld.edge(a, b, "R");
+        let store = bld.build();
+
+        let out = run(
+            &super::parse(
+                "CALL neighbor_aggregate({feature: 'h', op: 'sum', direction: 'out'}) \
+                 YIELD node, vector",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert_eq!(out.names, vec!["node".to_string(), "vector".to_string()]);
+        // Node a's aggregate is b's feature [3,4]; node b's is the zero vector.
+        assert_eq!(out.rows.len(), 2);
+        assert_eq!(
+            format!("{:?}", out.rows[0][1]),
+            "List([Num(3.0), Num(4.0)])"
+        );
+        assert_eq!(
+            format!("{:?}", out.rows[1][1]),
+            "List([Num(0.0), Num(0.0)])"
+        );
+    }
+
+    #[test]
     fn call_procedure_config_and_components() {
         let store = triangle_store();
         // degree with direction=both: each triangle node 2, isolated 0.

@@ -1077,8 +1077,10 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             let results = crate::algo::run_procedure(store, name, config)
                 .ok_or_else(|| format!("unknown procedure `{name}`"))?;
             let ids: Vec<u32> = results.iter().map(|(v, _)| *v).collect();
-            let vals: Vec<f64> = results.iter().map(|(_, r)| *r).collect();
-            Batch::of(vec![Col::Nodes(ids), Col::Num(vals)])
+            // The result column carries per-node Values (a scalar Num for most
+            // procedures, a List for neighbor_aggregate's feature vectors).
+            let vals: Vec<Value> = results.into_iter().map(|(_, r)| r).collect();
+            Batch::of(vec![Col::Nodes(ids), Col::Gen(vals)])
         }
     })
 }

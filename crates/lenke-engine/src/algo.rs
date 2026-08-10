@@ -5,10 +5,12 @@
 //!
 //! The catalog: the non-iterative set — degree, weakly/strongly connected
 //! components (union-by-min / Tarjan), on-cycle, BFS distances, single-source
-//! shortest paths, closeness and betweenness centrality — plus the iterative set,
-//! PageRank (global and personalized) and label propagation, whose f64 summation /
-//! tiebreak order is pinned (node-id and in-adjacency order, reciprocal multiply)
-//! so their results are reproducible and match lenke-core bit-for-bit.
+//! shortest paths, closeness and betweenness centrality, and neighbor feature
+//! aggregation — plus the iterative set, PageRank (global and personalized) and
+//! label propagation, whose f64 summation / tiebreak order is pinned (node-id and
+//! in-adjacency order, reciprocal multiply) so their results are reproducible and
+//! match lenke-core bit-for-bit. Most procedures yield one scalar per node;
+//! neighbor_aggregate yields a per-node feature vector (a `Value::List`).
 
 use crate::ir::Dir;
 use crate::store::Store;
@@ -608,6 +610,195 @@ pub fn shortest_path(
         .collect()
 }
 
+/// The element-wise aggregation for [`neighbor_aggregate`].
+#[derive(Clone, Copy, PartialEq)]
+enum AggOp {
+    Sum,
+    Mean,
+    Max,
+    Min,
+}
+
+/// A vertex's feature vector: a numeric list-valued property `key`, as `Vec<f64>`.
+/// `None` if absent or holding a non-numeric element (not a feature vector).
+fn read_feature(store: &Store, v: u32, key: &str) -> Option<Vec<f64>> {
+    match store.prop(v, key) {
+        Value::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in &items {
+                match it {
+                    Value::Num(n) => out.push(*n),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Neighbor feature aggregation (a GNN message-passing primitive): for each node,
+/// element-wise aggregate the `feature` vector property over its neighbours under
+/// `op` (mean/sum/max/min). Ported from core's `neighbor_aggregate` for the
+/// unweighted, un-normalized case: contributors are the node's out- and/or in-
+/// neighbours (per `direction`, a both-direction self-loop counted once), gathered
+/// and SORTED BY EDGE ID for a canonical accumulation order, so the folded f64 sum
+/// is byte-identical to core. `mean` divides by the number of folded contributors;
+/// a node with no featured contributor yields the zero vector (of the shared
+/// dimension). `include_self` folds the node's own feature first. Weighted
+/// (`weightProperty`) and GCN normalization are deferred (rejected for max/min in
+/// core; not built here). Returns `(node, Value::List)` in ascending-id order, or an
+/// `Err` for a missing `feature`, a bad `op`/`direction`, or ragged feature lengths.
+fn neighbor_aggregate(
+    store: &Store,
+    config: &[(String, Value)],
+) -> Result<Vec<(u32, Value)>, String> {
+    let cfg_str = |k: &str| -> Option<&str> {
+        config.iter().find(|(ck, _)| ck == k).and_then(|(_, v)| {
+            if let Value::Str(s) = v {
+                Some(s.as_ref())
+            } else {
+                None
+            }
+        })
+    };
+    let cfg_bool = |k: &str| -> Option<bool> {
+        config.iter().find(|(ck, _)| ck == k).and_then(|(_, v)| {
+            if let Value::Bool(b) = v {
+                Some(*b)
+            } else {
+                None
+            }
+        })
+    };
+    let feature = cfg_str("feature")
+        .ok_or_else(|| "neighbor_aggregate requires a `feature` property".to_string())?;
+    let op = match cfg_str("op").unwrap_or("mean") {
+        "mean" => AggOp::Mean,
+        "sum" => AggOp::Sum,
+        "max" => AggOp::Max,
+        "min" => AggOp::Min,
+        other => {
+            return Err(format!(
+                "neighbor_aggregate `op` must be one of mean|sum|max|min, got '{other}'"
+            ))
+        }
+    };
+    let (want_out, want_in) = match cfg_str("direction").unwrap_or("both") {
+        "out" => (true, false),
+        "in" => (false, true),
+        "both" => (true, true),
+        other => {
+            return Err(format!(
+                "neighbor_aggregate `direction` must be one of out|in|both, got '{other}'"
+            ))
+        }
+    };
+    let include_self = cfg_bool("includeSelf").unwrap_or(false);
+    let want = want_etype(store, cfg_str("edgeType"));
+
+    // Precompute every vertex's feature vector; infer the shared dimension (ragged
+    // vectors fault, matching core).
+    let slots = store.node_count();
+    let feats: Vec<Option<Vec<f64>>> = (0..slots as u32)
+        .map(|v| read_feature(store, v, feature))
+        .collect();
+    let mut dim: Option<usize> = None;
+    for f in feats.iter().flatten() {
+        match dim {
+            None => dim = Some(f.len()),
+            Some(d) if d != f.len() => {
+                return Err(format!(
+                "neighbor_aggregate feature vectors must all have the same length; found {} and {}",
+                d,
+                f.len()
+            ))
+            }
+            _ => {}
+        }
+    }
+    let d = dim.unwrap_or(0);
+
+    // A vertex's contributor `(eid, nbr)` pairs, sorted by edge id — the canonical,
+    // engine-independent accumulation order. A both-direction self-loop is counted
+    // once (its in-side copy dropped, mirroring `expand`).
+    let contributors = |v: u32| -> Vec<(u32, u32)> {
+        let mut contrib: Vec<(u32, u32)> = Vec::new();
+        if want_out {
+            for a in store.out(v) {
+                if want.is_some_and(|w| w.is_none_or(|t| t == a.etype)) {
+                    contrib.push((a.eid, a.nbr));
+                }
+            }
+        }
+        if want_in {
+            for a in store.inc(v) {
+                if want_out && a.nbr == v {
+                    continue;
+                }
+                if want.is_some_and(|w| w.is_none_or(|t| t == a.etype)) {
+                    contrib.push((a.eid, a.nbr));
+                }
+            }
+        }
+        contrib.sort_unstable_by_key(|&(eid, _)| eid);
+        contrib
+    };
+
+    let mut out: Vec<(u32, Value)> = Vec::with_capacity(store.all_nodes().len());
+    for v in store.all_nodes() {
+        let mut acc = vec![0.0f64; d];
+        let mut count = 0.0f64; // folded-contributor count (the `mean` divisor)
+        let mut started = false; // whether `acc` holds a real value (for max/min)
+        let mut fold = |vec: &[f64]| {
+            match op {
+                AggOp::Sum | AggOp::Mean => {
+                    for (a, x) in acc.iter_mut().zip(vec) {
+                        *a += *x;
+                    }
+                }
+                AggOp::Max => {
+                    if started {
+                        for (a, x) in acc.iter_mut().zip(vec) {
+                            *a = a.max(*x);
+                        }
+                    } else {
+                        acc.copy_from_slice(vec);
+                    }
+                }
+                AggOp::Min => {
+                    if started {
+                        for (a, x) in acc.iter_mut().zip(vec) {
+                            *a = a.min(*x);
+                        }
+                    } else {
+                        acc.copy_from_slice(vec);
+                    }
+                }
+            }
+            started = true;
+            count += 1.0;
+        };
+        if include_self {
+            if let Some(sv) = &feats[v as usize] {
+                fold(sv);
+            }
+        }
+        for (_, nbr) in contributors(v) {
+            if let Some(nv) = &feats[nbr as usize] {
+                fold(nv);
+            }
+        }
+        if op == AggOp::Mean && count != 0.0 {
+            for a in &mut acc {
+                *a /= count;
+            }
+        }
+        out.push((v, Value::List(acc.into_iter().map(Value::Num).collect())));
+    }
+    Ok(out)
+}
+
 /// The built-in procedure catalog: a `CALL name(...)` procedure name → its
 /// non-`node` result column name (matching lenke-core's snake_case surface). The
 /// output columns of every procedure are `[node, <result>]`. `None` = unknown.
@@ -624,6 +815,7 @@ pub fn procedure_result_col(name: &str) -> Option<&'static str> {
         "betweenness" => "centrality",
         "shortest_path" => "distance",
         "personalized_pagerank" => "score",
+        "neighbor_aggregate" => "vector",
         _ => return None,
     })
 }
@@ -637,7 +829,13 @@ pub fn run_procedure(
     store: &Store,
     name: &str,
     config: &[(String, Value)],
-) -> Option<Vec<(u32, f64)>> {
+) -> Option<Vec<(u32, Value)>> {
+    // neighbor_aggregate produces a per-node feature VECTOR (a Value::List) and may
+    // reject its config; a config error surfaces as `None` (CALL reports the failed
+    // procedure). Every other procedure is scalar and is wrapped into Value::Num below.
+    if name == "neighbor_aggregate" {
+        return neighbor_aggregate(store, config).ok();
+    }
     let str_of = |k: &str| {
         config.iter().find(|(ck, _)| ck == k).and_then(|(_, v)| {
             if let Value::Str(s) = v {
@@ -661,7 +859,8 @@ pub fn run_procedure(
         Some("both") => Dir::Both,
         _ => Dir::Out,
     };
-    Some(match name {
+    // Every remaining procedure is scalar `(node, f64)`; wrap into `(node, Value::Num)`.
+    let numeric: Vec<(u32, f64)> = match name {
         "degree" => degree(store, dir(), str_of("edgeType")),
         "connected_components" => weakly_connected_components(store, str_of("edgeType"))
             .into_iter()
@@ -713,7 +912,13 @@ pub fn run_procedure(
             personalized_pagerank(store, str_of("edgeType"), &seeds, d, iters)
         }
         _ => return None,
-    })
+    };
+    Some(
+        numeric
+            .into_iter()
+            .map(|(v, x)| (v, Value::Num(x)))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -897,6 +1102,64 @@ mod tests {
         let none = ppr(&[]);
         assert_eq!(ppr(&["999"]), none);
         assert!(none[3].1 > 0.0);
+    }
+
+    #[test]
+    fn neighbor_aggregate_folds_feature_vectors() {
+        // a(0)=[1,2], b(1)=[3,4], c(2)=[5,6]; edges a→b, a→c. OUT-aggregation at a
+        // folds b and c; b and c have no out-neighbour → the zero vector.
+        let mut b = Builder::default();
+        let vec = |xs: &[f64]| Value::List(xs.iter().map(|&x| Value::Num(x)).collect());
+        let a = b.node(&["N"], &[("h", vec(&[1.0, 2.0]))]);
+        let bb = b.node(&["N"], &[("h", vec(&[3.0, 4.0]))]);
+        let c = b.node(&["N"], &[("h", vec(&[5.0, 6.0]))]);
+        b.edge(a, bb, "R");
+        b.edge(a, c, "R");
+        let st = b.build();
+
+        let run = |op: &str, extra: &[(&str, Value)]| {
+            let mut cfg: Vec<(String, Value)> = vec![
+                ("feature".into(), Value::Str("h".into())),
+                ("op".into(), Value::Str(op.into())),
+                ("direction".into(), Value::Str("out".into())),
+            ];
+            cfg.extend(extra.iter().map(|(k, v)| ((*k).to_string(), v.clone())));
+            neighbor_aggregate(&st, &cfg).unwrap()
+        };
+        let node0 = |op: &str, extra: &[(&str, Value)]| match &run(op, extra)[0].1 {
+            Value::List(xs) => xs
+                .iter()
+                .map(|v| match v {
+                    Value::Num(n) => *n,
+                    _ => panic!("non-numeric"),
+                })
+                .collect::<Vec<f64>>(),
+            _ => panic!("not a list"),
+        };
+        assert_eq!(node0("sum", &[]), vec![8.0, 10.0]); // 3+5, 4+6
+        assert_eq!(node0("mean", &[]), vec![4.0, 5.0]); // /2 contributors
+        assert_eq!(node0("max", &[]), vec![5.0, 6.0]);
+        assert_eq!(node0("min", &[]), vec![3.0, 4.0]);
+        // includeSelf folds a's own [1,2] into the sum → [9,12].
+        assert_eq!(
+            node0("sum", &[("includeSelf", Value::Bool(true))]),
+            vec![9.0, 12.0]
+        );
+        // b(1) has no out-neighbour → the zero vector (mean does not divide by 0).
+        assert_eq!(
+            format!("{:?}", run("mean", &[])[1].1),
+            "List([Num(0.0), Num(0.0)])"
+        );
+        // Config errors surface as Err.
+        assert!(neighbor_aggregate(&st, &[]).is_err()); // missing feature
+        assert!(neighbor_aggregate(
+            &st,
+            &[
+                ("feature".into(), Value::Str("h".into())),
+                ("op".into(), Value::Str("median".into())),
+            ]
+        )
+        .is_err()); // bad op
     }
 
     #[test]
