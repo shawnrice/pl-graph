@@ -54,6 +54,9 @@ impl Col {
             // form only where a caller asked for a value column, never here — a
             // Nodes column is an element frontier, not a value. Callers that want
             // a value read a property off it instead.
+            // `u32::MAX` is the OPTIONAL-MATCH null sentinel (never a real dense id)
+            // — an unmatched optional element reads back as NULL.
+            Self::Nodes(v) | Self::Edges(v) if v[i] == u32::MAX => Value::Null,
             Self::Nodes(v) | Self::Edges(v) => Value::Num(f64::from(v[i])),
             Self::Num(v) => Value::Num(v[i]),
             Self::Bool(v) => Value::Bool(v[i]),

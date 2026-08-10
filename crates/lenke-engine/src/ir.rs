@@ -278,6 +278,17 @@ pub enum Plan {
         /// the node slot is appended, exactly as before.
         bind_edge: bool,
     },
+    /// A LEFT-OUTER single hop — GQL `OPTIONAL MATCH (a)-[:R]->(x)`. Like `Expand`
+    /// but a source row with NO matching neighbour is KEPT, its appended node slot
+    /// holding the null sentinel (`u32::MAX`, never a real dense id, read back as
+    /// NULL by property access / rendering / aggregates). So every input row yields
+    /// at least one output row. Node-only (no bound edge).
+    OptionalExpand {
+        input: Box<Plan>,
+        from: usize,
+        dir: Dir,
+        edge_label: Option<String>,
+    },
     /// An interval-overlap hop: like `Expand`, but keeps only edges whose interval
     /// `[edge.lo_key, edge.hi_key]` overlaps `[qlo, qhi]` (`lo <= qhi AND hi >= qlo`).
     /// Produced by the optimizer from `Expand{bind_edge} + Filter(r.lo <= X AND

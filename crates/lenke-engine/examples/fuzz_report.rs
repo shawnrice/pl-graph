@@ -268,6 +268,7 @@ fn main() {
         ("order_expr", p_order_expr),
         ("collect", p_collect),
         ("union", p_union),
+        ("optional_match", p_optional),
         ("edge_props", p_edge_props),
         ("string_literal_eq", p_string_lit),
         ("str_infix", p_str_infix),
@@ -387,6 +388,16 @@ fn p_return_star(rng: &mut Rng) -> (String, bool) {
     // order, compared as a multiset. The two-hop pattern binds an edge var `r`, so
     // this now exercises edge-element rendering too.
     (format!("{} RETURN *", pattern(var(rng))), false)
+}
+fn p_optional(rng: &mut Rng) -> (String, bool) {
+    // OPTIONAL MATCH left-outer hop: a node with no R-neighbour survives with `m`
+    // NULL. Tests the null sentinel via property read / element render / count(m).
+    // Compared as a multiset.
+    let ret = *rng.pick(&["m.a AS a1", "m.b AS a1", "m AS a1", "count(m) AS a1"]);
+    (
+        format!("MATCH (n:N) OPTIONAL MATCH (n)-[:R]->(m) RETURN n.id AS a0, {ret}"),
+        false,
+    )
 }
 fn p_union(rng: &mut Rng) -> (String, bool) {
     // Two RETURN arms over the same label. UNION dedups the combined rows, UNION ALL

@@ -397,6 +397,8 @@ impl Parser {
         loop {
             if self.eat_kw("WITH") {
                 plan = self.with_clause(plan)?;
+            } else if self.eat_kw("OPTIONAL") {
+                plan = self.optional_match(plan)?;
             } else if self.eat_kw("MATCH") {
                 plan = self.match_continue(plan)?;
             } else if self.eat_kw("CALL") {
@@ -974,6 +976,65 @@ impl Parser {
             plan = node_prop_filters(plan, from, v2_props);
         }
         Ok(plan)
+    }
+
+    /// `OPTIONAL MATCH (a)-[:R]->(x)` — a LEFT-OUTER single hop from a bound `a`. If
+    /// `a` has no matching neighbour, the row is kept with `x` NULL. Single-hop,
+    /// node-only, no bound edge; an inner `WHERE` is rejected (it filters the optional
+    /// match, which is not yet modelled) rather than mis-applied as a top-level filter.
+    fn optional_match(&mut self, plan: Plan) -> Result<Plan, String> {
+        if !self.eat_kw("MATCH") {
+            return Err("expected MATCH after OPTIONAL".into());
+        }
+        let (var, label, props) = self.node()?;
+        let Some(v) = var else {
+            return Err("OPTIONAL MATCH must start from a bound variable".into());
+        };
+        if label.is_some() {
+            return Err(format!(
+                "bound variable `{v}` cannot be re-labeled in OPTIONAL MATCH"
+            ));
+        }
+        if !props.is_empty() {
+            return Err(
+                "inline properties on the OPTIONAL MATCH start node are not supported; \
+                        use WHERE"
+                    .into(),
+            );
+        }
+        let Some(&from) = self.scope.get(&v) else {
+            return Err(format!(
+                "OPTIONAL MATCH must start from a bound variable; `{v}` is not in scope"
+            ));
+        };
+        let rel = self.rel()?;
+        if rel.var.is_some() || !rel.props.is_empty() {
+            return Err(
+                "a relationship variable / edge properties on OPTIONAL MATCH are not supported"
+                    .into(),
+            );
+        }
+        let (v2, _lbl2, v2_props) = self.node()?;
+        if !v2_props.is_empty() {
+            return Err(
+                "inline properties on the OPTIONAL MATCH landing node are not supported; use WHERE"
+                    .into(),
+            );
+        }
+        let node_slot = self.slots;
+        if let Some(nv) = v2 {
+            self.scope.insert(nv, node_slot);
+        }
+        self.slots += 1;
+        if self.peek_kw("WHERE") {
+            return Err("WHERE inside OPTIONAL MATCH is not supported yet".into());
+        }
+        Ok(Plan::OptionalExpand {
+            input: Box::new(plan),
+            from,
+            dir: rel.dir,
+            edge_label: rel.etype,
+        })
     }
 
     /// A continuing `MATCH` after `WITH`: it must start from a variable already
@@ -3921,6 +3982,57 @@ mod tests {
             &store,
         );
         assert!(matches!(col(&neg, 0, "x"), Value::Str(s) if &*s == "alice"));
+    }
+
+    /// OPTIONAL MATCH is a left-outer hop: a node with no matching neighbour survives
+    /// with the optional variable NULL; `count(x)` skips those nulls.
+    #[test]
+    fn optional_match_left_outer() {
+        let store = social(); // alice-KNOWS->bob, alice-KNOWS->carol, bob-KNOWS->carol
+        let q =
+            "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a.name AS an, b.name AS bn";
+        let out = run(&super::parse(q).unwrap(), &store);
+        // carol has no outgoing KNOWS → one row (carol, null).
+        let mut pairs: Vec<(String, Option<String>)> = out
+            .rows
+            .iter()
+            .map(|r| {
+                let a = match &r[0] {
+                    Value::Str(s) => s.to_string(),
+                    o => format!("{o:?}"),
+                };
+                let b = match &r[1] {
+                    Value::Str(s) => Some(s.to_string()),
+                    Value::Null => None,
+                    o => Some(format!("{o:?}")),
+                };
+                (a, b)
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("alice".into(), Some("bob".into())),
+                ("alice".into(), Some("carol".into())),
+                ("bob".into(), Some("carol".into())),
+                ("carol".into(), None), // left-outer: kept with NULL
+            ]
+        );
+        // count(x) over the optional skips the null (carol → 0).
+        let counts = run(
+            &super::parse(
+                "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b) RETURN a.name AS an, count(b) AS c",
+            )
+            .unwrap(),
+            &store,
+        );
+        let carol = counts
+            .rows
+            .iter()
+            .find(|r| matches!(&r[0], Value::Str(s) if &**s == "carol"))
+            .unwrap();
+        assert!(matches!(carol[1], Value::Num(x) if x == 0.0));
     }
 
     /// `UNION` concatenates two query arms' rows and dedups; `UNION ALL` keeps dups;

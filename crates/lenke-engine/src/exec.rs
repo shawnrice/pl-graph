@@ -518,6 +518,9 @@ fn pattern_value(props: &[(String, Value)], key: &str) -> Value {
 /// properties}` — needs an eid→endpoints accessor and is a separate step.)
 fn render_cell(col: &Col, i: usize, store: &Store) -> Value {
     match col {
+        // `u32::MAX` is the OPTIONAL-MATCH null sentinel → NULL, not an element map.
+        Col::Nodes(ids) if ids[i] == u32::MAX => Value::Null,
+        Col::Edges(eids) if eids[i] == u32::MAX => Value::Null,
         Col::Nodes(ids) => node_result_value(store, ids[i]),
         Col::Edges(eids) => edge_result_value(store, eids[i]),
         _ => col.value_at(i),
@@ -683,6 +686,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::AddEdge { .. }
         | Plan::CallProcedure { .. } => false,
         Plan::Expand { input, .. }
+        | Plan::OptionalExpand { input, .. }
         | Plan::VarLength { input, .. }
         | Plan::ShortestPath { input, .. }
         | Plan::Distinct { input }
@@ -780,6 +784,18 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             *dir,
             edge_label.as_deref(),
             *bind_edge,
+        ),
+        Plan::OptionalExpand {
+            input,
+            from,
+            dir,
+            edge_label,
+        } => optional_expand(
+            &pull(input, store, track)?,
+            store,
+            *from,
+            *dir,
+            edge_label.as_deref(),
         ),
         Plan::IntervalExpand {
             input,
@@ -1687,6 +1703,54 @@ fn expand(
         out.lineage = Some(lin.extend(&keep, &nbrs, &eids));
     }
     out
+}
+
+/// LEFT-OUTER single hop (`Plan::OptionalExpand`, GQL `OPTIONAL MATCH`): like
+/// [`expand`], but a source row with NO matching neighbour is KEPT, its appended
+/// node slot holding the `u32::MAX` null sentinel (read back as NULL everywhere).
+/// Node-only, no lineage. So every input row yields at least one output row.
+fn optional_expand(
+    batch: &Batch,
+    store: &Store,
+    from: usize,
+    dir: Dir,
+    edge_label: Option<&str>,
+) -> Batch {
+    // Every left row gets exactly one all-null neighbour row — used when the edge
+    // type is unknown, or the `from` slot isn't a node frontier.
+    let all_null = || {
+        let keep: Vec<usize> = (0..batch.rows()).collect();
+        let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
+        slots.push(Col::Nodes(vec![u32::MAX; batch.rows()]));
+        Batch::of(slots)
+    };
+    let want: Option<u32> = match edge_label {
+        None => None,
+        Some(name) => match store.etype_id(name) {
+            Some(id) => Some(id),
+            None => return all_null(), // unknown edge type → no match for any row
+        },
+    };
+    let Col::Nodes(src) = batch.slot(from) else {
+        return all_null();
+    };
+    let mut keep = Vec::new();
+    let mut nbrs = Vec::new();
+    for (row, &v) in src.iter().enumerate() {
+        let before = nbrs.len();
+        for_each_nbr(store, v, dir, want, |nbr, _| {
+            keep.push(row);
+            nbrs.push(nbr);
+        });
+        if nbrs.len() == before {
+            // No neighbour — keep the row with a null neighbour (left-outer).
+            keep.push(row);
+            nbrs.push(u32::MAX);
+        }
+    }
+    let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
+    slots.push(Col::Nodes(nbrs));
+    Batch::of(slots)
 }
 
 /// Interval-overlap hop (`Plan::IntervalExpand`): like [`expand`], but keeps only
@@ -4785,9 +4849,38 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
 /// storage column and staying unboxed when it and every read entry are
 /// present-and-typed; fall to `Gen` (with nulls) otherwise.
 fn read_property(store: &Store, col: &Col, key: &str) -> Col {
-    // An edge slot reads an EDGE property (boxed map, keyed by eid).
+    // An edge slot reads an EDGE property (boxed map, keyed by eid). A `u32::MAX`
+    // eid is the OPTIONAL null sentinel → NULL.
     if let Col::Edges(eids) = col {
-        return Col::Gen(eids.iter().map(|&e| store.edge_prop(e, key)).collect());
+        return Col::Gen(
+            eids.iter()
+                .map(|&e| {
+                    if e == u32::MAX {
+                        Value::Null
+                    } else {
+                        store.edge_prop(e, key)
+                    }
+                })
+                .collect(),
+        );
+    }
+    // A node column carrying any OPTIONAL null sentinel reads per row (sentinel →
+    // NULL, else the stored property); u32::MAX would index the property column out
+    // of bounds on the fast path below.
+    if let Col::Nodes(ids) = col {
+        if ids.contains(&u32::MAX) {
+            return Col::Gen(
+                ids.iter()
+                    .map(|&id| {
+                        if id == u32::MAX {
+                            Value::Null
+                        } else {
+                            store.prop(id, key)
+                        }
+                    })
+                    .collect(),
+            );
+        }
     }
     let Col::Nodes(ids) = col else {
         // A non-element column (e.g. a projected Record): `x.key` reads the record

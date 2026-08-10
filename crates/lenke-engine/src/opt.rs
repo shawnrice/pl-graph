@@ -128,6 +128,23 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 c,
             )
         }
+        Plan::OptionalExpand {
+            input,
+            from,
+            dir,
+            edge_label,
+        } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::OptionalExpand {
+                    input: Box::new(i),
+                    from,
+                    dir,
+                    edge_label,
+                },
+                c,
+            )
+        }
         Plan::IntervalExpand {
             input,
             from,
@@ -821,7 +838,9 @@ fn width(plan: &Plan) -> usize {
         | Plan::IntervalExpand {
             input, bind_edge, ..
         } => width(input) + if *bind_edge { 2 } else { 1 },
-        Plan::VarLength { input, .. } | Plan::ShortestPath { input, .. } => width(input) + 1,
+        Plan::VarLength { input, .. }
+        | Plan::ShortestPath { input, .. }
+        | Plan::OptionalExpand { input, .. } => width(input) + 1,
         Plan::Filter { input, .. }
         | Plan::OrderPage { input, .. }
         | Plan::Distinct { input }
@@ -1190,6 +1209,7 @@ mod tests {
         match p {
             Plan::Filter { .. } => true,
             Plan::Expand { input, .. }
+            | Plan::OptionalExpand { input, .. }
             | Plan::IntervalExpand { input, .. }
             | Plan::VarLength { input, .. }
             | Plan::ShortestPath { input, .. }
