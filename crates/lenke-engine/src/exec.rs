@@ -150,7 +150,7 @@ pub fn try_run(plan: &Plan, store: &Store) -> Result<Rows, String> {
             let mut rows = Flat::with_capacity(n, ncols);
             for i in 0..n {
                 for c in &batch.slots {
-                    rows.data.push(c.value_at(i));
+                    rows.data.push(render_cell(c, i, store));
                 }
             }
             Rows { names, rows }
@@ -159,7 +159,7 @@ pub fn try_run(plan: &Plan, store: &Store) -> Result<Rows, String> {
             let slot0 = batch.slot(0);
             let mut rows = Flat::with_capacity(n, 1);
             for i in 0..n {
-                rows.data.push(slot0.value_at(i));
+                rows.data.push(render_cell(slot0, i, store));
             }
             Rows {
                 names: vec!["_".to_string()],
@@ -477,6 +477,52 @@ fn pattern_value(props: &[(String, Value)], key: &str) -> Value {
         .iter()
         .find(|(k, _)| k == key)
         .map_or(Value::Null, |(_, v)| v.clone())
+}
+
+/// Render a batch cell (slot `col`, row `i`) to a result `Value`. A NODE frontier
+/// slot renders as core's element MAP `{id, labels, properties}` (not its bare id),
+/// so `RETURN n` / `RETURN *` match core byte-for-byte. Everything else materializes
+/// as its plain value. (Edge frontier rendering — `{id, from, to, labels,
+/// properties}` — needs an eid→endpoints accessor and is a separate step.)
+fn render_cell(col: &Col, i: usize, store: &Store) -> Value {
+    match col {
+        Col::Nodes(ids) => node_result_value(store, ids[i]),
+        _ => col.value_at(i),
+    }
+}
+
+/// The canonical result map for a node — `{id, labels(sorted), properties(sorted by
+/// key)}`, byte-identical to lenke-core's `val_to_value(Node)`.
+fn node_result_value(store: &Store, id: u32) -> Value {
+    use std::sync::Arc;
+    let ext = store
+        .node_ext_id(id)
+        .unwrap_or_else(|| Arc::from(id.to_string()));
+    let mut labels = store.labels_of(id);
+    labels.sort_unstable();
+    let labels_list = Value::List(labels.into_iter().map(|l| Value::Str(l.into())).collect());
+    // Present properties on this node, sorted by key (core's props_map ordering).
+    let mut props: Vec<(String, Value)> = store
+        .prop_keys()
+        .into_iter()
+        .filter(|k| store.has_prop(id, k))
+        .map(|k| {
+            let v = store.prop(id, &k);
+            (k, v)
+        })
+        .collect();
+    props.sort_by(|a, b| a.0.cmp(&b.0));
+    let props_map = Value::Map(Arc::new(
+        props
+            .into_iter()
+            .map(|(k, v)| (Value::Str(k.into()), v))
+            .collect(),
+    ));
+    Value::Map(Arc::new(vec![
+        (Value::Str("id".into()), Value::Str(ext)),
+        (Value::Str("labels".into()), labels_list),
+        (Value::Str("properties".into()), props_map),
+    ]))
 }
 
 /// The empty result a write statement returns (no columns, no rows).

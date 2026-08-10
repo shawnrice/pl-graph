@@ -2942,7 +2942,7 @@ mod tests {
             run(&super::parse(q).unwrap(), &store)
                 .rows
                 .iter()
-                .map(|r| (num(&r[0]), num(&r[1])))
+                .map(|r| (node_id(&r[0]), num(&r[1])))
                 .collect()
         };
         // Out-degrees: each triangle node 1, the isolated node 0.
@@ -2989,7 +2989,7 @@ mod tests {
         )
         .rows
         .iter()
-        .map(|r| (num(&r[0]), num(&r[1])))
+        .map(|r| (node_id(&r[0]), num(&r[1])))
         .collect();
         assert_eq!(comps, vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 3.0)]);
     }
@@ -3157,6 +3157,21 @@ mod tests {
     fn col(rows: &Rows, r: usize, name: &str) -> Value {
         let i = rows.names.iter().position(|n| n == name).expect("column");
         rows.rows[r][i].clone()
+    }
+
+    /// The numeric id of a NODE-element result map (`{id: "N", labels, properties}`),
+    /// which is how a node binding now renders (matching core).
+    fn node_id(v: &Value) -> f64 {
+        match v {
+            Value::Map(m) => m
+                .iter()
+                .find_map(|(k, val)| match (k, val) {
+                    (Value::Str(k), Value::Str(id)) if &**k == "id" => id.parse().ok(),
+                    _ => None,
+                })
+                .expect("node map carries a string id"),
+            other => num(other),
+        }
     }
 
     #[test]
@@ -3763,6 +3778,39 @@ mod tests {
             &store,
         );
         assert!(matches!(col(&neg, 0, "x"), Value::Str(s) if &*s == "alice"));
+    }
+
+    /// `RETURN n` (a bare node binding) renders the element MAP core produces —
+    /// `{id, labels(sorted), properties(sorted)}` — not the bare node id.
+    #[test]
+    fn return_node_renders_element_map() {
+        let store = social();
+        let out = run(
+            &super::parse("MATCH (p:Person {name:'alice'}) RETURN p").unwrap(),
+            &store,
+        );
+        let Value::Map(m) = &out.rows[0][0] else {
+            panic!("expected a node map, got {:?}", out.rows[0][0]);
+        };
+        // Top-level keys, in order.
+        let keys: Vec<&str> = m
+            .iter()
+            .map(|(k, _)| match k {
+                Value::Str(s) => s.as_ref(),
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(keys, vec!["id", "labels", "properties"]);
+        // labels is a List; properties is a Map carrying name='alice'.
+        assert!(
+            matches!(&m[1].1, Value::List(l) if matches!(&l[0], Value::Str(s) if &**s == "Person"))
+        );
+        let Value::Map(props) = &m[2].1 else {
+            panic!("properties must be a map")
+        };
+        assert!(props
+            .iter()
+            .any(|(k, v)| matches!((k, v), (Value::Str(k), Value::Str(v)) if &**k == "name" && &**v == "alice")));
     }
 
     /// An untyped relationship `-[r]->` / `-[]->` traverses edges of ANY type;

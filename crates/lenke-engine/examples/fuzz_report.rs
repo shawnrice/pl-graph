@@ -130,12 +130,59 @@ fn numk(n: f64) -> String {
         format!("f{n:.6}")
     }
 }
+// Type-AGNOSTIC canonical serialization of compound values (List/Record/Map), so an
+// engine Map and a core Map with the same contents compare EQUAL — the two Value
+// enums have different Debug type tags, which previously made every element map
+// (RETURN n) look divergent. Primitive leaves reuse `numk`. Node maps render the
+// same on both sides now, so this is what proves it.
+fn canon_e(v: &EngVal) -> String {
+    match v {
+        EngVal::Null => "z".into(),
+        EngVal::Bool(b) => format!("B{b}"),
+        EngVal::Num(n) => format!("N{}", numk(*n)),
+        EngVal::Str(s) => format!("S{s}"),
+        EngVal::List(x) => format!("[{}]", x.iter().map(canon_e).collect::<Vec<_>>().join(",")),
+        EngVal::Record(f) => format!(
+            "R{{{}}}",
+            f.iter()
+                .map(|(k, v)| format!("{k}={}", canon_e(v)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        EngVal::Map(m) => format!(
+            "M{{{}}}",
+            m.iter()
+                .map(|(k, v)| format!("{}={}", canon_e(k), canon_e(v)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        o => format!("?{o:?}"),
+    }
+}
+fn canon_c(v: &CoreVal) -> String {
+    match v {
+        CoreVal::Null => "z".into(),
+        CoreVal::Bool(b) => format!("B{b}"),
+        CoreVal::Num(n) => format!("N{}", numk(*n)),
+        CoreVal::Str(s) => format!("S{s}"),
+        CoreVal::List(x) => format!("[{}]", x.iter().map(canon_c).collect::<Vec<_>>().join(",")),
+        CoreVal::Map(m) => format!(
+            "M{{{}}}",
+            m.iter()
+                .map(|(k, v)| format!("S{k}={}", canon_c(v)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        o => format!("?{o:?}"),
+    }
+}
 fn ne(v: &EngVal) -> Cell {
     match v {
         EngVal::Null => Cell::Null,
         EngVal::Bool(b) => Cell::Bool(*b),
         EngVal::Num(n) => Cell::Num(numk(*n)),
         EngVal::Str(s) => Cell::Str(s.to_string()),
+        EngVal::List(_) | EngVal::Record(_) | EngVal::Map(_) => Cell::Other(canon_e(v)),
         o => Cell::Other(format!("{o:?}")),
     }
 }
@@ -145,6 +192,7 @@ fn nc(v: &CoreVal) -> Cell {
         CoreVal::Bool(b) => Cell::Bool(*b),
         CoreVal::Num(n) => Cell::Num(numk(*n)),
         CoreVal::Str(s) => Cell::Str(s.to_string()),
+        CoreVal::List(_) | CoreVal::Map(_) => Cell::Other(canon_c(v)),
         o => Cell::Other(format!("{o:?}")),
     }
 }
@@ -214,6 +262,7 @@ fn main() {
     type Gen = fn(&mut Rng) -> (String, bool);
     let probes: &[(&str, Gen)] = &[
         ("baseline_scan_filter", p_baseline),
+        ("element_map", p_element),
         ("edge_props", p_edge_props),
         ("string_literal_eq", p_string_lit),
         ("str_infix", p_str_infix),
@@ -319,6 +368,15 @@ fn cmp_op(rng: &mut Rng) -> &'static str {
     rng.pick(&["<", "<=", ">", ">=", "=", "<>"])
 }
 
+fn p_element(rng: &mut Rng) -> (String, bool) {
+    // Return a BARE node binding — exercises node-element map rendering
+    // ({id, labels, properties}) against core, the RETURN n / RETURN * shape.
+    let v = var(rng);
+    (
+        format!("{} RETURN {v}.id AS a0, {v} AS a1 ORDER BY a0", pattern(v)),
+        true,
+    )
+}
 fn p_baseline(rng: &mut Rng) -> (String, bool) {
     let v = var(rng);
     (
