@@ -633,6 +633,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // never evaluate arbitrary expressions, so they cannot fault.)
             if let Some(b) = try_scan_count(input, keys, aggs, store)
                 .or_else(|| try_scan_num_agg(input, keys, aggs, store))
+                .or_else(|| try_scan_multi_agg(input, keys, aggs, store))
                 .or_else(|| try_fused_count(input, keys, aggs, store))
                 .or_else(|| try_node_grouped_count(input, keys, aggs, store))
             {
@@ -1741,6 +1742,115 @@ fn try_scan_num_agg(
         }
     };
     Some(Batch::of(vec![Col::Gen(vec![result])]))
+}
+
+/// Answer several scalar numeric aggregates (`sum`/`avg`/`min`/`max`/`count`) over
+/// a bare `Scan` in ONE pass over the Num columns — e.g. `min(age), max(age)` or
+/// `count(*), avg(age)`. `None` if any agg is grouped/DISTINCT or not a numeric
+/// reduction over a `Num` property (or `count(*)`). Complements the single-agg
+/// [`try_scan_num_agg`], which keeps the tighter auto-vectorized loop.
+fn try_scan_multi_agg(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.is_empty() {
+        return None;
+    }
+    let label = match input {
+        Plan::Scan { label } => label,
+        _ => return None,
+    };
+    // Per agg: its Num column slices (None for `count(*)`) and function.
+    type AggSpec<'a> = (Option<(&'a [f64], &'a [bool])>, AggFn);
+    let mut specs: Vec<AggSpec> = Vec::with_capacity(aggs.len());
+    for agg in aggs {
+        if agg.distinct {
+            return None;
+        }
+        match (agg.func, agg.arg.as_ref()) {
+            (AggFn::Count, None) => specs.push((None, AggFn::Count)), // count(*)
+            (
+                AggFn::Sum | AggFn::Avg | AggFn::Count | AggFn::Min | AggFn::Max,
+                Some(Expr::Prop { slot: 0, key }),
+            ) => {
+                let Some(Column::Num { data, present }) = store.column(key) else {
+                    return None;
+                };
+                specs.push((Some((data.as_slice(), present.as_slice())), agg.func));
+            }
+            _ => return None,
+        }
+    }
+    // (total, count, best) per agg; `rows` counts scanned nodes for count(*).
+    let mut acc: Vec<(f64, u64, Option<f64>)> = vec![(0.0, 0, None); specs.len()];
+    let mut rows = 0u64;
+    let mut visit = |i: usize| {
+        rows += 1;
+        for (k, (col, func)) in specs.iter().enumerate() {
+            let Some((data, present)) = col else { continue };
+            if !present[i] {
+                continue;
+            }
+            let x = data[i];
+            let a = &mut acc[k];
+            a.0 += x;
+            a.1 += 1;
+            a.2 = Some(match a.2 {
+                None => x,
+                Some(b) => match func {
+                    AggFn::Min if value::cmp_num_total(x, b).is_lt() => x,
+                    AggFn::Max if value::cmp_num_total(x, b).is_gt() => x,
+                    _ => b,
+                },
+            });
+        }
+    };
+    let all_live = store.live_node_count() == store.node_count();
+    let whole = all_live
+        && match label {
+            None => true,
+            Some(l) => store.nodes_with_label(l).len() == store.node_count(),
+        };
+    if whole {
+        (0..store.node_count()).for_each(&mut visit);
+    } else {
+        match label {
+            Some(l) => store
+                .nodes_with_label(l)
+                .iter()
+                .for_each(|&id| visit(id as usize)),
+            None => (0..store.node_count()).for_each(|i| {
+                if store.is_alive(i as u32) {
+                    visit(i);
+                }
+            }),
+        }
+    }
+    // One output COLUMN per aggregate, each a single row (a scalar aggregate emits
+    // exactly one row).
+    let cols: Vec<Col> = specs
+        .iter()
+        .zip(&acc)
+        .map(|(&(col, func), &(total, cnt, best))| {
+            let v = match func {
+                AggFn::Count if col.is_none() => Value::Num(rows as f64), // count(*)
+                AggFn::Count => Value::Num(cnt as f64),                   // count(arg)
+                AggFn::Sum => Value::Num(total),                          // 0.0 over empty (K0a)
+                AggFn::Avg => {
+                    if cnt == 0 {
+                        Value::Null
+                    } else {
+                        Value::Num(total / cnt as f64)
+                    }
+                }
+                _ => best.map_or(Value::Null, Value::Num), // min/max of nothing → NULL
+            };
+            Col::Gen(vec![v])
+        })
+        .collect();
+    Some(Batch::of(cols))
 }
 
 /// Try to answer a scalar `count(*)` / `count(DISTINCT <last slot>)` sitting on
