@@ -362,6 +362,14 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 plan.filter(pred)
             }
+            // is(P) / is(op(v)) / is(literal): filter the current VALUE by a
+            // predicate — same as `where` on the value stream. A bare literal is an
+            // equality test (predicate_expr handles it).
+            "is" => {
+                let pred = self.predicate_expr(Expr::Slot(self.current))?;
+                self.expect(&Tok::RParen)?;
+                plan.filter(pred)
+            }
             "count" => {
                 self.expect(&Tok::RParen)?;
                 let p = plan.aggregate(
@@ -836,6 +844,24 @@ mod tests {
     fn gql_rows(q: &str, store: &Store) -> Rows {
         let plan = crate::gql::parse(q).unwrap_or_else(|e| panic!("parse gql `{q}`: {e}"));
         run(&plan, store)
+    }
+
+    /// `is(P)` filters the VALUE stream by a predicate (like `where`); `is(literal)`
+    /// is an equality test. Ages are alice 30, bob 25, carol 40.
+    #[test]
+    fn gremlin_is_value_predicate() {
+        let store = social();
+        let gt = value_bag(&gremlin_rows(
+            "g.V().hasLabel('Person').values('age').is(gt(28))",
+            &store,
+        ));
+        assert_eq!(gt, vec!["Num(30.0);", "Num(40.0);"]);
+        // Bare literal → equality.
+        let eq = value_bag(&gremlin_rows(
+            "g.V().hasLabel('Person').values('age').is(25)",
+            &store,
+        ));
+        assert_eq!(eq, vec!["Num(25.0);"]);
     }
 
     /// `has(k)` filters elements that CARRY property `k`; `hasNot(k)` those that
