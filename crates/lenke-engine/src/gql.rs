@@ -3364,6 +3364,34 @@ mod tests {
     }
 
     #[test]
+    fn call_peer_pressure_yields_cluster() {
+        // Sink 1→0, 2→0, 3→0: node 0 joins cluster 1 (tie to smallest ext id); the
+        // sources keep their own cluster. The yield column is `cluster`.
+        let mut bld = Builder::default();
+        let a = bld.node(&["N"], &[]);
+        let x = bld.node(&["N"], &[]);
+        let y = bld.node(&["N"], &[]);
+        let z = bld.node(&["N"], &[]);
+        bld.edge(x, a, "R");
+        bld.edge(y, a, "R");
+        bld.edge(z, a, "R");
+        let store = bld.build();
+
+        let rows_of = |q: &str| -> Vec<(f64, f64)> {
+            run(&super::parse(q).unwrap(), &store)
+                .rows
+                .iter()
+                .map(|r| (node_id(&r[0]), num(&r[1])))
+                .collect()
+        };
+        let want = vec![(0.0, 1.0), (1.0, 1.0), (2.0, 2.0), (3.0, 3.0)];
+        assert_eq!(rows_of("CALL peer_pressure() YIELD node, cluster"), want);
+        assert_eq!(rows_of("CALL peer_pressure()"), want);
+        let out = run(&super::parse("CALL peer_pressure()").unwrap(), &store);
+        assert_eq!(out.names, vec!["node".to_string(), "cluster".to_string()]);
+    }
+
+    #[test]
     fn call_procedure_config_and_components() {
         let store = triangle_store();
         // degree with direction=both: each triangle node 2, isolated 0.

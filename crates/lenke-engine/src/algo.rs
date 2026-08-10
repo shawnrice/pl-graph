@@ -6,8 +6,9 @@
 //! The catalog: the non-iterative set — degree, weakly/strongly connected
 //! components (union-by-min / Tarjan), on-cycle, BFS distances, single-source
 //! shortest paths, closeness and betweenness centrality, and neighbor feature
-//! aggregation — plus the iterative set, PageRank (global and personalized) and
-//! label propagation, whose f64 summation / tiebreak order is pinned (node-id and
+//! aggregation — plus the iterative set, PageRank (global and personalized), label
+//! propagation and peer-pressure clustering, whose f64 summation / tiebreak order
+//! is pinned (node-id and
 //! in-adjacency order, reciprocal multiply) so their results are reproducible and
 //! match lenke-core bit-for-bit. Most procedures yield one scalar per node;
 //! neighbor_aggregate yields a per-node feature vector (a `Value::List`).
@@ -22,6 +23,8 @@ pub const DEFAULT_DAMPING: f64 = 0.85;
 pub const DEFAULT_PAGERANK_ITERATIONS: u32 = 20;
 /// Label-propagation default round bound, matching lenke-core.
 pub const DEFAULT_LABEL_ITERATIONS: u32 = 10;
+/// Peer-pressure default round bound, matching lenke-core (30, NOT the pagerank 20).
+pub const DEFAULT_PEER_PRESSURE_ITERATIONS: u32 = 30;
 
 /// Resolve an optional edge-type name to `Some(Some(id))` (a specific type),
 /// `Some(None)` (any type), or `None` (a named-but-unknown type → matches
@@ -367,6 +370,80 @@ pub fn label_propagation(
         }
     }
     live.into_iter().map(|v| (v, labels[v as usize])).collect()
+}
+
+/// Peer-pressure clustering (a directed, vote-weighted label propagation). Every
+/// vertex starts as its own cluster; each round it adopts the cluster with the
+/// highest incoming VOTE ENERGY, where a source `s` casts `vote[s] = 1/outdeg[s]`
+/// for its current cluster and the energies are summed over `s`'s in-neighbours in
+/// in-adjacency (edge-insertion) order — the same fixed order core uses, so the
+/// per-cluster f64 sum is byte-identical. A vertex with no incoming vote keeps its
+/// own cluster. Ties are broken by the SMALLEST external-id string (matching core's
+/// `vid.text` comparison, not the dense id, so multi-digit ids agree too). Rounds
+/// run to convergence or `iterations` (core's default is 30). The cluster label is
+/// the winning cluster's dense id (surfaced as a number, like WCC/SCC). Returns
+/// `(node, cluster)` in ascending-id order; a named-but-unknown edge type → every
+/// vertex its own cluster.
+#[must_use]
+pub fn peer_pressure(store: &Store, edge_label: Option<&str>, iterations: u32) -> Vec<(u32, u32)> {
+    let n = store.node_count();
+    let live = store.all_nodes();
+    let mut cluster: Vec<u32> = (0..n as u32).collect();
+    let Some(want) = want_etype(store, edge_label) else {
+        return live.into_iter().map(|v| (v, v)).collect();
+    };
+
+    // vote[u] = 1/out-degree[u] (of the wanted type); a 0-out vertex casts nothing.
+    let mut outdeg = vec![0u32; n];
+    for &u in &live {
+        let mut c = 0u32;
+        for_each_nbr(store, u, Dir::Out, want, |_| c += 1);
+        outdeg[u as usize] = c;
+    }
+    let vote: Vec<f64> = outdeg
+        .iter()
+        .map(|&d| if d > 0 { 1.0 / f64::from(d) } else { 0.0 })
+        .collect();
+    // Break ties on the source cluster's EXTERNAL id string (core's `vid.text`).
+    let ext = |c: u32| store.node_ext_id(c);
+
+    for _ in 0..iterations {
+        let mut next = cluster.clone();
+        for &u in &live {
+            // Tally incoming vote energy per candidate cluster, in in-adjacency order.
+            let mut energy: HashMap<u32, f64> = HashMap::new();
+            let mut any = false;
+            for a in store.inc(u) {
+                if want.is_none_or(|w| w == a.etype) {
+                    *energy.entry(cluster[a.nbr as usize]).or_insert(0.0) += vote[a.nbr as usize];
+                    any = true;
+                }
+            }
+            if !any {
+                continue; // no incoming vote → keep own cluster
+            }
+            // Adopt the max-energy cluster; tie → smallest external id.
+            let mut best: Option<(u32, f64)> = None;
+            for (&c, &e) in &energy {
+                let better = match best {
+                    None => true,
+                    Some((bc, be)) => e > be || (e == be && ext(c) < ext(bc)),
+                };
+                if better {
+                    best = Some((c, e));
+                }
+            }
+            if let Some((c, _)) = best {
+                next[u as usize] = c;
+            }
+        }
+        if next == cluster {
+            break; // converged
+        }
+        cluster = next;
+    }
+
+    live.into_iter().map(|v| (v, cluster[v as usize])).collect()
 }
 
 /// Closeness centrality (unweighted, directed OUT): for each node, the reciprocal
@@ -816,6 +893,7 @@ pub fn procedure_result_col(name: &str) -> Option<&'static str> {
         "shortest_path" => "distance",
         "personalized_pagerank" => "score",
         "neighbor_aggregate" => "vector",
+        "peer_pressure" => "cluster",
         _ => return None,
     })
 }
@@ -910,6 +988,13 @@ pub fn run_procedure(
                 })
                 .unwrap_or_default();
             personalized_pagerank(store, str_of("edgeType"), &seeds, d, iters)
+        }
+        "peer_pressure" => {
+            let iters = num_of("iterations").map_or(DEFAULT_PEER_PRESSURE_ITERATIONS, |n| n as u32);
+            peer_pressure(store, str_of("edgeType"), iters)
+                .into_iter()
+                .map(|(v, c)| (v, f64::from(c)))
+                .collect()
         }
         _ => return None,
     };
@@ -1160,6 +1245,31 @@ mod tests {
             ]
         )
         .is_err()); // bad op
+    }
+
+    #[test]
+    fn peer_pressure_adopts_max_energy_cluster() {
+        // Sink: 1→0, 2→0, 3→0. Node 0 sees equal vote energy from clusters 1, 2, 3
+        // (each source has out-degree 1 → vote 1.0), so the tie goes to the smallest
+        // external id, "1"; the sources have no in-edge and keep their own cluster.
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[]);
+        let x = b.node(&["N"], &[]);
+        let y = b.node(&["N"], &[]);
+        let z = b.node(&["N"], &[]);
+        b.edge(x, a, "R");
+        b.edge(y, a, "R");
+        b.edge(z, a, "R");
+        let sink = b.build();
+        assert_eq!(
+            peer_pressure(&sink, None, DEFAULT_PEER_PRESSURE_ITERATIONS),
+            vec![(0, 1), (1, 1), (2, 2), (3, 3)]
+        );
+        // A named-but-unknown edge type → every vertex its own cluster.
+        assert_eq!(
+            peer_pressure(&sink, Some("NOPE"), DEFAULT_PEER_PRESSURE_ITERATIONS),
+            vec![(0, 0), (1, 1), (2, 2), (3, 3)]
+        );
     }
 
     #[test]
