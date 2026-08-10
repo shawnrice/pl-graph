@@ -336,12 +336,20 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
   foundation with no query path and no benchmark is premature — CLAUDE.md is
   emphatic that such perf must be MEASURED. Revisit with an edge-temporal seek
   query shape + planner rule (G4b) and a benchmark.
-- [~] G5. Edge-type index — DEFERRED. Also result-invariant perf: it would speed
-  type-filtered `expand`, but that is exactly the adjacency-change class
-  CLAUDE.md warns is "misjudged against wrong fixtures," and there is no
-  lenke-engine benchmark to justify it (or to catch an ingest/rollback
-  regression from maintaining a grouped/sorted adjacency). Revisit measured,
-  with a fixture that varies degree and edge:type ratio.
+- G5. Edge-type index (type-filtered `expand`), built measured-first, split:
+  - [x] G5a. Benchmark harness: `examples/expand_bench.rs` sweeps degree ×
+        edge-type count (per CLAUDE.md — vary degree and the edge:type ratio) and
+        times `MATCH (n:V)-[:T0]->() RETURN count(*)`. BASELINE (min of 7, release,
+        this box): degree 4 = 157µs; degree 32 = 1.5–2.0ms; degree 256 = 8.7–10.0ms
+        **independent of type count** (1/8/64 types all ~9ms). That is the finding:
+        the cost is scanning the WHOLE adjacency, so an index that seeks one type
+        only wins when the queried type is a small fraction of a high degree
+        (deg 256 / 64 types → T0 is ~4 of 256). Low-degree / single-type can't
+        benefit → the index must be OPT-IN so those pay nothing (G5b).
+  - [ ] G5b. Opt-in edge-type index (`create_edge_type_index`, maintained through
+        the mutation primitives + undo like the property indexes, zero cost when
+        not created), used by `for_each_nbr` for a type-filtered hop. Re-measure
+        the bench with it on, and price ingest; keep only if it wins net.
 
 ### Phase H — Semantics services
 
