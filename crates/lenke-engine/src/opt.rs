@@ -66,6 +66,33 @@ fn map_children(plan: Plan) -> (Plan, bool) {
                 c,
             )
         }
+        Plan::IntervalExpand {
+            input,
+            from,
+            dir,
+            edge_label,
+            lo_key,
+            hi_key,
+            qlo,
+            qhi,
+            bind_edge,
+        } => {
+            let (i, c) = rewrite(*input);
+            (
+                Plan::IntervalExpand {
+                    input: Box::new(i),
+                    from,
+                    dir,
+                    edge_label,
+                    lo_key,
+                    hi_key,
+                    qlo,
+                    qhi,
+                    bind_edge,
+                },
+                c,
+            )
+        }
         Plan::VarLength {
             input,
             from,
@@ -319,6 +346,51 @@ fn apply_local(plan: Plan) -> (Plan, bool) {
                 },
                 true,
             ),
+            // interval-overlap fusion: `Filter(r.lo <= X AND r.hi >= Y)` over a
+            // bind_edge Expand → an `IntervalExpand` (seek-or-scan). The predicate
+            // reads the bound EDGE slot (= the expand's input width), so the
+            // pushdown arm above never fires for it; here it fuses into the hop so
+            // an interval-indexed store can seek. Non-interval predicates on the
+            // edge fall through unchanged.
+            Plan::Expand {
+                input: ein,
+                from,
+                dir,
+                edge_label,
+                bind_edge: true,
+            } => {
+                let iw = width(&ein);
+                if let Some((lo_key, hi_key, qlo, qhi)) = interval_pattern(&pred, iw) {
+                    (
+                        Plan::IntervalExpand {
+                            input: ein,
+                            from,
+                            dir,
+                            edge_label,
+                            lo_key,
+                            hi_key,
+                            qlo: Box::new(qlo),
+                            qhi: Box::new(qhi),
+                            bind_edge: true,
+                        },
+                        true,
+                    )
+                } else {
+                    (
+                        Plan::Filter {
+                            input: Box::new(Plan::Expand {
+                                input: ein,
+                                from,
+                                dir,
+                                edge_label,
+                                bind_edge: true,
+                            }),
+                            pred,
+                        },
+                        false,
+                    )
+                }
+            }
             // predicate pushdown into a Join's LEFT side: legal when the predicate
             // reads only left slots (indices < left width; the join keeps the left
             // slots' indices, so no remap is needed). Right-side pushdown would
@@ -385,6 +457,64 @@ fn refs_below(expr: &Expr, bound: usize) -> bool {
     max_slot(expr).is_none_or(|m| m < bound)
 }
 
+/// Classify one comparison against the edge in slot `edge_slot` as an interval
+/// endpoint constraint: `Prop{edge_slot,k} <= bound` (the LO axis, `false`) or
+/// `Prop{edge_slot,k} >= bound` (the HI axis, `true`), including the mirrored
+/// spellings (`bound >= prop`, `bound <= prop`). Returns `(is_hi, key, bound)`.
+fn interval_side(c: &Expr, edge_slot: usize) -> Option<(bool, String, Expr)> {
+    let Expr::Compare { op, left, right } = c else {
+        return None;
+    };
+    // Put the edge Prop on the left, flipping the operator if it was on the right.
+    let (key, bound, op) = match (&**left, &**right) {
+        (Expr::Prop { slot, key }, _) if *slot == edge_slot => {
+            (key.clone(), (**right).clone(), *op)
+        }
+        (_, Expr::Prop { slot, key }) if *slot == edge_slot => {
+            (key.clone(), (**left).clone(), flip_cmp(*op))
+        }
+        _ => return None,
+    };
+    match op {
+        CompareOp::Le => Some((false, key, bound)), // prop <= bound → lo axis
+        CompareOp::Ge => Some((true, key, bound)),  // prop >= bound → hi axis
+        _ => None,                                  // strict/eq don't map to closed overlap
+    }
+}
+
+/// Swap the operands' order of a comparison (so `a OP b` ⇔ `b flip(OP) a`).
+fn flip_cmp(op: CompareOp) -> CompareOp {
+    match op {
+        CompareOp::Lt => CompareOp::Gt,
+        CompareOp::Gt => CompareOp::Lt,
+        CompareOp::Le => CompareOp::Ge,
+        CompareOp::Ge => CompareOp::Le,
+        CompareOp::Eq => CompareOp::Eq,
+        CompareOp::Ne => CompareOp::Ne,
+    }
+}
+
+/// Recognize `r.lo <= X AND r.hi >= Y` (in any spelling/order) on the edge bound
+/// at slot `edge_slot` (which equals the expand's input width). Returns
+/// `(lo_key, hi_key, qlo, qhi)` for an `IntervalExpand` (`qlo = Y`, `qhi = X`).
+/// Both bounds must be evaluable over the input row (reference only slots below
+/// the hop), so they never depend on the edge/node the hop appends.
+fn interval_pattern(pred: &Expr, edge_slot: usize) -> Option<(String, String, Expr, Expr)> {
+    let Expr::And(a, b) = pred else { return None };
+    let sa = interval_side(a, edge_slot)?;
+    let sb = interval_side(b, edge_slot)?;
+    // Need exactly one lo-axis and one hi-axis constraint.
+    let ((_, lo_key, qhi), (_, hi_key, qlo)) = match (sa.0, sb.0) {
+        (false, true) => (sa, sb),
+        (true, false) => (sb, sa),
+        _ => return None,
+    };
+    if !refs_below(&qhi, edge_slot) || !refs_below(&qlo, edge_slot) {
+        return None;
+    }
+    Some((lo_key, hi_key, qlo, qhi))
+}
+
 /// The highest slot index an expression reads, or `None` if it reads no slots.
 fn max_slot(expr: &Expr) -> Option<usize> {
     match expr {
@@ -446,6 +576,9 @@ fn width(plan: &Plan) -> usize {
 
         // A bind_edge Expand appends TWO slots (edge then node).
         Plan::Expand {
+            input, bind_edge, ..
+        }
+        | Plan::IntervalExpand {
             input, bind_edge, ..
         } => width(input) + if *bind_edge { 2 } else { 1 },
         Plan::VarLength { input, .. } | Plan::ShortestPath { input, .. } => width(input) + 1,
@@ -815,6 +948,7 @@ mod tests {
         match p {
             Plan::Filter { .. } => true,
             Plan::Expand { input, .. }
+            | Plan::IntervalExpand { input, .. }
             | Plan::VarLength { input, .. }
             | Plan::ShortestPath { input, .. }
             | Plan::Aggregate { input, .. }

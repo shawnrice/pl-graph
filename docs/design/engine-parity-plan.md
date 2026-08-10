@@ -356,10 +356,17 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
         the boxed post-filter scan — a large unambiguous win (the baseline cost was
         the boxed edge-prop probe, which the inline seek sidesteps). Build is a
         one-time pass over the props.
-  - [ ] G4c. Query/planner integration: recognize `r.lo <= X AND r.hi >= Y` on a
-        bound rel-var over an interval-indexed store and route the expand to the
-        seek (seek-or-scan fallback, like IndexSeek), so GQL/Gremlin queries get
-        the win transparently. Verify same rows as the scan.
+  - [x] G4c. Query/planner integration: new `Plan::IntervalExpand` (a seek-or-scan
+        hop like IndexSeek) + an optimizer rule that fuses `Filter(r.lo <= X AND
+        r.hi >= Y)` over a bind-edge `Expand` into it (recognizes both spellings
+        via `interval_side`/`flip_cmp`; bounds must reference only slots below the
+        hop). exec seeks via `for_each_overlap` when an OUT hop meets a matching
+        interval index, else scans the adjacency applying the overlap itself — so
+        rows are IDENTICAL either way (a non-numeric/absent bound or edge interval
+        drops the edge, matching the `<=`/`>=` filter). 1 exec test: the optimizer
+        fuses the pattern, and the plan returns the same count AND the same rows
+        with the index off (scan) vs on (seek), equal to the hand-computed answer.
+        Completes G4 — GQL as-of queries now get the interval seek transparently.
 - G5. Edge-type index (type-filtered `expand`), built measured-first, split:
   - [x] G5a. Benchmark harness: `examples/expand_bench.rs` sweeps degree ×
         edge-type count (per CLAUDE.md — vary degree and the edge:type ratio) and

@@ -260,6 +260,26 @@ pub enum Plan {
         /// the node slot is appended, exactly as before.
         bind_edge: bool,
     },
+    /// An interval-overlap hop: like `Expand`, but keeps only edges whose interval
+    /// `[edge.lo_key, edge.hi_key]` overlaps `[qlo, qhi]` (`lo <= qhi AND hi >= qlo`).
+    /// Produced by the optimizer from `Expand{bind_edge} + Filter(r.lo <= X AND
+    /// r.hi >= Y)`; a seek-or-scan operator (like `IndexSeek`): it uses the store's
+    /// interval index when one on `(lo_key, hi_key)` exists (huge win — see
+    /// `examples/interval_bench`), else scans the adjacency and applies the overlap
+    /// itself, so its rows are IDENTICAL either way. `qlo`/`qhi` are evaluated over
+    /// the input row (constants for an "as of" query). The index is over OUT-edges,
+    /// so only a `Dir::Out` hop can seek; other directions take the scan path.
+    IntervalExpand {
+        input: Box<Plan>,
+        from: usize,
+        dir: Dir,
+        edge_label: Option<String>,
+        lo_key: String,
+        hi_key: String,
+        qlo: Box<Expr>,
+        qhi: Box<Expr>,
+        bind_edge: bool,
+    },
     /// A quantified hop: from the element in `from`, reach nodes over `min..=max`
     /// hops of `dir`/`edge_label`, appending EACH reached endpoint as one new
     /// slot — one output row per matching path. `min == 0` includes the source

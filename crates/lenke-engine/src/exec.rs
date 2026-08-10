@@ -453,6 +453,9 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::ShortestPath { input, .. }
         | Plan::Distinct { input }
         | Plan::SortLocal { input, .. } => needs_lineage(input),
+        Plan::IntervalExpand {
+            input, qlo, qhi, ..
+        } => reads_path(qlo) || reads_path(qhi) || needs_lineage(input),
         Plan::Filter { input, pred } => reads_path(pred) || needs_lineage(input),
         Plan::Project { input, items } => {
             items.iter().any(|(_, e)| reads_path(e)) || needs_lineage(input)
@@ -542,6 +545,33 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             edge_label.as_deref(),
             *bind_edge,
         ),
+        Plan::IntervalExpand {
+            input,
+            from,
+            dir,
+            edge_label,
+            lo_key,
+            hi_key,
+            qlo,
+            qhi,
+            bind_edge,
+        } => {
+            let batch = pull(input, store, track)?;
+            let qlo_col = eval(qlo, store, &batch)?;
+            let qhi_col = eval(qhi, store, &batch)?;
+            interval_expand(
+                &batch,
+                store,
+                *from,
+                *dir,
+                edge_label.as_deref(),
+                lo_key,
+                hi_key,
+                &qlo_col,
+                &qhi_col,
+                *bind_edge,
+            )
+        }
         Plan::Filter { input, pred } => {
             let batch = pull(input, store, track)?;
             // Fast path: `<prop> <cmp> <literal>` reads storage in one pass to
@@ -1114,6 +1144,98 @@ fn expand(
     // Lineage strategy: when the input carried a path, extend each output row's
     // path by the neighbour it landed on AND the edge it crossed, so both
     // `nodes(p)` and `relationships(p)` are recoverable.
+    if let Some(lin) = &batch.lineage {
+        out.lineage = Some(lin.extend(&keep, &nbrs, &eids));
+    }
+    out
+}
+
+/// Interval-overlap hop (`Plan::IntervalExpand`): like [`expand`], but keeps only
+/// edges whose `[lo_key, hi_key]` interval overlaps `[qlo, qhi]` (per input row).
+/// Seek-or-scan: an OUT hop over a store with a matching interval index seeks
+/// (`for_each_overlap`); otherwise it scans the adjacency and applies the overlap
+/// itself — the rows are identical either way, so the optimizer can fuse without
+/// knowing whether the index exists. A non-numeric/absent bound or edge interval
+/// yields no match for that edge (matching what the `<=`/`>=` filter would do).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors `expand` plus the two bounds and keys"
+)]
+fn interval_expand(
+    batch: &Batch,
+    store: &Store,
+    from: usize,
+    dir: Dir,
+    edge_label: Option<&str>,
+    lo_key: &str,
+    hi_key: &str,
+    qlo_col: &Col,
+    qhi_col: &Col,
+    bind_edge: bool,
+) -> Batch {
+    let empty = || {
+        let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
+        if bind_edge {
+            slots.push(Col::Edges(vec![]));
+        }
+        slots.push(Col::Nodes(vec![]));
+        let mut b = Batch::of(slots);
+        if batch.lineage.is_some() {
+            b.lineage = Some(Lineage::empty());
+        }
+        b
+    };
+    let want: Option<u32> = match edge_label {
+        None => None,
+        Some(name) => match store.etype_id(name) {
+            Some(id) => Some(id),
+            None => return empty(),
+        },
+    };
+    let Col::Nodes(src) = batch.slot(from) else {
+        return empty();
+    };
+    // Seek only an OUT hop over a matching index (the index is over out-edges);
+    // any other case scans and applies the overlap.
+    let can_seek = matches!(dir, Dir::Out) && store.has_interval_index(lo_key, hi_key);
+
+    let mut keep = Vec::new();
+    let mut nbrs = Vec::new();
+    let mut eids = Vec::new();
+    for (row, &v) in src.iter().enumerate() {
+        // The bounds for this row; a non-numeric bound can never satisfy the
+        // numeric interval comparison, so the row contributes nothing.
+        let (Value::Num(qlo), Value::Num(qhi)) = (qlo_col.value_at(row), qhi_col.value_at(row))
+        else {
+            continue;
+        };
+        if can_seek {
+            store.for_each_overlap(v, qlo, qhi, |eid, nbr| {
+                keep.push(row);
+                nbrs.push(nbr);
+                eids.push(eid);
+            });
+        } else {
+            for_each_nbr(store, v, dir, want, |nbr, eid| {
+                if let (Value::Num(lo), Value::Num(hi)) =
+                    (store.edge_prop(eid, lo_key), store.edge_prop(eid, hi_key))
+                {
+                    if lo <= qhi && hi >= qlo {
+                        keep.push(row);
+                        nbrs.push(nbr);
+                        eids.push(eid);
+                    }
+                }
+            });
+        }
+    }
+
+    let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
+    if bind_edge {
+        slots.push(Col::Edges(eids.clone()));
+    }
+    slots.push(Col::Nodes(nbrs.clone()));
+    let mut out = Batch::of(slots);
     if let Some(lin) = &batch.lineage {
         out.lineage = Some(lin.extend(&keep, &nbrs, &eids));
     }
@@ -2803,6 +2925,75 @@ mod tests {
         let cplan =
             crate::gql::parse("MATCH (a:Person)-[:KNOWS]->() RETURN count(*) AS c").unwrap();
         assert!(matches!(run(&cplan, &store).rows[0][0], Value::Num(x) if x == 3.0));
+    }
+
+    /// Does the plan tree contain an `IntervalExpand` (the fused interval hop)?
+    fn has_interval_expand(p: &Plan) -> bool {
+        match p {
+            Plan::IntervalExpand { .. } => true,
+            Plan::Expand { input, .. }
+            | Plan::VarLength { input, .. }
+            | Plan::ShortestPath { input, .. }
+            | Plan::Filter { input, .. }
+            | Plan::Aggregate { input, .. }
+            | Plan::OrderPage { input, .. }
+            | Plan::Project { input, .. }
+            | Plan::Distinct { input }
+            | Plan::SortLocal { input, .. }
+            | Plan::Update { input, .. } => has_interval_expand(input),
+            Plan::Join { left, right, .. } => {
+                has_interval_expand(left) || has_interval_expand(right)
+            }
+            _ => false,
+        }
+    }
+
+    fn interval_store() -> Store {
+        // Emp 0 with 5 HELD edges to role 1, intervals [d, d+2] for d in 0..5.
+        let mut b = Builder::default();
+        b.node(&["Emp"], &[]);
+        b.node(&["Role"], &[]);
+        let mut st = b.build();
+        for d in 0..5u32 {
+            let e = st.add_edge(0, 1, "HELD");
+            st.set_edge_prop(e, "vf", n(f64::from(d)));
+            st.set_edge_prop(e, "vt", n(f64::from(d) + 2.0));
+        }
+        st
+    }
+
+    /// The optimizer fuses `r.vf <= X AND r.vt >= Y` over a bound-edge hop into an
+    /// `IntervalExpand`, which returns the SAME rows via the scan fallback (no
+    /// index) and via the index seek — and both equal the hand-computed answer.
+    #[test]
+    fn interval_expand_fuses_and_matches_scan_and_seek() {
+        use crate::opt::optimize;
+        let mut st = interval_store();
+        // As of t=3: [0,2] no, [1,3] yes, [2,4] yes, [3,5] yes, [4,6] no → 3.
+        let q = "MATCH (p:Emp)-[r:HELD]->(x) WHERE r.vf <= 3 AND r.vt >= 3 RETURN count(*) AS c";
+        let plan = optimize(crate::gql::parse(q).unwrap());
+        assert!(
+            has_interval_expand(&plan),
+            "optimizer did not fuse: {plan:?}"
+        );
+        // scan fallback (no interval index yet)
+        assert!(matches!(run(&plan, &st).rows[0][0], Value::Num(x) if x == 3.0));
+        // index seek (same plan, index present)
+        st.create_interval_index("vf", "vt");
+        assert!(matches!(run(&plan, &st).rows[0][0], Value::Num(x) if x == 3.0));
+
+        // Row-level equivalence: the matching intervals' vf are {1,2,3}, seek == scan.
+        let rq = "MATCH (p:Emp)-[r:HELD]->(x) WHERE r.vf <= 3 AND r.vt >= 3 RETURN r.vf AS f";
+        let rplan = optimize(crate::gql::parse(rq).unwrap());
+        let mut seek: Vec<String> = names_of(&run(&rplan, &st), 0);
+        seek.sort();
+        let scan_only = interval_store(); // fresh, no index
+        let mut scan: Vec<String> = names_of(&run(&rplan, &scan_only), 0);
+        scan.sort();
+        assert_eq!(seek, scan);
+        // vf of the matching intervals ([1,3],[2,4],[3,5]) — `names_of` renders a
+        // Num via its debug form.
+        assert_eq!(seek, vec!["Num(1.0)", "Num(2.0)", "Num(3.0)"]);
     }
 
     // --- relational core (unchanged behavior, now slot-addressed) ---
