@@ -634,6 +634,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             if let Some(b) = try_scan_count(input, keys, aggs, store)
                 .or_else(|| try_scan_num_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_multi_agg(input, keys, aggs, store))
+                .or_else(|| try_scan_distinct_count(input, keys, aggs, store))
                 .or_else(|| try_fused_count(input, keys, aggs, store))
                 .or_else(|| try_node_grouped_count(input, keys, aggs, store))
             {
@@ -1747,6 +1748,93 @@ fn try_scan_num_agg(
         }
     };
     Some(Batch::of(vec![Col::Gen(vec![result])]))
+}
+
+/// Visit each scanned node's dense id (as `usize`) for a bare `Scan`. Iterates the
+/// raw `0..node_count` range directly when the scan covers every live node (an
+/// unlabelled scan, or a label all nodes carry, nothing deleted) — sequential and
+/// vectorizable — otherwise walks the label's id list. Generic over `F` so there is
+/// no per-node dynamic dispatch. Shared by the scan-aggregate fast paths.
+fn scan_visit<F: FnMut(usize)>(store: &Store, label: &Option<String>, mut f: F) {
+    let all_live = store.live_node_count() == store.node_count();
+    let whole = all_live
+        && match label {
+            None => true,
+            Some(l) => store.nodes_with_label(l).len() == store.node_count(),
+        };
+    if whole {
+        (0..store.node_count()).for_each(&mut f);
+    } else {
+        match label {
+            Some(l) => store
+                .nodes_with_label(l)
+                .iter()
+                .for_each(|&id| f(id as usize)),
+            None => (0..store.node_count()).for_each(|i| {
+                if store.is_alive(i as u32) {
+                    f(i);
+                }
+            }),
+        }
+    }
+}
+
+/// Answer `count(DISTINCT n.k)` over a bare `Scan` by deduping the RAW column into
+/// a typed set (a `&str`, the f64 group bits, or a bool) and returning its size —
+/// no frontier materialization and no per-cell byte-key serialization. Nulls are
+/// skipped (as `count(DISTINCT)` does). `None` for a non-`Scan` input, a
+/// Temporal/Gen column, or a non-distinct/`count(*)` agg.
+fn try_scan_distinct_count(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.func != AggFn::Count || !agg.distinct {
+        return None;
+    }
+    let label = match input {
+        Plan::Scan { label } => label,
+        _ => return None,
+    };
+    let Some(Expr::Prop { slot: 0, key }) = agg.arg.as_ref() else {
+        return None;
+    };
+    let count = match store.column(key)? {
+        Column::Str { data, present } => {
+            let mut seen: FnvSet<&str> = FnvSet::default();
+            scan_visit(store, label, |i| {
+                if present[i] {
+                    seen.insert(data[i].as_ref());
+                }
+            });
+            seen.len()
+        }
+        Column::Num { data, present } => {
+            let mut seen: FnvSet<u64> = FnvSet::default();
+            scan_visit(store, label, |i| {
+                if present[i] {
+                    seen.insert(value::num_group_bits(data[i]));
+                }
+            });
+            seen.len()
+        }
+        Column::Bool { data, present } => {
+            let mut seen = [false; 2];
+            scan_visit(store, label, |i| {
+                if present[i] {
+                    seen[usize::from(data[i])] = true;
+                }
+            });
+            usize::from(seen[0]) + usize::from(seen[1])
+        }
+        _ => return None, // Temporal / Gen → the general aggregate
+    };
+    Some(scalar_num(count as f64))
 }
 
 /// Answer several scalar numeric aggregates (`sum`/`avg`/`min`/`max`/`count`) over
