@@ -675,6 +675,11 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
         }
         Plan::Distinct { input } => {
             let batch = pull(input, store, track)?;
+            // Typed single-column fast path: dedup by the raw value (a `&str`, the
+            // f64 group bits, or a dense id) — no per-row byte-key serialization.
+            if let Some(keep) = try_distinct_typed(&batch) {
+                return Ok(batch.gather(&keep));
+            }
             let n = batch.rows();
             let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
             let mut buf = Vec::new();
@@ -3502,6 +3507,56 @@ fn flip_op(op: CompareOp) -> CompareOp {
 /// match the general path exactly: an absent property is NULL → UNKNOWN → dropped,
 /// a NULL literal makes every comparison UNKNOWN → all dropped, and cross-type is
 /// the contract's `equals`/`cmp_total`. `None` if the predicate is not this shape.
+/// Row indices of the first occurrence of each distinct value in a SINGLE-column
+/// batch, keyed by the raw value (`&str`, f64 group bits, or a dense id) rather
+/// than a serialized byte key — the common `RETURN DISTINCT n.k` shape. `None` for
+/// a multi-column batch or a `Gen` column (which may hold nulls/mixed types, where
+/// the grouping-byte key is needed). First-seen order preserved.
+fn try_distinct_typed(batch: &Batch) -> Option<Vec<usize>> {
+    let [col] = batch.slots.as_slice() else {
+        return None;
+    };
+    let mut keep = Vec::new();
+    match col {
+        Col::Str(v) => {
+            let mut seen: FnvSet<&str> = FnvSet::default();
+            for (i, s) in v.iter().enumerate() {
+                if seen.insert(s.as_ref()) {
+                    keep.push(i);
+                }
+            }
+        }
+        Col::Num(v) => {
+            // f64 group bits collapse NaN payloads and signed zero, matching the
+            // grouping contract.
+            let mut seen: FnvSet<u64> = FnvSet::default();
+            for (i, &x) in v.iter().enumerate() {
+                if seen.insert(value::num_group_bits(x)) {
+                    keep.push(i);
+                }
+            }
+        }
+        Col::Nodes(v) | Col::Edges(v) => {
+            let mut seen: FnvSet<u32> = FnvSet::default();
+            for (i, &id) in v.iter().enumerate() {
+                if seen.insert(id) {
+                    keep.push(i);
+                }
+            }
+        }
+        Col::Bool(v) => {
+            let mut seen = [false; 2];
+            for (i, &b) in v.iter().enumerate() {
+                if !std::mem::replace(&mut seen[usize::from(b)], true) {
+                    keep.push(i);
+                }
+            }
+        }
+        Col::Gen(_) => return None, // nulls / mixed types → the grouping-byte key
+    }
+    Some(keep)
+}
+
 /// Flatten a conjunction into its atoms (`a AND b AND c` → `[a, b, c]`); a
 /// non-`And` expression is a single atom.
 fn flatten_and<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
