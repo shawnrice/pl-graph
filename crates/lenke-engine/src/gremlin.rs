@@ -21,6 +21,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         current: 0,
         slots: 1,
         labels: HashMap::new(),
+        edge_hop: None,
     };
     p.traversal()
 }
@@ -134,6 +135,13 @@ struct Parser {
     /// `as('x')` step labels -> the slot bound when the label was set. `select('x')`
     /// resolves through this.
     labels: HashMap<String, usize>,
+    /// Set by an edge hop (`outE`/`inE`/`bothE`) and consumed by the very next
+    /// vertex-move step (`inV`/`outV`/`otherV`): `(landed node slot, hop direction)`.
+    /// The edge hop leaves the current element on the EDGE; the vertex move steps
+    /// back onto the endpoint the hop already landed. Cleared at the top of every
+    /// `step`, so a vertex move only resolves when it IMMEDIATELY follows the edge
+    /// hop — exactly Gremlin's requirement.
+    edge_hop: Option<(usize, Dir)>,
 }
 
 impl Parser {
@@ -261,6 +269,9 @@ impl Parser {
         let name = self.ident()?;
         self.expect(&Tok::LParen)?;
         let lname = name.to_ascii_lowercase();
+        // An edge hop's landed endpoint is only reachable by the vertex move that
+        // IMMEDIATELY follows it; consume the record here so any other step clears it.
+        let prev_edge_hop = self.edge_hop.take();
 
         // --- write steps ---
         if lname == "property" {
@@ -360,6 +371,69 @@ impl Parser {
                 self.current = self.slots;
                 self.slots += 1;
                 plan.expand(from, dir, edge_label)
+            }
+            "oute" | "ine" | "bothe" => {
+                // Edge-yielding hop: bind the traversed edge as a slot and leave the
+                // current element ON that edge (so `.values`/`.count`/`.dedup` see the
+                // edge). `expand_edge` appends TWO slots — edge at W, the landed
+                // endpoint node at W+1 — so a following inV/outV/otherV can step onto
+                // the endpoint the hop already resolved.
+                let mut labels: Vec<String> = Vec::new();
+                if !matches!(self.peek(), Some(Tok::RParen)) {
+                    loop {
+                        labels.push(self.str_arg()?);
+                        if self.peek() == Some(&Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                let edge_label: Option<&str> =
+                    match labels.len() {
+                        0 => None,
+                        1 => Some(labels[0].as_str()),
+                        _ => return Err(
+                            "outE()/inE()/bothE() with multiple edge labels is not yet supported"
+                                .into(),
+                        ),
+                    };
+                let dir = match lname.as_str() {
+                    "oute" => Dir::Out,
+                    "ine" => Dir::In,
+                    _ => Dir::Both,
+                };
+                let from = self.current;
+                let edge_slot = self.slots; // W
+                let node_slot = self.slots + 1; // W+1: the landed endpoint
+                self.current = edge_slot;
+                self.slots += 2;
+                self.edge_hop = Some((node_slot, dir));
+                plan.expand_edge(from, dir, edge_label)
+            }
+            "inv" | "outv" | "otherv" => {
+                self.expect(&Tok::RParen)?;
+                let (node_slot, dir) = prev_edge_hop.ok_or_else(|| {
+                    format!("{name}() must immediately follow outE()/inE()/bothE()")
+                })?;
+                // The hop already landed the OTHER endpoint (the neighbour) in
+                // `node_slot`. That endpoint is: `otherV` for any direction; `inV`
+                // (the edge head/dst) only when we went OUT; `outV` (the edge
+                // tail/src) only when we went IN. The origin-returning combinations
+                // (`outE().outV()`, `inE().inV()`, and inV/outV after `bothE`) need the
+                // pre-hop vertex, which this pointer-move does not carry — deferred.
+                let ok = matches!(
+                    (lname.as_str(), dir),
+                    ("otherv", _) | ("inv", Dir::Out) | ("outv", Dir::In)
+                );
+                if !ok {
+                    return Err(format!(
+                        "{name}() after this edge step is not yet supported (returns the origin vertex)"
+                    ));
+                }
+                self.current = node_slot;
+                plan
             }
             "values" => {
                 let key = self.str_arg()?;
@@ -910,6 +984,48 @@ mod tests {
             gone.is_empty(),
             "missing id must contribute nothing: {gone:?}"
         );
+    }
+
+    /// `outE`/`inE`/`bothE` bind the traversed edge (current element becomes the
+    /// edge), and the canonical vertex move steps back onto the endpoint the hop
+    /// landed: `outE().inV()` == `out()`, `inE().outV()` == `in()`, `*E().otherV()`
+    /// == the corresponding both/out/in. Verified against the plain hops (same IR),
+    /// and `outE().count()` == `g.E().count()` (every edge is one node's out-edge).
+    #[test]
+    fn gremlin_edge_hops_and_endpoint_moves() {
+        let store = social();
+        // The edge frontier: outE over all vertices touches every edge once.
+        assert_eq!(
+            value_bag(&gremlin_rows("g.V().outE().count()", &store)),
+            value_bag(&gremlin_rows("g.E().count()", &store)),
+        );
+        // Canonical edge-step + vertex-move pairs equal the plain hops.
+        for (edge_form, hop_form) in [
+            (
+                "g.V().outE('KNOWS').inV().values('name')",
+                "g.V().out('KNOWS').values('name')",
+            ),
+            (
+                "g.V().inE('KNOWS').outV().values('name')",
+                "g.V().in('KNOWS').values('name')",
+            ),
+            (
+                "g.V().bothE('KNOWS').otherV().values('name')",
+                "g.V().both('KNOWS').values('name')",
+            ),
+        ] {
+            assert_eq!(
+                value_bag(&gremlin_rows(edge_form, &store)),
+                value_bag(&gremlin_rows(hop_form, &store)),
+                "{edge_form} must equal {hop_form}",
+            );
+        }
+        // Origin-returning / ambiguous combinations are deferred, not mis-answered.
+        assert!(super::parse("g.V().outE().outV().values('name')").is_err());
+        assert!(super::parse("g.V().inE().inV().values('name')").is_err());
+        assert!(super::parse("g.V().bothE().inV().values('name')").is_err());
+        // A vertex move must immediately follow an edge step.
+        assert!(super::parse("g.V().inV()").is_err());
     }
 
     /// `g.E()` is an all-edges READ source: it seeds the frontier with every live
