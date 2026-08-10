@@ -342,7 +342,7 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
         intervals INLINE and seeks overlaps sidesteps those probes entirely, so
         the win should be large (unlike G5's marginal case).
   - [x] G4b. Opt-in interval index + seek (store level): `create_interval_index(
-        lo_key, hi_key)` stores each node's OUT-edge intervals `(lo, hi, eid, nbr)`
+    lo_key, hi_key)` stores each node's OUT-edge intervals `(lo, hi, eid, nbr)`
         BOTH sorted by lo and by hi (read inline from the boxed props at build).
         `for_each_overlap(node, qlo, qhi, f)` seeds from whichever axis is more
         selective (`partition_point`) and post-filters the other — the FIRM
@@ -358,7 +358,7 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
         one-time pass over the props.
   - [x] G4c. Query/planner integration: new `Plan::IntervalExpand` (a seek-or-scan
         hop like IndexSeek) + an optimizer rule that fuses `Filter(r.lo <= X AND
-        r.hi >= Y)` over a bind-edge `Expand` into it (recognizes both spellings
+    r.hi >= Y)` over a bind-edge `Expand` into it (recognizes both spellings
         via `interval_side`/`flip_cmp`; bounds must reference only slots below the
         hop). exec seeks via `for_each_overlap` when an OUT hop meets a matching
         interval index, else scans the adjacency applying the overlap itself — so
@@ -536,6 +536,66 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       empty/all-null group returning NULL (SQL-style) vs lenke-core's 0 (the
       GQL/Cypher convention) — fixed in `fold_grouped` (SUM of nothing = 0, AVG
       stays NULL). 24k queries × 8 seeds now agree, 0 skips.
+
+### Phase K — Correctness census (from the fuzzer)
+
+`examples/fuzz_report.rs` probes 16 GQL feature families against lenke-core (3000
+random cases each) and buckets divergences: SEMANTIC (both return, differ),
+MISSING (engine errors, core returns), CORE_ERR (engine returns, core errors).
+The to-do list below is that census, most-impactful first. Counts are diverging
+cases / 3000. Fix correctness before optimizing (Phase G perf is done but these
+gaps come first).
+
+Two found during the census are already FIXED:
+- [x] K0a. `sum` over empty/all-null group → 0 (was NULL). (J2)
+- [x] K0b. Grouping by an EDGE property bucketed every row under one NULL group —
+      the `try_node_grouped_count` fast path read the bound-edge slot as an absent
+      node property. Now bind_edge groups fall to the general aggregate. Regression
+      test `group_by_edge_property_counts_per_value`; fuzzer `edge_props` 0/3000.
+
+Semantic bugs (wrong answers vs core) — fix for parity:
+- [ ] K1. ORDER BY DESC null placement (~1269/3000). Core keeps NULLS LAST in BOTH
+      directions (DESC reverses only the non-null order); the engine reverses the
+      whole total order, so nulls come FIRST under DESC. Repro: `RETURN n.id AS a0,
+      n.a AS a1 ORDER BY a1 DESC, a0`. Fix in the OrderPage comparator (nulls last
+      regardless of direction).
+- [ ] K2. Cross-type ordering comparison (`<` `<=` `>` `>=`) between different
+      types (~742/3000). Core yields NULL (3VL unknown) → the row drops in a WHERE
+      and renders NULL in a projection; the engine returns a Bool from the total
+      order (`cmp_total`), so it KEEPS rows core drops. The comparison OPERATORS
+      must return NULL on mixed types; sort/min/max/group keep `cmp_total` (they
+      need a total order). Repro: `WHERE n.a < n.b` (num vs str) → engine keeps,
+      core drops. (String-vs-temporal: core THROWS `E_INVALID_VALUE` — decide
+      throw vs null there; not exercised by the numeric/string fuzzer.) This
+      supersedes the J1 note, which wrongly called it an accepted total-order fork.
+- [ ] K3. Division / modulo by zero (~338/3000). Core THROWS `DataException
+      "division by zero"`; the engine returns NULL. Match core (throw). Repro:
+      `RETURN n.a / 0`. (Revisits the G3 audit, which wrongly recorded agreement.)
+- [ ] K4. Domain-invalid numeric fn results (~66/3000). `sqrt(-x)` (and, once
+      added, `ln`/`log` of ≤0) must return NaN like core; the engine's scalar
+      numeric fns map non-finite → NULL. Decide: keep computed NaN to match core.
+- [ ] K5. `size()` / `length()` on a STRING must return its length (core does);
+      the engine returns NULL for a non-list. `size` on a list already agrees.
+
+Missing functions (engine parser rejects them; core has ~93, engine ~25) — add to
+the catalog (parser allow-list + eval). Grouped by family:
+- [ ] K6. Cast functions: `to_integer`/`tointeger`, `to_float`/`tofloat`,
+      `to_string`/`tostring`, `to_boolean`/`toboolean` (engine has `CAST(x AS T)`
+      only). (~3000/3000 for that probe.)
+- [ ] K7. `IN` list-membership operator (`x IN [a, b, c]`) — absent entirely.
+- [ ] K8. `nullif(a, b)` (engine has `coalesce`).
+- [ ] K9. Math fns + constants: `exp`, `ln`, `log`, `sin`/`cos`/`tan`
+      (+`asin`/`acos`/`atan`, `sinh`/`cosh`/`tanh`/`cot`), `power`, `mod`, `e`,
+      `pi`, `degrees`, `radians`. Native match core's libm (the wasm-ulp caveat in
+      `backend-parity-fuzz` is not in scope here — this is native-vs-native).
+- [ ] K10. String fns: `ltrim`, `rtrim`, `btrim`, `reverse` (string), `left`,
+      `right`, `split`, `char_length`/`character_length`, `byte_length`/
+      `octet_length`.
+- [ ] K11. List fns: `reverse`(list), `tail`, `range(a, b[, step])`, `keys`,
+      `append`, `list_contains`, `list_sort`, `list_union`, `difference`,
+      `intersection`, `nodes`, `relationships`, `labels`, `type`, `property_names`.
+- [ ] K12. Re-run `fuzz_report` after each fix; the family's bucket should go to 0.
+      Widen the fuzzer to temporals and list values once K6–K11 land.
 
 ## Standing
 

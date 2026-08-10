@@ -1711,11 +1711,20 @@ fn try_node_grouped_count(
         from,
         dir,
         edge_label,
-        ..
+        bind_edge,
     } = input
     else {
         return None;
     };
+    if *bind_edge {
+        // With the edge bound, the endpoint node sits at slot w+1 and slot w is the
+        // EDGE — so a `Prop{slot: w}` key is an edge property, not a node one. This
+        // fast path reads NODE properties of the endpoint; hand a bound-edge group
+        // (e.g. `RETURN r.w, count(*)`) to the general aggregate, which reads the
+        // edge slot correctly. (Found by the differential fuzzer: this used to read
+        // the edge key as an absent node property and bucket every row under NULL.)
+        return None;
+    }
     let w = chain_width(inner)?;
     if *from + 1 != w {
         return None; // the final Expand must expand the current frontier
@@ -2997,6 +3006,39 @@ mod tests {
         // vf of the matching intervals ([1,3],[2,4],[3,5]) — `names_of` renders a
         // Num via its debug form.
         assert_eq!(seek, vec!["Num(1.0)", "Num(2.0)", "Num(3.0)"]);
+    }
+
+    /// Grouping by an EDGE property counts per distinct edge-prop value — the
+    /// bound edge sits at slot W and the endpoint node at W+1, so the count
+    /// fast-path must not read the edge key as an (absent) node property. (The
+    /// differential fuzzer found this bucketing every row under one NULL group.)
+    #[test]
+    fn group_by_edge_property_counts_per_value() {
+        let mut b = Builder::default();
+        let x = b.node(&["N"], &[]);
+        let y = b.node(&["N"], &[]);
+        let z = b.node(&["N"], &[]);
+        b.edge(x, y, "R");
+        b.edge(x, z, "R");
+        b.edge(y, z, "R");
+        let mut store = b.build();
+        // Set weights: two edges w=2, one w=7 (eids 0,1,2 in insertion order).
+        store.set_edge_prop(0, "w", n(2.0));
+        store.set_edge_prop(1, "w", n(2.0));
+        store.set_edge_prop(2, "w", n(7.0));
+        let plan =
+            crate::gql::parse("MATCH (a:N)-[r:R]->(b) RETURN r.w AS w, count(*) AS c").unwrap();
+        // Group {2.0 → 2 edges, 7.0 → 1 edge}, order-independent.
+        let mut got: Vec<(String, f64)> = run(&plan, &store)
+            .rows
+            .iter()
+            .map(|row| (format!("{:?}", row[0]), num(&row[1])))
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![("Num(2.0)".to_string(), 2.0), ("Num(7.0)".to_string(), 1.0)]
+        );
     }
 
     // --- relational core (unchanged behavior, now slot-addressed) ---
