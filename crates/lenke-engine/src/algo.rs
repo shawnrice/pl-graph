@@ -484,6 +484,29 @@ pub fn betweenness(store: &Store, edge_label: Option<&str>) -> Vec<(u32, f64)> {
     live.into_iter().map(|v| (v, cb[v as usize])).collect()
 }
 
+/// Single-source shortest-path distances (unweighted BFS layers) from a `source`
+/// external id, along `dir`/`edge_label`. Returns `(node, distance)` for every node
+/// REACHED (the source at 0), in ascending-id order — the unweighted default of
+/// core's `shortestPath`. Distances are integer hops, so the result is byte-
+/// identical to core. An unknown/absent source (or one resolving to no live node)
+/// yields nothing; a named-but-unknown edge type reaches only the source. Weighted
+/// (`weightProperty`, Dijkstra) and A* (`target`) are deferred.
+#[must_use]
+pub fn shortest_path(
+    store: &Store,
+    source: Option<&str>,
+    dir: Dir,
+    edge_label: Option<&str>,
+) -> Vec<(u32, f64)> {
+    let Some(src) = source.and_then(|s| store.node_by_ext(s)) else {
+        return Vec::new();
+    };
+    bfs_distances(store, src, dir, edge_label)
+        .into_iter()
+        .map(|(v, d)| (v, f64::from(d)))
+        .collect()
+}
+
 /// The built-in procedure catalog: a `CALL name(...)` procedure name → its
 /// non-`node` result column name (matching lenke-core's snake_case surface). The
 /// output columns of every procedure are `[node, <result>]`. `None` = unknown.
@@ -498,6 +521,7 @@ pub fn procedure_result_col(name: &str) -> Option<&'static str> {
         "label_propagation" => "label",
         "closeness" => "centrality",
         "betweenness" => "centrality",
+        "shortest_path" => "distance",
         _ => return None,
     })
 }
@@ -560,6 +584,7 @@ pub fn run_procedure(
             .collect(),
         "on_cycle" => on_cycle(store, str_of("edgeType")),
         "betweenness" => betweenness(store, str_of("edgeType")),
+        "shortest_path" => shortest_path(store, str_of("source"), dir(), str_of("edgeType")),
         _ => return None,
     })
 }
@@ -701,6 +726,30 @@ mod tests {
         assert_eq!(
             betweenness(&st, Some("NOPE")),
             vec![(0, 0.0), (1, 0.0), (2, 0.0), (3, 0.0)]
+        );
+    }
+
+    #[test]
+    fn shortest_path_bfs_layers_from_source() {
+        let st = triangle_plus_isolated();
+        // OUT from a(ext "0") on 0→1→2→0: 0@0, 1@1, 2@2; the isolated node is
+        // unreachable, so it is absent from the result.
+        assert_eq!(
+            shortest_path(&st, Some("0"), Dir::Out, None),
+            vec![(0, 0.0), (1, 1.0), (2, 2.0)]
+        );
+        // IN from a walks the cycle backwards: 0@0, then c(2)@1, then b(1)@2.
+        assert_eq!(
+            shortest_path(&st, Some("0"), Dir::In, None),
+            vec![(0, 0.0), (1, 2.0), (2, 1.0)]
+        );
+        // Unknown source → nothing.
+        assert!(shortest_path(&st, Some("999"), Dir::Out, None).is_empty());
+        assert!(shortest_path(&st, None, Dir::Out, None).is_empty());
+        // A named-but-unknown edge type reaches only the source.
+        assert_eq!(
+            shortest_path(&st, Some("0"), Dir::Out, Some("NOPE")),
+            vec![(0, 0.0)]
         );
     }
 

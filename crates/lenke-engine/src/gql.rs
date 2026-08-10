@@ -3268,6 +3268,31 @@ mod tests {
     }
 
     #[test]
+    fn call_shortest_path_procedure_yields_distance() {
+        let store = triangle_store();
+        let rows_of = |q: &str| -> Vec<(f64, f64)> {
+            run(&super::parse(q).unwrap(), &store)
+                .rows
+                .iter()
+                .map(|r| (node_id(&r[0]), num(&r[1])))
+                .collect()
+        };
+        // OUT from source "0" on the triangle: hop distances 0,1,2 to the three
+        // members; the isolated node is unreachable and absent.
+        let want = vec![(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)];
+        assert_eq!(
+            rows_of("CALL shortest_path({source: '0'}) YIELD node, distance"),
+            want
+        );
+        assert_eq!(rows_of("CALL shortest_path({source: '0'})"), want);
+        let out = run(
+            &super::parse("CALL shortest_path({source: '0'})").unwrap(),
+            &store,
+        );
+        assert_eq!(out.names, vec!["node".to_string(), "distance".to_string()]);
+    }
+
+    #[test]
     fn call_procedure_config_and_components() {
         let store = triangle_store();
         // degree with direction=both: each triangle node 2, isolated 0.
