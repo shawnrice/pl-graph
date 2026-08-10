@@ -3201,6 +3201,33 @@ mod tests {
     }
 
     #[test]
+    fn call_scc_procedure_yields_component_id() {
+        let store = triangle_store();
+        let rows_of = |q: &str| -> Vec<(f64, f64)> {
+            run(&super::parse(q).unwrap(), &store)
+                .rows
+                .iter()
+                .map(|r| (node_id(&r[0]), num(&r[1])))
+                .collect()
+        };
+        // The directed triangle {0,1,2} is one SCC (rep 0); the isolated node is {3}.
+        let want = vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 3.0)];
+        assert_eq!(
+            rows_of("CALL strongly_connected_components() YIELD node, componentId"),
+            want
+        );
+        assert_eq!(rows_of("CALL strongly_connected_components()"), want);
+        let out = run(
+            &super::parse("CALL strongly_connected_components()").unwrap(),
+            &store,
+        );
+        assert_eq!(
+            out.names,
+            vec!["node".to_string(), "componentId".to_string()]
+        );
+    }
+
+    #[test]
     fn call_procedure_config_and_components() {
         let store = triangle_store();
         // degree with direction=both: each triangle node 2, isolated 0.

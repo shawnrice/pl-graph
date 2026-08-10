@@ -292,6 +292,97 @@ pub fn closeness(store: &Store, edge_label: Option<&str>) -> Vec<(u32, f64)> {
         .collect()
 }
 
+/// Strongly connected components (Tarjan, iterative): partition the directed graph
+/// into maximal sets of mutually reachable vertices, labelling every member with
+/// the SMALLEST dense id in its component (matching the WCC convention). Ported
+/// from lenke-core's `strongly_connected_components`, which uses the same iterative
+/// Tarjan and the same min-member representative — the partition is unique and the
+/// rep is order-independent, so this agrees with core regardless of adjacency
+/// order. (Core surfaces the rep as its external-id string; this engine has only
+/// dense ids, so the rep is the number, exactly as WCC's `connected_components`
+/// does.) Returns `(node, representative)` in ascending-id order; a named-but-
+/// unknown edge type leaves every vertex a singleton (its own rep).
+#[must_use]
+pub fn strongly_connected_components(store: &Store, edge_label: Option<&str>) -> Vec<(u32, u32)> {
+    let n = store.node_count();
+    // Forward out-adjacency of the wanted type; unknown type → no edges.
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    if let Some(want) = want_etype(store, edge_label) {
+        for &v in &store.all_nodes() {
+            for_each_nbr(store, v, Dir::Out, want, |nbr| adj[v as usize].push(nbr));
+        }
+    }
+
+    const UNVISITED: u32 = u32::MAX;
+    let mut order = vec![UNVISITED; n]; // DFS discovery index (Tarjan's `index`)
+    let mut low = vec![0u32; n]; // lowlink
+    let mut on_stack = vec![false; n];
+    let mut comp = vec![UNVISITED; n]; // resolved component representative
+    let mut tstack: Vec<u32> = Vec::new(); // Tarjan's component stack
+    let mut counter: u32 = 0;
+    // Each DFS frame is `(vertex, next-neighbour cursor into adj[v])`.
+    let mut frames: Vec<(u32, usize)> = Vec::new();
+
+    for &s in &store.all_nodes() {
+        if order[s as usize] != UNVISITED {
+            continue;
+        }
+        order[s as usize] = counter;
+        low[s as usize] = counter;
+        counter += 1;
+        on_stack[s as usize] = true;
+        tstack.push(s);
+        frames.push((s, 0));
+
+        while let Some(&(v, ci)) = frames.last() {
+            let vu = v as usize;
+            if ci < adj[vu].len() {
+                frames.last_mut().unwrap().1 = ci + 1;
+                let w = adj[vu][ci];
+                let wu = w as usize;
+                if order[wu] == UNVISITED {
+                    order[wu] = counter;
+                    low[wu] = counter;
+                    counter += 1;
+                    on_stack[wu] = true;
+                    tstack.push(w);
+                    frames.push((w, 0));
+                } else if on_stack[wu] {
+                    low[vu] = low[vu].min(order[wu]);
+                }
+            } else {
+                // `v` fully explored: an SCC root pops its whole component and stamps
+                // every member with the component's smallest dense id.
+                if low[vu] == order[vu] {
+                    let mut members: Vec<u32> = Vec::new();
+                    loop {
+                        let m = tstack.pop().expect("component stack non-empty at root");
+                        on_stack[m as usize] = false;
+                        members.push(m);
+                        if m == v {
+                            break;
+                        }
+                    }
+                    let rep = *members.iter().min().expect("a component has a member");
+                    for m in members {
+                        comp[m as usize] = rep;
+                    }
+                }
+                frames.pop();
+                if let Some(&(p, _)) = frames.last() {
+                    low[p as usize] = low[p as usize].min(low[vu]);
+                }
+            }
+        }
+    }
+
+    store
+        .all_nodes()
+        .into_iter()
+        .map(|v| (v, comp[v as usize]))
+        .collect()
+}
+
 /// The built-in procedure catalog: a `CALL name(...)` procedure name → its
 /// non-`node` result column name (matching lenke-core's snake_case surface). The
 /// output columns of every procedure are `[node, <result>]`. `None` = unknown.
@@ -301,6 +392,7 @@ pub fn procedure_result_col(name: &str) -> Option<&'static str> {
         "degree" => "degree",
         "pagerank" => "score",
         "connected_components" => "componentId",
+        "strongly_connected_components" => "componentId",
         "label_propagation" => "label",
         "closeness" => "centrality",
         _ => return None,
@@ -359,6 +451,10 @@ pub fn run_procedure(
             pagerank(store, str_of("edgeType"), d, iters)
         }
         "closeness" => closeness(store, str_of("edgeType")),
+        "strongly_connected_components" => strongly_connected_components(store, str_of("edgeType"))
+            .into_iter()
+            .map(|(v, c)| (v, f64::from(c)))
+            .collect(),
         _ => return None,
     })
 }
@@ -418,6 +514,34 @@ mod tests {
         assert_eq!(
             closeness(&st, Some("NOPE")),
             vec![(0, 0.0), (1, 0.0), (2, 0.0), (3, 0.0)]
+        );
+    }
+
+    #[test]
+    fn scc_partitions_cycles_and_singletons() {
+        let st = triangle_plus_isolated();
+        // The directed triangle {0,1,2} is one SCC (rep = min member 0); the isolated
+        // node {3} is its own singleton (rep 3).
+        assert_eq!(
+            strongly_connected_components(&st, None),
+            vec![(0, 0), (1, 0), (2, 0), (3, 3)]
+        );
+        // A DAG (drop the closing c→a edge) has no non-trivial cycle → all singletons.
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[]);
+        let bb = b.node(&["N"], &[]);
+        let c = b.node(&["N"], &[]);
+        b.edge(a, bb, "R");
+        b.edge(bb, c, "R");
+        let dag = b.build();
+        assert_eq!(
+            strongly_connected_components(&dag, None),
+            vec![(0, 0), (1, 1), (2, 2)]
+        );
+        // A named-but-unknown edge type → every vertex is its own singleton.
+        assert_eq!(
+            strongly_connected_components(&st, Some("NOPE")),
+            vec![(0, 0), (1, 1), (2, 2), (3, 3)]
         );
     }
 
