@@ -47,6 +47,32 @@ struct RangeIndex {
     map: BTreeMap<OrdVal, Vec<u32>>,
 }
 
+/// One indexed interval: an out-edge's `[lo, hi]` (read from two numeric edge
+/// props at build time), plus the edge id and its neighbour. Copied inline so an
+/// overlap seek never touches the boxed edge-property map — the whole point of the
+/// index (the boxed post-filter is what `examples/interval_bench` measures as the
+/// cost).
+#[derive(Clone, Copy)]
+struct Iv {
+    lo: f64,
+    hi: f64,
+    eid: u32,
+    nbr: u32,
+}
+
+/// The opt-in edge INTERVAL index for one `(lo_key, hi_key)` pair over OUT-edges.
+/// Per source node its intervals are held BOTH sorted by `lo` ascending and by
+/// `hi` ascending, so an overlap query `[qlo, qhi]` (an edge overlaps iff
+/// `lo <= qhi AND hi >= qlo`) can SEED from whichever axis is more selective and
+/// post-filter the other — the RI-tree-lite rule from the bitemporal index (seed
+/// from the selective axis; never materialize and intersect both stabs).
+struct IntervalIndex {
+    lo_key: String,
+    hi_key: String,
+    by_lo: Vec<Vec<Iv>>,
+    by_hi: Vec<Vec<Iv>>,
+}
+
 /// A typed property column, indexed by node id. `present[i]` is false where node
 /// `i` does not carry this property (reads as `Value::Null`). One variant per
 /// value type; a heterogeneous property falls to `Gen`.
@@ -407,6 +433,11 @@ pub struct Store {
     edge_type_index: bool,
     out_type_idx: Vec<HashMap<u32, Vec<Adj>>>,
     in_type_idx: Vec<HashMap<u32, Vec<Adj>>>,
+    /// OPT-IN edge interval index (`None` unless `create_interval_index` was
+    /// called). Built from edge props at creation and maintained through the
+    /// mutation primitives; an interval-key edge-prop change triggers a full
+    /// rebuild (rare — intervals are typically bulk-loaded before the index).
+    interval: Option<IntervalIndex>,
 }
 
 /// A hash index on a node property PATH. `path` is `["age"]` for a plain property
@@ -704,6 +735,10 @@ impl Store {
             self.out_type_idx.push(HashMap::new());
             self.in_type_idx.push(HashMap::new());
         }
+        if let Some(ix) = &mut self.interval {
+            ix.by_lo.push(Vec::new());
+            ix.by_hi.push(Vec::new());
+        }
         self.deleted.push(false);
         for l in labels {
             // ids are handed out increasing, so appending keeps the bucket sorted.
@@ -762,6 +797,12 @@ impl Store {
                     etype,
                     eid,
                 });
+        }
+        if self.interval.is_some() {
+            // The new edge carries no interval props yet (they arrive via
+            // set_edge_prop, which rebuilds); reindexing now keeps `from`'s buckets
+            // consistent and picks the edge up once its props are set.
+            self.reindex_node_interval(from);
         }
         if let Some(log) = &mut self.undo {
             log.push(Undo::AddEdge {
@@ -830,6 +871,123 @@ impl Store {
         }
         self.out_type_idx[i] = om;
         self.in_type_idx[i] = im;
+    }
+
+    // --- opt-in edge interval index (G4) ---
+
+    /// Create the opt-in interval index over OUT-edges for the numeric edge props
+    /// `(lo_key, hi_key)` and build it from the current edges. Replaces any prior
+    /// interval index. After this, [`for_each_overlap`](Store::for_each_overlap)
+    /// seeks a node's edges whose `[lo, hi]` overlaps a query interval instead of
+    /// scanning the adjacency and reading the boxed props.
+    pub fn create_interval_index(&mut self, lo_key: &str, hi_key: &str) {
+        self.interval = Some(IntervalIndex {
+            lo_key: lo_key.to_string(),
+            hi_key: hi_key.to_string(),
+            by_lo: vec![Vec::new(); self.node_count],
+            by_hi: vec![Vec::new(); self.node_count],
+        });
+        for node in 0..self.node_count as u32 {
+            self.reindex_node_interval(node);
+        }
+    }
+
+    /// Whether an interval index on exactly `(lo_key, hi_key)` is active.
+    #[must_use]
+    pub fn has_interval_index(&self, lo_key: &str, hi_key: &str) -> bool {
+        self.interval
+            .as_ref()
+            .is_some_and(|ix| ix.lo_key == lo_key && ix.hi_key == hi_key)
+    }
+
+    /// Whether `key` is one of the active interval index's axes (so a change to it
+    /// invalidates the index).
+    fn interval_uses_key(&self, key: &str) -> bool {
+        self.interval
+            .as_ref()
+            .is_some_and(|ix| ix.lo_key == key || ix.hi_key == key)
+    }
+
+    /// Call `f(eid, nbr)` for each OUT-edge of `node` whose interval `[lo, hi]`
+    /// overlaps `[qlo, qhi]` (i.e. `lo <= qhi && hi >= qlo`), seeking via the
+    /// interval index. Seeds from whichever axis is the more selective (fewer
+    /// candidates) and post-filters the other — never intersecting both. A no-op if
+    /// no interval index is active or `node` is out of range.
+    pub fn for_each_overlap(&self, node: u32, qlo: f64, qhi: f64, mut f: impl FnMut(u32, u32)) {
+        let Some(ix) = &self.interval else { return };
+        let Some(by_lo) = ix.by_lo.get(node as usize) else {
+            return;
+        };
+        let by_hi = &ix.by_hi[node as usize];
+        // # with lo <= qhi (a prefix of by_lo); # with hi >= qlo (a suffix of by_hi).
+        let n_lo = by_lo.partition_point(|iv| iv.lo <= qhi);
+        let n_hi = by_hi.len() - by_hi.partition_point(|iv| iv.hi < qlo);
+        if n_lo <= n_hi {
+            for iv in &by_lo[..n_lo] {
+                if iv.hi >= qlo {
+                    f(iv.eid, iv.nbr);
+                }
+            }
+        } else {
+            for iv in &by_hi[by_hi.len() - n_hi..] {
+                if iv.lo <= qhi {
+                    f(iv.eid, iv.nbr);
+                }
+            }
+        }
+    }
+
+    /// Rebuild one source node's interval buckets from its current out-edges and
+    /// their (boxed) props. An edge missing either numeric interval prop is skipped
+    /// (it cannot be range-sought). No-op when the index is off.
+    fn reindex_node_interval(&mut self, node: u32) {
+        if self.interval.is_none() {
+            return;
+        }
+        let (lo_key, hi_key) = {
+            let ix = self.interval.as_ref().unwrap();
+            (ix.lo_key.clone(), ix.hi_key.clone())
+        };
+        let i = node as usize;
+        let mut ivs: Vec<Iv> = Vec::new();
+        for a in &self.out_adj[i] {
+            if let (Value::Num(lo), Value::Num(hi)) = (
+                self.edge_prop(a.eid, &lo_key),
+                self.edge_prop(a.eid, &hi_key),
+            ) {
+                ivs.push(Iv {
+                    lo,
+                    hi,
+                    eid: a.eid,
+                    nbr: a.nbr,
+                });
+            }
+        }
+        let mut by_lo = ivs.clone();
+        by_lo.sort_by(|a, b| a.lo.total_cmp(&b.lo));
+        let mut by_hi = ivs;
+        by_hi.sort_by(|a, b| a.hi.total_cmp(&b.hi));
+        let ix = self.interval.as_mut().unwrap();
+        ix.by_lo[i] = by_lo;
+        ix.by_hi[i] = by_hi;
+    }
+
+    /// Rebuild the whole interval index (used after an interval-key edge-prop change,
+    /// where the affected source node is not cheaply known from the eid).
+    fn rebuild_interval(&mut self) {
+        if self.interval.is_none() {
+            return;
+        }
+        // Resize per-node vectors in case node_count changed, then reindex all.
+        {
+            let n = self.node_count;
+            let ix = self.interval.as_mut().unwrap();
+            ix.by_lo = vec![Vec::new(); n];
+            ix.by_hi = vec![Vec::new(); n];
+        }
+        for node in 0..self.node_count as u32 {
+            self.reindex_node_interval(node);
+        }
     }
 
     /// Whether node `node` carries a present value for `key` (distinct from a
@@ -962,6 +1120,11 @@ impl Store {
             .insert(eid, value);
         if let (Some(rec), Some(log)) = (rec, self.undo.as_mut()) {
             log.push(rec);
+        }
+        // An interval-axis change moves an edge's interval; the source node isn't
+        // cheaply known from the eid, so rebuild the (opt-in, rarely-mutated) index.
+        if self.interval_uses_key(key) {
+            self.rebuild_interval();
         }
         self.record_change(Change::EdgeProp {
             eid,
@@ -1181,6 +1344,9 @@ impl Store {
         if let (Some(rec), Some(log)) = (rec, self.undo.as_mut()) {
             log.push(rec);
         }
+        if self.interval_uses_key(key) {
+            self.rebuild_interval();
+        }
         self.record_change(Change::EdgeProp {
             eid,
             key: key.to_string(),
@@ -1220,6 +1386,12 @@ impl Store {
         if self.edge_type_index {
             self.reindex_node_etypes(u);
             self.reindex_node_etypes(v);
+        }
+        if self.interval.is_some() {
+            // The interval index is on OUT-edges; the deleted eid was an out-edge
+            // of whichever endpoint is its source, so reindex both to be safe.
+            self.reindex_node_interval(u);
+            self.reindex_node_interval(v);
         }
         if let Some(log) = &mut self.undo {
             log.push(Undo::RestoreEdge { entries: removed });
@@ -1287,6 +1459,16 @@ impl Store {
                 }
             }
         }
+        if self.interval.is_some() {
+            // Interval index is on OUT-edges: id's own out-edges are gone, and each
+            // IN-neighbour (an edge `nbr -> id`) lost one of ITS out-edges.
+            self.reindex_node_interval(id);
+            for a in &inc {
+                if a.nbr != id {
+                    self.reindex_node_interval(a.nbr);
+                }
+            }
+        }
 
         if let Some(log) = &mut self.undo {
             log.push(Undo::RestoreNode {
@@ -1335,6 +1517,14 @@ impl Store {
             for rec in log.into_iter().rev() {
                 self.apply_undo(rec);
             }
+        }
+        // The interval index depends on edge PROPS as well as adjacency, both of
+        // which are restored by the undos above in an order that per-record index
+        // maintenance can't safely track — so rebuild it once against the fully
+        // restored graph. (The edge-type index depends only on adjacency, which
+        // each undo record reindexes as it restores it.)
+        if self.interval.is_some() {
+            self.rebuild_interval();
         }
     }
 
@@ -1414,6 +1604,10 @@ impl Store {
                 self.apply_undo(rec);
             }
             self.undo = Some(log);
+        }
+        // Rebuild the interval index against the restored graph (see `rollback`).
+        if self.interval.is_some() {
+            self.rebuild_interval();
         }
     }
 
@@ -1559,6 +1753,10 @@ impl Store {
             self.out_type_idx.pop();
             self.in_type_idx.pop();
         }
+        if let Some(ix) = &mut self.interval {
+            ix.by_lo.pop();
+            ix.by_hi.pop();
+        }
         self.deleted.pop();
         self.node_count -= 1;
     }
@@ -1647,6 +1845,7 @@ impl Builder {
             edge_type_index: false,
             out_type_idx: Vec::new(),
             in_type_idx: Vec::new(),
+            interval: None,
         }
     }
 }
@@ -2332,5 +2531,118 @@ mod tests {
         let three = st.add_node(&["V"], &[]);
         st.add_edge(three, 0, "LIKES");
         assert_eq!(out_ids(&st, three, "LIKES"), vec![0]);
+    }
+
+    // --- opt-in edge interval index (G4) ---
+
+    /// One Emp node (0) with `degree` HELD edges to role node 1, edge d carrying
+    /// interval `[d, d+width]`.
+    fn interval_graph(degree: u32, width: i64) -> Store {
+        let mut b = Builder::default();
+        b.node(&["Emp"], &[]);
+        b.node(&["Role"], &[]);
+        let mut st = b.build();
+        for d in 0..degree {
+            let eid = st.add_edge(0, 1, "HELD");
+            st.set_edge_prop(eid, "vf", n(f64::from(d)));
+            st.set_edge_prop(eid, "vt", n((i64::from(d) + width) as f64));
+        }
+        st
+    }
+
+    /// Overlap eids from the index (sorted), vs a brute-force scan of the flat
+    /// adjacency reading the boxed props.
+    fn overlap_eids(st: &Store, node: u32, qlo: f64, qhi: f64) -> Vec<u32> {
+        let mut v = Vec::new();
+        st.for_each_overlap(node, qlo, qhi, |eid, _| v.push(eid));
+        v.sort_unstable();
+        v
+    }
+    fn overlap_bruteforce(st: &Store, node: u32, qlo: f64, qhi: f64) -> Vec<u32> {
+        let mut v: Vec<u32> = st
+            .out(node)
+            .iter()
+            .filter(|a| {
+                matches!((st.edge_prop(a.eid, "vf"), st.edge_prop(a.eid, "vt")),
+                    (Value::Num(lo), Value::Num(hi)) if lo <= qhi && hi >= qlo)
+            })
+            .map(|a| a.eid)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// The seek agrees with a brute-force overlap scan for point queries across the
+    /// timeline AND for wider interval queries (both seed axes exercised).
+    #[test]
+    fn interval_seek_matches_bruteforce() {
+        let st = {
+            let mut s = interval_graph(64, 4);
+            s.create_interval_index("vf", "vt");
+            s
+        };
+        assert!(st.has_interval_index("vf", "vt"));
+        // as-of points across the whole timeline (0..=67), incl. the ends where one
+        // axis is far more selective than the other.
+        for t in 0..=67 {
+            let q = f64::from(t);
+            assert_eq!(
+                overlap_eids(&st, 0, q, q),
+                overlap_bruteforce(&st, 0, q, q),
+                "point t={t}"
+            );
+        }
+        // wider ranges
+        for &(lo, hi) in &[(10.0, 20.0), (0.0, 100.0), (63.0, 63.0), (-5.0, 2.0)] {
+            assert_eq!(
+                overlap_eids(&st, 0, lo, hi),
+                overlap_bruteforce(&st, 0, lo, hi),
+                "range [{lo},{hi}]"
+            );
+        }
+    }
+
+    /// Writes keep the interval index current: a new edge+interval appears, a
+    /// changed interval moves, a deleted edge vanishes.
+    #[test]
+    fn interval_index_tracks_writes() {
+        let mut st = interval_graph(4, 2); // edges: [0,2],[1,3],[2,4],[3,5]
+        st.create_interval_index("vf", "vt");
+        // as-of t=10 → none.
+        assert_eq!(overlap_eids(&st, 0, 10.0, 10.0), Vec::<u32>::new());
+        // add an edge covering t=10.
+        let e = st.add_edge(0, 1, "HELD");
+        st.set_edge_prop(e, "vf", n(8.0));
+        st.set_edge_prop(e, "vt", n(12.0));
+        assert_eq!(overlap_eids(&st, 0, 10.0, 10.0), vec![e]);
+        // move it off t=10.
+        st.set_edge_prop(e, "vt", n(9.0));
+        assert_eq!(overlap_eids(&st, 0, 10.0, 10.0), Vec::<u32>::new());
+        // delete it.
+        st.set_edge_prop(e, "vt", n(12.0));
+        st.delete_edge(0, 1, e);
+        assert_eq!(overlap_eids(&st, 0, 10.0, 10.0), Vec::<u32>::new());
+    }
+
+    /// Rollback restores the interval index exactly (a full rebuild against the
+    /// restored graph, so prop AND adjacency undo ordering can't drift it).
+    #[test]
+    fn interval_index_survives_rollback() {
+        let mut st = interval_graph(4, 2);
+        st.create_interval_index("vf", "vt");
+        let before: Vec<Vec<u32>> = (0..8)
+            .map(|t| overlap_eids(&st, 0, f64::from(t), f64::from(t)))
+            .collect();
+        st.begin();
+        let e = st.add_edge(0, 1, "HELD");
+        st.set_edge_prop(e, "vf", n(0.0));
+        st.set_edge_prop(e, "vt", n(100.0)); // covers everything, inside the txn
+        st.delete_edge(0, 1, 0); // and drop the first committed edge
+        assert!(overlap_eids(&st, 0, 3.0, 3.0).contains(&e));
+        st.rollback();
+        let after: Vec<Vec<u32>> = (0..8)
+            .map(|t| overlap_eids(&st, 0, f64::from(t), f64::from(t)))
+            .collect();
+        assert_eq!(before, after);
     }
 }

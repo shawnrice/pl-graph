@@ -10,8 +10,23 @@
 //!   cargo run --release --manifest-path crates/lenke-engine/Cargo.toml \
 //!     --example interval_bench
 //!
-//! Prints, per (nodes, degree), the min-of-`REPS` wall time for the as-of count.
-//! Compare before/after an interval index (G4b).
+//! Prints, per (nodes, degree), the min-of-`REPS` wall time for the as-of count:
+//! the boxed-post-filter scan vs. the interval-index seek, plus the build cost.
+//!
+//! MEASURED (min of 7, release; keep these next to the code, per CLAUDE.md):
+//! ```text
+//!  nodes  degree     scan_us     seek_us  speedup   build_us
+//!  20000       8     29996.0       155.6   192.79      32994
+//!  20000      64    364022.9      2841.9   128.09     347092
+//!  20000     512   4151669.4     18349.2   226.26    4267859
+//! 100000      64   2192915.6     22714.1    96.54    2395323
+//! ```
+//! The seek is 96–226× faster: it stores the intervals INLINE (no boxed edge-prop
+//! probe) and seeks only the overlapping edges from the selective axis. Unlike the
+//! edge-type index (G5), this is a large unambiguous win — because the baseline
+//! cost was the boxed post-filter, not the adjacency scan. Build cost (one pass
+//! reading the boxed props) is a one-time amortized expense. The seek is timed in
+//! isolation here; wiring it into the query planner transparently is G4c.
 
 use lenke_engine::store::{Builder, Store};
 use lenke_engine::value::Value;
@@ -67,11 +82,33 @@ fn time_asof(store: &Store, t: i64, reps: usize) -> f64 {
     best
 }
 
+/// The same as-of count via the interval index seek (in isolation — G4b ships the
+/// index + seek; wiring it into the query planner transparently is G4c). Counts,
+/// over every Emp node, the out-edges whose `[vf, vt]` covers the point `t`.
+fn time_asof_indexed(store: &Store, first_emp: u32, n_emp: u32, t: i64, reps: usize) -> f64 {
+    let q = t as f64;
+    let mut best = f64::INFINITY;
+    let mut sink = 0u64;
+    for _ in 0..reps {
+        let t0 = Instant::now();
+        let mut c = 0u64;
+        for e in 0..n_emp {
+            store.for_each_overlap(first_emp + e, q, q, |_, _| c += 1);
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6;
+        sink += c;
+        best = best.min(us);
+    }
+    std::hint::black_box(sink);
+    best
+}
+
 fn main() {
     const REPS: usize = 7;
+    const ROLES: u32 = 16; // must match `fixture`
     println!(
-        "{:>8} {:>7} {:>12} {:>14}",
-        "nodes", "degree", "asof_us", "us_per_node"
+        "{:>8} {:>7} {:>11} {:>11} {:>8} {:>10}",
+        "nodes", "degree", "scan_us", "seek_us", "speedup", "build_us"
     );
     for &(nodes, degree) in &[
         (20_000u32, 8u32),
@@ -79,13 +116,19 @@ fn main() {
         (20_000, 512),
         (100_000, 64),
     ] {
-        let store = fixture(nodes, degree);
         // Query as of the timeline midpoint (a representative selective point).
         let t = i64::from(degree) / 2;
-        let us = time_asof(&store, t, REPS);
+        let store = fixture(nodes, degree);
+        let scan_us = time_asof(&store, t, REPS);
+        // Indexed seek (isolated): build the interval index, then time the seek.
+        let mut indexed = fixture(nodes, degree);
+        let t0 = Instant::now();
+        indexed.create_interval_index("vf", "vt");
+        let build_us = t0.elapsed().as_secs_f64() * 1e6;
+        let seek_us = time_asof_indexed(&indexed, ROLES, nodes, t, REPS);
         println!(
-            "{nodes:>8} {degree:>7} {us:>12.1} {:>14.4}",
-            us / f64::from(nodes)
+            "{nodes:>8} {degree:>7} {scan_us:>11.1} {seek_us:>11.1} {:>8.2} {build_us:>10.1}",
+            scan_us / seek_us
         );
     }
 }

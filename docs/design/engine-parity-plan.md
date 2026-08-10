@@ -341,12 +341,25 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
         eid-keyed HashMap probe, per edge). An interval index that stores the
         intervals INLINE and seeks overlaps sidesteps those probes entirely, so
         the win should be large (unlike G5's marginal case).
-  - [ ] G4b. Opt-in per-node interval index + planner seek: store each node's
-        edges as `(lo, hi, eid, nbr)` for a declared `(lo_key, hi_key)` pair; an
-        overlap query `[qlo, qhi]` seeds from the selective axis and post-filters
-        the other (the bitemporal-index FIRM rule: never intersect both stabs).
-        Planner recognizes `r.lo <= X AND r.hi >= Y` on a bound rel-var and routes
-        the expand to the seek. Re-measure.
+  - [x] G4b. Opt-in interval index + seek (store level): `create_interval_index(
+        lo_key, hi_key)` stores each node's OUT-edge intervals `(lo, hi, eid, nbr)`
+        BOTH sorted by lo and by hi (read inline from the boxed props at build).
+        `for_each_overlap(node, qlo, qhi, f)` seeds from whichever axis is more
+        selective (`partition_point`) and post-filters the other — the FIRM
+        bitemporal rule (never intersect both stabs). Maintained through the
+        primitives + undo: per-node reindex on adjacency change, a full rebuild on
+        an interval-axis edge-prop change (source node not cheaply known from eid)
+        and once after rollback (prop+adjacency undo ordering can't be tracked per
+        record). OFF by default. 3 store tests (seek == brute-force across points
+        AND ranges incl. both seed axes; write tracking; rollback restore).
+        MEASURED (`interval_bench`, numbers in the file): **96–226× faster** than
+        the boxed post-filter scan — a large unambiguous win (the baseline cost was
+        the boxed edge-prop probe, which the inline seek sidesteps). Build is a
+        one-time pass over the props.
+  - [ ] G4c. Query/planner integration: recognize `r.lo <= X AND r.hi >= Y` on a
+        bound rel-var over an interval-indexed store and route the expand to the
+        seek (seek-or-scan fallback, like IndexSeek), so GQL/Gremlin queries get
+        the win transparently. Verify same rows as the scan.
 - G5. Edge-type index (type-filtered `expand`), built measured-first, split:
   - [x] G5a. Benchmark harness: `examples/expand_bench.rs` sweeps degree ×
         edge-type count (per CLAUDE.md — vary degree and the edge:type ratio) and
