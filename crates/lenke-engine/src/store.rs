@@ -86,6 +86,19 @@ pub enum Column {
         data: Vec<Arc<str>>,
         present: Vec<bool>,
     },
+    /// A DICTIONARY-encoded string column: `codes[i]` indexes `dict` (the distinct
+    /// values, in first-appearance order), so a low-cardinality column (a `dept` of
+    /// five values across 100k rows) stores one small `dict` plus a `u32` per row.
+    /// DISTINCT / GROUP BY / equality over it dedup and match on the `u32` code
+    /// instead of hashing string content — that is the whole point. Produced ONLY by
+    /// [`materialize`] when the cardinality stays under a cap; reads yield the SAME
+    /// `Value::Str` as an equivalent `Str` column, and any typed write decodes it
+    /// back to `Str` first (writes are the cold path), so it is a pure read encoding.
+    Dict {
+        dict: Vec<Arc<str>>,
+        codes: Vec<u32>,
+        present: Vec<bool>,
+    },
     Bool {
         data: Vec<bool>,
         present: Vec<bool>,
@@ -120,6 +133,11 @@ impl Column {
         match self {
             Self::Num { data, present } if present[idx] => Value::Num(data[idx]),
             Self::Str { data, present } if present[idx] => Value::Str(data[idx].clone()),
+            Self::Dict {
+                dict,
+                codes,
+                present,
+            } if present[idx] => Value::Str(dict[codes[idx] as usize].clone()),
             Self::Bool { data, present } if present[idx] => Value::Bool(data[idx]),
             Self::Temporal { data, present, .. } if present[idx] => Value::Temporal(data[idx]),
             Self::Gen { data, present } if present[idx] => data[idx].clone(),
@@ -132,6 +150,7 @@ impl Column {
         match self {
             Self::Num { present, .. }
             | Self::Str { present, .. }
+            | Self::Dict { present, .. }
             | Self::Bool { present, .. }
             | Self::Temporal { present, .. }
             | Self::Gen { present, .. } => present.len(),
@@ -181,6 +200,10 @@ impl Column {
                 data.push(Arc::from(""));
                 present.push(false);
             }
+            Self::Dict { codes, present, .. } => {
+                codes.push(0);
+                present.push(false);
+            }
             Self::Bool { data, present } => {
                 data.push(false);
                 present.push(false);
@@ -206,6 +229,7 @@ impl Column {
         match (self, v) {
             (Self::Num { .. }, Value::Num(_))
             | (Self::Str { .. }, Value::Str(_))
+            | (Self::Dict { .. }, Value::Str(_))
             | (Self::Bool { .. }, Value::Bool(_))
             | (Self::Gen { .. }, _) => true,
             (Self::Temporal { kind, .. }, Value::Temporal(t)) => t.kind() == *kind,
@@ -232,15 +256,49 @@ impl Column {
         match self {
             Self::Num { present, .. }
             | Self::Str { present, .. }
+            | Self::Dict { present, .. }
             | Self::Bool { present, .. }
             | Self::Temporal { present, .. }
             | Self::Gen { present, .. } => present[i],
         }
     }
 
+    /// Replace a `Dict` encoding with the equivalent `Str` column in place — the
+    /// one-time cost a dictionary-encoded column pays on its first value write, so
+    /// every mutator below can assume the plain `Str` representation. A no-op on any
+    /// other variant.
+    fn decode_dict(&mut self) {
+        let Self::Dict {
+            dict,
+            codes,
+            present,
+        } = self
+        else {
+            return;
+        };
+        let dict = std::mem::take(dict);
+        let codes = std::mem::take(codes);
+        let present = std::mem::take(present);
+        let data: Vec<Arc<str>> = codes
+            .iter()
+            .zip(&present)
+            .map(|(&c, &p)| {
+                if p {
+                    dict[c as usize].clone()
+                } else {
+                    Arc::from("")
+                }
+            })
+            .collect();
+        *self = Self::Str { data, present };
+    }
+
     /// Set node `i` to `v`, marking it present. The caller guarantees the column
     /// `accepts` `v` (promoting to `Gen` first if not).
     fn set(&mut self, i: usize, v: Value) {
+        // A dictionary column is a read encoding — decode to `Str` before mutating,
+        // so it never has to grow its dict on the write path.
+        self.decode_dict();
         match (self, v) {
             (Self::Num { data, present }, Value::Num(x)) => {
                 data[i] = x;
@@ -271,6 +329,7 @@ impl Column {
         match self {
             Self::Num { present, .. }
             | Self::Str { present, .. }
+            | Self::Dict { present, .. }
             | Self::Bool { present, .. }
             | Self::Temporal { present, .. }
             | Self::Gen { present, .. } => present[i] = false,
@@ -287,6 +346,10 @@ impl Column {
             }
             Self::Str { data, present } => {
                 data.pop();
+                present.pop();
+            }
+            Self::Dict { codes, present, .. } => {
+                codes.pop();
                 present.pop();
             }
             Self::Bool { data, present } => {
@@ -1955,6 +2018,51 @@ impl Builder {
     }
 }
 
+/// Attempt to dictionary-encode a string column. `Ok(Column::Dict)` when the number
+/// of DISTINCT present values stays under a cap (a categorical column — `dept`,
+/// `city`, `status`); `Err((data, present))` hands the buffers back for a plain
+/// `Str` column when the cardinality is too high for the encoding to pay (`name`, an
+/// id, free text). The probe aborts the moment the dict crosses the cap, so a
+/// high-cardinality column costs only the capped prefix, not a full scan.
+fn dict_encode(
+    data: Vec<Arc<str>>,
+    present: Vec<bool>,
+) -> Result<Column, (Vec<Arc<str>>, Vec<bool>)> {
+    const CAP: usize = 4096;
+    let mut dict: Vec<Arc<str>> = Vec::new();
+    let mut lookup: HashMap<Arc<str>, u32> = HashMap::new();
+    let mut codes = vec![0u32; data.len()];
+    for (i, s) in data.iter().enumerate() {
+        if !present[i] {
+            continue;
+        }
+        let code = if let Some(&c) = lookup.get(s) {
+            c
+        } else {
+            if dict.len() >= CAP {
+                return Err((data, present));
+            }
+            let c = dict.len() as u32;
+            dict.push(s.clone());
+            lookup.insert(s.clone(), c);
+            c
+        };
+        codes[i] = code;
+    }
+    // Encode only when the values actually REPEAT (distinct ≤ half the rows). An
+    // effectively-unique column (`name`, an email, free text) would spend a `u32`
+    // per row AND a full dict for no dedup benefit and a slower indirected read, so
+    // it stays `Str`. `dept`/`city`/`status`-shaped columns clear this easily.
+    if dict.is_empty() || dict.len() * 2 > data.len() {
+        return Err((data, present));
+    }
+    Ok(Column::Dict {
+        dict,
+        codes,
+        present,
+    })
+}
+
 /// Turn `(node, value)` pairs into the tightest typed column. Homogeneous
 /// numeric/string/bool columns unbox; anything mixed falls to `Gen`.
 fn materialize(pairs: Vec<(u32, Value)>, n: usize) -> Column {
@@ -1979,7 +2087,7 @@ fn materialize(pairs: Vec<(u32, Value)>, n: usize) -> Column {
                 present[i as usize] = true;
             }
         }
-        Column::Str { data, present }
+        dict_encode(data, present).unwrap_or_else(|(data, present)| Column::Str { data, present })
     } else if all(&|v| matches!(v, Value::Bool(_))) {
         let mut data = vec![false; n];
         let mut present = vec![false; n];

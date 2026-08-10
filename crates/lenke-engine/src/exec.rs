@@ -1535,6 +1535,28 @@ fn index_seek_ids(store: &Store, label: &str, key: &str, value: &Value) -> Vec<u
                             .filter(|&id| present[id as usize] && &*data[id as usize] == t)
                             .collect();
                     }
+                    (
+                        Some(Column::Dict {
+                            dict,
+                            codes,
+                            present,
+                        }),
+                        Value::Str(t),
+                    ) => {
+                        // Resolve the literal to its code ONCE, then match rows on the
+                        // `u32` — no per-row string compare. A literal absent from the
+                        // dict matches nothing.
+                        let t: &str = t;
+                        let Some(want) = dict.iter().position(|s| &**s == t) else {
+                            return Vec::new();
+                        };
+                        let want = want as u32;
+                        return ids
+                            .iter()
+                            .copied()
+                            .filter(|&id| present[id as usize] && codes[id as usize] == want)
+                            .collect();
+                    }
                     (Some(Column::Num { data, present }), Value::Num(t)) => {
                         let t = *t;
                         return ids
@@ -2009,15 +2031,61 @@ fn try_scan_group_agg(
     // `assign_groups`' typed fast path over the materialized column, which is as
     // fast — so leave those to the general aggregate (this fused path's per-agg
     // accumulator loop is slightly heavier and would regress them).
-    let Column::Str { data, present } = store.column(gkey)? else {
-        return None;
-    };
-    run!(
-        present,
-        |i: usize| data[i].as_ref(),
-        |i: usize| Value::Str(data[i].clone()),
-        ()
-    );
+    match store.column(gkey)? {
+        Column::Str { data, present } => {
+            run!(
+                present,
+                |i: usize| data[i].as_ref(),
+                |i: usize| Value::Str(data[i].clone()),
+                ()
+            );
+        }
+        Column::Dict {
+            dict,
+            codes,
+            present,
+        } => {
+            // Group by CODE, mapped to a dense group id in first-seen (scan) order —
+            // a per-code slot, no per-row string hash. First-seen (not dict order) is
+            // what the pinned GROUP BY order requires, since the dict was built over
+            // all nodes and the scan may visit a label subset in a different order.
+            let mut code_to_group: Vec<u32> = vec![u32::MAX; dict.len()];
+            let mut null_group: Option<u32> = None;
+            scan_visit(store, label, |i| {
+                let g = if present[i] {
+                    let c = codes[i] as usize;
+                    if code_to_group[c] == u32::MAX {
+                        let g = group_keys.len() as u32;
+                        code_to_group[c] = g;
+                        group_keys.push(Value::Str(dict[c].clone()));
+                        acc.push(GroupAcc {
+                            rows: 0,
+                            aggs: vec![(0.0, 0, None); na],
+                        });
+                        g as usize
+                    } else {
+                        code_to_group[c] as usize
+                    }
+                } else {
+                    match null_group {
+                        Some(g) => g as usize,
+                        None => {
+                            let g = group_keys.len() as u32;
+                            null_group = Some(g);
+                            group_keys.push(Value::Null);
+                            acc.push(GroupAcc {
+                                rows: 0,
+                                aggs: vec![(0.0, 0, None); na],
+                            });
+                            g as usize
+                        }
+                    }
+                };
+                accumulate(&mut acc, g, i);
+            });
+        }
+        _ => return None,
+    }
 
     // Build the output: the key column, then one column per aggregate.
     let key_col = Col::Gen(group_keys);
@@ -2081,6 +2149,20 @@ fn try_scan_distinct_count(
                 }
             });
             seen.len()
+        }
+        Column::Dict {
+            dict,
+            codes,
+            present,
+        } => {
+            // A distinct value == a distinct code: mark a per-code bitset, no hashing.
+            let mut seen = vec![false; dict.len()];
+            scan_visit(store, label, |i| {
+                if present[i] {
+                    seen[codes[i] as usize] = true;
+                }
+            });
+            seen.iter().filter(|&&b| b).count()
         }
         Column::Num { data, present } => {
             let mut seen: FnvSet<u64> = FnvSet::default();
@@ -3895,6 +3977,27 @@ fn try_distinct_scan_prop(input: &Plan, store: &Store) -> Option<Batch> {
                 }
             });
         }
+        Column::Dict {
+            dict,
+            codes,
+            present,
+        } => {
+            // First-seen order is preserved by pushing when a code is first observed
+            // during the scan (NOT dict order, which can differ from scan order under
+            // deletes / a label subset).
+            let mut seen = vec![false; dict.len()];
+            scan_visit(store, label, |i| {
+                if present[i] {
+                    let c = codes[i] as usize;
+                    if !std::mem::replace(&mut seen[c], true) {
+                        out.push(Value::Str(dict[c].clone()));
+                    }
+                } else if !saw_null {
+                    saw_null = true;
+                    out.push(Value::Null);
+                }
+            });
+        }
         Column::Num { data, present } => {
             let mut seen: FnvSet<u64> = FnvSet::default();
             scan_visit(store, label, |i| {
@@ -4154,6 +4257,15 @@ fn read_property(store: &Store, col: &Col, key: &str) -> Col {
         Column::Str { data, present } if ids.iter().all(|&i| present[i as usize]) => {
             Col::Str(ids.iter().map(|&i| data[i as usize].clone()).collect())
         }
+        Column::Dict {
+            dict,
+            codes,
+            present,
+        } if ids.iter().all(|&i| present[i as usize]) => Col::Str(
+            ids.iter()
+                .map(|&i| dict[codes[i as usize] as usize].clone())
+                .collect(),
+        ),
         Column::Bool { data, present } if ids.iter().all(|&i| present[i as usize]) => {
             Col::Bool(ids.iter().map(|&i| data[i as usize]).collect())
         }
@@ -4742,6 +4854,104 @@ mod tests {
             names_of(&run(&crate::gql::parse(q2).unwrap(), &store), 0),
             vec!["p49", "p9"]
         );
+    }
+
+    /// A low-cardinality string column dictionary-encodes, and every read shape
+    /// (DISTINCT / GROUP BY / equality filter / ORDER BY) returns exactly what the
+    /// plain `Str` column would — while a high-cardinality column stays `Str`.
+    #[test]
+    fn dict_encoded_column_round_trips() {
+        let depts = ["eng", "sales", "ops"];
+        let mut b = Builder::default();
+        for i in 0..30u32 {
+            b.node(
+                &["P"],
+                &[
+                    ("dept", s(depts[i as usize % 3])),
+                    ("name", s(&format!("p{i}"))), // 30 distinct -> stays Str
+                ],
+            );
+        }
+        let store = b.build();
+        // The low-card column encoded; the high-card one did not.
+        assert!(matches!(
+            store.column("dept"),
+            Some(crate::store::Column::Dict { .. })
+        ));
+        assert!(matches!(
+            store.column("name"),
+            Some(crate::store::Column::Str { .. })
+        ));
+
+        let rows = |q: &str| {
+            let mut r: Vec<String> = names_of(&run(&crate::gql::parse(q).unwrap(), &store), 0);
+            r.sort();
+            r
+        };
+        // DISTINCT over the dict column.
+        assert_eq!(
+            rows("MATCH (n:P) RETURN DISTINCT n.dept AS d"),
+            vec!["eng", "ops", "sales"]
+        );
+        // GROUP BY the dict column: 10 of each.
+        let g = run(
+            &crate::gql::parse("MATCH (n:P) RETURN n.dept AS d, count(*) AS c").unwrap(),
+            &store,
+        );
+        assert_eq!(g.rows.len(), 3);
+        assert!(g
+            .rows
+            .iter()
+            .all(|r| matches!(r[1], Value::Num(x) if x == 10.0)));
+        // count(DISTINCT) over the dict column.
+        let c = run(
+            &crate::gql::parse("MATCH (n:P) RETURN count(DISTINCT n.dept) AS c").unwrap(),
+            &store,
+        );
+        assert!(matches!(c.rows[0][0], Value::Num(x) if x == 3.0));
+        // Equality filter resolves through the dict; a miss matches nothing.
+        let count_where = |q: &str| match run(&crate::gql::parse(q).unwrap(), &store).rows[0][0] {
+            Value::Num(x) => x,
+            _ => panic!("count is not a number"),
+        };
+        assert_eq!(
+            count_where("MATCH (n:P) WHERE n.dept = 'eng' RETURN count(*) AS c"),
+            10.0
+        );
+        assert_eq!(
+            count_where("MATCH (n:P) WHERE n.dept = 'zzz' RETURN count(*) AS c"),
+            0.0
+        );
+        // ORDER BY the dict column sorts by VALUE, not code.
+        let o = run(
+            &crate::gql::parse("MATCH (n:P) RETURN DISTINCT n.dept AS d ORDER BY d").unwrap(),
+            &store,
+        );
+        assert_eq!(names_of(&o, 0), vec!["eng", "ops", "sales"]);
+    }
+
+    /// Writing a value to a dict-encoded column decodes it to `Str` in place, and the
+    /// new value reads back correctly alongside the untouched ones.
+    #[test]
+    fn dict_column_decodes_on_write() {
+        let mut b = Builder::default();
+        for _ in 0..6u32 {
+            b.node(&["P"], &[("dept", s("eng"))]);
+        }
+        let mut store = b.build();
+        assert!(matches!(
+            store.column("dept"),
+            Some(crate::store::Column::Dict { .. })
+        ));
+        let id = store.nodes_with_label("P")[0];
+        store.set_prop(id, "dept", s("legal"));
+        assert!(matches!(
+            store.column("dept"),
+            Some(crate::store::Column::Str { .. })
+        ));
+        assert!(matches!(store.prop(id, "dept"), Value::Str(x) if &*x == "legal"));
+        let other = store.nodes_with_label("P")[1];
+        assert!(matches!(store.prop(other, "dept"), Value::Str(x) if &*x == "eng"));
     }
 
     // --- relational core (unchanged behavior, now slot-addressed) ---
