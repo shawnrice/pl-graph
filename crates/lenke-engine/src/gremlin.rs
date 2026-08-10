@@ -490,6 +490,34 @@ impl Parser {
                 self.slots = 1;
                 p
             }
+            "id" | "label" => {
+                // Element accessors: `id()` → the preserved external id (polymorphic
+                // node/edge, via `element_id`); `label()` → a single label string (a
+                // vertex's label or an edge's type, via `element_label`). Both project
+                // the current element slot to a scalar and reset to a value stream.
+                self.expect(&Tok::RParen)?;
+                let func = if lname == "id" {
+                    "element_id"
+                } else {
+                    "element_label"
+                };
+                let p = plan.project(vec![(
+                    lname.clone(),
+                    Expr::Call {
+                        name: func.to_string(),
+                        args: vec![Expr::Slot(self.current)],
+                    },
+                )]);
+                self.current = 0;
+                self.slots = 1;
+                p
+            }
+            "valuemap" => {
+                // valueMap() is a PROPERTIES-only map (no id/label tokens by default),
+                // with TinkerPop's list-wrapped multi-values — semantics distinct from
+                // the engine's element_map render. Deferred to its own iteration.
+                return Err("valueMap() is not yet supported".into());
+            }
             "where" => {
                 // where(P.op(v)) / where(op(v)) / where(within(...)) — filter the
                 // current traverser's VALUE by a predicate (typically after values).
@@ -1071,6 +1099,36 @@ mod tests {
             gone.is_empty(),
             "missing id must contribute nothing: {gone:?}"
         );
+    }
+
+    /// `id()` projects the element's preserved external id (via `element_id`), and
+    /// `label()` a single label string — a vertex's label or an edge's type (via
+    /// `element_label`), both polymorphic over the current node/edge slot. Verified
+    /// vs the engine's own GQL `element_id`/`type` and vs the fixture's known labels.
+    #[test]
+    fn gremlin_id_and_label_accessors() {
+        let store = social();
+        // id() == element_id over the same elements.
+        assert_eq!(
+            value_bag(&gremlin_rows("g.V().id()", &store)),
+            value_bag(&gql_rows("MATCH (n) RETURN element_id(n)", &store)),
+        );
+        assert_eq!(
+            value_bag(&gremlin_rows("g.V().outE().id()", &store)),
+            value_bag(&gql_rows("MATCH ()-[r]->() RETURN element_id(r)", &store)),
+        );
+        // Vertex label() == its single label (Person x3, Project x1).
+        assert_eq!(
+            value_bag(&gremlin_rows("g.V().label().dedup()", &store)),
+            vec!["Str(\"Person\");", "Str(\"Project\");"],
+        );
+        // Edge label() == edge type, matching GQL type().
+        assert_eq!(
+            value_bag(&gremlin_rows("g.V().outE().label()", &store)),
+            value_bag(&gql_rows("MATCH ()-[r]->() RETURN type(r)", &store)),
+        );
+        // valueMap() is deferred (properties-only map with list-wrapped values).
+        assert!(super::parse("g.V().valueMap()").is_err());
     }
 
     /// `repeat(<hop>).times(n)` applies a single anonymous hop exactly n times — a

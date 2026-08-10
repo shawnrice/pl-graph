@@ -3491,6 +3491,32 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                     .collect();
                 return Ok(Col::Gen(out));
             }
+            // `element_label(node|edge)` → a SINGLE label string (Gremlin `label()`):
+            // a vertex's label, an edge's type. Not user-callable from GQL (which has
+            // list-valued `labels()` and `type()`); emitted only by the Gremlin
+            // front-end. A vertex with several labels yields the first in the store's
+            // canonical (sorted) order, consistent with GQL `labels()`; a vertex with
+            // no label yields Null.
+            if name == "element_label" {
+                let arg = eval(&args[0], store, batch)?;
+                let n = batch.rows();
+                let out: Vec<Value> = (0..n)
+                    .map(|i| match arg.value_at(i) {
+                        Value::Num(id) if matches!(arg, Col::Nodes(_)) => {
+                            let mut ls = store.labels_of(id as u32);
+                            ls.sort();
+                            ls.into_iter()
+                                .next()
+                                .map_or(Value::Null, |l| Value::Str(l.into()))
+                        }
+                        Value::Num(eid) if matches!(arg, Col::Edges(_)) => store
+                            .edge_type_name(eid as u32)
+                            .map_or(Value::Null, |t| Value::Str(t.into())),
+                        _ => Value::Null,
+                    })
+                    .collect();
+                return Ok(Col::Gen(out));
+            }
             // Element functions need the STORE and the element identity (a node/edge
             // slot), which the pure-value `call_scalar` cannot see — handle them
             // here off the evaluated argument column.
