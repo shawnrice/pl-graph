@@ -69,7 +69,7 @@ fn plan_and_time(lang: &Lang, q: &str, store: &Store) -> Result<(String, f64, us
         Gql => lenke_engine::gql::parse(q),
         Gremlin => lenke_engine::gremlin::parse(q),
     }?;
-    let plan = lenke_engine::opt::optimize(raw);
+    let plan = lenke_engine::opt::optimize_indexed(raw, store);
     let plan_str = format!("{plan:?}");
     let mut best = f64::MAX;
     let mut rows = 0;

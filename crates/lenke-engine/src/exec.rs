@@ -1587,13 +1587,15 @@ fn index_seek_ids(store: &Store, label: &str, key: &str, value: &Value) -> Vec<u
     }
     match store.index_lookup(key, value) {
         Some(cands) => {
-            // group_key == equals for a finite, non-null value, so the index
-            // bucket is exact; just intersect with the label.
-            let in_label: std::collections::HashSet<u32> =
-                store.nodes_with_label(label).iter().copied().collect();
+            // group_key == equals for a finite, non-null value, so the index bucket
+            // is exact; intersect with the label. The label bucket is sorted
+            // ascending, so binary-search each (usually few) candidate rather than
+            // building a HashSet of the WHOLE label per query — that O(label) build
+            // made an indexed seek SLOWER than the typed scan it was meant to beat.
+            let bucket = store.nodes_with_label(label);
             cands
                 .into_iter()
-                .filter(|id| in_label.contains(id))
+                .filter(|id| bucket.binary_search(id).is_ok())
                 .collect()
         }
         None => {

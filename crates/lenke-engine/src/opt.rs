@@ -10,6 +10,7 @@
 //! SHAPE changed as intended.
 
 use crate::ir::{CompareOp, Expr, Plan};
+use crate::store::Store;
 use crate::value::Value;
 
 /// Frontier width of a PURE Scan/Expand chain — `Some(width)` when `plan` is only
@@ -28,12 +29,57 @@ fn pure_chain_width(plan: &Plan) -> Option<usize> {
     }
 }
 
-/// Apply the rule set to a fixpoint (bounded, so a misbehaving rule cannot spin).
+/// What the planner may know about the store's PHYSICAL indexes, so a seed rule can
+/// prefer a conjunct backed by a real index over one that would only scan. Kept
+/// abstract (not `&Store`) so the optimizer stays a pure `Plan -> Plan` transform and
+/// so callers with no store (plan-shape tests) can pass [`NoIndexes`].
+pub trait IndexOracle {
+    /// A hash index exists on the exact (possibly dotted) property path `key`.
+    fn has_hash_index(&self, key: &str) -> bool;
+    /// A range index exists on property `key`.
+    fn has_range_index(&self, key: &str) -> bool;
+}
+
+/// The "no physical indexes" oracle: every seed becomes a scan-fallback seek, which
+/// is exactly the behavior before the optimizer could see indexes. Used by the
+/// store-less [`optimize`] and by plan-shape tests.
+pub struct NoIndexes;
+impl IndexOracle for NoIndexes {
+    fn has_hash_index(&self, _key: &str) -> bool {
+        false
+    }
+    fn has_range_index(&self, _key: &str) -> bool {
+        false
+    }
+}
+
+impl IndexOracle for crate::store::Store {
+    fn has_hash_index(&self, key: &str) -> bool {
+        Store::has_hash_index(self, key)
+    }
+    fn has_range_index(&self, key: &str) -> bool {
+        Store::has_range_index(self, key)
+    }
+}
+
+/// Apply the rule set to a fixpoint, blind to any physical indexes — a seedable
+/// predicate becomes a scan-fallback `IndexSeek`/`RangeSeek`. For index-aware
+/// planning (which conjunct of a multi-predicate filter to seed), use
+/// [`optimize_indexed`] with the store.
 #[must_use]
 pub fn optimize(plan: Plan) -> Plan {
+    optimize_indexed(plan, &NoIndexes)
+}
+
+/// Apply the rule set to a fixpoint, letting `idx` steer index-sensitive rules (the
+/// multi-predicate seed picks a conjunct backed by a real index when one exists —
+/// otherwise it still seeds one conjunct onto the typed-scan fast path, since a
+/// blind seek scans anyway). Bounded so a misbehaving rule cannot spin.
+#[must_use]
+pub fn optimize_indexed(plan: Plan, idx: &dyn IndexOracle) -> Plan {
     let mut plan = plan;
     for _ in 0..64 {
-        let (next, changed) = rewrite(plan);
+        let (next, changed) = rewrite(plan, idx);
         plan = next;
         if !changed {
             break;
@@ -44,14 +90,14 @@ pub fn optimize(plan: Plan) -> Plan {
 
 /// Rewrite one node: optimize its children, then apply the local rules to it.
 /// Returns the new plan and whether anything changed.
-fn rewrite(plan: Plan) -> (Plan, bool) {
-    let (plan, child_changed) = map_children(plan);
-    let (plan, local_changed) = apply_local(plan);
+fn rewrite(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
+    let (plan, child_changed) = map_children(plan, idx);
+    let (plan, local_changed) = apply_local(plan, idx);
     (plan, child_changed || local_changed)
 }
 
 /// Rebuild a node with its children individually rewritten.
-fn map_children(plan: Plan) -> (Plan, bool) {
+fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
     match plan {
         // Leaves: no children to rewrite. (`Row` only lives inside an EXISTS body,
         // which the optimizer never descends into, but it is still a leaf.)
@@ -70,7 +116,7 @@ fn map_children(plan: Plan) -> (Plan, bool) {
             edge_label,
             bind_edge,
         } => {
-            let (i, c) = rewrite(*input);
+            let (i, c) = rewrite(*input, idx);
             (
                 Plan::Expand {
                     input: Box::new(i),
@@ -93,7 +139,7 @@ fn map_children(plan: Plan) -> (Plan, bool) {
             qhi,
             bind_edge,
         } => {
-            let (i, c) = rewrite(*input);
+            let (i, c) = rewrite(*input, idx);
             (
                 Plan::IntervalExpand {
                     input: Box::new(i),
@@ -118,7 +164,7 @@ fn map_children(plan: Plan) -> (Plan, bool) {
             max,
             trail,
         } => {
-            let (i, c) = rewrite(*input);
+            let (i, c) = rewrite(*input, idx);
             (
                 Plan::VarLength {
                     input: Box::new(i),
@@ -139,7 +185,7 @@ fn map_children(plan: Plan) -> (Plan, bool) {
             edge_label,
             max,
         } => {
-            let (i, c) = rewrite(*input);
+            let (i, c) = rewrite(*input, idx);
             (
                 Plan::ShortestPath {
                     input: Box::new(i),
@@ -152,7 +198,7 @@ fn map_children(plan: Plan) -> (Plan, bool) {
             )
         }
         Plan::Filter { input, pred } => {
-            let (i, c) = rewrite(*input);
+            let (i, c) = rewrite(*input, idx);
             (
                 Plan::Filter {
                     input: Box::new(i),
@@ -166,7 +212,7 @@ fn map_children(plan: Plan) -> (Plan, bool) {
             keys,
             mut aggs,
         } => {
-            let (i, c) = rewrite(*input);
+            let (i, c) = rewrite(*input, idx);
             // `count(x)` over a bound ELEMENT is `count(*)`: a pattern variable bound
             // to a node/edge is never null, so counting it counts every row. When the
             // input is a pure Scan/Expand chain EVERY slot is such an element, so
@@ -201,7 +247,7 @@ fn map_children(plan: Plan) -> (Plan, bool) {
             skip,
             limit,
         } => {
-            let (i, c) = rewrite(*input);
+            let (i, c) = rewrite(*input, idx);
             // Fuse a pure PAGE over a pure SORT into one OrderPage. Gremlin lowers
             // `order().by(k)` then `range(lo, hi)` to two stacked OrderPages — an inner
             // full sort (no page) and an outer page (no keys) — so the sort ran over
@@ -258,7 +304,7 @@ fn map_children(plan: Plan) -> (Plan, bool) {
             )
         }
         Plan::Project { input, items } => {
-            let (i, c) = rewrite(*input);
+            let (i, c) = rewrite(*input, idx);
             (
                 Plan::Project {
                     input: Box::new(i),
@@ -268,11 +314,11 @@ fn map_children(plan: Plan) -> (Plan, bool) {
             )
         }
         Plan::Distinct { input } => {
-            let (i, c) = rewrite(*input);
+            let (i, c) = rewrite(*input, idx);
             (Plan::Distinct { input: Box::new(i) }, c)
         }
         Plan::SortLocal { input, descending } => {
-            let (i, c) = rewrite(*input);
+            let (i, c) = rewrite(*input, idx);
             (
                 Plan::SortLocal {
                     input: Box::new(i),
@@ -282,7 +328,7 @@ fn map_children(plan: Plan) -> (Plan, bool) {
             )
         }
         Plan::Update { input, ops } => {
-            let (i, c) = rewrite(*input);
+            let (i, c) = rewrite(*input, idx);
             (
                 Plan::Update {
                     input: Box::new(i),
@@ -292,8 +338,8 @@ fn map_children(plan: Plan) -> (Plan, bool) {
             )
         }
         Plan::Join { left, right, on } => {
-            let (l, cl) = rewrite(*left);
-            let (r, cr) = rewrite(*right);
+            let (l, cl) = rewrite(*left, idx);
+            let (r, cr) = rewrite(*right, idx);
             (
                 Plan::Join {
                     left: Box::new(l),
@@ -313,7 +359,7 @@ fn map_children(plan: Plan) -> (Plan, bool) {
             yields,
             outer_width,
         } => {
-            let (i, c) = rewrite(*input);
+            let (i, c) = rewrite(*input, idx);
             (
                 Plan::CallInline {
                     input: Box::new(i),
@@ -338,11 +384,15 @@ enum Seed {
 }
 
 /// Given a conjunction `a AND b AND …`, pick ONE conjunct to seed and return it
-/// with the residual predicate (the remaining conjuncts, re-`AND`ed). Prefers an
-/// equality seed over a range. `None` if the predicate is not an `AND`, or no
-/// conjunct is seekable — so a single comparison still flows through the plain
-/// `seek_target`/`range_seek_target` arms above, unchanged.
-fn seed_from_conjuncts(pred: &Expr) -> Option<(Seed, Option<Expr>)> {
+/// with the residual predicate (the remaining conjuncts, re-`AND`ed). The pick is
+/// INDEX-AWARE: an equality/range conjunct backed by a real physical index wins,
+/// because that seek reads the index instead of scanning; only when nothing is
+/// indexed does it fall back to seeding an equality (then a range) onto the
+/// typed-scan fast path — a blind seek would scan the whole label anyway, so which
+/// unindexed conjunct is chosen changes no cost, just avoids the far slower
+/// `Filter(And(…))(Scan)`. `None` if the predicate is not an `AND`, or no conjunct
+/// is seekable.
+fn seed_from_conjuncts(pred: &Expr, idx: &dyn IndexOracle) -> Option<(Seed, Option<Expr>)> {
     fn flatten<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
         match e {
             Expr::And(a, b) => {
@@ -357,10 +407,19 @@ fn seed_from_conjuncts(pred: &Expr) -> Option<(Seed, Option<Expr>)> {
     if conjuncts.len() < 2 {
         return None; // not a conjunction — the single-comparison arms handle it
     }
-    // Prefer an equality conjunct (more selective seek); fall back to a range.
+    // Selection priority (best first): an INDEXED equality, then an INDEXED range,
+    // then any equality (typed-scan fast path), then any range.
+    let eq_key = |c: &Expr| seek_target(c).map(|(k, _)| k);
+    let range_key = |c: &Expr| range_seek_target(c).map(|(k, _, _)| k);
     let pick = conjuncts
         .iter()
-        .position(|c| seek_target(c).is_some())
+        .position(|c| eq_key(c).is_some_and(|k| idx.has_hash_index(&k)))
+        .or_else(|| {
+            conjuncts
+                .iter()
+                .position(|c| range_key(c).is_some_and(|k| idx.has_range_index(&k)))
+        })
+        .or_else(|| conjuncts.iter().position(|c| seek_target(c).is_some()))
         .or_else(|| {
             conjuncts
                 .iter()
@@ -449,7 +508,7 @@ fn range_seek_target(pred: &Expr) -> Option<(String, CompareOp, Value)> {
 }
 
 /// The local rules, tried in order at a single node.
-fn apply_local(plan: Plan) -> (Plan, bool) {
+fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
     match plan {
         Plan::Filter { input, pred } => match *input {
             // filter-merge: `Filter(Filter(x, p2), p1)` -> `Filter(x, p1 AND p2)`.
@@ -564,7 +623,7 @@ fn apply_local(plan: Plan) -> (Plan, bool) {
                         },
                         true,
                     )
-                } else if let Some((seed, residual)) = seed_from_conjuncts(&pred) {
+                } else if let Some((seed, residual)) = seed_from_conjuncts(&pred, idx) {
                     // `Filter(a = x AND …)(Scan)` — seed ONE conjunct and keep the rest
                     // as a residual filter over the seek, so `WHERE k = x AND …` costs
                     // the same as the inline `(n:L {k: x, …})` (which seeds because it
@@ -1237,6 +1296,54 @@ mod tests {
         ] {
             assert_rows_preserved(&crate::gql::parse(q).unwrap(), &store);
         }
+    }
+
+    /// The multi-predicate seed is INDEX-AWARE: it seeds the conjunct backed by a
+    /// real index (so the seek reads the index, not a scan), falling back to the
+    /// first seekable conjunct only when nothing is indexed. The store-less
+    /// `optimize` stays blind (unchanged behavior).
+    #[test]
+    fn multi_predicate_seed_prefers_the_indexed_conjunct() {
+        let fresh = || {
+            let mut b = Builder::default();
+            for i in 0..40u32 {
+                b.node(
+                    &["Person"],
+                    &[
+                        ("dept", s(if i % 2 == 0 { "eng" } else { "sales" })),
+                        ("age", n(f64::from(i % 10))),
+                    ],
+                );
+            }
+            b.build()
+        };
+        let q = "MATCH (n:Person) WHERE n.dept = 'eng' AND n.age = 4 RETURN n.age AS a";
+        let plan = crate::gql::parse(q).unwrap();
+        let seeded_key = |store: &Store| -> Option<String> {
+            fn find(p: &Plan) -> Option<String> {
+                match p {
+                    Plan::IndexSeek { key, .. } => Some(key.clone()),
+                    Plan::Filter { input, .. }
+                    | Plan::Project { input, .. }
+                    | Plan::Aggregate { input, .. } => find(input),
+                    _ => None,
+                }
+            }
+            find(&optimize_indexed(plan.clone(), store))
+        };
+
+        // No index → first seekable conjunct (dept).
+        let mut plain = fresh();
+        assert_eq!(seeded_key(&plain).as_deref(), Some("dept"));
+        // Index on age → the seed switches to age (the indexed conjunct).
+        plain.create_index("age");
+        assert_eq!(seeded_key(&plain).as_deref(), Some("age"));
+        // Index on dept instead → seeds dept.
+        let mut dept_idx = fresh();
+        dept_idx.create_index("dept");
+        assert_eq!(seeded_key(&dept_idx).as_deref(), Some("dept"));
+        // The store-less path is unchanged (blind): seeds the first conjunct.
+        assert!(format!("{:?}", optimize(plan)).contains("key: \"dept\""));
     }
 
     /// Gremlin `order().by(k)` + `range(lo, hi)` lowers to two stacked OrderPages;

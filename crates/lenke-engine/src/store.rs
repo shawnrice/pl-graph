@@ -1319,6 +1319,23 @@ impl Store {
         self.indexes.iter().any(|i| i.base() == base)
     }
 
+    /// Whether a HASH index exists on the exact (possibly dotted) property path
+    /// `key` — what an `IndexSeek` on that key would actually use. The planner reads
+    /// this to seed a real index rather than a scan-fallback `IndexSeek`.
+    #[must_use]
+    pub fn has_hash_index(&self, key: &str) -> bool {
+        self.indexes
+            .iter()
+            .any(|i| i.path.iter().map(String::as_str).eq(key.split('.')))
+    }
+
+    /// Whether a RANGE index exists on property `key` — what a `RangeSeek` on that
+    /// key would actually use.
+    #[must_use]
+    pub fn has_range_index(&self, key: &str) -> bool {
+        self.is_range_indexed(key)
+    }
+
     /// Candidate node ids (ANY label) whose property PATH `key` groups equal to
     /// `value`, or `None` if no index exists on that path. Deleted ids filtered.
     #[must_use]
@@ -1870,7 +1887,14 @@ impl Store {
                     }
                 }
                 for l in labels {
-                    self.by_label.entry(l).or_default().push(id);
+                    // Re-insert in SORTED position (not push): a delete removed this
+                    // id from the middle, so appending would leave the bucket
+                    // unsorted, breaking both the id-order scan seed and the
+                    // binary-search label intersection in `index_seek_ids`. Adds are
+                    // monotonic and deletes retain order, so this keeps buckets sorted.
+                    let bucket = self.by_label.entry(l).or_default();
+                    let pos = bucket.partition_point(|&x| x < id);
+                    bucket.insert(pos, id);
                 }
                 for (k, present, value) in props {
                     if present {
@@ -2397,6 +2421,30 @@ mod tests {
     /// `delete_node` tombstones the node, detaches its edges from the neighbours'
     /// mirror lists, clears its props, and drops it from scans. Hand-traced on
     /// a→b, a→c, b→c: deleting b leaves a→c only, c with one incoming (from a).
+    #[test]
+    fn label_bucket_stays_sorted_through_delete_rollback() {
+        let mut st = Builder::default().build();
+        let ids: Vec<u32> = (0..6)
+            .map(|i| st.add_node(&["P"], &[("age", n(f64::from(i)))]))
+            .collect();
+        st.create_index("age");
+        // Delete a MIDDLE node in a transaction, then roll back (un-tombstone).
+        st.begin();
+        st.delete_node(ids[2]);
+        st.rollback();
+        // The label bucket must be sorted again — the restore re-inserts in place,
+        // not appended — so the id-order scan seed and the binary-search label
+        // intersection in `index_seek_ids` stay correct.
+        let bucket = st.nodes_with_label("P");
+        assert_eq!(bucket.len(), 6);
+        assert!(
+            bucket.windows(2).all(|w| w[0] < w[1]),
+            "bucket not sorted after rollback: {bucket:?}"
+        );
+        // And the hash index still resolves the restored middle node.
+        assert_eq!(st.index_lookup("age", &n(2.0)).unwrap(), vec![ids[2]]);
+    }
+
     #[test]
     fn delete_node_tombstones_and_cleans_up() {
         let mut st = Builder::default().build();

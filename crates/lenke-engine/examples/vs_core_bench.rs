@@ -72,7 +72,7 @@ fn core_fixture(n: u32, deg: u32) -> lenke_core::graph::Graph {
 }
 
 fn time_engine(store: &Store, q: &str, reps: usize) -> (f64, usize) {
-    let plan = lenke_engine::opt::optimize(lenke_engine::gql::parse(q).unwrap());
+    let plan = lenke_engine::opt::optimize_indexed(lenke_engine::gql::parse(q).unwrap(), store);
     let mut best = f64::MAX;
     let mut rows = 0;
     for _ in 0..reps {
