@@ -22,6 +22,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         slots: 1,
         labels: HashMap::new(),
         edge_hop: None,
+        pending_repeat: None,
     };
     p.traversal()
 }
@@ -142,6 +143,12 @@ struct Parser {
     /// `step`, so a vertex move only resolves when it IMMEDIATELY follows the edge
     /// hop — exactly Gremlin's requirement.
     edge_hop: Option<(usize, Dir)>,
+    /// Set by `repeat(<hop>)` and consumed by the very next `times(n)`: the single
+    /// hop `(direction, edge label)` the loop body applies. `repeat` alone is an
+    /// unbounded loop (unsupported), so the body is held here until `times` closes
+    /// it into a fixed-length `VarLength{min:n,max:n}`. A `repeat` not immediately
+    /// followed by `times` is an error (see the guard at the top of `step`).
+    pending_repeat: Option<(Dir, Option<String>)>,
 }
 
 impl Parser {
@@ -259,6 +266,9 @@ impl Parser {
             self.pos += 1;
             plan = self.step(plan)?;
         }
+        if self.pending_repeat.is_some() {
+            return Err("repeat(<hop>) must be followed by times(n)".into());
+        }
         if self.pos != self.toks.len() {
             return Err(format!("unexpected trailing input at token {}", self.pos));
         }
@@ -272,6 +282,11 @@ impl Parser {
         // An edge hop's landed endpoint is only reachable by the vertex move that
         // IMMEDIATELY follows it; consume the record here so any other step clears it.
         let prev_edge_hop = self.edge_hop.take();
+        // A `repeat(body)` is only valid when closed by the very next `times(n)`.
+        let prev_repeat = self.pending_repeat.take();
+        if prev_repeat.is_some() && lname != "times" {
+            return Err("repeat(<hop>) must be immediately followed by times(n)".into());
+        }
 
         // --- write steps ---
         if lname == "property" {
@@ -371,6 +386,30 @@ impl Parser {
                 self.current = self.slots;
                 self.slots += 1;
                 plan.expand(from, dir, edge_label)
+            }
+            "repeat" => {
+                // `repeat(<hop>)` v1: the body is a SINGLE anonymous hop
+                // (`out`/`in`/`both`, optionally `__`-prefixed). Held pending until
+                // the following `times(n)` closes it into a fixed-length walk. The
+                // LParen was already consumed at the top of `step`.
+                let (dir, label) = self.repeat_body()?;
+                self.expect(&Tok::RParen)?;
+                self.pending_repeat = Some((dir, label));
+                plan
+            }
+            "times" => {
+                let n = self.usize_arg()?;
+                self.expect(&Tok::RParen)?;
+                let (dir, label) =
+                    prev_repeat.ok_or("times(n) must immediately follow repeat(<hop>)")?;
+                // `repeat(out('L')).times(n)` applies the hop exactly n times — a
+                // WALK of length n (Gremlin allows revisiting edges, so trail=false,
+                // unlike GQL var-length which is a trail). min == max == n.
+                let n = u32::try_from(n).map_err(|_| "times(n): n too large")?;
+                let from = self.current;
+                self.current = self.slots;
+                self.slots += 1;
+                plan.var_length(from, dir, label.as_deref(), n, n, false)
             }
             "oute" | "ine" | "bothe" => {
                 // Edge-yielding hop: bind the traversed edge as a slot and leave the
@@ -848,6 +887,54 @@ impl Parser {
         }
     }
 
+    /// Parse a `repeat(...)` body — v1 accepts only a SINGLE anonymous hop:
+    /// `out('L')` / `in('L')` / `both('L')` (argless = any type), with an optional
+    /// leading `__.` (the TinkerPop anonymous-traversal spawn). Returns the hop's
+    /// `(direction, edge label)`. Multi-step bodies, nested repeats, filters, etc.
+    /// are deferred with an explicit error. The cursor starts just after `repeat(`
+    /// and stops at the body's closing `)` (left for the caller to consume).
+    fn repeat_body(&mut self) -> Result<(Dir, Option<String>), String> {
+        // Optional `__.` anonymous-traversal prefix.
+        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+            self.bump();
+            self.expect(&Tok::Dot)?;
+        }
+        let hop = self.ident()?;
+        let dir = match hop.to_ascii_lowercase().as_str() {
+            "out" => Dir::Out,
+            "in" => Dir::In,
+            "both" => Dir::Both,
+            other => {
+                return Err(format!(
+                    "repeat() body must be a single out/in/both hop, got `{other}`"
+                ))
+            }
+        };
+        self.expect(&Tok::LParen)?;
+        let mut labels: Vec<String> = Vec::new();
+        if !matches!(self.peek(), Some(Tok::RParen)) {
+            loop {
+                labels.push(self.str_arg()?);
+                if self.peek() == Some(&Tok::Comma) {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        let label = match labels.len() {
+            0 => None,
+            1 => Some(labels.remove(0)),
+            _ => {
+                return Err(
+                    "repeat() body hop with multiple edge labels is not yet supported".into(),
+                )
+            }
+        };
+        Ok((dir, label))
+    }
+
     /// Consume an optional `Scope` inside `order(...)`: bare `local`/`global`, or
     /// `Scope.local`/`Scope.global`. Returns true for local; no arg defaults to
     /// global. Leaves the cursor at the closing `)`.
@@ -984,6 +1071,46 @@ mod tests {
             gone.is_empty(),
             "missing id must contribute nothing: {gone:?}"
         );
+    }
+
+    /// `repeat(<hop>).times(n)` applies a single anonymous hop exactly n times — a
+    /// walk of length n. Verified against the equivalent chain of n plain hops (both
+    /// are walks, so this exercises `VarLength{min:n,max:n,trail:false}` end to end);
+    /// GQL var-length is a TRAIL, so the chained-hop equivalent is the right oracle.
+    #[test]
+    fn gremlin_repeat_times_fixed_length_walk() {
+        let store = social();
+        // times(n) == n chained hops, for out and both, by rows and by count.
+        for (repeat_form, chain_form) in [
+            (
+                "g.V().repeat(out('KNOWS')).times(1).values('name')",
+                "g.V().out('KNOWS').values('name')",
+            ),
+            (
+                "g.V().repeat(out('KNOWS')).times(2).values('name')",
+                "g.V().out('KNOWS').out('KNOWS').values('name')",
+            ),
+            (
+                "g.V().repeat(__.out('KNOWS')).times(2).values('name')",
+                "g.V().out('KNOWS').out('KNOWS').values('name')",
+            ),
+            (
+                "g.V().repeat(both('KNOWS')).times(2).count()",
+                "g.V().both('KNOWS').both('KNOWS').count()",
+            ),
+        ] {
+            assert_eq!(
+                value_bag(&gremlin_rows(repeat_form, &store)),
+                value_bag(&gremlin_rows(chain_form, &store)),
+                "{repeat_form} must equal {chain_form}",
+            );
+        }
+        // Deferred / malformed forms error rather than silently mis-answer.
+        assert!(super::parse("g.V().repeat(out('KNOWS'))").is_err()); // bare repeat = unbounded
+        assert!(super::parse("g.V().repeat(out('KNOWS')).values('name')").is_err()); // not closed by times
+        assert!(super::parse("g.V().times(2)").is_err()); // times without repeat
+        assert!(super::parse("g.V().repeat(out('A').out('B')).times(2)").is_err());
+        // multi-step body
     }
 
     /// `outE`/`inE`/`bothE` bind the traversed edge (current element becomes the
