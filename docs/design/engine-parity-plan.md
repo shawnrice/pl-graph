@@ -329,13 +329,24 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       is a single deterministic total order here (rank-based, never faults),
       whereas lenke-core's GQL raises E_INVALID_VALUE — a deliberate choice so
       sort/group/min-max stay total; equality already agrees (cross-type false).
-- [~] G4. Interval/temporal edge index — DEFERRED. It is a result-INVARIANT
-  optimization with NO consumer yet: nothing produces an "edges overlapping
-  interval" seek (traversal is adjacency-driven + edge-prop post-filter; edges
-  have no columnar/interval store, only a boxed eid→value map). An RI-tree
-  foundation with no query path and no benchmark is premature — CLAUDE.md is
-  emphatic that such perf must be MEASURED. Revisit with an edge-temporal seek
-  query shape + planner rule (G4b) and a benchmark.
+- G4. Interval/temporal edge index, built measured-first, split. The consumer
+  IS expressible in this adjacency-driven engine after all: a high-degree node
+  whose edges carry `[vf, vt]` intervals, queried "as of T"
+  (`MATCH (p)-[r:HELD]->() WHERE r.vf <= T AND r.vt >= T`) — the bitemporal shape.
+  - [x] G4a. Benchmark harness: `examples/interval_bench.rs` times the as-of
+        overlap count over a node's time-versioned edges. BASELINE (min of 7,
+        release): 20k×8 = 31ms, 20k×64 = 361ms, 20k×512 = **4.08s**, 100k×64 =
+        2.26s (~400ns/edge). The finding: the cost is NOT adjacency scan — it is
+        the BOXED edge-prop post-filter (`vf` and `vt` are each a String-keyed +
+        eid-keyed HashMap probe, per edge). An interval index that stores the
+        intervals INLINE and seeks overlaps sidesteps those probes entirely, so
+        the win should be large (unlike G5's marginal case).
+  - [ ] G4b. Opt-in per-node interval index + planner seek: store each node's
+        edges as `(lo, hi, eid, nbr)` for a declared `(lo_key, hi_key)` pair; an
+        overlap query `[qlo, qhi]` seeds from the selective axis and post-filters
+        the other (the bitemporal-index FIRM rule: never intersect both stabs).
+        Planner recognizes `r.lo <= X AND r.hi >= Y` on a bound rel-var and routes
+        the expand to the seek. Re-measure.
 - G5. Edge-type index (type-filtered `expand`), built measured-first, split:
   - [x] G5a. Benchmark harness: `examples/expand_bench.rs` sweeps degree ×
         edge-type count (per CLAUDE.md — vary degree and the edge:type ratio) and
