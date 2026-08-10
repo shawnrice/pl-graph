@@ -444,7 +444,8 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::RangeSeek { .. }
         | Plan::Insert { .. }
         | Plan::Merge { .. }
-        | Plan::AddEdge { .. } => false,
+        | Plan::AddEdge { .. }
+        | Plan::CallProcedure { .. } => false,
         Plan::Expand { input, .. }
         | Plan::VarLength { input, .. }
         | Plan::ShortestPath { input, .. }
@@ -666,6 +667,16 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // Carry any path the sub-rows accumulated (present only under lineage).
             out.lineage = sub.lineage;
             out
+        }
+        Plan::CallProcedure { name, config } => {
+            // Run the named graph algorithm over the whole store into a two-slot
+            // batch: node ids, then the per-node result. The parser validates the
+            // name, so an unknown one here is defensive.
+            let results = crate::algo::run_procedure(store, name, config)
+                .ok_or_else(|| format!("unknown procedure `{name}`"))?;
+            let ids: Vec<u32> = results.iter().map(|(v, _)| *v).collect();
+            let vals: Vec<f64> = results.iter().map(|(_, r)| *r).collect();
+            Batch::of(vec![Col::Nodes(ids), Col::Num(vals)])
         }
     })
 }

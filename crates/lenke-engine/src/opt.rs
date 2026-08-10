@@ -45,7 +45,8 @@ fn map_children(plan: Plan) -> (Plan, bool) {
         | Plan::RangeSeek { .. }
         | Plan::Insert { .. }
         | Plan::Merge { .. }
-        | Plan::AddEdge { .. }) => (p, false),
+        | Plan::AddEdge { .. }
+        | Plan::CallProcedure { .. }) => (p, false),
         Plan::Expand {
             input,
             from,
@@ -425,6 +426,8 @@ fn merge_max(a: Option<usize>, b: Option<usize>) -> Option<usize> {
 fn width(plan: &Plan) -> usize {
     match plan {
         Plan::Scan { .. } | Plan::IndexSeek { .. } | Plan::RangeSeek { .. } => 1,
+        // A named procedure yields exactly two columns: node id + its result.
+        Plan::CallProcedure { .. } => 2,
         // `Row` never appears in an outer plan (it lives only in an EXISTS body,
         // which pushdown does not traverse); width is meaningless here.
         Plan::Row => 0,
@@ -818,7 +821,8 @@ mod tests {
             | Plan::RangeSeek { .. }
             | Plan::Insert { .. }
             | Plan::Merge { .. }
-            | Plan::AddEdge { .. } => false,
+            | Plan::AddEdge { .. }
+            | Plan::CallProcedure { .. } => false,
         }
     }
 

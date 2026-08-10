@@ -409,10 +409,16 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       (list/record/map columns) and the flatbuffer Arrow-IPC wrapper
       (`tableFromIPC`/DuckDB/Polars) that layers on these exact buffers — the
       large, TS-verifier-dependent envelope; deferred from I2a.
-- [ ] I3. Named-procedure `CALL name(cfg) [YIELD col [AS a], …]` (relocated from
-      F3): the ISO-conformant home for the I1 algorithms — the procedure catalog
-      IS those algorithms, so it must land after them. `OPTIONAL CALL` keeps the
-      outer row (yields null-filled) when the call is empty.
+- [x] I3. Named-procedure `CALL name(cfg) [YIELD col [AS a], …]` (relocated from
+      F3): the ISO home for the I1 algorithms. `Plan::CallProcedure{name,config}`
+      runs the algorithm over the store into a `[node, <result>]` batch; the parser
+      (a top-level `CALL` entry point) validates the snake_case name against the
+      catalog (degree/pagerank/connected_components/label_propagation, result cols
+      degree/score/componentId/label), parses the `{k:v}` config map, and wraps it
+      in a Project applying YIELD (select/rename; default = all columns), which can
+      feed further clauses. 3 tests (degree yield/default/rename + hand plan,
+      degree({direction}) + connected_components, unknown-proc/unknown-yield
+      errors). `OPTIONAL CALL` (null-fill) deferred.
 
 ### Phase J — Agreement
 

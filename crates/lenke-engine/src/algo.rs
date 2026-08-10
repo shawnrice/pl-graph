@@ -10,6 +10,7 @@
 
 use crate::ir::Dir;
 use crate::store::Store;
+use crate::value::Value;
 use std::collections::HashMap;
 
 /// PageRank defaults, matching lenke-core.
@@ -263,6 +264,75 @@ pub fn label_propagation(
         }
     }
     live.into_iter().map(|v| (v, labels[v as usize])).collect()
+}
+
+/// The built-in procedure catalog: a `CALL name(...)` procedure name → its
+/// non-`node` result column name (matching lenke-core's snake_case surface). The
+/// output columns of every procedure are `[node, <result>]`. `None` = unknown.
+#[must_use]
+pub fn procedure_result_col(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "degree" => "degree",
+        "pagerank" => "score",
+        "connected_components" => "componentId",
+        "label_propagation" => "label",
+        _ => return None,
+    })
+}
+
+/// Run a named procedure with its `{key: value}` config, returning `(node, value)`
+/// per node (component ids / labels surfaced as their `f64` node-id number). `None`
+/// for an unknown name (the parser normally rejects that first). Reuses the
+/// deterministic algorithms above.
+#[must_use]
+pub fn run_procedure(
+    store: &Store,
+    name: &str,
+    config: &[(String, Value)],
+) -> Option<Vec<(u32, f64)>> {
+    let str_of = |k: &str| {
+        config.iter().find(|(ck, _)| ck == k).and_then(|(_, v)| {
+            if let Value::Str(s) = v {
+                Some(s.as_ref())
+            } else {
+                None
+            }
+        })
+    };
+    let num_of = |k: &str| {
+        config.iter().find(|(ck, _)| ck == k).and_then(|(_, v)| {
+            if let Value::Num(n) = v {
+                Some(*n)
+            } else {
+                None
+            }
+        })
+    };
+    let dir = || match str_of("direction") {
+        Some("in") => Dir::In,
+        Some("both") => Dir::Both,
+        _ => Dir::Out,
+    };
+    Some(match name {
+        "degree" => degree(store, dir(), str_of("edgeType")),
+        "connected_components" => weakly_connected_components(store, str_of("edgeType"))
+            .into_iter()
+            .map(|(v, c)| (v, f64::from(c)))
+            .collect(),
+        "label_propagation" => {
+            let iters = num_of("iterations").map_or(DEFAULT_LABEL_ITERATIONS, |n| n as u32);
+            label_propagation(store, str_of("edgeType"), iters)
+                .into_iter()
+                .map(|(v, l)| (v, f64::from(l)))
+                .collect()
+        }
+        "pagerank" => {
+            let d = num_of("dampingFactor").unwrap_or(DEFAULT_DAMPING);
+            let iters = num_of("iterations").map_or(DEFAULT_PAGERANK_ITERATIONS, |n| n as u32);
+            pagerank(store, str_of("edgeType"), d, iters)
+        }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

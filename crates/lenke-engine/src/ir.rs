@@ -345,6 +345,16 @@ pub enum Plan {
         yields: Vec<(String, Expr)>,
         outer_width: usize,
     },
+    /// `CALL name(config)` — a named built-in procedure (a graph algorithm). A leaf
+    /// that runs the algorithm over the whole store and produces a two-slot batch:
+    /// slot 0 the node ids (`Col::Nodes`), slot 1 the per-node result (`Col::Num`).
+    /// `config` is the `{key: value}` argument map. The parser wraps this in a
+    /// Project naming the columns (`node` + the procedure's result column) and
+    /// applying any `YIELD`.
+    CallProcedure {
+        name: String,
+        config: Vec<(String, Value)>,
+    },
     /// A write: create `nodes` (each with labels and inline properties) and the
     /// `edges` among them (`from`/`to` index into `nodes`). A leaf plan — it reads
     /// no input and produces no rows; it is run through the mutable executor

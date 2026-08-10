@@ -275,8 +275,14 @@ impl Parser {
         if self.eat_kw("INSERT") {
             return self.insert();
         }
+        // A top-level named-procedure call: `CALL name(config) [YIELD …]` invoking a
+        // built-in graph algorithm. (The inline `CALL (scope) { … }` form only
+        // occurs after a MATCH, inside `query_tail`.)
+        if self.eat_kw("CALL") {
+            return self.call_procedure();
+        }
         if !self.eat_kw("MATCH") {
-            return Err("expected MATCH or INSERT".into());
+            return Err("expected MATCH, INSERT, or CALL".into());
         }
         // Named-path form: `MATCH p = ANY SHORTEST (a)-[:R]->*(b)`. The path
         // variable binds to the row's path (lineage); the rest of the query
@@ -964,6 +970,65 @@ impl Parser {
             yields,
             outer_width,
         })
+    }
+
+    /// A top-level named-procedure call `CALL name(config) [YIELD col [AS a], …]`.
+    /// The procedure (a built-in graph algorithm) produces `[node, <result>]`; a
+    /// YIELD selects/renames those columns (default = both). The result flows on to
+    /// any following clause (RETURN/WITH/…), or the CALL is a complete statement.
+    fn call_procedure(&mut self) -> Result<Plan, String> {
+        let name = self.ident()?;
+        let result_col = crate::algo::procedure_result_col(&name)
+            .ok_or_else(|| format!("unknown procedure `{name}`"))?;
+        self.expect(&Tok::LParen)?;
+        let config = if matches!(self.peek(), Some(Tok::LBrace)) {
+            self.props()?
+        } else {
+            Vec::new()
+        };
+        self.expect(&Tok::RParen)?;
+        // The procedure's output columns: node at slot 0, result at slot 1.
+        self.scope = HashMap::from([("node".to_string(), 0), (result_col.to_string(), 1)]);
+        self.slots = 2;
+
+        let items: Vec<(String, Expr)> = if self.eat_kw("YIELD") {
+            let mut ys = Vec::new();
+            loop {
+                let col = self.ident()?;
+                let slot = *self
+                    .scope
+                    .get(&col)
+                    .ok_or_else(|| format!("YIELD `{col}` is not a procedure output"))?;
+                let alias = if self.eat_kw("AS") {
+                    self.ident()?
+                } else {
+                    col
+                };
+                ys.push((alias, Expr::Slot(slot)));
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            ys
+        } else {
+            vec![
+                ("node".into(), Expr::Slot(0)),
+                (result_col.to_string(), Expr::Slot(1)),
+            ]
+        };
+        // Rebind scope to the (aliased) yielded columns for any following clause.
+        self.scope = items
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| (n.clone(), i))
+            .collect();
+        self.slots = items.len();
+        let plan = Plan::CallProcedure { name, config }.project(items);
+        if self.pos == self.toks.len() {
+            Ok(plan)
+        } else {
+            self.query_tail(plan)
+        }
     }
 
     /// An optional `{n}` / `{n,m}` / `{n,}` quantifier after a relationship. An
@@ -2659,6 +2724,86 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("E_REQUIRED"), "got: {err}");
         assert_eq!(store.node_count(), before);
+    }
+
+    /// A directed triangle a→b→c→a (ids 0,1,2) + an isolated node d (3).
+    fn triangle_store() -> Store {
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[]);
+        let bb = b.node(&["N"], &[]);
+        let c = b.node(&["N"], &[]);
+        b.node(&["N"], &[]);
+        b.edge(a, bb, "R");
+        b.edge(bb, c, "R");
+        b.edge(c, a, "R");
+        b.build()
+    }
+
+    #[test]
+    fn call_degree_procedure_yield_and_default() {
+        use crate::ir::{Expr, Plan};
+        let store = triangle_store();
+        let rows_of = |q: &str| -> Vec<(f64, f64)> {
+            run(&super::parse(q).unwrap(), &store)
+                .rows
+                .iter()
+                .map(|r| (num(&r[0]), num(&r[1])))
+                .collect()
+        };
+        // Out-degrees: each triangle node 1, the isolated node 0.
+        let want = vec![(0.0, 1.0), (1.0, 1.0), (2.0, 1.0), (3.0, 0.0)];
+        assert_eq!(rows_of("CALL degree() YIELD node, degree"), want);
+        // No YIELD → the default [node, <result>] columns.
+        assert_eq!(rows_of("CALL degree()"), want);
+        // YIELD renames the output columns.
+        let out = run(
+            &super::parse("CALL degree() YIELD node AS n, degree AS d").unwrap(),
+            &store,
+        );
+        assert_eq!(out.names, vec!["n".to_string(), "d".to_string()]);
+
+        // Parse→run matches the hand-built plan (CallProcedure under a Project).
+        let hand = Plan::CallProcedure {
+            name: "degree".into(),
+            config: vec![],
+        }
+        .project(vec![
+            ("node".into(), Expr::Slot(0)),
+            ("degree".into(), Expr::Slot(1)),
+        ]);
+        assert_same("CALL degree()", &hand, &store);
+    }
+
+    #[test]
+    fn call_procedure_config_and_components() {
+        let store = triangle_store();
+        // degree with direction=both: each triangle node 2, isolated 0.
+        let both: Vec<f64> = run(
+            &super::parse("CALL degree({direction: 'both'}) YIELD degree").unwrap(),
+            &store,
+        )
+        .rows
+        .iter()
+        .map(|r| num(&r[0]))
+        .collect();
+        assert_eq!(both, vec![2.0, 2.0, 2.0, 0.0]);
+        // connected_components: triangle → component 0, isolated → 3.
+        let comps: Vec<(f64, f64)> = run(
+            &super::parse("CALL connected_components() YIELD node, componentId").unwrap(),
+            &store,
+        )
+        .rows
+        .iter()
+        .map(|r| (num(&r[0]), num(&r[1])))
+        .collect();
+        assert_eq!(comps, vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 3.0)]);
+    }
+
+    #[test]
+    fn call_procedure_errors() {
+        // Unknown procedure and unknown YIELD column are both parse errors.
+        assert!(super::parse("CALL bogus()").is_err());
+        assert!(super::parse("CALL degree() YIELD nope").is_err());
     }
 
     #[test]
