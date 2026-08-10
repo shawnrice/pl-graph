@@ -637,6 +637,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .or_else(|| try_scan_distinct_count(input, keys, aggs, store))
                 .or_else(|| try_fused_count(input, keys, aggs, store))
                 .or_else(|| try_node_grouped_count(input, keys, aggs, store))
+                .or_else(|| try_scan_group_agg(input, keys, aggs, store))
             {
                 b
             } else if let Some(b) = try_frontier_aggregate(input, keys, aggs, store)? {
@@ -1804,6 +1805,167 @@ fn scan_visit<F: FnMut(usize)>(store: &Store, label: &Option<String>, mut f: F) 
             }),
         }
     }
+}
+
+/// A group's accumulators: row count (for `count(*)`) plus `(total, count, best)`
+/// per numeric aggregate.
+struct GroupAcc {
+    rows: u64,
+    aggs: Vec<(f64, u64, Option<f64>)>,
+}
+
+/// Fused single-key grouped aggregate over a bare `Scan`: `RETURN n.k AS key,
+/// <aggs> …` where the group key is a `Str`/`Num`/`Bool` column and each aggregate
+/// is `count(*)` or a numeric reduction over a `Num` column. Reads the storage
+/// columns directly and groups by the TYPED key value (first-seen order, matching
+/// the grouping contract), so the frontier and projected columns are never
+/// materialized. `None` for any other shape (Temporal/Gen key, non-numeric agg
+/// arg, DISTINCT, multi-key). The per-key string hashing is the residual floor.
+fn try_scan_group_agg(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    let [(_, Expr::Prop { slot: 0, key: gkey })] = keys else {
+        return None;
+    };
+    let label = match input {
+        Plan::Scan { label } => label,
+        _ => return None,
+    };
+    // Agg specs: the Num column (None for count(*)) and function.
+    type Spec<'a> = (Option<(&'a [f64], &'a [bool])>, AggFn);
+    let mut specs: Vec<Spec> = Vec::with_capacity(aggs.len());
+    for agg in aggs {
+        if agg.distinct {
+            return None;
+        }
+        match (agg.func, agg.arg.as_ref()) {
+            (AggFn::Count, None) => specs.push((None, AggFn::Count)),
+            (
+                AggFn::Sum | AggFn::Avg | AggFn::Count | AggFn::Min | AggFn::Max,
+                Some(Expr::Prop { slot: 0, key }),
+            ) => {
+                let Some(Column::Num { data, present }) = store.column(key) else {
+                    return None;
+                };
+                specs.push((Some((data.as_slice(), present.as_slice())), agg.func));
+            }
+            _ => return None,
+        }
+    }
+
+    let mut group_keys: Vec<Value> = Vec::new();
+    let mut acc: Vec<GroupAcc> = Vec::new();
+    let na = specs.len();
+    // Add one row (dense group id `g`) to the accumulators.
+    let accumulate = |acc: &mut Vec<GroupAcc>, g: usize, i: usize| {
+        let a = &mut acc[g];
+        a.rows += 1;
+        for (k, &(col, func)) in specs.iter().enumerate() {
+            let Some((data, present)) = col else { continue };
+            if !present[i] {
+                continue;
+            }
+            let x = data[i];
+            let s = &mut a.aggs[k];
+            s.0 += x;
+            s.1 += 1;
+            s.2 = Some(match s.2 {
+                None => x,
+                Some(b) => match func {
+                    AggFn::Min if value::cmp_num_total(x, b).is_lt() => x,
+                    AggFn::Max if value::cmp_num_total(x, b).is_gt() => x,
+                    _ => b,
+                },
+            });
+        }
+    };
+
+    // Resolve a row to a dense group id (first-seen), creating the group on demand.
+    macro_rules! run {
+        ($present:expr, $lookup:expr, $keyval:expr, $nullkey:expr) => {{
+            let present = $present;
+            let mut map: FnvMap<_, u32> = FnvMap::default();
+            let mut null_group: Option<u32> = None;
+            scan_visit(store, label, |i| {
+                let g = if present[i] {
+                    let k = $lookup(i);
+                    match map.get(&k) {
+                        Some(&g) => g as usize,
+                        None => {
+                            let g = group_keys.len() as u32;
+                            map.insert(k, g);
+                            group_keys.push($keyval(i));
+                            acc.push(GroupAcc {
+                                rows: 0,
+                                aggs: vec![(0.0, 0, None); na],
+                            });
+                            g as usize
+                        }
+                    }
+                } else {
+                    match null_group {
+                        Some(g) => g as usize,
+                        None => {
+                            let g = group_keys.len() as u32;
+                            null_group = Some(g);
+                            group_keys.push(Value::Null);
+                            acc.push(GroupAcc {
+                                rows: 0,
+                                aggs: vec![(0.0, 0, None); na],
+                            });
+                            g as usize
+                        }
+                    }
+                };
+                accumulate(&mut acc, g, i);
+            });
+            let _ = $nullkey; // silence unused when the key type has no null path
+        }};
+    }
+    // Only a STRING group key: reading the storage column directly avoids
+    // materializing 100k `Arc<str>` (the win). A Num/Bool key already groups via
+    // `assign_groups`' typed fast path over the materialized column, which is as
+    // fast — so leave those to the general aggregate (this fused path's per-agg
+    // accumulator loop is slightly heavier and would regress them).
+    let Column::Str { data, present } = store.column(gkey)? else {
+        return None;
+    };
+    run!(
+        present,
+        |i: usize| data[i].as_ref(),
+        |i: usize| Value::Str(data[i].clone()),
+        ()
+    );
+
+    // Build the output: the key column, then one column per aggregate.
+    let key_col = Col::Gen(group_keys);
+    let mut cols = vec![key_col];
+    for (k, &(col, func)) in specs.iter().enumerate() {
+        let vals: Vec<Value> = acc
+            .iter()
+            .map(|a| {
+                let (total, cnt, best) = a.aggs[k];
+                match func {
+                    AggFn::Count if col.is_none() => Value::Num(a.rows as f64),
+                    AggFn::Count => Value::Num(cnt as f64),
+                    AggFn::Sum => Value::Num(total),
+                    AggFn::Avg => {
+                        if cnt == 0 {
+                            Value::Null
+                        } else {
+                            Value::Num(total / cnt as f64)
+                        }
+                    }
+                    _ => best.map_or(Value::Null, Value::Num),
+                }
+            })
+            .collect();
+        cols.push(Col::Gen(vals));
+    }
+    Some(Batch::of(cols))
 }
 
 /// Answer `count(DISTINCT n.k)` over a bare `Scan` by deduping the RAW column into
