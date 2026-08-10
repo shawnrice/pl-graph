@@ -677,13 +677,121 @@ pub fn shortest_path(
     source: Option<&str>,
     dir: Dir,
     edge_label: Option<&str>,
+    weight_property: Option<&str>,
 ) -> Vec<(u32, f64)> {
     let Some(src) = source.and_then(|s| store.node_by_ext(s)) else {
         return Vec::new();
     };
-    bfs_distances(store, src, dir, edge_label)
-        .into_iter()
-        .map(|(v, d)| (v, f64::from(d)))
+    match weight_property {
+        None => bfs_distances(store, src, dir, edge_label)
+            .into_iter()
+            .map(|(v, d)| (v, f64::from(d)))
+            .collect(),
+        Some(wk) => dijkstra(store, src, dir, edge_label, wk),
+    }
+}
+
+/// A Dijkstra frontier entry, ordered as a MIN-heap on `(dist, idx)` — the exact
+/// reversed comparison lenke-core's `State` uses, so `BinaryHeap` pops the smallest
+/// distance (ties by smallest id) in the same order and the per-vertex f64 distance
+/// is byte-identical.
+struct DijkstraState {
+    dist: f64,
+    idx: u32,
+}
+impl PartialEq for DijkstraState {
+    fn eq(&self, other: &Self) -> bool {
+        self.dist == other.dist && self.idx == other.idx
+    }
+}
+impl Eq for DijkstraState {}
+impl Ord for DijkstraState {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .dist
+            .partial_cmp(&self.dist)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| other.idx.cmp(&self.idx))
+    }
+}
+impl PartialOrd for DijkstraState {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// An edge's weight for the weighted shortest path: its `key` property as `f64`, or
+/// `0.0` when absent/non-numeric — matching core's `edge_weights`.
+fn edge_weight(store: &Store, eid: u32, key: &str) -> f64 {
+    match store.edge_prop(eid, key) {
+        Value::Num(n) => n,
+        _ => 0.0,
+    }
+}
+
+/// Weighted single-source shortest paths (Dijkstra) from `src` along `dir`/
+/// `edge_label`, edge costs read from the `weight` property. Ported from core's
+/// weighted `shortestPath`: the same min-heap `(dist, idx)` ordering, stale-entry
+/// skip (`du > dist[u]`), and strict relaxation (`nd < dist[nbr]`), with edge
+/// weights read in the same way — so the settling order and the accumulated f64
+/// distances are byte-identical. Core rejects a negative or NaN weight (Dijkstra is
+/// undefined for them); here that yields the empty result. Returns `(node,
+/// distance)` for every reachable node, ascending id.
+fn dijkstra(
+    store: &Store,
+    src: u32,
+    dir: Dir,
+    edge_label: Option<&str>,
+    weight: &str,
+) -> Vec<(u32, f64)> {
+    // Negative/NaN weights make Dijkstra unsound — reject the whole run (core errs).
+    for eid in store.all_edges() {
+        let w = edge_weight(store, eid, weight);
+        if w.is_nan() || w < 0.0 {
+            return Vec::new();
+        }
+    }
+    let n = store.node_count();
+    let want = want_etype(store, edge_label);
+    let type_ok = |et: u32| want.is_some_and(|inner| inner.is_none_or(|t| t == et));
+
+    let mut dist = vec![f64::INFINITY; n];
+    dist[src as usize] = 0.0;
+    let mut heap = std::collections::BinaryHeap::new();
+    heap.push(DijkstraState {
+        dist: 0.0,
+        idx: src,
+    });
+    while let Some(DijkstraState { dist: du, idx: u }) = heap.pop() {
+        if du > dist[u as usize] {
+            continue; // a shorter distance was already settled
+        }
+        // Relax the incident edges in the configured direction (out-adj then in-adj
+        // for `both`), in adjacency (edge-insertion) order — core's visit_adj order.
+        let mut relax = |nbr: u32, eid: u32, etype: u32| {
+            if !type_ok(etype) {
+                return;
+            }
+            let nd = du + edge_weight(store, eid, weight);
+            if nd < dist[nbr as usize] {
+                dist[nbr as usize] = nd;
+                heap.push(DijkstraState { dist: nd, idx: nbr });
+            }
+        };
+        if matches!(dir, Dir::Out | Dir::Both) {
+            for a in store.out(u) {
+                relax(a.nbr, a.eid, a.etype);
+            }
+        }
+        if matches!(dir, Dir::In | Dir::Both) {
+            for a in store.inc(u) {
+                relax(a.nbr, a.eid, a.etype);
+            }
+        }
+    }
+    (0..n as u32)
+        .filter(|&v| dist[v as usize].is_finite())
+        .map(|v| (v, dist[v as usize]))
         .collect()
 }
 
@@ -963,7 +1071,13 @@ pub fn run_procedure(
             .collect(),
         "on_cycle" => on_cycle(store, str_of("edgeType")),
         "betweenness" => betweenness(store, str_of("edgeType")),
-        "shortest_path" => shortest_path(store, str_of("source"), dir(), str_of("edgeType")),
+        "shortest_path" => shortest_path(
+            store,
+            str_of("source"),
+            dir(),
+            str_of("edgeType"),
+            str_of("weightProperty"),
+        ),
         "personalized_pagerank" => {
             let d = num_of("dampingFactor").unwrap_or(DEFAULT_DAMPING);
             let iters = num_of("iterations").map_or(DEFAULT_PAGERANK_ITERATIONS, |n| n as u32);
@@ -1273,25 +1387,61 @@ mod tests {
     }
 
     #[test]
+    fn shortest_path_weighted_dijkstra() {
+        // 0→1 (weight 10), 0→2 (1), 2→1 (1). The weighted shortest 0→1 is the light
+        // 2-hop detour (1+1=2), NOT the direct heavy edge — so it differs from the
+        // unweighted hop distance (1).
+        let mut b = Builder::default();
+        b.node(&["N"], &[]);
+        b.node(&["N"], &[]);
+        b.node(&["N"], &[]);
+        let mut st = b.build();
+        let e0 = st.add_edge(0, 1, "R");
+        st.set_edge_prop(e0, "w", Value::Num(10.0));
+        let e1 = st.add_edge(0, 2, "R");
+        st.set_edge_prop(e1, "w", Value::Num(1.0));
+        let e2 = st.add_edge(2, 1, "R");
+        st.set_edge_prop(e2, "w", Value::Num(1.0));
+
+        assert_eq!(
+            shortest_path(&st, Some("0"), Dir::Out, None, Some("w")),
+            vec![(0, 0.0), (1, 2.0), (2, 1.0)]
+        );
+        // Without the weight it is the plain hop distance (direct edge to 1).
+        assert_eq!(
+            shortest_path(&st, Some("0"), Dir::Out, None, None),
+            vec![(0, 0.0), (1, 1.0), (2, 1.0)]
+        );
+        // A negative weight makes Dijkstra unsound → the empty result (core errs).
+        let mut b2 = Builder::default();
+        b2.node(&["N"], &[]);
+        b2.node(&["N"], &[]);
+        let mut st2 = b2.build();
+        let en = st2.add_edge(0, 1, "R");
+        st2.set_edge_prop(en, "w", Value::Num(-1.0));
+        assert!(shortest_path(&st2, Some("0"), Dir::Out, None, Some("w")).is_empty());
+    }
+
+    #[test]
     fn shortest_path_bfs_layers_from_source() {
         let st = triangle_plus_isolated();
         // OUT from a(ext "0") on 0→1→2→0: 0@0, 1@1, 2@2; the isolated node is
         // unreachable, so it is absent from the result.
         assert_eq!(
-            shortest_path(&st, Some("0"), Dir::Out, None),
+            shortest_path(&st, Some("0"), Dir::Out, None, None),
             vec![(0, 0.0), (1, 1.0), (2, 2.0)]
         );
         // IN from a walks the cycle backwards: 0@0, then c(2)@1, then b(1)@2.
         assert_eq!(
-            shortest_path(&st, Some("0"), Dir::In, None),
+            shortest_path(&st, Some("0"), Dir::In, None, None),
             vec![(0, 0.0), (1, 2.0), (2, 1.0)]
         );
         // Unknown source → nothing.
-        assert!(shortest_path(&st, Some("999"), Dir::Out, None).is_empty());
-        assert!(shortest_path(&st, None, Dir::Out, None).is_empty());
+        assert!(shortest_path(&st, Some("999"), Dir::Out, None, None).is_empty());
+        assert!(shortest_path(&st, None, Dir::Out, None, None).is_empty());
         // A named-but-unknown edge type reaches only the source.
         assert_eq!(
-            shortest_path(&st, Some("0"), Dir::Out, Some("NOPE")),
+            shortest_path(&st, Some("0"), Dir::Out, Some("NOPE"), None),
             vec![(0, 0.0)]
         );
     }
