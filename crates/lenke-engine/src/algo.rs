@@ -266,6 +266,32 @@ pub fn label_propagation(
     live.into_iter().map(|v| (v, labels[v as usize])).collect()
 }
 
+/// Closeness centrality (unweighted, directed OUT): for each node, the reciprocal
+/// of the summed shortest-path (hop) distances to every node it can reach, or 0
+/// when it reaches nothing else. Ported from lenke-core's `closeness`: the
+/// distances are integer BFS hops summed in ascending-id order and the only
+/// floating-point operation is the final reciprocal, so it is byte-identical to
+/// core on the same graph. Weighted closeness (`weightProperty`) is deferred — this
+/// is the unweighted default. Returns `(node, closeness)` in ascending-id order; a
+/// named-but-unknown edge type reaches only each source (every sum 0 → every 0).
+#[must_use]
+pub fn closeness(store: &Store, edge_label: Option<&str>) -> Vec<(u32, f64)> {
+    store
+        .all_nodes()
+        .into_iter()
+        .map(|s| {
+            // `bfs_distances` yields reached nodes (incl. the source at 0) in
+            // ascending-id order — core sums finite distances in that same order.
+            let mut sum = 0.0f64;
+            for (_, d) in bfs_distances(store, s, Dir::Out, edge_label) {
+                sum += f64::from(d);
+            }
+            let c = if sum == 0.0 { 0.0 } else { 1.0 / sum };
+            (s, c)
+        })
+        .collect()
+}
+
 /// The built-in procedure catalog: a `CALL name(...)` procedure name → its
 /// non-`node` result column name (matching lenke-core's snake_case surface). The
 /// output columns of every procedure are `[node, <result>]`. `None` = unknown.
@@ -276,6 +302,7 @@ pub fn procedure_result_col(name: &str) -> Option<&'static str> {
         "pagerank" => "score",
         "connected_components" => "componentId",
         "label_propagation" => "label",
+        "closeness" => "centrality",
         _ => return None,
     })
 }
@@ -331,6 +358,7 @@ pub fn run_procedure(
             let iters = num_of("iterations").map_or(DEFAULT_PAGERANK_ITERATIONS, |n| n as u32);
             pagerank(store, str_of("edgeType"), d, iters)
         }
+        "closeness" => closeness(store, str_of("edgeType")),
         _ => return None,
     })
 }
@@ -372,6 +400,23 @@ mod tests {
         // An unknown edge type → all zero.
         assert_eq!(
             degree(&st, Dir::Out, Some("NOPE")),
+            vec![(0, 0.0), (1, 0.0), (2, 0.0), (3, 0.0)]
+        );
+    }
+
+    #[test]
+    fn closeness_reciprocal_of_summed_distances() {
+        let st = triangle_plus_isolated();
+        // Directed OUT on a→b→c→a: each triangle node reaches the other two at hop
+        // distances 1 and 2, so Σ = 3 and closeness = 1/3. The isolated node reaches
+        // nothing → sum 0 → closeness 0.
+        assert_eq!(
+            closeness(&st, None),
+            vec![(0, 1.0 / 3.0), (1, 1.0 / 3.0), (2, 1.0 / 3.0), (3, 0.0)]
+        );
+        // A named-but-unknown edge type reaches only each source → every closeness 0.
+        assert_eq!(
+            closeness(&st, Some("NOPE")),
             vec![(0, 0.0), (1, 0.0), (2, 0.0), (3, 0.0)]
         );
     }

@@ -3174,6 +3174,33 @@ mod tests {
     }
 
     #[test]
+    fn call_closeness_procedure_yields_centrality() {
+        let store = triangle_store();
+        let rows_of = |q: &str| -> Vec<(f64, f64)> {
+            run(&super::parse(q).unwrap(), &store)
+                .rows
+                .iter()
+                .map(|r| (node_id(&r[0]), num(&r[1])))
+                .collect()
+        };
+        // Directed OUT triangle: each member Σdist=3 → 1/3; the isolated node → 0.
+        let want = vec![
+            (0.0, 1.0 / 3.0),
+            (1.0, 1.0 / 3.0),
+            (2.0, 1.0 / 3.0),
+            (3.0, 0.0),
+        ];
+        assert_eq!(rows_of("CALL closeness() YIELD node, centrality"), want);
+        // Default columns (no YIELD) are [node, centrality].
+        assert_eq!(rows_of("CALL closeness()"), want);
+        let out = run(&super::parse("CALL closeness()").unwrap(), &store);
+        assert_eq!(
+            out.names,
+            vec!["node".to_string(), "centrality".to_string()]
+        );
+    }
+
+    #[test]
     fn call_procedure_config_and_components() {
         let store = triangle_store();
         // degree with direction=both: each triangle node 2, isolated 0.
