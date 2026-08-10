@@ -2178,25 +2178,22 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                         temporal_arith(*op, &a, &b)?
                     }
                 } else {
-                    match (value::as_num(&a), value::as_num(&b)) {
+                    match (value::num_of(&a), value::num_of(&b)) {
                         (Some(x), Some(y)) => {
                             // Division / modulo by zero THROWS (matches lenke-core's
-                            // DataException), rather than producing IEEE Inf/NaN.
+                            // DataException). Every OTHER result — including overflow
+                            // to ±Inf — is KEPT (IEEE), not nulled; NaN/Inf are only
+                            // coerced to null at the JSON egress boundary (K4).
                             if matches!(op, Div | Rem) && y == 0.0 {
                                 return Err("division by zero".into());
                             }
-                            let res = match op {
+                            Value::Num(match op {
                                 Add => x + y,
                                 Sub => x - y,
                                 Mul => x * y,
                                 Div => x / y,
                                 Rem => x % y,
-                            };
-                            if res.is_finite() {
-                                Value::Num(res)
-                            } else {
-                                Value::Null
-                            }
+                            })
                         }
                         _ => Value::Null,
                     }
@@ -2467,20 +2464,13 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         // numeric (2 args). `log(a, b)` is log-base-a of b = ln(b)/ln(a) (matches
         // core's argument order); `mod` is the fn form of `%` (NaN on a zero
         // divisor — it does NOT throw like the `%` OPERATOR, which core reserves for
-        // the operator). Non-finite results fall to NULL until K4.
-        "log" | "power" | "mod" => match (value::as_num(&args[0]), value::as_num(&args[1])) {
-            (Some(x), Some(y)) => {
-                let r = match name {
-                    "log" => y.ln() / x.ln(),
-                    "power" => x.powf(y),
-                    _ => x % y,
-                };
-                if r.is_finite() {
-                    Value::Num(r)
-                } else {
-                    Value::Null
-                }
-            }
+        // the operator). NaN/Inf results are KEPT (K4), coerced only at JSON egress.
+        "log" | "power" | "mod" => match (value::num_of(&args[0]), value::num_of(&args[1])) {
+            (Some(x), Some(y)) => Value::Num(match name {
+                "log" => y.ln() / x.ln(),
+                "power" => x.powf(y),
+                _ => x % y,
+            }),
             _ => Value::Null,
         },
         // nullif(a, b): NULL when a == b (value-contract equality), else a.
@@ -2820,11 +2810,12 @@ fn substring(args: &[Value]) -> Value {
     Value::Str(chars[begin..end].iter().collect::<String>().into())
 }
 
-/// Apply a unary numeric scalar function. Finite-or-null: a NULL / non-numeric /
-/// non-finite argument OR result (e.g. `sqrt(-1)`) yields NULL. `sign(0)` is 0
-/// (unlike `f64::signum`); rounding is f64's round-half-away-from-zero.
+/// Apply a unary numeric scalar function. A NULL / non-numeric argument yields
+/// NULL; a computed NaN/Inf result (e.g. `sqrt(-1)`, `ln(0)`) is KEPT (IEEE, like
+/// lenke-core — coerced to null only at JSON egress). `sign(0)` is 0 (unlike
+/// `f64::signum`); rounding is f64's round-half-away-from-zero.
 fn scalar_num_fn(name: &str, v: &Value) -> Value {
-    let Some(x) = value::as_num(v) else {
+    let Some(x) = value::num_of(v) else {
         return Value::Null;
     };
     let r = match name {
@@ -2861,11 +2852,9 @@ fn scalar_num_fn(name: &str, v: &Value) -> Value {
         "radians" => x.to_radians(),
         _ => return Value::Null, // parser rejects unknown names; defensive
     };
-    if r.is_finite() {
-        Value::Num(r)
-    } else {
-        Value::Null
-    }
+    // NaN/Inf are KEPT (K4) — a computed NaN (`sqrt(-1)`, `ln(-1)`) is a real
+    // signal, coerced to null only at the JSON egress boundary, matching core.
+    Value::Num(r)
 }
 
 /// `to_integer`/`to_float` FUNCTION: Num (truncated for integer) or a parseable
@@ -3336,6 +3325,25 @@ mod tests {
         );
     }
 
+    /// K4: computed NaN/Inf are KEPT in the result value (matching lenke-core, so a
+    /// caller can detect the signal), and coerced to null only at JSON egress.
+    #[test]
+    fn nan_and_inf_kept_in_results_coerced_at_egress() {
+        let mut b = Builder::default();
+        b.node(&["N"], &[("a", n(-4.0))]);
+        let store = b.build();
+        let val = |e: &str| {
+            let q = format!("MATCH (x:N) RETURN {e} AS v");
+            run(&crate::gql::parse(&q).unwrap(), &store).rows[0][0].clone()
+        };
+        assert!(matches!(val("sqrt(x.a)"), Value::Num(y) if y.is_nan())); // sqrt(-4) → NaN kept
+        assert!(matches!(val("sqrt(x.a) + 1"), Value::Num(y) if y.is_nan())); // NaN propagates
+        assert!(matches!(val("power(10, 400)"), Value::Num(y) if y.is_infinite())); // overflow → Inf
+                                                                                    // But the JSON egress renders both as null (no JSON form for NaN/Inf).
+        let ndjson = crate::ndjson::to_ndjson(&store);
+        assert!(!ndjson.contains("NaN") && !ndjson.to_lowercase().contains("inf"));
+    }
+
     /// Newly added scalar functions (K6 casts, K8 nullif, K9 math/constants,
     /// K5 size-on-string) match hand-computed values. One node with a=4, b="Carol".
     #[test]
@@ -3786,15 +3794,17 @@ mod tests {
         }
     }
 
-    /// A product that overflows f64 to Inf currently collapses to NULL (the
-    /// finite-or-null policy). NOTE: K4 revisits this to KEEP Inf like lenke-core.
+    /// A product that overflows f64 to +Inf is KEPT (IEEE), matching lenke-core —
+    /// NaN/Inf are coerced to null only at the JSON egress boundary, not here (K4).
     #[test]
-    fn arith_overflow_is_null() {
+    fn arith_overflow_keeps_inf() {
         use crate::ir::ArithOp::Mul;
         let store = social();
         let one = scan("Person").filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("alice"))));
         let big = one.project(vec![("x".into(), arith(Mul, lit(n(1e308)), lit(n(1e308))))]);
-        assert!(run(&big, &store).rows[0][0].is_null());
+        assert!(
+            matches!(run(&big, &store).rows[0][0], Value::Num(x) if x.is_infinite() && x > 0.0)
+        );
     }
 
     // --- Property index + IndexSeek (D1a) ---

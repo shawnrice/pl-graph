@@ -3377,13 +3377,14 @@ mod tests {
             &store,
         );
         assert_eq!(out.rows.iter().filter(|r| r[0].is_null()).count(), 1);
-        // sqrt of a negative is NULL (non-finite result).
+        // sqrt of a negative KEEPS NaN (a real signal), matching lenke-core — it is
+        // coerced to null only at JSON egress, not in the result value (K4).
         let out = run(
             &super::parse("MATCH (p:Person) WHERE p.name='alice' RETURN sqrt(0 - p.age) AS s")
                 .unwrap(),
             &store,
         );
-        assert!(col(&out, 0, "s").is_null());
+        assert!(matches!(col(&out, 0, "s"), crate::value::Value::Num(x) if x.is_nan()));
     }
 
     /// `coalesce` returns the first non-null argument.

@@ -576,7 +576,7 @@ Semantic bugs (wrong answers vs core) — fix for parity:
   ORIG: Division / modulo by zero (~338/3000). Core THROWS `DataException
   "division by zero"`; the engine returns NULL. Match core (throw). Repro:
       `RETURN n.a / 0`. (Revisits the G3 audit, which wrongly recorded agreement.)
-- [ ] K4. Domain-invalid numeric fn results (~66/3000). `sqrt(-x)` (and, once
+- [x] K4. (DONE) new value::num_of gates IEEE arithmetic + numeric fns; NaN/Inf KEPT in results (arith, scalar_num_fn, log/power/mod), coerced to null only at JSON egress (to_ndjson). as_num stays finite-only for indices. fuzzer numeric_fns 262->0.  ORIG: Domain-invalid numeric fn results (~66/3000). `sqrt(-x)` (and, once
       added, `ln`/`log` of ≤0) must return NaN like core; the engine's scalar
       numeric fns map non-finite → NULL. Decide: keep computed NaN to match core.
 - [x] K5. (DONE) size()/char_length on a STRING return length.  ORIG: `size()` / `length()` on a STRING must return its length (core does);
@@ -600,7 +600,7 @@ the catalog (parser allow-list + eval). Grouped by family:
 - [x] K11. (DONE) reverse(list)/tail/range(incl,step)/keys/labels/property_names; nodes/relationships already PathAccess. DEFERRED: type(edge) needs an eid->etype map; append/list_contains/list_sort/list_union/difference/intersection/element_id not yet.  ORIG: List fns: `reverse`(list), `tail`, `range(a, b[, step])`, `keys`,
       `append`, `list_contains`, `list_sort`, `list_union`, `difference`,
       `intersection`, `nodes`, `relationships`, `labels`, `type`, `property_names`.
-- [ ] K12. Re-run `fuzz_report` after each fix; the family's bucket should go to 0.
+- [x] K12. (DONE) fuzz_report re-run after every fix — all 16 buckets clean (only arithmetic 'skip' = both throw on div-by-zero); differential_fuzz 32k queries x 8 seeds agree. Fuzzer widening to temporals/list-values still open.  ORIG: Re-run `fuzz_report` after each fix; the family's bucket should go to 0.
       Widen the fuzzer to temporals and list values once K6–K11 land.
 
 ## Standing

@@ -177,6 +177,19 @@ pub fn as_num(v: &Value) -> Option<f64> {
     }
 }
 
+/// Any `Num`, INCLUDING NaN / ±Inf — the operand gate for IEEE arithmetic and the
+/// numeric scalar functions, which propagate non-finite results (a computed NaN is
+/// a real signal — e.g. `sqrt(-1)` — kept internally like lenke-core, and coerced
+/// to null only at the JSON egress boundary). Contrast [`as_num`], which is
+/// finite-only for callers that need a usable index/count (`substring`, `left`).
+#[must_use]
+pub fn num_of(v: &Value) -> Option<f64> {
+    match v {
+        Value::Num(x) => Some(*x),
+        _ => None,
+    }
+}
+
 /// The target type of a `CAST`, mirrored from `ir::CastTarget` so the conversion
 /// table lives beside the rest of the value contract. Kept in sync by the
 /// `From<ir::CastTarget>` below — a new target forces an arm here.
