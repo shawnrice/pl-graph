@@ -3392,7 +3392,74 @@ fn flip_op(op: CompareOp) -> CompareOp {
 /// match the general path exactly: an absent property is NULL → UNKNOWN → dropped,
 /// a NULL literal makes every comparison UNKNOWN → all dropped, and cross-type is
 /// the contract's `equals`/`cmp_total`. `None` if the predicate is not this shape.
+/// Flatten a conjunction into its atoms (`a AND b AND c` → `[a, b, c]`); a
+/// non-`And` expression is a single atom.
+fn flatten_and<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::And(a, b) => {
+            flatten_and(a, out);
+            flatten_and(b, out);
+        }
+        _ => out.push(e),
+    }
+}
+
+/// Keep rows satisfying a CONJUNCTION of `prop <op> num-literal` compares, all on
+/// the same node slot and all reading `Num` columns — one raw-f64 pass over the id
+/// list, each conjunct a `num_pred` (a NULL/NaN cell fails its conjunct → the row
+/// drops, matching AND's 3VL). `None` unless every atom fits that shape (the
+/// caller then tries the single-compare / general paths).
+fn try_num_conjunction(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usize>> {
+    if !matches!(pred, Expr::And(..)) {
+        return None; // a single compare is handled by the caller's typed path
+    }
+    let mut atoms = Vec::new();
+    flatten_and(pred, &mut atoms);
+    let mut slot0: Option<usize> = None;
+    let mut specs: Vec<(&[f64], &[bool], CompareOp, f64)> = Vec::with_capacity(atoms.len());
+    for atom in atoms {
+        let Expr::Compare { op, left, right } = atom else {
+            return None;
+        };
+        let (slot, key, op, lit) = match (left.as_ref(), right.as_ref()) {
+            (Expr::Prop { slot, key }, Expr::Lit(v)) => (*slot, key, *op, v),
+            (Expr::Lit(v), Expr::Prop { slot, key }) => (*slot, key, flip_op(*op), v),
+            _ => return None,
+        };
+        match slot0 {
+            Some(s) if s != slot => return None, // all atoms on the same slot
+            _ => slot0 = Some(slot),
+        }
+        let Value::Num(t) = lit else { return None };
+        let Some(Column::Num { data, present }) = store.column(key) else {
+            return None;
+        };
+        specs.push((data, present, op, *t));
+    }
+    let Col::Nodes(ids) = batch.slot(slot0?) else {
+        return None;
+    };
+    Some(
+        ids.iter()
+            .enumerate()
+            .filter(|&(_, &id)| {
+                let i = id as usize;
+                specs
+                    .iter()
+                    .all(|&(data, present, op, t)| present[i] && num_pred(op, data[i], t))
+            })
+            .map(|(row, _)| row)
+            .collect(),
+    )
+}
+
 fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usize>> {
+    // A CONJUNCTION of typed-numeric `prop <op> literal` compares on one node slot
+    // (e.g. `age >= 30 AND age < 40`) keeps rows satisfying ALL, in one raw-f64
+    // pass — no per-cell boxing, and no falling to the general And evaluator.
+    if let Some(keep) = try_num_conjunction(pred, store, batch) {
+        return Some(keep);
+    }
     let Expr::Compare { op, left, right } = pred else {
         return None;
     };
