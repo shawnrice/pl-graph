@@ -30,6 +30,7 @@
 //! cost-based optimizer; right-side join pushdown.
 
 pub mod algo;
+pub mod arrow;
 pub mod batch;
 pub mod exec;
 pub mod gql;

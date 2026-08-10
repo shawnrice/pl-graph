@@ -396,7 +396,19 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       1, and is bit-reproducible. NOTE (J1): label-prop tiebreaks on the dense node
       id (this engine has no external string ids) vs lenke-core's lexicographic
       string tiebreak — they agree when id order matches string order.
-- [ ] I2. Arrow IPC egress.
+- [x] I2a. Arrow columnar egress — the `ARW1` blob (a new `arrow` module):
+      `to_arrow(&Rows)` lays a query result out as lenke-core's dependency-free
+      carrier — 24-byte header (magic/version/nrows/ncols), 40-byte column
+      descriptors, 8-aligned body buffers that ARE Arrow's physical layout
+      (LE, LSB-first validity bitmap, i32 Utf8 offsets). Scalar column inference
+      matches lenke-core (present Nums→Float64, present Bools→Bool, else Utf8),
+      cell stringification matches for scalars/temporals. 3 tests via a hand-rolled
+      reader (header+types, null round-trip through the validity bitmap, mixed
+      num+bool→Utf8).
+- [ ] I2b. Arrow egress completion: the `FixedSizeList`/`Struct` column types
+      (list/record/map columns) and the flatbuffer Arrow-IPC wrapper
+      (`tableFromIPC`/DuckDB/Polars) that layers on these exact buffers — the
+      large, TS-verifier-dependent envelope; deferred from I2a.
 - [ ] I3. Named-procedure `CALL name(cfg) [YIELD col [AS a], …]` (relocated from
       F3): the ISO-conformant home for the I1 algorithms — the procedure catalog
       IS those algorithms, so it must land after them. `OPTIONAL CALL` keeps the
