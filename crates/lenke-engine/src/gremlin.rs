@@ -754,6 +754,57 @@ impl Parser {
                 self.slots = 1;
                 p
             }
+            "project" => {
+                // project('a','b',…).by(x).by(y) → one Map per traverser, keyed by the
+                // labels. Value for key i is the i-th `by` modulator, or the current
+                // element when there is no i-th `by` (core's `bys.get(i)` — NOT cycled).
+                let mut keys = vec![self.str_arg()?];
+                while self.peek() == Some(&Tok::Comma) {
+                    self.pos += 1;
+                    keys.push(self.str_arg()?);
+                }
+                self.expect(&Tok::RParen)?;
+                let elem_slot = self.current;
+                // Consume the trailing `.by(...)` modulators (like groupCount().by()).
+                let mut bys: Vec<Expr> = Vec::new();
+                while self.peek() == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
+                {
+                    self.expect(&Tok::Dot)?;
+                    self.ident()?; // `by`
+                    self.expect(&Tok::LParen)?;
+                    let by = if matches!(self.peek(), Some(Tok::Str(_))) {
+                        // by('key') → property access on the current element.
+                        let key = self.str_arg()?;
+                        Expr::Prop {
+                            slot: elem_slot,
+                            key,
+                        }
+                    } else if self.peek() == Some(&Tok::RParen) {
+                        // bare by() → the current element itself.
+                        Expr::Slot(elem_slot)
+                    } else {
+                        return Err(
+                            "project().by(<nested traversal>) is not yet supported (use by('key') or by())"
+                                .into(),
+                        );
+                    };
+                    self.expect(&Tok::RParen)?;
+                    bys.push(by);
+                }
+                let entries: Vec<(String, Expr)> = keys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| {
+                        let v = bys.get(i).cloned().unwrap_or(Expr::Slot(elem_slot));
+                        (k.clone(), v)
+                    })
+                    .collect();
+                let p = plan.project(vec![("project".into(), Expr::MapLit { entries })]);
+                self.current = 0;
+                self.slots = 1;
+                p
+            }
             "groupcount" => {
                 self.expect(&Tok::RParen)?;
                 // `groupCount()` groups by the current element; `groupCount().by('k')`
@@ -1163,6 +1214,38 @@ mod tests {
             gone.is_empty(),
             "missing id must contribute nothing: {gone:?}"
         );
+    }
+
+    /// `project('a','b').by(x).by(y)` builds one insertion-ordered Map per traverser:
+    /// key i takes the i-th `by` modulator, or the current element when there is no
+    /// i-th `by` (core's `bys.get(i)`, not cycled). `by('key')` reads a property; a
+    /// key with no `by` yields the element as its id, consistent with `select()`.
+    #[test]
+    fn gremlin_project_by_modulators() {
+        let store = social();
+        // Two by-modulators → {n: name, a: age}, keys in project order.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').project('n','a').by('name').by('age')",
+                &store,
+            )),
+            vec![
+                "Map([(Str(\"n\"), Str(\"alice\")), (Str(\"a\"), Num(30.0))]);",
+                "Map([(Str(\"n\"), Str(\"bob\")), (Str(\"a\"), Num(25.0))]);",
+                "Map([(Str(\"n\"), Str(\"carol\")), (Str(\"a\"), Num(40.0))]);",
+            ],
+        );
+        // A key with fewer bys than keys defaults to the current element (its id here,
+        // like select()): project('n','self').by('name') → {n: name, self: <id>}.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().has('name','bob').project('n','self').by('name')",
+                &store,
+            )),
+            vec!["Map([(Str(\"n\"), Str(\"bob\")), (Str(\"self\"), Num(1.0))]);"],
+        );
+        // Nested-traversal by-modulators are deferred, not mis-parsed.
+        assert!(super::parse("g.V().project('c').by(out().count())").is_err());
     }
 
     /// `path()` over a pure vertex-hop chain yields the sequence of vertices visited,
