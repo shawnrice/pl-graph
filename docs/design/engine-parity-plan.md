@@ -346,10 +346,23 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
         only wins when the queried type is a small fraction of a high degree
         (deg 256 / 64 types → T0 is ~4 of 256). Low-degree / single-type can't
         benefit → the index must be OPT-IN so those pay nothing (G5b).
-  - [ ] G5b. Opt-in edge-type index (`create_edge_type_index`, maintained through
-        the mutation primitives + undo like the property indexes, zero cost when
-        not created), used by `for_each_nbr` for a type-filtered hop. Re-measure
-        the bench with it on, and price ingest; keep only if it wins net.
+  - [x] G5b. Opt-in edge-type index: `create_edge_type_index` builds per-node
+        `etype → adjacency` buckets (`out_typed`/`in_typed`); `for_each_nbr` seeks
+        the bucket for a type-filtered hop instead of scanning. Maintained across
+        writes/deletes/rollback by a per-node rebuild off the authoritative flat
+        adjacency (O(1) push on the `add_edge` hot path), so no delta bookkeeping
+        can drift; OFF by default (zero cost, and existing tests unchanged). 6 tests
+        (buckets match a flat scan; add/delete/delete-node maintenance incl.
+        neighbour mirrors; rollback restores exactly; grows with a new node) + a
+        query-level equivalence test (same rows/counts with the index on vs off).
+        MEASURED (`expand_bench`, numbers kept in the file): WINS 6.5–8.1× in the
+        high-degree × many-type × selective regime (deg 256 / 8–64 types), but
+        LOSES at degree 4 (0.32×) and at 200k nodes / low type-count (0.65–0.87×) —
+        the per-node `HashMap` chases scattered heap while the flat scan is
+        contiguous (the cache-transition effect). Opt-in is exactly why that's
+        safe: a graph outside the winning regime never creates it. A CSR /
+        sorted-by-type adjacency is the future broad-win representation (deferred,
+        no workload needs it yet). Completes G5.
 
 ### Phase H — Semantics services
 

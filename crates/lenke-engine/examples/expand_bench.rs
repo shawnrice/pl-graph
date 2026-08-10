@@ -12,8 +12,31 @@
 //!     --example expand_bench
 //!
 //! It prints, per (nodes, degree, n_types), the min-of-`REPS` wall time to count
-//! all edges of ONE type via `MATCH (n:V)-[:T0]->() RETURN count(*)`. Compare the
-//! same rows before and after an edge-type index lands (G5b).
+//! all edges of ONE type via `MATCH (n:V)-[:T0]->() RETURN count(*)`, for the
+//! scan baseline vs. the opt-in edge-type index, plus the index build cost.
+//!
+//! MEASURED (min of 7, release; keep these numbers next to the code, per
+//! CLAUDE.md — this is where a wrong conclusion about the index would be drawn):
+//! ```text
+//!  nodes  degree  types   scan_us  index_us  speedup   build_us
+//!  50000       4      1     202.9     625.4     0.32     20505   ← index LOSES
+//!  50000      32      1    2457.0    1063.6     2.31     65553
+//!  50000      32      8    1485.7     842.5     1.76     85851
+//!  50000     256      1   10415.9    7025.7     1.48    366070
+//!  50000     256      8    8732.6    1074.1     8.13    471868   ← index WINS big
+//!  50000     256     64    8776.4    1341.1     6.54    639465   ← index WINS big
+//! 200000      32      1    9856.6   11375.2     0.87    233458   ← index LOSES
+//! 200000      32      8   10134.3   15596.6     0.65    277717   ← index LOSES
+//! ```
+//! Conclusion: the index wins (6–8×) ONLY in the high-degree × many-type ×
+//! selective-query regime at cache-resident sizes. At degree 4 it loses (a 4-entry
+//! scan beats a hashmap probe), and at 200k nodes it loses even at degree 32 — the
+//! per-node `HashMap` chases scattered heap while the flat adjacency scans
+//! contiguously (the classic cache-transition effect CLAUDE.md warns of). This is
+//! precisely why the index is OPT-IN (`create_edge_type_index`): a graph that does
+//! not fit the winning regime simply never creates it and pays nothing. A CSR /
+//! sorted-by-type adjacency (contiguous, no per-node hashmap) is the future
+//! representation that would make it a broad win; deferred until a workload needs it.
 
 use lenke_engine::store::{Builder, Store};
 use lenke_engine::value::Value;
@@ -76,8 +99,8 @@ fn time_count(store: &Store, reps: usize) -> f64 {
 fn main() {
     const REPS: usize = 7;
     println!(
-        "{:>8} {:>7} {:>7} {:>12} {:>14}",
-        "nodes", "degree", "types", "min_us", "us_per_node"
+        "{:>8} {:>7} {:>6} {:>11} {:>11} {:>8} {:>10}",
+        "nodes", "degree", "types", "scan_us", "index_us", "speedup", "build_us"
     );
     // Sweep the size across the cache transition (per CLAUDE.md: 200k–1M elements),
     // degree (per-edge costs scale with degree), and type spread (an index only
@@ -92,11 +115,19 @@ fn main() {
             if n_types > degree {
                 continue;
             }
+            // Baseline: full-adjacency scan-and-filter.
             let store = fixture(nodes, degree, n_types);
-            let us = time_count(&store, REPS);
+            let scan_us = time_count(&store, REPS);
+            // Indexed: build the opt-in edge-type index, then re-time. `build_us`
+            // is the one-time cost of `create_edge_type_index` over the fixture.
+            let mut indexed = fixture(nodes, degree, n_types);
+            let t = Instant::now();
+            indexed.create_edge_type_index();
+            let build_us = t.elapsed().as_secs_f64() * 1e6;
+            let index_us = time_count(&indexed, REPS);
             println!(
-                "{nodes:>8} {degree:>7} {n_types:>7} {us:>12.1} {:>14.4}",
-                us / f64::from(nodes)
+                "{nodes:>8} {degree:>7} {n_types:>6} {scan_us:>11.1} {index_us:>11.1} {:>8.2} {build_us:>10.1}",
+                scan_us / index_us
             );
         }
     }

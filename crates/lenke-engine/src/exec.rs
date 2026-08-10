@@ -1198,6 +1198,23 @@ fn range_seek_ids(store: &Store, label: &str, key: &str, op: CompareOp, value: &
 /// shared by the batch operator and the frontier executor so the two can never
 /// disagree on what an Expand reaches.
 fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: Option<u32>, mut f: impl FnMut(u32, u32)) {
+    // A type-filtered hop over an indexed store seeks the type bucket directly
+    // (O(matching), not O(degree)) — the whole point of the opt-in edge-type index.
+    if let Some(w) = want {
+        if store.has_edge_type_index() {
+            if matches!(dir, Dir::Out | Dir::Both) {
+                for a in store.out_typed(v, w) {
+                    f(a.nbr, a.eid);
+                }
+            }
+            if matches!(dir, Dir::In | Dir::Both) {
+                for a in store.in_typed(v, w) {
+                    f(a.nbr, a.eid);
+                }
+            }
+            return;
+        }
+    }
     let type_ok = |et: u32| want.is_none_or(|w| w == et);
     if matches!(dir, Dir::Out | Dir::Both) {
         for a in store.out(v) {
@@ -2765,6 +2782,27 @@ mod tests {
         b.edge(bob, c, "KNOWS");
         b.edge(a, proj, "WORKS_ON");
         b.build()
+    }
+
+    /// The opt-in edge-type index is a pure optimization: a type-filtered hop
+    /// returns the SAME rows with it on as with it off (for_each_nbr routes to the
+    /// bucket, but the answer is identical).
+    #[test]
+    fn edge_type_index_gives_identical_query_results() {
+        let mut store = social();
+        let plan = crate::gql::parse("MATCH (a:Person)-[:KNOWS]->(b) RETURN b.name AS b").unwrap();
+        let mut before = names_of(&run(&plan, &store), 0);
+        before.sort();
+        store.create_edge_type_index();
+        let mut after = names_of(&run(&plan, &store), 0);
+        after.sort();
+        assert_eq!(before, after);
+        // alice KNOWS bob & carol; bob KNOWS carol → bob, carol, carol.
+        assert_eq!(after, vec!["bob", "carol", "carol"]);
+        // A count through the fused fast path also matches.
+        let cplan =
+            crate::gql::parse("MATCH (a:Person)-[:KNOWS]->() RETURN count(*) AS c").unwrap();
+        assert!(matches!(run(&cplan, &store).rows[0][0], Value::Num(x) if x == 3.0));
     }
 
     // --- relational core (unchanged behavior, now slot-addressed) ---

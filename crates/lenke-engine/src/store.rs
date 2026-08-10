@@ -395,6 +395,18 @@ pub struct Store {
     indexes: Vec<Index>,
     /// range indexes on a node property `key` (ordered by `cmp_total`).
     ranges: Vec<RangeIndex>,
+    /// OPT-IN edge-type index: `edge_type_index` is false and the vectors empty
+    /// unless [`create_edge_type_index`](Store::create_edge_type_index) was called
+    /// (so a graph that does not need it pays nothing — see `examples/expand_bench`
+    /// for why the win is confined to high-degree, many-type nodes). When on,
+    /// `out_type_idx[node]`/`in_type_idx[node]` map an edge-type id to that node's
+    /// adjacency of that type, so a type-filtered hop seeks the bucket instead of
+    /// scanning the whole adjacency. Kept correct across writes/deletes/rollback by
+    /// a per-node rebuild whenever a node's flat adjacency changes (the flat lists
+    /// stay the source of truth), with an O(1) push on the `add_edge` hot path.
+    edge_type_index: bool,
+    out_type_idx: Vec<HashMap<u32, Vec<Adj>>>,
+    in_type_idx: Vec<HashMap<u32, Vec<Adj>>>,
 }
 
 /// A hash index on a node property PATH. `path` is `["age"]` for a plain property
@@ -688,6 +700,10 @@ impl Store {
         }
         self.out_adj.push(Vec::new());
         self.in_adj.push(Vec::new());
+        if self.edge_type_index {
+            self.out_type_idx.push(HashMap::new());
+            self.in_type_idx.push(HashMap::new());
+        }
         self.deleted.push(false);
         for l in labels {
             // ids are handed out increasing, so appending keeps the bucket sorted.
@@ -727,6 +743,26 @@ impl Store {
             etype,
             eid,
         });
+        if self.edge_type_index {
+            // Hot path: a single append to each endpoint's type bucket — O(1), not
+            // a per-node rebuild.
+            self.out_type_idx[from as usize]
+                .entry(etype)
+                .or_default()
+                .push(Adj {
+                    nbr: to,
+                    etype,
+                    eid,
+                });
+            self.in_type_idx[to as usize]
+                .entry(etype)
+                .or_default()
+                .push(Adj {
+                    nbr: from,
+                    etype,
+                    eid,
+                });
+        }
         if let Some(log) = &mut self.undo {
             log.push(Undo::AddEdge {
                 u: from,
@@ -736,6 +772,64 @@ impl Store {
         }
         self.record_change(Change::EdgeAdded(eid));
         eid
+    }
+
+    /// Create the opt-in edge-type index and build it from the current adjacency.
+    /// Idempotent; after this a type-filtered hop seeks a per-node type bucket
+    /// rather than scanning the whole adjacency (see the field docs and
+    /// `examples/expand_bench`). Subsequent writes maintain it.
+    pub fn create_edge_type_index(&mut self) {
+        self.edge_type_index = true;
+        self.out_type_idx = vec![HashMap::new(); self.node_count];
+        self.in_type_idx = vec![HashMap::new(); self.node_count];
+        for node in 0..self.node_count as u32 {
+            self.reindex_node_etypes(node);
+        }
+    }
+
+    /// Whether the opt-in edge-type index is active.
+    #[must_use]
+    pub fn has_edge_type_index(&self) -> bool {
+        self.edge_type_index
+    }
+
+    /// Node `node`'s outgoing adjacency of edge-type `etype` (empty if none, or if
+    /// the index is off — callers gate on [`has_edge_type_index`](Store::has_edge_type_index)).
+    #[must_use]
+    pub fn out_typed(&self, node: u32, etype: u32) -> &[Adj] {
+        self.out_type_idx
+            .get(node as usize)
+            .and_then(|m| m.get(&etype))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Node `node`'s incoming adjacency of edge-type `etype`.
+    #[must_use]
+    pub fn in_typed(&self, node: u32, etype: u32) -> &[Adj] {
+        self.in_type_idx
+            .get(node as usize)
+            .and_then(|m| m.get(&etype))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Rebuild one node's type buckets from its (authoritative) flat adjacency. A
+    /// no-op when the index is off. Called after any adjacency change other than
+    /// the `add_edge` hot path, so the index needs no per-edge delta bookkeeping.
+    fn reindex_node_etypes(&mut self, node: u32) {
+        if !self.edge_type_index {
+            return;
+        }
+        let i = node as usize;
+        let mut om: HashMap<u32, Vec<Adj>> = HashMap::new();
+        for a in &self.out_adj[i] {
+            om.entry(a.etype).or_default().push(*a);
+        }
+        let mut im: HashMap<u32, Vec<Adj>> = HashMap::new();
+        for a in &self.in_adj[i] {
+            im.entry(a.etype).or_default().push(*a);
+        }
+        self.out_type_idx[i] = om;
+        self.in_type_idx[i] = im;
     }
 
     /// Whether node `node` carries a present value for `key` (distinct from a
@@ -1123,6 +1217,10 @@ impl Store {
                 adj.retain(|a| a.eid != eid);
             }
         }
+        if self.edge_type_index {
+            self.reindex_node_etypes(u);
+            self.reindex_node_etypes(v);
+        }
         if let Some(log) = &mut self.undo {
             log.push(Undo::RestoreEdge { entries: removed });
         }
@@ -1179,6 +1277,16 @@ impl Store {
             col.set_absent(i);
         }
         self.deleted[i] = true;
+
+        if self.edge_type_index {
+            // Node i's buckets go empty; each neighbour lost this node's mirror.
+            self.reindex_node_etypes(id);
+            for a in out.iter().chain(inc.iter()) {
+                if a.nbr != id {
+                    self.reindex_node_etypes(a.nbr);
+                }
+            }
+        }
 
         if let Some(log) = &mut self.undo {
             log.push(Undo::RestoreNode {
@@ -1358,12 +1466,20 @@ impl Store {
                 }
             },
             Undo::RestoreEdge { entries } => {
+                let touched: Vec<u32> = if self.edge_type_index {
+                    entries.iter().map(|(node, _, _)| *node).collect()
+                } else {
+                    Vec::new()
+                };
                 for (node, is_out, adj) in entries {
                     if is_out {
                         self.out_adj[node as usize].push(adj);
                     } else {
                         self.in_adj[node as usize].push(adj);
                     }
+                }
+                for node in touched {
+                    self.reindex_node_etypes(node);
                 }
             }
             Undo::RestoreNode {
@@ -1397,6 +1513,20 @@ impl Store {
                 }
                 self.out_adj[i] = out;
                 self.in_adj[i] = inc;
+                if self.edge_type_index {
+                    // Rebuild id's buckets, and each neighbour that regained a
+                    // mirror (read the restored adjacency for the neighbour set).
+                    self.reindex_node_etypes(id);
+                    let nbrs: Vec<u32> = self.out_adj[i]
+                        .iter()
+                        .chain(self.in_adj[i].iter())
+                        .map(|a| a.nbr)
+                        .filter(|&nb| nb != id)
+                        .collect();
+                    for nb in nbrs {
+                        self.reindex_node_etypes(nb);
+                    }
+                }
                 for l in labels {
                     self.by_label.entry(l).or_default().push(id);
                 }
@@ -1425,6 +1555,10 @@ impl Store {
         }
         self.out_adj.pop();
         self.in_adj.pop();
+        if self.edge_type_index {
+            self.out_type_idx.pop();
+            self.in_type_idx.pop();
+        }
         self.deleted.pop();
         self.node_count -= 1;
     }
@@ -1508,6 +1642,11 @@ impl Builder {
             edge_props: HashMap::new(),
             indexes: Vec::new(),
             ranges: Vec::new(),
+            // The edge-type index is opt-in; bulk build never turns it on (the
+            // caller runs `create_edge_type_index` after load if it wants it).
+            edge_type_index: false,
+            out_type_idx: Vec::new(),
+            in_type_idx: Vec::new(),
         }
     }
 }
@@ -2093,5 +2232,105 @@ mod tests {
         });
         assert_eq!(r, Err("boom"));
         assert_eq!(st.node_count(), 1); // the aborted add was rolled back
+    }
+
+    // --- opt-in edge-type index (G5) ---
+
+    /// A small multi-type graph: node 0 knows 1 and likes 2; node 1 knows 2.
+    fn typed_graph() -> Store {
+        let mut b = Builder::default();
+        for _ in 0..3 {
+            b.node(&["V"], &[]);
+        }
+        b.edge(0, 1, "KNOWS");
+        b.edge(0, 2, "LIKES");
+        b.edge(1, 2, "KNOWS");
+        b.build()
+    }
+
+    /// The typed neighbours of `node` along `etype` (out), as a sorted id list.
+    fn out_ids(st: &Store, node: u32, ty: &str) -> Vec<u32> {
+        let et = st.etype_id(ty).unwrap();
+        let mut v: Vec<u32> = st.out_typed(node, et).iter().map(|a| a.nbr).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// The index, once built, agrees with a manual type-filter of the flat
+    /// adjacency for every node and type.
+    #[test]
+    fn edge_type_index_matches_flat_scan() {
+        let mut st = typed_graph();
+        st.create_edge_type_index();
+        assert!(st.has_edge_type_index());
+        for node in 0..st.node_count() as u32 {
+            for ty in ["KNOWS", "LIKES"] {
+                let et = st.etype_id(ty).unwrap();
+                let mut scan: Vec<u32> = st
+                    .out(node)
+                    .iter()
+                    .filter(|a| a.etype == et)
+                    .map(|a| a.nbr)
+                    .collect();
+                scan.sort_unstable();
+                assert_eq!(out_ids(&st, node, ty), scan, "node {node} type {ty}");
+            }
+        }
+        // node 0: KNOWS -> {1}, LIKES -> {2}
+        assert_eq!(out_ids(&st, 0, "KNOWS"), vec![1]);
+        assert_eq!(out_ids(&st, 0, "LIKES"), vec![2]);
+    }
+
+    /// add_edge keeps the index current (the O(1) hot path).
+    #[test]
+    fn edge_type_index_tracks_add() {
+        let mut st = typed_graph();
+        st.create_edge_type_index();
+        st.add_edge(0, 2, "KNOWS");
+        assert_eq!(out_ids(&st, 0, "KNOWS"), vec![1, 2]); // 0 now KNOWS 1 and 2
+    }
+
+    /// delete_edge and delete_node keep the index current, including neighbours'
+    /// incoming buckets.
+    #[test]
+    fn edge_type_index_tracks_delete() {
+        let mut st = typed_graph();
+        st.create_edge_type_index();
+        let et = st.etype_id("KNOWS").unwrap();
+        // delete 0-KNOWS->1: gone from 0's out bucket AND 1's in bucket.
+        st.delete_edge(0, 1, 0);
+        assert_eq!(out_ids(&st, 0, "KNOWS"), Vec::<u32>::new());
+        let in1: Vec<u32> = st.in_typed(1, et).iter().map(|a| a.nbr).collect();
+        assert_eq!(in1, Vec::<u32>::new());
+        // delete node 2: removes 0-LIKES->2 and 1-KNOWS->2 mirrors.
+        st.delete_node(2);
+        assert_eq!(out_ids(&st, 0, "LIKES"), Vec::<u32>::new());
+        assert_eq!(out_ids(&st, 1, "KNOWS"), Vec::<u32>::new());
+    }
+
+    /// Transaction rollback restores the index exactly (a per-node rebuild off the
+    /// restored flat adjacency, so no delta bookkeeping can drift).
+    #[test]
+    fn edge_type_index_survives_rollback() {
+        let mut st = typed_graph();
+        st.create_edge_type_index();
+        st.begin();
+        st.add_edge(0, 2, "KNOWS"); // 0 KNOWS {1,2} inside the txn
+        st.delete_edge(1, 2, 2); // 1 KNOWS {} inside the txn
+        assert_eq!(out_ids(&st, 0, "KNOWS"), vec![1, 2]);
+        st.rollback();
+        // Back to the committed shape: 0 KNOWS {1}, 1 KNOWS {2}.
+        assert_eq!(out_ids(&st, 0, "KNOWS"), vec![1]);
+        assert_eq!(out_ids(&st, 1, "KNOWS"), vec![2]);
+    }
+
+    /// A node added AFTER the index exists grows the index and indexes its edges.
+    #[test]
+    fn edge_type_index_grows_with_new_node() {
+        let mut st = typed_graph();
+        st.create_edge_type_index();
+        let three = st.add_node(&["V"], &[]);
+        st.add_edge(three, 0, "LIKES");
+        assert_eq!(out_ids(&st, three, "LIKES"), vec![0]);
     }
 }
