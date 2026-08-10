@@ -3,16 +3,16 @@
 //! serde) and deterministic (nodes by id; labels and property keys sorted; edges
 //! in adjacency order).
 //!
-//! Line shapes:
-//! - node: `{"id":N,"labels":[...],"props":{...}}`
-//! - edge: `{"from":F,"to":T,"type":"R","props":{...}}`
+//! Line shapes (ids are PRESERVED external ids — strings; a numeric id on ingest
+//! is accepted and kept as its text):
+//! - node: `{"id":"N","labels":[...],"props":{...}}`
+//! - edge: `{"id":"E","from":"F","to":"T","type":"R","props":{...}}`
 //!
 //! This module SERIALIZES values; it does not define value semantics (order,
 //! equality) — those stay in [`crate::value`]. A non-finite number (NaN/Inf) has
 //! no JSON form and is written as `null`, consistent with the engine's
 //! NaN/Inf→null policy.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::store::Store;
@@ -30,8 +30,10 @@ pub fn to_ndjson(store: &Store) -> String {
         if !store.is_alive(id) {
             continue;
         }
+        // Emit the PRESERVED external id (a string), so a dump→load round-trip
+        // keeps element identity stable.
         out.push_str("{\"id\":");
-        out.push_str(&id.to_string());
+        encode_string(&mut out, &store.node_ext_id(id).unwrap_or_default());
         out.push_str(",\"labels\":");
         encode_str_array(&mut out, &store.labels_of(id));
         out.push_str(",\"props\":");
@@ -46,10 +48,13 @@ pub fn to_ndjson(store: &Store) -> String {
             continue;
         }
         for a in store.out(from) {
-            out.push_str("{\"from\":");
-            out.push_str(&from.to_string());
+            // Preserved external ids for the edge and its endpoints.
+            out.push_str("{\"id\":");
+            encode_string(&mut out, &store.edge_ext_id(a.eid).unwrap_or_default());
+            out.push_str(",\"from\":");
+            encode_string(&mut out, &store.node_ext_id(from).unwrap_or_default());
             out.push_str(",\"to\":");
-            out.push_str(&a.nbr.to_string());
+            encode_string(&mut out, &store.node_ext_id(a.nbr).unwrap_or_default());
             out.push_str(",\"type\":");
             encode_string(&mut out, &store.etype_name(a.etype).unwrap_or_default());
             out.push_str(",\"props\":");
@@ -231,9 +236,11 @@ fn encode_string(out: &mut String, s: &str) {
 /// graph with deletions re-densifies on load — round-trip is exact for a gap-free
 /// dump and STABLE from the first reload otherwise.
 pub fn from_ndjson(text: &str) -> Result<Store, String> {
-    // Staged records: (file_id, labels, props) and (from, to, type, props).
-    type NodeRec = (u32, Vec<String>, Vec<(String, Value)>);
-    type EdgeRec = (u32, u32, String, Vec<(String, Value)>);
+    // Staged records: (external id, labels, props) and (from-id, to-id, edge id?,
+    // type, props). External ids are PRESERVED verbatim (no remap to fresh dense
+    // ids), so element_id / egress round-trip.
+    type NodeRec = (String, Vec<String>, Vec<(String, Value)>);
+    type EdgeRec = (String, String, Option<String>, String, Vec<(String, Value)>);
     let mut constraints: Vec<(String, Vec<String>)> = Vec::new();
     let mut required: Vec<(String, String)> = Vec::new();
     let mut nodes: Vec<NodeRec> = Vec::new();
@@ -263,17 +270,18 @@ pub fn from_ndjson(text: &str) -> Result<Store, String> {
                 }
                 _ => return Err(err("unknown schema kind".into())),
             }
-        } else if let Some(id) = field(&fields, "id") {
-            let file_id = json_u32(id).map_err(err)?;
-            let labels = json_str_array(req(&fields, "labels").map_err(err)?).map_err(err)?;
-            let props = json_props(req(&fields, "props").map_err(err)?).map_err(err)?;
-            nodes.push((file_id, labels, props));
         } else if field(&fields, "from").is_some() {
-            let from = json_u32(req(&fields, "from").map_err(err)?).map_err(err)?;
-            let to = json_u32(req(&fields, "to").map_err(err)?).map_err(err)?;
+            let from = json_id(req(&fields, "from").map_err(err)?).map_err(err)?;
+            let to = json_id(req(&fields, "to").map_err(err)?).map_err(err)?;
+            let edge_id = field(&fields, "id").map(json_id).transpose().map_err(err)?;
             let etype = json_string(req(&fields, "type").map_err(err)?).map_err(err)?;
             let props = json_props(req(&fields, "props").map_err(err)?).map_err(err)?;
-            edges.push((from, to, etype, props));
+            edges.push((from, to, edge_id, etype, props));
+        } else if let Some(id) = field(&fields, "id") {
+            let ext = json_id(id).map_err(err)?;
+            let labels = json_str_array(req(&fields, "labels").map_err(err)?).map_err(err)?;
+            let props = json_props(req(&fields, "props").map_err(err)?).map_err(err)?;
+            nodes.push((ext, labels, props));
         } else {
             return Err(err("object has no `schema`, `id`, or `from`".into()));
         }
@@ -289,22 +297,23 @@ pub fn from_ndjson(text: &str) -> Result<Store, String> {
     for (label, key) in &required {
         store.create_required_constraint(label, key)?;
     }
-    let mut remap: HashMap<u32, u32> = HashMap::new();
-    for (file_id, labels, props) in &nodes {
+    for (ext, labels, props) in &nodes {
         let lrefs: Vec<&str> = labels.iter().map(String::as_str).collect();
         let prefs: Vec<(&str, Value)> =
             props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-        let new_id = store.add_node(&lrefs, &prefs);
-        remap.insert(*file_id, new_id);
+        store.add_node_with_id(&Arc::from(ext.as_str()), &lrefs, &prefs);
     }
-    for (from, to, etype, props) in &edges {
-        let f = *remap
-            .get(from)
+    for (from, to, edge_id, etype, props) in &edges {
+        let f = store
+            .node_by_ext(from)
             .ok_or_else(|| format!("edge references unknown node id {from}"))?;
-        let t = *remap
-            .get(to)
+        let t = store
+            .node_by_ext(to)
             .ok_or_else(|| format!("edge references unknown node id {to}"))?;
-        let eid = store.add_edge(f, t, etype);
+        let eid = match edge_id {
+            Some(id) => store.add_edge_with_id(&Arc::from(id.as_str()), f, t, etype),
+            None => store.add_edge(f, t, etype),
+        };
         for (k, v) in props {
             store.set_edge_prop(eid, k, v.clone());
         }
@@ -329,10 +338,13 @@ fn field<'a>(fields: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
 fn req<'a>(fields: &'a [(String, Json)], key: &str) -> Result<&'a Json, String> {
     field(fields, key).ok_or_else(|| format!("missing field `{key}`"))
 }
-fn json_u32(j: &Json) -> Result<u32, String> {
+/// An element id, accepted as a JSON string OR a non-negative integer (rendered as
+/// its integer text) — so both `"id":"e0"` and `"id":0` preserve a stable id.
+fn json_id(j: &Json) -> Result<String, String> {
     match j {
-        Json::Num(n) if *n >= 0.0 && n.fract() == 0.0 => Ok(*n as u32),
-        _ => Err("expected a non-negative integer".into()),
+        Json::Str(s) => Ok(s.clone()),
+        Json::Num(n) if n.fract() == 0.0 => Ok((*n as i64).to_string()),
+        _ => Err("expected an id (string or integer)".into()),
     }
 }
 fn json_string(j: &Json) -> Result<String, String> {
@@ -607,9 +619,9 @@ mod tests {
         let b = st.add_node(&["P"], &[("name", s("b"))]);
         let eid = st.add_edge(a, b, "R");
         st.set_edge_prop(eid, "weight", n(0.5));
-        let expected = "{\"id\":0,\"labels\":[\"P\"],\"props\":{\"age\":1,\"name\":\"a\"}}\n\
-             {\"id\":1,\"labels\":[\"P\"],\"props\":{\"name\":\"b\"}}\n\
-             {\"from\":0,\"to\":1,\"type\":\"R\",\"props\":{\"weight\":0.5}}\n";
+        let expected = "{\"id\":\"0\",\"labels\":[\"P\"],\"props\":{\"age\":1,\"name\":\"a\"}}\n\
+             {\"id\":\"1\",\"labels\":[\"P\"],\"props\":{\"name\":\"b\"}}\n\
+             {\"id\":\"e0\",\"from\":\"0\",\"to\":\"1\",\"type\":\"R\",\"props\":{\"weight\":0.5}}\n";
         assert_eq!(to_ndjson(&st), expected);
     }
 
@@ -676,7 +688,7 @@ mod tests {
         let b = st.add_node(&["P"], &[("name", s("b"))]);
         st.add_edge(a, b, "R");
         st.delete_node(b);
-        let expected = "{\"id\":0,\"labels\":[\"P\"],\"props\":{\"name\":\"a\"}}\n";
+        let expected = "{\"id\":\"0\",\"labels\":[\"P\"],\"props\":{\"name\":\"a\"}}\n";
         assert_eq!(to_ndjson(&st), expected);
     }
 
@@ -696,7 +708,7 @@ mod tests {
         );
         let out = to_ndjson(&st);
         // keys sorted: ok, q, xs, z
-        let expected = "{\"id\":0,\"labels\":[],\"props\":\
+        let expected = "{\"id\":\"0\",\"labels\":[],\"props\":\
              {\"ok\":true,\"q\":\"a\\\"b\\nc\",\"xs\":[1,\"y\"],\"z\":null}}\n";
         assert_eq!(out, expected);
     }
@@ -708,7 +720,7 @@ mod tests {
         st.add_node(&[], &[("v", n(f64::NAN))]);
         assert_eq!(
             to_ndjson(&st),
-            "{\"id\":0,\"labels\":[],\"props\":{\"v\":null}}\n"
+            "{\"id\":\"0\",\"labels\":[],\"props\":{\"v\":null}}\n"
         );
     }
 
@@ -819,7 +831,7 @@ mod tests {
         st.create_unique_constraint("P", &["k"]).unwrap();
         st.add_node(&["P"], &[("k", n(1.0))]);
         let expected = "{\"schema\":\"unique\",\"label\":\"P\",\"keys\":[\"k\"]}\n\
-             {\"id\":0,\"labels\":[\"P\"],\"props\":{\"k\":1}}\n";
+             {\"id\":\"0\",\"labels\":[\"P\"],\"props\":{\"k\":1}}\n";
         assert_eq!(super::snapshot(&st), expected);
     }
 

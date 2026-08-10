@@ -223,6 +223,7 @@ fn main() {
         ("list_element_fns", p_list_fns),
         ("list_algebra_fns", p_list_algebra),
         ("type_fn", p_type_fn),
+        ("element_id_fn", p_element_id),
         ("cast_fns", p_cast_fns),
         ("cross_type_cmp", p_cross_type),
         ("aggregates", p_agg),
@@ -513,6 +514,20 @@ fn p_type_fn(_rng: &mut Rng) -> (String, bool) {
         "MATCH (n:N)-[r:R]->(m:N) RETURN n.id AS a0, type(r) AS a1 ORDER BY a0, a1".to_string(),
         true,
     )
+}
+fn p_element_id(rng: &mut Rng) -> (String, bool) {
+    // Preserved external ids for nodes and edges.
+    if rng.chance(1, 2) {
+        (
+            "MATCH (n:N) RETURN element_id(n) AS a0 ORDER BY a0".to_string(),
+            true,
+        )
+    } else {
+        (
+            "MATCH (n:N)-[r:R]->(m:N) RETURN element_id(r) AS a0 ORDER BY a0".to_string(),
+            true,
+        )
+    }
 }
 fn p_cast_fns(rng: &mut Rng) -> (String, bool) {
     let v = var(rng);

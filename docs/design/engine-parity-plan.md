@@ -86,7 +86,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
       (`ndjson::to_ndjson`); one object per live node `{id,labels,props}` then per
       edge `{from,to,type,props}`; deterministic (nodes by id, keys sorted);
       NaN/Inf→null. Serializes only — value semantics stay in value.rs.
-- [x] C2. NDJSON ingest (`ndjson::from_ndjson`): hand-rolled dependency-free JSON
+- [x] C2. NDJSON ingest (`ndjson::from_ndjson`). NOTE (K13): the original "ids are NOT preserved" decision was REVERSED — external ids are now kept verbatim (node_ext/edge_ext/ext_to_node), so element_id and dump→load round-trip preserve identity. hand-rolled dependency-free JSON
       parser; loads node then edge lines. Ids are NOT preserved — file ids may be
       gapped (deletions), so nodes get fresh dense ids and edges are remapped.
       Round-trip is exact for a gap-free dump, stable from the first reload

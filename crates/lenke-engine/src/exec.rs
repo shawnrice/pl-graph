@@ -2247,6 +2247,23 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             Col::Gen(out)
         }
         Expr::Call { name, args } => {
+            // `element_id(node|edge)` → the element's PRESERVED external id string.
+            if name == "element_id" {
+                let arg = eval(&args[0], store, batch)?;
+                let n = batch.rows();
+                let out: Vec<Value> = (0..n)
+                    .map(|i| match arg.value_at(i) {
+                        Value::Num(id) if matches!(arg, Col::Nodes(_)) => {
+                            store.node_ext_id(id as u32).map_or(Value::Null, Value::Str)
+                        }
+                        Value::Num(eid) if matches!(arg, Col::Edges(_)) => store
+                            .edge_ext_id(eid as u32)
+                            .map_or(Value::Null, Value::Str),
+                        _ => Value::Null,
+                    })
+                    .collect();
+                return Ok(Col::Gen(out));
+            }
             // `type(edge)` needs the store + the edge identity (an eid), so it is
             // handled here (off the evaluated arg column), not in `call_scalar`.
             if name == "type" {
@@ -3647,6 +3664,41 @@ mod tests {
         assert_eq!(
             ids("MATCH (n:N) WHERE 2 IN n.xs RETURN n.a AS a"),
             vec!["Num(2.0)", "Num(9.0)"]
+        );
+    }
+
+    /// External ids are PRESERVED through ingest and returned by element_id (nodes
+    /// and edges), and survive an NDJSON round-trip.
+    #[test]
+    fn element_id_preserves_external_ids() {
+        let nd = concat!(
+            "{\"id\":\"alice\",\"labels\":[\"P\"],\"props\":{}}\n",
+            "{\"id\":\"bob\",\"labels\":[\"P\"],\"props\":{}}\n",
+            "{\"id\":\"e42\",\"from\":\"alice\",\"to\":\"bob\",\"type\":\"KNOWS\",\"props\":{}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        // element_id(node) returns the preserved string id.
+        let mut ns = names_of(
+            &run(
+                &crate::gql::parse("MATCH (n:P) RETURN element_id(n) AS a0").unwrap(),
+                &store,
+            ),
+            0,
+        );
+        ns.sort();
+        assert_eq!(ns, vec!["alice", "bob"]);
+        // element_id(edge) returns the preserved edge id.
+        let es = run(
+            &crate::gql::parse("MATCH (a:P)-[r:KNOWS]->(b) RETURN element_id(r) AS a0").unwrap(),
+            &store,
+        );
+        assert!(matches!(&es.rows[0][0], Value::Str(s) if &**s == "e42"));
+        // NDJSON round-trip preserves those ids (dump contains them, reload keeps).
+        let dump = crate::ndjson::to_ndjson(&store);
+        assert!(dump.contains("\"id\":\"alice\"") && dump.contains("\"id\":\"e42\""));
+        assert_eq!(
+            crate::ndjson::to_ndjson(&crate::ndjson::from_ndjson(&dump).unwrap()),
+            dump
         );
     }
 

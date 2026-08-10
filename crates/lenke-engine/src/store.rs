@@ -391,6 +391,15 @@ pub struct Store {
     /// The reverse of an `Adj`'s `etype`, needed by `type(edge)` which has only an
     /// eid in hand, not an adjacency entry.
     edge_etype: Vec<u32>,
+    /// PRESERVED external ids — the stable, user-facing identity of each element,
+    /// carried verbatim through ingest → store → egress (and returned by
+    /// `element_id`). Ingest uses the id from the file; a created element (INSERT /
+    /// addV / addE / Builder) is minted one. Indexed by dense node id / eid.
+    node_ext: Vec<Arc<str>>,
+    edge_ext: Vec<Arc<str>>,
+    /// external node id → dense id, for resolving edge endpoints on ingest and
+    /// looking a node up by its stable id. A tombstoned node keeps its entry.
+    ext_to_node: HashMap<Arc<str>, u32>,
     /// tombstones, indexed by node id. A deleted node keeps its id slot (ids are
     /// dense and never reused) but is skipped by every scan and carries no edges
     /// or properties. `deleted.len() == node_count`.
@@ -602,6 +611,27 @@ impl Store {
         self.etype_name(etype)
     }
 
+    /// A node's preserved external id (for `element_id`), or `None` out of range.
+    #[must_use]
+    pub fn node_ext_id(&self, id: u32) -> Option<Arc<str>> {
+        self.node_ext.get(id as usize).cloned()
+    }
+
+    /// An edge's preserved external id (for `element_id`), or `None` out of range.
+    #[must_use]
+    pub fn edge_ext_id(&self, eid: u32) -> Option<Arc<str>> {
+        self.edge_ext.get(eid as usize).cloned()
+    }
+
+    /// The dense id of the live node with external id `ext`, or `None`.
+    #[must_use]
+    pub fn node_by_ext(&self, ext: &str) -> Option<u32> {
+        self.ext_to_node
+            .get(ext)
+            .copied()
+            .filter(|&id| !self.deleted[id as usize])
+    }
+
     // --- Unique constraints ----------------------------------------------
     //
     // A unique constraint declares that at most one live node with `label` may
@@ -736,8 +766,25 @@ impl Store {
 
     /// Add a node with `labels` and `(key, value)` properties; returns its id.
     pub fn add_node(&mut self, labels: &[&str], props: &[(&str, Value)]) -> u32 {
+        // A created node mints its external id from its dense id (stable for the
+        // life of the store — dense ids are never reused). Ingest supplies the
+        // file's id via `add_node_with_id`.
+        let ext: Arc<str> = Arc::from(self.node_count.to_string().as_str());
+        self.add_node_with_id(&ext, labels, props)
+    }
+
+    /// Add a node carrying an explicit external id (used by ingest, which preserves
+    /// the id from the file). Returns the dense id.
+    pub fn add_node_with_id(
+        &mut self,
+        ext: &Arc<str>,
+        labels: &[&str],
+        props: &[(&str, Value)],
+    ) -> u32 {
         let id = self.node_count as u32;
         self.node_count += 1;
+        self.node_ext.push(Arc::clone(ext));
+        self.ext_to_node.insert(Arc::clone(ext), id);
         // Keep every existing column the same length as the node set.
         for col in self.props.values_mut() {
             col.push_absent();
@@ -773,6 +820,15 @@ impl Store {
     /// out and in adjacency entries). Interns the edge type if new. The returned
     /// eid lets the caller attach edge properties to the new edge.
     pub fn add_edge(&mut self, from: u32, to: u32, label: &str) -> u32 {
+        // A created edge mints its external id as `e<eid>`; ingest supplies the
+        // file's id via `add_edge_with_id`.
+        let ext: Arc<str> = Arc::from(format!("e{}", self.next_eid).as_str());
+        self.add_edge_with_id(&ext, from, to, label)
+    }
+
+    /// Add an edge carrying an explicit external id (used by ingest). Returns the
+    /// eid.
+    pub fn add_edge_with_id(&mut self, ext: &Arc<str>, from: u32, to: u32, label: &str) -> u32 {
         assert!(
             (from as usize) < self.node_count && (to as usize) < self.node_count,
             "edge endpoint out of range"
@@ -787,6 +843,8 @@ impl Store {
             "edge_etype indexed by eid"
         );
         self.edge_etype.push(etype);
+        debug_assert_eq!(self.edge_ext.len() as u32, eid, "edge_ext indexed by eid");
+        self.edge_ext.push(Arc::clone(ext));
         self.out_adj[from as usize].push(Adj {
             nbr: to,
             etype,
@@ -1776,6 +1834,9 @@ impl Store {
             ix.by_lo.pop();
             ix.by_hi.pop();
         }
+        if let Some(ext) = self.node_ext.pop() {
+            self.ext_to_node.remove(&ext);
+        }
         self.deleted.pop();
         self.node_count -= 1;
     }
@@ -1828,6 +1889,17 @@ impl Builder {
         let mut out_adj = vec![Vec::new(); n];
         let mut in_adj = vec![Vec::new(); n];
         let edge_count = self.edges.len() as u32;
+        // Builder-created elements mint external ids (dense id string for nodes,
+        // `e<eid>` for edges) — the same scheme `add_node`/`add_edge` use.
+        let node_ext: Vec<Arc<str>> = (0..n).map(|i| Arc::from(i.to_string().as_str())).collect();
+        let ext_to_node: HashMap<Arc<str>, u32> = node_ext
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (Arc::clone(e), i as u32))
+            .collect();
+        let edge_ext: Vec<Arc<str>> = (0..edge_count)
+            .map(|e| Arc::from(format!("e{e}").as_str()))
+            .collect();
         let mut edge_etypes: Vec<u32> = Vec::with_capacity(self.edges.len());
         for (eid, (from, to, etype)) in self.edges.into_iter().enumerate() {
             let eid = eid as u32;
@@ -1853,6 +1925,9 @@ impl Builder {
             // Incremental edges continue the id sequence the build laid down.
             next_eid: edge_count,
             edge_etype: edge_etypes,
+            node_ext,
+            edge_ext,
+            ext_to_node,
             deleted: vec![false; n],
             undo: None,
             changes: None,
