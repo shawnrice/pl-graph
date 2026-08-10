@@ -265,6 +265,7 @@ fn main() {
         ("element_map", p_element),
         ("return_star", p_return_star),
         ("edge_element", p_edge_element),
+        ("order_expr", p_order_expr),
         ("edge_props", p_edge_props),
         ("string_literal_eq", p_string_lit),
         ("str_infix", p_str_infix),
@@ -384,6 +385,24 @@ fn p_return_star(rng: &mut Rng) -> (String, bool) {
     // order, compared as a multiset. The two-hop pattern binds an edge var `r`, so
     // this now exercises edge-element rendering too.
     (format!("{} RETURN *", pattern(var(rng))), false)
+}
+fn p_order_expr(rng: &mut Rng) -> (String, bool) {
+    // ORDER BY an UNPROJECTED expression (v.a, not a returned column), with v.id
+    // appended to fully break ties → a deterministic order both engines must match.
+    let v = var(rng);
+    let d = if rng.chance(1, 2) { " DESC" } else { "" };
+    let lim = if rng.chance(1, 3) {
+        format!(" LIMIT {}", 1 + rng.below(4))
+    } else {
+        String::new()
+    };
+    (
+        format!(
+            "{} RETURN {v}.b AS a0 ORDER BY {v}.a{d}, {v}.id{lim}",
+            pattern(v)
+        ),
+        true,
+    )
 }
 fn p_edge_element(_rng: &mut Rng) -> (String, bool) {
     // A bare EDGE binding — edge-element map rendering {id,from,to,labels,properties}

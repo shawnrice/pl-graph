@@ -401,23 +401,38 @@ impl Parser {
             return Err("expected RETURN, SET, REMOVE, WITH, or MATCH".into());
         }
         let distinct = self.eat_kw("DISTINCT");
-        let items = self.return_items()?;
-        let (mut plan, out_names) = apply_items(plan, &items);
+        let mut items = self.return_items()?;
+        let visible: Vec<String> = items.iter().map(RetItem::name).collect();
+        let has_agg = items.iter().any(|it| matches!(it, RetItem::Agg(_)));
 
-        if distinct {
-            plan = plan.distinct();
-        }
-
-        // ORDER BY / SKIP / LIMIT, over the OUTPUT columns (referenced by name),
-        // so it composes above aggregation and DISTINCT alike.
+        // ORDER BY: a key that is a visible output alias sorts by that column; a key
+        // that is an EXPRESSION over the bindings (`ORDER BY n.age`, `a.x + a.y`) is
+        // projected as a HIDDEN column here, sorted on, then dropped by a final
+        // projection — so ORDER BY is not limited to the returned columns.
+        let mut hidden: Vec<(String, Expr)> = Vec::new();
         let keys = if self.eat_kw("ORDER") {
             if !self.eat_kw("BY") {
                 return Err("expected BY after ORDER".into());
             }
-            self.sort_keys(&out_names)?
+            self.order_keys(&visible, has_agg, &mut hidden)?
         } else {
             Vec::new()
         };
+        for (name, e) in &hidden {
+            items.push(RetItem::Key(name.clone(), e.clone()));
+        }
+
+        let (mut plan, _all_names) = apply_items(plan, &items);
+        if distinct {
+            if !hidden.is_empty() {
+                return Err(
+                    "ORDER BY an expression together with DISTINCT is not supported; \
+                     project the sort key and ORDER BY its alias"
+                        .into(),
+                );
+            }
+            plan = plan.distinct();
+        }
         let skip = if self.eat_kw("SKIP") {
             Some(self.usize_lit()?)
         } else {
@@ -430,6 +445,15 @@ impl Parser {
         };
         if !keys.is_empty() || skip.is_some() || limit.is_some() {
             plan = plan.order_page(keys, skip, limit);
+        }
+        // Drop the hidden ORDER-BY columns, restoring exactly the visible outputs.
+        if !hidden.is_empty() {
+            let proj = visible
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.clone(), Expr::Slot(i)))
+                .collect();
+            plan = plan.project(proj);
         }
         Ok(plan)
     }
@@ -477,6 +501,9 @@ impl Parser {
 
     // sort keys := name [ASC|DESC] ( ',' name [ASC|DESC] )*
     // Each `name` is an OUTPUT column (by alias); it maps to that output slot.
+    /// ORDER BY over columns already in scope (the WITH boundary rebinds scope to the
+    /// projected outputs, so a key names an output column or an expression over them,
+    /// both evaluable on the post-projection batch — no hidden column needed).
     fn sort_keys(&mut self, out_names: &[String]) -> Result<Vec<crate::ir::SortKey>, String> {
         let mut keys = Vec::new();
         loop {
@@ -488,11 +515,70 @@ impl Parser {
             let descending = if self.eat_kw("DESC") {
                 true
             } else {
-                self.eat_kw("ASC"); // optional, default ascending
+                self.eat_kw("ASC");
                 false
             };
             keys.push(crate::ir::SortKey {
                 expr: Expr::Slot(slot),
+                descending,
+                nulls_first: false,
+            });
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Parse the ORDER BY key list. Each key is either a bare VISIBLE output alias
+    /// (→ sort by that column) or an EXPRESSION over the bindings, which is appended
+    /// to `hidden` (projected as a temporary column) and sorted on. An expression key
+    /// is rejected when the projection aggregates (the bindings are gone by then).
+    fn order_keys(
+        &mut self,
+        visible: &[String],
+        has_agg: bool,
+        hidden: &mut Vec<(String, Expr)>,
+    ) -> Result<Vec<crate::ir::SortKey>, String> {
+        // Is the next token a bare visible alias — an ident naming a visible column,
+        // followed by a sort TERMINATOR (comma / ASC / DESC / SKIP / LIMIT / end)?
+        // `n.age` is NOT (the `.` continues an expression), so it falls to `expr()`.
+        let terminator = |t: Option<&Tok>| {
+            matches!(t, None | Some(Tok::Comma))
+                || matches!(t, Some(Tok::Ident(s))
+                    if ["DESC", "ASC", "SKIP", "LIMIT"].iter().any(|k| s.eq_ignore_ascii_case(k)))
+        };
+        let mut keys = Vec::new();
+        loop {
+            let alias = match self.peek() {
+                Some(Tok::Ident(name)) => visible
+                    .iter()
+                    .position(|n| n == name)
+                    .filter(|_| terminator(self.toks.get(self.pos + 1))),
+                _ => None,
+            };
+            let expr = if let Some(slot) = alias {
+                self.bump();
+                Expr::Slot(slot)
+            } else {
+                if has_agg {
+                    return Err(
+                        "ORDER BY with aggregation must reference an output column by alias".into(),
+                    );
+                }
+                let e = self.expr()?;
+                let slot = visible.len() + hidden.len();
+                hidden.push((format!("__order{}", hidden.len()), e));
+                Expr::Slot(slot)
+            };
+            let descending = if self.eat_kw("DESC") {
+                true
+            } else {
+                self.eat_kw("ASC"); // optional, default ascending
+                false
+            };
+            keys.push(crate::ir::SortKey {
+                expr,
                 descending,
                 nulls_first: false, // GQL: NULLs last, both directions
             });
@@ -3796,6 +3882,45 @@ mod tests {
             &store,
         );
         assert!(matches!(col(&neg, 0, "x"), Value::Str(s) if &*s == "alice"));
+    }
+
+    /// ORDER BY can sort by an UNPROJECTED expression (`ORDER BY n.age` when only
+    /// `n.name` is returned) — projected as a hidden column, sorted, then dropped.
+    #[test]
+    fn order_by_unprojected_expression() {
+        let mut b = Builder::default();
+        for (nm, age) in [("c", 3.0), ("a", 1.0), ("b", 2.0)] {
+            b.node(&["P"], &[("name", s(nm)), ("age", n(age))]);
+        }
+        let store = b.build();
+        let names = |q: &str| -> Vec<String> {
+            run(&super::parse(q).unwrap(), &store)
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Value::Str(s) => s.to_string(),
+                    o => format!("{o:?}"),
+                })
+                .collect()
+        };
+        // Sort by the unprojected age; only name is returned.
+        assert_eq!(
+            names("MATCH (p:P) RETURN p.name AS nm ORDER BY p.age"),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(
+            names("MATCH (p:P) RETURN p.name AS nm ORDER BY p.age DESC"),
+            vec!["c", "b", "a"]
+        );
+        // The output is exactly the returned column (hidden sort column dropped).
+        assert_eq!(
+            run(
+                &super::parse("MATCH (p:P) RETURN p.name AS nm ORDER BY p.age").unwrap(),
+                &store
+            )
+            .names,
+            vec!["nm".to_string()]
+        );
     }
 
     /// `RETURN r` (a bound edge) renders core's edge element map —
