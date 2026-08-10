@@ -54,10 +54,72 @@ use fnv::{Map as FnvMap, Set as FnvSet};
 /// A materialized result: column names and rows of values. `Value` intentionally
 /// has no `PartialEq` (f64/NaN policy lives in the value contract, not a derive),
 /// so compare results through `value::equals`/`cmp_total`, not `==`.
+/// Result cells in a FLAT row-major buffer (`data[i*ncols + j]`) — one allocation
+/// for the whole result instead of a `Vec` per row. The nested `Vec<Vec<Value>>`
+/// layout measured ~4x slower to build (a malloc per row), and this matches core's
+/// `RowSet`. It still indexes and iterates like the old nested layout —
+/// `flat[i]` / `flat[i][j]` yield a row slice / cell, `flat.len()` the row count,
+/// `flat.iter()` (and `&flat`) yield `&[Value]` rows — so read sites are unchanged;
+/// only construction goes through [`Flat::from_rows`] or the direct push in `run`.
+#[derive(Debug, Clone, Default)]
+pub struct Flat {
+    data: Vec<Value>,
+    ncols: usize,
+}
+
+impl Flat {
+    fn with_capacity(nrows: usize, ncols: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(nrows.saturating_mul(ncols)),
+            ncols,
+        }
+    }
+    /// The number of rows (`data.len() / ncols`).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.data.len().checked_div(self.ncols).unwrap_or(0)
+    }
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+    /// Iterate rows as `&[Value]` slices — the drop-in for the old `Vec::iter`.
+    pub fn iter(&self) -> std::slice::Chunks<'_, Value> {
+        self.data.chunks(self.ncols.max(1))
+    }
+    /// Build from the nested layout — the construction path for tests and callers
+    /// that already hold a `Vec<Vec<Value>>`.
+    #[must_use]
+    pub fn from_rows(rows: Vec<Vec<Value>>) -> Self {
+        let ncols = rows.first().map_or(0, Vec::len);
+        let mut data = Vec::with_capacity(rows.len().saturating_mul(ncols));
+        for r in rows {
+            data.extend(r);
+        }
+        Self { data, ncols }
+    }
+}
+
+impl std::ops::Index<usize> for Flat {
+    type Output = [Value];
+    fn index(&self, i: usize) -> &[Value] {
+        let c = self.ncols.max(1);
+        &self.data[i * c..i * c + c]
+    }
+}
+
+impl<'a> IntoIterator for &'a Flat {
+    type Item = &'a [Value];
+    type IntoIter = std::slice::Chunks<'a, Value>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 #[derive(Debug)]
 pub struct Rows {
     pub names: Vec<String>,
-    pub rows: Vec<Vec<Value>>,
+    pub rows: Flat,
 }
 
 /// Run `plan` over `store`, returning materialized rows. Output column names come
@@ -83,14 +145,22 @@ pub fn try_run(plan: &Plan, store: &Store) -> Result<Rows, String> {
     let n = batch.rows();
     Ok(match output_names(plan) {
         Some(names) => {
-            let rows = (0..n)
-                .map(|i| batch.slots.iter().map(|c| c.value_at(i)).collect())
-                .collect();
+            // One flat allocation, row-major: for each row, push every slot's cell.
+            let ncols = names.len();
+            let mut rows = Flat::with_capacity(n, ncols);
+            for i in 0..n {
+                for c in &batch.slots {
+                    rows.data.push(c.value_at(i));
+                }
+            }
             Rows { names, rows }
         }
         None => {
             let slot0 = batch.slot(0);
-            let rows = (0..n).map(|i| vec![slot0.value_at(i)]).collect();
+            let mut rows = Flat::with_capacity(n, 1);
+            for i in 0..n {
+                rows.data.push(slot0.value_at(i));
+            }
             Rows {
                 names: vec!["_".to_string()],
                 rows,
@@ -381,7 +451,7 @@ fn pattern_value(props: &[(String, Value)], key: &str) -> Value {
 fn empty_rows() -> Rows {
     Rows {
         names: Vec::new(),
-        rows: Vec::new(),
+        rows: Flat::default(),
     }
 }
 

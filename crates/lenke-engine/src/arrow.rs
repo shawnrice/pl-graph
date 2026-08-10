@@ -1038,6 +1038,7 @@ pub fn to_arrow_ipc(rows: &Rows, file: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::Flat;
     use crate::value::make_record;
     use std::sync::Arc;
 
@@ -1106,10 +1107,10 @@ mod tests {
     fn arrow_blob_header_and_types() {
         let rows = Rows {
             names: vec!["age".into(), "name".into(), "ok".into()],
-            rows: vec![
+            rows: Flat::from_rows(vec![
                 vec![n(30.0), s("alice"), Value::Bool(true)],
                 vec![n(25.0), s("bob"), Value::Bool(false)],
-            ],
+            ]),
         };
         let blob = to_arrow(&rows);
         assert_eq!(&blob[0..4], b"ARW1");
@@ -1131,11 +1132,11 @@ mod tests {
     fn arrow_round_trips_cells_including_nulls() {
         let rows = Rows {
             names: vec!["v".into(), "s".into()],
-            rows: vec![
+            rows: Flat::from_rows(vec![
                 vec![n(1.5), s("x")],
                 vec![Value::Null, Value::Null], // a null in each column
                 vec![n(-2.0), s("z")],
-            ],
+            ]),
         };
         let blob = to_arrow(&rows);
         let decoded = decode(&blob);
@@ -1157,7 +1158,7 @@ mod tests {
     fn mixed_num_and_bool_becomes_utf8() {
         let rows = Rows {
             names: vec!["mixed".into()],
-            rows: vec![vec![n(1.0)], vec![Value::Bool(true)]],
+            rows: Flat::from_rows(vec![vec![n(1.0)], vec![Value::Bool(true)]]),
         };
         let decoded = decode(&to_arrow(&rows));
         assert_eq!(decoded[0].1, T_UTF8);
@@ -1190,10 +1191,10 @@ mod tests {
     fn fixed_size_list_layout() {
         let rows = Rows {
             names: vec!["pair".into()],
-            rows: vec![
+            rows: Flat::from_rows(vec![
                 vec![Value::List(vec![n(1.0), n(2.0)])],
                 vec![Value::List(vec![n(3.0), n(4.0)])],
-            ],
+            ]),
         };
         let blob = to_arrow(&rows);
         assert_eq!(u64_at(&blob, 16), 1); // one top-level column
@@ -1213,7 +1214,7 @@ mod tests {
     fn struct_layout_is_preorder() {
         let rows = Rows {
             names: vec!["rec".into()],
-            rows: vec![
+            rows: Flat::from_rows(vec![
                 vec![make_record(vec![
                     (Arc::from("z"), s("x")),
                     (Arc::from("a"), n(1.0)),
@@ -1222,7 +1223,7 @@ mod tests {
                     (Arc::from("z"), s("y")),
                     (Arc::from("a"), n(2.0)),
                 ])],
-            ],
+            ]),
         };
         let blob = to_arrow(&rows);
         assert_eq!(u64_at(&blob, 16), 1); // header counts TOP-LEVEL columns only
@@ -1252,10 +1253,10 @@ mod tests {
     fn struct_null_row_marked() {
         let rows = Rows {
             names: vec!["rec".into()],
-            rows: vec![
+            rows: Flat::from_rows(vec![
                 vec![make_record(vec![(Arc::from("a"), n(1.0))])],
                 vec![Value::Null],
-            ],
+            ]),
         };
         let blob = to_arrow(&rows);
         // struct descriptor null_count (field 1) == 1
@@ -1271,7 +1272,7 @@ mod tests {
         let map = Value::Map(Arc::new(vec![(s("a"), n(1.0)), (s("b"), n(2.0))]));
         let rows = Rows {
             names: vec!["m".into()],
-            rows: vec![vec![map]],
+            rows: Flat::from_rows(vec![vec![map]]),
         };
         let blob = to_arrow(&rows);
         assert_eq!(desc(&blob, 0).0, T_STRUCT);
