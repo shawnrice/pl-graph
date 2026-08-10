@@ -1730,11 +1730,12 @@ impl Parser {
             | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh"
             | "cot" | "degrees" | "radians" | "upper" | "lower" | "trim" | "length" | "size"
             | "head" | "last" | "year" | "month" | "day" | "hour" | "minute" | "second"
-            | "date" | "local_time" | "datetime" | "local_datetime" | "zoned_time"
-            | "zoned_datetime" | "duration" | "to_integer" | "tointeger" | "to_float"
-            | "tofloat" | "to_string" | "tostring" | "to_boolean" | "toboolean" | "char_length"
-            | "character_length" | "byte_length" | "octet_length" | "reverse" | "tail" | "keys"
-            | "labels" | "type" | "property_names" | "list_sort" | "element_id" => args.len() == 1,
+            | "_year" | "_month" | "_day" | "_hour" | "_minute" | "_second" | "date"
+            | "local_time" | "datetime" | "local_datetime" | "zoned_time" | "zoned_datetime"
+            | "duration" | "to_integer" | "tointeger" | "to_float" | "tofloat" | "to_string"
+            | "tostring" | "to_boolean" | "toboolean" | "char_length" | "character_length"
+            | "byte_length" | "octet_length" | "reverse" | "tail" | "keys" | "labels" | "type"
+            | "property_names" | "list_sort" | "element_id" => args.len() == 1,
             // list algebra (2 args)
             "append" | "list_contains" | "list_union" | "difference" | "intersection" => {
                 args.len() == 2
@@ -1831,12 +1832,13 @@ fn temporal_tag(kw: &str) -> Option<&'static str> {
     })
 }
 
-/// Map a path-accessor function name to its `PathPart`, or `None` if it is not
-/// one — the four ISO path functions (NOT `vertices`/`edges`).
+/// Map a path-accessor function name to its `PathPart`, or `None` if it is not one.
+/// `edges` is core's spelling for the relationships accessor — accepted for parity
+/// alongside the engine's `relationships` (a superset alias).
 fn path_part(name: &str) -> Option<PathPart> {
     Some(match name {
         "nodes" => PathPart::Nodes,
-        "relationships" => PathPart::Relationships,
+        "relationships" | "edges" => PathPart::Relationships,
         "path_length" => PathPart::Length,
         "elements" => PathPart::Elements,
         _ => return None,
@@ -2598,17 +2600,18 @@ mod tests {
         ] {
             assert_eq!(num(&col(&out, 0, name)), want, "{name}");
         }
-        // A component undefined for the kind is NULL (year of a time, hour of a date).
-        let out2 = run(
-            &super::parse(
-                "MATCH (p:Person) RETURN year(TIME '01:02:03') AS y, \
-                 hour(DATE '2024-01-01') AS h",
-            )
-            .unwrap(),
-            &store,
-        );
-        assert!(col(&out2, 0, "y").is_null());
-        assert!(col(&out2, 0, "h").is_null());
+        // A component undefined for the kind FAULTS with E_INVALID_VALUE (year of a
+        // time, hour of a date) — matching core, which errors rather than NULLs.
+        for q in [
+            "MATCH (p:Person) RETURN year(TIME '01:02:03') AS y",
+            "MATCH (p:Person) RETURN hour(DATE '2024-01-01') AS h",
+        ] {
+            let err = crate::exec::try_run(&super::parse(q).unwrap(), &store);
+            assert!(
+                matches!(&err, Err(e) if e.contains("E_INVALID_VALUE")),
+                "expected fault for `{q}`, got {err:?}"
+            );
+        }
     }
 
     #[test]

@@ -3241,12 +3241,12 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             // (`pi()`, `e()`) has no arg columns yet still yields one value per row.
             let cols = eval_all(args, store, batch)?;
             let n = batch.rows();
-            let out: Vec<Value> = (0..n)
+            let out = (0..n)
                 .map(|i| {
                     let row: Vec<Value> = cols.iter().map(|c| c.value_at(i)).collect();
-                    call_scalar(name, &row)
+                    call_scalar_checked(name, &row)
                 })
-                .collect();
+                .collect::<Result<Vec<Value>, String>>()?;
             Col::Gen(out)
         }
         Expr::List { items } => {
@@ -3445,6 +3445,41 @@ fn eval_all<'a>(
 /// Dispatch a scalar function over its already-evaluated argument row. Arity is
 /// enforced by the parser, so indexing `args` here is safe. NULL / wrong-type
 /// arguments yield NULL (no coercion, no throw).
+/// The fallible wrapper around [`call_scalar`]: nearly every scalar function is
+/// total, but a temporal component accessor of a kind that lacks that component
+/// (`_year` of a time, `_hour` of a date) FAULTS with `E_INVALID_VALUE` — matching
+/// core, which returns an error there rather than NULL. A non-temporal / null arg
+/// still yields NULL (nullish propagation), not a fault.
+fn call_scalar_checked(name: &str, args: &[Value]) -> Result<Value, String> {
+    if matches!(
+        name,
+        "year"
+            | "month"
+            | "day"
+            | "hour"
+            | "minute"
+            | "second"
+            | "_year"
+            | "_month"
+            | "_day"
+            | "_hour"
+            | "_minute"
+            | "_second"
+    ) {
+        if let Value::Temporal(t) = &args[0] {
+            return date_part(name.trim_start_matches('_'), *t)
+                .map(|n| Value::Num(n as f64))
+                .ok_or_else(|| {
+                    format!(
+                        "E_INVALID_VALUE: {} is undefined for this temporal kind",
+                        name.trim_start_matches('_')
+                    )
+                });
+        }
+    }
+    Ok(call_scalar(name, args))
+}
+
 fn call_scalar(name: &str, args: &[Value]) -> Value {
     match name {
         // variadic
@@ -3648,8 +3683,12 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         },
         // Temporal component accessors (1 arg → number, or NULL when the component
         // is undefined for that kind, e.g. year() of a time).
-        "year" | "month" | "day" | "hour" | "minute" | "second" => match &args[0] {
-            Value::Temporal(t) => date_part(name, *t).map_or(Value::Null, |n| Value::Num(n as f64)),
+        // Core spells these with the leading-underscore extension sigil (`_year`);
+        // accept that (parity) plus the bare name (kept as a superset alias).
+        "year" | "month" | "day" | "hour" | "minute" | "second" | "_year" | "_month" | "_day"
+        | "_hour" | "_minute" | "_second" => match &args[0] {
+            Value::Temporal(t) => date_part(name.trim_start_matches('_'), *t)
+                .map_or(Value::Null, |n| Value::Num(n as f64)),
             _ => Value::Null,
         },
         // Temporal constructors: parse a string, or coerce between kinds.
@@ -3921,8 +3960,11 @@ fn scalar_num_fn(name: &str, v: &Value) -> Value {
         "cosh" => x.cosh(),
         "tanh" => x.tanh(),
         "cot" => 1.0 / x.tan(),
-        "degrees" => x.to_degrees(),
-        "radians" => x.to_radians(),
+        // Multiply-then-divide, NOT `to_degrees`/`to_radians`: the latter pre-round
+        // the 180/PI (resp. PI/180) constant and land one ULP off core's byte-exact
+        // `(n*180)/PI` / `(n*PI)/180`.
+        "degrees" => (x * 180.0) / std::f64::consts::PI,
+        "radians" => (x * std::f64::consts::PI) / 180.0,
         _ => return Value::Null, // parser rejects unknown names; defensive
     };
     // NaN/Inf are KEPT (K4) — a computed NaN (`sqrt(-1)`, `ln(-1)`) is a real

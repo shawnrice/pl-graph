@@ -224,6 +224,7 @@ fn main() {
         ("order_desc_nulls", p_order_desc),
         ("string_fns", p_string_fns),
         ("numeric_fns", p_numeric_fns),
+        ("temporal_fns", p_temporal_fns),
         ("list_element_fns", p_list_fns),
         ("list_algebra_fns", p_list_algebra),
         ("type_fn", p_type_fn),
@@ -459,6 +460,36 @@ fn p_string_fns(rng: &mut Rng) -> (String, bool) {
     (
         format!(
             "{} RETURN {v}.id AS a0, {call} AS a1 ORDER BY a0",
+            pattern(v)
+        ),
+        true,
+    )
+}
+fn p_temporal_fns(rng: &mut Rng) -> (String, bool) {
+    // Component accessors over literal temporals — core spells them with the
+    // underscore sigil (`_year`, `_month`, …), which the engine must accept.
+    let v = var(rng);
+    let (ctor, comp) = match rng.below(4) {
+        0 => (
+            "date('2020-05-17')",
+            ["_year", "_month", "_day"][rng.below(3)],
+        ),
+        1 => (
+            "datetime('2020-05-17T13:45:06')",
+            ["_year", "_hour", "_minute", "_second"][rng.below(4)],
+        ),
+        2 => (
+            "local_time('13:45:06')",
+            ["_hour", "_minute", "_second", "_year"][rng.below(4)], // _year of a time → NULL, both
+        ),
+        _ => (
+            "date('1999-12-31')",
+            ["_year", "_month", "_day"][rng.below(3)],
+        ),
+    };
+    (
+        format!(
+            "{} RETURN {v}.id AS a0, {comp}({ctor}) AS a1 ORDER BY a0",
             pattern(v)
         ),
         true,
