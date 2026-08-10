@@ -634,38 +634,77 @@ pub fn on_cycle(store: &Store, edge_label: Option<&str>) -> Vec<(u32, f64)> {
 /// deferred — this is the exact unweighted default. Returns `(node, centrality)` in
 /// ascending-id order; a named-but-unknown edge type → every vertex `0.0`.
 #[must_use]
-pub fn betweenness(store: &Store, edge_label: Option<&str>) -> Vec<(u32, f64)> {
+pub fn betweenness(
+    store: &Store,
+    edge_label: Option<&str>,
+    weight_property: Option<&str>,
+) -> Vec<(u32, f64)> {
     let n = store.node_count();
     let live = store.all_nodes();
     let want = want_etype(store, edge_label);
+    let type_ok = |et: u32| want.is_some_and(|inner| inner.is_none_or(|t| t == et));
     let mut cb = vec![0f64; n];
 
     for &s in &live {
-        // --- BFS single-source shortest-path DAG (sigma / pred / stack) ---
+        // --- single-source shortest-path DAG (sigma / pred / stack) ---
         let mut sigma = vec![0f64; n];
         let mut pred: Vec<Vec<u32>> = vec![Vec::new(); n];
         let mut dist = vec![f64::INFINITY; n];
         let mut stack: Vec<u32> = Vec::new();
         sigma[s as usize] = 1.0;
         dist[s as usize] = 0.0;
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(s);
-        while let Some(v) = queue.pop_front() {
-            stack.push(v);
-            let dv = dist[v as usize];
-            if let Some(w) = want {
-                for_each_nbr(store, v, Dir::Out, w, |to| {
-                    if dist[to as usize].is_infinite() {
-                        dist[to as usize] = dv + 1.0;
-                        queue.push_back(to);
+        if let Some(wk) = weight_property {
+            // Weighted Dijkstra SSSP: settle in (dist, idx) heap order (== stack
+            // order); sigma RESETS on a strictly shorter path, ACCUMULATES on an
+            // equal-length one — core's weighted `sssp` branch exactly.
+            let mut settled = vec![false; n];
+            let mut heap = std::collections::BinaryHeap::new();
+            heap.push(DijkstraState { dist: 0.0, idx: s });
+            while let Some(DijkstraState { idx: v, .. }) = heap.pop() {
+                if settled[v as usize] {
+                    continue;
+                }
+                settled[v as usize] = true;
+                stack.push(v);
+                let dv = dist[v as usize];
+                for a in store.out(v) {
+                    if !type_ok(a.etype) {
+                        continue;
                     }
-                    // A shortest-path edge (v is one hop closer than `to`): count v's
-                    // paths into `to` and record v as a predecessor (edge order).
-                    if dist[to as usize] == dv + 1.0 {
+                    let to = a.nbr;
+                    let nd = dv + edge_weight(store, a.eid, wk);
+                    if nd < dist[to as usize] {
+                        dist[to as usize] = nd;
+                        sigma[to as usize] = sigma[v as usize];
+                        pred[to as usize] = vec![v];
+                        heap.push(DijkstraState { dist: nd, idx: to });
+                    } else if nd == dist[to as usize] {
                         sigma[to as usize] += sigma[v as usize];
                         pred[to as usize].push(v);
                     }
-                });
+                }
+            }
+        } else {
+            // Unweighted BFS layers.
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back(s);
+            while let Some(v) = queue.pop_front() {
+                stack.push(v);
+                let dv = dist[v as usize];
+                if let Some(w) = want {
+                    for_each_nbr(store, v, Dir::Out, w, |to| {
+                        if dist[to as usize].is_infinite() {
+                            dist[to as usize] = dv + 1.0;
+                            queue.push_back(to);
+                        }
+                        // A shortest-path edge (v is one hop closer than `to`): count
+                        // v's paths into `to` and record v as a predecessor.
+                        if dist[to as usize] == dv + 1.0 {
+                            sigma[to as usize] += sigma[v as usize];
+                            pred[to as usize].push(v);
+                        }
+                    });
+                }
             }
         }
 
@@ -1107,7 +1146,7 @@ pub fn run_procedure(
             .map(|(v, c)| (v, f64::from(c)))
             .collect(),
         "on_cycle" => on_cycle(store, str_of("edgeType")),
-        "betweenness" => betweenness(store, str_of("edgeType")),
+        "betweenness" => betweenness(store, str_of("edgeType"), str_of("weightProperty")),
         "shortest_path" => shortest_path(
             store,
             str_of("source"),
@@ -1271,7 +1310,7 @@ mod tests {
         // one 2-hop shortest path, so every betweenness is 1.0; the isolated node 0.
         let st = triangle_plus_isolated();
         assert_eq!(
-            betweenness(&st, None),
+            betweenness(&st, None, None),
             vec![(0, 1.0), (1, 1.0), (2, 1.0), (3, 0.0)]
         );
         // Diamond 0→1, 0→2, 1→3, 2→3: from 0 there are TWO shortest paths to 3, so
@@ -1287,12 +1326,12 @@ mod tests {
         b.edge(r, d, "R");
         let diamond = b.build();
         assert_eq!(
-            betweenness(&diamond, None),
+            betweenness(&diamond, None, None),
             vec![(0, 0.0), (1, 0.5), (2, 0.5), (3, 0.0)]
         );
         // A named-but-unknown edge type → no paths → every vertex 0.0.
         assert_eq!(
-            betweenness(&st, Some("NOPE")),
+            betweenness(&st, Some("NOPE"), None),
             vec![(0, 0.0), (1, 0.0), (2, 0.0), (3, 0.0)]
         );
     }
@@ -1447,6 +1486,35 @@ mod tests {
         assert_eq!(
             closeness(&st, None, None),
             vec![(0, 1.0 / 2.0), (1, 0.0), (2, 1.0)]
+        );
+    }
+
+    #[test]
+    fn betweenness_weighted_reroutes_dependency() {
+        // Diamond 0→1, 0→2, 1→3, 2→3 with the 2→3 branch heavy (w=5): the unique
+        // weighted shortest 0→3 goes via 1, so node 1 carries the FULL dependency
+        // (1.0) and node 2 none — where the UNWEIGHTED graph splits it 0.5/0.5.
+        let mut b = Builder::default();
+        for _ in 0..4 {
+            b.node(&["N"], &[]);
+        }
+        let mut st = b.build();
+        let e0 = st.add_edge(0, 1, "R");
+        st.set_edge_prop(e0, "w", Value::Num(1.0));
+        let e1 = st.add_edge(0, 2, "R");
+        st.set_edge_prop(e1, "w", Value::Num(1.0));
+        let e2 = st.add_edge(1, 3, "R");
+        st.set_edge_prop(e2, "w", Value::Num(1.0));
+        let e3 = st.add_edge(2, 3, "R");
+        st.set_edge_prop(e3, "w", Value::Num(5.0));
+
+        assert_eq!(
+            betweenness(&st, None, Some("w")),
+            vec![(0, 0.0), (1, 1.0), (2, 0.0), (3, 0.0)]
+        );
+        assert_eq!(
+            betweenness(&st, None, None),
+            vec![(0, 0.0), (1, 0.5), (2, 0.5), (3, 0.0)]
         );
     }
 

@@ -3368,6 +3368,41 @@ mod tests {
     }
 
     #[test]
+    fn call_betweenness_weighted() {
+        // Diamond with a heavy 2→3 branch: weighted betweenness routes all 0→3
+        // dependency through node 1 (1.0), where unweighted splits it 0.5/0.5.
+        let mut bld = Builder::default();
+        for _ in 0..4 {
+            bld.node(&["N"], &[]);
+        }
+        let mut store = bld.build();
+        let e0 = store.add_edge(0, 1, "R");
+        store.set_edge_prop(e0, "w", Value::Num(1.0));
+        let e1 = store.add_edge(0, 2, "R");
+        store.set_edge_prop(e1, "w", Value::Num(1.0));
+        let e2 = store.add_edge(1, 3, "R");
+        store.set_edge_prop(e2, "w", Value::Num(1.0));
+        let e3 = store.add_edge(2, 3, "R");
+        store.set_edge_prop(e3, "w", Value::Num(5.0));
+
+        let rows_of = |q: &str| -> Vec<(f64, f64)> {
+            run(&super::parse(q).unwrap(), &store)
+                .rows
+                .iter()
+                .map(|r| (node_id(&r[0]), num(&r[1])))
+                .collect()
+        };
+        assert_eq!(
+            rows_of("CALL betweenness({weightProperty: 'w'}) YIELD node, centrality"),
+            vec![(0.0, 0.0), (1.0, 1.0), (2.0, 0.0), (3.0, 0.0)]
+        );
+        assert_eq!(
+            rows_of("CALL betweenness()"),
+            vec![(0.0, 0.0), (1.0, 0.5), (2.0, 0.5), (3.0, 0.0)]
+        );
+    }
+
+    #[test]
     fn call_personalized_pagerank_yields_score() {
         let store = triangle_store();
         let rows_of = |q: &str| -> Vec<(f64, f64)> {
