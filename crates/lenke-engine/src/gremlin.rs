@@ -282,10 +282,27 @@ impl Parser {
             }
             "has" => {
                 let key = self.str_arg()?;
-                self.expect(&Tok::Comma)?;
-                let pred = self.has_predicate(key)?;
+                // has(k, pred) — value predicate; has(k) — key EXISTENCE.
+                let pred = if self.peek() == Some(&Tok::Comma) {
+                    self.bump();
+                    self.has_predicate(key)?
+                } else {
+                    Expr::PropertyExists {
+                        slot: self.current,
+                        key,
+                    }
+                };
                 self.expect(&Tok::RParen)?;
                 plan.filter(pred)
+            }
+            // hasNot(k): the element must NOT carry property `k`.
+            "hasnot" => {
+                let key = self.str_arg()?;
+                self.expect(&Tok::RParen)?;
+                plan.filter(Expr::Not(Box::new(Expr::PropertyExists {
+                    slot: self.current,
+                    key,
+                })))
             }
             "out" | "in" | "both" => {
                 // 0 args → ANY edge type (argless out()); 1 → that type. Multi-label
@@ -821,6 +838,22 @@ mod tests {
         run(&plan, store)
     }
 
+    /// `has(k)` filters elements that CARRY property `k`; `hasNot(k)` those that
+    /// don't — matching core. Only the `Project` node (graphdb) lacks `age`.
+    #[test]
+    fn gremlin_has_key_existence_and_hasnot() {
+        let store = social();
+        let has_age = value_bag(&gremlin_rows("g.V().has('age').values('name')", &store));
+        assert_eq!(
+            has_age,
+            vec!["Str(\"alice\");", "Str(\"bob\");", "Str(\"carol\");"]
+        );
+        let no_age = value_bag(&gremlin_rows("g.V().hasNot('age').values('name')", &store));
+        assert_eq!(no_age, vec!["Str(\"graphdb\");"]);
+        // has(k, pred) — the value-predicate form — still works.
+        assert!(super::parse("g.V().has('age', gt(28)).values('name')").is_ok());
+    }
+
     /// Argless `out()`/`in()`/`both()` traverse edges of ANY type (matching core),
     /// where a labelled hop is narrower — alice's WORKS_ON target only shows up
     /// through the untyped hop.
@@ -1028,7 +1061,8 @@ mod tests {
         assert!(super::parse("g.V(").is_err());
         assert!(super::parse("g.E().values('x')").is_err()); // only V()/addV() supported
         assert!(super::parse("g.V().frobnicate()").is_err()); // unknown step
-        assert!(super::parse("g.V().has('k')").is_err()); // has needs a value
+        assert!(super::parse("g.V().has('k')").is_ok()); // has(k) is key-existence now
+        assert!(super::parse("g.V().has()").is_err()); // has still needs a key
     }
 
     // --- writes: addV / property / drop ---
