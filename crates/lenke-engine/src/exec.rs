@@ -2207,9 +2207,11 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
         }
         Expr::Call { name, args } => {
             // Evaluate each argument to a column, then dispatch per row. Arity is
-            // validated at parse time, so `call_scalar` can index its args.
+            // validated at parse time, so `call_scalar` can index its args. The row
+            // count is the BATCH's, not the min over args — a niladic function
+            // (`pi()`, `e()`) has no arg columns yet still yields one value per row.
             let cols = eval_all(args, store, batch)?;
-            let n = cols.iter().map(Col::len).min().unwrap_or(0);
+            let n = batch.rows();
             let out: Vec<Value> = (0..n)
                 .map(|i| {
                     let row: Vec<Value> = cols.iter().map(|c| c.value_at(i)).collect();
@@ -2422,14 +2424,58 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             .find(|v| !v.is_null())
             .cloned()
             .unwrap_or(Value::Null),
+        // numeric constants (0 args)
+        "e" => Value::Num(std::f64::consts::E),
+        "pi" => Value::Num(std::f64::consts::PI),
         // numeric (1 arg)
-        "abs" | "sign" | "floor" | "ceil" | "round" | "sqrt" => scalar_num_fn(name, &args[0]),
+        "abs" | "sign" | "floor" | "ceil" | "ceiling" | "round" | "sqrt" | "exp" | "ln" | "sin"
+        | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "cot"
+        | "degrees" | "radians" => scalar_num_fn(name, &args[0]),
+        // numeric (2 args). `log(a, b)` is log-base-a of b = ln(b)/ln(a) (matches
+        // core's argument order); `mod` is the fn form of `%` (NaN on a zero
+        // divisor — it does NOT throw like the `%` OPERATOR, which core reserves for
+        // the operator). Non-finite results fall to NULL until K4.
+        "log" | "power" | "mod" => match (value::as_num(&args[0]), value::as_num(&args[1])) {
+            (Some(x), Some(y)) => {
+                let r = match name {
+                    "log" => y.ln() / x.ln(),
+                    "power" => x.powf(y),
+                    _ => x % y,
+                };
+                if r.is_finite() {
+                    Value::Num(r)
+                } else {
+                    Value::Null
+                }
+            }
+            _ => Value::Null,
+        },
+        // nullif(a, b): NULL when a == b (value-contract equality), else a.
+        "nullif" => {
+            if !args[0].is_null() && !args[1].is_null() && value::equals(&args[0], &args[1]) {
+                Value::Null
+            } else {
+                args[0].clone()
+            }
+        }
+        // Cast FUNCTIONS: NULL on a failed/inapplicable conversion (unlike `CAST`,
+        // which throws — and unlike `CAST`, these do NOT coerce a Bool to a number).
+        "to_integer" | "tointeger" => to_number(&args[0], true),
+        "to_float" | "tofloat" => to_number(&args[0], false),
+        "to_string" | "tostring" => to_string_fn(&args[0]),
+        "to_boolean" | "toboolean" => to_boolean_fn(&args[0]),
         // string (1 arg → string/number)
         "upper" => str_map(&args[0], str::to_uppercase),
         "lower" => str_map(&args[0], str::to_lowercase),
         "trim" => str_map(&args[0], |s| s.trim().to_string()),
-        "length" => match &args[0] {
+        // Character count of a string. `length`/`char_length`/`character_length`
+        // are synonyms here; `byte_length`/`octet_length` count UTF-8 bytes.
+        "length" | "char_length" | "character_length" => match &args[0] {
             Value::Str(s) => Value::Num(s.chars().count() as f64),
+            _ => Value::Null,
+        },
+        "byte_length" | "octet_length" => match &args[0] {
+            Value::Str(s) => Value::Num(s.len() as f64),
             _ => Value::Null,
         },
         // string predicates (2 args → bool)
@@ -2445,9 +2491,11 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         },
         // substring(s, start[, len]) — 0-based, char-indexed
         "substring" => substring(args),
-        // list (1 arg)
+        // `size` is polymorphic over a collection OR a string (char count), like
+        // lenke-core; a non-collection non-string is NULL.
         "size" => match &args[0] {
             Value::List(v) => Value::Num(v.len() as f64),
+            Value::Str(s) => Value::Num(s.chars().count() as f64),
             _ => Value::Null,
         },
         "head" => match &args[0] {
@@ -2695,15 +2743,98 @@ fn scalar_num_fn(name: &str, v: &Value) -> Value {
             }
         }
         "floor" => x.floor(),
-        "ceil" => x.ceil(),
+        "ceil" | "ceiling" => x.ceil(),
         "round" => x.round(),
         "sqrt" => x.sqrt(),
+        // Transcendentals — native libm, matching lenke-core's native build. A
+        // domain-invalid result (e.g. `ln(-1)`, `cot(0)`) is NaN/Inf and, for now,
+        // falls to NULL through the finite gate below (K4 will KEEP it, like core).
+        "exp" => x.exp(),
+        "ln" => x.ln(),
+        "sin" => x.sin(),
+        "cos" => x.cos(),
+        "tan" => x.tan(),
+        "asin" => x.asin(),
+        "acos" => x.acos(),
+        "atan" => x.atan(),
+        "sinh" => x.sinh(),
+        "cosh" => x.cosh(),
+        "tanh" => x.tanh(),
+        "cot" => 1.0 / x.tan(),
+        "degrees" => x.to_degrees(),
+        "radians" => x.to_radians(),
         _ => return Value::Null, // parser rejects unknown names; defensive
     };
     if r.is_finite() {
         Value::Num(r)
     } else {
         Value::Null
+    }
+}
+
+/// `to_integer`/`to_float` FUNCTION: Num (truncated for integer) or a parseable
+/// string; anything else — INCLUDING a Bool — is NULL (the fn forms do not coerce
+/// bools, unlike `CAST`). Matches lenke-core.
+fn to_number(v: &Value, integer: bool) -> Value {
+    let n = match v {
+        Value::Num(x) => *x,
+        Value::Str(s) => match s.trim().parse::<f64>() {
+            Ok(x) => x,
+            Err(_) => return Value::Null,
+        },
+        _ => return Value::Null,
+    };
+    if integer {
+        if n.is_finite() {
+            Value::Num(n.trunc())
+        } else {
+            Value::Null
+        }
+    } else {
+        Value::Num(n)
+    }
+}
+
+/// `to_string` FUNCTION: NULL→NULL, finite Num→its egress text, Bool→"true"/
+/// "false", Str→itself, Temporal→its ISO form; a non-finite number is NULL.
+fn to_string_fn(v: &Value) -> Value {
+    match v {
+        Value::Null => Value::Null,
+        Value::Str(s) => Value::Str(s.clone()),
+        Value::Bool(b) => Value::Str((if *b { "true" } else { "false" }).into()),
+        // Finite number as text; -0.0 renders as "0" (matches core — the sign of
+        // zero is dropped on string egress).
+        Value::Num(x) if x.is_finite() => {
+            let s = if *x == 0.0 {
+                "0".to_string()
+            } else {
+                x.to_string()
+            };
+            Value::Str(s.into())
+        }
+        Value::Temporal(t) => Value::Str(t.format().into()),
+        _ => Value::Null,
+    }
+}
+
+/// `to_boolean` FUNCTION: a Bool passes through; the strings "true"/"false"
+/// (trimmed, case-insensitive) convert; anything else is NULL.
+fn to_boolean_fn(v: &Value) -> Value {
+    match v {
+        Value::Bool(b) => Value::Bool(*b),
+        // A number coerces like C truthiness: nonzero → true, zero → false.
+        Value::Num(x) => Value::Bool(*x != 0.0),
+        Value::Str(s) => {
+            let t = s.trim();
+            if t.eq_ignore_ascii_case("true") {
+                Value::Bool(true)
+            } else if t.eq_ignore_ascii_case("false") {
+                Value::Bool(false)
+            } else {
+                Value::Null
+            }
+        }
+        _ => Value::Null,
     }
 }
 
@@ -3083,6 +3214,46 @@ mod tests {
             got,
             vec![("Num(2.0)".to_string(), 2.0), ("Num(7.0)".to_string(), 1.0)]
         );
+    }
+
+    /// Newly added scalar functions (K6 casts, K8 nullif, K9 math/constants,
+    /// K5 size-on-string) match hand-computed values. One node with a=4, b="Carol".
+    #[test]
+    fn added_scalar_functions() {
+        let mut b = Builder::default();
+        b.node(&["N"], &[("a", n(4.0)), ("b", s("Carol"))]);
+        let store = b.build();
+        let val = |e: &str| -> Value {
+            let q = format!("MATCH (n:N) RETURN {e} AS v");
+            run(&crate::gql::parse(&q).unwrap(), &store).rows[0][0].clone()
+        };
+        let num = |e: &str| match val(e) {
+            Value::Num(x) => x,
+            o => panic!("{e} → {o:?}"),
+        };
+        // constants + math (native libm, matching core)
+        assert!((num("pi()") - std::f64::consts::PI).abs() < 1e-12);
+        assert!((num("e()") - std::f64::consts::E).abs() < 1e-12);
+        assert_eq!(num("power(2, 10)"), 1024.0);
+        assert_eq!(num("log(2, 8)"), 3.0); // log base 2 of 8 = ln(8)/ln(2)
+        assert_eq!(num("mod(7, 3)"), 1.0);
+        assert!((num("ln(e())") - 1.0).abs() < 1e-12);
+        assert_eq!(num("degrees(pi())").round(), 180.0);
+        // casts (NULL on failure; no bool→number coercion)
+        assert_eq!(num("to_integer('7')"), 7.0);
+        assert_eq!(num("to_integer(4.9)"), 4.0);
+        assert_eq!(num("to_float('2.5')"), 2.5);
+        assert!(matches!(val("to_string(n.a)"), Value::Str(x) if &*x == "4"));
+        assert!(matches!(val("to_boolean('true')"), Value::Bool(true)));
+        assert!(matches!(val("to_boolean(0)"), Value::Bool(false)));
+        assert!(val("to_integer('nope')").is_null());
+        assert!(val("to_integer(true)").is_null()); // fn form does NOT coerce bool
+                                                    // nullif
+        assert!(val("nullif(n.a, 4)").is_null());
+        assert_eq!(num("nullif(n.a, 5)"), 4.0);
+        // size / char_length on a string (K5)
+        assert_eq!(num("size(n.b)"), 5.0);
+        assert_eq!(num("char_length(n.b)"), 5.0);
     }
 
     // --- relational core (unchanged behavior, now slot-addressed) ---

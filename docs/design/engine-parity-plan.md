@@ -579,18 +579,18 @@ Semantic bugs (wrong answers vs core) — fix for parity:
 - [ ] K4. Domain-invalid numeric fn results (~66/3000). `sqrt(-x)` (and, once
       added, `ln`/`log` of ≤0) must return NaN like core; the engine's scalar
       numeric fns map non-finite → NULL. Decide: keep computed NaN to match core.
-- [ ] K5. `size()` / `length()` on a STRING must return its length (core does);
+- [x] K5. (DONE) size()/char_length on a STRING return length.  ORIG: `size()` / `length()` on a STRING must return its length (core does);
       the engine returns NULL for a non-list. `size` on a list already agrees.
 
 Missing functions (engine parser rejects them; core has ~93, engine ~25) — add to
 the catalog (parser allow-list + eval). Grouped by family:
 
-- [ ] K6. Cast functions: `to_integer`/`tointeger`, `to_float`/`tofloat`,
+- [x] K6. (DONE) cast fns to_integer/to_float/to_string/to_boolean (+aliases), NULL-on-failure, no bool→number coercion.  ORIG: Cast functions: `to_integer`/`tointeger`, `to_float`/`tofloat`,
       `to_string`/`tostring`, `to_boolean`/`toboolean` (engine has `CAST(x AS T)`
       only). (~3000/3000 for that probe.)
 - [ ] K7. `IN` list-membership operator (`x IN [a, b, c]`) — absent entirely.
-- [ ] K8. `nullif(a, b)` (engine has `coalesce`).
-- [ ] K9. Math fns + constants: `exp`, `ln`, `log`, `sin`/`cos`/`tan`
+- [x] K8. (DONE) nullif.  ORIG: `nullif(a, b)` (engine has `coalesce`).
+- [x] K9. (DONE) math+constants: e,pi,exp,ln,log(base),power,mod,sin/cos/tan(+asin/acos/atan,sinh/cosh/tanh,cot),degrees,radians. NaN/Inf results still nulled until K4.  ORIG: Math fns + constants: `exp`, `ln`, `log`, `sin`/`cos`/`tan`
       (+`asin`/`acos`/`atan`, `sinh`/`cosh`/`tanh`/`cot`), `power`, `mod`, `e`,
       `pi`, `degrees`, `radians`. Native match core's libm (the wasm-ulp caveat in
       `backend-parity-fuzz` is not in scope here — this is native-vs-native).

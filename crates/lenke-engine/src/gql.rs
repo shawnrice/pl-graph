@@ -1595,13 +1595,20 @@ impl Parser {
             return Ok(Expr::PathAccess { part });
         }
         let arity_ok = match lname.as_str() {
+            // 0 args (numeric constants)
+            "e" | "pi" => args.is_empty(),
             // 1 arg
-            "abs" | "sign" | "floor" | "ceil" | "round" | "sqrt" | "upper" | "lower" | "trim"
-            | "length" | "size" | "head" | "last" | "year" | "month" | "day" | "hour"
-            | "minute" | "second" | "date" | "local_time" | "datetime" | "local_datetime"
-            | "zoned_time" | "zoned_datetime" | "duration" => args.len() == 1,
+            "abs" | "sign" | "floor" | "ceil" | "ceiling" | "round" | "sqrt" | "exp" | "ln"
+            | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh"
+            | "cot" | "degrees" | "radians" | "upper" | "lower" | "trim" | "length" | "size"
+            | "head" | "last" | "year" | "month" | "day" | "hour" | "minute" | "second"
+            | "date" | "local_time" | "datetime" | "local_datetime" | "zoned_time"
+            | "zoned_datetime" | "duration" | "to_integer" | "tointeger" | "to_float"
+            | "tofloat" | "to_string" | "tostring" | "to_boolean" | "toboolean" | "char_length"
+            | "character_length" | "byte_length" | "octet_length" => args.len() == 1,
             // 2 args
-            "starts_with" | "ends_with" | "contains" | "duration_between" => args.len() == 2,
+            "starts_with" | "ends_with" | "contains" | "duration_between" | "nullif" | "log"
+            | "power" | "mod" => args.len() == 2,
             // 3 args
             "replace" => args.len() == 3,
             // 2 or 3 args

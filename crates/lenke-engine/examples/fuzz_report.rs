@@ -149,20 +149,28 @@ enum Out {
     Rows(Vec<Vec<Cell>>),
     Err,
     Parse,
+    Panic,
 }
 fn eng(store: &lenke_engine::store::Store, q: &str) -> Out {
     let Ok(p) = lenke_engine::gql::parse(q) else {
         return Out::Parse;
     };
     let p = lenke_engine::opt::optimize(p);
-    match lenke_engine::exec::try_run(&p, store) {
-        Ok(r) => Out::Rows(
+    // A PANIC is the worst correctness bug (the engine must only ever return
+    // Err) — catch it so the census reports the offending query instead of
+    // aborting the whole run.
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lenke_engine::exec::try_run(&p, store)
+    }));
+    match caught {
+        Ok(Ok(r)) => Out::Rows(
             r.rows
                 .iter()
                 .map(|row| row.iter().map(ne).collect())
                 .collect(),
         ),
-        Err(_) => Out::Err,
+        Ok(Err(_)) => Out::Err,
+        Err(_) => Out::Panic,
     }
 }
 fn core(g: &mut lenke_core::graph::Graph, q: &str) -> Out {
@@ -181,10 +189,12 @@ struct Tally {
     semantic: u32,
     missing: u32,
     core_err: u32,
+    panic: u32,
     parse_skip: u32,
     repro_semantic: Option<String>,
     repro_missing: Option<String>,
     repro_core_err: Option<String>,
+    repro_panic: Option<String>,
 }
 
 fn main() {
@@ -192,6 +202,9 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3000);
+    // Silence the default panic hook — the census CATCHES panics and reports them
+    // as its worst bucket, so the per-panic backtrace spam is just noise.
+    std::panic::set_hook(Box::new(|_| {}));
 
     // Each probe: (name, generator). The generator returns (query, ordered?) where
     // `ordered` picks position-for-position vs multiset comparison.
@@ -225,6 +238,11 @@ fn main() {
             let store = lenke_engine::ndjson::from_ndjson(&engine_ndjson(&g)).unwrap();
             let mut cg = lenke_core::ndjson::decode(&core_ndjson(&g)).unwrap();
             match (eng(&store, &q), core(&mut cg, &q)) {
+                // A panic is the worst outcome — surface it regardless of core.
+                (Out::Panic, _) => {
+                    t.panic += 1;
+                    t.repro_panic.get_or_insert_with(|| q.clone());
+                }
                 (Out::Rows(mut a), Out::Rows(mut b)) => {
                     if !ordered {
                         a.sort();
@@ -250,18 +268,18 @@ fn main() {
         }
     }
 
-    println!(
-        "{:<22} {:>7} {:>9} {:>8} {:>9} {:>6}",
-        "probe", "ok", "SEMANTIC", "MISSING", "CORE_ERR", "skip"
-    );
+    println!("  probe                       ok  SEMANTIC  MISSING  CORE_ERR   PANIC   skip");
     for (name, t) in &tallies {
         println!(
-            "{name:<22} {:>7} {:>9} {:>8} {:>9} {:>6}",
-            t.ok, t.semantic, t.missing, t.core_err, t.parse_skip
+            "{name:<22} {:>9} {:>9} {:>8} {:>9} {:>7} {:>6}",
+            t.ok, t.semantic, t.missing, t.core_err, t.panic, t.parse_skip
         );
     }
     println!("\n── repros (one per probe×class) ──");
     for (name, t) in &tallies {
+        if let Some(r) = &t.repro_panic {
+            println!("PANIC     [{name}]  {r}");
+        }
         if let Some(r) = &t.repro_semantic {
             println!("SEMANTIC  [{name}]  {r}");
         }
@@ -431,7 +449,7 @@ fn p_numeric_fns(rng: &mut Rng) -> (String, bool) {
         "cos", "tan", "power", "mod", "e", "pi", "degrees", "radians",
     ]);
     let call = match *f {
-        "e" | "pi" => (*f).to_string(),
+        "e" | "pi" => format!("{f}()"),
         "power" | "mod" | "log" => format!("{f}({v}.a, 2)"),
         _ => format!("{f}({v}.a)"),
     };
