@@ -2206,6 +2206,39 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             Col::Gen(out)
         }
         Expr::Call { name, args } => {
+            // Element functions need the STORE and the element identity (a node/edge
+            // slot), which the pure-value `call_scalar` cannot see — handle them
+            // here off the evaluated argument column.
+            if matches!(name.as_str(), "keys" | "labels" | "property_names") {
+                let arg = eval(&args[0], store, batch)?;
+                let n = batch.rows();
+                let out: Vec<Value> = (0..n)
+                    .map(|i| match arg.value_at(i) {
+                        // A node surfaces as Num(id); its keys / property_names are
+                        // the SORTED present property keys, its labels the SORTED
+                        // labels — both as string lists (matching core).
+                        Value::Num(id) if matches!(arg, Col::Nodes(_)) => {
+                            let id = id as u32;
+                            let mut items: Vec<Value> = if name == "labels" {
+                                let mut ls = store.labels_of(id);
+                                ls.sort();
+                                ls.into_iter().map(|l| Value::Str(l.into())).collect()
+                            } else {
+                                store
+                                    .prop_keys()
+                                    .into_iter()
+                                    .filter(|k| store.has_prop(id, k))
+                                    .map(|k| Value::Str(k.into()))
+                                    .collect()
+                            };
+                            items.sort_by(value::cmp_total);
+                            Value::List(items)
+                        }
+                        _ => Value::Null,
+                    })
+                    .collect();
+                return Ok(Col::Gen(out));
+            }
             // Evaluate each argument to a column, then dispatch per row. Arity is
             // validated at parse time, so `call_scalar` can index its args. The row
             // count is the BATCH's, not the min over args — a niladic function
@@ -2468,6 +2501,39 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         "upper" => str_map(&args[0], str::to_uppercase),
         "lower" => str_map(&args[0], str::to_lowercase),
         "trim" => str_map(&args[0], |s| s.trim().to_string()),
+        // ltrim/rtrim/btrim: 1 arg trims WHITESPACE from that side; a 2nd string
+        // arg is the set of characters to strip instead.
+        "ltrim" | "rtrim" | "btrim" => trim_fn(name, args),
+        // reverse is polymorphic: a string reverses by char, a list by element;
+        // anything else is NULL (matches core, e.g. reverse(number) → NULL).
+        "reverse" => match &args[0] {
+            Value::Str(s) => Value::Str(s.chars().rev().collect::<String>().into()),
+            Value::List(v) => Value::List(v.iter().rev().cloned().collect()),
+            _ => Value::Null,
+        },
+        // left/right(s, n): the first / last n characters (n ≥ len → the whole
+        // string; n ≤ 0 → empty).
+        "left" | "right" => match (&args[0], value::as_num(&args[1])) {
+            (Value::Str(s), Some(k)) => {
+                let k = k.max(0.0) as usize;
+                let chars: Vec<char> = s.chars().collect();
+                let take = k.min(chars.len());
+                let slice = if name == "left" {
+                    &chars[..take]
+                } else {
+                    &chars[chars.len() - take..]
+                };
+                Value::Str(slice.iter().collect::<String>().into())
+            }
+            _ => Value::Null,
+        },
+        // split(s, delim) → a list of substrings.
+        "split" => match (&args[0], &args[1]) {
+            (Value::Str(s), Value::Str(d)) => {
+                Value::List(s.split(d.as_ref()).map(|p| Value::Str(p.into())).collect())
+            }
+            _ => Value::Null,
+        },
         // Character count of a string. `length`/`char_length`/`character_length`
         // are synonyms here; `byte_length`/`octet_length` count UTF-8 bytes.
         "length" | "char_length" | "character_length" => match &args[0] {
@@ -2502,6 +2568,36 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             Value::List(v) => v.first().cloned().unwrap_or(Value::Null),
             _ => Value::Null,
         },
+        // tail: all but the first element (empty list → empty).
+        "tail" => match &args[0] {
+            Value::List(v) => Value::List(v.iter().skip(1).cloned().collect()),
+            _ => Value::Null,
+        },
+        // range(start, end[, step]) — INCLUSIVE of both ends; default step 1; a
+        // zero step is NULL; a start past end with the wrong sign yields an empty
+        // list (matches core).
+        "range" => {
+            let step = if args.len() == 3 {
+                value::as_num(&args[2])
+            } else {
+                Some(1.0)
+            };
+            match (value::as_num(&args[0]), value::as_num(&args[1]), step) {
+                (Some(a), Some(b), Some(st)) if st != 0.0 => {
+                    let (mut cur, mut out) = (a, Vec::new());
+                    // Guard the element count so a pathological range can't OOM.
+                    while (st > 0.0 && cur <= b) || (st < 0.0 && cur >= b) {
+                        out.push(Value::Num(cur));
+                        if out.len() > 10_000_000 {
+                            break;
+                        }
+                        cur += st;
+                    }
+                    Value::List(out)
+                }
+                _ => Value::Null,
+            }
+        }
         "last" => match &args[0] {
             Value::List(v) => v.last().cloned().unwrap_or(Value::Null),
             _ => Value::Null,
@@ -2836,6 +2932,30 @@ fn to_boolean_fn(v: &Value) -> Value {
         }
         _ => Value::Null,
     }
+}
+
+/// `ltrim`/`rtrim`/`btrim`: strip whitespace (1 arg) or a given char set (2 args)
+/// from the left / right / both ends of a string. Non-string → NULL.
+fn trim_fn(name: &str, args: &[Value]) -> Value {
+    let Value::Str(s) = &args[0] else {
+        return Value::Null;
+    };
+    // A 2nd string arg is the set of chars to strip; otherwise strip whitespace.
+    let set: Option<Vec<char>> = match args.get(1) {
+        None => None,
+        Some(Value::Str(cs)) => Some(cs.chars().collect()),
+        Some(_) => return Value::Null, // a non-string char set
+    };
+    let strip = |c: char| {
+        set.as_ref()
+            .map_or_else(|| c.is_whitespace(), |v| v.contains(&c))
+    };
+    let trimmed = match name {
+        "ltrim" => s.trim_start_matches(strip),
+        "rtrim" => s.trim_end_matches(strip),
+        _ => s.trim_matches(strip), // btrim
+    };
+    Value::Str(trimmed.into())
 }
 
 /// `op` with its operands swapped — used to normalize `literal <cmp> prop` to
@@ -3254,6 +3374,60 @@ mod tests {
         // size / char_length on a string (K5)
         assert_eq!(num("size(n.b)"), 5.0);
         assert_eq!(num("char_length(n.b)"), 5.0);
+    }
+
+    /// String (K10) and list/element (K11) functions match hand-computed values.
+    #[test]
+    fn added_string_and_list_functions() {
+        let mut b = Builder::default();
+        b.node(&["N", "M"], &[("z", n(1.0)), ("a", n(2.0))]);
+        let store = b.build();
+        let val = |e: &str| -> Value {
+            let q = format!("MATCH (x:N) RETURN {e} AS v");
+            run(&crate::gql::parse(&q).unwrap(), &store).rows[0][0].clone()
+        };
+        let str_of = |e: &str| match val(e) {
+            Value::Str(s) => s.to_string(),
+            o => panic!("{e} → {o:?}"),
+        };
+        // `Value` has no `PartialEq` (the value contract owns equality), so compare
+        // list contents via debug strings.
+        let list_of = |e: &str| -> Vec<String> {
+            match val(e) {
+                Value::List(v) => v.iter().map(|x| format!("{x:?}")).collect(),
+                o => panic!("{e} → {o:?}"),
+            }
+        };
+        let dbg = |xs: &[Value]| -> Vec<String> { xs.iter().map(|x| format!("{x:?}")).collect() };
+        // trims (whitespace, and explicit char set)
+        assert_eq!(str_of("ltrim('  hi ')"), "hi ");
+        assert_eq!(str_of("rtrim('  hi ')"), "  hi");
+        assert_eq!(str_of("btrim('xxhixx', 'x')"), "hi");
+        // reverse (string + list), left/right, split
+        assert_eq!(str_of("reverse('abc')"), "cba");
+        assert_eq!(str_of("left('abcd', 2)"), "ab");
+        assert_eq!(str_of("right('abcd', 2)"), "cd");
+        assert_eq!(str_of("left('ab', 5)"), "ab"); // n > len → whole
+        assert_eq!(
+            list_of("split('a,b,c', ',')"),
+            dbg(&[s("a"), s("b"), s("c")])
+        );
+        // list fns
+        assert_eq!(
+            list_of("reverse([1, 2, 3])"),
+            dbg(&[n(3.0), n(2.0), n(1.0)])
+        );
+        assert_eq!(list_of("tail([1, 2, 3])"), dbg(&[n(2.0), n(3.0)]));
+        assert_eq!(
+            list_of("range(1, 4)"),
+            dbg(&[n(1.0), n(2.0), n(3.0), n(4.0)])
+        );
+        assert_eq!(list_of("range(5, 1, -1)").len(), 5);
+        assert!(val("range(1, 4, 0)").is_null()); // zero step
+        assert_eq!(list_of("range(5, 1)"), Vec::<String>::new()); // wrong-sign default step
+                                                                  // element fns: keys (sorted present props), labels (sorted)
+        assert_eq!(list_of("keys(x)"), dbg(&[s("a"), s("z")]));
+        assert_eq!(list_of("labels(x)"), dbg(&[s("M"), s("N")]));
     }
 
     // --- relational core (unchanged behavior, now slot-addressed) ---

@@ -594,10 +594,10 @@ the catalog (parser allow-list + eval). Grouped by family:
       (+`asin`/`acos`/`atan`, `sinh`/`cosh`/`tanh`/`cot`), `power`, `mod`, `e`,
       `pi`, `degrees`, `radians`. Native match core's libm (the wasm-ulp caveat in
       `backend-parity-fuzz` is not in scope here — this is native-vs-native).
-- [ ] K10. String fns: `ltrim`, `rtrim`, `btrim`, `reverse` (string), `left`,
+- [x] K10. (DONE) ltrim/rtrim/btrim (1 or 2 args), reverse (poly string+list), left/right, split, char_length/byte_length etc.  ORIG: String fns: `ltrim`, `rtrim`, `btrim`, `reverse` (string), `left`,
       `right`, `split`, `char_length`/`character_length`, `byte_length`/
       `octet_length`.
-- [ ] K11. List fns: `reverse`(list), `tail`, `range(a, b[, step])`, `keys`,
+- [x] K11. (DONE) reverse(list)/tail/range(incl,step)/keys/labels/property_names; nodes/relationships already PathAccess. DEFERRED: type(edge) needs an eid->etype map; append/list_contains/list_sort/list_union/difference/intersection/element_id not yet.  ORIG: List fns: `reverse`(list), `tail`, `range(a, b[, step])`, `keys`,
       `append`, `list_contains`, `list_sort`, `list_union`, `difference`,
       `intersection`, `nodes`, `relationships`, `labels`, `type`, `property_names`.
 - [ ] K12. Re-run `fuzz_report` after each fix; the family's bucket should go to 0.

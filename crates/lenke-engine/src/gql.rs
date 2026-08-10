@@ -1605,10 +1605,15 @@ impl Parser {
             | "date" | "local_time" | "datetime" | "local_datetime" | "zoned_time"
             | "zoned_datetime" | "duration" | "to_integer" | "tointeger" | "to_float"
             | "tofloat" | "to_string" | "tostring" | "to_boolean" | "toboolean" | "char_length"
-            | "character_length" | "byte_length" | "octet_length" => args.len() == 1,
+            | "character_length" | "byte_length" | "octet_length" | "reverse" | "tail" | "keys"
+            | "labels" | "type" | "property_names" => args.len() == 1,
+            // 1 or 2 args (bare form trims whitespace; a 2nd arg is the char set)
+            "ltrim" | "rtrim" | "btrim" => args.len() == 1 || args.len() == 2,
             // 2 args
             "starts_with" | "ends_with" | "contains" | "duration_between" | "nullif" | "log"
-            | "power" | "mod" => args.len() == 2,
+            | "power" | "mod" | "left" | "right" | "split" => args.len() == 2,
+            // 2 or 3 args
+            "range" => args.len() == 2 || args.len() == 3,
             // 3 args
             "replace" => args.len() == 3,
             // 2 or 3 args
