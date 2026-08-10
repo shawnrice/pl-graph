@@ -367,6 +367,26 @@ pub fn group_key_into(v: &Value, out: &mut Vec<u8>) {
     }
 }
 
+/// The THREE-VALUED comparison the ordering OPERATORS (`<` `<=` `>` `>=`) use:
+/// `None` (UNKNOWN) whenever the two values are not comparable — different types,
+/// or a NaN operand (IEEE-unordered). This is distinct from [`cmp_total`], which
+/// imposes a deterministic TOTAL order for sort/min/max/grouping; the operators
+/// must instead yield UNKNOWN (→ NULL, → a dropped WHERE row) on incomparable
+/// operands, matching lenke-core and SQL/Cypher 3VL. Only same-type scalars are
+/// comparable here; temporals compare only within the same kind.
+#[must_use]
+pub fn cmp_partial(a: &Value, b: &Value) -> Option<Ordering> {
+    match (a, b) {
+        (Value::Num(x), Value::Num(y)) => x.partial_cmp(y), // None iff a NaN operand
+        (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
+        (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
+        (Value::Temporal(x), Value::Temporal(y)) if x.kind() == y.kind() => Some(x.cmp_total(y)),
+        // Different types (incl. cross-kind temporals), collections, or null:
+        // incomparable via an ordering operator → UNKNOWN.
+        _ => None,
+    }
+}
+
 /// A deterministic total order over ANY pair of values — never panics. Used by
 /// sort, min/max, and grouping tiebreaks. Nulls sort last; NaN is the greatest
 /// number; `-0.0` and `0.0` tie. Distinct types order by rank so a mixed column
@@ -470,6 +490,21 @@ mod tests {
         assert_eq!(as_num(&s("1")), None);
         assert_eq!(as_num(&Value::Bool(true)), None);
         assert_eq!(as_num(&Value::Null), None);
+    }
+
+    #[test]
+    fn cmp_partial_is_three_valued() {
+        use std::cmp::Ordering;
+        // Same-type scalars are comparable.
+        assert_eq!(cmp_partial(&n(1.0), &n(2.0)), Some(Ordering::Less));
+        assert_eq!(cmp_partial(&s("a"), &s("b")), Some(Ordering::Less));
+        // Cross-type is UNKNOWN (None) — the operator yields NULL, NOT a rank Bool.
+        assert_eq!(cmp_partial(&n(1.0), &s("a")), None);
+        assert_eq!(cmp_partial(&Value::Bool(true), &n(1.0)), None);
+        // A NaN operand is IEEE-unordered → UNKNOWN (even though `cmp_total` ranks
+        // NaN greatest for sorting).
+        assert_eq!(cmp_partial(&n(f64::NAN), &n(1.0)), None);
+        assert_eq!(cmp_total(&n(f64::NAN), &n(1.0)), Ordering::Greater);
     }
 
     #[test]

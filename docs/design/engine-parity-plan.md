@@ -561,7 +561,8 @@ Semantic bugs (wrong answers vs core) — fix for parity:
       whole total order, so nulls come FIRST under DESC. Repro: `RETURN n.id AS a0,
   n.a AS a1 ORDER BY a1 DESC, a0`. Fix in the OrderPage comparator (nulls last
       regardless of direction).
-- [ ] K2. Cross-type ordering comparison (`<` `<=` `>` `>=`) between different
+- [x] K2. Cross-type ordering comparison (DONE: new value::cmp_partial — 3VL, None for cross-type/NaN — routes the <,<=,>,>= operators and range_pass; cmp_total stays for sort/min/max/group. fuzzer cross_type_cmp 742->0).
+  ORIG: Cross-type ordering comparison (`<` `<=` `>` `>=`) between different
       types (~742/3000). Core yields NULL (3VL unknown) → the row drops in a WHERE
       and renders NULL in a projection; the engine returns a Bool from the total
       order (`cmp_total`), so it KEEPS rows core drops. The comparison OPERATORS

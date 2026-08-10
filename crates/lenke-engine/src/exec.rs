@@ -1275,14 +1275,18 @@ fn index_seek_ids(store: &Store, label: &str, key: &str, value: &Value) -> Vec<u
     }
 }
 
-/// Whether `prop <op> value` holds under the value contract's total order — the
-/// exact test the `Filter` executor applies for a range comparison (a NULL
-/// operand is UNKNOWN → false). `op` must be a range op; `value` is non-null.
+/// Whether `prop <op> value` holds — the exact test the `Filter` executor applies
+/// for a range comparison. Three-valued via `cmp_partial`: a NULL operand OR
+/// incomparable operands (different types / NaN) are UNKNOWN → false (the row
+/// drops), matching the general `compare` path. `op` must be a range op; `value`
+/// is non-null.
 fn range_pass(prop: &Value, op: CompareOp, value: &Value) -> bool {
     if prop.is_null() {
         return false;
     }
-    let ord = value::cmp_total(prop, value);
+    let Some(ord) = value::cmp_partial(prop, value) else {
+        return false; // incomparable → UNKNOWN → drop
+    };
     match op {
         CompareOp::Lt => ord.is_lt(),
         CompareOp::Le => ord.is_le(),
@@ -2803,15 +2807,22 @@ fn compare(op: CompareOp, l: &Col, r: &Col) -> Col {
             out.push(None);
             continue;
         }
+        // Equality uses the value contract's `equals` (cross-type = false, not
+        // unknown). Ordering uses `cmp_partial` (3VL): incomparable operands —
+        // different types or a NaN — make the comparison UNKNOWN (→ NULL), NOT a
+        // Bool from the total order. (The total order is only for sort/min/max.)
         let res = match op {
-            CompareOp::Eq => value::equals(&a, &b),
-            CompareOp::Ne => !value::equals(&a, &b),
-            CompareOp::Lt => value::cmp_total(&a, &b).is_lt(),
-            CompareOp::Le => value::cmp_total(&a, &b).is_le(),
-            CompareOp::Gt => value::cmp_total(&a, &b).is_gt(),
-            CompareOp::Ge => value::cmp_total(&a, &b).is_ge(),
+            CompareOp::Eq => Some(value::equals(&a, &b)),
+            CompareOp::Ne => Some(!value::equals(&a, &b)),
+            CompareOp::Lt => value::cmp_partial(&a, &b).map(std::cmp::Ordering::is_lt),
+            CompareOp::Le => value::cmp_partial(&a, &b).map(std::cmp::Ordering::is_le),
+            CompareOp::Gt => value::cmp_partial(&a, &b).map(std::cmp::Ordering::is_gt),
+            CompareOp::Ge => value::cmp_partial(&a, &b).map(std::cmp::Ordering::is_ge),
         };
-        out.push(Some(res));
+        if res.is_none() {
+            any_unknown = true;
+        }
+        out.push(res);
     }
     if any_unknown {
         Col::Gen(
