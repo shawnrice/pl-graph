@@ -2648,6 +2648,17 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
 /// so a property value is first seen at the earliest node — hence earliest row —
 /// carrying it. `None` for any other shape (non-count aggregate, key that is not
 /// a lone frontier property), which falls through to the general frontier path.
+///
+/// Rejected optimization: for a DICT-encoded key, counting straight into per-code
+/// buckets during the traversal (`counts[codes[nbr]] += 1`), skipping this per-node
+/// intermediate and the Level-2 merge. It moved `c.city, count(*)` on the 2-hop
+/// 100k/deg-5 fixture only 24.5ms -> 23.0ms (0.54x -> 0.57x of core) — a consistent
+/// ~7% but still far from parity, and it TRADES the per-node scatter for reading the
+/// property once PER PATH (2.5M reads) instead of once per distinct endpoint (100k).
+/// The shape is memory-bound on ~2.5M random accesses either way; core's remaining
+/// edge is its CSR adjacency (sequential neighbour reads), which the per-node `Vec`
+/// adjacency here cannot match without a layout change (deferred, large blast radius).
+/// Not worth a second grouped-count path for a sub-10% move that leaves it slowest.
 fn try_node_grouped_count(
     input: &Plan,
     keys: &[(String, Expr)],
