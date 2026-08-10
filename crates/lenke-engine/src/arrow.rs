@@ -13,11 +13,13 @@
 //!   buf1_off buf1_len buf2_off buf2_len
 //! body: every referenced buffer, each 8-byte aligned; offsets are blob-relative.
 //! ```
-//! Type tags: 1 Float64, 2 Bool, 3 Utf8. Column type is inferred per column: all
-//! present cells `Num` → Float64; all present `Bool` → Bool; anything else (or a
-//! mix) → Utf8 (each cell stringified). The `FixedSizeList`/`Struct` column types
-//! and the flatbuffer Arrow-IPC wrapper that layers on these exact buffers are a
-//! later slice (I2b).
+//! Type tags: 1 Float64, 2 Bool, 3 Utf8, 4 FixedSizeList<Float64>, 5 Struct.
+//! Column type is inferred per column: all present cells record/map → `Struct`
+//! (typed child columns, pre-order flattened); all present cells all-numeric
+//! same-length lists → `FixedSizeList<Float64>`; all `Num` → Float64; all `Bool`
+//! → Bool; anything else (or a mix) → Utf8 (each cell stringified). The
+//! flatbuffer Arrow-IPC wrapper that layers on these exact buffers is a later
+//! slice (I2b-2).
 
 use crate::exec::Rows;
 use crate::value::Value;
@@ -26,6 +28,20 @@ use std::fmt::Write as _;
 pub const T_FLOAT64: u32 = 1;
 pub const T_BOOL: u32 = 2;
 pub const T_UTF8: u32 = 3;
+/// A fixed-dimension numeric list column → Arrow `FixedSizeList<Float64>[dim]`.
+/// `buf1` is the flat child `f64` values (`nrows × dim`), validity is the
+/// LIST-level bitmap, and `dim` rides the otherwise-empty `buf2_len` descriptor
+/// slot — so the fixed 40-byte column descriptor is unchanged.
+pub const T_FIXED_LIST: u32 = 4;
+/// A record/map column → Arrow `Struct<field: type, …>`. The struct has NO values
+/// buffer of its own — only a validity bitmap (a null row = a null/absent
+/// record) — and one typed CHILD column per field. Its child COUNT rides the
+/// otherwise-empty `buf2_len` slot, and its `n` child descriptors follow it in
+/// the descriptor array in pre-order (a child may itself be a struct → nesting).
+/// The header's `ncols` counts only TOP-LEVEL columns. A scalar-only blob has no
+/// struct descriptors, so its bytes are unchanged (byte-identical to before this
+/// type existed — and to lenke-core's scalar blob).
+pub const T_STRUCT: u32 = 5;
 
 const HEADER_LEN: usize = 24;
 const COLDESC_LEN: usize = 40;
@@ -35,10 +51,10 @@ fn align8(v: usize) -> usize {
     (v + 7) & !7
 }
 
-/// Render a cell as Utf8 text (validity carries the null, so a null is an empty
-/// span). Scalars match lenke-core (`Num` via `{n}`, `Temporal` via its ISO form);
-/// list/record/map get a compact form (their exact byte parity is deferred to I2b
-/// with the Struct/list column types).
+/// Render a cell as Utf8 text for the mixed-column fallback (validity carries the
+/// null, so a null is an empty span). Scalars match lenke-core (`Num` via `{n}`,
+/// `Temporal` via its ISO form). A record/map/list only reaches here in a
+/// type-MIXED column; a uniform one becomes a real `Struct`/`FixedSizeList`.
 fn cell_str(c: &Value, out: &mut String) {
     match c {
         Value::Null => {}
@@ -84,19 +100,262 @@ fn cell_str(c: &Value, out: &mut String) {
     }
 }
 
-/// One encoded column: its tag, validity bitmap (empty ⇒ no nulls), null count,
-/// and the two Arrow buffers (buf2 empty except for Utf8 data).
-struct EncCol {
-    tag: u32,
-    null_count: u32,
-    validity: Vec<u8>,
-    buf1: Vec<u8>,
-    buf2: Vec<u8>,
+/// The sorted union of a struct column's field names + a per-cell field lookup.
+/// A cell is "struct-like" if it is a `Record` (ISO record; keys already sorted,
+/// string names) or a `Map` whose keys are all strings (the Gremlin map that can
+/// name struct fields). This mirrors lenke-core, whose result-side `Map` (the
+/// serialized record form) is what it turns into a `Struct`.
+fn struct_fields(cell: &Value) -> Option<Vec<(&str, &Value)>> {
+    match cell {
+        Value::Record(fields) => Some(fields.iter().map(|(k, v)| (k.as_ref(), v)).collect()),
+        Value::Map(pairs) => pairs
+            .iter()
+            .map(|(k, v)| match k {
+                Value::Str(s) => Some((s.as_ref(), v)),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
+/// Value for `key` in a struct-like cell, or `Null` if the cell omits it (or is
+/// not struct-like).
+fn field_value(cell: &Value, key: &str) -> Value {
+    struct_fields(cell)
+        .and_then(|fs| {
+            fs.into_iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.clone())
+        })
+        .unwrap_or(Value::Null)
+}
+
+/// The shared dimension iff every present cell is an all-numeric list of the SAME
+/// length (≥ 1) → a `FixedSizeList<Float64>` column; else `None` (ragged, empty,
+/// non-numeric, or a non-list present cell → the caller falls back to `Utf8`).
+fn fixed_numeric_dim(cells: &[Value]) -> Option<usize> {
+    let mut dim: Option<usize> = None;
+    let mut saw = false;
+    for c in cells {
+        match c {
+            Value::Null => {}
+            Value::List(items) if items.iter().all(|v| matches!(v, Value::Num(_))) => {
+                saw = true;
+                match dim {
+                    None => dim = Some(items.len()),
+                    Some(d) if d != items.len() => return None,
+                    _ => {}
+                }
+            }
+            _ => return None,
+        }
+    }
+    dim.filter(|&d| saw && d >= 1)
+}
+
+/// A single result column in typed form (the Arrow physical types we emit),
+/// mirroring lenke-core's `ArrowColumn` so the assembled bytes match. `valid =
+/// None` means no nulls.
+enum ArrowColumn {
+    Num {
+        data: Vec<f64>,
+        valid: Option<Vec<bool>>,
+    },
+    Bool {
+        data: Vec<bool>,
+        valid: Option<Vec<bool>>,
+    },
+    Utf8 {
+        offsets: Vec<i32>,
+        bytes: Vec<u8>,
+        valid: Option<Vec<bool>>,
+    },
+    /// `FixedSizeList<Float64>[dim]`. `data` is the flat child values (`nrows ×
+    /// dim`, a null list contributing `dim` zeros); `valid` is the list-level mask.
+    FixedList {
+        dim: usize,
+        data: Vec<f64>,
+        valid: Option<Vec<bool>>,
+    },
+    /// `Struct`. `valid` is the struct-level null mask; each child is a full typed
+    /// column of the same length. Children are ordered by field name (canonical).
+    Struct {
+        valid: Option<Vec<bool>>,
+        children: Vec<(String, ArrowColumn)>,
+    },
+}
+
+impl ArrowColumn {
+    /// Infer a column's physical type from its cells, matching lenke-core:
+    /// all-record/map → `Struct`; all-numeric-same-length-list → `FixedSizeList`;
+    /// present Nums → Float64; present Bools → Bool; else Utf8.
+    fn from_values(cells: &[Value]) -> Self {
+        let n = cells.len();
+        // A column whose present cells are all records/maps → a real Struct (typed
+        // child columns), not a stringified blob. Fields = sorted union of names; a
+        // row that omits a field contributes null to that child. Recurses.
+        if !cells.is_empty()
+            && cells
+                .iter()
+                .all(|c| c.is_null() || struct_fields(c).is_some())
+            && cells.iter().any(|c| struct_fields(c).is_some())
+        {
+            let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for c in cells {
+                if let Some(fs) = struct_fields(c) {
+                    for (k, _) in fs {
+                        keys.insert(k.to_string());
+                    }
+                }
+            }
+            let valid: Vec<bool> = cells.iter().map(|c| struct_fields(c).is_some()).collect();
+            let any_null = valid.iter().any(|&v| !v);
+            let children: Vec<(String, Self)> = keys
+                .iter()
+                .map(|k| {
+                    let child: Vec<Value> = cells.iter().map(|c| field_value(c, k)).collect();
+                    (k.clone(), Self::from_values(&child))
+                })
+                .collect();
+            return Self::Struct {
+                valid: any_null.then_some(valid),
+                children,
+            };
+        }
+        // A fixed-dim numeric-list column → a real FixedSizeList<Float64>.
+        if let Some(dim) = fixed_numeric_dim(cells) {
+            let mut data = Vec::with_capacity(n * dim);
+            let mut valid = vec![true; n];
+            let mut any_null = false;
+            for (i, c) in cells.iter().enumerate() {
+                match c {
+                    Value::List(items) => {
+                        data.extend(items.iter().map(|v| match v {
+                            Value::Num(x) => *x,
+                            _ => 0.0,
+                        }));
+                    }
+                    _ => {
+                        valid[i] = false;
+                        any_null = true;
+                        data.extend(std::iter::repeat_n(0.0, dim));
+                    }
+                }
+            }
+            return Self::FixedList {
+                dim,
+                data,
+                valid: any_null.then_some(valid),
+            };
+        }
+        let (mut seen_num, mut seen_bool, mut seen_other) = (false, false, false);
+        let mut any_null = false;
+        let mut valid = vec![true; n];
+        for (i, c) in cells.iter().enumerate() {
+            match c {
+                Value::Null => {
+                    valid[i] = false;
+                    any_null = true;
+                }
+                Value::Num(_) => seen_num = true,
+                Value::Bool(_) => seen_bool = true,
+                _ => seen_other = true,
+            }
+        }
+        let valid = any_null.then_some(valid);
+        if seen_other || (seen_num && seen_bool) {
+            let mut offsets = Vec::with_capacity(n + 1);
+            let mut bytes = Vec::new();
+            let mut s = String::new();
+            offsets.push(0i32);
+            for c in cells {
+                s.clear();
+                cell_str(c, &mut s);
+                bytes.extend_from_slice(s.as_bytes());
+                offsets.push(bytes.len() as i32);
+            }
+            Self::Utf8 {
+                offsets,
+                bytes,
+                valid,
+            }
+        } else if seen_bool {
+            Self::Bool {
+                data: cells
+                    .iter()
+                    .map(|c| matches!(c, Value::Bool(true)))
+                    .collect(),
+                valid,
+            }
+        } else {
+            Self::Num {
+                data: cells
+                    .iter()
+                    .map(|c| if let Value::Num(x) = c { *x } else { 0.0 })
+                    .collect(),
+                valid,
+            }
+        }
+    }
+
+    fn valid_mask(&self) -> &Option<Vec<bool>> {
+        match self {
+            Self::Num { valid, .. }
+            | Self::Bool { valid, .. }
+            | Self::Utf8 { valid, .. }
+            | Self::FixedList { valid, .. }
+            | Self::Struct { valid, .. } => valid,
+        }
+    }
+
+    /// (tag, null_count, validity, buf1, buf2, extra) for blob assembly. `extra`
+    /// is the list size for `FixedList` (0 otherwise); it rides `buf2_len`. A
+    /// `Struct` never reaches here — it is flattened by [`flatten_descs`].
+    fn encode(&self, nrows: usize) -> (u32, u32, Vec<u8>, Vec<u8>, Vec<u8>, u32) {
+        let (null_count, validity) = encode_validity(self.valid_mask(), nrows);
+        let (tag, buf1, buf2, extra) = match self {
+            Self::Num { data, .. } => {
+                let mut b = Vec::with_capacity(data.len() * 8);
+                for v in data {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+                (T_FLOAT64, b, Vec::new(), 0)
+            }
+            Self::Bool { data, .. } => {
+                let mut b = vec![0u8; data.len().div_ceil(8)];
+                for (i, &v) in data.iter().enumerate() {
+                    if v {
+                        b[i / 8] |= 1 << (i % 8);
+                    }
+                }
+                (T_BOOL, b, Vec::new(), 0)
+            }
+            Self::Utf8 { offsets, bytes, .. } => {
+                let mut b = Vec::with_capacity(offsets.len() * 4);
+                for o in offsets {
+                    b.extend_from_slice(&o.to_le_bytes());
+                }
+                (T_UTF8, b, bytes.clone(), 0)
+            }
+            Self::FixedList { dim, data, .. } => {
+                let mut b = Vec::with_capacity(data.len() * 8);
+                for v in data {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+                (T_FIXED_LIST, b, Vec::new(), *dim as u32)
+            }
+            Self::Struct { .. } => {
+                unreachable!("structs are flattened by flatten_descs, not encoded")
+            }
+        };
+        (tag, null_count, validity, buf1, buf2, extra)
+    }
 }
 
 /// Validity bitmap (LSB-first) + null count from a presence mask; `None` ⇒ all
 /// valid ⇒ no bitmap.
-fn encode_validity(mask: Option<&[bool]>, nrows: usize) -> (u32, Vec<u8>) {
+fn encode_validity(mask: &Option<Vec<bool>>, nrows: usize) -> (u32, Vec<u8>) {
     match mask {
         None => (0, Vec::new()),
         Some(mask) => {
@@ -114,95 +373,84 @@ fn encode_validity(mask: Option<&[bool]>, nrows: usize) -> (u32, Vec<u8>) {
     }
 }
 
-/// Infer a column's Arrow type from its cells and encode its buffers, matching
-/// lenke-core's scalar inference (present Nums → Float64; present Bools → Bool;
-/// else Utf8).
-fn encode_column(cells: &[Value]) -> EncCol {
-    let n = cells.len();
-    let mut any_null = false;
-    let mut valid = vec![true; n];
-    let (mut seen_num, mut seen_bool, mut seen_other) = (false, false, false);
-    for (i, c) in cells.iter().enumerate() {
-        match c {
-            Value::Null => {
-                valid[i] = false;
-                any_null = true;
-            }
-            Value::Num(_) => seen_num = true,
-            Value::Bool(_) => seen_bool = true,
-            _ => seen_other = true,
-        }
-    }
-    let (null_count, validity) = encode_validity(any_null.then_some(valid.as_slice()), n);
+/// One ARW1 descriptor entry (pre-order): tag, null count, name, buffers. `extra`
+/// rides `buf2_len` — the list size for `FixedList`, the child count for
+/// `Struct`, else 0. A `Struct` contributes only its validity buffer.
+struct FlatDesc<'a> {
+    tag: u32,
+    null_count: u32,
+    name: &'a str,
+    validity: Vec<u8>,
+    buf1: Vec<u8>,
+    buf2: Vec<u8>,
+    extra: u32,
+}
 
-    if seen_other || (seen_num && seen_bool) {
-        // Utf8: i32 offsets[n+1] in buf1, data bytes in buf2.
-        let mut offsets = Vec::with_capacity((n + 1) * 4);
-        let mut bytes = Vec::new();
-        offsets.extend_from_slice(&0i32.to_le_bytes());
-        let mut s = String::new();
-        for c in cells {
-            s.clear();
-            cell_str(c, &mut s);
-            bytes.extend_from_slice(s.as_bytes());
-            offsets.extend_from_slice(&(bytes.len() as i32).to_le_bytes());
-        }
-        EncCol {
-            tag: T_UTF8,
-            null_count,
-            validity,
-            buf1: offsets,
-            buf2: bytes,
-        }
-    } else if seen_bool {
-        let mut b = vec![0u8; n.div_ceil(8)];
-        for (i, c) in cells.iter().enumerate() {
-            if matches!(c, Value::Bool(true)) {
-                b[i / 8] |= 1 << (i % 8);
+/// Flatten a (possibly nested) column into pre-order descriptors: a struct
+/// descriptor followed by its children's descriptors (recursively).
+fn flatten_descs<'a>(
+    name: &'a str,
+    col: &'a ArrowColumn,
+    nrows: usize,
+    out: &mut Vec<FlatDesc<'a>>,
+) {
+    match col {
+        ArrowColumn::Struct { valid, children } => {
+            let (null_count, validity) = encode_validity(valid, nrows);
+            out.push(FlatDesc {
+                tag: T_STRUCT,
+                null_count,
+                name,
+                validity,
+                buf1: Vec::new(),
+                buf2: Vec::new(),
+                extra: children.len() as u32,
+            });
+            for (child_name, child) in children {
+                flatten_descs(child_name, child, nrows, out);
             }
         }
-        EncCol {
-            tag: T_BOOL,
-            null_count,
-            validity,
-            buf1: b,
-            buf2: Vec::new(),
-        }
-    } else {
-        // Float64 (also the all-null column's default): each cell's f64, 0.0 where
-        // absent (validity marks the null).
-        let mut b = Vec::with_capacity(n * 8);
-        for c in cells {
-            let x = if let Value::Num(x) = c { *x } else { 0.0 };
-            b.extend_from_slice(&x.to_le_bytes());
-        }
-        EncCol {
-            tag: T_FLOAT64,
-            null_count,
-            validity,
-            buf1: b,
-            buf2: Vec::new(),
+        other => {
+            let (tag, null_count, validity, buf1, buf2, extra) = other.encode(nrows);
+            out.push(FlatDesc {
+                tag,
+                null_count,
+                name,
+                validity,
+                buf1,
+                buf2,
+                extra,
+            });
         }
     }
 }
 
-/// Encode a query result as an `ARW1` columnar blob.
+/// Encode a query result as an `ARW1` columnar blob. Byte-for-byte identical to
+/// lenke-core's `to_arrow` for the same logical table (asserted by the
+/// cross-engine `arrow_parity` test).
 #[must_use]
 pub fn to_arrow(rows: &Rows) -> Vec<u8> {
     let ncols = rows.names.len();
     let nrows = rows.rows.len();
-    // Column-major cells.
-    let cols: Vec<EncCol> = (0..ncols)
+    // Column-major typed columns.
+    let cols: Vec<ArrowColumn> = (0..ncols)
         .map(|j| {
             let cells: Vec<Value> = rows.rows.iter().map(|r| r[j].clone()).collect();
-            encode_column(&cells)
+            ArrowColumn::from_values(&cells)
         })
         .collect();
 
-    let body_base = align8(HEADER_LEN + ncols * COLDESC_LEN);
-    let mut body: Vec<u8> = Vec::new();
-    let mut descs: Vec<[u32; 10]> = Vec::with_capacity(ncols);
+    // The header counts TOP-LEVEL columns; a struct's children ride along as extra
+    // pre-order descriptors, so `flat` can be longer than `ncols`.
+    let mut flat: Vec<FlatDesc> = Vec::new();
     for (name, col) in rows.names.iter().zip(&cols) {
+        flatten_descs(name, col, nrows, &mut flat);
+    }
+
+    let body_base = align8(HEADER_LEN + flat.len() * COLDESC_LEN);
+    let mut body: Vec<u8> = Vec::new();
+    let mut descs: Vec<[u32; 10]> = Vec::with_capacity(flat.len());
+    for fd in &flat {
         let mut place = |bytes: &[u8]| -> (u32, u32) {
             while !body.len().is_multiple_of(8) {
                 body.push(0);
@@ -211,13 +459,18 @@ pub fn to_arrow(rows: &Rows) -> Vec<u8> {
             body.extend_from_slice(bytes);
             (off, bytes.len() as u32)
         };
-        let (name_off, name_len) = place(name.as_bytes());
-        let (val_off, val_len) = place(&col.validity);
-        let (b1_off, b1_len) = place(&col.buf1);
-        let (b2_off, b2_len) = place(&col.buf2);
+        let (name_off, name_len) = place(fd.name.as_bytes());
+        let (val_off, val_len) = place(&fd.validity);
+        let (b1_off, b1_len) = place(&fd.buf1);
+        let (b2_off, mut b2_len) = place(&fd.buf2);
+        // FixedSizeList (dim) and Struct (child count) have no buf2; their
+        // otherwise-zero buf2_len carries that count so a reader can rebuild them.
+        if fd.tag == T_FIXED_LIST || fd.tag == T_STRUCT {
+            b2_len = fd.extra;
+        }
         descs.push([
-            col.tag,
-            col.null_count,
+            fd.tag,
+            fd.null_count,
             name_off,
             name_len,
             val_off,
@@ -249,6 +502,7 @@ pub fn to_arrow(rows: &Rows) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::make_record;
     use std::sync::Arc;
 
     fn u32_at(blob: &[u8], off: usize) -> u32 {
@@ -373,5 +627,118 @@ mod tests {
         assert_eq!(decoded[0].1, T_UTF8);
         assert!(matches!(&decoded[0].2[0], Value::Str(x) if &**x == "1"));
         assert!(matches!(&decoded[0].2[1], Value::Str(x) if &**x == "true"));
+    }
+
+    // --- nested columns (I2b): FixedSizeList<Float64> and Struct ---
+
+    /// The `k`-th descriptor's fields, by name. (Descriptors are pre-order, so a
+    /// struct's children follow it; there can be more descriptors than `ncols`.)
+    fn desc(blob: &[u8], k: usize) -> (u32, u32, u32, u32) {
+        let d = HEADER_LEN + k * COLDESC_LEN;
+        // (tag, b1_off, b1_len, b2_len) — b2_len carries dim/child-count for
+        // FixedList/Struct.
+        (
+            u32_at(blob, d),
+            u32_at(blob, d + 24),
+            u32_at(blob, d + 28),
+            u32_at(blob, d + 36),
+        )
+    }
+    fn f64_at(blob: &[u8], off: usize) -> f64 {
+        f64::from_le_bytes(blob[off..off + 8].try_into().unwrap())
+    }
+
+    /// A column of same-length all-numeric lists → FixedSizeList<Float64>[dim],
+    /// dim riding buf2_len, buf1 the flat nrows×dim child values.
+    #[test]
+    fn fixed_size_list_layout() {
+        let rows = Rows {
+            names: vec!["pair".into()],
+            rows: vec![
+                vec![Value::List(vec![n(1.0), n(2.0)])],
+                vec![Value::List(vec![n(3.0), n(4.0)])],
+            ],
+        };
+        let blob = to_arrow(&rows);
+        assert_eq!(u64_at(&blob, 16), 1); // one top-level column
+        let (tag, b1_off, b1_len, dim) = desc(&blob, 0);
+        assert_eq!(tag, T_FIXED_LIST);
+        assert_eq!(dim, 2, "dim rides buf2_len");
+        assert_eq!(b1_len, 2 * 2 * 8, "nrows*dim f64s"); // 2 rows × 2 × 8 bytes
+        let vals: Vec<f64> = (0..4)
+            .map(|i| f64_at(&blob, b1_off as usize + i * 8))
+            .collect();
+        assert_eq!(vals, vec![1.0, 2.0, 3.0, 4.0]); // row-major flat child values
+    }
+
+    /// A record column → Struct: one top-level column, but three flattened
+    /// descriptors in pre-order (struct, then children sorted by name: a, z).
+    #[test]
+    fn struct_layout_is_preorder() {
+        let rows = Rows {
+            names: vec!["rec".into()],
+            rows: vec![
+                vec![make_record(vec![
+                    (Arc::from("z"), s("x")),
+                    (Arc::from("a"), n(1.0)),
+                ])],
+                vec![make_record(vec![
+                    (Arc::from("z"), s("y")),
+                    (Arc::from("a"), n(2.0)),
+                ])],
+            ],
+        };
+        let blob = to_arrow(&rows);
+        assert_eq!(u64_at(&blob, 16), 1); // header counts TOP-LEVEL columns only
+        let (stag, _, _, nchild) = desc(&blob, 0);
+        assert_eq!(stag, T_STRUCT);
+        assert_eq!(nchild, 2, "child count rides buf2_len");
+        // children sorted by name: a (Float64) then z (Utf8)
+        let d1 = HEADER_LEN + COLDESC_LEN;
+        let a_name = std::str::from_utf8(
+            &blob[u32_at(&blob, d1 + 8) as usize..][..u32_at(&blob, d1 + 12) as usize],
+        )
+        .unwrap();
+        assert_eq!(a_name, "a");
+        assert_eq!(desc(&blob, 1).0, T_FLOAT64);
+        let d2 = HEADER_LEN + 2 * COLDESC_LEN;
+        let z_name = std::str::from_utf8(
+            &blob[u32_at(&blob, d2 + 8) as usize..][..u32_at(&blob, d2 + 12) as usize],
+        )
+        .unwrap();
+        assert_eq!(z_name, "z");
+        assert_eq!(desc(&blob, 2).0, T_UTF8);
+    }
+
+    /// A struct-level null (a null row) is marked in the struct's validity, and the
+    /// missing row contributes null to every child.
+    #[test]
+    fn struct_null_row_marked() {
+        let rows = Rows {
+            names: vec!["rec".into()],
+            rows: vec![
+                vec![make_record(vec![(Arc::from("a"), n(1.0))])],
+                vec![Value::Null],
+            ],
+        };
+        let blob = to_arrow(&rows);
+        // struct descriptor null_count (field 1) == 1
+        assert_eq!(u32_at(&blob, HEADER_LEN + 4), 1);
+        // child `a` descriptor also has null_count 1 (the missing row).
+        assert_eq!(u32_at(&blob, HEADER_LEN + COLDESC_LEN + 4), 1);
+    }
+
+    /// A Gremlin map with all-string keys becomes a Struct too (mirrors how
+    /// lenke-core turns a result-side map into a struct).
+    #[test]
+    fn string_keyed_map_becomes_struct() {
+        let map = Value::Map(Arc::new(vec![(s("a"), n(1.0)), (s("b"), n(2.0))]));
+        let rows = Rows {
+            names: vec!["m".into()],
+            rows: vec![vec![map]],
+        };
+        let blob = to_arrow(&rows);
+        assert_eq!(desc(&blob, 0).0, T_STRUCT);
+        assert_eq!(desc(&blob, 0).3, 2); // two children
     }
 }

@@ -410,13 +410,23 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       cell stringification matches for scalars/temporals. 3 tests via a hand-rolled
       reader (header+types, null round-trip through the validity bitmap, mixed
       num+bool→Utf8).
-- [~] I2b. Arrow egress completion: the `FixedSizeList`/`Struct` column types
-  (list/record/map columns) and the flatbuffer Arrow-IPC wrapper
-  (`tableFromIPC`/DuckDB/Polars) that layers on these exact buffers — the
-  large, TS-verifier-dependent envelope; DEFERRED from I2a. The scalar
-  egress (I2a `to_arrow`) is the parity-relevant part and is done; this
-  envelope needs the apache-arrow dev-verifier + DuckDB/Polars round-trip,
-  an out-of-crate integration harness lenke-engine has no consumer for yet.
+- I2b. Arrow egress completion, split (the "TS-verifier-dependent" blocker
+  dissolved once lenke-core became a dev-dependency: byte-parity against the
+  reference encoder IS the verification, no apache-arrow needed):
+  - [x] I2b-1. Nested ARW1 columns: `FixedSizeList<Float64>` (all present cells
+        same-length numeric lists; dim rides `buf2_len`) and `Struct`
+        (record/map columns → typed child columns, pre-order flattened, child
+        count rides `buf2_len`; header `ncols` counts top-level only). Mirrors
+        lenke-core's `ArrowColumn`/`flatten_descs` exactly; engine `Record` and
+        string-keyed `Map` both become a `Struct` (matching core's result-side
+        Map→Struct). `tests/arrow_parity.rs` asserts BYTE-IDENTICAL `to_arrow`
+        blobs vs lenke-core for scalar, FixedSizeList, Struct, and nested
+        struct-with-list shapes (4 tests); 4 in-crate layout unit tests
+        (fixed-list flat values + dim, struct pre-order children, struct null
+        row, string-keyed map → struct).
+  - [ ] I2b-2. Arrow-IPC flatbuffer envelope (`Schema`/`RecordBatch`/`Footer`
+        messages over the ARW1 buffers) so DuckDB/Polars/pandas consume it via
+        `tableFromIPC`. Verify byte-for-byte against lenke-core's `to_arrow_ipc`.
 - [x] I3. Named-procedure `CALL name(cfg) [YIELD col [AS a], …]` (relocated from
       F3): the ISO home for the I1 algorithms. `Plan::CallProcedure{name,config}`
       runs the algorithm over the store into a `[node, <result>]` batch; the parser
