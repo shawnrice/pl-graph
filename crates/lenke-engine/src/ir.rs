@@ -238,6 +238,10 @@ pub enum Plan {
     /// Seed the frontier into slot 0: a label bucket, or the universe when
     /// `label` is None.
     Scan { label: Option<String> },
+    /// Seed slot 0 with specific nodes by their EXTERNAL ids — Gremlin `g.V(id, …)`.
+    /// Resolved at exec time (the parser has no store); an id that resolves to no
+    /// live node contributes nothing (matching Gremlin's `g.V(<missing>)`).
+    NodeSeed { ext_ids: Vec<String> },
     /// The correlated current row — the leaf of an `EXISTS { … }` body. It is NOT
     /// a stand-alone source: it yields whatever batch the enclosing `Expr::Exists`
     /// feeds it (the outer rows plus a provenance column), so it only ever appears

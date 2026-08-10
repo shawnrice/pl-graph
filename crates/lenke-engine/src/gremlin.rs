@@ -183,20 +183,31 @@ impl Parser {
         let mut plan = match head.to_ascii_lowercase().as_str() {
             "v" => {
                 self.expect(&Tok::LParen)?;
-                // g.V(<id>) is supported ONLY as the anchor of an addE (other
-                // V(id) read traversals are deferred — the Scan has no by-id form).
+                // Three head shapes:
+                //   g.V()               — all vertices (Scan).
+                //   g.V('a', 'b', …)    — the vertices with those EXTERNAL ids, a
+                //                         read source resolved at exec time (NodeSeed).
+                //   g.V(<num>).addE(…)  — the numeric-id anchor of an addE write.
                 if matches!(self.peek(), Some(Tok::Num(_))) {
                     let from = self.u_id()?;
                     self.expect(&Tok::RParen)?;
                     self.expect(&Tok::Dot)?;
                     let step = self.ident()?;
                     if !step.eq_ignore_ascii_case("addE") {
-                        return Err("g.V(id) is only supported before addE()".into());
+                        return Err("g.V(<numeric id>) is only supported before addE()".into());
                     }
                     self.expect(&Tok::LParen)?;
                     let etype = self.str_arg()?;
                     self.expect(&Tok::RParen)?;
                     self.finish_add_edge(Some(from), None, etype)?
+                } else if matches!(self.peek(), Some(Tok::Str(_))) {
+                    let mut ext_ids = vec![self.str_arg()?];
+                    while self.peek() == Some(&Tok::Comma) {
+                        self.bump();
+                        ext_ids.push(self.str_arg()?);
+                    }
+                    self.expect(&Tok::RParen)?;
+                    Plan::NodeSeed { ext_ids }
                 } else {
                     self.expect(&Tok::RParen)?;
                     Plan::Scan { label: None }
@@ -862,6 +873,32 @@ mod tests {
             &store,
         ));
         assert_eq!(eq, vec!["Num(25.0);"]);
+    }
+
+    /// `g.V('id', …)` is a READ source: seed the frontier with exactly the vertices
+    /// carrying those external ids (dense-id strings here), then traverse as usual.
+    /// A missing id contributes nothing — like core's `g.V(<absent>)`.
+    #[test]
+    fn gremlin_v_by_external_id_read_source() {
+        let store = social();
+        // Single id → that vertex.
+        let one = value_bag(&gremlin_rows("g.V('0').values('name')", &store));
+        assert_eq!(one, vec!["Str(\"alice\");"]);
+        // Several ids → their union, order-independent.
+        let many = value_bag(&gremlin_rows("g.V('1', '2').values('name')", &store));
+        assert_eq!(many, vec!["Str(\"bob\");", "Str(\"carol\");"]);
+        // Seeds a real frontier: hops compose off it.
+        let alice_out = value_bag(&gremlin_rows(
+            "g.V('0').out('KNOWS').values('name')",
+            &store,
+        ));
+        assert_eq!(alice_out, vec!["Str(\"bob\");", "Str(\"carol\");"]);
+        // A non-existent id yields nothing (no error).
+        let gone = value_bag(&gremlin_rows("g.V('999').values('name')", &store));
+        assert!(
+            gone.is_empty(),
+            "missing id must contribute nothing: {gone:?}"
+        );
     }
 
     /// `has(k)` filters elements that CARRY property `k`; `hasNot(k)` those that

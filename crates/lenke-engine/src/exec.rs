@@ -678,6 +678,7 @@ fn needs_lineage(plan: &Plan) -> bool {
     }
     match plan {
         Plan::Scan { .. }
+        | Plan::NodeSeed { .. }
         | Plan::Row
         | Plan::IndexSeek { .. }
         | Plan::RangeSeek { .. }
@@ -744,6 +745,19 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 Some(l) => store.nodes_with_label(l).to_vec(),
                 None => store.all_nodes(),
             };
+            let mut batch = Batch::single(Col::Nodes(ids.clone()));
+            if track {
+                batch.lineage = Some(Lineage::seed(&ids));
+            }
+            batch
+        }
+        Plan::NodeSeed { ext_ids } => {
+            // Resolve each external id to a LIVE node; an unknown/deleted id is
+            // silently dropped (Gremlin `g.V(<missing>)` yields nothing for it).
+            let ids: Vec<u32> = ext_ids
+                .iter()
+                .filter_map(|e| store.node_by_ext(e).filter(|&id| store.is_alive(id)))
+                .collect();
             let mut batch = Batch::single(Col::Nodes(ids.clone()));
             if track {
                 batch.lineage = Some(Lineage::seed(&ids));

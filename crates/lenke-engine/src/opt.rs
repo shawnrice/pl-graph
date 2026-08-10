@@ -102,6 +102,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
         // Leaves: no children to rewrite. (`Row` only lives inside an EXISTS body,
         // which the optimizer never descends into, but it is still a leaf.)
         p @ (Plan::Scan { .. }
+        | Plan::NodeSeed { .. }
         | Plan::Row
         | Plan::IndexSeek { .. }
         | Plan::RangeSeek { .. }
@@ -822,7 +823,10 @@ fn merge_max(a: Option<usize>, b: Option<usize>) -> Option<usize> {
 /// exist below an operator for pushdown legality.
 fn width(plan: &Plan) -> usize {
     match plan {
-        Plan::Scan { .. } | Plan::IndexSeek { .. } | Plan::RangeSeek { .. } => 1,
+        Plan::Scan { .. }
+        | Plan::NodeSeed { .. }
+        | Plan::IndexSeek { .. }
+        | Plan::RangeSeek { .. } => 1,
         // A named procedure yields exactly two columns: node id + its result.
         Plan::CallProcedure { .. } => 2,
         // `Row` never appears in an outer plan (it lives only in an EXISTS body,
@@ -1224,6 +1228,7 @@ mod tests {
                 plan_contains_filter(left) || plan_contains_filter(right)
             }
             Plan::Scan { .. }
+            | Plan::NodeSeed { .. }
             | Plan::Row
             | Plan::IndexSeek { .. }
             | Plan::RangeSeek { .. }
