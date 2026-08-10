@@ -1015,8 +1015,9 @@ fn fold_grouped(agg: &Agg, arg_col: Option<&Col>, group_of: &[u32], n_groups: us
         }
         AggFn::Sum | AggFn::Avg => {
             // total + count of non-null NUMERIC values; a non-null non-numeric
-            // poisons its group to NULL (never coerced to NaN), and an all-null
-            // (or empty) group is NULL — only count is 0 over nothing.
+            // poisons its group to NULL (never coerced to NaN). SUM and AVG differ
+            // over nothing, matching lenke-core (the GQL/Cypher convention): SUM of
+            // an empty/all-null group is 0, AVG is NULL (no values to divide).
             let mut total = vec![0f64; n_groups];
             let mut cnt = vec![0u64; n_groups];
             let mut poison = vec![false; n_groups];
@@ -1032,10 +1033,12 @@ fn fold_grouped(agg: &Agg, arg_col: Option<&Col>, group_of: &[u32], n_groups: us
             }
             (0..n_groups)
                 .map(|g| {
-                    if poison[g] || cnt[g] == 0 {
+                    if poison[g] {
                         Value::Null
                     } else if agg.func == AggFn::Sum {
-                        Value::Num(total[g])
+                        Value::Num(total[g]) // 0.0 when cnt == 0
+                    } else if cnt[g] == 0 {
+                        Value::Null // AVG of nothing
                     } else {
                         Value::Num(total[g] / cnt[g] as f64)
                     }
@@ -3764,9 +3767,11 @@ mod tests {
         assert_eq!(num(&out.rows[0][1]), 2.0); // distinct non-null: {10, 20}
     }
 
-    /// sum over an empty group is NULL, not 0 — only count is 0 over nothing.
+    /// Over nothing, `count` and `sum` are both 0 but `avg` is NULL — matching
+    /// lenke-core (the GQL/Cypher convention; the differential fuzzer flagged the
+    /// earlier SQL-style `sum → NULL`).
     #[test]
-    fn sum_over_empty_is_null_count_is_zero() {
+    fn sum_over_empty_is_zero_avg_is_null() {
         let store = social();
         // No node has this label → empty input to the scalar aggregate.
         let plan = Plan::Scan {
@@ -3777,12 +3782,14 @@ mod tests {
             vec![
                 agg(AggFn::Count, None, false, "c"),
                 agg(AggFn::Sum, Some(prop(0, "age")), false, "s"),
+                agg(AggFn::Avg, Some(prop(0, "age")), false, "a"),
             ],
         );
         let out = run(&plan, &store);
         assert_eq!(out.rows.len(), 1); // scalar aggregate still emits one row
         assert_eq!(num(&out.rows[0][0]), 0.0); // count(*) = 0
-        assert!(out.rows[0][1].is_null()); // sum = NULL
+        assert_eq!(num(&out.rows[0][1]), 0.0); // sum = 0
+        assert!(out.rows[0][2].is_null()); // avg = NULL
     }
 
     /// A grouped aggregate over empty input emits ZERO rows (unlike the scalar

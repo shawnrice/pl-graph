@@ -525,6 +525,18 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
     land differently. Algorithm outputs are not part of the matched GQL shapes.
     (§396.)
 
+- [x] J2. Differential fuzzer (`tests/differential_fuzz.rs`): the Rust-native
+      analogue of `differential-fuzz.test.ts` — a seeded PRNG generates random
+      graphs (absent / present-null / adversarial-value props) and random GQL from
+      the shared, type-safe surface (nested WHERE, whole-set + grouped aggregates
+      incl. `count(DISTINCT)`, projections with arithmetic, DISTINCT, deterministic
+      ORDER BY + paging), runs BOTH engines and asserts agreement (multiset or
+      ordered). Default 400 iters/seed 1 under `cargo test`; `FUZZ_SEED`/`FUZZ_ITERS`
+      to replay/scale. It IMMEDIATELY earned its keep: found `sum` over an
+      empty/all-null group returning NULL (SQL-style) vs lenke-core's 0 (the
+      GQL/Cypher convention) — fixed in `fold_grouped` (SUM of nothing = 0, AVG
+      stays NULL). 24k queries × 8 seeds now agree, 0 skips.
+
 ## Standing
 
 Update this file as slices land — tick the box and note the commit. The loop is
