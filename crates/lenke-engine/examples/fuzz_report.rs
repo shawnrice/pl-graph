@@ -213,6 +213,7 @@ fn main() {
         ("baseline_scan_filter", p_baseline),
         ("edge_props", p_edge_props),
         ("string_literal_eq", p_string_lit),
+        ("str_infix", p_str_infix),
         ("arithmetic", p_arith),
         ("case_when", p_case),
         ("coalesce_nullif", p_coalesce),
@@ -528,6 +529,21 @@ fn p_element_id(rng: &mut Rng) -> (String, bool) {
             true,
         )
     }
+}
+fn p_str_infix(rng: &mut Rng) -> (String, bool) {
+    let v = var(rng);
+    let (op, arg) = match rng.below(3) {
+        0 => ("CONTAINS", rng.pick(STRS)),
+        1 => ("STARTS WITH", rng.pick(STRS)),
+        _ => ("ENDS WITH", rng.pick(STRS)),
+    };
+    (
+        format!(
+            "{} WHERE {v}.b {op} '{arg}' RETURN {v}.id AS a0, {v}.b AS a1 ORDER BY a0",
+            pattern(v)
+        ),
+        true,
+    )
 }
 fn p_cast_fns(rng: &mut Rng) -> (String, bool) {
     let v = var(rng);

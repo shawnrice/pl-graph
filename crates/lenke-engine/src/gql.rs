@@ -1275,6 +1275,30 @@ impl Parser {
             });
         }
         self.pos = saved; // the NOT (if any) was not part of a NOT IN
+                          // String infix predicates `CONTAINS` / `STARTS WITH` / `ENDS WITH` desugar
+                          // to their scalar functions — three-valued (a NULL/non-string operand → NULL).
+        let str_fn = if self.eat_kw("CONTAINS") {
+            Some("contains")
+        } else if self.eat_kw("STARTS") {
+            if !self.eat_kw("WITH") {
+                return Err("expected WITH after STARTS".into());
+            }
+            Some("starts_with")
+        } else if self.eat_kw("ENDS") {
+            if !self.eat_kw("WITH") {
+                return Err("expected WITH after ENDS".into());
+            }
+            Some("ends_with")
+        } else {
+            None
+        };
+        if let Some(name) = str_fn {
+            let right = self.add_expr()?;
+            return Ok(Expr::Call {
+                name: name.to_string(),
+                args: vec![left, right],
+            });
+        }
         let op = match self.peek() {
             Some(Tok::Eq) => CompareOp::Eq,
             Some(Tok::Ne) => CompareOp::Ne,
@@ -3395,6 +3419,46 @@ mod tests {
             &store,
         );
         assert!(matches!(col(&out, 0, "s"), crate::value::Value::Num(x) if x.is_nan()));
+    }
+
+    /// `CONTAINS` / `STARTS WITH` / `ENDS WITH` infix predicates desugar to the
+    /// scalar functions and filter three-valued (a NULL operand drops the row).
+    #[test]
+    fn string_infix_predicates() {
+        let mut b = crate::store::Builder::default();
+        b.node(&["N"], &[("s", crate::value::Value::Str("carol".into()))]);
+        b.node(&["N"], &[("s", crate::value::Value::Str("bob".into()))]);
+        b.node(&["N"], &[]); // s absent → NULL
+        let store = b.build();
+        let names = |q: &str| -> Vec<String> {
+            let mut v: Vec<String> = run(&super::parse(q).unwrap(), &store)
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    crate::value::Value::Str(x) => x.to_string(),
+                    o => format!("{o:?}"),
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            names("MATCH (n:N) WHERE n.s CONTAINS 'o' RETURN n.s AS s"),
+            vec!["bob", "carol"]
+        );
+        assert_eq!(
+            names("MATCH (n:N) WHERE n.s STARTS WITH 'ca' RETURN n.s AS s"),
+            vec!["carol"]
+        );
+        assert_eq!(
+            names("MATCH (n:N) WHERE n.s ENDS WITH 'ob' RETURN n.s AS s"),
+            vec!["bob"]
+        );
+        // NULL operand → UNKNOWN → dropped (the s-absent node never matches).
+        assert_eq!(
+            names("MATCH (n:N) WHERE n.s CONTAINS 'zzz' RETURN n.s AS s"),
+            Vec::<String>::new()
+        );
     }
 
     /// `coalesce` returns the first non-null argument.
