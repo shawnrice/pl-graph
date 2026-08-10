@@ -675,6 +675,12 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             Batch::of(cols)
         }
         Plan::Distinct { input } => {
+            // Fused `DISTINCT n.k` over a bare Scan: read the storage column and
+            // dedup in one pass, emitting ONLY the distinct values — never
+            // materializing the 100k-row projected column.
+            if let Some(b) = try_distinct_scan_prop(input, store) {
+                return Ok(b);
+            }
             let batch = pull(input, store, track)?;
             // Typed single-column fast path: dedup by the raw value (a `&str`, the
             // f64 group bits, or a dense id) — no per-row byte-key serialization.
@@ -3616,6 +3622,70 @@ fn flip_op(op: CompareOp) -> CompareOp {
 /// match the general path exactly: an absent property is NULL → UNKNOWN → dropped,
 /// a NULL literal makes every comparison UNKNOWN → all dropped, and cross-type is
 /// the contract's `equals`/`cmp_total`. `None` if the predicate is not this shape.
+/// Fused `RETURN DISTINCT n.k` — a `Distinct` over a `Project(Scan, [one prop])` —
+/// reading the storage column directly and deduping to just the distinct values
+/// (first-seen order), so the 100k-row projected column is never materialized.
+/// Absence is a distinct value (a present-null / missing prop → one `Null` row, as
+/// grouping treats it). `None` unless the shape is exactly that over a `Num`/`Str`/
+/// `Bool` column.
+fn try_distinct_scan_prop(input: &Plan, store: &Store) -> Option<Batch> {
+    let Plan::Project { input: scan, items } = input else {
+        return None;
+    };
+    let [(_, Expr::Prop { slot: 0, key })] = items.as_slice() else {
+        return None;
+    };
+    let Plan::Scan { label } = scan.as_ref() else {
+        return None;
+    };
+    let mut out: Vec<Value> = Vec::new();
+    let mut saw_null = false;
+    match store.column(key)? {
+        Column::Str { data, present } => {
+            let mut seen: FnvSet<&str> = FnvSet::default();
+            scan_visit(store, label, |i| {
+                if present[i] {
+                    if seen.insert(data[i].as_ref()) {
+                        out.push(Value::Str(data[i].clone()));
+                    }
+                } else if !saw_null {
+                    saw_null = true;
+                    out.push(Value::Null);
+                }
+            });
+        }
+        Column::Num { data, present } => {
+            let mut seen: FnvSet<u64> = FnvSet::default();
+            scan_visit(store, label, |i| {
+                if present[i] {
+                    if seen.insert(value::num_group_bits(data[i])) {
+                        out.push(Value::Num(data[i]));
+                    }
+                } else if !saw_null {
+                    saw_null = true;
+                    out.push(Value::Null);
+                }
+            });
+        }
+        Column::Bool { data, present } => {
+            let mut seen = [false; 2];
+            scan_visit(store, label, |i| {
+                if present[i] {
+                    let b = data[i];
+                    if !std::mem::replace(&mut seen[usize::from(b)], true) {
+                        out.push(Value::Bool(b));
+                    }
+                } else if !saw_null {
+                    saw_null = true;
+                    out.push(Value::Null);
+                }
+            });
+        }
+        _ => return None, // Temporal / Gen → the general Distinct path
+    }
+    Some(Batch::of(vec![Col::Gen(out)]))
+}
+
 /// Row indices of the first occurrence of each distinct value in a SINGLE-column
 /// batch, keyed by the raw value (`&str`, f64 group bits, or a dense id) rather
 /// than a serialized byte key — the common `RETURN DISTINCT n.k` shape. `None` for
