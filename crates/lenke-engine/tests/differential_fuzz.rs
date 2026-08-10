@@ -257,15 +257,25 @@ fn gen_query(rng: &mut Rng) -> Query {
     };
 
     // A DISTINCT projection (compared as a set) — meaningful only without the
-    // unique id, so it lives in its own branch.
+    // unique id, so it lives in its own branch. The multi-column plain-prop forms
+    // (`DISTINCT n.a, n.b` etc.) exercise the fused multi-column distinct-scan fast
+    // path, including its dict-code composite key over the string column `b`.
     if rng.chance(1, 5) {
-        let e = if rng.chance(1, 2) {
-            num_expr(rng, var)
-        } else {
-            format!("{var}.b")
+        let items = match rng.below(4) {
+            0 => {
+                let e = if rng.chance(1, 2) {
+                    num_expr(rng, var)
+                } else {
+                    format!("{var}.b")
+                };
+                format!("{e} AS d")
+            }
+            1 => format!("{var}.b AS d0, {var}.a AS d1"),
+            2 => format!("{var}.a AS d0, {var}.b AS d1"),
+            _ => format!("{var}.a AS d0, {var}.b AS d1, {var}.id AS d2"),
         };
         return Query {
-            text: format!("{pattern}{where_clause} RETURN DISTINCT {e} AS d"),
+            text: format!("{pattern}{where_clause} RETURN DISTINCT {items}"),
             cmp: Cmp2::Multiset,
         };
     }

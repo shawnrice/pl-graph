@@ -687,6 +687,13 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             if let Some(b) = try_distinct_scan_prop(input, store) {
                 return Ok(b);
             }
+            // The multi-column sibling: dedup several storage columns on a composite
+            // key without materializing any of them (the `Arc<str>` dept column above
+            // all). Single-column shapes are already handled above; this catches
+            // `DISTINCT n.a, n.b, …`.
+            if let Some(b) = try_distinct_scan_multi(input, store) {
+                return Ok(b);
+            }
             let batch = pull(input, store, track)?;
             // Typed single-column fast path: dedup by the raw value (a `&str`, the
             // f64 group bits, or a dense id) — no per-row byte-key serialization.
@@ -3938,6 +3945,186 @@ fn flip_op(op: CompareOp) -> CompareOp {
     }
 }
 
+/// A typed reader over ONE storage column for the multi-column distinct fast path:
+/// it appends a row's grouping-key bytes (byte-identical to
+/// [`value::group_key_into`] over the boxed value, so the induced equivalence is the
+/// same) and produces the row's output `Value` — both reading the column directly,
+/// borrowing a `&str` for the key rather than boxing or cloning per row. A `Dict`
+/// column keys on its decoded string, exactly as a `Str` would.
+enum ColKeyer<'a> {
+    Dict {
+        dict: &'a [std::sync::Arc<str>],
+        codes: &'a [u32],
+        present: &'a [bool],
+    },
+    Num {
+        data: &'a [f64],
+        present: &'a [bool],
+    },
+    Str {
+        data: &'a [std::sync::Arc<str>],
+        present: &'a [bool],
+    },
+    Bool {
+        data: &'a [bool],
+        present: &'a [bool],
+    },
+}
+
+impl<'a> ColKeyer<'a> {
+    /// A keyer for a Num/Str/Bool/Dict column; `None` for Temporal/Gen/missing (which
+    /// may carry present-null or need typed compare — left to the general path).
+    fn of(col: Option<&'a Column>) -> Option<Self> {
+        match col? {
+            Column::Dict {
+                dict,
+                codes,
+                present,
+            } => Some(Self::Dict {
+                dict,
+                codes,
+                present,
+            }),
+            Column::Num { data, present } => Some(Self::Num { data, present }),
+            Column::Str { data, present } => Some(Self::Str { data, present }),
+            Column::Bool { data, present } => Some(Self::Bool { data, present }),
+            _ => None,
+        }
+    }
+
+    /// Append row `i`'s grouping-key bytes. Str/Num/Bool mirror `group_key_into`
+    /// tag-for-tag (absent → `0`, bool → `1`, num → `2`, str → `3`). A `Dict` column
+    /// instead keys on its `u32` CODE (tag `8`): the dict assigns exactly one code
+    /// per distinct string, so two rows share a code iff they share the string —
+    /// the same equivalence a string key induces, but 4 bytes and no string hash.
+    /// Codes never cross columns (each column keys at its own fixed offset).
+    fn key_into(&self, i: usize, out: &mut Vec<u8>) {
+        let push_str = |out: &mut Vec<u8>, s: &str| {
+            out.push(3);
+            out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        };
+        match self {
+            Self::Dict { codes, present, .. } => {
+                if present[i] {
+                    out.push(8);
+                    out.extend_from_slice(&codes[i].to_le_bytes());
+                } else {
+                    out.push(0);
+                }
+            }
+            Self::Str { data, present } => {
+                if present[i] {
+                    push_str(out, &data[i]);
+                } else {
+                    out.push(0);
+                }
+            }
+            Self::Num { data, present } => {
+                if present[i] {
+                    out.push(2);
+                    out.extend_from_slice(&value::num_group_bits(data[i]).to_le_bytes());
+                } else {
+                    out.push(0);
+                }
+            }
+            Self::Bool { data, present } => {
+                if present[i] {
+                    out.push(1);
+                    out.push(u8::from(data[i]));
+                } else {
+                    out.push(0);
+                }
+            }
+        }
+    }
+
+    /// Row `i`'s output value (absent → `Null`). Clones an `Arc` only here — called
+    /// once per SURVIVING distinct tuple, not per scanned row.
+    fn value_at(&self, i: usize) -> Value {
+        match self {
+            Self::Dict {
+                dict,
+                codes,
+                present,
+            } => {
+                if present[i] {
+                    Value::Str(dict[codes[i] as usize].clone())
+                } else {
+                    Value::Null
+                }
+            }
+            Self::Str { data, present } => {
+                if present[i] {
+                    Value::Str(data[i].clone())
+                } else {
+                    Value::Null
+                }
+            }
+            Self::Num { data, present } => {
+                if present[i] {
+                    Value::Num(data[i])
+                } else {
+                    Value::Null
+                }
+            }
+            Self::Bool { data, present } => {
+                if present[i] {
+                    Value::Bool(data[i])
+                } else {
+                    Value::Null
+                }
+            }
+        }
+    }
+}
+
+/// Fused multi-column `RETURN DISTINCT n.a, n.b, …` over a bare `Scan`: read the
+/// storage columns directly and dedup on a composite grouping key, emitting only the
+/// distinct tuples (first-seen order) — so the 100k-row projected columns (a `dept`
+/// of `Arc<str>` above all) are never materialized and no `Value` is boxed per
+/// scanned row. `None` unless the input is a `Project(Scan, [prop, …])` whose every
+/// key is a plain (non-dotted) property backed by a Num/Str/Bool/Dict column.
+fn try_distinct_scan_multi(input: &Plan, store: &Store) -> Option<Batch> {
+    let Plan::Project { input: scan, items } = input else {
+        return None;
+    };
+    let Plan::Scan { label } = scan.as_ref() else {
+        return None;
+    };
+    if items.is_empty() {
+        return None;
+    }
+    let mut readers: Vec<ColKeyer> = Vec::with_capacity(items.len());
+    for (_, e) in items {
+        let Expr::Prop { slot: 0, key } = e else {
+            return None;
+        };
+        if key.contains('.') {
+            return None; // a dotted record path — leave to the general path
+        }
+        readers.push(ColKeyer::of(store.column(key))?);
+    }
+
+    let ncol = readers.len();
+    let mut outs: Vec<Vec<Value>> = vec![Vec::new(); ncol];
+    let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
+    let mut buf: Vec<u8> = Vec::new();
+    scan_visit(store, label, |i| {
+        buf.clear();
+        for r in &readers {
+            r.key_into(i, &mut buf);
+        }
+        if !seen.contains(buf.as_slice()) {
+            seen.insert(buf.clone());
+            for (c, r) in readers.iter().enumerate() {
+                outs[c].push(r.value_at(i));
+            }
+        }
+    });
+    Some(Batch::of(outs.into_iter().map(Col::Gen).collect()))
+}
+
 /// One-pass predicate for the common `<prop> <cmp> <literal>` (either operand
 /// order) over a node frontier: read the storage property per row and emit the
 /// kept row indices, without building a full value column AND a full boolean mask
@@ -4952,6 +5139,55 @@ mod tests {
         assert!(matches!(store.prop(id, "dept"), Value::Str(x) if &*x == "legal"));
         let other = store.nodes_with_label("P")[1];
         assert!(matches!(store.prop(other, "dept"), Value::Str(x) if &*x == "eng"));
+    }
+
+    /// Multi-column `DISTINCT` over a dict-encoded string column plus a numeric one
+    /// (and an absent cell) dedups on the composite code+bits key exactly as the
+    /// general byte-key path would — same distinct tuples, absence as its own value.
+    #[test]
+    fn multi_col_distinct_over_dict_and_num() {
+        let depts = ["eng", "sales"];
+        let mut b = Builder::default();
+        // 20 rows: dept in {eng,sales} (cycles every row), age in {30,40} (flips
+        // every 2 rows) — decoupled, so all 4 present tuples occur...
+        for i in 0..20u32 {
+            b.node(
+                &["P"],
+                &[
+                    ("dept", s(depts[i as usize % 2])),
+                    ("age", n(f64::from(30 + ((i / 2) % 2) * 10))),
+                ],
+            );
+        }
+        // ...plus two rows whose dept is ABSENT (age 30) -> a 5th tuple (Null, 30).
+        b.node(&["P"], &[("age", n(30.0))]);
+        b.node(&["P"], &[("age", n(30.0))]);
+        let store = b.build();
+        assert!(matches!(
+            store.column("dept"),
+            Some(crate::store::Column::Dict { .. })
+        ));
+
+        let out = run(
+            &crate::gql::parse("MATCH (n:P) RETURN DISTINCT n.dept AS d, n.age AS age").unwrap(),
+            &store,
+        );
+        // Render each (dept, age) tuple to a stable string and compare as a set.
+        let mut got: Vec<String> = out
+            .rows
+            .iter()
+            .map(|r| format!("{:?}|{:?}", r[0], r[1]))
+            .collect();
+        got.sort();
+        let mut want = vec![
+            format!("{:?}|{:?}", Value::Str("eng".into()), Value::Num(30.0)),
+            format!("{:?}|{:?}", Value::Str("eng".into()), Value::Num(40.0)),
+            format!("{:?}|{:?}", Value::Str("sales".into()), Value::Num(30.0)),
+            format!("{:?}|{:?}", Value::Str("sales".into()), Value::Num(40.0)),
+            format!("{:?}|{:?}", Value::Null, Value::Num(30.0)),
+        ];
+        want.sort();
+        assert_eq!(got, want);
     }
 
     // --- relational core (unchanged behavior, now slot-addressed) ---
