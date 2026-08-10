@@ -284,8 +284,21 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
                     }
                 }
             }
-            // Write phase: apply in op/row order (last write wins per element+key;
-            // delete_node is idempotent for a node matched by several rows).
+            // Write phase, as a TRANSACTION so a constraint violation rolls the whole
+            // statement back — matching INSERT/_MERGE. Previously SET/REMOVE applied
+            // with no recheck, so `SET u.email = <existing>` silently violated a
+            // unique constraint and `REMOVE u.email` a required one.
+            store.begin();
+            // Nodes whose properties changed (Set/Remove) — the ones that can newly
+            // violate a unique/required constraint. A Delete can't create a violation
+            // on another node, so it doesn't seed a recheck.
+            let touched: Vec<u32> = applied
+                .iter()
+                .filter_map(|a| match a {
+                    Applied::Set(n, _, _) | Applied::Remove(n, _) => Some(*n),
+                    _ => None,
+                })
+                .collect();
             for a in applied {
                 match a {
                     Applied::Set(node, key, value) => store.set_prop(node, &key, value),
@@ -295,6 +308,25 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
                     Applied::Delete(node) => store.delete_node(node),
                 }
             }
+            // Recheck unique + required on every label a touched (still-live) node
+            // carries; roll the statement back on the first violation.
+            let mut labels: Vec<String> = touched
+                .iter()
+                .filter(|&&n| store.is_alive(n))
+                .flat_map(|&n| store.labels_of(n))
+                .collect();
+            labels.sort_unstable();
+            labels.dedup();
+            for l in &labels {
+                if let Err(e) = store
+                    .check_unique_for_label(l)
+                    .and_then(|()| store.check_required_for_label(l))
+                {
+                    store.rollback();
+                    return Err(e);
+                }
+            }
+            store.commit();
             Ok(empty_rows())
         }
         Plan::Merge {
@@ -5603,6 +5635,60 @@ mod tests {
         };
         assert!(execute(&plan, &mut store).is_err());
         assert_eq!(store.node_count(), 0); // both rolled back
+    }
+
+    /// A `SET` that collides with a unique constraint is REJECTED and rolled back —
+    /// the Update path enforces constraints like INSERT/_MERGE, not silently apply.
+    #[test]
+    fn set_enforces_unique_constraint() {
+        let mut b = Builder::default();
+        b.node(&["User"], &[("email", s("a@x"))]);
+        b.node(&["User"], &[("email", s("b@x"))]);
+        let mut store = b.build();
+        store.create_unique_constraint("User", &["email"]).unwrap();
+        let go = |q: &str, store: &mut Store| execute(&crate::gql::parse(q).unwrap(), store);
+
+        // Colliding SET → error, rolled back (still exactly one 'a@x').
+        assert!(go(
+            "MATCH (u:User) WHERE u.email='b@x' SET u.email='a@x'",
+            &mut store
+        )
+        .is_err());
+        let count = |store: &Store, v: &str| {
+            store
+                .nodes_with_label("User")
+                .iter()
+                .filter(|&&n| matches!(store.prop(n, "email"), Value::Str(e) if &*e == v))
+                .count()
+        };
+        assert_eq!(count(&store, "a@x"), 1, "collision must have rolled back");
+        assert_eq!(count(&store, "b@x"), 1);
+        // A non-colliding SET still applies.
+        assert!(go(
+            "MATCH (u:User) WHERE u.email='b@x' SET u.email='c@x'",
+            &mut store
+        )
+        .is_ok());
+        assert_eq!(count(&store, "c@x"), 1);
+    }
+
+    /// `REMOVE` of a required-constraint key is rejected and rolled back.
+    #[test]
+    fn remove_enforces_required_constraint() {
+        let mut b = Builder::default();
+        b.node(&["User"], &[("name", s("alice"))]);
+        let mut store = b.build();
+        store.create_required_constraint("User", "name").unwrap();
+        let id = store.nodes_with_label("User")[0];
+        assert!(execute(
+            &crate::gql::parse("MATCH (u:User) REMOVE u.name").unwrap(),
+            &mut store
+        )
+        .is_err());
+        assert!(
+            store.has_prop(id, "name"),
+            "required key must survive rollback"
+        );
     }
 
     /// A deleted node is absent from a label scan through the query path — build
