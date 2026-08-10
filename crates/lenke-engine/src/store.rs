@@ -524,6 +524,14 @@ impl Store {
         !self.deleted[id as usize]
     }
 
+    /// The number of LIVE nodes — `count(*)` over an unlabelled scan without
+    /// materializing the id vector. O(n) over the tombstone bitmap (no allocation);
+    /// deletions are rare, so the common all-live case is a fast bitmap sweep.
+    #[must_use]
+    pub fn live_node_count(&self) -> usize {
+        self.node_count - self.deleted.iter().filter(|&&d| d).count()
+    }
+
     /// The node ids carrying `label`, or an empty slice for an unknown label
     /// (which matches nothing — never "everything").
     #[must_use]

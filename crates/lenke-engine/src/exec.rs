@@ -631,7 +631,8 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // build the wide intermediate batch. Falls back to the general
             // aggregate for every shape it does not recognize. (The fused paths
             // never evaluate arbitrary expressions, so they cannot fault.)
-            if let Some(b) = try_fused_count(input, keys, aggs, store)
+            if let Some(b) = try_scan_count(input, keys, aggs, store)
+                .or_else(|| try_fused_count(input, keys, aggs, store))
                 .or_else(|| try_node_grouped_count(input, keys, aggs, store))
             {
                 b
@@ -1461,6 +1462,31 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
         }
         _ => None,
     }
+}
+
+/// Answer a scalar `count(*)` over a bare labelled/unlabelled `Scan` in O(1) (a
+/// label bucket length — buckets hold only live ids) or a single tombstone-bitmap
+/// sweep (unlabelled), WITHOUT materializing the id vector. `None` for any other
+/// shape (a WHERE seed, an Expand, `count(arg)`), which the other paths handle.
+fn try_scan_count(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.func != AggFn::Count || agg.arg.is_some() {
+        return None; // count(*) only; count(arg)/DISTINCT need the values
+    }
+    let n = match input {
+        Plan::Scan { label: Some(l) } => store.nodes_with_label(l).len(),
+        Plan::Scan { label: None } => store.live_node_count(),
+        _ => return None,
+    };
+    Some(scalar_num(n as f64))
 }
 
 /// Try to answer a scalar `count(*)` / `count(DISTINCT <last slot>)` sitting on
