@@ -55,6 +55,40 @@ fn assert_blob_parity(q: &str) {
     assert_eq!(e, c, "blob bytes differ for `{q}`");
 }
 
+fn engine_ipc(q: &str, file: bool) -> Vec<u8> {
+    let store = lenke_engine::ndjson::from_ndjson(ENGINE_ND).expect("engine load");
+    let rows = lenke_engine::exec::run(
+        &lenke_engine::gql::parse(q).unwrap_or_else(|e| panic!("engine parse `{q}`: {e}")),
+        &store,
+    );
+    lenke_engine::arrow::to_arrow_ipc(&rows, file)
+}
+
+fn core_ipc(q: &str, file: bool) -> Vec<u8> {
+    let mut g = lenke_core::ndjson::decode(CORE_ND).expect("core load");
+    let rs = lenke_core::gql::prepare(q)
+        .unwrap_or_else(|e| panic!("core parse `{q}`: {e}"))
+        .execute(&mut g, &CoreParams::new())
+        .unwrap_or_else(|e| panic!("core exec `{q}`: {e:?}"));
+    lenke_core::arrow::to_arrow_ipc(&rs, file)
+}
+
+/// Assert IPC byte-parity in BOTH the stream and file (Feather-v2) layouts.
+fn assert_ipc_parity(q: &str) {
+    for file in [false, true] {
+        let e = engine_ipc(q, file);
+        let c = core_ipc(q, file);
+        assert_eq!(
+            e.len(),
+            c.len(),
+            "IPC (file={file}) length differs for `{q}`: engine {} vs core {}",
+            e.len(),
+            c.len()
+        );
+        assert_eq!(e, c, "IPC (file={file}) bytes differ for `{q}`");
+    }
+}
+
 #[test]
 fn scalar_columns_match_core() {
     // Float64, Utf8, Bool, and a Utf8 column with a null (a missing prop).
@@ -84,4 +118,49 @@ fn nested_struct_with_list_child_matches_core() {
     assert_blob_parity(
         "MATCH (n:P) RETURN n.name AS name, {pair: [n.age, n.age]} AS rec ORDER BY name",
     );
+}
+
+// ── I2b-2: Arrow-IPC flatbuffer envelope (stream + file layouts) ──────────────
+
+#[test]
+fn ipc_scalar_matches_core() {
+    assert_ipc_parity("MATCH (n:P) RETURN n.name AS name, n.age AS age, n.ok AS ok ORDER BY name");
+}
+
+#[test]
+fn ipc_fixed_size_list_matches_core() {
+    assert_ipc_parity("MATCH (n:P) RETURN n.name AS name, [n.age, n.age] AS pair ORDER BY name");
+}
+
+#[test]
+fn ipc_struct_matches_core() {
+    assert_ipc_parity(
+        "MATCH (n:P) RETURN n.name AS name, {a: n.age, z: n.name} AS rec ORDER BY name",
+    );
+}
+
+#[test]
+fn ipc_nested_struct_with_list_matches_core() {
+    assert_ipc_parity(
+        "MATCH (n:P) RETURN n.name AS name, {pair: [n.age, n.age]} AS rec ORDER BY name",
+    );
+}
+
+/// The stream and file layouts differ in the expected ways: the file layout wraps
+/// the same messages in the `ARROW1` magic + trailing footer.
+#[test]
+fn ipc_envelope_shape() {
+    let q = "MATCH (n:P) RETURN n.name AS name, n.age AS age ORDER BY name";
+    let stream = engine_ipc(q, false);
+    let file = engine_ipc(q, true);
+    // Stream starts with a continuation marker (0xFFFFFFFF) and ends with the
+    // end-of-stream marker (0xFFFFFFFF, 0,0,0,0).
+    assert_eq!(&stream[0..4], &[0xFF, 0xFF, 0xFF, 0xFF]);
+    assert_eq!(
+        &stream[stream.len() - 8..],
+        &[0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]
+    );
+    // File layout is Feather-v2: `ARROW1\0\0` prefix and `ARROW1` suffix.
+    assert_eq!(&file[0..8], b"ARROW1\0\0");
+    assert_eq!(&file[file.len() - 6..], b"ARROW1");
 }

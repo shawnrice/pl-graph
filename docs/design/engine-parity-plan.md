@@ -424,9 +424,16 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
         struct-with-list shapes (4 tests); 4 in-crate layout unit tests
         (fixed-list flat values + dim, struct pre-order children, struct null
         row, string-keyed map → struct).
-  - [ ] I2b-2. Arrow-IPC flatbuffer envelope (`Schema`/`RecordBatch`/`Footer`
-        messages over the ARW1 buffers) so DuckDB/Polars/pandas consume it via
-        `tableFromIPC`. Verify byte-for-byte against lenke-core's `to_arrow_ipc`.
+  - [x] I2b-2. Arrow-IPC flatbuffer envelope: `to_arrow_ipc(rows, file)` frames
+        the ARW1 buffers as standard Apache Arrow IPC (`Schema`/`RecordBatch`/
+        `Footer` messages via a back-to-front FlatBuffers builder) — stream layout
+        or file/Feather-v2 — so DuckDB/Polars/pandas consume it via `tableFromIPC`.
+        A VERBATIM port of lenke-core's framing over the identical ARW1 blob; the
+        `to_arrow_ipc` signature takes `&Rows` (the only adaptation). 5 tests in
+        `arrow_parity.rs` assert BYTE-IDENTICAL IPC vs lenke-core in BOTH layouts
+        for scalar/FixedSizeList/Struct/nested shapes, plus an envelope-shape check
+        (stream continuation + end-of-stream markers; file `ARROW1` magic + footer).
+        Completes I2b.
 - [x] I3. Named-procedure `CALL name(cfg) [YIELD col [AS a], …]` (relocated from
       F3): the ISO home for the I1 algorithms. `Plan::CallProcedure{name,config}`
       runs the algorithm over the store into a `[node, <result>]` batch; the parser
