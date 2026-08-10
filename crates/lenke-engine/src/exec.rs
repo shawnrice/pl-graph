@@ -3495,38 +3495,52 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         "ltrim" | "rtrim" | "btrim" => trim_fn(name, args),
         // reverse is polymorphic: a string reverses by char, a list by element;
         // anything else is NULL (matches core, e.g. reverse(number) → NULL).
+        // reverse: a string reverses by UTF-16 unit (JS model — a surrogate pair
+        // reversed decodes lossily to U+FFFD, byte-identical to core), a list by
+        // element; anything else is NULL.
         "reverse" => match &args[0] {
-            Value::Str(s) => Value::Str(s.chars().rev().collect::<String>().into()),
+            Value::Str(s) => {
+                let mut units: Vec<u16> = s.encode_utf16().collect();
+                units.reverse();
+                Value::Str(String::from_utf16_lossy(&units).into())
+            }
             Value::List(v) => Value::List(v.iter().rev().cloned().collect()),
             _ => Value::Null,
         },
-        // left/right(s, n): the first / last n characters (n ≥ len → the whole
+        // left/right(s, n): the first / last n UTF-16 units (n ≥ len → the whole
         // string; n ≤ 0 → empty).
-        "left" | "right" => match (&args[0], value::as_num(&args[1])) {
+        "left" | "right" => match (&args[0], value::num_of(&args[1])) {
             (Value::Str(s), Some(k)) => {
-                let k = k.max(0.0) as usize;
-                let chars: Vec<char> = s.chars().collect();
-                let take = k.min(chars.len());
-                let slice = if name == "left" {
-                    &chars[..take]
+                let units = utf16_len(s);
+                let take = (k.max(0.0) as usize).min(units);
+                let out = if name == "left" {
+                    utf16_slice(s, 0, take)
                 } else {
-                    &chars[chars.len() - take..]
+                    utf16_slice(s, units - take, take)
                 };
-                Value::Str(slice.iter().collect::<String>().into())
+                Value::Str(out.into())
             }
             _ => Value::Null,
         },
-        // split(s, delim) → a list of substrings.
+        // split(s, delim) → a list of substrings. An EMPTY delimiter splits into one
+        // element per UTF-16 unit (JS model), matching core — NOT Rust's `split("")`.
         "split" => match (&args[0], &args[1]) {
             (Value::Str(s), Value::Str(d)) => {
-                Value::List(s.split(d.as_ref()).map(|p| Value::Str(p.into())).collect())
+                let parts: Vec<Value> = if d.is_empty() {
+                    s.encode_utf16()
+                        .map(|u| Value::Str(String::from_utf16_lossy(&[u]).into()))
+                        .collect()
+                } else {
+                    s.split(d.as_ref()).map(|p| Value::Str(p.into())).collect()
+                };
+                Value::List(parts)
             }
             _ => Value::Null,
         },
-        // Character count of a string. `length`/`char_length`/`character_length`
-        // are synonyms here; `byte_length`/`octet_length` count UTF-8 bytes.
+        // Length of a string in UTF-16 code units (JS `.length` model), matching
+        // core; `byte_length`/`octet_length` count UTF-8 bytes.
         "length" | "char_length" | "character_length" => match &args[0] {
-            Value::Str(s) => Value::Num(s.chars().count() as f64),
+            Value::Str(s) => Value::Num(utf16_len(s) as f64),
             _ => Value::Null,
         },
         "byte_length" | "octet_length" => match &args[0] {
@@ -3537,20 +3551,30 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         "starts_with" => str_bool(&args[0], &args[1], |s, sub| s.starts_with(sub)),
         "ends_with" => str_bool(&args[0], &args[1], |s, sub| s.ends_with(sub)),
         "contains" => str_bool(&args[0], &args[1], |s, sub| s.contains(sub)),
-        // replace(s, from, to) (3 args → string)
-        "replace" => match (&args[0], &args[1], &args[2]) {
-            (Value::Str(s), Value::Str(f), Value::Str(t)) => {
-                Value::Str(s.replace(f.as_ref(), t).into())
+        // replace(s, from[, to]) — `to` defaults to "" (core); an EMPTY search
+        // returns the string unchanged (core), NOT Rust's insert-everywhere.
+        "replace" => match (&args[0], &args[1]) {
+            (Value::Str(s), Value::Str(f)) => {
+                let t = match args.get(2) {
+                    Some(Value::Str(t)) => t.to_string(),
+                    Some(v) if !v.is_null() => return Value::Null,
+                    _ => String::new(),
+                };
+                if f.is_empty() {
+                    Value::Str(s.clone())
+                } else {
+                    Value::Str(s.replace(f.as_ref(), &t).into())
+                }
             }
             _ => Value::Null,
         },
-        // substring(s, start[, len]) — 0-based, char-indexed
+        // substring(s, start[, len]) — ISO 1-based, UTF-16-unit indexed
         "substring" => substring(args),
-        // `size` is polymorphic over a collection OR a string (char count), like
+        // `size` is polymorphic over a collection OR a string (UTF-16 units), like
         // lenke-core; a non-collection non-string is NULL.
         "size" => match &args[0] {
             Value::List(v) => Value::Num(v.len() as f64),
-            Value::Str(s) => Value::Num(s.chars().count() as f64),
+            Value::Str(s) => Value::Num(utf16_len(s) as f64),
             _ => Value::Null,
         },
         "head" => match &args[0] {
@@ -3818,26 +3842,45 @@ fn str_bool(a: &Value, b: &Value, f: impl Fn(&str, &str) -> bool) -> Value {
     }
 }
 
-/// `substring(s, start[, len])` — 0-based, Unicode-char indexed. `start` clamps to
-/// `[0, len]`; a negative `start`/`len`, or a NULL/non-string/non-numeric arg,
-/// yields NULL. Omitted `len` runs to the end.
+/// Slice `s` by UTF-16 code UNITS `[start, start+len)` (JS `String.slice` /
+/// `.length` model), decoding back to UTF-8. A slice that splits a surrogate pair
+/// yields U+FFFD there (lossy) — byte-identical to lenke-core (`utf16_slice`) and
+/// the TS engine. The whole string model here counts UTF-16 units, NOT `chars()`,
+/// so `size('😀')` is 2 (a surrogate pair), matching core.
+fn utf16_slice(s: &str, start: usize, len: usize) -> String {
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let end = start.saturating_add(len).min(units.len());
+    let start = start.min(end);
+    String::from_utf16_lossy(&units[start..end])
+}
+
+/// Length of `s` in UTF-16 code units — the JS `.length` model core uses.
+fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// `substring(s, start[, len])` — ISO/SQL **1-based** start, indexed by UTF-16 code
+/// UNIT (matching lenke-core exactly). A `start <= 0` shrinks the window from the
+/// front (SQL semantics); an omitted `len` runs to the end. NULL for a null string
+/// or start.
 fn substring(args: &[Value]) -> Value {
-    let (Value::Str(s), Some(start)) = (&args[0], value::as_num(&args[1])) else {
-        return Value::Null;
-    };
-    if start < 0.0 || start.fract() != 0.0 {
+    if args[0].is_null() || args[1].is_null() {
         return Value::Null;
     }
-    let chars: Vec<char> = s.chars().collect();
-    let begin = (start as usize).min(chars.len());
-    let end = match args.get(2) {
-        None => chars.len(),
-        Some(lv) => match value::as_num(lv) {
-            Some(l) if l >= 0.0 && l.fract() == 0.0 => (begin + l as usize).min(chars.len()),
-            _ => return Value::Null,
-        },
+    let Value::Str(s) = &args[0] else {
+        return Value::Null;
     };
-    Value::Str(chars[begin..end].iter().collect::<String>().into())
+    // 1-based → 0-based offset; a start <= 0 shrinks the window from the front.
+    let zero_start = value::num_of(&args[1]).unwrap_or(0.0) - 1.0;
+    let from = zero_start.max(0.0) as usize;
+    let count = match args.get(2) {
+        Some(z) if !z.is_null() => {
+            let end = (zero_start + value::num_of(z).unwrap_or(0.0)).max(0.0) as usize;
+            end.saturating_sub(from)
+        }
+        _ => usize::MAX,
+    };
+    Value::Str(utf16_slice(s, from, count).into())
 }
 
 /// Apply a unary numeric scalar function. A NULL / non-numeric argument yields

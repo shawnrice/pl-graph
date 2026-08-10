@@ -42,7 +42,10 @@ impl Rng {
 }
 
 const NUMS: &[&str] = &["0", "-0.0", "1", "-1", "2", "3", "42", "-7", "0.5", "100"];
-const STRS: &[&str] = &["a", "b", "carol", ""]; // safe GQL literals (no escaping)
+// Safe GQL literals (no escaping). Includes an astral emoji and a mixed
+// ASCII+emoji string so the UTF-16-vs-chars string model is actually exercised —
+// `size`/`substring`/`left`/`split` diverge there iff the engine miscounts units.
+const STRS: &[&str] = &["a", "b", "carol", "", "😀", "x😀y", "aXbXc"];
 
 // ── random graph (props: id unique, a number|null|absent, b string|null|absent,
 //    edges carry w number|null|absent) ────────────────────────────────────────
@@ -432,10 +435,25 @@ fn p_string_fns(rng: &mut Rng) -> (String, bool) {
         "left",
         "right",
         "split",
+        "substring",
+        "replace",
     ]);
     let call = match *f {
-        "left" | "right" => format!("{f}({v}.b, 2)"),
-        "split" => format!("{f}({v}.b, 'a')"),
+        "left" | "right" => format!("{f}({v}.b, {})", 1 + rng.below(4)),
+        // Both a non-empty and an EMPTY delimiter (the empty case diverged: Rust's
+        // split("") vs the JS per-code-unit model).
+        "split" => format!("{f}({v}.b, '{}')", rng.pick(&["X", "", "😀"])),
+        // Vary start (incl. <= 0) and presence of the length arg — exercises the
+        // ISO 1-based indexing and the from-the-front shrink on a non-positive start.
+        "substring" => {
+            let start = ["0", "1", "2", "-1"][rng.below(4)];
+            if rng.chance(1, 2) {
+                format!("{f}({v}.b, {start}, {})", rng.below(4))
+            } else {
+                format!("{f}({v}.b, {start})")
+            }
+        }
+        "replace" => format!("{f}({v}.b, '{}', '{}')", rng.pick(STRS), rng.pick(STRS)),
         _ => format!("{f}({v}.b)"),
     };
     (

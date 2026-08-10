@@ -3705,7 +3705,7 @@ mod tests {
         let out = run(&super::parse(q).unwrap(), &store);
         assert!(matches!(col(&out, 0, "u"), Value::Str(x) if &*x == "ALICE"));
         assert_eq!(num(&col(&out, 0, "l")), 5.0); // "alice"
-        assert!(matches!(col(&out, 0, "sub"), Value::Str(x) if &*x == "lic")); // 0-based [1,4)
+        assert!(matches!(col(&out, 0, "sub"), Value::Str(x) if &*x == "ali")); // ISO 1-based [1,4)
         assert!(matches!(col(&out, 0, "rep"), Value::Str(x) if &*x == "Alice"));
     }
 
@@ -3738,13 +3738,18 @@ mod tests {
             .unwrap(),
             &store,
         );
-        assert!(matches!(col(&out, 0, "tail"), Value::Str(x) if &*x == "ce")); // from idx 3
+        assert!(matches!(col(&out, 0, "tail"), Value::Str(x) if &*x == "ice")); // ISO 1-based, from unit 2
         assert!(matches!(col(&out, 0, "past"), Value::Str(x) if x.is_empty())); // clamped
-        assert!(
-            super::parse("MATCH (p:Person) RETURN substring(p.name, -1) AS x")
-                .map(|pl| run(&pl, &store).rows[0][0].is_null())
-                .unwrap_or(false)
-        ); // negative start → NULL (parses; evals null)
+                                                                                // A start <= 0 shrinks the window from the front (SQL semantics), so it
+                                                                                // returns the whole string — matching core, NOT NULL.
+        let neg = run(
+            &super::parse(
+                "MATCH (p:Person) WHERE p.name='alice' RETURN substring(p.name, -1) AS x",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert!(matches!(col(&neg, 0, "x"), Value::Str(s) if &*s == "alice"));
     }
 
     /// Parsed `upper(p.name)` matches the hand-built Call.
