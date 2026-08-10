@@ -357,6 +357,23 @@ impl Parser {
                 self.slots = 1;
                 p
             }
+            "fold" => {
+                self.expect(&Tok::RParen)?;
+                // Collect the whole value stream into one row holding a list (see
+                // AggFn::Collect). Bare fold() only; fold(seed, biFn) is deferred.
+                let p = plan.aggregate(
+                    vec![],
+                    vec![Agg {
+                        func: AggFn::Collect,
+                        arg: Some(Expr::Slot(self.current)),
+                        distinct: false,
+                        name: "fold".into(),
+                    }],
+                );
+                self.current = 0;
+                self.slots = 1;
+                p
+            }
             "dedup" => {
                 self.expect(&Tok::RParen)?;
                 plan.distinct()
@@ -374,33 +391,54 @@ impl Parser {
                 plan.order_page(vec![], Some(lo), Some(hi.saturating_sub(lo)))
             }
             "order" => {
+                // Optional scope: order()/order(global) sort the stream;
+                // order(local) sorts within the current list/map cell.
+                let is_local = self.parse_scope_is_local()?;
                 self.expect(&Tok::RParen)?;
-                // order() is followed by a `.by('k'[, asc|desc])` modulator.
-                self.expect(&Tok::Dot)?;
-                let by = self.ident()?;
-                if !by.eq_ignore_ascii_case("by") {
-                    return Err("order() must be followed by by(...)".into());
-                }
-                self.expect(&Tok::LParen)?;
-                let key = self.str_arg()?;
-                let descending = if self.peek() == Some(&Tok::Comma) {
-                    self.pos += 1;
-                    self.order_dir()?
+                if is_local {
+                    // order(local)[.by(asc|desc)] — the `by` here is a DIRECTION,
+                    // not a property key (list elements sort by natural order).
+                    let descending = if self.peek() == Some(&Tok::Dot)
+                        && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
+                    {
+                        self.expect(&Tok::Dot)?;
+                        self.ident()?; // `by`
+                        self.expect(&Tok::LParen)?;
+                        let d = self.order_dir()?;
+                        self.expect(&Tok::RParen)?;
+                        d
+                    } else {
+                        false
+                    };
+                    plan.sort_local(descending)
                 } else {
-                    false
-                };
-                self.expect(&Tok::RParen)?;
-                plan.order_page(
-                    vec![SortKey {
-                        expr: Expr::Prop {
-                            slot: self.current,
-                            key,
-                        },
-                        descending,
-                    }],
-                    None,
-                    None,
-                )
+                    // order().by('k'[, asc|desc]) — stream sort by a property.
+                    self.expect(&Tok::Dot)?;
+                    let by = self.ident()?;
+                    if !by.eq_ignore_ascii_case("by") {
+                        return Err("order() must be followed by by(...)".into());
+                    }
+                    self.expect(&Tok::LParen)?;
+                    let key = self.str_arg()?;
+                    let descending = if self.peek() == Some(&Tok::Comma) {
+                        self.pos += 1;
+                        self.order_dir()?
+                    } else {
+                        false
+                    };
+                    self.expect(&Tok::RParen)?;
+                    plan.order_page(
+                        vec![SortKey {
+                            expr: Expr::Prop {
+                                slot: self.current,
+                                key,
+                            },
+                            descending,
+                        }],
+                        None,
+                        None,
+                    )
+                }
             }
             "as" => {
                 // Label the current slot; the plan is unchanged (select resolves it).
@@ -662,6 +700,28 @@ impl Parser {
         }
     }
 
+    /// Consume an optional `Scope` inside `order(...)`: bare `local`/`global`, or
+    /// `Scope.local`/`Scope.global`. Returns true for local; no arg defaults to
+    /// global. Leaves the cursor at the closing `)`.
+    fn parse_scope_is_local(&mut self) -> Result<bool, String> {
+        match self.peek() {
+            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("local") => {
+                self.pos += 1;
+                Ok(true)
+            }
+            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("global") => {
+                self.pos += 1;
+                Ok(false)
+            }
+            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("Scope") => {
+                self.pos += 1;
+                self.expect(&Tok::Dot)?;
+                Ok(self.ident()?.eq_ignore_ascii_case("local"))
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// `asc`/`desc` — a bare ident, a quoted string, or `Order.desc`.
     fn order_dir(&mut self) -> Result<bool, String> {
         let word = match self.bump() {
@@ -809,6 +869,104 @@ mod tests {
             Value::Str(x) => assert_eq!(&**x, "alice"),
             _ => panic!(),
         }
+    }
+
+    /// The single list cell of a folded result: exactly one row, one column,
+    /// which is a `Value::List`. Returned as debug strings, since `Value` has no
+    /// `PartialEq` (equality is the value contract's, not derived) — the exact,
+    /// ordered element sequence is what an `order(local)` test needs to pin.
+    fn fold_list(out: &Rows) -> Vec<String> {
+        assert_eq!(out.rows.len(), 1, "fold emits exactly one row");
+        assert_eq!(out.rows[0].len(), 1, "fold emits one column");
+        match &out.rows[0][0] {
+            Value::List(items) => items.iter().map(|v| format!("{v:?}")).collect(),
+            other => panic!("expected a list cell, got {other:?}"),
+        }
+    }
+
+    /// The same debug-string projection for an expected element list.
+    fn dbg(items: &[Value]) -> Vec<String> {
+        items.iter().map(|v| format!("{v:?}")).collect()
+    }
+
+    /// fold() collects the whole value stream into one list. Order is unspecified
+    /// without a preceding sort, so the SET of names is what's pinned here.
+    #[test]
+    fn fold_collects_the_stream() {
+        let store = social();
+        let out = gremlin_rows("g.V().hasLabel('Person').values('name').fold()", &store);
+        let mut got = fold_list(&out);
+        got.sort();
+        let mut want = dbg(&[s("alice"), s("bob"), s("carol")]);
+        want.sort();
+        // Person names are alice/bob/carol; graphdb is a Project, excluded.
+        assert_eq!(got, want);
+    }
+
+    /// fold() over an empty stream still emits exactly one row: the empty list.
+    #[test]
+    fn fold_of_empty_is_one_empty_list() {
+        let store = social();
+        let out = gremlin_rows("g.V().hasLabel('Nope').values('name').fold()", &store);
+        assert_eq!(fold_list(&out), Vec::<String>::new());
+    }
+
+    /// order(local) sorts WITHIN the folded list — ascending by the value contract.
+    #[test]
+    fn order_local_sorts_the_list_ascending() {
+        let store = social();
+        let out = gremlin_rows(
+            "g.V().hasLabel('Person').values('name').fold().order(local)",
+            &store,
+        );
+        // names sorted ascending, exact order (not a set)
+        assert_eq!(fold_list(&out), dbg(&[s("alice"), s("bob"), s("carol")]));
+    }
+
+    /// order(local).by(desc) reverses the within-list order; numeric elements sort
+    /// numerically (the value contract), not lexically.
+    #[test]
+    fn order_local_by_desc_on_numbers() {
+        let store = social();
+        let out = gremlin_rows(
+            "g.V().hasLabel('Person').values('age').fold().order(local).by(desc)",
+            &store,
+        );
+        // ages 25/30/40 descending
+        assert_eq!(fold_list(&out), dbg(&[n(40.0), n(30.0), n(25.0)]));
+    }
+
+    /// `Scope.local` is an accepted spelling of the local scope.
+    #[test]
+    fn order_scope_local_spelling() {
+        let store = social();
+        let out = gremlin_rows(
+            "g.V().hasLabel('Person').values('name').fold().order(Scope.local)",
+            &store,
+        );
+        assert_eq!(fold_list(&out), dbg(&[s("alice"), s("bob"), s("carol")]));
+    }
+
+    /// order(local) faults nothing on a scalar cell — it passes through unchanged
+    /// (there is no list to sort), so a global order() is still the stream sort.
+    #[test]
+    fn order_local_passthrough_on_scalar() {
+        let store = social();
+        // No fold: each row's slot-0 is a scalar name; order(local) leaves it be.
+        let out = gremlin_rows(
+            "g.V().hasLabel('Person').values('name').order(local)",
+            &store,
+        );
+        let mut got: Vec<String> = out
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Str(x) => x.to_string(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["alice", "bob", "carol"]);
     }
 
     #[test]

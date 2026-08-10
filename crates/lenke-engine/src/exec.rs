@@ -396,7 +396,9 @@ fn output_names(plan: &Plan) -> Option<Vec<String>> {
             names.extend(aggs.iter().map(|a| a.name.clone()));
             Some(names)
         }
-        Plan::Distinct { input } | Plan::OrderPage { input, .. } => output_names(input),
+        Plan::Distinct { input }
+        | Plan::OrderPage { input, .. }
+        | Plan::SortLocal { input, .. } => output_names(input),
         _ => None,
     }
 }
@@ -449,7 +451,8 @@ fn needs_lineage(plan: &Plan) -> bool {
         Plan::Expand { input, .. }
         | Plan::VarLength { input, .. }
         | Plan::ShortestPath { input, .. }
-        | Plan::Distinct { input } => needs_lineage(input),
+        | Plan::Distinct { input }
+        | Plan::SortLocal { input, .. } => needs_lineage(input),
         Plan::Filter { input, pred } => reads_path(pred) || needs_lineage(input),
         Plan::Project { input, items } => {
             items.iter().any(|(_, e)| reads_path(e)) || needs_lineage(input)
@@ -641,6 +644,23 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 })
                 .collect();
             batch.gather(&keep)
+        }
+        Plan::SortLocal { input, descending } => {
+            // Gremlin `order(local)`: sort inside each row's slot-0 cell, leaving
+            // the batch shape and every other slot untouched. Ordering is the value
+            // contract's `cmp_total` (the single home for order); DESC reverses it.
+            let batch = pull(input, store, track)?;
+            let n = batch.rows();
+            let sorted: Vec<Value> = (0..n)
+                .map(|i| sort_local_cell(batch.slot(0).value_at(i), *descending))
+                .collect();
+            let mut slots: Vec<Col> = batch.slots.clone();
+            if !slots.is_empty() {
+                slots[0] = Col::Gen(sorted);
+            }
+            let mut out = Batch::of(slots);
+            out.lineage = batch.lineage;
+            out
         }
         Plan::Join { left, right, on } => {
             hash_join(&pull(left, store, track)?, &pull(right, store, track)?, on)
@@ -898,6 +918,25 @@ fn group_by_arc(keys: &[Arc<str>]) -> (Vec<u32>, Vec<usize>) {
     (group_of, first_row)
 }
 
+/// Sort one cell in place for `order(local)`: a `List` by its elements, a `Map`
+/// by its values (TinkerPop's default local map ordering), anything else
+/// unchanged. Order is the value contract's `cmp_total`; `descending` reverses.
+fn sort_local_cell(v: Value, descending: bool) -> Value {
+    let dir = |ord: std::cmp::Ordering| if descending { ord.reverse() } else { ord };
+    match v {
+        Value::List(mut items) => {
+            items.sort_by(|a, b| dir(value::cmp_total(a, b)));
+            Value::List(items)
+        }
+        Value::Map(pairs) => {
+            let mut pairs = (*pairs).clone();
+            pairs.sort_by(|a, b| dir(value::cmp_total(&a.1, &b.1)));
+            Value::Map(std::sync::Arc::new(pairs))
+        }
+        other => other,
+    }
+}
+
 /// Fold one aggregate to one value per group in a single streaming pass over the
 /// group labelling. Null policy and ordering come from the value contract;
 /// nothing here restates them.
@@ -972,6 +1011,16 @@ fn fold_grouped(agg: &Agg, arg_col: Option<&Col>, group_of: &[u32], n_groups: us
                     }
                 })
                 .collect()
+        }
+        AggFn::Collect => {
+            // Gremlin `fold()`: gather every value into each group's list, in row
+            // order (a preceding sort carries through), nulls kept. An empty group
+            // — which the no-key case still emits — folds to the empty list.
+            let mut lists: Vec<Vec<Value>> = vec![Vec::new(); n_groups];
+            for (i, &g) in group_of.iter().enumerate() {
+                lists[g as usize].push(col.value_at(i));
+            }
+            lists.into_iter().map(Value::List).collect()
         }
         AggFn::Min | AggFn::Max => {
             let want_min = agg.func == AggFn::Min;

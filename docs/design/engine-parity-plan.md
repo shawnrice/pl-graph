@@ -309,11 +309,16 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       `Value::Map` keyed by the labels (via a new `Expr::MapLit`, Gremlin-only);
       a single-label select still projects the element, an unknown label errors.
       1 test (ordered map of node ids). order(local) → F5d.
-- [~] F5d. Gremlin `order(local)` (within-list/map sort) — DEFERRED: no Gremlin
-  step yet PRODUCES a per-row list/map to sort (no `fold`/`aggregate(local)`;
-  multi-select yields a Map, groupCount yields rows). `order(local)` would have
-  nothing to operate on, so it waits on a list-producing step (a future `fold`).
-  Not a blocker for parity of the currently-expressible surface.
+- [x] F5d. Gremlin `fold()` + `order(local)` (was deferred for want of a
+      list-producing step — so this slice built the producer too). `fold()` is a
+      new `AggFn::Collect` (barrier aggregate, no keys → one row holding a
+      `Value::List` in group-row order, nulls kept, empty stream → one empty
+      list). `order(local)` is a new transparent `Plan::SortLocal` that sorts
+      inside slot 0's cell via `value::cmp_total` (List → elements; Map → by
+      value; scalar → passthrough), `.by(asc|desc)` optional, `Scope.local`
+      spelling accepted. 6 tests (fold set, fold-of-empty, order(local) asc on
+      strings, .by(desc) on numbers, Scope.local, scalar passthrough). fold(seed,
+      biFn) still deferred (no consumer).
 - [x] G3. Numeric edge-case parity audit against `value.rs`: confirmed agreement
       with lenke-core on the f64 model — `as_num` is finite-Num-only (NaN/Inf →
       None → arithmetic NULL), `-0.0 == 0.0`, NaN unequal under `equals` but
@@ -406,12 +411,12 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       reader (header+types, null round-trip through the validity bitmap, mixed
       num+bool→Utf8).
 - [~] I2b. Arrow egress completion: the `FixedSizeList`/`Struct` column types
-      (list/record/map columns) and the flatbuffer Arrow-IPC wrapper
-      (`tableFromIPC`/DuckDB/Polars) that layers on these exact buffers — the
-      large, TS-verifier-dependent envelope; DEFERRED from I2a. The scalar
-      egress (I2a `to_arrow`) is the parity-relevant part and is done; this
-      envelope needs the apache-arrow dev-verifier + DuckDB/Polars round-trip,
-      an out-of-crate integration harness lenke-engine has no consumer for yet.
+  (list/record/map columns) and the flatbuffer Arrow-IPC wrapper
+  (`tableFromIPC`/DuckDB/Polars) that layers on these exact buffers — the
+  large, TS-verifier-dependent envelope; DEFERRED from I2a. The scalar
+  egress (I2a `to_arrow`) is the parity-relevant part and is done; this
+  envelope needs the apache-arrow dev-verifier + DuckDB/Polars round-trip,
+  an out-of-crate integration harness lenke-engine has no consumer for yet.
 - [x] I3. Named-procedure `CALL name(cfg) [YIELD col [AS a], …]` (relocated from
       F3): the ISO home for the I1 algorithms. `Plan::CallProcedure{name,config}`
       runs the algorithm over the store into a `[node, <result>]` batch; the parser

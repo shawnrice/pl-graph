@@ -187,6 +187,11 @@ pub enum AggFn {
     Min,
     Max,
     Avg,
+    /// Collect every value in the group into a `Value::List`, in the group's
+    /// row order (so a preceding sort carries through). Nulls are kept — this is
+    /// a faithful fold of the stream, not a null-skipping numeric aggregate. This
+    /// is Gremlin `fold()`; a group with no rows folds to the empty list.
+    Collect,
 }
 
 /// One aggregate in an `Aggregate` operator: `func(arg)` (or `func(DISTINCT
@@ -315,6 +320,13 @@ pub enum Plan {
     /// two NaNs / two -0.0s collapse — the grouping notion, not predicate
     /// equality. Placed above a Project, it is `RETURN DISTINCT …`.
     Distinct { input: Box<Plan> },
+    /// Sort WITHIN each row's slot-0 value, in place — Gremlin `order(local)`.
+    /// A `List` cell becomes its elements sorted by the value contract's
+    /// `cmp_total`; a `Map` cell becomes its pairs sorted by VALUE (TinkerPop's
+    /// default local ordering of a map); any other cell passes through unchanged.
+    /// `descending` reverses the order. Transparent to output naming (like
+    /// `Distinct`/`OrderPage`), since it reorders inside a cell, not across rows.
+    SortLocal { input: Box<Plan>, descending: bool },
     /// Hash-join two sub-plans on shared bound variables. `on` lists
     /// `(left_slot, right_slot)` equalities — for `MATCH (a)-[:R]->(b),
     /// (a)-[:S]->(c)` sharing `a`, that is `[(a_left, a_right)]`.
@@ -548,6 +560,14 @@ impl Plan {
     pub fn distinct(self) -> Self {
         Self::Distinct {
             input: Box::new(self),
+        }
+    }
+
+    #[must_use]
+    pub fn sort_local(self, descending: bool) -> Self {
+        Self::SortLocal {
+            input: Box::new(self),
+            descending,
         }
     }
 

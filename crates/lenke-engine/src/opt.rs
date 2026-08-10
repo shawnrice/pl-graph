@@ -160,6 +160,16 @@ fn map_children(plan: Plan) -> (Plan, bool) {
             let (i, c) = rewrite(*input);
             (Plan::Distinct { input: Box::new(i) }, c)
         }
+        Plan::SortLocal { input, descending } => {
+            let (i, c) = rewrite(*input);
+            (
+                Plan::SortLocal {
+                    input: Box::new(i),
+                    descending,
+                },
+                c,
+            )
+        }
         Plan::Update { input, ops } => {
             let (i, c) = rewrite(*input);
             (
@@ -439,9 +449,10 @@ fn width(plan: &Plan) -> usize {
             input, bind_edge, ..
         } => width(input) + if *bind_edge { 2 } else { 1 },
         Plan::VarLength { input, .. } | Plan::ShortestPath { input, .. } => width(input) + 1,
-        Plan::Filter { input, .. } | Plan::OrderPage { input, .. } | Plan::Distinct { input } => {
-            width(input)
-        }
+        Plan::Filter { input, .. }
+        | Plan::OrderPage { input, .. }
+        | Plan::Distinct { input }
+        | Plan::SortLocal { input, .. } => width(input),
         Plan::Project { items, .. } => items.len(),
         Plan::Aggregate { keys, aggs, .. } => keys.len() + aggs.len(),
         Plan::Join { left, right, .. } => width(left) + width(right),
@@ -811,7 +822,8 @@ mod tests {
             | Plan::Project { input, .. }
             | Plan::Update { input, .. }
             | Plan::CallInline { input, .. }
-            | Plan::Distinct { input } => plan_contains_filter(input),
+            | Plan::Distinct { input }
+            | Plan::SortLocal { input, .. } => plan_contains_filter(input),
             Plan::Join { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)
             }
