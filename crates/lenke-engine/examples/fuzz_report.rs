@@ -266,6 +266,7 @@ fn main() {
         ("return_star", p_return_star),
         ("edge_element", p_edge_element),
         ("order_expr", p_order_expr),
+        ("collect", p_collect),
         ("edge_props", p_edge_props),
         ("string_literal_eq", p_string_lit),
         ("str_infix", p_str_infix),
@@ -385,6 +386,26 @@ fn p_return_star(rng: &mut Rng) -> (String, bool) {
     // order, compared as a multiset. The two-hop pattern binds an edge var `r`, so
     // this now exercises edge-element rendering too.
     (format!("{} RETURN *", pattern(var(rng))), false)
+}
+fn p_collect(rng: &mut Rng) -> (String, bool) {
+    // collect_list — grouped or scalar; nulls dropped, list in row order. The list
+    // order must match, so grouped rows are compared as a multiset but each list is
+    // structural. Scan order is id-order on both engines.
+    let v = var(rng);
+    if rng.chance(1, 2) {
+        (
+            format!(
+                "{} RETURN {v}.b AS a0, collect_list({v}.a) AS a1 ORDER BY a0",
+                pattern(v)
+            ),
+            true,
+        )
+    } else {
+        (
+            format!("{} RETURN collect_list({v}.a) AS a0", pattern(v)),
+            false,
+        )
+    }
 }
 fn p_order_expr(rng: &mut Rng) -> (String, bool) {
     // ORDER BY an UNPROJECTED expression (v.a, not a returned column), with v.id

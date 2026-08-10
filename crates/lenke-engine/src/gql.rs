@@ -94,6 +94,9 @@ fn agg_fn(name: &str) -> Option<AggFn> {
         "MIN" => AggFn::Min,
         "MAX" => AggFn::Max,
         "AVG" => AggFn::Avg,
+        // Core's list aggregate is `collect_list` (SKIPS nulls); `collect` is a
+        // superset alias. Distinct from Gremlin fold's null-keeping `Collect`.
+        "COLLECT_LIST" | "COLLECT" => AggFn::CollectList,
         _ => return None,
     })
 }
@@ -3882,6 +3885,39 @@ mod tests {
             &store,
         );
         assert!(matches!(col(&neg, 0, "x"), Value::Str(s) if &*s == "alice"));
+    }
+
+    /// `collect_list(x)` gathers a group's values into a list in row order, SKIPPING
+    /// nulls (core's semantics — distinct from Gremlin fold, which keeps them).
+    #[test]
+    fn collect_list_aggregate_skips_nulls() {
+        let mut b = Builder::default();
+        // dept eng: ages 1, (null), 3 ; dept ops: age 5
+        b.node(&["P"], &[("d", s("eng")), ("age", n(1.0))]);
+        b.node(&["P"], &[("d", s("eng"))]); // no age → null, dropped by collect_list
+        b.node(&["P"], &[("d", s("eng")), ("age", n(3.0))]);
+        b.node(&["P"], &[("d", s("ops")), ("age", n(5.0))]);
+        let store = b.build();
+        let out = run(
+            &super::parse("MATCH (p:P) RETURN p.d AS d, collect_list(p.age) AS ages ORDER BY d")
+                .unwrap(),
+            &store,
+        );
+        // Groups ordered by d: eng then ops. eng's list is [1, 3] (null skipped).
+        let list = |r: usize| match &out.rows[r][1] {
+            Value::List(v) => v
+                .iter()
+                .map(|x| match x {
+                    Value::Num(n) => *n,
+                    _ => f64::NAN,
+                })
+                .collect::<Vec<_>>(),
+            _ => panic!("expected a list"),
+        };
+        assert_eq!(list(0), vec![1.0, 3.0]);
+        assert_eq!(list(1), vec![5.0]);
+        // `collect` is a superset alias for the same thing.
+        assert!(super::parse("MATCH (p:P) RETURN collect(p.age) AS a").is_ok());
     }
 
     /// ORDER BY can sort by an UNPROJECTED expression (`ORDER BY n.age` when only

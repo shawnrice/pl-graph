@@ -202,6 +202,10 @@ pub enum AggFn {
     /// a faithful fold of the stream, not a null-skipping numeric aggregate. This
     /// is Gremlin `fold()`; a group with no rows folds to the empty list.
     Collect,
+    /// Like [`Collect`] but SKIPS nulls — GQL `collect_list`. Row order preserved,
+    /// an all-null (or empty) group folds to the empty list. Distinct from `Collect`
+    /// so Gremlin `fold()` (which keeps nulls) stays unchanged.
+    CollectList,
 }
 
 /// One aggregate in an `Aggregate` operator: `func(arg)` (or `func(DISTINCT

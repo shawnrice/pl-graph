@@ -1503,13 +1503,19 @@ fn fold_grouped(agg: &Agg, arg_col: Option<&Col>, group_of: &[u32], n_groups: us
                 })
                 .collect()
         }
-        AggFn::Collect => {
-            // Gremlin `fold()`: gather every value into each group's list, in row
-            // order (a preceding sort carries through), nulls kept. An empty group
-            // — which the no-key case still emits — folds to the empty list.
+        AggFn::Collect | AggFn::CollectList => {
+            // Gather each group's values into a list, in row order (a preceding sort
+            // carries through). `Collect` (Gremlin fold) KEEPS nulls; `CollectList`
+            // (GQL collect_list) SKIPS them, matching core. An empty (or all-null,
+            // for CollectList) group folds to the empty list.
+            let skip_nulls = agg.func == AggFn::CollectList;
             let mut lists: Vec<Vec<Value>> = vec![Vec::new(); n_groups];
             for (i, &g) in group_of.iter().enumerate() {
-                lists[g as usize].push(col.value_at(i));
+                let v = col.value_at(i);
+                if skip_nulls && v.is_null() {
+                    continue;
+                }
+                lists[g as usize].push(v);
             }
             lists.into_iter().map(Value::List).collect()
         }
