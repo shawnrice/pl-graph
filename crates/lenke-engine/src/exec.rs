@@ -632,6 +632,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // aggregate for every shape it does not recognize. (The fused paths
             // never evaluate arbitrary expressions, so they cannot fault.)
             if let Some(b) = try_scan_count(input, keys, aggs, store)
+                .or_else(|| try_scan_num_agg(input, keys, aggs, store))
                 .or_else(|| try_fused_count(input, keys, aggs, store))
                 .or_else(|| try_node_grouped_count(input, keys, aggs, store))
             {
@@ -1333,6 +1334,21 @@ fn range_pass(prop: &Value, op: CompareOp, value: &Value) -> bool {
 /// rows a `RangeSeek` produces. Uses a range index when present (candidates
 /// intersected with the label), else scans and filters via `range_pass`. A NULL
 /// `value` matches nothing (predicate UNKNOWN), matching a scan+filter.
+/// Raw-f64 comparison matching the value contract for two present numbers: `==`/
+/// `!=` for equality, `<`/`<=`/`>`/`>=` for ordering (a NaN operand makes ordering
+/// false — 3VL "unknown → drop", as `cmp_partial` gives). Used by the typed
+/// scan/filter fast paths so a numeric predicate never boxes a `Value`.
+fn num_pred(op: CompareOp, x: f64, t: f64) -> bool {
+    match op {
+        CompareOp::Eq => x == t,
+        CompareOp::Ne => x != t,
+        CompareOp::Lt => x < t,
+        CompareOp::Le => x <= t,
+        CompareOp::Gt => x > t,
+        CompareOp::Ge => x >= t,
+    }
+}
+
 fn range_seek_ids(store: &Store, label: &str, key: &str, op: CompareOp, value: &Value) -> Vec<u32> {
     if value.is_null() {
         return Vec::new();
@@ -1344,14 +1360,32 @@ fn range_seek_ids(store: &Store, label: &str, key: &str, op: CompareOp, value: &
             cands
                 .into_iter()
                 .filter(|id| in_label.contains(id))
+                // The index orders by the TOTAL order (cross-type by rank), but the
+                // OPERATOR is three-valued (cross-type → UNKNOWN → drop). Re-check
+                // each candidate with `range_pass` so an indexed seek returns
+                // exactly the scan-filter rows (the equivalent-spellings invariant);
+                // for a homogeneous column this keeps every candidate.
+                .filter(|&id| range_pass(&store.prop(id, key), op, value))
                 .collect()
         }
-        None => store
-            .nodes_with_label(label)
-            .iter()
-            .copied()
-            .filter(|&id| range_pass(&store.prop(id, key), op, value))
-            .collect(),
+        None => {
+            let ids = store.nodes_with_label(label);
+            // Typed fast path: a Num column vs a Num bound compares RAW f64 (no
+            // per-cell Value boxing) — the no-index scan is the common case.
+            if let (Some(Column::Num { data, present }), Value::Num(t)) = (store.column(key), value)
+            {
+                let t = *t;
+                return ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| present[id as usize] && num_pred(op, data[id as usize], t))
+                    .collect();
+            }
+            ids.iter()
+                .copied()
+                .filter(|&id| range_pass(&store.prop(id, key), op, value))
+                .collect()
+        }
     }
 }
 
@@ -1487,6 +1521,66 @@ fn try_scan_count(
         _ => return None,
     };
     Some(scalar_num(n as f64))
+}
+
+/// Answer a scalar `sum`/`avg`/`count(arg)` over a bare `Scan`'s Num property by
+/// summing the RAW f64 column (present cells only), WITHOUT materializing the
+/// frontier or boxing each cell into a `Value`. `None` (fall back) for a grouped
+/// aggregate, a DISTINCT, `min`/`max` (need the value-contract order), a non-`Num`
+/// column (which may need poison handling), or any non-`Scan` input.
+fn try_scan_num_agg(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.distinct || !matches!(agg.func, AggFn::Sum | AggFn::Avg | AggFn::Count) {
+        return None;
+    }
+    let label = match input {
+        Plan::Scan { label } => label,
+        _ => return None,
+    };
+    let Some(Expr::Prop { slot: 0, key }) = agg.arg.as_ref() else {
+        return None;
+    };
+    let Some(Column::Num { data, present }) = store.column(key) else {
+        return None; // non-numeric column: the general path handles poison
+    };
+    let (mut total, mut cnt) = (0f64, 0u64);
+    let mut visit = |i: usize| {
+        if present[i] {
+            total += data[i];
+            cnt += 1;
+        }
+    };
+    match label {
+        Some(l) => store
+            .nodes_with_label(l)
+            .iter()
+            .for_each(|&id| visit(id as usize)),
+        None => (0..store.node_count()).for_each(|i| {
+            if store.is_alive(i as u32) {
+                visit(i);
+            }
+        }),
+    }
+    let result = match agg.func {
+        AggFn::Sum => Value::Num(total), // 0.0 over an empty/all-null set (K0a)
+        AggFn::Count => Value::Num(cnt as f64), // count(arg) = present count
+        _ => {
+            if cnt == 0 {
+                Value::Null // avg of nothing
+            } else {
+                Value::Num(total / cnt as f64)
+            }
+        }
+    };
+    Some(Batch::of(vec![Col::Gen(vec![result])]))
 }
 
 /// Try to answer a scalar `count(*)` / `count(DISTINCT <last slot>)` sitting on
@@ -3154,23 +3248,57 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
     if lit.is_null() {
         return Some(Vec::new());
     }
-    let column = store.column(key);
+    let Some(column) = store.column(key) else {
+        return Some(Vec::new()); // property absent everywhere → UNKNOWN → all dropped
+    };
     let mut keep = Vec::new();
+    // Typed fast path: a Num column vs a Num literal compares RAW f64 — no per-cell
+    // `Value` boxing (the eval-vs-columnar cost). Semantics match the general
+    // `compare`: ordering is 3VL (a NaN cell is unordered → dropped, via `<`/`>`
+    // being false on NaN); equality via `==`/`!=`.
+    if let (Column::Num { data, present }, Value::Num(t)) = (column, lit) {
+        let t = *t;
+        for (row, &id) in ids.iter().enumerate() {
+            let i = id as usize;
+            if !present[i] {
+                continue; // NULL → UNKNOWN → dropped
+            }
+            let x = data[i];
+            let hit = match op {
+                CompareOp::Eq => x == t,
+                CompareOp::Ne => x != t,
+                CompareOp::Lt => x < t,
+                CompareOp::Le => x <= t,
+                CompareOp::Gt => x > t,
+                CompareOp::Ge => x >= t,
+            };
+            if hit {
+                keep.push(row);
+            }
+        }
+        return Some(keep);
+    }
+    // General path (Str/Bool/Temporal/Gen columns): read the cell, then compare via
+    // the value contract. Ordering uses `cmp_partial` (3VL — cross-type/NaN → drop,
+    // matching `compare`), NOT the total order.
     for (row, &id) in ids.iter().enumerate() {
-        let v = match column {
-            Some(c) => c.read(id as usize),
-            None => continue, // property absent everywhere → UNKNOWN → dropped
-        };
+        let v = column.read(id as usize);
         if v.is_null() {
             continue;
         }
         let hit = match op {
             CompareOp::Eq => value::equals(&v, lit),
             CompareOp::Ne => !value::equals(&v, lit),
-            CompareOp::Lt => value::cmp_total(&v, lit).is_lt(),
-            CompareOp::Le => value::cmp_total(&v, lit).is_le(),
-            CompareOp::Gt => value::cmp_total(&v, lit).is_gt(),
-            CompareOp::Ge => value::cmp_total(&v, lit).is_ge(),
+            _ => match value::cmp_partial(&v, lit) {
+                Some(o) => match op {
+                    CompareOp::Lt => o.is_lt(),
+                    CompareOp::Le => o.is_le(),
+                    CompareOp::Gt => o.is_gt(),
+                    CompareOp::Ge => o.is_ge(),
+                    _ => unreachable!("Eq/Ne handled above"),
+                },
+                None => continue, // incomparable → UNKNOWN → dropped
+            },
         };
         if hit {
             keep.push(row);
@@ -4234,14 +4362,15 @@ mod tests {
         }
     }
 
-    /// Range ordering is the value contract's total order: a NULL value matches
-    /// nothing, and (this engine's design) cross-type compares by rank, so a
-    /// string property is > a numeric literal — seek and filter agree on both.
+    /// An indexed range seek returns EXACTLY the scan-filter rows (the
+    /// equivalent-spellings invariant): a NULL value matches nothing, and a
+    /// cross-type comparison is UNKNOWN → dropped (a string property vs a numeric
+    /// bound does NOT match, per the 3VL operator semantics — K2).
     #[test]
     fn range_seek_null_and_cross_type_match_filter() {
         let mut st = Builder::default().build();
         st.add_node(&["P"], &[("v", n(10.0))]);
-        st.add_node(&["P"], &[("v", s("zzz"))]); // string > any number by rank
+        st.add_node(&["P"], &[("v", s("zzz"))]); // string: cross-type vs a number
         st.add_node(&["P"], &[]); // v absent → null
         st.create_range_index("v");
         let check = |st: &Store, op, val: Value| {
@@ -4254,8 +4383,9 @@ mod tests {
             let filt = scan("P").filter(cmp(op, prop(0, "v"), lit(val)));
             (run(&seek, st).rows.len(), run(&filt, st).rows.len())
         };
-        // v > 5: 10 and "zzz" (string outranks number); null excluded → 2, agree.
-        assert_eq!(check(&st, CompareOp::Gt, n(5.0)), (2, 2));
+        // v > 5: only 10 matches; "zzz" is cross-type → UNKNOWN → dropped; null
+        // excluded → 1, and seek agrees with filter.
+        assert_eq!(check(&st, CompareOp::Gt, n(5.0)), (1, 1));
         // v > null: UNKNOWN for all → 0, agree.
         assert_eq!(check(&st, CompareOp::Gt, Value::Null), (0, 0));
     }
