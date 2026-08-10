@@ -383,6 +383,44 @@ pub fn strongly_connected_components(store: &Store, edge_label: Option<&str>) ->
         .collect()
 }
 
+/// Per-vertex cycle membership: `1.0` iff the vertex lies on a directed cycle —
+/// its SCC has more than one member OR it has a self-loop (a 1-cycle) — else `0.0`.
+/// Ported from core's `on_cycle`, derived from the same SCC partition plus a
+/// self-loop scan, so it is byte-identical (the value is a boolean 0/1, no float
+/// arithmetic). Returns `(node, on_cycle)` in ascending-id order; a named-but-
+/// unknown edge type → no edges → every vertex `0.0`.
+#[must_use]
+pub fn on_cycle(store: &Store, edge_label: Option<&str>) -> Vec<(u32, f64)> {
+    let n = store.node_count();
+    // Component sizes by representative (a component with >1 member is a cycle).
+    let comp = strongly_connected_components(store, edge_label);
+    let mut rep_of = vec![0u32; n];
+    let mut size = vec![0u32; n];
+    for &(v, r) in &comp {
+        rep_of[v as usize] = r;
+        size[r as usize] += 1;
+    }
+    // Self-loops (v→v of the wanted type) put a singleton on a 1-cycle too.
+    let mut self_loop = vec![false; n];
+    if let Some(want) = want_etype(store, edge_label) {
+        for &v in &store.all_nodes() {
+            for_each_nbr(store, v, Dir::Out, want, |nbr| {
+                if nbr == v {
+                    self_loop[v as usize] = true;
+                }
+            });
+        }
+    }
+    store
+        .all_nodes()
+        .into_iter()
+        .map(|v| {
+            let cyclic = size[rep_of[v as usize] as usize] > 1 || self_loop[v as usize];
+            (v, if cyclic { 1.0 } else { 0.0 })
+        })
+        .collect()
+}
+
 /// The built-in procedure catalog: a `CALL name(...)` procedure name → its
 /// non-`node` result column name (matching lenke-core's snake_case surface). The
 /// output columns of every procedure are `[node, <result>]`. `None` = unknown.
@@ -393,6 +431,7 @@ pub fn procedure_result_col(name: &str) -> Option<&'static str> {
         "pagerank" => "score",
         "connected_components" => "componentId",
         "strongly_connected_components" => "componentId",
+        "on_cycle" => "onCycle",
         "label_propagation" => "label",
         "closeness" => "centrality",
         _ => return None,
@@ -455,6 +494,7 @@ pub fn run_procedure(
             .into_iter()
             .map(|(v, c)| (v, f64::from(c)))
             .collect(),
+        "on_cycle" => on_cycle(store, str_of("edgeType")),
         _ => return None,
     })
 }
@@ -542,6 +582,28 @@ mod tests {
         assert_eq!(
             strongly_connected_components(&st, Some("NOPE")),
             vec![(0, 0), (1, 1), (2, 2), (3, 3)]
+        );
+    }
+
+    #[test]
+    fn on_cycle_flags_cycle_members_and_self_loops() {
+        let st = triangle_plus_isolated();
+        // Triangle members are on a cycle (1.0); the isolated node is not (0.0).
+        assert_eq!(
+            on_cycle(&st, None),
+            vec![(0, 1.0), (1, 1.0), (2, 1.0), (3, 0.0)]
+        );
+        // A lone self-loop is a 1-cycle: node 1 loops on itself, node 0 does not.
+        let mut b = Builder::default();
+        let _a = b.node(&["N"], &[]);
+        let bb = b.node(&["N"], &[]);
+        b.edge(bb, bb, "R");
+        let loops = b.build();
+        assert_eq!(on_cycle(&loops, None), vec![(0, 0.0), (1, 1.0)]);
+        // A named-but-unknown edge type → nothing is on a cycle.
+        assert_eq!(
+            on_cycle(&st, Some("NOPE")),
+            vec![(0, 0.0), (1, 0.0), (2, 0.0), (3, 0.0)]
         );
     }
 

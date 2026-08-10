@@ -3228,6 +3228,24 @@ mod tests {
     }
 
     #[test]
+    fn call_on_cycle_procedure_yields_on_cycle_flag() {
+        let store = triangle_store();
+        let rows_of = |q: &str| -> Vec<(f64, f64)> {
+            run(&super::parse(q).unwrap(), &store)
+                .rows
+                .iter()
+                .map(|r| (node_id(&r[0]), num(&r[1])))
+                .collect()
+        };
+        // The triangle members are on a cycle (1.0); the isolated node is not (0.0).
+        let want = vec![(0.0, 1.0), (1.0, 1.0), (2.0, 1.0), (3.0, 0.0)];
+        assert_eq!(rows_of("CALL on_cycle() YIELD node, onCycle"), want);
+        assert_eq!(rows_of("CALL on_cycle()"), want);
+        let out = run(&super::parse("CALL on_cycle()").unwrap(), &store);
+        assert_eq!(out.names, vec!["node".to_string(), "onCycle".to_string()]);
+    }
+
+    #[test]
     fn call_procedure_config_and_components() {
         let store = triangle_store();
         // degree with direction=both: each triangle node 2, isolated 0.
