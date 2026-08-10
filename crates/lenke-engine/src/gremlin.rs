@@ -309,7 +309,7 @@ impl Parser {
         // taints it (`path()` and the element filters are path-preserving).
         if !matches!(
             lname.as_str(),
-            "out" | "in" | "both" | "has" | "hasnot" | "path"
+            "out" | "in" | "both" | "has" | "hasnot" | "and" | "or" | "not" | "path"
         ) {
             self.path_ok = false;
         }
@@ -377,6 +377,32 @@ impl Parser {
                     slot: self.current,
                     key,
                 })))
+            }
+            "and" | "or" => {
+                // and(f1, f2, …) / or(f1, f2, …): each child is an element filter
+                // (has/hasNot/nested and/or/not); combine their predicates and apply
+                // one Filter. The `(` was consumed at the top of `step`.
+                let parts = self.child_filter_list()?;
+                self.expect(&Tok::RParen)?;
+                let mut it = parts.into_iter();
+                let first = it
+                    .next()
+                    .ok_or_else(|| format!("{lname}() needs at least one child traversal"))?;
+                let combined = it.fold(first, |acc, e| {
+                    if lname == "and" {
+                        Expr::And(Box::new(acc), Box::new(e))
+                    } else {
+                        Expr::Or(Box::new(acc), Box::new(e))
+                    }
+                });
+                plan.filter(combined)
+            }
+            "not" => {
+                // not(f): negate a single child element filter. The `(` was consumed
+                // at the top of `step`.
+                let inner = self.child_filter_expr()?;
+                self.expect(&Tok::RParen)?;
+                plan.filter(Expr::Not(Box::new(inner)))
             }
             "out" | "in" | "both" => {
                 // 0 args → ANY edge type (argless out()); 1 → that type. Multi-label
@@ -1034,6 +1060,84 @@ impl Parser {
         self.predicate_expr(left)
     }
 
+    /// Parse ONE child traversal of `and`/`or`/`not` as a boolean predicate `Expr`
+    /// over the current element — without applying a filter. v1 accepts only element
+    /// FILTERS: `has('k')`, `has('k', pred)`, `hasNot('k')`, and nested
+    /// `and`/`or`/`not` of those (an optional `__.` anonymous-traversal prefix is
+    /// allowed). A navigating child (`out('X')`, …) is a semi-join needing a
+    /// subquery and is deferred with an explicit error. Leaves the cursor after the
+    /// child's own closing `)`.
+    fn child_filter_expr(&mut self) -> Result<Expr, String> {
+        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+            self.bump();
+            self.expect(&Tok::Dot)?;
+        }
+        let name = self.ident()?.to_ascii_lowercase();
+        self.expect(&Tok::LParen)?;
+        let expr = match name.as_str() {
+            "has" => {
+                let key = self.str_arg()?;
+                let e = if self.peek() == Some(&Tok::Comma) {
+                    self.bump();
+                    self.has_predicate(key)?
+                } else {
+                    Expr::PropertyExists {
+                        slot: self.current,
+                        key,
+                    }
+                };
+                self.expect(&Tok::RParen)?;
+                e
+            }
+            "hasnot" => {
+                let key = self.str_arg()?;
+                self.expect(&Tok::RParen)?;
+                Expr::Not(Box::new(Expr::PropertyExists {
+                    slot: self.current,
+                    key,
+                }))
+            }
+            "and" | "or" => {
+                let parts = self.child_filter_list()?;
+                self.expect(&Tok::RParen)?;
+                let mut it = parts.into_iter();
+                let first = it
+                    .next()
+                    .ok_or_else(|| format!("{name}() needs at least one child traversal"))?;
+                it.fold(first, |acc, e| {
+                    if name == "and" {
+                        Expr::And(Box::new(acc), Box::new(e))
+                    } else {
+                        Expr::Or(Box::new(acc), Box::new(e))
+                    }
+                })
+            }
+            "not" => {
+                let inner = self.child_filter_expr()?;
+                self.expect(&Tok::RParen)?;
+                Expr::Not(Box::new(inner))
+            }
+            other => {
+                return Err(format!(
+                    "and/or/not child `{other}()` is not a supported filter (navigating child \
+                     traversals are deferred; use has/hasNot/and/or/not)"
+                ))
+            }
+        };
+        Ok(expr)
+    }
+
+    /// Parse a comma-separated list of child filter traversals up to (but not
+    /// consuming) the enclosing `)`.
+    fn child_filter_list(&mut self) -> Result<Vec<Expr>, String> {
+        let mut parts = vec![self.child_filter_expr()?];
+        while self.peek() == Some(&Tok::Comma) {
+            self.bump();
+            parts.push(self.child_filter_expr()?);
+        }
+        Ok(parts)
+    }
+
     /// Parse a Gremlin predicate argument and build the full comparison `Expr`
     /// against `left`. Accepts an optional `P.` prefix, then one of:
     /// `op(literal)` (`gt`, `neq`, …), `within(a, b, …)` / `without(a, b, …)`
@@ -1303,6 +1407,62 @@ mod tests {
             gone.is_empty(),
             "missing id must contribute nothing: {gone:?}"
         );
+    }
+
+    /// `and(f1,f2,…)`, `or(f1,f2,…)`, `not(f)` combine element filters (has/hasNot,
+    /// nested and/or/not) into one predicate over the current element — the direct
+    /// Gremlin spelling of a boolean `WHERE`. Verified equal to the equivalent GQL
+    /// `WHERE … AND/OR/NOT …`. Navigating child traversals (semi-joins) are deferred.
+    #[test]
+    fn gremlin_and_or_not_filter_combinators() {
+        let store = social();
+        // and: two conjoined predicates == GQL AND.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').and(has('age', gt(28)), has('name', neq('carol'))).values('name')",
+                &store,
+            )),
+            value_bag(&gql_rows(
+                "MATCH (n:Person) WHERE n.age > 28 AND n.name <> 'carol' RETURN n.name",
+                &store,
+            )),
+        );
+        // or: disjunction == GQL OR.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').or(has('age', lt(28)), has('name', 'carol')).values('name')",
+                &store,
+            )),
+            value_bag(&gql_rows(
+                "MATCH (n:Person) WHERE n.age < 28 OR n.name = 'carol' RETURN n.name",
+                &store,
+            )),
+        );
+        // not: negation == GQL NOT.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').not(has('age', gt(28))).values('name')",
+                &store,
+            )),
+            value_bag(&gql_rows(
+                "MATCH (n:Person) WHERE NOT (n.age > 28) RETURN n.name",
+                &store,
+            )),
+        );
+        // Nested and/or compose (an or inside an and) == the GQL parenthesized form.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').and(has('age', gt(20)), or(has('name','bob'), has('name','carol'))).values('name')",
+                &store,
+            )),
+            value_bag(&gql_rows(
+                "MATCH (n:Person) WHERE n.age > 20 AND (n.name = 'bob' OR n.name = 'carol') RETURN n.name",
+                &store,
+            )),
+        );
+        // Navigating child traversals (semi-joins) are deferred, not mis-parsed.
+        assert!(super::parse("g.V().and(out('KNOWS'), has('age', gt(1)))").is_err());
+        assert!(super::parse("g.V().not(out('KNOWS'))").is_err());
     }
 
     /// `group().by(key).by(value)` is a grouped aggregation. Core shapes it as one
