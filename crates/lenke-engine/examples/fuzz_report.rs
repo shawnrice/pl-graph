@@ -264,6 +264,7 @@ fn main() {
         ("baseline_scan_filter", p_baseline),
         ("element_map", p_element),
         ("return_star", p_return_star),
+        ("edge_element", p_edge_element),
         ("edge_props", p_edge_props),
         ("string_literal_eq", p_string_lit),
         ("str_infix", p_str_infix),
@@ -379,16 +380,15 @@ fn p_element(rng: &mut Rng) -> (String, bool) {
     )
 }
 fn p_return_star(rng: &mut Rng) -> (String, bool) {
-    // RETURN * expands to the bound node bindings (element maps), in slot order,
-    // compared as a multiset. Node-only patterns for now — a pattern that binds an
-    // EDGE variable needs edge-element rendering (the next item); this probe grows to
-    // cover it then.
-    let w = if rng.chance(1, 2) {
-        format!(" WHERE n.a {} {}", cmp_op(rng), rng.pick(NUMS))
-    } else {
-        String::new()
-    };
-    (format!("MATCH (n:N){w} RETURN *"), false)
+    // RETURN * expands to every bound binding (node OR edge element maps), in slot
+    // order, compared as a multiset. The two-hop pattern binds an edge var `r`, so
+    // this now exercises edge-element rendering too.
+    (format!("{} RETURN *", pattern(var(rng))), false)
+}
+fn p_edge_element(_rng: &mut Rng) -> (String, bool) {
+    // A bare EDGE binding — edge-element map rendering {id,from,to,labels,properties}
+    // against core, compared as a multiset.
+    ("MATCH (n:N)-[r:R]->(m:N) RETURN r".to_string(), false)
 }
 fn p_baseline(rng: &mut Rng) -> (String, bool) {
     let v = var(rng);

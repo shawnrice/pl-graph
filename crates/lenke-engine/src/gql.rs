@@ -3798,6 +3798,32 @@ mod tests {
         assert!(matches!(col(&neg, 0, "x"), Value::Str(s) if &*s == "alice"));
     }
 
+    /// `RETURN r` (a bound edge) renders core's edge element map —
+    /// `{id, from, to, labels, properties}`.
+    #[test]
+    fn return_edge_renders_element_map() {
+        let store = social();
+        let out = run(
+            &super::parse("MATCH (a:Person {name:'alice'})-[r:KNOWS]->(b) RETURN r").unwrap(),
+            &store,
+        );
+        let Value::Map(m) = &out.rows[0][0] else {
+            panic!("expected an edge map, got {:?}", out.rows[0][0]);
+        };
+        let keys: Vec<&str> = m
+            .iter()
+            .map(|(k, _)| match k {
+                Value::Str(s) => s.as_ref(),
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(keys, vec!["id", "from", "to", "labels", "properties"]);
+        // labels is a list carrying the edge type.
+        assert!(
+            matches!(&m[3].1, Value::List(l) if matches!(&l[0], Value::Str(s) if &**s == "KNOWS"))
+        );
+    }
+
     /// `RETURN *` projects every bound variable, in slot (declaration) order, each
     /// column named for its variable.
     #[test]

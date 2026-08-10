@@ -454,6 +454,11 @@ pub struct Store {
     /// The reverse of an `Adj`'s `etype`, needed by `type(edge)` which has only an
     /// eid in hand, not an adjacency entry.
     edge_etype: Vec<u32>,
+    /// `(src, dst)` node ids per eid (indexed by eid; grows 1:1 with `next_eid` and
+    /// never shrinks, like `edge_etype`). Lets an edge be rendered as core's
+    /// `{id, from, to, labels, properties}` map from its eid alone, without scanning
+    /// adjacency for its endpoints.
+    edge_ends: Vec<(u32, u32)>,
     /// PRESERVED external ids — the stable, user-facing identity of each element,
     /// carried verbatim through ingest → store → egress (and returned by
     /// `element_id`). Ingest uses the id from the file; a created element (INSERT /
@@ -688,6 +693,12 @@ impl Store {
         self.node_ext.get(id as usize).cloned()
     }
 
+    /// The `(src, dst)` node ids of edge `eid`, or `None` if the eid is unknown.
+    #[must_use]
+    pub fn edge_endpoints(&self, eid: u32) -> Option<(u32, u32)> {
+        self.edge_ends.get(eid as usize).copied()
+    }
+
     /// An edge's preserved external id (for `element_id`), or `None` out of range.
     #[must_use]
     pub fn edge_ext_id(&self, eid: u32) -> Option<Arc<str>> {
@@ -914,6 +925,7 @@ impl Store {
             "edge_etype indexed by eid"
         );
         self.edge_etype.push(etype);
+        self.edge_ends.push((from, to));
         debug_assert_eq!(self.edge_ext.len() as u32, eid, "edge_ext indexed by eid");
         self.edge_ext.push(Arc::clone(ext));
         self.out_adj[from as usize].push(Adj {
@@ -1996,9 +2008,11 @@ impl Builder {
             .map(|e| Arc::from(format!("e{e}").as_str()))
             .collect();
         let mut edge_etypes: Vec<u32> = Vec::with_capacity(self.edges.len());
+        let mut edge_ends: Vec<(u32, u32)> = Vec::with_capacity(self.edges.len());
         for (eid, (from, to, etype)) in self.edges.into_iter().enumerate() {
             let eid = eid as u32;
             edge_etypes.push(etype); // index == eid (edges laid down in order)
+            edge_ends.push((from, to));
             out_adj[from as usize].push(Adj {
                 nbr: to,
                 etype,
@@ -2020,6 +2034,7 @@ impl Builder {
             // Incremental edges continue the id sequence the build laid down.
             next_eid: edge_count,
             edge_etype: edge_etypes,
+            edge_ends,
             node_ext,
             edge_ext,
             ext_to_node,

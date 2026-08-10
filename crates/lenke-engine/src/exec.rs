@@ -487,8 +487,56 @@ fn pattern_value(props: &[(String, Value)], key: &str) -> Value {
 fn render_cell(col: &Col, i: usize, store: &Store) -> Value {
     match col {
         Col::Nodes(ids) => node_result_value(store, ids[i]),
+        Col::Edges(eids) => edge_result_value(store, eids[i]),
         _ => col.value_at(i),
     }
+}
+
+/// The canonical result map for an edge — `{id, from, to, labels(sorted),
+/// properties(sorted by key)}`, byte-identical to lenke-core's `val_to_value(Edge)`.
+/// `from`/`to` are the endpoint EXTERNAL ids.
+fn edge_result_value(store: &Store, eid: u32) -> Value {
+    use std::sync::Arc;
+    let id = store
+        .edge_ext_id(eid)
+        .unwrap_or_else(|| Arc::from(format!("e{eid}")));
+    let (src, dst) = store.edge_endpoints(eid).unwrap_or((0, 0));
+    let ext = |n: u32| {
+        store
+            .node_ext_id(n)
+            .unwrap_or_else(|| Arc::from(n.to_string()))
+    };
+    // Single edge type here → a one-element (trivially sorted) labels list.
+    let labels = Value::List(
+        store
+            .edge_type_name(eid)
+            .into_iter()
+            .map(|t| Value::Str(t.into()))
+            .collect(),
+    );
+    let mut props: Vec<(String, Value)> = store
+        .edge_prop_keys()
+        .into_iter()
+        .filter(|k| store.has_edge_prop(eid, k))
+        .map(|k| {
+            let v = store.edge_prop(eid, &k);
+            (k, v)
+        })
+        .collect();
+    props.sort_by(|a, b| a.0.cmp(&b.0));
+    let props_map = Value::Map(Arc::new(
+        props
+            .into_iter()
+            .map(|(k, v)| (Value::Str(k.into()), v))
+            .collect(),
+    ));
+    Value::Map(Arc::new(vec![
+        (Value::Str("id".into()), Value::Str(id)),
+        (Value::Str("from".into()), Value::Str(ext(src))),
+        (Value::Str("to".into()), Value::Str(ext(dst))),
+        (Value::Str("labels".into()), labels),
+        (Value::Str("properties".into()), props_map),
+    ]))
 }
 
 /// The canonical result map for a node — `{id, labels(sorted), properties(sorted by
