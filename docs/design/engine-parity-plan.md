@@ -405,10 +405,13 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
       cell stringification matches for scalars/temporals. 3 tests via a hand-rolled
       reader (header+types, null round-trip through the validity bitmap, mixed
       num+bool→Utf8).
-- [ ] I2b. Arrow egress completion: the `FixedSizeList`/`Struct` column types
+- [~] I2b. Arrow egress completion: the `FixedSizeList`/`Struct` column types
       (list/record/map columns) and the flatbuffer Arrow-IPC wrapper
       (`tableFromIPC`/DuckDB/Polars) that layers on these exact buffers — the
-      large, TS-verifier-dependent envelope; deferred from I2a.
+      large, TS-verifier-dependent envelope; DEFERRED from I2a. The scalar
+      egress (I2a `to_arrow`) is the parity-relevant part and is done; this
+      envelope needs the apache-arrow dev-verifier + DuckDB/Polars round-trip,
+      an out-of-crate integration harness lenke-engine has no consumer for yet.
 - [x] I3. Named-procedure `CALL name(cfg) [YIELD col [AS a], …]` (relocated from
       F3): the ISO home for the I1 algorithms. `Plan::CallProcedure{name,config}`
       runs the algorithm over the store into a `[node, <result>]` batch; the parser
@@ -422,8 +425,31 @@ END` (WHEN/THEN/ELSE/END contextual keywords). Case arm added to every Expr
 
 ### Phase J — Agreement
 
-- [ ] J1. Conformance suite: run matched shapes on `lenke-engine` and
+- [x] J1. Conformance suite: run matched shapes on `lenke-engine` and
       `lenke-core`, assert same results (agreement, not byte-identity).
+      DONE — `crates/lenke-engine/tests/conformance.rs`. `lenke-core` is a
+      path DEV-dependency (Cargo.toml; test-only, normal build stays
+      standalone). One fixture defined as Rust data, serialized into each
+      engine's own NDJSON dialect (they differ on the wire); 25 matched GQL
+      shapes (19 unordered → multiset equality, 6 `ORDER BY` → ordered
+      equality) plus a load-sanity check, all green. Comparison is by VALUE
+      (scalars only), so the engines' independent dense-id assignments never
+      enter it; numbers via `num_key` (integers exact, non-integers to 1e-9 —
+      float bit-identity is a core-vs-TS invariant, not a lenke-engine one).
+
+  Documented divergences (accounted for, not failures):
+  - **ORDER BY scope.** `lenke-engine` scopes `ORDER BY` to OUTPUT columns
+    (by alias/name); `lenke-core` also accepts a non-projected expression
+    (`ORDER BY n.age` when only `n.name` is projected). The matched shapes
+    order by a projected alias, which both accept. (Engine choice, gql.rs:439.)
+  - **Cross-type ORDERING.** Engine gives a total order across types (by kind
+    rank); core THROWS `E_INVALID_VALUE` on `<=` across types. Equality already
+    agrees (cross-type = false in both). Not exercised by matched shapes. (§120,
+    §323.)
+  - **label-prop tiebreak.** Engine breaks label-propagation ties on the dense
+    node id; the two engines' dense ids are assigned independently, so a tie can
+    land differently. Algorithm outputs are not part of the matched GQL shapes.
+    (§396.)
 
 ## Standing
 

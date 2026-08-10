@@ -15,3 +15,11 @@ all = { level = "warn", priority = -1 }
 crate-type = ["lib"]
 
 [dependencies]
+
+# lenke-core is a dev-only dependency: the J1 cross-engine conformance suite
+# (tests/conformance.rs) loads an identical fixture into BOTH engines and asserts
+# equal result multisets. A dev-dependency compiles only for the test build, so
+# the normal `cargo build` of lenke-engine stays standalone and dependency-free.
+# This does not touch lenke-core's own sources or build.
+[dev-dependencies]
+lenke-core = { path = "../lenke-core" }
