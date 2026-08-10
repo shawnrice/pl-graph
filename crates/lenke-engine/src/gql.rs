@@ -1258,10 +1258,16 @@ impl Parser {
         let negated_in = self.eat_kw("NOT");
         if self.eat_kw("IN") {
             let rhs = self.add_expr()?;
-            let Expr::List { items } = rhs else {
-                return Err("IN requires a list literal, e.g. `x IN [1, 2, 3]`".into());
+            // A list LITERAL desugars to an OR-chain (more optimizable); any other
+            // list expression (a property, param, function result) uses the runtime
+            // `Expr::In`. Both are three-valued identically.
+            let member = match rhs {
+                Expr::List { items } => in_chain(&left, items),
+                haystack => Expr::In {
+                    needle: Box::new(left),
+                    haystack: Box::new(haystack),
+                },
             };
-            let member = in_chain(&left, items);
             return Ok(if negated_in {
                 Expr::Not(Box::new(member))
             } else {

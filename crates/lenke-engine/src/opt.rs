@@ -526,6 +526,10 @@ fn max_slot(expr: &Expr) -> Option<usize> {
         | Expr::Or(a, b)
         | Expr::Arith {
             left: a, right: b, ..
+        }
+        | Expr::In {
+            needle: a,
+            haystack: b,
         } => merge_max(max_slot(a), max_slot(b)),
         Expr::Call { args, .. } | Expr::List { items: args } => {
             args.iter().fold(None, |acc, a| merge_max(acc, max_slot(a)))

@@ -410,7 +410,11 @@ fn needs_lineage(plan: &Plan) -> bool {
         match e {
             // Reading any part of the path needs the lineage, just like `Path`.
             Expr::Path | Expr::PathAccess { .. } => true,
-            Expr::Compare { left, right, .. } => reads_path(left) || reads_path(right),
+            Expr::Compare { left, right, .. }
+            | Expr::In {
+                needle: left,
+                haystack: right,
+            } => reads_path(left) || reads_path(right),
             Expr::Not(x) => reads_path(x),
             Expr::And(a, b)
             | Expr::Or(a, b)
@@ -1607,6 +1611,10 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         | Expr::Or(a, b)
         | Expr::Arith {
             left: a, right: b, ..
+        }
+        | Expr::In {
+            needle: a,
+            haystack: b,
         } => refs_only_slot(a, s) && refs_only_slot(b, s),
         Expr::Call { args, .. } | Expr::List { items: args } => {
             args.iter().all(|a| refs_only_slot(a, s))
@@ -1651,6 +1659,10 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         Expr::Not(x) => Expr::Not(go(x)),
         Expr::And(a, b) => Expr::And(go(a), go(b)),
         Expr::Or(a, b) => Expr::Or(go(a), go(b)),
+        Expr::In { needle, haystack } => Expr::In {
+            needle: go(needle),
+            haystack: go(haystack),
+        },
         Expr::Compare { op, left, right } => Expr::Compare {
             op: *op,
             left: go(left),
@@ -2157,6 +2169,38 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             let l = eval(left, store, batch)?;
             let r = eval(right, store, batch)?;
             compare(*op, &l, &r)
+        }
+        Expr::In { needle, haystack } => {
+            // Runtime three-valued membership (a literal list desugars to an
+            // OR-chain instead; this matches its semantics). Per row: TRUE if any
+            // element equals the needle; else UNKNOWN (NULL) if the needle or any
+            // element is null (the answer can't be decided); else FALSE. A
+            // non-list haystack is NULL.
+            let nd = eval(needle, store, batch)?;
+            let hs = eval(haystack, store, batch)?;
+            let n = batch.rows();
+            let out: Vec<Value> = (0..n)
+                .map(|i| {
+                    let needle = nd.value_at(i);
+                    let Value::List(items) = hs.value_at(i) else {
+                        return Value::Null;
+                    };
+                    let mut saw_unknown = needle.is_null();
+                    for el in items.iter() {
+                        if el.is_null() || needle.is_null() {
+                            saw_unknown = true;
+                        } else if value::equals(&needle, el) {
+                            return Value::Bool(true);
+                        }
+                    }
+                    if saw_unknown {
+                        Value::Null
+                    } else {
+                        Value::Bool(false)
+                    }
+                })
+                .collect();
+            Col::Gen(out)
         }
         Expr::Arith { op, left, right } => {
             // f64 math via the value contract's `as_num` (finite Num only); any
@@ -3557,6 +3601,52 @@ mod tests {
         assert_eq!(
             ids("MATCH (n:N) WHERE n.a IN [] RETURN n.a AS a"),
             Vec::<String>::new()
+        );
+    }
+
+    /// Dynamic (non-literal) IN over a list PROPERTY — the runtime `Expr::In`, with
+    /// the same three-valued behavior as the literal OR-chain.
+    #[test]
+    fn in_operator_dynamic() {
+        let mut b = Builder::default();
+        b.node(
+            &["N"],
+            &[
+                ("a", n(2.0)),
+                ("xs", Value::List(vec![n(1.0), n(2.0), n(3.0)])),
+            ],
+        );
+        b.node(
+            &["N"],
+            &[
+                ("a", n(9.0)),
+                ("xs", Value::List(vec![n(1.0), n(2.0), n(3.0)])),
+            ],
+        );
+        b.node(
+            &["N"],
+            &[
+                ("a", n(5.0)),
+                ("xs", Value::List(vec![n(1.0), Value::Null, n(3.0)])),
+            ],
+        );
+        let store = b.build();
+        let ids = |q: &str| -> Vec<String> {
+            let mut v = names_of(&run(&crate::gql::parse(q).unwrap(), &store), 0);
+            v.sort();
+            v
+        };
+        // n.a IN n.xs: only the a=2 node (2 ∈ [1,2,3]); a=9 not in; a=5 vs [1,null,3]
+        // is UNKNOWN (null element) → dropped.
+        assert_eq!(
+            ids("MATCH (n:N) WHERE n.a IN n.xs RETURN n.a AS a"),
+            vec!["Num(2.0)"]
+        );
+        // 2 IN n.xs: the two nodes whose list has 2; the [1,null,3] node lacks 2 and
+        // is UNKNOWN → dropped.
+        assert_eq!(
+            ids("MATCH (n:N) WHERE 2 IN n.xs RETURN n.a AS a"),
+            vec!["Num(2.0)", "Num(9.0)"]
         );
     }
 

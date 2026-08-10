@@ -132,6 +132,16 @@ pub enum Expr {
         body: Box<Plan>,
         outer_width: usize,
     },
+    /// `needle IN haystack` where `haystack` is a dynamic (non-literal) list
+    /// expression (a list property, a param, a function result). A literal
+    /// `x IN [a, b]` desugars to an OR-chain at parse time instead; this is the
+    /// runtime form. Three-valued, exactly like that OR-chain: TRUE if any element
+    /// equals the needle, else UNKNOWN (NULL) if the needle or any element is null
+    /// (the membership can't be decided), else FALSE. A non-list haystack is NULL.
+    In {
+        needle: Box<Expr>,
+        haystack: Box<Expr>,
+    },
 }
 
 /// The target type of a `CAST`. The engine has one numeric type (`f64`), so

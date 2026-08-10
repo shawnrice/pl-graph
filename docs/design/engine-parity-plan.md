@@ -597,7 +597,7 @@ the catalog (parser allow-list + eval). Grouped by family:
 - [x] K10. (DONE) ltrim/rtrim/btrim (1 or 2 args), reverse (poly string+list), left/right, split, char_length/byte_length etc. ORIG: String fns: `ltrim`, `rtrim`, `btrim`, `reverse` (string), `left`,
       `right`, `split`, `char_length`/`character_length`, `byte_length`/
       `octet_length`.
-- [x] K11. (DONE) reverse(list)/tail/range(incl,step)/keys/labels/property_names; nodes/relationships already PathAccess. DONE (follow-up): type(edge) via a new eid->etype store map; append/list_contains/list_sort/list_union/difference/intersection. STILL OPEN: element_id (engine has no external ids — architectural), dynamic non-literal IN. ORIG: List fns: `reverse`(list), `tail`, `range(a, b[, step])`, `keys`,
+- [x] K11. (DONE) reverse(list)/tail/range(incl,step)/keys/labels/property_names; nodes/relationships already PathAccess. DONE (follow-up): type(edge) via a new eid->etype store map; append/list_contains/list_sort/list_union/difference/intersection. dynamic non-literal IN DONE (runtime Expr::In, 3VL == the literal OR-chain). STILL OPEN: element_id (engine has no external ids — architectural, see K13). ORIG: List fns: `reverse`(list), `tail`, `range(a, b[, step])`, `keys`,
       `append`, `list_contains`, `list_sort`, `list_union`, `difference`,
       `intersection`, `nodes`, `relationships`, `labels`, `type`, `property_names`.
 - [x] K12. (DONE) fuzz_report re-run after every fix — all 16 buckets clean (only arithmetic 'skip' = both throw on div-by-zero); differential_fuzz 32k queries x 8 seeds agree. Fuzzer widening to temporals/list-values still open. ORIG: Re-run `fuzz_report` after each fix; the family's bucket should go to 0.
