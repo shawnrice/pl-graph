@@ -1552,22 +1552,41 @@ fn try_scan_num_agg(
         return None; // non-numeric column: the general path handles poison
     };
     let (mut total, mut cnt) = (0f64, 0u64);
-    let mut visit = |i: usize| {
-        if present[i] {
-            total += data[i];
-            cnt += 1;
-        }
-    };
-    match label {
-        Some(l) => store
-            .nodes_with_label(l)
-            .iter()
-            .for_each(|&id| visit(id as usize)),
-        None => (0..store.node_count()).for_each(|i| {
-            if store.is_alive(i as u32) {
-                visit(i);
+    // Whole-column fast path: when the scan covers EVERY live node (an unlabelled
+    // scan, or a label all nodes carry) with nothing deleted, sum the raw
+    // `data`/`present` slices directly — no per-row id indirection, so the loop
+    // auto-vectorizes. Otherwise walk the label's id list.
+    let all_live = store.live_node_count() == store.node_count();
+    let whole = all_live
+        && match label {
+            None => true,
+            Some(l) => store.nodes_with_label(l).len() == store.node_count(),
+        };
+    if whole {
+        for (i, &x) in data.iter().enumerate() {
+            if present[i] {
+                total += x;
+                cnt += 1;
             }
-        }),
+        }
+    } else {
+        let mut visit = |i: usize| {
+            if present[i] {
+                total += data[i];
+                cnt += 1;
+            }
+        };
+        match label {
+            Some(l) => store
+                .nodes_with_label(l)
+                .iter()
+                .for_each(|&id| visit(id as usize)),
+            None => (0..store.node_count()).for_each(|i| {
+                if store.is_alive(i as u32) {
+                    visit(i);
+                }
+            }),
+        }
     }
     let result = match agg.func {
         AggFn::Sum => Value::Num(total), // 0.0 over an empty/all-null set (K0a)
