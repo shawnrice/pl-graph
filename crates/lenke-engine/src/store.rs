@@ -585,6 +585,21 @@ impl Store {
             .collect()
     }
 
+    /// Every LIVE edge id, in id order — the source for Gremlin `g.E()`. Each edge
+    /// appears exactly once as an out-edge (mirroring core's `g.E()` == `g.V().outE()`
+    /// desugar), and `delete_edge` retains-out the adjacency entry, so iterating
+    /// `out_adj` already reflects liveness with no separate tombstone check.
+    #[must_use]
+    pub fn all_edges(&self) -> Vec<u32> {
+        let mut eids: Vec<u32> = self
+            .out_adj
+            .iter()
+            .flat_map(|adj| adj.iter().map(|a| a.eid))
+            .collect();
+        eids.sort_unstable();
+        eids
+    }
+
     /// Whether node `id` is live (not tombstoned). Scans that iterate the id space
     /// directly consult this to skip deleted nodes.
     #[must_use]

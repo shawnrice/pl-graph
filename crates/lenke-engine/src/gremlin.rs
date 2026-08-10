@@ -213,6 +213,17 @@ impl Parser {
                     Plan::Scan { label: None }
                 }
             }
+            "e" => {
+                self.expect(&Tok::LParen)?;
+                // `g.E()` seeds every live edge. `g.E('id', …)` (edges by external
+                // id) is deferred — it needs an edge-liveness-checked reverse ext
+                // map the store does not carry yet.
+                if matches!(self.peek(), Some(Tok::Str(_))) {
+                    return Err("g.E(id) (edges by external id) is not supported yet".into());
+                }
+                self.expect(&Tok::RParen)?;
+                Plan::EdgeScan
+            }
             "adde" => {
                 // g.addE('T').from(V(a)).to(V(b)).property(...)
                 self.expect(&Tok::LParen)?;
@@ -901,6 +912,24 @@ mod tests {
         );
     }
 
+    /// `g.E()` is an all-edges READ source: it seeds the frontier with every live
+    /// edge (`social()` has 4: three KNOWS + one WORKS_ON). Cross-checked against the
+    /// engine's own GQL front-end — the anonymous directed pattern `()-[r]->()` — so
+    /// both lowerings of "every edge" agree; the GQL side is itself proven vs core by
+    /// the differential fuzzer. Counting through g.E() exercises the Col::Edges
+    /// frontier end to end.
+    #[test]
+    fn gremlin_e_all_edges_read_source() {
+        let store = social();
+        let ge = value_bag(&gremlin_rows("g.E().count()", &store));
+        assert_eq!(ge, vec!["Num(4.0);"]);
+        // Same "count every edge" via GQL's directed anonymous pattern.
+        let gql = value_bag(&gql_rows("MATCH ()-[r]->() RETURN count(r)", &store));
+        assert_eq!(ge, gql);
+        // g.E('id') (edges by external id) is deferred, not silently mis-parsed.
+        assert!(super::parse("g.E('e0')").is_err());
+    }
+
     /// `has(k)` filters elements that CARRY property `k`; `hasNot(k)` those that
     /// don't — matching core. Only the `Project` node (graphdb) lacks `age`.
     #[test]
@@ -1122,7 +1151,8 @@ mod tests {
     #[test]
     fn errors_not_panics() {
         assert!(super::parse("g.V(").is_err());
-        assert!(super::parse("g.E().values('x')").is_err()); // only V()/addV() supported
+        assert!(super::parse("g.E().values('x')").is_ok()); // g.E() is an all-edges source now
+        assert!(super::parse("g.E('e0')").is_err()); // edges-by-id form still deferred
         assert!(super::parse("g.V().frobnicate()").is_err()); // unknown step
         assert!(super::parse("g.V().has('k')").is_ok()); // has(k) is key-existence now
         assert!(super::parse("g.V().has()").is_err()); // has still needs a key

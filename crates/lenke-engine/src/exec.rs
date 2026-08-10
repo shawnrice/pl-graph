@@ -679,6 +679,7 @@ fn needs_lineage(plan: &Plan) -> bool {
     match plan {
         Plan::Scan { .. }
         | Plan::NodeSeed { .. }
+        | Plan::EdgeScan
         | Plan::Row
         | Plan::IndexSeek { .. }
         | Plan::RangeSeek { .. }
@@ -763,6 +764,12 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 batch.lineage = Some(Lineage::seed(&ids));
             }
             batch
+        }
+        Plan::EdgeScan => {
+            // The frontier is EDGES, not nodes. `track` is never set for a bare
+            // g.E() read (no path()/lineage step targets an edge frontier yet), so
+            // no lineage is seeded here — a path over g.E() is a later item.
+            Batch::single(Col::Edges(store.all_edges()))
         }
         Plan::IndexSeek { label, key, value } => {
             let ids = index_seek_ids(store, label, key, value);

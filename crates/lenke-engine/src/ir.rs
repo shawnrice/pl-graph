@@ -242,6 +242,10 @@ pub enum Plan {
     /// Resolved at exec time (the parser has no store); an id that resolves to no
     /// live node contributes nothing (matching Gremlin's `g.V(<missing>)`).
     NodeSeed { ext_ids: Vec<String> },
+    /// Seed slot 0 with EVERY live edge — Gremlin `g.E()`. The slot holds edge ids
+    /// (a `Col::Edges` frontier), not nodes; downstream steps that read the current
+    /// element (`values`/`id`/`label`/`count`) resolve it as an edge.
+    EdgeScan,
     /// The correlated current row — the leaf of an `EXISTS { … }` body. It is NOT
     /// a stand-alone source: it yields whatever batch the enclosing `Expr::Exists`
     /// feeds it (the outer rows plus a provenance column), so it only ever appears
