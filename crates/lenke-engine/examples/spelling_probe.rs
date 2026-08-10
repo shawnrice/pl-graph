@@ -124,6 +124,14 @@ fn main() {
             ],
         ),
         (
+            "multi-predicate: inline map vs WHERE-AND (both orders)",
+            &[
+                (Gql, "MATCH (n:Person {dept: 'eng', age: 30}) RETURN count(*) AS c"),
+                (Gql, "MATCH (n:Person) WHERE n.dept = 'eng' AND n.age = 30 RETURN count(*) AS c"),
+                (Gql, "MATCH (n:Person) WHERE n.age = 30 AND n.dept = 'eng' RETURN count(*) AS c"),
+            ],
+        ),
+        (
             "IN list vs OR chain",
             &[
                 (Gql, "MATCH (n:Person) WHERE n.dept IN ['eng', 'sales'] RETURN count(*) AS c"),

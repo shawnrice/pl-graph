@@ -17,6 +17,25 @@ use std::collections::{HashMap, HashSet};
 use crate::ir::{AggFn, CastTarget, CompareOp, Dir, Expr, PathPart, Plan};
 use crate::value::Value;
 
+/// A parsed node pattern head: its optional variable, optional label, and inline
+/// property map (`(v:Label {k: val, …})` — empty when absent).
+type ParsedNode = (Option<String>, Option<String>, Vec<(String, Value)>);
+
+/// Turn a node's inline properties `{k: v, …}` into a chain of `Eq` filters on its
+/// slot — the exact lowering of `WHERE slot.k = v AND …`. Sharing this single form
+/// is what makes `(n:L {k: v})` and `MATCH (n:L) WHERE n.k = v` optimize to the same
+/// plan (and seed the same index), so the two spellings cannot cost differently.
+fn node_prop_filters(mut plan: Plan, slot: usize, props: Vec<(String, Value)>) -> Plan {
+    for (k, val) in props {
+        plan = plan.filter(Expr::Compare {
+            op: CompareOp::Eq,
+            left: Box::new(Expr::Prop { slot, key: k }),
+            right: Box::new(Expr::Lit(val)),
+        });
+    }
+    plan
+}
+
 /// A parsed relationship pattern `-[var:Type {props}]->`: direction, edge type,
 /// an optional bound variable, and inline properties (a match filter in a
 /// pattern, edge properties to write in an INSERT).
@@ -428,7 +447,7 @@ impl Parser {
             );
         }
         let mut scope: HashMap<String, usize> = HashMap::new();
-        let (va, la) = self.node()?;
+        let (va, la, va_props) = self.node()?;
         if let Some(v) = va {
             scope.insert(v, 0);
         }
@@ -439,9 +458,15 @@ impl Parser {
                 "`ANY SHORTEST` requires a `*` or `+` quantifier on the relationship".into(),
             );
         }
-        let (vb, _lb) = self.node()?;
+        let (vb, _lb, vb_props) = self.node()?;
         if let Some(v) = vb {
             scope.insert(v, 1);
+        }
+        if !va_props.is_empty() || !vb_props.is_empty() {
+            return Err(
+                "inline properties on an `ANY SHORTEST` path endpoint are not supported; use WHERE"
+                    .into(),
+            );
         }
         self.path_vars.insert(pname);
         let plan =
@@ -737,13 +762,16 @@ impl Parser {
     fn pattern(&mut self) -> Result<(Plan, HashMap<String, usize>, usize), String> {
         let mut scope: HashMap<String, usize> = HashMap::new();
         let mut slots = 0usize;
-        let (var, label) = self.node()?;
+        let (var, label, props) = self.node()?;
         if let Some(v) = var {
             scope.insert(v, slots);
         }
         let from = slots;
         slots += 1;
-        let plan = self.extend_chain(Plan::Scan { label }, &mut scope, &mut slots, from)?;
+        // Inline props on the seed node become filters over the Scan — the same
+        // shape a `WHERE` produces, so the optimizer's index-seeding sees both alike.
+        let seed = node_prop_filters(Plan::Scan { label }, from, props);
+        let plan = self.extend_chain(seed, &mut scope, &mut slots, from)?;
         Ok((plan, scope, slots))
     }
 
@@ -762,9 +790,9 @@ impl Parser {
         while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow)) {
             let rel = self.rel()?;
             let quant = self.opt_quantifier()?;
-            let (v2, _lbl2) = self.node()?; // a hop's landing-node label is ignored for now
-                                            // A relationship variable or inline edge properties require binding the
-                                            // edge as a slot (edge at `slots`, node at `slots+1`).
+            let (v2, _lbl2, v2_props) = self.node()?; // a hop's landing-node label is ignored for now
+                                                      // A relationship variable or inline edge properties require binding the
+                                                      // edge as a slot (edge at `slots`, node at `slots+1`).
             let bind = rel.var.is_some() || !rel.props.is_empty();
             if let Some((min, max)) = quant {
                 if bind {
@@ -813,6 +841,9 @@ impl Parser {
                 plan = plan.expand(from, rel.dir, Some(&rel.etype));
                 from = node_slot;
             }
+            // Inline props on the landing node filter it, exactly as a WHERE would.
+            // (`from` is now that node's slot in every branch above.)
+            plan = node_prop_filters(plan, from, v2_props);
         }
         Ok(plan)
     }
@@ -822,13 +853,19 @@ impl Parser {
     /// than scanning afresh). A fresh/disconnected subsequent pattern — one whose
     /// first node is unbound — is not supported in this subset.
     fn match_continue(&mut self, plan: Plan) -> Result<Plan, String> {
-        let (var, label) = self.node()?;
+        let (var, label, props) = self.node()?;
         let Some(v) = var else {
             return Err("a MATCH after WITH must start from a bound variable".into());
         };
         if label.is_some() {
             return Err(format!(
                 "bound variable `{v}` cannot be re-labeled in a continuing MATCH"
+            ));
+        }
+        if !props.is_empty() {
+            return Err(format!(
+                "bound variable `{v}` cannot be re-constrained with inline properties in a \
+                 continuing MATCH; use WHERE"
             ));
         }
         let Some(&from) = self.scope.get(&v) else {
@@ -931,13 +968,19 @@ impl Parser {
         if !self.eat_kw("MATCH") {
             return Err("a CALL subquery must begin with MATCH".into());
         }
-        let (var, label) = self.node()?;
+        let (var, label, props) = self.node()?;
         let Some(v) = var else {
             return Err("a CALL subquery pattern must start from a scope variable".into());
         };
         if label.is_some() {
             return Err(format!(
                 "scope variable `{v}` cannot be re-labeled inside a CALL subquery"
+            ));
+        }
+        if !props.is_empty() {
+            return Err(format!(
+                "scope variable `{v}` cannot be re-constrained with inline properties inside a \
+                 CALL subquery; use WHERE"
             ));
         }
         if !scope_vars.contains(&v) {
@@ -1085,7 +1128,7 @@ impl Parser {
     }
 
     // node := '(' [var] [':' Label] ')'
-    fn node(&mut self) -> Result<(Option<String>, Option<String>), String> {
+    fn node(&mut self) -> Result<ParsedNode, String> {
         self.expect(&Tok::LParen)?;
         // An identifier here is the node variable; the label (if any) follows ':'.
         let var = if matches!(self.peek(), Some(Tok::Ident(_))) {
@@ -1098,8 +1141,17 @@ impl Parser {
         } else {
             None
         };
+        // Inline property map `(n:Label {k: v, …})`: a match filter on the node,
+        // the exact equivalent of `WHERE n.k = v AND …`. It lowers to the SAME `Eq`
+        // filters (see `node_prop_filters`), so the two spellings optimize to the
+        // same plan and seed the same index — equivalent spellings cost the same.
+        let props = if matches!(self.peek(), Some(Tok::LBrace)) {
+            self.props()?
+        } else {
+            Vec::new()
+        };
         self.expect(&Tok::RParen)?;
-        Ok((var, label))
+        Ok((var, label, props))
     }
 
     // rel := '-' '[' ':' R ']' '->'   (out)
@@ -1603,13 +1655,19 @@ impl Parser {
     fn exists_expr(&mut self) -> Result<Expr, String> {
         self.expect(&Tok::LBrace)?;
         let outer_width = self.slots;
-        let (var, label) = self.node()?;
+        let (var, label, props) = self.node()?;
         let Some(v) = var else {
             return Err("EXISTS pattern must start from a bound variable".into());
         };
         if label.is_some() {
             return Err(format!(
                 "bound variable `{v}` cannot be re-labeled inside EXISTS"
+            ));
+        }
+        if !props.is_empty() {
+            return Err(format!(
+                "bound variable `{v}` cannot be re-constrained with inline properties inside \
+                 EXISTS; use WHERE"
             ));
         }
         let Some(&from) = self.scope.get(&v) else {
@@ -1846,6 +1904,43 @@ mod tests {
             bag(&run(hand, store)),
             "parsed plan differs for `{query}`"
         );
+    }
+
+    /// Inline node-property maps `(n:L {k: v, …})` are a match filter — the same
+    /// rows as the `WHERE` spelling, on the seed node AND a hop's landing node.
+    #[test]
+    fn inline_property_maps_match_where() {
+        let store = social();
+        let same = |inline: &str, wher: &str| {
+            let a = bag(&run(&super::parse(inline).unwrap(), &store));
+            let b = bag(&run(&super::parse(wher).unwrap(), &store));
+            assert_eq!(a, b, "`{inline}` vs `{wher}`");
+        };
+        // Seed node, single and multi-property.
+        same(
+            "MATCH (n:Person {name: 'alice'}) RETURN n.age AS a",
+            "MATCH (n:Person) WHERE n.name = 'alice' RETURN n.age AS a",
+        );
+        same(
+            "MATCH (n:Person {name: 'alice', age: 30}) RETURN n.name AS x",
+            "MATCH (n:Person) WHERE n.name = 'alice' AND n.age = 30 RETURN n.name AS x",
+        );
+        // Landing node of a hop.
+        same(
+            "MATCH (a:Person {name: 'alice'})-[:KNOWS]->(b {name: 'carol'}) RETURN b.age AS a",
+            "MATCH (a:Person)-[:KNOWS]->(b) WHERE a.name = 'alice' AND b.name = 'carol' RETURN b.age AS a",
+        );
+        // Empty map is a no-op filter (all rows).
+        same(
+            "MATCH (n:Person {}) RETURN n.name AS x",
+            "MATCH (n:Person) RETURN n.name AS x",
+        );
+        // A non-matching constraint yields nothing.
+        assert!(bag(&run(
+            &super::parse("MATCH (n:Person {name: 'nobody'}) RETURN n.name AS x").unwrap(),
+            &store
+        ))
+        .is_empty());
     }
 
     #[test]

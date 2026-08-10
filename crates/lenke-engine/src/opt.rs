@@ -331,6 +331,58 @@ fn map_children(plan: Plan) -> (Plan, bool) {
 /// spelling (`prop = v` or `v = prop`) — return `(key, value)` for an index seek.
 /// Only `=` (not ranges), only slot 0 (the scanned node). Handling both spellings
 /// is the load-bearing part: a missed spelling silently keeps scanning.
+/// One seedable conjunct: an equality (→ `IndexSeek`) or a range (→ `RangeSeek`).
+enum Seed {
+    Index(String, Value),
+    Range(String, CompareOp, Value),
+}
+
+/// Given a conjunction `a AND b AND …`, pick ONE conjunct to seed and return it
+/// with the residual predicate (the remaining conjuncts, re-`AND`ed). Prefers an
+/// equality seed over a range. `None` if the predicate is not an `AND`, or no
+/// conjunct is seekable — so a single comparison still flows through the plain
+/// `seek_target`/`range_seek_target` arms above, unchanged.
+fn seed_from_conjuncts(pred: &Expr) -> Option<(Seed, Option<Expr>)> {
+    fn flatten<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match e {
+            Expr::And(a, b) => {
+                flatten(a, out);
+                flatten(b, out);
+            }
+            other => out.push(other),
+        }
+    }
+    let mut conjuncts = Vec::new();
+    flatten(pred, &mut conjuncts);
+    if conjuncts.len() < 2 {
+        return None; // not a conjunction — the single-comparison arms handle it
+    }
+    // Prefer an equality conjunct (more selective seek); fall back to a range.
+    let pick = conjuncts
+        .iter()
+        .position(|c| seek_target(c).is_some())
+        .or_else(|| {
+            conjuncts
+                .iter()
+                .position(|c| range_seek_target(c).is_some())
+        })?;
+    let seed = if let Some((k, v)) = seek_target(conjuncts[pick]) {
+        Seed::Index(k, v)
+    } else {
+        let (k, op, v) = range_seek_target(conjuncts[pick])?;
+        Seed::Range(k, op, v)
+    };
+    // Residual: the other conjuncts, re-`AND`ed (or `None` if the seed was the only
+    // one besides itself — i.e. exactly two conjuncts leaves a lone residual).
+    let residual = conjuncts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != pick)
+        .map(|(_, c)| (*c).clone())
+        .reduce(|a, b| Expr::And(Box::new(a), Box::new(b)));
+    Some((seed, residual))
+}
+
 fn seek_target(pred: &Expr) -> Option<(String, Value)> {
     let Expr::Compare {
         op: CompareOp::Eq,
@@ -512,6 +564,35 @@ fn apply_local(plan: Plan) -> (Plan, bool) {
                         },
                         true,
                     )
+                } else if let Some((seed, residual)) = seed_from_conjuncts(&pred) {
+                    // `Filter(a = x AND …)(Scan)` — seed ONE conjunct and keep the rest
+                    // as a residual filter over the seek, so `WHERE k = x AND …` costs
+                    // the same as the inline `(n:L {k: x, …})` (which seeds because it
+                    // lowers to stacked single filters). Without this a multi-predicate
+                    // WHERE ran the whole conjunction over a full Scan — measured 34x
+                    // its inline twin. The seek is semantically Scan+Filter(conjunct),
+                    // so peeling one conjunct out is a no-op on the rows.
+                    let seek = match seed {
+                        Seed::Index(key, value) => Plan::IndexSeek {
+                            label: l,
+                            key,
+                            value,
+                        },
+                        Seed::Range(key, op, value) => Plan::RangeSeek {
+                            label: l,
+                            key,
+                            op,
+                            value,
+                        },
+                    };
+                    let out = match residual {
+                        Some(pred) => Plan::Filter {
+                            input: Box::new(seek),
+                            pred,
+                        },
+                        None => seek,
+                    };
+                    (out, true)
                 } else {
                     (
                         Plan::Filter {
@@ -1105,6 +1186,54 @@ mod tests {
             "MATCH (n:Person) RETURN count(n) AS c",
             "MATCH (a:Person)-[:KNOWS]->(b) RETURN count(b) AS c",
             "MATCH (n:Person) RETURN count(n.age) AS c",
+        ] {
+            assert_rows_preserved(&crate::gql::parse(q).unwrap(), &store);
+        }
+    }
+
+    /// A multi-predicate `WHERE a = x AND b = y` seeds ONE conjunct into a seek and
+    /// keeps the rest as a residual filter — so it costs the same as the inline
+    /// `(n:L {a: x, b: y})` twin (which already seeded), not a full-scan conjunction.
+    /// The `count(*)`-shaped fixture is the one that showed the 34x gap.
+    #[test]
+    fn multi_predicate_where_seeds_a_conjunct() {
+        let store = social();
+        let seeded = |q: &str| {
+            let p = optimize(crate::gql::parse(q).unwrap());
+            format!("{p:?}").contains("IndexSeek")
+        };
+        // Both AND and the inline map seed; a lone equality already did.
+        assert!(seeded(
+            "MATCH (n:Person) WHERE n.name = 'alice' AND n.age = 30 RETURN count(*) AS c"
+        ));
+        assert!(seeded(
+            "MATCH (n:Person {name: 'alice', age: 30}) RETURN count(*) AS c"
+        ));
+        // The two spellings optimize to the SAME plan (same seek + residual).
+        assert_eq!(
+            format!(
+                "{:?}",
+                optimize(
+                    crate::gql::parse(
+                        "MATCH (n:Person {name: 'alice', age: 30}) RETURN n.age AS a"
+                    )
+                    .unwrap()
+                )
+            ),
+            format!(
+                "{:?}",
+                optimize(
+                    crate::gql::parse(
+                        "MATCH (n:Person) WHERE n.name = 'alice' AND n.age = 30 RETURN n.age AS a"
+                    )
+                    .unwrap()
+                )
+            ),
+        );
+        // And the rewrite never changes the rows (a 3-conjunct case too).
+        for q in [
+            "MATCH (n:Person) WHERE n.name = 'alice' AND n.age = 30 RETURN n.name AS x",
+            "MATCH (n:Person) WHERE n.age >= 20 AND n.age <= 40 AND n.name = 'carol' RETURN n.name AS x",
         ] {
             assert_rows_preserved(&crate::gql::parse(q).unwrap(), &store);
         }
