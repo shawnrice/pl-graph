@@ -23,6 +23,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         labels: HashMap::new(),
         edge_hop: None,
         pending_repeat: None,
+        path_ok: true,
     };
     p.traversal()
 }
@@ -149,6 +150,13 @@ struct Parser {
     /// it into a fixed-length `VarLength{min:n,max:n}`. A `repeat` not immediately
     /// followed by `times` is an error (see the guard at the top of `step`).
     pending_repeat: Option<(Dir, Option<String>)>,
+    /// Whether `path()` can still be answered: true while the traversal is a pure
+    /// vertex-hop chain (`V`-source + `out`/`in`/`both` + element filters), whose
+    /// Gremlin path is exactly the node sequence the engine's lineage records. Any
+    /// other step (edge hops, var-length, value projections, barriers, the `E`
+    /// source) makes the Gremlin path step-dependent in a way the nodes-only
+    /// rendering would not match, so `path()` is deferred once this is false.
+    path_ok: bool,
 }
 
 impl Parser {
@@ -237,6 +245,8 @@ impl Parser {
                     return Err("g.E(id) (edges by external id) is not supported yet".into());
                 }
                 self.expect(&Tok::RParen)?;
+                // An edge source makes the path start on an edge, not a node.
+                self.path_ok = false;
                 Plan::EdgeScan
             }
             "adde" => {
@@ -286,6 +296,14 @@ impl Parser {
         let prev_repeat = self.pending_repeat.take();
         if prev_repeat.is_some() && lname != "times" {
             return Err("repeat(<hop>) must be immediately followed by times(n)".into());
+        }
+        // Only a pure vertex-hop chain keeps `path()` answerable; every other step
+        // taints it (`path()` and the element filters are path-preserving).
+        if !matches!(
+            lname.as_str(),
+            "out" | "in" | "both" | "has" | "hasnot" | "path"
+        ) {
+            self.path_ok = false;
         }
 
         // --- write steps ---
@@ -506,6 +524,31 @@ impl Parser {
                     Expr::Call {
                         name: func.to_string(),
                         args: vec![Expr::Slot(self.current)],
+                    },
+                )]);
+                self.current = 0;
+                self.slots = 1;
+                p
+            }
+            "path" => {
+                self.expect(&Tok::RParen)?;
+                if !self.path_ok {
+                    return Err("path() is only supported over a pure vertex-hop chain \
+                                (V-source + out/in/both); edge steps, var-length, value \
+                                projections and the E source are deferred"
+                        .into());
+                }
+                // Gremlin path() over a vertex-hop chain is the sequence of vertices
+                // visited. The engine's lineage records exactly that node sequence
+                // (`Expr::Path` → the ids); `path_nodes` renders each id as its
+                // element map so the path elements are vertices, matching core. The
+                // `Expr::Path` argument both feeds the ids and makes `needs_lineage`
+                // switch tracking on.
+                let p = plan.project(vec![(
+                    "path".to_string(),
+                    Expr::Call {
+                        name: "path_nodes".to_string(),
+                        args: vec![Expr::Path],
                     },
                 )]);
                 self.current = 0;
@@ -1120,6 +1163,66 @@ mod tests {
             gone.is_empty(),
             "missing id must contribute nothing: {gone:?}"
         );
+    }
+
+    /// `path()` over a pure vertex-hop chain yields the sequence of vertices visited,
+    /// each rendered as its element map (not a bare id). Verified structurally: the
+    /// path elements ARE node maps whose id sequence is the hop sequence; and every
+    /// non-vertex-hop shape (edge steps, the E source, value projections, var-length)
+    /// is deferred rather than mis-answered.
+    #[test]
+    fn gremlin_path_vertex_hop_chain() {
+        let store = social();
+        // Pull the "id" of each node-map element, per path, as a sorted set of seqs.
+        fn id_seqs(q: &str, store: &Store) -> Vec<Vec<String>> {
+            let rows = gremlin_rows(q, store);
+            let mut out: Vec<Vec<String>> = rows
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Value::List(elems) => elems
+                        .iter()
+                        .map(|e| match e {
+                            Value::Map(pairs) => pairs
+                                .iter()
+                                .find(|(k, _)| matches!(k, Value::Str(s) if &**s == "id"))
+                                .and_then(|(_, v)| match v {
+                                    Value::Str(s) => Some(s.to_string()),
+                                    _ => None,
+                                })
+                                .expect("path element is a node map with an id"),
+                            o => panic!("path element not a node map: {o:?}"),
+                        })
+                        .collect(),
+                    o => panic!("path is not a list: {o:?}"),
+                })
+                .collect();
+            out.sort();
+            out
+        }
+        // Single vertex → a one-element path.
+        assert_eq!(
+            id_seqs("g.V('0').path()", &store),
+            vec![vec!["0".to_string()]]
+        );
+        // One hop from alice(0) → [0,1] and [0,2].
+        assert_eq!(
+            id_seqs("g.V('0').out('KNOWS').path()", &store),
+            vec![
+                vec!["0".to_string(), "1".to_string()],
+                vec!["0".to_string(), "2".to_string()],
+            ],
+        );
+        // Two hops: alice->bob->carol is the only length-2 KNOWS walk from alice.
+        assert_eq!(
+            id_seqs("g.V('0').out('KNOWS').out('KNOWS').path()", &store),
+            vec![vec!["0".to_string(), "1".to_string(), "2".to_string()]],
+        );
+        // Deferred shapes error explicitly.
+        assert!(super::parse("g.V().outE().inV().path()").is_err());
+        assert!(super::parse("g.E().path()").is_err());
+        assert!(super::parse("g.V().values('name').path()").is_err());
+        assert!(super::parse("g.V().repeat(out('KNOWS')).times(2).path()").is_err());
     }
 
     /// `valueMap()` projects a PROPERTIES-only map (no id/label tokens) with scalar
