@@ -513,10 +513,31 @@ impl Parser {
                 p
             }
             "valuemap" => {
-                // valueMap() is a PROPERTIES-only map (no id/label tokens by default),
-                // with TinkerPop's list-wrapped multi-values — semantics distinct from
-                // the engine's element_map render. Deferred to its own iteration.
-                return Err("valueMap() is not yet supported".into());
+                // valueMap() → a PROPERTIES-only map (no id/label tokens) with scalar
+                // values; valueMap('k1',…) filters keys. Lowers to the gremlin-only
+                // `value_map` exec fn: element slot, then the filter keys as literals.
+                let mut fn_args = vec![Expr::Slot(self.current)];
+                if !matches!(self.peek(), Some(Tok::RParen)) {
+                    loop {
+                        fn_args.push(Expr::Lit(Value::Str(self.str_arg()?.into())));
+                        if self.peek() == Some(&Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                let p = plan.project(vec![(
+                    "valueMap".to_string(),
+                    Expr::Call {
+                        name: "value_map".to_string(),
+                        args: fn_args,
+                    },
+                )]);
+                self.current = 0;
+                self.slots = 1;
+                p
             }
             "where" => {
                 // where(P.op(v)) / where(op(v)) / where(within(...)) — filter the
@@ -1101,6 +1122,42 @@ mod tests {
         );
     }
 
+    /// `valueMap()` projects a PROPERTIES-only map (no id/label tokens) with scalar
+    /// values; `valueMap('k',…)` filters keys. Present-properties only — the Project
+    /// node has no `age`, so its map omits it. The maps equal the `properties`
+    /// sub-map of the engine's GQL element render, which is byte-identical to core.
+    #[test]
+    fn gremlin_valuemap_properties_only() {
+        let store = social();
+        // All properties (keys sorted): the three Persons carry name+age, the
+        // Project only name.
+        assert_eq!(
+            value_bag(&gremlin_rows("g.V().valueMap()", &store)),
+            vec![
+                "Map([(Str(\"age\"), Num(25.0)), (Str(\"name\"), Str(\"bob\"))]);",
+                "Map([(Str(\"age\"), Num(30.0)), (Str(\"name\"), Str(\"alice\"))]);",
+                "Map([(Str(\"age\"), Num(40.0)), (Str(\"name\"), Str(\"carol\"))]);",
+                "Map([(Str(\"name\"), Str(\"graphdb\"))]);",
+            ],
+        );
+        // Key filter: only the named property, when present.
+        assert_eq!(
+            value_bag(&gremlin_rows("g.V().valueMap('name')", &store)),
+            vec![
+                "Map([(Str(\"name\"), Str(\"alice\"))]);",
+                "Map([(Str(\"name\"), Str(\"bob\"))]);",
+                "Map([(Str(\"name\"), Str(\"carol\"))]);",
+                "Map([(Str(\"name\"), Str(\"graphdb\"))]);",
+            ],
+        );
+        // Filtering an absent key drops it: the Project keeps only name under
+        // valueMap('name','age').
+        assert_eq!(
+            value_bag(&gremlin_rows("g.V().valueMap('name','age')", &store)),
+            value_bag(&gremlin_rows("g.V().valueMap()", &store)),
+        );
+    }
+
     /// `id()` projects the element's preserved external id (via `element_id`), and
     /// `label()` a single label string — a vertex's label or an edge's type (via
     /// `element_label`), both polymorphic over the current node/edge slot. Verified
@@ -1127,8 +1184,6 @@ mod tests {
             value_bag(&gremlin_rows("g.V().outE().label()", &store)),
             value_bag(&gql_rows("MATCH ()-[r]->() RETURN type(r)", &store)),
         );
-        // valueMap() is deferred (properties-only map with list-wrapped values).
-        assert!(super::parse("g.V().valueMap()").is_err());
     }
 
     /// `repeat(<hop>).times(n)` applies a single anonymous hop exactly n times — a

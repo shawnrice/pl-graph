@@ -3517,6 +3517,69 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                     .collect();
                 return Ok(Col::Gen(out));
             }
+            // `value_map(element[, 'k1', …])` → Gremlin `valueMap()`: a Value::Map of
+            // the element's PRESENT properties (no id/label tokens), with SCALAR
+            // values (core's `propertyMap()`, not built here, is the list-wrapped
+            // form). An optional trailing key list filters; no keys = every present
+            // property. Keys are sorted (the engine's element-map convention; map key
+            // order is set-based per policy). Gremlin-only — not in the GQL whitelist.
+            if name == "value_map" {
+                // The filter keys are constant string literals after the element arg.
+                let filter: Vec<String> = args[1..]
+                    .iter()
+                    .filter_map(|e| match e {
+                        Expr::Lit(Value::Str(s)) => Some(s.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                let arg = eval(&args[0], store, batch)?;
+                let n = batch.rows();
+                let out: Vec<Value> = (0..n)
+                    .map(|i| {
+                        let mut pairs: Vec<(String, Value)> = match arg.value_at(i) {
+                            Value::Num(id) if matches!(arg, Col::Nodes(_)) => {
+                                let id = id as u32;
+                                let keys = if filter.is_empty() {
+                                    store.prop_keys()
+                                } else {
+                                    filter.clone()
+                                };
+                                keys.into_iter()
+                                    .filter(|k| store.has_prop(id, k))
+                                    .map(|k| {
+                                        let v = store.prop(id, &k);
+                                        (k, v)
+                                    })
+                                    .collect()
+                            }
+                            Value::Num(eid) if matches!(arg, Col::Edges(_)) => {
+                                let eid = eid as u32;
+                                let keys = if filter.is_empty() {
+                                    store.edge_prop_keys()
+                                } else {
+                                    filter.clone()
+                                };
+                                keys.into_iter()
+                                    .filter(|k| store.has_edge_prop(eid, k))
+                                    .map(|k| {
+                                        let v = store.edge_prop(eid, &k);
+                                        (k, v)
+                                    })
+                                    .collect()
+                            }
+                            _ => return Value::Null,
+                        };
+                        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                        Value::Map(Arc::new(
+                            pairs
+                                .into_iter()
+                                .map(|(k, v)| (Value::Str(k.into()), v))
+                                .collect(),
+                        ))
+                    })
+                    .collect();
+                return Ok(Col::Gen(out));
+            }
             // Element functions need the STORE and the element identity (a node/edge
             // slot), which the pure-value `call_scalar` cannot see — handle them
             // here off the evaluated argument column.
