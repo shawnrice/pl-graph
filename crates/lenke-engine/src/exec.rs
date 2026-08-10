@@ -775,9 +775,56 @@ fn hash_join(lb: &Batch, rb: &Batch, on: &[(usize, usize)]) -> Batch {
     Batch::of(slots)
 }
 
-/// Sort the batch by `keys` (stable; ascending via `cmp_total`, descending its
-/// reverse), then keep the window `[skip, skip+limit)`. Reorders every slot
-/// together, so bound variables stay row-aligned.
+/// Compare two rows by the sort keys only (`Equal` on a full tie). NULL placement
+/// is the front-end's language contract (GQL last, Gremlin first), decided here
+/// BEFORE the total order (not by reversing `cmp_total` under DESC).
+#[inline]
+fn row_cmp(
+    key_cols: &[Col],
+    keys: &[crate::ir::SortKey],
+    a: usize,
+    b: usize,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (kc, k) in key_cols.iter().zip(keys) {
+        let (va, vb) = (kc.value_at(a), kc.value_at(b));
+        let ord = match (va.is_null(), vb.is_null()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => {
+                if k.nulls_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if k.nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, false) => {
+                let o = value::cmp_total(&va, &vb);
+                if k.descending {
+                    o.reverse()
+                } else {
+                    o
+                }
+            }
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Sort the batch by `keys`, then keep the window `[skip, skip+limit)`. Reorders
+/// every slot together, so bound variables stay row-aligned. When a `limit` makes
+/// the window a small prefix of the rows, only the TOP-K are selected (partition +
+/// partial sort — O(n) + O(k log k)) instead of a full O(n log n) sort; the full
+/// case keeps the stable sort (ties keep arrival order).
 fn order_page(
     batch: &Batch,
     store: &Store,
@@ -786,52 +833,26 @@ fn order_page(
     limit: Option<usize>,
 ) -> Result<Batch, String> {
     let n = batch.rows();
+    let start = skip.unwrap_or(0).min(n);
+    let end = limit.map_or(n, |l| start.saturating_add(l).min(n));
+    if end <= start {
+        return Ok(batch.gather(&[]));
+    }
     let mut idx: Vec<usize> = (0..n).collect();
     if !keys.is_empty() {
         let key_cols: Vec<Col> = eval_all(keys.iter().map(|k| &k.expr), store, batch)?;
-        // Stable sort: equal keys keep input order, so the last key's ties fall
-        // back to arrival order deterministically.
-        idx.sort_by(|&a, &b| {
-            for (kc, k) in key_cols.iter().zip(keys) {
-                let (va, vb) = (kc.value_at(a), kc.value_at(b));
-                // NULL placement is set by the front-end (GQL last, Gremlin first)
-                // and is INDEPENDENT of direction — so it is decided here, before
-                // the total order, not by reversing `cmp_total` (whose rank would
-                // otherwise flip NULLs to the wrong end under DESC).
-                let ord = match (va.is_null(), vb.is_null()) {
-                    (true, true) => std::cmp::Ordering::Equal,
-                    (true, false) => {
-                        if k.nulls_first {
-                            std::cmp::Ordering::Less
-                        } else {
-                            std::cmp::Ordering::Greater
-                        }
-                    }
-                    (false, true) => {
-                        if k.nulls_first {
-                            std::cmp::Ordering::Greater
-                        } else {
-                            std::cmp::Ordering::Less
-                        }
-                    }
-                    (false, false) => {
-                        let o = value::cmp_total(&va, &vb);
-                        if k.descending {
-                            o.reverse()
-                        } else {
-                            o
-                        }
-                    }
-                };
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
+        if end < n {
+            // Top-K: partition so the `end` smallest rows land in idx[..end], then
+            // sort just those. An arrival-index tiebreak makes the order TOTAL, so
+            // the prefix matches a full stable sort's first `end` rows exactly.
+            let total = |&a: &usize, &b: &usize| row_cmp(&key_cols, keys, a, b).then(a.cmp(&b));
+            idx.select_nth_unstable_by(end - 1, total);
+            idx[..end].sort_unstable_by(total);
+        } else {
+            // Full sort: stable, so ties keep arrival order (no index tiebreak).
+            idx.sort_by(|&a, &b| row_cmp(&key_cols, keys, a, b));
+        }
     }
-    let start = skip.unwrap_or(0).min(idx.len());
-    let end = limit.map_or(idx.len(), |l| start.saturating_add(l).min(idx.len()));
     Ok(batch.gather(&idx[start..end]))
 }
 
