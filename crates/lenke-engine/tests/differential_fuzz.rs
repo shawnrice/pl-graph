@@ -243,10 +243,20 @@ fn predicate(rng: &mut Rng, var: &str, depth: u32) -> String {
 }
 
 fn gen_query(rng: &mut Rng) -> Query {
-    // Pattern: node-only, or a 1-hop that binds the endpoint `m`.
+    // Pattern: node-only, or a 1-hop that binds the endpoint `m`. The hop is spelled
+    // typed OR untyped (bracketed `-[]->` / `-[e]->`) — all equivalent since there is
+    // one edge type, so it exercises the untyped-relationship parse against core.
     let two_hop = rng.chance(2, 5);
     let (pattern, var) = if two_hop {
-        ("MATCH (n:N)-[:R]->(m:N)", "m")
+        let rel = *rng.pick(&["-[:R]->", "-[]->", "-[e]->"]);
+        (
+            match rel {
+                "-[:R]->" => "MATCH (n:N)-[:R]->(m:N)",
+                "-[]->" => "MATCH (n:N)-[]->(m:N)",
+                _ => "MATCH (n:N)-[e]->(m:N)",
+            },
+            "m",
+        )
     } else {
         ("MATCH (n:N)", "n")
     };

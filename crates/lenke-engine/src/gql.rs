@@ -41,7 +41,9 @@ fn node_prop_filters(mut plan: Plan, slot: usize, props: Vec<(String, Value)>) -
 /// pattern, edge properties to write in an INSERT).
 struct Rel {
     dir: Dir,
-    etype: String,
+    /// The edge type, or `None` for an UNTYPED relationship (`-->`, `-[r]->`,
+    /// `-[]->`) which traverses edges of ANY type — `edge_label: None` in the plan.
+    etype: Option<String>,
     var: Option<String>,
     props: Vec<(String, Value)>,
 }
@@ -469,8 +471,7 @@ impl Parser {
             );
         }
         self.path_vars.insert(pname);
-        let plan =
-            Plan::Scan { label: la }.shortest_path(0, rel.dir, Some(rel.etype.as_str()), None);
+        let plan = Plan::Scan { label: la }.shortest_path(0, rel.dir, rel.etype.as_deref(), None);
         Ok((plan, scope, 2))
     }
 
@@ -675,7 +676,9 @@ impl Parser {
             edges.push(crate::ir::InsertEdge {
                 from,
                 to,
-                etype: rel.etype,
+                etype: rel
+                    .etype
+                    .ok_or("INSERT of a relationship requires an edge type")?,
                 props: rel.props,
             });
             prev = next;
@@ -807,7 +810,7 @@ impl Parser {
                     scope.insert(v, node_slot);
                 }
                 *slots += 1;
-                plan = plan.var_length(from, rel.dir, Some(&rel.etype), min, max, true);
+                plan = plan.var_length(from, rel.dir, rel.etype.as_deref(), min, max, true);
                 from = node_slot;
             } else if bind {
                 let edge_slot = *slots;
@@ -819,7 +822,7 @@ impl Parser {
                     scope.insert(v, node_slot);
                 }
                 *slots += 2;
-                plan = plan.expand_edge(from, rel.dir, Some(&rel.etype));
+                plan = plan.expand_edge(from, rel.dir, rel.etype.as_deref());
                 // Inline edge props are a match filter on the bound edge.
                 for (k, val) in rel.props {
                     plan = plan.filter(Expr::Compare {
@@ -838,7 +841,7 @@ impl Parser {
                     scope.insert(v, node_slot);
                 }
                 *slots += 1;
-                plan = plan.expand(from, rel.dir, Some(&rel.etype));
+                plan = plan.expand(from, rel.dir, rel.etype.as_deref());
                 from = node_slot;
             }
             // Inline props on the landing node filter it, exactly as a WHERE would.
@@ -1170,8 +1173,15 @@ impl Parser {
         } else {
             None
         };
-        self.expect(&Tok::Colon)?;
-        let etype = self.ident()?;
+        // `:Type` is OPTIONAL — `-[r]->` / `-[]->` is an UNTYPED hop (any edge type),
+        // matching core's bracketed untyped relationship. (Core's BARE `-->` has
+        // different semantics — it matches nothing — so it is deliberately NOT
+        // accepted here, to avoid a silent result divergence.)
+        let etype = if self.eat(&Tok::Colon) {
+            Some(self.ident()?)
+        } else {
+            None
+        };
         let props = if matches!(self.peek(), Some(Tok::LBrace)) {
             self.props()?
         } else {
@@ -3753,6 +3763,42 @@ mod tests {
             &store,
         );
         assert!(matches!(col(&neg, 0, "x"), Value::Str(s) if &*s == "alice"));
+    }
+
+    /// An untyped relationship `-[r]->` / `-[]->` traverses edges of ANY type;
+    /// `alice` has one KNOWS and one WORKS_ON out-edge, so untyped sees both while a
+    /// `:KNOWS` hop sees only one.
+    #[test]
+    fn untyped_relationship_traverses_all_types() {
+        let store = social();
+        let names = |q: &str| {
+            let out = run(&super::parse(q).unwrap(), &store);
+            let i = out.names.iter().position(|n| n == "n").expect("column n");
+            let mut v: Vec<String> = out
+                .rows
+                .iter()
+                .filter_map(|r| match &r[i] {
+                    Value::Str(s) => Some(s.to_string()),
+                    _ => None,
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        // Bare-variable and empty-bracket untyped forms both traverse everything.
+        assert_eq!(
+            names("MATCH (a:Person {name:'alice'})-[r]->(b) RETURN b.name AS n"),
+            vec!["bob", "carol", "graphdb"],
+        );
+        assert_eq!(
+            names("MATCH (a:Person {name:'alice'})-[]->(b) RETURN b.name AS n"),
+            vec!["bob", "carol", "graphdb"],
+        );
+        // A typed hop is narrower.
+        assert_eq!(
+            names("MATCH (a:Person {name:'alice'})-[:KNOWS]->(b) RETURN b.name AS n"),
+            vec!["bob", "carol"],
+        );
     }
 
     /// Parsed `upper(p.name)` matches the hand-built Call.
