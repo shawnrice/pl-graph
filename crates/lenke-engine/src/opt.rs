@@ -12,6 +12,22 @@
 use crate::ir::{CompareOp, Expr, Plan};
 use crate::value::Value;
 
+/// Frontier width of a PURE Scan/Expand chain — `Some(width)` when `plan` is only
+/// seeds and expands (so every one of its slots is a bound node/edge element), else
+/// `None`. Mirrors `exec::chain_width`; kept here so the optimizer can prove "every
+/// slot is an element" without reaching into exec. A `bind_edge` Expand appends two
+/// slots (edge then node); anything else (Filter/Project/Aggregate/…) is not a pure
+/// chain, so a slot there might be a projected scalar — hence `None`.
+fn pure_chain_width(plan: &Plan) -> Option<usize> {
+    match plan {
+        Plan::Scan { .. } | Plan::IndexSeek { .. } | Plan::RangeSeek { .. } => Some(1),
+        Plan::Expand {
+            input, bind_edge, ..
+        } => Some(pure_chain_width(input)? + if *bind_edge { 2 } else { 1 }),
+        _ => None,
+    }
+}
+
 /// Apply the rule set to a fixpoint (bounded, so a misbehaving rule cannot spin).
 #[must_use]
 pub fn optimize(plan: Plan) -> Plan {
@@ -145,8 +161,31 @@ fn map_children(plan: Plan) -> (Plan, bool) {
                 c,
             )
         }
-        Plan::Aggregate { input, keys, aggs } => {
+        Plan::Aggregate {
+            input,
+            keys,
+            mut aggs,
+        } => {
             let (i, c) = rewrite(*input);
+            // `count(x)` over a bound ELEMENT is `count(*)`: a pattern variable bound
+            // to a node/edge is never null, so counting it counts every row. When the
+            // input is a pure Scan/Expand chain EVERY slot is such an element, so
+            // rewrite a non-DISTINCT `count(Slot(k))` to the argument-free form — that
+            // canonicalizes `count(n)`/`count(b)` onto the O(1) `count(*)` fast path,
+            // closing a spelling perf cliff (`count(n)` was a full scan, `count(*)`
+            // O(1)). DISTINCT is left alone (`count(DISTINCT n)` is distinct elements,
+            // not the row count). A `count(n.prop)` argument is a `Prop`, not a `Slot`,
+            // so it is untouched — it genuinely counts non-null property values.
+            if pure_chain_width(&i).is_some() {
+                for agg in &mut aggs {
+                    if agg.func == crate::ir::AggFn::Count
+                        && !agg.distinct
+                        && matches!(agg.arg.as_ref(), Some(Expr::Slot(_)))
+                    {
+                        agg.arg = None;
+                    }
+                }
+            }
             (
                 Plan::Aggregate {
                     input: Box::new(i),
@@ -163,6 +202,51 @@ fn map_children(plan: Plan) -> (Plan, bool) {
             limit,
         } => {
             let (i, c) = rewrite(*input);
+            // Fuse a pure PAGE over a pure SORT into one OrderPage. Gremlin lowers
+            // `order().by(k)` then `range(lo, hi)` to two stacked OrderPages — an inner
+            // full sort (no page) and an outer page (no keys) — so the sort ran over
+            // ALL rows and the top-K / late-materialization fast path (which needs the
+            // sort and the limit on the SAME node) never fired: `order().by().range()`
+            // was ~7x its GQL `ORDER BY … LIMIT` twin. "Sort by k, then take
+            // [skip, skip+limit)" is exactly "sort by k with that page", so merging is
+            // meaning-preserving — but ONLY when the outer adds no keys and the inner
+            // has no page of its own (an inner limit would pre-truncate the rows).
+            if keys.is_empty() {
+                if let Plan::OrderPage {
+                    input: inner,
+                    keys: inner_keys,
+                    skip: None,
+                    limit: None,
+                } = i
+                {
+                    if !inner_keys.is_empty() {
+                        return (
+                            Plan::OrderPage {
+                                input: inner,
+                                keys: inner_keys,
+                                skip,
+                                limit,
+                            },
+                            true, // merged two nodes into one — a real change
+                        );
+                    }
+                    // Not mergeable after all — rebuild the inner OrderPage we moved out.
+                    return (
+                        Plan::OrderPage {
+                            input: Box::new(Plan::OrderPage {
+                                input: inner,
+                                keys: inner_keys,
+                                skip: None,
+                                limit: None,
+                            }),
+                            keys,
+                            skip,
+                            limit,
+                        },
+                        c,
+                    );
+                }
+            }
             (
                 Plan::OrderPage {
                     input: Box::new(i),
@@ -987,5 +1071,76 @@ mod tests {
         .unwrap();
         // The WHERE (slot 0) should end up pushed below the Expand.
         let _ = assert_rows_preserved(&plan, &store);
+    }
+
+    /// `count(<bound element>)` over a pure chain canonicalizes to argument-free
+    /// `count(*)` (same plan → same O(1) fast path), while `count(<property>)` and
+    /// `count(DISTINCT …)` are left alone. The spelling-perf-cliff guard.
+    #[test]
+    fn count_of_bound_element_canonicalizes_to_count_star() {
+        let store = social();
+        let plan_str = |q: &str| format!("{:?}", optimize(crate::gql::parse(q).unwrap()));
+
+        // count(n) == count(*) and count(b) == count(*) (1-hop), same optimized plan.
+        assert_eq!(
+            plan_str("MATCH (n:Person) RETURN count(n) AS c"),
+            plan_str("MATCH (n:Person) RETURN count(*) AS c"),
+        );
+        assert_eq!(
+            plan_str("MATCH (a:Person)-[:KNOWS]->(b) RETURN count(b) AS c"),
+            plan_str("MATCH (a:Person)-[:KNOWS]->(b) RETURN count(*) AS c"),
+        );
+        // A property count and a DISTINCT element count are NOT count(*).
+        assert_ne!(
+            plan_str("MATCH (n:Person) RETURN count(n.age) AS c"),
+            plan_str("MATCH (n:Person) RETURN count(*) AS c"),
+        );
+        assert_ne!(
+            plan_str("MATCH (n:Person) RETURN count(DISTINCT n) AS c"),
+            plan_str("MATCH (n:Person) RETURN count(*) AS c"),
+        );
+
+        // And every one of these still returns the SAME rows before/after optimizing.
+        for q in [
+            "MATCH (n:Person) RETURN count(n) AS c",
+            "MATCH (a:Person)-[:KNOWS]->(b) RETURN count(b) AS c",
+            "MATCH (n:Person) RETURN count(n.age) AS c",
+        ] {
+            assert_rows_preserved(&crate::gql::parse(q).unwrap(), &store);
+        }
+    }
+
+    /// Gremlin `order().by(k)` + `range(lo, hi)` lowers to two stacked OrderPages;
+    /// merging the page into the sort must NOT change which rows come back — the
+    /// delicate case is a TIE at the page boundary, where the surviving rows depend
+    /// on tie-breaking. A fixture with many equal keys stresses exactly that.
+    #[test]
+    fn stacked_orderpage_merge_preserves_rows_under_ties() {
+        let mut b = Builder::default();
+        // 12 nodes, keys in {0,1,2} — heavy ties, so a top-k boundary lands inside a
+        // tie group and the merged vs stacked forms must agree on which rows win.
+        for i in 0..12u32 {
+            b.node(
+                &["P"],
+                &[("k", n(f64::from(i % 3))), ("id", n(f64::from(i)))],
+            );
+        }
+        let store = b.build();
+        // Gremlin forms that produce stacked OrderPages (sort, then page).
+        for q in [
+            "g.V().hasLabel('P').order().by('k', desc).range(0, 2).values('id')",
+            "g.V().hasLabel('P').order().by('k').range(1, 4).values('id')",
+            "g.V().hasLabel('P').order().by('k', desc).range(2, 5).values('id')",
+        ] {
+            let plan = crate::gremlin::parse(q).unwrap();
+            // Sanity: the UNoptimized plan really is two stacked OrderPages.
+            assert!(
+                matches!(&plan, Plan::Project { input, .. }
+                    if matches!(input.as_ref(), Plan::OrderPage { input: inner, keys, .. }
+                        if keys.is_empty() && matches!(inner.as_ref(), Plan::OrderPage { .. }))),
+                "expected stacked OrderPages for `{q}`"
+            );
+            assert_rows_preserved(&plan, &store);
+        }
     }
 }
