@@ -421,6 +421,69 @@ pub fn on_cycle(store: &Store, edge_label: Option<&str>) -> Vec<(u32, f64)> {
         .collect()
 }
 
+/// Betweenness centrality (Brandes, unweighted, directed OUT, exact all-sources):
+/// for each vertex, the sum over all source-target pairs of the fraction of
+/// shortest paths that pass through it. Ported from core's `betweenness`: the
+/// per-source SSSP is the same BFS (VecDeque, `stack` in dequeue order, neighbours
+/// in edge-insertion order — which the engine's adjacency already is), `sigma`
+/// counts shortest paths, `pred` the predecessors, and the dependency
+/// back-propagation runs in reverse-stack order — the same fixed order core uses,
+/// so the per-vertex f64 sum is byte-identical. Sources are taken in ascending id.
+/// Weighted betweenness (`weightProperty`) and pivot sampling (`pivots`) are
+/// deferred — this is the exact unweighted default. Returns `(node, centrality)` in
+/// ascending-id order; a named-but-unknown edge type → every vertex `0.0`.
+#[must_use]
+pub fn betweenness(store: &Store, edge_label: Option<&str>) -> Vec<(u32, f64)> {
+    let n = store.node_count();
+    let live = store.all_nodes();
+    let want = want_etype(store, edge_label);
+    let mut cb = vec![0f64; n];
+
+    for &s in &live {
+        // --- BFS single-source shortest-path DAG (sigma / pred / stack) ---
+        let mut sigma = vec![0f64; n];
+        let mut pred: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut dist = vec![f64::INFINITY; n];
+        let mut stack: Vec<u32> = Vec::new();
+        sigma[s as usize] = 1.0;
+        dist[s as usize] = 0.0;
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(s);
+        while let Some(v) = queue.pop_front() {
+            stack.push(v);
+            let dv = dist[v as usize];
+            if let Some(w) = want {
+                for_each_nbr(store, v, Dir::Out, w, |to| {
+                    if dist[to as usize].is_infinite() {
+                        dist[to as usize] = dv + 1.0;
+                        queue.push_back(to);
+                    }
+                    // A shortest-path edge (v is one hop closer than `to`): count v's
+                    // paths into `to` and record v as a predecessor (edge order).
+                    if dist[to as usize] == dv + 1.0 {
+                        sigma[to as usize] += sigma[v as usize];
+                        pred[to as usize].push(v);
+                    }
+                });
+            }
+        }
+
+        // --- dependency accumulation, reverse-stack (non-increasing distance) ---
+        let mut delta = vec![0f64; n];
+        for &w in stack.iter().rev() {
+            let coeff = 1.0 + delta[w as usize];
+            for &v in &pred[w as usize] {
+                delta[v as usize] += (sigma[v as usize] / sigma[w as usize]) * coeff;
+            }
+            if w != s {
+                cb[w as usize] += delta[w as usize];
+            }
+        }
+    }
+
+    live.into_iter().map(|v| (v, cb[v as usize])).collect()
+}
+
 /// The built-in procedure catalog: a `CALL name(...)` procedure name → its
 /// non-`node` result column name (matching lenke-core's snake_case surface). The
 /// output columns of every procedure are `[node, <result>]`. `None` = unknown.
@@ -434,6 +497,7 @@ pub fn procedure_result_col(name: &str) -> Option<&'static str> {
         "on_cycle" => "onCycle",
         "label_propagation" => "label",
         "closeness" => "centrality",
+        "betweenness" => "centrality",
         _ => return None,
     })
 }
@@ -495,6 +559,7 @@ pub fn run_procedure(
             .map(|(v, c)| (v, f64::from(c)))
             .collect(),
         "on_cycle" => on_cycle(store, str_of("edgeType")),
+        "betweenness" => betweenness(store, str_of("edgeType")),
         _ => return None,
     })
 }
@@ -603,6 +668,38 @@ mod tests {
         // A named-but-unknown edge type → nothing is on a cycle.
         assert_eq!(
             on_cycle(&st, Some("NOPE")),
+            vec![(0, 0.0), (1, 0.0), (2, 0.0), (3, 0.0)]
+        );
+    }
+
+    #[test]
+    fn betweenness_directed_triangle_and_diamond() {
+        // Directed triangle 0→1→2→0: each vertex is the sole intermediary of exactly
+        // one 2-hop shortest path, so every betweenness is 1.0; the isolated node 0.
+        let st = triangle_plus_isolated();
+        assert_eq!(
+            betweenness(&st, None),
+            vec![(0, 1.0), (1, 1.0), (2, 1.0), (3, 0.0)]
+        );
+        // Diamond 0→1, 0→2, 1→3, 2→3: from 0 there are TWO shortest paths to 3, so
+        // each middle vertex carries HALF the dependency — exercises sigma division.
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[]);
+        let l = b.node(&["N"], &[]);
+        let r = b.node(&["N"], &[]);
+        let d = b.node(&["N"], &[]);
+        b.edge(a, l, "R");
+        b.edge(a, r, "R");
+        b.edge(l, d, "R");
+        b.edge(r, d, "R");
+        let diamond = b.build();
+        assert_eq!(
+            betweenness(&diamond, None),
+            vec![(0, 0.0), (1, 0.5), (2, 0.5), (3, 0.0)]
+        );
+        // A named-but-unknown edge type → no paths → every vertex 0.0.
+        assert_eq!(
+            betweenness(&st, Some("NOPE")),
             vec![(0, 0.0), (1, 0.0), (2, 0.0), (3, 0.0)]
         );
     }
