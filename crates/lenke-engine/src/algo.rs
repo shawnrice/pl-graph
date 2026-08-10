@@ -957,6 +957,17 @@ fn neighbor_aggregate(
     };
     let include_self = cfg_bool("includeSelf").unwrap_or(false);
     let want = want_etype(store, cfg_str("edgeType"));
+    // A per-edge weight SCALES each contributor, which is meaningless for the
+    // order/scale-independent max/min — reject loudly rather than silently ignore
+    // (matching core). GCN norm is deferred; this is the plain weighted case.
+    let weight_property = cfg_str("weightProperty");
+    if weight_property.is_some() && matches!(op, AggOp::Max | AggOp::Min) {
+        return Err(
+            "neighbor_aggregate `weightProperty` applies only to op=sum|mean (max/min are \
+             scale-independent)"
+                .to_string(),
+        );
+    }
 
     // Precompute every vertex's feature vector; infer the shared dimension (ragged
     // vectors fault, matching core).
@@ -1009,13 +1020,13 @@ fn neighbor_aggregate(
     let mut out: Vec<(u32, Value)> = Vec::with_capacity(store.all_nodes().len());
     for v in store.all_nodes() {
         let mut acc = vec![0.0f64; d];
-        let mut count = 0.0f64; // folded-contributor count (the `mean` divisor)
+        let mut coef_sum = 0.0f64; // Σ contributor coefficients (the `mean` divisor)
         let mut started = false; // whether `acc` holds a real value (for max/min)
-        let mut fold = |vec: &[f64]| {
+        let mut fold = |vec: &[f64], coef: f64| {
             match op {
                 AggOp::Sum | AggOp::Mean => {
                     for (a, x) in acc.iter_mut().zip(vec) {
-                        *a += *x;
+                        *a += coef * *x;
                     }
                 }
                 AggOp::Max => {
@@ -1038,21 +1049,23 @@ fn neighbor_aggregate(
                 }
             }
             started = true;
-            count += 1.0;
+            coef_sum += coef;
         };
         if include_self {
             if let Some(sv) = &feats[v as usize] {
-                fold(sv);
+                // The self-loop has coefficient 1.0 (no GCN normalization here).
+                fold(sv, 1.0);
             }
         }
-        for (_, nbr) in contributors(v) {
+        for (eid, nbr) in contributors(v) {
             if let Some(nv) = &feats[nbr as usize] {
-                fold(nv);
+                let coef = weight_property.map_or(1.0, |wk| edge_weight(store, eid, wk));
+                fold(nv, coef);
             }
         }
-        if op == AggOp::Mean && count != 0.0 {
+        if op == AggOp::Mean && coef_sum != 0.0 {
             for a in &mut acc {
-                *a /= count;
+                *a /= coef_sum;
             }
         }
         out.push((v, Value::List(acc.into_iter().map(Value::Num).collect())));
@@ -1377,6 +1390,47 @@ mod tests {
         let none = ppr(&[]);
         assert_eq!(ppr(&["999"]), none);
         assert!(none[3].1 > 0.0);
+    }
+
+    #[test]
+    fn neighbor_aggregate_weighted_scales_by_edge_weight() {
+        // 0→1 (w=1, feature [2]), 0→2 (w=3, feature [4]). Weighted sum at 0 is
+        // 1·2 + 3·4 = 14; weighted mean divides by the WEIGHT sum: 14/(1+3) = 3.5 —
+        // where the unweighted mean is (2+4)/2 = 3.
+        let mut b = Builder::default();
+        let f = |x: f64| Value::List(vec![Value::Num(x)]);
+        b.node(&["N"], &[]);
+        b.node(&["N"], &[("h", f(2.0))]);
+        b.node(&["N"], &[("h", f(4.0))]);
+        let mut st = b.build();
+        let e0 = st.add_edge(0, 1, "R");
+        st.set_edge_prop(e0, "w", Value::Num(1.0));
+        let e1 = st.add_edge(0, 2, "R");
+        st.set_edge_prop(e1, "w", Value::Num(3.0));
+
+        let cfg = |op: &str, weighted: bool| {
+            let mut c = vec![
+                ("feature".to_string(), Value::Str("h".into())),
+                ("op".to_string(), Value::Str(op.into())),
+                ("direction".to_string(), Value::Str("out".into())),
+            ];
+            if weighted {
+                c.push(("weightProperty".to_string(), Value::Str("w".into())));
+            }
+            c
+        };
+        let node0 = |op: &str, weighted: bool| {
+            format!(
+                "{:?}",
+                neighbor_aggregate(&st, &cfg(op, weighted)).unwrap()[0].1
+            )
+        };
+        assert_eq!(node0("sum", true), "List([Num(14.0)])");
+        assert_eq!(node0("mean", true), "List([Num(3.5)])");
+        assert_eq!(node0("mean", false), "List([Num(3.0)])");
+        // A weight is meaningless for the scale-independent max/min → Err.
+        assert!(neighbor_aggregate(&st, &cfg("max", true)).is_err());
+        assert!(neighbor_aggregate(&st, &cfg("min", true)).is_err());
     }
 
     #[test]

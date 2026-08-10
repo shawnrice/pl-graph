@@ -3403,6 +3403,31 @@ mod tests {
     }
 
     #[test]
+    fn call_neighbor_aggregate_weighted() {
+        // 0→1 (w=1, h=[2]), 0→2 (w=3, h=[4]): weighted mean at 0 is 14/(1+3)=3.5.
+        let mut bld = Builder::default();
+        let f = |x: f64| Value::List(vec![Value::Num(x)]);
+        bld.node(&["N"], &[]);
+        bld.node(&["N"], &[("h", f(2.0))]);
+        bld.node(&["N"], &[("h", f(4.0))]);
+        let mut store = bld.build();
+        let e0 = store.add_edge(0, 1, "R");
+        store.set_edge_prop(e0, "w", Value::Num(1.0));
+        let e1 = store.add_edge(0, 2, "R");
+        store.set_edge_prop(e1, "w", Value::Num(3.0));
+
+        let out = run(
+            &super::parse(
+                "CALL neighbor_aggregate({feature: 'h', op: 'mean', direction: 'out', \
+                 weightProperty: 'w'}) YIELD node, vector",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert_eq!(format!("{:?}", out.rows[0][1]), "List([Num(3.5)])");
+    }
+
+    #[test]
     fn call_personalized_pagerank_yields_score() {
         let store = triangle_store();
         let rows_of = |q: &str| -> Vec<(f64, f64)> {
