@@ -393,7 +393,11 @@ impl Parser {
         }
         // Write tail: MATCH … (SET … | REMOVE …)+  — updates the bound nodes and
         // returns no rows. Otherwise the read tail (RETURN …).
-        if self.peek_kw("SET") || self.peek_kw("REMOVE") {
+        if self.peek_kw("SET")
+            || self.peek_kw("REMOVE")
+            || self.peek_kw("DELETE")
+            || self.peek_kw("DETACH")
+        {
             let ops = self.set_ops()?;
             return Ok(Plan::Update {
                 input: Box::new(plan),
@@ -704,12 +708,30 @@ impl Parser {
                         break;
                     }
                 }
+            } else if self.peek_kw("DETACH") || self.peek_kw("DELETE") {
+                // DELETE var[, var] / DETACH DELETE var[, var]. Each var names a bound
+                // element (node or edge). DETACH also removes a node's edges.
+                let detach = self.eat_kw("DETACH");
+                if !self.eat_kw("DELETE") {
+                    return Err("expected DELETE after DETACH".into());
+                }
+                loop {
+                    let var = self.ident()?;
+                    let slot = *self
+                        .scope
+                        .get(&var)
+                        .ok_or_else(|| format!("unknown variable `{var}`"))?;
+                    ops.push(crate::ir::SetOp::Delete { slot, detach });
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
             } else {
                 break;
             }
         }
         if ops.is_empty() {
-            return Err("expected SET or REMOVE".into());
+            return Err("expected SET, REMOVE, or DELETE".into());
         }
         Ok(ops)
     }

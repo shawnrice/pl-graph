@@ -471,10 +471,14 @@ pub enum SetOp {
         slot: usize,
         key: String,
     },
-    /// Delete the bound node in `slot` (Gremlin `drop()` on vertices; the future
-    /// GQL `DELETE`). Applied in op order alongside SET/REMOVE.
+    /// Delete the bound element in `slot` — a node (GQL `DELETE`/`DETACH DELETE`,
+    /// Gremlin `drop()`) or an edge. `detach` deletes a node's incident edges too;
+    /// a non-`detach` DELETE of a node that still has edges is an error (Cypher/core
+    /// semantics). Applied in op order alongside SET/REMOVE. (Gremlin `drop()`
+    /// currently only reaches node slots and sets `detach: true`.)
     Delete {
         slot: usize,
+        detach: bool,
     },
 }
 

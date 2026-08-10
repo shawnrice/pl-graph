@@ -256,7 +256,11 @@ impl Parser {
             // Delete the current elements of the traversal.
             return Ok(Plan::Update {
                 input: Box::new(plan),
-                ops: vec![crate::ir::SetOp::Delete { slot: self.current }],
+                // Gremlin drop() removes the element AND its incident edges.
+                ops: vec![crate::ir::SetOp::Delete {
+                    slot: self.current,
+                    detach: true,
+                }],
             });
         }
         // A read step cannot follow a write step (addV/property/drop are terminal

@@ -225,7 +225,8 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
             enum Applied {
                 Set(u32, String, Value),
                 Remove(u32, String),
-                Delete(u32),
+                DeleteNode(u32, bool), // (node, detach)
+                DeleteEdge(u32),       // eid
                 SetEdge(u32, String, Value),
                 RemoveEdge(u32, String),
             }
@@ -272,15 +273,19 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
                             }
                             _ => {}
                         },
-                        crate::ir::SetOp::Delete { slot } => {
-                            // Edge deletion via drop() needs the endpoints (not just
-                            // the eid); deferred with Gremlin addE. Node delete here.
-                            if let Col::Nodes(ids) = batch.slot(*slot) {
+                        crate::ir::SetOp::Delete { slot, detach } => match batch.slot(*slot) {
+                            Col::Nodes(ids) => {
                                 for &id in ids {
-                                    applied.push(Applied::Delete(id));
+                                    applied.push(Applied::DeleteNode(id, *detach));
                                 }
                             }
-                        }
+                            Col::Edges(eids) => {
+                                for &e in eids {
+                                    applied.push(Applied::DeleteEdge(e));
+                                }
+                            }
+                            _ => {}
+                        },
                     }
                 }
             }
@@ -299,14 +304,41 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
                     _ => None,
                 })
                 .collect();
+            // Pass 1: property writes and EDGE deletes. Node deletes are deferred to
+            // pass 2 so an edge deleted here (`DELETE r, a, b`) leaves its endpoints
+            // relationship-free before the non-DETACH node-delete check runs.
+            let mut node_deletes: Vec<(u32, bool)> = Vec::new();
             for a in applied {
                 match a {
                     Applied::Set(node, key, value) => store.set_prop(node, &key, value),
                     Applied::Remove(node, key) => store.remove_prop(node, &key),
                     Applied::SetEdge(eid, key, value) => store.set_edge_prop(eid, &key, value),
                     Applied::RemoveEdge(eid, key) => store.remove_edge_prop(eid, &key),
-                    Applied::Delete(node) => store.delete_node(node),
+                    Applied::DeleteEdge(eid) => {
+                        if let Some((u, v)) = store.edge_endpoints(eid) {
+                            store.delete_edge(u, v, eid);
+                        }
+                    }
+                    Applied::DeleteNode(node, detach) => node_deletes.push((node, detach)),
                 }
+            }
+            // Pass 2: node deletes. A non-DETACH delete of a node that still has
+            // relationships is an error (Cypher/core semantics); DETACH deletes the
+            // incident edges too (delete_node cascades). A node matched by several
+            // rows is deleted once (skip if already gone).
+            for (node, detach) in node_deletes {
+                if !store.is_alive(node) {
+                    continue;
+                }
+                if !detach && (!store.out(node).is_empty() || !store.inc(node).is_empty()) {
+                    store.rollback();
+                    return Err(
+                        "E_INVALID_GRAPH_OP: cannot DELETE a node that still has relationships; \
+                         use DETACH DELETE"
+                            .into(),
+                    );
+                }
+                store.delete_node(node);
             }
             // Recheck unique + required on every label a touched (still-live) node
             // carries; roll the statement back on the first violation.
@@ -5789,6 +5821,45 @@ mod tests {
             store.has_prop(id, "name"),
             "required key must survive rollback"
         );
+    }
+
+    /// GQL DELETE / DETACH DELETE, matching core: a non-DETACH delete of a node with
+    /// relationships errors and rolls back; DETACH cascades the edges; an edge delete
+    /// leaves the endpoints; a node with no edges deletes plainly.
+    #[test]
+    fn gql_delete_and_detach_delete() {
+        let build = || {
+            let mut b = Builder::default();
+            let a = b.node(&["P"], &[("n", s("a"))]);
+            let z = b.node(&["P"], &[("n", s("b"))]);
+            let iso = b.node(&["P"], &[("n", s("iso"))]);
+            b.edge(a, z, "R");
+            let _ = iso;
+            b.build()
+        };
+        let go = |q: &str, store: &mut Store| execute(&crate::gql::parse(q).unwrap(), store);
+
+        // Non-DETACH delete of a node WITH an edge → error, nothing removed.
+        let mut s1 = build();
+        assert!(go("MATCH (p:P) WHERE p.n='a' DELETE p", &mut s1).is_err());
+        assert_eq!(s1.live_node_count(), 3, "rolled back");
+
+        // DETACH DELETE removes the node and its edge; the neighbour survives.
+        let mut s2 = build();
+        assert!(go("MATCH (p:P) WHERE p.n='a' DETACH DELETE p", &mut s2).is_ok());
+        assert_eq!(s2.live_node_count(), 2);
+
+        // A node with NO edges deletes plainly (no DETACH needed).
+        let mut s3 = build();
+        assert!(go("MATCH (p:P) WHERE p.n='iso' DELETE p", &mut s3).is_ok());
+        assert_eq!(s3.live_node_count(), 2);
+
+        // Deleting the EDGE leaves both endpoints; then a plain DELETE works.
+        let mut s4 = build();
+        assert!(go("MATCH (a:P)-[r:R]->(b) DELETE r", &mut s4).is_ok());
+        assert_eq!(s4.live_node_count(), 3);
+        assert!(go("MATCH (p:P) WHERE p.n='a' DELETE p", &mut s4).is_ok());
+        assert_eq!(s4.live_node_count(), 2);
     }
 
     /// A deleted node is absent from a label scan through the query path — build
