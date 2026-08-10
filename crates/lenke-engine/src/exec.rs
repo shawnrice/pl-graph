@@ -934,15 +934,36 @@ fn order_page(
     let mut idx: Vec<usize> = (0..n).collect();
     if !keys.is_empty() {
         let key_cols: Vec<Col> = eval_all(keys.iter().map(|k| &k.expr), store, batch)?;
-        if end < n {
-            // Top-K: partition so the `end` smallest rows land in idx[..end], then
-            // sort just those. An arrival-index tiebreak makes the order TOTAL, so
-            // the prefix matches a full stable sort's first `end` rows exactly.
+        // Typed fast path: a SINGLE numeric sort key compares raw f64 via
+        // `cmp_num_total` (NaN-greatest, -0 == 0) — no `value_at` boxing per
+        // comparison. `Col::Num` carries no nulls, so null placement is moot; an
+        // arrival-index tiebreak keeps the order total (deterministic, and equal to
+        // the stable full sort on ties).
+        if let [Col::Num(vals)] = key_cols.as_slice() {
+            let desc = keys[0].descending;
+            let cmp = |&a: &usize, &b: &usize| {
+                let o = if desc {
+                    value::cmp_num_total(vals[b], vals[a])
+                } else {
+                    value::cmp_num_total(vals[a], vals[b])
+                };
+                o.then(a.cmp(&b))
+            };
+            if end < n {
+                idx.select_nth_unstable_by(end - 1, cmp);
+                idx[..end].sort_unstable_by(cmp);
+            } else {
+                idx.sort_unstable_by(cmp);
+            }
+        } else if end < n {
+            // Top-K (general key): partition the `end` smallest, then sort them. An
+            // arrival-index tiebreak makes the order TOTAL, so the prefix matches a
+            // full stable sort's first `end` rows exactly.
             let total = |&a: &usize, &b: &usize| row_cmp(&key_cols, keys, a, b).then(a.cmp(&b));
             idx.select_nth_unstable_by(end - 1, total);
             idx[..end].sort_unstable_by(total);
         } else {
-            // Full sort: stable, so ties keep arrival order (no index tiebreak).
+            // Full sort (general key): stable, so ties keep arrival order.
             idx.sort_by(|&a, &b| row_cmp(&key_cols, keys, a, b));
         }
     }
