@@ -556,7 +556,8 @@ Two found during the census are already FIXED:
 
 Semantic bugs (wrong answers vs core) — fix for parity:
 
-- [ ] K1. ORDER BY DESC null placement (~1269/3000). Core keeps NULLS LAST in BOTH
+- [x] K1. ORDER BY DESC null placement (DONE: SortKey gained `nulls_first`, set per language — GQL false/last, Gremlin true/first — and OrderPage places NULLs by it INDEPENDENT of direction. fuzzer order_desc_nulls 1269->0).
+  ORIG: ORDER BY DESC null placement (~1269/3000). Core keeps NULLS LAST in BOTH
       directions (DESC reverses only the non-null order); the engine reverses the
       whole total order, so nulls come FIRST under DESC. Repro: `RETURN n.id AS a0,
   n.a AS a1 ORDER BY a1 DESC, a0`. Fix in the OrderPage comparator (nulls last

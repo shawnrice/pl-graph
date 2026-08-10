@@ -434,6 +434,7 @@ impl Parser {
                                 key,
                             },
                             descending,
+                            nulls_first: true, // Gremlin: NULLs first
                         }],
                         None,
                         None,

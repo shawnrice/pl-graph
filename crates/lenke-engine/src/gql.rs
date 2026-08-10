@@ -446,6 +446,7 @@ impl Parser {
             keys.push(crate::ir::SortKey {
                 expr: Expr::Slot(slot),
                 descending,
+                nulls_first: false, // GQL: NULLs last, both directions
             });
             if !self.eat(&Tok::Comma) {
                 break;

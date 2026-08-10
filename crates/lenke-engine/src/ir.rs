@@ -204,14 +204,18 @@ pub struct Agg {
     pub name: String,
 }
 
-/// One ORDER BY key: an expression and a direction. Ascending uses the value
-/// contract's `cmp_total` (nulls last); descending reverses it (so nulls come
-/// first under DESC — the total order reversed, which is the honest default and
-/// the front-end can override once NULLS FIRST/LAST syntax lands).
+/// One ORDER BY key: an expression, a direction, and where NULLs go. Null
+/// placement is a LANGUAGE contract set by the front-end, INDEPENDENT of
+/// direction: GQL puts NULLs last in both ASC and DESC (`nulls_first: false`),
+/// Gremlin puts them first (`nulls_first: true`). The non-null values order by
+/// `cmp_total`, reversed under `descending`; NULLs are then placed at the chosen
+/// end regardless of direction. (A NaN is a non-null number — it orders with the
+/// numbers via `cmp_total`, not with the NULLs.)
 #[derive(Clone, Debug)]
 pub struct SortKey {
     pub expr: Expr,
     pub descending: bool,
+    pub nulls_first: bool,
 }
 
 /// A logical plan node. A plan is a tree; execution pulls a batch up through it.

@@ -787,8 +787,36 @@ fn order_page(
         // back to arrival order deterministically.
         idx.sort_by(|&a, &b| {
             for (kc, k) in key_cols.iter().zip(keys) {
-                let ord = value::cmp_total(&kc.value_at(a), &kc.value_at(b));
-                let ord = if k.descending { ord.reverse() } else { ord };
+                let (va, vb) = (kc.value_at(a), kc.value_at(b));
+                // NULL placement is set by the front-end (GQL last, Gremlin first)
+                // and is INDEPENDENT of direction — so it is decided here, before
+                // the total order, not by reversing `cmp_total` (whose rank would
+                // otherwise flip NULLs to the wrong end under DESC).
+                let ord = match (va.is_null(), vb.is_null()) {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    (true, false) => {
+                        if k.nulls_first {
+                            std::cmp::Ordering::Less
+                        } else {
+                            std::cmp::Ordering::Greater
+                        }
+                    }
+                    (false, true) => {
+                        if k.nulls_first {
+                            std::cmp::Ordering::Greater
+                        } else {
+                            std::cmp::Ordering::Less
+                        }
+                    }
+                    (false, false) => {
+                        let o = value::cmp_total(&va, &vb);
+                        if k.descending {
+                            o.reverse()
+                        } else {
+                            o
+                        }
+                    }
+                };
                 if ord != std::cmp::Ordering::Equal {
                     return ord;
                 }
@@ -4024,13 +4052,56 @@ mod tests {
         crate::ir::SortKey {
             expr: prop(slot, key),
             descending: false,
+            nulls_first: false,
         }
     }
     fn desc(slot: usize, key: &str) -> crate::ir::SortKey {
         crate::ir::SortKey {
             expr: prop(slot, key),
             descending: true,
+            nulls_first: false,
         }
+    }
+
+    /// NULL placement is a language contract independent of direction: GQL keeps
+    /// NULLs LAST in both ASC and DESC (a NULL prop must not float to the front
+    /// under DESC). Uses a graph where one node lacks `age`.
+    #[test]
+    fn gql_order_by_desc_keeps_nulls_last() {
+        let mut b = Builder::default();
+        b.node(&["P"], &[("age", n(30.0))]);
+        b.node(&["P"], &[("age", n(10.0))]);
+        b.node(&["P"], &[]); // no age → NULL
+        let store = b.build();
+        let ages =
+            |q: &str| -> Vec<String> { names_of(&run(&crate::gql::parse(q).unwrap(), &store), 1) };
+        // DESC: 30, 10, then NULL last (not first).
+        assert_eq!(
+            ages("MATCH (p:P) RETURN p.age AS a0, p.age AS a1 ORDER BY a0 DESC"),
+            vec!["Num(30.0)", "Num(10.0)", "Null"]
+        );
+        // ASC: 10, 30, NULL last.
+        assert_eq!(
+            ages("MATCH (p:P) RETURN p.age AS a0, p.age AS a1 ORDER BY a0 ASC"),
+            vec!["Num(10.0)", "Num(30.0)", "Null"]
+        );
+    }
+
+    /// Gremlin's `order()` places NULLs FIRST (the other language default) — the
+    /// same shared OrderPage, driven by `SortKey.nulls_first`.
+    #[test]
+    fn gremlin_order_keeps_nulls_first() {
+        let mut b = Builder::default();
+        b.node(&["P"], &[("age", n(30.0)), ("name", s("a"))]);
+        b.node(&["P"], &[("age", n(10.0)), ("name", s("b"))]);
+        b.node(&["P"], &[("name", s("c"))]); // no age → NULL
+        let store = b.build();
+        let out = run(
+            &crate::gremlin::parse("g.V().hasLabel('P').order().by('age').values('name')").unwrap(),
+            &store,
+        );
+        // NULL-age node ('c') sorts FIRST, then 10 ('b'), 30 ('a').
+        assert_eq!(names_of(&out, 0), vec!["c", "b", "a"]);
     }
 
     /// ORDER BY age ascending, then project name.
