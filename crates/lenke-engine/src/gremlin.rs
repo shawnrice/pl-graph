@@ -61,6 +61,14 @@ fn or_of_equals(left: &Expr, vals: &[Value]) -> Expr {
     }
 }
 
+/// A parsed `group().by(...)` modulator: a property key, the current element, or a
+/// reducing `count()` traversal. Used to build the key-by and value-by of a group.
+enum GroupBy {
+    Key(String),
+    Element,
+    Count,
+}
+
 /// Whether a plan is a write (so read steps cannot chain after it).
 fn is_write(plan: &Plan) -> bool {
     matches!(
@@ -840,6 +848,87 @@ impl Parser {
                 self.slots = 2; // group key + count
                 p
             }
+            "group" => {
+                self.expect(&Tok::RParen)?;
+                // group().by(key).by(value) → grouped aggregation. Core shapes this as
+                // one {key: value} map; the engine represents a grouped result as ROWS
+                // of (key, value), consistent with groupCount() — the row model has no
+                // whole-stream single-map fold. The first `.by` is the group key, the
+                // second the reducing/mapping value; both optional.
+                let elem_slot = self.current;
+                // Collect up to two trailing `.by(...)` modulators.
+                let mut bys: Vec<GroupBy> = Vec::new();
+                while bys.len() < 2
+                    && self.peek() == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
+                {
+                    self.expect(&Tok::Dot)?;
+                    self.ident()?; // `by`
+                    self.expect(&Tok::LParen)?;
+                    let by = if matches!(self.peek(), Some(Tok::Str(_))) {
+                        GroupBy::Key(self.str_arg()?)
+                    } else if self.peek() == Some(&Tok::RParen) {
+                        GroupBy::Element
+                    } else if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("count"))
+                    {
+                        // by(count()) — a reducing traversal.
+                        self.ident()?;
+                        self.expect(&Tok::LParen)?;
+                        self.expect(&Tok::RParen)?;
+                        GroupBy::Count
+                    } else {
+                        return Err(
+                            "group().by(<nested traversal>) is only supported as by(count()) so far"
+                                .into(),
+                        );
+                    };
+                    self.expect(&Tok::RParen)?;
+                    bys.push(by);
+                }
+                // Key-by (first modulator): a property, or the element itself.
+                let key_expr = match bys.first() {
+                    Some(GroupBy::Key(k)) => (
+                        k.clone(),
+                        Expr::Prop {
+                            slot: elem_slot,
+                            key: k.clone(),
+                        },
+                    ),
+                    // by(count()) as a key makes no sense; treat absent/element/count
+                    // key as grouping by the element.
+                    _ => ("key".to_string(), Expr::Slot(elem_slot)),
+                };
+                // Value-by (second modulator): count() reduces; a property or the
+                // element folds (collect, keeping nulls = Gremlin fold).
+                let value_agg = match bys.get(1) {
+                    Some(GroupBy::Count) => Agg {
+                        func: AggFn::Count,
+                        arg: None,
+                        distinct: false,
+                        name: "value".into(),
+                    },
+                    Some(GroupBy::Key(k)) => Agg {
+                        func: AggFn::Collect,
+                        arg: Some(Expr::Prop {
+                            slot: elem_slot,
+                            key: k.clone(),
+                        }),
+                        distinct: false,
+                        name: "value".into(),
+                    },
+                    // Default (no second by) or bare by(): fold the group's elements.
+                    _ => Agg {
+                        func: AggFn::Collect,
+                        arg: Some(Expr::Slot(elem_slot)),
+                        distinct: false,
+                        name: "value".into(),
+                    },
+                };
+                let p = plan.aggregate(vec![key_expr], vec![value_agg]);
+                self.current = 0;
+                self.slots = 2; // group key + value
+                p
+            }
             other => return Err(format!("unsupported Gremlin step `{other}`")),
         };
         Ok(plan)
@@ -1214,6 +1303,54 @@ mod tests {
             gone.is_empty(),
             "missing id must contribute nothing: {gone:?}"
         );
+    }
+
+    /// `group().by(key).by(value)` is a grouped aggregation. Core shapes it as one
+    /// {key: value} map; the engine represents a grouped result as ROWS of (key,
+    /// value), consistent with `groupCount()`. `by(count())` reduces to a count (so
+    /// `group().by('k').by(count())` == `groupCount().by('k')`); a property/element
+    /// value folds the group (collect, Gremlin fold), elements folded as their ids.
+    #[test]
+    fn gremlin_group_by_key_and_value() {
+        let store = social();
+        // by(count()) reduces — identical to groupCount().by('k').
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').out('KNOWS').group().by('name').by(count())",
+                &store,
+            )),
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').out('KNOWS').groupCount().by('name')",
+                &store,
+            )),
+        );
+        // Default value-by folds the group's ELEMENTS (as ids). Names are unique here,
+        // so each group holds one element: alice(0), bob(1), carol(2).
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').group().by('name')",
+                &store
+            )),
+            vec![
+                "Str(\"alice\");List([Num(0.0)]);",
+                "Str(\"bob\");List([Num(1.0)]);",
+                "Str(\"carol\");List([Num(2.0)]);",
+            ],
+        );
+        // A property value-by folds that property per group.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').group().by('name').by('age')",
+                &store,
+            )),
+            vec![
+                "Str(\"alice\");List([Num(30.0)]);",
+                "Str(\"bob\");List([Num(25.0)]);",
+                "Str(\"carol\");List([Num(40.0)]);",
+            ],
+        );
+        // Non-count reducing traversals are deferred, not mis-parsed.
+        assert!(super::parse("g.V().group().by('name').by(out().count())").is_err());
     }
 
     /// `project('a','b').by(x).by(y)` builds one insertion-ordered Map per traverser:
