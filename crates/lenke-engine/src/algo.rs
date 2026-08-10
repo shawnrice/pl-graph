@@ -3,10 +3,12 @@
 //! output is DETERMINISTIC and reproducible (the same rule lenke-core follows so
 //! the two engines agree). Deleted (tombstoned) nodes are skipped.
 //!
-//! Five algorithms: the non-iterative trio — degree, weakly connected components
-//! (union-by-min), and BFS distances — plus the iterative pair, PageRank and label
-//! propagation, whose f64 summation / tiebreak order is pinned (node-id and
-//! in-adjacency order) so their results are reproducible and match lenke-core.
+//! The catalog: the non-iterative set — degree, weakly/strongly connected
+//! components (union-by-min / Tarjan), on-cycle, BFS distances, single-source
+//! shortest paths, closeness and betweenness centrality — plus the iterative set,
+//! PageRank (global and personalized) and label propagation, whose f64 summation /
+//! tiebreak order is pinned (node-id and in-adjacency order, reciprocal multiply)
+//! so their results are reproducible and match lenke-core bit-for-bit.
 
 use crate::ir::Dir;
 use crate::store::Store;
@@ -212,6 +214,105 @@ pub fn pagerank(
         }
         pr = next;
     }
+    live.into_iter().map(|v| (v, pr[v as usize])).collect()
+}
+
+/// Personalized PageRank (random-walk-with-restart): like PageRank, but the restart
+/// mass teleports to a PERSONALIZATION vector `p` — uniform `1/k` over the `k`
+/// distinct resolved `source_ext_ids` seeds (unknown/duplicate ids dropped), or
+/// `1/N` when no seed resolves (degenerating to global PageRank). Ported from core's
+/// `personalized_pagerank`: `teleport = (1-d) + d·dangling`; `pr'[v] = teleport·p[v]
+/// + d·Σ_{u→v} pr[u]·recip[u]` with `recip[u] = 1/outdeg[u]` a PRECOMPUTED reciprocal
+/// that is MULTIPLIED (matching core's `inc_fac`), the dangling sum taken in
+/// ascending-id order and the incoming pull in in-adjacency (edge-insertion) order —
+/// the same fixed orders core uses, so it is byte-identical. `pr` starts at `p`.
+/// Returns `(node, score)` in ascending-id order.
+#[must_use]
+pub fn personalized_pagerank(
+    store: &Store,
+    edge_label: Option<&str>,
+    source_ext_ids: &[String],
+    damping: f64,
+    iterations: u32,
+) -> Vec<(u32, f64)> {
+    let live = store.all_nodes();
+    if live.is_empty() {
+        return Vec::new();
+    }
+    let nf = live.len() as f64;
+    let slots = store.node_count();
+    let want_opt = want_etype(store, edge_label); // Option<Option<u32>>; None = no edges
+
+    // Out-degree of the wanted type, and its precomputed reciprocal (multiplied, not
+    // divided, to match core's `inc_fac` bit-for-bit). A dangling node's recip is 0.
+    let mut outdeg = vec![0u32; slots];
+    if let Some(want) = want_opt {
+        for &u in &live {
+            let mut c = 0u32;
+            for_each_nbr(store, u, Dir::Out, want, |_| c += 1);
+            outdeg[u as usize] = c;
+        }
+    }
+    let recip: Vec<f64> = outdeg
+        .iter()
+        .map(|&d| if d > 0 { 1.0 / f64::from(d) } else { 0.0 })
+        .collect();
+
+    // Resolve seeds → dense slots, dedup keeping first, drop unknowns.
+    let mut seed_slots: Vec<usize> = Vec::new();
+    let mut seen = vec![false; slots];
+    for id in source_ext_ids {
+        if let Some(s) = store.node_by_ext(id) {
+            let su = s as usize;
+            if !seen[su] {
+                seen[su] = true;
+                seed_slots.push(su);
+            }
+        }
+    }
+
+    // Personalization vector: uniform over the seeds, or global `1/N` if none resolve.
+    let mut p = vec![0.0f64; slots];
+    if seed_slots.is_empty() {
+        for &v in &live {
+            p[v as usize] = 1.0 / nf;
+        }
+    } else {
+        let share = 1.0 / seed_slots.len() as f64;
+        for &s in &seed_slots {
+            p[s] = share;
+        }
+    }
+    let mut pr = p.clone();
+
+    for _ in 0..iterations {
+        // Dangling mass, summed in ascending-id order (pinned f64 order).
+        let mut dangling = 0.0;
+        for &u in &live {
+            if outdeg[u as usize] == 0 {
+                dangling += pr[u as usize];
+            }
+        }
+        // Restart mass redistributed per `p` (not uniformly) — `teleport * p[v]`.
+        let teleport = (1.0 - damping) + damping * dangling;
+        let mut next = vec![0.0f64; slots];
+        if let Some(want) = want_opt {
+            for &v in &live {
+                let mut sum = 0.0;
+                for_each_nbr(store, v, Dir::In, want, |u| {
+                    sum += pr[u as usize] * recip[u as usize];
+                });
+                next[v as usize] = teleport * p[v as usize] + damping * sum;
+            }
+        } else {
+            // No edges: every pull sum is 0, so `pr` relaxes straight back to `p`.
+            for &v in &live {
+                next[v as usize] = teleport * p[v as usize];
+            }
+        }
+        pr = next;
+    }
+
     live.into_iter().map(|v| (v, pr[v as usize])).collect()
 }
 
@@ -522,6 +623,7 @@ pub fn procedure_result_col(name: &str) -> Option<&'static str> {
         "closeness" => "centrality",
         "betweenness" => "centrality",
         "shortest_path" => "distance",
+        "personalized_pagerank" => "score",
         _ => return None,
     })
 }
@@ -585,6 +687,31 @@ pub fn run_procedure(
         "on_cycle" => on_cycle(store, str_of("edgeType")),
         "betweenness" => betweenness(store, str_of("edgeType")),
         "shortest_path" => shortest_path(store, str_of("source"), dir(), str_of("edgeType")),
+        "personalized_pagerank" => {
+            let d = num_of("dampingFactor").unwrap_or(DEFAULT_DAMPING);
+            let iters = num_of("iterations").map_or(DEFAULT_PAGERANK_ITERATIONS, |n| n as u32);
+            // `sourceNodes` is a list of external-id strings (non-string items ignored).
+            let seeds: Vec<String> = config
+                .iter()
+                .find(|(ck, _)| ck == "sourceNodes")
+                .and_then(|(_, v)| {
+                    if let Value::List(items) = v {
+                        Some(
+                            items
+                                .iter()
+                                .filter_map(|it| match it {
+                                    Value::Str(s) => Some(s.to_string()),
+                                    _ => None,
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+            personalized_pagerank(store, str_of("edgeType"), &seeds, d, iters)
+        }
         _ => return None,
     })
 }
@@ -727,6 +854,49 @@ mod tests {
             betweenness(&st, Some("NOPE")),
             vec![(0, 0.0), (1, 0.0), (2, 0.0), (3, 0.0)]
         );
+    }
+
+    #[test]
+    fn personalized_pagerank_restarts_at_the_seed() {
+        let st = triangle_plus_isolated();
+        let ppr = |seeds: &[&str]| {
+            let owned: Vec<String> = seeds.iter().map(|s| (*s).to_string()).collect();
+            personalized_pagerank(
+                &st,
+                None,
+                &owned,
+                DEFAULT_DAMPING,
+                DEFAULT_PAGERANK_ITERATIONS,
+            )
+        };
+        // Seeding node 0 concentrates mass at 0, tapering around the directed cycle;
+        // the unreachable isolated node gets none. (Exact values pin the f64 result.)
+        let seed0 = ppr(&["0"]);
+        assert_eq!(
+            seed0,
+            vec![
+                (0, 0.375_920_077_192_677_5),
+                (1, 0.319_532_065_613_775_9),
+                (2, 0.304_547_857_193_546_66),
+                (3, 0.0),
+            ]
+        );
+        // Deterministic.
+        assert_eq!(ppr(&["0"]), seed0);
+        // Mass is conserved (a proper distribution over the reachable component).
+        let mass: f64 = seed0.iter().map(|&(_, x)| x).sum();
+        assert!((mass - 1.0).abs() < 1e-12, "mass {mass} should be ~1");
+        // The seed is the strict maximum.
+        assert!(seed0[0].1 > seed0[1].1 && seed0[0].1 > seed0[2].1);
+        // Seeding node 1 is the rotational image (triangle symmetry).
+        let seed1 = ppr(&["1"]);
+        assert_eq!(seed1[1].1, seed0[0].1);
+        assert_eq!(seed1[2].1, seed0[1].1);
+        // With no resolvable seed it degenerates to global PageRank — so an unknown
+        // id equals the empty-seed run, and there the isolated node gets teleport mass.
+        let none = ppr(&[]);
+        assert_eq!(ppr(&["999"]), none);
+        assert!(none[3].1 > 0.0);
     }
 
     #[test]

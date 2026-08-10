@@ -874,8 +874,24 @@ impl Parser {
         Ok(out)
     }
 
-    // A literal property value: number, string, or the keyword true/false/null.
+    // A literal property value: number, string, the keyword true/false/null, or a
+    // `[...]` list of literal values (used e.g. by `CALL personalized_pagerank(
+    // {sourceNodes: ['a', 'b']})`; a list is a first-class stored property value).
     fn literal_value(&mut self) -> Result<Value, String> {
+        if self.peek() == Some(&Tok::LBracket) {
+            self.bump();
+            let mut items = Vec::new();
+            if !self.eat(&Tok::RBracket) {
+                loop {
+                    items.push(self.literal_value()?);
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&Tok::RBracket)?;
+            }
+            return Ok(Value::List(items));
+        }
         match self.bump() {
             Some(Tok::Num(n)) => Ok(Value::Num(n)),
             Some(Tok::Str(s)) => Ok(Value::Str(s.into())),
@@ -3290,6 +3306,30 @@ mod tests {
             &store,
         );
         assert_eq!(out.names, vec!["node".to_string(), "distance".to_string()]);
+    }
+
+    #[test]
+    fn call_personalized_pagerank_yields_score() {
+        let store = triangle_store();
+        let rows_of = |q: &str| -> Vec<(f64, f64)> {
+            run(&super::parse(q).unwrap(), &store)
+                .rows
+                .iter()
+                .map(|r| (node_id(&r[0]), num(&r[1])))
+                .collect()
+        };
+        // Seeding node "0" via the sourceNodes list makes 0 the strict max and leaves
+        // the unreachable isolated node at 0; the yield column is `score`.
+        let seeded = rows_of("CALL personalized_pagerank({sourceNodes: ['0']}) YIELD node, score");
+        assert_eq!(seeded.len(), 4);
+        assert!(seeded[0].1 > seeded[1].1 && seeded[0].1 > seeded[2].1);
+        assert_eq!(seeded[3], (3.0, 0.0));
+        // Default columns are [node, score].
+        let out = run(
+            &super::parse("CALL personalized_pagerank({sourceNodes: ['0']})").unwrap(),
+            &store,
+        );
+        assert_eq!(out.names, vec!["node".to_string(), "score".to_string()]);
     }
 
     #[test]
