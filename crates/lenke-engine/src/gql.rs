@@ -111,7 +111,21 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         slots: 0,
         path_vars: HashSet::new(),
     };
-    let plan = p.query()?;
+    let mut plan = p.query()?;
+    // `<query> UNION [ALL] <query> …`: each arm is an independent query with a fresh
+    // binding scope. Left-associative.
+    while p.eat_kw("UNION") {
+        let all = p.eat_kw("ALL");
+        p.scope = HashMap::new();
+        p.slots = 0;
+        p.path_vars = HashSet::new();
+        let right = p.query()?;
+        plan = Plan::Union {
+            left: Box::new(plan),
+            right: Box::new(right),
+            all,
+        };
+    }
     if p.pos != p.toks.len() {
         return Err(format!("unexpected trailing input at token {}", p.pos));
     }
@@ -3907,6 +3921,49 @@ mod tests {
             &store,
         );
         assert!(matches!(col(&neg, 0, "x"), Value::Str(s) if &*s == "alice"));
+    }
+
+    /// `UNION` concatenates two query arms' rows and dedups; `UNION ALL` keeps dups;
+    /// the result's column names come from the LEFT arm.
+    #[test]
+    fn union_and_union_all() {
+        let mut b = Builder::default();
+        b.node(&["P"], &[("v", s("a"))]);
+        b.node(&["P"], &[("v", s("a"))]); // duplicate value
+        b.node(&["Q"], &[("v", s("b"))]);
+        let store = b.build();
+        let vals = |q: &str| -> Vec<String> {
+            let mut v: Vec<String> = run(&super::parse(q).unwrap(), &store)
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Value::Str(s) => s.to_string(),
+                    o => format!("{o:?}"),
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        // UNION dedups: {a, a} ∪ {b} → [a, b].
+        assert_eq!(
+            vals("MATCH (p:P) RETURN p.v AS x UNION MATCH (q:Q) RETURN q.v AS x"),
+            vec!["a", "b"]
+        );
+        // UNION ALL keeps every row: a, a, b.
+        assert_eq!(
+            vals("MATCH (p:P) RETURN p.v AS x UNION ALL MATCH (q:Q) RETURN q.v AS x"),
+            vec!["a", "a", "b"]
+        );
+        // Column names come from the LEFT arm even if the right differs.
+        assert_eq!(
+            run(
+                &super::parse("MATCH (p:P) RETURN p.v AS x UNION MATCH (q:Q) RETURN q.v AS y")
+                    .unwrap(),
+                &store
+            )
+            .names,
+            vec!["x".to_string()]
+        );
     }
 
     /// `collect_list(x)` gathers a group's values into a list in row order, SKIPPING

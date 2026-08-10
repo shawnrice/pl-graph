@@ -627,6 +627,8 @@ fn output_names(plan: &Plan) -> Option<Vec<String>> {
         Plan::Distinct { input }
         | Plan::OrderPage { input, .. }
         | Plan::SortLocal { input, .. } => output_names(input),
+        // UNION names come from the LEFT arm (core's rule).
+        Plan::Union { left, .. } => output_names(left),
         _ => None,
     }
 }
@@ -700,7 +702,9 @@ fn needs_lineage(plan: &Plan) -> bool {
         Plan::OrderPage { input, keys, .. } => {
             keys.iter().any(|k| reads_path(&k.expr)) || needs_lineage(input)
         }
-        Plan::Join { left, right, .. } => needs_lineage(left) || needs_lineage(right),
+        Plan::Join { left, right, .. } | Plan::Union { left, right, .. } => {
+            needs_lineage(left) || needs_lineage(right)
+        }
         // The subquery yields append columns; whether the OUTER plan needs a path
         // depends on its input (a path read inside the subquery is not surfaced).
         Plan::CallInline { input, yields, .. } => {
@@ -907,6 +911,42 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             let batch = pull(input, store, track)?;
             let cols = eval_all(items.iter().map(|(_, e)| e), store, &batch)?;
             Batch::of(cols)
+        }
+        Plan::Union { left, right, all } => {
+            // Run both arms, materialize each row (render_cell → nodes/edges as maps),
+            // pad to the LEFT arm's width, concatenate. UNION dedups the combined rows
+            // by the grouping key; UNION ALL keeps every row. Column names come from
+            // the left arm (see output_names).
+            let bl = pull(left, store, track)?;
+            let br = pull(right, store, track)?;
+            let ncols = bl.slots.len();
+            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(bl.rows() + br.rows());
+            for b in [&bl, &br] {
+                for i in 0..b.rows() {
+                    let mut row: Vec<Value> =
+                        b.slots.iter().map(|c| render_cell(c, i, store)).collect();
+                    row.resize(ncols, Value::Null); // pad a short arm to the left width
+                    rows.push(row);
+                }
+            }
+            if !*all {
+                let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
+                let mut buf = Vec::new();
+                rows.retain(|row| {
+                    buf.clear();
+                    for v in row {
+                        value::group_key_into(v, &mut buf);
+                    }
+                    seen.insert(buf.clone())
+                });
+            }
+            let mut cols: Vec<Vec<Value>> = vec![Vec::with_capacity(rows.len()); ncols.max(1)];
+            for row in rows {
+                for (j, v) in row.into_iter().enumerate() {
+                    cols[j].push(v);
+                }
+            }
+            Batch::of(cols.into_iter().map(Col::Gen).collect())
         }
         Plan::Distinct { input } => {
             // Fused `DISTINCT n.k` over a bare Scan: read the storage column and

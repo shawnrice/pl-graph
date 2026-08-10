@@ -358,6 +358,16 @@ pub enum Plan {
     /// two NaNs / two -0.0s collapse — the grouping notion, not predicate
     /// equality. Placed above a Project, it is `RETURN DISTINCT …`.
     Distinct { input: Box<Plan> },
+    /// `<query> UNION [ALL] <query>`: run both arms and concatenate their rows. The
+    /// result's column names come from the LEFT arm (core's rule — a name mismatch
+    /// is not an error). `UNION` (all=false) deduplicates the combined rows by the
+    /// grouping key; `UNION ALL` keeps every row. A shorter arm's rows are padded
+    /// with NULLs to the left arm's width.
+    Union {
+        left: Box<Plan>,
+        right: Box<Plan>,
+        all: bool,
+    },
     /// Sort WITHIN each row's slot-0 value, in place — Gremlin `order(local)`.
     /// A `List` cell becomes its elements sorted by the value contract's
     /// `cmp_total`; a `Map` cell becomes its pairs sorted by VALUE (TinkerPop's

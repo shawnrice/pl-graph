@@ -267,6 +267,7 @@ fn main() {
         ("edge_element", p_edge_element),
         ("order_expr", p_order_expr),
         ("collect", p_collect),
+        ("union", p_union),
         ("edge_props", p_edge_props),
         ("string_literal_eq", p_string_lit),
         ("str_infix", p_str_infix),
@@ -386,6 +387,21 @@ fn p_return_star(rng: &mut Rng) -> (String, bool) {
     // order, compared as a multiset. The two-hop pattern binds an edge var `r`, so
     // this now exercises edge-element rendering too.
     (format!("{} RETURN *", pattern(var(rng))), false)
+}
+fn p_union(rng: &mut Rng) -> (String, bool) {
+    // Two RETURN arms over the same label. UNION dedups the combined rows, UNION ALL
+    // keeps them; names come from the left arm. Compared as a multiset.
+    let all = if rng.chance(1, 2) { " ALL" } else { "" };
+    let (e1, e2) = *rng.pick(&[
+        ("n.a", "m.a"),
+        ("n.b", "m.b"),
+        ("n.a", "m.b"),
+        ("n.id", "m.id"),
+    ]);
+    (
+        format!("MATCH (n:N) RETURN {e1} AS a0 UNION{all} MATCH (m:N) RETURN {e2} AS a0"),
+        false,
+    )
 }
 fn p_collect(rng: &mut Rng) -> (String, bool) {
     // collect_list — grouped or scalar; nulls dropped, list in row order. The list

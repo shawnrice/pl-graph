@@ -349,6 +349,18 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 cl || cr,
             )
         }
+        Plan::Union { left, right, all } => {
+            let (l, cl) = rewrite(*left, idx);
+            let (r, cr) = rewrite(*right, idx);
+            (
+                Plan::Union {
+                    left: Box::new(l),
+                    right: Box::new(r),
+                    all,
+                },
+                cl || cr,
+            )
+        }
         // Optimize the outer `input`, but leave the correlated `body` alone: it is
         // rooted at `Plan::Row` and evaluated by `pull_body`, which expects the raw
         // Expand/Filter chain — a seed rule would rewrite it into an uneval-able
@@ -817,6 +829,8 @@ fn width(plan: &Plan) -> usize {
         Plan::Project { items, .. } => items.len(),
         Plan::Aggregate { keys, aggs, .. } => keys.len() + aggs.len(),
         Plan::Join { left, right, .. } => width(left) + width(right),
+        // UNION's result columns are the LEFT arm's.
+        Plan::Union { left, .. } => width(left),
         // Outer slots kept, plus one column per yielded subquery expression.
         Plan::CallInline {
             outer_width,
@@ -1186,7 +1200,7 @@ mod tests {
             | Plan::CallInline { input, .. }
             | Plan::Distinct { input }
             | Plan::SortLocal { input, .. } => plan_contains_filter(input),
-            Plan::Join { left, right, .. } => {
+            Plan::Join { left, right, .. } | Plan::Union { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)
             }
             Plan::Scan { .. }
