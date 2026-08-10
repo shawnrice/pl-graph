@@ -662,9 +662,14 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 Some(c) if keys.is_empty() => pull_capped(input, store, track, c)?,
                 _ => None,
             };
-            match capped {
-                Some(b) => order_page(&b, store, keys, *skip, *limit)?,
-                None => order_page(&pull(input, store, track)?, store, keys, *skip, *limit)?,
+            if let Some(b) = capped {
+                order_page(&b, store, keys, *skip, *limit)?
+            } else if let Some(b) = try_late_materialize(input, keys, *skip, *limit, store, track)?
+            {
+                // Sorted top-K over a projection: project only the surviving rows.
+                b
+            } else {
+                order_page(&pull(input, store, track)?, store, keys, *skip, *limit)?
             }
         }
         Plan::Project { input, items } => {
@@ -920,11 +925,116 @@ fn row_cmp(
     Ordering::Equal
 }
 
+/// Order `idx` (initially `0..idx.len()`) by `keys` so that `idx[..end]` are the
+/// `end` rows the sort window needs, correctly ordered. When `end < n` only the
+/// top-`end` are selected (partition + partial sort — O(n) + O(end log end)); the
+/// full case keeps a stable sort (ties keep arrival order). A single numeric key
+/// compares raw f64 via `cmp_num_total` (no per-comparison `value_at` boxing).
+fn sort_idx(idx: &mut [usize], key_cols: &[Col], keys: &[crate::ir::SortKey], end: usize) {
+    let n = idx.len();
+    if keys.is_empty() {
+        return;
+    }
+    if let [Col::Num(vals)] = key_cols {
+        // Col::Num carries no nulls, so null placement is moot; an arrival-index
+        // tiebreak makes the order total (deterministic, == the stable sort on ties).
+        let desc = keys[0].descending;
+        let cmp = |&a: &usize, &b: &usize| {
+            let o = if desc {
+                value::cmp_num_total(vals[b], vals[a])
+            } else {
+                value::cmp_num_total(vals[a], vals[b])
+            };
+            o.then(a.cmp(&b))
+        };
+        if end < n {
+            idx.select_nth_unstable_by(end - 1, cmp);
+            idx[..end].sort_unstable_by(cmp);
+        } else {
+            idx.sort_unstable_by(cmp);
+        }
+    } else if end < n {
+        let total = |&a: &usize, &b: &usize| row_cmp(key_cols, keys, a, b).then(a.cmp(&b));
+        idx.select_nth_unstable_by(end - 1, total);
+        idx[..end].sort_unstable_by(total);
+    } else {
+        idx.sort_by(|&a, &b| row_cmp(key_cols, keys, a, b));
+    }
+}
+
+/// LATE MATERIALIZATION for a sorted `LIMIT` over a `Project`: when the window is
+/// a strict PREFIX of the rows (`skip+limit < n`) and every sort key is an output
+/// alias (`Slot(i)` into the projection), evaluate ONLY the sort-key expressions
+/// over the projection's input to find the top-K rows, then project the FULL item
+/// list for just those K survivors — so the non-key columns (a `name` string per
+/// row, say) are built for K rows, not all N. `Ok(None)` when the shape doesn't
+/// fit (no limit, input not a Project, a key that isn't a projected alias, or the
+/// window is the whole set so there is nothing to save).
+fn try_late_materialize(
+    input: &Plan,
+    keys: &[crate::ir::SortKey],
+    skip: Option<usize>,
+    limit: Option<usize>,
+    store: &Store,
+    track: bool,
+) -> Result<Option<Batch>, String> {
+    let Some(limit) = limit else { return Ok(None) };
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    let Plan::Project {
+        input: pinput,
+        items,
+    } = input
+    else {
+        return Ok(None);
+    };
+    // Every sort key must be an output alias `Slot(i)` — map it to that item's
+    // expression, so it can be evaluated over the projection's INPUT.
+    let key_exprs: Option<Vec<&Expr>> = keys
+        .iter()
+        .map(|k| match &k.expr {
+            Expr::Slot(i) => items.get(*i).map(|(_, e)| e),
+            _ => None,
+        })
+        .collect();
+    let Some(key_exprs) = key_exprs else {
+        return Ok(None);
+    };
+
+    let base = pull(pinput, store, track)?;
+    let n = base.rows();
+    let start = skip.unwrap_or(0).min(n);
+    let end = start.saturating_add(limit).min(n);
+    if end >= n {
+        // The window is the whole set — a full projection is unavoidable; nothing
+        // to late-materialize.
+        return Ok(None);
+    }
+    if end <= start {
+        return Ok(Some(Batch::of(
+            items.iter().map(|_| Col::Nodes(vec![])).collect(),
+        )));
+    }
+
+    // Sort by the key columns evaluated over the base, take the window's rows.
+    let key_cols: Vec<Col> = key_exprs
+        .iter()
+        .map(|e| eval(e, store, &base))
+        .collect::<Result<_, _>>()?;
+    let mut idx: Vec<usize> = (0..n).collect();
+    sort_idx(&mut idx, &key_cols, keys, end);
+    let sub = base.gather(&idx[start..end]);
+
+    // NOW project every item, but only over the K surviving rows.
+    let cols = eval_all(items.iter().map(|(_, e)| e), store, &sub)?;
+    let mut out = Batch::of(cols);
+    out.lineage = sub.lineage;
+    Ok(Some(out))
+}
+
 /// Sort the batch by `keys`, then keep the window `[skip, skip+limit)`. Reorders
-/// every slot together, so bound variables stay row-aligned. When a `limit` makes
-/// the window a small prefix of the rows, only the TOP-K are selected (partition +
-/// partial sort — O(n) + O(k log k)) instead of a full O(n log n) sort; the full
-/// case keeps the stable sort (ties keep arrival order).
+/// every slot together, so bound variables stay row-aligned.
 fn order_page(
     batch: &Batch,
     store: &Store,
@@ -941,38 +1051,7 @@ fn order_page(
     let mut idx: Vec<usize> = (0..n).collect();
     if !keys.is_empty() {
         let key_cols: Vec<Col> = eval_all(keys.iter().map(|k| &k.expr), store, batch)?;
-        // Typed fast path: a SINGLE numeric sort key compares raw f64 via
-        // `cmp_num_total` (NaN-greatest, -0 == 0) — no `value_at` boxing per
-        // comparison. `Col::Num` carries no nulls, so null placement is moot; an
-        // arrival-index tiebreak keeps the order total (deterministic, and equal to
-        // the stable full sort on ties).
-        if let [Col::Num(vals)] = key_cols.as_slice() {
-            let desc = keys[0].descending;
-            let cmp = |&a: &usize, &b: &usize| {
-                let o = if desc {
-                    value::cmp_num_total(vals[b], vals[a])
-                } else {
-                    value::cmp_num_total(vals[a], vals[b])
-                };
-                o.then(a.cmp(&b))
-            };
-            if end < n {
-                idx.select_nth_unstable_by(end - 1, cmp);
-                idx[..end].sort_unstable_by(cmp);
-            } else {
-                idx.sort_unstable_by(cmp);
-            }
-        } else if end < n {
-            // Top-K (general key): partition the `end` smallest, then sort them. An
-            // arrival-index tiebreak makes the order TOTAL, so the prefix matches a
-            // full stable sort's first `end` rows exactly.
-            let total = |&a: &usize, &b: &usize| row_cmp(&key_cols, keys, a, b).then(a.cmp(&b));
-            idx.select_nth_unstable_by(end - 1, total);
-            idx[..end].sort_unstable_by(total);
-        } else {
-            // Full sort (general key): stable, so ties keep arrival order.
-            idx.sort_by(|&a, &b| row_cmp(&key_cols, keys, a, b));
-        }
+        sort_idx(&mut idx, &key_cols, keys, end);
     }
     Ok(batch.gather(&idx[start..end]))
 }
@@ -4633,6 +4712,35 @@ mod tests {
         assert_eq!(
             list("intersection([1, 2, 2, 3], [2, 3, 4])"),
             dbg(&[n(2.0), n(3.0)])
+        );
+    }
+
+    /// Late materialization (sorted top-K over a Project) returns the SAME rows as
+    /// the eager path — the non-key column is projected only for the survivors.
+    #[test]
+    fn late_materialize_top_k_matches_eager() {
+        let mut b = Builder::default();
+        for i in 0..50u32 {
+            b.node(
+                &["P"],
+                &[("age", n(f64::from(i % 10))), ("name", s(&format!("p{i}")))],
+            );
+        }
+        let store = b.build();
+        // Top-3 by age DESC, then name — a non-key column (name) is projected.
+        let q = "MATCH (p:P) RETURN p.name AS name, p.age AS age ORDER BY age DESC, name LIMIT 3";
+        let got = run(&crate::gql::parse(q).unwrap(), &store);
+        // Highest ages are 9 (p9, p19, p29, p39, p49) → name-sorted first three.
+        assert_eq!(names_of(&got, 0), vec!["p19", "p29", "p39"]);
+        assert!(got
+            .rows
+            .iter()
+            .all(|r| matches!(r[1], Value::Num(x) if x == 9.0)));
+        // With SKIP: rows 3..6 of the same order.
+        let q2 = "MATCH (p:P) RETURN p.name AS name, p.age AS age ORDER BY age DESC, name SKIP 3 LIMIT 2";
+        assert_eq!(
+            names_of(&run(&crate::gql::parse(q2).unwrap(), &store), 0),
+            vec!["p49", "p9"]
         );
     }
 
