@@ -648,7 +648,22 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             keys,
             skip,
             limit,
-        } => order_page(&pull(input, store, track)?, store, keys, *skip, *limit)?,
+        } => {
+            // A keyless page (LIMIT/SKIP without ORDER BY) keeps the first
+            // `skip+limit` rows in scan order — so cap the input at that many rows
+            // instead of materializing the whole scan and slicing. Only safe for a
+            // row-preserving Scan/Seek/Project chain (a Filter/Expand would need
+            // MORE rows to still yield `limit`), which `pull_capped` recognizes.
+            let cap = limit.map(|l| skip.unwrap_or(0).saturating_add(l));
+            let capped = match cap {
+                Some(c) if keys.is_empty() => pull_capped(input, store, track, c)?,
+                _ => None,
+            };
+            match capped {
+                Some(b) => order_page(&b, store, keys, *skip, *limit)?,
+                None => order_page(&pull(input, store, track)?, store, keys, *skip, *limit)?,
+            }
+        }
         Plan::Project { input, items } => {
             // Project produces a batch whose slots ARE the projected columns, so
             // an operator above it (Distinct, OrderPage) works on the output
@@ -773,6 +788,77 @@ fn hash_join(lb: &Batch, rb: &Batch, on: &[(usize, usize)]) -> Batch {
     let mut slots: Vec<Col> = lb.slots.iter().map(|c| c.gather(&keep_l)).collect();
     slots.extend(rb.slots.iter().map(|c| c.gather(&keep_r)));
     Batch::of(slots)
+}
+
+/// Pull at most `cap` rows from a ROW-PRESERVING chain (Scan / IndexSeek /
+/// RangeSeek / Project over one), so a keyless `LIMIT` need not materialize the
+/// whole scan. `Ok(None)` when the input is not cap-safe (a Filter/Expand/Distinct
+/// changes the row count, so an input cap could under-produce) — the caller then
+/// does the full pull. Faults propagate as `Err`.
+fn pull_capped(
+    plan: &Plan,
+    store: &Store,
+    track: bool,
+    cap: usize,
+) -> Result<Option<Batch>, String> {
+    Ok(match plan {
+        Plan::Scan { label } => {
+            let ids: Vec<u32> = match label {
+                Some(l) => store
+                    .nodes_with_label(l)
+                    .iter()
+                    .copied()
+                    .take(cap)
+                    .collect(),
+                None => (0..store.node_count() as u32)
+                    .filter(|&i| store.is_alive(i))
+                    .take(cap)
+                    .collect(),
+            };
+            let mut b = Batch::single(Col::Nodes(ids.clone()));
+            if track {
+                b.lineage = Some(Lineage::seed(&ids));
+            }
+            Some(b)
+        }
+        Plan::IndexSeek { label, key, value } => {
+            let ids: Vec<u32> = index_seek_ids(store, label, key, value)
+                .into_iter()
+                .take(cap)
+                .collect();
+            let mut b = Batch::single(Col::Nodes(ids.clone()));
+            if track {
+                b.lineage = Some(Lineage::seed(&ids));
+            }
+            Some(b)
+        }
+        Plan::RangeSeek {
+            label,
+            key,
+            op,
+            value,
+        } => {
+            let ids: Vec<u32> = range_seek_ids(store, label, key, *op, value)
+                .into_iter()
+                .take(cap)
+                .collect();
+            let mut b = Batch::single(Col::Nodes(ids.clone()));
+            if track {
+                b.lineage = Some(Lineage::seed(&ids));
+            }
+            Some(b)
+        }
+        Plan::Project { input, items } => match pull_capped(input, store, track, cap)? {
+            Some(batch) => {
+                let cols = eval_all(items.iter().map(|(_, e)| e), store, &batch)?;
+                let mut out = Batch::of(cols);
+                out.lineage = batch.lineage;
+                Some(out)
+            }
+            None => None,
+        },
+        _ => None, // Filter/Expand/Aggregate/Distinct/… change the row count
+    })
 }
 
 /// Compare two rows by the sort keys only (`Equal` on a full tie). NULL placement
