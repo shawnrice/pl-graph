@@ -386,6 +386,11 @@ pub struct Store {
     /// next edge id to hand out — monotonic, so an out/in pair shares one id and
     /// ids stay unique across incremental writes.
     next_eid: u32,
+    /// edge type id per eid (indexed by eid; grows 1:1 with `next_eid`, never
+    /// shrinks — a deleted eid's entry lingers, safe since eids are never reused).
+    /// The reverse of an `Adj`'s `etype`, needed by `type(edge)` which has only an
+    /// eid in hand, not an adjacency entry.
+    edge_etype: Vec<u32>,
     /// tombstones, indexed by node id. A deleted node keeps its id slot (ids are
     /// dense and never reused) but is skipped by every scan and carries no edges
     /// or properties. `deleted.len() == node_count`.
@@ -589,6 +594,14 @@ impl Store {
             .map(|(name, _)| name.clone())
     }
 
+    /// The type name of edge `eid` (for `type(edge)`), or `None` if the eid is out
+    /// of range. Looks up the eid's interned etype then its name.
+    #[must_use]
+    pub fn edge_type_name(&self, eid: u32) -> Option<String> {
+        let etype = *self.edge_etype.get(eid as usize)?;
+        self.etype_name(etype)
+    }
+
     // --- Unique constraints ----------------------------------------------
     //
     // A unique constraint declares that at most one live node with `label` may
@@ -768,6 +781,12 @@ impl Store {
         let etype = *self.etype_ids.entry(label.to_string()).or_insert(next);
         let eid = self.next_eid;
         self.next_eid += 1;
+        debug_assert_eq!(
+            self.edge_etype.len() as u32,
+            eid,
+            "edge_etype indexed by eid"
+        );
+        self.edge_etype.push(etype);
         self.out_adj[from as usize].push(Adj {
             nbr: to,
             etype,
@@ -1809,8 +1828,10 @@ impl Builder {
         let mut out_adj = vec![Vec::new(); n];
         let mut in_adj = vec![Vec::new(); n];
         let edge_count = self.edges.len() as u32;
+        let mut edge_etypes: Vec<u32> = Vec::with_capacity(self.edges.len());
         for (eid, (from, to, etype)) in self.edges.into_iter().enumerate() {
             let eid = eid as u32;
+            edge_etypes.push(etype); // index == eid (edges laid down in order)
             out_adj[from as usize].push(Adj {
                 nbr: to,
                 etype,
@@ -1831,6 +1852,7 @@ impl Builder {
             in_adj,
             // Incremental edges continue the id sequence the build laid down.
             next_eid: edge_count,
+            edge_etype: edge_etypes,
             deleted: vec![false; n],
             undo: None,
             changes: None,

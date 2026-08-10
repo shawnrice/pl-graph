@@ -1646,7 +1646,11 @@ impl Parser {
             | "zoned_datetime" | "duration" | "to_integer" | "tointeger" | "to_float"
             | "tofloat" | "to_string" | "tostring" | "to_boolean" | "toboolean" | "char_length"
             | "character_length" | "byte_length" | "octet_length" | "reverse" | "tail" | "keys"
-            | "labels" | "type" | "property_names" => args.len() == 1,
+            | "labels" | "type" | "property_names" | "list_sort" => args.len() == 1,
+            // list algebra (2 args)
+            "append" | "list_contains" | "list_union" | "difference" | "intersection" => {
+                args.len() == 2
+            }
             // 1 or 2 args (bare form trims whitespace; a 2nd arg is the char set)
             "ltrim" | "rtrim" | "btrim" => args.len() == 1 || args.len() == 2,
             // 2 args

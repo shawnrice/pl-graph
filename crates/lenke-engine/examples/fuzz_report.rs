@@ -221,6 +221,8 @@ fn main() {
         ("string_fns", p_string_fns),
         ("numeric_fns", p_numeric_fns),
         ("list_element_fns", p_list_fns),
+        ("list_algebra_fns", p_list_algebra),
+        ("type_fn", p_type_fn),
         ("cast_fns", p_cast_fns),
         ("cross_type_cmp", p_cross_type),
         ("aggregates", p_agg),
@@ -474,6 +476,41 @@ fn p_list_fns(rng: &mut Rng) -> (String, bool) {
             "{} RETURN {v}.id AS a0, {call} AS a1 ORDER BY a0",
             pattern(v)
         ),
+        true,
+    )
+}
+fn p_list_algebra(rng: &mut Rng) -> (String, bool) {
+    // Random small-int list literals (a few with a repeat or a null) through the
+    // set/list-algebra functions.
+    let lst = |rng: &mut Rng| -> String {
+        let n = 1 + rng.below(4);
+        let items: Vec<String> = (0..n)
+            .map(|_| match rng.below(5) {
+                0 => "null".to_string(),
+                k => (k % 3).to_string(),
+            })
+            .collect();
+        format!("[{}]", items.join(", "))
+    };
+    let a = lst(rng);
+    let b = lst(rng);
+    let e = match rng.below(6) {
+        0 => format!("append({a}, 9)"),
+        1 => format!("list_contains({a}, 1)"),
+        2 => format!("list_sort({a})"),
+        3 => format!("list_union({a}, {b})"),
+        4 => format!("difference({a}, {b})"),
+        _ => format!("intersection({a}, {b})"),
+    };
+    (
+        format!("MATCH (n:N) RETURN n.id AS a0, {e} AS a1 ORDER BY a0"),
+        true,
+    )
+}
+fn p_type_fn(_rng: &mut Rng) -> (String, bool) {
+    // type(edge) over the 1-hop pattern.
+    (
+        "MATCH (n:N)-[r:R]->(m:N) RETURN n.id AS a0, type(r) AS a1 ORDER BY a0, a1".to_string(),
         true,
     )
 }

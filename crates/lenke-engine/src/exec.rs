@@ -2203,6 +2203,21 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             Col::Gen(out)
         }
         Expr::Call { name, args } => {
+            // `type(edge)` needs the store + the edge identity (an eid), so it is
+            // handled here (off the evaluated arg column), not in `call_scalar`.
+            if name == "type" {
+                let arg = eval(&args[0], store, batch)?;
+                let n = batch.rows();
+                let out: Vec<Value> = (0..n)
+                    .map(|i| match arg.value_at(i) {
+                        Value::Num(eid) if matches!(arg, Col::Edges(_)) => store
+                            .edge_type_name(eid as u32)
+                            .map_or(Value::Null, |t| Value::Str(t.into())),
+                        _ => Value::Null,
+                    })
+                    .collect();
+                return Ok(Col::Gen(out));
+            }
             // Element functions need the STORE and the element identity (a node/edge
             // slot), which the pure-value `call_scalar` cannot see — handle them
             // here off the evaluated argument column.
@@ -2563,6 +2578,37 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             Value::List(v) => Value::List(v.iter().skip(1).cloned().collect()),
             _ => Value::Null,
         },
+        // append(list, x) → the list with x appended.
+        "append" => match &args[0] {
+            Value::List(v) => {
+                let mut out = v.clone();
+                out.push(args[1].clone());
+                Value::List(out)
+            }
+            _ => Value::Null,
+        },
+        // list_contains(list, x) → 1.0 if any element equals x, else 0.0 (a NUMBER,
+        // not a bool — matching core; `null` matches `null` via `equals`).
+        "list_contains" => match &args[0] {
+            Value::List(v) => Value::Num(f64::from(v.iter().any(|e| value::equals(e, &args[1])))),
+            _ => Value::Null,
+        },
+        // list_sort → elements ordered by the value contract's total order.
+        "list_sort" => match &args[0] {
+            Value::List(v) => {
+                let mut out = v.clone();
+                out.sort_by(value::cmp_total);
+                Value::List(out)
+            }
+            _ => Value::Null,
+        },
+        // Set algebra over lists — all DEDUPED (by value equality), matching core.
+        // union: a's elements then b's, deduped. intersection: elements of a also
+        // in b, deduped. difference: elements of a not in b, deduped.
+        "list_union" | "difference" | "intersection" => match (&args[0], &args[1]) {
+            (Value::List(a), Value::List(b)) => Value::List(list_set_op(name, a, b)),
+            _ => Value::Null,
+        },
         // range(start, end[, step]) — INCLUSIVE of both ends; default step 1; a
         // zero step is NULL; a start past end with the wrong sign yields an empty
         // list (matches core).
@@ -2921,6 +2967,44 @@ fn to_boolean_fn(v: &Value) -> Value {
         }
         _ => Value::Null,
     }
+}
+
+/// Set algebra over two lists, all producing a DEDUPED result (by the value
+/// contract's `equals`, so `null` collapses with `null`): `list_union` = a then
+/// the b-elements not already present; `intersection` = a-elements also in b;
+/// `difference` = a-elements not in b. Order follows first appearance in `a`
+/// (then `b` for union). O(n·m) — lists are small.
+fn list_set_op(name: &str, a: &[Value], b: &[Value]) -> Vec<Value> {
+    let contains = |xs: &[Value], v: &Value| xs.iter().any(|x| value::equals(x, v));
+    let mut out: Vec<Value> = Vec::new();
+    let push_unique = |out: &mut Vec<Value>, v: &Value| {
+        if !contains(out, v) {
+            out.push(v.clone());
+        }
+    };
+    match name {
+        "intersection" => {
+            for v in a {
+                if contains(b, v) {
+                    push_unique(&mut out, v);
+                }
+            }
+        }
+        "difference" => {
+            for v in a {
+                if !contains(b, v) {
+                    push_unique(&mut out, v);
+                }
+            }
+        }
+        _ => {
+            // union: everything in a, then b's new elements, deduped throughout.
+            for v in a.iter().chain(b.iter()) {
+                push_unique(&mut out, v);
+            }
+        }
+    }
+    out
 }
 
 /// `ltrim`/`rtrim`/`btrim`: strip whitespace (1 arg) or a given char set (2 args)
@@ -3473,6 +3557,53 @@ mod tests {
         assert_eq!(
             ids("MATCH (n:N) WHERE n.a IN [] RETURN n.a AS a"),
             Vec::<String>::new()
+        );
+    }
+
+    /// `type(edge)` and the list-algebra functions (previously deferred) match
+    /// hand-computed values.
+    #[test]
+    fn type_and_list_algebra_functions() {
+        let mut b = Builder::default();
+        let x = b.node(&["N"], &[]);
+        let y = b.node(&["N"], &[]);
+        b.edge(x, y, "KNOWS");
+        let store = b.build();
+        // type(edge)
+        let t = run(
+            &crate::gql::parse("MATCH (a:N)-[r:KNOWS]->(b) RETURN type(r) AS t").unwrap(),
+            &store,
+        );
+        assert!(matches!(&t.rows[0][0], Value::Str(s) if &**s == "KNOWS"));
+
+        let list = |e: &str| -> Vec<String> {
+            let q = format!("MATCH (a:N) RETURN {e} AS v LIMIT 1");
+            match &run(&crate::gql::parse(&q).unwrap(), &store).rows[0][0] {
+                Value::List(v) => v.iter().map(|x| format!("{x:?}")).collect(),
+                o => panic!("{e} → {o:?}"),
+            }
+        };
+        let one = |e: &str| -> Value {
+            let q = format!("MATCH (a:N) RETURN {e} AS v LIMIT 1");
+            run(&crate::gql::parse(&q).unwrap(), &store).rows[0][0].clone()
+        };
+        let dbg = |xs: &[Value]| -> Vec<String> { xs.iter().map(|x| format!("{x:?}")).collect() };
+        assert_eq!(list("append([1, 2], 3)"), dbg(&[n(1.0), n(2.0), n(3.0)]));
+        assert!(matches!(one("list_contains([1, 2, 3], 2)"), Value::Num(x) if x == 1.0));
+        assert!(matches!(one("list_contains([1, 2], 5)"), Value::Num(x) if x == 0.0));
+        assert!(matches!(one("list_contains([1, null], null)"), Value::Num(x) if x == 1.0));
+        assert_eq!(list("list_sort([3, 1, 2])"), dbg(&[n(1.0), n(2.0), n(3.0)]));
+        assert_eq!(
+            list("list_union([1, 1, 2], [2, 3])"),
+            dbg(&[n(1.0), n(2.0), n(3.0)])
+        );
+        assert_eq!(
+            list("difference([1, 1, 2, 3], [2])"),
+            dbg(&[n(1.0), n(3.0)])
+        );
+        assert_eq!(
+            list("intersection([1, 2, 2, 3], [2, 3, 4])"),
+            dbg(&[n(2.0), n(3.0)])
         );
     }
 

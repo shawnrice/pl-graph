@@ -557,13 +557,13 @@ Two found during the census are already FIXED:
 Semantic bugs (wrong answers vs core) — fix for parity:
 
 - [x] K1. ORDER BY DESC null placement (DONE: SortKey gained `nulls_first`, set per language — GQL false/last, Gremlin true/first — and OrderPage places NULLs by it INDEPENDENT of direction. fuzzer order_desc_nulls 1269->0).
-  ORIG: ORDER BY DESC null placement (~1269/3000). Core keeps NULLS LAST in BOTH
+      ORIG: ORDER BY DESC null placement (~1269/3000). Core keeps NULLS LAST in BOTH
       directions (DESC reverses only the non-null order); the engine reverses the
       whole total order, so nulls come FIRST under DESC. Repro: `RETURN n.id AS a0,
-  n.a AS a1 ORDER BY a1 DESC, a0`. Fix in the OrderPage comparator (nulls last
+n.a AS a1 ORDER BY a1 DESC, a0`. Fix in the OrderPage comparator (nulls last
       regardless of direction).
 - [x] K2. Cross-type ordering comparison (DONE: new value::cmp_partial — 3VL, None for cross-type/NaN — routes the <,<=,>,>= operators and range_pass; cmp_total stays for sort/min/max/group. fuzzer cross_type_cmp 742->0).
-  ORIG: Cross-type ordering comparison (`<` `<=` `>` `>=`) between different
+      ORIG: Cross-type ordering comparison (`<` `<=` `>` `>=`) between different
       types (~742/3000). Core yields NULL (3VL unknown) → the row drops in a WHERE
       and renders NULL in a projection; the engine returns a Bool from the total
       order (`cmp_total`), so it KEEPS rows core drops. The comparison OPERATORS
@@ -573,34 +573,34 @@ Semantic bugs (wrong answers vs core) — fix for parity:
       throw vs null there; not exercised by the numeric/string fuzzer.) This
       supersedes the J1 note, which wrongly called it an accepted total-order fork.
 - [x] K3. Division / modulo by zero (DONE: throws "division by zero" via the fallible read path, matching core; overflow→Inf still nulled until K4).
-  ORIG: Division / modulo by zero (~338/3000). Core THROWS `DataException
-  "division by zero"`; the engine returns NULL. Match core (throw). Repro:
+      ORIG: Division / modulo by zero (~338/3000). Core THROWS `DataException
+"division by zero"`; the engine returns NULL. Match core (throw). Repro:
       `RETURN n.a / 0`. (Revisits the G3 audit, which wrongly recorded agreement.)
-- [x] K4. (DONE) new value::num_of gates IEEE arithmetic + numeric fns; NaN/Inf KEPT in results (arith, scalar_num_fn, log/power/mod), coerced to null only at JSON egress (to_ndjson). as_num stays finite-only for indices. fuzzer numeric_fns 262->0.  ORIG: Domain-invalid numeric fn results (~66/3000). `sqrt(-x)` (and, once
+- [x] K4. (DONE) new value::num_of gates IEEE arithmetic + numeric fns; NaN/Inf KEPT in results (arith, scalar_num_fn, log/power/mod), coerced to null only at JSON egress (to_ndjson). as_num stays finite-only for indices. fuzzer numeric_fns 262->0. ORIG: Domain-invalid numeric fn results (~66/3000). `sqrt(-x)` (and, once
       added, `ln`/`log` of ≤0) must return NaN like core; the engine's scalar
       numeric fns map non-finite → NULL. Decide: keep computed NaN to match core.
-- [x] K5. (DONE) size()/char_length on a STRING return length.  ORIG: `size()` / `length()` on a STRING must return its length (core does);
+- [x] K5. (DONE) size()/char_length on a STRING return length. ORIG: `size()` / `length()` on a STRING must return its length (core does);
       the engine returns NULL for a non-list. `size` on a list already agrees.
 
 Missing functions (engine parser rejects them; core has ~93, engine ~25) — add to
 the catalog (parser allow-list + eval). Grouped by family:
 
-- [x] K6. (DONE) cast fns to_integer/to_float/to_string/to_boolean (+aliases), NULL-on-failure, no bool→number coercion.  ORIG: Cast functions: `to_integer`/`tointeger`, `to_float`/`tofloat`,
+- [x] K6. (DONE) cast fns to_integer/to_float/to_string/to_boolean (+aliases), NULL-on-failure, no bool→number coercion. ORIG: Cast functions: `to_integer`/`tointeger`, `to_float`/`tofloat`,
       `to_string`/`tostring`, `to_boolean`/`toboolean` (engine has `CAST(x AS T)`
       only). (~3000/3000 for that probe.)
-- [x] K7. (DONE) `[NOT] IN [list literal]` desugars to an OR-chain of equals (3VL falls out); dynamic (non-literal) IN deferred.  ORIG: `IN` list-membership operator (`x IN [a, b, c]`) — absent entirely.
-- [x] K8. (DONE) nullif.  ORIG: `nullif(a, b)` (engine has `coalesce`).
-- [x] K9. (DONE) math+constants: e,pi,exp,ln,log(base),power,mod,sin/cos/tan(+asin/acos/atan,sinh/cosh/tanh,cot),degrees,radians. NaN/Inf results still nulled until K4.  ORIG: Math fns + constants: `exp`, `ln`, `log`, `sin`/`cos`/`tan`
+- [x] K7. (DONE) `[NOT] IN [list literal]` desugars to an OR-chain of equals (3VL falls out); dynamic (non-literal) IN deferred. ORIG: `IN` list-membership operator (`x IN [a, b, c]`) — absent entirely.
+- [x] K8. (DONE) nullif. ORIG: `nullif(a, b)` (engine has `coalesce`).
+- [x] K9. (DONE) math+constants: e,pi,exp,ln,log(base),power,mod,sin/cos/tan(+asin/acos/atan,sinh/cosh/tanh,cot),degrees,radians. NaN/Inf results still nulled until K4. ORIG: Math fns + constants: `exp`, `ln`, `log`, `sin`/`cos`/`tan`
       (+`asin`/`acos`/`atan`, `sinh`/`cosh`/`tanh`/`cot`), `power`, `mod`, `e`,
       `pi`, `degrees`, `radians`. Native match core's libm (the wasm-ulp caveat in
       `backend-parity-fuzz` is not in scope here — this is native-vs-native).
-- [x] K10. (DONE) ltrim/rtrim/btrim (1 or 2 args), reverse (poly string+list), left/right, split, char_length/byte_length etc.  ORIG: String fns: `ltrim`, `rtrim`, `btrim`, `reverse` (string), `left`,
+- [x] K10. (DONE) ltrim/rtrim/btrim (1 or 2 args), reverse (poly string+list), left/right, split, char_length/byte_length etc. ORIG: String fns: `ltrim`, `rtrim`, `btrim`, `reverse` (string), `left`,
       `right`, `split`, `char_length`/`character_length`, `byte_length`/
       `octet_length`.
-- [x] K11. (DONE) reverse(list)/tail/range(incl,step)/keys/labels/property_names; nodes/relationships already PathAccess. DEFERRED: type(edge) needs an eid->etype map; append/list_contains/list_sort/list_union/difference/intersection/element_id not yet.  ORIG: List fns: `reverse`(list), `tail`, `range(a, b[, step])`, `keys`,
+- [x] K11. (DONE) reverse(list)/tail/range(incl,step)/keys/labels/property_names; nodes/relationships already PathAccess. DONE (follow-up): type(edge) via a new eid->etype store map; append/list_contains/list_sort/list_union/difference/intersection. STILL OPEN: element_id (engine has no external ids — architectural), dynamic non-literal IN. ORIG: List fns: `reverse`(list), `tail`, `range(a, b[, step])`, `keys`,
       `append`, `list_contains`, `list_sort`, `list_union`, `difference`,
       `intersection`, `nodes`, `relationships`, `labels`, `type`, `property_names`.
-- [x] K12. (DONE) fuzz_report re-run after every fix — all 16 buckets clean (only arithmetic 'skip' = both throw on div-by-zero); differential_fuzz 32k queries x 8 seeds agree. Fuzzer widening to temporals/list-values still open.  ORIG: Re-run `fuzz_report` after each fix; the family's bucket should go to 0.
+- [x] K12. (DONE) fuzz_report re-run after every fix — all 16 buckets clean (only arithmetic 'skip' = both throw on div-by-zero); differential_fuzz 32k queries x 8 seeds agree. Fuzzer widening to temporals/list-values still open. ORIG: Re-run `fuzz_report` after each fix; the family's bucket should go to 0.
       Widen the fuzzer to temporals and list values once K6–K11 land.
 
 ## Standing
