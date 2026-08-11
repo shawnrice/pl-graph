@@ -2510,49 +2510,91 @@ fn count_hops(plan: &Plan) -> usize {
     }
 }
 
-/// The per-node PATH-COUNT array of a pure Scan/Expand chain: `counts[v]` is the
+/// A per-node PATH-COUNT frontier, stored SPARSE (a list of active `(node, count)`)
+/// while few nodes carry a path, DENSE (indexed by node id) once the frontier
+/// covers a large fraction of the graph. A 5-hop count from a SINGLE source touches
+/// at most fan-out^hops distinct nodes — kept sparse, it costs O(active) per hop
+/// instead of the O(node_count) alloc + full scan a dense array pays every hop
+/// (that made `aml/chain5` 30x SLOWER than core: an 8 MB zeroed array and a 1M-entry
+/// scan, five times, for a frontier of a few hundred nodes). Counts are exact
+/// integers (< 2^53), so the f64 sums are order-independent and the representation
+/// switch is byte-identical.
+enum Counts {
+    Sparse(Vec<(u32, f64)>),
+    Dense(Vec<f64>),
+}
+
+impl Counts {
+    /// Call `f(node, count)` for every node carrying a non-zero count.
+    fn for_each(&self, mut f: impl FnMut(u32, f64)) {
+        match self {
+            Counts::Sparse(v) => {
+                for &(id, c) in v {
+                    f(id, c);
+                }
+            }
+            Counts::Dense(a) => {
+                for (i, &c) in a.iter().enumerate() {
+                    if c != 0.0 {
+                        f(i as u32, c);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Number of nodes carrying a path — the cost driver for the next hop.
+    fn active(&self) -> usize {
+        match self {
+            Counts::Sparse(v) => v.len(),
+            Counts::Dense(a) => a.iter().filter(|&&c| c != 0.0).count(),
+        }
+    }
+}
+
+/// The per-node PATH-COUNT frontier of a pure Scan/Expand chain: `counts[v]` is the
 /// number of chain paths whose last node is `v`. Propagated one hop at a time
 /// (`next[nbr] += counts[v]` over each matching edge) so it never materializes the
-/// exploding path multiset that [`frontier_ids`] carries — O(hops * edges) time and
-/// O(node_count) space regardless of the fan-out. Path counts are exact integers
-/// (< 2^53 for any real graph), so the f64 accumulation is exact and the derived
-/// count is byte-identical to summing the flat frontier. `None` for a non-chain.
-fn frontier_counts(plan: &Plan, store: &Store) -> Option<Vec<f64>> {
+/// exploding path multiset that [`frontier_ids`] carries — O(hops * edges) time.
+/// Sparse until the frontier is large (see [`Counts`]), so a narrow deep chain pays
+/// O(active) not O(node_count) per hop. `None` for a non-chain.
+fn frontier_counts(plan: &Plan, store: &Store) -> Option<Counts> {
     let n = store.node_count();
+    // Go dense once the active set is a large fraction of the graph: past this a
+    // dense array's O(1) scatter beats an FnvMap's hashing, and a full-scan seed is
+    // dense from the start. Below it the sparse list wins by touching only live nodes.
+    let dense_cut = (n / 16).max(1024);
     match plan {
         Plan::Scan { label } => {
-            let mut counts = vec![0.0f64; n];
-            match label {
-                Some(l) => store
-                    .nodes_with_label(l)
-                    .iter()
-                    .for_each(|&v| counts[v as usize] = 1.0),
-                None => store
-                    .all_nodes()
-                    .into_iter()
-                    .for_each(|v| counts[v as usize] = 1.0),
+            let seed: &[u32] = match label {
+                Some(l) => store.nodes_with_label(l),
+                None => return Some(dense_from(store.all_nodes().into_iter(), n)),
+            };
+            if seed.len() > dense_cut {
+                let mut counts = vec![0.0f64; n];
+                for &v in seed {
+                    counts[v as usize] = 1.0;
+                }
+                Some(Counts::Dense(counts))
+            } else {
+                Some(Counts::Sparse(seed.iter().map(|&v| (v, 1.0)).collect()))
             }
-            Some(counts)
         }
-        Plan::IndexSeek { label, key, value } => {
-            let mut counts = vec![0.0f64; n];
-            for v in index_seek_ids(store, label, key, value) {
-                counts[v as usize] += 1.0;
-            }
-            Some(counts)
-        }
+        Plan::IndexSeek { label, key, value } => Some(sparse_or_dense(
+            index_seek_ids(store, label, key, value),
+            n,
+            dense_cut,
+        )),
         Plan::RangeSeek {
             label,
             key,
             op,
             value,
-        } => {
-            let mut counts = vec![0.0f64; n];
-            for v in range_seek_ids(store, label, key, *op, value) {
-                counts[v as usize] += 1.0;
-            }
-            Some(counts)
-        }
+        } => Some(sparse_or_dense(
+            range_seek_ids(store, label, key, *op, value),
+            n,
+            dense_cut,
+        )),
         Plan::Expand {
             input,
             from,
@@ -2568,27 +2610,66 @@ fn frontier_counts(plan: &Plan, store: &Store) -> Option<Vec<f64>> {
                 None => None,
                 Some(name) => match store.etype_id(name) {
                     Some(id) => Some(id),
-                    None => return Some(vec![0.0f64; n]), // unknown label → no paths
+                    None => return Some(Counts::Sparse(Vec::new())), // unknown label → no paths
                 },
             };
-            let mut next = vec![0.0f64; n];
-            // Scatter: for each non-zero source, add its count to every matching
-            // neighbour. REJECTED alternative — a GATHER (sum prev[src] over each
-            // target's reverse edges, sequential writes): it was WORSE, because it
-            // must visit ALL n targets (not just non-zero sources) and the random
-            // READS of `prev` still thrash at scale. 3-hop count(*) at 200k/deg4
-            // 6.9ms -> 10.5ms (1.10x -> 0.72x) and no change at 1M/deg8 (still
-            // ~349ms). The scatter's non-zero-only pass wins.
-            for (v, &c) in prev.iter().enumerate() {
-                if c != 0.0 {
-                    for_each_nbr(store, v as u32, *dir, want, |nbr, _| {
-                        next[nbr as usize] += c;
+            // Estimate the next frontier's fan-out from the source count and the
+            // average degree; go dense when it will be large, sparse otherwise. The
+            // scatter itself is identical either way — only the accumulator differs.
+            let avg_deg = if n == 0 {
+                0.0
+            } else {
+                store.edge_count() as f64 / n as f64
+            };
+            let est_next = prev.active() as f64 * avg_deg.max(1.0);
+            if est_next > dense_cut as f64 {
+                let mut next = vec![0.0f64; n];
+                prev.for_each(|v, c| {
+                    for_each_nbr(store, v, *dir, want, |nbr, _| next[nbr as usize] += c);
+                });
+                Some(Counts::Dense(next))
+            } else {
+                // Sparse scatter into an FnvMap keyed by neighbour — touches only the
+                // few nodes a narrow frontier reaches, no O(node_count) allocation.
+                let mut next: FnvMap<u32, f64> = FnvMap::default();
+                prev.for_each(|v, c| {
+                    for_each_nbr(store, v, *dir, want, |nbr, _| {
+                        *next.entry(nbr).or_insert(0.0) += c;
                     });
-                }
+                });
+                Some(Counts::Sparse(next.into_iter().collect()))
             }
-            Some(next)
         }
         _ => None,
+    }
+}
+
+/// A DENSE count frontier with each listed id set to 1.0 (for a full unlabeled scan).
+fn dense_from(ids: impl Iterator<Item = u32>, n: usize) -> Counts {
+    let mut counts = vec![0.0f64; n];
+    for v in ids {
+        counts[v as usize] = 1.0;
+    }
+    Counts::Dense(counts)
+}
+
+/// Seed a count frontier from a seek's id list: sparse when the result is small
+/// (the common selective seek), dense when it is large. Duplicate ids accumulate.
+fn sparse_or_dense(ids: Vec<u32>, n: usize, dense_cut: usize) -> Counts {
+    if ids.len() > dense_cut {
+        let mut counts = vec![0.0f64; n];
+        for v in ids {
+            counts[v as usize] += 1.0;
+        }
+        Counts::Dense(counts)
+    } else {
+        // A seek CAN repeat an id (an index bucket with dups); fold so each node
+        // appears once with its multiplicity, matching the dense accumulation.
+        let mut map: FnvMap<u32, f64> = FnvMap::default();
+        for v in ids {
+            *map.entry(v).or_insert(0.0) += 1.0;
+        }
+        Counts::Sparse(map.into_iter().collect())
     }
 }
 
@@ -3744,13 +3825,11 @@ fn try_fused_count(
         if count_hops(inner) >= 2 {
             if let Some(counts) = frontier_counts(inner, store) {
                 let mut total = 0f64;
-                for (v, &c) in counts.iter().enumerate() {
-                    if c != 0.0 {
-                        let mut deg = 0f64;
-                        for_each_nbr(store, v as u32, *dir, want, |_, _| deg += 1.0);
-                        total += c * deg;
-                    }
-                }
+                counts.for_each(|v, c| {
+                    let mut deg = 0f64;
+                    for_each_nbr(store, v, *dir, want, |_, _| deg += 1.0);
+                    total += c * deg;
+                });
                 return Some(scalar_num(total));
             }
         }

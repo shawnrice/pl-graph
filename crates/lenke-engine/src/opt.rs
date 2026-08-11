@@ -1230,7 +1230,11 @@ mod tests {
     /// preserve rows (equivalent-spellings for ranges).
     #[test]
     fn range_filter_seeds_both_spellings() {
-        let store = social();
+        // A RangeSeek is only planned when a range index can serve it (else the
+        // vectorized Filter path is faster than the seek's scan-and-box fallback),
+        // so this fixture builds one on `age`.
+        let mut store = social();
+        store.create_range_index("age");
         let plan_of = |pred| {
             Plan::Scan {
                 label: Some("Person".into()),
@@ -1241,8 +1245,12 @@ mod tests {
         // age > 28  and  28 < age  are the same predicate, different spelling.
         let a = plan_of(cmp(CompareOp::Gt, prop(0, "age"), Expr::Lit(n(28.0))));
         let b = plan_of(cmp(CompareOp::Lt, Expr::Lit(n(28.0)), prop(0, "age")));
-        let oa = assert_rows_preserved(&a, &store);
-        let ob = assert_rows_preserved(&b, &store);
+        // Optimize through the indexed path (both spellings must normalize to the
+        // same RangeSeek) and confirm the rows are unchanged from the raw plan.
+        let oa = optimize_indexed(a.clone(), &store);
+        let ob = optimize_indexed(b.clone(), &store);
+        assert_eq!(bag(&run(&a, &store)), bag(&run(&oa, &store)));
+        assert_eq!(bag(&run(&b, &store)), bag(&run(&ob, &store)));
 
         let target = |p: &Plan| -> (String, CompareOp, Value) {
             let Plan::Project { input, .. } = p else {
