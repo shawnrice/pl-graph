@@ -5861,6 +5861,57 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
     if let Some(keep) = try_num_disjunction(pred, store, batch) {
         return Some(keep);
     }
+    // A string-search predicate `col STARTS WITH / ENDS WITH / CONTAINS lit` (which
+    // desugars to a `starts_with`/`ends_with`/`contains` call) over a raw Str/Dict
+    // column — scan `&str` directly, no per-cell `Value` boxing through
+    // `call_scalar` (the same win the Str compare path gets). Semantics match
+    // `str_bool`: a present string cell tests, an absent/NULL cell is UNKNOWN →
+    // dropped; a non-string column has no match and falls to the general path.
+    if let Expr::Call { name, args } = pred {
+        if let (
+            test @ ("starts_with" | "ends_with" | "contains"),
+            [Expr::Prop { slot, key }, Expr::Lit(Value::Str(sub))],
+        ) = (name.as_str(), args.as_slice())
+        {
+            if let Col::Nodes(ids) = batch.slot(*slot) {
+                let f: fn(&str, &str) -> bool = match test {
+                    "starts_with" => |s, t| s.starts_with(t),
+                    "ends_with" => |s, t| s.ends_with(t),
+                    _ => |s, t| s.contains(t),
+                };
+                let sub = sub.as_ref();
+                let mut keep = Vec::new();
+                match store.column(key) {
+                    Some(Column::Str { data, present }) => {
+                        for (row, &id) in ids.iter().enumerate() {
+                            let i = id as usize;
+                            if present[i] && f(data[i].as_ref(), sub) {
+                                keep.push(row);
+                            }
+                        }
+                        return Some(keep);
+                    }
+                    Some(Column::Dict {
+                        dict,
+                        codes,
+                        present,
+                    }) => {
+                        for (row, &id) in ids.iter().enumerate() {
+                            let i = id as usize;
+                            if present[i] && f(dict[codes[i] as usize].as_ref(), sub) {
+                                keep.push(row);
+                            }
+                        }
+                        return Some(keep);
+                    }
+                    // Column absent everywhere → every cell UNKNOWN → dropped.
+                    None => return Some(Vec::new()),
+                    // A non-string column: `str_bool` yields NULL → no match.
+                    _ => return Some(Vec::new()),
+                }
+            }
+        }
+    }
     let Expr::Compare { op, left, right } = pred else {
         return None;
     };

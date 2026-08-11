@@ -4079,6 +4079,45 @@ mod tests {
         assert!(super::parse("MATCH (a:Person)-[:KNOWS]->{3,1}(b) RETURN a.name AS a").is_err());
     }
 
+    /// The raw string-search filter fast path (STARTS WITH / ENDS WITH / CONTAINS)
+    /// must match the boxed `str_bool` for a dict-encoded (low-cardinality) column
+    /// and for a row missing the property (→ UNKNOWN → dropped).
+    #[test]
+    fn string_search_fast_path_dict_and_null() {
+        use crate::exec::execute;
+        let mut st = Builder::default().build();
+        // `city` is low-cardinality → dict-encoded; one node omits it entirely.
+        execute(
+            &super::parse(
+                "INSERT (:P {city: 'oslo'}), (:P {city: 'bergen'}), (:P {city: 'oslo'}), (:P {n: 1})",
+            )
+            .unwrap(),
+            &mut st,
+        )
+        .unwrap();
+        let count = |q: &str| match &run(&super::parse(q).unwrap(), &st).rows[0][0] {
+            Value::Num(x) => *x as i64,
+            other => panic!("not a count: {other:?}"),
+        };
+        assert_eq!(
+            count("MATCH (p:P) WHERE p.city STARTS WITH 'os' RETURN count(*) AS c"),
+            2
+        );
+        assert_eq!(
+            count("MATCH (p:P) WHERE p.city ENDS WITH 'en' RETURN count(*) AS c"),
+            1
+        );
+        assert_eq!(
+            count("MATCH (p:P) WHERE p.city CONTAINS 'o' RETURN count(*) AS c"),
+            2
+        ); // oslo, oslo (bergen has no 'o')
+           // The property-less node is UNKNOWN, never matched.
+        assert_eq!(
+            count("MATCH (p:P) WHERE p.city STARTS WITH '' RETURN count(*) AS c"),
+            3
+        );
+    }
+
     /// `DISTINCT … LIMIT k` streams with incremental dedup and stops at `k` distinct
     /// rows — it must equal the first `k` of the full distinct (first-seen order) and
     /// never exceed the total distinct count.
