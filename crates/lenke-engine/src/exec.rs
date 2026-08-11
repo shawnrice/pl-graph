@@ -905,6 +905,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // aggregate for every shape it does not recognize. (The fused paths
             // never evaluate arbitrary expressions, so they cannot fault.)
             if let Some(b) = try_scan_count(input, keys, aggs, store)
+                .or_else(|| try_filtered_count(input, keys, aggs, store))
                 .or_else(|| try_scan_num_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_multi_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_distinct_count(input, keys, aggs, store))
@@ -2285,6 +2286,35 @@ fn frontier_counts(plan: &Plan, store: &Store) -> Option<Vec<f64>> {
         }
         _ => None,
     }
+}
+
+/// Answer a scalar `count(*)` over `Filter(Scan)` by running only the filter and
+/// returning the number of survivors — NO gather of the surviving rows' columns
+/// (which the general Filter → Aggregate path builds and immediately discards for a
+/// count). Relies on `try_filter_keep`'s vectorized filter; falls back (`None`) when
+/// the predicate isn't a fast-path shape or the input isn't `Filter(Scan)`.
+fn try_filtered_count(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.func != AggFn::Count || agg.arg.is_some() || agg.distinct {
+        return None; // count(*) only
+    }
+    let Plan::Filter { input: scan, pred } = input else {
+        return None;
+    };
+    if !matches!(scan.as_ref(), Plan::Scan { .. }) {
+        return None;
+    }
+    let batch = pull(scan, store, false).ok()?;
+    let keep = try_filter_keep(pred, store, &batch)?;
+    Some(scalar_num(keep.len() as f64))
 }
 
 /// Answer a scalar `count(*)` over a bare labelled/unlabelled `Scan` in O(1) (a
