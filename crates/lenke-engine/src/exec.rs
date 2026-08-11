@@ -3638,6 +3638,60 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                     .collect();
                 return Ok(Col::Gen(out));
             }
+            // `list_{sum,mean,min,max}(list)` → Gremlin's scope-LOCAL aggregates over
+            // a list cell (e.g. after `fold()`): reduce the list's NUMERIC elements
+            // (nulls/non-numerics skipped), yielding Null for a list with no number —
+            // matching core's `local_num`/`local_extreme` on the numeric case.
+            // Gremlin-only. (Mixed numeric+non-numeric lists are the held cross-type
+            // territory; here the non-numerics are simply skipped.)
+            // `list_count(list)` → Gremlin `count(local)`: the number of local
+            // elements (a list's length, or 1 for a scalar cell — core's
+            // `local_elems(v).len()`). Gremlin-only.
+            if name == "list_count" {
+                let arg = eval(&args[0], store, batch)?;
+                let n = batch.rows();
+                let out: Vec<Value> = (0..n)
+                    .map(|i| match arg.value_at(i) {
+                        Value::List(items) => Value::Num(items.len() as f64),
+                        _ => Value::Num(1.0),
+                    })
+                    .collect();
+                return Ok(Col::Gen(out));
+            }
+            if matches!(
+                name.as_str(),
+                "list_sum" | "list_mean" | "list_min" | "list_max"
+            ) {
+                let arg = eval(&args[0], store, batch)?;
+                let n = batch.rows();
+                let out: Vec<Value> = (0..n)
+                    .map(|i| {
+                        let nums: Vec<f64> = match arg.value_at(i) {
+                            Value::List(items) => items
+                                .iter()
+                                .filter_map(|v| match v {
+                                    Value::Num(x) => Some(*x),
+                                    _ => None,
+                                })
+                                .collect(),
+                            // A scalar cell is a one-element local list.
+                            Value::Num(x) => vec![x],
+                            _ => Vec::new(),
+                        };
+                        if nums.is_empty() {
+                            return Value::Null;
+                        }
+                        let v = match name.as_str() {
+                            "list_sum" => nums.iter().sum(),
+                            "list_mean" => nums.iter().sum::<f64>() / nums.len() as f64,
+                            "list_min" => nums.iter().copied().fold(f64::INFINITY, f64::min),
+                            _ => nums.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                        };
+                        Value::Num(v)
+                    })
+                    .collect();
+                return Ok(Col::Gen(out));
+            }
             // Element functions need the STORE and the element identity (a node/edge
             // slot), which the pure-value `call_scalar` cannot see — handle them
             // here off the evaluated argument column.

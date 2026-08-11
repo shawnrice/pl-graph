@@ -771,42 +771,78 @@ impl Parser {
                 plan.filter(pred)
             }
             "count" => {
+                // count() folds the whole stream to one number; count(local) is
+                // per-row — the size of the current list cell (a fold()'d list).
+                let is_local = self.parse_scope_is_local()?;
                 self.expect(&Tok::RParen)?;
-                let p = plan.aggregate(
-                    vec![],
-                    vec![Agg {
-                        func: AggFn::Count,
-                        arg: None,
-                        distinct: false,
-                        name: "count".into(),
-                    }],
-                );
-                self.current = 0;
-                self.slots = 1;
-                p
+                if is_local {
+                    let p = plan.project(vec![(
+                        "count".to_string(),
+                        Expr::Call {
+                            name: "list_count".to_string(),
+                            args: vec![Expr::Slot(self.current)],
+                        },
+                    )]);
+                    self.current = 0;
+                    self.slots = 1;
+                    p
+                } else {
+                    let p = plan.aggregate(
+                        vec![],
+                        vec![Agg {
+                            func: AggFn::Count,
+                            arg: None,
+                            distinct: false,
+                            name: "count".into(),
+                        }],
+                    );
+                    self.current = 0;
+                    self.slots = 1;
+                    p
+                }
             }
             "min" | "max" | "sum" | "mean" => {
+                // Global: fold the whole value stream to one scalar. Local: reduce the
+                // current list cell per row (the numeric elements) via a list fn.
+                let is_local = self.parse_scope_is_local()?;
                 self.expect(&Tok::RParen)?;
-                // Fold the current value stream to a single scalar. `mean` is the
-                // value contract's average (Avg); the rest are their namesakes.
-                let func = match lname.as_str() {
-                    "min" => AggFn::Min,
-                    "max" => AggFn::Max,
-                    "sum" => AggFn::Sum,
-                    _ => AggFn::Avg,
-                };
-                let p = plan.aggregate(
-                    vec![],
-                    vec![Agg {
-                        func,
-                        arg: Some(Expr::Slot(self.current)),
-                        distinct: false,
-                        name: lname.clone(),
-                    }],
-                );
-                self.current = 0;
-                self.slots = 1;
-                p
+                if is_local {
+                    let fname = match lname.as_str() {
+                        "min" => "list_min",
+                        "max" => "list_max",
+                        "sum" => "list_sum",
+                        _ => "list_mean",
+                    };
+                    let p = plan.project(vec![(
+                        lname.clone(),
+                        Expr::Call {
+                            name: fname.to_string(),
+                            args: vec![Expr::Slot(self.current)],
+                        },
+                    )]);
+                    self.current = 0;
+                    self.slots = 1;
+                    p
+                } else {
+                    let func = match lname.as_str() {
+                        "min" => AggFn::Min,
+                        "max" => AggFn::Max,
+                        "sum" => AggFn::Sum,
+                        _ => AggFn::Avg,
+                    };
+                    let p = plan.aggregate(
+                        vec![],
+                        vec![Agg {
+                            func,
+                            arg: Some(Expr::Slot(self.current)),
+                            distinct: false,
+                            name: lname.clone(),
+                        }],
+                    );
+                    self.current = 0;
+                    self.slots = 1;
+                    p
+                }
             }
             "fold" => {
                 self.expect(&Tok::RParen)?;
@@ -1637,6 +1673,40 @@ mod tests {
                 &store
             )),
             vec!["Str(\"bob\");"],
+        );
+    }
+
+    /// The scope-LOCAL aggregates `count`/`sum`/`mean`/`min`/`max`(local) reduce the
+    /// current list cell PER ROW (after `fold()`), where the bare/global forms fold
+    /// the whole stream to one scalar. Over the folded Person ages [30,25,40]: local
+    /// count 3, sum 95, mean 95/3, min 25, max 40 — and the local sum equals the
+    /// global sum of the same values.
+    #[test]
+    fn gremlin_local_scope_aggregates() {
+        let store = social();
+        let folded = "g.V().hasLabel('Person').values('age').fold()";
+        assert_eq!(
+            value_bag(&gremlin_rows(&format!("{folded}.count(local)"), &store)),
+            vec!["Num(3.0);"],
+        );
+        assert_eq!(
+            value_bag(&gremlin_rows(&format!("{folded}.sum(local)"), &store)),
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').values('age').sum()",
+                &store
+            )),
+        );
+        assert_eq!(
+            value_bag(&gremlin_rows(&format!("{folded}.min(local)"), &store)),
+            vec!["Num(25.0);"],
+        );
+        assert_eq!(
+            value_bag(&gremlin_rows(&format!("{folded}.max(local)"), &store)),
+            vec!["Num(40.0);"],
+        );
+        assert_eq!(
+            value_bag(&gremlin_rows(&format!("{folded}.mean(local)"), &store)),
+            vec!["Num(31.666666666666668);"],
         );
     }
 
