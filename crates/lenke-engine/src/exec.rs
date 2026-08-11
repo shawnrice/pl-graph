@@ -3476,6 +3476,29 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             use crate::ir::ArithOp::{Add, Div, Mul, Rem, Sub};
             let l = eval(left, store, batch)?;
             let r = eval(right, store, batch)?;
+            // Raw fast path: both operands are `Col::Num` (a Num property — always
+            // finite, since NaN/Inf are nulled at ingest — or a broadcast literal), so
+            // no cell is null/non-numeric/temporal. Compute over the f64 slices with
+            // no per-row `value_at` boxing; Div/Rem by zero still THROWS, every other
+            // result (including ±Inf overflow) is kept, exactly as the general arm.
+            if let (Col::Num(xs), Col::Num(ys)) = (&l, &r) {
+                let n = xs.len().min(ys.len());
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    let (x, y) = (xs[i], ys[i]);
+                    if matches!(op, Div | Rem) && y == 0.0 {
+                        return Err("division by zero".into());
+                    }
+                    out.push(match op {
+                        Add => x + y,
+                        Sub => x - y,
+                        Mul => x * y,
+                        Div => x / y,
+                        Rem => x % y,
+                    });
+                }
+                return Ok(Col::Num(out));
+            }
             let n = l.len().min(r.len());
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
