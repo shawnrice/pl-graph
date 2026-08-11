@@ -694,6 +694,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::Distinct { input }
         | Plan::Tail { input, .. }
         | Plan::SortLocal { input, .. } => needs_lineage(input),
+        Plan::Branch { input, bodies } => needs_lineage(input) || bodies.iter().any(needs_lineage),
         Plan::IntervalExpand {
             input, qlo, qhi, ..
         } => reads_path(qlo) || reads_path(qhi) || needs_lineage(input),
@@ -950,6 +951,18 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             let rows = b.rows();
             let start = rows.saturating_sub(*n);
             b.gather(&(start..rows).collect::<Vec<usize>>())
+        }
+        Plan::Branch { input, bodies } => {
+            // Gremlin union: run every branch body over the SAME input frontier (each
+            // is Row-rooted, correlating on the current slot) and concatenate their
+            // sub-rows. Every branch lands its element at the same slot, so the
+            // concatenated column keeps its node/edge type — a continuable frontier.
+            let inb = pull(input, store, track)?;
+            let subs: Vec<Batch> = bodies
+                .iter()
+                .map(|b| pull_body(b, store, &inb))
+                .collect::<Result<_, _>>()?;
+            concat_batches(&subs)
         }
         Plan::Project { input, items } => {
             // Project produces a batch whose slots ARE the projected columns, so
@@ -3871,6 +3884,57 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
 /// pattern can contain — `Expand`/`VarLength`/`Filter` — rooted at `Plan::Row`,
 /// which yields `seed`. Every operator gathers the whole input row, so the
 /// provenance column rides through untouched; the caller reads it off the result.
+/// Concatenate several same-shaped batches row-wise (Gremlin `union`'s reconverge).
+/// Each output slot is the type-preserving concatenation of that slot across the
+/// batches — so a column that is `Col::Nodes` in every branch stays a node frontier
+/// (continuable), falling back to `Col::Gen` only when the branch column types
+/// differ. Empty input → an empty batch.
+fn concat_batches(subs: &[Batch]) -> Batch {
+    let Some(first) = subs.first() else {
+        return Batch::of(Vec::new());
+    };
+    let ncols = first.slots.len();
+    let cols: Vec<Col> = (0..ncols)
+        .map(|j| concat_cols(&subs.iter().map(|b| b.slot(j)).collect::<Vec<_>>()))
+        .collect();
+    Batch::of(cols)
+}
+
+/// Concatenate columns of (ideally) the same variant. Same variant → keep it and
+/// extend the inner vector; mixed variants → materialize every value into `Gen`.
+fn concat_cols(cols: &[&Col]) -> Col {
+    macro_rules! same {
+        ($variant:ident) => {{
+            let mut v = Vec::new();
+            for c in cols {
+                if let Col::$variant(xs) = c {
+                    v.extend(xs.iter().cloned());
+                } else {
+                    return Col::Gen(
+                        cols.iter()
+                            .flat_map(|c| (0..c.len()).map(|i| c.value_at(i)))
+                            .collect(),
+                    );
+                }
+            }
+            Col::$variant(v)
+        }};
+    }
+    match cols.first() {
+        None => Col::Gen(Vec::new()),
+        Some(Col::Nodes(_)) => same!(Nodes),
+        Some(Col::Edges(_)) => same!(Edges),
+        Some(Col::Num(_)) => same!(Num),
+        Some(Col::Bool(_)) => same!(Bool),
+        Some(Col::Str(_)) => same!(Str),
+        Some(Col::Gen(_)) => Col::Gen(
+            cols.iter()
+                .flat_map(|c| (0..c.len()).map(|i| c.value_at(i)))
+                .collect(),
+        ),
+    }
+}
+
 fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> {
     Ok(match plan {
         Plan::Row => seed.clone(),

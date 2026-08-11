@@ -367,6 +367,13 @@ pub enum Plan {
         skip: Option<usize>,
         limit: Option<usize>,
     },
+    /// Gremlin `union(t1, t2, …)`: for each input row, run every `body` (a
+    /// `Plan::Row`-rooted sub-plan continuing from the current slot) and CONCATENATE
+    /// all their sub-rows into one frontier — the columnar form of core's
+    /// per-traverser branch-and-reconverge. The bodies land a compatible frontier
+    /// (the parser scopes each to a single hop, so every branch appends its element
+    /// at the same slot and the concatenated column keeps its node/edge type).
+    Branch { input: Box<Plan>, bodies: Vec<Plan> },
     /// Keep the LAST `n` rows of the input, in input order — Gremlin `tail(n)`. The
     /// symmetric partner of a keyless `OrderPage` limit (the FIRST n): both take a
     /// window of the committed row order, but `tail`'s start offset (`rows - n`) is
@@ -629,6 +636,14 @@ impl Plan {
         Self::Tail {
             input: Box::new(self),
             n,
+        }
+    }
+
+    #[must_use]
+    pub fn branch(self, bodies: Vec<Plan>) -> Self {
+        Self::Branch {
+            input: Box::new(self),
+            bodies,
         }
     }
 

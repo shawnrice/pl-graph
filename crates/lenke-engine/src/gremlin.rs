@@ -446,6 +446,29 @@ impl Parser {
                     key,
                 })))
             }
+            "union" => {
+                // union(<hop>, <hop>, …): for each element, concatenate every branch's
+                // frontier. v1 scopes each branch to a single out/in/both hop off the
+                // current element; all branches land their neighbour at the same slot,
+                // so the union is a continuable node frontier.
+                let from = self.current;
+                let mut bodies = Vec::new();
+                loop {
+                    let (dir, label) = self.hop_body()?;
+                    bodies.push(Plan::Row.expand(from, dir, label.as_deref()));
+                    if self.peek() == Some(&Tok::Comma) {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                // Every branch appends its landed node at `self.slots` (the input
+                // width); that becomes the new current element.
+                self.current = self.slots;
+                self.slots += 1;
+                plan.branch(bodies)
+            }
             "and" | "or" => {
                 // and(f1, f2, …) / or(f1, f2, …): each child is an element filter
                 // (has/hasNot/nested and/or/not); combine their predicates and apply
@@ -1343,6 +1366,39 @@ impl Parser {
         Ok(expr)
     }
 
+    /// Parse a single anonymous hop body — `[__.] (out|in|both) ( [label] )` — and
+    /// return its `(direction, edge label)`. Shared by the branch steps (union) that
+    /// take hop sub-traversals. Multi-label / multi-step bodies are deferred.
+    fn hop_body(&mut self) -> Result<(Dir, Option<String>), String> {
+        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+            self.bump();
+            self.expect(&Tok::Dot)?;
+        }
+        let name = self.ident()?;
+        let dir = match name.to_ascii_lowercase().as_str() {
+            "out" => Dir::Out,
+            "in" => Dir::In,
+            "both" => Dir::Both,
+            other => {
+                return Err(format!(
+                    "a branch traversal must be a single out/in/both hop, got `{other}`"
+                ))
+            }
+        };
+        self.expect(&Tok::LParen)?;
+        let label = if matches!(self.peek(), Some(Tok::Str(_))) {
+            let l = self.str_arg()?;
+            if self.peek() == Some(&Tok::Comma) {
+                return Err("a branch hop with multiple edge labels is not yet supported".into());
+            }
+            Some(l)
+        } else {
+            None
+        };
+        self.expect(&Tok::RParen)?;
+        Ok((dir, label))
+    }
+
     /// Parse a comma-separated list of child filter traversals up to (but not
     /// consuming) the enclosing `)`.
     fn child_filter_list(&mut self) -> Result<Vec<Expr>, String> {
@@ -1674,6 +1730,38 @@ mod tests {
             )),
             vec!["Str(\"bob\");"],
         );
+    }
+
+    /// `union(<hop>, …)` concatenates each branch's frontier per element and — unlike
+    /// GQL's materializing UNION — keeps it a node frontier, so the traversal
+    /// CONTINUES (`.values()`, `.count()`, another hop). This is core's per-traverser
+    /// branch-and-reconverge, expressed columnar via Plan::Branch over pull_body.
+    #[test]
+    fn gremlin_union_of_hops() {
+        let store = social();
+        // alice's KNOWS targets (bob, carol) unioned with her WORKS_ON target (graphdb).
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V('0').union(out('KNOWS'), out('WORKS_ON')).values('name')",
+                &store,
+            )),
+            vec!["Str(\"bob\");", "Str(\"carol\");", "Str(\"graphdb\");"],
+        );
+        // The union frontier continues: count() sees all three, values() reads them.
+        assert_eq!(
+            value_bag(&gremlin_rows("g.V('0').union(out(), in()).count()", &store)),
+            vec!["Num(3.0);"],
+        );
+        // bob: out KNOWS (carol) unioned with in KNOWS (alice).
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V('1').union(out('KNOWS'), in('KNOWS')).values('name')",
+                &store,
+            )),
+            vec!["Str(\"alice\");", "Str(\"carol\");"],
+        );
+        // A multi-step branch is deferred (v1 is single-hop branches).
+        assert!(super::parse("g.V().union(out().out(), in())").is_err());
     }
 
     /// The scope-LOCAL aggregates `count`/`sum`/`mean`/`min`/`max`(local) reduce the

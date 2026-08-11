@@ -411,6 +411,18 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 c,
             )
         }
+        // Rewrite the input; the correlated branch bodies are left as-is (like an
+        // EXISTS/CALL body, the optimizer does not descend into them).
+        Plan::Branch { input, bodies } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::Branch {
+                    input: Box::new(i),
+                    bodies,
+                },
+                c,
+            )
+        }
     }
 }
 
@@ -856,6 +868,7 @@ fn width(plan: &Plan) -> usize {
         } => width(input) + if *bind_edge { 2 } else { 1 },
         Plan::VarLength { input, .. }
         | Plan::ShortestPath { input, .. }
+        | Plan::Branch { input, .. }
         | Plan::OptionalExpand { input, .. } => width(input) + 1,
         Plan::Filter { input, .. }
         | Plan::OrderPage { input, .. }
@@ -1237,6 +1250,7 @@ mod tests {
             | Plan::CallInline { input, .. }
             | Plan::Distinct { input }
             | Plan::Tail { input, .. }
+            | Plan::Branch { input, .. }
             | Plan::SortLocal { input, .. } => plan_contains_filter(input),
             Plan::Join { left, right, .. } | Plan::Union { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)
