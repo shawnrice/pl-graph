@@ -4082,6 +4082,37 @@ mod tests {
     /// The algebraic degree-product count for a bounded OUT var-length must equal the
     /// DFS enumeration — on a graph large enough that the formula path FIRES, and
     /// with a self-loop that exercises the reused-edge trail correction.
+    /// The 3-hop edge-product `count(*)` must equal the DFS enumeration — on a graph
+    /// with a cycle and a self-loop, since a FIXED chain is a WALK (edges may repeat,
+    /// no trail correction).
+    #[test]
+    fn three_hop_product_count_matches_enumeration() {
+        use crate::store::Builder;
+        let mut b = Builder::default();
+        b.node(&["N"], &[]);
+        b.node(&["N"], &[]);
+        b.node(&["N"], &[]); // a=0, b=1, c=2
+        b.edge(0, 1, "R");
+        b.edge(1, 2, "R");
+        b.edge(2, 0, "R"); // 3-cycle
+        b.edge(0, 0, "R"); // self-loop
+        let st = b.build();
+        let q = "MATCH (a:N)-[:R]->()-[:R]->()-[:R]->(d)";
+        let count = match &run(
+            &super::parse(&format!("{q} RETURN count(*) AS c")).unwrap(),
+            &st,
+        )
+        .rows[0][0]
+        {
+            Value::Num(x) => *x as usize,
+            other => panic!("not a count: {other:?}"),
+        };
+        let enumerated = run(&super::parse(&format!("{q} RETURN d.z AS d")).unwrap(), &st)
+            .rows
+            .len();
+        assert_eq!(count, enumerated, "product count != enumerated walks");
+    }
+
     #[test]
     fn varlen_degree_formula_matches_enumeration() {
         use crate::store::Builder;

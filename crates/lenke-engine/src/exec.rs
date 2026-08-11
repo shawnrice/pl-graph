@@ -917,6 +917,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .or_else(|| try_scan_num_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_multi_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_distinct_count(input, keys, aggs, store))
+                .or_else(|| try_3hop_product_count(input, keys, aggs, store))
                 .or_else(|| try_fused_count(input, keys, aggs, store))
                 .or_else(|| try_node_grouped_count(input, keys, aggs, store))
                 .or_else(|| try_scan_group_agg(input, keys, aggs, store))
@@ -3587,6 +3588,111 @@ fn try_scan_multi_agg(
 /// marks endpoints in a bitset over node ids. Returns `None` (fall back to the
 /// general aggregate) for any shape it does not recognize — so it is an
 /// optimization, never a semantic fork.
+/// Peel exactly `n` OUTgoing frontier hops (no bound edge) ending at a bare Scan,
+/// returning the per-hop edge labels FIRST-to-LAST and the Scan's label. `None`
+/// unless the plan is precisely that chain (used by the 3-hop edge-product count).
+fn peel_out_hops(plan: &Plan, n: usize) -> Option<(Vec<Option<String>>, Option<String>)> {
+    if n == 0 {
+        return match plan {
+            Plan::Scan { label } => Some((Vec::new(), label.clone())),
+            _ => None,
+        };
+    }
+    let Plan::Expand {
+        input,
+        from,
+        dir: Dir::Out,
+        edge_label,
+        bind_edge: false,
+    } = plan
+    else {
+        return None;
+    };
+    if *from + 1 != chain_width(input)? {
+        return None; // must expand the current frontier
+    }
+    let (mut labels, base) = peel_out_hops(input, n - 1)?;
+    labels.push(edge_label.clone());
+    Some((labels, base))
+}
+
+/// count(*) over a 3-hop OUT chain via the identity `1ᵀA₁A₂A₃1 = Σ` over the MIDDLE
+/// edges (b→c, hop 2) of `(source→b walks over hop 1) × (out-degree of c over hop
+/// 3)` — O(V+E), replacing the 2-hop count-propagation SCATTER (the 3-hop
+/// bottleneck: random `next[nbr] += c` writes) with degree products. A fixed chain
+/// is a WALK (edges may repeat), so there is NO trail correction — byte-identical
+/// to the propagation. Per-hop edge types are handled independently.
+fn try_3hop_product_count(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.func != AggFn::Count || agg.arg.is_some() || agg.distinct {
+        return None;
+    }
+    let (labels, base) = peel_out_hops(input, 3)?;
+    let mut wants: [Option<u32>; 3] = [None; 3];
+    for (i, l) in labels.iter().enumerate() {
+        wants[i] = match l {
+            None => None,
+            Some(name) => match store.etype_id(name) {
+                Some(id) => Some(id),
+                None => return Some(scalar_num(0.0)), // unknown edge type → no paths
+            },
+        };
+    }
+    let (w1, w2, w3) = (wants[0], wants[1], wants[2]);
+    let nc = store.node_count();
+    let hit = |a: &crate::store::Adj, w: Option<u32>| w.is_none_or(|w| w == a.etype);
+
+    // level1[b] = number of hop-1 edges from a SOURCE into b (= counts after 1 hop).
+    let mut level1 = vec![0u64; nc];
+    let bump = |s: u32, level1: &mut [u64]| {
+        for a in store.out(s) {
+            if hit(a, w1) {
+                level1[a.nbr as usize] += 1;
+            }
+        }
+    };
+    match &base {
+        Some(l) => {
+            for &s in store.nodes_with_label(l) {
+                bump(s, &mut level1);
+            }
+        }
+        None => {
+            for s in 0..nc as u32 {
+                if store.is_alive(s) {
+                    bump(s, &mut level1);
+                }
+            }
+        }
+    }
+    // outdeg3[c] = number of hop-3 out-edges of c.
+    let mut outdeg3 = vec![0u64; nc];
+    for (c, d) in outdeg3.iter_mut().enumerate() {
+        *d = store.out(c as u32).iter().filter(|a| hit(a, w3)).count() as u64;
+    }
+    // Σ over hop-2 middle edges (b→c) of level1[b] × outdeg3[c].
+    let mut total = 0u64;
+    for (b, &lvl) in level1.iter().enumerate() {
+        if lvl == 0 {
+            continue;
+        }
+        for a in store.out(b as u32) {
+            if hit(a, w2) {
+                total += lvl * outdeg3[a.nbr as usize];
+            }
+        }
+    }
+    Some(scalar_num(total as f64))
+}
+
 fn try_fused_count(
     input: &Plan,
     keys: &[(String, Expr)],
