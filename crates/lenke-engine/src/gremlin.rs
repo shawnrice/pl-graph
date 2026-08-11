@@ -617,11 +617,58 @@ impl Parser {
                 p
             }
             "where" => {
-                // where(P.op(v)) / where(op(v)) / where(within(...)) — filter the
-                // current traverser's VALUE by a predicate (typically after values).
-                let pred = self.predicate_expr(Expr::Slot(self.current))?;
-                self.expect(&Tok::RParen)?;
-                plan.filter(pred)
+                // Two forms: where(<hop>) is a SEMI-JOIN — keep the element if it HAS
+                // such an adjacency — and where(P) filters the current VALUE by a
+                // predicate. A leading `out`/`in`/`both` (or `__`) marks the hop form.
+                let is_hop = matches!(self.peek(), Some(Tok::Ident(s)) if {
+                    let l = s.to_ascii_lowercase();
+                    s == "__" || l == "out" || l == "in" || l == "both"
+                });
+                if is_hop {
+                    if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+                        self.bump();
+                        self.expect(&Tok::Dot)?;
+                    }
+                    let hop = self.ident()?;
+                    let dir = match hop.to_ascii_lowercase().as_str() {
+                        "out" => Dir::Out,
+                        "in" => Dir::In,
+                        "both" => Dir::Both,
+                        other => {
+                            return Err(format!(
+                                "where() traversal must be a single out/in/both hop, got `{other}`"
+                            ))
+                        }
+                    };
+                    self.expect(&Tok::LParen)?;
+                    // Optional single edge label (argless = any type). A multi-label
+                    // hop or a multi-step chain in where() is deferred.
+                    let label = if matches!(self.peek(), Some(Tok::Str(_))) {
+                        let l = self.str_arg()?;
+                        if self.peek() == Some(&Tok::Comma) {
+                            return Err(
+                                "where() hop with multiple edge labels is not yet supported".into(),
+                            );
+                        }
+                        Some(l)
+                    } else {
+                        None
+                    };
+                    self.expect(&Tok::RParen)?; // close the hop
+                    self.expect(&Tok::RParen)?; // close where(...)
+                                                // Correlated existence check: does the current element have such
+                                                // an edge? The body seeds `Plan::Row` (the outer row) and expands
+                                                // from the current slot — the same shape GQL's EXISTS { … } builds.
+                    let body = Plan::Row.expand(self.current, dir, label.as_deref());
+                    plan.filter(Expr::Exists {
+                        body: Box::new(body),
+                        outer_width: self.slots,
+                    })
+                } else {
+                    let pred = self.predicate_expr(Expr::Slot(self.current))?;
+                    self.expect(&Tok::RParen)?;
+                    plan.filter(pred)
+                }
             }
             // is(P) / is(op(v)) / is(literal): filter the current VALUE by a
             // predicate — same as `where` on the value stream. A bare literal is an
@@ -1407,6 +1454,60 @@ mod tests {
             gone.is_empty(),
             "missing id must contribute nothing: {gone:?}"
         );
+    }
+
+    /// `where(<hop>)` is a semi-join: keep the current element iff it HAS such an
+    /// adjacency. It lowers to an `Expr::Exists` whose body seeds `Plan::Row` and
+    /// expands from the current slot — the same shape GQL's `EXISTS { … }` builds —
+    /// so it equals the GQL `WHERE EXISTS { (n)-[:L]->() }` form. `where(P)` (the
+    /// value-predicate form) is unchanged.
+    #[test]
+    fn gremlin_where_hop_semijoin() {
+        let store = social();
+        // Vertices with an out-KNOWS edge (alice, bob) == the GQL EXISTS form.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().where(out('KNOWS')).values('name')",
+                &store
+            )),
+            value_bag(&gql_rows(
+                "MATCH (n) WHERE EXISTS { (n)-[:KNOWS]->() } RETURN n.name",
+                &store,
+            )),
+        );
+        // Incoming KNOWS (bob, carol) == the reverse EXISTS form.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().where(in('KNOWS')).values('name')",
+                &store
+            )),
+            value_bag(&gql_rows(
+                "MATCH (n) WHERE EXISTS { (n)<-[:KNOWS]-() } RETURN n.name",
+                &store,
+            )),
+        );
+        // Argless where(out()) is any out-edge; both() is either direction.
+        assert_eq!(
+            value_bag(&gremlin_rows("g.V().where(out()).values('name')", &store)),
+            vec!["Str(\"alice\");", "Str(\"bob\");"],
+        );
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().where(both('KNOWS')).values('name')",
+                &store
+            )),
+            vec!["Str(\"alice\");", "Str(\"bob\");", "Str(\"carol\");"],
+        );
+        // The value-predicate form still works (age > 28 → carol, alice).
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').values('age').where(gt(28))",
+                &store,
+            )),
+            vec!["Num(30.0);", "Num(40.0);"],
+        );
+        // A multi-label where-hop is deferred, not mis-parsed.
+        assert!(super::parse("g.V().where(out('A','B'))").is_err());
     }
 
     /// `and(f1,f2,…)`, `or(f1,f2,…)`, `not(f)` combine element filters (has/hasNot,
