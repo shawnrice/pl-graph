@@ -4143,6 +4143,46 @@ mod tests {
     }
 
     #[test]
+    fn edge_filtered_count_matches_enumeration() {
+        use crate::store::Builder;
+        use crate::value::Value;
+        // A small graph with a numeric edge property `w`; the streaming edge-filtered
+        // count must equal the enumerated matching-row count for each predicate.
+        let mut b = Builder::default();
+        for _ in 0..200 {
+            b.node(&["P"], &[]);
+        }
+        for i in 0u32..200 {
+            for d in 0u32..3 {
+                b.edge(i, (i * 7 + d * 13 + 1) % 200, "R");
+            }
+        }
+        let mut st = b.build();
+        for eid in st.all_edges() {
+            st.set_edge_prop(eid, "w", Value::Num(f64::from(eid % 10)));
+        }
+        let count = |q: &str| match &run(&super::parse(q).unwrap(), &st).rows[0][0] {
+            Value::Num(x) => *x as usize,
+            other => panic!("not a count: {other:?}"),
+        };
+        for wc in ["r.w > 5", "r.w >= 2 AND r.w < 5", "r.w = 3", "3 > r.w"] {
+            let c = count(&format!(
+                "MATCH (a:P)-[r:R]->(b) WHERE {wc} RETURN count(*) AS c"
+            ));
+            let rows = run(
+                &super::parse(&format!(
+                    "MATCH (a:P)-[r:R]->(b) WHERE {wc} RETURN r.w AS w"
+                ))
+                .unwrap(),
+                &st,
+            )
+            .rows
+            .len();
+            assert_eq!(c, rows, "edge-filtered count != enumerated for `{wc}`");
+        }
+    }
+
+    #[test]
     fn streaming_num_filtered_count_matches_enumeration() {
         use crate::store::Builder;
         // Includes a NULL age (every 11th) and a NaN age (every 13th) so the count's

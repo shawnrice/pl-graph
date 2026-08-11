@@ -912,6 +912,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // never evaluate arbitrary expressions, so they cannot fault.)
             if let Some(b) = try_scan_count(input, keys, aggs, store)
                 .or_else(|| try_filtered_count(input, keys, aggs, store))
+                .or_else(|| try_edge_filtered_count(input, keys, aggs, store))
                 .or_else(|| try_varlen_count(input, keys, aggs, store))
                 .or_else(|| try_varlen_distinct_count(input, keys, aggs, store))
                 .or_else(|| try_varlen_agg(input, keys, aggs, store))
@@ -2729,15 +2730,20 @@ fn try_filtered_count(
 /// runs the general filter). Every survivor test matches `try_filter_keep`'s typed
 /// paths exactly (present gates NULL; a NaN cell fails ordering → dropped), so the
 /// count is identical.
-fn try_stream_num_count(store: &Store, label: &Option<String>, pred: &Expr) -> Option<u64> {
-    // Pull `prop OP literal` (either operand order) into (key, op, f64) on slot 0.
+/// Recognize a filter predicate that is a CONJUNCTION of numeric compares all on the
+/// SAME property of one `slot` — `prop OP num` (either operand order) — returning
+/// `(key, bounds)`. Shared by the streaming node/edge count fast paths; `None` for a
+/// string / disjunction / multi-slot / multi-key / non-numeric predicate.
+fn num_conj_on_slot(pred: &Expr, slot: usize) -> Option<(String, Vec<(CompareOp, f64)>)> {
     let atom = |e: &Expr| -> Option<(String, CompareOp, f64)> {
         let Expr::Compare { op, left, right } = e else {
             return None;
         };
         let (key, op, lit) = match (left.as_ref(), right.as_ref()) {
-            (Expr::Prop { slot: 0, key }, Expr::Lit(v)) => (key.clone(), *op, v),
-            (Expr::Lit(v), Expr::Prop { slot: 0, key }) => (key.clone(), flip_op(*op), v),
+            (Expr::Prop { slot: s, key }, Expr::Lit(v)) if *s == slot => (key.clone(), *op, v),
+            (Expr::Lit(v), Expr::Prop { slot: s, key }) if *s == slot => {
+                (key.clone(), flip_op(*op), v)
+            }
             _ => return None,
         };
         match lit {
@@ -2747,7 +2753,6 @@ fn try_stream_num_count(store: &Store, label: &Option<String>, pred: &Expr) -> O
     };
     let mut conjuncts = Vec::new();
     flatten_and(pred, &mut conjuncts);
-    // Every conjunct must be a numeric compare on the SAME Num column.
     let mut key0: Option<String> = None;
     let mut bounds: Vec<(CompareOp, f64)> = Vec::with_capacity(conjuncts.len());
     for c in &conjuncts {
@@ -2758,7 +2763,77 @@ fn try_stream_num_count(store: &Store, label: &Option<String>, pred: &Expr) -> O
         }
         bounds.push((op, t));
     }
-    let key = key0?;
+    Some((key0?, bounds))
+}
+
+/// Answer `count(*)` over `Filter(edge-pred, Expand{bind_edge})` by STREAMING the
+/// expansion — for each source, test each matching out-edge's property inline and
+/// count — instead of materializing every `(source, edge, target)` row and filtering
+/// (an O(edges) Batch). Edge properties are boxed (a per-key eid→Value map), so the
+/// per-edge lookup stays, but the row materialization is what dominated. The survivor
+/// test matches the general Filter (a present Num edge prop tests the bounds;
+/// null/non-numeric → UNKNOWN → dropped), so the count is identical. Only the pred on
+/// the bound EDGE slot (not the target node) is handled; anything else falls through.
+fn try_edge_filtered_count(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.func != AggFn::Count || agg.arg.is_some() || agg.distinct {
+        return None; // count(*) only
+    }
+    let Plan::Filter {
+        input: expand,
+        pred,
+    } = input
+    else {
+        return None;
+    };
+    let Plan::Expand {
+        input: src,
+        from,
+        dir,
+        edge_label,
+        bind_edge,
+    } = expand.as_ref()
+    else {
+        return None;
+    };
+    if !bind_edge {
+        return None; // the edge must be bound for the filter to read its property
+    }
+    // A bind_edge Expand appends the edge at the slot just past its input (then the
+    // target node); the pred must be a numeric conjunction on that edge slot.
+    let edge_slot = from + 1;
+    let (key, bounds) = num_conj_on_slot(pred, edge_slot)?;
+    let want = match edge_label {
+        None => None,
+        Some(name) => match store.etype_id(name) {
+            Some(id) => Some(id),
+            None => return Some(scalar_num(0.0)), // unknown edge type → no rows
+        },
+    };
+    let src_ids = frontier_ids(src, store)?;
+    let mut count = 0u64;
+    for &v in &src_ids {
+        for_each_nbr(store, v, *dir, want, |_nbr, eid| {
+            if let Value::Num(x) = store.edge_prop(eid, &key) {
+                if bounds.iter().all(|&(op, t)| num_pred(op, x, t)) {
+                    count += 1;
+                }
+            }
+        });
+    }
+    Some(scalar_num(count as f64))
+}
+
+fn try_stream_num_count(store: &Store, label: &Option<String>, pred: &Expr) -> Option<u64> {
+    let (key, bounds) = num_conj_on_slot(pred, 0)?;
     let Some(Column::Num { data, present }) = store.column(&key) else {
         return None;
     };
