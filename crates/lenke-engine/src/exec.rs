@@ -5604,6 +5604,25 @@ fn read_property(store: &Store, col: &Col, key: &str) -> Col {
     // An edge slot reads an EDGE property (boxed map, keyed by eid). A `u32::MAX`
     // eid is the OPTIONAL null sentinel → NULL.
     if let Col::Edges(eids) = col {
+        // Fast path: a fully-present NUMERIC edge property → a raw `Col::Num`, so the
+        // downstream compare / aggregate hits the unboxed f64 path (the same win the
+        // node columns already get). One outer hash lookup for `key`, then a probe
+        // per edge; bail to the boxed `Gen` path the moment any edge is missing the
+        // key, is the OPTIONAL null sentinel (`u32::MAX`, absent from the map), or is
+        // non-numeric — those need the null-carrying general column.
+        if let Some(map) = store.edge_prop_map(key) {
+            let mut nums = Vec::with_capacity(eids.len());
+            let ok = eids.iter().all(|&e| match map.get(&e) {
+                Some(Value::Num(x)) => {
+                    nums.push(*x);
+                    true
+                }
+                _ => false,
+            });
+            if ok {
+                return Col::Num(nums);
+            }
+        }
         return Col::Gen(
             eids.iter()
                 .map(|&e| {

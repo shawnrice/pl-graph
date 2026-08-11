@@ -5174,6 +5174,48 @@ mod tests {
         assert!(matches!(col(&out, 0, "who"), Value::Str(x) if &*x == "b"));
     }
 
+    /// An edge property present on SOME edges must not use the all-present raw
+    /// `Col::Num` fast path — the reader falls back to the null-carrying column, so
+    /// the missing cell reads NULL (and is dropped by a numeric filter).
+    #[test]
+    fn edge_property_partly_present_reads_null() {
+        use crate::exec::execute;
+        let mut st = Builder::default().build();
+        execute(
+            &super::parse(
+                "INSERT (a:P {name: 'a'})-[:R {w: 0.5}]->(b:P {name: 'b'}), \
+                 (a)-[:R]->(c:P {name: 'c'})",
+            )
+            .unwrap(),
+            &mut st,
+        )
+        .unwrap();
+        // Projection: the w-less edge reads NULL, not a panic or a stale 0.
+        let out = run(
+            &super::parse("MATCH (a:P)-[r:R]->(b) RETURN b.name AS who, r.w AS w").unwrap(),
+            &st,
+        );
+        let mut got: Vec<(String, Value)> = out
+            .rows
+            .iter()
+            .map(|r| match (&r[0], &r[1]) {
+                (Value::Str(s), w) => (s.to_string(), w.clone()),
+                _ => panic!(),
+            })
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got[0].0, "b");
+        assert_eq!(num(&got[0].1), 0.5);
+        assert_eq!(got[1].0, "c");
+        assert!(got[1].1.is_null());
+        // Filter: `r.w > 0.4` keeps only the present-and-matching edge.
+        let out = run(
+            &super::parse("MATCH (a:P)-[r:R]->(b) WHERE r.w > 0.4 RETURN count(*) AS c").unwrap(),
+            &st,
+        );
+        assert_eq!(num(&col(&out, 0, "c")), 1.0);
+    }
+
     /// WHERE on an edge property filters edges: only the 0.5 edge passes `> 0.4`.
     #[test]
     fn where_on_edge_property() {

@@ -13,6 +13,35 @@ use std::sync::Arc;
 
 use crate::value::Value;
 
+/// Identity hasher for dense `u32` keys (edge ids). Edge ids are assigned
+/// sequentially, so hashing an id to itself spreads the SwissTable buckets nearly
+/// perfectly while skipping SipHash's per-probe mixing — the edge-property map is
+/// probed once per edge on every edge-property read, and that hashing dominated
+/// (a `HashMap<u32,_>` probe measured ~65ns; identity hashing removes the mix).
+/// `write` keeps a correct (if unused) byte fallback so a non-`u32` key can never
+/// silently mis-hash.
+#[derive(Default)]
+pub struct U32Hasher(u64);
+impl std::hash::Hasher for U32Hasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b);
+        }
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.0 = u64::from(n);
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+type U32BuildHasher = std::hash::BuildHasherDefault<U32Hasher>;
+/// One edge-property key's per-eid values, identity-hashed (see [`U32Hasher`]).
+pub type EdgeMap = HashMap<u32, Value, U32BuildHasher>;
+
 /// A `Value` ordered by the value contract's total order (`cmp_total`) — the key
 /// type for a range index's `BTreeMap`. It DELEGATES to `cmp_total`; it does not
 /// restate ordering. `Eq` is "compares equal under `cmp_total`", so values the
@@ -495,7 +524,7 @@ pub struct Store {
     /// less hot path than node scans, and eids are sparse after deletes. A deleted
     /// edge's props are left behind (eids are never reused, so a dead eid is never
     /// read); reclaiming them is a later tidy.
-    edge_props: HashMap<String, HashMap<u32, Value>>,
+    edge_props: HashMap<String, EdgeMap>,
     /// hash indexes on a node property `key`: value's group-key bytes -> node ids
     /// (any label; the seek intersects with the label). Maintained on writes
     /// through the primitives, so a transaction rollback (which replays the
@@ -1272,6 +1301,15 @@ impl Store {
             .and_then(|m| m.get(&eid))
             .cloned()
             .unwrap_or(Value::Null)
+    }
+
+    /// The raw per-eid map for one edge-property `key`, if any edge carries it.
+    /// Lets a reader resolve the key ONCE and probe many eids against that single
+    /// inner map (the exec edge-column fast path), instead of re-hashing `key` per
+    /// edge through [`Self::edge_prop`].
+    #[must_use]
+    pub fn edge_prop_map(&self, key: &str) -> Option<&EdgeMap> {
+        self.edge_props.get(key)
     }
 
     /// Whether edge `eid` carries a present value for `key`.
