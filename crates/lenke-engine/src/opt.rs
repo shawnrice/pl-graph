@@ -596,6 +596,121 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 },
                 true,
             ),
+            // predicate pushdown below a VarLength / ShortestPath: both append the
+            // reached endpoint at slot `width(input)`, keeping every input slot in
+            // place, so any conjunct that reads only those input slots (the classic
+            // case: a filter on the traversal SOURCE, `WHERE a.age = 1`) filters the
+            // input BEFORE the expansion. The predicate is SPLIT — the source part is
+            // pushed, a residual on the target stays above — because otherwise a
+            // mixed `a.age = 1 AND b.age = 2` refuses to push at all and the walk
+            // runs from every node: catastrophic for an unbounded `->*` reach
+            // (measured: a source-filtered ANY SHORTEST went from "does not finish"
+            // to instant).
+            Plan::VarLength {
+                input: vin,
+                from,
+                dir,
+                edge_label,
+                min,
+                max,
+                trail,
+            } => {
+                let (below, above) = split_pushable(pred, width(&vin));
+                match below {
+                    // No conjunct reads only the input — rebuild unchanged.
+                    None => {
+                        let vl = Plan::VarLength {
+                            input: vin,
+                            from,
+                            dir,
+                            edge_label,
+                            min,
+                            max,
+                            trail,
+                        };
+                        (
+                            Plan::Filter {
+                                input: Box::new(vl),
+                                pred: above.expect("a filter predicate is non-empty"),
+                            },
+                            false,
+                        )
+                    }
+                    Some(below) => {
+                        let inner = Plan::VarLength {
+                            input: Box::new(Plan::Filter {
+                                input: vin,
+                                pred: below,
+                            }),
+                            from,
+                            dir,
+                            edge_label,
+                            min,
+                            max,
+                            trail,
+                        };
+                        match above {
+                            Some(a) => (
+                                Plan::Filter {
+                                    input: Box::new(inner),
+                                    pred: a,
+                                },
+                                true,
+                            ),
+                            None => (inner, true),
+                        }
+                    }
+                }
+            }
+            Plan::ShortestPath {
+                input: sin,
+                from,
+                dir,
+                edge_label,
+                max,
+            } => {
+                let (below, above) = split_pushable(pred, width(&sin));
+                match below {
+                    None => {
+                        let sp = Plan::ShortestPath {
+                            input: sin,
+                            from,
+                            dir,
+                            edge_label,
+                            max,
+                        };
+                        (
+                            Plan::Filter {
+                                input: Box::new(sp),
+                                pred: above.expect("a filter predicate is non-empty"),
+                            },
+                            false,
+                        )
+                    }
+                    Some(below) => {
+                        let inner = Plan::ShortestPath {
+                            input: Box::new(Plan::Filter {
+                                input: sin,
+                                pred: below,
+                            }),
+                            from,
+                            dir,
+                            edge_label,
+                            max,
+                        };
+                        match above {
+                            Some(a) => (
+                                Plan::Filter {
+                                    input: Box::new(inner),
+                                    pred: a,
+                                },
+                                true,
+                            ),
+                            None => (inner, true),
+                        }
+                    }
+                }
+            }
             // interval-overlap fusion: `Filter(r.lo <= X AND r.hi >= Y)` over a
             // bind_edge Expand → an `IntervalExpand` (seek-or-scan). The predicate
             // reads the bound EDGE slot (= the expand's input width), so the
@@ -734,6 +849,35 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
 /// (a constant, or a Path) trivially qualifies.
 fn refs_below(expr: &Expr, bound: usize) -> bool {
     max_slot(expr).is_none_or(|m| m < bound)
+}
+
+/// Flatten a top-level AND tree into its conjuncts (order preserved).
+fn flatten_and(e: Expr, out: &mut Vec<Expr>) {
+    match e {
+        Expr::And(a, b) => {
+            flatten_and(*a, out);
+            flatten_and(*b, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// Rebuild a left-leaning AND-chain from conjuncts; `None` if empty.
+fn and_all(conjs: Vec<Expr>) -> Option<Expr> {
+    let mut it = conjs.into_iter();
+    let first = it.next()?;
+    Some(it.fold(first, |acc, e| Expr::And(Box::new(acc), Box::new(e))))
+}
+
+/// Split `pred`'s conjuncts into those referencing only slots `< bound` (pushable
+/// below an operator that appends slots ≥ `bound`) and the rest. AND is symmetric
+/// for the keep-TRUE filter, so re-grouping is exact. Returns `(below, above)`.
+fn split_pushable(pred: Expr, bound: usize) -> (Option<Expr>, Option<Expr>) {
+    let mut conj = Vec::new();
+    flatten_and(pred, &mut conj);
+    let (below, above): (Vec<Expr>, Vec<Expr>) =
+        conj.into_iter().partition(|c| refs_below(c, bound));
+    (and_all(below), and_all(above))
 }
 
 /// Classify one comparison against the edge in slot `edge_slot` as an interval
@@ -1158,6 +1302,56 @@ mod tests {
                 );
             }
             other => panic!("expected Filter at top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn varlen_split_pushdown_source_below_target_above() {
+        let store = social();
+        // `a.name = 'alice' AND b.age >= 40` over a var-length hop: the source
+        // conjunct (slot 0) pushes below the VarLength; the target conjunct (slot 1,
+        // the appended endpoint) stays above. Rows must be unchanged.
+        let plan = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .var_length(0, Dir::Out, Some("KNOWS"), 1, 2, true)
+        .filter(Expr::And(
+            Box::new(cmp(CompareOp::Eq, prop(0, "name"), Expr::Lit(s("alice")))),
+            Box::new(cmp(CompareOp::Ge, prop(1, "age"), Expr::Lit(n(40.0)))),
+        ));
+        let opt = assert_rows_preserved(&plan, &store);
+        // Shape: Filter{target} over VarLength{ input: <pushed source> }.
+        match opt {
+            Plan::Filter { input, pred } => {
+                assert!(!refs_below(&pred, 1), "the residual reads the target slot");
+                let Plan::VarLength { input: vin, .. } = *input else {
+                    panic!("expected VarLength under the residual filter");
+                };
+                assert!(
+                    matches!(*vin, Plan::Filter { .. } | Plan::IndexSeek { .. }),
+                    "the source predicate moved below the VarLength"
+                );
+            }
+            other => panic!("expected a residual Filter on top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shortest_path_source_filter_pushes_down() {
+        let store = social();
+        // A pure source filter over ShortestPath pushes fully below it (no residual).
+        let plan = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .shortest_path(0, Dir::Out, Some("KNOWS"), None)
+        .filter(cmp(CompareOp::Eq, prop(0, "name"), Expr::Lit(s("alice"))));
+        let opt = assert_rows_preserved(&plan, &store);
+        match opt {
+            Plan::ShortestPath { input, .. } => assert!(
+                matches!(*input, Plan::Filter { .. } | Plan::IndexSeek { .. }),
+                "source predicate now below the ShortestPath"
+            ),
+            other => panic!("expected ShortestPath at top, got {other:?}"),
         }
     }
 

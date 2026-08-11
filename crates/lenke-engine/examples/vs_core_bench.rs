@@ -218,6 +218,20 @@ fn shapes() -> Vec<Shape> {
         same("var/1to3", "MATCH (a:Person)-[:R]->{1,3}(b) RETURN count(*) AS c"),
         // --- OPTIONAL MATCH ---
         same("opt/expand", "MATCH (a:Person) WHERE a.age < 5 OPTIONAL MATCH (a)-[:R]->(b) RETURN count(b) AS c"),
+        // --- bounded reachability (source-filter pushdown below the traversal) ---
+        same("path/reach", "MATCH (a:Person)-[:R]->{1,3}(b) WHERE a.age = 1 RETURN count(DISTINCT b) AS c"),
+        same("path/reach-src", "MATCH (a:Person)-[:R]->{1,4}(b) WHERE a.name = 'n5' RETURN count(*) AS c"),
+        // --- EXISTS / subquery ---
+        same("exists/hop", "MATCH (a:Person) WHERE EXISTS { (a)-[:R]->(b) WHERE b.age > 90 } RETURN count(*) AS c"),
+        same("call/inline", "MATCH (a:Person) WHERE a.age < 3 CALL (a) { MATCH (a)-[:R]->(b) RETURN b.age AS ba } RETURN count(*) AS c"),
+        // --- UNION ---
+        same("union/all", "MATCH (p:Person) WHERE p.age < 5 RETURN p.name AS n UNION ALL MATCH (p:Person) WHERE p.age > 95 RETURN p.name AS n"),
+        same("union/dedup", "MATCH (p:Person) WHERE p.age < 5 RETURN p.age AS a UNION MATCH (p:Person) WHERE p.age < 10 RETURN p.age AS a"),
+        // --- list / misc functions ---
+        same("fn/minmax-str", "MATCH (p:Person) RETURN min(p.name) AS lo, max(p.name) AS hi"),
+        same("fn/abs-round", "MATCH (p:Person) RETURN sum(abs(p.age - 50)) AS s"),
+        // --- OPTIONAL projecting the optional var ---
+        same("opt/proj", "MATCH (a:Person) WHERE a.age < 5 OPTIONAL MATCH (a)-[:R]->(b) RETURN a.name AS a, b.age AS ba"),
         // --- CALL algorithms (snake_case on both engines) ---
         same("call/degree", "CALL degree() YIELD degree RETURN sum(degree) AS s"),
         same("call/wcc", "CALL connected_components() YIELD componentId RETURN count(DISTINCT componentId) AS c"),
