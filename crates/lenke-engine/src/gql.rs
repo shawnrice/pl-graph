@@ -364,6 +364,41 @@ impl Parser {
         // pattern's slots by the left width (the Join operator's convention).
         let (mut plan, mut scope, mut slots) = self.pattern()?;
         while self.eat(&Tok::Comma) {
+            // Fold a shared-start LINEAR comma pattern into chained expansion. A
+            // pattern that begins at an already-bound variable and only introduces
+            // NEW variables (no cycle-closing) is exactly a continuing MATCH from
+            // that variable — index-nested-loop over its adjacency — rather than an
+            // independent Scan of the whole label + hash join. The join re-scans and
+            // materializes both sides (measured ~11x slower on a two-hop join,
+            // `join/tri` in vs_core_bench); the chained expand walks adjacency. Any
+            // non-foldable shape (first node unbound/relabeled, or a landing var that
+            // re-binds an existing one) rewinds and takes the correct hash join.
+            let saved = self.pos;
+            if matches!(self.peek(), Some(Tok::LParen)) {
+                let probe = self.node()?;
+                let start = match &probe {
+                    (Some(v), None, props) if props.is_empty() => scope.get(v).copied(),
+                    _ => None,
+                };
+                if let Some(from) = start {
+                    let (mut sc, mut sl) = (scope.clone(), slots);
+                    let before = sl;
+                    let cand = self.extend_chain(plan.clone(), &mut sc, &mut sl, from)?;
+                    // A cycle-close silently rebinds a previously-bound variable into
+                    // the freshly-appended slot range (extend_chain only appends). If
+                    // no old binding moved, the pattern was a pure linear extension.
+                    let rebound = scope
+                        .iter()
+                        .any(|(k, &old)| old < before && sc.get(k) != Some(&old));
+                    if !rebound {
+                        plan = cand;
+                        scope = sc;
+                        slots = sl;
+                        continue;
+                    }
+                }
+                self.pos = saved;
+            }
             let (p2, s2, k2) = self.pattern()?;
             let on: Vec<(usize, usize)> = s2
                 .iter()
@@ -4042,6 +4077,69 @@ mod tests {
     #[test]
     fn bad_quantifier_errors() {
         assert!(super::parse("MATCH (a:Person)-[:KNOWS]->{3,1}(b) RETURN a.name AS a").is_err());
+    }
+
+    /// A shared-start LINEAR comma pattern `…, (b)-[:R]->(c)` (b bound, c new) folds
+    /// into a chained expansion — no hash Join — and returns exactly what the join
+    /// spelling would. Guards the `join/tri` optimization.
+    #[test]
+    fn comma_join_linear_folds_to_chain() {
+        use crate::ir::{Dir, Expr, Plan};
+        let store = social();
+        let q = "MATCH (a:Person)-[:KNOWS]->(b), (b)-[:KNOWS]->(c) RETURN c.name AS c";
+        let plan = super::parse(q).unwrap();
+        // The fold fired: the plan is a chain of Expands, with no Join operator.
+        assert!(
+            !format!("{plan:?}").contains("Join"),
+            "expected the linear comma pattern to fold into a chain, got a Join"
+        );
+        // …and it equals the same shape written as one chained MATCH.
+        let hand = Plan::Scan {
+            label: Some("Person".into()),
+        }
+        .expand(0, Dir::Out, Some("KNOWS"))
+        .expand(1, Dir::Out, Some("KNOWS"))
+        .project(vec![(
+            "c".into(),
+            Expr::Prop {
+                slot: 2,
+                key: "name".into(),
+            },
+        )]);
+        assert_same(q, &hand, &store);
+    }
+
+    /// A cycle-CLOSING comma pattern `(a)-[:R]->(b), (b)-[:R]->(a)` must NOT fold
+    /// (a chained expand would rebind `a` rather than require the walk return to it);
+    /// it falls back to the hash Join, which equates the shared endpoints.
+    #[test]
+    fn comma_join_cycle_close_keeps_join() {
+        let store = social();
+        // carol KNOWS alice and alice KNOWS carol? alice->bob->carol, carol->? In
+        // `social`, the only mutual KNOWS pair drives the count; we assert the plan
+        // shape (Join kept) and that it runs without rebinding to a wrong answer.
+        let q = "MATCH (a:Person)-[:KNOWS]->(b), (b)-[:KNOWS]->(a) RETURN a.name AS a";
+        let plan = super::parse(q).unwrap();
+        assert!(
+            format!("{plan:?}").contains("Join"),
+            "a cycle-closing comma pattern must keep the hash Join"
+        );
+        // Every returned `a` must genuinely sit on a 2-cycle a->b->a.
+        let out = run(&plan, &store);
+        for row in &out.rows {
+            let Value::Str(name) = &row[0] else {
+                panic!("expected a name")
+            };
+            let back = run(
+                &super::parse(&format!(
+                    "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(a2) \
+                     WHERE a.name = '{name}' AND a2.name = '{name}' RETURN a.name AS a"
+                ))
+                .unwrap(),
+                &store,
+            );
+            assert!(!back.rows.is_empty(), "{name} is not on a real 2-cycle");
+        }
     }
 
     // --- part 3.5: arithmetic (E1) ---
