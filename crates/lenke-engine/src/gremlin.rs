@@ -1164,10 +1164,39 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 Expr::Not(Box::new(inner))
             }
+            // A navigating hop child is a semi-join predicate: does the current
+            // element HAVE such an adjacency? It builds the same `Expr::Exists` the
+            // `where(<hop>)` step does, so `not(out('L'))` is the anti-join and
+            // `and(out('L'), has(…))` mixes an edge test with a property test.
+            "out" | "in" | "both" => {
+                let dir = match name.as_str() {
+                    "out" => Dir::Out,
+                    "in" => Dir::In,
+                    _ => Dir::Both,
+                };
+                let label = if matches!(self.peek(), Some(Tok::Str(_))) {
+                    let l = self.str_arg()?;
+                    if self.peek() == Some(&Tok::Comma) {
+                        return Err(
+                            "and/or/not hop child with multiple edge labels is not yet supported"
+                                .into(),
+                        );
+                    }
+                    Some(l)
+                } else {
+                    None
+                };
+                self.expect(&Tok::RParen)?;
+                let body = Plan::Row.expand(self.current, dir, label.as_deref());
+                Expr::Exists {
+                    body: Box::new(body),
+                    outer_width: self.slots,
+                }
+            }
             other => {
                 return Err(format!(
-                    "and/or/not child `{other}()` is not a supported filter (navigating child \
-                     traversals are deferred; use has/hasNot/and/or/not)"
+                    "and/or/not child `{other}()` is not a supported filter (use \
+                     has/hasNot/out/in/both/and/or/not)"
                 ))
             }
         };
@@ -1456,6 +1485,52 @@ mod tests {
         );
     }
 
+    /// `and`/`or`/`not` accept navigating hop children too, each a semi-join
+    /// `Expr::Exists` (the same construction as `where(<hop>)`). So `not(out('L'))`
+    /// is the ANTI-join (elements without such an edge) and `and(out('L'), has(…))`
+    /// mixes an edge test with a property test — verified equal to the GQL
+    /// EXISTS/NOT EXISTS forms.
+    #[test]
+    fn gremlin_and_or_not_hop_children() {
+        let store = social();
+        // not(out(KNOWS)) = the anti-join: vertices WITHOUT an out-KNOWS edge.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().not(out('KNOWS')).values('name')",
+                &store
+            )),
+            value_bag(&gql_rows(
+                "MATCH (n) WHERE NOT EXISTS { (n)-[:KNOWS]->() } RETURN n.name",
+                &store,
+            )),
+        );
+        // and(<hop>, <property>) mixes a semi-join with a predicate.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().and(out('KNOWS'), has('name','alice')).values('name')",
+                &store,
+            )),
+            value_bag(&gql_rows(
+                "MATCH (n) WHERE EXISTS { (n)-[:KNOWS]->() } AND n.name='alice' RETURN n.name",
+                &store,
+            )),
+        );
+        // or of two different hops.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().or(out('WORKS_ON'), in('KNOWS')).values('name')",
+                &store,
+            )),
+            value_bag(&gql_rows(
+                "MATCH (n) WHERE EXISTS { (n)-[:WORKS_ON]->() } OR EXISTS { (n)<-[:KNOWS]-() } \
+                 RETURN n.name",
+                &store,
+            )),
+        );
+        // A multi-label hop child is deferred, not mis-parsed.
+        assert!(super::parse("g.V().and(out('A','B'), has('k'))").is_err());
+    }
+
     /// `where(<hop>)` is a semi-join: keep the current element iff it HAS such an
     /// adjacency. It lowers to an `Expr::Exists` whose body seeds `Plan::Row` and
     /// expands from the current slot — the same shape GQL's `EXISTS { … }` builds —
@@ -1561,9 +1636,10 @@ mod tests {
                 &store,
             )),
         );
-        // Navigating child traversals (semi-joins) are deferred, not mis-parsed.
-        assert!(super::parse("g.V().and(out('KNOWS'), has('age', gt(1)))").is_err());
-        assert!(super::parse("g.V().not(out('KNOWS'))").is_err());
+        // Navigating child traversals are now semi-joins (see
+        // `gremlin_and_or_not_hop_children`); they parse rather than error.
+        assert!(super::parse("g.V().and(out('KNOWS'), has('age', gt(1)))").is_ok());
+        assert!(super::parse("g.V().not(out('KNOWS'))").is_ok());
     }
 
     /// `group().by(key).by(value)` is a grouped aggregation. Core shapes it as one
