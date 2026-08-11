@@ -2267,6 +2267,13 @@ fn frontier_counts(plan: &Plan, store: &Store) -> Option<Vec<f64>> {
                 },
             };
             let mut next = vec![0.0f64; n];
+            // Scatter: for each non-zero source, add its count to every matching
+            // neighbour. REJECTED alternative — a GATHER (sum prev[src] over each
+            // target's reverse edges, sequential writes): it was WORSE, because it
+            // must visit ALL n targets (not just non-zero sources) and the random
+            // READS of `prev` still thrash at scale. 3-hop count(*) at 200k/deg4
+            // 6.9ms -> 10.5ms (1.10x -> 0.72x) and no change at 1M/deg8 (still
+            // ~349ms). The scatter's non-zero-only pass wins.
             for (v, &c) in prev.iter().enumerate() {
                 if c != 0.0 {
                     for_each_nbr(store, v as u32, *dir, want, |nbr, _| {
