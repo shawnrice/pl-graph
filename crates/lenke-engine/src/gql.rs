@@ -4079,6 +4079,40 @@ mod tests {
         assert!(super::parse("MATCH (a:Person)-[:KNOWS]->{3,1}(b) RETURN a.name AS a").is_err());
     }
 
+    /// `NOT p` over compares / AND / OR is pushed into the raw filter fast paths by
+    /// inversion; each form must return the SAME rows as its hand-inverted twin.
+    #[test]
+    fn not_pushdown_equals_inverted() {
+        let store = social();
+        let rows = |q: &str| {
+            let mut v: Vec<String> = run(&super::parse(q).unwrap(), &store)
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Value::Str(s) => s.to_string(),
+                    other => format!("{other:?}"),
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        // NOT (compare)
+        assert_eq!(
+            rows("MATCH (p:Person) WHERE NOT p.age > 30 RETURN p.name AS n"),
+            rows("MATCH (p:Person) WHERE p.age <= 30 RETURN p.name AS n"),
+        );
+        // NOT (a AND b) ≡ NOT a OR NOT b
+        assert_eq!(
+            rows("MATCH (p:Person) WHERE NOT (p.age >= 20 AND p.age < 40) RETURN p.name AS n"),
+            rows("MATCH (p:Person) WHERE p.age < 20 OR p.age >= 40 RETURN p.name AS n"),
+        );
+        // NOT (a OR b) ≡ NOT a AND NOT b
+        assert_eq!(
+            rows("MATCH (p:Person) WHERE NOT (p.age < 25 OR p.age > 60) RETURN p.name AS n"),
+            rows("MATCH (p:Person) WHERE p.age >= 25 AND p.age <= 60 RETURN p.name AS n"),
+        );
+    }
+
     /// A shared-start LINEAR comma pattern `…, (b)-[:R]->(c)` (b bound, c new) folds
     /// into a chained expansion — no hash Join — and returns exactly what the join
     /// spelling would. Guards the `join/tri` optimization.

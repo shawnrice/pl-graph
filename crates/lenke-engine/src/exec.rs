@@ -5001,6 +5001,40 @@ fn flip_op(op: CompareOp) -> CompareOp {
     }
 }
 
+/// The negation of a compare operator — `NOT (x op y)` ≡ `x invert_op(op) y` for
+/// present, finite operands. Stored Num/Str cells always are (NaN/absent → NULL,
+/// gated by `present`), so the raw fast paths keep the exact keep-TRUE semantics.
+fn invert_op(op: CompareOp) -> CompareOp {
+    match op {
+        CompareOp::Eq => CompareOp::Ne,
+        CompareOp::Ne => CompareOp::Eq,
+        CompareOp::Lt => CompareOp::Ge,
+        CompareOp::Ge => CompareOp::Lt,
+        CompareOp::Gt => CompareOp::Le,
+        CompareOp::Le => CompareOp::Gt,
+    }
+}
+
+/// De Morgan push-down of `NOT` for the keep-TRUE filter: an equivalent positive
+/// predicate (`NOT` eliminated) when `e` is built from compares / AND / OR / NOT,
+/// else `None`. Exact in Kleene 3-valued logic for "keep rows where TRUE": `NOT e`
+/// is TRUE iff `e` is FALSE, and each rule preserves that (`AND` is FALSE iff an
+/// operand is FALSE → `OR` of the negations; `>` inverts to `<=`; etc.). Absent /
+/// NaN cells stay dropped on both sides because every compare is UNKNOWN there.
+fn invert_pred(e: &Expr) -> Option<Expr> {
+    Some(match e {
+        Expr::Compare { op, left, right } => Expr::Compare {
+            op: invert_op(*op),
+            left: left.clone(),
+            right: right.clone(),
+        },
+        Expr::And(a, b) => Expr::Or(Box::new(invert_pred(a)?), Box::new(invert_pred(b)?)),
+        Expr::Or(a, b) => Expr::And(Box::new(invert_pred(a)?), Box::new(invert_pred(b)?)),
+        Expr::Not(inner) => (**inner).clone(),
+        _ => return None,
+    })
+}
+
 /// A typed reader over ONE storage column for the multi-column distinct fast path:
 /// it appends a row's grouping-key bytes (byte-identical to
 /// [`value::group_key_into`] over the boxed value, so the induced equivalence is the
@@ -5446,6 +5480,13 @@ fn try_num_conjunction(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<
 }
 
 fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usize>> {
+    // `NOT p` pushes into the raw fast paths by inverting `p` (De Morgan + operator
+    // flip), exact for the keep-TRUE filter. If the inverted form is not itself
+    // fast-pathable, this returns None and the caller evaluates the original `NOT`
+    // through the general (boxed) path.
+    if let Expr::Not(inner) = pred {
+        return invert_pred(inner).and_then(|pos| try_filter_keep(&pos, store, batch));
+    }
     // A CONJUNCTION of typed-numeric `prop <op> literal` compares on one node slot
     // (e.g. `age >= 30 AND age < 40`) keeps rows satisfying ALL, in one raw-f64
     // pass — no per-cell boxing, and no falling to the general And evaluator.
