@@ -4114,6 +4114,52 @@ mod tests {
     }
 
     #[test]
+    fn streaming_num_filtered_count_matches_enumeration() {
+        use crate::store::Builder;
+        // Includes a NULL age (every 11th) and a NaN age (every 13th) so the count's
+        // NULL-gating and NaN-drops-from-ordering rules are exercised; the streaming
+        // count must equal the enumerated survivor count for each predicate spelling.
+        let mut b = Builder::default();
+        for i in 0..3000u32 {
+            let mut props = vec![("name", Value::Str(format!("n{i}").into()))];
+            let age = if i % 13 == 0 {
+                Some(f64::NAN)
+            } else if i % 11 == 0 {
+                None
+            } else {
+                Some(f64::from(i % 100))
+            };
+            if let Some(a) = age {
+                props.push(("age", Value::Num(a)));
+            }
+            b.node(&["P"], &props);
+        }
+        let st = b.build();
+        let cnt = |q: &str| match &run(&super::parse(q).unwrap(), &st).rows[0][0] {
+            Value::Num(x) => *x as usize,
+            other => panic!("not a count: {other:?}"),
+        };
+        // Each: count(*) (streaming) == the enumerated row count (RETURN name).
+        for wc in [
+            "p.age > 50",
+            "50 < p.age", // flipped operands, same predicate
+            "p.age >= 10 AND p.age < 20",
+            "p.age <= 10 AND p.age >= 5",
+            "p.age = 42",
+            "p.age <> 42",
+        ] {
+            let c = cnt(&format!("MATCH (p:P) WHERE {wc} RETURN count(*) AS c"));
+            let rows = run(
+                &super::parse(&format!("MATCH (p:P) WHERE {wc} RETURN p.name AS n")).unwrap(),
+                &st,
+            )
+            .rows
+            .len();
+            assert_eq!(c, rows, "streaming count != enumerated for `{wc}`");
+        }
+    }
+
+    #[test]
     fn low_card_num_distinct_matches_hashing() {
         use crate::store::Builder;
         use std::collections::BTreeSet;
