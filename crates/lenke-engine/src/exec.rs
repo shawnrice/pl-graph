@@ -1292,6 +1292,25 @@ fn sort_idx(idx: &mut [usize], key_cols: &[Col], keys: &[crate::ir::SortKey], en
         } else {
             idx.sort_unstable_by(cmp);
         }
+    } else if let [Col::Str(vals)] = key_cols {
+        // A single string key: compare the `Arc<str>` cells directly (lexicographic,
+        // == `cmp_total` for strings) instead of boxing each cell through `value_at`.
+        // Col::Str carries no nulls; the arrival-index tiebreak keeps it total/stable.
+        let desc = keys[0].descending;
+        let cmp = |&a: &usize, &b: &usize| {
+            let o = if desc {
+                vals[b].as_ref().cmp(vals[a].as_ref())
+            } else {
+                vals[a].as_ref().cmp(vals[b].as_ref())
+            };
+            o.then(a.cmp(&b))
+        };
+        if end < n {
+            idx.select_nth_unstable_by(end - 1, cmp);
+            idx[..end].sort_unstable_by(cmp);
+        } else {
+            idx.sort_unstable_by(cmp);
+        }
     } else if end < n {
         let total = |&a: &usize, &b: &usize| row_cmp(key_cols, keys, a, b).then(a.cmp(&b));
         idx.select_nth_unstable_by(end - 1, total);
