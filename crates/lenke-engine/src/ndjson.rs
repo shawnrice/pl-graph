@@ -318,6 +318,9 @@ pub fn from_ndjson(text: &str) -> Result<Store, String> {
             store.set_edge_prop(eid, k, v.clone());
         }
     }
+    // Incremental loading left the CSR overlay stale; flatten it once so a loaded
+    // snapshot gets the contiguous read path without waiting for a later rebuild.
+    store.rebuild_csr();
     Ok(store)
 }
 

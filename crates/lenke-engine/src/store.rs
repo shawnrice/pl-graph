@@ -549,6 +549,20 @@ pub struct Store {
     /// mutation primitives; an interval-key edge-prop change triggers a full
     /// rebuild (rare — intervals are typically bulk-loaded before the index).
     interval: Option<IntervalIndex>,
+    /// CSR READ OVERLAY of the adjacency. `out_adj`/`in_adj` (per-node `Vec`s) stay
+    /// the source of truth for writes/rollback; this flattens them into one
+    /// contiguous array per direction (offset `off[v]..off[v+1]` is node `v`'s
+    /// slice) so a traversal streams cache-friendly memory instead of chasing a
+    /// scattered `Vec` pointer per node. Built at load and rebuilt on demand; any
+    /// adjacency write clears `csr_fresh`, and `out`/`inc` then fall back to the
+    /// per-node `Vec`s (correct, just no CSR speedup until the next rebuild). The
+    /// flat arrays are built in `out_adj` order, so a CSR slice is byte-identical to
+    /// the `Vec` slice — order-sensitive summations/traversals are unaffected.
+    csr_out_off: Vec<u32>,
+    csr_out: Vec<Adj>,
+    csr_in_off: Vec<u32>,
+    csr_in: Vec<Adj>,
+    csr_fresh: bool,
 }
 
 /// A hash index on a node property PATH. `path` is `["age"]` for a plain property
@@ -596,13 +610,65 @@ impl Store {
     /// A node's outgoing adjacency.
     #[must_use]
     pub fn out(&self, node: u32) -> &[Adj] {
+        if self.csr_fresh {
+            let v = node as usize;
+            if v + 1 < self.csr_out_off.len() {
+                let (a, b) = (
+                    self.csr_out_off[v] as usize,
+                    self.csr_out_off[v + 1] as usize,
+                );
+                return &self.csr_out[a..b];
+            }
+            return &[];
+        }
         self.out_adj.get(node as usize).map_or(&[], Vec::as_slice)
     }
 
     /// A node's incoming adjacency.
     #[must_use]
     pub fn inc(&self, node: u32) -> &[Adj] {
+        if self.csr_fresh {
+            let v = node as usize;
+            if v + 1 < self.csr_in_off.len() {
+                let (a, b) = (self.csr_in_off[v] as usize, self.csr_in_off[v + 1] as usize);
+                return &self.csr_in[a..b];
+            }
+            return &[];
+        }
         self.in_adj.get(node as usize).map_or(&[], Vec::as_slice)
+    }
+
+    /// (Re)build the CSR read overlay from the per-node adjacency, preserving each
+    /// node's neighbour ORDER exactly (so a CSR slice equals the `Vec` slice). O(V+E)
+    /// — called once after a load, and on demand after a batch of writes. Marks the
+    /// overlay fresh, so subsequent `out`/`inc` use the contiguous arrays.
+    pub fn rebuild_csr(&mut self) {
+        let n = self.out_adj.len();
+        self.csr_out_off.clear();
+        self.csr_out.clear();
+        self.csr_in_off.clear();
+        self.csr_in.clear();
+        self.csr_out_off.reserve(n + 1);
+        self.csr_in_off.reserve(n + 1);
+        self.csr_out_off.push(0);
+        for adj in &self.out_adj {
+            self.csr_out.extend_from_slice(adj);
+            self.csr_out_off
+                .push(u32::try_from(self.csr_out.len()).expect("edge count exceeds u32"));
+        }
+        self.csr_in_off.push(0);
+        for adj in &self.in_adj {
+            self.csr_in.extend_from_slice(adj);
+            self.csr_in_off
+                .push(u32::try_from(self.csr_in.len()).expect("edge count exceeds u32"));
+        }
+        self.csr_fresh = true;
+    }
+
+    /// Drop the CSR overlay (an adjacency write happened); `out`/`inc` fall back to
+    /// the per-node `Vec`s until the next [`Self::rebuild_csr`].
+    fn invalidate_csr(&mut self) {
+        self.csr_fresh = false;
     }
 
     /// Every LIVE node id — the scan universe when no label narrows it. Deleted
@@ -918,6 +984,7 @@ impl Store {
         labels: &[&str],
         props: &[(&str, Value)],
     ) -> u32 {
+        self.invalidate_csr(); // a new node changes the adjacency shape
         let id = self.node_count as u32;
         self.node_count += 1;
         self.node_ext.push(Arc::clone(ext));
@@ -966,6 +1033,7 @@ impl Store {
     /// Add an edge carrying an explicit external id (used by ingest). Returns the
     /// eid.
     pub fn add_edge_with_id(&mut self, ext: &Arc<str>, from: u32, to: u32, label: &str) -> u32 {
+        self.invalidate_csr();
         assert!(
             (from as usize) < self.node_count && (to as usize) < self.node_count,
             "edge endpoint out of range"
@@ -1632,6 +1700,7 @@ impl Store {
     /// was its source (so it is safe to call with the endpoints in either order,
     /// e.g. from a hop matched via incoming adjacency). A no-op if already gone.
     pub fn delete_edge(&mut self, u: u32, v: u32, eid: u32) {
+        self.invalidate_csr();
         let logging = self.undo.is_some();
         let mut removed: Vec<(u32, bool, Adj)> = Vec::new();
         for node in [u, v] {
@@ -1677,6 +1746,7 @@ impl Store {
     /// it from every label bucket, and clear its properties. After this it is
     /// absent from all scans and traversals. A no-op if already deleted.
     pub fn delete_node(&mut self, id: u32) {
+        self.invalidate_csr();
         let i = id as usize;
         if self.deleted[i] {
             return;
@@ -1907,6 +1977,9 @@ impl Store {
     /// Apply one undo record. The caller has taken the log out (`self.undo` is
     /// `None`), so the primitive mutations invoked here do not re-log.
     fn apply_undo(&mut self, rec: Undo) {
+        // Rollback replays adjacency changes; conservatively drop the overlay (a
+        // prop-only undo also clears it — harmless, just forces one rebuild).
+        self.invalidate_csr();
         match rec {
             Undo::AddNode => self.pop_last_node(),
             Undo::AddEdge { u, v, eid } => self.delete_edge(u, v, eid),
@@ -2017,6 +2090,7 @@ impl Store {
 
     /// Pop the last (highest-id) node — the inverse of a logged `add_node`.
     fn pop_last_node(&mut self) {
+        self.invalidate_csr();
         debug_assert!(self.node_count > 0);
         let id = (self.node_count - 1) as u32;
         // Drop it from any indexes while its props still exist.
@@ -2120,7 +2194,7 @@ impl Builder {
                 eid,
             });
         }
-        Store {
+        let mut st = Store {
             node_count: n,
             by_label: self.by_label,
             props,
@@ -2149,7 +2223,15 @@ impl Builder {
             out_type_idx: Vec::new(),
             in_type_idx: Vec::new(),
             interval: None,
-        }
+            csr_out_off: Vec::new(),
+            csr_out: Vec::new(),
+            csr_in_off: Vec::new(),
+            csr_in: Vec::new(),
+            csr_fresh: false,
+        };
+        // Flatten the freshly-built adjacency into the CSR read overlay.
+        st.rebuild_csr();
+        st
     }
 }
 
@@ -2278,6 +2360,35 @@ fn homogeneous_temporal_kind(pairs: &[(u32, Value)]) -> Option<crate::temporal::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CSR read overlay must (a) match the per-node adjacency exactly after a
+    /// build, (b) reflect a write IMMEDIATELY (invalidation → Vec fallback), and
+    /// (c) match again after an explicit rebuild.
+    #[test]
+    fn csr_overlay_matches_and_invalidates_on_write() {
+        let mut b = Builder::default();
+        b.node(&["N"], &[]);
+        b.node(&["N"], &[]);
+        b.node(&["N"], &[]);
+        b.edge(0, 1, "R");
+        b.edge(0, 2, "R");
+        let mut st = b.build();
+        let out = |st: &Store, v: u32| -> Vec<u32> { st.out(v).iter().map(|a| a.nbr).collect() };
+        let inc = |st: &Store, v: u32| -> Vec<u32> { st.inc(v).iter().map(|a| a.nbr).collect() };
+        // (a) fresh CSR after build: neighbour ORDER preserved.
+        assert!(st.csr_fresh);
+        assert_eq!(out(&st, 0), vec![1, 2]);
+        // (b) a write clears the overlay and is visible at once via the Vec fallback.
+        st.add_edge(0, 1, "R");
+        assert!(!st.csr_fresh);
+        assert_eq!(out(&st, 0), vec![1, 2, 1]);
+        assert_eq!(inc(&st, 1), vec![0, 0]);
+        // (c) rebuild re-enables the CSR and it still matches.
+        st.rebuild_csr();
+        assert!(st.csr_fresh);
+        assert_eq!(out(&st, 0), vec![1, 2, 1]);
+        assert_eq!(inc(&st, 1), vec![0, 0]);
+    }
 
     fn s(x: &str) -> Value {
         Value::Str(Arc::from(x))
