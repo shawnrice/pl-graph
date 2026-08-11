@@ -4667,6 +4667,64 @@ fn shortest_path(
     out
 }
 
+/// Elementwise `l OP r` over two already-evaluated columns — the general arithmetic
+/// body, shared by `Expr::Arith` and its scalar fast path's non-numeric fallback.
+/// Raw f64 when both are `Col::Num`; otherwise per-cell via the value contract (a
+/// NULL / non-numeric operand → NULL, a temporal operand → `temporal_arith`). Div/Rem
+/// by a zero divisor (the RIGHT operand) throws, matching core's DataException.
+fn arith_general(op: crate::ir::ArithOp, l: &Col, r: &Col) -> Result<Col, String> {
+    use crate::ir::ArithOp::{Add, Div, Mul, Rem, Sub};
+    if let (Col::Num(xs), Col::Num(ys)) = (l, r) {
+        let n = xs.len().min(ys.len());
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let (x, y) = (xs[i], ys[i]);
+            if matches!(op, Div | Rem) && y == 0.0 {
+                return Err("division by zero".into());
+            }
+            out.push(match op {
+                Add => x + y,
+                Sub => x - y,
+                Mul => x * y,
+                Div => x / y,
+                Rem => x % y,
+            });
+        }
+        return Ok(Col::Num(out));
+    }
+    let n = l.len().min(r.len());
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = l.value_at(i);
+        let b = r.value_at(i);
+        let v = if matches!(a, Value::Temporal(_)) || matches!(b, Value::Temporal(_)) {
+            if a.is_null() || b.is_null() {
+                Value::Null
+            } else {
+                temporal_arith(op, &a, &b)?
+            }
+        } else {
+            match (value::num_of(&a), value::num_of(&b)) {
+                (Some(x), Some(y)) => {
+                    if matches!(op, Div | Rem) && y == 0.0 {
+                        return Err("division by zero".into());
+                    }
+                    Value::Num(match op {
+                        Add => x + y,
+                        Sub => x - y,
+                        Mul => x * y,
+                        Div => x / y,
+                        Rem => x % y,
+                    })
+                }
+                _ => Value::Null,
+            }
+        };
+        out.push(v);
+    }
+    Ok(Col::Gen(out))
+}
+
 /// Evaluate `expr` over every row of `batch`, producing a column.
 fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
     Ok(match expr {
@@ -4777,66 +4835,71 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             // either operand is a temporal, `temporal_arith` takes over (and may
             // THROW on a result out of the representable range).
             use crate::ir::ArithOp::{Add, Div, Mul, Rem, Sub};
-            let l = eval(left, store, batch)?;
-            let r = eval(right, store, batch)?;
-            // Raw fast path: both operands are `Col::Num` (a Num property — always
-            // finite, since NaN/Inf are nulled at ingest — or a broadcast literal), so
-            // no cell is null/non-numeric/temporal. Compute over the f64 slices with
-            // no per-row `value_at` boxing; Div/Rem by zero still THROWS, every other
-            // result (including ±Inf overflow) is kept, exactly as the general arm.
-            if let (Col::Num(xs), Col::Num(ys)) = (&l, &r) {
-                let n = xs.len().min(ys.len());
-                let mut out = Vec::with_capacity(n);
-                for i in 0..n {
-                    let (x, y) = (xs[i], ys[i]);
-                    if matches!(op, Div | Rem) && y == 0.0 {
-                        return Err("division by zero".into());
-                    }
-                    out.push(match op {
-                        Add => x + y,
-                        Sub => x - y,
-                        Mul => x * y,
-                        Div => x / y,
-                        Rem => x % y,
-                    });
-                }
-                return Ok(Col::Num(out));
-            }
-            let n = l.len().min(r.len());
-            let mut out = Vec::with_capacity(n);
-            for i in 0..n {
-                let a = l.value_at(i);
-                let b = r.value_at(i);
-                let v = if matches!(a, Value::Temporal(_)) || matches!(b, Value::Temporal(_)) {
-                    if a.is_null() || b.is_null() {
-                        Value::Null
-                    } else {
-                        temporal_arith(*op, &a, &b)?
-                    }
-                } else {
-                    match (value::num_of(&a), value::num_of(&b)) {
-                        (Some(x), Some(y)) => {
-                            // Division / modulo by zero THROWS (matches lenke-core's
-                            // DataException). Every OTHER result — including overflow
-                            // to ±Inf — is KEPT (IEEE), not nulled; NaN/Inf are only
-                            // coerced to null at the JSON egress boundary (K4).
-                            if matches!(op, Div | Rem) && y == 0.0 {
+            // Scalar-literal fast path: `col OP num` / `num OP col`. Evaluate ONLY the
+            // non-literal operand and fold the constant into the loop — never
+            // materializing an n-length broadcast column for the literal. A chain like
+            // `age * 2 + 1` then costs one gather + two scalar passes instead of two
+            // 8 MB constant columns plus a boxed intermediate; at 1M that alloc traffic
+            // was the whole gap (proj/arith 0.55x). Semantics match the general arm
+            // below: div/rem by a zero DIVISOR throws (the divisor is the RIGHT
+            // operand), every other f64 result is kept.
+            let lit_num = |e: &Expr| match e {
+                Expr::Lit(Value::Num(t)) if t.is_finite() => Some(*t),
+                _ => None,
+            };
+            let scalar = match (lit_num(left), lit_num(right)) {
+                (_, Some(t)) => Some((t, false)), // col OP num (num is the divisor)
+                (Some(t), None) => Some((t, true)), // num OP col (col is the divisor)
+                _ => None,
+            };
+            if let Some((t, num_on_left)) = scalar {
+                let other = if num_on_left { right } else { left };
+                let col = eval(other, store, batch)?;
+                if let Col::Num(xs) = col {
+                    let mut out = Vec::with_capacity(xs.len());
+                    if matches!(op, Div | Rem) && num_on_left {
+                        // num OP col → the COLUMN is the divisor; a zero cell throws.
+                        for &x in &xs {
+                            if x == 0.0 {
                                 return Err("division by zero".into());
                             }
-                            Value::Num(match op {
-                                Add => x + y,
-                                Sub => x - y,
-                                Mul => x * y,
-                                Div => x / y,
-                                Rem => x % y,
-                            })
+                            out.push(if matches!(op, Div) { t / x } else { t % x });
                         }
-                        _ => Value::Null,
+                    } else if matches!(op, Div | Rem) {
+                        // col OP num → the LITERAL is the divisor; throw once if zero.
+                        if t == 0.0 {
+                            return Err("division by zero".into());
+                        }
+                        for &x in &xs {
+                            out.push(if matches!(op, Div) { x / t } else { x % t });
+                        }
+                    } else {
+                        for &x in &xs {
+                            let (a, b) = if num_on_left { (t, x) } else { (x, t) };
+                            out.push(match op {
+                                Add => a + b,
+                                Sub => a - b,
+                                Mul => a * b,
+                                _ => unreachable!(),
+                            });
+                        }
                     }
+                    return Ok(Col::Num(out));
+                }
+                // The non-literal side is not a raw Num column (a null / boxed / temporal
+                // operand): reuse the evaluated `col` and a broadcast literal through the
+                // general loop rather than re-evaluating.
+                let lit_col = broadcast(Value::Num(t), col.len());
+                let (l, r) = if num_on_left {
+                    (lit_col, col)
+                } else {
+                    (col, lit_col)
                 };
-                out.push(v);
+                return arith_general(*op, &l, &r);
             }
-            Col::Gen(out)
+            let l = eval(left, store, batch)?;
+            let r = eval(right, store, batch)?;
+            return arith_general(*op, &l, &r);
         }
         Expr::Call { name, args } => {
             // `element_id(node|edge)` → the element's PRESERVED external id string.
