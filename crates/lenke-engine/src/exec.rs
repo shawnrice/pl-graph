@@ -1006,6 +1006,15 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             let bl = pull(left, store, track)?;
             let br = pull(right, store, track)?;
             let ncols = bl.slots.len();
+            // UNION ALL of same-width arms: concatenate the arms COLUMN-wise (bl's rows
+            // then br's), preserving each column's native type — no per-row Vec<Value>
+            // materialize + transpose (the ~4x-slower nested-Vec build). The final
+            // result rendering turns nodes/edges into maps just as render_cell would,
+            // so this is byte-identical. The dedup / width-padding path below still
+            // handles UNION (distinct) and mismatched-width arms.
+            if *all && br.slots.len() == ncols {
+                return Ok(concat_batches(&[bl, br]));
+            }
             let mut rows: Vec<Vec<Value>> = Vec::with_capacity(bl.rows() + br.rows());
             for b in [&bl, &br] {
                 for i in 0..b.rows() {
