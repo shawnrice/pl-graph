@@ -2656,6 +2656,47 @@ fn try_varlen_count(
     let Col::Nodes(src) = batch.slot(*from) else {
         return None;
     };
+
+    // ALGEBRAIC count: for a bounded OUT trail with max<=2, count(*) is the sum of
+    // per-hop trail counts computed from degrees in O(V+E) — NOT by enumerating the
+    // O(paths) walks. 1-hop = the source out-edges; 2-hop = for each source out-edge
+    // s->y, the neighbour's out-degree, minus the one reused-self-loop path
+    // (s->s->s over the same edge, which a trail forbids). Only taken when the
+    // enumeration would be the MORE expensive path (a large source set); a filtered
+    // / small source stays on the DFS below, where enumeration is already cheap.
+    if matches!(dir, Dir::Out) && *max <= 2 && *max >= 1 && *trail {
+        let (nc, ec) = (store.node_count(), store.edge_count());
+        let avg_deg = if nc == 0 { 0.0 } else { ec as f64 / nc as f64 };
+        let est_paths = src.len() as f64 * avg_deg.powi(*max as i32);
+        if est_paths > 2.0 * (nc + ec) as f64 {
+            let mut outdeg = vec![0u64; nc];
+            for (v, d) in outdeg.iter_mut().enumerate() {
+                *d = match want {
+                    None => store.out(v as u32).len() as u64,
+                    Some(w) => store.out(v as u32).iter().filter(|a| a.etype == w).count() as u64,
+                };
+            }
+            let mut total: u64 = 0;
+            for &s in src {
+                for a in store.out(s) {
+                    if want.is_some_and(|w| w != a.etype) {
+                        continue;
+                    }
+                    if *min <= 1 {
+                        total += 1; // the 1-hop trail s -> a.nbr
+                    }
+                    if *max >= 2 {
+                        total += outdeg[a.nbr as usize]; // 2-hop trails s -> a.nbr -> z
+                        if a.nbr == s {
+                            total -= 1; // exclude the reused self-loop s -> s -> s
+                        }
+                    }
+                }
+            }
+            return Some(scalar_num(total as f64));
+        }
+    }
+
     let mut total: u64 = 0;
     let mut used: Vec<u32> = Vec::new();
     for &v in src {

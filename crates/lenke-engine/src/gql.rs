@@ -4079,6 +4079,47 @@ mod tests {
         assert!(super::parse("MATCH (a:Person)-[:KNOWS]->{3,1}(b) RETURN a.name AS a").is_err());
     }
 
+    /// The algebraic degree-product count for a bounded OUT var-length must equal the
+    /// DFS enumeration — on a graph large enough that the formula path FIRES, and
+    /// with a self-loop that exercises the reused-edge trail correction.
+    #[test]
+    fn varlen_degree_formula_matches_enumeration() {
+        use crate::store::Builder;
+        // 1000 nodes, degree 4 → est_paths (1000·4²=16k) > 2·(V+E) (~10k), so the
+        // formula fires for {1,2}/{2,2}; a self-loop on node 0 tests the correction.
+        let mut b = Builder::default();
+        for _ in 0..1000 {
+            b.node(&["N"], &[]);
+        }
+        for i in 0u32..1000 {
+            for d in 0u32..4 {
+                b.edge(i, (i * 7 + d * 13 + 1) % 1000, "R");
+            }
+        }
+        b.edge(0, 0, "R"); // self-loop → reused-edge trail exclusion
+        let st = b.build();
+        let count = |q: &str| match &run(&super::parse(q).unwrap(), &st).rows[0][0] {
+            Value::Num(x) => *x as usize,
+            other => panic!("not a count: {other:?}"),
+        };
+        // The count(*) (formula) must equal the enumerated row count (RETURN b).
+        for (lo, hi) in [(1u32, 1u32), (1, 2), (2, 2)] {
+            let formula = count(&format!(
+                "MATCH (a:N)-[:R]->{{{lo},{hi}}}(b) RETURN count(*) AS c"
+            ));
+            let enumerated = run(
+                &super::parse(&format!(
+                    "MATCH (a:N)-[:R]->{{{lo},{hi}}}(b) RETURN b.z AS b"
+                ))
+                .unwrap(),
+                &st,
+            )
+            .rows
+            .len();
+            assert_eq!(formula, enumerated, "mismatch for {{{lo},{hi}}}");
+        }
+    }
+
     /// Cardinality-driven anchor flip: a selective indexed `=` on the traversal
     /// TARGET seeds the target and walks reverse edges instead of scanning every
     /// source. The result multiset must equal the forward walk — INCLUDING excluding
