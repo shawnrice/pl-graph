@@ -5319,8 +5319,34 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
         }
         return Some(keep);
     }
-    // General path (Str/Bool/Temporal/Gen columns): read the cell, then compare via
-    // the value contract. Ordering uses `cmp_partial` (3VL — cross-type/NaN → drop,
+    // Typed fast path: a Str column vs a Str literal compares `&str` directly — no
+    // per-cell `Value` boxing. `=`/`<>` are byte equality (== `value::equals`);
+    // ordering is lexicographic (== `cmp_partial` for two strings). A NULL cell is
+    // gated by `present`; a NULL literal was handled above.
+    if let (Column::Str { data, present }, Value::Str(t)) = (column, lit) {
+        let t = t.as_ref();
+        for (row, &id) in ids.iter().enumerate() {
+            let i = id as usize;
+            if !present[i] {
+                continue; // NULL → UNKNOWN → dropped
+            }
+            let x = data[i].as_ref();
+            let hit = match op {
+                CompareOp::Eq => x == t,
+                CompareOp::Ne => x != t,
+                CompareOp::Lt => x < t,
+                CompareOp::Le => x <= t,
+                CompareOp::Gt => x > t,
+                CompareOp::Ge => x >= t,
+            };
+            if hit {
+                keep.push(row);
+            }
+        }
+        return Some(keep);
+    }
+    // General path (Bool/Temporal/Gen columns): read the cell, then compare via the
+    // value contract. Ordering uses `cmp_partial` (3VL — cross-type/NaN → drop,
     // matching `compare`), NOT the total order.
     for (row, &id) in ids.iter().enumerate() {
         let v = column.read(id as usize);

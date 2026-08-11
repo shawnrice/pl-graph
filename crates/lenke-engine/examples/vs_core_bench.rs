@@ -125,6 +125,8 @@ fn main() {
         "MATCH (p:Person) WHERE p.age < 5 OR p.age > 95 RETURN p.name AS name",
         "MATCH (p:Person) WHERE p.age IN [1, 2, 3, 4, 5] RETURN p.name AS name",
         "MATCH (p:Person) WHERE p.name = 'n12345' RETURN p.age AS age",
+        "MATCH (p:Person) WHERE p.name < 'n15' RETURN p.age AS age",
+        "MATCH (p:Person) WHERE p.name <> 'n0' RETURN count(*) AS c",
         // --- projections / expressions ---
         "MATCH (p:Person) RETURN p.name AS name, p.age AS age",
         "MATCH (p:Person) RETURN p.age + 1 AS a",
