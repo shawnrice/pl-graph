@@ -6586,10 +6586,18 @@ fn try_num_conjunction(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<
     // Same-column range (`lo <= x AND x < hi`) — the overwhelmingly common
     // conjunction. Normalize the two bounds to a concrete lower/upper with
     // inclusivity, then run ONE loop of LITERAL f64 comparisons: no per-element `match
-    // op` and no runtime spec loop, so it vectorizes like the single-compare path
-    // (which WINS) instead of running ~2x slower. NaN fails both compares (dropped),
-    // matching `num_pred`'s 3VL; `present` gates nulls — byte-identical to the general
-    // path below.
+    // op` and no runtime spec loop. NaN fails both compares (dropped), matching
+    // `num_pred`'s 3VL; `present` gates nulls — byte-identical to the general path
+    // below. At 1M this turns range filter+project from 0.68x to 1.10x.
+    //
+    // REJECTED (both measured NEUTRAL at the 200k cache-resident bench size, where
+    // range count(*) sits at ~0.73x — core just has a tighter scalar loop and this is
+    // a ~0.16ms gap on a sub-ms scan, below the reliable-signal floor):
+    //   - Iterating the column SEQUENTIALLY when the id list is the contiguous full
+    //     scan (`id == row`), to drop the `d0[ids[row]]` gather: no change (the gather
+    //     of a 0..n list is already sequential in practice).
+    //   - The default release target has no SIMD gather, so a mask-then-compact split
+    //     would not vectorize the gather either — no reason to expect a win.
     if specs.len() == 2 {
         let (d0, p0, op0, t0) = specs[0];
         let (d1, _, op1, t1) = specs[1];
