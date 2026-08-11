@@ -1421,6 +1421,38 @@ impl Store {
         )
     }
 
+    /// The size of the hash-index bucket for `key = value` — an EXACT selectivity
+    /// for an `=` seek, O(1) (the bucket `Vec`'s length; it may count a few
+    /// tombstoned ids, which is fine for an estimate). `None` if no index on `key`.
+    #[must_use]
+    pub fn index_bucket_len(&self, key: &str, value: &Value) -> Option<usize> {
+        let path: Vec<String> = key.split('.').map(String::from).collect();
+        let idx = self.indexes.iter().find(|i| i.path == path)?;
+        let gk = crate::value::group_key(value);
+        Some(idx.map.get(&gk).map_or(0, Vec::len))
+    }
+
+    /// Total edges ever created (O(1), monotonic). Used as
+    /// `avg_degree = edge_count / node_count` for a fan-out estimate; a few deleted
+    /// edges lingering only nudge the estimate, which never affects correctness.
+    #[must_use]
+    pub fn edge_count(&self) -> usize {
+        self.next_eid as usize
+    }
+
+    /// The EXACT number of distinct present values in a low-cardinality
+    /// (dict-encoded) column — the group count for a grouping key, `dict.len()`,
+    /// O(1). `None` for an absent or non-dict column (a high-cardinality string /
+    /// numeric column has no cheap exact distinct count — that is where estimation,
+    /// not counting, is unavoidable).
+    #[must_use]
+    pub fn distinct_count(&self, key: &str) -> Option<usize> {
+        match self.column(key)? {
+            Column::Dict { dict, .. } => Some(dict.len()),
+            _ => None,
+        }
+    }
+
     /// Update every hash index whose BASE is `base` for a node whose base value
     /// changed from `old` to `new` (`None` = absent on that side).
     fn reindex_node(&mut self, base: &str, node: u32, old: Option<&Value>, new: Option<&Value>) {

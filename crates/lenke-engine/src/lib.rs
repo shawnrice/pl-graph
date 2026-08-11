@@ -32,6 +32,7 @@
 pub mod algo;
 pub mod arrow;
 pub mod batch;
+pub mod cost;
 pub mod exec;
 pub mod gql;
 pub mod gremlin;
