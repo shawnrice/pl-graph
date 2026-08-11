@@ -834,6 +834,18 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 plan.order_page(vec![], None, Some(n))
             }
+            "tail" => {
+                // tail(n) — the LAST n rows of the stream (default 1), the mirror of
+                // limit. Operates on the committed row order; a preceding order()
+                // makes it "the top n".
+                let n = if matches!(self.peek(), Some(Tok::Num(_))) {
+                    self.usize_arg()?
+                } else {
+                    1
+                };
+                self.expect(&Tok::RParen)?;
+                plan.tail(n)
+            }
             "range" => {
                 let lo = self.usize_arg()?;
                 self.expect(&Tok::Comma)?;
@@ -1625,6 +1637,33 @@ mod tests {
                 &store
             )),
             vec!["Str(\"bob\");"],
+        );
+    }
+
+    /// `tail(n)` keeps the LAST n rows of the committed order — the mirror of
+    /// `limit(n)` (the first n). After `order().by('age')` it is the top-n by age.
+    #[test]
+    fn gremlin_tail_is_the_last_n() {
+        let store = social();
+        let ages = "g.V().hasLabel('Person').order().by('age').values('age')";
+        // tail(2) = the two largest ages (the tail of the ascending order); limit(2)
+        // = the two smallest — different windows of the same order.
+        assert_eq!(
+            value_bag(&gremlin_rows(&format!("{ages}.tail(2)"), &store)),
+            vec!["Num(30.0);", "Num(40.0);"],
+        );
+        assert_eq!(
+            value_bag(&gremlin_rows(&format!("{ages}.limit(2)"), &store)),
+            vec!["Num(25.0);", "Num(30.0);"],
+        );
+        // Default n = 1 (the single largest); an oversized n keeps everything.
+        assert_eq!(
+            value_bag(&gremlin_rows(&format!("{ages}.tail()"), &store)),
+            vec!["Num(40.0);"],
+        );
+        assert_eq!(
+            value_bag(&gremlin_rows(&format!("{ages}.tail(99)"), &store)),
+            vec!["Num(25.0);", "Num(30.0);", "Num(40.0);"],
         );
     }
 

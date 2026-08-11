@@ -692,6 +692,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::VarLength { input, .. }
         | Plan::ShortestPath { input, .. }
         | Plan::Distinct { input }
+        | Plan::Tail { input, .. }
         | Plan::SortLocal { input, .. } => needs_lineage(input),
         Plan::IntervalExpand {
             input, qlo, qhi, ..
@@ -940,6 +941,15 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             } else {
                 order_page(&pull(input, store, track)?, store, keys, *skip, *limit)?
             }
+        }
+        Plan::Tail { input, n } => {
+            // The last `n` rows in input order (Gremlin tail): gather the tail window,
+            // computing its start from the materialized row count. `gather` carries
+            // the slots AND the lineage sidecar, so a path survives the trim.
+            let b = pull(input, store, track)?;
+            let rows = b.rows();
+            let start = rows.saturating_sub(*n);
+            b.gather(&(start..rows).collect::<Vec<usize>>())
         }
         Plan::Project { input, items } => {
             // Project produces a batch whose slots ARE the projected columns, so

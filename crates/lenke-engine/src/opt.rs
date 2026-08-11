@@ -336,6 +336,16 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             let (i, c) = rewrite(*input, idx);
             (Plan::Distinct { input: Box::new(i) }, c)
         }
+        Plan::Tail { input, n } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::Tail {
+                    input: Box::new(i),
+                    n,
+                },
+                c,
+            )
+        }
         Plan::SortLocal { input, descending } => {
             let (i, c) = rewrite(*input, idx);
             (
@@ -850,6 +860,7 @@ fn width(plan: &Plan) -> usize {
         Plan::Filter { input, .. }
         | Plan::OrderPage { input, .. }
         | Plan::Distinct { input }
+        | Plan::Tail { input, .. }
         | Plan::SortLocal { input, .. } => width(input),
         Plan::Project { items, .. } => items.len(),
         Plan::Aggregate { keys, aggs, .. } => keys.len() + aggs.len(),
@@ -1225,6 +1236,7 @@ mod tests {
             | Plan::Update { input, .. }
             | Plan::CallInline { input, .. }
             | Plan::Distinct { input }
+            | Plan::Tail { input, .. }
             | Plan::SortLocal { input, .. } => plan_contains_filter(input),
             Plan::Join { left, right, .. } | Plan::Union { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)

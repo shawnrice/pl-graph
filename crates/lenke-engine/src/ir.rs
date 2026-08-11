@@ -367,6 +367,11 @@ pub enum Plan {
         skip: Option<usize>,
         limit: Option<usize>,
     },
+    /// Keep the LAST `n` rows of the input, in input order — Gremlin `tail(n)`. The
+    /// symmetric partner of a keyless `OrderPage` limit (the FIRST n): both take a
+    /// window of the committed row order, but `tail`'s start offset (`rows - n`) is
+    /// only known at exec, so it is its own node rather than an `OrderPage` skip.
+    Tail { input: Box<Plan>, n: usize },
     /// Produce output columns: `(name, expr)` per column.
     Project {
         input: Box<Plan>,
@@ -616,6 +621,14 @@ impl Plan {
             keys,
             skip,
             limit,
+        }
+    }
+
+    #[must_use]
+    pub fn tail(self, n: usize) -> Self {
+        Self::Tail {
+            input: Box::new(self),
+            n,
         }
     }
 
