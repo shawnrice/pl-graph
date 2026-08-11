@@ -5111,6 +5111,67 @@ fn flatten_and<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
+fn flatten_or<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::Or(a, b) => {
+            flatten_or(a, out);
+            flatten_or(b, out);
+        }
+        _ => out.push(e),
+    }
+}
+
+/// Keep rows satisfying a DISJUNCTION of `prop <op> num-literal` compares, all on
+/// the same node slot and all reading `Num` columns — one raw-f64 pass keeping a
+/// row when ANY disjunct is TRUE. This is the OR mirror of [`try_num_conjunction`],
+/// and it also catches `x IN [a, b, …]`, which the parser desugars to an OR-chain of
+/// equalities. 3VL WHERE semantics hold: a disjunct over a NULL/NaN cell is never
+/// TRUE, so the row is kept iff some disjunct is definitely TRUE (else FALSE/UNKNOWN
+/// → dropped), matching the general `Or` evaluator under `is_true`.
+fn try_num_disjunction(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usize>> {
+    if !matches!(pred, Expr::Or(..)) {
+        return None;
+    }
+    let mut atoms = Vec::new();
+    flatten_or(pred, &mut atoms);
+    let mut slot0: Option<usize> = None;
+    let mut specs: Vec<(&[f64], &[bool], CompareOp, f64)> = Vec::with_capacity(atoms.len());
+    for atom in atoms {
+        let Expr::Compare { op, left, right } = atom else {
+            return None;
+        };
+        let (slot, key, op, lit) = match (left.as_ref(), right.as_ref()) {
+            (Expr::Prop { slot, key }, Expr::Lit(v)) => (*slot, key, *op, v),
+            (Expr::Lit(v), Expr::Prop { slot, key }) => (*slot, key, flip_op(*op), v),
+            _ => return None,
+        };
+        match slot0 {
+            Some(s) if s != slot => return None, // all disjuncts on the same slot
+            _ => slot0 = Some(slot),
+        }
+        let Value::Num(t) = lit else { return None };
+        let Some(Column::Num { data, present }) = store.column(key) else {
+            return None;
+        };
+        specs.push((data, present, op, *t));
+    }
+    let Col::Nodes(ids) = batch.slot(slot0?) else {
+        return None;
+    };
+    Some(
+        ids.iter()
+            .enumerate()
+            .filter(|&(_, &id)| {
+                let i = id as usize;
+                specs
+                    .iter()
+                    .any(|&(data, present, op, t)| present[i] && num_pred(op, data[i], t))
+            })
+            .map(|(row, _)| row)
+            .collect(),
+    )
+}
+
 /// Keep rows satisfying a CONJUNCTION of `prop <op> num-literal` compares, all on
 /// the same node slot and all reading `Num` columns — one raw-f64 pass over the id
 /// list, each conjunct a `num_pred` (a NULL/NaN cell fails its conjunct → the row
@@ -5165,6 +5226,10 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
     // (e.g. `age >= 30 AND age < 40`) keeps rows satisfying ALL, in one raw-f64
     // pass — no per-cell boxing, and no falling to the general And evaluator.
     if let Some(keep) = try_num_conjunction(pred, store, batch) {
+        return Some(keep);
+    }
+    // The OR mirror — `age < 5 OR age > 95`, and `age IN [1, 2, …]` (an OR-chain).
+    if let Some(keep) = try_num_disjunction(pred, store, batch) {
         return Some(keep);
     }
     let Expr::Compare { op, left, right } = pred else {

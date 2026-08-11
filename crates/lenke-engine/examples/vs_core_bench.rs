@@ -118,13 +118,38 @@ fn main() {
     let mut cgraph = core_fixture(n, deg);
 
     let queries = [
+        // --- scans / filters ---
         "MATCH (p:Person) WHERE p.age > 90 RETURN p.name AS name",
+        "MATCH (p:Person) WHERE p.age >= 10 AND p.age < 20 RETURN p.name AS name",
+        "MATCH (p:Person) WHERE p.age = 42 RETURN p.name AS name",
+        "MATCH (p:Person) WHERE p.age < 5 OR p.age > 95 RETURN p.name AS name",
+        "MATCH (p:Person) WHERE p.age IN [1, 2, 3, 4, 5] RETURN p.name AS name",
+        "MATCH (p:Person) WHERE p.name = 'n12345' RETURN p.age AS age",
+        // --- projections / expressions ---
+        "MATCH (p:Person) RETURN p.name AS name, p.age AS age",
+        "MATCH (p:Person) RETURN p.age + 1 AS a",
+        "MATCH (p:Person) RETURN upper(p.name) AS u",
+        // --- aggregations ---
         "MATCH (p:Person) RETURN count(*) AS c",
         "MATCH (p:Person) RETURN avg(p.age) AS a",
+        "MATCH (p:Person) RETURN sum(p.age) AS s, min(p.age) AS mn, max(p.age) AS mx",
+        "MATCH (p:Person) RETURN p.age AS age, count(*) AS c",
+        "MATCH (p:Person) WHERE p.age > 50 RETURN count(*) AS c",
+        // --- ordering / paging / distinct ---
+        "MATCH (p:Person) RETURN p.age AS age ORDER BY age",
+        "MATCH (p:Person) RETURN p.age AS age ORDER BY age DESC LIMIT 10",
+        "MATCH (p:Person) RETURN p.name AS name ORDER BY name LIMIT 100",
+        "MATCH (p:Person) RETURN DISTINCT p.age AS age",
+        // --- traversal ---
         "MATCH (a:Person)-[:R]->(b) RETURN count(*) AS c",
         "MATCH (a:Person)-[:R]->(b) RETURN b.name AS who",
+        "MATCH (a:Person)-[:R]->(b) WHERE b.age > 90 RETURN b.name AS who",
         "MATCH (a:Person)-[:R]->(b) RETURN b.age AS age, count(*) AS c",
         "MATCH (a:Person)-[:R]->()-[:R]->(c) RETURN count(*) AS c",
+        "MATCH (a:Person)-[:R]->()-[:R]->()-[:R]->(d) RETURN count(*) AS c",
+        "MATCH (a:Person)<-[:R]-(b) RETURN count(*) AS c",
+        // --- distinct over a traversal (dedup) ---
+        "MATCH (a:Person)-[:R]->(b) RETURN DISTINCT b.age AS age",
     ];
 
     println!("  engine_ms     core_ms    ratio      rows  query");
