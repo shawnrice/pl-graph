@@ -309,7 +309,17 @@ impl Parser {
         // taints it (`path()` and the element filters are path-preserving).
         if !matches!(
             lname.as_str(),
-            "out" | "in" | "both" | "has" | "hasnot" | "and" | "or" | "not" | "path"
+            "out"
+                | "in"
+                | "both"
+                | "has"
+                | "hasnot"
+                | "and"
+                | "or"
+                | "not"
+                | "path"
+                | "simplepath"
+                | "cyclicpath"
         ) {
             self.path_ok = false;
         }
@@ -588,6 +598,30 @@ impl Parser {
                 self.current = 0;
                 self.slots = 1;
                 p
+            }
+            "simplepath" | "cyclicpath" => {
+                self.expect(&Tok::RParen)?;
+                if !self.path_ok {
+                    return Err("simplePath()/cyclicPath() are only supported over a pure \
+                                vertex-hop chain (V-source + out/in/both)"
+                        .into());
+                }
+                // simplePath keeps traversers whose node path has NO repeat;
+                // cyclicPath keeps those that DO. `path_has_dup` reads the lineage
+                // node path (`Expr::Path`), which also switches lineage tracking on.
+                let has_dup = Expr::Call {
+                    name: "path_has_dup".to_string(),
+                    args: vec![Expr::Path],
+                };
+                let pred = if lname == "simplepath" {
+                    Expr::Not(Box::new(has_dup))
+                } else {
+                    has_dup
+                };
+                // A filter does not change the current element, so path_ok is
+                // preserved (simplepath/cyclicpath are in the path-preserving set) —
+                // a following path() still works.
+                plan.filter(pred)
             }
             "valuemap" => {
                 // valueMap() → a PROPERTIES-only map (no id/label tokens) with scalar
@@ -1483,6 +1517,51 @@ mod tests {
             gone.is_empty(),
             "missing id must contribute nothing: {gone:?}"
         );
+    }
+
+    /// `simplePath()` keeps traversers whose vertex path has NO repeat; `cyclicPath()`
+    /// keeps those that DO — a partition of the stream. They read the lineage node
+    /// path (like `path()`), so they are scoped to pure vertex-hop chains. A 2-hop
+    /// `both` walk from a node returns to it on half the paths (the cyclic ones).
+    #[test]
+    fn gremlin_simple_and_cyclic_path() {
+        let store = social();
+        // 2-hop BOTH from alice: [0,1,0] and [0,2,0] return to alice (cyclic); [0,1,2]
+        // and [0,2,1] reach a new node (simple).
+        let base = "g.V('0').both('KNOWS').both('KNOWS')";
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                &format!("{base}.simplePath().values('name')"),
+                &store
+            )),
+            vec!["Str(\"bob\");", "Str(\"carol\");"],
+        );
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                &format!("{base}.cyclicPath().values('name')"),
+                &store
+            )),
+            vec!["Str(\"alice\");", "Str(\"alice\");"],
+        );
+        // The two are complementary: together they are the whole stream (4 paths).
+        let all = value_bag(&gremlin_rows(&format!("{base}.count()"), &store));
+        assert_eq!(all, vec!["Num(4.0);"]);
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                &format!("{base}.simplePath().count()"),
+                &store
+            )),
+            vec!["Num(2.0);"],
+        );
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                &format!("{base}.cyclicPath().count()"),
+                &store
+            )),
+            vec!["Num(2.0);"],
+        );
+        // Only over a pure vertex-hop chain — a value stream is deferred.
+        assert!(super::parse("g.V().values('name').simplePath()").is_err());
     }
 
     /// `and`/`or`/`not` accept navigating hop children too, each a semi-join

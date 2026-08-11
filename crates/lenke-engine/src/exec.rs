@@ -3605,6 +3605,29 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                     .collect();
                 return Ok(Col::Gen(out));
             }
+            // `path_has_dup(path)` → Gremlin `cyclicPath`/`simplePath` support: TRUE if
+            // the lineage node path repeats any vertex, FALSE if all distinct. The
+            // argument is `Expr::Path` (a per-row list of node-id Nums); a Null row
+            // (no lineage) is Null. Gremlin-only — not in the GQL whitelist.
+            if name == "path_has_dup" {
+                let arg = eval(&args[0], store, batch)?;
+                let n = batch.rows();
+                let out: Vec<Value> = (0..n)
+                    .map(|i| match arg.value_at(i) {
+                        Value::List(ids) => {
+                            let mut seen: std::collections::HashSet<u64> =
+                                std::collections::HashSet::new();
+                            let dup = ids.iter().any(|v| match v {
+                                Value::Num(id) => !seen.insert(id.to_bits()),
+                                _ => false,
+                            });
+                            Value::Bool(dup)
+                        }
+                        other => other,
+                    })
+                    .collect();
+                return Ok(Col::Gen(out));
+            }
             // Element functions need the STORE and the element identity (a node/edge
             // slot), which the pure-value `call_scalar` cannot see — handle them
             // here off the evaluated argument column.
