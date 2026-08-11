@@ -17,6 +17,13 @@
 //!     --example vs_core_bench
 //!   BENCH_N=1000000 BENCH_DEG=8 cargo run --release ... --example vs_core_bench
 //!   BENCH_FILTER=call cargo run --release ... --example vs_core_bench   # substring match
+//!
+//! Threading: the engine is SINGLE-THREADED (it targets wasm); core uses rayon. The
+//! only shape core leads on default hardware is `call/labelprop`, and that is core
+//! spreading a slower serial algorithm across cores, not a better algorithm. For the
+//! fair algorithm-to-algorithm comparison (and the one that reflects the wasm
+//! target) pin core to one core — there the engine wins labelprop ~6x:
+//!   RAYON_NUM_THREADS=1 cargo run --release ... --example vs_core_bench
 
 use lenke_core::gql::eval::Params as CoreParams;
 use lenke_engine::store::{Builder, Store};
@@ -265,6 +272,15 @@ fn main() {
     eprintln!(
         "fixture: {n} Person nodes (1/3 also VIP), degree {deg} ({} R edges, weighted)",
         u64::from(n) * u64::from(deg)
+    );
+    // The engine is single-threaded (it must run on wasm). Core uses rayon, so the
+    // only shape it "wins" — call/labelprop — is core spreading a SLOWER serial
+    // algorithm across cores; pin core with RAYON_NUM_THREADS=1 for the fair
+    // algorithm-to-algorithm comparison (there the engine wins labelprop ~6x). Print
+    // the pool size so a labelprop ratio is never read without knowing which it is.
+    eprintln!(
+        "core rayon threads: {} (set RAYON_NUM_THREADS=1 for the single-core comparison)",
+        std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "all cores".into())
     );
 
     let estore = engine_fixture(n, deg);
