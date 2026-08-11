@@ -2738,6 +2738,51 @@ fn try_scan_multi_agg(
             _ => return None,
         }
     }
+    // Fast path: every value-aggregate reads ONE Num column (e.g. `sum(age),
+    // min(age), max(age)`) — a single BRANCH-FREE pass computing sum/cnt/min/max
+    // with straight f64 ops (stored Nums are finite, so `x < mn` == cmp_num_total),
+    // instead of the per-element per-spec match in the general loop below.
+    let used: Vec<*const f64> = specs
+        .iter()
+        .filter_map(|(c, _)| c.map(|(d, _)| d.as_ptr()))
+        .collect();
+    if !used.is_empty() && used.iter().all(|&p| p == used[0]) {
+        let (data, present) = specs.iter().find_map(|(c, _)| *c).expect("used non-empty");
+        let (mut sum, mut cnt, mut mn, mut mx, mut rows) =
+            (0.0f64, 0u64, f64::INFINITY, f64::NEG_INFINITY, 0u64);
+        scan_visit(store, label, |i| {
+            rows += 1;
+            if present[i] {
+                let x = data[i];
+                sum += x;
+                cnt += 1;
+                if x < mn {
+                    mn = x;
+                }
+                if x > mx {
+                    mx = x;
+                }
+            }
+        });
+        let cols: Vec<Col> = specs
+            .iter()
+            .map(|&(col, func)| {
+                let v = match func {
+                    AggFn::Count if col.is_none() => Value::Num(rows as f64),
+                    AggFn::Count => Value::Num(cnt as f64),
+                    AggFn::Sum => Value::Num(sum),
+                    AggFn::Avg if cnt == 0 => Value::Null,
+                    AggFn::Avg => Value::Num(sum / cnt as f64),
+                    AggFn::Min if cnt == 0 => Value::Null,
+                    AggFn::Min => Value::Num(mn),
+                    AggFn::Max if cnt == 0 => Value::Null,
+                    _ => Value::Num(mx),
+                };
+                Col::Gen(vec![v])
+            })
+            .collect();
+        return Some(Batch::of(cols));
+    }
     // (total, count, best) per agg; `rows` counts scanned nodes for count(*).
     let mut acc: Vec<(f64, u64, Option<f64>)> = vec![(0.0, 0, None); specs.len()];
     let mut rows = 0u64;
