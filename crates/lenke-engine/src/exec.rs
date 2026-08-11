@@ -3547,6 +3547,51 @@ fn try_scan_group_agg(
 /// no frontier materialization and no per-cell byte-key serialization. Nulls are
 /// skipped (as `count(DISTINCT)` does). `None` for a non-`Scan` input, a
 /// Temporal/Gen column, or a non-distinct/`count(*)` agg.
+/// The number of DISTINCT values in a Num column over `label`, computed with a
+/// bitset when every present value is an INTEGER in a small span — `count(DISTINCT
+/// age)` over 100 ages hashes 200k cells into an FnvSet; here it sets 100 bits and
+/// pops them. One pass finds the span + integrality (a value that is non-integer,
+/// NaN, or Inf disqualifies it, since `fract()`/`is_finite` reject those), a second
+/// sets a bit per `value - min`. Distinct finite integers map to distinct offsets,
+/// so the popcount equals the FnvSet's `len` exactly. `None` (fall back to hashing)
+/// when the column is empty, non-integer, or spans too wide to bitset cheaply.
+fn low_card_int_distinct_count(
+    store: &Store,
+    label: &Option<String>,
+    data: &[f64],
+    present: &[bool],
+) -> Option<usize> {
+    const MAX_SPAN: usize = 1 << 20; // cap the bitset at ~1M bits (128 KB)
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut any, mut all_int) = (false, true);
+    scan_visit(store, label, |i| {
+        if present[i] {
+            let x = data[i];
+            any = true;
+            if x.is_finite() && x.fract() == 0.0 {
+                lo = lo.min(x);
+                hi = hi.max(x);
+            } else {
+                all_int = false;
+            }
+        }
+    });
+    if !any || !all_int {
+        return None;
+    }
+    let span = (hi - lo) as usize;
+    if span >= MAX_SPAN {
+        return None;
+    }
+    let mut bits = vec![false; span + 1];
+    scan_visit(store, label, |i| {
+        if present[i] {
+            bits[(data[i] - lo) as usize] = true;
+        }
+    });
+    Some(bits.iter().filter(|&&b| b).count())
+}
+
 fn try_scan_distinct_count(
     input: &Plan,
     keys: &[(String, Expr)],
@@ -3592,13 +3637,20 @@ fn try_scan_distinct_count(
             seen.iter().filter(|&&b| b).count()
         }
         Column::Num { data, present } => {
-            let mut seen: FnvSet<u64> = FnvSet::default();
-            scan_visit(store, label, |i| {
-                if present[i] {
-                    seen.insert(value::num_group_bits(data[i]));
-                }
-            });
-            seen.len()
+            // Low-cardinality integer fast path: dedup with a bitset (popcount), no
+            // hashing. Falls back to the FnvSet when values are wide-ranged or
+            // non-integer. The distinct count is identical either way.
+            if let Some(c) = low_card_int_distinct_count(store, label, data, present) {
+                c
+            } else {
+                let mut seen: FnvSet<u64> = FnvSet::default();
+                scan_visit(store, label, |i| {
+                    if present[i] {
+                        seen.insert(value::num_group_bits(data[i]));
+                    }
+                });
+                seen.len()
+            }
         }
         Column::Bool { data, present } => {
             let mut seen = [false; 2];
