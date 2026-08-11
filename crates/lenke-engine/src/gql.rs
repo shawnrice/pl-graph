@@ -4079,6 +4079,45 @@ mod tests {
         assert!(super::parse("MATCH (a:Person)-[:KNOWS]->{3,1}(b) RETURN a.name AS a").is_err());
     }
 
+    /// Cardinality-driven anchor flip: a selective indexed `=` on the traversal
+    /// TARGET seeds the target and walks reverse edges instead of scanning every
+    /// source. The result multiset must equal the forward walk — INCLUDING excluding
+    /// a non-source-label node reached in reverse (`bot` is not a `Person`).
+    #[test]
+    fn anchor_flip_matches_forward_and_respects_source_label() {
+        use crate::store::{Builder, Store};
+        let mut b = Builder::default();
+        // ids 0..3 in insertion order.
+        b.node(&["Person"], &[("name", Value::Str("p1".into()))]); // 0
+        b.node(&["Person"], &[("name", Value::Str("p2".into()))]); // 1
+        b.node(&["Bot"], &[("name", Value::Str("bot".into()))]); // 2 (not Person)
+        b.node(&["Person"], &[("name", Value::Str("target".into()))]); // 3
+        b.edge(0, 3, "R");
+        b.edge(1, 3, "R");
+        b.edge(2, 3, "R"); // bot -> target
+        let mut st = b.build();
+        let q = "MATCH (a:Person)-[:R]->(b) WHERE b.name = 'target' RETURN a.name AS a";
+        let names = |st: &Store| {
+            let mut v: Vec<String> = run(&super::parse(q).unwrap(), st)
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Value::Str(s) => s.to_string(),
+                    o => format!("{o:?}"),
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        // Forward (no index): only the two Person sources reach the target.
+        let forward = names(&st);
+        assert_eq!(forward, vec!["p1".to_string(), "p2".to_string()]);
+        // With an index on `name` the anchor flips (target count 1 < Person count 3);
+        // it must give the SAME set — `bot`, reached walking reverse, is excluded.
+        st.create_index("name");
+        assert_eq!(names(&st), forward);
+    }
+
     /// The raw string-search filter fast path (STARTS WITH / ENDS WITH / CONTAINS)
     /// must match the boxed `str_bool` for a dict-encoded (low-cardinality) column
     /// and for a row missing the property (→ UNKNOWN → dropped).

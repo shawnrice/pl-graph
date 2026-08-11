@@ -850,6 +850,12 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             )
         }
         Plan::Filter { input, pred } => {
+            // Anchor flip: a selective indexed `=` on the traversal TARGET is far
+            // cheaper to seed-and-walk-in-reverse than to scan every source and
+            // filter. Same slot layout, multiset-preserving.
+            if let Some(b) = try_reverse_expand(pred, input, store, track) {
+                return Ok(b);
+            }
             let batch = pull(input, store, track)?;
             // Fast path: `<prop> <cmp> <literal>` reads storage in one pass to
             // keep-indices; otherwise evaluate the predicate as a full column.
@@ -1902,6 +1908,100 @@ fn fold_grouped(agg: &Agg, arg_col: Option<&Col>, group_of: &[u32], n_groups: us
 /// existing slots replicated and the neighbour appended as a new slot. This is
 /// the bulk (lineage-free) strategy: `keep` records which input row each output
 /// row came from, `nbrs` the landed node — the existing slots are gathered by
+fn reverse_dir(dir: Dir) -> Dir {
+    match dir {
+        Dir::Out => Dir::In,
+        Dir::In => Dir::Out,
+        Dir::Both => Dir::Both,
+    }
+}
+
+/// Cardinality-driven ANCHOR FLIP for `Filter(target = lit, Expand(Scan(src), Out))`
+/// — the "selective filter on the traversal TARGET" shape. The forward plan scans
+/// EVERY source and expands to filter the target at the end; when the target is an
+/// indexed `=` whose bucket is smaller than the source scan, it is far cheaper to
+/// SEED the target (index) and walk the edges in REVERSE to the sources. The output
+/// is the IDENTICAL `[source, target]` slot layout, so nothing downstream changes;
+/// only the (unspecified) row order differs — the multiset is preserved. `None`
+/// unless the shape matches, the target is index-seekable, the cost says flip, and
+/// no path is tracked / no edge is bound.
+fn try_reverse_expand(pred: &Expr, input: &Plan, store: &Store, track: bool) -> Option<Batch> {
+    if track {
+        return None; // a path-reading query keeps the forward walk (lineage)
+    }
+    let Plan::Expand {
+        input: src,
+        from: 0,
+        dir,
+        edge_label,
+        bind_edge: false,
+    } = input
+    else {
+        return None;
+    };
+    let Plan::Scan { label: src_label } = src.as_ref() else {
+        return None; // source must be an unfiltered scan (else seed the source)
+    };
+    // pred must be `target.key = lit` on the appended slot (slot 1 over a 1-wide
+    // scan) with a hash index on `key`.
+    let (key, value) = target_eq(pred)?;
+    if !store.has_hash_index(&key) {
+        return None;
+    }
+    // Cardinality decision: seed the SMALLER side. Forward seeds the source scan;
+    // reverse seeds the target bucket. Flip only when the target bucket is smaller.
+    let target_rows = store.index_bucket_len(&key, &value)?;
+    let source_rows = match src_label {
+        Some(l) => store.nodes_with_label(l).len(),
+        None => store.live_node_count(),
+    };
+    if target_rows >= source_rows {
+        return None;
+    }
+    let want: Option<u32> = match edge_label.as_deref() {
+        None => None,
+        Some(name) => Some(store.etype_id(name)?),
+    };
+    let rev = reverse_dir(*dir);
+    // Seed the targets (raw index bucket, any label — the forward path does not
+    // constrain the target's label either), walk reverse edges to the sources, and
+    // keep only sources carrying the scan's label.
+    let targets = store.index_lookup(&key, &value)?;
+    let mut sources = Vec::new();
+    let mut ends = Vec::new();
+    for &t in &targets {
+        for_each_nbr(store, t, rev, want, |a, _| {
+            if src_label
+                .as_deref()
+                .is_none_or(|l| store.labels_of(a).iter().any(|x| x == l))
+            {
+                sources.push(a);
+                ends.push(t);
+            }
+        });
+    }
+    Some(Batch::of(vec![Col::Nodes(sources), Col::Nodes(ends)]))
+}
+
+/// Parse `Prop{slot 1, key} = Lit(value)` (or its mirror) — a target-slot equality.
+fn target_eq(pred: &Expr) -> Option<(String, Value)> {
+    let Expr::Compare {
+        op: CompareOp::Eq,
+        left,
+        right,
+    } = pred
+    else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Prop { slot: 1, key }, Expr::Lit(v))
+        | (Expr::Lit(v), Expr::Prop { slot: 1, key }) => {
+            (!v.is_null()).then(|| (key.clone(), v.clone()))
+        }
+        _ => None,
+    }
+}
+
 /// `keep`, so no per-row struct is built.
 fn expand(
     batch: &Batch,
