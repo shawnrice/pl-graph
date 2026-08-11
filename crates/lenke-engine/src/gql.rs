@@ -4151,6 +4151,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn varlen_distinct_count_bfs_matches_enumeration() {
+        use crate::store::Builder;
+        use std::collections::HashSet;
+        // A graph with cycles and a self-loop, so shortest-distance reachability and
+        // the walk-enumerated endpoint SET are non-trivially exercised.
+        let mut b = Builder::default();
+        for i in 0..300 {
+            b.node(&["N"], &[("k", Value::Num(f64::from(i)))]); // unique per-node key
+        }
+        for i in 0u32..300 {
+            for d in 0u32..3 {
+                b.edge(i, (i * 7 + d * 11 + 1) % 300, "R");
+            }
+        }
+        b.edge(0, 0, "R"); // self-loop
+        let st = b.build();
+        let count = |q: &str| match &run(&super::parse(q).unwrap(), &st).rows[0][0] {
+            Value::Num(x) => *x as usize,
+            other => panic!("not a count: {other:?}"),
+        };
+        // For every min≤1 bound the BFS fast path fires; compare to the DISTINCT set
+        // of endpoints the enumerating path emits. IN and BOTH exercise reverse hops.
+        for (lo, hi) in [(0u32, 2u32), (1, 1), (1, 3), (1, 4)] {
+            for dir in ["->", "<-", "-"] {
+                let (l, r) = match dir {
+                    "->" => ("-[:R]", "->"),
+                    "<-" => ("<-[:R]", "-"),
+                    _ => ("-[:R]", "-"),
+                };
+                let pat = format!("(a:N){l}{r}{{{lo},{hi}}}(b)");
+                let fast = count(&format!("MATCH {pat} RETURN count(DISTINCT b) AS c"));
+                let rows = run(
+                    &super::parse(&format!("MATCH {pat} RETURN b.k AS b")).unwrap(),
+                    &st,
+                )
+                .rows;
+                let enumerated: HashSet<String> =
+                    rows.iter().map(|r| format!("{:?}", r[0])).collect();
+                assert_eq!(
+                    fast,
+                    enumerated.len(),
+                    "BFS distinct != enumerated distinct for {pat}"
+                );
+            }
+        }
+    }
+
     /// Cardinality-driven anchor flip: a selective indexed `=` on the traversal
     /// TARGET seeds the target and walks reverse edges instead of scanning every
     /// source. The result multiset must equal the forward walk — INCLUDING excluding
