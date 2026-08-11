@@ -968,13 +968,21 @@ fn neighbor_aggregate(
     };
     let include_self = cfg_bool("includeSelf").unwrap_or(false);
     let want = want_etype(store, cfg_str("edgeType"));
-    // A per-edge weight SCALES each contributor, which is meaningless for the
-    // order/scale-independent max/min — reject loudly rather than silently ignore
-    // (matching core). GCN norm is deferred; this is the plain weighted case.
+    let gcn = match cfg_str("norm").unwrap_or("none") {
+        "none" => false,
+        "gcn" => true,
+        other => {
+            return Err(format!(
+                "neighbor_aggregate `norm` must be one of none|gcn, got '{other}'"
+            ))
+        }
+    };
+    // A per-edge weight or a GCN norm SCALES each contributor, which is meaningless
+    // for the order/scale-independent max/min — reject loudly (matching core).
     let weight_property = cfg_str("weightProperty");
-    if weight_property.is_some() && matches!(op, AggOp::Max | AggOp::Min) {
+    if (weight_property.is_some() || gcn) && matches!(op, AggOp::Max | AggOp::Min) {
         return Err(
-            "neighbor_aggregate `weightProperty` applies only to op=sum|mean (max/min are \
+            "neighbor_aggregate `weightProperty`/`norm` apply only to op=sum|mean (max/min are \
              scale-independent)"
                 .to_string(),
         );
@@ -1028,6 +1036,18 @@ fn neighbor_aggregate(
         contrib
     };
 
+    // GCN degree per vertex: its contributor count under the same direction/type
+    // filter, plus the self-loop when includeSelf (the Ã = A + I self-loop), floored
+    // at 1 so a source/sink contributes a finite 1/sqrt(deg_i·deg_j) rather than
+    // dividing by zero. Only needed for the GCN norm.
+    let deg: Vec<f64> = if gcn {
+        (0..slots as u32)
+            .map(|v| (contributors(v).len() + usize::from(include_self)).max(1) as f64)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut out: Vec<(u32, Value)> = Vec::with_capacity(store.all_nodes().len());
     for v in store.all_nodes() {
         let mut acc = vec![0.0f64; d];
@@ -1064,14 +1084,21 @@ fn neighbor_aggregate(
         };
         if include_self {
             if let Some(sv) = &feats[v as usize] {
-                // The self-loop has coefficient 1.0 (no GCN normalization here).
-                fold(sv, 1.0);
+                // The self-loop has weight 1.0 and GCN factor 1/deg_i (== 1/sqrt(deg·deg)).
+                let coef = if gcn { 1.0 / deg[v as usize] } else { 1.0 };
+                fold(sv, coef);
             }
         }
         for (eid, nbr) in contributors(v) {
             if let Some(nv) = &feats[nbr as usize] {
-                let coef = weight_property.map_or(1.0, |wk| edge_weight(store, eid, wk));
-                fold(nv, coef);
+                // coef = edge weight (1.0 unweighted) × GCN factor (1/sqrt(deg_i·deg_j)).
+                let w = weight_property.map_or(1.0, |wk| edge_weight(store, eid, wk));
+                let nf = if gcn {
+                    1.0 / (deg[v as usize] * deg[nbr as usize]).sqrt()
+                } else {
+                    1.0
+                };
+                fold(nv, w * nf);
             }
         }
         if op == AggOp::Mean && coef_sum != 0.0 {
@@ -1402,6 +1429,53 @@ mod tests {
         let none = ppr(&[]);
         assert_eq!(ppr(&["999"]), none);
         assert!(none[3].1 > 0.0);
+    }
+
+    #[test]
+    fn neighbor_aggregate_gcn_normalization() {
+        // 0→1, 0→2 (unweighted); features 1=[2], 2=[4]. Degrees under the OUT filter:
+        // deg[0]=2 (two contributors), deg[1]=deg[2]=1 (no out-neighbours, floored to
+        // 1). Each contributor's GCN factor is 1/sqrt(deg_0·deg_nbr) = 1/sqrt(2), so
+        // the GCN sum at 0 is 2/sqrt(2) + 4/sqrt(2) — folded in that order (the exact
+        // f64 lenke-core produces, NOT a re-derived 3·sqrt(2), which rounds one ULP
+        // off in the last place).
+        let mut b = Builder::default();
+        let f = |x: f64| Value::List(vec![Value::Num(x)]);
+        b.node(&["N"], &[]);
+        b.node(&["N"], &[("h", f(2.0))]);
+        b.node(&["N"], &[("h", f(4.0))]);
+        let mut st = b.build();
+        st.add_edge(0, 1, "R");
+        st.add_edge(0, 2, "R");
+
+        let cfg = |op: &str, gcn: bool| {
+            let mut c = vec![
+                ("feature".to_string(), Value::Str("h".into())),
+                ("op".to_string(), Value::Str(op.into())),
+                ("direction".to_string(), Value::Str("out".into())),
+            ];
+            if gcn {
+                c.push(("norm".to_string(), Value::Str("gcn".into())));
+            }
+            c
+        };
+        let node0 = |op: &str, gcn: bool| {
+            format!("{:?}", neighbor_aggregate(&st, &cfg(op, gcn)).unwrap()[0].1)
+        };
+        // GCN sum: 2·(1/√2) + 4·(1/√2), in fold order.
+        assert_eq!(node0("sum", true), "List([Num(4.242640687119285)])");
+        // Un-normalized sum is just 2 + 4 = 6.
+        assert_eq!(node0("sum", false), "List([Num(6.0)])");
+        // A GCN norm is meaningless for max/min → Err; a bad norm value → Err.
+        assert!(neighbor_aggregate(&st, &cfg("max", true)).is_err());
+        assert!(neighbor_aggregate(
+            &st,
+            &[
+                ("feature".into(), Value::Str("h".into())),
+                ("norm".into(), Value::Str("l2".into())),
+            ]
+        )
+        .is_err());
     }
 
     #[test]

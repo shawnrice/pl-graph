@@ -3435,6 +3435,33 @@ mod tests {
     }
 
     #[test]
+    fn call_neighbor_aggregate_gcn() {
+        // 0→1, 0→2 (unweighted); h(1)=[2], h(2)=[4]. GCN sum at 0 folds each
+        // contributor by 1/sqrt(deg_0·deg_nbr) = 1/sqrt(2).
+        let mut bld = Builder::default();
+        let f = |x: f64| Value::List(vec![Value::Num(x)]);
+        bld.node(&["N"], &[]);
+        bld.node(&["N"], &[("h", f(2.0))]);
+        bld.node(&["N"], &[("h", f(4.0))]);
+        let mut store = bld.build();
+        store.add_edge(0, 1, "R");
+        store.add_edge(0, 2, "R");
+
+        let out = run(
+            &super::parse(
+                "CALL neighbor_aggregate({feature: 'h', op: 'sum', direction: 'out', \
+                 norm: 'gcn'}) YIELD node, vector",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert_eq!(
+            format!("{:?}", out.rows[0][1]),
+            "List([Num(4.242640687119285)])"
+        );
+    }
+
+    #[test]
     fn call_personalized_pagerank_yields_score() {
         let store = triangle_store();
         let rows_of = |q: &str| -> Vec<(f64, f64)> {
