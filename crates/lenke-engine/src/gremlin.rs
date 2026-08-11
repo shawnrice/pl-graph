@@ -314,6 +314,7 @@ impl Parser {
                 | "both"
                 | "has"
                 | "hasnot"
+                | "hasid"
                 | "and"
                 | "or"
                 | "not"
@@ -378,6 +379,21 @@ impl Parser {
                 };
                 self.expect(&Tok::RParen)?;
                 plan.filter(pred)
+            }
+            // hasId('a', …): keep the element iff its EXTERNAL id is one of the given
+            // ids — an `element_id`-in-list predicate (an OR of equals).
+            "hasid" => {
+                let mut ids = vec![Value::Str(self.str_arg()?.into())];
+                while self.peek() == Some(&Tok::Comma) {
+                    self.bump();
+                    ids.push(Value::Str(self.str_arg()?.into()));
+                }
+                self.expect(&Tok::RParen)?;
+                let left = Expr::Call {
+                    name: "element_id".to_string(),
+                    args: vec![Expr::Slot(self.current)],
+                };
+                plan.filter(or_of_equals(&left, &ids))
             }
             // hasNot(k): the element must NOT carry property `k`.
             "hasnot" => {
@@ -1516,6 +1532,30 @@ mod tests {
         assert!(
             gone.is_empty(),
             "missing id must contribute nothing: {gone:?}"
+        );
+    }
+
+    /// `hasId('a', …)` keeps the element iff its external id is one of the given ids
+    /// — an `element_id`-in-list filter, verified equal to the GQL `element_id(n) = …`
+    /// predicate. Works on nodes and edges.
+    #[test]
+    fn gremlin_has_id_filters_by_external_id() {
+        let store = social();
+        assert_eq!(
+            value_bag(&gremlin_rows("g.V().hasId('0','1').values('name')", &store)),
+            value_bag(&gql_rows(
+                "MATCH (n) WHERE element_id(n)='0' OR element_id(n)='1' RETURN n.name",
+                &store,
+            )),
+        );
+        // A single id, and an edge id.
+        assert_eq!(
+            value_bag(&gremlin_rows("g.V().hasId('2').values('name')", &store)),
+            vec!["Str(\"carol\");"],
+        );
+        assert_eq!(
+            value_bag(&gremlin_rows("g.E().hasId('e0').count()", &store)),
+            vec!["Num(1.0);"],
         );
     }
 
