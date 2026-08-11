@@ -559,13 +559,33 @@ pub fn closeness(
 #[must_use]
 pub fn strongly_connected_components(store: &Store, edge_label: Option<&str>) -> Vec<(u32, u32)> {
     let n = store.node_count();
-    // Forward out-adjacency of the wanted type; unknown type → no edges.
-    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
-    if let Some(want) = want_etype(store, edge_label) {
-        for &v in &store.all_nodes() {
-            for_each_nbr(store, v, Dir::Out, want, |nbr| adj[v as usize].push(nbr));
+    // Forward out-adjacency of the wanted type as a FLAT CSR (offsets + neighbours) —
+    // ONE allocation, not a `Vec` per vertex (a million small allocations at 1M
+    // vertices dominated the runtime). Neighbour order within a vertex is the
+    // `for_each_nbr` order, unchanged, so the DFS visits identically; unknown type →
+    // no edges. `adj[v]` becomes `flat[offsets[v]..offsets[v+1]]`.
+    let (offsets, flat): (Vec<u32>, Vec<u32>) = match want_etype(store, edge_label) {
+        None => (vec![0u32; n + 1], Vec::new()),
+        Some(want) => {
+            let mut offsets = vec![0u32; n + 1];
+            for &v in &store.all_nodes() {
+                for_each_nbr(store, v, Dir::Out, want, |_| offsets[v as usize + 1] += 1);
+            }
+            for v in 0..n {
+                offsets[v + 1] += offsets[v];
+            }
+            let mut flat = vec![0u32; offsets[n] as usize];
+            let mut cur = offsets.clone();
+            for &v in &store.all_nodes() {
+                for_each_nbr(store, v, Dir::Out, want, |nbr| {
+                    flat[cur[v as usize] as usize] = nbr;
+                    cur[v as usize] += 1;
+                });
+            }
+            (offsets, flat)
         }
-    }
+    };
+    let adj_of = |v: usize| -> &[u32] { &flat[offsets[v] as usize..offsets[v + 1] as usize] };
 
     const UNVISITED: u32 = u32::MAX;
     let mut order = vec![UNVISITED; n]; // DFS discovery index (Tarjan's `index`)
@@ -590,9 +610,10 @@ pub fn strongly_connected_components(store: &Store, edge_label: Option<&str>) ->
 
         while let Some(&(v, ci)) = frames.last() {
             let vu = v as usize;
-            if ci < adj[vu].len() {
+            let nbrs = adj_of(vu);
+            if ci < nbrs.len() {
                 frames.last_mut().unwrap().1 = ci + 1;
-                let w = adj[vu][ci];
+                let w = nbrs[ci];
                 let wu = w as usize;
                 if order[wu] == UNVISITED {
                     order[wu] = counter;
