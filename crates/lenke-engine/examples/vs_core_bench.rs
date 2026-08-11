@@ -74,6 +74,9 @@ fn engine_fixture(n: u32, deg: u32) -> Store {
     for eid in st.all_edges() {
         st.set_edge_prop(eid, "w", Value::Num(f64::from(eid % 1000)));
     }
+    // A hash index on `name` (what a user filtering by name would build) — lets the
+    // anchor flip and point lookups seek instead of scan.
+    st.create_index("name");
     st
 }
 
@@ -108,7 +111,9 @@ fn core_fixture(n: u32, deg: u32) -> lenke_core::graph::Graph {
             e += 1;
         }
     }
-    lenke_core::ndjson::decode(&s).expect("core load")
+    let mut g = lenke_core::ndjson::decode(&s).expect("core load");
+    g.create_vertex_index("name"); // same index both engines get
+    g
 }
 
 fn time_engine(store: &Store, q: &str, reps: usize) -> Result<(f64, usize), String> {
@@ -216,6 +221,8 @@ fn shapes() -> Vec<Shape> {
         // --- var-length paths ---
         same("var/1to2", "MATCH (a:Person)-[:R]->{1,2}(b) RETURN count(*) AS c"),
         same("var/1to3", "MATCH (a:Person)-[:R]->{1,3}(b) RETURN count(*) AS c"),
+        // --- cardinality-driven anchor flip: selective indexed filter on the TARGET ---
+        same("flip/target", "MATCH (a:Person)-[:R]->(b) WHERE b.name = 'n99' RETURN a.name AS s, b.name AS t"),
         // --- AML-shaped: fixed multi-hop chains with per-hop edge predicates ---
         same("aml/struct3", "MATCH (a:Person)-[e1:R]->(b)-[e2:R]->(c)-[e3:R]->(d) WHERE e1.w > e2.w AND e2.w > e3.w RETURN a.name AS s, d.name AS t LIMIT 5000"),
         same("aml/chain5", "MATCH (a:Person)-[:R]->(b)-[:R]->(c)-[:R]->(d)-[:R]->(e) WHERE a.name = 'n5' RETURN count(*) AS c"),

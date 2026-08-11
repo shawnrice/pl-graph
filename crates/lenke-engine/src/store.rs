@@ -651,6 +651,17 @@ impl Store {
         self.by_label.get(label).map_or(&[], Vec::as_slice)
     }
 
+    /// Whether node `id` carries `label`. A binary search of the label bucket, which
+    /// is kept SORTED ascending (ids are pushed in increasing insertion order and
+    /// `retain` on delete preserves order) — O(log |label|), so a per-node label
+    /// test costs a search, not the whole-bucket scan `labels_of` does.
+    #[must_use]
+    pub fn is_labeled(&self, id: u32, label: &str) -> bool {
+        self.by_label
+            .get(label)
+            .is_some_and(|bucket| bucket.binary_search(&id).is_ok())
+    }
+
     /// A node's value for `key`, or `Null` if the key or the node's entry is
     /// absent. The typed read; the batch layer's bulk gather uses the column
     /// directly (see `column`).

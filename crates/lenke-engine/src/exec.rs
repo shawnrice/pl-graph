@@ -1971,10 +1971,7 @@ fn try_reverse_expand(pred: &Expr, input: &Plan, store: &Store, track: bool) -> 
     let mut ends = Vec::new();
     for &t in &targets {
         for_each_nbr(store, t, rev, want, |a, _| {
-            if src_label
-                .as_deref()
-                .is_none_or(|l| store.labels_of(a).iter().any(|x| x == l))
-            {
+            if src_label.as_deref().is_none_or(|l| store.is_labeled(a, l)) {
                 sources.push(a);
                 ends.push(t);
             }
