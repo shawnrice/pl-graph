@@ -77,6 +77,10 @@ fn engine_fixture(n: u32, deg: u32) -> Store {
     // A hash index on `name` (what a user filtering by name would build) — lets the
     // anchor flip and point lookups seek instead of scan.
     st.create_index("name");
+    // A range index on `name` too — a user who runs `name < 'n15'` builds one, and
+    // core's `create_vertex_index` is already a sorted structure that serves ranges,
+    // so this is the parity fixture for the range shapes (not an extra advantage).
+    st.create_range_index("name");
     st
 }
 

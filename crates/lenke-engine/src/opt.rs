@@ -783,7 +783,15 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                         },
                         true,
                     )
-                } else if let Some((key, op, value)) = range_seek_target(&pred) {
+                } else if let Some((key, op, value)) =
+                    range_seek_target(&pred).filter(|(k, _, _)| idx.has_range_index(k))
+                {
+                    // Only seed a RangeSeek when a range index can actually serve it.
+                    // Without one, RangeSeek's fallback SCANS and BOXES each cell, which
+                    // is SLOWER than leaving a `Filter(Scan)` — that hits the vectorized
+                    // raw-`&str`/raw-f64 compare in `try_filter_keep`. (A standalone
+                    // range predicate here must match the conjunct path, which already
+                    // gates its Range seed on `has_range_index`.)
                     (
                         Plan::RangeSeek {
                             label: l,

@@ -2352,11 +2352,18 @@ fn range_seek_ids(store: &Store, label: &str, key: &str, op: CompareOp, value: &
     }
     match store.range_lookup(key, op, value) {
         Some(cands) => {
-            let in_label: std::collections::HashSet<u32> =
-                store.nodes_with_label(label).iter().copied().collect();
+            // Test label membership with a per-candidate binary search of the sorted
+            // label bucket (O(cands·log|label|)), NOT a HashSet built from the whole
+            // bucket — that build is O(|label|) and dominates when the label covers
+            // most of the graph (a single-label store makes it pure waste: the range
+            // index already narrowed to `cands`, then we'd rebuild a set of everything
+            // to intersect back down). When the bucket covers ALL non-deleted nodes,
+            // every candidate is in-label, so skip the test entirely.
+            let bucket = store.nodes_with_label(label);
+            let all_in_label = bucket.len() == store.live_node_count();
             cands
                 .into_iter()
-                .filter(|id| in_label.contains(id))
+                .filter(|&id| all_in_label || store.is_labeled(id, label))
                 // The index orders by the TOTAL order (cross-type by rank), but the
                 // OPERATOR is three-valued (cross-type → UNKNOWN → drop). Re-check
                 // each candidate with `range_pass` so an indexed seek returns
