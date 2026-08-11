@@ -341,16 +341,28 @@ pub fn label_propagation(
     let live = store.all_nodes();
     let mut labels: Vec<u32> = (0..n as u32).collect();
     if let Some(want) = want_etype(store, edge_label) {
+        // Reused scratch: a dense per-label tally indexed by label id (labels are
+        // always in `0..n`), reset via a touched-list so each node costs O(degree),
+        // not O(n) — and never a per-node heap allocation (the previous `HashMap`
+        // per node per iteration was the whole cost). The winner is identical: the
+        // most-frequent label, ties broken by smallest id (order-independent).
+        let mut count = vec![0u32; n];
+        let mut touched: Vec<u32> = Vec::new();
         for _ in 0..iterations {
             let mut next = labels.clone();
             for &v in &live {
-                let mut counts: HashMap<u32, u32> = HashMap::new();
+                touched.clear();
                 for_each_nbr(store, v, Dir::Both, want, |u| {
-                    *counts.entry(labels[u as usize]).or_insert(0) += 1;
+                    let lbl = labels[u as usize];
+                    if count[lbl as usize] == 0 {
+                        touched.push(lbl);
+                    }
+                    count[lbl as usize] += 1;
                 });
                 // Most-frequent label; tie → smallest label id. No neighbours → keep.
                 let mut best: Option<(u32, u32)> = None; // (label, count)
-                for (&lbl, &c) in &counts {
+                for &lbl in &touched {
+                    let c = count[lbl as usize];
                     let better = match best {
                         None => true,
                         Some((bl, bc)) => c > bc || (c == bc && lbl < bl),
@@ -361,6 +373,9 @@ pub fn label_propagation(
                 }
                 if let Some((lbl, _)) = best {
                     next[v as usize] = lbl;
+                }
+                for &lbl in &touched {
+                    count[lbl as usize] = 0; // reset only what this node touched
                 }
             }
             if next == labels {
