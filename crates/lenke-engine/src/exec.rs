@@ -1337,19 +1337,23 @@ fn pull_capped_stream(plan: &Plan, store: &Store, cap: usize) -> Result<Option<B
     if ids.is_empty() {
         return Ok(None); // empty source → let the full path build the right shape
     }
-    // A block large enough that a few reach `cap` under a selective filter / low
-    // fan-out, small enough that a huge scan is never fully materialized.
-    let block = cap.saturating_mul(4).max(512);
+    // ADAPTIVE block size, starting at 1 and doubling. A high-fan-out chain (double
+    // var-length) makes even one source overshoot `cap`, so the first block must be
+    // tiny — else a fixed block materializes thousands of rows per source. A
+    // selective filter / low fan-out grows the block geometrically, so the overhead
+    // stays logarithmic. This mirrors a lazy engine producing just past `cap`.
     let mut acc: Vec<Batch> = Vec::new();
     let mut total = 0usize;
-    for chunk in ids.chunks(block) {
-        let seed = Batch::single(Col::Nodes(chunk.to_vec()));
+    let mut start = 0usize;
+    let mut block = 1usize;
+    while start < ids.len() && total < cap {
+        let end = (start + block).min(ids.len());
+        let seed = Batch::single(Col::Nodes(ids[start..end].to_vec()));
         let b = pull_body(&body, store, &seed)?;
         total += b.rows();
         acc.push(b);
-        if total >= cap {
-            break;
-        }
+        start = end;
+        block = block.saturating_mul(2).min(8192);
     }
     Ok(Some(concat_batches(&acc)))
 }
