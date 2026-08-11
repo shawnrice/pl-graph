@@ -150,6 +150,7 @@ enum Tok {
     Plus,
     Slash,
     Percent,
+    Concat, // ||
     RArrow, // ->
     LArrow, // <-
     Eq,
@@ -187,6 +188,14 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             '+' => out.push(Tok::Plus),
             '/' => out.push(Tok::Slash),
             '%' => out.push(Tok::Percent),
+            '|' => {
+                if b.get(i + 1) == Some(&'|') {
+                    out.push(Tok::Concat);
+                    i += 1;
+                } else {
+                    return Err("expected `||` (single `|` is not an operator)".into());
+                }
+            }
             '=' => out.push(Tok::Eq),
             '-' => {
                 if b.get(i + 1) == Some(&'>') {
@@ -1556,8 +1565,9 @@ impl Parser {
     }
 
     fn cmp_expr(&mut self) -> Result<Expr, String> {
-        // Comparison operands are arithmetic expressions (arith binds tighter).
-        let left = self.add_expr()?;
+        // Comparison operands are concat expressions (`||` binds tighter than a
+        // comparison, looser than `+`/`-` — the ISO precedence core uses).
+        let left = self.concat_expr()?;
         // Postfix `IS [NOT] NULL` — a definite null test, checked before the
         // binary comparison operators (a value is one or the other, not both).
         if self.eat_kw("IS") {
@@ -1576,7 +1586,7 @@ impl Parser {
         let saved = self.pos;
         let negated_in = self.eat_kw("NOT");
         if self.eat_kw("IN") {
-            let rhs = self.add_expr()?;
+            let rhs = self.concat_expr()?;
             // A list LITERAL desugars to an OR-chain (more optimizable); any other
             // list expression (a property, param, function result) uses the runtime
             // `Expr::In`. Both are three-valued identically.
@@ -1612,7 +1622,7 @@ impl Parser {
             None
         };
         if let Some(name) = str_fn {
-            let right = self.add_expr()?;
+            let right = self.concat_expr()?;
             return Ok(Expr::Call {
                 name: name.to_string(),
                 args: vec![left, right],
@@ -1628,11 +1638,30 @@ impl Parser {
             _ => return Ok(left),
         };
         self.pos += 1;
-        let right = self.add_expr()?;
+        let right = self.concat_expr()?;
         Ok(Expr::Compare {
             op,
             left: Box::new(left),
             right: Box::new(right),
+        })
+    }
+
+    // concat_expr := add_expr ( '||' add_expr )*  — string/list concatenation, a
+    // level between comparison and additive (the ISO precedence). A run of `||`
+    // folds into ONE n-ary `concat(...)` call (matching core's flat Concat node), so
+    // the null-propagation and js-string coercion live in the `concat` scalar fn.
+    fn concat_expr(&mut self) -> Result<Expr, String> {
+        let first = self.add_expr()?;
+        if !matches!(self.peek(), Some(Tok::Concat)) {
+            return Ok(first);
+        }
+        let mut args = vec![first];
+        while self.eat(&Tok::Concat) {
+            args.push(self.add_expr()?);
+        }
+        Ok(Expr::Call {
+            name: "concat".to_string(),
+            args,
         })
     }
 
@@ -4157,6 +4186,46 @@ mod tests {
             .len();
             assert_eq!(c, rows, "streaming count != enumerated for `{wc}`");
         }
+    }
+
+    #[test]
+    fn string_concat_operator() {
+        use crate::store::Builder;
+        let mut b = Builder::default();
+        b.node(
+            &["P"],
+            &[("name", Value::Str("ab".into())), ("age", Value::Num(7.0))],
+        );
+        let st = b.build();
+        let one = |q: &str| -> Value { run(&super::parse(q).unwrap(), &st).rows[0][0].clone() };
+        // string || string, chain, num coercion (7 → "7"), null propagation, list concat.
+        assert!(
+            matches!(one("MATCH (p:P) RETURN p.name || '!' AS x"), Value::Str(ref s) if &**s == "ab!")
+        );
+        assert!(
+            matches!(one("MATCH (p:P) RETURN 'a' || 'b' || 'c' AS x"), Value::Str(ref s) if &**s == "abc")
+        );
+        assert!(
+            matches!(one("MATCH (p:P) RETURN p.name || '-' || p.age AS x"), Value::Str(ref s) if &**s == "ab-7")
+        );
+        assert!(matches!(
+            one("MATCH (p:P) RETURN p.missing || 'x' AS x"),
+            Value::Null
+        ));
+        assert!(matches!(
+            one("MATCH (p:P) RETURN 'x' || p.missing AS x"),
+            Value::Null
+        ));
+        assert!(
+            matches!(one("MATCH (p:P) RETURN [1, 2] || [3] AS x"), Value::List(ref v) if v.len() == 3)
+        );
+        // Precedence: `||` binds looser than `+`, tighter than `=`. `1 + 2 || 3` is
+        // `(1+2) || 3` = "33"; used in WHERE it is a concat operand of the comparison.
+        assert!(
+            matches!(one("MATCH (p:P) RETURN 1 + 2 || 3 AS x"), Value::Str(ref s) if &**s == "33")
+        );
+        // A lone `|` is not an operator.
+        assert!(super::parse("MATCH (p:P) RETURN p.age | 1 AS x").is_err());
     }
 
     #[test]

@@ -5580,6 +5580,17 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             .find(|v| !v.is_null())
             .cloned()
             .unwrap_or(Value::Null),
+        // `a || b || …` — left-associative concat (the parser folds a `||` run into
+        // one call). Matches core's `concat_step` fold: ANY null operand → NULL; two
+        // lists concatenate element-wise; otherwise both sides JS-string-coerce (via
+        // `to_string_fn`) and join.
+        "concat" => {
+            let mut acc = args.first().cloned().unwrap_or(Value::Null);
+            for r in &args[1..] {
+                acc = concat_step(&acc, r);
+            }
+            acc
+        }
         // numeric constants (0 args)
         "e" => Value::Num(std::f64::consts::E),
         "pi" => Value::Num(std::f64::consts::PI),
@@ -6113,6 +6124,22 @@ fn to_number(v: &Value, integer: bool) -> Value {
 
 /// `to_string` FUNCTION: NULL→NULL, finite Num→its egress text, Bool→"true"/
 /// "false", Str→itself, Temporal→its ISO form; a non-finite number is NULL.
+/// One step of the `||` fold, matching core's `concat_step`: null propagates, two
+/// lists concatenate, otherwise both operands JS-string-coerce and join.
+fn concat_step(l: &Value, r: &Value) -> Value {
+    if l.is_null() || r.is_null() {
+        return Value::Null;
+    }
+    if let (Value::List(a), Value::List(b)) = (l, r) {
+        return Value::List(a.iter().chain(b.iter()).cloned().collect());
+    }
+    match (to_string_fn(l), to_string_fn(r)) {
+        (Value::Str(a), Value::Str(b)) => Value::Str(format!("{a}{b}").into()),
+        // A non-stringable operand (e.g. a map) → NULL, as core's js_str-of-unknown does.
+        _ => Value::Null,
+    }
+}
+
 fn to_string_fn(v: &Value) -> Value {
     match v {
         Value::Null => Value::Null,
