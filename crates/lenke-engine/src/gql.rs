@@ -4079,6 +4079,46 @@ mod tests {
         assert!(super::parse("MATCH (a:Person)-[:KNOWS]->{3,1}(b) RETURN a.name AS a").is_err());
     }
 
+    /// A bare `LIMIT`/`SKIP` (no ORDER BY) over a filtered/expanded chain streams the
+    /// source in blocks and stops early — and must return EXACTLY the same rows the
+    /// full materialize-then-slice would (the block order preserves scan order).
+    #[test]
+    fn streaming_limit_equals_full_prefix() {
+        use crate::exec::execute;
+        let mut st = Builder::default().build();
+        // A chain of nodes 0->1->…; each has age = id, so a filter + expand + limit
+        // is non-trivial and the count fast-paths don't apply.
+        execute(
+            &super::parse(
+                "INSERT (a:P {age: 1})-[:R]->(b:P {age: 2})-[:R]->(c:P {age: 3}), \
+                 (d:P {age: 4})-[:R]->(e:P {age: 5}), (f:P {age: 6})-[:R]->(g:P {age: 7})",
+            )
+            .unwrap(),
+            &mut st,
+        )
+        .unwrap();
+        let rows = |q: &str| {
+            run(&super::parse(q).unwrap(), &st)
+                .rows
+                .iter()
+                .map(|r| format!("{r:?}"))
+                .collect::<Vec<_>>()
+        };
+        let base = "MATCH (a:P)-[:R]->(b) WHERE b.age > 2 RETURN b.age AS x";
+        let full = rows(base);
+        assert!(full.len() >= 2, "need enough rows to slice");
+        // LIMIT streams; it must equal the full result's prefix.
+        let lim = rows(&format!("{base} LIMIT 2"));
+        assert_eq!(lim, full[..2].to_vec());
+        // SKIP + LIMIT streams to skip+limit then slices — equal to the full window.
+        let win = rows(&format!("{base} SKIP 1 LIMIT 2"));
+        let end = 3.min(full.len());
+        assert_eq!(win, full[1..end].to_vec());
+        // A LIMIT larger than the result returns everything (no truncation).
+        let big = rows(&format!("{base} LIMIT 10000"));
+        assert_eq!(big, full);
+    }
+
     /// The vectorized finite→finite unary numeric functions (abs/floor/ceil/round/
     /// sign) must produce exactly what the boxed `scalar_num_fn` does, so an
     /// aggregate over them is correct. Known inputs, hand-computed sums.

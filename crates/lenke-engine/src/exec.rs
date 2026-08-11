@@ -934,7 +934,15 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // MORE rows to still yield `limit`), which `pull_capped` recognizes.
             let cap = limit.map(|l| skip.unwrap_or(0).saturating_add(l));
             let capped = match cap {
-                Some(c) if keys.is_empty() => pull_capped(input, store, track, c)?,
+                Some(c) if keys.is_empty() => match pull_capped(input, store, track, c)? {
+                    Some(b) => Some(b),
+                    // The row-preserving cap didn't apply (a Filter/Expand/VarLength in
+                    // the chain). Stream the chain block-by-block until `c` rows land —
+                    // identical rows, computed early. Path-tracking LIMITs take the
+                    // full path (lineage isn't carried across the block concat).
+                    None if !track => pull_capped_stream(input, store, c)?,
+                    None => None,
+                },
                 _ => None,
             };
             if let Some(b) = capped {
@@ -1219,6 +1227,131 @@ fn pull_capped(
         },
         _ => None, // Filter/Expand/Aggregate/Distinct/… change the row count
     })
+}
+
+/// If `plan` is a STREAMABLE chain — Project/Filter/Expand/VarLength over a
+/// chunkable leaf (Scan/IndexSeek/RangeSeek) — return the chain with the leaf
+/// replaced by `Plan::Row` (so it runs from a seeded frontier) plus the leaf's full
+/// id list. `None` for any operator the row-by-row `pull_body` cannot stream
+/// (Aggregate/Distinct/Join/OrderPage/OptionalExpand/…).
+fn streaming_chain(plan: &Plan, store: &Store) -> Option<(Plan, Vec<u32>)> {
+    match plan {
+        Plan::Scan { label } => {
+            let ids: Vec<u32> = match label {
+                Some(l) => store.nodes_with_label(l).to_vec(),
+                None => (0..store.node_count() as u32)
+                    .filter(|&i| store.is_alive(i))
+                    .collect(),
+            };
+            Some((Plan::Row, ids))
+        }
+        Plan::IndexSeek { label, key, value } => {
+            Some((Plan::Row, index_seek_ids(store, label, key, value)))
+        }
+        Plan::RangeSeek {
+            label,
+            key,
+            op,
+            value,
+        } => Some((Plan::Row, range_seek_ids(store, label, key, *op, value))),
+        Plan::Filter { input, pred } => {
+            let (body, ids) = streaming_chain(input, store)?;
+            Some((
+                Plan::Filter {
+                    input: Box::new(body),
+                    pred: pred.clone(),
+                },
+                ids,
+            ))
+        }
+        Plan::Expand {
+            input,
+            from,
+            dir,
+            edge_label,
+            bind_edge,
+        } => {
+            let (body, ids) = streaming_chain(input, store)?;
+            Some((
+                Plan::Expand {
+                    input: Box::new(body),
+                    from: *from,
+                    dir: *dir,
+                    edge_label: edge_label.clone(),
+                    bind_edge: *bind_edge,
+                },
+                ids,
+            ))
+        }
+        Plan::VarLength {
+            input,
+            from,
+            dir,
+            edge_label,
+            min,
+            max,
+            trail,
+        } => {
+            let (body, ids) = streaming_chain(input, store)?;
+            Some((
+                Plan::VarLength {
+                    input: Box::new(body),
+                    from: *from,
+                    dir: *dir,
+                    edge_label: edge_label.clone(),
+                    min: *min,
+                    max: *max,
+                    trail: *trail,
+                },
+                ids,
+            ))
+        }
+        Plan::Project { input, items } => {
+            let (body, ids) = streaming_chain(input, store)?;
+            Some((
+                Plan::Project {
+                    input: Box::new(body),
+                    items: items.clone(),
+                },
+                ids,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Short-circuit a keyless `LIMIT`/`SKIP` (no `ORDER BY`) over a streamable chain
+/// that `pull_capped` can't cap because it filters/expands: run the chain over
+/// successive BLOCKS of the source, stopping once `cap` rows have accumulated. The
+/// blocks are taken in source-id order and concatenated in order, and per-block
+/// operators are the same row-wise ones — so the accumulated rows are IDENTICAL
+/// (same order) to materializing the whole input and slicing, just computed early.
+/// Only for `!track` (a path-reading LIMIT keeps the full path via the slow path).
+fn pull_capped_stream(plan: &Plan, store: &Store, cap: usize) -> Result<Option<Batch>, String> {
+    if cap == 0 {
+        return Ok(None); // LIMIT 0 handled by the general path (empty, right width)
+    }
+    let Some((body, ids)) = streaming_chain(plan, store) else {
+        return Ok(None);
+    };
+    if ids.is_empty() {
+        return Ok(None); // empty source → let the full path build the right shape
+    }
+    // A block large enough that a few reach `cap` under a selective filter / low
+    // fan-out, small enough that a huge scan is never fully materialized.
+    let block = cap.saturating_mul(4).max(512);
+    let mut acc: Vec<Batch> = Vec::new();
+    let mut total = 0usize;
+    for chunk in ids.chunks(block) {
+        let seed = Batch::single(Col::Nodes(chunk.to_vec()));
+        let b = pull_body(&body, store, &seed)?;
+        total += b.rows();
+        acc.push(b);
+        if total >= cap {
+            break;
+        }
+    }
+    Ok(Some(concat_batches(&acc)))
 }
 
 /// Compare two rows by the sort keys only (`Equal` on a full tie). NULL placement
@@ -4448,6 +4581,15 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
                     .collect(),
             };
             b.gather(&keep)
+        }
+        // A projection is streamable too (used by the LIMIT short-circuit driver;
+        // EXISTS bodies never contain one). Evaluate the items over the sub-frontier.
+        Plan::Project { input, items } => {
+            let b = pull_body(input, store, seed)?;
+            let cols = eval_all(items.iter().map(|(_, e)| e), store, &b)?;
+            let mut out = Batch::of(cols);
+            out.lineage = b.lineage;
+            out
         }
         other => {
             return Err(format!("unsupported operator in EXISTS body: {other:?}"));
