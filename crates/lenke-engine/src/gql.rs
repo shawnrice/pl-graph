@@ -3306,6 +3306,13 @@ mod tests {
             &store,
         );
         assert_eq!(out.names, vec!["node".to_string(), "distance".to_string()]);
+        // A `target` restricts the result to just that vertex's distance.
+        assert_eq!(
+            rows_of("CALL shortest_path({source: '0', target: '2'}) YIELD node, distance"),
+            vec![(2.0, 2.0)]
+        );
+        // An unreachable target (the isolated node) yields nothing.
+        assert!(rows_of("CALL shortest_path({source: '0', target: '3'})").is_empty());
     }
 
     #[test]

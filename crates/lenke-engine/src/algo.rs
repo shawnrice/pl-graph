@@ -738,16 +738,27 @@ pub fn shortest_path(
     dir: Dir,
     edge_label: Option<&str>,
     weight_property: Option<&str>,
+    target: Option<&str>,
 ) -> Vec<(u32, f64)> {
     let Some(src) = source.and_then(|s| store.node_by_ext(s)) else {
         return Vec::new();
     };
-    match weight_property {
+    let all: Vec<(u32, f64)> = match weight_property {
         None => bfs_distances(store, src, dir, edge_label)
             .into_iter()
             .map(|(v, d)| (v, f64::from(d)))
             .collect(),
         Some(wk) => dijkstra(store, src, dir, edge_label, wk),
+    };
+    // A `target` restricts the result to that one vertex's distance (like core): its
+    // row if reachable (`all` holds only reachable nodes), else nothing — and an
+    // unknown target id yields nothing.
+    match target {
+        None => all,
+        Some(t) => match store.node_by_ext(t) {
+            Some(tgt) => all.into_iter().filter(|&(v, _)| v == tgt).collect(),
+            None => Vec::new(),
+        },
     }
 }
 
@@ -1166,6 +1177,7 @@ pub fn run_procedure(
             dir(),
             str_of("edgeType"),
             str_of("weightProperty"),
+            str_of("target"),
         ),
         "personalized_pagerank" => {
             let d = num_of("dampingFactor").unwrap_or(DEFAULT_DAMPING);
@@ -1590,12 +1602,12 @@ mod tests {
         st.set_edge_prop(e2, "w", Value::Num(1.0));
 
         assert_eq!(
-            shortest_path(&st, Some("0"), Dir::Out, None, Some("w")),
+            shortest_path(&st, Some("0"), Dir::Out, None, Some("w"), None),
             vec![(0, 0.0), (1, 2.0), (2, 1.0)]
         );
         // Without the weight it is the plain hop distance (direct edge to 1).
         assert_eq!(
-            shortest_path(&st, Some("0"), Dir::Out, None, None),
+            shortest_path(&st, Some("0"), Dir::Out, None, None, None),
             vec![(0, 0.0), (1, 1.0), (2, 1.0)]
         );
         // A negative weight makes Dijkstra unsound → the empty result (core errs).
@@ -1605,7 +1617,7 @@ mod tests {
         let mut st2 = b2.build();
         let en = st2.add_edge(0, 1, "R");
         st2.set_edge_prop(en, "w", Value::Num(-1.0));
-        assert!(shortest_path(&st2, Some("0"), Dir::Out, None, Some("w")).is_empty());
+        assert!(shortest_path(&st2, Some("0"), Dir::Out, None, Some("w"), None).is_empty());
     }
 
     #[test]
@@ -1614,22 +1626,30 @@ mod tests {
         // OUT from a(ext "0") on 0→1→2→0: 0@0, 1@1, 2@2; the isolated node is
         // unreachable, so it is absent from the result.
         assert_eq!(
-            shortest_path(&st, Some("0"), Dir::Out, None, None),
+            shortest_path(&st, Some("0"), Dir::Out, None, None, None),
             vec![(0, 0.0), (1, 1.0), (2, 2.0)]
         );
         // IN from a walks the cycle backwards: 0@0, then c(2)@1, then b(1)@2.
         assert_eq!(
-            shortest_path(&st, Some("0"), Dir::In, None, None),
+            shortest_path(&st, Some("0"), Dir::In, None, None, None),
             vec![(0, 0.0), (1, 2.0), (2, 1.0)]
         );
         // Unknown source → nothing.
-        assert!(shortest_path(&st, Some("999"), Dir::Out, None, None).is_empty());
-        assert!(shortest_path(&st, None, Dir::Out, None, None).is_empty());
+        assert!(shortest_path(&st, Some("999"), Dir::Out, None, None, None).is_empty());
+        assert!(shortest_path(&st, None, Dir::Out, None, None, None).is_empty());
         // A named-but-unknown edge type reaches only the source.
         assert_eq!(
-            shortest_path(&st, Some("0"), Dir::Out, Some("NOPE"), None),
+            shortest_path(&st, Some("0"), Dir::Out, Some("NOPE"), None, None),
             vec![(0, 0.0)]
         );
+        // A `target` restricts the result to just that vertex's distance.
+        assert_eq!(
+            shortest_path(&st, Some("0"), Dir::Out, None, None, Some("2")),
+            vec![(2, 2.0)]
+        );
+        // An unreachable target (isolated node 3) or an unknown id → nothing.
+        assert!(shortest_path(&st, Some("0"), Dir::Out, None, None, Some("3")).is_empty());
+        assert!(shortest_path(&st, Some("0"), Dir::Out, None, None, Some("999")).is_empty());
     }
 
     #[test]
