@@ -57,6 +57,37 @@ fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: Option<u32>, mut f: impl 
     }
 }
 
+/// A compact CSR snapshot of the adjacency for ONE `(dir, want)` — the flattened
+/// neighbour ids `nbr` plus per-node offsets `off`. Built once from `for_each_nbr`
+/// (so neighbour ORDER is preserved exactly — out-slice then in-slice, matching the
+/// live traversal), it replaces the per-node `Vec<Vec<Adj>>` pointer-chase with a
+/// contiguous 4-byte-per-edge sweep. Worth it only for MULTI-PASS algorithms
+/// (PageRank, label propagation), where the O(E) build amortizes over many passes
+/// and every pass then streams cache-friendly memory; the summation/visit order is
+/// identical, so results stay byte-for-byte the same.
+struct Csr {
+    off: Vec<u32>,
+    nbr: Vec<u32>,
+}
+
+impl Csr {
+    fn build(store: &Store, dir: Dir, want: Option<u32>, slots: usize) -> Self {
+        let mut off = vec![0u32; slots + 1];
+        let mut nbr: Vec<u32> = Vec::new();
+        for v in 0..slots as u32 {
+            off[v as usize] = u32::try_from(nbr.len()).expect("edge count exceeds u32");
+            for_each_nbr(store, v, dir, want, |u| nbr.push(u));
+        }
+        off[slots] = u32::try_from(nbr.len()).expect("edge count exceeds u32");
+        Self { off, nbr }
+    }
+
+    #[inline]
+    fn nbrs(&self, v: u32) -> &[u32] {
+        &self.nbr[self.off[v as usize] as usize..self.off[v as usize + 1] as usize]
+    }
+}
+
 /// Degree centrality: per live node, the count of incident edges along `dir`
 /// (`Out`/`In`/`Both`), optionally restricted to `edge_label`. A named-but-unknown
 /// edge type gives every node degree 0. Ascending-id order.
@@ -198,6 +229,10 @@ pub fn pagerank(
         pr[v as usize] = 1.0 / nf;
     }
 
+    // In-CSR built once: PageRank pulls over incoming edges every iteration, so the
+    // contiguous sweep amortizes across all of them. Neighbour order equals
+    // `for_each_nbr(Dir::In)` order, keeping the pinned summation order.
+    let in_csr = Csr::build(store, Dir::In, want, slots);
     for _ in 0..iterations {
         // Dangling mass, summed in node-id order (serial — the f64 order is pinned).
         let mut dangling = 0.0;
@@ -212,9 +247,9 @@ pub fn pagerank(
             // Pull over incoming edges u→v (in `in_adj` order): each source u has
             // this out-edge, so its out-degree is ≥ 1 (no divide-by-zero).
             let mut sum = 0.0;
-            for_each_nbr(store, v, Dir::In, want, |u| {
+            for &u in in_csr.nbrs(v) {
                 sum += pr[u as usize] / f64::from(outdeg[u as usize]);
-            });
+            }
             next[v as usize] = base + damping * sum;
         }
         pr = next;
@@ -348,17 +383,20 @@ pub fn label_propagation(
         // most-frequent label, ties broken by smallest id (order-independent).
         let mut count = vec![0u32; n];
         let mut touched: Vec<u32> = Vec::new();
+        // Both-direction CSR built once and swept every iteration (order = out then
+        // in, as `for_each_nbr` gives — the tally is order-independent anyway).
+        let csr = Csr::build(store, Dir::Both, want, n);
         for _ in 0..iterations {
             let mut next = labels.clone();
             for &v in &live {
                 touched.clear();
-                for_each_nbr(store, v, Dir::Both, want, |u| {
+                for &u in csr.nbrs(v) {
                     let lbl = labels[u as usize];
                     if count[lbl as usize] == 0 {
                         touched.push(lbl);
                     }
                     count[lbl as usize] += 1;
-                });
+                }
                 // Most-frequent label; tie → smallest label id. No neighbours → keep.
                 let mut best: Option<(u32, u32)> = None; // (label, count)
                 for &lbl in &touched {
