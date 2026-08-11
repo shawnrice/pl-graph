@@ -3552,6 +3552,106 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                     .collect();
                 return Ok(Col::Gen(out));
             }
+            // `element_map(element[, 'k1', …])` → Gremlin `elementMap()`: core's FLAT
+            // shape — `{id, label, <props…>}` for a node, plus `IN`/`OUT` endpoint
+            // stubs for an edge — where `label` is SINGULAR (the first label / edge
+            // type) and the present properties are flattened alongside the tokens
+            // (so a property named `id`/`label` would shadow one; that's the lossy
+            // flat form, distinct from the nested `{id, labels, properties}` render).
+            // An optional trailing key list filters the properties. Gremlin-only.
+            if name == "element_map" {
+                let filter: Vec<String> = args[1..]
+                    .iter()
+                    .filter_map(|e| match e {
+                        Expr::Lit(Value::Str(s)) => Some(s.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                // The first (sorted) label of a node, or an edge's type.
+                let node_label = |id: u32| -> Value {
+                    let mut ls = store.labels_of(id);
+                    ls.sort();
+                    ls.into_iter()
+                        .next()
+                        .map_or(Value::Null, |l| Value::Str(l.into()))
+                };
+                let node_id = |id: u32| store.node_ext_id(id).map_or(Value::Null, Value::Str);
+                let arg = eval(&args[0], store, batch)?;
+                let n = batch.rows();
+                let out: Vec<Value> = (0..n)
+                    .map(|i| {
+                        let mut entries: Vec<(Value, Value)> = Vec::new();
+                        match arg.value_at(i) {
+                            Value::Num(id) if matches!(arg, Col::Nodes(_)) => {
+                                let id = id as u32;
+                                entries.push((Value::Str("id".into()), node_id(id)));
+                                entries.push((Value::Str("label".into()), node_label(id)));
+                                let keys = if filter.is_empty() {
+                                    store.prop_keys()
+                                } else {
+                                    filter.clone()
+                                };
+                                let mut props: Vec<(String, Value)> = keys
+                                    .into_iter()
+                                    .filter(|k| store.has_prop(id, k))
+                                    .map(|k| {
+                                        let v = store.prop(id, &k);
+                                        (k, v)
+                                    })
+                                    .collect();
+                                props.sort_by(|a, b| a.0.cmp(&b.0));
+                                for (k, v) in props {
+                                    entries.push((Value::Str(k.into()), v));
+                                }
+                            }
+                            Value::Num(eid) if matches!(arg, Col::Edges(_)) => {
+                                let eid = eid as u32;
+                                entries.push((
+                                    Value::Str("id".into()),
+                                    store.edge_ext_id(eid).map_or(Value::Null, Value::Str),
+                                ));
+                                entries.push((
+                                    Value::Str("label".into()),
+                                    store
+                                        .edge_type_name(eid)
+                                        .map_or(Value::Null, |t| Value::Str(t.into())),
+                                ));
+                                if let Some((src, dst)) = store.edge_endpoints(eid) {
+                                    let stub = |v: u32| {
+                                        Value::Map(Arc::new(vec![
+                                            (Value::Str("id".into()), node_id(v)),
+                                            (Value::Str("label".into()), node_label(v)),
+                                        ]))
+                                    };
+                                    // Core: IN is the destination, OUT the source.
+                                    entries.push((Value::Str("IN".into()), stub(dst)));
+                                    entries.push((Value::Str("OUT".into()), stub(src)));
+                                }
+                                let keys = if filter.is_empty() {
+                                    store.edge_prop_keys()
+                                } else {
+                                    filter.clone()
+                                };
+                                let mut props: Vec<(String, Value)> = keys
+                                    .into_iter()
+                                    .filter(|k| store.has_edge_prop(eid, k))
+                                    .map(|k| {
+                                        let v = store.edge_prop(eid, &k);
+                                        (k, v)
+                                    })
+                                    .collect();
+                                props.sort_by(|a, b| a.0.cmp(&b.0));
+                                for (k, v) in props {
+                                    entries.push((Value::Str(k.into()), v));
+                                }
+                            }
+                            _ => return Value::Null,
+                        }
+                        Value::Map(Arc::new(entries))
+                    })
+                    .collect();
+                return Ok(Col::Gen(out));
+            }
             // `value_map(element[, 'k1', …])` → Gremlin `valueMap()`: a Value::Map of
             // the element's PRESENT properties (no id/label tokens), with SCALAR
             // values (core's `propertyMap()`, not built here, is the list-wrapped

@@ -779,6 +779,33 @@ impl Parser {
                 // a following path() still works.
                 plan.filter(pred)
             }
+            "elementmap" => {
+                // elementMap() → core's FLAT element map {id, label, <props…>} (plus
+                // IN/OUT for edges); elementMap('k',…) filters the properties. Lowers
+                // to the gremlin-only `element_map` exec fn (element slot + key list).
+                let mut fn_args = vec![Expr::Slot(self.current)];
+                if !matches!(self.peek(), Some(Tok::RParen)) {
+                    loop {
+                        fn_args.push(Expr::Lit(Value::Str(self.str_arg()?.into())));
+                        if self.peek() == Some(&Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                let p = plan.project(vec![(
+                    "elementMap".to_string(),
+                    Expr::Call {
+                        name: "element_map".to_string(),
+                        args: fn_args,
+                    },
+                )]);
+                self.current = 0;
+                self.slots = 1;
+                p
+            }
             "valuemap" => {
                 // valueMap() → a PROPERTIES-only map (no id/label tokens) with scalar
                 // values; valueMap('k1',…) filters keys. Lowers to the gremlin-only
@@ -1805,6 +1832,40 @@ mod tests {
             )),
             vec!["Str(\"bob\");"],
         );
+    }
+
+    /// `elementMap()` is core's FLAT element map — `{id, label, <props…>}` for a
+    /// node, plus `IN`/`OUT` endpoint stubs for an edge — with a SINGULAR label and
+    /// the properties flattened alongside the tokens. `elementMap('k',…)` filters the
+    /// properties. This is the Gremlin/TinkerPop shape (distinct from the nested
+    /// `{id, labels, properties}` render used for a bare returned element).
+    #[test]
+    fn gremlin_element_map_flat_shape() {
+        let store = social();
+        // Node: id + singular label + flattened (sorted) present properties.
+        assert_eq!(
+            value_bag(&gremlin_rows("g.V('0').elementMap()", &store)),
+            vec![
+                "Map([(Str(\"id\"), Str(\"0\")), (Str(\"label\"), Str(\"Person\")), \
+                 (Str(\"age\"), Num(30.0)), (Str(\"name\"), Str(\"alice\"))]);",
+            ],
+        );
+        // A key filter restricts the flattened properties.
+        assert_eq!(
+            value_bag(&gremlin_rows("g.V('0').elementMap('name')", &store)),
+            vec![
+                "Map([(Str(\"id\"), Str(\"0\")), (Str(\"label\"), Str(\"Person\")), \
+                 (Str(\"name\"), Str(\"alice\"))]);",
+            ],
+        );
+        // Edge: id + type label + IN (destination) / OUT (source) stubs, matching
+        // core's element_map_val (IN = e_dst, OUT = e_src). alice(0)→bob(1) KNOWS = e0.
+        let edge = value_bag(&gremlin_rows("g.V('0').outE('KNOWS').elementMap()", &store));
+        assert!(edge.iter().any(|s| s.contains(
+            "(Str(\"id\"), Str(\"e0\")), (Str(\"label\"), Str(\"KNOWS\")), \
+             (Str(\"IN\"), Map([(Str(\"id\"), Str(\"1\")), (Str(\"label\"), Str(\"Person\"))])), \
+             (Str(\"OUT\"), Map([(Str(\"id\"), Str(\"0\")), (Str(\"label\"), Str(\"Person\"))]))"
+        )));
     }
 
     /// `coalesce(<hop>, …)` takes the FIRST branch that yields per element (an Exists
