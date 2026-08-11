@@ -3316,6 +3316,38 @@ mod tests {
     }
 
     #[test]
+    fn call_shortest_path_astar() {
+        // 0→1 (w=10), 0→2 (1), 2→1 (1): A* 0→1 returns the exact shortest distance (2),
+        // the same as Dijkstra, guided by the algorithm:'astar' backend.
+        let mut bld = Builder::default();
+        bld.node(&["N"], &[]);
+        bld.node(&["N"], &[]);
+        bld.node(&["N"], &[]);
+        let mut store = bld.build();
+        let e0 = store.add_edge(0, 1, "R");
+        store.set_edge_prop(e0, "w", Value::Num(10.0));
+        let e1 = store.add_edge(0, 2, "R");
+        store.set_edge_prop(e1, "w", Value::Num(1.0));
+        let e2 = store.add_edge(2, 1, "R");
+        store.set_edge_prop(e2, "w", Value::Num(1.0));
+
+        let rows_of = |q: &str| -> Vec<(f64, f64)> {
+            run(&super::parse(q).unwrap(), &store)
+                .rows
+                .iter()
+                .map(|r| (node_id(&r[0]), num(&r[1])))
+                .collect()
+        };
+        assert_eq!(
+            rows_of(
+                "CALL shortest_path({source:'0', target:'1', weightProperty:'w', \
+                 algorithm:'astar'}) YIELD node, distance"
+            ),
+            vec![(1.0, 2.0)]
+        );
+    }
+
+    #[test]
     fn call_shortest_path_weighted() {
         // 0→1 (w=10), 0→2 (w=1), 2→1 (w=1): weighted 0→1 = 2 (light detour), while
         // unweighted 0→1 = 1 (direct edge).

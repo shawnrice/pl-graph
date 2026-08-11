@@ -882,6 +882,83 @@ fn dijkstra_dist(
     dist
 }
 
+/// A\* goal-directed search from `source` to `target` (both external ids). Like
+/// Dijkstra, but the heap priority is `g + h`, where `g` is the best-known cost so
+/// far and `h(v)` is the admissible lower-bound from `v` to the target read from the
+/// `heuristic` property (0 when absent). Ported from core's `astar`: same
+/// `(priority, idx)` heap order, same closed-set + strict `ng < g[nbr]` relaxation,
+/// same edge weights (unweighted → unit cost). With an admissible heuristic the
+/// settled `g[target]` is the exact shortest distance — identical to Dijkstra's, and
+/// byte-identical to core. Returns `[(target, distance)]` if reachable, else empty.
+fn astar_search(
+    store: &Store,
+    source: Option<&str>,
+    target: Option<&str>,
+    dir: Dir,
+    edge_label: Option<&str>,
+    weight: Option<&str>,
+    heuristic: Option<&str>,
+) -> Vec<(u32, f64)> {
+    let (Some(src), Some(tgt)) = (
+        source.and_then(|s| store.node_by_ext(s)),
+        target.and_then(|t| store.node_by_ext(t)),
+    ) else {
+        return Vec::new();
+    };
+    let n = store.node_count();
+    let want = want_etype(store, edge_label);
+    let type_ok = |et: u32| want.is_some_and(|inner| inner.is_none_or(|t| t == et));
+    let h = |v: u32| -> f64 {
+        heuristic.map_or(0.0, |k| match store.prop(v, k) {
+            Value::Num(x) => x,
+            _ => 0.0,
+        })
+    };
+    let cost = |eid: u32| weight.map_or(1.0, |k| edge_weight(store, eid, k));
+
+    let mut g = vec![f64::INFINITY; n];
+    g[src as usize] = 0.0;
+    let mut closed = vec![false; n];
+    let mut heap = std::collections::BinaryHeap::new();
+    heap.push(DijkstraState {
+        dist: h(src),
+        idx: src,
+    });
+    while let Some(DijkstraState { idx: u, .. }) = heap.pop() {
+        if closed[u as usize] {
+            continue;
+        }
+        closed[u as usize] = true;
+        if u == tgt {
+            return vec![(tgt, g[u as usize])];
+        }
+        let mut relax = |nbr: u32, eid: u32, etype: u32| {
+            if !type_ok(etype) || closed[nbr as usize] {
+                return;
+            }
+            let ng = g[u as usize] + cost(eid);
+            if ng < g[nbr as usize] {
+                g[nbr as usize] = ng;
+                heap.push(DijkstraState {
+                    dist: ng + h(nbr),
+                    idx: nbr,
+                });
+            }
+        };
+        if matches!(dir, Dir::Out | Dir::Both) {
+            for a in store.out(u) {
+                relax(a.nbr, a.eid, a.etype);
+            }
+        }
+        if matches!(dir, Dir::In | Dir::Both) {
+            for a in store.inc(u) {
+                relax(a.nbr, a.eid, a.etype);
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// The element-wise aggregation for [`neighbor_aggregate`].
 #[derive(Clone, Copy, PartialEq)]
 enum AggOp {
@@ -1198,14 +1275,29 @@ pub fn run_procedure(
             .collect(),
         "on_cycle" => on_cycle(store, str_of("edgeType")),
         "betweenness" => betweenness(store, str_of("edgeType"), str_of("weightProperty")),
-        "shortest_path" => shortest_path(
-            store,
-            str_of("source"),
-            dir(),
-            str_of("edgeType"),
-            str_of("weightProperty"),
-            str_of("target"),
-        ),
+        "shortest_path" => {
+            if str_of("algorithm") == Some("astar") {
+                // Goal-directed A*: source→target only, guided by heuristicProperty.
+                astar_search(
+                    store,
+                    str_of("source"),
+                    str_of("target"),
+                    dir(),
+                    str_of("edgeType"),
+                    str_of("weightProperty"),
+                    str_of("heuristicProperty"),
+                )
+            } else {
+                shortest_path(
+                    store,
+                    str_of("source"),
+                    dir(),
+                    str_of("edgeType"),
+                    str_of("weightProperty"),
+                    str_of("target"),
+                )
+            }
+        }
         "personalized_pagerank" => {
             let d = num_of("dampingFactor").unwrap_or(DEFAULT_DAMPING);
             let iters = num_of("iterations").map_or(DEFAULT_PAGERANK_ITERATIONS, |n| n as u32);
@@ -1656,6 +1748,51 @@ mod tests {
             betweenness(&st, None, None),
             vec![(0, 0.0), (1, 0.5), (2, 0.5), (3, 0.0)]
         );
+    }
+
+    #[test]
+    fn astar_matches_dijkstra_distance() {
+        // 0→1 (w=10), 0→2 (1), 2→1 (1): the shortest 0→1 is the light detour (2).
+        let mut b = Builder::default();
+        b.node(&["N"], &[("hdist", Value::Num(1.0))]); // admissible heuristic to node 1
+        b.node(&["N"], &[("hdist", Value::Num(0.0))]);
+        b.node(&["N"], &[("hdist", Value::Num(0.5))]);
+        let mut st = b.build();
+        let e0 = st.add_edge(0, 1, "R");
+        st.set_edge_prop(e0, "w", Value::Num(10.0));
+        let e1 = st.add_edge(0, 2, "R");
+        st.set_edge_prop(e1, "w", Value::Num(1.0));
+        let e2 = st.add_edge(2, 1, "R");
+        st.set_edge_prop(e2, "w", Value::Num(1.0));
+
+        // A* returns the exact shortest distance — the same as target-restricted
+        // weighted Dijkstra — with or without a (admissible) heuristic.
+        let dij = shortest_path(&st, Some("0"), Dir::Out, None, Some("w"), Some("1"));
+        assert_eq!(dij, vec![(1, 2.0)]);
+        assert_eq!(
+            astar_search(&st, Some("0"), Some("1"), Dir::Out, None, Some("w"), None),
+            dij
+        );
+        assert_eq!(
+            astar_search(
+                &st,
+                Some("0"),
+                Some("1"),
+                Dir::Out,
+                None,
+                Some("w"),
+                Some("hdist")
+            ),
+            dij
+        );
+        // Unweighted A* is the hop distance (direct edge to 1).
+        assert_eq!(
+            astar_search(&st, Some("0"), Some("1"), Dir::Out, None, None, None),
+            vec![(1, 1.0)]
+        );
+        // A missing/unknown source or target → empty.
+        assert!(astar_search(&st, Some("0"), Some("999"), Dir::Out, None, None, None).is_empty());
+        assert!(astar_search(&st, None, Some("1"), Dir::Out, None, None, None).is_empty());
     }
 
     #[test]
