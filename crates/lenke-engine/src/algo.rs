@@ -1406,12 +1406,14 @@ pub fn run_procedure(
         }
         _ => return None,
     };
-    Some(
-        numeric
-            .into_iter()
-            .map(|(v, x)| (v, Value::Num(x)))
-            .collect(),
-    )
+    // `on_cycle` yields a BOOLEAN flag (core surfaces `onCycle` as Bool, not a 0/1
+    // number); every other scalar procedure yields a number.
+    let to_value: fn(f64) -> Value = if name == "on_cycle" {
+        |x| Value::Bool(x != 0.0)
+    } else {
+        Value::Num
+    };
+    Some(numeric.into_iter().map(|(v, x)| (v, to_value(x))).collect())
 }
 
 #[cfg(test)]
