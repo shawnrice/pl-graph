@@ -216,6 +216,10 @@ fn shapes() -> Vec<Shape> {
         // --- var-length paths ---
         same("var/1to2", "MATCH (a:Person)-[:R]->{1,2}(b) RETURN count(*) AS c"),
         same("var/1to3", "MATCH (a:Person)-[:R]->{1,3}(b) RETURN count(*) AS c"),
+        // --- AML-shaped: fixed multi-hop chains with per-hop edge predicates ---
+        same("aml/struct3", "MATCH (a:Person)-[e1:R]->(b)-[e2:R]->(c)-[e3:R]->(d) WHERE e1.w > e2.w AND e2.w > e3.w RETURN a.name AS s, d.name AS t LIMIT 5000"),
+        same("aml/chain5", "MATCH (a:Person)-[:R]->(b)-[:R]->(c)-[:R]->(d)-[:R]->(e) WHERE a.name = 'n5' RETURN count(*) AS c"),
+        same("aml/reach6", "MATCH (a:Person)-[:R]->{1,6}(b) WHERE a.name = 'n5' RETURN count(*) AS c"),
         // --- OPTIONAL MATCH ---
         same("opt/expand", "MATCH (a:Person) WHERE a.age < 5 OPTIONAL MATCH (a)-[:R]->(b) RETURN count(b) AS c"),
         // --- bounded reachability (source-filter pushdown below the traversal) ---

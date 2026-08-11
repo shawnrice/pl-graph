@@ -297,34 +297,49 @@ impl Gen<'_> {
         }
     }
 
-    /// The MATCH pattern: a labelled source, then 0-2 hops. Returns the pattern
-    /// text, the last bound node variable (the traversal target), and the hop count.
-    /// Hop depth and var-length bounds are capped so a single generated query's
-    /// materialization stays bounded (the fuzzer times thousands of them); the
-    /// timeout guard is the backstop for whatever slips through.
-    fn pattern(&mut self) -> (String, String, usize) {
+    /// The MATCH pattern: a labelled source, then 0-4 hops (weighted shallow), any
+    /// hop optionally variable-length ({1,2}..{2,4}), reversed, or EDGE-BOUND (which
+    /// enables per-hop edge predicates — the AML "structuring" shape). Returns the
+    /// pattern text, the last bound node variable, the hop count, and the bound edge
+    /// variables. Deep/var-length chains explode; the timeout guard is the backstop,
+    /// and the query builder biases deep chains toward a LIMIT / reducer.
+    fn pattern(&mut self) -> (String, String, usize, Vec<String>) {
         let label = self.rng.pick(LABELS);
         let mut pat = format!("(a:{label})");
         let mut last = "a".to_string();
-        let hops = self.rng.below(3); // 0..=2
-        let vars = ["b", "c"];
-        for var in vars.iter().take(hops) {
+        let mut edges: Vec<String> = Vec::new();
+        // Weighted toward shallow so the fuzz isn't all explosions, but reaches 4.
+        let hops = match self.rng.below(12) {
+            0..=4 => 1,
+            5..=7 => 2,
+            8..=10 => 3,
+            _ => 4,
+        };
+        let vars = ["b", "c", "d", "e"];
+        for (h, var) in vars.iter().enumerate().take(hops) {
             let ety = self.rng.pick(ETYPES);
-            if self.rng.chance(1, 5) {
-                // variable-length hop, capped to {1,2}
+            if self.rng.chance(1, 6) {
+                // variable-length hop, up to {2,4}
                 self.tag("varlen");
                 let lo = 1 + self.rng.below(2);
-                pat.push_str(&format!("-[:{ety}]->{{{lo},{}}}({var})", lo + 1));
+                let hi = lo + 1 + self.rng.below(2);
+                pat.push_str(&format!("-[:{ety}]->{{{lo},{hi}}}({var})"));
             } else if self.rng.chance(1, 4) {
                 self.tag("hop-in");
                 pat.push_str(&format!("<-[:{ety}]-({var})"));
+            } else if self.rng.chance(1, 3) {
+                // edge-bound hop — enables an edge predicate on `e{h}`
+                self.tag("hop-edge");
+                let ev = format!("e{h}");
+                pat.push_str(&format!("-[{ev}:{ety}]->({var})"));
+                edges.push(ev);
             } else {
                 self.tag("hop-out");
                 pat.push_str(&format!("-[:{ety}]->({var})"));
             }
             last = (*var).to_string();
         }
-        (pat, last, hops)
+        (pat, last, hops, edges)
     }
 
     /// A full query. `algo_ok` allows a CALL tail.
@@ -348,7 +363,7 @@ impl Gen<'_> {
             return format!("CALL {proc}() YIELD {yield_col} RETURN {agg} AS c");
         }
 
-        let (pat, tgt, hops) = self.pattern();
+        let (pat, tgt, hops, edges) = self.pattern();
         let mut q = format!("MATCH {pat}");
 
         // Optional comma-pattern joined on the target (a linear extension). Only at
@@ -359,12 +374,33 @@ impl Gen<'_> {
             q.push_str(&format!(", ({tgt})-[:{ety}]->(z)"));
         }
 
-        // Optional WHERE.
+        // WHERE: node predicate on the target and/or EDGE predicates on bound edges
+        // (a single `e.w <op> k`, or the AML per-hop `e1.w > e2.w` structuring chain).
+        let mut wheres: Vec<String> = Vec::new();
         if self.rng.chance(3, 5) {
             self.tag("where");
-            let pred = self.predicate(&tgt, 2);
-            q.push_str(&format!(" WHERE {pred}"));
+            wheres.push(self.predicate(&tgt, 2));
         }
+        if edges.len() >= 2 && self.rng.chance(1, 2) {
+            self.tag("edge-pred-chain");
+            for pair in edges.windows(2) {
+                wheres.push(format!("{}.w > {}.w", pair[0], pair[1]));
+            }
+        } else if let Some(ev) = edges.first() {
+            if self.rng.chance(1, 2) {
+                self.tag("edge-pred");
+                let op = *self.rng.pick(&["<", ">", "=", "<>"]);
+                wheres.push(format!("{ev}.w {op} {}", self.rng.below(1000)));
+            }
+        }
+        if !wheres.is_empty() {
+            q.push_str(&format!(" WHERE {}", wheres.join(" AND ")));
+        }
+
+        // A deep chain (>=3 hops) is biased toward a bounding LIMIT — the realistic
+        // AML "layering" shape (`… LIMIT 5000`), and where a streaming top-K / cap
+        // would pay off.
+        let deep = hops >= 3;
 
         // Optional WITH pipeline stage (project a numeric alias then filter).
         if self.rng.chance(1, 10) {
@@ -374,11 +410,19 @@ impl Gen<'_> {
             return format!("{q} RETURN count(*) AS c");
         }
 
-        // Tail: aggregate or projection.
-        if self.rng.chance(1, 2) {
+        // Tail: aggregate or projection (deep chains lean to a LIMIT'd projection).
+        if !deep && self.rng.chance(1, 2) {
             self.aggregate_tail(&tgt).map_or_else(
                 || format!("{q} RETURN count(*) AS c"),
                 |t| format!("{q} {t}"),
+            )
+        } else if deep && self.rng.chance(3, 5) {
+            // Bounded layering: project the endpoints with a LIMIT.
+            self.tag("proj");
+            self.tag("limit");
+            format!(
+                "{q} RETURN {tgt}.name AS s, {tgt}.city AS t LIMIT {}",
+                100 + self.rng.below(5000)
             )
         } else {
             format!("{q} {}", self.projection_tail(&tgt))
