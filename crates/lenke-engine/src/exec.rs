@@ -6504,6 +6504,57 @@ fn try_num_conjunction(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<
     let Col::Nodes(ids) = batch.slot(slot0?) else {
         return None;
     };
+    // Same-column range (`lo <= x AND x < hi`) — the overwhelmingly common
+    // conjunction. Normalize the two bounds to a concrete lower/upper with
+    // inclusivity, then run ONE loop of LITERAL f64 comparisons: no per-element `match
+    // op` and no runtime spec loop, so it vectorizes like the single-compare path
+    // (which WINS) instead of running ~2x slower. NaN fails both compares (dropped),
+    // matching `num_pred`'s 3VL; `present` gates nulls — byte-identical to the general
+    // path below.
+    if specs.len() == 2 {
+        let (d0, p0, op0, t0) = specs[0];
+        let (d1, _, op1, t1) = specs[1];
+        if std::ptr::eq(d0.as_ptr(), d1.as_ptr()) {
+            let bound = |op, t| match op {
+                CompareOp::Ge => Some((true, t, true)), // (is_lower, value, inclusive)
+                CompareOp::Gt => Some((true, t, false)),
+                CompareOp::Le => Some((false, t, true)),
+                CompareOp::Lt => Some((false, t, false)),
+                _ => None, // Eq/Ne is not a range bound
+            };
+            if let (Some((lo_a, va, ia)), Some((lo_b, vb, ib))) = (bound(op0, t0), bound(op1, t1)) {
+                // One bound must be lower and the other upper (else e.g. `x>=5 AND x>=10`,
+                // not a range — fall through to the general path).
+                let lohi = match (lo_a, lo_b) {
+                    (true, false) => Some(((va, ia), (vb, ib))),
+                    (false, true) => Some(((vb, ib), (va, ia))),
+                    _ => None,
+                };
+                if let Some(((lo, lo_inc), (hi, hi_inc))) = lohi {
+                    macro_rules! range_loop {
+                        ($lo_cmp:tt, $hi_cmp:tt) => {{
+                            let mut keep = Vec::new();
+                            for (row, &id) in ids.iter().enumerate() {
+                                let i = id as usize;
+                                let x = d0[i];
+                                if p0[i] && x $lo_cmp lo && x $hi_cmp hi {
+                                    keep.push(row);
+                                }
+                            }
+                            keep
+                        }};
+                    }
+                    let keep = match (lo_inc, hi_inc) {
+                        (true, true) => range_loop!(>=, <=),
+                        (true, false) => range_loop!(>=, <),
+                        (false, true) => range_loop!(>, <=),
+                        (false, false) => range_loop!(>, <),
+                    };
+                    return Some(keep);
+                }
+            }
+        }
+    }
     Some(
         ids.iter()
             .enumerate()
