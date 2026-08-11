@@ -4118,6 +4118,53 @@ mod tests {
         );
     }
 
+    /// A scalar / grouped aggregate over a traversal streams the source in blocks
+    /// into running accumulators (no full endpoint multiset). The result must equal
+    /// the materializing path — checked here on a hand-built chain graph.
+    #[test]
+    fn streaming_aggregate_over_traversal_is_exact() {
+        use crate::exec::execute;
+        let mut st = Builder::default().build();
+        // a(1)->b(2)->c(3), a(1)->d(4); scores 2,3,4 reachable at 1..2 hops from a.
+        execute(
+            &super::parse(
+                "INSERT (a:P {g: 0, s: 1})-[:R]->(b:P {g: 1, s: 2})-[:R]->(c:P {g: 1, s: 3}), \
+                 (a)-[:R]->(d:P {g: 0, s: 4})",
+            )
+            .unwrap(),
+            &mut st,
+        )
+        .unwrap();
+        let one = |q: &str| match &run(&super::parse(q).unwrap(), &st).rows[0][0] {
+            Value::Num(x) => *x,
+            other => panic!("not a number: {other:?}"),
+        };
+        // Scalar over a 1..2-hop reach from a: endpoints b(2), d(4) at hop 1; c(3) at
+        // hop 2 → {2,4,3}. min=2, max=4, sum=9, count=3.
+        let base = "MATCH (a:P {s: 1})-[:R]->{1,2}(x)";
+        assert_eq!(one(&format!("{base} RETURN min(x.s) AS v")), 2.0);
+        assert_eq!(one(&format!("{base} RETURN max(x.s) AS v")), 4.0);
+        assert_eq!(one(&format!("{base} RETURN sum(x.s) AS v")), 9.0);
+        assert_eq!(one(&format!("{base} RETURN count(*) AS v")), 3.0);
+        // Grouped by a property: g=1 for {b,c}=(2,3), g=0 for {d}=(4). sums 5 and 4.
+        let rows = run(
+            &super::parse("MATCH (p:P)-[:R]->(q) RETURN q.g AS g, sum(q.s) AS v").unwrap(),
+            &st,
+        );
+        let mut got: Vec<(i64, i64)> = rows
+            .rows
+            .iter()
+            .map(|r| match (&r[0], &r[1]) {
+                (Value::Num(g), Value::Num(v)) => (*g as i64, *v as i64),
+                _ => panic!(),
+            })
+            .collect();
+        got.sort();
+        // q.g over edges a->b(1), b->c(1), a->d(0): group 1 sums s of {b,c}=2+3=5;
+        // group 0 sums s of {d}=4.
+        assert_eq!(got, vec![(0, 4), (1, 5)]);
+    }
+
     /// `DISTINCT … LIMIT k` streams with incremental dedup and stops at `k` distinct
     /// rows — it must equal the first `k` of the full distinct (first-seen order) and
     /// never exceed the total distinct count.

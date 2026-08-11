@@ -907,6 +907,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             if let Some(b) = try_scan_count(input, keys, aggs, store)
                 .or_else(|| try_filtered_count(input, keys, aggs, store))
                 .or_else(|| try_varlen_count(input, keys, aggs, store))
+                .or_else(|| try_varlen_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_num_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_multi_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_distinct_count(input, keys, aggs, store))
@@ -2628,6 +2629,251 @@ fn varlen_count_dfs(
             used.pop();
         }
     }
+}
+
+/// The fold twin of `varlen_count_dfs`: calls `emit(endpoint)` at every length in
+/// `min..=max` instead of counting. Traversal / edge-type / trail logic — and thus
+/// the EMISSION ORDER — are identical to `var_length`, so a `sum` folded here lands
+/// the same value as materializing then summing.
+#[allow(clippy::too_many_arguments)]
+fn varlen_agg_dfs(
+    store: &Store,
+    v: u32,
+    len: u32,
+    min: u32,
+    max: u32,
+    dir: Dir,
+    want: Option<u32>,
+    trail: bool,
+    used: &mut Vec<u32>,
+    emit: &mut dyn FnMut(u32),
+) {
+    if len >= min {
+        emit(v);
+    }
+    if len == max {
+        return;
+    }
+    let out: &[crate::store::Adj] = if matches!(dir, Dir::Out | Dir::Both) {
+        store.out(v)
+    } else {
+        &[]
+    };
+    let inc: &[crate::store::Adj] = if matches!(dir, Dir::In | Dir::Both) {
+        store.inc(v)
+    } else {
+        &[]
+    };
+    for a in out.iter().chain(inc.iter()) {
+        if want.is_some_and(|w| w != a.etype) {
+            continue;
+        }
+        if trail && used.contains(&a.eid) {
+            continue;
+        }
+        if trail {
+            used.push(a.eid);
+        }
+        varlen_agg_dfs(
+            store,
+            a.nbr,
+            len + 1,
+            min,
+            max,
+            dir,
+            want,
+            trail,
+            used,
+            emit,
+        );
+        if trail {
+            used.pop();
+        }
+    }
+}
+
+/// A scalar `sum`/`avg`/`min`/`max`/`count(arg)` over a bare var-length's ENDPOINT
+/// property, folded DURING the DFS — no keep/ends, no gather, no intermediate batch
+/// (which `try_frontier_aggregate`/`aggregate` all build, ~3x the traversal). The
+/// emission order matches `var_length`, so `sum` folds in the same order and the
+/// value contract (`cmp_num_total`) drives min/max — byte-identical to the
+/// materializing path. `None` unless the aggregate reads exactly the appended
+/// endpoint slot (block-streaming the general chain was measured a net regression;
+/// this surgical fold is the low-overhead win).
+fn try_varlen_agg(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.distinct
+        || !matches!(
+            agg.func,
+            AggFn::Sum | AggFn::Avg | AggFn::Min | AggFn::Max | AggFn::Count
+        )
+    {
+        return None;
+    }
+    let Plan::VarLength {
+        input: inner,
+        from,
+        dir,
+        edge_label,
+        min,
+        max,
+        trail,
+    } = input
+    else {
+        return None;
+    };
+    // The aggregate argument must be a property of the ENDPOINT (the appended slot).
+    let Some(Expr::Prop { slot, key }) = agg.arg.as_ref() else {
+        return None; // count(*) is `try_varlen_count`
+    };
+    let want = match edge_label.as_deref() {
+        None => None,
+        Some(name) => store.etype_id(name).map(Some).unwrap_or_else(|| {
+            // Unknown edge type → no paths → the empty-aggregate value.
+            Some(u32::MAX) // sentinel that matches nothing (etype ids are dense)
+        }),
+    };
+    let batch = pull(inner, store, false).ok()?;
+    if *slot != batch.slots.len() {
+        return None; // arg is not the endpoint
+    }
+    let Col::Nodes(src) = batch.slot(*from) else {
+        return None;
+    };
+    let column = store.column(key)?; // property absent everywhere → fall back
+    let dfs = |emit: &mut dyn FnMut(u32)| {
+        let mut used: Vec<u32> = Vec::new();
+        for &v in src {
+            varlen_agg_dfs(store, v, 0, *min, *max, *dir, want, *trail, &mut used, emit);
+        }
+    };
+
+    let val = match (agg.func, column) {
+        (AggFn::Sum | AggFn::Avg, Column::Num { data, present }) => {
+            let mut total = 0.0f64;
+            let mut cnt = 0u64;
+            dfs(&mut |v| {
+                let i = v as usize;
+                if present[i] {
+                    total += data[i];
+                    cnt += 1;
+                }
+            });
+            if agg.func == AggFn::Sum {
+                Value::Num(total)
+            } else if cnt == 0 {
+                Value::Null
+            } else {
+                Value::Num(total / cnt as f64)
+            }
+        }
+        (AggFn::Min | AggFn::Max, Column::Num { data, present }) => {
+            let want_min = agg.func == AggFn::Min;
+            let mut best: Option<f64> = None;
+            dfs(&mut |v| {
+                let i = v as usize;
+                if present[i] {
+                    let x = data[i];
+                    best = Some(match best {
+                        None => x,
+                        Some(b) => {
+                            let ord = value::cmp_num_total(x, b);
+                            if (want_min && ord.is_lt()) || (!want_min && ord.is_gt()) {
+                                x
+                            } else {
+                                b
+                            }
+                        }
+                    });
+                }
+            });
+            best.map_or(Value::Null, Value::Num)
+        }
+        (AggFn::Min | AggFn::Max, Column::Str { data, present }) => {
+            // Track the best endpoint id (not a borrow into `data`), comparing `&str`
+            // directly — the value contract's order for two strings is lexicographic,
+            // so this equals the materializing min/max. `<`/`>` on equal keeps the
+            // first (`cmp_total(..).is_lt()` semantics).
+            let want_min = agg.func == AggFn::Min;
+            let mut best: Option<u32> = None;
+            dfs(&mut |v| {
+                let i = v as usize;
+                if present[i] {
+                    best = Some(match best {
+                        None => v,
+                        Some(b) => {
+                            let (sv, sb) = (data[i].as_ref(), data[b as usize].as_ref());
+                            if (want_min && sv < sb) || (!want_min && sv > sb) {
+                                v
+                            } else {
+                                b
+                            }
+                        }
+                    });
+                }
+            });
+            best.map_or(Value::Null, |v| Value::Str(data[v as usize].clone()))
+        }
+        (
+            AggFn::Min | AggFn::Max,
+            Column::Dict {
+                dict,
+                codes,
+                present,
+            },
+        ) => {
+            let want_min = agg.func == AggFn::Min;
+            let str_of = |v: u32| dict[codes[v as usize] as usize].as_ref();
+            let mut best: Option<u32> = None;
+            dfs(&mut |v| {
+                if present[v as usize] {
+                    best = Some(match best {
+                        None => v,
+                        Some(b) => {
+                            if (want_min && str_of(v) < str_of(b))
+                                || (!want_min && str_of(v) > str_of(b))
+                            {
+                                v
+                            } else {
+                                b
+                            }
+                        }
+                    });
+                }
+            });
+            best.map_or(Value::Null, |v| {
+                Value::Str(dict[codes[v as usize] as usize].clone())
+            })
+        }
+        (AggFn::Min | AggFn::Max, _) => return None, // Temporal/Bool/Gen → general path
+        (AggFn::Count, col) => {
+            // count(arg): endpoints whose property is present (non-null).
+            let present: &[bool] = match col {
+                Column::Num { present, .. }
+                | Column::Str { present, .. }
+                | Column::Bool { present, .. }
+                | Column::Dict { present, .. } => present,
+                _ => return None, // Temporal/Gen → the general path
+            };
+            let mut cnt = 0u64;
+            dfs(&mut |v| {
+                if present[v as usize] {
+                    cnt += 1;
+                }
+            });
+            Value::Num(cnt as f64)
+        }
+        _ => return None,
+    };
+    Some(Batch::single(Col::Gen(vec![val])))
 }
 
 /// Answer a scalar `count(*)` over a bare labelled/unlabelled `Scan` in O(1) (a
