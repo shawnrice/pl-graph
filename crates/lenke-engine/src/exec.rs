@@ -936,12 +936,17 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             let capped = match cap {
                 Some(c) if keys.is_empty() => match pull_capped(input, store, track, c)? {
                     Some(b) => Some(b),
+                    None if track => None,
                     // The row-preserving cap didn't apply (a Filter/Expand/VarLength in
                     // the chain). Stream the chain block-by-block until `c` rows land —
-                    // identical rows, computed early. Path-tracking LIMITs take the
-                    // full path (lineage isn't carried across the block concat).
-                    None if !track => pull_capped_stream(input, store, c)?,
-                    None => None,
+                    // identical rows, computed early. A `DISTINCT … LIMIT` streams with
+                    // incremental dedup, stopping at `c` distinct rows.
+                    None => match input.as_ref() {
+                        Plan::Distinct { input: inner } => {
+                            pull_distinct_capped_stream(inner, store, c)?
+                        }
+                        _ => pull_capped_stream(input, store, c)?,
+                    },
                 },
                 _ => None,
             };
@@ -1352,6 +1357,61 @@ fn pull_capped_stream(plan: &Plan, store: &Store, cap: usize) -> Result<Option<B
         let b = pull_body(&body, store, &seed)?;
         total += b.rows();
         acc.push(b);
+        start = end;
+        block = block.saturating_mul(2).min(8192);
+    }
+    Ok(Some(concat_batches(&acc)))
+}
+
+/// Streaming `DISTINCT … LIMIT k` over a streamable chain: dedup incrementally
+/// (the same whole-row grouping key as `Plan::Distinct`) while streaming source
+/// blocks, stopping once `cap` DISTINCT rows are collected. First-occurrence order
+/// is preserved (blocks in source-id order), so the result matches a full
+/// distinct-then-slice. Lets "give me N distinct X" short-circuit instead of
+/// materializing every reachable row before deduping.
+fn pull_distinct_capped_stream(
+    inner: &Plan,
+    store: &Store,
+    cap: usize,
+) -> Result<Option<Batch>, String> {
+    if cap == 0 {
+        return Ok(None);
+    }
+    let Some((body, ids)) = streaming_chain(inner, store) else {
+        return Ok(None);
+    };
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
+    let mut buf = Vec::new();
+    let mut acc: Vec<Batch> = Vec::new();
+    let mut distinct = 0usize;
+    let mut start = 0usize;
+    let mut block = 1usize;
+    while start < ids.len() && distinct < cap {
+        let end = (start + block).min(ids.len());
+        let b = pull_body(
+            &body,
+            store,
+            &Batch::single(Col::Nodes(ids[start..end].to_vec())),
+        )?;
+        let mut keep = Vec::new();
+        for i in 0..b.rows() {
+            buf.clear();
+            for c in &b.slots {
+                value::group_key_into(&c.value_at(i), &mut buf);
+            }
+            if !seen.contains(buf.as_slice()) {
+                seen.insert(buf.clone());
+                keep.push(i);
+                distinct += 1;
+                if distinct >= cap {
+                    break;
+                }
+            }
+        }
+        acc.push(b.gather(&keep));
         start = end;
         block = block.saturating_mul(2).min(8192);
     }

@@ -4079,6 +4079,50 @@ mod tests {
         assert!(super::parse("MATCH (a:Person)-[:KNOWS]->{3,1}(b) RETURN a.name AS a").is_err());
     }
 
+    /// `DISTINCT … LIMIT k` streams with incremental dedup and stops at `k` distinct
+    /// rows — it must equal the first `k` of the full distinct (first-seen order) and
+    /// never exceed the total distinct count.
+    #[test]
+    fn streaming_distinct_limit_equals_full_prefix() {
+        use crate::exec::execute;
+        let mut st = Builder::default().build();
+        // Nodes with ages cycling 0..4 so there are exactly 5 distinct target ages.
+        let mut q = String::from("INSERT ");
+        for i in 0..20 {
+            if i > 0 {
+                q.push_str(", ");
+            }
+            q.push_str(&format!("(:P {{age: {}}})", i % 5));
+        }
+        execute(&super::parse(&q).unwrap(), &mut st).unwrap();
+        // Give every P a self-ish edge so a hop exists (chain them a->a+1).
+        execute(
+            &super::parse("MATCH (a:P), (b:P) WHERE a.age = 0 AND b.age = 1 CREATE (a)-[:R]->(b)")
+                .unwrap_or_else(|_| super::parse("MATCH (p:P) RETURN p.age AS a").unwrap()),
+            &mut st,
+        )
+        .ok();
+        let rows = |query: &str| {
+            let mut v: Vec<String> = run(&super::parse(query).unwrap(), &st)
+                .rows
+                .iter()
+                .map(|r| format!("{r:?}"))
+                .collect();
+            v.sort();
+            v
+        };
+        // Over a plain scan (streamable): DISTINCT age has 5 values.
+        let full = rows("MATCH (p:P) RETURN DISTINCT p.age AS x");
+        assert_eq!(full.len(), 5);
+        // LIMIT 3 yields exactly 3 distinct rows, all a subset of the full set.
+        let lim = rows("MATCH (p:P) RETURN DISTINCT p.age AS x LIMIT 3");
+        assert_eq!(lim.len(), 3);
+        assert!(lim.iter().all(|r| full.contains(r)));
+        // LIMIT beyond the total returns exactly the full distinct set.
+        let big = rows("MATCH (p:P) RETURN DISTINCT p.age AS x LIMIT 999");
+        assert_eq!(big, full);
+    }
+
     /// A bare `LIMIT`/`SKIP` (no ORDER BY) over a filtered/expanded chain streams the
     /// source in blocks and stops early — and must return EXACTLY the same rows the
     /// full materialize-then-slice would (the block order preserves scan order).
