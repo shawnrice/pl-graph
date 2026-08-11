@@ -4114,6 +4114,55 @@ mod tests {
     }
 
     #[test]
+    fn low_card_num_distinct_matches_hashing() {
+        use crate::store::Builder;
+        use std::collections::BTreeSet;
+        // Columns exercising: low-card ints (age), a NULL every 5th (age absent),
+        // high-card ints past the trivial range (uniq), and non-integers (frac, must
+        // fall back to hashing). The bitset path must agree with the hashing path on
+        // BOTH count(DISTINCT) and the DISTINCT value SET.
+        let mut b = Builder::default();
+        for i in 0..2000u32 {
+            let mut props = vec![
+                ("uniq", Value::Num(f64::from(i))),
+                ("frac", Value::Num(f64::from(i % 9) + 0.25)),
+            ];
+            // age covers every value 0..49; the NULL condition (i%7) is independent of
+            // the value so the present ages are still the full {0..49}.
+            if i % 7 != 0 {
+                props.push(("age", Value::Num(f64::from(i % 50))));
+            }
+            b.node(&["N"], &props);
+        }
+        let st = b.build();
+        let count = |q: &str| match &run(&super::parse(q).unwrap(), &st).rows[0][0] {
+            Value::Num(x) => *x as usize,
+            other => panic!("not a count: {other:?}"),
+        };
+        let set = |q: &str| -> BTreeSet<String> {
+            run(&super::parse(q).unwrap(), &st)
+                .rows
+                .iter()
+                .map(|r| format!("{:?}", r[0]))
+                .collect()
+        };
+        // count(DISTINCT k) == the size of the DISTINCT value set, for every column.
+        for k in ["age", "uniq", "frac"] {
+            let c = count(&format!("MATCH (n:N) RETURN count(DISTINCT n.{k}) AS c"));
+            let s = set(&format!("MATCH (n:N) RETURN DISTINCT n.{k} AS v"));
+            // The DISTINCT set includes a NULL for `age` (absent every 5th node), which
+            // count(DISTINCT) excludes — so the set is one larger exactly there.
+            let extra = usize::from(k == "age");
+            assert_eq!(c + extra, s.len(), "count vs set mismatch for {k}");
+        }
+        // Concrete expected values: age = {0..49} plus NULL.
+        let age = set("MATCH (n:N) RETURN DISTINCT n.age AS v");
+        assert_eq!(age.len(), 51);
+        assert!(age.contains("Null"));
+        assert_eq!(count("MATCH (n:N) RETURN count(DISTINCT n.age) AS c"), 50);
+    }
+
+    #[test]
     fn varlen_degree_formula_matches_enumeration() {
         use crate::store::Builder;
         // 1000 nodes, degree 4 → est_paths (1000·4²=16k) > 2·(V+E) (~10k), so the

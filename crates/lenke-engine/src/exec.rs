@@ -3547,23 +3547,24 @@ fn try_scan_group_agg(
 /// no frontier materialization and no per-cell byte-key serialization. Nulls are
 /// skipped (as `count(DISTINCT)` does). `None` for a non-`Scan` input, a
 /// Temporal/Gen column, or a non-distinct/`count(*)` agg.
-/// The number of DISTINCT values in a Num column over `label`, computed with a
-/// bitset when every present value is an INTEGER in a small span — `count(DISTINCT
-/// age)` over 100 ages hashes 200k cells into an FnvSet; here it sets 100 bits and
-/// pops them. One pass finds the span + integrality (a value that is non-integer,
-/// NaN, or Inf disqualifies it, since `fract()`/`is_finite` reject those), a second
-/// sets a bit per `value - min`. Distinct finite integers map to distinct offsets,
-/// so the popcount equals the FnvSet's `len` exactly. `None` (fall back to hashing)
-/// when the column is empty, non-integer, or spans too wide to bitset cheaply.
-fn low_card_int_distinct_count(
+/// A membership bitset over the DISTINCT integer values of a Num column: returns
+/// `(min, bits)` where `bits[k]` is set iff the value `min + k` is present. Used
+/// instead of hashing when every present value is a finite INTEGER in a small span
+/// — `count(DISTINCT age)` / `DISTINCT age` over 100 ages then sets 100 bits rather
+/// than hashing 200k cells. One pass finds the span + integrality (a non-integer,
+/// NaN, or Inf value disqualifies via `fract()`/`is_finite`), a second sets the
+/// bits. Distinct finite integers map to distinct offsets, so a popcount equals the
+/// FnvSet's `len` and the set bits recover every distinct value exactly. `None`
+/// (fall back to hashing) when the column is empty, non-integer, or spans too wide.
+fn low_card_int_bitset(
     store: &Store,
     label: &Option<String>,
     data: &[f64],
     present: &[bool],
-) -> Option<usize> {
+) -> Option<(f64, Vec<bool>, bool)> {
     const MAX_SPAN: usize = 1 << 20; // cap the bitset at ~1M bits (128 KB)
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-    let (mut any, mut all_int) = (false, true);
+    let (mut any, mut all_int, mut saw_absent) = (false, true, false);
     scan_visit(store, label, |i| {
         if present[i] {
             let x = data[i];
@@ -3574,6 +3575,8 @@ fn low_card_int_distinct_count(
             } else {
                 all_int = false;
             }
+        } else {
+            saw_absent = true; // a NULL cell — DISTINCT keeps one, count ignores it
         }
     });
     if !any || !all_int {
@@ -3589,7 +3592,7 @@ fn low_card_int_distinct_count(
             bits[(data[i] - lo) as usize] = true;
         }
     });
-    Some(bits.iter().filter(|&&b| b).count())
+    Some((lo, bits, saw_absent))
 }
 
 fn try_scan_distinct_count(
@@ -3640,8 +3643,8 @@ fn try_scan_distinct_count(
             // Low-cardinality integer fast path: dedup with a bitset (popcount), no
             // hashing. Falls back to the FnvSet when values are wide-ranged or
             // non-integer. The distinct count is identical either way.
-            if let Some(c) = low_card_int_distinct_count(store, label, data, present) {
-                c
+            if let Some((_, bits, _)) = low_card_int_bitset(store, label, data, present) {
+                bits.iter().filter(|&&b| b).count()
             } else {
                 let mut seen: FnvSet<u64> = FnvSet::default();
                 scan_visit(store, label, |i| {
@@ -6367,17 +6370,32 @@ fn try_distinct_scan_prop(input: &Plan, store: &Store) -> Option<Batch> {
             });
         }
         Column::Num { data, present } => {
-            let mut seen: FnvSet<u64> = FnvSet::default();
-            scan_visit(store, label, |i| {
-                if present[i] {
-                    if seen.insert(value::num_group_bits(data[i])) {
-                        out.push(Value::Num(data[i]));
-                    }
-                } else if !saw_null {
-                    saw_null = true;
+            // Low-card integer fast path: recover the distinct values from a bitset
+            // (ascending) instead of hashing every cell. DISTINCT output order is
+            // unspecified (compared as a set), so ascending is fine; a NULL is still
+            // emitted once if any cell is absent.
+            if let Some((lo, bits, saw_absent)) = low_card_int_bitset(store, label, data, present) {
+                if saw_absent {
                     out.push(Value::Null);
                 }
-            });
+                for (k, &set) in bits.iter().enumerate() {
+                    if set {
+                        out.push(Value::Num(lo + k as f64));
+                    }
+                }
+            } else {
+                let mut seen: FnvSet<u64> = FnvSet::default();
+                scan_visit(store, label, |i| {
+                    if present[i] {
+                        if seen.insert(value::num_group_bits(data[i])) {
+                            out.push(Value::Num(data[i]));
+                        }
+                    } else if !saw_null {
+                        saw_null = true;
+                        out.push(Value::Null);
+                    }
+                });
+            }
         }
         Column::Bool { data, present } => {
             let mut seen = [false; 2];
