@@ -4079,6 +4079,44 @@ mod tests {
         assert!(super::parse("MATCH (a:Person)-[:KNOWS]->{3,1}(b) RETURN a.name AS a").is_err());
     }
 
+    /// The `count(*)`-over-VarLength fast path must equal the materializing path's
+    /// row count for every quantifier / direction — including trail exclusion on the
+    /// cycles in `social`. Guards `try_varlen_count`.
+    #[test]
+    fn varlen_count_matches_materialized() {
+        let store = social();
+        let count_star = |q: &str| match &run(&super::parse(q).unwrap(), &store).rows[0][0] {
+            Value::Num(x) => *x as usize,
+            other => panic!("not a count: {other:?}"),
+        };
+        let materialized = |q: &str| run(&super::parse(q).unwrap(), &store).rows.len();
+        for (ct, mt) in [
+            (
+                "MATCH (a:Person)-[:KNOWS]->{1,2}(b) RETURN count(*) AS c",
+                "MATCH (a:Person)-[:KNOWS]->{1,2}(b) RETURN b.name AS b",
+            ),
+            (
+                "MATCH (a:Person)-[:KNOWS]->{1,3}(b) RETURN count(*) AS c",
+                "MATCH (a:Person)-[:KNOWS]->{1,3}(b) RETURN b.name AS b",
+            ),
+            (
+                "MATCH (a:Person)-[:KNOWS]->{2}(b) RETURN count(*) AS c",
+                "MATCH (a:Person)-[:KNOWS]->{2}(b) RETURN b.name AS b",
+            ),
+            (
+                "MATCH (a:Person)<-[:KNOWS]-{1,2}(b) RETURN count(*) AS c",
+                "MATCH (a:Person)<-[:KNOWS]-{1,2}(b) RETURN b.name AS b",
+            ),
+        ] {
+            assert_eq!(count_star(ct), materialized(mt), "mismatch for `{ct}`");
+        }
+        // Unknown edge type → zero paths, and the fast path must agree.
+        assert_eq!(
+            count_star("MATCH (a:Person)-[:NOPE]->{1,2}(b) RETURN count(*) AS c"),
+            0
+        );
+    }
+
     /// `NOT p` over compares / AND / OR is pushed into the raw filter fast paths by
     /// inversion; each form must return the SAME rows as its hand-inverted twin.
     #[test]

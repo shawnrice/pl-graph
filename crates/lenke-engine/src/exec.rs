@@ -906,6 +906,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // never evaluate arbitrary expressions, so they cannot fault.)
             if let Some(b) = try_scan_count(input, keys, aggs, store)
                 .or_else(|| try_filtered_count(input, keys, aggs, store))
+                .or_else(|| try_varlen_count(input, keys, aggs, store))
                 .or_else(|| try_scan_num_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_multi_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_distinct_count(input, keys, aggs, store))
@@ -2317,6 +2318,121 @@ fn try_filtered_count(
     Some(scalar_num(keep.len() as f64))
 }
 
+/// Answer a scalar `count(*)` over a `VarLength` hop by DFS-counting the emitted
+/// paths per source row, WITHOUT materializing the (up to millions of) keep/ends
+/// vectors or gathering the input slots — which the general VarLength → Aggregate
+/// path builds and immediately discards for a count. Same traversal, edge-type
+/// filter and trail bookkeeping as `var_length`, so the count is exact and
+/// identical. `None` for a grouped / arg'd / DISTINCT aggregate or a non-`VarLength`
+/// input (handled elsewhere).
+fn try_varlen_count(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.func != AggFn::Count || agg.arg.is_some() || agg.distinct {
+        return None; // count(*) only
+    }
+    let Plan::VarLength {
+        input: inner,
+        from,
+        dir,
+        edge_label,
+        min,
+        max,
+        trail,
+    } = input
+    else {
+        return None;
+    };
+    let want = match edge_label.as_deref() {
+        None => None,
+        Some(name) => match store.etype_id(name) {
+            Some(id) => Some(id),
+            None => return Some(scalar_num(0.0)), // unknown edge type → no paths
+        },
+    };
+    let batch = pull(inner, store, false).ok()?;
+    let Col::Nodes(src) = batch.slot(*from) else {
+        return None;
+    };
+    let mut total: u64 = 0;
+    let mut used: Vec<u32> = Vec::new();
+    for &v in src {
+        varlen_count_dfs(
+            store, v, 0, *min, *max, *dir, want, *trail, &mut used, &mut total,
+        );
+        debug_assert!(used.is_empty());
+    }
+    Some(scalar_num(total as f64))
+}
+
+/// The counting twin of `varlen_dfs`: increments `total` at every length in
+/// `min..=max` instead of pushing `(row, endpoint)`. Traversal order, edge-type
+/// filtering and trail (no-edge-reuse) logic are identical, so the tally equals
+/// the number of rows the materializing path would emit.
+#[allow(clippy::too_many_arguments)]
+fn varlen_count_dfs(
+    store: &Store,
+    v: u32,
+    len: u32,
+    min: u32,
+    max: u32,
+    dir: Dir,
+    want: Option<u32>,
+    trail: bool,
+    used: &mut Vec<u32>,
+    total: &mut u64,
+) {
+    if len >= min {
+        *total += 1;
+    }
+    if len == max {
+        return;
+    }
+    let out: &[crate::store::Adj] = if matches!(dir, Dir::Out | Dir::Both) {
+        store.out(v)
+    } else {
+        &[]
+    };
+    let inc: &[crate::store::Adj] = if matches!(dir, Dir::In | Dir::Both) {
+        store.inc(v)
+    } else {
+        &[]
+    };
+    for a in out.iter().chain(inc.iter()) {
+        if want.is_some_and(|w| w != a.etype) {
+            continue;
+        }
+        if trail && used.contains(&a.eid) {
+            continue;
+        }
+        if trail {
+            used.push(a.eid);
+        }
+        varlen_count_dfs(
+            store,
+            a.nbr,
+            len + 1,
+            min,
+            max,
+            dir,
+            want,
+            trail,
+            used,
+            total,
+        );
+        if trail {
+            used.pop();
+        }
+    }
+}
+
 /// Answer a scalar `count(*)` over a bare labelled/unlabelled `Scan` in O(1) (a
 /// label bucket length — buckets hold only live ids) or a single tombstone-bitmap
 /// sweep (unlabelled), WITHOUT materializing the id vector. `None` for any other
@@ -3393,14 +3509,21 @@ fn varlen_dfs(
     if len == max {
         return;
     }
-    let mut adjs: Vec<crate::store::Adj> = Vec::new();
-    if matches!(dir, Dir::Out | Dir::Both) {
-        adjs.extend_from_slice(store.out(v));
-    }
-    if matches!(dir, Dir::In | Dir::Both) {
-        adjs.extend_from_slice(store.inc(v));
-    }
-    for a in adjs {
+    // Iterate the OUT then IN adjacency slices directly — chained, not copied into
+    // a per-visit `Vec` (that allocation, once per node on a path of which there are
+    // millions, dominated). Order is unchanged (out first, then in), so the emitted
+    // path multiset and its order are bit-identical.
+    let out: &[crate::store::Adj] = if matches!(dir, Dir::Out | Dir::Both) {
+        store.out(v)
+    } else {
+        &[]
+    };
+    let inc: &[crate::store::Adj] = if matches!(dir, Dir::In | Dir::Both) {
+        store.inc(v)
+    } else {
+        &[]
+    };
+    for a in out.iter().chain(inc.iter()) {
         if want.is_some_and(|w| w != a.etype) {
             continue;
         }
