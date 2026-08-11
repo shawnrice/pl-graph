@@ -813,12 +813,14 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             from,
             dir,
             edge_label,
+            keep_source,
         } => optional_expand(
             &pull(input, store, track)?,
             store,
             *from,
             *dir,
             edge_label.as_deref(),
+            *keep_source,
         ),
         Plan::IntervalExpand {
             input,
@@ -1761,24 +1763,32 @@ fn optional_expand(
     from: usize,
     dir: Dir,
     edge_label: Option<&str>,
+    keep_source: bool,
 ) -> Batch {
-    // Every left row gets exactly one all-null neighbour row — used when the edge
-    // type is unknown, or the `from` slot isn't a node frontier.
-    let all_null = || {
+    // The value a missed row lands: the source element (Gremlin optional) or the
+    // null sentinel (GQL OPTIONAL MATCH). `miss(v)` picks per row.
+    let miss = |v: u32| if keep_source { v } else { u32::MAX };
+    // Every left row gets exactly one neighbour-less row — used when the edge type
+    // is unknown, or the `from` slot isn't a node frontier.
+    let all_miss = || {
         let keep: Vec<usize> = (0..batch.rows()).collect();
         let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
-        slots.push(Col::Nodes(vec![u32::MAX; batch.rows()]));
+        let landed: Vec<u32> = match (keep_source, batch.slot(from)) {
+            (true, Col::Nodes(src)) => src.clone(),
+            _ => vec![u32::MAX; batch.rows()],
+        };
+        slots.push(Col::Nodes(landed));
         Batch::of(slots)
     };
     let want: Option<u32> = match edge_label {
         None => None,
         Some(name) => match store.etype_id(name) {
             Some(id) => Some(id),
-            None => return all_null(), // unknown edge type → no match for any row
+            None => return all_miss(), // unknown edge type → no match for any row
         },
     };
     let Col::Nodes(src) = batch.slot(from) else {
-        return all_null();
+        return all_miss();
     };
     let mut keep = Vec::new();
     let mut nbrs = Vec::new();
@@ -1789,9 +1799,9 @@ fn optional_expand(
             nbrs.push(nbr);
         });
         if nbrs.len() == before {
-            // No neighbour — keep the row with a null neighbour (left-outer).
+            // No neighbour — keep the row, landing the miss value (source or null).
             keep.push(row);
-            nbrs.push(u32::MAX);
+            nbrs.push(miss(v));
         }
     }
     let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();

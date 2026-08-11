@@ -296,6 +296,12 @@ pub enum Plan {
         from: usize,
         dir: Dir,
         edge_label: Option<String>,
+        /// What a row with NO matching neighbour lands in the appended slot: the
+        /// `u32::MAX` null sentinel (GQL `OPTIONAL MATCH` — `false`) or the source
+        /// element itself (Gremlin `optional(<hop>)`, which passes the traverser
+        /// through unchanged on a miss — `true`). Either way the slot stays a node
+        /// frontier, so the result continues.
+        keep_source: bool,
     },
     /// An interval-overlap hop: like `Expand`, but keeps only edges whose interval
     /// `[edge.lo_key, edge.hi_key]` overlaps `[qlo, qhi]` (`lo <= qhi AND hi >= qlo`).
@@ -563,6 +569,23 @@ impl Plan {
             dir,
             edge_label: edge_label.map(str::to_string),
             bind_edge: true,
+        }
+    }
+
+    #[must_use]
+    pub fn optional_expand(
+        self,
+        from: usize,
+        dir: Dir,
+        edge_label: Option<&str>,
+        keep_source: bool,
+    ) -> Self {
+        Self::OptionalExpand {
+            input: Box::new(self),
+            from,
+            dir,
+            edge_label: edge_label.map(str::to_string),
+            keep_source,
         }
     }
 

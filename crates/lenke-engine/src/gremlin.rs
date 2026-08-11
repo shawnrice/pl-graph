@@ -469,6 +469,81 @@ impl Parser {
                 self.slots += 1;
                 plan.branch(bodies)
             }
+            "optional" => {
+                // optional(<hop>): advance to the hop's neighbour(s) if any, else keep
+                // the element unchanged. This is OptionalExpand with keep_source — a
+                // missed row lands the SOURCE element (not null), so the frontier
+                // continues either way. v1 is a single hop.
+                let from = self.current;
+                let (dir, label) = self.hop_body()?;
+                self.expect(&Tok::RParen)?;
+                self.current = self.slots;
+                self.slots += 1;
+                plan.optional_expand(from, dir, label.as_deref(), true)
+            }
+            "coalesce" => {
+                // coalesce(<hop>, <hop>, …): per element, the FIRST branch that
+                // produces a result. Each branch k fires when no earlier branch's hop
+                // exists AND its own does — an Exists guard chain — then expands. All
+                // branches land at the same slot, so it reconverges like union.
+                let from = self.current;
+                let slots = self.slots;
+                let exists = |dir: Dir, label: Option<&str>| Expr::Exists {
+                    body: Box::new(Plan::Row.expand(from, dir, label)),
+                    outer_width: slots,
+                };
+                let mut bodies = Vec::new();
+                let mut prior: Option<Expr> = None; // OR of the earlier branches' Exists
+                loop {
+                    let (dir, label) = self.hop_body()?;
+                    let this = exists(dir, label.as_deref());
+                    let guard = match &prior {
+                        None => this.clone(),
+                        Some(p) => Expr::And(
+                            Box::new(Expr::Not(Box::new(p.clone()))),
+                            Box::new(this.clone()),
+                        ),
+                    };
+                    bodies.push(Plan::Row.filter(guard).expand(from, dir, label.as_deref()));
+                    prior = Some(match prior {
+                        None => this,
+                        Some(p) => Expr::Or(Box::new(p), Box::new(this)),
+                    });
+                    if self.peek() == Some(&Tok::Comma) {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                self.current = self.slots;
+                self.slots += 1;
+                plan.branch(bodies)
+            }
+            "choose" => {
+                // choose(<pred>, <thenHop>, <elseHop>): route each element by a filter
+                // predicate — the then-hop when it holds, the else-hop otherwise. Both
+                // land at the same slot, reconverging like union.
+                let from = self.current;
+                let pred = self.child_filter_expr()?;
+                self.expect(&Tok::Comma)?;
+                let (t_dir, t_label) = self.hop_body()?;
+                self.expect(&Tok::Comma)?;
+                let (e_dir, e_label) = self.hop_body()?;
+                self.expect(&Tok::RParen)?;
+                let then_body =
+                    Plan::Row
+                        .filter(pred.clone())
+                        .expand(from, t_dir, t_label.as_deref());
+                let else_body = Plan::Row.filter(Expr::Not(Box::new(pred))).expand(
+                    from,
+                    e_dir,
+                    e_label.as_deref(),
+                );
+                self.current = self.slots;
+                self.slots += 1;
+                plan.branch(vec![then_body, else_body])
+            }
             "and" | "or" => {
                 // and(f1, f2, …) / or(f1, f2, …): each child is an element filter
                 // (has/hasNot/nested and/or/not); combine their predicates and apply
@@ -1729,6 +1804,55 @@ mod tests {
                 &store
             )),
             vec!["Str(\"bob\");"],
+        );
+    }
+
+    /// `coalesce(<hop>, …)` takes the FIRST branch that yields per element (an Exists
+    /// guard chain over the same Branch reconverge); `choose(<pred>, <thenHop>,
+    /// <elseHop>)` routes by a predicate; `optional(<hop>)` advances if the hop
+    /// yields, else keeps the element (OptionalExpand keep_source). All keep a
+    /// continuable frontier.
+    #[test]
+    fn gremlin_coalesce_choose_optional() {
+        let store = social();
+        // coalesce: WORKS_ON if present (alice→graphdb), else out KNOWS (bob→carol);
+        // carol has neither → nothing.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').coalesce(out('WORKS_ON'), out('KNOWS')).values('name')",
+                &store,
+            )),
+            vec!["Str(\"carol\");", "Str(\"graphdb\");"],
+        );
+        // choose: alice routes to out KNOWS (bob, carol); the others to out WORKS_ON
+        // (none, since only alice has it).
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').choose(has('name','alice'), out('KNOWS'), out('WORKS_ON')).values('name')",
+                &store,
+            )),
+            vec!["Str(\"bob\");", "Str(\"carol\");"],
+        );
+        // optional: alice→bob,carol; bob→carol; carol has no out KNOWS → stays carol.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person').optional(out('KNOWS')).values('name')",
+                &store,
+            )),
+            vec![
+                "Str(\"bob\");",
+                "Str(\"carol\");",
+                "Str(\"carol\");",
+                "Str(\"carol\");",
+            ],
+        );
+        // A missed optional keeps the element (frontier continues).
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V('2').optional(out('KNOWS')).values('name')",
+                &store
+            )),
+            vec!["Str(\"carol\");"],
         );
     }
 

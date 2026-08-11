@@ -1050,6 +1050,8 @@ impl Parser {
             from,
             dir: rel.dir,
             edge_label: rel.etype,
+            // GQL OPTIONAL MATCH lands NULL for a node with no match.
+            keep_source: false,
         })
     }
 
