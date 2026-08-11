@@ -4079,6 +4079,31 @@ mod tests {
         assert!(super::parse("MATCH (a:Person)-[:KNOWS]->{3,1}(b) RETURN a.name AS a").is_err());
     }
 
+    /// The vectorized finite→finite unary numeric functions (abs/floor/ceil/round/
+    /// sign) must produce exactly what the boxed `scalar_num_fn` does, so an
+    /// aggregate over them is correct. Known inputs, hand-computed sums.
+    #[test]
+    fn vectorized_unary_num_fns_are_exact() {
+        use crate::exec::execute;
+        let mut st = Builder::default().build();
+        // `p.v - 5` yields -3 / 2.5 / 0 (a raw Num column via the Arith fast path),
+        // which the unary functions then vectorize.
+        execute(
+            &super::parse("INSERT (:P {v: 2.0}), (:P {v: 7.5}), (:P {v: 5.0})").unwrap(),
+            &mut st,
+        )
+        .unwrap();
+        let s = |q: &str| match &run(&super::parse(q).unwrap(), &st).rows[0][0] {
+            Value::Num(x) => *x,
+            other => panic!("not a number: {other:?}"),
+        };
+        assert_eq!(s("MATCH (p:P) RETURN sum(abs(p.v - 5)) AS s"), 5.5); // 3 + 2.5 + 0
+        assert_eq!(s("MATCH (p:P) RETURN sum(floor(p.v - 5)) AS s"), -1.0); // -3 + 2 + 0
+        assert_eq!(s("MATCH (p:P) RETURN sum(ceil(p.v - 5)) AS s"), 0.0); // -3 + 3 + 0
+        assert_eq!(s("MATCH (p:P) RETURN sum(sign(p.v - 5)) AS s"), 0.0); // -1 + 1 + 0
+        assert_eq!(s("MATCH (p:P) RETURN sum(round(p.v - 5)) AS s"), 0.0); // -3 + 3(2.5→3) + 0
+    }
+
     /// The `count(*)`-over-VarLength fast path must equal the materializing path's
     /// row count for every quantifier / direction — including trail exclusion on the
     /// cycles in `social`. Guards `try_varlen_count`.

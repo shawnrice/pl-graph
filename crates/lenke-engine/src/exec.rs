@@ -4195,6 +4195,17 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                     .collect();
                 return Ok(Col::Gen(out));
             }
+            // Vectorized unary numeric functions that map finite→finite over a raw
+            // `Num` column stay a `Num` column (no per-row boxing), so a downstream
+            // aggregate/compare keeps the f64 fast path — e.g. `sum(abs(x - k))`.
+            if args.len() == 1 {
+                if let Some(f) = unary_finite_num_fn(name) {
+                    if let Col::Num(xs) = eval(&args[0], store, batch)? {
+                        return Ok(Col::Num(xs.iter().map(|&x| f(x)).collect()));
+                    }
+                    // A non-`Num` arg (nulls / mixed) falls through to the boxed path.
+                }
+            }
             // Evaluate each argument to a column, then dispatch per row. Arity is
             // validated at parse time, so `call_scalar` can index its args. The row
             // count is the BATCH's, not the min over args — a niladic function
@@ -4937,6 +4948,30 @@ fn substring(args: &[Value]) -> Value {
 /// NULL; a computed NaN/Inf result (e.g. `sqrt(-1)`, `ln(0)`) is KEPT (IEEE, like
 /// lenke-core — coerced to null only at JSON egress). `sign(0)` is 0 (unlike
 /// `f64::signum`); rounding is f64's round-half-away-from-zero.
+/// The finite→finite unary numeric functions, as raw `f64 -> f64` closures that
+/// match [`scalar_num_fn`] EXACTLY. Restricted to functions that cannot introduce
+/// NaN/Inf from a finite input (`sqrt`/`ln`/`exp`/… can, so they are excluded):
+/// the result column then keeps the all-finite invariant of a stored `Num` column,
+/// and the vectorized path is byte-identical to the boxed one. `None` = not eligible.
+fn unary_finite_num_fn(name: &str) -> Option<fn(f64) -> f64> {
+    Some(match name {
+        "abs" => f64::abs,
+        "floor" => f64::floor,
+        "ceil" | "ceiling" => f64::ceil,
+        "round" => f64::round,
+        "sign" => |x: f64| {
+            if x > 0.0 {
+                1.0
+            } else if x < 0.0 {
+                -1.0
+            } else {
+                0.0
+            }
+        },
+        _ => return None,
+    })
+}
+
 fn scalar_num_fn(name: &str, v: &Value) -> Value {
     let Some(x) = value::num_of(v) else {
         return Value::Null;
