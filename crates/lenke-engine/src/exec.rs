@@ -2197,6 +2197,89 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
     }
 }
 
+/// The number of `Expand` hops in a pure Scan/Expand chain (0 for a bare seed).
+fn count_hops(plan: &Plan) -> usize {
+    match plan {
+        Plan::Expand { input, .. } => 1 + count_hops(input),
+        _ => 0,
+    }
+}
+
+/// The per-node PATH-COUNT array of a pure Scan/Expand chain: `counts[v]` is the
+/// number of chain paths whose last node is `v`. Propagated one hop at a time
+/// (`next[nbr] += counts[v]` over each matching edge) so it never materializes the
+/// exploding path multiset that [`frontier_ids`] carries — O(hops * edges) time and
+/// O(node_count) space regardless of the fan-out. Path counts are exact integers
+/// (< 2^53 for any real graph), so the f64 accumulation is exact and the derived
+/// count is byte-identical to summing the flat frontier. `None` for a non-chain.
+fn frontier_counts(plan: &Plan, store: &Store) -> Option<Vec<f64>> {
+    let n = store.node_count();
+    match plan {
+        Plan::Scan { label } => {
+            let mut counts = vec![0.0f64; n];
+            match label {
+                Some(l) => store
+                    .nodes_with_label(l)
+                    .iter()
+                    .for_each(|&v| counts[v as usize] = 1.0),
+                None => store
+                    .all_nodes()
+                    .into_iter()
+                    .for_each(|v| counts[v as usize] = 1.0),
+            }
+            Some(counts)
+        }
+        Plan::IndexSeek { label, key, value } => {
+            let mut counts = vec![0.0f64; n];
+            for v in index_seek_ids(store, label, key, value) {
+                counts[v as usize] += 1.0;
+            }
+            Some(counts)
+        }
+        Plan::RangeSeek {
+            label,
+            key,
+            op,
+            value,
+        } => {
+            let mut counts = vec![0.0f64; n];
+            for v in range_seek_ids(store, label, key, *op, value) {
+                counts[v as usize] += 1.0;
+            }
+            Some(counts)
+        }
+        Plan::Expand {
+            input,
+            from,
+            dir,
+            edge_label,
+            ..
+        } => {
+            if *from + 1 != chain_width(input)? {
+                return None;
+            }
+            let prev = frontier_counts(input, store)?;
+            let want = match edge_label {
+                None => None,
+                Some(name) => match store.etype_id(name) {
+                    Some(id) => Some(id),
+                    None => return Some(vec![0.0f64; n]), // unknown label → no paths
+                },
+            };
+            let mut next = vec![0.0f64; n];
+            for (v, &c) in prev.iter().enumerate() {
+                if c != 0.0 {
+                    for_each_nbr(store, v as u32, *dir, want, |nbr, _| {
+                        next[nbr as usize] += c;
+                    });
+                }
+            }
+            Some(next)
+        }
+        _ => None,
+    }
+}
+
 /// Answer a scalar `count(*)` over a bare labelled/unlabelled `Scan` in O(1) (a
 /// label bucket length — buckets hold only live ids) or a single tombstone-bitmap
 /// sweep (unlabelled), WITHOUT materializing the id vector. `None` for any other
@@ -2762,6 +2845,23 @@ fn try_fused_count(
     let src = frontier_ids(inner, store)?; // ids feeding the final hop, w/ multiplicity
 
     if agg.arg.is_none() {
+        // DEEP chain (≥2 hops feed the final hop, so the intermediate frontier would
+        // explode with path multiplicity): propagate a per-node count array instead
+        // of materializing the frontier ids — O(hops * edges) time, O(node_count)
+        // space. The count is Σ_v counts[v] * matching-out-degree(v).
+        if count_hops(inner) >= 2 {
+            if let Some(counts) = frontier_counts(inner, store) {
+                let mut total = 0f64;
+                for (v, &c) in counts.iter().enumerate() {
+                    if c != 0.0 {
+                        let mut deg = 0f64;
+                        for_each_nbr(store, v as u32, *dir, want, |_, _| deg += 1.0);
+                        total += c * deg;
+                    }
+                }
+                return Some(scalar_num(total));
+            }
+        }
         // count(*): number of final-hop paths = sum over sources of matching
         // out-degree. When the sources come from an Expand they repeat (many paths
         // reach the same node), and a node's degree is the same each time — so
