@@ -69,6 +69,23 @@ enum GroupBy {
     Count,
 }
 
+/// A runtime label-membership predicate over `slot`: `label ∈ labels(slot)`, OR-ed
+/// across `labels` (matching Gremlin `hasLabel('A','B')` = has ANY of them). Uses the
+/// list-valued `labels()` element function and `Expr::In`, so it works anywhere in a
+/// traversal (not just folded into a scan).
+fn label_membership(slot: usize, labels: &[String]) -> Expr {
+    let one = |l: &str| Expr::In {
+        needle: Box::new(Expr::Lit(Value::Str(l.into()))),
+        haystack: Box::new(Expr::Call {
+            name: "labels".to_string(),
+            args: vec![Expr::Slot(slot)],
+        }),
+    };
+    let mut it = labels.iter();
+    let first = one(it.next().expect("hasLabel needs at least one label"));
+    it.fold(first, |acc, l| Expr::Or(Box::new(acc), Box::new(one(l))))
+}
+
 /// Whether a plan is a write (so read steps cannot chain after it).
 fn is_write(plan: &Plan) -> bool {
     matches!(
@@ -356,29 +373,54 @@ impl Parser {
 
         let plan = match lname.as_str() {
             "haslabel" => {
-                let label = self.str_arg()?;
+                let mut labels = vec![self.str_arg()?];
+                while self.peek() == Some(&Tok::Comma) {
+                    self.bump();
+                    labels.push(self.str_arg()?);
+                }
                 self.expect(&Tok::RParen)?;
-                // Fold into the scan when it is still bare (the common form right
-                // after V()); otherwise it would need a label-filter operator.
-                match plan {
-                    Plan::Scan { label: None } => Plan::Scan { label: Some(label) },
-                    _ => return Err("hasLabel is only supported right after V()".into()),
+                let cur = self.current;
+                // A single label on a still-bare scan folds in (the efficient form
+                // right after V()); otherwise it is a runtime label-membership filter,
+                // so `hasLabel` works after a hop and with multiple labels too.
+                if labels.len() == 1 && matches!(plan, Plan::Scan { label: None }) {
+                    Plan::Scan {
+                        label: Some(labels.remove(0)),
+                    }
+                } else {
+                    plan.filter(label_membership(cur, &labels))
                 }
             }
             "has" => {
-                let key = self.str_arg()?;
-                // has(k, pred) — value predicate; has(k) — key EXISTENCE.
-                let pred = if self.peek() == Some(&Tok::Comma) {
+                let first = self.str_arg()?;
+                if self.peek() == Some(&Tok::Comma) {
                     self.bump();
-                    self.has_predicate(key)?
-                } else {
-                    Expr::PropertyExists {
-                        slot: self.current,
-                        key,
+                    // has(label, key, pred) — the 3-arg form — is a label check AND a
+                    // property predicate. Detect it: a string key followed by another
+                    // comma (has(k, pred) has no comma after its predicate).
+                    if matches!(self.peek(), Some(Tok::Str(_)))
+                        && self.toks.get(self.pos + 1) == Some(&Tok::Comma)
+                    {
+                        let key = self.str_arg()?;
+                        self.expect(&Tok::Comma)?;
+                        let prop = self.has_predicate(key)?;
+                        self.expect(&Tok::RParen)?;
+                        let label = label_membership(self.current, &[first]);
+                        plan.filter(Expr::And(Box::new(label), Box::new(prop)))
+                    } else {
+                        // has(k, pred) — a value predicate on property `first`.
+                        let pred = self.has_predicate(first)?;
+                        self.expect(&Tok::RParen)?;
+                        plan.filter(pred)
                     }
-                };
-                self.expect(&Tok::RParen)?;
-                plan.filter(pred)
+                } else {
+                    // has(k) — key EXISTENCE.
+                    self.expect(&Tok::RParen)?;
+                    plan.filter(Expr::PropertyExists {
+                        slot: self.current,
+                        key: first,
+                    })
+                }
             }
             // hasId('a', …): keep the element iff its EXTERNAL id is one of the given
             // ids — an `element_id`-in-list predicate (an OR of equals).
@@ -1532,6 +1574,57 @@ mod tests {
         assert!(
             gone.is_empty(),
             "missing id must contribute nothing: {gone:?}"
+        );
+    }
+
+    /// The 3-arg `has('Label','k',pred)` is a label check AND a property predicate,
+    /// and `hasLabel` now works anywhere (after a hop, and with multiple labels =
+    /// ANY of them) via a runtime `label ∈ labels(n)` membership — not just folded
+    /// into the scan right after `V()`.
+    #[test]
+    fn gremlin_has_label_forms() {
+        let store = social();
+        // has(label, key, pred) == 'Label' IN labels(n) AND n.key = pred.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().has('Person','name','alice').values('name')",
+                &store,
+            )),
+            value_bag(&gql_rows(
+                "MATCH (n) WHERE 'Person' IN labels(n) AND n.name='alice' RETURN n.name",
+                &store,
+            )),
+        );
+        // hasLabel after a hop (not right after V()): alice's non-Person neighbour.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V('0').out().hasLabel('Project').values('name')",
+                &store,
+            )),
+            vec!["Str(\"graphdb\");"],
+        );
+        // Multi-label hasLabel matches ANY of the labels (all 4 nodes here).
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Person','Project').count()",
+                &store
+            )),
+            vec!["Num(4.0);"],
+        );
+        // The single-label-after-V() fast path and 2-arg has still work.
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().hasLabel('Project').values('name')",
+                &store
+            )),
+            vec!["Str(\"graphdb\");"],
+        );
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V().has('name','bob').values('name')",
+                &store
+            )),
+            vec!["Str(\"bob\");"],
         );
     }
 
