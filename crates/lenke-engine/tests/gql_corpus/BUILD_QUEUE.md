@@ -388,8 +388,8 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 - **~25 value-contract "core rejects but engine accepts"** — LEAVE baselined (f64 model, CAST-throws,
   range_bounded core-caps, num_string_overflow, distinct_nan string->NaN, m_reserved_word, is_typed_closed,
   inline_constraint, h_rejects_literal, graph_pred_all). These are the intentional divergences; do NOT flip.
-- **subquery cluster (~13): VALUE scalar subquery + uncorrelated/multi-pattern EXISTS** (value_subquery_*,
-  exists_multi_match, exists_bound_a). VALUE{…RETURN count(*)} correlated ~ CountSubquery (2 easy). General
+- **subquery cluster (~13): VALUE scalar subquery + uncorrelated/multi-pattern EXISTS** (value*subquery*_,
+  exists_multi_match, exists_bound_a). VALUE{…RETURN count(_)} correlated ~ CountSubquery (2 easy). General
   VALUE (scalar b.name) + uncorrelated EXISTS { MATCH .. MATCH .. } need pull_body to run a Scan/cross-join
   body or a constant-subquery eval (pull_body currently: Row/Expand/VarLength/Filter/Project only). MEDIUM.
 - **shortest_per_hop (3): per-hop edge WHERE in a shortest path** `-[e:R WHERE e.w>5]->*` — thread an edge

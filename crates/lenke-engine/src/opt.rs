@@ -239,6 +239,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             min,
             max,
             selector,
+            edge_pred,
         } => {
             let (i, c) = rewrite(*input, idx);
             (
@@ -250,6 +251,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                     min,
                     max,
                     selector,
+                    edge_pred,
                 },
                 c,
             )
@@ -712,6 +714,7 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 min,
                 max,
                 selector,
+                edge_pred,
             } => {
                 let (below, above) = split_pushable(pred, width(&sin));
                 match below {
@@ -724,6 +727,7 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                             min,
                             max,
                             selector,
+                            edge_pred,
                         };
                         (
                             Plan::Filter {
@@ -745,6 +749,7 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                             min,
                             max,
                             selector,
+                            edge_pred,
                         };
                         match above {
                             Some(a) => (
@@ -1427,6 +1432,7 @@ mod tests {
             1,
             None,
             crate::ir::ShortestSelector::Any,
+            None,
         )
         .filter(cmp(CompareOp::Eq, prop(0, "name"), Expr::Lit(s("alice"))));
         let opt = assert_rows_preserved(&plan, &store);

@@ -44,9 +44,6 @@ tests_c.jsonl::for_unwinds_literal_list
 tests_c.jsonl::for_with_offset
 tests_c.jsonl::for_with_ordinality
 tests_c.jsonl::prop_str_plus_num_faults
-tests_c.jsonl::shortest_per_hop_all_filtered
-tests_c.jsonl::shortest_per_hop_any_filtered
-tests_c.jsonl::shortest_per_hop_blocks_all
 tests_c.jsonl::str_plus_num_faults
 tests_c.jsonl::sum_distinct_mix_num_duration_faults
 tests_c.jsonl::sum_mix_num_duration_faults
@@ -91,7 +88,6 @@ tests_d.jsonl::qsp_multi_cross_2
 tests_d.jsonl::qsp_multi_ends_1
 tests_d.jsonl::qsp_multi_ends_2
 tests_d.jsonl::qsp_multi_gv
-tests_d.jsonl::shortest_k_per_hop_pred
 tests_d.jsonl::vqs_16
 tests_d.jsonl::vqs_22
 tests_e.jsonl::bang_unary_not_binds_tightly

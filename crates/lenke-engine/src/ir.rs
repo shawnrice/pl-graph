@@ -484,6 +484,9 @@ pub enum Plan {
         min: u32,
         max: Option<u32>,
         selector: ShortestSelector,
+        /// A per-hop edge predicate (`-[e:R WHERE e.w > 5]->*`) over the edge at
+        /// scalar slot 0; an edge failing it is not traversed. `None` = no filter.
+        edge_pred: Option<Box<Expr>>,
     },
     /// Keep rows where `pred` is TRUE (three-valued: FALSE and NULL drop).
     Filter { input: Box<Plan>, pred: Expr },
@@ -756,6 +759,7 @@ impl Plan {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn shortest_path(
         self,
         from: usize,
@@ -764,6 +768,7 @@ impl Plan {
         min: u32,
         max: Option<u32>,
         selector: ShortestSelector,
+        edge_pred: Option<Box<Expr>>,
     ) -> Self {
         Self::ShortestPath {
             input: Box::new(self),
@@ -773,6 +778,7 @@ impl Plan {
             min,
             max,
             selector,
+            edge_pred,
         }
     }
 

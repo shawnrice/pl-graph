@@ -978,6 +978,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             min,
             max,
             selector,
+            edge_pred,
         } => shortest_path(
             &pull(input, store, track)?,
             store,
@@ -987,6 +988,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             *min,
             *max,
             *selector,
+            edge_pred.as_deref(),
         ),
         Plan::Aggregate { input, keys, aggs } => {
             // Frontier fast path: a scalar count over an Expand chain need not
@@ -5214,6 +5216,7 @@ fn shortest_path(
     min: u32,
     max: Option<u32>,
     selector: crate::ir::ShortestSelector,
+    edge_pred: Option<&Expr>,
 ) -> Batch {
     use crate::ir::ShortestSelector;
     let empty = || {
@@ -5228,7 +5231,9 @@ fn shortest_path(
     // `SHORTEST k` (k >= 2) needs paths BEYOND the single shortest length, so it
     // can't ride the BFS below — enumerate trails and select per endpoint instead.
     if let ShortestSelector::ShortestK { k, group } = selector {
-        return shortest_k_path(batch, store, from, dir, &want, min, max, k, group);
+        return shortest_k_path(
+            batch, store, from, dir, &want, min, max, k, group, edge_pred,
+        );
     }
     let Col::Nodes(src) = batch.slot(from) else {
         return empty();
@@ -5271,7 +5276,8 @@ fn shortest_path(
                 adjs.extend_from_slice(store.inc(v));
             }
             for a in adjs {
-                if !edge_carries_wanted(store, &a, &want) {
+                if !edge_carries_wanted(store, &a, &want) || !edge_pred_ok(edge_pred, store, a.eid)
+                {
                     continue;
                 }
                 match dist.get(&a.nbr).copied() {
@@ -5378,6 +5384,21 @@ fn shortest_path(
     out
 }
 
+/// A per-hop edge predicate (`-[e:R WHERE …]->`): TRUE (traverse) when there is no
+/// predicate, else evaluate it over a one-row batch holding just the edge at slot 0.
+/// A false / null / faulting predicate blocks the edge.
+fn edge_pred_ok(pred: Option<&Expr>, store: &Store, eid: u32) -> bool {
+    match pred {
+        None => true,
+        Some(p) => {
+            let mini = Batch::of(vec![Col::Edges(vec![eid])]);
+            eval(p, store, &mini)
+                .map(|c| c.value_at(0).is_true())
+                .unwrap_or(false)
+        }
+    }
+}
+
 /// Endpoint → its trails as `(length, node chain, edge chain)`, in discovery order.
 type TrailsByEnd = FnvMap<u32, Vec<(u32, Vec<u32>, Vec<u32>)>>;
 
@@ -5398,6 +5419,7 @@ fn shortest_k_path(
     max: Option<u32>,
     k: u32,
     group: bool,
+    edge_pred: Option<&Expr>,
 ) -> Batch {
     let empty = || {
         let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
@@ -5427,6 +5449,7 @@ fn shortest_k_path(
             cap,
             dir,
             want,
+            edge_pred,
             &mut used,
             &mut node_stack,
             &mut edge_stack,
@@ -5508,6 +5531,7 @@ fn collect_trails(
     max: u32,
     dir: Dir,
     want: &[u32],
+    edge_pred: Option<&Expr>,
     used: &mut Vec<u32>,
     node_stack: &mut Vec<u32>,
     edge_stack: &mut Vec<u32>,
@@ -5540,7 +5564,10 @@ fn collect_trails(
         .map(|a| (false, a))
         .chain(inc.iter().map(|a| (true, a)))
     {
-        if !edge_carries_wanted(store, a, want) || used.contains(&a.eid) {
+        if !edge_carries_wanted(store, a, want)
+            || used.contains(&a.eid)
+            || !edge_pred_ok(edge_pred, store, a.eid)
+        {
             continue;
         }
         if is_inc && drop_loop && a.nbr == v {
@@ -5557,6 +5584,7 @@ fn collect_trails(
             max,
             dir,
             want,
+            edge_pred,
             used,
             node_stack,
             edge_stack,
@@ -8847,6 +8875,42 @@ mod tests {
         );
     }
 
+    /// A per-hop edge WHERE in a shortest path filters which edges may be traversed.
+    /// a-e1(w1)->b, a-e2(w10)->c, c-e3(w10)->b. With w>5, e1 is blocked → a->c->b (2).
+    #[test]
+    fn shortest_path_per_hop_edge_where() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{\"w\":1.0}}\n",
+            "{\"from\":\"a\",\"to\":\"c\",\"labels\":[\"R\"],\"props\":{\"w\":10.0}}\n",
+            "{\"from\":\"c\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{\"w\":10.0}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let lens = |q: &str| -> Vec<f64> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            run(&plan, &store)
+                .rows
+                .iter()
+                .map(|r| match r[0] {
+                    Value::Num(x) => x,
+                    ref o => panic!("{o:?}"),
+                })
+                .collect()
+        };
+        // e.w > 5 blocks a->b (w1); shortest a->b is a->c->b, length 2.
+        assert_eq!(
+            lens("MATCH p = ANY SHORTEST (a:N {id:'a'})-[e:R WHERE e.w > 5]->*(b:N {id:'b'}) RETURN path_length(p) AS len"),
+            vec![2.0]
+        );
+        // e.w > 100 blocks every edge → b unreachable.
+        assert!(
+            lens("MATCH p = ANY SHORTEST (a:N {id:'a'})-[e:R WHERE e.w > 100]->*(b:N {id:'b'}) RETURN path_length(p) AS len")
+                .is_empty()
+        );
+    }
+
     /// SHORTEST k (k>=2) keeps the k shortest trails per endpoint by (length,
     /// discovery); GROUP keeps every trail in the k smallest distinct lengths.
     /// a->d (1), a->b->d (2), a->c->d (2).
@@ -11497,6 +11561,7 @@ mod tests {
                 1,
                 None,
                 crate::ir::ShortestSelector::Any,
+                None,
             )
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
@@ -11526,6 +11591,7 @@ mod tests {
                 1,
                 None,
                 crate::ir::ShortestSelector::Any,
+                None,
             )
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
@@ -11556,6 +11622,7 @@ mod tests {
                 1,
                 Some(2),
                 crate::ir::ShortestSelector::Any,
+                None,
             )
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
@@ -11584,6 +11651,7 @@ mod tests {
                 1,
                 None,
                 crate::ir::ShortestSelector::Any,
+                None,
             )
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);

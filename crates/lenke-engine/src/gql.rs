@@ -1208,12 +1208,32 @@ impl Parser {
             return Err("a shortest path requires a `*` or `+` quantifier".into());
         };
         let (vb, _lb, vb_props, vb_where, _vb_le) = self.node()?;
-        if va_where.is_some() || vb_where.is_some() || rel.where_range.is_some() {
-            return Err("inline WHERE on a shortest-path element is not supported".into());
+        if va_where.is_some() || vb_where.is_some() {
+            return Err("inline WHERE on a shortest-path node is not supported".into());
         }
+        // A per-hop edge `WHERE` (`-[e:R WHERE e.w > 5]->*`) filters which edges the
+        // path may traverse — parse it against a SCALAR mini-scope (the edge at slot
+        // 0), independent of the outer bindings, since it is evaluated per edge.
+        let edge_pred = if let Some(r) = rel.where_range {
+            let Some(evar) = rel.var.clone() else {
+                return Err(
+                    "a per-hop edge WHERE on a shortest path needs an edge variable".into(),
+                );
+            };
+            let saved_scope = std::mem::take(&mut self.scope);
+            let saved_slots = self.slots;
+            self.scope = HashMap::from([(evar, 0usize)]);
+            self.slots = 1;
+            let pred = self.parse_captured_where(r)?;
+            self.scope = saved_scope;
+            self.slots = saved_slots;
+            Some(Box::new(pred))
+        } else {
+            None
+        };
         // Seed node: label + inline props seed the scan (slot 0).
         let mut plan = node_prop_filters(Plan::Scan { label: la }, 0, va_props);
-        plan = plan.shortest_path(0, rel.dir, &rel.etypes, min, None, selector);
+        plan = plan.shortest_path(0, rel.dir, &rel.etypes, min, None, selector, edge_pred);
         // Endpoint node at slot 1: inline props filter it; its label is ignored (as
         // for any landing node in this subset).
         plan = node_prop_filters(plan, 1, vb_props);
@@ -4505,6 +4525,7 @@ mod tests {
                 0,
                 None,
                 crate::ir::ShortestSelector::Any,
+                None,
             )
             .project(vec![(
                 "len".into(),
