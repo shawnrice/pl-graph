@@ -497,35 +497,40 @@ larger set of feature gaps surfaced (64 non-nested engine!=core). Shipped, each 
 - per-hop edge WHERE on a plain var-length (3) - REPEATABLE ELEMENTS/DIFFERENT EDGES modes + labels(edge) (4)
 - GROUP BY without aggregate = DISTINCT (1)
 
-### ROUND 8 — "do the 14 and the 27" (73 -> 61; session 265 -> 61)
+### ROUND 8 — "do the 14 and the 27" (73 -> 55; session 265 -> 55, 210 cases cleared)
 
-Continued on the 27 specialized features, each gate-green + fuzz-byte-identical:
+Cleared 15 specialized features, each gate-green + fuzz-byte-identical (seeds 1 & 42):
 
-- uncorrelated COUNT subquery (`COUNT { MATCH … MATCH … }`, 1) + repeated-var on a FIXED hop (self-loop
-  `(u)-[r]->(u)`; cycle-closing comma pattern folds, 1)
-- GROUP BY a non-returned key = hidden grouping key + schema-aware ORDER-BY-alias resolution (1)
-- leading OPTIONAL MATCH pads one null row when empty (`Plan::NullPadIfEmpty`, tck_null1, 1)
-- per-hop edge WHERE may reference the hop SOURCE variable (`(a)-[e WHERE a.k=…]->{…}`, 1)
-- interval-overlap hop compares TEMPORAL bounds, not just numeric (contains_window — was a real
-  correctness bug: date-interval queries silently returned empty, 1)
-- group-variable list typing survives a WITH rename (`WITH e AS hops … hops[i].amt`, 1)
-- ORDER BY expression can reference an output alias (`ORDER BY (LET x=a IN x END)`, 1)
+- uncorrelated COUNT subquery (`COUNT { MATCH … MATCH … }`) + repeated-var on a FIXED hop (self-loop
+  `(u)-[r]->(u)`; cycle-closing comma pattern folds)
+- GROUP BY a non-returned key = hidden grouping key + schema-aware ORDER-BY-alias resolution
+- leading OPTIONAL MATCH pads one null row when empty (`Plan::NullPadIfEmpty`, tck_null1)
+- per-hop edge WHERE may reference the hop SOURCE variable (`(a)-[e WHERE a.k=…]->{…}`)
+- interval-overlap hop compares TEMPORAL bounds, not just numeric (contains_window — a real correctness
+  bug: date-interval queries silently returned empty)
+- group-variable list typing survives a WITH rename (`WITH e AS hops … hops[i].amt`)
+- ORDER BY expression can reference an output alias (`ORDER BY (LET x=a IN x END)`)
+- IS TYPED RECORD closed schema (`{a::INTEGER, b::STRING [NOT NULL], geo::RECORD {…}}`, 2)
+- uncorrelated CALL () {…} empty-scope subquery (cross-join; outer refs isolated to NULL, 2)
+- correlated CALL with a COUNT aggregate (LEFT semantics, count 0 for empty)
+- edge-label negation `-[:!T]->` / `-[:!(A|B)]->` (complement id set in want_etypes)
 
-REMAINING (61 = ~30 value-contract intentional + ~31 feature):
+REMAINING (55 = ~30 value-contract intentional + ~25 feature). The remaining feature work is the
+HARDEST tier — each item is high-effort and/or has NO fuzzer byte-identity safety net (the differential
+fuzzer only generates node-only / 1-2-hop patterns, NOT quantified/nested groups). Recommend extending
+the fuzzer to emit quantified + nested groups BEFORE attempting the nested cluster, so byte-identity is
+verifiable beyond the 14 corpus cases.
 
 - NESTED-RECURSIVE (14): list-of-lists group vars (nested_paren_lol/varying_1/2, nested_quant_gv_vectorize),
   variable-inner group vars (nested_outer_gv_2), multi-rep decomposition (nested_quant_ends_2/3),
   nested per-rep WHERE (nested_per_rep_where_1..4), nested per-hop edge (nested_per_hop_edge_1/2), vqs_16.
-  Needs core's recursive bind_unit + nested Value::List materialization. The big coherent HARD chunk.
-- SMALL FEATURES still open (buildable, deferred by cost/risk):
-  - any_shortest_plus_seed_cycle_len — shortest cycle back to the bound seed; needs surgery on the shared
-    BFS (start re-reachable via a non-trivial path). 1 case, HIGH byte-identity risk. DEFERRED.
-  - m_edge_label_negation (`-[:!T]->`) — edge-label negation; threads a neg flag through want_etypes +
-    every plan node (Expand/VarLength/ShortestPath). MEDIUM (wide).
-  - CALL variants (3): call_inline_count (correlated per-outer aggregate — pull_body has no Aggregate arm),
-    call_scope_isolation_total (empty `()` scope = uncorrelated body, cross-join), decorrelate_scope_isolation
-    (empty scope + isolated outer ref → 0 rows). Correlated lateral with a fresh scan + aggregates. HARD.
-  - is_typed_closed_record_1/2 — `IS TYPED RECORD {a :: INTEGER, …}` closed structural record typing. MEDIUM.
+  Needs core's recursive bind_unit + nested Value::List materialization with byte-identical enumeration
+  order. The big coherent HARD chunk; verified data model captured (x[outer][inner] depth = enclosing groups).
+- any_shortest_plus_seed_cycle_len (1) — shortest cycle back to the bound seed; needs surgery on the shared
+  BFS so `start` is re-reachable via a non-trivial path. HIGH byte-identity risk on a hot shared fn.
+- for_drives_batch_optional_match (1) — FOR-driven fresh-var OPTIONAL MATCH `(p:Person {name: name})`: needs
+  BOTH a correlated inline-prop EXPRESSION (props() only takes literals today) AND a left-outer correlated
+  node scan (no such plan node). Two new capabilities.
 - VALUE-CONTRACT (~30, leave baselined by principle): num_string_overflow, distinct_nan, sum/avg-over-temporal
   + mixed, CAST-throws (bool/list/int_null), range caps, m_reserved_word, inline_constraint, hardening (bool*num
   / str+num / oversized-int / overflow-exponent), date_part strict, faulting_aggregate, call_config_*_error,
