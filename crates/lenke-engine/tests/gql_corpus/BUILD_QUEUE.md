@@ -369,8 +369,8 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 - **inline edge props on a PLAIN var-length `-[:R {amt:20.0}]->{n,m}`** (per_hop_inline_from_a/b, 2) —
   NOW EASY: desugar to a RepeatGroup with per_rep_pred = (e.amt == 20.0) at scalar slot 1, empty group_binds.
   In extend_chain's quant+bind path, when rel has ONLY inline props (no var, no where), build RepeatGroup.
-- **VALUE scalar subquery / uncorrelated multi-pattern EXISTS** (9: value_subquery_*, exists_multi_match) —
-  VALUE{…RETURN count(*)} ~ CountSubquery correlated; general VALUE + uncorrelated EXISTS need pull_body
+- **VALUE scalar subquery / uncorrelated multi-pattern EXISTS** (9: value*subquery*_, exists_multi_match) —
+  VALUE{…RETURN count(_)} ~ CountSubquery correlated; general VALUE + uncorrelated EXISTS need pull_body
   to run a Scan/cross-join body or a constant-subquery eval. MEDIUM.
 - **multi-hop group unit k>1** (gv_bind_each_rep_2hop), **nested groups** (vqs_16, nested_paren_varying,
   nested_outer_gv, nested_quant_ends, nested_per_hop, nested_per_rep), **WITH-carry** (gv_carry_through_with) — hard.

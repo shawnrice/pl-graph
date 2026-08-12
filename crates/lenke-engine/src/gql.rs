@@ -1931,20 +1931,49 @@ impl Parser {
             // `slots+1`) so `e.k` can resolve.
             let bind = rel.var.is_some() || !rel.props.is_empty() || rel.where_range.is_some();
             if let Some((min, max)) = quant {
-                if bind {
-                    return Err(
-                        "a relationship variable / edge properties on a variable-length \
-                         pattern are not supported"
-                            .into(),
-                    );
-                }
                 let node_slot = *slots;
                 if let Some(v) = v2 {
                     scope.insert(v, node_slot);
                 }
                 *slots += 1;
-                // The leading path mode (default TRAIL) selects the reuse semantics.
-                plan = plan.var_length(from, rel.dir, &rel.etypes, min, max, self.path_mode);
+                if bind {
+                    // Inline edge PROPERTIES on a var-length hop (`-[:R {k:v}]->{n,m}`)
+                    // are a per-repetition edge filter → a RepeatGroup whose per_rep_pred
+                    // matches each edge (edge at scalar slot 1). A relationship VARIABLE
+                    // or an inline edge WHERE on a var-length hop stays unsupported.
+                    if rel.var.is_some() || rel.where_range.is_some() {
+                        return Err("a relationship variable / edge WHERE on a variable-length \
+                             pattern is not supported"
+                            .into());
+                    }
+                    let mut pred: Option<Expr> = None;
+                    for (k, val) in rel.props {
+                        let cmp = Expr::Compare {
+                            op: CompareOp::Eq,
+                            left: Box::new(Expr::Prop { slot: 1, key: k }),
+                            right: Box::new(Expr::Lit(val)),
+                        };
+                        pred = Some(match pred {
+                            None => cmp,
+                            Some(p) => Expr::And(Box::new(p), Box::new(cmp)),
+                        });
+                    }
+                    plan = Plan::RepeatGroup {
+                        input: Box::new(plan),
+                        from,
+                        dir: rel.dir,
+                        edge_label: rel.etypes,
+                        min,
+                        max,
+                        mode: self.path_mode,
+                        endpoint_slot: node_slot,
+                        group_binds: Vec::new(),
+                        per_rep_pred: pred.map(Box::new),
+                    };
+                } else {
+                    // The leading path mode (default TRAIL) selects the reuse semantics.
+                    plan = plan.var_length(from, rel.dir, &rel.etypes, min, max, self.path_mode);
+                }
                 from = node_slot;
             } else if bind {
                 let edge_slot = *slots;

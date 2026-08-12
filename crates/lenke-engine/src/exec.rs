@@ -8779,6 +8779,35 @@ mod tests {
         );
     }
 
+    /// Inline edge properties on a plain var-length hop filter every edge on the
+    /// path. a-e(10)->b-e(20)->c-e(5)->d; only b->c has amt 20.
+    #[test]
+    fn var_length_inline_edge_props() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"id\":\"d\",\"labels\":[\"N\"],\"props\":{\"id\":\"d\"}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{\"amt\":10.0}}\n",
+            "{\"from\":\"b\",\"to\":\"c\",\"labels\":[\"R\"],\"props\":{\"amt\":20.0}}\n",
+            "{\"from\":\"c\",\"to\":\"d\",\"labels\":[\"R\"],\"props\":{\"amt\":5.0}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let ids = |q: &str| -> Vec<String> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            let mut v = names_of(&run(&plan, &store), 0);
+            v.sort();
+            v
+        };
+        // From a, no outgoing amt=20 edge → no path.
+        assert!(ids("MATCH (a:N {id:'a'})-[:R {amt:20.0}]->{1,3}(x) RETURN x.id AS id").is_empty());
+        // From b, b->c has amt 20 → x = c (c->d is amt 5, excluded).
+        assert_eq!(
+            ids("MATCH (b:N {id:'b'})-[:R {amt:20.0}]->{1,3}(x) RETURN x.id AS id"),
+            vec!["c"]
+        );
+    }
+
     /// A per-repetition WHERE prunes each hop by the rep's scalar x/e/y. Path
     /// a-e1(30)->b-e2(20)->c-e3(10)->d; bals a=100,b=200,c=5,d=200.
     #[test]
