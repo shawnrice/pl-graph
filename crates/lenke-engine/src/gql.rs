@@ -128,6 +128,8 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         lets: Vec::new(),
         suppress_in: false,
         path_mode: PathMode::Trail,
+        having_aggs: None,
+        having_base: 0,
     };
     let mut plan = p.query()?;
     // `<query> UNION [ALL] <query> …`: each arm is an independent query with a fresh
@@ -394,6 +396,14 @@ struct Parser {
     /// from a leading mode keyword (`WALK`/`TRAIL`/`SIMPLE`/`ACYCLIC`, default
     /// `Trail`) and read at the `var_length` build. See [`PathMode`].
     path_mode: PathMode,
+    /// While parsing a `HAVING` predicate, aggregate calls in expression position
+    /// (`count(*) > 1`) are HOISTED into this list and replaced with a `Slot` into
+    /// the post-aggregation schema (see `select_with_having`). `None` everywhere
+    /// else — an aggregate outside HAVING/return-items is an error.
+    having_aggs: Option<Vec<crate::ir::Agg>>,
+    /// Post-aggregation schema index of the FIRST hoisted HAVING aggregate
+    /// (`keys.len() + select_aggs.len()`); the i-th lands at `having_base + i`.
+    having_base: usize,
 }
 
 impl Parser {
@@ -796,25 +806,162 @@ impl Parser {
             let items = self.return_items()?;
             (Plan::Row, items)
         };
-        // GROUP BY: the non-aggregated SELECT items are already the implicit grouping
-        // keys (`apply_items`), so parse and discard an explicit GROUP BY that names
-        // them. (Forcing a group with no aggregate in the list, and HAVING, are the
-        // next phase.)
+        // GROUP BY keys (expressions over the input bindings).
+        let mut group_keys: Vec<Expr> = Vec::new();
         if self.eat_kw("GROUP") {
             if !self.eat_kw("BY") {
                 return Err("expected BY after GROUP".into());
             }
             loop {
-                let _ = self.expr()?;
+                group_keys.push(self.expr()?);
                 if !self.eat(&Tok::Comma) {
                     break;
                 }
             }
         }
+        // A HAVING clause needs the explicit aggregate pipeline; without it the
+        // non-aggregated SELECT items are already the implicit grouping keys, so the
+        // ordinary projection path handles GROUP BY (which was consumed above).
         if self.peek_kw("HAVING") {
-            return Err("SELECT … HAVING is not supported yet".into());
+            return self.select_with_having(plan, distinct, items, group_keys);
         }
         self.project_and_page(plan, distinct, items)
+    }
+
+    /// Parse and hoist an aggregate call encountered in a HAVING predicate: `func`
+    /// is its `AggFn` (its name is already consumed; `(` is next). Records the `Agg`
+    /// in `having_aggs` and returns a `Slot` into the post-aggregation schema.
+    fn hoist_having_agg(&mut self, func: AggFn) -> Result<Expr, String> {
+        self.expect(&Tok::LParen)?;
+        let (arg, distinct, frac) = if self.eat(&Tok::Star) {
+            self.expect(&Tok::RParen)?;
+            (None, false, None)
+        } else {
+            let distinct = self.eat_kw("DISTINCT");
+            let a = self.expr()?;
+            let frac = if self.eat(&Tok::Comma) {
+                match self.expr()? {
+                    Expr::Lit(Value::Num(f)) => Some(f),
+                    _ => return Err("percentile fraction must be a numeric constant".into()),
+                }
+            } else {
+                None
+            };
+            self.expect(&Tok::RParen)?;
+            (Some(a), distinct, frac)
+        };
+        let aggs = self.having_aggs.as_mut().expect("in HAVING");
+        let idx = aggs.len();
+        aggs.push(crate::ir::Agg {
+            func,
+            arg,
+            distinct,
+            name: format!("__h{idx}"),
+            frac,
+        });
+        Ok(Expr::Slot(self.having_base + idx))
+    }
+
+    /// `SELECT items FROM MATCH … GROUP BY g HAVING h [ORDER BY] [paging]` — the
+    /// grouped/HAVING form. Aggregates in the SELECT list and (hoisted) in HAVING
+    /// share one `Aggregate` over the group keys; HAVING then filters the grouped
+    /// rows (a group-key reference in HAVING is rewritten to its key column, an
+    /// aggregate to its output column), and the SELECT items project in item order —
+    /// dropping any HAVING-only aggregate column.
+    fn select_with_having(
+        &mut self,
+        plan: Plan,
+        distinct: bool,
+        items: Vec<RetItem>,
+        group_keys: Vec<Expr>,
+    ) -> Result<Plan, String> {
+        // Split the SELECT list into key (non-aggregate) items and aggregate items.
+        let select_keys: Vec<(String, Expr)> = items
+            .iter()
+            .filter_map(|it| match it {
+                RetItem::Key(n, e) => Some((n.clone(), e.clone())),
+                RetItem::Agg(_) => None,
+            })
+            .collect();
+        let select_aggs: Vec<crate::ir::Agg> = items
+            .iter()
+            .filter_map(|it| match it {
+                RetItem::Agg(a) => Some(a.clone()),
+                RetItem::Key(..) => None,
+            })
+            .collect();
+        // Grouping keys: the SELECT non-aggregate items, plus any GROUP BY expression
+        // not already among them (matched structurally).
+        let mut keys: Vec<(String, Expr)> = select_keys.clone();
+        for gk in &group_keys {
+            if !keys.iter().any(|(_, e)| expr_eq(e, gk)) {
+                keys.push((format!("__gk{}", keys.len()), gk.clone()));
+            }
+        }
+        // Parse HAVING with aggregate hoisting active. Aggregates land after the
+        // keys and the SELECT-list aggregates in the post-aggregation schema.
+        self.eat_kw("HAVING");
+        self.having_base = keys.len() + select_aggs.len();
+        self.having_aggs = Some(Vec::new());
+        let having_raw = self.expr()?;
+        let having_aggs = self.having_aggs.take().expect("in HAVING");
+        // A group-key reference in HAVING (`n.age >= 35`) reads the key column, not
+        // the input property — rewrite it to the key's post-aggregation slot.
+        let having = rewrite_group_keys(having_raw, &keys);
+
+        let mut aggs = select_aggs.clone();
+        aggs.extend(having_aggs);
+        let mut p = plan.aggregate(keys.clone(), aggs).filter(having);
+
+        // Project the SELECT items in ITEM order onto the post-aggregation schema
+        // (`[keys…, select_aggs…, having_aggs…]`), dropping the HAVING-only columns.
+        let mut proj: Vec<(String, Expr)> = Vec::with_capacity(items.len());
+        for it in &items {
+            match it {
+                RetItem::Key(name, e) => {
+                    let ki = keys
+                        .iter()
+                        .position(|(_, ke)| expr_eq(ke, e))
+                        .ok_or("a SELECT item is neither an aggregate nor a group key")?;
+                    proj.push((name.clone(), Expr::Slot(ki)));
+                }
+                RetItem::Agg(a) => {
+                    let ai = select_aggs
+                        .iter()
+                        .position(|sa| sa.name == a.name)
+                        .expect("select agg");
+                    proj.push((a.name.clone(), Expr::Slot(keys.len() + ai)));
+                }
+            }
+        }
+        let out_names: Vec<String> = proj.iter().map(|(n, _)| n.clone()).collect();
+        p = p.project(proj);
+        if distinct {
+            p = p.distinct();
+        }
+        // ORDER BY (over the output aliases) and paging.
+        let sort_keys = if self.eat_kw("ORDER") {
+            if !self.eat_kw("BY") {
+                return Err("expected BY after ORDER".into());
+            }
+            self.sort_keys(&out_names)?
+        } else {
+            Vec::new()
+        };
+        let skip = if self.eat_kw("OFFSET") || self.eat_kw("SKIP") {
+            Some(self.usize_lit()?)
+        } else {
+            None
+        };
+        let limit = if self.eat_kw("LIMIT") {
+            Some(self.usize_lit()?)
+        } else {
+            None
+        };
+        if !sort_keys.is_empty() || skip.is_some() || limit.is_some() {
+            p = p.order_page(sort_keys, skip, limit);
+        }
+        Ok(p)
     }
 
     /// Parse a shortest-path SELECTOR if one is present: `ANY SHORTEST` → Any,
@@ -2451,6 +2598,14 @@ impl Parser {
                         return Ok(Expr::Lit(Value::Temporal(t)));
                     }
                 }
+                // Inside a HAVING predicate, an aggregate call in expression position
+                // (`count(*) > 1`) is hoisted into `having_aggs` and replaced by a
+                // reference to its post-aggregation output column.
+                if self.having_aggs.is_some() && self.peek() == Some(&Tok::LParen) {
+                    if let Some(func) = agg_fn(&s) {
+                        return self.hoist_having_agg(func);
+                    }
+                }
                 // A scalar function call `name(args…)`. (Aggregates are handled in
                 // return_items, never reached here.)
                 if self.peek() == Some(&Tok::LParen) {
@@ -2816,6 +2971,53 @@ const MAX_VARLEN: u32 = 32;
 /// aggregate anywhere makes it an `Aggregate` whose non-aggregate items are the
 /// implicit GROUP BY keys; otherwise a plain `Project`. Shared by `RETURN` and
 /// `WITH` so the two build identical shapes.
+/// Structural equality of two expressions (the IR `Expr` is not `PartialEq`), via
+/// their debug rendering. Used to match a HAVING/SELECT expression against a group
+/// key — exact enough for keys, which are simple property/slot expressions.
+fn expr_eq(a: &Expr, b: &Expr) -> bool {
+    format!("{a:?}") == format!("{b:?}")
+}
+
+/// Rewrite a HAVING predicate so any sub-expression equal to a group key becomes a
+/// `Slot` into the post-aggregation schema (that key's column index) — a group-key
+/// reference reads the grouped column, not the pre-aggregation property. Aggregates
+/// were already replaced with slots at parse time (see `hoist_having_agg`).
+fn rewrite_group_keys(e: Expr, keys: &[(String, Expr)]) -> Expr {
+    if let Some(i) = keys.iter().position(|(_, ke)| expr_eq(ke, &e)) {
+        return Expr::Slot(i);
+    }
+    let go = |b: Box<Expr>| Box::new(rewrite_group_keys(*b, keys));
+    match e {
+        Expr::Not(x) => Expr::Not(go(x)),
+        Expr::And(a, b) => Expr::And(go(a), go(b)),
+        Expr::Or(a, b) => Expr::Or(go(a), go(b)),
+        Expr::Xor(a, b) => Expr::Xor(go(a), go(b)),
+        Expr::Compare { op, left, right } => Expr::Compare {
+            op,
+            left: go(left),
+            right: go(right),
+        },
+        Expr::Arith { op, left, right } => Expr::Arith {
+            op,
+            left: go(left),
+            right: go(right),
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: go(expr),
+            negated,
+        },
+        Expr::In { needle, haystack } => Expr::In {
+            needle: go(needle),
+            haystack: go(haystack),
+        },
+        Expr::Call { name, args } => Expr::Call {
+            name,
+            args: args.into_iter().map(|a| rewrite_group_keys(a, keys)).collect(),
+        },
+        other => other,
+    }
+}
+
 fn apply_items(plan: Plan, items: &[RetItem]) -> (Plan, Vec<String>) {
     let has_agg = items.iter().any(|it| matches!(it, RetItem::Agg(_)));
     let out_names: Vec<String> = items.iter().map(RetItem::name).collect();

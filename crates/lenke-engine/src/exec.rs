@@ -8248,6 +8248,49 @@ mod tests {
         assert_eq!(count("MATCH (a)-[r:R]->(b) RETURN count(*) AS c"), 2.0);
     }
 
+    /// `SELECT … GROUP BY … HAVING …` filters grouped rows: on an aggregate
+    /// (`count(*) > 1`), on a group key (`n.age >= 35`), globally (no GROUP BY), and
+    /// `HAVING null` drops every group. An aggregate may appear only in HAVING.
+    #[test]
+    fn select_having() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"Person\"],\"props\":{\"age\":30}}\n",
+            "{\"id\":\"b\",\"labels\":[\"Person\"],\"props\":{\"age\":30}}\n",
+            "{\"id\":\"c\",\"labels\":[\"Person\"],\"props\":{\"age\":40}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let rows = |q: &str| -> Vec<String> {
+            run(&crate::gql::parse(q).unwrap(), &store)
+                .rows
+                .iter()
+                .map(|r| r.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(","))
+                .collect()
+        };
+        // HAVING on an aggregate: only the age-30 group (count 2 > 1).
+        assert_eq!(
+            rows("SELECT n.age AS age, count(*) AS c FROM MATCH (n:Person) GROUP BY n.age HAVING count(*) > 1 ORDER BY age"),
+            vec!["Num(30.0),Num(2.0)"]
+        );
+        // Aggregate only in HAVING, not in the SELECT list.
+        assert_eq!(
+            rows("SELECT n.age AS age FROM MATCH (n:Person) GROUP BY n.age HAVING count(*) > 1"),
+            vec!["Num(30.0)"]
+        );
+        // HAVING on a group key.
+        assert_eq!(
+            rows("SELECT n.age AS age FROM MATCH (n:Person) GROUP BY n.age HAVING n.age >= 35 ORDER BY age"),
+            vec!["Num(40.0)"]
+        );
+        // Global HAVING (no GROUP BY): 3 people — passes >2, fails >100.
+        assert_eq!(
+            rows("SELECT count(*) AS c FROM MATCH (n:Person) HAVING count(*) > 2"),
+            vec!["Num(3.0)"]
+        );
+        assert!(rows("SELECT count(*) AS c FROM MATCH (n:Person) HAVING count(*) > 100").is_empty());
+        // HAVING null drops every group.
+        assert!(rows("SELECT n.age AS age FROM MATCH (n:Person) GROUP BY n.age HAVING null").is_empty());
+    }
+
     /// `ALL SHORTEST` emits one row per distinct shortest path (so a target reached
     /// by two equal-length paths appears twice), while `ANY SHORTEST` emits one row
     /// per reachable target. A `*` quantifier includes the zero-length seed.

@@ -222,13 +222,6 @@ tests_e.jsonl::match_mode_repeatable_elements
 tests_e.jsonl::property_exists_on_edges
 tests_e.jsonl::property_exists_on_null_element
 tests_e.jsonl::record_field_access_subscript
-tests_e.jsonl::select_having_count
-tests_e.jsonl::select_having_global_fail
-tests_e.jsonl::select_having_global_pass
-tests_e.jsonl::select_having_group_key
-tests_e.jsonl::select_having_not_in_select
-tests_e.jsonl::select_having_null_drops
-tests_e.jsonl::select_having_order_limit
 tests_e.jsonl::subpath_where_and_clause_compose_bob
 tests_e.jsonl::subpath_where_and_clause_compose_dave
 tests_e.jsonl::subpath_where_equals_clause_subpath
