@@ -3370,20 +3370,27 @@ impl Parser {
             // categories are handled — temporal and closed-record-schema types
             // deliberately parse-error (left to the general path / baseline).
             if self.eat_kw("TYPED") {
-                let category = self.value_type_category()?;
-                let not_null = if self.peek_kw("NOT") {
-                    // `NOT NULL` modifier — but not if this `NOT` starts another clause.
-                    let save = self.pos;
-                    self.eat_kw("NOT");
-                    if self.eat_kw("NULL") {
-                        true
+                // A CLOSED record type `RECORD { f :: TYPE [NOT NULL], … }` is parsed
+                // into a schema Value and checked by `__is_typed_record`. (A bare/ANY
+                // `RECORD` — no `{…}` — stays the plain `record` category below.)
+                if self.peek_kw("RECORD")
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::LBrace))
+                {
+                    self.eat_kw("RECORD");
+                    let schema = self.parse_record_schema()?;
+                    let not_null = self.parse_typed_not_null();
+                    let call = Expr::Call {
+                        name: "__is_typed_record".into(),
+                        args: vec![left, Expr::Lit(schema), Expr::Lit(Value::Bool(not_null))],
+                    };
+                    return Ok(if negated {
+                        Expr::Not(Box::new(call))
                     } else {
-                        self.pos = save;
-                        false
-                    }
-                } else {
-                    false
-                };
+                        call
+                    });
+                }
+                let category = self.value_type_category()?;
+                let not_null = self.parse_typed_not_null();
                 let call = Expr::Call {
                     name: "__is_typed".into(),
                     args: vec![
@@ -4061,6 +4068,57 @@ impl Parser {
     // count_subquery := COUNT '{' node ( rel [quant] node )* [WHERE pred] '}' — the
     // number of sub-matches per outer row (distinct from the `count(*)` aggregate,
     // which takes `(…)`). Same correlated body as EXISTS.
+    /// Trailing `NOT NULL` modifier on an IS TYPED type — but not if the `NOT` begins
+    /// a separate clause. Returns whether a `NOT NULL` was consumed.
+    fn parse_typed_not_null(&mut self) -> bool {
+        if self.peek_kw("NOT") {
+            let save = self.pos;
+            self.eat_kw("NOT");
+            if self.eat_kw("NULL") {
+                return true;
+            }
+            self.pos = save;
+        }
+        false
+    }
+
+    /// Parse a closed record schema `{ f :: TYPE [NOT NULL], … }` (the opening
+    /// `RECORD` keyword already consumed) into a `Value::Record` mapping each field to
+    /// a descriptor `List[category, not_null, nested_schema_or_null]`, the shape
+    /// `record_matches_schema` checks. A field type may itself be a nested `RECORD
+    /// { … }`. An empty `{}` is a closed record with no fields.
+    fn parse_record_schema(&mut self) -> Result<Value, String> {
+        self.expect(&Tok::LBrace)?;
+        let mut fields: Vec<(std::sync::Arc<str>, Value)> = Vec::new();
+        if !matches!(self.peek(), Some(Tok::RBrace)) {
+            loop {
+                let name = self.ident()?;
+                self.expect(&Tok::Colon)?;
+                self.expect(&Tok::Colon)?;
+                let (category, nested): (&'static str, Value) = if self.peek_kw("RECORD")
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::LBrace))
+                {
+                    self.eat_kw("RECORD");
+                    ("record", self.parse_record_schema()?)
+                } else {
+                    (self.value_type_category()?, Value::Null)
+                };
+                let not_null = self.parse_typed_not_null();
+                let desc = Value::List(vec![
+                    Value::Str(category.into()),
+                    Value::Bool(not_null),
+                    nested,
+                ]);
+                fields.push((name.into(), desc));
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(crate::value::make_record(fields))
+    }
+
     /// Parse the `<value type>` of an `IS TYPED` predicate into the category string
     /// `category_matches` understands. Only the scalar/record/list vocabulary; a
     /// temporal type or a closed `RECORD { … }` schema returns an error (those cases

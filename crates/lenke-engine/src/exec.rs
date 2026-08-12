@@ -7027,6 +7027,99 @@ fn call_scalar_checked(name: &str, args: &[Value]) -> Result<Value, String> {
     Ok(call_scalar(name, args))
 }
 
+/// Does the (non-null) value `v` match the IS TYPED scalar category `category`?
+/// `integer` requires an integral finite number; `float` any number. Replicates
+/// core's `category_matches`/`value_is_typed_ty`.
+fn scalar_is_typed(category: &str, v: &Value) -> bool {
+    match category {
+        "any" => true,
+        "null" => false, // v is non-null here
+        "bool" => matches!(v, Value::Bool(_)),
+        "string" => matches!(v, Value::Str(_)),
+        "integer" => matches!(v, Value::Num(n) if n.is_finite() && n.fract() == 0.0),
+        "float" => matches!(v, Value::Num(_)),
+        "list" => matches!(v, Value::List(_)),
+        "record" => matches!(v, Value::Record(_)),
+        "date" | "local_time" | "local_datetime" | "zoned_time" | "zoned_datetime" | "duration" => {
+            use crate::temporal::TemporalKind as K;
+            if let Value::Temporal(t) = v {
+                let want = match category {
+                    "date" => K::Date,
+                    "local_time" => K::Time,
+                    "local_datetime" => K::DateTime,
+                    "zoned_time" => K::ZonedTime,
+                    "zoned_datetime" => K::ZonedDateTime,
+                    _ => K::Duration,
+                };
+                t.kind() == want
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Does the record value `v` conform to a CLOSED record type `schema` (a `Record`
+/// of field → descriptor `List[category, not_null, nested_schema_or_null]`)? Closed:
+/// every field of `v` must be declared; every declared field must be present-and-
+/// typed or absent-and-nullable; a null field value is allowed only when nullable;
+/// a `record`-category field recurses into its nested schema (or, for an open
+/// `RECORD` with no schema, only checks the value is a record).
+fn record_matches_schema(v: &Value, schema: &[(std::sync::Arc<str>, Value)]) -> bool {
+    let Value::Record(fields) = v else {
+        return false;
+    };
+    // No undeclared field.
+    for (k, _) in fields.iter() {
+        if !schema.iter().any(|(sk, _)| sk == k) {
+            return false;
+        }
+    }
+    for (sk, desc) in schema.iter() {
+        let Value::List(d) = desc else {
+            return false;
+        };
+        let category = match &d[0] {
+            Value::Str(s) => s.as_ref(),
+            _ => return false,
+        };
+        let field_not_null = matches!(d[1], Value::Bool(true));
+        let nested = &d[2];
+        match fields.iter().find(|(fk, _)| fk == sk) {
+            None => {
+                if field_not_null {
+                    return false; // required field absent
+                }
+            }
+            Some((_, fv)) => {
+                if fv.is_null() {
+                    if field_not_null {
+                        return false;
+                    }
+                } else if category == "record" {
+                    match nested {
+                        Value::Record(sub) => {
+                            if !record_matches_schema(fv, sub) {
+                                return false;
+                            }
+                        }
+                        // Open `RECORD` (no `{…}`): only require a record value.
+                        _ => {
+                            if !matches!(fv, Value::Record(_)) {
+                                return false;
+                            }
+                        }
+                    }
+                } else if !scalar_is_typed(category, fv) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 fn call_scalar(name: &str, args: &[Value]) -> Value {
     match name {
         // variadic
@@ -7049,35 +7142,23 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             if v.is_null() {
                 return Value::Bool(!not_null);
             }
-            let ok = match category {
-                "any" => true,
-                "null" => false, // v is non-null here
-                "bool" => matches!(v, Value::Bool(_)),
-                "string" => matches!(v, Value::Str(_)),
-                "integer" => matches!(v, Value::Num(n) if n.is_finite() && n.fract() == 0.0),
-                "float" => matches!(v, Value::Num(_)),
-                "list" => matches!(v, Value::List(_)),
-                "record" => matches!(v, Value::Record(_)),
-                "date" | "local_time" | "local_datetime" | "zoned_time" | "zoned_datetime"
-                | "duration" => {
-                    use crate::temporal::TemporalKind as K;
-                    if let Value::Temporal(t) = v {
-                        let want = match category {
-                            "date" => K::Date,
-                            "local_time" => K::Time,
-                            "local_datetime" => K::DateTime,
-                            "zoned_time" => K::ZonedTime,
-                            "zoned_datetime" => K::ZonedDateTime,
-                            _ => K::Duration,
-                        };
-                        t.kind() == want
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
+            Value::Bool(scalar_is_typed(category, v))
+        }
+        // `x IS [NOT] TYPED RECORD { f :: TYPE [NOT NULL], … }` — a CLOSED record type.
+        // arg[1] encodes the schema as a `Record` mapping each field to a descriptor
+        // `List[category, not_null, nested_schema_or_null]`. A closed record conforms
+        // iff it carries NO undeclared field and every declared field is present-and-
+        // typed or absent-and-nullable (recursively for nested records).
+        "__is_typed_record" => {
+            let v = &args[0];
+            let not_null = matches!(args[2], Value::Bool(true));
+            if v.is_null() {
+                return Value::Bool(!not_null);
+            }
+            let Value::Record(schema) = &args[1] else {
+                return Value::Null;
             };
-            Value::Bool(ok)
+            Value::Bool(record_matches_schema(v, schema))
         }
         // `a || b || …` — left-associative concat (the parser folds a `||` run into
         // one call). Matches core's `concat_step` fold: ANY null operand → NULL; two
@@ -9732,6 +9813,39 @@ mod tests {
                                                              // Anonymous endpoint: only the group vars are used.
         let r = row("MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){2} RETURN size(e) AS ne");
         assert!(matches!(r[0], Value::Num(x) if x == 2.0));
+    }
+
+    /// `IS TYPED RECORD { f :: TYPE [NOT NULL], … }` is a CLOSED record type: no
+    /// extra fields, every declared field present-and-typed or absent-and-nullable,
+    /// recursing into nested records. INTEGER requires an integral number.
+    #[test]
+    fn is_typed_closed_record() {
+        let store =
+            crate::ndjson::from_ndjson("{\"id\":\"1\",\"labels\":[\"X\"],\"props\":{}}").unwrap();
+        let row = |q: &str| -> Vec<bool> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            run(&plan, &store).rows[0]
+                .iter()
+                .map(|v| matches!(v, Value::Bool(true)))
+                .collect()
+        };
+        assert_eq!(
+            row(
+                "RETURN {a: 1, b: 'x'} IS TYPED RECORD {a :: INTEGER, b :: STRING} AS a, \
+                 {a: 1} IS TYPED RECORD {a :: INTEGER, b :: STRING} AS b, \
+                 {a: 1, b: 'x', c: 9} IS TYPED RECORD {a :: INTEGER, b :: STRING} AS c, \
+                 {a: 1.5} IS TYPED RECORD {a :: INTEGER} AS d, \
+                 {a: 1.5} IS TYPED RECORD {a :: FLOAT} AS e"
+            ),
+            vec![true, true, false, false, true]
+        );
+        assert_eq!(
+            row("RETURN {} IS TYPED RECORD {a :: INTEGER NOT NULL} AS a, \
+                 {a: null} IS TYPED RECORD {a :: INTEGER NOT NULL} AS b, \
+                 {geo: {lat: 1, lng: 2}} IS TYPED RECORD {geo :: RECORD {lat :: INTEGER, lng :: INTEGER}} AS c, \
+                 {geo: {lat: 'x'}} IS TYPED RECORD {geo :: RECORD {lat :: INTEGER, lng :: INTEGER}} AS d"),
+            vec![false, false, true, false]
+        );
     }
 
     /// A group-variable EDGE list keeps its element typing across a `WITH … AS`
