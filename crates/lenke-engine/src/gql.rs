@@ -512,6 +512,21 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
 
 // --- parser ------------------------------------------------------------------
 
+/// The parsed shape of a quantified subpath group `((x)-[e1]->(m)…){n,m}`: its
+/// uniform hop direction/edge-type, the quantifier bounds (in REPETITIONS), the hop
+/// count `k`, the inner variable names per position (`node_vars` len `k+1`,
+/// `edge_vars` len `k`), and an optional single-hop per-rep predicate.
+struct SubpathGroup {
+    dir: Dir,
+    etypes: Vec<String>,
+    min: u32,
+    max: u32,
+    k: u32,
+    node_vars: Vec<Option<String>>,
+    edge_vars: Vec<Option<String>>,
+    per_rep_pred: Option<Expr>,
+}
+
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
@@ -1872,8 +1887,8 @@ impl Parser {
             // to the endpoint), so it lowers to `var_length`. The endpoint `(t)` that
             // follows is parsed and bound like any landing node.
             if self.is_subpath_group_start() {
-                let (dir, etypes, min, max, src_var, edge_var, tgt_var, per_rep_pred) =
-                    self.parse_subpath_group()?;
+                let g = self.parse_subpath_group()?;
+                let k = g.k;
                 // The endpoint `(t)` is OPTIONAL — `((x)-[e]->(y)){2}` (anonymous
                 // landing) is valid when only the group variables are used.
                 let (v2, v2_label, v2_props, v2_where, v2_le) =
@@ -1888,48 +1903,50 @@ impl Parser {
                 }
                 *slots += 1;
                 // Each NAMED inner variable becomes a GROUP variable — a list column
-                // appended after the endpoint, in source/edge/target order (the order
-                // `Plan::RepeatGroup` materializes them). A node group var (`x`/`y`)
-                // and an edge group var (`e`) are tracked so `x[i].prop` resolves.
+                // appended after the endpoint. Node variables at unit positions 0..=k
+                // (`NodeAt`), edge variables at 0..k (`EdgeAt`); a node group var and
+                // an edge group var are tracked so `x[i].prop` resolves. Interleave in
+                // position order (node p, edge p, node p+1, …) — the order does not
+                // matter to the executor (each carries its position) but keeps slots tidy.
                 let mut group_binds: Vec<(crate::ir::GroupPos, usize)> = Vec::new();
-                if let Some(n) = src_var {
-                    let s = *slots;
-                    *slots += 1;
-                    scope.insert(n, s);
-                    self.group_node_slots.insert(s);
-                    group_binds.push((crate::ir::GroupPos::Source, s));
+                for p in 0..=k as usize {
+                    if let Some(n) = g.node_vars[p].clone() {
+                        let s = *slots;
+                        *slots += 1;
+                        scope.insert(n, s);
+                        self.group_node_slots.insert(s);
+                        group_binds.push((crate::ir::GroupPos::NodeAt(p as u32), s));
+                    }
+                    if p < k as usize {
+                        if let Some(n) = g.edge_vars[p].clone() {
+                            let s = *slots;
+                            *slots += 1;
+                            scope.insert(n, s);
+                            self.group_edge_slots.insert(s);
+                            group_binds.push((crate::ir::GroupPos::EdgeAt(p as u32), s));
+                        }
+                    }
                 }
-                if let Some(n) = edge_var {
-                    let s = *slots;
-                    *slots += 1;
-                    scope.insert(n, s);
-                    self.group_edge_slots.insert(s);
-                    group_binds.push((crate::ir::GroupPos::Edge, s));
-                }
-                if let Some(n) = tgt_var {
-                    let s = *slots;
-                    *slots += 1;
-                    scope.insert(n, s);
-                    self.group_node_slots.insert(s);
-                    group_binds.push((crate::ir::GroupPos::Target, s));
-                }
-                // No group variables AND no per-rep filter → the endpoint-only
-                // var_length lowering; otherwise a RepeatGroup (group lists and/or a
-                // per-repetition WHERE pruning each hop).
-                plan = if group_binds.is_empty() && per_rep_pred.is_none() {
-                    plan.var_length(from, dir, &etypes, min, max, self.path_mode)
+                // `min`/`max` are in REPETITIONS; a rep spans `k` hops → the var-length
+                // hop bounds are `min*k..=max*k`. No group vars, no per-rep filter, and
+                // a single hop → the endpoint-only var_length lowering; otherwise a
+                // RepeatGroup (group lists, multi-hop, and/or a per-repetition WHERE).
+                let (hop_min, hop_max) = (g.min * k, g.max * k);
+                plan = if group_binds.is_empty() && g.per_rep_pred.is_none() && k == 1 {
+                    plan.var_length(from, g.dir, &g.etypes, hop_min, hop_max, self.path_mode)
                 } else {
                     Plan::RepeatGroup {
                         input: Box::new(plan),
                         from,
-                        dir,
-                        edge_label: etypes,
-                        min,
-                        max,
+                        dir: g.dir,
+                        edge_label: g.etypes,
+                        min: hop_min,
+                        max: hop_max,
                         mode: self.path_mode,
                         endpoint_slot: node_slot,
                         group_binds,
-                        per_rep_pred: per_rep_pred.map(Box::new),
+                        k,
+                        per_rep_pred: g.per_rep_pred.map(Box::new),
                     }
                 };
                 from = node_slot;
@@ -1988,6 +2005,7 @@ impl Parser {
                         mode: self.path_mode,
                         endpoint_slot: node_slot,
                         group_binds: Vec::new(),
+                        k: 1,
                         per_rep_pred: pred.map(Box::new),
                     };
                 } else {
@@ -2086,69 +2104,84 @@ impl Parser {
         false
     }
 
-    /// Parse a SINGLE-edge subpath group `((x)-[e:R]->(y)){n,m}` and return its
-    /// direction, edge types, quantifier bounds, and the inner variable NAMES
-    /// (source `x`, edge `e`, target `y`) — each of which, when named, becomes a
-    /// GROUP variable bound as a list across repetitions (see `Plan::RepeatGroup`).
-    /// Inner-node labels/properties, a per-rep `WHERE`, a bound edge's props, and a
-    /// multi-hop body are all rejected (later increments).
-    #[allow(clippy::type_complexity)]
-    fn parse_subpath_group(
-        &mut self,
-    ) -> Result<
-        (
-            Dir,
-            Vec<String>,
-            u32,
-            u32,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<Expr>,
-        ),
-        String,
-    > {
+    /// Parse a subpath group `((x)-[e1:R]->(m)…-[ek:R]->(y)){n,m}` — one or more hops
+    /// per repetition unit (all hops must share direction and edge type). Returns the
+    /// unit's shape and its inner variable NAMES per position (each, when named,
+    /// becomes a GROUP variable — a list across repetitions; see `Plan::RepeatGroup`).
+    /// Inner-node labels/properties and a bound edge's props stay rejected; a per-rep
+    /// `WHERE` is single-hop only (multi-hop needs both edges bound per rep).
+    fn parse_subpath_group(&mut self) -> Result<SubpathGroup, String> {
         self.expect(&Tok::LParen)?; // the group's own opening paren
         let bad_inner =
             |n: &ParsedNode| n.1.is_some() || n.4.is_some() || !n.2.is_empty() || n.3.is_some();
-        let src = self.node()?;
-        if bad_inner(&src) {
+        let first = self.node()?;
+        if bad_inner(&first) {
             return Err(
                 "a label/property/WHERE on a subpath-group inner node is not supported yet".into(),
             );
         }
-        let source_var = src.0.clone();
-        let rel = self.rel()?;
-        if !rel.props.is_empty() || rel.where_range.is_some() {
-            return Err(
-                "edge properties / a per-hop WHERE on a subpath group are not supported yet".into(),
-            );
+        let mut node_vars: Vec<Option<String>> = vec![first.0.clone()];
+        let mut edge_vars: Vec<Option<String>> = Vec::new();
+        let mut dir: Option<Dir> = None;
+        let mut etypes: Option<Vec<String>> = None;
+        // One or more hops, each `-[e:R]->(n)`; all hops must agree on direction and
+        // edge type (a mixed-type/-direction unit is not supported).
+        loop {
+            let rel = self.rel()?;
+            if !rel.props.is_empty() || rel.where_range.is_some() {
+                return Err(
+                    "edge properties / a per-hop WHERE on a subpath group are not supported yet"
+                        .into(),
+                );
+            }
+            match dir {
+                None => dir = Some(rel.dir),
+                Some(d) if d == rel.dir => {}
+                _ => {
+                    return Err("a subpath group with mixed hop directions is not supported".into())
+                }
+            }
+            match &etypes {
+                None => etypes = Some(rel.etypes.clone()),
+                Some(e) if *e == rel.etypes => {}
+                _ => {
+                    return Err("a subpath group with mixed hop edge types is not supported".into())
+                }
+            }
+            edge_vars.push(rel.var.clone());
+            let n = self.node()?;
+            if bad_inner(&n) {
+                return Err(
+                    "a label/property/WHERE on a subpath-group inner node is not supported yet"
+                        .into(),
+                );
+            }
+            node_vars.push(n.0.clone());
+            if !matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde)) {
+                break;
+            }
         }
-        let edge_var = rel.var.clone();
-        let tgt = self.node()?;
-        if bad_inner(&tgt) {
-            return Err(
-                "a label/property/WHERE on a subpath-group inner node is not supported yet".into(),
-            );
-        }
-        let target_var = tgt.0.clone();
-        if matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde)) {
-            return Err("a multi-hop subpath-group body is not supported yet".into());
-        }
-        // A PER-REPETITION `WHERE` — parsed against a SCALAR mini-scope (this rep's
-        // source=0, edge=1, target=2), NOT the group list bindings, since it is
-        // evaluated at each hop over the rep's single values.
+        let k = edge_vars.len() as u32;
+        // A PER-REPETITION `WHERE` — SINGLE-HOP only for now (multi-hop would need
+        // every edge of the rep bound). Parsed against a scalar mini-scope (this rep's
+        // source=0, edge=1, target=2), independent of the group list bindings.
         let per_rep_pred = if self.eat_kw("WHERE") {
+            if k != 1 {
+                return Err(
+                    "a per-repetition WHERE on a multi-hop subpath group is not supported yet"
+                        .into(),
+                );
+            }
             let saved_scope = std::mem::take(&mut self.scope);
             let saved_slots = self.slots;
             let mut mini: HashMap<String, usize> = HashMap::new();
-            if let Some(n) = &source_var {
+            if let Some(n) = &node_vars[0] {
                 mini.insert(n.clone(), 0);
             }
-            if let Some(n) = &edge_var {
+            if let Some(n) = &edge_vars[0] {
                 mini.insert(n.clone(), 1);
             }
-            if let Some(n) = &target_var {
+            if let Some(n) = &node_vars[1] {
                 mini.insert(n.clone(), 2);
             }
             self.scope = mini;
@@ -2164,16 +2197,16 @@ impl Parser {
         let (min, max) = self
             .opt_quantifier()?
             .ok_or("a subpath group requires a `{n,m}` / `*` / `+` quantifier")?;
-        Ok((
-            rel.dir,
-            rel.etypes,
+        Ok(SubpathGroup {
+            dir: dir.expect("at least one hop"),
+            etypes: etypes.expect("at least one hop"),
             min,
             max,
-            source_var,
-            edge_var,
-            target_var,
+            k,
+            node_vars,
+            edge_vars,
             per_rep_pred,
-        ))
+        })
     }
 
     /// `OPTIONAL MATCH (a)-[:R]->(x)` — a LEFT-OUTER single hop from a bound `a`. If

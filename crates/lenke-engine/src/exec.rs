@@ -946,6 +946,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             *mode,
             &[],
             None,
+            1,
         ),
         Plan::RepeatGroup {
             input,
@@ -957,6 +958,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             mode,
             endpoint_slot: _,
             group_binds,
+            k,
             per_rep_pred,
         } => var_length(
             &pull(input, store, track)?,
@@ -969,6 +971,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             *mode,
             group_binds,
             per_rep_pred.as_deref(),
+            *k,
         ),
         Plan::ShortestPath {
             input,
@@ -4916,6 +4919,9 @@ fn var_length(
     // A per-repetition `WHERE` (RepeatGroup) over the rep's SCALAR variables at fixed
     // mini-scope slots (source=0, edge=1, target=2); a hop failing it is pruned.
     per_rep_pred: Option<&Expr>,
+    // Hops per repetition unit: an endpoint is emitted only at a rep boundary
+    // (`len % k == 0`). 1 for a plain hop or a single-hop group.
+    k: u32,
 ) -> Batch {
     let empty = || {
         let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
@@ -4976,6 +4982,7 @@ fn var_length(
             group_binds,
             &mut group_cols,
             per_rep_pred,
+            k,
         );
         if node_unique {
             used.pop();
@@ -5001,28 +5008,27 @@ fn var_length(
 }
 
 /// Materialize the group-variable lists for ONE emitted repetition-path and push
-/// each into its column. `node_stack` = `[source, n1, …, endpoint]`, `edge_stack` =
-/// the per-rep edges; a k=1 unit has `reps = edge_stack.len()` and the variable at
-/// `Source` is `node_stack[rep]`, `Target` is `node_stack[rep+1]`, `Edge` is
-/// `edge_stack[rep]` — each rendered as a `Value::Num` id inside a `Value::List`.
+/// each into its column. `node_stack` = `[source, …, endpoint]` (len `reps*k + 1`),
+/// `edge_stack` the flat edges (len `reps*k`); `k` is the unit hop count. The
+/// variable at `NodeAt(p)` collects `node_stack[rep*k + p]` across reps, `EdgeAt(p)`
+/// collects `edge_stack[rep*k + p]` — each a `Value::Num` id inside a `Value::List`.
 fn push_group_cols(
     node_stack: &[u32],
     edge_stack: &[u32],
+    k: u32,
     group_binds: &[(crate::ir::GroupPos, usize)],
     group_cols: &mut [Vec<Value>],
 ) {
     use crate::ir::GroupPos;
-    let reps = edge_stack.len();
+    let k = k as usize;
+    let reps = edge_stack.len() / k;
     for (i, (pos, _)) in group_binds.iter().enumerate() {
         let list: Vec<Value> = match pos {
-            GroupPos::Source => (0..reps)
-                .map(|r| Value::Num(f64::from(node_stack[r])))
+            GroupPos::NodeAt(p) => (0..reps)
+                .map(|r| Value::Num(f64::from(node_stack[r * k + *p as usize])))
                 .collect(),
-            GroupPos::Target => (0..reps)
-                .map(|r| Value::Num(f64::from(node_stack[r + 1])))
-                .collect(),
-            GroupPos::Edge => (0..reps)
-                .map(|r| Value::Num(f64::from(edge_stack[r])))
+            GroupPos::EdgeAt(p) => (0..reps)
+                .map(|r| Value::Num(f64::from(edge_stack[r * k + *p as usize])))
                 .collect(),
         };
         group_cols[i].push(Value::List(list));
@@ -5062,8 +5068,10 @@ fn varlen_dfs(
     // A per-repetition predicate over the rep's scalar (source=0, edge=1, target=2);
     // a hop that fails it is not descended into (the path through it is pruned).
     per_rep_pred: Option<&Expr>,
+    // Hops per repetition unit: an endpoint is emitted only at a rep boundary.
+    k: u32,
 ) {
-    if len >= min {
+    if len >= min && len.is_multiple_of(k) {
         keep.push(row);
         ends.push(v);
         if let Some(b) = track_batch {
@@ -5079,7 +5087,7 @@ fn varlen_dfs(
             );
         }
         if !group_binds.is_empty() {
-            push_group_cols(node_stack, edge_stack, group_binds, group_cols);
+            push_group_cols(node_stack, edge_stack, k, group_binds, group_cols);
         }
     }
     if len == max {
@@ -5137,8 +5145,9 @@ fn varlen_dfs(
         let mark = match varlen_step(mode, start, a, used) {
             VarStep::Skip => continue,
             VarStep::Close => {
-                // Emit the closing endpoint (the start) at this length, no descent.
-                if len + 1 >= min {
+                // Emit the closing endpoint (the start) at this length, no descent —
+                // only at a rep boundary for a multi-hop unit.
+                if len + 1 >= min && (len + 1).is_multiple_of(k) {
                     keep.push(row);
                     ends.push(a.nbr);
                     if track_batch.is_some() || !group_binds.is_empty() {
@@ -5157,7 +5166,7 @@ fn varlen_dfs(
                             );
                         }
                         if !group_binds.is_empty() {
-                            push_group_cols(node_stack, edge_stack, group_binds, group_cols);
+                            push_group_cols(node_stack, edge_stack, k, group_binds, group_cols);
                         }
                         node_stack.pop();
                         edge_stack.pop();
@@ -5193,6 +5202,7 @@ fn varlen_dfs(
             group_binds,
             group_cols,
             per_rep_pred,
+            k,
         );
         node_stack.pop();
         edge_stack.pop();
@@ -6675,6 +6685,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             *mode,
             &[],
             None,
+            1,
         ),
         Plan::Filter { input, pred } => {
             let b = pull_body(input, store, seed)?;
@@ -8861,6 +8872,39 @@ mod tests {
             ids("MATCH (b:N {id:'b'})-[:R {amt:20.0}]->{1,3}(x) RETURN x.id AS id"),
             vec!["c"]
         );
+    }
+
+    /// A MULTI-HOP group unit `((x)-[e1]->(m)-[e2]->(y)){2}` binds each inner var to
+    /// a list strided by the unit hop count k; the endpoint lands at a rep boundary.
+    /// Chain a-11->b-22->c-33->d-44->e. 2 reps of 2 hops → t=e.
+    #[test]
+    fn repeat_group_multi_hop_unit() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"id\":\"d\",\"labels\":[\"N\"],\"props\":{\"id\":\"d\"}}\n",
+            "{\"id\":\"e\",\"labels\":[\"N\"],\"props\":{\"id\":\"e\"}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{\"amt\":11.0}}\n",
+            "{\"from\":\"b\",\"to\":\"c\",\"labels\":[\"R\"],\"props\":{\"amt\":22.0}}\n",
+            "{\"from\":\"c\",\"to\":\"d\",\"labels\":[\"R\"],\"props\":{\"amt\":33.0}}\n",
+            "{\"from\":\"d\",\"to\":\"e\",\"labels\":[\"R\"],\"props\":{\"amt\":44.0}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let q = "MATCH (s:N {id:'a'}) ((x)-[e1:R]->(m)-[e2:R]->(y)){2} (t) \
+                 RETURN t.id AS tid, x[0].id AS x0, x[1].id AS x1, m[1].id AS m1, \
+                 y[1].id AS y1, e1[0].amt AS p0, e2[1].amt AS q1";
+        let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+        let out = run(&plan, &store);
+        assert_eq!(out.rows.len(), 1);
+        let r = &out.rows[0];
+        assert!(matches!(&r[0], Value::Str(s) if &**s == "e")); // t = e
+        assert!(matches!(&r[1], Value::Str(s) if &**s == "a")); // x[0] = a
+        assert!(matches!(&r[2], Value::Str(s) if &**s == "c")); // x[1] = c
+        assert!(matches!(&r[3], Value::Str(s) if &**s == "d")); // m[1] = d
+        assert!(matches!(&r[4], Value::Str(s) if &**s == "e")); // y[1] = e
+        assert!(matches!(r[5], Value::Num(x) if x == 11.0)); // e1[0].amt
+        assert!(matches!(r[6], Value::Num(x) if x == 44.0)); // e2[1].amt
     }
 
     /// A per-repetition WHERE prunes each hop by the rep's scalar x/e/y. Path

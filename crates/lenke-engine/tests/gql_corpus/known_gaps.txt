@@ -59,11 +59,7 @@ tests_d.jsonl::bare_path_binds_simple_cycle
 tests_d.jsonl::call_inline_count
 tests_d.jsonl::call_scope_isolation_total
 tests_d.jsonl::decorrelate_scope_isolation
-tests_d.jsonl::gv_bind_each_rep_2hop
 tests_d.jsonl::gv_carry_through_with
-tests_d.jsonl::mea_acyclic
-tests_d.jsonl::mea_simple
-tests_d.jsonl::mea_trail
 tests_d.jsonl::nested_outer_gv_1
 tests_d.jsonl::nested_outer_gv_2
 tests_d.jsonl::nested_paren_lol
@@ -85,9 +81,6 @@ tests_d.jsonl::per_hop_outer_var
 tests_d.jsonl::per_hop_path_binding
 tests_d.jsonl::qsp_multi_cross_1
 tests_d.jsonl::qsp_multi_cross_2
-tests_d.jsonl::qsp_multi_ends_1
-tests_d.jsonl::qsp_multi_ends_2
-tests_d.jsonl::qsp_multi_gv
 tests_d.jsonl::vqs_16
 tests_d.jsonl::vqs_22
 tests_e.jsonl::bang_unary_not_binds_tightly

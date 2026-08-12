@@ -427,8 +427,8 @@ edge_pred, var_length lineage, multi-label edges. When only value-contract + gen
 
 ### ROUND 6 (cont.) — 134 -> 132 (session total 265 -> 132, 133 cases)
 
-- **VALUE { … RETURN count(*) } correlated subquery — DONE** (commit 014d0fd0, 134->132, 2 cases).
-  correlated_subquery_body gained a count_return flag; VALUE consumes the trailing RETURN count(*) and
+- **VALUE { … RETURN count(\*) } correlated subquery — DONE** (commit 014d0fd0, 134->132, 2 cases).
+  correlated_subquery_body gained a count_return flag; VALUE consumes the trailing RETURN count(\*) and
   lowers to CountSubquery (same as COUNT { … }). General VALUE (scalar RETURN / uncorrelated / constant) deferred.
 
 ### NEXT (baseline 132) — remaining tractable-ish, then hard:
@@ -438,7 +438,7 @@ edge_pred, var_length lineage, multi-label edges. When only value-contract + gen
   must materialize with stride k (verts[rep*k+p]) and only emit endpoints at rep boundaries (len % k == 0).
   RepeatGroup is single-hop; this needs a k field + DFS emit-gating. MEDIUM-HARD.
 - **general VALUE scalar subquery / uncorrelated multi-pattern EXISTS** (value_subquery_correlated_scalar,
-  _global, _constant, _where_narrows, exists_multi_match ~4, exists_bound_a) — need a scalar-subquery
+  \_global, \_constant, \_where_narrows, exists_multi_match ~4, exists_bound_a) — need a scalar-subquery
   evaluator returning the body's single value, AND pull_body to run a Scan/cross-join / multi-MATCH body
   (multi-MATCH is broken even at top level: "bound variable y cannot be re-labeled in a continuing MATCH"). HARD.
 - **~25 value-contract "core rejects"** — LEAVE baselined.

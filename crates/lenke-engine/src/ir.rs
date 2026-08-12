@@ -50,15 +50,15 @@ pub enum PathMode {
     Acyclic,
 }
 
-/// The position of a quantified subpath-group variable within its single-hop unit
-/// `((x)-[e]->(y)){…}` — which flat-path slice it collects across repetitions:
-/// `Source` = each rep's start node (`x`), `Target` = each rep's end node (`y`),
-/// `Edge` = each rep's edge (`e`). See `Plan::RepeatGroup`.
+/// The position of a quantified subpath-group variable within its `k`-hop unit
+/// `((x)-[e1]->(m)-[e2]->(y)){…}` — which flat-path slice it collects across
+/// repetitions. `NodeAt(p)` is the node at unit position `p` (0..=k) → `verts[rep*k
+/// + p]`; `EdgeAt(p)` the edge at position `p` (0..k) → `edges[rep*k + p]`. A single
+/// hop is `NodeAt(0)` (source `x`), `EdgeAt(0)` (edge `e`), `NodeAt(1)` (target `y`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupPos {
-    Source,
-    Edge,
-    Target,
+    NodeAt(u32),
+    EdgeAt(u32),
 }
 
 /// Element typing for a subscript whose base is a group-variable LIST: a group node
@@ -463,6 +463,10 @@ pub enum Plan {
         mode: PathMode,
         endpoint_slot: usize,
         group_binds: Vec<(GroupPos, usize)>,
+        /// Hops per repetition unit (`k`): 1 for `((x)-[e]->(y)){…}`, 2 for a
+        /// two-hop body, etc. `min`/`max` above are HOP counts (`reps * k`); an
+        /// endpoint is emitted only at a rep boundary (`hops % k == 0`).
+        k: u32,
         /// A PER-REPETITION `WHERE` (`((x)-[e]->(y) WHERE pred){…}`) — a predicate
         /// over the rep's SCALAR variables at fixed mini-scope slots (source=0,
         /// edge=1, target=2), evaluated at each hop; a hop that fails it is pruned.
