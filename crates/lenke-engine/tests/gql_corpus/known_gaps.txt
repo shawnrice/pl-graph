@@ -164,11 +164,8 @@ tests_f.jsonl::counting_edges_where_14
 tests_f.jsonl::distinct_nan_1
 tests_f.jsonl::distinct_nan_2
 tests_f.jsonl::distinct_nan_3
-tests_f.jsonl::distinct_signed_zero_4
-tests_f.jsonl::distinct_signed_zero_5
 tests_f.jsonl::faulting_aggregate_err
 tests_f.jsonl::fused_pipeline_13
-tests_f.jsonl::group_by_bound_1
 tests_f.jsonl::inline_constraint_14
 tests_f.jsonl::inline_constraint_15
 tests_f.jsonl::inline_constraint_per_row

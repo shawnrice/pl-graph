@@ -762,6 +762,8 @@ impl Parser {
         loop {
             if self.eat_kw("WITH") {
                 plan = self.with_clause(plan)?;
+            } else if self.eat_kw("LET") {
+                plan = self.let_clause(plan)?;
             } else if self.eat_kw("OPTIONAL") {
                 plan = self.optional_match(plan)?;
             } else if self.eat_kw("MATCH") {
@@ -2045,6 +2047,44 @@ impl Parser {
     /// space (`name -> column index`) for the following part. `ORDER BY/SKIP/LIMIT`
     /// ride the projection; a trailing `WHERE` is a post-projection (HAVING)
     /// filter, matching lenke-core's `WITH … WHERE`.
+    /// `LET name = expr [, name = expr]*` — the ISO additive-binding clause: ADD the
+    /// new bindings to the working table, carrying every existing binding forward
+    /// (unlike WITH, which projects only its listed items). Distinct from the `LET …
+    /// IN … END` *expression* (parsed in `expr`), which this never reaches: here the
+    /// binding value runs to the next clause, with no `IN`/`END`.
+    fn let_clause(&mut self, plan: Plan) -> Result<Plan, String> {
+        let mut new_binds: Vec<(String, Expr)> = Vec::new();
+        loop {
+            let name = self.ident()?;
+            self.expect(&Tok::Eq)?;
+            let e = self.expr()?;
+            new_binds.push((name, e));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        // Pass every existing binding through, in slot order (a HashMap iteration is
+        // unordered — the slot index is the stable key), then append the new ones.
+        let mut existing: Vec<(usize, String)> =
+            self.scope.iter().map(|(n, &s)| (s, n.clone())).collect();
+        existing.sort();
+        let mut items: Vec<RetItem> = existing
+            .iter()
+            .map(|(s, n)| RetItem::Key(n.clone(), Expr::Slot(*s)))
+            .collect();
+        for (n, e) in new_binds {
+            items.push(RetItem::Key(n, e));
+        }
+        let (plan, out_names) = apply_items(plan, &items);
+        let mut scope = HashMap::new();
+        for (i, name) in out_names.iter().enumerate() {
+            scope.insert(name.clone(), i);
+        }
+        self.scope = scope;
+        self.slots = out_names.len();
+        Ok(plan)
+    }
+
     fn with_clause(&mut self, plan: Plan) -> Result<Plan, String> {
         let distinct = self.eat_kw("DISTINCT");
         let items = self.return_items()?;

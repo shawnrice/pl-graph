@@ -8430,6 +8430,38 @@ mod tests {
         );
     }
 
+    /// The `LET name = expr` clause adds a binding, carrying existing bindings
+    /// forward, so a later RETURN/GROUP BY can reference it. t = 5,5,9.
+    #[test]
+    fn let_clause_binds_and_carries_forward() {
+        let mut b = Builder::default();
+        b.node(&["P"], &[("t", n(5.0))]);
+        b.node(&["P"], &[("t", n(5.0))]);
+        b.node(&["P"], &[("t", n(9.0))]);
+        let store = b.build();
+        let rows = |q: &str| -> Vec<(f64, f64)> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            run(&plan, &store)
+                .rows
+                .iter()
+                .map(|r| match (&r[0], &r[1]) {
+                    (Value::Num(a), Value::Num(c)) => (*a, *c),
+                    o => panic!("{o:?}"),
+                })
+                .collect()
+        };
+        // LET-bound key used in RETURN + GROUP BY + ORDER BY.
+        assert_eq!(
+            rows("MATCH (n:P) LET t = n.t RETURN t, count(*) AS c GROUP BY t ORDER BY t"),
+            vec![(5.0, 2.0), (9.0, 1.0)]
+        );
+        // The original binding `n` survives the LET (still usable downstream).
+        assert_eq!(
+            rows("MATCH (n:P) LET t = n.t RETURN n.t AS a, count(*) AS c ORDER BY a"),
+            vec![(5.0, 2.0), (9.0, 1.0)]
+        );
+    }
+
     /// ORDER BY resolves an output alias even before `NULLS FIRST|LAST`, and ORDER
     /// BY the underlying expression of a projected alias sorts by that output column
     /// (so it composes with DISTINCT). k = 3, (null), 7 over three P nodes.
