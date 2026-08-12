@@ -85,7 +85,6 @@ tests_d.jsonl::nested_quant_ends_1
 tests_d.jsonl::nested_quant_ends_2
 tests_d.jsonl::nested_quant_ends_3
 tests_d.jsonl::nested_quant_gv_vectorize
-tests_d.jsonl::paren_grouping_no_quant
 tests_d.jsonl::per_hop_admits_all
 tests_d.jsonl::per_hop_filters
 tests_d.jsonl::per_hop_inline_from_a
@@ -144,14 +143,6 @@ tests_e.jsonl::match_mode_different_edges
 tests_e.jsonl::match_mode_repeatable_elements
 tests_e.jsonl::property_exists_on_edges
 tests_e.jsonl::property_exists_on_null_element
-tests_e.jsonl::subpath_where_and_clause_compose_bob
-tests_e.jsonl::subpath_where_and_clause_compose_dave
-tests_e.jsonl::subpath_where_equals_clause_subpath
-tests_e.jsonl::subpath_where_filters_1
-tests_e.jsonl::subpath_where_filters_2
-tests_e.jsonl::subpath_where_only_end
-tests_e.jsonl::subpath_where_only_start
-tests_e.jsonl::subpath_where_single_node
 tests_e.jsonl::value_subquery_aggregate_carol_zero
 tests_e.jsonl::value_subquery_aggregate_dave_deg
 tests_e.jsonl::value_subquery_aggregate_global

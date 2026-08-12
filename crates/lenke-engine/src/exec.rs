@@ -8430,6 +8430,41 @@ mod tests {
         );
     }
 
+    /// An UNQUANTIFIED subpath group `(( pattern [WHERE p] ))` is a scoping paren:
+    /// the inner pattern + trailing WHERE filter, no repetition. A NAMED path over
+    /// one is rejected (core does). Fixture: Amy(25)->Bob(40), Bob(40)->Amy(25).
+    #[test]
+    fn unquantified_subpath_group() {
+        let nd = concat!(
+            "{\"id\":\"amy\",\"labels\":[\"Person\"],\"props\":{\"name\":\"Amy\",\"age\":25}}\n",
+            "{\"id\":\"bob\",\"labels\":[\"Person\"],\"props\":{\"name\":\"Bob\",\"age\":40}}\n",
+            "{\"from\":\"amy\",\"to\":\"bob\",\"labels\":[\"KNOWS\"],\"props\":{}}\n",
+            "{\"from\":\"bob\",\"to\":\"amy\",\"labels\":[\"KNOWS\"],\"props\":{}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let names = |q: &str| -> Vec<String> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            let mut v = names_of(&run(&plan, &store), 0);
+            v.sort();
+            v
+        };
+        // Only Amy(25)->Bob(40) satisfies x.age < y.age.
+        assert_eq!(
+            names("MATCH ((x:Person)-[:KNOWS]->(y:Person) WHERE x.age < y.age) RETURN x.name AS n"),
+            vec!["Amy"]
+        );
+        // Single-node group with WHERE.
+        assert_eq!(
+            names("MATCH ((x:Person) WHERE x.age >= 35) RETURN x.name AS n"),
+            vec!["Bob"]
+        );
+        // A named path over an unquantified group is rejected (matches core).
+        assert!(
+            crate::gql::parse("MATCH p = ((x)-[:KNOWS]->(y) WHERE x.age < y.age) RETURN p")
+                .is_err()
+        );
+    }
+
     /// The `LET name = expr` clause adds a binding, carrying existing bindings
     /// forward, so a later RETURN/GROUP BY can reference it. t = 5,5,9.
     #[test]

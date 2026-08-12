@@ -1734,13 +1734,30 @@ impl Parser {
     fn pattern(&mut self) -> Result<(Plan, HashMap<String, usize>, usize), String> {
         let mut scope: HashMap<String, usize> = HashMap::new();
         let mut slots = 0usize;
-        // Unanchored subpath group `((x)-[:R]->(y)){n,m} (t)` — synthesize an
-        // anonymous seed node (scan every node), matching core, then chain from it.
         if self.is_subpath_group_start() {
-            let from = slots;
-            slots += 1;
-            let plan =
-                self.extend_chain(Plan::Scan { label: None }, &mut scope, &mut slots, from)?;
+            if self.subpath_group_is_quantified() {
+                // Unanchored QUANTIFIED subpath group `((x)-[:R]->(y)){n,m} (t)` —
+                // synthesize an anonymous seed node (scan every node), matching core,
+                // then chain from it (the group lowers to a var_length hop).
+                let from = slots;
+                slots += 1;
+                let plan =
+                    self.extend_chain(Plan::Scan { label: None }, &mut scope, &mut slots, from)?;
+                return Ok((plan, scope, slots));
+            }
+            // A NAMED path may not bind an unquantified subpath group (ISO: a group
+            // is a path factor only when quantified) — core rejects it, so match that
+            // rather than binding a lineage the reference engine would not.
+            if !self.path_vars.is_empty() {
+                return Err(
+                    "a named path over an unquantified subpath group is not supported".into(),
+                );
+            }
+            // An UNQUANTIFIED group `(( <pattern> [WHERE p] ))` is just a scoping
+            // paren: unwrap the outer `(`, parse the inner pattern inline, apply the
+            // group's trailing WHERE over the inner scope, then close the group.
+            self.expect(&Tok::LParen)?;
+            let plan = self.grouped_subpattern(&mut scope, &mut slots)?;
             return Ok((plan, scope, slots));
         }
         let (var, label, props, where_range, label_expr) = self.node()?;
@@ -1763,6 +1780,40 @@ impl Parser {
         }
         let plan = self.extend_chain(seed, &mut scope, &mut slots, from)?;
         Ok((plan, scope, slots))
+    }
+
+    /// Parse the body of an UNQUANTIFIED subpath group — the outer `(` already
+    /// consumed: an inner leading node (labels/props/inline-WHERE all allowed), its
+    /// hop tail, and the group's trailing `WHERE` (a predicate over the whole inner
+    /// scope), then the closing `)`. The group is a scoping paren, so its bindings
+    /// join the enclosing pattern's `scope`/`slots` directly.
+    fn grouped_subpattern(
+        &mut self,
+        scope: &mut HashMap<String, usize>,
+        slots: &mut usize,
+    ) -> Result<Plan, String> {
+        let (var, label, props, where_range, label_expr) = self.node()?;
+        if let Some(v) = var {
+            scope.insert(v, *slots);
+        }
+        let from = *slots;
+        *slots += 1;
+        let mut seed = node_prop_filters(Plan::Scan { label }, from, props);
+        if let Some(le) = label_expr {
+            seed = seed.filter(lower_label_expr(&le, from));
+        }
+        if let Some(r) = where_range {
+            self.scope = scope.clone();
+            seed = seed.filter(self.parse_captured_where(r)?);
+        }
+        let mut plan = self.extend_chain(seed, scope, slots, from)?;
+        if self.eat_kw("WHERE") {
+            self.scope = scope.clone();
+            self.slots = *slots;
+            plan = plan.filter(self.expr()?);
+        }
+        self.expect(&Tok::RParen)?;
+        Ok(plan)
     }
 
     /// Parse the `( rel [quantifier] node )*` tail of a pattern, extending `plan`
@@ -1891,6 +1942,32 @@ impl Parser {
     fn is_subpath_group_start(&self) -> bool {
         matches!(self.peek(), Some(Tok::LParen))
             && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
+    }
+
+    /// At a subpath-group start (`self.pos` on the group's outer `(`), does a
+    /// quantifier (`{n,m}` / `*` / `+`) follow the group's matching `)`? A quantified
+    /// group is a repeated hop (lowers to var_length); an unquantified one is just a
+    /// scoping paren around a sub-pattern. Scans balanced parens to the group close.
+    fn subpath_group_is_quantified(&self) -> bool {
+        let mut depth = 0usize;
+        let mut i = self.pos;
+        while let Some(t) = self.toks.get(i) {
+            match t {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(
+                            self.toks.get(i + 1),
+                            Some(Tok::LBrace | Tok::Star | Tok::Plus)
+                        );
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        false
     }
 
     /// Parse a SINGLE-edge subpath group `((x)-[e:R]->(y)){n,m}` and return its
