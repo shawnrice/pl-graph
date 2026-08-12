@@ -589,7 +589,8 @@ impl Parser {
             }
             plan = plan.distinct();
         }
-        let skip = if self.eat_kw("SKIP") {
+        // `OFFSET` is the ISO spelling of `SKIP` — a synonym here (core accepts both).
+        let skip = if self.eat_kw("SKIP") || self.eat_kw("OFFSET") {
             Some(self.usize_lit()?)
         } else {
             None
@@ -709,7 +710,7 @@ impl Parser {
         let terminator = |t: Option<&Tok>| {
             matches!(t, None | Some(Tok::Comma))
                 || matches!(t, Some(Tok::Ident(s))
-                    if ["DESC", "ASC", "SKIP", "LIMIT"].iter().any(|k| s.eq_ignore_ascii_case(k)))
+                    if ["DESC", "ASC", "SKIP", "OFFSET", "LIMIT"].iter().any(|k| s.eq_ignore_ascii_case(k)))
         };
         let mut keys = Vec::new();
         loop {
@@ -1329,7 +1330,8 @@ impl Parser {
         } else {
             Vec::new()
         };
-        let skip = if self.eat_kw("SKIP") {
+        // `OFFSET` is the ISO spelling of `SKIP` — a synonym here (core accepts both).
+        let skip = if self.eat_kw("SKIP") || self.eat_kw("OFFSET") {
             Some(self.usize_lit()?)
         } else {
             None
