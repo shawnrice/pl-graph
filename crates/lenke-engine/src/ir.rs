@@ -241,6 +241,11 @@ pub enum Expr {
     UncorrelatedExists {
         body: Box<Plan>,
     },
+    /// `COUNT { … }` whose body references NO outer variable — an UNCORRELATED count.
+    /// The body is run once and its ROW COUNT broadcast to every outer row.
+    UncorrelatedCount {
+        body: Box<Plan>,
+    },
     /// `VALUE { … RETURN <scalar> }` whose body references NO outer variable — an
     /// UNCORRELATED scalar subquery (`VALUE { RETURN 1+2 }`, `VALUE { MATCH (n)
     /// RETURN count(*) }`). `body` is the WHOLE self-contained query (including the

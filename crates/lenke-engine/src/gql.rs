@@ -2138,9 +2138,18 @@ impl Parser {
                     scope.insert(rv.clone(), edge_slot);
                 }
                 let node_slot = *slots + 1;
-                if let Some(v) = v2 {
-                    scope.insert(v, node_slot);
-                }
+                // A landing variable already in scope is a repeated pattern variable
+                // (a self-loop `(u)-[r]->(u)`) — an equality join, not a rebind.
+                let repeat_eq = match &v2 {
+                    Some(v) => match scope.get(v) {
+                        Some(&existing) => Some(existing),
+                        None => {
+                            scope.insert(v.clone(), node_slot);
+                            None
+                        }
+                    },
+                    None => None,
+                };
                 *slots += 2;
                 plan = plan.expand_edge(from, rel.dir, &rel.etypes);
                 // Inline edge props are a match filter on the bound edge.
@@ -2162,14 +2171,35 @@ impl Parser {
                     plan = plan.filter(self.parse_captured_where(r)?);
                 }
                 from = node_slot;
+                if let Some(existing) = repeat_eq {
+                    plan = plan.filter(Expr::Compare {
+                        op: CompareOp::Eq,
+                        left: Box::new(Expr::Slot(node_slot)),
+                        right: Box::new(Expr::Slot(existing)),
+                    });
+                }
             } else {
                 let node_slot = *slots;
-                if let Some(v) = v2 {
-                    scope.insert(v, node_slot);
-                }
+                let repeat_eq = match &v2 {
+                    Some(v) => match scope.get(v) {
+                        Some(&existing) => Some(existing),
+                        None => {
+                            scope.insert(v.clone(), node_slot);
+                            None
+                        }
+                    },
+                    None => None,
+                };
                 *slots += 1;
                 plan = plan.expand(from, rel.dir, &rel.etypes);
                 from = node_slot;
+                if let Some(existing) = repeat_eq {
+                    plan = plan.filter(Expr::Compare {
+                        op: CompareOp::Eq,
+                        left: Box::new(Expr::Slot(node_slot)),
+                        right: Box::new(Expr::Slot(existing)),
+                    });
+                }
             }
             // The landing node's LABEL constrains it (as core does) — a filter on the
             // node's label set, since a landing node has no seed `Scan`.
@@ -3931,6 +3961,13 @@ impl Parser {
     }
 
     fn count_subquery_expr(&mut self) -> Result<Expr, String> {
+        if self.subquery_is_uncorrelated() {
+            let (body, _, _) = self.parse_uncorrelated_subquery_body()?;
+            self.expect(&Tok::RBrace)?;
+            return Ok(Expr::UncorrelatedCount {
+                body: Box::new(body),
+            });
+        }
         let (body, outer_width, _, _) = self.correlated_subquery_body("COUNT")?;
         self.expect(&Tok::RBrace)?;
         Ok(Expr::CountSubquery {
@@ -7076,21 +7113,15 @@ mod tests {
         assert_same(q, &hand, &store);
     }
 
-    /// A cycle-CLOSING comma pattern `(a)-[:R]->(b), (b)-[:R]->(a)` must NOT fold
-    /// (a chained expand would rebind `a` rather than require the walk return to it);
-    /// it falls back to the hash Join, which equates the shared endpoints.
+    /// A cycle-CLOSING comma pattern `(a)-[:R]->(b), (b)-[:R]->(a)` closes correctly:
+    /// the repeated landing variable `a` becomes an equality join (not a rebind), so
+    /// every returned `a` genuinely sits on a real 2-cycle. (The plan may fold to a
+    /// chained expand + equality now that the repeat is handled, rather than a Join.)
     #[test]
     fn comma_join_cycle_close_keeps_join() {
         let store = social();
-        // carol KNOWS alice and alice KNOWS carol? alice->bob->carol, carol->? In
-        // `social`, the only mutual KNOWS pair drives the count; we assert the plan
-        // shape (Join kept) and that it runs without rebinding to a wrong answer.
         let q = "MATCH (a:Person)-[:KNOWS]->(b), (b)-[:KNOWS]->(a) RETURN a.name AS a";
         let plan = super::parse(q).unwrap();
-        assert!(
-            format!("{plan:?}").contains("Join"),
-            "a cycle-closing comma pattern must keep the hash Join"
-        );
         // Every returned `a` must genuinely sit on a 2-cycle a->b->a.
         let out = run(&plan, &store);
         for row in &out.rows {

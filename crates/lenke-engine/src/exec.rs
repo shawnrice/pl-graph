@@ -732,6 +732,7 @@ fn needs_lineage(plan: &Plan) -> bool {
             | Expr::CountSubquery { .. }
             | Expr::ScalarSubquery { .. }
             | Expr::UncorrelatedExists { .. }
+            | Expr::UncorrelatedCount { .. }
             | Expr::UncorrelatedScalar { .. } => false,
         }
     }
@@ -4705,6 +4706,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         | Expr::CountSubquery { .. }
         | Expr::ScalarSubquery { .. }
         | Expr::UncorrelatedExists { .. }
+        | Expr::UncorrelatedCount { .. }
         | Expr::UncorrelatedScalar { .. } => false,
     }
 }
@@ -4804,6 +4806,7 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         | Expr::CountSubquery { .. }
         | Expr::ScalarSubquery { .. }
         | Expr::UncorrelatedExists { .. }
+        | Expr::UncorrelatedCount { .. }
         | Expr::UncorrelatedScalar { .. } => expr.clone(),
     }
 }
@@ -6748,6 +6751,11 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             // scan/join/filter plan) and broadcast whether it produced any row.
             let exists = pull(body, store, false)?.rows() > 0;
             Col::Bool(vec![exists; batch.rows()])
+        }
+        Expr::UncorrelatedCount { body } => {
+            // Run the self-contained body once; broadcast its row count.
+            let n = pull(body, store, false)?.rows() as f64;
+            Col::Num(vec![n; batch.rows()])
         }
         Expr::UncorrelatedScalar { body } => {
             // Run the self-contained body (its own RETURN) once; the VALUE is its
