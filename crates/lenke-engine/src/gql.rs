@@ -2343,6 +2343,25 @@ impl Parser {
                     call
                 });
             }
+            // `x IS [NOT] LABELED <label>` — a definite label-set membership test,
+            // the keyword form of the `x:Label` predicate. Desugars to
+            // `'<label>' IN labels(x)` (the label set is never null, so `IS NOT
+            // LABELED` is a plain negation).
+            if self.eat_kw("LABELED") {
+                let label = self.ident()?;
+                let pred = Expr::In {
+                    needle: Box::new(Expr::Lit(Value::Str(label.into()))),
+                    haystack: Box::new(Expr::Call {
+                        name: "labels".into(),
+                        args: vec![left],
+                    }),
+                };
+                return Ok(if negated {
+                    Expr::Not(Box::new(pred))
+                } else {
+                    pred
+                });
+            }
             let want = if self.eat_kw("TRUE") {
                 true
             } else if self.eat_kw("FALSE") {
@@ -6163,6 +6182,29 @@ mod tests {
         assert_eq!(val(r"RETURN '\U01F600' AS r"), "\u{1F600}");
         // A malformed \u escape is rejected (agreeing with core).
         assert!(super::parse(r"RETURN '\uH' AS x").is_err());
+    }
+
+    /// `x IS [NOT] LABELED L` tests the element's label set (the keyword form of
+    /// the `x:L` predicate).
+    #[test]
+    fn is_labeled_predicate() {
+        let store = social();
+        let n = |q: &str| -> f64 {
+            match run(&super::parse(q).unwrap(), &store).rows[0][0] {
+                Value::Num(x) => x,
+                ref o => panic!("want num, got {o:?}"),
+            }
+        };
+        let total = n("MATCH (x) RETURN count(*) AS c");
+        let persons = n("MATCH (x) WHERE x IS LABELED Person RETURN count(*) AS c");
+        assert!(persons > 0.0 && persons <= total);
+        // IS NOT LABELED is the complement.
+        assert_eq!(
+            n("MATCH (x) WHERE x IS NOT LABELED Person RETURN count(*) AS c"),
+            total - persons
+        );
+        // Agrees with the `x:Label` predicate form.
+        assert_eq!(persons, n("MATCH (x) WHERE x:Person RETURN count(*) AS c"));
     }
 
     // --- part 3.8: string functions (E4a) ---
