@@ -1969,9 +1969,20 @@ impl Parser {
             let bind = rel.var.is_some() || !rel.props.is_empty() || rel.where_range.is_some();
             if let Some((min, max)) = quant {
                 let node_slot = *slots;
-                if let Some(v) = v2 {
-                    scope.insert(v, node_slot);
-                }
+                // A landing variable ALREADY in scope is a repeated pattern variable
+                // (`(a)…(a)`, or a `WHERE EXISTS { (a)-[…]->+(b) }` correlated on both
+                // ends) — the two positions must be the SAME node, an equality join
+                // added after the hop rather than a rebind.
+                let repeat_eq = match &v2 {
+                    Some(v) => match scope.get(v) {
+                        Some(&existing) => Some(existing),
+                        None => {
+                            scope.insert(v.clone(), node_slot);
+                            None
+                        }
+                    },
+                    None => None,
+                };
                 *slots += 1;
                 if bind {
                     // Inline edge PROPERTIES on a var-length hop (`-[:R {k:v}]->{n,m}`)
@@ -2013,6 +2024,13 @@ impl Parser {
                     plan = plan.var_length(from, rel.dir, &rel.etypes, min, max, self.path_mode);
                 }
                 from = node_slot;
+                if let Some(existing) = repeat_eq {
+                    plan = plan.filter(Expr::Compare {
+                        op: CompareOp::Eq,
+                        left: Box::new(Expr::Slot(node_slot)),
+                        right: Box::new(Expr::Slot(existing)),
+                    });
+                }
             } else if bind {
                 let edge_slot = *slots;
                 if let Some(rv) = &rel.var {

@@ -18,15 +18,7 @@ tests_b.jsonl::call_config_wrong_type_error
 tests_b.jsonl::cast_bool
 tests_b.jsonl::cast_int_null
 tests_b.jsonl::cast_list
-tests_b.jsonl::exists_bound_a_a_plus
-tests_b.jsonl::exists_bound_a_e_plus
 tests_b.jsonl::malformed_num_1e999_error
-tests_b.jsonl::multiseg_u1_d2_bounded
-tests_b.jsonl::multiseg_u1_d2_star
-tests_b.jsonl::multiseg_u1_d3_bounded
-tests_b.jsonl::multiseg_u1_d3_star
-tests_b.jsonl::multiseg_u2_f1_bounded
-tests_b.jsonl::multiseg_u2_f1_star
 tests_b.jsonl::oversized_int_error
 tests_b.jsonl::sum_date_errors
 tests_c.jsonl::any_shortest_bounded_one_names
@@ -55,7 +47,6 @@ tests_d.jsonl::bare_all_fixed_pattern
 tests_d.jsonl::bare_all_matches_default
 tests_d.jsonl::bare_any_dedups_bounded
 tests_d.jsonl::bare_any_one_per_endpoint
-tests_d.jsonl::bare_path_binds_simple_cycle
 tests_d.jsonl::call_inline_count
 tests_d.jsonl::call_scope_isolation_total
 tests_d.jsonl::decorrelate_scope_isolation

@@ -8969,6 +8969,40 @@ mod tests {
         );
     }
 
+    /// A repeated pattern variable on a var-length landing is an equality join: an
+    /// EXISTS correlated on BOTH anchors `EXISTS { (a)-[:R]->+(b) }`, and a cycle
+    /// `(a)-[:R]->{1,3}(a)`. Chain a->b->c (no cycle back to a).
+    #[test]
+    fn repeated_variable_landing_equality() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{}}\n",
+            "{\"from\":\"b\",\"to\":\"c\",\"labels\":[\"R\"],\"props\":{}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let rows = |q: &str| -> usize {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            run(&plan, &store).rows.len()
+        };
+        // a reaches c → EXISTS true → 1 row.
+        assert_eq!(
+            rows("MATCH (a:N {id:'a'}), (b:N {id:'c'}) WHERE EXISTS { MATCH (a)-[:R]->+(b) } RETURN 1 AS x"),
+            1
+        );
+        // a does NOT reach a (no cycle) → EXISTS false → 0 rows.
+        assert_eq!(
+            rows("MATCH (a:N {id:'a'}), (b:N {id:'a'}) WHERE EXISTS { MATCH (a)-[:R]->+(b) } RETURN 1 AS x"),
+            0
+        );
+        // A named cycle `(a)…(a)`: a can't return to a → no path.
+        assert_eq!(
+            rows("MATCH p = SIMPLE (a:N {id:'a'})-[:R]->{1,3}(a) RETURN path_length(p) AS len"),
+            0
+        );
+    }
+
     /// An uncorrelated VALUE subquery runs a self-contained body once: a constant
     /// (`VALUE { RETURN 1+2 }`) or a global aggregate (`VALUE { MATCH (n) RETURN
     /// count(*) }`).
