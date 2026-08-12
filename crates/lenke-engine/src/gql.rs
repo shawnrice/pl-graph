@@ -1380,6 +1380,15 @@ impl Parser {
     /// An optional `{n}` / `{n,m}` / `{n,}` quantifier after a relationship. An
     /// open upper bound is capped at `MAX_VARLEN` hops for this subset.
     fn opt_quantifier(&mut self) -> Result<Option<(u32, u32)>, String> {
+        // Abbreviations: `+` == `{1,}` (one or more), `*` == `{0,}` (zero or more) —
+        // the ISO shorthands for an unbounded quantifier. In this position (after a
+        // relationship, before a node) `+`/`*` are unambiguously quantifiers.
+        if self.eat(&Tok::Plus) {
+            return Ok(Some((1, MAX_VARLEN)));
+        }
+        if self.eat(&Tok::Star) {
+            return Ok(Some((0, MAX_VARLEN)));
+        }
         if !self.eat(&Tok::LBrace) {
             return Ok(None);
         }

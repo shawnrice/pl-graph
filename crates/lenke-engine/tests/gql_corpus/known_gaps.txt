@@ -3,10 +3,8 @@
 # mismatches. As gaps are fixed, their keys are reported as now-passing and
 # should be removed. Regenerate with CORPUS_BASELINE=1.
 hardening.jsonl::h_bool_times_number_raises_data_exception
-hardening.jsonl::h_plain_quantified_segment_label_only_works
 hardening.jsonl::h_rejects_literal_oversized_integer_literal
 hardening.jsonl::h_string_plus_number_raises_data_exception
-hardening.jsonl::h_trail_cycle_terminates_one_row_per_trail
 hardening.jsonl::h_undirected_self_loop_counted_once
 hardening.jsonl::h_valid_numeric_literals_accepted_6
 hardening.jsonl::h_valid_numeric_literals_accepted_8
@@ -17,7 +15,6 @@ language.jsonl::m_colon_label_predicate_desugars_to_is_labeled_2
 language.jsonl::m_edge_label_disjunction
 language.jsonl::m_edge_label_negation
 language.jsonl::m_except
-language.jsonl::m_financial_var_length_money_flow
 language.jsonl::m_hex_scientific_underscored_numbers_4
 language.jsonl::m_hex_scientific_underscored_numbers_5
 language.jsonl::m_hex_scientific_underscored_numbers_6
@@ -50,8 +47,6 @@ language.jsonl::m_simple_case_over_integers_3
 language.jsonl::m_simple_case_over_integers_4
 language.jsonl::m_undirected_edge_matches_either_traversal_direction
 language.jsonl::m_undirected_var_length
-language.jsonl::m_var_length_plus_one_or_more_hops
-language.jsonl::m_var_length_star_includes_zero_hops
 language.jsonl::m_xor
 tck.jsonl::tck_boolean3_xor_three_valued
 tck.jsonl::tck_literals6_control_character_escapes_decode_1
@@ -85,11 +80,6 @@ tests_a.jsonl::exists_count_semi_join_2
 tests_a.jsonl::exists_count_semi_join_3
 tests_a.jsonl::exists_count_semi_join_4
 tests_a.jsonl::exists_count_semi_join_5
-tests_a.jsonl::exists_reachability_1
-tests_a.jsonl::exists_reachability_3
-tests_a.jsonl::exists_reachability_5
-tests_a.jsonl::exists_reachability_7
-tests_a.jsonl::exists_reachability_9
 tests_a.jsonl::group_by_aggregate
 tests_a.jsonl::inline_where_label
 tests_a.jsonl::insert_multi_label_node
@@ -109,16 +99,9 @@ tests_a.jsonl::percentile_odd_2
 tests_a.jsonl::percentile_odd_3
 tests_a.jsonl::percentile_odd_4
 tests_a.jsonl::percentile_odd_5
-tests_a.jsonl::reachable_distinct_1
-tests_a.jsonl::reachable_distinct_2
 tests_a.jsonl::reachable_distinct_3
-tests_a.jsonl::reachable_distinct_4
-tests_a.jsonl::reachable_distinct_5
 tests_a.jsonl::three_valued_boolean_logic
 tests_a.jsonl::undirected_edge
-tests_a.jsonl::undirected_var_length
-tests_a.jsonl::var_length_plus
-tests_a.jsonl::var_length_star_includes_self
 tests_a.jsonl::xor_precedence
 tests_b.jsonl::atan2_0_1
 tests_b.jsonl::atan2_1_0
@@ -211,7 +194,6 @@ tests_c.jsonl::sum_mix_num_duration_faults
 tests_c.jsonl::sum_mix_str_duration_faults
 tests_c.jsonl::temporal_duration_unordered_count_zero
 tests_c.jsonl::temporal_timestamp_ge
-tests_c.jsonl::trail_cycle_terminates_count
 tests_c.jsonl::trail_mode_forbids_reuse
 tests_c.jsonl::walk_mode_admits_repeats
 tests_c.jsonl::walk_mode_count
@@ -289,7 +271,6 @@ tests_d.jsonl::shortest_1_keeps_one
 tests_d.jsonl::shortest_2_group_all
 tests_d.jsonl::shortest_2_groups_synonym
 tests_d.jsonl::shortest_2_keeps_two
-tests_d.jsonl::shortest_groups_count
 tests_d.jsonl::shortest_k_clamps
 tests_d.jsonl::shortest_k_per_hop_pred
 tests_d.jsonl::simple_close_emits
