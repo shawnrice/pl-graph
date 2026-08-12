@@ -1062,16 +1062,33 @@ impl Parser {
                 self.eat_kw("ASC");
                 false
             };
+            let nulls_first = self.parse_nulls_order()?;
             keys.push(crate::ir::SortKey {
                 expr: Expr::Slot(slot),
                 descending,
-                nulls_first: false,
+                nulls_first,
             });
             if !self.eat(&Tok::Comma) {
                 break;
             }
         }
         Ok(keys)
+    }
+
+    /// Parse an optional `NULLS FIRST|LAST` after a sort key's ASC/DESC. The default
+    /// (no clause) is `false` (nulls sort LAST, both directions — matching core).
+    fn parse_nulls_order(&mut self) -> Result<bool, String> {
+        if self.eat_kw("NULLS") {
+            if self.eat_kw("FIRST") {
+                Ok(true)
+            } else if self.eat_kw("LAST") {
+                Ok(false)
+            } else {
+                Err("expected FIRST or LAST after NULLS".into())
+            }
+        } else {
+            Ok(false)
+        }
     }
 
     /// Parse a statement-position ORDER BY key list (a standalone sort BEFORE the
@@ -1088,10 +1105,11 @@ impl Parser {
                 self.eat_kw("ASC");
                 false
             };
+            let nulls_first = self.parse_nulls_order()?;
             keys.push(crate::ir::SortKey {
                 expr,
                 descending,
-                nulls_first: false,
+                nulls_first,
             });
             if !self.eat(&Tok::Comma) {
                 break;
@@ -1147,10 +1165,12 @@ impl Parser {
                 self.eat_kw("ASC"); // optional, default ascending
                 false
             };
+            // `NULLS FIRST|LAST` overrides the default (nulls last, both directions).
+            let nulls_first = self.parse_nulls_order()?;
             keys.push(crate::ir::SortKey {
                 expr,
                 descending,
-                nulls_first: false, // GQL: NULLs last, both directions
+                nulls_first,
             });
             if !self.eat(&Tok::Comma) {
                 break;
@@ -6051,6 +6071,34 @@ mod tests {
         assert_eq!(
             val("MATCH (p:Person) WHERE p.name = 'alice' RETURN CASE p.nope WHEN 1 THEN 'a' ELSE 'none' END AS r"),
             "Str(\"none\")"
+        );
+    }
+
+    /// `ORDER BY … NULLS FIRST|LAST` overrides the default null placement (last).
+    #[test]
+    fn order_by_nulls_first_last() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"P\"],\"props\":{\"age\":30}}\n",
+            "{\"id\":\"b\",\"labels\":[\"P\"],\"props\":{\"age\":null}}\n",
+            "{\"id\":\"c\",\"labels\":[\"P\"],\"props\":{\"age\":40}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let col0 = |q: &str| -> Vec<String> {
+            run(&super::parse(q).unwrap(), &store)
+                .rows
+                .iter()
+                .map(|r| format!("{:?}", r[0]))
+                .collect()
+        };
+        // ASC NULLS FIRST puts the null ahead of 30, 40.
+        assert_eq!(
+            col0("MATCH (n:P) RETURN n.age AS age ORDER BY n.age ASC NULLS FIRST"),
+            vec!["Null", "Num(30.0)", "Num(40.0)"]
+        );
+        // DESC NULLS LAST keeps the null after 40, 30.
+        assert_eq!(
+            col0("MATCH (n:P) RETURN n.age AS age ORDER BY n.age DESC NULLS LAST"),
+            vec!["Num(40.0)", "Num(30.0)", "Null"]
         );
     }
 

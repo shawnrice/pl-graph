@@ -17,8 +17,6 @@ language.jsonl::m_label_conjunction
 language.jsonl::m_label_disjunction
 language.jsonl::m_label_negation
 language.jsonl::m_label_wildcard
-language.jsonl::m_nulls_first_overrides_ascending_default
-language.jsonl::m_nulls_last_overrides_descending_default
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_1
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_2
 tck.jsonl::tck_literals6_control_character_escapes_decode_1
@@ -275,7 +273,6 @@ tests_f.jsonl::num_string_overflow_4
 tests_f.jsonl::order_alias_10a
 tests_f.jsonl::order_alias_10b
 tests_f.jsonl::order_alias_3a
-tests_f.jsonl::order_alias_3b
 tests_f.jsonl::order_alias_9b
 tests_f.jsonl::page_before_projection_1
 tests_f.jsonl::page_composes_1
