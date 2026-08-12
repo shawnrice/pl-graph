@@ -515,19 +515,33 @@ Cleared 15 specialized features, each gate-green + fuzz-byte-identical (seeds 1 
 - correlated CALL with a COUNT aggregate (LEFT semantics, count 0 for empty)
 - edge-label negation `-[:!T]->` / `-[:!(A|B)]->` (complement id set in want_etypes)
 
-REMAINING (55 = ~30 value-contract intentional + ~25 feature). The remaining feature work is the
-HARDEST tier — each item is high-effort and/or has NO fuzzer byte-identity safety net (the differential
-fuzzer only generates node-only / 1-2-hop patterns, NOT quantified/nested groups). Recommend extending
-the fuzzer to emit quantified + nested groups BEFORE attempting the nested cluster, so byte-identity is
-verifiable beyond the 14 corpus cases.
+### ROUND 9 — extend the fuzzers to emit the hard shapes, then fix (55 -> 55 corpus; 3 fuzzer-found fixes)
+
+The byte-identity safety net that gated the nested cluster now EXISTS. Shared generator
+`tests/support/gql_shapes.rs` (quantified var-length, subpath GROUPS with group vars, per-rep WHERE,
+shortest, and — behind `Caps::nested` — NESTED groups + group-over-var-length), reducing every binding
+to SCALARS so results compare as a multiset. Reused by BOTH `differential_fuzz.rs` (correctness) and
+`perf_fuzz.rs` (perf) via `#[path]`. `FUZZ_HARD=supported` (default, CI-green) / `all` (nested driver:
+engine parse-error on a shape core supports = hard failure with repro) / `off`. Per-query 2s timeout
+guard + `FUZZ_TRACE=1`.
+
+Building it immediately found + fixed 3 real byte-identity bugs in ALREADY-shipped constructs:
+- ANY SHORTEST `->+(t)` now admits the SOURCE at the shortest CYCLE length (collect cycle-closing edges
+  in the BFS). This IS any_shortest_plus_seed_cycle_len — now cleared (the count already reflects it).
+- shortest `->*` and group `*`/`{0,…}` over an UNKNOWN edge type now still emit the zero-rep source
+  (fall through with a never-matching set, not the empty "any" set / early empty()).
+
+REMAINING (55 = ~30 value-contract intentional + ~24 feature). The nested cluster is now DRIVABLE:
+`FUZZ_HARD=all` red-fails with a concrete repro (first: `( (x)-[e:R]->{0,1}(y) ){1,2} … size(e[1])`).
+Parser entry point: `gql.rs::parse_subpath_group` (~2441/2473 bail-outs). Needs a recursive/variable-
+stride RepeatGroup materializing nested `Value::List`.
 
 - NESTED-RECURSIVE (14): list-of-lists group vars (nested_paren_lol/varying_1/2, nested_quant_gv_vectorize),
   variable-inner group vars (nested_outer_gv_2), multi-rep decomposition (nested_quant_ends_2/3),
   nested per-rep WHERE (nested_per_rep_where_1..4), nested per-hop edge (nested_per_hop_edge_1/2), vqs_16.
   Needs core's recursive bind_unit + nested Value::List materialization with byte-identical enumeration
   order. The big coherent HARD chunk; verified data model captured (x[outer][inner] depth = enclosing groups).
-- any_shortest_plus_seed_cycle_len (1) — shortest cycle back to the bound seed; needs surgery on the shared
-  BFS so `start` is re-reachable via a non-trivial path. HIGH byte-identity risk on a hot shared fn.
+  NOW fuzzer-driven (`FUZZ_HARD=all`).
 - for_drives_batch_optional_match (1) — FOR-driven fresh-var OPTIONAL MATCH `(p:Person {name: name})`: needs
   BOTH a correlated inline-prop EXPRESSION (props() only takes literals today) AND a left-outer correlated
   node scan (no such plan node). Two new capabilities.
