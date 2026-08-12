@@ -2053,26 +2053,40 @@ impl Parser {
                 };
                 *slots += 1;
                 if bind {
-                    // Inline edge PROPERTIES on a var-length hop (`-[:R {k:v}]->{n,m}`)
-                    // are a per-repetition edge filter → a RepeatGroup whose per_rep_pred
-                    // matches each edge (edge at scalar slot 1). A relationship VARIABLE
-                    // or an inline edge WHERE on a var-length hop stays unsupported.
-                    if rel.var.is_some() || rel.where_range.is_some() {
-                        return Err("a relationship variable / edge WHERE on a variable-length \
-                             pattern is not supported"
-                            .into());
-                    }
+                    // A per-hop edge filter on a var-length hop → a RepeatGroup (k=1)
+                    // whose per_rep_pred tests each edge (the edge at scalar slot 1).
+                    // Covers inline edge PROPERTIES (`-[:R {k:v}]->{n,m}`) and an inline
+                    // edge WHERE (`-[e:R WHERE …]->{n,m}`). The edge variable is bound
+                    // only INSIDE the WHERE (at the scalar slot), so a WHERE referencing
+                    // an OUTER variable is not yet supported (it fails to resolve).
                     let mut pred: Option<Expr> = None;
+                    let and = |p: Option<Expr>, cmp: Expr| {
+                        Some(match p {
+                            None => cmp,
+                            Some(prev) => Expr::And(Box::new(prev), Box::new(cmp)),
+                        })
+                    };
                     for (k, val) in rel.props {
                         let cmp = Expr::Compare {
                             op: CompareOp::Eq,
                             left: Box::new(Expr::Prop { slot: 1, key: k }),
                             right: Box::new(Expr::Lit(val)),
                         };
-                        pred = Some(match pred {
-                            None => cmp,
-                            Some(p) => Expr::And(Box::new(p), Box::new(cmp)),
-                        });
+                        pred = and(pred, cmp);
+                    }
+                    if let Some(r) = rel.where_range {
+                        let saved_scope = std::mem::take(&mut self.scope);
+                        let saved_slots = self.slots;
+                        let mut mini: HashMap<String, usize> = HashMap::new();
+                        if let Some(ev) = &rel.var {
+                            mini.insert(ev.clone(), 1);
+                        }
+                        self.scope = mini;
+                        self.slots = 3;
+                        let w = self.parse_captured_where(r)?;
+                        self.scope = saved_scope;
+                        self.slots = saved_slots;
+                        pred = and(pred, w);
                     }
                     plan = Plan::RepeatGroup {
                         input: Box::new(plan),

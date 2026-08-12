@@ -9075,6 +9075,36 @@ mod tests {
         );
     }
 
+    /// A per-hop edge WHERE on a plain var-length hop filters each hop's edge.
+    /// a-e(20)->b-e(5)->c: e.amt>=10 admits only a->b.
+    #[test]
+    fn plain_var_length_per_hop_where() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{\"amt\":20.0}}\n",
+            "{\"from\":\"b\",\"to\":\"c\",\"labels\":[\"R\"],\"props\":{\"amt\":5.0}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let ids = |q: &str| -> Vec<String> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            let mut v = names_of(&run(&plan, &store), 0);
+            v.sort();
+            v
+        };
+        // e.amt >= 10 blocks b->c → only a->b reaches b.
+        assert_eq!(
+            ids("MATCH (a:N {id:'a'})-[e:R WHERE e.amt >= 10]->{1,3}(x) RETURN x.id AS id"),
+            vec!["b"]
+        );
+        // e.amt >= 1 admits all → b, c.
+        assert_eq!(
+            ids("MATCH (a:N {id:'a'})-[e:R WHERE e.amt >= 1]->{1,3}(x) RETURN x.id AS id"),
+            vec!["b", "c"]
+        );
+    }
+
     /// Graph-element predicates: IS DIRECTED, IS SOURCE/DESTINATION OF, ALL_DIFFERENT,
     /// SAME — three-valued over element identity (a null operand → NULL).
     #[test]
@@ -9087,7 +9117,7 @@ mod tests {
         let store = crate::ndjson::from_ndjson(nd).unwrap();
         let row = |q: &str| -> Vec<Value> {
             let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
-            run(&plan, &store).rows[0].clone()
+            run(&plan, &store).rows[0].to_vec()
         };
         let r = row(
             "MATCH (a:N {id:'a'})-[e:R]->(b:N {id:'b'}) RETURN e IS DIRECTED AS d, \
