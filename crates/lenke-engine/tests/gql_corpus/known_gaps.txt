@@ -52,7 +52,6 @@ tests_e.jsonl::date_part_rejects_number
 tests_e.jsonl::date_part_rejects_string
 tests_e.jsonl::is_typed_closed_record_1
 tests_e.jsonl::is_typed_closed_record_2
-tests_f.jsonl::contains_window
 tests_f.jsonl::distinct_nan_1
 tests_f.jsonl::distinct_nan_2
 tests_f.jsonl::distinct_nan_3

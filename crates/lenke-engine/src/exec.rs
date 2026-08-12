@@ -2471,31 +2471,41 @@ fn interval_expand(
     let mut nbrs = Vec::new();
     let mut eids = Vec::new();
     for (row, &v) in src.iter().enumerate() {
-        // The bounds for this row; a non-numeric bound can never satisfy the
-        // numeric interval comparison, so the row contributes nothing.
-        let (Value::Num(qlo), Value::Num(qhi)) = (qlo_col.value_at(row), qhi_col.value_at(row))
-        else {
+        let qlo = qlo_col.value_at(row);
+        let qhi = qhi_col.value_at(row);
+        // A NULL bound can never satisfy the comparison, so the row contributes
+        // nothing (matching what the `<=`/`>=` filter would do).
+        if qlo.is_null() || qhi.is_null() {
             continue;
-        };
+        }
+        // The RI-tree seek is numeric-only; NUMERIC bounds over a matching OUT index
+        // take it. Temporal (or index-less) bounds fall to the scan below.
         if can_seek {
-            store.for_each_overlap(v, qlo, qhi, |eid, nbr| {
+            if let (Value::Num(qlo_n), Value::Num(qhi_n)) = (&qlo, &qhi) {
+                store.for_each_overlap(v, *qlo_n, *qhi_n, |eid, nbr| {
+                    keep.push(row);
+                    nbrs.push(nbr);
+                    eids.push(eid);
+                });
+                continue;
+            }
+        }
+        // General scan: keep an edge whose `[lo, hi]` overlaps `[qlo, qhi]` — `lo <=
+        // qhi AND hi >= qlo` under the value contract's 3VL ordering (`cmp_partial`),
+        // the SAME comparison the `<=`/`>=` filter uses. So numeric AND temporal
+        // bounds work, and an absent / incomparable bound drops out exactly as the
+        // filter would (an unknown comparison is not an overlap).
+        for_each_nbr(store, v, dir, &want, |nbr, eid| {
+            let lo = store.edge_prop(eid, lo_key);
+            let hi = store.edge_prop(eid, hi_key);
+            let lo_le_qhi = value::cmp_partial(&lo, &qhi).map(std::cmp::Ordering::is_le);
+            let hi_ge_qlo = value::cmp_partial(&hi, &qlo).map(std::cmp::Ordering::is_ge);
+            if lo_le_qhi == Some(true) && hi_ge_qlo == Some(true) {
                 keep.push(row);
                 nbrs.push(nbr);
                 eids.push(eid);
-            });
-        } else {
-            for_each_nbr(store, v, dir, &want, |nbr, eid| {
-                if let (Value::Num(lo), Value::Num(hi)) =
-                    (store.edge_prop(eid, lo_key), store.edge_prop(eid, hi_key))
-                {
-                    if lo <= qhi && hi >= qlo {
-                        keep.push(row);
-                        nbrs.push(nbr);
-                        eids.push(eid);
-                    }
-                }
-            });
-        }
+            }
+        });
     }
 
     let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
@@ -8810,6 +8820,27 @@ mod tests {
         let cplan =
             crate::gql::parse("MATCH (a:Person)-[:KNOWS]->() RETURN count(*) AS c").unwrap();
         assert!(matches!(run(&cplan, &store).rows[0][0], Value::Num(x) if x == 3.0));
+    }
+
+    /// `r.vf <= X AND r.vt >= Y` fuses to an `IntervalExpand` whose scan fallback now
+    /// compares TEMPORAL bounds (not just numeric) via the value contract — so a
+    /// "contains the window" query over date edges returns the covering edges instead
+    /// of nothing (the numeric-only guard used to skip every temporal edge).
+    #[test]
+    fn interval_expand_scan_handles_temporal_bounds() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{\"id\":\"covers\",\"vf\":{\"@date\":\"2024-01-01\"},\"vt\":{\"@date\":\"2024-12-01\"}}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{\"id\":\"exact\",\"vf\":{\"@date\":\"2024-04-01\"},\"vt\":{\"@date\":\"2024-08-01\"}}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{\"id\":\"disjoint\",\"vf\":{\"@date\":\"2024-01-01\"},\"vt\":{\"@date\":\"2024-03-01\"}}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let q = "MATCH ()-[r:R]->() WHERE r.vf <= DATE '2024-04-01' AND r.vt >= DATE '2024-08-01' RETURN r.id AS id ORDER BY id";
+        let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+        // The optimizer must have fused it into the interval hop.
+        assert!(has_interval_expand(&plan));
+        assert_eq!(names_of(&run(&plan, &store), 0), vec!["covers", "exact"]);
     }
 
     /// Does the plan tree contain an `IntervalExpand` (the fused interval hop)?
