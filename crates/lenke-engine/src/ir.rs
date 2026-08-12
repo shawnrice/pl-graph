@@ -699,6 +699,17 @@ pub enum Plan {
     /// columns — the ISO left-outer of the pattern against the implicit single unit
     /// row. Non-empty results pass through unchanged.
     NullPadIfEmpty { input: Box<Plan>, width: usize },
+    /// `OPTIONAL MATCH (p:Label {k: expr, …})` on a FRESH variable — a LEFT-OUTER
+    /// correlated node lookup (the FOR-driven `OPTIONAL MATCH (p:Person {name: name})`
+    /// shape). For each input row, find the `label` nodes whose property `k` equals
+    /// `expr` evaluated over that row; emit one output row (input columns + the node at
+    /// `node_slot`) per match, or one row with the node NULL when none match.
+    OptionalScan {
+        input: Box<Plan>,
+        label: Option<String>,
+        filters: Vec<(String, Expr)>,
+        node_slot: usize,
+    },
     /// `CALL (scope) { <subquery> }` — an inline correlated (lateral) subquery. For
     /// each row of `input`, run `body` (a `Plan::Row`-rooted pattern that continues
     /// from a scope variable) and emit one output row per sub-row: the `input`

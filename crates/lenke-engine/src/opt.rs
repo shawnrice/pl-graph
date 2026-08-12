@@ -424,6 +424,23 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             let (i, c) = rewrite(*input, idx);
             (Plan::Distinct { input: Box::new(i) }, c)
         }
+        Plan::OptionalScan {
+            input,
+            label,
+            filters,
+            node_slot,
+        } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::OptionalScan {
+                    input: Box::new(i),
+                    label,
+                    filters,
+                    node_slot,
+                },
+                c,
+            )
+        }
         Plan::NullPadIfEmpty { input, width } => {
             let (i, c) = rewrite(*input, idx);
             (
@@ -1168,6 +1185,8 @@ fn width(plan: &Plan) -> usize {
         | Plan::SortLocal { input, .. } => width(input),
         // The padded null row carries exactly the pattern's columns.
         Plan::NullPadIfEmpty { width, .. } => *width,
+        // A left-outer correlated scan appends the matched (or NULL) node.
+        Plan::OptionalScan { input, .. } => width(input) + 1,
         Plan::Project { items, .. } => items.len(),
         Plan::Aggregate { keys, aggs, .. } => keys.len() + aggs.len(),
         Plan::Join { left, right, .. } => width(left) + width(right),
@@ -1614,6 +1633,7 @@ mod tests {
             | Plan::Tail { input, .. }
             | Plan::Branch { input, .. }
             | Plan::NullPadIfEmpty { input, .. }
+            | Plan::OptionalScan { input, .. }
             | Plan::SortLocal { input, .. } => plan_contains_filter(input),
             Plan::Join { left, right, .. } | Plan::Union { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)

@@ -19,7 +19,6 @@ tests_b.jsonl::malformed_num_1e999_error
 tests_b.jsonl::oversized_int_error
 tests_b.jsonl::sum_date_errors
 tests_c.jsonl::bool_times_num_faults
-tests_c.jsonl::for_drives_batch_optional_match
 tests_c.jsonl::prop_str_plus_num_faults
 tests_c.jsonl::str_plus_num_faults
 tests_c.jsonl::sum_distinct_mix_num_duration_faults

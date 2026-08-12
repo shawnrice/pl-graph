@@ -200,6 +200,8 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
             }
         }
 
+        // A left-outer correlated scan yields >= 1 row per input row (the NULL pad).
+        Plan::OptionalScan { input, .. } => estimate(input, store).scale(2.0, false),
         // A leading OPTIONAL MATCH yields at least one row (the null pad when empty).
         Plan::NullPadIfEmpty { input, .. } => {
             let inp = estimate(input, store);

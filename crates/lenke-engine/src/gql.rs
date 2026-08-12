@@ -2945,11 +2945,65 @@ impl Parser {
         if !self.eat_kw("MATCH") {
             return Err("expected MATCH after OPTIONAL".into());
         }
-        let (var, label, props, start_where, _le) = self.node()?;
+        // Parse the leading node MANUALLY so its inline props may be EXPRESSIONS
+        // (`{name: name}` correlates on a bound variable) — `node()` only takes
+        // literal props. A FRESH variable with a label and NO following relationship is
+        // a left-outer correlated SCAN (`Plan::OptionalScan`, the FOR-driven form); a
+        // BOUND variable followed by a hop is the left-outer expand below.
+        self.expect(&Tok::LParen)?;
+        let var = if matches!(self.peek(), Some(Tok::Ident(_))) {
+            Some(self.ident()?)
+        } else {
+            None
+        };
+        let label = if self.eat(&Tok::Colon) {
+            Some(self.ident()?)
+        } else {
+            None
+        };
+        let mut filters: Vec<(String, Expr)> = Vec::new();
+        if matches!(self.peek(), Some(Tok::LBrace)) {
+            self.expect(&Tok::LBrace)?;
+            if !self.eat(&Tok::RBrace) {
+                loop {
+                    let key = self.ident()?;
+                    self.expect(&Tok::Colon)?;
+                    filters.push((key, self.expr()?));
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&Tok::RBrace)?;
+            }
+        }
+        let inline_where = self.eat_kw("WHERE");
+        self.expect(&Tok::RParen)?;
+        let has_rel = matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde));
+        let bound = var.as_ref().and_then(|v| self.scope.get(v)).copied();
+
+        // Fresh-variable single node (no rel) → a left-outer correlated scan.
+        if bound.is_none() && !has_rel {
+            if inline_where {
+                return Err("inline WHERE inside OPTIONAL MATCH is not supported yet".into());
+            }
+            let node_slot = self.slots;
+            if let Some(v) = var {
+                self.scope.insert(v, node_slot);
+            }
+            self.slots += 1;
+            return Ok(Plan::OptionalScan {
+                input: Box::new(plan),
+                label,
+                filters,
+                node_slot,
+            });
+        }
+
+        // Otherwise the bound-variable left-outer HOP form.
         let Some(v) = var else {
             return Err("OPTIONAL MATCH must start from a bound variable".into());
         };
-        if start_where.is_some() {
+        if inline_where {
             return Err("inline WHERE inside OPTIONAL MATCH is not supported yet".into());
         }
         if label.is_some() {
@@ -2957,7 +3011,7 @@ impl Parser {
                 "bound variable `{v}` cannot be re-labeled in OPTIONAL MATCH"
             ));
         }
-        if !props.is_empty() {
+        if !filters.is_empty() {
             return Err(
                 "inline properties on the OPTIONAL MATCH start node are not supported; \
                         use WHERE"

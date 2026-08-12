@@ -758,6 +758,9 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::Tail { input, .. }
         | Plan::NullPadIfEmpty { input, .. }
         | Plan::SortLocal { input, .. } => needs_lineage(input),
+        Plan::OptionalScan { input, filters, .. } => {
+            filters.iter().any(|(_, e)| reads_path(e)) || needs_lineage(input)
+        }
         Plan::Unwind { input, list, .. } => reads_path(list) || needs_lineage(input),
         Plan::Branch { input, bodies } => needs_lineage(input) || bodies.iter().any(needs_lineage),
         Plan::IntervalExpand {
@@ -1312,6 +1315,47 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             } else {
                 batch
             }
+        }
+        Plan::OptionalScan {
+            input,
+            label,
+            filters,
+            node_slot: _,
+        } => {
+            // A correlated left-outer node lookup: for each input row, the `label` nodes
+            // whose prop `k` equals `expr` over that row; else one NULL-node row. The
+            // filter exprs are evaluated over the whole input batch (column-at-a-time).
+            let batch = pull(input, store, track)?;
+            let candidates: Vec<u32> = match label {
+                Some(l) => store.nodes_with_label(l).to_vec(),
+                None => (0..store.node_count() as u32).collect(),
+            };
+            let fcols: Vec<Col> = filters
+                .iter()
+                .map(|(_, e)| eval(e, store, &batch))
+                .collect::<Result<_, _>>()?;
+            let mut keep: Vec<usize> = Vec::new();
+            let mut nodes: Vec<u32> = Vec::new();
+            for row in 0..batch.rows() {
+                let mut matched = false;
+                for &c in &candidates {
+                    let ok = filters.iter().zip(&fcols).all(|((key, _), col)| {
+                        value::equals(&store.prop(c, key), &col.value_at(row))
+                    });
+                    if ok {
+                        keep.push(row);
+                        nodes.push(c);
+                        matched = true;
+                    }
+                }
+                if !matched {
+                    keep.push(row);
+                    nodes.push(u32::MAX); // left-outer: no match → NULL node
+                }
+            }
+            let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
+            slots.push(Col::Nodes(nodes));
+            Batch::of(slots)
         }
         Plan::CallInline {
             input,
@@ -10017,6 +10061,38 @@ mod tests {
             &store,
         );
         assert_eq!(run(&plan, &store).rows.len(), 2);
+    }
+
+    /// A FOR-driven fresh-variable `OPTIONAL MATCH (p:Label {k: expr})` is a left-outer
+    /// correlated scan: each unwound name finds the matching node (its age), or a NULL
+    /// node when none matches.
+    #[test]
+    fn for_driven_optional_scan() {
+        let mut b = Builder::default();
+        b.node(&["Person"], &[("name", s("josh")), ("age", n(32.0))]);
+        b.node(&["Person"], &[("name", s("marko")), ("age", n(29.0))]);
+        let store = b.build();
+        let plan = crate::opt::optimize_indexed(
+            crate::gql::parse(
+                "FOR name IN ['josh', 'nobody'] \
+                 OPTIONAL MATCH (p:Person {name: name}) RETURN name, p.age",
+            )
+            .unwrap(),
+            &store,
+        );
+        let rows: Vec<(String, Value)> = run(&plan, &store)
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Str(nm) => (nm.to_string(), r[1].clone()),
+                o => panic!("{o:?}"),
+            })
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "josh");
+        assert!(matches!(rows[0].1, Value::Num(x) if x == 32.0));
+        assert_eq!(rows[1].0, "nobody");
+        assert!(rows[1].1.is_null());
     }
 
     /// A single-outer-rep endpoint-only nested group `( ()-[:R]->{1,3}() ){1} (t)`
