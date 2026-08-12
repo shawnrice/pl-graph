@@ -2872,7 +2872,7 @@ impl Parser {
         }
         self.expect(&Tok::RParen)?;
         if scope_vars.is_empty() {
-            return Err("CALL (…) needs at least one scope variable to correlate on".into());
+            return self.call_inline_uncorrelated(plan, outer_width);
         }
         for v in &scope_vars {
             if !self.scope.contains_key(v) {
@@ -2957,6 +2957,46 @@ impl Parser {
             yields,
             outer_width,
         })
+    }
+
+    /// `CALL () { <subquery> }` — an UNCORRELATED (empty-scope) inline subquery. The
+    /// body is an INDEPENDENT query (a fresh MATCH … RETURN, aggregates allowed) run
+    /// once; its rows CROSS-JOIN the outer working table, appending the yielded
+    /// columns. The `()` scope imports nothing, so a reference to an outer variable is
+    /// ISOLATED — resolved to NULL (matching core's scope isolation), which lets a
+    /// body like `WHERE c = a` compile and simply match nothing. The `CALL (` and
+    /// `)` are already consumed; the outer scope is intact in `self`.
+    fn call_inline_uncorrelated(&mut self, plan: Plan, outer_width: usize) -> Result<Plan, String> {
+        self.expect(&Tok::LBrace)?;
+        if !self.eat_kw("MATCH") {
+            return Err("a CALL subquery must begin with MATCH".into());
+        }
+        // Parse the body in a FRESH slot space, with outer variables isolated to NULL
+        // (a LET-style local shadowing any outer binding). A parse error discards the
+        // whole parser, so the saved state need not be restored on the error paths.
+        let outer_scope = std::mem::take(&mut self.scope);
+        let let_base = self.lets.len();
+        for name in outer_scope.keys() {
+            self.lets.push((name.clone(), Expr::Lit(Value::Null)));
+        }
+        self.slots = 0;
+        let body = self.match_body()?;
+        if !self.eat_kw("RETURN") {
+            return Err("a CALL subquery needs a RETURN".into());
+        }
+        let items = self.return_items()?;
+        let (body_out, out_names) = apply_items(body, &items);
+        self.expect(&Tok::RBrace)?;
+
+        // Restore the outer scope; the yields append as its new trailing columns
+        // (cross-join layout: right slot `j` lands at `outer_width + j`).
+        self.lets.truncate(let_base);
+        self.scope = outer_scope;
+        for (i, name) in out_names.iter().enumerate() {
+            self.scope.insert(name.clone(), outer_width + i);
+        }
+        self.slots = outer_width + out_names.len();
+        Ok(Plan::join(plan, body_out, Vec::new()))
     }
 
     /// A top-level named-procedure call `CALL name(config) [YIELD col [AS a], …]`.
@@ -5172,6 +5212,36 @@ mod tests {
                 "name=Str(\"bob\");friend=Str(\"carol\");",
             ]
         );
+    }
+
+    /// `CALL () { … }` — an UNCORRELATED empty-scope subquery — runs once and
+    /// cross-joins the outer table. An aggregate body yields a single row (so each
+    /// outer row survives); a body referencing an outer variable sees it as NULL
+    /// (scope isolation), so `WHERE c = a` matches nothing.
+    #[test]
+    fn call_inline_uncorrelated_empty_scope() {
+        let store = social(); // 4 nodes: alice, bob, carol, graphdb
+        let total = run(
+            &super::parse(
+                "MATCH (p:Person {name: 'alice'}) \
+                 CALL () { MATCH (n) RETURN count(n) AS total } RETURN total",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert_eq!(total.rows.len(), 1);
+        assert!(matches!(total.rows[0][0], crate::value::Value::Num(x) if x == 4.0));
+        // Isolated outer reference: `c = a` with `a` NULL inside `()` → no rows.
+        let iso = run(
+            &super::parse(
+                "MATCH (a:Person) WHERE a.name = 'alice' \
+                 CALL () { MATCH (b:Person)-[:KNOWS]->(c) WHERE c = a RETURN c.name AS cn } \
+                 RETURN cn",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert_eq!(iso.rows.len(), 0);
     }
 
     #[test]
