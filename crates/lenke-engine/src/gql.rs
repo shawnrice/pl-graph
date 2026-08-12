@@ -810,6 +810,19 @@ impl Parser {
     ) -> Result<Plan, String> {
         let visible: Vec<String> = items.iter().map(RetItem::name).collect();
         let has_agg = items.iter().any(|it| matches!(it, RetItem::Agg(_)));
+        // When grouping, the non-aggregate items are the group keys; they occupy the
+        // FIRST columns of the aggregate output (keys before aggregates), so an
+        // `ORDER BY` over a group-key EXPRESSION (`ORDER BY s.name`) maps to that
+        // column even though the bindings are gone.
+        let key_slots: Vec<(Expr, usize)> = items
+            .iter()
+            .filter_map(|it| match it {
+                RetItem::Key(_, e) => Some(e.clone()),
+                RetItem::Agg(_) => None,
+            })
+            .enumerate()
+            .map(|(i, e)| (e, i))
+            .collect();
 
         // ORDER BY: a key that is a visible output alias sorts by that column; a key
         // that is an EXPRESSION over the bindings (`ORDER BY n.age`, `a.x + a.y`) is
@@ -820,7 +833,7 @@ impl Parser {
             if !self.eat_kw("BY") {
                 return Err("expected BY after ORDER".into());
             }
-            self.order_keys(&visible, has_agg, &mut hidden)?
+            self.order_keys(&visible, has_agg, &key_slots, &mut hidden)?
         } else {
             Vec::new()
         };
@@ -1244,6 +1257,7 @@ impl Parser {
         &mut self,
         visible: &[String],
         has_agg: bool,
+        key_slots: &[(Expr, usize)],
         hidden: &mut Vec<(String, Expr)>,
     ) -> Result<Vec<crate::ir::SortKey>, String> {
         // Is the next token a bare visible alias — an ident naming a visible column,
@@ -1267,15 +1281,23 @@ impl Parser {
                 self.bump();
                 Expr::Slot(slot)
             } else {
-                if has_agg {
-                    return Err(
-                        "ORDER BY with aggregation must reference an output column by alias".into(),
-                    );
-                }
                 let e = self.expr()?;
-                let slot = visible.len() + hidden.len();
-                hidden.push((format!("__order{}", hidden.len()), e));
-                Expr::Slot(slot)
+                if has_agg {
+                    // Under aggregation the bindings are gone, so the only valid
+                    // expression key is one that IS a group key — order by its column.
+                    match key_slots.iter().find(|(ke, _)| expr_eq(ke, &e)) {
+                        Some((_, slot)) => Expr::Slot(*slot),
+                        None => {
+                            return Err("ORDER BY with aggregation must reference an output \
+                                        column alias or a group key"
+                                .into())
+                        }
+                    }
+                } else {
+                    let slot = visible.len() + hidden.len();
+                    hidden.push((format!("__order{}", hidden.len()), e));
+                    Expr::Slot(slot)
+                }
             };
             let descending = if self.eat_kw("DESC") {
                 true
@@ -6405,6 +6427,28 @@ mod tests {
         // min = the smallest number; max = the bool (highest rank present).
         assert_eq!(col0("MATCH (n:X) RETURN min(n.v) AS m"), vec!["Num(1.0)"]);
         assert_eq!(col0("MATCH (n:X) RETURN max(n.v) AS m"), vec!["Bool(true)"]);
+    }
+
+    /// `ORDER BY` over a group-key EXPRESSION works under implicit grouping — the
+    /// key column is ordered even though the bindings are gone post-aggregation.
+    #[test]
+    fn grouped_order_by_group_key() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"P\"],\"props\":{\"city\":\"z\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"P\"],\"props\":{\"city\":\"a\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"P\"],\"props\":{\"city\":\"a\"}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        // Group by city, count, ORDER BY the group-key expression n.city.
+        let rows: Vec<String> = run(
+            &super::parse("MATCH (n:P) RETURN n.city, count(*) AS c ORDER BY n.city").unwrap(),
+            &store,
+        )
+        .rows
+        .iter()
+        .map(|r| format!("{:?},{:?}", r[0], r[1]))
+        .collect();
+        assert_eq!(rows, vec!["Str(\"a\"),Num(2.0)", "Str(\"z\"),Num(1.0)"]);
     }
 
     // --- part 3.8: string functions (E4a) ---
