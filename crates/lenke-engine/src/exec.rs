@@ -8761,6 +8761,33 @@ mod tests {
         ));
     }
 
+    /// `VALUE { MATCH (a)-[:R]->(b) RETURN count(*) }` is a correlated count subquery
+    /// (a degree), lowering to the same result as `COUNT { (a)-[:R]->(b) }`.
+    #[test]
+    fn value_count_subquery() {
+        let nd = concat!(
+            "{\"id\":\"dave\",\"labels\":[\"P\"],\"props\":{\"id\":\"dave\"}}\n",
+            "{\"id\":\"carol\",\"labels\":[\"P\"],\"props\":{\"id\":\"carol\"}}\n",
+            "{\"id\":\"x\",\"labels\":[\"P\"],\"props\":{\"id\":\"x\"}}\n",
+            "{\"id\":\"y\",\"labels\":[\"P\"],\"props\":{\"id\":\"y\"}}\n",
+            "{\"from\":\"dave\",\"to\":\"x\",\"labels\":[\"KNOWS\"],\"props\":{}}\n",
+            "{\"from\":\"dave\",\"to\":\"y\",\"labels\":[\"KNOWS\"],\"props\":{}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let deg = |id: &str| -> f64 {
+            let q = format!(
+                "MATCH (a:P) WHERE a.id='{id}' RETURN VALUE {{ MATCH (a)-[:KNOWS]->(b) RETURN count(*) }} AS deg"
+            );
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(&q).unwrap(), &store);
+            match run(&plan, &store).rows[0][0] {
+                Value::Num(x) => x,
+                ref o => panic!("{o:?}"),
+            }
+        };
+        assert_eq!(deg("dave"), 2.0); // dave knows x and y
+        assert_eq!(deg("carol"), 0.0); // carol knows no one
+    }
+
     /// Multi-label edges: an edge's type is its FIRST label; the rest are secondary
     /// labels a `-[:label]->` hop must still match. `a-[:X,:Y]->b`, `a-[:Y]->c`.
     #[test]

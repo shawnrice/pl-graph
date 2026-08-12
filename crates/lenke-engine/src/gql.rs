@@ -3224,6 +3224,11 @@ impl Parser {
                 if s.eq_ignore_ascii_case("count") && matches!(self.peek(), Some(Tok::LBrace)) {
                     return self.count_subquery_expr();
                 }
+                // VALUE { MATCH <pattern> RETURN count(*) } — a correlated scalar
+                // subquery (only the count(*) shape, which is a degree).
+                if s.eq_ignore_ascii_case("value") && matches!(self.peek(), Some(Tok::LBrace)) {
+                    return self.value_count_subquery_expr();
+                }
                 // Two-word zoned literal `ZONED TIME '…'` / `ZONED DATETIME '…'`.
                 if s.eq_ignore_ascii_case("zoned") {
                     if let Some(Tok::Ident(kind)) = self.peek().cloned() {
@@ -3429,7 +3434,7 @@ impl Parser {
     // already bound in the outer scope (the correlation), and the body extends
     // from it. A trailing WHERE is a sub-pattern predicate over the body scope.
     fn exists_expr(&mut self) -> Result<Expr, String> {
-        let (body, outer_width) = self.correlated_subquery_body("EXISTS")?;
+        let (body, outer_width) = self.correlated_subquery_body("EXISTS", false)?;
         Ok(Expr::Exists {
             body: Box::new(body),
             outer_width,
@@ -3486,7 +3491,18 @@ impl Parser {
     }
 
     fn count_subquery_expr(&mut self) -> Result<Expr, String> {
-        let (body, outer_width) = self.correlated_subquery_body("COUNT")?;
+        let (body, outer_width) = self.correlated_subquery_body("COUNT", false)?;
+        Ok(Expr::CountSubquery {
+            body: Box::new(body),
+            outer_width,
+        })
+    }
+
+    // value := VALUE '{' MATCH <pattern> RETURN count(*) '}' — a correlated scalar
+    // subquery. Only the `count(*)` RETURN is supported, which is exactly a
+    // `COUNT { … }` (a degree), so it lowers to the same CountSubquery.
+    fn value_count_subquery_expr(&mut self) -> Result<Expr, String> {
+        let (body, outer_width) = self.correlated_subquery_body("VALUE", true)?;
         Ok(Expr::CountSubquery {
             body: Box::new(body),
             outer_width,
@@ -3497,7 +3513,11 @@ impl Parser {
     /// `COUNT { … }`: a pattern correlated on an outer-bound start variable, rooted at
     /// `Plan::Row`, with slot `outer_width` reserved for the evaluator's provenance
     /// column. Returns `(body, outer_width)`. `kw` names the construct for errors.
-    fn correlated_subquery_body(&mut self, kw: &str) -> Result<(Plan, usize), String> {
+    fn correlated_subquery_body(
+        &mut self,
+        kw: &str,
+        count_return: bool,
+    ) -> Result<(Plan, usize), String> {
         self.expect(&Tok::LBrace)?;
         // The pattern may be written with an explicit leading `MATCH` — `EXISTS {
         // MATCH (a)-[:R]->(b) }` — the full-statement form; accept it as sugar.
@@ -3590,6 +3610,21 @@ impl Parser {
         } else {
             body
         };
+        // The VALUE form `VALUE { MATCH … RETURN count(*) }` carries an explicit
+        // RETURN; only the `count(*)` shape is supported (it makes this a correlated
+        // count subquery, exactly like `COUNT { … }`).
+        if count_return {
+            if !self.eat_kw("RETURN") {
+                return Err(format!("{kw} subquery must end with RETURN count(*)"));
+            }
+            let is_count_star = self.eat_kw("COUNT")
+                && self.eat(&Tok::LParen)
+                && self.eat(&Tok::Star)
+                && self.eat(&Tok::RParen);
+            if !is_count_star {
+                return Err(format!("only `{kw} {{ … RETURN count(*) }}` is supported"));
+            }
+        }
         self.expect(&Tok::RBrace)?;
         Ok((body, outer_width))
     }

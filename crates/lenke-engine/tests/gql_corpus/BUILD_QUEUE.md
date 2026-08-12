@@ -413,8 +413,8 @@ ShortestK + collect_trails (trail enumeration), var_length lineage (node/edge st
 
 ### NEXT (baseline 134) — still-tractable first, then hard:
 
-- **VALUE{…RETURN count(*)} correlated ~ CountSubquery** (value_subquery_aggregate_dave_deg/carol_zero, 2) —
-  parse `VALUE { MATCH <corr-body> RETURN count(*) }`, detect the count(*) RETURN, emit CountSubquery
+- **VALUE{…RETURN count(\*)} correlated ~ CountSubquery** (value_subquery_aggregate_dave_deg/carol_zero, 2) —
+  parse `VALUE { MATCH <corr-body> RETURN count(*) }`, detect the count(\*) RETURN, emit CountSubquery
   (reuse correlated_subquery_body). EASY-MEDIUM. The general VALUE (scalar b.name) + uncorrelated forms are harder.
 - **multi-hop group unit k>1 `((x)-[e1]->(m)-[e2]->(y)){n}`** (gv_bind_each_rep_2hop, qsp_multi_ends/cross ~4)
   — the group body has k>1 hops; generalize push_group_cols to stride verts[rep*k+p]/edges[rep*k+p] and the
