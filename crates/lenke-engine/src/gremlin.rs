@@ -485,7 +485,7 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 self.current = self.slots;
                 self.slots += 1;
-                plan.optional_expand(from, dir, &etypes_of(label.as_deref()), true)
+                plan.optional_expand(from, dir, &etypes_of(label.as_deref()), true, false)
             }
             "coalesce" => {
                 // coalesce(<hop>, <hop>, …): per element, the FIRST branch that

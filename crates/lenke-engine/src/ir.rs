@@ -406,6 +406,10 @@ pub enum Plan {
         /// through unchanged on a miss — `true`). Either way the slot stays a node
         /// frontier, so the result continues.
         keep_source: bool,
+        /// Bind the traversed edge too: when `true`, appends an EDGE column (the
+        /// `u32::MAX` null sentinel on a miss) BEFORE the node column — so
+        /// `OPTIONAL MATCH (a)-[f:R]->(b)` binds `f` at `width` and `b` at `width+1`.
+        bind_edge: bool,
     },
     /// An interval-overlap hop: like `Expand`, but keeps only edges whose interval
     /// `[edge.lo_key, edge.hi_key]` overlaps `[qlo, qhi]` (`lo <= qhi AND hi >= qlo`).
@@ -731,6 +735,7 @@ impl Plan {
         dir: Dir,
         edge_label: &[String],
         keep_source: bool,
+        bind_edge: bool,
     ) -> Self {
         Self::OptionalExpand {
             input: Box::new(self),
@@ -738,6 +743,7 @@ impl Plan {
             dir,
             edge_label: edge_label.to_vec(),
             keep_source,
+            bind_edge,
         }
     }
 

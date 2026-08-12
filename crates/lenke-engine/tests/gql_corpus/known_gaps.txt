@@ -80,7 +80,6 @@ tests_d.jsonl::per_hop_filters
 tests_d.jsonl::per_hop_outer_var
 tests_d.jsonl::per_hop_path_binding
 tests_d.jsonl::vqs_16
-tests_d.jsonl::vqs_22
 tests_e.jsonl::bang_unary_not_binds_tightly
 tests_e.jsonl::count_multi_match
 tests_e.jsonl::date_part_bare_name_unknown_fn

@@ -139,6 +139,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             dir,
             edge_label,
             keep_source,
+            bind_edge,
         } => {
             let (i, c) = rewrite(*input, idx);
             (
@@ -148,6 +149,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                     dir,
                     edge_label,
                     keep_source,
+                    bind_edge,
                 },
                 c,
             )
@@ -1086,8 +1088,11 @@ fn width(plan: &Plan) -> usize {
         } => width(input) + if *bind_edge { 2 } else { 1 },
         Plan::VarLength { input, .. }
         | Plan::ShortestPath { input, .. }
-        | Plan::Branch { input, .. }
-        | Plan::OptionalExpand { input, .. } => width(input) + 1,
+        | Plan::Branch { input, .. } => width(input) + 1,
+        // A bound-edge OPTIONAL MATCH appends the edge column too.
+        Plan::OptionalExpand {
+            input, bind_edge, ..
+        } => width(input) + if *bind_edge { 2 } else { 1 },
         // The endpoint column plus one list column per group variable.
         Plan::RepeatGroup {
             input, group_binds, ..

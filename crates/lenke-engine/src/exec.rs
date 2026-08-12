@@ -876,6 +876,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             dir,
             edge_label,
             keep_source,
+            bind_edge,
         } => optional_expand(
             &pull(input, store, track)?,
             store,
@@ -883,6 +884,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             *dir,
             edge_label,
             *keep_source,
+            *bind_edge,
         ),
         Plan::IntervalExpand {
             input,
@@ -2312,6 +2314,7 @@ fn optional_expand(
     dir: Dir,
     edge_label: &[String],
     keep_source: bool,
+    bind_edge: bool,
 ) -> Batch {
     // The value a missed row lands: the source element (Gremlin optional) or the
     // null sentinel (GQL OPTIONAL MATCH). `miss(v)` picks per row.
@@ -2325,6 +2328,9 @@ fn optional_expand(
             (true, Col::Nodes(src)) => src.clone(),
             _ => vec![u32::MAX; batch.rows()],
         };
+        if bind_edge {
+            slots.push(Col::Edges(vec![u32::MAX; batch.rows()])); // no edge on a miss
+        }
         slots.push(Col::Nodes(landed));
         Batch::of(slots)
     };
@@ -2337,19 +2343,26 @@ fn optional_expand(
     };
     let mut keep = Vec::new();
     let mut nbrs = Vec::new();
+    let mut eids = Vec::new();
     for (row, &v) in src.iter().enumerate() {
         let before = nbrs.len();
-        for_each_nbr(store, v, dir, &want, |nbr, _| {
+        for_each_nbr(store, v, dir, &want, |nbr, eid| {
             keep.push(row);
             nbrs.push(nbr);
+            eids.push(eid);
         });
         if nbrs.len() == before {
-            // No neighbour — keep the row, landing the miss value (source or null).
+            // No neighbour — keep the row, landing the miss value (source or null),
+            // and a null-sentinel edge if the edge is bound.
             keep.push(row);
             nbrs.push(miss(v));
+            eids.push(u32::MAX);
         }
     }
     let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
+    if bind_edge {
+        slots.push(Col::Edges(eids)); // edge column BEFORE the node column
+    }
     slots.push(Col::Nodes(nbrs));
     Batch::of(slots)
 }
@@ -8898,6 +8911,41 @@ mod tests {
             ids("MATCH (b:N {id:'b'})-[:R {amt:20.0}]->{1,3}(x) RETURN x.id AS id"),
             vec!["c"]
         );
+    }
+
+    /// OPTIONAL MATCH binding an edge variable `(a)-[f:R]->(b)` binds the edge slot
+    /// too (left-outer: null edge + null node on a miss). a->b->c, c has no out edge.
+    #[test]
+    fn optional_match_binds_edge() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{\"w\":7.0}}\n",
+            "{\"from\":\"b\",\"to\":\"c\",\"labels\":[\"R\"],\"props\":{\"w\":9.0}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        // For each N, OPTIONAL MATCH one outgoing R edge; RETURN the node id + f.w.
+        // a->b (w7), b->c (w9), c has none → f.w NULL.
+        let q =
+            "MATCH (n:N) OPTIONAL MATCH (n)-[f:R]->(u) RETURN n.id AS id, f.w AS w ORDER BY n.id";
+        let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+        let out = run(&plan, &store);
+        let got: Vec<(String, Value)> = out
+            .rows
+            .iter()
+            .map(|r| {
+                let id = match &r[0] {
+                    Value::Str(s) => s.to_string(),
+                    o => format!("{o:?}"),
+                };
+                (id, r[1].clone())
+            })
+            .collect();
+        assert_eq!(got.len(), 3);
+        assert!(matches!(&got[0], (id, Value::Num(w)) if id == "a" && *w == 7.0));
+        assert!(matches!(&got[1], (id, Value::Num(w)) if id == "b" && *w == 9.0));
+        assert!(matches!(&got[2], (id, v) if id == "c" && v.is_null())); // no edge → f null
     }
 
     /// A per-repetition WHERE on a MULTI-HOP unit references every edge of the rep

@@ -2239,10 +2239,9 @@ impl Parser {
             ));
         };
         let rel = self.rel()?;
-        if rel.var.is_some() || !rel.props.is_empty() || rel.where_range.is_some() {
+        if !rel.props.is_empty() || rel.where_range.is_some() {
             return Err(
-                "a relationship variable / edge properties on OPTIONAL MATCH are not supported"
-                    .into(),
+                "edge properties / an inline edge WHERE on OPTIONAL MATCH are not supported".into(),
             );
         }
         let (v2, _lbl2, v2_props, v2_where, _v2_le) = self.node()?;
@@ -2251,6 +2250,16 @@ impl Parser {
                 "inline properties on the OPTIONAL MATCH landing node are not supported; use WHERE"
                     .into(),
             );
+        }
+        // A bound edge variable binds the edge at `slots` and the landing node at
+        // `slots+1` (matching a plain bound-edge hop); otherwise just the node.
+        let bind_edge = rel.var.is_some();
+        if bind_edge {
+            let edge_slot = self.slots;
+            if let Some(rv) = &rel.var {
+                self.scope.insert(rv.clone(), edge_slot);
+            }
+            self.slots += 1;
         }
         let node_slot = self.slots;
         if let Some(nv) = v2 {
@@ -2267,6 +2276,7 @@ impl Parser {
             edge_label: rel.etypes,
             // GQL OPTIONAL MATCH lands NULL for a node with no match.
             keep_source: false,
+            bind_edge,
         })
     }
 
