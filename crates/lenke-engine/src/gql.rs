@@ -1307,7 +1307,7 @@ impl Parser {
         let terminator = |t: Option<&Tok>| {
             matches!(t, None | Some(Tok::Comma))
                 || matches!(t, Some(Tok::Ident(s))
-                    if ["DESC", "ASC", "SKIP", "OFFSET", "LIMIT"].iter().any(|k| s.eq_ignore_ascii_case(k)))
+                    if ["DESC", "ASC", "SKIP", "OFFSET", "LIMIT", "NULLS"].iter().any(|k| s.eq_ignore_ascii_case(k)))
         };
         let mut keys = Vec::new();
         loop {
@@ -1323,17 +1323,18 @@ impl Parser {
                 Expr::Slot(slot)
             } else {
                 let e = self.expr()?;
-                if has_agg {
-                    // Under aggregation the bindings are gone, so the only valid
-                    // expression key is one that IS a group key — order by its column.
-                    match key_slots.iter().find(|(ke, _)| expr_eq(ke, &e)) {
-                        Some((_, slot)) => Expr::Slot(*slot),
-                        None => {
-                            return Err("ORDER BY with aggregation must reference an output \
-                                        column alias or a group key"
-                                .into())
-                        }
-                    }
+                // ORDER BY an expression that IS a projected item's expression
+                // (`RETURN u.n AS a … ORDER BY u.n`) sorts by that OUTPUT column, not
+                // a hidden one — so it composes with DISTINCT (a hidden sort column
+                // would change the DISTINCT row) and, under aggregation, references a
+                // group key. Falls through to a hidden column only for a genuinely
+                // new expression, which DISTINCT then rejects below.
+                if let Some((_, slot)) = key_slots.iter().find(|(ke, _)| expr_eq(ke, &e)) {
+                    Expr::Slot(*slot)
+                } else if has_agg {
+                    return Err("ORDER BY with aggregation must reference an output \
+                                column alias or a group key"
+                        .into());
                 } else {
                     let slot = visible.len() + hidden.len();
                     hidden.push((format!("__order{}", hidden.len()), e));

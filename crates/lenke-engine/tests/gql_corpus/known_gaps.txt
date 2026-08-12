@@ -176,8 +176,6 @@ tests_f.jsonl::label_disjunction_7
 tests_f.jsonl::num_string_overflow_1
 tests_f.jsonl::num_string_overflow_2
 tests_f.jsonl::num_string_overflow_4
-tests_f.jsonl::order_alias_3a
-tests_f.jsonl::order_alias_9b
 tests_f.jsonl::page_before_projection_1
 tests_f.jsonl::page_composes_1
 tests_f.jsonl::page_composes_3

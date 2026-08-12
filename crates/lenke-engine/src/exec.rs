@@ -8430,6 +8430,36 @@ mod tests {
         );
     }
 
+    /// ORDER BY resolves an output alias even before `NULLS FIRST|LAST`, and ORDER
+    /// BY the underlying expression of a projected alias sorts by that output column
+    /// (so it composes with DISTINCT). k = 3, (null), 7 over three P nodes.
+    #[test]
+    fn order_by_alias_with_nulls_and_projected_expr() {
+        let mut b = Builder::default();
+        b.node(&["P"], &[("k", n(3.0)), ("nn", n(1.0))]);
+        b.node(&["P"], &[("nn", n(2.0))]); // k absent -> null
+        b.node(&["P"], &[("k", n(7.0)), ("nn", n(1.0))]);
+        let store = b.build();
+        let col0 = |q: &str| -> Vec<Value> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            run(&plan, &store)
+                .rows
+                .iter()
+                .map(|r| r[0].clone())
+                .collect()
+        };
+        // NULLS FIRST after a bare alias: null sorts first, then 3, 7.
+        let got = col0("MATCH (u:P) RETURN u.k AS a ORDER BY a NULLS FIRST");
+        assert!(got[0].is_null());
+        assert!(matches!(got[1], Value::Num(x) if x == 3.0));
+        assert!(matches!(got[2], Value::Num(x) if x == 7.0));
+        // DISTINCT with ORDER BY the underlying expression of the projected alias.
+        let got = col0("MATCH (u:P) RETURN DISTINCT u.nn AS a ORDER BY u.nn");
+        assert_eq!(got.len(), 2); // distinct {1,2}
+        assert!(matches!(got[0], Value::Num(x) if x == 1.0));
+        assert!(matches!(got[1], Value::Num(x) if x == 2.0));
+    }
+
     /// An explicit `GROUP BY` after the RETURN list parses and groups the same as
     /// the implicit (non-aggregate items are the keys). n=1,1,2 over three P nodes.
     #[test]
