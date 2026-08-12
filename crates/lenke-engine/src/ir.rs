@@ -230,6 +230,11 @@ pub enum AggFn {
     /// NULL over 0 rows, `samp` over fewer than 2. Matches core's `stddev_of`.
     StddevPop,
     StddevSamp,
+    /// Ordered-set aggregates `percentile_cont(x, f)` / `percentile_disc(x, f)` — the
+    /// interpolated / discrete `f`-th percentile of the group's finite numeric values
+    /// (the fraction `f` rides in `Agg::frac`). NULL over an empty group.
+    PercentileCont,
+    PercentileDisc,
 }
 
 /// One aggregate in an `Aggregate` operator: `func(arg)` (or `func(DISTINCT
@@ -240,6 +245,9 @@ pub struct Agg {
     pub arg: Option<Expr>,
     pub distinct: bool,
     pub name: String,
+    /// The fraction argument of `percentile_cont`/`percentile_disc` (a constant);
+    /// `None` for every other aggregate.
+    pub frac: Option<f64>,
 }
 
 /// One ORDER BY key: an expression, a direction, and where NULLs go. Null

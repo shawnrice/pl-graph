@@ -86,14 +86,6 @@ tests_a.jsonl::label_expr_not
 tests_a.jsonl::label_expr_or
 tests_a.jsonl::label_expr_wildcard
 tests_a.jsonl::order_by_letin_over_output_column
-tests_a.jsonl::percentile_even_1
-tests_a.jsonl::percentile_even_2
-tests_a.jsonl::percentile_even_3
-tests_a.jsonl::percentile_odd_1
-tests_a.jsonl::percentile_odd_2
-tests_a.jsonl::percentile_odd_3
-tests_a.jsonl::percentile_odd_4
-tests_a.jsonl::percentile_odd_5
 tests_a.jsonl::reachable_distinct_3
 tests_a.jsonl::three_valued_boolean_logic
 tests_a.jsonl::undirected_edge

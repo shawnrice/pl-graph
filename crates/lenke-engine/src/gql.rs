@@ -99,6 +99,8 @@ fn agg_fn(name: &str) -> Option<AggFn> {
         "COLLECT_LIST" | "COLLECT" => AggFn::CollectList,
         "STDDEV_POP" => AggFn::StddevPop,
         "STDDEV_SAMP" => AggFn::StddevSamp,
+        "PERCENTILE_CONT" => AggFn::PercentileCont,
+        "PERCENTILE_DISC" => AggFn::PercentileDisc,
         _ => return None,
     })
 }
@@ -1539,7 +1541,7 @@ impl Parser {
             }
             let idx = items.len();
             let item = if let Some(func) = self.peek_agg() {
-                let (agg_arg, distinct) = self.aggregate_call()?;
+                let (agg_arg, distinct, frac) = self.aggregate_call()?;
                 let name = if self.eat_kw("AS") {
                     self.ident()?
                 } else {
@@ -1550,6 +1552,7 @@ impl Parser {
                     arg: agg_arg,
                     distinct,
                     name,
+                    frac,
                 })
             } else {
                 let e = self.expr()?;
@@ -1580,17 +1583,27 @@ impl Parser {
 
     // aggregate_call := aggName '(' ( '*' | [DISTINCT] expr ) ')'
     // returns (arg, distinct); arg is None only for `count(*)`.
-    fn aggregate_call(&mut self) -> Result<(Option<Expr>, bool), String> {
+    fn aggregate_call(&mut self) -> Result<(Option<Expr>, bool, Option<f64>), String> {
         self.pos += 1; // the aggregate name (already validated by peek_agg)
         self.expect(&Tok::LParen)?;
         if self.eat(&Tok::Star) {
             self.expect(&Tok::RParen)?;
-            return Ok((None, false));
+            return Ok((None, false, None));
         }
         let distinct = self.eat_kw("DISTINCT");
         let arg = self.expr()?;
+        // A second argument is the ordered-set fraction of
+        // `percentile_cont(x, f)`/`percentile_disc(x, f)` — a constant in [0, 1].
+        let frac = if self.eat(&Tok::Comma) {
+            match self.expr()? {
+                Expr::Lit(Value::Num(f)) => Some(f),
+                _ => return Err("percentile fraction must be a numeric constant".into()),
+            }
+        } else {
+            None
+        };
         self.expect(&Tok::RParen)?;
-        Ok((Some(arg), distinct))
+        Ok((Some(arg), distinct, frac))
     }
 
     // Expression precedence: OR < AND < NOT < comparison < primary.
@@ -2669,8 +2682,7 @@ mod tests {
                 func: AggFn::Count,
                 arg: Some(Expr::Slot(1)),
                 distinct: false,
-                name: "n".into(),
-            }],
+                name: "n".into(), frac: None,}],
         )
         .filter(Expr::Compare {
             op: CompareOp::Ge,
@@ -4147,8 +4159,7 @@ mod tests {
                         key: "age".into(),
                     }),
                     distinct: false,
-                    name: "s".into(),
-                },
+                    name: "s".into(), frac: None,},
                 Agg {
                     func: AggFn::Avg,
                     arg: Some(Expr::Prop {
@@ -4156,8 +4167,7 @@ mod tests {
                         key: "age".into(),
                     }),
                     distinct: false,
-                    name: "a".into(),
-                },
+                    name: "a".into(), frac: None,},
             ],
         );
         assert_same(

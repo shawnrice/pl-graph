@@ -1967,7 +1967,52 @@ fn fold_grouped(agg: &Agg, arg_col: Option<&Col>, group_of: &[u32], n_groups: us
                 .map(|g| stddev_of(cnt[g], sum[g], sum_sq[g], sample))
                 .collect()
         }
+        AggFn::PercentileCont | AggFn::PercentileDisc => {
+            // Ordered-set: gather each group's finite numeric values, sort, and take
+            // the `frac`-th percentile (interpolated for cont, discrete for disc) —
+            // replicated from core's `percentile`. Empty group → NULL.
+            let cont = agg.func == AggFn::PercentileCont;
+            let frac = agg.frac.unwrap_or(0.0);
+            let mut per_group: Vec<Vec<f64>> = vec![Vec::new(); n_groups];
+            for (i, &g) in group_of.iter().enumerate() {
+                if let Some(x) = value::num_of(&col.value_at(i)) {
+                    if x.is_finite() {
+                        per_group[g as usize].push(x);
+                    }
+                }
+            }
+            per_group
+                .into_iter()
+                .map(|nums| percentile_of(nums, frac, cont))
+                .collect()
+        }
     }
+}
+
+/// The `frac`-th percentile of `nums` — interpolated (`cont`) or discrete (`disc`) —
+/// replicated exactly from core's `percentile`. Empty input → NULL.
+fn percentile_of(mut nums: Vec<f64>, frac: f64, cont: bool) -> Value {
+    if nums.is_empty() {
+        return Value::Null;
+    }
+    nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = nums.len();
+    let result = if cont {
+        let rn = frac * (n - 1) as f64;
+        let lo = rn.floor() as usize;
+        let hi = rn.ceil() as usize;
+        if lo == hi {
+            nums[lo]
+        } else {
+            nums[lo] + (rn - lo as f64) * (nums[hi] - nums[lo])
+        }
+    } else {
+        let idx = ((frac * n as f64).ceil() as usize)
+            .saturating_sub(1)
+            .min(n - 1);
+        nums[idx]
+    };
+    Value::Num(result)
 }
 
 /// Population / sample standard deviation from one-pass moments — replicated exactly
@@ -4596,6 +4641,7 @@ fn try_frontier_aggregate(
             arg: a.arg.as_ref().map(|e| remap_slot(e, last, 0)),
             distinct: a.distinct,
             name: a.name.clone(),
+            frac: a.frac,
         })
         .collect();
     Ok(Some(aggregate(&batch, store, &keys, &aggs)?))
@@ -8843,6 +8889,7 @@ mod tests {
             arg,
             distinct,
             name: name.to_string(),
+            frac: None,
         }
     }
 
