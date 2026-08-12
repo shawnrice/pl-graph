@@ -171,13 +171,52 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 - Next FEATURE work (unambiguous, the bulk): edge-label negation -[:!T]->, node-label expr in WHERE, SHORTEST k>=2, reverse-correlated subquery, FOR..IN, per-hop var-length WHERE, and THE BIG ONE ((..)){n,m} (~85, scout first).
 
 ### Round-5 progress (baseline 265)
+
 - label expression in a WHERE predicate x:A|B (commit e8c8f56f) — 280->279.
 - reverse-correlated COUNT/EXISTS subquery (commit 9f153740) — 279->273 (6). Forward landing-slot contract validated it.
 - Subpath-group `((..)){n,m}` INCREMENT 1 (single-edge, endpoint-only -> var_length desugar) (commit bd883674) — 273->265 (8). Parser hook: is_subpath_group_start / parse_subpath_group in gql.rs; unanchored `((` seeds Scan{None} in pattern().
 
 ### Subpath-group scout plan (real gap = 48 cases, staged):
+
 - INC 1 DONE (single-edge endpoint-only, 8 cases).
-- INC 2 (multi-hop body, endpoint-only ~5: mea_trail, qsp_multi_ends_1/2; mea_acyclic/simple DEFER — path mode on multi-hop): bounded-unroll `{n,m}` into r*k Expands UNION'd; RISK: unroll is a WALK, not Trail — only safe where no edge repeats in reach or `{n,n}` exact. Check each fixture.
-- INC 3 (group-var-as-list in RETURN, ~21: qsp_group_vars_*, gv_*, vqs_7/9/11/13/14/15/19/21/22/23, unanchored_path_len/nodes_size): NEEDS (a) new `Plan::RepeatGroup{body,min,max,mode,group_slots,...}` in ir.rs + a DFS repeater in exec that materializes one Value::List per group slot (columnar analogue of core bind_group_vars_flat pathfind.rs:163), AND (b) `Expr::Index{base,idx}` — subscript `x[i]` — parse postfix `[` in field_chain (gql.rs), eval next to Expr::Field. Expr::Index is a HARD PREREQ (y[size(y)-1], x[0].id). LARGE.
+- INC 2 (multi-hop body, endpoint-only ~5: mea_trail, qsp_multi_ends_1/2; mea_acyclic/simple DEFER — path mode on multi-hop): bounded-unroll `{n,m}` into r\*k Expands UNION'd; RISK: unroll is a WALK, not Trail — only safe where no edge repeats in reach or `{n,n}` exact. Check each fixture.
+- INC 3 (group-var-as-list in RETURN, ~21: qsp*group_vars*_, gv\__, vqs_7/9/11/13/14/15/19/21/22/23, unanchored_path_len/nodes_size): NEEDS (a) new `Plan::RepeatGroup{body,min,max,mode,group_slots,...}` in ir.rs + a DFS repeater in exec that materializes one Value::List per group slot (columnar analogue of core bind_group_vars_flat pathfind.rs:163), AND (b) `Expr::Index{base,idx}` — subscript `x[i]` — parse postfix `[` in field_chain (gql.rs), eval next to Expr::Field. Expr::Index is a HARD PREREQ (y[size(y)-1], x[0].id). LARGE.
 - INC 4 DEFER: nested `((..){a,b}){n,m}` list-of-lists (bind_unit recursion), per-rep WHERE with per-rep vars (e.amt<=x.bal — the per-hop-WHERE feature).
-Row order NOT a hazard (multiset compare; ordered:true cases carry ORDER BY).
+  Row order NOT a hazard (multiset compare; ordered:true cases carry ORDER BY).
+
+### ROUND 6 (loop cont.) — baseline 265 -> 202
+
+- **Expr::Index subscript `x[i]` — DONE** (commit c69d0b1c, 265->257, 8 cases). ISO 0-based
+  subscript over list literals, records, maps, AND `nodes(p)[i]`/`edges(p)[i]` path lists.
+  The path case emits a typed Col::Nodes/Col::Edges (u32::MAX sentinel for out-of-range) so a
+  following `.prop` resolves the node/edge property (`edges(p)[0].w`). Parser routes
+  list/record/map/call primaries through field_chain so a subscript can follow. This was
+  the INC3 part (a) prereq.
+- **Multi-label edges — DONE** (commit 32982b57, 257->202, 55 cases). Was the single biggest
+  cluster (all tests_f walked_frame/streamed_count/every_count). An edge's type is its FIRST
+  label; the rest are secondary. Store gains sparse `edge_extra: HashMap<eid,Vec<u32>>` +
+  `edge_has_label`/`has_multi_label_edges`, mirroring core's e_type/e_extra. One shared
+  `edge_carries_wanted` predicate feeds for_each_nbr, the var-length DFS/count/fold, the
+  shortest BFS, and the degree-product/3-hop count shortcuts. Type-index fast path skipped on
+  a multi-label graph. ndjson reads edge `"labels":[…]` (first=type, rest=extras); harness
+  passes the whole array through instead of first(). type(edge) still = first label.
+
+### Remaining 202 — reclassified next targets (tractable -> hard)
+
+- **`bare_path_*` / walked_frame_33 (~4): named path over a NON-shortest var-length**
+  (`MATCH p = (a)-[:R]->{1,3}(x) RETURN path_length(p)`). Engine rejects with "a named path
+  requires a shortest-path selector"; core accepts and binds the (walk) path. NEXT, tractable:
+  lift that parser restriction for a var-length body and materialize the lineage path. Verify
+  path mode = WALK matches core.
+- **per-hop WHERE in a subpath group `((x)-[e:R]->(y) WHERE pred){n,m}` (~10: qsp_per_hop_*,
+  vqs_8, subpath_where_*)** — where the WHERE only FILTERS and the RETURN needs no group-var
+  list (just t.id). Per-rep predicate over the rep's own x/e/y. MEDIUM.
+- **THE BIG ONE: group-variable-as-list `Plan::RepeatGroup` (~21: qsp_group_vars_*, gv_*,
+  vqs_7/9/11/…)** — each group var (x,e,y) binds to a Value::List across reps; `size(e)`,
+  `x[0].id`, `y[size(y)-1].id`, `WITH e AS hops`. Needs the new operator + DFS repeater
+  materializing one list per group slot (columnar analogue of core bind_group_vars_flat).
+  Expr::Index (done) was the prereq. LARGE — its own iteration.
+- Smaller: zero_limit_ (4), order_alias_ (4), distinct_nan_ (3), group_by_bound (3),
+  value_subquery_aggregate (3), num_string_overflow (3, likely value-contract), exists_multi_match (4).
+- VALUE-CONTRACT (surface, don't flip): num_string_overflow, sum/avg-over-temporal faults,
+  oversized-int, CAST-throws. Left baselined by design.
