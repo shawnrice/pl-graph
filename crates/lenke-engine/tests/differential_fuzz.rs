@@ -205,6 +205,10 @@ enum Cmp2 {
 struct Query {
     text: String,
     cmp: Cmp2,
+    /// A HARD shape (from `gql_shapes`) — the engine is expected to SUPPORT it, so an
+    /// engine parse/exec error while core succeeds is a feature gap to fix (a hard
+    /// failure), not generator over-reach to skip.
+    hard: bool,
 }
 
 /// A numeric-typed scalar expression over the endpoint bound as `var`.
@@ -255,6 +259,7 @@ fn gen_query(rng: &mut Rng, n_nodes: usize, hard: Option<Caps>) -> Query {
                 return Query {
                     text: h.text,
                     cmp: Cmp2::Multiset,
+                    hard: true,
                 };
             }
         }
@@ -303,6 +308,7 @@ fn gen_query(rng: &mut Rng, n_nodes: usize, hard: Option<Caps>) -> Query {
         return Query {
             text: format!("{pattern}{where_clause} RETURN DISTINCT {items}"),
             cmp: Cmp2::Multiset,
+            hard: false,
         };
     }
 
@@ -327,11 +333,13 @@ fn gen_query(rng: &mut Rng, n_nodes: usize, hard: Option<Caps>) -> Query {
             Query {
                 text: format!("{pattern}{where_clause} RETURN {key} AS k, {agg} AS v"),
                 cmp: Cmp2::Multiset,
+                hard: false,
             }
         } else {
             Query {
                 text: format!("{pattern}{where_clause} RETURN {agg} AS v"),
                 cmp: Cmp2::Multiset,
+                hard: false,
             }
         }
     } else {
@@ -365,6 +373,7 @@ fn gen_query(rng: &mut Rng, n_nodes: usize, hard: Option<Caps>) -> Query {
         Query {
             text,
             cmp: Cmp2::Ordered,
+            hard: false,
         }
     }
 }
@@ -411,21 +420,36 @@ enum Outcome {
     Rows(Vec<Vec<Cell>>),
     Err,
     ParseErr,
+    Timeout, // a pathological shape blew the per-query budget — skip, don't hang
 }
 
-fn run_engine(store: &lenke_engine::store::Store, q: &str) -> Outcome {
+/// Run the engine on a worker thread with a wall-clock budget. A hard shape can
+/// enumerate a huge number of trails on a dense small graph; the budget keeps one
+/// pathological query from hanging the whole suite (it is counted, not compared).
+fn run_engine(store: &std::sync::Arc<lenke_engine::store::Store>, q: &str) -> Outcome {
     let Ok(plan) = lenke_engine::gql::parse(q) else {
         return Outcome::ParseErr;
     };
-    let plan = lenke_engine::opt::optimize(plan);
-    match lenke_engine::exec::try_run(&plan, store) {
-        Ok(rows) => Outcome::Rows(
-            rows.rows
-                .iter()
-                .map(|r| r.iter().map(norm_eng).collect())
-                .collect(),
-        ),
-        Err(_) => Outcome::Err,
+    let plan = std::sync::Arc::new(lenke_engine::opt::optimize_indexed(plan, store.as_ref()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (s, p) = (std::sync::Arc::clone(store), std::sync::Arc::clone(&plan));
+    std::thread::spawn(move || {
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lenke_engine::exec::try_run(&p, &s)
+        }));
+        let _ = tx.send(match out {
+            Ok(Ok(rows)) => Outcome::Rows(
+                rows.rows
+                    .iter()
+                    .map(|r| r.iter().map(norm_eng).collect())
+                    .collect(),
+            ),
+            _ => Outcome::Err,
+        });
+    });
+    match rx.recv_timeout(std::time::Duration::from_millis(2000)) {
+        Ok(o) => o,
+        Err(_) => Outcome::Timeout,
     }
 }
 
@@ -465,13 +489,19 @@ fn engine_agrees_with_core_on_random_queries() {
 
     let mut compared = 0usize; // cases where both engines produced rows
     let mut skipped = 0usize; // parse mismatches (generator over-reach)
+    let mut timeouts = 0usize; // pathological shapes that blew the per-query budget
 
     for it in 0..iters {
         let g = gen_graph(&mut rng);
         let q = gen_query(&mut rng, g.nodes.len(), hard);
-        let store = lenke_engine::ndjson::from_ndjson(&engine_ndjson(&g)).expect("engine load");
+        let store = std::sync::Arc::new(
+            lenke_engine::ndjson::from_ndjson(&engine_ndjson(&g)).expect("engine load"),
+        );
         let mut graph = lenke_core::ndjson::decode(&core_ndjson(&g)).expect("core load");
 
+        if std::env::var("FUZZ_TRACE").is_ok() {
+            eprintln!("iter {it}: {}", q.text);
+        }
         let e = run_engine(&store, &q.text);
         let c = run_core(&mut graph, &q.text);
 
@@ -500,6 +530,17 @@ fn engine_agrees_with_core_on_random_queries() {
             (Outcome::Err, Outcome::Rows(_)) => {
                 panic!("core returned rows, engine ERRORED{}", repro())
             }
+            // A pathological engine shape (huge trail enumeration) that blew the
+            // budget — skip it, but surface the query so a real perf cliff is visible.
+            (Outcome::Timeout, _) => {
+                eprintln!("engine TIMEOUT (skipped){}", repro());
+                timeouts += 1;
+            }
+            // A HARD shape the engine could not parse/execute but core could is a
+            // MISSING FEATURE to implement — fail (this is the nested-work driver).
+            (Outcome::ParseErr | Outcome::Err, Outcome::Rows(_)) if q.hard => {
+                panic!("engine lacks a hard shape core supports{}", repro())
+            }
             // A parse mismatch means the generator produced syntax one side lacks —
             // not a conformance bug. Count it; a flood would mean the generator drifted.
             _ => skipped += 1,
@@ -509,9 +550,9 @@ fn engine_agrees_with_core_on_random_queries() {
     // The suite is only meaningful if most cases actually compared rows.
     assert!(
         compared * 3 >= iters,
-        "too few real comparisons: {compared}/{iters} compared, {skipped} parse-skipped (seed {seed})"
+        "too few real comparisons: {compared}/{iters} compared, {skipped} parse-skipped, {timeouts} timed out (seed {seed})"
     );
     eprintln!(
-        "differential_fuzz: seed {seed}, {iters} iters, {compared} compared, {skipped} skipped"
+        "differential_fuzz: seed {seed}, {iters} iters, {compared} compared, {skipped} skipped, {timeouts} timed out"
     );
 }

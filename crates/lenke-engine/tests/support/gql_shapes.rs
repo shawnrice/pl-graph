@@ -92,8 +92,8 @@ pub struct Hard {
     pub multiset: bool,
 }
 
-/// A small quantifier `{lo,hi}` with `hi <= 3` (keeps trail enumeration bounded on
-/// a small graph). Occasionally an exact `{n}` or the `+`/`*` shorthands.
+/// A small quantifier with `hi <= 3` — used by SINGLE-level families where a few
+/// hops on a small graph enumerate cheaply.
 fn quant(rng: &mut Rng) -> (String, u32, u32) {
     match rng.below(6) {
         0 => ("+".into(), 1, 3),
@@ -107,6 +107,19 @@ fn quant(rng: &mut Rng) -> (String, u32, u32) {
             let hi = lo + 1 + rng.below(2) as u32;
             (format!("{{{lo},{hi}}}"), lo, hi)
         }
+    }
+}
+
+/// A BOUNDED, progress-guaranteed quantifier for NESTED families: `1 <= lo <= hi <=
+/// 2` (or an exact `{1}`/`{2}`), never `*`/`+`. An unbounded outer over an inner that
+/// can match zero hops (`( … {0,n} )*`) is a degenerate no-progress loop that
+/// explodes BOTH engines — the corpus's nested cases are all small and bounded, so
+/// mirror that.
+fn quant_bounded(rng: &mut Rng) -> (String, u32, u32) {
+    match rng.below(3) {
+        0 => ("{1}".into(), 1, 1),
+        1 => ("{2}".into(), 2, 2),
+        _ => ("{1,2}".into(), 1, 2),
     }
 }
 
@@ -241,8 +254,8 @@ pub fn gen_hard(rng: &mut Rng, s: &Schema, caps: &Caps, src_id: usize) -> Option
         3 => {
             tags.push("nested");
             tags.push("nested-lol");
-            let (inner, _, _) = quant(rng);
-            let (outer, _, _) = quant(rng);
+            let (inner, _, _) = quant_bounded(rng);
+            let (outer, _, _) = quant_bounded(rng);
             let bind_edge = rng.chance(1, 2);
             let ev = if bind_edge { "e" } else { "" };
             let inner_where = if caps.per_rep && rng.chance(1, 4) {
@@ -280,7 +293,7 @@ pub fn gen_hard(rng: &mut Rng, s: &Schema, caps: &Caps, src_id: usize) -> Option
             tags.push("nested");
             tags.push("nested-varlen-inner");
             let (inner, _, _) = quant(rng);
-            let (outer, _, _) = quant(rng);
+            let (outer, _, _) = quant_bounded(rng);
             let bind_edge = rng.chance(1, 2);
             let ev = if bind_edge { "e" } else { "" };
             let group = format!("( (x)-[{ev}:{ety}]->{inner}(y) ){outer}", ety = s.etype,);
