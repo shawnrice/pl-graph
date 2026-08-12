@@ -5381,12 +5381,20 @@ fn nested_group(
     if sub.elems.iter().any(|el| matches!(el, GElem::Sub { .. })) {
         return empty(); // deeper than 2 levels — not supported yet
     }
-    // Inner flat unit: `ik` hops per inner rep; resolve each hop's wanted edge types.
+    // Inner flat unit: `ik` hops per inner rep; resolve each hop's wanted edge types
+    // and its optional per-hop edge predicate.
     let ik = sub.elems.len();
     let mut inner_want: Vec<Vec<u32>> = Vec::with_capacity(ik);
     let mut inner_dir: Vec<Dir> = Vec::with_capacity(ik);
+    let mut inner_epred: Vec<Option<&Expr>> = Vec::with_capacity(ik);
     for el in &sub.elems {
-        let GElem::Hop { dir, etypes, .. } = el else {
+        let GElem::Hop {
+            dir,
+            etypes,
+            edge_pred,
+            ..
+        } = el
+        else {
             return empty();
         };
         match want_etypes(store, etypes) {
@@ -5394,6 +5402,7 @@ fn nested_group(
             Err(()) => inner_want.push(vec![u32::MAX]), // unknown type: matches nothing
         }
         inner_dir.push(*dir);
+        inner_epred.push(edge_pred.as_deref());
     }
     let Col::Nodes(src) = batch.slot(from) else {
         return empty();
@@ -5411,6 +5420,7 @@ fn nested_group(
         ik: usize,
         inner_want: &'a [Vec<u32>],
         inner_dir: &'a [Dir],
+        inner_epred: &'a [Option<&'a Expr>],
         omin: u32,
         omax: u32,
         imin: u32,
@@ -5426,6 +5436,7 @@ fn nested_group(
         ik,
         inner_want: &inner_want,
         inner_dir: &inner_dir,
+        inner_epred: &inner_epred,
         omin: min,
         omax: max,
         imin: *imin,
@@ -5460,6 +5471,9 @@ fn nested_group(
             for a in adjs {
                 if !edge_carries_wanted(self.store, &a, want) {
                     continue;
+                }
+                if !edge_pred_ok(self.inner_epred[ie], self.store, a.eid) {
+                    continue; // per-hop edge WHERE / inline props
                 }
                 if self.trail && self.used_edges.contains(&a.eid) {
                     continue;

@@ -26,8 +26,6 @@ tests_c.jsonl::sum_distinct_mix_num_duration_faults
 tests_c.jsonl::sum_mix_num_duration_faults
 tests_c.jsonl::sum_mix_str_duration_faults
 tests_c.jsonl::temporal_duration_unordered_count_zero
-tests_d.jsonl::nested_per_hop_edge_1
-tests_d.jsonl::nested_per_hop_edge_2
 tests_d.jsonl::nested_per_rep_where_1
 tests_d.jsonl::nested_per_rep_where_2
 tests_d.jsonl::nested_per_rep_where_3

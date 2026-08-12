@@ -78,12 +78,14 @@ pub struct GUnit {
 #[derive(Clone, Debug)]
 pub enum GElem {
     /// A single graph hop. `edge_slot`/`target_slot` bind the edge / landing node as
-    /// group variables (at THIS unit's nesting depth).
+    /// group variables (at THIS unit's nesting depth). `edge_pred` is a PER-HOP edge
+    /// filter (`-[e WHERE …]->` / inline `{k:v}`) over the edge at mini-scope slot 0.
     Hop {
         dir: Dir,
         etypes: Vec<String>,
         edge_slot: Option<usize>,
         target_slot: Option<usize>,
+        edge_pred: Option<Box<Expr>>,
     },
     /// A nested quantified sub-group `( <unit> ){min,max}`. `target_slot` binds the
     /// sub-group's landing (its last inner hop's target, per outer rep).

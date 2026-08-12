@@ -2070,40 +2070,16 @@ impl Parser {
             // to the endpoint), so it lowers to `var_length`. The endpoint `(t)` that
             // follows is parsed and bound like any landing node.
             if self.is_subpath_group_start() {
-                // Route the two-level NESTED shapes to the general nested parser: a
-                // group inside a group (`( ((…` — a third open paren), or — caught
-                // below — a quantified inner hop with bound variables / a multi-rep
-                // endpoint-only nested group that the flat parser can't express.
-                let save = self.pos;
-                let body_is_group = matches!(self.toks.get(self.pos + 2), Some(Tok::LParen));
-                let attempt = if body_is_group {
-                    Err("__nested__".to_string())
-                } else {
-                    self.parse_subpath_group()
-                };
-                let g = match attempt {
-                    Ok(g) if g.inner_quant.is_some() && (g.min != 1 || g.max != 1) => {
-                        // A multi-repetition endpoint-only nested group.
-                        self.pos = save;
-                        let (p, nf) = self.parse_nested_group(plan, scope, slots, from)?;
-                        plan = p;
-                        from = nf;
-                        continue;
-                    }
-                    Ok(g) => g,
-                    Err(e)
-                        if e == "__nested__"
-                            || e.contains("bound inner edge")
-                            || e.contains("bound inner variables") =>
-                    {
-                        self.pos = save;
-                        let (p, nf) = self.parse_nested_group(plan, scope, slots, from)?;
-                        plan = p;
-                        from = nf;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
+                // A NESTED subpath group (an inner quantifier inside the outer group)
+                // routes to the general nested parser producing a `Plan::NestedGroup`;
+                // a flat single-level group stays on `parse_subpath_group`.
+                if self.subpath_group_is_nested() {
+                    let (p, nf) = self.parse_nested_group(plan, scope, slots, from)?;
+                    plan = p;
+                    from = nf;
+                    continue;
+                }
+                let g = self.parse_subpath_group()?;
                 let k = g.k;
                 // The endpoint `(t)` is OPTIONAL — `((x)-[e]->(y)){2}` (anonymous
                 // landing) is valid when only the group variables are used.
@@ -2390,6 +2366,45 @@ impl Parser {
             && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
     }
 
+    /// At a subpath-group start (`self.pos` on the outer `(`), is the group NESTED —
+    /// i.e. does an INNER quantifier (`{n…}` / `*` / `+`) appear inside it, before the
+    /// outer `)`? A `{` counts only when followed by a digit (a quantifier, not a
+    /// node/edge property map) and outside `[...]` edge brackets. Nested groups route
+    /// to `parse_nested_group`; flat groups stay on `parse_subpath_group`.
+    fn subpath_group_is_nested(&self) -> bool {
+        let mut pdepth = 0i32;
+        let mut bdepth = 0i32;
+        let mut i = self.pos;
+        let mut started = false;
+        while let Some(t) = self.toks.get(i) {
+            match t {
+                Tok::LParen => {
+                    pdepth += 1;
+                    started = true;
+                }
+                Tok::RParen => {
+                    pdepth -= 1;
+                    if started && pdepth == 0 {
+                        return false; // outer group closed with no inner quantifier
+                    }
+                }
+                Tok::LBracket => bdepth += 1,
+                Tok::RBracket => bdepth -= 1,
+                Tok::Star | Tok::Plus if pdepth >= 1 && bdepth == 0 => return true,
+                Tok::LBrace
+                    if pdepth >= 1
+                        && bdepth == 0
+                        && matches!(self.toks.get(i + 1), Some(Tok::Num(_))) =>
+                {
+                    return true
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// At a subpath-group start (`self.pos` on the group's outer `(`), does a
     /// quantifier (`{n,m}` / `*` / `+`) follow the group's matching `)`? A quantified
     /// group is a repeated hop (lowers to var_length); an unquantified one is just a
@@ -2597,6 +2612,47 @@ impl Parser {
     /// Builds a `Plan::NestedGroup` over a `GUnit` and binds each named inner variable
     /// as a group list at its nesting depth. Returns the extended plan and the new
     /// `from` (the endpoint slot). `self.pos` is on the outer `(`.
+    /// Build a nested inner hop's PER-HOP edge predicate from its inline props
+    /// (`{k:v}` → `e.k = v`) and inline `WHERE` — both over the edge at mini-scope
+    /// slot 0 (the shape `edge_pred_ok` evaluates). `None` when the hop is unfiltered.
+    fn edge_pred_from_rel(&mut self, rel: &Rel) -> Result<Option<Expr>, String> {
+        let and = |p: Option<Expr>, c: Expr| {
+            Some(match p {
+                None => c,
+                Some(prev) => Expr::And(Box::new(prev), Box::new(c)),
+            })
+        };
+        let mut pred: Option<Expr> = None;
+        for (k, val) in &rel.props {
+            pred = and(
+                pred,
+                Expr::Compare {
+                    op: CompareOp::Eq,
+                    left: Box::new(Expr::Prop {
+                        slot: 0,
+                        key: k.clone(),
+                    }),
+                    right: Box::new(Expr::Lit(val.clone())),
+                },
+            );
+        }
+        if let Some(r) = rel.where_range {
+            let saved = std::mem::take(&mut self.scope);
+            let saved_slots = self.slots;
+            let mut mini: HashMap<String, usize> = HashMap::new();
+            if let Some(ev) = &rel.var {
+                mini.insert(ev.clone(), 0);
+            }
+            self.scope = mini;
+            self.slots = 1;
+            let w = self.parse_captured_where(r)?;
+            self.scope = saved;
+            self.slots = saved_slots;
+            pred = and(pred, w);
+        }
+        Ok(pred)
+    }
+
     fn parse_nested_group(
         &mut self,
         plan: Plan,
@@ -2614,19 +2670,19 @@ impl Parser {
             && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen));
 
         // Parse the (single-hop) inner unit and the two quantifiers.
-        let (xvar, evar, dir, etypes, yvar, imin, imax, omin, omax) = if family3 {
+        let (xvar, evar, dir, etypes, edge_pred, yvar, imin, imax, omin, omax) = if family3 {
             self.expect(&Tok::LParen)?; // inner group `(`
             let x = self.node()?;
             let rel = self.rel()?;
             let y = self.node()?;
-            if bad_inner(&x) || bad_inner(&y) || !rel.props.is_empty() || rel.where_range.is_some()
-            {
+            if bad_inner(&x) || bad_inner(&y) {
                 return Err(
-                    "labels/properties/WHERE inside a nested subpath group are not \
+                    "a label/property/WHERE on a nested subpath-group inner node is not \
                             supported yet"
                         .into(),
                 );
             }
+            let epred = self.edge_pred_from_rel(&rel)?;
             self.expect(&Tok::RParen)?; // inner group `)`
             let (imin, imax) = self
                 .opt_quantifier()?
@@ -2636,7 +2692,7 @@ impl Parser {
                 .opt_quantifier()?
                 .ok_or("a nested subpath group needs an outer quantifier")?;
             (
-                x.0, rel.var, rel.dir, rel.etypes, y.0, imin, imax, omin, omax,
+                x.0, rel.var, rel.dir, rel.etypes, epred, y.0, imin, imax, omin, omax,
             )
         } else {
             let x = self.node()?;
@@ -2645,20 +2701,20 @@ impl Parser {
                 .opt_quantifier()?
                 .ok_or("expected an inner `{lo,hi}` quantifier in a nested subpath group")?;
             let y = self.node()?;
-            if bad_inner(&x) || bad_inner(&y) || !rel.props.is_empty() || rel.where_range.is_some()
-            {
+            if bad_inner(&x) || bad_inner(&y) {
                 return Err(
-                    "labels/properties/WHERE inside a nested subpath group are not \
+                    "a label/property/WHERE on a nested subpath-group inner node is not \
                             supported yet"
                         .into(),
                 );
             }
+            let epred = self.edge_pred_from_rel(&rel)?;
             self.expect(&Tok::RParen)?; // outer group `)`
             let (omin, omax) = self
                 .opt_quantifier()?
                 .ok_or("a nested subpath group needs an outer quantifier")?;
             (
-                x.0, rel.var, rel.dir, rel.etypes, y.0, imin, imax, omin, omax,
+                x.0, rel.var, rel.dir, rel.etypes, epred, y.0, imin, imax, omin, omax,
             )
         };
 
@@ -2713,6 +2769,7 @@ impl Parser {
             etypes: etypes.clone(),
             edge_slot: eslot,
             target_slot: if family3 { yslot } else { None },
+            edge_pred: edge_pred.map(Box::new),
         };
         let (outer_start, sub_target) = if family3 {
             (None, None)
