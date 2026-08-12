@@ -2895,18 +2895,13 @@ impl Parser {
                     .scope
                     .get(&s)
                     .ok_or_else(|| format!("unknown variable `{s}`"))?;
-                // `x:Label` — a boolean label predicate in expression position (e.g.
-                // `WHERE x:Person`). Desugar to `'Label' IN labels(x)`, reusing the
-                // existing `IN` + `labels()` (NULL/absence handling falls out of `IN`).
+                // `x:LabelExpr` — a boolean label predicate in expression position
+                // (`WHERE x:Person`, `WHERE x:Person|Software`, `x:A&B`, `x:!A`).
+                // Lowered via the shared label-expression lowering to a predicate
+                // over `labels(x)` (a single label is `'Label' IN labels(x)`).
                 if self.eat(&Tok::Colon) {
-                    let label = self.ident()?;
-                    return Ok(Expr::In {
-                        needle: Box::new(Expr::Lit(Value::Str(label.into()))),
-                        haystack: Box::new(Expr::Call {
-                            name: "labels".into(),
-                            args: vec![Expr::Slot(slot)],
-                        }),
-                    });
+                    let le = self.parse_label_expr()?;
+                    return Ok(lower_label_expr(&le, slot));
                 }
                 if self.eat(&Tok::Dot) {
                     // The FIRST `.key` stays a `Prop` (the shape the optimizer
@@ -6633,6 +6628,29 @@ mod tests {
         assert_eq!(n("MATCH (t:T) RETURN count(*) * 2 - 1 AS c"), 5.0);
         // A bare aggregate is unaffected.
         assert_eq!(n("MATCH (t:T) RETURN count(*) AS c"), 3.0);
+    }
+
+    /// A label EXPRESSION in a WHERE predicate (`x:A|B`, `x:A&B`, `x:!A`) lowers via
+    /// the shared label-expression lowering, like the pattern-position label algebra.
+    #[test]
+    fn label_expr_in_predicate() {
+        let nd = concat!(
+            "{\"id\":\"pa\",\"labels\":[\"Person\",\"Admin\"],\"props\":{}}\n",
+            "{\"id\":\"p\",\"labels\":[\"Person\"],\"props\":{}}\n",
+            "{\"id\":\"s\",\"labels\":[\"Software\"],\"props\":{}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let n = |q: &str| -> f64 {
+            match run(&super::parse(q).unwrap(), &store).rows[0][0] {
+                Value::Num(x) => x,
+                ref o => panic!("want num, got {o:?}"),
+            }
+        };
+        assert_eq!(n("MATCH (x) WHERE x:Person|Software RETURN count(*) AS c"), 3.0);
+        assert_eq!(n("MATCH (x) WHERE x:Person&Admin RETURN count(*) AS c"), 1.0);
+        assert_eq!(n("MATCH (x) WHERE x:!Software RETURN count(*) AS c"), 2.0);
+        // A single label is unchanged.
+        assert_eq!(n("MATCH (x) WHERE x:Person RETURN count(*) AS c"), 2.0);
     }
 
     // --- part 3.8: string functions (E4a) ---
