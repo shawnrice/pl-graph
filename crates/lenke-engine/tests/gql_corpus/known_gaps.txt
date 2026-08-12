@@ -64,7 +64,6 @@ tests_c.jsonl::sum_distinct_mix_num_duration_faults
 tests_c.jsonl::sum_mix_num_duration_faults
 tests_c.jsonl::sum_mix_str_duration_faults
 tests_c.jsonl::temporal_duration_unordered_count_zero
-tests_c.jsonl::temporal_timestamp_ge
 tests_d.jsonl::bare_all_binds_paths
 tests_d.jsonl::bare_all_composes_mode
 tests_d.jsonl::bare_all_fixed_pattern

@@ -3312,7 +3312,8 @@ fn temporal_tag(kw: &str) -> Option<&'static str> {
     Some(match kw.to_ascii_uppercase().as_str() {
         "DATE" => "date",
         "TIME" => "localtime",
-        "DATETIME" => "datetime",
+        // `TIMESTAMP` is core's alias for a (local) DATETIME literal.
+        "DATETIME" | "TIMESTAMP" => "datetime",
         "DURATION" => "duration",
         _ => return None,
     })
@@ -6449,6 +6450,22 @@ mod tests {
         .map(|r| format!("{:?},{:?}", r[0], r[1]))
         .collect();
         assert_eq!(rows, vec!["Str(\"a\"),Num(2.0)", "Str(\"z\"),Num(1.0)"]);
+    }
+
+    /// `TIMESTAMP '…'` is core's alias for a (local) DATETIME literal.
+    #[test]
+    fn timestamp_is_datetime_alias() {
+        let store = social();
+        let val = |q: &str| format!("{:?}", run(&super::parse(q).unwrap(), &store).rows[0][0]);
+        // TIMESTAMP parses and compares equal to the same DATETIME literal.
+        assert_eq!(
+            val("RETURN TIMESTAMP '2021-06-15T08:30:00' = DATETIME '2021-06-15T08:30:00' AS x"),
+            "Bool(true)"
+        );
+        assert_eq!(
+            val("RETURN TIMESTAMP '2021-06-15T08:30:00.5' >= DATETIME '2021-06-15T08:30:00' AS x"),
+            "Bool(true)"
+        );
     }
 
     // --- part 3.8: string functions (E4a) ---
