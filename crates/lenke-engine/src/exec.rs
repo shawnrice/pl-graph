@@ -5043,9 +5043,12 @@ fn var_length(
         }
         Batch::of(slots)
     };
+    // An unknown edge type matches NO edge, but a `*`/`{0,…}` still emits each source
+    // at zero reps (endpoint = source, group lists empty). A never-matching set (NOT
+    // the empty "any" set) lets the DFS traverse nothing yet still emit those.
     let want = match want_etypes(store, edge_label) {
         Ok(w) => w,
-        Err(()) => return empty(),
+        Err(()) => vec![u32::MAX],
     };
     let Col::Nodes(src) = batch.slot(from) else {
         return empty();
@@ -5378,7 +5381,11 @@ fn shortest_path(
     };
     let want = match want_etypes(store, edge_label) {
         Ok(w) => w,
-        Err(()) => return empty(),
+        // An unknown edge type matches NO edge — but the zero-length path traverses
+        // none, so a `*` (min == 0) still emits each source at length 0. Fall through
+        // with a never-matching set (NOT the empty "any" set) so the BFS traverses
+        // nothing yet the emit loop still yields the length-0 sources.
+        Err(()) => vec![u32::MAX],
     };
     // `SHORTEST k` (k >= 2) needs paths BEYOND the single shortest length, so it
     // can't ride the BFS below — enumerate trails and select per endpoint instead.
@@ -5415,6 +5422,11 @@ fn shortest_path(
         let mut order: Vec<u32> = vec![start];
         let mut q: VecDeque<u32> = VecDeque::new();
         q.push_back(start);
+        // Edges that CLOSE a cycle back to `start` as `(len, tail, eid)` where `len =
+        // dist[tail] + 1`. A `+`-style (min >= 1) quantifier treats the source as a
+        // valid endpoint at the shortest such length (a cycle) — standard BFS never
+        // re-reaches `start`, so collect the closing edges here.
+        let mut cycle_edges: Vec<(u32, u32, u32)> = Vec::new();
         while let Some(v) = q.pop_front() {
             let dv = dist[&v];
             if max.is_some_and(|m| dv >= m) {
@@ -5431,6 +5443,9 @@ fn shortest_path(
                 if !edge_carries_wanted(store, &a, &want) || !edge_pred_ok(edge_pred, store, a.eid)
                 {
                     continue;
+                }
+                if min >= 1 && a.nbr == start {
+                    cycle_edges.push((dv + 1, v, a.eid));
                 }
                 match dist.get(&a.nbr).copied() {
                     None => {
@@ -5515,6 +5530,71 @@ fn shortest_path(
                         for _ in 0..pcount.get(&node).copied().unwrap_or(0) {
                             keep.push(row);
                             ends.push(node);
+                        }
+                    }
+                }
+            }
+        }
+
+        // A `+`-style (min >= 1) quantifier admits the SOURCE as an endpoint at the
+        // shortest CYCLE length back to it — the length-0 self-path is excluded, so
+        // `start` re-reached via a non-trivial path is its shortest match. The global
+        // shortest cycle = min over closing edges `tail -> start` of `dist[tail] + 1`.
+        if min >= 1 {
+            if let Some(cyc) = cycle_edges.iter().map(|&(d, _, _)| d).min() {
+                if cyc >= min && max.is_none_or(|m| cyc <= m) {
+                    match selector {
+                        ShortestSelector::ShortestK { .. } => unreachable!("ShortestK routed away"),
+                        ShortestSelector::Any => {
+                            keep.push(row);
+                            ends.push(start);
+                            if track {
+                                let &(_, tail, eid) =
+                                    cycle_edges.iter().find(|&&(d, _, _)| d == cyc).unwrap();
+                                let (mut chain, mut echain) = first_pred_chain(tail, start, &preds);
+                                chain.push(start);
+                                echain.push(eid);
+                                push_path(
+                                    batch,
+                                    row,
+                                    &chain,
+                                    &echain,
+                                    &mut path_values,
+                                    &mut path_offsets,
+                                    &mut path_edges,
+                                    &mut path_edge_offsets,
+                                );
+                            }
+                        }
+                        ShortestSelector::All => {
+                            for &(_, tail, eid) in cycle_edges.iter().filter(|&&(d, _, _)| d == cyc)
+                            {
+                                if track {
+                                    for (mut chain, mut echain) in
+                                        enumerate_shortest_paths(tail, start, &preds)
+                                    {
+                                        chain.push(start);
+                                        echain.push(eid);
+                                        keep.push(row);
+                                        ends.push(start);
+                                        push_path(
+                                            batch,
+                                            row,
+                                            &chain,
+                                            &echain,
+                                            &mut path_values,
+                                            &mut path_offsets,
+                                            &mut path_edges,
+                                            &mut path_edge_offsets,
+                                        );
+                                    }
+                                } else {
+                                    for _ in 0..pcount.get(&tail).copied().unwrap_or(1) {
+                                        keep.push(row);
+                                        ends.push(start);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -12647,7 +12727,9 @@ mod tests {
         assert_eq!(got, vec!["b", "c"]); // d (distance 3) beyond the cap
     }
 
-    /// A cycle does not loop forever — each node is reached once.
+    /// A cycle does not loop forever — each node is reached once. With a `+`
+    /// (min 1) quantifier the source IS a valid endpoint at the shortest CYCLE
+    /// length back to it (a->b->c->a is length 3), matching core.
     #[test]
     fn shortest_path_terminates_on_a_cycle() {
         let mut b = Builder::default();
@@ -12673,8 +12755,8 @@ mod tests {
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);
         got.sort();
-        // b(1), c(2); a is the source, not re-emitted despite the cycle back.
-        assert_eq!(got, vec!["b", "c"]);
+        // b(1), c(2), and a(3) — the source closes the shortest cycle back to itself.
+        assert_eq!(got, vec!["a", "b", "c"]);
     }
 
     // --- Lineage (path) ---

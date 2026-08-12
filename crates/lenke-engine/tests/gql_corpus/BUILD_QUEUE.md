@@ -532,7 +532,7 @@ verifiable beyond the 14 corpus cases.
   BOTH a correlated inline-prop EXPRESSION (props() only takes literals today) AND a left-outer correlated
   node scan (no such plan node). Two new capabilities.
 - VALUE-CONTRACT (~30, leave baselined by principle): num_string_overflow, distinct_nan, sum/avg-over-temporal
-  + mixed, CAST-throws (bool/list/int_null), range caps, m_reserved_word, inline_constraint, hardening (bool*num
-  / str+num / oversized-int / overflow-exponent), date_part strict, faulting_aggregate, call_config_*_error,
-  zero_bound_3 (core treats {0,0} as {0,1} — engine's 4 is ISO-correct), temporal_duration (core lacks
-  duration ordering — engine's compare is correct).
+  - mixed, CAST-throws (bool/list/int*null), range caps, m_reserved_word, inline_constraint, hardening (bool\*num
+    / str+num / oversized-int / overflow-exponent), date_part strict, faulting_aggregate, call_config*\*\_error,
+    zero_bound_3 (core treats {0,0} as {0,1} — engine's 4 is ISO-correct), temporal_duration (core lacks
+    duration ordering — engine's compare is correct).

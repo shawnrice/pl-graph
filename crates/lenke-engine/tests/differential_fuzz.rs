@@ -28,28 +28,21 @@ use lenke_core::gql::eval::Params as CoreParams;
 use lenke_core::graph::Value as CoreVal;
 use lenke_engine::value::Value as EngVal;
 
-// ── PRNG (xorshift64*, seeded, reproducible) ─────────────────────────────────
+// The shared hard-shape generator (quantified/group/nested/shortest patterns),
+// reused by the perf fuzzer too. Its `Rng` is the same xorshift64* this file used.
+#[path = "support/gql_shapes.rs"]
+mod gql_shapes;
+use gql_shapes::{Caps, Rng, Schema};
 
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-    fn chance(&mut self, num: u32, den: u32) -> bool {
-        (self.next() % u64::from(den)) < u64::from(num)
-    }
-    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
-        &xs[self.below(xs.len())]
-    }
-}
+/// This fixture's GQL vocabulary for the shared generator: label `N`, edge type `R`,
+/// numeric prop `a`, unique id `id`, numeric edge prop `w`.
+const SCHEMA: Schema = Schema {
+    label: "N",
+    etype: "R",
+    num: "a",
+    id: "id",
+    ew: "w",
+};
 
 // ── the random graph ─────────────────────────────────────────────────────────
 
@@ -163,13 +156,20 @@ fn engine_ndjson(g: &Graph) -> String {
         ));
         s.push('\n');
     }
-    for (f, t) in &g.edges {
+    for (i, (f, t)) in g.edges.iter().enumerate() {
         s.push_str(&format!(
-            r#"{{"from":{f},"to":{t},"type":"R","props":{{}}}}"#
+            r#"{{"from":{f},"to":{t},"type":"R","props":{{"w":{}}}}}"#,
+            edge_w(i)
         ));
         s.push('\n');
     }
     s
+}
+
+/// A deterministic numeric edge property, identical in both dialects (for per-hop /
+/// per-rep edge predicates on `e.w`).
+fn edge_w(i: usize) -> u32 {
+    (i.wrapping_mul(37) % 100) as u32
 }
 
 fn core_ndjson(g: &Graph) -> String {
@@ -184,7 +184,8 @@ fn core_ndjson(g: &Graph) -> String {
     }
     for (i, (f, t)) in g.edges.iter().enumerate() {
         s.push_str(&format!(
-            r#"{{"type":"edge","id":"e{i}","labels":["R"],"from":"{f}","to":"{t}","properties":{{}}}}"#
+            r#"{{"type":"edge","id":"e{i}","labels":["R"],"from":"{f}","to":"{t}","properties":{{"w":{}}}}}"#,
+            edge_w(i)
         ));
         s.push('\n');
     }
@@ -242,7 +243,22 @@ fn predicate(rng: &mut Rng, var: &str, depth: u32) -> String {
     }
 }
 
-fn gen_query(rng: &mut Rng) -> Query {
+fn gen_query(rng: &mut Rng, n_nodes: usize, hard: Option<Caps>) -> Query {
+    // A HARD shape (quantified/group/nested/shortest pattern) about half the time
+    // when enabled: anchored at a random real node id, reducing every path/group
+    // binding to scalars, compared as a multiset. This is the byte-identity net for
+    // the constructs the flat grammar below never reaches.
+    if let Some(caps) = hard {
+        if rng.chance(1, 2) {
+            let src = rng.below(n_nodes);
+            if let Some(h) = gql_shapes::gen_hard(rng, &SCHEMA, &caps, src) {
+                return Query {
+                    text: h.text,
+                    cmp: Cmp2::Multiset,
+                };
+            }
+        }
+    }
     // Pattern: node-only, or a 1-hop that binds the endpoint `m`. The hop is spelled
     // typed OR untyped (bracketed `-[]->` / `-[e]->`) — all equivalent since there is
     // one edge type, so it exercises the untyped-relationship parse against core.
@@ -439,12 +455,20 @@ fn engine_agrees_with_core_on_random_queries() {
         .unwrap_or(400);
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
 
+    // Hard-shape coverage: FUZZ_HARD=off | supported (default) | all (adds nested).
+    // `supported` keeps CI green; `all` drives/verifies the nested implementation.
+    let hard = match std::env::var("FUZZ_HARD").as_deref() {
+        Ok("off") => None,
+        Ok("all") => Some(Caps::all()),
+        _ => Some(Caps::supported()),
+    };
+
     let mut compared = 0usize; // cases where both engines produced rows
     let mut skipped = 0usize; // parse mismatches (generator over-reach)
 
     for it in 0..iters {
         let g = gen_graph(&mut rng);
-        let q = gen_query(&mut rng);
+        let q = gen_query(&mut rng, g.nodes.len(), hard);
         let store = lenke_engine::ndjson::from_ndjson(&engine_ndjson(&g)).expect("engine load");
         let mut graph = lenke_core::ndjson::decode(&core_ndjson(&g)).expect("core load");
 
