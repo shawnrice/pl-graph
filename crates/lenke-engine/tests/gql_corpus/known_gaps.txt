@@ -10,7 +10,6 @@ hardening.jsonl::h_valid_numeric_literals_accepted_6
 hardening.jsonl::h_valid_numeric_literals_accepted_8
 hardening.jsonl::h_valid_numeric_literals_accepted_9
 language.jsonl::m_block_comment
-language.jsonl::m_colon_label_predicate_desugars_to_is_labeled_1
 language.jsonl::m_colon_label_predicate_desugars_to_is_labeled_2
 language.jsonl::m_edge_label_disjunction
 language.jsonl::m_edge_label_negation
@@ -373,7 +372,6 @@ tests_f.jsonl::comma_join_4
 tests_f.jsonl::contains_window
 tests_f.jsonl::count_shortcuts_labels_1
 tests_f.jsonl::count_shortcuts_labels_3
-tests_f.jsonl::counting_edges_where_12
 tests_f.jsonl::counting_edges_where_13
 tests_f.jsonl::counting_edges_where_14
 tests_f.jsonl::counting_edges_where_6

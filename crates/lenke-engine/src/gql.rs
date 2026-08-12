@@ -1916,6 +1916,19 @@ impl Parser {
                     .scope
                     .get(&s)
                     .ok_or_else(|| format!("unknown variable `{s}`"))?;
+                // `x:Label` — a boolean label predicate in expression position (e.g.
+                // `WHERE x:Person`). Desugar to `'Label' IN labels(x)`, reusing the
+                // existing `IN` + `labels()` (NULL/absence handling falls out of `IN`).
+                if self.eat(&Tok::Colon) {
+                    let label = self.ident()?;
+                    return Ok(Expr::In {
+                        needle: Box::new(Expr::Lit(Value::Str(label.into()))),
+                        haystack: Box::new(Expr::Call {
+                            name: "labels".into(),
+                            args: vec![Expr::Slot(slot)],
+                        }),
+                    });
+                }
                 if self.eat(&Tok::Dot) {
                     // The FIRST `.key` stays a `Prop` (the shape the optimizer
                     // seeks on); any further `.key` are record-field accesses on
