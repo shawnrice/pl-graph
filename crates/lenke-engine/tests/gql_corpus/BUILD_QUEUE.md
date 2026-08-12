@@ -276,3 +276,34 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 - Smaller: shortest\_ / shortest_per_hop (SHORTEST k>=2), value_subquery_aggregate (3), multiseg_u (6),
   distinct_nan (string->NaN, murky/value-contract), num_string_overflow (value-contract, leave).
 - group_by_bound_1 done; order_by_letin_over_output_column = LET-IN-END _expression_ in ORDER BY (separate).
+
+### ROUND 6 (cont.) — 169 -> 165 (session total 265 -> 165, 100 cases)
+
+- **PROPERTY_EXISTS on edges + null element — DONE** (commit 83104a79, 169->167). Handles a node
+  OR edge slot; a non-element (u32::MAX sentinel or computed value) -> NULL (matches core).
+- **FILTER clause + repeated statement-level ORDER BY/LIMIT — DONE** (commit 01b8a9fb, 167->165).
+  ISO FILTER statement in the query-tail loop; the standalone order/page clause now loops (page then re-page).
+
+### NEXT (baseline 165) — remaining is dominated by a few LARGE features:
+
+- **THE BIG LEVER: group-variable-as-list `RepeatGroup`** (~21: vqs_ 12, qsp_group_vars 4, gv_*).
+  DESIGN CONFIRMED: core binds each group var to a LIST across reps (pathfind.rs bind_group_vars_flat:
+  for a k=1 single-hop group, source var x = [verts[rep] for rep], edge e = [edges[rep]], target y =
+  [verts[rep+1]]). The engine's var_length lineage (node_stack/edge_stack per emitted path, already
+  built) captures exactly this — so materialize x/e/y list columns AT EMIT from the stacks. Cleanest as
+  an extension to var_length (append list columns for the named group vars after the endpoint) OR a
+  follow-on operator reading the group segment. Scope to SINGLE-HOP groups first; multi-hop (gv_bind_each_rep_2hop)
+  and nested (nested_paren_varying, list-of-lists) defer. Its own iteration.
+- **per-hop edge WHERE `-[e:R WHERE pred]->` in var-length AND shortest** (qsp_per_hop 3, per_hop_inline 2,
+  shortest_per_hop 3, nested_per_hop 2) — thread a captured predicate into the varlen_dfs / shortest BFS
+  adjacency step, evaluating with the hop's edge (and endpoints) bound. Recurring; unblocks ~10.
+- **SHORTEST k (k>=2)** (shortest_2_keeps_two, _group_all, _groups_synonym, shortest_k_clamps = 4;
+  shortest_k_per_hop_pred also needs per-hop WHERE). ALGORITHM CONFIRMED (core shortest_k_walk): enumerate
+  ALL trails per endpoint, sort by (length, discovery), keep first k (plain) or all paths in the k smallest
+  distinct lengths (GROUP/GROUPS). Needs trail enumeration (var_length DFS) + per-endpoint selection + lineage.
+- **VALUE scalar subquery / uncorrelated multi-pattern EXISTS** (value_subquery_* 5, exists_multi_match 4) —
+  VALUE { … RETURN count(*) } maps to CountSubquery for the correlated count case; general VALUE + uncorrelated
+  EXISTS need pull_body to run a Scan/cross-join body or a constant-subquery eval.
+- **multiseg_u (6)** — dual-anchor correlated multi-segment EXISTS (ReBAC). HARD.
+- VALUE-CONTRACT (leave/surface): range_bounded_2/3 (core caps range size — check if safe error-parity or
+  value-contract), num_string_overflow, distinct_nan (string->NaN), sum/avg-over-temporal, CAST-throws.
