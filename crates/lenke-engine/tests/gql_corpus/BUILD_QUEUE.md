@@ -377,3 +377,29 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 - **multiseg_u (6)** dual-anchor correlated multi-segment EXISTS (ReBAC). HARD.
 - VALUE-CONTRACT (leave/surface): range_bounded_2/3, num_string_overflow, distinct_nan, sum/avg-over-temporal,
   CAST-throws, m_reserved_word (reserved-word-as-identifier = intentional).
+
+### ROUND 6 (cont.) — 140 -> 138 (session total 265 -> 138, 127 cases)
+
+- **inline edge props on a var-length hop — DONE** (commit f227f2a5, 140->138). `-[:R {k:v}]->{n,m}`
+  desugars to a RepeatGroup with per_rep_pred = AND(edge.k==v) (edge at scalar slot 1), no group binds.
+
+### REMAINING 138 landscape (baseline 138):
+
+- **~25 value-contract "core rejects but engine accepts"** — LEAVE baselined (f64 model, CAST-throws,
+  range_bounded core-caps, num_string_overflow, distinct_nan string->NaN, m_reserved_word, is_typed_closed,
+  inline_constraint, h_rejects_literal, graph_pred_all). These are the intentional divergences; do NOT flip.
+- **subquery cluster (~13): VALUE scalar subquery + uncorrelated/multi-pattern EXISTS** (value_subquery_*,
+  exists_multi_match, exists_bound_a). VALUE{…RETURN count(*)} correlated ~ CountSubquery (2 easy). General
+  VALUE (scalar b.name) + uncorrelated EXISTS { MATCH .. MATCH .. } need pull_body to run a Scan/cross-join
+  body or a constant-subquery eval (pull_body currently: Row/Expand/VarLength/Filter/Project only). MEDIUM.
+- **shortest_per_hop (3): per-hop edge WHERE in a shortest path** `-[e:R WHERE e.w>5]->*` — thread an edge
+  predicate into shortest_path BFS + shortest_k collect_trails (reuse the per-rep eval-per-edge mechanism). MEDIUM.
+- **nested groups (~13): nested_per_rep, nested_quant_ends, nested_per_hop, nested_paren_varying,
+  nested_outer_gv** — list-of-lists group vars, a group WRAPPING a var-length/group (bind_unit recursion). HARD.
+- **multi-hop group unit k>1 (qsp_multi_ends/cross ~4, gv_bind_each_rep_2hop)** — generalize push_group_cols
+  with the unit hop count k (verts[rep*k+p]). MEDIUM-HARD.
+- **multiseg_u (6)** dual-anchor correlated multi-segment EXISTS (ReBAC). HARD.
+- WITH-carry of a group list (gv_carry_through_with) — elem-kind must survive the WITH rebind.
+
+Infra now in place for reuse: RepeatGroup (group_binds + per_rep_pred), Expr::Index.elem (typed subscripts),
+ShortestK + collect_trails (trail enumeration), var_length lineage (node/edge stacks), multi-label edges.
