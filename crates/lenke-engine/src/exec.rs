@@ -5372,45 +5372,14 @@ fn nested_group(
         }
         Batch::of(slots)
     };
-    // The 2-level shape: the outer body is exactly one `Sub` (the inner group), whose
-    // body is FLAT (hops only). Anything else is unsupported here → no rows.
-    let GElem::Sub {
-        unit: sub,
-        min: imin,
-        max: imax,
-        ..
-    } = (match unit.elems.as_slice() {
-        [only] => only,
-        _ => return empty(),
-    })
-    else {
-        return empty();
-    };
-    if sub.elems.iter().any(|el| matches!(el, GElem::Sub { .. })) {
-        return empty(); // deeper than 2 levels — not supported yet
-    }
-    // Inner flat unit: `ik` hops per inner rep; resolve each hop's wanted edge types
-    // and its optional per-hop edge predicate.
-    let ik = sub.elems.len();
-    let mut inner_want: Vec<Vec<u32>> = Vec::with_capacity(ik);
-    let mut inner_dir: Vec<Dir> = Vec::with_capacity(ik);
-    let mut inner_epred: Vec<Option<&Expr>> = Vec::with_capacity(ik);
-    for el in &sub.elems {
-        let GElem::Hop {
-            dir,
-            etypes,
-            edge_pred,
-            ..
-        } = el
-        else {
-            return empty();
-        };
-        match want_etypes(store, etypes) {
-            Ok(w) => inner_want.push(w),
-            Err(()) => inner_want.push(vec![u32::MAX]), // unknown type: matches nothing
+    // Each outer element is a Hop or a Sub whose inner unit is FLAT (hops only — no
+    // deeper than 2 levels). Anything else is unsupported here → no rows.
+    for el in &unit.elems {
+        if let GElem::Sub { unit: sub, .. } = el {
+            if sub.elems.iter().any(|e| matches!(e, GElem::Sub { .. })) {
+                return empty();
+            }
         }
-        inner_dir.push(*dir);
-        inner_epred.push(edge_pred.as_deref());
     }
     let Col::Nodes(src) = batch.slot(from) else {
         return empty();
@@ -5427,14 +5396,8 @@ fn nested_group(
         store: &'a Store,
         unit: &'a crate::ir::GUnit,
         per_rep: Option<&'a Expr>,
-        ik: usize,
-        inner_want: &'a [Vec<u32>],
-        inner_dir: &'a [Dir],
-        inner_epred: &'a [Option<&'a Expr>],
         omin: u32,
         omax: u32,
-        imin: u32,
-        imax: u32,
         trail: bool,
         node_unique: bool,
         used_edges: Vec<u32>,
@@ -5445,14 +5408,8 @@ fn nested_group(
         store,
         unit,
         per_rep: per_rep_pred,
-        ik,
-        inner_want: &inner_want,
-        inner_dir: &inner_dir,
-        inner_epred: &inner_epred,
         omin: min,
         omax: max,
-        imin: *imin,
-        imax: *imax,
         trail,
         node_unique,
         used_edges: Vec::new(),
@@ -5461,18 +5418,18 @@ fn nested_group(
     };
 
     impl M<'_> {
-        // One hop from `v` along inner hop position `ie` (0..ik). Calls `f(target)`
-        // for each admissible neighbour, with the StepRec pushed. Restores on return.
-        fn hop(
+        // One hop from `v` (edge types `want`, direction `dir`, per-hop `epred`), tagged
+        // with `levels`. Calls `f(target)` per admissible neighbour, StepRec pushed;
+        // restores on return.
+        fn do_hop(
             &mut self,
             v: u32,
-            orep: u32,
-            irep: u32,
-            ie: usize,
-            mut f: impl FnMut(&mut Self, u32),
+            want: &[u32],
+            dir: Dir,
+            epred: Option<&Expr>,
+            levels: Vec<(u32, usize)>,
+            f: &mut dyn FnMut(&mut Self, u32),
         ) {
-            let want = &self.inner_want[ie];
-            let dir = self.inner_dir[ie];
             let mut adjs: Vec<crate::store::Adj> = Vec::new();
             if matches!(dir, Dir::Out | Dir::Both) {
                 adjs.extend_from_slice(self.store.out(v));
@@ -5484,7 +5441,7 @@ fn nested_group(
                 if !edge_carries_wanted(self.store, &a, want) {
                     continue;
                 }
-                if !edge_pred_ok(self.inner_epred[ie], self.store, a.eid) {
+                if !edge_pred_ok(epred, self.store, a.eid) {
                     continue; // per-hop edge WHERE / inline props
                 }
                 if self.trail && self.used_edges.contains(&a.eid) {
@@ -5493,10 +5450,8 @@ fn nested_group(
                 if self.node_unique && self.used_nodes.contains(&a.nbr) {
                     continue;
                 }
-                // levels: enclosing outer unit pinned at its Sub element (index 0),
-                // then this inner unit's (irep, advanced-past element).
                 self.steps.push(StepRec {
-                    levels: vec![(orep, 0), (irep, ie + 1)],
+                    levels: levels.clone(),
                     source: v,
                     edge: a.eid,
                     target: a.nbr,
@@ -5518,40 +5473,107 @@ fn nested_group(
             }
         }
 
-        // Match ONE inner rep (ik hops) from `v`, then `cont(end)`.
-        fn inner_rep(
-            &mut self,
-            v: u32,
-            orep: u32,
-            irep: u32,
-            ie: usize,
-            cont: &mut dyn FnMut(&mut Self, u32),
-        ) {
-            if ie == self.ik {
+        // Match the OUTER unit's element sequence `outer.elems[ei..]` from `v`, then
+        // `cont(end)`. A direct hop advances one element (levels `[(orep, ei+1)]`); a
+        // Sub repeats its flat inner unit before continuing (levels
+        // `[(orep, ei), (irep, ihop+1)]` for its inner hops).
+        fn seq(&mut self, v: u32, ei: usize, orep: u32, cont: &mut dyn FnMut(&mut Self, u32)) {
+            let outer = self.unit; // copy the &GUnit so `self` stays free for the calls
+            if ei == outer.elems.len() {
                 cont(self, v);
                 return;
             }
-            self.hop(v, orep, irep, ie, |slf, nbr| {
-                slf.inner_rep(nbr, orep, irep, ie + 1, cont)
-            });
+            match &outer.elems[ei] {
+                GElem::Hop {
+                    dir,
+                    etypes,
+                    edge_pred,
+                    ..
+                } => {
+                    let want = want_etypes(self.store, etypes).unwrap_or_else(|()| vec![u32::MAX]);
+                    let (dir, epred) = (*dir, edge_pred.as_deref());
+                    self.do_hop(
+                        v,
+                        &want,
+                        dir,
+                        epred,
+                        vec![(orep, ei + 1)],
+                        &mut |slf, nbr| slf.seq(nbr, ei + 1, orep, cont),
+                    );
+                }
+                GElem::Sub {
+                    unit: sub,
+                    min,
+                    max,
+                    ..
+                } => {
+                    let (smin, smax) = (*min, *max);
+                    self.sub_walk(v, sub, smin, smax, orep, ei, 0, &mut |slf, end| {
+                        slf.seq(end, ei + 1, orep, cont)
+                    });
+                }
+            }
         }
 
-        // The inner var-length: repeat the inner unit [imin,imax] times from `v`,
-        // calling `cont(end)` at each inner-rep-count boundary in range.
-        fn inner_walk(
+        // Repeat a Sub's flat inner unit [smin,smax] times from `v`; `cont(end)` at each
+        // inner-rep-count boundary in range.
+        #[allow(clippy::too_many_arguments)]
+        fn sub_walk(
             &mut self,
             v: u32,
+            sub: &crate::ir::GUnit,
+            smin: u32,
+            smax: u32,
             orep: u32,
+            es: usize,
             irep: u32,
             cont: &mut dyn FnMut(&mut Self, u32),
         ) {
-            if irep >= self.imin {
+            if irep >= smin {
                 cont(self, v);
             }
-            if irep < self.imax {
-                let mut c = |slf: &mut Self, end: u32| slf.inner_walk(end, orep, irep + 1, cont);
-                self.inner_rep(v, orep, irep, 0, &mut c);
+            if irep < smax {
+                self.sub_rep(v, sub, 0, orep, es, irep, &mut |slf, end| {
+                    slf.sub_walk(end, sub, smin, smax, orep, es, irep + 1, cont)
+                });
             }
+        }
+
+        // Match one inner rep (the Sub's flat hops) from `v`, then `cont(end)`.
+        #[allow(clippy::too_many_arguments)]
+        fn sub_rep(
+            &mut self,
+            v: u32,
+            sub: &crate::ir::GUnit,
+            ihop: usize,
+            orep: u32,
+            es: usize,
+            irep: u32,
+            cont: &mut dyn FnMut(&mut Self, u32),
+        ) {
+            if ihop == sub.elems.len() {
+                cont(self, v);
+                return;
+            }
+            let GElem::Hop {
+                dir,
+                etypes,
+                edge_pred,
+                ..
+            } = &sub.elems[ihop]
+            else {
+                return;
+            };
+            let want = want_etypes(self.store, etypes).unwrap_or_else(|()| vec![u32::MAX]);
+            let (dir, epred) = (*dir, edge_pred.as_deref());
+            self.do_hop(
+                v,
+                &want,
+                dir,
+                epred,
+                vec![(orep, es), (irep, ihop + 1)],
+                &mut |slf, nbr| slf.sub_rep(nbr, sub, ihop + 1, orep, es, irep, cont),
+            );
         }
 
         // The PER-REP `WHERE` over the just-completed outer rep `orep`: bind the unit's
@@ -5593,7 +5615,7 @@ fn nested_group(
                         slf.outer_walk(end, orep + 1, emit);
                     }
                 };
-                self.inner_walk(v, orep, 0, &mut c);
+                self.seq(v, 0, orep, &mut c);
             }
         }
     }

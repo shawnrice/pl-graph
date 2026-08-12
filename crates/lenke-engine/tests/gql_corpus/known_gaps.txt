@@ -26,7 +26,6 @@ tests_c.jsonl::sum_distinct_mix_num_duration_faults
 tests_c.jsonl::sum_mix_num_duration_faults
 tests_c.jsonl::sum_mix_str_duration_faults
 tests_c.jsonl::temporal_duration_unordered_count_zero
-tests_d.jsonl::nested_quant_ends_3
 tests_e.jsonl::date_part_bare_name_unknown_fn
 tests_e.jsonl::date_part_rejects_number
 tests_e.jsonl::date_part_rejects_string

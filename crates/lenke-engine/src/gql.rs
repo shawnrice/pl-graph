@@ -2661,80 +2661,137 @@ impl Parser {
         from: usize,
     ) -> Result<(Plan, usize), String> {
         use crate::ir::{GElem, GUnit};
+        // A parsed body element before slot assignment (variable NAMES, not slots).
+        enum Seg {
+            Hop {
+                edge: Option<String>,
+                target: Option<String>,
+                dir: Dir,
+                etypes: Vec<String>,
+                epred: Option<Expr>,
+            },
+            Sub {
+                inner: Vec<Seg>,
+                start: Option<String>,
+                min: u32,
+                max: u32,
+                target: Option<String>,
+            },
+        }
         let bad_inner =
             |n: &ParsedNode| n.1.is_some() || n.4.is_some() || !n.2.is_empty() || n.3.is_some();
+        let noinner = "a label/property/WHERE on a nested subpath-group inner node is not \
+                       supported yet";
         self.expect(&Tok::LParen)?; // outer group `(`
-                                    // family 3 iff the body is itself a group (`( (( …`): the next token is `(`
-                                    // (the inner group) and the one after is `(` (the inner group's first node).
+                                    // family 3 iff the body is itself a group (`( (( …`).
         let family3 = matches!(self.peek(), Some(Tok::LParen))
             && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen));
 
-        // Parse the (single-hop) inner unit, the two quantifiers, and an optional
-        // PER-REP `WHERE` (after the inner unit, before the outer `)`).
-        let (xvar, evar, dir, etypes, edge_pred, yvar, imin, imax, omin, omax, perrep_range) =
-            if family3 {
-                self.expect(&Tok::LParen)?; // inner group `(`
-                let x = self.node()?;
+        // Parse the outer body into (outer-start var, element sequence). Family 3 is a
+        // single inner GROUP `((…)…){a,b}` → one Sub; the general form is a hop
+        // sequence `<node> (<rel> [quant] <node>)+` where a quantified hop is a Sub.
+        let (outer_start, segs): (Option<String>, Vec<Seg>) = if family3 {
+            self.expect(&Tok::LParen)?; // inner group `(`
+            let x = self.node()?;
+            if bad_inner(&x) {
+                return Err(noinner.into());
+            }
+            let mut inner: Vec<Seg> = Vec::new();
+            loop {
                 let rel = self.rel()?;
-                let y = self.node()?;
-                if bad_inner(&x) || bad_inner(&y) {
-                    return Err(
-                        "a label/property/WHERE on a nested subpath-group inner node is not \
-                            supported yet"
-                            .into(),
-                    );
+                let n = self.node()?;
+                if bad_inner(&n) {
+                    return Err(noinner.into());
                 }
                 let epred = self.edge_pred_from_rel(&rel)?;
-                self.expect(&Tok::RParen)?; // inner group `)`
-                let (imin, imax) = self
-                    .opt_quantifier()?
-                    .ok_or("the inner group of a nested subpath needs a quantifier")?;
-                let perrep = if self.eat_kw("WHERE") {
-                    Some(self.capture_inline_where())
-                } else {
-                    None
-                };
-                self.expect(&Tok::RParen)?; // outer group `)`
-                let (omin, omax) = self
-                    .opt_quantifier()?
-                    .ok_or("a nested subpath group needs an outer quantifier")?;
-                (
-                    x.0, rel.var, rel.dir, rel.etypes, epred, y.0, imin, imax, omin, omax, perrep,
-                )
-            } else {
-                let x = self.node()?;
-                let rel = self.rel()?;
-                let (imin, imax) = self
-                    .opt_quantifier()?
-                    .ok_or("expected an inner `{lo,hi}` quantifier in a nested subpath group")?;
-                let y = self.node()?;
-                if bad_inner(&x) || bad_inner(&y) {
-                    return Err(
-                        "a label/property/WHERE on a nested subpath-group inner node is not \
-                            supported yet"
-                            .into(),
-                    );
+                inner.push(Seg::Hop {
+                    edge: rel.var,
+                    target: n.0,
+                    dir: rel.dir,
+                    etypes: rel.etypes,
+                    epred,
+                });
+                if !matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde)) {
+                    break;
                 }
+            }
+            self.expect(&Tok::RParen)?; // inner group `)`
+            let (imin, imax) = self
+                .opt_quantifier()?
+                .ok_or("the inner group of a nested subpath needs a quantifier")?;
+            (
+                None,
+                vec![Seg::Sub {
+                    inner,
+                    start: x.0,
+                    min: imin,
+                    max: imax,
+                    target: None,
+                }],
+            )
+        } else {
+            let start = self.node()?;
+            if bad_inner(&start) {
+                return Err(noinner.into());
+            }
+            let mut segs: Vec<Seg> = Vec::new();
+            loop {
+                let rel = self.rel()?;
                 let epred = self.edge_pred_from_rel(&rel)?;
-                let perrep = if self.eat_kw("WHERE") {
-                    Some(self.capture_inline_where())
+                if let Some((imin, imax)) = self.opt_quantifier()? {
+                    // A quantified hop `-[e]->{lo,hi}` — a Sub with a bare single-hop inner.
+                    let n = self.node()?;
+                    if bad_inner(&n) {
+                        return Err(noinner.into());
+                    }
+                    segs.push(Seg::Sub {
+                        inner: vec![Seg::Hop {
+                            edge: rel.var,
+                            target: None,
+                            dir: rel.dir,
+                            etypes: rel.etypes,
+                            epred,
+                        }],
+                        start: None,
+                        min: imin,
+                        max: imax,
+                        target: n.0,
+                    });
                 } else {
-                    None
-                };
-                self.expect(&Tok::RParen)?; // outer group `)`
-                let (omin, omax) = self
-                    .opt_quantifier()?
-                    .ok_or("a nested subpath group needs an outer quantifier")?;
-                (
-                    x.0, rel.var, rel.dir, rel.etypes, epred, y.0, imin, imax, omin, omax, perrep,
-                )
-            };
+                    let n = self.node()?;
+                    if bad_inner(&n) {
+                        return Err(noinner.into());
+                    }
+                    segs.push(Seg::Hop {
+                        edge: rel.var,
+                        target: n.0,
+                        dir: rel.dir,
+                        etypes: rel.etypes,
+                        epred,
+                    });
+                }
+                if !matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde)) {
+                    break;
+                }
+            }
+            (start.0, segs)
+        };
 
-        // The endpoint `(t)` (optional — anonymous when only the group vars are used)
-        // is parsed BEFORE slots are assigned, because the executor's output columns
-        // are `[input…, endpoint, binds…]` — so the endpoint slot must come first, then
-        // one bind slot per named group variable, in the order the executor appends
-        // them (x, e, y).
+        // An optional PER-REP `WHERE` (after the body, before the outer `)`), then the
+        // outer `)` and the outer quantifier.
+        let perrep_range = if self.eat_kw("WHERE") {
+            Some(self.capture_inline_where())
+        } else {
+            None
+        };
+        self.expect(&Tok::RParen)?; // outer group `)`
+        let (omin, omax) = self
+            .opt_quantifier()?
+            .ok_or("a nested subpath group needs an outer quantifier")?;
+
+        // The endpoint `(t)` (optional). The executor's output columns are `[input…,
+        // endpoint, binds…]`, so the endpoint slot comes FIRST, then one bind slot per
+        // named group variable.
         let (tvar, t_label, t_props, t_where, t_le) = if matches!(self.peek(), Some(Tok::LParen)) {
             self.node()?
         } else {
@@ -2745,38 +2802,100 @@ impl Parser {
         if let Some(v) = tvar {
             scope.insert(v, node_slot);
         }
-        // Group-variable slots, endpoint-first order preserved: family 3 → all depth 2;
-        // family 4 → x/y depth 1 (per outer rep), e depth 2.
-        let (xd, yd) = if family3 { (2, 2) } else { (1, 1) };
-        let mut bind_slots: Vec<usize> = Vec::new();
-        let mut assign = |this: &mut Self,
-                          name: &Option<String>,
-                          is_edge: bool,
-                          depth: u8,
-                          slots: &mut usize,
-                          bind_slots: &mut Vec<usize>|
-         -> Option<usize> {
-            let n = name.clone()?;
-            let s = *slots;
-            *slots += 1;
-            scope.insert(n, s);
-            if is_edge {
-                this.group_edge_slots.insert(s);
-            } else {
-                this.group_node_slots.insert(s);
-            }
-            this.group_var_depth.insert(s, depth);
-            bind_slots.push(s);
-            Some(s)
-        };
-        let xslot = assign(self, &xvar, false, xd, slots, &mut bind_slots);
-        let eslot = assign(self, &evar, true, 2, slots, &mut bind_slots);
-        let yslot = assign(self, &yvar, false, yd, slots, &mut bind_slots);
 
-        // The PER-REP `WHERE` sees each variable ONE nesting level shallower than
-        // globally (the per-rep view): an outer-depth var is a scalar, an inner-Sub var
-        // a list over the inner reps. Parse it with the group depths temporarily
-        // decremented so `x[i]`/`size(e)` type at the per-rep depth, then restore.
+        // Assign a slot to each NAMED group variable (endpoint-first already done). A
+        // variable's list-nesting depth = its enclosing quantifiers: 1 for an
+        // outer-level variable, 2 for one inside a Sub. `assign` records the slot into
+        // `scope`, the node/edge sets, `group_var_depth`, and `bind_slots` (ascending).
+        let mut bind_slots: Vec<usize> = Vec::new();
+        let mut assign =
+            |this: &mut Self, name: &Option<String>, is_edge: bool, depth: u8| -> Option<usize> {
+                let n = name.clone()?;
+                let s = *slots;
+                *slots += 1;
+                scope.insert(n, s);
+                if is_edge {
+                    this.group_edge_slots.insert(s);
+                } else {
+                    this.group_node_slots.insert(s);
+                }
+                this.group_var_depth.insert(s, depth);
+                bind_slots.push(s);
+                Some(s)
+            };
+        let outer_start_slot = assign(self, &outer_start, false, 1);
+
+        // Build the GUnit from the skeleton, assigning slots as we go.
+        let mut elems: Vec<GElem> = Vec::with_capacity(segs.len());
+        for seg in &segs {
+            match seg {
+                Seg::Hop {
+                    edge,
+                    target,
+                    dir,
+                    etypes,
+                    epred,
+                } => {
+                    let eslot = assign(self, edge, true, 1);
+                    let tslot = assign(self, target, false, 1);
+                    elems.push(GElem::Hop {
+                        dir: *dir,
+                        etypes: etypes.clone(),
+                        edge_slot: eslot,
+                        target_slot: tslot,
+                        edge_pred: epred.clone().map(Box::new),
+                    });
+                }
+                Seg::Sub {
+                    inner,
+                    start,
+                    min,
+                    max,
+                    target,
+                } => {
+                    let sub_start = assign(self, start, false, 2);
+                    let mut inner_elems: Vec<GElem> = Vec::with_capacity(inner.len());
+                    for h in inner {
+                        let Seg::Hop {
+                            edge,
+                            target,
+                            dir,
+                            etypes,
+                            epred,
+                        } = h
+                        else {
+                            unreachable!("a Sub's inner is flat (hops only)")
+                        };
+                        let eslot = assign(self, edge, true, 2);
+                        let tslot = assign(self, target, false, 2);
+                        inner_elems.push(GElem::Hop {
+                            dir: *dir,
+                            etypes: etypes.clone(),
+                            edge_slot: eslot,
+                            target_slot: tslot,
+                            edge_pred: epred.clone().map(Box::new),
+                        });
+                    }
+                    let sub_target = assign(self, target, false, 1);
+                    elems.push(GElem::Sub {
+                        unit: Box::new(GUnit {
+                            start_slot: sub_start,
+                            elems: inner_elems,
+                        }),
+                        min: *min,
+                        max: *max,
+                        target_slot: sub_target,
+                    });
+                }
+            }
+        }
+        let unit = GUnit {
+            start_slot: outer_start_slot,
+            elems,
+        };
+
+        // The PER-REP `WHERE` sees each variable ONE nesting level shallower (the
+        // per-rep view). Parse it with the group depths temporarily decremented.
         let per_rep_pred = if let Some(r) = perrep_range {
             let saved: Vec<(usize, u8)> = bind_slots
                 .iter()
@@ -2794,35 +2913,6 @@ impl Parser {
             Some(pred)
         } else {
             None
-        };
-
-        // Build the GUnit. Family 3: outer body is a Sub whose inner unit starts at x.
-        // Family 4: outer starts at x; the Sub's inner unit is a bare hop; y is the
-        // Sub's landing.
-        let hop = GElem::Hop {
-            dir,
-            etypes: etypes.clone(),
-            edge_slot: eslot,
-            target_slot: if family3 { yslot } else { None },
-            edge_pred: edge_pred.map(Box::new),
-        };
-        let (outer_start, sub_target) = if family3 {
-            (None, None)
-        } else {
-            (xslot, yslot)
-        };
-        let inner_start = if family3 { xslot } else { None };
-        let unit = GUnit {
-            start_slot: outer_start,
-            elems: vec![GElem::Sub {
-                unit: Box::new(GUnit {
-                    start_slot: inner_start,
-                    elems: vec![hop],
-                }),
-                min: imin,
-                max: imax,
-                target_slot: sub_target,
-            }],
         };
 
         let mut plan = Plan::NestedGroup {

@@ -173,6 +173,7 @@ pub fn gen_hard(rng: &mut Rng, s: &Schema, caps: &Caps, src_id: usize) -> Option
     if caps.nested {
         families.push(3);
         families.push(4);
+        families.push(5);
     }
     let fam = *rng.pick(&families);
     let src = format!("(src:{} {{{}: {src_id}}})", s.label, s.id);
@@ -296,7 +297,7 @@ pub fn gen_hard(rng: &mut Rng, s: &Schema, caps: &Caps, src_id: usize) -> Option
             )
         }
         // ── group over a VAR-LENGTH inner: `( (x)-[e]->{lo,hi}(y) ){c,d} (t)` ─
-        _ => {
+        4 => {
             tags.push("nested");
             tags.push("nested-varlen-inner");
             // Inner min >= 1: an empty inner rep (`{0,n}`) is an epsilon-closure case
@@ -313,6 +314,29 @@ pub fn gen_hard(rng: &mut Rng, s: &Schema, caps: &Caps, src_id: usize) -> Option
             } else {
                 let g = if rng.chance(1, 2) { "x" } else { "y" };
                 node_reducer(rng, s, g, 1)
+            };
+            format!(
+                "MATCH {src} {group} (t) RETURN t.{} AS tid, {reducer}",
+                s.id
+            )
+        }
+        // ── MULTI-SEGMENT inner: a fixed hop then a var-length, both in the outer unit
+        // `( (a)-[e1]->(b)-[e2]->{lo,hi}(c) ){c,d} (t)`. `a`/`b`/`c` and `e1` are
+        // outer-level (depth 1); `e2` (inside the var-length Sub) is depth 2.
+        _ => {
+            tags.push("nested");
+            tags.push("nested-multiseg");
+            let (inner, _, _) = quant_bounded(rng);
+            let (outer, _, _) = quant_bounded(rng);
+            let group = format!(
+                "( (a)-[e1:{ety}]->(b)-[e2:{ety}]->{inner}(c) ){outer}",
+                ety = s.etype,
+            );
+            let reducer = match rng.below(4) {
+                0 => node_reducer(rng, s, "a", 1),
+                1 => node_reducer(rng, s, "b", 1),
+                2 => edge_reducer(rng, s, "e1", 1),
+                _ => edge_reducer(rng, s, "e2", 2),
             };
             format!(
                 "MATCH {src} {group} (t) RETURN t.{} AS tid, {reducer}",

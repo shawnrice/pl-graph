@@ -572,8 +572,9 @@ shipped constructs along the way (round 9): shortest `->+(t)` source-cycle (clea
 any_shortest_plus_seed_cycle_len), and the unknown-edge-type zero-rep source for shortest/group.
 
 REMAINING FEATURE (2, each its own structural extension):
+
 - nested_quant_ends_3 — a MULTI-SEGMENT inner unit (`( ()-[:R]->()-[:R]->{1,2}() ){1}`): the outer body is
   [Hop, Sub], not a single Sub. Needs a general multi-element GUnit matcher (match_seq over outer elems).
 - for_drives_batch_optional_match — FOR-driven fresh-var OPTIONAL MATCH: correlated inline-prop EXPRESSIONs
   (props() takes only literals) + a left-outer correlated node scan.
-Plus the deferred empty-inner-rep `{0,n}` epsilon-closure (fuzzer's nested inner is min>=1).
+  Plus the deferred empty-inner-rep `{0,n}` epsilon-closure (fuzzer's nested inner is min>=1).
