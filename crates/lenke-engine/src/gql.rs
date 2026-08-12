@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{AggFn, CastTarget, CompareOp, Dir, Expr, PathPart, Plan};
+use crate::ir::{AggFn, CastTarget, CompareOp, Dir, Expr, PathMode, PathPart, Plan};
 use crate::value::Value;
 
 /// A parsed node pattern head: its optional variable, optional label, inline
@@ -127,7 +127,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         path_vars: HashSet::new(),
         lets: Vec::new(),
         suppress_in: false,
-        path_walk: false,
+        path_mode: PathMode::Trail,
     };
     let mut plan = p.query()?;
     // `<query> UNION [ALL] <query> …`: each arm is an independent query with a fresh
@@ -390,10 +390,10 @@ struct Parser {
     /// NOT the membership operator — so `LET x = 2 + 3 IN body` binds `2+3`, not
     /// `2+3 IN body`. This suppresses the `IN`-membership handling in `cmp_expr`.
     suppress_in: bool,
-    /// The path mode of the pattern currently being parsed: `MATCH WALK …` allows a
-    /// variable-length hop to repeat edges, `TRAIL` (the default) forbids it. Set
-    /// per `query()` from a leading mode keyword and read at the `var_length` build.
-    path_walk: bool,
+    /// The path mode of the pattern currently being parsed, set per `match_body()`
+    /// from a leading mode keyword (`WALK`/`TRAIL`/`SIMPLE`/`ACYCLIC`, default
+    /// `Trail`) and read at the `var_length` build. See [`PathMode`].
+    path_mode: PathMode,
 }
 
 impl Parser {
@@ -504,17 +504,20 @@ impl Parser {
     /// the plan. Shared by `query()` and `SELECT … FROM MATCH …`.
     fn match_body(&mut self) -> Result<Plan, String> {
         // Optional leading path mode: `MATCH WALK …` lets a variable-length hop
-        // reuse edges; `TRAIL` (the ISO default, and the engine's) forbids it. The
-        // keyword can only appear here — a pattern always begins with `(`, and the
-        // named-path form was handled above — so a bare Ident is unambiguously a
-        // mode word. `ACYCLIC`/`SIMPLE` (node non-reuse) aren't modeled yet.
-        self.path_walk = false;
+        // reuse edges; `TRAIL` (the ISO default, and the engine's) forbids reusing
+        // an edge; `SIMPLE`/`ACYCLIC` forbid reusing a NODE (Simple permits the
+        // closing `start == end`). The keyword can only appear here — a pattern
+        // always begins with `(`, and the named-path form was handled above — so a
+        // bare Ident is unambiguously a mode word.
+        self.path_mode = PathMode::Trail;
         if self.eat_kw("WALK") {
-            self.path_walk = true;
+            self.path_mode = PathMode::Walk;
         } else if self.eat_kw("TRAIL") {
-            self.path_walk = false;
-        } else if self.peek_kw("ACYCLIC") || self.peek_kw("SIMPLE") {
-            return Err("ACYCLIC / SIMPLE path modes are not supported yet".into());
+            self.path_mode = PathMode::Trail;
+        } else if self.eat_kw("SIMPLE") {
+            self.path_mode = PathMode::Simple;
+        } else if self.eat_kw("ACYCLIC") {
+            self.path_mode = PathMode::Acyclic;
         }
         // A comma-separated list of patterns, joined on shared variables. Each
         // pattern parses in its OWN slot space; join maps a shared variable's
@@ -571,7 +574,7 @@ impl Parser {
         }
         // The mode applies only to this MATCH's own pattern hops; clear it so it
         // never leaks into a var-length hop inside a later `EXISTS { … }` subquery.
-        self.path_walk = false;
+        self.path_mode = PathMode::Trail;
         // Publish the merged scope for WHERE/RETURN/ORDER to resolve variables.
         self.scope = scope;
         self.slots = slots;
@@ -1383,15 +1386,8 @@ impl Parser {
                     scope.insert(v, node_slot);
                 }
                 *slots += 1;
-                // `trail` (no edge reuse) is the default / TRAIL mode; WALK allows it.
-                plan = plan.var_length(
-                    from,
-                    rel.dir,
-                    &rel.etypes,
-                    min,
-                    max,
-                    !self.path_walk,
-                );
+                // The leading path mode (default TRAIL) selects the reuse semantics.
+                plan = plan.var_length(from, rel.dir, &rel.etypes, min, max, self.path_mode);
                 from = node_slot;
             } else if bind {
                 let edge_slot = *slots;
@@ -4752,7 +4748,7 @@ mod tests {
 
     #[test]
     fn var_length_range() {
-        use crate::ir::{Dir, Expr, Plan};
+        use crate::ir::{Dir, Expr, PathMode, Plan};
         let store = social();
         // (a)-[:KNOWS]->{1,2}(b) from alice: b(len1)={bob,carol}, then len2 from
         // those: bob->carol. Trail. Cross-check vs hand-built VarLength.
@@ -4767,7 +4763,7 @@ mod tests {
             }),
             right: Box::new(Expr::Lit(Value::Str("alice".into()))),
         })
-        .var_length(0, Dir::Out, &["KNOWS".to_string()], 1, 2, true)
+        .var_length(0, Dir::Out, &["KNOWS".to_string()], 1, 2, PathMode::Trail)
         .project(vec![(
             "b".into(),
             Expr::Prop {

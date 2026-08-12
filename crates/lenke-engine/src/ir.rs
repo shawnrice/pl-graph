@@ -14,6 +14,24 @@ pub enum Dir {
     Both,
 }
 
+/// The path-restriction mode of a variable-length hop (ISO GQL). It decides which
+/// elements a single path may repeat:
+/// - `Walk`: no restriction — edges AND nodes may repeat (`MATCH WALK`).
+/// - `Trail`: no edge repeats within a path — the engine's (and ISO's) default.
+/// - `Simple`: no node repeats, EXCEPT a path may close on its own start
+///   (`start == end`, a cycle).
+/// - `Acyclic`: no node repeats at all — not even the start.
+///
+/// `Trail` is the default so a bare `-[:R]->{1,3}` keeps the historic behaviour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PathMode {
+    Walk,
+    #[default]
+    Trail,
+    Simple,
+    Acyclic,
+}
+
 /// An expression over the current row. A row is a tuple of bound slots; `Slot(n)`
 /// is the value at slot `n`, and `Prop { slot, key }` reads a property off the
 /// element in that slot.
@@ -361,11 +379,12 @@ pub enum Plan {
     /// A quantified hop: from the element in `from`, reach nodes over `min..=max`
     /// hops of `dir`/`edge_label`, appending EACH reached endpoint as one new
     /// slot — one output row per matching path. `min == 0` includes the source
-    /// itself (a zero-length path). `trail` is EXPLICIT and load-bearing: when
-    /// true no edge may repeat within a single path (a trail); when false edges
-    /// may repeat (a walk). The two differ on a cycle/self-loop and must never be
-    /// conflated — a quantified repetition is a trail, a chain of separate fixed
-    /// Expands is a walk.
+    /// itself (a zero-length path). `mode` is EXPLICIT and load-bearing: it selects
+    /// the path-restriction semantics (see [`PathMode`]). `Trail` (the default)
+    /// forbids reusing an edge; `Walk` allows anything; `Simple`/`Acyclic` forbid
+    /// reusing a node (Simple permits the closing `start == end`). The modes differ
+    /// on a cycle/self-loop and must never be conflated — a quantified repetition
+    /// carries its mode, a chain of separate fixed Expands is a walk.
     VarLength {
         input: Box<Plan>,
         from: usize,
@@ -373,7 +392,7 @@ pub enum Plan {
         edge_label: Vec<String>,
         min: u32,
         max: u32,
-        trail: bool,
+        mode: PathMode,
     },
     /// Shortest-path reach: BFS from the element in `from` along `dir`/
     /// `edge_label`, emitting EACH reachable target once at its shortest distance
@@ -644,7 +663,7 @@ impl Plan {
         edge_label: &[String],
         min: u32,
         max: u32,
-        trail: bool,
+        mode: PathMode,
     ) -> Self {
         Self::VarLength {
             input: Box::new(self),
@@ -653,7 +672,7 @@ impl Plan {
             edge_label: edge_label.to_vec(),
             min,
             max,
-            trail,
+            mode,
         }
     }
 

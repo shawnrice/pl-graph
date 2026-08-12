@@ -9,7 +9,7 @@
 //! .limit(n) | .range(lo,hi) | .groupCount().by('k')`. The traversal's implicit
 //! current element is a slot, hops append slots, exactly as in the IR.
 
-use crate::ir::{Agg, AggFn, CompareOp, Dir, Expr, Plan, SortKey};
+use crate::ir::{Agg, AggFn, CompareOp, Dir, Expr, PathMode, Plan, SortKey};
 use crate::value::Value;
 use std::collections::HashMap;
 
@@ -627,13 +627,13 @@ impl Parser {
                 let (dir, label) =
                     prev_repeat.ok_or("times(n) must immediately follow repeat(<hop>)")?;
                 // `repeat(out('L')).times(n)` applies the hop exactly n times — a
-                // WALK of length n (Gremlin allows revisiting edges, so trail=false,
+                // WALK of length n (Gremlin allows revisiting edges, so PathMode::Walk,
                 // unlike GQL var-length which is a trail). min == max == n.
                 let n = u32::try_from(n).map_err(|_| "times(n): n too large")?;
                 let from = self.current;
                 self.current = self.slots;
                 self.slots += 1;
-                plan.var_length(from, dir, &etypes_of(label.as_deref()), n, n, false)
+                plan.var_length(from, dir, &etypes_of(label.as_deref()), n, n, PathMode::Walk)
             }
             "oute" | "ine" | "bothe" => {
                 // Edge-yielding hop: bind the traversed edge as a slot and leave the

@@ -381,7 +381,7 @@ fn available_ram_bytes() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::Dir;
+    use crate::ir::{Dir, PathMode};
     use crate::store::{Builder, Store};
     use crate::value::Value;
 
@@ -433,7 +433,7 @@ mod tests {
         assert!((one.rows - f64::from(n * deg)).abs() < 1.0, "1-hop ≈ n*deg");
         // VarLength {1,2}: n × (deg + deg²).
         let two = estimate(
-            &scan("Person").var_length(0, Dir::Out, &["R".to_string()], 1, 2, true),
+            &scan("Person").var_length(0, Dir::Out, &["R".to_string()], 1, 2, PathMode::Trail),
             &st,
         );
         let expected = f64::from(n) * (f64::from(deg) + f64::from(deg * deg));
@@ -444,7 +444,7 @@ mod tests {
             materialize_rows: 50_000.0,
         };
         assert!(prefer_bounded_memory(
-            &scan("Person").var_length(0, Dir::Out, &["R".to_string()], 1, 2, true),
+            &scan("Person").var_length(0, Dir::Out, &["R".to_string()], 1, 2, PathMode::Trail),
             &st,
             &budget
         ));

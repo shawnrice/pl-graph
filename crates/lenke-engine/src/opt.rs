@@ -186,7 +186,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             edge_label,
             min,
             max,
-            trail,
+            mode,
         } => {
             let (i, c) = rewrite(*input, idx);
             (
@@ -197,7 +197,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                     edge_label,
                     min,
                     max,
-                    trail,
+                    mode,
                 },
                 c,
             )
@@ -622,7 +622,7 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 edge_label,
                 min,
                 max,
-                trail,
+                mode,
             } => {
                 let (below, above) = split_pushable(pred, width(&vin));
                 match below {
@@ -635,7 +635,7 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                             edge_label,
                             min,
                             max,
-                            trail,
+                            mode,
                         };
                         (
                             Plan::Filter {
@@ -656,7 +656,7 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                             edge_label,
                             min,
                             max,
-                            trail,
+                            mode,
                         };
                         match above {
                             Some(a) => (
@@ -1064,7 +1064,7 @@ fn width(plan: &Plan) -> usize {
 mod tests {
     use super::*;
     use crate::exec::{run, Rows};
-    use crate::ir::{CompareOp, Dir, Expr, Plan};
+    use crate::ir::{CompareOp, Dir, Expr, PathMode, Plan};
     use crate::store::{Builder, Store};
     use crate::value::Value;
     use std::sync::Arc;
@@ -1347,7 +1347,7 @@ mod tests {
         let plan = Plan::Scan {
             label: Some("Person".into()),
         }
-        .var_length(0, Dir::Out, &["KNOWS".to_string()], 1, 2, true)
+        .var_length(0, Dir::Out, &["KNOWS".to_string()], 1, 2, PathMode::Trail)
         .filter(Expr::And(
             Box::new(cmp(CompareOp::Eq, prop(0, "name"), Expr::Lit(s("alice")))),
             Box::new(cmp(CompareOp::Ge, prop(1, "age"), Expr::Lit(n(40.0)))),

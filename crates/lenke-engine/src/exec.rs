@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::batch::{Batch, Col, Lineage};
-use crate::ir::{Agg, AggFn, CombineOp, CompareOp, Dir, Expr, Plan};
+use crate::ir::{Agg, AggFn, CombineOp, CompareOp, Dir, Expr, PathMode, Plan};
 use crate::store::{Column, Store};
 use crate::value::{self, Value};
 
@@ -940,7 +940,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             edge_label,
             min,
             max,
-            trail,
+            mode,
         } => var_length(
             &pull(input, store, track)?,
             store,
@@ -949,7 +949,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             edge_label,
             *min,
             *max,
-            *trail,
+            *mode,
         ),
         Plan::ShortestPath {
             input,
@@ -1401,7 +1401,7 @@ fn streaming_chain(plan: &Plan, store: &Store) -> Option<(Plan, Vec<u32>)> {
             edge_label,
             min,
             max,
-            trail,
+            mode,
         } => {
             let (body, ids) = streaming_chain(input, store)?;
             Some((
@@ -1412,7 +1412,7 @@ fn streaming_chain(plan: &Plan, store: &Store) -> Option<(Plan, Vec<u32>)> {
                     edge_label: edge_label.clone(),
                     min: *min,
                     max: *max,
-                    trail: *trail,
+                    mode: *mode,
                 },
                 ids,
             ))
@@ -3082,7 +3082,7 @@ fn try_varlen_count(
         edge_label,
         min,
         max,
-        trail,
+        mode,
     } = input
     else {
         return None;
@@ -3103,7 +3103,9 @@ fn try_varlen_count(
     // (s->s->s over the same edge, which a trail forbids). Only taken when the
     // enumeration would be the MORE expensive path (a large source set); a filtered
     // / small source stays on the DFS below, where enumeration is already cheap.
-    if matches!(dir, Dir::Out) && *max <= 2 && *max >= 1 && *trail {
+    // TRAIL only: the degree algebra counts node-repeating trails, which SIMPLE /
+    // ACYCLIC forbid — those must enumerate via the DFS below.
+    if matches!(dir, Dir::Out) && *max <= 2 && *max >= 1 && matches!(mode, PathMode::Trail) {
         let (nc, ec) = (store.node_count(), store.edge_count());
         let avg_deg = if nc == 0 { 0.0 } else { ec as f64 / nc as f64 };
         let est_paths = src.len() as f64 * avg_deg.powi(*max as i32);
@@ -3143,10 +3145,17 @@ fn try_varlen_count(
 
     let mut total: u64 = 0;
     let mut used: Vec<u32> = Vec::new();
+    let node_unique = matches!(mode, PathMode::Simple | PathMode::Acyclic);
     for &v in src {
+        if node_unique {
+            used.push(v); // mark the start node
+        }
         varlen_count_dfs(
-            store, v, 0, *min, *max, *dir, &want, *trail, &mut used, &mut total,
+            store, v, 0, *min, *max, *dir, &want, *mode, v, &mut used, &mut total,
         );
+        if node_unique {
+            used.pop();
+        }
         debug_assert!(used.is_empty());
     }
     Some(scalar_num(total as f64))
@@ -3165,7 +3174,8 @@ fn varlen_count_dfs(
     max: u32,
     dir: Dir,
     want: &[u32],
-    trail: bool,
+    mode: PathMode,
+    start: u32,
     used: &mut Vec<u32>,
     total: &mut u64,
 ) {
@@ -3199,11 +3209,18 @@ fn varlen_count_dfs(
         if is_inc && drop_loop && a.nbr == v {
             continue;
         }
-        if trail && used.contains(&a.eid) {
-            continue;
-        }
-        if trail {
-            used.push(a.eid);
+        let mark = match varlen_step(mode, start, a, used) {
+            VarStep::Skip => continue,
+            VarStep::Close => {
+                if len + 1 >= min {
+                    *total += 1;
+                }
+                continue;
+            }
+            VarStep::Go(mark) => mark,
+        };
+        if let Some(m) = mark {
+            used.push(m);
         }
         varlen_count_dfs(
             store,
@@ -3213,14 +3230,56 @@ fn varlen_count_dfs(
             max,
             dir,
             want,
-            trail,
+            mode,
+            start,
             used,
             total,
         );
-        if trail {
+        if mark.is_some() {
             used.pop();
         }
     }
+}
+
+/// The outcome of the per-hop reuse gate ([`varlen_step`]).
+enum VarStep {
+    /// The hop is forbidden — skip this neighbour.
+    Skip,
+    /// A SIMPLE closing hop (`nbr == start`): emit the endpoint but do NOT descend —
+    /// the cycle is closed, and extending it would repeat an interior node (mirrors
+    /// core's `is_close` early-`continue`).
+    Close,
+    /// Descend. `Some(id)` is pushed onto the reuse stack before recursing (Trail:
+    /// the edge id; Simple/Acyclic: the node id); `None` pushes nothing (Walk).
+    Go(Option<u32>),
+}
+
+/// The per-hop reuse gate shared by every var-length DFS. Decides whether the hop
+/// across `a` is legal under `mode`, and whether it closes a Simple cycle.
+///
+/// For the node modes `used` is a NODE stack (the driver seeds it with `start`); for
+/// Trail it is an EDGE stack. `Simple` permits a hop that closes the cycle on the
+/// walk's `start` even though `start` is already marked — that hop emits (via
+/// [`VarStep::Close`]) but terminates the path.
+#[inline]
+fn varlen_step(mode: PathMode, start: u32, a: &crate::store::Adj, used: &[u32]) -> VarStep {
+    if matches!(mode, PathMode::Simple) && a.nbr == start {
+        return VarStep::Close;
+    }
+    let collide = match mode {
+        PathMode::Trail => used.contains(&a.eid),
+        PathMode::Simple | PathMode::Acyclic => used.contains(&a.nbr),
+        PathMode::Walk => false,
+    };
+    if collide {
+        return VarStep::Skip;
+    }
+    let mark = match mode {
+        PathMode::Walk => None,
+        PathMode::Trail => Some(a.eid),
+        PathMode::Simple | PathMode::Acyclic => Some(a.nbr),
+    };
+    VarStep::Go(mark)
 }
 
 /// Answer `count(DISTINCT endpoint)` over a bounded var-length hop by MULTI-SOURCE
@@ -3258,11 +3317,17 @@ fn try_varlen_distinct_count(
         edge_label,
         min,
         max,
-        ..
+        mode,
     } = input
     else {
         return None;
     };
+    // The BFS-reachability fusion relies on shortest-distance == walk equivalence,
+    // which only holds when nodes may repeat (Walk / Trail). SIMPLE / ACYCLIC forbid
+    // node reuse, so a distinct-endpoint count must enumerate — fall through.
+    if !matches!(mode, PathMode::Walk | PathMode::Trail) {
+        return None;
+    }
     // Only min ≤ 1 (see the invariant above); a min-0 lower bound also counts the
     // sources themselves as 0-hop endpoints.
     if *min > 1 {
@@ -3331,7 +3396,8 @@ fn varlen_agg_dfs(
     max: u32,
     dir: Dir,
     want: &[u32],
-    trail: bool,
+    mode: PathMode,
+    start: u32,
     used: &mut Vec<u32>,
     emit: &mut dyn FnMut(u32),
 ) {
@@ -3364,11 +3430,18 @@ fn varlen_agg_dfs(
         if is_inc && drop_loop && a.nbr == v {
             continue;
         }
-        if trail && used.contains(&a.eid) {
-            continue;
-        }
-        if trail {
-            used.push(a.eid);
+        let mark = match varlen_step(mode, start, a, used) {
+            VarStep::Skip => continue,
+            VarStep::Close => {
+                if len + 1 >= min {
+                    emit(a.nbr);
+                }
+                continue;
+            }
+            VarStep::Go(mark) => mark,
+        };
+        if let Some(m) = mark {
+            used.push(m);
         }
         varlen_agg_dfs(
             store,
@@ -3378,11 +3451,12 @@ fn varlen_agg_dfs(
             max,
             dir,
             want,
-            trail,
+            mode,
+            start,
             used,
             emit,
         );
-        if trail {
+        if mark.is_some() {
             used.pop();
         }
     }
@@ -3421,7 +3495,7 @@ fn try_varlen_agg(
         edge_label,
         min,
         max,
-        trail,
+        mode,
     } = input
     else {
         return None;
@@ -3445,10 +3519,17 @@ fn try_varlen_agg(
         return None;
     };
     let column = store.column(key)?; // property absent everywhere → fall back
+    let node_unique = matches!(mode, PathMode::Simple | PathMode::Acyclic);
     let dfs = |emit: &mut dyn FnMut(u32)| {
         let mut used: Vec<u32> = Vec::new();
         for &v in src {
-            varlen_agg_dfs(store, v, 0, *min, *max, *dir, &want, *trail, &mut used, emit);
+            if node_unique {
+                used.push(v); // mark the start node
+            }
+            varlen_agg_dfs(store, v, 0, *min, *max, *dir, &want, *mode, v, &mut used, emit);
+            if node_unique {
+                used.pop();
+            }
         }
     };
 
@@ -4729,8 +4810,9 @@ fn try_frontier_aggregate(
 /// `min..=max` from the node in `from`, and emit one output row per path with the
 /// reached endpoint appended as a new slot. `min == 0` emits the source itself.
 ///
-/// `trail` chooses the semantics and nothing else does: true forbids reusing an
-/// edge within one path (a trail), false allows it (a walk). They diverge on a
+/// `mode` chooses the semantics and nothing else does (see [`PathMode`]): `Trail`
+/// forbids reusing an edge, `Walk` allows anything, `Simple`/`Acyclic` forbid
+/// reusing a node (Simple permits the closing `start == end`). They diverge on a
 /// cycle/self-loop — pinned by the tests — and are never conflated with a chain
 /// of separate fixed `Expand`s (which is always a walk).
 #[allow(clippy::too_many_arguments)]
@@ -4742,7 +4824,7 @@ fn var_length(
     edge_label: &[String],
     min: u32,
     max: u32,
-    trail: bool,
+    mode: PathMode,
 ) -> Batch {
     let empty = || {
         let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
@@ -4759,11 +4841,20 @@ fn var_length(
 
     let mut keep = Vec::new();
     let mut ends = Vec::new();
-    let mut used: Vec<u32> = Vec::new(); // edge ids on the current path (trail only)
+    // For Trail this is the EDGE stack; for Simple/Acyclic the NODE stack (seeded
+    // with the start). Empty for Walk.
+    let mut used: Vec<u32> = Vec::new();
+    let node_unique = matches!(mode, PathMode::Simple | PathMode::Acyclic);
     for (row, &v) in src.iter().enumerate() {
+        if node_unique {
+            used.push(v); // mark the start node
+        }
         varlen_dfs(
-            store, v, 0, min, max, dir, &want, trail, &mut used, row, &mut keep, &mut ends,
+            store, v, 0, min, max, dir, &want, mode, v, &mut used, row, &mut keep, &mut ends,
         );
+        if node_unique {
+            used.pop();
+        }
         debug_assert!(used.is_empty());
     }
 
@@ -4774,8 +4865,9 @@ fn var_length(
 
 /// Depth-first path enumeration for `var_length`. Emits `(row, endpoint)` at
 /// every length in `min..=max` reached from the source, pushing straight into
-/// `keep`/`ends` (a recursion-friendly alternative to a closure). For a trail,
-/// `used` holds the edge ids on the current path and blocks reuse.
+/// `keep`/`ends` (a recursion-friendly alternative to a closure). `used` holds the
+/// on-path elements that block reuse under `mode` — edge ids for a trail, node ids
+/// for Simple/Acyclic (seeded with `start`). See [`varlen_step`].
 #[allow(clippy::too_many_arguments)]
 fn varlen_dfs(
     store: &Store,
@@ -4785,7 +4877,8 @@ fn varlen_dfs(
     max: u32,
     dir: Dir,
     want: &[u32],
-    trail: bool,
+    mode: PathMode,
+    start: u32,
     used: &mut Vec<u32>,
     row: usize,
     keep: &mut Vec<usize>,
@@ -4825,11 +4918,20 @@ fn varlen_dfs(
         if is_inc && drop_loop && a.nbr == v {
             continue;
         }
-        if trail && used.contains(&a.eid) {
-            continue; // a trail may not reuse an edge
-        }
-        if trail {
-            used.push(a.eid);
+        let mark = match varlen_step(mode, start, a, used) {
+            VarStep::Skip => continue,
+            VarStep::Close => {
+                // Emit the closing endpoint (the start) at this length, no descent.
+                if len + 1 >= min {
+                    keep.push(row);
+                    ends.push(a.nbr);
+                }
+                continue;
+            }
+            VarStep::Go(mark) => mark,
+        };
+        if let Some(m) = mark {
+            used.push(m);
         }
         varlen_dfs(
             store,
@@ -4839,13 +4941,14 @@ fn varlen_dfs(
             max,
             dir,
             want,
-            trail,
+            mode,
+            start,
             used,
             row,
             keep,
             ends,
         );
-        if trail {
+        if mark.is_some() {
             used.pop();
         }
     }
@@ -5810,7 +5913,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             edge_label,
             min,
             max,
-            trail,
+            mode,
         } => var_length(
             &pull_body(input, store, seed)?,
             store,
@@ -5819,7 +5922,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             edge_label,
             *min,
             *max,
-            *trail,
+            *mode,
         ),
         Plan::Filter { input, pred } => {
             let b = pull_body(input, store, seed)?;
@@ -9846,7 +9949,7 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .var_length(0, Dir::Out, &["R".to_string()], 1, 2, true)
+            .var_length(0, Dir::Out, &["R".to_string()], 1, 2, PathMode::Trail)
             .project(vec![("end".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);
@@ -9866,7 +9969,7 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .var_length(0, Dir::Out, &["R".to_string()], 0, 2, true)
+            .var_length(0, Dir::Out, &["R".to_string()], 0, 2, PathMode::Trail)
             .project(vec![("end".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);
@@ -9887,12 +9990,12 @@ mod tests {
 
         let walk = base
             .clone()
-            .var_length(0, Dir::Out, &["R".to_string()], 1, 2, false)
+            .var_length(0, Dir::Out, &["R".to_string()], 1, 2, PathMode::Walk)
             .project(vec![("end".into(), prop(1, "name"))]);
         assert_eq!(run(&walk, &store).rows.len(), 2, "walk reuses the edge");
 
         let trail = base
-            .var_length(0, Dir::Out, &["R".to_string()], 1, 2, true)
+            .var_length(0, Dir::Out, &["R".to_string()], 1, 2, PathMode::Trail)
             .project(vec![("end".into(), prop(1, "name"))]);
         assert_eq!(
             run(&trail, &store).rows.len(),
@@ -9917,14 +10020,84 @@ mod tests {
 
         let trail = from_a
             .clone()
-            .var_length(0, Dir::Out, &["R".to_string()], 1, 3, true)
+            .var_length(0, Dir::Out, &["R".to_string()], 1, 3, PathMode::Trail)
             .project(vec![("end".into(), prop(1, "name"))]);
         assert_eq!(run(&trail, &store).rows.len(), 2); // b (len1), a (len2)
 
         let walk = from_a
-            .var_length(0, Dir::Out, &["R".to_string()], 1, 3, false)
+            .var_length(0, Dir::Out, &["R".to_string()], 1, 3, PathMode::Walk)
             .project(vec![("end".into(), prop(1, "name"))]);
         assert_eq!(run(&walk, &store).rows.len(), 3); // b, a, b
+    }
+
+    /// Build the triangle a->b->c->a with a spur a->d — the ACYCLIC/SIMPLE fixture.
+    #[cfg(test)]
+    fn triangle_with_spur() -> Store {
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[("name", s("a"))]);
+        let bb = b.node(&["N"], &[("name", s("b"))]);
+        let c = b.node(&["N"], &[("name", s("c"))]);
+        let d = b.node(&["N"], &[("name", s("d"))]);
+        b.edge(a, bb, "R");
+        b.edge(bb, c, "R");
+        b.edge(c, a, "R"); // closes the cycle back to the start
+        b.edge(a, d, "R");
+        b.build()
+    }
+
+    /// ACYCLIC forbids repeating ANY node — the hop c->a back to the start is
+    /// rejected, so from a over `{1,3}` the endpoints are b, c, d (never a).
+    #[test]
+    fn varlen_acyclic_forbids_revisiting_the_start() {
+        let store = triangle_with_spur();
+        let plan = scan("N")
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
+            .var_length(0, Dir::Out, &["R".to_string()], 1, 3, PathMode::Acyclic)
+            .project(vec![("end".into(), prop(1, "name"))]);
+        let mut got = names_of(&run(&plan, &store), 0);
+        got.sort();
+        assert_eq!(got, vec!["b", "c", "d"]); // no `a`: acyclic can't cycle back
+    }
+
+    /// SIMPLE forbids repeating an INTERIOR node but PERMITS a path that closes on
+    /// its own start (start == end). From a over `{1,3}` the cycle a->b->c->a is a
+    /// legal simple (closed) path, so `a` is emitted alongside b, c, d.
+    #[test]
+    fn varlen_simple_allows_the_closing_cycle() {
+        let store = triangle_with_spur();
+        let plan = scan("N")
+            .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
+            .var_length(0, Dir::Out, &["R".to_string()], 1, 3, PathMode::Simple)
+            .project(vec![("end".into(), prop(1, "name"))]);
+        let mut got = names_of(&run(&plan, &store), 0);
+        got.sort();
+        assert_eq!(got, vec!["a", "b", "c", "d"]); // `a` via the closing cycle
+    }
+
+    /// Over a 2-cycle a<->b from a with `{1,4}`, the count driver must respect the
+    /// node modes (not the algebraic trail shortcut): SIMPLE emits b (len1) and the
+    /// closing a (len2) = 2; ACYCLIC emits only b = 1 (a would repeat the start).
+    #[test]
+    fn varlen_count_honors_node_modes() {
+        let mut b = Builder::default();
+        let a = b.node(&["N"], &[("name", s("a"))]);
+        let bb = b.node(&["N"], &[("name", s("b"))]);
+        b.edge(a, bb, "R");
+        b.edge(bb, a, "R");
+        let store = b.build();
+        let from_a = scan("N").filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))));
+        let count = |mode| {
+            let plan = from_a
+                .clone()
+                .var_length(0, Dir::Out, &["R".to_string()], 1, 4, mode)
+                .aggregate(vec![], vec![agg(AggFn::Count, None, false, "c")]);
+            match run(&plan, &store).rows[0][0] {
+                Value::Num(n) => n,
+                ref other => panic!("want num, got {other:?}"),
+            }
+        };
+        assert_eq!(count(PathMode::Simple), 2.0);
+        assert_eq!(count(PathMode::Acyclic), 1.0);
     }
 
     /// Exact length `{2,2}` emits only the 2-hop endpoints.
@@ -9939,7 +10112,7 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .var_length(0, Dir::Out, &["R".to_string()], 2, 2, true)
+            .var_length(0, Dir::Out, &["R".to_string()], 2, 2, PathMode::Trail)
             .project(vec![("end".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         assert_eq!(names_of(&out, 0), vec!["c"]); // only the 2-hop endpoint
