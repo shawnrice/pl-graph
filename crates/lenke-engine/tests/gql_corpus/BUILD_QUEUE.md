@@ -551,3 +551,29 @@ stride RepeatGroup materializing nested `Value::List`.
     / str+num / oversized-int / overflow-exponent), date_part strict, faulting_aggregate, call_config*\*\_error,
     zero_bound_3 (core treats {0,0} as {0,1} — engine's 4 is ISO-correct), temporal_duration (core lacks
     duration ordering — engine's compare is correct).
+
+### ROUND 10 — nested subpath groups implemented, fuzzer-driven (55 -> 42; 13 of 14 nested cleared)
+
+`Plan::NestedGroup` over a recursive `GUnit`/`GElem` IR (`exec.rs::nested_group`): a 2-level (single-Sub
+inner) double-DFS emitting `levels`-tagged `StepRec`s, materialized into nested `Value::List`s by the
+recursive `bind_nested` (a port of core's pathfind model — the fuzzer compares as a multiset, so only the
+SET of (endpoint + nested group-var lists) must match, not core's enumeration order). Parser:
+`subpath_group_is_nested()` routes to `parse_nested_group`; `group_var_depth` + `field_chain` type
+`x[i][j].prop` at the right depth. Each step fuzzer-driven (`FUZZ_HARD=all`), each gate-green:
+
+- basic list-of-lists group vars (7): nested_outer_gv_2, nested_paren_lol, nested_paren_varying_1/2,
+  nested_quant_ends_2, nested_quant_gv_vectorize, vqs_16
+- per-hop edge WHERE / inline props on the inner hop (2): nested_per_hop_edge_1/2 (`GElem::Hop.edge_pred`)
+- per-rep WHERE (4): nested_per_rep_where_1/2/3/4 (per-rep view = one level shallower, `bind_nested`
+  key_start=1; parser decrements group_var_depth while parsing the WHERE)
+
+Nested is now DEFAULT fuzz coverage (`Caps::supported() == all`). Fuzzer-found + fixed 3 real bugs in
+shipped constructs along the way (round 9): shortest `->+(t)` source-cycle (cleared
+any_shortest_plus_seed_cycle_len), and the unknown-edge-type zero-rep source for shortest/group.
+
+REMAINING FEATURE (2, each its own structural extension):
+- nested_quant_ends_3 — a MULTI-SEGMENT inner unit (`( ()-[:R]->()-[:R]->{1,2}() ){1}`): the outer body is
+  [Hop, Sub], not a single Sub. Needs a general multi-element GUnit matcher (match_seq over outer elems).
+- for_drives_batch_optional_match — FOR-driven fresh-var OPTIONAL MATCH: correlated inline-prop EXPRESSIONs
+  (props() takes only literals) + a left-outer correlated node scan.
+Plus the deferred empty-inner-rep `{0,n}` epsilon-closure (fuzzer's nested inner is min>=1).
