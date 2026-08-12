@@ -220,3 +220,30 @@ User directive: fix all remaining deferred items (they were deferred for effort,
   value_subquery_aggregate (3), num_string_overflow (3, likely value-contract), exists_multi_match (4).
 - VALUE-CONTRACT (surface, don't flip): num_string_overflow, sum/avg-over-temporal faults,
   oversized-int, CAST-throws. Left baselined by design.
+
+### ROUND 6 (cont.) — 202 -> 190
+
+- **Named path over a non-shortest var-length — DONE** (commit 0095a5cc, 202->194, 8 cases).
+  Lifted the "named path requires a shortest selector" parser restriction; var_length now
+  builds a Lineage sidecar (node/edge chain stack + push_path, shared with shortest_path) so
+  path_length(p)/edges(p)/nodes(p) resolve over a plain var-length body. New PathBufs struct.
+  bare_path_binds_simple_cycle stays baselined (needs repeated-pattern-variable `(a)…(a)`
+  equality join — a separate feature).
+- **LIMIT 0 short-circuits before projection — DONE** (commit 10d32af0, 194->190, 4 cases).
+  OrderPage with limit==0 returns empty without pulling its input, so a faulting projection
+  (`RETURN 1/0 AS x LIMIT 0`) yields empty (matches core) instead of erroring.
+
+### NEXT (baseline 190), tractable -> hard:
+
+- **repeated-pattern-variable equality join `(a)…(a)` / `(x)-[]->(x)`** (bare_path_binds_simple_cycle
+  + likely others): a variable used twice in a pattern pins the two slots equal (post-filter
+  new_slot == existing_slot). Check how node() binds a name already in scope. SMALL-MED.
+- **`->{0,0}` zero-bound quantifier** (zero_bound_3): min=max=0 var-length = stay at source,
+  count = source count. Likely a var_length min==max==0 edge case. SMALL.
+- **per-hop WHERE in a subpath group `((x)-[e:R]->(y) WHERE pred){n,m}`** (~10: qsp_per_hop_*,
+  vqs_8, subpath_where_*) where the WHERE only filters. MEDIUM.
+- **THE BIG ONE: group-variable-as-list `Plan::RepeatGroup`** (~21: qsp_group_vars_*, gv_*,
+  vqs_7/9/11/…). Its own iteration. Expr::Index (done) + var_length lineage (done) are prereqs.
+- Smaller: order_alias (4, NULLS FIRST / DISTINCT+ORDER-BY-underlying-expr), distinct_nan (3),
+  group_by_bound (3, LET/WITH bound name + GROUP BY), exists_multi_match (4, EXISTS{ MATCH MATCH }).
+- VALUE-CONTRACT (surface, don't flip): num_string_overflow, sum/avg-over-temporal, oversized-int, CAST-throws.
