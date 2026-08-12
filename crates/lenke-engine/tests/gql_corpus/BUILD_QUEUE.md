@@ -164,7 +164,20 @@ User directive: fix all remaining deferred items (they were deferred for effort,
    Verify EVERY iteration: cargo test --release --lib; differential_fuzz seeds 1 & 42 (byte-identity); clippy 0; re-baseline CORPUS_BASELINE=1 (0 NEW); commit; update this file.
 
 ### Round-5 progress + reclassification (baseline 280)
-- count(*)+1 aggregate-in-projection-expr — DONE (commit c538ee7d, 281->280).
+
+- count(\*)+1 aggregate-in-projection-expr — DONE (commit c538ee7d, 281->280).
 - RECLASSIFIED: **aggregate-type faults (avg/sum over temporal/mixed/list) are VALUE-CONTRACT, not safe error-parity.** fold_grouped deliberately POISONS a non-numeric aggregate group to NULL (explicit code comment), the SAME postgres-style non-numeric->NULL model as arith `'abc'+1`->NULL. Core THROWS. Changing sum/avg to throw = changing the value contract the user chose. SURFACE, do not silently flip. Same bucket: oversized/overflow int literals, str/bool + num arith. => user decision.
-- Genuinely SAFE error-parity (fix, no value-contract change): reserved-word-as-identifier (parser rejects a reserved keyword used as a bare name), CALL config validation (call_config_*). date_part_* needs checking (may be non-date->throw = value-contract, or a missing-fn = safe).
+- Genuinely SAFE error-parity (fix, no value-contract change): reserved-word-as-identifier (parser rejects a reserved keyword used as a bare name), CALL config validation (call*config*_). date*part*_ needs checking (may be non-date->throw = value-contract, or a missing-fn = safe).
 - Next FEATURE work (unambiguous, the bulk): edge-label negation -[:!T]->, node-label expr in WHERE, SHORTEST k>=2, reverse-correlated subquery, FOR..IN, per-hop var-length WHERE, and THE BIG ONE ((..)){n,m} (~85, scout first).
+
+### Round-5 progress (baseline 265)
+- label expression in a WHERE predicate x:A|B (commit e8c8f56f) — 280->279.
+- reverse-correlated COUNT/EXISTS subquery (commit 9f153740) — 279->273 (6). Forward landing-slot contract validated it.
+- Subpath-group `((..)){n,m}` INCREMENT 1 (single-edge, endpoint-only -> var_length desugar) (commit bd883674) — 273->265 (8). Parser hook: is_subpath_group_start / parse_subpath_group in gql.rs; unanchored `((` seeds Scan{None} in pattern().
+
+### Subpath-group scout plan (real gap = 48 cases, staged):
+- INC 1 DONE (single-edge endpoint-only, 8 cases).
+- INC 2 (multi-hop body, endpoint-only ~5: mea_trail, qsp_multi_ends_1/2; mea_acyclic/simple DEFER — path mode on multi-hop): bounded-unroll `{n,m}` into r*k Expands UNION'd; RISK: unroll is a WALK, not Trail — only safe where no edge repeats in reach or `{n,n}` exact. Check each fixture.
+- INC 3 (group-var-as-list in RETURN, ~21: qsp_group_vars_*, gv_*, vqs_7/9/11/13/14/15/19/21/22/23, unanchored_path_len/nodes_size): NEEDS (a) new `Plan::RepeatGroup{body,min,max,mode,group_slots,...}` in ir.rs + a DFS repeater in exec that materializes one Value::List per group slot (columnar analogue of core bind_group_vars_flat pathfind.rs:163), AND (b) `Expr::Index{base,idx}` — subscript `x[i]` — parse postfix `[` in field_chain (gql.rs), eval next to Expr::Field. Expr::Index is a HARD PREREQ (y[size(y)-1], x[0].id). LARGE.
+- INC 4 DEFER: nested `((..){a,b}){n,m}` list-of-lists (bind_unit recursion), per-rep WHERE with per-rep vars (e.amt<=x.bal — the per-hop-WHERE feature).
+Row order NOT a hazard (multiset compare; ordered:true cases carry ORDER BY).
