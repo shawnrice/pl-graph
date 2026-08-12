@@ -1917,7 +1917,56 @@ fn fold_grouped(agg: &Agg, arg_col: Option<&Col>, group_of: &[u32], n_groups: us
             }
             best.into_iter().map(|o| o.unwrap_or(Value::Null)).collect()
         }
+        AggFn::StddevPop | AggFn::StddevSamp => {
+            // One-pass moments per group: a present non-null value contributes as a
+            // number (a non-numeric one as NaN, which propagates — matching core's
+            // stddev over a non-numeric column). NULLs are skipped.
+            let sample = agg.func == AggFn::StddevSamp;
+            let mut sum = vec![0f64; n_groups];
+            let mut sum_sq = vec![0f64; n_groups];
+            let mut cnt = vec![0u64; n_groups];
+            for (i, &g) in group_of.iter().enumerate() {
+                let v = col.value_at(i);
+                if v.is_null() {
+                    continue;
+                }
+                let x = value::num_of(&v).unwrap_or(f64::NAN);
+                let g = g as usize;
+                sum[g] += x;
+                sum_sq[g] += x * x;
+                cnt[g] += 1;
+            }
+            (0..n_groups)
+                .map(|g| stddev_of(cnt[g], sum[g], sum_sq[g], sample))
+                .collect()
+        }
     }
+}
+
+/// Population / sample standard deviation from one-pass moments — replicated exactly
+/// from core's `stddev_of`. `pop` is NULL over 0 rows, `samp` over fewer than 2; the
+/// summed squared deviation is clamped at 0 (preserving NaN) so f64 cancellation
+/// can't slip a tiny negative into `sqrt`.
+fn stddev_of(n: u64, sum: f64, sum_sq: f64, sample: bool) -> Value {
+    let denom = if sample {
+        if n < 2 {
+            return Value::Null;
+        }
+        (n - 1) as f64
+    } else {
+        if n == 0 {
+            return Value::Null;
+        }
+        n as f64
+    };
+    let nf = n as f64;
+    let variance = (sum_sq - sum * sum / nf) / denom;
+    let clamped = if variance.is_nan() {
+        f64::NAN
+    } else {
+        variance.max(0.0)
+    };
+    Value::Num(clamped.sqrt())
 }
 
 /// A hop: for each input row, expand the node in slot `from` along `dir`,

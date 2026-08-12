@@ -214,6 +214,11 @@ pub enum AggFn {
     /// an all-null (or empty) group folds to the empty list. Distinct from `Collect`
     /// so Gremlin `fold()` (which keeps nulls) stays unchanged.
     CollectList,
+    /// Population / sample standard deviation from the one-pass moments
+    /// `sqrt((Σx² − (Σx)²/n) / denom)`, denom = `n` (pop) or `n−1` (samp). `pop` is
+    /// NULL over 0 rows, `samp` over fewer than 2. Matches core's `stddev_of`.
+    StddevPop,
+    StddevSamp,
 }
 
 /// One aggregate in an `Aggregate` operator: `func(arg)` (or `func(DISTINCT

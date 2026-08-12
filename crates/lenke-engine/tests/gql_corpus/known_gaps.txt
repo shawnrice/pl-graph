@@ -431,12 +431,6 @@ tests_f.jsonl::standalone_page_1
 tests_f.jsonl::standalone_page_2
 tests_f.jsonl::standalone_page_3
 tests_f.jsonl::standalone_page_4
-tests_f.jsonl::stddev_nonnum_1
-tests_f.jsonl::stddev_nonnum_2
-tests_f.jsonl::stddev_nonnum_3
-tests_f.jsonl::stddev_num_1
-tests_f.jsonl::stddev_num_2
-tests_f.jsonl::stddev_num_3
 tests_f.jsonl::streamed_count_1
 tests_f.jsonl::streamed_count_10
 tests_f.jsonl::streamed_count_11

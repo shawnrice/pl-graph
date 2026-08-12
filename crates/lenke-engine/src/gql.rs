@@ -97,6 +97,8 @@ fn agg_fn(name: &str) -> Option<AggFn> {
         // Core's list aggregate is `collect_list` (SKIPS nulls); `collect` is a
         // superset alias. Distinct from Gremlin fold's null-keeping `Collect`.
         "COLLECT_LIST" | "COLLECT" => AggFn::CollectList,
+        "STDDEV_POP" => AggFn::StddevPop,
+        "STDDEV_SAMP" => AggFn::StddevSamp,
         _ => return None,
     })
 }
