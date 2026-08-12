@@ -2195,9 +2195,13 @@ impl Parser {
                 }
             }
             edge_vars.push(rel.var.clone());
-            // An INNER quantifier — `( ()-[:R]->{a,b}() ){c,d}`. Only supported for a
-            // single anonymous endpoint-only hop, which the caller desugars to one
-            // var-length over the combined bounds. Reject any other multi-hop mix.
+            // An INNER quantifier — `( ()-[:R]->{a,b}() ){c,d}` (a var-length inside
+            // the group). Two supported shapes:
+            //  - FIXED `{m,m}` (anonymous edge): each rep is exactly `m` hops, so it is
+            //    a `k = m` unit — the source and target may be named group variables;
+            //    the `m-1` intermediates are anonymous.
+            //  - VARIABLE `{a,b}` but ANONYMOUS endpoints: an endpoint-only nested
+            //    group, desugared to a var-length by the caller (single outer rep only).
             if let Some((imin, imax)) = self.opt_quantifier()? {
                 let n = self.node()?;
                 if bad_inner(&n) {
@@ -2207,12 +2211,42 @@ impl Parser {
                             .into(),
                     );
                 }
-                if first.0.is_some() || rel.var.is_some() || n.0.is_some() || node_vars.len() != 1 {
-                    return Err(
-                        "a quantified subpath-group body with bound inner variables is \
-                                not supported yet"
-                            .into(),
-                    );
+                if node_vars.len() != 1 || rel.var.is_some() {
+                    return Err("a quantified subpath-group body with a bound inner edge \
+                                or a preceding hop is not supported yet"
+                        .into());
+                }
+                if imin == imax && imin >= 1 {
+                    // `k = m` unit: source at position 0, target at position m, the
+                    // intermediates anonymous. The single parsed (anonymous) edge var
+                    // stands for all `m` hops.
+                    let k = imin;
+                    edge_vars = vec![None; k as usize];
+                    node_vars = vec![first.0.clone()];
+                    for _ in 1..k {
+                        node_vars.push(None);
+                    }
+                    node_vars.push(n.0.clone());
+                    self.expect(&Tok::RParen)?;
+                    let (min, max) = self
+                        .opt_quantifier()?
+                        .ok_or("a subpath group requires a `{n,m}` / `*` / `+` quantifier")?;
+                    return Ok(SubpathGroup {
+                        dir: dir.expect("at least one hop"),
+                        etypes: etypes.expect("at least one hop"),
+                        min,
+                        max,
+                        k,
+                        node_vars,
+                        edge_vars,
+                        per_rep_pred: None,
+                        inner_quant: None,
+                    });
+                }
+                if first.0.is_some() || n.0.is_some() {
+                    return Err("a variable-length subpath-group body with bound inner \
+                                variables is not supported yet"
+                        .into());
                 }
                 node_vars.push(n.0.clone());
                 self.expect(&Tok::RParen)?;
