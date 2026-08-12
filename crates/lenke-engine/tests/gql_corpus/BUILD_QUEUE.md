@@ -14,6 +14,7 @@ Verify every feature: `cargo test --release --lib`; differential_fuzz seeds 1 & 
 - TRIM spec-form + round(2-arg)/atan2/log10/list_sort(order,nullOrder) — 391->381 (10 cases).
 - INSERT..RETURN binds created nodes (parallel worktree agent, merged 867e2bd3) — 3 cases.
 - ACYCLIC / SIMPLE path modes (parallel worktree agent, cherry-picked c6e2b751) — 11 cases. VarLength `trail:bool`→`mode:PathMode`. bare_all_composes_mode / bare_path_binds_simple_cycle stay blocked (need `((..)){n}` subpath group). [Combined parallel re-baseline: 377->363.]
+- ALL SHORTEST / SHORTEST 1 selectors (commit 2b480fe3) — 363->350 (13 cases; inline shortest-endpoint props also unblocked ANY-SHORTEST subscript cases). k>=2 + per-hop WHERE deferred.
 - SELECT..FROM MATCH **phase 1** (constant / projection / global-agg / GROUP BY via implicit grouping) — 381->377 (4 cases). Refactored `match_body` + `project_and_page` (both now shared with SELECT). **Phase 2 (HAVING) still TODO** — 7 `select_having_*` cases; needs GROUP BY that forces a group with NO agg in the SELECT list, an `extract_aggs` expr-walker to hoist HAVING/ORDER aggregates into the group aggs, and a post-aggregation filter with slot rewriting (keys-then-aggs schema). Currently `SELECT … HAVING` errors (baselined). See queue section 3 Phase 2.
 
 ## ~~1. Edge-label disjunction~~ DONE — ~~~24 cases~~ 16 cases
@@ -48,14 +49,17 @@ Pure parser desugar to MATCH+RETURN. Keywords non-reserved (no lexer change).
 - Phase 2 (cases 82-88, HAVING/GROUP BY): GROUP BY forces grouping even w/o agg in SELECT; HAVING lowered input-scope, aggs extracted (new `extract_aggs` expr-walker) into group aggs, evaluated post-agg. `aggregating = has_agg_items || group_keys || having`. plan.aggregate(keys,aggs)->filter(rewritten_having)->project(item order)->order_page. HAVING null drops all (3VL filter). Final project in ITEM order (Aggregate emits keys-then-aggs).
 - GOTCHA: item-order vs aggregate key-then-agg order coincide for corpus (keys before count(\*)); Phase 2 project fixes latent hazard.
 
-## 4. ALL SHORTEST / SHORTEST 1 — READY TO IMPLEMENT (worktree agent was blocked by a bad fork base; design below is complete & verified against current code)
+## 4. ALL SHORTEST / SHORTEST 1 — DONE (commit 2b480fe3, 363->350, 13 cases; k>=2 + per-hop WHERE deferred)
+
+<details><summary>original design (implemented)</summary> (worktree agent was blocked by a bad fork base; design below is complete & verified against current code)
 
 Concrete plan (implement in the MAIN tree; agent a5af0ba3 could not because its worktree predated the crate):
+
 - ir.rs: `enum ShortestSelector { Any, All }`; add `min: u32` + `selector: ShortestSelector` to `Plan::ShortestPath` (currently has input/from/dir/edge_label/max); update the `shortest_path(...)` builder signature.
 - gql.rs `shortest_path_binding` + `query`: accept `ANY SHORTEST`/`ALL SHORTEST`/`SHORTEST 1[ GROUP|GROUPS]` (→Any; `1 GROUP`→All; k>=2 and k=0 → parse error). Add a BARE-selector entry (no path var) before match_body. Translate inline endpoint/seed `label`+`{props}` into Scan-label + node_prop_filters (seed below the hop, endpoint filters above it; a same-var endpoint like `->{1,3}(a)` → a `Slot(src)=Slot(end)` equality filter). Keep rejecting per-hop edge WHERE. Thread `min` from `*`(0)/`+`(1).
 - exec.rs `shortest_path` (+ dispatch ~900): record ALL min-distance predecessors and enumerate the shortest-path DAG (`enumerate_shortest_paths`), emitting one row per distinct shortest path so endpoint multiplicity is right WITH OR WITHOUT lineage (do NOT gate multiplicity on `track`). Endpoints = nodes with `dist >= min`, so `*`(min 0) emits the seed at dist 0 (zero-length-to-self). `Any` keeps only the FIRST predecessor → one row per endpoint (existing 4 unit tests stay green at min=1). Mirror core all_shortest_walk / shortest_ends (crates/lenke-core/src/gql/eval/pathfind.rs). Seed-cycle re-emission is NOT needed for any required case.
 - opt.rs: 4 `Plan::ShortestPath { .. }` match arms (rewrite ~202/211, pushdown ~671/681/697) need `min, selector` added to destructure + reconstruction. ALSO cost.rs estimate arm.
-- Fixes all 8 all_shortest_*/shortest_1_* cases + incidental ANY-SHORTEST inline-props cases. DEFER SHORTEST k>=2 + shortest_k_per_hop_pred (parse error).
+- Fixes all 8 all*shortest*_/shortest*1*_ cases + incidental ANY-SHORTEST inline-props cases. DEFER SHORTEST k>=2 + shortest_k_per_hop_pred (parse error).
 
 ## 4-OLD. (scout summary, superseded by the design above)
 
