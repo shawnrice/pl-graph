@@ -6382,6 +6382,31 @@ mod tests {
         );
     }
 
+    /// The cross-type total order (Num < Str < Bool < Temporal < compound < Null,
+    /// matching core) drives ORDER BY / min / max over a mixed-type column.
+    #[test]
+    fn mixed_type_total_order() {
+        let nd = concat!(
+            "{\"id\":\"1\",\"labels\":[\"X\"],\"props\":{\"v\":2}}\n",
+            "{\"id\":\"2\",\"labels\":[\"X\"],\"props\":{\"v\":\"a\"}}\n",
+            "{\"id\":\"3\",\"labels\":[\"X\"],\"props\":{\"v\":1}}\n",
+            "{\"id\":\"4\",\"labels\":[\"X\"],\"props\":{\"v\":true}}\n",
+            "{\"id\":\"5\",\"labels\":[\"X\"],\"props\":{\"v\":\"b\"}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let col0 = |q: &str| -> Vec<String> {
+            run(&super::parse(q).unwrap(), &store).rows.iter().map(|r| format!("{:?}", r[0])).collect()
+        };
+        // ORDER BY asc: numbers, then strings, then bool.
+        assert_eq!(
+            col0("MATCH (n:X) RETURN n.v AS v ORDER BY n.v"),
+            vec!["Num(1.0)", "Num(2.0)", "Str(\"a\")", "Str(\"b\")", "Bool(true)"]
+        );
+        // min = the smallest number; max = the bool (highest rank present).
+        assert_eq!(col0("MATCH (n:X) RETURN min(n.v) AS m"), vec!["Num(1.0)"]);
+        assert_eq!(col0("MATCH (n:X) RETURN max(n.v) AS m"), vec!["Bool(true)"]);
+    }
+
     // --- part 3.8: string functions (E4a) ---
 
     /// upper/lower/trim/length/substring/replace on alice's name — hand-computed.

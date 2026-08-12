@@ -31,16 +31,12 @@ tests_b.jsonl::cast_list
 tests_b.jsonl::exists_bound_a_a_plus
 tests_b.jsonl::exists_bound_a_e_plus
 tests_b.jsonl::malformed_num_1e999_error
-tests_b.jsonl::max_total_order
-tests_b.jsonl::min_total_order
 tests_b.jsonl::multiseg_u1_d2_bounded
 tests_b.jsonl::multiseg_u1_d2_star
 tests_b.jsonl::multiseg_u1_d3_bounded
 tests_b.jsonl::multiseg_u1_d3_star
 tests_b.jsonl::multiseg_u2_f1_bounded
 tests_b.jsonl::multiseg_u2_f1_star
-tests_b.jsonl::order_total_order_asc
-tests_b.jsonl::order_total_order_desc
 tests_b.jsonl::oversized_int_error
 tests_b.jsonl::sum_date_errors
 tests_c.jsonl::any_shortest_bounded_one_names

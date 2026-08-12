@@ -93,10 +93,15 @@ impl Value {
     /// The type rank for the cross-type total order. Kept private: only
     /// `cmp_total` should depend on the numbering.
     const fn rank(&self) -> u8 {
+        // Cross-type sort rank, matching core's `type_rank` (Num < Str < Bool <
+        // Temporal < compound) so ORDER BY / min / max / list_sort over a mixed
+        // column agrees byte-for-byte. Compound kinds keep distinct ranks (their
+        // relative order beyond core's shared "else" only matters for mixed-compound
+        // sorts, which stay as they were).
         match self {
-            Self::Bool(_) => 0,
-            Self::Num(_) => 1,
-            Self::Str(_) => 2,
+            Self::Num(_) => 0,
+            Self::Str(_) => 1,
+            Self::Bool(_) => 2,
             Self::Temporal(_) => 3,
             Self::List(_) => 4,
             Self::Record(_) => 5,
@@ -536,13 +541,15 @@ mod tests {
 
     #[test]
     fn cross_type_ordering_is_total_never_a_throw() {
-        // DIVERGENCE (recorded for J1): lenke-engine's `cmp_total` is a single
-        // deterministic total order over ANY pair — cross-type orders by rank and
-        // never faults — whereas lenke-core's GQL ordering raises E_INVALID_VALUE
-        // on incompatible types. Chosen so sort/group/min-max are total here.
-        assert_eq!(cmp_total(&n(1.0), &s("a")), Ordering::Less); // Num(1) < Str(2)
-        assert_eq!(cmp_total(&Value::Bool(true), &n(0.0)), Ordering::Less); // Bool(0) < Num(1)
-        assert_eq!(cmp_total(&s("z"), &Value::Null), Ordering::Less); // Str(2) < Null(last)
+        // lenke-engine's `cmp_total` is a single deterministic total order over ANY
+        // pair — cross-type orders by rank and never faults — where the `<=`/`<`
+        // OPERATOR raises E_INVALID_VALUE on incompatible types. The rank matches
+        // core's `type_rank`: Num < Str < Bool < Temporal < compound < Null, so
+        // ORDER BY / min / max over a mixed column agree byte-for-byte with core.
+        assert_eq!(cmp_total(&n(1.0), &s("a")), Ordering::Less); // Num(0) < Str(1)
+        assert_eq!(cmp_total(&Value::Bool(true), &n(0.0)), Ordering::Greater); // Bool(2) > Num(0)
+        assert_eq!(cmp_total(&s("z"), &Value::Bool(true)), Ordering::Less); // Str(1) < Bool(2)
+        assert_eq!(cmp_total(&s("z"), &Value::Null), Ordering::Less); // Str(1) < Null(last)
                                                                       // …and it is a strict total order: antisymmetric on the same pair.
         assert_eq!(cmp_total(&s("a"), &n(1.0)), Ordering::Greater);
     }
@@ -747,11 +754,11 @@ mod tests {
         // Nulls sort last, across types, without panicking.
         let mut xs = [Value::Null, n(2.0), s("z"), Value::Bool(true), n(1.0)];
         xs.sort_by(cmp_total);
-        // rank order: Bool, Num, Num, Str, Null
-        assert!(matches!(xs[0], Value::Bool(true)));
-        assert!(matches!(xs[1], Value::Num(x) if x == 1.0));
-        assert!(matches!(xs[2], Value::Num(x) if x == 2.0));
-        assert!(matches!(xs[3], Value::Str(_)));
+        // rank order (matching core): Num, Num, Str, Bool, Null
+        assert!(matches!(xs[0], Value::Num(x) if x == 1.0));
+        assert!(matches!(xs[1], Value::Num(x) if x == 2.0));
+        assert!(matches!(xs[2], Value::Str(_)));
+        assert!(matches!(xs[3], Value::Bool(true)));
         assert!(matches!(xs[4], Value::Null));
     }
 }
