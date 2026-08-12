@@ -5770,6 +5770,33 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             .find(|v| !v.is_null())
             .cloned()
             .unwrap_or(Value::Null),
+        // `x IS [NOT] TYPED <type> [NOT NULL]` desugars here: args are (value,
+        // category, not_null). A NULL value conforms to any nullable type (so it is
+        // `!not_null`); else the value's runtime type must match the category —
+        // replicated from core's `category_matches`/`value_is_typed_ty`.
+        "__is_typed" => {
+            let v = &args[0];
+            let category = match &args[1] {
+                Value::Str(s) => s.as_ref(),
+                _ => return Value::Null,
+            };
+            let not_null = matches!(args[2], Value::Bool(true));
+            if v.is_null() {
+                return Value::Bool(!not_null);
+            }
+            let ok = match category {
+                "any" => true,
+                "null" => false, // v is non-null here
+                "bool" => matches!(v, Value::Bool(_)),
+                "string" => matches!(v, Value::Str(_)),
+                "integer" => matches!(v, Value::Num(n) if n.is_finite() && n.fract() == 0.0),
+                "float" => matches!(v, Value::Num(_)),
+                "list" => matches!(v, Value::List(_)),
+                "record" => matches!(v, Value::Record(_)),
+                _ => false,
+            };
+            Value::Bool(ok)
+        }
         // `a || b || …` — left-associative concat (the parser folds a `||` run into
         // one call). Matches core's `concat_step` fold: ANY null operand → NULL; two
         // lists concatenate element-wise; otherwise both sides JS-string-coerce (via

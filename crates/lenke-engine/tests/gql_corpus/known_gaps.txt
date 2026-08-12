@@ -306,11 +306,6 @@ tests_e.jsonl::group_by_without_aggregate_is_distinct
 tests_e.jsonl::inline_element_where
 tests_e.jsonl::is_typed_closed_record_1
 tests_e.jsonl::is_typed_closed_record_2
-tests_e.jsonl::is_typed_null_conformance_1
-tests_e.jsonl::is_typed_null_conformance_2
-tests_e.jsonl::is_typed_open_record_1
-tests_e.jsonl::is_typed_open_record_2
-tests_e.jsonl::is_typed_scalar_numeric_inference
 tests_e.jsonl::is_typed_temporal_and_negation
 tests_e.jsonl::match_mode_different_edges
 tests_e.jsonl::match_mode_repeatable_elements

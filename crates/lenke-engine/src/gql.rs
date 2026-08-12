@@ -1643,6 +1643,40 @@ impl Parser {
                     negated,
                 });
             }
+            // `x IS [NOT] TYPED <value type> [NOT NULL]` — the ISO value-type
+            // predicate. Desugars to `__is_typed(x, '<category>', <not_null>)`; a NULL
+            // value conforms to any nullable type. Only the scalar/record/list
+            // categories are handled — temporal and closed-record-schema types
+            // deliberately parse-error (left to the general path / baseline).
+            if self.eat_kw("TYPED") {
+                let category = self.value_type_category()?;
+                let not_null = if self.peek_kw("NOT") {
+                    // `NOT NULL` modifier — but not if this `NOT` starts another clause.
+                    let save = self.pos;
+                    self.eat_kw("NOT");
+                    if self.eat_kw("NULL") {
+                        true
+                    } else {
+                        self.pos = save;
+                        false
+                    }
+                } else {
+                    false
+                };
+                let call = Expr::Call {
+                    name: "__is_typed".into(),
+                    args: vec![
+                        left,
+                        Expr::Lit(Value::Str(category.into())),
+                        Expr::Lit(Value::Bool(not_null)),
+                    ],
+                };
+                return Ok(if negated {
+                    Expr::Not(Box::new(call))
+                } else {
+                    call
+                });
+            }
             let want = if self.eat_kw("TRUE") {
                 true
             } else if self.eat_kw("FALSE") {
@@ -2101,6 +2135,37 @@ impl Parser {
     // count_subquery := COUNT '{' node ( rel [quant] node )* [WHERE pred] '}' — the
     // number of sub-matches per outer row (distinct from the `count(*)` aggregate,
     // which takes `(…)`). Same correlated body as EXISTS.
+    /// Parse the `<value type>` of an `IS TYPED` predicate into the category string
+    /// `category_matches` understands. Only the scalar/record/list vocabulary; a
+    /// temporal type or a closed `RECORD { … }` schema returns an error (those cases
+    /// are left unhandled rather than answered wrong).
+    fn value_type_category(&mut self) -> Result<&'static str, String> {
+        let ty = self.ident()?;
+        Ok(match ty.to_ascii_uppercase().as_str() {
+            "ANY" => {
+                if self.peek_kw("RECORD") {
+                    self.eat_kw("RECORD");
+                    "record"
+                } else {
+                    "any"
+                }
+            }
+            "RECORD" => {
+                if matches!(self.peek(), Some(Tok::LBrace)) {
+                    return Err("IS TYPED closed RECORD schema is not supported".into());
+                }
+                "record"
+            }
+            "INTEGER" | "INT" => "integer",
+            "FLOAT" => "float",
+            "STRING" => "string",
+            "BOOLEAN" | "BOOL" => "bool",
+            "LIST" => "list",
+            "NULL" => "null",
+            other => return Err(format!("IS TYPED {other} is not supported")),
+        })
+    }
+
     fn count_subquery_expr(&mut self) -> Result<Expr, String> {
         let (body, outer_width) = self.correlated_subquery_body("COUNT")?;
         Ok(Expr::CountSubquery {
