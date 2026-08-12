@@ -62,6 +62,22 @@ impl LabelExpr {
     }
 }
 
+/// The label predicate for a NON-seed node (a landing node — it has no `Scan` to
+/// carry a seed label, so the WHOLE label constraint is a filter). `None` when the
+/// node is unlabelled or `:%` (any). Combines the seed label and the compound
+/// residual that `node()` split apart.
+fn landing_label_filter(
+    label: Option<String>,
+    label_expr: Option<LabelExpr>,
+    slot: usize,
+) -> Option<Expr> {
+    if let Some(le) = label_expr {
+        Some(lower_label_expr(&le, slot)) // compound already includes the seed label
+    } else {
+        label.map(|l| lower_label_expr(&LabelExpr::Label(l), slot))
+    }
+}
+
 /// Lower a label expression to a boolean predicate over the node in `slot`: a label
 /// `L` → `'L' IN labels(slot)`, `%` → TRUE, with the boolean operators.
 fn lower_label_expr(le: &LabelExpr, slot: usize) -> Expr {
@@ -1690,7 +1706,7 @@ impl Parser {
         while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde)) {
             let rel = self.rel()?;
             let quant = self.opt_quantifier()?;
-            let (v2, _lbl2, v2_props, v2_where, _v2_le) = self.node()?; // a hop's landing-node label is ignored for now
+            let (v2, v2_label, v2_props, v2_where, v2_le) = self.node()?;
                                                                 // A relationship variable, inline edge properties, or an inline edge
                                                                 // WHERE require binding the edge as a slot (edge at `slots`, node at
                                                                 // `slots+1`) so `e.k` can resolve.
@@ -1749,6 +1765,11 @@ impl Parser {
                 *slots += 1;
                 plan = plan.expand(from, rel.dir, &rel.etypes);
                 from = node_slot;
+            }
+            // The landing node's LABEL constrains it (as core does) — a filter on the
+            // node's label set, since a landing node has no seed `Scan`.
+            if let Some(pred) = landing_label_filter(v2_label, v2_le, from) {
+                plan = plan.filter(pred);
             }
             // Inline props on the landing node filter it, exactly as a WHERE would.
             // (`from` is now that node's slot in every branch above.)
@@ -6330,6 +6351,35 @@ mod tests {
         assert_eq!(n("MATCH (x:!Software) RETURN count(*) AS c"), 2.0); // pa, p
         assert_eq!(n("MATCH (x:%) RETURN count(*) AS c"), 3.0); // any label
         assert_eq!(n("MATCH (x IS Person) RETURN count(*) AS c"), 2.0); // pa, p (= :Person)
+    }
+
+    /// A landing (non-seed) node's label constrains the hop, as core does — in a
+    /// plain MATCH and inside a COUNT{}/EXISTS{} subquery body.
+    #[test]
+    fn landing_node_label() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"name\":\"a\"}}\n",
+            "{\"id\":\"t\",\"labels\":[\"N\",\"Target\"],\"props\":{}}\n",
+            "{\"id\":\"x\",\"labels\":[\"N\"],\"props\":{}}\n",
+            "{\"id\":\"e1\",\"from\":\"a\",\"to\":\"t\",\"type\":\"R\",\"props\":{}}\n",
+            "{\"id\":\"e2\",\"from\":\"a\",\"to\":\"x\",\"type\":\"R\",\"props\":{}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let n = |q: &str| -> f64 {
+            match run(&super::parse(q).unwrap(), &store).rows[0][0] {
+                Value::Num(x) => x,
+                ref o => panic!("want num, got {o:?}"),
+            }
+        };
+        // Plain MATCH: a -> Target lands only on `t` (1), not `x`.
+        assert_eq!(n("MATCH (a)-[:R]->(b:Target) RETURN count(*) AS c"), 1.0);
+        // Without the label, both neighbours count.
+        assert_eq!(n("MATCH (a)-[:R]->(b) RETURN count(*) AS c"), 2.0);
+        // The same constraint inside a COUNT{} subquery body.
+        assert_eq!(
+            n("MATCH (a {name:'a'}) RETURN COUNT { (a)-[:R]->(:Target) } AS c"),
+            1.0
+        );
     }
 
     // --- part 3.8: string functions (E4a) ---
