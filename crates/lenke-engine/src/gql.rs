@@ -1030,7 +1030,23 @@ impl Parser {
             if !self.eat_kw("BY") {
                 return Err("expected BY after ORDER".into());
             }
-            self.order_keys(&visible, &visible_cols, has_agg, &key_slots, &mut hidden)?
+            // An ORDER-BY *expression* may reference an output alias by name inside a
+            // larger expression (`ORDER BY (LET x = a IN x END)`, where `a` is a
+            // RETURN alias). Expose the non-aggregate aliases' defining expressions as
+            // LET-style locals for the duration of the sort-key parse, so a bare alias
+            // name inlines to its definition (evaluated over the bindings), then remove
+            // them. (A bare top-level alias still takes the visible-column fast path.)
+            let let_base = self.lets.len();
+            if !has_agg {
+                for it in &items {
+                    if let RetItem::Key(name, e) = it {
+                        self.lets.push((name.clone(), e.clone()));
+                    }
+                }
+            }
+            let ks = self.order_keys(&visible, &visible_cols, has_agg, &key_slots, &mut hidden)?;
+            self.lets.truncate(let_base);
+            ks
         } else {
             Vec::new()
         };

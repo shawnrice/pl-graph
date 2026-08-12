@@ -9,7 +9,6 @@ hardening.jsonl::h_string_plus_number_raises_data_exception
 language.jsonl::m_edge_label_negation
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_1
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_2
-tests_a.jsonl::order_by_letin_over_output_column
 tests_b.jsonl::avg_duration_errors
 tests_b.jsonl::call_config_bogus_error
 tests_b.jsonl::call_config_pivot_error

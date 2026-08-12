@@ -9886,6 +9886,13 @@ mod tests {
         assert_eq!(got.len(), 2); // distinct {1,2}
         assert!(matches!(got[0], Value::Num(x) if x == 1.0));
         assert!(matches!(got[1], Value::Num(x) if x == 2.0));
+        // An ORDER BY *expression* may reference an output alias by name (`a` inside
+        // a LET-IN): it inlines to the alias's definition (u.k), so the rows sort by
+        // k — null first only under NULLS FIRST; default nulls last.
+        let got = col0("MATCH (u:P) RETURN u.k AS a ORDER BY (LET x = a IN x END)");
+        assert!(matches!(got[0], Value::Num(x) if x == 3.0));
+        assert!(matches!(got[1], Value::Num(x) if x == 7.0));
+        assert!(got[2].is_null());
     }
 
     /// An explicit `GROUP BY` after the RETURN list parses and groups the same as
