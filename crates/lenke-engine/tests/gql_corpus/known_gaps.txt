@@ -12,8 +12,6 @@ language.jsonl::m_colon_label_predicate_desugars_to_is_labeled_2
 language.jsonl::m_edge_label_disjunction
 language.jsonl::m_edge_label_negation
 language.jsonl::m_implicit_grouping
-language.jsonl::m_inline_where_on_edge
-language.jsonl::m_inline_where_on_node
 language.jsonl::m_insert_return_binds_created_node
 language.jsonl::m_is_as_label_introducer
 language.jsonl::m_is_labeled_tests_element_1
@@ -29,7 +27,6 @@ language.jsonl::m_nulls_first_overrides_ascending_default
 language.jsonl::m_nulls_last_overrides_descending_default
 language.jsonl::m_numeric_value_functions_8
 language.jsonl::m_offset_is_synonym_for_skip
-language.jsonl::m_property_map_and_inline_where_combine
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_1
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_2
 language.jsonl::m_simple_case_null_subject_never_matches
@@ -63,14 +60,12 @@ tests_a.jsonl::count_subquery_degree_4
 tests_a.jsonl::count_subquery_degree_7
 tests_a.jsonl::count_subquery_degree_8
 tests_a.jsonl::count_subquery_degree_9
-tests_a.jsonl::edge_property_inline_where
 tests_a.jsonl::exists_count_semi_join_1
 tests_a.jsonl::exists_count_semi_join_2
 tests_a.jsonl::exists_count_semi_join_3
 tests_a.jsonl::exists_count_semi_join_4
 tests_a.jsonl::exists_count_semi_join_5
 tests_a.jsonl::group_by_aggregate
-tests_a.jsonl::inline_where_label
 tests_a.jsonl::insert_multi_label_node
 tests_a.jsonl::insert_node_then_return
 tests_a.jsonl::is_labeled
@@ -287,7 +282,6 @@ tests_e.jsonl::graph_pred_source_destination_of
 tests_e.jsonl::group_by_non_returned_key
 tests_e.jsonl::group_by_with_aggregate
 tests_e.jsonl::group_by_without_aggregate_is_distinct
-tests_e.jsonl::inline_element_where
 tests_e.jsonl::is_typed_closed_record_1
 tests_e.jsonl::is_typed_closed_record_2
 tests_e.jsonl::match_mode_different_edges

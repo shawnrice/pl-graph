@@ -17,9 +17,16 @@ use std::collections::{HashMap, HashSet};
 use crate::ir::{AggFn, CastTarget, CompareOp, Dir, Expr, PathPart, Plan};
 use crate::value::Value;
 
-/// A parsed node pattern head: its optional variable, optional label, and inline
-/// property map (`(v:Label {k: val, …})` — empty when absent).
-type ParsedNode = (Option<String>, Option<String>, Vec<(String, Value)>);
+/// A parsed node pattern head: its optional variable, optional label, inline
+/// property map (`(v:Label {k: val, …})` — empty when absent), and the token span
+/// of an optional inline `WHERE` predicate (`(v:Label WHERE pred)` — `None` when
+/// absent; re-parsed once the variable is bound to a slot).
+type ParsedNode = (
+    Option<String>,
+    Option<String>,
+    Vec<(String, Value)>,
+    Option<(usize, usize)>,
+);
 
 /// Turn a node's inline properties `{k: v, …}` into a chain of `Eq` filters on its
 /// slot — the exact lowering of `WHERE slot.k = v AND …`. Sharing this single form
@@ -46,6 +53,9 @@ struct Rel {
     etype: Option<String>,
     var: Option<String>,
     props: Vec<(String, Value)>,
+    /// Token span of an inline `WHERE pred` on the edge (`-[e:T WHERE pred]->`),
+    /// re-parsed once the edge is bound to a slot; `None` when absent.
+    where_range: Option<(usize, usize)>,
 }
 
 /// A parsed RETURN item: a keyed expression (a grouping key / plain projection)
@@ -465,7 +475,7 @@ impl Parser {
             if matches!(self.peek(), Some(Tok::LParen)) {
                 let probe = self.node()?;
                 let start = match &probe {
-                    (Some(v), None, props) if props.is_empty() => scope.get(v).copied(),
+                    (Some(v), None, props, None) if props.is_empty() => scope.get(v).copied(),
                     _ => None,
                 };
                 if let Some(from) = start {
@@ -619,7 +629,7 @@ impl Parser {
             );
         }
         let mut scope: HashMap<String, usize> = HashMap::new();
-        let (va, la, va_props) = self.node()?;
+        let (va, la, va_props, va_where) = self.node()?;
         if let Some(v) = va {
             scope.insert(v, 0);
         }
@@ -630,9 +640,16 @@ impl Parser {
                 "`ANY SHORTEST` requires a `*` or `+` quantifier on the relationship".into(),
             );
         }
-        let (vb, _lb, vb_props) = self.node()?;
+        let (vb, _lb, vb_props, vb_where) = self.node()?;
         if let Some(v) = vb {
             scope.insert(v, 1);
+        }
+        if va_where.is_some() || vb_where.is_some() || rel.where_range.is_some() {
+            return Err(
+                "inline WHERE on an `ANY SHORTEST` path element is not supported; use a \
+                 trailing WHERE"
+                    .into(),
+            );
         }
         if !va_props.is_empty() || !vb_props.is_empty() {
             return Err(
@@ -915,6 +932,9 @@ impl Parser {
         let mut prev = self.insert_node(nodes, var_to_idx)?;
         while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow)) {
             let rel = self.rel()?;
+            if rel.where_range.is_some() {
+                return Err("inline WHERE on an INSERT relationship is not supported".into());
+            }
             let next = self.insert_node(nodes, var_to_idx)?;
             let (from, to) = match rel.dir {
                 Dir::Out => (prev, next),
@@ -979,6 +999,46 @@ impl Parser {
     }
 
     // props := '{' [ key ':' literal ( ',' key ':' literal )* ] '}'
+    /// After an inline `WHERE` inside a pattern element (`(v:L WHERE pred)` or
+    /// `-[e:T WHERE pred]->`), capture the predicate's token span WITHOUT parsing.
+    /// The element's variable isn't bound to a slot until `pattern`/`extend_chain`
+    /// assigns one, so the expression can't resolve `v.k` yet; `parse_captured_where`
+    /// parses the span once the binding exists. The span runs to the element's own
+    /// closing `)`/`]` — the first unmatched closer at bracket-depth 0.
+    fn capture_inline_where(&mut self) -> (usize, usize) {
+        let start = self.pos;
+        let mut depth = 0i32;
+        while let Some(t) = self.toks.get(self.pos) {
+            match t {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+            self.pos += 1;
+        }
+        (start, self.pos)
+    }
+
+    /// Parse a captured inline-`WHERE` span (see `capture_inline_where`) as a
+    /// predicate expression, with `self.scope` already carrying the element's
+    /// binding. Restores the cursor afterward so pattern parsing continues where
+    /// it left off.
+    fn parse_captured_where(&mut self, range: (usize, usize)) -> Result<Expr, String> {
+        let saved = self.pos;
+        self.pos = range.0;
+        let e = self.expr()?;
+        if self.pos != range.1 {
+            return Err("unexpected tokens in inline WHERE predicate".into());
+        }
+        self.pos = saved;
+        Ok(e)
+    }
+
     fn props(&mut self) -> Result<Vec<(String, Value)>, String> {
         self.expect(&Tok::LBrace)?;
         let mut out = Vec::new();
@@ -1031,7 +1091,7 @@ impl Parser {
     fn pattern(&mut self) -> Result<(Plan, HashMap<String, usize>, usize), String> {
         let mut scope: HashMap<String, usize> = HashMap::new();
         let mut slots = 0usize;
-        let (var, label, props) = self.node()?;
+        let (var, label, props, where_range) = self.node()?;
         if let Some(v) = var {
             scope.insert(v, slots);
         }
@@ -1039,7 +1099,11 @@ impl Parser {
         slots += 1;
         // Inline props on the seed node become filters over the Scan — the same
         // shape a `WHERE` produces, so the optimizer's index-seeding sees both alike.
-        let seed = node_prop_filters(Plan::Scan { label }, from, props);
+        let mut seed = node_prop_filters(Plan::Scan { label }, from, props);
+        if let Some(r) = where_range {
+            self.scope = scope.clone();
+            seed = seed.filter(self.parse_captured_where(r)?);
+        }
         let plan = self.extend_chain(seed, &mut scope, &mut slots, from)?;
         Ok((plan, scope, slots))
     }
@@ -1059,10 +1123,11 @@ impl Parser {
         while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow)) {
             let rel = self.rel()?;
             let quant = self.opt_quantifier()?;
-            let (v2, _lbl2, v2_props) = self.node()?; // a hop's landing-node label is ignored for now
-                                                      // A relationship variable or inline edge properties require binding the
-                                                      // edge as a slot (edge at `slots`, node at `slots+1`).
-            let bind = rel.var.is_some() || !rel.props.is_empty();
+            let (v2, _lbl2, v2_props, v2_where) = self.node()?; // a hop's landing-node label is ignored for now
+                                                                // A relationship variable, inline edge properties, or an inline edge
+                                                                // WHERE require binding the edge as a slot (edge at `slots`, node at
+                                                                // `slots+1`) so `e.k` can resolve.
+            let bind = rel.var.is_some() || !rel.props.is_empty() || rel.where_range.is_some();
             if let Some((min, max)) = quant {
                 if bind {
                     return Err(
@@ -1100,6 +1165,13 @@ impl Parser {
                         right: Box::new(Expr::Lit(val)),
                     });
                 }
+                // Inline edge `WHERE` — an arbitrary predicate on the bound edge
+                // (and any variable bound so far), applied with both the edge and
+                // the landing node in scope.
+                if let Some(r) = rel.where_range {
+                    self.scope = scope.clone();
+                    plan = plan.filter(self.parse_captured_where(r)?);
+                }
                 from = node_slot;
             } else {
                 let node_slot = *slots;
@@ -1113,6 +1185,12 @@ impl Parser {
             // Inline props on the landing node filter it, exactly as a WHERE would.
             // (`from` is now that node's slot in every branch above.)
             plan = node_prop_filters(plan, from, v2_props);
+            // Inline `WHERE` on the landing node — an arbitrary predicate, applied
+            // with the node (and everything bound so far) in scope.
+            if let Some(r) = v2_where {
+                self.scope = scope.clone();
+                plan = plan.filter(self.parse_captured_where(r)?);
+            }
         }
         Ok(plan)
     }
@@ -1125,10 +1203,13 @@ impl Parser {
         if !self.eat_kw("MATCH") {
             return Err("expected MATCH after OPTIONAL".into());
         }
-        let (var, label, props) = self.node()?;
+        let (var, label, props, start_where) = self.node()?;
         let Some(v) = var else {
             return Err("OPTIONAL MATCH must start from a bound variable".into());
         };
+        if start_where.is_some() {
+            return Err("inline WHERE inside OPTIONAL MATCH is not supported yet".into());
+        }
         if label.is_some() {
             return Err(format!(
                 "bound variable `{v}` cannot be re-labeled in OPTIONAL MATCH"
@@ -1147,14 +1228,14 @@ impl Parser {
             ));
         };
         let rel = self.rel()?;
-        if rel.var.is_some() || !rel.props.is_empty() {
+        if rel.var.is_some() || !rel.props.is_empty() || rel.where_range.is_some() {
             return Err(
                 "a relationship variable / edge properties on OPTIONAL MATCH are not supported"
                     .into(),
             );
         }
-        let (v2, _lbl2, v2_props) = self.node()?;
-        if !v2_props.is_empty() {
+        let (v2, _lbl2, v2_props, v2_where) = self.node()?;
+        if !v2_props.is_empty() || v2_where.is_some() {
             return Err(
                 "inline properties on the OPTIONAL MATCH landing node are not supported; use WHERE"
                     .into(),
@@ -1183,10 +1264,16 @@ impl Parser {
     /// than scanning afresh). A fresh/disconnected subsequent pattern — one whose
     /// first node is unbound — is not supported in this subset.
     fn match_continue(&mut self, plan: Plan) -> Result<Plan, String> {
-        let (var, label, props) = self.node()?;
+        let (var, label, props, start_where) = self.node()?;
         let Some(v) = var else {
             return Err("a MATCH after WITH must start from a bound variable".into());
         };
+        if start_where.is_some() {
+            return Err(
+                "inline WHERE on a continuing MATCH's start variable is not supported; use WHERE"
+                    .into(),
+            );
+        }
         if label.is_some() {
             return Err(format!(
                 "bound variable `{v}` cannot be re-labeled in a continuing MATCH"
@@ -1298,10 +1385,13 @@ impl Parser {
         if !self.eat_kw("MATCH") {
             return Err("a CALL subquery must begin with MATCH".into());
         }
-        let (var, label, props) = self.node()?;
+        let (var, label, props, start_where) = self.node()?;
         let Some(v) = var else {
             return Err("a CALL subquery pattern must start from a scope variable".into());
         };
+        if start_where.is_some() {
+            return Err("inline WHERE on a CALL subquery start variable is not supported".into());
+        }
         if label.is_some() {
             return Err(format!(
                 "scope variable `{v}` cannot be re-labeled inside a CALL subquery"
@@ -1489,8 +1579,16 @@ impl Parser {
         } else {
             Vec::new()
         };
+        // Inline `WHERE pred` after the label/props: an arbitrary predicate on the
+        // node, equivalent to a trailing `WHERE`. Captured now, parsed once the
+        // node's slot exists (see `capture_inline_where`).
+        let where_range = if self.eat_kw("WHERE") {
+            Some(self.capture_inline_where())
+        } else {
+            None
+        };
         self.expect(&Tok::RParen)?;
-        Ok((var, label, props))
+        Ok((var, label, props, where_range))
     }
 
     // rel := '-' '[' ':' R ']' '->'   (out)
@@ -1523,6 +1621,12 @@ impl Parser {
         } else {
             Vec::new()
         };
+        // Inline `WHERE pred` on the edge, equivalent to a trailing `WHERE`.
+        let where_range = if self.eat_kw("WHERE") {
+            Some(self.capture_inline_where())
+        } else {
+            None
+        };
         self.expect(&Tok::RBracket)?;
         let dir = if incoming {
             self.expect(&Tok::Minus)?;
@@ -1539,6 +1643,7 @@ impl Parser {
             etype,
             var,
             props,
+            where_range,
         })
     }
 
@@ -2238,10 +2343,15 @@ impl Parser {
         // MATCH (a)-[:R]->(b) }` — the full-statement form; accept it as sugar.
         self.eat_kw("MATCH");
         let outer_width = self.slots;
-        let (var, label, props) = self.node()?;
+        let (var, label, props, start_where) = self.node()?;
         let Some(v) = var else {
             return Err(format!("{kw} pattern must start from a bound variable"));
         };
+        if start_where.is_some() {
+            return Err(format!(
+                "inline WHERE on a {kw} start variable is not supported; use a trailing WHERE"
+            ));
+        }
         if label.is_some() {
             return Err(format!(
                 "bound variable `{v}` cannot be re-labeled inside {kw}"
