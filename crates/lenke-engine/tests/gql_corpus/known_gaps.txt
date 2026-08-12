@@ -6,7 +6,6 @@ hardening.jsonl::h_bool_times_number_raises_data_exception
 hardening.jsonl::h_rejects_literal_overflowing_exponent
 hardening.jsonl::h_rejects_literal_oversized_integer_literal
 hardening.jsonl::h_string_plus_number_raises_data_exception
-language.jsonl::m_block_comment
 language.jsonl::m_colon_label_predicate_desugars_to_is_labeled_2
 language.jsonl::m_edge_label_disjunction
 language.jsonl::m_edge_label_negation
@@ -20,8 +19,6 @@ language.jsonl::m_label_conjunction
 language.jsonl::m_label_disjunction
 language.jsonl::m_label_negation
 language.jsonl::m_label_wildcard
-language.jsonl::m_line_comment_double_dash
-language.jsonl::m_line_comment_double_slash
 language.jsonl::m_nulls_first_overrides_ascending_default
 language.jsonl::m_nulls_last_overrides_descending_default
 language.jsonl::m_numeric_value_functions_8
@@ -347,9 +344,7 @@ tests_f.jsonl::order_alias_3a
 tests_f.jsonl::order_alias_3b
 tests_f.jsonl::order_alias_9b
 tests_f.jsonl::page_before_projection_1
-tests_f.jsonl::page_before_projection_2
 tests_f.jsonl::page_composes_1
-tests_f.jsonl::page_composes_2
 tests_f.jsonl::page_composes_3
 tests_f.jsonl::range_bounded_2
 tests_f.jsonl::range_bounded_3
@@ -363,13 +358,6 @@ tests_f.jsonl::semi_join_declines_2
 tests_f.jsonl::semi_join_declines_3
 tests_f.jsonl::semi_join_declines_5
 tests_f.jsonl::size_labels_edge
-tests_f.jsonl::standalone_orderby_1
-tests_f.jsonl::standalone_orderby_2
-tests_f.jsonl::standalone_orderby_3
-tests_f.jsonl::standalone_page_1
-tests_f.jsonl::standalone_page_2
-tests_f.jsonl::standalone_page_3
-tests_f.jsonl::standalone_page_4
 tests_f.jsonl::streamed_count_1
 tests_f.jsonl::streamed_count_10
 tests_f.jsonl::streamed_count_11

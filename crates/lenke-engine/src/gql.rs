@@ -202,6 +202,27 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             i += 1;
             continue;
         }
+        // Comments, checked before any operator: `--` and `//` run to end of line,
+        // `/* … */` is a block. `--` is UNCONDITIONALLY a comment (GQL has no `--`
+        // edge — undirected uses `~`), so this must precede the `-` and `/` arms.
+        if (c == '-' && b.get(i + 1) == Some(&'-')) || (c == '/' && b.get(i + 1) == Some(&'/')) {
+            i += 2;
+            while i < b.len() && b[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && b.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i < b.len() && !(b[i] == '*' && b.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            if i >= b.len() {
+                return Err("unterminated block comment".into());
+            }
+            i += 2; // past the closing `*/`
+            continue;
+        }
         match c {
             '(' => out.push(Tok::LParen),
             ')' => out.push(Tok::RParen),
@@ -563,6 +584,31 @@ impl Parser {
                 break;
             }
         }
+        // Statement-position `ORDER BY [OFFSET n] [LIMIT n]` BEFORE `RETURN`: sort
+        // and page the bound rows, then the following RETURN projects. Core allows
+        // this as a standalone order-and-page clause. `SKIP` is not a valid STARTER
+        // here (only ORDER/OFFSET/LIMIT), matching core.
+        if self.peek_kw("ORDER") || self.peek_kw("OFFSET") || self.peek_kw("LIMIT") {
+            let keys = if self.eat_kw("ORDER") {
+                if !self.eat_kw("BY") {
+                    return Err("expected BY after ORDER".into());
+                }
+                self.standalone_sort_keys()?
+            } else {
+                Vec::new()
+            };
+            let skip = if self.eat_kw("OFFSET") || self.eat_kw("SKIP") {
+                Some(self.usize_lit()?)
+            } else {
+                None
+            };
+            let limit = if self.eat_kw("LIMIT") {
+                Some(self.usize_lit()?)
+            } else {
+                None
+            };
+            plan = plan.order_page(keys, skip, limit);
+        }
         // Write tail: MATCH … (SET … | REMOVE …)+  — updates the bound nodes and
         // returns no rows. Otherwise the read tail (RETURN …).
         if self.peek_kw("SET")
@@ -707,6 +753,32 @@ impl Parser {
             };
             keys.push(crate::ir::SortKey {
                 expr: Expr::Slot(slot),
+                descending,
+                nulls_first: false,
+            });
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Parse a statement-position ORDER BY key list (a standalone sort BEFORE the
+    /// RETURN): each key is a full expression over the current bindings with an
+    /// optional ASC/DESC. Simpler than `order_keys` — the rows are the bindings, so
+    /// no hidden output column is needed.
+    fn standalone_sort_keys(&mut self) -> Result<Vec<crate::ir::SortKey>, String> {
+        let mut keys = Vec::new();
+        loop {
+            let expr = self.expr()?;
+            let descending = if self.eat_kw("DESC") {
+                true
+            } else {
+                self.eat_kw("ASC");
+                false
+            };
+            keys.push(crate::ir::SortKey {
+                expr,
                 descending,
                 nulls_first: false,
             });
