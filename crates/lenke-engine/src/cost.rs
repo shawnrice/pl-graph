@@ -98,7 +98,7 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
         } => {
             // One hop multiplies by the fan-out of the matching edge type. Never
             // exact (per-node degree varies), and an unknown edge type yields none.
-            let fanout = if unknown_edge(edge_label.as_deref(), store) {
+            let fanout = if unknown_edge(edge_label, store) {
                 0.0
             } else {
                 avg_degree(store)
@@ -110,7 +110,7 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
         } => {
             // A left-outer hop keeps at least the source row (a miss → NULL), so the
             // multiplier is at least 1.
-            let fanout = if unknown_edge(edge_label.as_deref(), store) {
+            let fanout = if unknown_edge(edge_label, store) {
                 1.0
             } else {
                 avg_degree(store).max(1.0)
@@ -124,7 +124,7 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
             max,
             ..
         } => {
-            let d = if unknown_edge(edge_label.as_deref(), store) {
+            let d = if unknown_edge(edge_label, store) {
                 0.0
             } else {
                 avg_degree(store)
@@ -231,8 +231,11 @@ fn group_estimate(keys: &[(String, Expr)], input: &Plan, store: &Store) -> Card 
     Card::approx((inp.rows * 0.5).min(inp.rows).max(1.0))
 }
 
-fn unknown_edge(edge_label: Option<&str>, store: &Store) -> bool {
-    edge_label.is_some_and(|name| store.etype_id(name).is_none())
+/// True when the edge-type constraint is TYPED (non-empty) but NONE of its names
+/// resolve to a known edge type — the traversal then matches nothing. An empty list
+/// is "any type" (not unknown).
+fn unknown_edge(edge_label: &[String], store: &Store) -> bool {
+    !edge_label.is_empty() && edge_label.iter().all(|name| store.etype_id(name).is_none())
 }
 
 /// Estimate a predicate's selectivity in `[0, 1]` and whether it is exact. Uses the
@@ -421,12 +424,12 @@ mod tests {
         let (n, deg) = (3000u32, 4u32);
         let st = fixture(n, deg);
         // avg_degree = edges/nodes = deg. A 1-hop ≈ nodes × deg.
-        let one = estimate(&scan("Person").expand(0, Dir::Out, Some("R")), &st);
+        let one = estimate(&scan("Person").expand(0, Dir::Out, &["R".to_string()]), &st);
         assert!(!one.exact);
         assert!((one.rows - f64::from(n * deg)).abs() < 1.0, "1-hop ≈ n*deg");
         // VarLength {1,2}: n × (deg + deg²).
         let two = estimate(
-            &scan("Person").var_length(0, Dir::Out, Some("R"), 1, 2, true),
+            &scan("Person").var_length(0, Dir::Out, &["R".to_string()], 1, 2, true),
             &st,
         );
         let expected = f64::from(n) * (f64::from(deg) + f64::from(deg * deg));
@@ -437,7 +440,7 @@ mod tests {
             materialize_rows: 50_000.0,
         };
         assert!(prefer_bounded_memory(
-            &scan("Person").var_length(0, Dir::Out, Some("R"), 1, 2, true),
+            &scan("Person").var_length(0, Dir::Out, &["R".to_string()], 1, 2, true),
             &st,
             &budget
         ));
@@ -467,7 +470,7 @@ mod tests {
         let st = fixture(3000, 4);
         let plan =
             scan("Person")
-                .expand(0, Dir::Out, Some("R"))
+                .expand(0, Dir::Out, &["R".to_string()])
                 .order_page(Vec::new(), None, Some(50));
         assert_eq!(estimate(&plan, &st).rows as u32, 50);
     }

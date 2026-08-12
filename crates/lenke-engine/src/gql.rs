@@ -48,9 +48,10 @@ fn node_prop_filters(mut plan: Plan, slot: usize, props: Vec<(String, Value)>) -
 /// pattern, edge properties to write in an INSERT).
 struct Rel {
     dir: Dir,
-    /// The edge type, or `None` for an UNTYPED relationship (`-->`, `-[r]->`,
-    /// `-[]->`) which traverses edges of ANY type — `edge_label: None` in the plan.
-    etype: Option<String>,
+    /// The edge types: EMPTY for an UNTYPED relationship (`-->`, `-[r]->`, `-[]->`)
+    /// which traverses edges of ANY type, one entry for `-[:T]->`, or several for a
+    /// disjunction `-[:A|B]->` (matches an edge whose type is any of them).
+    etypes: Vec<String>,
     var: Option<String>,
     props: Vec<(String, Value)>,
     /// Token span of an inline `WHERE pred` on the edge (`-[e:T WHERE pred]->`),
@@ -181,6 +182,7 @@ enum Tok {
     RArrow, // ->
     LArrow, // <-
     Tilde,  // ~ (undirected relationship delimiter)
+    Pipe,   // | (edge-type disjunction in `[:A|B]`)
     Eq,
     Ne,
     Lt,
@@ -247,7 +249,8 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                     out.push(Tok::Concat);
                     i += 1;
                 } else {
-                    return Err("expected `||` (single `|` is not an operator)".into());
+                    // A bare `|` is the edge-type-disjunction separator (`[:A|B]`).
+                    out.push(Tok::Pipe);
                 }
             }
             '=' => out.push(Tok::Eq),
@@ -728,7 +731,7 @@ impl Parser {
             );
         }
         self.path_vars.insert(pname);
-        let plan = Plan::Scan { label: la }.shortest_path(0, rel.dir, rel.etype.as_deref(), None);
+        let plan = Plan::Scan { label: la }.shortest_path(0, rel.dir, &rel.etypes, None);
         Ok((plan, scope, 2))
     }
 
@@ -1039,12 +1042,22 @@ impl Parser {
                     return Err("INSERT requires a directed relationship".into());
                 }
             };
+            // An inserted edge has exactly one concrete type — a `|`-disjunction is
+            // a MATCH construct, not creatable.
+            let etype = match rel.etypes.as_slice() {
+                [t] => t.clone(),
+                [] => return Err("INSERT of a relationship requires an edge type".into()),
+                _ => {
+                    return Err(
+                        "INSERT of a relationship requires a single edge type, not a disjunction"
+                            .into(),
+                    )
+                }
+            };
             edges.push(crate::ir::InsertEdge {
                 from,
                 to,
-                etype: rel
-                    .etype
-                    .ok_or("INSERT of a relationship requires an edge type")?,
+                etype,
                 props: rel.props,
             });
             prev = next;
@@ -1241,7 +1254,7 @@ impl Parser {
                 plan = plan.var_length(
                     from,
                     rel.dir,
-                    rel.etype.as_deref(),
+                    &rel.etypes,
                     min,
                     max,
                     !self.path_walk,
@@ -1257,7 +1270,7 @@ impl Parser {
                     scope.insert(v, node_slot);
                 }
                 *slots += 2;
-                plan = plan.expand_edge(from, rel.dir, rel.etype.as_deref());
+                plan = plan.expand_edge(from, rel.dir, &rel.etypes);
                 // Inline edge props are a match filter on the bound edge.
                 for (k, val) in rel.props {
                     plan = plan.filter(Expr::Compare {
@@ -1283,7 +1296,7 @@ impl Parser {
                     scope.insert(v, node_slot);
                 }
                 *slots += 1;
-                plan = plan.expand(from, rel.dir, rel.etype.as_deref());
+                plan = plan.expand(from, rel.dir, &rel.etypes);
                 from = node_slot;
             }
             // Inline props on the landing node filter it, exactly as a WHERE would.
@@ -1357,7 +1370,7 @@ impl Parser {
             input: Box::new(plan),
             from,
             dir: rel.dir,
-            edge_label: rel.etype,
+            edge_label: rel.etypes,
             // GQL OPTIONAL MATCH lands NULL for a node with no match.
             keep_source: false,
         })
@@ -1718,11 +1731,15 @@ impl Parser {
         // matching core's bracketed untyped relationship. (Core's BARE `-->` has
         // different semantics — it matches nothing — so it is deliberately NOT
         // accepted here, to avoid a silent result divergence.)
-        let etype = if self.eat(&Tok::Colon) {
-            Some(self.ident()?)
-        } else {
-            None
-        };
+        // `:Type` with an optional `|`-disjunction (`:A|B|C`) — an edge matches if
+        // its type is ANY of them. Empty = untyped (any type).
+        let mut etypes = Vec::new();
+        if self.eat(&Tok::Colon) {
+            etypes.push(self.ident()?);
+            while self.eat(&Tok::Pipe) {
+                etypes.push(self.ident()?);
+            }
+        }
         let props = if matches!(self.peek(), Some(Tok::LBrace)) {
             self.props()?
         } else {
@@ -1749,7 +1766,7 @@ impl Parser {
         };
         Ok(Rel {
             dir,
-            etype,
+            etypes,
             var,
             props,
             where_range,
@@ -2930,7 +2947,7 @@ mod tests {
         let hand = Plan::Scan {
             label: Some("Person".into()),
         }
-        .expand(0, Dir::Out, Some("KNOWS"))
+        .expand(0, Dir::Out, &["KNOWS".to_string()])
         .aggregate(
             vec![("a".into(), Expr::Slot(0))],
             vec![crate::ir::Agg {
@@ -2983,7 +3000,7 @@ mod tests {
             }),
             right: Box::new(Expr::Lit(Value::Num(30.0))),
         })
-        .expand(0, Dir::Out, Some("KNOWS"))
+        .expand(0, Dir::Out, &["KNOWS".to_string()])
         .project(vec![(
             "name".into(),
             Expr::Prop {
@@ -3023,7 +3040,7 @@ mod tests {
         let store = social();
         // Who has an outgoing KNOWS? alice (bob,carol) and bob (carol); carol has
         // none. EXISTS is a definite predicate over the correlated node `p`.
-        let body = Plan::Row.expand(0, Dir::Out, Some("KNOWS"));
+        let body = Plan::Row.expand(0, Dir::Out, &["KNOWS".to_string()]);
         let hand = Plan::Scan {
             label: Some("Person".into()),
         }
@@ -3095,7 +3112,7 @@ mod tests {
             input: Box::new(Plan::Scan {
                 label: Some("Person".into()),
             }),
-            body: Box::new(Plan::Row.expand(0, Dir::Out, Some("KNOWS"))),
+            body: Box::new(Plan::Row.expand(0, Dir::Out, &["KNOWS".to_string()])),
             yields: vec![(
                 "friend".into(),
                 Expr::Prop {
@@ -3217,7 +3234,7 @@ mod tests {
         );
         // Parse cross-check against the hand-built ShortestPath plan (all sources).
         let hand = Plan::Scan { label: None }
-            .shortest_path(0, Dir::Out, Some("LINK"), None)
+            .shortest_path(0, Dir::Out, &["LINK".to_string()], None)
             .project(vec![(
                 "len".into(),
                 Expr::PathAccess {
@@ -4225,7 +4242,7 @@ mod tests {
         let hand = Plan::Scan {
             label: Some("Person".into()),
         }
-        .expand(0, Dir::Out, Some("KNOWS"))
+        .expand(0, Dir::Out, &["KNOWS".to_string()])
         .project(vec![
             (
                 "a".into(),
@@ -4257,8 +4274,8 @@ mod tests {
         let hand = Plan::Scan {
             label: Some("Person".into()),
         }
-        .expand(0, Dir::Out, Some("KNOWS"))
-        .expand(1, Dir::Out, Some("KNOWS"))
+        .expand(0, Dir::Out, &["KNOWS".to_string()])
+        .expand(1, Dir::Out, &["KNOWS".to_string()])
         .filter(Expr::And(
             Box::new(Expr::Compare {
                 op: crate::ir::CompareOp::Eq,
@@ -4311,7 +4328,7 @@ mod tests {
             }),
             right: Box::new(Expr::Lit(Value::Str("carol".into()))),
         })
-        .expand(0, Dir::In, Some("KNOWS"))
+        .expand(0, Dir::In, &["KNOWS".to_string()])
         .project(vec![(
             "who".into(),
             Expr::Prop {
@@ -4511,11 +4528,11 @@ mod tests {
         let left = Plan::Scan {
             label: Some("Person".into()),
         }
-        .expand(0, Dir::Out, Some("KNOWS"));
+        .expand(0, Dir::Out, &["KNOWS".to_string()]);
         let right = Plan::Scan {
             label: Some("Person".into()),
         }
-        .expand(0, Dir::Out, Some("WORKS_ON"));
+        .expand(0, Dir::Out, &["WORKS_ON".to_string()]);
         let hand = Plan::join(left, right, vec![(0, 0)]).project(vec![
             (
                 "a".into(),
@@ -4573,7 +4590,7 @@ mod tests {
             }),
             right: Box::new(Expr::Lit(Value::Str("alice".into()))),
         })
-        .var_length(0, Dir::Out, Some("KNOWS"), 1, 2, true)
+        .var_length(0, Dir::Out, &["KNOWS".to_string()], 1, 2, true)
         .project(vec![(
             "b".into(),
             Expr::Prop {
@@ -5241,8 +5258,8 @@ mod tests {
         let hand = Plan::Scan {
             label: Some("Person".into()),
         }
-        .expand(0, Dir::Out, Some("KNOWS"))
-        .expand(1, Dir::Out, Some("KNOWS"))
+        .expand(0, Dir::Out, &["KNOWS".to_string()])
+        .expand(1, Dir::Out, &["KNOWS".to_string()])
         .project(vec![(
             "c".into(),
             Expr::Prop {
@@ -6421,7 +6438,7 @@ mod tests {
         let hand = Plan::Scan {
             label: Some("P".into()),
         }
-        .expand_edge(0, crate::ir::Dir::Out, Some("R"))
+        .expand_edge(0, crate::ir::Dir::Out, &["R".to_string()])
         .project(vec![(
             "w".into(),
             Expr::Prop {

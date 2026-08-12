@@ -7,7 +7,6 @@ hardening.jsonl::h_rejects_literal_overflowing_exponent
 hardening.jsonl::h_rejects_literal_oversized_integer_literal
 hardening.jsonl::h_string_plus_number_raises_data_exception
 language.jsonl::m_colon_label_predicate_desugars_to_is_labeled_2
-language.jsonl::m_edge_label_disjunction
 language.jsonl::m_edge_label_negation
 language.jsonl::m_implicit_grouping
 language.jsonl::m_insert_return_binds_created_node
@@ -75,7 +74,6 @@ tests_b.jsonl::call_config_wrong_type_error
 tests_b.jsonl::cast_bool
 tests_b.jsonl::cast_int_null
 tests_b.jsonl::cast_list
-tests_b.jsonl::edge_type_seed_disjunction
 tests_b.jsonl::exists_bound_a_a_plus
 tests_b.jsonl::exists_bound_a_e_plus
 tests_b.jsonl::list_sort_desc
@@ -83,16 +81,10 @@ tests_b.jsonl::list_sort_nulls_first
 tests_b.jsonl::malformed_num_1e999_error
 tests_b.jsonl::max_total_order
 tests_b.jsonl::min_total_order
-tests_b.jsonl::multiseg_u1_d1_bounded
-tests_b.jsonl::multiseg_u1_d1_star
 tests_b.jsonl::multiseg_u1_d2_bounded
 tests_b.jsonl::multiseg_u1_d2_star
 tests_b.jsonl::multiseg_u1_d3_bounded
 tests_b.jsonl::multiseg_u1_d3_star
-tests_b.jsonl::multiseg_u1_f1_bounded
-tests_b.jsonl::multiseg_u1_f1_star
-tests_b.jsonl::multiseg_u2_d3_bounded
-tests_b.jsonl::multiseg_u2_d3_star
 tests_b.jsonl::multiseg_u2_f1_bounded
 tests_b.jsonl::multiseg_u2_f1_star
 tests_b.jsonl::order_total_order_asc
@@ -295,7 +287,6 @@ tests_e.jsonl::value_subquery_correlated_scalar_2
 tests_e.jsonl::value_subquery_where_narrows
 tests_f.jsonl::alias_leave_3
 tests_f.jsonl::backward_semi_1
-tests_f.jsonl::backward_semi_12
 tests_f.jsonl::backward_semi_13
 tests_f.jsonl::backward_semi_14
 tests_f.jsonl::backward_semi_2
@@ -305,7 +296,6 @@ tests_f.jsonl::count_shortcuts_labels_1
 tests_f.jsonl::count_shortcuts_labels_3
 tests_f.jsonl::counting_edges_where_13
 tests_f.jsonl::counting_edges_where_14
-tests_f.jsonl::counting_edges_where_6
 tests_f.jsonl::distinct_nan_1
 tests_f.jsonl::distinct_nan_2
 tests_f.jsonl::distinct_nan_3
@@ -330,8 +320,6 @@ tests_f.jsonl::inline_constraint_14
 tests_f.jsonl::inline_constraint_15
 tests_f.jsonl::inline_constraint_per_row
 tests_f.jsonl::label_disjunction_2
-tests_f.jsonl::label_disjunction_3
-tests_f.jsonl::label_disjunction_4
 tests_f.jsonl::label_disjunction_5
 tests_f.jsonl::label_disjunction_6
 tests_f.jsonl::label_disjunction_7
@@ -352,7 +340,6 @@ tests_f.jsonl::range_float_step_stall
 tests_f.jsonl::reverse_semi_19
 tests_f.jsonl::reverse_semi_4
 tests_f.jsonl::semi_join_count_1
-tests_f.jsonl::semi_join_count_10
 tests_f.jsonl::semi_join_declines_1
 tests_f.jsonl::semi_join_declines_2
 tests_f.jsonl::semi_join_declines_3
@@ -373,12 +360,10 @@ tests_f.jsonl::streamed_count_21
 tests_f.jsonl::streamed_count_22
 tests_f.jsonl::streamed_count_3
 tests_f.jsonl::streamed_count_4
-tests_f.jsonl::streamed_count_6
 tests_f.jsonl::streamed_count_8
 tests_f.jsonl::streamed_count_9
 tests_f.jsonl::type_of_edge_1
 tests_f.jsonl::vec_extreme_nan_2
-tests_f.jsonl::walk_count_10
 tests_f.jsonl::walked_frame_1
 tests_f.jsonl::walked_frame_10
 tests_f.jsonl::walked_frame_11
@@ -387,7 +372,6 @@ tests_f.jsonl::walked_frame_16
 tests_f.jsonl::walked_frame_17
 tests_f.jsonl::walked_frame_18
 tests_f.jsonl::walked_frame_2
-tests_f.jsonl::walked_frame_20
 tests_f.jsonl::walked_frame_23
 tests_f.jsonl::walked_frame_24
 tests_f.jsonl::walked_frame_25

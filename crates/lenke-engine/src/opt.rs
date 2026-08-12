@@ -1291,7 +1291,7 @@ mod tests {
         let plan = Plan::Scan {
             label: Some("Person".into()),
         }
-        .expand(0, Dir::Out, Some("KNOWS"))
+        .expand(0, Dir::Out, &["KNOWS".to_string()])
         .filter(cmp(CompareOp::Eq, prop(0, "name"), Expr::Lit(s("alice"))));
         let opt = assert_rows_preserved(&plan, &store);
         // Shape: Expand{ input: <pushed-down predicate> }. The pushed filter over
@@ -1315,7 +1315,7 @@ mod tests {
         let plan = Plan::Scan {
             label: Some("Person".into()),
         }
-        .expand(0, Dir::Out, Some("KNOWS"))
+        .expand(0, Dir::Out, &["KNOWS".to_string()])
         .filter(cmp(CompareOp::Ge, prop(1, "age"), Expr::Lit(n(40.0))));
         let opt = assert_rows_preserved(&plan, &store);
         // Shape unchanged: Filter still on top of Expand.
@@ -1339,7 +1339,7 @@ mod tests {
         let plan = Plan::Scan {
             label: Some("Person".into()),
         }
-        .var_length(0, Dir::Out, Some("KNOWS"), 1, 2, true)
+        .var_length(0, Dir::Out, &["KNOWS".to_string()], 1, 2, true)
         .filter(Expr::And(
             Box::new(cmp(CompareOp::Eq, prop(0, "name"), Expr::Lit(s("alice")))),
             Box::new(cmp(CompareOp::Ge, prop(1, "age"), Expr::Lit(n(40.0)))),
@@ -1368,7 +1368,7 @@ mod tests {
         let plan = Plan::Scan {
             label: Some("Person".into()),
         }
-        .shortest_path(0, Dir::Out, Some("KNOWS"), None)
+        .shortest_path(0, Dir::Out, &["KNOWS".to_string()], None)
         .filter(cmp(CompareOp::Eq, prop(0, "name"), Expr::Lit(s("alice"))));
         let opt = assert_rows_preserved(&plan, &store);
         match opt {
@@ -1411,7 +1411,7 @@ mod tests {
         // then PUSH the merged filter below the Expand — two rules, to a fixpoint.
         // Unlabelled scan so seeding does not fire, isolating merge + pushdown.
         let plan = Plan::Scan { label: None }
-            .expand(0, Dir::Out, Some("KNOWS"))
+            .expand(0, Dir::Out, &["KNOWS".to_string()])
             .filter(cmp(CompareOp::Le, prop(0, "age"), Expr::Lit(n(100.0))))
             .filter(cmp(CompareOp::Ge, prop(0, "age"), Expr::Lit(n(0.0))));
         let opt = assert_rows_preserved(&plan, &store);
@@ -1433,11 +1433,11 @@ mod tests {
         // A filter on a left-side slot pushes into the Join's left input.
         // Unlabelled left scan so the pushed filter stays a Filter (not seeded),
         // which is what this test checks.
-        let left = Plan::Scan { label: None }.expand(0, Dir::Out, Some("KNOWS"));
+        let left = Plan::Scan { label: None }.expand(0, Dir::Out, &["KNOWS".to_string()]);
         let right = Plan::Scan {
             label: Some("Person".into()),
         }
-        .expand(0, Dir::Out, Some("KNOWS"));
+        .expand(0, Dir::Out, &["KNOWS".to_string()]);
         // left width is 2 (a, b); a filter on slot 0 (left's a) pushes left.
         let plan = Plan::join(left, right, vec![(0, 0)]).filter(cmp(
             CompareOp::Ge,

@@ -314,7 +314,7 @@ pub enum Plan {
         input: Box<Plan>,
         from: usize,
         dir: Dir,
-        edge_label: Option<String>,
+        edge_label: Vec<String>,
         /// When true, also bind the traversed EDGE: the output appends the edge
         /// slot (a `Col::Edges`) THEN the landed node slot — so for input width W,
         /// the edge is slot W and the node slot W+1. When false (the default), only
@@ -330,7 +330,7 @@ pub enum Plan {
         input: Box<Plan>,
         from: usize,
         dir: Dir,
-        edge_label: Option<String>,
+        edge_label: Vec<String>,
         /// What a row with NO matching neighbour lands in the appended slot: the
         /// `u32::MAX` null sentinel (GQL `OPTIONAL MATCH` — `false`) or the source
         /// element itself (Gremlin `optional(<hop>)`, which passes the traverser
@@ -351,7 +351,7 @@ pub enum Plan {
         input: Box<Plan>,
         from: usize,
         dir: Dir,
-        edge_label: Option<String>,
+        edge_label: Vec<String>,
         lo_key: String,
         hi_key: String,
         qlo: Box<Expr>,
@@ -370,7 +370,7 @@ pub enum Plan {
         input: Box<Plan>,
         from: usize,
         dir: Dir,
-        edge_label: Option<String>,
+        edge_label: Vec<String>,
         min: u32,
         max: u32,
         trail: bool,
@@ -384,7 +384,7 @@ pub enum Plan {
         input: Box<Plan>,
         from: usize,
         dir: Dir,
-        edge_label: Option<String>,
+        edge_label: Vec<String>,
         max: Option<u32>,
     },
     /// Keep rows where `pred` is TRUE (three-valued: FALSE and NULL drop).
@@ -585,12 +585,12 @@ pub struct InsertEdge {
 
 impl Plan {
     #[must_use]
-    pub fn expand(self, from: usize, dir: Dir, edge_label: Option<&str>) -> Self {
+    pub fn expand(self, from: usize, dir: Dir, edge_label: &[String]) -> Self {
         Self::Expand {
             input: Box::new(self),
             from,
             dir,
-            edge_label: edge_label.map(str::to_string),
+            edge_label: edge_label.to_vec(),
             bind_edge: false,
         }
     }
@@ -598,12 +598,12 @@ impl Plan {
     /// Like [`Self::expand`] but also binds the traversed edge as a slot (edge
     /// slot then node slot). Used for `(a)-[r:T]->(b)` where `r` is read.
     #[must_use]
-    pub fn expand_edge(self, from: usize, dir: Dir, edge_label: Option<&str>) -> Self {
+    pub fn expand_edge(self, from: usize, dir: Dir, edge_label: &[String]) -> Self {
         Self::Expand {
             input: Box::new(self),
             from,
             dir,
-            edge_label: edge_label.map(str::to_string),
+            edge_label: edge_label.to_vec(),
             bind_edge: true,
         }
     }
@@ -613,14 +613,14 @@ impl Plan {
         self,
         from: usize,
         dir: Dir,
-        edge_label: Option<&str>,
+        edge_label: &[String],
         keep_source: bool,
     ) -> Self {
         Self::OptionalExpand {
             input: Box::new(self),
             from,
             dir,
-            edge_label: edge_label.map(str::to_string),
+            edge_label: edge_label.to_vec(),
             keep_source,
         }
     }
@@ -630,7 +630,7 @@ impl Plan {
         self,
         from: usize,
         dir: Dir,
-        edge_label: Option<&str>,
+        edge_label: &[String],
         min: u32,
         max: u32,
         trail: bool,
@@ -639,7 +639,7 @@ impl Plan {
             input: Box::new(self),
             from,
             dir,
-            edge_label: edge_label.map(str::to_string),
+            edge_label: edge_label.to_vec(),
             min,
             max,
             trail,
@@ -651,14 +651,14 @@ impl Plan {
         self,
         from: usize,
         dir: Dir,
-        edge_label: Option<&str>,
+        edge_label: &[String],
         max: Option<u32>,
     ) -> Self {
         Self::ShortestPath {
             input: Box::new(self),
             from,
             dir,
-            edge_label: edge_label.map(str::to_string),
+            edge_label: edge_label.to_vec(),
             max,
         }
     }

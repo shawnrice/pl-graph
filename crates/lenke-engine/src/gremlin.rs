@@ -13,6 +13,12 @@ use crate::ir::{Agg, AggFn, CompareOp, Dir, Expr, Plan, SortKey};
 use crate::value::Value;
 use std::collections::HashMap;
 
+/// A Gremlin step carries at most one edge label; the plan builders take the
+/// `&[String]` edge-type list (empty = any) that GQL's `|`-disjunction produces.
+fn etypes_of(label: Option<&str>) -> Vec<String> {
+    label.into_iter().map(str::to_string).collect()
+}
+
 pub fn parse(query: &str) -> Result<Plan, String> {
     let toks = lex(query)?;
     let mut p = Parser {
@@ -455,7 +461,7 @@ impl Parser {
                 let mut bodies = Vec::new();
                 loop {
                     let (dir, label) = self.hop_body()?;
-                    bodies.push(Plan::Row.expand(from, dir, label.as_deref()));
+                    bodies.push(Plan::Row.expand(from, dir, &etypes_of(label.as_deref())));
                     if self.peek() == Some(&Tok::Comma) {
                         self.bump();
                     } else {
@@ -479,7 +485,7 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 self.current = self.slots;
                 self.slots += 1;
-                plan.optional_expand(from, dir, label.as_deref(), true)
+                plan.optional_expand(from, dir, &etypes_of(label.as_deref()), true)
             }
             "coalesce" => {
                 // coalesce(<hop>, <hop>, …): per element, the FIRST branch that
@@ -489,7 +495,7 @@ impl Parser {
                 let from = self.current;
                 let slots = self.slots;
                 let exists = |dir: Dir, label: Option<&str>| Expr::Exists {
-                    body: Box::new(Plan::Row.expand(from, dir, label)),
+                    body: Box::new(Plan::Row.expand(from, dir, &etypes_of(label))),
                     outer_width: slots,
                 };
                 let mut bodies = Vec::new();
@@ -504,7 +510,7 @@ impl Parser {
                             Box::new(this.clone()),
                         ),
                     };
-                    bodies.push(Plan::Row.filter(guard).expand(from, dir, label.as_deref()));
+                    bodies.push(Plan::Row.filter(guard).expand(from, dir, &etypes_of(label.as_deref())));
                     prior = Some(match prior {
                         None => this,
                         Some(p) => Expr::Or(Box::new(p), Box::new(this)),
@@ -534,11 +540,11 @@ impl Parser {
                 let then_body =
                     Plan::Row
                         .filter(pred.clone())
-                        .expand(from, t_dir, t_label.as_deref());
+                        .expand(from, t_dir, &etypes_of(t_label.as_deref()));
                 let else_body = Plan::Row.filter(Expr::Not(Box::new(pred))).expand(
                     from,
                     e_dir,
-                    e_label.as_deref(),
+                    &etypes_of(e_label.as_deref()),
                 );
                 self.current = self.slots;
                 self.slots += 1;
@@ -603,7 +609,7 @@ impl Parser {
                 let from = self.current;
                 self.current = self.slots;
                 self.slots += 1;
-                plan.expand(from, dir, edge_label)
+                plan.expand(from, dir, &etypes_of(edge_label))
             }
             "repeat" => {
                 // `repeat(<hop>)` v1: the body is a SINGLE anonymous hop
@@ -627,7 +633,7 @@ impl Parser {
                 let from = self.current;
                 self.current = self.slots;
                 self.slots += 1;
-                plan.var_length(from, dir, label.as_deref(), n, n, false)
+                plan.var_length(from, dir, &etypes_of(label.as_deref()), n, n, false)
             }
             "oute" | "ine" | "bothe" => {
                 // Edge-yielding hop: bind the traversed edge as a slot and leave the
@@ -667,7 +673,7 @@ impl Parser {
                 self.current = edge_slot;
                 self.slots += 2;
                 self.edge_hop = Some((node_slot, dir));
-                plan.expand_edge(from, dir, edge_label)
+                plan.expand_edge(from, dir, &etypes_of(edge_label))
             }
             "inv" | "outv" | "otherv" => {
                 self.expect(&Tok::RParen)?;
@@ -876,7 +882,7 @@ impl Parser {
                                                 // Correlated existence check: does the current element have such
                                                 // an edge? The body seeds `Plan::Row` (the outer row) and expands
                                                 // from the current slot — the same shape GQL's EXISTS { … } builds.
-                    let body = Plan::Row.expand(self.current, dir, label.as_deref());
+                    let body = Plan::Row.expand(self.current, dir, &etypes_of(label.as_deref()));
                     plan.filter(Expr::Exists {
                         body: Box::new(body),
                         outer_width: self.slots,
@@ -1445,7 +1451,7 @@ impl Parser {
                     None
                 };
                 self.expect(&Tok::RParen)?;
-                let body = Plan::Row.expand(self.current, dir, label.as_deref());
+                let body = Plan::Row.expand(self.current, dir, &etypes_of(label.as_deref()));
                 Expr::Exists {
                     body: Box::new(body),
                     outer_width: self.slots,

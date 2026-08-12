@@ -811,7 +811,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             store,
             *from,
             *dir,
-            edge_label.as_deref(),
+            edge_label,
             *bind_edge,
         ),
         Plan::OptionalExpand {
@@ -825,7 +825,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             store,
             *from,
             *dir,
-            edge_label.as_deref(),
+            edge_label,
             *keep_source,
         ),
         Plan::IntervalExpand {
@@ -847,7 +847,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 store,
                 *from,
                 *dir,
-                edge_label.as_deref(),
+                edge_label,
                 lo_key,
                 hi_key,
                 &qlo_col,
@@ -892,7 +892,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             store,
             *from,
             *dir,
-            edge_label.as_deref(),
+            edge_label,
             *min,
             *max,
             *trail,
@@ -908,7 +908,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             store,
             *from,
             *dir,
-            edge_label.as_deref(),
+            edge_label,
             *max,
         ),
         Plan::Aggregate { input, keys, aggs } => {
@@ -2097,9 +2097,9 @@ fn try_reverse_expand(pred: &Expr, input: &Plan, store: &Store, track: bool) -> 
     if target_rows >= source_rows {
         return None;
     }
-    let want: Option<u32> = match edge_label.as_deref() {
-        None => None,
-        Some(name) => Some(store.etype_id(name)?),
+    let want = match want_etypes(store, edge_label) {
+        Ok(w) => w,
+        Err(()) => return None,
     };
     let rev = reverse_dir(*dir);
     // Seed the targets (raw index bucket, any label — the forward path does not
@@ -2109,7 +2109,7 @@ fn try_reverse_expand(pred: &Expr, input: &Plan, store: &Store, track: bool) -> 
     let mut sources = Vec::new();
     let mut ends = Vec::new();
     for &t in &targets {
-        for_each_nbr(store, t, rev, want, |a, _| {
+        for_each_nbr(store, t, rev, &want, |a, _| {
             if src_label.as_deref().is_none_or(|l| store.is_labeled(a, l)) {
                 sources.push(a);
                 ends.push(t);
@@ -2144,7 +2144,7 @@ fn expand(
     store: &Store,
     from: usize,
     dir: Dir,
-    edge_label: Option<&str>,
+    edge_label: &[String],
     bind_edge: bool,
 ) -> Batch {
     // An empty expand still appends the landed slot(s), so the output has the same
@@ -2164,12 +2164,9 @@ fn expand(
     };
     // Resolve the edge label to an interned id up front; an unknown label matches
     // nothing (not everything).
-    let want: Option<u32> = match edge_label {
-        None => None,
-        Some(name) => match store.etype_id(name) {
-            Some(id) => Some(id),
-            None => return empty(),
-        },
+    let want = match want_etypes(store, edge_label) {
+        Ok(w) => w,
+        Err(()) => return empty(),
     };
     let Col::Nodes(src) = batch.slot(from) else {
         // Only a node frontier can be expanded; anything else yields nothing.
@@ -2184,7 +2181,7 @@ fn expand(
     let mut nbrs = Vec::new();
     let mut eids = Vec::new();
     for (row, &v) in src.iter().enumerate() {
-        for_each_nbr(store, v, dir, want, |nbr, eid| {
+        for_each_nbr(store, v, dir, &want, |nbr, eid| {
             keep.push(row);
             nbrs.push(nbr);
             if need_eids {
@@ -2217,7 +2214,7 @@ fn optional_expand(
     store: &Store,
     from: usize,
     dir: Dir,
-    edge_label: Option<&str>,
+    edge_label: &[String],
     keep_source: bool,
 ) -> Batch {
     // The value a missed row lands: the source element (Gremlin optional) or the
@@ -2235,12 +2232,9 @@ fn optional_expand(
         slots.push(Col::Nodes(landed));
         Batch::of(slots)
     };
-    let want: Option<u32> = match edge_label {
-        None => None,
-        Some(name) => match store.etype_id(name) {
-            Some(id) => Some(id),
-            None => return all_miss(), // unknown edge type → no match for any row
-        },
+    let want = match want_etypes(store, edge_label) {
+        Ok(w) => w,
+        Err(()) => return all_miss(), // unknown edge type → no match for any row
     };
     let Col::Nodes(src) = batch.slot(from) else {
         return all_miss();
@@ -2249,7 +2243,7 @@ fn optional_expand(
     let mut nbrs = Vec::new();
     for (row, &v) in src.iter().enumerate() {
         let before = nbrs.len();
-        for_each_nbr(store, v, dir, want, |nbr, _| {
+        for_each_nbr(store, v, dir, &want, |nbr, _| {
             keep.push(row);
             nbrs.push(nbr);
         });
@@ -2280,7 +2274,7 @@ fn interval_expand(
     store: &Store,
     from: usize,
     dir: Dir,
-    edge_label: Option<&str>,
+    edge_label: &[String],
     lo_key: &str,
     hi_key: &str,
     qlo_col: &Col,
@@ -2299,12 +2293,9 @@ fn interval_expand(
         }
         b
     };
-    let want: Option<u32> = match edge_label {
-        None => None,
-        Some(name) => match store.etype_id(name) {
-            Some(id) => Some(id),
-            None => return empty(),
-        },
+    let want = match want_etypes(store, edge_label) {
+        Ok(w) => w,
+        Err(()) => return empty(),
     };
     let Col::Nodes(src) = batch.slot(from) else {
         return empty();
@@ -2330,7 +2321,7 @@ fn interval_expand(
                 eids.push(eid);
             });
         } else {
-            for_each_nbr(store, v, dir, want, |nbr, eid| {
+            for_each_nbr(store, v, dir, &want, |nbr, eid| {
                 if let (Value::Num(lo), Value::Num(hi)) =
                     (store.edge_prop(eid, lo_key), store.edge_prop(eid, hi_key))
                 {
@@ -2535,22 +2526,44 @@ fn range_seek_ids(store: &Store, label: &str, key: &str, op: CompareOp, value: &
 /// with `(neighbour, eid)`. The one place Expand's adjacency walk is spelled —
 /// shared by the batch operator and the frontier executor so the two can never
 /// disagree on what an Expand reaches.
-fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: Option<u32>, mut f: impl FnMut(u32, u32)) {
+/// Resolve an edge-type constraint (the plan's `edge_label` list) to the matching
+/// type ids the walkers filter on. An EMPTY list is untyped — any edge — so it
+/// returns `Ok(vec![])` (an empty `want` slice reads as "any"). A typed list whose
+/// names ALL fail to resolve matches no edge, so it returns `Err(())` and the caller
+/// short-circuits to its own empty result. Otherwise the known ids, unknown names
+/// dropped — mirroring core's `lower_labels`.
+fn want_etypes(store: &Store, edge_label: &[String]) -> Result<Vec<u32>, ()> {
+    if edge_label.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<u32> = edge_label
+        .iter()
+        .filter_map(|n| store.etype_id(n))
+        .collect();
+    if ids.is_empty() {
+        return Err(());
+    }
+    Ok(ids)
+}
+
+fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: &[u32], mut f: impl FnMut(u32, u32)) {
     // An undirected walk reaches a self-loop from BOTH the out- and the in-index;
     // emit it once (from the out-side) by dropping its in-side copy. Directed walks
     // touch one index, so they keep it either way. Matches core's SelfLoops::Once.
     let drop_loop = matches!(dir, Dir::Both);
-    // A type-filtered hop over an indexed store seeks the type bucket directly
+    // A SINGLE-type hop over an indexed store seeks the type bucket directly
     // (O(matching), not O(degree)) — the whole point of the opt-in edge-type index.
-    if let Some(w) = want {
+    // A disjunction (`want.len() >= 2`) must NOT union buckets: that reorders vs the
+    // flat stored-order scan and would break byte-identity, so it falls through.
+    if let [w] = want {
         if store.has_edge_type_index() {
             if matches!(dir, Dir::Out | Dir::Both) {
-                for a in store.out_typed(v, w) {
+                for a in store.out_typed(v, *w) {
                     f(a.nbr, a.eid);
                 }
             }
             if matches!(dir, Dir::In | Dir::Both) {
-                for a in store.in_typed(v, w) {
+                for a in store.in_typed(v, *w) {
                     if !(drop_loop && a.nbr == v) {
                         f(a.nbr, a.eid);
                     }
@@ -2559,7 +2572,8 @@ fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: Option<u32>, mut f: impl 
             return;
         }
     }
-    let type_ok = |et: u32| want.is_none_or(|w| w == et);
+    // Empty `want` = any type; otherwise the edge's type must be in the set.
+    let type_ok = |et: u32| want.is_empty() || want.contains(&et);
     if matches!(dir, Dir::Out | Dir::Both) {
         for a in store.out(v) {
             if type_ok(a.etype) {
@@ -2629,16 +2643,13 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
                 return None;
             }
             let src = frontier_ids(input, store)?;
-            let want = match edge_label {
-                None => None,
-                Some(name) => match store.etype_id(name) {
-                    Some(id) => Some(id),
-                    None => return Some(Vec::new()), // unknown label matches nothing
-                },
+            let want = match want_etypes(store, edge_label) {
+                Ok(w) => w,
+                Err(()) => return Some(Vec::new()), // unknown label matches nothing
             };
             let mut out = Vec::new();
             for &v in &src {
-                for_each_nbr(store, v, *dir, want, |nbr, _eid| out.push(nbr));
+                for_each_nbr(store, v, *dir, &want, |nbr, _eid| out.push(nbr));
             }
             Some(out)
         }
@@ -2750,12 +2761,9 @@ fn frontier_counts(plan: &Plan, store: &Store) -> Option<Counts> {
                 return None;
             }
             let prev = frontier_counts(input, store)?;
-            let want = match edge_label {
-                None => None,
-                Some(name) => match store.etype_id(name) {
-                    Some(id) => Some(id),
-                    None => return Some(Counts::Sparse(Vec::new())), // unknown label → no paths
-                },
+            let want = match want_etypes(store, edge_label) {
+                Ok(w) => w,
+                Err(()) => return Some(Counts::Sparse(Vec::new())), // unknown label → no paths
             };
             // Estimate the next frontier's fan-out from the source count and the
             // average degree; go dense when it will be large, sparse otherwise. The
@@ -2769,7 +2777,7 @@ fn frontier_counts(plan: &Plan, store: &Store) -> Option<Counts> {
             if est_next > dense_cut as f64 {
                 let mut next = vec![0.0f64; n];
                 prev.for_each(|v, c| {
-                    for_each_nbr(store, v, *dir, want, |nbr, _| next[nbr as usize] += c);
+                    for_each_nbr(store, v, *dir, &want, |nbr, _| next[nbr as usize] += c);
                 });
                 Some(Counts::Dense(next))
             } else {
@@ -2777,7 +2785,7 @@ fn frontier_counts(plan: &Plan, store: &Store) -> Option<Counts> {
                 // few nodes a narrow frontier reaches, no O(node_count) allocation.
                 let mut next: FnvMap<u32, f64> = FnvMap::default();
                 prev.for_each(|v, c| {
-                    for_each_nbr(store, v, *dir, want, |nbr, _| {
+                    for_each_nbr(store, v, *dir, &want, |nbr, _| {
                         *next.entry(nbr).or_insert(0.0) += c;
                     });
                 });
@@ -2944,12 +2952,9 @@ fn try_edge_filtered_count(
     // target node); the pred must be a numeric conjunction on that edge slot.
     let edge_slot = from + 1;
     let (key, bounds) = num_conj_on_slot(pred, edge_slot)?;
-    let want = match edge_label {
-        None => None,
-        Some(name) => match store.etype_id(name) {
-            Some(id) => Some(id),
-            None => return Some(scalar_num(0.0)), // unknown edge type → no rows
-        },
+    let want = match want_etypes(store, edge_label) {
+        Ok(w) => w,
+        Err(()) => return Some(scalar_num(0.0)), // unknown edge type → no rows
     };
     let src_ids = frontier_ids(src, store)?;
     let mut count = 0u64;
@@ -2958,7 +2963,7 @@ fn try_edge_filtered_count(
     // key is not homogeneously numeric.
     if let Some((data, present)) = store.edge_num_column(&key) {
         for &v in &src_ids {
-            for_each_nbr(store, v, *dir, want, |_nbr, eid| {
+            for_each_nbr(store, v, *dir, &want, |_nbr, eid| {
                 let i = eid as usize;
                 if present[i] && bounds.iter().all(|&(op, t)| num_pred(op, data[i], t)) {
                     count += 1;
@@ -2967,7 +2972,7 @@ fn try_edge_filtered_count(
         }
     } else {
         for &v in &src_ids {
-            for_each_nbr(store, v, *dir, want, |_nbr, eid| {
+            for_each_nbr(store, v, *dir, &want, |_nbr, eid| {
                 if let Value::Num(x) = store.edge_prop(eid, &key) {
                     if bounds.iter().all(|&(op, t)| num_pred(op, x, t)) {
                         count += 1;
@@ -3028,12 +3033,9 @@ fn try_varlen_count(
     else {
         return None;
     };
-    let want = match edge_label.as_deref() {
-        None => None,
-        Some(name) => match store.etype_id(name) {
-            Some(id) => Some(id),
-            None => return Some(scalar_num(0.0)), // unknown edge type → no paths
-        },
+    let want = match want_etypes(store, edge_label) {
+        Ok(w) => w,
+        Err(()) => return Some(scalar_num(0.0)), // unknown edge type → no paths
     };
     let batch = pull(inner, store, false).ok()?;
     let Col::Nodes(src) = batch.slot(*from) else {
@@ -3054,15 +3056,20 @@ fn try_varlen_count(
         if est_paths > 2.0 * (nc + ec) as f64 {
             let mut outdeg = vec![0u64; nc];
             for (v, d) in outdeg.iter_mut().enumerate() {
-                *d = match want {
-                    None => store.out(v as u32).len() as u64,
-                    Some(w) => store.out(v as u32).iter().filter(|a| a.etype == w).count() as u64,
+                *d = if want.is_empty() {
+                    store.out(v as u32).len() as u64
+                } else {
+                    store
+                        .out(v as u32)
+                        .iter()
+                        .filter(|a| want.contains(&a.etype))
+                        .count() as u64
                 };
             }
             let mut total: u64 = 0;
             for &s in src {
                 for a in store.out(s) {
-                    if want.is_some_and(|w| w != a.etype) {
+                    if !want.is_empty() && !want.contains(&a.etype) {
                         continue;
                     }
                     if *min <= 1 {
@@ -3084,7 +3091,7 @@ fn try_varlen_count(
     let mut used: Vec<u32> = Vec::new();
     for &v in src {
         varlen_count_dfs(
-            store, v, 0, *min, *max, *dir, want, *trail, &mut used, &mut total,
+            store, v, 0, *min, *max, *dir, &want, *trail, &mut used, &mut total,
         );
         debug_assert!(used.is_empty());
     }
@@ -3103,7 +3110,7 @@ fn varlen_count_dfs(
     min: u32,
     max: u32,
     dir: Dir,
-    want: Option<u32>,
+    want: &[u32],
     trail: bool,
     used: &mut Vec<u32>,
     total: &mut u64,
@@ -3132,7 +3139,7 @@ fn varlen_count_dfs(
         .map(|a| (false, a))
         .chain(inc.iter().map(|a| (true, a)))
     {
-        if want.is_some_and(|w| w != a.etype) {
+        if !want.is_empty() && !want.contains(&a.etype) {
             continue;
         }
         if is_inc && drop_loop && a.nbr == v {
@@ -3207,12 +3214,9 @@ fn try_varlen_distinct_count(
     if *min > 1 {
         return None;
     }
-    let want = match edge_label.as_deref() {
-        None => None,
-        Some(name) => match store.etype_id(name) {
-            Some(id) => Some(id),
-            None => return Some(scalar_num(0.0)), // unknown edge type → no endpoints
-        },
+    let want = match want_etypes(store, edge_label) {
+        Ok(w) => w,
+        Err(()) => return Some(scalar_num(0.0)), // unknown edge type → no endpoints
     };
     let batch = pull(inner, store, false).ok()?;
     // The endpoint the VarLength appends lands at the slot just past the inner width;
@@ -3245,7 +3249,7 @@ fn try_varlen_distinct_count(
             break;
         }
         for &v in &frontier {
-            for_each_nbr(store, v, *dir, want, |nbr, _| {
+            for_each_nbr(store, v, *dir, &want, |nbr, _| {
                 reached[nbr as usize] = true;
                 if !visited[nbr as usize] {
                     visited[nbr as usize] = true;
@@ -3272,7 +3276,7 @@ fn varlen_agg_dfs(
     min: u32,
     max: u32,
     dir: Dir,
-    want: Option<u32>,
+    want: &[u32],
     trail: bool,
     used: &mut Vec<u32>,
     emit: &mut dyn FnMut(u32),
@@ -3300,7 +3304,7 @@ fn varlen_agg_dfs(
         .map(|a| (false, a))
         .chain(inc.iter().map(|a| (true, a)))
     {
-        if want.is_some_and(|w| w != a.etype) {
+        if !want.is_empty() && !want.contains(&a.etype) {
             continue;
         }
         if is_inc && drop_loop && a.nbr == v {
@@ -3372,12 +3376,12 @@ fn try_varlen_agg(
     let Some(Expr::Prop { slot, key }) = agg.arg.as_ref() else {
         return None; // count(*) is `try_varlen_count`
     };
-    let want = match edge_label.as_deref() {
-        None => None,
-        Some(name) => store.etype_id(name).map(Some).unwrap_or_else(|| {
-            // Unknown edge type → no paths → the empty-aggregate value.
-            Some(u32::MAX) // sentinel that matches nothing (etype ids are dense)
-        }),
+    let want = match want_etypes(store, edge_label) {
+        Ok(w) => w,
+        // Unknown edge type → no paths. A non-empty want of a non-existent id
+        // (etype ids are dense, so u32::MAX is none) matches nothing, yielding the
+        // empty-aggregate value without a special-cased early return here.
+        Err(()) => vec![u32::MAX],
     };
     let batch = pull(inner, store, false).ok()?;
     if *slot != batch.slots.len() {
@@ -3390,7 +3394,7 @@ fn try_varlen_agg(
     let dfs = |emit: &mut dyn FnMut(u32)| {
         let mut used: Vec<u32> = Vec::new();
         for &v in src {
-            varlen_agg_dfs(store, v, 0, *min, *max, *dir, want, *trail, &mut used, emit);
+            varlen_agg_dfs(store, v, 0, *min, *max, *dir, &want, *trail, &mut used, emit);
         }
     };
 
@@ -4145,7 +4149,7 @@ fn try_scan_multi_agg(
 /// Peel exactly `n` OUTgoing frontier hops (no bound edge) ending at a bare Scan,
 /// returning the per-hop edge labels FIRST-to-LAST and the Scan's label. `None`
 /// unless the plan is precisely that chain (used by the 3-hop edge-product count).
-fn peel_out_hops(plan: &Plan, n: usize) -> Option<(Vec<Option<String>>, Option<String>)> {
+fn peel_out_hops(plan: &Plan, n: usize) -> Option<(Vec<Vec<String>>, Option<String>)> {
     if n == 0 {
         return match plan {
             Plan::Scan { label } => Some((Vec::new(), label.clone())),
@@ -4190,19 +4194,17 @@ fn try_3hop_product_count(
         return None;
     }
     let (labels, base) = peel_out_hops(input, 3)?;
-    let mut wants: [Option<u32>; 3] = [None; 3];
-    for (i, l) in labels.iter().enumerate() {
-        wants[i] = match l {
-            None => None,
-            Some(name) => match store.etype_id(name) {
-                Some(id) => Some(id),
-                None => return Some(scalar_num(0.0)), // unknown edge type → no paths
-            },
-        };
+    let mut wants: Vec<Vec<u32>> = Vec::with_capacity(3);
+    for l in &labels {
+        match want_etypes(store, l) {
+            Ok(w) => wants.push(w),
+            Err(()) => return Some(scalar_num(0.0)), // unknown edge type → no paths
+        }
     }
-    let (w1, w2, w3) = (wants[0], wants[1], wants[2]);
+    let (w1, w2, w3) = (&wants[0], &wants[1], &wants[2]);
     let nc = store.node_count();
-    let hit = |a: &crate::store::Adj, w: Option<u32>| w.is_none_or(|w| w == a.etype);
+    // Empty want = any type; else the edge type must be in the hop's set.
+    let hit = |a: &crate::store::Adj, w: &[u32]| w.is_empty() || w.contains(&a.etype);
 
     // level1[b] = number of hop-1 edges from a SOURCE into b (= counts after 1 hop).
     let mut level1 = vec![0u64; nc];
@@ -4274,12 +4276,9 @@ fn try_fused_count(
     if *from + 1 != w {
         return None; // the final Expand must expand the current frontier
     }
-    let want = match edge_label {
-        None => None,
-        Some(name) => match store.etype_id(name) {
-            Some(id) => Some(id),
-            None => return Some(scalar_num(0.0)), // unknown label: zero rows
-        },
+    let want = match want_etypes(store, edge_label) {
+        Ok(w) => w,
+        Err(()) => return Some(scalar_num(0.0)), // unknown label: zero rows
     };
     let src = frontier_ids(inner, store)?; // ids feeding the final hop, w/ multiplicity
 
@@ -4293,7 +4292,7 @@ fn try_fused_count(
                 let mut total = 0f64;
                 counts.for_each(|v, c| {
                     let mut deg = 0f64;
-                    for_each_nbr(store, v, *dir, want, |_, _| deg += 1.0);
+                    for_each_nbr(store, v, *dir, &want, |_, _| deg += 1.0);
                     total += c * deg;
                 });
                 return Some(scalar_num(total));
@@ -4310,12 +4309,12 @@ fn try_fused_count(
             let (distinct, mult) = distinct_with_mult(&src, store.node_count());
             for (i, &v) in distinct.iter().enumerate() {
                 let mut deg = 0f64;
-                for_each_nbr(store, v, *dir, want, |_, _| deg += 1.0);
+                for_each_nbr(store, v, *dir, &want, |_, _| deg += 1.0);
                 total += mult[i] * deg;
             }
         } else {
             for &v in &src {
-                for_each_nbr(store, v, *dir, want, |_, _| total += 1.0);
+                for_each_nbr(store, v, *dir, &want, |_, _| total += 1.0);
             }
         }
         return Some(scalar_num(total));
@@ -4352,7 +4351,7 @@ fn try_fused_count(
         let mut seen = vec![false; nc];
         let mut cnt = 0f64;
         for &v in sources {
-            for_each_nbr(store, v, *dir, want, |nbr, _| {
+            for_each_nbr(store, v, *dir, &want, |nbr, _| {
                 if !seen[nbr as usize] {
                     seen[nbr as usize] = true;
                     cnt += 1.0;
@@ -4584,12 +4583,9 @@ fn try_node_grouped_count(
     if *slot != w {
         return None; // key must read the endpoint (last) slot, index == w
     }
-    let want = match edge_label {
-        None => None,
-        Some(name) => match store.etype_id(name) {
-            Some(id) => Some(id),
-            None => return Some(Batch::of(vec![Col::Nodes(vec![]), Col::Gen(vec![])])),
-        },
+    let want = match want_etypes(store, edge_label) {
+        Ok(w) => w,
+        Err(()) => return Some(Batch::of(vec![Col::Nodes(vec![]), Col::Gen(vec![])])),
     };
     let src = frontier_ids(inner, store)?; // nodes feeding the final hop, w/ multiplicity
 
@@ -4600,7 +4596,7 @@ fn try_node_grouped_count(
     let mut rep_ids: Vec<u32> = Vec::new();
     let mut node_count: Vec<f64> = Vec::new();
     for &v in &src {
-        for_each_nbr(store, v, *dir, want, |nbr, _| {
+        for_each_nbr(store, v, *dir, &want, |nbr, _| {
             let slot = &mut group_of[nbr as usize];
             if *slot == u32::MAX {
                 *slot = u32::try_from(rep_ids.len()).expect("group count fits in u32");
@@ -4689,7 +4685,7 @@ fn var_length(
     store: &Store,
     from: usize,
     dir: Dir,
-    edge_label: Option<&str>,
+    edge_label: &[String],
     min: u32,
     max: u32,
     trail: bool,
@@ -4699,12 +4695,9 @@ fn var_length(
         slots.push(Col::Nodes(vec![]));
         Batch::of(slots)
     };
-    let want: Option<u32> = match edge_label {
-        None => None,
-        Some(name) => match store.etype_id(name) {
-            Some(id) => Some(id),
-            None => return empty(),
-        },
+    let want = match want_etypes(store, edge_label) {
+        Ok(w) => w,
+        Err(()) => return empty(),
     };
     let Col::Nodes(src) = batch.slot(from) else {
         return empty();
@@ -4715,7 +4708,7 @@ fn var_length(
     let mut used: Vec<u32> = Vec::new(); // edge ids on the current path (trail only)
     for (row, &v) in src.iter().enumerate() {
         varlen_dfs(
-            store, v, 0, min, max, dir, want, trail, &mut used, row, &mut keep, &mut ends,
+            store, v, 0, min, max, dir, &want, trail, &mut used, row, &mut keep, &mut ends,
         );
         debug_assert!(used.is_empty());
     }
@@ -4737,7 +4730,7 @@ fn varlen_dfs(
     min: u32,
     max: u32,
     dir: Dir,
-    want: Option<u32>,
+    want: &[u32],
     trail: bool,
     used: &mut Vec<u32>,
     row: usize,
@@ -4772,7 +4765,7 @@ fn varlen_dfs(
         .map(|a| (false, a))
         .chain(inc.iter().map(|a| (true, a)))
     {
-        if want.is_some_and(|w| w != a.etype) {
+        if !want.is_empty() && !want.contains(&a.etype) {
             continue;
         }
         if is_inc && drop_loop && a.nbr == v {
@@ -4814,7 +4807,7 @@ fn shortest_path(
     store: &Store,
     from: usize,
     dir: Dir,
-    edge_label: Option<&str>,
+    edge_label: &[String],
     max: Option<u32>,
 ) -> Batch {
     let empty = || {
@@ -4822,12 +4815,9 @@ fn shortest_path(
         slots.push(Col::Nodes(vec![]));
         Batch::of(slots)
     };
-    let want: Option<u32> = match edge_label {
-        None => None,
-        Some(name) => match store.etype_id(name) {
-            Some(id) => Some(id),
-            None => return empty(),
-        },
+    let want = match want_etypes(store, edge_label) {
+        Ok(w) => w,
+        Err(()) => return empty(),
     };
     let Col::Nodes(src) = batch.slot(from) else {
         return empty();
@@ -4865,7 +4855,7 @@ fn shortest_path(
                 adjs.extend_from_slice(store.inc(v));
             }
             for a in adjs {
-                if want.is_some_and(|w| w != a.etype) {
+                if !want.is_empty() && !want.contains(&a.etype) {
                     continue;
                 }
                 // First reach = shortest reach (BFS), and only the first is kept.
@@ -5756,7 +5746,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             store,
             *from,
             *dir,
-            edge_label.as_deref(),
+            edge_label,
             *bind_edge,
         ),
         Plan::VarLength {
@@ -5772,7 +5762,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             store,
             *from,
             *dir,
-            edge_label.as_deref(),
+            edge_label,
             *min,
             *max,
             *trail,
@@ -7915,6 +7905,49 @@ mod tests {
         assert_eq!(count("MATCH (a)-[r:R]->(b) RETURN count(*) AS c"), 2.0);
     }
 
+    /// An edge-type disjunction `-[:A|B]->` matches an edge whose type is ANY of the
+    /// listed types; a typed-but-all-unknown disjunction matches nothing (it is NOT
+    /// read as "any"); an unknown name in a partial disjunction is dropped.
+    #[test]
+    fn edge_type_disjunction() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{}}\n",
+            "{\"id\":\"e1\",\"from\":\"a\",\"to\":\"b\",\"type\":\"KNOWS\",\"props\":{}}\n",
+            "{\"id\":\"e2\",\"from\":\"a\",\"to\":\"c\",\"type\":\"CREATED\",\"props\":{}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let count = |q: &str| -> f64 {
+            match run(&crate::gql::parse(q).unwrap(), &store).rows[0][0] {
+                Value::Num(n) => n,
+                ref other => panic!("want num, got {other:?}"),
+            }
+        };
+        // Both edge types match → both neighbours.
+        assert_eq!(
+            count("MATCH (a)-[:KNOWS|CREATED]->(x) RETURN count(*) AS c"),
+            2.0
+        );
+        // Order is irrelevant to the set.
+        assert_eq!(
+            count("MATCH (a)-[:CREATED|KNOWS]->(x) RETURN count(*) AS c"),
+            2.0
+        );
+        // A single named type still matches only that one.
+        assert_eq!(count("MATCH (a)-[:KNOWS]->(x) RETURN count(*) AS c"), 1.0);
+        // A partial disjunction drops the unknown name, keeping the known one.
+        assert_eq!(
+            count("MATCH (a)-[:KNOWS|BOGUS]->(x) RETURN count(*) AS c"),
+            1.0
+        );
+        // Typed but ALL-unknown matches nothing (NOT read as "any type").
+        assert_eq!(
+            count("MATCH (a)-[:BOGUS|NOPE]->(x) RETURN count(*) AS c"),
+            0.0
+        );
+    }
+
     /// `MATCH WALK` lets a variable-length hop reuse an edge; `TRAIL` (the default)
     /// forbids it. Over a self-loop, a length-2 hop exists as a WALK (reuse the loop)
     /// but not as a TRAIL.
@@ -8875,7 +8908,7 @@ mod tests {
     fn expand_binds_both_ends() {
         let store = social();
         let plan = scan("Person")
-            .expand(0, Dir::Out, Some("KNOWS"))
+            .expand(0, Dir::Out, &["KNOWS".to_string()])
             .project(vec![
                 ("a".into(), prop(0, "name")),
                 ("b".into(), prop(1, "name")),
@@ -8903,7 +8936,7 @@ mod tests {
     fn expand_filters_by_edge_label() {
         let store = social();
         let plan = scan("Person")
-            .expand(0, Dir::Out, Some("WORKS_ON"))
+            .expand(0, Dir::Out, &["WORKS_ON".to_string()])
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         assert_eq!(names_of(&out, 0), vec!["graphdb"]);
@@ -8914,7 +8947,7 @@ mod tests {
     fn filter_on_the_expanded_end() {
         let store = social();
         let plan = scan("Person")
-            .expand(0, Dir::Out, Some("KNOWS"))
+            .expand(0, Dir::Out, &["KNOWS".to_string()])
             .filter(cmp(CompareOp::Ge, prop(1, "age"), lit(n(40.0))))
             .project(vec![("a".into(), prop(0, "name"))]);
         let out = run(&plan, &store);
@@ -8930,7 +8963,7 @@ mod tests {
         let store = social();
         let plan = scan("Person")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("carol"))))
-            .expand(0, Dir::In, Some("KNOWS"))
+            .expand(0, Dir::In, &["KNOWS".to_string()])
             .project(vec![("who".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);
@@ -8943,7 +8976,7 @@ mod tests {
     fn expand_unknown_label_is_empty() {
         let store = social();
         let plan = scan("Person")
-            .expand(0, Dir::Out, Some("NOPE"))
+            .expand(0, Dir::Out, &["NOPE".to_string()])
             .project(vec![("x".into(), prop(1, "name"))]);
         assert_eq!(run(&plan, &store).rows.len(), 0);
     }
@@ -8959,7 +8992,7 @@ mod tests {
         st.add_edge(a, b, "R");
         let eid = st.out(a)[0].eid;
         st.set_edge_prop(eid, "weight", n(0.5));
-        let plan = scan("P").expand_edge(0, Dir::Out, Some("R")).project(vec![
+        let plan = scan("P").expand_edge(0, Dir::Out, &["R".to_string()]).project(vec![
             ("w".into(), prop(1, "weight")), // edge slot
             ("b".into(), prop(2, "name")),   // node slot
         ]);
@@ -8977,7 +9010,7 @@ mod tests {
         let b = st.add_node(&["P"], &[]);
         st.add_edge(a, b, "R");
         let plan = scan("P")
-            .expand_edge(0, Dir::Out, Some("R"))
+            .expand_edge(0, Dir::Out, &["R".to_string()])
             .project(vec![("w".into(), prop(1, "weight"))]);
         let out = run(&plan, &st);
         assert_eq!(out.rows.len(), 1);
@@ -8999,7 +9032,7 @@ mod tests {
         st.set_edge_prop(e1, "w", n(0.5));
         st.set_edge_prop(e2, "w", n(0.2));
         let plan = scan("P")
-            .expand_edge(0, Dir::Out, Some("R"))
+            .expand_edge(0, Dir::Out, &["R".to_string()])
             .filter(cmp(CompareOp::Gt, prop(1, "w"), lit(n(0.4))))
             .project(vec![("b".into(), prop(2, "name"))]);
         assert_eq!(names_of(&run(&plan, &st), 0), vec!["b"]);
@@ -9152,7 +9185,7 @@ mod tests {
     #[test]
     fn count_out_degree_grouped_by_source() {
         let store = social();
-        let plan = scan("Person").expand(0, Dir::Out, Some("KNOWS")).aggregate(
+        let plan = scan("Person").expand(0, Dir::Out, &["KNOWS".to_string()]).aggregate(
             vec![("who".into(), prop(0, "name"))],
             vec![agg(AggFn::Count, None, false, "deg")],
         );
@@ -9173,7 +9206,7 @@ mod tests {
     fn fused_count_star_one_hop() {
         let store = social();
         let plan = scan("Person")
-            .expand(0, Dir::Out, Some("KNOWS"))
+            .expand(0, Dir::Out, &["KNOWS".to_string()])
             .aggregate(vec![], vec![agg(AggFn::Count, None, false, "c")]);
         let out = run(&plan, &store);
         assert_eq!(out.rows.len(), 1);
@@ -9187,8 +9220,8 @@ mod tests {
     fn fused_count_star_two_hop() {
         let store = social();
         let plan = scan("Person")
-            .expand(0, Dir::Out, Some("KNOWS"))
-            .expand(1, Dir::Out, Some("KNOWS"))
+            .expand(0, Dir::Out, &["KNOWS".to_string()])
+            .expand(1, Dir::Out, &["KNOWS".to_string()])
             .aggregate(vec![], vec![agg(AggFn::Count, None, false, "c")]);
         let out = run(&plan, &store);
         assert_eq!(num(&out.rows[0][0]), 1.0);
@@ -9212,8 +9245,8 @@ mod tests {
         bld.edge(x, q, "R");
         let store = bld.build();
         let plan = scan("P")
-            .expand(0, Dir::Out, Some("R"))
-            .expand(1, Dir::Out, Some("R"))
+            .expand(0, Dir::Out, &["R".to_string()])
+            .expand(1, Dir::Out, &["R".to_string()])
             .aggregate(vec![], vec![agg(AggFn::Count, None, false, "c")]);
         assert_eq!(num(&run(&plan, &store).rows[0][0]), 4.0);
     }
@@ -9224,8 +9257,8 @@ mod tests {
     fn fused_count_distinct_endpoint() {
         let store = social();
         let plan = scan("Person")
-            .expand(0, Dir::Out, Some("KNOWS"))
-            .expand(1, Dir::Out, Some("KNOWS"))
+            .expand(0, Dir::Out, &["KNOWS".to_string()])
+            .expand(1, Dir::Out, &["KNOWS".to_string()])
             .aggregate(
                 vec![],
                 vec![agg(AggFn::Count, Some(Expr::Slot(2)), true, "c")],
@@ -9240,7 +9273,7 @@ mod tests {
     #[test]
     fn frontier_grouped_count_matches() {
         let store = social();
-        let plan = scan("Person").expand(0, Dir::Out, Some("KNOWS")).aggregate(
+        let plan = scan("Person").expand(0, Dir::Out, &["KNOWS".to_string()]).aggregate(
             vec![("who".into(), prop(1, "name"))],
             vec![agg(AggFn::Count, None, false, "c")],
         );
@@ -9265,7 +9298,7 @@ mod tests {
         b.edge(a, n2, "R");
         b.edge(a, n3, "R");
         let store = b.build();
-        let plan = scan("P").expand(0, Dir::Out, Some("R")).aggregate(
+        let plan = scan("P").expand(0, Dir::Out, &["R".to_string()]).aggregate(
             vec![("city".into(), prop(1, "city"))],
             vec![agg(AggFn::Count, None, false, "c")],
         );
@@ -9282,7 +9315,7 @@ mod tests {
     #[test]
     fn frontier_grouped_sum_matches() {
         let store = social();
-        let plan = scan("Person").expand(0, Dir::Out, Some("KNOWS")).aggregate(
+        let plan = scan("Person").expand(0, Dir::Out, &["KNOWS".to_string()]).aggregate(
             vec![("who".into(), prop(1, "name"))],
             vec![agg(AggFn::Sum, Some(prop(1, "age")), false, "s")],
         );
@@ -9296,7 +9329,7 @@ mod tests {
     fn fused_count_unknown_label_is_zero() {
         let store = social();
         let plan = scan("Person")
-            .expand(0, Dir::Out, Some("NOPE"))
+            .expand(0, Dir::Out, &["NOPE".to_string()])
             .aggregate(vec![], vec![agg(AggFn::Count, None, false, "c")]);
         assert_eq!(num(&run(&plan, &store).rows[0][0]), 0.0);
     }
@@ -9505,7 +9538,7 @@ mod tests {
     fn distinct_reached_set() {
         let store = social();
         let plan = scan("Person")
-            .expand(0, Dir::Out, Some("KNOWS"))
+            .expand(0, Dir::Out, &["KNOWS".to_string()])
             .project(vec![("who".into(), prop(1, "name"))])
             .distinct();
         let out = run(&plan, &store);
@@ -9522,8 +9555,8 @@ mod tests {
     #[test]
     fn join_shared_start_variable() {
         let store = social();
-        let left = scan("Person").expand(0, Dir::Out, Some("KNOWS"));
-        let right = scan("Person").expand(0, Dir::Out, Some("WORKS_ON"));
+        let left = scan("Person").expand(0, Dir::Out, &["KNOWS".to_string()]);
+        let right = scan("Person").expand(0, Dir::Out, &["WORKS_ON".to_string()]);
         let plan = Plan::join(left, right, vec![(0, 0)]).project(vec![
             ("a".into(), prop(0, "name")),
             ("b".into(), prop(1, "name")),
@@ -9562,8 +9595,8 @@ mod tests {
         b.edge(a, s1, "S");
         b.edge(a, s2, "S");
         let store = b.build();
-        let left = scan("P").expand(0, Dir::Out, Some("R"));
-        let right = scan("P").expand(0, Dir::Out, Some("S"));
+        let left = scan("P").expand(0, Dir::Out, &["R".to_string()]);
+        let right = scan("P").expand(0, Dir::Out, &["S".to_string()]);
         let plan = Plan::join(left, right, vec![(0, 0)]).project(vec![
             ("r".into(), prop(1, "name")),
             ("s".into(), prop(3, "name")),
@@ -9593,8 +9626,8 @@ mod tests {
         let store = social();
         // Everyone with a KNOWS edge, joined to everyone with a WORKS_ON edge on
         // the SAME person. Only alice has both, so bob (KNOWS only) drops.
-        let left = scan("Person").expand(0, Dir::Out, Some("KNOWS"));
-        let right = scan("Person").expand(0, Dir::Out, Some("WORKS_ON"));
+        let left = scan("Person").expand(0, Dir::Out, &["KNOWS".to_string()]);
+        let right = scan("Person").expand(0, Dir::Out, &["WORKS_ON".to_string()]);
         let plan = Plan::join(left, right, vec![(0, 0)])
             .project(vec![("a".into(), prop(0, "name"))])
             .distinct();
@@ -9617,7 +9650,7 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .var_length(0, Dir::Out, Some("R"), 1, 2, true)
+            .var_length(0, Dir::Out, &["R".to_string()], 1, 2, true)
             .project(vec![("end".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);
@@ -9637,7 +9670,7 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .var_length(0, Dir::Out, Some("R"), 0, 2, true)
+            .var_length(0, Dir::Out, &["R".to_string()], 0, 2, true)
             .project(vec![("end".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);
@@ -9658,12 +9691,12 @@ mod tests {
 
         let walk = base
             .clone()
-            .var_length(0, Dir::Out, Some("R"), 1, 2, false)
+            .var_length(0, Dir::Out, &["R".to_string()], 1, 2, false)
             .project(vec![("end".into(), prop(1, "name"))]);
         assert_eq!(run(&walk, &store).rows.len(), 2, "walk reuses the edge");
 
         let trail = base
-            .var_length(0, Dir::Out, Some("R"), 1, 2, true)
+            .var_length(0, Dir::Out, &["R".to_string()], 1, 2, true)
             .project(vec![("end".into(), prop(1, "name"))]);
         assert_eq!(
             run(&trail, &store).rows.len(),
@@ -9688,12 +9721,12 @@ mod tests {
 
         let trail = from_a
             .clone()
-            .var_length(0, Dir::Out, Some("R"), 1, 3, true)
+            .var_length(0, Dir::Out, &["R".to_string()], 1, 3, true)
             .project(vec![("end".into(), prop(1, "name"))]);
         assert_eq!(run(&trail, &store).rows.len(), 2); // b (len1), a (len2)
 
         let walk = from_a
-            .var_length(0, Dir::Out, Some("R"), 1, 3, false)
+            .var_length(0, Dir::Out, &["R".to_string()], 1, 3, false)
             .project(vec![("end".into(), prop(1, "name"))]);
         assert_eq!(run(&walk, &store).rows.len(), 3); // b, a, b
     }
@@ -9710,7 +9743,7 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .var_length(0, Dir::Out, Some("R"), 2, 2, true)
+            .var_length(0, Dir::Out, &["R".to_string()], 2, 2, true)
             .project(vec![("end".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         assert_eq!(names_of(&out, 0), vec!["c"]); // only the 2-hop endpoint
@@ -9734,7 +9767,7 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .shortest_path(0, Dir::Out, Some("R"), None)
+            .shortest_path(0, Dir::Out, &["R".to_string()], None)
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);
@@ -9756,7 +9789,7 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .shortest_path(0, Dir::Out, Some("R"), None)
+            .shortest_path(0, Dir::Out, &["R".to_string()], None)
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);
@@ -9779,7 +9812,7 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .shortest_path(0, Dir::Out, Some("R"), Some(2))
+            .shortest_path(0, Dir::Out, &["R".to_string()], Some(2))
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);
@@ -9800,7 +9833,7 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .shortest_path(0, Dir::Out, Some("R"), None)
+            .shortest_path(0, Dir::Out, &["R".to_string()], None)
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);
@@ -9825,8 +9858,8 @@ mod tests {
         // (a)-[:R]->(x)-[:R]->(y) starting at a, RETURN path.
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .expand(0, Dir::Out, Some("R"))
-            .expand(1, Dir::Out, Some("R"))
+            .expand(0, Dir::Out, &["R".to_string()])
+            .expand(1, Dir::Out, &["R".to_string()])
             .project(vec![("p".into(), Expr::Path)]);
         let out = run(&plan, &store);
         assert_eq!(out.rows.len(), 1);
@@ -9861,8 +9894,8 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .expand(0, Dir::Out, Some("R"))
-            .expand(1, Dir::Out, Some("R"))
+            .expand(0, Dir::Out, &["R".to_string()])
+            .expand(1, Dir::Out, &["R".to_string()])
             .project(vec![(
                 "es".into(),
                 Expr::PathAccess {
@@ -9894,7 +9927,7 @@ mod tests {
         // alice -KNOWS-> {bob, carol}; RETURN path per edge.
         let plan = scan("Person")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("alice"))))
-            .expand(0, Dir::Out, Some("KNOWS"))
+            .expand(0, Dir::Out, &["KNOWS".to_string()])
             .project(vec![("p".into(), Expr::Path)]);
         let out = run(&plan, &store);
         assert_eq!(out.rows.len(), 2); // alice->bob, alice->carol
@@ -9913,18 +9946,18 @@ mod tests {
     fn lineage_free_plan_builds_no_sidecar() {
         let store = social();
         let plain = scan("Person")
-            .expand(0, Dir::Out, Some("KNOWS"))
+            .expand(0, Dir::Out, &["KNOWS".to_string()])
             .project(vec![("b".into(), prop(1, "name"))]);
         assert!(!super::needs_lineage(&plain), "no Path read -> no lineage");
         // The pulled batch (before the lineage-dropping Project) has no sidecar.
-        let inner = scan("Person").expand(0, Dir::Out, Some("KNOWS"));
+        let inner = scan("Person").expand(0, Dir::Out, &["KNOWS".to_string()]);
         assert!(super::pull(&inner, &store, false)
             .unwrap()
             .lineage
             .is_none());
 
         let with_path = scan("Person")
-            .expand(0, Dir::Out, Some("KNOWS"))
+            .expand(0, Dir::Out, &["KNOWS".to_string()])
             .project(vec![("p".into(), Expr::Path)]);
         assert!(super::needs_lineage(&with_path), "Path read -> lineage");
         // With track=true the expand carries a sidecar.
@@ -9945,7 +9978,7 @@ mod tests {
         // a -> {b(age3), c(age2)}; order by the neighbour's age asc, RETURN path.
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .expand(0, Dir::Out, Some("R"))
+            .expand(0, Dir::Out, &["R".to_string()])
             .order_page(vec![asc(1, "age")], None, None)
             .project(vec![
                 ("last".into(), prop(1, "name")),
