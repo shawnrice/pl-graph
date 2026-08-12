@@ -2162,30 +2162,27 @@ impl Parser {
             }
         }
         let k = edge_vars.len() as u32;
-        // A PER-REPETITION `WHERE` — SINGLE-HOP only for now (multi-hop would need
-        // every edge of the rep bound). Parsed against a scalar mini-scope (this rep's
-        // source=0, edge=1, target=2), independent of the group list bindings.
+        // A PER-REPETITION `WHERE`, evaluated at each rep boundary over the rep's
+        // SCALAR variables — node at unit position `p` (0..=k) at mini-scope slot
+        // `2p`, edge at position `p` (0..k) at slot `2p+1`. So a single hop is
+        // x=0/e=1/y=2; a two-hop unit is x=0/e1=1/m=2/e2=3/y=4. Independent of the
+        // group list bindings.
         let per_rep_pred = if self.eat_kw("WHERE") {
-            if k != 1 {
-                return Err(
-                    "a per-repetition WHERE on a multi-hop subpath group is not supported yet"
-                        .into(),
-                );
-            }
             let saved_scope = std::mem::take(&mut self.scope);
             let saved_slots = self.slots;
             let mut mini: HashMap<String, usize> = HashMap::new();
-            if let Some(n) = &node_vars[0] {
-                mini.insert(n.clone(), 0);
+            for (p, nv) in node_vars.iter().enumerate() {
+                if let Some(n) = nv {
+                    mini.insert(n.clone(), 2 * p);
+                }
             }
-            if let Some(n) = &edge_vars[0] {
-                mini.insert(n.clone(), 1);
-            }
-            if let Some(n) = &node_vars[1] {
-                mini.insert(n.clone(), 2);
+            for (p, ev) in edge_vars.iter().enumerate() {
+                if let Some(n) = ev {
+                    mini.insert(n.clone(), 2 * p + 1);
+                }
             }
             self.scope = mini;
-            self.slots = 3;
+            self.slots = 2 * k as usize + 1;
             let pred = self.expr()?;
             self.scope = saved_scope;
             self.slots = saved_slots;

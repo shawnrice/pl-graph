@@ -79,8 +79,6 @@ tests_d.jsonl::per_hop_admits_all
 tests_d.jsonl::per_hop_filters
 tests_d.jsonl::per_hop_outer_var
 tests_d.jsonl::per_hop_path_binding
-tests_d.jsonl::qsp_multi_cross_1
-tests_d.jsonl::qsp_multi_cross_2
 tests_d.jsonl::vqs_16
 tests_d.jsonl::vqs_22
 tests_e.jsonl::bang_unary_not_binds_tightly

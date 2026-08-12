@@ -450,7 +450,7 @@ nested-groups + general-subqueries + multiseg + WITH-carry, all genuinely hard. 
 ### ROUND 6 — FINAL (session 265 -> 125, 140 cases cleared; LOOP STOPPED)
 
 - **multi-hop subpath group unit k>1 — DONE** (commit 82d71122, 132->125, 7 cases). GroupPos became
-  NodeAt(p)/EdgeAt(p); RepeatGroup carries k; min/max lowered to hops (reps*k); DFS emits only at a rep
+  NodeAt(p)/EdgeAt(p); RepeatGroup carries k; min/max lowered to hops (reps\*k); DFS emits only at a rep
   boundary (len.is_multiple_of(k)); push_group_cols strides by k. Cleared gv_bind_each_rep_2hop,
   qsp_multi_ends_1/2, qsp_multi_gv, mea_trail/simple/acyclic.
 
@@ -461,6 +461,7 @@ features. The remaining 125 are NOT tractable without either changing the value 
 large multi-file mechanism for 1-6 cases each:
 
 REMAINING, categorized:
+
 - ~25 VALUE-CONTRACT "core rejects" — INTENTIONAL, leave forever: f64 model (num_string_overflow,
   oversized ints), CAST-throws, range_bounded core-caps, distinct_nan string->NaN, m_reserved_word
   (reserved word as identifier), is_typed_closed RECORD schema, inline_constraint, h_rejects_literal,
@@ -470,10 +471,10 @@ REMAINING, categorized:
   recursion). Needs a recursive RepeatGroup + nested Value::List materialization. HARD.
 - SUBQUERIES (~11): exists_multi_match, exists_bound_a (uncorrelated / multi-MATCH EXISTS — pull_body
   supports only Row/Expand/VarLength/Filter/Project, no Scan/cross-join; multi-MATCH is broken even at
-  top level), value_subquery_correlated_scalar/_where/_constant (general scalar subquery returning a
+  top level), value_subquery_correlated_scalar/\_where/\_constant (general scalar subquery returning a
   value, not a count). Needs a scalar-subquery evaluator + cross-join pull_body. HARD.
-- MULTISEG (6): multiseg_u — dual-anchor correlated multi-segment EXISTS (ReBAC: (u)-[:MEMBER]->*(s)-[…]->
-  (gr)-[:PARENT]->*(t) correlated on BOTH u and t). Needs a two-sided correlated reachability body. HARD.
+- MULTISEG (6): multiseg_u — dual-anchor correlated multi-segment EXISTS (ReBAC: (u)-[:MEMBER]->_(s)-[…]->
+  (gr)-[:PARENT]->_(t) correlated on BOTH u and t). Needs a two-sided correlated reachability body. HARD.
 - qsp_multi_cross (2): per-rep WHERE on a MULTI-hop unit (references e1 AND e2 of the rep) — needs a
   per-rep-BOUNDARY eval with a multi-slot mini-scope, distinct from the per-hop mechanism. MEDIUM.
 - vqs_22 (1): a group followed by OPTIONAL MATCH. WITH-carry of a group list (1). MEDIUM.

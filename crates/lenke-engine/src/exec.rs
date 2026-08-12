@@ -5012,6 +5012,33 @@ fn var_length(
 /// `edge_stack` the flat edges (len `reps*k`); `k` is the unit hop count. The
 /// variable at `NodeAt(p)` collects `node_stack[rep*k + p]` across reps, `EdgeAt(p)`
 /// collects `edge_stack[rep*k + p]` — each a `Value::Num` id inside a `Value::List`.
+/// Evaluate a per-repetition `WHERE` over the rep that ENDS at hop `len` (its `k`
+/// hops occupy `edge_stack[len-k..len]` and its `k+1` nodes `node_stack[len-k..=len]`).
+/// Binds node position `p` at mini-scope slot `2p`, edge position `p` at `2p+1`, then
+/// evaluates over that one-row batch. A false / null / faulting predicate fails the rep.
+fn rep_pred_ok(
+    pred: &Expr,
+    store: &Store,
+    node_stack: &[u32],
+    edge_stack: &[u32],
+    len: u32,
+    k: u32,
+) -> bool {
+    let (len, k) = (len as usize, k as usize);
+    let base = len - k;
+    let mut slots: Vec<Col> = Vec::with_capacity(2 * k + 1);
+    for p in 0..=k {
+        slots.push(Col::Nodes(vec![node_stack[base + p]]));
+        if p < k {
+            slots.push(Col::Edges(vec![edge_stack[base + p]]));
+        }
+    }
+    let mini = Batch::of(slots);
+    eval(pred, store, &mini)
+        .map(|c| c.value_at(0).is_true())
+        .unwrap_or(false)
+}
+
 fn push_group_cols(
     node_stack: &[u32],
     edge_stack: &[u32],
@@ -5071,6 +5098,18 @@ fn varlen_dfs(
     // Hops per repetition unit: an endpoint is emitted only at a rep boundary.
     k: u32,
 ) {
+    // Per-repetition WHERE: on COMPLETING a rep (a boundary at len > 0), check the
+    // just-finished rep's predicate over its scalar variables (node pos p at slot 2p,
+    // edge pos p at 2p+1). A per-rep WHERE must hold for EVERY rep, so a failing rep
+    // invalidates the whole path onward — prune (no emit, no descent).
+    if let Some(pred) = per_rep_pred {
+        if len > 0
+            && len.is_multiple_of(k)
+            && !rep_pred_ok(pred, store, node_stack, edge_stack, len, k)
+        {
+            return;
+        }
+    }
     if len >= min && len.is_multiple_of(k) {
         keep.push(row);
         ends.push(v);
@@ -5126,22 +5165,9 @@ fn varlen_dfs(
         if is_inc && drop_loop && a.nbr == v {
             continue;
         }
-        // Per-repetition WHERE: evaluate the predicate over THIS rep's scalar
-        // variables (source = v at slot 0, edge = a.eid at 1, target = a.nbr at 2);
-        // a hop that does not satisfy it (false / null / fault) is pruned entirely.
-        if let Some(pred) = per_rep_pred {
-            let mini = Batch::of(vec![
-                Col::Nodes(vec![v]),
-                Col::Edges(vec![a.eid]),
-                Col::Nodes(vec![a.nbr]),
-            ]);
-            if !eval(pred, store, &mini)
-                .map(|c| c.value_at(0).is_true())
-                .unwrap_or(false)
-            {
-                continue;
-            }
-        }
+        // (A per-repetition WHERE is checked at the rep boundary on the way IN — see
+        // the top of this function — not per hop, so a multi-hop rep sees all its
+        // edges bound.)
         let mark = match varlen_step(mode, start, a, used) {
             VarStep::Skip => continue,
             VarStep::Close => {
@@ -8871,6 +8897,40 @@ mod tests {
         assert_eq!(
             ids("MATCH (b:N {id:'b'})-[:R {amt:20.0}]->{1,3}(x) RETURN x.id AS id"),
             vec!["c"]
+        );
+    }
+
+    /// A per-repetition WHERE on a MULTI-HOP unit references every edge of the rep
+    /// (e1 AND e2), checked at the rep boundary. Chain a-b-c-d-e, all amt 10.
+    #[test]
+    fn multi_hop_group_per_rep_where() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"id\":\"d\",\"labels\":[\"N\"],\"props\":{\"id\":\"d\"}}\n",
+            "{\"id\":\"e\",\"labels\":[\"N\"],\"props\":{\"id\":\"e\"}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{\"amt\":10.0}}\n",
+            "{\"from\":\"b\",\"to\":\"c\",\"labels\":[\"R\"],\"props\":{\"amt\":10.0}}\n",
+            "{\"from\":\"c\",\"to\":\"d\",\"labels\":[\"R\"],\"props\":{\"amt\":10.0}}\n",
+            "{\"from\":\"d\",\"to\":\"e\",\"labels\":[\"R\"],\"props\":{\"amt\":10.0}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let ids = |q: &str| -> Vec<String> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            let mut v = names_of(&run(&plan, &store), 0);
+            v.sort();
+            v
+        };
+        // e2.amt <= e1.amt (10<=10) holds → 1 rep (t=c), 2 reps (t=e).
+        assert_eq!(
+            ids("MATCH (s:N {id:'a'}) ((x)-[e1:R]->(m)-[e2:R]->(y) WHERE e2.amt <= e1.amt){1,2} (t) RETURN t.id AS id"),
+            vec!["c", "e"]
+        );
+        // e2.amt < e1.amt (10<10) fails every rep → no path.
+        assert!(
+            ids("MATCH (s:N {id:'a'}) ((x)-[e1:R]->(m)-[e2:R]->(y) WHERE e2.amt < e1.amt){1,2} (t) RETURN t.id AS id")
+                .is_empty()
         );
     }
 
