@@ -290,14 +290,56 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                 }
             }
             '\'' => {
+                // A single-quoted string with backslash escapes: the simple set
+                // (`\\ \' \" \t \n \r \b \f`), `\uXXXX` (4 hex) / `\UXXXXXX` (6 hex)
+                // code points, and any other `\x` → `x` (drop the backslash). Mirrors
+                // core's lexer; a malformed `\u`/`\U` is a syntax error (kept as an
+                // intentional reject-parity divergence).
                 let mut t = String::new();
                 i += 1;
-                while i < b.len() && b[i] != '\'' {
-                    t.push(b[i]);
+                loop {
+                    if i >= b.len() {
+                        return Err("unterminated string literal".into());
+                    }
+                    let ch = b[i];
+                    if ch == '\'' {
+                        break; // closing quote
+                    }
+                    if ch == '\\' {
+                        let Some(&esc) = b.get(i + 1) else {
+                            return Err("unterminated string escape".into());
+                        };
+                        match esc {
+                            '\\' => t.push('\\'),
+                            '\'' => t.push('\''),
+                            '"' => t.push('"'),
+                            't' => t.push('\t'),
+                            'n' => t.push('\n'),
+                            'r' => t.push('\r'),
+                            'b' => t.push('\u{0008}'),
+                            'f' => t.push('\u{000C}'),
+                            'u' | 'U' => {
+                                let width = if esc == 'u' { 4 } else { 6 };
+                                let end = i + 2 + width;
+                                let cp = b
+                                    .get(i + 2..end)
+                                    .map(|w| w.iter().collect::<String>())
+                                    .and_then(|h| u32::from_str_radix(&h, 16).ok())
+                                    .and_then(char::from_u32)
+                                    .ok_or_else(|| {
+                                        format!("invalid \\{esc} escape (expected {width} hex digits)")
+                                    })?;
+                                t.push(cp);
+                                i = end;
+                                continue;
+                            }
+                            other => t.push(other), // unknown escape: drop the backslash
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    t.push(ch);
                     i += 1;
-                }
-                if i >= b.len() {
-                    return Err("unterminated string literal".into());
                 }
                 out.push(Tok::Str(t));
             }
@@ -6100,6 +6142,27 @@ mod tests {
             col0("MATCH (n:P) RETURN n.age AS age ORDER BY n.age DESC NULLS LAST"),
             vec!["Num(40.0)", "Num(30.0)", "Null"]
         );
+    }
+
+    /// String-literal backslash escapes decode to their characters; `\\uXXXX` /
+    /// `\\UXXXXXX` are code points; a malformed unicode escape is a syntax error.
+    #[test]
+    fn string_escapes() {
+        let store = social();
+        let val = |q: &str| -> String {
+            match run(&super::parse(q).unwrap(), &store).rows[0][0] {
+                Value::Str(ref s) => s.to_string(),
+                ref o => panic!("want str, got {o:?}"),
+            }
+        };
+        assert_eq!(val(r"RETURN '\n' AS r"), "\n");
+        assert_eq!(val(r"RETURN '\t' AS r"), "\t");
+        assert_eq!(val(r"RETURN '\\' AS r"), "\\");
+        assert_eq!(val(r"RETURN '\'' AS r"), "'");
+        assert_eq!(val(r"RETURN '\u0041' AS r"), "A");
+        assert_eq!(val(r"RETURN '\U01F600' AS r"), "\u{1F600}");
+        // A malformed \u escape is rejected (agreeing with core).
+        assert!(super::parse(r"RETURN '\uH' AS x").is_err());
     }
 
     // --- part 3.8: string functions (E4a) ---
