@@ -7643,6 +7643,47 @@ fn call_scalar_checked(name: &str, args: &[Value]) -> Result<Value, String> {
             )),
         };
     }
+    // Numeric scalar functions take numbers only — a non-null, non-numeric argument
+    // (a string, bool, temporal, list) is a data exception, never coerced (the same
+    // SQL rule as arithmetic and the temporal accessors above). `sqrt('1e300')`
+    // throws rather than silently returning NULL or coercing the string. A NULL arg
+    // still propagates to NULL inside `call_scalar`.
+    if matches!(
+        name,
+        "abs"
+            | "sign"
+            | "floor"
+            | "ceil"
+            | "ceiling"
+            | "sqrt"
+            | "exp"
+            | "ln"
+            | "log10"
+            | "sin"
+            | "cos"
+            | "tan"
+            | "asin"
+            | "acos"
+            | "atan"
+            | "sinh"
+            | "cosh"
+            | "tanh"
+            | "cot"
+            | "degrees"
+            | "radians"
+            | "round"
+            | "log"
+            | "power"
+            | "mod"
+            | "atan2"
+    ) && args
+        .iter()
+        .any(|a| !a.is_null() && !matches!(a, Value::Num(_)))
+    {
+        return Err(format!(
+            "E_INVALID_VALUE: {name}() requires a number (a string is not coerced)"
+        ));
+    }
     Ok(call_scalar(name, args))
 }
 
