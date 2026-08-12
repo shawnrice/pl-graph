@@ -49,7 +49,6 @@ tests_d.jsonl::nested_quant_ends_3
 tests_d.jsonl::nested_quant_gv_vectorize
 tests_d.jsonl::per_hop_outer_var
 tests_d.jsonl::vqs_16
-tests_e.jsonl::bang_unary_not_binds_tightly
 tests_e.jsonl::count_multi_match
 tests_e.jsonl::date_part_bare_name_unknown_fn
 tests_e.jsonl::date_part_rejects_number
@@ -63,7 +62,6 @@ tests_f.jsonl::distinct_nan_1
 tests_f.jsonl::distinct_nan_2
 tests_f.jsonl::distinct_nan_3
 tests_f.jsonl::faulting_aggregate_err
-tests_f.jsonl::fused_pipeline_13
 tests_f.jsonl::inline_constraint_14
 tests_f.jsonl::inline_constraint_15
 tests_f.jsonl::inline_constraint_per_row

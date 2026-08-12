@@ -473,8 +473,8 @@ REMAINING, categorized:
   supports only Row/Expand/VarLength/Filter/Project, no Scan/cross-join; multi-MATCH is broken even at
   top level), value_subquery_correlated_scalar/\_where/\_constant (general scalar subquery returning a
   value, not a count). Needs a scalar-subquery evaluator + cross-join pull_body. HARD.
-- MULTISEG (6): multiseg_u — dual-anchor correlated multi-segment EXISTS (ReBAC: (u)-[:MEMBER]->_(s)-[…]->
-  (gr)-[:PARENT]->_(t) correlated on BOTH u and t). Needs a two-sided correlated reachability body. HARD.
+- MULTISEG (6): multiseg*u — dual-anchor correlated multi-segment EXISTS (ReBAC: (u)-[:MEMBER]->*(s)-[…]->
+  (gr)-[:PARENT]->\_(t) correlated on BOTH u and t). Needs a two-sided correlated reachability body. HARD.
 - qsp_multi_cross (2): per-rep WHERE on a MULTI-hop unit (references e1 AND e2 of the rep) — needs a
   per-rep-BOUNDARY eval with a multi-slot mini-scope, distinct from the per-hop mechanism. MEDIUM.
 - vqs_22 (1): a group followed by OPTIONAL MATCH. WITH-carry of a group list (1). MEDIUM.
@@ -489,15 +489,16 @@ FILTER + composed paging; GROUP BY after RETURN; ORDER BY alias/NULLS; unquantif
 The "genuinely-hard" clusters flagged at the round-6 stop turned out largely tractable, plus a much
 larger set of feature gaps surfaced (64 non-nested engine!=core). Shipped, each gate-green + byte-identical:
 
-- per-rep WHERE on a multi-hop unit (rep-boundary eval, 2)     - OPTIONAL MATCH binding an edge var (1)
-- correlated scalar VALUE subquery (ScalarSubquery, 3)         - uncorrelated multi-pattern EXISTS (4)
-- uncorrelated VALUE scalar subquery (2)                       - repeated-variable equality join (9 — incl ALL multiseg!)
-- single-rep + fixed-inner nested groups (2)                   - FOR..IN list unwind (Plan::Unwind, 10)
-- bare ALL/ANY selectors (6)                                   - graph-element predicates IS DIRECTED/SOURCE OF/ALL_DIFFERENT/SAME (5)
-- per-hop edge WHERE on a plain var-length (3)                 - REPEATABLE ELEMENTS/DIFFERENT EDGES modes + labels(edge) (4)
+- per-rep WHERE on a multi-hop unit (rep-boundary eval, 2) - OPTIONAL MATCH binding an edge var (1)
+- correlated scalar VALUE subquery (ScalarSubquery, 3) - uncorrelated multi-pattern EXISTS (4)
+- uncorrelated VALUE scalar subquery (2) - repeated-variable equality join (9 — incl ALL multiseg!)
+- single-rep + fixed-inner nested groups (2) - FOR..IN list unwind (Plan::Unwind, 10)
+- bare ALL/ANY selectors (6) - graph-element predicates IS DIRECTED/SOURCE OF/ALL_DIFFERENT/SAME (5)
+- per-hop edge WHERE on a plain var-length (3) - REPEATABLE ELEMENTS/DIFFERENT EDGES modes + labels(edge) (4)
 - GROUP BY without aggregate = DISTINCT (1)
 
 REMAINING (73 = ~25 value-contract intentional + ~48 feature):
+
 - NESTED-RECURSIVE (~14): list-of-lists group vars (nested_paren_lol/varying, nested_quant_gv),
   variable-inner group vars (nested_outer_gv_2), multi-rep decomposition (nested_quant_ends_2/3),
   nested per-rep WHERE (nested_per_rep_where, 4), vqs_16. Needs core's recursive bind_unit + nested lists.

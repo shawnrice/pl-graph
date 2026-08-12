@@ -2475,7 +2475,41 @@ impl Parser {
     /// than scanning afresh). A fresh/disconnected subsequent pattern — one whose
     /// first node is unbound — is not supported in this subset.
     fn match_continue(&mut self, plan: Plan) -> Result<Plan, String> {
-        let (var, label, props, start_where, _le) = self.node()?;
+        let (var, label, props, start_where, label_expr) = self.node()?;
+        // A continuing MATCH whose first node is a FRESH (unbound) variable is a new
+        // INDEPENDENT pattern, cross-joined with the working table (`MATCH (p:P) MATCH
+        // (q:Q) …`) — parsed in its own slot space, then joined on any shared variable.
+        let bound_start = var.as_ref().and_then(|v| self.scope.get(v)).copied();
+        if bound_start.is_none() {
+            let mut sub_scope: HashMap<String, usize> = HashMap::new();
+            if let Some(v) = &var {
+                sub_scope.insert(v.clone(), 0);
+            }
+            let mut sub_slots = 1usize;
+            let mut seed = node_prop_filters(Plan::Scan { label }, 0, props);
+            if let Some(le) = label_expr {
+                seed = seed.filter(lower_label_expr(&le, 0));
+            }
+            if let Some(r) = start_where {
+                self.scope = sub_scope.clone();
+                seed = seed.filter(self.parse_captured_where(r)?);
+            }
+            let p2 = self.extend_chain(seed, &mut sub_scope, &mut sub_slots, 0)?;
+            let width = self.slots;
+            let on: Vec<(usize, usize)> = sub_scope
+                .iter()
+                .filter_map(|(v, &r)| self.scope.get(v).map(|&l| (l, r)))
+                .collect();
+            let mut plan = Plan::join(plan, p2, on);
+            for (v, &r) in &sub_scope {
+                self.scope.entry(v.clone()).or_insert(width + r);
+            }
+            self.slots = width + sub_slots;
+            if self.eat_kw("WHERE") {
+                plan = plan.filter(self.expr()?);
+            }
+            return Ok(plan);
+        }
         let Some(v) = var else {
             return Err("a MATCH after WITH must start from a bound variable".into());
         };
@@ -3395,6 +3429,12 @@ impl Parser {
 
     // primary := '(' expr ')' | literal | var '.' key | var
     fn primary(&mut self) -> Result<Expr, String> {
+        // `!expr` — the tight-binding unary NOT (like C's `!`, tighter than the
+        // comparison operators, unlike the keyword `NOT` which sits above them). So
+        // `!(1=2) = true` parses as `(!(1=2)) = true`.
+        if self.eat(&Tok::Bang) {
+            return Ok(Expr::Not(Box::new(self.primary()?)));
+        }
         // `LET name = expr [, name = expr]* IN body END` — local bindings. Each
         // binding is pushed onto `self.lets` (later bindings may reference earlier
         // ones), the body is parsed with them in scope (a reference inlines the bound
@@ -4773,13 +4813,13 @@ mod tests {
     }
 
     #[test]
-    fn continuing_match_from_unbound_variable_errors() {
-        // After `WITH a`, only `a` is in scope; a continuing MATCH from an unbound
-        // variable is a clear parse error, not a silent fresh scan.
-        let err =
-            super::parse("MATCH (a:Person) WITH a MATCH (z)-[:KNOWS]->(y) RETURN y.name AS name")
-                .unwrap_err();
-        assert!(err.contains("not in scope"), "got: {err}");
+    fn continuing_match_from_fresh_variable_cross_joins() {
+        // A continuing MATCH whose first node is a FRESH variable is a new independent
+        // pattern cross-joined with the working table (valid ISO), not an error.
+        assert!(super::parse(
+            "MATCH (a:Person) WITH a MATCH (z)-[:KNOWS]->(y) RETURN y.name AS name"
+        )
+        .is_ok());
     }
 
     #[test]
