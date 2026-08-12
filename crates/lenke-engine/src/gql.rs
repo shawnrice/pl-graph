@@ -183,6 +183,7 @@ enum Tok {
     LArrow, // <-
     Tilde,  // ~ (undirected relationship delimiter)
     Pipe,   // | (edge-type disjunction in `[:A|B]`)
+    Amp,    // & (multi-label conjunction in `INSERT (n:A&B)`)
     Eq,
     Ne,
     Lt,
@@ -253,6 +254,7 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                     out.push(Tok::Pipe);
                 }
             }
+            '&' => out.push(Tok::Amp),
             '=' => out.push(Tok::Eq),
             '-' => {
                 if b.get(i + 1) == Some(&'>') {
@@ -1126,6 +1128,24 @@ impl Parser {
                 break;
             }
         }
+        // `INSERT (…) RETURN …`: the created nodes are bound into scope so a
+        // following projection can read them. Each node keeps the slot equal to
+        // its creation index (the same index `var_to_idx` records), so the tail's
+        // `Expr::Prop{slot}` lines up with the seeded row the executor builds.
+        if self.peek_kw("RETURN")
+            || self.peek_kw("ORDER")
+            || self.peek_kw("OFFSET")
+            || self.peek_kw("LIMIT")
+        {
+            self.scope = var_to_idx;
+            self.slots = nodes.len();
+            let tail = self.query_tail(Plan::Row)?;
+            return Ok(Plan::InsertReturn {
+                nodes,
+                edges,
+                tail: Box::new(tail),
+            });
+        }
         Ok(Plan::Insert { nodes, edges })
     }
 
@@ -1190,6 +1210,11 @@ impl Parser {
         let mut labels = Vec::new();
         while self.eat(&Tok::Colon) {
             labels.push(self.ident()?);
+            // `&` conjoins additional labels (`:A&B`). Only AND is creatable —
+            // `|`/`!` are label-expression forms that don't denote a single node.
+            while self.eat(&Tok::Amp) {
+                labels.push(self.ident()?);
+            }
         }
         let props = if matches!(self.peek(), Some(Tok::LBrace)) {
             self.props()?
@@ -6631,5 +6656,60 @@ mod tests {
         let probe = "MATCH (u:User) RETURN u.email AS e, u.name AS nm, u.created AS c";
         let pp = super::parse(probe).unwrap();
         assert_eq!(bag(&run(&pp, &st_p)), bag(&run(&pp, &st_h)));
+    }
+
+    /// `INSERT (n:…) RETURN n.…` binds the created node into scope so the trailing
+    /// projection reads it — the engine's first write-then-return path. The
+    /// returned row equals reading the same node back from the mutated store.
+    #[test]
+    fn insert_return_binds_created_node() {
+        use crate::exec::execute;
+        let mut st = social();
+        let out = execute(
+            &super::parse("INSERT (n:Person {name: 'z'}) RETURN n.name").unwrap(),
+            &mut st,
+        )
+        .unwrap();
+        // Exactly one projected row for the one created node.
+        assert_eq!(out.rows.len(), 1);
+        // …and it matches reading that node back (proving the bind, not a constant).
+        let probe = super::parse("MATCH (n:Person {name: 'z'}) RETURN n.name").unwrap();
+        assert_eq!(bag(&out), bag(&run(&probe, &st)));
+    }
+
+    /// The projection may read several properties of the created node.
+    #[test]
+    fn insert_return_projects_multiple_props() {
+        use crate::exec::execute;
+        let mut st = social();
+        let out = execute(
+            &super::parse("INSERT (n:Person {name: 'newbie', age: 99}) RETURN n.name, n.age")
+                .unwrap(),
+            &mut st,
+        )
+        .unwrap();
+        assert_eq!(out.rows.len(), 1);
+        let probe =
+            super::parse("MATCH (n:Person {name: 'newbie'}) RETURN n.name, n.age").unwrap();
+        assert_eq!(bag(&out), bag(&run(&probe, &st)));
+    }
+
+    /// `&`-separated labels create a multi-labelled node (`n:Person&Admin`): the
+    /// created node answers a MATCH on EITHER label.
+    #[test]
+    fn insert_return_multi_label_ampersand() {
+        use crate::exec::execute;
+        let mut st = social();
+        let out = execute(
+            &super::parse("INSERT (n:Person&Admin {name: 'root'}) RETURN n.name").unwrap(),
+            &mut st,
+        )
+        .unwrap();
+        assert_eq!(out.rows.len(), 1);
+        // The node carries BOTH labels — reachable via Admin and via Person.
+        let by_admin = super::parse("MATCH (n:Admin) RETURN n.name").unwrap();
+        assert_eq!(bag(&out), bag(&run(&by_admin, &st)));
+        let by_person = super::parse("MATCH (n:Person {name: 'root'}) RETURN n.name").unwrap();
+        assert_eq!(bag(&run(&by_person, &st)), bag(&run(&by_admin, &st)));
     }
 }

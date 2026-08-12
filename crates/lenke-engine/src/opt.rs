@@ -101,6 +101,8 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
     match plan {
         // Leaves: no children to rewrite. (`Row` only lives inside an EXISTS body,
         // which the optimizer never descends into, but it is still a leaf.)
+        // `InsertReturn`'s `tail` is a Row-seeded projection with nothing for the
+        // read-side rewrites (index seeds, pushdown) to act on, so it is a leaf too.
         p @ (Plan::Scan { .. }
         | Plan::NodeSeed { .. }
         | Plan::EdgeScan
@@ -108,6 +110,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
         | Plan::IndexSeek { .. }
         | Plan::RangeSeek { .. }
         | Plan::Insert { .. }
+        | Plan::InsertReturn { .. }
         | Plan::Merge { .. }
         | Plan::AddEdge { .. }
         | Plan::CallProcedure { .. }) => (p, false),
@@ -1019,8 +1022,13 @@ fn width(plan: &Plan) -> usize {
         // `Row` never appears in an outer plan (it lives only in an EXISTS body,
         // which pushdown does not traverse); width is meaningless here.
         Plan::Row => 0,
-        // Writes carry no output row.
-        Plan::Insert { .. } | Plan::Update { .. } | Plan::Merge { .. } | Plan::AddEdge { .. } => 0,
+        // Writes carry no output row. `InsertReturn` is a write too — its RETURN
+        // rows are produced by the executor, not by this read-side width pass.
+        Plan::Insert { .. }
+        | Plan::InsertReturn { .. }
+        | Plan::Update { .. }
+        | Plan::Merge { .. }
+        | Plan::AddEdge { .. } => 0,
 
         // A bind_edge Expand appends TWO slots (edge then node).
         Plan::Expand {
@@ -1476,6 +1484,7 @@ mod tests {
             Plan::Join { left, right, .. } | Plan::Union { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)
             }
+            Plan::InsertReturn { tail, .. } => plan_contains_filter(tail),
             Plan::Scan { .. }
             | Plan::NodeSeed { .. }
             | Plan::EdgeScan

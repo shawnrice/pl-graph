@@ -175,47 +175,98 @@ pub fn try_run(plan: &Plan, store: &Store) -> Result<Rows, String> {
 /// statements that can mutate; read-only callers can keep using [`run`]. Returns
 /// `Err` when a write violates a constraint (the write is rolled back); reads and
 /// successful writes are `Ok` (a write's result is the empty row set).
+/// Run an `Insert`'s writes (nodes then edges) inside a transaction, enforcing
+/// unique + required constraints on every touched label and rolling the whole
+/// statement back on the first violation. Returns the ids of the created nodes,
+/// in creation order (index i is the node declared at position i). Shared by
+/// `Plan::Insert` and `Plan::InsertReturn`.
+fn run_insert(
+    store: &mut Store,
+    nodes: &[crate::ir::InsertNode],
+    edges: &[crate::ir::InsertEdge],
+) -> Result<Vec<u32>, String> {
+    // In a transaction so a constraint violation rolls the whole INSERT back
+    // rather than leaving a partial write.
+    store.begin();
+    let mut ids = Vec::with_capacity(nodes.len());
+    for spec in nodes {
+        let labels: Vec<&str> = spec.labels.iter().map(String::as_str).collect();
+        let props: Vec<(&str, Value)> = spec
+            .props
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect();
+        ids.push(store.add_node(&labels, &props));
+    }
+    for e in edges {
+        let eid = store.add_edge(ids[e.from], ids[e.to], &e.etype);
+        for (k, v) in &e.props {
+            store.set_edge_prop(eid, k, v.clone());
+        }
+    }
+    // Enforce unique AND required constraints on every label this INSERT touched
+    // (roll the whole INSERT back on the first violation).
+    let mut labels: Vec<&str> = nodes
+        .iter()
+        .flat_map(|s| s.labels.iter().map(String::as_str))
+        .collect();
+    labels.sort_unstable();
+    labels.dedup();
+    for l in labels {
+        if let Err(e) = store
+            .check_unique_for_label(l)
+            .and_then(|()| store.check_required_for_label(l))
+        {
+            store.rollback();
+            return Err(e);
+        }
+    }
+    store.commit();
+    Ok(ids)
+}
+
 pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
     match plan {
         Plan::Insert { nodes, edges } => {
-            // In a transaction so a constraint violation rolls the whole INSERT
-            // back rather than leaving a partial write.
-            store.begin();
-            let mut ids = Vec::with_capacity(nodes.len());
-            for spec in nodes {
-                let labels: Vec<&str> = spec.labels.iter().map(String::as_str).collect();
-                let props: Vec<(&str, Value)> = spec
-                    .props
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.clone()))
-                    .collect();
-                ids.push(store.add_node(&labels, &props));
-            }
-            for e in edges {
-                let eid = store.add_edge(ids[e.from], ids[e.to], &e.etype);
-                for (k, v) in &e.props {
-                    store.set_edge_prop(eid, k, v.clone());
-                }
-            }
-            // Enforce unique AND required constraints on every label this INSERT
-            // touched (roll the whole INSERT back on the first violation).
-            let mut labels: Vec<&str> = nodes
-                .iter()
-                .flat_map(|s| s.labels.iter().map(String::as_str))
-                .collect();
-            labels.sort_unstable();
-            labels.dedup();
-            for l in labels {
-                if let Err(e) = store
-                    .check_unique_for_label(l)
-                    .and_then(|()| store.check_required_for_label(l))
-                {
-                    store.rollback();
-                    return Err(e);
-                }
-            }
-            store.commit();
+            run_insert(store, nodes, edges)?;
             Ok(empty_rows())
+        }
+        Plan::InsertReturn { nodes, edges, tail } => {
+            // First write-then-return path: run the INSERT, then bind each created
+            // node into the slot equal to its creation index and project the tail.
+            let ids = run_insert(store, nodes, edges)?;
+            // A one-row seed: slot i carries the id of the i-th created node, so the
+            // tail's `Expr::Prop{slot}` reads the node just created at that index.
+            let seed = Batch::of(ids.iter().map(|&id| Col::Nodes(vec![id])).collect());
+            // The tail is restricted (by the parser + this guard) to pure
+            // projections; `pull_body` covers Row/Project/Filter, not the read
+            // pipeline's grouping/paging operators.
+            let store_ref: &Store = store;
+            let batch = pull_body(tail, store_ref, &seed)?;
+            let n = batch.rows();
+            Ok(match output_names(tail) {
+                Some(names) => {
+                    let ncols = names.len();
+                    let mut rows = Flat::with_capacity(n, ncols);
+                    for i in 0..n {
+                        for c in &batch.slots {
+                            rows.data.push(render_cell(c, i, store_ref));
+                        }
+                    }
+                    Rows { names, rows }
+                }
+                None => {
+                    let slot0 = batch.slot(0);
+                    let mut rows = Flat::with_capacity(n, 1);
+                    for i in 0..n {
+                        rows.data.push(render_cell(slot0, i, store_ref));
+                    }
+                    Rows {
+                        names: vec!["_".to_string()],
+                        rows,
+                    }
+                }
+            })
         }
         Plan::Update { input, ops } => {
             // Read phase: run the match and compute every write into OWNED data —
@@ -686,6 +737,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::IndexSeek { .. }
         | Plan::RangeSeek { .. }
         | Plan::Insert { .. }
+        | Plan::InsertReturn { .. }
         | Plan::Merge { .. }
         | Plan::AddEdge { .. }
         | Plan::CallProcedure { .. } => false,
@@ -737,9 +789,11 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
         // A write plan is never pulled (a read sub-plan cannot contain one); it
         // is run through `execute`. Yield an empty batch if it somehow reaches
         // here so `run` on a bare write is a harmless no-op rather than a panic.
-        Plan::Insert { .. } | Plan::Update { .. } | Plan::Merge { .. } | Plan::AddEdge { .. } => {
-            Batch::of(Vec::new())
-        }
+        Plan::Insert { .. }
+        | Plan::InsertReturn { .. }
+        | Plan::Update { .. }
+        | Plan::Merge { .. }
+        | Plan::AddEdge { .. } => Batch::of(Vec::new()),
         // `Row` is the leaf of an EXISTS body and is only ever fed a batch by
         // `pull_body`; reaching it through the main pipeline is a bug.
         Plan::Row => {

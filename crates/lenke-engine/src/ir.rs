@@ -497,6 +497,17 @@ pub enum Plan {
         nodes: Vec<InsertNode>,
         edges: Vec<InsertEdge>,
     },
+    /// An `Insert` whose created nodes are bound into scope for a following
+    /// projection (`INSERT (n:Person {…}) RETURN n.name`). Each created node
+    /// occupies the slot equal to its creation index in `nodes`, so the `tail`
+    /// (a `Plan::Row`-rooted projection) resolves `Expr::Prop{slot}` against the
+    /// seeded row. A write — run through `exec::execute`, never pulled as a read;
+    /// the `tail` is restricted to pure projections (Row/Project).
+    InsertReturn {
+        nodes: Vec<InsertNode>,
+        edges: Vec<InsertEdge>,
+        tail: Box<Plan>,
+    },
     /// A write over the rows of a read sub-plan: for each matched row, apply the
     /// `ops` (SET/REMOVE) to the bound nodes. Run through `exec::execute`, not
     /// pulled; produces no rows (a RETURN after an update is a later slice).

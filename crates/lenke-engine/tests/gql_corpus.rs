@@ -153,7 +153,7 @@ fn run_engine(fixture: &str, query: &str) -> Outcome {
         .filter_map(core_line_to_engine)
         .collect::<Vec<_>>()
         .join("\n");
-    let store = match lenke_engine::ndjson::from_ndjson(&eng_nd) {
+    let mut store = match lenke_engine::ndjson::from_ndjson(&eng_nd) {
         Ok(s) => s,
         Err(e) => panic!("engine fixture failed to load: {e}"),
     };
@@ -161,8 +161,12 @@ fn run_engine(fixture: &str, query: &str) -> Outcome {
         return Outcome::Err;
     };
     let plan = lenke_engine::opt::optimize_indexed(plan, &store);
+    // `execute` handles both reads and writes: a write mutates the (fresh, single-
+    // use) store and may RETURN rows (`INSERT … RETURN`); a read falls through to
+    // `try_run` over a shared borrow. Routing everything through it keeps write-
+    // then-return cases comparable to core's `prepare(...).execute(...)`.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        lenke_engine::exec::try_run(&plan, &store)
+        lenke_engine::exec::execute(&plan, &mut store)
     })) {
         Ok(Ok(rows)) => Outcome::Rows(
             rows.rows

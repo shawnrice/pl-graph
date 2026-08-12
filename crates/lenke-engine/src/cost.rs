@@ -208,8 +208,12 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
             estimate(input, store).scale(avg_degree(store).max(1.0), false)
         }
 
-        // Writes / seeds with no row output worth costing.
-        Plan::Insert { .. } | Plan::AddEdge { .. } | Plan::Merge { .. } => Card::approx(1.0),
+        // Writes / seeds with no row output worth costing. `InsertReturn` projects
+        // a single created-node row, so its output is ~1 too.
+        Plan::Insert { .. }
+        | Plan::InsertReturn { .. }
+        | Plan::AddEdge { .. }
+        | Plan::Merge { .. } => Card::approx(1.0),
     }
 }
 
