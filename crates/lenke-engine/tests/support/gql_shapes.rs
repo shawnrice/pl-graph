@@ -71,12 +71,13 @@ impl Caps {
             nested: true,
         }
     }
-    /// Everything the engine is known to support (nested excluded).
+    /// Everything the engine is known to support. Nested groups are now byte-identical
+    /// for every shape the generator emits (2-level, inner min>=1, no multi-segment
+    /// inner), so they are ON by default — the permanent CI guard. A future unsupported
+    /// shape (empty inner rep, multi-segment inner) should get its own cap, gated off
+    /// here until implemented.
     pub fn supported() -> Self {
-        Self {
-            nested: false,
-            ..Self::all()
-        }
+        Self::all()
     }
     fn any(&self) -> bool {
         self.varlen || self.group || self.per_rep || self.shortest || self.nested
