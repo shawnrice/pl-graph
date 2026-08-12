@@ -397,6 +397,16 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             let (i, c) = rewrite(*input, idx);
             (Plan::Distinct { input: Box::new(i) }, c)
         }
+        Plan::NullPadIfEmpty { input, width } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::NullPadIfEmpty {
+                    input: Box::new(i),
+                    width,
+                },
+                c,
+            )
+        }
         Plan::Tail { input, n } => {
             let (i, c) = rewrite(*input, idx);
             (
@@ -1125,6 +1135,8 @@ fn width(plan: &Plan) -> usize {
         | Plan::Distinct { input }
         | Plan::Tail { input, .. }
         | Plan::SortLocal { input, .. } => width(input),
+        // The padded null row carries exactly the pattern's columns.
+        Plan::NullPadIfEmpty { width, .. } => *width,
         Plan::Project { items, .. } => items.len(),
         Plan::Aggregate { keys, aggs, .. } => keys.len() + aggs.len(),
         Plan::Join { left, right, .. } => width(left) + width(right),
@@ -1569,6 +1581,7 @@ mod tests {
             | Plan::Distinct { input }
             | Plan::Tail { input, .. }
             | Plan::Branch { input, .. }
+            | Plan::NullPadIfEmpty { input, .. }
             | Plan::SortLocal { input, .. } => plan_contains_filter(input),
             Plan::Join { left, right, .. } | Plan::Union { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)

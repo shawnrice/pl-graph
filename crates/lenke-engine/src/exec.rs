@@ -755,6 +755,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::ShortestPath { input, .. }
         | Plan::Distinct { input }
         | Plan::Tail { input, .. }
+        | Plan::NullPadIfEmpty { input, .. }
         | Plan::SortLocal { input, .. } => needs_lineage(input),
         Plan::Unwind { input, list, .. } => reads_path(list) || needs_lineage(input),
         Plan::Branch { input, bodies } => needs_lineage(input) || bodies.iter().any(needs_lineage),
@@ -1278,6 +1279,17 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
         }
         Plan::Join { left, right, on } => {
             hash_join(&pull(left, store, track)?, &pull(right, store, track)?, on)
+        }
+        Plan::NullPadIfEmpty { input, width } => {
+            // A leading OPTIONAL MATCH: pass the pattern's rows through, or — when it
+            // matched nothing — emit one row of NULL columns. The u32::MAX node
+            // sentinel reads back as NULL for any property/element access.
+            let batch = pull(input, store, track)?;
+            if batch.rows() == 0 {
+                Batch::of((0..*width).map(|_| Col::Nodes(vec![u32::MAX])).collect())
+            } else {
+                batch
+            }
         }
         Plan::CallInline {
             input,
@@ -9843,6 +9855,40 @@ mod tests {
             nums("MATCH (e:E) RETURN sum(e.sal) AS s GROUP BY e.dept ORDER BY s"),
             vec![50.0, 300.0]
         );
+    }
+
+    /// A leading `OPTIONAL MATCH` with no prior binding: on an EMPTY graph it still
+    /// yields one row, with the pattern variable NULL — so `n.missing IS NULL` is
+    /// true. On a non-empty graph it behaves like an ordinary scan (one row per
+    /// node), no null padding.
+    #[test]
+    fn leading_optional_match_pads_one_null_row_when_empty() {
+        let empty = Builder::default().build();
+        let plan = crate::opt::optimize_indexed(
+            crate::gql::parse("OPTIONAL MATCH (n) RETURN n.missing IS NULL AS m").unwrap(),
+            &empty,
+        );
+        let out = run(&plan, &empty);
+        assert_eq!(out.rows.len(), 1);
+        assert!(matches!(out.rows[0][0], Value::Bool(true)));
+
+        let mut b = Builder::default();
+        b.node(&["X"], &[("a", n(5.0))]);
+        b.node(&["X"], &[("a", n(6.0))]);
+        let store = b.build();
+        let plan = crate::opt::optimize_indexed(
+            crate::gql::parse("OPTIONAL MATCH (n) RETURN n.a AS a ORDER BY a").unwrap(),
+            &store,
+        );
+        let got: Vec<f64> = run(&plan, &store)
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Num(x) => *x,
+                o => panic!("{o:?}"),
+            })
+            .collect();
+        assert_eq!(got, vec![5.0, 6.0]);
     }
 
     /// LIMIT 0 yields the empty result WITHOUT evaluating the projection, so a

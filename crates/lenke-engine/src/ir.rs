@@ -634,6 +634,11 @@ pub enum Plan {
         right: Box<Plan>,
         on: Vec<(usize, usize)>,
     },
+    /// A leading `OPTIONAL MATCH <pattern>` with no prior binding: run `input` (the
+    /// pattern) and, if it produces NO rows, emit exactly one row of `width` NULL
+    /// columns — the ISO left-outer of the pattern against the implicit single unit
+    /// row. Non-empty results pass through unchanged.
+    NullPadIfEmpty { input: Box<Plan>, width: usize },
     /// `CALL (scope) { <subquery> }` — an inline correlated (lateral) subquery. For
     /// each row of `input`, run `body` (a `Plan::Row`-rooted pattern that continues
     /// from a scope variable) and emit one output row per sub-row: the `input`

@@ -647,6 +647,22 @@ impl Parser {
             let plan = self.for_clause(Plan::Row)?;
             return self.query_tail(plan);
         }
+        // A leading `OPTIONAL MATCH <pattern>` with no prior MATCH: the pattern's
+        // matches, OR — if it matches nothing — one all-NULL row (the ISO left-outer
+        // against the implicit single unit row). `NullPadIfEmpty` supplies that row.
+        if self.peek_kw("OPTIONAL") {
+            self.eat_kw("OPTIONAL");
+            if !self.eat_kw("MATCH") {
+                return Err("expected MATCH after OPTIONAL".into());
+            }
+            let plan = self.match_body()?;
+            let width = self.slots;
+            let plan = Plan::NullPadIfEmpty {
+                input: Box::new(plan),
+                width,
+            };
+            return self.query_tail(plan);
+        }
         // A bare `RETURN <items>` with no MATCH — a "return statement" (ISO GQL primary
         // query). It projects its items over ONE unit row (`Plan::Row`), so literals,
         // arithmetic, function calls and `count(*)` (= 1) evaluate with no bindings.

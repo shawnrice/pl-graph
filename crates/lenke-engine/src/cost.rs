@@ -194,6 +194,15 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
             }
         }
 
+        // A leading OPTIONAL MATCH yields at least one row (the null pad when empty).
+        Plan::NullPadIfEmpty { input, .. } => {
+            let inp = estimate(input, store);
+            Card {
+                rows: inp.rows.max(1.0),
+                exact: inp.exact,
+            }
+        }
+
         // --- row-preserving / structural ----------------------------------------
         Plan::Project { input, .. }
         | Plan::SortLocal { input, .. }
