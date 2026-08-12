@@ -470,6 +470,11 @@ impl Parser {
         if self.peek_kw("RETURN") {
             return self.query_tail(Plan::Row);
         }
+        // `SELECT items [FROM MATCH …]` — the SQL-style projection, pure sugar for
+        // MATCH…RETURN.
+        if self.peek_kw("SELECT") {
+            return self.select_statement();
+        }
         if !self.eat_kw("MATCH") {
             return Err("expected MATCH, INSERT, CALL, or RETURN".into());
         }
@@ -487,6 +492,15 @@ impl Parser {
             }
             return self.query_tail(plan);
         }
+        let plan = self.match_body()?;
+        self.query_tail(plan)
+    }
+
+    /// Parse a MATCH pattern body — the `MATCH` keyword (and any named-path head)
+    /// already consumed: an optional leading path mode, the comma-joined pattern
+    /// list, publishing `scope`/`slots`, and an optional trailing `WHERE`. Returns
+    /// the plan. Shared by `query()` and `SELECT … FROM MATCH …`.
+    fn match_body(&mut self) -> Result<Plan, String> {
         // Optional leading path mode: `MATCH WALK …` lets a variable-length hop
         // reuse edges; `TRAIL` (the ISO default, and the engine's) forbids it. The
         // keyword can only appear here — a pattern always begins with `(`, and the
@@ -563,7 +577,7 @@ impl Parser {
             let pred = self.expr()?;
             plan = plan.filter(pred);
         }
-        self.query_tail(plan)
+        Ok(plan)
     }
 
     /// The clauses after the first `MATCH … [WHERE]`: chained parts
@@ -629,7 +643,21 @@ impl Parser {
             return Err("expected RETURN, SET, REMOVE, WITH, or MATCH".into());
         }
         let distinct = self.eat_kw("DISTINCT");
-        let mut items = self.return_items()?;
+        let items = self.return_items()?;
+        self.project_and_page(plan, distinct, items)
+    }
+
+    /// Given an already-parsed projection `items` (a RETURN or SELECT list), build
+    /// the projection/aggregation over `plan`, then parse and apply an optional
+    /// trailing `ORDER BY` (over output aliases or binding expressions, via hidden
+    /// columns) and `OFFSET`/`SKIP`/`LIMIT` paging, plus `DISTINCT`. Shared by the
+    /// `RETURN` tail and `SELECT … FROM MATCH …`.
+    fn project_and_page(
+        &mut self,
+        plan: Plan,
+        distinct: bool,
+        mut items: Vec<RetItem>,
+    ) -> Result<Plan, String> {
         let visible: Vec<String> = items.iter().map(RetItem::name).collect();
         let has_agg = items.iter().any(|it| matches!(it, RetItem::Agg(_)));
 
@@ -685,6 +713,86 @@ impl Parser {
             plan = plan.project(proj);
         }
         Ok(plan)
+    }
+
+    /// Scan forward from the cursor for a bracket-depth-0 `FROM` — the boundary
+    /// between a SELECT's item list and its `FROM MATCH` — returning its token
+    /// index, or `None` if the SELECT has no FROM (a constant projection). Nested
+    /// parens/brackets/braces (e.g. `count(*)`, `TRIM(x FROM y)`) are skipped; a
+    /// depth-0 `UNION` ends the scan (the FROM would belong to a later arm).
+    fn scan_for_from(&self) -> Option<usize> {
+        let mut depth = 0i32;
+        let mut i = self.pos;
+        while let Some(t) = self.toks.get(i) {
+            match t {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => depth -= 1,
+                Tok::Ident(s) if depth == 0 && s.eq_ignore_ascii_case("FROM") => return Some(i),
+                Tok::Ident(s) if depth == 0 && s.eq_ignore_ascii_case("UNION") => return None,
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// `SELECT [DISTINCT] items [FROM [<graph>] MATCH pattern [WHERE]] [GROUP BY g]
+    /// [ORDER BY o] [OFFSET/LIMIT]` — pure sugar for MATCH…RETURN. The items are
+    /// written BEFORE the FROM that binds their variables, so parse FROM MATCH first
+    /// (populating scope), then rewind to parse the items. GROUP BY is handled by
+    /// the implicit grouping in `apply_items` (which keys by the non-aggregate
+    /// items); explicit HAVING is a later phase.
+    fn select_statement(&mut self) -> Result<Plan, String> {
+        self.eat_kw("SELECT");
+        let distinct = self.eat_kw("DISTINCT");
+        let items_start = self.pos;
+        let (plan, items) = if let Some(from_pos) = self.scan_for_from() {
+            self.pos = from_pos;
+            self.eat_kw("FROM");
+            // An optional graph reference (CURRENT_GRAPH / HOME_GRAPH / …) may precede
+            // MATCH — lenke is single-graph, so consume and ignore a lone ident here.
+            if !self.peek_kw("MATCH") && matches!(self.peek(), Some(Tok::Ident(_))) {
+                self.pos += 1;
+            }
+            if !self.eat_kw("MATCH") {
+                return Err("expected MATCH after FROM in a SELECT".into());
+            }
+            let plan = self.match_body()?;
+            let after_match = self.pos;
+            // Rewind to parse the items against the now-populated binding scope.
+            self.pos = items_start;
+            let items = self.return_items()?;
+            if self.pos != from_pos {
+                return Err("unexpected tokens in the SELECT list before FROM".into());
+            }
+            self.pos = after_match;
+            (plan, items)
+        } else {
+            // No FROM: a constant projection over one unit row (no bindings).
+            self.scope = HashMap::new();
+            self.slots = 0;
+            let items = self.return_items()?;
+            (Plan::Row, items)
+        };
+        // GROUP BY: the non-aggregated SELECT items are already the implicit grouping
+        // keys (`apply_items`), so parse and discard an explicit GROUP BY that names
+        // them. (Forcing a group with no aggregate in the list, and HAVING, are the
+        // next phase.)
+        if self.eat_kw("GROUP") {
+            if !self.eat_kw("BY") {
+                return Err("expected BY after GROUP".into());
+            }
+            loop {
+                let _ = self.expr()?;
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        if self.peek_kw("HAVING") {
+            return Err("SELECT … HAVING is not supported yet".into());
+        }
+        self.project_and_page(plan, distinct, items)
     }
 
     /// `p = ANY SHORTEST (a)-[:R]->*(b)` — the ANY-shortest named-path pattern.

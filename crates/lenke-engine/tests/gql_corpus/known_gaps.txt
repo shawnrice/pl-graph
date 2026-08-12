@@ -249,10 +249,6 @@ tests_e.jsonl::match_mode_repeatable_elements
 tests_e.jsonl::property_exists_on_edges
 tests_e.jsonl::property_exists_on_null_element
 tests_e.jsonl::record_field_access_subscript
-tests_e.jsonl::select_constant
-tests_e.jsonl::select_count_where
-tests_e.jsonl::select_from_match
-tests_e.jsonl::select_group_by
 tests_e.jsonl::select_having_count
 tests_e.jsonl::select_having_global_fail
 tests_e.jsonl::select_having_global_pass

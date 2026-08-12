@@ -7961,6 +7961,40 @@ mod tests {
         assert_eq!(count("MATCH (a)-[r:R]->(b) RETURN count(*) AS c"), 2.0);
     }
 
+    /// `SELECT … [FROM MATCH …]` is sugar for MATCH…RETURN: a constant projection
+    /// with no FROM, a plain projection, a global aggregate with WHERE, and a
+    /// GROUP BY (via implicit grouping) with ORDER BY over an output alias.
+    #[test]
+    fn select_from_match() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"Person\"],\"props\":{\"name\":\"Alice\",\"age\":30}}\n",
+            "{\"id\":\"b\",\"labels\":[\"Person\"],\"props\":{\"name\":\"Bob\",\"age\":40}}\n",
+            "{\"id\":\"c\",\"labels\":[\"Person\"],\"props\":{\"name\":\"Cara\",\"age\":30}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let one = |q: &str| -> Value { run(&crate::gql::parse(q).unwrap(), &store).rows[0][0].clone() };
+        // Constant projection, no FROM.
+        assert!(matches!(one("SELECT 1 + 2 AS v"), Value::Num(n) if n == 3.0));
+        // Plain projection with an inline filter.
+        assert!(matches!(one("SELECT n.name AS nm FROM MATCH (n:Person {name: 'Alice'})"), Value::Str(s) if &*s == "Alice"));
+        // Global aggregate with WHERE (>= 30 → all three).
+        assert!(matches!(one("SELECT count(*) AS c FROM MATCH (n:Person) WHERE n.age >= 30"), Value::Num(n) if n == 3.0));
+        // GROUP BY age with ORDER BY the output alias: ages 30 (×2), 40 (×1).
+        let grouped = run(
+            &crate::gql::parse(
+                "SELECT n.age AS age, count(*) AS c FROM MATCH (n:Person) GROUP BY n.age ORDER BY age",
+            )
+            .unwrap(),
+            &store,
+        );
+        let rows: Vec<String> = grouped
+            .rows
+            .iter()
+            .map(|r| format!("{:?},{:?}", r[0], r[1]))
+            .collect();
+        assert_eq!(rows, vec!["Num(30.0),Num(2.0)", "Num(40.0),Num(1.0)"]);
+    }
+
     /// Scalar functions: 2-arg round (incl. negative digits), atan2 (arg order +
     /// null propagation), log10, TRIM spec forms, and list_sort with order/nullOrder.
     #[test]
