@@ -102,6 +102,39 @@ fn lower_label_expr(le: &LabelExpr, slot: usize) -> Expr {
     }
 }
 
+/// The ISO/IEC 39075 reserved words (verbatim from lenke-core's list) — none may be a
+/// bare identifier (a variable or label name). See [`Parser::ident_binding`].
+const RESERVED_WORDS: &str = "abs acos all all_different and any array as asc ascending asin at atan \
+atan2 avg big bigint binary bool boolean both btrim by byte_length bytes call cardinality case cast \
+ceil ceiling char char_length character_length characteristics close coalesce collect_list commit \
+copy cos cosh cot count create current_date current_graph current_property_graph current_schema \
+current_time current_timestamp date datetime day dec decimal degrees delete desc descending detach \
+distinct double drop duration duration_between element_id else end except exists exp false filter \
+finish float float16 float32 float64 float128 float256 floor for from group having home_graph \
+home_property_graph home_schema hour if implies in insert int integer int8 integer8 int16 integer16 \
+int32 integer32 int64 integer64 int128 integer128 int256 integer256 intersect interval is leading \
+left let like limit list ln local local_datetime local_time local_timestamp log log10 lower ltrim \
+match max min minute mod month next nodetach normalize not nothing null nulls nullif octet_length of \
+offset optional or order otherwise parameter parameters path path_length paths percentile_cont \
+percentile_disc power precision property_exists radians real record remove replace reset return \
+right rollback rtrim same schema second select session session_user set signed sin sinh size skip \
+small smallint sqrt start stddev_pop stddev_samp string sum tan tanh then time timestamp trailing \
+trim true typed ubigint uint uint8 uint16 uint32 uint64 uint128 uint256 union unknown unsigned upper \
+use usmallint value varbinary varchar variable when where with xor year yield zoned zoned_datetime \
+zoned_time abstract aggregate aggregates alter catalog clear clone constraint current_role \
+current_user data directory dryrun exact existing function gqlstatus grant instant infinity number \
+numeric on open partition procedure product project query records reference rename revoke substring \
+system_user temporal unique unit values whitespace";
+
+/// Is `word` (case-insensitive) an ISO reserved word, hence not a bare identifier?
+fn is_reserved_word(word: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
+    static R: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    R.get_or_init(|| RESERVED_WORDS.split(' ').collect())
+        .contains(word.to_ascii_lowercase().as_str())
+}
+
 /// Turn a node's inline properties `{k: v, …}` into a chain of `Eq` filters on its
 /// slot — the exact lowering of `WHERE slot.k = v AND …`. Sharing this single form
 /// is what makes `(n:L {k: v})` and `MATCH (n:L) WHERE n.k = v` optimize to the same
@@ -628,6 +661,20 @@ impl Parser {
             Some(Tok::Ident(s)) => Ok(s),
             other => Err(format!("expected an identifier, got {other:?}")),
         }
+    }
+
+    /// An identifier in a BINDING position (a variable or label name), where an ISO
+    /// reserved word is not a bare identifier (`MATCH (select)` / `(n:Match)` are
+    /// rejected, matching core). Reserved words stay usable as keywords, function
+    /// names, and property keys — only a fresh binding name is constrained.
+    fn ident_binding(&mut self) -> Result<String, String> {
+        let s = self.ident()?;
+        if is_reserved_word(&s) {
+            return Err(format!(
+                "`{s}` is a reserved word and cannot be a bare identifier"
+            ));
+        }
+        Ok(s)
     }
 
     // query := MATCH pattern [WHERE expr]
@@ -3578,7 +3625,7 @@ impl Parser {
         self.expect(&Tok::LParen)?;
         // An identifier here is the node variable; the label (if any) follows ':'.
         let var = if matches!(self.peek(), Some(Tok::Ident(_))) {
-            Some(self.ident()?)
+            Some(self.ident_binding()?)
         } else {
             None
         };
@@ -3642,7 +3689,7 @@ impl Parser {
             self.expect(&Tok::RParen)?;
             return Ok(e);
         }
-        Ok(LabelExpr::Label(self.ident()?))
+        Ok(LabelExpr::Label(self.ident_binding()?))
     }
 
     // rel := '-' '[' ':' R ']' '->'   (out)
