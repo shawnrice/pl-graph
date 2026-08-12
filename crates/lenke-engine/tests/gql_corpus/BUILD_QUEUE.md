@@ -483,3 +483,27 @@ Infra shipped this session (reusable for the above): multi-label edges; Expr::In
 ElemKind typed elements; named-path var_length lineage; RepeatGroup (group_binds NodeAt/EdgeAt + k +
 per_rep_pred); ShortestK + collect_trails + edge_pred; VALUE/COUNT correlated subqueries; LET clause;
 FILTER + composed paging; GROUP BY after RETURN; ORDER BY alias/NULLS; unquantified subpath group.
+
+### ROUND 7 — "work on the hard features" (125 -> 73; session 265 -> 73, 192 cases)
+
+The "genuinely-hard" clusters flagged at the round-6 stop turned out largely tractable, plus a much
+larger set of feature gaps surfaced (64 non-nested engine!=core). Shipped, each gate-green + byte-identical:
+
+- per-rep WHERE on a multi-hop unit (rep-boundary eval, 2)     - OPTIONAL MATCH binding an edge var (1)
+- correlated scalar VALUE subquery (ScalarSubquery, 3)         - uncorrelated multi-pattern EXISTS (4)
+- uncorrelated VALUE scalar subquery (2)                       - repeated-variable equality join (9 — incl ALL multiseg!)
+- single-rep + fixed-inner nested groups (2)                   - FOR..IN list unwind (Plan::Unwind, 10)
+- bare ALL/ANY selectors (6)                                   - graph-element predicates IS DIRECTED/SOURCE OF/ALL_DIFFERENT/SAME (5)
+- per-hop edge WHERE on a plain var-length (3)                 - REPEATABLE ELEMENTS/DIFFERENT EDGES modes + labels(edge) (4)
+- GROUP BY without aggregate = DISTINCT (1)
+
+REMAINING (73 = ~25 value-contract intentional + ~48 feature):
+- NESTED-RECURSIVE (~14): list-of-lists group vars (nested_paren_lol/varying, nested_quant_gv),
+  variable-inner group vars (nested_outer_gv_2), multi-rep decomposition (nested_quant_ends_2/3),
+  nested per-rep WHERE (nested_per_rep_where, 4), vqs_16. Needs core's recursive bind_unit + nested lists.
+- SMALL FEATURES still open: group_by_non_returned_key (aggregate keys-before-aggs ordering),
+  per_hop_outer_var (per-hop WHERE referencing an outer var), any_shortest_bounded/plus_seed_cycle (2),
+  m_edge_label_negation (-[:!T]->), CAST bool/list/int, CALL inline count/scope (3), is_typed_closed_record (2),
+  order_by_letin, page_before_projection (statement LIMIT 0), gv_carry_through_with, size_labels/range_float singles.
+- VALUE-CONTRACT (~25, leave): num_string_overflow, distinct_nan, sum/avg-over-temporal, CAST-throws,
+  range caps, m_reserved_word, inline_constraint, tck_null, temporal_duration.
