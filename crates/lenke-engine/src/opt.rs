@@ -1048,7 +1048,7 @@ fn max_slot(expr: &Expr) -> Option<usize> {
         | Expr::CountSubquery { outer_width, .. }
         | Expr::ScalarSubquery { outer_width, .. } => outer_width.checked_sub(1),
         // An uncorrelated body reads no outer slot.
-        Expr::UncorrelatedExists { .. } => None,
+        Expr::UncorrelatedExists { .. } | Expr::UncorrelatedScalar { .. } => None,
     }
 }
 

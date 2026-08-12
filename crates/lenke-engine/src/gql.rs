@@ -3623,6 +3623,24 @@ impl Parser {
     // scalar expression (`RETURN b.name`) becomes a ScalarSubquery: the body's single
     // value per outer row (NULL when the body matches nothing).
     fn value_count_subquery_expr(&mut self) -> Result<Expr, String> {
+        // An UNCORRELATED body is a self-contained query — build the whole thing
+        // (pattern + RETURN projection/aggregate) and run it once.
+        if self.subquery_is_uncorrelated() {
+            let (body, body_scope, body_slots) = self.parse_uncorrelated_subquery_body()?;
+            if !self.eat_kw("RETURN") {
+                return Err("a VALUE subquery must end with RETURN <expr>".into());
+            }
+            let saved_scope = std::mem::replace(&mut self.scope, body_scope);
+            let saved_slots = std::mem::replace(&mut self.slots, body_slots);
+            let items = self.return_items()?;
+            let (full, _) = apply_items(body, &items);
+            self.scope = saved_scope;
+            self.slots = saved_slots;
+            self.expect(&Tok::RBrace)?;
+            return Ok(Expr::UncorrelatedScalar {
+                body: Box::new(full),
+            });
+        }
         let (body, outer_width, sub_scope, sub_slots) = self.correlated_subquery_body("VALUE")?;
         if !self.eat_kw("RETURN") {
             return Err("a VALUE subquery must end with RETURN <expr>".into());

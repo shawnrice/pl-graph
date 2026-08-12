@@ -729,7 +729,8 @@ fn needs_lineage(plan: &Plan) -> bool {
             | Expr::Exists { .. }
             | Expr::CountSubquery { .. }
             | Expr::ScalarSubquery { .. }
-            | Expr::UncorrelatedExists { .. } => false,
+            | Expr::UncorrelatedExists { .. }
+            | Expr::UncorrelatedScalar { .. } => false,
         }
     }
     match plan {
@@ -4665,7 +4666,8 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         Expr::Exists { .. }
         | Expr::CountSubquery { .. }
         | Expr::ScalarSubquery { .. }
-        | Expr::UncorrelatedExists { .. } => false,
+        | Expr::UncorrelatedExists { .. }
+        | Expr::UncorrelatedScalar { .. } => false,
     }
 }
 
@@ -4758,7 +4760,8 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         Expr::Exists { .. }
         | Expr::CountSubquery { .. }
         | Expr::ScalarSubquery { .. }
-        | Expr::UncorrelatedExists { .. } => expr.clone(),
+        | Expr::UncorrelatedExists { .. }
+        | Expr::UncorrelatedScalar { .. } => expr.clone(),
     }
 }
 
@@ -6670,6 +6673,17 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             // scan/join/filter plan) and broadcast whether it produced any row.
             let exists = pull(body, store, false)?.rows() > 0;
             Col::Bool(vec![exists; batch.rows()])
+        }
+        Expr::UncorrelatedScalar { body } => {
+            // Run the self-contained body (its own RETURN) once; the VALUE is its
+            // single value (NULL if empty, an error if more than one row).
+            let b = pull(body, store, false)?;
+            let v = match b.rows() {
+                0 => Value::Null,
+                1 => b.slot(0).value_at(0),
+                _ => return Err("a VALUE subquery returned more than one row".into()),
+            };
+            broadcast(v, batch.rows())
         }
     })
 }
@@ -8952,6 +8966,31 @@ mod tests {
         assert_eq!(
             ids("MATCH (b:N {id:'b'})-[:R {amt:20.0}]->{1,3}(x) RETURN x.id AS id"),
             vec!["c"]
+        );
+    }
+
+    /// An uncorrelated VALUE subquery runs a self-contained body once: a constant
+    /// (`VALUE { RETURN 1+2 }`) or a global aggregate (`VALUE { MATCH (n) RETURN
+    /// count(*) }`).
+    #[test]
+    fn uncorrelated_value_subquery() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"Person\"],\"props\":{}}\n",
+            "{\"id\":\"b\",\"labels\":[\"Person\"],\"props\":{}}\n",
+            "{\"id\":\"c\",\"labels\":[\"Person\"],\"props\":{}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let num = |q: &str| -> f64 {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            match run(&plan, &store).rows[0][0] {
+                Value::Num(x) => x,
+                ref o => panic!("{o:?}"),
+            }
+        };
+        assert_eq!(num("RETURN VALUE { RETURN 1 + 2 } AS v"), 3.0);
+        assert_eq!(
+            num("RETURN VALUE { MATCH (n:Person) RETURN count(*) } AS c"),
+            3.0
         );
     }
 

@@ -228,6 +228,14 @@ pub enum Expr {
     UncorrelatedExists {
         body: Box<Plan>,
     },
+    /// `VALUE { … RETURN <scalar> }` whose body references NO outer variable — an
+    /// UNCORRELATED scalar subquery (`VALUE { RETURN 1+2 }`, `VALUE { MATCH (n)
+    /// RETURN count(*) }`). `body` is the WHOLE self-contained query (including the
+    /// RETURN projection/aggregate); it is run once and its single value broadcast.
+    /// Empty result → NULL; more than one row → an error, like a correlated VALUE.
+    UncorrelatedScalar {
+        body: Box<Plan>,
+    },
     /// `needle IN haystack` where `haystack` is a dynamic (non-literal) list
     /// expression (a list property, a param, a function result). A literal
     /// `x IN [a, b]` desugars to an OR-chain at parse time instead; this is the
