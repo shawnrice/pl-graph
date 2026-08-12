@@ -1,0 +1,60 @@
+{"name":"tck_boolean1_and_three_valued","fixture":"","query":"RETURN true AND true AS tt, true AND false AS tf, true AND null AS tn, false AND true AS ft, false AND false AS ff, false AND null AS fn, null AND true AS nt, null AND false AS nf, null AND null AS nn","ordered":false}
+{"name":"tck_boolean2_or_three_valued","fixture":"","query":"RETURN true OR true AS tt, true OR false AS tf, true OR null AS tn, false OR true AS ft, false OR false AS ff, false OR null AS fn, null OR true AS nt, null OR false AS nf, null OR null AS nn","ordered":false}
+{"name":"tck_boolean3_xor_three_valued","fixture":"","query":"RETURN true XOR true AS tt, true XOR false AS tf, true XOR null AS tn, false XOR true AS ft, false XOR false AS ff, false XOR null AS fn, null XOR true AS nt, null XOR false AS nf, null XOR null AS nn","ordered":false}
+{"name":"tck_boolean4_not_three_valued","fixture":"","query":"RETURN NOT true AS nt, NOT false AS nf, NOT null AS nn","ordered":false}
+{"name":"tck_null3_inverse_of_null_is_null","fixture":"","query":"RETURN NOT null AS val","ordered":false}
+{"name":"tck_null3_null_equals_null_is_unknown","fixture":"","query":"RETURN null = null AS val","ordered":false}
+{"name":"tck_null3_null_not_equals_null_is_unknown","fixture":"","query":"RETURN null <> null AS val","ordered":false}
+{"name":"tck_null3_in_with_null_membership_three_valued_logic","fixture":"","query":"RETURN 1 IN [1, 2] AS present, 3 IN [1, 2] AS absent, 1 IN [1, null] AS foundDespiteNull, 3 IN [1, null] AS unknownDueToNull, null IN [1, 2] AS nullElt, null IN [] AS nullInEmpty, 1 IN [] AS valInEmpty","ordered":false}
+{"name":"tck_null1_property_null_check_on_null_node_unmatched_optional","fixture":"","query":"OPTIONAL MATCH (n) RETURN n.missing IS NULL AS missingNull","ordered":false}
+{"name":"tck_null1_literal_null_is_null","fixture":"","query":"RETURN null IS NULL AS val","ordered":false}
+{"name":"tck_precedence1_iso_or_xor_share_left_associative_level","fixture":"","query":"RETURN true OR true XOR true AS a, true OR (true XOR true) AS b, (true OR true) XOR true AS c","ordered":false}
+{"name":"tck_precedence1_and_takes_precedence_over_xor","fixture":"","query":"RETURN true XOR false AND false AS a, true XOR (false AND false) AS b, (true XOR false) AND false AS c","ordered":false}
+{"name":"tck_precedence1_and_takes_precedence_over_or","fixture":"","query":"RETURN true OR false AND false AS a, true OR (false AND false) AS b, (true OR false) AND false AS c","ordered":false}
+{"name":"tck_precedence1_not_takes_precedence_over_and","fixture":"","query":"RETURN NOT true AND false AS a, (NOT true) AND false AS b, NOT (true AND false) AS c","ordered":false}
+{"name":"tck_precedence1_not_takes_precedence_over_or","fixture":"","query":"RETURN NOT false OR true AS a, (NOT false) OR true AS b, NOT (false OR true) AS c","ordered":false}
+{"name":"tck_precedence1_comparison_takes_precedence_over_not","fixture":"","query":"RETURN NOT false >= false AS a, NOT (false >= false) AS b, (NOT false) >= false AS c","ordered":false}
+{"name":"tck_precedence2_multiplication_takes_precedence_over_addition","fixture":"","query":"RETURN 4 * 2 + 3 * 2 AS a, 4 * 2 + (3 * 2) AS b, 4 * (2 + 3) * 2 AS c","ordered":false}
+{"name":"tck_precedence2_unary_minus_takes_precedence_over_addition","fixture":"","query":"RETURN -3 + 2 AS a, (-3) + 2 AS b, -(3 + 2) AS c","ordered":false}
+{"name":"tck_mathematical6_modulo_of_positive_integers","fixture":"","query":"RETURN 7 % 3 AS a, 8 % 4 AS b, 5 % 3 AS c","ordered":false}
+{"name":"tck_comparison3_chained_comparison_rejected","fixture":"","query":"RETURN 1 < 2 < 3 AS x","ordered":false}
+{"name":"tck_union1_two_unique_elements_distinct","fixture":"","query":"RETURN 1 AS x UNION RETURN 2 AS x","ordered":false}
+{"name":"tck_union1_three_elements_two_unique_distinct","fixture":"","query":"RETURN 2 AS x UNION RETURN 1 AS x UNION RETURN 2 AS x","ordered":false}
+{"name":"tck_union2_union_all_keeps_duplicates","fixture":"","query":"RETURN 1 AS x UNION ALL RETURN 1 AS x","ordered":false}
+{"name":"tck_literals_booleans_and_null_case_insensitive_1","fixture":"","query":"RETURN true AS literal","ordered":false}
+{"name":"tck_literals_booleans_and_null_case_insensitive_2","fixture":"","query":"RETURN TRUE AS literal","ordered":false}
+{"name":"tck_literals_booleans_and_null_case_insensitive_3","fixture":"","query":"RETURN false AS literal","ordered":false}
+{"name":"tck_literals_booleans_and_null_case_insensitive_4","fixture":"","query":"RETURN FALSE AS literal","ordered":false}
+{"name":"tck_literals_booleans_and_null_case_insensitive_5","fixture":"","query":"RETURN null AS literal","ordered":false}
+{"name":"tck_literals_decimal_integers_1","fixture":"","query":"RETURN 1 AS literal","ordered":false}
+{"name":"tck_literals_decimal_integers_2","fixture":"","query":"RETURN 0 AS literal","ordered":false}
+{"name":"tck_literals_decimal_integers_3","fixture":"","query":"RETURN 372036854 AS literal","ordered":false}
+{"name":"tck_literals_hexadecimal_integers_1","fixture":"","query":"RETURN 0x1 AS literal","ordered":false}
+{"name":"tck_literals_hexadecimal_integers_2","fixture":"","query":"RETURN 0x162CD4F6 AS literal","ordered":false}
+{"name":"tck_literals_octal_integers_1","fixture":"","query":"RETURN 0o1 AS literal","ordered":false}
+{"name":"tck_literals_octal_integers_2","fixture":"","query":"RETURN 0o2613152366 AS literal","ordered":false}
+{"name":"tck_literals_floats_1","fixture":"","query":"RETURN 1.0 AS literal","ordered":false}
+{"name":"tck_literals_floats_2","fixture":"","query":"RETURN .1 AS literal","ordered":false}
+{"name":"tck_literals_floats_3","fixture":"","query":"RETURN .3405892687 AS literal","ordered":false}
+{"name":"tck_literals_floats_4","fixture":"","query":"RETURN 3985764.3405892687 AS literal","ordered":false}
+{"name":"tck_literals_strings_1","fixture":"","query":"RETURN '' AS literal","ordered":false}
+{"name":"tck_literals_strings_2","fixture":"","query":"RETURN 'a' AS literal","ordered":false}
+{"name":"tck_literals6_control_character_escapes_decode_1","fixture":"","query":"RETURN '\\n' AS literal","ordered":false}
+{"name":"tck_literals6_control_character_escapes_decode_2","fixture":"","query":"RETURN '\\t' AS literal","ordered":false}
+{"name":"tck_literals6_control_character_escapes_decode_3","fixture":"","query":"RETURN '\\r' AS literal","ordered":false}
+{"name":"tck_literals6_escaped_backslash_and_quotes_decode_1","fixture":"","query":"RETURN '\\\\' AS literal","ordered":false}
+{"name":"tck_literals6_escaped_backslash_and_quotes_decode_2","fixture":"","query":"RETURN '\\'' AS literal","ordered":false}
+{"name":"tck_literals6_escaped_backslash_and_quotes_decode_3","fixture":"","query":"RETURN '\"' AS literal","ordered":false}
+{"name":"tck_literals6_unicode_escapes_decode_to_code_points_1","fixture":"","query":"RETURN '\\u0041' AS literal","ordered":false}
+{"name":"tck_literals6_unicode_escapes_decode_to_code_points_2","fixture":"","query":"RETURN '\\u01FF' AS literal","ordered":false}
+{"name":"tck_literals6_unicode_escapes_decode_to_code_points_3","fixture":"","query":"RETURN '\\U01F600' AS literal","ordered":false}
+{"name":"tck_literals6_malformed_unicode_escape_is_syntax_error","fixture":"","query":"RETURN '\\uH' AS x","ordered":false}
+{"name":"tck_mathematical_subtraction_multiplication_division_1","fixture":"","query":"RETURN 7 - 2 AS r","ordered":false}
+{"name":"tck_mathematical_subtraction_multiplication_division_2","fixture":"","query":"RETURN 3 * 4 AS r","ordered":false}
+{"name":"tck_mathematical_subtraction_multiplication_division_3","fixture":"","query":"RETURN 6 / 2 AS r","ordered":false}
+{"name":"tck_mathematical_any_null_operand_yields_null_1","fixture":"","query":"RETURN null - 1 AS r","ordered":false}
+{"name":"tck_mathematical_any_null_operand_yields_null_2","fixture":"","query":"RETURN 2 - null AS r","ordered":false}
+{"name":"tck_mathematical_any_null_operand_yields_null_3","fixture":"","query":"RETURN null * 3 AS r","ordered":false}
+{"name":"tck_mathematical_any_null_operand_yields_null_4","fixture":"","query":"RETURN 5 / null AS r","ordered":false}
+{"name":"tck_match1_matching_non_existent_nodes_returns_empty","fixture":"","query":"MATCH (n) RETURN n.x AS x","ordered":false}
+{"name":"tck_match2_matching_non_existent_relationships_returns_empty","fixture":"","query":"MATCH ()-[r]->() RETURN r.x AS x","ordered":false}

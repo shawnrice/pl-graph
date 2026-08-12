@@ -10,7 +10,12 @@ the engine.
 ## Case format — one JSON object per line
 
 ```json
-{"name":"short_snake_name","fixture":"<core-dialect NDJSON>","query":"MATCH ... RETURN ...","ordered":false}
+{
+  "name": "short_snake_name",
+  "fixture": "<core-dialect NDJSON>",
+  "query": "MATCH ... RETURN ...",
+  "ordered": false
+}
 ```
 
 - **name** — short identifier (source test fn name + a suffix if the test has several queries).
@@ -33,7 +38,7 @@ the engine.
 ## What to SKIP (do not emit a case)
 
 - **Parameterized** queries (`qp(g, Q, params)` / `$name` in the query) — the runner passes no params.
-- **Multi-statement** tests (a write statement, then a *separate* read) — only one `query` per case.
+- **Multi-statement** tests (a write statement, then a _separate_ read) — only one `query` per case.
 - Queries returning **whole nodes/edges/paths/maps** (`RETURN n`, `RETURN p` for a path) — their
   representation is not comparable across engines. Only scalar RETURNs.
 - Tests whose fixture or expected can't be read off directly (custom Rust logic, loops building data).
@@ -46,3 +51,12 @@ engine≠core mismatch, so genuine engine gaps surface for review.
 ```
 cargo test --release --manifest-path crates/lenke-engine/Cargo.toml --test gql_corpus -- --nocapture
 ```
+
+## Excluded: parser recursion-depth cases
+
+Four core hardening cases (`h_deep_nested_{parens,not,label_negation,lists}`) feed
+thousands of nested tokens to assert a clean syntax error. Core has a parser
+recursion-depth guard; the engine's recursive-descent parser has none, so it
+**overflows the stack** (uncatchable) instead of erroring. They are omitted from the
+corpus (they would abort the run) and tracked as a known gap: the engine parser
+needs depth limits like core's.
