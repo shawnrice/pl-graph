@@ -6153,14 +6153,42 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             )
         }
         Expr::PropertyExists { slot, key } => {
-            // Presence, not value: true iff the element carries a stored value for
-            // `key`. Only nodes carry the presence bitmap here (edge-property
-            // existence is deferred); a non-node slot has no property → FALSE.
-            let out: Vec<bool> = match batch.slot(*slot) {
-                Col::Nodes(ids) => ids.iter().map(|&id| store.has_prop(id, key)).collect(),
-                other => vec![false; other.len()],
-            };
-            Col::Bool(out)
+            // Presence, not value: TRUE iff the element carries a stored value for
+            // `key`, FALSE if not — but on a NON-element (the OPTIONAL null sentinel
+            // `u32::MAX`, or a computed value) the answer is NULL, matching core's
+            // `prop_present` (`_ => Val::Null`). A column with no sentinel keeps the
+            // unboxed `Col::Bool` fast path; a sentinel forces the null-carrying `Gen`.
+            match batch.slot(*slot) {
+                Col::Nodes(ids) if !ids.contains(&u32::MAX) => {
+                    Col::Bool(ids.iter().map(|&id| store.has_prop(id, key)).collect())
+                }
+                Col::Nodes(ids) => Col::Gen(
+                    ids.iter()
+                        .map(|&id| {
+                            if id == u32::MAX {
+                                Value::Null
+                            } else {
+                                Value::Bool(store.has_prop(id, key))
+                            }
+                        })
+                        .collect(),
+                ),
+                Col::Edges(eids) if !eids.contains(&u32::MAX) => {
+                    Col::Bool(eids.iter().map(|&e| store.has_edge_prop(e, key)).collect())
+                }
+                Col::Edges(eids) => Col::Gen(
+                    eids.iter()
+                        .map(|&e| {
+                            if e == u32::MAX {
+                                Value::Null
+                            } else {
+                                Value::Bool(store.has_edge_prop(e, key))
+                            }
+                        })
+                        .collect(),
+                ),
+                other => Col::Gen(vec![Value::Null; other.len()]),
+            }
         }
         Expr::Exists { body, .. } => {
             // Correlated existence: run the sub-pattern over ALL outer rows at once,
@@ -9468,6 +9496,36 @@ mod tests {
         let out = run(&exists, &store);
         assert!(matches!(out.rows[0][0], Value::Bool(true))); // present-null
         assert!(matches!(out.rows[1][0], Value::Bool(false))); // absent
+    }
+
+    /// PROPERTY_EXISTS works on an EDGE slot (not just nodes), and a NULL element
+    /// (the OPTIONAL unmatched sentinel) yields NULL, not FALSE — matching core.
+    #[test]
+    fn property_exists_on_edges_and_null_element() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{\"w\":3}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let val = |q: &str| -> Value {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            run(&plan, &store).rows[0][0].clone()
+        };
+        // edge carries `w`, not `gone`.
+        assert!(matches!(
+            val("MATCH ()-[e:R]->() RETURN property_exists(e, w) AS x"),
+            Value::Bool(true)
+        ));
+        assert!(matches!(
+            val("MATCH ()-[e:R]->() RETURN property_exists(e, gone) AS x"),
+            Value::Bool(false)
+        ));
+        // OPTIONAL MATCH that finds nothing → m is NULL → property_exists is NULL.
+        assert!(val(
+            "MATCH (n:N) OPTIONAL MATCH (n)-[:NOSUCH]->(m) RETURN property_exists(m, x) AS x"
+        )
+        .is_null());
     }
 
     #[test]

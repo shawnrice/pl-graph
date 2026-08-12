@@ -141,8 +141,6 @@ tests_e.jsonl::is_typed_closed_record_1
 tests_e.jsonl::is_typed_closed_record_2
 tests_e.jsonl::match_mode_different_edges
 tests_e.jsonl::match_mode_repeatable_elements
-tests_e.jsonl::property_exists_on_edges
-tests_e.jsonl::property_exists_on_null_element
 tests_e.jsonl::value_subquery_aggregate_carol_zero
 tests_e.jsonl::value_subquery_aggregate_dave_deg
 tests_e.jsonl::value_subquery_aggregate_global

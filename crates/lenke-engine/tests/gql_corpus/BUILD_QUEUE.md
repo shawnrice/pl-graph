@@ -211,7 +211,7 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 - **per-hop WHERE in a subpath group `((x)-[e:R]->(y) WHERE pred){n,m}` (~10: qsp*per_hop*_,
   vqs*8, subpath_where*_)** — where the WHERE only FILTERS and the RETURN needs no group-var
   list (just t.id). Per-rep predicate over the rep's own x/e/y. MEDIUM.
-- **THE BIG ONE: group-variable-as-list `Plan::RepeatGroup` (~21: qsp*group_vars*_, gv\__,
+- **THE BIG ONE: group-variable-as-list `Plan::RepeatGroup` (~21: qsp*group_vars*\_, gv\_\_,
   vqs_7/9/11/…)** — each group var (x,e,y) binds to a Value::List across reps; `size(e)`,
   `x[0].id`, `y[size(y)-1].id`, `WITH e AS hops`. Needs the new operator + DFS repeater
   materializing one list per group slot (columnar analogue of core bind_group_vars_flat).
@@ -242,7 +242,7 @@ User directive: fix all remaining deferred items (they were deferred for effort,
   count = source count. Likely a var_length min==max==0 edge case. SMALL.
 - **per-hop WHERE in a subpath group `((x)-[e:R]->(y) WHERE pred){n,m}`** (~10: qsp*per_hop*_,
   vqs*8, subpath_where*_) where the WHERE only filters. MEDIUM.
-- **THE BIG ONE: group-variable-as-list `Plan::RepeatGroup`** (~21: qsp*group_vars*_, gv\__,
+- **THE BIG ONE: group-variable-as-list `Plan::RepeatGroup`** (~21: qsp*group_vars*\_, gv\_\_,
   vqs_7/9/11/…). Its own iteration. Expr::Index (done) + var_length lineage (done) are prereqs.
 - Smaller: order_alias (4, NULLS FIRST / DISTINCT+ORDER-BY-underlying-expr), distinct_nan (3),
   group_by_bound (3, LET/WITH bound name + GROUP BY), exists_multi_match (4, EXISTS{ MATCH MATCH }).
@@ -264,15 +264,15 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 
 ### NEXT (baseline 169), tractable -> hard:
 
-- **per-hop WHERE in a QUANTIFIED subpath group `((x)-[e:R]->(y) WHERE pred){n,m}`** (qsp_per_hop_*,
+- **per-hop WHERE in a QUANTIFIED subpath group `((x)-[e:R]->(y) WHERE pred){n,m}`** (qsp*per_hop*\*,
   vqs_8, nested_per_rep) — the WHERE filters each repetition. Now that unquantified groups + the
   balanced-paren split exist, this extends the quantified path with a per-rep predicate in var_length. MEDIUM.
-- **THE BIG LEVER: group-variable-as-list `Plan::RepeatGroup`** (~21: qsp_group_vars_*, gv_*,
+- **THE BIG LEVER: group-variable-as-list `Plan::RepeatGroup`** (~21: qsp*group_vars*_, gv\__,
   vqs_7/9/11/…) — each group var (x,e,y) binds to a Value::List across reps. Its own iteration.
   Expr::Index + var_length lineage (both done) are prereqs.
 - **uncorrelated multi-pattern EXISTS `EXISTS { MATCH (x:N) MATCH (y:M) }`** (exists_multi_match, 4) —
   needs pull_body to support a Scan/cross-join body (currently Row/Expand/VarLength/Filter/Project
   only), or a constant-EXISTS eval (body independent of the outer row → run once, broadcast). MEDIUM.
-- Smaller: shortest_ / shortest_per_hop (SHORTEST k>=2), value_subquery_aggregate (3), multiseg_u (6),
+- Smaller: shortest\_ / shortest_per_hop (SHORTEST k>=2), value_subquery_aggregate (3), multiseg_u (6),
   distinct_nan (string->NaN, murky/value-contract), num_string_overflow (value-contract, leave).
-- group_by_bound_1 done; order_by_letin_over_output_column = LET-IN-END *expression* in ORDER BY (separate).
+- group_by_bound_1 done; order_by_letin_over_output_column = LET-IN-END _expression_ in ORDER BY (separate).
