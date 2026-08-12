@@ -258,12 +258,30 @@ pub fn gen_hard(rng: &mut Rng, s: &Schema, caps: &Caps, src_id: usize) -> Option
             let (outer, _, _) = quant_bounded(rng);
             let bind_edge = rng.chance(1, 2);
             let ev = if bind_edge { "e" } else { "" };
-            // A per-rep WHERE inside a NESTED group is deferred (epsilon/perrep binding).
-            let inner_where = "";
+            // A PER-REP WHERE (after the inner group, over the per-rep view): `size(e)`
+            // (edge list of this outer rep) or `x[i].prop` (inner-rep-indexed node).
+            let perrep = if caps.per_rep && rng.chance(1, 3) {
+                tags.push("nested-per-rep-where");
+                if bind_edge && rng.chance(1, 2) {
+                    format!(
+                        " WHERE size(e) {} {}",
+                        rng.pick(&["=", ">=", "<"]),
+                        1 + rng.below(2)
+                    )
+                } else {
+                    format!(
+                        " WHERE x[0].{} {} {}",
+                        s.num,
+                        rng.pick(&[">=", "<", "<>"]),
+                        rng.below(100)
+                    )
+                }
+            } else {
+                String::new()
+            };
             let group = format!(
-                "( ((x)-[{ev}:{ety}]->(y){iw}){inner} ){outer}",
+                "( ((x)-[{ev}:{ety}]->(y)){inner}{perrep} ){outer}",
                 ety = s.etype,
-                iw = inner_where,
             );
             // Depth-2 reducer over x (or e).
             let reducer = if bind_edge && rng.chance(1, 2) {

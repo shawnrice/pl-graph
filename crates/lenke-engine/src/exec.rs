@@ -993,6 +993,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             mode,
             endpoint_slot: _,
             bind_slots,
+            per_rep_pred,
         } => nested_group(
             &pull(input, store, track)?,
             store,
@@ -1002,6 +1003,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             *max,
             *mode,
             bind_slots,
+            per_rep_pred.as_deref(),
         ),
         Plan::ShortestPath {
             input,
@@ -5209,6 +5211,7 @@ fn push_group_cols(
 /// advanced PAST, EXCEPT that a step inside a `Sub` keeps the enclosing unit's entry
 /// pinned at that Sub's element index. This is what lets the structured binder place
 /// each variable at the right nesting depth. Mirrors core's `pathfind::StepRec`.
+#[derive(Clone)]
 struct StepRec {
     levels: Vec<(u32, usize)>,
     source: u32,
@@ -5258,12 +5261,16 @@ impl Nest {
 fn bind_nested(
     unit: &crate::ir::GUnit,
     tree_path: &[usize],
+    key_start: usize,
     steps: &[StepRec],
     out: &mut Vec<(usize, Value)>,
 ) {
     use crate::ir::GElem;
     let depth = tree_path.len();
-    let key = |s: &StepRec| -> Vec<u32> { s.levels[0..=depth].iter().map(|(r, _)| *r).collect() };
+    // `key_start = 0` = the full-nesting emit view; `key_start = 1` drops the outer-rep
+    // index for a PER-REP `WHERE` (each var one level shallower). Clamp to `depth+1`.
+    let ks = key_start.min(depth + 1);
+    let key = |s: &StepRec| -> Vec<u32> { s.levels[ks..=depth].iter().map(|(r, _)| *r).collect() };
     let within = |s: &StepRec| -> bool {
         s.levels.len() > depth
             && s.levels[..depth]
@@ -5333,7 +5340,7 @@ fn bind_nested(
                 }
                 let mut child = tree_path.to_vec();
                 child.push(e);
-                bind_nested(sub, &child, steps, out);
+                bind_nested(sub, &child, key_start, steps, out);
             }
         }
     }
@@ -5354,6 +5361,7 @@ fn nested_group(
     max: u32,
     mode: PathMode,
     bind_slots: &[usize],
+    per_rep_pred: Option<&Expr>,
 ) -> Batch {
     use crate::ir::GElem;
     let empty = || {
@@ -5417,6 +5425,8 @@ fn nested_group(
     // Recursion state, carried in a small struct to keep the many closures honest.
     struct M<'a> {
         store: &'a Store,
+        unit: &'a crate::ir::GUnit,
+        per_rep: Option<&'a Expr>,
         ik: usize,
         inner_want: &'a [Vec<u32>],
         inner_dir: &'a [Dir],
@@ -5433,6 +5443,8 @@ fn nested_group(
     }
     let mut m = M {
         store,
+        unit,
+        per_rep: per_rep_pred,
         ik,
         inner_want: &inner_want,
         inner_dir: &inner_dir,
@@ -5542,14 +5554,45 @@ fn nested_group(
             }
         }
 
+        // The PER-REP `WHERE` over the just-completed outer rep `orep`: bind the unit's
+        // variables in the per-rep view (`key_start = 1`, over that rep's steps) and
+        // evaluate. `true` when there is no predicate. A rep failing it is pruned.
+        fn rep_ok(&self, orep: u32) -> bool {
+            let Some(pred) = self.per_rep else {
+                return true;
+            };
+            let rep_steps: Vec<StepRec> = self
+                .steps
+                .iter()
+                .filter(|s| s.levels.first().is_some_and(|(r, _)| *r == orep))
+                .cloned()
+                .collect();
+            let mut pairs: Vec<(usize, Value)> = Vec::new();
+            bind_nested(self.unit, &[], 1, &rep_steps, &mut pairs);
+            let maxslot = pairs.iter().map(|(s, _)| *s).max().unwrap_or(0);
+            let mut cols: Vec<Col> = (0..=maxslot).map(|_| Col::Gen(vec![Value::Null])).collect();
+            for (s, v) in pairs {
+                cols[s] = Col::Gen(vec![v]);
+            }
+            let mini = Batch::of(cols);
+            eval(pred, self.store, &mini)
+                .map(|c| c.value_at(0).is_true())
+                .unwrap_or(false)
+        }
+
         // The outer repetition: repeat the whole unit [omin,omax] times from `v`,
-        // emitting the endpoint at each outer-rep-count boundary in range.
+        // emitting the endpoint at each outer-rep-count boundary in range. A completed
+        // outer rep that fails the per-rep `WHERE` prunes that branch.
         fn outer_walk(&mut self, v: u32, orep: u32, emit: &mut dyn FnMut(&mut Self, u32)) {
             if orep >= self.omin {
                 emit(self, v);
             }
             if orep < self.omax {
-                let mut c = |slf: &mut Self, end: u32| slf.outer_walk(end, orep + 1, emit);
+                let mut c = |slf: &mut Self, end: u32| {
+                    if slf.rep_ok(orep) {
+                        slf.outer_walk(end, orep + 1, emit);
+                    }
+                };
                 self.inner_walk(v, orep, 0, &mut c);
             }
         }
@@ -5563,7 +5606,7 @@ fn nested_group(
             keep.push(row);
             ends.push(end);
             let mut pairs: Vec<(usize, Value)> = Vec::new();
-            bind_nested(unit, &[], &slf.steps, &mut pairs);
+            bind_nested(unit, &[], 0, &slf.steps, &mut pairs);
             for (ci, &want_slot) in bind_slots.iter().enumerate() {
                 let v = pairs
                     .iter()

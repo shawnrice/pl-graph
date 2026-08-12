@@ -261,6 +261,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             mode,
             endpoint_slot,
             bind_slots,
+            per_rep_pred,
         } => {
             let (i, c) = rewrite(*input, idx);
             (
@@ -273,6 +274,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                     mode,
                     endpoint_slot,
                     bind_slots,
+                    per_rep_pred,
                 },
                 c,
             )

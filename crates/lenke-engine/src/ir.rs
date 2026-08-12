@@ -591,6 +591,12 @@ pub enum Plan {
         endpoint_slot: usize,
         /// Every bound inner-variable slot, ascending — the trailing list columns.
         bind_slots: Vec<usize>,
+        /// A PER-REPETITION `WHERE` (`( <unit> WHERE pred ){c,d}`), evaluated at each
+        /// OUTER-rep completion over that rep's variables in the PER-REP view — a
+        /// variable one nesting level shallower than globally (an outer-depth var is a
+        /// scalar, an inner-Sub var a list over the inner reps). A rep failing it is
+        /// pruned. `None` = no per-rep filter.
+        per_rep_pred: Option<Box<Expr>>,
     },
     /// Shortest-path reach: BFS from the element in `from` along `dir`/
     /// `edge_label`, emitting EACH reachable target once at its shortest distance

@@ -2669,54 +2669,66 @@ impl Parser {
         let family3 = matches!(self.peek(), Some(Tok::LParen))
             && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen));
 
-        // Parse the (single-hop) inner unit and the two quantifiers.
-        let (xvar, evar, dir, etypes, edge_pred, yvar, imin, imax, omin, omax) = if family3 {
-            self.expect(&Tok::LParen)?; // inner group `(`
-            let x = self.node()?;
-            let rel = self.rel()?;
-            let y = self.node()?;
-            if bad_inner(&x) || bad_inner(&y) {
-                return Err(
-                    "a label/property/WHERE on a nested subpath-group inner node is not \
+        // Parse the (single-hop) inner unit, the two quantifiers, and an optional
+        // PER-REP `WHERE` (after the inner unit, before the outer `)`).
+        let (xvar, evar, dir, etypes, edge_pred, yvar, imin, imax, omin, omax, perrep_range) =
+            if family3 {
+                self.expect(&Tok::LParen)?; // inner group `(`
+                let x = self.node()?;
+                let rel = self.rel()?;
+                let y = self.node()?;
+                if bad_inner(&x) || bad_inner(&y) {
+                    return Err(
+                        "a label/property/WHERE on a nested subpath-group inner node is not \
                             supported yet"
-                        .into(),
-                );
-            }
-            let epred = self.edge_pred_from_rel(&rel)?;
-            self.expect(&Tok::RParen)?; // inner group `)`
-            let (imin, imax) = self
-                .opt_quantifier()?
-                .ok_or("the inner group of a nested subpath needs a quantifier")?;
-            self.expect(&Tok::RParen)?; // outer group `)`
-            let (omin, omax) = self
-                .opt_quantifier()?
-                .ok_or("a nested subpath group needs an outer quantifier")?;
-            (
-                x.0, rel.var, rel.dir, rel.etypes, epred, y.0, imin, imax, omin, omax,
-            )
-        } else {
-            let x = self.node()?;
-            let rel = self.rel()?;
-            let (imin, imax) = self
-                .opt_quantifier()?
-                .ok_or("expected an inner `{lo,hi}` quantifier in a nested subpath group")?;
-            let y = self.node()?;
-            if bad_inner(&x) || bad_inner(&y) {
-                return Err(
-                    "a label/property/WHERE on a nested subpath-group inner node is not \
+                            .into(),
+                    );
+                }
+                let epred = self.edge_pred_from_rel(&rel)?;
+                self.expect(&Tok::RParen)?; // inner group `)`
+                let (imin, imax) = self
+                    .opt_quantifier()?
+                    .ok_or("the inner group of a nested subpath needs a quantifier")?;
+                let perrep = if self.eat_kw("WHERE") {
+                    Some(self.capture_inline_where())
+                } else {
+                    None
+                };
+                self.expect(&Tok::RParen)?; // outer group `)`
+                let (omin, omax) = self
+                    .opt_quantifier()?
+                    .ok_or("a nested subpath group needs an outer quantifier")?;
+                (
+                    x.0, rel.var, rel.dir, rel.etypes, epred, y.0, imin, imax, omin, omax, perrep,
+                )
+            } else {
+                let x = self.node()?;
+                let rel = self.rel()?;
+                let (imin, imax) = self
+                    .opt_quantifier()?
+                    .ok_or("expected an inner `{lo,hi}` quantifier in a nested subpath group")?;
+                let y = self.node()?;
+                if bad_inner(&x) || bad_inner(&y) {
+                    return Err(
+                        "a label/property/WHERE on a nested subpath-group inner node is not \
                             supported yet"
-                        .into(),
-                );
-            }
-            let epred = self.edge_pred_from_rel(&rel)?;
-            self.expect(&Tok::RParen)?; // outer group `)`
-            let (omin, omax) = self
-                .opt_quantifier()?
-                .ok_or("a nested subpath group needs an outer quantifier")?;
-            (
-                x.0, rel.var, rel.dir, rel.etypes, epred, y.0, imin, imax, omin, omax,
-            )
-        };
+                            .into(),
+                    );
+                }
+                let epred = self.edge_pred_from_rel(&rel)?;
+                let perrep = if self.eat_kw("WHERE") {
+                    Some(self.capture_inline_where())
+                } else {
+                    None
+                };
+                self.expect(&Tok::RParen)?; // outer group `)`
+                let (omin, omax) = self
+                    .opt_quantifier()?
+                    .ok_or("a nested subpath group needs an outer quantifier")?;
+                (
+                    x.0, rel.var, rel.dir, rel.etypes, epred, y.0, imin, imax, omin, omax, perrep,
+                )
+            };
 
         // The endpoint `(t)` (optional — anonymous when only the group vars are used)
         // is parsed BEFORE slots are assigned, because the executor's output columns
@@ -2761,6 +2773,29 @@ impl Parser {
         let eslot = assign(self, &evar, true, 2, slots, &mut bind_slots);
         let yslot = assign(self, &yvar, false, yd, slots, &mut bind_slots);
 
+        // The PER-REP `WHERE` sees each variable ONE nesting level shallower than
+        // globally (the per-rep view): an outer-depth var is a scalar, an inner-Sub var
+        // a list over the inner reps. Parse it with the group depths temporarily
+        // decremented so `x[i]`/`size(e)` type at the per-rep depth, then restore.
+        let per_rep_pred = if let Some(r) = perrep_range {
+            let saved: Vec<(usize, u8)> = bind_slots
+                .iter()
+                .map(|&s| (s, self.group_var_depth[&s]))
+                .collect();
+            for &s in &bind_slots {
+                let d = self.group_var_depth[&s];
+                self.group_var_depth.insert(s, d.saturating_sub(1));
+            }
+            self.scope = scope.clone();
+            let pred = self.parse_captured_where(r)?;
+            for (s, d) in saved {
+                self.group_var_depth.insert(s, d);
+            }
+            Some(pred)
+        } else {
+            None
+        };
+
         // Build the GUnit. Family 3: outer body is a Sub whose inner unit starts at x.
         // Family 4: outer starts at x; the Sub's inner unit is a bare hop; y is the
         // Sub's landing.
@@ -2799,6 +2834,7 @@ impl Parser {
             mode: self.path_mode,
             endpoint_slot: node_slot,
             bind_slots,
+            per_rep_pred: per_rep_pred.map(Box::new),
         };
         if let Some(pred) = landing_label_filter(t_label, t_le, node_slot) {
             plan = plan.filter(pred);
