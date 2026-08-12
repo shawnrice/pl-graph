@@ -3091,7 +3091,7 @@ impl Parser {
         // MATCH (a)-[:R]->(b) }` — the full-statement form; accept it as sugar.
         self.eat_kw("MATCH");
         let outer_width = self.slots;
-        let (var, label, props, start_where, _le) = self.node()?;
+        let (var, label, props, start_where, le) = self.node()?;
         let Some(v) = var else {
             return Err(format!("{kw} pattern must start from a bound variable"));
         };
@@ -3100,25 +3100,72 @@ impl Parser {
                 "inline WHERE on a {kw} start variable is not supported; use a trailing WHERE"
             ));
         }
-        if label.is_some() {
-            return Err(format!(
-                "bound variable `{v}` cannot be re-labeled inside {kw}"
-            ));
-        }
-        if !props.is_empty() {
-            return Err(format!(
-                "bound variable `{v}` cannot be re-constrained with inline properties inside \
-                 {kw}; use WHERE"
-            ));
-        }
-        let Some(&from) = self.scope.get(&v) else {
-            return Err(format!(
-                "{kw} must start from a bound (correlated) variable; `{v}` is not in scope"
-            ));
-        };
+
         let mut sub_scope = self.scope.clone();
         let mut sub_slots = outer_width + 1;
-        let body = self.extend_chain(Plan::Row, &mut sub_scope, &mut sub_slots, from)?;
+        let body = if let Some(&from) = self.scope.get(&v) {
+            // FORWARD: the first node is the bound correlated variable; it may not be
+            // re-labeled or re-constrained. Extend the chain from it.
+            if label.is_some() || le.is_some() {
+                return Err(format!("bound variable `{v}` cannot be re-labeled inside {kw}"));
+            }
+            if !props.is_empty() {
+                return Err(format!(
+                    "bound variable `{v}` cannot be re-constrained with inline properties \
+                     inside {kw}; use WHERE"
+                ));
+            }
+            self.extend_chain(Plan::Row, &mut sub_scope, &mut sub_slots, from)?
+        } else {
+            // REVERSE (single hop): the first node is a LOCAL variable; the correlated
+            // (bound) variable is the LANDING — `EXISTS { (m)-[:R]->(n) }` with `n`
+            // outer. Traverse from the bound endpoint backward to the local node.
+            let rel = self.rel()?;
+            if self.opt_quantifier()?.is_some() {
+                return Err(format!(
+                    "a variable-length {kw} correlated on the landing node is not supported"
+                ));
+            }
+            if rel.var.is_some() || !rel.props.is_empty() || rel.where_range.is_some() {
+                return Err(format!(
+                    "a bound edge / edge properties on a landing-correlated {kw} is not supported"
+                ));
+            }
+            let (vb, vb_label, vb_props, vb_where, vb_le) = self.node()?;
+            let Some(vb) = vb else {
+                return Err(format!("{kw} must correlate on a bound variable"));
+            };
+            let Some(&from) = self.scope.get(&vb) else {
+                return Err(format!(
+                    "{kw} must start from or land on a bound (correlated) variable; neither \
+                     `{v}` nor `{vb}` is in scope"
+                ));
+            };
+            if vb_label.is_some() || vb_le.is_some() || !vb_props.is_empty() || vb_where.is_some() {
+                return Err(format!(
+                    "the correlated variable `{vb}` cannot be re-constrained inside {kw}"
+                ));
+            }
+            // Reverse the hop direction and expand from the bound endpoint; the local
+            // node lands at the same slot the forward path would use.
+            let rev_dir = match rel.dir {
+                Dir::Out => Dir::In,
+                Dir::In => Dir::Out,
+                Dir::Both => Dir::Both,
+            };
+            let local_slot = outer_width + 1;
+            sub_scope.insert(v.clone(), local_slot);
+            let mut body = Plan::Row.expand(from, rev_dir, &rel.etypes);
+            if let Some(pred) = landing_label_filter(label, le, local_slot) {
+                body = body.filter(pred);
+            }
+            body = node_prop_filters(body, local_slot, props);
+            if let Some(r) = start_where {
+                self.scope = sub_scope.clone();
+                body = body.filter(self.parse_captured_where(r)?);
+            }
+            body
+        };
         let body = if self.eat_kw("WHERE") {
             let saved_scope = std::mem::replace(&mut self.scope, sub_scope);
             let saved_slots = std::mem::replace(&mut self.slots, sub_slots);
@@ -3898,13 +3945,13 @@ mod tests {
 
     #[test]
     fn exists_from_unbound_variable_errors() {
-        // The correlated start must be a bound variable — a fresh scan inside
-        // EXISTS is not this construct.
+        // The correlated variable must be a bound endpoint — a fully-fresh scan
+        // inside EXISTS (NEITHER endpoint bound) is not this construct.
         let err = super::parse(
             "MATCH (p:Person) WHERE EXISTS { (z)-[:KNOWS]->(x) } RETURN p.name AS name",
         )
         .unwrap_err();
-        assert!(err.contains("not in scope"), "got: {err}");
+        assert!(err.contains("in scope"), "got: {err}");
     }
 
     #[test]
@@ -6651,6 +6698,35 @@ mod tests {
         assert_eq!(n("MATCH (x) WHERE x:!Software RETURN count(*) AS c"), 2.0);
         // A single label is unchanged.
         assert_eq!(n("MATCH (x) WHERE x:Person RETURN count(*) AS c"), 2.0);
+    }
+
+    /// A reverse-correlated COUNT/EXISTS subquery — the outer variable is the hop's
+    /// LANDING (`COUNT { (m)-[:R]->(n) }`), so the body traverses from the bound
+    /// endpoint backward. In-degree, incoming direction, and a local-node label all
+    /// resolve correctly.
+    #[test]
+    fn reverse_correlated_subquery() {
+        let nd = concat!(
+            "{\"id\":\"n0\",\"labels\":[\"Node\"],\"props\":{\"name\":\"n0\"}}\n",
+            "{\"id\":\"n1\",\"labels\":[\"Node\"],\"props\":{\"name\":\"n1\"}}\n",
+            "{\"id\":\"n2\",\"labels\":[\"Node\"],\"props\":{\"name\":\"n2\"}}\n",
+            "{\"id\":\"e1\",\"from\":\"n0\",\"to\":\"n1\",\"type\":\"R\",\"props\":{}}\n",
+            "{\"id\":\"e2\",\"from\":\"n0\",\"to\":\"n1\",\"type\":\"R\",\"props\":{}}\n",
+            "{\"id\":\"e3\",\"from\":\"n0\",\"to\":\"n2\",\"type\":\"R\",\"props\":{}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let n = |q: &str| -> f64 {
+            match run(&super::parse(q).unwrap(), &store).rows[0][0] {
+                Value::Num(x) => x,
+                ref o => panic!("want num, got {o:?}"),
+            }
+        };
+        // in-degree of n1 = 2.
+        assert_eq!(n("MATCH (n:Node) WHERE n.name='n1' RETURN COUNT { (m)-[:R]->(n) } AS c"), 2.0);
+        // out-degree of n0 via incoming arrow at the local node = 3.
+        assert_eq!(n("MATCH (n:Node) WHERE n.name='n0' RETURN COUNT { (m)<-[:R]-(n) } AS c"), 3.0);
+        // local-node label filter narrows the reverse hop.
+        assert_eq!(n("MATCH (n:Node) WHERE n.name='n1' RETURN COUNT { (m:Node)-[:R]->(n) } AS c"), 2.0);
     }
 
     // --- part 3.8: string functions (E4a) ---

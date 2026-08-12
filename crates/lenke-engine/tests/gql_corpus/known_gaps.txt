@@ -10,12 +10,6 @@ language.jsonl::m_edge_label_negation
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_1
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_2
 tck.jsonl::tck_null1_property_null_check_on_null_node_unmatched_optional
-tests_a.jsonl::count_subquery_degree_10
-tests_a.jsonl::count_subquery_degree_11
-tests_a.jsonl::count_subquery_degree_12
-tests_a.jsonl::count_subquery_degree_7
-tests_a.jsonl::count_subquery_degree_8
-tests_a.jsonl::count_subquery_degree_9
 tests_a.jsonl::order_by_letin_over_output_column
 tests_b.jsonl::avg_duration_errors
 tests_b.jsonl::call_config_bogus_error
