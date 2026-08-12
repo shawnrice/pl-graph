@@ -2536,6 +2536,10 @@ fn range_seek_ids(store: &Store, label: &str, key: &str, op: CompareOp, value: &
 /// shared by the batch operator and the frontier executor so the two can never
 /// disagree on what an Expand reaches.
 fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: Option<u32>, mut f: impl FnMut(u32, u32)) {
+    // An undirected walk reaches a self-loop from BOTH the out- and the in-index;
+    // emit it once (from the out-side) by dropping its in-side copy. Directed walks
+    // touch one index, so they keep it either way. Matches core's SelfLoops::Once.
+    let drop_loop = matches!(dir, Dir::Both);
     // A type-filtered hop over an indexed store seeks the type bucket directly
     // (O(matching), not O(degree)) — the whole point of the opt-in edge-type index.
     if let Some(w) = want {
@@ -2547,7 +2551,9 @@ fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: Option<u32>, mut f: impl 
             }
             if matches!(dir, Dir::In | Dir::Both) {
                 for a in store.in_typed(v, w) {
-                    f(a.nbr, a.eid);
+                    if !(drop_loop && a.nbr == v) {
+                        f(a.nbr, a.eid);
+                    }
                 }
             }
             return;
@@ -2563,7 +2569,7 @@ fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: Option<u32>, mut f: impl 
     }
     if matches!(dir, Dir::In | Dir::Both) {
         for a in store.inc(v) {
-            if type_ok(a.etype) {
+            if type_ok(a.etype) && !(drop_loop && a.nbr == v) {
                 f(a.nbr, a.eid);
             }
         }
@@ -3118,8 +3124,18 @@ fn varlen_count_dfs(
     } else {
         &[]
     };
-    for a in out.iter().chain(inc.iter()) {
+    // Undirected: a self-loop sits in both indexes; drop its in-side copy so it is
+    // walked once (matches core's SelfLoops::Once).
+    let drop_loop = matches!(dir, Dir::Both);
+    for (is_inc, a) in out
+        .iter()
+        .map(|a| (false, a))
+        .chain(inc.iter().map(|a| (true, a)))
+    {
         if want.is_some_and(|w| w != a.etype) {
+            continue;
+        }
+        if is_inc && drop_loop && a.nbr == v {
             continue;
         }
         if trail && used.contains(&a.eid) {
@@ -3277,8 +3293,17 @@ fn varlen_agg_dfs(
     } else {
         &[]
     };
-    for a in out.iter().chain(inc.iter()) {
+    // Undirected: drop the in-side copy of a self-loop so it is walked once.
+    let drop_loop = matches!(dir, Dir::Both);
+    for (is_inc, a) in out
+        .iter()
+        .map(|a| (false, a))
+        .chain(inc.iter().map(|a| (true, a)))
+    {
         if want.is_some_and(|w| w != a.etype) {
+            continue;
+        }
+        if is_inc && drop_loop && a.nbr == v {
             continue;
         }
         if trail && used.contains(&a.eid) {
@@ -4740,8 +4765,17 @@ fn varlen_dfs(
     } else {
         &[]
     };
-    for a in out.iter().chain(inc.iter()) {
+    // Undirected: drop the in-side copy of a self-loop so it is walked once.
+    let drop_loop = matches!(dir, Dir::Both);
+    for (is_inc, a) in out
+        .iter()
+        .map(|a| (false, a))
+        .chain(inc.iter().map(|a| (true, a)))
+    {
         if want.is_some_and(|w| w != a.etype) {
+            continue;
+        }
+        if is_inc && drop_loop && a.nbr == v {
             continue;
         }
         if trail && used.contains(&a.eid) {
@@ -7852,6 +7886,70 @@ mod tests {
             ids("MATCH (n:N) WHERE 2 IN n.xs RETURN n.a AS a"),
             vec!["Num(2.0)", "Num(9.0)"]
         );
+    }
+
+    /// Undirected `~` traversal is `Dir::Both`: a normal edge is reached from both
+    /// endpoints (two rows), but a self-loop is walked ONCE (its in-side copy is
+    /// dropped), matching core's `SelfLoops::Once`.
+    #[test]
+    fn undirected_tilde_self_loop_counted_once() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{}}\n",
+            "{\"id\":\"e1\",\"from\":\"a\",\"to\":\"a\",\"type\":\"R\",\"props\":{}}\n",
+            "{\"id\":\"e2\",\"from\":\"a\",\"to\":\"b\",\"type\":\"R\",\"props\":{}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let count = |q: &str| -> f64 {
+            match run(&crate::gql::parse(q).unwrap(), &store).rows[0][0] {
+                Value::Num(n) => n,
+                ref other => panic!("want num, got {other:?}"),
+            }
+        };
+        // Self-loop once (1) + a-b both orientations (2) = 3.
+        assert_eq!(count("MATCH (a)~[r]~(b) RETURN count(*) AS c"), 3.0);
+        // The same over a single-hop var-length spelling routes through the DFS
+        // walker, which also drops the self-loop's in-side copy.
+        assert_eq!(count("MATCH (a)~[:R]~{1,1}(b) RETURN count(*) AS c"), 3.0);
+        // A directed self-loop is walked once either way (one index touched).
+        assert_eq!(count("MATCH (a)-[r:R]->(b) RETURN count(*) AS c"), 2.0);
+    }
+
+    /// `~` resolves to `Dir::Both` regardless of which side (or a `-`/`~` mix) is
+    /// used, matching either traversal direction of the edge.
+    #[test]
+    fn undirected_tilde_matches_either_direction() {
+        let nd = concat!(
+            "{\"id\":\"josh\",\"labels\":[\"P\"],\"props\":{\"name\":\"josh\"}}\n",
+            "{\"id\":\"vadas\",\"labels\":[\"P\"],\"props\":{\"name\":\"vadas\"}}\n",
+            "{\"id\":\"e1\",\"from\":\"josh\",\"to\":\"vadas\",\"type\":\"KNOWS\",\"props\":{}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        // josh has an OUT edge; the undirected walk still reaches vadas.
+        let mut a = names_of(
+            &run(
+                &crate::gql::parse(
+                    "MATCH (a)~[:KNOWS]~(b) WHERE a.name = 'josh' RETURN b.name AS n",
+                )
+                .unwrap(),
+                &store,
+            ),
+            0,
+        );
+        a.sort();
+        assert_eq!(a, vec!["vadas"]);
+        // vadas has only an IN edge; the undirected walk reaches josh.
+        let b = names_of(
+            &run(
+                &crate::gql::parse(
+                    "MATCH (a)~[:KNOWS]~(b) WHERE a.name = 'vadas' RETURN b.name AS n",
+                )
+                .unwrap(),
+                &store,
+            ),
+            0,
+        );
+        assert_eq!(b, vec!["josh"]);
     }
 
     /// External ids are PRESERVED through ingest and returned by element_id (nodes

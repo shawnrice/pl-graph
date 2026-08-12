@@ -179,6 +179,7 @@ enum Tok {
     Concat, // ||
     RArrow, // ->
     LArrow, // <-
+    Tilde,  // ~ (undirected relationship delimiter)
     Eq,
     Ne,
     Lt,
@@ -218,6 +219,7 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             '+' => out.push(Tok::Plus),
             '/' => out.push(Tok::Slash),
             '%' => out.push(Tok::Percent),
+            '~' => out.push(Tok::Tilde),
             '|' => {
                 if b.get(i + 1) == Some(&'|') {
                     out.push(Tok::Concat);
@@ -931,7 +933,7 @@ impl Parser {
         var_to_idx: &mut HashMap<String, usize>,
     ) -> Result<(), String> {
         let mut prev = self.insert_node(nodes, var_to_idx)?;
-        while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow)) {
+        while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde)) {
             let rel = self.rel()?;
             if rel.where_range.is_some() {
                 return Err("inline WHERE on an INSERT relationship is not supported".into());
@@ -1121,7 +1123,7 @@ impl Parser {
         slots: &mut usize,
         mut from: usize,
     ) -> Result<Plan, String> {
-        while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow)) {
+        while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde)) {
             let rel = self.rel()?;
             let quant = self.opt_quantifier()?;
             let (v2, _lbl2, v2_props, v2_where) = self.node()?; // a hop's landing-node label is ignored for now
@@ -1596,12 +1598,14 @@ impl Parser {
     // rel := '-' '[' ':' R ']' '->'   (out)
     //      | '-' '[' ':' R ']' '-'    (both)
     //      | '<-' '[' ':' R ']' '-'   (in)
-    // rel := ('-' | '<-') '[' [var] ':' Type [ '{' props '}' ] ']' ('->' | '-')
-    // Captures an optional relationship VARIABLE and inline edge PROPERTIES.
+    // rel := ('-' | '~' | '<-') '[' [var] ':' Type [ '{' props '}' ] ']' ('->' | '-' | '~')
+    // Captures an optional relationship VARIABLE and inline edge PROPERTIES. `~` is
+    // the undirected delimiter: like `-`, it carries NO direction, so `~[...]~`
+    // (and any `-`/`~` mix) is `Dir::Both`, exactly as core resolves it.
     fn rel(&mut self) -> Result<Rel, String> {
         let incoming = self.eat(&Tok::LArrow);
-        if !incoming {
-            self.expect(&Tok::Minus)?;
+        if !incoming && !self.eat(&Tok::Minus) && !self.eat(&Tok::Tilde) {
+            return Err(format!("expected `-`, `~`, or `<-` at token {}", self.pos));
         }
         self.expect(&Tok::LBracket)?;
         let var = if matches!(self.peek(), Some(Tok::Ident(_))) {
@@ -1631,11 +1635,13 @@ impl Parser {
         };
         self.expect(&Tok::RBracket)?;
         let dir = if incoming {
-            self.expect(&Tok::Minus)?;
+            if !self.eat(&Tok::Minus) && !self.eat(&Tok::Tilde) {
+                return Err(format!("expected `-` or `~` to close a relationship at token {}", self.pos));
+            }
             Dir::In
         } else if self.eat(&Tok::RArrow) {
             Dir::Out
-        } else if self.eat(&Tok::Minus) {
+        } else if self.eat(&Tok::Minus) || self.eat(&Tok::Tilde) {
             Dir::Both
         } else {
             return Err(format!("malformed relationship at token {}", self.pos));
