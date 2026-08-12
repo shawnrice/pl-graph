@@ -141,11 +141,22 @@ fn is_reserved_word(word: &str) -> bool {
 /// plan (and seed the same index), so the two spellings cannot cost differently.
 fn node_prop_filters(mut plan: Plan, slot: usize, props: Vec<(String, Value)>) -> Plan {
     for (k, val) in props {
-        plan = plan.filter(Expr::Compare {
-            op: CompareOp::Eq,
-            left: Box::new(Expr::Prop { slot, key: k }),
-            right: Box::new(Expr::Lit(val)),
-        });
+        // An inline `{k: null}` constraint is an IS NULL test — it matches a node
+        // whose `k` is null/absent — NOT the three-valued `k = null` (which is UNKNOWN
+        // and matches nothing). Matches core's structural constraint semantics.
+        let f = if val.is_null() {
+            Expr::IsNull {
+                expr: Box::new(Expr::Prop { slot, key: k }),
+                negated: false,
+            }
+        } else {
+            Expr::Compare {
+                op: CompareOp::Eq,
+                left: Box::new(Expr::Prop { slot, key: k }),
+                right: Box::new(Expr::Lit(val)),
+            }
+        };
+        plan = plan.filter(f);
     }
     plan
 }
