@@ -20,7 +20,6 @@ language.jsonl::m_label_negation
 language.jsonl::m_label_wildcard
 language.jsonl::m_nulls_first_overrides_ascending_default
 language.jsonl::m_nulls_last_overrides_descending_default
-language.jsonl::m_numeric_value_functions_8
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_1
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_2
 language.jsonl::m_simple_case_null_subject_never_matches
@@ -63,10 +62,6 @@ tests_a.jsonl::label_expr_or
 tests_a.jsonl::label_expr_wildcard
 tests_a.jsonl::order_by_letin_over_output_column
 tests_a.jsonl::reachable_distinct_3
-tests_b.jsonl::atan2_0_1
-tests_b.jsonl::atan2_1_0
-tests_b.jsonl::atan2_1_1
-tests_b.jsonl::atan2_null
 tests_b.jsonl::avg_duration_errors
 tests_b.jsonl::call_config_bogus_error
 tests_b.jsonl::call_config_pivot_error
@@ -76,8 +71,6 @@ tests_b.jsonl::cast_int_null
 tests_b.jsonl::cast_list
 tests_b.jsonl::exists_bound_a_a_plus
 tests_b.jsonl::exists_bound_a_e_plus
-tests_b.jsonl::list_sort_desc
-tests_b.jsonl::list_sort_nulls_first
 tests_b.jsonl::malformed_num_1e999_error
 tests_b.jsonl::max_total_order
 tests_b.jsonl::min_total_order
@@ -90,8 +83,6 @@ tests_b.jsonl::multiseg_u2_f1_star
 tests_b.jsonl::order_total_order_asc
 tests_b.jsonl::order_total_order_desc
 tests_b.jsonl::oversized_int_error
-tests_b.jsonl::round_digits
-tests_b.jsonl::round_neg_digits
 tests_b.jsonl::sum_date_errors
 tests_c.jsonl::acyclic_mode_count
 tests_c.jsonl::acyclic_mode_no_cycle_back
@@ -277,7 +268,6 @@ tests_e.jsonl::subpath_where_filters_2
 tests_e.jsonl::subpath_where_only_end
 tests_e.jsonl::subpath_where_only_start
 tests_e.jsonl::subpath_where_single_node
-tests_e.jsonl::trim_sql_spec_form
 tests_e.jsonl::value_subquery_aggregate_carol_zero
 tests_e.jsonl::value_subquery_aggregate_dave_deg
 tests_e.jsonl::value_subquery_aggregate_global

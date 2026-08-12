@@ -2525,6 +2525,12 @@ impl Parser {
     // Validates the name and arity here so `eval` only sees well-formed calls.
     fn call(&mut self, name: &str) -> Result<Expr, String> {
         self.expect(&Tok::LParen)?;
+        // `TRIM` has the SQL spec grammar `TRIM([LEADING|TRAILING|BOTH] [char] FROM
+        // src)` (as well as the plain `TRIM(src)`), which the generic comma-arg loop
+        // can't parse — special-case it into the ordinary ltrim/rtrim/trim calls.
+        if name.eq_ignore_ascii_case("trim") {
+            return self.trim_call();
+        }
         let mut args = Vec::new();
         if self.peek() != Some(&Tok::RParen) {
             loop {
@@ -2548,7 +2554,7 @@ impl Parser {
             // 0 args (numeric constants)
             "e" | "pi" => args.is_empty(),
             // 1 arg
-            "abs" | "sign" | "floor" | "ceil" | "ceiling" | "round" | "sqrt" | "exp" | "ln"
+            "abs" | "sign" | "floor" | "ceil" | "ceiling" | "sqrt" | "exp" | "ln" | "log10"
             | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh"
             | "cot" | "degrees" | "radians" | "upper" | "lower" | "trim" | "length" | "size"
             | "head" | "last" | "year" | "month" | "day" | "hour" | "minute" | "second"
@@ -2557,7 +2563,11 @@ impl Parser {
             | "duration" | "to_integer" | "tointeger" | "to_float" | "tofloat" | "to_string"
             | "tostring" | "to_boolean" | "toboolean" | "char_length" | "character_length"
             | "byte_length" | "octet_length" | "reverse" | "tail" | "keys" | "labels" | "type"
-            | "property_names" | "list_sort" | "element_id" => args.len() == 1,
+            | "property_names" | "element_id" => args.len() == 1,
+            // `round(x)` or `round(x, digits)`
+            "round" => args.len() == 1 || args.len() == 2,
+            // `list_sort(list)` / `(list, order)` / `(list, order, nullOrder)`
+            "list_sort" => (1..=3).contains(&args.len()),
             // list algebra (2 args)
             "append" | "list_contains" | "list_union" | "difference" | "intersection" => {
                 args.len() == 2
@@ -2566,7 +2576,7 @@ impl Parser {
             "ltrim" | "rtrim" | "btrim" => args.len() == 1 || args.len() == 2,
             // 2 args
             "starts_with" | "ends_with" | "contains" | "duration_between" | "nullif" | "log"
-            | "power" | "mod" | "left" | "right" | "split" => args.len() == 2,
+            | "power" | "mod" | "left" | "right" | "split" | "atan2" => args.len() == 2,
             // 2 or 3 args
             "range" => args.len() == 2 || args.len() == 3,
             // 3 args
@@ -2583,6 +2593,40 @@ impl Parser {
             ));
         }
         Ok(Expr::Call { name: lname, args })
+    }
+
+    /// Parse the SQL-spec `TRIM` body — the `(` is already consumed. A leading
+    /// `LEADING`/`TRAILING`/`BOTH` (default BOTH) selects the side and desugars to
+    /// `ltrim`/`rtrim`/`trim`; an optional trim character precedes `FROM src`. So
+    /// `TRIM(LEADING 'x' FROM s)` → `ltrim(s, 'x')` and `TRIM(s)` → `trim(s)`. The
+    /// char, when present, is the SECOND argument, matching core.
+    fn trim_call(&mut self) -> Result<Expr, String> {
+        let fname = if self.eat_kw("LEADING") {
+            "ltrim"
+        } else if self.eat_kw("TRAILING") {
+            "rtrim"
+        } else {
+            self.eat_kw("BOTH");
+            "trim"
+        };
+        let args = if self.eat_kw("FROM") {
+            // `TRIM([side] FROM src)` — whitespace trim, no char set.
+            vec![self.expr()?]
+        } else {
+            let e1 = self.expr()?;
+            if self.eat_kw("FROM") {
+                // `TRIM([side] char FROM src)` — char is the 2nd arg.
+                vec![self.expr()?, e1]
+            } else {
+                // Plain `TRIM(src)`.
+                vec![e1]
+            }
+        };
+        self.expect(&Tok::RParen)?;
+        Ok(Expr::Call {
+            name: fname.into(),
+            args,
+        })
     }
 }
 

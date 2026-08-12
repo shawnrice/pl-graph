@@ -5907,21 +5907,39 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         "e" => Value::Num(std::f64::consts::E),
         "pi" => Value::Num(std::f64::consts::PI),
         // numeric (1 arg)
-        "abs" | "sign" | "floor" | "ceil" | "ceiling" | "round" | "sqrt" | "exp" | "ln" | "sin"
+        "abs" | "sign" | "floor" | "ceil" | "ceiling" | "sqrt" | "exp" | "ln" | "log10" | "sin"
         | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "cot"
         | "degrees" | "radians" => scalar_num_fn(name, &args[0]),
+        // `round(x)` rounds to an integer; `round(x, digits)` to `digits` decimal
+        // places (negative rounds left of the point). Half away from zero, matching
+        // core; the `(x*f).round()/f` form is bit-identical (do not reformulate).
+        "round" => match value::num_of(&args[0]) {
+            Some(x) => {
+                let digits = args
+                    .get(1)
+                    .and_then(value::num_of)
+                    .map_or(0, |d| d.trunc() as i32);
+                let f = 10f64.powi(digits);
+                Value::Num((x * f).round() / f)
+            }
+            None => Value::Null,
+        },
         // numeric (2 args). `log(a, b)` is log-base-a of b = ln(b)/ln(a) (matches
         // core's argument order); `mod` is the fn form of `%` (NaN on a zero
         // divisor — it does NOT throw like the `%` OPERATOR, which core reserves for
-        // the operator). NaN/Inf results are KEPT (K4), coerced only at JSON egress.
-        "log" | "power" | "mod" => match (value::num_of(&args[0]), value::num_of(&args[1])) {
-            (Some(x), Some(y)) => Value::Num(match name {
-                "log" => y.ln() / x.ln(),
-                "power" => x.powf(y),
-                _ => x % y,
-            }),
-            _ => Value::Null,
-        },
+        // the operator); `atan2(y, x)` is the two-argument arctangent. NaN/Inf
+        // results are KEPT (K4), coerced only at JSON egress.
+        "log" | "power" | "mod" | "atan2" => {
+            match (value::num_of(&args[0]), value::num_of(&args[1])) {
+                (Some(x), Some(y)) => Value::Num(match name {
+                    "log" => y.ln() / x.ln(),
+                    "power" => x.powf(y),
+                    "atan2" => x.atan2(y),
+                    _ => x % y,
+                }),
+                _ => Value::Null,
+            }
+        }
         // nullif(a, b): NULL when a == b (value-contract equality), else a.
         "nullif" => {
             if !args[0].is_null() && !args[1].is_null() && value::equals(&args[0], &args[1]) {
@@ -5939,7 +5957,9 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         // string (1 arg → string/number)
         "upper" => str_map(&args[0], str::to_uppercase),
         "lower" => str_map(&args[0], str::to_lowercase),
-        "trim" => str_map(&args[0], |s| s.trim().to_string()),
+        // `trim` is both-sides; a 2nd (char-set) arg from the SQL-spec form is
+        // honored by routing through btrim (identical to core's Trim).
+        "trim" => trim_fn("btrim", args),
         // ltrim/rtrim/btrim: 1 arg trims WHITESPACE from that side; a 2nd string
         // arg is the set of characters to strip instead.
         "ltrim" | "rtrim" | "btrim" => trim_fn(name, args),
@@ -6051,11 +6071,46 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             Value::List(v) => Value::Num(f64::from(v.iter().any(|e| value::equals(e, &args[1])))),
             _ => Value::Null,
         },
-        // list_sort → elements ordered by the value contract's total order.
+        // list_sort(list, [order], [nullOrder]) — the value contract's total order,
+        // reversed for `'desc'`, with absolute null placement (`'first'`/`'last'`,
+        // default last). Mirrors ORDER BY / core's compare_sort byte-for-byte. A
+        // stored list never holds NaN (it becomes null at ingest), so `is_null`
+        // covers every nullish element.
         "list_sort" => match &args[0] {
             Value::List(v) => {
+                let descending =
+                    matches!(args.get(1), Some(Value::Str(s)) if s.eq_ignore_ascii_case("desc"));
+                let nulls_first =
+                    matches!(args.get(2), Some(Value::Str(s)) if s.eq_ignore_ascii_case("first"));
                 let mut out = v.clone();
-                out.sort_by(value::cmp_total);
+                out.sort_by(|x, y| {
+                    use std::cmp::Ordering;
+                    match (x.is_null(), y.is_null()) {
+                        (true, true) => Ordering::Equal,
+                        (true, false) => {
+                            if nulls_first {
+                                Ordering::Less
+                            } else {
+                                Ordering::Greater
+                            }
+                        }
+                        (false, true) => {
+                            if nulls_first {
+                                Ordering::Greater
+                            } else {
+                                Ordering::Less
+                            }
+                        }
+                        (false, false) => {
+                            let o = value::cmp_total(x, y);
+                            if descending {
+                                o.reverse()
+                            } else {
+                                o
+                            }
+                        }
+                    }
+                });
                 Value::List(out)
             }
             _ => Value::Null,
@@ -6389,6 +6444,7 @@ fn scalar_num_fn(name: &str, v: &Value) -> Value {
         // falls to NULL through the finite gate below (K4 will KEEP it, like core).
         "exp" => x.exp(),
         "ln" => x.ln(),
+        "log10" => x.log10(),
         "sin" => x.sin(),
         "cos" => x.cos(),
         "tan" => x.tan(),
@@ -7903,6 +7959,58 @@ mod tests {
         assert_eq!(count("MATCH (a)~[:R]~{1,1}(b) RETURN count(*) AS c"), 3.0);
         // A directed self-loop is walked once either way (one index touched).
         assert_eq!(count("MATCH (a)-[r:R]->(b) RETURN count(*) AS c"), 2.0);
+    }
+
+    /// Scalar functions: 2-arg round (incl. negative digits), atan2 (arg order +
+    /// null propagation), log10, TRIM spec forms, and list_sort with order/nullOrder.
+    #[test]
+    fn scalar_fns_batch() {
+        let store = crate::ndjson::from_ndjson("{\"id\":\"n\",\"labels\":[\"V\"],\"props\":{}}").unwrap();
+        let val = |q: &str| -> Value { run(&crate::gql::parse(q).unwrap(), &store).rows[0][0].clone() };
+        let num = |q: &str| -> f64 {
+            match val(q) {
+                Value::Num(n) => n,
+                other => panic!("want num, got {other:?}"),
+            }
+        };
+        // round to N decimal places; negative digits round left of the point.
+        assert_eq!(num("RETURN round(1.2345, 2) AS r"), 1.23);
+        assert_eq!(num("RETURN round(1234.5678, -2) AS r"), 1200.0);
+        assert_eq!(num("RETURN round(2.5) AS r"), 3.0); // 1-arg still works
+        // atan2(y, x): arg order matters; a null arg → NULL.
+        assert!((num("RETURN atan2(1, 1) AS r") - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
+        assert_eq!(num("RETURN atan2(0, 1) AS r"), 0.0);
+        assert!(matches!(val("RETURN atan2(null, 1) AS r"), Value::Null));
+        // log10.
+        assert_eq!(num("RETURN log10(1000) AS r"), 3.0);
+        // TRIM spec forms desugar to trim/ltrim/rtrim with the char as 2nd arg.
+        let s = |q: &str| -> String {
+            match val(q) {
+                Value::Str(x) => x.to_string(),
+                other => panic!("want str, got {other:?}"),
+            }
+        };
+        assert_eq!(s("RETURN TRIM('  hi  ') AS r"), "hi");
+        assert_eq!(s("RETURN TRIM(BOTH FROM '  hi  ') AS r"), "hi");
+        assert_eq!(s("RETURN TRIM(LEADING 'x' FROM 'xxhi') AS r"), "hi");
+        assert_eq!(s("RETURN TRIM(TRAILING 'x' FROM 'hixx') AS r"), "hi");
+        assert_eq!(s("RETURN TRIM('x' FROM 'xxhixx') AS r"), "hi");
+        // list_sort: default ascending, 'desc' reverses, nullOrder places nulls.
+        // Compare list results by their debug rendering (Value is not PartialEq).
+        let list = |q: &str| -> String { format!("{:?}", val(q)) };
+        assert_eq!(
+            list("RETURN list_sort([3,1,2], 'desc') AS r"),
+            "List([Num(3.0), Num(2.0), Num(1.0)])"
+        );
+        assert_eq!(
+            list("RETURN list_sort([3,1,null,2], 'asc', 'first') AS r"),
+            "List([Null, Num(1.0), Num(2.0), Num(3.0)])"
+        );
+        // default null placement is LAST.
+        assert_eq!(
+            list("RETURN list_sort([2,null,1]) AS r"),
+            "List([Num(1.0), Num(2.0), Null])"
+        );
     }
 
     /// An edge-type disjunction `-[:A|B]->` matches an edge whose type is ANY of the

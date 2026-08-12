@@ -11,6 +11,7 @@ Verify every feature: `cargo test --release --lib`; differential_fuzz seeds 1 & 
 - WALK / TRAIL path modes (commit 88010650) — corpus 427->419.
 - Line/block comments + standalone ORDER BY before RETURN (commit e22a41c7) — 419->405.
 - Edge-label disjunction `-[:A|B]->` — 407->391 (16 cases; node-label disjunction `(n:A|B)` stays deferred).
+- TRIM spec-form + round(2-arg)/atan2/log10/list_sort(order,nullOrder) (commit pending) — 391->381 (10 cases).
 
 ## ~~1. Edge-label disjunction~~ DONE — ~~~24 cases~~ 16 cases
 
