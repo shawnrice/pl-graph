@@ -97,10 +97,6 @@ tests_d.jsonl::qsp_multi_gv
 tests_d.jsonl::qsp_per_hop_cross_element
 tests_d.jsonl::qsp_per_hop_permissive
 tests_d.jsonl::qsp_per_hop_target_node
-tests_d.jsonl::shortest_2_group_all
-tests_d.jsonl::shortest_2_groups_synonym
-tests_d.jsonl::shortest_2_keeps_two
-tests_d.jsonl::shortest_k_clamps
 tests_d.jsonl::shortest_k_per_hop_pred
 tests_d.jsonl::vqs_16
 tests_d.jsonl::vqs_22

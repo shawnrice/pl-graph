@@ -22,6 +22,14 @@ pub enum Dir {
 pub enum ShortestSelector {
     Any,
     All,
+    /// `SHORTEST k [GROUP]` (k >= 2): enumerate every trail to each endpoint, order
+    /// by (length, discovery), then keep the first `k` (plain) or every path whose
+    /// length is among the `k` smallest distinct lengths (`group`). `k == 1` reduces
+    /// to `Any`, `k == 1 GROUP` to `All` (handled at parse time).
+    ShortestK {
+        k: u32,
+        group: bool,
+    },
 }
 
 /// The path-restriction mode of a variable-length hop (ISO GQL). It decides which

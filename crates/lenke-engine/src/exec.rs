@@ -5198,6 +5198,11 @@ fn shortest_path(
         Ok(w) => w,
         Err(()) => return empty(),
     };
+    // `SHORTEST k` (k >= 2) needs paths BEYOND the single shortest length, so it
+    // can't ride the BFS below — enumerate trails and select per endpoint instead.
+    if let ShortestSelector::ShortestK { k, group } = selector {
+        return shortest_k_path(batch, store, from, dir, &want, min, max, k, group);
+    }
     let Col::Nodes(src) = batch.slot(from) else {
         return empty();
     };
@@ -5286,6 +5291,8 @@ fn shortest_path(
                 continue; // a `+` quantifier (min 1) excludes the zero-length seed
             }
             match selector {
+                // `ShortestK` returned early to `shortest_k_path`; only Any/All here.
+                ShortestSelector::ShortestK { .. } => unreachable!("ShortestK routed away"),
                 ShortestSelector::Any => {
                     keep.push(row);
                     ends.push(node);
@@ -5342,6 +5349,196 @@ fn shortest_path(
         });
     }
     out
+}
+
+/// Endpoint → its trails as `(length, node chain, edge chain)`, in discovery order.
+type TrailsByEnd = FnvMap<u32, Vec<(u32, Vec<u32>, Vec<u32>)>>;
+
+/// `SHORTEST k [GROUP]` (k >= 2): enumerate every TRAIL from each source (no edge
+/// reuse → finite), group by endpoint, order each endpoint's trails by (length,
+/// discovery), then keep the first `k` (plain) or every trail whose length is among
+/// the `k` smallest distinct lengths (`group`). Mirrors core's `shortest_k_walk`;
+/// the endpoint's own label/property filter is a `Filter` above this, so it selects
+/// k per endpoint here and the filter narrows afterward.
+#[allow(clippy::too_many_arguments)]
+fn shortest_k_path(
+    batch: &Batch,
+    store: &Store,
+    from: usize,
+    dir: Dir,
+    want: &[u32],
+    min: u32,
+    max: Option<u32>,
+    k: u32,
+    group: bool,
+) -> Batch {
+    let empty = || {
+        let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
+        slots.push(Col::Nodes(vec![]));
+        Batch::of(slots)
+    };
+    let Col::Nodes(src) = batch.slot(from) else {
+        return empty();
+    };
+    let track = batch.lineage.is_some();
+    let cap = max.unwrap_or(u32::MAX);
+    let mut keep = Vec::new();
+    let mut ends = Vec::new();
+    let mut bufs = PathBufs::new();
+    for (row, &start) in src.iter().enumerate() {
+        // endpoint -> its trails as (length, node chain, edge chain) in discovery
+        // (DFS) order — the same order the stable length sort tie-breaks on.
+        let mut per_end: TrailsByEnd = FnvMap::default();
+        let mut node_stack = vec![start];
+        let mut edge_stack: Vec<u32> = Vec::new();
+        let mut used: Vec<u32> = Vec::new();
+        collect_trails(
+            store,
+            start,
+            0,
+            min,
+            cap,
+            dir,
+            want,
+            &mut used,
+            &mut node_stack,
+            &mut edge_stack,
+            &mut per_end,
+        );
+        let mut end_ids: Vec<u32> = per_end.keys().copied().collect();
+        end_ids.sort_unstable();
+        for end in end_ids {
+            let mut paths = per_end.remove(&end).unwrap();
+            paths.sort_by_key(|(len, _, _)| *len); // stable: discovery order within a length
+            let selected: Vec<(Vec<u32>, Vec<u32>)> = if group {
+                // Keep every trail at or below the k-th smallest DISTINCT length.
+                let mut distinct: Vec<u32> = Vec::new();
+                for (len, _, _) in &paths {
+                    if distinct.last() != Some(len) {
+                        distinct.push(*len);
+                    }
+                }
+                match distinct
+                    .get((k as usize).min(distinct.len()).saturating_sub(1))
+                    .copied()
+                {
+                    Some(cut) => paths
+                        .into_iter()
+                        .filter(|(l, _, _)| *l <= cut)
+                        .map(|(_, n, e)| (n, e))
+                        .collect(),
+                    None => Vec::new(),
+                }
+            } else {
+                paths
+                    .into_iter()
+                    .take(k as usize)
+                    .map(|(_, n, e)| (n, e))
+                    .collect()
+            };
+            for (nodes, edges) in selected {
+                keep.push(row);
+                ends.push(end);
+                if track {
+                    push_path(
+                        batch,
+                        row,
+                        &nodes,
+                        &edges,
+                        &mut bufs.values,
+                        &mut bufs.offsets,
+                        &mut bufs.edges,
+                        &mut bufs.edge_offsets,
+                    );
+                }
+            }
+        }
+    }
+    let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
+    slots.push(Col::Nodes(ends));
+    let mut out = Batch::of(slots);
+    if track {
+        out.lineage = Some(Lineage {
+            values: bufs.values,
+            offsets: bufs.offsets,
+            edges: bufs.edges,
+            edge_offsets: bufs.edge_offsets,
+        });
+    }
+    out
+}
+
+/// Enumerate every TRAIL (no edge reused) from the source, recording each at every
+/// length in `min..=max` into `per_end` keyed by its current endpoint, with the full
+/// node/edge chain. `used` holds the on-path edge ids; `node_stack`/`edge_stack` the
+/// chain source..`v`. See [`shortest_k_path`].
+#[allow(clippy::too_many_arguments)]
+fn collect_trails(
+    store: &Store,
+    v: u32,
+    len: u32,
+    min: u32,
+    max: u32,
+    dir: Dir,
+    want: &[u32],
+    used: &mut Vec<u32>,
+    node_stack: &mut Vec<u32>,
+    edge_stack: &mut Vec<u32>,
+    per_end: &mut TrailsByEnd,
+) {
+    if len >= min {
+        per_end
+            .entry(v)
+            .or_default()
+            .push((len, node_stack.clone(), edge_stack.clone()));
+    }
+    if len == max {
+        return;
+    }
+    // OUT then IN adjacency, matching the walkers' emission order; a trail forbids
+    // reusing an edge, which also bounds the recursion (depth <= edge count).
+    let out: &[crate::store::Adj] = if matches!(dir, Dir::Out | Dir::Both) {
+        store.out(v)
+    } else {
+        &[]
+    };
+    let inc: &[crate::store::Adj] = if matches!(dir, Dir::In | Dir::Both) {
+        store.inc(v)
+    } else {
+        &[]
+    };
+    let drop_loop = matches!(dir, Dir::Both);
+    for (is_inc, a) in out
+        .iter()
+        .map(|a| (false, a))
+        .chain(inc.iter().map(|a| (true, a)))
+    {
+        if !edge_carries_wanted(store, a, want) || used.contains(&a.eid) {
+            continue;
+        }
+        if is_inc && drop_loop && a.nbr == v {
+            continue;
+        }
+        used.push(a.eid);
+        node_stack.push(a.nbr);
+        edge_stack.push(a.eid);
+        collect_trails(
+            store,
+            a.nbr,
+            len + 1,
+            min,
+            max,
+            dir,
+            want,
+            used,
+            node_stack,
+            edge_stack,
+            per_end,
+        );
+        used.pop();
+        node_stack.pop();
+        edge_stack.pop();
+    }
 }
 
 /// The single shortest path start..node via the FIRST predecessor of each node (the
@@ -8554,6 +8751,53 @@ mod tests {
         );
     }
 
+    /// SHORTEST k (k>=2) keeps the k shortest trails per endpoint by (length,
+    /// discovery); GROUP keeps every trail in the k smallest distinct lengths.
+    /// a->d (1), a->b->d (2), a->c->d (2).
+    #[test]
+    fn shortest_k_selector() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"id\":\"d\",\"labels\":[\"N\"],\"props\":{\"id\":\"d\"}}\n",
+            "{\"from\":\"a\",\"to\":\"d\",\"labels\":[\"R\"],\"props\":{}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{}}\n",
+            "{\"from\":\"b\",\"to\":\"d\",\"labels\":[\"R\"],\"props\":{}}\n",
+            "{\"from\":\"a\",\"to\":\"c\",\"labels\":[\"R\"],\"props\":{}}\n",
+            "{\"from\":\"c\",\"to\":\"d\",\"labels\":[\"R\"],\"props\":{}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let lens = |q: &str| -> Vec<f64> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            let mut v: Vec<f64> = run(&plan, &store)
+                .rows
+                .iter()
+                .map(|r| match r[0] {
+                    Value::Num(x) => x,
+                    ref o => panic!("{o:?}"),
+                })
+                .collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v
+        };
+        // SHORTEST 2 → the two shortest: len 1 and one len 2.
+        assert_eq!(
+            lens("MATCH p = SHORTEST 2 (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN path_length(p) AS len"),
+            vec![1.0, 2.0]
+        );
+        // SHORTEST 2 GROUP → all trails in the 2 smallest lengths (1 and 2): 1,2,2.
+        assert_eq!(
+            lens("MATCH p = SHORTEST 2 GROUP (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN path_length(p) AS len"),
+            vec![1.0, 2.0, 2.0]
+        );
+        // SHORTEST 10 clamps to the 3 available.
+        assert_eq!(
+            lens("MATCH p = SHORTEST 10 (a:N {id:'a'})-[:R]->*(x:N {id:'d'}) RETURN path_length(p) AS len"),
+            vec![1.0, 2.0, 2.0]
+        );
+    }
+
     /// A quantified subpath group binds its inner variables as GROUP lists: each
     /// becomes a list over the repetitions, with `size()` the hop count and `v[i]`
     /// a typed node/edge element so `x[i].prop` resolves. Path a-R(10)->b-R(20)->c.
@@ -8571,7 +8815,7 @@ mod tests {
             let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
             let out = run(&plan, &store);
             assert_eq!(out.rows.len(), 1, "{q}");
-            out.rows[0].clone()
+            out.rows[0].to_vec()
         };
         // {2}: t=c, size(e)=size(x)=size(y)=2, x[0]=a, y[1]=c, e[0].amt=10.
         let r = row(

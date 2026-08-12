@@ -319,15 +319,15 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 
 ### NEXT (baseline 150), remaining group-var + other levers:
 
-- **per-rep WHERE in a group `((x)-[e:R]->(y) WHERE pred){n,m}`** (qsp_group_vars_where_scalar, vqs_8,
-  qsp_per_hop_*, nested_per_rep) — per-repetition predicate over x/e/y. Extend RepeatGroup/var_length
+- **per-rep WHERE in a group `((x)-[e:R]->(y) WHERE pred){n,m}`** (qsp*group_vars_where_scalar, vqs_8,
+  qsp_per_hop*\*, nested_per_rep) — per-repetition predicate over x/e/y. Extend RepeatGroup/var_length
   DFS with a captured predicate evaluated per hop (bind x=current,e=edge,y=next). Overlaps per-hop edge WHERE.
 - **multi-hop group unit `((x)-[e1]->(m)-[e2]->(y)){n}`** (gv_bind_each_rep_2hop) — k>1: the flat stride
   becomes verts[rep*k+p]; generalize push_group_cols with the unit's hop count k + per-position slots.
 - **WITH-carry of a group list** (gv_carry_through_with: `WITH e AS hops … hops[1].amt`) — the group list
   survives a WITH projection; needs the elem-kind (node/edge) to carry through the WITH rebind.
 - **nested groups** (vqs_16, nested_paren_varying, nested_outer_gv) — list-of-lists; DEFER (bind_unit recursion).
-- **SHORTEST k>=2** (4: shortest_2_*, shortest_k_clamps) — core shortest_k_walk (enumerate trails, sort by
+- **SHORTEST k>=2** (4: shortest*2*\*, shortest_k_clamps) — core shortest_k_walk (enumerate trails, sort by
   length, keep first k / k length-groups). **per-hop edge WHERE** (~8) — thread predicate into varlen/shortest.
 - **VALUE scalar subquery / uncorrelated multi-pattern EXISTS** (9). **multiseg_u** (6, dual-anchor, HARD).
 - VALUE-CONTRACT (leave/surface): range_bounded, num_string_overflow, distinct_nan, sum/avg-over-temporal, CAST.

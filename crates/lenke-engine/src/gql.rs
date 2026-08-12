@@ -1178,7 +1178,7 @@ impl Parser {
             return match k {
                 1 if group => Ok(Some(ShortestSelector::All)),
                 1 => Ok(Some(ShortestSelector::Any)),
-                _ => Err("SHORTEST k for k other than 1 is not supported".into()),
+                _ => Ok(Some(ShortestSelector::ShortestK { k: k as u32, group })),
             };
         }
         Ok(None)
