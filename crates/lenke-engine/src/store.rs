@@ -827,6 +827,24 @@ impl Store {
         self.etype_name(etype)
     }
 
+    /// All of edge `eid`'s labels — its type (first) then any secondary labels
+    /// (multi-label edges), in that order.
+    #[must_use]
+    pub fn edge_labels_of(&self, eid: u32) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(t) = self.edge_type_name(eid) {
+            out.push(t);
+        }
+        if let Some(extra) = self.edge_extra.get(&eid) {
+            for &tid in extra {
+                if let Some(name) = self.etype_name(tid) {
+                    out.push(name);
+                }
+            }
+        }
+        out
+    }
+
     /// A node's preserved external id (for `element_id`), or `None` out of range.
     #[must_use]
     pub fn node_ext_id(&self, id: u32) -> Option<Arc<str>> {

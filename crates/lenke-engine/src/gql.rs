@@ -750,6 +750,15 @@ impl Parser {
             self.path_mode = PathMode::Simple;
         } else if self.eat_kw("ACYCLIC") {
             self.path_mode = PathMode::Acyclic;
+        } else if self.eat_kw("REPEATABLE") {
+            // `REPEATABLE ELEMENTS` — the ISO match mode that allows reusing any
+            // element: a WALK.
+            self.eat_kw("ELEMENTS");
+            self.path_mode = PathMode::Walk;
+        } else if self.eat_kw("DIFFERENT") {
+            // `DIFFERENT EDGES` — no edge reused: the default TRAIL.
+            self.eat_kw("EDGES");
+            self.path_mode = PathMode::Trail;
         }
         // A comma-separated list of patterns, joined on shared variables. Each
         // pattern parses in its OWN slot space; join maps a shared variable's

@@ -59,8 +59,6 @@ tests_e.jsonl::group_by_non_returned_key
 tests_e.jsonl::group_by_without_aggregate_is_distinct
 tests_e.jsonl::is_typed_closed_record_1
 tests_e.jsonl::is_typed_closed_record_2
-tests_e.jsonl::match_mode_different_edges
-tests_e.jsonl::match_mode_repeatable_elements
 tests_f.jsonl::contains_window
 tests_f.jsonl::counting_edges_where_14
 tests_f.jsonl::distinct_nan_1
@@ -71,7 +69,6 @@ tests_f.jsonl::fused_pipeline_13
 tests_f.jsonl::inline_constraint_14
 tests_f.jsonl::inline_constraint_15
 tests_f.jsonl::inline_constraint_per_row
-tests_f.jsonl::label_disjunction_7
 tests_f.jsonl::num_string_overflow_1
 tests_f.jsonl::num_string_overflow_2
 tests_f.jsonl::num_string_overflow_4
@@ -79,5 +76,4 @@ tests_f.jsonl::page_before_projection_1
 tests_f.jsonl::range_bounded_2
 tests_f.jsonl::range_bounded_3
 tests_f.jsonl::range_float_step_stall
-tests_f.jsonl::size_labels_edge
 tests_f.jsonl::zero_bound_3

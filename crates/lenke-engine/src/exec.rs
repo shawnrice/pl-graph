@@ -6481,6 +6481,32 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                             items.sort_by(value::cmp_total);
                             Value::List(items)
                         }
+                        // An edge: `labels(e)` is its label list (type first, then any
+                        // secondary labels); `keys`/`property_names` its present edge
+                        // property keys, sorted.
+                        Value::Num(id) if matches!(arg, Col::Edges(_)) => {
+                            let eid = id as u32;
+                            let mut items: Vec<Value> = if name == "labels" {
+                                store
+                                    .edge_labels_of(eid)
+                                    .into_iter()
+                                    .map(|l| Value::Str(l.into()))
+                                    .collect()
+                            } else {
+                                store
+                                    .edge_prop_keys()
+                                    .into_iter()
+                                    .filter(|k| store.has_edge_prop(eid, k))
+                                    .map(|k| Value::Str(k.into()))
+                                    .collect()
+                            };
+                            if name == "labels" {
+                                // Edge labels keep TYPE-first order (not sorted).
+                            } else {
+                                items.sort_by(value::cmp_total);
+                            }
+                            Value::List(items)
+                        }
                         _ => Value::Null,
                     })
                     .collect();
