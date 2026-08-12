@@ -105,14 +105,17 @@ Still DEFERRED (hard / out of scope): `((..)){n}` subpath groups (~85 — the la
 - ~~Label algebra orig~~ (~9): `(n:A&B)` conjunction (AND of label filters — seed Scan on first, filter the rest), `(n:!A)` negation, `(n:%)` wildcard (any label), `(n IS Person)` IS-introducer (= `:Person`), edge `-[:!T]->` negation, label disjunction in a WHERE predicate (`x:A|B`). Medium; the `&` conjunction and `IS` introducer are the most tractable.
 - **THE BIG LEVER: parenthesized subpath-group quantification `((..)){n,m}`** (~85 cases, tests_d/tests_b). A genuine feature: a parenthesized path segment repeated n..m times, binding the group's variables per repetition. This is the single largest remaining cluster but a substantial implementation (new IR for a repeated sub-pattern + per-rep variable scoping + interaction with path modes). Assess carefully before committing; may warrant its own scouting pass. If not taken, it + the other hard-deferred features (per-hop var-length WHERE, FOR..IN, SHORTEST k>=2) + intentional divergences are the floor — STOP with a final summary.
 
+## Round 4 — DONE so far: landing-node labels (commit 4b9dcf59, 310->289, 21 cases — endpoint labels in COUNT{}/EXISTS{} subqueries + landing label-disjunction). NEW deferred: reverse-correlated subquery where the outer var is the hop's LANDING (`COUNT { (m)-[:R]->(n) }`, `(m)<-[:R]-(n)`, `(m:Target)-[:R]->(n)`) — needs the body to traverse from the bound endpoint backward (~6 cases).
 
-## Round 4 — tractable tail found at baseline 310 (NOT yet exhausted — keep going, do not stop)
+## Round 4 (cont) — tractable tail found at baseline 310 (NOT yet exhausted — keep going, do not stop)
+
 Re-categorized the 309 remaining: 25 intentional "core rejects" + 285 engine!=core. The 285 = ((..)){n} subpath group (~85, the big lever), per-hop var-length WHERE (~17), FOR..IN/WITH OFFSET (~12), SHORTEST k>=2 (~5) — all hard-deferred — PLUS this tractable tail worth investigating (each cluster: dump a case, run engine vs core, find the divergence):
+
 - **COUNT{} / EXISTS{} subquery variants** (~15: count_subquery_degree_3..12, exists_count_semi_join_1..5): endpoint LABELS inside the subquery (`(n)-[:R]->(:Target)`), INCOMING direction (`(m)<-[:R]-(n)`, `(m)-[:R]->(n)`), `WHERE true` bodies, and `count(DISTINCT a)`. Likely the correlated-subquery body doesn't handle an endpoint label / reversed hop / the start not being the outer var. HIGH VALUE if a common root cause.
 - **CAST edge cases** (~3: cast_bool `CAST('yes' AS BOOL)`, cast_list `CAST('ab' AS LIST)`, cast_int_null `CAST('nope' AS INT)`): string→bool/list/int coercions; check value::cast vs core.
 - **Total order** (~4: order_total_order_asc/desc, min_total_order, max_total_order): a sort/min/max total-order nuance (likely NaN/null placement or mixed-type) — compare vs core's cmp_total.
 - **Implicit grouping + ORDER BY** (~2: m_implicit_grouping, group_by_aggregate — `RETURN s.name, count(*) ORDER BY s.name`): investigate why the grouped projection + ORDER BY over a group key diverges (row order? the ORDER BY hidden-column path with an aggregate?).
 - **Temporal compares** (~few: temporal_timestamp_ge, temporal_duration_unordered_count_zero): DURATION/DATETIME/TIMESTAMP literal comparisons.
-- **count(*) arithmetic** (count_star_shortcut_plus1 `count(*) + 1`), order_by_letin_over_output_column (LET in ORDER BY).
+- **count(\*) arithmetic** (count_star_shortcut_plus1 `count(*) + 1`), order_by_letin_over_output_column (LET in ORDER BY).
 
 STOP only once THIS tail is worked and only ((..)){n} + per-hop-WHERE + FOR..IN + SHORTEST-k>=2 + edge-label-negation + intentional divergences remain.
