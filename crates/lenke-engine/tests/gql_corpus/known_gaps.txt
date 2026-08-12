@@ -32,7 +32,6 @@ tests_c.jsonl::temporal_duration_unordered_count_zero
 tests_d.jsonl::call_inline_count
 tests_d.jsonl::call_scope_isolation_total
 tests_d.jsonl::decorrelate_scope_isolation
-tests_d.jsonl::gv_carry_through_with
 tests_d.jsonl::nested_outer_gv_2
 tests_d.jsonl::nested_paren_lol
 tests_d.jsonl::nested_paren_varying_1

@@ -2770,6 +2770,29 @@ impl Parser {
     fn with_clause(&mut self, plan: Plan) -> Result<Plan, String> {
         let distinct = self.eat_kw("DISTINCT");
         let items = self.return_items()?;
+        // Carry group-variable list typing across the WITH boundary: `WITH e AS hops`
+        // (where `e` is an edge group list) must keep `hops` an EDGE list, so a later
+        // `hops[i].amt` still resolves the edge property. A bare `Slot` item re-projects
+        // to output column `i` (item order, no aggregate), so map the old
+        // node-/edge-list slots onto their new columns.
+        if !items.iter().any(RetItem::has_agg) {
+            let (mut new_node, mut new_edge) = (HashSet::new(), HashSet::new());
+            for (i, it) in items.iter().enumerate() {
+                if let RetItem::Key(_, Expr::Slot(s)) = it {
+                    if self.group_node_slots.contains(s) {
+                        new_node.insert(i);
+                    }
+                    if self.group_edge_slots.contains(s) {
+                        new_edge.insert(i);
+                    }
+                }
+            }
+            self.group_node_slots = new_node;
+            self.group_edge_slots = new_edge;
+        } else {
+            self.group_node_slots.clear();
+            self.group_edge_slots.clear();
+        }
         let (mut plan, out_names) = apply_items(plan, &items);
         if distinct {
             plan = plan.distinct();

@@ -9734,6 +9734,35 @@ mod tests {
         assert!(matches!(r[0], Value::Num(x) if x == 2.0));
     }
 
+    /// A group-variable EDGE list keeps its element typing across a `WITH … AS`
+    /// rename: `WITH e AS hops` leaves `hops[i].amt` resolving the edge property, not
+    /// NULL. (The parser remaps the edge-/node-list slot sets through the WITH.)
+    #[test]
+    fn group_variable_edge_typing_survives_with_rename() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{\"amt\":11}}\n",
+            "{\"from\":\"b\",\"to\":\"c\",\"labels\":[\"R\"],\"props\":{\"amt\":22}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let plan = crate::opt::optimize_indexed(
+            crate::gql::parse(
+                "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){2} (t) \
+                 WITH e AS hops, t RETURN t.id AS tid, hops[1].amt AS amt2, hops[0].amt AS amt1",
+            )
+            .unwrap(),
+            &store,
+        );
+        let out = run(&plan, &store);
+        assert_eq!(out.rows.len(), 1);
+        let r = out.rows[0].to_vec();
+        assert!(matches!(&r[0], Value::Str(s) if &**s == "c"));
+        assert!(matches!(r[1], Value::Num(x) if x == 22.0)); // hops[1].amt
+        assert!(matches!(r[2], Value::Num(x) if x == 11.0)); // hops[0].amt
+    }
+
     /// A standalone FILTER clause filters the working table, and repeated statement-
     /// position ORDER BY … LIMIT compose (page then re-page). n = 1,5,9.
     #[test]
