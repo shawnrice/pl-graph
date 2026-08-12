@@ -28,6 +28,23 @@ type ParsedNode = (
     Vec<(String, Value)>,
     Option<(usize, usize)>,
     Option<LabelExpr>,
+    // Correlated inline-property expressions `{k: <expr>}` (see `props`), captured as
+    // token spans and lowered to `k = <expr>` filters once the node's slot is bound.
+    PropExprs,
+);
+
+/// Correlated inline-property values `{k: <expr>}` captured as `(key, token-span)`
+/// pairs — parsed to filters later (see `props` / `apply_prop_exprs`).
+type PropExprs = Vec<(String, (usize, usize))>;
+
+/// A parsed node in a context that does not carry correlated inline-property
+/// expressions (see `node_plain`) — `ParsedNode` without its trailing `prop_exprs`.
+type PlainNode = (
+    Option<String>,
+    Option<String>,
+    Vec<(String, Value)>,
+    Option<(usize, usize)>,
+    Option<LabelExpr>,
 );
 
 /// A boolean label expression (`%` = any, a label, `!`/`&`/`|`), parsed from a node's
@@ -857,7 +874,7 @@ impl Parser {
             // re-binds an existing one) rewinds and takes the correct hash join.
             let saved = self.pos;
             if matches!(self.peek(), Some(Tok::LParen)) {
-                let probe = self.node()?;
+                let probe = self.node_plain()?;
                 let start = match &probe {
                     (Some(v), None, props, None, None) if props.is_empty() => scope.get(v).copied(),
                     _ => None,
@@ -1446,7 +1463,7 @@ impl Parser {
         selector: crate::ir::ShortestSelector,
     ) -> Result<(Plan, HashMap<String, usize>, usize), String> {
         let mut scope: HashMap<String, usize> = HashMap::new();
-        let (va, la, va_props, va_where, _va_le) = self.node()?;
+        let (va, la, va_props, va_where, _va_le) = self.node_plain()?;
         if let Some(v) = &va {
             scope.insert(v.clone(), 0);
         }
@@ -1461,7 +1478,7 @@ impl Parser {
         } else {
             return Err("a shortest path requires a `*`, `+`, or `{n,m}` quantifier".into());
         };
-        let (vb, _lb, vb_props, vb_where, _vb_le) = self.node()?;
+        let (vb, _lb, vb_props, vb_where, _vb_le) = self.node_plain()?;
         if va_where.is_some() || vb_where.is_some() {
             return Err("inline WHERE on a shortest-path node is not supported".into());
         }
@@ -1677,7 +1694,7 @@ impl Parser {
         self.expect(&Tok::Colon)?;
         let label = self.ident()?;
         let props = if matches!(self.peek(), Some(Tok::LBrace)) {
-            self.props()?
+            self.literal_props("a _MERGE key")?
         } else {
             Vec::new()
         };
@@ -1909,7 +1926,7 @@ impl Parser {
             }
         }
         let props = if matches!(self.peek(), Some(Tok::LBrace)) {
-            self.props()?
+            self.literal_props("an inserted node")?
         } else {
             Vec::new()
         };
@@ -1973,22 +1990,103 @@ impl Parser {
         Ok(e)
     }
 
-    fn props(&mut self) -> Result<Vec<(String, Value)>, String> {
+    /// Inline property map `{k: v, …}`. A value is a plain LITERAL when
+    /// `literal_value` consumes it whole (the next token is a `,` or `}`); anything
+    /// else — `{n: a.n}`, `{n: $p + 1}` — is a correlated EXPRESSION whose token span
+    /// is CAPTURED here and lowered later (once the element's slot is bound) as the
+    /// filter `k = <expr>`, the exact equivalent of an inline `WHERE k = <expr>`. The
+    /// two return vectors keep literals (seedable) and expressions apart; a position
+    /// that only permits literals (INSERT / _MERGE / CALL config) rejects a non-empty
+    /// expression vector.
+    fn props(&mut self) -> Result<(Vec<(String, Value)>, PropExprs), String> {
         self.expect(&Tok::LBrace)?;
-        let mut out = Vec::new();
+        let mut lits = Vec::new();
+        let mut exprs = Vec::new();
         if self.eat(&Tok::RBrace) {
-            return Ok(out);
+            return Ok((lits, exprs));
         }
         loop {
             let key = self.ident()?;
             self.expect(&Tok::Colon)?;
-            out.push((key, self.literal_value()?));
+            let save = self.pos;
+            match self.literal_value() {
+                Ok(v) if matches!(self.peek(), Some(Tok::Comma) | Some(Tok::RBrace)) => {
+                    lits.push((key, v));
+                }
+                _ => {
+                    self.pos = save;
+                    exprs.push((key, self.capture_prop_value()));
+                }
+            }
             if !self.eat(&Tok::Comma) {
                 break;
             }
         }
         self.expect(&Tok::RBrace)?;
-        Ok(out)
+        Ok((lits, exprs))
+    }
+
+    /// A property map in a position that permits ONLY literal values (INSERT / _MERGE
+    /// / CALL config) — a correlated `{k: <expr>}` is rejected with a context message.
+    fn literal_props(&mut self, ctx: &str) -> Result<Vec<(String, Value)>, String> {
+        let (lits, exprs) = self.props()?;
+        if !exprs.is_empty() {
+            return Err(format!(
+                "{ctx} property values must be literals, not expressions"
+            ));
+        }
+        Ok(lits)
+    }
+
+    /// Capture the token span of a non-literal inline-property VALUE: from the cursor
+    /// to the first top-level `,` (next property) or `}` (map close), tracking bracket
+    /// depth so a nested `(…)`/`[…]`/`{…}` inside the value does not end it. Parsed as
+    /// an expression later by `parse_captured_where`, like an inline WHERE.
+    fn capture_prop_value(&mut self) -> (usize, usize) {
+        let start = self.pos;
+        let mut depth = 0i32;
+        while let Some(t) = self.toks.get(self.pos) {
+            match t {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket => depth -= 1,
+                Tok::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Tok::Comma if depth == 0 => break,
+                _ => {}
+            }
+            self.pos += 1;
+        }
+        (start, self.pos)
+    }
+
+    /// Lower captured inline-property expressions (see `props`) into `k = <expr>`
+    /// filters over the element at `slot`, with `scope` carrying every binding so a
+    /// correlated value (`(b {n: a.n})`) resolves the outer variable. A no-op when
+    /// `exprs` is empty (the common case — no cursor or scope is touched then).
+    fn apply_prop_exprs(
+        &mut self,
+        mut plan: Plan,
+        slot: usize,
+        exprs: PropExprs,
+        scope: &HashMap<String, usize>,
+    ) -> Result<Plan, String> {
+        if exprs.is_empty() {
+            return Ok(plan);
+        }
+        self.scope = scope.clone();
+        for (k, range) in exprs {
+            let val = self.parse_captured_where(range)?;
+            plan = plan.filter(Expr::Compare {
+                op: CompareOp::Eq,
+                left: Box::new(Expr::Prop { slot, key: k }),
+                right: Box::new(val),
+            });
+        }
+        Ok(plan)
     }
 
     // A literal property value: number, string, the keyword true/false/null, or a
@@ -2058,7 +2156,7 @@ impl Parser {
             let plan = self.grouped_subpattern(&mut scope, &mut slots)?;
             return Ok((plan, scope, slots));
         }
-        let (var, label, props, where_range, label_expr) = self.node()?;
+        let (var, label, props, where_range, label_expr, prop_exprs) = self.node()?;
         if let Some(v) = var {
             scope.insert(v, slots);
         }
@@ -2076,6 +2174,7 @@ impl Parser {
             self.scope = scope.clone();
             seed = seed.filter(self.parse_captured_where(r)?);
         }
+        seed = self.apply_prop_exprs(seed, from, prop_exprs, &scope)?;
         let plan = self.extend_chain(seed, &mut scope, &mut slots, from)?;
         Ok((plan, scope, slots))
     }
@@ -2090,7 +2189,7 @@ impl Parser {
         scope: &mut HashMap<String, usize>,
         slots: &mut usize,
     ) -> Result<Plan, String> {
-        let (var, label, props, where_range, label_expr) = self.node()?;
+        let (var, label, props, where_range, label_expr, prop_exprs) = self.node()?;
         if let Some(v) = var {
             scope.insert(v, *slots);
         }
@@ -2104,6 +2203,7 @@ impl Parser {
             self.scope = scope.clone();
             seed = seed.filter(self.parse_captured_where(r)?);
         }
+        seed = self.apply_prop_exprs(seed, from, prop_exprs, scope)?;
         let mut plan = self.extend_chain(seed, scope, slots, from)?;
         if self.eat_kw("WHERE") {
             self.scope = scope.clone();
@@ -2150,7 +2250,7 @@ impl Parser {
                 // landing) is valid when only the group variables are used.
                 let (v2, v2_label, v2_props, v2_where, v2_le) =
                     if matches!(self.peek(), Some(Tok::LParen)) {
-                        self.node()?
+                        self.node_plain()?
                     } else {
                         (None, None, Vec::new(), None, None)
                     };
@@ -2243,7 +2343,7 @@ impl Parser {
             }
             let rel = self.rel()?;
             let quant = self.opt_quantifier()?;
-            let (v2, v2_label, v2_props, v2_where, v2_le) = self.node()?;
+            let (v2, v2_label, v2_props, v2_where, v2_le, v2_prop_exprs) = self.node()?;
             // A relationship variable, inline edge properties, or an inline edge
             // WHERE require binding the edge as a slot (edge at `slots`, node at
             // `slots+1`) so `e.k` can resolve.
@@ -2413,6 +2513,10 @@ impl Parser {
             // Inline props on the landing node filter it, exactly as a WHERE would.
             // (`from` is now that node's slot in every branch above.)
             plan = node_prop_filters(plan, from, v2_props);
+            // A correlated inline-property expression `(b {n: a.n})` — lowered to the
+            // filter `b.n = a.n`, the exact equivalent of `(b WHERE b.n = a.n)`, with
+            // every outer binding in scope.
+            plan = self.apply_prop_exprs(plan, from, v2_prop_exprs, scope)?;
             // Inline `WHERE` on the landing node — an arbitrary predicate, applied
             // with the node (and everything bound so far) in scope.
             if let Some(r) = v2_where {
@@ -2505,8 +2609,8 @@ impl Parser {
     fn parse_subpath_group(&mut self) -> Result<SubpathGroup, String> {
         self.expect(&Tok::LParen)?; // the group's own opening paren
         let bad_inner =
-            |n: &ParsedNode| n.1.is_some() || n.4.is_some() || !n.2.is_empty() || n.3.is_some();
-        let first = self.node()?;
+            |n: &PlainNode| n.1.is_some() || n.4.is_some() || !n.2.is_empty() || n.3.is_some();
+        let first = self.node_plain()?;
         if bad_inner(&first) {
             return Err(
                 "a label/property/WHERE on a subpath-group inner node is not supported yet".into(),
@@ -2549,7 +2653,7 @@ impl Parser {
             //  - VARIABLE `{a,b}` but ANONYMOUS endpoints: an endpoint-only nested
             //    group, desugared to a var-length by the caller (single outer rep only).
             if let Some((imin, imax)) = self.opt_quantifier()? {
-                let n = self.node()?;
+                let n = self.node_plain()?;
                 if bad_inner(&n) {
                     return Err(
                         "a label/property/WHERE on a subpath-group inner node is not \
@@ -2611,7 +2715,7 @@ impl Parser {
                     inner_quant: Some((imin, imax)),
                 });
             }
-            let n = self.node()?;
+            let n = self.node_plain()?;
             if bad_inner(&n) {
                 return Err(
                     "a label/property/WHERE on a subpath-group inner node is not supported yet"
@@ -2744,7 +2848,7 @@ impl Parser {
             },
         }
         let bad_inner =
-            |n: &ParsedNode| n.1.is_some() || n.4.is_some() || !n.2.is_empty() || n.3.is_some();
+            |n: &PlainNode| n.1.is_some() || n.4.is_some() || !n.2.is_empty() || n.3.is_some();
         let noinner = "a label/property/WHERE on a nested subpath-group inner node is not \
                        supported yet";
         self.expect(&Tok::LParen)?; // outer group `(`
@@ -2757,14 +2861,14 @@ impl Parser {
         // sequence `<node> (<rel> [quant] <node>)+` where a quantified hop is a Sub.
         let (outer_start, segs): (Option<String>, Vec<Seg>) = if family3 {
             self.expect(&Tok::LParen)?; // inner group `(`
-            let x = self.node()?;
+            let x = self.node_plain()?;
             if bad_inner(&x) {
                 return Err(noinner.into());
             }
             let mut inner: Vec<Seg> = Vec::new();
             loop {
                 let rel = self.rel()?;
-                let n = self.node()?;
+                let n = self.node_plain()?;
                 if bad_inner(&n) {
                     return Err(noinner.into());
                 }
@@ -2795,7 +2899,7 @@ impl Parser {
                 }],
             )
         } else {
-            let start = self.node()?;
+            let start = self.node_plain()?;
             if bad_inner(&start) {
                 return Err(noinner.into());
             }
@@ -2805,7 +2909,7 @@ impl Parser {
                 let epred = self.edge_pred_from_rel(&rel)?;
                 if let Some((imin, imax)) = self.opt_quantifier()? {
                     // A quantified hop `-[e]->{lo,hi}` — a Sub with a bare single-hop inner.
-                    let n = self.node()?;
+                    let n = self.node_plain()?;
                     if bad_inner(&n) {
                         return Err(noinner.into());
                     }
@@ -2823,7 +2927,7 @@ impl Parser {
                         target: n.0,
                     });
                 } else {
-                    let n = self.node()?;
+                    let n = self.node_plain()?;
                     if bad_inner(&n) {
                         return Err(noinner.into());
                     }
@@ -2858,7 +2962,7 @@ impl Parser {
         // endpoint, binds…]`, so the endpoint slot comes FIRST, then one bind slot per
         // named group variable.
         let (tvar, t_label, t_props, t_where, t_le) = if matches!(self.peek(), Some(Tok::LParen)) {
-            self.node()?
+            self.node_plain()?
         } else {
             (None, None, Vec::new(), None, None)
         };
@@ -3094,7 +3198,7 @@ impl Parser {
                 "edge properties / an inline edge WHERE on OPTIONAL MATCH are not supported".into(),
             );
         }
-        let (v2, _lbl2, v2_props, v2_where, _v2_le) = self.node()?;
+        let (v2, _lbl2, v2_props, v2_where, _v2_le) = self.node_plain()?;
         if !v2_props.is_empty() || v2_where.is_some() {
             return Err(
                 "inline properties on the OPTIONAL MATCH landing node are not supported; use WHERE"
@@ -3135,7 +3239,7 @@ impl Parser {
     /// than scanning afresh). A fresh/disconnected subsequent pattern — one whose
     /// first node is unbound — is not supported in this subset.
     fn match_continue(&mut self, plan: Plan) -> Result<Plan, String> {
-        let (var, label, props, start_where, label_expr) = self.node()?;
+        let (var, label, props, start_where, label_expr) = self.node_plain()?;
         // A continuing MATCH whose first node is a FRESH (unbound) variable is a new
         // INDEPENDENT pattern, cross-joined with the working table (`MATCH (p:P) MATCH
         // (q:Q) …`) — parsed in its own slot space, then joined on any shared variable.
@@ -3390,7 +3494,7 @@ impl Parser {
         if !self.eat_kw("MATCH") {
             return Err("a CALL subquery must begin with MATCH".into());
         }
-        let (var, label, props, start_where, _le) = self.node()?;
+        let (var, label, props, start_where, _le) = self.node_plain()?;
         let Some(v) = var else {
             return Err("a CALL subquery pattern must start from a scope variable".into());
         };
@@ -3550,7 +3654,7 @@ impl Parser {
             .ok_or_else(|| format!("unknown procedure `{name}`"))?;
         self.expect(&Tok::LParen)?;
         let config = if matches!(self.peek(), Some(Tok::LBrace)) {
-            self.props()?
+            self.literal_props("a CALL config")?
         } else {
             Vec::new()
         };
@@ -3638,6 +3742,19 @@ impl Parser {
         }
     }
 
+    /// `node()` for the contexts that do NOT support a correlated inline-property
+    /// expression `{k: <expr>}` — everything except a pattern's anchor and hop-landing
+    /// nodes. A captured expression here is an explicit error, never a silent drop.
+    fn node_plain(&mut self) -> Result<PlainNode, String> {
+        let (v, l, p, w, le, exprs) = self.node()?;
+        if !exprs.is_empty() {
+            return Err(
+                "an inline property expression is only supported on a MATCH pattern node; use an inline WHERE here".into(),
+            );
+        }
+        Ok((v, l, p, w, le))
+    }
+
     // node := '(' [var] [':' Label] ')'
     fn node(&mut self) -> Result<ParsedNode, String> {
         self.expect(&Tok::LParen)?;
@@ -3660,10 +3777,10 @@ impl Parser {
         // the exact equivalent of `WHERE n.k = v AND …`. It lowers to the SAME `Eq`
         // filters (see `node_prop_filters`), so the two spellings optimize to the
         // same plan and seed the same index — equivalent spellings cost the same.
-        let props = if matches!(self.peek(), Some(Tok::LBrace)) {
+        let (props, prop_exprs) = if matches!(self.peek(), Some(Tok::LBrace)) {
             self.props()?
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         // Inline `WHERE pred` after the label/props: an arbitrary predicate on the
         // node, equivalent to a trailing `WHERE`. Captured now, parsed once the
@@ -3674,7 +3791,7 @@ impl Parser {
             None
         };
         self.expect(&Tok::RParen)?;
-        Ok((var, label, props, where_range, label_expr))
+        Ok((var, label, props, where_range, label_expr, prop_exprs))
     }
 
     /// Parse a boolean label expression: `factor ('&' factor)* ('|' …)*` with `!`
@@ -3758,7 +3875,15 @@ impl Parser {
             }
         }
         let props = if matches!(self.peek(), Some(Tok::LBrace)) {
-            self.props()?
+            let (lits, exprs) = self.props()?;
+            if !exprs.is_empty() {
+                // An inline EDGE property expression `-[:R {w: a.n}]->` — use an inline
+                // edge `WHERE` instead (the correlated-edge lowering lives there).
+                return Err(
+                    "an inline edge property expression is not supported; use an inline WHERE on the edge".into(),
+                );
+            }
+            lits
         } else {
             Vec::new()
         };
@@ -4873,7 +4998,7 @@ impl Parser {
         // MATCH (a)-[:R]->(b) }` — the full-statement form; accept it as sugar.
         self.eat_kw("MATCH");
         let outer_width = self.slots;
-        let (var, label, props, start_where, le) = self.node()?;
+        let (var, label, props, start_where, le) = self.node_plain()?;
         let Some(v) = var else {
             return Err(format!("{kw} pattern must start from a bound variable"));
         };
@@ -4915,7 +5040,7 @@ impl Parser {
                     "a bound edge / edge properties on a landing-correlated {kw} is not supported"
                 ));
             }
-            let (vb, vb_label, vb_props, vb_where, vb_le) = self.node()?;
+            let (vb, vb_label, vb_props, vb_where, vb_le) = self.node_plain()?;
             let Some(vb) = vb else {
                 return Err(format!("{kw} must correlate on a bound variable"));
             };
@@ -5417,6 +5542,67 @@ mod tests {
             &store
         ))
         .is_empty());
+    }
+
+    /// A CORRELATED inline-property value `(b {k: a.k})` — an expression, not a
+    /// literal — lowers to the filter `b.k = a.k`, the exact equivalent of the
+    /// `(b WHERE b.k = a.k)` spelling (equivalent spellings cost the same).
+    #[test]
+    fn inline_property_expression_matches_where() {
+        // A chain where a hop lands on a node whose age equals the source's.
+        let mut b = Builder::default();
+        let a = b.node(&["P"], &[("age", n(30.0))]);
+        let same_age = b.node(&["P"], &[("age", n(30.0))]);
+        let diff_age = b.node(&["P"], &[("age", n(40.0))]);
+        b.edge(a, same_age, "R");
+        b.edge(a, diff_age, "R");
+        let store = b.build();
+        let same = |inline: &str, wher: &str| {
+            let x = bag(&run(&super::parse(inline).unwrap(), &store));
+            let y = bag(&run(&super::parse(wher).unwrap(), &store));
+            assert_eq!(x, y, "`{inline}` vs `{wher}`");
+        };
+        // Landing correlated on the source: only the same-age neighbour matches.
+        same(
+            "MATCH (a:P)-[:R]->(b {age: a.age}) RETURN b.age AS x",
+            "MATCH (a:P)-[:R]->(b) WHERE b.age = a.age RETURN b.age AS x",
+        );
+        // An arithmetic expression in the value position.
+        same(
+            "MATCH (a:P)-[:R]->(b {age: a.age + 10}) RETURN b.age AS x",
+            "MATCH (a:P)-[:R]->(b) WHERE b.age = a.age + 10 RETURN b.age AS x",
+        );
+        // A constant expression on the ANCHOR node (nothing bound before it).
+        same(
+            "MATCH (a:P {age: 20 + 20}) RETURN a.age AS x",
+            "MATCH (a:P) WHERE a.age = 40 RETURN a.age AS x",
+        );
+    }
+
+    /// A literal `{k: null}` stays an IS NULL structural test (not `k = null`), and a
+    /// plain literal value stays literal — the expression path must not swallow them.
+    #[test]
+    fn inline_literal_and_null_props_unchanged() {
+        let mut b = Builder::default();
+        b.node(&["P"], &[("age", n(1.0))]);
+        b.node(&["P"], &[("age", Value::Null)]);
+        let store = b.build();
+        let count = |q: &str| bag(&run(&super::parse(q).unwrap(), &store)).len();
+        // `{age: null}` matches the null-valued node only (IS NULL).
+        assert_eq!(count("MATCH (n:P {age: null}) RETURN n.age AS x"), 1);
+        // `{age: 1}` matches the numeric node only.
+        assert_eq!(count("MATCH (n:P {age: 1}) RETURN n.age AS x"), 1);
+    }
+
+    /// Positions that permit only literal property values reject an expression with a
+    /// context message rather than silently dropping it.
+    #[test]
+    fn inline_property_expression_rejected_where_unsupported() {
+        let e = super::parse("INSERT (x:P {age: y.age})").unwrap_err();
+        assert!(
+            e.contains("must be literals"),
+            "expected a literal-only rejection, got: {e}"
+        );
     }
 
     #[test]

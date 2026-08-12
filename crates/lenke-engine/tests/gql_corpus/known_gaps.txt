@@ -11,7 +11,6 @@ tests_c.jsonl::temporal_duration_unordered_count_zero
 tests_f.jsonl::distinct_nan_1
 tests_f.jsonl::distinct_nan_2
 tests_f.jsonl::distinct_nan_3
-tests_f.jsonl::inline_constraint_per_row
 tests_f.jsonl::num_string_overflow_4
 tests_f.jsonl::range_bounded_2
 tests_f.jsonl::range_bounded_3
