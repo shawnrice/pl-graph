@@ -320,6 +320,7 @@ pub enum CastTarget {
     Float,
     String,
     Boolean,
+    List,
 }
 
 /// Which part of a path an accessor returns. `Length` is the hop count (= number

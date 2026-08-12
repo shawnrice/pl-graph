@@ -4555,6 +4555,7 @@ impl Parser {
             "FLOAT" | "DOUBLE" | "REAL" | "NUMBER" | "NUMERIC" => CastTarget::Float,
             "STRING" | "VARCHAR" | "TEXT" | "CHAR" => CastTarget::String,
             "BOOL" | "BOOLEAN" => CastTarget::Boolean,
+            "LIST" => CastTarget::List,
             other => return Err(format!("unknown CAST target type `{other}`")),
         };
         self.expect(&Tok::RParen)?;

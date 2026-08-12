@@ -204,6 +204,7 @@ pub enum CastTarget {
     Float,
     String,
     Boolean,
+    List,
 }
 
 impl From<crate::ir::CastTarget> for CastTarget {
@@ -213,6 +214,7 @@ impl From<crate::ir::CastTarget> for CastTarget {
             crate::ir::CastTarget::Float => Self::Float,
             crate::ir::CastTarget::String => Self::String,
             crate::ir::CastTarget::Boolean => Self::Boolean,
+            crate::ir::CastTarget::List => Self::List,
         }
     }
 }
@@ -288,6 +290,18 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
             }
             .as_str(),
         ))),
+        // `CAST(x AS LIST)`: a list passes through; a string splits into its UTF-16
+        // code-unit characters (the `split('')` unit model); any other non-null scalar
+        // becomes a singleton list. Matches core's `to_list`.
+        CastTarget::List => match v {
+            Value::List(_) => Ok(v.clone()),
+            Value::Str(s) => Ok(Value::List(
+                s.encode_utf16()
+                    .map(|u| Value::Str(Arc::from(String::from_utf16_lossy(&[u]).as_str())))
+                    .collect(),
+            )),
+            other => Ok(Value::List(vec![other.clone()])),
+        },
         CastTarget::Boolean => match v {
             Value::Bool(b) => Ok(Value::Bool(*b)),
             // Numeric truthiness: zero is false, every other (incl. NaN) is true.
