@@ -312,11 +312,6 @@ tests_e.jsonl::is_typed_open_record_1
 tests_e.jsonl::is_typed_open_record_2
 tests_e.jsonl::is_typed_scalar_numeric_inference
 tests_e.jsonl::is_typed_temporal_and_negation
-tests_e.jsonl::let_in_binding_suppresses_in_1
-tests_e.jsonl::let_in_binding_suppresses_in_2
-tests_e.jsonl::let_in_expression_1
-tests_e.jsonl::let_in_expression_2
-tests_e.jsonl::let_in_expression_correlated
 tests_e.jsonl::match_mode_different_edges
 tests_e.jsonl::match_mode_repeatable_elements
 tests_e.jsonl::property_exists_on_edges

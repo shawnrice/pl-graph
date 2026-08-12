@@ -112,6 +112,8 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         scope: HashMap::new(),
         slots: 0,
         path_vars: HashSet::new(),
+        lets: Vec::new(),
+        suppress_in: false,
     };
     let mut plan = p.query()?;
     // `<query> UNION [ALL] <query> …`: each arm is an independent query with a fresh
@@ -313,6 +315,14 @@ struct Parser {
     /// resolve to `Expr::Path` rather than a slot, since the path is the lineage
     /// sidecar — one per row — not a batch column.
     path_vars: HashSet<String>,
+    /// `LET name = expr IN …` local bindings (a stack for nesting). A reference to
+    /// such a name in an expression inlines its bound `Expr` (substitution), so LET
+    /// needs no runtime concept — the body is a plain expression once parsed.
+    lets: Vec<(String, Expr)>,
+    /// While parsing a `LET` binding value, the top-level `IN` is the LET separator,
+    /// NOT the membership operator — so `LET x = 2 + 3 IN body` binds `2+3`, not
+    /// `2+3 IN body`. This suppresses the `IN`-membership handling in `cmp_expr`.
+    suppress_in: bool,
 }
 
 impl Parser {
@@ -1657,8 +1667,8 @@ impl Parser {
         // tests, so its three-valued behavior falls out of the `=` operator (a
         // NULL element or operand makes a non-match UNKNOWN, not false).
         let saved = self.pos;
-        let negated_in = self.eat_kw("NOT");
-        if self.eat_kw("IN") {
+        let negated_in = !self.suppress_in && self.eat_kw("NOT");
+        if !self.suppress_in && self.eat_kw("IN") {
             let rhs = self.concat_expr()?;
             // A list LITERAL desugars to an OR-chain (more optimizable); any other
             // list expression (a property, param, function result) uses the runtime
@@ -1796,10 +1806,46 @@ impl Parser {
 
     // primary := '(' expr ')' | literal | var '.' key | var
     fn primary(&mut self) -> Result<Expr, String> {
+        // `LET name = expr [, name = expr]* IN body END` — local bindings. Each
+        // binding is pushed onto `self.lets` (later bindings may reference earlier
+        // ones), the body is parsed with them in scope (a reference inlines the bound
+        // expr), then they are popped. The body IS the substituted expression.
+        if self.peek_kw("LET") {
+            self.pos += 1; // LET
+            let base = self.lets.len();
+            loop {
+                let name = self.ident()?;
+                self.expect(&Tok::Eq)?;
+                // The binding value's top-level `IN` is the LET separator, not
+                // membership (a parenthesized `IN` is restored inside `primary`).
+                let saved = self.suppress_in;
+                self.suppress_in = true;
+                let val = self.expr()?;
+                self.suppress_in = saved;
+                self.lets.push((name, val));
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            if !self.eat_kw("IN") {
+                return Err("expected IN after LET bindings".into());
+            }
+            let body = self.expr()?;
+            if !self.eat_kw("END") {
+                return Err("expected END to close LET … IN".into());
+            }
+            self.lets.truncate(base);
+            return Ok(body);
+        }
         match self.peek().cloned() {
             Some(Tok::LParen) => {
                 self.pos += 1;
+                // A parenthesized group restores normal `IN`-membership even inside a
+                // LET binding value (`LET x = (a IN [1,2]) IN …`).
+                let saved = self.suppress_in;
+                self.suppress_in = false;
                 let e = self.expr()?;
+                self.suppress_in = saved;
                 self.expect(&Tok::RParen)?;
                 self.field_chain(e)
             }
@@ -1923,6 +1969,11 @@ impl Parser {
                 // not a slot — there is exactly one path per row.
                 if self.path_vars.contains(&s) {
                     return Ok(Expr::Path);
+                }
+                // A `LET`-bound local name inlines its bound expression (innermost
+                // binding wins), before any graph-variable resolution.
+                if let Some((_, e)) = self.lets.iter().rev().find(|(n, _)| n == &s) {
+                    return Ok(e.clone());
                 }
                 let slot = *self
                     .scope
