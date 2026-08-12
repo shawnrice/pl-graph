@@ -8009,22 +8009,39 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         // list (matches core).
         "range" => {
             let step = if args.len() == 3 {
-                value::as_num(&args[2])
+                value::as_num(&args[2]).map(f64::trunc)
             } else {
                 Some(1.0)
             };
-            match (value::as_num(&args[0]), value::as_num(&args[1]), step) {
+            match (
+                value::as_num(&args[0]).map(f64::trunc),
+                value::as_num(&args[1]).map(f64::trunc),
+                step,
+            ) {
                 (Some(a), Some(b), Some(st)) if st != 0.0 => {
-                    let (mut cur, mut out) = (a, Vec::new());
-                    // Guard the element count so a pathological range can't OOM.
-                    while (st > 0.0 && cur <= b) || (st < 0.0 && cur >= b) {
-                        out.push(Value::Num(cur));
-                        if out.len() > 10_000_000 {
-                            break;
+                    // COUNT-driven, not comparison-driven: `cur += st` stops advancing
+                    // once `cur` reaches 2^53 (a no-op in f64), so a `while cur <= b`
+                    // loop never terminates even when the count is tiny — e.g.
+                    // range(9007199254740992, 9007199254740994) has just 3 elements.
+                    // Compute the count up front (matching core), and cap the
+                    // allocation. The emitted values still come from repeated addition.
+                    let count = ((b - a) / st).floor() + 1.0;
+                    if count.is_nan() || count <= 0.0 {
+                        Value::List(Vec::new())
+                    } else {
+                        let n = if count > 10_000_001.0 {
+                            10_000_001
+                        } else {
+                            count as usize
+                        };
+                        let mut out = Vec::with_capacity(n);
+                        let mut cur = a;
+                        for _ in 0..n {
+                            out.push(Value::Num(cur));
+                            cur += st;
                         }
-                        cur += st;
+                        Value::List(out)
                     }
-                    Value::List(out)
                 }
                 _ => Value::Null,
             }

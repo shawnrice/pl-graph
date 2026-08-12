@@ -17,5 +17,4 @@ tests_f.jsonl::inline_constraint_per_row
 tests_f.jsonl::num_string_overflow_4
 tests_f.jsonl::range_bounded_2
 tests_f.jsonl::range_bounded_3
-tests_f.jsonl::range_float_step_stall
 tests_f.jsonl::zero_bound_3
