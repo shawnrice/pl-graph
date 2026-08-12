@@ -2162,6 +2162,21 @@ impl Parser {
             "BOOLEAN" | "BOOL" => "bool",
             "LIST" => "list",
             "NULL" => "null",
+            "DATE" => "date",
+            "DURATION" => "duration",
+            // Two-word temporal types: `LOCAL TIME`/`LOCAL DATETIME`, `ZONED
+            // TIME`/`ZONED DATETIME`.
+            "LOCAL" | "ZONED" => {
+                let zoned = ty.eq_ignore_ascii_case("ZONED");
+                let unit = self.ident()?;
+                match (zoned, unit.to_ascii_uppercase().as_str()) {
+                    (false, "TIME") => "local_time",
+                    (false, "DATETIME") => "local_datetime",
+                    (true, "TIME") => "zoned_time",
+                    (true, "DATETIME") => "zoned_datetime",
+                    _ => return Err(format!("IS TYPED {ty} {unit} is not supported")),
+                }
+            }
             other => return Err(format!("IS TYPED {other} is not supported")),
         })
     }

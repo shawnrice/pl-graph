@@ -5793,6 +5793,23 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
                 "float" => matches!(v, Value::Num(_)),
                 "list" => matches!(v, Value::List(_)),
                 "record" => matches!(v, Value::Record(_)),
+                "date" | "local_time" | "local_datetime" | "zoned_time" | "zoned_datetime"
+                | "duration" => {
+                    use crate::temporal::TemporalKind as K;
+                    if let Value::Temporal(t) = v {
+                        let want = match category {
+                            "date" => K::Date,
+                            "local_time" => K::Time,
+                            "local_datetime" => K::DateTime,
+                            "zoned_time" => K::ZonedTime,
+                            "zoned_datetime" => K::ZonedDateTime,
+                            _ => K::Duration,
+                        };
+                        t.kind() == want
+                    } else {
+                        false
+                    }
+                }
                 _ => false,
             };
             Value::Bool(ok)
