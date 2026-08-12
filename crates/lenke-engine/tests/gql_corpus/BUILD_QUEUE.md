@@ -149,9 +149,11 @@ The tractable tail is worked. Remaining 281 = 25 intentional "core rejects" (num
   INTENTIONAL (leave forever): CAST throws (engine design; core is lenient), f64 numeric model (oversized ints / arith-on-non-numeric -> NULL), cross-type-compare OPERATOR throw, reserved-word-as-identifier, malformed literals.
 
 ## ROUND 5 — FINISH EVERYTHING (loop restarted at baseline 281; drive known_gaps toward 0)
+
 User directive: fix all remaining deferred items (they were deferred for effort, not principle). Priority order (tractable -> hard); DIAGNOSE each before coding (inline engine-dialect ndjson fixture, engine-vs-core):
-1. count(*)+1 (aggregate nested in a projection/ORDER-BY expr, 1+) — reuse hoist_having_agg; generalize return_items/apply_items; keep RETURN + WITH byte-identical.
-2. SAFE error-parity "core rejects" (make the engine ALSO reject, matching core — these do NOT change the f64 value contract): reserved-word-as-identifier (m_reserved_word_*), CALL config validation (call_config_*), aggregate-type faults (avg_duration/sum_date/sum_mix_*/faulting_aggregate — sum/avg over temporal/mixed throws), date_part_* (unknown fn / rejects string|number), range_bounded_2/3.
+
+1. count(\*)+1 (aggregate nested in a projection/ORDER-BY expr, 1+) — reuse hoist_having_agg; generalize return_items/apply_items; keep RETURN + WITH byte-identical.
+2. SAFE error-parity "core rejects" (make the engine ALSO reject, matching core — these do NOT change the f64 value contract): reserved-word-as-identifier (m*reserved_word*_), CALL config validation (call*config*_), aggregate-type faults (avg*duration/sum_date/sum_mix*_/faulting*aggregate — sum/avg over temporal/mixed throws), date_part*_ (unknown fn / rejects string|number), range_bounded_2/3.
 3. Edge-label negation `-[:!T]->` + node-label disjunction/expr inside a WHERE predicate (`x:A|B`).
 4. SHORTEST k>=2 / bounded shortest (~5) — per-trail length-ordered enumeration.
 5. reverse-correlated subquery (~6) — FIRST verify the EXISTS/CountSubquery landing-slot contract (forward binds landing at scope-slot outer_width+1 vs runtime column outer_width); then start from the bound endpoint with reversed dir + landing filter at the correct slot.
@@ -159,4 +161,10 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 7. per-hop var-length WHERE `-[e:R WHERE ..]->{..}` / `(()-[..]->()){..}` (~17).
 8. THE BIG ONE: parenthesized subpath-group quantification `((..)){n,m}` (~85+) — do a READ-ONLY scout first (design the repeated-sub-pattern IR + per-rep variable scoping + interaction with path modes), then implement.
 9. NUMERIC-MODEL value-contract cases (oversized/overflow int literals, arith-on-non-numeric str/bool+num -> NULL vs core throw): these were the user's established f64/postgres-style choice. Attempt ONLY if it holds byte-identity for existing cases; if fixing requires breaking the f64 model or the fuzzer, SURFACE to the user rather than silently changing the value contract.
-Verify EVERY iteration: cargo test --release --lib; differential_fuzz seeds 1 & 42 (byte-identity); clippy 0; re-baseline CORPUS_BASELINE=1 (0 NEW); commit; update this file.
+   Verify EVERY iteration: cargo test --release --lib; differential_fuzz seeds 1 & 42 (byte-identity); clippy 0; re-baseline CORPUS_BASELINE=1 (0 NEW); commit; update this file.
+
+### Round-5 progress + reclassification (baseline 280)
+- count(*)+1 aggregate-in-projection-expr — DONE (commit c538ee7d, 281->280).
+- RECLASSIFIED: **aggregate-type faults (avg/sum over temporal/mixed/list) are VALUE-CONTRACT, not safe error-parity.** fold_grouped deliberately POISONS a non-numeric aggregate group to NULL (explicit code comment), the SAME postgres-style non-numeric->NULL model as arith `'abc'+1`->NULL. Core THROWS. Changing sum/avg to throw = changing the value contract the user chose. SURFACE, do not silently flip. Same bucket: oversized/overflow int literals, str/bool + num arith. => user decision.
+- Genuinely SAFE error-parity (fix, no value-contract change): reserved-word-as-identifier (parser rejects a reserved keyword used as a bare name), CALL config validation (call_config_*). date_part_* needs checking (may be non-date->throw = value-contract, or a missing-fn = safe).
+- Next FEATURE work (unambiguous, the bulk): edge-label negation -[:!T]->, node-label expr in WHERE, SHORTEST k>=2, reverse-correlated subquery, FOR..IN, per-hop var-length WHERE, and THE BIG ONE ((..)){n,m} (~85, scout first).
