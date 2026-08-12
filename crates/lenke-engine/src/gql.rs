@@ -770,15 +770,21 @@ impl Parser {
                 plan = self.match_continue(plan)?;
             } else if self.eat_kw("CALL") {
                 plan = self.call_inline(plan)?;
+            } else if self.eat_kw("FILTER") {
+                // `FILTER [WHERE] <cond>` — the ISO standalone filtering statement: a
+                // predicate over the current bindings, no projection.
+                self.eat_kw("WHERE");
+                plan = plan.filter(self.expr()?);
             } else {
                 break;
             }
         }
         // Statement-position `ORDER BY [OFFSET n] [LIMIT n]` BEFORE `RETURN`: sort
         // and page the bound rows, then the following RETURN projects. Core allows
-        // this as a standalone order-and-page clause. `SKIP` is not a valid STARTER
-        // here (only ORDER/OFFSET/LIMIT), matching core.
-        if self.peek_kw("ORDER") || self.peek_kw("OFFSET") || self.peek_kw("LIMIT") {
+        // this as a standalone order-and-page clause, and allows it to REPEAT (`ORDER
+        // BY … LIMIT 2 ORDER BY … DESC LIMIT 1` — page then re-page), so this loops.
+        // `SKIP` is not a valid STARTER here (only ORDER/OFFSET/LIMIT), matching core.
+        while self.peek_kw("ORDER") || self.peek_kw("OFFSET") || self.peek_kw("LIMIT") {
             let keys = if self.eat_kw("ORDER") {
                 if !self.eat_kw("BY") {
                     return Err("expected BY after ORDER".into());

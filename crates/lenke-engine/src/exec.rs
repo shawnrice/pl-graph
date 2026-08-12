@@ -8458,6 +8458,34 @@ mod tests {
         );
     }
 
+    /// A standalone FILTER clause filters the working table, and repeated statement-
+    /// position ORDER BY … LIMIT compose (page then re-page). n = 1,5,9.
+    #[test]
+    fn filter_clause_and_composed_paging() {
+        let mut b = Builder::default();
+        b.node(&["T"], &[("n", n(1.0))]);
+        b.node(&["T"], &[("n", n(5.0))]);
+        b.node(&["T"], &[("n", n(9.0))]);
+        let store = b.build();
+        let one = |q: &str| -> f64 {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            match run(&plan, &store).rows[0][0] {
+                Value::Num(x) => x,
+                ref o => panic!("{o:?}"),
+            }
+        };
+        // FILTER keeps n>3 (5,9); ORDER BY n LIMIT 1 -> 5.
+        assert_eq!(
+            one("MATCH (t:T) FILTER t.n > 3 ORDER BY t.n LIMIT 1 RETURN t.n AS x"),
+            5.0
+        );
+        // Page (asc, top 2 -> {1,5}) then re-page (desc, top 1 -> 5).
+        assert_eq!(
+            one("MATCH (t:T) ORDER BY t.n LIMIT 2 ORDER BY t.n DESC LIMIT 1 RETURN t.n AS x"),
+            5.0
+        );
+    }
+
     /// An UNQUANTIFIED subpath group `(( pattern [WHERE p] ))` is a scoping paren:
     /// the inner pattern + trailing WHERE filter, no repetition. A NAMED path over
     /// one is rejected (core does). Fixture: Amy(25)->Bob(40), Bob(40)->Amy(25).
