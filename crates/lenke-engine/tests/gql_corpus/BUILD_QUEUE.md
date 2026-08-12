@@ -356,3 +356,24 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 - **multiseg_u (6)** — dual-anchor correlated multi-segment EXISTS (ReBAC). HARD.
 - VALUE-CONTRACT (leave/surface): range_bounded_2/3, num_string_overflow, distinct_nan (string->NaN),
   sum/avg-over-temporal, CAST-throws, m_reserved_word (reserved-word-as-identifier = intentional).
+
+### ROUND 6 (cont.) — 146 -> 140 (session total 265 -> 140, 125 cases)
+
+- **per-repetition WHERE in a subpath group — DONE** (commit fe539a72, 146->140, 6 cases).
+  RepeatGroup gains per_rep_pred (Option<Box<Expr>>); parser parses the group WHERE against a fixed
+  SCALAR mini-scope (source=0, edge=1, target=2), var_length DFS evals it per hop over a 1-row batch
+  [Nodes([v]), Edges([eid]), Nodes([nbr])], pruning failing hops. Composes with group lists + optional endpoint.
+
+### NEXT (baseline 140):
+
+- **inline edge props on a PLAIN var-length `-[:R {amt:20.0}]->{n,m}`** (per_hop_inline_from_a/b, 2) —
+  NOW EASY: desugar to a RepeatGroup with per_rep_pred = (e.amt == 20.0) at scalar slot 1, empty group_binds.
+  In extend_chain's quant+bind path, when rel has ONLY inline props (no var, no where), build RepeatGroup.
+- **VALUE scalar subquery / uncorrelated multi-pattern EXISTS** (9: value_subquery_*, exists_multi_match) —
+  VALUE{…RETURN count(*)} ~ CountSubquery correlated; general VALUE + uncorrelated EXISTS need pull_body
+  to run a Scan/cross-join body or a constant-subquery eval. MEDIUM.
+- **multi-hop group unit k>1** (gv_bind_each_rep_2hop), **nested groups** (vqs_16, nested_paren_varying,
+  nested_outer_gv, nested_quant_ends, nested_per_hop, nested_per_rep), **WITH-carry** (gv_carry_through_with) — hard.
+- **multiseg_u (6)** dual-anchor correlated multi-segment EXISTS (ReBAC). HARD.
+- VALUE-CONTRACT (leave/surface): range_bounded_2/3, num_string_overflow, distinct_nan, sum/avg-over-temporal,
+  CAST-throws, m_reserved_word (reserved-word-as-identifier = intentional).
