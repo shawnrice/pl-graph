@@ -921,12 +921,13 @@ impl Parser {
         // parse it (for syntax + scope) and let the ordinary aggregate path group.
         // (On the SELECT path GROUP BY is already gone, so this is a no-op there.)
         let mut group_by_present = false;
+        let mut group_exprs: Vec<Expr> = Vec::new();
         if self.eat_kw("GROUP") {
             if !self.eat_kw("BY") {
                 return Err("expected BY after GROUP".into());
             }
             loop {
-                self.expr()?;
+                group_exprs.push(self.expr()?);
                 group_by_present = true;
                 if !self.eat(&Tok::Comma) {
                     break;
@@ -935,6 +936,33 @@ impl Parser {
         }
         let visible: Vec<String> = items.iter().map(RetItem::name).collect();
         let has_agg = items.iter().any(|it| matches!(it, RetItem::Agg(_)));
+        let has_agg_expr = items.iter().any(|it| matches!(it, RetItem::AggExpr { .. }));
+        // A GROUP BY key that is NOT already a visible non-aggregate output item is a
+        // HIDDEN grouping key: it widens the grouping (`RETURN count(*) GROUP BY
+        // e.dept` = one row per dept) without appearing in the output. Appended as a
+        // hidden Key item so the aggregate groups on it, then dropped by a final
+        // schema-aware projection. (Only for the simple-aggregate shape; an
+        // aggregate-expression projection already re-projects in item order.)
+        let visible_key_exprs: Vec<Expr> = items
+            .iter()
+            .filter_map(|it| match it {
+                RetItem::Key(_, e) => Some(e.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut extra_group: Vec<(String, Expr)> = Vec::new();
+        if has_agg && !has_agg_expr {
+            for ge in &group_exprs {
+                if !visible_key_exprs.iter().any(|k| expr_eq(k, ge)) {
+                    let name = format!("__gk{}", extra_group.len());
+                    extra_group.push((name, ge.clone()));
+                }
+            }
+        }
+        for (name, e) in &extra_group {
+            items.push(RetItem::Key(name.clone(), e.clone()));
+        }
+        let needs_schema_proj = !extra_group.is_empty();
         // `GROUP BY <keys>` with NO aggregate is DISTINCT over the projection (the
         // returned items ARE the keys), matching core.
         let group_distinct = group_by_present && !has_agg;
@@ -952,6 +980,31 @@ impl Parser {
             .map(|(i, e)| (e, i))
             .collect();
 
+        // The column each visible output name occupies in the plan's schema. For a
+        // simple aggregate the schema is `[keys… , aggs…]` in item order, NOT the
+        // RETURN order, so an ORDER-BY alias must resolve to the true column (an agg
+        // sits after every key). For non-aggregate / aggregate-expression plans the
+        // columns already match the visible order.
+        let visible_cols: Vec<usize> = if has_agg && !has_agg_expr {
+            let mut schema: Vec<String> = Vec::new();
+            for it in &items {
+                if let RetItem::Key(n, _) = it {
+                    schema.push(n.clone());
+                }
+            }
+            for it in &items {
+                if let RetItem::Agg(a) = it {
+                    schema.push(a.name.clone());
+                }
+            }
+            visible
+                .iter()
+                .map(|n| schema.iter().position(|s| s == n).unwrap_or(0))
+                .collect()
+        } else {
+            (0..visible.len()).collect()
+        };
+
         // ORDER BY: a key that is a visible output alias sorts by that column; a key
         // that is an EXPRESSION over the bindings (`ORDER BY n.age`, `a.x + a.y`) is
         // projected as a HIDDEN column here, sorted on, then dropped by a final
@@ -961,7 +1014,7 @@ impl Parser {
             if !self.eat_kw("BY") {
                 return Err("expected BY after ORDER".into());
             }
-            self.order_keys(&visible, has_agg, &key_slots, &mut hidden)?
+            self.order_keys(&visible, &visible_cols, has_agg, &key_slots, &mut hidden)?
         } else {
             Vec::new()
         };
@@ -996,8 +1049,35 @@ impl Parser {
         if !keys.is_empty() || skip.is_some() || limit.is_some() {
             plan = plan.order_page(keys, skip, limit);
         }
-        // Drop the hidden ORDER-BY columns, restoring exactly the visible outputs.
-        if !hidden.is_empty() {
+        // Drop the hidden columns (ORDER-BY sort keys and/or non-returned GROUP BY
+        // keys), restoring exactly the visible outputs. When extra group keys were
+        // added the aggregate schema is `[keys… , aggs…]` in item order — not the
+        // RETURN order — so map each visible name to its true column; otherwise the
+        // projection produced columns in visible order already.
+        if needs_schema_proj {
+            let mut schema: Vec<String> = Vec::new();
+            for it in &items {
+                if let RetItem::Key(n, _) = it {
+                    schema.push(n.clone());
+                }
+            }
+            for it in &items {
+                if let RetItem::Agg(a) = it {
+                    schema.push(a.name.clone());
+                }
+            }
+            let proj = visible
+                .iter()
+                .map(|n| {
+                    let col = schema
+                        .iter()
+                        .position(|s| s == n)
+                        .expect("a visible output name must exist in the aggregate schema");
+                    (n.clone(), Expr::Slot(col))
+                })
+                .collect();
+            plan = plan.project(proj);
+        } else if !hidden.is_empty() {
             let proj = visible
                 .iter()
                 .enumerate()
@@ -1412,6 +1492,7 @@ impl Parser {
     fn order_keys(
         &mut self,
         visible: &[String],
+        visible_cols: &[usize],
         has_agg: bool,
         key_slots: &[(Expr, usize)],
         hidden: &mut Vec<(String, Expr)>,
@@ -1430,7 +1511,8 @@ impl Parser {
                 Some(Tok::Ident(name)) => visible
                     .iter()
                     .position(|n| n == name)
-                    .filter(|_| terminator(self.toks.get(self.pos + 1))),
+                    .filter(|_| terminator(self.toks.get(self.pos + 1)))
+                    .map(|i| visible_cols[i]),
                 _ => None,
             };
             let expr = if let Some(slot) = alias {

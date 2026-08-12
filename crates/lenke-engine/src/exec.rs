@@ -9811,6 +9811,40 @@ mod tests {
         );
     }
 
+    /// GROUP BY a key that is NOT among the RETURN items still groups: it becomes a
+    /// hidden grouping key, dropped from the output. `RETURN count(*) GROUP BY
+    /// e.dept` yields one row per dept. An aggregate ORDER BY resolves to its true
+    /// (keys-then-aggs) schema column, not its RETURN position.
+    #[test]
+    fn group_by_non_returned_key() {
+        let mut b = Builder::default();
+        b.node(&["E"], &[("dept", s("eng")), ("sal", n(100.0))]);
+        b.node(&["E"], &[("dept", s("eng")), ("sal", n(200.0))]);
+        b.node(&["E"], &[("dept", s("sales")), ("sal", n(50.0))]);
+        let store = b.build();
+        let nums = |q: &str| -> Vec<f64> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            run(&plan, &store)
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Value::Num(x) => *x,
+                    o => panic!("{o:?}"),
+                })
+                .collect()
+        };
+        // count per dept, key not returned: two groups (eng=2, sales=1), any order.
+        let mut c = nums("MATCH (e:E) RETURN count(*) AS c GROUP BY e.dept");
+        c.sort_by(|a, b| a.total_cmp(b));
+        assert_eq!(c, vec![1.0, 2.0]);
+        // sum per dept ordered by the aggregate: the ORDER BY alias must hit the sum
+        // column (after the hidden key), so ascending is [50, 300] not [300, 50].
+        assert_eq!(
+            nums("MATCH (e:E) RETURN sum(e.sal) AS s GROUP BY e.dept ORDER BY s"),
+            vec![50.0, 300.0]
+        );
+    }
+
     /// LIMIT 0 yields the empty result WITHOUT evaluating the projection, so a
     /// faulting expression (`1/0`) under LIMIT 0 does not error (matches core).
     #[test]
