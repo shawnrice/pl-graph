@@ -128,9 +128,19 @@ STOP only once THIS tail is worked and only ((..)){n} + per-hop-WHERE + FOR..IN 
 - **STILL OPEN: aggregate NESTED in a projection expression** (~2+: count_star_shortcut_plus1 `RETURN count(*) + 1`, m_implicit_grouping / group_by_aggregate `RETURN s.name, count(*) ORDER BY s.name`). The RETURN-level analog of the HAVING `extract_aggs` already built: an aggregate nested inside a projection expression (`count(*)+1`) or an ORDER BY over a group-key expression needs the agg hoisted into the Aggregate and the surrounding expr rewritten to a slot. Reuse the HAVING machinery (hoist_having_agg / rewrite_group_keys) generalized to the RETURN item list. MEDIUM.
 - Reverse-correlated subquery (~6, `COUNT { (m)-[:R]->(n) }` outer var is landing) and temporal literal compares (temporal_timestamp_ge etc.) — still open, medium.
 
-
 ## Round 4 (cont) — diagnoses at baseline 282
+
 - **TIMESTAMP literal = DONE** (commit 18fbf82a, 283->282): `TIMESTAMP '…'` is core's DATETIME alias; added to temporal_tag.
 - **reverse-correlated subquery (~6) — DIAGNOSED, DEFER (slot-management risk).** correlated_subquery_body requires the FIRST subquery node to be the bound outer var; the failing cases have the outer var as the LANDING (`COUNT { (m)-[:R]->(n) }`). Forward body = `Expand{input:Row, from:<outer slot>}` and only counts matches. The catch: extend_chain binds the landing at scope-slot `outer_width+1` while the runtime column lands at `outer_width` (a gap that's harmless ONLY because forward cases never filter the landing). A reverse case with a local-node LABEL (`(m:Target)-[:R]->(n)`) needs a filter at the correct landing slot — get the offset wrong and it silently miscounts. Needs careful slot reconciliation (verify against the EXISTS/CountSubquery eval's row-width contract) before implementing. MEDIUM.
 - **aggregate nested in a projection expr `count(*)+1` (~1) — remaining.** return_items parses a leading aggregate as a bare RetItem::Agg then chokes on the trailing `+ 1`. Needs generalizing apply_items: parse each RETURN item as an expression with aggregate hoisting (reuse hoist_having_agg), keys = items with no aggregate, project each item's (rewritten) expr over the post-agg schema. Touches apply_items (shared by RETURN + WITH) — verify WITH still works. MEDIUM.
 - temporal_duration_unordered_count_zero — likely already-passing-or-intentional (fixture has `d` not `dur`, so `n.dur` is missing -> NULL > DURATION -> UNKNOWN -> count 0); re-check.
+
+## CAMPAIGN COMPLETE — baseline 694 -> 281 (this run: from 427). STOPPED.
+The tractable tail is worked. Remaining 281 = 25 intentional "core rejects" (numeric-model + error-parity)
++ 257 hard-deferred, dominated by:
+- parenthesized subpath-group `((..)){n,m}` (~85+) — a genuine feature: repeated sub-pattern IR + per-rep var scoping. The single largest remaining lever; warrants its own scouting pass.
+- per-hop var-length WHERE `-[e WHERE ..]->{..}` (~17), FOR..IN / WITH OFFSET|ORDINALITY list unwind (~12), SHORTEST k>=2 / bounded shortest (~5).
+- reverse-correlated subquery (~6) — DIAGNOSED, deferred: needs verified landing-slot reconciliation in the EXISTS/CountSubquery body (silent-miscount risk).
+- aggregate nested in a projection expr `count(*)+1` (1) — deferred: generalizing the shared RETURN/WITH apply_items pipeline for one case is not worth the regression risk.
+- edge-label negation `-[:!T]->` + node-label disjunction in a WHERE predicate — the remaining label-algebra corners.
+INTENTIONAL (leave forever): CAST throws (engine design; core is lenient), f64 numeric model (oversized ints / arith-on-non-numeric -> NULL), cross-type-compare OPERATOR throw, reserved-word-as-identifier, malformed literals.
