@@ -403,3 +403,24 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 
 Infra now in place for reuse: RepeatGroup (group_binds + per_rep_pred), Expr::Index.elem (typed subscripts),
 ShortestK + collect_trails (trail enumeration), var_length lineage (node/edge stacks), multi-label edges.
+
+### ROUND 6 (cont.) — 138 -> 134 (session total 265 -> 134, 131 cases)
+
+- **per-hop edge WHERE in a shortest path — DONE** (commit 23dc817e, 138->134, 4 cases). ShortestPath
+  gains edge_pred (Option<Box<Expr>>); parser parses the edge WHERE against a scalar mini-scope (edge at
+  slot 0); BFS + collect_trails skip an edge failing it via edge_pred_ok (eval over [Col::Edges([eid])]).
+  Also cleared shortest_k_per_hop_pred (SHORTEST k + per-hop combined).
+
+### NEXT (baseline 134) — still-tractable first, then hard:
+
+- **VALUE{…RETURN count(*)} correlated ~ CountSubquery** (value_subquery_aggregate_dave_deg/carol_zero, 2) —
+  parse `VALUE { MATCH <corr-body> RETURN count(*) }`, detect the count(*) RETURN, emit CountSubquery
+  (reuse correlated_subquery_body). EASY-MEDIUM. The general VALUE (scalar b.name) + uncorrelated forms are harder.
+- **multi-hop group unit k>1 `((x)-[e1]->(m)-[e2]->(y)){n}`** (gv_bind_each_rep_2hop, qsp_multi_ends/cross ~4)
+  — the group body has k>1 hops; generalize push_group_cols to stride verts[rep*k+p]/edges[rep*k+p] and the
+  parser to bind per-position vars. Also needs the var_length DFS to only emit at multiples of k reps. MEDIUM-HARD.
+- **~25 value-contract "core rejects"** — LEAVE baselined (see prior entry).
+- **nested groups (~13)**, **multiseg_u (6)**, **general VALUE / uncorrelated EXISTS (~11)**, **WITH-carry (1)** — HARD.
+
+Infra in place: RepeatGroup (group_binds + per_rep_pred), Expr::Index.elem, ShortestK + collect_trails +
+edge_pred, var_length lineage, multi-label edges. When only value-contract + genuinely-hard remain, STOP with a summary.
