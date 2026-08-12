@@ -4,9 +4,6 @@
 # should be removed. Regenerate with CORPUS_BASELINE=1.
 hardening.jsonl::h_rejects_literal_overflowing_exponent
 hardening.jsonl::h_rejects_literal_oversized_integer_literal
-tests_b.jsonl::call_config_bogus_error
-tests_b.jsonl::call_config_pivot_error
-tests_b.jsonl::call_config_wrong_type_error
 tests_b.jsonl::cast_int_null
 tests_b.jsonl::cast_list
 tests_b.jsonl::malformed_num_1e999_error

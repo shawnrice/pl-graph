@@ -1381,6 +1381,9 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             out
         }
         Plan::CallProcedure { name, config } => {
+            // A bad config (unknown key / wrong-type value) is a data exception — not
+            // silently ignored — matching core.
+            crate::algo::validate_config(config)?;
             // Run the named graph algorithm over the whole store into a two-slot
             // batch: node ids, then the per-node result. The parser validates the
             // name, so an unknown one here is defensive.

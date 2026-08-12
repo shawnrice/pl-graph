@@ -1284,6 +1284,86 @@ pub fn procedure_result_col(name: &str) -> Option<&'static str> {
     })
 }
 
+/// The accepted `CALL <algo>({…})` config keys (core's list, plus the engine's
+/// `edgeType` spelling of `edgeLabel`). A config map is validated against this set so
+/// a typo or a wrong key no longer silently no-ops. Order is fixed so the "did you
+/// mean" tie-break is deterministic.
+const CONFIG_KEYS: &[&str] = &[
+    "edgeLabel",
+    "edgeType",
+    "direction",
+    "weightProperty",
+    "dampingFactor",
+    "iterations",
+    "pivots",
+    "seedProperty",
+    "source",
+    "sourceNodes",
+    "target",
+    "writeProperty",
+    "algorithm",
+    "heuristicProperty",
+    "feature",
+    "op",
+    "includeSelf",
+    "norm",
+];
+
+/// Case-insensitive Levenshtein edit distance — for the config-key "did you mean".
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().flat_map(char::to_lowercase).collect();
+    let b: Vec<char> = b.chars().flat_map(char::to_lowercase).collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Validate a `CALL` config map: every key must be a known config key (unknown →
+/// error, with a "did you mean") and carry the right value TYPE (a wrong type is a
+/// data exception). Matches core — a bad config no longer silently no-ops.
+pub fn validate_config(config: &[(String, Value)]) -> Result<(), String> {
+    for (k, v) in config {
+        let expect: &str = match k.as_str() {
+            "dampingFactor" | "iterations" | "pivots" => "number",
+            "includeSelf" => "boolean",
+            "sourceNodes" => "list",
+            "edgeLabel" | "edgeType" | "direction" | "weightProperty" | "seedProperty"
+            | "source" | "target" | "writeProperty" | "algorithm" | "heuristicProperty"
+            | "feature" | "op" | "norm" => "string",
+            _ => {
+                let hint = CONFIG_KEYS
+                    .iter()
+                    .map(|c| (edit_distance(k, c), *c))
+                    .filter(|(d, _)| *d <= 2)
+                    .min_by_key(|(d, _)| *d)
+                    .map(|(_, c)| c);
+                return Err(match hint {
+                    Some(s) => format!("unknown config key '{k}' (did you mean '{s}'?)"),
+                    None => format!("unknown config key '{k}'"),
+                });
+            }
+        };
+        let ok = match expect {
+            "number" => matches!(v, Value::Num(_)),
+            "boolean" => matches!(v, Value::Bool(_)),
+            "list" => matches!(v, Value::List(_)),
+            _ => matches!(v, Value::Str(_)),
+        };
+        if !ok {
+            return Err(format!("config key '{k}' expects a {expect}"));
+        }
+    }
+    Ok(())
+}
+
 /// Run a named procedure with its `{key: value}` config, returning `(node, value)`
 /// per node (component ids / labels surfaced as their `f64` node-id number). `None`
 /// for an unknown name (the parser normally rejects that first). Reuses the
