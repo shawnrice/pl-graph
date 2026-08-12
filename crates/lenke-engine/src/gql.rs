@@ -2930,6 +2930,41 @@ impl Parser {
             return Err("a CALL subquery needs a RETURN".into());
         }
         let items = self.return_items()?;
+        // A single `COUNT(...)` aggregate RETURN is a correlated COUNT subquery: for
+        // each outer row, the number of body sub-matches (0 if none — LEFT semantics,
+        // so the outer row survives). Appended via a projection that passes the outer
+        // columns through and adds the count. (Other aggregates in a CALL stay
+        // unsupported.)
+        if items.len() == 1 {
+            if let RetItem::Agg(agg) = &items[0] {
+                if agg.func == crate::ir::AggFn::Count && !agg.distinct {
+                    let name = agg.name.clone();
+                    self.expect(&Tok::RBrace)?;
+                    self.scope = outer_scope;
+                    let mut by_slot: Vec<Option<String>> = vec![None; outer_width];
+                    for (n, &s) in self.scope.iter() {
+                        if s < outer_width {
+                            by_slot[s] = Some(n.clone());
+                        }
+                    }
+                    let mut proj: Vec<(String, Expr)> = by_slot
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, nm)| (nm.unwrap_or_else(|| format!("col{i}")), Expr::Slot(i)))
+                        .collect();
+                    proj.push((
+                        name.clone(),
+                        Expr::CountSubquery {
+                            body: Box::new(body),
+                            outer_width,
+                        },
+                    ));
+                    self.scope.insert(name, outer_width);
+                    self.slots = outer_width + 1;
+                    return Ok(plan.project(proj));
+                }
+            }
+        }
         if items.iter().any(RetItem::has_agg) {
             return Err("an aggregating RETURN inside CALL { … } is not supported".into());
         }
@@ -5210,6 +5245,30 @@ mod tests {
                 "name=Str(\"alice\");friend=Str(\"bob\");",
                 "name=Str(\"alice\");friend=Str(\"carol\");",
                 "name=Str(\"bob\");friend=Str(\"carol\");",
+            ]
+        );
+    }
+
+    /// A single `COUNT(...)` aggregate RETURN in a correlated `CALL (p) { … }` is a
+    /// per-outer-row count with LEFT semantics: an outer row whose sub-pattern matches
+    /// nothing still survives with count 0.
+    #[test]
+    fn call_inline_correlated_count() {
+        let store = social(); // alice KNOWS bob & carol; bob KNOWS carol; carol knows none
+        let out = run(
+            &super::parse(
+                "MATCH (p:Person) CALL (p) { MATCH (p)-[:KNOWS]->(f) RETURN count(f) AS c } \
+                 RETURN p.name AS name, c ORDER BY name",
+            )
+            .unwrap(),
+            &store,
+        );
+        assert_eq!(
+            bag(&out),
+            vec![
+                "name=Str(\"alice\");c=Num(2.0);",
+                "name=Str(\"bob\");c=Num(1.0);",
+                "name=Str(\"carol\");c=Num(0.0);", // no KNOWS → survives with 0
             ]
         );
     }
