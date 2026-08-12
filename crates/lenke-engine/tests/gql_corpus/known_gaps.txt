@@ -9,7 +9,6 @@ hardening.jsonl::h_string_plus_number_raises_data_exception
 language.jsonl::m_colon_label_predicate_desugars_to_is_labeled_2
 language.jsonl::m_edge_label_negation
 language.jsonl::m_implicit_grouping
-language.jsonl::m_insert_return_binds_created_node
 language.jsonl::m_is_as_label_introducer
 language.jsonl::m_is_labeled_tests_element_1
 language.jsonl::m_is_labeled_tests_element_2
@@ -53,8 +52,6 @@ tests_a.jsonl::exists_count_semi_join_3
 tests_a.jsonl::exists_count_semi_join_4
 tests_a.jsonl::exists_count_semi_join_5
 tests_a.jsonl::group_by_aggregate
-tests_a.jsonl::insert_multi_label_node
-tests_a.jsonl::insert_node_then_return
 tests_a.jsonl::is_labeled
 tests_a.jsonl::is_not_labeled
 tests_a.jsonl::label_expr_not
@@ -84,8 +81,6 @@ tests_b.jsonl::order_total_order_asc
 tests_b.jsonl::order_total_order_desc
 tests_b.jsonl::oversized_int_error
 tests_b.jsonl::sum_date_errors
-tests_c.jsonl::acyclic_mode_count
-tests_c.jsonl::acyclic_mode_no_cycle_back
 tests_c.jsonl::all_shortest_endpoint_multiplicity
 tests_c.jsonl::all_shortest_tied_lengths
 tests_c.jsonl::any_shortest_bounded_one_names
@@ -106,15 +101,11 @@ tests_c.jsonl::for_over_scalar_singleton
 tests_c.jsonl::for_unwinds_literal_list
 tests_c.jsonl::for_with_offset
 tests_c.jsonl::for_with_ordinality
-tests_c.jsonl::path_mode_acyclic_ends
-tests_c.jsonl::path_mode_simple_ends
 tests_c.jsonl::prop_str_plus_num_faults
 tests_c.jsonl::shortest_per_hop_all_filtered
 tests_c.jsonl::shortest_per_hop_any_filtered
 tests_c.jsonl::shortest_per_hop_blocks_all
 tests_c.jsonl::shortest_per_hop_unfiltered
-tests_c.jsonl::simple_mode_closing_cycle
-tests_c.jsonl::simple_mode_count
 tests_c.jsonl::str_plus_num_faults
 tests_c.jsonl::subscript_consecutive_hop_compare
 tests_c.jsonl::subscript_edge0_weight
@@ -168,10 +159,6 @@ tests_d.jsonl::nested_quant_ends_1
 tests_d.jsonl::nested_quant_ends_2
 tests_d.jsonl::nested_quant_ends_3
 tests_d.jsonl::nested_quant_gv_vectorize
-tests_d.jsonl::non_trail_count_acyclic
-tests_d.jsonl::non_trail_count_simple
-tests_d.jsonl::non_trail_enum_acyclic
-tests_d.jsonl::non_trail_enum_simple
 tests_d.jsonl::paren_grouping_no_quant
 tests_d.jsonl::per_hop_admits_all
 tests_d.jsonl::per_hop_filters
@@ -199,7 +186,6 @@ tests_d.jsonl::shortest_2_groups_synonym
 tests_d.jsonl::shortest_2_keeps_two
 tests_d.jsonl::shortest_k_clamps
 tests_d.jsonl::shortest_k_per_hop_pred
-tests_d.jsonl::simple_close_emits
 tests_d.jsonl::unanchored_bounded
 tests_d.jsonl::unanchored_nodes_size
 tests_d.jsonl::unanchored_path_len
