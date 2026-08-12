@@ -5108,13 +5108,17 @@ fn rep_pred_ok(
 ) -> bool {
     let (len, k) = (len as usize, k as usize);
     let base = len - k;
-    let mut slots: Vec<Col> = Vec::with_capacity(2 * k + 1);
+    let mut slots: Vec<Col> = Vec::with_capacity(2 * k + 2);
     for p in 0..=k {
         slots.push(Col::Nodes(vec![node_stack[base + p]]));
         if p < k {
             slots.push(Col::Edges(vec![edge_stack[base + p]]));
         }
     }
+    // Slot `2k+1` carries the path SOURCE, so a per-hop WHERE can reference the hop's
+    // outer anchor variable (`(a)-[e WHERE a.k = …]->{…}`); the parser maps that
+    // variable to this slot. `node_stack[0]` is the source for every repetition.
+    slots.push(Col::Nodes(vec![node_stack[0]]));
     let mini = Batch::of(slots);
     eval(pred, store, &mini)
         .map(|c| c.value_at(0).is_true())
@@ -9154,6 +9158,38 @@ mod tests {
         assert_eq!(
             ids("MATCH (a:N {id:'a'})-[e:R WHERE e.amt >= 1]->{1,3}(x) RETURN x.id AS id"),
             vec!["b", "c"]
+        );
+    }
+
+    /// A per-hop edge WHERE may also reference the hop's SOURCE variable: `(a)-[e
+    /// WHERE a.id = … AND e.amt >= …]->{1,3}(x)`. The anchor `a` maps to the path
+    /// source at eval time, so a true condition admits the walk and a false one
+    /// blocks every path.
+    #[test]
+    fn per_hop_where_references_outer_source() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{\"amt\":20.0}}\n",
+            "{\"from\":\"b\",\"to\":\"c\",\"labels\":[\"R\"],\"props\":{\"amt\":20.0}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let ids = |q: &str| -> Vec<String> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            let mut v = names_of(&run(&plan, &store), 0);
+            v.sort();
+            v
+        };
+        // a.id = 'a' holds → both hops admitted (b, c).
+        assert_eq!(
+            ids("MATCH (a:N {id:'a'})-[e:R WHERE e.amt >= 10 AND a.id = 'a']->{1,3}(x) RETURN x.id AS id"),
+            vec!["b", "c"]
+        );
+        // a.id = 'zzz' is false → no path survives.
+        assert!(
+            ids("MATCH (a:N {id:'a'})-[e:R WHERE a.id = 'zzz']->{1,3}(x) RETURN x.id AS id")
+                .is_empty()
         );
     }
 

@@ -2198,8 +2198,18 @@ impl Parser {
                         if let Some(ev) = &rel.var {
                             mini.insert(ev.clone(), 1);
                         }
+                        // The hop SOURCE is visible to a per-hop WHERE: any outer
+                        // variable bound at `from` (the anchor `a` in `(a)-[e WHERE
+                        // a.k = …]->{…}`) maps to a dedicated mini-slot (3) that
+                        // `rep_pred_ok` fills with the path source. Other outer
+                        // variables are still out of reach (they are not on the path).
+                        for (name, &sl) in scope.iter() {
+                            if sl == from {
+                                mini.insert(name.clone(), 3);
+                            }
+                        }
                         self.scope = mini;
-                        self.slots = 3;
+                        self.slots = 4;
                         let w = self.parse_captured_where(r)?;
                         self.scope = saved_scope;
                         self.slots = saved_slots;

@@ -46,7 +46,6 @@ tests_d.jsonl::nested_per_rep_where_4
 tests_d.jsonl::nested_quant_ends_2
 tests_d.jsonl::nested_quant_ends_3
 tests_d.jsonl::nested_quant_gv_vectorize
-tests_d.jsonl::per_hop_outer_var
 tests_d.jsonl::vqs_16
 tests_e.jsonl::date_part_bare_name_unknown_fn
 tests_e.jsonl::date_part_rejects_number
