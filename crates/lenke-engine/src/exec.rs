@@ -2820,14 +2820,28 @@ fn try_edge_filtered_count(
     };
     let src_ids = frontier_ids(src, store)?;
     let mut count = 0u64;
-    for &v in &src_ids {
-        for_each_nbr(store, v, *dir, want, |_nbr, eid| {
-            if let Value::Num(x) = store.edge_prop(eid, &key) {
-                if bounds.iter().all(|&(op, t)| num_pred(op, x, t)) {
+    // Typed overlay: read the edge property as a raw f64 (no per-edge hash probe +
+    // Value unbox). Falls back to the boxed edge_prop when the overlay is stale or the
+    // key is not homogeneously numeric.
+    if let Some((data, present)) = store.edge_num_column(&key) {
+        for &v in &src_ids {
+            for_each_nbr(store, v, *dir, want, |_nbr, eid| {
+                let i = eid as usize;
+                if present[i] && bounds.iter().all(|&(op, t)| num_pred(op, data[i], t)) {
                     count += 1;
                 }
-            }
-        });
+            });
+        }
+    } else {
+        for &v in &src_ids {
+            for_each_nbr(store, v, *dir, want, |_nbr, eid| {
+                if let Value::Num(x) = store.edge_prop(eid, &key) {
+                    if bounds.iter().all(|&(op, t)| num_pred(op, x, t)) {
+                        count += 1;
+                    }
+                }
+            });
+        }
     }
     Some(scalar_num(count as f64))
 }
@@ -7065,6 +7079,18 @@ fn read_property(store: &Store, col: &Col, key: &str) -> Col {
     // An edge slot reads an EDGE property (boxed map, keyed by eid). A `u32::MAX`
     // eid is the OPTIONAL null sentinel → NULL.
     if let Col::Edges(eids) = col {
+        // Fastest path: the typed numeric overlay — read `data[eid]` as a raw f64 with
+        // NO per-edge hash probe (the boxed `map.get` below). Only when every edge has
+        // a present value (the null sentinel `u32::MAX` indexes past `present`, so it
+        // fails the check and falls through to the null-carrying general column).
+        if let Some((data, present)) = store.edge_num_column(key) {
+            if eids
+                .iter()
+                .all(|&e| (e as usize) < present.len() && present[e as usize])
+            {
+                return Col::Num(eids.iter().map(|&e| data[e as usize]).collect());
+            }
+        }
         // Fast path: a fully-present NUMERIC edge property → a raw `Col::Num`, so the
         // downstream compare / aggregate hits the unboxed f64 path (the same win the
         // node columns already get). One outer hash lookup for `key`, then a probe

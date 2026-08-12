@@ -563,6 +563,19 @@ pub struct Store {
     csr_in_off: Vec<u32>,
     csr_in: Vec<Adj>,
     csr_fresh: bool,
+    /// TYPED READ OVERLAY of the numeric edge properties. `edge_props` (the boxed
+    /// eid→Value maps) stays the source of truth for writes / egress / codecs /
+    /// rollback; this densifies each HOMOGENEOUSLY-NUMERIC edge key into a raw
+    /// `Vec<f64>` + present bitset indexed by eid, so an edge-property filter /
+    /// projection reads a contiguous `f64` (no per-edge hash probe + `Value` unbox —
+    /// the cost that dominated `edge/wfilter`/`wproj`). Built at load and rebuilt on
+    /// demand; any edge-property write clears `edge_num_fresh`, and readers then fall
+    /// back to the boxed `edge_prop` (correct, just no speedup until the next
+    /// rebuild). A key with any non-numeric present value is omitted (readers use the
+    /// boxed path for it). Values are the SAME as `edge_prop`, so nothing observable
+    /// changes — it is a pure read encoding, like the CSR overlay.
+    edge_num: HashMap<String, (Vec<f64>, Vec<bool>)>,
+    edge_num_fresh: bool,
 }
 
 /// A hash index on a node property PATH. `path` is `["age"]` for a plain property
@@ -1034,6 +1047,7 @@ impl Store {
     /// eid.
     pub fn add_edge_with_id(&mut self, ext: &Arc<str>, from: u32, to: u32, label: &str) -> u32 {
         self.invalidate_csr();
+        self.invalidate_edge_num(); // next_eid grows; the eid-indexed overlay is stale
         assert!(
             (from as usize) < self.node_count && (to as usize) < self.node_count,
             "edge endpoint out of range"
@@ -1391,6 +1405,110 @@ impl Store {
         self.edge_props.get(key)
     }
 
+    /// The dense numeric READ overlay for edge-property `key` — `(data, present)`
+    /// indexed by eid — or `None` when the overlay is stale (an edge write happened),
+    /// the key is absent, or the key is not homogeneously numeric. When present,
+    /// `data[eid]`/`present[eid]` read the SAME value as [`Self::edge_prop`] with no
+    /// hash probe or `Value` unbox. Callers fall back to `edge_prop` on `None`.
+    #[must_use]
+    pub fn edge_num_column(&self, key: &str) -> Option<(&[f64], &[bool])> {
+        if !self.edge_num_fresh {
+            return None;
+        }
+        self.edge_num
+            .get(key)
+            .map(|(d, p)| (d.as_slice(), p.as_slice()))
+    }
+
+    /// Rebuild the numeric edge-property overlay from the boxed `edge_props` source of
+    /// truth: one dense `Vec<f64>` + present bitset per HOMOGENEOUSLY-NUMERIC key,
+    /// indexed by eid. A key with any non-numeric present value is omitted. Called at
+    /// load; a write invalidates it (readers fall back until the next rebuild).
+    pub fn rebuild_edge_num(&mut self) {
+        let n = self.next_eid as usize;
+        self.edge_num.clear();
+        for (key, map) in &self.edge_props {
+            if map.values().all(|v| matches!(v, Value::Num(_))) {
+                let mut data = vec![0.0f64; n];
+                let mut present = vec![false; n];
+                for (&eid, v) in map {
+                    if let Value::Num(x) = v {
+                        let i = eid as usize;
+                        if i < n {
+                            data[i] = *x;
+                            present[i] = true;
+                        }
+                    }
+                }
+                self.edge_num.insert(key.clone(), (data, present));
+            }
+        }
+        self.edge_num_fresh = true;
+    }
+
+    fn invalidate_edge_num(&mut self) {
+        self.edge_num_fresh = false;
+    }
+
+    /// Keep the numeric edge overlay in step with a `set_edge_prop` (called AFTER the
+    /// boxed map is updated). A no-op when the overlay is stale. A Num write updates
+    /// or (on a key's first appearance / re-promotion) full-builds that key's dense
+    /// arrays from the boxed map; a non-Num write demotes the key (readers fall back
+    /// to the boxed path for it). Keeps `edge_num_column` byte-identical to
+    /// `edge_prop`.
+    fn edge_num_on_set(&mut self, eid: u32, key: &str) {
+        if !self.edge_num_fresh {
+            return;
+        }
+        let is_num = matches!(
+            self.edge_props.get(key).and_then(|m| m.get(&eid)),
+            Some(Value::Num(_))
+        );
+        if !is_num {
+            self.edge_num.remove(key); // a non-numeric present value → not an overlay key
+            return;
+        }
+        if self.edge_num.contains_key(key) {
+            let Some(Value::Num(x)) = self.edge_props.get(key).and_then(|m| m.get(&eid)) else {
+                return;
+            };
+            let x = *x;
+            if let Some((data, present)) = self.edge_num.get_mut(key) {
+                data[eid as usize] = x;
+                present[eid as usize] = true;
+            }
+            return;
+        }
+        // First value for this key (or a re-promotion): build its arrays from the boxed
+        // map, which now includes this write — only when EVERY present value is Num.
+        let n = self.next_eid as usize;
+        if let Some(map) = self.edge_props.get(key) {
+            if map.values().all(|v| matches!(v, Value::Num(_))) {
+                let mut data = vec![0.0f64; n];
+                let mut present = vec![false; n];
+                for (&e, v) in map {
+                    if let Value::Num(x) = v {
+                        data[e as usize] = *x;
+                        present[e as usize] = true;
+                    }
+                }
+                self.edge_num.insert(key.to_string(), (data, present));
+            }
+        }
+    }
+
+    /// Keep the overlay in step with a `remove_edge_prop` (the key reads NULL again).
+    fn edge_num_on_remove(&mut self, eid: u32, key: &str) {
+        if !self.edge_num_fresh {
+            return;
+        }
+        if let Some((_, present)) = self.edge_num.get_mut(key) {
+            if let Some(p) = present.get_mut(eid as usize) {
+                *p = false;
+            }
+        }
+    }
+
     /// Whether edge `eid` carries a present value for `key`.
     #[must_use]
     pub fn has_edge_prop(&self, eid: u32, key: &str) -> bool {
@@ -1410,6 +1528,7 @@ impl Store {
             .entry(key.to_string())
             .or_default()
             .insert(eid, value);
+        self.edge_num_on_set(eid, key); // keep the typed read overlay in step
         if let (Some(rec), Some(log)) = (rec, self.undo.as_mut()) {
             log.push(rec);
         }
@@ -1682,6 +1801,7 @@ impl Store {
         if let Some(m) = self.edge_props.get_mut(key) {
             m.remove(&eid);
         }
+        self.edge_num_on_remove(eid, key); // keep the typed read overlay in step
         if let (Some(rec), Some(log)) = (rec, self.undo.as_mut()) {
             log.push(rec);
         }
@@ -1701,6 +1821,7 @@ impl Store {
     /// e.g. from a hop matched via incoming adjacency). A no-op if already gone.
     pub fn delete_edge(&mut self, u: u32, v: u32, eid: u32) {
         self.invalidate_csr();
+        self.invalidate_edge_num();
         let logging = self.undo.is_some();
         let mut removed: Vec<(u32, bool, Adj)> = Vec::new();
         for node in [u, v] {
@@ -1747,6 +1868,7 @@ impl Store {
     /// absent from all scans and traversals. A no-op if already deleted.
     pub fn delete_node(&mut self, id: u32) {
         self.invalidate_csr();
+        self.invalidate_edge_num(); // deletes incident edges
         let i = id as usize;
         if self.deleted[i] {
             return;
@@ -1980,6 +2102,7 @@ impl Store {
         // Rollback replays adjacency changes; conservatively drop the overlay (a
         // prop-only undo also clears it — harmless, just forces one rebuild).
         self.invalidate_csr();
+        self.invalidate_edge_num();
         match rec {
             Undo::AddNode => self.pop_last_node(),
             Undo::AddEdge { u, v, eid } => self.delete_edge(u, v, eid),
@@ -2228,9 +2351,13 @@ impl Builder {
             csr_in_off: Vec::new(),
             csr_in: Vec::new(),
             csr_fresh: false,
+            edge_num: HashMap::new(),
+            edge_num_fresh: false,
         };
-        // Flatten the freshly-built adjacency into the CSR read overlay.
+        // Flatten the freshly-built adjacency into the CSR read overlay, and densify
+        // the numeric edge properties into the typed read overlay.
         st.rebuild_csr();
+        st.rebuild_edge_num();
         st
     }
 }
@@ -2834,6 +2961,70 @@ mod tests {
         st.remove_edge_prop(eid, "weight");
         assert!(!st.has_edge_prop(eid, "weight"));
         assert!(st.edge_prop(eid, "weight").is_null());
+    }
+
+    /// The numeric edge overlay tracks the boxed source of truth through every
+    /// mutation, and demotes a key that gains a non-numeric value.
+    #[test]
+    fn edge_num_overlay_tracks_boxed() {
+        // Edges via the Builder (as the bench / from_ndjson do), so build() leaves the
+        // overlay fresh and the incremental set-maintenance keeps it so.
+        let mut b = Builder::default();
+        let ids: Vec<u32> = (0..6).map(|_| b.node(&[], &[])).collect();
+        for i in 0..5 {
+            b.edge(ids[i], ids[i + 1], "R");
+        }
+        let mut st = b.build();
+        let eids: Vec<u32> = (0..5).map(|i| st.out(i)[0].eid).collect();
+        // Overlay agrees with edge_prop for every eid, for a numeric key.
+        let agree = |st: &Store, key: &str| {
+            let Some((data, present)) = st.edge_num_column(key) else {
+                return None; // key not overlaid
+            };
+            for (idx, &eid) in eids.iter().enumerate() {
+                let boxed = st.edge_prop(eid, key);
+                let ov = if present[eid as usize] {
+                    Value::Num(data[eid as usize])
+                } else {
+                    Value::Null
+                };
+                assert!(
+                    crate::value::equals(&boxed, &ov) || (boxed.is_null() && ov.is_null()),
+                    "overlay/boxed mismatch at eid {eid} (row {idx})"
+                );
+            }
+            Some(())
+        };
+        for &eid in &eids {
+            st.set_edge_prop(eid, "w", n(f64::from(eid) * 2.0));
+        }
+        assert!(
+            agree(&st, "w").is_some(),
+            "w should be overlaid after bulk set"
+        );
+        // Remove one, mutate another — overlay still agrees.
+        st.remove_edge_prop(eids[1], "w");
+        st.set_edge_prop(eids[2], "w", n(99.0));
+        agree(&st, "w");
+        // A non-numeric write demotes the key (readers fall back to boxed).
+        st.set_edge_prop(eids[0], "w", s("hello"));
+        assert!(
+            st.edge_num_column("w").is_none(),
+            "a Str value demotes the overlay"
+        );
+        assert!(matches!(st.edge_prop(eids[0], "w"), Value::Str(ref x) if &**x == "hello"));
+        // A separate numeric key stays overlaid and correct.
+        st.set_edge_prop(eids[3], "k", n(7.0));
+        st.set_edge_prop(eids[4], "k", n(8.0));
+        assert!(agree(&st, "k").is_some());
+        // A fresh add_edge invalidates the overlay (eid space grew) → boxed fallback.
+        st.add_edge(0, 2, "R");
+        assert!(
+            st.edge_num_column("k").is_none(),
+            "add_edge invalidates the overlay"
+        );
+        assert!(matches!(st.edge_prop(eids[3], "k"), Value::Num(x) if x == 7.0));
+        // boxed still right
     }
 
     /// An edge property write rolls back with the transaction.
