@@ -350,8 +350,14 @@ impl Parser {
         if self.eat_kw("CALL") {
             return self.call_procedure();
         }
+        // A bare `RETURN <items>` with no MATCH — a "return statement" (ISO GQL primary
+        // query). It projects its items over ONE unit row (`Plan::Row`), so literals,
+        // arithmetic, function calls and `count(*)` (= 1) evaluate with no bindings.
+        if self.peek_kw("RETURN") {
+            return self.query_tail(Plan::Row);
+        }
         if !self.eat_kw("MATCH") {
-            return Err("expected MATCH, INSERT, or CALL".into());
+            return Err("expected MATCH, INSERT, CALL, or RETURN".into());
         }
         // Named-path form: `MATCH p = ANY SHORTEST (a)-[:R]->*(b)`. The path
         // variable binds to the row's path (lineage); the rest of the query
@@ -3822,7 +3828,8 @@ mod tests {
     fn parse_errors_are_reported_not_panicked() {
         assert!(super::parse("MATCH (p:Person").is_err()); // unclosed
         assert!(super::parse("MATCH (p:Person) RETURN q.name").is_err()); // unknown var
-        assert!(super::parse("RETURN 1").is_err()); // no MATCH
+        assert!(super::parse("RETURN 1").is_ok()); // bare RETURN is a valid statement
+        assert!(super::parse("RETURN").is_err()); // …but RETURN needs at least one item
         assert!(super::parse("MATCH (p:Person) WHERE p.age > RETURN p.name").is_err());
     }
 

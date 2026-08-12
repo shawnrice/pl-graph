@@ -741,7 +741,11 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
         // `Row` is the leaf of an EXISTS body and is only ever fed a batch by
         // `pull_body`; reaching it through the main pipeline is a bug.
         Plan::Row => {
-            return Err("Plan::Row is only valid inside an EXISTS body".into());
+            // ONE unit row (a single dummy cell so `rows()` == 1) — the input to a
+            // bare `RETURN <items>` with no MATCH. A row with no bound variables; the
+            // projected items reference no slots. (Inside an EXISTS body, `Plan::Row`
+            // is seeded by `pull_body`, not this path.)
+            Batch::single(Col::Num(vec![0.0]))
         }
         Plan::Scan { label } => {
             let ids = match label {
