@@ -752,6 +752,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::OptionalExpand { input, .. }
         | Plan::VarLength { input, .. }
         | Plan::RepeatGroup { input, .. }
+        | Plan::NestedGroup { input, .. }
         | Plan::ShortestPath { input, .. }
         | Plan::Distinct { input }
         | Plan::Tail { input, .. }
@@ -982,6 +983,25 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             group_binds,
             per_rep_pred.as_deref(),
             *k,
+        ),
+        Plan::NestedGroup {
+            input,
+            from,
+            unit,
+            min,
+            max,
+            mode,
+            endpoint_slot: _,
+            bind_slots,
+        } => nested_group(
+            &pull(input, store, track)?,
+            store,
+            *from,
+            unit,
+            *min,
+            *max,
+            *mode,
+            bind_slots,
         ),
         Plan::ShortestPath {
             input,
@@ -5179,6 +5199,378 @@ fn push_group_cols(
         };
         group_cols[i].push(Value::List(list));
     }
+}
+
+// ── NESTED subpath groups (`Plan::NestedGroup`) ──────────────────────────────
+
+/// One graph-consuming hop of a matched trail, tagged with its position in the
+/// (nested) repetition pattern. `levels` is the cursor stack outer→inner: one
+/// `(rep, elem_after)` per active unit — `elem_after` is the element index the hop
+/// advanced PAST, EXCEPT that a step inside a `Sub` keeps the enclosing unit's entry
+/// pinned at that Sub's element index. This is what lets the structured binder place
+/// each variable at the right nesting depth. Mirrors core's `pathfind::StepRec`.
+struct StepRec {
+    levels: Vec<(u32, usize)>,
+    source: u32,
+    edge: u32,
+    target: u32,
+}
+
+/// A partially-built nested list keyed by a rep-tuple: `insert([i,j], v)` puts `v` at
+/// `list[i][j]`, growing intermediate lists. Depth-`d` variable → `d+1`-element keys.
+enum Nest {
+    Leaf(Value),
+    List(Vec<Nest>),
+}
+impl Nest {
+    fn insert(&mut self, idx: &[u32], val: Value) {
+        match idx.split_first() {
+            None => *self = Nest::Leaf(val),
+            Some((&i, rest)) => {
+                if !matches!(self, Nest::List(_)) {
+                    *self = Nest::List(Vec::new());
+                }
+                if let Nest::List(v) = self {
+                    let i = i as usize;
+                    while v.len() <= i {
+                        v.push(Nest::List(Vec::new()));
+                    }
+                    v[i].insert(rest, val);
+                }
+            }
+        }
+    }
+    fn into_val(self) -> Value {
+        match self {
+            Nest::Leaf(v) => v,
+            Nest::List(items) => Value::List(items.into_iter().map(Nest::into_val).collect()),
+        }
+    }
+}
+
+/// Assemble every bound variable of `unit` (recursively into its `Sub`s) as a
+/// (possibly nested) list keyed by the repetition counters of the units it sits in —
+/// one list level per enclosing quantifier. `tree_path` is the `Sub`-element indices
+/// from the top unit to THIS one, so `depth = tree_path.len()` is its nesting depth.
+/// A node/edge id is stored as `Value::Num(id)` (the group-variable convention; the
+/// `x[i].prop` element-typing reads it back). Mirrors core's `pathfind::bind_unit`
+/// with `key_start = 0`.
+fn bind_nested(
+    unit: &crate::ir::GUnit,
+    tree_path: &[usize],
+    steps: &[StepRec],
+    out: &mut Vec<(usize, Value)>,
+) {
+    use crate::ir::GElem;
+    let depth = tree_path.len();
+    let key = |s: &StepRec| -> Vec<u32> { s.levels[0..=depth].iter().map(|(r, _)| *r).collect() };
+    let within = |s: &StepRec| -> bool {
+        s.levels.len() > depth
+            && s.levels[..depth]
+                .iter()
+                .map(|(_, e)| *e)
+                .eq(tree_path.iter().copied())
+    };
+    // The unit's source = each rep-instance's FIRST hop's source (deduped per key).
+    if let Some(slot) = unit.start_slot {
+        let mut nest = Nest::List(Vec::new());
+        let mut seen: std::collections::HashSet<Vec<u32>> = std::collections::HashSet::new();
+        for s in steps.iter().filter(|s| within(s)) {
+            let k = key(s);
+            if seen.insert(k.clone()) {
+                nest.insert(&k, Value::Num(f64::from(s.source)));
+            }
+        }
+        out.push((slot, nest.into_val()));
+    }
+    for (e, elem) in unit.elems.iter().enumerate() {
+        match elem {
+            GElem::Hop {
+                edge_slot,
+                target_slot,
+                ..
+            } => {
+                let direct = |s: &&StepRec| {
+                    within(s) && s.levels.len() == depth + 1 && s.levels[depth].1 == e + 1
+                };
+                if let Some(slot) = target_slot {
+                    let mut nest = Nest::List(Vec::new());
+                    for s in steps.iter().filter(direct) {
+                        nest.insert(&key(s), Value::Num(f64::from(s.target)));
+                    }
+                    out.push((*slot, nest.into_val()));
+                }
+                if let Some(slot) = edge_slot {
+                    let mut nest = Nest::List(Vec::new());
+                    for s in steps.iter().filter(direct) {
+                        nest.insert(&key(s), Value::Num(f64::from(s.edge)));
+                    }
+                    out.push((*slot, nest.into_val()));
+                }
+            }
+            GElem::Sub {
+                unit: sub,
+                target_slot,
+                ..
+            } => {
+                // The Sub's landing = its LAST inner hop's target, per rep-instance.
+                if let Some(slot) = target_slot {
+                    let mut last: Vec<(Vec<u32>, u32)> = Vec::new();
+                    for s in steps.iter().filter(|s| {
+                        within(s) && s.levels.len() > depth + 1 && s.levels[depth].1 == e
+                    }) {
+                        let k = key(s);
+                        match last.iter_mut().find(|(kk, _)| *kk == k) {
+                            Some(slot) => slot.1 = s.target,
+                            None => last.push((k, s.target)),
+                        }
+                    }
+                    let mut nest = Nest::List(Vec::new());
+                    for (k, t) in last {
+                        nest.insert(&k, Value::Num(f64::from(t)));
+                    }
+                    out.push((*slot, nest.into_val()));
+                }
+                let mut child = tree_path.to_vec();
+                child.push(e);
+                bind_nested(sub, &child, steps, out);
+            }
+        }
+    }
+}
+
+/// `Plan::NestedGroup`: a subpath group `( <unit> ){min,max}` whose body is a single
+/// nested quantified sub-group / quantified inner hop (the 2-level shape the corpus
+/// and fuzzer produce: `( ((x)-[e]->(y)){a,b} ){c,d}` and `( (x)-[e]->{a,b}(y)
+/// ){c,d}`). Enumerates every valid outer×inner repetition-decomposition as a TRAIL
+/// and materializes each bound inner variable as a (nested) list via `bind_nested`.
+#[allow(clippy::too_many_arguments)]
+fn nested_group(
+    batch: &Batch,
+    store: &Store,
+    from: usize,
+    unit: &crate::ir::GUnit,
+    min: u32,
+    max: u32,
+    mode: PathMode,
+    bind_slots: &[usize],
+) -> Batch {
+    use crate::ir::GElem;
+    let empty = || {
+        let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
+        slots.push(Col::Nodes(vec![]));
+        for _ in bind_slots {
+            slots.push(Col::Gen(vec![]));
+        }
+        Batch::of(slots)
+    };
+    // The 2-level shape: the outer body is exactly one `Sub` (the inner group), whose
+    // body is FLAT (hops only). Anything else is unsupported here → no rows.
+    let GElem::Sub {
+        unit: sub,
+        min: imin,
+        max: imax,
+        ..
+    } = (match unit.elems.as_slice() {
+        [only] => only,
+        _ => return empty(),
+    })
+    else {
+        return empty();
+    };
+    if sub.elems.iter().any(|el| matches!(el, GElem::Sub { .. })) {
+        return empty(); // deeper than 2 levels — not supported yet
+    }
+    // Inner flat unit: `ik` hops per inner rep; resolve each hop's wanted edge types.
+    let ik = sub.elems.len();
+    let mut inner_want: Vec<Vec<u32>> = Vec::with_capacity(ik);
+    let mut inner_dir: Vec<Dir> = Vec::with_capacity(ik);
+    for el in &sub.elems {
+        let GElem::Hop { dir, etypes, .. } = el else {
+            return empty();
+        };
+        match want_etypes(store, etypes) {
+            Ok(w) => inner_want.push(w),
+            Err(()) => inner_want.push(vec![u32::MAX]), // unknown type: matches nothing
+        }
+        inner_dir.push(*dir);
+    }
+    let Col::Nodes(src) = batch.slot(from) else {
+        return empty();
+    };
+    let trail = matches!(mode, PathMode::Trail);
+    let node_unique = matches!(mode, PathMode::Simple | PathMode::Acyclic);
+
+    let mut keep: Vec<usize> = Vec::new();
+    let mut ends: Vec<u32> = Vec::new();
+    let mut cols: Vec<Vec<Value>> = vec![Vec::new(); bind_slots.len()];
+
+    // Recursion state, carried in a small struct to keep the many closures honest.
+    struct M<'a> {
+        store: &'a Store,
+        ik: usize,
+        inner_want: &'a [Vec<u32>],
+        inner_dir: &'a [Dir],
+        omin: u32,
+        omax: u32,
+        imin: u32,
+        imax: u32,
+        trail: bool,
+        node_unique: bool,
+        used_edges: Vec<u32>,
+        used_nodes: Vec<u32>,
+        steps: Vec<StepRec>,
+    }
+    let mut m = M {
+        store,
+        ik,
+        inner_want: &inner_want,
+        inner_dir: &inner_dir,
+        omin: min,
+        omax: max,
+        imin: *imin,
+        imax: *imax,
+        trail,
+        node_unique,
+        used_edges: Vec::new(),
+        used_nodes: Vec::new(),
+        steps: Vec::new(),
+    };
+
+    impl M<'_> {
+        // One hop from `v` along inner hop position `ie` (0..ik). Calls `f(target)`
+        // for each admissible neighbour, with the StepRec pushed. Restores on return.
+        fn hop(
+            &mut self,
+            v: u32,
+            orep: u32,
+            irep: u32,
+            ie: usize,
+            mut f: impl FnMut(&mut Self, u32),
+        ) {
+            let want = &self.inner_want[ie];
+            let dir = self.inner_dir[ie];
+            let mut adjs: Vec<crate::store::Adj> = Vec::new();
+            if matches!(dir, Dir::Out | Dir::Both) {
+                adjs.extend_from_slice(self.store.out(v));
+            }
+            if matches!(dir, Dir::In | Dir::Both) {
+                adjs.extend_from_slice(self.store.inc(v));
+            }
+            for a in adjs {
+                if !edge_carries_wanted(self.store, &a, want) {
+                    continue;
+                }
+                if self.trail && self.used_edges.contains(&a.eid) {
+                    continue;
+                }
+                if self.node_unique && self.used_nodes.contains(&a.nbr) {
+                    continue;
+                }
+                // levels: enclosing outer unit pinned at its Sub element (index 0),
+                // then this inner unit's (irep, advanced-past element).
+                self.steps.push(StepRec {
+                    levels: vec![(orep, 0), (irep, ie + 1)],
+                    source: v,
+                    edge: a.eid,
+                    target: a.nbr,
+                });
+                if self.trail {
+                    self.used_edges.push(a.eid);
+                }
+                if self.node_unique {
+                    self.used_nodes.push(a.nbr);
+                }
+                f(self, a.nbr);
+                if self.node_unique {
+                    self.used_nodes.pop();
+                }
+                if self.trail {
+                    self.used_edges.pop();
+                }
+                self.steps.pop();
+            }
+        }
+
+        // Match ONE inner rep (ik hops) from `v`, then `cont(end)`.
+        fn inner_rep(
+            &mut self,
+            v: u32,
+            orep: u32,
+            irep: u32,
+            ie: usize,
+            cont: &mut dyn FnMut(&mut Self, u32),
+        ) {
+            if ie == self.ik {
+                cont(self, v);
+                return;
+            }
+            self.hop(v, orep, irep, ie, |slf, nbr| {
+                slf.inner_rep(nbr, orep, irep, ie + 1, cont)
+            });
+        }
+
+        // The inner var-length: repeat the inner unit [imin,imax] times from `v`,
+        // calling `cont(end)` at each inner-rep-count boundary in range.
+        fn inner_walk(
+            &mut self,
+            v: u32,
+            orep: u32,
+            irep: u32,
+            cont: &mut dyn FnMut(&mut Self, u32),
+        ) {
+            if irep >= self.imin {
+                cont(self, v);
+            }
+            if irep < self.imax {
+                let mut c = |slf: &mut Self, end: u32| slf.inner_walk(end, orep, irep + 1, cont);
+                self.inner_rep(v, orep, irep, 0, &mut c);
+            }
+        }
+
+        // The outer repetition: repeat the whole unit [omin,omax] times from `v`,
+        // emitting the endpoint at each outer-rep-count boundary in range.
+        fn outer_walk(&mut self, v: u32, orep: u32, emit: &mut dyn FnMut(&mut Self, u32)) {
+            if orep >= self.omin {
+                emit(self, v);
+            }
+            if orep < self.omax {
+                let mut c = |slf: &mut Self, end: u32| slf.outer_walk(end, orep + 1, emit);
+                self.inner_walk(v, orep, 0, &mut c);
+            }
+        }
+    }
+
+    for (row, &s) in src.iter().enumerate() {
+        if m.node_unique {
+            m.used_nodes.push(s);
+        }
+        let mut emit = |slf: &mut M, end: u32| {
+            keep.push(row);
+            ends.push(end);
+            let mut pairs: Vec<(usize, Value)> = Vec::new();
+            bind_nested(unit, &[], &slf.steps, &mut pairs);
+            for (ci, &want_slot) in bind_slots.iter().enumerate() {
+                let v = pairs
+                    .iter()
+                    .find(|(sl, _)| *sl == want_slot)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or(Value::Null);
+                cols[ci].push(v);
+            }
+        };
+        m.outer_walk(s, 0, &mut emit);
+        if m.node_unique {
+            m.used_nodes.pop();
+        }
+    }
+
+    let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
+    slots.push(Col::Nodes(ends));
+    for c in cols {
+        slots.push(Col::Gen(c));
+    }
+    Batch::of(slots)
 }
 
 /// Depth-first path enumeration for `var_length`. Emits `(row, endpoint)` at
@@ -9570,11 +9962,19 @@ mod tests {
         let mut v = names_of(&run(&plan, &store), 0);
         v.sort();
         assert_eq!(v, vec!["b", "c", "d"]); // reachable in 1..3 hops
-                                            // A multi-repetition nested group is rejected (needs rep-decomposition).
-        assert!(crate::gql::parse(
-            "MATCH (s:N {id:'a'}) ( ()-[:R]->{1,2}() ){2} (t) RETURN t.id AS id"
-        )
-        .is_err());
+                                            // A MULTI-repetition endpoint-only nested group now enumerates each
+                                            // rep-decomposition (`Plan::NestedGroup`): `( ()-[:R]->{1,2}() ){2}` from a on
+                                            // the chain a->b->c->d = 2 outer reps, each 1-2 hops (trail). Endpoints (with
+                                            // multiplicity, one row per decomposition): 2+2=c, 2+... only c and d reach.
+                                            // a->b then b->c (c), a->b then b->c->d (d), a->b->c then c->d (d).
+        let plan2 = crate::opt::optimize_indexed(
+            crate::gql::parse("MATCH (s:N {id:'a'}) ( ()-[:R]->{1,2}() ){2} (t) RETURN t.id AS id")
+                .unwrap(),
+            &store,
+        );
+        let mut v2 = names_of(&run(&plan2, &store), 0);
+        v2.sort();
+        assert_eq!(v2, vec!["c", "d", "d"]);
     }
 
     /// A repeated pattern variable on a var-length landing is an equality join: an
@@ -9759,6 +10159,71 @@ mod tests {
         assert!(
             ids("MATCH (s:N {id:'a'}) ((x)-[e1:R]->(m)-[e2:R]->(y) WHERE e2.amt < e1.amt){1,2} (t) RETURN t.id AS id")
                 .is_empty()
+        );
+    }
+
+    /// NESTED subpath groups (`Plan::NestedGroup`): group variables materialize as
+    /// (nested) lists — one list level per enclosing quantifier. On the triangle
+    /// a->b->c->a: family 4 `( (x)-[e:R]->{1,2}(y) ){1,2}` binds x/y once per OUTER rep
+    /// (depth 1) and e as a list-of-lists (depth 2); family 3 `( ((x)-[e]->(y)){1,2}
+    /// ){1,2}` binds x as a list-of-lists (depth 2).
+    #[test]
+    fn nested_subpath_groups() {
+        // Chain a->b->c->d->e (ids 0..4).
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":0}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":1}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":2}}\n",
+            "{\"id\":\"d\",\"labels\":[\"N\"],\"props\":{\"id\":3}}\n",
+            "{\"id\":\"e\",\"labels\":[\"N\"],\"props\":{\"id\":4}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{}}\n",
+            "{\"from\":\"b\",\"to\":\"c\",\"labels\":[\"R\"],\"props\":{}}\n",
+            "{\"from\":\"c\",\"to\":\"d\",\"labels\":[\"R\"],\"props\":{}}\n",
+            "{\"from\":\"d\",\"to\":\"e\",\"labels\":[\"R\"],\"props\":{}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let rows = |q: &str| -> Vec<Vec<f64>> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            let mut v: Vec<Vec<f64>> = run(&plan, &store)
+                .rows
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|c| match c {
+                            Value::Num(x) => *x,
+                            o => panic!("{o:?}"),
+                        })
+                        .collect()
+                })
+                .collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v
+        };
+        // Family 4 from a: the 6 trail decompositions of outer{1,2}×inner{1,2}.
+        // (tid, size(x), size(e)) — size(x)/size(e) = the outer rep count.
+        assert_eq!(
+            rows(
+                "MATCH (s:N {id:0}) ( (x)-[e:R]->{1,2}(y) ){1,2} (t) \
+                  RETURN t.id AS tid, size(x) AS nx, size(e) AS ne"
+            ),
+            vec![
+                vec![1.0, 1.0, 1.0],
+                vec![2.0, 1.0, 1.0],
+                vec![2.0, 2.0, 2.0],
+                vec![3.0, 2.0, 2.0],
+                vec![3.0, 2.0, 2.0],
+                vec![4.0, 2.0, 2.0],
+            ]
+        );
+        // Family 3 `( ((x)-[e]->(y)){2,2} ){2} (t)` from a: exactly one match — 2 outer
+        // reps of 2 inner hops = the 4-hop trail a->b->c->d->e, endpoint e(4). x is
+        // depth-2: size(x)=2 (outer), size(x[0])=2 (inner), x[0][0]=a(0).
+        assert_eq!(
+            rows(
+                "MATCH (s:N {id:0}) ( ((x)-[e:R]->(y)){2,2} ){2} (t) \
+                  RETURN t.id AS tid, size(x) AS nx, size(x[0]) AS nx0, x[0][0].id AS a00"
+            ),
+            vec![vec![4.0, 2.0, 2.0, 0.0]]
         );
     }
 

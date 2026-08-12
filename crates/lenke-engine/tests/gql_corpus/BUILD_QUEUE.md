@@ -526,6 +526,7 @@ engine parse-error on a shape core supports = hard failure with repro) / `off`. 
 guard + `FUZZ_TRACE=1`.
 
 Building it immediately found + fixed 3 real byte-identity bugs in ALREADY-shipped constructs:
+
 - ANY SHORTEST `->+(t)` now admits the SOURCE at the shortest CYCLE length (collect cycle-closing edges
   in the BFS). This IS any_shortest_plus_seed_cycle_len — now cleared (the count already reflects it).
 - shortest `->*` and group `*`/`{0,…}` over an UNKNOWN edge type now still emit the zero-rep source

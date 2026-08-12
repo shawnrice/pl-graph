@@ -61,6 +61,40 @@ pub enum GroupPos {
     EdgeAt(u32),
 }
 
+/// A subpath-group UNIT for the general (possibly NESTED) matcher — an ordered list
+/// of elements plus the unit's own source-variable slot. Mirrors core's `CUnit`. A
+/// bound variable's list-nesting depth equals the number of enclosing quantified
+/// sub-units, so `bind_nested` assembles each as a `Value::List` (of lists) keyed by
+/// the repetition counters of the units it sits inside. Used by `Plan::NestedGroup`;
+/// the FLAT single-level case still lowers to `Plan::RepeatGroup`.
+#[derive(Clone, Debug)]
+pub struct GUnit {
+    /// The unit's source node variable (`x` in `(x)-[e]->(y)`), bound once per rep.
+    pub start_slot: Option<usize>,
+    pub elems: Vec<GElem>,
+}
+
+/// One element of a [`GUnit`]: a single hop, or a nested quantified sub-unit.
+#[derive(Clone, Debug)]
+pub enum GElem {
+    /// A single graph hop. `edge_slot`/`target_slot` bind the edge / landing node as
+    /// group variables (at THIS unit's nesting depth).
+    Hop {
+        dir: Dir,
+        etypes: Vec<String>,
+        edge_slot: Option<usize>,
+        target_slot: Option<usize>,
+    },
+    /// A nested quantified sub-group `( <unit> ){min,max}`. `target_slot` binds the
+    /// sub-group's landing (its last inner hop's target, per outer rep).
+    Sub {
+        unit: Box<GUnit>,
+        min: u32,
+        max: u32,
+        target_slot: Option<usize>,
+    },
+}
+
 /// Element typing for a subscript whose base is a group-variable LIST: a group node
 /// list (`x`/`y`) makes `x[i]` a node (so `x[i].prop` resolves the node property),
 /// an edge list (`e`) makes it an edge. `Plain` is an ordinary list/record subscript
@@ -537,6 +571,24 @@ pub enum Plan {
         /// edge=1, target=2), evaluated at each hop; a hop that fails it is pruned.
         /// `None` = no per-rep filter.
         per_rep_pred: Option<Box<Expr>>,
+    },
+    /// `( <unit> ){min,max}` where the body itself contains a quantified sub-group
+    /// (`( (…){a,b} ){c,d}`) or a quantified inner hop (`( (x)-[e]->{a,b}(y) ){c,d}`)
+    /// — the general NESTED subpath group. Each valid repetition-decomposition is one
+    /// trail; every bound inner variable is materialized as a (possibly nested) list,
+    /// one list level per enclosing quantifier. Output layout: the input columns, then
+    /// the endpoint at `endpoint_slot`, then one list column per `bind_slots` entry (in
+    /// slot order). The flat single-level case stays on [`RepeatGroup`].
+    NestedGroup {
+        input: Box<Plan>,
+        from: usize,
+        unit: GUnit,
+        min: u32,
+        max: u32,
+        mode: PathMode,
+        endpoint_slot: usize,
+        /// Every bound inner-variable slot, ascending — the trailing list columns.
+        bind_slots: Vec<usize>,
     },
     /// Shortest-path reach: BFS from the element in `from` along `dir`/
     /// `edge_label`, emitting EACH reachable target once at its shortest distance

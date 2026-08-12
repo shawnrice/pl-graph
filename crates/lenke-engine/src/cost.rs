@@ -149,6 +149,12 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
             }
             estimate(input, store).scale(mult, false)
         }
+        // A nested group enumerates outer×inner repetition-decompositions — a large
+        // fan-out; approximate as a degree-driven blow-up over the outer×inner range.
+        Plan::NestedGroup { input, max, .. } => {
+            let d = avg_degree(store).max(1.0);
+            estimate(input, store).scale(d.powi(i32::try_from(*max).unwrap_or(1).max(1)), false)
+        }
         Plan::ShortestPath { input, .. } => {
             // ANY-shortest emits ~one row per reachable target; without running a
             // BFS we cap at the whole graph — a deliberate over-estimate that routes

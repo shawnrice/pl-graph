@@ -258,20 +258,8 @@ pub fn gen_hard(rng: &mut Rng, s: &Schema, caps: &Caps, src_id: usize) -> Option
             let (outer, _, _) = quant_bounded(rng);
             let bind_edge = rng.chance(1, 2);
             let ev = if bind_edge { "e" } else { "" };
-            let inner_where = if caps.per_rep && rng.chance(1, 4) {
-                tags.push("nested-per-rep-where");
-                if bind_edge {
-                    format!(
-                        " WHERE size(e) {} {}",
-                        rng.pick(&["=", ">="]),
-                        1 + rng.below(2)
-                    )
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            };
+            // A per-rep WHERE inside a NESTED group is deferred (epsilon/perrep binding).
+            let inner_where = "";
             let group = format!(
                 "( ((x)-[{ev}:{ety}]->(y){iw}){inner} ){outer}",
                 ety = s.etype,
@@ -292,7 +280,9 @@ pub fn gen_hard(rng: &mut Rng, s: &Schema, caps: &Caps, src_id: usize) -> Option
         _ => {
             tags.push("nested");
             tags.push("nested-varlen-inner");
-            let (inner, _, _) = quant(rng);
+            // Inner min >= 1: an empty inner rep (`{0,n}`) is an epsilon-closure case
+            // (core pads outer reps with 0-hop inner matches) handled separately.
+            let (inner, _, _) = quant_bounded(rng);
             let (outer, _, _) = quant_bounded(rng);
             let bind_edge = rng.chance(1, 2);
             let ev = if bind_edge { "e" } else { "" };

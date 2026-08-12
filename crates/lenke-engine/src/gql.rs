@@ -218,6 +218,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         path_vars: HashSet::new(),
         group_node_slots: HashSet::new(),
         group_edge_slots: HashSet::new(),
+        group_var_depth: HashMap::new(),
         lets: Vec::new(),
         suppress_in: false,
         path_mode: PathMode::Trail,
@@ -243,6 +244,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         p.path_vars = HashSet::new();
         p.group_node_slots = HashSet::new();
         p.group_edge_slots = HashSet::new();
+        p.group_var_depth = HashMap::new();
         let right = p.query()?;
         plan = Plan::Union {
             left: Box::new(plan),
@@ -547,6 +549,10 @@ struct Parser {
     /// `x[i].prop` resolves the node/edge property. See `Plan::RepeatGroup`.
     group_node_slots: HashSet<usize>,
     group_edge_slots: HashSet<usize>,
+    /// The list-nesting DEPTH of a group-variable slot (1 = flat `x[i]`, 2 = a nested
+    /// group's `x[i][j]`). Absent → 1. Decides which subscript level yields the typed
+    /// element in `field_chain` (only the `depth`-th subscript is a node/edge).
+    group_var_depth: HashMap<usize, u8>,
     /// `LET name = expr IN …` local bindings (a stack for nesting). A reference to
     /// such a name in an expression inlines its bound `Expr` (substitution), so LET
     /// needs no runtime concept — the body is a plain expression once parsed.
@@ -2064,7 +2070,40 @@ impl Parser {
             // to the endpoint), so it lowers to `var_length`. The endpoint `(t)` that
             // follows is parsed and bound like any landing node.
             if self.is_subpath_group_start() {
-                let g = self.parse_subpath_group()?;
+                // Route the two-level NESTED shapes to the general nested parser: a
+                // group inside a group (`( ((…` — a third open paren), or — caught
+                // below — a quantified inner hop with bound variables / a multi-rep
+                // endpoint-only nested group that the flat parser can't express.
+                let save = self.pos;
+                let body_is_group = matches!(self.toks.get(self.pos + 2), Some(Tok::LParen));
+                let attempt = if body_is_group {
+                    Err("__nested__".to_string())
+                } else {
+                    self.parse_subpath_group()
+                };
+                let g = match attempt {
+                    Ok(g) if g.inner_quant.is_some() && (g.min != 1 || g.max != 1) => {
+                        // A multi-repetition endpoint-only nested group.
+                        self.pos = save;
+                        let (p, nf) = self.parse_nested_group(plan, scope, slots, from)?;
+                        plan = p;
+                        from = nf;
+                        continue;
+                    }
+                    Ok(g) => g,
+                    Err(e)
+                        if e == "__nested__"
+                            || e.contains("bound inner edge")
+                            || e.contains("bound inner variables") =>
+                    {
+                        self.pos = save;
+                        let (p, nf) = self.parse_nested_group(plan, scope, slots, from)?;
+                        plan = p;
+                        from = nf;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 let k = g.k;
                 // The endpoint `(t)` is OPTIONAL — `((x)-[e]->(y)){2}` (anonymous
                 // landing) is valid when only the group variables are used.
@@ -2548,6 +2587,171 @@ impl Parser {
             per_rep_pred,
             inner_quant: None,
         })
+    }
+
+    /// Parse a NESTED subpath group — the two-level shapes the flat parser rejects:
+    ///   family 3: `( ((x)-[e:R]->(y)){a,b} ){c,d} (t)` — a group inside a group;
+    ///             x/e/y bind as LIST-OF-LISTS (depth 2).
+    ///   family 4: `( (x)-[e:R]->{lo,hi}(y) ){c,d} (t)` — a quantified inner hop;
+    ///             x/y bind once per OUTER rep (depth 1), e is a list-of-lists (depth 2).
+    /// Builds a `Plan::NestedGroup` over a `GUnit` and binds each named inner variable
+    /// as a group list at its nesting depth. Returns the extended plan and the new
+    /// `from` (the endpoint slot). `self.pos` is on the outer `(`.
+    fn parse_nested_group(
+        &mut self,
+        plan: Plan,
+        scope: &mut HashMap<String, usize>,
+        slots: &mut usize,
+        from: usize,
+    ) -> Result<(Plan, usize), String> {
+        use crate::ir::{GElem, GUnit};
+        let bad_inner =
+            |n: &ParsedNode| n.1.is_some() || n.4.is_some() || !n.2.is_empty() || n.3.is_some();
+        self.expect(&Tok::LParen)?; // outer group `(`
+                                    // family 3 iff the body is itself a group (`( (( …`): the next token is `(`
+                                    // (the inner group) and the one after is `(` (the inner group's first node).
+        let family3 = matches!(self.peek(), Some(Tok::LParen))
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen));
+
+        // Parse the (single-hop) inner unit and the two quantifiers.
+        let (xvar, evar, dir, etypes, yvar, imin, imax, omin, omax) = if family3 {
+            self.expect(&Tok::LParen)?; // inner group `(`
+            let x = self.node()?;
+            let rel = self.rel()?;
+            let y = self.node()?;
+            if bad_inner(&x) || bad_inner(&y) || !rel.props.is_empty() || rel.where_range.is_some()
+            {
+                return Err(
+                    "labels/properties/WHERE inside a nested subpath group are not \
+                            supported yet"
+                        .into(),
+                );
+            }
+            self.expect(&Tok::RParen)?; // inner group `)`
+            let (imin, imax) = self
+                .opt_quantifier()?
+                .ok_or("the inner group of a nested subpath needs a quantifier")?;
+            self.expect(&Tok::RParen)?; // outer group `)`
+            let (omin, omax) = self
+                .opt_quantifier()?
+                .ok_or("a nested subpath group needs an outer quantifier")?;
+            (
+                x.0, rel.var, rel.dir, rel.etypes, y.0, imin, imax, omin, omax,
+            )
+        } else {
+            let x = self.node()?;
+            let rel = self.rel()?;
+            let (imin, imax) = self
+                .opt_quantifier()?
+                .ok_or("expected an inner `{lo,hi}` quantifier in a nested subpath group")?;
+            let y = self.node()?;
+            if bad_inner(&x) || bad_inner(&y) || !rel.props.is_empty() || rel.where_range.is_some()
+            {
+                return Err(
+                    "labels/properties/WHERE inside a nested subpath group are not \
+                            supported yet"
+                        .into(),
+                );
+            }
+            self.expect(&Tok::RParen)?; // outer group `)`
+            let (omin, omax) = self
+                .opt_quantifier()?
+                .ok_or("a nested subpath group needs an outer quantifier")?;
+            (
+                x.0, rel.var, rel.dir, rel.etypes, y.0, imin, imax, omin, omax,
+            )
+        };
+
+        // The endpoint `(t)` (optional — anonymous when only the group vars are used)
+        // is parsed BEFORE slots are assigned, because the executor's output columns
+        // are `[input…, endpoint, binds…]` — so the endpoint slot must come first, then
+        // one bind slot per named group variable, in the order the executor appends
+        // them (x, e, y).
+        let (tvar, t_label, t_props, t_where, t_le) = if matches!(self.peek(), Some(Tok::LParen)) {
+            self.node()?
+        } else {
+            (None, None, Vec::new(), None, None)
+        };
+        let node_slot = *slots;
+        *slots += 1;
+        if let Some(v) = tvar {
+            scope.insert(v, node_slot);
+        }
+        // Group-variable slots, endpoint-first order preserved: family 3 → all depth 2;
+        // family 4 → x/y depth 1 (per outer rep), e depth 2.
+        let (xd, yd) = if family3 { (2, 2) } else { (1, 1) };
+        let mut bind_slots: Vec<usize> = Vec::new();
+        let mut assign = |this: &mut Self,
+                          name: &Option<String>,
+                          is_edge: bool,
+                          depth: u8,
+                          slots: &mut usize,
+                          bind_slots: &mut Vec<usize>|
+         -> Option<usize> {
+            let n = name.clone()?;
+            let s = *slots;
+            *slots += 1;
+            scope.insert(n, s);
+            if is_edge {
+                this.group_edge_slots.insert(s);
+            } else {
+                this.group_node_slots.insert(s);
+            }
+            this.group_var_depth.insert(s, depth);
+            bind_slots.push(s);
+            Some(s)
+        };
+        let xslot = assign(self, &xvar, false, xd, slots, &mut bind_slots);
+        let eslot = assign(self, &evar, true, 2, slots, &mut bind_slots);
+        let yslot = assign(self, &yvar, false, yd, slots, &mut bind_slots);
+
+        // Build the GUnit. Family 3: outer body is a Sub whose inner unit starts at x.
+        // Family 4: outer starts at x; the Sub's inner unit is a bare hop; y is the
+        // Sub's landing.
+        let hop = GElem::Hop {
+            dir,
+            etypes: etypes.clone(),
+            edge_slot: eslot,
+            target_slot: if family3 { yslot } else { None },
+        };
+        let (outer_start, sub_target) = if family3 {
+            (None, None)
+        } else {
+            (xslot, yslot)
+        };
+        let inner_start = if family3 { xslot } else { None };
+        let unit = GUnit {
+            start_slot: outer_start,
+            elems: vec![GElem::Sub {
+                unit: Box::new(GUnit {
+                    start_slot: inner_start,
+                    elems: vec![hop],
+                }),
+                min: imin,
+                max: imax,
+                target_slot: sub_target,
+            }],
+        };
+
+        let mut plan = Plan::NestedGroup {
+            input: Box::new(plan),
+            from,
+            unit,
+            min: omin,
+            max: omax,
+            mode: self.path_mode,
+            endpoint_slot: node_slot,
+            bind_slots,
+        };
+        if let Some(pred) = landing_label_filter(t_label, t_le, node_slot) {
+            plan = plan.filter(pred);
+        }
+        plan = node_prop_filters(plan, node_slot, t_props);
+        if let Some(r) = t_where {
+            self.scope = scope.clone();
+            plan = plan.filter(self.parse_captured_where(r)?);
+        }
+        Ok((plan, node_slot))
     }
 
     /// `OPTIONAL MATCH (a)-[:R]->(x)` — a LEFT-OUTER single hop from a bound `a`. If
@@ -3954,6 +4158,23 @@ impl Parser {
     /// expression), building nested `Expr::Field`. (A bare variable handles its
     /// own single `.prop` in `primary`, keeping that the optimizer's `Prop` shape.)
     fn field_chain(&mut self, mut base: Expr) -> Result<Expr, String> {
+        // A group-variable list yields its typed element (node/edge) only at its FULL
+        // nesting depth: a depth-1 `x[i]` is a node, but a depth-2 `x[i][j]` indexes an
+        // inner list first (Plain) and the SECOND subscript is the node. Track the
+        // group root's kind+depth and how many subscripts have been applied.
+        let mut group: Option<(u8, crate::ir::ElemKind, u8)> = match &base {
+            Expr::Slot(s) if self.group_node_slots.contains(s) => Some((
+                self.group_var_depth.get(s).copied().unwrap_or(1),
+                crate::ir::ElemKind::Node,
+                0,
+            )),
+            Expr::Slot(s) if self.group_edge_slots.contains(s) => Some((
+                self.group_var_depth.get(s).copied().unwrap_or(1),
+                crate::ir::ElemKind::Edge,
+                0,
+            )),
+            _ => None,
+        };
         loop {
             if self.eat(&Tok::Dot) {
                 let key = self.ident()?;
@@ -3961,16 +4182,23 @@ impl Parser {
                     base: Box::new(base),
                     key,
                 };
+                group = None; // a `.field` ends the group-index chain
             } else if self.eat(&Tok::LBracket) {
-                // Subscript `base[index]` — a list element or a record/map field. If
-                // the base is a group-variable list (`x[i]` / `e[i]`), tag the element
-                // kind so a following `.prop` resolves the node/edge property.
+                // Subscript `base[index]`. On a group-variable list the subscript at the
+                // variable's full depth yields the typed element (so `.prop` resolves the
+                // node/edge property); shallower subscripts index inner lists (Plain).
                 let index = self.expr()?;
                 self.expect(&Tok::RBracket)?;
-                let elem = match &base {
-                    Expr::Slot(s) if self.group_node_slots.contains(s) => crate::ir::ElemKind::Node,
-                    Expr::Slot(s) if self.group_edge_slots.contains(s) => crate::ir::ElemKind::Edge,
-                    _ => crate::ir::ElemKind::Plain,
+                let elem = match &mut group {
+                    Some((depth, kind, applied)) => {
+                        *applied += 1;
+                        if *applied == *depth {
+                            *kind
+                        } else {
+                            crate::ir::ElemKind::Plain
+                        }
+                    }
+                    None => crate::ir::ElemKind::Plain,
                 };
                 base = Expr::Index {
                     base: Box::new(base),

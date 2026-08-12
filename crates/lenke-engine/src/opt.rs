@@ -252,6 +252,31 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 c,
             )
         }
+        Plan::NestedGroup {
+            input,
+            from,
+            unit,
+            min,
+            max,
+            mode,
+            endpoint_slot,
+            bind_slots,
+        } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::NestedGroup {
+                    input: Box::new(i),
+                    from,
+                    unit,
+                    min,
+                    max,
+                    mode,
+                    endpoint_slot,
+                    bind_slots,
+                },
+                c,
+            )
+        }
         Plan::ShortestPath {
             input,
             from,
@@ -1130,6 +1155,10 @@ fn width(plan: &Plan) -> usize {
         Plan::RepeatGroup {
             input, group_binds, ..
         } => width(input) + 1 + group_binds.len(),
+        // The endpoint column plus one (possibly nested) list column per bound var.
+        Plan::NestedGroup {
+            input, bind_slots, ..
+        } => width(input) + 1 + bind_slots.len(),
         Plan::Filter { input, .. }
         | Plan::OrderPage { input, .. }
         | Plan::Distinct { input }
@@ -1572,6 +1601,7 @@ mod tests {
             | Plan::IntervalExpand { input, .. }
             | Plan::VarLength { input, .. }
             | Plan::RepeatGroup { input, .. }
+            | Plan::NestedGroup { input, .. }
             | Plan::ShortestPath { input, .. }
             | Plan::Aggregate { input, .. }
             | Plan::OrderPage { input, .. }
