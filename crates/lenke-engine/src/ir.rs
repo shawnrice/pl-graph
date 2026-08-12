@@ -42,6 +42,9 @@ pub enum Expr {
     Not(Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
+    /// Boolean `left XOR right` — same precedence level as `Or`, left-associative.
+    /// Three-valued: a NULL operand yields NULL; otherwise `a != b`.
+    Xor(Box<Expr>, Box<Expr>),
     /// Arithmetic `left <op> right`. `f64` math; a NULL, non-numeric, or
     /// non-finite operand — or a non-finite result — yields NULL (via
     /// `value::as_num` + a finiteness check). Unary minus desugars to `0 - x`.

@@ -961,6 +961,7 @@ fn max_slot(expr: &Expr) -> Option<usize> {
         Expr::Not(x) => max_slot(x),
         Expr::And(a, b)
         | Expr::Or(a, b)
+        | Expr::Xor(a, b)
         | Expr::Arith {
             left: a, right: b, ..
         }

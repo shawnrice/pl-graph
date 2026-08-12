@@ -1745,10 +1745,20 @@ impl Parser {
     }
 
     fn or_expr(&mut self) -> Result<Expr, String> {
+        // OR and XOR share one left-associative precedence level (ISO), above AND.
+        // Binary left-nesting here is equivalent to core's flatten-same/nest-on-
+        // switch: `a OR b XOR c` parses as `(a OR b) XOR c`.
         let mut left = self.and_expr()?;
-        while self.eat_kw("OR") {
-            let right = self.and_expr()?;
-            left = Expr::Or(Box::new(left), Box::new(right));
+        loop {
+            if self.eat_kw("OR") {
+                let right = self.and_expr()?;
+                left = Expr::Or(Box::new(left), Box::new(right));
+            } else if self.eat_kw("XOR") {
+                let right = self.and_expr()?;
+                left = Expr::Xor(Box::new(left), Box::new(right));
+            } else {
+                break;
+            }
         }
         Ok(left)
     }

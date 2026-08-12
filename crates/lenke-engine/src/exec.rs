@@ -651,6 +651,7 @@ fn needs_lineage(plan: &Plan) -> bool {
             Expr::Not(x) => reads_path(x),
             Expr::And(a, b)
             | Expr::Or(a, b)
+            | Expr::Xor(a, b)
             | Expr::Arith {
                 left: a, right: b, ..
             } => reads_path(a) || reads_path(b),
@@ -4375,6 +4376,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         Expr::Not(x) => refs_only_slot(x, s),
         Expr::And(a, b)
         | Expr::Or(a, b)
+        | Expr::Xor(a, b)
         | Expr::Arith {
             left: a, right: b, ..
         }
@@ -4425,6 +4427,7 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         Expr::Not(x) => Expr::Not(go(x)),
         Expr::And(a, b) => Expr::And(go(a), go(b)),
         Expr::Or(a, b) => Expr::Or(go(a), go(b)),
+        Expr::Xor(a, b) => Expr::Xor(go(a), go(b)),
         Expr::In { needle, haystack } => Expr::In {
             needle: go(needle),
             haystack: go(haystack),
@@ -5006,6 +5009,11 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
         Expr::Or(l, r) => zip_bool(store, batch, l, r, |a, b| match (a, b) {
             (Some(true), _) | (_, Some(true)) => Some(true),
             (Some(false), Some(false)) => Some(false),
+            _ => None,
+        })?,
+        // Three-valued XOR: both known → `a != b`; any UNKNOWN operand → UNKNOWN.
+        Expr::Xor(l, r) => zip_bool(store, batch, l, r, |a, b| match (a, b) {
+            (Some(x), Some(y)) => Some(x != y),
             _ => None,
         })?,
         Expr::Compare { op, left, right } => {

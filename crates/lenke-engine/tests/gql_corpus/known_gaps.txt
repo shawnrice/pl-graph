@@ -35,8 +35,6 @@ language.jsonl::m_simple_case_over_integers_3
 language.jsonl::m_simple_case_over_integers_4
 language.jsonl::m_undirected_edge_matches_either_traversal_direction
 language.jsonl::m_undirected_var_length
-language.jsonl::m_xor
-tck.jsonl::tck_boolean3_xor_three_valued
 tck.jsonl::tck_literals6_control_character_escapes_decode_1
 tck.jsonl::tck_literals6_control_character_escapes_decode_2
 tck.jsonl::tck_literals6_control_character_escapes_decode_3
@@ -47,8 +45,6 @@ tck.jsonl::tck_literals6_unicode_escapes_decode_to_code_points_1
 tck.jsonl::tck_literals6_unicode_escapes_decode_to_code_points_2
 tck.jsonl::tck_literals6_unicode_escapes_decode_to_code_points_3
 tck.jsonl::tck_null1_property_null_check_on_null_node_unmatched_optional
-tck.jsonl::tck_precedence1_and_takes_precedence_over_xor
-tck.jsonl::tck_precedence1_iso_or_xor_share_left_associative_level
 tests_a.jsonl::case_simple_form
 tests_a.jsonl::count_star_shortcut_plus1
 tests_a.jsonl::count_subquery_degree_10
@@ -74,9 +70,7 @@ tests_a.jsonl::label_expr_or
 tests_a.jsonl::label_expr_wildcard
 tests_a.jsonl::order_by_letin_over_output_column
 tests_a.jsonl::reachable_distinct_3
-tests_a.jsonl::three_valued_boolean_logic
 tests_a.jsonl::undirected_edge
-tests_a.jsonl::xor_precedence
 tests_b.jsonl::atan2_0_1
 tests_b.jsonl::atan2_1_0
 tests_b.jsonl::atan2_1_1
