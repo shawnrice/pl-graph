@@ -525,6 +525,10 @@ struct SubpathGroup {
     node_vars: Vec<Option<String>>,
     edge_vars: Vec<Option<String>>,
     per_rep_pred: Option<Expr>,
+    /// An INNER quantifier on a single-hop endpoint-only body — `( ()-[:R]->{a,b}()
+    /// ){c,d}`. The whole thing reaches the same endpoints as a var-length over the
+    /// combined bounds `[a*c, b*d]`, so the caller desugars it to one `var_length`.
+    inner_quant: Option<(u32, u32)>,
 }
 
 struct Parser {
@@ -1902,6 +1906,30 @@ impl Parser {
                     scope.insert(v, node_slot);
                 }
                 *slots += 1;
+                // An endpoint-only NESTED group `( ()-[:R]->{a,b}() ){1} (t)` — a
+                // SINGLE outer repetition — reaches exactly the same endpoints (once
+                // each) as one var-length `{a,b}`, so it desugars. With MORE than one
+                // outer rep the same endpoint is reached once per rep-DECOMPOSITION (a
+                // multiplicity a flat var-length cannot reproduce), so that stays
+                // unsupported.
+                if let Some((imin, imax)) = g.inner_quant {
+                    if g.min != 1 || g.max != 1 {
+                        return Err("a multi-repetition nested subpath group is not \
+                                    supported yet"
+                            .into());
+                    }
+                    plan = plan.var_length(from, g.dir, &g.etypes, imin, imax, self.path_mode);
+                    from = node_slot;
+                    if let Some(pred) = landing_label_filter(v2_label, v2_le, from) {
+                        plan = plan.filter(pred);
+                    }
+                    plan = node_prop_filters(plan, from, v2_props);
+                    if let Some(r) = v2_where {
+                        self.scope = scope.clone();
+                        plan = plan.filter(self.parse_captured_where(r)?);
+                    }
+                    continue;
+                }
                 // Each NAMED inner variable becomes a GROUP variable — a list column
                 // appended after the endpoint. Node variables at unit positions 0..=k
                 // (`NodeAt`), edge variables at 0..k (`EdgeAt`); a node group var and
@@ -2167,6 +2195,42 @@ impl Parser {
                 }
             }
             edge_vars.push(rel.var.clone());
+            // An INNER quantifier — `( ()-[:R]->{a,b}() ){c,d}`. Only supported for a
+            // single anonymous endpoint-only hop, which the caller desugars to one
+            // var-length over the combined bounds. Reject any other multi-hop mix.
+            if let Some((imin, imax)) = self.opt_quantifier()? {
+                let n = self.node()?;
+                if bad_inner(&n) {
+                    return Err(
+                        "a label/property/WHERE on a subpath-group inner node is not \
+                                supported yet"
+                            .into(),
+                    );
+                }
+                if first.0.is_some() || rel.var.is_some() || n.0.is_some() || node_vars.len() != 1 {
+                    return Err(
+                        "a quantified subpath-group body with bound inner variables is \
+                                not supported yet"
+                            .into(),
+                    );
+                }
+                node_vars.push(n.0.clone());
+                self.expect(&Tok::RParen)?;
+                let (min, max) = self
+                    .opt_quantifier()?
+                    .ok_or("a subpath group requires a `{n,m}` / `*` / `+` quantifier")?;
+                return Ok(SubpathGroup {
+                    dir: dir.expect("at least one hop"),
+                    etypes: etypes.expect("at least one hop"),
+                    min,
+                    max,
+                    k: 1,
+                    node_vars,
+                    edge_vars,
+                    per_rep_pred: None,
+                    inner_quant: Some((imin, imax)),
+                });
+            }
             let n = self.node()?;
             if bad_inner(&n) {
                 return Err(
@@ -2221,6 +2285,7 @@ impl Parser {
             node_vars,
             edge_vars,
             per_rep_pred,
+            inner_quant: None,
         })
     }
 

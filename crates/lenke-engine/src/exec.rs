@@ -8969,6 +8969,35 @@ mod tests {
         );
     }
 
+    /// A single-outer-rep endpoint-only nested group `( ()-[:R]->{1,3}() ){1} (t)`
+    /// desugars to a var-length {1,3}. Chain a->b->c->d.
+    #[test]
+    fn nested_endpoint_only_single_rep() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"id\":\"d\",\"labels\":[\"N\"],\"props\":{\"id\":\"d\"}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{}}\n",
+            "{\"from\":\"b\",\"to\":\"c\",\"labels\":[\"R\"],\"props\":{}}\n",
+            "{\"from\":\"c\",\"to\":\"d\",\"labels\":[\"R\"],\"props\":{}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let plan = crate::opt::optimize_indexed(
+            crate::gql::parse("MATCH (s:N {id:'a'}) ( ()-[:R]->{1,3}() ){1} (t) RETURN t.id AS id")
+                .unwrap(),
+            &store,
+        );
+        let mut v = names_of(&run(&plan, &store), 0);
+        v.sort();
+        assert_eq!(v, vec!["b", "c", "d"]); // reachable in 1..3 hops
+                                            // A multi-repetition nested group is rejected (needs rep-decomposition).
+        assert!(crate::gql::parse(
+            "MATCH (s:N {id:'a'}) ( ()-[:R]->{1,2}() ){2} (t) RETURN t.id AS id"
+        )
+        .is_err());
+    }
+
     /// A repeated pattern variable on a var-length landing is an equality join: an
     /// EXISTS correlated on BOTH anchors `EXISTS { (a)-[:R]->+(b) }`, and a cycle
     /// `(a)-[:R]->{1,3}(a)`. Chain a->b->c (no cycle back to a).

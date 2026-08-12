@@ -62,7 +62,6 @@ tests_d.jsonl::nested_per_rep_where_1
 tests_d.jsonl::nested_per_rep_where_2
 tests_d.jsonl::nested_per_rep_where_3
 tests_d.jsonl::nested_per_rep_where_4
-tests_d.jsonl::nested_quant_ends_1
 tests_d.jsonl::nested_quant_ends_2
 tests_d.jsonl::nested_quant_ends_3
 tests_d.jsonl::nested_quant_gv_vectorize
