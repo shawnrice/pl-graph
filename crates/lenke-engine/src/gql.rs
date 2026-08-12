@@ -3173,6 +3173,32 @@ impl Parser {
                     pred
                 });
             }
+            // `e IS [NOT] DIRECTED` — a graph-element predicate (every edge here is
+            // directed; a null element yields NULL).
+            if self.eat_kw("DIRECTED") {
+                return Ok(Expr::GraphPred {
+                    op: crate::ir::GraphPredOp::IsDirected,
+                    args: vec![left],
+                    negated,
+                });
+            }
+            // `a IS [NOT] SOURCE OF e` / `a IS [NOT] DESTINATION OF e`.
+            if self.eat_kw("SOURCE") || self.peek_kw("DESTINATION") {
+                let is_source = !self.eat_kw("DESTINATION");
+                if !self.eat_kw("OF") {
+                    return Err("expected OF after IS SOURCE / DESTINATION".into());
+                }
+                let edge = self.primary()?;
+                return Ok(Expr::GraphPred {
+                    op: if is_source {
+                        crate::ir::GraphPredOp::IsSourceOf
+                    } else {
+                        crate::ir::GraphPredOp::IsDestinationOf
+                    },
+                    args: vec![left, edge],
+                    negated,
+                });
+            }
             let want = if self.eat_kw("TRUE") {
                 true
             } else if self.eat_kw("FALSE") {
@@ -3463,6 +3489,33 @@ impl Parser {
                 // subquery (only the count(*) shape, which is a degree).
                 if s.eq_ignore_ascii_case("value") && matches!(self.peek(), Some(Tok::LBrace)) {
                     return self.value_count_subquery_expr();
+                }
+                // `ALL_DIFFERENT(a, b, …)` / `SAME(a, b, …)` — graph-element identity
+                // predicates over their element arguments.
+                if (s.eq_ignore_ascii_case("all_different") || s.eq_ignore_ascii_case("same"))
+                    && matches!(self.peek(), Some(Tok::LParen))
+                {
+                    let op = if s.eq_ignore_ascii_case("same") {
+                        crate::ir::GraphPredOp::Same
+                    } else {
+                        crate::ir::GraphPredOp::AllDifferent
+                    };
+                    self.expect(&Tok::LParen)?;
+                    let mut args = Vec::new();
+                    if self.peek() != Some(&Tok::RParen) {
+                        loop {
+                            args.push(self.expr()?);
+                            if !self.eat(&Tok::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(&Tok::RParen)?;
+                    return Ok(Expr::GraphPred {
+                        op,
+                        args,
+                        negated: false,
+                    });
                 }
                 // Two-word zoned literal `ZONED TIME '…'` / `ZONED DATETIME '…'`.
                 if s.eq_ignore_ascii_case("zoned") {

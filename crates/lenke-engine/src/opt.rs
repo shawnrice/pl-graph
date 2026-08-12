@@ -1037,7 +1037,7 @@ fn max_slot(expr: &Expr) -> Option<usize> {
             needle: a,
             haystack: b,
         } => merge_max(max_slot(a), max_slot(b)),
-        Expr::Call { args, .. } | Expr::List { items: args } => {
+        Expr::Call { args, .. } | Expr::GraphPred { args, .. } | Expr::List { items: args } => {
             args.iter().fold(None, |acc, a| merge_max(acc, max_slot(a)))
         }
         Expr::Record { fields } | Expr::MapLit { entries: fields } => fields

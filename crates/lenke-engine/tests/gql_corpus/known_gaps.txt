@@ -58,11 +58,6 @@ tests_e.jsonl::count_multi_match
 tests_e.jsonl::date_part_bare_name_unknown_fn
 tests_e.jsonl::date_part_rejects_number
 tests_e.jsonl::date_part_rejects_string
-tests_e.jsonl::graph_pred_all_different_and_same_1
-tests_e.jsonl::graph_pred_all_different_and_same_2
-tests_e.jsonl::graph_pred_is_directed
-tests_e.jsonl::graph_pred_null_is_three_valued
-tests_e.jsonl::graph_pred_source_destination_of
 tests_e.jsonl::group_by_non_returned_key
 tests_e.jsonl::group_by_without_aggregate_is_distinct
 tests_e.jsonl::is_typed_closed_record_1

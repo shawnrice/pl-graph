@@ -73,6 +73,19 @@ pub enum ElemKind {
     Edge,
 }
 
+/// An ISO graph-element predicate over element IDENTITY (a node/edge's id + kind):
+/// `IsDirected` (`e IS DIRECTED`), `IsSourceOf`/`IsDestinationOf` (`a IS SOURCE OF
+/// e`), `AllDifferent`/`Same` (`ALL_DIFFERENT(…)`, `SAME(…)`). All are three-valued —
+/// a NULL / non-element operand yields NULL. See `Expr::GraphPred`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphPredOp {
+    IsDirected,
+    IsSourceOf,
+    IsDestinationOf,
+    AllDifferent,
+    Same,
+}
+
 /// An expression over the current row. A row is a tuple of bound slots; `Slot(n)`
 /// is the value at slot `n`, and `Prop { slot, key }` reads a property off the
 /// element in that slot.
@@ -235,6 +248,14 @@ pub enum Expr {
     /// Empty result → NULL; more than one row → an error, like a correlated VALUE.
     UncorrelatedScalar {
         body: Box<Plan>,
+    },
+    /// An ISO graph-element predicate (`IS DIRECTED`, `IS SOURCE OF`, `ALL_DIFFERENT`,
+    /// `SAME`, …) over element identity. `negated` applies the `IS NOT …` spelling
+    /// (three-valued: a NULL result stays NULL). `args` are the operand expressions.
+    GraphPred {
+        op: GraphPredOp,
+        args: Vec<Expr>,
+        negated: bool,
     },
     /// `needle IN haystack` where `haystack` is a dynamic (non-literal) list
     /// expression (a list property, a param, a function result). A literal

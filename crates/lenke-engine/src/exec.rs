@@ -706,7 +706,9 @@ fn needs_lineage(plan: &Plan) -> bool {
             | Expr::Arith {
                 left: a, right: b, ..
             } => reads_path(a) || reads_path(b),
-            Expr::Call { args, .. } | Expr::List { items: args } => args.iter().any(reads_path),
+            Expr::Call { args, .. } | Expr::GraphPred { args, .. } | Expr::List { items: args } => {
+                args.iter().any(reads_path)
+            }
             Expr::Record { fields } | Expr::MapLit { entries: fields } => {
                 fields.iter().any(|(_, e)| reads_path(e))
             }
@@ -4676,7 +4678,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
             needle: a,
             haystack: b,
         } => refs_only_slot(a, s) && refs_only_slot(b, s),
-        Expr::Call { args, .. } | Expr::List { items: args } => {
+        Expr::Call { args, .. } | Expr::GraphPred { args, .. } | Expr::List { items: args } => {
             args.iter().all(|a| refs_only_slot(a, s))
         }
         Expr::Record { fields } | Expr::MapLit { entries: fields } => {
@@ -4742,6 +4744,11 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         Expr::Call { name, args } => Expr::Call {
             name: name.clone(),
             args: args.iter().map(|a| remap_slot(a, from, to)).collect(),
+        },
+        Expr::GraphPred { op, args, negated } => Expr::GraphPred {
+            op: *op,
+            args: args.iter().map(|a| remap_slot(a, from, to)).collect(),
+            negated: *negated,
         },
         Expr::List { items } => Expr::List {
             items: items.iter().map(|a| remap_slot(a, from, to)).collect(),
@@ -6720,6 +6727,69 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 _ => return Err("a VALUE subquery returned more than one row".into()),
             };
             broadcast(v, batch.rows())
+        }
+        Expr::GraphPred { op, args, negated } => {
+            use crate::ir::GraphPredOp;
+            // Each operand as a column; per row, its element IDENTITY (kind + id) or
+            // None (a NULL / non-element). The predicate is three-valued: any None
+            // operand yields NULL.
+            let cols: Vec<Col> = args
+                .iter()
+                .map(|a| eval(a, store, batch))
+                .collect::<Result<_, _>>()?;
+            let ident = |c: &Col, i: usize| -> Option<(u8, u32)> {
+                match c {
+                    Col::Nodes(v) if v[i] != u32::MAX => Some((0, v[i])),
+                    Col::Edges(v) if v[i] != u32::MAX => Some((1, v[i])),
+                    _ => None,
+                }
+            };
+            let out: Vec<Value> = (0..batch.rows())
+                .map(|i| {
+                    let idents: Vec<Option<(u8, u32)>> = cols.iter().map(|c| ident(c, i)).collect();
+                    let r: Option<bool> = match op {
+                        GraphPredOp::IsDirected => match idents[0] {
+                            Some((1, _)) => Some(true), // an edge is directed
+                            Some(_) => Some(false),     // a node is not
+                            None => None,
+                        },
+                        GraphPredOp::IsSourceOf | GraphPredOp::IsDestinationOf => {
+                            match (idents[0], idents[1]) {
+                                (Some((0, node)), Some((1, eid))) => {
+                                    store.edge_endpoints(eid).map(|(s, d)| {
+                                        node == if matches!(op, GraphPredOp::IsSourceOf) {
+                                            s
+                                        } else {
+                                            d
+                                        }
+                                    })
+                                }
+                                (None, _) | (_, None) => None,
+                                _ => Some(false), // wrong kinds (e.g. edge IS SOURCE OF)
+                            }
+                        }
+                        GraphPredOp::AllDifferent | GraphPredOp::Same => {
+                            if idents.iter().any(Option::is_none) {
+                                None
+                            } else {
+                                let all_same = idents.windows(2).all(|w| w[0] == w[1]);
+                                let all_diff = (0..idents.len())
+                                    .all(|a| (a + 1..idents.len()).all(|b| idents[a] != idents[b]));
+                                Some(if matches!(op, GraphPredOp::Same) {
+                                    all_same
+                                } else {
+                                    all_diff
+                                })
+                            }
+                        }
+                    };
+                    match r.map(|b| b ^ *negated) {
+                        Some(b) => Value::Bool(b),
+                        None => Value::Null,
+                    }
+                })
+                .collect();
+            Col::Gen(out)
         }
     })
 }
@@ -9003,6 +9073,39 @@ mod tests {
             ids("MATCH (b:N {id:'b'})-[:R {amt:20.0}]->{1,3}(x) RETURN x.id AS id"),
             vec!["c"]
         );
+    }
+
+    /// Graph-element predicates: IS DIRECTED, IS SOURCE/DESTINATION OF, ALL_DIFFERENT,
+    /// SAME — three-valued over element identity (a null operand → NULL).
+    #[test]
+    fn graph_element_predicates() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let row = |q: &str| -> Vec<Value> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            run(&plan, &store).rows[0].clone()
+        };
+        let r = row(
+            "MATCH (a:N {id:'a'})-[e:R]->(b:N {id:'b'}) RETURN e IS DIRECTED AS d, \
+             a IS SOURCE OF e AS asrc, b IS DESTINATION OF e AS bdst, b IS SOURCE OF e AS bsrc, \
+             ALL_DIFFERENT(a, b) AS diff, SAME(a, a) AS saa, SAME(a, b) AS sab",
+        );
+        assert!(matches!(r[0], Value::Bool(true))); // e IS DIRECTED
+        assert!(matches!(r[1], Value::Bool(true))); // a IS SOURCE OF e
+        assert!(matches!(r[2], Value::Bool(true))); // b IS DESTINATION OF e
+        assert!(matches!(r[3], Value::Bool(false))); // b IS SOURCE OF e
+        assert!(matches!(r[4], Value::Bool(true))); // ALL_DIFFERENT(a,b)
+        assert!(matches!(r[5], Value::Bool(true))); // SAME(a,a)
+        assert!(matches!(r[6], Value::Bool(false))); // SAME(a,b)
+                                                     // Three-valued: a null element → NULL.
+        let r = row("MATCH (a:N {id:'a'}) OPTIONAL MATCH (a)-[:NOSUCH]->(m) \
+             RETURN m IS DIRECTED AS d, ALL_DIFFERENT(a, m) AS ad");
+        assert!(r[0].is_null());
+        assert!(r[1].is_null());
     }
 
     /// Bare ALL/ANY selectors: ALL is the default (every path — a duplicate endpoint
