@@ -12,7 +12,8 @@ Verify every feature: `cargo test --release --lib`; differential_fuzz seeds 1 & 
 - Line/block comments + standalone ORDER BY before RETURN (commit e22a41c7) — 419->405.
 - Edge-label disjunction `-[:A|B]->` — 407->391 (16 cases; node-label disjunction `(n:A|B)` stays deferred).
 - TRIM spec-form + round(2-arg)/atan2/log10/list_sort(order,nullOrder) — 391->381 (10 cases).
-- INSERT..RETURN binds created nodes (parallel worktree agent, merged 867e2bd3) — 376->373 (3 cases).
+- INSERT..RETURN binds created nodes (parallel worktree agent, merged 867e2bd3) — 3 cases.
+- ACYCLIC / SIMPLE path modes (parallel worktree agent, cherry-picked c6e2b751) — 11 cases. VarLength `trail:bool`→`mode:PathMode`. bare_all_composes_mode / bare_path_binds_simple_cycle stay blocked (need `((..)){n}` subpath group). [Combined parallel re-baseline: 377->363.]
 - SELECT..FROM MATCH **phase 1** (constant / projection / global-agg / GROUP BY via implicit grouping) — 381->377 (4 cases). Refactored `match_body` + `project_and_page` (both now shared with SELECT). **Phase 2 (HAVING) still TODO** — 7 `select_having_*` cases; needs GROUP BY that forces a group with NO agg in the SELECT list, an `extract_aggs` expr-walker to hoist HAVING/ORDER aggregates into the group aggs, and a post-aggregation filter with slot rewriting (keys-then-aggs schema). Currently `SELECT … HAVING` errors (baselined). See queue section 3 Phase 2.
 
 ## ~~1. Edge-label disjunction~~ DONE — ~~~24 cases~~ 16 cases
