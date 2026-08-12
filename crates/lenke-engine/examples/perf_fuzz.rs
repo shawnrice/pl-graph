@@ -30,30 +30,23 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-// --- deterministic RNG -------------------------------------------------------
+// The shared hard-shape generator (quantified/group/nested/shortest patterns),
+// reused from the differential fuzzer so the perf sweep exercises the same
+// constructs. Its `Rng` is the same xorshift64* this example used.
+#[path = "../tests/support/gql_shapes.rs"]
+mod gql_shapes;
+use gql_shapes::Rng;
 
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        // xorshift64*
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-    fn chance(&mut self, num: u32, den: u32) -> bool {
-        (self.next() % u64::from(den)) < u64::from(num)
-    }
-    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
-        let i = self.below(xs.len());
-        &xs[i]
-    }
-}
+/// This fixture's GQL vocabulary for the shared hard-shape generator. `id` is the
+/// (non-unique) `age` prop — fine for perf, where the anchor just bounds the source
+/// set; `ew` is the edge weight `w`.
+const HARD_SCHEMA: gql_shapes::Schema = gql_shapes::Schema {
+    label: "Person",
+    etype: "R",
+    num: "age",
+    id: "age",
+    ew: "w",
+};
 
 // --- fixture (identical graph to both engines) -------------------------------
 
@@ -344,6 +337,20 @@ impl Gen<'_> {
 
     /// A full query. `algo_ok` allows a CALL tail.
     fn query(&mut self) -> String {
+        // A HARD shape (quantified / subpath group / nested / shortest) from the
+        // shared generator — the same constructs the differential fuzzer verifies,
+        // timed here to price them. Anchored on a random `age` bucket.
+        if self.rng.chance(1, 6) {
+            let src = self.rng.below(120);
+            if let Some(h) =
+                gql_shapes::gen_hard(self.rng, &HARD_SCHEMA, &gql_shapes::Caps::all(), src)
+            {
+                for t in h.tags {
+                    self.tag(t);
+                }
+                return h.text;
+            }
+        }
         // A CALL-algorithm query (its own shape).
         if self.rng.chance(1, 12) {
             self.tag("call-algo");

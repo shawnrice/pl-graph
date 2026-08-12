@@ -536,9 +536,10 @@ fn engine_agrees_with_core_on_random_queries() {
                 eprintln!("engine TIMEOUT (skipped){}", repro());
                 timeouts += 1;
             }
-            // A HARD shape the engine could not parse/execute but core could is a
-            // MISSING FEATURE to implement — fail (this is the nested-work driver).
-            (Outcome::ParseErr | Outcome::Err, Outcome::Rows(_)) if q.hard => {
+            // A HARD shape the engine could not PARSE but core could is a MISSING
+            // FEATURE to implement — fail (this is the nested-work driver). (An engine
+            // exec error vs core rows is already the unconditional panic above.)
+            (Outcome::ParseErr, Outcome::Rows(_)) if q.hard => {
                 panic!("engine lacks a hard shape core supports{}", repro())
             }
             // A parse mismatch means the generator produced syntax one side lacks —
