@@ -292,9 +292,11 @@ pub fn cast(v: &Value, target: CastTarget) -> Result<Value, String> {
             Value::Bool(b) => Ok(Value::Bool(*b)),
             // Numeric truthiness: zero is false, every other (incl. NaN) is true.
             Value::Num(x) => Ok(Value::Bool(*x != 0.0)),
-            Value::Str(s) => match s.trim() {
-                "true" => Ok(Value::Bool(true)),
-                "false" => Ok(Value::Bool(false)),
+            // The SQL boolean spellings (case-insensitive, trimmed); an unrecognized
+            // string is a data exception (strict CAST — `CAST('1' AS INT)` throws too).
+            Value::Str(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "t" | "true" | "y" | "yes" | "on" | "1" => Ok(Value::Bool(true)),
+                "f" | "false" | "n" | "no" | "off" | "0" => Ok(Value::Bool(false)),
                 _ => bad(&format!("string {s:?}"), "boolean"),
             },
             Value::List(_) => bad("list", "boolean"),
@@ -656,16 +658,21 @@ mod tests {
             &cast(&n(-2.0), CastTarget::Boolean).unwrap(),
             &b(true)
         ));
-        // Only the words true/false convert (trimmed); anything else throws.
-        assert!(equals(
-            &cast(&s(" true "), CastTarget::Boolean).unwrap(),
-            &b(true)
-        ));
-        assert!(equals(
-            &cast(&s("false"), CastTarget::Boolean).unwrap(),
-            &b(false)
-        ));
-        assert!(cast(&s("yes"), CastTarget::Boolean).is_err());
+        // The SQL boolean spellings convert (case-insensitive, trimmed); an
+        // unrecognized string throws.
+        for t in [" true ", "yes", "Y", "ON", "1", "t"] {
+            assert!(
+                equals(&cast(&s(t), CastTarget::Boolean).unwrap(), &b(true)),
+                "{t}"
+            );
+        }
+        for f in ["false", "no", "N", "off", "0", "F"] {
+            assert!(
+                equals(&cast(&s(f), CastTarget::Boolean).unwrap(), &b(false)),
+                "{f}"
+            );
+        }
+        assert!(cast(&s("maybe"), CastTarget::Boolean).is_err());
     }
 
     #[test]

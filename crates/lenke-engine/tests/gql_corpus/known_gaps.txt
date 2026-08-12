@@ -9,7 +9,6 @@ language.jsonl::m_reserved_word_rejected_as_bare_identifier_2
 tests_b.jsonl::call_config_bogus_error
 tests_b.jsonl::call_config_pivot_error
 tests_b.jsonl::call_config_wrong_type_error
-tests_b.jsonl::cast_bool
 tests_b.jsonl::cast_int_null
 tests_b.jsonl::cast_list
 tests_b.jsonl::malformed_num_1e999_error
@@ -24,8 +23,6 @@ tests_f.jsonl::distinct_nan_3
 tests_f.jsonl::inline_constraint_14
 tests_f.jsonl::inline_constraint_15
 tests_f.jsonl::inline_constraint_per_row
-tests_f.jsonl::num_string_overflow_1
-tests_f.jsonl::num_string_overflow_2
 tests_f.jsonl::num_string_overflow_4
 tests_f.jsonl::range_bounded_2
 tests_f.jsonl::range_bounded_3

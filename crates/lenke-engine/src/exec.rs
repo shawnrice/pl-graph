@@ -8363,9 +8363,11 @@ fn scalar_num_fn(name: &str, v: &Value) -> Value {
 fn to_number(v: &Value, integer: bool) -> Value {
     let n = match v {
         Value::Num(x) => *x,
+        // A string that parses to a NON-finite value (`'1e1000'` → inf, `'nan'`) is
+        // NULL — the fn form never yields inf/NaN, matching core's `.filter(is_finite)`.
         Value::Str(s) => match s.trim().parse::<f64>() {
-            Ok(x) => x,
-            Err(_) => return Value::Null,
+            Ok(x) if x.is_finite() => x,
+            _ => return Value::Null,
         },
         _ => return Value::Null,
     };
