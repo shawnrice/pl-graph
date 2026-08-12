@@ -21,11 +21,6 @@ language.jsonl::m_nulls_first_overrides_ascending_default
 language.jsonl::m_nulls_last_overrides_descending_default
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_1
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_2
-language.jsonl::m_simple_case_null_subject_never_matches
-language.jsonl::m_simple_case_over_integers_1
-language.jsonl::m_simple_case_over_integers_2
-language.jsonl::m_simple_case_over_integers_3
-language.jsonl::m_simple_case_over_integers_4
 tck.jsonl::tck_literals6_control_character_escapes_decode_1
 tck.jsonl::tck_literals6_control_character_escapes_decode_2
 tck.jsonl::tck_literals6_control_character_escapes_decode_3
@@ -36,7 +31,6 @@ tck.jsonl::tck_literals6_unicode_escapes_decode_to_code_points_1
 tck.jsonl::tck_literals6_unicode_escapes_decode_to_code_points_2
 tck.jsonl::tck_literals6_unicode_escapes_decode_to_code_points_3
 tck.jsonl::tck_null1_property_null_check_on_null_node_unmatched_optional
-tests_a.jsonl::case_simple_form
 tests_a.jsonl::count_star_shortcut_plus1
 tests_a.jsonl::count_subquery_degree_10
 tests_a.jsonl::count_subquery_degree_11

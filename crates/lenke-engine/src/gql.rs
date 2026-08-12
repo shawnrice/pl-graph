@@ -2666,19 +2666,34 @@ impl Parser {
         Ok(base)
     }
 
-    // case := CASE (WHEN expr THEN expr)+ [ELSE expr] END   (searched form)
-    // WHEN/THEN/ELSE/END are contextual keywords. The simple form
-    // `CASE <e> WHEN <v> …` is deferred (would desugar to `WHEN e = v THEN …`).
+    // case := CASE [subject] (WHEN expr THEN expr)+ [ELSE expr] END
+    // WHEN/THEN/ELSE/END are contextual keywords. The SEARCHED form has no subject
+    // (`WHEN <cond>`); the SIMPLE form has one (`CASE <e> WHEN <v>`), which desugars
+    // to searched `WHEN e = v THEN …`. A NULL subject makes every `e = v` UNKNOWN, so
+    // no branch matches and it falls to ELSE — 3VL, matching core.
     fn case_expr(&mut self) -> Result<Expr, String> {
+        let subject = if self.peek_kw("WHEN") {
+            None
+        } else {
+            Some(self.expr()?)
+        };
         if !self.peek_kw("WHEN") {
-            return Err("only searched CASE (CASE WHEN … END) is supported".into());
+            return Err("expected WHEN in CASE".into());
         }
         let mut branches = Vec::new();
         while self.eat_kw("WHEN") {
-            let cond = self.expr()?;
+            let when = self.expr()?;
             if !self.eat_kw("THEN") {
                 return Err("expected THEN in CASE".into());
             }
+            let cond = match &subject {
+                None => when,
+                Some(subj) => Expr::Compare {
+                    op: CompareOp::Eq,
+                    left: Box::new(subj.clone()),
+                    right: Box::new(when),
+                },
+            };
             branches.push((cond, self.expr()?));
         }
         let otherwise = if self.eat_kw("ELSE") {
@@ -6007,12 +6022,36 @@ mod tests {
 
     #[test]
     fn case_errors() {
+        // The simple form is now supported (desugars to searched CASE).
         assert!(
-            super::parse("MATCH (p:Person) RETURN CASE p.age WHEN 30 THEN 'x' END AS y").is_err()
-        ); // simple form deferred
+            super::parse("MATCH (p:Person) RETURN CASE p.age WHEN 30 THEN 'x' END AS y").is_ok()
+        );
         assert!(
             super::parse("MATCH (p:Person) RETURN CASE WHEN p.age >= 30 THEN 'x' AS y").is_err()
         ); // no END
+    }
+
+    /// The simple CASE form `CASE <subject> WHEN <v> THEN …` desugars to searched
+    /// CASE (`WHEN subject = v`); a NULL subject matches no branch (3VL) → ELSE.
+    #[test]
+    fn simple_case_form() {
+        let store = social();
+        let val = |q: &str| -> String {
+            format!("{:?}", run(&super::parse(q).unwrap(), &store).rows[0][0])
+        };
+        assert_eq!(
+            val("RETURN CASE 5 WHEN 1 THEN 'a' WHEN 5 THEN 'b' ELSE 'c' END AS r"),
+            "Str(\"b\")"
+        );
+        assert_eq!(
+            val("RETURN CASE 42 WHEN 1 THEN 'a' ELSE 'c' END AS r"),
+            "Str(\"c\")"
+        );
+        // A NULL subject never equals a WHEN value → falls to ELSE.
+        assert_eq!(
+            val("MATCH (p:Person) WHERE p.name = 'alice' RETURN CASE p.nope WHEN 1 THEN 'a' ELSE 'none' END AS r"),
+            "Str(\"none\")"
+        );
     }
 
     // --- part 3.8: string functions (E4a) ---
