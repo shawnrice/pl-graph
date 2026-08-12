@@ -120,9 +120,10 @@ Re-categorized the 309 remaining: 25 intentional "core rejects" + 285 engine!=co
 
 STOP only once THIS tail is worked and only ((..)){n} + per-hop-WHERE + FOR..IN + SHORTEST-k>=2 + edge-label-negation + intentional divergences remain.
 
-
 ## Round 4 diagnosis notes (baseline 285)
+
 - **CAST string->bool/list/int = INTENTIONAL divergence, LEAVE BASELINED.** Core desugars `CAST(x AS BOOL)`->`to_boolean(x)` / `AS LIST`->`to_list(x)` (lenient, NULL on failure); the engine's CAST THROWS E_INVALID_VALUE by deliberate design (documented in ir.rs: "a failed conversion throws ... unlike CAST FUNCTIONS which return NULL"). Changing it is a value-contract change — do not.
 - **Total order = FIXED** (commit 3b16d5c6, 289->285): `rank()` now Num<Str<Bool<Temporal (was Bool<Num<Str) matching core type_rank. Was a latent bug the fuzzer never hit.
-- **NEXT tractable: aggregate in a RETURN expression** (~2+: count_star_shortcut_plus1 `RETURN count(*) + 1`, m_implicit_grouping / group_by_aggregate `RETURN s.name, count(*) ORDER BY s.name`). The RETURN-level analog of the HAVING `extract_aggs` already built: an aggregate nested inside a projection expression (`count(*)+1`) or an ORDER BY over a group-key expression needs the agg hoisted into the Aggregate and the surrounding expr rewritten to a slot. Reuse the HAVING machinery (hoist_having_agg / rewrite_group_keys) generalized to the RETURN item list. MEDIUM.
+- **Grouped ORDER BY over a group-key expression** — DONE (commit ba1a631d, 285->283, 2 cases: m_implicit_grouping, group_by_aggregate). order_keys now matches an ORDER BY expr against the group keys.
+- **STILL OPEN: aggregate NESTED in a projection expression** (~2+: count_star_shortcut_plus1 `RETURN count(*) + 1`, m_implicit_grouping / group_by_aggregate `RETURN s.name, count(*) ORDER BY s.name`). The RETURN-level analog of the HAVING `extract_aggs` already built: an aggregate nested inside a projection expression (`count(*)+1`) or an ORDER BY over a group-key expression needs the agg hoisted into the Aggregate and the surrounding expr rewritten to a slot. Reuse the HAVING machinery (hoist_having_agg / rewrite_group_keys) generalized to the RETURN item list. MEDIUM.
 - Reverse-correlated subquery (~6, `COUNT { (m)-[:R]->(n) }` outer var is landing) and temporal literal compares (temporal_timestamp_ge etc.) — still open, medium.
