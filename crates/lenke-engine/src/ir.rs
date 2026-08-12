@@ -121,6 +121,13 @@ pub enum Expr {
         base: Box<Expr>,
         key: String,
     },
+    /// ISO GQL list/record subscript `base[index]` — 0-based, out of range → NULL,
+    /// null-safe; a numeric index on a list, a string index on a record/map, else
+    /// NULL. A non-integer / negative index is NULL.
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
     /// `CAST(<expr> AS <TYPE>)`. The coercion itself lives in `value::cast` (the
     /// single home for the conversion table); a failed conversion throws
     /// `E_INVALID_VALUE` (the read pipeline is fallible — see `exec::try_run`),

@@ -989,6 +989,7 @@ fn max_slot(expr: &Expr) -> Option<usize> {
             .iter()
             .fold(None, |acc, (_, e)| merge_max(acc, max_slot(e))),
         Expr::Field { base, .. } => max_slot(base),
+        Expr::Index { base, index } => merge_max(max_slot(base), max_slot(index)),
         Expr::Case {
             branches,
             otherwise,
@@ -1386,7 +1387,14 @@ mod tests {
         let plan = Plan::Scan {
             label: Some("Person".into()),
         }
-        .shortest_path(0, Dir::Out, &["KNOWS".to_string()],  1, None, crate::ir::ShortestSelector::Any)
+        .shortest_path(
+            0,
+            Dir::Out,
+            &["KNOWS".to_string()],
+            1,
+            None,
+            crate::ir::ShortestSelector::Any,
+        )
         .filter(cmp(CompareOp::Eq, prop(0, "name"), Expr::Lit(s("alice"))));
         let opt = assert_rows_preserved(&plan, &store);
         match opt {

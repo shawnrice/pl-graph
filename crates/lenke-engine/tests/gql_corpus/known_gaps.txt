@@ -48,10 +48,6 @@ tests_c.jsonl::shortest_per_hop_all_filtered
 tests_c.jsonl::shortest_per_hop_any_filtered
 tests_c.jsonl::shortest_per_hop_blocks_all
 tests_c.jsonl::str_plus_num_faults
-tests_c.jsonl::subscript_consecutive_hop_compare
-tests_c.jsonl::subscript_edge0_weight
-tests_c.jsonl::subscript_node2_id
-tests_c.jsonl::subscript_out_of_range_null
 tests_c.jsonl::sum_distinct_mix_num_duration_faults
 tests_c.jsonl::sum_mix_num_duration_faults
 tests_c.jsonl::sum_mix_str_duration_faults
@@ -101,7 +97,6 @@ tests_d.jsonl::per_hop_inline_from_a
 tests_d.jsonl::per_hop_inline_from_b
 tests_d.jsonl::per_hop_outer_var
 tests_d.jsonl::per_hop_path_binding
-tests_d.jsonl::postfix_prop_of_missing_key_is_null
 tests_d.jsonl::qsp_group_vars_2reps
 tests_d.jsonl::qsp_group_vars_anon_endpoint
 tests_d.jsonl::qsp_group_vars_where_scalar
@@ -121,7 +116,6 @@ tests_d.jsonl::shortest_k_clamps
 tests_d.jsonl::shortest_k_per_hop_pred
 tests_d.jsonl::unanchored_nodes_size
 tests_d.jsonl::unanchored_path_len
-tests_d.jsonl::vec_col_subscript
 tests_d.jsonl::vqs_11
 tests_d.jsonl::vqs_13
 tests_d.jsonl::vqs_14
@@ -140,7 +134,6 @@ tests_e.jsonl::count_multi_match
 tests_e.jsonl::date_part_bare_name_unknown_fn
 tests_e.jsonl::date_part_rejects_number
 tests_e.jsonl::date_part_rejects_string
-tests_e.jsonl::deep_field_access_subscript
 tests_e.jsonl::exists_multi_match_false
 tests_e.jsonl::exists_multi_match_true
 tests_e.jsonl::exists_multi_match_where_false
@@ -159,7 +152,6 @@ tests_e.jsonl::match_mode_different_edges
 tests_e.jsonl::match_mode_repeatable_elements
 tests_e.jsonl::property_exists_on_edges
 tests_e.jsonl::property_exists_on_null_element
-tests_e.jsonl::record_field_access_subscript
 tests_e.jsonl::subpath_where_and_clause_compose_bob
 tests_e.jsonl::subpath_where_and_clause_compose_dave
 tests_e.jsonl::subpath_where_equals_clause_subpath

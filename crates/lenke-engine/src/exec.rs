@@ -711,6 +711,7 @@ fn needs_lineage(plan: &Plan) -> bool {
                 fields.iter().any(|(_, e)| reads_path(e))
             }
             Expr::Field { base, .. } => reads_path(base),
+            Expr::Index { base, index } => reads_path(base) || reads_path(index),
             Expr::Case {
                 branches,
                 otherwise,
@@ -897,15 +898,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             let qlo_col = eval(qlo, store, &batch)?;
             let qhi_col = eval(qhi, store, &batch)?;
             interval_expand(
-                &batch,
-                store,
-                *from,
-                *dir,
-                edge_label,
-                lo_key,
-                hi_key,
-                &qlo_col,
-                &qhi_col,
+                &batch, store, *from, *dir, edge_label, lo_key, hi_key, &qlo_col, &qhi_col,
                 *bind_edge,
             )
         }
@@ -3530,7 +3523,9 @@ fn try_varlen_agg(
             if node_unique {
                 used.push(v); // mark the start node
             }
-            varlen_agg_dfs(store, v, 0, *min, *max, *dir, &want, *mode, v, &mut used, emit);
+            varlen_agg_dfs(
+                store, v, 0, *min, *max, *dir, &want, *mode, v, &mut used, emit,
+            );
             if node_unique {
                 used.pop();
             }
@@ -4554,6 +4549,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
             fields.iter().all(|(_, e)| refs_only_slot(e, s))
         }
         Expr::Field { base, .. } => refs_only_slot(base, s),
+        Expr::Index { base, index } => refs_only_slot(base, s) && refs_only_slot(index, s),
         Expr::Case {
             branches,
             otherwise,
@@ -4623,6 +4619,10 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
                 .iter()
                 .map(|(k, e)| (k.clone(), remap_slot(e, from, to)))
                 .collect(),
+        },
+        Expr::Index { base, index } => Expr::Index {
+            base: go(base),
+            index: go(index),
         },
         Expr::Field { base, key } => Expr::Field {
             base: go(base),
@@ -5055,7 +5055,11 @@ fn shortest_path(
                 }
                 let c = preds
                     .get(&node)
-                    .map(|ps| ps.iter().map(|&(p, _)| pcount.get(&p).copied().unwrap_or(0)).sum())
+                    .map(|ps| {
+                        ps.iter()
+                            .map(|&(p, _)| pcount.get(&p).copied().unwrap_or(0))
+                            .sum()
+                    })
                     .unwrap_or(0);
                 pcount.insert(node, c);
             }
@@ -5266,6 +5270,91 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
         Expr::Field { base, key } => {
             let col = eval(base, store, batch)?;
             read_property(store, &col, key)
+        }
+        // `base[index]` — 0-based list element or record/map field. Out of range /
+        // negative / non-integer index → NULL; null-safe. Mirrors core.
+        //
+        // Special case: `nodes(p)[i]` / relationships(p)[i]` (an Index over a path
+        // accessor) must keep the ELEMENT typing so a following `.prop` resolves the
+        // node/edge property (`edges(p)[0].w`). The path lists carry ids as `Num`,
+        // which a generic list-index would flatten to an untyped scalar. Emit a typed
+        // `Col::Nodes`/`Col::Edges` instead (out-of-range → `u32::MAX` null sentinel).
+        Expr::Index { base, index }
+            if matches!(
+                base.as_ref(),
+                Expr::PathAccess {
+                    part: crate::ir::PathPart::Nodes | crate::ir::PathPart::Relationships
+                }
+            ) =>
+        {
+            let is_nodes = matches!(
+                base.as_ref(),
+                Expr::PathAccess {
+                    part: crate::ir::PathPart::Nodes
+                }
+            );
+            let icol = eval(index, store, batch)?;
+            let ids: Vec<u32> = match &batch.lineage {
+                Some(lin) => (0..batch.rows())
+                    .map(|i| {
+                        let elems = if is_nodes {
+                            lin.path_at(i)
+                        } else {
+                            lin.edges_at(i)
+                        };
+                        match icol.value_at(i) {
+                            Value::Num(n)
+                                if n >= 0.0 && n.fract() == 0.0 && (n as usize) < elems.len() =>
+                            {
+                                match elems[n as usize] {
+                                    Value::Num(x) => x as u32,
+                                    _ => u32::MAX,
+                                }
+                            }
+                            _ => u32::MAX,
+                        }
+                    })
+                    .collect(),
+                None => vec![u32::MAX; batch.rows()],
+            };
+            if is_nodes {
+                Col::Nodes(ids)
+            } else {
+                Col::Edges(ids)
+            }
+        }
+        Expr::Index { base, index } => {
+            let bcol = eval(base, store, batch)?;
+            let icol = eval(index, store, batch)?;
+            Col::Gen(
+                (0..batch.rows())
+                    .map(|i| match bcol.value_at(i) {
+                        Value::List(items) => match icol.value_at(i) {
+                            Value::Num(n)
+                                if n >= 0.0 && n.fract() == 0.0 && (n as usize) < items.len() =>
+                            {
+                                items[n as usize].clone()
+                            }
+                            _ => Value::Null,
+                        },
+                        Value::Record(fields) => match icol.value_at(i) {
+                            Value::Str(k) => fields
+                                .iter()
+                                .find(|(fk, _)| *fk == k)
+                                .map_or(Value::Null, |(_, v)| v.clone()),
+                            _ => Value::Null,
+                        },
+                        Value::Map(entries) => match icol.value_at(i) {
+                            Value::Str(k) => entries
+                                .iter()
+                                .find(|(ek, _)| matches!(ek, Value::Str(s) if *s == k))
+                                .map_or(Value::Null, |(_, v)| v.clone()),
+                            _ => Value::Null,
+                        },
+                        _ => Value::Null,
+                    })
+                    .collect(),
+            )
         }
         Expr::Path => match &batch.lineage {
             // Each row's path as a List of node ids; NULL when the plan tracks no
@@ -6363,45 +6452,45 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         // default last). Mirrors ORDER BY / core's compare_sort byte-for-byte. A
         // stored list never holds NaN (it becomes null at ingest), so `is_null`
         // covers every nullish element.
-        "list_sort" => match &args[0] {
-            Value::List(v) => {
-                let descending =
-                    matches!(args.get(1), Some(Value::Str(s)) if s.eq_ignore_ascii_case("desc"));
-                let nulls_first =
-                    matches!(args.get(2), Some(Value::Str(s)) if s.eq_ignore_ascii_case("first"));
-                let mut out = v.clone();
-                out.sort_by(|x, y| {
-                    use std::cmp::Ordering;
-                    match (x.is_null(), y.is_null()) {
-                        (true, true) => Ordering::Equal,
-                        (true, false) => {
-                            if nulls_first {
-                                Ordering::Less
-                            } else {
-                                Ordering::Greater
+        "list_sort" => {
+            match &args[0] {
+                Value::List(v) => {
+                    let descending = matches!(args.get(1), Some(Value::Str(s)) if s.eq_ignore_ascii_case("desc"));
+                    let nulls_first = matches!(args.get(2), Some(Value::Str(s)) if s.eq_ignore_ascii_case("first"));
+                    let mut out = v.clone();
+                    out.sort_by(|x, y| {
+                        use std::cmp::Ordering;
+                        match (x.is_null(), y.is_null()) {
+                            (true, true) => Ordering::Equal,
+                            (true, false) => {
+                                if nulls_first {
+                                    Ordering::Less
+                                } else {
+                                    Ordering::Greater
+                                }
+                            }
+                            (false, true) => {
+                                if nulls_first {
+                                    Ordering::Greater
+                                } else {
+                                    Ordering::Less
+                                }
+                            }
+                            (false, false) => {
+                                let o = value::cmp_total(x, y);
+                                if descending {
+                                    o.reverse()
+                                } else {
+                                    o
+                                }
                             }
                         }
-                        (false, true) => {
-                            if nulls_first {
-                                Ordering::Greater
-                            } else {
-                                Ordering::Less
-                            }
-                        }
-                        (false, false) => {
-                            let o = value::cmp_total(x, y);
-                            if descending {
-                                o.reverse()
-                            } else {
-                                o
-                            }
-                        }
-                    }
-                });
-                Value::List(out)
+                    });
+                    Value::List(out)
+                }
+                _ => Value::Null,
             }
-            _ => Value::Null,
-        },
+        }
         // Set algebra over lists — all DEDUPED (by value equality), matching core.
         // union: a's elements then b's, deduped. intersection: elements of a also
         // in b, deduped. difference: elements of a not in b, deduped.
@@ -8083,6 +8172,62 @@ mod tests {
         assert_eq!(num("char_length(n.b)"), 5.0);
     }
 
+    /// Subscript `base[index]` (ISO 0-based) over a list literal, record and map:
+    /// in-range element, out-of-range / negative / non-integer → NULL, null-safe.
+    #[test]
+    fn subscript_list_record_map() {
+        let mut b = Builder::default();
+        b.node(&["N"], &[("z", n(1.0))]);
+        let store = b.build();
+        let num = |e: &str| -> f64 {
+            let q = format!("MATCH (x:N) RETURN {e} AS v");
+            match run(&crate::gql::parse(&q).unwrap(), &store).rows[0][0] {
+                Value::Num(x) => x,
+                ref o => panic!("{e} → {o:?}"),
+            }
+        };
+        let isnull = |e: &str| -> bool {
+            let q = format!("MATCH (x:N) RETURN {e} AS v");
+            run(&crate::gql::parse(&q).unwrap(), &store).rows[0][0].is_null()
+        };
+        assert_eq!(num("[10,20,30][0]"), 10.0);
+        assert_eq!(num("[10,20,30][2]"), 30.0);
+        assert!(isnull("[10,20,30][9]")); // out of range
+        assert!(isnull("[10,20,30][-1]")); // negative
+        assert!(isnull("[10,20,30][1.5]")); // non-integer
+        assert_eq!(num("{a:1,b:2}['b']"), 2.0); // record field by string key
+        assert!(isnull("{a:1,b:2}['zzz']")); // missing field
+    }
+
+    /// `edges(p)[i]` / `nodes(p)[i]` keep element typing so a following `.prop`
+    /// resolves the edge/node property. Path n0 -R(w=5)-> n1 -R(w=7)-> n2.
+    #[test]
+    fn subscript_path_element_property() {
+        let nd = concat!(
+            "{\"id\":\"n0\",\"labels\":[\"N\"],\"props\":{\"id\":\"n0\"}}\n",
+            "{\"id\":\"n1\",\"labels\":[\"N\"],\"props\":{\"id\":\"n1\"}}\n",
+            "{\"id\":\"n2\",\"labels\":[\"N\"],\"props\":{\"id\":\"n2\"}}\n",
+            "{\"id\":\"e1\",\"from\":\"n0\",\"to\":\"n1\",\"type\":\"R\",\"props\":{\"w\":5}}\n",
+            "{\"id\":\"e2\",\"from\":\"n1\",\"to\":\"n2\",\"type\":\"R\",\"props\":{\"w\":7}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let val = |e: &str| -> Value {
+            let q = format!(
+                "MATCH p = ANY SHORTEST (a:N {{id:'n0'}})-[:R]->*(b:N {{id:'n2'}}) RETURN {e} AS v"
+            );
+            run(&crate::gql::parse(&q).unwrap(), &store).rows[0][0].clone()
+        };
+        assert!(matches!(val("edges(p)[0].w"), Value::Num(x) if x == 5.0)); // first edge property
+        assert!(matches!(val("edges(p)[1].w"), Value::Num(x) if x == 7.0)); // second edge property
+        assert!(val("edges(p)[9].w").is_null()); // out-of-range edge → NULL prop
+        assert!(matches!(val("nodes(p)[2].id"), Value::Str(x) if &*x == "n2"));
+        assert!(val("nodes(p)[0].nope").is_null()); // missing node property
+        assert!(matches!(
+            val("edges(p)[1].w > edges(p)[0].w"),
+            Value::Bool(true)
+        ));
+    }
+
     /// String (K10) and list/element (K11) functions match hand-computed values.
     #[test]
     fn added_string_and_list_functions() {
@@ -8263,7 +8408,12 @@ mod tests {
             run(&crate::gql::parse(q).unwrap(), &store)
                 .rows
                 .iter()
-                .map(|r| r.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(","))
+                .map(|r| {
+                    r.iter()
+                        .map(|c| format!("{c:?}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
                 .collect()
         };
         // HAVING on an aggregate: only the age-30 group (count 2 > 1).
@@ -8286,9 +8436,13 @@ mod tests {
             rows("SELECT count(*) AS c FROM MATCH (n:Person) HAVING count(*) > 2"),
             vec!["Num(3.0)"]
         );
-        assert!(rows("SELECT count(*) AS c FROM MATCH (n:Person) HAVING count(*) > 100").is_empty());
+        assert!(
+            rows("SELECT count(*) AS c FROM MATCH (n:Person) HAVING count(*) > 100").is_empty()
+        );
         // HAVING null drops every group.
-        assert!(rows("SELECT n.age AS age FROM MATCH (n:Person) GROUP BY n.age HAVING null").is_empty());
+        assert!(
+            rows("SELECT n.age AS age FROM MATCH (n:Person) GROUP BY n.age HAVING null").is_empty()
+        );
     }
 
     /// `ALL SHORTEST` emits one row per distinct shortest path (so a target reached
@@ -8351,13 +8505,18 @@ mod tests {
             "{\"id\":\"c\",\"labels\":[\"Person\"],\"props\":{\"name\":\"Cara\",\"age\":30}}\n",
         );
         let store = crate::ndjson::from_ndjson(nd).unwrap();
-        let one = |q: &str| -> Value { run(&crate::gql::parse(q).unwrap(), &store).rows[0][0].clone() };
+        let one =
+            |q: &str| -> Value { run(&crate::gql::parse(q).unwrap(), &store).rows[0][0].clone() };
         // Constant projection, no FROM.
         assert!(matches!(one("SELECT 1 + 2 AS v"), Value::Num(n) if n == 3.0));
         // Plain projection with an inline filter.
-        assert!(matches!(one("SELECT n.name AS nm FROM MATCH (n:Person {name: 'Alice'})"), Value::Str(s) if &*s == "Alice"));
+        assert!(
+            matches!(one("SELECT n.name AS nm FROM MATCH (n:Person {name: 'Alice'})"), Value::Str(s) if &*s == "Alice")
+        );
         // Global aggregate with WHERE (>= 30 → all three).
-        assert!(matches!(one("SELECT count(*) AS c FROM MATCH (n:Person) WHERE n.age >= 30"), Value::Num(n) if n == 3.0));
+        assert!(
+            matches!(one("SELECT count(*) AS c FROM MATCH (n:Person) WHERE n.age >= 30"), Value::Num(n) if n == 3.0)
+        );
         // GROUP BY age with ORDER BY the output alias: ages 30 (×2), 40 (×1).
         let grouped = run(
             &crate::gql::parse(
@@ -8378,8 +8537,10 @@ mod tests {
     /// null propagation), log10, TRIM spec forms, and list_sort with order/nullOrder.
     #[test]
     fn scalar_fns_batch() {
-        let store = crate::ndjson::from_ndjson("{\"id\":\"n\",\"labels\":[\"V\"],\"props\":{}}").unwrap();
-        let val = |q: &str| -> Value { run(&crate::gql::parse(q).unwrap(), &store).rows[0][0].clone() };
+        let store =
+            crate::ndjson::from_ndjson("{\"id\":\"n\",\"labels\":[\"V\"],\"props\":{}}").unwrap();
+        let val =
+            |q: &str| -> Value { run(&crate::gql::parse(q).unwrap(), &store).rows[0][0].clone() };
         let num = |q: &str| -> f64 {
             match val(q) {
                 Value::Num(n) => n,
@@ -8390,7 +8551,7 @@ mod tests {
         assert_eq!(num("RETURN round(1.2345, 2) AS r"), 1.23);
         assert_eq!(num("RETURN round(1234.5678, -2) AS r"), 1200.0);
         assert_eq!(num("RETURN round(2.5) AS r"), 3.0); // 1-arg still works
-        // atan2(y, x): arg order matters; a null arg → NULL.
+                                                        // atan2(y, x): arg order matters; a null arg → NULL.
         assert!((num("RETURN atan2(1, 1) AS r") - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
         assert_eq!(num("RETURN atan2(0, 1) AS r"), 0.0);
         assert!(matches!(val("RETURN atan2(null, 1) AS r"), Value::Null));
@@ -9513,10 +9674,12 @@ mod tests {
         st.add_edge(a, b, "R");
         let eid = st.out(a)[0].eid;
         st.set_edge_prop(eid, "weight", n(0.5));
-        let plan = scan("P").expand_edge(0, Dir::Out, &["R".to_string()]).project(vec![
-            ("w".into(), prop(1, "weight")), // edge slot
-            ("b".into(), prop(2, "name")),   // node slot
-        ]);
+        let plan = scan("P")
+            .expand_edge(0, Dir::Out, &["R".to_string()])
+            .project(vec![
+                ("w".into(), prop(1, "weight")), // edge slot
+                ("b".into(), prop(2, "name")),   // node slot
+            ]);
         let out = run(&plan, &st);
         assert_eq!(out.rows.len(), 1);
         assert!(matches!(&out.rows[0][0], Value::Num(x) if *x == 0.5));
@@ -9706,10 +9869,12 @@ mod tests {
     #[test]
     fn count_out_degree_grouped_by_source() {
         let store = social();
-        let plan = scan("Person").expand(0, Dir::Out, &["KNOWS".to_string()]).aggregate(
-            vec![("who".into(), prop(0, "name"))],
-            vec![agg(AggFn::Count, None, false, "deg")],
-        );
+        let plan = scan("Person")
+            .expand(0, Dir::Out, &["KNOWS".to_string()])
+            .aggregate(
+                vec![("who".into(), prop(0, "name"))],
+                vec![agg(AggFn::Count, None, false, "deg")],
+            );
         let out = run(&plan, &store);
         let mut got: Vec<(String, f64)> = out
             .rows
@@ -9794,10 +9959,12 @@ mod tests {
     #[test]
     fn frontier_grouped_count_matches() {
         let store = social();
-        let plan = scan("Person").expand(0, Dir::Out, &["KNOWS".to_string()]).aggregate(
-            vec![("who".into(), prop(1, "name"))],
-            vec![agg(AggFn::Count, None, false, "c")],
-        );
+        let plan = scan("Person")
+            .expand(0, Dir::Out, &["KNOWS".to_string()])
+            .aggregate(
+                vec![("who".into(), prop(1, "name"))],
+                vec![agg(AggFn::Count, None, false, "c")],
+            );
         let out = run(&plan, &store);
         assert_eq!(as_str(&out.rows[0][0]), "bob");
         assert_eq!(num(&out.rows[0][1]), 1.0);
@@ -9836,10 +10003,12 @@ mod tests {
     #[test]
     fn frontier_grouped_sum_matches() {
         let store = social();
-        let plan = scan("Person").expand(0, Dir::Out, &["KNOWS".to_string()]).aggregate(
-            vec![("who".into(), prop(1, "name"))],
-            vec![agg(AggFn::Sum, Some(prop(1, "age")), false, "s")],
-        );
+        let plan = scan("Person")
+            .expand(0, Dir::Out, &["KNOWS".to_string()])
+            .aggregate(
+                vec![("who".into(), prop(1, "name"))],
+                vec![agg(AggFn::Sum, Some(prop(1, "age")), false, "s")],
+            );
         let out = run(&plan, &store);
         assert_eq!(num(&out.rows[0][1]), 25.0); // bob
         assert_eq!(num(&out.rows[1][1]), 80.0); // carol twice
@@ -10358,7 +10527,14 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .shortest_path(0, Dir::Out, &["R".to_string()],  1, None, crate::ir::ShortestSelector::Any)
+            .shortest_path(
+                0,
+                Dir::Out,
+                &["R".to_string()],
+                1,
+                None,
+                crate::ir::ShortestSelector::Any,
+            )
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);
@@ -10380,7 +10556,14 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .shortest_path(0, Dir::Out, &["R".to_string()],  1, None, crate::ir::ShortestSelector::Any)
+            .shortest_path(
+                0,
+                Dir::Out,
+                &["R".to_string()],
+                1,
+                None,
+                crate::ir::ShortestSelector::Any,
+            )
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);
@@ -10403,7 +10586,14 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .shortest_path(0, Dir::Out, &["R".to_string()],  1, Some(2), crate::ir::ShortestSelector::Any)
+            .shortest_path(
+                0,
+                Dir::Out,
+                &["R".to_string()],
+                1,
+                Some(2),
+                crate::ir::ShortestSelector::Any,
+            )
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);
@@ -10424,7 +10614,14 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .shortest_path(0, Dir::Out, &["R".to_string()],  1, None, crate::ir::ShortestSelector::Any)
+            .shortest_path(
+                0,
+                Dir::Out,
+                &["R".to_string()],
+                1,
+                None,
+                crate::ir::ShortestSelector::Any,
+            )
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);

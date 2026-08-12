@@ -330,9 +330,7 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             ':' => out.push(Tok::Colon),
             // A `.` immediately followed by a digit is a leading-dot float (`.5`);
             // it falls through to the numeric arm below. A bare `.` is the accessor.
-            '.' if !matches!(b.get(i + 1), Some(d) if d.is_ascii_digit()) => {
-                out.push(Tok::Dot)
-            }
+            '.' if !matches!(b.get(i + 1), Some(d) if d.is_ascii_digit()) => out.push(Tok::Dot),
             ',' => out.push(Tok::Comma),
             '*' => out.push(Tok::Star),
             '+' => out.push(Tok::Plus),
@@ -420,7 +418,9 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                                     .and_then(|h| u32::from_str_radix(&h, 16).ok())
                                     .and_then(char::from_u32)
                                     .ok_or_else(|| {
-                                        format!("invalid \\{esc} escape (expected {width} hex digits)")
+                                        format!(
+                                            "invalid \\{esc} escape (expected {width} hex digits)"
+                                        )
                                     })?;
                                 t.push(cp);
                                 i = end;
@@ -1123,13 +1123,9 @@ impl Parser {
     /// `ALL SHORTEST` → All, `SHORTEST 1` → Any, `SHORTEST 1 GROUP[S]` → All. Returns
     /// `None` (consuming nothing) when the next tokens are not a selector. `SHORTEST k`
     /// for k ≠ 1, and bare `ANY`/`ALL` (walk) without `SHORTEST`, are errors here.
-    fn parse_shortest_selector(
-        &mut self,
-    ) -> Result<Option<crate::ir::ShortestSelector>, String> {
+    fn parse_shortest_selector(&mut self) -> Result<Option<crate::ir::ShortestSelector>, String> {
         use crate::ir::ShortestSelector;
-        let next_is = |p: &Self, kw: &str| {
-            matches!(p.toks.get(p.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(kw))
-        };
+        let next_is = |p: &Self, kw: &str| matches!(p.toks.get(p.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(kw));
         if self.peek_kw("ANY") && next_is(self, "SHORTEST") {
             self.pos += 2;
             return Ok(Some(ShortestSelector::Any));
@@ -1554,16 +1550,15 @@ impl Parser {
             };
             // An inserted edge has exactly one concrete type — a `|`-disjunction is
             // a MATCH construct, not creatable.
-            let etype = match rel.etypes.as_slice() {
-                [t] => t.clone(),
-                [] => return Err("INSERT of a relationship requires an edge type".into()),
-                _ => {
-                    return Err(
+            let etype =
+                match rel.etypes.as_slice() {
+                    [t] => t.clone(),
+                    [] => return Err("INSERT of a relationship requires an edge type".into()),
+                    _ => return Err(
                         "INSERT of a relationship requires a single edge type, not a disjunction"
                             .into(),
-                    )
-                }
-            };
+                    ),
+                };
             edges.push(crate::ir::InsertEdge {
                 from,
                 to,
@@ -1789,9 +1784,9 @@ impl Parser {
             let rel = self.rel()?;
             let quant = self.opt_quantifier()?;
             let (v2, v2_label, v2_props, v2_where, v2_le) = self.node()?;
-                                                                // A relationship variable, inline edge properties, or an inline edge
-                                                                // WHERE require binding the edge as a slot (edge at `slots`, node at
-                                                                // `slots+1`) so `e.k` can resolve.
+            // A relationship variable, inline edge properties, or an inline edge
+            // WHERE require binding the edge as a slot (edge at `slots`, node at
+            // `slots+1`) so `e.k` can resolve.
             let bind = rel.var.is_some() || !rel.props.is_empty() || rel.where_range.is_some();
             if let Some((min, max)) = quant {
                 if bind {
@@ -1882,7 +1877,8 @@ impl Parser {
     /// edge's props, and a multi-hop body are all rejected (later increments).
     fn parse_subpath_group(&mut self) -> Result<(Dir, Vec<String>, u32, u32), String> {
         self.expect(&Tok::LParen)?; // the group's own opening paren
-        let bad_inner = |n: &ParsedNode| n.1.is_some() || n.4.is_some() || !n.2.is_empty() || n.3.is_some();
+        let bad_inner =
+            |n: &ParsedNode| n.1.is_some() || n.4.is_some() || !n.2.is_empty() || n.3.is_some();
         let src = self.node()?;
         if bad_inner(&src) {
             return Err(
@@ -1891,7 +1887,9 @@ impl Parser {
         }
         let rel = self.rel()?;
         if !rel.props.is_empty() || rel.where_range.is_some() {
-            return Err("edge properties / a per-hop WHERE on a subpath group are not supported yet".into());
+            return Err(
+                "edge properties / a per-hop WHERE on a subpath group are not supported yet".into(),
+            );
         }
         let tgt = self.node()?;
         if bad_inner(&tgt) {
@@ -2393,7 +2391,10 @@ impl Parser {
         self.expect(&Tok::RBracket)?;
         let dir = if incoming {
             if !self.eat(&Tok::Minus) && !self.eat(&Tok::Tilde) {
-                return Err(format!("expected `-` or `~` to close a relationship at token {}", self.pos));
+                return Err(format!(
+                    "expected `-` or `~` to close a relationship at token {}",
+                    self.pos
+                ));
             }
             Dir::In
         } else if self.eat(&Tok::RArrow) {
@@ -2854,7 +2855,7 @@ impl Parser {
                     }
                 }
                 self.expect(&Tok::RBracket)?;
-                Ok(Expr::List { items })
+                self.field_chain(Expr::List { items })
             }
             Some(Tok::LBrace) => {
                 // A record literal `{k: expr, …}` (empty `{}` allowed). In
@@ -2959,9 +2960,11 @@ impl Parser {
                     }
                 }
                 // A scalar function call `name(args…)`. (Aggregates are handled in
-                // return_items, never reached here.)
+                // return_items, never reached here.) A call may be subscripted /
+                // field-accessed (`edges(p)[0].w`), so route through `field_chain`.
                 if self.peek() == Some(&Tok::LParen) {
-                    return self.call(&s);
+                    let call = self.call(&s)?;
+                    return self.field_chain(call);
                 }
                 // A path variable resolves to the current row's path (lineage),
                 // not a slot — there is exactly one path per row.
@@ -3003,12 +3006,24 @@ impl Parser {
     /// expression), building nested `Expr::Field`. (A bare variable handles its
     /// own single `.prop` in `primary`, keeping that the optimizer's `Prop` shape.)
     fn field_chain(&mut self, mut base: Expr) -> Result<Expr, String> {
-        while self.eat(&Tok::Dot) {
-            let key = self.ident()?;
-            base = Expr::Field {
-                base: Box::new(base),
-                key,
-            };
+        loop {
+            if self.eat(&Tok::Dot) {
+                let key = self.ident()?;
+                base = Expr::Field {
+                    base: Box::new(base),
+                    key,
+                };
+            } else if self.eat(&Tok::LBracket) {
+                // Subscript `base[index]` — a list element or a record/map field.
+                let index = self.expr()?;
+                self.expect(&Tok::RBracket)?;
+                base = Expr::Index {
+                    base: Box::new(base),
+                    index: Box::new(index),
+                };
+            } else {
+                break;
+            }
         }
         Ok(base)
     }
@@ -3189,7 +3204,9 @@ impl Parser {
             // FORWARD: the first node is the bound correlated variable; it may not be
             // re-labeled or re-constrained. Extend the chain from it.
             if label.is_some() || le.is_some() {
-                return Err(format!("bound variable `{v}` cannot be re-labeled inside {kw}"));
+                return Err(format!(
+                    "bound variable `{v}` cannot be re-labeled inside {kw}"
+                ));
             }
             if !props.is_empty() {
                 return Err(format!(
@@ -3421,7 +3438,10 @@ fn rewrite_group_keys(e: Expr, keys: &[(String, Expr)]) -> Expr {
         },
         Expr::Call { name, args } => Expr::Call {
             name,
-            args: args.into_iter().map(|a| rewrite_group_keys(a, keys)).collect(),
+            args: args
+                .into_iter()
+                .map(|a| rewrite_group_keys(a, keys))
+                .collect(),
         },
         other => other,
     }
@@ -3448,7 +3468,10 @@ fn is_operator_continuation(t: Option<&Tok>) -> bool {
         ) => true,
         // Keyword operators (`OR`/`AND`/`XOR`/`IN`/`IS`).
         Some(Tok::Ident(s)) => {
-            matches!(s.to_ascii_uppercase().as_str(), "OR" | "AND" | "XOR" | "IN" | "IS")
+            matches!(
+                s.to_ascii_uppercase().as_str(),
+                "OR" | "AND" | "XOR" | "IN" | "IS"
+            )
         }
         _ => false,
     }
@@ -3485,7 +3508,10 @@ fn rewrite_agg_slots(e: Expr, base: usize) -> Expr {
         },
         Expr::Call { name, args } => Expr::Call {
             name,
-            args: args.into_iter().map(|a| rewrite_agg_slots(a, base)).collect(),
+            args: args
+                .into_iter()
+                .map(|a| rewrite_agg_slots(a, base))
+                .collect(),
         },
         other => other,
     }
@@ -3548,7 +3574,11 @@ fn apply_items(plan: Plan, items: &[RetItem]) -> (Plan, Vec<String>) {
                     aggs.push(a.clone());
                     proj.push((a.name.clone(), Expr::Slot(pos)));
                 }
-                RetItem::AggExpr { name, expr, aggs: ia } => {
+                RetItem::AggExpr {
+                    name,
+                    expr,
+                    aggs: ia,
+                } => {
                     let base = k + aggs.len();
                     aggs.extend(ia.iter().cloned());
                     proj.push((name.clone(), rewrite_agg_slots(expr.clone(), base)));
@@ -3888,7 +3918,9 @@ mod tests {
                 func: AggFn::Count,
                 arg: Some(Expr::Slot(1)),
                 distinct: false,
-                name: "n".into(), frac: None,}],
+                name: "n".into(),
+                frac: None,
+            }],
         )
         .filter(Expr::Compare {
             op: CompareOp::Ge,
@@ -4171,7 +4203,14 @@ mod tests {
         // Parse cross-check against the hand-built ShortestPath plan (all sources).
         // `*` is min 0 (the seed is a zero-length path to itself).
         let hand = Plan::Scan { label: None }
-            .shortest_path(0, Dir::Out, &["LINK".to_string()], 0, None, crate::ir::ShortestSelector::Any)
+            .shortest_path(
+                0,
+                Dir::Out,
+                &["LINK".to_string()],
+                0,
+                None,
+                crate::ir::ShortestSelector::Any,
+            )
             .project(vec![(
                 "len".into(),
                 Expr::PathAccess {
@@ -5368,7 +5407,9 @@ mod tests {
                         key: "age".into(),
                     }),
                     distinct: false,
-                    name: "s".into(), frac: None,},
+                    name: "s".into(),
+                    frac: None,
+                },
                 Agg {
                     func: AggFn::Avg,
                     arg: Some(Expr::Prop {
@@ -5376,7 +5417,9 @@ mod tests {
                         key: "age".into(),
                     }),
                     distinct: false,
-                    name: "a".into(), frac: None,},
+                    name: "a".into(),
+                    frac: None,
+                },
             ],
         );
         assert_same(
@@ -6687,12 +6730,22 @@ mod tests {
         );
         let store = crate::ndjson::from_ndjson(nd).unwrap();
         let col0 = |q: &str| -> Vec<String> {
-            run(&super::parse(q).unwrap(), &store).rows.iter().map(|r| format!("{:?}", r[0])).collect()
+            run(&super::parse(q).unwrap(), &store)
+                .rows
+                .iter()
+                .map(|r| format!("{:?}", r[0]))
+                .collect()
         };
         // ORDER BY asc: numbers, then strings, then bool.
         assert_eq!(
             col0("MATCH (n:X) RETURN n.v AS v ORDER BY n.v"),
-            vec!["Num(1.0)", "Num(2.0)", "Str(\"a\")", "Str(\"b\")", "Bool(true)"]
+            vec![
+                "Num(1.0)",
+                "Num(2.0)",
+                "Str(\"a\")",
+                "Str(\"b\")",
+                "Bool(true)"
+            ]
         );
         // min = the smallest number; max = the bool (highest rank present).
         assert_eq!(col0("MATCH (n:X) RETURN min(n.v) AS m"), vec!["Num(1.0)"]);
@@ -6775,8 +6828,14 @@ mod tests {
                 ref o => panic!("want num, got {o:?}"),
             }
         };
-        assert_eq!(n("MATCH (x) WHERE x:Person|Software RETURN count(*) AS c"), 3.0);
-        assert_eq!(n("MATCH (x) WHERE x:Person&Admin RETURN count(*) AS c"), 1.0);
+        assert_eq!(
+            n("MATCH (x) WHERE x:Person|Software RETURN count(*) AS c"),
+            3.0
+        );
+        assert_eq!(
+            n("MATCH (x) WHERE x:Person&Admin RETURN count(*) AS c"),
+            1.0
+        );
         assert_eq!(n("MATCH (x) WHERE x:!Software RETURN count(*) AS c"), 2.0);
         // A single label is unchanged.
         assert_eq!(n("MATCH (x) WHERE x:Person RETURN count(*) AS c"), 2.0);
@@ -6804,11 +6863,20 @@ mod tests {
             }
         };
         // in-degree of n1 = 2.
-        assert_eq!(n("MATCH (n:Node) WHERE n.name='n1' RETURN COUNT { (m)-[:R]->(n) } AS c"), 2.0);
+        assert_eq!(
+            n("MATCH (n:Node) WHERE n.name='n1' RETURN COUNT { (m)-[:R]->(n) } AS c"),
+            2.0
+        );
         // out-degree of n0 via incoming arrow at the local node = 3.
-        assert_eq!(n("MATCH (n:Node) WHERE n.name='n0' RETURN COUNT { (m)<-[:R]-(n) } AS c"), 3.0);
+        assert_eq!(
+            n("MATCH (n:Node) WHERE n.name='n0' RETURN COUNT { (m)<-[:R]-(n) } AS c"),
+            3.0
+        );
         // local-node label filter narrows the reverse hop.
-        assert_eq!(n("MATCH (n:Node) WHERE n.name='n1' RETURN COUNT { (m:Node)-[:R]->(n) } AS c"), 2.0);
+        assert_eq!(
+            n("MATCH (n:Node) WHERE n.name='n1' RETURN COUNT { (m:Node)-[:R]->(n) } AS c"),
+            2.0
+        );
     }
 
     /// A single-edge parenthesized subpath group `((x)-[e:R]->(y)){n,m}(t)` lowers
@@ -6828,7 +6896,10 @@ mod tests {
         let store = crate::ndjson::from_ndjson(nd).unwrap();
         let ids = |q: &str| -> Vec<String> {
             let mut v: Vec<String> = run(&super::parse(q).unwrap(), &store)
-                .rows.iter().map(|r| format!("{:?}", r[0])).collect();
+                .rows
+                .iter()
+                .map(|r| format!("{:?}", r[0]))
+                .collect();
             v.sort();
             v
         };
@@ -7772,8 +7843,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.rows.len(), 1);
-        let probe =
-            super::parse("MATCH (n:Person {name: 'newbie'}) RETURN n.name, n.age").unwrap();
+        let probe = super::parse("MATCH (n:Person {name: 'newbie'}) RETURN n.name, n.age").unwrap();
         assert_eq!(bag(&out), bag(&run(&probe, &st)));
     }
 
