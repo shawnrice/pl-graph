@@ -8,9 +8,6 @@ hardening.jsonl::h_rejects_literal_oversized_integer_literal
 hardening.jsonl::h_string_plus_number_raises_data_exception
 hardening.jsonl::h_trail_cycle_terminates_one_row_per_trail
 hardening.jsonl::h_undirected_self_loop_counted_once
-hardening.jsonl::h_valid_numeric_literals_accepted_3
-hardening.jsonl::h_valid_numeric_literals_accepted_4
-hardening.jsonl::h_valid_numeric_literals_accepted_5
 hardening.jsonl::h_valid_numeric_literals_accepted_6
 hardening.jsonl::h_valid_numeric_literals_accepted_8
 hardening.jsonl::h_valid_numeric_literals_accepted_9
@@ -23,9 +20,6 @@ language.jsonl::m_edge_label_disjunction
 language.jsonl::m_edge_label_negation
 language.jsonl::m_except
 language.jsonl::m_financial_var_length_money_flow
-language.jsonl::m_hex_scientific_underscored_numbers_1
-language.jsonl::m_hex_scientific_underscored_numbers_2
-language.jsonl::m_hex_scientific_underscored_numbers_3
 language.jsonl::m_hex_scientific_underscored_numbers_4
 language.jsonl::m_hex_scientific_underscored_numbers_5
 language.jsonl::m_hex_scientific_underscored_numbers_6
@@ -38,8 +32,6 @@ language.jsonl::m_is_as_label_introducer
 language.jsonl::m_is_labeled_tests_element_1
 language.jsonl::m_is_labeled_tests_element_2
 language.jsonl::m_is_not_labeled_negates
-language.jsonl::m_is_true_is_not_true_resolve_unknown_predicates_1
-language.jsonl::m_is_true_is_not_true_resolve_unknown_predicates_2
 language.jsonl::m_label_conjunction
 language.jsonl::m_label_disjunction
 language.jsonl::m_label_negation
@@ -58,7 +50,6 @@ language.jsonl::m_simple_case_over_integers_1
 language.jsonl::m_simple_case_over_integers_2
 language.jsonl::m_simple_case_over_integers_3
 language.jsonl::m_simple_case_over_integers_4
-language.jsonl::m_truth_value_tests
 language.jsonl::m_undirected_edge_matches_either_traversal_direction
 language.jsonl::m_undirected_var_length
 language.jsonl::m_var_length_plus_one_or_more_hops
@@ -76,10 +67,6 @@ tck.jsonl::tck_literals6_unicode_escapes_decode_to_code_points_2
 tck.jsonl::tck_literals6_unicode_escapes_decode_to_code_points_3
 tck.jsonl::tck_literals_floats_2
 tck.jsonl::tck_literals_floats_3
-tck.jsonl::tck_literals_hexadecimal_integers_1
-tck.jsonl::tck_literals_hexadecimal_integers_2
-tck.jsonl::tck_literals_octal_integers_1
-tck.jsonl::tck_literals_octal_integers_2
 tck.jsonl::tck_null1_property_null_check_on_null_node_unmatched_optional
 tck.jsonl::tck_precedence1_and_takes_precedence_over_xor
 tck.jsonl::tck_precedence1_iso_or_xor_share_left_associative_level
@@ -117,7 +104,6 @@ tests_a.jsonl::insert_node_then_return
 tests_a.jsonl::intersect_
 tests_a.jsonl::is_labeled
 tests_a.jsonl::is_not_labeled
-tests_a.jsonl::is_truth
 tests_a.jsonl::label_expr_not
 tests_a.jsonl::label_expr_or
 tests_a.jsonl::label_expr_wildcard
@@ -146,7 +132,6 @@ tests_b.jsonl::atan2_1_0
 tests_b.jsonl::atan2_1_1
 tests_b.jsonl::atan2_null
 tests_b.jsonl::avg_duration_errors
-tests_b.jsonl::binary_101
 tests_b.jsonl::call_config_bogus_error
 tests_b.jsonl::call_config_pivot_error
 tests_b.jsonl::call_config_wrong_type_error
@@ -165,7 +150,6 @@ tests_b.jsonl::exists_bound_e_e_star
 tests_b.jsonl::exists_bound_f_f_plus
 tests_b.jsonl::exists_bound_g_g_plus
 tests_b.jsonl::exists_bound_reversed
-tests_b.jsonl::hex_ff
 tests_b.jsonl::list_sort_desc
 tests_b.jsonl::list_sort_nulls_first
 tests_b.jsonl::max_total_order
@@ -182,7 +166,6 @@ tests_b.jsonl::multiseg_u2_d3_bounded
 tests_b.jsonl::multiseg_u2_d3_star
 tests_b.jsonl::multiseg_u2_f1_bounded
 tests_b.jsonl::multiseg_u2_f1_star
-tests_b.jsonl::octal_17
 tests_b.jsonl::order_total_order_asc
 tests_b.jsonl::order_total_order_desc
 tests_b.jsonl::oversized_int_error

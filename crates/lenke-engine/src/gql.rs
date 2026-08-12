@@ -241,6 +241,29 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                 out.push(Tok::Str(t));
             }
             _ if c.is_ascii_digit() => {
+                // Radix prefixes `0x`/`0o`/`0b` — an integer in that base (value as
+                // f64, matching core). Else a decimal (with an optional `.`).
+                if c == '0' && i + 1 < b.len() {
+                    let radix = match b[i + 1].to_ascii_lowercase() {
+                        'x' => Some(16u32),
+                        'o' => Some(8),
+                        'b' => Some(2),
+                        _ => None,
+                    };
+                    if let Some(radix) = radix {
+                        let start = i + 2;
+                        let mut j = start;
+                        while j < b.len() && b[j].is_digit(radix) {
+                            j += 1;
+                        }
+                        let digits: String = b[start..j].iter().collect();
+                        let v = u64::from_str_radix(&digits, radix)
+                            .map_err(|_| format!("bad radix literal `{}`", &digits))?;
+                        out.push(Tok::Num(v as f64));
+                        i = j;
+                        continue;
+                    }
+                }
                 let start = i;
                 while i < b.len() && (b[i].is_ascii_digit() || b[i] == '.') {
                     i += 1;
@@ -1578,13 +1601,36 @@ impl Parser {
         // binary comparison operators (a value is one or the other, not both).
         if self.eat_kw("IS") {
             let negated = self.eat_kw("NOT");
-            if !self.eat_kw("NULL") {
-                return Err("expected NULL after IS [NOT]".into());
+            // `IS [NOT] NULL | UNKNOWN | TRUE | FALSE`. UNKNOWN == NULL for a boolean
+            // 3VL value. `x IS TRUE` is TRUE iff x is present and true — exactly
+            // `coalesce(x = true, false)` (a NULL/non-bool x → false); `IS NOT TRUE`
+            // negates it. All desugar to existing exprs (no new node).
+            if self.eat_kw("NULL") || self.peek_kw("UNKNOWN") {
+                self.eat_kw("UNKNOWN");
+                return Ok(Expr::IsNull {
+                    expr: Box::new(left),
+                    negated,
+                });
             }
-            return Ok(Expr::IsNull {
-                expr: Box::new(left),
-                negated,
-            });
+            let want = if self.eat_kw("TRUE") {
+                true
+            } else if self.eat_kw("FALSE") {
+                false
+            } else {
+                return Err("expected NULL, UNKNOWN, TRUE, or FALSE after IS [NOT]".into());
+            };
+            let is = Expr::Call {
+                name: "coalesce".into(),
+                args: vec![
+                    Expr::Compare {
+                        op: CompareOp::Eq,
+                        left: Box::new(left),
+                        right: Box::new(Expr::Lit(Value::Bool(want))),
+                    },
+                    Expr::Lit(Value::Bool(false)),
+                ],
+            };
+            return Ok(if negated { Expr::Not(Box::new(is)) } else { is });
         }
         // `left [NOT] IN <list literal>` — desugars to an OR-chain of equality
         // tests, so its three-valued behavior falls out of the `=` operator (a
