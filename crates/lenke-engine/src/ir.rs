@@ -14,6 +14,16 @@ pub enum Dir {
     Both,
 }
 
+/// Which shortest paths a `ShortestPath` hop keeps per reachable target. `Any`
+/// emits ONE representative (the first BFS reach); `All` emits every distinct
+/// minimum-length path (so a target reachable by two shortest paths yields two
+/// rows). `SHORTEST 1` reduces to `Any`, `SHORTEST 1 GROUP` to `All`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShortestSelector {
+    Any,
+    All,
+}
+
 /// The path-restriction mode of a variable-length hop (ISO GQL). It decides which
 /// elements a single path may repeat:
 /// - `Walk`: no restriction — edges AND nodes may repeat (`MATCH WALK`).
@@ -404,7 +414,11 @@ pub enum Plan {
         from: usize,
         dir: Dir,
         edge_label: Vec<String>,
+        /// Minimum hop count for a target to count as reached — `0` for a `*`
+        /// quantifier (the seed itself is a zero-length path to itself), `1` for `+`.
+        min: u32,
         max: Option<u32>,
+        selector: ShortestSelector,
     },
     /// Keep rows where `pred` is TRUE (three-valued: FALSE and NULL drop).
     Filter { input: Box<Plan>, pred: Expr },
@@ -682,14 +696,18 @@ impl Plan {
         from: usize,
         dir: Dir,
         edge_label: &[String],
+        min: u32,
         max: Option<u32>,
+        selector: ShortestSelector,
     ) -> Self {
         Self::ShortestPath {
             input: Box::new(self),
             from,
             dir,
             edge_label: edge_label.to_vec(),
+            min,
             max,
+            selector,
         }
     }
 

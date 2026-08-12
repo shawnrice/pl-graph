@@ -207,7 +207,9 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             from,
             dir,
             edge_label,
+            min,
             max,
+            selector,
         } => {
             let (i, c) = rewrite(*input, idx);
             (
@@ -216,7 +218,9 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                     from,
                     dir,
                     edge_label,
+                    min,
                     max,
+                    selector,
                 },
                 c,
             )
@@ -676,7 +680,9 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 from,
                 dir,
                 edge_label,
+                min,
                 max,
+                selector,
             } => {
                 let (below, above) = split_pushable(pred, width(&sin));
                 match below {
@@ -686,7 +692,9 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                             from,
                             dir,
                             edge_label,
+                            min,
                             max,
+                            selector,
                         };
                         (
                             Plan::Filter {
@@ -705,7 +713,9 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                             from,
                             dir,
                             edge_label,
+                            min,
                             max,
+                            selector,
                         };
                         match above {
                             Some(a) => (
@@ -1376,7 +1386,7 @@ mod tests {
         let plan = Plan::Scan {
             label: Some("Person".into()),
         }
-        .shortest_path(0, Dir::Out, &["KNOWS".to_string()], None)
+        .shortest_path(0, Dir::Out, &["KNOWS".to_string()],  1, None, crate::ir::ShortestSelector::Any)
         .filter(cmp(CompareOp::Eq, prop(0, "name"), Expr::Lit(s("alice"))));
         let opt = assert_rows_preserved(&plan, &store);
         match opt {

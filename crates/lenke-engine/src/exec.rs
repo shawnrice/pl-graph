@@ -956,14 +956,18 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             from,
             dir,
             edge_label,
+            min,
             max,
+            selector,
         } => shortest_path(
             &pull(input, store, track)?,
             store,
             *from,
             *dir,
             edge_label,
+            *min,
             *max,
+            *selector,
         ),
         Plan::Aggregate { input, keys, aggs } => {
             // Frontier fast path: a scalar count over an Expand chain need not
@@ -4965,8 +4969,11 @@ fn shortest_path(
     from: usize,
     dir: Dir,
     edge_label: &[String],
+    min: u32,
     max: Option<u32>,
+    selector: crate::ir::ShortestSelector,
 ) -> Batch {
+    use crate::ir::ShortestSelector;
     let empty = || {
         let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
         slots.push(Col::Nodes(vec![]));
@@ -4980,9 +4987,10 @@ fn shortest_path(
         return empty();
     };
 
-    // When the input carries a path, reconstruct each shortest path (BFS
-    // predecessors) so `Expr::Path` — hence `nodes(p)`/`path_length(p)` — sees the
-    // whole node chain, not just the endpoint.
+    // When the input carries a path, each emitted row reconstructs the node/edge
+    // chain start..endpoint so `Expr::Path` (nodes(p)/path_length(p)) sees the whole
+    // path. Endpoint MULTIPLICITY (how many shortest paths reach it) is emitted for
+    // `ALL` regardless of lineage.
     let track = batch.lineage.is_some();
     let mut path_values: Vec<Value> = Vec::new();
     let mut path_offsets: Vec<usize> = vec![0];
@@ -4991,18 +4999,22 @@ fn shortest_path(
 
     let mut keep = Vec::new();
     let mut ends = Vec::new();
+
     for (row, &start) in src.iter().enumerate() {
-        let mut visited: FnvSet<u32> = FnvSet::default();
-        visited.insert(start);
-        // child -> parent, and child -> edge used to reach it, for reconstructing
-        // the shortest path (nodes AND relationships) back to `start`.
-        let mut pred: FnvMap<u32, u32> = FnvMap::default();
-        let mut pred_edge: FnvMap<u32, u32> = FnvMap::default();
-        let mut q: VecDeque<(u32, u32)> = VecDeque::new();
-        q.push_back((start, 0));
-        while let Some((v, d)) = q.pop_front() {
-            if max.is_some_and(|m| d >= m) {
-                continue; // reached the hop cap; do not expand further
+        // BFS from `start`: shortest distance per node, plus ALL predecessors that
+        // lie on a shortest path (an edge prev->node with dist[prev] + 1 == dist[node]).
+        // `order` is BFS discovery order — every node's predecessors precede it, so a
+        // bottom-up pass over it computes path counts / enumerations.
+        let mut dist: FnvMap<u32, u32> = FnvMap::default();
+        dist.insert(start, 0);
+        let mut preds: FnvMap<u32, Vec<(u32, u32)>> = FnvMap::default();
+        let mut order: Vec<u32> = vec![start];
+        let mut q: VecDeque<u32> = VecDeque::new();
+        q.push_back(start);
+        while let Some(v) = q.pop_front() {
+            let dv = dist[&v];
+            if max.is_some_and(|m| dv >= m) {
+                continue; // hop cap: do not expand past `max`
             }
             let mut adjs: Vec<crate::store::Adj> = Vec::new();
             if matches!(dir, Dir::Out | Dir::Both) {
@@ -5015,39 +5027,85 @@ fn shortest_path(
                 if !want.is_empty() && !want.contains(&a.etype) {
                     continue;
                 }
-                // First reach = shortest reach (BFS), and only the first is kept.
-                if visited.insert(a.nbr) {
-                    keep.push(row);
-                    ends.push(a.nbr);
-                    if track {
-                        pred.insert(a.nbr, v);
-                        pred_edge.insert(a.nbr, a.eid);
-                        // Walk parents back to `start` (its pred is never set),
-                        // collecting the edge crossed at each step, then append
-                        // `start..target` (and its edges) to the input row's path.
-                        let mut chain = vec![a.nbr];
-                        let mut edge_chain: Vec<u32> = Vec::new();
-                        let mut cur = a.nbr;
-                        while cur != start {
-                            edge_chain.push(pred_edge[&cur]);
-                            cur = pred[&cur];
-                            chain.push(cur);
-                        }
-                        chain.reverse(); // start .. target
-                        edge_chain.reverse(); // e0 .. e(k-1)
-                        let lin = batch.lineage.as_ref().expect("track");
-                        path_values.extend_from_slice(lin.path_at(row)); // ends at start
-                        for &node in &chain[1..] {
-                            path_values.push(Value::Num(f64::from(node)));
-                        }
-                        path_offsets.push(path_values.len());
-                        path_edges.extend_from_slice(lin.edges_at(row));
-                        for &edge in &edge_chain {
-                            path_edges.push(Value::Num(f64::from(edge)));
-                        }
-                        path_edge_offsets.push(path_edges.len());
+                match dist.get(&a.nbr).copied() {
+                    None => {
+                        dist.insert(a.nbr, dv + 1);
+                        preds.entry(a.nbr).or_default().push((v, a.eid));
+                        order.push(a.nbr);
+                        q.push_back(a.nbr);
                     }
-                    q.push_back((a.nbr, d + 1));
+                    // Another edge onto a node at its shortest distance — a second
+                    // shortest-path predecessor.
+                    Some(dn) if dn == dv + 1 => {
+                        preds.entry(a.nbr).or_default().push((v, a.eid));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // `ALL` without lineage: emit each endpoint as many times as it has distinct
+        // shortest paths (count DP over `order`).
+        let mut pcount: FnvMap<u32, u64> = FnvMap::default();
+        if matches!(selector, ShortestSelector::All) && !track {
+            pcount.insert(start, 1);
+            for &node in &order {
+                if node == start {
+                    continue;
+                }
+                let c = preds
+                    .get(&node)
+                    .map(|ps| ps.iter().map(|&(p, _)| pcount.get(&p).copied().unwrap_or(0)).sum())
+                    .unwrap_or(0);
+                pcount.insert(node, c);
+            }
+        }
+
+        for &node in &order {
+            let dn = dist[&node];
+            if dn < min {
+                continue; // a `+` quantifier (min 1) excludes the zero-length seed
+            }
+            match selector {
+                ShortestSelector::Any => {
+                    keep.push(row);
+                    ends.push(node);
+                    if track {
+                        let (chain, echain) = first_pred_chain(node, start, &preds);
+                        push_path(
+                            batch,
+                            row,
+                            &chain,
+                            &echain,
+                            &mut path_values,
+                            &mut path_offsets,
+                            &mut path_edges,
+                            &mut path_edge_offsets,
+                        );
+                    }
+                }
+                ShortestSelector::All => {
+                    if track {
+                        for (chain, echain) in enumerate_shortest_paths(node, start, &preds) {
+                            keep.push(row);
+                            ends.push(node);
+                            push_path(
+                                batch,
+                                row,
+                                &chain,
+                                &echain,
+                                &mut path_values,
+                                &mut path_offsets,
+                                &mut path_edges,
+                                &mut path_edge_offsets,
+                            );
+                        }
+                    } else {
+                        for _ in 0..pcount.get(&node).copied().unwrap_or(0) {
+                            keep.push(row);
+                            ends.push(node);
+                        }
+                    }
                 }
             }
         }
@@ -5065,6 +5123,78 @@ fn shortest_path(
         });
     }
     out
+}
+
+/// The single shortest path start..node via the FIRST predecessor of each node (the
+/// BFS-tree parent) — the representative `ANY SHORTEST` keeps. Returns the node chain
+/// (start..node inclusive) and its edge chain. `node == start` gives `([start], [])`.
+fn first_pred_chain(
+    node: u32,
+    start: u32,
+    preds: &FnvMap<u32, Vec<(u32, u32)>>,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut chain = vec![node];
+    let mut echain = Vec::new();
+    let mut cur = node;
+    while cur != start {
+        let (prev, e) = preds[&cur][0];
+        echain.push(e);
+        cur = prev;
+        chain.push(cur);
+    }
+    chain.reverse();
+    echain.reverse();
+    (chain, echain)
+}
+
+/// Every distinct shortest path start..node through the predecessor DAG, each as a
+/// (node chain start..node, edge chain) pair. Exponential on a wide lattice — the
+/// same cost core's `enumerate_shortest_paths` pays; no case in scope hits it.
+fn enumerate_shortest_paths(
+    node: u32,
+    start: u32,
+    preds: &FnvMap<u32, Vec<(u32, u32)>>,
+) -> Vec<(Vec<u32>, Vec<u32>)> {
+    if node == start {
+        return vec![(vec![start], Vec::new())];
+    }
+    let mut out = Vec::new();
+    if let Some(ps) = preds.get(&node) {
+        for &(prev, e) in ps {
+            for (mut chain, mut echain) in enumerate_shortest_paths(prev, start, preds) {
+                chain.push(node);
+                echain.push(e);
+                out.push((chain, echain));
+            }
+        }
+    }
+    out
+}
+
+/// Append one shortest-path row's lineage: the input row's carried path (ending at
+/// `start`) followed by the reconstructed `start..node` chain and its edges.
+#[allow(clippy::too_many_arguments)]
+fn push_path(
+    batch: &Batch,
+    row: usize,
+    chain: &[u32],
+    echain: &[u32],
+    path_values: &mut Vec<Value>,
+    path_offsets: &mut Vec<usize>,
+    path_edges: &mut Vec<Value>,
+    path_edge_offsets: &mut Vec<usize>,
+) {
+    let lin = batch.lineage.as_ref().expect("track");
+    path_values.extend_from_slice(lin.path_at(row));
+    for &n in &chain[1..] {
+        path_values.push(Value::Num(f64::from(n)));
+    }
+    path_offsets.push(path_values.len());
+    path_edges.extend_from_slice(lin.edges_at(row));
+    for &e in echain {
+        path_edges.push(Value::Num(f64::from(e)));
+    }
+    path_edge_offsets.push(path_edges.len());
 }
 
 /// Elementwise `l OP r` over two already-evaluated columns — the general arithmetic
@@ -8118,6 +8248,55 @@ mod tests {
         assert_eq!(count("MATCH (a)-[r:R]->(b) RETURN count(*) AS c"), 2.0);
     }
 
+    /// `ALL SHORTEST` emits one row per distinct shortest path (so a target reached
+    /// by two equal-length paths appears twice), while `ANY SHORTEST` emits one row
+    /// per reachable target. A `*` quantifier includes the zero-length seed.
+    #[test]
+    fn all_shortest_multiplicity() {
+        // Diamond: a->b, a->c, b->d, c->d — d is reachable by two 2-hop paths.
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"id\":\"d\",\"labels\":[\"N\"],\"props\":{\"id\":\"d\"}}\n",
+            "{\"id\":\"e1\",\"from\":\"a\",\"to\":\"b\",\"type\":\"R\",\"props\":{}}\n",
+            "{\"id\":\"e2\",\"from\":\"a\",\"to\":\"c\",\"type\":\"R\",\"props\":{}}\n",
+            "{\"id\":\"e3\",\"from\":\"b\",\"to\":\"d\",\"type\":\"R\",\"props\":{}}\n",
+            "{\"id\":\"e4\",\"from\":\"c\",\"to\":\"d\",\"type\":\"R\",\"props\":{}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let count = |q: &str| -> f64 {
+            match run(&crate::gql::parse(q).unwrap(), &store).rows[0][0] {
+                Value::Num(n) => n,
+                ref other => panic!("want num, got {other:?}"),
+            }
+        };
+        // ANY: seed a (len 0) + b + c + d(once) = 4 rows.
+        assert_eq!(
+            count("MATCH ANY SHORTEST (a {id:'a'})-[:R]->*(x) RETURN count(*) AS c"),
+            4.0
+        );
+        // ALL: a + b + c + d TWICE (two shortest paths) = 5 rows.
+        assert_eq!(
+            count("MATCH ALL SHORTEST (a {id:'a'})-[:R]->*(x) RETURN count(*) AS c"),
+            5.0
+        );
+        // ALL restricted to endpoint d: two shortest paths → 2 rows.
+        assert_eq!(
+            count("MATCH ALL SHORTEST (a {id:'a'})-[:R]->*(x {id:'d'}) RETURN count(*) AS c"),
+            2.0
+        );
+        // SHORTEST 1 reduces to ANY (one row for d); SHORTEST 1 GROUP to ALL (two).
+        assert_eq!(
+            count("MATCH SHORTEST 1 (a {id:'a'})-[:R]->*(x {id:'d'}) RETURN count(*) AS c"),
+            1.0
+        );
+        assert_eq!(
+            count("MATCH SHORTEST 1 GROUP (a {id:'a'})-[:R]->*(x {id:'d'}) RETURN count(*) AS c"),
+            2.0
+        );
+    }
+
     /// `SELECT … [FROM MATCH …]` is sugar for MATCH…RETURN: a constant projection
     /// with no FROM, a plain projection, a global aggregate with WHERE, and a
     /// GROUP BY (via implicit grouping) with ORDER BY over an output alias.
@@ -10136,7 +10315,7 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .shortest_path(0, Dir::Out, &["R".to_string()], None)
+            .shortest_path(0, Dir::Out, &["R".to_string()],  1, None, crate::ir::ShortestSelector::Any)
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);
@@ -10158,7 +10337,7 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .shortest_path(0, Dir::Out, &["R".to_string()], None)
+            .shortest_path(0, Dir::Out, &["R".to_string()],  1, None, crate::ir::ShortestSelector::Any)
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);
@@ -10181,7 +10360,7 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .shortest_path(0, Dir::Out, &["R".to_string()], Some(2))
+            .shortest_path(0, Dir::Out, &["R".to_string()],  1, Some(2), crate::ir::ShortestSelector::Any)
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);
@@ -10202,7 +10381,7 @@ mod tests {
         let store = b.build();
         let plan = scan("N")
             .filter(cmp(CompareOp::Eq, prop(0, "name"), lit(s("a"))))
-            .shortest_path(0, Dir::Out, &["R".to_string()], None)
+            .shortest_path(0, Dir::Out, &["R".to_string()],  1, None, crate::ir::ShortestSelector::Any)
             .project(vec![("t".into(), prop(1, "name"))]);
         let out = run(&plan, &store);
         let mut got = names_of(&out, 0);

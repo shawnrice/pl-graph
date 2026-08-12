@@ -480,13 +480,30 @@ impl Parser {
         if !self.eat_kw("MATCH") {
             return Err("expected MATCH, INSERT, CALL, or RETURN".into());
         }
-        // Named-path form: `MATCH p = ANY SHORTEST (a)-[:R]->*(b)`. The path
-        // variable binds to the row's path (lineage); the rest of the query
-        // (WHERE/WITH/RETURN) is shared with the ordinary pattern below.
+        // Named-path form: `MATCH p = <selector> (a)-[:R]->*(b)`. The path variable
+        // binds to the row's path (lineage); the rest (WHERE/WITH/RETURN) is shared.
         if matches!(self.peek(), Some(Tok::Ident(_)))
             && self.toks.get(self.pos + 1) == Some(&Tok::Eq)
         {
-            let (mut plan, scope, slots) = self.shortest_path_binding()?;
+            let pname = self.ident()?;
+            self.expect(&Tok::Eq)?;
+            let selector = self.parse_shortest_selector()?.ok_or(
+                "a named path requires a shortest-path selector (ANY SHORTEST / \
+                 ALL SHORTEST / SHORTEST 1)",
+            )?;
+            self.path_vars.insert(pname);
+            let (mut plan, scope, slots) = self.shortest_pattern(selector)?;
+            self.scope = scope;
+            self.slots = slots;
+            if self.eat_kw("WHERE") {
+                plan = plan.filter(self.expr()?);
+            }
+            return self.query_tail(plan);
+        }
+        // Bare selector form: `MATCH ALL SHORTEST (a)-[:R]->*(x)` — no path variable,
+        // just the reached endpoints.
+        if let Some(selector) = self.parse_shortest_selector()? {
+            let (mut plan, scope, slots) = self.shortest_pattern(selector)?;
             self.scope = scope;
             self.slots = slots;
             if self.eat_kw("WHERE") {
@@ -800,51 +817,82 @@ impl Parser {
         self.project_and_page(plan, distinct, items)
     }
 
-    /// `p = ANY SHORTEST (a)-[:R]->*(b)` — the ANY-shortest named-path pattern.
-    /// Binds `p` to the row's path, `a` to slot 0 and `b` to slot 1, and plans a
-    /// `ShortestPath` hop. The `*`/`+` quantifier is unbounded (`{…}` shortest is
-    /// deferred); an edge type is required, as elsewhere in this subset.
-    fn shortest_path_binding(&mut self) -> Result<(Plan, HashMap<String, usize>, usize), String> {
-        let pname = self.ident()?;
-        self.expect(&Tok::Eq)?;
-        if !(self.eat_kw("ANY") && self.eat_kw("SHORTEST")) {
-            return Err(
-                "a named path requires `ANY SHORTEST` (other path selectors \
-                        are not supported)"
-                    .into(),
-            );
+    /// Parse a shortest-path SELECTOR if one is present: `ANY SHORTEST` → Any,
+    /// `ALL SHORTEST` → All, `SHORTEST 1` → Any, `SHORTEST 1 GROUP[S]` → All. Returns
+    /// `None` (consuming nothing) when the next tokens are not a selector. `SHORTEST k`
+    /// for k ≠ 1, and bare `ANY`/`ALL` (walk) without `SHORTEST`, are errors here.
+    fn parse_shortest_selector(
+        &mut self,
+    ) -> Result<Option<crate::ir::ShortestSelector>, String> {
+        use crate::ir::ShortestSelector;
+        let next_is = |p: &Self, kw: &str| {
+            matches!(p.toks.get(p.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(kw))
+        };
+        if self.peek_kw("ANY") && next_is(self, "SHORTEST") {
+            self.pos += 2;
+            return Ok(Some(ShortestSelector::Any));
         }
+        if self.peek_kw("ALL") && next_is(self, "SHORTEST") {
+            self.pos += 2;
+            return Ok(Some(ShortestSelector::All));
+        }
+        if self.eat_kw("SHORTEST") {
+            let k = self.usize_lit()?;
+            let group = self.eat_kw("GROUP") || self.eat_kw("GROUPS");
+            return match k {
+                1 if group => Ok(Some(ShortestSelector::All)),
+                1 => Ok(Some(ShortestSelector::Any)),
+                _ => Err("SHORTEST k for k other than 1 is not supported".into()),
+            };
+        }
+        Ok(None)
+    }
+
+    /// The pattern after a shortest-path selector: `(a[:L] [{props}])-[:R]->*(b …)`.
+    /// Seed label+props seed the `Scan`; the endpoint's props filter above the hop
+    /// (its label is ignored, as elsewhere for a landing node); a same-variable
+    /// endpoint (`…*(a)`) adds a `seed == endpoint` equality. `*` → min 0 (the seed
+    /// is a zero-length path to itself), `+` → min 1. Inline WHERE / bound edge stay
+    /// rejected. Binds seed→slot 0, endpoint→slot 1.
+    fn shortest_pattern(
+        &mut self,
+        selector: crate::ir::ShortestSelector,
+    ) -> Result<(Plan, HashMap<String, usize>, usize), String> {
         let mut scope: HashMap<String, usize> = HashMap::new();
         let (va, la, va_props, va_where) = self.node()?;
-        if let Some(v) = va {
-            scope.insert(v, 0);
+        if let Some(v) = &va {
+            scope.insert(v.clone(), 0);
         }
         let rel = self.rel()?;
-        // The reachability quantifier: `*` or `+` (both unbounded here).
-        if !(self.eat(&Tok::Star) || self.eat(&Tok::Plus)) {
-            return Err(
-                "`ANY SHORTEST` requires a `*` or `+` quantifier on the relationship".into(),
-            );
-        }
+        let min = if self.eat(&Tok::Star) {
+            0
+        } else if self.eat(&Tok::Plus) {
+            1
+        } else {
+            return Err("a shortest path requires a `*` or `+` quantifier".into());
+        };
         let (vb, _lb, vb_props, vb_where) = self.node()?;
-        if let Some(v) = vb {
-            scope.insert(v, 1);
-        }
         if va_where.is_some() || vb_where.is_some() || rel.where_range.is_some() {
-            return Err(
-                "inline WHERE on an `ANY SHORTEST` path element is not supported; use a \
-                 trailing WHERE"
-                    .into(),
-            );
+            return Err("inline WHERE on a shortest-path element is not supported".into());
         }
-        if !va_props.is_empty() || !vb_props.is_empty() {
-            return Err(
-                "inline properties on an `ANY SHORTEST` path endpoint are not supported; use WHERE"
-                    .into(),
-            );
+        // Seed node: label + inline props seed the scan (slot 0).
+        let mut plan = node_prop_filters(Plan::Scan { label: la }, 0, va_props);
+        plan = plan.shortest_path(0, rel.dir, &rel.etypes, min, None, selector);
+        // Endpoint node at slot 1: inline props filter it; its label is ignored (as
+        // for any landing node in this subset).
+        plan = node_prop_filters(plan, 1, vb_props);
+        // A same-variable endpoint closes back on the seed: constrain slot 1 == slot 0.
+        if let Some(v) = &vb {
+            if scope.get(v) == Some(&0) {
+                plan = plan.filter(Expr::Compare {
+                    op: CompareOp::Eq,
+                    left: Box::new(Expr::Slot(0)),
+                    right: Box::new(Expr::Slot(1)),
+                });
+            } else {
+                scope.insert(v.clone(), 1);
+            }
         }
-        self.path_vars.insert(pname);
-        let plan = Plan::Scan { label: la }.shortest_path(0, rel.dir, &rel.etypes, None);
         Ok((plan, scope, 2))
     }
 
@@ -3394,20 +3442,23 @@ mod tests {
     fn any_shortest_path_length() {
         use crate::ir::{Dir, Expr, PathPart, Plan};
         let store = chain();
-        // Shortest LINK paths from `a`: b at 1 hop, c at 2, d at 3.
+        // Shortest LINK paths from `a`: the `*` quantifier admits the zero-length
+        // path to `a` itself (len 0), then b at 1 hop, c at 2, d at 3.
         let q = "MATCH p = ANY SHORTEST (x)-[:LINK]->*(y) WHERE x.name = 'a' \
                  RETURN y.name AS y, path_length(p) AS len";
         assert_eq!(
             bag(&run(&super::parse(q).unwrap(), &store)),
             vec![
+                "y=Str(\"a\");len=Num(0.0);",
                 "y=Str(\"b\");len=Num(1.0);",
                 "y=Str(\"c\");len=Num(2.0);",
                 "y=Str(\"d\");len=Num(3.0);",
             ]
         );
         // Parse cross-check against the hand-built ShortestPath plan (all sources).
+        // `*` is min 0 (the seed is a zero-length path to itself).
         let hand = Plan::Scan { label: None }
-            .shortest_path(0, Dir::Out, &["LINK".to_string()], None)
+            .shortest_path(0, Dir::Out, &["LINK".to_string()], 0, None, crate::ir::ShortestSelector::Any)
             .project(vec![(
                 "len".into(),
                 Expr::PathAccess {
