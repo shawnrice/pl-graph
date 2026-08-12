@@ -7619,24 +7619,29 @@ fn eval_all<'a>(
 /// arguments yield NULL (no coercion, no throw).
 /// The fallible wrapper around [`call_scalar`]: nearly every scalar function is
 /// total, but a temporal component accessor of a kind that lacks that component
-/// (`_year` of a time, `_hour` of a date) FAULTS with `E_INVALID_VALUE` — matching
-/// core, which returns an error there rather than NULL. A non-temporal / null arg
-/// still yields NULL (nullish propagation), not a fault.
+/// (`_year` of a time, `_hour` of a date) FAULTS with `E_INVALID_VALUE`. A non-null
+/// NON-temporal argument (a number or string — never coerced) is ALSO a data
+/// exception (matching core); only a NULL arg yields NULL (nullish propagation).
 fn call_scalar_checked(name: &str, args: &[Value]) -> Result<Value, String> {
     if matches!(
         name,
         "_year" | "_month" | "_day" | "_hour" | "_minute" | "_second"
     ) {
-        if let Value::Temporal(t) = &args[0] {
-            return date_part(name.trim_start_matches('_'), *t)
+        return match &args[0] {
+            Value::Temporal(t) => date_part(name.trim_start_matches('_'), *t)
                 .map(|n| Value::Num(n as f64))
                 .ok_or_else(|| {
                     format!(
                         "E_INVALID_VALUE: {} is undefined for this temporal kind",
                         name.trim_start_matches('_')
                     )
-                });
-        }
+                }),
+            Value::Null => Ok(Value::Null),
+            _ => Err(format!(
+                "E_INVALID_VALUE: {}() requires a temporal value (a string is not coerced)",
+                name.trim_start_matches('_')
+            )),
+        };
     }
     Ok(call_scalar(name, args))
 }
