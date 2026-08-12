@@ -5853,6 +5853,12 @@ fn arith_general(op: crate::ir::ArithOp, l: &Col, r: &Col) -> Result<Col, String
 
 /// Evaluate `expr` over every row of `batch`, producing a column.
 fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
+    // No rows → no values to produce, and nothing to evaluate: a constant faulting
+    // expression (`1/0` under `… LIMIT 0 RETURN 1/0`) must not error over an empty
+    // batch. Short-circuit before any per-expression work.
+    if batch.rows() == 0 {
+        return Ok(Col::Gen(Vec::new()));
+    }
     Ok(match expr {
         Expr::Slot(n) => batch.slot(*n).clone(),
         Expr::Lit(v) => broadcast(v.clone(), batch.rows()),
