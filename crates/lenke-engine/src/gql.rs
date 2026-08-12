@@ -1715,6 +1715,15 @@ impl Parser {
     fn pattern(&mut self) -> Result<(Plan, HashMap<String, usize>, usize), String> {
         let mut scope: HashMap<String, usize> = HashMap::new();
         let mut slots = 0usize;
+        // Unanchored subpath group `((x)-[:R]->(y)){n,m} (t)` — synthesize an
+        // anonymous seed node (scan every node), matching core, then chain from it.
+        if self.is_subpath_group_start() {
+            let from = slots;
+            slots += 1;
+            let plan =
+                self.extend_chain(Plan::Scan { label: None }, &mut scope, &mut slots, from)?;
+            return Ok((plan, scope, slots));
+        }
         let (var, label, props, where_range, label_expr) = self.node()?;
         if let Some(v) = var {
             scope.insert(v, slots);
@@ -1749,7 +1758,34 @@ impl Parser {
         slots: &mut usize,
         mut from: usize,
     ) -> Result<Plan, String> {
-        while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde)) {
+        while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde))
+            || self.is_subpath_group_start()
+        {
+            // A parenthesized subpath group `((x)-[e:R]->(y)){n,m} (t)`. A SINGLE-edge
+            // group with no per-rep predicate and no downstream group-variable use is
+            // exactly a variable-length hop (same edge-distinct/path-mode reachability
+            // to the endpoint), so it lowers to `var_length`. The endpoint `(t)` that
+            // follows is parsed and bound like any landing node.
+            if self.is_subpath_group_start() {
+                let (dir, etypes, min, max) = self.parse_subpath_group()?;
+                let (v2, v2_label, v2_props, v2_where, v2_le) = self.node()?;
+                let node_slot = *slots;
+                if let Some(v) = v2 {
+                    scope.insert(v, node_slot);
+                }
+                *slots += 1;
+                plan = plan.var_length(from, dir, &etypes, min, max, self.path_mode);
+                from = node_slot;
+                if let Some(pred) = landing_label_filter(v2_label, v2_le, from) {
+                    plan = plan.filter(pred);
+                }
+                plan = node_prop_filters(plan, from, v2_props);
+                if let Some(r) = v2_where {
+                    self.scope = scope.clone();
+                    plan = plan.filter(self.parse_captured_where(r)?);
+                }
+                continue;
+            }
             let rel = self.rel()?;
             let quant = self.opt_quantifier()?;
             let (v2, v2_label, v2_props, v2_where, v2_le) = self.node()?;
@@ -1828,6 +1864,52 @@ impl Parser {
             }
         }
         Ok(plan)
+    }
+
+    /// True when the cursor is at a parenthesized subpath group `((…)…`: a `(`
+    /// immediately followed by another `(` (a node pattern always opens with a single
+    /// `(`, so `((` can only be a group).
+    fn is_subpath_group_start(&self) -> bool {
+        matches!(self.peek(), Some(Tok::LParen))
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
+    }
+
+    /// Parse a SINGLE-edge subpath group `((x)-[e:R]->(y)){n,m}` and return its
+    /// direction, edge types, and quantifier bounds. The inner variables are group
+    /// variables (bound as lists across repetitions in ISO GQL) — this endpoint-only
+    /// lowering ignores them, so a case that REFERENCES a group variable downstream
+    /// stays unsupported. Inner-node labels/properties, a per-rep `WHERE`, a bound
+    /// edge's props, and a multi-hop body are all rejected (later increments).
+    fn parse_subpath_group(&mut self) -> Result<(Dir, Vec<String>, u32, u32), String> {
+        self.expect(&Tok::LParen)?; // the group's own opening paren
+        let bad_inner = |n: &ParsedNode| n.1.is_some() || n.4.is_some() || !n.2.is_empty() || n.3.is_some();
+        let src = self.node()?;
+        if bad_inner(&src) {
+            return Err(
+                "a label/property/WHERE on a subpath-group inner node is not supported yet".into(),
+            );
+        }
+        let rel = self.rel()?;
+        if !rel.props.is_empty() || rel.where_range.is_some() {
+            return Err("edge properties / a per-hop WHERE on a subpath group are not supported yet".into());
+        }
+        let tgt = self.node()?;
+        if bad_inner(&tgt) {
+            return Err(
+                "a label/property/WHERE on a subpath-group inner node is not supported yet".into(),
+            );
+        }
+        if matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde)) {
+            return Err("a multi-hop subpath-group body is not supported yet".into());
+        }
+        if self.peek_kw("WHERE") {
+            return Err("a per-repetition WHERE on a subpath group is not supported yet".into());
+        }
+        self.expect(&Tok::RParen)?; // close the group
+        let (min, max) = self
+            .opt_quantifier()?
+            .ok_or("a subpath group requires a `{n,m}` / `*` / `+` quantifier")?;
+        Ok((rel.dir, rel.etypes, min, max))
     }
 
     /// `OPTIONAL MATCH (a)-[:R]->(x)` — a LEFT-OUTER single hop from a bound `a`. If
@@ -6727,6 +6809,44 @@ mod tests {
         assert_eq!(n("MATCH (n:Node) WHERE n.name='n0' RETURN COUNT { (m)<-[:R]-(n) } AS c"), 3.0);
         // local-node label filter narrows the reverse hop.
         assert_eq!(n("MATCH (n:Node) WHERE n.name='n1' RETURN COUNT { (m:Node)-[:R]->(n) } AS c"), 2.0);
+    }
+
+    /// A single-edge parenthesized subpath group `((x)-[e:R]->(y)){n,m}(t)` lowers
+    /// to a variable-length hop to the endpoint (endpoint-only; group vars ignored).
+    #[test]
+    fn subpath_group_single_edge() {
+        // chain a -> b -> c -> d
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"id\":\"d\",\"labels\":[\"N\"],\"props\":{\"id\":\"d\"}}\n",
+            "{\"id\":\"e1\",\"from\":\"a\",\"to\":\"b\",\"type\":\"R\",\"props\":{}}\n",
+            "{\"id\":\"e2\",\"from\":\"b\",\"to\":\"c\",\"type\":\"R\",\"props\":{}}\n",
+            "{\"id\":\"e3\",\"from\":\"c\",\"to\":\"d\",\"type\":\"R\",\"props\":{}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let ids = |q: &str| -> Vec<String> {
+            let mut v: Vec<String> = run(&super::parse(q).unwrap(), &store)
+                .rows.iter().map(|r| format!("{:?}", r[0])).collect();
+            v.sort();
+            v
+        };
+        // 1..2 reps from a: b (1), c (2).
+        assert_eq!(
+            ids("MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){1,2} (t) RETURN t.id AS id"),
+            vec!["Str(\"b\")", "Str(\"c\")"]
+        );
+        // Anonymous inner nodes + exact {2}: only c.
+        assert_eq!(
+            ids("MATCH (s:N {id:'a'}) (()-[:R]->()){2} (t) RETURN t.id AS id"),
+            vec!["Str(\"c\")"]
+        );
+        // Unanchored group: every 1-rep landing = b, c, d.
+        assert_eq!(
+            ids("MATCH ((x)-[:R]->(y)){1,1} (t) RETURN t.id AS id"),
+            vec!["Str(\"b\")", "Str(\"c\")", "Str(\"d\")"]
+        );
     }
 
     // --- part 3.8: string functions (E4a) ---
