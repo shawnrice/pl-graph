@@ -7915,6 +7915,38 @@ mod tests {
         assert_eq!(count("MATCH (a)-[r:R]->(b) RETURN count(*) AS c"), 2.0);
     }
 
+    /// `MATCH WALK` lets a variable-length hop reuse an edge; `TRAIL` (the default)
+    /// forbids it. Over a self-loop, a length-2 hop exists as a WALK (reuse the loop)
+    /// but not as a TRAIL.
+    #[test]
+    fn path_mode_walk_vs_trail_edge_reuse() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"e1\",\"from\":\"a\",\"to\":\"a\",\"type\":\"R\",\"props\":{}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let count = |q: &str| -> f64 {
+            match run(&crate::gql::parse(q).unwrap(), &store).rows[0][0] {
+                Value::Num(n) => n,
+                ref other => panic!("want num, got {other:?}"),
+            }
+        };
+        // WALK: a->a->a reuses the loop edge — one length-2 walk.
+        assert_eq!(
+            count("MATCH WALK (a {id:'a'})-[:R]->{2,2}(x) RETURN count(*) AS c"),
+            1.0
+        );
+        // TRAIL (default): the loop edge can't repeat — no length-2 trail.
+        assert_eq!(
+            count("MATCH TRAIL (a {id:'a'})-[:R]->{2,2}(x) RETURN count(*) AS c"),
+            0.0
+        );
+        assert_eq!(
+            count("MATCH (a {id:'a'})-[:R]->{2,2}(x) RETURN count(*) AS c"),
+            0.0
+        );
+    }
+
     /// `~` resolves to `Dir::Both` regardless of which side (or a `-`/`~` mix) is
     /// used, matching either traversal direction of the edge.
     #[test]

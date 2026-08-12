@@ -126,6 +126,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         path_vars: HashSet::new(),
         lets: Vec::new(),
         suppress_in: false,
+        path_walk: false,
     };
     let mut plan = p.query()?;
     // `<query> UNION [ALL] <query> …`: each arm is an independent query with a fresh
@@ -363,6 +364,10 @@ struct Parser {
     /// NOT the membership operator — so `LET x = 2 + 3 IN body` binds `2+3`, not
     /// `2+3 IN body`. This suppresses the `IN`-membership handling in `cmp_expr`.
     suppress_in: bool,
+    /// The path mode of the pattern currently being parsed: `MATCH WALK …` allows a
+    /// variable-length hop to repeat edges, `TRAIL` (the default) forbids it. Set
+    /// per `query()` from a leading mode keyword and read at the `var_length` build.
+    path_walk: bool,
 }
 
 impl Parser {
@@ -458,6 +463,19 @@ impl Parser {
             }
             return self.query_tail(plan);
         }
+        // Optional leading path mode: `MATCH WALK …` lets a variable-length hop
+        // reuse edges; `TRAIL` (the ISO default, and the engine's) forbids it. The
+        // keyword can only appear here — a pattern always begins with `(`, and the
+        // named-path form was handled above — so a bare Ident is unambiguously a
+        // mode word. `ACYCLIC`/`SIMPLE` (node non-reuse) aren't modeled yet.
+        self.path_walk = false;
+        if self.eat_kw("WALK") {
+            self.path_walk = true;
+        } else if self.eat_kw("TRAIL") {
+            self.path_walk = false;
+        } else if self.peek_kw("ACYCLIC") || self.peek_kw("SIMPLE") {
+            return Err("ACYCLIC / SIMPLE path modes are not supported yet".into());
+        }
         // A comma-separated list of patterns, joined on shared variables. Each
         // pattern parses in its OWN slot space; join maps a shared variable's
         // left slot to its right slot, and the merged scope shifts the right
@@ -511,6 +529,9 @@ impl Parser {
             }
             slots += k2;
         }
+        // The mode applies only to this MATCH's own pattern hops; clear it so it
+        // never leaks into a var-length hop inside a later `EXISTS { … }` subquery.
+        self.path_walk = false;
         // Publish the merged scope for WHERE/RETURN/ORDER to resolve variables.
         self.scope = scope;
         self.slots = slots;
@@ -1144,7 +1165,15 @@ impl Parser {
                     scope.insert(v, node_slot);
                 }
                 *slots += 1;
-                plan = plan.var_length(from, rel.dir, rel.etype.as_deref(), min, max, true);
+                // `trail` (no edge reuse) is the default / TRAIL mode; WALK allows it.
+                plan = plan.var_length(
+                    from,
+                    rel.dir,
+                    rel.etype.as_deref(),
+                    min,
+                    max,
+                    !self.path_walk,
+                );
                 from = node_slot;
             } else if bind {
                 let edge_slot = *slots;

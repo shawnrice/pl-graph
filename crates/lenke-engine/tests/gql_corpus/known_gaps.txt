@@ -128,8 +128,6 @@ tests_c.jsonl::for_with_offset
 tests_c.jsonl::for_with_ordinality
 tests_c.jsonl::path_mode_acyclic_ends
 tests_c.jsonl::path_mode_simple_ends
-tests_c.jsonl::path_mode_trail_ends
-tests_c.jsonl::path_mode_walk_ends
 tests_c.jsonl::prop_str_plus_num_faults
 tests_c.jsonl::shortest_per_hop_all_filtered
 tests_c.jsonl::shortest_per_hop_any_filtered
@@ -147,9 +145,6 @@ tests_c.jsonl::sum_mix_num_duration_faults
 tests_c.jsonl::sum_mix_str_duration_faults
 tests_c.jsonl::temporal_duration_unordered_count_zero
 tests_c.jsonl::temporal_timestamp_ge
-tests_c.jsonl::trail_mode_forbids_reuse
-tests_c.jsonl::walk_mode_admits_repeats
-tests_c.jsonl::walk_mode_count
 tests_d.jsonl::all_shortest_no_path_is_empty
 tests_d.jsonl::all_shortest_single_path_agrees_with_any
 tests_d.jsonl::all_shortest_to_d_len
@@ -195,10 +190,8 @@ tests_d.jsonl::nested_quant_ends_3
 tests_d.jsonl::nested_quant_gv_vectorize
 tests_d.jsonl::non_trail_count_acyclic
 tests_d.jsonl::non_trail_count_simple
-tests_d.jsonl::non_trail_count_walk
 tests_d.jsonl::non_trail_enum_acyclic
 tests_d.jsonl::non_trail_enum_simple
-tests_d.jsonl::non_trail_enum_walk
 tests_d.jsonl::paren_grouping_no_quant
 tests_d.jsonl::per_hop_admits_all
 tests_d.jsonl::per_hop_filters
@@ -238,7 +231,6 @@ tests_d.jsonl::vqs_13
 tests_d.jsonl::vqs_14
 tests_d.jsonl::vqs_15
 tests_d.jsonl::vqs_16
-tests_d.jsonl::vqs_17
 tests_d.jsonl::vqs_18
 tests_d.jsonl::vqs_19
 tests_d.jsonl::vqs_20
