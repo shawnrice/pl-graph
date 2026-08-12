@@ -76,6 +76,9 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
         Plan::Scan { label: None } => Card::exact(store.live_node_count()),
         Plan::EdgeScan => Card::exact(store.edge_count()),
         Plan::Row => Card::exact(1),
+        // A list unwind multiplies the input by the (unknown) list length — treat it
+        // as a small fan-out, like a low-degree expansion.
+        Plan::Unwind { input, .. } => estimate(input, store).scale(4.0, false),
         Plan::NodeSeed { ext_ids } => Card::exact(ext_ids.len()),
         Plan::IndexSeek { key, value, .. } => store.index_bucket_len(key, value).map_or_else(
             || Card::approx(store.live_node_count() as f64 * EQ_SEL),

@@ -753,6 +753,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::Distinct { input }
         | Plan::Tail { input, .. }
         | Plan::SortLocal { input, .. } => needs_lineage(input),
+        Plan::Unwind { input, list, .. } => reads_path(list) || needs_lineage(input),
         Plan::Branch { input, bodies } => needs_lineage(input) || bodies.iter().any(needs_lineage),
         Plan::IntervalExpand {
             input, qlo, qhi, ..
@@ -1105,6 +1106,41 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             let batch = pull(input, store, track)?;
             let cols = eval_all(items.iter().map(|(_, e)| e), store, &batch)?;
             Batch::of(cols)
+        }
+        Plan::Unwind {
+            input,
+            list,
+            var_slot: _,
+            ordinal,
+        } => {
+            // For each input row, evaluate the list and emit one row per element
+            // (NULL/empty → none; a non-list scalar → a one-element singleton),
+            // appending the element and, optionally, its ordinal counter.
+            let batch = pull(input, store, track)?;
+            let lists = eval(list, store, &batch)?;
+            let mut keep = Vec::new();
+            let mut elems: Vec<Value> = Vec::new();
+            let mut ords: Vec<Value> = Vec::new();
+            for i in 0..batch.rows() {
+                let items: Vec<Value> = match lists.value_at(i) {
+                    Value::List(v) => v,
+                    Value::Null => Vec::new(),
+                    scalar => vec![scalar], // a non-list value is a singleton list
+                };
+                for (j, e) in items.into_iter().enumerate() {
+                    keep.push(i);
+                    elems.push(e);
+                    if let Some((_, one_based)) = ordinal {
+                        ords.push(Value::Num((j + usize::from(*one_based)) as f64));
+                    }
+                }
+            }
+            let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
+            slots.push(Col::Gen(elems));
+            if ordinal.is_some() {
+                slots.push(Col::Gen(ords));
+            }
+            Batch::of(slots)
         }
         Plan::Union {
             left,
@@ -8967,6 +9003,42 @@ mod tests {
             ids("MATCH (b:N {id:'b'})-[:R {amt:20.0}]->{1,3}(x) RETURN x.id AS id"),
             vec!["c"]
         );
+    }
+
+    /// FOR..IN list unwind: literal list, ordinal (1-based ORDINALITY / 0-based
+    /// OFFSET), null/empty → no rows, a scalar singleton, and multiplying a MATCH.
+    #[test]
+    fn for_in_unwind() {
+        let mut b = Builder::default();
+        b.node(&["P"], &[("name", s("marko"))]);
+        let store = b.build();
+        let col = |q: &str, c: usize| -> Vec<Value> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            run(&plan, &store)
+                .rows
+                .iter()
+                .map(|r| r[c].clone())
+                .collect()
+        };
+        assert_eq!(
+            col("FOR x IN [1, 2, 3] RETURN x", 0),
+            vec![Value::Num(1.0), Value::Num(2.0), Value::Num(3.0)]
+        );
+        // ORDINALITY is 1-based, OFFSET 0-based.
+        assert_eq!(
+            col("FOR x IN ['a','b'] WITH ORDINALITY i RETURN i", 0),
+            vec![Value::Num(1.0), Value::Num(2.0)]
+        );
+        assert_eq!(
+            col("FOR x IN ['a','b'] WITH OFFSET i RETURN i", 0),
+            vec![Value::Num(0.0), Value::Num(1.0)]
+        );
+        // null and empty list → no rows; a non-list scalar → one row.
+        assert_eq!(col("FOR x IN null RETURN x", 0).len(), 0);
+        assert_eq!(col("FOR x IN [] RETURN x", 0).len(), 0);
+        assert_eq!(col("FOR x IN 5 RETURN x", 0), vec![Value::Num(5.0)]);
+        // Multiplies a prior MATCH (one row per (match, element)).
+        assert_eq!(col("MATCH (p:P) FOR t IN ['x','y'] RETURN t", 0).len(), 2);
     }
 
     /// A single-outer-rep endpoint-only nested group `( ()-[:R]->{1,3}() ){1} (t)`

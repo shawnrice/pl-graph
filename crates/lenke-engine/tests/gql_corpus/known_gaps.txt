@@ -24,17 +24,7 @@ tests_b.jsonl::sum_date_errors
 tests_c.jsonl::any_shortest_bounded_one_names
 tests_c.jsonl::any_shortest_plus_seed_cycle_len
 tests_c.jsonl::bool_times_num_faults
-tests_c.jsonl::for_bare_with_new_clause
 tests_c.jsonl::for_drives_batch_optional_match
-tests_c.jsonl::for_first_clause_no_seed
-tests_c.jsonl::for_list_references_bound_var
-tests_c.jsonl::for_multiplies_prior_match
-tests_c.jsonl::for_over_empty_no_rows
-tests_c.jsonl::for_over_null_no_rows
-tests_c.jsonl::for_over_scalar_singleton
-tests_c.jsonl::for_unwinds_literal_list
-tests_c.jsonl::for_with_offset
-tests_c.jsonl::for_with_ordinality
 tests_c.jsonl::prop_str_plus_num_faults
 tests_c.jsonl::str_plus_num_faults
 tests_c.jsonl::sum_distinct_mix_num_duration_faults

@@ -379,6 +379,17 @@ pub enum Plan {
     /// feeds it (the outer rows plus a provenance column), so it only ever appears
     /// inside a body evaluated by `exec::pull_body`, never in the main pipeline.
     Row,
+    /// `FOR <var> IN <list> [WITH ORDINALITY|OFFSET <ord>]` — ISO list unwind. For
+    /// each input row, evaluate `list` and emit one output row per element, binding
+    /// the element at `var_slot` (appended after the input columns). A NULL list and
+    /// an empty list yield NO rows; a NON-list scalar is a one-element singleton.
+    /// `ordinal` appends a 1-based (`ORDINALITY`) or 0-based (`OFFSET`) counter.
+    Unwind {
+        input: Box<Plan>,
+        list: Box<Expr>,
+        var_slot: usize,
+        ordinal: Option<(usize, bool)>,
+    },
     /// Seed slot 0 with the nodes carrying `label` whose property `key` equals
     /// `value` under predicate `=`. Produces exactly the rows of
     /// `Scan(label) + Filter(key = value)`; uses a property index when one exists,

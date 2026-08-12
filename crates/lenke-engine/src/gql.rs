@@ -639,6 +639,14 @@ impl Parser {
         if self.eat_kw("CALL") {
             return self.call_procedure();
         }
+        // A leading `FOR <var> IN <list>` — a list-unwind that seeds the query (no
+        // prior MATCH), rooted at one unit row. `Plan::Row` materializes as a single
+        // dummy column, so the first binding lands at slot 1 (past it).
+        if self.eat_kw("FOR") {
+            self.slots = 1;
+            let plan = self.for_clause(Plan::Row)?;
+            return self.query_tail(plan);
+        }
         // A bare `RETURN <items>` with no MATCH — a "return statement" (ISO GQL primary
         // query). It projects its items over ONE unit row (`Plan::Row`), so literals,
         // arithmetic, function calls and `count(*)` (= 1) evaluate with no bindings.
@@ -798,6 +806,8 @@ impl Parser {
                 plan = self.match_continue(plan)?;
             } else if self.eat_kw("CALL") {
                 plan = self.call_inline(plan)?;
+            } else if self.eat_kw("FOR") {
+                plan = self.for_clause(plan)?;
             } else if self.eat_kw("FILTER") {
                 // `FILTER [WHERE] <cond>` — the ISO standalone filtering statement: a
                 // predicate over the current bindings, no projection.
@@ -2482,6 +2492,44 @@ impl Parser {
         self.scope = scope;
         self.slots = out_names.len();
         Ok(plan)
+    }
+
+    /// `FOR <var> IN <list> [WITH ORDINALITY|OFFSET <ord>]` — ISO list unwind. The
+    /// `FOR` keyword is already consumed. Binds `var` (and the optional ordinal) into
+    /// scope and appends a `Plan::Unwind`. `WITH ORDINALITY`/`WITH OFFSET` here is
+    /// part of the FOR (not the separate WITH clause), so only that spelling is eaten.
+    fn for_clause(&mut self, plan: Plan) -> Result<Plan, String> {
+        let var = self.ident()?;
+        if !self.eat_kw("IN") {
+            return Err("expected IN after the FOR variable".into());
+        }
+        let list = self.expr()?;
+        let var_slot = self.slots;
+        self.slots += 1;
+        self.scope.insert(var, var_slot);
+        let ordinal = if self.peek_kw("WITH")
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s))
+                if s.eq_ignore_ascii_case("ORDINALITY") || s.eq_ignore_ascii_case("OFFSET"))
+        {
+            self.eat_kw("WITH");
+            let one_based = self.eat_kw("ORDINALITY");
+            if !one_based {
+                self.eat_kw("OFFSET");
+            }
+            let ord_var = self.ident()?;
+            let ord_slot = self.slots;
+            self.slots += 1;
+            self.scope.insert(ord_var, ord_slot);
+            Some((ord_slot, one_based))
+        } else {
+            None
+        };
+        Ok(Plan::Unwind {
+            input: Box::new(plan),
+            list: Box::new(list),
+            var_slot,
+            ordinal,
+        })
     }
 
     fn with_clause(&mut self, plan: Plan) -> Result<Plan, String> {

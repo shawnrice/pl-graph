@@ -114,6 +114,23 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
         | Plan::Merge { .. }
         | Plan::AddEdge { .. }
         | Plan::CallProcedure { .. }) => (p, false),
+        Plan::Unwind {
+            input,
+            list,
+            var_slot,
+            ordinal,
+        } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::Unwind {
+                    input: Box::new(i),
+                    list,
+                    var_slot,
+                    ordinal,
+                },
+                c,
+            )
+        }
         Plan::Expand {
             input,
             from,
@@ -1073,6 +1090,8 @@ fn width(plan: &Plan) -> usize {
         // `Row` never appears in an outer plan (it lives only in an EXISTS body,
         // which pushdown does not traverse); width is meaningless here.
         Plan::Row => 0,
+        // Unwind appends the element and, optionally, an ordinal counter.
+        Plan::Unwind { input, ordinal, .. } => width(input) + 1 + usize::from(ordinal.is_some()),
         // Writes carry no output row. `InsertReturn` is a write too — its RETURN
         // rows are produced by the executor, not by this read-side width pass.
         Plan::Insert { .. }
@@ -1534,6 +1553,7 @@ mod tests {
         match p {
             Plan::Filter { .. } => true,
             Plan::Expand { input, .. }
+            | Plan::Unwind { input, .. }
             | Plan::OptionalExpand { input, .. }
             | Plan::IntervalExpand { input, .. }
             | Plan::VarLength { input, .. }
