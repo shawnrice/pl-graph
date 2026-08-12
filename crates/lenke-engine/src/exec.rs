@@ -727,7 +727,8 @@ fn needs_lineage(plan: &Plan) -> bool {
             | Expr::Lit(_)
             | Expr::PropertyExists { .. }
             | Expr::Exists { .. }
-            | Expr::CountSubquery { .. } => false,
+            | Expr::CountSubquery { .. }
+            | Expr::ScalarSubquery { .. } => false,
         }
     }
     match plan {
@@ -4660,7 +4661,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         // An EXISTS correlates on outer slots below `outer_width`; conservatively
         // treat it as touching more than one, so it never rides the frontier-only
         // aggregate fast path.
-        Expr::Exists { .. } | Expr::CountSubquery { .. } => false,
+        Expr::Exists { .. } | Expr::CountSubquery { .. } | Expr::ScalarSubquery { .. } => false,
     }
 }
 
@@ -4750,7 +4751,9 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         },
         // Never reached: `refs_only_slot` rejects EXISTS, so the frontier remap
         // that calls this is never handed one. Clone rather than rewrite a body.
-        Expr::Exists { .. } | Expr::CountSubquery { .. } => expr.clone(),
+        Expr::Exists { .. } | Expr::CountSubquery { .. } | Expr::ScalarSubquery { .. } => {
+            expr.clone()
+        }
     }
 }
 
@@ -6628,6 +6631,34 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 }
             }
             Col::Num(counts)
+        }
+        Expr::ScalarSubquery { body, scalar, .. } => {
+            // Correlated scalar: same provenance-tagged sub-run, but project `scalar`
+            // over the surviving sub-rows and return each outer row's single value
+            // (NULL when the body matched nothing). A VALUE subquery must return AT
+            // MOST one row per outer row — more than one is an error (matching core).
+            let n = batch.rows();
+            let prov = batch.slots.len();
+            let mut slots = batch.slots.clone();
+            slots.push(Col::Num((0..n).map(|i| i as f64).collect()));
+            let seed = Batch::of(slots);
+            let survivors = pull_body(body, store, &seed)?;
+            let vals = eval(scalar, store, &survivors)?;
+            let mut out = vec![Value::Null; n];
+            let mut seen = vec![false; n];
+            if let Col::Num(ids) = survivors.slot(prov).clone() {
+                for (j, &id) in ids.iter().enumerate() {
+                    let i = id as usize;
+                    if i < n {
+                        if seen[i] {
+                            return Err("a VALUE subquery returned more than one row".into());
+                        }
+                        seen[i] = true;
+                        out[i] = vals.value_at(j);
+                    }
+                }
+            }
+            Col::Gen(out)
         }
     })
 }
@@ -8911,6 +8942,36 @@ mod tests {
             ids("MATCH (b:N {id:'b'})-[:R {amt:20.0}]->{1,3}(x) RETURN x.id AS id"),
             vec!["c"]
         );
+    }
+
+    /// A correlated scalar VALUE subquery returns the body's single value per outer
+    /// row (NULL if empty), and ERRORS if the body matches more than one row.
+    #[test]
+    fn scalar_value_subquery() {
+        let nd = concat!(
+            "{\"id\":\"alice\",\"labels\":[\"Person\"],\"props\":{\"id\":\"alice\",\"name\":\"Alice\"}}\n",
+            "{\"id\":\"carol\",\"labels\":[\"Person\"],\"props\":{\"id\":\"carol\",\"name\":\"Carol\"}}\n",
+            "{\"id\":\"dave\",\"labels\":[\"Person\"],\"props\":{\"id\":\"dave\",\"name\":\"Dave\"}}\n",
+            "{\"id\":\"bob\",\"labels\":[\"Person\"],\"props\":{\"id\":\"bob\",\"name\":\"Bob\"}}\n",
+            "{\"id\":\"erin\",\"labels\":[\"Person\"],\"props\":{\"id\":\"erin\",\"name\":\"Erin\"}}\n",
+            "{\"from\":\"alice\",\"to\":\"bob\",\"labels\":[\"KNOWS\"],\"props\":{}}\n",
+            "{\"from\":\"dave\",\"to\":\"bob\",\"labels\":[\"KNOWS\"],\"props\":{}}\n",
+            "{\"from\":\"dave\",\"to\":\"erin\",\"labels\":[\"KNOWS\"],\"props\":{}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let one = |id: &str| -> Value {
+            let q = format!(
+                "MATCH (a:Person) WHERE a.id='{id}' RETURN VALUE {{ MATCH (a)-[:KNOWS]->(b) RETURN b.name }} AS f"
+            );
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(&q).unwrap(), &store);
+            run(&plan, &store).rows[0][0].clone()
+        };
+        assert!(matches!(one("alice"), Value::Str(s) if &*s == "Bob")); // one friend
+        assert!(one("carol").is_null()); // no friend → NULL
+                                         // dave knows two → the subquery returns >1 row → execute errors.
+        let q = "MATCH (a:Person) WHERE a.id='dave' RETURN VALUE { MATCH (a)-[:KNOWS]->(b) RETURN b.name } AS f";
+        let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+        assert!(try_run(&plan, &store).is_err());
     }
 
     /// OPTIONAL MATCH binding an edge variable `(a)-[f:R]->(b)` binds the edge slot

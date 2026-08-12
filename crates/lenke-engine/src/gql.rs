@@ -3474,7 +3474,8 @@ impl Parser {
     // already bound in the outer scope (the correlation), and the body extends
     // from it. A trailing WHERE is a sub-pattern predicate over the body scope.
     fn exists_expr(&mut self) -> Result<Expr, String> {
-        let (body, outer_width) = self.correlated_subquery_body("EXISTS", false)?;
+        let (body, outer_width, _, _) = self.correlated_subquery_body("EXISTS")?;
+        self.expect(&Tok::RBrace)?;
         Ok(Expr::Exists {
             body: Box::new(body),
             outer_width,
@@ -3531,20 +3532,48 @@ impl Parser {
     }
 
     fn count_subquery_expr(&mut self) -> Result<Expr, String> {
-        let (body, outer_width) = self.correlated_subquery_body("COUNT", false)?;
+        let (body, outer_width, _, _) = self.correlated_subquery_body("COUNT")?;
+        self.expect(&Tok::RBrace)?;
         Ok(Expr::CountSubquery {
             body: Box::new(body),
             outer_width,
         })
     }
 
-    // value := VALUE '{' MATCH <pattern> RETURN count(*) '}' — a correlated scalar
-    // subquery. Only the `count(*)` RETURN is supported, which is exactly a
-    // `COUNT { … }` (a degree), so it lowers to the same CountSubquery.
+    // value := VALUE '{' MATCH <pattern> RETURN <expr> '}' — a correlated scalar
+    // subquery. `RETURN count(*)` lowers to a CountSubquery (a degree); any other
+    // scalar expression (`RETURN b.name`) becomes a ScalarSubquery: the body's single
+    // value per outer row (NULL when the body matches nothing).
     fn value_count_subquery_expr(&mut self) -> Result<Expr, String> {
-        let (body, outer_width) = self.correlated_subquery_body("VALUE", true)?;
-        Ok(Expr::CountSubquery {
+        let (body, outer_width, sub_scope, sub_slots) = self.correlated_subquery_body("VALUE")?;
+        if !self.eat_kw("RETURN") {
+            return Err("a VALUE subquery must end with RETURN <expr>".into());
+        }
+        // `RETURN count(*)` → CountSubquery (no scope needed).
+        if self.peek_kw("COUNT")
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
+            && matches!(self.toks.get(self.pos + 2), Some(Tok::Star))
+        {
+            self.eat_kw("COUNT");
+            self.expect(&Tok::LParen)?;
+            self.expect(&Tok::Star)?;
+            self.expect(&Tok::RParen)?;
+            self.expect(&Tok::RBrace)?;
+            return Ok(Expr::CountSubquery {
+                body: Box::new(body),
+                outer_width,
+            });
+        }
+        // A scalar RETURN expression, parsed against the body's sub-scope.
+        let saved_scope = std::mem::replace(&mut self.scope, sub_scope);
+        let saved_slots = std::mem::replace(&mut self.slots, sub_slots);
+        let scalar = self.expr()?;
+        self.scope = saved_scope;
+        self.slots = saved_slots;
+        self.expect(&Tok::RBrace)?;
+        Ok(Expr::ScalarSubquery {
             body: Box::new(body),
+            scalar: Box::new(scalar),
             outer_width,
         })
     }
@@ -3553,11 +3582,11 @@ impl Parser {
     /// `COUNT { … }`: a pattern correlated on an outer-bound start variable, rooted at
     /// `Plan::Row`, with slot `outer_width` reserved for the evaluator's provenance
     /// column. Returns `(body, outer_width)`. `kw` names the construct for errors.
+    #[allow(clippy::type_complexity)]
     fn correlated_subquery_body(
         &mut self,
         kw: &str,
-        count_return: bool,
-    ) -> Result<(Plan, usize), String> {
+    ) -> Result<(Plan, usize, HashMap<String, usize>, usize), String> {
         self.expect(&Tok::LBrace)?;
         // The pattern may be written with an explicit leading `MATCH` — `EXISTS {
         // MATCH (a)-[:R]->(b) }` — the full-statement form; accept it as sugar.
@@ -3641,7 +3670,7 @@ impl Parser {
             body
         };
         let body = if self.eat_kw("WHERE") {
-            let saved_scope = std::mem::replace(&mut self.scope, sub_scope);
+            let saved_scope = std::mem::replace(&mut self.scope, sub_scope.clone());
             let saved_slots = std::mem::replace(&mut self.slots, sub_slots);
             let pred = self.expr()?;
             self.scope = saved_scope;
@@ -3650,23 +3679,9 @@ impl Parser {
         } else {
             body
         };
-        // The VALUE form `VALUE { MATCH … RETURN count(*) }` carries an explicit
-        // RETURN; only the `count(*)` shape is supported (it makes this a correlated
-        // count subquery, exactly like `COUNT { … }`).
-        if count_return {
-            if !self.eat_kw("RETURN") {
-                return Err(format!("{kw} subquery must end with RETURN count(*)"));
-            }
-            let is_count_star = self.eat_kw("COUNT")
-                && self.eat(&Tok::LParen)
-                && self.eat(&Tok::Star)
-                && self.eat(&Tok::RParen);
-            if !is_count_star {
-                return Err(format!("only `{kw} {{ … RETURN count(*) }}` is supported"));
-            }
-        }
-        self.expect(&Tok::RBrace)?;
-        Ok((body, outer_width))
+        // The caller consumes any trailing `RETURN …` (for VALUE) and the closing
+        // `}`; it also owns the sub-scope so it can parse a scalar RETURN expression.
+        Ok((body, outer_width, sub_scope, sub_slots))
     }
 
     // call := name '(' [ expr (',' expr)* ] ')'  — a scalar function.

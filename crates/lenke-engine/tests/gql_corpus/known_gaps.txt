@@ -102,9 +102,6 @@ tests_e.jsonl::match_mode_different_edges
 tests_e.jsonl::match_mode_repeatable_elements
 tests_e.jsonl::value_subquery_aggregate_global
 tests_e.jsonl::value_subquery_constant
-tests_e.jsonl::value_subquery_correlated_scalar_1
-tests_e.jsonl::value_subquery_correlated_scalar_2
-tests_e.jsonl::value_subquery_where_narrows
 tests_f.jsonl::contains_window
 tests_f.jsonl::counting_edges_where_14
 tests_f.jsonl::distinct_nan_1

@@ -212,6 +212,15 @@ pub enum Expr {
         body: Box<Plan>,
         outer_width: usize,
     },
+    /// `VALUE { <pattern> RETURN <scalar> }` — a correlated SCALAR subquery. Same
+    /// provenance-tagged body run as [`Expr::Exists`]; yields the `scalar` expression
+    /// evaluated on the body's single matching row per outer row (NULL when the body
+    /// matches nothing). `scalar` is an expression over the body's sub-scope.
+    ScalarSubquery {
+        body: Box<Plan>,
+        scalar: Box<Expr>,
+        outer_width: usize,
+    },
     /// `needle IN haystack` where `haystack` is a dynamic (non-literal) list
     /// expression (a list property, a param, a function result). A literal
     /// `x IN [a, b]` desugars to an OR-chain at parse time instead; this is the
