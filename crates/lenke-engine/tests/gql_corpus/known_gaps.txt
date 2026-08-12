@@ -2,13 +2,10 @@
 # lenke-core. The corpus gate is green as long as no case OUTSIDE this list
 # mismatches. As gaps are fixed, their keys are reported as now-passing and
 # should be removed. Regenerate with CORPUS_BASELINE=1.
-hardening.jsonl::h_bool_times_number_raises_data_exception
 hardening.jsonl::h_rejects_literal_overflowing_exponent
 hardening.jsonl::h_rejects_literal_oversized_integer_literal
-hardening.jsonl::h_string_plus_number_raises_data_exception
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_1
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_2
-tests_b.jsonl::avg_duration_errors
 tests_b.jsonl::call_config_bogus_error
 tests_b.jsonl::call_config_pivot_error
 tests_b.jsonl::call_config_wrong_type_error
@@ -17,13 +14,6 @@ tests_b.jsonl::cast_int_null
 tests_b.jsonl::cast_list
 tests_b.jsonl::malformed_num_1e999_error
 tests_b.jsonl::oversized_int_error
-tests_b.jsonl::sum_date_errors
-tests_c.jsonl::bool_times_num_faults
-tests_c.jsonl::prop_str_plus_num_faults
-tests_c.jsonl::str_plus_num_faults
-tests_c.jsonl::sum_distinct_mix_num_duration_faults
-tests_c.jsonl::sum_mix_num_duration_faults
-tests_c.jsonl::sum_mix_str_duration_faults
 tests_c.jsonl::temporal_duration_unordered_count_zero
 tests_e.jsonl::date_part_bare_name_unknown_fn
 tests_e.jsonl::date_part_rejects_number
@@ -31,7 +21,6 @@ tests_e.jsonl::date_part_rejects_string
 tests_f.jsonl::distinct_nan_1
 tests_f.jsonl::distinct_nan_2
 tests_f.jsonl::distinct_nan_3
-tests_f.jsonl::faulting_aggregate_err
 tests_f.jsonl::inline_constraint_14
 tests_f.jsonl::inline_constraint_15
 tests_f.jsonl::inline_constraint_per_row

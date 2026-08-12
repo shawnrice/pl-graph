@@ -582,7 +582,7 @@ any_shortest_plus_seed_cycle_len), and the unknown-edge-type zero-rep source for
   OptionalScan; bound var + hop → OptionalExpand (unchanged).
 
 **DONE — every buildable feature gap is cleared.** The corpus is at its principled FLOOR: all 40 remaining
-divergences are INTENTIONAL value-contract (leave baselined): hardening arithmetic (bool*num / str+num /
+divergences are INTENTIONAL value-contract (leave baselined): hardening arithmetic (bool\*num / str+num /
 oversized-int / overflow-exponent), reserved words, sum/avg-over-temporal + mixed, CALL-config errors, strict
 CAST (bool/list/int_null), malformed/oversized num, date_part strict, distinct-NaN, faulting-aggregate, inline
 constraints, num_string_overflow, range caps, temporal_duration (core lacks duration ordering), zero_bound_3

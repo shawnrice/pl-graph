@@ -1931,7 +1931,7 @@ fn aggregate(
             arg_col.as_ref(),
             &group_of,
             n_groups,
-        )));
+        )?));
     }
 
     Ok(Batch::of(slots))
@@ -2052,20 +2052,25 @@ fn sort_local_cell(v: Value, descending: bool) -> Value {
 /// Fold one aggregate to one value per group in a single streaming pass over the
 /// group labelling. Null policy and ordering come from the value contract;
 /// nothing here restates them.
-fn fold_grouped(agg: &Agg, arg_col: Option<&Col>, group_of: &[u32], n_groups: usize) -> Vec<Value> {
+fn fold_grouped(
+    agg: &Agg,
+    arg_col: Option<&Col>,
+    group_of: &[u32],
+    n_groups: usize,
+) -> Result<Vec<Value>, String> {
     // `count(*)` — no argument — is each group's row count: a pure tally.
     if agg.func == AggFn::Count && agg.arg.is_none() {
         let mut tally = vec![0f64; n_groups];
         for &g in group_of {
             tally[g as usize] += 1.0;
         }
-        return tally.into_iter().map(Value::Num).collect();
+        return Ok(tally.into_iter().map(Value::Num).collect());
     }
     let Some(col) = arg_col else {
-        return vec![Value::Null; n_groups]; // sum/min/max/avg with no argument
+        return Ok(vec![Value::Null; n_groups]); // sum/min/max/avg with no argument
     };
 
-    match agg.func {
+    Ok(match agg.func {
         AggFn::Count if agg.distinct => {
             // Per-group distinct count. A dedicated set per group, keyed by the
             // grouping bytes; a group entry is allocated only for a new value.
@@ -2096,13 +2101,12 @@ fn fold_grouped(agg: &Agg, arg_col: Option<&Col>, group_of: &[u32], n_groups: us
             tally.into_iter().map(Value::Num).collect()
         }
         AggFn::Sum | AggFn::Avg => {
-            // total + count of non-null NUMERIC values; a non-null non-numeric
-            // poisons its group to NULL (never coerced to NaN). SUM and AVG differ
-            // over nothing, matching lenke-core (the GQL/Cypher convention): SUM of
-            // an empty/all-null group is 0, AVG is NULL (no values to divide).
+            // total + count of non-null NUMERIC values. A non-null NON-numeric value
+            // (duration/date/string/list) is a DATA EXCEPTION — sum()/avg() never
+            // coerce (the same SQL rule as binary arithmetic). NULLs are skipped. SUM
+            // of an empty/all-null group is 0, AVG is NULL (no values to divide).
             let mut total = vec![0f64; n_groups];
             let mut cnt = vec![0u64; n_groups];
-            let mut poison = vec![false; n_groups];
             for (i, &g) in group_of.iter().enumerate() {
                 match col.value_at(i) {
                     Value::Null => {}
@@ -2110,14 +2114,12 @@ fn fold_grouped(agg: &Agg, arg_col: Option<&Col>, group_of: &[u32], n_groups: us
                         total[g as usize] += x;
                         cnt[g as usize] += 1;
                     }
-                    _ => poison[g as usize] = true,
+                    _ => return Err("sum()/avg() require numeric values".into()),
                 }
             }
             (0..n_groups)
                 .map(|g| {
-                    if poison[g] {
-                        Value::Null
-                    } else if agg.func == AggFn::Sum {
+                    if agg.func == AggFn::Sum {
                         Value::Num(total[g]) // 0.0 when cnt == 0
                     } else if cnt[g] == 0 {
                         Value::Null // AVG of nothing
@@ -2205,7 +2207,7 @@ fn fold_grouped(agg: &Agg, arg_col: Option<&Col>, group_of: &[u32], n_groups: us
                 .map(|nums| percentile_of(nums, frac, cont))
                 .collect()
         }
-    }
+    })
 }
 
 /// The `frac`-th percentile of `nums` — interpolated (`cont`) or discrete (`disc`) —
@@ -6487,7 +6489,12 @@ fn arith_general(op: crate::ir::ArithOp, l: &Col, r: &Col) -> Result<Col, String
                         Rem => x % y,
                     })
                 }
-                _ => Value::Null,
+                // A NULL operand → NULL (three-valued). A NON-null NON-numeric operand
+                // (string/bool/list/record) is a DATA EXCEPTION — arithmetic never
+                // implicitly coerces; use an explicit CAST (`CAST('1' AS INT) * n`). This
+                // is core's SQL-style rule (`'abc' + 1` throws; `1 + null` is null).
+                _ if a.is_null() || b.is_null() => Value::Null,
+                _ => return Err("arithmetic requires a number".into()),
             }
         };
         out.push(v);
@@ -12093,6 +12100,34 @@ mod tests {
             .filter(|r| r[0].is_null())
             .count();
         assert_eq!(nulls, 1); // only the Project node lacks age
+    }
+
+    /// Arithmetic follows core's SQL rule: a NULL operand yields NULL, but a non-null
+    /// NON-numeric operand (string/bool) is a DATA EXCEPTION (never coerced) — an
+    /// explicit CAST is the escape hatch. Aggregates sum()/avg() likewise throw over a
+    /// non-numeric value.
+    #[test]
+    fn arith_and_agg_throw_on_non_numeric() {
+        let store = social();
+        let ok = |q: &str| {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            try_run(&plan, &store)
+        };
+        // null operand → NULL (not an error).
+        assert!(ok("RETURN 1 + null AS r").unwrap().rows[0][0].is_null());
+        // non-null non-numeric → error.
+        assert!(ok("RETURN 'abc' + 1 AS r").is_err());
+        assert!(ok("RETURN true * 2 AS r").is_err());
+        assert!(ok("MATCH (p:Person) RETURN p.name + 1 AS r").is_err());
+        // CAST is the escape hatch.
+        assert!(matches!(
+            ok("RETURN CAST('2' AS INT) * 3 AS r").unwrap().rows[0][0],
+            Value::Num(x) if x == 6.0
+        ));
+        // sum/avg over numbers still work; over a non-numeric they throw.
+        assert!(ok("MATCH (p:Person) RETURN sum(p.age) AS r").is_ok());
+        assert!(ok("MATCH (p:Person) RETURN sum(p.name) AS r").is_err());
+        assert!(ok("MATCH (p:Person) RETURN avg(p.name) AS r").is_err());
     }
 
     /// Division / modulo by zero THROWS (matches lenke-core's DataException), via
