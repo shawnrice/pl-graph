@@ -711,7 +711,7 @@ fn needs_lineage(plan: &Plan) -> bool {
                 fields.iter().any(|(_, e)| reads_path(e))
             }
             Expr::Field { base, .. } => reads_path(base),
-            Expr::Index { base, index } => reads_path(base) || reads_path(index),
+            Expr::Index { base, index, .. } => reads_path(base) || reads_path(index),
             Expr::Case {
                 branches,
                 otherwise,
@@ -745,6 +745,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         Plan::Expand { input, .. }
         | Plan::OptionalExpand { input, .. }
         | Plan::VarLength { input, .. }
+        | Plan::RepeatGroup { input, .. }
         | Plan::ShortestPath { input, .. }
         | Plan::Distinct { input }
         | Plan::Tail { input, .. }
@@ -943,6 +944,28 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             *min,
             *max,
             *mode,
+            &[],
+        ),
+        Plan::RepeatGroup {
+            input,
+            from,
+            dir,
+            edge_label,
+            min,
+            max,
+            mode,
+            endpoint_slot: _,
+            group_binds,
+        } => var_length(
+            &pull(input, store, track)?,
+            store,
+            *from,
+            *dir,
+            edge_label,
+            *min,
+            *max,
+            *mode,
+            group_binds,
         ),
         Plan::ShortestPath {
             input,
@@ -4600,7 +4623,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
             fields.iter().all(|(_, e)| refs_only_slot(e, s))
         }
         Expr::Field { base, .. } => refs_only_slot(base, s),
-        Expr::Index { base, index } => refs_only_slot(base, s) && refs_only_slot(index, s),
+        Expr::Index { base, index, .. } => refs_only_slot(base, s) && refs_only_slot(index, s),
         Expr::Case {
             branches,
             otherwise,
@@ -4671,9 +4694,10 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
                 .map(|(k, e)| (k.clone(), remap_slot(e, from, to)))
                 .collect(),
         },
-        Expr::Index { base, index } => Expr::Index {
+        Expr::Index { base, index, elem } => Expr::Index {
             base: go(base),
             index: go(index),
+            elem: *elem,
         },
         Expr::Field { base, key } => Expr::Field {
             base: go(base),
@@ -4880,10 +4904,17 @@ fn var_length(
     min: u32,
     max: u32,
     mode: PathMode,
+    // A quantified subpath group binds inner variables as GROUP lists (RepeatGroup);
+    // each `(pos, _slot)` appends one list column (source/edge/target per rep) after
+    // the endpoint. Empty = a plain var-length hop (endpoint only).
+    group_binds: &[(crate::ir::GroupPos, usize)],
 ) -> Batch {
     let empty = || {
         let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
         slots.push(Col::Nodes(vec![]));
+        for _ in group_binds {
+            slots.push(Col::Gen(vec![]));
+        }
         Batch::of(slots)
     };
     let want = match want_etypes(store, edge_label) {
@@ -4904,6 +4935,8 @@ fn var_length(
     // with the start). Empty for Walk.
     let mut used: Vec<u32> = Vec::new();
     let mut bufs = PathBufs::new();
+    // One accumulating list column per group bind, row-aligned with `keep`/`ends`.
+    let mut group_cols: Vec<Vec<Value>> = vec![Vec::new(); group_binds.len()];
     let node_unique = matches!(mode, PathMode::Simple | PathMode::Acyclic);
     for (row, &v) in src.iter().enumerate() {
         if node_unique {
@@ -4932,6 +4965,8 @@ fn var_length(
             &mut node_stack,
             &mut edge_stack,
             &mut bufs,
+            group_binds,
+            &mut group_cols,
         );
         if node_unique {
             used.pop();
@@ -4941,6 +4976,9 @@ fn var_length(
 
     let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
     slots.push(Col::Nodes(ends));
+    for col in group_cols {
+        slots.push(Col::Gen(col));
+    }
     let mut out = Batch::of(slots);
     if track {
         out.lineage = Some(Lineage {
@@ -4951,6 +4989,35 @@ fn var_length(
         });
     }
     out
+}
+
+/// Materialize the group-variable lists for ONE emitted repetition-path and push
+/// each into its column. `node_stack` = `[source, n1, …, endpoint]`, `edge_stack` =
+/// the per-rep edges; a k=1 unit has `reps = edge_stack.len()` and the variable at
+/// `Source` is `node_stack[rep]`, `Target` is `node_stack[rep+1]`, `Edge` is
+/// `edge_stack[rep]` — each rendered as a `Value::Num` id inside a `Value::List`.
+fn push_group_cols(
+    node_stack: &[u32],
+    edge_stack: &[u32],
+    group_binds: &[(crate::ir::GroupPos, usize)],
+    group_cols: &mut [Vec<Value>],
+) {
+    use crate::ir::GroupPos;
+    let reps = edge_stack.len();
+    for (i, (pos, _)) in group_binds.iter().enumerate() {
+        let list: Vec<Value> = match pos {
+            GroupPos::Source => (0..reps)
+                .map(|r| Value::Num(f64::from(node_stack[r])))
+                .collect(),
+            GroupPos::Target => (0..reps)
+                .map(|r| Value::Num(f64::from(node_stack[r + 1])))
+                .collect(),
+            GroupPos::Edge => (0..reps)
+                .map(|r| Value::Num(f64::from(edge_stack[r])))
+                .collect(),
+        };
+        group_cols[i].push(Value::List(list));
+    }
 }
 
 /// Depth-first path enumeration for `var_length`. Emits `(row, endpoint)` at
@@ -4979,6 +5046,10 @@ fn varlen_dfs(
     node_stack: &mut Vec<u32>,
     edge_stack: &mut Vec<u32>,
     bufs: &mut PathBufs,
+    // Group-variable materialization (a RepeatGroup): at each emit, push one list per
+    // bind (source/edge/target across reps) into `group_cols`. Empty = no group vars.
+    group_binds: &[(crate::ir::GroupPos, usize)],
+    group_cols: &mut Vec<Vec<Value>>,
 ) {
     if len >= min {
         keep.push(row);
@@ -4994,6 +5065,9 @@ fn varlen_dfs(
                 &mut bufs.edges,
                 &mut bufs.edge_offsets,
             );
+        }
+        if !group_binds.is_empty() {
+            push_group_cols(node_stack, edge_stack, group_binds, group_cols);
         }
     }
     if len == max {
@@ -5039,19 +5113,24 @@ fn varlen_dfs(
                 if len + 1 >= min {
                     keep.push(row);
                     ends.push(a.nbr);
-                    if let Some(b) = track_batch {
+                    if track_batch.is_some() || !group_binds.is_empty() {
                         node_stack.push(a.nbr);
                         edge_stack.push(a.eid);
-                        push_path(
-                            b,
-                            row,
-                            node_stack,
-                            edge_stack,
-                            &mut bufs.values,
-                            &mut bufs.offsets,
-                            &mut bufs.edges,
-                            &mut bufs.edge_offsets,
-                        );
+                        if let Some(b) = track_batch {
+                            push_path(
+                                b,
+                                row,
+                                node_stack,
+                                edge_stack,
+                                &mut bufs.values,
+                                &mut bufs.offsets,
+                                &mut bufs.edges,
+                                &mut bufs.edge_offsets,
+                            );
+                        }
+                        if !group_binds.is_empty() {
+                            push_group_cols(node_stack, edge_stack, group_binds, group_cols);
+                        }
                         node_stack.pop();
                         edge_stack.pop();
                     }
@@ -5083,6 +5162,8 @@ fn varlen_dfs(
             node_stack,
             edge_stack,
             bufs,
+            group_binds,
+            group_cols,
         );
         node_stack.pop();
         edge_stack.pop();
@@ -5435,7 +5516,7 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
         // node/edge property (`edges(p)[0].w`). The path lists carry ids as `Num`,
         // which a generic list-index would flatten to an untyped scalar. Emit a typed
         // `Col::Nodes`/`Col::Edges` instead (out-of-range → `u32::MAX` null sentinel).
-        Expr::Index { base, index }
+        Expr::Index { base, index, .. }
             if matches!(
                 base.as_ref(),
                 Expr::PathAccess {
@@ -5479,38 +5560,52 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 Col::Edges(ids)
             }
         }
-        Expr::Index { base, index } => {
+        Expr::Index { base, index, elem } => {
             let bcol = eval(base, store, batch)?;
             let icol = eval(index, store, batch)?;
-            Col::Gen(
-                (0..batch.rows())
-                    .map(|i| match bcol.value_at(i) {
-                        Value::List(items) => match icol.value_at(i) {
-                            Value::Num(n)
-                                if n >= 0.0 && n.fract() == 0.0 && (n as usize) < items.len() =>
-                            {
-                                items[n as usize].clone()
-                            }
-                            _ => Value::Null,
-                        },
-                        Value::Record(fields) => match icol.value_at(i) {
-                            Value::Str(k) => fields
-                                .iter()
-                                .find(|(fk, _)| *fk == k)
-                                .map_or(Value::Null, |(_, v)| v.clone()),
-                            _ => Value::Null,
-                        },
-                        Value::Map(entries) => match icol.value_at(i) {
-                            Value::Str(k) => entries
-                                .iter()
-                                .find(|(ek, _)| matches!(ek, Value::Str(s) if *s == k))
-                                .map_or(Value::Null, |(_, v)| v.clone()),
-                            _ => Value::Null,
-                        },
-                        _ => Value::Null,
-                    })
-                    .collect(),
-            )
+            // Index into the per-row list/record/map → the element value (or NULL).
+            let at = |i: usize| match bcol.value_at(i) {
+                Value::List(items) => match icol.value_at(i) {
+                    Value::Num(n) if n >= 0.0 && n.fract() == 0.0 && (n as usize) < items.len() => {
+                        items[n as usize].clone()
+                    }
+                    _ => Value::Null,
+                },
+                Value::Record(fields) => match icol.value_at(i) {
+                    Value::Str(k) => fields
+                        .iter()
+                        .find(|(fk, _)| *fk == k)
+                        .map_or(Value::Null, |(_, v)| v.clone()),
+                    _ => Value::Null,
+                },
+                Value::Map(entries) => match icol.value_at(i) {
+                    Value::Str(k) => entries
+                        .iter()
+                        .find(|(ek, _)| matches!(ek, Value::Str(s) if *s == k))
+                        .map_or(Value::Null, |(_, v)| v.clone()),
+                    _ => Value::Null,
+                },
+                _ => Value::Null,
+            };
+            match elem {
+                // A group-variable list element keeps NODE/EDGE typing so a following
+                // `.prop` resolves — mirror the path-subscript case: emit a typed
+                // `Col::Nodes`/`Col::Edges` (out-of-range / non-node → u32::MAX null).
+                crate::ir::ElemKind::Node | crate::ir::ElemKind::Edge => {
+                    let ids: Vec<u32> = (0..batch.rows())
+                        .map(|i| match at(i) {
+                            Value::Num(x) if x >= 0.0 && x.fract() == 0.0 => x as u32,
+                            _ => u32::MAX,
+                        })
+                        .collect();
+                    if matches!(elem, crate::ir::ElemKind::Node) {
+                        Col::Nodes(ids)
+                    } else {
+                        Col::Edges(ids)
+                    }
+                }
+                crate::ir::ElemKind::Plain => Col::Gen((0..batch.rows()).map(at).collect()),
+            }
         }
         Expr::Path => match &batch.lineage {
             // Each row's path as a List of node ids; NULL when the plan tracks no
@@ -6326,6 +6421,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             *min,
             *max,
             *mode,
+            &[],
         ),
         Plan::Filter { input, pred } => {
             let b = pull_body(input, store, seed)?;
@@ -8456,6 +8552,41 @@ mod tests {
             ty("MATCH (a:N)-[e:Y]->(b) RETURN type(e) AS t"),
             vec!["X", "Y", "Z"]
         );
+    }
+
+    /// A quantified subpath group binds its inner variables as GROUP lists: each
+    /// becomes a list over the repetitions, with `size()` the hop count and `v[i]`
+    /// a typed node/edge element so `x[i].prop` resolves. Path a-R(10)->b-R(20)->c.
+    #[test]
+    fn repeat_group_binds_group_variables() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{\"amt\":10}}\n",
+            "{\"from\":\"b\",\"to\":\"c\",\"labels\":[\"R\"],\"props\":{\"amt\":20}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let row = |q: &str| -> Vec<Value> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            let out = run(&plan, &store);
+            assert_eq!(out.rows.len(), 1, "{q}");
+            out.rows[0].clone()
+        };
+        // {2}: t=c, size(e)=size(x)=size(y)=2, x[0]=a, y[1]=c, e[0].amt=10.
+        let r = row(
+            "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){2} (t) \
+             RETURN t.id AS tid, size(e) AS ne, size(x) AS nx, x[0].id AS x0, y[1].id AS y1, e[0].amt AS e0",
+        );
+        assert!(matches!(&r[0], Value::Str(s) if &**s == "c")); // tid
+        assert!(matches!(r[1], Value::Num(x) if x == 2.0)); // size(e)
+        assert!(matches!(r[2], Value::Num(x) if x == 2.0)); // size(x)
+        assert!(matches!(&r[3], Value::Str(s) if &**s == "a")); // x[0].id
+        assert!(matches!(&r[4], Value::Str(s) if &**s == "c")); // y[1].id
+        assert!(matches!(r[5], Value::Num(x) if x == 10.0)); // e[0].amt
+                                                             // Anonymous endpoint: only the group vars are used.
+        let r = row("MATCH (s:N {id:'a'}) ((x)-[e:R]->(y)){2} RETURN size(e) AS ne");
+        assert!(matches!(r[0], Value::Num(x) if x == 2.0));
     }
 
     /// A standalone FILTER clause filters the working table, and repeated statement-

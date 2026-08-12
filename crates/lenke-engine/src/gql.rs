@@ -216,6 +216,8 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         scope: HashMap::new(),
         slots: 0,
         path_vars: HashSet::new(),
+        group_node_slots: HashSet::new(),
+        group_edge_slots: HashSet::new(),
         lets: Vec::new(),
         suppress_in: false,
         path_mode: PathMode::Trail,
@@ -239,6 +241,8 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         p.scope = HashMap::new();
         p.slots = 0;
         p.path_vars = HashSet::new();
+        p.group_node_slots = HashSet::new();
+        p.group_edge_slots = HashSet::new();
         let right = p.query()?;
         plan = Plan::Union {
             left: Box::new(plan),
@@ -519,6 +523,11 @@ struct Parser {
     /// resolve to `Expr::Path` rather than a slot, since the path is the lineage
     /// sidecar — one per row — not a batch column.
     path_vars: HashSet<String>,
+    /// Slots holding a group-variable NODE list (`x`/`y` of a quantified subpath
+    /// group) resp. EDGE list (`e`) — so `x[i]`/`e[i]` can tag the element kind and
+    /// `x[i].prop` resolves the node/edge property. See `Plan::RepeatGroup`.
+    group_node_slots: HashSet<usize>,
+    group_edge_slots: HashSet<usize>,
     /// `LET name = expr IN …` local bindings (a stack for nesting). A reference to
     /// such a name in an expression inlines its bound `Expr` (substitution), so LET
     /// needs no runtime concept — the body is a plain expression once parsed.
@@ -1843,14 +1852,64 @@ impl Parser {
             // to the endpoint), so it lowers to `var_length`. The endpoint `(t)` that
             // follows is parsed and bound like any landing node.
             if self.is_subpath_group_start() {
-                let (dir, etypes, min, max) = self.parse_subpath_group()?;
-                let (v2, v2_label, v2_props, v2_where, v2_le) = self.node()?;
+                let (dir, etypes, min, max, src_var, edge_var, tgt_var) =
+                    self.parse_subpath_group()?;
+                // The endpoint `(t)` is OPTIONAL — `((x)-[e]->(y)){2}` (anonymous
+                // landing) is valid when only the group variables are used.
+                let (v2, v2_label, v2_props, v2_where, v2_le) =
+                    if matches!(self.peek(), Some(Tok::LParen)) {
+                        self.node()?
+                    } else {
+                        (None, None, Vec::new(), None, None)
+                    };
                 let node_slot = *slots;
                 if let Some(v) = v2 {
                     scope.insert(v, node_slot);
                 }
                 *slots += 1;
-                plan = plan.var_length(from, dir, &etypes, min, max, self.path_mode);
+                // Each NAMED inner variable becomes a GROUP variable — a list column
+                // appended after the endpoint, in source/edge/target order (the order
+                // `Plan::RepeatGroup` materializes them). A node group var (`x`/`y`)
+                // and an edge group var (`e`) are tracked so `x[i].prop` resolves.
+                let mut group_binds: Vec<(crate::ir::GroupPos, usize)> = Vec::new();
+                if let Some(n) = src_var {
+                    let s = *slots;
+                    *slots += 1;
+                    scope.insert(n, s);
+                    self.group_node_slots.insert(s);
+                    group_binds.push((crate::ir::GroupPos::Source, s));
+                }
+                if let Some(n) = edge_var {
+                    let s = *slots;
+                    *slots += 1;
+                    scope.insert(n, s);
+                    self.group_edge_slots.insert(s);
+                    group_binds.push((crate::ir::GroupPos::Edge, s));
+                }
+                if let Some(n) = tgt_var {
+                    let s = *slots;
+                    *slots += 1;
+                    scope.insert(n, s);
+                    self.group_node_slots.insert(s);
+                    group_binds.push((crate::ir::GroupPos::Target, s));
+                }
+                // No group variables referenced → the endpoint-only var_length
+                // lowering; otherwise a RepeatGroup that also binds the group lists.
+                plan = if group_binds.is_empty() {
+                    plan.var_length(from, dir, &etypes, min, max, self.path_mode)
+                } else {
+                    Plan::RepeatGroup {
+                        input: Box::new(plan),
+                        from,
+                        dir,
+                        edge_label: etypes,
+                        min,
+                        max,
+                        mode: self.path_mode,
+                        endpoint_slot: node_slot,
+                        group_binds,
+                    }
+                };
                 from = node_slot;
                 if let Some(pred) = landing_label_filter(v2_label, v2_le, from) {
                     plan = plan.filter(pred);
@@ -1977,12 +2036,26 @@ impl Parser {
     }
 
     /// Parse a SINGLE-edge subpath group `((x)-[e:R]->(y)){n,m}` and return its
-    /// direction, edge types, and quantifier bounds. The inner variables are group
-    /// variables (bound as lists across repetitions in ISO GQL) — this endpoint-only
-    /// lowering ignores them, so a case that REFERENCES a group variable downstream
-    /// stays unsupported. Inner-node labels/properties, a per-rep `WHERE`, a bound
-    /// edge's props, and a multi-hop body are all rejected (later increments).
-    fn parse_subpath_group(&mut self) -> Result<(Dir, Vec<String>, u32, u32), String> {
+    /// direction, edge types, quantifier bounds, and the inner variable NAMES
+    /// (source `x`, edge `e`, target `y`) — each of which, when named, becomes a
+    /// GROUP variable bound as a list across repetitions (see `Plan::RepeatGroup`).
+    /// Inner-node labels/properties, a per-rep `WHERE`, a bound edge's props, and a
+    /// multi-hop body are all rejected (later increments).
+    #[allow(clippy::type_complexity)]
+    fn parse_subpath_group(
+        &mut self,
+    ) -> Result<
+        (
+            Dir,
+            Vec<String>,
+            u32,
+            u32,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+        String,
+    > {
         self.expect(&Tok::LParen)?; // the group's own opening paren
         let bad_inner =
             |n: &ParsedNode| n.1.is_some() || n.4.is_some() || !n.2.is_empty() || n.3.is_some();
@@ -1992,18 +2065,21 @@ impl Parser {
                 "a label/property/WHERE on a subpath-group inner node is not supported yet".into(),
             );
         }
+        let source_var = src.0.clone();
         let rel = self.rel()?;
         if !rel.props.is_empty() || rel.where_range.is_some() {
             return Err(
                 "edge properties / a per-hop WHERE on a subpath group are not supported yet".into(),
             );
         }
+        let edge_var = rel.var.clone();
         let tgt = self.node()?;
         if bad_inner(&tgt) {
             return Err(
                 "a label/property/WHERE on a subpath-group inner node is not supported yet".into(),
             );
         }
+        let target_var = tgt.0.clone();
         if matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde)) {
             return Err("a multi-hop subpath-group body is not supported yet".into());
         }
@@ -2014,7 +2090,9 @@ impl Parser {
         let (min, max) = self
             .opt_quantifier()?
             .ok_or("a subpath group requires a `{n,m}` / `*` / `+` quantifier")?;
-        Ok((rel.dir, rel.etypes, min, max))
+        Ok((
+            rel.dir, rel.etypes, min, max, source_var, edge_var, target_var,
+        ))
     }
 
     /// `OPTIONAL MATCH (a)-[:R]->(x)` — a LEFT-OUTER single hop from a bound `a`. If
@@ -3140,7 +3218,10 @@ impl Parser {
                     let key = self.ident()?;
                     self.field_chain(Expr::Prop { slot, key })
                 } else {
-                    Ok(Expr::Slot(slot))
+                    // A bare variable may still be subscripted (`x[0]` — a group
+                    // variable list), so route through `field_chain` (a no-op when
+                    // nothing follows).
+                    self.field_chain(Expr::Slot(slot))
                 }
             }
             other => Err(format!("expected an expression, got {other:?}")),
@@ -3159,12 +3240,20 @@ impl Parser {
                     key,
                 };
             } else if self.eat(&Tok::LBracket) {
-                // Subscript `base[index]` — a list element or a record/map field.
+                // Subscript `base[index]` — a list element or a record/map field. If
+                // the base is a group-variable list (`x[i]` / `e[i]`), tag the element
+                // kind so a following `.prop` resolves the node/edge property.
                 let index = self.expr()?;
                 self.expect(&Tok::RBracket)?;
+                let elem = match &base {
+                    Expr::Slot(s) if self.group_node_slots.contains(s) => crate::ir::ElemKind::Node,
+                    Expr::Slot(s) if self.group_edge_slots.contains(s) => crate::ir::ElemKind::Edge,
+                    _ => crate::ir::ElemKind::Plain,
+                };
                 base = Expr::Index {
                     base: Box::new(base),
                     index: Box::new(index),
+                    elem,
                 };
             } else {
                 break;

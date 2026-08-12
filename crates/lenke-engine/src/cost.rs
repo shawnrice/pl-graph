@@ -123,6 +123,13 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
             min,
             max,
             ..
+        }
+        | Plan::RepeatGroup {
+            input,
+            edge_label,
+            min,
+            max,
+            ..
         } => {
             let d = if unknown_edge(edge_label, store) {
                 0.0

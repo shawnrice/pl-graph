@@ -202,6 +202,33 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 c,
             )
         }
+        Plan::RepeatGroup {
+            input,
+            from,
+            dir,
+            edge_label,
+            min,
+            max,
+            mode,
+            endpoint_slot,
+            group_binds,
+        } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::RepeatGroup {
+                    input: Box::new(i),
+                    from,
+                    dir,
+                    edge_label,
+                    min,
+                    max,
+                    mode,
+                    endpoint_slot,
+                    group_binds,
+                },
+                c,
+            )
+        }
         Plan::ShortestPath {
             input,
             from,
@@ -989,7 +1016,7 @@ fn max_slot(expr: &Expr) -> Option<usize> {
             .iter()
             .fold(None, |acc, (_, e)| merge_max(acc, max_slot(e))),
         Expr::Field { base, .. } => max_slot(base),
-        Expr::Index { base, index } => merge_max(max_slot(base), max_slot(index)),
+        Expr::Index { base, index, .. } => merge_max(max_slot(base), max_slot(index)),
         Expr::Case {
             branches,
             otherwise,
@@ -1052,6 +1079,10 @@ fn width(plan: &Plan) -> usize {
         | Plan::ShortestPath { input, .. }
         | Plan::Branch { input, .. }
         | Plan::OptionalExpand { input, .. } => width(input) + 1,
+        // The endpoint column plus one list column per group variable.
+        Plan::RepeatGroup {
+            input, group_binds, ..
+        } => width(input) + 1 + group_binds.len(),
         Plan::Filter { input, .. }
         | Plan::OrderPage { input, .. }
         | Plan::Distinct { input }
@@ -1489,6 +1520,7 @@ mod tests {
             | Plan::OptionalExpand { input, .. }
             | Plan::IntervalExpand { input, .. }
             | Plan::VarLength { input, .. }
+            | Plan::RepeatGroup { input, .. }
             | Plan::ShortestPath { input, .. }
             | Plan::Aggregate { input, .. }
             | Plan::OrderPage { input, .. }

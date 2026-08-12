@@ -42,6 +42,29 @@ pub enum PathMode {
     Acyclic,
 }
 
+/// The position of a quantified subpath-group variable within its single-hop unit
+/// `((x)-[e]->(y)){…}` — which flat-path slice it collects across repetitions:
+/// `Source` = each rep's start node (`x`), `Target` = each rep's end node (`y`),
+/// `Edge` = each rep's edge (`e`). See `Plan::RepeatGroup`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupPos {
+    Source,
+    Edge,
+    Target,
+}
+
+/// Element typing for a subscript whose base is a group-variable LIST: a group node
+/// list (`x`/`y`) makes `x[i]` a node (so `x[i].prop` resolves the node property),
+/// an edge list (`e`) makes it an edge. `Plain` is an ordinary list/record subscript
+/// (the value at the index, untyped).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ElemKind {
+    #[default]
+    Plain,
+    Node,
+    Edge,
+}
+
 /// An expression over the current row. A row is a tuple of bound slots; `Slot(n)`
 /// is the value at slot `n`, and `Prop { slot, key }` reads a property off the
 /// element in that slot.
@@ -127,6 +150,9 @@ pub enum Expr {
     Index {
         base: Box<Expr>,
         index: Box<Expr>,
+        /// Element typing when `base` is a group-variable list — makes `x[i].prop`
+        /// resolve the node/edge property. `Plain` for an ordinary subscript.
+        elem: ElemKind,
     },
     /// `CAST(<expr> AS <TYPE>)`. The coercion itself lives in `value::cast` (the
     /// single home for the conversion table); a failed conversion throws
@@ -410,6 +436,25 @@ pub enum Plan {
         min: u32,
         max: u32,
         mode: PathMode,
+    },
+    /// A quantified subpath group `((x)-[e]->(y)){min,max}` that BINDS its inner
+    /// variables as GROUP variables — each becomes a LIST over the repetitions. Like
+    /// [`VarLength`] (same reachability to `endpoint_slot`), but also appends one
+    /// list column per entry of `group_binds` (a `(GroupPos, slot)`): the source
+    /// (`x`), edge (`e`), or target (`y`) value at each repetition. SINGLE-HOP unit
+    /// only (`k == 1`); multi-hop / nested groups are lowered elsewhere. The endpoint
+    /// column is appended FIRST (at `endpoint_slot`), then the group columns in
+    /// `group_binds` order.
+    RepeatGroup {
+        input: Box<Plan>,
+        from: usize,
+        dir: Dir,
+        edge_label: Vec<String>,
+        min: u32,
+        max: u32,
+        mode: PathMode,
+        endpoint_slot: usize,
+        group_binds: Vec<(GroupPos, usize)>,
     },
     /// Shortest-path reach: BFS from the element in `from` along `dir`/
     /// `edge_label`, emitting EACH reachable target once at its shortest distance

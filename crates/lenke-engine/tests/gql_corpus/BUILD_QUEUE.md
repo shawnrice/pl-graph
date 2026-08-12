@@ -267,7 +267,7 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 - **per-hop WHERE in a QUANTIFIED subpath group `((x)-[e:R]->(y) WHERE pred){n,m}`** (qsp*per_hop*\*,
   vqs_8, nested_per_rep) — the WHERE filters each repetition. Now that unquantified groups + the
   balanced-paren split exist, this extends the quantified path with a per-rep predicate in var_length. MEDIUM.
-- **THE BIG LEVER: group-variable-as-list `Plan::RepeatGroup`** (~21: qsp*group_vars*_, gv\__,
+- **THE BIG LEVER: group-variable-as-list `Plan::RepeatGroup`** (~21: qsp*group_vars*\_, gv\_\_,
   vqs_7/9/11/…) — each group var (x,e,y) binds to a Value::List across reps. Its own iteration.
   Expr::Index + var_length lineage (both done) are prereqs.
 - **uncorrelated multi-pattern EXISTS `EXISTS { MATCH (x:N) MATCH (y:M) }`** (exists_multi_match, 4) —
@@ -275,7 +275,7 @@ User directive: fix all remaining deferred items (they were deferred for effort,
   only), or a constant-EXISTS eval (body independent of the outer row → run once, broadcast). MEDIUM.
 - Smaller: shortest\_ / shortest_per_hop (SHORTEST k>=2), value_subquery_aggregate (3), multiseg_u (6),
   distinct_nan (string->NaN, murky/value-contract), num_string_overflow (value-contract, leave).
-- group_by_bound_1 done; order_by_letin_over_output_column = LET-IN-END _expression_ in ORDER BY (separate).
+- group*by_bound_1 done; order_by_letin_over_output_column = LET-IN-END \_expression* in ORDER BY (separate).
 
 ### ROUND 6 (cont.) — 169 -> 165 (session total 265 -> 165, 100 cases)
 
@@ -286,7 +286,7 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 
 ### NEXT (baseline 165) — remaining is dominated by a few LARGE features:
 
-- **THE BIG LEVER: group-variable-as-list `RepeatGroup`** (~21: vqs_ 12, qsp_group_vars 4, gv_*).
+- **THE BIG LEVER: group-variable-as-list `RepeatGroup`** (~21: vqs* 12, qsp_group_vars 4, gv*\*).
   DESIGN CONFIRMED: core binds each group var to a LIST across reps (pathfind.rs bind_group_vars_flat:
   for a k=1 single-hop group, source var x = [verts[rep] for rep], edge e = [edges[rep]], target y =
   [verts[rep+1]]). The engine's var_length lineage (node_stack/edge_stack per emitted path, already
@@ -297,12 +297,12 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 - **per-hop edge WHERE `-[e:R WHERE pred]->` in var-length AND shortest** (qsp_per_hop 3, per_hop_inline 2,
   shortest_per_hop 3, nested_per_hop 2) — thread a captured predicate into the varlen_dfs / shortest BFS
   adjacency step, evaluating with the hop's edge (and endpoints) bound. Recurring; unblocks ~10.
-- **SHORTEST k (k>=2)** (shortest_2_keeps_two, _group_all, _groups_synonym, shortest_k_clamps = 4;
+- **SHORTEST k (k>=2)** (shortest_2_keeps_two, \_group_all, \_groups_synonym, shortest_k_clamps = 4;
   shortest_k_per_hop_pred also needs per-hop WHERE). ALGORITHM CONFIRMED (core shortest_k_walk): enumerate
   ALL trails per endpoint, sort by (length, discovery), keep first k (plain) or all paths in the k smallest
   distinct lengths (GROUP/GROUPS). Needs trail enumeration (var_length DFS) + per-endpoint selection + lineage.
-- **VALUE scalar subquery / uncorrelated multi-pattern EXISTS** (value_subquery_* 5, exists_multi_match 4) —
-  VALUE { … RETURN count(*) } maps to CountSubquery for the correlated count case; general VALUE + uncorrelated
+- **VALUE scalar subquery / uncorrelated multi-pattern EXISTS** (value*subquery*_ 5, exists_multi_match 4) —
+  VALUE { … RETURN count(_) } maps to CountSubquery for the correlated count case; general VALUE + uncorrelated
   EXISTS need pull_body to run a Scan/cross-join body or a constant-subquery eval.
 - **multiseg_u (6)** — dual-anchor correlated multi-segment EXISTS (ReBAC). HARD.
 - VALUE-CONTRACT (leave/surface): range_bounded_2/3 (core caps range size — check if safe error-parity or
