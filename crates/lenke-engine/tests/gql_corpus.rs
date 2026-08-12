@@ -99,14 +99,15 @@ fn core_line_to_engine(line: &str) -> Option<String> {
             }
             out.insert("from".into(), obj.get("from").cloned().unwrap_or(J::Null));
             out.insert("to".into(), obj.get("to").cloned().unwrap_or(J::Null));
-            // core edge type is the (single) entry of `labels`; engine uses `type`.
-            let etype = obj
+            // An edge's type is its FIRST label; any further labels are secondary
+            // (multi-label edges). Pass the whole `labels` array through — the engine
+            // ndjson loader reads the first as the type and the rest as extras.
+            let labels = obj
                 .get("labels")
                 .and_then(J::as_array)
-                .and_then(|a| a.first())
                 .cloned()
-                .unwrap_or(J::String("".into()));
-            out.insert("type".into(), etype);
+                .unwrap_or_default();
+            out.insert("labels".into(), J::Array(labels));
             out.insert("props".into(), props);
             Some(J::Object(out).to_string())
         }

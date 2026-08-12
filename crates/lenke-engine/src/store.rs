@@ -483,6 +483,12 @@ pub struct Store {
     /// The reverse of an `Adj`'s `etype`, needed by `type(edge)` which has only an
     /// eid in hand, not an adjacency entry.
     edge_etype: Vec<u32>,
+    /// SECONDARY edge labels (eid -> the labels past the first), mirroring core's
+    /// `e_extra`. An edge's *type* is its first label (`edge_etype`); a multi-label
+    /// edge — `-[:X:Y]->` / an ndjson `"labels":["X","Y"]` — carries the rest here.
+    /// SPARSE: empty unless some edge has >1 label, so a single-label graph pays
+    /// nothing and `edge_has_label` stays the single `u32` compare it replaced.
+    edge_extra: HashMap<u32, Vec<u32>>,
     /// `(src, dst)` node ids per eid (indexed by eid; grows 1:1 with `next_eid` and
     /// never shrinks, like `edge_etype`). Lets an edge be rendered as core's
     /// `{id, from, to, labels, properties}` map from its eid alone, without scanning
@@ -1110,6 +1116,46 @@ impl Store {
         }
         self.record_change(Change::EdgeAdded(eid));
         eid
+    }
+
+    /// Attach SECONDARY labels to an edge (the labels past its first/type). Ingest
+    /// of a multi-label `"labels":[…]` edge calls this after `add_edge_with_id`;
+    /// `extra_names` is the label list with the first (already the edge type)
+    /// dropped. Names are interned like an edge type. A no-op for an empty list, so
+    /// a single-label graph never touches `edge_extra`.
+    pub fn set_edge_extra_labels(&mut self, eid: u32, extra_names: &[&str]) {
+        if extra_names.is_empty() {
+            return;
+        }
+        let ids: Vec<u32> = extra_names
+            .iter()
+            .map(|name| {
+                let next = self.etype_ids.len() as u32;
+                *self.etype_ids.entry((*name).to_string()).or_insert(next)
+            })
+            .collect();
+        self.edge_extra.insert(eid, ids);
+    }
+
+    /// Does edge `eid` carry label `tid`? Checks the primary type then, only when
+    /// some edge in the graph is multi-label, the secondary set. Mirrors core's
+    /// `edge_has_label`: the `is_empty` guard keeps a single-label graph at one
+    /// `u32` compare.
+    #[must_use]
+    pub fn edge_has_label(&self, eid: u32, tid: u32) -> bool {
+        self.edge_etype.get(eid as usize).is_some_and(|&t| t == tid)
+            || (!self.edge_extra.is_empty()
+                && self
+                    .edge_extra
+                    .get(&eid)
+                    .is_some_and(|extra| extra.contains(&tid)))
+    }
+
+    /// Whether ANY edge carries more than one label — lets an adjacency walk keep
+    /// its single-`u32`-compare fast path when no edge is multi-label.
+    #[must_use]
+    pub fn has_multi_label_edges(&self) -> bool {
+        !self.edge_extra.is_empty()
     }
 
     /// Create the opt-in edge-type index and build it from the current adjacency.
@@ -2327,6 +2373,7 @@ impl Builder {
             // Incremental edges continue the id sequence the build laid down.
             next_eid: edge_count,
             edge_etype: edge_etypes,
+            edge_extra: HashMap::new(),
             edge_ends,
             node_ext,
             edge_ext,

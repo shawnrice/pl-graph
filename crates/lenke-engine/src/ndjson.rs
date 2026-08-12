@@ -237,10 +237,17 @@ fn encode_string(out: &mut String, s: &str) {
 /// dump and STABLE from the first reload otherwise.
 pub fn from_ndjson(text: &str) -> Result<Store, String> {
     // Staged records: (external id, labels, props) and (from-id, to-id, edge id?,
-    // type, props). External ids are PRESERVED verbatim (no remap to fresh dense
-    // ids), so element_id / egress round-trip.
+    // labels, props) — an edge's first label is its type, the rest are secondary.
+    // External ids are PRESERVED verbatim (no remap to fresh dense ids), so
+    // element_id / egress round-trip.
     type NodeRec = (String, Vec<String>, Vec<(String, Value)>);
-    type EdgeRec = (String, String, Option<String>, String, Vec<(String, Value)>);
+    type EdgeRec = (
+        String,
+        String,
+        Option<String>,
+        Vec<String>,
+        Vec<(String, Value)>,
+    );
     let mut constraints: Vec<(String, Vec<String>)> = Vec::new();
     let mut required: Vec<(String, String)> = Vec::new();
     let mut nodes: Vec<NodeRec> = Vec::new();
@@ -274,9 +281,20 @@ pub fn from_ndjson(text: &str) -> Result<Store, String> {
             let from = json_id(req(&fields, "from").map_err(err)?).map_err(err)?;
             let to = json_id(req(&fields, "to").map_err(err)?).map_err(err)?;
             let edge_id = field(&fields, "id").map(json_id).transpose().map_err(err)?;
-            let etype = json_string(req(&fields, "type").map_err(err)?).map_err(err)?;
+            // An edge's type is its FIRST label; the rest are secondary labels
+            // (multi-label edges). Accept either the single-label `"type"` form or a
+            // `"labels":[…]` array (at least one entry required).
+            let labels: Vec<String> = if let Some(l) = field(&fields, "labels") {
+                let arr = json_str_array(l).map_err(err)?;
+                if arr.is_empty() {
+                    return Err(err("edge `labels` must have at least one entry".into()));
+                }
+                arr
+            } else {
+                vec![json_string(req(&fields, "type").map_err(err)?).map_err(err)?]
+            };
             let props = json_props(req(&fields, "props").map_err(err)?).map_err(err)?;
-            edges.push((from, to, edge_id, etype, props));
+            edges.push((from, to, edge_id, labels, props));
         } else if let Some(id) = field(&fields, "id") {
             let ext = json_id(id).map_err(err)?;
             let labels = json_str_array(req(&fields, "labels").map_err(err)?).map_err(err)?;
@@ -303,17 +321,22 @@ pub fn from_ndjson(text: &str) -> Result<Store, String> {
             props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
         store.add_node_with_id(&Arc::from(ext.as_str()), &lrefs, &prefs);
     }
-    for (from, to, edge_id, etype, props) in &edges {
+    for (from, to, edge_id, labels, props) in &edges {
         let f = store
             .node_by_ext(from)
             .ok_or_else(|| format!("edge references unknown node id {from}"))?;
         let t = store
             .node_by_ext(to)
             .ok_or_else(|| format!("edge references unknown node id {to}"))?;
+        let etype = &labels[0];
         let eid = match edge_id {
             Some(id) => store.add_edge_with_id(&Arc::from(id.as_str()), f, t, etype),
             None => store.add_edge(f, t, etype),
         };
+        if labels.len() > 1 {
+            let extra: Vec<&str> = labels[1..].iter().map(String::as_str).collect();
+            store.set_edge_extra_labels(eid, &extra);
+        }
         for (k, v) in props {
             store.set_edge_prop(eid, k, v.clone());
         }

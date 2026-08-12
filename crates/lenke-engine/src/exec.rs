@@ -2597,6 +2597,18 @@ fn want_etypes(store: &Store, edge_label: &[String]) -> Result<Vec<u32>, ()> {
     Ok(ids)
 }
 
+/// Does adjacency entry `a` carry one of the `want` labels? Empty `want` = any
+/// edge. Checks the primary type (`a.etype`, already in a register) then, only on a
+/// multi-label graph, the eid's secondary set. The one predicate every edge-type
+/// filter shares, so a `:Y` hop over a multi-label edge matches everywhere.
+#[inline]
+fn edge_carries_wanted(store: &Store, a: &crate::store::Adj, want: &[u32]) -> bool {
+    want.is_empty()
+        || want.iter().any(|&w| {
+            w == a.etype || (store.has_multi_label_edges() && store.edge_has_label(a.eid, w))
+        })
+}
+
 fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: &[u32], mut f: impl FnMut(u32, u32)) {
     // An undirected walk reaches a self-loop from BOTH the out- and the in-index;
     // emit it once (from the out-side) by dropping its in-side copy. Directed walks
@@ -2606,8 +2618,12 @@ fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: &[u32], mut f: impl FnMut
     // (O(matching), not O(degree)) — the whole point of the opt-in edge-type index.
     // A disjunction (`want.len() >= 2`) must NOT union buckets: that reorders vs the
     // flat stored-order scan and would break byte-identity, so it falls through.
+    // The type-index bucket keys on an edge's PRIMARY label only, so it cannot see
+    // a `:Y` match on a multi-label edge whose first label is `X`. Skip it whenever
+    // the graph has any multi-label edge (rare) and fall to the flat scan below,
+    // which consults the secondary labels.
     if let [w] = want {
-        if store.has_edge_type_index() {
+        if store.has_edge_type_index() && !store.has_multi_label_edges() {
             if matches!(dir, Dir::Out | Dir::Both) {
                 for a in store.out_typed(v, *w) {
                     f(a.nbr, a.eid);
@@ -2623,18 +2639,26 @@ fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: &[u32], mut f: impl FnMut
             return;
         }
     }
-    // Empty `want` = any type; otherwise the edge's type must be in the set.
-    let type_ok = |et: u32| want.is_empty() || want.contains(&et);
+    // Empty `want` = any type; otherwise the edge must carry one of the wanted
+    // labels. `edge_has_label` checks the primary type (already in `a.etype`) then,
+    // only when the graph has multi-label edges, the eid's secondary set.
+    let has_extra = store.has_multi_label_edges();
+    let type_ok = |et: u32, eid: u32| {
+        want.is_empty()
+            || want
+                .iter()
+                .any(|&w| w == et || (has_extra && store.edge_has_label(eid, w)))
+    };
     if matches!(dir, Dir::Out | Dir::Both) {
         for a in store.out(v) {
-            if type_ok(a.etype) {
+            if type_ok(a.etype, a.eid) {
                 f(a.nbr, a.eid);
             }
         }
     }
     if matches!(dir, Dir::In | Dir::Both) {
         for a in store.inc(v) {
-            if type_ok(a.etype) && !(drop_loop && a.nbr == v) {
+            if type_ok(a.etype, a.eid) && !(drop_loop && a.nbr == v) {
                 f(a.nbr, a.eid);
             }
         }
@@ -3115,14 +3139,14 @@ fn try_varlen_count(
                     store
                         .out(v as u32)
                         .iter()
-                        .filter(|a| want.contains(&a.etype))
+                        .filter(|a| edge_carries_wanted(store, a, &want))
                         .count() as u64
                 };
             }
             let mut total: u64 = 0;
             for &s in src {
                 for a in store.out(s) {
-                    if !want.is_empty() && !want.contains(&a.etype) {
+                    if !edge_carries_wanted(store, a, &want) {
                         continue;
                     }
                     if *min <= 1 {
@@ -3200,7 +3224,13 @@ fn varlen_count_dfs(
         .map(|a| (false, a))
         .chain(inc.iter().map(|a| (true, a)))
     {
-        if !want.is_empty() && !want.contains(&a.etype) {
+        // The edge must carry a wanted label — its primary type (`a.etype`) or, on
+        // a multi-label graph, a secondary one (`edge_has_label`).
+        if !want.is_empty()
+            && !want.iter().any(|&w| {
+                w == a.etype || (store.has_multi_label_edges() && store.edge_has_label(a.eid, w))
+            })
+        {
             continue;
         }
         if is_inc && drop_loop && a.nbr == v {
@@ -3421,7 +3451,13 @@ fn varlen_agg_dfs(
         .map(|a| (false, a))
         .chain(inc.iter().map(|a| (true, a)))
     {
-        if !want.is_empty() && !want.contains(&a.etype) {
+        // The edge must carry a wanted label — its primary type (`a.etype`) or, on
+        // a multi-label graph, a secondary one (`edge_has_label`).
+        if !want.is_empty()
+            && !want.iter().any(|&w| {
+                w == a.etype || (store.has_multi_label_edges() && store.edge_has_label(a.eid, w))
+            })
+        {
             continue;
         }
         if is_inc && drop_loop && a.nbr == v {
@@ -4337,8 +4373,9 @@ fn try_3hop_product_count(
     }
     let (w1, w2, w3) = (&wants[0], &wants[1], &wants[2]);
     let nc = store.node_count();
-    // Empty want = any type; else the edge type must be in the hop's set.
-    let hit = |a: &crate::store::Adj, w: &[u32]| w.is_empty() || w.contains(&a.etype);
+    // Empty want = any type; else the edge must carry one of the hop's labels
+    // (primary or, on a multi-label graph, secondary).
+    let hit = |a: &crate::store::Adj, w: &[u32]| edge_carries_wanted(store, a, w);
 
     // level1[b] = number of hop-1 edges from a SOURCE into b (= counts after 1 hop).
     let mut level1 = vec![0u64; nc];
@@ -4916,7 +4953,13 @@ fn varlen_dfs(
         .map(|a| (false, a))
         .chain(inc.iter().map(|a| (true, a)))
     {
-        if !want.is_empty() && !want.contains(&a.etype) {
+        // The edge must carry a wanted label — its primary type (`a.etype`) or, on
+        // a multi-label graph, a secondary one (`edge_has_label`).
+        if !want.is_empty()
+            && !want.iter().any(|&w| {
+                w == a.etype || (store.has_multi_label_edges() && store.edge_has_label(a.eid, w))
+            })
+        {
             continue;
         }
         if is_inc && drop_loop && a.nbr == v {
@@ -5024,7 +5067,7 @@ fn shortest_path(
                 adjs.extend_from_slice(store.inc(v));
             }
             for a in adjs {
-                if !want.is_empty() && !want.contains(&a.etype) {
+                if !edge_carries_wanted(store, &a, &want) {
                     continue;
                 }
                 match dist.get(&a.nbr).copied() {
@@ -8226,6 +8269,52 @@ mod tests {
             val("edges(p)[1].w > edges(p)[0].w"),
             Value::Bool(true)
         ));
+    }
+
+    /// Multi-label edges: an edge's type is its FIRST label; the rest are secondary
+    /// labels a `-[:label]->` hop must still match. `a-[:X,:Y]->b`, `a-[:Y]->c`.
+    #[test]
+    fn multi_label_edge_matching() {
+        // a -r0[X,Y]-> b ; a -r1[Y]-> c ; b -r2[Z,Y]-> c
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"id\":\"r0\",\"from\":\"a\",\"to\":\"b\",\"labels\":[\"X\",\"Y\"],\"props\":{}}\n",
+            "{\"id\":\"r1\",\"from\":\"a\",\"to\":\"c\",\"labels\":[\"Y\"],\"props\":{}}\n",
+            "{\"id\":\"r2\",\"from\":\"b\",\"to\":\"c\",\"labels\":[\"Z\",\"Y\"],\"props\":{}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        assert!(store.has_multi_label_edges());
+        let ids = |q: &str| -> Vec<String> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            let mut v = names_of(&run(&plan, &store), 0);
+            v.sort();
+            v
+        };
+        // `:Y` reaches every edge (all three carry Y, two only as a secondary label).
+        assert_eq!(
+            ids("MATCH (a:N)-[:Y]->(b) RETURN b.id AS x"),
+            vec!["b", "c", "c"]
+        );
+        // `:X` only r0 (its primary), `:Z` only r2 (its primary).
+        assert_eq!(ids("MATCH (a:N)-[:X]->(b) RETURN b.id AS x"), vec!["b"]);
+        assert_eq!(ids("MATCH (a:N)-[:Z]->(b) RETURN b.id AS x"), vec!["c"]);
+        // A var-length `:Y` hop crosses secondary-label edges too: a-Y->b-Y->c.
+        assert!(
+            ids("MATCH (a:N {id:'a'})-[:Y]->{2}(b) RETURN b.id AS x").contains(&"c".to_string())
+        );
+        // type(edge) is the FIRST label, not a secondary one.
+        let ty = |q: &str| -> Vec<String> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            let mut v = names_of(&run(&plan, &store), 0);
+            v.sort();
+            v
+        };
+        assert_eq!(
+            ty("MATCH (a:N)-[e:Y]->(b) RETURN type(e) AS t"),
+            vec!["X", "Y", "Z"]
+        );
     }
 
     /// String (K10) and list/element (K11) functions match hand-computed values.
