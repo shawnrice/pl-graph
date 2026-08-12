@@ -6,7 +6,6 @@ hardening.jsonl::h_bool_times_number_raises_data_exception
 hardening.jsonl::h_rejects_literal_overflowing_exponent
 hardening.jsonl::h_rejects_literal_oversized_integer_literal
 hardening.jsonl::h_string_plus_number_raises_data_exception
-language.jsonl::m_edge_label_negation
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_1
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_2
 tests_b.jsonl::avg_duration_errors

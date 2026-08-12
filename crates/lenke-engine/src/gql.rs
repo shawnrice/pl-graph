@@ -3228,11 +3228,27 @@ impl Parser {
         // accepted here, to avoid a silent result divergence.)
         // `:Type` with an optional `|`-disjunction (`:A|B|C`) — an edge matches if
         // its type is ANY of them. Empty = untyped (any type).
+        // A leading `!` NEGATES the type set (`:!T` / `:!(A|B|C)`) — the hop matches
+        // any edge whose type is NOT one of the named ones. Encoded as a "!" sentinel
+        // first element, which `want_etypes` resolves to the complement id set.
         let mut etypes = Vec::new();
         if self.eat(&Tok::Colon) {
-            etypes.push(self.ident()?);
-            while self.eat(&Tok::Pipe) {
+            if self.eat(&Tok::Bang) {
+                etypes.push("!".to_string());
+                if self.eat(&Tok::LParen) {
+                    etypes.push(self.ident()?);
+                    while self.eat(&Tok::Pipe) {
+                        etypes.push(self.ident()?);
+                    }
+                    self.expect(&Tok::RParen)?;
+                } else {
+                    etypes.push(self.ident()?);
+                }
+            } else {
                 etypes.push(self.ident()?);
+                while self.eat(&Tok::Pipe) {
+                    etypes.push(self.ident()?);
+                }
             }
         }
         let props = if matches!(self.peek(), Some(Tok::LBrace)) {

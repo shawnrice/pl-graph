@@ -626,6 +626,13 @@ impl Store {
         self.etype_ids.get(name).copied()
     }
 
+    /// Every interned edge-type id — the universe an edge-label NEGATION (`-[:!T]->`)
+    /// complements against. Order is unspecified (a membership set for the caller).
+    #[must_use]
+    pub fn all_etype_ids(&self) -> Vec<u32> {
+        self.etype_ids.values().copied().collect()
+    }
+
     /// A node's outgoing adjacency.
     #[must_use]
     pub fn out(&self, node: u32) -> &[Adj] {

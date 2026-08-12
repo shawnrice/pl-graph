@@ -2709,6 +2709,26 @@ fn want_etypes(store: &Store, edge_label: &[String]) -> Result<Vec<u32>, ()> {
     if edge_label.is_empty() {
         return Ok(Vec::new());
     }
+    // A leading "!" sentinel marks a NEGATED label set (`-[:!T]->` / `-[:!(A|B)]->`):
+    // the hop matches any edge whose type is NOT one of the named ones. Resolve to the
+    // COMPLEMENT id set so every downstream membership check is unchanged. An unknown
+    // named type contributes nothing to exclude; if the complement is empty (every
+    // type excluded) the hop matches nothing (`Err`).
+    if edge_label[0] == "!" {
+        let excluded: Vec<u32> = edge_label[1..]
+            .iter()
+            .filter_map(|n| store.etype_id(n))
+            .collect();
+        let complement: Vec<u32> = store
+            .all_etype_ids()
+            .into_iter()
+            .filter(|id| !excluded.contains(id))
+            .collect();
+        if complement.is_empty() {
+            return Err(());
+        }
+        return Ok(complement);
+    }
     let ids: Vec<u32> = edge_label
         .iter()
         .filter_map(|n| store.etype_id(n))
@@ -9211,6 +9231,43 @@ mod tests {
         assert_eq!(
             ty("MATCH (a:N)-[e:Y]->(b) RETURN type(e) AS t"),
             vec!["X", "Y", "Z"]
+        );
+    }
+
+    /// Edge-label NEGATION `-[:!T]->` matches any edge whose type is NOT `T` (the
+    /// complement of the named types), and `:!(A|B)` negates a disjunction.
+    #[test]
+    fn edge_label_negation() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"P\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"P\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"P\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"id\":\"s\",\"labels\":[\"P\"],\"props\":{\"id\":\"s\"}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"KNOWS\"],\"props\":{}}\n",
+            "{\"from\":\"a\",\"to\":\"c\",\"labels\":[\"CREATED\"],\"props\":{}}\n",
+            "{\"from\":\"a\",\"to\":\"s\",\"labels\":[\"LIKES\"],\"props\":{}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let ids = |q: &str| -> Vec<String> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            let mut v = names_of(&run(&plan, &store), 0);
+            v.sort();
+            v
+        };
+        // NOT CREATED → the KNOWS and LIKES targets.
+        assert_eq!(
+            ids("MATCH (a:P {id:'a'})-[:!CREATED]->(x) RETURN x.id AS x"),
+            vec!["b", "s"]
+        );
+        // NOT (CREATED|LIKES) → only the KNOWS target.
+        assert_eq!(
+            ids("MATCH (a:P {id:'a'})-[:!(CREATED|LIKES)]->(x) RETURN x.id AS x"),
+            vec!["b"]
+        );
+        // A negated unknown type excludes nothing → every out-edge.
+        assert_eq!(
+            ids("MATCH (a:P {id:'a'})-[:!NOSUCH]->(x) RETURN x.id AS x"),
+            vec!["b", "c", "s"]
         );
     }
 
