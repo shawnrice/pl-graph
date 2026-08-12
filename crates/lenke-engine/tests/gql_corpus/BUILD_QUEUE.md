@@ -247,3 +247,32 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 - Smaller: order_alias (4, NULLS FIRST / DISTINCT+ORDER-BY-underlying-expr), distinct_nan (3),
   group_by_bound (3, LET/WITH bound name + GROUP BY), exists_multi_match (4, EXISTS{ MATCH MATCH }).
 - VALUE-CONTRACT (surface, don't flip): num_string_overflow, sum/avg-over-temporal, oversized-int, CAST-throws.
+
+### ROUND 6 (cont.) — 190 -> 169
+
+- **GROUP BY after RETURN — DONE** (commit 4c5c5186, 190->183, 7 cases). project_and_page now
+  consumes an explicit GROUP BY (was SELECT-only); non-agg items are the implicit keys.
+- **ORDER BY alias before NULLS + by a projected expr — DONE** (commit 22fe08fb, 183->181, 2).
+  Added NULLS to the bare-alias terminator set; an ORDER BY expr equal to a projected item's
+  expr sorts by that output column (composes with DISTINCT).
+- **LET binding clause — DONE** (commit 53c20335, 181->178, 3). ISO additive-binding clause
+  `LET name = expr [,…]` (distinct from the LET…IN…END expression): projects existing bindings
+  forward + adds new ones.
+- **Unquantified subpath group `(( pattern WHERE ))` — DONE** (commit 2539be58, 178->169, 9).
+  Balanced-paren lookahead splits quantified (var_length) from unquantified (scoping paren →
+  inline inner pattern + trailing WHERE). Named path over an unquantified group rejected (core does).
+
+### NEXT (baseline 169), tractable -> hard:
+
+- **per-hop WHERE in a QUANTIFIED subpath group `((x)-[e:R]->(y) WHERE pred){n,m}`** (qsp_per_hop_*,
+  vqs_8, nested_per_rep) — the WHERE filters each repetition. Now that unquantified groups + the
+  balanced-paren split exist, this extends the quantified path with a per-rep predicate in var_length. MEDIUM.
+- **THE BIG LEVER: group-variable-as-list `Plan::RepeatGroup`** (~21: qsp_group_vars_*, gv_*,
+  vqs_7/9/11/…) — each group var (x,e,y) binds to a Value::List across reps. Its own iteration.
+  Expr::Index + var_length lineage (both done) are prereqs.
+- **uncorrelated multi-pattern EXISTS `EXISTS { MATCH (x:N) MATCH (y:M) }`** (exists_multi_match, 4) —
+  needs pull_body to support a Scan/cross-join body (currently Row/Expand/VarLength/Filter/Project
+  only), or a constant-EXISTS eval (body independent of the outer row → run once, broadcast). MEDIUM.
+- Smaller: shortest_ / shortest_per_hop (SHORTEST k>=2), value_subquery_aggregate (3), multiseg_u (6),
+  distinct_nan (string->NaN, murky/value-contract), num_string_overflow (value-contract, leave).
+- group_by_bound_1 done; order_by_letin_over_output_column = LET-IN-END *expression* in ORDER BY (separate).
