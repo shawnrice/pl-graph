@@ -571,10 +571,22 @@ Nested is now DEFAULT fuzz coverage (`Caps::supported() == all`). Fuzzer-found +
 shipped constructs along the way (round 9): shortest `->+(t)` source-cycle (cleared
 any_shortest_plus_seed_cycle_len), and the unknown-edge-type zero-rep source for shortest/group.
 
-REMAINING FEATURE (2, each its own structural extension):
+### ROUND 11 — the last two feature cases; corpus at its value-contract FLOOR (42 -> 40)
 
-- nested_quant_ends_3 — a MULTI-SEGMENT inner unit (`( ()-[:R]->()-[:R]->{1,2}() ){1}`): the outer body is
-  [Hop, Sub], not a single Sub. Needs a general multi-element GUnit matcher (match_seq over outer elems).
-- for_drives_batch_optional_match — FOR-driven fresh-var OPTIONAL MATCH: correlated inline-prop EXPRESSIONs
-  (props() takes only literals) + a left-outer correlated node scan.
-  Plus the deferred empty-inner-rep `{0,n}` epsilon-closure (fuzzer's nested inner is min>=1).
+- nested_quant_ends_3 (multi-segment inner) — generalized `nested_group` to an OUTER unit with an arbitrary
+  element SEQUENCE (`seq` walks Hop/Sub in order, levels tagged per element position); the parser parses the
+  body into a Seg skeleton (`<node> (<rel> [quant] <node>)+`) and assigns slots endpoint-first with per-element
+  depths. Families 3/4 fold into this one path. Multi-segment added to the fuzzer (family 5), FUZZ_HARD green.
+- for_drives_batch_optional_match — `Plan::OptionalScan` (a left-outer correlated node lookup) + a manual
+  OPTIONAL MATCH node parse so inline props may be EXPRESSIONS (`{name: name}`). Fresh var + label + no rel →
+  OptionalScan; bound var + hop → OptionalExpand (unchanged).
+
+**DONE — every buildable feature gap is cleared.** The corpus is at its principled FLOOR: all 40 remaining
+divergences are INTENTIONAL value-contract (leave baselined): hardening arithmetic (bool*num / str+num /
+oversized-int / overflow-exponent), reserved words, sum/avg-over-temporal + mixed, CALL-config errors, strict
+CAST (bool/list/int_null), malformed/oversized num, date_part strict, distinct-NaN, faulting-aggregate, inline
+constraints, num_string_overflow, range caps, temporal_duration (core lacks duration ordering), zero_bound_3
+(core treats {0,0} as {0,1} — engine's 4 is ISO-correct). Session: 265 -> 40 (225 cases cleared).
+
+Only known non-corpus deferral: an EMPTY inner rep `{0,n}` in a nested group (core's epsilon-cycle closure) —
+the fuzzer's nested inner is min>=1; no corpus case needs it.
