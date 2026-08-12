@@ -221,6 +221,13 @@ pub enum Expr {
         scalar: Box<Expr>,
         outer_width: usize,
     },
+    /// `EXISTS { … }` whose body references NO outer variable — an UNCORRELATED
+    /// existence check (`EXISTS { MATCH (x:N) MATCH (y:M) }`). The body is a
+    /// self-contained plan (scans, cross-joins, filters); it is run once and the
+    /// same boolean (non-empty?) is broadcast to every outer row.
+    UncorrelatedExists {
+        body: Box<Plan>,
+    },
     /// `needle IN haystack` where `haystack` is a dynamic (non-literal) list
     /// expression (a list property, a param, a function result). A literal
     /// `x IN [a, b]` desugars to an OR-chain at parse time instead; this is the

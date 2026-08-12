@@ -85,10 +85,6 @@ tests_e.jsonl::count_multi_match
 tests_e.jsonl::date_part_bare_name_unknown_fn
 tests_e.jsonl::date_part_rejects_number
 tests_e.jsonl::date_part_rejects_string
-tests_e.jsonl::exists_multi_match_false
-tests_e.jsonl::exists_multi_match_true
-tests_e.jsonl::exists_multi_match_where_false
-tests_e.jsonl::exists_multi_match_where_true
 tests_e.jsonl::graph_pred_all_different_and_same_1
 tests_e.jsonl::graph_pred_all_different_and_same_2
 tests_e.jsonl::graph_pred_is_directed

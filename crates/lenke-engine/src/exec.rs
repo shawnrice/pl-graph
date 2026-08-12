@@ -728,7 +728,8 @@ fn needs_lineage(plan: &Plan) -> bool {
             | Expr::PropertyExists { .. }
             | Expr::Exists { .. }
             | Expr::CountSubquery { .. }
-            | Expr::ScalarSubquery { .. } => false,
+            | Expr::ScalarSubquery { .. }
+            | Expr::UncorrelatedExists { .. } => false,
         }
     }
     match plan {
@@ -4661,7 +4662,10 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         // An EXISTS correlates on outer slots below `outer_width`; conservatively
         // treat it as touching more than one, so it never rides the frontier-only
         // aggregate fast path.
-        Expr::Exists { .. } | Expr::CountSubquery { .. } | Expr::ScalarSubquery { .. } => false,
+        Expr::Exists { .. }
+        | Expr::CountSubquery { .. }
+        | Expr::ScalarSubquery { .. }
+        | Expr::UncorrelatedExists { .. } => false,
     }
 }
 
@@ -4751,9 +4755,10 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         },
         // Never reached: `refs_only_slot` rejects EXISTS, so the frontier remap
         // that calls this is never handed one. Clone rather than rewrite a body.
-        Expr::Exists { .. } | Expr::CountSubquery { .. } | Expr::ScalarSubquery { .. } => {
-            expr.clone()
-        }
+        Expr::Exists { .. }
+        | Expr::CountSubquery { .. }
+        | Expr::ScalarSubquery { .. }
+        | Expr::UncorrelatedExists { .. } => expr.clone(),
     }
 }
 
@@ -6659,6 +6664,12 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 }
             }
             Col::Gen(out)
+        }
+        Expr::UncorrelatedExists { body } => {
+            // The body references no outer variable — run it ONCE (a self-contained
+            // scan/join/filter plan) and broadcast whether it produced any row.
+            let exists = pull(body, store, false)?.rows() > 0;
+            Col::Bool(vec![exists; batch.rows()])
         }
     })
 }
@@ -8942,6 +8953,33 @@ mod tests {
             ids("MATCH (b:N {id:'b'})-[:R {amt:20.0}]->{1,3}(x) RETURN x.id AS id"),
             vec!["c"]
         );
+    }
+
+    /// An uncorrelated multi-pattern EXISTS `EXISTS { MATCH (x:N) MATCH (y:M) }` is a
+    /// self-contained cross-join existence check, run once and broadcast.
+    #[test]
+    fn uncorrelated_multi_match_exists() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"M\"],\"props\":{\"id\":\"b\"}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let b = |q: &str| -> bool {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            matches!(run(&plan, &store).rows[0][0], Value::Bool(true))
+        };
+        // N and M both non-empty → true.
+        assert!(b("RETURN EXISTS { MATCH (x:N) MATCH (y:M) } AS e"));
+        // Z is empty → the cross-join is empty → false.
+        assert!(!b("RETURN EXISTS { MATCH (x:N) MATCH (y:Z) } AS e"));
+        // Per-clause WHERE: x.id='a' and y.id='b' both match → true.
+        assert!(b(
+            "RETURN EXISTS { MATCH (x:N) WHERE x.id='a' MATCH (y:M) WHERE y.id='b' } AS e"
+        ));
+        // y.id='nope' matches nothing → false.
+        assert!(!b(
+            "RETURN EXISTS { MATCH (x:N) WHERE x.id='a' MATCH (y:M) WHERE y.id='nope' } AS e"
+        ));
     }
 
     /// A correlated scalar VALUE subquery returns the body's single value per outer

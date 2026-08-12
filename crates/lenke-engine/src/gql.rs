@@ -3474,12 +3474,90 @@ impl Parser {
     // already bound in the outer scope (the correlation), and the body extends
     // from it. A trailing WHERE is a sub-pattern predicate over the body scope.
     fn exists_expr(&mut self) -> Result<Expr, String> {
+        // An UNCORRELATED body (references no outer variable) is a self-contained
+        // existence check — `EXISTS { MATCH (x:N) MATCH (y:M) }` — run once.
+        if self.subquery_is_uncorrelated() {
+            let (body, _, _) = self.parse_uncorrelated_subquery_body()?;
+            self.expect(&Tok::RBrace)?;
+            return Ok(Expr::UncorrelatedExists {
+                body: Box::new(body),
+            });
+        }
         let (body, outer_width, _, _) = self.correlated_subquery_body("EXISTS")?;
         self.expect(&Tok::RBrace)?;
         Ok(Expr::Exists {
             body: Box::new(body),
             outer_width,
         })
+    }
+
+    /// True when the subquery body at `self.pos` (a `{`) references NO variable bound
+    /// in the OUTER scope — i.e. it is self-contained (uncorrelated). Scans the
+    /// balanced-brace body for any identifier that names an outer binding.
+    fn subquery_is_uncorrelated(&self) -> bool {
+        let mut depth = 0usize;
+        let mut i = self.pos;
+        while let Some(t) = self.toks.get(i) {
+            match t {
+                Tok::LBrace => depth += 1,
+                Tok::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return true;
+                    }
+                }
+                Tok::Ident(s) if self.scope.contains_key(s) => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// Parse the body of an UNCORRELATED subquery — `{ [MATCH <pattern> [WHERE]]* }`,
+    /// one or more MATCH clauses cross-joined (a shared variable becomes a join key),
+    /// or an empty body (`Plan::Row`, for a `RETURN`-only VALUE). The opening `{` is
+    /// consumed; the trailing `RETURN`/`}` are left to the caller. Parsed in a FRESH
+    /// scope; the outer scope is RESTORED before returning, and the body's own scope
+    /// and width are returned so a VALUE caller can parse a scalar RETURN against them.
+    fn parse_uncorrelated_subquery_body(
+        &mut self,
+    ) -> Result<(Plan, HashMap<String, usize>, usize), String> {
+        self.expect(&Tok::LBrace)?;
+        // A parse error aborts the whole parse, so the outer scope need only be
+        // restored on the success path.
+        let outer_scope = self.scope.clone();
+        let outer_slots = self.slots;
+        let mut scope: HashMap<String, usize> = HashMap::new();
+        let mut slots = 0usize;
+        let mut plan = Plan::Row; // a RETURN-only body projects over one unit row
+        if self.peek_kw("MATCH") || matches!(self.peek(), Some(Tok::LParen)) {
+            self.eat_kw("MATCH");
+            self.scope = HashMap::new();
+            self.slots = 0;
+            plan = self.match_body()?;
+            scope = std::mem::take(&mut self.scope);
+            slots = self.slots;
+            while self.eat_kw("MATCH") {
+                self.scope = HashMap::new();
+                self.slots = 0;
+                let p2 = self.match_body()?;
+                let s2 = std::mem::take(&mut self.scope);
+                let k2 = self.slots;
+                let on: Vec<(usize, usize)> = s2
+                    .iter()
+                    .filter_map(|(v, &r)| scope.get(v).map(|&l| (l, r)))
+                    .collect();
+                plan = Plan::join(plan, p2, on);
+                for (v, &r) in &s2 {
+                    scope.entry(v.clone()).or_insert(slots + r);
+                }
+                slots += k2;
+            }
+        }
+        self.scope = outer_scope;
+        self.slots = outer_slots;
+        Ok((plan, scope, slots))
     }
 
     // count_subquery := COUNT '{' node ( rel [quant] node )* [WHERE pred] '}' — the
@@ -4463,14 +4541,13 @@ mod tests {
     }
 
     #[test]
-    fn exists_from_unbound_variable_errors() {
-        // The correlated variable must be a bound endpoint — a fully-fresh scan
-        // inside EXISTS (NEITHER endpoint bound) is not this construct.
-        let err = super::parse(
+    fn exists_uncorrelated_body_is_accepted() {
+        // An EXISTS body that binds NEITHER endpoint to an outer variable is a valid
+        // UNCORRELATED existence check (run once) — not an error.
+        assert!(super::parse(
             "MATCH (p:Person) WHERE EXISTS { (z)-[:KNOWS]->(x) } RETURN p.name AS name",
         )
-        .unwrap_err();
-        assert!(err.contains("in scope"), "got: {err}");
+        .is_ok());
     }
 
     #[test]
