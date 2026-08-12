@@ -331,3 +331,28 @@ User directive: fix all remaining deferred items (they were deferred for effort,
   length, keep first k / k length-groups). **per-hop edge WHERE** (~8) — thread predicate into varlen/shortest.
 - **VALUE scalar subquery / uncorrelated multi-pattern EXISTS** (9). **multiseg_u** (6, dual-anchor, HARD).
 - VALUE-CONTRACT (leave/surface): range_bounded, num_string_overflow, distinct_nan, sum/avg-over-temporal, CAST.
+
+### ROUND 6 (cont.) — 150 -> 146 (session total 265 -> 146, 119 cases)
+
+- **SHORTEST k (k>=2) selector — DONE** (commit 49e17341, 150->146, 4 cases). New
+  ShortestSelector::ShortestK{k,group}; shortest_k_path enumerates all TRAILS per source (collect_trails,
+  edge-dedup bounds depth), groups by endpoint, sorts by (length,discovery), keeps first k or k distinct
+  length-groups (mirrors core shortest_k_walk). Endpoint filter stays a Filter above.
+
+### NEXT (baseline 146) — the remaining are the hard/nested tail:
+
+- **per-rep WHERE in a group `((x)-[e]->(y) WHERE pred){n,m}`** (qsp_group_vars_where_scalar,
+  qsp_per_hop_*, vqs_8, nested_per_rep) — per-repetition predicate over the rep's SCALAR x/e/y; needs
+  per-rep scalar slots + eval a captured predicate per hop in the RepeatGroup/var_length DFS (build a
+  1-row batch with x=Col::Nodes([v]), e=Col::Edges([eid]), y=Col::Nodes([nbr]) and eval). MEDIUM-HARD.
+- **inline edge props on a plain var-length `-[:R {amt:20.0}]->{n,m}`** (per_hop_inline_from_a/b) — each
+  edge must match; needs an edge-prop filter threaded into var_length (VarLength has no such field — add
+  one or a per-hop predicate). Overlaps per-rep WHERE (edge-only case). 2 cases.
+- **multi-hop group unit k>1** (gv_bind_each_rep_2hop), **nested groups** (vqs_16, nested_paren_varying,
+  nested_outer_gv, nested_quant_ends), **WITH-carry of a group list** (gv_carry_through_with) — DEFER-hard.
+- **VALUE scalar subquery / uncorrelated multi-pattern EXISTS** (value_subquery_* 5, exists_multi_match 4)
+  — VALUE {…RETURN count(*)} ~ CountSubquery for the correlated case; general VALUE + uncorrelated EXISTS
+  need pull_body to run a Scan/cross-join body or a constant-subquery eval. MEDIUM.
+- **multiseg_u (6)** — dual-anchor correlated multi-segment EXISTS (ReBAC). HARD.
+- VALUE-CONTRACT (leave/surface): range_bounded_2/3, num_string_overflow, distinct_nan (string->NaN),
+  sum/avg-over-temporal, CAST-throws, m_reserved_word (reserved-word-as-identifier = intentional).
