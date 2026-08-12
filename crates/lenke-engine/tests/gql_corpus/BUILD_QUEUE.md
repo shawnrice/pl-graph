@@ -424,3 +424,25 @@ ShortestK + collect_trails (trail enumeration), var_length lineage (node/edge st
 
 Infra in place: RepeatGroup (group_binds + per_rep_pred), Expr::Index.elem, ShortestK + collect_trails +
 edge_pred, var_length lineage, multi-label edges. When only value-contract + genuinely-hard remain, STOP with a summary.
+
+### ROUND 6 (cont.) — 134 -> 132 (session total 265 -> 132, 133 cases)
+
+- **VALUE { … RETURN count(*) } correlated subquery — DONE** (commit 014d0fd0, 134->132, 2 cases).
+  correlated_subquery_body gained a count_return flag; VALUE consumes the trailing RETURN count(*) and
+  lowers to CountSubquery (same as COUNT { … }). General VALUE (scalar RETURN / uncorrelated / constant) deferred.
+
+### NEXT (baseline 132) — remaining tractable-ish, then hard:
+
+- **multi-hop group unit k>1 `((x)-[e1]->(m)-[e2]->(y)){n}`** (gv_bind_each_rep_2hop, qsp_multi_ends/cross ~4) —
+  parser must accept a multi-hop group body (currently rejects), bind per-position vars, and the executor
+  must materialize with stride k (verts[rep*k+p]) and only emit endpoints at rep boundaries (len % k == 0).
+  RepeatGroup is single-hop; this needs a k field + DFS emit-gating. MEDIUM-HARD.
+- **general VALUE scalar subquery / uncorrelated multi-pattern EXISTS** (value_subquery_correlated_scalar,
+  _global, _constant, _where_narrows, exists_multi_match ~4, exists_bound_a) — need a scalar-subquery
+  evaluator returning the body's single value, AND pull_body to run a Scan/cross-join / multi-MATCH body
+  (multi-MATCH is broken even at top level: "bound variable y cannot be re-labeled in a continuing MATCH"). HARD.
+- **~25 value-contract "core rejects"** — LEAVE baselined.
+- **nested groups (~13)**, **multiseg_u (6, dual-anchor ReBAC)**, **WITH-carry of a group list (1)** — HARD.
+
+STOP CRITERION getting close: after the multi-hop group unit, the non-value-contract remainder is
+nested-groups + general-subqueries + multiseg + WITH-carry, all genuinely hard. Reassess then.
