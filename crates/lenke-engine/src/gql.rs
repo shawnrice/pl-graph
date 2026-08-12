@@ -2052,6 +2052,9 @@ impl Parser {
     /// column. Returns `(body, outer_width)`. `kw` names the construct for errors.
     fn correlated_subquery_body(&mut self, kw: &str) -> Result<(Plan, usize), String> {
         self.expect(&Tok::LBrace)?;
+        // The pattern may be written with an explicit leading `MATCH` — `EXISTS {
+        // MATCH (a)-[:R]->(b) }` — the full-statement form; accept it as sugar.
+        self.eat_kw("MATCH");
         let outer_width = self.slots;
         let (var, label, props) = self.node()?;
         let Some(v) = var else {
