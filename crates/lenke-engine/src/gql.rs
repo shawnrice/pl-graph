@@ -116,7 +116,16 @@ pub fn parse(query: &str) -> Result<Plan, String> {
     let mut plan = p.query()?;
     // `<query> UNION [ALL] <query> …`: each arm is an independent query with a fresh
     // binding scope. Left-associative.
-    while p.eat_kw("UNION") {
+    loop {
+        let op = if p.eat_kw("UNION") {
+            crate::ir::CombineOp::Union
+        } else if p.eat_kw("EXCEPT") {
+            crate::ir::CombineOp::Except
+        } else if p.eat_kw("INTERSECT") {
+            crate::ir::CombineOp::Intersect
+        } else {
+            break;
+        };
         let all = p.eat_kw("ALL");
         p.scope = HashMap::new();
         p.slots = 0;
@@ -126,6 +135,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
             left: Box::new(plan),
             right: Box::new(right),
             all,
+            op,
         };
     }
     if p.pos != p.toks.len() {

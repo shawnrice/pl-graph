@@ -195,6 +195,17 @@ pub enum CompareOp {
     Ge,
 }
 
+/// A GQL set operation joining two query arms. `Union` concatenates (deduped unless
+/// `all`); `Except` keeps left rows absent from the right; `Intersect` keeps left
+/// rows present in the right. `Except`/`Intersect` always dedup (the `all` variants
+/// are not distinguished here).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CombineOp {
+    Union,
+    Except,
+    Intersect,
+}
+
 /// An aggregate function. `Count` with no argument (`arg: None`, `distinct:
 /// false`) is `count(*)`; with an argument it counts non-null values; with
 /// `distinct` it counts non-null distinct values.
@@ -417,6 +428,7 @@ pub enum Plan {
         left: Box<Plan>,
         right: Box<Plan>,
         all: bool,
+        op: CombineOp,
     },
     /// Sort WITHIN each row's slot-0 value, in place — Gremlin `order(local)`.
     /// A `List` cell becomes its elements sorted by the value contract's

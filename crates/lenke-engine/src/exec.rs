@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::batch::{Batch, Col, Lineage};
-use crate::ir::{Agg, AggFn, CompareOp, Dir, Expr, Plan};
+use crate::ir::{Agg, AggFn, CombineOp, CompareOp, Dir, Expr, Plan};
 use crate::store::{Column, Store};
 use crate::value::{self, Value};
 
@@ -1004,43 +1004,70 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             let cols = eval_all(items.iter().map(|(_, e)| e), store, &batch)?;
             Batch::of(cols)
         }
-        Plan::Union { left, right, all } => {
+        Plan::Union {
+            left,
+            right,
+            all,
+            op,
+        } => {
             // Run both arms, materialize each row (render_cell → nodes/edges as maps),
-            // pad to the LEFT arm's width, concatenate. UNION dedups the combined rows
-            // by the grouping key; UNION ALL keeps every row. Column names come from
-            // the left arm (see output_names).
+            // pad to the LEFT arm's width. UNION concatenates (deduped unless ALL);
+            // EXCEPT keeps left rows absent from the right; INTERSECT keeps left rows
+            // present in the right (both deduped). Column names come from the left arm.
             let bl = pull(left, store, track)?;
             let br = pull(right, store, track)?;
             let ncols = bl.slots.len();
-            // UNION ALL of same-width arms: concatenate the arms COLUMN-wise (bl's rows
-            // then br's), preserving each column's native type — no per-row Vec<Value>
-            // materialize + transpose (the ~4x-slower nested-Vec build). The final
-            // result rendering turns nodes/edges into maps just as render_cell would,
-            // so this is byte-identical. The dedup / width-padding path below still
-            // handles UNION (distinct) and mismatched-width arms.
-            if *all && br.slots.len() == ncols {
+            // Fast path: UNION ALL of same-width arms concatenates COLUMN-wise.
+            if matches!(op, CombineOp::Union) && *all && br.slots.len() == ncols {
                 return Ok(concat_batches(&[bl, br]));
             }
-            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(bl.rows() + br.rows());
-            for b in [&bl, &br] {
-                for i in 0..b.rows() {
-                    let mut row: Vec<Value> =
-                        b.slots.iter().map(|c| render_cell(c, i, store)).collect();
-                    row.resize(ncols, Value::Null); // pad a short arm to the left width
-                    rows.push(row);
-                }
-            }
-            if !*all {
-                let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
+            let row_of = |b: &Batch, i: usize| -> Vec<Value> {
+                let mut row: Vec<Value> =
+                    b.slots.iter().map(|c| render_cell(c, i, store)).collect();
+                row.resize(ncols, Value::Null);
+                row
+            };
+            let key_of = |row: &[Value]| -> Vec<u8> {
                 let mut buf = Vec::new();
-                rows.retain(|row| {
-                    buf.clear();
-                    for v in row {
-                        value::group_key_into(v, &mut buf);
+                for v in row {
+                    value::group_key_into(v, &mut buf);
+                }
+                buf
+            };
+            let rows: Vec<Vec<Value>> = match op {
+                CombineOp::Union => {
+                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(bl.rows() + br.rows());
+                    for b in [&bl, &br] {
+                        for i in 0..b.rows() {
+                            rows.push(row_of(b, i));
+                        }
                     }
-                    seen.insert(buf.clone())
-                });
-            }
+                    if !*all {
+                        let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
+                        rows.retain(|row| seen.insert(key_of(row)));
+                    }
+                    rows
+                }
+                CombineOp::Except | CombineOp::Intersect => {
+                    // The right arm's key set; keep a LEFT row iff its key is absent
+                    // (EXCEPT) or present (INTERSECT). Always deduped.
+                    let mut right_keys: FnvSet<Vec<u8>> = FnvSet::default();
+                    for i in 0..br.rows() {
+                        right_keys.insert(key_of(&row_of(&br, i)));
+                    }
+                    let want_present = matches!(op, CombineOp::Intersect);
+                    let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
+                    let mut rows = Vec::new();
+                    for i in 0..bl.rows() {
+                        let row = row_of(&bl, i);
+                        let k = key_of(&row);
+                        if right_keys.contains(&k) == want_present && seen.insert(k) {
+                            rows.push(row);
+                        }
+                    }
+                    rows
+                }
+            };
             let mut cols: Vec<Vec<Value>> = vec![Vec::with_capacity(rows.len()); ncols.max(1)];
             for row in rows {
                 for (j, v) in row.into_iter().enumerate() {

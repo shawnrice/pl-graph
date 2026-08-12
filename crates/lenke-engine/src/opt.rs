@@ -380,7 +380,12 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 cl || cr,
             )
         }
-        Plan::Union { left, right, all } => {
+        Plan::Union {
+            left,
+            right,
+            all,
+            op,
+        } => {
             let (l, cl) = rewrite(*left, idx);
             let (r, cr) = rewrite(*right, idx);
             (
@@ -388,6 +393,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                     left: Box::new(l),
                     right: Box::new(r),
                     all,
+                    op,
                 },
                 cl || cr,
             )

@@ -13,7 +13,6 @@ language.jsonl::m_block_comment
 language.jsonl::m_colon_label_predicate_desugars_to_is_labeled_2
 language.jsonl::m_edge_label_disjunction
 language.jsonl::m_edge_label_negation
-language.jsonl::m_except
 language.jsonl::m_hex_scientific_underscored_numbers_4
 language.jsonl::m_hex_scientific_underscored_numbers_5
 language.jsonl::m_hex_scientific_underscored_numbers_6
@@ -21,7 +20,6 @@ language.jsonl::m_implicit_grouping
 language.jsonl::m_inline_where_on_edge
 language.jsonl::m_inline_where_on_node
 language.jsonl::m_insert_return_binds_created_node
-language.jsonl::m_intersect
 language.jsonl::m_is_as_label_introducer
 language.jsonl::m_is_labeled_tests_element_1
 language.jsonl::m_is_labeled_tests_element_2
@@ -73,7 +71,6 @@ tests_a.jsonl::count_subquery_degree_7
 tests_a.jsonl::count_subquery_degree_8
 tests_a.jsonl::count_subquery_degree_9
 tests_a.jsonl::edge_property_inline_where
-tests_a.jsonl::except_
 tests_a.jsonl::exists_count_semi_join_1
 tests_a.jsonl::exists_count_semi_join_2
 tests_a.jsonl::exists_count_semi_join_3
@@ -83,7 +80,6 @@ tests_a.jsonl::group_by_aggregate
 tests_a.jsonl::inline_where_label
 tests_a.jsonl::insert_multi_label_node
 tests_a.jsonl::insert_node_then_return
-tests_a.jsonl::intersect_
 tests_a.jsonl::is_labeled
 tests_a.jsonl::is_not_labeled
 tests_a.jsonl::label_expr_not
