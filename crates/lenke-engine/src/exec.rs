@@ -993,6 +993,20 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             keys,
             skip,
             limit,
+        } if *limit == Some(0) => {
+            // LIMIT 0 keeps no rows, so the input's projection is never evaluated —
+            // a faulting expression (`RETURN 1/0 AS x LIMIT 0`) must yield the empty
+            // result, not the fault. Short-circuit without pulling the input. One
+            // empty slot keeps the unnamed-output path (`batch.slot(0)`) valid; an
+            // empty result carries no column identity anyway.
+            let _ = (input, keys, skip);
+            Batch::of(vec![Col::Nodes(vec![])])
+        }
+        Plan::OrderPage {
+            input,
+            keys,
+            skip,
+            limit,
         } => {
             // A keyless page (LIMIT/SKIP without ORDER BY) keeps the first
             // `skip+limit` rows in scan order — so cap the input at that many rows
@@ -8414,6 +8428,28 @@ mod tests {
             ty("MATCH (a:N)-[e:Y]->(b) RETURN type(e) AS t"),
             vec!["X", "Y", "Z"]
         );
+    }
+
+    /// LIMIT 0 yields the empty result WITHOUT evaluating the projection, so a
+    /// faulting expression (`1/0`) under LIMIT 0 does not error (matches core).
+    #[test]
+    fn limit_zero_short_circuits_before_projection() {
+        let mut b = Builder::default();
+        b.node(&["T"], &[("x", n(3.0))]);
+        let store = b.build();
+        // Without LIMIT 0, `1/0` faults; with it, the projection is never reached.
+        let plan = crate::opt::optimize_indexed(
+            crate::gql::parse("MATCH (n:T) RETURN 1/0 AS x LIMIT 0").unwrap(),
+            &store,
+        );
+        let out = try_run(&plan, &store).expect("LIMIT 0 must not fault");
+        assert_eq!(out.rows.len(), 0);
+        // DISTINCT … LIMIT 0 too.
+        let plan = crate::opt::optimize_indexed(
+            crate::gql::parse("MATCH (n:T) RETURN DISTINCT 1/0 AS x LIMIT 0").unwrap(),
+            &store,
+        );
+        assert_eq!(try_run(&plan, &store).unwrap().rows.len(), 0);
     }
 
     /// A named path over a NON-shortest var-length pattern binds the walk lineage,

@@ -193,7 +193,3 @@ tests_f.jsonl::range_float_step_stall
 tests_f.jsonl::size_labels_edge
 tests_f.jsonl::vec_extreme_nan_2
 tests_f.jsonl::zero_bound_3
-tests_f.jsonl::zero_limit_1
-tests_f.jsonl::zero_limit_3
-tests_f.jsonl::zero_limit_4
-tests_f.jsonl::zero_limit_5
