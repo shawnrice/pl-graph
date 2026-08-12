@@ -198,7 +198,11 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             '{' => out.push(Tok::LBrace),
             '}' => out.push(Tok::RBrace),
             ':' => out.push(Tok::Colon),
-            '.' => out.push(Tok::Dot),
+            // A `.` immediately followed by a digit is a leading-dot float (`.5`);
+            // it falls through to the numeric arm below. A bare `.` is the accessor.
+            '.' if !matches!(b.get(i + 1), Some(d) if d.is_ascii_digit()) => {
+                out.push(Tok::Dot)
+            }
             ',' => out.push(Tok::Comma),
             '*' => out.push(Tok::Star),
             '+' => out.push(Tok::Plus),
@@ -256,9 +260,9 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                 }
                 out.push(Tok::Str(t));
             }
-            _ if c.is_ascii_digit() => {
+            _ if c.is_ascii_digit() || c == '.' => {
                 // Radix prefixes `0x`/`0o`/`0b` — an integer in that base (value as
-                // f64, matching core). Else a decimal (with an optional `.`).
+                // f64, matching core). Else a decimal.
                 if c == '0' && i + 1 < b.len() {
                     let radix = match b[i + 1].to_ascii_lowercase() {
                         'x' => Some(16u32),
@@ -280,12 +284,34 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                         continue;
                     }
                 }
+                // Decimal: integer part, optional `.fraction`, optional `e[+/-]exp`.
+                // Underscores are permitted inside digit runs (`1_000`) and stripped
+                // before parsing; a leading-dot float (`.5`) has no integer part.
+                // Matches core's lexer exactly.
                 let start = i;
-                while i < b.len() && (b[i].is_ascii_digit() || b[i] == '.') {
+                while i < b.len() && (b[i].is_ascii_digit() || b[i] == '_') {
                     i += 1;
                 }
+                if i < b.len() && b[i] == '.' {
+                    i += 1;
+                    while i < b.len() && (b[i].is_ascii_digit() || b[i] == '_') {
+                        i += 1;
+                    }
+                }
+                if i < b.len() && (b[i] == 'e' || b[i] == 'E') {
+                    i += 1;
+                    if i < b.len() && (b[i] == '+' || b[i] == '-') {
+                        i += 1;
+                    }
+                    while i < b.len() && (b[i].is_ascii_digit() || b[i] == '_') {
+                        i += 1;
+                    }
+                }
                 let text: String = b[start..i].iter().collect();
-                let n: f64 = text.parse().map_err(|_| format!("bad number `{text}`"))?;
+                let cleaned: String = text.chars().filter(|&ch| ch != '_').collect();
+                let n: f64 = cleaned
+                    .parse()
+                    .map_err(|_| format!("bad number `{text}`"))?;
                 out.push(Tok::Num(n));
                 continue; // i already advanced past the number
             }
