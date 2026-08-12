@@ -133,11 +133,24 @@ struct Rel {
     where_range: Option<(usize, usize)>,
 }
 
-/// A parsed RETURN item: a keyed expression (a grouping key / plain projection)
-/// or an aggregate.
+/// Aggregate outputs referenced inside a projection expression use a slot at this
+/// base + local index (`count(*) + 1` → `Slot(AGG_SLOT_BASE) + 1`), distinguishing
+/// them from ordinary binding slots so `apply_items` can rewrite them to the real
+/// post-aggregation column once the group schema is assembled.
+const AGG_SLOT_BASE: usize = 1 << 40;
+
+/// A parsed RETURN item: a keyed expression (a grouping key / plain projection), a
+/// bare aggregate, or an expression that CONTAINS aggregates (`count(*) + 1`) — the
+/// last carries the hoisted aggregates and an expression that references them by
+/// `AGG_SLOT_BASE`-offset slots.
 enum RetItem {
     Key(String, Expr),
     Agg(crate::ir::Agg),
+    AggExpr {
+        name: String,
+        expr: Expr,
+        aggs: Vec<crate::ir::Agg>,
+    },
 }
 
 impl RetItem {
@@ -145,7 +158,11 @@ impl RetItem {
         match self {
             Self::Key(n, _) => n.clone(),
             Self::Agg(a) => a.name.clone(),
+            Self::AggExpr { name, .. } => name.clone(),
         }
+    }
+    fn has_agg(&self) -> bool {
+        matches!(self, Self::Agg(_) | Self::AggExpr { .. })
     }
 }
 
@@ -818,7 +835,7 @@ impl Parser {
             .iter()
             .filter_map(|it| match it {
                 RetItem::Key(_, e) => Some(e.clone()),
-                RetItem::Agg(_) => None,
+                RetItem::Agg(_) | RetItem::AggExpr { .. } => None,
             })
             .enumerate()
             .map(|(i, e)| (e, i))
@@ -1011,14 +1028,14 @@ impl Parser {
             .iter()
             .filter_map(|it| match it {
                 RetItem::Key(n, e) => Some((n.clone(), e.clone())),
-                RetItem::Agg(_) => None,
+                RetItem::Agg(_) | RetItem::AggExpr { .. } => None,
             })
             .collect();
         let select_aggs: Vec<crate::ir::Agg> = items
             .iter()
             .filter_map(|it| match it {
                 RetItem::Agg(a) => Some(a.clone()),
-                RetItem::Key(..) => None,
+                RetItem::Key(..) | RetItem::AggExpr { .. } => None,
             })
             .collect();
         // Grouping keys: the SELECT non-aggregate items, plus any GROUP BY expression
@@ -1062,6 +1079,13 @@ impl Parser {
                         .position(|sa| sa.name == a.name)
                         .expect("select agg");
                     proj.push((a.name.clone(), Expr::Slot(keys.len() + ai)));
+                }
+                RetItem::AggExpr { .. } => {
+                    return Err(
+                        "an aggregate expression in a SELECT with GROUP BY/HAVING is not \
+                         supported"
+                            .into(),
+                    )
                 }
             }
         }
@@ -2043,14 +2067,16 @@ impl Parser {
             return Err("a CALL subquery needs a RETURN".into());
         }
         let items = self.return_items()?;
-        if items.iter().any(|it| matches!(it, RetItem::Agg(_))) {
+        if items.iter().any(RetItem::has_agg) {
             return Err("an aggregating RETURN inside CALL { … } is not supported".into());
         }
         let yields: Vec<(String, Expr)> = items
             .into_iter()
             .map(|it| match it {
                 RetItem::Key(name, e) => (name, e),
-                RetItem::Agg(_) => unreachable!("aggregates rejected above"),
+                RetItem::Agg(_) | RetItem::AggExpr { .. } => {
+                    unreachable!("aggregates rejected above")
+                }
             })
             .collect();
         self.expect(&Tok::RBrace)?;
@@ -2329,19 +2355,37 @@ impl Parser {
             }
             let idx = items.len();
             let item = if let Some(func) = self.peek_agg() {
+                let save = self.pos;
                 let (agg_arg, distinct, frac) = self.aggregate_call()?;
-                let name = if self.eat_kw("AS") {
-                    self.ident()?
+                // A bare aggregate is followed by `AS`/`,`/a tail keyword; an operator
+                // means the aggregate is embedded in a larger expression (`count(*)+1`),
+                // which we re-parse with aggregate hoisting into a `RetItem::AggExpr`.
+                if is_operator_continuation(self.peek()) {
+                    self.pos = save;
+                    self.having_base = AGG_SLOT_BASE;
+                    self.having_aggs = Some(Vec::new());
+                    let expr = self.expr()?;
+                    let aggs = self.having_aggs.take().expect("hoisting");
+                    let name = if self.eat_kw("AS") {
+                        self.ident()?
+                    } else {
+                        self.item_name(&expr, idx)
+                    };
+                    RetItem::AggExpr { name, expr, aggs }
                 } else {
-                    format!("col{idx}")
-                };
-                RetItem::Agg(crate::ir::Agg {
-                    func,
-                    arg: agg_arg,
-                    distinct,
-                    name,
-                    frac,
-                })
+                    let name = if self.eat_kw("AS") {
+                        self.ident()?
+                    } else {
+                        format!("col{idx}")
+                    };
+                    RetItem::Agg(crate::ir::Agg {
+                        func,
+                        arg: agg_arg,
+                        distinct,
+                        name,
+                        frac,
+                    })
+                }
             } else {
                 let e = self.expr()?;
                 let name = if self.eat_kw("AS") {
@@ -3259,34 +3303,135 @@ fn rewrite_group_keys(e: Expr, keys: &[(String, Expr)]) -> Expr {
     }
 }
 
+/// Is the token an infix operator that would continue an expression after a parsed
+/// aggregate (`count(*) <op> …`)? Used to tell a bare aggregate item from one
+/// embedded in a larger projection expression.
+fn is_operator_continuation(t: Option<&Tok>) -> bool {
+    match t {
+        Some(
+            Tok::Plus
+            | Tok::Minus
+            | Tok::Star
+            | Tok::Slash
+            | Tok::Percent
+            | Tok::Concat
+            | Tok::Eq
+            | Tok::Ne
+            | Tok::Lt
+            | Tok::Le
+            | Tok::Gt
+            | Tok::Ge,
+        ) => true,
+        // Keyword operators (`OR`/`AND`/`XOR`/`IN`/`IS`).
+        Some(Tok::Ident(s)) => {
+            matches!(s.to_ascii_uppercase().as_str(), "OR" | "AND" | "XOR" | "IN" | "IS")
+        }
+        _ => false,
+    }
+}
+
+/// Rewrite an aggregate-expression's `AGG_SLOT_BASE`-offset slots to their real
+/// post-aggregation columns: the i-th hoisted aggregate of an item lands at
+/// `base + i` in the `[keys…, aggs…]` schema.
+fn rewrite_agg_slots(e: Expr, base: usize) -> Expr {
+    let go = |b: Box<Expr>| Box::new(rewrite_agg_slots(*b, base));
+    match e {
+        Expr::Slot(s) if s >= AGG_SLOT_BASE => Expr::Slot(base + (s - AGG_SLOT_BASE)),
+        Expr::Not(x) => Expr::Not(go(x)),
+        Expr::And(a, b) => Expr::And(go(a), go(b)),
+        Expr::Or(a, b) => Expr::Or(go(a), go(b)),
+        Expr::Xor(a, b) => Expr::Xor(go(a), go(b)),
+        Expr::Compare { op, left, right } => Expr::Compare {
+            op,
+            left: go(left),
+            right: go(right),
+        },
+        Expr::Arith { op, left, right } => Expr::Arith {
+            op,
+            left: go(left),
+            right: go(right),
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: go(expr),
+            negated,
+        },
+        Expr::In { needle, haystack } => Expr::In {
+            needle: go(needle),
+            haystack: go(haystack),
+        },
+        Expr::Call { name, args } => Expr::Call {
+            name,
+            args: args.into_iter().map(|a| rewrite_agg_slots(a, base)).collect(),
+        },
+        other => other,
+    }
+}
+
 fn apply_items(plan: Plan, items: &[RetItem]) -> (Plan, Vec<String>) {
-    let has_agg = items.iter().any(|it| matches!(it, RetItem::Agg(_)));
+    let has_agg = items.iter().any(RetItem::has_agg);
+    let has_agg_expr = items.iter().any(|it| matches!(it, RetItem::AggExpr { .. }));
     let out_names: Vec<String> = items.iter().map(RetItem::name).collect();
-    let plan = if has_agg {
+    let plan = if !has_agg {
+        let proj = items
+            .iter()
+            .map(|it| match it {
+                RetItem::Key(name, e) => (name.clone(), e.clone()),
+                _ => unreachable!("no aggregates on this branch"),
+            })
+            .collect();
+        plan.project(proj)
+    } else if !has_agg_expr {
+        // Simple aggregate: keys then aggregates, output = the aggregate columns.
         let keys = items
             .iter()
             .filter_map(|it| match it {
                 RetItem::Key(name, e) => Some((name.clone(), e.clone())),
-                RetItem::Agg(_) => None,
+                _ => None,
             })
             .collect();
         let aggs = items
             .iter()
             .filter_map(|it| match it {
                 RetItem::Agg(a) => Some(a.clone()),
-                RetItem::Key(..) => None,
+                _ => None,
             })
             .collect();
         plan.aggregate(keys, aggs)
     } else {
-        let proj = items
+        // An aggregate embedded in a projection expression: aggregate over the group
+        // keys and ALL hoisted aggregates, then PROJECT each item over the
+        // `[keys…, aggs…]` schema (a bare agg → its column; an agg-expression → its
+        // slot-rewritten expression; a key → its key column).
+        let keys: Vec<(String, Expr)> = items
             .iter()
-            .map(|it| match it {
-                RetItem::Key(name, e) => (name.clone(), e.clone()),
-                RetItem::Agg(_) => unreachable!("no aggregates on this branch"),
+            .filter_map(|it| match it {
+                RetItem::Key(name, e) => Some((name.clone(), e.clone())),
+                _ => None,
             })
             .collect();
-        plan.project(proj)
+        let k = keys.len();
+        let mut aggs: Vec<crate::ir::Agg> = Vec::new();
+        let mut proj: Vec<(String, Expr)> = Vec::with_capacity(items.len());
+        let mut key_i = 0usize;
+        for it in items {
+            match it {
+                RetItem::Key(name, _) => {
+                    proj.push((name.clone(), Expr::Slot(key_i)));
+                    key_i += 1;
+                }
+                RetItem::Agg(a) => {
+                    let pos = k + aggs.len();
+                    aggs.push(a.clone());
+                    proj.push((a.name.clone(), Expr::Slot(pos)));
+                }
+                RetItem::AggExpr { name, expr, aggs: ia } => {
+                    let base = k + aggs.len();
+                    aggs.extend(ia.iter().cloned());
+                    proj.push((name.clone(), rewrite_agg_slots(expr.clone(), base)));
+                }
+            }
+        }
+        plan.aggregate(keys, aggs).project(proj)
     };
     (plan, out_names)
 }
@@ -6466,6 +6611,28 @@ mod tests {
             val("RETURN TIMESTAMP '2021-06-15T08:30:00.5' >= DATETIME '2021-06-15T08:30:00' AS x"),
             "Bool(true)"
         );
+    }
+
+    /// An aggregate nested in a projection expression (`count(*) + 1`) hoists the
+    /// aggregate into the group and projects the surrounding arithmetic over it.
+    #[test]
+    fn aggregate_in_projection_expression() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"T\"],\"props\":{}}\n",
+            "{\"id\":\"b\",\"labels\":[\"T\"],\"props\":{}}\n",
+            "{\"id\":\"c\",\"labels\":[\"T\"],\"props\":{}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let n = |q: &str| -> f64 {
+            match run(&super::parse(q).unwrap(), &store).rows[0][0] {
+                Value::Num(x) => x,
+                ref o => panic!("want num, got {o:?}"),
+            }
+        };
+        assert_eq!(n("MATCH (t:T) RETURN count(*) + 1 AS c"), 4.0);
+        assert_eq!(n("MATCH (t:T) RETURN count(*) * 2 - 1 AS c"), 5.0);
+        // A bare aggregate is unaffected.
+        assert_eq!(n("MATCH (t:T) RETURN count(*) AS c"), 3.0);
     }
 
     // --- part 3.8: string functions (E4a) ---
