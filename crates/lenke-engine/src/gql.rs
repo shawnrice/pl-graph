@@ -17,16 +17,74 @@ use std::collections::{HashMap, HashSet};
 use crate::ir::{AggFn, CastTarget, CompareOp, Dir, Expr, PathMode, PathPart, Plan};
 use crate::value::Value;
 
-/// A parsed node pattern head: its optional variable, optional label, inline
-/// property map (`(v:Label {k: val, …})` — empty when absent), and the token span
-/// of an optional inline `WHERE` predicate (`(v:Label WHERE pred)` — `None` when
-/// absent; re-parsed once the variable is bound to a slot).
+/// A parsed node pattern head: its optional variable, the SEED label (a single
+/// positive label used for `Scan`, or `None`), inline property map (empty when
+/// absent), the token span of an optional inline `WHERE` predicate, and a residual
+/// LABEL predicate — `Some` only for a compound label expression (`:A&B`, `:A|B`,
+/// `:!A`) that the seed label does not fully cover, applied as a filter on the slot.
 type ParsedNode = (
     Option<String>,
     Option<String>,
     Vec<(String, Value)>,
     Option<(usize, usize)>,
+    Option<LabelExpr>,
 );
+
+/// A boolean label expression (`%` = any, a label, `!`/`&`/`|`), parsed from a node's
+/// `:…` (or `IS …`) label position. Lowered per-slot to a predicate over the node's
+/// label set. `%` and a bare positive label need no residual filter (a bare label is
+/// the seed `Scan`, `%` scans all); the compound forms do.
+enum LabelExpr {
+    Any,
+    Label(String),
+    Not(Box<LabelExpr>),
+    And(Box<LabelExpr>, Box<LabelExpr>),
+    Or(Box<LabelExpr>, Box<LabelExpr>),
+}
+
+impl LabelExpr {
+    /// A single positive label to seed the `Scan` on — `Label(L)`, or the first one
+    /// found down a conjunction chain (`A & …` seeds on `A`); `None` otherwise.
+    fn seed_label(&self) -> Option<String> {
+        match self {
+            LabelExpr::Label(l) => Some(l.clone()),
+            LabelExpr::And(a, b) => a.seed_label().or_else(|| b.seed_label()),
+            _ => None,
+        }
+    }
+    /// `Some(self)` when a residual per-slot filter is needed — every compound form.
+    /// A bare label is covered by the seed `Scan`; `%` scans everything.
+    fn needs_filter(self) -> Option<LabelExpr> {
+        match self {
+            LabelExpr::Any | LabelExpr::Label(_) => None,
+            other => Some(other),
+        }
+    }
+}
+
+/// Lower a label expression to a boolean predicate over the node in `slot`: a label
+/// `L` → `'L' IN labels(slot)`, `%` → TRUE, with the boolean operators.
+fn lower_label_expr(le: &LabelExpr, slot: usize) -> Expr {
+    match le {
+        LabelExpr::Any => Expr::Lit(Value::Bool(true)),
+        LabelExpr::Label(l) => Expr::In {
+            needle: Box::new(Expr::Lit(Value::Str(l.clone().into()))),
+            haystack: Box::new(Expr::Call {
+                name: "labels".into(),
+                args: vec![Expr::Slot(slot)],
+            }),
+        },
+        LabelExpr::Not(x) => Expr::Not(Box::new(lower_label_expr(x, slot))),
+        LabelExpr::And(a, b) => Expr::And(
+            Box::new(lower_label_expr(a, slot)),
+            Box::new(lower_label_expr(b, slot)),
+        ),
+        LabelExpr::Or(a, b) => Expr::Or(
+            Box::new(lower_label_expr(a, slot)),
+            Box::new(lower_label_expr(b, slot)),
+        ),
+    }
+}
 
 /// Turn a node's inline properties `{k: v, …}` into a chain of `Eq` filters on its
 /// slot — the exact lowering of `WHERE slot.k = v AND …`. Sharing this single form
@@ -186,6 +244,7 @@ enum Tok {
     Tilde,  // ~ (undirected relationship delimiter)
     Pipe,   // | (edge-type disjunction in `[:A|B]`)
     Amp,    // & (multi-label conjunction in `INSERT (n:A&B)`)
+    Bang,   // ! (label negation in `(n:!A)`)
     Eq,
     Ne,
     Lt,
@@ -257,6 +316,7 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                 }
             }
             '&' => out.push(Tok::Amp),
+            '!' => out.push(Tok::Bang),
             '=' => out.push(Tok::Eq),
             '-' => {
                 if b.get(i + 1) == Some(&'>') {
@@ -607,7 +667,7 @@ impl Parser {
             if matches!(self.peek(), Some(Tok::LParen)) {
                 let probe = self.node()?;
                 let start = match &probe {
-                    (Some(v), None, props, None) if props.is_empty() => scope.get(v).copied(),
+                    (Some(v), None, props, None, None) if props.is_empty() => scope.get(v).copied(),
                     _ => None,
                 };
                 if let Some(from) = start {
@@ -1048,7 +1108,7 @@ impl Parser {
         selector: crate::ir::ShortestSelector,
     ) -> Result<(Plan, HashMap<String, usize>, usize), String> {
         let mut scope: HashMap<String, usize> = HashMap::new();
-        let (va, la, va_props, va_where) = self.node()?;
+        let (va, la, va_props, va_where, _va_le) = self.node()?;
         if let Some(v) = &va {
             scope.insert(v.clone(), 0);
         }
@@ -1060,7 +1120,7 @@ impl Parser {
         } else {
             return Err("a shortest path requires a `*` or `+` quantifier".into());
         };
-        let (vb, _lb, vb_props, vb_where) = self.node()?;
+        let (vb, _lb, vb_props, vb_where, _vb_le) = self.node()?;
         if va_where.is_some() || vb_where.is_some() || rel.where_range.is_some() {
             return Err("inline WHERE on a shortest-path element is not supported".into());
         }
@@ -1593,7 +1653,7 @@ impl Parser {
     fn pattern(&mut self) -> Result<(Plan, HashMap<String, usize>, usize), String> {
         let mut scope: HashMap<String, usize> = HashMap::new();
         let mut slots = 0usize;
-        let (var, label, props, where_range) = self.node()?;
+        let (var, label, props, where_range, label_expr) = self.node()?;
         if let Some(v) = var {
             scope.insert(v, slots);
         }
@@ -1602,6 +1662,11 @@ impl Parser {
         // Inline props on the seed node become filters over the Scan — the same
         // shape a `WHERE` produces, so the optimizer's index-seeding sees both alike.
         let mut seed = node_prop_filters(Plan::Scan { label }, from, props);
+        // A compound label expression (`:A&B`, `:A|B`, `:!A`) applies a residual
+        // predicate on top of the seed `Scan`.
+        if let Some(le) = label_expr {
+            seed = seed.filter(lower_label_expr(&le, from));
+        }
         if let Some(r) = where_range {
             self.scope = scope.clone();
             seed = seed.filter(self.parse_captured_where(r)?);
@@ -1625,7 +1690,7 @@ impl Parser {
         while matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde)) {
             let rel = self.rel()?;
             let quant = self.opt_quantifier()?;
-            let (v2, _lbl2, v2_props, v2_where) = self.node()?; // a hop's landing-node label is ignored for now
+            let (v2, _lbl2, v2_props, v2_where, _v2_le) = self.node()?; // a hop's landing-node label is ignored for now
                                                                 // A relationship variable, inline edge properties, or an inline edge
                                                                 // WHERE require binding the edge as a slot (edge at `slots`, node at
                                                                 // `slots+1`) so `e.k` can resolve.
@@ -1706,7 +1771,7 @@ impl Parser {
         if !self.eat_kw("MATCH") {
             return Err("expected MATCH after OPTIONAL".into());
         }
-        let (var, label, props, start_where) = self.node()?;
+        let (var, label, props, start_where, _le) = self.node()?;
         let Some(v) = var else {
             return Err("OPTIONAL MATCH must start from a bound variable".into());
         };
@@ -1737,7 +1802,7 @@ impl Parser {
                     .into(),
             );
         }
-        let (v2, _lbl2, v2_props, v2_where) = self.node()?;
+        let (v2, _lbl2, v2_props, v2_where, _v2_le) = self.node()?;
         if !v2_props.is_empty() || v2_where.is_some() {
             return Err(
                 "inline properties on the OPTIONAL MATCH landing node are not supported; use WHERE"
@@ -1767,7 +1832,7 @@ impl Parser {
     /// than scanning afresh). A fresh/disconnected subsequent pattern — one whose
     /// first node is unbound — is not supported in this subset.
     fn match_continue(&mut self, plan: Plan) -> Result<Plan, String> {
-        let (var, label, props, start_where) = self.node()?;
+        let (var, label, props, start_where, _le) = self.node()?;
         let Some(v) = var else {
             return Err("a MATCH after WITH must start from a bound variable".into());
         };
@@ -1889,7 +1954,7 @@ impl Parser {
         if !self.eat_kw("MATCH") {
             return Err("a CALL subquery must begin with MATCH".into());
         }
-        let (var, label, props, start_where) = self.node()?;
+        let (var, label, props, start_where, _le) = self.node()?;
         let Some(v) = var else {
             return Err("a CALL subquery pattern must start from a scope variable".into());
         };
@@ -2069,10 +2134,14 @@ impl Parser {
         } else {
             None
         };
-        let label = if self.eat(&Tok::Colon) {
-            Some(self.ident()?)
+        // The label: `:LabelExpr` or the `IS LabelExpr` introducer. A bare positive
+        // label is the seed `Scan` label; a compound expression (`:A&B`, `:A|B`,
+        // `:!A`, `:%`) yields a residual per-slot filter (`label_expr`).
+        let (label, label_expr) = if self.eat(&Tok::Colon) || self.eat_kw("IS") {
+            let le = self.parse_label_expr()?;
+            (le.seed_label(), le.needs_filter())
         } else {
-            None
+            (None, None)
         };
         // Inline property map `(n:Label {k: v, …})`: a match filter on the node,
         // the exact equivalent of `WHERE n.k = v AND …`. It lowers to the SAME `Eq`
@@ -2092,7 +2161,40 @@ impl Parser {
             None
         };
         self.expect(&Tok::RParen)?;
-        Ok((var, label, props, where_range))
+        Ok((var, label, props, where_range, label_expr))
+    }
+
+    /// Parse a boolean label expression: `factor ('&' factor)* ('|' …)*` with `!`
+    /// negation and `%` wildcard, `!` binding tighter than `&` tighter than `|`.
+    fn parse_label_expr(&mut self) -> Result<LabelExpr, String> {
+        let mut left = self.label_and()?;
+        while self.eat(&Tok::Pipe) {
+            left = LabelExpr::Or(Box::new(left), Box::new(self.label_and()?));
+        }
+        Ok(left)
+    }
+
+    fn label_and(&mut self) -> Result<LabelExpr, String> {
+        let mut left = self.label_factor()?;
+        while self.eat(&Tok::Amp) {
+            left = LabelExpr::And(Box::new(left), Box::new(self.label_factor()?));
+        }
+        Ok(left)
+    }
+
+    fn label_factor(&mut self) -> Result<LabelExpr, String> {
+        if self.eat(&Tok::Bang) {
+            return Ok(LabelExpr::Not(Box::new(self.label_factor()?)));
+        }
+        if self.eat(&Tok::Percent) {
+            return Ok(LabelExpr::Any);
+        }
+        if self.eat(&Tok::LParen) {
+            let e = self.parse_label_expr()?;
+            self.expect(&Tok::RParen)?;
+            return Ok(e);
+        }
+        Ok(LabelExpr::Label(self.ident()?))
     }
 
     // rel := '-' '[' ':' R ']' '->'   (out)
@@ -2907,7 +3009,7 @@ impl Parser {
         // MATCH (a)-[:R]->(b) }` — the full-statement form; accept it as sugar.
         self.eat_kw("MATCH");
         let outer_width = self.slots;
-        let (var, label, props, start_where) = self.node()?;
+        let (var, label, props, start_where, _le) = self.node()?;
         let Some(v) = var else {
             return Err(format!("{kw} pattern must start from a bound variable"));
         };
@@ -6205,6 +6307,29 @@ mod tests {
         );
         // Agrees with the `x:Label` predicate form.
         assert_eq!(persons, n("MATCH (x) WHERE x:Person RETURN count(*) AS c"));
+    }
+
+    /// Node label algebra: conjunction `:A&B`, disjunction `:A|B`, negation `:!A`,
+    /// wildcard `:%`, and the `IS L` introducer, over multi-label nodes.
+    #[test]
+    fn node_label_algebra() {
+        let nd = concat!(
+            "{\"id\":\"pa\",\"labels\":[\"Person\",\"Admin\"],\"props\":{}}\n",
+            "{\"id\":\"p\",\"labels\":[\"Person\"],\"props\":{}}\n",
+            "{\"id\":\"s\",\"labels\":[\"Software\"],\"props\":{}}\n",
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let n = |q: &str| -> f64 {
+            match run(&super::parse(q).unwrap(), &store).rows[0][0] {
+                Value::Num(x) => x,
+                ref o => panic!("want num, got {o:?}"),
+            }
+        };
+        assert_eq!(n("MATCH (x:Person&Admin) RETURN count(*) AS c"), 1.0); // only pa
+        assert_eq!(n("MATCH (x:Person|Software) RETURN count(*) AS c"), 3.0); // pa, p, s
+        assert_eq!(n("MATCH (x:!Software) RETURN count(*) AS c"), 2.0); // pa, p
+        assert_eq!(n("MATCH (x:%) RETURN count(*) AS c"), 3.0); // any label
+        assert_eq!(n("MATCH (x IS Person) RETURN count(*) AS c"), 2.0); // pa, p (= :Person)
     }
 
     // --- part 3.8: string functions (E4a) ---

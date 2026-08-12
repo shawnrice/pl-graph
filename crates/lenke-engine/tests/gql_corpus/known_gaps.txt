@@ -9,11 +9,6 @@ hardening.jsonl::h_string_plus_number_raises_data_exception
 language.jsonl::m_colon_label_predicate_desugars_to_is_labeled_2
 language.jsonl::m_edge_label_negation
 language.jsonl::m_implicit_grouping
-language.jsonl::m_is_as_label_introducer
-language.jsonl::m_label_conjunction
-language.jsonl::m_label_disjunction
-language.jsonl::m_label_negation
-language.jsonl::m_label_wildcard
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_1
 language.jsonl::m_reserved_word_rejected_as_bare_identifier_2
 tck.jsonl::tck_null1_property_null_check_on_null_node_unmatched_optional
@@ -32,9 +27,6 @@ tests_a.jsonl::exists_count_semi_join_3
 tests_a.jsonl::exists_count_semi_join_4
 tests_a.jsonl::exists_count_semi_join_5
 tests_a.jsonl::group_by_aggregate
-tests_a.jsonl::label_expr_not
-tests_a.jsonl::label_expr_or
-tests_a.jsonl::label_expr_wildcard
 tests_a.jsonl::order_by_letin_over_output_column
 tests_a.jsonl::reachable_distinct_3
 tests_b.jsonl::avg_duration_errors
@@ -250,8 +242,6 @@ tests_f.jsonl::inline_constraint_14
 tests_f.jsonl::inline_constraint_15
 tests_f.jsonl::inline_constraint_per_row
 tests_f.jsonl::label_disjunction_2
-tests_f.jsonl::label_disjunction_5
-tests_f.jsonl::label_disjunction_6
 tests_f.jsonl::label_disjunction_7
 tests_f.jsonl::num_string_overflow_1
 tests_f.jsonl::num_string_overflow_2
