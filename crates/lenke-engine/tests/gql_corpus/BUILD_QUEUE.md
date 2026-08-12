@@ -11,7 +11,8 @@ Verify every feature: `cargo test --release --lib`; differential_fuzz seeds 1 & 
 - WALK / TRAIL path modes (commit 88010650) — corpus 427->419.
 - Line/block comments + standalone ORDER BY before RETURN (commit e22a41c7) — 419->405.
 - Edge-label disjunction `-[:A|B]->` — 407->391 (16 cases; node-label disjunction `(n:A|B)` stays deferred).
-- TRIM spec-form + round(2-arg)/atan2/log10/list_sort(order,nullOrder) (commit pending) — 391->381 (10 cases).
+- TRIM spec-form + round(2-arg)/atan2/log10/list_sort(order,nullOrder) — 391->381 (10 cases).
+- SELECT..FROM MATCH **phase 1** (constant / projection / global-agg / GROUP BY via implicit grouping) — 381->377 (4 cases). Refactored `match_body` + `project_and_page` (both now shared with SELECT). **Phase 2 (HAVING) still TODO** — 7 `select_having_*` cases; needs GROUP BY that forces a group with NO agg in the SELECT list, an `extract_aggs` expr-walker to hoist HAVING/ORDER aggregates into the group aggs, and a post-aggregation filter with slot rewriting (keys-then-aggs schema). Currently `SELECT … HAVING` errors (baselined). See queue section 3 Phase 2.
 
 ## ~~1. Edge-label disjunction~~ DONE — ~~~24 cases~~ 16 cases
 
