@@ -632,17 +632,21 @@ impl Parser {
         {
             let pname = self.ident()?;
             self.expect(&Tok::Eq)?;
-            let selector = self.parse_shortest_selector()?.ok_or(
-                "a named path requires a shortest-path selector (ANY SHORTEST / \
-                 ALL SHORTEST / SHORTEST 1)",
-            )?;
             self.path_vars.insert(pname);
-            let (mut plan, scope, slots) = self.shortest_pattern(selector)?;
-            self.scope = scope;
-            self.slots = slots;
-            if self.eat_kw("WHERE") {
-                plan = plan.filter(self.expr()?);
+            // With a shortest-path selector it is a shortest-path pattern; without
+            // one it is a plain named path (the ISO default WALK/TRAIL body), which
+            // binds the pattern's lineage exactly like an unnamed MATCH — the path
+            // variable just makes it readable via path_length(p)/nodes(p)/edges(p).
+            if let Some(selector) = self.parse_shortest_selector()? {
+                let (mut plan, scope, slots) = self.shortest_pattern(selector)?;
+                self.scope = scope;
+                self.slots = slots;
+                if self.eat_kw("WHERE") {
+                    plan = plan.filter(self.expr()?);
+                }
+                return self.query_tail(plan);
             }
+            let plan = self.match_body()?;
             return self.query_tail(plan);
         }
         // Bare selector form: `MATCH ALL SHORTEST (a)-[:R]->*(x)` — no path variable,
@@ -4299,9 +4303,13 @@ mod tests {
     }
 
     #[test]
-    fn named_path_requires_any_shortest() {
-        let err = super::parse("MATCH p = (a)-[:LINK]->(b) RETURN p").unwrap_err();
-        assert!(err.contains("ANY SHORTEST"), "got: {err}");
+    fn named_path_over_plain_pattern_is_accepted() {
+        // A named path does NOT require a shortest-path selector: `MATCH p = <plain
+        // pattern>` binds the pattern's (WALK/TRAIL) lineage, readable via
+        // path_length(p)/nodes(p)/edges(p). Both a fixed hop and a var-length body
+        // parse.
+        assert!(super::parse("MATCH p = (a)-[:LINK]->(b) RETURN p").is_ok());
+        assert!(super::parse("MATCH p = (a)-[:LINK]->{1,3}(b) RETURN path_length(p) AS n").is_ok());
     }
 
     #[test]

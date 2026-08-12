@@ -472,10 +472,9 @@ mod tests {
     #[test]
     fn limit_caps_the_estimate() {
         let st = fixture(3000, 4);
-        let plan =
-            scan("Person")
-                .expand(0, Dir::Out, &["R".to_string()])
-                .order_page(Vec::new(), None, Some(50));
+        let plan = scan("Person")
+            .expand(0, Dir::Out, &["R".to_string()])
+            .order_page(Vec::new(), None, Some(50));
         assert_eq!(estimate(&plan, &st).rows as u32, 50);
     }
 

@@ -4880,18 +4880,44 @@ fn var_length(
         return empty();
     };
 
+    // A named path over the pattern (`MATCH p = (a)-[:R]->{1,3}(b)`) needs the
+    // per-row node/edge chain so path_length(p)/nodes(p)/edges(p) resolve; the
+    // input carries a lineage exactly when the plan reads the path.
+    let track = batch.lineage.is_some();
     let mut keep = Vec::new();
     let mut ends = Vec::new();
     // For Trail this is the EDGE stack; for Simple/Acyclic the NODE stack (seeded
     // with the start). Empty for Walk.
     let mut used: Vec<u32> = Vec::new();
+    let mut bufs = PathBufs::new();
     let node_unique = matches!(mode, PathMode::Simple | PathMode::Acyclic);
     for (row, &v) in src.iter().enumerate() {
         if node_unique {
             used.push(v); // mark the start node
         }
+        // The node/edge chain from the source to the DFS frontier — seeded with the
+        // source so `push_path` (which skips `chain[0]`, already the input path's
+        // tail) reconstructs the whole path.
+        let mut node_stack = vec![v];
+        let mut edge_stack: Vec<u32> = Vec::new();
         varlen_dfs(
-            store, v, 0, min, max, dir, &want, mode, v, &mut used, row, &mut keep, &mut ends,
+            store,
+            v,
+            0,
+            min,
+            max,
+            dir,
+            &want,
+            mode,
+            v,
+            &mut used,
+            row,
+            &mut keep,
+            &mut ends,
+            if track { Some(batch) } else { None },
+            &mut node_stack,
+            &mut edge_stack,
+            &mut bufs,
         );
         if node_unique {
             used.pop();
@@ -4901,7 +4927,16 @@ fn var_length(
 
     let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
     slots.push(Col::Nodes(ends));
-    Batch::of(slots)
+    let mut out = Batch::of(slots);
+    if track {
+        out.lineage = Some(Lineage {
+            values: bufs.values,
+            offsets: bufs.offsets,
+            edges: bufs.edges,
+            edge_offsets: bufs.edge_offsets,
+        });
+    }
+    out
 }
 
 /// Depth-first path enumeration for `var_length`. Emits `(row, endpoint)` at
@@ -4924,10 +4959,28 @@ fn varlen_dfs(
     row: usize,
     keep: &mut Vec<usize>,
     ends: &mut Vec<u32>,
+    // Lineage recording (a named path): `Some(input_batch)` records each emitted
+    // path into `bufs`; `node_stack`/`edge_stack` hold the chain source..`v`.
+    track_batch: Option<&Batch>,
+    node_stack: &mut Vec<u32>,
+    edge_stack: &mut Vec<u32>,
+    bufs: &mut PathBufs,
 ) {
     if len >= min {
         keep.push(row);
         ends.push(v);
+        if let Some(b) = track_batch {
+            push_path(
+                b,
+                row,
+                node_stack,
+                edge_stack,
+                &mut bufs.values,
+                &mut bufs.offsets,
+                &mut bufs.edges,
+                &mut bufs.edge_offsets,
+            );
+        }
     }
     if len == max {
         return;
@@ -4972,6 +5025,22 @@ fn varlen_dfs(
                 if len + 1 >= min {
                     keep.push(row);
                     ends.push(a.nbr);
+                    if let Some(b) = track_batch {
+                        node_stack.push(a.nbr);
+                        edge_stack.push(a.eid);
+                        push_path(
+                            b,
+                            row,
+                            node_stack,
+                            edge_stack,
+                            &mut bufs.values,
+                            &mut bufs.offsets,
+                            &mut bufs.edges,
+                            &mut bufs.edge_offsets,
+                        );
+                        node_stack.pop();
+                        edge_stack.pop();
+                    }
                 }
                 continue;
             }
@@ -4980,6 +5049,8 @@ fn varlen_dfs(
         if let Some(m) = mark {
             used.push(m);
         }
+        node_stack.push(a.nbr);
+        edge_stack.push(a.eid);
         varlen_dfs(
             store,
             a.nbr,
@@ -4994,7 +5065,13 @@ fn varlen_dfs(
             row,
             keep,
             ends,
+            track_batch,
+            node_stack,
+            edge_stack,
+            bufs,
         );
+        node_stack.pop();
+        edge_stack.pop();
         if mark.is_some() {
             used.pop();
         }
@@ -5220,6 +5297,28 @@ fn enumerate_shortest_paths(
 
 /// Append one shortest-path row's lineage: the input row's carried path (ending at
 /// `start`) followed by the reconstructed `start..node` chain and its edges.
+#[allow(clippy::too_many_arguments)]
+/// The four parallel buffers a [`Lineage`] is assembled from, seeded with the
+/// leading `0` offset each side needs. Shared by the var-length DFS to accumulate a
+/// per-emitted-row path.
+struct PathBufs {
+    values: Vec<Value>,
+    offsets: Vec<usize>,
+    edges: Vec<Value>,
+    edge_offsets: Vec<usize>,
+}
+
+impl PathBufs {
+    fn new() -> Self {
+        Self {
+            values: Vec::new(),
+            offsets: vec![0],
+            edges: Vec::new(),
+            edge_offsets: vec![0],
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_path(
     batch: &Batch,
@@ -8314,6 +8413,60 @@ mod tests {
         assert_eq!(
             ty("MATCH (a:N)-[e:Y]->(b) RETURN type(e) AS t"),
             vec!["X", "Y", "Z"]
+        );
+    }
+
+    /// A named path over a NON-shortest var-length pattern binds the walk lineage,
+    /// so path_length(p)/edges(p)/nodes(p) resolve. Fixture a->b->c->a (cycle) + a->d.
+    #[test]
+    fn named_path_over_var_length_binds_lineage() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"id\":\"d\",\"labels\":[\"N\"],\"props\":{\"id\":\"d\"}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{}}\n",
+            "{\"from\":\"b\",\"to\":\"c\",\"labels\":[\"R\"],\"props\":{}}\n",
+            "{\"from\":\"c\",\"to\":\"a\",\"labels\":[\"R\"],\"props\":{}}\n",
+            "{\"from\":\"a\",\"to\":\"d\",\"labels\":[\"R\"],\"props\":{}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let run_q = |q: &str, col: usize| -> Vec<f64> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            let mut v: Vec<f64> = run(&plan, &store)
+                .rows
+                .iter()
+                .map(|r| match r[col] {
+                    Value::Num(x) => x,
+                    ref o => panic!("{o:?}"),
+                })
+                .collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v
+        };
+        // paths from a of length 1..3: a-b (1), a-d (1), a-b-c (2), a-b-c-a (3).
+        assert_eq!(
+            run_q(
+                "MATCH p = (a:N {id:'a'})-[:R]->{1,3}(x) RETURN path_length(p) AS len",
+                0
+            ),
+            vec![1.0, 1.0, 2.0, 3.0]
+        );
+        // size(edges(p)) tracks the hop count (path_length).
+        assert_eq!(
+            run_q(
+                "MATCH p = (a:N {id:'a'})-[:R]->{1,3}(x) RETURN size(edges(p)) AS es",
+                0
+            ),
+            vec![1.0, 1.0, 2.0, 3.0]
+        );
+        // min 0 binds the length-0 seed path (a itself) too.
+        assert_eq!(
+            run_q(
+                "MATCH p = (a:N {id:'a'})-[:R]->{0,1}(x) RETURN path_length(p) AS len",
+                0
+            ),
+            vec![0.0, 1.0, 1.0]
         );
     }
 

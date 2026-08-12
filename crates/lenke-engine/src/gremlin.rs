@@ -510,7 +510,11 @@ impl Parser {
                             Box::new(this.clone()),
                         ),
                     };
-                    bodies.push(Plan::Row.filter(guard).expand(from, dir, &etypes_of(label.as_deref())));
+                    bodies.push(Plan::Row.filter(guard).expand(
+                        from,
+                        dir,
+                        &etypes_of(label.as_deref()),
+                    ));
                     prior = Some(match prior {
                         None => this,
                         Some(p) => Expr::Or(Box::new(p), Box::new(this)),
@@ -537,10 +541,11 @@ impl Parser {
                 self.expect(&Tok::Comma)?;
                 let (e_dir, e_label) = self.hop_body()?;
                 self.expect(&Tok::RParen)?;
-                let then_body =
-                    Plan::Row
-                        .filter(pred.clone())
-                        .expand(from, t_dir, &etypes_of(t_label.as_deref()));
+                let then_body = Plan::Row.filter(pred.clone()).expand(
+                    from,
+                    t_dir,
+                    &etypes_of(t_label.as_deref()),
+                );
                 let else_body = Plan::Row.filter(Expr::Not(Box::new(pred))).expand(
                     from,
                     e_dir,
@@ -633,7 +638,14 @@ impl Parser {
                 let from = self.current;
                 self.current = self.slots;
                 self.slots += 1;
-                plan.var_length(from, dir, &etypes_of(label.as_deref()), n, n, PathMode::Walk)
+                plan.var_length(
+                    from,
+                    dir,
+                    &etypes_of(label.as_deref()),
+                    n,
+                    n,
+                    PathMode::Walk,
+                )
             }
             "oute" | "ine" | "bothe" => {
                 // Edge-yielding hop: bind the traversed edge as a slot and leave the
@@ -924,7 +936,9 @@ impl Parser {
                             func: AggFn::Count,
                             arg: None,
                             distinct: false,
-                            name: "count".into(), frac: None,}],
+                            name: "count".into(),
+                            frac: None,
+                        }],
                     );
                     self.current = 0;
                     self.slots = 1;
@@ -966,7 +980,9 @@ impl Parser {
                             func,
                             arg: Some(Expr::Slot(self.current)),
                             distinct: false,
-                            name: lname.clone(), frac: None,}],
+                            name: lname.clone(),
+                            frac: None,
+                        }],
                     );
                     self.current = 0;
                     self.slots = 1;
@@ -983,7 +999,9 @@ impl Parser {
                         func: AggFn::Collect,
                         arg: Some(Expr::Slot(self.current)),
                         distinct: false,
-                        name: "fold".into(), frac: None,}],
+                        name: "fold".into(),
+                        frac: None,
+                    }],
                 );
                 self.current = 0;
                 self.slots = 1;
@@ -1182,7 +1200,9 @@ impl Parser {
                         func: AggFn::Count,
                         arg: None,
                         distinct: false,
-                        name: "count".into(), frac: None,}],
+                        name: "count".into(),
+                        frac: None,
+                    }],
                 );
                 self.current = 0;
                 self.slots = 2; // group key + count
@@ -1245,7 +1265,9 @@ impl Parser {
                         func: AggFn::Count,
                         arg: None,
                         distinct: false,
-                        name: "value".into(), frac: None,},
+                        name: "value".into(),
+                        frac: None,
+                    },
                     Some(GroupBy::Key(k)) => Agg {
                         func: AggFn::Collect,
                         arg: Some(Expr::Prop {
@@ -1253,13 +1275,17 @@ impl Parser {
                             key: k.clone(),
                         }),
                         distinct: false,
-                        name: "value".into(), frac: None,},
+                        name: "value".into(),
+                        frac: None,
+                    },
                     // Default (no second by) or bare by(): fold the group's elements.
                     _ => Agg {
                         func: AggFn::Collect,
                         arg: Some(Expr::Slot(elem_slot)),
                         distinct: false,
-                        name: "value".into(), frac: None,},
+                        name: "value".into(),
+                        frac: None,
+                    },
                 };
                 let p = plan.aggregate(vec![key_expr], vec![value_agg]);
                 self.current = 0;

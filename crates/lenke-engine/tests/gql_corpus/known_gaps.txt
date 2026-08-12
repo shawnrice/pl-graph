@@ -59,11 +59,6 @@ tests_d.jsonl::bare_all_matches_default
 tests_d.jsonl::bare_any_dedups_bounded
 tests_d.jsonl::bare_any_one_per_endpoint
 tests_d.jsonl::bare_path_binds_simple_cycle
-tests_d.jsonl::bare_path_binds_walk_ends
-tests_d.jsonl::bare_path_binds_walk_lens
-tests_d.jsonl::bare_path_edges_match_hop_count
-tests_d.jsonl::bare_path_empty_when_unreachable
-tests_d.jsonl::bare_path_min_zero_binds_the_seed
 tests_d.jsonl::call_inline_count
 tests_d.jsonl::call_scope_isolation_total
 tests_d.jsonl::decorrelate_scope_isolation
@@ -114,8 +109,6 @@ tests_d.jsonl::shortest_2_groups_synonym
 tests_d.jsonl::shortest_2_keeps_two
 tests_d.jsonl::shortest_k_clamps
 tests_d.jsonl::shortest_k_per_hop_pred
-tests_d.jsonl::unanchored_nodes_size
-tests_d.jsonl::unanchored_path_len
 tests_d.jsonl::vqs_11
 tests_d.jsonl::vqs_13
 tests_d.jsonl::vqs_14
@@ -199,7 +192,6 @@ tests_f.jsonl::range_bounded_3
 tests_f.jsonl::range_float_step_stall
 tests_f.jsonl::size_labels_edge
 tests_f.jsonl::vec_extreme_nan_2
-tests_f.jsonl::walked_frame_33
 tests_f.jsonl::zero_bound_3
 tests_f.jsonl::zero_limit_1
 tests_f.jsonl::zero_limit_3
