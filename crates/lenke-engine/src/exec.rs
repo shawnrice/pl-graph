@@ -945,6 +945,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             *max,
             *mode,
             &[],
+            None,
         ),
         Plan::RepeatGroup {
             input,
@@ -956,6 +957,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             mode,
             endpoint_slot: _,
             group_binds,
+            per_rep_pred,
         } => var_length(
             &pull(input, store, track)?,
             store,
@@ -966,6 +968,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             *max,
             *mode,
             group_binds,
+            per_rep_pred.as_deref(),
         ),
         Plan::ShortestPath {
             input,
@@ -4908,6 +4911,9 @@ fn var_length(
     // each `(pos, _slot)` appends one list column (source/edge/target per rep) after
     // the endpoint. Empty = a plain var-length hop (endpoint only).
     group_binds: &[(crate::ir::GroupPos, usize)],
+    // A per-repetition `WHERE` (RepeatGroup) over the rep's SCALAR variables at fixed
+    // mini-scope slots (source=0, edge=1, target=2); a hop failing it is pruned.
+    per_rep_pred: Option<&Expr>,
 ) -> Batch {
     let empty = || {
         let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
@@ -4967,6 +4973,7 @@ fn var_length(
             &mut bufs,
             group_binds,
             &mut group_cols,
+            per_rep_pred,
         );
         if node_unique {
             used.pop();
@@ -5050,6 +5057,9 @@ fn varlen_dfs(
     // bind (source/edge/target across reps) into `group_cols`. Empty = no group vars.
     group_binds: &[(crate::ir::GroupPos, usize)],
     group_cols: &mut Vec<Vec<Value>>,
+    // A per-repetition predicate over the rep's scalar (source=0, edge=1, target=2);
+    // a hop that fails it is not descended into (the path through it is pruned).
+    per_rep_pred: Option<&Expr>,
 ) {
     if len >= min {
         keep.push(row);
@@ -5105,6 +5115,22 @@ fn varlen_dfs(
         }
         if is_inc && drop_loop && a.nbr == v {
             continue;
+        }
+        // Per-repetition WHERE: evaluate the predicate over THIS rep's scalar
+        // variables (source = v at slot 0, edge = a.eid at 1, target = a.nbr at 2);
+        // a hop that does not satisfy it (false / null / fault) is pruned entirely.
+        if let Some(pred) = per_rep_pred {
+            let mini = Batch::of(vec![
+                Col::Nodes(vec![v]),
+                Col::Edges(vec![a.eid]),
+                Col::Nodes(vec![a.nbr]),
+            ]);
+            if !eval(pred, store, &mini)
+                .map(|c| c.value_at(0).is_true())
+                .unwrap_or(false)
+            {
+                continue;
+            }
         }
         let mark = match varlen_step(mode, start, a, used) {
             VarStep::Skip => continue,
@@ -5164,6 +5190,7 @@ fn varlen_dfs(
             bufs,
             group_binds,
             group_cols,
+            per_rep_pred,
         );
         node_stack.pop();
         edge_stack.pop();
@@ -6619,6 +6646,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             *max,
             *mode,
             &[],
+            None,
         ),
         Plan::Filter { input, pred } => {
             let b = pull_body(input, store, seed)?;
@@ -8748,6 +8776,45 @@ mod tests {
         assert_eq!(
             ty("MATCH (a:N)-[e:Y]->(b) RETURN type(e) AS t"),
             vec!["X", "Y", "Z"]
+        );
+    }
+
+    /// A per-repetition WHERE prunes each hop by the rep's scalar x/e/y. Path
+    /// a-e1(30)->b-e2(20)->c-e3(10)->d; bals a=100,b=200,c=5,d=200.
+    #[test]
+    fn repeat_group_per_rep_where() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\",\"bal\":100.0}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\",\"bal\":200.0}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\",\"bal\":5.0}}\n",
+            "{\"id\":\"d\",\"labels\":[\"N\"],\"props\":{\"id\":\"d\",\"bal\":200.0}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{\"amt\":30.0}}\n",
+            "{\"from\":\"b\",\"to\":\"c\",\"labels\":[\"R\"],\"props\":{\"amt\":20.0}}\n",
+            "{\"from\":\"c\",\"to\":\"d\",\"labels\":[\"R\"],\"props\":{\"amt\":10.0}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let ids = |q: &str| -> Vec<String> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            let mut v = names_of(&run(&plan, &store), 0);
+            v.sort();
+            v
+        };
+        // e.amt >= 1 holds for every edge → reach b, c, d.
+        assert_eq!(
+            ids(
+                "MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt >= 1){1,3} (t) RETURN t.id AS id"
+            ),
+            vec!["b", "c", "d"]
+        );
+        // e.amt <= x.bal fails at c->d (10 <= 5 false) → only b, c.
+        assert_eq!(
+            ids("MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE e.amt <= x.bal){1,3} (t) RETURN t.id AS id"),
+            vec!["b", "c"]
+        );
+        // y.bal >= 100 fails when y=c (bal 5) → only b (a->b).
+        assert_eq!(
+            ids("MATCH (s:N {id:'a'}) ((x)-[e:R]->(y) WHERE y.bal >= 100){1,3} (t) RETURN t.id AS id"),
+            vec!["b"]
         );
     }
 

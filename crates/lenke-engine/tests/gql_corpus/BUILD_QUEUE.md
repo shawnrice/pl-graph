@@ -341,8 +341,8 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 
 ### NEXT (baseline 146) — the remaining are the hard/nested tail:
 
-- **per-rep WHERE in a group `((x)-[e]->(y) WHERE pred){n,m}`** (qsp_group_vars_where_scalar,
-  qsp_per_hop_*, vqs_8, nested_per_rep) — per-repetition predicate over the rep's SCALAR x/e/y; needs
+- **per-rep WHERE in a group `((x)-[e]->(y) WHERE pred){n,m}`** (qsp*group_vars_where_scalar,
+  qsp_per_hop*\*, vqs_8, nested_per_rep) — per-repetition predicate over the rep's SCALAR x/e/y; needs
   per-rep scalar slots + eval a captured predicate per hop in the RepeatGroup/var_length DFS (build a
   1-row batch with x=Col::Nodes([v]), e=Col::Edges([eid]), y=Col::Nodes([nbr]) and eval). MEDIUM-HARD.
 - **inline edge props on a plain var-length `-[:R {amt:20.0}]->{n,m}`** (per_hop_inline_from_a/b) — each
@@ -350,8 +350,8 @@ User directive: fix all remaining deferred items (they were deferred for effort,
   one or a per-hop predicate). Overlaps per-rep WHERE (edge-only case). 2 cases.
 - **multi-hop group unit k>1** (gv_bind_each_rep_2hop), **nested groups** (vqs_16, nested_paren_varying,
   nested_outer_gv, nested_quant_ends), **WITH-carry of a group list** (gv_carry_through_with) — DEFER-hard.
-- **VALUE scalar subquery / uncorrelated multi-pattern EXISTS** (value_subquery_* 5, exists_multi_match 4)
-  — VALUE {…RETURN count(*)} ~ CountSubquery for the correlated case; general VALUE + uncorrelated EXISTS
+- **VALUE scalar subquery / uncorrelated multi-pattern EXISTS** (value*subquery*_ 5, exists_multi_match 4)
+  — VALUE {…RETURN count(_)} ~ CountSubquery for the correlated case; general VALUE + uncorrelated EXISTS
   need pull_body to run a Scan/cross-join body or a constant-subquery eval. MEDIUM.
 - **multiseg_u (6)** — dual-anchor correlated multi-segment EXISTS (ReBAC). HARD.
 - VALUE-CONTRACT (leave/surface): range_bounded_2/3, num_string_overflow, distinct_nan (string->NaN),

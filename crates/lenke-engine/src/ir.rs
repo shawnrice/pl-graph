@@ -463,6 +463,11 @@ pub enum Plan {
         mode: PathMode,
         endpoint_slot: usize,
         group_binds: Vec<(GroupPos, usize)>,
+        /// A PER-REPETITION `WHERE` (`((x)-[e]->(y) WHERE pred){…}`) — a predicate
+        /// over the rep's SCALAR variables at fixed mini-scope slots (source=0,
+        /// edge=1, target=2), evaluated at each hop; a hop that fails it is pruned.
+        /// `None` = no per-rep filter.
+        per_rep_pred: Option<Box<Expr>>,
     },
     /// Shortest-path reach: BFS from the element in `from` along `dir`/
     /// `edge_label`, emitting EACH reachable target once at its shortest distance

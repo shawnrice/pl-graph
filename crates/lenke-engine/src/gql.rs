@@ -1852,7 +1852,7 @@ impl Parser {
             // to the endpoint), so it lowers to `var_length`. The endpoint `(t)` that
             // follows is parsed and bound like any landing node.
             if self.is_subpath_group_start() {
-                let (dir, etypes, min, max, src_var, edge_var, tgt_var) =
+                let (dir, etypes, min, max, src_var, edge_var, tgt_var, per_rep_pred) =
                     self.parse_subpath_group()?;
                 // The endpoint `(t)` is OPTIONAL — `((x)-[e]->(y)){2}` (anonymous
                 // landing) is valid when only the group variables are used.
@@ -1893,9 +1893,10 @@ impl Parser {
                     self.group_node_slots.insert(s);
                     group_binds.push((crate::ir::GroupPos::Target, s));
                 }
-                // No group variables referenced → the endpoint-only var_length
-                // lowering; otherwise a RepeatGroup that also binds the group lists.
-                plan = if group_binds.is_empty() {
+                // No group variables AND no per-rep filter → the endpoint-only
+                // var_length lowering; otherwise a RepeatGroup (group lists and/or a
+                // per-repetition WHERE pruning each hop).
+                plan = if group_binds.is_empty() && per_rep_pred.is_none() {
                     plan.var_length(from, dir, &etypes, min, max, self.path_mode)
                 } else {
                     Plan::RepeatGroup {
@@ -1908,6 +1909,7 @@ impl Parser {
                         mode: self.path_mode,
                         endpoint_slot: node_slot,
                         group_binds,
+                        per_rep_pred: per_rep_pred.map(Box::new),
                     }
                 };
                 from = node_slot;
@@ -2053,6 +2055,7 @@ impl Parser {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<Expr>,
         ),
         String,
     > {
@@ -2083,15 +2086,44 @@ impl Parser {
         if matches!(self.peek(), Some(Tok::Minus | Tok::LArrow | Tok::Tilde)) {
             return Err("a multi-hop subpath-group body is not supported yet".into());
         }
-        if self.peek_kw("WHERE") {
-            return Err("a per-repetition WHERE on a subpath group is not supported yet".into());
-        }
+        // A PER-REPETITION `WHERE` — parsed against a SCALAR mini-scope (this rep's
+        // source=0, edge=1, target=2), NOT the group list bindings, since it is
+        // evaluated at each hop over the rep's single values.
+        let per_rep_pred = if self.eat_kw("WHERE") {
+            let saved_scope = std::mem::take(&mut self.scope);
+            let saved_slots = self.slots;
+            let mut mini: HashMap<String, usize> = HashMap::new();
+            if let Some(n) = &source_var {
+                mini.insert(n.clone(), 0);
+            }
+            if let Some(n) = &edge_var {
+                mini.insert(n.clone(), 1);
+            }
+            if let Some(n) = &target_var {
+                mini.insert(n.clone(), 2);
+            }
+            self.scope = mini;
+            self.slots = 3;
+            let pred = self.expr()?;
+            self.scope = saved_scope;
+            self.slots = saved_slots;
+            Some(pred)
+        } else {
+            None
+        };
         self.expect(&Tok::RParen)?; // close the group
         let (min, max) = self
             .opt_quantifier()?
             .ok_or("a subpath group requires a `{n,m}` / `*` / `+` quantifier")?;
         Ok((
-            rel.dir, rel.etypes, min, max, source_var, edge_var, target_var,
+            rel.dir,
+            rel.etypes,
+            min,
+            max,
+            source_var,
+            edge_var,
+            target_var,
+            per_rep_pred,
         ))
     }
 
