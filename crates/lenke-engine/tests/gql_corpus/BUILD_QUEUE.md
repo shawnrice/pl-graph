@@ -497,14 +497,37 @@ larger set of feature gaps surfaced (64 non-nested engine!=core). Shipped, each 
 - per-hop edge WHERE on a plain var-length (3) - REPEATABLE ELEMENTS/DIFFERENT EDGES modes + labels(edge) (4)
 - GROUP BY without aggregate = DISTINCT (1)
 
-REMAINING (73 = ~25 value-contract intentional + ~48 feature):
+### ROUND 8 — "do the 14 and the 27" (73 -> 61; session 265 -> 61)
 
-- NESTED-RECURSIVE (~14): list-of-lists group vars (nested_paren_lol/varying, nested_quant_gv),
+Continued on the 27 specialized features, each gate-green + fuzz-byte-identical:
+
+- uncorrelated COUNT subquery (`COUNT { MATCH … MATCH … }`, 1) + repeated-var on a FIXED hop (self-loop
+  `(u)-[r]->(u)`; cycle-closing comma pattern folds, 1)
+- GROUP BY a non-returned key = hidden grouping key + schema-aware ORDER-BY-alias resolution (1)
+- leading OPTIONAL MATCH pads one null row when empty (`Plan::NullPadIfEmpty`, tck_null1, 1)
+- per-hop edge WHERE may reference the hop SOURCE variable (`(a)-[e WHERE a.k=…]->{…}`, 1)
+- interval-overlap hop compares TEMPORAL bounds, not just numeric (contains_window — was a real
+  correctness bug: date-interval queries silently returned empty, 1)
+- group-variable list typing survives a WITH rename (`WITH e AS hops … hops[i].amt`, 1)
+- ORDER BY expression can reference an output alias (`ORDER BY (LET x=a IN x END)`, 1)
+
+REMAINING (61 = ~30 value-contract intentional + ~31 feature):
+
+- NESTED-RECURSIVE (14): list-of-lists group vars (nested_paren_lol/varying_1/2, nested_quant_gv_vectorize),
   variable-inner group vars (nested_outer_gv_2), multi-rep decomposition (nested_quant_ends_2/3),
-  nested per-rep WHERE (nested_per_rep_where, 4), vqs_16. Needs core's recursive bind_unit + nested lists.
-- SMALL FEATURES still open: group_by_non_returned_key (aggregate keys-before-aggs ordering),
-  per_hop_outer_var (per-hop WHERE referencing an outer var), any_shortest_bounded/plus_seed_cycle (2),
-  m_edge_label_negation (-[:!T]->), CAST bool/list/int, CALL inline count/scope (3), is_typed_closed_record (2),
-  order_by_letin, page_before_projection (statement LIMIT 0), gv_carry_through_with, size_labels/range_float singles.
-- VALUE-CONTRACT (~25, leave): num_string_overflow, distinct_nan, sum/avg-over-temporal, CAST-throws,
-  range caps, m_reserved_word, inline_constraint, tck_null, temporal_duration.
+  nested per-rep WHERE (nested_per_rep_where_1..4), nested per-hop edge (nested_per_hop_edge_1/2), vqs_16.
+  Needs core's recursive bind_unit + nested Value::List materialization. The big coherent HARD chunk.
+- SMALL FEATURES still open (buildable, deferred by cost/risk):
+  - any_shortest_plus_seed_cycle_len — shortest cycle back to the bound seed; needs surgery on the shared
+    BFS (start re-reachable via a non-trivial path). 1 case, HIGH byte-identity risk. DEFERRED.
+  - m_edge_label_negation (`-[:!T]->`) — edge-label negation; threads a neg flag through want_etypes +
+    every plan node (Expand/VarLength/ShortestPath). MEDIUM (wide).
+  - CALL variants (3): call_inline_count (correlated per-outer aggregate — pull_body has no Aggregate arm),
+    call_scope_isolation_total (empty `()` scope = uncorrelated body, cross-join), decorrelate_scope_isolation
+    (empty scope + isolated outer ref → 0 rows). Correlated lateral with a fresh scan + aggregates. HARD.
+  - is_typed_closed_record_1/2 — `IS TYPED RECORD {a :: INTEGER, …}` closed structural record typing. MEDIUM.
+- VALUE-CONTRACT (~30, leave baselined by principle): num_string_overflow, distinct_nan, sum/avg-over-temporal
+  + mixed, CAST-throws (bool/list/int_null), range caps, m_reserved_word, inline_constraint, hardening (bool*num
+  / str+num / oversized-int / overflow-exponent), date_part strict, faulting_aggregate, call_config_*_error,
+  zero_bound_3 (core treats {0,0} as {0,1} — engine's 4 is ISO-correct), temporal_duration (core lacks
+  duration ordering — engine's compare is correct).
