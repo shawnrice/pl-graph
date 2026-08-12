@@ -920,12 +920,14 @@ impl Parser {
         // matching the SELECT path, which consumes GROUP BY before calling here —
         // parse it (for syntax + scope) and let the ordinary aggregate path group.
         // (On the SELECT path GROUP BY is already gone, so this is a no-op there.)
+        let mut group_by_present = false;
         if self.eat_kw("GROUP") {
             if !self.eat_kw("BY") {
                 return Err("expected BY after GROUP".into());
             }
             loop {
                 self.expr()?;
+                group_by_present = true;
                 if !self.eat(&Tok::Comma) {
                     break;
                 }
@@ -933,6 +935,9 @@ impl Parser {
         }
         let visible: Vec<String> = items.iter().map(RetItem::name).collect();
         let has_agg = items.iter().any(|it| matches!(it, RetItem::Agg(_)));
+        // `GROUP BY <keys>` with NO aggregate is DISTINCT over the projection (the
+        // returned items ARE the keys), matching core.
+        let group_distinct = group_by_present && !has_agg;
         // When grouping, the non-aggregate items are the group keys; they occupy the
         // FIRST columns of the aggregate output (keys before aggregates), so an
         // `ORDER BY` over a group-key EXPRESSION (`ORDER BY s.name`) maps to that
@@ -973,6 +978,8 @@ impl Parser {
                         .into(),
                 );
             }
+            plan = plan.distinct();
+        } else if group_distinct && hidden.is_empty() {
             plan = plan.distinct();
         }
         // `OFFSET` is the ISO spelling of `SKIP` — a synonym here (core accepts both).

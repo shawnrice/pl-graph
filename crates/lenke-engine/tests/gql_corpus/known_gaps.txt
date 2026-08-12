@@ -56,7 +56,6 @@ tests_e.jsonl::date_part_bare_name_unknown_fn
 tests_e.jsonl::date_part_rejects_number
 tests_e.jsonl::date_part_rejects_string
 tests_e.jsonl::group_by_non_returned_key
-tests_e.jsonl::group_by_without_aggregate_is_distinct
 tests_e.jsonl::is_typed_closed_record_1
 tests_e.jsonl::is_typed_closed_record_2
 tests_f.jsonl::contains_window
