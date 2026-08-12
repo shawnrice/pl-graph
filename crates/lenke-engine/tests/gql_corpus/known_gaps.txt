@@ -137,7 +137,6 @@ tests_e.jsonl::graph_pred_is_directed
 tests_e.jsonl::graph_pred_null_is_three_valued
 tests_e.jsonl::graph_pred_source_destination_of
 tests_e.jsonl::group_by_non_returned_key
-tests_e.jsonl::group_by_with_aggregate
 tests_e.jsonl::group_by_without_aggregate_is_distinct
 tests_e.jsonl::is_typed_closed_record_1
 tests_e.jsonl::is_typed_closed_record_2
@@ -160,7 +159,6 @@ tests_e.jsonl::value_subquery_constant
 tests_e.jsonl::value_subquery_correlated_scalar_1
 tests_e.jsonl::value_subquery_correlated_scalar_2
 tests_e.jsonl::value_subquery_where_narrows
-tests_f.jsonl::alias_leave_3
 tests_f.jsonl::contains_window
 tests_f.jsonl::counting_edges_where_14
 tests_f.jsonl::distinct_nan_1
@@ -171,8 +169,6 @@ tests_f.jsonl::distinct_signed_zero_5
 tests_f.jsonl::faulting_aggregate_err
 tests_f.jsonl::fused_pipeline_13
 tests_f.jsonl::group_by_bound_1
-tests_f.jsonl::group_by_bound_2
-tests_f.jsonl::group_by_bound_3
 tests_f.jsonl::inline_constraint_14
 tests_f.jsonl::inline_constraint_15
 tests_f.jsonl::inline_constraint_per_row
@@ -180,8 +176,6 @@ tests_f.jsonl::label_disjunction_7
 tests_f.jsonl::num_string_overflow_1
 tests_f.jsonl::num_string_overflow_2
 tests_f.jsonl::num_string_overflow_4
-tests_f.jsonl::order_alias_10a
-tests_f.jsonl::order_alias_10b
 tests_f.jsonl::order_alias_3a
 tests_f.jsonl::order_alias_9b
 tests_f.jsonl::page_before_projection_1
@@ -191,5 +185,4 @@ tests_f.jsonl::range_bounded_2
 tests_f.jsonl::range_bounded_3
 tests_f.jsonl::range_float_step_stall
 tests_f.jsonl::size_labels_edge
-tests_f.jsonl::vec_extreme_nan_2
 tests_f.jsonl::zero_bound_3

@@ -829,6 +829,23 @@ impl Parser {
         distinct: bool,
         mut items: Vec<RetItem>,
     ) -> Result<Plan, String> {
+        // An explicit `GROUP BY <keys>` after the RETURN list (`RETURN u.n AS a,
+        // count(*) AS c GROUP BY u.n ORDER BY a`) names the grouping keys. The
+        // non-aggregate RETURN items already ARE the implicit grouping keys, so —
+        // matching the SELECT path, which consumes GROUP BY before calling here —
+        // parse it (for syntax + scope) and let the ordinary aggregate path group.
+        // (On the SELECT path GROUP BY is already gone, so this is a no-op there.)
+        if self.eat_kw("GROUP") {
+            if !self.eat_kw("BY") {
+                return Err("expected BY after GROUP".into());
+            }
+            loop {
+                self.expr()?;
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
         let visible: Vec<String> = items.iter().map(RetItem::name).collect();
         let has_agg = items.iter().any(|it| matches!(it, RetItem::Agg(_)));
         // When grouping, the non-aggregate items are the group keys; they occupy the

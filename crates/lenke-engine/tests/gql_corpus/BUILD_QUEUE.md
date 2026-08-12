@@ -180,7 +180,7 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 
 - INC 1 DONE (single-edge endpoint-only, 8 cases).
 - INC 2 (multi-hop body, endpoint-only ~5: mea_trail, qsp_multi_ends_1/2; mea_acyclic/simple DEFER — path mode on multi-hop): bounded-unroll `{n,m}` into r\*k Expands UNION'd; RISK: unroll is a WALK, not Trail — only safe where no edge repeats in reach or `{n,n}` exact. Check each fixture.
-- INC 3 (group-var-as-list in RETURN, ~21: qsp*group_vars*_, gv\__, vqs_7/9/11/13/14/15/19/21/22/23, unanchored_path_len/nodes_size): NEEDS (a) new `Plan::RepeatGroup{body,min,max,mode,group_slots,...}` in ir.rs + a DFS repeater in exec that materializes one Value::List per group slot (columnar analogue of core bind_group_vars_flat pathfind.rs:163), AND (b) `Expr::Index{base,idx}` — subscript `x[i]` — parse postfix `[` in field_chain (gql.rs), eval next to Expr::Field. Expr::Index is a HARD PREREQ (y[size(y)-1], x[0].id). LARGE.
+- INC 3 (group-var-as-list in RETURN, ~21: qsp*group_vars*\_, gv\_\_, vqs_7/9/11/13/14/15/19/21/22/23, unanchored_path_len/nodes_size): NEEDS (a) new `Plan::RepeatGroup{body,min,max,mode,group_slots,...}` in ir.rs + a DFS repeater in exec that materializes one Value::List per group slot (columnar analogue of core bind_group_vars_flat pathfind.rs:163), AND (b) `Expr::Index{base,idx}` — subscript `x[i]` — parse postfix `[` in field_chain (gql.rs), eval next to Expr::Field. Expr::Index is a HARD PREREQ (y[size(y)-1], x[0].id). LARGE.
 - INC 4 DEFER: nested `((..){a,b}){n,m}` list-of-lists (bind_unit recursion), per-rep WHERE with per-rep vars (e.amt<=x.bal — the per-hop-WHERE feature).
   Row order NOT a hazard (multiset compare; ordered:true cases carry ORDER BY).
 
@@ -208,15 +208,15 @@ User directive: fix all remaining deferred items (they were deferred for effort,
   requires a shortest-path selector"; core accepts and binds the (walk) path. NEXT, tractable:
   lift that parser restriction for a var-length body and materialize the lineage path. Verify
   path mode = WALK matches core.
-- **per-hop WHERE in a subpath group `((x)-[e:R]->(y) WHERE pred){n,m}` (~10: qsp_per_hop_*,
-  vqs_8, subpath_where_*)** — where the WHERE only FILTERS and the RETURN needs no group-var
+- **per-hop WHERE in a subpath group `((x)-[e:R]->(y) WHERE pred){n,m}` (~10: qsp*per_hop*_,
+  vqs*8, subpath_where*_)** — where the WHERE only FILTERS and the RETURN needs no group-var
   list (just t.id). Per-rep predicate over the rep's own x/e/y. MEDIUM.
-- **THE BIG ONE: group-variable-as-list `Plan::RepeatGroup` (~21: qsp_group_vars_*, gv_*,
+- **THE BIG ONE: group-variable-as-list `Plan::RepeatGroup` (~21: qsp*group_vars*_, gv\__,
   vqs_7/9/11/…)** — each group var (x,e,y) binds to a Value::List across reps; `size(e)`,
   `x[0].id`, `y[size(y)-1].id`, `WITH e AS hops`. Needs the new operator + DFS repeater
   materializing one list per group slot (columnar analogue of core bind_group_vars_flat).
   Expr::Index (done) was the prereq. LARGE — its own iteration.
-- Smaller: zero_limit_ (4), order_alias_ (4), distinct_nan_ (3), group_by_bound (3),
+- Smaller: zero*limit* (4), order*alias* (4), distinct*nan* (3), group_by_bound (3),
   value_subquery_aggregate (3), num_string_overflow (3, likely value-contract), exists_multi_match (4).
 - VALUE-CONTRACT (surface, don't flip): num_string_overflow, sum/avg-over-temporal faults,
   oversized-int, CAST-throws. Left baselined by design.
@@ -236,13 +236,13 @@ User directive: fix all remaining deferred items (they were deferred for effort,
 ### NEXT (baseline 190), tractable -> hard:
 
 - **repeated-pattern-variable equality join `(a)…(a)` / `(x)-[]->(x)`** (bare_path_binds_simple_cycle
-  + likely others): a variable used twice in a pattern pins the two slots equal (post-filter
-  new_slot == existing_slot). Check how node() binds a name already in scope. SMALL-MED.
+  - likely others): a variable used twice in a pattern pins the two slots equal (post-filter
+    new_slot == existing_slot). Check how node() binds a name already in scope. SMALL-MED.
 - **`->{0,0}` zero-bound quantifier** (zero_bound_3): min=max=0 var-length = stay at source,
   count = source count. Likely a var_length min==max==0 edge case. SMALL.
-- **per-hop WHERE in a subpath group `((x)-[e:R]->(y) WHERE pred){n,m}`** (~10: qsp_per_hop_*,
-  vqs_8, subpath_where_*) where the WHERE only filters. MEDIUM.
-- **THE BIG ONE: group-variable-as-list `Plan::RepeatGroup`** (~21: qsp_group_vars_*, gv_*,
+- **per-hop WHERE in a subpath group `((x)-[e:R]->(y) WHERE pred){n,m}`** (~10: qsp*per_hop*_,
+  vqs*8, subpath_where*_) where the WHERE only filters. MEDIUM.
+- **THE BIG ONE: group-variable-as-list `Plan::RepeatGroup`** (~21: qsp*group_vars*_, gv\__,
   vqs_7/9/11/…). Its own iteration. Expr::Index (done) + var_length lineage (done) are prereqs.
 - Smaller: order_alias (4, NULLS FIRST / DISTINCT+ORDER-BY-underlying-expr), distinct_nan (3),
   group_by_bound (3, LET/WITH bound name + GROUP BY), exists_multi_match (4, EXISTS{ MATCH MATCH }).

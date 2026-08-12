@@ -8430,6 +8430,37 @@ mod tests {
         );
     }
 
+    /// An explicit `GROUP BY` after the RETURN list parses and groups the same as
+    /// the implicit (non-aggregate items are the keys). n=1,1,2 over three P nodes.
+    #[test]
+    fn explicit_group_by_after_return() {
+        let mut b = Builder::default();
+        b.node(&["P"], &[("n", n(1.0))]);
+        b.node(&["P"], &[("n", n(1.0))]);
+        b.node(&["P"], &[("n", n(2.0))]);
+        let store = b.build();
+        // GROUP BY the underlying expression, ORDER BY the alias then the expr.
+        let rows = |q: &str| -> Vec<(f64, f64)> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            run(&plan, &store)
+                .rows
+                .iter()
+                .map(|r| match (&r[0], &r[1]) {
+                    (Value::Num(a), Value::Num(c)) => (*a, *c),
+                    o => panic!("{o:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            rows("MATCH (u:P) RETURN u.n AS a, count(*) AS c GROUP BY u.n ORDER BY a"),
+            vec![(1.0, 2.0), (2.0, 1.0)]
+        );
+        assert_eq!(
+            rows("MATCH (u:P) RETURN u.n AS a, count(*) AS c GROUP BY u.n ORDER BY u.n"),
+            vec![(1.0, 2.0), (2.0, 1.0)]
+        );
+    }
+
     /// LIMIT 0 yields the empty result WITHOUT evaluating the projection, so a
     /// faulting expression (`1/0`) under LIMIT 0 does not error (matches core).
     #[test]
