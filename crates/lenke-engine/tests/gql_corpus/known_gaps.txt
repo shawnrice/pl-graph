@@ -31,12 +31,6 @@ tests_c.jsonl::sum_distinct_mix_num_duration_faults
 tests_c.jsonl::sum_mix_num_duration_faults
 tests_c.jsonl::sum_mix_str_duration_faults
 tests_c.jsonl::temporal_duration_unordered_count_zero
-tests_d.jsonl::bare_all_binds_paths
-tests_d.jsonl::bare_all_composes_mode
-tests_d.jsonl::bare_all_fixed_pattern
-tests_d.jsonl::bare_all_matches_default
-tests_d.jsonl::bare_any_dedups_bounded
-tests_d.jsonl::bare_any_one_per_endpoint
 tests_d.jsonl::call_inline_count
 tests_d.jsonl::call_scope_isolation_total
 tests_d.jsonl::decorrelate_scope_isolation

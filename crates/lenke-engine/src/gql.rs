@@ -682,7 +682,11 @@ impl Parser {
                 }
                 return self.query_tail(plan);
             }
-            let plan = self.match_body()?;
+            let any = self.parse_bare_selector();
+            let mut plan = self.match_body()?;
+            if any == Some(true) {
+                plan = plan.distinct();
+            }
             return self.query_tail(plan);
         }
         // Bare selector form: `MATCH ALL SHORTEST (a)-[:R]->*(x)` — no path variable,
@@ -696,8 +700,34 @@ impl Parser {
             }
             return self.query_tail(plan);
         }
-        let plan = self.match_body()?;
+        // Bare `ALL`/`ANY` selector (no SHORTEST): `ALL` is the default (every path);
+        // `ANY` keeps one arbitrary path per endpoint (dedup the pattern's bindings).
+        let any = self.parse_bare_selector();
+        let mut plan = self.match_body()?;
+        if any == Some(true) {
+            plan = plan.distinct();
+        }
         self.query_tail(plan)
+    }
+
+    /// A BARE `ALL` / `ANY` path selector (NOT `… SHORTEST`, which `parse_shortest_
+    /// selector` owns). Returns `Some(true)` for `ANY` (dedup one path per endpoint),
+    /// `Some(false)` for `ALL` (the default — every path), `None` for neither.
+    fn parse_bare_selector(&mut self) -> Option<bool> {
+        let next_is_shortest = matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s))
+            if s.eq_ignore_ascii_case("SHORTEST"));
+        if next_is_shortest {
+            return None;
+        }
+        if self.peek_kw("ALL") {
+            self.eat_kw("ALL");
+            Some(false)
+        } else if self.peek_kw("ANY") {
+            self.eat_kw("ANY");
+            Some(true)
+        } else {
+            None
+        }
     }
 
     /// Parse a MATCH pattern body — the `MATCH` keyword (and any named-path head)

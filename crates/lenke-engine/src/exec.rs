@@ -9005,6 +9005,39 @@ mod tests {
         );
     }
 
+    /// Bare ALL/ANY selectors: ALL is the default (every path — a duplicate endpoint
+    /// per path), ANY keeps one per endpoint (dedup). Diamond a->b->d, a->c->d.
+    #[test]
+    fn bare_all_any_selectors() {
+        let nd = concat!(
+            "{\"id\":\"a\",\"labels\":[\"N\"],\"props\":{\"id\":\"a\"}}\n",
+            "{\"id\":\"b\",\"labels\":[\"N\"],\"props\":{\"id\":\"b\"}}\n",
+            "{\"id\":\"c\",\"labels\":[\"N\"],\"props\":{\"id\":\"c\"}}\n",
+            "{\"id\":\"d\",\"labels\":[\"N\"],\"props\":{\"id\":\"d\"}}\n",
+            "{\"from\":\"a\",\"to\":\"b\",\"labels\":[\"R\"],\"props\":{}}\n",
+            "{\"from\":\"a\",\"to\":\"c\",\"labels\":[\"R\"],\"props\":{}}\n",
+            "{\"from\":\"b\",\"to\":\"d\",\"labels\":[\"R\"],\"props\":{}}\n",
+            "{\"from\":\"c\",\"to\":\"d\",\"labels\":[\"R\"],\"props\":{}}"
+        );
+        let store = crate::ndjson::from_ndjson(nd).unwrap();
+        let ids = |q: &str| -> Vec<String> {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
+            let mut v = names_of(&run(&plan, &store), 0);
+            v.sort();
+            v
+        };
+        // ALL: d reached by two 2-hop paths → d appears twice; b, c once each.
+        assert_eq!(
+            ids("MATCH ALL (a:N {id:'a'})-[:R]->{1,2}(x) RETURN x.id AS id"),
+            vec!["b", "c", "d", "d"]
+        );
+        // ANY: one per endpoint → b, c, d once each.
+        assert_eq!(
+            ids("MATCH ANY (a:N {id:'a'})-[:R]->{1,2}(x) RETURN x.id AS id"),
+            vec!["b", "c", "d"]
+        );
+    }
+
     /// FOR..IN list unwind: literal list, ordinal (1-based ORDINALITY / 0-based
     /// OFFSET), null/empty → no rows, a scalar singleton, and multiplying a MATCH.
     #[test]
@@ -9012,33 +9045,37 @@ mod tests {
         let mut b = Builder::default();
         b.node(&["P"], &[("name", s("marko"))]);
         let store = b.build();
-        let col = |q: &str, c: usize| -> Vec<Value> {
+        let nums = |q: &str| -> Vec<f64> {
             let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &store);
             run(&plan, &store)
                 .rows
                 .iter()
-                .map(|r| r[c].clone())
+                .map(|r| match r[0] {
+                    Value::Num(x) => x,
+                    ref o => panic!("{o:?}"),
+                })
                 .collect()
         };
-        assert_eq!(
-            col("FOR x IN [1, 2, 3] RETURN x", 0),
-            vec![Value::Num(1.0), Value::Num(2.0), Value::Num(3.0)]
-        );
+        assert_eq!(nums("FOR x IN [1, 2, 3] RETURN x"), vec![1.0, 2.0, 3.0]);
         // ORDINALITY is 1-based, OFFSET 0-based.
         assert_eq!(
-            col("FOR x IN ['a','b'] WITH ORDINALITY i RETURN i", 0),
-            vec![Value::Num(1.0), Value::Num(2.0)]
+            nums("FOR x IN ['a','b'] WITH ORDINALITY i RETURN i"),
+            vec![1.0, 2.0]
         );
         assert_eq!(
-            col("FOR x IN ['a','b'] WITH OFFSET i RETURN i", 0),
-            vec![Value::Num(0.0), Value::Num(1.0)]
+            nums("FOR x IN ['a','b'] WITH OFFSET i RETURN i"),
+            vec![0.0, 1.0]
         );
         // null and empty list → no rows; a non-list scalar → one row.
-        assert_eq!(col("FOR x IN null RETURN x", 0).len(), 0);
-        assert_eq!(col("FOR x IN [] RETURN x", 0).len(), 0);
-        assert_eq!(col("FOR x IN 5 RETURN x", 0), vec![Value::Num(5.0)]);
+        assert_eq!(nums("FOR x IN null RETURN x").len(), 0);
+        assert_eq!(nums("FOR x IN [] RETURN x").len(), 0);
+        assert_eq!(nums("FOR x IN 5 RETURN x"), vec![5.0]);
         // Multiplies a prior MATCH (one row per (match, element)).
-        assert_eq!(col("MATCH (p:P) FOR t IN ['x','y'] RETURN t", 0).len(), 2);
+        let plan = crate::opt::optimize_indexed(
+            crate::gql::parse("MATCH (p:P) FOR t IN ['x','y'] RETURN t").unwrap(),
+            &store,
+        );
+        assert_eq!(run(&plan, &store).rows.len(), 2);
     }
 
     /// A single-outer-rep endpoint-only nested group `( ()-[:R]->{1,3}() ){1} (t)`
