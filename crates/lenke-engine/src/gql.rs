@@ -1275,12 +1275,15 @@ impl Parser {
             scope.insert(v.clone(), 0);
         }
         let rel = self.rel()?;
-        let min = if self.eat(&Tok::Star) {
-            0
+        // `*` → min 0 unbounded, `+` → min 1 unbounded, `{n,m}` → a bounded hop range.
+        let (min, max) = if self.eat(&Tok::Star) {
+            (0, None)
         } else if self.eat(&Tok::Plus) {
-            1
+            (1, None)
+        } else if let Some((lo, hi)) = self.opt_quantifier()? {
+            (lo, Some(hi))
         } else {
-            return Err("a shortest path requires a `*` or `+` quantifier".into());
+            return Err("a shortest path requires a `*`, `+`, or `{n,m}` quantifier".into());
         };
         let (vb, _lb, vb_props, vb_where, _vb_le) = self.node()?;
         if va_where.is_some() || vb_where.is_some() {
@@ -1308,7 +1311,7 @@ impl Parser {
         };
         // Seed node: label + inline props seed the scan (slot 0).
         let mut plan = node_prop_filters(Plan::Scan { label: la }, 0, va_props);
-        plan = plan.shortest_path(0, rel.dir, &rel.etypes, min, None, selector, edge_pred);
+        plan = plan.shortest_path(0, rel.dir, &rel.etypes, min, max, selector, edge_pred);
         // Endpoint node at slot 1: inline props filter it; its label is ignored (as
         // for any landing node in this subset).
         plan = node_prop_filters(plan, 1, vb_props);

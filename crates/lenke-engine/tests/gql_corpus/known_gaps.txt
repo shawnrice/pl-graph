@@ -21,7 +21,6 @@ tests_b.jsonl::cast_list
 tests_b.jsonl::malformed_num_1e999_error
 tests_b.jsonl::oversized_int_error
 tests_b.jsonl::sum_date_errors
-tests_c.jsonl::any_shortest_bounded_one_names
 tests_c.jsonl::any_shortest_plus_seed_cycle_len
 tests_c.jsonl::bool_times_num_faults
 tests_c.jsonl::for_drives_batch_optional_match
