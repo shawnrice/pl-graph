@@ -14,8 +14,6 @@ hardening.jsonl::h_valid_numeric_literals_accepted_9
 language.jsonl::m_block_comment
 language.jsonl::m_colon_label_predicate_desugars_to_is_labeled_1
 language.jsonl::m_colon_label_predicate_desugars_to_is_labeled_2
-language.jsonl::m_count_subquery_in_where
-language.jsonl::m_count_subquery_returns_correlated_match_count
 language.jsonl::m_edge_label_disjunction
 language.jsonl::m_edge_label_negation
 language.jsonl::m_except
@@ -72,16 +70,11 @@ tck.jsonl::tck_precedence1_and_takes_precedence_over_xor
 tck.jsonl::tck_precedence1_iso_or_xor_share_left_associative_level
 tests_a.jsonl::case_simple_form
 tests_a.jsonl::count_star_shortcut_plus1
-tests_a.jsonl::count_subquery
-tests_a.jsonl::count_subquery_degree_1
 tests_a.jsonl::count_subquery_degree_10
 tests_a.jsonl::count_subquery_degree_11
 tests_a.jsonl::count_subquery_degree_12
-tests_a.jsonl::count_subquery_degree_2
 tests_a.jsonl::count_subquery_degree_3
 tests_a.jsonl::count_subquery_degree_4
-tests_a.jsonl::count_subquery_degree_5
-tests_a.jsonl::count_subquery_degree_6
 tests_a.jsonl::count_subquery_degree_7
 tests_a.jsonl::count_subquery_degree_8
 tests_a.jsonl::count_subquery_degree_9

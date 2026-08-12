@@ -985,7 +985,9 @@ fn max_slot(expr: &Expr) -> Option<usize> {
         // EXISTS correlates on outer slots below `outer_width`; claim it reads up
         // to the topmost, so the predicate is never pushed below an operator that
         // binds a variable it might reference.
-        Expr::Exists { outer_width, .. } => outer_width.checked_sub(1),
+        Expr::Exists { outer_width, .. } | Expr::CountSubquery { outer_width, .. } => {
+            outer_width.checked_sub(1)
+        }
     }
 }
 

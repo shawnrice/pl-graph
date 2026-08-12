@@ -673,7 +673,8 @@ fn needs_lineage(plan: &Plan) -> bool {
             | Expr::Prop { .. }
             | Expr::Lit(_)
             | Expr::PropertyExists { .. }
-            | Expr::Exists { .. } => false,
+            | Expr::Exists { .. }
+            | Expr::CountSubquery { .. } => false,
         }
     }
     match plan {
@@ -4282,7 +4283,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         // An EXISTS correlates on outer slots below `outer_width`; conservatively
         // treat it as touching more than one, so it never rides the frontier-only
         // aggregate fast path.
-        Expr::Exists { .. } => false,
+        Expr::Exists { .. } | Expr::CountSubquery { .. } => false,
     }
 }
 
@@ -4366,7 +4367,7 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         },
         // Never reached: `refs_only_slot` rejects EXISTS, so the frontier remap
         // that calls this is never handed one. Clone rather than rewrite a body.
-        Expr::Exists { .. } => expr.clone(),
+        Expr::Exists { .. } | Expr::CountSubquery { .. } => expr.clone(),
     }
 }
 
@@ -5497,6 +5498,26 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 }
             }
             Col::Bool(hit)
+        }
+        Expr::CountSubquery { body, .. } => {
+            // Correlated count: same provenance-tagged sub-run as EXISTS, but TALLY
+            // the sub-rows per outer row instead of a boolean any().
+            let n = batch.rows();
+            let prov = batch.slots.len();
+            let mut slots = batch.slots.clone();
+            slots.push(Col::Num((0..n).map(|i| i as f64).collect()));
+            let seed = Batch::of(slots);
+            let survivors = pull_body(body, store, &seed)?;
+            let mut counts = vec![0f64; n];
+            if let Col::Num(ids) = survivors.slot(prov) {
+                for &id in ids {
+                    let i = id as usize;
+                    if i < n {
+                        counts[i] += 1.0;
+                    }
+                }
+            }
+            Col::Num(counts)
         }
     })
 }

@@ -1857,6 +1857,11 @@ impl Parser {
                 if s.eq_ignore_ascii_case("exists") {
                     return self.exists_expr();
                 }
+                // COUNT { <pattern> } — the correlated count subquery (braces), as
+                // opposed to the `count(*)`/`count(x)` aggregate (parens).
+                if s.eq_ignore_ascii_case("count") && matches!(self.peek(), Some(Tok::LBrace)) {
+                    return self.count_subquery_expr();
+                }
                 // Two-word zoned literal `ZONED TIME '…'` / `ZONED DATETIME '…'`.
                 if s.eq_ignore_ascii_case("zoned") {
                     if let Some(Tok::Ident(kind)) = self.peek().cloned() {
@@ -2001,35 +2006,54 @@ impl Parser {
     // already bound in the outer scope (the correlation), and the body extends
     // from it. A trailing WHERE is a sub-pattern predicate over the body scope.
     fn exists_expr(&mut self) -> Result<Expr, String> {
+        let (body, outer_width) = self.correlated_subquery_body("EXISTS")?;
+        Ok(Expr::Exists {
+            body: Box::new(body),
+            outer_width,
+        })
+    }
+
+    // count_subquery := COUNT '{' node ( rel [quant] node )* [WHERE pred] '}' — the
+    // number of sub-matches per outer row (distinct from the `count(*)` aggregate,
+    // which takes `(…)`). Same correlated body as EXISTS.
+    fn count_subquery_expr(&mut self) -> Result<Expr, String> {
+        let (body, outer_width) = self.correlated_subquery_body("COUNT")?;
+        Ok(Expr::CountSubquery {
+            body: Box::new(body),
+            outer_width,
+        })
+    }
+
+    /// Parse the `{ <pattern> [WHERE pred] }` body shared by `EXISTS { … }` and
+    /// `COUNT { … }`: a pattern correlated on an outer-bound start variable, rooted at
+    /// `Plan::Row`, with slot `outer_width` reserved for the evaluator's provenance
+    /// column. Returns `(body, outer_width)`. `kw` names the construct for errors.
+    fn correlated_subquery_body(&mut self, kw: &str) -> Result<(Plan, usize), String> {
         self.expect(&Tok::LBrace)?;
         let outer_width = self.slots;
         let (var, label, props) = self.node()?;
         let Some(v) = var else {
-            return Err("EXISTS pattern must start from a bound variable".into());
+            return Err(format!("{kw} pattern must start from a bound variable"));
         };
         if label.is_some() {
             return Err(format!(
-                "bound variable `{v}` cannot be re-labeled inside EXISTS"
+                "bound variable `{v}` cannot be re-labeled inside {kw}"
             ));
         }
         if !props.is_empty() {
             return Err(format!(
                 "bound variable `{v}` cannot be re-constrained with inline properties inside \
-                 EXISTS; use WHERE"
+                 {kw}; use WHERE"
             ));
         }
         let Some(&from) = self.scope.get(&v) else {
             return Err(format!(
-                "EXISTS must start from a bound (correlated) variable; `{v}` is not in scope"
+                "{kw} must start from a bound (correlated) variable; `{v}` is not in scope"
             ));
         };
-        // The body's sub-scope: the outer variables stay at their slots, slot
-        // `outer_width` is reserved for the provenance column the evaluator adds,
-        // and new body variables land at `outer_width + 1` onward.
         let mut sub_scope = self.scope.clone();
         let mut sub_slots = outer_width + 1;
         let body = self.extend_chain(Plan::Row, &mut sub_scope, &mut sub_slots, from)?;
-        // An optional WHERE inside the braces, resolved against the body scope.
         let body = if self.eat_kw("WHERE") {
             let saved_scope = std::mem::replace(&mut self.scope, sub_scope);
             let saved_slots = std::mem::replace(&mut self.slots, sub_slots);
@@ -2041,10 +2065,7 @@ impl Parser {
             body
         };
         self.expect(&Tok::RBrace)?;
-        Ok(Expr::Exists {
-            body: Box::new(body),
-            outer_width,
-        })
+        Ok((body, outer_width))
     }
 
     // call := name '(' [ expr (',' expr)* ] ')'  — a scalar function.

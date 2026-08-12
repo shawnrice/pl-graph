@@ -132,6 +132,14 @@ pub enum Expr {
         body: Box<Plan>,
         outer_width: usize,
     },
+    /// `COUNT { <pattern> [WHERE …] }` — a correlated count subquery. Same body shape
+    /// and correlation as [`Expr::Exists`] (a `Plan::Row`-rooted body over the outer
+    /// rows, provenance-tagged), but yields the NUMBER of sub-matches per outer row as
+    /// a `Num`, not a Bool.
+    CountSubquery {
+        body: Box<Plan>,
+        outer_width: usize,
+    },
     /// `needle IN haystack` where `haystack` is a dynamic (non-literal) list
     /// expression (a list property, a param, a function result). A literal
     /// `x IN [a, b]` desugars to an OR-chain at parse time instead; this is the
