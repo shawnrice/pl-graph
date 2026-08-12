@@ -14,7 +14,6 @@ tests_b.jsonl::cast_list
 tests_b.jsonl::malformed_num_1e999_error
 tests_b.jsonl::oversized_int_error
 tests_c.jsonl::temporal_duration_unordered_count_zero
-tests_e.jsonl::date_part_bare_name_unknown_fn
 tests_e.jsonl::date_part_rejects_number
 tests_e.jsonl::date_part_rejects_string
 tests_f.jsonl::distinct_nan_1

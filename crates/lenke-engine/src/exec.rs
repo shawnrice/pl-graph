@@ -7622,18 +7622,7 @@ fn eval_all<'a>(
 fn call_scalar_checked(name: &str, args: &[Value]) -> Result<Value, String> {
     if matches!(
         name,
-        "year"
-            | "month"
-            | "day"
-            | "hour"
-            | "minute"
-            | "second"
-            | "_year"
-            | "_month"
-            | "_day"
-            | "_hour"
-            | "_minute"
-            | "_second"
+        "_year" | "_month" | "_day" | "_hour" | "_minute" | "_second"
     ) {
         if let Value::Temporal(t) = &args[0] {
             return date_part(name.trim_start_matches('_'), *t)
@@ -8042,11 +8031,9 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
             _ => Value::Null,
         },
         // Temporal component accessors (1 arg → number, or NULL when the component
-        // is undefined for that kind, e.g. year() of a time).
-        // Core spells these with the leading-underscore extension sigil (`_year`);
-        // accept that (parity) plus the bare name (kept as a superset alias).
-        "year" | "month" | "day" | "hour" | "minute" | "second" | "_year" | "_month" | "_day"
-        | "_hour" | "_minute" | "_second" => match &args[0] {
+        // is undefined for that kind). Core spells these with the leading-underscore
+        // extension sigil (`_year`); the bare ISO name is not in the grammar.
+        "_year" | "_month" | "_day" | "_hour" | "_minute" | "_second" => match &args[0] {
             Value::Temporal(t) => date_part(name.trim_start_matches('_'), *t)
                 .map_or(Value::Null, |n| Value::Num(n as f64)),
             _ => Value::Null,

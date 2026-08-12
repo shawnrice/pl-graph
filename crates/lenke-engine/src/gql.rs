@@ -4935,7 +4935,9 @@ impl Parser {
             "abs" | "sign" | "floor" | "ceil" | "ceiling" | "sqrt" | "exp" | "ln" | "log10"
             | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh"
             | "cot" | "degrees" | "radians" | "upper" | "lower" | "trim" | "length" | "size"
-            | "head" | "last" | "year" | "month" | "day" | "hour" | "minute" | "second"
+            | "head" | "last"
+            // Temporal component accessors carry the leading-underscore extension sigil
+            // (`_year`), matching core; the bare ISO spellings are NOT in the grammar.
             | "_year" | "_month" | "_day" | "_hour" | "_minute" | "_second" | "date"
             | "local_time" | "datetime" | "local_datetime" | "zoned_time" | "zoned_datetime"
             | "duration" | "to_integer" | "tointeger" | "to_float" | "tofloat" | "to_string"
@@ -6054,12 +6056,15 @@ mod tests {
     #[test]
     fn temporal_component_accessors() {
         let store = social();
+        // Component accessors carry the leading-underscore extension sigil (`_year`);
+        // the bare ISO spelling `year()` is NOT a function (unknown-function error).
+        assert!(super::parse("RETURN year(DATE '2024-03-15') AS y").is_err());
         let out = run(
             &super::parse(
-                "MATCH (p:Person) RETURN year(DATE '2024-03-15') AS y, \
-                 month(DATE '2024-03-15') AS mo, day(DATE '2024-03-15') AS d, \
-                 hour(TIME '13:45:06') AS h, minute(TIME '13:45:06') AS mi, \
-                 second(TIME '13:45:06') AS se, year(DATETIME '2020-07-04T09:30:00') AS dty",
+                "MATCH (p:Person) RETURN _year(DATE '2024-03-15') AS y, \
+                 _month(DATE '2024-03-15') AS mo, _day(DATE '2024-03-15') AS d, \
+                 _hour(TIME '13:45:06') AS h, _minute(TIME '13:45:06') AS mi, \
+                 _second(TIME '13:45:06') AS se, _year(DATETIME '2020-07-04T09:30:00') AS dty",
             )
             .unwrap(),
             &store,
@@ -6078,8 +6083,8 @@ mod tests {
         // A component undefined for the kind FAULTS with E_INVALID_VALUE (year of a
         // time, hour of a date) — matching core, which errors rather than NULLs.
         for q in [
-            "MATCH (p:Person) RETURN year(TIME '01:02:03') AS y",
-            "MATCH (p:Person) RETURN hour(DATE '2024-01-01') AS h",
+            "MATCH (p:Person) RETURN _year(TIME '01:02:03') AS y",
+            "MATCH (p:Person) RETURN _hour(DATE '2024-01-01') AS h",
         ] {
             let err = crate::exec::try_run(&super::parse(q).unwrap(), &store);
             assert!(
