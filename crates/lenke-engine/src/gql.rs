@@ -1998,6 +1998,13 @@ impl Parser {
             }
             return Ok(Value::List(items));
         }
+        // A leading `-` on a numeric literal (`{n: -0.0}`, `-3`): negate the number.
+        if self.eat(&Tok::Minus) {
+            return match self.bump() {
+                Some(Tok::Num(n)) => Ok(Value::Num(-n)),
+                other => Err(format!("expected a number after `-`, got {other:?}")),
+            };
+        }
         match self.bump() {
             Some(Tok::Num(n)) => Ok(Value::Num(n)),
             Some(Tok::Str(s)) => Ok(Value::Str(s.into())),
