@@ -777,6 +777,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         Plan::Scan { .. }
         | Plan::NodeSeed { .. }
         | Plan::EdgeScan
+        | Plan::EdgeSeed { .. }
         | Plan::Row
         | Plan::IndexSeek { .. }
         | Plan::RangeSeek { .. }
@@ -891,6 +892,22 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // g.E() read (no path()/lineage step targets an edge frontier yet), so
             // no lineage is seeded here — a path over g.E() is a later item.
             Batch::single(Col::Edges(store.all_edges()))
+        }
+        Plan::EdgeSeed { ext_ids } => {
+            // Resolve each external id to a LIVE edge, preserving request order; an
+            // unknown/deleted id is dropped. No reverse ext→edge map exists, so build
+            // one lazily from the live-edge set (edge id lookups are rare/small).
+            let mut by_ext: std::collections::HashMap<Arc<str>, u32> = std::collections::HashMap::new();
+            for e in store.all_edges() {
+                if let Some(x) = store.edge_ext_id(e) {
+                    by_ext.entry(x).or_insert(e);
+                }
+            }
+            let ids: Vec<u32> = ext_ids
+                .iter()
+                .filter_map(|e| by_ext.get(e.as_str()).copied())
+                .collect();
+            Batch::single(Col::Edges(ids))
         }
         Plan::IndexSeek { label, key, value } => {
             let ids = index_seek_ids(store, label, key, value);

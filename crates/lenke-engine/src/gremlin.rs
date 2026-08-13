@@ -538,6 +538,72 @@ impl Parser {
         }
     }
 
+    /// Parse the body of a `project(...).by(<body>)` modulator (the cursor sits just
+    /// after the opening `(`; leaves it AT the closing `)`). Supports the same key/id/
+    /// label forms as [`by_key_expr`], the bare `by()` (the element itself), and a
+    /// degree sub-traversal `[__.](out|in|both|outE|inE|bothE)('L'…).count()` — a
+    /// correlated `CountSubquery`, the only nested body core's projections use here.
+    fn project_by_body(&mut self, elem_slot: usize) -> Result<Expr, String> {
+        // bare by() → the element itself.
+        if self.peek() == Some(&Tok::RParen) {
+            return Ok(Expr::Slot(elem_slot));
+        }
+        // by('key') / by(id) / by(label) / by(T.id) / by(T.label).
+        let token_form = matches!(self.peek(), Some(Tok::Str(_)))
+            || matches!(self.peek(), Some(Tok::Ident(s)) if {
+                let l = s.to_ascii_lowercase();
+                l == "id" || l == "label" || l == "t"
+            });
+        if token_form {
+            return Ok(self.by_key_expr(elem_slot)?.1);
+        }
+        // Degree sub-traversal: an optional `__.`, one navigating hop, `.count()`.
+        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+            self.bump();
+            self.expect(&Tok::Dot)?;
+        }
+        let hop = self.ident()?.to_ascii_lowercase();
+        let (dir, is_edge) = match hop.as_str() {
+            "out" => (Dir::Out, false),
+            "in" => (Dir::In, false),
+            "both" => (Dir::Both, false),
+            "oute" => (Dir::Out, true),
+            "ine" => (Dir::In, true),
+            "bothe" => (Dir::Both, true),
+            other => {
+                return Err(format!(
+                    "project().by(<traversal>): only a degree `….count()` body is supported, got `{other}`"
+                ))
+            }
+        };
+        self.expect(&Tok::LParen)?;
+        let mut labels: Vec<String> = Vec::new();
+        if matches!(self.peek(), Some(Tok::Str(_))) {
+            labels.push(self.str_arg()?);
+            while self.peek() == Some(&Tok::Comma) {
+                self.bump();
+                labels.push(self.str_arg()?);
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        self.expect(&Tok::Dot)?;
+        let c = self.ident()?;
+        if !c.eq_ignore_ascii_case("count") {
+            return Err("project().by(<traversal>) body must end with .count()".into());
+        }
+        self.expect(&Tok::LParen)?;
+        self.expect(&Tok::RParen)?;
+        let body = if is_edge {
+            Plan::Row.expand_edge(elem_slot, dir, &labels)
+        } else {
+            Plan::Row.expand(elem_slot, dir, &labels)
+        };
+        Ok(Expr::CountSubquery {
+            body: Box::new(body),
+            outer_width: self.slots,
+        })
+    }
+
     // traversal := 'g' '.' ( 'V' '(' ')' | 'addV' '(' Label ')' ) ( '.' step )*
     fn traversal(&mut self) -> Result<Plan, String> {
         let g = self.ident()?;
@@ -603,16 +669,22 @@ impl Parser {
             }
             "e" => {
                 self.expect(&Tok::LParen)?;
-                // `g.E()` seeds every live edge. `g.E('id', …)` (edges by external
-                // id) is deferred — it needs an edge-liveness-checked reverse ext
-                // map the store does not carry yet.
-                if matches!(self.peek(), Some(Tok::Str(_))) {
-                    return Err("g.E(id) (edges by external id) is not supported yet".into());
-                }
-                self.expect(&Tok::RParen)?;
-                // An edge source makes the path start on an edge, not a node.
+                // `g.E()` seeds every live edge; `g.E('id', …)` seeds the edges with
+                // those external ids (in request order).
                 self.path_ok = false;
-                Plan::EdgeScan
+                if matches!(self.peek(), Some(Tok::Str(_))) {
+                    let mut ext_ids = vec![self.str_arg()?];
+                    while self.peek() == Some(&Tok::Comma) {
+                        self.bump();
+                        ext_ids.push(self.str_arg()?);
+                    }
+                    self.expect(&Tok::RParen)?;
+                    Plan::EdgeSeed { ext_ids }
+                } else {
+                    self.expect(&Tok::RParen)?;
+                    // An edge source makes the path start on an edge, not a node.
+                    Plan::EdgeScan
+                }
             }
             "adde" => {
                 // g.addE('T').from(V(a)).to(V(b)).property(...)
@@ -1964,22 +2036,7 @@ impl Parser {
                     self.expect(&Tok::Dot)?;
                     self.ident()?; // `by`
                     self.expect(&Tok::LParen)?;
-                    let by = if matches!(self.peek(), Some(Tok::Str(_))) {
-                        // by('key') → property access on the current element.
-                        let key = self.str_arg()?;
-                        Expr::Prop {
-                            slot: elem_slot,
-                            key,
-                        }
-                    } else if self.peek() == Some(&Tok::RParen) {
-                        // bare by() → the current element itself.
-                        Expr::Slot(elem_slot)
-                    } else {
-                        return Err(
-                            "project().by(<nested traversal>) is not yet supported (use by('key') or by())"
-                                .into(),
-                        );
-                    };
+                    let by = self.project_by_body(elem_slot)?;
                     self.expect(&Tok::RParen)?;
                     bys.push(by);
                 }
@@ -2967,8 +3024,15 @@ impl Parser {
             self.expect(&Tok::Dot)?;
         }
         // An identifier immediately applied to `(` is an operator; anything else is
-        // a bare literal compared for equality.
-        if matches!(self.peek(), Some(Tok::Ident(_)))
+        // a bare literal compared for equality. A temporal constructor (`date(…)`,
+        // `datetime(…)`, …) reads as a LITERAL, not an operator — `has('vf',
+        // date('…'))` is an equality, and `lte(date('…'))` nests it as the bound.
+        let is_temporal_ctor = matches!(self.peek(), Some(Tok::Ident(s)) if matches!(
+            s.to_ascii_lowercase().as_str(),
+            "date" | "datetime" | "time" | "duration" | "zoned_time" | "zoned_datetime"
+        ));
+        if !is_temporal_ctor
+            && matches!(self.peek(), Some(Tok::Ident(_)))
             && self.toks.get(self.pos + 1) == Some(&Tok::LParen)
         {
             let op_name = self.ident()?.to_ascii_lowercase();
@@ -3088,6 +3152,26 @@ impl Parser {
     }
 
     fn literal(&mut self) -> Result<Value, String> {
+        // Temporal constructors — `date('…')`, `datetime('…')`, `time('…')`,
+        // `duration('…')`, `zoned_time`/`zoned_datetime`. The text dialect spells
+        // local time `time(…)` where the shared tag is `localtime`; every kind goes
+        // through the one `Temporal::parse` the codecs and GQL parser use.
+        if let Some(Tok::Ident(name)) = self.peek() {
+            let ctor = name.to_ascii_lowercase();
+            if matches!(
+                ctor.as_str(),
+                "date" | "datetime" | "time" | "duration" | "zoned_time" | "zoned_datetime"
+            ) && self.toks.get(self.pos + 1) == Some(&Tok::LParen)
+            {
+                self.bump(); // ctor name
+                self.expect(&Tok::LParen)?;
+                let lit = self.str_arg()?;
+                self.expect(&Tok::RParen)?;
+                let tag = if ctor == "time" { "localtime" } else { &ctor };
+                let t = crate::temporal::Temporal::parse(tag, &lit)?;
+                return Ok(Value::Temporal(t));
+            }
+        }
         match self.bump() {
             Some(Tok::Str(s)) => Ok(Value::Str(s.into())),
             Some(Tok::Num(n)) => Ok(Value::Num(n)),
@@ -3820,8 +3904,8 @@ mod tests {
             )),
             vec!["Map([(Str(\"n\"), Str(\"bob\")), (Str(\"self\"), Num(1.0))]);"],
         );
-        // Nested-traversal by-modulators are deferred, not mis-parsed.
-        assert!(super::parse("g.V().project('c').by(out().count())").is_err());
+        // A degree `<hop>.count()` by-modulator is a correlated count subquery.
+        assert!(super::parse("g.V().project('c').by(out().count())").is_ok());
     }
 
     /// `path()` over a pure vertex-hop chain yields the sequence of vertices visited,
@@ -4044,8 +4128,8 @@ mod tests {
         // Same "count every edge" via GQL's directed anonymous pattern.
         let gql = value_bag(&gql_rows("MATCH ()-[r]->() RETURN count(r)", &store));
         assert_eq!(ge, gql);
-        // g.E('id') (edges by external id) is deferred, not silently mis-parsed.
-        assert!(super::parse("g.E('e0')").is_err());
+        // g.E('id') (edges by external id) seeds the named edge.
+        assert!(super::parse("g.E('e0')").is_ok());
     }
 
     /// `has(k)` filters elements that CARRY property `k`; `hasNot(k)` those that
@@ -4268,7 +4352,7 @@ mod tests {
     fn errors_not_panics() {
         assert!(super::parse("g.V(").is_err());
         assert!(super::parse("g.E().values('x')").is_ok()); // g.E() is an all-edges source now
-        assert!(super::parse("g.E('e0')").is_err()); // edges-by-id form still deferred
+        assert!(super::parse("g.E('e0')").is_ok()); // edges by external id
         assert!(super::parse("g.V().frobnicate()").is_err()); // unknown step
         assert!(super::parse("g.V().has('k')").is_ok()); // has(k) is key-existence now
         assert!(super::parse("g.V().has()").is_err()); // has still needs a key

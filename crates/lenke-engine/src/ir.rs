@@ -446,6 +446,10 @@ pub enum Plan {
     /// (a `Col::Edges` frontier), not nodes; downstream steps that read the current
     /// element (`values`/`id`/`label`/`count`) resolve it as an edge.
     EdgeScan,
+    /// Seed slot 0 with specific EDGES by external id — Gremlin `g.E(id, …)`. Like
+    /// [`NodeSeed`] but for the edge frontier; an id resolving to no live edge
+    /// contributes nothing. Preserves the requested id order.
+    EdgeSeed { ext_ids: Vec<String> },
     /// The correlated current row — the leaf of an `EXISTS { … }` body. It is NOT
     /// a stand-alone source: it yields whatever batch the enclosing `Expr::Exists`
     /// feeds it (the outer rows plus a provenance column), so it only ever appears

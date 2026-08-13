@@ -106,6 +106,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
         p @ (Plan::Scan { .. }
         | Plan::NodeSeed { .. }
         | Plan::EdgeScan
+        | Plan::EdgeSeed { .. }
         | Plan::Row
         | Plan::IndexSeek { .. }
         | Plan::RangeSeek { .. }
@@ -1217,6 +1218,7 @@ fn width(plan: &Plan) -> usize {
         Plan::Scan { .. }
         | Plan::NodeSeed { .. }
         | Plan::EdgeScan
+        | Plan::EdgeSeed { .. }
         | Plan::IndexSeek { .. }
         | Plan::RangeSeek { .. } => 1,
         // A named procedure yields exactly two columns: node id + its result.
@@ -1734,6 +1736,7 @@ mod tests {
             Plan::Scan { .. }
             | Plan::NodeSeed { .. }
             | Plan::EdgeScan
+        | Plan::EdgeSeed { .. }
             | Plan::Row
             | Plan::IndexSeek { .. }
             | Plan::RangeSeek { .. }
