@@ -750,6 +750,11 @@ pub enum Plan {
     Tree {
         input: Box<Plan>,
         by: Option<String>,
+        /// A trailing value projection folded INTO the tree as its leaf level —
+        /// `out(...).values('name').tree()` keys the last level by the last vertex's
+        /// `leaf_value` property (a scalar), one level deeper than the vertices. `None`
+        /// = a plain vertex-path tree.
+        leaf_value: Option<String>,
     },
     /// A Gremlin OLAP annotate step (`pageRank`/`connectedComponent`/`peerPressure`):
     /// run the algorithm over the whole store, then APPEND the per-node result as a
@@ -1175,10 +1180,11 @@ impl Plan {
     }
 
     #[must_use]
-    pub fn tree(self, by: Option<String>) -> Self {
+    pub fn tree(self, by: Option<String>, leaf_value: Option<String>) -> Self {
         Self::Tree {
             input: Box::new(self),
             by,
+            leaf_value,
         }
     }
 

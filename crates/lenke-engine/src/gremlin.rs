@@ -33,6 +33,8 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         path_ok: true,
         edge_path_ok: true,
         path_has_edges: false,
+        path_leaf: None,
+        path_ok_pre_step: true,
         caps: std::collections::HashMap::new(),
         algo_props: std::collections::HashMap::new(),
         last_algo: None,
@@ -565,6 +567,14 @@ struct Parser {
     /// At least one explicit edge hop (`outE`/`inE`/`bothE`) occurred — the signal to
     /// render `path()` as the interleaved node/edge chain rather than nodes-only.
     path_has_edges: bool,
+    /// A trailing `values('k')` on a vertex-hop chain that a following `tree()` folds
+    /// in as its leaf level (`out(...).values('name').tree()`). The `values` step, when
+    /// it sees `tree()` next, records the key here INSTEAD of projecting (which would
+    /// drop the lineage), keeping the vertex frontier so tree() reads the node path.
+    path_leaf: Option<String>,
+    /// `path_ok` as it was at the START of the current step, before that step's taint —
+    /// the values-into-tree check needs the pre-step value (the taint runs first).
+    path_ok_pre_step: bool,
     /// Whether `path()` can still be answered: true while the traversal is a pure
     /// vertex-hop chain (`V`-source + `out`/`in`/`both` + element filters), whose
     /// Gremlin path is exactly the node sequence the engine's lineage records. Any
@@ -1096,6 +1106,9 @@ impl Parser {
         } else {
             plan
         };
+        // The pre-taint value — a `values('k')` that folds into a following `tree()`
+        // needs to know it was still on a pure vertex chain BEFORE this step's taint.
+        self.path_ok_pre_step = self.path_ok;
         // Only a pure vertex-hop chain keeps `path()` answerable; every other step
         // taints it (`path()` and the element filters are path-preserving). The repeat
         // modulators are exempt: `repeat(<vertex-hop>)` lowers to a VarLength walk that
@@ -2170,6 +2183,25 @@ impl Parser {
                 }
                 self.expect(&Tok::RParen)?;
                 let from = self.current;
+                // `<vertex-hop chain>.values('k').tree()`: fold the projected value in as
+                // the tree's LEAF level. Projecting here would collapse the batch and drop
+                // the lineage tree() reads, so instead keep the vertex frontier, filter to
+                // rows that HAVE the key (values() skips absent), and record the leaf key.
+                if keys.len() == 1
+                    && self.path_ok_pre_step
+                    && matches!(self.peek(), Some(Tok::Dot))
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("tree"))
+                {
+                    let key = keys.pop().expect("one key");
+                    let p = plan.filter(Expr::PropertyExists {
+                        slot: from,
+                        key: key.clone(),
+                    });
+                    // Keep the vertex chain answerable so tree() reads the node lineage.
+                    self.path_ok = true;
+                    self.path_leaf = Some(key);
+                    return Ok(p);
+                }
                 let p = if keys.len() == 1 && self.algo_props.contains_key(&keys[0]) {
                     // An OLAP annotate property reads the computed slot (always present).
                     let slot = self.algo_props[&keys[0]];
@@ -4017,7 +4049,10 @@ impl Parser {
                 } else {
                     None
                 };
-                let p = plan.tree(by);
+                // A trailing `values('k')` (recorded by the values arm) folds in as the
+                // leaf level of the tree.
+                let leaf = self.path_leaf.take();
+                let p = plan.tree(by, leaf);
                 self.current = 0;
                 self.slots = 1;
                 p

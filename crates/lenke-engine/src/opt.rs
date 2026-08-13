@@ -119,12 +119,17 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             let (i, c) = rewrite(*input, idx);
             (Plan::GroupToMap { input: Box::new(i) }, c)
         }
-        Plan::Tree { input, by } => {
+        Plan::Tree {
+            input,
+            by,
+            leaf_value,
+        } => {
             let (i, c) = rewrite(*input, idx);
             (
                 Plan::Tree {
                     input: Box::new(i),
                     by,
+                    leaf_value,
                 },
                 c,
             )

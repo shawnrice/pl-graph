@@ -1416,7 +1416,11 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             ]));
             Batch::single(Col::Gen(vec![map]))
         }
-        Plan::Tree { input, by } => {
+        Plan::Tree {
+            input,
+            by,
+            leaf_value,
+        } => {
             // Fold every traverser's vertex-hop path (node-id lineage) into one nested
             // Map, keyed level-by-level by each element's full element map (bare tree)
             // or its `by` property. Force lineage tracking (Expr::Path reads it).
@@ -1425,7 +1429,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             let mut tree = GremlinTree::default();
             for i in 0..b.rows() {
                 if let Value::List(ids) = paths.value_at(i) {
-                    let keys: Vec<Value> = ids
+                    let mut keys: Vec<Value> = ids
                         .iter()
                         .map(|v| match v {
                             Value::Num(id) => match by {
@@ -1435,6 +1439,11 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                             other => other.clone(),
                         })
                         .collect();
+                    // A trailing `values('k').tree()` adds a deeper LEAF level keyed by the
+                    // last vertex's property (`out(...).values('name').tree()`).
+                    if let (Some(lk), Some(Value::Num(last))) = (leaf_value, ids.last()) {
+                        keys.push(store.prop(*last as u32, lk));
+                    }
                     tree.insert(&keys);
                 }
             }
