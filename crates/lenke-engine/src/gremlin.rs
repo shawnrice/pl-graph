@@ -1316,6 +1316,36 @@ impl Parser {
                 self.slots = 1; // one Map column
                 p
             }
+            "constant" => {
+                // Replace every traverser with a constant value (Gremlin constant(x)).
+                let v = self.literal()?;
+                self.expect(&Tok::RParen)?;
+                let p = plan.project(vec![("constant".to_string(), Expr::Lit(v))]);
+                self.current = 0;
+                self.slots = 1;
+                p
+            }
+            "unfold" => {
+                // Flatten the current list-valued stream (Gremlin unfold): each list
+                // element becomes its own traverser. Lowers to Unwind over the current
+                // slot; a fold()/unfold() round-trips back to the element stream.
+                self.expect(&Tok::RParen)?;
+                let list = Expr::Slot(self.current);
+                let var_slot = self.slots;
+                self.slots += 1;
+                let unwound = Plan::Unwind {
+                    input: Box::new(plan),
+                    list: Box::new(list),
+                    var_slot,
+                    ordinal: None,
+                };
+                // Project the unwound element as the single output column (as values()
+                // does) so the terminal render reads it, not the original list slot.
+                let p = unwound.project(vec![("unfold".to_string(), Expr::Slot(var_slot))]);
+                self.current = 0;
+                self.slots = 1;
+                p
+            }
             other => return Err(format!("unsupported Gremlin step `{other}`")),
         };
         Ok(plan)

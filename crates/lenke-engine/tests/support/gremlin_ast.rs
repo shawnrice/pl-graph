@@ -76,6 +76,8 @@ pub enum Step {
     Order,
     /// `.by('key', dir)` modulator on the preceding step.
     ByKey(&'static str, COrder),
+    /// `.by(dir)` modulator — natural order of the current value, explicit direction.
+    ByValue(COrder),
     /// `.by('key')` modulator (identity direction / projection).
     By(&'static str),
     Limit(usize),
@@ -195,6 +197,14 @@ fn emit_step(st: &Step) -> String {
         Order => "order()".into(),
         ByKey(k, d) => format!(
             "by('{k}',{})",
+            if matches!(d, COrder::Desc) {
+                "desc"
+            } else {
+                "asc"
+            }
+        ),
+        ByValue(d) => format!(
+            "by({})",
             if matches!(d, COrder::Desc) {
                 "desc"
             } else {
@@ -326,6 +336,7 @@ fn apply_core(t: CTrav, st: &Step) -> CTrav {
         CyclicPath => t.cyclic_path(),
         Order => t.order(),
         ByKey(k, d) => t.by_dir(k, *d),
+        ByValue(d) => t.by_identity_dir(*d),
         By(k) => t.by(k),
         Limit(n) => t.limit(*n),
         Range(a, b) => t.range(*a, *b),

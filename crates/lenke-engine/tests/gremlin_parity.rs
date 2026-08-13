@@ -200,7 +200,7 @@ fn c(name: &'static str, ordered: bool, steps: Vec<Step>) -> Case {
 /// Gremlin parity cases the engine does NOT yet match — UNFINISHED, MEASURED gaps
 /// (not "won't-fix"), each naming concrete engine work the harness verifies the
 /// moment it's closed. Empty = every case in the corpus is at parity.
-const KNOWN_GREMLIN_GAPS: &[&str] = &[];
+const KNOWN_GREMLIN_GAPS: &[&str] = &["union_names_ages", "coalesce_lang_name", "local_out_count"];
 
 #[test]
 fn gremlin_parity() {
@@ -474,6 +474,226 @@ fn gremlin_parity() {
                 HasLabel(vec!["PERSON"]),
                 Where(vec![Out(vec!["KNOWS"])]),
                 Values(vec!["name"]),
+            ],
+        ),
+        // — untyped hops —
+        c(
+            "out_untyped_names",
+            false,
+            vec![
+                V,
+                HasVal("name", Val::S("marko")),
+                Out(vec![]),
+                Values(vec!["name"]),
+            ],
+        ),
+        c(
+            "both_untyped_count",
+            false,
+            vec![V, HasVal("name", Val::S("marko")), Both(vec![]), Count],
+        ),
+        // — has variants —
+        c(
+            "hasnot_lang",
+            false,
+            vec![V, HasNot("lang"), Values(vec!["name"])],
+        ),
+        c(
+            "has_neq",
+            false,
+            vec![
+                V,
+                HasLabel(vec!["PERSON"]),
+                Has("name", Pred::Neq(Val::S("marko"))),
+                Values(vec!["name"]),
+            ],
+        ),
+        c(
+            "has_within_names",
+            false,
+            vec![
+                V,
+                Has("name", Pred::Within(vec![Val::S("marko"), Val::S("lop")])),
+                Values(vec!["name"]),
+            ],
+        ),
+        c(
+            "has_without_lang",
+            false,
+            vec![
+                V,
+                HasLabel(vec!["SOFTWARE"]),
+                Has("lang", Pred::Without(vec![Val::S("python")])),
+                Values(vec!["name"]),
+            ],
+        ),
+        c(
+            "is_within",
+            false,
+            vec![
+                V,
+                HasLabel(vec!["PERSON"]),
+                Values(vec!["age"]),
+                Is(Pred::Within(vec![Val::N(29.0), Val::N(35.0)])),
+            ],
+        ),
+        // — as/select —
+        c(
+            "as_select_names",
+            false,
+            vec![
+                V,
+                HasLabel(vec!["PERSON"]),
+                As("p"),
+                Values(vec!["name"]),
+                As("n"),
+                Select(vec!["n"]),
+            ],
+        ),
+        // — project —
+        c(
+            "project_name_age",
+            false,
+            vec![
+                V,
+                HasLabel(vec!["PERSON"]),
+                Project(vec!["n", "a"]),
+                By("name"),
+                By("age"),
+            ],
+        ),
+        // — union —
+        c(
+            "union_names_ages",
+            false,
+            vec![
+                V,
+                HasVal("name", Val::S("marko")),
+                Union(vec![
+                    vec![Values(vec!["name"])],
+                    vec![Out(vec!["KNOWS"]), Values(vec!["name"])],
+                ]),
+            ],
+        ),
+        // — coalesce —
+        c(
+            "coalesce_lang_name",
+            false,
+            vec![
+                V,
+                Coalesce(vec![vec![Values(vec!["lang"])], vec![Values(vec!["name"])]]),
+            ],
+        ),
+        // — optional —
+        c(
+            "optional_out",
+            false,
+            vec![
+                V,
+                HasVal("name", Val::S("vadas")),
+                Optional(vec![Out(vec!["KNOWS"])]),
+                Values(vec!["name"]),
+            ],
+        ),
+        // — local —
+        c(
+            "local_out_count",
+            false,
+            vec![
+                V,
+                HasLabel(vec!["PERSON"]),
+                Local(vec![Out(vec!["CREATED"]), Count]),
+            ],
+        ),
+        // — repeat/times —
+        c(
+            "repeat_out_2_ids",
+            false,
+            vec![
+                V,
+                HasVal("name", Val::S("marko")),
+                Repeat(vec![Out(vec![])]),
+                Times(1),
+                Id,
+            ],
+        ),
+        // — dedup / order variants —
+        c(
+            "order_age_asc_names",
+            true,
+            vec![
+                V,
+                HasLabel(vec!["PERSON"]),
+                Order,
+                ByKey("age", COrder::Asc),
+                Values(vec!["name"]),
+            ],
+        ),
+        c(
+            "order_value_desc",
+            true,
+            vec![
+                V,
+                HasLabel(vec!["PERSON"]),
+                Values(vec!["age"]),
+                Order,
+                ByValue(COrder::Desc),
+            ],
+        ),
+        c(
+            "dedup_lang",
+            false,
+            vec![V, HasLabel(vec!["SOFTWARE"]), Values(vec!["lang"]), Dedup],
+        ),
+        // — count/sum/min/max on hop —
+        c(
+            "out_created_count",
+            false,
+            vec![V, HasLabel(vec!["PERSON"]), Out(vec!["CREATED"]), Count],
+        ),
+        c(
+            "sum_weights",
+            false,
+            vec![V, OutE(vec!["CREATED"]), Values(vec!["weight"]), Sum],
+        ),
+        // — valueMap / elementMap variants —
+        c(
+            "valuemap_all_software",
+            false,
+            vec![V, HasLabel(vec!["SOFTWARE"]), ValueMap(vec![])],
+        ),
+        c(
+            "elementmap_lang",
+            false,
+            vec![V, HasLabel(vec!["SOFTWARE"]), ElementMap(vec!["lang"])],
+        ),
+        // — unfold / constant / inject —
+        c(
+            "fold_unfold",
+            false,
+            vec![
+                V,
+                HasLabel(vec!["PERSON"]),
+                Values(vec!["name"]),
+                Fold,
+                Unfold,
+            ],
+        ),
+        c(
+            "constant_x",
+            false,
+            vec![V, HasVal("name", Val::S("marko")), Constant(Val::S("x"))],
+        ),
+        // — simplePath / cyclicPath —
+        c(
+            "simplepath_count",
+            false,
+            vec![
+                V,
+                HasVal("name", Val::S("marko")),
+                Out(vec!["KNOWS"]),
+                SimplePath,
+                Count,
             ],
         ),
     ];
