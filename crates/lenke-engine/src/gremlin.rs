@@ -912,12 +912,26 @@ impl Parser {
             }
             // hasNot(k): the element must NOT carry property `k`.
             "hasnot" => {
-                let key = self.str_arg()?;
+                // hasNot('k') keeps elements WITHOUT key k; variadic hasNot('a','b')
+                // keeps those with NONE of the keys (AND of the negations).
+                let mut keys = vec![self.str_arg()?];
+                while self.peek() == Some(&Tok::Comma) {
+                    self.bump();
+                    keys.push(self.str_arg()?);
+                }
                 self.expect(&Tok::RParen)?;
-                plan.filter(Expr::Not(Box::new(Expr::PropertyExists {
-                    slot: self.current,
-                    key,
-                })))
+                let mut pred: Option<Expr> = None;
+                for key in keys {
+                    let neg = Expr::Not(Box::new(Expr::PropertyExists {
+                        slot: self.current,
+                        key,
+                    }));
+                    pred = Some(match pred {
+                        None => neg,
+                        Some(p) => Expr::And(Box::new(p), Box::new(neg)),
+                    });
+                }
+                plan.filter(pred.expect("hasNot has at least one key"))
             }
             "haskey" => {
                 // Keep elements that HAVE any of the listed property keys.
@@ -2038,9 +2052,59 @@ impl Parser {
                 }
             }
             "limit" => {
-                let n = self.usize_arg()?;
-                self.expect(&Tok::RParen)?;
-                plan.order_page(vec![], None, Some(n))
+                // limit(n) — the first n rows. limit(local, n) — the first n of each
+                // list CELL (a slice `[0, n)`), like tail(local, k) but from the front.
+                let is_local = self.parse_scope_is_local()?;
+                if is_local {
+                    self.expect(&Tok::Comma)?;
+                    let n = self.usize_arg()?;
+                    self.expect(&Tok::RParen)?;
+                    let p = plan.project(vec![(
+                        "limit".to_string(),
+                        Expr::Call {
+                            name: "list_range".to_string(),
+                            args: vec![
+                                Expr::Slot(self.current),
+                                Expr::Lit(Value::Num(0.0)),
+                                Expr::Lit(Value::Num(n as f64)),
+                            ],
+                        },
+                    )]);
+                    self.current = 0;
+                    self.slots = 1;
+                    p
+                } else {
+                    let n = self.usize_arg()?;
+                    self.expect(&Tok::RParen)?;
+                    plan.order_page(vec![], None, Some(n))
+                }
+            }
+            "skip" => {
+                // skip(n) — drop the first n rows. skip(local, n) — drop the first n of
+                // each list CELL.
+                let is_local = self.parse_scope_is_local()?;
+                if is_local {
+                    self.expect(&Tok::Comma)?;
+                    let n = self.usize_arg()?;
+                    self.expect(&Tok::RParen)?;
+                    let p = plan.project(vec![(
+                        "skip".to_string(),
+                        Expr::Call {
+                            name: "list_skip".to_string(),
+                            args: vec![
+                                Expr::Slot(self.current),
+                                Expr::Lit(Value::Num(n as f64)),
+                            ],
+                        },
+                    )]);
+                    self.current = 0;
+                    self.slots = 1;
+                    p
+                } else {
+                    let n = self.usize_arg()?;
+                    self.expect(&Tok::RParen)?;
+                    plan.order_page(vec![], Some(n), None)
+                }
             }
             "tail" => {
                 // tail(n) — the LAST n rows of the stream (default 1), the mirror of
@@ -2548,6 +2612,50 @@ impl Parser {
                 // Pass-through — the current element is unchanged (Gremlin identity()).
                 self.expect(&Tok::RParen)?;
                 plan
+            }
+            "filter" => {
+                // filter(<traversal>): keep the element iff the sub-traversal produces
+                // output — the same semi-join machinery `where(<traversal>)` uses.
+                let e = self.child_filter_expr()?;
+                self.expect(&Tok::RParen)?;
+                plan.filter(e)
+            }
+            "sideeffect" => {
+                // sideEffect(<traversal>): run the body for its SIDE EFFECTS; the main
+                // stream passes through unchanged. The one observable effect is a
+                // named-bag aggregate/store, which must snapshot the OUTER frontier (a
+                // Row-rooted sub-parse would snapshot the wrong plan), so it is handled
+                // here; every other body is a pure identity (its output is discarded).
+                let mut probe = self.pos;
+                if matches!(self.toks.get(probe), Some(Tok::Ident(s)) if s == "__") {
+                    probe += 1;
+                    if self.toks.get(probe) == Some(&Tok::Dot) {
+                        probe += 1;
+                    }
+                }
+                let is_bag = matches!(self.toks.get(probe), Some(Tok::Ident(s)) if {
+                    let l = s.to_ascii_lowercase();
+                    l == "aggregate" || l == "store"
+                });
+                if is_bag {
+                    if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+                        self.bump();
+                        self.expect(&Tok::Dot)?;
+                    }
+                    self.ident()?; // aggregate/store
+                    self.expect(&Tok::LParen)?;
+                    let key = self.str_arg()?;
+                    self.expect(&Tok::RParen)?; // close aggregate(...)
+                    self.expect(&Tok::RParen)?; // close sideEffect(...)
+                    self.caps
+                        .insert(key, (plan.clone(), Expr::Slot(self.current)));
+                    plan
+                } else {
+                    // Parse-and-discard the body; the main stream is identity.
+                    let _ = self.parse_sub_body(self.current, self.slots)?;
+                    self.expect(&Tok::RParen)?;
+                    plan
+                }
             }
             "sack" => {
                 // sack() reads the per-traverser accumulator; sack(op).by('k') folds a
@@ -3123,6 +3231,33 @@ impl Parser {
                     exists
                 }
             }
+            // `label()`/`id()` in filter position, optionally narrowed by `.is(pred)` —
+            // `filter(label().is(eq('PERSON')))`. Inline (a Call [compared]) rather than
+            // an Exists over a projection body.
+            "label" | "id" => {
+                self.expect(&Tok::RParen)?;
+                let val = Expr::Call {
+                    name: if name == "label" {
+                        "element_label".into()
+                    } else {
+                        "element_id".into()
+                    },
+                    args: vec![Expr::Slot(self.current)],
+                };
+                if self.peek() == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("is"))
+                {
+                    self.expect(&Tok::Dot)?;
+                    self.ident()?; // is
+                    self.expect(&Tok::LParen)?;
+                    let pred = self.predicate_expr(val)?;
+                    self.expect(&Tok::RParen)?;
+                    pred
+                } else {
+                    // A bare `label()`/`id()` always yields a value → always true.
+                    Expr::Lit(Value::Bool(true))
+                }
+            }
             "out" | "in" | "both" | "oute" | "ine" | "bothe" => {
                 let dir = match name.as_str() {
                     "out" | "oute" => Dir::Out,
@@ -3618,8 +3753,8 @@ impl Parser {
             // Text predicates (`TextP`): a single string bound, desugaring to the
             // same `starts_with`/`ends_with`/`contains` scalar the GQL infix forms use.
             if let Some(fname) = match op_name.as_str() {
-                "startingwith" => Some("starts_with"),
-                "endingwith" => Some("ends_with"),
+                "startingwith" | "startswith" => Some("starts_with"),
+                "endingwith" | "endswith" => Some("ends_with"),
                 "containing" => Some("contains"),
                 "notstartingwith" | "notendingwith" | "notcontaining" => None,
                 _ => Some(""),
@@ -4439,17 +4574,19 @@ mod tests {
                 &store,
             )),
         );
-        // Default value-by folds the group's ELEMENTS (as ids). Names are unique here,
-        // so each group holds one element: alice(0), bob(1), carol(2).
+        // Default value-by folds the group's ELEMENTS, each rendered as its element
+        // map (like a top-level vertex, so a folded vertex canonicalizes the same way).
+        // Names are unique here, so each group holds one element: alice(0), bob(1),
+        // carol(2).
         assert_eq!(
             value_bag(&gremlin_rows(
                 "g.V().hasLabel('Person').group().by('name')",
                 &store
             )),
             // group() folds to ONE Gremlin Map {name: [elements]} (first-seen key
-            // order), matching core — not the old (key, value) row model.
+            // order), matching core.
             vec![
-                "Map([(Str(\"alice\"), List([Num(0.0)])), (Str(\"bob\"), List([Num(1.0)])), (Str(\"carol\"), List([Num(2.0)]))]);",
+                "Map([(Str(\"alice\"), List([Map([(Str(\"id\"), Str(\"0\")), (Str(\"labels\"), List([Str(\"Person\")])), (Str(\"properties\"), Map([(Str(\"age\"), Num(30.0)), (Str(\"name\"), Str(\"alice\"))]))])])), (Str(\"bob\"), List([Map([(Str(\"id\"), Str(\"1\")), (Str(\"labels\"), List([Str(\"Person\")])), (Str(\"properties\"), Map([(Str(\"age\"), Num(25.0)), (Str(\"name\"), Str(\"bob\"))]))])])), (Str(\"carol\"), List([Map([(Str(\"id\"), Str(\"2\")), (Str(\"labels\"), List([Str(\"Person\")])), (Str(\"properties\"), Map([(Str(\"age\"), Num(40.0)), (Str(\"name\"), Str(\"carol\"))]))])]))]);",
             ],
         );
         // A property value-by folds that property per group.

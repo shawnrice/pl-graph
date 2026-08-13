@@ -2196,6 +2196,7 @@ fn aggregate(
             arg_col.as_ref(),
             &group_of,
             n_groups,
+            store,
         )?));
     }
 
@@ -2326,6 +2327,7 @@ fn fold_grouped(
     arg_col: Option<&Col>,
     group_of: &[u32],
     n_groups: usize,
+    store: &Store,
 ) -> Result<Vec<Value>, String> {
     // `count(*)` — no argument — is each group's row count: a pure tally.
     if agg.func == AggFn::Count && agg.arg.is_none() {
@@ -2406,7 +2408,10 @@ fn fold_grouped(
             let skip_nulls = agg.func == AggFn::CollectList;
             let mut lists: Vec<Vec<Value>> = vec![Vec::new(); n_groups];
             for (i, &g) in group_of.iter().enumerate() {
-                let v = col.value_at(i);
+                // A folded VERTEX/EDGE renders as its element map (same as a top-level
+                // one), not the raw dense id — so a `fold()`/`aggregate` of elements is
+                // self-describing and canonicalizes like `g.V()` does.
+                let v = render_cell(col, i, store);
                 if skip_nulls && v.is_null() {
                     continue;
                 }
@@ -7460,6 +7465,27 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                         let a = lo.min(items.len());
                         let b = hi.min(items.len()).max(a);
                         Value::List(items[a..b].to_vec())
+                    })
+                    .collect();
+                return Ok(Col::Gen(out));
+            }
+            // `list_skip(list, n)` → Gremlin `skip(local, n)`: each list cell WITHOUT
+            // its first n elements. Gremlin-only.
+            if name == "list_skip" {
+                let arg = eval(&args[0], store, batch)?;
+                let k = match &args[1] {
+                    Expr::Lit(Value::Num(n)) => *n as usize,
+                    _ => return Err("skip(local, n): n must be a literal integer".into()),
+                };
+                let n = batch.rows();
+                let out: Vec<Value> = (0..n)
+                    .map(|i| {
+                        let items = match arg.value_at(i) {
+                            Value::List(items) => items,
+                            other => vec![other],
+                        };
+                        let a = k.min(items.len());
+                        Value::List(items[a..].to_vec())
                     })
                     .collect();
                 return Ok(Col::Gen(out));
