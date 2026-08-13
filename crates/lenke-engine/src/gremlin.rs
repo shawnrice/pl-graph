@@ -499,6 +499,9 @@ struct RepeatCtx {
     filter: Option<Expr>,
     /// an inner `.as('tag')` in the body — bound to the endpoint at flush time.
     bind_tag: Option<String>,
+    /// a `loops()`-based min-depth override (e.g. `emit(loops().is(gt(1)))` emits from
+    /// depth 2). Overrides the default `min` in `flush_repeat`.
+    min_override: Option<u32>,
 }
 
 struct Parser {
@@ -1789,6 +1792,7 @@ impl Parser {
                     min_one: false,
                     filter: None,
                     bind_tag,
+                    min_override: None,
                 });
                 plan
             }
@@ -1805,10 +1809,25 @@ impl Parser {
             }
             "emit" => {
                 // `emit()` / `emit(pred)`: emit at EVERY depth (min → 1), optionally
-                // filtering the emitted endpoint. Only the post-repeat form is built.
-                let ctx_open = self.pending_repeat.is_some();
-                if !ctx_open {
+                // filtering the emitted endpoint. A `loops()` predicate instead bounds
+                // the emitted DEPTH (`emit(loops().is(gt(1)))` → from depth 2).
+                if self.pending_repeat.is_none() {
                     return Err("emit() must follow repeat(<hop>)".into());
+                }
+                if let Some((op, n)) = self.try_loops_predicate()? {
+                    self.expect(&Tok::RParen)?;
+                    // TinkerPop `loops()` == depth + 1 at the emit check, so a predicate
+                    // on loops maps to a depth bound one lower: gt(k) → depth ≥ k,
+                    // ge(k)/eq(k) → depth ≥ k-1.
+                    let min = match op {
+                        CompareOp::Gt => n,
+                        CompareOp::Ge | CompareOp::Eq => n.saturating_sub(1),
+                        _ => 1,
+                    };
+                    let ctx = self.pending_repeat.as_mut().unwrap();
+                    ctx.min_one = true;
+                    ctx.min_override = Some(min);
+                    return Ok(plan);
                 }
                 let filter = if self.peek() == Some(&Tok::RParen) {
                     None
@@ -1824,12 +1843,25 @@ impl Parser {
                 plan
             }
             "until" => {
-                // `until(pred)`: loop until the endpoint satisfies `pred`, emitting it.
-                // Modelled as a min-1 walk to the default cap, keeping endpoints that
-                // satisfy `pred` (exact when a satisfying node has no onward hop, the
-                // shape core's fixture exercises; a general stop-on-satisfy is deferred).
+                // `until(pred)`: loop until the endpoint satisfies `pred`. A
+                // `loops().is(eq(n))` predicate is exactly `times(n)` (stop after n
+                // hops). Otherwise a min-1 walk keeping endpoints that satisfy `pred`.
                 if self.pending_repeat.is_none() {
                     return Err("until(pred) must follow repeat(<hop>)".into());
+                }
+                if let Some((op, n)) = self.try_loops_predicate()? {
+                    self.expect(&Tok::RParen)?;
+                    // `loops()` == depth + 1, so stopping when loops == n means the walk
+                    // ran to depth n-1 — a fixed-length `times(n-1)` walk.
+                    let times = match op {
+                        CompareOp::Eq | CompareOp::Ge => n.saturating_sub(1),
+                        CompareOp::Gt => n,
+                        _ => return Err("until(loops().is(<op>)) unsupported op".into()),
+                    };
+                    let ctx = self.pending_repeat.as_mut().unwrap();
+                    ctx.times = Some(times);
+                    ctx.min_one = false;
+                    return Ok(plan);
                 }
                 let f = self.child_filter_expr()?;
                 self.expect(&Tok::RParen)?;
@@ -4936,6 +4968,44 @@ impl Parser {
     /// `(direction, edge label)`. Multi-step bodies, nested repeats, filters, etc.
     /// are deferred with an explicit error. The cursor starts just after `repeat(`
     /// and stops at the body's closing `)` (left for the caller to consume).
+    /// Parse a `[__.]loops().is([P.]op(n))` predicate, returning `(op, n)`; `None` (cursor
+    /// restored) if the next tokens are not that shape. Used by `emit`/`until` to bound
+    /// the repeat DEPTH by the loop counter.
+    fn try_loops_predicate(&mut self) -> Result<Option<(CompareOp, u32)>, String> {
+        let save = self.pos;
+        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+            self.bump();
+            if self.peek() == Some(&Tok::Dot) {
+                self.bump();
+            } else {
+                self.pos = save;
+                return Ok(None);
+            }
+        }
+        if !matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("loops")) {
+            self.pos = save;
+            return Ok(None);
+        }
+        // Consume `loops().is([P.]op(n))`.
+        self.ident()?; // loops
+        self.expect(&Tok::LParen)?;
+        self.expect(&Tok::RParen)?;
+        self.expect(&Tok::Dot)?;
+        let isn = self.ident()?;
+        if !isn.eq_ignore_ascii_case("is") {
+            self.pos = save;
+            return Ok(None);
+        }
+        self.expect(&Tok::LParen)?;
+        let (op, val) = self.simple_predicate()?;
+        self.expect(&Tok::RParen)?;
+        let n = match val {
+            Value::Num(x) if x >= 0.0 => x as u32,
+            _ => return Err("loops().is(op(n)): n must be a non-negative integer".into()),
+        };
+        Ok(Some((op, n)))
+    }
+
     fn repeat_body(&mut self) -> Result<(Dir, Option<String>, Option<String>), String> {
         // Optional `__.` anonymous-traversal prefix.
         if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
@@ -5007,6 +5077,8 @@ impl Parser {
                 return Err("repeat(<hop>) must be closed by times(n), emit() or until(pred)".into())
             }
         };
+        // A `loops()` emit predicate raises the minimum emitted depth.
+        let min = ctx.min_override.map_or(min, |m| m.max(min));
         let p = plan.var_length(
             ctx.from,
             ctx.dir,
