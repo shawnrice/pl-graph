@@ -544,6 +544,14 @@ impl Parser {
     /// Parse the content of a `by(...)` group/select/project key: a `'prop'` string,
     /// or the `id`/`label` (also `T.id`/`T.label`) element token. Returns a display
     /// name and the value expression over `slot`.
+    /// Consume an optional empty `()` — `by(label())` vs the bare token `by(label)`.
+    fn eat_empty_parens(&mut self) {
+        if self.peek() == Some(&Tok::LParen) && self.toks.get(self.pos + 1) == Some(&Tok::RParen) {
+            self.bump();
+            self.bump();
+        }
+    }
+
     fn by_key_expr(&mut self, slot: usize) -> Result<(String, Expr), String> {
         if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("T")) {
             self.bump();
@@ -556,6 +564,7 @@ impl Parser {
             }
             Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("id") => {
                 self.bump();
+                self.eat_empty_parens();
                 Ok((
                     "id".into(),
                     Expr::Call {
@@ -566,6 +575,7 @@ impl Parser {
             }
             Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("label") => {
                 self.bump();
+                self.eat_empty_parens();
                 Ok((
                     "label".into(),
                     Expr::Call {
@@ -2193,6 +2203,21 @@ impl Parser {
                     }
                 }
                 self.expect(&Tok::RParen)?;
+                // Optional `.by('k'|id|label)`: dedup by that property/token of the
+                // element (keep the first element per distinct by-value).
+                if self.peek() == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
+                {
+                    self.expect(&Tok::Dot)?;
+                    self.ident()?; // by
+                    self.expect(&Tok::LParen)?;
+                    let (_, e) = self.by_key_expr(self.current)?;
+                    self.expect(&Tok::RParen)?;
+                    let w = self.slots;
+                    let p = plan.map_slot(w, e, true);
+                    self.slots += 1;
+                    return Ok(p.distinct_by(vec![w]));
+                }
                 if labels.is_empty() {
                     plan.distinct()
                 } else {
