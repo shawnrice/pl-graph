@@ -578,6 +578,44 @@ fn render_cell(col: &Col, i: usize, store: &Store) -> Value {
     }
 }
 
+/// The `id` field of a bare-VERTEX element map (`{id, labels, properties}`), or `None`.
+fn vertex_map_ext_id(v: &Value) -> Option<&str> {
+    let Value::Map(pairs) = v else { return None };
+    let keys: std::collections::BTreeSet<&str> = pairs
+        .iter()
+        .filter_map(|(k, _)| match k {
+            Value::Str(s) => Some(s.as_ref()),
+            _ => None,
+        })
+        .collect();
+    if keys.len() != pairs.len()
+        || keys != ["id", "labels", "properties"].into_iter().collect()
+    {
+        return None;
+    }
+    pairs.iter().find_map(|(k, val)| match (k, val) {
+        (Value::Str(k), Value::Str(id)) if k.as_ref() == "id" => Some(id.as_ref()),
+        _ => None,
+    })
+}
+
+/// Reconstitute an `unfold`ed element column: when every element is a resolvable
+/// bare-VERTEX element map (the fold().unfold() round-trip), resolve each `id` back to
+/// a live dense node id and return a `Col::Nodes` so downstream steps operate on the
+/// vertices again. Otherwise keep the raw values as a `Col::Gen`.
+fn reunfold_elements(elems: &[Value], store: &Store) -> Col {
+    if !elems.is_empty() {
+        let ids: Option<Vec<u32>> = elems
+            .iter()
+            .map(|v| vertex_map_ext_id(v).and_then(|ext| store.node_by_ext(ext)))
+            .collect();
+        if let Some(ids) = ids {
+            return Col::Nodes(ids);
+        }
+    }
+    Col::Gen(elems.to_vec())
+}
+
 /// The canonical result map for an edge — `{id, from, to, labels(sorted),
 /// properties(sorted by key)}`, byte-identical to lenke-core's `val_to_value(Edge)`.
 /// `from`/`to` are the endpoint EXTERNAL ids.
@@ -1441,7 +1479,11 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 }
             }
             let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
-            slots.push(Col::Gen(elems));
+            // A folded VERTEX/EDGE round-trips through fold().unfold() as its element
+            // map; reconstitute a live element frontier by resolving the `id` field back
+            // to a dense id, so `values`/`out`/`order` operate on nodes again. Falls back
+            // to the raw map column if any element is not a resolvable element map.
+            slots.push(reunfold_elements(&elems, store));
             if ordinal.is_some() {
                 slots.push(Col::Gen(ords));
             }
