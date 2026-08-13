@@ -8030,6 +8030,23 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             out.lineage = b.lineage;
             out
         }
+        // Append/overwrite one column — a `choose(...identity())` else arm copies the
+        // pass-through element into the reconverge slot inside a Branch body.
+        Plan::MapSlot {
+            input,
+            slot,
+            value,
+            append,
+        } => {
+            let mut b = pull_body(input, store, seed)?;
+            let col = eval(value, store, &b)?;
+            if *append {
+                b.slots.push(col);
+            } else if *slot < b.slots.len() {
+                b.slots[*slot] = col;
+            }
+            b
+        }
         other => {
             return Err(format!("unsupported operator in EXISTS body: {other:?}"));
         }

@@ -1422,22 +1422,62 @@ impl Parser {
                     self.slots = 1;
                     return Ok(p);
                 }
+                // The THEN arm is a hop; its neighbour lands at the reconverge slot W.
                 let (t_dir, t_label) = self.hop_body()?;
-                self.expect(&Tok::Comma)?;
-                let (e_dir, e_label) = self.hop_body()?;
+                let land = self.slots;
+                let then_body =
+                    Plan::Row
+                        .filter(pred.clone())
+                        .expand(from, t_dir, &etypes_of(t_label.as_deref()));
+                // The ELSE arm is a hop, `identity()`, or absent (implicit identity). An
+                // identity/absent arm passes the element through — copy it into slot W so
+                // both arms reconverge there.
+                let else_is_hop = self.peek() == Some(&Tok::Comma) && {
+                    // The else arm starts after the comma and an optional `__.`.
+                    let mut p = self.pos + 1;
+                    if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
+                        p += 1;
+                        if self.toks.get(p) == Some(&Tok::Dot) {
+                            p += 1;
+                        }
+                    }
+                    matches!(self.toks.get(p), Some(Tok::Ident(s)) if {
+                        let l = s.to_ascii_lowercase();
+                        l == "out" || l == "in" || l == "both"
+                    })
+                };
+                let else_body = if else_is_hop {
+                    self.expect(&Tok::Comma)?;
+                    let (e_dir, e_label) = self.hop_body()?;
+                    Plan::Row.filter(Expr::Not(Box::new(pred))).expand(
+                        from,
+                        e_dir,
+                        &etypes_of(e_label.as_deref()),
+                    )
+                } else {
+                    // `, identity()` or nothing → pass the element through at slot W.
+                    if self.peek() == Some(&Tok::Comma) {
+                        self.bump();
+                        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+                            self.bump();
+                            self.expect(&Tok::Dot)?;
+                        }
+                        let id = self.ident()?; // identity
+                        if !id.eq_ignore_ascii_case("identity") {
+                            return Err(format!("choose(): unsupported else arm `{id}`"));
+                        }
+                        self.expect(&Tok::LParen)?;
+                        self.expect(&Tok::RParen)?;
+                    }
+                    Plan::Row.filter(Expr::Not(Box::new(pred))).map_slot(
+                        land,
+                        Expr::Slot(from),
+                        true,
+                    )
+                };
                 self.expect(&Tok::RParen)?;
-                let then_body = Plan::Row.filter(pred.clone()).expand(
-                    from,
-                    t_dir,
-                    &etypes_of(t_label.as_deref()),
-                );
-                let else_body = Plan::Row.filter(Expr::Not(Box::new(pred))).expand(
-                    from,
-                    e_dir,
-                    &etypes_of(e_label.as_deref()),
-                );
-                self.current = self.slots;
-                self.slots += 1;
+                self.current = land;
+                self.slots = land + 1;
                 plan.branch(vec![then_body, else_body])
             }
             "and" | "or" => {
@@ -2620,6 +2660,26 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 plan.filter(e)
             }
+            "flatmap" | "map" => {
+                // flatMap(<traversal>)/map(<traversal>): apply the body's step chain to
+                // the current frontier and continue from its output (flatMap flattens a
+                // multi-output body; in this eager model map's single-output body is the
+                // same shape). The body chains directly onto `plan` (NOT Row-rooted).
+                if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+                    self.bump();
+                    self.expect(&Tok::Dot)?;
+                }
+                let mut p = plan;
+                if matches!(self.peek(), Some(Tok::Ident(_))) {
+                    p = self.step(p)?;
+                    while self.peek() == Some(&Tok::Dot) {
+                        self.bump();
+                        p = self.step(p)?;
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                p
+            }
             "sideeffect" => {
                 // sideEffect(<traversal>): run the body for its SIDE EFFECTS; the main
                 // stream passes through unchanged. The one observable effect is a
@@ -2946,9 +3006,12 @@ impl Parser {
                     self.slots = 1;
                     return Ok(snap.subgraph(edge_slot));
                 }
-                let (snap, expr) = self.caps.get(&key).cloned().ok_or_else(|| {
-                    format!("cap('{key}'): no aggregate()/store() filled that key")
-                })?;
+                let Some((snap, expr)) = self.caps.get(&key).cloned() else {
+                    // An unfilled key caps to a single EMPTY list (core), not an error.
+                    self.current = 0;
+                    self.slots = 1;
+                    return Ok(Plan::Row.project(vec![(key, Expr::Lit(Value::List(vec![])))]));
+                };
                 let p = snap.aggregate(
                     vec![],
                     vec![Agg {
@@ -5269,8 +5332,11 @@ mod tests {
                 &store
             )),
         );
-        // cap of an unfilled key errors, not panics.
-        assert!(super::parse("g.V().cap('nope')").is_err());
+        // cap of an unfilled key yields a single EMPTY list (core), not an error.
+        assert_eq!(
+            value_bag(&gremlin_rows("g.V('1').cap('nope')", &store)),
+            vec!["List([]);"],
+        );
         // barrier() and identity() are pass-throughs.
         for step in ["barrier", "identity"] {
             assert_eq!(
