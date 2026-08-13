@@ -33,6 +33,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         caps: std::collections::HashMap::new(),
         algo_props: std::collections::HashMap::new(),
         last_algo: None,
+        first_labels: std::collections::HashMap::new(),
         sack_slot: None,
         subgraph_caps: std::collections::HashMap::new(),
     };
@@ -256,14 +257,25 @@ impl MathParser<'_> {
                         args,
                     });
                 }
-                // Bare unary application `sin _` / `sin 2` (only unary functions).
+                // Bare unary application `sin _` / `sin 2` / `abs -3` (only unary
+                // functions). A signed operand (`abs -3`) is taken as the function's
+                // argument (mXparser juxtaposition binds tighter than the outer `-`).
+                // A name BOUND as a step-label shadows the function (`math('sin + 1')`
+                // with an `as('sin')` reads the variable), so skip the application then.
                 if is_unary_math_fn(&name)
+                    && !self.labels.contains_key(&name)
                     && matches!(
                         self.peek(),
-                        Some(MathTok::Num(_) | MathTok::Underscore | MathTok::LParen | MathTok::Ident(_))
+                        Some(
+                            MathTok::Num(_)
+                                | MathTok::Underscore
+                                | MathTok::LParen
+                                | MathTok::Ident(_)
+                                | MathTok::Op('-' | '+')
+                        )
                     )
                 {
-                    let arg = self.primary()?;
+                    let arg = self.unary()?;
                     return Ok(Expr::Call {
                         name: math_fn_name(&name).to_string(),
                         args: vec![arg],
@@ -455,6 +467,10 @@ struct Parser {
     /// store property.
     algo_props: std::collections::HashMap<String, usize>,
     last_algo: Option<usize>,
+    /// The FIRST slot each `as('x')` label was bound to (labels holds the LAST). A
+    /// tag rebound across a hop has two bindings; `select(Pop.first, 'x')` reads this
+    /// one, `select(Pop.last, 'x')` (the default) reads `labels`.
+    first_labels: std::collections::HashMap<String, usize>,
     /// The slot carrying the per-traverser `sack` accumulator (a column appended by
     /// `withSack(init)`), or None when no sack is in play.
     sack_slot: Option<usize>,
@@ -1930,10 +1946,28 @@ impl Parser {
                 // Label the current slot; the plan is unchanged (select resolves it).
                 let label = self.str_arg()?;
                 self.expect(&Tok::RParen)?;
+                self.first_labels.entry(label.clone()).or_insert(self.current);
                 self.labels.insert(label, self.current);
                 plan
             }
             "select" => {
+                // An optional leading `Pop` token (`First`/`Last`, or `Pop.first`/
+                // `Pop.last`) picks WHICH binding of a rebound tag to read. `First`
+                // reads the first binding (`first_labels`); the default is the last.
+                let mut pop_first = false;
+                if matches!(self.peek(), Some(Tok::Ident(s)) if {
+                    let l = s.to_ascii_lowercase();
+                    l == "first" || l == "last" || l == "pop"
+                }) && self.toks.get(self.pos + 1) != Some(&Tok::LParen)
+                {
+                    let mut tok = self.ident()?;
+                    if self.peek() == Some(&Tok::Dot) {
+                        self.bump();
+                        tok = self.ident()?; // strip the `Pop.` prefix
+                    }
+                    pop_first = tok.eq_ignore_ascii_case("first");
+                    self.expect(&Tok::Comma)?;
+                }
                 // One or more labels. A single label projects that element; two or
                 // more build an insertion-ordered Map keyed by the labels.
                 let mut labels = vec![self.str_arg()?];
@@ -1976,8 +2010,13 @@ impl Parser {
                     self.expect(&Tok::RParen)?;
                     bys.push(by);
                 }
+                let table = if pop_first {
+                    &self.first_labels
+                } else {
+                    &self.labels
+                };
                 let slot_of = |l: &str| {
-                    self.labels
+                    table
                         .get(l)
                         .copied()
                         .ok_or_else(|| format!("select('{l}'): no step is labelled `{l}`"))
@@ -2374,6 +2413,10 @@ impl Parser {
                         let name = self.str_arg()?;
                         self.expect(&Tok::RParen)?;
                         if let Some(slot) = self.last_algo {
+                            // Rename, don't alias: the default property is no longer
+                            // readable once `propertyName` redirects the result (core
+                            // writes ONLY where asked), so drop the default mapping.
+                            self.algo_props.retain(|_, &mut s| s != slot);
                             self.algo_props.insert(name, slot);
                         }
                         plan
