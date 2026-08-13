@@ -632,6 +632,109 @@ impl Parser {
                 self.slots += 1;
                 plan.branch(bodies)
             }
+            "match" => {
+                // match(<pattern>, …) where each pattern is `[__.]as('s').<hop>.as('e')`.
+                // Greedy solve: bind the entry element to the first pattern's start tag,
+                // then repeatedly apply any pattern whose start tag is already bound —
+                // expanding from its slot and binding the landing to the end tag (or, if
+                // that tag is already bound, adding an equality constraint). Covers
+                // chain/tree/cyclic-constraint shapes; an unsolvable order errors.
+                let entry = self.current;
+                let mut plan = plan;
+                type MatchPat = (String, Dir, Option<String>, String);
+                let mut pats: Vec<MatchPat> = Vec::new();
+                loop {
+                    if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+                        self.bump();
+                        self.expect(&Tok::Dot)?;
+                    }
+                    let as1 = self.ident()?;
+                    if !as1.eq_ignore_ascii_case("as") {
+                        return Err("match() pattern must start with as('tag')".into());
+                    }
+                    self.expect(&Tok::LParen)?;
+                    let s = self.str_arg()?;
+                    self.expect(&Tok::RParen)?;
+                    self.expect(&Tok::Dot)?;
+                    let hop = self.ident()?.to_ascii_lowercase();
+                    let dir = match hop.as_str() {
+                        "out" => Dir::Out,
+                        "in" => Dir::In,
+                        "both" => Dir::Both,
+                        other => {
+                            return Err(format!(
+                                "match() pattern hop must be out/in/both, got `{other}`"
+                            ))
+                        }
+                    };
+                    self.expect(&Tok::LParen)?;
+                    let label = if matches!(self.peek(), Some(Tok::Str(_))) {
+                        Some(self.str_arg()?)
+                    } else {
+                        None
+                    };
+                    self.expect(&Tok::RParen)?;
+                    self.expect(&Tok::Dot)?;
+                    let as2 = self.ident()?;
+                    if !as2.eq_ignore_ascii_case("as") {
+                        return Err("match() pattern must end with as('tag')".into());
+                    }
+                    self.expect(&Tok::LParen)?;
+                    let e = self.str_arg()?;
+                    self.expect(&Tok::RParen)?;
+                    pats.push((s, dir, label, e));
+                    if self.peek() == Some(&Tok::Comma) {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                if let Some((s0, ..)) = pats.first() {
+                    self.labels.entry(s0.clone()).or_insert(entry);
+                }
+                let mut applied = vec![false; pats.len()];
+                loop {
+                    let mut progress = false;
+                    for i in 0..pats.len() {
+                        if applied[i] {
+                            continue;
+                        }
+                        let (s, dir, label, e) = pats[i].clone();
+                        let Some(&start_slot) = self.labels.get(&s) else {
+                            continue;
+                        };
+                        let landed = self.slots;
+                        plan = plan.expand(start_slot, dir, &etypes_of(label.as_deref()));
+                        self.slots += 1;
+                        match self.labels.get(&e).copied() {
+                            Some(existing) => {
+                                plan = plan.filter(Expr::Compare {
+                                    op: CompareOp::Eq,
+                                    left: Box::new(Expr::Slot(landed)),
+                                    right: Box::new(Expr::Slot(existing)),
+                                });
+                            }
+                            None => {
+                                self.labels.insert(e.clone(), landed);
+                            }
+                        }
+                        applied[i] = true;
+                        progress = true;
+                    }
+                    if !progress {
+                        break;
+                    }
+                }
+                if applied.iter().any(|&a| !a) {
+                    return Err(
+                        "match(): patterns with no bound start tag are not solvable in this subset"
+                            .into(),
+                    );
+                }
+                self.current = entry;
+                plan
+            }
             "branch" => {
                 // branch(<test>).option(m, <hop>)….option(none, <hop>): route each
                 // element by the TEST value — the option whose match value equals it,

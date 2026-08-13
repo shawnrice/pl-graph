@@ -114,6 +114,7 @@ pub enum Step {
     Cap(&'static str),
     Subgraph(&'static str),
     ShortestPath,
+    Match(Vec<Vec<Step>>),
     PageRank(Option<f64>),
     ConnectedComponent,
     PeerPressure,
@@ -276,6 +277,10 @@ fn emit_step(st: &Step) -> String {
         Cap(k) => format!("cap('{k}')"),
         Subgraph(k) => format!("subgraph('{k}')"),
         ShortestPath => "shortestPath()".into(),
+        Match(ps) => format!(
+            "match({})",
+            ps.iter().map(|p| emit_sub(p)).collect::<Vec<_>>().join(",")
+        ),
         PageRank(Some(a)) => format!("pageRank({a})"),
         PageRank(None) => "pageRank()".into(),
         ConnectedComponent => "connectedComponent()".into(),
@@ -420,6 +425,7 @@ fn apply_core(t: CTrav, st: &Step) -> CTrav {
         Cap(k) => t.cap(k),
         Subgraph(k) => t.subgraph(k),
         ShortestPath => t.shortest_path(),
+        Match(ps) => t.match_(ps.iter().map(|p| csub(p)).collect()),
         PageRank(a) => t.page_rank(*a),
         ConnectedComponent => t.connected_component(),
         PeerPressure => t.peer_pressure(),

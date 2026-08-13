@@ -712,6 +712,34 @@ fn gremlin_parity() {
             false,
             vec![V, HasLabel(vec!["PERSON"]), Values(vec!["name"]), Barrier],
         ),
+        // — match(...): conjunctive labelled patterns (chain-shaped) —
+        c(
+            "match_chain",
+            false,
+            vec![
+                V,
+                Match(vec![
+                    vec![As("a"), Out(vec!["KNOWS"]), As("b")],
+                    vec![As("b"), Out(vec!["CREATED"]), As("c")],
+                ]),
+                Select(vec!["c"]),
+                By("name"),
+            ],
+        ),
+        c(
+            "match_two_hops_from_a",
+            false,
+            vec![
+                V,
+                HasVal("name", Val::S("marko")),
+                Match(vec![
+                    vec![As("a"), Out(vec!["KNOWS"]), As("b")],
+                    vec![As("a"), Out(vec!["CREATED"]), As("d")],
+                ]),
+                Select(vec!["b"]),
+                By("name"),
+            ],
+        ),
         // — shortestPath(): all shortest undirected paths (as ext-id vertex lists) —
         c(
             "shortest_from_marko",
