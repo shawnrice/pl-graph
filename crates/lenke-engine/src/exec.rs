@@ -8409,7 +8409,16 @@ fn concat_batches(subs: &[Batch]) -> Batch {
     let cols: Vec<Col> = (0..ncols)
         .map(|j| concat_cols(&subs.iter().map(|b| b.slot(j)).collect::<Vec<_>>()))
         .collect();
-    Batch::of(cols)
+    let mut out = Batch::of(cols);
+    // Preserve lineage: when every sub carries a sidecar, concatenate them row-wise so
+    // path()/GremlinPath survives a union/coalesce branch. (All-or-nothing — a partial
+    // set would desync the row alignment.)
+    if subs.iter().all(|b| b.lineage.is_some()) {
+        let lins: Vec<&crate::batch::Lineage> =
+            subs.iter().map(|b| b.lineage.as_ref().unwrap()).collect();
+        out.lineage = Some(crate::batch::Lineage::concat(&lins));
+    }
+    out
 }
 
 /// Concatenate columns of (ideally) the same variant. Same variant → keep it and

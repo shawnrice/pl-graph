@@ -181,6 +181,32 @@ impl Lineage {
             edge_offsets,
         }
     }
+
+    /// Concatenate several sidecars row-wise (union/coalesce branch output): each
+    /// input's paths in order, so the result is row-aligned with concatenated slot
+    /// columns.
+    #[must_use]
+    pub fn concat(parts: &[&Lineage]) -> Self {
+        let mut values = Vec::new();
+        let mut offsets = vec![0usize];
+        let mut edges = Vec::new();
+        let mut edge_offsets = vec![0usize];
+        for lin in parts {
+            let rows = lin.offsets.len().saturating_sub(1);
+            for i in 0..rows {
+                values.extend_from_slice(lin.path_at(i));
+                offsets.push(values.len());
+                edges.extend_from_slice(lin.edges_at(i));
+                edge_offsets.push(edges.len());
+            }
+        }
+        Self {
+            values,
+            offsets,
+            edges,
+            edge_offsets,
+        }
+    }
 }
 
 /// One batch flowing between operators. A batch is a set of row-aligned SLOT

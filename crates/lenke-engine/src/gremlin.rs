@@ -1134,6 +1134,9 @@ impl Parser {
                 | "has" | "haslabel" | "hasnot" | "hasid"
                 | "and" | "or" | "not"
                 | "path" | "tree" | "simplepath" | "cyclicpath"
+                // coalesce decides its own edge_path_ok in-arm (an edge-yielding body
+                // keeps it; a non-edge one clears it), so exempt it from this taint.
+                | "coalesce"
         ) {
             self.edge_path_ok = false;
         }
@@ -1431,6 +1434,13 @@ impl Parser {
                 self.current = land.0;
                 self.slots = land.1;
                 self.on_edge = any_edge;
+                // An edge-yielding coalesce keeps the interleaved edge-path answerable
+                // (its edge lands in the lineage); a non-edge coalesce breaks it.
+                if any_edge {
+                    self.path_has_edges = true;
+                } else {
+                    self.edge_path_ok = false;
+                }
                 plan.branch(bodies)
             }
             "match" => {
