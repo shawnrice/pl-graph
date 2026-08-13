@@ -1224,6 +1224,16 @@ impl Parser {
                             body: Box::new(Plan::Row.expand(from, dir, &labels)),
                             outer_width: slots,
                         },
+                        // A body led by a FILTER (`hasLabel('PERSON').values('name')`)
+                        // produces output only where the filter holds; that predicate is
+                        // the guard. Peek it via child_filter_expr, then restore the
+                        // cursor so parse_sub_body re-parses the full body.
+                        None if self.peek_leading_is_filter() => {
+                            let save = self.pos;
+                            let pred = self.child_filter_expr()?;
+                            self.pos = save;
+                            pred
+                        }
                         None => Expr::Lit(Value::Bool(true)), // a value body always produces
                     };
                     let guard = match &prior {
@@ -4200,6 +4210,24 @@ impl Parser {
     /// hop `[__.](out|in|both)('L', …)`, returning its `(direction, edge labels)`. Used
     /// to form a body's existence guard before parsing it. `None` when the body does not
     /// start with a hop (a value body such as `constant(v)` always produces output).
+    /// True when the coalesce body ahead starts with an element FILTER
+    /// (`hasLabel`/`has`/`hasNot`/`hasKey`/`hasValue`/`where`/`not`/`and`/`or`/`filter`),
+    /// so the body only produces output where that filter holds.
+    fn peek_leading_is_filter(&self) -> bool {
+        let mut p = self.pos;
+        if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
+            p += 1;
+            if self.toks.get(p) == Some(&Tok::Dot) {
+                p += 1;
+            }
+        }
+        matches!(self.toks.get(p), Some(Tok::Ident(s)) if matches!(
+            s.to_ascii_lowercase().as_str(),
+            "haslabel" | "has" | "hasnot" | "haskey" | "hasvalue" | "where" | "not"
+                | "and" | "or" | "filter"
+        ))
+    }
+
     /// True when the coalesce/union body ahead starts with an EDGE hop
     /// (`[__.](outE|inE|bothE)`), so the reconverged frontier holds edges.
     fn peek_leading_is_edge(&self) -> bool {
