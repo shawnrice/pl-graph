@@ -5745,6 +5745,58 @@ mod tests {
         run(&plan, store)
     }
 
+    /// The streaming bounded top-K (`order().by(prop).limit(k)` over a bare scan) must
+    /// return EXACTLY what a full sort would — same tie order (arrival = node-id order for
+    /// a V() scan), across ascending/descending and with a skip. Ages have heavy ties, so
+    /// the tiebreak is exercised. Ground truth: a stable sort by (age, id) in the test.
+    #[test]
+    fn streaming_top_k_matches_full_sort_order() {
+        let mut b = Builder::default();
+        let ages: Vec<f64> = (0..500).map(|i| f64::from(i % 7)).collect(); // many ties
+        for &a in &ages {
+            b.node(&["N"], &[("age", n(a))]);
+        }
+        let st = b.build();
+        let ids = |q: &str| -> Vec<u32> {
+            gremlin_rows(q, &st)
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Value::Num(x) => *x as u32,
+                    Value::Str(s) => s.parse().unwrap(),
+                    other => panic!("want an id: {other:?}"),
+                })
+                .collect()
+        };
+        // Expected: stable sort of (age, id), the arrival tiebreak being id order.
+        let mut asc: Vec<u32> = (0..500u32).collect();
+        asc.sort_by(|&a, &b2| {
+            ages[a as usize]
+                .partial_cmp(&ages[b2 as usize])
+                .unwrap()
+                .then(a.cmp(&b2))
+        });
+        let desc: Vec<u32> = {
+            let mut d: Vec<u32> = (0..500u32).collect();
+            d.sort_by(|&a, &b2| {
+                ages[b2 as usize]
+                    .partial_cmp(&ages[a as usize])
+                    .unwrap()
+                    .then(a.cmp(&b2))
+            });
+            d
+        };
+        // `id()` returns the external id (the dense-id string here) — compare as u32.
+        assert_eq!(ids("g.V().order().by('age').limit(10).id()"), asc[..10]);
+        assert_eq!(ids("g.V().order().by('age').limit(5).id()"), asc[..5]);
+        assert_eq!(
+            ids("g.V().order().by('age', desc).limit(10).id()"),
+            desc[..10]
+        );
+        // With a skip (range): `range(3, 13)` == skip 3, limit 10.
+        assert_eq!(ids("g.V().order().by('age').range(3, 13).id()"), asc[3..13]);
+    }
+
     /// A type filter must match an edge's SECONDARY label, not just its primary type —
     /// the per-edge `edge_has_extra` bit (which skips the extras probe for single-label
     /// edges) must be SET for a multi-label edge, or the secondary match is missed.

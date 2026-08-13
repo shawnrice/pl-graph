@@ -1570,6 +1570,9 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             };
             if let Some(b) = capped {
                 order_page(&b, store, keys, *skip, *limit)?
+            } else if let Some(b) = try_scan_top_k(input, keys, *skip, *limit, store, track) {
+                // Streaming bounded top-K over a bare scan — no full frontier/idx array.
+                b
             } else if let Some(b) = try_late_materialize(input, keys, *skip, *limit, store, track)?
             {
                 // Sorted top-K over a projection: project only the surviving rows.
@@ -2452,6 +2455,89 @@ fn sort_idx(idx: &mut [usize], key_cols: &[Col], keys: &[crate::ir::SortKey], en
     } else {
         idx.sort_by(|&a, &b| row_cmp(key_cols, keys, a, b));
     }
+}
+
+/// STREAMING TOP-K for `ORDER BY <numeric prop> [DESC] LIMIT k` over a bare `Scan`:
+/// instead of materializing the whole frontier + key column + an index array and then
+/// partial-sorting (what `order_page` does on a pulled batch), scan the nodes once,
+/// reading the key sequentially, and keep only the best `skip+limit` in a bounded buffer
+/// (periodically trimmed with `select_nth`). O(N) time, O(k) space — matching core's
+/// streaming heap. Returns the top-K rows as the OrderPage output (a single `Col::Nodes`
+/// in sort order), so a `Project` above it builds its columns for K rows, not N.
+///
+/// `None` (fall back to `order_page`) for anything outside the narrow shape: lineage
+/// tracking, a non-`Scan` input, a multi-key / non-`Prop(slot 0)` sort, a non-numeric or
+/// null-bearing key column (the ordering with nulls goes through the general path), or a
+/// window that is not a small prefix (streaming buys nothing near a full sort).
+fn try_scan_top_k(
+    input: &Plan,
+    keys: &[crate::ir::SortKey],
+    skip: Option<usize>,
+    limit: Option<usize>,
+    store: &Store,
+    track: bool,
+) -> Option<Batch> {
+    if track {
+        return None; // a path/lineage sort is not this shape
+    }
+    let limit = limit?;
+    let [k] = keys else { return None };
+    let Expr::Prop { slot: 0, key } = &k.expr else {
+        return None;
+    };
+    let Plan::Scan { label } = input else {
+        return None;
+    };
+    let Some(Column::Num { data, present }) = store.column(key) else {
+        return None; // numeric, unboxed key only (matches order_page's Col::Num path)
+    };
+    let kcap = skip.unwrap_or(0).checked_add(limit)?;
+    if kcap == 0 {
+        return Some(Batch::of(vec![Col::Nodes(Vec::new())]));
+    }
+    if kcap.saturating_mul(2) >= store.node_count() {
+        return None; // window is not a small prefix — a full sort is as cheap
+    }
+    let desc = k.descending;
+    // Sort order as `order_page`'s Col::Num path: key asc/desc, then arrival (row order)
+    // ascending as a total tiebreak. `cmp` "less" = ranks earlier = keep.
+    let cmp = |a: &(f64, u32, u32), b: &(f64, u32, u32)| {
+        let o = if desc {
+            value::cmp_num_total(b.0, a.0)
+        } else {
+            value::cmp_num_total(a.0, b.0)
+        };
+        o.then(a.1.cmp(&b.1))
+    };
+    let trim = kcap.saturating_mul(4).max(1024);
+    let mut buf: Vec<(f64, u32, u32)> = Vec::with_capacity(trim);
+    let mut arrival = 0u32;
+    let mut has_null = false;
+    scan_visit(store, label, |i| {
+        if !present[i] {
+            has_null = true; // key ordering with nulls → general path
+            return;
+        }
+        buf.push((data[i], arrival, i as u32));
+        arrival += 1;
+        if buf.len() >= trim {
+            buf.select_nth_unstable_by(kcap - 1, cmp);
+            buf.truncate(kcap);
+        }
+    });
+    if has_null {
+        return None;
+    }
+    let end = kcap.min(buf.len());
+    if end < buf.len() {
+        buf.select_nth_unstable_by(end - 1, cmp);
+        buf.truncate(end);
+    }
+    buf.sort_unstable_by(cmp);
+    let start = skip.unwrap_or(0).min(buf.len());
+    Some(Batch::of(vec![Col::Nodes(
+        buf[start..].iter().map(|&(_, _, n)| n).collect(),
+    )]))
 }
 
 /// LATE MATERIALIZATION for a sorted `LIMIT` over a `Project`: when the window is
