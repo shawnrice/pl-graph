@@ -7908,6 +7908,24 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             if name == "element_label" {
                 let arg = eval(&args[0], store, batch)?;
                 let n = batch.rows();
+                // Large node frontier (`V().label()`): resolve labels through the
+                // store's one-pass forward map (O(total membership) + O(1)/row) rather
+                // than probing every label bucket per node (O(labels·log n)/row, cache-
+                // hostile). Small frontiers keep the per-node path — inverting the whole
+                // store would cost more than a handful of probes.
+                if let Col::Nodes(ids) = &arg {
+                    if n >= store.node_count() / 4 {
+                        let (names, code_of) = store.min_label_map();
+                        let out: Vec<Value> = ids
+                            .iter()
+                            .map(|&id| match code_of.get(id as usize) {
+                                Some(&c) if c != u32::MAX => Value::Str(names[c as usize].clone()),
+                                _ => Value::Null,
+                            })
+                            .collect();
+                        return Ok(Col::Gen(out));
+                    }
+                }
                 // Intern each distinct label ONCE for the whole column, so a big
                 // `V().label()` frontier allocates one Arc per label, not per row.
                 let mut cache: Vec<(&str, std::sync::Arc<str>)> = Vec::new();

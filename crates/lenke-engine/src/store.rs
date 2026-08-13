@@ -862,6 +862,36 @@ impl Store {
             .min()
     }
 
+    /// A forward node → min-label mapping for the WHOLE store, built in one pass:
+    /// `(names, code_of)` where `names` are the distinct labels interned once in
+    /// ascending order and `code_of[id]` indexes them (`u32::MAX` = unlabelled).
+    ///
+    /// [`min_label_name`] answers one node by probing every label bucket with a
+    /// binary search — O(labels · log n) per node with cache-hostile random access,
+    /// which is the cost of a whole-frontier `V().label()`. Inverting the buckets
+    /// once (a sequential scan per bucket, ascending label order so the FIRST bucket
+    /// to claim a node is its min) turns that whole column into O(total membership)
+    /// build + O(1) per row. Callers processing a large node frontier use this
+    /// instead of the per-node probe.
+    #[must_use]
+    pub fn min_label_map(&self) -> (Vec<Arc<str>>, Vec<u32>) {
+        let mut buckets: Vec<(&String, &Vec<u32>)> = self.by_label.iter().collect();
+        buckets.sort_by(|a, b| a.0.cmp(b.0));
+        let names: Vec<Arc<str>> = buckets.iter().map(|(l, _)| Arc::from(l.as_str())).collect();
+        let mut code_of = vec![u32::MAX; self.node_count()];
+        for (code, (_, ids)) in buckets.iter().enumerate() {
+            // Iterate the bucket in its native (ascending id) order — a sequential
+            // read — and claim only nodes no earlier (smaller) label already took.
+            for &id in ids.iter() {
+                let slot = &mut code_of[id as usize];
+                if *slot == u32::MAX {
+                    *slot = code as u32;
+                }
+            }
+        }
+        (names, code_of)
+    }
+
     /// The labels carried by node `id`, sorted. Each label bucket is kept SORTED
     /// ascending (see `is_labeled`), so membership is a BINARY SEARCH — a linear
     /// `contains` here made per-node materialization (element maps in fold/valueMap/
