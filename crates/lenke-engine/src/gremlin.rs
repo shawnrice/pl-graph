@@ -502,6 +502,11 @@ struct RepeatCtx {
     /// a `loops()`-based min-depth override (e.g. `emit(loops().is(gt(1)))` emits from
     /// depth 2). Overrides the default `min` in `flush_repeat`.
     min_override: Option<u32>,
+    /// `path_ok` at the moment `repeat()` opened. The walk lowers to a pure vertex-hop
+    /// VarLength (which records full path lineage), so `flush_repeat` restores this —
+    /// letting `path()`/`tree()` follow a `repeat(<vertex-hop>)` when the prefix was
+    /// itself path-answerable.
+    path_ok_at_open: bool,
 }
 
 struct Parser {
@@ -1057,7 +1062,10 @@ impl Parser {
             plan
         };
         // Only a pure vertex-hop chain keeps `path()` answerable; every other step
-        // taints it (`path()` and the element filters are path-preserving).
+        // taints it (`path()` and the element filters are path-preserving). The repeat
+        // modulators are exempt: `repeat(<vertex-hop>)` lowers to a VarLength walk that
+        // records full path lineage (flush_repeat restores `path_ok` to its pre-repeat
+        // value), so a following `path()`/`tree()` stays answerable.
         if !matches!(
             lname.as_str(),
             "out"
@@ -1074,6 +1082,10 @@ impl Parser {
                 | "tree"
                 | "simplepath"
                 | "cyclicpath"
+                | "repeat"
+                | "times"
+                | "emit"
+                | "until"
         ) {
             self.path_ok = false;
         }
@@ -1865,6 +1877,7 @@ impl Parser {
                     filter: None,
                     bind_tag,
                     min_override: None,
+                    path_ok_at_open: self.path_ok,
                 });
                 plan
             }
@@ -5208,6 +5221,9 @@ impl Parser {
         // account for it and land the current element there.
         self.current = ctx.out_slot;
         self.slots = ctx.out_slot + 1;
+        // A pure vertex-hop walk records full path lineage — restore path-answerability
+        // to what it was before the repeat modulators tainted it.
+        self.path_ok = ctx.path_ok_at_open;
         // An inner `.as('tag')` binds the tag to the endpoint (the last landing).
         if let Some(tag) = ctx.bind_tag {
             self.first_labels.entry(tag.clone()).or_insert(ctx.out_slot);
@@ -5955,7 +5971,9 @@ mod tests {
         assert!(super::parse("g.V().outE().inV().path()").is_err());
         assert!(super::parse("g.E().path()").is_err());
         assert!(super::parse("g.V().values('name').path()").is_err());
-        assert!(super::parse("g.V().repeat(out('KNOWS')).times(2).path()").is_err());
+        // A `repeat(<vertex-hop>)` walk records full path lineage, so path() over it
+        // parses (the VarLength endpoints carry their node chains).
+        assert!(super::parse("g.V().repeat(out('KNOWS')).times(2).path()").is_ok());
     }
 
     /// `valueMap()` projects a PROPERTIES-only map (no id/label tokens) with scalar
