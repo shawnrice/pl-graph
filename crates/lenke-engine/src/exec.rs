@@ -7824,11 +7824,7 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 let out: Vec<Value> = (0..n)
                     .map(|i| match arg.value_at(i) {
                         Value::Num(id) if matches!(arg, Col::Nodes(_)) => {
-                            let mut ls = store.labels_of(id as u32);
-                            ls.sort();
-                            ls.into_iter()
-                                .next()
-                                .map_or(Value::Null, |l| Value::Str(l.into()))
+                            store.min_label(id as u32).map_or(Value::Null, Value::Str)
                         }
                         Value::Num(eid) if matches!(arg, Col::Edges(_)) => store
                             .edge_type_name(eid as u32)
