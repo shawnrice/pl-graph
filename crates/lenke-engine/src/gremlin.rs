@@ -36,6 +36,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         on_edge: false,
         prop_keys: None,
         first_labels: std::collections::HashMap::new(),
+        all_labels: std::collections::HashMap::new(),
         sack_slot: None,
         subgraph_caps: std::collections::HashMap::new(),
     };
@@ -551,6 +552,9 @@ struct Parser {
     /// tag rebound across a hop has two bindings; `select(Pop.first, 'x')` reads this
     /// one, `select(Pop.last, 'x')` (the default) reads `labels`.
     first_labels: std::collections::HashMap<String, usize>,
+    /// EVERY slot each `as('x')` label was bound to, in order — `select(Pop.all, 'x')`
+    /// returns them all as a list.
+    all_labels: std::collections::HashMap<String, Vec<usize>>,
     /// The slot carrying the per-traverser `sack` accumulator (a column appended by
     /// `withSack(init)`), or None when no sack is in play.
     sack_slot: Option<usize>,
@@ -2703,6 +2707,10 @@ impl Parser {
                 let label = self.str_arg()?;
                 self.expect(&Tok::RParen)?;
                 self.first_labels.entry(label.clone()).or_insert(self.current);
+                self.all_labels
+                    .entry(label.clone())
+                    .or_default()
+                    .push(self.current);
                 self.labels.insert(label, self.current);
                 plan
             }
@@ -2736,13 +2744,15 @@ impl Parser {
                     self.slots = 1;
                     return Ok(p);
                 }
-                // An optional leading `Pop` token (`First`/`Last`, or `Pop.first`/
-                // `Pop.last`) picks WHICH binding of a rebound tag to read. `First`
-                // reads the first binding (`first_labels`); the default is the last.
+                // An optional leading `Pop` token (`First`/`Last`/`All`, or the
+                // `Pop.`-prefixed forms) picks WHICH binding of a rebound tag to read.
+                // `First` reads the first binding (`first_labels`); `All` returns every
+                // binding as a list; the default is the last.
                 let mut pop_first = false;
+                let mut pop_all = false;
                 if matches!(self.peek(), Some(Tok::Ident(s)) if {
                     let l = s.to_ascii_lowercase();
-                    l == "first" || l == "last" || l == "pop"
+                    l == "first" || l == "last" || l == "all" || l == "pop"
                 }) && self.toks.get(self.pos + 1) != Some(&Tok::LParen)
                 {
                     let mut tok = self.ident()?;
@@ -2751,6 +2761,7 @@ impl Parser {
                         tok = self.ident()?; // strip the `Pop.` prefix
                     }
                     pop_first = tok.eq_ignore_ascii_case("first");
+                    pop_all = tok.eq_ignore_ascii_case("all");
                     self.expect(&Tok::Comma)?;
                 }
                 // One or more labels. A single label projects that element; two or
@@ -2899,7 +2910,16 @@ impl Parser {
                         }
                     })
                 };
-                let p = if labels.len() == 1 {
+                let p = if pop_all {
+                    // Pop.all: every binding of the (single) tag, as a list.
+                    let slots = self
+                        .all_labels
+                        .get(&labels[0])
+                        .cloned()
+                        .ok_or_else(|| format!("select('{}'): no step is labelled it", labels[0]))?;
+                    let items = slots.into_iter().map(Expr::Slot).collect();
+                    plan.project(vec![(labels[0].clone(), Expr::List { items })])
+                } else if labels.len() == 1 {
                     plan.project(vec![(labels[0].clone(), val_of(0, &labels[0])?)])
                 } else {
                     let entries = labels

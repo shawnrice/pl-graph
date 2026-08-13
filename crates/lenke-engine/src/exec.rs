@@ -7836,12 +7836,13 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             Col::Gen(out)
         }
         Expr::List { items } => {
-            // Per row, build a Value::List of each element's value.
+            // Per row, build a Value::List of each element's value. A VERTEX/EDGE element
+            // renders as its element map (render_cell), consistent with a top-level one.
             let cols = eval_all(items, store, batch)?;
             let n = batch.rows();
             Col::Gen(
                 (0..n)
-                    .map(|i| Value::List(cols.iter().map(|c| c.value_at(i)).collect()))
+                    .map(|i| Value::List(cols.iter().map(|c| render_cell(c, i, store)).collect()))
                     .collect(),
             )
         }
