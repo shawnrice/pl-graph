@@ -504,6 +504,12 @@ pub struct Store {
     /// The reverse of an `Adj`'s `etype`, needed by `type(edge)` which has only an
     /// eid in hand, not an adjacency entry.
     edge_etype: Vec<u32>,
+    /// Per-edge (by eid) flag: does this edge carry SECONDARY labels? Lets a type
+    /// filter skip the `edge_extra` HashMap probe for the overwhelming majority of
+    /// edges (single-label) whose primary type simply did not match — a scattered
+    /// `bool` read instead of a SipHash-of-`u32` + bucket chase. Parallel to
+    /// `edge_etype` (grows with it, never shrinks). Empty ⇒ treated as all-false.
+    edge_has_extra: Vec<bool>,
     /// SECONDARY edge labels (eid -> the labels past the first), mirroring core's
     /// `e_extra`. An edge's *type* is its first label (`edge_etype`); a multi-label
     /// edge — `-[:X:Y]->` / an ndjson `"labels":["X","Y"]` — carries the rest here.
@@ -1203,6 +1209,7 @@ impl Store {
             "edge_etype indexed by eid"
         );
         self.edge_etype.push(etype);
+        self.edge_has_extra.push(false); // no secondary labels until set_edge_extra_labels
         self.edge_ends.push((from, to));
         debug_assert_eq!(self.edge_ext.len() as u32, eid, "edge_ext indexed by eid");
         self.edge_ext.push(Arc::clone(ext));
@@ -1270,6 +1277,9 @@ impl Store {
             })
             .collect();
         self.edge_extra.insert(eid, ids);
+        if let Some(flag) = self.edge_has_extra.get_mut(eid as usize) {
+            *flag = true;
+        }
     }
 
     /// Does edge `eid` carry label `tid`? Checks the primary type then, only when
@@ -1279,7 +1289,31 @@ impl Store {
     #[must_use]
     pub fn edge_has_label(&self, eid: u32, tid: u32) -> bool {
         self.edge_etype.get(eid as usize).is_some_and(|&t| t == tid)
-            || (!self.edge_extra.is_empty()
+            || (self
+                .edge_has_extra
+                .get(eid as usize)
+                .copied()
+                .unwrap_or(false)
+                && self
+                    .edge_extra
+                    .get(&eid)
+                    .is_some_and(|extra| extra.contains(&tid)))
+    }
+
+    /// As [`edge_has_label`](Self::edge_has_label), for a caller that ALREADY holds
+    /// the edge's primary type (`first`, mirrored on every `Adj`). Mirrors core's
+    /// `edge_type_matches`: starting from `first` (already in a register) skips the
+    /// random `edge_etype[eid]` re-read `edge_has_label` does — a cache miss per edge
+    /// to learn something the caller had. Core measured that re-read at 4.3x on a
+    /// per-row correlated edge count; an adjacency type-filter is the same hot loop.
+    #[must_use]
+    pub fn edge_type_matches(&self, first: u32, eid: u32, tid: u32) -> bool {
+        first == tid
+            || (self
+                .edge_has_extra
+                .get(eid as usize)
+                .copied()
+                .unwrap_or(false)
                 && self
                     .edge_extra
                     .get(&eid)
@@ -2510,6 +2544,9 @@ impl Builder {
             next_eid: edge_count,
             edge_etype: edge_etypes,
             edge_extra: HashMap::new(),
+            // Builder edges are single-label (`edge_extra` empty), so no edge carries
+            // secondary labels; a later set_edge_extra_labels flips the bit.
+            edge_has_extra: vec![false; edge_count as usize],
             edge_ends,
             node_ext,
             edge_ext,

@@ -3473,10 +3473,15 @@ fn range_seek_ids(store: &Store, label: &str, key: &str, op: CompareOp, value: &
 fn node_has_nbr(store: &Store, v: u32, dir: Dir, want: &[u32]) -> bool {
     let has_extra = store.has_multi_label_edges();
     let type_ok = |et: u32, eid: u32| {
+        // Pass the primary type `et` (already in a register from the Adj) to
+        // edge_type_matches instead of edge_has_label, so a primary-type MISS does not
+        // pay a redundant random read of edge_etype[eid] to re-learn `et != w` — only
+        // the (rare) secondary-set probe. Guard the probe on has_extra so a single-label
+        // graph never touches it. See edge_type_matches / core's 4.3x note.
         want.is_empty()
             || want
                 .iter()
-                .any(|&w| w == et || (has_extra && store.edge_has_label(eid, w)))
+                .any(|&w| w == et || (has_extra && store.edge_type_matches(et, eid, w)))
     };
     if matches!(dir, Dir::Out | Dir::Both) && store.out(v).iter().any(|a| type_ok(a.etype, a.eid)) {
         return true;
@@ -3576,10 +3581,15 @@ fn for_each_nbr(
     // only when the graph has multi-label edges, the eid's secondary set.
     let has_extra = store.has_multi_label_edges();
     let type_ok = |et: u32, eid: u32| {
+        // Pass the primary type `et` (already in a register from the Adj) to
+        // edge_type_matches instead of edge_has_label, so a primary-type MISS does not
+        // pay a redundant random read of edge_etype[eid] to re-learn `et != w` — only
+        // the (rare) secondary-set probe. Guard the probe on has_extra so a single-label
+        // graph never touches it. See edge_type_matches / core's 4.3x note.
         want.is_empty()
             || want
                 .iter()
-                .any(|&w| w == et || (has_extra && store.edge_has_label(eid, w)))
+                .any(|&w| w == et || (has_extra && store.edge_type_matches(et, eid, w)))
     };
     if matches!(dir, Dir::Out | Dir::Both) {
         for a in store.out(v) {

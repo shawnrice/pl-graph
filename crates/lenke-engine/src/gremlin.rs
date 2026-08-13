@@ -5745,6 +5745,34 @@ mod tests {
         run(&plan, store)
     }
 
+    /// A type filter must match an edge's SECONDARY label, not just its primary type —
+    /// the per-edge `edge_has_extra` bit (which skips the extras probe for single-label
+    /// edges) must be SET for a multi-label edge, or the secondary match is missed.
+    /// Edge 0→1 is `[F, R]` (R secondary); `out('R')` must still reach node 1.
+    #[test]
+    fn edge_type_filter_matches_secondary_label() {
+        let nd = [
+            r#"{"id":"0","labels":["N"],"props":{}}"#,
+            r#"{"id":"1","labels":["N"],"props":{}}"#,
+            r#"{"id":"2","labels":["N"],"props":{}}"#,
+            r#"{"from":"0","to":"1","labels":["F","R"],"props":{}}"#, // R is SECONDARY
+            r#"{"from":"0","to":"2","labels":["R"],"props":{}}"#,     // R is primary
+            r#"{"from":"0","to":"1","labels":["F"],"props":{}}"#,     // no R at all
+        ]
+        .join("\n");
+        let st = crate::ndjson::from_ndjson(&nd).unwrap();
+        let count = |q: &str| match &gremlin_rows(q, &st).rows[0][0] {
+            Value::Num(x) => *x as i64,
+            other => panic!("not a count: {other:?}"),
+        };
+        // Two R-edges from node 0 (the [F,R] secondary + the primary R); the bare F is out.
+        assert_eq!(count("g.V('0').out('R').count()"), 2);
+        // The [F,R] edge is reached by BOTH out('F') and out('R').
+        assert_eq!(count("g.V('0').out('F').count()"), 2); // [F,R] + [F]
+                                                           // Distinct R-neighbours of 0: nodes 1 and 2.
+        assert_eq!(count("g.V('0').out('R').dedup().count()"), 2);
+    }
+
     /// `repeat(dir).times(k).dedup().count()` — the distinct-endpoint fast path
     /// (per-level set expansion) must equal the count from ENUMERATING the same walk
     /// with explicit hops (`both().both()…`, which are ordinary Expand steps, not a
