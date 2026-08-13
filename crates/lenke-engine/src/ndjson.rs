@@ -346,6 +346,11 @@ pub fn from_ndjson(text: &str) -> Result<Store, String> {
     // contiguous read path and the typed edge-property reads without a later rebuild.
     store.rebuild_csr();
     store.rebuild_edge_num();
+    // Dictionary-encode categorical string columns now that every value is in — the
+    // finalize that gives a bulk-loaded `city`/`dept`/`status` the code-based encoding
+    // incremental adds skip (turns GROUP BY / DISTINCT / equality over them into u32
+    // work instead of string hashing).
+    store.dict_encode_columns();
     Ok(store)
 }
 

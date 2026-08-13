@@ -322,6 +322,22 @@ impl Column {
         *self = Self::Str { data, present };
     }
 
+    /// Dictionary-encode this column in place if it is a low-cardinality `Str`
+    /// column (a categorical `city`/`dept`/`status`) — the forward of [`decode_dict`].
+    /// A no-op on any other variant, or a `Str` column too high-cardinality to pay
+    /// (see [`dict_encode`]). Incremental `add_node_with_id` builds plain `Str`
+    /// columns; a bulk loader runs this once so categorical columns get the same
+    /// code-based encoding the `materialize` path already gives, which turns GROUP BY
+    /// / DISTINCT / equality over them into `u32`-code work instead of string hashing.
+    fn try_dict_encode(&mut self) {
+        if let Self::Str { data, present } = self {
+            let data = std::mem::take(data);
+            let present = std::mem::take(present);
+            *self = dict_encode(data, present)
+                .unwrap_or_else(|(data, present)| Self::Str { data, present });
+        }
+    }
+
     /// Set node `i` to `v`, marking it present. The caller guarantees the column
     /// `accepts` `v` (promoting to `Gen` first if not).
     fn set(&mut self, i: usize, v: Value) {
@@ -1062,6 +1078,18 @@ impl Store {
     // typed column, promoting it to `Gen` on a type change. These are the store
     // primitives the language write statements (Phase B) and transactions (A3)
     // build on; they do not enforce constraints — that is a later, higher layer.
+
+    /// After a bulk load, dictionary-encode every eligible categorical `Str` property
+    /// column. Incremental adds build plain `Str` columns; a bulk loader
+    /// ([`crate::ndjson::from_ndjson`]) calls this ONCE at the end so a low-cardinality
+    /// `city`/`dept`/`status` gets the code-based encoding that makes GROUP BY /
+    /// DISTINCT / equality match on a `u32` code instead of hashing string content. A
+    /// high-cardinality column (`name`, an id) is left as `Str` by `dict_encode`'s cap.
+    pub fn dict_encode_columns(&mut self) {
+        for col in self.props.values_mut() {
+            col.try_dict_encode();
+        }
+    }
 
     /// Add a node with `labels` and `(key, value)` properties; returns its id.
     pub fn add_node(&mut self, labels: &[&str], props: &[(&str, Value)]) -> u32 {
