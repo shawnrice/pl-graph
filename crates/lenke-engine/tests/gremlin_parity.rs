@@ -707,6 +707,27 @@ fn gremlin_parity() {
             false,
             vec![V, HasLabel(vec!["PERSON"]), Values(vec!["name"]), Barrier],
         ),
+        // — tree(): nested-map fold of vertex-hop paths —
+        c(
+            "tree_by_name",
+            false,
+            vec![
+                V,
+                HasVal("name", Val::S("marko")),
+                Out(vec!["KNOWS"]),
+                Out(vec!["CREATED"]),
+                Tree,
+                By("name"),
+            ],
+        ),
+        c(
+            "tree_persons_by_name",
+            false,
+            vec![V, HasLabel(vec!["PERSON"]), Tree, By("name")],
+        ),
+        // NOTE: bare tree() keys by the vertex ELEMENT — the engine renders an element
+        // map, core keys by the vertex itself (the no-Value::Node gap), so it is not
+        // canonically comparable here; the tree().by('k') forms above are.
         // — inject: add literal values to the whole stream —
         c(
             "inject_one",

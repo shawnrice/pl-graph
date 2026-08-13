@@ -175,6 +175,7 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
         }
         Plan::GroupToMap { .. } => Card::exact(1), // folds all groups into one Map row
         Plan::AlgoAnnotate { input, .. } => estimate(input, store), // pass-through, +1 column
+        Plan::Tree { .. } => Card::exact(1),       // folds all paths into one nested Map row
         Plan::Distinct { input } => {
             // At most the input; without a cheap distinct count assume heavy overlap.
             estimate(input, store).scale(0.5, false)

@@ -644,6 +644,14 @@ pub enum Plan {
     /// yield one Map object rather than the relational (key,value) rows that GQL
     /// `GROUP BY` keeps.
     GroupToMap { input: Box<Plan> },
+    /// Gremlin `tree()` [`.by('k')`]: fold EVERY traverser's vertex-hop path (the
+    /// node-id lineage) into ONE nested `Value::Map`, keyed level-by-level by each
+    /// path element — rendered as its full element map, or its `by` property. Emits a
+    /// single row. Only valid over a pure vertex-hop chain (path lineage = node ids).
+    Tree {
+        input: Box<Plan>,
+        by: Option<String>,
+    },
     /// A Gremlin OLAP annotate step (`pageRank`/`connectedComponent`/`peerPressure`):
     /// run the algorithm over the whole store, then APPEND the per-node result as a
     /// new column aligned to the vertex frontier at `node_slot`, so a following
@@ -977,6 +985,14 @@ impl Plan {
     pub fn group_to_map(self) -> Self {
         Self::GroupToMap {
             input: Box::new(self),
+        }
+    }
+
+    #[must_use]
+    pub fn tree(self, by: Option<String>) -> Self {
+        Self::Tree {
+            input: Box::new(self),
+            by,
         }
     }
 

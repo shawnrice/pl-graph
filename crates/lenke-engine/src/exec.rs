@@ -760,6 +760,8 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::GroupToMap { input }
         | Plan::AlgoAnnotate { input, .. }
         | Plan::SortLocal { input, .. } => needs_lineage(input),
+        // tree() reads the path lineage itself, so its INPUT must track it.
+        Plan::Tree { .. } => true,
         Plan::OptionalScan { input, filters, .. } => {
             filters.iter().any(|(_, e)| reads_path(e)) || needs_lineage(input)
         }
@@ -1044,6 +1046,30 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 pairs.push((k, v));
             }
             Batch::single(Col::Gen(vec![Value::Map(std::sync::Arc::new(pairs))]))
+        }
+        Plan::Tree { input, by } => {
+            // Fold every traverser's vertex-hop path (node-id lineage) into one nested
+            // Map, keyed level-by-level by each element's full element map (bare tree)
+            // or its `by` property. Force lineage tracking (Expr::Path reads it).
+            let b = pull(input, store, true)?;
+            let paths = eval(&Expr::Path, store, &b)?;
+            let mut tree = GremlinTree::default();
+            for i in 0..b.rows() {
+                if let Value::List(ids) = paths.value_at(i) {
+                    let keys: Vec<Value> = ids
+                        .iter()
+                        .map(|v| match v {
+                            Value::Num(id) => match by {
+                                Some(k) => store.prop(*id as u32, k),
+                                None => node_result_value(store, *id as u32),
+                            },
+                            other => other.clone(),
+                        })
+                        .collect();
+                    tree.insert(&keys);
+                }
+            }
+            Batch::single(Col::Gen(vec![tree.to_value()]))
         }
         Plan::AlgoAnnotate {
             input,
@@ -4812,6 +4838,42 @@ fn try_fused_count(
 /// result.
 fn scalar_num(x: f64) -> Batch {
     Batch::of(vec![Col::Gen(vec![Value::Num(x)])])
+}
+
+/// A Gremlin `tree()` accumulator: a nested, INSERTION-ORDERED map (children keyed by
+/// value, matched via `value::equals`), materialized into nested `Value::Map`s.
+#[derive(Default)]
+struct GremlinTree {
+    children: Vec<(Value, GremlinTree)>,
+}
+
+impl GremlinTree {
+    fn insert(&mut self, keys: &[Value]) {
+        let Some((first, rest)) = keys.split_first() else {
+            return;
+        };
+        let idx = self
+            .children
+            .iter()
+            .position(|(k, _)| crate::value::equals(k, first));
+        let child = match idx {
+            Some(i) => &mut self.children[i].1,
+            None => {
+                self.children.push((first.clone(), GremlinTree::default()));
+                &mut self.children.last_mut().expect("just pushed").1
+            }
+        };
+        child.insert(rest);
+    }
+
+    fn to_value(&self) -> Value {
+        Value::Map(std::sync::Arc::new(
+            self.children
+                .iter()
+                .map(|(k, c)| (k.clone(), c.to_value()))
+                .collect(),
+        ))
+    }
 }
 
 /// A component/cluster id as the ROOT vertex's external-id string — the value core's

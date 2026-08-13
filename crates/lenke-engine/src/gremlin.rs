@@ -348,12 +348,14 @@ impl Parser {
                 | "in"
                 | "both"
                 | "has"
+                | "haslabel"
                 | "hasnot"
                 | "hasid"
                 | "and"
                 | "or"
                 | "not"
                 | "path"
+                | "tree"
                 | "simplepath"
                 | "cyclicpath"
         ) {
@@ -1525,6 +1527,35 @@ impl Parser {
                 // barrier() is the identity step). Bulk-collect semantics are invisible.
                 self.expect(&Tok::RParen)?;
                 plan
+            }
+            "tree" => {
+                // tree()[.by('k')]: fold every traverser's vertex-hop path into one
+                // nested Map. Only over a pure vertex-hop chain (path lineage = node
+                // ids), like path().
+                self.expect(&Tok::RParen)?;
+                if !self.path_ok {
+                    return Err(
+                        "tree() is only supported over a pure vertex-hop chain (V-source \
+                         + out/in/both); value projections and edge steps are deferred"
+                            .into(),
+                    );
+                }
+                let by = if self.peek() == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
+                {
+                    self.expect(&Tok::Dot)?;
+                    self.ident()?; // `by`
+                    self.expect(&Tok::LParen)?;
+                    let k = self.str_arg()?;
+                    self.expect(&Tok::RParen)?;
+                    Some(k)
+                } else {
+                    None
+                };
+                let p = plan.tree(by);
+                self.current = 0;
+                self.slots = 1;
+                p
             }
             "aggregate" | "store" => {
                 // A named side-effect bag: record the CURRENT stream (plan prefix +
