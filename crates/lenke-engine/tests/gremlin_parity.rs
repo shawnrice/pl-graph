@@ -197,15 +197,10 @@ fn c(name: &'static str, ordered: bool, steps: Vec<Step>) -> Case {
     }
 }
 
-/// Gremlin parity cases the engine does NOT yet match. These are UNFINISHED, real,
-/// MEASURED gaps (not "won't-fix" divergences) — each names concrete engine work the
-/// harness will verify the moment it's closed:
-///   - group / groupCount: core folds the grouped stream into ONE Gremlin `Map`; the
-///     engine models a grouped result as (key,value) ROWS (its GQL GROUP BY heritage).
-///     The Gremlin front-end needs a map-fold terminal. `[group-map]`
-///   - path().by(k): the path lineage renders whole element maps; a `by` modulator
-///     must project each path element to a property. `[path-by]`
-const KNOWN_GREMLIN_GAPS: &[&str] = &["path_names"];
+/// Gremlin parity cases the engine does NOT yet match — UNFINISHED, MEASURED gaps
+/// (not "won't-fix"), each naming concrete engine work the harness verifies the
+/// moment it's closed. Empty = every case in the corpus is at parity.
+const KNOWN_GREMLIN_GAPS: &[&str] = &[];
 
 #[test]
 fn gremlin_parity() {

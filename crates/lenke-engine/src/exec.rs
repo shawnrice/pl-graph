@@ -7052,6 +7052,30 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                     .collect();
                 return Ok(Col::Gen(out));
             }
+            // `path_values(path, 'k')` → Gremlin `path().by('k')`: render each path
+            // element as its `k` property instead of the whole vertex element map.
+            if name == "path_values" {
+                let arg = eval(&args[0], store, batch)?;
+                let key = match &args[1] {
+                    Expr::Lit(Value::Str(s)) => s.clone(),
+                    _ => return Err("path().by(...) key must be a literal string".into()),
+                };
+                let n = batch.rows();
+                let out: Vec<Value> = (0..n)
+                    .map(|i| match arg.value_at(i) {
+                        Value::List(ids) => Value::List(
+                            ids.into_iter()
+                                .map(|v| match v {
+                                    Value::Num(id) => store.prop(id as u32, &key),
+                                    other => other,
+                                })
+                                .collect(),
+                        ),
+                        other => other,
+                    })
+                    .collect();
+                return Ok(Col::Gen(out));
+            }
             // `path_has_dup(path)` → Gremlin `cyclicPath`/`simplePath` support: TRUE if
             // the lineage node path repeats any vertex, FALSE if all distinct. The
             // argument is `Expr::Path` (a per-row list of node-id Nums); a Null row

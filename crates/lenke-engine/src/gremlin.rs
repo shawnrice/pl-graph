@@ -744,13 +744,27 @@ impl Parser {
                 // element map so the path elements are vertices, matching core. The
                 // `Expr::Path` argument both feeds the ids and makes `needs_lineage`
                 // switch tracking on.
-                let p = plan.project(vec![(
-                    "path".to_string(),
+                // An optional `.by('k')` projects each path ELEMENT to a property
+                // (Gremlin `path().by('name')` → a list of names, not vertex maps).
+                let call = if self.peek() == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
+                {
+                    self.expect(&Tok::Dot)?;
+                    self.ident()?; // `by`
+                    self.expect(&Tok::LParen)?;
+                    let key = self.str_arg()?;
+                    self.expect(&Tok::RParen)?;
+                    Expr::Call {
+                        name: "path_values".to_string(),
+                        args: vec![Expr::Path, Expr::Lit(Value::Str(key.into()))],
+                    }
+                } else {
                     Expr::Call {
                         name: "path_nodes".to_string(),
                         args: vec![Expr::Path],
-                    },
-                )]);
+                    }
+                };
+                let p = plan.project(vec![("path".to_string(), call)]);
                 self.current = 0;
                 self.slots = 1;
                 p
