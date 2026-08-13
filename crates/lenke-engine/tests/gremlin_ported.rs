@@ -172,7 +172,13 @@ fn collapse_bare(c: Cmp) -> Cmp {
         Cmp::Map(es) => {
             let keys: std::collections::BTreeSet<&str> = es
                 .iter()
-                .filter_map(|(k, _)| if let Cmp::Str(s) = k { Some(s.as_str()) } else { None })
+                .filter_map(|(k, _)| {
+                    if let Cmp::Str(s) = k {
+                        Some(s.as_str())
+                    } else {
+                        None
+                    }
+                })
                 .collect();
             let is_vertex = keys.len() == es.len()
                 && keys == ["id", "labels", "properties"].into_iter().collect();
@@ -217,7 +223,12 @@ fn modern() -> lenke_core::graph::Graph {
 /// when core produced a raw element (no `Value::Node` in the engine) — the body's own
 /// assertions on `core_res` still run. Compared order-independently (Gremlin order is
 /// unspecified without an explicit `order()`; ordered tests use `ordered()` on core).
-fn assert_engine_matches(query: &str, core_res: &[GVal], store: &lenke_engine::store::Store, cg: &lenke_core::graph::Graph) {
+fn assert_engine_matches(
+    query: &str,
+    core_res: &[GVal],
+    store: &lenke_engine::store::Store,
+    cg: &lenke_core::graph::Graph,
+) {
     if is_write(query) {
         return; // writes run on core only (see is_write)
     }
@@ -1643,7 +1654,10 @@ fn prefixes() -> Vec<(dual::Traversal, &'static str)> {
         (dual::g().v_ids(&[]).has_label(&["P"]), "label only"),
         (dual::g().v_ids(&[]).has("n", P::gte(996.0)), "range seek"),
         (dual::g().v_ids(&[]).has_val("k", "key0005"), "point seek"),
-        (dual::g().v_ids(&[]).has_label(&["P"]).out(&["R"]), "after a hop"),
+        (
+            dual::g().v_ids(&[]).has_label(&["P"]).out(&["R"]),
+            "after a hop",
+        ),
         (
             dual::g().v_ids(&[]).has_label(&["P"]).out_e(&["R"]),
             "edge frontier",
@@ -1665,14 +1679,20 @@ fn key_for(label: &str) -> &'static str {
 /// Run a count query on a custom graph (dual-checked) and read its single number.
 #[allow(dead_code)]
 fn count_of(g: &mut Graph, src: &str) -> f64 {
-    one_num(parse(src).unwrap_or_else(|e| panic!("`{src}` parses: {e}")).run(g))
+    one_num(
+        parse(src)
+            .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+            .run(g),
+    )
 }
 
 /// Assert a traversal agrees with its `fold().unfold()`-streamed spelling (core-side;
 /// each run is also dual-checked against the engine).
 #[allow(dead_code)]
 fn same_via_stream(g: &mut Graph, src: &str) {
-    let column = parse(src).unwrap_or_else(|e| panic!("`{src}` parses: {e}")).run(g);
+    let column = parse(src)
+        .unwrap_or_else(|e| panic!("`{src}` parses: {e}"))
+        .run(g);
     let (head, tail) = src.split_once('.').expect("a traversal has a step");
     let streamed_src = format!("{head}.{}", tail.replacen('.', ".fold().unfold().", 1));
     let streamed = parse(&streamed_src)
@@ -4087,15 +4107,17 @@ fn p2_repeat_times_three_emit_software() {
 
 #[test]
 fn p2_repeat_times_three_until_software() {
-    let r = qs_e("g.V('1').repeat(__.out()).times(3).until(__.hasLabel('SOFTWARE')).values('name')");
+    let r =
+        qs_e("g.V('1').repeat(__.out()).times(3).until(__.hasLabel('SOFTWARE')).values('name')");
     assert_eq!(names(r), vec!["lop", "lop", "ripple"]);
 }
 
 #[test]
 fn p2_repeat_loops_self_limit() {
     // repeat(out().where(loops().is(lt(2)))).times(5).emit()
-    let r =
-        qs_e("g.V('1').repeat(__.out().where(__.loops().is(lt(2)))).times(5).emit().values('name')");
+    let r = qs_e(
+        "g.V('1').repeat(__.out().where(__.loops().is(lt(2)))).times(5).emit().values('name')",
+    );
     assert_eq!(names(r), vec!["josh", "lop", "vadas"]);
 }
 
@@ -4390,8 +4412,9 @@ fn p2_select_pop_last_inside_repeat() {
 
 #[test]
 fn p2_select_pop_first_inside_repeat() {
-    let r =
-        qs_e("g.V('1').repeat(__.out().as('hop')).times(2).select(Pop.first, 'hop').values('name')");
+    let r = qs_e(
+        "g.V('1').repeat(__.out().as('hop')).times(2).select(Pop.first, 'hop').values('name')",
+    );
     assert_eq!(names(r), vec!["josh", "josh"]);
 }
 
@@ -4427,8 +4450,9 @@ fn p2_choose_then_else() {
 #[test]
 fn p2_choose_haslabel_branches() {
     // choose(hasLabel('PERSON'), out('CREATED'), identity()).values('name')
-    let r =
-        qs_e("g.V().choose(__.hasLabel('PERSON'), __.out('CREATED'), __.identity()).values('name')");
+    let r = qs_e(
+        "g.V().choose(__.hasLabel('PERSON'), __.out('CREATED'), __.identity()).values('name')",
+    );
     assert_eq!(
         ordered(r),
         vec!["lop", "ripple", "lop", "lop", "lop", "ripple"]
@@ -4603,10 +4627,9 @@ fn p2_adde_to_subplan() {
 fn p2_adde_from_tag() {
     // tag marko, hop to out-neighbors, addE('META').from('start').to(V('6')).
     let mut g = modern();
-    let r =
-        parse("g.V('1').as('start').out('KNOWS').addE('META').from('start').to(__.V('6'))")
-            .unwrap()
-            .run(&mut g);
+    let r = parse("g.V('1').as('start').out('KNOWS').addE('META').from('start').to(__.V('6'))")
+        .unwrap()
+        .run(&mut g);
     assert_eq!(r.len(), 2); // marko knows vadas + josh → 2 edges
     let count = dual::g().E().count().run(&mut g);
     assert_eq!(count, vec![GVal::Num(8.0)]);
@@ -4664,9 +4687,8 @@ fn p2_fail_throws_with_message() {
     // carrying the user's message — NOT a process-aborting panic. TS throws a
     // catchable error here too. (`run` ignores it, matching the addV/addE faults.)
     let mut g = modern();
-    let t =
-        parse("g.V().hasLabel('PERSON').has('name', eq('peter')).fold().fail('Test Fail')")
-            .unwrap();
+    let t = parse("g.V().hasLabel('PERSON').has('name', eq('peter')).fold().fail('Test Fail')")
+        .unwrap();
     let err = try_run(&mut g, &t).unwrap_err();
     assert_eq!(err.code, lenke_core::error_codes::ErrorCode::DataException);
     assert!(err.message.contains("Test Fail"), "got: {}", err.message);
@@ -4987,8 +5009,7 @@ fn p3_subplan_repeat_body_adds_vertices() {
     // repeat(addV('REP').property('via','rep')).times(2) over V('1') adds 2 verts.
     let mut g = modern();
     let before = g.vertex_count();
-    let t =
-        parse("g.V('1').repeat(__.addV('REP').property('via', 'rep')).times(2)").unwrap();
+    let t = parse("g.V('1').repeat(__.addV('REP').property('via', 'rep')).times(2)").unwrap();
     let _ = t.run(&mut g);
     assert_eq!(g.vertex_count(), before + 2);
 }
@@ -4998,8 +5019,8 @@ fn p3_subplan_map_body_adds_vertices() {
     // map(addV('SHADOW')...) over the four people adds 4 vertices.
     let mut g = modern();
     let before = g.vertex_count();
-    let t = parse("g.V().hasLabel('PERSON').map(__.addV('SHADOW').property('via', 'map'))")
-        .unwrap();
+    let t =
+        parse("g.V().hasLabel('PERSON').map(__.addV('SHADOW').property('via', 'map'))").unwrap();
     let _ = t.run(&mut g);
     assert_eq!(g.vertex_count(), before + 4);
 }
@@ -5008,8 +5029,7 @@ fn p3_subplan_map_body_adds_vertices() {
 fn p3_subplan_repeat_until_times_zero_smoke() {
     // repeat(identity).until(count().is(eq(0))).times(0) — smoke: doesn't panic.
     let mut g = modern();
-    let t = parse("g.V('1').repeat(__.identity()).until(__.count().is(eq(0))).times(0)")
-        .unwrap();
+    let t = parse("g.V('1').repeat(__.identity()).until(__.count().is(eq(0))).times(0)").unwrap();
     let r = t.run(&mut g);
     // smoke: a Vec is produced.
     let _ = r.len();
@@ -6168,11 +6188,12 @@ fn p5_values_multiple_keys() {
 #[test]
 fn p5_values_chained_has_out_values() {
     assert_eq!(
-        ordered(q_eids(g()
-            .V()
-            .has("name", P::eq("marko"))
-            .out(&["KNOWS"])
-            .values(&["name"]))),
+        ordered(q_eids(
+            g().V()
+                .has("name", P::eq("marko"))
+                .out(&["KNOWS"])
+                .values(&["name"])
+        )),
         vec!["vadas", "josh"]
     );
 }
@@ -6204,11 +6225,12 @@ fn p5_values_out_by_label_then_values() {
 #[test]
 fn p5_values_has_out_created_values() {
     assert_eq!(
-        ordered(q_eids(g()
-            .V()
-            .has("name", P::eq("marko"))
-            .out(&["CREATED"])
-            .values(&["name"]))),
+        ordered(q_eids(
+            g().V()
+                .has("name", P::eq("marko"))
+                .out(&["CREATED"])
+                .values(&["name"])
+        )),
         vec!["lop"]
     );
 }
@@ -6232,19 +6254,23 @@ fn p5_values_out_out_values() {
 #[test]
 fn p5_values_chained_predicate_has_age() {
     assert_eq!(
-        ordered(q_eids(g()
-            .V()
-            .has("name", P::eq("marko"))
-            .out(&["KNOWS"])
-            .has("age", P::gt(29))
-            .values(&["name"]))),
+        ordered(q_eids(
+            g().V()
+                .has("name", P::eq("marko"))
+                .out(&["KNOWS"])
+                .has("age", P::gt(29))
+                .values(&["name"])
+        )),
         vec!["josh"]
     );
 }
 
 #[test]
 fn p5_sum_numbers() {
-    assert_eq!(q_eids(g().V().values(&["age"]).sum()), vec![GVal::Num(123.0)]);
+    assert_eq!(
+        q_eids(g().V().values(&["age"]).sum()),
+        vec![GVal::Num(123.0)]
+    );
 }
 
 #[test]
@@ -6303,14 +6329,15 @@ fn p5_dedup_strings() {
 fn p5_dedup_select_cartesian_shape() {
     // V().as(a).out(CREATED).as(b).in(CREATED).as(c).select(a,b,c) — 10 rows
     // of {a,b,c} vertex maps (the cartesian shape before any dedup).
-    let r = q_eids(g()
-        .V()
-        .as_("a")
-        .out(&["CREATED"])
-        .as_("b")
-        .in_(&["CREATED"])
-        .as_("c")
-        .select(&["a", "b", "c"]));
+    let r = q_eids(
+        g().V()
+            .as_("a")
+            .out(&["CREATED"])
+            .as_("b")
+            .in_(&["CREATED"])
+            .as_("c")
+            .select(&["a", "b", "c"]),
+    );
     let triples: Vec<(String, String, String)> = r
         .iter()
         .map(|m| {
@@ -6607,7 +6634,10 @@ fn p5_shortest_path_no_target_reaches_all() {
 
 #[test]
 fn p5_id_all_vertices() {
-    assert_eq!(ordered(q_eids(g().V().id())), vec!["1", "2", "4", "6", "3", "5"]);
+    assert_eq!(
+        ordered(q_eids(g().V().id())),
+        vec!["1", "2", "4", "6", "3", "5"]
+    );
 }
 
 #[test]
@@ -6730,15 +6760,16 @@ fn p5_simple_path_filters_revisits() {
 #[test]
 fn p6_select_multiple_labeled_positions() {
     // V().as(a).out().as(b).out().as(c).select(a,b,c) → ids.
-    let r = q_eids(g()
-        .V()
-        .as_("a")
-        .out(&[])
-        .as_("b")
-        .out(&[])
-        .as_("c")
-        .select(&["a", "b", "c"])
-        .by_id());
+    let r = q_eids(
+        g().V()
+            .as_("a")
+            .out(&[])
+            .as_("b")
+            .out(&[])
+            .as_("c")
+            .select(&["a", "b", "c"])
+            .by_id(),
+    );
     let rows: Vec<Vec<(String, String)>> = r
         .iter()
         .map(|m| as_map(m).iter().map(|(k, v)| (s(k), s(v))).collect())
@@ -6762,15 +6793,16 @@ fn p6_select_multiple_labeled_positions() {
 
 #[test]
 fn p6_select_need_not_select_everything() {
-    let r = q_eids(g()
-        .V()
-        .as_("a")
-        .out(&[])
-        .as_("b")
-        .out(&[])
-        .as_("c")
-        .select(&["a", "b"])
-        .by_id());
+    let r = q_eids(
+        g().V()
+            .as_("a")
+            .out(&[])
+            .as_("b")
+            .out(&[])
+            .as_("c")
+            .select(&["a", "b"])
+            .by_id(),
+    );
     let rows: Vec<Vec<(String, String)>> = r
         .iter()
         .map(|m| as_map(m).iter().map(|(k, v)| (s(k), s(v))).collect())
@@ -6824,13 +6856,14 @@ fn p6_select_current_position() {
 #[test]
 fn p6_select_both_pair_per_neighbor() {
     // g.V(1).as(a).both().as(b).select(a,b) — marko's both() = vadas, josh, lop.
-    let r = q_eids(g()
-        .v_ids(&["1"])
-        .as_("a")
-        .both(&[])
-        .as_("b")
-        .select(&["a", "b"])
-        .by_id());
+    let r = q_eids(
+        g().v_ids(&["1"])
+            .as_("a")
+            .both(&[])
+            .as_("b")
+            .select(&["a", "b"])
+            .by_id(),
+    );
     let rows: Vec<Vec<(String, String)>> = r
         .iter()
         .map(|m| as_map(m).iter().map(|(k, v)| (s(k), s(v))).collect())
@@ -6854,14 +6887,15 @@ fn p6_select_drops_missing_label() {
 #[test]
 fn p6_select_by_subtraversal_projects() {
     // select('a','b').by(in(CREATED).count()).by('name'); a=marko →0, b=lop→'lop'.
-    let r = q_eids(g()
-        .v_ids(&["1"])
-        .as_("a")
-        .out(&["CREATED"])
-        .as_("b")
-        .select(&["a", "b"])
-        .by_t(dual::__().in_(&["CREATED"]).count())
-        .by("name"));
+    let r = q_eids(
+        g().v_ids(&["1"])
+            .as_("a")
+            .out(&["CREATED"])
+            .as_("b")
+            .select(&["a", "b"])
+            .by_t(dual::__().in_(&["CREATED"]).count())
+            .by("name"),
+    );
     let m = as_map(&r[0]);
     assert_eq!(map_get_m(m, "a"), Some(&GVal::Num(0.0)));
     assert_eq!(map_get_m(m, "b"), Some(&GVal::Str("lop".into())));
@@ -6870,24 +6904,26 @@ fn p6_select_by_subtraversal_projects() {
 #[test]
 fn p6_select_single_by_fold_count() {
     // V(3=lop).as(a).select(a).by(in(CREATED).values(name).count()) → 3.
-    let r = q_eids(g()
-        .v_ids(&["3"])
-        .as_("a")
-        .select(&["a"])
-        .by_t(dual::__().in_(&["CREATED"]).values(&["name"]).count()));
+    let r = q_eids(
+        g().v_ids(&["3"])
+            .as_("a")
+            .select(&["a"])
+            .by_t(dual::__().in_(&["CREATED"]).values(&["name"]).count()),
+    );
     assert_eq!(one_num(r), 3.0);
 }
 
 #[test]
 fn p6_select_by_name_both_positions() {
-    let r = q_eids(g()
-        .v_ids(&["1"])
-        .as_("a")
-        .out(&["KNOWS"])
-        .as_("b")
-        .select(&["a", "b"])
-        .by("name")
-        .by("name"));
+    let r = q_eids(
+        g().v_ids(&["1"])
+            .as_("a")
+            .out(&["KNOWS"])
+            .as_("b")
+            .select(&["a", "b"])
+            .by("name")
+            .by("name"),
+    );
     let rows: Vec<(String, String)> = r
         .iter()
         .map(|m| {
@@ -7184,12 +7220,13 @@ fn p6_ine_created_on_v3() {
 #[test]
 fn p6_tree_josh_software_names() {
     // V().has(name,josh).out(CREATED).values(name).tree()
-    let out = q_eids(g()
-        .V()
-        .has("name", P::eq("josh"))
-        .out(&["CREATED"])
-        .values(&["name"])
-        .tree());
+    let out = q_eids(
+        g().V()
+            .has("name", P::eq("josh"))
+            .out(&["CREATED"])
+            .values(&["name"])
+            .tree(),
+    );
     assert_eq!(out.len(), 1);
     let root = as_map(&out[0]);
     assert_eq!(root.len(), 1); // josh
@@ -7548,11 +7585,12 @@ fn p6_hasvalue_filters_by_value() {
 
 #[test]
 fn p6_hasvalue_excludes_non_matching() {
-    let r = q_eids(g()
-        .V()
-        .has_id(&["1"])
-        .properties(&["name"])
-        .has_value(["vadas"]));
+    let r = q_eids(
+        g().V()
+            .has_id(&["1"])
+            .properties(&["name"])
+            .has_value(["vadas"]),
+    );
     assert_eq!(r.len(), 0);
 }
 
@@ -7710,8 +7748,7 @@ fn textual_until_before_repeat_attaches() {
     // dropped and run to natural termination. From marko, until(name=josh) stops
     // the walk at josh; without the fix it'd drop until and yield the final
     // frontier (["lop","ripple"]).
-    let t =
-        parse("g.V('1').until(has('name','josh')).repeat(out()).values('name')").unwrap();
+    let t = parse("g.V('1').until(has('name','josh')).repeat(out()).values('name')").unwrap();
     assert_eq!(sorted_names(q(t)), vec!["josh"]);
 }
 
@@ -7727,14 +7764,13 @@ fn repeat_until_post_form_is_do_while() {
     assert_eq!(sorted_names(built), vec!["josh", "vadas"]);
 
     // Textual post-form is byte-identical to the builder.
-    let t = parse("g.V('1').repeat(out('KNOWS')).until(hasLabel('PERSON')).values('name')")
-        .unwrap();
+    let t =
+        parse("g.V('1').repeat(out('KNOWS')).until(hasLabel('PERSON')).values('name')").unwrap();
     assert_eq!(sorted_names(q(t)), vec!["josh", "vadas"]);
 
     // Pre-form `until(cond).repeat(body)` is while-do → marko exits before the body.
     let pre =
-        parse("g.V('1').until(hasLabel('PERSON')).repeat(out('KNOWS')).values('name')")
-            .unwrap();
+        parse("g.V('1').until(hasLabel('PERSON')).repeat(out('KNOWS')).values('name')").unwrap();
     assert_eq!(sorted_names(q(pre)), vec!["marko"]);
 }
 
@@ -7772,15 +7808,13 @@ fn order_local_ranks_group_map_by_value() {
     );
 
     // Textual form must parse to the same thing (Scope.local routing on `order`).
-    let t =
-        parse("g.V().groupCount().by(T.label).order(Scope.local).by(Order.desc)").unwrap();
+    let t = parse("g.V().groupCount().by(T.label).order(Scope.local).by(Order.desc)").unwrap();
     assert_eq!(q(t), out);
 }
 
 #[test]
 fn order_local_sorts_a_folded_list() {
-    let t =
-        parse("g.V().hasLabel('PERSON').values('age').fold().order(Scope.local)").unwrap();
+    let t = parse("g.V().hasLabel('PERSON').values('age').fold().order(Scope.local)").unwrap();
     let out = q(t);
     let nums: Vec<f64> = match &out[0] {
         GVal::List(xs) => xs
@@ -7885,8 +7919,8 @@ fn id_of_a_path_faults_from_the_plan() {
 
     // But `unfold()` turns it into its ELEMENTS, and those do have ids — so the
     // check must not simply look for a later `id()`.
-    let unfolded = try_run(&mut graph, &g().E().path().unfold().id())
-        .expect("elements of a path have ids");
+    let unfolded =
+        try_run(&mut graph, &g().E().path().unfold().id()).expect("elements of a path have ids");
 
     assert!(
         unfolded.iter().all(|v| matches!(v, GVal::Str(_))),
@@ -8981,9 +9015,7 @@ fn a_cross_type_count_still_faults() {
     let mut graph = seeded();
 
     // The terminal must not answer what the per-step path would have thrown on.
-    assert!(
-        try_run(&mut graph, &g().v_ids(&[]).has("k", P::gt(5.0)).count()).is_err()
-    );
+    assert!(try_run(&mut graph, &g().v_ids(&[]).has("k", P::gt(5.0)).count()).is_err());
 }
 
 #[test]
@@ -9866,9 +9898,7 @@ fn bench_tag_carry() {
     type Build = fn() -> dual::Traversal;
 
     let build: &[(&str, Build)] = &[
-        ("untagged 2-hop", || {
-            dual::g().V().out(&[]).out(&[]).count()
-        }),
+        ("untagged 2-hop", || dual::g().V().out(&[]).out(&[]).count()),
         ("as() then 2-hop", || {
             dual::g().V().as_("x").out(&[]).out(&[]).count()
         }),
@@ -9947,10 +9977,7 @@ fn a_path_reading_step_inside_a_container_still_tracks_the_path() {
     let paths = dual::g()
         .V()
         .limit(3)
-        .union(vec![
-            dual::__().out(&[]).path(),
-            dual::__().in_(&[]).path(),
-        ])
+        .union(vec![dual::__().out(&[]).path(), dual::__().in_(&[]).path()])
         .run(&mut g);
 
     assert!(
@@ -9961,4 +9988,3 @@ fn a_path_reading_step_inside_a_container_still_tracks_the_path() {
         "path() nested in union produced no multi-element path"
     );
 }
-

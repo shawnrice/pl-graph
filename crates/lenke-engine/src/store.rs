@@ -801,16 +801,25 @@ impl Store {
     pub fn prop_keys_arc(&self) -> std::sync::Arc<[std::sync::Arc<str>]> {
         let len = self.props.len();
         {
-            let g = self.prop_keys_cache.read().expect("prop_keys_cache poisoned");
+            let g = self
+                .prop_keys_cache
+                .read()
+                .expect("prop_keys_cache poisoned");
             if g.0 == len {
                 return std::sync::Arc::clone(&g.1);
             }
         }
-        let mut keys: Vec<std::sync::Arc<str>> =
-            self.props.keys().map(|k| std::sync::Arc::from(k.as_str())).collect();
+        let mut keys: Vec<std::sync::Arc<str>> = self
+            .props
+            .keys()
+            .map(|k| std::sync::Arc::from(k.as_str()))
+            .collect();
         keys.sort();
         let arc: std::sync::Arc<[std::sync::Arc<str>]> = keys.into();
-        let mut g = self.prop_keys_cache.write().expect("prop_keys_cache poisoned");
+        let mut g = self
+            .prop_keys_cache
+            .write()
+            .expect("prop_keys_cache poisoned");
         *g = (len, std::sync::Arc::clone(&arc));
         arc
     }

@@ -540,7 +540,8 @@ mod tests {
             arg: None,
             distinct: false,
             name: "c".into(),
-            frac: None, null_on_empty: false,
+            frac: None,
+            null_on_empty: false,
         }
     }
 }

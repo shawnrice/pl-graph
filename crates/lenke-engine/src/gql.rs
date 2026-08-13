@@ -5795,7 +5795,8 @@ mod tests {
                 arg: Some(Expr::Slot(1)),
                 distinct: false,
                 name: "n".into(),
-                frac: None, null_on_empty: false,
+                frac: None,
+                null_on_empty: false,
             }],
         )
         .filter(Expr::Compare {
@@ -7345,7 +7346,8 @@ mod tests {
                     }),
                     distinct: false,
                     name: "s".into(),
-                    frac: None, null_on_empty: false,
+                    frac: None,
+                    null_on_empty: false,
                 },
                 Agg {
                     func: AggFn::Avg,
@@ -7355,7 +7357,8 @@ mod tests {
                     }),
                     distinct: false,
                     name: "a".into(),
-                    frac: None, null_on_empty: false,
+                    frac: None,
+                    null_on_empty: false,
                 },
             ],
         );

@@ -609,9 +609,7 @@ fn vertex_map_ext_id(v: &Value) -> Option<&str> {
             _ => None,
         })
         .collect();
-    if keys.len() != pairs.len()
-        || keys != ["id", "labels", "properties"].into_iter().collect()
-    {
+    if keys.len() != pairs.len() || keys != ["id", "labels", "properties"].into_iter().collect() {
         return None;
     }
     pairs.iter().find_map(|(k, val)| match (k, val) {
@@ -631,7 +629,10 @@ fn edge_map_ext_id(v: &Value) -> Option<&str> {
         })
         .collect();
     if keys.len() != pairs.len()
-        || keys != ["from", "id", "labels", "properties", "to"].into_iter().collect()
+        || keys
+            != ["from", "id", "labels", "properties", "to"]
+                .into_iter()
+                .collect()
     {
         return None;
     }
@@ -658,8 +659,7 @@ fn reunfold_elements(elems: &[Value], store: &Store) -> Col {
     }
     // Try edges — build a lazy ext→edge map (no reverse map is stored).
     if elems.iter().all(|v| edge_map_ext_id(v).is_some()) {
-        let mut by_ext: std::collections::HashMap<Arc<str>, u32> =
-            std::collections::HashMap::new();
+        let mut by_ext: std::collections::HashMap<Arc<str>, u32> = std::collections::HashMap::new();
         for e in store.all_edges() {
             if let Some(x) = store.edge_ext_id(e) {
                 by_ext.entry(x).or_insert(e);
@@ -928,9 +928,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::AddEdge { .. }
         | Plan::CallProcedure { .. } => false,
         Plan::Sample { input, .. }
-
         | Plan::Enumerate { input, .. }
-
         | Plan::EdgeVertex { input, .. }
         | Plan::Expand { input, .. }
         | Plan::OptionalExpand { input, .. }
@@ -1043,7 +1041,8 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // Resolve each external id to a LIVE edge, preserving request order; an
             // unknown/deleted id is dropped. No reverse ext→edge map exists, so build
             // one lazily from the live-edge set (edge id lookups are rare/small).
-            let mut by_ext: std::collections::HashMap<Arc<str>, u32> = std::collections::HashMap::new();
+            let mut by_ext: std::collections::HashMap<Arc<str>, u32> =
+                std::collections::HashMap::new();
             for e in store.all_edges() {
                 if let Some(x) = store.edge_ext_id(e) {
                     by_ext.entry(x).or_insert(e);
@@ -3678,9 +3677,7 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
 fn count_hops(plan: &Plan) -> usize {
     match plan {
         Plan::Sample { input, .. }
-
         | Plan::Enumerate { input, .. }
-
         | Plan::EdgeVertex { input, .. }
         | Plan::Expand { input, .. } => 1 + count_hops(input),
         _ => 0,
@@ -4156,7 +4153,18 @@ fn try_varlen_count(
             used.push(v); // mark the start node
         }
         varlen_count_dfs(
-            store, v, 0, *min, *max, *dir, &want, *mode, v, &mut used, &mut total, *double_loops,
+            store,
+            v,
+            0,
+            *min,
+            *max,
+            *dir,
+            &want,
+            *mode,
+            v,
+            &mut used,
+            &mut total,
+            *double_loops,
         );
         if node_unique {
             used.pop();
@@ -4772,7 +4780,9 @@ fn try_frontier_prop_agg(
             });
         }
     });
-    Some(Batch::single(Col::Gen(vec![best.map_or(Value::Null, Value::Num)])))
+    Some(Batch::single(Col::Gen(vec![
+        best.map_or(Value::Null, Value::Num)
+    ])))
 }
 
 /// Answer a scalar `count(*)` over a bare labelled/unlabelled `Scan` in O(1) (a
@@ -5745,7 +5755,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         Expr::Exists { .. }
         | Expr::CountSubquery { .. }
         | Expr::ScalarSubquery { .. }
-            | Expr::CollectSubquery { .. }
+        | Expr::CollectSubquery { .. }
         | Expr::UncorrelatedExists { .. }
         | Expr::UncorrelatedCount { .. }
         | Expr::UncorrelatedScalar { .. } => false,
@@ -5853,7 +5863,7 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         Expr::Exists { .. }
         | Expr::CountSubquery { .. }
         | Expr::ScalarSubquery { .. }
-            | Expr::CollectSubquery { .. }
+        | Expr::CollectSubquery { .. }
         | Expr::UncorrelatedExists { .. }
         | Expr::UncorrelatedCount { .. }
         | Expr::UncorrelatedScalar { .. } => expr.clone(),
@@ -8132,9 +8142,7 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 // Sentinel keys from `path().by(id|label)`: the element's ext-id / label.
                 let map_elem = |id: u32| -> Value {
                     match key.as_ref() {
-                        "\u{0}id" => store
-                            .node_ext_id(id)
-                            .map_or(Value::Null, Value::Str),
+                        "\u{0}id" => store.node_ext_id(id).map_or(Value::Null, Value::Str),
                         "\u{0}label" => store
                             .labels_of(id)
                             .into_iter()
@@ -8271,9 +8279,13 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                         "eq" => value::equals(el, &cmp),
                         "neq" => !value::equals(el, &cmp),
                         "gt" => value::cmp_partial(el, &cmp).is_some_and(std::cmp::Ordering::is_gt),
-                        "gte" => value::cmp_partial(el, &cmp).is_some_and(std::cmp::Ordering::is_ge),
+                        "gte" => {
+                            value::cmp_partial(el, &cmp).is_some_and(std::cmp::Ordering::is_ge)
+                        }
                         "lt" => value::cmp_partial(el, &cmp).is_some_and(std::cmp::Ordering::is_lt),
-                        "lte" => value::cmp_partial(el, &cmp).is_some_and(std::cmp::Ordering::is_le),
+                        "lte" => {
+                            value::cmp_partial(el, &cmp).is_some_and(std::cmp::Ordering::is_le)
+                        }
                         _ => false,
                     }
                 };
@@ -11112,11 +11124,9 @@ mod tests {
         match p {
             Plan::IntervalExpand { .. } => true,
             Plan::Sample { input, .. }
-
             | Plan::Enumerate { input, .. }
-
             | Plan::EdgeVertex { input, .. }
-        | Plan::Expand { input, .. }
+            | Plan::Expand { input, .. }
             | Plan::VarLength { input, .. }
             | Plan::ShortestPath { input, .. }
             | Plan::Filter { input, .. }
@@ -14088,7 +14098,8 @@ mod tests {
             arg,
             distinct,
             name: name.to_string(),
-            frac: None, null_on_empty: false,
+            frac: None,
+            null_on_empty: false,
         }
     }
 

@@ -64,7 +64,14 @@ impl Rng {
 // --- fixture (one ndjson → both engines, so ids/edges are identical) ---------
 
 const CITIES: &[&str] = &[
-    "oslo", "bergen", "troms", "stavanger", "bodo", "tromso", "aalborg", "moss",
+    "oslo",
+    "bergen",
+    "troms",
+    "stavanger",
+    "bodo",
+    "tromso",
+    "aalborg",
+    "moss",
 ];
 
 /// Build BOTH engines' ndjson from the SAME logical graph, so ids/edges/props are
@@ -85,7 +92,9 @@ fn fixture_ndjson(n: u32, deg: u32) -> (String, String) {
             i.wrapping_mul(7) % 1000,
             CITIES[(i % CITIES.len() as u32) as usize],
         );
-        es.push_str(&format!(r#"{{"id":"{i}","labels":{labels},"props":{{{props}}}}}"#));
+        es.push_str(&format!(
+            r#"{{"id":"{i}","labels":{labels},"props":{{{props}}}}}"#
+        ));
         es.push('\n');
         cs.push_str(&format!(
             r#"{{"type":"node","id":"{i}","labels":{labels},"properties":{{{props}}}}}"#
@@ -107,11 +116,21 @@ fn fixture_ndjson(n: u32, deg: u32) -> (String, String) {
     };
     for i in 0..n {
         for d in 0..deg {
-            let to = (i.wrapping_mul(7).wrapping_add(d.wrapping_mul(13)).wrapping_add(1)) % n;
+            let to = (i
+                .wrapping_mul(7)
+                .wrapping_add(d.wrapping_mul(13))
+                .wrapping_add(1))
+                % n;
             push_edge(&mut es, &mut cs, i, to, "R");
         }
         if i % 5 == 0 {
-            push_edge(&mut es, &mut cs, i, (i.wrapping_mul(3).wrapping_add(2)) % n, "F");
+            push_edge(
+                &mut es,
+                &mut cs,
+                i,
+                (i.wrapping_mul(3).wrapping_add(2)) % n,
+                "F",
+            );
         }
     }
     (es, cs)
@@ -159,7 +178,9 @@ impl Gen<'_> {
             _ => {
                 self.tag("src-id");
                 let k = 1 + self.rng.below(3);
-                let ids: Vec<String> = (0..k).map(|_| format!("'{}'", self.rng.below(self.n))).collect();
+                let ids: Vec<String> = (0..k)
+                    .map(|_| format!("'{}'", self.rng.below(self.n)))
+                    .collect();
                 format!("g.V({})", ids.join(", "))
             }
         }
@@ -188,7 +209,10 @@ impl Gen<'_> {
                 } else {
                     String::new()
                 };
-                let (e, v) = *self.rng.pick(&[("outE", "inV"), ("inE", "outV"), ("bothE", "otherV")]);
+                let (e, v) =
+                    *self
+                        .rng
+                        .pick(&[("outE", "inV"), ("inE", "outV"), ("bothE", "otherV")]);
                 format!(".{e}({et}).{v}()")
             }
         }
@@ -224,11 +248,17 @@ impl Gen<'_> {
                 // `until` bounded by a `times` cap — an unbounded until on a cyclic graph
                 // would run to the 100-iteration ceiling (a catastrophic fan-out).
                 self.tag("repeat-until");
-                format!(".repeat({body}).times(2).until(__.hasLabel('{}'))", self.rng.pick(LABELS))
+                format!(
+                    ".repeat({body}).times(2).until(__.hasLabel('{}'))",
+                    self.rng.pick(LABELS)
+                )
             }
             _ => {
                 self.tag("repeat-bodyfilter");
-                format!(".repeat({body}.hasLabel('{}')).times({times})", self.rng.pick(LABELS))
+                format!(
+                    ".repeat({body}.hasLabel('{}')).times({times})",
+                    self.rng.pick(LABELS)
+                )
             }
         }
     }
@@ -270,7 +300,10 @@ impl Gen<'_> {
             }
             3..=4 => {
                 self.tag("values");
-                format!(".values('{}')", self.rng.pick(&["name", "age", "city", "score"]))
+                format!(
+                    ".values('{}')",
+                    self.rng.pick(&["name", "age", "city", "score"])
+                )
             }
             5 => {
                 self.tag("agg");
@@ -287,11 +320,19 @@ impl Gen<'_> {
             }
             7 => {
                 self.tag("group");
-                format!(".group().by('{}').by('{}')", self.rng.pick(STR_PROPS), self.rng.pick(NUM_PROPS))
+                format!(
+                    ".group().by('{}').by('{}')",
+                    self.rng.pick(STR_PROPS),
+                    self.rng.pick(NUM_PROPS)
+                )
             }
             8 => {
                 self.tag("order-limit");
-                format!(".order().by('{}').limit({})", self.rng.pick(NUM_PROPS), 1 + self.rng.below(50))
+                format!(
+                    ".order().by('{}').limit({})",
+                    self.rng.pick(NUM_PROPS),
+                    1 + self.rng.below(50)
+                )
             }
             9..=10 => {
                 self.tag("path");
@@ -401,7 +442,8 @@ fn time_engine_guarded(
         let mut rows = 0;
         for _ in 0..reps {
             let t = Instant::now();
-            let out = std::panic::catch_unwind(AssertUnwindSafe(|| lenke_engine::exec::run(&p, &s)));
+            let out =
+                std::panic::catch_unwind(AssertUnwindSafe(|| lenke_engine::exec::run(&p, &s)));
             match out {
                 Ok(o) => {
                     best = best.min(t.elapsed().as_secs_f64() * 1e3);
@@ -449,7 +491,10 @@ fn time_core(
 }
 
 fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 struct Timed {
@@ -470,7 +515,10 @@ fn main() {
     let n = env_u32("BENCH_N", 10_000);
     let deg = env_u32("BENCH_DEG", 4);
     let gen_n = env_u32("FUZZ_N", 20_000) as usize;
-    let seed = std::env::var("PERF_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0xC0FFEE);
+    let seed = std::env::var("PERF_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0xC0FFEE);
     let max_time = env_u32("FUZZ_MAX_TEMPLATES", 2000) as usize;
     let budget = Duration::from_millis(u64::from(env_u32("FUZZ_BUDGET_MS", 1500)));
     let opt = env_u32("GREMLIN_OPT", 0) != 0;
@@ -523,14 +571,18 @@ fn main() {
                 continue;
             }
             Err(why) => {
-                *skips.entry(format!("engine {}", first_line(&why))).or_insert(0) += 1;
+                *skips
+                    .entry(format!("engine {}", first_line(&why)))
+                    .or_insert(0) += 1;
                 continue;
             }
         };
         let c = match time_core(&mut cgraph, q, REPS, materialize) {
             Ok(v) => v,
             Err(why) => {
-                *skips.entry(format!("core {}", first_line(&why))).or_insert(0) += 1;
+                *skips
+                    .entry(format!("core {}", first_line(&why)))
+                    .or_insert(0) += 1;
                 continue;
             }
         };
@@ -566,7 +618,10 @@ fn main() {
         }
     }
     if !engine_panics.is_empty() {
-        println!("\n!!! {} ENGINE PANICS (parseable, core-runnable) !!!", engine_panics.len());
+        println!(
+            "\n!!! {} ENGINE PANICS (parseable, core-runnable) !!!",
+            engine_panics.len()
+        );
         for q in engine_panics.iter().take(15) {
             println!("  {q}");
         }
@@ -602,8 +657,10 @@ fn main() {
             }
         }
     }
-    let mut tag_rows: Vec<(&&str, f64, usize, usize)> =
-        per_tag.iter().map(|(t, (sum, n, lose))| (t, sum / *n as f64, *n, *lose)).collect();
+    let mut tag_rows: Vec<(&&str, f64, usize, usize)> = per_tag
+        .iter()
+        .map(|(t, (sum, n, lose))| (t, sum / *n as f64, *n, *lose))
+        .collect();
     tag_rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
     println!("\nper-feature mean ratio (worst first, >1 = engine faster):");
     println!("  {:>7}  {:>5}  {:>5}  feature", "mean", "n", "lose");

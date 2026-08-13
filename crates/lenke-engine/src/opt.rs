@@ -1814,7 +1814,7 @@ mod tests {
             Plan::Scan { .. }
             | Plan::NodeSeed { .. }
             | Plan::EdgeScan
-        | Plan::EdgeSeed { .. }
+            | Plan::EdgeSeed { .. }
             | Plan::Row
             | Plan::IndexSeek { .. }
             | Plan::RangeSeek { .. }

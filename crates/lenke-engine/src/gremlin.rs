@@ -146,8 +146,23 @@ fn math_const(name: &str) -> Option<f64> {
 fn is_unary_math_fn(name: &str) -> bool {
     matches!(
         name,
-        "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "sqrt"
-            | "abs" | "ceil" | "floor" | "exp" | "ln" | "log10" | "signum"
+        "sin"
+            | "cos"
+            | "tan"
+            | "asin"
+            | "acos"
+            | "atan"
+            | "sinh"
+            | "cosh"
+            | "tanh"
+            | "sqrt"
+            | "abs"
+            | "ceil"
+            | "floor"
+            | "exp"
+            | "ln"
+            | "log10"
+            | "signum"
     )
 }
 
@@ -177,7 +192,11 @@ impl MathParser<'_> {
             self.pos += 1;
             let right = self.term()?;
             left = Expr::Arith {
-                op: if op == '+' { ArithOp::Add } else { ArithOp::Sub },
+                op: if op == '+' {
+                    ArithOp::Add
+                } else {
+                    ArithOp::Sub
+                },
                 left: Box::new(left),
                 right: Box::new(right),
             };
@@ -735,7 +754,11 @@ impl Parser {
             "oute" => (Dir::Out, true),
             "ine" => (Dir::In, true),
             "bothe" => (Dir::Both, true),
-            other => return Err(format!("order().by(<traversal>): unsupported body `{other}`")),
+            other => {
+                return Err(format!(
+                    "order().by(<traversal>): unsupported body `{other}`"
+                ))
+            }
         };
         self.expect(&Tok::LParen)?;
         let mut labels: Vec<String> = Vec::new();
@@ -879,7 +902,11 @@ impl Parser {
         }) {
             let acc = self.ident()?.to_ascii_lowercase();
             self.eat_empty_parens();
-            let func = if acc == "id" { "element_id" } else { "element_label" };
+            let func = if acc == "id" {
+                "element_id"
+            } else {
+                "element_label"
+            };
             return Ok(Expr::Call {
                 name: func.into(),
                 args: vec![Expr::Slot(elem_slot)],
@@ -1838,10 +1865,11 @@ impl Parser {
                 // The THEN arm is a hop; its neighbour lands at the reconverge slot W.
                 let (t_dir, t_label) = self.hop_body()?;
                 let land = self.slots;
-                let then_body =
-                    Plan::Row
-                        .filter(pred.clone())
-                        .expand(from, t_dir, &etypes_of(t_label.as_deref()));
+                let then_body = Plan::Row.filter(pred.clone()).expand(
+                    from,
+                    t_dir,
+                    &etypes_of(t_label.as_deref()),
+                );
                 // The ELSE arm is a hop, `identity()`, or absent (implicit identity). An
                 // identity/absent arm passes the element through — copy it into slot W so
                 // both arms reconverge there.
@@ -2171,7 +2199,7 @@ impl Parser {
                             "bothv" => Dir::Both,
                             _ => {
                                 return Err(
-                                    "otherV() off a bare edge frontier is not supported".into(),
+                                    "otherV() off a bare edge frontier is not supported".into()
                                 )
                             }
                         };
@@ -2303,7 +2331,8 @@ impl Parser {
                             self.bump();
                             self.expect(&Tok::Dot)?;
                         }
-                        if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("T")) {
+                        if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("T"))
+                        {
                             self.bump();
                             self.expect(&Tok::Dot)?;
                         }
@@ -2505,9 +2534,10 @@ impl Parser {
                 match self.prop_keys.take() {
                     Some(keys) => {
                         // `properties('k').value()` → the property VALUE (element's `k`).
-                        let key = keys.first().cloned().ok_or(
-                            "value() after a multi-key properties() is not yet supported",
-                        )?;
+                        let key = keys
+                            .first()
+                            .cloned()
+                            .ok_or("value() after a multi-key properties() is not yet supported")?;
                         let p = plan.project(vec![(
                             "value".to_string(),
                             Expr::Prop {
@@ -2600,10 +2630,10 @@ impl Parser {
                     let end = self.str_arg()?;
                     self.expect(&Tok::RParen)?; // close op(...)
                     self.expect(&Tok::RParen)?; // close where(...)
-                    // Optional `.by('k')` modulators pick a PROPERTY to compare on each
-                    // side (`where('a',lt('b')).by('age')` → a.age < b.age). One `by`
-                    // applies to both sides; two apply to start then end in order. With
-                    // no `by` the tagged elements are compared directly (slot vs slot).
+                                                // Optional `.by('k')` modulators pick a PROPERTY to compare on each
+                                                // side (`where('a',lt('b')).by('age')` → a.age < b.age). One `by`
+                                                // applies to both sides; two apply to start then end in order. With
+                                                // no `by` the tagged elements are compared directly (slot vs slot).
                     let mut bys: Vec<String> = Vec::new();
                     while self.peek() == Some(&Tok::Dot)
                         && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
@@ -2737,7 +2767,8 @@ impl Parser {
                             arg: None,
                             distinct: false,
                             name: "count".into(),
-                            frac: None, null_on_empty: false,
+                            frac: None,
+                            null_on_empty: false,
                         }],
                     );
                     self.current = 0;
@@ -2806,7 +2837,8 @@ impl Parser {
                         arg: Some(Expr::Slot(self.current)),
                         distinct: false,
                         name: "fold".into(),
-                        frac: None, null_on_empty: false,
+                        frac: None,
+                        null_on_empty: false,
                     }],
                 );
                 self.current = 0;
@@ -2923,10 +2955,7 @@ impl Parser {
                         "skip".to_string(),
                         Expr::Call {
                             name: "list_skip".to_string(),
-                            args: vec![
-                                Expr::Slot(self.current),
-                                Expr::Lit(Value::Num(n as f64)),
-                            ],
+                            args: vec![Expr::Slot(self.current), Expr::Lit(Value::Num(n as f64))],
                         },
                     )]);
                     self.current = 0;
@@ -3077,7 +3106,9 @@ impl Parser {
                 // Label the current slot; the plan is unchanged (select resolves it).
                 let label = self.str_arg()?;
                 self.expect(&Tok::RParen)?;
-                self.first_labels.entry(label.clone()).or_insert(self.current);
+                self.first_labels
+                    .entry(label.clone())
+                    .or_insert(self.current);
                 self.all_labels
                     .entry(label.clone())
                     .or_default()
@@ -3298,11 +3329,9 @@ impl Parser {
                 }
                 let p = if pop_all {
                     // Pop.all: every binding of the (single) tag, as a list.
-                    let slots = self
-                        .all_labels
-                        .get(&labels[0])
-                        .cloned()
-                        .ok_or_else(|| format!("select('{}'): no step is labelled it", labels[0]))?;
+                    let slots = self.all_labels.get(&labels[0]).cloned().ok_or_else(|| {
+                        format!("select('{}'): no step is labelled it", labels[0])
+                    })?;
                     let items = slots.into_iter().map(Expr::Slot).collect();
                     plan.project(vec![(labels[0].clone(), Expr::List { items })])
                 } else if labels.len() == 1 {
@@ -3379,7 +3408,8 @@ impl Parser {
                             arg: None,
                             distinct: false,
                             name: "count".into(),
-                            frac: None, null_on_empty: false,
+                            frac: None,
+                            null_on_empty: false,
                         }],
                     )
                     // Gremlin groupCount() is a single {key: count} Map, not (k,c) rows.
@@ -3565,7 +3595,8 @@ impl Parser {
                         arg: None,
                         distinct: false,
                         name: "value".into(),
-                        frac: None, null_on_empty: false,
+                        frac: None,
+                        null_on_empty: false,
                     },
                     Some(GroupBy::Key(k)) => Agg {
                         func: AggFn::Collect,
@@ -3575,14 +3606,16 @@ impl Parser {
                         }),
                         distinct: false,
                         name: "value".into(),
-                        frac: None, null_on_empty: false,
+                        frac: None,
+                        null_on_empty: false,
                     },
                     Some(GroupBy::KeyExpr(_, e)) => Agg {
                         func: AggFn::Collect,
                         arg: Some(e.clone()),
                         distinct: false,
                         name: "value".into(),
-                        frac: None, null_on_empty: false,
+                        frac: None,
+                        null_on_empty: false,
                     },
                     Some(GroupBy::Reduce(func, arg)) => Agg {
                         func: *func,
@@ -3600,7 +3633,8 @@ impl Parser {
                         arg: Some(Expr::Slot(elem_slot)),
                         distinct: false,
                         name: "value".into(),
-                        frac: None, null_on_empty: false,
+                        frac: None,
+                        null_on_empty: false,
                     },
                 };
                 let p = plan
@@ -3634,7 +3668,10 @@ impl Parser {
                     self.expect(&Tok::LParen)?;
                     let k = self.str_arg()?;
                     self.expect(&Tok::RParen)?;
-                    Expr::Prop { slot: self.current, key: k }
+                    Expr::Prop {
+                        slot: self.current,
+                        key: k,
+                    }
                 } else {
                     Expr::Slot(self.current)
                 };
@@ -3890,8 +3927,7 @@ impl Parser {
                         self.expect(&Tok::RParen)?;
                         // The CollectSubquery exec inserts a provenance column at
                         // `outer_width`, so a body slot at/after it shifts up by one.
-                        let mut scalar =
-                            aggs[0].arg.clone().unwrap_or(Expr::Slot(self.current));
+                        let mut scalar = aggs[0].arg.clone().unwrap_or(Expr::Slot(self.current));
                         shift_body_slots(&mut scalar, width);
                         let expr = Expr::CollectSubquery {
                             body: input,
@@ -3923,10 +3959,12 @@ impl Parser {
                         self.expect(&Tok::RParen)?; // close local(...)
                         p
                     }
-                    _ => return Err(
-                        "local(<traversal>) beyond a hop chain or count()/fold() is deferred"
-                            .into(),
-                    ),
+                    _ => {
+                        return Err(
+                            "local(<traversal>) beyond a hop chain or count()/fold() is deferred"
+                                .into(),
+                        )
+                    }
                 }
             }
             "withcomputer" => {
@@ -4013,14 +4051,22 @@ impl Parser {
                             } => {
                                 let algo = match algo {
                                     crate::ir::GremlinAlgo::PageRank { damping, .. } => {
-                                        crate::ir::GremlinAlgo::PageRank { damping, iterations: n }
+                                        crate::ir::GremlinAlgo::PageRank {
+                                            damping,
+                                            iterations: n,
+                                        }
                                     }
                                     crate::ir::GremlinAlgo::PeerPressure { .. } => {
                                         crate::ir::GremlinAlgo::PeerPressure { iterations: n }
                                     }
                                     other => other,
                                 };
-                                Plan::AlgoAnnotate { input, algo, edge_label, node_slot }
+                                Plan::AlgoAnnotate {
+                                    input,
+                                    algo,
+                                    edge_label,
+                                    node_slot,
+                                }
                             }
                             other => other,
                         }
@@ -4043,15 +4089,11 @@ impl Parser {
                                 target: Some(target),
                             },
                             _ => {
-                                return Err(
-                                    "with(target, …) applies only to shortestPath()".into()
-                                )
+                                return Err("with(target, …) applies only to shortestPath()".into())
                             }
                         }
                     }
-                    other => {
-                        return Err(format!("with({other}, …) is not yet supported"))
-                    }
+                    other => return Err(format!("with({other}, …) is not yet supported")),
                 }
             }
             "barrier" => {
@@ -4146,7 +4188,8 @@ impl Parser {
                         arg: Some(expr),
                         distinct: false,
                         name: key,
-                        frac: None, null_on_empty: false,
+                        frac: None,
+                        null_on_empty: false,
                     }],
                 );
                 self.current = 0;
@@ -4209,8 +4252,16 @@ impl Parser {
         // re-arm the edge-hop pointer the top-of-step take() cleared.
         if matches!(
             lname.as_str(),
-            "has" | "hasnot" | "haskey" | "hasvalue" | "subgraph" | "aggregate" | "store"
-                | "dedup" | "where" | "as"
+            "has"
+                | "hasnot"
+                | "haskey"
+                | "hasvalue"
+                | "subgraph"
+                | "aggregate"
+                | "store"
+                | "dedup"
+                | "where"
+                | "as"
         ) {
             self.edge_hop = prev_edge_hop;
         }
@@ -4350,7 +4401,10 @@ impl Parser {
                 slot: self.current,
                 key,
             };
-            return Ok(Expr::Not(Box::new(Expr::And(Box::new(exists), Box::new(base)))));
+            return Ok(Expr::Not(Box::new(Expr::And(
+                Box::new(exists),
+                Box::new(base),
+            ))));
         }
         self.predicate_expr(left)
     }
@@ -4709,9 +4763,7 @@ impl Parser {
     /// `(start_tag, direction, edge_label, end_tag?)`. Shared by the `not(...)`
     /// fragment (cursor already past any leading `__.`).
     #[allow(clippy::type_complexity)]
-    fn match_hop_head(
-        &mut self,
-    ) -> Result<(String, Dir, Option<String>, Option<String>), String> {
+    fn match_hop_head(&mut self) -> Result<(String, Dir, Option<String>, Option<String>), String> {
         let as1 = self.ident()?;
         if !as1.eq_ignore_ascii_case("as") {
             return Err("match() fragment must start with as('tag')".into());
@@ -4787,9 +4839,7 @@ impl Parser {
                     "gte" => CompareOp::Ge,
                     "lt" => CompareOp::Lt,
                     "lte" => CompareOp::Le,
-                    other => {
-                        return Err(format!("match() has(): unsupported predicate `{other}`"))
-                    }
+                    other => return Err(format!("match() has(): unsupported predicate `{other}`")),
                 };
                 Some((cop, v))
             }
@@ -5382,7 +5432,16 @@ impl Parser {
     #[allow(clippy::type_complexity)]
     fn repeat_body(
         &mut self,
-    ) -> Result<(Dir, Option<String>, Option<String>, Option<Expr>, Option<u32>), String> {
+    ) -> Result<
+        (
+            Dir,
+            Option<String>,
+            Option<String>,
+            Option<Expr>,
+            Option<u32>,
+        ),
+        String,
+    > {
         // Optional `__.` anonymous-traversal prefix.
         if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
             self.bump();
@@ -5484,10 +5543,10 @@ impl Parser {
             return Ok(plan);
         };
         const CAP: u32 = 100; // the TS engine's default iteration cap
-        // A `repeat(identity())` walk never moves the frontier, so the ONLY thing the
-        // modulators decide is whether any depth is emittable. A post-form `until` is a
-        // do-while (min 1); with `times(0)` (max 0) min > max, so nothing survives —
-        // matching core. Otherwise the frontier passes through.
+                              // A `repeat(identity())` walk never moves the frontier, so the ONLY thing the
+                              // modulators decide is whether any depth is emittable. A post-form `until` is a
+                              // do-while (min 1); with `times(0)` (max 0) min > max, so nothing survives —
+                              // matching core. Otherwise the frontier passes through.
         if ctx.identity_body {
             let (min, max) = if ctx.until.is_some() {
                 (1, ctx.times.unwrap_or(CAP))
@@ -5512,11 +5571,7 @@ impl Parser {
         // unrolls — a variable emit/until/body-filter/loops-cap walk keeps the VarLength
         // and binds just the endpoint.
         if let (Some(tag), false, Some(n)) = (ctx.bind_tag.as_ref(), ctx.min_one, ctx.times) {
-            if n >= 1
-                && ctx.until.is_none()
-                && ctx.body_filter.is_none()
-                && ctx.max_cap.is_none()
-            {
+            if n >= 1 && ctx.until.is_none() && ctx.body_filter.is_none() && ctx.max_cap.is_none() {
                 let etypes = etypes_of(ctx.label.as_deref());
                 let tag = tag.clone();
                 self.slots = ctx.out_slot; // reclaim the pre-allocated endpoint slot
@@ -5584,7 +5639,10 @@ impl Parser {
         // An inner `.as('tag')` binds the tag to the endpoint (the last landing).
         if let Some(tag) = ctx.bind_tag {
             self.first_labels.entry(tag.clone()).or_insert(ctx.out_slot);
-            self.all_labels.entry(tag.clone()).or_default().push(ctx.out_slot);
+            self.all_labels
+                .entry(tag.clone())
+                .or_default()
+                .push(ctx.out_slot);
             self.labels.insert(tag, ctx.out_slot);
         }
         Ok(match ctx.filter {
@@ -7062,7 +7120,8 @@ mod tests {
                 assert!(matches!(&pairs[0].0, Value::Str(s) if &**s == "p"));
                 assert!(matches!(&pairs[1].0, Value::Str(s) if &**s == "f"));
                 assert!(matches!(map_id(&pairs[0].1), Some(Value::Str(s)) if &*s == "1")); // bob
-                assert!(matches!(map_id(&pairs[1].1), Some(Value::Str(s)) if &*s == "2")); // carol
+                assert!(matches!(map_id(&pairs[1].1), Some(Value::Str(s)) if &*s == "2"));
+                // carol
             }
             o => panic!("expected a Map, got {o:?}"),
         }
