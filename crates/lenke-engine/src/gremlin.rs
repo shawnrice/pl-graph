@@ -1656,16 +1656,17 @@ impl Parser {
                 let parts = self.child_filter_list()?;
                 self.expect(&Tok::RParen)?;
                 let mut it = parts.into_iter();
-                let first = it
-                    .next()
-                    .ok_or_else(|| format!("{lname}() needs at least one child traversal"))?;
-                let combined = it.fold(first, |acc, e| {
-                    if lname == "and" {
-                        Expr::And(Box::new(acc), Box::new(e))
-                    } else {
-                        Expr::Or(Box::new(acc), Box::new(e))
-                    }
-                });
+                let combined = match it.next() {
+                    Some(first) => it.fold(first, |acc, e| {
+                        if lname == "and" {
+                            Expr::And(Box::new(acc), Box::new(e))
+                        } else {
+                            Expr::Or(Box::new(acc), Box::new(e))
+                        }
+                    }),
+                    // Empty: `or()` matches nothing (false), `and()` everything (true).
+                    None => Expr::Lit(Value::Bool(lname == "and")),
+                };
                 plan.filter(combined)
             }
             "not" => {
@@ -3786,6 +3787,20 @@ impl Parser {
                 }
             }
         };
+        // Chained ELEMENT filters conjoin: `has('n',1).has('n',1)`, `hasLabel(..).has(..)`.
+        // (A hop-led chain like `out().where(...)` is a nested sub-traversal, handled by
+        // the catch-all above, not conjoined here.)
+        let mut expr = expr;
+        while self.peek() == Some(&Tok::Dot)
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if {
+                matches!(s.to_ascii_lowercase().as_str(),
+                    "has" | "hasnot" | "haslabel" | "haskey" | "hasvalue")
+            })
+        {
+            self.bump(); // the `.`
+            let next = self.child_filter_expr()?;
+            expr = Expr::And(Box::new(expr), Box::new(next));
+        }
         Ok(expr)
     }
 
@@ -4160,6 +4175,11 @@ impl Parser {
     /// Parse a comma-separated list of child filter traversals up to (but not
     /// consuming) the enclosing `)`.
     fn child_filter_list(&mut self) -> Result<Vec<Expr>, String> {
+        // An empty list — `and()` / `or()` — is allowed (the caller supplies the
+        // identity: `or()` matches nothing, `and()` matches everything).
+        if self.peek() == Some(&Tok::RParen) {
+            return Ok(Vec::new());
+        }
         let mut parts = vec![self.child_filter_expr()?];
         while self.peek() == Some(&Tok::Comma) {
             self.bump();
