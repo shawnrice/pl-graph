@@ -497,6 +497,8 @@ struct RepeatCtx {
     min_one: bool,
     /// an `emit(pred)`/`until(pred)` filter on the emitted endpoint (at `out_slot`).
     filter: Option<Expr>,
+    /// an inner `.as('tag')` in the body — bound to the endpoint at flush time.
+    bind_tag: Option<String>,
 }
 
 struct Parser {
@@ -1773,7 +1775,7 @@ impl Parser {
                 // (the endpoint) is pre-allocated as the width so an emit/until
                 // predicate parsed before the flush references it. The LParen was
                 // already consumed at the top of `step`.
-                let (dir, label) = self.repeat_body()?;
+                let (dir, label, bind_tag) = self.repeat_body()?;
                 self.expect(&Tok::RParen)?;
                 let from = self.current;
                 let out_slot = self.slots; // endpoint == width at flush time
@@ -1786,6 +1788,7 @@ impl Parser {
                     times: None,
                     min_one: false,
                     filter: None,
+                    bind_tag,
                 });
                 plan
             }
@@ -4866,7 +4869,7 @@ impl Parser {
     /// `(direction, edge label)`. Multi-step bodies, nested repeats, filters, etc.
     /// are deferred with an explicit error. The cursor starts just after `repeat(`
     /// and stops at the body's closing `)` (left for the caller to consume).
-    fn repeat_body(&mut self) -> Result<(Dir, Option<String>), String> {
+    fn repeat_body(&mut self) -> Result<(Dir, Option<String>, Option<String>), String> {
         // Optional `__.` anonymous-traversal prefix.
         if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
             self.bump();
@@ -4905,7 +4908,19 @@ impl Parser {
                 )
             }
         };
-        Ok((dir, label))
+        // An optional inner `.as('tag')` binds the tag to the walk's endpoint (the last
+        // iteration's landing) — `repeat(out('CREATED').as('a')).times(1).select('a')`.
+        let mut tag = None;
+        if self.peek() == Some(&Tok::Dot)
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("as"))
+        {
+            self.expect(&Tok::Dot)?;
+            self.ident()?; // as
+            self.expect(&Tok::LParen)?;
+            tag = Some(self.str_arg()?);
+            self.expect(&Tok::RParen)?;
+        }
+        Ok((dir, label, tag))
     }
 
     /// Close an open `repeat(...)` into a `VarLength` walk. `times(n)` alone is a
@@ -4937,6 +4952,12 @@ impl Parser {
         // account for it and land the current element there.
         self.current = ctx.out_slot;
         self.slots = ctx.out_slot + 1;
+        // An inner `.as('tag')` binds the tag to the endpoint (the last landing).
+        if let Some(tag) = ctx.bind_tag {
+            self.first_labels.entry(tag.clone()).or_insert(ctx.out_slot);
+            self.all_labels.entry(tag.clone()).or_default().push(ctx.out_slot);
+            self.labels.insert(tag, ctx.out_slot);
+        }
         Ok(match ctx.filter {
             Some(f) => p.filter(f),
             None => p,
