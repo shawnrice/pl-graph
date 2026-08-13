@@ -47,6 +47,7 @@ fn labels(ls: &[&str]) -> String {
 
 // ── predicate shim ───────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct P {
     core: cg::P,
     eng: String,
@@ -160,6 +161,7 @@ impl P {
 
 // ── traversal shim ───────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct Traversal {
     core: cg::Traversal,
     eng: String,
