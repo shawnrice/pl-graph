@@ -33,6 +33,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         caps: std::collections::HashMap::new(),
         algo_props: std::collections::HashMap::new(),
         last_algo: None,
+        prop_keys: None,
         first_labels: std::collections::HashMap::new(),
         sack_slot: None,
         subgraph_caps: std::collections::HashMap::new(),
@@ -484,6 +485,11 @@ struct Parser {
     /// store property.
     algo_props: std::collections::HashMap<String, usize>,
     last_algo: Option<usize>,
+    /// Set by `properties('k'…)`: the property keys the current element is a property
+    /// STREAM over (the element stays current, present-filtered). A following
+    /// `value()`/`key()`/`label()`/`hasValue()`/`count()` reads through this. `None`
+    /// when not in a property stream; `Some(keys)` with the keys (empty = all present).
+    prop_keys: Option<Vec<String>>,
     /// The FIRST slot each `as('x')` label was bound to (labels holds the LAST). A
     /// tag rebound across a hop has two bindings; `select(Pop.first, 'x')` reads this
     /// one, `select(Pop.last, 'x')` (the default) reads `labels`.
@@ -1857,6 +1863,96 @@ impl Parser {
                 self.current = 0;
                 self.slots = 1;
                 p
+            }
+            "properties" => {
+                // `properties('k'…)` is a stream of the element's Property objects. The
+                // engine has no Property value; instead the element stays current,
+                // present-filtered on the key(s), and a following value()/key()/label()/
+                // hasValue()/count() reads through `prop_keys`. Single key: filter present
+                // on it. Multiple/all keys: keep the element (a following terminal fans
+                // out or the bare Property result is skipped by the harness).
+                let mut keys: Vec<String> = Vec::new();
+                if !matches!(self.peek(), Some(Tok::RParen)) {
+                    loop {
+                        keys.push(self.str_arg()?);
+                        if self.peek() == Some(&Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                let p = if keys.len() == 1 {
+                    plan.filter(Expr::PropertyExists {
+                        slot: self.current,
+                        key: keys[0].clone(),
+                    })
+                } else {
+                    plan
+                };
+                self.prop_keys = Some(keys);
+                p
+            }
+            "value" => {
+                self.expect(&Tok::RParen)?;
+                match self.prop_keys.take() {
+                    Some(keys) => {
+                        // `properties('k').value()` → the property VALUE (element's `k`).
+                        let key = keys.first().cloned().ok_or(
+                            "value() after a multi-key properties() is not yet supported",
+                        )?;
+                        let p = plan.project(vec![(
+                            "value".to_string(),
+                            Expr::Prop {
+                                slot: self.current,
+                                key,
+                            },
+                        )]);
+                        self.current = 0;
+                        self.slots = 1;
+                        p
+                    }
+                    // value() on a non-property is the value itself (identity).
+                    None => plan,
+                }
+            }
+            "key" if self.prop_keys.is_some() => {
+                // `properties('k').key()` → the property KEY (a constant per stream).
+                self.expect(&Tok::RParen)?;
+                let keys = self.prop_keys.take().unwrap();
+                let key = keys
+                    .first()
+                    .cloned()
+                    .ok_or("key() after a multi-key properties() is not yet supported")?;
+                let p = plan.project(vec![(
+                    "key".to_string(),
+                    Expr::Lit(Value::Str(key.into())),
+                )]);
+                self.current = 0;
+                self.slots = 1;
+                p
+            }
+            "hasvalue" if self.prop_keys.is_some() => {
+                // `properties('k').hasValue(v…)` → keep the property whose value is one of
+                // v… (an OR-of-equals on the element's `k`), staying in the stream.
+                let key = self
+                    .prop_keys
+                    .as_ref()
+                    .and_then(|ks| ks.first())
+                    .cloned()
+                    .ok_or("hasValue() after a multi-key properties() is not yet supported")?;
+                let mut vals = vec![self.literal()?];
+                while self.peek() == Some(&Tok::Comma) {
+                    self.bump();
+                    vals.push(self.literal()?);
+                }
+                self.expect(&Tok::RParen)?;
+                let left = Expr::Prop {
+                    slot: self.current,
+                    key,
+                };
+                plan.filter(or_of_equals(&left, &vals))
             }
             "where" => {
                 // Tagged key form `where('a', op('b'))`: keep traversers where the
