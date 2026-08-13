@@ -34,6 +34,12 @@ pub fn val(v: &GVal) -> String {
         GVal::Num(n) => format!("{n}"),
         GVal::Bool(b) => format!("{b}"),
         GVal::Null => "null".into(),
+        // A list renders as a `[…]` literal (each element via `val`), so
+        // inject([1,2,3]) drives a real list-literal query, not Debug output.
+        GVal::List(items) => {
+            let inner = items.iter().map(val).collect::<Vec<_>>().join(",");
+            format!("[{inner}]")
+        }
         other => format!("{other:?}"),
     }
 }

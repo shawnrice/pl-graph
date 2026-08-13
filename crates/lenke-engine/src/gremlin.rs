@@ -49,6 +49,8 @@ enum Tok {
     Dot,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Comma,
     Ident(String),
     Str(String),
@@ -408,6 +410,8 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
         }
         match c {
             '.' => out.push(Tok::Dot),
+            '[' => out.push(Tok::LBracket),
+            ']' => out.push(Tok::RBracket),
             '(' => out.push(Tok::LParen),
             ')' => out.push(Tok::RParen),
             ',' => out.push(Tok::Comma),
@@ -4743,6 +4747,23 @@ impl Parser {
                 let t = crate::temporal::Temporal::parse(tag, &lit)?;
                 return Ok(Value::Temporal(t));
             }
+        }
+        // A list literal `[a, b, …]` (nestable).
+        if self.peek() == Some(&Tok::LBracket) {
+            self.bump();
+            let mut items = Vec::new();
+            if self.peek() != Some(&Tok::RBracket) {
+                loop {
+                    items.push(self.literal()?);
+                    if self.peek() == Some(&Tok::Comma) {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect(&Tok::RBracket)?;
+            return Ok(Value::List(items));
         }
         match self.bump() {
             Some(Tok::Str(s)) => Ok(Value::Str(s.into())),
