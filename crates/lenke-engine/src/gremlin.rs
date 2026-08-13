@@ -5788,6 +5788,11 @@ mod tests {
         for (fast, enumerated) in cases {
             assert_eq!(count(fast), count(enumerated), "{fast} vs {enumerated}");
         }
+        // 1-hop dedup (a single Expand, not a VarLength) also takes the distinct-
+        // endpoint fast path. On this ring every node is some node's neighbour AND some
+        // node's out-target, so the distinct 1-hop set is ALL 40 — an independent check.
+        assert_eq!(count("g.V().both().dedup().count()"), 40);
+        assert_eq!(count("g.V().out().dedup().count()"), 40);
     }
 
     /// `repeat(out()).times(k).count()` — the WALK degree-algebra count (O(V+E), fired

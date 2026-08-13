@@ -4414,38 +4414,58 @@ fn try_varlen_distinctby_count(
     let [dedup_slot] = key_slots.as_slice() else {
         return None;
     };
-    let Plan::VarLength {
-        input: vl_inner,
-        from,
-        dir,
-        edge_label,
-        min,
-        max,
-        mode,
-        until,
-        body_filter,
-        double_loops: _, // a distinct endpoint set is blind to edge multiplicity
-    } = inner.as_ref()
-    else {
-        return None;
+    // The dedup'd source is either a var-length WALK (repeat(...).times(k)) or a single
+    // Expand hop (`both().dedup()`) — both a distinct-endpoint question. Normalize to
+    // (inner-plan, from, dir, edge_label, min, max); a single Expand is a 1-hop walk.
+    let (src_plan, from, dir, edge_label, min, max) = match inner.as_ref() {
+        Plan::VarLength {
+            input: vl_inner,
+            from,
+            dir,
+            edge_label,
+            min,
+            max,
+            mode,
+            until,
+            body_filter,
+            double_loops: _, // a distinct endpoint set is blind to edge multiplicity
+        } => {
+            if until.is_some()
+                || body_filter.is_some()
+                || !matches!(mode, PathMode::Walk | PathMode::Trail)
+            {
+                return None;
+            }
+            (vl_inner.as_ref(), *from, *dir, edge_label, *min, *max)
+        }
+        Plan::Expand {
+            input: ex_inner,
+            from,
+            dir,
+            edge_label,
+            bind_edge,
+            double_loops: _,
+        } => {
+            if *bind_edge {
+                return None; // the bound edge slot shifts the endpoint; not this shape
+            }
+            (ex_inner.as_ref(), *from, *dir, edge_label, 1u32, 1u32)
+        }
+        _ => return None,
     };
-    if until.is_some() || body_filter.is_some() || !matches!(mode, PathMode::Walk | PathMode::Trail)
-    {
-        return None;
-    }
     let want = match want_etypes(store, edge_label) {
         Ok(w) => w,
         Err(()) => return Some(scalar_num(0.0)),
     };
-    let batch = pull(vl_inner, store, false).ok()?;
-    // The dedup key must be exactly the endpoint the walk appends (slot == inner width).
+    let batch = pull(src_plan, store, false).ok()?;
+    // The dedup key must be exactly the endpoint the hop appends (slot == inner width).
     if *dedup_slot != batch.slots.len() {
         return None;
     }
-    let Col::Nodes(src) = batch.slot(*from) else {
+    let Col::Nodes(src) = batch.slot(from) else {
         return None;
     };
-    let count = varlen_distinct_endpoint_count(store, src, *dir, &want, *min, *max);
+    let count = varlen_distinct_endpoint_count(store, src, dir, &want, min, max);
     Some(scalar_num(count as f64))
 }
 
