@@ -823,13 +823,16 @@ impl Store {
         k
     }
 
-    /// The labels carried by node `id`, sorted.
+    /// The labels carried by node `id`, sorted. Each label bucket is kept SORTED
+    /// ascending (see `is_labeled`), so membership is a BINARY SEARCH — a linear
+    /// `contains` here made per-node materialization (element maps in fold/valueMap/
+    /// path/id) O(total label membership), which dominated those shapes.
     #[must_use]
     pub fn labels_of(&self, id: u32) -> Vec<String> {
         let mut ls: Vec<String> = self
             .by_label
             .iter()
-            .filter(|(_, ids)| ids.contains(&id))
+            .filter(|(_, ids)| ids.binary_search(&id).is_ok())
             .map(|(l, _)| l.clone())
             .collect();
         ls.sort();
