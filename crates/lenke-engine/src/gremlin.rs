@@ -2390,7 +2390,11 @@ impl Parser {
                     return Ok(p.distinct_by(vec![w]));
                 }
                 if labels.is_empty() {
-                    plan.distinct()
+                    // Gremlin dedup() dedups on the CURRENT traverser value, not the
+                    // whole row — after a hop the row also carries the source, so a
+                    // whole-row distinct would keep duplicate neighbours reached from
+                    // different sources.
+                    plan.distinct_by(vec![self.current])
                 } else {
                     let key_slots = labels
                         .iter()
