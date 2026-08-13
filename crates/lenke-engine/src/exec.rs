@@ -4099,16 +4099,22 @@ fn try_varlen_count(
         return None;
     };
 
-    // ALGEBRAIC count: for a bounded OUT trail with max<=2, count(*) is the sum of
-    // per-hop trail counts computed from degrees in O(V+E) — NOT by enumerating the
+    // ALGEBRAIC count: for a bounded OUT walk/trail with max<=2, count(*) is the sum of
+    // per-hop path counts computed from degrees in O(V+E) — NOT by enumerating the
     // O(paths) walks. 1-hop = the source out-edges; 2-hop = for each source out-edge
-    // s->y, the neighbour's out-degree, minus the one reused-self-loop path
-    // (s->s->s over the same edge, which a trail forbids). Only taken when the
-    // enumeration would be the MORE expensive path (a large source set); a filtered
-    // / small source stays on the DFS below, where enumeration is already cheap.
-    // TRAIL only: the degree algebra counts node-repeating trails, which SIMPLE /
-    // ACYCLIC forbid — those must enumerate via the DFS below.
-    if matches!(dir, Dir::Out) && *max <= 2 && *max >= 1 && matches!(mode, PathMode::Trail) {
+    // s->y, the neighbour's out-degree. A TRAIL (no edge reuse) then excludes the one
+    // reused-self-loop path s->s->s over the same edge; a WALK (repeat()'s default)
+    // permits it, so it makes no correction. Only taken when the enumeration would be
+    // the MORE expensive path (a large source set); a filtered / small source stays on
+    // the DFS below, where enumeration is already cheap. WALK/TRAIL only: the degree
+    // algebra counts node-repeating paths, which SIMPLE / ACYCLIC forbid — those must
+    // enumerate via the DFS below.
+    let is_trail = matches!(mode, PathMode::Trail);
+    if matches!(dir, Dir::Out)
+        && *max <= 2
+        && *max >= 1
+        && matches!(mode, PathMode::Trail | PathMode::Walk)
+    {
         let (nc, ec) = (store.node_count(), store.edge_count());
         let avg_deg = if nc == 0 { 0.0 } else { ec as f64 / nc as f64 };
         let est_paths = src.len() as f64 * avg_deg.powi(*max as i32);
@@ -4132,12 +4138,12 @@ fn try_varlen_count(
                         continue;
                     }
                     if *min <= 1 {
-                        total += 1; // the 1-hop trail s -> a.nbr
+                        total += 1; // the 1-hop path s -> a.nbr
                     }
                     if *max >= 2 {
-                        total += outdeg[a.nbr as usize]; // 2-hop trails s -> a.nbr -> z
-                        if a.nbr == s {
-                            total -= 1; // exclude the reused self-loop s -> s -> s
+                        total += outdeg[a.nbr as usize]; // 2-hop paths s -> a.nbr -> z
+                        if is_trail && a.nbr == s {
+                            total -= 1; // a trail excludes the reused self-loop s -> s -> s
                         }
                     }
                 }

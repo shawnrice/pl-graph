@@ -5790,6 +5790,52 @@ mod tests {
         }
     }
 
+    /// `repeat(out()).times(k).count()` — the WALK degree-algebra count (O(V+E), fired
+    /// only above the enumeration-cost threshold) must equal the count from ENUMERATING
+    /// the same walk with explicit `out().out()…` hops. Sized (3000 nodes, deg 4) so the
+    /// algebra actually fires; self-loops stress the walk's edge-reuse (no subtraction).
+    #[test]
+    fn repeat_out_count_algebra_matches_enumeration() {
+        let mut b = Builder::default();
+        for _ in 0..3000 {
+            b.node(&["N"], &[]);
+        }
+        for i in 0u32..3000 {
+            for d in 0u32..4 {
+                let ty = if d % 2 == 0 { "R" } else { "F" };
+                b.edge(i, (i * 7 + d * 13 + 1) % 3000, ty);
+            }
+        }
+        b.edge(0, 0, "R"); // self-loop (walk may reuse it)
+        b.edge(5, 5, "R");
+        let st = b.build();
+        let count = |q: &str| match &gremlin_rows(q, &st).rows[0][0] {
+            Value::Num(x) => *x as i64,
+            other => panic!("not a count: {other:?}"),
+        };
+        let cases = [
+            (
+                "g.V().repeat(__.out()).times(2).count()",
+                "g.V().out().out().count()",
+            ),
+            (
+                "g.V().repeat(__.out()).times(1).count()",
+                "g.V().out().count()",
+            ),
+            (
+                "g.V().repeat(__.out('R')).times(2).count()",
+                "g.V().out('R').out('R').count()",
+            ),
+        ];
+        for (algebra, enumerated) in cases {
+            assert_eq!(
+                count(algebra),
+                count(enumerated),
+                "{algebra} vs {enumerated}"
+            );
+        }
+    }
+
     /// `is(P)` filters the VALUE stream by a predicate (like `where`); `is(literal)`
     /// is an equality test. Ages are alice 30, bob 25, carol 40.
     #[test]
