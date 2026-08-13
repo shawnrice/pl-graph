@@ -2733,6 +2733,30 @@ impl Parser {
                             other => other,
                         }
                     }
+                    "target" => {
+                        // shortestPath().with(target, __.has('k'[, op(v)])): restrict the
+                        // enumeration to paths whose destination matches the predicate.
+                        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+                            self.bump();
+                            self.expect(&Tok::Dot)?;
+                        }
+                        let target = self.parse_match_has()?;
+                        self.expect(&Tok::RParen)?;
+                        match plan {
+                            Plan::ShortestPathEnum {
+                                input, node_slot, ..
+                            } => Plan::ShortestPathEnum {
+                                input,
+                                node_slot,
+                                target: Some(target),
+                            },
+                            _ => {
+                                return Err(
+                                    "with(target, …) applies only to shortestPath()".into()
+                                )
+                            }
+                        }
+                    }
                     other => {
                         return Err(format!("with({other}, …) is not yet supported"))
                     }

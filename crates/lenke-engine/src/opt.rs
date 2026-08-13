@@ -156,12 +156,17 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 c,
             )
         }
-        Plan::ShortestPathEnum { input, node_slot } => {
+        Plan::ShortestPathEnum {
+            input,
+            node_slot,
+            target,
+        } => {
             let (i, c) = rewrite(*input, idx);
             (
                 Plan::ShortestPathEnum {
                     input: Box::new(i),
                     node_slot,
+                    target,
                 },
                 c,
             )

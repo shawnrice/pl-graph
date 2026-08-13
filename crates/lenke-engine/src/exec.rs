@@ -1120,12 +1120,29 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             }
             b
         }
-        Plan::ShortestPathEnum { input, node_slot } => {
+        Plan::ShortestPathEnum {
+            input,
+            node_slot,
+            target,
+        } => {
             // For each source vertex, emit one row per shortest path (undirected), each
             // a list of the path vertices' external ids (so it compares cleanly — the
-            // engine has no Value::Node). Path order is unspecified (multiset).
+            // engine has no Value::Node). Path order is unspecified (multiset). A
+            // `with(target, has(…))` keeps only paths whose LAST vertex matches.
             let b = pull(input, store, track)?;
             let n = b.rows();
+            let dest_ok = |v: u32| match target {
+                None => true,
+                Some((key, pred)) => {
+                    if !store.has_prop(v, key) {
+                        return false;
+                    }
+                    match pred {
+                        None => true,
+                        Some((op, want)) => cmp_apply(*op, &store.prop(v, key), want),
+                    }
+                }
+            };
             let mut out: Vec<Value> = Vec::new();
             for i in 0..n {
                 let src = match b.slot(*node_slot).value_at(i) {
@@ -1133,6 +1150,9 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                     _ => continue,
                 };
                 for path in crate::algo::shortest_paths_from(store, src, crate::ir::Dir::Both) {
+                    if !path.last().is_some_and(|&v| dest_ok(v)) {
+                        continue;
+                    }
                     let ids: Vec<Value> = path
                         .into_iter()
                         .map(|v| store.node_ext_id(v).map_or(Value::Null, Value::Str))
@@ -8673,6 +8693,19 @@ fn str_map(v: &Value, f: impl Fn(&str) -> String) -> Value {
 }
 
 /// A two-string predicate; NULL/non-string operand yields NULL.
+/// Apply a comparison as a plain bool (UNKNOWN → false). For the shortestPath
+/// target filter, where a non-matching/incomparable destination is simply excluded.
+fn cmp_apply(op: CompareOp, a: &Value, b: &Value) -> bool {
+    match op {
+        CompareOp::Eq => value::equals(a, b),
+        CompareOp::Ne => !value::equals(a, b),
+        CompareOp::Lt => value::cmp_partial(a, b).is_some_and(std::cmp::Ordering::is_lt),
+        CompareOp::Le => value::cmp_partial(a, b).is_some_and(std::cmp::Ordering::is_le),
+        CompareOp::Gt => value::cmp_partial(a, b).is_some_and(std::cmp::Ordering::is_gt),
+        CompareOp::Ge => value::cmp_partial(a, b).is_some_and(std::cmp::Ordering::is_ge),
+    }
+}
+
 fn str_bool(a: &Value, b: &Value, f: impl Fn(&str, &str) -> bool) -> Value {
     match (a, b) {
         (Value::Str(s), Value::Str(sub)) => Value::Bool(f(s, sub)),

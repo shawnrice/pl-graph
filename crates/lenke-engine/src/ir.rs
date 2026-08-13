@@ -652,7 +652,13 @@ pub enum Plan {
     /// per shortest path (undirected BFS) to every reachable vertex, each rendered as
     /// a `Value::List` of the path vertices' EXTERNAL ids. Path order is unspecified
     /// (compare as a multiset).
-    ShortestPathEnum { input: Box<Plan>, node_slot: usize },
+    ShortestPathEnum {
+        input: Box<Plan>,
+        node_slot: usize,
+        /// `with(target, __.has('k'[, op(v)]))`: keep only paths whose DESTINATION
+        /// vertex satisfies this property filter. `None` enumerates to every vertex.
+        target: Option<(String, Option<(CompareOp, Value)>)>,
+    },
     /// Gremlin `subgraph('sg')` revealed by `cap('sg')`: collect the EDGE frontier at
     /// `edge_slot` (deduped) plus their endpoint vertices (deduped), emitting ONE row
     /// holding a `{vertices: [records], edges: [records]}` Map of self-describing
@@ -1031,6 +1037,7 @@ impl Plan {
         Self::ShortestPathEnum {
             input: Box::new(self),
             node_slot,
+            target: None,
         }
     }
 
