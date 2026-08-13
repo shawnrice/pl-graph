@@ -3044,12 +3044,59 @@ impl Parser {
                             self.expect(&Tok::LParen)?;
                             self.expect(&Tok::RParen)?;
                             GroupBy::Count
+                        } else if matches!(self.peek(), Some(Tok::Ident(s)) if {
+                            let l = s.to_ascii_lowercase();
+                            matches!(l.as_str(), "out" | "in" | "both" | "oute" | "ine" | "bothe")
+                        }) {
+                            // `<hop>('L').count()` value-by — the group's total degree =
+                            // Σ over the group of each element's neighbour count.
+                            let hop = self.ident()?.to_ascii_lowercase();
+                            let (hdir, hedge) = match hop.as_str() {
+                                "out" => (Dir::Out, false),
+                                "in" => (Dir::In, false),
+                                "both" => (Dir::Both, false),
+                                "oute" => (Dir::Out, true),
+                                "ine" => (Dir::In, true),
+                                _ => (Dir::Both, true),
+                            };
+                            self.expect(&Tok::LParen)?;
+                            let mut ls: Vec<String> = Vec::new();
+                            if matches!(self.peek(), Some(Tok::Str(_))) {
+                                ls.push(self.str_arg()?);
+                                while self.peek() == Some(&Tok::Comma) {
+                                    self.bump();
+                                    ls.push(self.str_arg()?);
+                                }
+                            }
+                            self.expect(&Tok::RParen)?;
+                            self.expect(&Tok::Dot)?;
+                            let c = self.ident()?;
+                            if !c.eq_ignore_ascii_case("count") {
+                                return Err("group().by(<hop>…) must end with .count()".into());
+                            }
+                            self.expect(&Tok::LParen)?;
+                            self.expect(&Tok::RParen)?;
+                            let body = if hedge {
+                                Plan::Row.expand_edge(elem_slot, hdir, &ls)
+                            } else {
+                                Plan::Row.expand(elem_slot, hdir, &ls)
+                            };
+                            let deg = Expr::CountSubquery {
+                                body: Box::new(body),
+                                outer_width: self.slots,
+                            };
+                            GroupBy::Reduce(AggFn::Sum, Some(deg))
                         } else if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("values"))
                         {
-                            // values('k')[.<agg>()] — a per-group aggregate over `k`.
+                            // values('k'…)[.<agg>()] — a per-group aggregate over the
+                            // (possibly several) keys' present values.
                             self.ident()?; // values
                             self.expect(&Tok::LParen)?;
-                            let k = self.str_arg()?;
+                            let mut ks = vec![self.str_arg()?];
+                            while self.peek() == Some(&Tok::Comma) {
+                                self.bump();
+                                ks.push(self.str_arg()?);
+                            }
                             self.expect(&Tok::RParen)?;
                             // Optional trailing `.<agg>()`; a bare values() folds (Collect).
                             let func = if self.peek() == Some(&Tok::Dot) {
@@ -3072,23 +3119,34 @@ impl Parser {
                             } else {
                                 AggFn::Collect
                             };
-                            // `values('k').count()` counts PRESENT values (a stored null
-                            // is present), not non-null; mark presence so Count tallies it.
-                            let arg = if func == AggFn::Count {
-                                Expr::Case {
-                                    branches: vec![(
-                                        Expr::PropertyExists {
-                                            slot: elem_slot,
-                                            key: k,
-                                        },
-                                        Expr::Lit(Value::Num(1.0)),
-                                    )],
-                                    otherwise: None,
+                            // Per key, the per-row contribution: `count()` counts PRESENT
+                            // values (a stored null is present) via a presence marker;
+                            // the others use the raw property. Multiple keys flatten into
+                            // a LIST arg that fold_grouped reduces element-wise.
+                            let per_key = |k: String| -> Expr {
+                                if func == AggFn::Count {
+                                    Expr::Case {
+                                        branches: vec![(
+                                            Expr::PropertyExists {
+                                                slot: elem_slot,
+                                                key: k,
+                                            },
+                                            Expr::Lit(Value::Num(1.0)),
+                                        )],
+                                        otherwise: None,
+                                    }
+                                } else {
+                                    Expr::Prop {
+                                        slot: elem_slot,
+                                        key: k,
+                                    }
                                 }
+                            };
+                            let arg = if ks.len() == 1 {
+                                per_key(ks.remove(0))
                             } else {
-                                Expr::Prop {
-                                    slot: elem_slot,
-                                    key: k,
+                                Expr::List {
+                                    items: ks.into_iter().map(per_key).collect(),
                                 }
                             };
                             GroupBy::Reduce(func, Some(arg))
@@ -5611,8 +5669,9 @@ mod tests {
                 "Map([(Str(\"alice\"), List([Num(30.0)])), (Str(\"bob\"), List([Num(25.0)])), (Str(\"carol\"), List([Num(40.0)]))]);",
             ],
         );
-        // Non-count reducing traversals are deferred, not mis-parsed.
-        assert!(super::parse("g.V().group().by('name').by(out().count())").is_err());
+        // A <hop>.count() value-by is the group's total degree (a Sum of per-element
+        // degrees).
+        assert!(super::parse("g.V().group().by('name').by(out().count())").is_ok());
     }
 
     /// `project('a','b').by(x).by(y)` builds one insertion-ordered Map per traverser:

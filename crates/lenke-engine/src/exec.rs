@@ -2563,6 +2563,16 @@ fn fold_grouped(
                         total[g as usize] += x;
                         cnt[g as usize] += 1;
                     }
+                    // A Gremlin multi-key `values('v','k')` arg is a LIST — flatten it,
+                    // summing each numeric element (skipping non-numeric/null).
+                    Value::List(items) if agg.null_on_empty => {
+                        for el in &items {
+                            if let Value::Num(x) = el {
+                                total[g as usize] += x;
+                                cnt[g as usize] += 1;
+                            }
+                        }
+                    }
                     // GQL faults on a non-numeric sum/avg; Gremlin (`null_on_empty`
                     // marker) SKIPS it, like a null (so sum of {"text", 4} is 4).
                     _ if agg.null_on_empty => {}
