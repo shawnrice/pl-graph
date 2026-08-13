@@ -1507,6 +1507,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .or_else(|| try_varlen_count(input, keys, aggs, store))
                 .or_else(|| try_frontier_count(input, keys, aggs, store))
                 .or_else(|| try_varlen_distinct_count(input, keys, aggs, store))
+                .or_else(|| try_varlen_distinctby_count(input, keys, aggs, store))
                 .or_else(|| try_varlen_agg(input, keys, aggs, store))
                 .or_else(|| try_frontier_prop_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_num_agg(input, keys, aggs, store))
@@ -4342,23 +4343,23 @@ fn try_varlen_distinct_count(
         mode,
         until,
         body_filter,
-        double_loops,
+        double_loops: _, // a distinct endpoint set is blind to edge multiplicity
     } = input
     else {
         return None;
     };
-    if until.is_some() || body_filter.is_some() || *double_loops {
+    if until.is_some() || body_filter.is_some() {
         return None; // an until(pred) walk emits a filtered subset — no closed-form count
     }
-    // The BFS-reachability fusion relies on shortest-distance == walk equivalence,
-    // which only holds when nodes may repeat (Walk / Trail). SIMPLE / ACYCLIC forbid
-    // node reuse, so a distinct-endpoint count must enumerate — fall through.
+    // A distinct ENDPOINT set is blind to edge multiplicity, so `double_loops` (a
+    // both()-crossed self-loop counted twice) is irrelevant here — the self is reached
+    // either way. It is deliberately NOT a bail condition (unlike the multiplicity
+    // counts).
+    //
+    // The set-reachability fusion relies on nodes being allowed to repeat (Walk /
+    // Trail). SIMPLE / ACYCLIC forbid node reuse, so a distinct-endpoint count must
+    // enumerate — fall through.
     if !matches!(mode, PathMode::Walk | PathMode::Trail) {
-        return None;
-    }
-    // Only min ≤ 1 (see the invariant above); a min-0 lower bound also counts the
-    // sources themselves as 0-hop endpoints.
-    if *min > 1 {
         return None;
     }
     let want = match want_etypes(store, edge_label) {
@@ -4374,7 +4375,136 @@ fn try_varlen_distinct_count(
     let Col::Nodes(src) = batch.slot(*from) else {
         return None;
     };
+    let count = varlen_distinct_endpoint_count(store, src, *dir, &want, *min, *max);
+    Some(scalar_num(count as f64))
+}
+
+/// `<walk>.dedup().count()` — `count(*)` over a `DistinctBy` (on the endpoint slot) of a
+/// var-length walk. Same distinct-endpoint count as [`try_varlen_distinct_count`]'s
+/// `count(DISTINCT endpoint)`, but the front-end spells `dedup().count()` as a separate
+/// `DistinctBy` node rather than a distinct aggregate, so it needs its own matcher. The
+/// dedup key must be exactly the walk's appended endpoint slot; anything else (dedup on
+/// the source, a multi-key dedup) is a different question and falls through.
+fn try_varlen_distinctby_count(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.func != AggFn::Count || agg.arg.is_some() || agg.distinct {
+        return None; // plain count(*)
+    }
+    let Plan::DistinctBy {
+        input: inner,
+        key_slots,
+    } = input
+    else {
+        return None;
+    };
+    let [dedup_slot] = key_slots.as_slice() else {
+        return None;
+    };
+    let Plan::VarLength {
+        input: vl_inner,
+        from,
+        dir,
+        edge_label,
+        min,
+        max,
+        mode,
+        until,
+        body_filter,
+        double_loops: _, // a distinct endpoint set is blind to edge multiplicity
+    } = inner.as_ref()
+    else {
+        return None;
+    };
+    if until.is_some() || body_filter.is_some() || !matches!(mode, PathMode::Walk | PathMode::Trail)
+    {
+        return None;
+    }
+    let want = match want_etypes(store, edge_label) {
+        Ok(w) => w,
+        Err(()) => return Some(scalar_num(0.0)),
+    };
+    let batch = pull(vl_inner, store, false).ok()?;
+    // The dedup key must be exactly the endpoint the walk appends (slot == inner width).
+    if *dedup_slot != batch.slots.len() {
+        return None;
+    }
+    let Col::Nodes(src) = batch.slot(*from) else {
+        return None;
+    };
+    let count = varlen_distinct_endpoint_count(store, src, *dir, &want, *min, *max);
+    Some(scalar_num(count as f64))
+}
+
+/// The number of DISTINCT nodes reachable from `src` by a Walk/Trail of `min..=max`
+/// hops along `dir`/`want` edges — the shared kernel behind both `count(DISTINCT
+/// endpoint)` and `count(*)` over a `dedup()` of a var-length walk. Two regimes:
+///
+/// - `min ≤ 1`: cumulative shortest-distance BFS. Each node is expanded at most once
+///   (at its shortest distance), so an edge is traversed once — O(E) — and every node
+///   within `max` hops is an endpoint (every hop ≥ 1 ≥ min).
+/// - `min ≥ 2`: a walk may revisit, so the endpoints at EXACTLY h hops are the h-th
+///   neighbour-set iterate N^h(src), NOT the distance-h set. Expand the DISTINCT
+///   frontier one level at a time (each level a set — a node expands at most once per
+///   level) and union the levels in `min..=max`. O(hops · E), versus the
+///   product-of-degrees an enumeration of every walk would pay.
+///
+/// Blind to edge multiplicity (a set), so a both()-crossed self-loop needs no special
+/// casing. `min == 0` also counts the sources as their own 0-hop endpoints.
+fn varlen_distinct_endpoint_count(
+    store: &Store,
+    src: &[u32],
+    dir: Dir,
+    want: &[u32],
+    min: u32,
+    max: u32,
+) -> usize {
     let n = store.node_count();
+    if min >= 2 {
+        let mut reached = vec![false; n];
+        let mut in_next = vec![false; n];
+        let mut seen = vec![false; n];
+        let mut frontier: Vec<u32> = Vec::with_capacity(src.len());
+        for &s in src {
+            if !seen[s as usize] {
+                seen[s as usize] = true;
+                frontier.push(s);
+            }
+        }
+        let mut next: Vec<u32> = Vec::new();
+        for hop in 1..=max {
+            if frontier.is_empty() {
+                break;
+            }
+            next.clear();
+            for &v in &frontier {
+                for_each_nbr(store, v, dir, want, false, |nbr, _| {
+                    if !in_next[nbr as usize] {
+                        in_next[nbr as usize] = true;
+                        next.push(nbr);
+                    }
+                });
+            }
+            if hop >= min {
+                for &w in &next {
+                    reached[w as usize] = true;
+                }
+            }
+            // Reset the level-set for reuse (only the touched entries), then advance.
+            for &w in &next {
+                in_next[w as usize] = false;
+            }
+            std::mem::swap(&mut frontier, &mut next);
+        }
+        return reached.iter().filter(|&&r| r).count();
+    }
     let mut visited = vec![false; n]; // added to a frontier (expansion dedup)
     let mut reached = vec![false; n]; // a valid endpoint (hop in min..=max)
     let mut frontier: Vec<u32> = Vec::with_capacity(src.len());
@@ -4383,20 +4513,17 @@ fn try_varlen_distinct_count(
             visited[s as usize] = true;
             frontier.push(s);
         }
-        if *min == 0 {
+        if min == 0 {
             reached[s as usize] = true; // the 0-hop path a=b
         }
     }
-    // BFS `max` levels. Each node is expanded at most once (at its shortest distance),
-    // so an edge is traversed once from its source — O(E). Every neighbour reached is
-    // an endpoint (hop ≥ 1 ≥ min); newly-seen ones seed the next level.
     let mut next: Vec<u32> = Vec::new();
-    for _hop in 1..=*max {
+    for _hop in 1..=max {
         if frontier.is_empty() {
             break;
         }
         for &v in &frontier {
-            for_each_nbr(store, v, *dir, &want, false, |nbr, _| {
+            for_each_nbr(store, v, dir, want, false, |nbr, _| {
                 reached[nbr as usize] = true;
                 if !visited[nbr as usize] {
                     visited[nbr as usize] = true;
@@ -4407,8 +4534,7 @@ fn try_varlen_distinct_count(
         std::mem::swap(&mut frontier, &mut next);
         next.clear();
     }
-    let count = reached.iter().filter(|&&r| r).count();
-    Some(scalar_num(count as f64))
+    reached.iter().filter(|&&r| r).count()
 }
 
 /// The fold twin of `varlen_count_dfs`: calls `emit(endpoint)` at every length in

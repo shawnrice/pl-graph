@@ -7833,9 +7833,20 @@ mod tests {
             Value::Num(x) => *x as usize,
             other => panic!("not a count: {other:?}"),
         };
-        // For every min≤1 bound the BFS fast path fires; compare to the DISTINCT set
-        // of endpoints the enumerating path emits. IN and BOTH exercise reverse hops.
-        for (lo, hi) in [(0u32, 2u32), (1, 1), (1, 3), (1, 4)] {
+        // min≤1 fires the cumulative shortest-distance BFS; min≥2 fires the per-level
+        // set-expansion (N^h(src), not the distance-h set — a walk may revisit). Both
+        // regimes must equal the DISTINCT set of endpoints the enumerating path emits.
+        // IN and BOTH exercise reverse hops; the self-loop stresses revisits.
+        for (lo, hi) in [
+            (0u32, 2u32),
+            (1, 1),
+            (1, 3),
+            (1, 4),
+            (2, 2),
+            (2, 3),
+            (3, 3),
+            (2, 4),
+        ] {
             for dir in ["->", "<-", "-"] {
                 let (l, r) = match dir {
                     "->" => ("-[:R]", "->"),

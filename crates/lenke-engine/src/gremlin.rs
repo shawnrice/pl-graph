@@ -5745,6 +5745,51 @@ mod tests {
         run(&plan, store)
     }
 
+    /// `repeat(dir).times(k).dedup().count()` — the distinct-endpoint fast path
+    /// (per-level set expansion) must equal the count from ENUMERATING the same walk
+    /// with explicit hops (`both().both()…`, which are ordinary Expand steps, not a
+    /// VarLength, so they enumerate and dedup for real). A triangle + a self-loop make
+    /// revisits non-trivial, so distinct < total.
+    #[test]
+    fn repeat_dedup_count_matches_explicit_hop_enumeration() {
+        let mut b = Builder::default();
+        for i in 0..40 {
+            b.node(&["N"], &[("k", n(f64::from(i)))]);
+        }
+        for i in 0u32..40 {
+            b.edge(i, (i + 1) % 40, "R"); // a ring
+            b.edge(i, (i * 7 + 3) % 40, "R"); // chords → cycles
+        }
+        b.edge(0, 0, "R"); // self-loop
+        let st = b.build();
+        let count = |q: &str| match &gremlin_rows(q, &st).rows[0][0] {
+            Value::Num(x) => *x as i64,
+            other => panic!("not a count: {other:?}"),
+        };
+        // (fast path via repeat/VarLength, enumerated via explicit Expand hops).
+        let cases = [
+            (
+                "g.V().repeat(__.both()).times(2).dedup().count()",
+                "g.V().both().both().dedup().count()",
+            ),
+            (
+                "g.V().repeat(__.out()).times(2).dedup().count()",
+                "g.V().out().out().dedup().count()",
+            ),
+            (
+                "g.V().repeat(__.both()).times(3).dedup().count()",
+                "g.V().both().both().both().dedup().count()",
+            ),
+            (
+                "g.V().repeat(__.in()).times(2).dedup().count()",
+                "g.V().in().in().dedup().count()",
+            ),
+        ];
+        for (fast, enumerated) in cases {
+            assert_eq!(count(fast), count(enumerated), "{fast} vs {enumerated}");
+        }
+    }
+
     /// `is(P)` filters the VALUE stream by a predicate (like `where`); `is(literal)`
     /// is an equality test. Ages are alice 30, bob 25, carol 40.
     #[test]
