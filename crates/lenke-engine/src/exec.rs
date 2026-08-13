@@ -1503,6 +1503,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .or_else(|| try_filtered_count(input, keys, aggs, store))
                 .or_else(|| try_edge_filtered_count(input, keys, aggs, store))
                 .or_else(|| try_varlen_count(input, keys, aggs, store))
+                .or_else(|| try_frontier_count(input, keys, aggs, store))
                 .or_else(|| try_varlen_distinct_count(input, keys, aggs, store))
                 .or_else(|| try_varlen_agg(input, keys, aggs, store))
                 .or_else(|| try_frontier_prop_agg(input, keys, aggs, store))
@@ -3452,6 +3453,12 @@ fn chain_width(plan: &Plan) -> Option<usize> {
         Plan::Expand {
             input, bind_edge, ..
         } => Some(chain_width(input)? + if *bind_edge { 2 } else { 1 }),
+        // A frontier `hasLabel(…)` filter keeps the width (it drops rows, not slots) —
+        // so a fused counter can see the chain through it (see `frontier_counts`).
+        Plan::Filter {
+            input,
+            pred: Expr::IsLabeled { .. },
+        } => chain_width(input),
         _ => None,
     }
 }
@@ -3658,6 +3665,32 @@ fn frontier_counts(plan: &Plan, store: &Store) -> Option<Counts> {
                 });
                 Some(Counts::Sparse(next.into_iter().collect()))
             }
+        }
+        // A frontier `hasLabel(L…)` filter: drop the count of any node not carrying one
+        // of the labels (a bucket binary-search per active node), so a fused count/agg
+        // sees through `<hops>.hasLabel(L).count()` instead of materializing.
+        Plan::Filter {
+            input,
+            pred: Expr::IsLabeled { slot, labels },
+        } => {
+            if *slot + 1 != chain_width(input)? {
+                return None; // the filter must test the current frontier
+            }
+            let counts = frontier_counts(input, store)?;
+            let keep = |id: u32| labels.iter().any(|l| store.is_labeled(id, l));
+            Some(match counts {
+                Counts::Sparse(v) => {
+                    Counts::Sparse(v.into_iter().filter(|&(id, _)| keep(id)).collect())
+                }
+                Counts::Dense(mut a) => {
+                    for (i, c) in a.iter_mut().enumerate() {
+                        if *c != 0.0 && !keep(i as u32) {
+                            *c = 0.0;
+                        }
+                    }
+                    Counts::Dense(a)
+                }
+            })
         }
         _ => None,
     }
@@ -4506,6 +4539,41 @@ fn try_varlen_agg(
 /// loses row order) is byte-identical; SUM/AVG would change the summation order, so they
 /// stay on `try_frontier_aggregate` (`frontier_ids`, which keeps order). Numeric columns
 /// only; a filtered chain / edge hop / non-numeric column returns None.
+/// `count(*)` over any plan `frontier_counts` can fold — including a `hasLabel(L)`-
+/// filtered hop chain (`<hops>.hasLabel(L).count()`) — as the SUM of the per-node path
+/// multiplicities, never materializing the frontier. Order-independent (an integer row
+/// count), so byte-identical. `None` for a non-fusable shape.
+fn try_frontier_count(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.func != AggFn::Count || agg.arg.is_some() || agg.distinct {
+        return None; // count(*) only
+    }
+    // Only worth the frontier fold when a plain filter/hop chain would otherwise
+    // materialize — i.e. there IS a frontier filter (the bare-chain counts already have
+    // their own fast-paths). Require a top-level IsLabeled filter.
+    if !matches!(
+        input,
+        Plan::Filter {
+            pred: Expr::IsLabeled { .. },
+            ..
+        }
+    ) {
+        return None;
+    }
+    let counts = frontier_counts(input, store)?;
+    let mut total = 0f64;
+    counts.for_each(|_, c| total += c);
+    Some(scalar_num(total))
+}
+
 fn try_frontier_prop_agg(
     input: &Plan,
     keys: &[(String, Expr)],
