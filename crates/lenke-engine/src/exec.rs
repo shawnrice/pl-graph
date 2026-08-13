@@ -5885,11 +5885,39 @@ fn rep_pred_ok(
 /// built referencing the endpoint slot, so a one-row mini-batch places `v` there (and
 /// at every lower slot, harmless — a well-formed until pred reads only the endpoint).
 fn until_ok(pred: &Expr, store: &Store, endpoint_slot: usize, v: u32) -> bool {
+    // Fast path: the common until/body-filter predicates (hasLabel, hasProp, and their
+    // boolean combinations) evaluate DIRECTLY on the node — no per-node Batch allocation.
+    // Anything else (a value comparison, a nested Exists) falls back to the mini-batch.
+    if let Some(b) = eval_node_bool(pred, store, v) {
+        return b;
+    }
     let slots: Vec<Col> = (0..=endpoint_slot).map(|_| Col::Nodes(vec![v])).collect();
     let mini = Batch::of(slots);
     eval(pred, store, &mini)
         .map(|c| c.value_at(0).is_true())
         .unwrap_or(false)
+}
+
+/// Evaluate a boolean predicate directly against a single node `v`, for the EXACT,
+/// allocation-free forms a repeat `until`/body-filter uses (all slots in the mini-batch
+/// are `v`, so the slot index is immaterial). `None` = a form this can't handle exactly
+/// (`Compare`, `Case`, `Exists`, …) — the caller falls back to the batch evaluator.
+fn eval_node_bool(pred: &Expr, store: &Store, v: u32) -> Option<bool> {
+    match pred {
+        Expr::IsLabeled { labels, .. } => Some(labels.iter().any(|l| store.is_labeled(v, l))),
+        Expr::PropertyExists { key, .. } => Some(store.has_prop(v, key)),
+        Expr::Lit(Value::Bool(b)) => Some(*b),
+        Expr::Not(x) => eval_node_bool(x, store, v).map(|b| !b),
+        Expr::And(a, b) => match (eval_node_bool(a, store, v), eval_node_bool(b, store, v)) {
+            (Some(x), Some(y)) => Some(x && y),
+            _ => None,
+        },
+        Expr::Or(a, b) => match (eval_node_bool(a, store, v), eval_node_bool(b, store, v)) {
+            (Some(x), Some(y)) => Some(x || y),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn push_group_cols(
