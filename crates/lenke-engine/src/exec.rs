@@ -159,7 +159,10 @@ pub fn try_run(plan: &Plan, store: &Store) -> Result<Rows, String> {
     // it (Scan seeds, Expand extends); otherwise no operator builds a sidecar and
     // the query pays nothing for lineage.
     let track = needs_lineage(plan);
-    let batch = pull(plan, store, track)?;
+    let batch = match pull_top_output_streamed(plan, store, track)? {
+        Some(b) => b,
+        None => pull(plan, store, track)?,
+    };
     let n = batch.rows();
     Ok(match output_names(plan) {
         Some(names) => {
@@ -2187,6 +2190,57 @@ fn pull_distinct_capped_stream(
         acc.push(b.gather(&keep));
         start = end;
         block = block.saturating_mul(2).min(8192);
+    }
+    Ok(Some(concat_batches(&acc)))
+}
+
+/// The TOP-LEVEL output over a VERY large streamable chain (`<hops>.values(k)` /
+/// `.label()` / `.id()`): stream the source in blocks so the exploding per-hop
+/// intermediate frontiers are never materialized — expand + project fuse into one pass
+/// per block. Only at the top level (never an intermediate projection, which feeds a
+/// reducing op that would shrink it anyway) and behind a HIGH size gate, so the block
+/// overhead is amortized and medium frontiers stay on the vectorized materialized path.
+/// Blocks run in source-id order and concatenate in order → byte-identical. `None`
+/// otherwise (small input, lineage, or a non-projection output).
+fn pull_top_output_streamed(
+    plan: &Plan,
+    store: &Store,
+    track: bool,
+) -> Result<Option<Batch>, String> {
+    if track {
+        return Ok(None);
+    }
+    let Plan::Project { input, items } = plan else {
+        return Ok(None);
+    };
+    // A deliberately HIGH threshold: the win is avoiding the per-hop intermediate Cols,
+    // which only matters once the fan-out is huge; below it the vectorized materialized
+    // project is faster (the block/concat overhead would regress it).
+    const STREAM_OUTPUT_ROWS: f64 = 1_000_000.0;
+    if crate::cost::estimate(input, store).rows < STREAM_OUTPUT_ROWS {
+        return Ok(None);
+    }
+    let Some((inner_body, ids)) = streaming_chain(input, store) else {
+        return Ok(None);
+    };
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let body = Plan::Project {
+        input: Box::new(inner_body),
+        items: items.to_vec(),
+    };
+    const BLOCK: usize = 8192;
+    let mut acc: Vec<Batch> = Vec::new();
+    let mut start = 0usize;
+    while start < ids.len() {
+        let end = (start + BLOCK).min(ids.len());
+        acc.push(pull_body(
+            &body,
+            store,
+            &Batch::single(Col::Nodes(ids[start..end].to_vec())),
+        )?);
+        start = end;
     }
     Ok(Some(concat_batches(&acc)))
 }
