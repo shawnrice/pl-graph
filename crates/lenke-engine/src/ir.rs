@@ -261,6 +261,14 @@ pub enum Expr {
         body: Box<Plan>,
         outer_width: usize,
     },
+    /// Gremlin `local(<hop>.fold())`: a correlated COLLECT — the same provenance-tagged
+    /// body as [`Expr::CountSubquery`], but gathers `scalar` over the survivors per outer
+    /// row into a `Value::List` (the empty list when the body matches nothing).
+    CollectSubquery {
+        body: Box<Plan>,
+        scalar: Box<Expr>,
+        outer_width: usize,
+    },
     /// `VALUE { <pattern> RETURN <scalar> }` — a correlated SCALAR subquery. Same
     /// provenance-tagged body run as [`Expr::Exists`]; yields the `scalar` expression
     /// evaluated on the body's single matching row per outer row (NULL when the body

@@ -327,6 +327,38 @@ enum GroupBy {
     Reduce(AggFn, Option<Expr>),
 }
 
+/// Shift every slot reference `>= threshold` up by one — used when a correlated
+/// subquery body gets a provenance column inserted at `threshold`, pushing the body's
+/// own appended slots up. Recurses through the common scalar Expr shapes.
+fn shift_body_slots(e: &mut Expr, threshold: usize) {
+    match e {
+        Expr::Slot(s) => {
+            if *s >= threshold {
+                *s += 1;
+            }
+        }
+        Expr::Prop { slot, .. } | Expr::PropertyExists { slot, .. } => {
+            if *slot >= threshold {
+                *slot += 1;
+            }
+        }
+        Expr::Call { args, .. } | Expr::List { items: args } => {
+            for a in args {
+                shift_body_slots(a, threshold);
+            }
+        }
+        Expr::Compare { left, right, .. }
+        | Expr::Arith { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right) => {
+            shift_body_slots(left, threshold);
+            shift_body_slots(right, threshold);
+        }
+        Expr::Not(x) => shift_body_slots(x, threshold),
+        _ => {}
+    }
+}
+
 /// A stable string tag for a comparison operator, for the `list_none` scan fn.
 fn compare_op_tag(op: CompareOp) -> &'static str {
     match op {
@@ -3346,14 +3378,15 @@ impl Parser {
                 // needs grouped-by-input scoping the row model does not yet have).
                 let from = self.current;
                 let width = self.slots;
+                let save = self.pos;
                 let (body, _oc, _os) = self.parse_sub_body(from, width)?;
-                self.expect(&Tok::RParen)?;
                 match body {
                     Plan::Aggregate { input, keys, aggs }
                         if keys.is_empty()
                             && aggs.len() == 1
                             && matches!(aggs[0].func, AggFn::Count) =>
                     {
+                        self.expect(&Tok::RParen)?;
                         let expr = Expr::CountSubquery {
                             body: input,
                             outer_width: width,
@@ -3363,8 +3396,50 @@ impl Parser {
                         self.slots = 1;
                         p
                     }
+                    // `local(<hop>.fold())` — a per-element COLLECT into a list.
+                    Plan::Aggregate { input, keys, aggs }
+                        if keys.is_empty()
+                            && aggs.len() == 1
+                            && matches!(aggs[0].func, AggFn::Collect) =>
+                    {
+                        self.expect(&Tok::RParen)?;
+                        // The CollectSubquery exec inserts a provenance column at
+                        // `outer_width`, so a body slot at/after it shifts up by one.
+                        let mut scalar =
+                            aggs[0].arg.clone().unwrap_or(Expr::Slot(self.current));
+                        shift_body_slots(&mut scalar, width);
+                        let expr = Expr::CollectSubquery {
+                            body: input,
+                            scalar: Box::new(scalar),
+                            outer_width: width,
+                        };
+                        let p = plan.project(vec![("local".to_string(), expr)]);
+                        self.current = 0;
+                        self.slots = 1;
+                        p
+                    }
+                    // A non-reducing hop/value chain — `local(outE().inV())` — is per
+                    // element already the same as applying the chain (each input keeps
+                    // its own outputs), so re-parse the body onto the current plan.
+                    _ if !matches!(body, Plan::Aggregate { .. }) => {
+                        self.pos = save;
+                        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+                            self.bump();
+                            self.expect(&Tok::Dot)?;
+                        }
+                        let mut p = plan;
+                        if matches!(self.peek(), Some(Tok::Ident(_))) {
+                            p = self.step(p)?;
+                            while self.peek() == Some(&Tok::Dot) {
+                                self.bump();
+                                p = self.step(p)?;
+                            }
+                        }
+                        self.expect(&Tok::RParen)?; // close local(...)
+                        p
+                    }
                     _ => return Err(
-                        "local(<traversal>) is only supported as local(<hop chain>.count()) so far"
+                        "local(<traversal>) beyond a hop chain or count()/fold() is deferred"
                             .into(),
                     ),
                 }
@@ -5947,8 +6022,8 @@ mod tests {
             vec!["Num(0.0);", "Num(1.0);", "Num(2.0);"],
             "one count per person, zeros kept",
         );
-        // A body without a trailing count() is a clear error, not a silent wrong answer.
-        assert!(super::parse("g.V().local(out('KNOWS').values('name'))").is_err());
+        // A non-reducing hop chain is applied per element (local is transparent to it).
+        assert!(super::parse("g.V().local(out('KNOWS').values('name'))").is_ok());
     }
 
     #[test]

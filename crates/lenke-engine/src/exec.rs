@@ -845,6 +845,7 @@ fn needs_lineage(plan: &Plan) -> bool {
             | Expr::Exists { .. }
             | Expr::CountSubquery { .. }
             | Expr::ScalarSubquery { .. }
+            | Expr::CollectSubquery { .. }
             | Expr::UncorrelatedExists { .. }
             | Expr::UncorrelatedCount { .. }
             | Expr::UncorrelatedScalar { .. } => false,
@@ -5279,6 +5280,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         Expr::Exists { .. }
         | Expr::CountSubquery { .. }
         | Expr::ScalarSubquery { .. }
+            | Expr::CollectSubquery { .. }
         | Expr::UncorrelatedExists { .. }
         | Expr::UncorrelatedCount { .. }
         | Expr::UncorrelatedScalar { .. } => false,
@@ -5379,6 +5381,7 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         Expr::Exists { .. }
         | Expr::CountSubquery { .. }
         | Expr::ScalarSubquery { .. }
+            | Expr::CollectSubquery { .. }
         | Expr::UncorrelatedExists { .. }
         | Expr::UncorrelatedCount { .. }
         | Expr::UncorrelatedScalar { .. } => expr.clone(),
@@ -8007,6 +8010,28 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 }
             }
             Col::Num(counts)
+        }
+        Expr::CollectSubquery { body, scalar, .. } => {
+            // Correlated collect (Gremlin local(<hop>.fold())): the same provenance-
+            // tagged sub-run, gathering `scalar` per outer row into a list (empty when
+            // nothing matched). Vertices/edges render as element maps (render_cell).
+            let n = batch.rows();
+            let prov = batch.slots.len();
+            let mut slots = batch.slots.clone();
+            slots.push(Col::Num((0..n).map(|i| i as f64).collect()));
+            let seed = Batch::of(slots);
+            let survivors = pull_body(body, store, &seed)?;
+            let vals = eval(scalar, store, &survivors)?;
+            let mut out: Vec<Vec<Value>> = vec![Vec::new(); n];
+            if let Col::Num(ids) = survivors.slot(prov).clone() {
+                for (j, &id) in ids.iter().enumerate() {
+                    let i = id as usize;
+                    if i < n {
+                        out[i].push(render_cell(&vals, j, store));
+                    }
+                }
+            }
+            Col::Gen(out.into_iter().map(Value::List).collect())
         }
         Expr::ScalarSubquery { body, scalar, .. } => {
             // Correlated scalar: same provenance-tagged sub-run, but project `scalar`
