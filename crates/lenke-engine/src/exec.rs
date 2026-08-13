@@ -2097,6 +2097,21 @@ fn streaming_chain(plan: &Plan, store: &Store) -> Option<(Plan, Vec<u32>)> {
                 ids,
             ))
         }
+        Plan::EdgeVertex {
+            input,
+            edge_slot,
+            which,
+        } => {
+            let (body, ids) = streaming_chain(input, store)?;
+            Some((
+                Plan::EdgeVertex {
+                    input: Box::new(body),
+                    edge_slot: *edge_slot,
+                    which: *which,
+                },
+                ids,
+            ))
+        }
         _ => None,
     }
 }
@@ -8880,6 +8895,46 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             *bind_edge,
             *double_loops,
         ),
+        // Edge frontier → endpoint vertex (`inV`/`outV`/`otherV` off a bound edge) —
+        // the streamable twin of the main EdgeVertex arm; appends the endpoint slot
+        // (Both fans out to two rows). Lineage-free (streaming is `!track`).
+        Plan::EdgeVertex {
+            input,
+            edge_slot,
+            which,
+        } => {
+            let b = pull_body(input, store, seed)?;
+            let mut keep: Vec<usize> = Vec::new();
+            let mut nodes: Vec<u32> = Vec::new();
+            for i in 0..b.rows() {
+                let eid = match b.slot(*edge_slot).value_at(i) {
+                    Value::Num(x) if x >= 0.0 => x as u32,
+                    _ => continue,
+                };
+                let Some((src, dst)) = store.edge_endpoints(eid) else {
+                    continue;
+                };
+                match which {
+                    Dir::Out => {
+                        keep.push(i);
+                        nodes.push(src);
+                    }
+                    Dir::In => {
+                        keep.push(i);
+                        nodes.push(dst);
+                    }
+                    Dir::Both => {
+                        keep.push(i);
+                        nodes.push(src);
+                        keep.push(i);
+                        nodes.push(dst);
+                    }
+                }
+            }
+            let mut out = b.gather(&keep);
+            out.slots.push(Col::Nodes(nodes));
+            out
+        }
         Plan::VarLength {
             input,
             from,
