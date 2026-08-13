@@ -326,6 +326,18 @@ enum GroupBy {
     Reduce(AggFn, Option<Expr>),
 }
 
+/// A stable string tag for a comparison operator, for the `list_none` scan fn.
+fn compare_op_tag(op: CompareOp) -> &'static str {
+    match op {
+        CompareOp::Eq => "eq",
+        CompareOp::Ne => "neq",
+        CompareOp::Gt => "gt",
+        CompareOp::Ge => "gte",
+        CompareOp::Lt => "lt",
+        CompareOp::Le => "lte",
+    }
+}
+
 /// A runtime label-membership predicate over `slot`: `label ∈ labels(slot)`, OR-ed
 /// across `labels` (matching Gremlin `hasLabel('A','B')` = has ANY of them). Uses the
 /// list-valued `labels()` element function and `Expr::In`, so it works anywhere in a
@@ -544,6 +556,29 @@ impl Parser {
     /// Parse the content of a `by(...)` group/select/project key: a `'prop'` string,
     /// or the `id`/`label` (also `T.id`/`T.label`) element token. Returns a display
     /// name and the value expression over `slot`.
+    /// Parse a simple comparison predicate `[P.]op(literal)` → (op, value). Used where
+    /// only eq/neq/gt/gte/lt/lte against one literal is meaningful (e.g. `none(pred)`).
+    fn simple_predicate(&mut self) -> Result<(CompareOp, Value), String> {
+        if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("P")) {
+            self.bump();
+            self.expect(&Tok::Dot)?;
+        }
+        let op_name = self.ident()?.to_ascii_lowercase();
+        let op = match op_name.as_str() {
+            "eq" => CompareOp::Eq,
+            "neq" => CompareOp::Ne,
+            "gt" => CompareOp::Gt,
+            "gte" => CompareOp::Ge,
+            "lt" => CompareOp::Lt,
+            "lte" => CompareOp::Le,
+            other => return Err(format!("expected a comparison predicate, got `{other}`")),
+        };
+        self.expect(&Tok::LParen)?;
+        let val = self.literal()?;
+        self.expect(&Tok::RParen)?;
+        Ok((op, val))
+    }
+
     /// Consume an optional empty `()` — `by(label())` vs the bare token `by(label)`.
     fn eat_empty_parens(&mut self) {
         if self.peek() == Some(&Tok::LParen) && self.toks.get(self.pos + 1) == Some(&Tok::RParen) {
@@ -2844,11 +2879,27 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 plan
             }
-            "none" if self.peek() == Some(&Tok::RParen) => {
-                // none() drops EVERY traverser — an always-false filter. (The predicate
-                // form none(pred) — keep iff no element matches — is deferred.)
-                self.expect(&Tok::RParen)?;
-                plan.filter(Expr::Lit(Value::Bool(false)))
+            "none" => {
+                // none() drops EVERY traverser — an always-false filter. none(pred) keeps
+                // the traverser iff NO element of the current value (a list cell, or a
+                // scalar treated as a 1-element list) satisfies `pred` — a `list_none`
+                // scan lowering the comparison to an (op, value) pair.
+                if self.peek() == Some(&Tok::RParen) {
+                    self.expect(&Tok::RParen)?;
+                    plan.filter(Expr::Lit(Value::Bool(false)))
+                } else {
+                    let (op, val) = self.simple_predicate()?;
+                    self.expect(&Tok::RParen)?;
+                    let e = Expr::Call {
+                        name: "list_none".to_string(),
+                        args: vec![
+                            Expr::Slot(self.current),
+                            Expr::Lit(Value::Str(compare_op_tag(op).into())),
+                            Expr::Lit(val),
+                        ],
+                    };
+                    plan.filter(e)
+                }
             }
             "filter" => {
                 // filter(<traversal>): keep the element iff the sub-traversal produces

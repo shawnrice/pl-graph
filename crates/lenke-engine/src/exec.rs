@@ -7481,6 +7481,42 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                     .collect();
                 return Ok(Col::Gen(out));
             }
+            // `list_none(value, op, cmp)` → Gremlin `none(pred)`: true iff NO element of
+            // `value` (a list cell, or a scalar treated as a 1-element list) satisfies
+            // `op(element, cmp)`. Vacuously true over an empty list.
+            if name == "list_none" {
+                let arg = eval(&args[0], store, batch)?;
+                let op = match &args[1] {
+                    Expr::Lit(Value::Str(s)) => s.to_string(),
+                    _ => return Err("none(pred): internal op tag missing".into()),
+                };
+                let cmp = match &args[2] {
+                    Expr::Lit(v) => v.clone(),
+                    _ => return Err("none(pred): bound must be a literal".into()),
+                };
+                let matches_pred = |el: &Value| -> bool {
+                    match op.as_str() {
+                        "eq" => value::equals(el, &cmp),
+                        "neq" => !value::equals(el, &cmp),
+                        "gt" => value::cmp_partial(el, &cmp).is_some_and(std::cmp::Ordering::is_gt),
+                        "gte" => value::cmp_partial(el, &cmp).is_some_and(std::cmp::Ordering::is_ge),
+                        "lt" => value::cmp_partial(el, &cmp).is_some_and(std::cmp::Ordering::is_lt),
+                        "lte" => value::cmp_partial(el, &cmp).is_some_and(std::cmp::Ordering::is_le),
+                        _ => false,
+                    }
+                };
+                let n = batch.rows();
+                let out: Vec<Value> = (0..n)
+                    .map(|i| {
+                        let none_match = match arg.value_at(i) {
+                            Value::List(items) => !items.iter().any(&matches_pred),
+                            other => !matches_pred(&other),
+                        };
+                        Value::Bool(none_match)
+                    })
+                    .collect();
+                return Ok(Col::Gen(out));
+            }
             // `list_skip(list, n)` → Gremlin `skip(local, n)`: each list cell WITHOUT
             // its first n elements. Gremlin-only.
             if name == "list_skip" {
