@@ -1071,56 +1071,124 @@ impl Parser {
                 plan.branch(bodies)
             }
             "match" => {
-                // match(<pattern>, …) where each pattern is `[__.]as('s').<hop>.as('e')`.
-                // Greedy solve: bind the entry element to the first pattern's start tag,
-                // then repeatedly apply any pattern whose start tag is already bound —
-                // expanding from its slot and binding the landing to the end tag (or, if
-                // that tag is already bound, adding an equality constraint). Covers
-                // chain/tree/cyclic-constraint shapes; an unsolvable order errors.
+                // match(<fragment>, …). A fragment is one of:
+                //   as('s').<hop>('L'?)[.has(…)]*.as('e')  — a hop binding (with optional
+                //                                             embedded property filters)
+                //   as('s')[.has(…)]+                       — a filter on a bound tag
+                //   not(as('s').<hop>('L'?).as('e'))        — an anti-join between tags
+                // Greedy solve: bind the entry to the first fragment's start tag, then
+                // repeatedly apply any fragment whose needed tag(s) are already bound.
                 let entry = self.current;
                 let mut plan = plan;
-                type MatchPat = (String, Dir, Option<String>, String);
-                let mut pats: Vec<MatchPat> = Vec::new();
+                enum Frag {
+                    Hop {
+                        start: String,
+                        dir: Dir,
+                        label: Option<String>,
+                        filters: Vec<(String, Option<(CompareOp, Value)>)>,
+                        end: String,
+                    },
+                    Filter {
+                        start: String,
+                        filters: Vec<(String, Option<(CompareOp, Value)>)>,
+                    },
+                    Not {
+                        start: String,
+                        dir: Dir,
+                        label: Option<String>,
+                        end: String,
+                    },
+                }
+                let mut frags: Vec<Frag> = Vec::new();
+                let mut first_start: Option<String> = None;
                 loop {
                     if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
                         self.bump();
                         self.expect(&Tok::Dot)?;
                     }
-                    let as1 = self.ident()?;
-                    if !as1.eq_ignore_ascii_case("as") {
-                        return Err("match() pattern must start with as('tag')".into());
-                    }
-                    self.expect(&Tok::LParen)?;
-                    let s = self.str_arg()?;
-                    self.expect(&Tok::RParen)?;
-                    self.expect(&Tok::Dot)?;
-                    let hop = self.ident()?.to_ascii_lowercase();
-                    let dir = match hop.as_str() {
-                        "out" => Dir::Out,
-                        "in" => Dir::In,
-                        "both" => Dir::Both,
-                        other => {
-                            return Err(format!(
-                                "match() pattern hop must be out/in/both, got `{other}`"
-                            ))
+                    let head = self.ident()?;
+                    if head.eq_ignore_ascii_case("not") {
+                        // not( [__.] as('s').<hop>('L'?).as('e') )
+                        self.expect(&Tok::LParen)?;
+                        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+                            self.bump();
+                            self.expect(&Tok::Dot)?;
                         }
-                    };
-                    self.expect(&Tok::LParen)?;
-                    let label = if matches!(self.peek(), Some(Tok::Str(_))) {
-                        Some(self.str_arg()?)
+                        let (start, dir, label, end) = self.match_hop_head()?;
+                        self.expect(&Tok::RParen)?; // close not(...)
+                        if first_start.is_none() {
+                            first_start = Some(start.clone());
+                        }
+                        frags.push(Frag::Not {
+                            start,
+                            dir,
+                            label,
+                            end: end.ok_or("match() not(...) fragment must end with as('tag')")?,
+                        });
                     } else {
-                        None
-                    };
-                    self.expect(&Tok::RParen)?;
-                    self.expect(&Tok::Dot)?;
-                    let as2 = self.ident()?;
-                    if !as2.eq_ignore_ascii_case("as") {
-                        return Err("match() pattern must end with as('tag')".into());
+                        if !head.eq_ignore_ascii_case("as") {
+                            return Err("match() fragment must start with as('tag')".into());
+                        }
+                        self.expect(&Tok::LParen)?;
+                        let start = self.str_arg()?;
+                        self.expect(&Tok::RParen)?;
+                        if first_start.is_none() {
+                            first_start = Some(start.clone());
+                        }
+                        self.expect(&Tok::Dot)?;
+                        // Next step decides the fragment kind: a hop, or a bare filter.
+                        let is_hop = matches!(self.peek(), Some(Tok::Ident(s)) if {
+                            let l = s.to_ascii_lowercase();
+                            l == "out" || l == "in" || l == "both"
+                        });
+                        if is_hop {
+                            let dir = match self.ident()?.to_ascii_lowercase().as_str() {
+                                "out" => Dir::Out,
+                                "in" => Dir::In,
+                                _ => Dir::Both,
+                            };
+                            self.expect(&Tok::LParen)?;
+                            let label = if matches!(self.peek(), Some(Tok::Str(_))) {
+                                Some(self.str_arg()?)
+                            } else {
+                                None
+                            };
+                            self.expect(&Tok::RParen)?;
+                            // Zero or more embedded `.has(...)` on the landed element.
+                            let mut filters = Vec::new();
+                            while self.peek() == Some(&Tok::Dot)
+                                && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("has"))
+                            {
+                                self.expect(&Tok::Dot)?;
+                                filters.push(self.parse_match_has()?);
+                            }
+                            self.expect(&Tok::Dot)?;
+                            let as2 = self.ident()?;
+                            if !as2.eq_ignore_ascii_case("as") {
+                                return Err("match() hop fragment must end with as('tag')".into());
+                            }
+                            self.expect(&Tok::LParen)?;
+                            let end = self.str_arg()?;
+                            self.expect(&Tok::RParen)?;
+                            frags.push(Frag::Hop {
+                                start,
+                                dir,
+                                label,
+                                filters,
+                                end,
+                            });
+                        } else {
+                            // A bare filter fragment: one or more `has(...)` on the tag.
+                            let mut filters = vec![self.parse_match_has()?];
+                            while self.peek() == Some(&Tok::Dot)
+                                && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("has"))
+                            {
+                                self.expect(&Tok::Dot)?;
+                                filters.push(self.parse_match_has()?);
+                            }
+                            frags.push(Frag::Filter { start, filters });
+                        }
                     }
-                    self.expect(&Tok::LParen)?;
-                    let e = self.str_arg()?;
-                    self.expect(&Tok::RParen)?;
-                    pats.push((s, dir, label, e));
                     if self.peek() == Some(&Tok::Comma) {
                         self.bump();
                     } else {
@@ -1128,33 +1196,101 @@ impl Parser {
                     }
                 }
                 self.expect(&Tok::RParen)?;
-                if let Some((s0, ..)) = pats.first() {
-                    self.labels.entry(s0.clone()).or_insert(entry);
+                if let Some(s0) = first_start {
+                    self.labels.entry(s0).or_insert(entry);
                 }
-                let mut applied = vec![false; pats.len()];
+                let has_expr = |slot: usize, f: &(String, Option<(CompareOp, Value)>)| {
+                    let exists = Expr::PropertyExists {
+                        slot,
+                        key: f.0.clone(),
+                    };
+                    match &f.1 {
+                        None => exists,
+                        Some((op, v)) => Expr::And(
+                            Box::new(exists),
+                            Box::new(Expr::Compare {
+                                op: *op,
+                                left: Box::new(Expr::Prop {
+                                    slot,
+                                    key: f.0.clone(),
+                                }),
+                                right: Box::new(Expr::Lit(v.clone())),
+                            }),
+                        ),
+                    }
+                };
+                let mut applied = vec![false; frags.len()];
                 loop {
                     let mut progress = false;
-                    for i in 0..pats.len() {
+                    for i in 0..frags.len() {
                         if applied[i] {
                             continue;
                         }
-                        let (s, dir, label, e) = pats[i].clone();
-                        let Some(&start_slot) = self.labels.get(&s) else {
-                            continue;
-                        };
-                        let landed = self.slots;
-                        plan = plan.expand(start_slot, dir, &etypes_of(label.as_deref()));
-                        self.slots += 1;
-                        match self.labels.get(&e).copied() {
-                            Some(existing) => {
-                                plan = plan.filter(Expr::Compare {
-                                    op: CompareOp::Eq,
-                                    left: Box::new(Expr::Slot(landed)),
-                                    right: Box::new(Expr::Slot(existing)),
-                                });
+                        match &frags[i] {
+                            Frag::Hop {
+                                start,
+                                dir,
+                                label,
+                                filters,
+                                end,
+                            } => {
+                                let Some(&start_slot) = self.labels.get(start) else {
+                                    continue;
+                                };
+                                let landed = self.slots;
+                                plan = plan.expand(start_slot, *dir, &etypes_of(label.as_deref()));
+                                self.slots += 1;
+                                for f in filters {
+                                    plan = plan.filter(has_expr(landed, f));
+                                }
+                                match self.labels.get(end).copied() {
+                                    Some(existing) => {
+                                        plan = plan.filter(Expr::Compare {
+                                            op: CompareOp::Eq,
+                                            left: Box::new(Expr::Slot(landed)),
+                                            right: Box::new(Expr::Slot(existing)),
+                                        });
+                                    }
+                                    None => {
+                                        self.labels.insert(end.clone(), landed);
+                                    }
+                                }
                             }
-                            None => {
-                                self.labels.insert(e.clone(), landed);
+                            Frag::Filter { start, filters } => {
+                                let Some(&slot) = self.labels.get(start) else {
+                                    continue;
+                                };
+                                for f in filters {
+                                    plan = plan.filter(has_expr(slot, f));
+                                }
+                            }
+                            Frag::Not {
+                                start,
+                                dir,
+                                label,
+                                end,
+                            } => {
+                                let (Some(&s_slot), Some(&e_slot)) =
+                                    (self.labels.get(start), self.labels.get(end))
+                                else {
+                                    continue;
+                                };
+                                // NOT ∃ an edge start→end: the anti-join over a correlated
+                                // one-hop existence constrained to the bound end slot. The
+                                // Exists exec inserts a provenance column at `self.slots`,
+                                // so the hop's landed node lands one past it.
+                                let landed = self.slots + 1;
+                                let body = Plan::Row
+                                    .expand(s_slot, *dir, &etypes_of(label.as_deref()))
+                                    .filter(Expr::Compare {
+                                        op: CompareOp::Eq,
+                                        left: Box::new(Expr::Slot(landed)),
+                                        right: Box::new(Expr::Slot(e_slot)),
+                                    });
+                                plan = plan.filter(Expr::Not(Box::new(Expr::Exists {
+                                    body: Box::new(body),
+                                    outer_width: self.slots,
+                                })));
                             }
                         }
                         applied[i] = true;
@@ -3080,6 +3216,85 @@ impl Parser {
         };
         self.expect(&Tok::RParen)?;
         Ok((dir, label))
+    }
+
+    /// Parse a match hop head `as('s').<hop>('L'?)[.as('e')]`, returning
+    /// `(start_tag, direction, edge_label, end_tag?)`. Shared by the `not(...)`
+    /// fragment (cursor already past any leading `__.`).
+    #[allow(clippy::type_complexity)]
+    fn match_hop_head(
+        &mut self,
+    ) -> Result<(String, Dir, Option<String>, Option<String>), String> {
+        let as1 = self.ident()?;
+        if !as1.eq_ignore_ascii_case("as") {
+            return Err("match() fragment must start with as('tag')".into());
+        }
+        self.expect(&Tok::LParen)?;
+        let start = self.str_arg()?;
+        self.expect(&Tok::RParen)?;
+        self.expect(&Tok::Dot)?;
+        let dir = match self.ident()?.to_ascii_lowercase().as_str() {
+            "out" => Dir::Out,
+            "in" => Dir::In,
+            "both" => Dir::Both,
+            other => return Err(format!("match() hop must be out/in/both, got `{other}`")),
+        };
+        self.expect(&Tok::LParen)?;
+        let label = if matches!(self.peek(), Some(Tok::Str(_))) {
+            Some(self.str_arg()?)
+        } else {
+            None
+        };
+        self.expect(&Tok::RParen)?;
+        let end = if self.peek() == Some(&Tok::Dot)
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("as"))
+        {
+            self.expect(&Tok::Dot)?;
+            self.ident()?; // as
+            self.expect(&Tok::LParen)?;
+            let e = self.str_arg()?;
+            self.expect(&Tok::RParen)?;
+            Some(e)
+        } else {
+            None
+        };
+        Ok((start, dir, label, end))
+    }
+
+    /// Parse a match `has('k'[, [P.]op(v)])` filter (cursor AT the `has` ident),
+    /// returning the key and an optional `(comparison, literal)` bound.
+    fn parse_match_has(&mut self) -> Result<(String, Option<(CompareOp, Value)>), String> {
+        let h = self.ident()?;
+        if !h.eq_ignore_ascii_case("has") {
+            return Err("match() filter fragment expects has(...)".into());
+        }
+        self.expect(&Tok::LParen)?;
+        let key = self.str_arg()?;
+        let pred = if self.peek() == Some(&Tok::Comma) {
+            self.bump();
+            if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("P")) {
+                self.bump();
+                self.expect(&Tok::Dot)?;
+            }
+            let op = self.ident()?.to_ascii_lowercase();
+            self.expect(&Tok::LParen)?;
+            let v = self.literal()?;
+            self.expect(&Tok::RParen)?;
+            let cop = match op.as_str() {
+                "eq" => CompareOp::Eq,
+                "neq" => CompareOp::Ne,
+                "gt" => CompareOp::Gt,
+                "gte" => CompareOp::Ge,
+                "lt" => CompareOp::Lt,
+                "lte" => CompareOp::Le,
+                other => return Err(format!("match() has(): unsupported predicate `{other}`")),
+            };
+            Some((cop, v))
+        } else {
+            None
+        };
+        self.expect(&Tok::RParen)?;
+        Ok((key, pred))
     }
 
     /// Try to parse ONE single-VALUE sub-traversal body — `[__.]constant(v)`,
