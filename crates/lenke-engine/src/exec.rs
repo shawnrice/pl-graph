@@ -3310,6 +3310,27 @@ fn range_seek_ids(store: &Store, label: &str, key: &str, op: CompareOp, value: &
 /// names ALL fail to resolve matches no edge, so it returns `Err(())` and the caller
 /// short-circuits to its own empty result. Otherwise the known ids, unknown names
 /// dropped — mirroring core's `lower_labels`.
+/// Does node `v` have ANY neighbour over `dir`/`want` (empty `want` = any type)? A
+/// short-circuiting existence check for `where(out/in/both)` — scans adjacency until
+/// the first match, never materializing the neighbours. Self-loop doubling is moot for
+/// existence.
+fn node_has_nbr(store: &Store, v: u32, dir: Dir, want: &[u32]) -> bool {
+    let has_extra = store.has_multi_label_edges();
+    let type_ok = |et: u32, eid: u32| {
+        want.is_empty()
+            || want
+                .iter()
+                .any(|&w| w == et || (has_extra && store.edge_has_label(eid, w)))
+    };
+    if matches!(dir, Dir::Out | Dir::Both) && store.out(v).iter().any(|a| type_ok(a.etype, a.eid)) {
+        return true;
+    }
+    if matches!(dir, Dir::In | Dir::Both) && store.inc(v).iter().any(|a| type_ok(a.etype, a.eid)) {
+        return true;
+    }
+    false
+}
+
 fn want_etypes(store: &Store, edge_label: &[String]) -> Result<Vec<u32>, ()> {
     if edge_label.is_empty() {
         return Ok(Vec::new());
@@ -8291,6 +8312,33 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             }
         }
         Expr::Exists { body, .. } => {
+            // Fast path: a bare vertex-hop existence semi-join (`where(out/in/both)`)
+            // only asks "does this row have ANY matching neighbour?" — check the
+            // adjacency per row and short-circuit, instead of expanding EVERY neighbour
+            // of the whole frontier and back-mapping via a provenance column.
+            if let Plan::Expand {
+                input,
+                from,
+                dir,
+                edge_label,
+                bind_edge: false,
+                double_loops: _,
+            } = body.as_ref()
+            {
+                if matches!(**input, Plan::Row) {
+                    if let Col::Nodes(ids) = batch.slot(*from) {
+                        let want = match want_etypes(store, edge_label) {
+                            Ok(w) => w,
+                            Err(()) => return Ok(Col::Bool(vec![false; ids.len()])),
+                        };
+                        return Ok(Col::Bool(
+                            ids.iter()
+                                .map(|&v| v != u32::MAX && node_has_nbr(store, v, *dir, &want))
+                                .collect(),
+                        ));
+                    }
+                }
+            }
             // Correlated existence: run the sub-pattern over ALL outer rows at once,
             // tagging each with a unique provenance id so surviving sub-rows point
             // back to the outer row they came from. An outer row is TRUE iff at
