@@ -525,6 +525,11 @@ pub enum Plan {
         /// the edge is slot W and the node slot W+1. When false (the default), only
         /// the node slot is appended, exactly as before.
         bind_edge: bool,
+        /// Self-loop policy for an undirected (`Both`) hop: when true, a self-loop is
+        /// traversed TWICE (out-edge AND in-edge) — Gremlin's `both()` contract; when
+        /// false (the default), once — GQL's `MATCH (a)-[:R]-(b)`. No effect for a
+        /// directed hop (one index).
+        double_loops: bool,
     },
     /// A LEFT-OUTER single hop — GQL `OPTIONAL MATCH (a)-[:R]->(x)`. Like `Expand`
     /// but a source row with NO matching neighbour is KEPT, its appended node slot
@@ -953,6 +958,21 @@ impl Plan {
             dir,
             edge_label: edge_label.to_vec(),
             bind_edge: false,
+            double_loops: false,
+        }
+    }
+
+    /// Like [`Self::expand`] but traverses a self-loop TWICE for an undirected hop —
+    /// Gremlin `both()`'s contract (an out-edge AND an in-edge of the same vertex).
+    #[must_use]
+    pub fn expand_both_gremlin(self, from: usize, edge_label: &[String]) -> Self {
+        Self::Expand {
+            input: Box::new(self),
+            from,
+            dir: Dir::Both,
+            edge_label: edge_label.to_vec(),
+            bind_edge: false,
+            double_loops: true,
         }
     }
 
@@ -966,6 +986,7 @@ impl Plan {
             dir,
             edge_label: edge_label.to_vec(),
             bind_edge: true,
+            double_loops: false,
         }
     }
 

@@ -236,6 +236,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             dir,
             edge_label,
             bind_edge,
+            double_loops,
         } => {
             let (i, c) = rewrite(*input, idx);
             (
@@ -245,6 +246,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                     dir,
                     edge_label,
                     bind_edge,
+                    double_loops,
                 },
                 c,
             )
@@ -819,6 +821,7 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 dir,
                 edge_label,
                 bind_edge,
+                double_loops,
             } if refs_below(&pred, width(&ein)) => (
                 Plan::Expand {
                     input: Box::new(Plan::Filter { input: ein, pred }),
@@ -826,6 +829,7 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                     dir,
                     edge_label,
                     bind_edge,
+                    double_loops,
                 },
                 true,
             ),
@@ -965,6 +969,7 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 dir,
                 edge_label,
                 bind_edge: true,
+                double_loops,
             } => {
                 let iw = width(&ein);
                 if let Some((lo_key, hi_key, qlo, qhi)) = interval_pattern(&pred, iw) {
@@ -991,6 +996,7 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                                 dir,
                                 edge_label,
                                 bind_edge: true,
+                                double_loops,
                             }),
                             pred,
                         },

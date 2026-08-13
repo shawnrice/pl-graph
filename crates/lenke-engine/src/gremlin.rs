@@ -1759,7 +1759,12 @@ impl Parser {
                 self.current = self.slots;
                 self.slots += 1;
                 self.on_edge = false;
-                plan.expand(from, dir, &labels)
+                // Gremlin `both()` traverses a self-loop TWICE (out- AND in-edge).
+                if matches!(dir, Dir::Both) {
+                    plan.expand_both_gremlin(from, &labels)
+                } else {
+                    plan.expand(from, dir, &labels)
+                }
             }
             "repeat" => {
                 // `repeat(<hop>)` v1: the body is a SINGLE anonymous hop

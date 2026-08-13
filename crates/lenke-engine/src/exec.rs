@@ -1069,6 +1069,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             dir,
             edge_label,
             bind_edge,
+            double_loops,
         } => expand(
             &pull(input, store, track)?,
             store,
@@ -1076,6 +1077,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             *dir,
             edge_label,
             *bind_edge,
+            *double_loops,
         ),
         Plan::OptionalExpand {
             input,
@@ -1947,6 +1949,7 @@ fn streaming_chain(plan: &Plan, store: &Store) -> Option<(Plan, Vec<u32>)> {
             dir,
             edge_label,
             bind_edge,
+            double_loops,
         } => {
             let (body, ids) = streaming_chain(input, store)?;
             Some((
@@ -1956,6 +1959,7 @@ fn streaming_chain(plan: &Plan, store: &Store) -> Option<(Plan, Vec<u32>)> {
                     dir: *dir,
                     edge_label: edge_label.clone(),
                     bind_edge: *bind_edge,
+                    double_loops: *double_loops,
                 },
                 ids,
             ))
@@ -2712,6 +2716,7 @@ fn try_reverse_expand(pred: &Expr, input: &Plan, store: &Store, track: bool) -> 
         dir,
         edge_label,
         bind_edge: false,
+        double_loops: false,
     } = input
     else {
         return None;
@@ -2747,7 +2752,7 @@ fn try_reverse_expand(pred: &Expr, input: &Plan, store: &Store, track: bool) -> 
     let mut sources = Vec::new();
     let mut ends = Vec::new();
     for &t in &targets {
-        for_each_nbr(store, t, rev, &want, |a, _| {
+        for_each_nbr(store, t, rev, &want, false, |a, _| {
             if src_label.as_deref().is_none_or(|l| store.is_labeled(a, l)) {
                 sources.push(a);
                 ends.push(t);
@@ -2784,6 +2789,7 @@ fn expand(
     dir: Dir,
     edge_label: &[String],
     bind_edge: bool,
+    double_loops: bool,
 ) -> Batch {
     // An empty expand still appends the landed slot(s), so the output has the same
     // shape a successful expand would (K+1 slots, or K+2 with the edge bound) — a
@@ -2819,7 +2825,7 @@ fn expand(
     let mut nbrs = Vec::new();
     let mut eids = Vec::new();
     for (row, &v) in src.iter().enumerate() {
-        for_each_nbr(store, v, dir, &want, |nbr, eid| {
+        for_each_nbr(store, v, dir, &want, double_loops, |nbr, eid| {
             keep.push(row);
             nbrs.push(nbr);
             if need_eids {
@@ -2886,7 +2892,7 @@ fn optional_expand(
     let mut eids = Vec::new();
     for (row, &v) in src.iter().enumerate() {
         let before = nbrs.len();
-        for_each_nbr(store, v, dir, &want, |nbr, eid| {
+        for_each_nbr(store, v, dir, &want, false, |nbr, eid| {
             keep.push(row);
             nbrs.push(nbr);
             eids.push(eid);
@@ -2981,7 +2987,7 @@ fn interval_expand(
         // the SAME comparison the `<=`/`>=` filter uses. So numeric AND temporal
         // bounds work, and an absent / incomparable bound drops out exactly as the
         // filter would (an unknown comparison is not an overlap).
-        for_each_nbr(store, v, dir, &want, |nbr, eid| {
+        for_each_nbr(store, v, dir, &want, false, |nbr, eid| {
             let lo = store.edge_prop(eid, lo_key);
             let hi = store.edge_prop(eid, hi_key);
             let lo_le_qhi = value::cmp_partial(&lo, &qhi).map(std::cmp::Ordering::is_le);
@@ -3237,11 +3243,19 @@ fn edge_carries_wanted(store: &Store, a: &crate::store::Adj, want: &[u32]) -> bo
         })
 }
 
-fn for_each_nbr(store: &Store, v: u32, dir: Dir, want: &[u32], mut f: impl FnMut(u32, u32)) {
-    // An undirected walk reaches a self-loop from BOTH the out- and the in-index;
-    // emit it once (from the out-side) by dropping its in-side copy. Directed walks
-    // touch one index, so they keep it either way. Matches core's SelfLoops::Once.
-    let drop_loop = matches!(dir, Dir::Both);
+fn for_each_nbr(
+    store: &Store,
+    v: u32,
+    dir: Dir,
+    want: &[u32],
+    double_loops: bool,
+    mut f: impl FnMut(u32, u32),
+) {
+    // An undirected walk reaches a self-loop from BOTH the out- and the in-index.
+    // GQL emits it ONCE (drops the in-side copy); Gremlin `both()` keeps BOTH
+    // (`double_loops`) — the self-loop is an out-edge AND an in-edge. Directed walks
+    // touch one index, so they keep it either way.
+    let drop_loop = matches!(dir, Dir::Both) && !double_loops;
     // A SINGLE-type hop over an indexed store seeks the type bucket directly
     // (O(matching), not O(degree)) — the whole point of the opt-in edge-type index.
     // A disjunction (`want.len() >= 2`) must NOT union buckets: that reorders vs the
@@ -3338,8 +3352,14 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
             from,
             dir,
             edge_label,
+            double_loops,
             ..
         } => {
+            // A double-self-loop (Gremlin both()) hop is not handled by this Once
+            // frontier fast-path — decline so the general expand runs.
+            if *double_loops {
+                return None;
+            }
             // Must expand the CURRENT frontier (the last slot); a linear pattern
             // always does, but a hand-built plan might not.
             if *from + 1 != chain_width(input)? {
@@ -3352,7 +3372,7 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
             };
             let mut out = Vec::new();
             for &v in &src {
-                for_each_nbr(store, v, *dir, &want, |nbr, _eid| out.push(nbr));
+                for_each_nbr(store, v, *dir, &want, false, |nbr, _eid| out.push(nbr));
             }
             Some(out)
         }
@@ -3461,8 +3481,12 @@ fn frontier_counts(plan: &Plan, store: &Store) -> Option<Counts> {
             from,
             dir,
             edge_label,
+            double_loops,
             ..
         } => {
+            if *double_loops {
+                return None; // double-self-loop hop → general path
+            }
             if *from + 1 != chain_width(input)? {
                 return None;
             }
@@ -3483,7 +3507,7 @@ fn frontier_counts(plan: &Plan, store: &Store) -> Option<Counts> {
             if est_next > dense_cut as f64 {
                 let mut next = vec![0.0f64; n];
                 prev.for_each(|v, c| {
-                    for_each_nbr(store, v, *dir, &want, |nbr, _| next[nbr as usize] += c);
+                    for_each_nbr(store, v, *dir, &want, false, |nbr, _| next[nbr as usize] += c);
                 });
                 Some(Counts::Dense(next))
             } else {
@@ -3491,7 +3515,7 @@ fn frontier_counts(plan: &Plan, store: &Store) -> Option<Counts> {
                 // few nodes a narrow frontier reaches, no O(node_count) allocation.
                 let mut next: FnvMap<u32, f64> = FnvMap::default();
                 prev.for_each(|v, c| {
-                    for_each_nbr(store, v, *dir, &want, |nbr, _| {
+                    for_each_nbr(store, v, *dir, &want, false, |nbr, _| {
                         *next.entry(nbr).or_insert(0.0) += c;
                     });
                 });
@@ -3647,6 +3671,7 @@ fn try_edge_filtered_count(
         dir,
         edge_label,
         bind_edge,
+        double_loops: false,
     } = expand.as_ref()
     else {
         return None;
@@ -3669,7 +3694,7 @@ fn try_edge_filtered_count(
     // key is not homogeneously numeric.
     if let Some((data, present)) = store.edge_num_column(&key) {
         for &v in &src_ids {
-            for_each_nbr(store, v, *dir, &want, |_nbr, eid| {
+            for_each_nbr(store, v, *dir, &want, false, |_nbr, eid| {
                 let i = eid as usize;
                 if present[i] && bounds.iter().all(|&(op, t)| num_pred(op, data[i], t)) {
                     count += 1;
@@ -3678,7 +3703,7 @@ fn try_edge_filtered_count(
         }
     } else {
         for &v in &src_ids {
-            for_each_nbr(store, v, *dir, &want, |_nbr, eid| {
+            for_each_nbr(store, v, *dir, &want, false, |_nbr, eid| {
                 if let Value::Num(x) = store.edge_prop(eid, &key) {
                     if bounds.iter().all(|&(op, t)| num_pred(op, x, t)) {
                         count += 1;
@@ -4026,7 +4051,7 @@ fn try_varlen_distinct_count(
             break;
         }
         for &v in &frontier {
-            for_each_nbr(store, v, *dir, &want, |nbr, _| {
+            for_each_nbr(store, v, *dir, &want, false, |nbr, _| {
                 reached[nbr as usize] = true;
                 if !visited[nbr as usize] {
                     visited[nbr as usize] = true;
@@ -4964,6 +4989,7 @@ fn peel_out_hops(plan: &Plan, n: usize) -> Option<(Vec<Vec<String>>, Option<Stri
         dir: Dir::Out,
         edge_label,
         bind_edge: false,
+        double_loops: false,
     } = plan
     else {
         return None;
@@ -5070,6 +5096,7 @@ fn try_fused_count(
         from,
         dir,
         edge_label,
+        double_loops: false,
         ..
     } = input
     else {
@@ -5095,7 +5122,7 @@ fn try_fused_count(
                 let mut total = 0f64;
                 counts.for_each(|v, c| {
                     let mut deg = 0f64;
-                    for_each_nbr(store, v, *dir, &want, |_, _| deg += 1.0);
+                    for_each_nbr(store, v, *dir, &want, false, |_, _| deg += 1.0);
                     total += c * deg;
                 });
                 return Some(scalar_num(total));
@@ -5112,12 +5139,12 @@ fn try_fused_count(
             let (distinct, mult) = distinct_with_mult(&src, store.node_count());
             for (i, &v) in distinct.iter().enumerate() {
                 let mut deg = 0f64;
-                for_each_nbr(store, v, *dir, &want, |_, _| deg += 1.0);
+                for_each_nbr(store, v, *dir, &want, false, |_, _| deg += 1.0);
                 total += mult[i] * deg;
             }
         } else {
             for &v in &src {
-                for_each_nbr(store, v, *dir, &want, |_, _| total += 1.0);
+                for_each_nbr(store, v, *dir, &want, false, |_, _| total += 1.0);
             }
         }
         return Some(scalar_num(total));
@@ -5154,7 +5181,7 @@ fn try_fused_count(
         let mut seen = vec![false; nc];
         let mut cnt = 0f64;
         for &v in sources {
-            for_each_nbr(store, v, *dir, &want, |nbr, _| {
+            for_each_nbr(store, v, *dir, &want, false, |nbr, _| {
                 if !seen[nbr as usize] {
                     seen[nbr as usize] = true;
                     cnt += 1.0;
@@ -5429,6 +5456,7 @@ fn try_node_grouped_count(
         dir,
         edge_label,
         bind_edge,
+        double_loops: false,
     } = input
     else {
         return None;
@@ -5465,7 +5493,7 @@ fn try_node_grouped_count(
     let mut rep_ids: Vec<u32> = Vec::new();
     let mut node_count: Vec<f64> = Vec::new();
     for &v in &src {
-        for_each_nbr(store, v, *dir, &want, |nbr, _| {
+        for_each_nbr(store, v, *dir, &want, false, |nbr, _| {
             let slot = &mut group_of[nbr as usize];
             if *slot == u32::MAX {
                 *slot = u32::try_from(rep_ids.len()).expect("group count fits in u32");
@@ -8215,6 +8243,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             dir,
             edge_label,
             bind_edge,
+            double_loops,
         } => expand(
             &pull_body(input, store, seed)?,
             store,
@@ -8222,6 +8251,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             *dir,
             edge_label,
             *bind_edge,
+            *double_loops,
         ),
         Plan::VarLength {
             input,
