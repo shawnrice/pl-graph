@@ -3658,7 +3658,15 @@ impl Parser {
                 let key = self.str_arg()?;
                 let e = if self.peek() == Some(&Tok::Comma) {
                     self.bump();
-                    self.has_predicate(key)?
+                    // In a FILTER-CHILD position (not/and/or), the predicate must be
+                    // 2-VALUED so `not(has('n',1))` sees a definite false for a stored
+                    // null (3VL null would make Not→null→dropped, but core keeps it).
+                    // Coerce the (possibly-null) predicate to false-unless-true.
+                    let pred = self.has_predicate(key)?;
+                    Expr::Case {
+                        branches: vec![(pred, Expr::Lit(Value::Bool(true)))],
+                        otherwise: Some(Box::new(Expr::Lit(Value::Bool(false)))),
+                    }
                 } else {
                     Expr::PropertyExists {
                         slot: self.current,
