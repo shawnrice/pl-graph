@@ -2653,6 +2653,12 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 plan
             }
+            "none" if self.peek() == Some(&Tok::RParen) => {
+                // none() drops EVERY traverser — an always-false filter. (The predicate
+                // form none(pred) — keep iff no element matches — is deferred.)
+                self.expect(&Tok::RParen)?;
+                plan.filter(Expr::Lit(Value::Bool(false)))
+            }
             "filter" => {
                 // filter(<traversal>): keep the element iff the sub-traversal produces
                 // output — the same semi-join machinery `where(<traversal>)` uses.
