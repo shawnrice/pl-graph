@@ -662,7 +662,8 @@ impl Parser {
                 };
                 self.expect(&Tok::RParen)?; // close branch(...)
                                             // Parse `.option(m, <hop>)` modulators (m = literal, or bare `none`).
-                let mut opts: Vec<(Option<Value>, (Dir, Option<String>))> = Vec::new();
+                type BranchOpt = (Option<Value>, (Dir, Option<String>));
+                let mut opts: Vec<BranchOpt> = Vec::new();
                 while self.peek() == Some(&Tok::Dot)
                     && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("option"))
                 {
