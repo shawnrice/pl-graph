@@ -774,6 +774,16 @@ impl Parser {
         if self.pos != self.toks.len() {
             return Err(format!("unexpected trailing input at token {}", self.pos));
         }
+        // A bare traversal that ends on a hop (no terminal projection) leaves the
+        // current element in a slot > 0, but the result renderer emits slot 0 (the
+        // source). Project the current element into slot 0 so the output is the
+        // traverser's element — `g.V('3').in('CREATED')` yields the neighbours, not
+        // three copies of the source.
+        if self.current != 0 {
+            plan = plan.project(vec![("_".to_string(), Expr::Slot(self.current))]);
+            self.current = 0;
+            self.slots = 1;
+        }
         Ok(plan)
     }
 
@@ -2666,11 +2676,11 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 plan.filter(e)
             }
-            "flatmap" | "map" => {
-                // flatMap(<traversal>)/map(<traversal>): apply the body's step chain to
-                // the current frontier and continue from its output (flatMap flattens a
-                // multi-output body; in this eager model map's single-output body is the
-                // same shape). The body chains directly onto `plan` (NOT Row-rooted).
+            "flatmap" => {
+                // flatMap(<traversal>): apply the body's step chain to the current
+                // frontier and continue from its output. The body chains directly onto
+                // `plan` (NOT Row-rooted). (map() differs — a reducing-barrier body like
+                // count() folds the whole stream — so it is NOT handled here.)
                 if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
                     self.bump();
                     self.expect(&Tok::Dot)?;
