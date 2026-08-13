@@ -1602,6 +1602,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .or_else(|| try_3hop_product_count(input, keys, aggs, store))
                 .or_else(|| try_fused_count(input, keys, aggs, store))
                 .or_else(|| try_node_grouped_count(input, keys, aggs, store))
+                .or_else(|| try_scan_dict_count(input, keys, aggs, store))
                 .or_else(|| try_scan_group_agg(input, keys, aggs, store))
             {
                 b
@@ -5267,6 +5268,81 @@ struct GroupAcc {
 /// the grouping contract), so the frontier and projected columns are never
 /// materialized. `None` for any other shape (Temporal/Gen key, non-numeric agg
 /// arg, DISTINCT, multi-key). The per-key string hashing is the residual floor.
+/// The TIGHT case of [`try_scan_group_agg`]: a plain `count(*) GROUP BY <col>` where the
+/// group column is DICTIONARY-encoded (a categorical `city`/`status`). Count directly per
+/// dict CODE into a `Vec<u64>` — no per-group `GroupAcc` struct, no `accumulate` closure,
+/// no bounds-checked `acc[group]` write per row, just `counts[code] += 1`.
+///
+/// This exists because the general `GroupAcc` path, while fine natively, is
+/// DISPROPORTIONATELY slow on wasm: its nested closure + per-row struct indexing compile
+/// to indirect calls / bounds-checked accesses that wasm penalizes several times more
+/// than native, which flipped `groupCount().by('city')` and `GROUP BY city` from wins to
+/// losses on the wasm surface while they won on FFI/native. The lean loop closes that.
+/// Numeric aggregates, multi-agg, and non-dict keys stay on `try_scan_group_agg`.
+fn try_scan_dict_count(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    let [(_, Expr::Prop { slot: 0, key })] = keys else {
+        return None;
+    };
+    let [agg] = aggs else {
+        return None;
+    };
+    if agg.func != AggFn::Count || agg.arg.is_some() || agg.distinct {
+        return None; // count(*) only
+    }
+    let Plan::Scan { label } = input else {
+        return None;
+    };
+    let Some(Column::Dict {
+        dict,
+        codes,
+        present,
+    }) = store.column(key)
+    else {
+        return None;
+    };
+    // `usize` counters, NOT u64: a count cannot exceed node_count, and `usize` is 32-bit
+    // (native i32) on wasm32 where a u64 add is EMULATED — the general path's u64
+    // GroupAcc.rows is part of why grouping was disproportionately slow on wasm.
+    let mut counts = vec![0usize; dict.len()];
+    let mut null_count = 0usize;
+    // Group output order is FIRST-SEEN (the grouping contract, matching the general path):
+    // record a code the first time it is counted (its count goes 0 -> 1); -1 = null group.
+    let mut order: Vec<i32> = Vec::new();
+    let mut seen_null = false;
+    scan_visit(store, label, |i| {
+        if present[i] {
+            let c = codes[i] as usize;
+            if counts[c] == 0 {
+                order.push(c as i32);
+            }
+            counts[c] += 1;
+        } else {
+            if !seen_null {
+                seen_null = true;
+                order.push(-1);
+            }
+            null_count += 1;
+        }
+    });
+    let mut key_col: Vec<Value> = Vec::with_capacity(order.len());
+    let mut cnt_col: Vec<Value> = Vec::with_capacity(order.len());
+    for &code in &order {
+        if code < 0 {
+            key_col.push(Value::Null);
+            cnt_col.push(Value::Num(null_count as f64));
+        } else {
+            key_col.push(Value::Str(dict[code as usize].clone()));
+            cnt_col.push(Value::Num(counts[code as usize] as f64));
+        }
+    }
+    Some(Batch::of(vec![Col::Gen(key_col), Col::Gen(cnt_col)]))
+}
+
 fn try_scan_group_agg(
     input: &Plan,
     keys: &[(String, Expr)],
