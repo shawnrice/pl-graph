@@ -102,8 +102,14 @@ enum Cmp {
     Bool(bool),
     Num(String),
     Str(String),
-    /// Non-scalar (element/map/list/path) — kept comparable and labelled so a
-    /// mismatch surfaces, but flagged so the harness can skip it from the scalar set.
+    /// A list — element order PRESERVED (fold/path are order-bearing).
+    List(Vec<Cmp>),
+    /// A map — entries SORTED by key (content parity; insertion order is a
+    /// separate concern the ordered cases don't exercise through a bare map).
+    Map(Vec<(Cmp, Cmp)>),
+    /// A raw element (`Node`/`Edge`) or any value the normalizer can't reduce to a
+    /// canonical scalar. Its presence means the case must project to `id()`/`values`
+    /// to be comparable — the harness flags it rather than guessing an identity.
     Other(String),
 }
 
@@ -117,12 +123,19 @@ fn num_key(n: f64) -> String {
     }
 }
 
+fn sorted_map(mut entries: Vec<(Cmp, Cmp)>) -> Cmp {
+    entries.sort();
+    Cmp::Map(entries)
+}
+
 fn norm_eng(v: &EngVal) -> Cmp {
     match v {
         EngVal::Null => Cmp::Null,
         EngVal::Bool(b) => Cmp::Bool(*b),
         EngVal::Num(n) => Cmp::Num(num_key(*n)),
         EngVal::Str(s) => Cmp::Str(s.to_string()),
+        EngVal::List(xs) => Cmp::List(xs.iter().map(norm_eng).collect()),
+        EngVal::Map(m) => sorted_map(m.iter().map(|(k, v)| (norm_eng(k), norm_eng(v))).collect()),
         other => Cmp::Other(format!("{other:?}")),
     }
 }
@@ -133,13 +146,29 @@ fn norm_core(v: &CoreVal) -> Cmp {
         CoreVal::Bool(b) => Cmp::Bool(*b),
         CoreVal::Num(n) => Cmp::Num(num_key(*n)),
         CoreVal::Str(s) => Cmp::Str(s.to_string()),
+        CoreVal::List(xs) => Cmp::List(xs.iter().map(norm_core).collect()),
+        CoreVal::Map(m) => sorted_map(
+            m.iter()
+                .map(|(k, v)| (norm_core(k), norm_core(v)))
+                .collect(),
+        ),
         other => Cmp::Other(format!("{other:?}")),
     }
 }
 
-/// True when a result set contains a non-scalar (so the scalar harness skips it).
+/// True when any value (at any depth) is an un-canonicalizable `Other` — the case
+/// must project elements to `id()`/`values` to be comparable, so the harness skips it.
+fn has_other(c: &Cmp) -> bool {
+    match c {
+        Cmp::Other(_) => true,
+        Cmp::List(xs) => xs.iter().any(has_other),
+        Cmp::Map(es) => es.iter().any(|(k, v)| has_other(k) || has_other(v)),
+        _ => false,
+    }
+}
+
 fn has_nonscalar(v: &[Cmp]) -> bool {
-    v.iter().any(|c| matches!(c, Cmp::Other(_)))
+    v.iter().any(has_other)
 }
 
 // ── run both engines ─────────────────────────────────────────────────────────
@@ -168,8 +197,15 @@ fn c(name: &'static str, ordered: bool, steps: Vec<Step>) -> Case {
     }
 }
 
-/// Gremlin parity cases the engine does NOT yet match — kept green as known gaps.
-const KNOWN_GREMLIN_GAPS: &[&str] = &[];
+/// Gremlin parity cases the engine does NOT yet match. These are UNFINISHED, real,
+/// MEASURED gaps (not "won't-fix" divergences) — each names concrete engine work the
+/// harness will verify the moment it's closed:
+///   - group / groupCount: core folds the grouped stream into ONE Gremlin `Map`; the
+///     engine models a grouped result as (key,value) ROWS (its GQL GROUP BY heritage).
+///     The Gremlin front-end needs a map-fold terminal. `[group-map]`
+///   - path().by(k): the path lineage renders whole element maps; a `by` modulator
+///     must project each path element to a property. `[path-by]`
+const KNOWN_GREMLIN_GAPS: &[&str] = &["groupcount_lang", "groupcount_label", "path_names"];
 
 #[test]
 fn gremlin_parity() {
@@ -361,6 +397,87 @@ fn gremlin_parity() {
                 V,
                 HasVal("name", Val::S("marko")),
                 Out(vec!["KNOWS", "CREATED"]),
+                Values(vec!["name"]),
+            ],
+        ),
+        // — element identity via id() (ext-id strings, canonical on both sides) —
+        c("all_ids", false, vec![V, Id]),
+        c("person_ids", false, vec![V, HasLabel(vec!["PERSON"]), Id]),
+        c(
+            "marko_out_ids",
+            false,
+            vec![V, HasVal("name", Val::S("marko")), Out(vec!["KNOWS"]), Id],
+        ),
+        c(
+            "created_in_ids",
+            false,
+            vec![V, HasLabel(vec!["SOFTWARE"]), In(vec!["CREATED"]), Id],
+        ),
+        // — maps of scalars (valueMap / elementMap) —
+        c(
+            "valuemap_name",
+            false,
+            vec![V, HasLabel(vec!["PERSON"]), ValueMap(vec!["name"])],
+        ),
+        c(
+            "valuemap_name_age",
+            false,
+            vec![V, HasLabel(vec!["PERSON"]), ValueMap(vec!["name", "age"])],
+        ),
+        c(
+            "elementmap_marko",
+            false,
+            vec![V, HasVal("name", Val::S("marko")), ElementMap(vec!["name"])],
+        ),
+        // — lists (fold) —
+        c(
+            "names_fold",
+            false,
+            vec![V, HasLabel(vec!["PERSON"]), Values(vec!["name"]), Fold],
+        ),
+        c(
+            "ages_ordered_fold",
+            true,
+            vec![
+                V,
+                HasLabel(vec!["PERSON"]),
+                Values(vec!["age"]),
+                Order,
+                Fold,
+            ],
+        ),
+        // — groupCount —
+        c(
+            "groupcount_lang",
+            false,
+            vec![V, HasLabel(vec!["SOFTWARE"]), GroupCount, By("lang")],
+        ),
+        c("groupcount_label", false, vec![V, Label, GroupCount]),
+        // — path projected to names —
+        c(
+            "path_names",
+            false,
+            vec![
+                V,
+                HasVal("name", Val::S("marko")),
+                Out(vec!["KNOWS"]),
+                Path,
+                By("name"),
+            ],
+        ),
+        // — dedup count / where —
+        c(
+            "created_names_count",
+            false,
+            vec![V, Out(vec!["CREATED"]), Values(vec!["name"]), Dedup, Count],
+        ),
+        c(
+            "where_knows_out",
+            false,
+            vec![
+                V,
+                HasLabel(vec!["PERSON"]),
+                Where(vec![Out(vec!["KNOWS"])]),
                 Values(vec!["name"]),
             ],
         ),
