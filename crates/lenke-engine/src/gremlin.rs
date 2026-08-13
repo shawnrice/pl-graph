@@ -732,7 +732,7 @@ impl Parser {
         self.expect(&Tok::LParen)?;
         self.expect(&Tok::RParen)?;
         let body = if is_edge {
-            Plan::Row.expand_edge(current, dir, &labels)
+            Plan::Row.expand_edge_gremlin(current, dir, &labels)
         } else {
             Plan::Row.expand(current, dir, &labels)
         };
@@ -889,7 +889,7 @@ impl Parser {
         // The neighbour lands one past the provenance column (inserted at `width`).
         let landed = width + 1;
         let mut body = if is_edge {
-            Plan::Row.expand_edge(elem_slot, dir, &labels)
+            Plan::Row.expand_edge_gremlin(elem_slot, dir, &labels)
         } else {
             Plan::Row.expand(elem_slot, dir, &labels)
         };
@@ -2117,7 +2117,7 @@ impl Parser {
                 self.on_edge = true;
                 self.slots += 2;
                 self.edge_hop = Some((node_slot, dir));
-                plan.expand_edge(from, dir, &labels)
+                plan.expand_edge_gremlin(from, dir, &labels)
             }
             "inv" | "outv" | "otherv" | "bothv" => {
                 self.expect(&Tok::RParen)?;
@@ -3225,7 +3225,7 @@ impl Parser {
                             },
                             SelBy::Degree(dir, ls, is_edge) => {
                                 let body = if *is_edge {
-                                    Plan::Row.expand_edge(slot, *dir, ls)
+                                    Plan::Row.expand_edge_gremlin(slot, *dir, ls)
                                 } else {
                                     Plan::Row.expand(slot, *dir, ls)
                                 };
@@ -3411,7 +3411,7 @@ impl Parser {
                             self.expect(&Tok::LParen)?;
                             self.expect(&Tok::RParen)?;
                             let body = if hedge {
-                                Plan::Row.expand_edge(elem_slot, hdir, &ls)
+                                Plan::Row.expand_edge_gremlin(elem_slot, hdir, &ls)
                             } else {
                                 Plan::Row.expand(elem_slot, hdir, &ls)
                             };
@@ -4475,7 +4475,7 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 let is_edge = matches!(name.as_str(), "oute" | "ine" | "bothe");
                 let hop = if is_edge {
-                    Plan::Row.expand_edge(self.current, dir, &labels)
+                    Plan::Row.expand_edge_gremlin(self.current, dir, &labels)
                 } else {
                     Plan::Row.expand(self.current, dir, &labels)
                 };
@@ -5528,6 +5528,7 @@ impl Parser {
             PathMode::Walk,
             ctx.until.map(Box::new),
             ctx.body_filter.map(Box::new),
+            matches!(ctx.dir, Dir::Both),
         );
         // The walk appended its endpoint at `out_slot` (the width before this call);
         // account for it and land the current element there.

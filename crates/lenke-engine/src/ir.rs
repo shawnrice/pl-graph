@@ -627,6 +627,11 @@ pub enum Plan {
         /// nor descended into — so only surviving nodes continue the walk. `None` = no
         /// body filter. Evaluated over the same one-row mini-batch as `until`.
         body_filter: Option<Box<Expr>>,
+        /// Gremlin `repeat(both())` self-loop semantics: an undirected hop crosses a
+        /// self-loop TWICE. GQL undirected var-length (`-[:R]-{1,3}`) keeps it once
+        /// (`false`); a Gremlin `both()` walk doubles it (`true`, only bites on
+        /// `Dir::Both`) — matching core.
+        double_loops: bool,
     },
     /// A quantified subpath group `((x)-[e]->(y)){min,max}` that BINDS its inner
     /// variables as GROUP variables — each becomes a LIST over the repetitions. Like
@@ -1033,6 +1038,22 @@ impl Plan {
         }
     }
 
+    /// Like [`Self::expand_edge`] but with Gremlin `bothE()` self-loop semantics: an
+    /// undirected edge hop crosses a self-loop TWICE (it is both an out- and an in-edge),
+    /// so `bothE().otherV()` on a self-loop yields the vertex twice — matching core. A
+    /// directed edge hop is unaffected (`double_loops` only bites on `Dir::Both`).
+    #[must_use]
+    pub fn expand_edge_gremlin(self, from: usize, dir: Dir, edge_label: &[String]) -> Self {
+        Self::Expand {
+            input: Box::new(self),
+            from,
+            dir,
+            edge_label: edge_label.to_vec(),
+            bind_edge: true,
+            double_loops: matches!(dir, Dir::Both),
+        }
+    }
+
     #[must_use]
     pub fn optional_expand(
         self,
@@ -1072,12 +1093,14 @@ impl Plan {
             mode,
             until: None,
             body_filter: None,
+            double_loops: false,
         }
     }
 
     /// [`Self::var_length`] with a Gremlin `until(pred)` stop condition and/or a
     /// `repeat(<hop>.<filter>)` body filter (see the `until`/`body_filter` fields on
-    /// [`Plan::VarLength`]).
+    /// [`Plan::VarLength`]). `double_loops` gives it Gremlin `both()` self-loop
+    /// semantics (a self-loop crossed twice).
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn var_length_until(
@@ -1090,6 +1113,7 @@ impl Plan {
         mode: PathMode,
         until: Option<Box<Expr>>,
         body_filter: Option<Box<Expr>>,
+        double_loops: bool,
     ) -> Self {
         Self::VarLength {
             input: Box::new(self),
@@ -1101,6 +1125,7 @@ impl Plan {
             mode,
             until,
             body_filter,
+            double_loops,
         }
     }
 

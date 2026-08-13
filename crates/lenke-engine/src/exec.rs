@@ -1229,6 +1229,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             mode,
             until,
             body_filter,
+            double_loops,
         } => var_length(
             &pull(input, store, track)?,
             store,
@@ -1243,6 +1244,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             1,
             until.as_deref(),
             body_filter.as_deref(),
+            *double_loops,
         ),
         Plan::RepeatGroup {
             input,
@@ -1270,6 +1272,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             *k,
             None,
             None,
+            false,
         ),
         Plan::NestedGroup {
             input,
@@ -2070,6 +2073,7 @@ fn streaming_chain(plan: &Plan, store: &Store) -> Option<(Plan, Vec<u32>)> {
             mode,
             until,
             body_filter,
+            double_loops,
         } => {
             let (body, ids) = streaming_chain(input, store)?;
             Some((
@@ -2083,6 +2087,7 @@ fn streaming_chain(plan: &Plan, store: &Store) -> Option<(Plan, Vec<u32>)> {
                     mode: *mode,
                     until: until.clone(),
                     body_filter: body_filter.clone(),
+                    double_loops: *double_loops,
                 },
                 ids,
             ))
@@ -3874,11 +3879,12 @@ fn try_varlen_count(
         mode,
         until,
         body_filter,
+        double_loops,
     } = input
     else {
         return None;
     };
-    if until.is_some() || body_filter.is_some() {
+    if until.is_some() || body_filter.is_some() || *double_loops {
         return None; // an until(pred) walk emits a filtered subset — no closed-form count
     }
     let want = match want_etypes(store, edge_label) {
@@ -4120,11 +4126,12 @@ fn try_varlen_distinct_count(
         mode,
         until,
         body_filter,
+        double_loops,
     } = input
     else {
         return None;
     };
-    if until.is_some() || body_filter.is_some() {
+    if until.is_some() || body_filter.is_some() || *double_loops {
         return None; // an until(pred) walk emits a filtered subset — no closed-form count
     }
     // The BFS-reachability fusion relies on shortest-distance == walk equivalence,
@@ -4309,11 +4316,12 @@ fn try_varlen_agg(
         mode,
         until,
         body_filter,
+        double_loops,
     } = input
     else {
         return None;
     };
-    if until.is_some() || body_filter.is_some() {
+    if until.is_some() || body_filter.is_some() || *double_loops {
         return None; // an until(pred) walk emits a filtered subset — no closed-form agg
     }
     // The aggregate argument must be a property of the ENDPOINT (the appended slot).
@@ -5735,6 +5743,9 @@ fn var_length(
     // Gremlin `repeat(<hop>.<filter>)` body filter: a predicate on each hop TARGET
     // (`len > 0`); a target that fails it is pruned (no emit, no descent).
     body_filter: Option<&Expr>,
+    // Gremlin `both()` self-loop doubling — a self-loop is walked twice (see the
+    // `double_loops` field on Plan::VarLength).
+    double_loops: bool,
 ) -> Batch {
     let empty = || {
         let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
@@ -5804,6 +5815,7 @@ fn var_length(
             k,
             until_stop.map(|p| (p, endpoint_slot)),
             body_filter.map(|p| (p, endpoint_slot)),
+            double_loops,
         );
         if node_unique {
             used.pop();
@@ -6388,6 +6400,8 @@ fn varlen_dfs(
     // Gremlin `repeat(<hop>.<filter>)` body filter: `(pred, endpoint_slot)`. Applied at
     // each hop target (`len > 0`); a target that fails it is pruned entirely.
     body_filter: Option<(&Expr, usize)>,
+    // Gremlin `both()` self-loop doubling — keep the in-side copy of a self-loop.
+    double_loops: bool,
 ) {
     // A body filter prunes a hop target that fails it — no emit, no descent (the source
     // at len 0 is not a hop target, so it is exempt).
@@ -6458,7 +6472,7 @@ fn varlen_dfs(
         &[]
     };
     // Undirected: drop the in-side copy of a self-loop so it is walked once.
-    let drop_loop = matches!(dir, Dir::Both);
+    let drop_loop = matches!(dir, Dir::Both) && !double_loops;
     for (is_inc, a) in out
         .iter()
         .map(|a| (false, a))
@@ -6542,6 +6556,7 @@ fn varlen_dfs(
             k,
             until_stop,
             body_filter,
+            double_loops,
         );
         node_stack.pop();
         edge_stack.pop();
@@ -8494,6 +8509,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             mode,
             until,
             body_filter,
+            double_loops,
         } => var_length(
             &pull_body(input, store, seed)?,
             store,
@@ -8508,6 +8524,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             1,
             until.as_deref(),
             body_filter.as_deref(),
+            *double_loops,
         ),
         Plan::Filter { input, pred } => {
             let b = pull_body(input, store, seed)?;

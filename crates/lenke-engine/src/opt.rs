@@ -324,6 +324,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             mode,
             until,
             body_filter,
+            double_loops,
         } => {
             let (i, c) = rewrite(*input, idx);
             (
@@ -337,6 +338,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                     mode,
                     until,
                     body_filter,
+                    double_loops,
                 },
                 c,
             )
@@ -872,6 +874,7 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 mode,
                 until,
                 body_filter,
+                double_loops,
             } => {
                 let (below, above) = split_pushable(pred, width(&vin));
                 match below {
@@ -887,6 +890,7 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                             mode,
                             until,
                             body_filter,
+                            double_loops,
                         };
                         (
                             Plan::Filter {
@@ -910,6 +914,7 @@ fn apply_local(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                             mode,
                             until,
                             body_filter,
+                            double_loops,
                         };
                         match above {
                             Some(a) => (
