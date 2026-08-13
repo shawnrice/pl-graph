@@ -562,6 +562,98 @@ impl Parser {
     /// Parse the content of a `by(...)` group/select/project key: a `'prop'` string,
     /// or the `id`/`label` (also `T.id`/`T.label`) element token. Returns a display
     /// name and the value expression over `slot`.
+    /// Parse ONE `order().by(<body>)` modulator's content (cursor just after `(`,
+    /// leaves it AT the closing `)`): a property, a direction on the current value, an
+    /// id/label/T token, or a degree sub-traversal `[__.]<hop>('L').count()`, each with
+    /// an optional trailing `, asc|desc`. Returns `(sort_expr, descending)`.
+    fn order_by_body(&mut self, current: usize) -> Result<(Expr, bool), String> {
+        // Empty by() → the current value, ascending.
+        if self.peek() == Some(&Tok::RParen) {
+            return Ok((Expr::Slot(current), false));
+        }
+        // A property key.
+        if matches!(self.peek(), Some(Tok::Str(_))) {
+            let key = self.str_arg()?;
+            let descending = if self.peek() == Some(&Tok::Comma) {
+                self.bump();
+                self.order_dir()?
+            } else {
+                false
+            };
+            return Ok((Expr::Prop { slot: current, key }, descending));
+        }
+        // A bare direction (asc/desc/Order.*) on the current value.
+        if matches!(self.peek(), Some(Tok::Ident(s)) if {
+            let l = s.to_ascii_lowercase();
+            l == "asc" || l == "desc" || l == "order"
+        }) {
+            let descending = self.order_dir()?;
+            return Ok((Expr::Slot(current), descending));
+        }
+        // An id/label/T token.
+        if matches!(self.peek(), Some(Tok::Ident(s)) if {
+            let l = s.to_ascii_lowercase();
+            l == "id" || l == "label" || l == "t"
+        }) {
+            let (_, e) = self.by_key_expr(current)?;
+            let descending = if self.peek() == Some(&Tok::Comma) {
+                self.bump();
+                self.order_dir()?
+            } else {
+                false
+            };
+            return Ok((e, descending));
+        }
+        // A degree sub-traversal: `[__.]<hop>('L'…).count()`.
+        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+            self.bump();
+            self.expect(&Tok::Dot)?;
+        }
+        let hop = self.ident()?.to_ascii_lowercase();
+        let (dir, is_edge) = match hop.as_str() {
+            "out" => (Dir::Out, false),
+            "in" => (Dir::In, false),
+            "both" => (Dir::Both, false),
+            "oute" => (Dir::Out, true),
+            "ine" => (Dir::In, true),
+            "bothe" => (Dir::Both, true),
+            other => return Err(format!("order().by(<traversal>): unsupported body `{other}`")),
+        };
+        self.expect(&Tok::LParen)?;
+        let mut labels: Vec<String> = Vec::new();
+        if matches!(self.peek(), Some(Tok::Str(_))) {
+            labels.push(self.str_arg()?);
+            while self.peek() == Some(&Tok::Comma) {
+                self.bump();
+                labels.push(self.str_arg()?);
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        self.expect(&Tok::Dot)?;
+        let c = self.ident()?;
+        if !c.eq_ignore_ascii_case("count") {
+            return Err("order().by(<traversal>) body must end with .count()".into());
+        }
+        self.expect(&Tok::LParen)?;
+        self.expect(&Tok::RParen)?;
+        let body = if is_edge {
+            Plan::Row.expand_edge(current, dir, &labels)
+        } else {
+            Plan::Row.expand(current, dir, &labels)
+        };
+        let expr = Expr::CountSubquery {
+            body: Box::new(body),
+            outer_width: self.slots,
+        };
+        let descending = if self.peek() == Some(&Tok::Comma) {
+            self.bump();
+            self.order_dir()?
+        } else {
+            false
+        };
+        Ok((expr, descending))
+    }
+
     /// Parse a simple comparison predicate `[P.]op(literal)` → (op, value). Used where
     /// only eq/neq/gt/gte/lt/lte against one literal is meaningful (e.g. `none(pred)`).
     fn simple_predicate(&mut self) -> Result<(CompareOp, Value), String> {
@@ -2472,56 +2564,33 @@ impl Parser {
                     };
                     plan.sort_local(descending, by_key)
                 } else {
-                    // Global stream sort. `.by` is OPTIONAL — a bare value stream
-                    // sorts by its own natural order:
-                    //   order()                     — natural order of the value
-                    //   order().by()                — same, explicit identity
-                    //   order().by(asc|desc)        — natural order, explicit direction
-                    //   order().by('k'[, asc|desc]) — by property `k`
-                    // A string arg is a property key; a bare ident (asc/desc/Order)
-                    // is a direction on the current value (`Slot(current)`).
-                    let has_by = self.peek() == Some(&Tok::Dot)
-                        && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"));
-                    let (expr, descending) = if has_by {
+                    // Global stream sort with zero or more `.by(...)` modulators, each a
+                    // sort key (applied in order). A key body is a property, a direction
+                    // on the current value, an id/label/T token, or a degree sub-traversal
+                    // `[__.]<hop>('L').count()` — each with an optional trailing direction.
+                    let mut keys: Vec<SortKey> = Vec::new();
+                    while self.peek() == Some(&Tok::Dot)
+                        && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
+                    {
                         self.expect(&Tok::Dot)?;
                         self.ident()?; // `by`
                         self.expect(&Tok::LParen)?;
-                        if self.peek() == Some(&Tok::RParen) {
-                            self.expect(&Tok::RParen)?;
-                            (Expr::Slot(self.current), false)
-                        } else if matches!(self.peek(), Some(Tok::Str(_))) {
-                            let key = self.str_arg()?;
-                            let descending = if self.peek() == Some(&Tok::Comma) {
-                                self.pos += 1;
-                                self.order_dir()?
-                            } else {
-                                false
-                            };
-                            self.expect(&Tok::RParen)?;
-                            (
-                                Expr::Prop {
-                                    slot: self.current,
-                                    key,
-                                },
-                                descending,
-                            )
-                        } else {
-                            let descending = self.order_dir()?;
-                            self.expect(&Tok::RParen)?;
-                            (Expr::Slot(self.current), descending)
-                        }
-                    } else {
-                        (Expr::Slot(self.current), false)
-                    };
-                    plan.order_page(
-                        vec![SortKey {
+                        let (expr, descending) = self.order_by_body(self.current)?;
+                        self.expect(&Tok::RParen)?;
+                        keys.push(SortKey {
                             expr,
                             descending,
                             nulls_first: true, // Gremlin: NULLs first
-                        }],
-                        None,
-                        None,
-                    )
+                        });
+                    }
+                    if keys.is_empty() {
+                        keys.push(SortKey {
+                            expr: Expr::Slot(self.current),
+                            descending: false,
+                            nulls_first: true,
+                        });
+                    }
+                    plan.order_page(keys, None, None)
                 }
             }
             "as" => {
