@@ -7824,17 +7824,34 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             if name == "element_label" {
                 let arg = eval(&args[0], store, batch)?;
                 let n = batch.rows();
-                let out: Vec<Value> = (0..n)
-                    .map(|i| match arg.value_at(i) {
+                // Intern each distinct label ONCE for the whole column, so a big
+                // `V().label()` frontier allocates one Arc per label, not per row.
+                let mut cache: Vec<(&str, std::sync::Arc<str>)> = Vec::new();
+                let mut out: Vec<Value> = Vec::with_capacity(n);
+                for i in 0..n {
+                    out.push(match arg.value_at(i) {
                         Value::Num(id) if matches!(arg, Col::Nodes(_)) => {
-                            store.min_label(id as u32).map_or(Value::Null, Value::Str)
+                            match store.min_label_name(id as u32) {
+                                Some(nm) => {
+                                    let arc = match cache.iter().find(|(c, _)| *c == nm) {
+                                        Some((_, a)) => a.clone(),
+                                        None => {
+                                            let a: std::sync::Arc<str> = std::sync::Arc::from(nm);
+                                            cache.push((nm, a.clone()));
+                                            a
+                                        }
+                                    };
+                                    Value::Str(arc)
+                                }
+                                None => Value::Null,
+                            }
                         }
                         Value::Num(eid) if matches!(arg, Col::Edges(_)) => store
                             .edge_type_name(eid as u32)
                             .map_or(Value::Null, |t| Value::Str(t.into())),
                         _ => Value::Null,
-                    })
-                    .collect();
+                    });
+                }
                 return Ok(Col::Gen(out));
             }
             // `element_map(element[, 'k1', …])` → Gremlin `elementMap()`: core's FLAT

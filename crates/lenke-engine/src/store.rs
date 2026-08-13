@@ -824,18 +824,17 @@ impl Store {
     }
 
     /// The lexicographically SMALLEST label node `id` carries (Gremlin `label()` — a
-    /// vertex's single label), without allocating/sorting the whole label list the way
-    /// `labels_of(id).first()` did. Per-row on `V().label()` over a big frontier, so the
-    /// per-row `Vec<String>` clone dominated; this tracks the min via a bucket
-    /// binary-search per label instead.
+    /// vertex's single label) as a BORROWED name, without allocating/sorting the whole
+    /// label list the way `labels_of(id).first()` did. The caller interns the `Arc`
+    /// (few distinct labels), so `V().label()` over a big frontier does one allocation
+    /// per label, not per row. `min` via a bucket binary-search per label.
     #[must_use]
-    pub fn min_label(&self, id: u32) -> Option<Arc<str>> {
+    pub fn min_label_name(&self, id: u32) -> Option<&str> {
         self.by_label
             .iter()
             .filter(|(_, ids)| ids.binary_search(&id).is_ok())
-            .map(|(l, _)| l)
+            .map(|(l, _)| l.as_str())
             .min()
-            .map(|l| Arc::from(l.as_str()))
     }
 
     /// The labels carried by node `id`, sorted. Each label bucket is kept SORTED
