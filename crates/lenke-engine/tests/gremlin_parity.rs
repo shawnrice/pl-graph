@@ -707,6 +707,32 @@ fn gremlin_parity() {
             false,
             vec![V, HasLabel(vec!["PERSON"]), Values(vec!["name"]), Barrier],
         ),
+        // — inject: add literal values to the whole stream —
+        c(
+            "inject_one",
+            false,
+            vec![
+                V,
+                HasLabel(vec!["PERSON"]),
+                Values(vec!["name"]),
+                Inject(vec![Val::S("x")]),
+            ],
+        ),
+        c(
+            "inject_many",
+            false,
+            vec![
+                V,
+                HasLabel(vec!["SOFTWARE"]),
+                Values(vec!["name"]),
+                Inject(vec![Val::S("a"), Val::S("b")]),
+            ],
+        ),
+        c(
+            "inject_count",
+            false,
+            vec![V, Values(vec!["name"]), Inject(vec![Val::S("x")]), Count],
+        ),
         // — tail(local, k): last k of each list cell —
         c(
             "tail_local_2",

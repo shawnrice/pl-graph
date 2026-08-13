@@ -114,6 +114,7 @@ pub enum Step {
     ConnectedComponent,
     PeerPressure,
     TailLocal(usize),
+    Inject(Vec<Val>),
 }
 
 /// A whole traversal: an ordered list of steps.
@@ -267,6 +268,7 @@ fn emit_step(st: &Step) -> String {
         ConnectedComponent => "connectedComponent()".into(),
         PeerPressure => "peerPressure()".into(),
         TailLocal(n) => format!("tail(local,{n})"),
+        Inject(vs) => format!("inject({})", join_vals(vs)),
     }
 }
 
@@ -389,6 +391,7 @@ fn apply_core(t: CTrav, st: &Step) -> CTrav {
         ConnectedComponent => t.connected_component(),
         PeerPressure => t.peer_pressure(),
         TailLocal(n) => t.tail_local(*n),
+        Inject(vs) => t.inject(vs.iter().map(cval).collect::<Vec<_>>()),
     }
 }
 

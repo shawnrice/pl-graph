@@ -1560,6 +1560,34 @@ impl Parser {
                 self.slots = 1;
                 p
             }
+            "inject" => {
+                // inject(v1, v2, …): ADD the literal values to the WHOLE stream (a
+                // whole-stream union with a literal-rows plan), not once per element.
+                // Normalize the current stream to its single element column first so
+                // both union arms are one column wide.
+                let vals = self.literal_list()?;
+                self.expect(&Tok::RParen)?;
+                let cur = plan.project(vec![("inject".to_string(), Expr::Slot(self.current))]);
+                // Literal rows: unwind the value list over a single Row (which pulls as
+                // one dummy column), then project the appended element — which Unwind
+                // places at the NEXT slot, i.e. slot 1 after Row's dummy slot 0.
+                let lit_plan = Plan::Unwind {
+                    input: Box::new(Plan::Row),
+                    list: Box::new(Expr::Lit(Value::List(vals))),
+                    var_slot: 1,
+                    ordinal: None,
+                }
+                .project(vec![("inject".to_string(), Expr::Slot(1))]);
+                let p = Plan::Union {
+                    left: Box::new(cur),
+                    right: Box::new(lit_plan),
+                    all: true,
+                    op: crate::ir::CombineOp::Union,
+                };
+                self.current = 0;
+                self.slots = 1;
+                p
+            }
             "unfold" => {
                 // Flatten the current list-valued stream (Gremlin unfold): each list
                 // element becomes its own traverser. Lowers to Unwind over the current
