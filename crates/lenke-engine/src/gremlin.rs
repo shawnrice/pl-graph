@@ -1040,15 +1040,35 @@ impl Parser {
             }
             "tail" => {
                 // tail(n) — the LAST n rows of the stream (default 1), the mirror of
-                // limit. Operates on the committed row order; a preceding order()
-                // makes it "the top n".
-                let n = if matches!(self.peek(), Some(Tok::Num(_))) {
+                // limit. tail(local[, k]) — the last k of each list CELL instead.
+                let is_local = self.parse_scope_is_local()?;
+                let n = if is_local {
+                    if self.peek() == Some(&Tok::Comma) {
+                        self.bump();
+                        self.usize_arg()?
+                    } else {
+                        1
+                    }
+                } else if matches!(self.peek(), Some(Tok::Num(_))) {
                     self.usize_arg()?
                 } else {
                     1
                 };
                 self.expect(&Tok::RParen)?;
-                plan.tail(n)
+                if is_local {
+                    let p = plan.project(vec![(
+                        "tail".to_string(),
+                        Expr::Call {
+                            name: "list_tail".to_string(),
+                            args: vec![Expr::Slot(self.current), Expr::Lit(Value::Num(n as f64))],
+                        },
+                    )]);
+                    self.current = 0;
+                    self.slots = 1;
+                    p
+                } else {
+                    plan.tail(n)
+                }
             }
             "range" => {
                 let lo = self.usize_arg()?;

@@ -7171,6 +7171,33 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                     .collect();
                 return Ok(Col::Gen(out));
             }
+            // `list_tail(list, k)` → Gremlin `tail(local, k)`: the LAST k elements of
+            // each list cell (a scalar cell is a 1-element list → itself when k>=1,
+            // else empty). Gremlin-only.
+            if name == "list_tail" {
+                let arg = eval(&args[0], store, batch)?;
+                let k = match &args[1] {
+                    Expr::Lit(Value::Num(n)) => (*n as usize).max(0),
+                    _ => return Err("tail(local, k): k must be a literal integer".into()),
+                };
+                let n = batch.rows();
+                let out: Vec<Value> = (0..n)
+                    .map(|i| match arg.value_at(i) {
+                        Value::List(items) => {
+                            let start = items.len().saturating_sub(k);
+                            Value::List(items[start..].to_vec())
+                        }
+                        other => {
+                            if k >= 1 {
+                                other
+                            } else {
+                                Value::List(vec![])
+                            }
+                        }
+                    })
+                    .collect();
+                return Ok(Col::Gen(out));
+            }
             if matches!(
                 name.as_str(),
                 "list_sum" | "list_mean" | "list_min" | "list_max"

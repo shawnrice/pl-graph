@@ -113,6 +113,7 @@ pub enum Step {
     PageRank(Option<f64>),
     ConnectedComponent,
     PeerPressure,
+    TailLocal(usize),
 }
 
 /// A whole traversal: an ordered list of steps.
@@ -265,6 +266,7 @@ fn emit_step(st: &Step) -> String {
         PageRank(None) => "pageRank()".into(),
         ConnectedComponent => "connectedComponent()".into(),
         PeerPressure => "peerPressure()".into(),
+        TailLocal(n) => format!("tail(local,{n})"),
     }
 }
 
@@ -386,6 +388,7 @@ fn apply_core(t: CTrav, st: &Step) -> CTrav {
         PageRank(a) => t.page_rank(*a),
         ConnectedComponent => t.connected_component(),
         PeerPressure => t.peer_pressure(),
+        TailLocal(n) => t.tail_local(*n),
     }
 }
 

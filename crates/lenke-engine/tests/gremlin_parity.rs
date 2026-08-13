@@ -707,6 +707,19 @@ fn gremlin_parity() {
             false,
             vec![V, HasLabel(vec!["PERSON"]), Values(vec!["name"]), Barrier],
         ),
+        // — tail(local, k): last k of each list cell —
+        c(
+            "tail_local_2",
+            false,
+            vec![
+                V,
+                HasLabel(vec!["PERSON"]),
+                Values(vec!["age"]),
+                Order,
+                Fold,
+                TailLocal(2),
+            ],
+        ),
         // — select with by-modulators (projects each tagged element to a property) —
         c(
             "select_by_name",
