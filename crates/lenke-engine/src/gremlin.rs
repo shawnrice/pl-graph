@@ -1401,6 +1401,38 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 plan
             }
+            "local" => {
+                // local(<traversal>) runs the body PER input element. v1 supports the
+                // common reducing form local(<hop chain>.count()) — a per-element
+                // (correlated) count that keeps every input row (0 for no matches),
+                // lowered to Expr::CountSubquery over the hop body. A body without a
+                // trailing count() is deferred (a general per-element sub-traversal
+                // needs grouped-by-input scoping the row model does not yet have).
+                let from = self.current;
+                let width = self.slots;
+                let (body, _oc, _os) = self.parse_sub_body(from, width)?;
+                self.expect(&Tok::RParen)?;
+                match body {
+                    Plan::Aggregate { input, keys, aggs }
+                        if keys.is_empty()
+                            && aggs.len() == 1
+                            && matches!(aggs[0].func, AggFn::Count) =>
+                    {
+                        let expr = Expr::CountSubquery {
+                            body: input,
+                            outer_width: width,
+                        };
+                        let p = plan.project(vec![("local".to_string(), expr)]);
+                        self.current = 0;
+                        self.slots = 1;
+                        p
+                    }
+                    _ => return Err(
+                        "local(<traversal>) is only supported as local(<hop chain>.count()) so far"
+                            .into(),
+                    ),
+                }
+            }
             "withcomputer" => {
                 // A no-op marker (lenke always computes in-process), matching core.
                 self.expect(&Tok::RParen)?;
@@ -3229,6 +3261,26 @@ mod tests {
             crate::exec::execute(&super::parse("g.V(0).addE('R').to(V(9))").unwrap(), &mut st)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn local_count_is_per_element() {
+        let store = social();
+        // local(out('KNOWS').count()) is the per-vertex out-degree, keeping vertices
+        // with zero (unlike a global count). alice→2, bob→1, carol→0, +Project has 0.
+        let counts = value_bag(&gremlin_rows(
+            "g.V().hasLabel('Person').local(out('KNOWS').count())",
+            &store,
+        ));
+        // social() has 3 persons; every one contributes a count (0 kept). KNOWS is
+        // alice→bob, alice→carol, bob→carol → out-degrees carol=0, bob=1, alice=2.
+        assert_eq!(
+            counts,
+            vec!["Num(0.0);", "Num(1.0);", "Num(2.0);"],
+            "one count per person, zeros kept",
+        );
+        // A body without a trailing count() is a clear error, not a silent wrong answer.
+        assert!(super::parse("g.V().local(out('KNOWS').values('name'))").is_err());
     }
 
     #[test]
