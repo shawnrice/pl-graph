@@ -2778,6 +2778,48 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 plan.filter(e)
             }
+            "map" => {
+                // map(<body>): per traverser, the body's FIRST result (empties dropped).
+                // A single-VALUE body is a per-row projection: `count()` maps each
+                // traverser to 1; `values('k')`/`constant`/`id`/`label` project that
+                // value. (A navigating body — map(out()) taking the first neighbour —
+                // is deferred.) `map(count())` is the reducing-barrier case that must
+                // NOT fold the whole stream.
+                let from = self.current;
+                let mut probe = self.pos;
+                if matches!(self.toks.get(probe), Some(Tok::Ident(s)) if s == "__") {
+                    probe += 1;
+                    if self.toks.get(probe) == Some(&Tok::Dot) {
+                        probe += 1;
+                    }
+                }
+                let is_count = matches!(self.toks.get(probe), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("count"))
+                    && self.toks.get(probe + 1) == Some(&Tok::LParen)
+                    && self.toks.get(probe + 2) == Some(&Tok::RParen);
+                if is_count {
+                    // Consume `[__.]count()` then close map(...).
+                    if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+                        self.bump();
+                        self.expect(&Tok::Dot)?;
+                    }
+                    self.ident()?; // count
+                    self.expect(&Tok::LParen)?;
+                    self.expect(&Tok::RParen)?;
+                    self.expect(&Tok::RParen)?; // close map(...)
+                    let p = plan.project(vec![("map".to_string(), Expr::Lit(Value::Num(1.0)))]);
+                    self.current = 0;
+                    self.slots = 1;
+                    p
+                } else if let Some(val) = self.parse_single_value_body(from)? {
+                    self.expect(&Tok::RParen)?;
+                    let p = plan.project(vec![("map".to_string(), val)]);
+                    self.current = 0;
+                    self.slots = 1;
+                    p
+                } else {
+                    return Err("map(<navigating traversal>) is not yet supported".into());
+                }
+            }
             "flatmap" => {
                 // flatMap(<traversal>): apply the body's step chain to the current
                 // frontier and continue from its output. The body chains directly onto
