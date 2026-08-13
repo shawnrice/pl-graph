@@ -524,6 +524,9 @@ struct RepeatCtx {
     /// max-depth cap on the walk (`loops()` == depth + 1). `None` = no cap from a body
     /// `where(loops())`.
     max_cap: Option<u32>,
+    /// A degenerate `repeat(identity())` body: the walk doesn't move, so `flush_repeat`
+    /// passes the frontier through unchanged (exact for `times(0)`).
+    identity_body: bool,
 }
 
 struct Parser {
@@ -1882,6 +1885,48 @@ impl Parser {
                 // (the endpoint) is pre-allocated as the width so an emit/until
                 // predicate parsed before the flush references it. The LParen was
                 // already consumed at the top of `step`.
+                // A degenerate `repeat(identity())` body doesn't move the frontier; hold
+                // it open with an identity marker so the modulators still attach, then
+                // flush to a passthrough (exact for `times(0)`; a reasonable smoke result
+                // otherwise). The endpoint stays the current element (no new slot).
+                let is_identity = {
+                    let mut p = self.pos;
+                    if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
+                        p += 1;
+                        if self.toks.get(p) == Some(&Tok::Dot) {
+                            p += 1;
+                        }
+                    }
+                    matches!(self.toks.get(p), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("identity"))
+                };
+                if is_identity {
+                    if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+                        self.bump();
+                        self.expect(&Tok::Dot)?;
+                    }
+                    self.ident()?; // identity
+                    self.expect(&Tok::LParen)?;
+                    self.expect(&Tok::RParen)?;
+                    self.expect(&Tok::RParen)?; // close repeat(...)
+                    self.pending_repeat = Some(RepeatCtx {
+                        dir: Dir::Out,
+                        label: None,
+                        from: self.current,
+                        out_slot: self.current,
+                        times: None,
+                        min_one: false,
+                        filter: None,
+                        bind_tag: None,
+                        min_override: None,
+                        path_ok_at_open: self.path_ok,
+                        until: None,
+                        until_pre: false,
+                        body_filter: None,
+                        max_cap: None,
+                        identity_body: true,
+                    });
+                    return Ok(plan);
+                }
                 let (dir, label, bind_tag, body_filter, max_cap) = self.repeat_body()?;
                 self.expect(&Tok::RParen)?;
                 let from = self.current;
@@ -1904,6 +1949,7 @@ impl Parser {
                     until_pre: true,
                     body_filter,
                     max_cap,
+                    identity_body: false,
                 });
                 plan
             }
@@ -5276,6 +5322,27 @@ impl Parser {
             return Ok(plan);
         };
         const CAP: u32 = 100; // the TS engine's default iteration cap
+        // A `repeat(identity())` walk never moves the frontier, so the ONLY thing the
+        // modulators decide is whether any depth is emittable. A post-form `until` is a
+        // do-while (min 1); with `times(0)` (max 0) min > max, so nothing survives —
+        // matching core. Otherwise the frontier passes through.
+        if ctx.identity_body {
+            let (min, max) = if ctx.until.is_some() {
+                (1, ctx.times.unwrap_or(CAP))
+            } else {
+                match (ctx.min_one, ctx.times) {
+                    (false, Some(n)) => (n, n),
+                    (true, Some(n)) => (1, n),
+                    (true, None) => (1, CAP),
+                    (false, None) => (0, 0),
+                }
+            };
+            return Ok(if min > max {
+                plan.filter(Expr::Lit(Value::Bool(false)))
+            } else {
+                plan
+            });
+        }
         // An `until(pred)` walk runs to the cap (or `times`), emitting only on a match:
         // pre-form is while-do (min 0 — a source may satisfy `pred`), post-form do-while
         // (min 1). Otherwise `times`/`emit` decide the bounds as before.
