@@ -4067,6 +4067,15 @@ impl Parser {
                     let pred = self.predicate_expr(cnt)?;
                     self.expect(&Tok::RParen)?;
                     pred
+                } else if self.peek() == Some(&Tok::Dot) {
+                    // A trailing step (`out('KNOWS').where(out('CREATED'))`) makes the
+                    // child a multi-step sub-traversal: Exists over the whole chain.
+                    self.pos = start;
+                    let (body, _oc, _os) = self.parse_sub_body(self.current, self.slots)?;
+                    Expr::Exists {
+                        body: Box::new(body),
+                        outer_width: self.slots,
+                    }
                 } else {
                     Expr::Exists {
                         body: Box::new(hop),
