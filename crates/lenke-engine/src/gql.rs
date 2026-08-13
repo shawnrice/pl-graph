@@ -198,7 +198,13 @@ struct Rel {
 /// base + local index (`count(*) + 1` → `Slot(AGG_SLOT_BASE) + 1`), distinguishing
 /// them from ordinary binding slots so `apply_items` can rewrite them to the real
 /// post-aggregation column once the group schema is assembled.
-const AGG_SLOT_BASE: usize = 1 << 40;
+///
+/// It is only a sentinel far above any real per-query binding slot (a query has dozens,
+/// never millions) and is never serialized, so its exact value is immaterial — but it
+/// MUST fit in `usize` on every target. `1 << 28` clears real slots by a factor of
+/// hundreds of millions while still fitting 32-bit `usize` (wasm32); `1 << 40` did not,
+/// and const-overflowed the wasm build.
+const AGG_SLOT_BASE: usize = 1 << 28;
 
 /// A parsed RETURN item: a keyed expression (a grouping key / plain projection), a
 /// bare aggregate, or an expression that CONTAINS aggregates (`count(*) + 1`) — the
