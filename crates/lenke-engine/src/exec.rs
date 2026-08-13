@@ -8184,6 +8184,62 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             }
             b
         }
+        // A reducing body (`fold()`/`count()` inside a union/coalesce branch) folds the
+        // sub-frontier; run the general aggregate over the pulled body.
+        Plan::Aggregate { input, keys, aggs } => {
+            let b = pull_body(input, store, seed)?;
+            aggregate(&b, store, keys, aggs)?
+        }
+        // A per-cell list sort inside a branch body.
+        Plan::SortLocal {
+            input,
+            descending,
+            by_key,
+        } => {
+            let b = pull_body(input, store, seed)?;
+            let n = b.rows();
+            let sorted: Vec<Value> = (0..n)
+                .map(|i| sort_local_cell(b.slot(0).value_at(i), *descending, *by_key))
+                .collect();
+            let mut slots = b.slots.clone();
+            if !slots.is_empty() {
+                slots[0] = Col::Gen(sorted);
+            }
+            Batch::of(slots)
+        }
+        // An unwind inside a branch body (a union of fold/unfold, etc.).
+        Plan::Unwind {
+            input,
+            list,
+            ordinal,
+            ..
+        } => {
+            let b = pull_body(input, store, seed)?;
+            let lists = eval(list, store, &b)?;
+            let mut keep = Vec::new();
+            let mut elems: Vec<Value> = Vec::new();
+            let mut ords: Vec<Value> = Vec::new();
+            for i in 0..b.rows() {
+                let items: Vec<Value> = match lists.value_at(i) {
+                    Value::List(v) => v,
+                    Value::Null => Vec::new(),
+                    scalar => vec![scalar],
+                };
+                for (j, e) in items.into_iter().enumerate() {
+                    keep.push(i);
+                    elems.push(e);
+                    if let Some((_, one_based)) = ordinal {
+                        ords.push(Value::Num((j + usize::from(*one_based)) as f64));
+                    }
+                }
+            }
+            let mut slots: Vec<Col> = b.slots.iter().map(|c| c.gather(&keep)).collect();
+            slots.push(reunfold_elements(&elems, store));
+            if ordinal.is_some() {
+                slots.push(Col::Gen(ords));
+            }
+            Batch::of(slots)
+        }
         other => {
             return Err(format!("unsupported operator in EXISTS body: {other:?}"));
         }
