@@ -29,6 +29,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         labels: HashMap::new(),
         edge_hop: None,
         pending_repeat: None,
+        pending_until: None,
         path_ok: true,
         caps: std::collections::HashMap::new(),
         algo_props: std::collections::HashMap::new(),
@@ -507,6 +508,14 @@ struct RepeatCtx {
     /// letting `path()`/`tree()` follow a `repeat(<vertex-hop>)` when the prefix was
     /// itself path-answerable.
     path_ok_at_open: bool,
+    /// A Gremlin `until(pred)` stop condition on the walk. The pre-form
+    /// `until(pred).repeat(body)` (while-do, checked BEFORE the body — `until_pre`) and
+    /// the post-form `repeat(body).until(pred)` (do-while) both land here; `flush_repeat`
+    /// sets `min` to 0 (pre) or 1 (post) and lowers to `var_length_until`.
+    until: Option<Expr>,
+    /// True when `until` came from the PRE-form (`until(pred).repeat(body)`): a source
+    /// already satisfying `pred` emits at depth 0.
+    until_pre: bool,
 }
 
 struct Parser {
@@ -530,6 +539,9 @@ struct Parser {
     /// `until`); the next non-modulator step (or the end) flushes it into a
     /// `VarLength` walk. See [`RepeatCtx`] and `flush_repeat`.
     pending_repeat: Option<RepeatCtx>,
+    /// A PRE-form `until(pred)` seen BEFORE its `repeat(body)` (`until(pred).repeat(…)`,
+    /// while-do). Stashed here until the following `repeat()` opens and consumes it.
+    pending_until: Option<Expr>,
     /// Whether `path()` can still be answered: true while the traversal is a pure
     /// vertex-hop chain (`V`-source + `out`/`in`/`both` + element filters), whose
     /// Gremlin path is exactly the node sequence the engine's lineage records. Any
@@ -1878,6 +1890,10 @@ impl Parser {
                     bind_tag,
                     min_override: None,
                     path_ok_at_open: self.path_ok,
+                    // A PRE-form `until(pred).repeat(body)` stashed its predicate; attach
+                    // it now as a while-do stop (checked before the body → `until_pre`).
+                    until: self.pending_until.take(),
+                    until_pre: true,
                 });
                 plan
             }
@@ -1930,9 +1946,17 @@ impl Parser {
             "until" => {
                 // `until(pred)`: loop until the endpoint satisfies `pred`. A
                 // `loops().is(eq(n))` predicate is exactly `times(n)` (stop after n
-                // hops). Otherwise a min-1 walk keeping endpoints that satisfy `pred`.
+                // hops). Otherwise a prune-on-match walk (see the `until` field on
+                // Plan::VarLength). Two positions: POST-form `repeat(body).until(pred)`
+                // (do-while) sets the stop on the pending ctx; PRE-form
+                // `until(pred).repeat(body)` (while-do) is stashed until repeat() opens.
                 if self.pending_repeat.is_none() {
-                    return Err("until(pred) must follow repeat(<hop>)".into());
+                    // PRE-form: no loops() shorthand here (a while-do count is unusual);
+                    // stash the endpoint predicate for the following repeat().
+                    let f = self.child_filter_expr()?;
+                    self.expect(&Tok::RParen)?;
+                    self.pending_until = Some(f);
+                    return Ok(plan);
                 }
                 if let Some((op, n)) = self.try_loops_predicate()? {
                     self.expect(&Tok::RParen)?;
@@ -1951,8 +1975,9 @@ impl Parser {
                 let f = self.child_filter_expr()?;
                 self.expect(&Tok::RParen)?;
                 let ctx = self.pending_repeat.as_mut().unwrap();
-                ctx.min_one = true;
-                ctx.filter = Some(f);
+                // POST-form do-while: at least one body iteration, then stop on match.
+                ctx.until = Some(f);
+                ctx.until_pre = false;
                 plan
             }
             "oute" | "ine" | "bothe" => {
@@ -5199,23 +5224,34 @@ impl Parser {
             return Ok(plan);
         };
         const CAP: u32 = 100; // the TS engine's default iteration cap
-        let (min, max) = match (ctx.min_one, ctx.times) {
-            (false, Some(n)) => (n, n),
-            (true, Some(n)) => (1, n),
-            (true, None) => (1, CAP),
-            (false, None) => {
-                return Err("repeat(<hop>) must be closed by times(n), emit() or until(pred)".into())
+        // An `until(pred)` walk runs to the cap (or `times`), emitting only on a match:
+        // pre-form is while-do (min 0 — a source may satisfy `pred`), post-form do-while
+        // (min 1). Otherwise `times`/`emit` decide the bounds as before.
+        let (min, max) = if ctx.until.is_some() {
+            let lo = u32::from(!ctx.until_pre);
+            (lo, ctx.times.unwrap_or(CAP))
+        } else {
+            match (ctx.min_one, ctx.times) {
+                (false, Some(n)) => (n, n),
+                (true, Some(n)) => (1, n),
+                (true, None) => (1, CAP),
+                (false, None) => {
+                    return Err(
+                        "repeat(<hop>) must be closed by times(n), emit() or until(pred)".into(),
+                    )
+                }
             }
         };
         // A `loops()` emit predicate raises the minimum emitted depth.
         let min = ctx.min_override.map_or(min, |m| m.max(min));
-        let p = plan.var_length(
+        let p = plan.var_length_until(
             ctx.from,
             ctx.dir,
             &etypes_of(ctx.label.as_deref()),
             min,
             max,
             PathMode::Walk,
+            ctx.until.map(Box::new),
         );
         // The walk appended its endpoint at `out_slot` (the width before this call);
         // account for it and land the current element there.

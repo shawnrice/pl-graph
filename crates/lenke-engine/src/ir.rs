@@ -592,6 +592,14 @@ pub enum Plan {
         min: u32,
         max: u32,
         mode: PathMode,
+        /// Gremlin `until(pred)` stop condition (both spellings): a walk emits an
+        /// endpoint ONLY when `pred` holds (checked at each landing from depth `min`)
+        /// and then PRUNES — that branch stops rather than hopping past the match. The
+        /// pre-form `until(pred).repeat(body)` sets `min = 0` (while-do: a source that
+        /// already satisfies `pred` emits at depth 0); the post-form
+        /// `repeat(body).until(pred)` sets `min = 1` (do-while). `None` = a plain
+        /// bounded walk (emit every landing in `[min, max]`).
+        until: Option<Box<Expr>>,
     },
     /// A quantified subpath group `((x)-[e]->(y)){min,max}` that BINDS its inner
     /// variables as GROUP variables — each becomes a LIST over the repetitions. Like
@@ -1030,6 +1038,33 @@ impl Plan {
             min,
             max,
             mode,
+            until: None,
+        }
+    }
+
+    /// [`Self::var_length`] with a Gremlin `until(pred)` stop condition (see the
+    /// `until` field on [`Plan::VarLength`]).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn var_length_until(
+        self,
+        from: usize,
+        dir: Dir,
+        edge_label: &[String],
+        min: u32,
+        max: u32,
+        mode: PathMode,
+        until: Option<Box<Expr>>,
+    ) -> Self {
+        Self::VarLength {
+            input: Box::new(self),
+            from,
+            dir,
+            edge_label: edge_label.to_vec(),
+            min,
+            max,
+            mode,
+            until,
         }
     }
 

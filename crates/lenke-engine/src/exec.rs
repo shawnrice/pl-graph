@@ -1183,6 +1183,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             min,
             max,
             mode,
+            until,
         } => var_length(
             &pull(input, store, track)?,
             store,
@@ -1195,6 +1196,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             &[],
             None,
             1,
+            until.as_deref(),
         ),
         Plan::RepeatGroup {
             input,
@@ -1220,6 +1222,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             group_binds,
             per_rep_pred.as_deref(),
             *k,
+            None,
         ),
         Plan::NestedGroup {
             input,
@@ -2009,6 +2012,7 @@ fn streaming_chain(plan: &Plan, store: &Store) -> Option<(Plan, Vec<u32>)> {
             min,
             max,
             mode,
+            until,
         } => {
             let (body, ids) = streaming_chain(input, store)?;
             Some((
@@ -2020,6 +2024,7 @@ fn streaming_chain(plan: &Plan, store: &Store) -> Option<(Plan, Vec<u32>)> {
                     min: *min,
                     max: *max,
                     mode: *mode,
+                    until: until.clone(),
                 },
                 ids,
             ))
@@ -3809,10 +3814,14 @@ fn try_varlen_count(
         min,
         max,
         mode,
+        until,
     } = input
     else {
         return None;
     };
+    if until.is_some() {
+        return None; // an until(pred) walk emits a filtered subset — no closed-form count
+    }
     let want = match want_etypes(store, edge_label) {
         Ok(w) => w,
         Err(()) => return Some(scalar_num(0.0)), // unknown edge type → no paths
@@ -4050,10 +4059,14 @@ fn try_varlen_distinct_count(
         min,
         max,
         mode,
+        until,
     } = input
     else {
         return None;
     };
+    if until.is_some() {
+        return None; // an until(pred) walk emits a filtered subset — no closed-form count
+    }
     // The BFS-reachability fusion relies on shortest-distance == walk equivalence,
     // which only holds when nodes may repeat (Walk / Trail). SIMPLE / ACYCLIC forbid
     // node reuse, so a distinct-endpoint count must enumerate — fall through.
@@ -4234,10 +4247,14 @@ fn try_varlen_agg(
         min,
         max,
         mode,
+        until,
     } = input
     else {
         return None;
     };
+    if until.is_some() {
+        return None; // an until(pred) walk emits a filtered subset — no closed-form agg
+    }
     // The aggregate argument must be a property of the ENDPOINT (the appended slot).
     let Some(Expr::Prop { slot, key }) = agg.arg.as_ref() else {
         return None; // count(*) is `try_varlen_count`
@@ -5647,6 +5664,10 @@ fn var_length(
     // Hops per repetition unit: an endpoint is emitted only at a rep boundary
     // (`len % k == 0`). 1 for a plain hop or a single-hop group.
     k: u32,
+    // Gremlin `until(pred)`: emit an endpoint ONLY when `pred` holds (evaluated over a
+    // one-row mini-batch whose endpoint slot carries the landed node) and PRUNE that
+    // branch on a match. `min` decides the earliest depth checked (0 pre-form, 1 post).
+    until_stop: Option<&Expr>,
 ) -> Batch {
     let empty = || {
         let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
@@ -5663,6 +5684,9 @@ fn var_length(
         Ok(w) => w,
         Err(()) => vec![u32::MAX],
     };
+    // The walk appends its endpoint at the first free slot; an `until(pred)` mini-batch
+    // places the landed node there so a pred like `hasLabel(endpoint)` resolves.
+    let endpoint_slot = batch.slots.len();
     let Col::Nodes(src) = batch.slot(from) else {
         return empty();
     };
@@ -5711,6 +5735,7 @@ fn var_length(
             &mut group_cols,
             per_rep_pred,
             k,
+            until_stop.map(|p| (p, endpoint_slot)),
         );
         if node_unique {
             used.pop();
@@ -5765,6 +5790,17 @@ fn rep_pred_ok(
     // outer anchor variable (`(a)-[e WHERE a.k = …]->{…}`); the parser maps that
     // variable to this slot. `node_stack[0]` is the source for every repetition.
     slots.push(Col::Nodes(vec![node_stack[0]]));
+    let mini = Batch::of(slots);
+    eval(pred, store, &mini)
+        .map(|c| c.value_at(0).is_true())
+        .unwrap_or(false)
+}
+
+/// Evaluate a Gremlin `until(pred)` at a single walk endpoint `v`. The predicate was
+/// built referencing the endpoint slot, so a one-row mini-batch places `v` there (and
+/// at every lower slot, harmless — a well-formed until pred reads only the endpoint).
+fn until_ok(pred: &Expr, store: &Store, endpoint_slot: usize, v: u32) -> bool {
+    let slots: Vec<Col> = (0..=endpoint_slot).map(|_| Col::Nodes(vec![v])).collect();
     let mini = Batch::of(slots);
     eval(pred, store, &mini)
         .map(|c| c.value_at(0).is_true())
@@ -6278,6 +6314,9 @@ fn varlen_dfs(
     per_rep_pred: Option<&Expr>,
     // Hops per repetition unit: an endpoint is emitted only at a rep boundary.
     k: u32,
+    // Gremlin `until(pred)`: `(pred, endpoint_slot)`. An endpoint is emitted ONLY when
+    // `pred` holds at it, and the branch then PRUNES (no descent past the match).
+    until_stop: Option<(&Expr, usize)>,
 ) {
     // Per-repetition WHERE: on COMPLETING a rep (a boundary at len > 0), check the
     // just-finished rep's predicate over its scalar variables (node pos p at slot 2p,
@@ -6291,7 +6330,12 @@ fn varlen_dfs(
             return;
         }
     }
-    if len >= min && len.is_multiple_of(k) {
+    // With `until(pred)` a landing is emitted ONLY when the predicate holds; a plain
+    // walk emits every landing in `[min, max]`. On an `until` match the branch prunes.
+    let at_boundary = len >= min && len.is_multiple_of(k);
+    let until_hit = until_stop.map(|(p, slot)| until_ok(p, store, slot, v));
+    let emit_here = at_boundary && until_hit.unwrap_or(true);
+    if emit_here {
         keep.push(row);
         ends.push(v);
         if let Some(b) = track_batch {
@@ -6309,6 +6353,12 @@ fn varlen_dfs(
         if !group_binds.is_empty() {
             push_group_cols(node_stack, edge_stack, k, group_binds, group_cols);
         }
+    }
+    // An `until` match at an emit boundary stops the walk here (the loop exit); a match
+    // BELOW `min` (e.g. a post-form do-while source that already satisfies `pred`) does
+    // NOT — the body must still run its minimum iterations first. So prune on `emit_here`.
+    if until_stop.is_some() && emit_here {
+        return;
     }
     if len == max {
         return;
@@ -6410,6 +6460,7 @@ fn varlen_dfs(
             group_cols,
             per_rep_pred,
             k,
+            until_stop,
         );
         node_stack.pop();
         edge_stack.pop();
@@ -8310,6 +8361,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             min,
             max,
             mode,
+            until,
         } => var_length(
             &pull_body(input, store, seed)?,
             store,
@@ -8322,6 +8374,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             &[],
             None,
             1,
+            until.as_deref(),
         ),
         Plan::Filter { input, pred } => {
             let b = pull_body(input, store, seed)?;
