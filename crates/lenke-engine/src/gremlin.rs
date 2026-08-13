@@ -582,8 +582,9 @@ impl Parser {
                 plan.filter(Expr::Not(Box::new(inner)))
             }
             "out" | "in" | "both" => {
-                // 0 args → ANY edge type (argless out()); 1 → that type. Multi-label
-                // out('A','B') is a follow-up (needs a union of hops).
+                // 0 args → ANY edge type (argless out()); 1+ → a disjunction over the
+                // listed types, exactly as GQL's `-[:A|B]->` lowers (the plan builder
+                // takes the whole `&[String]` etype list, empty = any).
                 let mut labels: Vec<String> = Vec::new();
                 if !matches!(self.peek(), Some(Tok::RParen)) {
                     loop {
@@ -596,16 +597,6 @@ impl Parser {
                     }
                 }
                 self.expect(&Tok::RParen)?;
-                let edge_label: Option<&str> = match labels.len() {
-                    0 => None,
-                    1 => Some(labels[0].as_str()),
-                    _ => {
-                        return Err(
-                            "out()/in()/both() with multiple edge labels is not yet supported"
-                                .into(),
-                        )
-                    }
-                };
                 let dir = match name.to_ascii_lowercase().as_str() {
                     "out" => Dir::Out,
                     "in" => Dir::In,
@@ -614,7 +605,7 @@ impl Parser {
                 let from = self.current;
                 self.current = self.slots;
                 self.slots += 1;
-                plan.expand(from, dir, &etypes_of(edge_label))
+                plan.expand(from, dir, &labels)
             }
             "repeat" => {
                 // `repeat(<hop>)` v1: the body is a SINGLE anonymous hop
@@ -665,15 +656,6 @@ impl Parser {
                     }
                 }
                 self.expect(&Tok::RParen)?;
-                let edge_label: Option<&str> =
-                    match labels.len() {
-                        0 => None,
-                        1 => Some(labels[0].as_str()),
-                        _ => return Err(
-                            "outE()/inE()/bothE() with multiple edge labels is not yet supported"
-                                .into(),
-                        ),
-                    };
                 let dir = match lname.as_str() {
                     "oute" => Dir::Out,
                     "ine" => Dir::In,
@@ -685,7 +667,7 @@ impl Parser {
                 self.current = edge_slot;
                 self.slots += 2;
                 self.edge_hop = Some((node_slot, dir));
-                plan.expand_edge(from, dir, &etypes_of(edge_label))
+                plan.expand_edge(from, dir, &labels)
             }
             "inv" | "outv" | "otherv" => {
                 self.expect(&Tok::RParen)?;
@@ -1057,27 +1039,50 @@ impl Parser {
                     };
                     plan.sort_local(descending)
                 } else {
-                    // order().by('k'[, asc|desc]) — stream sort by a property.
-                    self.expect(&Tok::Dot)?;
-                    let by = self.ident()?;
-                    if !by.eq_ignore_ascii_case("by") {
-                        return Err("order() must be followed by by(...)".into());
-                    }
-                    self.expect(&Tok::LParen)?;
-                    let key = self.str_arg()?;
-                    let descending = if self.peek() == Some(&Tok::Comma) {
-                        self.pos += 1;
-                        self.order_dir()?
+                    // Global stream sort. `.by` is OPTIONAL — a bare value stream
+                    // sorts by its own natural order:
+                    //   order()                     — natural order of the value
+                    //   order().by()                — same, explicit identity
+                    //   order().by(asc|desc)        — natural order, explicit direction
+                    //   order().by('k'[, asc|desc]) — by property `k`
+                    // A string arg is a property key; a bare ident (asc/desc/Order)
+                    // is a direction on the current value (`Slot(current)`).
+                    let has_by = self.peek() == Some(&Tok::Dot)
+                        && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"));
+                    let (expr, descending) = if has_by {
+                        self.expect(&Tok::Dot)?;
+                        self.ident()?; // `by`
+                        self.expect(&Tok::LParen)?;
+                        if self.peek() == Some(&Tok::RParen) {
+                            self.expect(&Tok::RParen)?;
+                            (Expr::Slot(self.current), false)
+                        } else if matches!(self.peek(), Some(Tok::Str(_))) {
+                            let key = self.str_arg()?;
+                            let descending = if self.peek() == Some(&Tok::Comma) {
+                                self.pos += 1;
+                                self.order_dir()?
+                            } else {
+                                false
+                            };
+                            self.expect(&Tok::RParen)?;
+                            (
+                                Expr::Prop {
+                                    slot: self.current,
+                                    key,
+                                },
+                                descending,
+                            )
+                        } else {
+                            let descending = self.order_dir()?;
+                            self.expect(&Tok::RParen)?;
+                            (Expr::Slot(self.current), descending)
+                        }
                     } else {
-                        false
+                        (Expr::Slot(self.current), false)
                     };
-                    self.expect(&Tok::RParen)?;
                     plan.order_page(
                         vec![SortKey {
-                            expr: Expr::Prop {
-                                slot: self.current,
-                                key,
-                            },
+                            expr,
                             descending,
                             nulls_first: true, // Gremlin: NULLs first
                         }],
@@ -1564,6 +1569,69 @@ impl Parser {
                 } else {
                     member
                 });
+            }
+            // Range predicates take TWO bounds. `between(lo,hi)` is lo-inclusive,
+            // hi-EXCLUSIVE (TinkerPop); `inside(lo,hi)` is exclusive both ends;
+            // `outside(lo,hi)` is the complement (`< lo OR > hi`).
+            if matches!(op_name.as_str(), "between" | "inside" | "outside") {
+                let lo = self.literal()?;
+                self.expect(&Tok::Comma)?;
+                let hi = self.literal()?;
+                self.expect(&Tok::RParen)?;
+                let cmp = |op: CompareOp, v: &Value| Expr::Compare {
+                    op,
+                    left: Box::new(left.clone()),
+                    right: Box::new(Expr::Lit(v.clone())),
+                };
+                return Ok(match op_name.as_str() {
+                    "between" => Expr::And(
+                        Box::new(cmp(CompareOp::Ge, &lo)),
+                        Box::new(cmp(CompareOp::Lt, &hi)),
+                    ),
+                    "inside" => Expr::And(
+                        Box::new(cmp(CompareOp::Gt, &lo)),
+                        Box::new(cmp(CompareOp::Lt, &hi)),
+                    ),
+                    _ => Expr::Or(
+                        Box::new(cmp(CompareOp::Lt, &lo)),
+                        Box::new(cmp(CompareOp::Gt, &hi)),
+                    ),
+                });
+            }
+            // Text predicates (`TextP`): a single string bound, desugaring to the
+            // same `starts_with`/`ends_with`/`contains` scalar the GQL infix forms use.
+            if let Some(fname) = match op_name.as_str() {
+                "startingwith" => Some("starts_with"),
+                "endingwith" => Some("ends_with"),
+                "containing" => Some("contains"),
+                "notstartingwith" | "notendingwith" | "notcontaining" => None,
+                _ => Some(""),
+            }
+            .filter(|f| !f.is_empty())
+            {
+                let val = self.literal()?;
+                self.expect(&Tok::RParen)?;
+                return Ok(Expr::Call {
+                    name: fname.to_string(),
+                    args: vec![left, Expr::Lit(val)],
+                });
+            }
+            // Negated text predicates: NOT of the positive form.
+            if matches!(
+                op_name.as_str(),
+                "notstartingwith" | "notendingwith" | "notcontaining"
+            ) {
+                let fname = match op_name.as_str() {
+                    "notstartingwith" => "starts_with",
+                    "notendingwith" => "ends_with",
+                    _ => "contains",
+                };
+                let val = self.literal()?;
+                self.expect(&Tok::RParen)?;
+                return Ok(Expr::Not(Box::new(Expr::Call {
+                    name: fname.to_string(),
+                    args: vec![left, Expr::Lit(val)],
+                })));
             }
             let val = self.literal()?;
             self.expect(&Tok::RParen)?;
