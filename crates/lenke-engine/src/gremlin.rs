@@ -2889,10 +2889,6 @@ impl Parser {
                             self.expect(&Tok::LParen)?;
                             let k = self.str_arg()?;
                             self.expect(&Tok::RParen)?;
-                            let arg = Expr::Prop {
-                                slot: elem_slot,
-                                key: k,
-                            };
                             // Optional trailing `.<agg>()`; a bare values() folds (Collect).
                             let func = if self.peek() == Some(&Tok::Dot) {
                                 self.bump();
@@ -2913,6 +2909,25 @@ impl Parser {
                                 }
                             } else {
                                 AggFn::Collect
+                            };
+                            // `values('k').count()` counts PRESENT values (a stored null
+                            // is present), not non-null; mark presence so Count tallies it.
+                            let arg = if func == AggFn::Count {
+                                Expr::Case {
+                                    branches: vec![(
+                                        Expr::PropertyExists {
+                                            slot: elem_slot,
+                                            key: k,
+                                        },
+                                        Expr::Lit(Value::Num(1.0)),
+                                    )],
+                                    otherwise: None,
+                                }
+                            } else {
+                                Expr::Prop {
+                                    slot: elem_slot,
+                                    key: k,
+                                }
                             };
                             GroupBy::Reduce(func, Some(arg))
                         } else if !dunder
@@ -3794,7 +3809,15 @@ impl Parser {
                         key: key.clone(),
                     })?;
                     self.expect(&Tok::RParen)?;
-                    Expr::And(Box::new(exists), Box::new(pred))
+                    // 2-valued (like the has child): `not(values('n').is(gt(5)))` must see
+                    // a definite false for a stored/absent null, not 3VL null → dropped.
+                    Expr::Case {
+                        branches: vec![(
+                            Expr::And(Box::new(exists), Box::new(pred)),
+                            Expr::Lit(Value::Bool(true)),
+                        )],
+                        otherwise: Some(Box::new(Expr::Lit(Value::Bool(false)))),
+                    }
                 } else {
                     exists
                 }
