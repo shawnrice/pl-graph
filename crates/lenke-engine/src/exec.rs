@@ -5636,7 +5636,12 @@ fn scalar_num(x: f64) -> Batch {
 /// value, matched via `value::equals`), materialized into nested `Value::Map`s.
 #[derive(Default)]
 struct GremlinTree {
-    children: Vec<(Value, GremlinTree)>,
+    // Children in FIRST-SEEN order (the Gremlin tree contract) …
+    order: Vec<(Value, GremlinTree)>,
+    // … plus a grouping-key → index map so a level with many children is an O(1) hash
+    // lookup, not a linear scan comparing full element-map keys (which made a wide
+    // tree O(paths · children · map-size) — the dominant `tree()` cost).
+    index: FnvMap<Vec<u8>, usize>,
 }
 
 impl GremlinTree {
@@ -5644,23 +5649,23 @@ impl GremlinTree {
         let Some((first, rest)) = keys.split_first() else {
             return;
         };
-        let idx = self
-            .children
-            .iter()
-            .position(|(k, _)| crate::value::equals(k, first));
-        let child = match idx {
-            Some(i) => &mut self.children[i].1,
+        let mut kb = Vec::new();
+        crate::value::group_key_into(first, &mut kb);
+        let i = match self.index.get(&kb) {
+            Some(&i) => i,
             None => {
-                self.children.push((first.clone(), GremlinTree::default()));
-                &mut self.children.last_mut().expect("just pushed").1
+                let idx = self.order.len();
+                self.order.push((first.clone(), GremlinTree::default()));
+                self.index.insert(kb, idx);
+                idx
             }
         };
-        child.insert(rest);
+        self.order[i].1.insert(rest);
     }
 
     fn to_value(&self) -> Value {
         Value::Map(std::sync::Arc::new(
-            self.children
+            self.order
                 .iter()
                 .map(|(k, c)| (k.clone(), c.to_value()))
                 .collect(),
