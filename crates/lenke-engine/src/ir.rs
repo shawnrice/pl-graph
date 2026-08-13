@@ -423,6 +423,15 @@ pub struct SortKey {
     pub nulls_first: bool,
 }
 
+/// A Gremlin graph-algorithm annotate kind (see `Plan::AlgoAnnotate`). Parameters
+/// carry the resolved config; the algorithm math lives in `crate::algo`.
+#[derive(Clone, Debug)]
+pub enum GremlinAlgo {
+    PageRank { damping: f64, iterations: u32 },
+    ConnectedComponent,
+    PeerPressure { iterations: u32 },
+}
+
 /// A logical plan node. A plan is a tree; execution pulls a batch up through it.
 #[derive(Clone, Debug)]
 pub enum Plan {
@@ -635,6 +644,17 @@ pub enum Plan {
     /// yield one Map object rather than the relational (key,value) rows that GQL
     /// `GROUP BY` keeps.
     GroupToMap { input: Box<Plan> },
+    /// A Gremlin OLAP annotate step (`pageRank`/`connectedComponent`/`peerPressure`):
+    /// run the algorithm over the whole store, then APPEND the per-node result as a
+    /// new column aligned to the vertex frontier at `node_slot`, so a following
+    /// `values(<property>)` (routed to this appended slot) reads it. Pass-through: the
+    /// vertex frontier is unchanged, matching core's "stream + attached property".
+    AlgoAnnotate {
+        input: Box<Plan>,
+        algo: GremlinAlgo,
+        edge_label: Option<String>,
+        node_slot: usize,
+    },
     /// Sort by `keys` (empty = no sort, pure paging), then keep the window
     /// `[skip, skip+limit)`. Sorting is STABLE — equal keys keep input order — so
     /// `keys` empty with a `limit` is a plain prefix. Runs before any Project, so
@@ -957,6 +977,21 @@ impl Plan {
     pub fn group_to_map(self) -> Self {
         Self::GroupToMap {
             input: Box::new(self),
+        }
+    }
+
+    #[must_use]
+    pub fn algo_annotate(
+        self,
+        algo: GremlinAlgo,
+        edge_label: Option<String>,
+        node_slot: usize,
+    ) -> Self {
+        Self::AlgoAnnotate {
+            input: Box::new(self),
+            algo,
+            edge_label,
+            node_slot,
         }
     }
 

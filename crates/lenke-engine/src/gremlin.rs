@@ -31,6 +31,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         pending_repeat: None,
         path_ok: true,
         caps: std::collections::HashMap::new(),
+        algo_props: std::collections::HashMap::new(),
     };
     p.traversal()
 }
@@ -195,6 +196,10 @@ struct Parser {
     /// bag holds the elements as they were at aggregate/store time, not after later
     /// value projections).
     caps: std::collections::HashMap<String, (Plan, Expr)>,
+    /// OLAP annotate property name → the slot its computed value lands in (see
+    /// `AlgoAnnotate`). A following `values(<property>)` reads that slot instead of a
+    /// store property.
+    algo_props: std::collections::HashMap<String, usize>,
 }
 
 impl Parser {
@@ -712,13 +717,17 @@ impl Parser {
             "values" => {
                 let key = self.str_arg()?;
                 self.expect(&Tok::RParen)?;
-                let p = plan.project(vec![(
-                    key.clone(),
-                    Expr::Prop {
+                // An OLAP annotate property (pageRank/component/cluster) reads the
+                // computed slot the annotate step appended; any other key is a store
+                // property of the current element.
+                let value_expr = match self.algo_props.get(&key) {
+                    Some(&slot) => Expr::Slot(slot),
+                    None => Expr::Prop {
                         slot: self.current,
-                        key,
+                        key: key.clone(),
                     },
-                )]);
+                };
+                let p = plan.project(vec![(key.clone(), value_expr)]);
                 // The value stream is now the single output column — subsequent
                 // steps (where/min/max/…) address it at slot 0.
                 self.current = 0;
@@ -1346,6 +1355,53 @@ impl Parser {
                 // Pass-through — the current element is unchanged (Gremlin identity()).
                 self.expect(&Tok::RParen)?;
                 plan
+            }
+            "withcomputer" => {
+                // A no-op marker (lenke always computes in-process), matching core.
+                self.expect(&Tok::RParen)?;
+                plan
+            }
+            "pagerank" | "connectedcomponent" | "peerpressure" => {
+                // OLAP annotate: run the algorithm over the store and attach the
+                // per-node result at a new slot; a following values(<default property>)
+                // reads it. Pass-through: the vertex frontier is unchanged. Optional
+                // `pageRank(alpha)` sets the damping factor; `.with(...)` modulators
+                // are deferred (default property names / iterations only for now).
+                let alpha = if lname == "pagerank" {
+                    if let Some(Tok::Num(n)) = self.peek().cloned() {
+                        self.bump();
+                        Some(n)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                self.expect(&Tok::RParen)?;
+                let (algo, prop) = match lname.as_str() {
+                    "pagerank" => (
+                        crate::ir::GremlinAlgo::PageRank {
+                            damping: alpha.unwrap_or(0.85),
+                            iterations: 20,
+                        },
+                        "gremlin.pageRankVertexProgram.pageRank",
+                    ),
+                    "connectedcomponent" => (
+                        crate::ir::GremlinAlgo::ConnectedComponent,
+                        "gremlin.connectedComponentVertexProgram.component",
+                    ),
+                    _ => (
+                        crate::ir::GremlinAlgo::PeerPressure { iterations: 30 },
+                        "gremlin.peerPressureVertexProgram.cluster",
+                    ),
+                };
+                let node_slot = self.current;
+                let out_slot = self.slots;
+                let p = plan.algo_annotate(algo, None, node_slot);
+                self.slots += 1;
+                self.algo_props.insert(prop.to_string(), out_slot);
+                self.path_ok = false;
+                p
             }
             "barrier" => {
                 // A lazy-barrier is a no-op in this eager executor (matching core, where
@@ -3127,6 +3183,38 @@ mod tests {
         assert!(
             crate::exec::execute(&super::parse("g.V(0).addE('R').to(V(9))").unwrap(), &mut st)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn olap_annotate_steps_attach_a_readable_property() {
+        let store = social();
+        // pageRank(): every vertex gets a numeric score under the default property.
+        let pr = gremlin_rows(
+            "g.V().pageRank().values('gremlin.pageRankVertexProgram.pageRank')",
+            &store,
+        );
+        assert_eq!(pr.rows.len(), 4, "one score per person");
+        assert!(
+            pr.rows.iter().all(|r| matches!(r[0], Value::Num(_))),
+            "pageRank values are numbers: {:?}",
+            pr.rows
+        );
+        // connectedComponent(): the whole social graph is one component → one id.
+        let cc = value_bag(&gremlin_rows(
+            "g.V().connectedComponent().values('gremlin.connectedComponentVertexProgram.component').dedup()",
+            &store,
+        ));
+        assert_eq!(cc.len(), 1, "one component id (all connected): {cc:?}");
+        // The component id is an external-id STRING (the root vertex), like core.
+        assert!(
+            cc[0].starts_with("Str("),
+            "component id is a string: {cc:?}"
+        );
+        // A non-algo property still reads the store after an annotate (pass-through).
+        assert_eq!(
+            value_bag(&gremlin_rows("g.V().pageRank().values('name')", &store)),
+            value_bag(&gremlin_rows("g.V().values('name')", &store)),
         );
     }
 

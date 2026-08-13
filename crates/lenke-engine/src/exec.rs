@@ -758,6 +758,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::Tail { input, .. }
         | Plan::NullPadIfEmpty { input, .. }
         | Plan::GroupToMap { input }
+        | Plan::AlgoAnnotate { input, .. }
         | Plan::SortLocal { input, .. } => needs_lineage(input),
         Plan::OptionalScan { input, filters, .. } => {
             filters.iter().any(|(_, e)| reads_path(e)) || needs_lineage(input)
@@ -1043,6 +1044,50 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 pairs.push((k, v));
             }
             Batch::single(Col::Gen(vec![Value::Map(std::sync::Arc::new(pairs))]))
+        }
+        Plan::AlgoAnnotate {
+            input,
+            algo,
+            edge_label,
+            node_slot,
+        } => {
+            use crate::ir::GremlinAlgo;
+            let mut b = pull(input, store, track)?;
+            let el = edge_label.as_deref();
+            // Compute the per-node result once over the whole store (byte-identical to
+            // core — same summation/root rules in `algo`). Component/cluster ids are
+            // the ROOT vertex's external-id STRING (core writes the same), pageRank a
+            // numeric score.
+            let scores: std::collections::HashMap<u32, Value> = match algo {
+                GremlinAlgo::PageRank {
+                    damping,
+                    iterations,
+                } => crate::algo::pagerank(store, el, *damping, *iterations)
+                    .into_iter()
+                    .map(|(v, s)| (v, Value::Num(s)))
+                    .collect(),
+                GremlinAlgo::ConnectedComponent => {
+                    crate::algo::weakly_connected_components(store, el)
+                        .into_iter()
+                        .map(|(v, root)| (v, root_ext_id(store, root)))
+                        .collect()
+                }
+                GremlinAlgo::PeerPressure { iterations } => {
+                    crate::algo::peer_pressure(store, el, *iterations)
+                        .into_iter()
+                        .map(|(v, root)| (v, root_ext_id(store, root)))
+                        .collect()
+                }
+            };
+            let n = b.rows();
+            let col: Vec<Value> = (0..n)
+                .map(|i| match &b.slots[*node_slot] {
+                    Col::Nodes(ids) => scores.get(&ids[i]).cloned().unwrap_or(Value::Null),
+                    _ => Value::Null,
+                })
+                .collect();
+            b.slots.push(Col::Gen(col));
+            b
         }
         Plan::Aggregate { input, keys, aggs } => {
             // Frontier fast path: a scalar count over an Expand chain need not
@@ -4767,6 +4812,13 @@ fn try_fused_count(
 /// result.
 fn scalar_num(x: f64) -> Batch {
     Batch::of(vec![Col::Gen(vec![Value::Num(x)])])
+}
+
+/// A component/cluster id as the ROOT vertex's external-id string — the value core's
+/// `connectedComponent`/`peerPressure` write (`Value::Str(vid.arc(root))`). A root
+/// with no external id (never, for a loaded node) reads back NULL.
+fn root_ext_id(store: &Store, root: u32) -> Value {
+    store.node_ext_id(root).map_or(Value::Null, Value::Str)
 }
 
 /// Collapse a node-id multiset to (distinct ids in first-seen order, their

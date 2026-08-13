@@ -118,6 +118,23 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             let (i, c) = rewrite(*input, idx);
             (Plan::GroupToMap { input: Box::new(i) }, c)
         }
+        Plan::AlgoAnnotate {
+            input,
+            algo,
+            edge_label,
+            node_slot,
+        } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::AlgoAnnotate {
+                    input: Box::new(i),
+                    algo,
+                    edge_label,
+                    node_slot,
+                },
+                c,
+            )
+        }
         Plan::Unwind {
             input,
             list,
@@ -1194,6 +1211,7 @@ fn width(plan: &Plan) -> usize {
         Plan::Project { items, .. } => items.len(),
         Plan::Aggregate { keys, aggs, .. } => keys.len() + aggs.len(),
         Plan::GroupToMap { .. } => 1,
+        Plan::AlgoAnnotate { input, .. } => width(input) + 1,
         Plan::Join { left, right, .. } => width(left) + width(right),
         // UNION's result columns are the LEFT arm's.
         Plan::Union { left, .. } => width(left),
@@ -1640,6 +1658,7 @@ mod tests {
             | Plan::NullPadIfEmpty { input, .. }
             | Plan::OptionalScan { input, .. }
             | Plan::GroupToMap { input }
+            | Plan::AlgoAnnotate { input, .. }
             | Plan::SortLocal { input, .. } => plan_contains_filter(input),
             Plan::Join { left, right, .. } | Plan::Union { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)

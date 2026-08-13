@@ -707,6 +707,54 @@ fn gremlin_parity() {
             false,
             vec![V, HasLabel(vec!["PERSON"]), Values(vec!["name"]), Barrier],
         ),
+        // — OLAP annotate (pageRank / connectedComponent / peerPressure) —
+        c(
+            "pagerank_scores",
+            false,
+            vec![
+                V,
+                PageRank(None),
+                Values(vec!["gremlin.pageRankVertexProgram.pageRank"]),
+            ],
+        ),
+        c(
+            "pagerank_alpha",
+            false,
+            vec![
+                V,
+                PageRank(Some(0.85)),
+                Values(vec!["gremlin.pageRankVertexProgram.pageRank"]),
+            ],
+        ),
+        c(
+            "connected_component_ids",
+            false,
+            vec![
+                V,
+                ConnectedComponent,
+                Values(vec!["gremlin.connectedComponentVertexProgram.component"]),
+            ],
+        ),
+        c(
+            "connected_component_dedup",
+            false,
+            vec![
+                V,
+                ConnectedComponent,
+                Values(vec!["gremlin.connectedComponentVertexProgram.component"]),
+                Dedup,
+            ],
+        ),
+        c(
+            "peer_pressure_clusters",
+            false,
+            vec![
+                V,
+                PeerPressure,
+                Values(vec!["gremlin.peerPressureVertexProgram.cluster"]),
+                Dedup,
+            ],
+        ),
         // — aggregate/store + cap —
         c(
             "aggregate_cap_names",

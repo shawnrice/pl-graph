@@ -110,6 +110,9 @@ pub enum Step {
     Aggregate(&'static str),
     Store(&'static str),
     Cap(&'static str),
+    PageRank(Option<f64>),
+    ConnectedComponent,
+    PeerPressure,
 }
 
 /// A whole traversal: an ordered list of steps.
@@ -258,6 +261,10 @@ fn emit_step(st: &Step) -> String {
         Aggregate(k) => format!("aggregate('{k}')"),
         Store(k) => format!("store('{k}')"),
         Cap(k) => format!("cap('{k}')"),
+        PageRank(Some(a)) => format!("pageRank({a})"),
+        PageRank(None) => "pageRank()".into(),
+        ConnectedComponent => "connectedComponent()".into(),
+        PeerPressure => "peerPressure()".into(),
     }
 }
 
@@ -376,6 +383,9 @@ fn apply_core(t: CTrav, st: &Step) -> CTrav {
         Aggregate(k) => t.aggregate(k),
         Store(k) => t.store(k),
         Cap(k) => t.cap(k),
+        PageRank(a) => t.page_rank(*a),
+        ConnectedComponent => t.connected_component(),
+        PeerPressure => t.peer_pressure(),
     }
 }
 
