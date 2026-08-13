@@ -60,8 +60,6 @@ export const toEngineDialect = (ndjson: string): string =>
 export type Engine = 'core' | 'engine';
 
 export type CompareHandle = {
-  readonly core: Pointer;
-  readonly engine: Pointer;
   vertexCount(e: Engine): number;
   edgeCount(e: Engine): number;
   /** Run a Gremlin query; returns raw JSON text, or null on parse/exec failure. */
@@ -71,6 +69,8 @@ export type CompareHandle = {
   free(): void;
 };
 
+// A comparison surface — an FFI or wasm loader — that builds a paired graph and closes
+// the underlying artifact. Both surfaces implement this so one harness drives either.
 export type Loaded = {
   fromCoreNdjson(coreNdjson: string): CompareHandle;
   close(): void;
@@ -110,8 +110,6 @@ export const loadCompare = (libPath: string = LIB_PATH): Loaded => {
     }
 
     return {
-      core,
-      engine,
       vertexCount: (e) =>
         Number(e === 'core' ? s.lnk_graph_vertex_count(core) : s.lnk_e_graph_vertex_count(engine)),
       edgeCount: (e) =>

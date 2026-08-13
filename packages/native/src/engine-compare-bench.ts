@@ -1,19 +1,22 @@
-import { fixtureNdjson } from './engine-compare-fixture.js';
 // Cross-engine PERF: shipped row-based core vs the standalone columnar engine, same
-// graph, same queries, one artifact, through the FFI. The apples-to-apples answer to
-// "what did the engine work buy us." Correctness is gated separately by
-// `engine-compare.test.ts`; this only times queries whose results already match.
+// graph, same queries, one artifact. The apples-to-apples answer to "what did the engine
+// work buy us." Correctness is gated separately by `engine-compare.test.ts`; this only
+// times queries whose results already match.
 //
-// Build the feature'd artifact first, then run:
+// Build the feature'd artifact(s) first, then run:
 //   cargo build --release --features engine-compare --manifest-path ../../crates/lenke-core/Cargo.toml
-//   bun run src/engine-compare-bench.ts
+//   bun run src/engine-compare-bench.ts                 # FFI (default)
+//   BENCH_SURFACE=wasm bun run src/engine-compare-bench.ts   # wasm (needs the .wasm build)
 // Env: BENCH_N (vertices, default 100000), BENCH_DEG (out-degree, default 4),
-//      BENCH_REPS (timed reps, min taken, default 7).
-import { type Engine, loadCompare } from './engine-compare.js';
+//      BENCH_REPS (timed reps, min taken, default 7), BENCH_SURFACE (ffi | wasm).
+import { fixtureNdjson } from './engine-compare-fixture.js';
+import { loadCompareWasm } from './engine-compare-wasm.js';
+import { type Engine, type Loaded, loadCompare } from './engine-compare.js';
 
 const N = Number(process.env.BENCH_N ?? 100_000);
 const DEG = Number(process.env.BENCH_DEG ?? 4);
 const REPS = Number(process.env.BENCH_REPS ?? 7);
+const SURFACE = process.env.BENCH_SURFACE ?? 'ffi';
 
 // (feature tag, query). Tags group the summary so a regression is attributable.
 const QUERIES: Array<[string, string, 'gremlin' | 'gql']> = [
@@ -63,8 +66,10 @@ const bestOf = (reps: number, fn: () => unknown): number => {
   return best;
 };
 
-const main = (): void => {
-  const lib = loadCompare();
+const main = async (): Promise<void> => {
+  const lib: Loaded = SURFACE === 'wasm' ? await loadCompareWasm() : loadCompare();
+
+  process.stdout.write(`surface: ${SURFACE}\n`);
   process.stdout.write(`building fixture: ${N} vertices, out-degree ${DEG}…\n`);
   const h = lib.fromCoreNdjson(fixtureNdjson(N, DEG));
   const V = h.vertexCount('core');
@@ -117,4 +122,4 @@ const main = (): void => {
   );
 };
 
-main();
+await main();

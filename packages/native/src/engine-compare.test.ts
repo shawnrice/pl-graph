@@ -1,3 +1,4 @@
+import { describe, expect, test } from 'bun:test';
 // Cross-engine CORRECTNESS: the shipped row-based core vs the standalone columnar
 // engine (`lenke-engine`), driven from the SAME graph through one artifact's `lnk_*` /
 // `lnk_e_*` FFI. A broad Gremlin + GQL query set runs on both; results are compared as
@@ -6,10 +7,11 @@
 //
 // Needs a `.so` built WITH the feature (default `bun run build:rust` does NOT include it):
 //   cargo build --release --features engine-compare --manifest-path ../../crates/lenke-core/Cargo.toml
-import { describe, expect, test } from 'bun:test';
+import { existsSync } from 'node:fs';
 
 import { EDGE_CASE_NDJSON, fixtureNdjson } from './engine-compare-fixture.js';
-import { type CompareHandle, loadCompare, norm } from './engine-compare.js';
+import { loadCompareWasm, WASM_PATH } from './engine-compare-wasm.js';
+import { type CompareHandle, type Loaded, loadCompare, norm } from './engine-compare.js';
 
 // Recursively sort object keys, so two documents that differ ONLY in key order
 // normalize equal. Used to prove a divergence is purely ordering, not content.
@@ -130,32 +132,44 @@ const runSuite = (
   });
 };
 
-describe('engine vs core', () => {
-  const lib = loadCompare();
+const runSurface = (surface: string, lib: Loaded): void => {
+  describe(`engine vs core · ${surface}`, () => {
+    // Same vertex/edge counts is the precondition — if the graphs differ, nothing below
+    // is apples-to-apples.
+    const graphs: Array<[string, string]> = [
+      ['edge-case', EDGE_CASE_NDJSON],
+      ['fixture-2k-deg3', fixtureNdjson(2000, 3)],
+    ];
 
-  // Same vertex/edge counts is the precondition — if the graphs differ, nothing below
-  // is apples-to-apples.
-  const graphs: Array<[string, string]> = [
-    ['edge-case', EDGE_CASE_NDJSON],
-    ['fixture-2k-deg3', fixtureNdjson(2000, 3)],
-  ];
+    for (const [name, ndjson] of graphs) {
+      const h = lib.fromCoreNdjson(ndjson);
 
-  for (const [name, ndjson] of graphs) {
-    const h = lib.fromCoreNdjson(ndjson);
-    test(`${name}: identical vertex/edge counts`, () => {
-      expect(h.vertexCount('engine')).toBe(h.vertexCount('core'));
-      expect(h.edgeCount('engine')).toBe(h.edgeCount('core'));
-    });
+      test(`${name}: identical vertex/edge counts`, () => {
+        expect(h.vertexCount('engine')).toBe(h.vertexCount('core'));
+        expect(h.edgeCount('engine')).toBe(h.edgeCount('core'));
+      });
 
-    // The edge-case graph has no Person/VIP labels, so only run the labelled suites on
-    // the fixture; run label-agnostic Gremlin structure on both.
-    if (name === 'fixture-2k-deg3') {
-      runSuite(name, h, 'gremlin', gremlinQueries());
-      runSuite(name, h, 'gql', gqlQueries());
-      knownDivergences(h);
+      // The edge-case graph has no Person/VIP labels, so only run the labelled suites on
+      // the fixture; run label-agnostic Gremlin structure on both.
+      if (name === 'fixture-2k-deg3') {
+        runSuite(name, h, 'gremlin', gremlinQueries());
+        runSuite(name, h, 'gql', gqlQueries());
+        knownDivergences(h);
+      }
     }
-  }
-});
+  });
+};
+
+// FFI is always available (the test's .so is the same artifact). wasm runs the identical
+// comparison inside a WebAssembly instance — but only if the feature'd .wasm has been
+// built, so a repo without it skips the wasm surface rather than failing.
+runSurface('ffi', loadCompare());
+
+if (existsSync(WASM_PATH)) {
+  runSurface('wasm', await loadCompareWasm());
+} else {
+  test.skip('wasm surface (build the engine-compare .wasm to enable)', () => {});
+}
 
 // The comparison surfaced exactly two engine-vs-core differences, both understood and
 // documented here rather than papered over — a drop-in must either match core or have a
