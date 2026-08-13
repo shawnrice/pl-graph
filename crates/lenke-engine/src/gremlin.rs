@@ -5343,6 +5343,42 @@ impl Parser {
                 plan
             });
         }
+        // A fixed-`times` walk carrying an inner `.as('tag')` UNROLLS into N explicit
+        // hops, so the tag binds once PER ITERATION (a distinct slot each), which is what
+        // select(Pop.first/all, 'tag') reads (first binding / every binding as a list).
+        // A single VarLength endpoint would bind the tag ONCE. Only the plain fixed walk
+        // unrolls — a variable emit/until/body-filter/loops-cap walk keeps the VarLength
+        // and binds just the endpoint.
+        if let (Some(tag), false, Some(n)) = (ctx.bind_tag.as_ref(), ctx.min_one, ctx.times) {
+            if n >= 1
+                && ctx.until.is_none()
+                && ctx.body_filter.is_none()
+                && ctx.max_cap.is_none()
+            {
+                let etypes = etypes_of(ctx.label.as_deref());
+                let tag = tag.clone();
+                self.slots = ctx.out_slot; // reclaim the pre-allocated endpoint slot
+                let mut p = plan;
+                let mut cur = ctx.from;
+                for _ in 0..n {
+                    let landed = self.slots;
+                    p = if matches!(ctx.dir, Dir::Both) {
+                        p.expand_both_gremlin(cur, &etypes)
+                    } else {
+                        p.expand(cur, ctx.dir, &etypes)
+                    };
+                    self.slots += 1;
+                    self.first_labels.entry(tag.clone()).or_insert(landed);
+                    self.all_labels.entry(tag.clone()).or_default().push(landed);
+                    self.labels.insert(tag.clone(), landed);
+                    cur = landed;
+                }
+                self.current = cur;
+                self.slots = cur + 1;
+                self.path_ok = ctx.path_ok_at_open;
+                return Ok(p);
+            }
+        }
         // An `until(pred)` walk runs to the cap (or `times`), emitting only on a match:
         // pre-form is while-do (min 0 — a source may satisfy `pred`), post-form do-while
         // (min 1). Otherwise `times`/`emit` decide the bounds as before.
