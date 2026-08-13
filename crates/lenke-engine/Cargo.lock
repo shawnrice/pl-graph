@@ -61,6 +61,7 @@ name = "lenke-engine"
 version = "0.0.0"
 dependencies = [
  "lenke-core",
+ "regex",
  "serde_json",
 ]
 

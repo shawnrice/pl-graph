@@ -3317,7 +3317,9 @@ impl Parser {
     /// (membership, an OR-of-equals and its negation), or a bare literal
     /// (equality). Shared by `has(...)` and `where(...)`.
     fn predicate_expr(&mut self, left: Expr) -> Result<Expr, String> {
-        if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("P")) {
+        // Strip a `P.` / `TextP.` namespace prefix (`has('n', TextP.regex('^r'))`).
+        if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("P") || s.eq_ignore_ascii_case("TextP"))
+        {
             self.pos += 1;
             self.expect(&Tok::Dot)?;
         }
@@ -3389,6 +3391,22 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 return Ok(Expr::Call {
                     name: fname.to_string(),
+                    args: vec![left, Expr::Lit(val)],
+                });
+            }
+            // `regex(pattern)` / `TextP.regex(pattern)`: a `regex_match` call. The
+            // pattern is validated at PARSE time (like core), so a bad pattern is a
+            // parse error rather than a silent no-match at runtime.
+            if op_name == "regex" {
+                let val = self.literal()?;
+                self.expect(&Tok::RParen)?;
+                if let Value::Str(p) = &val {
+                    regex::Regex::new(p).map_err(|e| format!("regex: invalid pattern: {e}"))?;
+                } else {
+                    return Err("regex(pattern): pattern must be a string".into());
+                }
+                return Ok(Expr::Call {
+                    name: "regex_match".to_string(),
                     args: vec![left, Expr::Lit(val)],
                 });
             }

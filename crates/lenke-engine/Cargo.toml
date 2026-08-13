@@ -16,6 +16,17 @@ crate-type = ["lib"]
 
 [dependencies]
 
+# The Gremlin `regex()` / `TextP.regex()` predicate. The ONE runtime dependency:
+# byte-identity with core's regex predicate requires the SAME engine, so the crate
+# and its feature set mirror lenke-core exactly (linear-time, no backreferences/
+# lookaround; a trimmed unicode set — `unicode-perl` + `unicode-case`). Everything
+# else in this crate stays std-only.
+regex = { version = "1", default-features = false, features = [
+  "std",
+  "unicode-perl",
+  "unicode-case",
+] }
+
 # lenke-core is a dev-only dependency: the J1 cross-engine conformance suite
 # (tests/conformance.rs) loads an identical fixture into BOTH engines and asserts
 # equal result multisets. A dev-dependency compiles only for the test build, so

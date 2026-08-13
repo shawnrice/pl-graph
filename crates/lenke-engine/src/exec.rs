@@ -8334,6 +8334,7 @@ fn call_scalar(name: &str, args: &[Value]) -> Value {
         "starts_with" => str_bool(&args[0], &args[1], |s, sub| s.starts_with(sub)),
         "ends_with" => str_bool(&args[0], &args[1], |s, sub| s.ends_with(sub)),
         "contains" => str_bool(&args[0], &args[1], |s, sub| s.contains(sub)),
+        "regex_match" => regex_match(&args[0], &args[1]),
         // replace(s, from[, to]) — `to` defaults to "" (core); an EMPTY search
         // returns the string unchanged (core), NOT Rust's insert-everywhere.
         "replace" => match (&args[0], &args[1]) {
@@ -8677,6 +8678,37 @@ fn str_bool(a: &Value, b: &Value, f: impl Fn(&str, &str) -> bool) -> Value {
         (Value::Str(s), Value::Str(sub)) => Value::Bool(f(s, sub)),
         _ => Value::Null,
     }
+}
+
+thread_local! {
+    /// Compiled-regex cache for the Gremlin `regex()` predicate, bounded like core's.
+    static REGEX_CACHE: std::cell::RefCell<std::collections::HashMap<String, regex::Regex>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// `regex_match(value, pattern)` → Gremlin `regex(pattern)`: true when `value` is a
+/// string the pattern finds a match in. A non-string is false; an invalid pattern
+/// (already rejected at parse time) is false. Byte-identical to core's `regex_is_match`
+/// — same `regex` crate, same bounded thread-local cache.
+fn regex_match(v: &Value, pat: &Value) -> Value {
+    let (Value::Str(s), Value::Str(p)) = (v, pat) else {
+        return Value::Bool(false);
+    };
+    REGEX_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if !cache.contains_key(p.as_ref()) {
+            if cache.len() >= 1000 {
+                cache.clear();
+            }
+            match regex::Regex::new(p) {
+                Ok(re) => {
+                    cache.insert(p.to_string(), re);
+                }
+                Err(_) => return Value::Bool(false),
+            }
+        }
+        Value::Bool(cache.get(p.as_ref()).is_some_and(|re| re.is_match(s)))
+    })
 }
 
 /// Slice `s` by UTF-16 code UNITS `[start, start+len)` (JS `String.slice` /
