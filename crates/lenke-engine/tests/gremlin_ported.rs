@@ -245,13 +245,30 @@ fn assert_engine_matches(query: &str, core_res: &[GVal], store: &lenke_engine::s
 
 /// Build once, run on BOTH engines, assert they agree, return core's result for the
 /// test body's own `assert_eq!`.
-fn q(t: dual::Traversal) -> Vec<GVal> {
-    let query = t.query();
-    let mut g = core_graph();
-    let store = engine_store();
-    let core_res = t.run(&mut g);
-    assert_engine_matches(&query, &core_res, &store, &g);
-    core_res
+/// `q(t)` accepts EITHER a builder `dual::Traversal` or a string-parsed `ParsedT`
+/// (some tests do `q(parse("…").unwrap())`); both run on core, dual-check the engine,
+/// and return core's result.
+trait DualRun {
+    fn dual_run(self) -> Vec<GVal>;
+}
+impl DualRun for dual::Traversal {
+    fn dual_run(self) -> Vec<GVal> {
+        let query = self.query();
+        let mut g = core_graph();
+        let store = engine_store();
+        let core_res = self.run(&mut g);
+        assert_engine_matches(&query, &core_res, &store, &g);
+        core_res
+    }
+}
+impl DualRun for ParsedT {
+    fn dual_run(self) -> Vec<GVal> {
+        let mut g = core_graph();
+        self.run(&mut g)
+    }
+}
+fn q<T: DualRun>(t: T) -> Vec<GVal> {
+    t.dual_run()
 }
 
 // A dual-running `super::parse(...)` replacement: parses on core (so `.unwrap()`/
@@ -360,6 +377,13 @@ fn try_run(
 
 fn results_to_json(g: &lenke_core::graph::Graph, vals: &[GVal]) -> String {
     lenke_core::gremlin::exec::results_to_json(g, vals)
+}
+
+/// Core's infallible plan runner (`super::run` in divergence_tests): yields empty on a
+/// fault. Core-only (fault behavior is not dual-checked).
+#[allow(dead_code)]
+fn run_faultless(g: &mut lenke_core::graph::Graph, t: &impl CoreRef) -> Vec<GVal> {
+    lenke_core::gremlin::exec::run(g, t.cref())
 }
 
 // ── core's Gremlin tests, ported verbatim (bodies unchanged; builder/helpers shimmed) ──
@@ -1456,6 +1480,107 @@ fn qs_eids(query: &str) -> Vec<GVal> {
 /// Sorted string results (order-independent).
 fn sorted(r: Vec<GVal>) -> Vec<String> {
     let mut v: Vec<String> = r.iter().map(s).collect();
+    v.sort();
+    v
+}
+
+// ── divergence_tests fixtures + helpers (custom graphs, dual-driven) ─────────
+
+#[allow(dead_code)]
+fn bucket_fixture() -> Graph {
+    let mut lines = String::new();
+    for (i, l) in [r#"["V","W"]"#, r#"["V"]"#, r#"["V"]"#, r#"["V"]"#]
+        .iter()
+        .enumerate()
+    {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{i}}}}}\n"
+        ));
+    }
+    for (i, (from, to, t)) in [(0, 1, "R"), (1, 2, "R"), (2, 2, "R"), (0, 2, "S")]
+        .iter()
+        .enumerate()
+    {
+        lines.push_str(&format!(
+            "{{\"type\":\"edge\",\"id\":\"e{i}\",\"from\":\"n{from}\",\"to\":\"n{to}\",\"labels\":[\"{t}\"],\"properties\":{{}}}}\n"
+        ));
+    }
+    ndjson::decode(&lines).expect("fixture decodes")
+}
+
+#[allow(dead_code)]
+fn presence_fixture() -> Graph {
+    let lines = [
+        r#"{"type":"node","id":"n0","labels":["V"],"properties":{"a":1,"b":2}}"#,
+        r#"{"type":"node","id":"n1","labels":["V"],"properties":{"a":3}}"#,
+        r#"{"type":"node","id":"n2","labels":["V"],"properties":{"a":null}}"#,
+        r#"{"type":"node","id":"n3","labels":["V"],"properties":{}}"#,
+        r#"{"type":"edge","id":"e0","from":"n0","to":"n1","labels":["R"],"properties":{"w":1}}"#,
+        r#"{"type":"edge","id":"e1","from":"n1","to":"n2","labels":["R"],"properties":{}}"#,
+    ]
+    .join("\n");
+    ndjson::decode(&lines).expect("fixture decodes")
+}
+
+#[allow(dead_code)]
+fn grouped_fold_fixture() -> Graph {
+    let lines = [
+        r#"{"type":"node","id":"n0","labels":["V"],"properties":{"k":"a","v":1}}"#,
+        r#"{"type":"node","id":"n1","labels":["V"],"properties":{"k":"a","v":2}}"#,
+        r#"{"type":"node","id":"n2","labels":["V"],"properties":{"k":"b","v":10}}"#,
+        r#"{"type":"node","id":"n3","labels":["V"],"properties":{"k":"b"}}"#,
+        r#"{"type":"node","id":"n4","labels":["V"],"properties":{"v":100}}"#,
+        r#"{"type":"node","id":"n5","labels":["V"],"properties":{}}"#,
+        r#"{"type":"node","id":"n6","labels":["V"],"properties":{"k":null,"v":7}}"#,
+        r#"{"type":"node","id":"n7","labels":["V"],"properties":{"k":"z","v":null}}"#,
+        r#"{"type":"node","id":"n8","labels":["V"],"properties":{"k":"z","v":null}}"#,
+        r#"{"type":"node","id":"n9","labels":["V"],"properties":{"k":"s","v":"text"}}"#,
+        r#"{"type":"node","id":"n10","labels":["V"],"properties":{"k":"s","v":4}}"#,
+        r#"{"type":"node","id":"n11","labels":["V"],"properties":{"k":"f","v":1e16}}"#,
+        r#"{"type":"node","id":"n12","labels":["V"],"properties":{"k":"f","v":1}}"#,
+        r#"{"type":"node","id":"n13","labels":["V"],"properties":{"k":"f","v":1}}"#,
+        r#"{"type":"edge","id":"e0","from":"n0","to":"n1","labels":["R"],"properties":{"ek":"x","ev":3}}"#,
+        r#"{"type":"edge","id":"e1","from":"n1","to":"n2","labels":["R"],"properties":{"ek":"x","ev":4}}"#,
+        r#"{"type":"edge","id":"e2","from":"n2","to":"n0","labels":["R"],"properties":{"ek":"y"}}"#,
+    ]
+    .join("\n");
+    ndjson::decode(&lines).expect("fixture decodes")
+}
+
+/// Run a count query on a custom graph (dual-checked) and read its single number.
+#[allow(dead_code)]
+fn count_of(g: &mut Graph, src: &str) -> f64 {
+    one_num(parse(src).unwrap_or_else(|e| panic!("`{src}` parses: {e}")).run(g))
+}
+
+/// Assert a traversal agrees with its `fold().unfold()`-streamed spelling (core-side;
+/// each run is also dual-checked against the engine).
+#[allow(dead_code)]
+fn same_via_stream(g: &mut Graph, src: &str) {
+    let column = parse(src).unwrap_or_else(|e| panic!("`{src}` parses: {e}")).run(g);
+    let (head, tail) = src.split_once('.').expect("a traversal has a step");
+    let streamed_src = format!("{head}.{}", tail.replacen('.', ".fold().unfold().", 1));
+    let streamed = parse(&streamed_src)
+        .unwrap_or_else(|e| panic!("`{streamed_src}` parses: {e}"))
+        .run(g);
+    assert_eq!(
+        format!("{column:?}"),
+        format!("{streamed:?}"),
+        "`{src}` disagreed with its streamed spelling `{streamed_src}`"
+    );
+    assert!(!column.is_empty(), "`{src}` returned nothing to compare");
+}
+
+/// Sorted string results, non-strings rendered debug (divergence_tests' `sorted_names`).
+#[allow(dead_code)]
+fn sorted_names(r: Vec<GVal>) -> Vec<String> {
+    let mut v: Vec<String> = r
+        .iter()
+        .map(|g| match g {
+            GVal::Str(s) => s.to_string(),
+            other => format!("{other:?}"),
+        })
+        .collect();
     v.sort();
     v
 }
@@ -7377,5 +7502,882 @@ fn p6_identity_equals_v() {
     let with_identity = ordered(q(g().V().identity().id()));
     let direct = ordered(q(g().V().id()));
     assert_eq!(with_identity, direct);
+}
+
+// ==== 41 tests from divergence_tests.rs ====
+#[test]
+fn min_skips_nulls() {
+    let r = g()
+        .inject([GVal::Null, GVal::Num(10.0), GVal::Num(9.0), GVal::Null])
+        .min();
+    assert_eq!(one_num(q(r)), 9.0);
+}
+
+#[test]
+fn max_skips_nulls() {
+    let r = g()
+        .inject([GVal::Null, GVal::Num(10.0), GVal::Num(9.0), GVal::Null])
+        .max();
+    assert_eq!(one_num(q(r)), 10.0);
+}
+
+#[test]
+fn min_all_null_is_null() {
+    let r = g().inject([GVal::Null, GVal::Null]).min();
+    assert!(matches!(q(r).as_slice(), [GVal::Null]));
+}
+
+#[test]
+fn sum_all_null_is_null() {
+    let r = g().inject([GVal::Null, GVal::Null]).sum();
+    assert!(matches!(q(r).as_slice(), [GVal::Null]));
+}
+
+#[test]
+fn mean_all_null_is_null() {
+    let r = g().inject([GVal::Null]).mean();
+    assert!(matches!(q(r).as_slice(), [GVal::Null]));
+}
+
+#[test]
+fn e_external_id_resolves() {
+    let r = g().e_ids(&["e0"]);
+    assert_eq!(q(r).len(), 1);
+}
+
+#[test]
+fn has_key_on_property_stream() {
+    // marko has name + age; hasKey("name") keeps just the name property.
+    let r = g().v_ids(&["1"]).properties(&[]).has_key(&["name"]);
+    assert_eq!(q(r).len(), 1);
+}
+
+#[test]
+fn dedup_multi_by_keys_on_full_tuple() {
+    // lop and ripple share lang=java but differ on name.
+    let by_lang = g().v_ids(&["3", "5"]).dedup().by("lang");
+    assert_eq!(q(by_lang).len(), 1);
+
+    let by_lang_name = g().v_ids(&["3", "5"]).dedup().by("lang").by("name");
+    assert_eq!(q(by_lang_name).len(), 2);
+}
+
+#[test]
+fn value_identity_on_non_property() {
+    let r = g().inject([GVal::Num(5.0)]).value();
+    assert_eq!(one_num(q(r)), 5.0);
+}
+
+#[test]
+fn property_drops_non_element() {
+    let r = g().inject([GVal::Num(5.0)]).property("k", GVal::Num(1.0));
+    assert!(q(r).is_empty());
+}
+
+#[test]
+fn repeat_until_loops_stops_after_first_pass() {
+    // loops()==2 fires one body pass in: marko's neighbors, not their neighbors.
+    let r = g()
+        .v_ids(&["1"])
+        .repeat(__().out(&[]))
+        .until(__().loops().is(P::eq(2)))
+        .values(&["name"]);
+    assert_eq!(sorted_names(q(r)), vec!["josh", "lop", "vadas"]);
+}
+
+#[test]
+fn textual_until_before_repeat_attaches() {
+    // Same fix, the other pre-form modulator: `until(cond).repeat(out())` — until
+    // precedes its repeat and must ATTACH (stop at the first match), not be
+    // dropped and run to natural termination. From marko, until(name=josh) stops
+    // the walk at josh; without the fix it'd drop until and yield the final
+    // frontier (["lop","ripple"]).
+    let t =
+        parse("g.V('1').until(has('name','josh')).repeat(out()).values('name')").unwrap();
+    assert_eq!(sorted_names(q(t)), vec!["josh"]);
+}
+
+#[test]
+fn repeat_until_post_form_is_do_while() {
+    // From marko (a PERSON): the body runs once → out('KNOWS') → josh, vadas (both
+    // PERSON → satisfy until and exit). The old while-do returned [marko].
+    let built = q(dual::g()
+        .v_ids(&["1"])
+        .repeat(__().out(&["KNOWS"]))
+        .until(__().has_label(&["PERSON"]))
+        .values(&["name"]));
+    assert_eq!(sorted_names(built), vec!["josh", "vadas"]);
+
+    // Textual post-form is byte-identical to the builder.
+    let t = parse("g.V('1').repeat(out('KNOWS')).until(hasLabel('PERSON')).values('name')")
+        .unwrap();
+    assert_eq!(sorted_names(q(t)), vec!["josh", "vadas"]);
+
+    // Pre-form `until(cond).repeat(body)` is while-do → marko exits before the body.
+    let pre =
+        parse("g.V('1').until(hasLabel('PERSON')).repeat(out('KNOWS')).values('name')")
+            .unwrap();
+    assert_eq!(sorted_names(q(pre)), vec!["marko"]);
+}
+
+#[test]
+fn order_local_ranks_group_map_by_value() {
+    // Builder form: groupCount → Map{PERSON:4, SOFTWARE:2}; order(local) by value desc.
+    let out = q(dual::g()
+        .V()
+        .group_count()
+        .by_label()
+        .order_local()
+        .by_identity_dir(Order::Desc));
+    let entries = match &out[0] {
+        GVal::Map(e) => e,
+        _ => panic!("expected a Map, got {out:?}"),
+    };
+    let got: Vec<(String, f64)> = entries
+        .iter()
+        .map(|(k, v)| {
+            (
+                match k {
+                    GVal::Str(s) => s.to_string(),
+                    _ => panic!("non-string key"),
+                },
+                match v {
+                    GVal::Num(n) => *n,
+                    _ => panic!("non-number value"),
+                },
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![("PERSON".to_string(), 4.0), ("SOFTWARE".to_string(), 2.0)]
+    );
+
+    // Textual form must parse to the same thing (Scope.local routing on `order`).
+    let t =
+        parse("g.V().groupCount().by(T.label).order(Scope.local).by(Order.desc)").unwrap();
+    assert_eq!(q(t), out);
+}
+
+#[test]
+fn order_local_sorts_a_folded_list() {
+    let t =
+        parse("g.V().hasLabel('PERSON').values('age').fold().order(Scope.local)").unwrap();
+    let out = q(t);
+    let nums: Vec<f64> = match &out[0] {
+        GVal::List(xs) => xs
+            .iter()
+            .map(|x| match x {
+                GVal::Num(n) => *n,
+                _ => panic!("non-number"),
+            })
+            .collect(),
+        _ => panic!("expected a List, got {out:?}"),
+    };
+    assert_eq!(nums, vec![27.0, 29.0, 32.0, 35.0]);
+}
+
+#[test]
+fn group_reducing_value_by_folds_the_group() {
+    let entries = |out: &[GVal]| -> Vec<(GVal, GVal)> {
+        match out.first() {
+            Some(GVal::Map(e)) => e.clone().into_pairs(),
+            other => panic!("expected a Map, got {other:?}"),
+        }
+    };
+    let get = |es: &[(GVal, GVal)], k: &str| -> GVal {
+        es.iter()
+            .find(|(key, _)| matches!(key, GVal::Str(s) if &**s == k))
+            .map(|(_, v)| v.clone())
+            .unwrap_or(GVal::Null)
+    };
+
+    // by(count()) → a per-bucket count; the textual form is byte-identical.
+    let by_count = q(dual::g().V().group().by_label().by_t(dual::__().count()));
+    let es = entries(&by_count);
+    assert_eq!(get(&es, "PERSON"), GVal::Num(4.0));
+    assert_eq!(get(&es, "SOFTWARE"), GVal::Num(2.0));
+    assert_eq!(
+        q(parse("g.V().group().by(T.label).by(count())").unwrap()),
+        by_count
+    );
+
+    // by(values('age').sum()) → sum per bucket; SOFTWARE has no ages → Null.
+    let by_sum = q(dual::g()
+        .V()
+        .group()
+        .by_label()
+        .by_t(dual::__().values(&["age"]).sum()));
+    let es = entries(&by_sum);
+    assert_eq!(get(&es, "PERSON"), GVal::Num(123.0));
+    assert_eq!(get(&es, "SOFTWARE"), GVal::Null);
+
+    // A mapping value-by (a plain key) still collects a list (unchanged).
+    let by_name = q(dual::g().V().group().by_label().by("name"));
+    assert!(matches!(get(&entries(&by_name), "SOFTWARE"), GVal::List(v) if v.len() == 2));
+}
+
+#[test]
+fn repeat_emit_loops_predicate_offset() {
+    // emit(loops().is(gt(1))) emits both body levels of a times(3) walk.
+    let r = g()
+        .v_ids(&["1"])
+        .repeat(__().out(&[]))
+        .times(3)
+        .emit(__().loops().is(P::gt(1)))
+        .values(&["name"]);
+    assert_eq!(
+        sorted_names(q(r)),
+        vec!["josh", "lop", "lop", "ripple", "vadas"]
+    );
+}
+
+/// `id()` / `label()` on a PATH is an error, and one raised from the PLAN.
+///
+/// This reverses what this test used to assert. It required null, on the
+/// grounds that the TS engine returned null too — which it did, so the engines
+/// agreed with each other and with nothing else. TinkerPop types
+/// `IdStep<S extends Element>` and does `traverser.get().id()`, so on a path the
+/// erased generic gives a bare `ClassCastException` ("ImmutablePath cannot be
+/// cast to ...Element"). A path has no id and no label; answering null said it
+/// had one, and it was null.
+///
+/// Raised from the step list before any walk, because it is a property of the
+/// plan: `path().id()` cannot succeed on any graph, so there is nothing to
+/// evaluate. `DataException`, not `Syntax` (the traversal parses) and not
+/// `InvalidValue` (a path is a perfectly good value that has no id) — the same
+/// code the TS engine raises from the same check.
+#[test]
+fn id_of_a_path_faults_from_the_plan() {
+    let mut graph = modern();
+
+    for t in [g().E().path().id(), g().E().path().label()] {
+        let err = try_run(&mut graph, &t).expect_err("a path has no id or label");
+
+        assert_eq!(err.code, lenke_core::error_codes::ErrorCode::DataException);
+        assert!(
+            err.message.contains("not an element"),
+            "the message must say why: {}",
+            err.message
+        );
+    }
+
+    // Through steps that hand the value on unchanged, the path is still a path.
+    assert!(try_run(&mut graph, &g().E().path().limit(2).id()).is_err());
+
+    // But `unfold()` turns it into its ELEMENTS, and those do have ids — so the
+    // check must not simply look for a later `id()`.
+    let unfolded = try_run(&mut graph, &g().E().path().unfold().id())
+        .expect("elements of a path have ids");
+
+    assert!(
+        unfolded.iter().all(|v| matches!(v, GVal::Str(_))),
+        "got {unfolded:?}"
+    );
+}
+
+/// The fault reaches the caller through whatever follows it.
+///
+/// This test previously asserted the OPPOSITE — that summing the ids of paths
+/// was an all-null fold and explicitly "not a fault" — which is the decision
+/// reversed above. A terminal downstream must not swallow it: the plan is
+/// unsatisfiable whatever `sum()` would have done with the nulls.
+#[test]
+fn a_plan_fault_survives_the_steps_after_it() {
+    let mut graph = modern();
+
+    for t in [
+        g().E().path().id().sum(),
+        g().E().path().id().count(),
+        g().E().path().id().fold(),
+    ] {
+        assert_eq!(
+            try_run(&mut graph, &t).map(|_| ()).unwrap_err().code,
+            lenke_core::error_codes::ErrorCode::DataException
+        );
+    }
+
+    // `run` is infallible and cannot say why, so it yields nothing rather than
+    // an answer that was never computable.
+    assert!(run_faultless(&mut graph, &g().E().path().id().sum()).is_empty());
+}
+
+#[test]
+fn id_of_a_real_element_still_reports_it() {
+    // The null case must not swallow the real one.
+    let ids = q(g().V().has_label(&["SOFTWARE"]).id());
+    assert_eq!(ids.len(), 2);
+    assert!(ids.iter().all(|v| matches!(v, GVal::Str(_))), "got {ids:?}");
+}
+
+/// Naming several edge labels is a disjunction over ONE edge, not a walk per
+/// name — an edge labelled `[R, S]` must traverse ONCE under `outE('R','S')`.
+///
+/// The TS engine buckets an edge under every label it carries and walked one
+/// bucket per named label, so it emitted that edge twice while this engine (one
+/// adjacency pass, an any-of predicate) emitted it once. Same shape as the GQL
+/// `[:R|S]` double-count. Pinned on both sides.
+#[test]
+fn naming_several_edge_labels_traverses_a_multi_label_edge_once() {
+    let mut g = lenke_core::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{}}"#,
+            r#"{"type":"edge","id":"e0","from":"a","to":"b","labels":["R","S"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    let n = |t: dual::Traversal, g: &mut lenke_core::graph::Graph| t.count().run(g);
+    let one = vec![GVal::Num(1.0)];
+
+    // Every spelling that selects this edge selects it exactly once.
+    assert_eq!(n(dual::g().v_ids(&["a"]).out_e(&["R"]), &mut g), one);
+    assert_eq!(n(dual::g().v_ids(&["a"]).out_e(&["S"]), &mut g), one);
+    assert_eq!(n(dual::g().v_ids(&["a"]).out_e(&[]), &mut g), one);
+    assert_eq!(
+        n(dual::g().v_ids(&["a"]).out_e(&["R", "S"]), &mut g),
+        one,
+        "`outE('R','S')` walked the edge once per matching label"
+    );
+    assert_eq!(n(dual::g().v_ids(&["a"]).out(&["R", "S"]), &mut g), one);
+
+    // ...in both directions, and for `both`, which sees it from each end once.
+    assert_eq!(n(dual::g().v_ids(&["b"]).in_e(&["R", "S"]), &mut g), one);
+    assert_eq!(n(dual::g().v_ids(&["a"]).both_e(&["R", "S"]), &mut g), one);
+    assert_eq!(n(dual::g().v_ids(&["b"]).both_e(&["R", "S"]), &mut g), one);
+
+    // A name no edge carries contributes nothing rather than suppressing the rest.
+    assert_eq!(
+        n(dual::g().v_ids(&["a"]).out_e(&["R", "ABSENT"]), &mut g),
+        one
+    );
+    assert_eq!(
+        n(dual::g().v_ids(&["a"]).out_e(&["ABSENT"]), &mut g),
+        vec![GVal::Num(0.0)]
+    );
+}
+
+/// `out(T).count()` is the size of the T bucket — one traverser per edge.
+#[test]
+fn counting_a_bare_hop_is_the_edge_bucket() {
+    let mut g = bucket_fixture();
+
+    assert_eq!(count_of(&mut g, "g.V().out('R').count()"), 3.0);
+    assert_eq!(count_of(&mut g, "g.V().in('R').count()"), 3.0);
+    assert_eq!(count_of(&mut g, "g.V().out('S').count()"), 1.0);
+    assert_eq!(count_of(&mut g, "g.V().out('R','S').count()"), 4.0);
+}
+
+/// The self-loop is ONE out-edge of one vertex, so the bucket length is right;
+/// `both()` sees it from both ends and the bucket length is not, which is why
+/// that direction takes the walk.
+#[test]
+fn an_undirected_hop_count_is_not_the_bucket_length() {
+    let mut g = bucket_fixture();
+
+    // n0-n1, n1-n2, n2-n2 seen from each end: 2 + 2 + 2.
+    assert_eq!(count_of(&mut g, "g.V().both('R').count()"), 6.0);
+}
+
+/// A filter before the hop means the traversers are not the whole universe, so
+/// the shortcut must not fire. Both of these once counted the bucket.
+#[test]
+fn a_filtered_hop_count_is_not_the_bucket_length() {
+    let mut g = bucket_fixture();
+
+    // Only n0 is a W, and it has one R out-edge.
+    assert_eq!(
+        count_of(&mut g, "g.V().hasLabel('W').out('R').count()"),
+        1.0
+    );
+    assert_eq!(count_of(&mut g, "g.V().has('n', 1).out('R').count()"), 1.0);
+}
+
+/// `dedup()` after the hop counts distinct FAR ENDS, which is a different
+/// question from how many edges there are: n1 and n2 are each landed on twice
+/// across `R`'s three edges — n2 by `n1->n2` and by its own self-loop.
+#[test]
+fn a_deduped_hop_count_is_not_the_bucket_length() {
+    let mut g = bucket_fixture();
+
+    assert_eq!(count_of(&mut g, "g.V().out('R').dedup().count()"), 2.0);
+}
+
+/// A type no edge carries is zero, not "any type".
+#[test]
+fn counting_a_hop_of_an_unknown_type_is_zero() {
+    let mut g = bucket_fixture();
+
+    assert_eq!(count_of(&mut g, "g.V().out('NOPE').count()"), 0.0);
+    assert_eq!(count_of(&mut g, "g.V().out('NOPE','R').count()"), 3.0);
+}
+
+/// A second hop is not a bucket length — it depends on the far ends' degrees.
+#[test]
+fn counting_two_hops_is_not_the_bucket_length() {
+    let mut g = bucket_fixture();
+
+    // n0->n1->n2, n1->n2->n2, n2->n2->n2.
+    assert_eq!(count_of(&mut g, "g.V().out('R').out('R').count()"), 3.0);
+}
+
+#[test]
+fn element_map_off_a_frontier_matches_the_stream() {
+    let mut g = modern();
+
+    same_via_stream(&mut g, "g.V().elementMap()");
+    same_via_stream(&mut g, "g.V().elementMap('name')");
+    // An edge map carries the IN/OUT endpoint stubs as well.
+    same_via_stream(&mut g, "g.E().elementMap()");
+    same_via_stream(&mut g, "g.V().hasLabel('PERSON').elementMap('name','age')");
+    // A key nothing carries is absent, not null.
+    same_via_stream(&mut g, "g.V().elementMap('nope')");
+}
+
+#[test]
+fn project_off_a_frontier_matches_the_stream() {
+    let mut g = modern();
+
+    same_via_stream(&mut g, "g.V().project('name').by('name')");
+    same_via_stream(&mut g, "g.V().project('name','age').by('name').by('age')");
+    // Fewer `by()`s than keys: the rest project the element itself.
+    same_via_stream(&mut g, "g.V().project('self','name').by().by('name')");
+    same_via_stream(&mut g, "g.V().project('self')");
+    // A key nothing carries.
+    same_via_stream(&mut g, "g.V().project('nope').by('nope')");
+    // A sub-traversal `by()` is not a column and stays on the stream — the two
+    // spellings must still agree, which is what says the guard declines rather
+    // than mis-reads it.
+    same_via_stream(&mut g, "g.V().project('out').by(__.out().count())");
+    same_via_stream(&mut g, "g.V().project('id').by(__.id())");
+    same_via_stream(
+        &mut g,
+        "g.E().project('label','weight').by(__.label()).by('weight')",
+    );
+}
+
+/// A hop between the source and the LIMIT means the cap is not the scan's — the
+/// frontier it bounds is the one AFTER the walk.
+#[test]
+fn a_limit_past_a_hop_does_not_cap_the_scan() {
+    let mut lines = String::new();
+
+    // Every edge leaves the LAST vertex. A scan capped at 3 would keep the first
+    // three, which have no out-edges at all, and answer 0 where the right answer
+    // is 3 — the fixture has to put the edges where a wrongly capped scan cannot
+    // reach them, or capping and not capping agree by luck.
+    for i in 0..4usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{{}}}}\n"
+        ));
+    }
+    for (i, (a, b)) in [(3, 0), (3, 1), (3, 2), (3, 3)].iter().enumerate() {
+        lines.push_str(&format!(
+            "{{\"type\":\"edge\",\"id\":\"e{i}\",\"from\":\"n{a}\",\"to\":\"n{b}\",\"labels\":[\"R\"],\"properties\":{{}}}}\n"
+        ));
+    }
+
+    let mut g = lenke_core::ndjson::decode(&lines).expect("fixture decodes");
+
+    // Four edges, so four traversers land; the limit takes three of them.
+    assert_eq!(count_of(&mut g, "g.V().out('R').limit(3).count()"), 3.0);
+    assert_eq!(count_of(&mut g, "g.V().out('R').limit(10).count()"), 4.0);
+    assert_eq!(count_of(&mut g, "g.V().out('R').range(1, 3).count()"), 2.0);
+}
+
+#[test]
+fn presence_narrows_the_same_rows_the_stream_would() {
+    let mut g = presence_fixture();
+
+    assert_eq!(count_of(&mut g, "g.V().has('b').count()"), 1.0);
+    assert_eq!(count_of(&mut g, "g.V().hasNot('b').count()"), 3.0);
+    // A key no element carries: nothing has it, everything lacks it.
+    assert_eq!(count_of(&mut g, "g.V().has('zz').count()"), 0.0);
+    assert_eq!(count_of(&mut g, "g.V().hasNot('zz').count()"), 4.0);
+    // Edges have their own store.
+    assert_eq!(count_of(&mut g, "g.E().has('w').count()"), 1.0);
+    assert_eq!(count_of(&mut g, "g.E().hasNot('w').count()"), 1.0);
+    // Composed with a label and with a value predicate.
+    assert_eq!(
+        count_of(&mut g, "g.V().hasLabel('V').has('a').count()"),
+        3.0
+    );
+    assert_eq!(count_of(&mut g, "g.V().has('a').has('b').count()"), 1.0);
+    assert_eq!(count_of(&mut g, "g.V().has('a', 3).has('b').count()"), 0.0);
+    assert_eq!(count_of(&mut g, "g.V().hasNot('b').has('a').count()"), 2.0);
+}
+
+/// `hasKey('a','b')` means EITHER key — a disjunction the presence list cannot
+/// express, so it must decline to lower rather than read as "both".
+#[test]
+fn a_multi_key_presence_test_is_any_of_them() {
+    let mut g = presence_fixture();
+
+    assert_eq!(count_of(&mut g, "g.V().hasKey('a','b').count()"), 3.0);
+    assert_eq!(count_of(&mut g, "g.V().hasKey('a').count()"), 3.0);
+    assert_eq!(count_of(&mut g, "g.V().hasKey('b').count()"), 1.0);
+    assert_eq!(count_of(&mut g, "g.V().hasNot('a','b').count()"), 1.0);
+}
+
+/// The paging cap and presence compose: the cap counts SURVIVORS.
+#[test]
+fn a_capped_scan_counts_rows_that_survive_presence() {
+    let mut g = presence_fixture();
+
+    assert_eq!(count_of(&mut g, "g.V().has('a').limit(2).count()"), 2.0);
+    assert_eq!(count_of(&mut g, "g.V().has('b').limit(2).count()"), 1.0);
+    assert_eq!(count_of(&mut g, "g.V().hasNot('a').limit(5).count()"), 1.0);
+}
+
+/// The disjunction has to hold with NO index to answer it — it used to be a seed
+/// and nothing else, so an unindexed one simply did not apply. These fixtures
+/// have no index at all, which is the case that would have silently returned
+/// every row.
+#[test]
+fn an_or_of_comparisons_narrows_without_an_index() {
+    let mut lines = String::new();
+
+    for i in 0..60usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{{\"n\":{},\"s\":\"s{}\"}}}}\n",
+            i % 10,
+            i % 4
+        ));
+    }
+
+    let mut g = lenke_core::ndjson::decode(&lines).expect("fixture decodes");
+
+    // 6 vertices per residue class.
+    assert_eq!(count_of(&mut g, "g.V().or(__.has('n', 3)).count()"), 6.0);
+    assert_eq!(
+        count_of(&mut g, "g.V().or(__.has('n', 3), __.has('n', 9)).count()"),
+        12.0
+    );
+    // The same value twice is still that value's rows, once each.
+    assert_eq!(
+        count_of(&mut g, "g.V().or(__.has('n', 3), __.has('n', 3)).count()"),
+        6.0
+    );
+    // Different keys, and a mix of ops.
+    assert_eq!(
+        count_of(
+            &mut g,
+            "g.V().or(__.has('n', 0), __.has('s', 's1')).count()"
+        ),
+        21.0
+    );
+    assert_eq!(
+        count_of(
+            &mut g,
+            "g.V().or(__.has('n', lt(2)), __.has('n', gte(8))).count()"
+        ),
+        24.0
+    );
+    // Composed with a conjunct and a label: the AND of the two.
+    assert_eq!(
+        count_of(
+            &mut g,
+            "g.V().hasLabel('V').has('s', 's1').or(__.has('n', 3), __.has('n', 9)).count()"
+        ),
+        // n=3 lands on i=3,13,23,33,43,53 and n=9 on i=9,…,59; three of each also
+        // carry s1 (i % 4 == 1).
+        6.0
+    );
+    // And with the cap, which applies the disjunction on a different code path.
+    assert_eq!(
+        count_of(
+            &mut g,
+            "g.V().or(__.has('n', 3), __.has('n', 9)).limit(5).count()"
+        ),
+        5.0
+    );
+    assert_eq!(
+        count_of(
+            &mut g,
+            "g.V().or(__.has('n', 3), __.has('n', 9)).limit(50).count()"
+        ),
+        12.0
+    );
+}
+
+/// A branch that is not a single comparison must decline to lower rather than be
+/// dropped — dropping a BRANCH loses rows, and capturing the step leaves nothing
+/// to re-check.
+#[test]
+fn an_or_of_anything_else_still_answers() {
+    let mut lines = String::new();
+
+    for i in 0..20usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{{\"n\":{}}}}}\n",
+            i % 5
+        ));
+    }
+    for i in 0..20usize {
+        lines.push_str(&format!(
+            "{{\"type\":\"edge\",\"id\":\"e{i}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"properties\":{{}}}}\n",
+            (i + 1) % 20
+        ));
+    }
+
+    let mut g = lenke_core::ndjson::decode(&lines).expect("fixture decodes");
+
+    // A branch with two comparisons in it (an AND inside the OR).
+    assert_eq!(
+        count_of(
+            &mut g,
+            "g.V().or(__.has('n', 1).has('n', 1), __.has('n', 2)).count()"
+        ),
+        8.0
+    );
+    // A branch that walks.
+    assert_eq!(
+        count_of(&mut g, "g.V().or(__.out('R'), __.has('n', 0)).count()"),
+        20.0
+    );
+    // A branch that is a label test.
+    assert_eq!(
+        count_of(&mut g, "g.V().or(__.hasLabel('V'), __.has('n', 0)).count()"),
+        20.0
+    );
+    // An empty `or()` matches nothing, as TinkerPop's does.
+    assert_eq!(count_of(&mut g, "g.V().or().count()"), 0.0);
+}
+
+#[test]
+fn a_grouped_fold_off_a_frontier_matches_the_stream() {
+    let mut g = grouped_fold_fixture();
+
+    for reduce in ["sum", "max", "min", "mean"] {
+        same_via_stream(
+            &mut g,
+            &format!("g.V().group().by('k').by(__.values('v').{reduce}())"),
+        );
+        same_via_stream(
+            &mut g,
+            &format!("g.E().group().by('ek').by(__.values('ev').{reduce}())"),
+        );
+        // Grouping BY the value and folding the key, so the absent side swaps.
+        same_via_stream(
+            &mut g,
+            &format!("g.V().group().by('v').by(__.values('v').{reduce}())"),
+        );
+    }
+}
+
+/// `count()` as the value-`by()` must NOT take the column arm: a column read
+/// cannot tell an absent key from a stored null, and a count is the one reducer
+/// that has to. n7/n8 hold stored nulls, so the `z` group counts 2 either way —
+/// the case that discriminates is the null-KEY group, whose members are an absent
+/// key twice and a stored null once.
+#[test]
+fn a_grouped_count_is_not_a_column_fold() {
+    let mut g = grouped_fold_fixture();
+
+    same_via_stream(&mut g, "g.V().group().by('k').by(__.count())");
+    same_via_stream(&mut g, "g.V().group().by('k').by(__.values('v').count())");
+    // Two keys read per element is not one column.
+    same_via_stream(&mut g, "g.V().group().by('k').by(__.values('v','k').sum())");
+    // No value-by at all: the members themselves.
+    same_via_stream(&mut g, "g.V().group().by('k')");
+    // A value-by that walks.
+    same_via_stream(&mut g, "g.V().group().by('k').by(__.out('R').count())");
+}
+
+/// A STORED NULL is present and satisfies no comparison, so it satisfies every
+/// negation of one. A NaN would be the same case, and cannot arise: every write
+/// entry point coerces a non-finite number to null, so there is no NaN in a
+/// column to test against.
+#[test]
+fn a_stored_null_satisfies_every_negated_comparison() {
+    let mut g = lenke_core::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"n":1}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"n":null}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    // `a` matches each comparison and is excluded; the stored null never does.
+    assert_eq!(count_of(&mut g, "g.V().not(__.has('n', 1)).count()"), 1.0);
+    assert_eq!(
+        count_of(&mut g, "g.V().not(__.has('n', gt(0))).count()"),
+        1.0
+    );
+    assert_eq!(
+        count_of(&mut g, "g.V().not(__.has('n', lt(9))).count()"),
+        1.0
+    );
+    // And it IS present, so presence and negation disagree about it on purpose.
+    assert_eq!(count_of(&mut g, "g.V().has('n').count()"), 2.0);
+}
+
+/// What a NEGATIVE `has(k, …)` predicate does with an element that lacks `k`.
+///
+/// TinkerPop's rule is uniform: `has(k, P)` filters out an element without `k`
+/// whatever `P` is, because there is no value for the predicate to be applied to.
+/// This engine is NOT uniform, and this test pins which is which rather than
+/// leaving it to be discovered:
+///
+/// ```text
+///                          here   TinkerPop
+///   neq(v)                  keeps   drops
+///   without(v)              keeps   drops
+///   outside(lo, hi)         drops   drops
+///   notContaining(s)        drops   drops
+/// ```
+///
+/// The TS engine gives the same five answers, so the two are consistent with each
+/// other and no differential fuzzer can see any of this. That is also why it is
+/// not fixed here: `neq` and `without` returning fewer rows is a behavior change
+/// to both engines, and it is a decision, not a bug fix to one side.
+///
+/// `not(__.has(k, v))` is a different question and DOES keep such an element in
+/// both this engine and TinkerPop — see
+/// `a_negated_has_includes_elements_without_the_key`.
+#[test]
+fn a_negative_predicate_does_not_treat_a_missing_key_uniformly() {
+    let mut g = lenke_core::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"n":3,"s":"xy"}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"n":4,"s":"zz"}}"#,
+            // no properties at all
+            r#"{"type":"node","id":"c","labels":["V"],"properties":{}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    // KEEPS `c`. TinkerPop answers 1 for both of these.
+    assert_eq!(count_of(&mut g, "g.V().has('n', neq(3)).count()"), 2.0);
+    assert_eq!(count_of(&mut g, "g.V().has('n', without(3)).count()"), 2.0);
+    // DROPS `c`, which is what TinkerPop does for all four.
+    assert_eq!(
+        count_of(&mut g, "g.V().has('n', outside(2, 4)).count()"),
+        0.0
+    );
+    assert_eq!(
+        count_of(&mut g, "g.V().has('s', notContaining('x')).count()"),
+        1.0
+    );
+    // The positive predicates agree with TinkerPop and with each other.
+    assert_eq!(
+        count_of(&mut g, "g.V().has('n', within(3, 4)).count()"),
+        2.0
+    );
+    assert_eq!(count_of(&mut g, "g.V().has('n', gt(0)).count()"), 2.0);
+}
+
+/// Sorting a numeric column on the raw `f64` has to give the same order as
+/// sorting the boxed values, tie for tie.
+///
+/// It does by construction — `gcmp_total`'s non-NaN numeric arm IS `total_cmp`,
+/// and the arm declines a column with a NaN in it before reaching either. The
+/// case worth pinning anyway is `-0.0`, which `total_cmp` orders BEFORE `0.0`
+/// while equality calls them equal: if the fast path had used `partial_cmp` the
+/// two would tie, the index tie-break would put them in frontier order, and a
+/// `limit` across that boundary would return a different row.
+#[test]
+fn ordering_a_numeric_column_matches_the_boxed_sort() {
+    let mut lines = String::new();
+
+    // Duplicates so ties are everywhere, and both zeroes, and both infinities.
+    for (i, v) in [
+        "1", "-0.0", "0.0", "3", "1", "-1", "1e308", "-1e308", "0.0", "-0.0", "2", "2",
+    ]
+    .iter()
+    .enumerate()
+    {
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":[\"V\"],\"properties\":{{\"n\":{v}}}}}\n"
+        ));
+    }
+
+    let mut g = lenke_core::ndjson::decode(&lines).expect("fixture decodes");
+
+    for spelling in ["order().by('n')", "order().by('n', desc)"] {
+        same_via_stream(&mut g, &format!("g.V().{spelling}.id()"));
+        same_via_stream(&mut g, &format!("g.V().{spelling}.values('n')"));
+
+        for k in [1usize, 2, 5, 11, 12, 50] {
+            same_via_stream(&mut g, &format!("g.V().{spelling}.limit({k}).id()"));
+        }
+        same_via_stream(&mut g, &format!("g.V().{spelling}.range(2, 6).id()"));
+        same_via_stream(&mut g, &format!("g.V().{spelling}.tail(3).id()"));
+    }
+    // A column that is NOT all numbers keeps the boxed comparator.
+    let mut mixed = lenke_core::ndjson::decode(
+        &[
+            r#"{"type":"node","id":"a","labels":["V"],"properties":{"n":"s"}}"#,
+            r#"{"type":"node","id":"b","labels":["V"],"properties":{"n":"t"}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("fixture decodes");
+
+    same_via_stream(&mut mixed, "g.V().order().by('n').id()");
+}
+
+/// `where`/`not` over the element's OWN property runs as a column test, and both
+/// spellings of it agree with the stream.
+///
+/// Two things had to change for this: the column layer only understood a
+/// `where` body that HOPS, and `lower_prefix` consumed a `not()` it could not
+/// capture — which declined the whole lowering rather than leaving the step for
+/// the arm that handles it. The `not` case measured 2.488ms against 0.058 after.
+#[test]
+fn a_self_predicate_where_matches_the_stream() {
+    let mut lines = String::new();
+
+    for i in 0..200usize {
+        let l = if i % 5 == 0 {
+            r#"["V","W"]"#
+        } else {
+            r#"["V"]"#
+        };
+
+        lines.push_str(&format!(
+            "{{\"type\":\"node\",\"id\":\"n{i}\",\"labels\":{l},\"properties\":{{\"n\":{},\"s\":\"k{}\"}}}}\n",
+            i % 13,
+            i % 3
+        ));
+    }
+    // A vertex with no `n` at all, and one whose `n` is a stored null.
+    lines.push_str(r#"{"type":"node","id":"x","labels":["V"],"properties":{"s":"k0"}}"#);
+    lines.push('\n');
+    lines.push_str(r#"{"type":"node","id":"y","labels":["V"],"properties":{"n":null,"s":"k0"}}"#);
+    lines.push('\n');
+
+    let mut g = lenke_core::ndjson::decode(&lines).expect("fixture decodes");
+
+    for q in [
+        "g.V().where(__.values('n').is(gt(5))).count()",
+        "g.V().not(__.values('n').is(gt(5))).count()",
+        "g.V().where(__.has('n', gt(5))).count()",
+        "g.V().not(__.has('n', gt(5))).count()",
+        "g.V().hasLabel('V').where(__.values('n').is(7)).count()",
+        "g.V().hasLabel('V').not(__.values('n').is(7)).count()",
+        // A key nothing carries, and a string predicate.
+        "g.V().where(__.values('zz').is(1)).count()",
+        "g.V().not(__.values('zz').is(1)).count()",
+        "g.V().where(__.values('s').is('k1')).count()",
+        // Composed with a hop on either side.
+        "g.V().where(__.values('n').is(gt(5))).count()",
+        "g.V().not(__.values('n').is(gt(5))).dedup().count()",
+    ] {
+        let column = count_of(&mut g, q);
+        // `fold().unfold()` means the same and takes the STREAM.
+        let (head, tail) = q.split_once('.').expect("a traversal has a step");
+        let streamed = format!("{head}.{}", tail.replacen('.', ".fold().unfold().", 1));
+
+        assert_eq!(
+            column,
+            count_of(&mut g, &streamed),
+            "`{q}` disagreed with its streamed spelling"
+        );
+    }
 }
 
