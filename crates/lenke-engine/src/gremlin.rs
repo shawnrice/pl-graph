@@ -5125,14 +5125,17 @@ mod tests {
                 "Map([(Str(\"n\"), Str(\"carol\")), (Str(\"a\"), Num(40.0))]);",
             ],
         );
-        // A key with fewer bys than keys defaults to the current element (its id here,
-        // like select()): project('n','self').by('name') → {n: name, self: <id>}.
+        // A key with fewer bys than keys defaults to the current element, rendered as
+        // its element map (like a top-level vertex): project('n','self').by('name') →
+        // {n: name, self: {id,labels,properties}}.
         assert_eq!(
             value_bag(&gremlin_rows(
                 "g.V().has('name','bob').project('n','self').by('name')",
                 &store,
             )),
-            vec!["Map([(Str(\"n\"), Str(\"bob\")), (Str(\"self\"), Num(1.0))]);"],
+            vec![
+                "Map([(Str(\"n\"), Str(\"bob\")), (Str(\"self\"), Map([(Str(\"id\"), Str(\"1\")), (Str(\"labels\"), List([Str(\"Person\")])), (Str(\"properties\"), Map([(Str(\"age\"), Num(25.0)), (Str(\"name\"), Str(\"bob\"))]))]))]);"
+            ],
         );
         // A degree `<hop>.count()` by-modulator is a correlated count subquery.
         assert!(super::parse("g.V().project('c').by(out().count())").is_ok());
@@ -5903,21 +5906,29 @@ mod tests {
     #[test]
     fn multi_select_builds_an_ordered_map() {
         let store = social();
-        // bob KNOWS carol only: select('p','f') is a Map {p: bob(1), f: carol(2)},
-        // insertion-ordered (p then f), values are the node ids.
+        // bob KNOWS carol only: select('p','f') is a Map {p: bob, f: carol},
+        // insertion-ordered (p then f), the values being the vertices' element maps.
         let out = gremlin_rows(
             "g.V().hasLabel('Person').has('name', 'bob').as('p').out('KNOWS').as('f') \
              .select('p', 'f')",
             &store,
         );
         assert_eq!(out.rows.len(), 1);
+        // The `id` field of a vertex element-map value.
+        let map_id = |v: &Value| match v {
+            Value::Map(m) => m
+                .iter()
+                .find(|(k, _)| matches!(k, Value::Str(s) if &**s == "id"))
+                .map(|(_, id)| id.clone()),
+            _ => None,
+        };
         match &out.rows[0][0] {
             Value::Map(pairs) => {
                 assert_eq!(pairs.len(), 2);
                 assert!(matches!(&pairs[0].0, Value::Str(s) if &**s == "p"));
                 assert!(matches!(&pairs[1].0, Value::Str(s) if &**s == "f"));
-                assert!(matches!(pairs[0].1, Value::Num(x) if x == 1.0)); // bob
-                assert!(matches!(pairs[1].1, Value::Num(x) if x == 2.0)); // carol
+                assert!(matches!(map_id(&pairs[0].1), Some(Value::Str(s)) if &*s == "1")); // bob
+                assert!(matches!(map_id(&pairs[1].1), Some(Value::Str(s)) if &*s == "2")); // carol
             }
             o => panic!("expected a Map, got {o:?}"),
         }

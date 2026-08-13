@@ -7748,7 +7748,9 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             )
         }
         Expr::MapLit { entries } => {
-            // Per row, an insertion-ordered Value::Map with string keys.
+            // Per row, an insertion-ordered Value::Map with string keys. A VERTEX/EDGE
+            // value renders as its element map (via render_cell), not a raw dense id, so
+            // a project()/select() map of elements canonicalizes like a top-level one.
             let cols = eval_all(entries.iter().map(|(_, e)| e), store, batch)?;
             let n = batch.rows();
             Col::Gen(
@@ -7757,7 +7759,9 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                         let pairs = entries
                             .iter()
                             .zip(&cols)
-                            .map(|((k, _), c)| (Value::Str(Arc::from(k.as_str())), c.value_at(i)))
+                            .map(|((k, _), c)| {
+                                (Value::Str(Arc::from(k.as_str())), render_cell(c, i, store))
+                            })
                             .collect();
                         Value::Map(Arc::new(pairs))
                     })
