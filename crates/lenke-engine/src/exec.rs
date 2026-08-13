@@ -4020,7 +4020,7 @@ fn try_varlen_count(
     else {
         return None;
     };
-    if until.is_some() || body_filter.is_some() || *double_loops {
+    if until.is_some() || body_filter.is_some() {
         return None; // an until(pred) walk emits a filtered subset — no closed-form count
     }
     let want = match want_etypes(store, edge_label) {
@@ -4087,7 +4087,7 @@ fn try_varlen_count(
             used.push(v); // mark the start node
         }
         varlen_count_dfs(
-            store, v, 0, *min, *max, *dir, &want, *mode, v, &mut used, &mut total,
+            store, v, 0, *min, *max, *dir, &want, *mode, v, &mut used, &mut total, *double_loops,
         );
         if node_unique {
             used.pop();
@@ -4114,6 +4114,7 @@ fn varlen_count_dfs(
     start: u32,
     used: &mut Vec<u32>,
     total: &mut u64,
+    double_loops: bool,
 ) {
     if len >= min {
         *total += 1;
@@ -4132,8 +4133,9 @@ fn varlen_count_dfs(
         &[]
     };
     // Undirected: a self-loop sits in both indexes; drop its in-side copy so it is
-    // walked once (matches core's SelfLoops::Once).
-    let drop_loop = matches!(dir, Dir::Both);
+    // walked once (core's SelfLoops::Once) — UNLESS this is a Gremlin `both()` walk,
+    // which crosses it twice.
+    let drop_loop = matches!(dir, Dir::Both) && !double_loops;
     for (is_inc, a) in out
         .iter()
         .map(|a| (false, a))
@@ -4176,6 +4178,7 @@ fn varlen_count_dfs(
             start,
             used,
             total,
+            double_loops,
         );
         if mark.is_some() {
             used.pop();
