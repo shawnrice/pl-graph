@@ -9,7 +9,7 @@
 //! .limit(n) | .range(lo,hi) | .groupCount().by('k')`. The traversal's implicit
 //! current element is a slot, hops append slots, exactly as in the IR.
 
-use crate::ir::{Agg, AggFn, CompareOp, Dir, Expr, PathMode, Plan, SortKey};
+use crate::ir::{Agg, AggFn, ArithOp, CompareOp, Dir, Expr, PathMode, Plan, SortKey};
 use crate::value::Value;
 use std::collections::HashMap;
 
@@ -32,6 +32,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         path_ok: true,
         caps: std::collections::HashMap::new(),
         algo_props: std::collections::HashMap::new(),
+        sack_slot: None,
     };
     p.traversal()
 }
@@ -200,6 +201,9 @@ struct Parser {
     /// `AlgoAnnotate`). A following `values(<property>)` reads that slot instead of a
     /// store property.
     algo_props: std::collections::HashMap<String, usize>,
+    /// The slot carrying the per-traverser `sack` accumulator (a column appended by
+    /// `withSack(init)`), or None when no sack is in play.
+    sack_slot: Option<usize>,
 }
 
 impl Parser {
@@ -245,6 +249,28 @@ impl Parser {
             return Err(format!("expected `g`, got `{g}`"));
         }
         self.expect(&Tok::Dot)?;
+        // Source-config prefixes before the real head: `g.withSack(init).V()…`
+        // (seed the sack after the source is built) and `g.withComputer().V()…`
+        // (a no-op marker). Multiple may chain.
+        let mut sack_init: Option<Value> = None;
+        loop {
+            match self.peek() {
+                Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("withSack") => {
+                    self.bump();
+                    self.expect(&Tok::LParen)?;
+                    sack_init = Some(self.literal()?);
+                    self.expect(&Tok::RParen)?;
+                    self.expect(&Tok::Dot)?;
+                }
+                Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("withComputer") => {
+                    self.bump();
+                    self.expect(&Tok::LParen)?;
+                    self.expect(&Tok::RParen)?;
+                    self.expect(&Tok::Dot)?;
+                }
+                _ => break,
+            }
+        }
         let head = self.ident()?;
         let mut plan = match head.to_ascii_lowercase().as_str() {
             "v" => {
@@ -315,6 +341,14 @@ impl Parser {
             }
             other => return Err(format!("expected V() or addV(...), got `{other}`")),
         };
+        // Seed the sack accumulator as an appended column carried alongside the
+        // element frontier (a MapSlot append, so the node frontier is preserved).
+        if let Some(init) = sack_init {
+            let slot = self.slots;
+            plan = plan.map_slot(slot, Expr::Lit(init), true);
+            self.slots += 1;
+            self.sack_slot = Some(slot);
+        }
         while self.peek() == Some(&Tok::Dot) {
             self.pos += 1;
             plan = self.step(plan)?;
@@ -1465,6 +1499,62 @@ impl Parser {
                 // Pass-through — the current element is unchanged (Gremlin identity()).
                 self.expect(&Tok::RParen)?;
                 plan
+            }
+            "sack" => {
+                // sack() reads the per-traverser accumulator; sack(op).by('k') folds a
+                // property into it in place (the frontier passes through). Requires a
+                // preceding withSack(init).
+                let sack = self
+                    .sack_slot
+                    .ok_or("sack() requires a preceding g.withSack(init)")?;
+                if self.peek() == Some(&Tok::RParen) {
+                    self.expect(&Tok::RParen)?;
+                    let p = plan.project(vec![("sack".to_string(), Expr::Slot(sack))]);
+                    self.current = 0;
+                    self.slots = 1;
+                    p
+                } else {
+                    let op = self.ident()?.to_ascii_lowercase();
+                    self.expect(&Tok::RParen)?;
+                    self.expect(&Tok::Dot)?;
+                    let by = self.ident()?;
+                    if !by.eq_ignore_ascii_case("by") {
+                        return Err("sack(op) must be followed by by('k')".into());
+                    }
+                    self.expect(&Tok::LParen)?;
+                    let k = self.str_arg()?;
+                    self.expect(&Tok::RParen)?;
+                    let s = || Expr::Slot(sack);
+                    let val = || Expr::Prop {
+                        slot: self.current,
+                        key: k.clone(),
+                    };
+                    let arith = |op| Expr::Arith {
+                        op,
+                        left: Box::new(s()),
+                        right: Box::new(val()),
+                    };
+                    let cmp_keep = |op| Expr::Case {
+                        branches: vec![(
+                            Expr::Compare {
+                                op,
+                                left: Box::new(s()),
+                                right: Box::new(val()),
+                            },
+                            s(),
+                        )],
+                        otherwise: Some(Box::new(val())),
+                    };
+                    let new = match op.as_str() {
+                        "sum" => arith(ArithOp::Add),
+                        "mult" => arith(ArithOp::Mul),
+                        "assign" => val(),
+                        "min" => cmp_keep(CompareOp::Le),
+                        "max" => cmp_keep(CompareOp::Ge),
+                        other => return Err(format!("unsupported sack operator `{other}`")),
+                    };
+                    plan.map_slot(sack, new, false)
+                }
             }
             "local" => {
                 // local(<traversal>) runs the body PER input element. v1 supports the

@@ -763,6 +763,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::SortLocal { input, .. } => needs_lineage(input),
         // tree() reads the path lineage itself, so its INPUT must track it.
         Plan::Tree { .. } => true,
+        Plan::MapSlot { input, value, .. } => reads_path(value) || needs_lineage(input),
         Plan::OptionalScan { input, filters, .. } => {
             filters.iter().any(|(_, e)| reads_path(e)) || needs_lineage(input)
         }
@@ -1047,6 +1048,21 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 pairs.push((k, v));
             }
             Batch::single(Col::Gen(vec![Value::Map(std::sync::Arc::new(pairs))]))
+        }
+        Plan::MapSlot {
+            input,
+            slot,
+            value,
+            append,
+        } => {
+            let mut b = pull(input, store, track)?;
+            let col = eval(value, store, &b)?;
+            if *append {
+                b.slots.push(col);
+            } else if *slot < b.slots.len() {
+                b.slots[*slot] = col;
+            }
+            b
         }
         Plan::Tree { input, by } => {
             // Fold every traverser's vertex-hop path (node-id lineage) into one nested

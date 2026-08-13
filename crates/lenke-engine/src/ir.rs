@@ -644,6 +644,17 @@ pub enum Plan {
     /// yield one Map object rather than the relational (key,value) rows that GQL
     /// `GROUP BY` keeps.
     GroupToMap { input: Box<Plan> },
+    /// Append or overwrite ONE slot's column with `value` (evaluated per row),
+    /// leaving every other slot intact — used to carry a Gremlin `sack` accumulator
+    /// alongside the element frontier (a Project would collapse the frontier to the
+    /// projected values). `append` adds a new column at the input width; otherwise it
+    /// replaces `slot`.
+    MapSlot {
+        input: Box<Plan>,
+        slot: usize,
+        value: Box<Expr>,
+        append: bool,
+    },
     /// Gremlin `tree()` [`.by('k')`]: fold EVERY traverser's vertex-hop path (the
     /// node-id lineage) into ONE nested `Value::Map`, keyed level-by-level by each
     /// path element — rendered as its full element map, or its `by` property. Emits a
@@ -992,6 +1003,16 @@ impl Plan {
     pub fn group_to_map(self) -> Self {
         Self::GroupToMap {
             input: Box::new(self),
+        }
+    }
+
+    #[must_use]
+    pub fn map_slot(self, slot: usize, value: Expr, append: bool) -> Self {
+        Self::MapSlot {
+            input: Box::new(self),
+            slot,
+            value: Box::new(value),
+            append,
         }
     }
 

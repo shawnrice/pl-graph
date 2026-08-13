@@ -707,6 +707,39 @@ fn gremlin_parity() {
             false,
             vec![V, HasLabel(vec!["PERSON"]), Values(vec!["name"]), Barrier],
         ),
+        // — sack: per-traverser accumulator —
+        c(
+            "sack_sum_age",
+            false,
+            vec![
+                WithSack(Val::N(100.0)),
+                V,
+                HasLabel(vec!["PERSON"]),
+                SackBy("sum", "age"),
+                SackRead,
+            ],
+        ),
+        c(
+            "sack_assign_age",
+            false,
+            vec![
+                WithSack(Val::N(0.0)),
+                V,
+                HasLabel(vec!["PERSON"]),
+                SackBy("assign", "age"),
+                SackRead,
+            ],
+        ),
+        c(
+            "sack_read_init",
+            false,
+            vec![
+                WithSack(Val::N(7.0)),
+                V,
+                HasVal("name", Val::S("marko")),
+                SackRead,
+            ],
+        ),
         // — dedup(labels): keyed distinct on a tagged value —
         c(
             "dedup_by_lang_tag",

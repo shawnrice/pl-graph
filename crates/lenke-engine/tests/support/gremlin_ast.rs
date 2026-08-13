@@ -11,7 +11,9 @@
 
 #![allow(dead_code)]
 
-use lenke_core::gremlin::{self as cg, Order as COrder, Traversal as CTrav, P as CP};
+use lenke_core::gremlin::{
+    self as cg, Order as COrder, SackOp as CSackOp, Traversal as CTrav, P as CP,
+};
 
 /// A literal value in a step argument (`has('age', 29)`, `constant('x')`).
 #[derive(Clone, Debug)]
@@ -117,6 +119,9 @@ pub enum Step {
     Inject(Vec<Val>),
     Tree,
     DedupLabels(Vec<&'static str>),
+    WithSack(Val),
+    SackRead,
+    SackBy(&'static str, &'static str),
 }
 
 /// A whole traversal: an ordered list of steps.
@@ -273,6 +278,9 @@ fn emit_step(st: &Step) -> String {
         Inject(vs) => format!("inject({})", join_vals(vs)),
         Tree => "tree()".into(),
         DedupLabels(ls) => format!("dedup({})", join_labels(ls)),
+        WithSack(v) => format!("withSack({})", emit_val(v)),
+        SackRead => "sack()".into(),
+        SackBy(op, k) => format!("sack({op}).by('{k}')"),
     }
 }
 
@@ -398,6 +406,18 @@ fn apply_core(t: CTrav, st: &Step) -> CTrav {
         Inject(vs) => t.inject(vs.iter().map(cval).collect::<Vec<_>>()),
         Tree => t.tree(),
         DedupLabels(ls) => t.dedup_labels(ls.iter().map(|s| s.to_string()).collect()),
+        WithSack(v) => t.with_sack(cval(v)),
+        SackRead => t.sack(),
+        SackBy(op, k) => {
+            let o = match *op {
+                "sum" => CSackOp::Sum,
+                "mult" => CSackOp::Mult,
+                "assign" => CSackOp::Assign,
+                "min" => CSackOp::Min,
+                _ => CSackOp::Max,
+            };
+            t.sack_op(o).by(k)
+        }
     }
 }
 
