@@ -200,7 +200,7 @@ fn c(name: &'static str, ordered: bool, steps: Vec<Step>) -> Case {
 /// Gremlin parity cases the engine does NOT yet match — UNFINISHED, MEASURED gaps
 /// (not "won't-fix"), each naming concrete engine work the harness verifies the
 /// moment it's closed. Empty = every case in the corpus is at parity.
-const KNOWN_GREMLIN_GAPS: &[&str] = &["coalesce_lang_name"];
+const KNOWN_GREMLIN_GAPS: &[&str] = &[];
 
 #[test]
 fn gremlin_parity() {

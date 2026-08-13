@@ -508,13 +508,53 @@ impl Parser {
                 // produces a result. Each branch k fires when no earlier branch's hop
                 // exists AND its own does — an Exists guard chain — then expands. All
                 // branches land at the same slot, so it reconverges like union.
-                // coalesce(<hop>, <hop>, …): per element, the FIRST branch that
-                // produces a result. Each branch k fires when no earlier branch's hop
-                // exists AND its own does — an Exists guard chain — then expands. All
-                // branches land at the same slot, so it reconverges like union.
-                // v1 single-hop bodies only; multi-step value bodies are deferred (they
-                // need the branch/Exists exec to handle heterogeneous value columns).
+                // coalesce of all-`values('k')` bodies — `coalesce(values('lang'),
+                // values('name'))` = the FIRST PRESENT property (drop the element if
+                // none present). Lowers to a scalar Case over PropertyExists + a filter
+                // that keeps only rows with at least one present, sidestepping the
+                // Exists-over-a-projection provenance limitation.
                 let from = self.current;
+                if let Some(keys) = self.try_all_values_bodies() {
+                    let present = |k: &str| Expr::PropertyExists {
+                        slot: from,
+                        key: k.to_string(),
+                    };
+                    let mut any: Option<Expr> = None;
+                    for k in &keys {
+                        any = Some(match any {
+                            None => present(k),
+                            Some(p) => Expr::Or(Box::new(p), Box::new(present(k))),
+                        });
+                    }
+                    let branches = keys
+                        .iter()
+                        .map(|k| {
+                            (
+                                present(k),
+                                Expr::Prop {
+                                    slot: from,
+                                    key: k.clone(),
+                                },
+                            )
+                        })
+                        .collect();
+                    let p = plan
+                        .filter(any.expect("coalesce has at least one body"))
+                        .project(vec![(
+                            "coalesce".to_string(),
+                            Expr::Case {
+                                branches,
+                                otherwise: None,
+                            },
+                        )]);
+                    self.current = 0;
+                    self.slots = 1;
+                    return Ok(p);
+                }
+                // Otherwise: coalesce(<hop>, <hop>, …) — per element, the FIRST branch
+                // that produces a result, via an Exists guard chain then expand. All
+                // branches land at the same slot, so it reconverges like union. Single-
+                // hop bodies only; mixed multi-step value bodies stay deferred.
                 let slots = self.slots;
                 let exists = |dir: Dir, label: Option<&str>| Expr::Exists {
                     body: Box::new(Plan::Row.expand(from, dir, &etypes_of(label))),
@@ -1773,6 +1813,67 @@ impl Parser {
         };
         self.expect(&Tok::RParen)?;
         Ok((dir, label))
+    }
+
+    /// Try to parse the whole coalesce argument list as bodies that are EACH a single
+    /// `[__.]values('k')` projection, consuming through the closing `)`. Returns the
+    /// keys in order, or `None` (cursor restored) if any body is something else.
+    fn try_all_values_bodies(&mut self) -> Option<Vec<String>> {
+        let save = self.pos;
+        let mut keys = Vec::new();
+        loop {
+            if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+                self.bump();
+                if self.peek() == Some(&Tok::Dot) {
+                    self.bump();
+                } else {
+                    self.pos = save;
+                    return None;
+                }
+            }
+            match self.peek() {
+                Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("values") => self.bump(),
+                _ => {
+                    self.pos = save;
+                    return None;
+                }
+            };
+            if self.peek() != Some(&Tok::LParen) {
+                self.pos = save;
+                return None;
+            }
+            self.bump();
+            let k = match self.peek().cloned() {
+                Some(Tok::Str(s)) => {
+                    self.bump();
+                    s
+                }
+                _ => {
+                    self.pos = save;
+                    return None;
+                }
+            };
+            if self.peek() != Some(&Tok::RParen) {
+                self.pos = save;
+                return None;
+            }
+            self.bump();
+            keys.push(k);
+            match self.peek() {
+                Some(Tok::Comma) => {
+                    self.bump();
+                }
+                Some(Tok::RParen) => {
+                    self.bump();
+                    break;
+                }
+                _ => {
+                    self.pos = save;
+                    return None;
+                }
+            }
+        }
+        Some(keys)
     }
 
     /// Parse an anonymous sub-traversal `__.step().step()…` (a branch/union/coalesce/
