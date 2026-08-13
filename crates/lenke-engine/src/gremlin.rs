@@ -1147,18 +1147,43 @@ impl Parser {
                     labels.push(self.str_arg()?);
                 }
                 self.expect(&Tok::RParen)?;
+                // Trailing `.by('key')` modulators project each selected element to a
+                // property; they CYCLE across the labels (core's `bys[i % bys.len()]`).
+                // `by('k')` only for now (a nested by-traversal is deferred).
+                let mut bys: Vec<String> = Vec::new();
+                while self.peek() == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
+                {
+                    self.expect(&Tok::Dot)?;
+                    self.ident()?; // `by`
+                    self.expect(&Tok::LParen)?;
+                    bys.push(self.str_arg()?);
+                    self.expect(&Tok::RParen)?;
+                }
                 let slot_of = |l: &str| {
                     self.labels
                         .get(l)
                         .copied()
                         .ok_or_else(|| format!("select('{l}'): no step is labelled `{l}`"))
                 };
+                let val_of = |i: usize, l: &str| -> Result<Expr, String> {
+                    let slot = slot_of(l)?;
+                    Ok(if bys.is_empty() {
+                        Expr::Slot(slot)
+                    } else {
+                        Expr::Prop {
+                            slot,
+                            key: bys[i % bys.len()].clone(),
+                        }
+                    })
+                };
                 let p = if labels.len() == 1 {
-                    plan.project(vec![(labels[0].clone(), Expr::Slot(slot_of(&labels[0])?))])
+                    plan.project(vec![(labels[0].clone(), val_of(0, &labels[0])?)])
                 } else {
                     let entries = labels
                         .iter()
-                        .map(|l| Ok((l.clone(), Expr::Slot(slot_of(l)?))))
+                        .enumerate()
+                        .map(|(i, l)| Ok((l.clone(), val_of(i, l)?)))
                         .collect::<Result<Vec<_>, String>>()?;
                     plan.project(vec![("select".into(), Expr::MapLit { entries })])
                 };

@@ -707,6 +707,32 @@ fn gremlin_parity() {
             false,
             vec![V, HasLabel(vec!["PERSON"]), Values(vec!["name"]), Barrier],
         ),
+        // — select with by-modulators (projects each tagged element to a property) —
+        c(
+            "select_by_name",
+            false,
+            vec![
+                V,
+                HasVal("name", Val::S("marko")),
+                As("a"),
+                Out(vec!["KNOWS"]),
+                As("b"),
+                Select(vec!["a", "b"]),
+                By("name"),
+            ],
+        ),
+        c(
+            "select_one_by_name",
+            false,
+            vec![
+                V,
+                HasVal("name", Val::S("marko")),
+                As("a"),
+                Out(vec!["KNOWS"]),
+                Select(vec!["a"]),
+                By("name"),
+            ],
+        ),
         // — OLAP annotate (pageRank / connectedComponent / peerPressure) —
         c(
             "pagerank_scores",
