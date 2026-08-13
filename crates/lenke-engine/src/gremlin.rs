@@ -33,6 +33,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         caps: std::collections::HashMap::new(),
         algo_props: std::collections::HashMap::new(),
         last_algo: None,
+        on_edge: false,
         prop_keys: None,
         first_labels: std::collections::HashMap::new(),
         sack_slot: None,
@@ -500,6 +501,11 @@ struct Parser {
     /// store property.
     algo_props: std::collections::HashMap<String, usize>,
     last_algo: Option<usize>,
+    /// True when the current frontier holds EDGES (the `E` source, `EdgeSeed`, an
+    /// `outE`/`inE`/`bothE` hop, or a coalesce/union of edge bodies) rather than nodes.
+    /// A bare `inV`/`outV`/`bothV` off an edge frontier reads its endpoint; off a node
+    /// frontier it is an error (a vertex move must follow an edge step).
+    on_edge: bool,
     /// Set by `properties('k'…)`: the property keys the current element is a property
     /// STREAM over (the element stays current, present-filtered). A following
     /// `value()`/`key()`/`label()`/`hasValue()`/`count()` reads through this. `None`
@@ -766,10 +772,12 @@ impl Parser {
                         ext_ids.push(self.str_arg()?);
                     }
                     self.expect(&Tok::RParen)?;
+                    self.on_edge = true;
                     Plan::EdgeSeed { ext_ids }
                 } else {
                     self.expect(&Tok::RParen)?;
                     // An edge source makes the path start on an edge, not a node.
+                    self.on_edge = true;
                     Plan::EdgeScan
                 }
             }
@@ -1114,7 +1122,11 @@ impl Parser {
                 let mut bodies = Vec::new();
                 let mut prior: Option<Expr> = None; // OR of the earlier branches' existence
                 let mut land;
+                let mut any_edge = false; // an edge-hop body → coalesce yields an edge frontier
                 loop {
+                    if self.peek_leading_is_edge() {
+                        any_edge = true;
+                    }
                     let this = match self.peek_leading_hop() {
                         Some((dir, labels)) => Expr::Exists {
                             body: Box::new(Plan::Row.expand(from, dir, &labels)),
@@ -1146,6 +1158,7 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 self.current = land.0;
                 self.slots = land.1;
+                self.on_edge = any_edge;
                 plan.branch(bodies)
             }
             "match" => {
@@ -1594,6 +1607,7 @@ impl Parser {
                 let from = self.current;
                 self.current = self.slots;
                 self.slots += 1;
+                self.on_edge = false;
                 plan.expand(from, dir, &labels)
             }
             "repeat" => {
@@ -1692,32 +1706,61 @@ impl Parser {
                 let edge_slot = self.slots; // W
                 let node_slot = self.slots + 1; // W+1: the landed endpoint
                 self.current = edge_slot;
+                self.on_edge = true;
                 self.slots += 2;
                 self.edge_hop = Some((node_slot, dir));
                 plan.expand_edge(from, dir, &labels)
             }
-            "inv" | "outv" | "otherv" => {
+            "inv" | "outv" | "otherv" | "bothv" => {
                 self.expect(&Tok::RParen)?;
-                let (node_slot, dir) = prev_edge_hop.ok_or_else(|| {
-                    format!("{name}() must immediately follow outE()/inE()/bothE()")
-                })?;
-                // The hop already landed the OTHER endpoint (the neighbour) in
-                // `node_slot`. That endpoint is: `otherV` for any direction; `inV`
-                // (the edge head/dst) only when we went OUT; `outV` (the edge
-                // tail/src) only when we went IN. The origin-returning combinations
-                // (`outE().outV()`, `inE().inV()`, and inV/outV after `bothE`) need the
-                // pre-hop vertex, which this pointer-move does not carry — deferred.
-                let ok = matches!(
-                    (lname.as_str(), dir),
-                    ("otherv", _) | ("inv", Dir::Out) | ("outv", Dir::In)
-                );
-                if !ok {
-                    return Err(format!(
-                        "{name}() after this edge step is not yet supported (returns the origin vertex)"
-                    ));
+                match prev_edge_hop {
+                    // Immediately after outE/inE/bothE, the hop already landed the OTHER
+                    // endpoint in `node_slot`: `otherV` for any direction; `inV` (dst)
+                    // only when we went OUT; `outV` (src) only when we went IN. The
+                    // origin-returning combinations fall through to EdgeVertex below.
+                    Some((node_slot, dir))
+                        if matches!(
+                            (lname.as_str(), dir),
+                            ("otherv", _) | ("inv", Dir::Out) | ("outv", Dir::In)
+                        ) =>
+                    {
+                        self.current = node_slot;
+                        self.on_edge = false;
+                        plan
+                    }
+                    // Otherwise (a bare edge frontier — `g.E().outV()`,
+                    // `coalesce(outE(...)).inV()` — or an origin-returning combination):
+                    // read the endpoint straight off the edge at the current slot. Only
+                    // valid when the frontier actually holds edges.
+                    _ if self.on_edge => {
+                        self.on_edge = false;
+                        let which = match lname.as_str() {
+                            "outv" => Dir::Out,
+                            "inv" => Dir::In,
+                            "bothv" => Dir::Both,
+                            _ => {
+                                return Err(
+                                    "otherV() off a bare edge frontier is not supported".into(),
+                                )
+                            }
+                        };
+                        let edge_slot = self.current;
+                        let landed = self.slots;
+                        self.current = landed;
+                        self.slots += 1;
+                        Plan::EdgeVertex {
+                            input: Box::new(plan),
+                            edge_slot,
+                            which,
+                        }
+                    }
+                    // A vertex move with no edge frontier and no preceding edge hop.
+                    _ => {
+                        return Err(format!(
+                            "{name}() must immediately follow outE()/inE()/bothE()"
+                        ))
+                    }
                 }
-                self.current = node_slot;
-                plan
             }
             "values" => {
                 // values('k', …): emit the value of each listed property that is
@@ -3960,6 +4003,7 @@ impl Parser {
         let saved_edge = self.edge_hop.take();
         let saved_repeat = self.pending_repeat.take();
         let saved_path_ok = self.path_ok;
+        let saved_on_edge = self.on_edge;
         self.current = from;
         self.slots = width;
         // Optional leading `__.` (an anonymous traversal). The body is then a `.`-
@@ -3984,6 +4028,7 @@ impl Parser {
         self.edge_hop = saved_edge;
         self.pending_repeat = saved_repeat;
         self.path_ok = saved_path_ok;
+        self.on_edge = saved_on_edge;
         Ok((body, out_current, out_slots))
     }
 
@@ -3991,6 +4036,22 @@ impl Parser {
     /// hop `[__.](out|in|both)('L', …)`, returning its `(direction, edge labels)`. Used
     /// to form a body's existence guard before parsing it. `None` when the body does not
     /// start with a hop (a value body such as `constant(v)` always produces output).
+    /// True when the coalesce/union body ahead starts with an EDGE hop
+    /// (`[__.](outE|inE|bothE)`), so the reconverged frontier holds edges.
+    fn peek_leading_is_edge(&self) -> bool {
+        let mut p = self.pos;
+        if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
+            p += 1;
+            if self.toks.get(p) == Some(&Tok::Dot) {
+                p += 1;
+            }
+        }
+        matches!(self.toks.get(p), Some(Tok::Ident(s)) if {
+            let l = s.to_ascii_lowercase();
+            l == "oute" || l == "ine" || l == "bothe"
+        })
+    }
+
     fn peek_leading_hop(&self) -> Option<(Dir, Vec<String>)> {
         let mut p = self.pos;
         if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
@@ -5186,11 +5247,11 @@ mod tests {
                 "{edge_form} must equal {hop_form}",
             );
         }
-        // Origin-returning / ambiguous combinations are deferred, not mis-answered.
-        assert!(super::parse("g.V().outE().outV().values('name')").is_err());
-        assert!(super::parse("g.V().inE().inV().values('name')").is_err());
-        assert!(super::parse("g.V().bothE().inV().values('name')").is_err());
-        // A vertex move must immediately follow an edge step.
+        // Origin-returning combinations read the endpoint straight off the edge.
+        assert!(super::parse("g.V().outE().outV().values('name')").is_ok());
+        assert!(super::parse("g.V().inE().inV().values('name')").is_ok());
+        assert!(super::parse("g.V().bothE().inV().values('name')").is_ok());
+        // A vertex move with no edge frontier is still an error.
         assert!(super::parse("g.V().inV()").is_err());
     }
 

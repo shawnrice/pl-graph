@@ -178,6 +178,15 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
         Plan::AlgoAnnotate { input, .. } => estimate(input, store), // pass-through, +1 column
         Plan::Tree { .. } => Card::exact(1),       // folds all paths into one nested Map row
         Plan::MapSlot { input, .. } => estimate(input, store), // pass-through (append/overwrite a slot)
+        // Out/In keep one row per edge; Both fans out to two.
+        Plan::EdgeVertex { input, which, .. } => {
+            let f = if matches!(which, crate::ir::Dir::Both) {
+                2.0
+            } else {
+                1.0
+            };
+            estimate(input, store).scale(f, false)
+        }
         Plan::Subgraph { .. } => Card::exact(1),
         Plan::ShortestPathEnum { input, .. } => estimate(input, store).scale(4.0, false),
         Plan::Distinct { input } => {

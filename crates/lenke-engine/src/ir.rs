@@ -454,6 +454,15 @@ pub enum Plan {
     /// [`NodeSeed`] but for the edge frontier; an id resolving to no live edge
     /// contributes nothing. Preserves the requested id order.
     EdgeSeed { ext_ids: Vec<String> },
+    /// Move from an EDGE frontier to an endpoint VERTEX — Gremlin `outV`/`inV`/`bothV`
+    /// off an edge (e.g. `g.E().outV()`, `coalesce(outE(...)).inV()`), where no
+    /// preceding `outE`/`inE` pre-landed the endpoint. Reads the edge at `edge_slot`,
+    /// appends the endpoint node at a new slot; `Both` fans out to two rows per edge.
+    EdgeVertex {
+        input: Box<Plan>,
+        edge_slot: usize,
+        which: Dir,
+    },
     /// The correlated current row — the leaf of an `EXISTS { … }` body. It is NOT
     /// a stand-alone source: it yields whatever batch the enclosing `Expr::Exists`
     /// feeds it (the outer rows plus a provenance column), so it only ever appears

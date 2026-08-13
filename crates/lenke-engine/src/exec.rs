@@ -786,7 +786,8 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::Merge { .. }
         | Plan::AddEdge { .. }
         | Plan::CallProcedure { .. } => false,
-        Plan::Expand { input, .. }
+        Plan::EdgeVertex { input, .. }
+        | Plan::Expand { input, .. }
         | Plan::OptionalExpand { input, .. }
         | Plan::VarLength { input, .. }
         | Plan::RepeatGroup { input, .. }
@@ -908,6 +909,47 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .filter_map(|e| by_ext.get(e.as_str()).copied())
                 .collect();
             Batch::single(Col::Edges(ids))
+        }
+        Plan::EdgeVertex {
+            input,
+            edge_slot,
+            which,
+        } => {
+            // Edge frontier → endpoint vertex. Out=src (outV), In=dst (inV), Both=both
+            // (fans out to two rows/edge). The endpoint lands in a new appended slot;
+            // every other slot is carried through (duplicated for Both).
+            let b = pull(input, store, track)?;
+            let n = b.rows();
+            let mut keep: Vec<usize> = Vec::new();
+            let mut nodes: Vec<u32> = Vec::new();
+            for i in 0..n {
+                let eid = match b.slot(*edge_slot).value_at(i) {
+                    Value::Num(x) if x >= 0.0 => x as u32,
+                    _ => continue,
+                };
+                let Some((src, dst)) = store.edge_endpoints(eid) else {
+                    continue;
+                };
+                match which {
+                    Dir::Out => {
+                        keep.push(i);
+                        nodes.push(src);
+                    }
+                    Dir::In => {
+                        keep.push(i);
+                        nodes.push(dst);
+                    }
+                    Dir::Both => {
+                        keep.push(i);
+                        nodes.push(src);
+                        keep.push(i);
+                        nodes.push(dst);
+                    }
+                }
+            }
+            let mut out = b.gather(&keep);
+            out.slots.push(Col::Nodes(nodes));
+            out
         }
         Plan::IndexSeek { label, key, value } => {
             let ids = index_seek_ids(store, label, key, value);
@@ -3223,7 +3265,8 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
 /// The number of `Expand` hops in a pure Scan/Expand chain (0 for a bare seed).
 fn count_hops(plan: &Plan) -> usize {
     match plan {
-        Plan::Expand { input, .. } => 1 + count_hops(input),
+        Plan::EdgeVertex { input, .. }
+        | Plan::Expand { input, .. } => 1 + count_hops(input),
         _ => 0,
     }
 }
@@ -10146,7 +10189,8 @@ mod tests {
     fn has_interval_expand(p: &Plan) -> bool {
         match p {
             Plan::IntervalExpand { .. } => true,
-            Plan::Expand { input, .. }
+            Plan::EdgeVertex { input, .. }
+        | Plan::Expand { input, .. }
             | Plan::VarLength { input, .. }
             | Plan::ShortestPath { input, .. }
             | Plan::Filter { input, .. }
