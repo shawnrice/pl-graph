@@ -599,18 +599,57 @@ fn vertex_map_ext_id(v: &Value) -> Option<&str> {
     })
 }
 
+/// The `id` field of a bare-EDGE element map (`{id, from, to, labels, properties}`).
+fn edge_map_ext_id(v: &Value) -> Option<&str> {
+    let Value::Map(pairs) = v else { return None };
+    let keys: std::collections::BTreeSet<&str> = pairs
+        .iter()
+        .filter_map(|(k, _)| match k {
+            Value::Str(s) => Some(s.as_ref()),
+            _ => None,
+        })
+        .collect();
+    if keys.len() != pairs.len()
+        || keys != ["from", "id", "labels", "properties", "to"].into_iter().collect()
+    {
+        return None;
+    }
+    pairs.iter().find_map(|(k, val)| match (k, val) {
+        (Value::Str(k), Value::Str(id)) if k.as_ref() == "id" => Some(id.as_ref()),
+        _ => None,
+    })
+}
+
 /// Reconstitute an `unfold`ed element column: when every element is a resolvable
-/// bare-VERTEX element map (the fold().unfold() round-trip), resolve each `id` back to
-/// a live dense node id and return a `Col::Nodes` so downstream steps operate on the
-/// vertices again. Otherwise keep the raw values as a `Col::Gen`.
+/// bare VERTEX (or EDGE) element map (the fold().unfold() round-trip), resolve each
+/// `id` back to a live dense id and return a `Col::Nodes` (or `Col::Edges`) so
+/// downstream steps operate on the elements again. Otherwise keep the raw `Col::Gen`.
 fn reunfold_elements(elems: &[Value], store: &Store) -> Col {
-    if !elems.is_empty() {
-        let ids: Option<Vec<u32>> = elems
+    if elems.is_empty() {
+        return Col::Gen(Vec::new());
+    }
+    let nodes: Option<Vec<u32>> = elems
+        .iter()
+        .map(|v| vertex_map_ext_id(v).and_then(|ext| store.node_by_ext(ext)))
+        .collect();
+    if let Some(ids) = nodes {
+        return Col::Nodes(ids);
+    }
+    // Try edges — build a lazy ext→edge map (no reverse map is stored).
+    if elems.iter().all(|v| edge_map_ext_id(v).is_some()) {
+        let mut by_ext: std::collections::HashMap<Arc<str>, u32> =
+            std::collections::HashMap::new();
+        for e in store.all_edges() {
+            if let Some(x) = store.edge_ext_id(e) {
+                by_ext.entry(x).or_insert(e);
+            }
+        }
+        let eids: Option<Vec<u32>> = elems
             .iter()
-            .map(|v| vertex_map_ext_id(v).and_then(|ext| store.node_by_ext(ext)))
+            .map(|v| edge_map_ext_id(v).and_then(|ext| by_ext.get(ext).copied()))
             .collect();
-        if let Some(ids) = ids {
-            return Col::Nodes(ids);
+        if let Some(eids) = eids {
+            return Col::Edges(eids);
         }
     }
     Col::Gen(elems.to_vec())
@@ -2469,6 +2508,9 @@ fn fold_grouped(
                         total[g as usize] += x;
                         cnt[g as usize] += 1;
                     }
+                    // GQL faults on a non-numeric sum/avg; Gremlin (`null_on_empty`
+                    // marker) SKIPS it, like a null (so sum of {"text", 4} is 4).
+                    _ if agg.null_on_empty => {}
                     _ => return Err("sum()/avg() require numeric values".into()),
                 }
             }

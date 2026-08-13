@@ -2335,8 +2335,9 @@ impl Parser {
                             distinct: false,
                             name: lname.clone(),
                             frac: None,
-                            // Gremlin sum() of nothing is NULL, not 0.
-                            null_on_empty: matches!(func, AggFn::Sum),
+                            // Gremlin numeric-agg semantics: sum() of nothing is NULL and
+                            // a non-numeric sum()/mean() propagates NaN (never faults).
+                            null_on_empty: matches!(func, AggFn::Sum | AggFn::Avg),
                         }],
                     );
                     self.current = 0;
@@ -2939,7 +2940,9 @@ impl Parser {
                         distinct: false,
                         name: "value".into(),
                         frac: None,
-                        null_on_empty: matches!(func, AggFn::Sum),
+                        // Gremlin numeric-agg semantics: sum() of nothing is NULL, and a
+                        // non-numeric sum()/mean() propagates NaN (never faults).
+                        null_on_empty: matches!(func, AggFn::Sum | AggFn::Avg),
                     },
                     // Default (no second by) or bare by(): fold the group's elements.
                     _ => Agg {
