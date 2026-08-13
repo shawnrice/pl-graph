@@ -4423,24 +4423,40 @@ impl Parser {
         let key = self.str_arg()?;
         let pred = if self.peek() == Some(&Tok::Comma) {
             self.bump();
-            if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("P")) {
-                self.bump();
-                self.expect(&Tok::Dot)?;
+            // `has('k', <literal>)` is equality; `has('k', [P.]op(v))` a comparison.
+            let is_op = matches!(self.peek(), Some(Tok::Ident(s)) if {
+                let l = s.to_ascii_lowercase();
+                s.as_str() == "P" || matches!(l.as_str(), "eq"|"neq"|"gt"|"gte"|"lt"|"lte")
+            }) && self.toks.get(self.pos + 1) == Some(&Tok::Dot)
+                || matches!(self.peek(), Some(Tok::Ident(s)) if {
+                    matches!(s.to_ascii_lowercase().as_str(), "eq"|"neq"|"gt"|"gte"|"lt"|"lte")
+                }) && self.toks.get(self.pos + 1) == Some(&Tok::LParen);
+            if !is_op {
+                // A bare literal value → equality.
+                let v = self.literal()?;
+                Some((CompareOp::Eq, v))
+            } else {
+                if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("P")) {
+                    self.bump();
+                    self.expect(&Tok::Dot)?;
+                }
+                let op = self.ident()?.to_ascii_lowercase();
+                self.expect(&Tok::LParen)?;
+                let v = self.literal()?;
+                self.expect(&Tok::RParen)?;
+                let cop = match op.as_str() {
+                    "eq" => CompareOp::Eq,
+                    "neq" => CompareOp::Ne,
+                    "gt" => CompareOp::Gt,
+                    "gte" => CompareOp::Ge,
+                    "lt" => CompareOp::Lt,
+                    "lte" => CompareOp::Le,
+                    other => {
+                        return Err(format!("match() has(): unsupported predicate `{other}`"))
+                    }
+                };
+                Some((cop, v))
             }
-            let op = self.ident()?.to_ascii_lowercase();
-            self.expect(&Tok::LParen)?;
-            let v = self.literal()?;
-            self.expect(&Tok::RParen)?;
-            let cop = match op.as_str() {
-                "eq" => CompareOp::Eq,
-                "neq" => CompareOp::Ne,
-                "gt" => CompareOp::Gt,
-                "gte" => CompareOp::Ge,
-                "lt" => CompareOp::Lt,
-                "lte" => CompareOp::Le,
-                other => return Err(format!("match() has(): unsupported predicate `{other}`")),
-            };
-            Some((cop, v))
         } else {
             None
         };
