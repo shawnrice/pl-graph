@@ -1228,7 +1228,7 @@ fn interval_pattern(pred: &Expr, edge_slot: usize) -> Option<(String, String, Ex
 fn max_slot(expr: &Expr) -> Option<usize> {
     match expr {
         Expr::Slot(n) => Some(*n),
-        Expr::Prop { slot, .. } => Some(*slot),
+        Expr::Prop { slot, .. } | Expr::IsLabeled { slot, .. } => Some(*slot),
         Expr::Lit(_) | Expr::Path | Expr::PathAccess { .. } | Expr::GremlinPath { .. } => None,
         Expr::Not(x) => max_slot(x),
         Expr::And(a, b)

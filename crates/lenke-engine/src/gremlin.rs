@@ -384,16 +384,13 @@ fn compare_op_tag(op: CompareOp) -> &'static str {
 /// list-valued `labels()` element function and `Expr::In`, so it works anywhere in a
 /// traversal (not just folded into a scan).
 fn label_membership(slot: usize, labels: &[String]) -> Expr {
-    let one = |l: &str| Expr::In {
-        needle: Box::new(Expr::Lit(Value::Str(l.into()))),
-        haystack: Box::new(Expr::Call {
-            name: "labels".to_string(),
-            args: vec![Expr::Slot(slot)],
-        }),
-    };
-    let mut it = labels.iter();
-    let first = one(it.next().expect("hasLabel needs at least one label"));
-    it.fold(first, |acc, l| Expr::Or(Box::new(acc), Box::new(one(l))))
+    // A single vectorized membership test over the label buckets — no per-row list
+    // materialization (the old `In(Lit, labels(slot))` OR-chain allocated a label list
+    // and string-compared per row, which dominated `hasLabel` filters on big frontiers).
+    Expr::IsLabeled {
+        slot,
+        labels: labels.to_vec(),
+    }
 }
 
 /// Whether a plan is a write (so read steps cannot chain after it).

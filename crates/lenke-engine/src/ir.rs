@@ -129,6 +129,14 @@ pub enum GraphPredOp {
 pub enum Expr {
     /// The value bound at slot `n` (e.g. a scanned or expanded node).
     Slot(usize),
+    /// Gremlin `hasLabel(L, …)` / GQL label test: TRUE iff the element in `slot` carries
+    /// ANY of `labels`. Evaluated by resolving each label's (sorted) id bucket ONCE and
+    /// binary-searching per row — no per-row list materialization or string hashing,
+    /// unlike the `In(Lit, labels(slot))` form it replaces.
+    IsLabeled {
+        slot: usize,
+        labels: Vec<String>,
+    },
     /// A property of the element in slot `slot`.
     Prop {
         slot: usize,

@@ -904,6 +904,7 @@ fn needs_lineage(plan: &Plan) -> bool {
             | Expr::Prop { .. }
             | Expr::Lit(_)
             | Expr::PropertyExists { .. }
+            | Expr::IsLabeled { .. }
             | Expr::Exists { .. }
             | Expr::CountSubquery { .. }
             | Expr::ScalarSubquery { .. }
@@ -5435,7 +5436,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         }
         Expr::Compare { left, right, .. } => refs_only_slot(left, s) && refs_only_slot(right, s),
         Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => refs_only_slot(expr, s),
-        Expr::PropertyExists { slot, .. } => *slot == s,
+        Expr::PropertyExists { slot, .. } | Expr::IsLabeled { slot, .. } => *slot == s,
         // An EXISTS correlates on outer slots below `outer_width`; conservatively
         // treat it as touching more than one, so it never rides the frontier-only
         // aggregate fast path.
@@ -5540,6 +5541,10 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         Expr::PropertyExists { slot, key } => Expr::PropertyExists {
             slot: if *slot == from { to } else { *slot },
             key: key.clone(),
+        },
+        Expr::IsLabeled { slot, labels } => Expr::IsLabeled {
+            slot: if *slot == from { to } else { *slot },
+            labels: labels.clone(),
         },
         // Never reached: `refs_only_slot` rejects EXISTS, so the frontier remap
         // that calls this is never handed one. Clone rather than rewrite a body.
@@ -8195,6 +8200,32 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                     .map(|i| col.value_at(i).is_null() != *negated)
                     .collect(),
             )
+        }
+        Expr::IsLabeled { slot, labels } => {
+            // Membership via the label buckets: resolve each label's sorted id bucket
+            // ONCE, then binary-search per row (nodes) — no per-row list build or string
+            // hashing. Edges compare the type name (rarer path). A non-element is false.
+            let node_buckets: Vec<&[u32]> =
+                labels.iter().map(|l| store.nodes_with_label(l)).collect();
+            match batch.slot(*slot) {
+                Col::Nodes(ids) => Col::Bool(
+                    ids.iter()
+                        .map(|&id| {
+                            id != u32::MAX
+                                && node_buckets.iter().any(|b| b.binary_search(&id).is_ok())
+                        })
+                        .collect(),
+                ),
+                Col::Edges(eids) => Col::Bool(
+                    eids.iter()
+                        .map(|&e| {
+                            e != u32::MAX
+                                && store.edge_type_name(e).is_some_and(|t| labels.contains(&t))
+                        })
+                        .collect(),
+                ),
+                other => Col::Bool(vec![false; other.len()]),
+            }
         }
         Expr::PropertyExists { slot, key } => {
             // Presence, not value: TRUE iff the element carries a stored value for
