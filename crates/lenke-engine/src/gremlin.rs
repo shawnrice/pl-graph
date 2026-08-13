@@ -2518,9 +2518,11 @@ impl Parser {
                     }
                 }
                 self.expect(&Tok::RParen)?;
-                // Optional `.by('k'|id|label)`: dedup by that property/token of the
-                // element (keep the first element per distinct by-value).
-                if self.peek() == Some(&Tok::Dot)
+                // Optional `.by('k'|id|label)` modulators: dedup by the TUPLE of those
+                // by-values of the element (keep the first per distinct tuple).
+                let mut by_slots: Vec<usize> = Vec::new();
+                let mut p = plan;
+                while self.peek() == Some(&Tok::Dot)
                     && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
                 {
                     self.expect(&Tok::Dot)?;
@@ -2529,10 +2531,14 @@ impl Parser {
                     let (_, e) = self.by_key_expr(self.current)?;
                     self.expect(&Tok::RParen)?;
                     let w = self.slots;
-                    let p = plan.map_slot(w, e, true);
+                    p = p.map_slot(w, e, true);
                     self.slots += 1;
-                    return Ok(p.distinct_by(vec![w]));
+                    by_slots.push(w);
                 }
+                if !by_slots.is_empty() {
+                    return Ok(p.distinct_by(by_slots));
+                }
+                let plan = p;
                 if labels.is_empty() {
                     // Gremlin dedup() dedups on the CURRENT traverser value, not the
                     // whole row — after a hop the row also carries the source, so a
@@ -2950,6 +2956,21 @@ impl Parser {
                         }
                     })
                 };
+                // A select over an UNBOUND tag drops every traverser (core yields
+                // nothing), rather than erroring — the tag is a compile-time slot, so an
+                // unknown one produces no output.
+                let any_unbound = labels.iter().any(|l| {
+                    if pop_all {
+                        !self.all_labels.contains_key(l)
+                    } else {
+                        !self.labels.contains_key(l)
+                    }
+                });
+                if any_unbound {
+                    self.current = 0;
+                    self.slots = 1;
+                    return Ok(plan.filter(Expr::Lit(Value::Bool(false))));
+                }
                 let p = if pop_all {
                     // Pop.all: every binding of the (single) tag, as a list.
                     let slots = self
@@ -6538,9 +6559,10 @@ mod tests {
 
     #[test]
     fn select_errors() {
-        // An unknown label errors — whether alone or inside a multi-select.
-        assert!(super::parse("g.V().as('p').select('q')").is_err());
-        assert!(super::parse("g.V().as('a').out('R').as('b').select('a','z')").is_err());
+        // A select over an UNKNOWN label drops every traverser (core yields nothing),
+        // rather than erroring — whether alone or inside a multi-select.
+        assert!(super::parse("g.V().as('p').select('q')").is_ok());
+        assert!(super::parse("g.V().as('a').out('R').as('b').select('a','z')").is_ok());
     }
 
     #[test]
