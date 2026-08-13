@@ -116,6 +116,7 @@ pub enum Step {
     TailLocal(usize),
     Inject(Vec<Val>),
     Tree,
+    DedupLabels(Vec<&'static str>),
 }
 
 /// A whole traversal: an ordered list of steps.
@@ -271,6 +272,7 @@ fn emit_step(st: &Step) -> String {
         TailLocal(n) => format!("tail(local,{n})"),
         Inject(vs) => format!("inject({})", join_vals(vs)),
         Tree => "tree()".into(),
+        DedupLabels(ls) => format!("dedup({})", join_labels(ls)),
     }
 }
 
@@ -395,6 +397,7 @@ fn apply_core(t: CTrav, st: &Step) -> CTrav {
         TailLocal(n) => t.tail_local(*n),
         Inject(vs) => t.inject(vs.iter().map(cval).collect::<Vec<_>>()),
         Tree => t.tree(),
+        DedupLabels(ls) => t.dedup_labels(ls.iter().map(|s| s.to_string()).collect()),
     }
 }
 

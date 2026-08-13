@@ -455,6 +455,16 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             let (i, c) = rewrite(*input, idx);
             (Plan::Distinct { input: Box::new(i) }, c)
         }
+        Plan::DistinctBy { input, key_slots } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::DistinctBy {
+                    input: Box::new(i),
+                    key_slots,
+                },
+                c,
+            )
+        }
         Plan::OptionalScan {
             input,
             label,
@@ -1212,6 +1222,7 @@ fn width(plan: &Plan) -> usize {
         Plan::Filter { input, .. }
         | Plan::OrderPage { input, .. }
         | Plan::Distinct { input }
+        | Plan::DistinctBy { input, .. }
         | Plan::Tail { input, .. }
         | Plan::SortLocal { input, .. } => width(input),
         // The padded null row carries exactly the pattern's columns.
@@ -1664,6 +1675,8 @@ mod tests {
             | Plan::Update { input, .. }
             | Plan::CallInline { input, .. }
             | Plan::Distinct { input }
+            | Plan::DistinctBy { input, .. }
+            | Plan::DistinctBy { input, .. }
             | Plan::Tail { input, .. }
             | Plan::Branch { input, .. }
             | Plan::NullPadIfEmpty { input, .. }

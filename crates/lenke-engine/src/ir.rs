@@ -695,6 +695,13 @@ pub enum Plan {
     /// two NaNs / two -0.0s collapse — the grouping notion, not predicate
     /// equality. Placed above a Project, it is `RETURN DISTINCT …`.
     Distinct { input: Box<Plan> },
+    /// Gremlin `dedup('a','b')`: keep the FIRST row per distinct tuple of values at
+    /// `key_slots` (the tagged slots), preserving every other column — a keyed
+    /// first-seen distinct, unlike `Distinct` which keys the whole row.
+    DistinctBy {
+        input: Box<Plan>,
+        key_slots: Vec<usize>,
+    },
     /// `<query> UNION [ALL] <query>`: run both arms and concatenate their rows. The
     /// result's column names come from the LEFT arm (core's rule — a name mismatch
     /// is not an error). `UNION` (all=false) deduplicates the combined rows by the
@@ -1046,6 +1053,13 @@ impl Plan {
     }
 
     #[must_use]
+    pub fn distinct_by(self, key_slots: Vec<usize>) -> Self {
+        Self::DistinctBy {
+            input: Box::new(self),
+            key_slots,
+        }
+    }
+
     pub fn distinct(self) -> Self {
         Self::Distinct {
             input: Box::new(self),

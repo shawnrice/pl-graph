@@ -707,6 +707,29 @@ fn gremlin_parity() {
             false,
             vec![V, HasLabel(vec!["PERSON"]), Values(vec!["name"]), Barrier],
         ),
+        // — dedup(labels): keyed distinct on a tagged value —
+        c(
+            "dedup_by_lang_tag",
+            false,
+            vec![
+                V,
+                HasLabel(vec!["SOFTWARE"]),
+                Values(vec!["lang"]),
+                As("l"),
+                DedupLabels(vec!["l"]),
+            ],
+        ),
+        c(
+            "dedup_created_targets",
+            false,
+            vec![
+                V,
+                Out(vec!["CREATED"]),
+                As("c"),
+                DedupLabels(vec!["c"]),
+                Values(vec!["name"]),
+            ],
+        ),
         // — tree(): nested-map fold of vertex-hop paths —
         c(
             "tree_by_name",

@@ -755,6 +755,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::NestedGroup { input, .. }
         | Plan::ShortestPath { input, .. }
         | Plan::Distinct { input }
+        | Plan::DistinctBy { input, .. }
         | Plan::Tail { input, .. }
         | Plan::NullPadIfEmpty { input, .. }
         | Plan::GroupToMap { input }
@@ -1361,6 +1362,30 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                     buf.clear();
                     for c in &batch.slots {
                         value::group_key_into(&c.value_at(i), &mut buf);
+                    }
+                    if seen.contains(buf.as_slice()) {
+                        false
+                    } else {
+                        seen.insert(buf.clone());
+                        true
+                    }
+                })
+                .collect();
+            batch.gather(&keep)
+        }
+        Plan::DistinctBy { input, key_slots } => {
+            // Gremlin dedup('a','b'): keep the first row per distinct tuple of the
+            // tagged key slots, preserving every other column (group-first-seen keyed
+            // on those slots only). Same NaN-never-a-duplicate rule as Distinct.
+            let batch = pull(input, store, track)?;
+            let n = batch.rows();
+            let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
+            let mut buf = Vec::new();
+            let keep: Vec<usize> = (0..n)
+                .filter(|&i| {
+                    buf.clear();
+                    for &s in key_slots {
+                        value::group_key_into(&batch.slot(s).value_at(i), &mut buf);
                     }
                     if seen.contains(buf.as_slice()) {
                         false

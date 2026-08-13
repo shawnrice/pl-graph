@@ -1072,8 +1072,31 @@ impl Parser {
                 p
             }
             "dedup" => {
+                // dedup() dedups the whole row; dedup('a','b') keeps the first row per
+                // distinct tuple of the values TAGGED at those labels (keyed distinct).
+                let mut labels: Vec<String> = Vec::new();
+                if matches!(self.peek(), Some(Tok::Str(_))) {
+                    labels.push(self.str_arg()?);
+                    while self.peek() == Some(&Tok::Comma) {
+                        self.bump();
+                        labels.push(self.str_arg()?);
+                    }
+                }
                 self.expect(&Tok::RParen)?;
-                plan.distinct()
+                if labels.is_empty() {
+                    plan.distinct()
+                } else {
+                    let key_slots = labels
+                        .iter()
+                        .map(|l| {
+                            self.labels
+                                .get(l)
+                                .copied()
+                                .ok_or_else(|| format!("dedup('{l}'): no step is labelled `{l}`"))
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
+                    plan.distinct_by(key_slots)
+                }
             }
             "limit" => {
                 let n = self.usize_arg()?;

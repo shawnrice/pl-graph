@@ -180,6 +180,7 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
             // At most the input; without a cheap distinct count assume heavy overlap.
             estimate(input, store).scale(0.5, false)
         }
+        Plan::DistinctBy { input, .. } => estimate(input, store).scale(0.5, false),
         Plan::OrderPage {
             input, skip, limit, ..
         } => {
