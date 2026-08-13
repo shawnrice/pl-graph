@@ -1761,24 +1761,16 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // Gremlin dedup('a','b'): keep the first row per distinct tuple of the
             // tagged key slots, preserving every other column (group-first-seen keyed
             // on those slots only). Same NaN-never-a-duplicate rule as Distinct.
+            // Over a LARGE streamable fan-out, dedup incrementally block-by-block so the
+            // exploding frontier is never fully materialized (same first-seen result).
+            if let Some(b) = try_distinct_by_streamed(input, key_slots, store, track)? {
+                return Ok(b);
+            }
             let batch = pull(input, store, track)?;
-            let n = batch.rows();
-            let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
-            let mut buf = Vec::new();
-            let keep: Vec<usize> = (0..n)
-                .filter(|&i| {
-                    buf.clear();
-                    for &s in key_slots {
-                        value::group_key_into(&batch.slot(s).value_at(i), &mut buf);
-                    }
-                    if seen.contains(buf.as_slice()) {
-                        false
-                    } else {
-                        seen.insert(buf.clone());
-                        true
-                    }
-                })
-                .collect();
+            let typed = distinct_by_typed(&batch, key_slots);
+            let mut seen_ids: FnvSet<u32> = FnvSet::default();
+            let mut seen_bytes: FnvSet<Vec<u8>> = FnvSet::default();
+            let keep = distinct_by_keep(&batch, key_slots, typed, &mut seen_ids, &mut seen_bytes);
             batch.gather(&keep)
         }
         Plan::SortLocal {
@@ -2195,6 +2187,99 @@ fn pull_distinct_capped_stream(
         acc.push(b.gather(&keep));
         start = end;
         block = block.saturating_mul(2).min(8192);
+    }
+    Ok(Some(concat_batches(&acc)))
+}
+
+/// Keep the rows of `batch` whose key (the `key_slots` tuple) is seen for the FIRST
+/// time, threading the seen-set across calls (streamed dedup). A SINGLE node/edge key
+/// slot (`typed`) deduplicates by raw `u32` id — no per-row byte-key serialization,
+/// which dominated `dedup()` over a big fan-out; `value_at(Col::Nodes)` is `Node(id)`
+/// so a node's group key IS its id, keeping it byte-identical.
+fn distinct_by_keep(
+    batch: &Batch,
+    key_slots: &[usize],
+    typed: bool,
+    seen_ids: &mut FnvSet<u32>,
+    seen_bytes: &mut FnvSet<Vec<u8>>,
+) -> Vec<usize> {
+    let mut keep = Vec::new();
+    if typed {
+        let ids: &[u32] = match batch.slot(key_slots[0]) {
+            Col::Nodes(v) | Col::Edges(v) => v,
+            _ => unreachable!("typed only when the single key slot is Nodes/Edges"),
+        };
+        for (i, &id) in ids.iter().enumerate() {
+            if seen_ids.insert(id) {
+                keep.push(i);
+            }
+        }
+    } else {
+        let mut buf = Vec::new();
+        for i in 0..batch.rows() {
+            buf.clear();
+            for &s in key_slots {
+                value::group_key_into(&batch.slot(s).value_at(i), &mut buf);
+            }
+            if seen_bytes.insert(buf.clone()) {
+                keep.push(i);
+            }
+        }
+    }
+    keep
+}
+
+/// Whether `batch`'s single key slot is a node/edge column (so `distinct_by_keep` can
+/// key by raw `u32`).
+fn distinct_by_typed(batch: &Batch, key_slots: &[usize]) -> bool {
+    key_slots.len() == 1 && matches!(batch.slot(key_slots[0]), Col::Nodes(_) | Col::Edges(_))
+}
+
+/// UNCAPPED `dedup` (`Plan::DistinctBy`) over a streamable chain with BOUNDED memory:
+/// stream the source in blocks through the chain, deduping incrementally on `key_slots`
+/// into a global key set and keeping only the first occurrence of each key. A high
+/// fan-out (`both().both()…`) that dedups down to ≤ node_count distinct keys never
+/// materializes the exploding frontier — the peak is one block's expansion plus the
+/// distinct rows. Blocks run in source-id order, so first-occurrence order (hence the
+/// result) is byte-identical to materialize-then-dedup. Gated to a large estimated
+/// input and `!track` (lineage would need the full path); `None` otherwise.
+fn try_distinct_by_streamed(
+    inner: &Plan,
+    key_slots: &[usize],
+    store: &Store,
+    track: bool,
+) -> Result<Option<Batch>, String> {
+    if track {
+        return Ok(None); // a path-reading dedup keeps the full lineage — slow path
+    }
+    if !crate::cost::prefer_bounded_memory(inner, store, &crate::cost::Budget::default_budget()) {
+        return Ok(None); // small intermediate → materializing is cheaper than blocking
+    }
+    let Some((body, ids)) = streaming_chain(inner, store) else {
+        return Ok(None);
+    };
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    // A fixed block bounds the peak intermediate (block × fan-out) without the
+    // early-stop adaptive sizing the capped streamers need (here we scan everything).
+    const BLOCK: usize = 2048;
+    let mut seen_ids: FnvSet<u32> = FnvSet::default();
+    let mut seen_bytes: FnvSet<Vec<u8>> = FnvSet::default();
+    let mut typed: Option<bool> = None;
+    let mut acc: Vec<Batch> = Vec::new();
+    let mut start = 0usize;
+    while start < ids.len() {
+        let end = (start + BLOCK).min(ids.len());
+        let b = pull_body(
+            &body,
+            store,
+            &Batch::single(Col::Nodes(ids[start..end].to_vec())),
+        )?;
+        let t = *typed.get_or_insert_with(|| distinct_by_typed(&b, key_slots));
+        let keep = distinct_by_keep(&b, key_slots, t, &mut seen_ids, &mut seen_bytes);
+        acc.push(b.gather(&keep));
+        start = end;
     }
     Ok(Some(concat_batches(&acc)))
 }
