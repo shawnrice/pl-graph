@@ -2725,6 +2725,9 @@ impl Parser {
                     Key(String),
                     Id,
                     Label,
+                    /// A degree sub-traversal `[__.]<hop>('L'…).count()` — the count of
+                    /// the tagged element's neighbours; built per tag from its slot.
+                    Degree(Dir, Vec<String>, bool),
                 }
                 let mut bys: Vec<SelBy> = Vec::new();
                 while self.peek() == Some(&Tok::Dot)
@@ -2733,20 +2736,78 @@ impl Parser {
                     self.expect(&Tok::Dot)?;
                     self.ident()?; // `by`
                     self.expect(&Tok::LParen)?;
+                    // A degree sub-traversal `[__.]<hop>('L'…)[.values('k')].count()`.
+                    let deg_head = {
+                        let mut p = self.pos;
+                        if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
+                            p += 1;
+                            if self.toks.get(p) == Some(&Tok::Dot) {
+                                p += 1;
+                            }
+                        }
+                        matches!(self.toks.get(p), Some(Tok::Ident(s)) if matches!(
+                            s.to_ascii_lowercase().as_str(),
+                            "out" | "in" | "both" | "oute" | "ine" | "bothe"))
+                    };
                     if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("T")) {
                         self.bump();
                         self.expect(&Tok::Dot)?;
                     }
-                    let by = match self.peek().cloned() {
-                        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("id") => {
+                    let by = if deg_head {
+                        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
                             self.bump();
-                            SelBy::Id
+                            self.expect(&Tok::Dot)?;
                         }
-                        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("label") => {
-                            self.bump();
-                            SelBy::Label
+                        let hop = self.ident()?.to_ascii_lowercase();
+                        let (dir, is_edge) = match hop.as_str() {
+                            "out" => (Dir::Out, false),
+                            "in" => (Dir::In, false),
+                            "both" => (Dir::Both, false),
+                            "oute" => (Dir::Out, true),
+                            "ine" => (Dir::In, true),
+                            _ => (Dir::Both, true),
+                        };
+                        self.expect(&Tok::LParen)?;
+                        let mut ls: Vec<String> = Vec::new();
+                        if matches!(self.peek(), Some(Tok::Str(_))) {
+                            ls.push(self.str_arg()?);
+                            while self.peek() == Some(&Tok::Comma) {
+                                self.bump();
+                                ls.push(self.str_arg()?);
+                            }
                         }
-                        _ => SelBy::Key(self.str_arg()?),
+                        self.expect(&Tok::RParen)?;
+                        // Optional intermediate `.values('k')` (counts present names —
+                        // same cardinality as the hop, so ignored for a count).
+                        if self.peek() == Some(&Tok::Dot)
+                            && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("values"))
+                        {
+                            self.expect(&Tok::Dot)?;
+                            self.ident()?; // values
+                            self.expect(&Tok::LParen)?;
+                            self.str_arg()?;
+                            self.expect(&Tok::RParen)?;
+                        }
+                        self.expect(&Tok::Dot)?;
+                        let c = self.ident()?; // count
+                        if !c.eq_ignore_ascii_case("count") {
+                            return Err("select().by(<traversal>) must end with .count()".into());
+                        }
+                        self.expect(&Tok::LParen)?;
+                        self.expect(&Tok::RParen)?;
+                        SelBy::Degree(dir, ls, is_edge)
+                    } else {
+                        match self.peek().cloned() {
+                            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("id") => {
+                                self.bump();
+                                SelBy::Id
+                            }
+                            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("label") => {
+                                self.bump();
+                                SelBy::Label
+                            }
+                            _ => SelBy::Key(self.str_arg()?),
+                        }
                     };
                     self.expect(&Tok::RParen)?;
                     bys.push(by);
@@ -2780,6 +2841,17 @@ impl Parser {
                                 name: "element_label".into(),
                                 args: vec![Expr::Slot(slot)],
                             },
+                            SelBy::Degree(dir, ls, is_edge) => {
+                                let body = if *is_edge {
+                                    Plan::Row.expand_edge(slot, *dir, ls)
+                                } else {
+                                    Plan::Row.expand(slot, *dir, ls)
+                                };
+                                Expr::CountSubquery {
+                                    body: Box::new(body),
+                                    outer_width: self.slots,
+                                }
+                            }
                         }
                     })
                 };
