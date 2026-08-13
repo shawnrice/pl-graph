@@ -425,6 +425,7 @@ fn time_core(
     graph: &mut lenke_core::graph::Graph,
     q: &str,
     reps: usize,
+    materialize: bool,
 ) -> Result<(f64, usize), String> {
     let t = lenke_core::gremlin::parse(q).map_err(|e| format!("parse: {e}"))?;
     let mut best = f64::MAX;
@@ -432,6 +433,15 @@ fn time_core(
     for _ in 0..reps {
         let ti = Instant::now();
         let rs = lenke_core::gremlin::try_run(graph, &t).map_err(|e| format!("exec: {e:?}"))?;
+        // Core returns LAZY GVal::Node/Edge handles; the engine's run() fully MATERIALIZES
+        // its result (render_cell → element-map Values). To compare "time to produce the
+        // usable result" (not "time to a lazy handle"), force core to render its output —
+        // else element-returning shapes (fold/valueMap/path/id) measure work core simply
+        // deferred. Mirrors the GQL harness, which times core's materialized RowSet.
+        if materialize {
+            let s = lenke_core::gremlin::exec::results_to_json(graph, &rs);
+            std::hint::black_box(&s);
+        }
         best = best.min(ti.elapsed().as_secs_f64() * 1e3);
         rows = rs.len();
     }
@@ -464,6 +474,10 @@ fn main() {
     let max_time = env_u32("FUZZ_MAX_TEMPLATES", 2000) as usize;
     let budget = Duration::from_millis(u64::from(env_u32("FUZZ_BUDGET_MS", 1500)));
     let opt = env_u32("GREMLIN_OPT", 0) != 0;
+    // Materialize core's result (render to output) so element-returning shapes compare
+    // the SAME work the engine's run() already does. Set MATERIALIZE=0 to measure core's
+    // lazy try_run instead (engine looks worse on fold/valueMap/path — an artifact).
+    let materialize = env_u32("MATERIALIZE", 1) != 0;
 
     eprintln!(
         "fixture: {n} nodes, deg {deg}; generating {gen_n} traversals (seed {seed}); engine-opt={opt}"
@@ -513,7 +527,7 @@ fn main() {
                 continue;
             }
         };
-        let c = match time_core(&mut cgraph, q, REPS) {
+        let c = match time_core(&mut cgraph, q, REPS, materialize) {
             Ok(v) => v,
             Err(why) => {
                 *skips.entry(format!("core {}", first_line(&why))).or_insert(0) += 1;
