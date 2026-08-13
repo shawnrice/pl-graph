@@ -1903,7 +1903,9 @@ impl Parser {
                 self.slots = 1;
                 p
             }
-            "id" | "label" => {
+            // (When in a `properties(...)` stream, `label()`/`key()` mean the property
+            // key — handled by the guarded prop arm below, so exclude label here.)
+            "id" | "label" if !(lname == "label" && self.prop_keys.is_some()) => {
                 // Element accessors: `id()` → the preserved external id (polymorphic
                 // node/edge, via `element_id`); `label()` → a single label string (a
                 // vertex's label or an edge's type, via `element_label`). Both project
@@ -2101,21 +2103,46 @@ impl Parser {
                     None => plan,
                 }
             }
-            "key" if self.prop_keys.is_some() => {
-                // `properties('k').key()` → the property KEY (a constant per stream).
+            "key" | "label" if self.prop_keys.is_some() => {
+                // `properties('k').key()`/`.label()` → the property KEY. A single-key
+                // stream is a constant; an all-keys `properties()` fans out the element's
+                // present property keys (one row per key) via keys(element) + unwind.
                 self.expect(&Tok::RParen)?;
                 let keys = self.prop_keys.take().unwrap();
-                let key = keys
-                    .first()
-                    .cloned()
-                    .ok_or("key() after a multi-key properties() is not yet supported")?;
-                let p = plan.project(vec![(
-                    "key".to_string(),
-                    Expr::Lit(Value::Str(key.into())),
-                )]);
-                self.current = 0;
-                self.slots = 1;
-                p
+                if keys.len() == 1 {
+                    let p = plan.project(vec![(
+                        "key".to_string(),
+                        Expr::Lit(Value::Str(keys[0].clone().into())),
+                    )]);
+                    self.current = 0;
+                    self.slots = 1;
+                    p
+                } else {
+                    // all/multi keys: append the element's key LIST as a new slot, then
+                    // unwind it into a stream of one key per row (the unfold pattern).
+                    let keys_slot = self.slots;
+                    let listed = plan.map_slot(
+                        keys_slot,
+                        Expr::Call {
+                            name: "keys".to_string(),
+                            args: vec![Expr::Slot(self.current)],
+                        },
+                        true,
+                    );
+                    self.slots += 1;
+                    let var_slot = self.slots;
+                    self.slots += 1;
+                    let unwound = Plan::Unwind {
+                        input: Box::new(listed),
+                        list: Box::new(Expr::Slot(keys_slot)),
+                        var_slot,
+                        ordinal: None,
+                    };
+                    let p = unwound.project(vec![("key".to_string(), Expr::Slot(var_slot))]);
+                    self.current = 0;
+                    self.slots = 1;
+                    p
+                }
             }
             "hasvalue" if self.prop_keys.is_some() => {
                 // `properties('k').hasValue(v…)` → keep the property whose value is one of
