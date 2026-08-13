@@ -426,6 +426,25 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
 
 // --- parser ------------------------------------------------------------------
 
+/// An open `repeat(<hop>)` awaiting its modulators. `times(n)` bounds the walk;
+/// `emit()`/`emit(pred)` and `until(pred)` emit at every depth (min becomes 1) and
+/// optionally filter the emitted endpoint. Flushed into a `VarLength` walk (endpoint
+/// at `out_slot`) by `flush_repeat` when a non-modulator step or the end follows.
+struct RepeatCtx {
+    dir: Dir,
+    label: Option<String>,
+    /// the slot the loop hops FROM (the element repeat() was reached on).
+    from: usize,
+    /// the slot the walk's endpoint lands in (== the width at flush time).
+    out_slot: usize,
+    /// `times(n)` bound, if given; absent means the default iteration cap.
+    times: Option<u32>,
+    /// emit/until makes the walk emit at every depth ≥ 1 (min = 1).
+    min_one: bool,
+    /// an `emit(pred)`/`until(pred)` filter on the emitted endpoint (at `out_slot`).
+    filter: Option<Expr>,
+}
+
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
@@ -443,12 +462,10 @@ struct Parser {
     /// `step`, so a vertex move only resolves when it IMMEDIATELY follows the edge
     /// hop — exactly Gremlin's requirement.
     edge_hop: Option<(usize, Dir)>,
-    /// Set by `repeat(<hop>)` and consumed by the very next `times(n)`: the single
-    /// hop `(direction, edge label)` the loop body applies. `repeat` alone is an
-    /// unbounded loop (unsupported), so the body is held here until `times` closes
-    /// it into a fixed-length `VarLength{min:n,max:n}`. A `repeat` not immediately
-    /// followed by `times` is an error (see the guard at the top of `step`).
-    pending_repeat: Option<(Dir, Option<String>)>,
+    /// Set by `repeat(<hop>)` and held open across its modulators (`times`/`emit`/
+    /// `until`); the next non-modulator step (or the end) flushes it into a
+    /// `VarLength` walk. See [`RepeatCtx`] and `flush_repeat`.
+    pending_repeat: Option<RepeatCtx>,
     /// Whether `path()` can still be answered: true while the traversal is a pure
     /// vertex-hop chain (`V`-source + `out`/`in`/`both` + element filters), whose
     /// Gremlin path is exactly the node sequence the engine's lineage records. Any
@@ -753,9 +770,7 @@ impl Parser {
             self.pos += 1;
             plan = self.step(plan)?;
         }
-        if self.pending_repeat.is_some() {
-            return Err("repeat(<hop>) must be followed by times(n)".into());
-        }
+        plan = self.flush_repeat(plan)?;
         if self.pos != self.toks.len() {
             return Err(format!("unexpected trailing input at token {}", self.pos));
         }
@@ -769,11 +784,15 @@ impl Parser {
         // An edge hop's landed endpoint is only reachable by the vertex move that
         // IMMEDIATELY follows it; consume the record here so any other step clears it.
         let prev_edge_hop = self.edge_hop.take();
-        // A `repeat(body)` is only valid when closed by the very next `times(n)`.
-        let prev_repeat = self.pending_repeat.take();
-        if prev_repeat.is_some() && lname != "times" {
-            return Err("repeat(<hop>) must be immediately followed by times(n)".into());
-        }
+        // A pending `repeat` stays open across its modulators (times/emit/until); any
+        // other step flushes it into a VarLength walk first.
+        let plan = if self.pending_repeat.is_some()
+            && !matches!(lname.as_str(), "times" | "emit" | "until")
+        {
+            self.flush_repeat(plan)?
+        } else {
+            plan
+        };
         // Only a pure vertex-hop chain keeps `path()` answerable; every other step
         // taints it (`path()` and the element filters are path-preserving).
         if !matches!(
@@ -1305,34 +1324,72 @@ impl Parser {
             }
             "repeat" => {
                 // `repeat(<hop>)` v1: the body is a SINGLE anonymous hop
-                // (`out`/`in`/`both`, optionally `__`-prefixed). Held pending until
-                // the following `times(n)` closes it into a fixed-length walk. The
-                // LParen was already consumed at the top of `step`.
+                // (`out`/`in`/`both`, optionally `__`-prefixed). Held OPEN (not built)
+                // so the modulators times/emit/until can shape the walk; `out_slot`
+                // (the endpoint) is pre-allocated as the width so an emit/until
+                // predicate parsed before the flush references it. The LParen was
+                // already consumed at the top of `step`.
                 let (dir, label) = self.repeat_body()?;
                 self.expect(&Tok::RParen)?;
-                self.pending_repeat = Some((dir, label));
+                let from = self.current;
+                let out_slot = self.slots; // endpoint == width at flush time
+                self.current = out_slot; // emit/until predicates read the endpoint
+                self.pending_repeat = Some(RepeatCtx {
+                    dir,
+                    label,
+                    from,
+                    out_slot,
+                    times: None,
+                    min_one: false,
+                    filter: None,
+                });
                 plan
             }
             "times" => {
                 let n = self.usize_arg()?;
                 self.expect(&Tok::RParen)?;
-                let (dir, label) =
-                    prev_repeat.ok_or("times(n) must immediately follow repeat(<hop>)")?;
-                // `repeat(out('L')).times(n)` applies the hop exactly n times — a
-                // WALK of length n (Gremlin allows revisiting edges, so PathMode::Walk,
-                // unlike GQL var-length which is a trail). min == max == n.
                 let n = u32::try_from(n).map_err(|_| "times(n): n too large")?;
-                let from = self.current;
-                self.current = self.slots;
-                self.slots += 1;
-                plan.var_length(
-                    from,
-                    dir,
-                    &etypes_of(label.as_deref()),
-                    n,
-                    n,
-                    PathMode::Walk,
-                )
+                let ctx = self
+                    .pending_repeat
+                    .as_mut()
+                    .ok_or("times(n) must follow repeat(<hop>)")?;
+                ctx.times = Some(n);
+                plan
+            }
+            "emit" => {
+                // `emit()` / `emit(pred)`: emit at EVERY depth (min → 1), optionally
+                // filtering the emitted endpoint. Only the post-repeat form is built.
+                let ctx_open = self.pending_repeat.is_some();
+                if !ctx_open {
+                    return Err("emit() must follow repeat(<hop>)".into());
+                }
+                let filter = if self.peek() == Some(&Tok::RParen) {
+                    None
+                } else {
+                    Some(self.child_filter_expr()?)
+                };
+                self.expect(&Tok::RParen)?;
+                let ctx = self.pending_repeat.as_mut().unwrap();
+                ctx.min_one = true;
+                if let Some(f) = filter {
+                    ctx.filter = Some(f);
+                }
+                plan
+            }
+            "until" => {
+                // `until(pred)`: loop until the endpoint satisfies `pred`, emitting it.
+                // Modelled as a min-1 walk to the default cap, keeping endpoints that
+                // satisfy `pred` (exact when a satisfying node has no onward hop, the
+                // shape core's fixture exercises; a general stop-on-satisfy is deferred).
+                if self.pending_repeat.is_none() {
+                    return Err("until(pred) must follow repeat(<hop>)".into());
+                }
+                let f = self.child_filter_expr()?;
+                self.expect(&Tok::RParen)?;
+                let ctx = self.pending_repeat.as_mut().unwrap();
+                ctx.min_one = true;
+                ctx.filter = Some(f);
+                plan
             }
             "oute" | "ine" | "bothe" => {
                 // Edge-yielding hop: bind the traversed edge as a slot and leave the
@@ -3277,6 +3334,41 @@ impl Parser {
             }
         };
         Ok((dir, label))
+    }
+
+    /// Close an open `repeat(...)` into a `VarLength` walk. `times(n)` alone is a
+    /// fixed-length walk (min = max = n); an `emit`/`until` modulator emits at every
+    /// depth (min = 1) up to `n` or the default iteration cap, optionally filtering
+    /// the emitted endpoint. Walk mode (Gremlin allows revisiting edges).
+    fn flush_repeat(&mut self, plan: Plan) -> Result<Plan, String> {
+        let Some(ctx) = self.pending_repeat.take() else {
+            return Ok(plan);
+        };
+        const CAP: u32 = 100; // the TS engine's default iteration cap
+        let (min, max) = match (ctx.min_one, ctx.times) {
+            (false, Some(n)) => (n, n),
+            (true, Some(n)) => (1, n),
+            (true, None) => (1, CAP),
+            (false, None) => {
+                return Err("repeat(<hop>) must be closed by times(n), emit() or until(pred)".into())
+            }
+        };
+        let p = plan.var_length(
+            ctx.from,
+            ctx.dir,
+            &etypes_of(ctx.label.as_deref()),
+            min,
+            max,
+            PathMode::Walk,
+        );
+        // The walk appended its endpoint at `out_slot` (the width before this call);
+        // account for it and land the current element there.
+        self.current = ctx.out_slot;
+        self.slots = ctx.out_slot + 1;
+        Ok(match ctx.filter {
+            Some(f) => p.filter(f),
+            None => p,
+        })
     }
 
     /// Consume an optional `Scope` inside `order(...)`: bare `local`/`global`, or
