@@ -787,7 +787,14 @@ impl Parser {
         if token_form {
             return Ok(self.by_key_expr(elem_slot)?.1);
         }
-        // Degree sub-traversal: an optional `__.`, one navigating hop, `.count()`.
+        // A correlated sub-traversal body — one navigating hop, then a reduction:
+        //   `hop('L'…).count()`                → scalar CountSubquery
+        //   `hop('L'…).fold()`                 → list CollectSubquery of the elements
+        //   `hop('L'…).values('k').fold()`     → list CollectSubquery of a property
+        // Built manually (rather than via parse_sub_body) so the CollectSubquery's
+        // provenance column survives: an inner `values(...)` PROJECTS the body down to
+        // a single column, which would drop the provenance the correlated collect needs.
+        let width = self.slots;
         if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
             self.bump();
             self.expect(&Tok::Dot)?;
@@ -802,7 +809,7 @@ impl Parser {
             "bothe" => (Dir::Both, true),
             other => {
                 return Err(format!(
-                    "project().by(<traversal>): only a degree `….count()` body is supported, got `{other}`"
+                    "project().by(<traversal>): only a single-hop reducing body is supported, got `{other}`"
                 ))
             }
         };
@@ -816,22 +823,56 @@ impl Parser {
             }
         }
         self.expect(&Tok::RParen)?;
-        self.expect(&Tok::Dot)?;
-        let c = self.ident()?;
-        if !c.eq_ignore_ascii_case("count") {
-            return Err("project().by(<traversal>) body must end with .count()".into());
-        }
-        self.expect(&Tok::LParen)?;
-        self.expect(&Tok::RParen)?;
-        let body = if is_edge {
+        // The neighbour lands one past the provenance column (inserted at `width`).
+        let landed = width + 1;
+        let mut body = if is_edge {
             Plan::Row.expand_edge(elem_slot, dir, &labels)
         } else {
             Plan::Row.expand(elem_slot, dir, &labels)
         };
-        Ok(Expr::CountSubquery {
-            body: Box::new(body),
-            outer_width: self.slots,
-        })
+        self.expect(&Tok::Dot)?;
+        let reducer = self.ident()?.to_ascii_lowercase();
+        // Optional `.values('k')` between the hop and `.fold()`.
+        let mut val_key: Option<String> = None;
+        let reducer = if reducer == "values" {
+            self.expect(&Tok::LParen)?;
+            val_key = Some(self.str_arg()?);
+            self.expect(&Tok::RParen)?;
+            self.expect(&Tok::Dot)?;
+            self.ident()?.to_ascii_lowercase()
+        } else {
+            reducer
+        };
+        self.expect(&Tok::LParen)?;
+        self.expect(&Tok::RParen)?;
+        match reducer.as_str() {
+            "count" if val_key.is_none() => Ok(Expr::CountSubquery {
+                body: Box::new(body),
+                outer_width: width,
+            }),
+            "fold" => {
+                let scalar = match val_key {
+                    Some(key) => {
+                        // Keep only neighbours that HAVE the property (values() skips
+                        // absent), then collect its value.
+                        body = body.filter(Expr::PropertyExists {
+                            slot: landed,
+                            key: key.clone(),
+                        });
+                        Expr::Prop { slot: landed, key }
+                    }
+                    None => Expr::Slot(landed),
+                };
+                Ok(Expr::CollectSubquery {
+                    body: Box::new(body),
+                    scalar: Box::new(scalar),
+                    outer_width: width,
+                })
+            }
+            other => Err(format!(
+                "project().by(<traversal>): reducing body must end in count()/fold(), got `{other}`"
+            )),
+        }
     }
 
     // traversal := 'g' '.' ( 'V' '(' ')' | 'addV' '(' Label ')' ) ( '.' step )*

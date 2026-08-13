@@ -3997,14 +3997,14 @@ fn p1_idx_edge_range_matches_scan() {
 fn p2_repeat_times_two() {
     // marko.repeat(out()).times(2) → grandchildren {ripple, lop}.
     assert_eq!(
-        names(qs("g.V('1').repeat(__.out()).times(2).values('name')")),
+        names(qs_e("g.V('1').repeat(__.out()).times(2).values('name')")),
         vec!["lop", "ripple"]
     );
 }
 
 #[test]
 fn p2_repeat_until_software() {
-    let r = qs("g.V('1').repeat(__.out()).until(__.hasLabel('SOFTWARE')).values('name')");
+    let r = qs_e("g.V('1').repeat(__.out()).until(__.hasLabel('SOFTWARE')).values('name')");
     assert_eq!(names(r), vec!["lop", "lop", "ripple"]);
 }
 
@@ -4013,27 +4013,27 @@ fn p2_repeat_until_ripple_from_start() {
     // Pre-form `until(cond).repeat(body)` is while-do — checked BEFORE the body,
     // so starting AT ripple yields ripple without running out(). (Post-form
     // `.until()` is do-while: ripple is a sink → out() drains it → [].)
-    let r = qs("g.V('5').until(__.has('name', eq('ripple'))).repeat(__.out()).values('name')");
+    let r = qs_e("g.V('5').until(__.has('name', eq('ripple'))).repeat(__.out()).values('name')");
     assert_eq!(ordered(r), vec!["ripple"]);
 }
 
 #[test]
 fn p2_repeat_times_two_emit() {
     // post-form emit: AFTER each body application; input (marko) not emitted.
-    let r = qs("g.V('1').repeat(__.out()).times(2).emit().values('name')");
+    let r = qs_e("g.V('1').repeat(__.out()).times(2).emit().values('name')");
     assert_eq!(names(r), vec!["josh", "lop", "lop", "ripple", "vadas"]);
 }
 
 #[test]
 fn p2_repeat_emit_filtered_software() {
-    let r = qs("g.V('1').repeat(__.out()).times(2).emit(__.hasLabel('SOFTWARE')).values('name')");
+    let r = qs_e("g.V('1').repeat(__.out()).times(2).emit(__.hasLabel('SOFTWARE')).values('name')");
     assert_eq!(names(r), vec!["lop", "lop", "ripple"]);
 }
 
 #[test]
 fn p2_repeat_times_two_path() {
     // repeat(out()).times(2).path().by('name') → full two-hop paths.
-    let r = qs("g.V('1').repeat(__.out()).times(2).path().by('name')");
+    let r = qs_e("g.V('1').repeat(__.out()).times(2).path().by('name')");
     let mut paths: Vec<String> = r
         .iter()
         .map(|p| match p {
@@ -4047,7 +4047,7 @@ fn p2_repeat_times_two_path() {
 
 #[test]
 fn p2_repeat_times_two_emit_path_starts_marko() {
-    let r = qs("g.V('1').repeat(__.out()).times(2).emit().path().by('name')");
+    let r = qs_e("g.V('1').repeat(__.out()).times(2).emit().path().by('name')");
     assert!(!r.is_empty());
     for p in &r {
         match p {
@@ -4059,31 +4059,31 @@ fn p2_repeat_times_two_emit_path_starts_marko() {
 
 #[test]
 fn p2_repeat_until_sinks_oute_count() {
-    let r = qs("g.V('1').repeat(__.out()).until(__.outE().count().is(eq(0))).values('name')");
+    let r = qs_e("g.V('1').repeat(__.out()).until(__.outE().count().is(eq(0))).values('name')");
     assert_eq!(names(r), vec!["lop", "lop", "ripple", "vadas"]);
 }
 
 #[test]
 fn p2_repeat_times_three_empty() {
-    let r = qs("g.V('1').repeat(__.out()).times(3).values('name')");
+    let r = qs_e("g.V('1').repeat(__.out()).times(3).values('name')");
     assert!(r.is_empty());
 }
 
 #[test]
 fn p2_repeat_times_three_emit() {
-    let r = qs("g.V('1').repeat(__.out()).times(3).emit().values('name')");
+    let r = qs_e("g.V('1').repeat(__.out()).times(3).emit().values('name')");
     assert_eq!(names(r), vec!["josh", "lop", "lop", "ripple", "vadas"]);
 }
 
 #[test]
 fn p2_repeat_times_three_emit_software() {
-    let r = qs("g.V('1').repeat(__.out()).times(3).emit(__.hasLabel('SOFTWARE')).values('name')");
+    let r = qs_e("g.V('1').repeat(__.out()).times(3).emit(__.hasLabel('SOFTWARE')).values('name')");
     assert_eq!(names(r), vec!["lop", "lop", "ripple"]);
 }
 
 #[test]
 fn p2_repeat_times_three_until_software() {
-    let r = qs("g.V('1').repeat(__.out()).times(3).until(__.hasLabel('SOFTWARE')).values('name')");
+    let r = qs_e("g.V('1').repeat(__.out()).times(3).until(__.hasLabel('SOFTWARE')).values('name')");
     assert_eq!(names(r), vec!["lop", "lop", "ripple"]);
 }
 
@@ -4091,19 +4091,19 @@ fn p2_repeat_times_three_until_software() {
 fn p2_repeat_loops_self_limit() {
     // repeat(out().where(loops().is(lt(2)))).times(5).emit()
     let r =
-        qs("g.V('1').repeat(__.out().where(__.loops().is(lt(2)))).times(5).emit().values('name')");
+        qs_e("g.V('1').repeat(__.out().where(__.loops().is(lt(2)))).times(5).emit().values('name')");
     assert_eq!(names(r), vec!["josh", "lop", "vadas"]);
 }
 
 #[test]
 fn p2_repeat_empty_input() {
-    let r = qs("g.V('999').repeat(__.out()).times(3).values('name')");
+    let r = qs_e("g.V('999').repeat(__.out()).times(3).values('name')");
     assert!(r.is_empty());
 }
 
 #[test]
 fn p2_repeat_times_zero_passthrough() {
-    let r = qs("g.V('1').repeat(__.out()).times(0).values('name')");
+    let r = qs_e("g.V('1').repeat(__.out()).times(0).values('name')");
     assert_eq!(ordered(r), vec!["marko"]);
 }
 
@@ -4111,19 +4111,19 @@ fn p2_repeat_times_zero_passthrough() {
 fn p2_repeat_until_true_on_input() {
     // Pre-form `until(cond).repeat(body)` is while-do: starting at lop (SOFTWARE),
     // the pre-form until is checked first → the input passes through unchanged.
-    let r = qs("g.V('3').until(__.hasLabel('SOFTWARE')).repeat(__.out()).values('name')");
+    let r = qs_e("g.V('3').until(__.hasLabel('SOFTWARE')).repeat(__.out()).values('name')");
     assert_eq!(ordered(r), vec!["lop"]);
 }
 
 #[test]
 fn p2_repeat_times_cap_high() {
-    let r = qs("g.V('1').repeat(__.out()).times(50).values('name')");
+    let r = qs_e("g.V('1').repeat(__.out()).times(50).values('name')");
     assert!(r.is_empty());
 }
 
 #[test]
 fn p2_element_map_one_key() {
-    let r = qs("g.V().elementMap('name')");
+    let r = qs_e("g.V().elementMap('name')");
     assert_eq!(r.len(), 6);
     // order = marko, vadas, josh, peter, lop, ripple
     assert_emap(
@@ -4146,7 +4146,7 @@ fn p2_element_map_one_key() {
 
 #[test]
 fn p2_element_map_no_keys_all_props() {
-    let r = qs("g.V().elementMap()");
+    let r = qs_e("g.V().elementMap()");
     assert_emap(
         &r[0],
         &[
@@ -4170,7 +4170,7 @@ fn p2_element_map_no_keys_all_props() {
 #[test]
 fn p2_element_map_missing_key_on_some() {
     // elementMap('age') — software has no age → just id+label.
-    let r = qs("g.V().elementMap('age')");
+    let r = qs_e("g.V().elementMap('age')");
     assert_emap(
         &r[0],
         &[
@@ -4190,7 +4190,7 @@ fn p2_element_map_missing_key_on_some() {
 
 #[test]
 fn p2_element_map_skips_unknown_key() {
-    let r = qs("g.V().elementMap('age', 'blah')");
+    let r = qs_e("g.V().elementMap('age', 'blah')");
     assert_emap(
         &r[0],
         &[
@@ -4203,7 +4203,7 @@ fn p2_element_map_skips_unknown_key() {
 
 #[test]
 fn p2_element_map_after_has_within() {
-    let r = qs("g.V().has('name', within('josh','marko')).elementMap()");
+    let r = qs_e("g.V().has('name', within('josh','marko')).elementMap()");
     assert_eq!(r.len(), 2);
     let got = names(
         r.iter()
@@ -4222,7 +4222,7 @@ fn p2_element_map_after_has_within() {
 
 #[test]
 fn p2_element_map_after_not_haslabel() {
-    let r = qs("g.V().not(__.hasLabel('PERSON')).elementMap()");
+    let r = qs_e("g.V().not(__.hasLabel('PERSON')).elementMap()");
     assert_eq!(r.len(), 2);
     assert_emap(
         &r[0],
@@ -4238,7 +4238,7 @@ fn p2_element_map_after_not_haslabel() {
 #[test]
 fn p2_element_map_on_edge_in_out_submaps() {
     // marko -[CREATED #9]-> lop, weight 0.4. Edge elementMap has IN/OUT submaps.
-    let r = qs("g.V('1').outE('CREATED').elementMap()");
+    let r = qs_e("g.V('1').outE('CREATED').elementMap()");
     assert_eq!(r.len(), 1);
     let m = map_sorted(&r[0]);
     let get = |k: &str| m.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
@@ -4264,49 +4264,49 @@ fn p2_element_map_on_edge_in_out_submaps() {
 
 #[test]
 fn p2_element_map_all_edges() {
-    let r = qs("g.E().elementMap('weight')");
+    let r = qs_e("g.E().elementMap('weight')");
     assert_eq!(r.len(), 6);
 }
 
 #[test]
 fn p2_textp_containing_o() {
-    let r = qs("g.V().has('name', containing('o')).values('name')");
+    let r = qs_e("g.V().has('name', containing('o')).values('name')");
     assert_eq!(names(r), vec!["josh", "lop", "marko"]);
 }
 
 #[test]
 fn p2_textp_not_containing_o() {
-    let r = qs("g.V().has('name', notContaining('o')).values('name')");
+    let r = qs_e("g.V().has('name', notContaining('o')).values('name')");
     assert_eq!(names(r), vec!["peter", "ripple", "vadas"]);
 }
 
 #[test]
 fn p2_textp_ending_with_o() {
-    let r = qs("g.V().hasLabel('PERSON').has('name', endingWith('o')).values('name')");
+    let r = qs_e("g.V().hasLabel('PERSON').has('name', endingWith('o')).values('name')");
     assert_eq!(ordered(r), vec!["marko"]);
 }
 
 #[test]
 fn p2_textp_starts_with_m() {
-    let r = qs("g.V().hasLabel('PERSON').has('name', startingWith('m')).values('name')");
+    let r = qs_e("g.V().hasLabel('PERSON').has('name', startingWith('m')).values('name')");
     assert_eq!(ordered(r), vec!["marko"]);
 }
 
 #[test]
 fn p2_aggregate_passthrough() {
-    let r = qs("g.V('1').out('CREATED').aggregate('x').values('name')");
+    let r = qs_e("g.V('1').out('CREATED').aggregate('x').values('name')");
     assert_eq!(ordered(r), vec!["lop"]);
 }
 
 #[test]
 fn p2_aggregate_transparent_downstream() {
-    let r = qs("g.V('1').out('CREATED').aggregate('x').in('CREATED').id()");
+    let r = qs_e("g.V('1').out('CREATED').aggregate('x').in('CREATED').id()");
     assert_eq!(names(r), vec!["1", "4", "6"]);
 }
 
 #[test]
 fn p2_cap_reads_bag() {
-    let r = qs("g.V().out('KNOWS').aggregate('x').cap('x')");
+    let r = qs_e("g.V().out('KNOWS').aggregate('x').cap('x')");
     assert_eq!(r.len(), 1);
     let bag = match &r[0] {
         GVal::List(items) => items,
@@ -4320,13 +4320,13 @@ fn p2_cap_reads_bag() {
 
 #[test]
 fn p2_cap_empty_key() {
-    let r = qs("g.V('1').cap('never-set')");
+    let r = qs_e("g.V('1').cap('never-set')");
     assert_eq!(r, vec![GVal::list(vec![])]);
 }
 
 #[test]
 fn p2_aggregate_full_stream_before_cap() {
-    let r = qs("g.V().aggregate('all').cap('all')");
+    let r = qs_e("g.V().aggregate('all').cap('all')");
     let bag = match &r[0] {
         GVal::List(items) => items,
         _ => panic!(),
@@ -4339,13 +4339,13 @@ fn p2_aggregate_full_stream_before_cap() {
 
 #[test]
 fn p2_aggregate_transparent_long_chain() {
-    let r = qs("g.V('1').out('CREATED').aggregate('x').in('CREATED').out('CREATED').id()");
+    let r = qs_e("g.V('1').out('CREATED').aggregate('x').in('CREATED').out('CREATED').id()");
     assert_eq!(names(r), vec!["3", "3", "3", "5"]);
 }
 
 #[test]
 fn p2_multiple_aggregates_independent_keys() {
-    let r = qs("g.V().aggregate('persons').aggregate('all').cap('persons')");
+    let r = qs_e("g.V().aggregate('persons').aggregate('all').cap('persons')");
     let bag = match &r[0] {
         GVal::List(items) => items,
         _ => panic!(),
@@ -4358,19 +4358,19 @@ fn p2_multiple_aggregates_independent_keys() {
 
 #[test]
 fn p2_select_pop_default_last_single() {
-    let r = qs("g.V('1').as('start').select('start').values('name')");
+    let r = qs_e("g.V('1').as('start').select('start').values('name')");
     assert_eq!(ordered(r), vec!["marko"]);
 }
 
 #[test]
 fn p2_select_pop_first_single() {
-    let r = qs("g.V('1').as('start').select(Pop.first, 'start').values('name')");
+    let r = qs_e("g.V('1').as('start').select(Pop.first, 'start').values('name')");
     assert_eq!(ordered(r), vec!["marko"]);
 }
 
 #[test]
 fn p2_select_pop_all_single() {
-    let r = qs("g.V('1').as('start').select(Pop.all, 'start')");
+    let r = qs_e("g.V('1').as('start').select(Pop.all, 'start')");
     assert_eq!(r.len(), 1);
     match &r[0] {
         GVal::List(items) => assert_eq!(items.len(), 1),
@@ -4380,20 +4380,20 @@ fn p2_select_pop_all_single() {
 
 #[test]
 fn p2_select_pop_last_inside_repeat() {
-    let r = qs("g.V('4').repeat(__.out('CREATED').as('a')).times(1).select('a').values('name')");
+    let r = qs_e("g.V('4').repeat(__.out('CREATED').as('a')).times(1).select('a').values('name')");
     assert_eq!(names(r), vec!["lop", "ripple"]);
 }
 
 #[test]
 fn p2_select_pop_first_inside_repeat() {
     let r =
-        qs("g.V('1').repeat(__.out().as('hop')).times(2).select(Pop.first, 'hop').values('name')");
+        qs_e("g.V('1').repeat(__.out().as('hop')).times(2).select(Pop.first, 'hop').values('name')");
     assert_eq!(names(r), vec!["josh", "josh"]);
 }
 
 #[test]
 fn p2_select_pop_all_inside_repeat() {
-    let r = qs("g.V('1').repeat(__.out().as('hop')).times(2).select(Pop.all, 'hop')");
+    let r = qs_e("g.V('1').repeat(__.out().as('hop')).times(2).select(Pop.all, 'hop')");
     assert_eq!(r.len(), 2);
     for list in &r {
         match list {
@@ -4406,7 +4406,7 @@ fn p2_select_pop_all_inside_repeat() {
 #[test]
 fn p2_choose_then_else() {
     // choose(has('name','marko'), values('age'), values('name'))
-    let r = qs("g.V().choose(__.has('name', eq('marko')), __.values('age'), __.values('name'))");
+    let r = qs_e("g.V().choose(__.has('name', eq('marko')), __.values('age'), __.values('name'))");
     assert_eq!(
         r,
         vec![
@@ -4424,7 +4424,7 @@ fn p2_choose_then_else() {
 fn p2_choose_haslabel_branches() {
     // choose(hasLabel('PERSON'), out('CREATED'), identity()).values('name')
     let r =
-        qs("g.V().choose(__.hasLabel('PERSON'), __.out('CREATED'), __.identity()).values('name')");
+        qs_e("g.V().choose(__.hasLabel('PERSON'), __.out('CREATED'), __.identity()).values('name')");
     assert_eq!(
         ordered(r),
         vec!["lop", "ripple", "lop", "lop", "lop", "ripple"]
@@ -4434,7 +4434,7 @@ fn p2_choose_haslabel_branches() {
 #[test]
 fn p2_choose_by_age_predicate() {
     // hasLabel('PERSON').choose(values('age').is(lte(30)), in(), out()).values('name')
-    let r = qs(
+    let r = qs_e(
         "g.V().hasLabel('PERSON').choose(__.values('age').is(lte(30)), __.in(), __.out()).values('name')",
     );
     assert_eq!(ordered(r), vec!["marko", "ripple", "lop", "lop"]);
@@ -4443,7 +4443,7 @@ fn p2_choose_by_age_predicate() {
 #[test]
 fn p2_choose_on_oute_count() {
     // choose(outE('KNOWS').count().is(gt(0)), out('KNOWS'), identity())
-    let r = qs(
+    let r = qs_e(
         "g.V().hasLabel('PERSON').choose(__.outE('KNOWS').count().is(gt(0)), __.out('KNOWS'), __.identity()).values('name')",
     );
     assert_eq!(ordered(r), vec!["vadas", "josh", "vadas", "josh", "peter"]);
@@ -4452,7 +4452,7 @@ fn p2_choose_on_oute_count() {
 #[test]
 fn p2_choose_no_else_is_identity() {
     // choose(hasLabel('PERSON'), out('CREATED')) — missing else = identity.
-    let r = qs("g.V().choose(__.hasLabel('PERSON'), __.out('CREATED')).values('name')");
+    let r = qs_e("g.V().choose(__.hasLabel('PERSON'), __.out('CREATED')).values('name')");
     assert_eq!(
         ordered(r),
         vec!["lop", "ripple", "lop", "lop", "lop", "ripple"]
@@ -4461,7 +4461,7 @@ fn p2_choose_no_else_is_identity() {
 
 #[test]
 fn p2_choose_no_else_test_fails_passthrough() {
-    let r = qs(
+    let r = qs_e(
         "g.V().hasLabel('PERSON').choose(__.has('name', eq('nonexistent')), __.out('CREATED')).values('name')",
     );
     assert_eq!(ordered(r), vec!["marko", "vadas", "josh", "peter"]);
@@ -4469,37 +4469,37 @@ fn p2_choose_no_else_test_fails_passthrough() {
 
 #[test]
 fn p2_min_numbers() {
-    let r = qs("g.V().values('age').min()");
+    let r = qs_e("g.V().values('age').min()");
     assert_eq!(r, vec![GVal::Num(27.0)]);
 }
 
 #[test]
 fn p2_min_strings() {
-    let r = qs("g.V().values('name').min()");
+    let r = qs_e("g.V().values('name').min()");
     assert_eq!(r, vec![GVal::Str("josh".into())]);
 }
 
 #[test]
 fn p2_min_after_repeat_both_times_three() {
-    let r = qs("g.V().repeat(__.both()).times(3).values('age').min()");
+    let r = qs_e("g.V().repeat(__.both()).times(3).values('age').min()");
     assert_eq!(r, vec![GVal::Num(27.0)]);
 }
 
 #[test]
 fn p2_coalesce_falls_back_to_name() {
-    let r = qs("g.V().hasLabel('PERSON').coalesce(__.values('nickname'), __.values('name'))");
+    let r = qs_e("g.V().hasLabel('PERSON').coalesce(__.values('nickname'), __.values('name'))");
     assert_eq!(ordered(r), vec!["marko", "vadas", "josh", "peter"]);
 }
 
 #[test]
 fn p2_coalesce_first_nonempty_created() {
-    let r = qs("g.V('1').coalesce(__.outE('CREATED'), __.outE('KNOWS')).inV().values('name')");
+    let r = qs_e("g.V('1').coalesce(__.outE('CREATED'), __.outE('KNOWS')).inV().values('name')");
     assert_eq!(ordered(r), vec!["lop"]);
 }
 
 #[test]
 fn p2_coalesce_knows_first_paths() {
-    let r = qs(
+    let r = qs_e(
         "g.V('1').coalesce(__.outE('KNOWS'), __.outE('CREATED')).inV().path().by('name').by(__.label())",
     );
     let paths: Vec<Vec<String>> = r
@@ -4520,7 +4520,7 @@ fn p2_coalesce_knows_first_paths() {
 
 #[test]
 fn p2_coalesce_created_first_path() {
-    let r = qs(
+    let r = qs_e(
         "g.V('1').coalesce(__.outE('CREATED'), __.outE('KNOWS')).inV().path().by('name').by(__.label())",
     );
     let paths: Vec<Vec<String>> = r
@@ -4535,43 +4535,43 @@ fn p2_coalesce_created_first_path() {
 
 #[test]
 fn p2_coalesce_knows_first_names() {
-    let r = qs("g.V('1').coalesce(__.outE('KNOWS'), __.outE('CREATED')).inV().values('name')");
+    let r = qs_e("g.V('1').coalesce(__.outE('KNOWS'), __.outE('CREATED')).inV().values('name')");
     assert_eq!(ordered(r), vec!["vadas", "josh"]);
 }
 
 #[test]
 fn p2_mean_numbers() {
-    let r = qs("g.V().values('age').mean()");
+    let r = qs_e("g.V().values('age').mean()");
     assert_eq!(r, vec![GVal::Num(30.75)]);
 }
 
 #[test]
 fn p2_mean_after_repeat_both_times_three() {
-    let r = qs("g.V().repeat(__.both()).times(3).values('age').mean()");
+    let r = qs_e("g.V().repeat(__.both()).times(3).values('age').mean()");
     assert_eq!(r, vec![GVal::Num(1471.0 / 48.0)]);
 }
 
 #[test]
 fn p2_flatmap_expands_via_subplan() {
-    let r = qs("g.V('1').flatMap(__.out()).values('name')");
+    let r = qs_e("g.V('1').flatMap(__.out()).values('name')");
     assert_eq!(names(r), vec!["josh", "lop", "vadas"]);
 }
 
 #[test]
 fn p2_flatmap_drops_empty() {
-    let r = qs("g.V().hasLabel('SOFTWARE').flatMap(__.out())");
+    let r = qs_e("g.V().hasLabel('SOFTWARE').flatMap(__.out())");
     assert!(r.is_empty());
 }
 
 #[test]
 fn p2_flatmap_values_equiv() {
-    let r = qs("g.V().hasLabel('PERSON').flatMap(__.values('name'))");
+    let r = qs_e("g.V().hasLabel('PERSON').flatMap(__.values('name'))");
     assert_eq!(names(r), vec!["josh", "marko", "peter", "vadas"]);
 }
 
 #[test]
 fn p2_flatmap_many_per_input() {
-    let r = qs("g.V().hasLabel('PERSON').flatMap(__.out('CREATED')).values('name')");
+    let r = qs_e("g.V().hasLabel('PERSON').flatMap(__.out('CREATED')).values('name')");
     assert_eq!(names(r), vec!["lop", "lop", "lop", "ripple"]);
 }
 
@@ -4579,7 +4579,7 @@ fn p2_flatmap_many_per_input() {
 fn p2_adde_to_subplan() {
     // marko -[NEMESIS]-> peter; input is FROM, sub-plan is TO.
     let mut g = modern();
-    let before = q(dual::g().E().count());
+    let before = q_eids(dual::g().E().count());
     let r = parse("g.V('1').addE('NEMESIS').to(__.V('6'))")
         .unwrap()
         .run(&mut g);
@@ -4635,7 +4635,7 @@ fn p2_add_e_unresolvable_endpoint_faults() {
 
 #[test]
 fn p2_label_vertices() {
-    let r = qs("g.V().label()");
+    let r = qs_e("g.V().label()");
     assert_eq!(
         ordered(r),
         vec!["PERSON", "PERSON", "PERSON", "PERSON", "SOFTWARE", "SOFTWARE"]
@@ -4644,13 +4644,13 @@ fn p2_label_vertices() {
 
 #[test]
 fn p2_label_edges() {
-    let r = qs("g.V('1').outE().label()");
+    let r = qs_e("g.V('1').outE().label()");
     assert_eq!(ordered(r), vec!["KNOWS", "KNOWS", "CREATED"]);
 }
 
 #[test]
 fn p2_label_on_property_returns_key() {
-    let r = qs("g.V('1').properties().label()");
+    let r = qs_e("g.V('1').properties().label()");
     assert_eq!(names(r), vec!["age", "name"]);
 }
 
@@ -4691,26 +4691,26 @@ fn p2_fail_default_message() {
 
 #[test]
 fn p2_subgraph_collect_knows_edges() {
-    let r = qs("g.E().hasLabel('KNOWS').subgraph('sg').cap('sg')");
+    let r = qs_e("g.E().hasLabel('KNOWS').subgraph('sg').cap('sg')");
     assert_eq!(subgraph_counts(r), (3, 2));
 }
 
 #[test]
 fn p2_subgraph_chained_accumulation() {
-    let r = qs("g.V().outE('KNOWS').subgraph('knowsG').inV().outE('CREATED').subgraph('createdG').inV().cap('createdG')");
+    let r = qs_e("g.V().outE('KNOWS').subgraph('knowsG').inV().outE('CREATED').subgraph('createdG').inV().cap('createdG')");
     assert_eq!(subgraph_counts(r), (3, 2));
 }
 
 #[test]
 fn p2_cyclic_path_keeps_repeats() {
     // V(1).both().both().cyclicPath() → marko thrice.
-    let r = qs("g.V('1').both().both().cyclicPath().id()");
+    let r = qs_e("g.V('1').both().both().cyclicPath().id()");
     assert_eq!(ordered(r), vec!["1", "1", "1"]);
 }
 
 #[test]
 fn p2_cyclic_path_then_path() {
-    let r = qs("g.V('1').both().both().cyclicPath().path()");
+    let r = qs_e("g.V('1').both().both().cyclicPath().path()");
     assert_eq!(r.len(), 3);
     let g = modern();
     for p in &r {
