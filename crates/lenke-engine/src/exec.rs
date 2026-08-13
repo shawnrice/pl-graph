@@ -8164,6 +8164,24 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 if let Col::Nodes(ids) = &arg {
                     if n >= store.node_count() / 4 {
                         let (names, code_of) = store.min_label_map();
+                        // Gather codes in one pass; if EVERY node is labelled, emit a
+                        // typed `Col::Str` — no per-row `Value::Str` box, and the JSON
+                        // writer takes its string fast path. A single unlabelled node
+                        // (needs a NULL, which `Col::Str` cannot hold) falls to `Col::Gen`.
+                        let mut labels: Vec<std::sync::Arc<str>> = Vec::with_capacity(ids.len());
+                        let mut all_labelled = true;
+                        for &id in ids {
+                            match code_of.get(id as usize) {
+                                Some(&c) if c != u32::MAX => labels.push(names[c as usize].clone()),
+                                _ => {
+                                    all_labelled = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if all_labelled {
+                            return Ok(Col::Str(labels));
+                        }
                         let out: Vec<Value> = ids
                             .iter()
                             .map(|&id| match code_of.get(id as usize) {
@@ -11168,26 +11186,40 @@ fn read_property(store: &Store, col: &Col, key: &str) -> Col {
     let Some(column) = store.column(key) else {
         return Col::Gen(vec![Value::Null; ids.len()]);
     };
-    match column {
-        Column::Num { data, present } if ids.iter().all(|&i| present[i as usize]) => {
-            Col::Num(ids.iter().map(|&i| data[i as usize]).collect())
+    // Gather `data_at(i)` for every id in ONE pass, bailing to `None` the moment a value
+    // is absent — so a fully-present column (the common case) does a single scattered
+    // pass instead of the separate `all(present)` pre-check + gather (two passes over the
+    // frontier). A null-bearing column bails and falls to the general per-row path.
+    fn gather<T>(ids: &[u32], present: &[bool], data_at: impl Fn(usize) -> T) -> Option<Vec<T>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let i = id as usize;
+            if !present[i] {
+                return None;
+            }
+            out.push(data_at(i));
         }
-        Column::Str { data, present } if ids.iter().all(|&i| present[i as usize]) => {
-            Col::Str(ids.iter().map(|&i| data[i as usize].clone()).collect())
+        Some(out)
+    }
+    let general = || Col::Gen(ids.iter().map(|&i| store.prop(i, key)).collect());
+    match column {
+        Column::Num { data, present } => {
+            gather(ids, present, |i| data[i]).map_or_else(general, Col::Num)
+        }
+        Column::Str { data, present } => {
+            gather(ids, present, |i| data[i].clone()).map_or_else(general, Col::Str)
         }
         Column::Dict {
             dict,
             codes,
             present,
-        } if ids.iter().all(|&i| present[i as usize]) => Col::Str(
-            ids.iter()
-                .map(|&i| dict[codes[i as usize] as usize].clone())
-                .collect(),
-        ),
-        Column::Bool { data, present } if ids.iter().all(|&i| present[i as usize]) => {
-            Col::Bool(ids.iter().map(|&i| data[i as usize]).collect())
+        } => {
+            gather(ids, present, |i| dict[codes[i] as usize].clone()).map_or_else(general, Col::Str)
         }
-        _ => Col::Gen(ids.iter().map(|&i| store.prop(i, key)).collect()),
+        Column::Bool { data, present } => {
+            gather(ids, present, |i| data[i]).map_or_else(general, Col::Bool)
+        }
+        _ => general(),
     }
 }
 
