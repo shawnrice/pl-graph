@@ -173,6 +173,7 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
                 group_estimate(keys, input, store)
             }
         }
+        Plan::GroupToMap { .. } => Card::exact(1), // folds all groups into one Map row
         Plan::Distinct { input } => {
             // At most the input; without a cheap distinct count assume heavy overlap.
             estimate(input, store).scale(0.5, false)

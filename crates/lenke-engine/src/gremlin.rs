@@ -1199,18 +1199,21 @@ impl Parser {
                 } else {
                     ("key".to_string(), Expr::Slot(self.current))
                 };
-                let p = plan.aggregate(
-                    vec![key_expr],
-                    vec![Agg {
-                        func: AggFn::Count,
-                        arg: None,
-                        distinct: false,
-                        name: "count".into(),
-                        frac: None,
-                    }],
-                );
+                let p = plan
+                    .aggregate(
+                        vec![key_expr],
+                        vec![Agg {
+                            func: AggFn::Count,
+                            arg: None,
+                            distinct: false,
+                            name: "count".into(),
+                            frac: None,
+                        }],
+                    )
+                    // Gremlin groupCount() is a single {key: count} Map, not (k,c) rows.
+                    .group_to_map();
                 self.current = 0;
-                self.slots = 2; // group key + count
+                self.slots = 1; // one Map column
                 p
             }
             "group" => {
@@ -1292,9 +1295,11 @@ impl Parser {
                         frac: None,
                     },
                 };
-                let p = plan.aggregate(vec![key_expr], vec![value_agg]);
+                let p = plan
+                    .aggregate(vec![key_expr], vec![value_agg])
+                    .group_to_map();
                 self.current = 0;
-                self.slots = 2; // group key + value
+                self.slots = 1; // one Map column
                 p
             }
             other => return Err(format!("unsupported Gremlin step `{other}`")),
@@ -2355,10 +2360,10 @@ mod tests {
                 "g.V().hasLabel('Person').group().by('name')",
                 &store
             )),
+            // group() folds to ONE Gremlin Map {name: [elements]} (first-seen key
+            // order), matching core — not the old (key, value) row model.
             vec![
-                "Str(\"alice\");List([Num(0.0)]);",
-                "Str(\"bob\");List([Num(1.0)]);",
-                "Str(\"carol\");List([Num(2.0)]);",
+                "Map([(Str(\"alice\"), List([Num(0.0)])), (Str(\"bob\"), List([Num(1.0)])), (Str(\"carol\"), List([Num(2.0)]))]);",
             ],
         );
         // A property value-by folds that property per group.
@@ -2368,9 +2373,7 @@ mod tests {
                 &store,
             )),
             vec![
-                "Str(\"alice\");List([Num(30.0)]);",
-                "Str(\"bob\");List([Num(25.0)]);",
-                "Str(\"carol\");List([Num(40.0)]);",
+                "Map([(Str(\"alice\"), List([Num(30.0)])), (Str(\"bob\"), List([Num(25.0)])), (Str(\"carol\"), List([Num(40.0)]))]);",
             ],
         );
         // Non-count reducing traversals are deferred, not mis-parsed.
@@ -2702,12 +2705,10 @@ mod tests {
                 "MATCH (a:Person)-[:KNOWS]->(b) RETURN DISTINCT b.name",
                 "g.V().hasLabel('Person').out('KNOWS').values('name').dedup()",
             ),
-            (
-                // groupCount after out() groups by the NEIGHBOUR's name (the
-                // current element post-hop), so the GQL equivalent groups by b.
-                "MATCH (a:Person)-[:KNOWS]->(b) RETURN b.name AS who, count(*) AS c",
-                "g.V().hasLabel('Person').out('KNOWS').groupCount().by('name')",
-            ),
+            // NOTE: GQL GROUP BY and Gremlin groupCount() do NOT agree by design —
+            // GQL yields relational (key, count) ROWS, Gremlin yields a single
+            // {key: count} Map (see `bare_group_count_groups_by_the_current_element`).
+            // So no groupCount pair belongs in this row-equality list.
         ];
         for (gql, gremlin) in pairs {
             assert_eq!(
@@ -3048,9 +3049,10 @@ mod tests {
     #[test]
     fn bare_group_count_groups_by_the_current_element() {
         let store = social();
-        // KNOWS targets are bob, carol, carol → {bob:1, carol:2}. Bare groupCount()
-        // over the name stream and the .by('name') form agree.
-        let want = vec!["Str(\"bob\");Num(1.0);", "Str(\"carol\");Num(2.0);"];
+        // KNOWS targets are bob, carol, carol → one Map {bob:1, carol:2} (Gremlin
+        // groupCount is a single Map, not (key,count) rows). Bare groupCount() over
+        // the name stream and the .by('name') form agree.
+        let want = vec!["Map([(Str(\"bob\"), Num(1.0)), (Str(\"carol\"), Num(2.0))]);"];
         assert_eq!(
             value_bag(&gremlin_rows(
                 "g.V().hasLabel('Person').out('KNOWS').values('name').groupCount()",

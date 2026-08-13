@@ -205,7 +205,7 @@ fn c(name: &'static str, ordered: bool, steps: Vec<Step>) -> Case {
 ///     The Gremlin front-end needs a map-fold terminal. `[group-map]`
 ///   - path().by(k): the path lineage renders whole element maps; a `by` modulator
 ///     must project each path element to a property. `[path-by]`
-const KNOWN_GREMLIN_GAPS: &[&str] = &["groupcount_lang", "groupcount_label", "path_names"];
+const KNOWN_GREMLIN_GAPS: &[&str] = &["path_names"];
 
 #[test]
 fn gremlin_parity() {

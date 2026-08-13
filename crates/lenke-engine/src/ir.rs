@@ -629,6 +629,12 @@ pub enum Plan {
         keys: Vec<(String, Expr)>,
         aggs: Vec<Agg>,
     },
+    /// Fold a two-column grouped result (`[key, value]` rows, as `Aggregate`
+    /// produces) into ONE row holding a single `Value::Map` of `{key: value}`, in
+    /// first-seen key order — Gremlin `group()`/`groupCount()` semantics, which
+    /// yield one Map object rather than the relational (key,value) rows that GQL
+    /// `GROUP BY` keeps.
+    GroupToMap { input: Box<Plan> },
     /// Sort by `keys` (empty = no sort, pure paging), then keep the window
     /// `[skip, skip+limit)`. Sorting is STABLE — equal keys keep input order — so
     /// `keys` empty with a `limit` is a plain prefix. Runs before any Project, so
@@ -944,6 +950,13 @@ impl Plan {
             input: Box::new(self),
             keys,
             aggs,
+        }
+    }
+
+    #[must_use]
+    pub fn group_to_map(self) -> Self {
+        Self::GroupToMap {
+            input: Box::new(self),
         }
     }
 

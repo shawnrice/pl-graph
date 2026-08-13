@@ -757,6 +757,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::Distinct { input }
         | Plan::Tail { input, .. }
         | Plan::NullPadIfEmpty { input, .. }
+        | Plan::GroupToMap { input }
         | Plan::SortLocal { input, .. } => needs_lineage(input),
         Plan::OptionalScan { input, filters, .. } => {
             filters.iter().any(|(_, e)| reads_path(e)) || needs_lineage(input)
@@ -1028,6 +1029,21 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             *selector,
             edge_pred.as_deref(),
         ),
+        Plan::GroupToMap { input } => {
+            // Fold the grouped `[key, value]` rows into one Gremlin Map, first-seen
+            // key order (the harness compares map content order-independently; core
+            // is also first-seen). A single-column value the group produced (count,
+            // list) is the map value; a missing second column reads as NULL.
+            let b = pull(input, store, track)?;
+            let n = b.rows();
+            let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(n);
+            for i in 0..n {
+                let k = b.slots[0].value_at(i);
+                let v = b.slots.get(1).map_or(Value::Null, |c| c.value_at(i));
+                pairs.push((k, v));
+            }
+            Batch::single(Col::Gen(vec![Value::Map(std::sync::Arc::new(pairs))]))
+        }
         Plan::Aggregate { input, keys, aggs } => {
             // Frontier fast path: a scalar count over an Expand chain need not
             // build the wide intermediate batch. Falls back to the general
