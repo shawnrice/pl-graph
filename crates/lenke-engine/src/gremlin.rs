@@ -520,6 +520,10 @@ struct RepeatCtx {
     /// `repeat(out().hasLabel('PERSON'))`) — a target failing it is pruned. `None` = a
     /// bare hop body.
     body_filter: Option<Expr>,
+    /// A `repeat(<hop>.where(loops().is(<op>(n))))` in-body depth guard, lowered to a
+    /// max-depth cap on the walk (`loops()` == depth + 1). `None` = no cap from a body
+    /// `where(loops())`.
+    max_cap: Option<u32>,
 }
 
 struct Parser {
@@ -1878,7 +1882,7 @@ impl Parser {
                 // (the endpoint) is pre-allocated as the width so an emit/until
                 // predicate parsed before the flush references it. The LParen was
                 // already consumed at the top of `step`.
-                let (dir, label, bind_tag, body_filter) = self.repeat_body()?;
+                let (dir, label, bind_tag, body_filter, max_cap) = self.repeat_body()?;
                 self.expect(&Tok::RParen)?;
                 let from = self.current;
                 let out_slot = self.slots; // endpoint == width at flush time
@@ -1899,6 +1903,7 @@ impl Parser {
                     until: self.pending_until.take(),
                     until_pre: true,
                     body_filter,
+                    max_cap,
                 });
                 plan
             }
@@ -5169,7 +5174,7 @@ impl Parser {
     #[allow(clippy::type_complexity)]
     fn repeat_body(
         &mut self,
-    ) -> Result<(Dir, Option<String>, Option<String>, Option<Expr>), String> {
+    ) -> Result<(Dir, Option<String>, Option<String>, Option<Expr>, Option<u32>), String> {
         // Optional `__.` anonymous-traversal prefix.
         if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
             self.bump();
@@ -5226,6 +5231,7 @@ impl Parser {
         // is still the source here, but the body filter is evaluated over a one-row
         // mini-batch whose every slot carries the landed node, so the slot is immaterial.)
         let mut body_filter = None;
+        let mut max_cap = None;
         if self.peek() == Some(&Tok::Dot)
             && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if {
                 matches!(s.to_ascii_lowercase().as_str(), "haslabel" | "has" | "hasnot" | "haskey")
@@ -5235,8 +5241,30 @@ impl Parser {
             // child_filter_expr consumes the filter's own parens; the repeat arm closes
             // the outer `repeat(...)` paren after this returns.
             body_filter = Some(self.child_filter_expr()?);
+        } else if self.peek() == Some(&Tok::Dot)
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("where"))
+        {
+            // `where(loops().is(<op>(n)))` — an in-body depth guard. `loops()` == depth+1,
+            // so the walk continues while the guard holds: `lt(n)` caps depth at n-1,
+            // `le(n)`/`lte(n)` at n. (A non-loops body `where(...)` is not yet supported.)
+            self.expect(&Tok::Dot)?;
+            self.ident()?; // where
+            self.expect(&Tok::LParen)?;
+            let Some((op, n)) = self.try_loops_predicate()? else {
+                return Err("repeat(<hop>.where(...)) supports only where(loops().is(...))".into());
+            };
+            self.expect(&Tok::RParen)?; // close where(...)
+            max_cap = Some(match op {
+                CompareOp::Lt => n.saturating_sub(1),
+                CompareOp::Le => n,
+                other => {
+                    return Err(format!(
+                        "repeat(<hop>.where(loops().is({other:?}(n)))) unsupported op"
+                    ))
+                }
+            });
         }
-        Ok((dir, label, tag, body_filter))
+        Ok((dir, label, tag, body_filter, max_cap))
     }
 
     /// Close an open `repeat(...)` into a `VarLength` walk. `times(n)` alone is a
@@ -5268,6 +5296,8 @@ impl Parser {
         };
         // A `loops()` emit predicate raises the minimum emitted depth.
         let min = ctx.min_override.map_or(min, |m| m.max(min));
+        // An in-body `where(loops())` depth guard caps the max (never above the bound).
+        let max = ctx.max_cap.map_or(max, |c| c.min(max));
         let p = plan.var_length_until(
             ctx.from,
             ctx.dir,
