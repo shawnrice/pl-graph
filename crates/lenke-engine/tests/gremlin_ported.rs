@@ -26,14 +26,27 @@ fn core_graph() -> lenke_core::graph::Graph {
 }
 
 fn engine_store() -> lenke_engine::store::Store {
-    // Convert core-dialect lines ({type,id,labels,properties} / {type,from,to,labels})
-    // to the engine dialect ({id,labels,props} / {id,from,to,type,props}).
+    engine_store_from(MODERN_CORE)
+}
+
+/// Build an engine store from CORE-dialect ndjson (as `lenke_core::ndjson::encode`
+/// emits) — so the engine runs on the exact same graph the core test built.
+fn engine_store_from(core_ndjson: &str) -> lenke_engine::store::Store {
     let mut out = String::new();
-    for line in MODERN_CORE.lines().filter(|l| !l.trim().is_empty()) {
+    for line in core_ndjson.lines().filter(|l| !l.trim().is_empty()) {
         out.push_str(&core_line_to_engine(line));
         out.push('\n');
     }
-    lenke_engine::ndjson::from_ndjson(&out).expect("engine modern fixture")
+    lenke_engine::ndjson::from_ndjson(&out).expect("engine fixture")
+}
+
+/// A traversal that MUTATES the graph — dual-checking it would re-run the write on an
+/// already-written graph, so those run on core only (writes are covered by core's own
+/// contract tests).
+fn is_write(query: &str) -> bool {
+    ["addV", "addE", ".drop(", ".property("]
+        .iter()
+        .any(|w| query.contains(w))
 }
 
 fn core_line_to_engine(line: &str) -> String {
@@ -147,6 +160,40 @@ fn vertex_id(m: &[(EngVal, EngVal)]) -> EngVal {
         .unwrap_or(EngVal::Null)
 }
 
+/// Collapse a bare-vertex `{id,labels,properties}` map to its ext-id anywhere in a `Cmp`
+/// tree. Core renders a vertex bag (e.g. `subgraph()`'s `vertices`) as element maps while
+/// the engine renders ext-id strings; both denote the same vertex set, and the harness
+/// contract compares vertices by ext-id (there is no `Value::Node`). Idempotent on the
+/// engine side, whose bare vertices `norm_eng` already reduced.
+fn collapse_bare(c: Cmp) -> Cmp {
+    match c {
+        Cmp::List(xs) => Cmp::List(xs.into_iter().map(collapse_bare).collect()),
+        Cmp::Map(es) => {
+            let keys: std::collections::BTreeSet<&str> = es
+                .iter()
+                .filter_map(|(k, _)| if let Cmp::Str(s) = k { Some(s.as_str()) } else { None })
+                .collect();
+            let is_vertex = keys.len() == es.len()
+                && keys == ["id", "labels", "properties"].into_iter().collect();
+            if is_vertex {
+                let id = es
+                    .into_iter()
+                    .find(|(k, _)| matches!(k, Cmp::Str(s) if s == "id"))
+                    .map(|(_, v)| v)
+                    .unwrap_or(Cmp::Null);
+                collapse_bare(id)
+            } else {
+                Cmp::Map(
+                    es.into_iter()
+                        .map(|(k, v)| (collapse_bare(k), collapse_bare(v)))
+                        .collect(),
+                )
+            }
+        }
+        other => other,
+    }
+}
+
 /// True when a value contains a raw element the normalizer can't canonicalize — such a
 /// case can't be differentially compared (the engine has no Value::Node), so it's
 /// checked on CORE only (the body's own assert still runs).
@@ -169,17 +216,25 @@ fn modern() -> lenke_core::graph::Graph {
 /// when core produced a raw element (no `Value::Node` in the engine) — the body's own
 /// assertions on `core_res` still run. Compared order-independently (Gremlin order is
 /// unspecified without an explicit `order()`; ordered tests use `ordered()` on core).
-fn assert_engine_matches(query: &str, core_res: &[GVal]) {
-    let cg = core_graph();
-    let core_cmp: Vec<Cmp> = core_res.iter().map(|v| norm_core(v, &cg)).collect();
+fn assert_engine_matches(query: &str, core_res: &[GVal], store: &lenke_engine::store::Store, cg: &lenke_core::graph::Graph) {
+    if is_write(query) {
+        return; // writes run on core only (see is_write)
+    }
+    let core_cmp: Vec<Cmp> = core_res.iter().map(|v| norm_core(v, cg)).collect();
     if core_cmp.iter().any(has_other) {
         return;
     }
     match lenke_engine::gremlin::parse(query) {
         Ok(plan) => {
-            let rows = lenke_engine::exec::run(&plan, &engine_store());
-            let mut a = core_cmp;
-            let mut b: Vec<Cmp> = rows.rows.iter().flatten().map(norm_eng).collect();
+            let rows = lenke_engine::exec::run(&plan, store);
+            let mut a: Vec<Cmp> = core_cmp.into_iter().map(collapse_bare).collect();
+            let mut b: Vec<Cmp> = rows
+                .rows
+                .iter()
+                .flatten()
+                .map(norm_eng)
+                .map(collapse_bare)
+                .collect();
             a.sort();
             b.sort();
             assert_eq!(a, b, "engine != core for `{query}`");
@@ -192,8 +247,10 @@ fn assert_engine_matches(query: &str, core_res: &[GVal]) {
 /// test body's own `assert_eq!`.
 fn q(t: dual::Traversal) -> Vec<GVal> {
     let query = t.query();
-    let core_res = t.run(&mut core_graph());
-    assert_engine_matches(&query, &core_res);
+    let mut g = core_graph();
+    let store = engine_store();
+    let core_res = t.run(&mut g);
+    assert_engine_matches(&query, &core_res, &store, &g);
     core_res
 }
 
@@ -224,8 +281,10 @@ fn parse(query: &str) -> Result<ParsedT, String> {
 
 impl ParsedT {
     fn run(&self, graph: &mut lenke_core::graph::Graph) -> Vec<GVal> {
+        // Run the engine on the SAME graph core uses (encode → engine store).
+        let store = engine_store_from(&lenke_core::ndjson::encode(graph));
         let core_res = self.core.run(graph);
-        assert_engine_matches(&self.query, &core_res);
+        assert_engine_matches(&self.query, &core_res, &store, graph);
         core_res
     }
 }
@@ -1603,7 +1662,7 @@ fn q_idx(indexes: &[&str], t: dual::Traversal) -> Vec<GVal> {
         g.create_vertex_index(k);
     }
     let core_res = t.run(&mut g);
-    assert_engine_matches(&query, &core_res);
+    assert_engine_matches(&query, &core_res, &engine_store(), &g);
     core_res
 }
 
@@ -1958,7 +2017,7 @@ fn sp_paths(t: dual::Traversal) -> Vec<Vec<String>> {
     let query = t.query();
     let mut g = modern();
     let core_res = t.run(&mut g);
-    assert_engine_matches(&query, &core_res);
+    assert_engine_matches(&query, &core_res, &engine_store(), &g);
     core_res
         .iter()
         .map(|p| match p {

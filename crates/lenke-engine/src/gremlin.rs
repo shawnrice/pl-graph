@@ -32,6 +32,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         path_ok: true,
         caps: std::collections::HashMap::new(),
         algo_props: std::collections::HashMap::new(),
+        last_algo: None,
         sack_slot: None,
         subgraph_caps: std::collections::HashMap::new(),
     };
@@ -54,6 +55,234 @@ enum Tok {
 /// Build `left = v0 OR left = v1 OR …` — the membership test `within(v0, v1, …)`
 /// desugars to. An empty list is a constant FALSE (`1 = 0`), so `within()` and
 /// (negated) `without()` behave sensibly.
+// ── math() expression parsing ────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+enum MathTok {
+    Num(f64),
+    Ident(String),
+    Op(char), // + - * / % ^
+    LParen,
+    RParen,
+    Comma,
+    Underscore,
+}
+
+fn math_lex(s: &str) -> Result<Vec<MathTok>, String> {
+    let b: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    let mut out = Vec::new();
+    while i < b.len() {
+        let c = b[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        match c {
+            '+' | '-' | '*' | '/' | '%' | '^' => {
+                out.push(MathTok::Op(c));
+                i += 1;
+            }
+            '(' => {
+                out.push(MathTok::LParen);
+                i += 1;
+            }
+            ')' => {
+                out.push(MathTok::RParen);
+                i += 1;
+            }
+            ',' => {
+                out.push(MathTok::Comma);
+                i += 1;
+            }
+            '_' if !(i + 1 < b.len() && (b[i + 1].is_alphanumeric() || b[i + 1] == '_')) => {
+                out.push(MathTok::Underscore);
+                i += 1;
+            }
+            c if c.is_ascii_digit() || c == '.' => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_digit() || b[i] == '.' || b[i] == 'e') {
+                    i += 1;
+                }
+                let n: f64 = b[start..i]
+                    .iter()
+                    .collect::<String>()
+                    .parse()
+                    .map_err(|_| "math(): bad number".to_string())?;
+                out.push(MathTok::Num(n));
+            }
+            c if c.is_alphabetic() || c == '_' => {
+                let start = i;
+                while i < b.len() && (b[i].is_alphanumeric() || b[i] == '_') {
+                    i += 1;
+                }
+                out.push(MathTok::Ident(b[start..i].iter().collect()));
+            }
+            other => return Err(format!("math(): unexpected char `{other}`")),
+        }
+    }
+    Ok(out)
+}
+
+fn math_const(name: &str) -> Option<f64> {
+    match name {
+        "pi" => Some(std::f64::consts::PI),
+        "e" => Some(std::f64::consts::E),
+        _ => None,
+    }
+}
+
+fn is_unary_math_fn(name: &str) -> bool {
+    matches!(
+        name,
+        "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "sqrt"
+            | "abs" | "ceil" | "floor" | "exp" | "ln" | "log10" | "signum"
+    )
+}
+
+/// Map a math() function name to the engine scalar-fn name (identical kernels).
+fn math_fn_name(name: &str) -> &str {
+    match name {
+        "signum" => "sign",
+        "pow" => "power",
+        other => other,
+    }
+}
+
+struct MathParser<'a> {
+    toks: Vec<MathTok>,
+    pos: usize,
+    operand: &'a Expr,
+    labels: &'a std::collections::HashMap<String, usize>,
+}
+
+impl MathParser<'_> {
+    fn peek(&self) -> Option<&MathTok> {
+        self.toks.get(self.pos)
+    }
+    fn expr(&mut self) -> Result<Expr, String> {
+        let mut left = self.term()?;
+        while let Some(MathTok::Op(op @ ('+' | '-'))) = self.peek().cloned() {
+            self.pos += 1;
+            let right = self.term()?;
+            left = Expr::Arith {
+                op: if op == '+' { ArithOp::Add } else { ArithOp::Sub },
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+    fn term(&mut self) -> Result<Expr, String> {
+        let mut left = self.power()?;
+        while let Some(MathTok::Op(op @ ('*' | '/' | '%'))) = self.peek().cloned() {
+            self.pos += 1;
+            let right = self.power()?;
+            left = Expr::Arith {
+                op: match op {
+                    '*' => ArithOp::Mul,
+                    '/' => ArithOp::Div,
+                    _ => ArithOp::Rem,
+                },
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+    fn power(&mut self) -> Result<Expr, String> {
+        let base = self.unary()?;
+        if let Some(MathTok::Op('^')) = self.peek() {
+            self.pos += 1;
+            let exp = self.power()?; // right-associative
+            return Ok(Expr::Call {
+                name: "power".into(),
+                args: vec![base, exp],
+            });
+        }
+        Ok(base)
+    }
+    fn unary(&mut self) -> Result<Expr, String> {
+        if let Some(MathTok::Op(op @ ('-' | '+'))) = self.peek().cloned() {
+            self.pos += 1;
+            let e = self.unary()?;
+            return Ok(if op == '-' {
+                Expr::Arith {
+                    op: ArithOp::Sub,
+                    left: Box::new(Expr::Lit(Value::Num(0.0))),
+                    right: Box::new(e),
+                }
+            } else {
+                e
+            });
+        }
+        self.primary()
+    }
+    fn primary(&mut self) -> Result<Expr, String> {
+        match self.peek().cloned() {
+            Some(MathTok::Num(n)) => {
+                self.pos += 1;
+                Ok(Expr::Lit(Value::Num(n)))
+            }
+            Some(MathTok::Underscore) => {
+                self.pos += 1;
+                Ok(self.operand.clone())
+            }
+            Some(MathTok::LParen) => {
+                self.pos += 1;
+                let e = self.expr()?;
+                if self.peek() != Some(&MathTok::RParen) {
+                    return Err("math(): expected `)`".into());
+                }
+                self.pos += 1;
+                Ok(e)
+            }
+            Some(MathTok::Ident(name)) => {
+                self.pos += 1;
+                // `name(args)` function call.
+                if self.peek() == Some(&MathTok::LParen) {
+                    self.pos += 1;
+                    let mut args = vec![self.expr()?];
+                    while self.peek() == Some(&MathTok::Comma) {
+                        self.pos += 1;
+                        args.push(self.expr()?);
+                    }
+                    if self.peek() != Some(&MathTok::RParen) {
+                        return Err("math(): expected `)` after args".into());
+                    }
+                    self.pos += 1;
+                    return Ok(Expr::Call {
+                        name: math_fn_name(&name).to_string(),
+                        args,
+                    });
+                }
+                // Bare unary application `sin _` / `sin 2` (only unary functions).
+                if is_unary_math_fn(&name)
+                    && matches!(
+                        self.peek(),
+                        Some(MathTok::Num(_) | MathTok::Underscore | MathTok::LParen | MathTok::Ident(_))
+                    )
+                {
+                    let arg = self.primary()?;
+                    return Ok(Expr::Call {
+                        name: math_fn_name(&name).to_string(),
+                        args: vec![arg],
+                    });
+                }
+                // A constant, else a named step-label variable.
+                if let Some(c) = math_const(&name) {
+                    return Ok(Expr::Lit(Value::Num(c)));
+                }
+                match self.labels.get(&name) {
+                    Some(&slot) => Ok(Expr::Slot(slot)),
+                    None => Err(format!("math(): unknown variable `{name}`")),
+                }
+            }
+            other => Err(format!("math(): unexpected token {other:?}")),
+        }
+    }
+}
+
 fn or_of_equals(left: &Expr, vals: &[Value]) -> Expr {
     let eq = |v: &Value| Expr::Compare {
         op: CompareOp::Eq,
@@ -125,14 +354,35 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                 let quote = c;
                 let mut t = String::new();
                 i += 1;
-                while i < b.len() && b[i] != quote {
-                    t.push(b[i]);
+                // Decode the common escapes (`\n \t \r`, `\\`, `\'`) rather than
+                // dropping the backslash — byte-identical to core's lexer.
+                let mut terminated = false;
+                while i < b.len() {
+                    let ch = b[i];
+                    if ch == quote {
+                        i += 1;
+                        terminated = true;
+                        break;
+                    }
+                    if ch == '\\' && i + 1 < b.len() {
+                        i += 1;
+                        t.push(match b[i] {
+                            'n' => '\n',
+                            't' => '\t',
+                            'r' => '\r',
+                            other => other,
+                        });
+                        i += 1;
+                        continue;
+                    }
+                    t.push(ch);
                     i += 1;
                 }
-                if i >= b.len() {
+                if !terminated {
                     return Err("unterminated string literal".into());
                 }
                 out.push(Tok::Str(t));
+                continue;
             }
             _ if c.is_ascii_digit()
                 || (c == '-' && b.get(i + 1).is_some_and(char::is_ascii_digit)) =>
@@ -204,6 +454,7 @@ struct Parser {
     /// `AlgoAnnotate`). A following `values(<property>)` reads that slot instead of a
     /// store property.
     algo_props: std::collections::HashMap<String, usize>,
+    last_algo: Option<usize>,
     /// The slot carrying the per-traverser `sack` accumulator (a column appended by
     /// `withSack(init)`), or None when no sack is in play.
     sack_slot: Option<usize>,
@@ -1251,6 +1502,20 @@ impl Parser {
                     let end = self.str_arg()?;
                     self.expect(&Tok::RParen)?; // close op(...)
                     self.expect(&Tok::RParen)?; // close where(...)
+                    // Optional `.by('k')` modulators pick a PROPERTY to compare on each
+                    // side (`where('a',lt('b')).by('age')` → a.age < b.age). One `by`
+                    // applies to both sides; two apply to start then end in order. With
+                    // no `by` the tagged elements are compared directly (slot vs slot).
+                    let mut bys: Vec<String> = Vec::new();
+                    while self.peek() == Some(&Tok::Dot)
+                        && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
+                    {
+                        self.expect(&Tok::Dot)?;
+                        self.ident()?; // by
+                        self.expect(&Tok::LParen)?;
+                        bys.push(self.str_arg()?);
+                        self.expect(&Tok::RParen)?;
+                    }
                     let slot_of = |l: &str| {
                         self.labels
                             .get(l)
@@ -1268,64 +1533,78 @@ impl Parser {
                             return Err(format!("where('{start}', {other}(…)) needs a comparison"))
                         }
                     };
+                    let side = |slot: usize, idx: usize| match bys.get(idx).or_else(|| bys.first())
+                    {
+                        Some(k) => Expr::Prop {
+                            slot,
+                            key: k.clone(),
+                        },
+                        None => Expr::Slot(slot),
+                    };
                     let pred = Expr::Compare {
                         op,
-                        left: Box::new(Expr::Slot(slot_of(&start)?)),
-                        right: Box::new(Expr::Slot(slot_of(&end)?)),
+                        left: Box::new(side(slot_of(&start)?, 0)),
+                        right: Box::new(side(slot_of(&end)?, 1)),
                     };
                     return Ok(plan.filter(pred));
                 }
                 // Two forms: where(<hop>) is a SEMI-JOIN — keep the element if it HAS
                 // such an adjacency — and where(P) filters the current VALUE by a
                 // predicate. A leading `out`/`in`/`both` (or `__`) marks the hop form.
-                let is_hop = matches!(self.peek(), Some(Tok::Ident(s)) if {
+                // A traversal filter (`__.`, or a step head) routes through the general
+                // filter-child machinery (hops → Exists, `<hop>.count().is()` →
+                // CountSubquery, not/and/or, hasLabel, …).
+                let is_traversal = matches!(self.peek(), Some(Tok::Ident(s)) if {
                     let l = s.to_ascii_lowercase();
-                    s == "__" || l == "out" || l == "in" || l == "both"
+                    s == "__" || matches!(l.as_str(),
+                        "out" | "in" | "both" | "oute" | "ine" | "bothe"
+                        | "not" | "and" | "or" | "has" | "hasnot" | "haslabel" | "haskey")
                 });
-                if is_hop {
-                    if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
-                        self.bump();
-                        self.expect(&Tok::Dot)?;
-                    }
-                    let hop = self.ident()?;
-                    let dir = match hop.to_ascii_lowercase().as_str() {
-                        "out" => Dir::Out,
-                        "in" => Dir::In,
-                        "both" => Dir::Both,
-                        other => {
-                            return Err(format!(
-                                "where() traversal must be a single out/in/both hop, got `{other}`"
-                            ))
-                        }
-                    };
-                    self.expect(&Tok::LParen)?;
-                    // Optional single edge label (argless = any type). A multi-label
-                    // hop or a multi-step chain in where() is deferred.
-                    let label = if matches!(self.peek(), Some(Tok::Str(_))) {
-                        let l = self.str_arg()?;
-                        if self.peek() == Some(&Tok::Comma) {
-                            return Err(
-                                "where() hop with multiple edge labels is not yet supported".into(),
-                            );
-                        }
-                        Some(l)
-                    } else {
-                        None
-                    };
-                    self.expect(&Tok::RParen)?; // close the hop
+                if is_traversal {
+                    let e = self.child_filter_expr()?;
                     self.expect(&Tok::RParen)?; // close where(...)
-                                                // Correlated existence check: does the current element have such
-                                                // an edge? The body seeds `Plan::Row` (the outer row) and expands
-                                                // from the current slot — the same shape GQL's EXISTS { … } builds.
-                    let body = Plan::Row.expand(self.current, dir, &etypes_of(label.as_deref()));
-                    plan.filter(Expr::Exists {
-                        body: Box::new(body),
-                        outer_width: self.slots,
-                    })
+                    plan.filter(e)
                 } else {
-                    let pred = self.predicate_expr(Expr::Slot(self.current))?;
-                    self.expect(&Tok::RParen)?;
-                    plan.filter(pred)
+                    // Predicate on the current value: `where(op(v))`. If the rhs is a
+                    // single bound step-label — `where(neq('me'))` after tagging `me` —
+                    // compare the current value to that TAG's value (core's tagged
+                    // where); otherwise fall through to the literal-predicate path.
+                    let tag_form = match (self.peek(), self.toks.get(self.pos + 1)) {
+                        (Some(Tok::Ident(op)), Some(Tok::LParen)) => {
+                            let cop = match op.to_ascii_lowercase().as_str() {
+                                "eq" => Some(CompareOp::Eq),
+                                "neq" => Some(CompareOp::Ne),
+                                "gt" => Some(CompareOp::Gt),
+                                "gte" => Some(CompareOp::Ge),
+                                "lt" => Some(CompareOp::Lt),
+                                "lte" => Some(CompareOp::Le),
+                                _ => None,
+                            };
+                            match (cop, self.toks.get(self.pos + 2)) {
+                                (Some(op), Some(Tok::Str(s))) => {
+                                    self.labels.get(s).copied().map(|slot| (op, slot))
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some((op, slot)) = tag_form {
+                        self.bump(); // op
+                        self.bump(); // (
+                        self.bump(); // tag string
+                        self.expect(&Tok::RParen)?; // close op(...)
+                        self.expect(&Tok::RParen)?; // close where(...)
+                        plan.filter(Expr::Compare {
+                            op,
+                            left: Box::new(Expr::Slot(self.current)),
+                            right: Box::new(Expr::Slot(slot)),
+                        })
+                    } else {
+                        let pred = self.predicate_expr(Expr::Slot(self.current))?;
+                        self.expect(&Tok::RParen)?;
+                        plan.filter(pred)
+                    }
                 }
             }
             // is(P) / is(op(v)) / is(literal): filter the current VALUE by a
@@ -1857,6 +2136,31 @@ impl Parser {
                 self.slots = 1;
                 p
             }
+            "math" => {
+                // math('<expr>')[.by('k')]: evaluate a math expression. `_` is the
+                // current value, or the `.by('k')` projection of it; named identifiers
+                // resolve to step-label variables. Lowers to the engine arithmetic /
+                // scalar-fn kernels (bit-identical to GQL).
+                let expr_str = self.str_arg()?;
+                self.expect(&Tok::RParen)?;
+                let operand = if self.peek() == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
+                {
+                    self.expect(&Tok::Dot)?;
+                    self.ident()?; // `by`
+                    self.expect(&Tok::LParen)?;
+                    let k = self.str_arg()?;
+                    self.expect(&Tok::RParen)?;
+                    Expr::Prop { slot: self.current, key: k }
+                } else {
+                    Expr::Slot(self.current)
+                };
+                let e = self.parse_math(&expr_str, &operand)?;
+                let p = plan.project(vec![("math".to_string(), e)]);
+                self.current = 0;
+                self.slots = 1;
+                p
+            }
             "identity" => {
                 // Pass-through — the current element is unchanged (Gremlin identity()).
                 self.expect(&Tok::RParen)?;
@@ -1994,8 +2298,58 @@ impl Parser {
                 let p = plan.algo_annotate(algo, None, node_slot);
                 self.slots += 1;
                 self.algo_props.insert(prop.to_string(), out_slot);
+                self.last_algo = Some(out_slot);
                 self.path_ok = false;
                 p
+            }
+            "with" => {
+                // OLAP config modulator on the preceding algo step: `with([X.]propertyName,
+                // 'name')` aliases the result property; `with([X.]times, n)` sets the
+                // iteration count. `with([X.]target, …)` (shortestPath) is deferred.
+                let mut key = self.ident()?;
+                if self.peek() == Some(&Tok::Dot) {
+                    self.bump();
+                    key = self.ident()?; // strip the `PageRank.` / `PeerPressure.` prefix
+                }
+                self.expect(&Tok::Comma)?;
+                match key.to_ascii_lowercase().as_str() {
+                    "propertyname" => {
+                        let name = self.str_arg()?;
+                        self.expect(&Tok::RParen)?;
+                        if let Some(slot) = self.last_algo {
+                            self.algo_props.insert(name, slot);
+                        }
+                        plan
+                    }
+                    "times" => {
+                        let n = self.usize_arg()? as u32;
+                        self.expect(&Tok::RParen)?;
+                        // Re-issue the last AlgoAnnotate with the requested iterations.
+                        match plan {
+                            Plan::AlgoAnnotate {
+                                input,
+                                algo,
+                                edge_label,
+                                node_slot,
+                            } => {
+                                let algo = match algo {
+                                    crate::ir::GremlinAlgo::PageRank { damping, .. } => {
+                                        crate::ir::GremlinAlgo::PageRank { damping, iterations: n }
+                                    }
+                                    crate::ir::GremlinAlgo::PeerPressure { .. } => {
+                                        crate::ir::GremlinAlgo::PeerPressure { iterations: n }
+                                    }
+                                    other => other,
+                                };
+                                Plan::AlgoAnnotate { input, algo, edge_label, node_slot }
+                            }
+                            other => other,
+                        }
+                    }
+                    other => {
+                        return Err(format!("with({other}, …) is not yet supported"))
+                    }
+                }
             }
             "barrier" => {
                 // A lazy-barrier is a no-op in this eager executor (matching core, where
@@ -2141,6 +2495,16 @@ impl Parser {
             }
             other => return Err(format!("unsupported Gremlin step `{other}`")),
         };
+        // Edge-transparent steps operate ON the edge frontier and stay on it, so a
+        // following inV()/outV()/otherV() still resolves the hop's landed endpoint —
+        // re-arm the edge-hop pointer the top-of-step take() cleared.
+        if matches!(
+            lname.as_str(),
+            "has" | "hasnot" | "haskey" | "hasvalue" | "subgraph" | "aggregate" | "store"
+                | "dedup" | "where" | "as"
+        ) {
+            self.edge_hop = prev_edge_hop;
+        }
         Ok(plan)
     }
 
@@ -2315,6 +2679,39 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 label_membership(self.current, &ls)
             }
+            // `values('k')` in filter position is a presence test; a trailing
+            // `.is(<pred>)` narrows it to a value predicate. Expressed inline
+            // (PropertyExists [AND Compare]) rather than an Exists over a
+            // projection body — a projection collapses the batch and drops the
+            // provenance column the Exists machinery reads.
+            "values" => {
+                let key = self.str_arg()?;
+                if self.peek() == Some(&Tok::Comma) {
+                    return Err(
+                        "values() with multiple keys is not supported in a filter child".into(),
+                    );
+                }
+                self.expect(&Tok::RParen)?;
+                let exists = Expr::PropertyExists {
+                    slot: self.current,
+                    key: key.clone(),
+                };
+                if self.peek() == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("is"))
+                {
+                    self.expect(&Tok::Dot)?;
+                    self.ident()?; // is
+                    self.expect(&Tok::LParen)?;
+                    let pred = self.predicate_expr(Expr::Prop {
+                        slot: self.current,
+                        key: key.clone(),
+                    })?;
+                    self.expect(&Tok::RParen)?;
+                    Expr::And(Box::new(exists), Box::new(pred))
+                } else {
+                    exists
+                }
+            }
             "out" | "in" | "both" | "oute" | "ine" | "bothe" => {
                 let dir = match name.as_str() {
                     "out" | "oute" => Dir::Out,
@@ -2384,6 +2781,26 @@ impl Parser {
     /// Parse a single anonymous hop body — `[__.] (out|in|both) ( [label] )` — and
     /// return its `(direction, edge label)`. Shared by the branch steps (union) that
     /// take hop sub-traversals. Multi-label / multi-step bodies are deferred.
+    /// Parse a Gremlin `math('…')` expression string into an engine `Expr`. `operand`
+    /// resolves the `_` variable (and any named step-label variable via `var_slot`).
+    /// Grammar precedence (mXparser/TinkerPop): `+ -` < `* / %` < `^` (right-assoc) <
+    /// unary `- +` < primary (number, `(expr)`, `name(args)`, bare unary `sin _`,
+    /// constant `pi`/`e`, or a variable). Maps to the same f64 kernels GQL uses.
+    fn parse_math(&self, src: &str, operand: &Expr) -> Result<Expr, String> {
+        let toks = math_lex(src)?;
+        let mut mp = MathParser {
+            toks,
+            pos: 0,
+            operand,
+            labels: &self.labels,
+        };
+        let e = mp.expr()?;
+        if mp.pos != mp.toks.len() {
+            return Err(format!("math('{src}'): trailing tokens"));
+        }
+        Ok(e)
+    }
+
     fn hop_body(&mut self) -> Result<(Dir, Option<String>), String> {
         if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
             self.bump();
@@ -3268,8 +3685,8 @@ mod tests {
             )),
             vec!["Num(30.0);", "Num(40.0);"],
         );
-        // A multi-label where-hop is deferred, not mis-parsed.
-        assert!(super::parse("g.V().where(out('A','B'))").is_err());
+        // A multi-label where-hop is a semi-join over either edge type.
+        assert!(super::parse("g.V().where(out('A','B'))").is_ok());
     }
 
     /// `and(f1,f2,…)`, `or(f1,f2,…)`, `not(f)` combine element filters (has/hasNot,
