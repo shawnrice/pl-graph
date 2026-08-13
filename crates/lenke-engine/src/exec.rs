@@ -164,30 +164,116 @@ pub fn try_run(plan: &Plan, store: &Store) -> Result<Rows, String> {
         None => pull(plan, store, track)?,
     };
     let n = batch.rows();
-    Ok(match output_names(plan) {
-        Some(names) => {
-            // One flat allocation, row-major: for each row, push every slot's cell.
-            let ncols = names.len();
-            let mut rows = Flat::with_capacity(n, ncols);
-            for i in 0..n {
-                for c in &batch.slots {
-                    rows.data.push(render_cell(c, i, store));
-                }
+    // CONSUME the batch to build the result — the final render is the LAST use of these
+    // columns, so a materialized Str/Num/Bool/Gen cell MOVES into its `Value` instead of
+    // being cloned out of a column we then drop. The old build re-cloned every cell (a
+    // second full materialization on top of the projection's Col::Str), doubling the
+    // per-row Arc-clone work a string projection pays.
+    let names = output_names(plan).unwrap_or_else(|| vec!["_".to_string()]);
+    let ncols = names.len();
+    let slots = batch.slots;
+    let data = if ncols == 1 {
+        // Single output column (values/label/id/count, or a one-item RETURN): its cells
+        // ARE the rows — move them straight into a row-major buffer, no transpose.
+        let col = slots
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Col::Gen(vec![Value::Null; n]));
+        col_into_values(col, store)
+    } else {
+        // Multi-column: a row-major buffer filled column-by-column (each column consumed).
+        let mut data = vec![Value::Null; n * ncols];
+        for (c, col) in slots.into_iter().enumerate() {
+            if c >= ncols {
+                break; // defensive: never write past the declared columns
             }
-            Rows { names, rows }
+            render_col_into(col, store, &mut data, c, ncols);
         }
-        None => {
-            let slot0 = batch.slot(0);
-            let mut rows = Flat::with_capacity(n, 1);
-            for i in 0..n {
-                rows.data.push(render_cell(slot0, i, store));
-            }
-            Rows {
-                names: vec!["_".to_string()],
-                rows,
-            }
-        }
+        data
+    };
+    Ok(Rows {
+        names,
+        rows: Flat { data, ncols },
     })
+}
+
+/// Move a single output column's cells into a fresh row-major `Vec<Value>`, CONSUMING
+/// the column: a `Str`/`Num`/`Bool` cell moves into its `Value` (no clone), a `Gen`
+/// column IS already `Vec<Value>` (returned as-is, zero work), and a node/edge frontier
+/// renders to its element value via the store. Matches `render_cell` exactly, minus the
+/// clone.
+fn col_into_values(col: Col, store: &Store) -> Vec<Value> {
+    match col {
+        Col::Str(data) => data.into_iter().map(Value::Str).collect(),
+        Col::Num(data) => data.into_iter().map(Value::Num).collect(),
+        Col::Bool(data) => data.into_iter().map(Value::Bool).collect(),
+        Col::Gen(data) => data,
+        Col::Nodes(ids) => ids
+            .into_iter()
+            .map(|id| {
+                if id == u32::MAX {
+                    Value::Null
+                } else {
+                    node_result_value(store, id)
+                }
+            })
+            .collect(),
+        Col::Edges(eids) => eids
+            .into_iter()
+            .map(|e| {
+                if e == u32::MAX {
+                    Value::Null
+                } else {
+                    edge_result_value(store, e)
+                }
+            })
+            .collect(),
+    }
+}
+
+/// The multi-column twin of [`col_into_values`]: move column `col`'s cells into the
+/// row-major `out` buffer at column `c` (stride `ncols`), consuming the column.
+fn render_col_into(col: Col, store: &Store, out: &mut [Value], c: usize, ncols: usize) {
+    match col {
+        Col::Str(data) => {
+            for (i, s) in data.into_iter().enumerate() {
+                out[i * ncols + c] = Value::Str(s);
+            }
+        }
+        Col::Num(data) => {
+            for (i, x) in data.into_iter().enumerate() {
+                out[i * ncols + c] = Value::Num(x);
+            }
+        }
+        Col::Bool(data) => {
+            for (i, b) in data.into_iter().enumerate() {
+                out[i * ncols + c] = Value::Bool(b);
+            }
+        }
+        Col::Gen(data) => {
+            for (i, v) in data.into_iter().enumerate() {
+                out[i * ncols + c] = v;
+            }
+        }
+        Col::Nodes(ids) => {
+            for (i, id) in ids.into_iter().enumerate() {
+                out[i * ncols + c] = if id == u32::MAX {
+                    Value::Null
+                } else {
+                    node_result_value(store, id)
+                };
+            }
+        }
+        Col::Edges(eids) => {
+            for (i, e) in eids.into_iter().enumerate() {
+                out[i * ncols + c] = if e == u32::MAX {
+                    Value::Null
+                } else {
+                    edge_result_value(store, e)
+                };
+            }
+        }
+    }
 }
 
 /// Run a plan that MAY write, against a mutable store. A write plan (`Insert`)
