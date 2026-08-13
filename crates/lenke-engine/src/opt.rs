@@ -1913,11 +1913,19 @@ mod tests {
             "g.V().hasLabel('P').order().by('k', desc).range(2, 5).values('id')",
         ] {
             let plan = crate::gremlin::parse(q).unwrap();
-            // Sanity: the UNoptimized plan really is two stacked OrderPages.
+            // Sanity: the UNoptimized plan really is two stacked OrderPages. `values`
+            // now skips absent properties, so a `Filter` (PropertyExists) sits between
+            // the Project and the OrderPages — descend through it.
+            let below_project = match &plan {
+                Plan::Project { input, .. } => match input.as_ref() {
+                    Plan::Filter { input, .. } => input.as_ref(),
+                    other => other,
+                },
+                other => other,
+            };
             assert!(
-                matches!(&plan, Plan::Project { input, .. }
-                    if matches!(input.as_ref(), Plan::OrderPage { input: inner, keys, .. }
-                        if keys.is_empty() && matches!(inner.as_ref(), Plan::OrderPage { .. }))),
+                matches!(below_project, Plan::OrderPage { input: inner, keys, .. }
+                    if keys.is_empty() && matches!(inner.as_ref(), Plan::OrderPage { .. })),
                 "expected stacked OrderPages for `{q}`"
             );
             assert_rows_preserved(&plan, &store);

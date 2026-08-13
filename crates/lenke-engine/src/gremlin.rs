@@ -75,6 +75,8 @@ fn or_of_equals(left: &Expr, vals: &[Value]) -> Expr {
 /// reducing `count()` traversal. Used to build the key-by and value-by of a group.
 enum GroupBy {
     Key(String),
+    /// An `id`/`label` token by-modulator, carrying its element expression.
+    KeyExpr(String, Expr),
     Element,
     Count,
 }
@@ -246,6 +248,45 @@ impl Parser {
         }
     }
 
+    /// Parse the content of a `by(...)` group/select/project key: a `'prop'` string,
+    /// or the `id`/`label` (also `T.id`/`T.label`) element token. Returns a display
+    /// name and the value expression over `slot`.
+    fn by_key_expr(&mut self, slot: usize) -> Result<(String, Expr), String> {
+        if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("T")) {
+            self.bump();
+            self.expect(&Tok::Dot)?;
+        }
+        match self.peek().cloned() {
+            Some(Tok::Str(k)) => {
+                self.bump();
+                Ok((k.clone(), Expr::Prop { slot, key: k }))
+            }
+            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("id") => {
+                self.bump();
+                Ok((
+                    "id".into(),
+                    Expr::Call {
+                        name: "element_id".into(),
+                        args: vec![Expr::Slot(slot)],
+                    },
+                ))
+            }
+            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("label") => {
+                self.bump();
+                Ok((
+                    "label".into(),
+                    Expr::Call {
+                        name: "element_label".into(),
+                        args: vec![Expr::Slot(slot)],
+                    },
+                ))
+            }
+            other => Err(format!(
+                "by(...): expected a key or id/label token, got {other:?}"
+            )),
+        }
+    }
+
     // traversal := 'g' '.' ( 'V' '(' ')' | 'addV' '(' Label ')' ) ( '.' step )*
     fn traversal(&mut self) -> Result<Plan, String> {
         let g = self.ident()?;
@@ -342,6 +383,22 @@ impl Parser {
                     }],
                     edges: vec![],
                 }
+            }
+            "inject" => {
+                // g.inject(v1, v2, …): a SOURCE that seeds the stream with the literal
+                // values — an unwind of the value list over a single Row.
+                self.expect(&Tok::LParen)?;
+                let vals = self.literal_list()?;
+                self.expect(&Tok::RParen)?;
+                self.current = 0;
+                self.slots = 1;
+                Plan::Unwind {
+                    input: Box::new(Plan::Row),
+                    list: Box::new(Expr::Lit(Value::List(vals))),
+                    var_slot: 1,
+                    ordinal: None,
+                }
+                .project(vec![("inject".to_string(), Expr::Slot(1))])
             }
             other => return Err(format!("expected V() or addV(...), got `{other}`")),
         };
@@ -503,6 +560,27 @@ impl Parser {
                     slot: self.current,
                     key,
                 })))
+            }
+            "haskey" => {
+                // Keep elements that HAVE any of the listed property keys.
+                let mut keys = vec![self.str_arg()?];
+                while self.peek() == Some(&Tok::Comma) {
+                    self.bump();
+                    keys.push(self.str_arg()?);
+                }
+                self.expect(&Tok::RParen)?;
+                let mut pred: Option<Expr> = None;
+                for k in keys {
+                    let pe = Expr::PropertyExists {
+                        slot: self.current,
+                        key: k,
+                    };
+                    pred = Some(match pred {
+                        None => pe,
+                        Some(p) => Expr::Or(Box::new(p), Box::new(pe)),
+                    });
+                }
+                plan.filter(pred.expect("hasKey needs a key"))
             }
             "union" => {
                 // union(<hop>, <hop>, …): for each element, concatenate every branch's
@@ -768,51 +846,45 @@ impl Parser {
                     }
                 };
                 self.expect(&Tok::RParen)?; // close branch(...)
-                                            // Parse `.option(m, <hop>)` modulators (m = literal, or bare `none`).
-                type BranchOpt = (Option<Value>, (Dir, Option<String>));
-                let mut opts: Vec<BranchOpt> = Vec::new();
+                                            // Parse `.option(m, <body>)` modulators (m = literal, or bare `none`
+                                            // for the default). Each body is an arbitrary sub-traversal, gated on
+                                            // the INPUT element by the routing guard (so no Exists-provenance issue).
+                let width = self.slots;
+                let mut bodies = Vec::new();
+                let mut matched: Vec<Value> = Vec::new();
+                let mut land = (0usize, 1usize);
                 while self.peek() == Some(&Tok::Dot)
                     && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("option"))
                 {
                     self.expect(&Tok::Dot)?;
                     self.ident()?; // `option`
                     self.expect(&Tok::LParen)?;
-                    let m = if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("none"))
-                    {
+                    let is_none = matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("none"));
+                    let guard = if is_none {
                         self.bump();
-                        // `none` may be spelled `none()` — swallow an empty arg list.
                         if self.peek() == Some(&Tok::LParen) {
                             self.bump();
                             self.expect(&Tok::RParen)?;
                         }
-                        None
+                        Expr::Not(Box::new(or_of_equals(&test_expr, &matched)))
                     } else {
-                        Some(self.literal()?)
-                    };
-                    self.expect(&Tok::Comma)?;
-                    let hop = self.hop_body()?;
-                    self.expect(&Tok::RParen)?;
-                    opts.push((m, hop));
-                }
-                let matched: Vec<Value> = opts.iter().filter_map(|(m, _)| m.clone()).collect();
-                let mut bodies = Vec::new();
-                for (m, (dir, label)) in &opts {
-                    let guard = match m {
-                        Some(v) => Expr::Compare {
+                        let v = self.literal()?;
+                        matched.push(v.clone());
+                        Expr::Compare {
                             op: CompareOp::Eq,
                             left: Box::new(test_expr.clone()),
-                            right: Box::new(Expr::Lit(v.clone())),
-                        },
-                        None => Expr::Not(Box::new(or_of_equals(&test_expr, &matched))),
+                            right: Box::new(Expr::Lit(v)),
+                        }
                     };
-                    bodies.push(Plan::Row.filter(guard).expand(
-                        from,
-                        *dir,
-                        &etypes_of(label.as_deref()),
-                    ));
+                    self.expect(&Tok::Comma)?;
+                    let seed = Plan::Row.filter(guard);
+                    let (body, oc, os) = self.parse_sub_body_seeded(seed, from, width)?;
+                    land = (oc, os);
+                    self.expect(&Tok::RParen)?;
+                    bodies.push(body);
                 }
-                self.current = self.slots;
-                self.slots += 1;
+                self.current = land.0;
+                self.slots = land.1;
                 plan.branch(bodies)
             }
             "choose" => {
@@ -978,21 +1050,49 @@ impl Parser {
                 plan
             }
             "values" => {
-                let key = self.str_arg()?;
+                // values('k', …): emit the value of each listed property that is
+                // PRESENT on the element — an ABSENT property yields nothing (core
+                // skips it; a present-but-null value is kept, per the null-first-class
+                // policy). Single key: filter-present then project. Multiple keys: a
+                // per-element branch over each present key.
+                let mut keys = vec![self.str_arg()?];
+                while self.peek() == Some(&Tok::Comma) {
+                    self.bump();
+                    keys.push(self.str_arg()?);
+                }
                 self.expect(&Tok::RParen)?;
-                // An OLAP annotate property (pageRank/component/cluster) reads the
-                // computed slot the annotate step appended; any other key is a store
-                // property of the current element.
-                let value_expr = match self.algo_props.get(&key) {
-                    Some(&slot) => Expr::Slot(slot),
-                    None => Expr::Prop {
-                        slot: self.current,
+                let from = self.current;
+                let p = if keys.len() == 1 && self.algo_props.contains_key(&keys[0]) {
+                    // An OLAP annotate property reads the computed slot (always present).
+                    let slot = self.algo_props[&keys[0]];
+                    plan.project(vec![(keys[0].clone(), Expr::Slot(slot))])
+                } else if keys.len() == 1 {
+                    let key = keys.pop().expect("one key");
+                    plan.filter(Expr::PropertyExists {
+                        slot: from,
                         key: key.clone(),
-                    },
+                    })
+                    .project(vec![(key.clone(), Expr::Prop { slot: from, key })])
+                } else {
+                    let bodies = keys
+                        .iter()
+                        .map(|k| {
+                            Plan::Row
+                                .filter(Expr::PropertyExists {
+                                    slot: from,
+                                    key: k.clone(),
+                                })
+                                .project(vec![(
+                                    k.clone(),
+                                    Expr::Prop {
+                                        slot: from,
+                                        key: k.clone(),
+                                    },
+                                )])
+                        })
+                        .collect();
+                    plan.branch(bodies)
                 };
-                let p = plan.project(vec![(key.clone(), value_expr)]);
-                // The value stream is now the single output column — subsequent
-                // steps (where/min/max/…) address it at slot 0.
                 self.current = 0;
                 self.slots = 1;
                 p
@@ -1494,15 +1594,36 @@ impl Parser {
                 // Trailing `.by('key')` modulators project each selected element to a
                 // property; they CYCLE across the labels (core's `bys[i % bys.len()]`).
                 // `by('k')` only for now (a nested by-traversal is deferred).
-                let mut bys: Vec<String> = Vec::new();
+                // A by-modulator is a property key or an `id`/`label` element token.
+                enum SelBy {
+                    Key(String),
+                    Id,
+                    Label,
+                }
+                let mut bys: Vec<SelBy> = Vec::new();
                 while self.peek() == Some(&Tok::Dot)
                     && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
                 {
                     self.expect(&Tok::Dot)?;
                     self.ident()?; // `by`
                     self.expect(&Tok::LParen)?;
-                    bys.push(self.str_arg()?);
+                    if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("T")) {
+                        self.bump();
+                        self.expect(&Tok::Dot)?;
+                    }
+                    let by = match self.peek().cloned() {
+                        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("id") => {
+                            self.bump();
+                            SelBy::Id
+                        }
+                        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("label") => {
+                            self.bump();
+                            SelBy::Label
+                        }
+                        _ => SelBy::Key(self.str_arg()?),
+                    };
                     self.expect(&Tok::RParen)?;
+                    bys.push(by);
                 }
                 let slot_of = |l: &str| {
                     self.labels
@@ -1515,9 +1636,19 @@ impl Parser {
                     Ok(if bys.is_empty() {
                         Expr::Slot(slot)
                     } else {
-                        Expr::Prop {
-                            slot,
-                            key: bys[i % bys.len()].clone(),
+                        match &bys[i % bys.len()] {
+                            SelBy::Key(k) => Expr::Prop {
+                                slot,
+                                key: k.clone(),
+                            },
+                            SelBy::Id => Expr::Call {
+                                name: "element_id".into(),
+                                args: vec![Expr::Slot(slot)],
+                            },
+                            SelBy::Label => Expr::Call {
+                                name: "element_label".into(),
+                                args: vec![Expr::Slot(slot)],
+                            },
                         }
                     })
                 };
@@ -1596,15 +1727,9 @@ impl Parser {
                     self.expect(&Tok::Dot)?;
                     self.ident()?; // `by`
                     self.expect(&Tok::LParen)?;
-                    let key = self.str_arg()?;
+                    let ke = self.by_key_expr(self.current)?;
                     self.expect(&Tok::RParen)?;
-                    (
-                        key.clone(),
-                        Expr::Prop {
-                            slot: self.current,
-                            key,
-                        },
-                    )
+                    ke
                 } else {
                     ("key".to_string(), Expr::Slot(self.current))
                 };
@@ -1653,6 +1778,10 @@ impl Parser {
                         self.expect(&Tok::LParen)?;
                         self.expect(&Tok::RParen)?;
                         GroupBy::Count
+                    } else if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("id") || s.eq_ignore_ascii_case("label") || s.eq_ignore_ascii_case("T"))
+                    {
+                        let (name, e) = self.by_key_expr(elem_slot)?;
+                        GroupBy::KeyExpr(name, e)
                     } else {
                         return Err(
                             "group().by(<nested traversal>) is only supported as by(count()) so far"
@@ -1671,6 +1800,7 @@ impl Parser {
                             key: k.clone(),
                         },
                     ),
+                    Some(GroupBy::KeyExpr(name, e)) => (name.clone(), e.clone()),
                     // by(count()) as a key makes no sense; treat absent/element/count
                     // key as grouping by the element.
                     _ => ("key".to_string(), Expr::Slot(elem_slot)),
@@ -1691,6 +1821,13 @@ impl Parser {
                             slot: elem_slot,
                             key: k.clone(),
                         }),
+                        distinct: false,
+                        name: "value".into(),
+                        frac: None,
+                    },
+                    Some(GroupBy::KeyExpr(_, e)) => Agg {
+                        func: AggFn::Collect,
+                        arg: Some(e.clone()),
                         distinct: false,
                         name: "value".into(),
                         frac: None,
@@ -2115,6 +2252,7 @@ impl Parser {
     /// subquery and is deferred with an explicit error. Leaves the cursor after the
     /// child's own closing `)`.
     fn child_filter_expr(&mut self) -> Result<Expr, String> {
+        let start = self.pos;
         if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
             self.bump();
             self.expect(&Tok::Dot)?;
@@ -2168,36 +2306,76 @@ impl Parser {
             // element HAVE such an adjacency? It builds the same `Expr::Exists` the
             // `where(<hop>)` step does, so `not(out('L'))` is the anti-join and
             // `and(out('L'), has(…))` mixes an edge test with a property test.
-            "out" | "in" | "both" => {
+            "haslabel" => {
+                let mut ls = vec![self.str_arg()?];
+                while self.peek() == Some(&Tok::Comma) {
+                    self.bump();
+                    ls.push(self.str_arg()?);
+                }
+                self.expect(&Tok::RParen)?;
+                label_membership(self.current, &ls)
+            }
+            "out" | "in" | "both" | "oute" | "ine" | "bothe" => {
                 let dir = match name.as_str() {
-                    "out" => Dir::Out,
-                    "in" => Dir::In,
+                    "out" | "oute" => Dir::Out,
+                    "in" | "ine" => Dir::In,
                     _ => Dir::Both,
                 };
-                let label = if matches!(self.peek(), Some(Tok::Str(_))) {
-                    let l = self.str_arg()?;
-                    if self.peek() == Some(&Tok::Comma) {
-                        return Err(
-                            "and/or/not hop child with multiple edge labels is not yet supported"
-                                .into(),
-                        );
+                let mut labels: Vec<String> = Vec::new();
+                if matches!(self.peek(), Some(Tok::Str(_))) {
+                    labels.push(self.str_arg()?);
+                    while self.peek() == Some(&Tok::Comma) {
+                        self.bump();
+                        labels.push(self.str_arg()?);
                     }
-                    Some(l)
-                } else {
-                    None
-                };
+                }
                 self.expect(&Tok::RParen)?;
-                let body = Plan::Row.expand(self.current, dir, &etypes_of(label.as_deref()));
+                let is_edge = matches!(name.as_str(), "oute" | "ine" | "bothe");
+                let hop = if is_edge {
+                    Plan::Row.expand_edge(self.current, dir, &labels)
+                } else {
+                    Plan::Row.expand(self.current, dir, &labels)
+                };
+                // A trailing `.count().is(<pred>)` on the child is a DEGREE test — a
+                // correlated CountSubquery compared per the predicate (an aggregate
+                // inside an Exists body would collapse its provenance). Otherwise the
+                // child is an existence semi-join.
+                if self.peek() == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("count"))
+                {
+                    self.expect(&Tok::Dot)?;
+                    self.ident()?; // count
+                    self.expect(&Tok::LParen)?;
+                    self.expect(&Tok::RParen)?;
+                    self.expect(&Tok::Dot)?;
+                    let isn = self.ident()?; // is
+                    if !isn.eq_ignore_ascii_case("is") {
+                        return Err("count() in a filter child must be followed by is(...)".into());
+                    }
+                    self.expect(&Tok::LParen)?;
+                    let cnt = Expr::CountSubquery {
+                        body: Box::new(hop),
+                        outer_width: self.slots,
+                    };
+                    let pred = self.predicate_expr(cnt)?;
+                    self.expect(&Tok::RParen)?;
+                    pred
+                } else {
+                    Expr::Exists {
+                        body: Box::new(hop),
+                        outer_width: self.slots,
+                    }
+                }
+            }
+            // Any other child: a general sub-traversal filter — keep the element if the
+            // body produces ≥1 output (Exists over the Row-rooted sub-plan).
+            _ => {
+                self.pos = start;
+                let (body, _oc, _os) = self.parse_sub_body(self.current, self.slots)?;
                 Expr::Exists {
                     body: Box::new(body),
                     outer_width: self.slots,
                 }
-            }
-            other => {
-                return Err(format!(
-                    "and/or/not child `{other}()` is not a supported filter (use \
-                     has/hasNot/out/in/both/and/or/not)"
-                ))
             }
         };
         Ok(expr)
@@ -3036,8 +3214,8 @@ mod tests {
                 &store,
             )),
         );
-        // A multi-label hop child is deferred, not mis-parsed.
-        assert!(super::parse("g.V().and(out('A','B'), has('k'))").is_err());
+        // A multi-label hop child is now supported (Exists over a disjunction hop).
+        assert!(super::parse("g.V().and(out('A','B'), has('k'))").is_ok());
     }
 
     /// `where(<hop>)` is a semi-join: keep the current element iff it HAS such an
