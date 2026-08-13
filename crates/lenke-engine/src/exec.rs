@@ -7513,12 +7513,26 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                     _ => return Err("path().by(...) key must be a literal string".into()),
                 };
                 let n = batch.rows();
+                // Sentinel keys from `path().by(id|label)`: the element's ext-id / label.
+                let map_elem = |id: u32| -> Value {
+                    match key.as_ref() {
+                        "\u{0}id" => store
+                            .node_ext_id(id)
+                            .map_or(Value::Null, Value::Str),
+                        "\u{0}label" => store
+                            .labels_of(id)
+                            .into_iter()
+                            .next()
+                            .map_or(Value::Null, |l| Value::Str(l.into())),
+                        _ => store.prop(id, &key),
+                    }
+                };
                 let out: Vec<Value> = (0..n)
                     .map(|i| match arg.value_at(i) {
                         Value::List(ids) => Value::List(
                             ids.into_iter()
                                 .map(|v| match v {
-                                    Value::Num(id) => store.prop(id as u32, &key),
+                                    Value::Num(id) => map_elem(id as u32),
                                     other => other,
                                 })
                                 .collect(),

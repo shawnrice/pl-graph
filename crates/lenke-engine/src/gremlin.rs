@@ -1959,7 +1959,25 @@ impl Parser {
                     self.expect(&Tok::Dot)?;
                     self.ident()?; // `by`
                     self.expect(&Tok::LParen)?;
-                    let key = self.str_arg()?;
+                    // by('k') → each element's property; by(id|label|T.id|T.label) → the
+                    // element's ext-id / label (sentinel keys the path_values fn maps).
+                    if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("T")) {
+                        self.bump();
+                        self.expect(&Tok::Dot)?;
+                    }
+                    let key = match self.peek() {
+                        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("id") => {
+                            self.bump();
+                            self.eat_empty_parens();
+                            "\u{0}id".to_string()
+                        }
+                        Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("label") => {
+                            self.bump();
+                            self.eat_empty_parens();
+                            "\u{0}label".to_string()
+                        }
+                        _ => self.str_arg()?,
+                    };
                     self.expect(&Tok::RParen)?;
                     Expr::Call {
                         name: "path_values".to_string(),
