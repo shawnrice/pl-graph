@@ -1505,6 +1505,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .or_else(|| try_varlen_count(input, keys, aggs, store))
                 .or_else(|| try_varlen_distinct_count(input, keys, aggs, store))
                 .or_else(|| try_varlen_agg(input, keys, aggs, store))
+                .or_else(|| try_frontier_prop_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_num_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_multi_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_distinct_count(input, keys, aggs, store))
@@ -4496,6 +4497,59 @@ fn try_varlen_agg(
         _ => return None,
     };
     Some(Batch::single(Col::Gen(vec![val])))
+}
+
+/// `<hop-chain>.values(k).min()/max()` over a pure Scan/Expand chain: fold the numeric
+/// property `k` over the per-node PATH-COUNT frontier — WITHOUT materializing the
+/// exploding frontier (the min/max analog of the count fast-path). MIN/MAX only: they
+/// are order-INDEPENDENT, so collapsing the frontier to per-node multiplicity (which
+/// loses row order) is byte-identical; SUM/AVG would change the summation order, so they
+/// stay on `try_frontier_aggregate` (`frontier_ids`, which keeps order). Numeric columns
+/// only; a filtered chain / edge hop / non-numeric column returns None.
+fn try_frontier_prop_agg(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.distinct || !matches!(agg.func, AggFn::Min | AggFn::Max) {
+        return None;
+    }
+    let Some(Expr::Prop { slot, key }) = agg.arg.as_ref() else {
+        return None;
+    };
+    let width = chain_width(input)?;
+    if *slot != width - 1 {
+        return None; // arg must be a property of the chain frontier
+    }
+    let Some(Column::Num { data, present }) = store.column(key) else {
+        return None; // non-numeric / absent-everywhere → general path
+    };
+    let counts = frontier_counts(input, store)?;
+    let want_min = agg.func == AggFn::Min;
+    let mut best: Option<f64> = None;
+    counts.for_each(|v, _c| {
+        let i = v as usize;
+        if present[i] {
+            let x = data[i];
+            best = Some(match best {
+                None => x,
+                Some(b) => {
+                    let ord = value::cmp_num_total(x, b);
+                    if (want_min && ord.is_lt()) || (!want_min && ord.is_gt()) {
+                        x
+                    } else {
+                        b
+                    }
+                }
+            });
+        }
+    });
+    Some(Batch::single(Col::Gen(vec![best.map_or(Value::Null, Value::Num)])))
 }
 
 /// Answer a scalar `count(*)` over a bare labelled/unlabelled `Scan` in O(1) (a

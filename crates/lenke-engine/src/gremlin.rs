@@ -393,6 +393,32 @@ fn label_membership(slot: usize, labels: &[String]) -> Expr {
     }
 }
 
+/// If `plan` is the `values('k')` lowering — `Project([(_, Prop{s,k})])` over
+/// `Filter(PropertyExists{s,k})` — unwrap it to `(chain, Prop{s,k})` so a FOLLOWING
+/// reducing aggregate folds the property DIRECTLY over the chain. Equivalent (a reduce
+/// skips nulls, so filtering absent first changes nothing) and it lets the frontier /
+/// var-length aggregate fast-paths recognize the chain, which a values wrapper hides —
+/// turning `<hops>.values(k).sum()` from a full frontier materialization into the fused
+/// path. Otherwise the plan is returned unchanged with `Slot(current)` as the arg.
+fn unwrap_values_fold(plan: Plan, current: usize) -> (Plan, Expr) {
+    let is_shape = matches!(&plan, Plan::Project { items, input }
+        if items.len() == 1
+            && matches!(&items[0].1, Expr::Prop { slot, key }
+                if matches!(input.as_ref(), Plan::Filter { pred, .. }
+                    if matches!(pred, Expr::PropertyExists { slot: ps, key: pk } if ps == slot && pk == key))));
+    if !is_shape {
+        return (plan, Expr::Slot(current));
+    }
+    let Plan::Project { items, input } = plan else {
+        unreachable!("shape checked")
+    };
+    let arg = items.into_iter().next().expect("one item").1; // Prop{slot,key}
+    let Plan::Filter { input: chain, .. } = *input else {
+        unreachable!("shape checked")
+    };
+    (*chain, arg)
+}
+
 /// Whether a plan is a write (so read steps cannot chain after it).
 fn is_write(plan: &Plan) -> bool {
     matches!(
@@ -2748,11 +2774,14 @@ impl Parser {
                         "sum" => AggFn::Sum,
                         _ => AggFn::Avg,
                     };
-                    let p = plan.aggregate(
+                    // Fold the property DIRECTLY over the chain (unwrap a preceding
+                    // values(k)) so the aggregate fast-paths see the hop/var-length chain.
+                    let (agg_in, arg) = unwrap_values_fold(plan, self.current);
+                    let p = agg_in.aggregate(
                         vec![],
                         vec![Agg {
                             func,
-                            arg: Some(Expr::Slot(self.current)),
+                            arg: Some(arg),
                             distinct: false,
                             name: lname.clone(),
                             frac: None,
