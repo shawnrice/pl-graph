@@ -178,6 +178,7 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
         Plan::Tree { .. } => Card::exact(1),       // folds all paths into one nested Map row
         Plan::MapSlot { input, .. } => estimate(input, store), // pass-through (append/overwrite a slot)
         Plan::Subgraph { .. } => Card::exact(1),
+        Plan::ShortestPathEnum { input, .. } => estimate(input, store).scale(4.0, false),
         Plan::Distinct { input } => {
             // At most the input; without a cheap distinct count assume heavy overlap.
             estimate(input, store).scale(0.5, false)

@@ -155,6 +155,64 @@ pub fn weakly_connected_components(store: &Store, edge_label: Option<&str>) -> V
         .collect()
 }
 
+/// Every SHORTEST path from `src` along `dir` to every reachable vertex, as node-id
+/// lists (`[src, …, target]`). BFS records all minimum-length predecessors, then
+/// reconstructs each distinct shortest path — a target reachable two equally-short
+/// ways yields two paths. Ported from lenke-core's `shortest_paths_from`. The result
+/// ORDER is unspecified (target set iterated in hash order), so compare as a multiset.
+#[must_use]
+pub fn shortest_paths_from(store: &Store, src: u32, dir: Dir) -> Vec<Vec<u32>> {
+    use std::collections::HashMap;
+    if (src as usize) >= store.node_count() || !store.is_alive(src) {
+        return Vec::new();
+    }
+    let mut dist: HashMap<u32, usize> = HashMap::from([(src, 0)]);
+    let mut preds: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut frontier = vec![src];
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for &v in &frontier {
+            let d = dist[&v];
+            let mut nbrs = Vec::new();
+            for_each_nbr(store, v, dir, None, |n| nbrs.push(n));
+            for n in nbrs {
+                match dist.get(&n).copied() {
+                    None => {
+                        dist.insert(n, d + 1);
+                        preds.insert(n, vec![v]);
+                        next.push(n);
+                    }
+                    Some(nd) if nd == d + 1 => preds.entry(n).or_default().push(v),
+                    _ => {}
+                }
+            }
+        }
+        frontier = next;
+    }
+    fn build(
+        src: u32,
+        id: u32,
+        tail: &[u32],
+        preds: &HashMap<u32, Vec<u32>>,
+        out: &mut Vec<Vec<u32>>,
+    ) {
+        let mut path = vec![id];
+        path.extend_from_slice(tail);
+        if id == src {
+            out.push(path);
+            return;
+        }
+        for &p in preds.get(&id).map(Vec::as_slice).unwrap_or_default() {
+            build(src, p, &path, preds, out);
+        }
+    }
+    let mut paths = Vec::new();
+    for &id in dist.keys() {
+        build(src, id, &[], &preds, &mut paths);
+    }
+    paths
+}
+
 /// BFS hop distances from `source` along `dir`/`edge_label`. Returns `(node,
 /// distance)` for every node REACHED (including the source at 0), in ascending-id
 /// order. Distances are shortest-path, so the result is order-independent. A

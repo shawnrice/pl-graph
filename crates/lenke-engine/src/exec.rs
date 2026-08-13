@@ -802,6 +802,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         Plan::Tree { .. } => true,
         Plan::MapSlot { input, value, .. } => reads_path(value) || needs_lineage(input),
         Plan::Subgraph { input, .. } => needs_lineage(input),
+        Plan::ShortestPathEnum { input, .. } => needs_lineage(input),
         Plan::OptionalScan { input, filters, .. } => {
             filters.iter().any(|(_, e)| reads_path(e)) || needs_lineage(input)
         }
@@ -1101,6 +1102,28 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 b.slots[*slot] = col;
             }
             b
+        }
+        Plan::ShortestPathEnum { input, node_slot } => {
+            // For each source vertex, emit one row per shortest path (undirected), each
+            // a list of the path vertices' external ids (so it compares cleanly — the
+            // engine has no Value::Node). Path order is unspecified (multiset).
+            let b = pull(input, store, track)?;
+            let n = b.rows();
+            let mut out: Vec<Value> = Vec::new();
+            for i in 0..n {
+                let src = match b.slot(*node_slot).value_at(i) {
+                    Value::Num(x) if x >= 0.0 => x as u32,
+                    _ => continue,
+                };
+                for path in crate::algo::shortest_paths_from(store, src, crate::ir::Dir::Both) {
+                    let ids: Vec<Value> = path
+                        .into_iter()
+                        .map(|v| store.node_ext_id(v).map_or(Value::Null, Value::Str))
+                        .collect();
+                    out.push(Value::List(ids));
+                }
+            }
+            Batch::single(Col::Gen(out))
         }
         Plan::Subgraph { input, edge_slot } => {
             // Collect the edge frontier (deduped, first-seen) + their endpoint vertices

@@ -140,16 +140,20 @@ fn norm_eng(v: &EngVal) -> Cmp {
     }
 }
 
-fn norm_core(v: &CoreVal) -> Cmp {
+fn norm_core(v: &CoreVal, g: &lenke_core::graph::Graph) -> Cmp {
     match v {
         CoreVal::Null => Cmp::Null,
         CoreVal::Bool(b) => Cmp::Bool(*b),
         CoreVal::Num(n) => Cmp::Num(num_key(*n)),
         CoreVal::Str(s) => Cmp::Str(s.to_string()),
-        CoreVal::List(xs) => Cmp::List(xs.iter().map(norm_core).collect()),
+        // A vertex's canonical identity is its external id — matching how the engine
+        // renders vertices inside a path (it has no Value::Node). Lets shortestPath
+        // paths (lists of vertices) compare cleanly.
+        CoreVal::Node(id) => Cmp::Str(g.vid.text(*id).to_string()),
+        CoreVal::List(xs) => Cmp::List(xs.iter().map(|x| norm_core(x, g)).collect()),
         CoreVal::Map(m) => sorted_map(
             m.iter()
-                .map(|(k, v)| (norm_core(k), norm_core(v)))
+                .map(|(k, v)| (norm_core(k, g), norm_core(v, g)))
                 .collect(),
         ),
         other => Cmp::Other(format!("{other:?}")),
@@ -180,7 +184,8 @@ fn run_engine(store: &lenke_engine::store::Store, query: &str) -> Result<Vec<Cmp
 }
 
 fn run_core(graph: &mut lenke_core::graph::Graph, steps: &Steps) -> Vec<Cmp> {
-    steps.to_core().run(graph).iter().map(norm_core).collect()
+    let out = steps.to_core().run(graph);
+    out.iter().map(|v| norm_core(v, graph)).collect()
 }
 
 struct Case {
@@ -706,6 +711,17 @@ fn gremlin_parity() {
             "barrier_names",
             false,
             vec![V, HasLabel(vec!["PERSON"]), Values(vec!["name"]), Barrier],
+        ),
+        // — shortestPath(): all shortest undirected paths (as ext-id vertex lists) —
+        c(
+            "shortest_from_marko",
+            false,
+            vec![V, HasVal("name", Val::S("marko")), ShortestPath],
+        ),
+        c(
+            "shortest_from_ripple",
+            false,
+            vec![V, HasVal("name", Val::S("ripple")), ShortestPath],
         ),
         // — subgraph('sg').cap('sg') — {vertices, edges} element-record Map —
         c(

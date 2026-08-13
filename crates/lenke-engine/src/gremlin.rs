@@ -1763,6 +1763,15 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 plan
             }
+            "shortestpath" => {
+                // shortestPath(): for each source vertex, emit one path (list of vertex
+                // external ids) per shortest undirected path to every reachable vertex.
+                self.expect(&Tok::RParen)?;
+                let p = plan.shortest_path_enum(self.current);
+                self.current = 0;
+                self.slots = 1;
+                p
+            }
             "tree" => {
                 // tree()[.by('k')]: fold every traverser's vertex-hop path into one
                 // nested Map. Only over a pure vertex-hop chain (path lineage = node

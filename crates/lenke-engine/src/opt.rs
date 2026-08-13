@@ -155,6 +155,16 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 c,
             )
         }
+        Plan::ShortestPathEnum { input, node_slot } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::ShortestPathEnum {
+                    input: Box::new(i),
+                    node_slot,
+                },
+                c,
+            )
+        }
         Plan::AlgoAnnotate {
             input,
             algo,
@@ -1262,6 +1272,7 @@ fn width(plan: &Plan) -> usize {
         Plan::Tree { .. } => 1,
         Plan::MapSlot { input, append, .. } => width(input) + usize::from(*append),
         Plan::Subgraph { .. } => 1,
+        Plan::ShortestPathEnum { .. } => 1,
         Plan::AlgoAnnotate { input, .. } => width(input) + 1,
         Plan::Join { left, right, .. } => width(left) + width(right),
         // UNION's result columns are the LEFT arm's.
@@ -1714,6 +1725,7 @@ mod tests {
             | Plan::Tree { input, .. }
             | Plan::MapSlot { input, .. }
             | Plan::Subgraph { input, .. }
+            | Plan::ShortestPathEnum { input, .. }
             | Plan::SortLocal { input, .. } => plan_contains_filter(input),
             Plan::Join { left, right, .. } | Plan::Union { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)

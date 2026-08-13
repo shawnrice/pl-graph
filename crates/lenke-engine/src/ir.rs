@@ -644,6 +644,11 @@ pub enum Plan {
     /// yield one Map object rather than the relational (key,value) rows that GQL
     /// `GROUP BY` keeps.
     GroupToMap { input: Box<Plan> },
+    /// Gremlin `shortestPath()`: for each source vertex at `node_slot`, emit ONE row
+    /// per shortest path (undirected BFS) to every reachable vertex, each rendered as
+    /// a `Value::List` of the path vertices' EXTERNAL ids. Path order is unspecified
+    /// (compare as a multiset).
+    ShortestPathEnum { input: Box<Plan>, node_slot: usize },
     /// Gremlin `subgraph('sg')` revealed by `cap('sg')`: collect the EDGE frontier at
     /// `edge_slot` (deduped) plus their endpoint vertices (deduped), emitting ONE row
     /// holding a `{vertices: [records], edges: [records]}` Map of self-describing
@@ -1008,6 +1013,14 @@ impl Plan {
     pub fn group_to_map(self) -> Self {
         Self::GroupToMap {
             input: Box::new(self),
+        }
+    }
+
+    #[must_use]
+    pub fn shortest_path_enum(self, node_slot: usize) -> Self {
+        Self::ShortestPathEnum {
+            input: Box::new(self),
+            node_slot,
         }
     }
 
