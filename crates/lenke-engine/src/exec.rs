@@ -1184,6 +1184,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             max,
             mode,
             until,
+            body_filter,
         } => var_length(
             &pull(input, store, track)?,
             store,
@@ -1197,6 +1198,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             None,
             1,
             until.as_deref(),
+            body_filter.as_deref(),
         ),
         Plan::RepeatGroup {
             input,
@@ -1222,6 +1224,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             group_binds,
             per_rep_pred.as_deref(),
             *k,
+            None,
             None,
         ),
         Plan::NestedGroup {
@@ -2013,6 +2016,7 @@ fn streaming_chain(plan: &Plan, store: &Store) -> Option<(Plan, Vec<u32>)> {
             max,
             mode,
             until,
+            body_filter,
         } => {
             let (body, ids) = streaming_chain(input, store)?;
             Some((
@@ -2025,6 +2029,7 @@ fn streaming_chain(plan: &Plan, store: &Store) -> Option<(Plan, Vec<u32>)> {
                     max: *max,
                     mode: *mode,
                     until: until.clone(),
+                    body_filter: body_filter.clone(),
                 },
                 ids,
             ))
@@ -3815,11 +3820,12 @@ fn try_varlen_count(
         max,
         mode,
         until,
+        body_filter,
     } = input
     else {
         return None;
     };
-    if until.is_some() {
+    if until.is_some() || body_filter.is_some() {
         return None; // an until(pred) walk emits a filtered subset — no closed-form count
     }
     let want = match want_etypes(store, edge_label) {
@@ -4060,11 +4066,12 @@ fn try_varlen_distinct_count(
         max,
         mode,
         until,
+        body_filter,
     } = input
     else {
         return None;
     };
-    if until.is_some() {
+    if until.is_some() || body_filter.is_some() {
         return None; // an until(pred) walk emits a filtered subset — no closed-form count
     }
     // The BFS-reachability fusion relies on shortest-distance == walk equivalence,
@@ -4248,11 +4255,12 @@ fn try_varlen_agg(
         max,
         mode,
         until,
+        body_filter,
     } = input
     else {
         return None;
     };
-    if until.is_some() {
+    if until.is_some() || body_filter.is_some() {
         return None; // an until(pred) walk emits a filtered subset — no closed-form agg
     }
     // The aggregate argument must be a property of the ENDPOINT (the appended slot).
@@ -5668,6 +5676,9 @@ fn var_length(
     // one-row mini-batch whose endpoint slot carries the landed node) and PRUNE that
     // branch on a match. `min` decides the earliest depth checked (0 pre-form, 1 post).
     until_stop: Option<&Expr>,
+    // Gremlin `repeat(<hop>.<filter>)` body filter: a predicate on each hop TARGET
+    // (`len > 0`); a target that fails it is pruned (no emit, no descent).
+    body_filter: Option<&Expr>,
 ) -> Batch {
     let empty = || {
         let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
@@ -5736,6 +5747,7 @@ fn var_length(
             per_rep_pred,
             k,
             until_stop.map(|p| (p, endpoint_slot)),
+            body_filter.map(|p| (p, endpoint_slot)),
         );
         if node_unique {
             used.pop();
@@ -6317,7 +6329,19 @@ fn varlen_dfs(
     // Gremlin `until(pred)`: `(pred, endpoint_slot)`. An endpoint is emitted ONLY when
     // `pred` holds at it, and the branch then PRUNES (no descent past the match).
     until_stop: Option<(&Expr, usize)>,
+    // Gremlin `repeat(<hop>.<filter>)` body filter: `(pred, endpoint_slot)`. Applied at
+    // each hop target (`len > 0`); a target that fails it is pruned entirely.
+    body_filter: Option<(&Expr, usize)>,
 ) {
+    // A body filter prunes a hop target that fails it — no emit, no descent (the source
+    // at len 0 is not a hop target, so it is exempt).
+    if len > 0 {
+        if let Some((pred, slot)) = body_filter {
+            if !until_ok(pred, store, slot, v) {
+                return;
+            }
+        }
+    }
     // Per-repetition WHERE: on COMPLETING a rep (a boundary at len > 0), check the
     // just-finished rep's predicate over its scalar variables (node pos p at slot 2p,
     // edge pos p at 2p+1). A per-rep WHERE must hold for EVERY rep, so a failing rep
@@ -6461,6 +6485,7 @@ fn varlen_dfs(
             per_rep_pred,
             k,
             until_stop,
+            body_filter,
         );
         node_stack.pop();
         edge_stack.pop();
@@ -8362,6 +8387,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             max,
             mode,
             until,
+            body_filter,
         } => var_length(
             &pull_body(input, store, seed)?,
             store,
@@ -8375,6 +8401,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             None,
             1,
             until.as_deref(),
+            body_filter.as_deref(),
         ),
         Plan::Filter { input, pred } => {
             let b = pull_body(input, store, seed)?;

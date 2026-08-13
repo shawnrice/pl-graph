@@ -600,6 +600,12 @@ pub enum Plan {
         /// `repeat(body).until(pred)` sets `min = 1` (do-while). `None` = a plain
         /// bounded walk (emit every landing in `[min, max]`).
         until: Option<Box<Expr>>,
+        /// A Gremlin `repeat(<hop>.<filter>)` body filter (e.g. `repeat(out().hasLabel
+        /// ('PERSON'))`): a predicate on the HOP TARGET, applied at each landing past
+        /// the source (`len > 0`). A target that fails it is PRUNED — neither emitted
+        /// nor descended into — so only surviving nodes continue the walk. `None` = no
+        /// body filter. Evaluated over the same one-row mini-batch as `until`.
+        body_filter: Option<Box<Expr>>,
     },
     /// A quantified subpath group `((x)-[e]->(y)){min,max}` that BINDS its inner
     /// variables as GROUP variables — each becomes a LIST over the repetitions. Like
@@ -1039,11 +1045,13 @@ impl Plan {
             max,
             mode,
             until: None,
+            body_filter: None,
         }
     }
 
-    /// [`Self::var_length`] with a Gremlin `until(pred)` stop condition (see the
-    /// `until` field on [`Plan::VarLength`]).
+    /// [`Self::var_length`] with a Gremlin `until(pred)` stop condition and/or a
+    /// `repeat(<hop>.<filter>)` body filter (see the `until`/`body_filter` fields on
+    /// [`Plan::VarLength`]).
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn var_length_until(
@@ -1055,6 +1063,7 @@ impl Plan {
         max: u32,
         mode: PathMode,
         until: Option<Box<Expr>>,
+        body_filter: Option<Box<Expr>>,
     ) -> Self {
         Self::VarLength {
             input: Box::new(self),
@@ -1065,6 +1074,7 @@ impl Plan {
             max,
             mode,
             until,
+            body_filter,
         }
     }
 

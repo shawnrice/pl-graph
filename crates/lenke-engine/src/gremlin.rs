@@ -516,6 +516,10 @@ struct RepeatCtx {
     /// True when `until` came from the PRE-form (`until(pred).repeat(body)`): a source
     /// already satisfying `pred` emits at depth 0.
     until_pre: bool,
+    /// A `repeat(<hop>.<filter>)` body filter on the hop TARGET (e.g.
+    /// `repeat(out().hasLabel('PERSON'))`) — a target failing it is pruned. `None` = a
+    /// bare hop body.
+    body_filter: Option<Expr>,
 }
 
 struct Parser {
@@ -1874,7 +1878,7 @@ impl Parser {
                 // (the endpoint) is pre-allocated as the width so an emit/until
                 // predicate parsed before the flush references it. The LParen was
                 // already consumed at the top of `step`.
-                let (dir, label, bind_tag) = self.repeat_body()?;
+                let (dir, label, bind_tag, body_filter) = self.repeat_body()?;
                 self.expect(&Tok::RParen)?;
                 let from = self.current;
                 let out_slot = self.slots; // endpoint == width at flush time
@@ -1894,6 +1898,7 @@ impl Parser {
                     // it now as a while-do stop (checked before the body → `until_pre`).
                     until: self.pending_until.take(),
                     until_pre: true,
+                    body_filter,
                 });
                 plan
             }
@@ -5161,7 +5166,10 @@ impl Parser {
         Ok(Some((op, n)))
     }
 
-    fn repeat_body(&mut self) -> Result<(Dir, Option<String>, Option<String>), String> {
+    #[allow(clippy::type_complexity)]
+    fn repeat_body(
+        &mut self,
+    ) -> Result<(Dir, Option<String>, Option<String>, Option<Expr>), String> {
         // Optional `__.` anonymous-traversal prefix.
         if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
             self.bump();
@@ -5212,7 +5220,23 @@ impl Parser {
             tag = Some(self.str_arg()?);
             self.expect(&Tok::RParen)?;
         }
-        Ok((dir, label, tag))
+        // An optional trailing element filter on the hop TARGET —
+        // `repeat(out().hasLabel('PERSON'))` / `repeat(out().has('k', v))`. It becomes a
+        // per-hop body filter: a target failing it is pruned from the walk. (`self.current`
+        // is still the source here, but the body filter is evaluated over a one-row
+        // mini-batch whose every slot carries the landed node, so the slot is immaterial.)
+        let mut body_filter = None;
+        if self.peek() == Some(&Tok::Dot)
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if {
+                matches!(s.to_ascii_lowercase().as_str(), "haslabel" | "has" | "hasnot" | "haskey")
+            })
+        {
+            self.expect(&Tok::Dot)?;
+            // child_filter_expr consumes the filter's own parens; the repeat arm closes
+            // the outer `repeat(...)` paren after this returns.
+            body_filter = Some(self.child_filter_expr()?);
+        }
+        Ok((dir, label, tag, body_filter))
     }
 
     /// Close an open `repeat(...)` into a `VarLength` walk. `times(n)` alone is a
@@ -5252,6 +5276,7 @@ impl Parser {
             max,
             PathMode::Walk,
             ctx.until.map(Box::new),
+            ctx.body_filter.map(Box::new),
         );
         // The walk appended its endpoint at `out_slot` (the width before this call);
         // account for it and land the current element there.
