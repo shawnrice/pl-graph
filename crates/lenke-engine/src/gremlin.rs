@@ -2861,7 +2861,25 @@ impl Parser {
                 } else {
                     let n = self.usize_arg()?;
                     self.expect(&Tok::RParen)?;
-                    plan.order_page(vec![], None, Some(n))
+                    // Fuse `order().by(…).limit(n)` into ONE top-N OrderPage: with a
+                    // limit the sort is a partial select_nth (O(rows·log n)), not a full
+                    // O(rows·log rows) sort followed by a slice. Only when the input sort
+                    // has no page of its own (skip/limit None) — else the tighter bound
+                    // would be lost.
+                    match plan {
+                        Plan::OrderPage {
+                            input,
+                            keys,
+                            skip: None,
+                            limit: None,
+                        } => Plan::OrderPage {
+                            input,
+                            keys,
+                            skip: None,
+                            limit: Some(n),
+                        },
+                        other => other.order_page(vec![], None, Some(n)),
+                    }
                 }
             }
             "skip" => {
