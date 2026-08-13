@@ -744,7 +744,13 @@ pub enum Plan {
     /// default local ordering of a map); any other cell passes through unchanged.
     /// `descending` reverses the order. Transparent to output naming (like
     /// `Distinct`/`OrderPage`), since it reorders inside a cell, not across rows.
-    SortLocal { input: Box<Plan>, descending: bool },
+    SortLocal {
+        input: Box<Plan>,
+        descending: bool,
+        /// Sort a Map cell by its KEYS instead of its values (Gremlin
+        /// `order(local).by(keys)` vs the default `by(values)`). Ignored for lists.
+        by_key: bool,
+    },
     /// Hash-join two sub-plans on shared bound variables. `on` lists
     /// `(left_slot, right_slot)` equalities — for `MATCH (a)-[:R]->(b),
     /// (a)-[:S]->(c)` sharing `a`, that is `[(a_left, a_right)]`.
@@ -1118,10 +1124,11 @@ impl Plan {
     }
 
     #[must_use]
-    pub fn sort_local(self, descending: bool) -> Self {
+    pub fn sort_local(self, descending: bool, by_key: bool) -> Self {
         Self::SortLocal {
             input: Box::new(self),
             descending,
+            by_key,
         }
     }
 

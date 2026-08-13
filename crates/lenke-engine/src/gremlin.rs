@@ -1919,11 +1919,34 @@ impl Parser {
                 }
             }
             "range" => {
+                // range(lo, hi) — the half-open row window [lo, hi). range(local, lo,
+                // hi) — the same slice WITHIN each list cell instead of over the stream.
+                let is_local = self.parse_scope_is_local()?;
+                if is_local {
+                    self.expect(&Tok::Comma)?;
+                }
                 let lo = self.usize_arg()?;
                 self.expect(&Tok::Comma)?;
                 let hi = self.usize_arg()?;
                 self.expect(&Tok::RParen)?;
-                plan.order_page(vec![], Some(lo), Some(hi.saturating_sub(lo)))
+                if is_local {
+                    let p = plan.project(vec![(
+                        "range".to_string(),
+                        Expr::Call {
+                            name: "list_range".to_string(),
+                            args: vec![
+                                Expr::Slot(self.current),
+                                Expr::Lit(Value::Num(lo as f64)),
+                                Expr::Lit(Value::Num(hi as f64)),
+                            ],
+                        },
+                    )]);
+                    self.current = 0;
+                    self.slots = 1;
+                    p
+                } else {
+                    plan.order_page(vec![], Some(lo), Some(hi.saturating_sub(lo)))
+                }
             }
             "order" => {
                 // Optional scope: order()/order(global) sort the stream;
@@ -1931,21 +1954,43 @@ impl Parser {
                 let is_local = self.parse_scope_is_local()?;
                 self.expect(&Tok::RParen)?;
                 if is_local {
-                    // order(local)[.by(asc|desc)] — the `by` here is a DIRECTION,
-                    // not a property key (list elements sort by natural order).
-                    let descending = if self.peek() == Some(&Tok::Dot)
+                    // order(local)[.by([keys|values,] [asc|desc])]. For a LIST the `by`
+                    // is a direction (elements sort by natural order); for a MAP an
+                    // optional `keys`/`values` Column token picks the sort axis
+                    // (default `values`), then an optional direction.
+                    let (descending, by_key) = if self.peek() == Some(&Tok::Dot)
                         && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
                     {
                         self.expect(&Tok::Dot)?;
                         self.ident()?; // `by`
                         self.expect(&Tok::LParen)?;
-                        let d = self.order_dir()?;
+                        // Optional `Column.keys`/`Column.values` (or bare `keys`/`values`).
+                        let mut by_key = false;
+                        if matches!(self.peek(), Some(Tok::Ident(s)) if {
+                            let l = s.to_ascii_lowercase();
+                            l == "keys" || l == "values" || l == "column"
+                        }) {
+                            let mut col = self.ident()?;
+                            if self.peek() == Some(&Tok::Dot) {
+                                self.bump();
+                                col = self.ident()?; // strip `Column.`
+                            }
+                            by_key = col.eq_ignore_ascii_case("keys");
+                            if self.peek() == Some(&Tok::Comma) {
+                                self.bump();
+                            }
+                        }
+                        let d = if self.peek() == Some(&Tok::RParen) {
+                            false
+                        } else {
+                            self.order_dir()?
+                        };
                         self.expect(&Tok::RParen)?;
-                        d
+                        (d, by_key)
                     } else {
-                        false
+                        (false, false)
                     };
-                    plan.sort_local(descending)
+                    plan.sort_local(descending, by_key)
                 } else {
                     // Global stream sort. `.by` is OPTIONAL — a bare value stream
                     // sorts by its own natural order:
@@ -2008,6 +2053,35 @@ impl Parser {
                 plan
             }
             "select" => {
+                // `select(Column.keys|values)` (or bare `keys`/`values`): project a
+                // Map cell to the LIST of its keys or values, in the map's current
+                // order. Distinct from tag selection — no string label follows.
+                if matches!(self.peek(), Some(Tok::Ident(s)) if {
+                    let l = s.to_ascii_lowercase();
+                    l == "keys" || l == "values" || l == "column"
+                }) {
+                    let mut col = self.ident()?;
+                    if self.peek() == Some(&Tok::Dot) {
+                        self.bump();
+                        col = self.ident()?; // strip `Column.`
+                    }
+                    self.expect(&Tok::RParen)?;
+                    let fname = if col.eq_ignore_ascii_case("keys") {
+                        "map_keys"
+                    } else {
+                        "map_values"
+                    };
+                    let p = plan.project(vec![(
+                        "select".into(),
+                        Expr::Call {
+                            name: fname.into(),
+                            args: vec![Expr::Slot(self.current)],
+                        },
+                    )]);
+                    self.current = 0;
+                    self.slots = 1;
+                    return Ok(p);
+                }
                 // An optional leading `Pop` token (`First`/`Last`, or `Pop.first`/
                 // `Pop.last`) picks WHICH binding of a rebound tag to read. `First`
                 // reads the first binding (`first_labels`); the default is the last.

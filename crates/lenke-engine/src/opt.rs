@@ -540,12 +540,17 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 c,
             )
         }
-        Plan::SortLocal { input, descending } => {
+        Plan::SortLocal {
+            input,
+            descending,
+            by_key,
+        } => {
             let (i, c) = rewrite(*input, idx);
             (
                 Plan::SortLocal {
                     input: Box::new(i),
                     descending,
+                    by_key,
                 },
                 c,
             )

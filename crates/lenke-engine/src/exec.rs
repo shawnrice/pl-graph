@@ -1523,14 +1523,18 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .collect();
             batch.gather(&keep)
         }
-        Plan::SortLocal { input, descending } => {
+        Plan::SortLocal {
+            input,
+            descending,
+            by_key,
+        } => {
             // Gremlin `order(local)`: sort inside each row's slot-0 cell, leaving
             // the batch shape and every other slot untouched. Ordering is the value
             // contract's `cmp_total` (the single home for order); DESC reverses it.
             let batch = pull(input, store, track)?;
             let n = batch.rows();
             let sorted: Vec<Value> = (0..n)
-                .map(|i| sort_local_cell(batch.slot(0).value_at(i), *descending))
+                .map(|i| sort_local_cell(batch.slot(0).value_at(i), *descending, *by_key))
                 .collect();
             let mut slots: Vec<Col> = batch.slots.clone();
             if !slots.is_empty() {
@@ -2274,7 +2278,7 @@ fn group_by_arc(keys: &[Arc<str>]) -> (Vec<u32>, Vec<usize>) {
 /// Sort one cell in place for `order(local)`: a `List` by its elements, a `Map`
 /// by its values (TinkerPop's default local map ordering), anything else
 /// unchanged. Order is the value contract's `cmp_total`; `descending` reverses.
-fn sort_local_cell(v: Value, descending: bool) -> Value {
+fn sort_local_cell(v: Value, descending: bool, by_key: bool) -> Value {
     let dir = |ord: std::cmp::Ordering| if descending { ord.reverse() } else { ord };
     match v {
         Value::List(mut items) => {
@@ -2283,7 +2287,11 @@ fn sort_local_cell(v: Value, descending: bool) -> Value {
         }
         Value::Map(pairs) => {
             let mut pairs = (*pairs).clone();
-            pairs.sort_by(|a, b| dir(value::cmp_total(&a.1, &b.1)));
+            // `by(values)` (the default) sorts on the entry value; `by(keys)` on the key.
+            pairs.sort_by(|a, b| {
+                let (l, r) = if by_key { (&a.0, &b.0) } else { (&a.1, &b.1) };
+                dir(value::cmp_total(l, r))
+            });
             Value::Map(std::sync::Arc::new(pairs))
         }
         other => other,
@@ -7411,6 +7419,31 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                     .collect();
                 return Ok(Col::Gen(out));
             }
+            // `list_range(list, lo, hi)` → Gremlin `range(local, lo, hi)`: the
+            // half-open slice `[lo, hi)` of each list cell (a scalar cell is a
+            // 1-element list). Gremlin-only.
+            if name == "list_range" {
+                let arg = eval(&args[0], store, batch)?;
+                let bound = |e: &Expr| match e {
+                    Expr::Lit(Value::Num(n)) => Ok(*n as usize),
+                    _ => Err("range(local, …): bounds must be literal integers".to_string()),
+                };
+                let lo = bound(&args[1])?;
+                let hi = bound(&args[2])?;
+                let n = batch.rows();
+                let out: Vec<Value> = (0..n)
+                    .map(|i| {
+                        let items = match arg.value_at(i) {
+                            Value::List(items) => items,
+                            other => vec![other],
+                        };
+                        let a = lo.min(items.len());
+                        let b = hi.min(items.len()).max(a);
+                        Value::List(items[a..b].to_vec())
+                    })
+                    .collect();
+                return Ok(Col::Gen(out));
+            }
             if matches!(
                 name.as_str(),
                 "list_sum" | "list_mean" | "list_min" | "list_max"
@@ -7448,6 +7481,26 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             // Element functions need the STORE and the element identity (a node/edge
             // slot), which the pure-value `call_scalar` cannot see — handle them
             // here off the evaluated argument column.
+            // `map_keys`/`map_values` → Gremlin `select(Column.keys|values)` on a Map:
+            // the entry keys or values AS A LIST, in the Map's current (post-order)
+            // order. A non-Map cell passes through.
+            if matches!(name.as_str(), "map_keys" | "map_values") {
+                let arg = eval(&args[0], store, batch)?;
+                let want_keys = name == "map_keys";
+                let n = batch.rows();
+                let out: Vec<Value> = (0..n)
+                    .map(|i| match arg.value_at(i) {
+                        Value::Map(pairs) => Value::List(
+                            pairs
+                                .iter()
+                                .map(|(k, v)| if want_keys { k.clone() } else { v.clone() })
+                                .collect(),
+                        ),
+                        other => other,
+                    })
+                    .collect();
+                return Ok(Col::Gen(out));
+            }
             if matches!(name.as_str(), "keys" | "labels" | "property_names") {
                 let arg = eval(&args[0], store, batch)?;
                 let n = batch.rows();
