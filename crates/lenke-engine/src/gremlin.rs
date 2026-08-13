@@ -3592,8 +3592,46 @@ impl Parser {
     fn has_predicate(&mut self, key: String) -> Result<Expr, String> {
         let left = Expr::Prop {
             slot: self.current,
-            key,
+            key: key.clone(),
         };
+        // TinkerPop: `has(k, neq(v))` / `has(k, without(…))` KEEP an element that lacks
+        // `k` (the negation is vacuously satisfied), unlike a positive predicate whose
+        // 3VL drops a missing key. (The TEXT negations — notContaining etc. — instead
+        // require the key present, like the positive text predicates, so they are NOT in
+        // this set.) Lower neq/without as `NOT(PropertyExists(k) AND <positive base>)`.
+        let mut probe = self.pos;
+        if matches!(self.toks.get(probe), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("P") || s.eq_ignore_ascii_case("TextP"))
+            && self.toks.get(probe + 1) == Some(&Tok::Dot)
+        {
+            probe += 2;
+        }
+        let is_negated = matches!(self.toks.get(probe), Some(Tok::Ident(s)) if matches!(
+            s.to_ascii_lowercase().as_str(),
+            "neq" | "without"
+        ));
+        if is_negated {
+            let pred = self.predicate_expr(left)?;
+            // predicate_expr already produced the NEGATED form (`Compare(Ne, …)` or
+            // `Not(base)`); recover the POSITIVE base and guard it with presence.
+            let base = match pred {
+                Expr::Not(inner) => *inner,
+                Expr::Compare {
+                    op: CompareOp::Ne,
+                    left,
+                    right,
+                } => Expr::Compare {
+                    op: CompareOp::Eq,
+                    left,
+                    right,
+                },
+                other => return Ok(other), // not a recognized negation; leave as-is
+            };
+            let exists = Expr::PropertyExists {
+                slot: self.current,
+                key,
+            };
+            return Ok(Expr::Not(Box::new(Expr::And(Box::new(exists), Box::new(base)))));
+        }
         self.predicate_expr(left)
     }
 
