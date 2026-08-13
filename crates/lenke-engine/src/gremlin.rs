@@ -1160,9 +1160,17 @@ impl Parser {
                 let mut bodies = Vec::new();
                 let mut land;
                 loop {
-                    let (body, oc, os) = self.parse_sub_body(from, width)?;
-                    bodies.push(body);
-                    land = (oc, os);
+                    // A `<hop>.count()` branch is a PER-ELEMENT count (each input keeps
+                    // its own degree), not a global fold — lower it to a Row-projected
+                    // CountSubquery. Any other body parses as a Row-rooted sub-plan.
+                    if let Some(body) = self.try_count_body(from, width)? {
+                        bodies.push(body);
+                        land = (0, 1);
+                    } else {
+                        let (body, oc, os) = self.parse_sub_body(from, width)?;
+                        bodies.push(body);
+                        land = (oc, os);
+                    }
                     if self.peek() == Some(&Tok::Comma) {
                         self.bump();
                     } else {
@@ -4410,6 +4418,60 @@ impl Parser {
     /// hop `[__.](out|in|both)('L', …)`, returning its `(direction, edge labels)`. Used
     /// to form a body's existence guard before parsing it. `None` when the body does not
     /// start with a hop (a value body such as `constant(v)` always produces output).
+    /// Parse a union branch that is a PER-ELEMENT `[__.](out|in|both)('L'…).count()`,
+    /// returning a `Row`-projected `CountSubquery` (one count per input row). Returns
+    /// `None` with the cursor unchanged when the body is not that shape.
+    fn try_count_body(&mut self, from: usize, width: usize) -> Result<Option<Plan>, String> {
+        let save = self.pos;
+        let mut p = self.pos;
+        if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
+            p += 1;
+            if self.toks.get(p) == Some(&Tok::Dot) {
+                p += 1;
+            }
+        }
+        let dir = match self.toks.get(p) {
+            Some(Tok::Ident(s)) => match s.to_ascii_lowercase().as_str() {
+                "out" => Dir::Out,
+                "in" => Dir::In,
+                "both" => Dir::Both,
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        // Consume `[__.]<hop>(labels).count()`, bailing (cursor restored) on any mismatch.
+        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+            self.bump();
+            self.expect(&Tok::Dot)?;
+        }
+        self.ident()?; // hop (dir already resolved)
+        self.expect(&Tok::LParen)?;
+        let mut labels: Vec<String> = Vec::new();
+        if matches!(self.peek(), Some(Tok::Str(_))) {
+            labels.push(self.str_arg()?);
+            while self.peek() == Some(&Tok::Comma) {
+                self.bump();
+                labels.push(self.str_arg()?);
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        let is_count = self.peek() == Some(&Tok::Dot)
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("count"));
+        if !is_count {
+            self.pos = save;
+            return Ok(None);
+        }
+        self.expect(&Tok::Dot)?;
+        self.ident()?; // count
+        self.expect(&Tok::LParen)?;
+        self.expect(&Tok::RParen)?;
+        let count = Expr::CountSubquery {
+            body: Box::new(Plan::Row.expand(from, dir, &labels)),
+            outer_width: width,
+        };
+        Ok(Some(Plan::Row.project(vec![("count".to_string(), count)])))
+    }
+
     /// True when the coalesce body ahead starts with an element FILTER
     /// (`hasLabel`/`has`/`hasNot`/`hasKey`/`hasValue`/`where`/`not`/`and`/`or`/`filter`),
     /// so the body only produces output where that filter holds.
