@@ -7177,7 +7177,7 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             if name == "list_tail" {
                 let arg = eval(&args[0], store, batch)?;
                 let k = match &args[1] {
-                    Expr::Lit(Value::Num(n)) => (*n as usize).max(0),
+                    Expr::Lit(Value::Num(n)) => *n as usize,
                     _ => return Err("tail(local, k): k must be a literal integer".into()),
                 };
                 let n = batch.rows();
