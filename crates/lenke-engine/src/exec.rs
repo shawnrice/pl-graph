@@ -3497,11 +3497,6 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
             double_loops,
             ..
         } => {
-            // A double-self-loop (Gremlin both()) hop is not handled by this Once
-            // frontier fast-path — decline so the general expand runs.
-            if *double_loops {
-                return None;
-            }
             // Must expand the CURRENT frontier (the last slot); a linear pattern
             // always does, but a hand-built plan might not.
             if *from + 1 != chain_width(input)? {
@@ -3512,9 +3507,12 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
                 Ok(w) => w,
                 Err(()) => return Some(Vec::new()), // unknown label matches nothing
             };
+            // Gremlin `both()` walks a self-loop TWICE (`double_loops`), so the endpoint
+            // multiset matches core.
+            let dl = *double_loops;
             let mut out = Vec::new();
             for &v in &src {
-                for_each_nbr(store, v, *dir, &want, false, |nbr, _eid| out.push(nbr));
+                for_each_nbr(store, v, *dir, &want, dl, |nbr, _eid| out.push(nbr));
             }
             Some(out)
         }
@@ -3628,9 +3626,6 @@ fn frontier_counts(plan: &Plan, store: &Store) -> Option<Counts> {
             double_loops,
             ..
         } => {
-            if *double_loops {
-                return None; // double-self-loop hop → general path
-            }
             if *from + 1 != chain_width(input)? {
                 return None;
             }
@@ -3639,6 +3634,9 @@ fn frontier_counts(plan: &Plan, store: &Store) -> Option<Counts> {
                 Ok(w) => w,
                 Err(()) => return Some(Counts::Sparse(Vec::new())), // unknown label → no paths
             };
+            // Gremlin `both()` walks a self-loop TWICE — `for_each_nbr` doubles it under
+            // `double_loops`, so the multiplicity (hence the count) matches core.
+            let dl = *double_loops;
             // Estimate the next frontier's fan-out from the source count and the
             // average degree; go dense when it will be large, sparse otherwise. The
             // scatter itself is identical either way — only the accumulator differs.
@@ -3651,7 +3649,7 @@ fn frontier_counts(plan: &Plan, store: &Store) -> Option<Counts> {
             if est_next > dense_cut as f64 {
                 let mut next = vec![0.0f64; n];
                 prev.for_each(|v, c| {
-                    for_each_nbr(store, v, *dir, &want, false, |nbr, _| next[nbr as usize] += c);
+                    for_each_nbr(store, v, *dir, &want, dl, |nbr, _| next[nbr as usize] += c);
                 });
                 Some(Counts::Dense(next))
             } else {
@@ -3659,7 +3657,7 @@ fn frontier_counts(plan: &Plan, store: &Store) -> Option<Counts> {
                 // few nodes a narrow frontier reaches, no O(node_count) allocation.
                 let mut next: FnvMap<u32, f64> = FnvMap::default();
                 prev.for_each(|v, c| {
-                    for_each_nbr(store, v, *dir, &want, false, |nbr, _| {
+                    for_each_nbr(store, v, *dir, &want, dl, |nbr, _| {
                         *next.entry(nbr).or_insert(0.0) += c;
                     });
                 });
@@ -5372,12 +5370,14 @@ fn try_fused_count(
         from,
         dir,
         edge_label,
-        double_loops: false,
+        double_loops,
         ..
     } = input
     else {
         return None;
     };
+    // Gremlin `both()` walks a self-loop twice — the final-hop degree counts it twice.
+    let dl = *double_loops;
     let w = chain_width(inner)?; // slot count feeding the final hop
     if *from + 1 != w {
         return None; // the final Expand must expand the current frontier
@@ -5398,7 +5398,7 @@ fn try_fused_count(
                 let mut total = 0f64;
                 counts.for_each(|v, c| {
                     let mut deg = 0f64;
-                    for_each_nbr(store, v, *dir, &want, false, |_, _| deg += 1.0);
+                    for_each_nbr(store, v, *dir, &want, dl, |_, _| deg += 1.0);
                     total += c * deg;
                 });
                 return Some(scalar_num(total));
@@ -5415,12 +5415,12 @@ fn try_fused_count(
             let (distinct, mult) = distinct_with_mult(&src, store.node_count());
             for (i, &v) in distinct.iter().enumerate() {
                 let mut deg = 0f64;
-                for_each_nbr(store, v, *dir, &want, false, |_, _| deg += 1.0);
+                for_each_nbr(store, v, *dir, &want, dl, |_, _| deg += 1.0);
                 total += mult[i] * deg;
             }
         } else {
             for &v in &src {
-                for_each_nbr(store, v, *dir, &want, false, |_, _| total += 1.0);
+                for_each_nbr(store, v, *dir, &want, dl, |_, _| total += 1.0);
             }
         }
         return Some(scalar_num(total));
