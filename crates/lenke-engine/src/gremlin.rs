@@ -950,6 +950,44 @@ impl Parser {
                 p
             }
             "where" => {
+                // Tagged key form `where('a', op('b'))`: keep traversers where the
+                // value at step-label `a` relates (op) to the value at label `b` — a
+                // slot-vs-slot comparison (core's WhereKey; the predicate's rhs is a
+                // step-label, not a literal). Detected by a leading string + comma.
+                if matches!(self.peek(), Some(Tok::Str(_)))
+                    && self.toks.get(self.pos + 1) == Some(&Tok::Comma)
+                {
+                    let start = self.str_arg()?;
+                    self.expect(&Tok::Comma)?;
+                    let op_name = self.ident()?.to_ascii_lowercase();
+                    self.expect(&Tok::LParen)?;
+                    let end = self.str_arg()?;
+                    self.expect(&Tok::RParen)?; // close op(...)
+                    self.expect(&Tok::RParen)?; // close where(...)
+                    let slot_of = |l: &str| {
+                        self.labels
+                            .get(l)
+                            .copied()
+                            .ok_or_else(|| format!("where('{l}', …): no step is labelled `{l}`"))
+                    };
+                    let op = match op_name.as_str() {
+                        "eq" => CompareOp::Eq,
+                        "neq" => CompareOp::Ne,
+                        "gt" => CompareOp::Gt,
+                        "gte" => CompareOp::Ge,
+                        "lt" => CompareOp::Lt,
+                        "lte" => CompareOp::Le,
+                        other => {
+                            return Err(format!("where('{start}', {other}(…)) needs a comparison"))
+                        }
+                    };
+                    let pred = Expr::Compare {
+                        op,
+                        left: Box::new(Expr::Slot(slot_of(&start)?)),
+                        right: Box::new(Expr::Slot(slot_of(&end)?)),
+                    };
+                    return Ok(plan.filter(pred));
+                }
                 // Two forms: where(<hop>) is a SEMI-JOIN — keep the element if it HAS
                 // such an adjacency — and where(P) filters the current VALUE by a
                 // predicate. A leading `out`/`in`/`both` (or `__`) marks the hop form.

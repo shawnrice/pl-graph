@@ -122,6 +122,7 @@ pub enum Step {
     WithSack(Val),
     SackRead,
     SackBy(&'static str, &'static str),
+    WhereKeyTag(&'static str, &'static str, &'static str),
 }
 
 /// A whole traversal: an ordered list of steps.
@@ -281,6 +282,7 @@ fn emit_step(st: &Step) -> String {
         WithSack(v) => format!("withSack({})", emit_val(v)),
         SackRead => "sack()".into(),
         SackBy(op, k) => format!("sack({op}).by('{k}')"),
+        WhereKeyTag(a, op, b) => format!("where('{a}',{op}('{b}'))"),
     }
 }
 
@@ -417,6 +419,18 @@ fn apply_core(t: CTrav, st: &Step) -> CTrav {
                 _ => CSackOp::Max,
             };
             t.sack_op(o).by(k)
+        }
+        WhereKeyTag(a, op, b) => {
+            let rhs = cg::GVal::Str((*b).into());
+            let p = match *op {
+                "eq" => CP::eq(rhs),
+                "neq" => CP::neq(rhs),
+                "gt" => CP::gt(rhs),
+                "gte" => CP::gte(rhs),
+                "lt" => CP::lt(rhs),
+                _ => CP::lte(rhs),
+            };
+            t.where_key(a, p)
         }
     }
 }

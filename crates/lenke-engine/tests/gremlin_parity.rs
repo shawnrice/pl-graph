@@ -707,6 +707,33 @@ fn gremlin_parity() {
             false,
             vec![V, HasLabel(vec!["PERSON"]), Values(vec!["name"]), Barrier],
         ),
+        // — tagged where('a', op('b')): compare two step-label values (by identity) —
+        c(
+            "where_key_neq",
+            false,
+            vec![
+                V,
+                HasVal("name", Val::S("marko")),
+                As("a"),
+                Out(vec!["KNOWS"]),
+                As("b"),
+                WhereKeyTag("a", "neq", "b"),
+                Values(vec!["name"]),
+            ],
+        ),
+        c(
+            "where_key_eq_self",
+            false,
+            vec![
+                V,
+                HasLabel(vec!["PERSON"]),
+                As("a"),
+                Out(vec!["KNOWS"]),
+                As("b"),
+                WhereKeyTag("a", "eq", "a"),
+                Values(vec!["name"]),
+            ],
+        ),
         // — sack: per-traverser accumulator —
         c(
             "sack_sum_age",
