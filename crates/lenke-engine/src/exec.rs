@@ -863,7 +863,9 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::Merge { .. }
         | Plan::AddEdge { .. }
         | Plan::CallProcedure { .. } => false,
-        Plan::EdgeVertex { input, .. }
+        Plan::Enumerate { input, .. }
+
+        | Plan::EdgeVertex { input, .. }
         | Plan::Expand { input, .. }
         | Plan::OptionalExpand { input, .. }
         | Plan::VarLength { input, .. }
@@ -986,6 +988,17 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .filter_map(|e| by_ext.get(e.as_str()).copied())
                 .collect();
             Batch::single(Col::Edges(ids))
+        }
+        Plan::Enumerate { input, slot } => {
+            // Gremlin index(): each row → [element, stream-position]. The element renders
+            // as its value (vertices/edges as element maps); position is the row index.
+            let b = pull(input, store, track)?;
+            let n = b.rows();
+            let col = b.slot(*slot);
+            let out: Vec<Value> = (0..n)
+                .map(|i| Value::List(vec![render_cell(col, i, store), Value::Num(i as f64)]))
+                .collect();
+            Batch::single(Col::Gen(out))
         }
         Plan::EdgeVertex {
             input,
@@ -3349,7 +3362,9 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
 /// The number of `Expand` hops in a pure Scan/Expand chain (0 for a bare seed).
 fn count_hops(plan: &Plan) -> usize {
     match plan {
-        Plan::EdgeVertex { input, .. }
+        Plan::Enumerate { input, .. }
+
+        | Plan::EdgeVertex { input, .. }
         | Plan::Expand { input, .. } => 1 + count_hops(input),
         _ => 0,
     }
@@ -10333,7 +10348,9 @@ mod tests {
     fn has_interval_expand(p: &Plan) -> bool {
         match p {
             Plan::IntervalExpand { .. } => true,
-            Plan::EdgeVertex { input, .. }
+            Plan::Enumerate { input, .. }
+
+            | Plan::EdgeVertex { input, .. }
         | Plan::Expand { input, .. }
             | Plan::VarLength { input, .. }
             | Plan::ShortestPath { input, .. }

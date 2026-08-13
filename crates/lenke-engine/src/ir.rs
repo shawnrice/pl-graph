@@ -454,6 +454,10 @@ pub enum Plan {
     /// [`NodeSeed`] but for the edge frontier; an id resolving to no live edge
     /// contributes nothing. Preserves the requested id order.
     EdgeSeed { ext_ids: Vec<String> },
+    /// Gremlin `index()`: replace each row with the 2-element list `[element, position]`
+    /// where `position` is the element's 0-based index IN THE STREAM. Collapses to one
+    /// output column (a list per row).
+    Enumerate { input: Box<Plan>, slot: usize },
     /// Move from an EDGE frontier to an endpoint VERTEX — Gremlin `outV`/`inV`/`bothV`
     /// off an edge (e.g. `g.E().outV()`, `coalesce(outE(...)).inV()`), where no
     /// preceding `outE`/`inE` pre-landed the endpoint. Reads the edge at `edge_slot`,

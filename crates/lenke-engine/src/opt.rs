@@ -161,6 +161,16 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 c,
             )
         }
+        Plan::Enumerate { input, slot } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::Enumerate {
+                    input: Box::new(i),
+                    slot,
+                },
+                c,
+            )
+        }
         Plan::Subgraph { input, edge_slot } => {
             let (i, c) = rewrite(*input, idx);
             (
@@ -1300,6 +1310,7 @@ fn width(plan: &Plan) -> usize {
         Plan::MapSlot { input, append, .. } => width(input) + usize::from(*append),
         Plan::EdgeVertex { input, .. } => width(input) + 1,
         Plan::Subgraph { .. } => 1,
+        Plan::Enumerate { .. } => 1,
         Plan::ShortestPathEnum { .. } => 1,
         Plan::AlgoAnnotate { input, .. } => width(input) + 1,
         Plan::Join { left, right, .. } => width(left) + width(right),
@@ -1753,6 +1764,7 @@ mod tests {
             | Plan::Tree { input, .. }
             | Plan::MapSlot { input, .. }
             | Plan::EdgeVertex { input, .. }
+            | Plan::Enumerate { input, .. }
             | Plan::Subgraph { input, .. }
             | Plan::ShortestPathEnum { input, .. }
             | Plan::SortLocal { input, .. } => plan_contains_filter(input),

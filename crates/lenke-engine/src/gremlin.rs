@@ -3036,6 +3036,18 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 plan
             }
+            "index" => {
+                // index(): pair each element with its 0-based position in the stream —
+                // one [element, position] list per row.
+                self.expect(&Tok::RParen)?;
+                let p = Plan::Enumerate {
+                    input: Box::new(plan),
+                    slot: self.current,
+                };
+                self.current = 0;
+                self.slots = 1;
+                p
+            }
             "none" => {
                 // none() drops EVERY traverser — an always-false filter. none(pred) keeps
                 // the traverser iff NO element of the current value (a list cell, or a
