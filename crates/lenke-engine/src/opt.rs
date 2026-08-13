@@ -145,6 +145,16 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 c,
             )
         }
+        Plan::Subgraph { input, edge_slot } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::Subgraph {
+                    input: Box::new(i),
+                    edge_slot,
+                },
+                c,
+            )
+        }
         Plan::AlgoAnnotate {
             input,
             algo,
@@ -1251,6 +1261,7 @@ fn width(plan: &Plan) -> usize {
         Plan::GroupToMap { .. } => 1,
         Plan::Tree { .. } => 1,
         Plan::MapSlot { input, append, .. } => width(input) + usize::from(*append),
+        Plan::Subgraph { .. } => 1,
         Plan::AlgoAnnotate { input, .. } => width(input) + 1,
         Plan::Join { left, right, .. } => width(left) + width(right),
         // UNION's result columns are the LEFT arm's.
@@ -1702,6 +1713,7 @@ mod tests {
             | Plan::AlgoAnnotate { input, .. }
             | Plan::Tree { input, .. }
             | Plan::MapSlot { input, .. }
+            | Plan::Subgraph { input, .. }
             | Plan::SortLocal { input, .. } => plan_contains_filter(input),
             Plan::Join { left, right, .. } | Plan::Union { left, right, .. } => {
                 plan_contains_filter(left) || plan_contains_filter(right)

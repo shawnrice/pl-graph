@@ -33,6 +33,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         caps: std::collections::HashMap::new(),
         algo_props: std::collections::HashMap::new(),
         sack_slot: None,
+        subgraph_caps: std::collections::HashMap::new(),
     };
     p.traversal()
 }
@@ -204,6 +205,9 @@ struct Parser {
     /// The slot carrying the per-traverser `sack` accumulator (a column appended by
     /// `withSack(init)`), or None when no sack is in play.
     sack_slot: Option<usize>,
+    /// Named subgraph bags (`subgraph('sg')` → snapshot plan + the edge slot), revealed
+    /// by `cap('sg')` as a `{vertices, edges}` Map.
+    subgraph_caps: std::collections::HashMap<String, (Plan, usize)>,
 }
 
 impl Parser {
@@ -1799,12 +1803,27 @@ impl Parser {
                     .insert(key, (plan.clone(), Expr::Slot(self.current)));
                 plan
             }
-            "cap" => {
-                // Reveal a bag as a single list, folding the SNAPSHOT taken at the
-                // aggregate/store point (not the live stream). Reuses the fold()
-                // lowering (AggFn::Collect keeps nulls) for byte-identity with core.
+            "subgraph" => {
+                // Collect the current EDGE frontier into a named bag; cap('sg') reveals
+                // it as a {vertices, edges} Map. Pass-through side effect (the snapshot
+                // captures the plan prefix + the edge slot at this point).
                 let key = self.str_arg()?;
                 self.expect(&Tok::RParen)?;
+                self.subgraph_caps.insert(key, (plan.clone(), self.current));
+                plan
+            }
+            "cap" => {
+                // Reveal a bag. A subgraph bag → a {vertices, edges} Map (via
+                // Plan::Subgraph over the snapshot); otherwise a single list, folding
+                // the aggregate/store SNAPSHOT (AggFn::Collect keeps nulls) for
+                // byte-identity with core.
+                let key = self.str_arg()?;
+                self.expect(&Tok::RParen)?;
+                if let Some((snap, edge_slot)) = self.subgraph_caps.get(&key).cloned() {
+                    self.current = 0;
+                    self.slots = 1;
+                    return Ok(snap.subgraph(edge_slot));
+                }
                 let (snap, expr) = self.caps.get(&key).cloned().ok_or_else(|| {
                     format!("cap('{key}'): no aggregate()/store() filled that key")
                 })?;

@@ -659,6 +659,43 @@ fn node_result_value(store: &Store, id: u32) -> Value {
     ]))
 }
 
+/// A self-describing edge record `{id, label, outV, inV, properties}` — the shape
+/// core's `subgraph_edge` builds (single `label` string; endpoints as external ids;
+/// properties sorted by key).
+fn subgraph_edge_value(store: &Store, eid: u32) -> Value {
+    use std::sync::Arc;
+    let ext = |id: u32| store.node_ext_id(id).map_or(Value::Null, Value::Str);
+    let (src, dst) = store.edge_endpoints(eid).unwrap_or((0, 0));
+    let mut keys: Vec<String> = store
+        .edge_prop_keys()
+        .into_iter()
+        .filter(|k| store.has_edge_prop(eid, k))
+        .collect();
+    keys.sort();
+    let props: Vec<(Value, Value)> = keys
+        .into_iter()
+        .map(|k| {
+            let v = store.edge_prop(eid, &k);
+            (Value::Str(k.into()), v)
+        })
+        .collect();
+    Value::Map(Arc::new(vec![
+        (
+            Value::Str("id".into()),
+            store.edge_ext_id(eid).map_or(Value::Null, Value::Str),
+        ),
+        (
+            Value::Str("label".into()),
+            store
+                .edge_type_name(eid)
+                .map_or(Value::Null, |s| Value::Str(s.into())),
+        ),
+        (Value::Str("outV".into()), ext(src)),
+        (Value::Str("inV".into()), ext(dst)),
+        (Value::Str("properties".into()), Value::Map(Arc::new(props))),
+    ]))
+}
+
 /// The empty result a write statement returns (no columns, no rows).
 fn empty_rows() -> Rows {
     Rows {
@@ -764,6 +801,7 @@ fn needs_lineage(plan: &Plan) -> bool {
         // tree() reads the path lineage itself, so its INPUT must track it.
         Plan::Tree { .. } => true,
         Plan::MapSlot { input, value, .. } => reads_path(value) || needs_lineage(input),
+        Plan::Subgraph { input, .. } => needs_lineage(input),
         Plan::OptionalScan { input, filters, .. } => {
             filters.iter().any(|(_, e)| reads_path(e)) || needs_lineage(input)
         }
@@ -1063,6 +1101,38 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 b.slots[*slot] = col;
             }
             b
+        }
+        Plan::Subgraph { input, edge_slot } => {
+            // Collect the edge frontier (deduped, first-seen) + their endpoint vertices
+            // (deduped), into one {vertices:[…], edges:[…]} Map of element records.
+            let b = pull(input, store, track)?;
+            let n = b.rows();
+            let mut edge_seen: FnvSet<u32> = FnvSet::default();
+            let mut vert_seen: FnvSet<u32> = FnvSet::default();
+            let mut edges: Vec<Value> = Vec::new();
+            let mut verts: Vec<Value> = Vec::new();
+            for i in 0..n {
+                let eid = match b.slot(*edge_slot).value_at(i) {
+                    Value::Num(x) if x >= 0.0 => x as u32,
+                    _ => continue,
+                };
+                if !edge_seen.insert(eid) {
+                    continue;
+                }
+                edges.push(subgraph_edge_value(store, eid));
+                if let Some((src, dst)) = store.edge_endpoints(eid) {
+                    for v in [src, dst] {
+                        if vert_seen.insert(v) {
+                            verts.push(node_result_value(store, v));
+                        }
+                    }
+                }
+            }
+            let map = Value::Map(std::sync::Arc::new(vec![
+                (Value::Str("vertices".into()), Value::List(verts)),
+                (Value::Str("edges".into()), Value::List(edges)),
+            ]));
+            Batch::single(Col::Gen(vec![map]))
         }
         Plan::Tree { input, by } => {
             // Fold every traverser's vertex-hop path (node-id lineage) into one nested

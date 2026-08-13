@@ -707,6 +707,17 @@ fn gremlin_parity() {
             false,
             vec![V, HasLabel(vec!["PERSON"]), Values(vec!["name"]), Barrier],
         ),
+        // — subgraph('sg').cap('sg') — {vertices, edges} element-record Map —
+        c(
+            "subgraph_knows",
+            false,
+            vec![V, OutE(vec!["KNOWS"]), Subgraph("sg"), Cap("sg")],
+        ),
+        c(
+            "subgraph_created",
+            false,
+            vec![V, OutE(vec!["CREATED"]), Subgraph("sg"), Cap("sg")],
+        ),
         // — branch(values('k')).option(m, hop).option(none, hop) — value-routed —
         c(
             "branch_by_lang",

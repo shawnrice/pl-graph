@@ -644,6 +644,11 @@ pub enum Plan {
     /// yield one Map object rather than the relational (key,value) rows that GQL
     /// `GROUP BY` keeps.
     GroupToMap { input: Box<Plan> },
+    /// Gremlin `subgraph('sg')` revealed by `cap('sg')`: collect the EDGE frontier at
+    /// `edge_slot` (deduped) plus their endpoint vertices (deduped), emitting ONE row
+    /// holding a `{vertices: [records], edges: [records]}` Map of self-describing
+    /// element records — matching core's `subgraph_vertex`/`subgraph_edge` shapes.
+    Subgraph { input: Box<Plan>, edge_slot: usize },
     /// Append or overwrite ONE slot's column with `value` (evaluated per row),
     /// leaving every other slot intact — used to carry a Gremlin `sack` accumulator
     /// alongside the element frontier (a Project would collapse the frontier to the
@@ -1003,6 +1008,14 @@ impl Plan {
     pub fn group_to_map(self) -> Self {
         Self::GroupToMap {
             input: Box::new(self),
+        }
+    }
+
+    #[must_use]
+    pub fn subgraph(self, edge_slot: usize) -> Self {
+        Self::Subgraph {
+            input: Box::new(self),
+            edge_slot,
         }
     }
 
