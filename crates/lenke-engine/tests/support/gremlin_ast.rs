@@ -123,6 +123,7 @@ pub enum Step {
     SackRead,
     SackBy(&'static str, &'static str),
     WhereKeyTag(&'static str, &'static str, &'static str),
+    Branch(&'static str, Vec<(Option<Val>, Vec<Step>)>),
 }
 
 /// A whole traversal: an ordered list of steps.
@@ -283,6 +284,18 @@ fn emit_step(st: &Step) -> String {
         SackRead => "sack()".into(),
         SackBy(op, k) => format!("sack({op}).by('{k}')"),
         WhereKeyTag(a, op, b) => format!("where('{a}',{op}('{b}'))"),
+        Branch(test, opts) => {
+            let mut out = format!("branch(values('{test}'))");
+            for (m, body) in opts {
+                match m {
+                    Some(v) => {
+                        out.push_str(&format!(".option({},{})", emit_val(v), emit_sub(body)))
+                    }
+                    None => out.push_str(&format!(".option(none,{})", emit_sub(body))),
+                }
+            }
+            out
+        }
     }
 }
 
@@ -431,6 +444,16 @@ fn apply_core(t: CTrav, st: &Step) -> CTrav {
                 _ => CP::lte(rhs),
             };
             t.where_key(a, p)
+        }
+        Branch(test, opts) => {
+            let mut t = t.branch(cg::__().values(&[test]));
+            for (m, body) in opts {
+                match m {
+                    Some(v) => t = t.option(cval(v), csub(body)),
+                    None => t = t.option_none(csub(body)),
+                }
+            }
+            t
         }
     }
 }

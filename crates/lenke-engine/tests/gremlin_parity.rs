@@ -707,6 +707,23 @@ fn gremlin_parity() {
             false,
             vec![V, HasLabel(vec!["PERSON"]), Values(vec!["name"]), Barrier],
         ),
+        // — branch(values('k')).option(m, hop).option(none, hop) — value-routed —
+        c(
+            "branch_by_lang",
+            false,
+            vec![
+                V,
+                HasLabel(vec!["PERSON"]),
+                Branch(
+                    "age",
+                    vec![
+                        (Some(Val::N(29.0)), vec![Out(vec!["KNOWS"])]),
+                        (None, vec![Out(vec!["CREATED"])]),
+                    ],
+                ),
+                Values(vec!["name"]),
+            ],
+        ),
         // — tagged where('a', op('b')): compare two step-label values (by identity) —
         c(
             "where_key_neq",

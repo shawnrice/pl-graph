@@ -628,6 +628,85 @@ impl Parser {
                 self.slots += 1;
                 plan.branch(bodies)
             }
+            "branch" => {
+                // branch(<test>).option(m, <hop>)….option(none, <hop>): route each
+                // element by the TEST value — the option whose match value equals it,
+                // else the `none` default. v1: test is values('k') or label(), each
+                // option body a single hop. Guards are choose-style (test == m; default
+                // = test matches none), all landing at the same slot like union.
+                let from = self.current;
+                if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+                    self.bump();
+                    self.expect(&Tok::Dot)?;
+                }
+                let test_name = self.ident()?.to_ascii_lowercase();
+                self.expect(&Tok::LParen)?;
+                let test_expr = match test_name.as_str() {
+                    "values" => {
+                        let k = self.str_arg()?;
+                        self.expect(&Tok::RParen)?;
+                        Expr::Prop { slot: from, key: k }
+                    }
+                    "label" => {
+                        self.expect(&Tok::RParen)?;
+                        Expr::Call {
+                            name: "element_label".to_string(),
+                            args: vec![Expr::Slot(from)],
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "branch(<test>): only values('k') or label() supported, got `{other}`"
+                        ))
+                    }
+                };
+                self.expect(&Tok::RParen)?; // close branch(...)
+                                            // Parse `.option(m, <hop>)` modulators (m = literal, or bare `none`).
+                let mut opts: Vec<(Option<Value>, (Dir, Option<String>))> = Vec::new();
+                while self.peek() == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("option"))
+                {
+                    self.expect(&Tok::Dot)?;
+                    self.ident()?; // `option`
+                    self.expect(&Tok::LParen)?;
+                    let m = if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("none"))
+                    {
+                        self.bump();
+                        // `none` may be spelled `none()` — swallow an empty arg list.
+                        if self.peek() == Some(&Tok::LParen) {
+                            self.bump();
+                            self.expect(&Tok::RParen)?;
+                        }
+                        None
+                    } else {
+                        Some(self.literal()?)
+                    };
+                    self.expect(&Tok::Comma)?;
+                    let hop = self.hop_body()?;
+                    self.expect(&Tok::RParen)?;
+                    opts.push((m, hop));
+                }
+                let matched: Vec<Value> = opts.iter().filter_map(|(m, _)| m.clone()).collect();
+                let mut bodies = Vec::new();
+                for (m, (dir, label)) in &opts {
+                    let guard = match m {
+                        Some(v) => Expr::Compare {
+                            op: CompareOp::Eq,
+                            left: Box::new(test_expr.clone()),
+                            right: Box::new(Expr::Lit(v.clone())),
+                        },
+                        None => Expr::Not(Box::new(or_of_equals(&test_expr, &matched))),
+                    };
+                    bodies.push(Plan::Row.filter(guard).expand(
+                        from,
+                        *dir,
+                        &etypes_of(label.as_deref()),
+                    ));
+                }
+                self.current = self.slots;
+                self.slots += 1;
+                plan.branch(bodies)
+            }
             "choose" => {
                 // choose(<pred>, <thenHop>, <elseHop>): route each element by a filter
                 // predicate — the then-hop when it holds, the else-hop otherwise. Both
