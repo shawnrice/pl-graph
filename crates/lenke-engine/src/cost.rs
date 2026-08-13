@@ -179,6 +179,10 @@ pub fn estimate(plan: &Plan, store: &Store) -> Card {
         Plan::Tree { .. } => Card::exact(1),       // folds all paths into one nested Map row
         Plan::MapSlot { input, .. } => estimate(input, store), // pass-through (append/overwrite a slot)
         Plan::Enumerate { input, .. } => estimate(input, store), // one list per row
+        Plan::Sample { input, n } => {
+            let e = estimate(input, store);
+            Card::approx(e.rows.min(*n as f64))
+        }
         // Out/In keep one row per edge; Both fans out to two.
         Plan::EdgeVertex { input, which, .. } => {
             let f = if matches!(which, crate::ir::Dir::Both) {

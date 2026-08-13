@@ -14,6 +14,24 @@ use crate::ir::{Agg, AggFn, CombineOp, CompareOp, Dir, Expr, PathMode, Plan};
 use crate::store::{Column, Store};
 use crate::value::{self, Value};
 
+/// Mulberry32 PRNG — the fully-specified generator `sample()` uses with a FIXED seed,
+/// byte-identical to lenke-core (and the TS engine): same seed + same draw order ⇒ the
+/// same seeded shuffle on every engine.
+struct Mulberry32 {
+    s: u32,
+}
+impl Mulberry32 {
+    fn new(seed: u32) -> Self {
+        Self { s: seed }
+    }
+    fn next_f64(&mut self) -> f64 {
+        self.s = self.s.wrapping_add(0x6d2b_79f5);
+        let mut t = (self.s ^ (self.s >> 15)).wrapping_mul(1u32 | self.s);
+        t ^= t.wrapping_add((t ^ (t >> 7)).wrapping_mul(61u32 | t));
+        f64::from(t ^ (t >> 14)) / 4_294_967_296.0
+    }
+}
+
 /// A fast, dependency-free hasher for the engine's INTERNAL grouping, distinct,
 /// and join maps. The default `HashMap` hasher (SipHash) is DoS-resistant, which
 /// these maps — built and dropped inside one operator over trusted, already-
@@ -864,7 +882,9 @@ fn needs_lineage(plan: &Plan) -> bool {
         | Plan::Merge { .. }
         | Plan::AddEdge { .. }
         | Plan::CallProcedure { .. } => false,
-        Plan::Enumerate { input, .. }
+        Plan::Sample { input, .. }
+
+        | Plan::Enumerate { input, .. }
 
         | Plan::EdgeVertex { input, .. }
         | Plan::Expand { input, .. }
@@ -989,6 +1009,23 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .filter_map(|e| by_ext.get(e.as_str()).copied())
                 .collect();
             Batch::single(Col::Edges(ids))
+        }
+        Plan::Sample { input, n } => {
+            // A fixed-seed Mulberry32 partial Fisher-Yates shuffle over the whole row
+            // stream, truncated to n — byte-identical to core's sampleStep (same seed,
+            // same draw order). The engine's frontier order matches core's here, so the
+            // selected subset agrees.
+            let b = pull(input, store, track)?;
+            let len = b.rows();
+            let k = (*n).min(len);
+            let mut idx: Vec<usize> = (0..len).collect();
+            let mut rng = Mulberry32::new(0x9e37_79b9);
+            for i in 0..k {
+                let j = i + (rng.next_f64() * (len - i) as f64) as usize;
+                idx.swap(i, j);
+            }
+            idx.truncate(k);
+            b.gather(&idx)
         }
         Plan::Enumerate { input, slot } => {
             // Gremlin index(): each row → [element, stream-position]. The element renders
@@ -3383,7 +3420,9 @@ fn frontier_ids(plan: &Plan, store: &Store) -> Option<Vec<u32>> {
 /// The number of `Expand` hops in a pure Scan/Expand chain (0 for a bare seed).
 fn count_hops(plan: &Plan) -> usize {
     match plan {
-        Plan::Enumerate { input, .. }
+        Plan::Sample { input, .. }
+
+        | Plan::Enumerate { input, .. }
 
         | Plan::EdgeVertex { input, .. }
         | Plan::Expand { input, .. } => 1 + count_hops(input),
@@ -10418,7 +10457,9 @@ mod tests {
     fn has_interval_expand(p: &Plan) -> bool {
         match p {
             Plan::IntervalExpand { .. } => true,
-            Plan::Enumerate { input, .. }
+            Plan::Sample { input, .. }
+
+            | Plan::Enumerate { input, .. }
 
             | Plan::EdgeVertex { input, .. }
         | Plan::Expand { input, .. }

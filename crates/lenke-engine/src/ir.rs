@@ -462,6 +462,9 @@ pub enum Plan {
     /// [`NodeSeed`] but for the edge frontier; an id resolving to no live edge
     /// contributes nothing. Preserves the requested id order.
     EdgeSeed { ext_ids: Vec<String> },
+    /// Gremlin `sample(n)`: a seeded (fixed Mulberry32) partial Fisher-Yates shuffle of
+    /// the whole row stream, truncated to `n` — deterministic and byte-identical to core.
+    Sample { input: Box<Plan>, n: usize },
     /// Gremlin `index()`: replace each row with the 2-element list `[element, position]`
     /// where `position` is the element's 0-based index IN THE STREAM. Collapses to one
     /// output column (a list per row).

@@ -171,6 +171,16 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
                 c,
             )
         }
+        Plan::Sample { input, n } => {
+            let (i, c) = rewrite(*input, idx);
+            (
+                Plan::Sample {
+                    input: Box::new(i),
+                    n,
+                },
+                c,
+            )
+        }
         Plan::Subgraph { input, edge_slot } => {
             let (i, c) = rewrite(*input, idx);
             (
@@ -1305,6 +1315,7 @@ fn width(plan: &Plan) -> usize {
         | Plan::Distinct { input }
         | Plan::DistinctBy { input, .. }
         | Plan::Tail { input, .. }
+        | Plan::Sample { input, .. }
         | Plan::SortLocal { input, .. } => width(input),
         // The padded null row carries exactly the pattern's columns.
         Plan::NullPadIfEmpty { width, .. } => *width,
@@ -1763,6 +1774,7 @@ mod tests {
             | Plan::Distinct { input }
             | Plan::DistinctBy { input, .. }
             | Plan::Tail { input, .. }
+            | Plan::Sample { input, .. }
             | Plan::Branch { input, .. }
             | Plan::NullPadIfEmpty { input, .. }
             | Plan::OptionalScan { input, .. }

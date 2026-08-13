@@ -3213,6 +3213,15 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 plan
             }
+            "sample" => {
+                // sample(n): a fixed-seed shuffle of the stream, truncated to n.
+                let n = self.usize_arg()?;
+                self.expect(&Tok::RParen)?;
+                Plan::Sample {
+                    input: Box::new(plan),
+                    n,
+                }
+            }
             "index" => {
                 // index(): pair each element with its 0-based position in the stream —
                 // one [element, position] list per row.
