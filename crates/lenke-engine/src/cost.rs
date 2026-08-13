@@ -526,7 +526,7 @@ mod tests {
             arg: None,
             distinct: false,
             name: "c".into(),
-            frac: None,
+            frac: None, null_on_empty: false,
         }
     }
 }

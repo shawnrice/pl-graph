@@ -321,6 +321,9 @@ enum GroupBy {
     KeyExpr(String, Expr),
     Element,
     Count,
+    /// A reducing sub-traversal value-by — `by(__.values('v').sum())` etc.: the
+    /// aggregate function and its (optional) per-element argument expression.
+    Reduce(AggFn, Option<Expr>),
 }
 
 /// A runtime label-membership predicate over `slot`: `label ∈ labels(slot)`, OR-ed
@@ -2106,7 +2109,7 @@ impl Parser {
                             arg: None,
                             distinct: false,
                             name: "count".into(),
-                            frac: None,
+                            frac: None, null_on_empty: false,
                         }],
                     );
                     self.current = 0;
@@ -2151,6 +2154,8 @@ impl Parser {
                             distinct: false,
                             name: lname.clone(),
                             frac: None,
+                            // Gremlin sum() of nothing is NULL, not 0.
+                            null_on_empty: matches!(func, AggFn::Sum),
                         }],
                     );
                     self.current = 0;
@@ -2169,7 +2174,7 @@ impl Parser {
                         arg: Some(Expr::Slot(self.current)),
                         distinct: false,
                         name: "fold".into(),
-                        frac: None,
+                        frac: None, null_on_empty: false,
                     }],
                 );
                 self.current = 0;
@@ -2619,7 +2624,7 @@ impl Parser {
                             arg: None,
                             distinct: false,
                             name: "count".into(),
-                            frac: None,
+                            frac: None, null_on_empty: false,
                         }],
                     )
                     // Gremlin groupCount() is a single {key: count} Map, not (k,c) rows.
@@ -2649,22 +2654,63 @@ impl Parser {
                         GroupBy::Key(self.str_arg()?)
                     } else if self.peek() == Some(&Tok::RParen) {
                         GroupBy::Element
-                    } else if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("count"))
-                    {
-                        // by(count()) — a reducing traversal.
-                        self.ident()?;
-                        self.expect(&Tok::LParen)?;
-                        self.expect(&Tok::RParen)?;
-                        GroupBy::Count
-                    } else if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("id") || s.eq_ignore_ascii_case("label") || s.eq_ignore_ascii_case("T"))
-                    {
-                        let (name, e) = self.by_key_expr(elem_slot)?;
-                        GroupBy::KeyExpr(name, e)
                     } else {
-                        return Err(
-                            "group().by(<nested traversal>) is only supported as by(count()) so far"
-                                .into(),
-                        );
+                        // A reducing sub-traversal, optionally `__.`-prefixed.
+                        let dunder = matches!(self.peek(), Some(Tok::Ident(s)) if s == "__");
+                        if dunder {
+                            self.bump();
+                            self.expect(&Tok::Dot)?;
+                        }
+                        if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("count"))
+                        {
+                            self.ident()?; // count
+                            self.expect(&Tok::LParen)?;
+                            self.expect(&Tok::RParen)?;
+                            GroupBy::Count
+                        } else if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("values"))
+                        {
+                            // values('k')[.<agg>()] — a per-group aggregate over `k`.
+                            self.ident()?; // values
+                            self.expect(&Tok::LParen)?;
+                            let k = self.str_arg()?;
+                            self.expect(&Tok::RParen)?;
+                            let arg = Expr::Prop {
+                                slot: elem_slot,
+                                key: k,
+                            };
+                            // Optional trailing `.<agg>()`; a bare values() folds (Collect).
+                            let func = if self.peek() == Some(&Tok::Dot) {
+                                self.bump();
+                                let a = self.ident()?.to_ascii_lowercase();
+                                self.expect(&Tok::LParen)?;
+                                self.expect(&Tok::RParen)?;
+                                match a.as_str() {
+                                    "sum" => AggFn::Sum,
+                                    "min" => AggFn::Min,
+                                    "max" => AggFn::Max,
+                                    "mean" => AggFn::Avg,
+                                    "count" => AggFn::Count,
+                                    other => {
+                                        return Err(format!(
+                                            "group().by(values(...).{other}()) is not supported"
+                                        ))
+                                    }
+                                }
+                            } else {
+                                AggFn::Collect
+                            };
+                            GroupBy::Reduce(func, Some(arg))
+                        } else if !dunder
+                            && matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("id") || s.eq_ignore_ascii_case("label") || s.eq_ignore_ascii_case("T"))
+                        {
+                            let (name, e) = self.by_key_expr(elem_slot)?;
+                            GroupBy::KeyExpr(name, e)
+                        } else {
+                            return Err(
+                                "group().by(<nested traversal>): only count()/values(...).<agg>() supported"
+                                    .into(),
+                            );
+                        }
                     };
                     self.expect(&Tok::RParen)?;
                     bys.push(by);
@@ -2691,7 +2737,7 @@ impl Parser {
                         arg: None,
                         distinct: false,
                         name: "value".into(),
-                        frac: None,
+                        frac: None, null_on_empty: false,
                     },
                     Some(GroupBy::Key(k)) => Agg {
                         func: AggFn::Collect,
@@ -2701,14 +2747,22 @@ impl Parser {
                         }),
                         distinct: false,
                         name: "value".into(),
-                        frac: None,
+                        frac: None, null_on_empty: false,
                     },
                     Some(GroupBy::KeyExpr(_, e)) => Agg {
                         func: AggFn::Collect,
                         arg: Some(e.clone()),
                         distinct: false,
                         name: "value".into(),
+                        frac: None, null_on_empty: false,
+                    },
+                    Some(GroupBy::Reduce(func, arg)) => Agg {
+                        func: *func,
+                        arg: arg.clone(),
+                        distinct: false,
+                        name: "value".into(),
                         frac: None,
+                        null_on_empty: matches!(func, AggFn::Sum),
                     },
                     // Default (no second by) or bare by(): fold the group's elements.
                     _ => Agg {
@@ -2716,7 +2770,7 @@ impl Parser {
                         arg: Some(Expr::Slot(elem_slot)),
                         distinct: false,
                         name: "value".into(),
-                        frac: None,
+                        frac: None, null_on_empty: false,
                     },
                 };
                 let p = plan
@@ -3179,7 +3233,7 @@ impl Parser {
                         arg: Some(expr),
                         distinct: false,
                         name: key,
-                        frac: None,
+                        frac: None, null_on_empty: false,
                     }],
                 );
                 self.current = 0;

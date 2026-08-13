@@ -407,6 +407,10 @@ pub struct Agg {
     /// The fraction argument of `percentile_cont`/`percentile_disc` (a constant);
     /// `None` for every other aggregate.
     pub frac: Option<f64>,
+    /// When true, an empty / all-null `Sum` yields NULL instead of 0 — the Gremlin
+    /// `sum()` contract (no traversers → no value), vs GQL/SQL's `SUM = 0`. Only
+    /// affects `Sum` (Min/Max/Avg already null on an empty set).
+    pub null_on_empty: bool,
 }
 
 /// One ORDER BY key: an expression, a direction, and where NULLs go. Null

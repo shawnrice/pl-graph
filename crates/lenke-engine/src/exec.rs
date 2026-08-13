@@ -2391,7 +2391,11 @@ fn fold_grouped(
             (0..n_groups)
                 .map(|g| {
                     if agg.func == AggFn::Sum {
-                        Value::Num(total[g]) // 0.0 when cnt == 0
+                        if cnt[g] == 0 && agg.null_on_empty {
+                            Value::Null // Gremlin sum() of nothing is NULL
+                        } else {
+                            Value::Num(total[g]) // 0.0 when cnt == 0 (GQL/SQL)
+                        }
                     } else if cnt[g] == 0 {
                         Value::Null // AVG of nothing
                     } else {
@@ -4263,6 +4267,7 @@ fn try_scan_num_agg(
         }
     }
     let result = match agg.func {
+        AggFn::Sum if agg.null_on_empty && cnt == 0 => Value::Null, // Gremlin sum() of nothing
         AggFn::Sum => Value::Num(total), // 0.0 over an empty/all-null set (K0a)
         AggFn::Count => Value::Num(cnt as f64), // count(arg) = present count
         _ => {
@@ -5385,6 +5390,7 @@ fn try_frontier_aggregate(
             distinct: a.distinct,
             name: a.name.clone(),
             frac: a.frac,
+            null_on_empty: a.null_on_empty,
         })
         .collect();
     Ok(Some(aggregate(&batch, store, &keys, &aggs)?))
@@ -13076,7 +13082,7 @@ mod tests {
             arg,
             distinct,
             name: name.to_string(),
-            frac: None,
+            frac: None, null_on_empty: false,
         }
     }
 
