@@ -458,10 +458,13 @@ impl Parser {
                 // current element; all branches land their neighbour at the same slot,
                 // so the union is a continuable node frontier.
                 let from = self.current;
+                let width = self.slots;
                 let mut bodies = Vec::new();
+                let mut land;
                 loop {
-                    let (dir, label) = self.hop_body()?;
-                    bodies.push(Plan::Row.expand(from, dir, &etypes_of(label.as_deref())));
+                    let (body, oc, os) = self.parse_sub_body(from, width)?;
+                    bodies.push(body);
+                    land = (oc, os);
                     if self.peek() == Some(&Tok::Comma) {
                         self.bump();
                     } else {
@@ -469,10 +472,11 @@ impl Parser {
                     }
                 }
                 self.expect(&Tok::RParen)?;
-                // Every branch appends its landed node at `self.slots` (the input
-                // width); that becomes the new current element.
-                self.current = self.slots;
-                self.slots += 1;
+                // Each body lands its result at the same slot (value bodies project to
+                // slot 0; single-hop bodies land the neighbour at the input width) —
+                // the concatenated frontier continues from there.
+                self.current = land.0;
+                self.slots = land.1;
                 plan.branch(bodies)
             }
             "optional" => {
@@ -492,6 +496,12 @@ impl Parser {
                 // produces a result. Each branch k fires when no earlier branch's hop
                 // exists AND its own does — an Exists guard chain — then expands. All
                 // branches land at the same slot, so it reconverges like union.
+                // coalesce(<hop>, <hop>, …): per element, the FIRST branch that
+                // produces a result. Each branch k fires when no earlier branch's hop
+                // exists AND its own does — an Exists guard chain — then expands. All
+                // branches land at the same slot, so it reconverges like union.
+                // v1 single-hop bodies only; multi-step value bodies are deferred (they
+                // need the branch/Exists exec to handle heterogeneous value columns).
                 let from = self.current;
                 let slots = self.slots;
                 let exists = |dir: Dir, label: Option<&str>| Expr::Exists {
@@ -1580,6 +1590,59 @@ impl Parser {
         Ok((dir, label))
     }
 
+    /// Parse an anonymous sub-traversal `__.step().step()…` (a branch/union/coalesce/
+    /// local body) into a `Plan::Row`-rooted sub-plan that correlates on the incoming
+    /// element at slot `from` (row width `width`). Returns the sub-plan and the slot /
+    /// width the body LANDS at, so the caller can set the post-branch frontier. The
+    /// parser's current/slots/edge-hop/repeat state is saved and restored around it.
+    fn parse_sub_body(
+        &mut self,
+        from: usize,
+        width: usize,
+    ) -> Result<(Plan, usize, usize), String> {
+        self.parse_sub_body_seeded(Plan::Row, from, width)
+    }
+
+    /// Like [`parse_sub_body`] but the body chains onto `seed` (a `Plan::Row`, or a
+    /// `Row` pre-filtered by a coalesce exclusion guard) instead of a bare `Row`.
+    fn parse_sub_body_seeded(
+        &mut self,
+        seed: Plan,
+        from: usize,
+        width: usize,
+    ) -> Result<(Plan, usize, usize), String> {
+        let saved_current = self.current;
+        let saved_slots = self.slots;
+        let saved_edge = self.edge_hop.take();
+        let saved_repeat = self.pending_repeat.take();
+        let saved_path_ok = self.path_ok;
+        self.current = from;
+        self.slots = width;
+        // Optional leading `__.` (an anonymous traversal). The body is then a `.`-
+        // separated step chain; the FIRST step may appear bare (`out(...)`) or after
+        // the `__.` — both spellings occur in branch bodies.
+        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+            self.bump();
+            self.expect(&Tok::Dot)?;
+        }
+        let mut body = seed;
+        if matches!(self.peek(), Some(Tok::Ident(_))) {
+            body = self.step(body)?;
+            while self.peek() == Some(&Tok::Dot) {
+                self.bump();
+                body = self.step(body)?;
+            }
+        }
+        let out_current = self.current;
+        let out_slots = self.slots;
+        self.current = saved_current;
+        self.slots = saved_slots;
+        self.edge_hop = saved_edge;
+        self.pending_repeat = saved_repeat;
+        self.path_ok = saved_path_ok;
+        Ok((body, out_current, out_slots))
+    }
+
     /// Parse a comma-separated list of child filter traversals up to (but not
     /// consuming) the enclosing `)`.
     fn child_filter_list(&mut self) -> Result<Vec<Expr>, String> {
@@ -2087,8 +2150,11 @@ mod tests {
             )),
             vec!["Str(\"alice\");", "Str(\"carol\");"],
         );
-        // A multi-step branch is deferred (v1 is single-hop branches).
-        assert!(super::parse("g.V().union(out().out(), in())").is_err());
+        // Multi-step branch bodies are now supported (arbitrary sub-traversals per
+        // branch, not just a single hop): alice's 2-hop KNOWS reach unioned with a
+        // value body still parses and runs.
+        assert!(super::parse("g.V().union(out().out(), in())").is_ok());
+        assert!(super::parse("g.V().union(values('name'), out('KNOWS').values('name'))").is_ok());
     }
 
     /// The scope-LOCAL aggregates `count`/`sum`/`mean`/`min`/`max`(local) reduce the
