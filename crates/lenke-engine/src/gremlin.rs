@@ -4067,6 +4067,59 @@ impl Parser {
                 } else {
                     Plan::Row.expand(self.current, dir, &labels)
                 };
+                // A trailing `.values('k').<agg>().is(<pred>)` is a correlated reducing
+                // scalar test — `where(in('CREATED').values('age').mean().is(inside(…)))`.
+                // Collect the neighbours' `k` per outer row (CollectSubquery), reduce it
+                // with the list aggregate, then compare (an aggregate INSIDE an Exists
+                // body would collapse its provenance, hence the collect-then-reduce).
+                if self.peek() == Some(&Tok::Dot)
+                    && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("values"))
+                    && !is_edge
+                {
+                    self.expect(&Tok::Dot)?;
+                    self.ident()?; // values
+                    self.expect(&Tok::LParen)?;
+                    let k = self.str_arg()?;
+                    self.expect(&Tok::RParen)?;
+                    self.expect(&Tok::Dot)?;
+                    let agg = self.ident()?.to_ascii_lowercase();
+                    let list_fn = match agg.as_str() {
+                        "mean" => "list_mean",
+                        "sum" => "list_sum",
+                        "min" => "list_min",
+                        "max" => "list_max",
+                        "count" => "list_count",
+                        other => {
+                            return Err(format!("filter child values(...).{other}() unsupported"))
+                        }
+                    };
+                    self.expect(&Tok::LParen)?;
+                    self.expect(&Tok::RParen)?;
+                    self.expect(&Tok::Dot)?;
+                    let isn = self.ident()?;
+                    if !isn.eq_ignore_ascii_case("is") {
+                        return Err("values(...).<agg>() in a filter child needs is(...)".into());
+                    }
+                    self.expect(&Tok::LParen)?;
+                    // scalar = the neighbour's `k`, shifted past the provenance column.
+                    let mut scalar = Expr::Prop {
+                        slot: self.slots,
+                        key: k,
+                    };
+                    shift_body_slots(&mut scalar, self.slots);
+                    let collected = Expr::CollectSubquery {
+                        body: Box::new(hop),
+                        scalar: Box::new(scalar),
+                        outer_width: self.slots,
+                    };
+                    let reduced = Expr::Call {
+                        name: list_fn.to_string(),
+                        args: vec![collected],
+                    };
+                    let pred = self.predicate_expr(reduced)?;
+                    self.expect(&Tok::RParen)?;
+                    return Ok(pred);
+                }
                 // A trailing `.count().is(<pred>)` on the child is a DEGREE test — a
                 // correlated CountSubquery compared per the predicate (an aggregate
                 // inside an Exists body would collapse its provenance). Otherwise the
