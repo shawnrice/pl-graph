@@ -4490,6 +4490,7 @@ impl Parser {
             Some(Tok::Num(n)) => Ok(Value::Num(n)),
             Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("true") => Ok(Value::Bool(true)),
             Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("false") => Ok(Value::Bool(false)),
+            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("null") => Ok(Value::Null),
             other => Err(format!("expected a literal, got {other:?}")),
         }
     }
