@@ -470,6 +470,11 @@ pub struct Store {
     by_label: HashMap<String, Vec<u32>>,
     /// property name -> its typed column (length == node_count).
     props: HashMap<String, Column>,
+    /// Cached SORTED property-key list for element-map materialization. Property keys
+    /// are only ever ADDED to `props` (a removed value keeps its column), so `props.len()`
+    /// changing is exactly the key SET changing — the cache self-invalidates on a length
+    /// mismatch, needing no write-path hook. Avoids the per-node `prop_keys()` clone+sort.
+    prop_keys_cache: std::sync::RwLock<(usize, std::sync::Arc<[std::sync::Arc<str>]>)>,
     /// edge-type name -> interned id, and the reverse.
     etype_ids: HashMap<String, u32>,
     /// per-node outgoing / incoming adjacency, indexed by node id.
@@ -787,6 +792,27 @@ impl Store {
         let mut k: Vec<String> = self.props.keys().cloned().collect();
         k.sort();
         k
+    }
+
+    /// The sorted property keys as shared `Arc<str>`, cached (see `prop_keys_cache`).
+    /// The hot path for materializing node element maps — one refcount bump per node
+    /// instead of cloning+sorting the whole key list each time.
+    #[must_use]
+    pub fn prop_keys_arc(&self) -> std::sync::Arc<[std::sync::Arc<str>]> {
+        let len = self.props.len();
+        {
+            let g = self.prop_keys_cache.read().expect("prop_keys_cache poisoned");
+            if g.0 == len {
+                return std::sync::Arc::clone(&g.1);
+            }
+        }
+        let mut keys: Vec<std::sync::Arc<str>> =
+            self.props.keys().map(|k| std::sync::Arc::from(k.as_str())).collect();
+        keys.sort();
+        let arc: std::sync::Arc<[std::sync::Arc<str>]> = keys.into();
+        let mut g = self.prop_keys_cache.write().expect("prop_keys_cache poisoned");
+        *g = (len, std::sync::Arc::clone(&arc));
+        arc
     }
 
     /// All edge-property keys, sorted.
@@ -2392,6 +2418,7 @@ impl Builder {
             node_count: n,
             by_label: self.by_label,
             props,
+            prop_keys_cache: std::sync::RwLock::default(),
             etype_ids: self.etype_ids,
             out_adj,
             in_adj,

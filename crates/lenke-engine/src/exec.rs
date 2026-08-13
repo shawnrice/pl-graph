@@ -774,21 +774,18 @@ fn node_result_value(store: &Store, id: u32) -> Value {
     let mut labels = store.labels_of(id);
     labels.sort_unstable();
     let labels_list = Value::List(labels.into_iter().map(|l| Value::Str(l.into())).collect());
-    // Present properties on this node, sorted by key (core's props_map ordering).
-    let mut props: Vec<(String, Value)> = store
-        .prop_keys()
-        .into_iter()
-        .filter(|k| store.has_prop(id, k))
-        .map(|k| {
-            let v = store.prop(id, &k);
-            (k, v)
-        })
-        .collect();
-    props.sort_by(|a, b| a.0.cmp(&b.0));
+    // Present properties on this node, keyed in `prop_keys()` order — which is ALREADY
+    // sorted, so the filtered subset stays sorted (core's props_map ordering) with no
+    // re-sort and no intermediate Vec.
     let props_map = Value::Map(Arc::new(
-        props
-            .into_iter()
-            .map(|(k, v)| (Value::Str(k.into()), v))
+        store
+            .prop_keys_arc()
+            .iter()
+            .filter(|k| store.has_prop(id, k))
+            .map(|k| {
+                let v = store.prop(id, k);
+                (Value::Str(Arc::clone(k)), v)
+            })
             .collect(),
     ));
     Value::Map(Arc::new(vec![
