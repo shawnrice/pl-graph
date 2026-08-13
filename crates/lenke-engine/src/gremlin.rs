@@ -1825,10 +1825,16 @@ impl Parser {
                 self.slots = 1;
                 p
             }
-            "valuemap" => {
+            "valuemap" | "propertymap" => {
                 // valueMap() → a PROPERTIES-only map (no id/label tokens) with scalar
-                // values; valueMap('k1',…) filters keys. Lowers to the gremlin-only
-                // `value_map` exec fn: element slot, then the filter keys as literals.
+                // values; valueMap('k1',…) filters keys. propertyMap() is the same but
+                // each value is wrapped in a single-element list. Both lower to the
+                // gremlin-only `value_map`/`property_map` exec fn (element slot + keys).
+                let fn_name = if lname == "propertymap" {
+                    "property_map"
+                } else {
+                    "value_map"
+                };
                 let mut fn_args = vec![Expr::Slot(self.current)];
                 if !matches!(self.peek(), Some(Tok::RParen)) {
                     loop {
@@ -1842,9 +1848,9 @@ impl Parser {
                 }
                 self.expect(&Tok::RParen)?;
                 let p = plan.project(vec![(
-                    "valueMap".to_string(),
+                    fn_name.to_string(),
                     Expr::Call {
-                        name: "value_map".to_string(),
+                        name: fn_name.to_string(),
                         args: fn_args,
                     },
                 )]);

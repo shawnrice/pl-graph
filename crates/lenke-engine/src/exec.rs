@@ -7270,7 +7270,10 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             // form). An optional trailing key list filters; no keys = every present
             // property. Keys are sorted (the engine's element-map convention; map key
             // order is set-based per policy). Gremlin-only — not in the GQL whitelist.
-            if name == "value_map" {
+            if name == "value_map" || name == "property_map" {
+                // `property_map` is `value_map` with each value wrapped in a single-
+                // element LIST (a TinkerPop property is multi-valued; lenke is single).
+                let wrap = name == "property_map";
                 // The filter keys are constant string literals after the element arg.
                 let filter: Vec<String> = args[1..]
                     .iter()
@@ -7320,7 +7323,10 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                         Value::Map(Arc::new(
                             pairs
                                 .into_iter()
-                                .map(|(k, v)| (Value::Str(k.into()), v))
+                                .map(|(k, v)| {
+                                    let v = if wrap { Value::List(vec![v]) } else { v };
+                                    (Value::Str(k.into()), v)
+                                })
                                 .collect(),
                         ))
                     })
