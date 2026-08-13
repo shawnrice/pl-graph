@@ -799,6 +799,19 @@ impl Parser {
             self.bump();
             self.expect(&Tok::Dot)?;
         }
+        // Element accessors as a sub-traversal: `by(__.id())` / `by(__.label())`.
+        if matches!(self.peek(), Some(Tok::Ident(s)) if {
+            let l = s.to_ascii_lowercase();
+            (l == "id" || l == "label") && self.toks.get(self.pos + 1) == Some(&Tok::LParen)
+        }) {
+            let acc = self.ident()?.to_ascii_lowercase();
+            self.eat_empty_parens();
+            let func = if acc == "id" { "element_id" } else { "element_label" };
+            return Ok(Expr::Call {
+                name: func.into(),
+                args: vec![Expr::Slot(elem_slot)],
+            });
+        }
         let hop = self.ident()?.to_ascii_lowercase();
         let (dir, is_edge) = match hop.as_str() {
             "out" => (Dir::Out, false),
@@ -1678,6 +1691,24 @@ impl Parser {
                 let from = self.current;
                 let pred = self.child_filter_expr()?;
                 self.expect(&Tok::Comma)?;
+                // A `drop()` then-arm (no else): delete the pred-matching elements —
+                // a terminal write, so nothing reconverges. `choose(identity(), drop())`
+                // deletes everything the predicate keeps.
+                if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("drop"))
+                    && self.toks.get(self.pos + 1) == Some(&Tok::LParen)
+                {
+                    self.bump(); // drop
+                    self.expect(&Tok::LParen)?;
+                    self.expect(&Tok::RParen)?;
+                    self.expect(&Tok::RParen)?; // close choose(...)
+                    return Ok(Plan::Update {
+                        input: Box::new(plan.filter(pred)),
+                        ops: vec![crate::ir::SetOp::Delete {
+                            slot: from,
+                            detach: true,
+                        }],
+                    });
+                }
                 if let Some(then_val) = self.parse_single_value_body(from)? {
                     self.expect(&Tok::Comma)?;
                     let else_val = self.parse_single_value_body(from)?.ok_or(

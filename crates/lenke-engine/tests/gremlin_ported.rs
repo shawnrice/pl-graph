@@ -44,7 +44,8 @@ fn engine_store_from(core_ndjson: &str) -> lenke_engine::store::Store {
 /// already-written graph, so those run on core only (writes are covered by core's own
 /// contract tests).
 fn is_write(query: &str) -> bool {
-    ["addV", "addE", ".drop(", ".property("]
+    // `drop(` (no leading dot) also catches a `drop()` mutation arm inside choose().
+    ["addV", "addE", "drop(", ".property("]
         .iter()
         .any(|w| query.contains(w))
 }
