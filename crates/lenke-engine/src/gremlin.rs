@@ -1027,20 +1027,23 @@ impl Parser {
                     self.slots = 1;
                     return Ok(p);
                 }
-                // Otherwise: coalesce(<hop>, <hop>, …) — per element, the FIRST branch
-                // that produces a result, via an Exists guard chain then expand. All
-                // branches land at the same slot, so it reconverges like union. Single-
-                // hop bodies only; mixed multi-step value bodies stay deferred.
+                // General: each body is a sub-traversal reconverging to one output slot.
+                // A body CONTRIBUTES when its leading hop exists (`out('CREATED')…`), or
+                // ALWAYS when it has no leading hop (`constant(v)`, a bare value). Body k
+                // fires only where every earlier body did NOT — an exclusion guard on the
+                // seed `Row`, then the body's own steps (a hop chain, a projection, …).
                 let slots = self.slots;
-                let exists = |dir: Dir, label: Option<&str>| Expr::Exists {
-                    body: Box::new(Plan::Row.expand(from, dir, &etypes_of(label))),
-                    outer_width: slots,
-                };
                 let mut bodies = Vec::new();
-                let mut prior: Option<Expr> = None; // OR of the earlier branches' Exists
+                let mut prior: Option<Expr> = None; // OR of the earlier branches' existence
+                let mut land;
                 loop {
-                    let (dir, label) = self.hop_body()?;
-                    let this = exists(dir, label.as_deref());
+                    let this = match self.peek_leading_hop() {
+                        Some((dir, labels)) => Expr::Exists {
+                            body: Box::new(Plan::Row.expand(from, dir, &labels)),
+                            outer_width: slots,
+                        },
+                        None => Expr::Lit(Value::Bool(true)), // a value body always produces
+                    };
                     let guard = match &prior {
                         None => this.clone(),
                         Some(p) => Expr::And(
@@ -1048,11 +1051,10 @@ impl Parser {
                             Box::new(this.clone()),
                         ),
                     };
-                    bodies.push(Plan::Row.filter(guard).expand(
-                        from,
-                        dir,
-                        &etypes_of(label.as_deref()),
-                    ));
+                    let (body, oc, os) =
+                        self.parse_sub_body_seeded(Plan::Row.filter(guard), from, slots)?;
+                    bodies.push(body);
+                    land = (oc, os);
                     prior = Some(match prior {
                         None => this,
                         Some(p) => Expr::Or(Box::new(p), Box::new(this)),
@@ -1064,8 +1066,8 @@ impl Parser {
                     }
                 }
                 self.expect(&Tok::RParen)?;
-                self.current = self.slots;
-                self.slots += 1;
+                self.current = land.0;
+                self.slots = land.1;
                 plan.branch(bodies)
             }
             "match" => {
@@ -1246,12 +1248,30 @@ impl Parser {
                 plan.branch(bodies)
             }
             "choose" => {
-                // choose(<pred>, <thenHop>, <elseHop>): route each element by a filter
-                // predicate — the then-hop when it holds, the else-hop otherwise. Both
-                // land at the same slot, reconverging like union.
+                // choose(<pred>, <then>, <else>): route each element by a filter
+                // predicate. When both arms are single-VALUE bodies (`values('k')`,
+                // `constant(v)`, `id()`, `label()`) it is a per-row Case projection;
+                // otherwise both arms are hops reconverging like union.
                 let from = self.current;
                 let pred = self.child_filter_expr()?;
                 self.expect(&Tok::Comma)?;
+                if let Some(then_val) = self.parse_single_value_body(from)? {
+                    self.expect(&Tok::Comma)?;
+                    let else_val = self.parse_single_value_body(from)?.ok_or(
+                        "choose(): mixing a value arm with a non-value arm is not supported",
+                    )?;
+                    self.expect(&Tok::RParen)?;
+                    let p = plan.project(vec![(
+                        "choose".to_string(),
+                        Expr::Case {
+                            branches: vec![(pred, then_val)],
+                            otherwise: Some(Box::new(else_val)),
+                        },
+                    )]);
+                    self.current = 0;
+                    self.slots = 1;
+                    return Ok(p);
+                }
                 let (t_dir, t_label) = self.hop_body()?;
                 self.expect(&Tok::Comma)?;
                 let (e_dir, e_label) = self.hop_body()?;
@@ -3062,6 +3082,70 @@ impl Parser {
         Ok((dir, label))
     }
 
+    /// Try to parse ONE single-VALUE sub-traversal body — `[__.]constant(v)`,
+    /// `[__.]values('k')` (single key), `[__.]id()`, `[__.]label()` — into the `Expr`
+    /// it yields per row (reading the element at `from`). Returns `None` with the
+    /// cursor restored when the body is not one of these (e.g. a hop). Used by
+    /// `choose` to decide between the Case and the union-of-hops lowering.
+    fn parse_single_value_body(&mut self, from: usize) -> Result<Option<Expr>, String> {
+        let save = self.pos;
+        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+            self.bump();
+            if self.peek() == Some(&Tok::Dot) {
+                self.bump();
+            } else {
+                self.pos = save;
+                return Ok(None);
+            }
+        }
+        let name = match self.peek() {
+            Some(Tok::Ident(s)) => s.to_ascii_lowercase(),
+            _ => {
+                self.pos = save;
+                return Ok(None);
+            }
+        };
+        let expr = match name.as_str() {
+            "constant" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let v = self.literal()?;
+                self.expect(&Tok::RParen)?;
+                Expr::Lit(v)
+            }
+            "values" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                let k = self.str_arg()?;
+                // A multi-key values() is not a single value — leave it for another path.
+                if self.peek() == Some(&Tok::Comma) {
+                    self.pos = save;
+                    return Ok(None);
+                }
+                self.expect(&Tok::RParen)?;
+                Expr::Prop { slot: from, key: k }
+            }
+            "id" | "label" => {
+                self.bump();
+                self.expect(&Tok::LParen)?;
+                self.expect(&Tok::RParen)?;
+                Expr::Call {
+                    name: if name == "id" {
+                        "element_id".into()
+                    } else {
+                        "element_label".into()
+                    },
+                    args: vec![Expr::Slot(from)],
+                }
+            }
+            _ => {
+                self.pos = save;
+                return Ok(None);
+            }
+        };
+        Ok(Some(expr))
+    }
+
     /// Try to parse the whole coalesce argument list as bodies that are EACH a single
     /// `[__.]values('k')` projection, consuming through the closing `)`. Returns the
     /// keys in order, or `None` (cursor restored) if any body is something else.
@@ -3174,6 +3258,46 @@ impl Parser {
         self.pending_repeat = saved_repeat;
         self.path_ok = saved_path_ok;
         Ok((body, out_current, out_slots))
+    }
+
+    /// Look ahead — WITHOUT consuming — for a coalesce/branch body's leading navigating
+    /// hop `[__.](out|in|both)('L', …)`, returning its `(direction, edge labels)`. Used
+    /// to form a body's existence guard before parsing it. `None` when the body does not
+    /// start with a hop (a value body such as `constant(v)` always produces output).
+    fn peek_leading_hop(&self) -> Option<(Dir, Vec<String>)> {
+        let mut p = self.pos;
+        if matches!(self.toks.get(p), Some(Tok::Ident(s)) if s == "__") {
+            p += 1;
+            if self.toks.get(p) != Some(&Tok::Dot) {
+                return None;
+            }
+            p += 1;
+        }
+        let dir = match self.toks.get(p) {
+            Some(Tok::Ident(s)) => match s.to_ascii_lowercase().as_str() {
+                "out" => Dir::Out,
+                "in" => Dir::In,
+                "both" => Dir::Both,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        p += 1;
+        if self.toks.get(p) != Some(&Tok::LParen) {
+            return None;
+        }
+        p += 1;
+        let mut labels = Vec::new();
+        while let Some(Tok::Str(s)) = self.toks.get(p) {
+            labels.push(s.clone());
+            p += 1;
+            if self.toks.get(p) == Some(&Tok::Comma) {
+                p += 1;
+            } else {
+                break;
+            }
+        }
+        Some((dir, labels))
     }
 
     /// Parse a comma-separated list of child filter traversals up to (but not
