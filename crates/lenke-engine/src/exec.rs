@@ -8163,7 +8163,8 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 // store would cost more than a handful of probes.
                 if let Col::Nodes(ids) = &arg {
                     if n >= store.node_count() / 4 {
-                        let (names, code_of) = store.min_label_map();
+                        let map = store.min_label_map();
+                        let (names, code_of) = &*map;
                         // Gather codes in one pass; if EVERY node is labelled, emit a
                         // typed `Col::Str` — no per-row `Value::Str` box, and the JSON
                         // writer takes its string fast path. A single unlabelled node

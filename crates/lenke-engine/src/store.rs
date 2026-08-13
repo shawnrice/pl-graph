@@ -491,6 +491,13 @@ pub struct Store {
     /// changing is exactly the key SET changing — the cache self-invalidates on a length
     /// mismatch, needing no write-path hook. Avoids the per-node `prop_keys()` clone+sort.
     prop_keys_cache: std::sync::RwLock<(usize, std::sync::Arc<[std::sync::Arc<str>]>)>,
+    /// Cached forward node→min-label map (see `min_label_map`), keyed on `node_count`.
+    /// Labels are immutable once a node is created and `by_label` only grows as nodes
+    /// are added, so a `node_count` mismatch is exactly "a node was added" — the one
+    /// event that can change the map — and the cache self-invalidates with no write hook.
+    #[allow(clippy::type_complexity)]
+    min_label_cache:
+        std::sync::RwLock<Option<(usize, std::sync::Arc<(Vec<std::sync::Arc<str>>, Vec<u32>)>)>>,
     /// edge-type name -> interned id, and the reverse.
     etype_ids: HashMap<String, u32>,
     /// per-node outgoing / incoming adjacency, indexed by node id.
@@ -879,12 +886,27 @@ impl Store {
     /// to claim a node is its min) turns that whole column into O(total membership)
     /// build + O(1) per row. Callers processing a large node frontier use this
     /// instead of the per-node probe.
+    /// The map is a derived read-only index, so it is CACHED (keyed on `node_count`,
+    /// see `min_label_cache`) — a repeated `V().label()` against a stable store rebuilds
+    /// it once, not per call. Returned as an `Arc` so a cache hit is a refcount bump.
     #[must_use]
-    pub fn min_label_map(&self) -> (Vec<Arc<str>>, Vec<u32>) {
+    pub fn min_label_map(&self) -> Arc<(Vec<Arc<str>>, Vec<u32>)> {
+        let n = self.node_count();
+        {
+            let g = self
+                .min_label_cache
+                .read()
+                .expect("min_label_cache poisoned");
+            if let Some((cached_n, map)) = g.as_ref() {
+                if *cached_n == n {
+                    return Arc::clone(map);
+                }
+            }
+        }
         let mut buckets: Vec<(&String, &Vec<u32>)> = self.by_label.iter().collect();
         buckets.sort_by(|a, b| a.0.cmp(b.0));
         let names: Vec<Arc<str>> = buckets.iter().map(|(l, _)| Arc::from(l.as_str())).collect();
-        let mut code_of = vec![u32::MAX; self.node_count()];
+        let mut code_of = vec![u32::MAX; n];
         for (code, (_, ids)) in buckets.iter().enumerate() {
             // Iterate the bucket in its native (ascending id) order — a sequential
             // read — and claim only nodes no earlier (smaller) label already took.
@@ -895,7 +917,12 @@ impl Store {
                 }
             }
         }
-        (names, code_of)
+        let map = Arc::new((names, code_of));
+        *self
+            .min_label_cache
+            .write()
+            .expect("min_label_cache poisoned") = Some((n, Arc::clone(&map)));
+        map
     }
 
     /// The labels carried by node `id`, sorted. Each label bucket is kept SORTED
@@ -2537,6 +2564,7 @@ impl Builder {
             by_label: self.by_label,
             props,
             prop_keys_cache: std::sync::RwLock::default(),
+            min_label_cache: std::sync::RwLock::default(),
             etype_ids: self.etype_ids,
             out_adj,
             in_adj,
