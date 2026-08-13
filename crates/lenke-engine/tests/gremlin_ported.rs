@@ -1752,7 +1752,10 @@ fn ids_of(t: dual::Traversal) -> Vec<String> {
 /// Run a traversal (dual-checked) and resolve each path (a list) to element texts.
 #[allow(dead_code)]
 fn paths_text(t: dual::Traversal) -> Vec<Vec<String>> {
-    let mut g = modern();
+    // The edge-id Modern graph, so an edge element in a path renders its stable ext-id
+    // ("8") on BOTH engines — a plain graph would have core mint a synthetic "e1" while
+    // the encoded engine store carries the real id.
+    let mut g = modern_eids();
     t.run(&mut g)
         .iter()
         .map(|p| match p {

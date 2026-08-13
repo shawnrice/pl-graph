@@ -720,6 +720,50 @@ fn edge_result_value(store: &Store, eid: u32) -> Value {
     ]))
 }
 
+/// Render one element of an interleaved Gremlin `path()` per its (cycled) `by`
+/// modulator. A vertex or an edge (`is_edge`); `Element` → the element map,
+/// `Prop` → a property value, `Id`/`Label` → the ext-id / label string.
+fn render_gpath_elem(store: &Store, id: u32, is_edge: bool, by: &crate::ir::GPathBy) -> Value {
+    use crate::ir::GPathBy;
+    match by {
+        GPathBy::Element => {
+            if is_edge {
+                edge_result_value(store, id)
+            } else {
+                node_result_value(store, id)
+            }
+        }
+        GPathBy::Prop(k) => {
+            if is_edge {
+                store.edge_prop(id, k)
+            } else {
+                store.prop(id, k)
+            }
+        }
+        GPathBy::Id => {
+            let ext = if is_edge {
+                store.edge_ext_id(id)
+            } else {
+                store.node_ext_id(id)
+            };
+            ext.map_or(Value::Null, Value::Str)
+        }
+        GPathBy::Label => {
+            if is_edge {
+                store
+                    .edge_type_name(id)
+                    .map_or(Value::Null, |t| Value::Str(t.into()))
+            } else {
+                store
+                    .labels_of(id)
+                    .into_iter()
+                    .next()
+                    .map_or(Value::Null, |l| Value::Str(l.into()))
+            }
+        }
+    }
+}
+
 /// The canonical result map for a node — `{id, labels(sorted), properties(sorted by
 /// key)}`, byte-identical to lenke-core's `val_to_value(Node)`.
 fn node_result_value(store: &Store, id: u32) -> Value {
@@ -825,7 +869,7 @@ fn needs_lineage(plan: &Plan) -> bool {
     fn reads_path(e: &Expr) -> bool {
         match e {
             // Reading any part of the path needs the lineage, just like `Path`.
-            Expr::Path | Expr::PathAccess { .. } => true,
+            Expr::Path | Expr::PathAccess { .. } | Expr::GremlinPath { .. } => true,
             Expr::Compare { left, right, .. }
             | Expr::In {
                 needle: left,
@@ -5343,7 +5387,7 @@ fn refs_only_slot(expr: &Expr, s: usize) -> bool {
         Expr::Lit(_) => true,
         Expr::Slot(n) => *n == s,
         Expr::Prop { slot, .. } => *slot == s,
-        Expr::Path | Expr::PathAccess { .. } => false,
+        Expr::Path | Expr::PathAccess { .. } | Expr::GremlinPath { .. } => false,
         Expr::Not(x) => refs_only_slot(x, s),
         Expr::And(a, b)
         | Expr::Or(a, b)
@@ -5399,9 +5443,12 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
             slot: to,
             key: key.clone(),
         },
-        Expr::Slot(_) | Expr::Prop { .. } | Expr::Lit(_) | Expr::Path | Expr::PathAccess { .. } => {
-            expr.clone()
-        }
+        Expr::Slot(_)
+        | Expr::Prop { .. }
+        | Expr::Lit(_)
+        | Expr::Path
+        | Expr::PathAccess { .. }
+        | Expr::GremlinPath { .. } => expr.clone(),
         Expr::Not(x) => Expr::Not(go(x)),
         Expr::And(a, b) => Expr::And(go(a), go(b)),
         Expr::Or(a, b) => Expr::Or(go(a), go(b)),
@@ -7246,6 +7293,47 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             Some(lin) => Col::Gen(
                 (0..batch.rows())
                     .map(|i| Value::List(lin.path_at(i).to_vec()))
+                    .collect(),
+            ),
+            None => Col::Gen(vec![Value::Null; batch.rows()]),
+        },
+        Expr::GremlinPath { ends_on_edge, bys } => match &batch.lineage {
+            Some(lin) => Col::Gen(
+                (0..batch.rows())
+                    .map(|i| {
+                        let nodes = lin.path_at(i);
+                        let edges = lin.edges_at(i);
+                        // Interleave v0,e0,v1,e1,… ; each entry is (id, is_edge).
+                        let mut elems: Vec<(u32, bool)> = Vec::new();
+                        for j in 0..edges.len() {
+                            if let (Some(Value::Num(nv)), Some(Value::Num(ev))) =
+                                (nodes.get(j), edges.get(j))
+                            {
+                                elems.push((*nv as u32, false));
+                                elems.push((*ev as u32, true));
+                            }
+                        }
+                        // The final vertex, unless the path stops on the edge (`outE`
+                        // with no following `inV` — the recorded target is premature).
+                        if !ends_on_edge {
+                            if let Some(Value::Num(nv)) = nodes.get(edges.len()) {
+                                elems.push((*nv as u32, false));
+                            }
+                        }
+                        let out: Vec<Value> = elems
+                            .iter()
+                            .enumerate()
+                            .map(|(p, &(id, is_edge))| {
+                                let by = if bys.is_empty() {
+                                    &crate::ir::GPathBy::Element
+                                } else {
+                                    &bys[p % bys.len()]
+                                };
+                                render_gpath_elem(store, id, is_edge, by)
+                            })
+                            .collect();
+                        Value::List(out)
+                    })
                     .collect(),
             ),
             None => Col::Gen(vec![Value::Null; batch.rows()]),

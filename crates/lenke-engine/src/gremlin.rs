@@ -31,6 +31,8 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         pending_repeat: None,
         pending_until: None,
         path_ok: true,
+        edge_path_ok: true,
+        path_has_edges: false,
         caps: std::collections::HashMap::new(),
         algo_props: std::collections::HashMap::new(),
         last_algo: None,
@@ -553,6 +555,16 @@ struct Parser {
     /// A PRE-form `until(pred)` seen BEFORE its `repeat(body)` (`until(pred).repeat(…)`,
     /// while-do). Stashed here until the following `repeat()` opens and consumes it.
     pending_until: Option<Expr>,
+    /// Whether `path()` can be answered as an INTERLEAVED node/edge chain: true while the
+    /// traversal is `V`-source + explicit edge hops (`outE`/`inE`/`bothE`) and their
+    /// `inV`/`outV`/`otherV` vertex moves (plus element filters) — a `[v0,e0,v1,e1,…]`
+    /// path. A plain `out`/`in`/`both` (which hides its edge) or any other step breaks
+    /// it. `path_has_edges` records that at least one edge hop occurred (so a bare
+    /// vertex-only path still renders through the nodes-only path, not this one).
+    edge_path_ok: bool,
+    /// At least one explicit edge hop (`outE`/`inE`/`bothE`) occurred — the signal to
+    /// render `path()` as the interleaved node/edge chain rather than nodes-only.
+    path_has_edges: bool,
     /// Whether `path()` can still be answered: true while the traversal is a pure
     /// vertex-hop chain (`V`-source + `out`/`in`/`both` + element filters), whose
     /// Gremlin path is exactly the node sequence the engine's lineage records. Any
@@ -1111,6 +1123,22 @@ impl Parser {
                 | "until"
         ) {
             self.path_ok = false;
+        }
+        // The INTERLEAVED edge-path (`outE().inV()…path()`) stays answerable through the
+        // explicit edge hops and their vertex moves plus element filters; anything else
+        // (a plain vertex hop, a value projection, a barrier) breaks the alternation.
+        if !matches!(
+            lname.as_str(),
+            "oute" | "ine" | "bothe"
+                | "inv" | "outv" | "otherv" | "bothv"
+                | "has" | "haslabel" | "hasnot" | "hasid"
+                | "and" | "or" | "not"
+                | "path" | "tree" | "simplepath" | "cyclicpath"
+        ) {
+            self.edge_path_ok = false;
+        }
+        if matches!(lname.as_str(), "oute" | "ine" | "bothe") {
+            self.path_has_edges = true;
         }
 
         // --- write steps ---
@@ -2193,6 +2221,51 @@ impl Parser {
             }
             "path" => {
                 self.expect(&Tok::RParen)?;
+                // An interleaved node/edge path (`outE().inV()…`) renders through
+                // GremlinPath (lineage `values` zipped with `edges`); a bare vertex-hop
+                // chain stays on the nodes-only path below.
+                if self.path_has_edges && self.edge_path_ok {
+                    let ends_on_edge = self.on_edge;
+                    let mut bys: Vec<crate::ir::GPathBy> = Vec::new();
+                    while self.peek() == Some(&Tok::Dot)
+                        && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("by"))
+                    {
+                        self.expect(&Tok::Dot)?;
+                        self.ident()?; // by
+                        self.expect(&Tok::LParen)?;
+                        // by('k') | by(id) | by(label) | by(T.id|T.label) | by(__.id()|__.label()).
+                        if matches!(self.peek(), Some(Tok::Ident(s)) if s == "__") {
+                            self.bump();
+                            self.expect(&Tok::Dot)?;
+                        }
+                        if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("T")) {
+                            self.bump();
+                            self.expect(&Tok::Dot)?;
+                        }
+                        let by = match self.peek() {
+                            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("id") => {
+                                self.bump();
+                                self.eat_empty_parens();
+                                crate::ir::GPathBy::Id
+                            }
+                            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("label") => {
+                                self.bump();
+                                self.eat_empty_parens();
+                                crate::ir::GPathBy::Label
+                            }
+                            _ => crate::ir::GPathBy::Prop(self.str_arg()?),
+                        };
+                        self.expect(&Tok::RParen)?;
+                        bys.push(by);
+                    }
+                    let p = plan.project(vec![(
+                        "path".to_string(),
+                        Expr::GremlinPath { ends_on_edge, bys },
+                    )]);
+                    self.current = 0;
+                    self.slots = 1;
+                    return Ok(p);
+                }
                 if !self.path_ok {
                     return Err("path() is only supported over a pure vertex-hop chain \
                                 (V-source + out/in/both); edge steps, var-length, value \
@@ -6161,8 +6234,9 @@ mod tests {
             id_seqs("g.V('0').out('KNOWS').out('KNOWS').path()", &store),
             vec![vec!["0".to_string(), "1".to_string(), "2".to_string()]],
         );
-        // Deferred shapes error explicitly.
-        assert!(super::parse("g.V().outE().inV().path()").is_err());
+        // An interleaved node/edge path (`outE().inV()`) renders through GremlinPath.
+        assert!(super::parse("g.V().outE().inV().path()").is_ok());
+        // Still deferred: the bare `E` source, and a value projection before path().
         assert!(super::parse("g.E().path()").is_err());
         assert!(super::parse("g.V().values('name').path()").is_err());
         // A `repeat(<vertex-hop>)` walk records full path lineage, so path() over it

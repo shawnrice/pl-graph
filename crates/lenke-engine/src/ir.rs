@@ -242,6 +242,16 @@ pub enum Expr {
     PathAccess {
         part: PathPart,
     },
+    /// Gremlin `path()` over an INTERLEAVED node/edge chain (`outE().inV()…`): the
+    /// lineage's `values` (vertices) zipped with `edges` in traversal order —
+    /// `[v0, e0, v1, e1, …]`. `ends_on_edge` drops the premature target the final `outE`
+    /// recorded when no `inV` followed (the path stops on the edge). Each element is
+    /// rendered by the positionally-CYCLED `bys` (an empty `bys` renders element maps);
+    /// a vertex vs edge element is known from its parity in the interleaving.
+    GremlinPath {
+        ends_on_edge: bool,
+        bys: Vec<GPathBy>,
+    },
     /// `EXISTS { <pattern> [WHERE <pred>] }` — a correlated existence predicate. A
     /// definite Bool per outer row: TRUE iff the sub-pattern, extended from an
     /// outer-bound variable, matches at least once for that row. `body` is a
@@ -340,6 +350,17 @@ pub enum PathPart {
     Relationships,
     Length,
     Elements,
+}
+
+/// A `path().by(...)` element projection for the interleaved Gremlin path
+/// ([`Expr::GremlinPath`]). `Element` renders the whole element map; `Prop` a property;
+/// `Id`/`Label` the element's ext-id / label. Applied CYCLICALLY across path positions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GPathBy {
+    Element,
+    Prop(String),
+    Id,
+    Label,
 }
 
 /// A binary arithmetic operator.
