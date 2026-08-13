@@ -1676,7 +1676,6 @@ mod tests {
             | Plan::CallInline { input, .. }
             | Plan::Distinct { input }
             | Plan::DistinctBy { input, .. }
-            | Plan::DistinctBy { input, .. }
             | Plan::Tail { input, .. }
             | Plan::Branch { input, .. }
             | Plan::NullPadIfEmpty { input, .. }
