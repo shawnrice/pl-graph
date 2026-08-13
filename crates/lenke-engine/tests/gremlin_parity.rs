@@ -696,6 +696,69 @@ fn gremlin_parity() {
                 Count,
             ],
         ),
+        // — identity / barrier —
+        c(
+            "identity_names",
+            false,
+            vec![V, HasLabel(vec!["PERSON"]), Identity, Values(vec!["name"])],
+        ),
+        c(
+            "barrier_names",
+            false,
+            vec![V, HasLabel(vec!["PERSON"]), Values(vec!["name"]), Barrier],
+        ),
+        // — aggregate/store + cap —
+        c(
+            "aggregate_cap_names",
+            false,
+            vec![
+                V,
+                HasLabel(vec!["PERSON"]),
+                Values(vec!["name"]),
+                Aggregate("x"),
+                Cap("x"),
+            ],
+        ),
+        c(
+            "store_cap_names",
+            false,
+            vec![
+                V,
+                HasLabel(vec!["SOFTWARE"]),
+                Values(vec!["name"]),
+                Store("s"),
+                Cap("s"),
+            ],
+        ),
+        c(
+            "aggregate_passthrough",
+            false,
+            vec![
+                V,
+                HasVal("name", Val::S("marko")),
+                Out(vec!["CREATED"]),
+                Aggregate("x"),
+                Values(vec!["name"]),
+            ],
+        ),
+        // NOTE: store('s').values(...).cap('s') where the bag holds VERTICES then
+        // projects id() is NOT covered — the engine represents a bagged vertex as its
+        // dense-id Num (no Value::Node), so a later id() can't resolve it. Cases that
+        // aggregate/cap SCALARS (above) are at parity; element-identity-through-a-bag
+        // is the same representation gap the corpus sidesteps by projecting first.
+        // — multi-step union with value bodies —
+        c(
+            "union_multi_step",
+            false,
+            vec![
+                V,
+                HasVal("name", Val::S("marko")),
+                Union(vec![
+                    vec![Out(vec!["KNOWS"]), Values(vec!["name"])],
+                    vec![Out(vec!["CREATED"]), Values(vec!["name"])],
+                ]),
+            ],
+        ),
     ];
 
     let mut diverged: Vec<String> = Vec::new();

@@ -106,6 +106,10 @@ pub enum Step {
     Unfold,
     Constant(Val),
     Identity,
+    Barrier,
+    Aggregate(&'static str),
+    Store(&'static str),
+    Cap(&'static str),
 }
 
 /// A whole traversal: an ordered list of steps.
@@ -250,6 +254,10 @@ fn emit_step(st: &Step) -> String {
         Unfold => "unfold()".into(),
         Constant(v) => format!("constant({})", emit_val(v)),
         Identity => "identity()".into(),
+        Barrier => "barrier()".into(),
+        Aggregate(k) => format!("aggregate('{k}')"),
+        Store(k) => format!("store('{k}')"),
+        Cap(k) => format!("cap('{k}')"),
     }
 }
 
@@ -364,6 +372,10 @@ fn apply_core(t: CTrav, st: &Step) -> CTrav {
         Unfold => t.unfold(),
         Constant(v) => t.constant(cval(v)),
         Identity => t.identity(),
+        Barrier => t.barrier(),
+        Aggregate(k) => t.aggregate(k),
+        Store(k) => t.store(k),
+        Cap(k) => t.cap(k),
     }
 }
 

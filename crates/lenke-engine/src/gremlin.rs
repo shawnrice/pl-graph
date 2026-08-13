@@ -30,6 +30,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         edge_hop: None,
         pending_repeat: None,
         path_ok: true,
+        caps: std::collections::HashMap::new(),
     };
     p.traversal()
 }
@@ -188,6 +189,12 @@ struct Parser {
     /// source) makes the Gremlin path step-dependent in a way the nodes-only
     /// rendering would not match, so `path()` is deferred once this is false.
     path_ok: bool,
+    /// Named side-effect bags for `aggregate`/`store` → revealed by `cap`. Each entry
+    /// snapshots the plan PREFIX and the current-slot expression at the point the bag
+    /// was filled, so `cap(key)` folds exactly that stream (matching core, where the
+    /// bag holds the elements as they were at aggregate/store time, not after later
+    /// value projections).
+    caps: std::collections::HashMap<String, (Plan, Expr)>,
 }
 
 impl Parser {
@@ -1331,6 +1338,51 @@ impl Parser {
                 let v = self.literal()?;
                 self.expect(&Tok::RParen)?;
                 let p = plan.project(vec![("constant".to_string(), Expr::Lit(v))]);
+                self.current = 0;
+                self.slots = 1;
+                p
+            }
+            "identity" => {
+                // Pass-through — the current element is unchanged (Gremlin identity()).
+                self.expect(&Tok::RParen)?;
+                plan
+            }
+            "barrier" => {
+                // A lazy-barrier is a no-op in this eager executor (matching core, where
+                // barrier() is the identity step). Bulk-collect semantics are invisible.
+                self.expect(&Tok::RParen)?;
+                plan
+            }
+            "aggregate" | "store" => {
+                // A named side-effect bag: record the CURRENT stream (plan prefix +
+                // the current-slot value) under `key`, then pass through unchanged. In
+                // this eager executor aggregate and store are identical (both eagerly
+                // collect), matching core. Revealed later by cap(key).
+                let key = self.str_arg()?;
+                self.expect(&Tok::RParen)?;
+                self.caps
+                    .insert(key, (plan.clone(), Expr::Slot(self.current)));
+                plan
+            }
+            "cap" => {
+                // Reveal a bag as a single list, folding the SNAPSHOT taken at the
+                // aggregate/store point (not the live stream). Reuses the fold()
+                // lowering (AggFn::Collect keeps nulls) for byte-identity with core.
+                let key = self.str_arg()?;
+                self.expect(&Tok::RParen)?;
+                let (snap, expr) = self.caps.get(&key).cloned().ok_or_else(|| {
+                    format!("cap('{key}'): no aggregate()/store() filled that key")
+                })?;
+                let p = snap.aggregate(
+                    vec![],
+                    vec![Agg {
+                        func: AggFn::Collect,
+                        arg: Some(expr),
+                        distinct: false,
+                        name: key,
+                        frac: None,
+                    }],
+                );
                 self.current = 0;
                 self.slots = 1;
                 p
@@ -3076,6 +3128,49 @@ mod tests {
             crate::exec::execute(&super::parse("g.V(0).addE('R').to(V(9))").unwrap(), &mut st)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn aggregate_store_cap_side_effect_bag() {
+        let store = social();
+        // aggregate('x') fills a bag with the value stream; cap('x') reveals it as one
+        // list. store is an alias in this eager executor.
+        let agg = value_bag(&gremlin_rows(
+            "g.V().hasLabel('Person').values('name').aggregate('x').cap('x')",
+            &store,
+        ));
+        let sto = value_bag(&gremlin_rows(
+            "g.V().hasLabel('Person').values('name').store('x').cap('x')",
+            &store,
+        ));
+        assert_eq!(agg, sto, "aggregate and store are interchangeable");
+        assert_eq!(agg.len(), 1, "cap yields exactly one row (a list)");
+        // aggregate() alone is a pass-through side effect (no effect on results).
+        assert_eq!(
+            value_bag(&gremlin_rows(
+                "g.V('0').out('KNOWS').aggregate('x').values('name')",
+                &store,
+            )),
+            value_bag(&gremlin_rows(
+                "g.V('0').out('KNOWS').values('name')",
+                &store
+            )),
+        );
+        // cap of an unfilled key errors, not panics.
+        assert!(super::parse("g.V().cap('nope')").is_err());
+        // barrier() and identity() are pass-throughs.
+        for step in ["barrier", "identity"] {
+            assert_eq!(
+                value_bag(&gremlin_rows(
+                    &format!("g.V().hasLabel('Person').{step}().values('name')"),
+                    &store,
+                )),
+                value_bag(&gremlin_rows(
+                    "g.V().hasLabel('Person').values('name')",
+                    &store
+                )),
+            );
+        }
     }
 
     #[test]
