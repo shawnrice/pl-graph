@@ -57,6 +57,13 @@ regex = { version = "1", default-features = false, features = [
   "unicode-perl",
   "unicode-case",
 ], optional = true }
+# The standalone columnar engine, wired in ONLY for the cross-engine comparison
+# harness (the `engine-compare` feature). Off by default so the shipped cdylib/
+# wasm carry nothing extra; `packages/native` turns it on to run both engines
+# through the same differential-fuzz + bench across every surface. This is a
+# regular dep here while `lenke-engine` keeps `lenke-core` as a DEV-dep only, so
+# there is no build cycle (dev-deps sit outside the lib dependency graph).
+lenke-engine = { path = "../lenke-engine", optional = true }
 
 [features]
 # Composable feature set so a minimal build ships only what it uses (the binary
@@ -107,3 +114,9 @@ parallel = ["gql", "dep:rayon"]
 # off by default — it trades throughput for single-query latency, so it's a
 # deliberate choice, not a default.
 parallel-query = ["parallel"]
+
+# `engine-compare`: expose the standalone columnar engine behind a parallel
+# `lnk_e_*` FFI surface, so the SAME graph/query drives BOTH engines through the
+# comparison harness (correctness + perf, native + wasm). Off by default — this
+# is a measurement build, not a shipped one.
+engine-compare = ["dep:lenke-engine", "gql", "gremlin", "ndjson"]

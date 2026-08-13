@@ -22,6 +22,10 @@
 pub mod error;
 pub mod error_codes;
 pub mod ffi;
+/// Parallel `lnk_e_*` ABI over the standalone `lenke-engine`, for the cross-engine
+/// comparison harness. Measurement-only; off unless `engine-compare` is set.
+#[cfg(feature = "engine-compare")]
+pub mod ffi_engine;
 pub mod ffi_error;
 #[cfg(test)]
 mod fixtures;

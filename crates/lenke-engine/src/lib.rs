@@ -37,6 +37,7 @@ pub mod exec;
 pub mod gql;
 pub mod gremlin;
 pub mod ir;
+pub mod json;
 pub mod ndjson;
 pub mod opt;
 pub mod store;
