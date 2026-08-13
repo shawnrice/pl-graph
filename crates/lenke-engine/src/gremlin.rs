@@ -4316,11 +4316,16 @@ impl Parser {
                 } else if self.peek() == Some(&Tok::Dot) {
                     // A trailing step (`out('KNOWS').where(out('CREATED'))`) makes the
                     // child a multi-step sub-traversal: Exists over the whole chain.
+                    // Reserve the provenance slot (parse at width+1) so an inner filter
+                    // or nested Exists numbers new slots PAST it — the correlated exec
+                    // inserts a provenance column at `outer_width`.
                     self.pos = start;
-                    let (body, _oc, _os) = self.parse_sub_body(self.current, self.slots)?;
+                    let width = self.slots;
+                    let (body, _oc, _os) =
+                        self.parse_sub_body_seeded(Plan::Row, self.current, width + 1)?;
                     Expr::Exists {
                         body: Box::new(body),
-                        outer_width: self.slots,
+                        outer_width: width,
                     }
                 } else {
                     Expr::Exists {
@@ -4330,13 +4335,16 @@ impl Parser {
                 }
             }
             // Any other child: a general sub-traversal filter — keep the element if the
-            // body produces ≥1 output (Exists over the Row-rooted sub-plan).
+            // body produces ≥1 output (Exists over the Row-rooted sub-plan). Reserve the
+            // provenance slot (parse at width+1), as the trailing-step case above.
             _ => {
                 self.pos = start;
-                let (body, _oc, _os) = self.parse_sub_body(self.current, self.slots)?;
+                let width = self.slots;
+                let (body, _oc, _os) =
+                    self.parse_sub_body_seeded(Plan::Row, self.current, width + 1)?;
                 Expr::Exists {
                     body: Box::new(body),
-                    outer_width: self.slots,
+                    outer_width: width,
                 }
             }
         };
