@@ -9060,12 +9060,23 @@ fn run_varlen<S: VarlenEmit>(
 struct StreamPropEmit<'a> {
     out: String,
     first: bool,
-    store: &'a Store,
-    key: &'a str,
+    // The property COLUMN, resolved once — a typed cell read per endpoint (no per-row
+    // HashMap-by-key `store.prop`, which made the stream 1.3-1.6x slower than the
+    // vectorized materialized read at medium sizes). `None` = the key has no column.
+    col: Option<&'a Column>,
     // `values(k)` inserts a `PropertyExists{k}` filter above the hop: an endpoint MISSING
     // the property is dropped, not emitted as null. Mirror that skip when set.
     require_present: bool,
     byte_cap: usize,
+}
+
+impl StreamPropEmit<'_> {
+    fn sep(&mut self) {
+        if !self.first {
+            self.out.push(',');
+        }
+        self.first = false;
+    }
 }
 
 impl VarlenEmit for StreamPropEmit<'_> {
@@ -9073,15 +9084,31 @@ impl VarlenEmit for StreamPropEmit<'_> {
         if self.out.len() > self.byte_cap {
             return; // over the cap — stop appending (should_stop halts descent)
         }
-        let endpoint = *node_stack.last().expect("a path always has an endpoint");
-        if self.require_present && !self.store.has_prop(endpoint, self.key) {
-            return; // filtered out by the PropertyExists guard — emit nothing
+        let i = *node_stack.last().expect("a path always has an endpoint") as usize;
+        let present = self.col.is_some_and(|c| c.present_at(i));
+        if !present {
+            if self.require_present {
+                return; // dropped by the PropertyExists guard
+            }
+            self.sep();
+            self.out.push_str("null");
+            return;
         }
-        if !self.first {
-            self.out.push(',');
+        self.sep();
+        // Typed cell write — byte-identical to `read_property(endpoint) -> write_value`.
+        match self.col.expect("present implies a column") {
+            Column::Str { data, .. } => crate::json::write_string(&mut self.out, &data[i]),
+            Column::Dict { dict, codes, .. } => {
+                crate::json::write_string(&mut self.out, &dict[codes[i] as usize]);
+            }
+            Column::Num { data, .. } => {
+                crate::json::write_value(&mut self.out, &Value::Num(data[i]));
+            }
+            Column::Bool { data, .. } => {
+                self.out.push_str(if data[i] { "true" } else { "false" });
+            }
+            other => crate::json::write_value(&mut self.out, &other.read(i)), // Temporal/Gen
         }
-        self.first = false;
-        crate::json::write_value(&mut self.out, &self.store.prop(endpoint, self.key));
     }
     fn should_stop(&self) -> bool {
         self.out.len() > self.byte_cap
@@ -9146,8 +9173,7 @@ fn try_stream_varlen_json(plan: &Plan, store: &Store) -> Option<Result<String, S
     let mut sink = StreamPropEmit {
         out: String::from("["),
         first: true,
-        store,
-        key,
+        col: store.column(key),
         require_present,
         byte_cap: BYTE_CAP,
     };
