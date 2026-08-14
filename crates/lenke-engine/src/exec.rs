@@ -3660,6 +3660,31 @@ fn order_page(
 /// then each aggregate is a single streaming pass over that labelling — so an
 /// aggregate never materializes its group's rows, and `count(*)` is a tally, not
 /// a bucketed list of row indices.
+/// First-seen grouping for a SINGLE node-PROPERTY key over a materialized batch, via the
+/// typed [`frontier_group_by`] (Str/Num/Bool/Dict read off storage) — the general-batch
+/// analogue of [`try_dict_grouping`]. Unlike the chain-only `try_frontier_group_fold`, it
+/// works on whatever batch the aggregate already pulled (a join, a filtered frontier), so a
+/// grouped aggregate over ANY shape skips the `Col::Str` + byte-key `assign_groups` pays.
+/// `None` unless the sole key is `Prop{slot, <plain col>}` over a `Col::Nodes` slot backed
+/// by a Str/Num/Bool/Dict column.
+fn try_node_prop_grouping(
+    keys: &[(String, Expr)],
+    store: &Store,
+    batch: &Batch,
+) -> Option<(Vec<u32>, Col, usize)> {
+    let [(_, Expr::Prop { slot, key })] = keys else {
+        return None;
+    };
+    if key.contains('.') {
+        return None;
+    }
+    let Col::Nodes(frontier) = batch.slot(*slot) else {
+        return None;
+    };
+    let (group_of, key_out, n_groups) = frontier_group_by(store, key, frontier)?;
+    Some((group_of, Col::Gen(key_out), n_groups))
+}
+
 fn aggregate(
     batch: &Batch,
     store: &Store,
@@ -3680,6 +3705,12 @@ fn aggregate(
     {
         let ng = fr.len();
         (g, fr, ng, vec![kc])
+    } else if let Some((g, kc, ng)) = try_node_prop_grouping(keys, store, batch) {
+        // A single node PROPERTY key (Str/Num/Bool) grouped with the TYPED set read straight
+        // off storage — no full `Col::Str` of `Arc` clones + byte key that eval + assign_
+        // groups would build. Works on ANY materialized batch (a join, a filtered frontier,
+        // a chain), so a grouped aggregate over a comma-join takes it too. Byte-identical.
+        (g, Vec::new(), ng, vec![kc])
     } else if keys.is_empty() {
         (vec![0u32; n], Vec::new(), 1, Vec::new())
     } else {
@@ -3693,6 +3724,26 @@ fn aggregate(
     let mut slots: Vec<Col> = key_out;
 
     for agg in aggs {
+        // Raw min/max over a NUMERIC node-property arg: fold the `f64` off the column with
+        // `cmp_num_total`, skipping the `Col::Num` eval and the per-cell `Value` boxing
+        // `fold_grouped` pays. Byte-identical (same total order, null skip, all-null → NULL).
+        if matches!(agg.func, AggFn::Min | AggFn::Max) {
+            if let Some(Expr::Prop { slot, key }) = &agg.arg {
+                if let (Col::Nodes(frontier), Some(Column::Num { data, present })) =
+                    (batch.slot(*slot), store.column(key))
+                {
+                    slots.push(Col::Gen(fold_num_minmax(
+                        frontier,
+                        &group_of,
+                        n_groups,
+                        data,
+                        present,
+                        agg.func == AggFn::Min,
+                    )));
+                    continue;
+                }
+            }
+        }
         let arg_col = agg
             .arg
             .as_ref()
