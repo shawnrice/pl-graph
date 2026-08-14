@@ -646,6 +646,30 @@ fn main() {
     let estore = Arc::new(engine_fixture(n, deg));
     let mut cgraph = core_fixture(n, deg);
 
+    // Targeted mode: time a fixed list of queries from a file (one per line; a leading
+    // `<...>  ` prefix up to the last "  " is stripped so the loss-dump/cluster lines work
+    // as-is) on the SAME fixture and harness. For attributing a specific optimization.
+    if let Ok(path) = std::env::var("FUZZ_QUERIES") {
+        let text = std::fs::read_to_string(&path).expect("read FUZZ_QUERIES file");
+        println!("targeted: timing queries from {path}\n  {:>7} {:>9} {:>9}  query", "ratio", "eng_ms", "core_ms");
+        for line in text.lines() {
+            let q = line.rsplit("  ").next().unwrap_or(line).trim();
+            if q.is_empty() || !q.to_ascii_uppercase().contains("MATCH") {
+                continue;
+            }
+            let e = time_engine_guarded(&estore, q, REPS, budget);
+            let c = time_core(&mut cgraph, q, REPS);
+            match (e, c) {
+                (Ok((e_ms, er)), Ok((c_ms, cr))) => {
+                    let flag = if er != cr { "  ROWS DIFFER!" } else { "" };
+                    println!("  {:>6.2}x {e_ms:>9.3} {c_ms:>9.3}  {q}{flag}", c_ms / e_ms);
+                }
+                (e, c) => println!("  (skipped: eng={e:?} core={c:?})  {q}"),
+            }
+        }
+        return;
+    }
+
     // 1) Generate and dedup to unique templates (keep the first concrete instance).
     let mut rng = Rng(seed);
     let mut templates: HashMap<String, (String, Vec<&'static str>)> = HashMap::new();
