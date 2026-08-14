@@ -1633,6 +1633,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .or_else(|| try_fused_count(input, keys, aggs, store))
                 .or_else(|| try_node_grouped_count(input, keys, aggs, store))
                 .or_else(|| try_scan_dict_count(input, keys, aggs, store))
+                .or_else(|| try_frontier_dict_count(input, keys, aggs, store, track))
                 .or_else(|| try_scan_group_agg(input, keys, aggs, store))
             {
                 b
@@ -5486,6 +5487,77 @@ fn try_scan_dict_count(
             null_count += 1;
         }
     });
+    let mut key_col: Vec<Value> = Vec::with_capacity(order.len());
+    let mut cnt_col: Vec<Value> = Vec::with_capacity(order.len());
+    for &code in &order {
+        if code < 0 {
+            key_col.push(Value::Null);
+            cnt_col.push(Value::Num(null_count as f64));
+        } else {
+            key_col.push(Value::Str(dict[code as usize].clone()));
+            cnt_col.push(Value::Num(counts[code as usize] as f64));
+        }
+    }
+    Some(Batch::of(vec![Col::Gen(key_col), Col::Gen(cnt_col)]))
+}
+
+/// `count(*) GROUP BY <dict col>` over ANY frontier — a hop, a filter — not just a bare
+/// Scan (which [`try_scan_dict_count`] already streams). Pull the frontier once, then
+/// count per dict CODE, instead of the general group_by decoding each cell to a
+/// `Value::Str` and HASHING it (`group_by_arc`) — the string hash over a big hop frontier
+/// was the whole cost (`inE('R').outV().groupCount().by('city')` at 0.08x). First-seen
+/// group order and null handling (absent OR the u32::MAX optional-match sentinel → the
+/// null group) match the general path exactly.
+fn try_frontier_dict_count(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+    track: bool,
+) -> Option<Batch> {
+    let [(_, Expr::Prop { slot, key })] = keys else {
+        return None;
+    };
+    let [agg] = aggs else {
+        return None;
+    };
+    if agg.func != AggFn::Count || agg.arg.is_some() || agg.distinct {
+        return None;
+    }
+    if matches!(input, Plan::Scan { .. }) {
+        return None; // the bare-scan case streams via try_scan_dict_count
+    }
+    let Some(Column::Dict {
+        dict,
+        codes,
+        present,
+    }) = store.column(key)
+    else {
+        return None;
+    };
+    let batch = pull(input, store, track).ok()?;
+    let Col::Nodes(ids) = batch.slot(*slot) else {
+        return None;
+    };
+    let mut counts = vec![0usize; dict.len()];
+    let mut null_count = 0usize;
+    let mut order: Vec<i32> = Vec::new();
+    let mut seen_null = false;
+    for &id in ids {
+        if id != u32::MAX && present[id as usize] {
+            let c = codes[id as usize] as usize;
+            if counts[c] == 0 {
+                order.push(c as i32);
+            }
+            counts[c] += 1;
+        } else {
+            if !seen_null {
+                seen_null = true;
+                order.push(-1);
+            }
+            null_count += 1;
+        }
+    }
     let mut key_col: Vec<Value> = Vec::with_capacity(order.len());
     let mut cnt_col: Vec<Value> = Vec::with_capacity(order.len());
     for &code in &order {
