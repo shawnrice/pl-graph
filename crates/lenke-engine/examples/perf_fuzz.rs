@@ -701,11 +701,15 @@ fn main() {
         const MARKERS: [&str; 8] = ["->{", "<-{", "SHORTEST", "){", ")*", ")+", "->*", "->+"];
         MARKERS.iter().any(|m| q.contains(m))
     };
+    // Deterministic order so the timed subset is identical across runs and across commits
+    // (HashMap iteration is randomized) — required to diff a baseline vs a change on one seed.
+    let mut ordered: Vec<&(String, Vec<&'static str>)> = templates.values().collect();
+    ordered.sort_by(|a, b| a.0.cmp(&b.0));
     let mut timed = 0usize;
     let mut processed = 0usize;
     let mut recursive_skipped = 0usize;
     let run_start = Instant::now();
-    for (q, tags) in templates.values() {
+    for (q, tags) in ordered {
         if timed >= max_time {
             break;
         }
@@ -864,6 +868,20 @@ fn main() {
         }
         match std::fs::write(&path, out) {
             Ok(()) => eprintln!("wrote losing templates to {path}"),
+            Err(e) => eprintln!("could not write {path}: {e}"),
+        }
+    }
+
+    // Every timed template, keyed by query, for a deterministic baseline-vs-change diff.
+    if let Ok(path) = std::env::var("FUZZ_DUMP_ALL") {
+        let mut rows: Vec<&Timed> = results.iter().collect();
+        rows.sort_by(|a, b| a.query.cmp(&b.query));
+        let mut out = String::new();
+        for r in rows {
+            out.push_str(&format!("{:.3}\t{}\t{}\t{}\n", r.ratio, r.e_ms, r.rows, r.query));
+        }
+        match std::fs::write(&path, out) {
+            Ok(()) => eprintln!("wrote {} timed templates to {path}", results.len()),
             Err(e) => eprintln!("could not write {path}: {e}"),
         }
     }
