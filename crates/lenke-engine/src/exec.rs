@@ -2764,6 +2764,26 @@ fn aggregate(
             .as_ref()
             .map(|e| eval(e, store, batch))
             .transpose()?;
+        // Ungrouped fold (`g.V()…fold()` / GQL `collect(x)`) over a VALUE column: the
+        // whole input is one list, so CONSUME the column and MOVE each cell into it — no
+        // per-element clone the grouped render path pays. Big for a fold of strings
+        // (numbers were already cheap Copy). Elements (Nodes/Edges) still take the render
+        // path — they must build an element map either way, so moving buys nothing there.
+        // Byte-identical: row order and rendering are unchanged.
+        let movable = keys.is_empty()
+            && matches!(agg.func, AggFn::Collect | AggFn::CollectList)
+            && matches!(
+                arg_col,
+                Some(Col::Str(_) | Col::Num(_) | Col::Bool(_) | Col::Gen(_))
+            );
+        if movable {
+            let mut list = col_into_values(arg_col.unwrap(), store);
+            if agg.func == AggFn::CollectList {
+                list.retain(|v| !v.is_null()); // collect_list drops NULLs (Collect keeps)
+            }
+            slots.push(Col::Gen(vec![Value::List(list)]));
+            continue;
+        }
         slots.push(Col::Gen(fold_grouped(
             agg,
             arg_col.as_ref(),
