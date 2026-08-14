@@ -3625,6 +3625,7 @@ fn try_late_materialize(
         .iter()
         .map(|e| eval(e, store, &base))
         .collect::<Result<_, _>>()?;
+    let key_cols = typed_key_cols(key_cols);
     let mut idx: Vec<usize> = (0..n).collect();
     sort_idx(&mut idx, &key_cols, keys, end);
     let sub = base.gather(&idx[start..end]);
@@ -3654,9 +3655,19 @@ fn order_page(
     let mut idx: Vec<usize> = (0..n).collect();
     if !keys.is_empty() {
         let key_cols: Vec<Col> = eval_all(keys.iter().map(|k| &k.expr), store, batch)?;
+        let key_cols = typed_key_cols(key_cols);
         sort_idx(&mut idx, &key_cols, keys, end);
     }
     Ok(batch.gather(&idx[start..end]))
+}
+
+/// Fold a homogeneous computed key column (`Col::Gen`) into a typed one so `sort_idx`'s
+/// raw-f64 / `Arc<str>` arms fire — applied ONLY at a sort, so a plain computed projection
+/// keeps the cheap boxed path and does not pay the fold for nothing.
+fn typed_key_cols(cols: Vec<Col>) -> Vec<Col> {
+    cols.into_iter()
+        .map(|c| if let Col::Gen(v) = c { typed_col_from_values(v) } else { c })
+        .collect()
 }
 
 /// Group `batch` by `keys` and compute `aggs` per group. Output slots are the key
@@ -3668,6 +3679,10 @@ fn order_page(
 /// then each aggregate is a single streaming pass over that labelling — so an
 /// aggregate never materializes its group's rows, and `count(*)` is a tally, not
 /// a bucketed list of row indices.
+/// Frontier size below which the storage-direct fold/group loses to eval-then-fold on a
+/// compact column (the random `store.column[node]` reads only pay off at scale).
+const FRONTIER_FOLD_MIN: usize = 50_000;
+
 /// First-seen grouping for a SINGLE node-PROPERTY key over a materialized batch, via the
 /// typed [`frontier_group_by`] (Str/Num/Bool/Dict read off storage) — the general-batch
 /// analogue of [`try_dict_grouping`]. Unlike the chain-only `try_frontier_group_fold`, it
@@ -3680,6 +3695,12 @@ fn try_node_prop_grouping(
     store: &Store,
     batch: &Batch,
 ) -> Option<(Vec<u32>, Col, usize)> {
+    // Only worth it on a LARGE frontier, where skipping the key `Col` materialization pays.
+    // On a small/filtered batch the random `store.column[node]` reads lose to eval'ing a
+    // compact key column then grouping it (measured: filtered grouped-aggs regressed).
+    if batch.rows() < FRONTIER_FOLD_MIN {
+        return None;
+    }
     let [(_, Expr::Prop { slot, key })] = keys else {
         return None;
     };
@@ -3735,7 +3756,9 @@ fn aggregate(
         // Raw min/max over a NUMERIC node-property arg: fold the `f64` off the column with
         // `cmp_num_total`, skipping the `Col::Num` eval and the per-cell `Value` boxing
         // `fold_grouped` pays. Byte-identical (same total order, null skip, all-null → NULL).
-        if matches!(agg.func, AggFn::Min | AggFn::Max) {
+        // Only on a large frontier — on a small/filtered batch the random reads lose to
+        // eval-then-fold on the compact column.
+        if matches!(agg.func, AggFn::Min | AggFn::Max) && n >= FRONTIER_FOLD_MIN {
             if let Some(Expr::Prop { slot, key }) = &agg.arg {
                 if let (Col::Nodes(frontier), Some(Column::Num { data, present })) =
                     (batch.slot(*slot), store.column(key))
@@ -5951,7 +5974,7 @@ fn try_eval_dict_scalar(expr: &Expr, store: &Store, batch: &Batch) -> Option<Col
         per_code.push(ev(&Value::Str(dv.clone()))?);
     }
     let null_val = ev(&Value::Null)?;
-    Some(typed_col_from_values(
+    Some(Col::Gen(
         ids.iter()
             .map(|&id| {
                 if id != u32::MAX && present[id as usize] {
@@ -11693,10 +11716,10 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 buf.extend(cols.iter().map(|c| c.value_at(i)));
                 out.push(call_scalar_checked(name, &buf)?);
             }
-            // A homogeneous non-null result (e.g. upper()/lower()/substring() -> all Str)
-            // becomes a typed column so a downstream sort/DISTINCT/GROUP BY skips per-cell
-            // boxing; mixed/nullable stays Gen.
-            typed_col_from_values(out)
+            // Stays boxed here — a plain computed projection must not pay the typed-fold
+            // cost for no benefit (measured: RETURN trim()/substring() regressed). The SORT
+            // path converts a homogeneous key column to typed on demand (see order_page).
+            Col::Gen(out)
         }
         Expr::List { items } => {
             // Per row, build a Value::List of each element's value. A VERTEX/EDGE element
