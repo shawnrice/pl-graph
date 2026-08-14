@@ -427,6 +427,7 @@ fn time_engine_guarded(
     reps: usize,
     budget: Duration,
     opt: bool,
+    materialize: bool,
 ) -> Result<(f64, usize), String> {
     let plan = lenke_engine::gremlin::parse(q).map_err(|e| format!("parse: {e}"))?;
     let plan = if opt {
@@ -442,12 +443,21 @@ fn time_engine_guarded(
         let mut rows = 0;
         for _ in 0..reps {
             let t = Instant::now();
-            let out =
-                std::panic::catch_unwind(AssertUnwindSafe(|| lenke_engine::exec::run(&p, &s)));
+            // Serialize to JSON inside the timed region when `materialize` — the SAME
+            // work core is charged (results_to_json), so string/element shapes are a fair
+            // fight (the shipped lnk_e_gremlin_json path serializes too).
+            let out = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let r = lenke_engine::exec::run(&p, &s);
+                let n = r.rows.len();
+                if materialize {
+                    std::hint::black_box(lenke_engine::json::gremlin_results_json(&r));
+                }
+                n
+            }));
             match out {
-                Ok(o) => {
+                Ok(n) => {
                     best = best.min(t.elapsed().as_secs_f64() * 1e3);
-                    rows = o.rows.len();
+                    rows = n;
                 }
                 Err(_) => {
                     let _ = tx.send(Err("engine panic".to_string()));
@@ -521,7 +531,9 @@ fn main() {
         .unwrap_or(0xC0FFEE);
     let max_time = env_u32("FUZZ_MAX_TEMPLATES", 2000) as usize;
     let budget = Duration::from_millis(u64::from(env_u32("FUZZ_BUDGET_MS", 1500)));
-    let opt = env_u32("GREMLIN_OPT", 0) != 0;
+    // Optimize by default — the shipped lnk_e_gremlin_json path runs optimize_indexed,
+    // so a fair comparison does too (on an unindexed fixture it is near-free anyway).
+    let opt = env_u32("GREMLIN_OPT", 1) != 0;
     // Materialize core's result (render to output) so element-returning shapes compare
     // the SAME work the engine's run() already does. Set MATERIALIZE=0 to measure core's
     // lazy try_run instead (engine looks worse on fold/valueMap/path — an artifact).
@@ -560,7 +572,7 @@ fn main() {
         if timed >= max_time {
             break;
         }
-        let e = match time_engine_guarded(&estore, q, REPS, budget, opt) {
+        let e = match time_engine_guarded(&estore, q, REPS, budget, opt, materialize) {
             Ok(v) => v,
             Err(why) if why == "TIMEOUT" => {
                 timeouts.push(q.clone());
