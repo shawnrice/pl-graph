@@ -208,16 +208,7 @@ fn col_into_values(col: Col, store: &Store) -> Vec<Value> {
         Col::Num(data) => data.into_iter().map(Value::Num).collect(),
         Col::Bool(data) => data.into_iter().map(Value::Bool).collect(),
         Col::Gen(data) => data,
-        Col::Nodes(ids) => ids
-            .into_iter()
-            .map(|id| {
-                if id == u32::MAX {
-                    Value::Null
-                } else {
-                    node_result_value(store, id)
-                }
-            })
-            .collect(),
+        Col::Nodes(ids) => render_nodes(store, &ids),
         Col::Edges(eids) => eids
             .into_iter()
             .map(|e| {
@@ -256,12 +247,8 @@ fn render_col_into(col: Col, store: &Store, out: &mut [Value], c: usize, ncols: 
             }
         }
         Col::Nodes(ids) => {
-            for (i, id) in ids.into_iter().enumerate() {
-                out[i * ncols + c] = if id == u32::MAX {
-                    Value::Null
-                } else {
-                    node_result_value(store, id)
-                };
+            for (i, v) in render_nodes(store, &ids).into_iter().enumerate() {
+                out[i * ncols + c] = v;
             }
         }
         Col::Edges(eids) => {
@@ -851,6 +838,48 @@ fn render_gpath_elem(store: &Store, id: u32, is_edge: bool, by: &crate::ir::GPat
             }
         }
     }
+}
+
+/// Render MANY nodes to their result maps, resolving the property columns ONCE for the
+/// whole batch instead of two HashMap-by-key lookups per node per key (what calling
+/// [`node_result_value`] per node costs). Byte-identical to per-node rendering: the
+/// property map keeps `prop_keys` (sorted) order, filtered to present, and labels stay
+/// sorted. The big win for element-materializing shapes — `fold()`, `path`, `valueMap`,
+/// `elementMap`, and a bare `g.V()` frontier — where the per-node column re-resolution
+/// dominated.
+fn render_nodes(store: &Store, ids: &[u32]) -> Vec<Value> {
+    use crate::store::Column;
+    use std::sync::Arc;
+    let keys = store.prop_keys_arc();
+    let cols: Vec<(&Arc<str>, &Column)> = keys
+        .iter()
+        .filter_map(|k| store.column(k).map(|c| (k, c)))
+        .collect();
+    ids.iter()
+        .map(|&id| {
+            if id == u32::MAX {
+                return Value::Null;
+            }
+            let i = id as usize;
+            let ext = store
+                .node_ext_id(id)
+                .unwrap_or_else(|| Arc::from(id.to_string()));
+            let mut labels = store.labels_of(id);
+            labels.sort_unstable();
+            let labels_list =
+                Value::List(labels.into_iter().map(|l| Value::Str(l.into())).collect());
+            let props: Vec<(Value, Value)> = cols
+                .iter()
+                .filter(|(_, c)| c.present_at(i))
+                .map(|(k, c)| (Value::Str(Arc::clone(k)), c.read(i)))
+                .collect();
+            Value::Map(Arc::new(vec![
+                (Value::Str("id".into()), Value::Str(ext)),
+                (Value::Str("labels".into()), labels_list),
+                (Value::Str("properties".into()), Value::Map(Arc::new(props))),
+            ]))
+        })
+        .collect()
 }
 
 /// The canonical result map for a node — `{id, labels(sorted), properties(sorted by
@@ -2774,7 +2803,7 @@ fn aggregate(
             && matches!(agg.func, AggFn::Collect | AggFn::CollectList)
             && matches!(
                 arg_col,
-                Some(Col::Str(_) | Col::Num(_) | Col::Bool(_) | Col::Gen(_))
+                Some(Col::Str(_) | Col::Num(_) | Col::Bool(_) | Col::Gen(_) | Col::Nodes(_))
             );
         if movable {
             let mut list = col_into_values(arg_col.unwrap(), store);
