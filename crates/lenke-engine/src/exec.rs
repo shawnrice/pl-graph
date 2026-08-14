@@ -1742,6 +1742,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .or_else(|| try_filtered_scan_num_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_multi_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_distinct_count(input, keys, aggs, store))
+                .or_else(|| try_frontier_distinct_count(input, keys, aggs, store))
                 .or_else(|| try_3hop_product_count(input, keys, aggs, store))
                 .or_else(|| try_fused_count(input, keys, aggs, store))
                 .or_else(|| try_node_grouped_count(input, keys, aggs, store))
@@ -5568,6 +5569,36 @@ fn dict_pred_value(pred: &Expr, slot: usize, key: &str, v: &Value, store: &Store
 /// string allocations instead of one per row (the result `Value`s, including `Arc<str>`,
 /// are cloned per row = a refcount bump, not a new allocation). Byte-identical: the value
 /// is a function of the property alone (absent → the NULL case, computed once).
+/// Fold the boxed `Vec<Value>` a scalar function produced into a TYPED column when every
+/// cell is the same non-null primitive (`Num`/`Str`/`Bool`). A downstream sort, DISTINCT or
+/// GROUP BY on the computed value then takes the typed fast path (raw f64 / `Arc<str>`
+/// compare, dict-code dedup) instead of boxing every cell per comparison. A single null or a
+/// mixed type keeps it `Gen`; either way `value_at(i)` is byte-identical for every row, so
+/// this is purely an internal representation choice — never an observable one.
+fn typed_col_from_values(out: Vec<Value>) -> Col {
+    let Some(first) = out.first() else {
+        return Col::Gen(out);
+    };
+    match first {
+        Value::Num(_) if out.iter().all(|v| matches!(v, Value::Num(_))) => Col::Num(
+            out.iter()
+                .map(|v| if let Value::Num(x) = v { *x } else { unreachable!() })
+                .collect(),
+        ),
+        Value::Str(_) if out.iter().all(|v| matches!(v, Value::Str(_))) => Col::Str(
+            out.into_iter()
+                .map(|v| if let Value::Str(s) = v { s } else { unreachable!() })
+                .collect(),
+        ),
+        Value::Bool(_) if out.iter().all(|v| matches!(v, Value::Bool(_))) => Col::Bool(
+            out.iter()
+                .map(|v| if let Value::Bool(b) = v { *b } else { unreachable!() })
+                .collect(),
+        ),
+        _ => Col::Gen(out),
+    }
+}
+
 fn try_eval_dict_scalar(expr: &Expr, store: &Store, batch: &Batch) -> Option<Col> {
     let (slot, key) = sole_prop_ref(expr)?;
     let Col::Nodes(ids) = batch.slot(slot) else {
@@ -5590,7 +5621,7 @@ fn try_eval_dict_scalar(expr: &Expr, store: &Store, batch: &Batch) -> Option<Col
         per_code.push(ev(&Value::Str(dv.clone()))?);
     }
     let null_val = ev(&Value::Null)?;
-    Some(Col::Gen(
+    Some(typed_col_from_values(
         ids.iter()
             .map(|&id| {
                 if id != u32::MAX && present[id as usize] {
@@ -7454,6 +7485,82 @@ fn try_scan_distinct_count(
         Column::Bool { data, present } => {
             let mut seen = [false; 2];
             scan_visit(store, label, |i| {
+                if present[i] {
+                    seen[usize::from(data[i])] = true;
+                }
+            });
+            usize::from(seen[0]) + usize::from(seen[1])
+        }
+        _ => return None, // Temporal / Gen → the general aggregate
+    };
+    Some(scalar_num(count as f64))
+}
+
+/// The frontier sibling of [`try_scan_distinct_count`]: `count(DISTINCT <frontier prop>)`
+/// over a hop chain, deduped over the DISTINCT reached endpoints (`frontier_counts`) rather
+/// than materializing the exploded path multiset and byte-keying every row through the
+/// general grouped fold. Path multiplicity is irrelevant to DISTINCT, so visiting each
+/// endpoint once yields the identical value set — byte-identical count, far less work.
+fn try_frontier_distinct_count(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.func != AggFn::Count || !agg.distinct {
+        return None;
+    }
+    let Some(Expr::Prop { slot, key }) = agg.arg.as_ref() else {
+        return None;
+    };
+    let width = chain_width(input)?;
+    if *slot != width - 1 {
+        return None; // arg must be a property of the chain frontier
+    }
+    let counts = frontier_counts(input, store)?;
+    let count = match store.column(key)? {
+        Column::Str { data, present } => {
+            let mut seen: FnvSet<&str> = FnvSet::default();
+            counts.for_each(|v, _| {
+                let i = v as usize;
+                if present[i] {
+                    seen.insert(data[i].as_ref());
+                }
+            });
+            seen.len()
+        }
+        Column::Dict {
+            dict,
+            codes,
+            present,
+        } => {
+            let mut seen = vec![false; dict.len()];
+            counts.for_each(|v, _| {
+                let i = v as usize;
+                if present[i] {
+                    seen[codes[i] as usize] = true;
+                }
+            });
+            seen.iter().filter(|&&b| b).count()
+        }
+        Column::Num { data, present } => {
+            let mut seen: FnvSet<u64> = FnvSet::default();
+            counts.for_each(|v, _| {
+                let i = v as usize;
+                if present[i] {
+                    seen.insert(value::num_group_bits(data[i]));
+                }
+            });
+            seen.len()
+        }
+        Column::Bool { data, present } => {
+            let mut seen = [false; 2];
+            counts.for_each(|v, _| {
+                let i = v as usize;
                 if present[i] {
                     seen[usize::from(data[i])] = true;
                 }
@@ -11256,7 +11363,10 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 buf.extend(cols.iter().map(|c| c.value_at(i)));
                 out.push(call_scalar_checked(name, &buf)?);
             }
-            Col::Gen(out)
+            // A homogeneous non-null result (e.g. upper()/lower()/substring() -> all Str)
+            // becomes a typed column so a downstream sort/DISTINCT/GROUP BY skips per-cell
+            // boxing; mixed/nullable stays Gen.
+            typed_col_from_values(out)
         }
         Expr::List { items } => {
             // Per row, build a Value::List of each element's value. A VERTEX/EDGE element
