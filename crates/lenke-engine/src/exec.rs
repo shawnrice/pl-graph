@@ -1971,6 +1971,9 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // each endpoint node off storage (dict codes), never building the exploded
             // frontier's property columns. Lineage-free (DISTINCT collapses paths).
             if !track {
+                if let Some(b) = try_distinct_frontier_prop(input, store) {
+                    return Ok(b);
+                }
                 if let Some(b) = try_distinct_frontier_multi(input, store) {
                     return Ok(b);
                 }
@@ -4996,6 +4999,22 @@ fn chain_width(plan: &Plan) -> Option<usize> {
             input,
             pred: Expr::IsLabeled { .. },
         } => chain_width(input),
+        _ => None,
+    }
+}
+
+/// Slot count of a Scan/Expand chain, seeing through ANY row-filter — safe ONLY for an
+/// executor that PULLS the chain (the pull applies every filter, so the frontier is already
+/// filtered). The count-fold paths must NOT use this (they re-walk and re-check the filter
+/// themselves, so they stay on the IsLabeled-only `chain_width`); the DISTINCT frontier
+/// paths, which pull, can.
+fn chain_pull_width(plan: &Plan) -> Option<usize> {
+    match plan {
+        Plan::Scan { .. } | Plan::IndexSeek { .. } | Plan::RangeSeek { .. } => Some(1),
+        Plan::Expand {
+            input, bind_edge, ..
+        } => Some(chain_pull_width(input)? + if *bind_edge { 2 } else { 1 }),
+        Plan::Filter { input, .. } => chain_pull_width(input),
         _ => None,
     }
 }
@@ -13336,6 +13355,108 @@ fn try_distinct_scan_multi(input: &Plan, store: &Store) -> Option<Batch> {
     Some(Batch::of(outs.into_iter().map(Col::Gen).collect()))
 }
 
+/// The frontier sibling of [`try_distinct_scan_prop`]: single-column `RETURN DISTINCT b.k`
+/// where `b` is a HOP-CHAIN endpoint. Pull the chain (cheap `Col::Nodes`, no property
+/// column), then dedup the endpoint's values off storage with a TYPED set — `FnvSet<&str>`
+/// for Str, a per-code bitset for Dict, `FnvSet<u64>` (group bits) for Num — instead of the
+/// composite byte-key. This is the single-column case the multi-column
+/// [`try_distinct_frontier_multi`] deliberately bails on (a raw Str/Num loses to the typed
+/// set there). Absence is one `Null` row (first-seen); DISTINCT order is set-compared.
+fn try_distinct_frontier_prop(input: &Plan, store: &Store) -> Option<Batch> {
+    let Plan::Project { input: chain, items } = input else {
+        return None;
+    };
+    let [(_, Expr::Prop { slot, key })] = items.as_slice() else {
+        return None;
+    };
+    if key.contains('.') {
+        return None;
+    }
+    let endpoint = chain_pull_width(chain)?.checked_sub(1)?;
+    if *slot != endpoint {
+        return None;
+    }
+    let col = store.column(key)?;
+    if !matches!(
+        col,
+        Column::Str { .. } | Column::Dict { .. } | Column::Num { .. } | Column::Bool { .. }
+    ) {
+        return None; // Temporal / Gen → the general path
+    }
+    let batch = pull(chain, store, false).ok()?;
+    let Col::Nodes(frontier) = batch.slot(endpoint) else {
+        return None;
+    };
+    let mut out: Vec<Value> = Vec::new();
+    let mut saw_null = false;
+    let mut null_once = |out: &mut Vec<Value>, saw: &mut bool| {
+        if !*saw {
+            *saw = true;
+            out.push(Value::Null);
+        }
+    };
+    match col {
+        Column::Str { data, present } => {
+            let mut seen: FnvSet<&str> = FnvSet::default();
+            for &node in frontier {
+                if node != u32::MAX && present[node as usize] {
+                    let i = node as usize;
+                    if seen.insert(data[i].as_ref()) {
+                        out.push(Value::Str(data[i].clone()));
+                    }
+                } else {
+                    null_once(&mut out, &mut saw_null);
+                }
+            }
+        }
+        Column::Dict {
+            dict,
+            codes,
+            present,
+        } => {
+            let mut seen = vec![false; dict.len()];
+            for &node in frontier {
+                if node != u32::MAX && present[node as usize] {
+                    let c = codes[node as usize] as usize;
+                    if !std::mem::replace(&mut seen[c], true) {
+                        out.push(Value::Str(dict[c].clone()));
+                    }
+                } else {
+                    null_once(&mut out, &mut saw_null);
+                }
+            }
+        }
+        Column::Num { data, present } => {
+            let mut seen: FnvSet<u64> = FnvSet::default();
+            for &node in frontier {
+                if node != u32::MAX && present[node as usize] {
+                    let i = node as usize;
+                    if seen.insert(value::num_group_bits(data[i])) {
+                        out.push(Value::Num(data[i]));
+                    }
+                } else {
+                    null_once(&mut out, &mut saw_null);
+                }
+            }
+        }
+        Column::Bool { data, present } => {
+            let mut seen = [false; 2];
+            for &node in frontier {
+                if node != u32::MAX && present[node as usize] {
+                    let b = usize::from(data[node as usize]);
+                    if !std::mem::replace(&mut seen[b], true) {
+                        out.push(Value::Bool(data[node as usize]));
+                    }
+                } else {
+                    null_once(&mut out, &mut saw_null);
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(Batch::single(Col::Gen(out)))
+}
+
 /// The frontier sibling of [`try_distinct_scan_multi`]: `RETURN DISTINCT b.a, b.b, …`
 /// where `b` is a HOP-CHAIN endpoint. Pull the chain (cheap `Col::Nodes` columns — the
 /// traversal is unavoidable, but NO per-hop property column is built), then key each
@@ -13353,7 +13474,7 @@ fn try_distinct_frontier_multi(input: &Plan, store: &Store) -> Option<Batch> {
     if items.is_empty() {
         return None;
     }
-    let endpoint = chain_width(chain)?.checked_sub(1)?;
+    let endpoint = chain_pull_width(chain)?.checked_sub(1)?;
     let mut readers: Vec<ColKeyer> = Vec::with_capacity(items.len());
     for (_, e) in items {
         let Expr::Prop { slot, key } = e else {
