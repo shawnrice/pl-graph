@@ -1751,6 +1751,8 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .or_else(|| try_scan_group_agg(input, keys, aggs, store))
             {
                 b
+            } else if let Some(b) = try_frontier_group_fold(input, keys, aggs, store) {
+                b
             } else if let Some(b) = try_frontier_aggregate(input, keys, aggs, store)? {
                 b
             } else {
@@ -3720,6 +3722,170 @@ fn aggregate(
     }
 
     Ok(Batch::of(slots))
+}
+
+/// Group a node frontier by ONE of its properties, in first-seen order, reading the key
+/// straight off storage with a TYPED set — `FnvMap<&str>` for Str (no `Arc` clone, no
+/// `Col::Str` materialization), a per-code `Vec` for Dict, `FnvMap<u64>` group-bits for Num,
+/// a 2-slot table for Bool. Returns `(group_of, key_out, n_groups)`, byte-identical to
+/// `assign_groups`/`try_dict_grouping` over the same key (a value and its code/hash share a
+/// first occurrence, absence is one Null group). This is the expensive half of a grouped
+/// aggregate over a big frontier — the general path pays a full `Col::Str` of `Arc` clones
+/// plus a byte key here; this pays neither.
+fn frontier_group_by(
+    store: &Store,
+    key: &str,
+    frontier: &[u32],
+) -> Option<(Vec<u32>, Vec<Value>, usize)> {
+    let col = store.column(key)?;
+    let mut group_of: Vec<u32> = Vec::with_capacity(frontier.len());
+    let mut key_out: Vec<Value> = Vec::new();
+    let mut null_group: Option<u32> = None;
+    macro_rules! null_g {
+        () => {{
+            *null_group.get_or_insert_with(|| {
+                let g = key_out.len() as u32;
+                key_out.push(Value::Null);
+                g
+            })
+        }};
+    }
+    match col {
+        Column::Str { data, present } => {
+            let mut seen: FnvMap<&str, u32> = FnvMap::default();
+            for &node in frontier {
+                let g = if node != u32::MAX && present[node as usize] {
+                    let s = data[node as usize].as_ref();
+                    if let Some(&g) = seen.get(s) {
+                        g
+                    } else {
+                        let g = key_out.len() as u32;
+                        seen.insert(s, g);
+                        key_out.push(Value::Str(data[node as usize].clone()));
+                        g
+                    }
+                } else {
+                    null_g!()
+                };
+                group_of.push(g);
+            }
+        }
+        Column::Dict {
+            dict,
+            codes,
+            present,
+        } => {
+            let mut code_to_group: Vec<u32> = vec![u32::MAX; dict.len()];
+            for &node in frontier {
+                let g = if node != u32::MAX && present[node as usize] {
+                    let c = codes[node as usize] as usize;
+                    if code_to_group[c] == u32::MAX {
+                        code_to_group[c] = key_out.len() as u32;
+                        key_out.push(Value::Str(dict[c].clone()));
+                    }
+                    code_to_group[c]
+                } else {
+                    null_g!()
+                };
+                group_of.push(g);
+            }
+        }
+        Column::Num { data, present } => {
+            let mut seen: FnvMap<u64, u32> = FnvMap::default();
+            for &node in frontier {
+                let g = if node != u32::MAX && present[node as usize] {
+                    let bits = value::num_group_bits(data[node as usize]);
+                    if let Some(&g) = seen.get(&bits) {
+                        g
+                    } else {
+                        let g = key_out.len() as u32;
+                        seen.insert(bits, g);
+                        key_out.push(Value::Num(data[node as usize]));
+                        g
+                    }
+                } else {
+                    null_g!()
+                };
+                group_of.push(g);
+            }
+        }
+        Column::Bool { data, present } => {
+            let mut slot: [Option<u32>; 2] = [None, None];
+            for &node in frontier {
+                let g = if node != u32::MAX && present[node as usize] {
+                    let b = usize::from(data[node as usize]);
+                    *slot[b].get_or_insert_with(|| {
+                        let g = key_out.len() as u32;
+                        key_out.push(Value::Bool(data[node as usize]));
+                        g
+                    })
+                } else {
+                    null_g!()
+                };
+                group_of.push(g);
+            }
+        }
+        _ => return None, // Temporal / Gen → the general path
+    }
+    let n = key_out.len();
+    Some((group_of, key_out, n))
+}
+
+/// Fused grouped aggregate over a large hop-chain frontier: build `group_of` with the typed
+/// [`frontier_group_by`] (skipping the full key `Col::Str` + byte key the general
+/// [`aggregate`] pays) and reuse [`fold_grouped`] for the aggregates — byte-identical, but
+/// without materializing the exploded frontier's KEY column. Wins exactly the case the
+/// diagnostics isolated: a high-cardinality string group key over a multi-hop frontier.
+/// `None` unless the key and every agg arg are plain properties of the chain frontier.
+fn try_frontier_group_fold(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    let [(_, Expr::Prop { slot: kslot, key: kkey })] = keys else {
+        return None;
+    };
+    if kkey.contains('.') {
+        return None;
+    }
+    let width = chain_width(input)?;
+    if *kslot != width - 1 {
+        return None;
+    }
+    // Every agg arg must be a plain frontier property (or none, for count(*)) — so it reads
+    // off the single-slot frontier batch after a slot remap. Any richer arg → general path.
+    for a in aggs {
+        match &a.arg {
+            None => {}
+            Some(Expr::Prop { slot, key }) if *slot == width - 1 && !key.contains('.') => {}
+            _ => return None,
+        }
+    }
+    let frontier = frontier_ids(input, store)?;
+    // Only worth skipping the key-column materialization once the frontier is large.
+    const FUSED_GROUP_ROWS: usize = 100_000;
+    if frontier.len() < FUSED_GROUP_ROWS {
+        return None;
+    }
+    let (group_of, key_out, n_groups) = frontier_group_by(store, kkey, &frontier)?;
+    let fb = Batch::single(Col::Nodes(frontier));
+    let mut slots: Vec<Col> = vec![Col::Gen(key_out)];
+    for agg in aggs {
+        // The arg references the frontier's endpoint slot; the frontier sits at slot 0 of
+        // `fb`, so remap the property read to slot 0. count(*) has no arg.
+        let arg_col = match &agg.arg {
+            None => None,
+            Some(Expr::Prop { key, .. }) => {
+                Some(eval(&Expr::Prop { slot: 0, key: key.clone() }, store, &fb).ok()?)
+            }
+            _ => return None,
+        };
+        slots.push(Col::Gen(
+            fold_grouped(agg, arg_col.as_ref(), &group_of, n_groups, store).ok()?,
+        ));
+    }
+    Some(Batch::of(slots))
 }
 
 /// First-seen grouping for a SINGLE dict-column key, by code — avoiding the per-row dict
