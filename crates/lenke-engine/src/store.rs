@@ -281,7 +281,9 @@ impl Column {
         Self::Gen { data, present }
     }
 
-    fn present_at(&self, i: usize) -> bool {
+    /// Whether node `i` has a present (non-NULL) value in this column.
+    #[must_use]
+    pub fn present_at(&self, i: usize) -> bool {
         match self {
             Self::Num { present, .. }
             | Self::Str { present, .. }

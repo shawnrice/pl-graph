@@ -11110,6 +11110,46 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
     if let Some(keep) = try_num_disjunction(pred, store, batch) {
         return Some(keep);
     }
+    // A general MIXED conjunction: keep rows satisfying BOTH conjuncts by intersecting
+    // each one's fast-path keep-set (both built in ascending row order, so a linear
+    // merge). This is what generalizes `try_num_conjunction` (all-numeric) to the shape
+    // a projection creates — `values(k)` / `valueMap` AND-s a `PropertyExists{k}` onto
+    // the user's selective filter, and `And(PropertyExists, age = 90)` used to knock the
+    // WHOLE filter off the raw path onto the boxed general eval over the full scan (the
+    // selective-filter-then-projection cliff). Only fires when EVERY conjunct is itself
+    // fast-pathable; otherwise `None` → the general path (no worse than before).
+    if let Expr::And(a, b) = pred {
+        // Evaluate the likely-more-SELECTIVE conjunct first, then test the other only on
+        // its survivors — so a selective `age = 90` (100 of 100k) makes the second pass
+        // 100 rows, not another 100k. A bare `PropertyExists` is a presence gate that
+        // rarely reduces, so it goes LAST. Reduces the two-full-pass intersection to one
+        // selective pass + a tiny follow-up.
+        let a_gate = matches!(a.as_ref(), Expr::PropertyExists { .. });
+        let b_gate = matches!(b.as_ref(), Expr::PropertyExists { .. });
+        let (first, second) = if a_gate && !b_gate { (b, a) } else { (a, b) };
+        let kf = try_filter_keep(first, store, batch)?;
+        let sub = batch.gather(&kf);
+        let ks = try_filter_keep(second, store, &sub)?;
+        return Some(ks.iter().map(|&j| kf[j]).collect());
+    }
+    // `PropertyExists{k}` (the presence gate `values(k)` / element maps add): keep rows
+    // whose column `k` is present — a raw `present[]` pass, no boxing. An
+    // absent-everywhere column keeps nothing.
+    if let Expr::PropertyExists { slot, key } = pred {
+        let Col::Nodes(ids) = batch.slot(*slot) else {
+            return None;
+        };
+        let Some(column) = store.column(key) else {
+            return Some(Vec::new());
+        };
+        return Some(
+            ids.iter()
+                .enumerate()
+                .filter(|&(_, &id)| column.present_at(id as usize))
+                .map(|(row, _)| row)
+                .collect(),
+        );
+    }
     // A string-search predicate `col STARTS WITH / ENDS WITH / CONTAINS lit` (which
     // desugars to a `starts_with`/`ends_with`/`contains` call) over a raw Str/Dict
     // column — scan `&str` directly, no per-cell `Value` boxing through

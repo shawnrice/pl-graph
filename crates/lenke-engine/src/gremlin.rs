@@ -5745,6 +5745,50 @@ mod tests {
         run(&plan, store)
     }
 
+    /// A MIXED conjunction filter — the shape a projection creates (`values(k)` AND-s a
+    /// `PropertyExists{k}` onto the user's `has(...)`) — must keep EXACTLY the rows
+    /// satisfying every conjunct, whichever order the fast path evaluates them in. Some
+    /// nodes lack `name` (so PropertyExists actually gates), and the selective `age`
+    /// equality vs the non-selective presence gate exercises the ordering heuristic.
+    #[test]
+    fn mixed_conjunction_filter_keeps_exactly_all_conjuncts() {
+        let mut b = Builder::default();
+        // 60 nodes; age = i%6 (so age==3 hits 10 of them); name present only when i%2==0.
+        for i in 0..60u32 {
+            let mut props: Vec<(&str, Value)> =
+                vec![("age", n(f64::from(i % 6))), ("score", n(f64::from(i)))];
+            if i % 2 == 0 {
+                props.push(("name", s("nm")));
+            }
+            b.node(&["N"], &props);
+        }
+        let st = b.build();
+        let cnt = |q: &str| match &gremlin_rows(q, &st).rows[0][0] {
+            Value::Num(x) => *x as i64,
+            other => panic!("not a count: {other:?}"),
+        };
+        // age==3 → i in {3,9,15,...,57} (10 nodes), of which name present (i%2==0) → NONE
+        // (all are odd). So values('name') over age==3 yields 0 rows.
+        assert_eq!(cnt("g.V().has('age', eq(3)).count()"), 10);
+        assert_eq!(cnt("g.V().has('age', eq(3)).values('name').count()"), 0);
+        // age==2 → i in {2,8,...,56} (10 nodes), all even → name present → 10 names.
+        assert_eq!(cnt("g.V().has('age', eq(2)).values('name').count()"), 10);
+        // A two-Compare conjunction: age<3 AND score>=30 (rows i%6<3 and i>=30).
+        let expect = (0..60u32).filter(|&i| i % 6 < 3 && i >= 30).count() as i64;
+        assert_eq!(
+            cnt("g.V().has('age', lt(3)).has('score', gte(30)).count()"),
+            expect
+        );
+        // …and with a values() presence gate AND-ed on (name present too).
+        let expect2 = (0..60u32)
+            .filter(|&i| i % 6 < 3 && i >= 30 && i % 2 == 0)
+            .count() as i64;
+        assert_eq!(
+            cnt("g.V().has('age', lt(3)).has('score', gte(30)).values('name').count()"),
+            expect2
+        );
+    }
+
     /// The streaming bounded top-K (`order().by(prop).limit(k)` over a bare scan) must
     /// return EXACTLY what a full sort would — same tie order (arrival = node-id order for
     /// a V() scan), across ascending/descending and with a skip. Ages have heavy ties, so
