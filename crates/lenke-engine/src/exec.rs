@@ -4168,19 +4168,30 @@ fn try_filtered_count(
 /// `(key, bounds)`. Shared by the streaming node/edge count fast paths; `None` for a
 /// string / disjunction / multi-slot / multi-key / non-numeric predicate.
 fn num_conj_on_slot(pred: &Expr, slot: usize) -> Option<(String, Vec<(CompareOp, f64)>)> {
-    let atom = |e: &Expr| -> Option<(String, CompareOp, f64)> {
-        let Expr::Compare { op, left, right } = e else {
-            return None;
-        };
-        let (key, op, lit) = match (left.as_ref(), right.as_ref()) {
-            (Expr::Prop { slot: s, key }, Expr::Lit(v)) if *s == slot => (key.clone(), *op, v),
-            (Expr::Lit(v), Expr::Prop { slot: s, key }) if *s == slot => {
-                (key.clone(), flip_op(*op), v)
+    // An atom on `slot` is either a numeric compare (a bound) or a `PropertyExists`
+    // presence gate (NO bound — redundant with the streaming count's own `present[i]`
+    // check, and implied by any compare on the same key). `has(k, pred)` desugars to
+    // `And(PropertyExists{k}, <compare>)`, so accepting the presence atom is what keeps
+    // a non-selective `has('age', neq(60)).count()` on the streaming path instead of
+    // materializing a 99% keep-list.
+    let atom = |e: &Expr| -> Option<(String, Option<(CompareOp, f64)>)> {
+        match e {
+            Expr::PropertyExists { slot: s, key } if *s == slot => Some((key.clone(), None)),
+            Expr::Compare { op, left, right } => {
+                let (key, op, lit) = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Prop { slot: s, key }, Expr::Lit(v)) if *s == slot => {
+                        (key.clone(), *op, v)
+                    }
+                    (Expr::Lit(v), Expr::Prop { slot: s, key }) if *s == slot => {
+                        (key.clone(), flip_op(*op), v)
+                    }
+                    _ => return None,
+                };
+                match lit {
+                    Value::Num(t) => Some((key, Some((op, *t)))),
+                    _ => None,
+                }
             }
-            _ => return None,
-        };
-        match lit {
-            Value::Num(t) => Some((key, op, *t)),
             _ => None,
         }
     };
@@ -4189,12 +4200,14 @@ fn num_conj_on_slot(pred: &Expr, slot: usize) -> Option<(String, Vec<(CompareOp,
     let mut key0: Option<String> = None;
     let mut bounds: Vec<(CompareOp, f64)> = Vec::with_capacity(conjuncts.len());
     for c in &conjuncts {
-        let (key, op, t) = atom(c)?;
+        let (key, bound) = atom(c)?;
         match &key0 {
-            Some(k) if *k != key => return None,
+            Some(k) if *k != key => return None, // a second key can't stream one column
             _ => key0 = Some(key),
         }
-        bounds.push((op, t));
+        if let Some(b) = bound {
+            bounds.push(b);
+        }
     }
     Some((key0?, bounds))
 }
