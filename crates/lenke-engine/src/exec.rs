@@ -1724,6 +1724,12 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             b
         }
         Plan::Aggregate { input, keys, aggs } => {
+            // REJECTED lever — `WITH <expr> AS a WHERE <pred on a> RETURN count(*)` inlined to
+            // one filtered count (fold the alias back, drop the rename projection) so the
+            // count ladder could fuse the predicate. Measured a REGRESSION (0.50x -> 0.37x):
+            // the WITH's projection NARROWS the batch to one column, which the downstream
+            // count rides cheaply; dropping it widens the materialization, and the fused count
+            // does not match the combined multi-predicate filter, so nothing is recovered.
             // Frontier fast path: a scalar count over an Expand chain need not
             // build the wide intermediate batch. Falls back to the general
             // aggregate for every shape it does not recognize. (The fused paths
@@ -13627,7 +13633,7 @@ fn try_distinct_frontier_prop(input: &Plan, store: &Store) -> Option<Batch> {
     };
     let mut out: Vec<Value> = Vec::new();
     let mut saw_null = false;
-    let mut null_once = |out: &mut Vec<Value>, saw: &mut bool| {
+    let null_once = |out: &mut Vec<Value>, saw: &mut bool| {
         if !*saw {
             *saw = true;
             out.push(Value::Null);
