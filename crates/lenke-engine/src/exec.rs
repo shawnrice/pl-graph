@@ -13650,6 +13650,23 @@ fn try_distinct_scan_multi(input: &Plan, store: &Store) -> Option<Batch> {
     Some(Batch::of(outs.into_iter().map(Col::Gen).collect()))
 }
 
+/// The row-order endpoint frontier of a chain for a fused DISTINCT path: a pure Scan/Expand
+/// chain yields just the endpoint ids directly (`frontier_ids` — no intermediate slots
+/// materialized, unlike a full `pull`); a filtered chain is pulled once and its endpoint slot
+/// cloned out.
+fn chain_frontier(chain: &Plan, store: &Store, endpoint: usize) -> Option<Vec<u32>> {
+    match frontier_ids(chain, store) {
+        Some(f) => Some(f),
+        None => {
+            let b = pull(chain, store, false).ok()?;
+            match b.slot(endpoint) {
+                Col::Nodes(f) => Some(f.clone()),
+                _ => None,
+            }
+        }
+    }
+}
+
 /// The frontier sibling of [`try_distinct_scan_prop`]: single-column `RETURN DISTINCT b.k`
 /// where `b` is a HOP-CHAIN endpoint. Pull the chain (cheap `Col::Nodes`, no property
 /// column), then dedup the endpoint's values off storage with a TYPED set — `FnvSet<&str>`
@@ -13678,10 +13695,8 @@ fn try_distinct_frontier_prop(input: &Plan, store: &Store) -> Option<Batch> {
     ) {
         return None; // Temporal / Gen → the general path
     }
-    let batch = pull(chain, store, false).ok()?;
-    let Col::Nodes(frontier) = batch.slot(endpoint) else {
-        return None;
-    };
+    let frontier = chain_frontier(chain, store, endpoint)?;
+    let frontier: &[u32] = &frontier;
     let mut out: Vec<Value> = Vec::new();
     let mut saw_null = false;
     let null_once = |out: &mut Vec<Value>, saw: &mut bool| {
@@ -13787,13 +13802,10 @@ fn try_distinct_frontier_multi(input: &Plan, store: &Store) -> Option<Batch> {
     if readers.len() == 1 && !matches!(readers[0], ColKeyer::Dict { .. }) {
         return None;
     }
-    // Pull the chain only (no Project): its slots are `Col::Nodes`, never the boxed
-    // property columns the general path would build. A pull fault bails to the general
-    // path (which re-pulls and surfaces the error) rather than swallowing it.
-    let batch = pull(chain, store, false).ok()?;
-    let Col::Nodes(frontier) = batch.slot(endpoint) else {
-        return None;
-    };
+    // A pure Scan/Expand chain yields just the endpoint ids (no intermediate slots
+    // materialized); a filtered chain is pulled once and its endpoint extracted.
+    let frontier = chain_frontier(chain, store, endpoint)?;
+    let frontier: &[u32] = &frontier;
     let ncol = readers.len();
     let mut outs: Vec<Vec<Value>> = vec![Vec::new(); ncol];
     let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
