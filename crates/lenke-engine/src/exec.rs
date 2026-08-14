@@ -6047,15 +6047,101 @@ fn try_varlen_count(
     Some(scalar_num(total as f64))
 }
 
-/// The counting twin of `varlen_dfs`: increments `total` at every length in
-/// `min..=max` instead of pushing `(row, endpoint)`. Traversal order, edge-type
-/// filtering and trail (no-edge-reuse) logic are identical, so the tally equals
-/// the number of rows the materializing path would emit.
+/// The shared LEAN iterative walker behind the count/agg var-length fast-paths: like
+/// `varlen_walk` but with neither the path stacks nor an emit sink — it just calls
+/// `visit(v)` once per "row" the materializing path would emit (every length in
+/// `min..=max`, plus each `Close` endpoint). An explicit heap frame stack, so it uses
+/// O(1) CALL stack however deep the closure — the recursive twins it replaced went one
+/// frame per hop, so a deep count/agg could overflow (or commit the 1 GiB big stack).
+#[allow(clippy::too_many_arguments)]
+fn varlen_scan_walk(
+    store: &Store,
+    v0: u32,
+    min: u32,
+    max: u32,
+    dir: Dir,
+    want: &[u32],
+    mode: PathMode,
+    start: u32,
+    used: &mut Vec<u32>,
+    double_loops: bool,
+    visit: &mut dyn FnMut(u32),
+) {
+    // Root pre-work: the length-0 source is a row iff `min == 0`; no descent past `max`.
+    if min == 0 {
+        visit(v0);
+    }
+    if max == 0 {
+        return;
+    }
+    let drop_loop = matches!(dir, Dir::Both) && !double_loops;
+    struct SF {
+        v: u32,
+        len: u32,
+        cursor: usize,
+        pending: Option<bool>, // Some(pop_used) once we've descended into a child
+    }
+    let mut stack = vec![SF { v: v0, len: 0, cursor: 0, pending: None }];
+    'frames: while let Some(top) = stack.last_mut() {
+        if let Some(pop_used) = top.pending.take() {
+            if pop_used {
+                used.pop();
+            }
+        }
+        let (v, len) = (top.v, top.len);
+        loop {
+            let Some((is_inc, a)) = adj_nth(store, v, dir, top.cursor) else {
+                stack.pop();
+                continue 'frames;
+            };
+            top.cursor += 1;
+            if !want.is_empty()
+                && !want.iter().any(|&w| {
+                    w == a.etype || (store.has_multi_label_edges() && store.edge_has_label(a.eid, w))
+                })
+            {
+                continue;
+            }
+            if is_inc && drop_loop && a.nbr == v {
+                continue;
+            }
+            let mark = match varlen_step(mode, start, &a, used) {
+                VarStep::Skip => continue,
+                VarStep::Close => {
+                    if len + 1 >= min {
+                        visit(a.nbr);
+                    }
+                    continue;
+                }
+                VarStep::Go(mark) => mark,
+            };
+            // Child pre-work at len+1: it is a row iff in range, then descend unless at
+            // `max` (the recursion's `len == max` early return — its mark push/pop around
+            // an immediately-returning child cannot affect the tally, so we skip it).
+            let clen = len + 1;
+            if clen >= min {
+                visit(a.nbr);
+            }
+            if clen == max {
+                continue;
+            }
+            if let Some(m) = mark {
+                used.push(m);
+            }
+            top.pending = Some(mark.is_some());
+            stack.push(SF { v: a.nbr, len: clen, cursor: 0, pending: None });
+            continue 'frames;
+        }
+    }
+}
+
+/// The counting twin of `varlen_dfs`: tallies every row the materializing path would
+/// emit. Iterative (see [`varlen_scan_walk`]) so a deep count can't overflow the stack.
 #[allow(clippy::too_many_arguments)]
 fn varlen_count_dfs(
     store: &Store,
     v: u32,
-    len: u32,
+    _len: u32, // always 0 at the call sites — the walk starts at the source
     min: u32,
     max: u32,
     dir: Dir,
@@ -6066,74 +6152,9 @@ fn varlen_count_dfs(
     total: &mut u64,
     double_loops: bool,
 ) {
-    if len >= min {
+    varlen_scan_walk(store, v, min, max, dir, want, mode, start, used, double_loops, &mut |_| {
         *total += 1;
-    }
-    if len == max {
-        return;
-    }
-    let out: &[crate::store::Adj] = if matches!(dir, Dir::Out | Dir::Both) {
-        store.out(v)
-    } else {
-        &[]
-    };
-    let inc: &[crate::store::Adj] = if matches!(dir, Dir::In | Dir::Both) {
-        store.inc(v)
-    } else {
-        &[]
-    };
-    // Undirected: a self-loop sits in both indexes; drop its in-side copy so it is
-    // walked once (core's SelfLoops::Once) — UNLESS this is a Gremlin `both()` walk,
-    // which crosses it twice.
-    let drop_loop = matches!(dir, Dir::Both) && !double_loops;
-    for (is_inc, a) in out
-        .iter()
-        .map(|a| (false, a))
-        .chain(inc.iter().map(|a| (true, a)))
-    {
-        // The edge must carry a wanted label — its primary type (`a.etype`) or, on
-        // a multi-label graph, a secondary one (`edge_has_label`).
-        if !want.is_empty()
-            && !want.iter().any(|&w| {
-                w == a.etype || (store.has_multi_label_edges() && store.edge_has_label(a.eid, w))
-            })
-        {
-            continue;
-        }
-        if is_inc && drop_loop && a.nbr == v {
-            continue;
-        }
-        let mark = match varlen_step(mode, start, a, used) {
-            VarStep::Skip => continue,
-            VarStep::Close => {
-                if len + 1 >= min {
-                    *total += 1;
-                }
-                continue;
-            }
-            VarStep::Go(mark) => mark,
-        };
-        if let Some(m) = mark {
-            used.push(m);
-        }
-        varlen_count_dfs(
-            store,
-            a.nbr,
-            len + 1,
-            min,
-            max,
-            dir,
-            want,
-            mode,
-            start,
-            used,
-            total,
-            double_loops,
-        );
-        if mark.is_some() {
-            used.pop();
-        }
-    }
+    });
 }
 
 /// The outcome of the per-hop reuse gate ([`varlen_step`]).
@@ -6442,7 +6463,7 @@ fn varlen_distinct_endpoint_count(
 fn varlen_agg_dfs(
     store: &Store,
     v: u32,
-    len: u32,
+    _len: u32, // always 0 at the call sites — the walk starts at the source
     min: u32,
     max: u32,
     dir: Dir,
@@ -6452,71 +6473,9 @@ fn varlen_agg_dfs(
     used: &mut Vec<u32>,
     emit: &mut dyn FnMut(u32),
 ) {
-    if len >= min {
-        emit(v);
-    }
-    if len == max {
-        return;
-    }
-    let out: &[crate::store::Adj] = if matches!(dir, Dir::Out | Dir::Both) {
-        store.out(v)
-    } else {
-        &[]
-    };
-    let inc: &[crate::store::Adj] = if matches!(dir, Dir::In | Dir::Both) {
-        store.inc(v)
-    } else {
-        &[]
-    };
-    // Undirected: drop the in-side copy of a self-loop so it is walked once.
-    let drop_loop = matches!(dir, Dir::Both);
-    for (is_inc, a) in out
-        .iter()
-        .map(|a| (false, a))
-        .chain(inc.iter().map(|a| (true, a)))
-    {
-        // The edge must carry a wanted label — its primary type (`a.etype`) or, on
-        // a multi-label graph, a secondary one (`edge_has_label`).
-        if !want.is_empty()
-            && !want.iter().any(|&w| {
-                w == a.etype || (store.has_multi_label_edges() && store.edge_has_label(a.eid, w))
-            })
-        {
-            continue;
-        }
-        if is_inc && drop_loop && a.nbr == v {
-            continue;
-        }
-        let mark = match varlen_step(mode, start, a, used) {
-            VarStep::Skip => continue,
-            VarStep::Close => {
-                if len + 1 >= min {
-                    emit(a.nbr);
-                }
-                continue;
-            }
-            VarStep::Go(mark) => mark,
-        };
-        if let Some(m) = mark {
-            used.push(m);
-        }
-        varlen_agg_dfs(
-            store,
-            a.nbr,
-            len + 1,
-            min,
-            max,
-            dir,
-            want,
-            mode,
-            start,
-            used,
-            emit,
-        );
-        if mark.is_some() {
-            used.pop();
-        }
-    }
+    // The fold twin visits the same endpoints in the same order as the materializing
+    // path (this fast-path is only taken without a `both()` double-loop, so `false`).
+    varlen_scan_walk(store, v, min, max, dir, want, mode, start, used, false, emit);
 }
 
 /// A scalar `sum`/`avg`/`min`/`max`/`count(arg)` over a bare var-length's ENDPOINT
@@ -14234,6 +14193,55 @@ mod tests {
                                 rec, itr,
                                 "mode={mode:?} dir={dir:?} {min}..={max} k={k} dl={double_loops} ecount={ecount}"
                             );
+                            // The count/agg fast-path twins (k=1, no preds) must equal the
+                            // materialized rows: count == #rows, agg-sum == sum of endpoints.
+                            if k == 1 {
+                                let node_unique =
+                                    matches!(mode, PathMode::Simple | PathMode::Acyclic);
+                                let mut total = 0u64;
+                                let mut used: Vec<u32> = Vec::new();
+                                for src in 0..n_nodes {
+                                    if node_unique {
+                                        used.push(src);
+                                    }
+                                    varlen_count_dfs(
+                                        &store, src, 0, min, max, dir, &[], mode, src, &mut used,
+                                        &mut total, double_loops,
+                                    );
+                                    if node_unique {
+                                        used.pop();
+                                    }
+                                }
+                                assert_eq!(
+                                    total as usize,
+                                    itr.len(),
+                                    "count twin vs materialized rows: mode={mode:?} dir={dir:?} {min}..={max} dl={double_loops}"
+                                );
+                                // The agg fast-path is only taken without a both()-doubled
+                                // self-loop, so compare it against the dl=false rows only.
+                                if !double_loops {
+                                    let mut sum = 0u64;
+                                    let mut used2: Vec<u32> = Vec::new();
+                                    for src in 0..n_nodes {
+                                        if node_unique {
+                                            used2.push(src);
+                                        }
+                                        varlen_agg_dfs(
+                                            &store, src, 0, min, max, dir, &[], mode, src,
+                                            &mut used2, &mut |v| sum += u64::from(v),
+                                        );
+                                        if node_unique {
+                                            used2.pop();
+                                        }
+                                    }
+                                    let want: u64 =
+                                        itr.iter().map(|(ns, _)| u64::from(*ns.last().unwrap())).sum();
+                                    assert_eq!(
+                                        sum, want,
+                                        "agg-sum twin vs materialized endpoints: mode={mode:?} dir={dir:?} {min}..={max}"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -14291,10 +14299,20 @@ mod tests {
                     false,
                     &mut sink,
                 );
-                sink.0
+                // The count fast-path twin must ALSO be O(1) stack (it shares varlen_scan_walk).
+                let mut total = 0u64;
+                let mut used: Vec<u32> = Vec::new();
+                varlen_count_dfs(
+                    &store, 0, 0, 1, u32::MAX, Dir::Out, &[], PathMode::Walk, 0, &mut used,
+                    &mut total, false,
+                );
+                (sink.0, total)
             })
             .unwrap();
-        assert_eq!(handle.join().expect("must not overflow the tiny stack"), 39_999);
+        assert_eq!(
+            handle.join().expect("must not overflow the tiny stack"),
+            (39_999, 39_999)
+        );
     }
 
     fn n(x: f64) -> Value {
