@@ -3862,6 +3862,10 @@ fn try_frontier_group_fold(
             _ => return None,
         }
     }
+    // Only the pure Scan/Expand chain, via the cheap direct frontier. A FILTERED chain is
+    // left to the general/filtered-aggregate paths: pulling it here to fuse the grouping
+    // would double the pull for a selective filter (the size gate bails AFTER the pull, then
+    // the fallback re-pulls) — measured a 0.30x regression, not worth the non-selective win.
     let frontier = frontier_ids(input, store)?;
     // Only worth skipping the key-column materialization once the frontier is large.
     const FUSED_GROUP_ROWS: usize = 100_000;
