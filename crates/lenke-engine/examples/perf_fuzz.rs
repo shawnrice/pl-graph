@@ -822,6 +822,27 @@ fn main() {
     if shown == 0 {
         println!("  (none below 0.9x above the noise floor)");
     }
+
+    // Dump EVERY losing template (ratio < 1.0) as TSV for offline clustering — the
+    // printed list is truncated to the slowest few. `results` is already ratio-sorted.
+    if let Ok(path) = std::env::var("FUZZ_LOSS_DUMP") {
+        let mut out = String::from("ratio\te_ms\tc_ms\trows\ttags\tquery\n");
+        for r in results.iter().filter(|r| r.ratio < 1.0) {
+            out.push_str(&format!(
+                "{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\n",
+                r.ratio,
+                r.e_ms,
+                r.c_ms,
+                r.rows,
+                r.tags.join(","),
+                r.query
+            ));
+        }
+        match std::fs::write(&path, out) {
+            Ok(()) => eprintln!("wrote losing templates to {path}"),
+            Err(e) => eprintln!("could not write {path}: {e}"),
+        }
+    }
 }
 
 fn first_line(s: &str) -> String {
