@@ -1626,6 +1626,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .or_else(|| try_varlen_agg(input, keys, aggs, store))
                 .or_else(|| try_frontier_prop_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_num_agg(input, keys, aggs, store))
+                .or_else(|| try_filtered_scan_num_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_multi_agg(input, keys, aggs, store))
                 .or_else(|| try_scan_distinct_count(input, keys, aggs, store))
                 .or_else(|| try_3hop_product_count(input, keys, aggs, store))
@@ -5222,6 +5223,90 @@ fn try_scan_count(
 /// frontier or boxing each cell into a `Value`. `None` (fall back) for a grouped
 /// aggregate, a DISTINCT, `min`/`max` (need the value-contract order), a non-`Num`
 /// column (which may need poison handling), or any non-`Scan` input.
+/// A scalar numeric aggregate (`sum`/`avg`/`min`/`max`/`count(prop)`) over a FILTERED
+/// scan — `has(...).values(k).sum()` and friends. Get the survivors from the filter fast
+/// path (`try_filter_keep`, which raw-passes num/str/And/Not/dict predicates), then
+/// accumulate the aggregate directly over their column values — no gather of a survivor
+/// frontier, no Project into a Col::Num, no boxed fold. `None` for a non-`Filter{Scan}`
+/// input, a non-fast-pathable predicate, or an unsupported agg — the general path runs.
+fn try_filtered_scan_num_agg(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.distinct
+        || !matches!(
+            agg.func,
+            AggFn::Sum | AggFn::Avg | AggFn::Min | AggFn::Max | AggFn::Count
+        )
+    {
+        return None;
+    }
+    let Plan::Filter { input: scan, pred } = input else {
+        return None;
+    };
+    let Plan::Scan { label } = scan.as_ref() else {
+        return None;
+    };
+    let Some(Expr::Prop { slot: 0, key }) = agg.arg.as_ref() else {
+        return None; // count(*) is try_filtered_count; only a prop agg here
+    };
+    let Some(Column::Num { data, present }) = store.column(key) else {
+        return None;
+    };
+    // Survivor ROWS of the scan frontier (row index == the node id for a bare scan).
+    let ids: Vec<u32> = match label {
+        Some(l) => store.nodes_with_label(l).to_vec(),
+        None => store.all_nodes(),
+    };
+    let batch = Batch::of(vec![Col::Nodes(ids)]);
+    let keep = try_filter_keep(pred, store, &batch)?;
+    let Col::Nodes(sids) = batch.slot(0) else {
+        return None;
+    };
+    let (mut total, mut cnt, mut best): (f64, u64, Option<f64>) = (0.0, 0, None);
+    for &row in &keep {
+        let i = sids[row] as usize;
+        if !present[i] {
+            continue; // the agg's own prop may be NULL even when the filter passed
+        }
+        let x = data[i];
+        total += x;
+        cnt += 1;
+        best = Some(match best {
+            None => x,
+            Some(b) => {
+                let keep_new = (agg.func == AggFn::Min && value::cmp_num_total(x, b).is_lt())
+                    || (agg.func == AggFn::Max && value::cmp_num_total(x, b).is_gt());
+                if keep_new {
+                    x
+                } else {
+                    b
+                }
+            }
+        });
+    }
+    let result = match agg.func {
+        AggFn::Sum if agg.null_on_empty && cnt == 0 => Value::Null,
+        AggFn::Sum => Value::Num(total),
+        AggFn::Count => Value::Num(cnt as f64),
+        AggFn::Avg => {
+            if cnt == 0 {
+                Value::Null
+            } else {
+                Value::Num(total / cnt as f64)
+            }
+        }
+        _ => best.map_or(Value::Null, Value::Num), // min/max of nothing → NULL
+    };
+    Some(Batch::single(Col::Gen(vec![result])))
+}
+
 fn try_scan_num_agg(
     input: &Plan,
     keys: &[(String, Expr)],
