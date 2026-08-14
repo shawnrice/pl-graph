@@ -5745,6 +5745,56 @@ mod tests {
         run(&plan, store)
     }
 
+    /// A string compare on a DICTIONARY-encoded column (built by from_ndjson for a
+    /// categorical property) must match the general/`Str` path exactly for every operator
+    /// — `=`/`<>` via code equality, ordering via the decoded string. Absent nodes drop.
+    #[test]
+    fn dict_column_string_filter_matches_all_ops() {
+        let cities = ["oslo", "bergen", "trondheim", "oslo", "bergen"];
+        let mut nd = String::new();
+        for (i, c) in (0..250u32).map(|i| (i, cities[(i % 5) as usize])) {
+            nd.push_str(&format!(
+                r#"{{"id":"{i}","labels":["N"],"props":{{"city":"{c}"}}}}"#
+            ));
+            nd.push('\n');
+        }
+        // two nodes with NO city (must drop from every compare)
+        nd.push_str(r#"{"id":"250","labels":["N"],"props":{"z":"x"}}"#);
+        nd.push('\n');
+        nd.push_str(r#"{"id":"251","labels":["N"],"props":{"z":"y"}}"#);
+        nd.push('\n');
+        let st = crate::ndjson::from_ndjson(&nd).unwrap();
+        assert!(
+            matches!(st.column("city"), Some(crate::store::Column::Dict { .. })),
+            "city should be dict-encoded"
+        );
+        let cnt = |q: &str| match &gremlin_rows(q, &st).rows[0][0] {
+            Value::Num(x) => *x as i64,
+            other => panic!("not a count: {other:?}"),
+        };
+        let want = |f: &dyn Fn(&str) -> bool| {
+            (0..250u32).filter(|&i| f(cities[(i % 5) as usize])).count() as i64
+        };
+        assert_eq!(
+            cnt("g.V().has('city', eq('oslo')).count()"),
+            want(&|c| c == "oslo")
+        );
+        // neq keeps present-and-unequal PLUS the 2 absent nodes (Not(And(exists,eq)) 3VL).
+        assert_eq!(
+            cnt("g.V().has('city', neq('oslo')).count()"),
+            want(&|c| c != "oslo") + 2
+        );
+        assert_eq!(cnt("g.V().has('city', eq('nowhere')).count()"), 0);
+        assert_eq!(
+            cnt("g.V().has('city', gt('c')).count()"),
+            want(&|c| c > "c")
+        );
+        assert_eq!(
+            cnt("g.V().has('city', lte('oslo')).count()"),
+            want(&|c| c <= "oslo")
+        );
+    }
+
     /// `repeat(x).times(1)` is rewritten to a single `Expand` at plan time — so it MUST
     /// return exactly what the explicit one-hop `x()` does, INCLUDING a self-loop (Walk
     /// keeps A->A). Compare the rewritten var-length form to the explicit hop across

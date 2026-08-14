@@ -11411,6 +11411,57 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
         }
         return Some(keep);
     }
+    // Typed fast path: a DICTIONARY-encoded string column vs a Str literal. `=`/`<>`
+    // resolve the literal's code ONCE and compare `u32` codes per row (no per-cell string
+    // read); ordering decodes `dict[code]` (a cheap indexed lookup, still no boxing). A
+    // categorical column (`city`/`status`) is Dict, so this is what keeps a
+    // `has('city','oslo').count()` off the boxed general path (which read a `Value::Str`
+    // per node — the whole scan).
+    if let (
+        Column::Dict {
+            dict,
+            codes,
+            present,
+        },
+        Value::Str(t),
+    ) = (column, lit)
+    {
+        let t = t.as_ref();
+        // For =/<> the answer is purely code equality against the literal's code (absent
+        // from the dict ⇒ nothing equals it / everything present is unequal).
+        if matches!(op, CompareOp::Eq | CompareOp::Ne) {
+            let target = dict.iter().position(|d| d.as_ref() == t);
+            for (row, &id) in ids.iter().enumerate() {
+                let i = id as usize;
+                if !present[i] {
+                    continue;
+                }
+                let eq = target.is_some_and(|tc| codes[i] as usize == tc);
+                if (op == CompareOp::Eq) == eq {
+                    keep.push(row);
+                }
+            }
+            return Some(keep);
+        }
+        for (row, &id) in ids.iter().enumerate() {
+            let i = id as usize;
+            if !present[i] {
+                continue;
+            }
+            let x = dict[codes[i] as usize].as_ref();
+            let hit = match op {
+                CompareOp::Lt => x < t,
+                CompareOp::Le => x <= t,
+                CompareOp::Gt => x > t,
+                CompareOp::Ge => x >= t,
+                _ => unreachable!(), // Eq/Ne handled above
+            };
+            if hit {
+                keep.push(row);
+            }
+        }
+        return Some(keep);
+    }
     // General path (Bool/Temporal/Gen columns): read the cell, then compare via the
     // value contract. Ordering uses `cmp_partial` (3VL — cross-type/NaN → drop,
     // matching `compare`), NOT the total order.
