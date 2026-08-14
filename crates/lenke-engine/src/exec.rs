@@ -3869,15 +3869,34 @@ fn try_frontier_group_fold(
         return None;
     }
     let (group_of, key_out, n_groups) = frontier_group_by(store, kkey, &frontier)?;
-    let fb = Batch::single(Col::Nodes(frontier));
     let mut slots: Vec<Col> = vec![Col::Gen(key_out)];
+    let mut fb: Option<Batch> = None; // built lazily (only for args that need fold_grouped)
     for agg in aggs {
-        // The arg references the frontier's endpoint slot; the frontier sits at slot 0 of
-        // `fb`, so remap the property read to slot 0. count(*) has no arg.
+        // min/max over a NUMERIC frontier property folds RAW off the column (`f64`,
+        // `cmp_num_total`) — no per-row `value_at` boxing to `Value` + general `cmp_total`,
+        // which the diagnostics showed is the whole remaining cost over a big frontier.
+        if matches!(agg.func, AggFn::Min | AggFn::Max) {
+            if let Some(Expr::Prop { key, .. }) = &agg.arg {
+                if let Some(Column::Num { data, present }) = store.column(key) {
+                    slots.push(Col::Gen(fold_num_minmax(
+                        &frontier,
+                        &group_of,
+                        n_groups,
+                        data,
+                        present,
+                        agg.func == AggFn::Min,
+                    )));
+                    continue;
+                }
+            }
+        }
+        // count(*) needs no arg column; anything else reads the arg off the frontier (slot 0
+        // of `fb`) and reuses the general byte-identical fold.
         let arg_col = match &agg.arg {
             None => None,
             Some(Expr::Prop { key, .. }) => {
-                Some(eval(&Expr::Prop { slot: 0, key: key.clone() }, store, &fb).ok()?)
+                let b = fb.get_or_insert_with(|| Batch::single(Col::Nodes(frontier.clone())));
+                Some(eval(&Expr::Prop { slot: 0, key: key.clone() }, store, b).ok()?)
             }
             _ => return None,
         };
@@ -3886,6 +3905,43 @@ fn try_frontier_group_fold(
         ));
     }
     Some(Batch::of(slots))
+}
+
+/// Per-group min/max of a NUMERIC frontier column, folded RAW: `f64` compared with
+/// `cmp_num_total` (the same total order [`fold_grouped`]'s `cmp_total` uses for two
+/// numbers), a NULL/absent cell skipped, an all-null group → NULL. Avoids boxing every cell
+/// to a `Value` and the general comparison — byte-identical, far cheaper over a big frontier.
+fn fold_num_minmax(
+    frontier: &[u32],
+    group_of: &[u32],
+    n_groups: usize,
+    data: &[f64],
+    present: &[bool],
+    want_min: bool,
+) -> Vec<Value> {
+    let mut best: Vec<Option<f64>> = vec![None; n_groups];
+    for (i, &g) in group_of.iter().enumerate() {
+        let node = frontier[i];
+        if node == u32::MAX || !present[node as usize] {
+            continue;
+        }
+        let x = data[node as usize];
+        let slot = &mut best[g as usize];
+        *slot = Some(match *slot {
+            None => x,
+            Some(cur) => {
+                let ord = value::cmp_num_total(x, cur);
+                if (want_min && ord.is_lt()) || (!want_min && ord.is_gt()) {
+                    x
+                } else {
+                    cur
+                }
+            }
+        });
+    }
+    best.into_iter()
+        .map(|o| o.map_or(Value::Null, Value::Num))
+        .collect()
 }
 
 /// First-seen grouping for a SINGLE dict-column key, by code — avoiding the per-row dict
