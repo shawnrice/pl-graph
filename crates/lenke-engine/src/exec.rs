@@ -3431,20 +3431,28 @@ fn sort_idx(idx: &mut [usize], key_cols: &[Col], keys: &[crate::ir::SortKey], en
     if let [Col::Num(vals)] = key_cols {
         // Col::Num carries no nulls, so null placement is moot; an arrival-index
         // tiebreak makes the order total (deterministic, == the stable sort on ties).
+        // Sort (key, index) PAIRS so each comparison reads the f64 INLINE — the index-only
+        // sort loads `vals[a]`/`vals[b]` (random) on every compare and cache-misses; carrying
+        // the key with the index does one gather, then compares locally. Same value-then-
+        // index order → byte-identical.
         let desc = keys[0].descending;
-        let cmp = |&a: &usize, &b: &usize| {
+        let mut pairs: Vec<(f64, usize)> = idx.iter().map(|&i| (vals[i], i)).collect();
+        let cmp = |a: &(f64, usize), b: &(f64, usize)| {
             let o = if desc {
-                value::cmp_num_total(vals[b], vals[a])
+                value::cmp_num_total(b.0, a.0)
             } else {
-                value::cmp_num_total(vals[a], vals[b])
+                value::cmp_num_total(a.0, b.0)
             };
-            o.then(a.cmp(&b))
+            o.then(a.1.cmp(&b.1))
         };
         if end < n {
-            idx.select_nth_unstable_by(end - 1, cmp);
-            idx[..end].sort_unstable_by(cmp);
+            pairs.select_nth_unstable_by(end - 1, cmp);
+            pairs[..end].sort_unstable_by(cmp);
         } else {
-            idx.sort_unstable_by(cmp);
+            pairs.sort_unstable_by(cmp);
+        }
+        for (slot, p) in idx.iter_mut().zip(&pairs) {
+            *slot = p.1;
         }
     } else if let [Col::Str(vals)] = key_cols {
         // A single string key: compare the `Arc<str>` cells directly (lexicographic,
