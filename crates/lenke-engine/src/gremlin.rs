@@ -5745,6 +5745,35 @@ mod tests {
         run(&plan, store)
     }
 
+    /// `has(k, neq(v))` desugars to `Not(And(PropertyExists{k}, Eq{k,v}))`; the raw fast
+    /// path must match that 3VL exactly — an absent-`k` node IS kept (false AND null =
+    /// false, Not = true), a present `k != v` is kept, a present `k == v` is dropped.
+    /// The GQL differential engine already pins this against core; here we lock the row
+    /// set directly on a graph where some nodes lack the key.
+    #[test]
+    fn has_neq_keeps_absent_and_unequal() {
+        let mut b = Builder::default();
+        // ids 0..30: age = i % 5; ids 30..40: NO age at all.
+        for i in 0..30u32 {
+            b.node(&["N"], &[("age", n(f64::from(i % 5)))]);
+        }
+        for _ in 30..40u32 {
+            b.node(&["N"], &[("other", s("x"))]);
+        }
+        let st = b.build();
+        let cnt = |q: &str| match &gremlin_rows(q, &st).rows[0][0] {
+            Value::Num(x) => *x as i64,
+            other => panic!("not a count: {other:?}"),
+        };
+        // neq(2): drop the 6 present nodes with age==2 (i in {2,7,12,17,22,27}); keep the
+        // other 24 present + ALL 10 absent = 34.
+        assert_eq!(cnt("g.V().has('age', neq(2)).count()"), 34);
+        // neq over a value NO present node has (age==99): keep all 30 present + 10 absent.
+        assert_eq!(cnt("g.V().has('age', neq(99)).count()"), 40);
+        // Sanity: eq(2) is the complement over PRESENT nodes only — 6.
+        assert_eq!(cnt("g.V().has('age', eq(2)).count()"), 6);
+    }
+
     /// A MIXED conjunction filter — the shape a projection creates (`values(k)` AND-s a
     /// `PropertyExists{k}` onto the user's `has(...)`) — must keep EXACTLY the rows
     /// satisfying every conjunct, whichever order the fast path evaluates them in. Some

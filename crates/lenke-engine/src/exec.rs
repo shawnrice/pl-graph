@@ -11192,6 +11192,51 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
     // fast-pathable, this returns None and the caller evaluates the original `NOT`
     // through the general (boxed) path.
     if let Expr::Not(inner) = pred {
+        // `has(k, neq(v))` (and any negated `has(k, <cmp>)`) desugars to
+        // `Not(And(PropertyExists{k}, Compare{k}))`. Per node the keep is `absent OR
+        // !cmp` — a raw Num pass (an absent node IS kept) — instead of the general boxed
+        // eval, which materialized ~all rows for a non-selective complement like neq.
+        if let Expr::And(a, b) = inner.as_ref() {
+            // Identify (PropertyExists{k}, Compare on k) in either order.
+            let pair = match (a.as_ref(), b.as_ref()) {
+                (pe @ Expr::PropertyExists { .. }, cmp @ Expr::Compare { .. })
+                | (cmp @ Expr::Compare { .. }, pe @ Expr::PropertyExists { .. }) => Some((pe, cmp)),
+                _ => None,
+            };
+            if let Some((
+                Expr::PropertyExists { slot: s1, key: k1 },
+                Expr::Compare { op, left, right },
+            )) = pair
+            {
+                let bound = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Prop { slot, key }, Expr::Lit(Value::Num(t)))
+                        if key == k1 && slot == s1 =>
+                    {
+                        Some((*op, *t))
+                    }
+                    (Expr::Lit(Value::Num(t)), Expr::Prop { slot, key })
+                        if key == k1 && slot == s1 =>
+                    {
+                        Some((flip_op(*op), *t))
+                    }
+                    _ => None,
+                };
+                if let (Some((op, t)), Col::Nodes(ids), Some(Column::Num { data, present })) =
+                    (bound, batch.slot(*s1), store.column(k1))
+                {
+                    return Some(
+                        ids.iter()
+                            .enumerate()
+                            .filter(|&(_, &id)| {
+                                let i = id as usize;
+                                !present[i] || !num_pred(op, data[i], t)
+                            })
+                            .map(|(row, _)| row)
+                            .collect(),
+                    );
+                }
+            }
+        }
         return invert_pred(inner).and_then(|pos| try_filter_keep(&pos, store, batch));
     }
     // A CONJUNCTION of typed-numeric `prop <op> literal` compares on one node slot
