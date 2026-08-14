@@ -2728,6 +2728,19 @@ pub fn try_run_gremlin_json(plan: &Plan, store: &Store) -> Result<String, String
     on_big_stack(plan, || try_run_gremlin_json_inner(plan, store))
 }
 
+/// GQL egress (`lnk_e_query_rows`): stream a var-length endpoint projection to the
+/// `{columns, rows}` document when it applies — so a large closure completes without
+/// materializing the row batch — else materialize + serialize. Big-stack-dispatched like
+/// `try_run`. Byte-identical to `gql_rows_json(try_run(...))`.
+pub fn try_run_gql_json(plan: &Plan, store: &Store) -> Result<String, String> {
+    on_big_stack(plan, || {
+        if let Some(res) = try_stream_varlen_json(plan, store, true) {
+            return res;
+        }
+        Ok(crate::json::gql_rows_json(&try_run_inner(plan, store)?))
+    })
+}
+
 fn try_run_gremlin_json_inner(plan: &Plan, store: &Store) -> Result<String, String> {
     // Fused element/value-map serialization: for a terminal node-map projection, write
     // the JSON straight from the columns and skip building a `Value::Map` tree per row
@@ -2754,7 +2767,7 @@ fn try_run_gremlin_json_inner(plan: &Plan, store: &Store) -> Result<String, Stri
     // Stream a var-length endpoint projection straight to JSON — no giant row batch, so a
     // large closure completes (up to a byte cap) where the materialized path would trip
     // the 1M-row trail limit.
-    if let Some(res) = try_stream_varlen_json(plan, store) {
+    if let Some(res) = try_stream_varlen_json(plan, store, false) {
         return res;
     }
     Ok(crate::json::gremlin_results_json(&try_run(plan, store)?))
@@ -9065,8 +9078,11 @@ struct StreamPropEmit<'a> {
     // vectorized materialized read at medium sizes). `None` = the key has no column.
     col: Option<&'a Column>,
     // `values(k)` inserts a `PropertyExists{k}` filter above the hop: an endpoint MISSING
-    // the property is dropped, not emitted as null. Mirror that skip when set.
+    // the property is dropped, not emitted as null. Mirror that skip when set. (A GQL
+    // `RETURN t.k` has no such filter and emits null for an absent value.)
     require_present: bool,
+    // GQL rows wrap each value in a 1-column array (`[v]`); a Gremlin value stream does not.
+    wrap_row: bool,
     byte_cap: usize,
 }
 
@@ -9086,28 +9102,33 @@ impl VarlenEmit for StreamPropEmit<'_> {
         }
         let i = *node_stack.last().expect("a path always has an endpoint") as usize;
         let present = self.col.is_some_and(|c| c.present_at(i));
-        if !present {
-            if self.require_present {
-                return; // dropped by the PropertyExists guard
-            }
-            self.sep();
-            self.out.push_str("null");
-            return;
+        if !present && self.require_present {
+            return; // dropped by the PropertyExists guard
         }
         self.sep();
-        // Typed cell write — byte-identical to `read_property(endpoint) -> write_value`.
-        match self.col.expect("present implies a column") {
-            Column::Str { data, .. } => crate::json::write_string(&mut self.out, &data[i]),
-            Column::Dict { dict, codes, .. } => {
-                crate::json::write_string(&mut self.out, &dict[codes[i] as usize]);
+        if self.wrap_row {
+            self.out.push('[');
+        }
+        if !present {
+            self.out.push_str("null");
+        } else {
+            // Typed cell write — byte-identical to `read_property(endpoint) -> write_value`.
+            match self.col.expect("present implies a column") {
+                Column::Str { data, .. } => crate::json::write_string(&mut self.out, &data[i]),
+                Column::Dict { dict, codes, .. } => {
+                    crate::json::write_string(&mut self.out, &dict[codes[i] as usize]);
+                }
+                Column::Num { data, .. } => {
+                    crate::json::write_value(&mut self.out, &Value::Num(data[i]));
+                }
+                Column::Bool { data, .. } => {
+                    self.out.push_str(if data[i] { "true" } else { "false" });
+                }
+                other => crate::json::write_value(&mut self.out, &other.read(i)), // Temporal/Gen
             }
-            Column::Num { data, .. } => {
-                crate::json::write_value(&mut self.out, &Value::Num(data[i]));
-            }
-            Column::Bool { data, .. } => {
-                self.out.push_str(if data[i] { "true" } else { "false" });
-            }
-            other => crate::json::write_value(&mut self.out, &other.read(i)), // Temporal/Gen
+        }
+        if self.wrap_row {
+            self.out.push(']');
         }
     }
     fn should_stop(&self) -> bool {
@@ -9120,7 +9141,11 @@ impl VarlenEmit for StreamPropEmit<'_> {
 /// Returns `None` when the shape isn't a single-`Prop` projection of the endpoint over a
 /// plain `VarLength` (no lineage, no group binds); `Some(Err)` when the output byte cap is
 /// hit; `Some(Ok(json))` otherwise. Byte-identical to serializing the materialized result.
-fn try_stream_varlen_json(plan: &Plan, store: &Store) -> Option<Result<String, String>> {
+fn try_stream_varlen_json(
+    plan: &Plan,
+    store: &Store,
+    gql: bool,
+) -> Option<Result<String, String>> {
     // Output cap — generous (compact text), so far more rows complete than the 1M-row
     // trail cap the materialized path hits, yet a runaway still fails loudly.
     const BYTE_CAP: usize = 256 << 20; // 256 MiB
@@ -9130,7 +9155,7 @@ fn try_stream_varlen_json(plan: &Plan, store: &Store) -> Option<Result<String, S
     let Plan::Project { input, items } = plan else {
         return None;
     };
-    let [(_, Expr::Prop { slot, key })] = items.as_slice() else {
+    let [(colname, Expr::Prop { slot, key })] = items.as_slice() else {
         return None;
     };
     // `values(k)` puts a `PropertyExists{k}` filter between the projection and the hop;
@@ -9170,11 +9195,21 @@ fn try_stream_varlen_json(plan: &Plan, store: &Store) -> Option<Result<String, S
         Ok(w) => w,
         Err(()) => vec![u32::MAX],
     };
+    // Envelope: Gremlin is a bare value array `[…]`; GQL is `{columns:[name],rows:[[v],…]}`.
+    let out = if gql {
+        let mut p = String::from("{\"columns\":[");
+        crate::json::write_string(&mut p, colname);
+        p.push_str("],\"rows\":[");
+        p
+    } else {
+        String::from("[")
+    };
     let mut sink = StreamPropEmit {
-        out: String::from("["),
+        out,
         first: true,
         col: store.column(key),
         require_present,
+        wrap_row: gql,
         byte_cap: BYTE_CAP,
     };
     run_varlen(
@@ -9198,7 +9233,7 @@ fn try_stream_varlen_json(plan: &Plan, store: &Store) -> Option<Result<String, S
              add a tighter bound/`LIMIT` or dedup the frontier"
         )));
     }
-    sink.out.push(']');
+    sink.out.push_str(if gql { "]}" } else { "]" });
     Some(Ok(sink.out))
 }
 

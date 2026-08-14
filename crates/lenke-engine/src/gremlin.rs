@@ -6169,6 +6169,50 @@ mod tests {
         assert!(streamed.starts_with('[') && streamed.ends_with(']') && streamed.len() > 2);
     }
 
+    /// The GQL egress streams a var-length endpoint projection to the `{columns,rows}`
+    /// document, byte-identical to `gql_rows_json(try_run(..))` — including emitting `null`
+    /// for an absent value (GQL has no `values()` PropertyExists guard) — and completes a
+    /// closure past the row cap that the materialized path rejects.
+    #[test]
+    fn streamed_varlen_gql_matches_and_bypasses_the_row_cap() {
+        use crate::store::ConfigId;
+        let mut nd = String::new();
+        for i in 0..60u32 {
+            // ~1/3 of nodes have no `name` -> GQL emits `[null]` (not dropped).
+            let props = if i % 3 == 0 {
+                format!("\"age\":{}", i % 20)
+            } else {
+                format!("\"age\":{},\"name\":\"p{i}\"", i % 20)
+            };
+            nd.push_str(&format!("{{\"id\":\"n{i}\",\"labels\":[\"P\"],\"props\":{{{props}}}}}\n"));
+        }
+        for e in 0..120u32 {
+            nd.push_str(&format!(
+                "{{\"id\":\"e{e}\",\"from\":\"n{}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"props\":{{}}}}\n",
+                e % 60,
+                (e * 7 + 1) % 60
+            ));
+        }
+        let mut st = crate::ndjson::from_ndjson(&nd).unwrap();
+        for q in [
+            "MATCH (a:P)-[:R]->{1,3}(t) RETURN t.name AS r",
+            "MATCH (a:P)-[:R]->{2,2}(t) RETURN t.age AS a",
+        ] {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &st);
+            let streamed = crate::exec::try_run_gql_json(&plan, &st).unwrap();
+            let material = crate::json::gql_rows_json(&crate::exec::try_run(&plan, &st).unwrap());
+            assert_eq!(streamed, material, "GQL streamed vs materialized diverged for `{q}`");
+        }
+        st.set_limit(ConfigId::LimitsTrail, 100);
+        let plan = crate::opt::optimize_indexed(
+            crate::gql::parse("MATCH (a:P)-[:R]->{3,3}(t) RETURN t.name AS r").unwrap(),
+            &st,
+        );
+        assert!(crate::exec::try_run(&plan, &st).is_err()); // materialized: E_RESOURCE
+        let streamed = crate::exec::try_run_gql_json(&plan, &st).unwrap(); // streamed: completes
+        assert!(streamed.starts_with("{\"columns\":") && streamed.ends_with("]}"));
+    }
+
     /// A DEEP traversal (recursion depth = hop count) must not overflow the stack — the
     /// recursive var-length DFS runs on a large stack (`on_big_stack`). A 25k-node chain
     /// walked end to end recurses ~25k frames, well past the default 8 MB stack, yet must

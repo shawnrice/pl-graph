@@ -206,7 +206,9 @@ pub unsafe extern "C" fn lnk_e_query_rows(
     // Panic backstop (see `lnk_e_gremlin_json`): a faulting query fails this one call with
     // a null result, never unwinds across the C boundary.
     let json = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        lenke_engine::exec::try_run(&plan, store).map(|r| lenke_engine::json::gql_rows_json(&r))
+        // Streams a var-length endpoint projection straight to the {columns,rows}
+        // document (no giant row batch), else materializes + serializes — byte-identical.
+        lenke_engine::exec::try_run_gql_json(&plan, store)
     })) {
         Ok(Ok(json)) => json,
         Ok(Err(_)) | Err(_) => return std::ptr::null_mut(),
