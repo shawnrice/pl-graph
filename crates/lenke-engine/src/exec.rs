@@ -2751,6 +2751,12 @@ fn try_run_gremlin_json_inner(plan: &Plan, store: &Store) -> Result<String, Stri
     if let Some(json) = try_stream_gremlin_json(plan, store, track, STREAM_JSON_ROWS) {
         return Ok(json);
     }
+    // Stream a var-length endpoint projection straight to JSON — no giant row batch, so a
+    // large closure completes (up to a byte cap) where the materialized path would trip
+    // the 1M-row trail limit.
+    if let Some(res) = try_stream_varlen_json(plan, store) {
+        return res;
+    }
     Ok(crate::json::gremlin_results_json(&try_run(plan, store)?))
 }
 
@@ -9043,6 +9049,131 @@ fn run_varlen<S: VarlenEmit>(
             break; // budget/cap tripped — do not start the next source's walk
         }
     }
+}
+
+/// The streaming emit: writes each emitted endpoint's property straight into a JSON array
+/// buffer, never building a batch — so a huge var-length closure costs O(output text), not
+/// O(rows × boxed Value). Bounded by a byte cap: past it we stop and the caller returns
+/// `E_RESOURCE_EXHAUSTED` (a loud failure, not a silent truncation or an OOM). The bytes
+/// written are identical to `read_property(endpoint) -> write_value`, so streamed output
+/// equals the materialized `gremlin_results_json`.
+struct StreamPropEmit<'a> {
+    out: String,
+    first: bool,
+    store: &'a Store,
+    key: &'a str,
+    // `values(k)` inserts a `PropertyExists{k}` filter above the hop: an endpoint MISSING
+    // the property is dropped, not emitted as null. Mirror that skip when set.
+    require_present: bool,
+    byte_cap: usize,
+}
+
+impl VarlenEmit for StreamPropEmit<'_> {
+    fn emit(&mut self, _row: usize, node_stack: &[u32], _edge_stack: &[u32]) {
+        if self.out.len() > self.byte_cap {
+            return; // over the cap — stop appending (should_stop halts descent)
+        }
+        let endpoint = *node_stack.last().expect("a path always has an endpoint");
+        if self.require_present && !self.store.has_prop(endpoint, self.key) {
+            return; // filtered out by the PropertyExists guard — emit nothing
+        }
+        if !self.first {
+            self.out.push(',');
+        }
+        self.first = false;
+        crate::json::write_value(&mut self.out, &self.store.prop(endpoint, self.key));
+    }
+    fn should_stop(&self) -> bool {
+        self.out.len() > self.byte_cap
+    }
+}
+
+/// `g.V()…repeat(hop).values(k)` / GQL `RETURN t.k` over a plain var-length: stream the
+/// endpoint property to a JSON array without materializing the (possibly huge) row batch.
+/// Returns `None` when the shape isn't a single-`Prop` projection of the endpoint over a
+/// plain `VarLength` (no lineage, no group binds); `Some(Err)` when the output byte cap is
+/// hit; `Some(Ok(json))` otherwise. Byte-identical to serializing the materialized result.
+fn try_stream_varlen_json(plan: &Plan, store: &Store) -> Option<Result<String, String>> {
+    // Output cap — generous (compact text), so far more rows complete than the 1M-row
+    // trail cap the materialized path hits, yet a runaway still fails loudly.
+    const BYTE_CAP: usize = 256 << 20; // 256 MiB
+    if needs_lineage(plan) {
+        return None;
+    }
+    let Plan::Project { input, items } = plan else {
+        return None;
+    };
+    let [(_, Expr::Prop { slot, key })] = items.as_slice() else {
+        return None;
+    };
+    // `values(k)` puts a `PropertyExists{k}` filter between the projection and the hop;
+    // peel it (and honor its drop-if-absent semantics). Any other filter → fall back.
+    let (vl, require_present) = match input.as_ref() {
+        vl @ Plan::VarLength { .. } => (vl, false),
+        Plan::Filter {
+            input: fin,
+            pred: Expr::PropertyExists { slot: fs, key: fk },
+        } if fs == slot && fk == key => (fin.as_ref(), true),
+        _ => return None,
+    };
+    let Plan::VarLength {
+        input: vl_in,
+        from,
+        dir,
+        edge_label,
+        min,
+        max,
+        mode,
+        until,
+        body_filter,
+        double_loops,
+    } = vl
+    else {
+        return None;
+    };
+    let vl_batch = pull(vl_in, store, false).ok()?;
+    let endpoint_slot = vl_batch.slots.len();
+    if *slot != endpoint_slot {
+        return None; // the projection reads some bound var other than the endpoint
+    }
+    let Col::Nodes(src) = vl_batch.slot(*from) else {
+        return None;
+    };
+    let want = match want_etypes(store, edge_label) {
+        Ok(w) => w,
+        Err(()) => vec![u32::MAX],
+    };
+    let mut sink = StreamPropEmit {
+        out: String::from("["),
+        first: true,
+        store,
+        key,
+        require_present,
+        byte_cap: BYTE_CAP,
+    };
+    run_varlen(
+        src,
+        store,
+        &want,
+        *min,
+        *max,
+        *dir,
+        *mode,
+        None, // a plain VarLength has no per-rep predicate (that is RepeatGroup)
+        1,
+        until.as_deref().map(|p| (p, endpoint_slot)),
+        body_filter.as_deref().map(|p| (p, endpoint_slot)),
+        *double_loops,
+        &mut sink,
+    );
+    if sink.out.len() > BYTE_CAP {
+        return Some(Err(format!(
+            "E_RESOURCE_EXHAUSTED: variable-length traversal output exceeded {BYTE_CAP} bytes; \
+             add a tighter bound/`LIMIT` or dedup the frontier"
+        )));
+    }
+    sink.out.push(']');
+    Some(Ok(sink.out))
 }
 
 #[allow(clippy::too_many_arguments)]

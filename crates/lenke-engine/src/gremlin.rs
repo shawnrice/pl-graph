@@ -6118,6 +6118,57 @@ mod tests {
         assert!(deep > 0.0 && deep <= 300.0, "deep reach-count out of range: {deep}");
     }
 
+    /// Streaming a var-length endpoint projection to JSON must be (1) BYTE-IDENTICAL to
+    /// serializing the materialized result — including `values()`'s drop-if-absent
+    /// semantics (some nodes here lack `name`) — and (2) able to COMPLETE a closure larger
+    /// than the row cap, since it never materializes the batch (the memory win over core's
+    /// materialize-then-serialize).
+    #[test]
+    fn streamed_varlen_values_matches_and_bypasses_the_row_cap() {
+        use crate::store::ConfigId;
+        let mut nd = String::new();
+        for i in 0..60u32 {
+            let labels: &str = if i % 4 == 0 { "[\"P\",\"V\"]" } else { "[\"P\"]" };
+            // ~1/3 of nodes have NO `name` — the PropertyExists guard must drop them.
+            let props = if i % 3 == 0 {
+                format!("\"age\":{}", i % 20)
+            } else {
+                format!("\"age\":{},\"name\":\"p{i}\"", i % 20)
+            };
+            nd.push_str(&format!("{{\"id\":\"n{i}\",\"labels\":{labels},\"props\":{{{props}}}}}\n"));
+        }
+        for e in 0..120u32 {
+            nd.push_str(&format!(
+                "{{\"id\":\"e{e}\",\"from\":\"n{}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"props\":{{}}}}\n",
+                e % 60,
+                (e * 7 + 1) % 60
+            ));
+        }
+        let mut st = crate::ndjson::from_ndjson(&nd).unwrap();
+        // (1) byte-identity across shapes (default cap, both paths complete).
+        for q in [
+            "g.V().repeat(out()).times(3).values('name')",
+            "g.V().repeat(out()).emit().times(2).values('name')",
+            "g.V().repeat(both()).times(2).values('name')",
+            "g.V().repeat(out()).until(__.hasLabel('V')).times(4).values('name')",
+        ] {
+            let plan = crate::opt::optimize_indexed(super::parse(q).unwrap(), &st);
+            let streamed = crate::exec::run_gremlin_json(&plan, &st);
+            let material = crate::json::gremlin_results_json(&run(&plan, &st));
+            assert_eq!(streamed, material, "streamed vs materialized diverged for `{q}`");
+        }
+        // (2) with a tiny row cap, a modest closure trips the MATERIALIZED path but the
+        // streamed path (bounded by output bytes, not rows) still completes.
+        st.set_limit(ConfigId::LimitsTrail, 100);
+        let plan = crate::opt::optimize_indexed(
+            super::parse("g.V().repeat(out()).times(3).values('name')").unwrap(),
+            &st,
+        );
+        assert!(crate::exec::try_run(&plan, &st).is_err()); // materialized: E_RESOURCE
+        let streamed = crate::exec::run_gremlin_json(&plan, &st); // streamed: completes
+        assert!(streamed.starts_with('[') && streamed.ends_with(']') && streamed.len() > 2);
+    }
+
     /// A DEEP traversal (recursion depth = hop count) must not overflow the stack — the
     /// recursive var-length DFS runs on a large stack (`on_big_stack`). A 25k-node chain
     /// walked end to end recurses ~25k frames, well past the default 8 MB stack, yet must
