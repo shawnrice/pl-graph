@@ -4059,7 +4059,17 @@ fn frontier_counts(plan: &Plan, store: &Store) -> Option<Counts> {
                 return None; // the filter must test the current frontier
             }
             let counts = frontier_counts(input, store)?;
-            let keep = |id: u32| labels.iter().any(|l| store.is_labeled(id, l));
+            // Membership BITSET once (O(total wanted membership)), then O(1) per node —
+            // a mid-traversal `hasLabel` over a big count frontier tests up to node_count
+            // ids, and a per-node binary_search into the label buckets (is_labeled) is
+            // cache-hostile at that scale.
+            let mut member = vec![false; store.node_count()];
+            for l in labels {
+                for &id in store.nodes_with_label(l) {
+                    member[id as usize] = true;
+                }
+            }
+            let keep = |id: u32| member[id as usize];
             Some(match counts {
                 Counts::Sparse(v) => {
                     Counts::Sparse(v.into_iter().filter(|&(id, _)| keep(id)).collect())
@@ -9059,14 +9069,36 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             let node_buckets: Vec<&[u32]> =
                 labels.iter().map(|l| store.nodes_with_label(l)).collect();
             match batch.slot(*slot) {
-                Col::Nodes(ids) => Col::Bool(
-                    ids.iter()
-                        .map(|&id| {
-                            id != u32::MAX
-                                && node_buckets.iter().any(|b| b.binary_search(&id).is_ok())
-                        })
-                        .collect(),
-                ),
+                Col::Nodes(ids) => {
+                    // Large frontier (a mid-traversal `hasLabel` after a hop, often WITH
+                    // multiplicity): build a membership BITSET once — O(total wanted
+                    // membership) — and test each row O(1), instead of N cache-hostile
+                    // binary searches into the buckets. Small frontiers keep the probe
+                    // (building the bitset would cost more than a few searches).
+                    let total_bucket: usize = node_buckets.iter().map(|b| b.len()).sum();
+                    if ids.len() >= 1024 && ids.len() >= total_bucket {
+                        let mut member = vec![false; store.node_count()];
+                        for b in &node_buckets {
+                            for &id in *b {
+                                member[id as usize] = true;
+                            }
+                        }
+                        Col::Bool(
+                            ids.iter()
+                                .map(|&id| id != u32::MAX && member[id as usize])
+                                .collect(),
+                        )
+                    } else {
+                        Col::Bool(
+                            ids.iter()
+                                .map(|&id| {
+                                    id != u32::MAX
+                                        && node_buckets.iter().any(|b| b.binary_search(&id).is_ok())
+                                })
+                                .collect(),
+                        )
+                    }
+                }
                 Col::Edges(eids) => Col::Bool(
                     eids.iter()
                         .map(|&e| {
