@@ -93,6 +93,11 @@ fn engine_fixture(n: u32, deg: u32) -> Store {
     for eid in st.all_edges() {
         st.set_edge_prop(eid, "w", Value::Num(f64::from(eid % 1000)));
     }
+    // Var-length closures now enumerate fully (no silent hop cap), so an unbounded
+    // shape runs to the trail limit before it errors. Lower the limit to make a
+    // completing run feasible; the default matches the shipped 1M-row bound.
+    let trail = env_u32("FUZZ_TRAIL_LIMIT", 1_000_000);
+    st.set_limit(lenke_engine::store::ConfigId::LimitsTrail, u64::from(trail));
     st
 }
 
@@ -561,12 +566,19 @@ fn time_engine_guarded(
         for _ in 0..reps {
             let t = Instant::now();
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                lenke_engine::exec::run(&p, &s)
+                lenke_engine::exec::try_run(&p, &s)
             }));
             match out {
-                Ok(o) => {
+                // A runtime fault (E_RESOURCE on an unbounded closure, a failed CAST) is a
+                // categorized outcome, not a panic — surface its message so the report can
+                // separate "engine correctly refused" from "engine crashed".
+                Ok(Ok(o)) => {
                     best = best.min(t.elapsed().as_secs_f64() * 1e3);
                     rows = o.rows.len();
+                }
+                Ok(Err(e)) => {
+                    let _ = tx.send(Err(e));
+                    return;
                 }
                 Err(_) => {
                     let _ = tx.send(Err("engine panic".to_string()));
@@ -655,10 +667,36 @@ fn main() {
     let mut skips: HashMap<String, usize> = HashMap::new();
     let mut mismatches: Vec<(String, usize, usize)> = Vec::new();
     let mut timeouts: Vec<String> = Vec::new();
+    // Recursive path shapes (var-length, subpath-group quantifiers, shortest) run on a
+    // 1 GiB scoped stack and can enumerate deeply; with FUZZ_SKIP_VARLEN set they are
+    // skipped so a run stays bounded in memory. Their behavior is characterized
+    // separately (the engine refuses oversized closures with E_RESOURCE); this leaves
+    // the analytical-shape regression/mismatch signal, which is what the flag is for.
+    let skip_recursive = env_u32("FUZZ_SKIP_VARLEN", 0) != 0;
+    let is_recursive = |q: &str| {
+        const MARKERS: [&str; 8] = ["->{", "<-{", "SHORTEST", "){", ")*", ")+", "->*", "->+"];
+        MARKERS.iter().any(|m| q.contains(m))
+    };
     let mut timed = 0usize;
+    let mut processed = 0usize;
+    let mut recursive_skipped = 0usize;
+    let run_start = Instant::now();
     for (q, tags) in templates.values() {
         if timed >= max_time {
             break;
+        }
+        if skip_recursive && is_recursive(q) {
+            recursive_skipped += 1;
+            continue;
+        }
+        processed += 1;
+        if processed.is_multiple_of(250) {
+            eprintln!(
+                "  progress: {processed} processed, {timed} timed, {} errored, {} timeout ({:.0}s)",
+                skips.values().sum::<usize>(),
+                timeouts.len(),
+                run_start.elapsed().as_secs_f64()
+            );
         }
         let e = match time_engine_guarded(&estore, q, REPS, budget) {
             Ok(v) => v,
@@ -702,7 +740,7 @@ fn main() {
     let total = results.len();
     let wins = results.iter().filter(|r| r.ratio >= 1.0).count();
     println!(
-        "\n=== {total} templates timed | {wins} win / {} lose | {} skipped kinds ===",
+        "\n=== {total} templates timed | {wins} win / {} lose | {} skipped kinds | {recursive_skipped} recursive skipped ===",
         total - wins,
         skips.values().sum::<usize>()
     );
