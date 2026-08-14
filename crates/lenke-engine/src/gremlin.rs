@@ -5745,6 +5745,50 @@ mod tests {
         run(&plan, store)
     }
 
+    /// `repeat(x).times(1)` is rewritten to a single `Expand` at plan time — so it MUST
+    /// return exactly what the explicit one-hop `x()` does, INCLUDING a self-loop (Walk
+    /// keeps A->A). Compare the rewritten var-length form to the explicit hop across
+    /// out/in/both and typed edges, count + distinct + a value projection.
+    #[test]
+    fn repeat_times_one_equals_explicit_hop() {
+        let mut b = Builder::default();
+        for i in 0..40u32 {
+            b.node(&["N"], &[("v", n(f64::from(i)))]);
+        }
+        for i in 0u32..40 {
+            b.edge(i, (i + 1) % 40, "R");
+            b.edge(i, (i * 3 + 7) % 40, "F");
+        }
+        b.edge(0, 0, "R"); // self-loop — Walk keeps it on a 1-hop
+        let st = b.build();
+        let bag = |q: &str| value_bag(&gremlin_rows(q, &st));
+        for (rep, hop) in [
+            (
+                "g.V().repeat(__.out()).times(1).count()",
+                "g.V().out().count()",
+            ),
+            (
+                "g.V().repeat(__.both()).times(1).count()",
+                "g.V().both().count()",
+            ),
+            (
+                "g.V().repeat(__.in('R')).times(1).count()",
+                "g.V().in('R').count()",
+            ),
+            (
+                "g.V().repeat(__.both()).times(1).dedup().count()",
+                "g.V().both().dedup().count()",
+            ),
+            (
+                "g.V().repeat(__.out()).times(1).values('v')",
+                "g.V().out().values('v')",
+            ),
+            ("g.V('0').repeat(__.out('R')).times(1)", "g.V('0').out('R')"),
+        ] {
+            assert_eq!(bag(rep), bag(hop), "{rep} vs {hop}");
+        }
+    }
+
     /// `has(k, neq(v))` desugars to `Not(And(PropertyExists{k}, Eq{k,v}))`; the raw fast
     /// path must match that 3VL exactly — an absent-`k` node IS kept (false AND null =
     /// false, Not = true), a present `k != v` is kept, a present `k == v` is dropped.

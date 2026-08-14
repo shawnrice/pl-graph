@@ -327,6 +327,30 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
             double_loops,
         } => {
             let (i, c) = rewrite(*input, idx);
+            // `repeat(x).times(1)` — a VarLength of EXACTLY one hop with no until /
+            // body_filter — IS a single Expand, which unlocks every frontier fast path
+            // (counts, prop-agg, fused hops) the var-length executor lacks. Safe for
+            // WALK/TRAIL (one hop reuses no node/edge, so a self-loop A->A is kept, as
+            // Expand does); SIMPLE/ACYCLIC would drop that self-loop (revisits A), so they
+            // keep the VarLength.
+            if min == 1
+                && max == 1
+                && until.is_none()
+                && body_filter.is_none()
+                && matches!(mode, crate::ir::PathMode::Walk | crate::ir::PathMode::Trail)
+            {
+                return (
+                    Plan::Expand {
+                        input: Box::new(i),
+                        from,
+                        dir,
+                        edge_label,
+                        bind_edge: false,
+                        double_loops,
+                    },
+                    c,
+                );
+            }
             (
                 Plan::VarLength {
                     input: Box::new(i),
