@@ -3849,7 +3849,7 @@ fn try_frontier_group_fold(
     if kkey.contains('.') {
         return None;
     }
-    let width = chain_width(input)?;
+    let width = chain_width(input).or_else(|| chain_pull_width(input))?;
     if *kslot != width - 1 {
         return None;
     }
@@ -3862,16 +3862,28 @@ fn try_frontier_group_fold(
             _ => return None,
         }
     }
-    // Only the pure Scan/Expand chain, via the cheap direct frontier. A FILTERED chain is
-    // left to the general/filtered-aggregate paths: pulling it here to fuse the grouping
-    // would double the pull for a selective filter (the size gate bails AFTER the pull, then
-    // the fallback re-pulls) — measured a 0.30x regression, not worth the non-selective win.
-    let frontier = frontier_ids(input, store)?;
-    // Only worth skipping the key-column materialization once the frontier is large.
-    const FUSED_GROUP_ROWS: usize = 100_000;
-    if frontier.len() < FUSED_GROUP_ROWS {
+    // Gate on the ESTIMATED frontier size BEFORE any traversal/pull, so a SELECTIVE filter
+    // (a small frontier) bails here with ZERO wasted work. Pulling and then bailing on a
+    // post-hoc size check would double the pull for the fallback — a measured 0.30x
+    // regression. The estimator models filter selectivity (an indexed `=` is exact); a wrong
+    // estimate only costs time (byte-identical routes), never a row.
+    const FUSED_GROUP_ROWS: f64 = 100_000.0;
+    if crate::cost::estimate(input, store).rows < FUSED_GROUP_ROWS {
         return None;
     }
+    // A pure Scan/Expand chain gets its frontier cheaply and directly; a FILTERED chain is
+    // pulled ONCE (the pull applies every filter) and its endpoint slot IS the filtered
+    // frontier — same rows, same order the general path would group.
+    let frontier = match frontier_ids(input, store) {
+        Some(f) => f,
+        None => {
+            let b = pull(input, store, false).ok()?;
+            let Col::Nodes(f) = b.slot(width - 1) else {
+                return None;
+            };
+            f.clone()
+        }
+    };
     let (group_of, key_out, n_groups) = frontier_group_by(store, kkey, &frontier)?;
     let mut slots: Vec<Col> = vec![Col::Gen(key_out)];
     let mut fb: Option<Batch> = None; // built lazily (only for args that need fold_grouped)
