@@ -161,6 +161,11 @@ pub fn run(plan: &Plan, store: &Store) -> Rows {
 /// large-stack thread instead. Everything else keeps the cheap direct path.
 fn plan_has_varlen(plan: &Plan) -> bool {
     match plan {
+        // `VarLength` now runs the ITERATIVE `varlen_walk` (O(1) call stack — see
+        // `deep_varlen_walk_runs_on_a_tiny_stack`), so it never *commits* the big stack.
+        // We still take the reservation: it is virtual (≈0 RSS) and protects the whole
+        // read pipeline around the walk, which does use call-stack proportional to plan
+        // shape. The others below still recurse on data and genuinely need it.
         Plan::VarLength { .. }
         | Plan::RepeatGroup { .. }
         | Plan::NestedGroup { .. }
@@ -9033,10 +9038,9 @@ fn run_varlen<S: VarlenEmit>(
         }
         let mut node_stack = vec![v];
         let mut edge_stack: Vec<u32> = Vec::new();
-        varlen_dfs(
+        varlen_walk(
             store,
             v,
-            0,
             min,
             max,
             dir,
@@ -9237,6 +9241,256 @@ fn try_stream_varlen_json(
     Some(Ok(sink.out))
 }
 
+/// The pre-work verdict for a node reached at depth `len`: does the walk emit here,
+/// and should it descend into this node's adjacency? Mirrors the early-return ladder
+/// at the top of the recursive body so the iterative driver stays byte-identical.
+enum Enter {
+    /// Budget/cap tripped — abort the whole walk (unwind, no more emits).
+    Stop,
+    /// This node contributes no descent (a filter pruned it, an `until` matched, or
+    /// `len == max`). Any emit for it has already fired.
+    Prune,
+    /// Emit (if at a boundary) done; iterate this node's adjacency.
+    Iterate,
+}
+
+/// Node-entry pre-work: `should_stop`, body filter, per-rep predicate, the boundary
+/// emit, the `until`-match prune, and the `len == max` stop — in the SAME order and
+/// with the SAME emit point as the recursive `varlen_dfs`. Split out so the iterative
+/// driver runs it once per node exactly as the recursion did.
+#[allow(clippy::too_many_arguments)]
+fn varlen_enter<S: VarlenEmit>(
+    store: &Store,
+    v: u32,
+    len: u32,
+    min: u32,
+    max: u32,
+    k: u32,
+    per_rep_pred: Option<&Expr>,
+    until_stop: Option<(&Expr, usize)>,
+    body_filter: Option<(&Expr, usize)>,
+    node_stack: &[u32],
+    edge_stack: &[u32],
+    row: usize,
+    sink: &mut S,
+) -> Enter {
+    if sink.should_stop() {
+        return Enter::Stop;
+    }
+    if len > 0 {
+        if let Some((pred, slot)) = body_filter {
+            if !until_ok(pred, store, slot, v) {
+                return Enter::Prune;
+            }
+        }
+    }
+    if let Some(pred) = per_rep_pred {
+        if len > 0
+            && len.is_multiple_of(k)
+            && !rep_pred_ok(pred, store, node_stack, edge_stack, len, k)
+        {
+            return Enter::Prune;
+        }
+    }
+    let at_boundary = len >= min && len.is_multiple_of(k);
+    let until_hit = until_stop.map(|(p, slot)| until_ok(p, store, slot, v));
+    let emit_here = at_boundary && until_hit.unwrap_or(true);
+    if emit_here {
+        sink.emit(row, node_stack, edge_stack);
+    }
+    if until_stop.is_some() && emit_here {
+        return Enter::Prune;
+    }
+    if len == max {
+        return Enter::Prune;
+    }
+    Enter::Iterate
+}
+
+/// The `i`th adjacency entry of `v` under `dir`, in the recursion's order: the whole
+/// OUT slice first, then the whole IN slice. Recomputes the slices per call (each is an
+/// O(1) borrow), so the driver need not hold a borrow of `store` across the frame.
+#[inline]
+fn adj_nth(store: &Store, v: u32, dir: Dir, i: usize) -> Option<(bool, crate::store::Adj)> {
+    let out: &[crate::store::Adj] = if matches!(dir, Dir::Out | Dir::Both) {
+        store.out(v)
+    } else {
+        &[]
+    };
+    if i < out.len() {
+        return Some((false, out[i]));
+    }
+    let inc: &[crate::store::Adj] = if matches!(dir, Dir::In | Dir::Both) {
+        store.inc(v)
+    } else {
+        &[]
+    };
+    inc.get(i - out.len()).map(|a| (true, *a))
+}
+
+/// One open node on the walk's path: where we are (`v`, `len`), how far through its
+/// adjacency we've iterated (`cursor`), and — once we descend — how to undo the
+/// child's push when we resume (`pending`: `Some(true)` also pops a `used` mark).
+struct VarFrame {
+    v: u32,
+    len: u32,
+    cursor: usize,
+    pending: Option<bool>,
+}
+
+/// Iterative equivalent of [`varlen_dfs`] — an explicit heap-allocated frame stack in
+/// place of call recursion, so a deep closure costs heap (bounded, cheap to grow), not
+/// call-stack pages. This removes the multi-hundred-MB stack a deep path used to commit
+/// (and the 1 GiB scoped thread that hosted it): peak memory is now the frame stack plus
+/// the path stacks, all `O(current depth)`.
+///
+/// Byte-identical to the recursion for every walk that stays under the budget/cap: same
+/// pre-order emit points (via [`varlen_enter`]), same OUT-then-IN adjacency order (via
+/// [`adj_nth`]), same `Close` handling. Past the cap both return `E_RESOURCE` and their
+/// partial output is discarded, so the exact over-cap emit count is unobservable — the
+/// driver just tears down promptly, restoring `used`/the path stacks for the assert in
+/// [`run_varlen`].
+#[allow(clippy::too_many_arguments)]
+fn varlen_walk<S: VarlenEmit>(
+    store: &Store,
+    v0: u32,
+    min: u32,
+    max: u32,
+    dir: Dir,
+    want: &[u32],
+    mode: PathMode,
+    start: u32,
+    used: &mut Vec<u32>,
+    row: usize,
+    node_stack: &mut Vec<u32>,
+    edge_stack: &mut Vec<u32>,
+    per_rep_pred: Option<&Expr>,
+    k: u32,
+    until_stop: Option<(&Expr, usize)>,
+    body_filter: Option<(&Expr, usize)>,
+    double_loops: bool,
+    sink: &mut S,
+) {
+    // The source's own pre-work (an emit at `len == 0` for `min == 0`, filters). If it
+    // does not descend, there is nothing to walk.
+    match varlen_enter(
+        store, v0, 0, min, max, k, per_rep_pred, until_stop, body_filter, node_stack,
+        edge_stack, row, sink,
+    ) {
+        Enter::Iterate => {}
+        Enter::Prune | Enter::Stop => return,
+    }
+    let drop_loop = matches!(dir, Dir::Both) && !double_loops;
+    let mut stack: Vec<VarFrame> = vec![VarFrame { v: v0, len: 0, cursor: 0, pending: None }];
+    // Tear the whole stack down, undoing each frame's pending child push — keeps `used`
+    // and the path stacks clean on an abort so the next source starts fresh.
+    macro_rules! teardown {
+        () => {{
+            while let Some(f) = stack.pop() {
+                if let Some(pop_used) = f.pending {
+                    node_stack.pop();
+                    edge_stack.pop();
+                    if pop_used {
+                        used.pop();
+                    }
+                }
+            }
+            return;
+        }};
+    }
+    'frames: while let Some(top) = stack.last_mut() {
+        // Resuming after a child finished: undo the push that descent made.
+        if let Some(pop_used) = top.pending.take() {
+            node_stack.pop();
+            edge_stack.pop();
+            if pop_used {
+                used.pop();
+            }
+        }
+        let (v, len) = (top.v, top.len);
+        loop {
+            let cursor = top.cursor;
+            let Some((is_inc, a)) = adj_nth(store, v, dir, cursor) else {
+                stack.pop(); // this node's adjacency is exhausted
+                continue 'frames;
+            };
+            top.cursor += 1;
+            // Edge must carry a wanted label (primary type or, multi-label, a secondary).
+            if !want.is_empty()
+                && !want.iter().any(|&w| {
+                    w == a.etype || (store.has_multi_label_edges() && store.edge_has_label(a.eid, w))
+                })
+            {
+                continue;
+            }
+            if is_inc && drop_loop && a.nbr == v {
+                continue;
+            }
+            let mark = match varlen_step(mode, start, &a, used) {
+                VarStep::Skip => continue,
+                VarStep::Close => {
+                    // Closing hop (Simple cycle back to `start`): emit at a rep boundary,
+                    // never descend. Push/emit/pop so the path is complete for the sink.
+                    if len + 1 >= min && (len + 1).is_multiple_of(k) {
+                        node_stack.push(a.nbr);
+                        edge_stack.push(a.eid);
+                        sink.emit(row, node_stack, edge_stack);
+                        node_stack.pop();
+                        edge_stack.pop();
+                    }
+                    continue;
+                }
+                VarStep::Go(mark) => mark,
+            };
+            if let Some(m) = mark {
+                used.push(m);
+            }
+            node_stack.push(a.nbr);
+            edge_stack.push(a.eid);
+            match varlen_enter(
+                store,
+                a.nbr,
+                len + 1,
+                min,
+                max,
+                k,
+                per_rep_pred,
+                until_stop,
+                body_filter,
+                node_stack,
+                edge_stack,
+                row,
+                sink,
+            ) {
+                Enter::Iterate => {
+                    // Descend: remember how to undo this push, push the child frame.
+                    top.pending = Some(mark.is_some());
+                    stack.push(VarFrame { v: a.nbr, len: len + 1, cursor: 0, pending: None });
+                    continue 'frames;
+                }
+                Enter::Prune => {
+                    // No descent — undo the push now and try the next sibling edge.
+                    node_stack.pop();
+                    edge_stack.pop();
+                    if mark.is_some() {
+                        used.pop();
+                    }
+                    continue;
+                }
+                Enter::Stop => {
+                    node_stack.pop();
+                    edge_stack.pop();
+                    if mark.is_some() {
+                        used.pop();
+                    }
+                    teardown!();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn varlen_dfs<S: VarlenEmit>(
     store: &Store,
@@ -13885,6 +14139,163 @@ mod tests {
     use crate::ir::Plan;
     use crate::store::Builder;
     use std::sync::Arc;
+
+    /// The iterative `varlen_walk` must emit the exact same paths, in the exact same
+    /// order, as the recursive `varlen_dfs` it replaced — over every mode/direction/bound
+    /// combination on a spread of random graphs. Byte-identity is the hard invariant; this
+    /// is the direct A/B guard (the corpus + differential fuzzer cover the predicate hooks).
+    #[test]
+    fn iterative_varlen_matches_recursive() {
+        struct RecordEmit {
+            paths: Vec<(Vec<u32>, Vec<u32>)>,
+        }
+        impl VarlenEmit for RecordEmit {
+            fn emit(&mut self, _row: usize, node_stack: &[u32], edge_stack: &[u32]) {
+                self.paths.push((node_stack.to_vec(), edge_stack.to_vec()));
+            }
+            fn should_stop(&self) -> bool {
+                false
+            }
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn collect(
+            store: &Store,
+            n_nodes: u32,
+            mode: PathMode,
+            dir: Dir,
+            min: u32,
+            max: u32,
+            k: u32,
+            double_loops: bool,
+            iterative: bool,
+        ) -> Vec<(Vec<u32>, Vec<u32>)> {
+            let node_unique = matches!(mode, PathMode::Simple | PathMode::Acyclic);
+            let mut sink = RecordEmit { paths: Vec::new() };
+            let mut used: Vec<u32> = Vec::new();
+            for v in 0..n_nodes {
+                if node_unique {
+                    used.push(v);
+                }
+                let mut ns = vec![v];
+                let mut es: Vec<u32> = Vec::new();
+                if iterative {
+                    varlen_walk(
+                        store, v, min, max, dir, &[], mode, v, &mut used, v as usize, &mut ns,
+                        &mut es, None, k, None, None, double_loops, &mut sink,
+                    );
+                } else {
+                    varlen_dfs(
+                        store, v, 0, min, max, dir, &[], mode, v, &mut used, v as usize, &mut ns,
+                        &mut es, None, k, None, None, double_loops, &mut sink,
+                    );
+                }
+                if node_unique {
+                    used.pop();
+                }
+                assert!(used.is_empty(), "used stack left dirty after a source");
+            }
+            sink.paths
+        }
+
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _trial in 0..60 {
+            let n_nodes = 4 + (rng() % 7) as u32;
+            let mut nd = String::new();
+            for i in 0..n_nodes {
+                nd.push_str(&format!("{{\"id\":\"n{i}\",\"labels\":[\"P\"],\"props\":{{}}}}\n"));
+            }
+            let ecount = (rng() % (u64::from(n_nodes) * 3 + 1)) as u32;
+            for e in 0..ecount {
+                let f = (rng() % u64::from(n_nodes)) as u32;
+                let t = (rng() % u64::from(n_nodes)) as u32;
+                nd.push_str(&format!(
+                    "{{\"id\":\"e{e}\",\"from\":\"n{f}\",\"to\":\"n{t}\",\"labels\":[\"R\"],\"props\":{{}}}}\n"
+                ));
+            }
+            let store = crate::ndjson::from_ndjson(&nd).unwrap();
+            for mode in [PathMode::Walk, PathMode::Trail, PathMode::Simple, PathMode::Acyclic] {
+                for dir in [Dir::Out, Dir::In, Dir::Both] {
+                    for (min, max, k) in [(0u32, 3u32, 1u32), (1, 4, 1), (2, 2, 1), (1, 6, 2), (0, 4, 1)]
+                    {
+                        for double_loops in [false, true] {
+                            let rec = collect(
+                                &store, n_nodes, mode, dir, min, max, k, double_loops, false,
+                            );
+                            let itr = collect(
+                                &store, n_nodes, mode, dir, min, max, k, double_loops, true,
+                            );
+                            assert_eq!(
+                                rec, itr,
+                                "mode={mode:?} dir={dir:?} {min}..={max} k={k} dl={double_loops} ecount={ecount}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The iterative walk uses O(1) call stack regardless of closure depth: a 40k-deep
+    /// traversal — which the old recursive DFS would have driven ~40k frames deep, blowing
+    /// any normal stack — completes on a deliberately TINY (512 KiB) thread. This is why a
+    /// deep closure can no longer overflow (and why its peak memory is now bounded heap,
+    /// not committed stack). Drives `run_varlen` directly, off any big stack.
+    #[test]
+    fn deep_varlen_walk_runs_on_a_tiny_stack() {
+        // A 40k-long chain n0->n1->...; recursing it would need ~20 MB of stack.
+        let mut nd = String::new();
+        for i in 0..40_000u32 {
+            nd.push_str(&format!("{{\"id\":\"n{i}\",\"labels\":[\"P\"],\"props\":{{}}}}\n"));
+        }
+        for i in 0..39_999u32 {
+            nd.push_str(&format!(
+                "{{\"id\":\"e{i}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"props\":{{}}}}\n",
+                i + 1
+            ));
+        }
+        let store = crate::ndjson::from_ndjson(&nd).unwrap();
+        // Drive the walk directly (bypassing the pull machinery) so the test isolates
+        // varlen_walk's OWN stack use. An unbounded out-walk from n0 emits one path per
+        // reachable prefix (39 999 of them) and recurses 40k deep in the old DFS.
+        struct CountEmit(usize);
+        impl VarlenEmit for CountEmit {
+            fn emit(&mut self, _row: usize, _node_stack: &[u32], _edge_stack: &[u32]) {
+                self.0 += 1;
+            }
+            fn should_stop(&self) -> bool {
+                false
+            }
+        }
+        let handle = std::thread::Builder::new()
+            .stack_size(512 * 1024) // far below the ~20 MB a recursive DFS would need
+            .spawn(move || {
+                let mut sink = CountEmit(0);
+                run_varlen(
+                    &[0],           // source = n0
+                    &store,
+                    &[],            // any edge label
+                    1,              // min
+                    u32::MAX,       // max (unbounded)
+                    Dir::Out,
+                    PathMode::Walk,
+                    None,
+                    1,              // k
+                    None,
+                    None,
+                    false,
+                    &mut sink,
+                );
+                sink.0
+            })
+            .unwrap();
+        assert_eq!(handle.join().expect("must not overflow the tiny stack"), 39_999);
+    }
 
     fn n(x: f64) -> Value {
         Value::Num(x)
