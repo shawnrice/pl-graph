@@ -88,6 +88,133 @@ pub fn optimize_indexed(plan: Plan, idx: &dyn IndexOracle) -> Plan {
     plan
 }
 
+/// Output column count of a plan, when it is statically known — enough to locate the
+/// slot a hop APPENDS (its endpoint). `None` for shapes whose width isn't obvious.
+fn plan_out_width(p: &Plan) -> Option<usize> {
+    Some(match p {
+        Plan::Scan { .. }
+        | Plan::IndexSeek { .. }
+        | Plan::RangeSeek { .. }
+        | Plan::NodeSeed { .. }
+        | Plan::EdgeSeed { .. }
+        | Plan::Row => 1,
+        Plan::Expand {
+            input, bind_edge, ..
+        } => plan_out_width(input)? + usize::from(*bind_edge) + 1,
+        Plan::VarLength { input, .. } | Plan::ShortestPath { input, .. } => {
+            plan_out_width(input)? + 1
+        }
+        Plan::Filter { input, .. }
+        | Plan::OrderPage { input, .. }
+        | Plan::Distinct { input }
+        | Plan::DistinctBy { input, .. } => plan_out_width(input)?,
+        Plan::Project { items, .. } => items.len(),
+        _ => return None,
+    })
+}
+
+/// Is the value at `slot` in `p`'s output a NODE? Conservative: only shapes that provably
+/// bind a node there return true (an edge slot / unknown shape → false, so we never turn
+/// an EDGE label test into a node `IsLabeled`). A hop's appended endpoint (slot ==
+/// input width) is a node when `bind_edge` is false; a bound edge lands one slot earlier.
+fn slot_is_node(p: &Plan, slot: usize) -> bool {
+    match p {
+        Plan::Scan { .. }
+        | Plan::IndexSeek { .. }
+        | Plan::RangeSeek { .. }
+        | Plan::NodeSeed { .. } => slot == 0,
+        Plan::Expand {
+            input, bind_edge, ..
+        } => match plan_out_width(input) {
+            // The endpoint node is the LAST appended slot; a bound edge sits one before it.
+            Some(w) if slot == w + usize::from(*bind_edge) => true,
+            _ => slot_is_node(input, slot),
+        },
+        Plan::VarLength { input, .. } | Plan::ShortestPath { input, .. } => {
+            match plan_out_width(input) {
+                Some(w) if slot == w => true, // the appended endpoint is a node
+                _ => slot_is_node(input, slot),
+            }
+        }
+        Plan::Filter { input, .. }
+        | Plan::OrderPage { input, .. }
+        | Plan::Distinct { input }
+        | Plan::DistinctBy { input, .. } => slot_is_node(input, slot),
+        _ => false,
+    }
+}
+
+/// Canonicalize a predicate so every fast-path sees ONE spelling of a label test:
+/// `<label> IN labels(slot)` — the form GQL's `(b:Label)` pattern emits — becomes
+/// `IsLabeled { slot, [label] }`, the same node Gremlin's `hasLabel` produces. Gated on
+/// `slot` being a NODE (via `input`, the plan feeding the filter) because an EDGE's
+/// `IS LABELED` lowers to the same `In(Lit, labels(slot))` form but means the edge's
+/// type, which `IsLabeled` (node labels) would answer wrongly. Recurses through the
+/// boolean combinators.
+fn normalize_pred(e: Expr, input: &Plan) -> Expr {
+    match e {
+        Expr::In { needle, haystack } => {
+            if let (Expr::Lit(crate::value::Value::Str(l)), Expr::Call { name, args }) =
+                (needle.as_ref(), haystack.as_ref())
+            {
+                if name == "labels" && args.len() == 1 {
+                    if let Expr::Slot(s) = args[0] {
+                        if slot_is_node(input, s) {
+                            return Expr::IsLabeled {
+                                slot: s,
+                                labels: vec![l.to_string()],
+                            };
+                        }
+                    }
+                }
+            }
+            // `x IN [<literals>]` → `x = a OR x = b OR …`: the OR-chain vectorizes through
+            // the fast compare path and lets the index-seed logic multi-seek, instead of
+            // re-cloning the list value and scanning it per row. Identical 3VL — a NULL in
+            // the list makes a non-matching row UNKNOWN exactly as `x = NULL` (→ NULL) does
+            // inside the OR. Gated to a small literal list of a cheap needle (so the needle
+            // isn't re-evaluated expensively) with at least one element.
+            if let Expr::Lit(crate::value::Value::List(items)) = haystack.as_ref() {
+                let simple_needle = matches!(
+                    needle.as_ref(),
+                    Expr::Prop { .. } | Expr::Slot(_) | Expr::Lit(_)
+                );
+                if simple_needle && !items.is_empty() && items.len() <= 32 {
+                    let eq = |v: &crate::value::Value| Expr::Compare {
+                        op: CompareOp::Eq,
+                        left: needle.clone(),
+                        right: Box::new(Expr::Lit(v.clone())),
+                    };
+                    let mut it = items.iter().rev();
+                    let mut acc = eq(it.next().expect("non-empty"));
+                    for item in it {
+                        acc = Expr::Or(Box::new(eq(item)), Box::new(acc));
+                    }
+                    return acc;
+                }
+            }
+            Expr::In {
+                needle: Box::new(normalize_pred(*needle, input)),
+                haystack: Box::new(normalize_pred(*haystack, input)),
+            }
+        }
+        Expr::Not(a) => Expr::Not(Box::new(normalize_pred(*a, input))),
+        Expr::And(a, b) => Expr::And(
+            Box::new(normalize_pred(*a, input)),
+            Box::new(normalize_pred(*b, input)),
+        ),
+        Expr::Or(a, b) => Expr::Or(
+            Box::new(normalize_pred(*a, input)),
+            Box::new(normalize_pred(*b, input)),
+        ),
+        Expr::Xor(a, b) => Expr::Xor(
+            Box::new(normalize_pred(*a, input)),
+            Box::new(normalize_pred(*b, input)),
+        ),
+        other => other,
+    }
+}
+
 /// Rewrite one node: optimize its children, then apply the local rules to it.
 /// Returns the new plan and whether anything changed.
 fn rewrite(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
@@ -452,6 +579,7 @@ fn map_children(plan: Plan, idx: &dyn IndexOracle) -> (Plan, bool) {
         }
         Plan::Filter { input, pred } => {
             let (i, c) = rewrite(*input, idx);
+            let pred = normalize_pred(pred, &i);
             (
                 Plan::Filter {
                     input: Box::new(i),

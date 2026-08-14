@@ -154,7 +154,74 @@ pub fn run(plan: &Plan, store: &Store) -> Rows {
 /// plan that never evaluates a fallible expression cannot error, which is why
 /// [`run`] can wrap this with `.expect` — the panic path is unreachable for such
 /// plans, and callers that may run user CASTs use `try_run` (or `execute`).
+/// Does the plan contain a variable-length / repeat / shortest-path operator? Those run a
+/// recursive DFS whose depth is the traversal depth, so an unbounded quantifier on a deep
+/// graph can recurse far enough to overflow the default 8 MB stack (a stack overflow
+/// aborts the process — `catch_unwind` cannot recover it). Such a plan runs on a
+/// large-stack thread instead. Everything else keeps the cheap direct path.
+fn plan_has_varlen(plan: &Plan) -> bool {
+    match plan {
+        Plan::VarLength { .. }
+        | Plan::RepeatGroup { .. }
+        | Plan::NestedGroup { .. }
+        | Plan::ShortestPath { .. }
+        | Plan::ShortestPathEnum { .. } => true,
+        Plan::Scan { .. }
+        | Plan::NodeSeed { .. }
+        | Plan::EdgeScan
+        | Plan::EdgeSeed { .. }
+        | Plan::Row
+        | Plan::IndexSeek { .. }
+        | Plan::RangeSeek { .. }
+        | Plan::Insert { .. }
+        | Plan::InsertReturn { .. }
+        | Plan::Merge { .. }
+        | Plan::AddEdge { .. }
+        | Plan::CallProcedure { .. } => false,
+        Plan::Filter { input, .. }
+        | Plan::Project { input, .. }
+        | Plan::Aggregate { input, .. }
+        | Plan::Expand { input, .. }
+        | Plan::EdgeVertex { input, .. }
+        | Plan::Distinct { input }
+        | Plan::DistinctBy { input, .. }
+        | Plan::OrderPage { input, .. }
+        | Plan::Sample { input, .. }
+        | Plan::Enumerate { input, .. }
+        | Plan::GroupToMap { input }
+        | Plan::SortLocal { input, .. }
+        | Plan::Unwind { input, .. }
+        | Plan::Update { input, .. }
+        | Plan::CallInline { input, .. } => plan_has_varlen(input),
+        Plan::Join { left, right, .. } | Plan::Union { left, right, .. } => {
+            plan_has_varlen(left) || plan_has_varlen(right)
+        }
+        // Rare/other operators (tree, subgraph, interval/optional expand, algo wrappers):
+        // conservatively use the big stack — they may wrap a traversal, and the cost of a
+        // reserved-but-untouched stack is nil.
+        _ => true,
+    }
+}
+
 pub fn try_run(plan: &Plan, store: &Store) -> Result<Rows, String> {
+    // Run a deep-recursion (traversal) plan on a big stack so an unbounded quantifier
+    // can't overflow; a simple plan keeps the cheap direct path. Stack is virtual —
+    // reserving a large size costs nothing until the recursion actually uses it.
+    if plan_has_varlen(plan) {
+        const BIG_STACK: usize = 1 << 30; // 1 GiB (virtual)
+        return std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(BIG_STACK)
+                .spawn_scoped(s, || try_run_inner(plan, store))
+                .expect("spawn traversal thread")
+                .join()
+                .expect("traversal thread panicked")
+        });
+    }
+    try_run_inner(plan, store)
+}
+
+fn try_run_inner(plan: &Plan, store: &Store) -> Result<Rows, String> {
     // Lineage is plan-global: if anything reads the path, the whole plan tracks
     // it (Scan seeds, Expand extends); otherwise no operator builds a sidecar and
     // the query pays nothing for lineage.
@@ -882,6 +949,33 @@ fn render_nodes(store: &Store, ids: &[u32]) -> Vec<Value> {
         .collect()
 }
 
+/// Resolve the node property columns an element/value map reads, in the SAME order and
+/// membership the per-node path produced — sorted keys (every present property, or the
+/// `filter` list sorted), each paired with its column. Hoists the per-node
+/// `prop_keys()` clone+sort and per-key HashMap probes out of the row loop; the caller
+/// then does one `present_at`/`read` per column per node. Byte-identical: `prop_keys_arc`
+/// is already sorted, a filter list is sorted here, and a filtered-then-sorted present
+/// subset is the same set in the same order.
+fn resolve_node_cols<'a>(
+    store: &'a Store,
+    filter: &[String],
+) -> Vec<(std::sync::Arc<str>, &'a crate::store::Column)> {
+    use std::sync::Arc;
+    if filter.is_empty() {
+        store
+            .prop_keys_arc()
+            .iter()
+            .filter_map(|k| store.column(k).map(|c| (Arc::clone(k), c)))
+            .collect()
+    } else {
+        let mut keys = filter.to_vec();
+        keys.sort();
+        keys.into_iter()
+            .filter_map(|k| store.column(&k).map(|c| (Arc::from(k.as_str()), c)))
+            .collect()
+    }
+}
+
 /// The canonical result map for a node — `{id, labels(sorted), properties(sorted by
 /// key)}`, byte-identical to lenke-core's `val_to_value(Node)`.
 fn node_result_value(store: &Store, id: u32) -> Value {
@@ -1317,6 +1411,12 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             if let Some(b) = try_reverse_expand(pred, input, store, track) {
                 return Ok(b);
             }
+            // Target-aware shortest path: a `= t` on the endpoint bounds the BFS to the
+            // target's distance (the outer filter here still runs, so this only skips
+            // work the filter would discard).
+            if let Some(b) = try_shortest_early_stop(pred, input, store, track) {
+                return Ok(b);
+            }
             let batch = pull(input, store, track)?;
             // Fast path: `<prop> <cmp> <literal>` reads storage in one pass to
             // keep-indices; otherwise evaluate the predicate as a full column.
@@ -1360,7 +1460,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             until.as_deref(),
             body_filter.as_deref(),
             *double_loops,
-        ),
+        )?,
         Plan::RepeatGroup {
             input,
             from,
@@ -1388,7 +1488,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             None,
             None,
             false,
-        ),
+        )?,
         Plan::NestedGroup {
             input,
             from,
@@ -1429,6 +1529,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             *max,
             *selector,
             edge_pred.as_deref(),
+            None,
         ),
         Plan::GroupToMap { input } => {
             // Fold the grouped `[key, value]` rows into one Gremlin Map, first-seen
@@ -1620,6 +1721,7 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 .or_else(|| try_filtered_count(input, keys, aggs, store))
                 .or_else(|| try_edge_filtered_count(input, keys, aggs, store))
                 .or_else(|| try_varlen_count(input, keys, aggs, store))
+                .or_else(|| try_edge_cross_count(input, keys, aggs, store))
                 .or_else(|| try_frontier_count(input, keys, aggs, store))
                 .or_else(|| try_varlen_distinct_count(input, keys, aggs, store))
                 .or_else(|| try_varlen_distinctby_count(input, keys, aggs, store))
@@ -1882,6 +1984,14 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             batch.gather(&keep)
         }
         Plan::DistinctBy { input, key_slots } => {
+            // `values(<dict col>).dedup()`: dedup on the dict CODES (≤ dict size) in one
+            // pass instead of decoding + hashing every row's string. First-seen by code is
+            // the same order as first-seen by string, so byte-identical.
+            if key_slots.as_slice() == [0] {
+                if let Some(b) = try_distinct_dict_col(input, store) {
+                    return Ok(b);
+                }
+            }
             // Gremlin dedup('a','b'): keep the first row per distinct tuple of the
             // tagged key slots, preserving every other column (group-first-seen keyed
             // on those slots only). Same NaN-never-a-duplicate rule as Distinct.
@@ -2381,6 +2491,738 @@ fn pull_top_output_streamed(
     Ok(Some(concat_batches(&acc)))
 }
 
+/// PROTOTYPE streaming result sink (Gremlin single-column array): serialize the result
+/// JSON directly, block by block, instead of materializing the whole output `Batch` then
+/// the `Rows` then the string. `streaming_chain` runs each hop PER BLOCK, so the full
+/// frontier is never built, and only O(block) intermediate values coexist — the win for a
+/// projection over a big fan-out and the defuse for a deep-traversal blow-up.
+///
+/// CONSERVATIVE opt-in: only a terminal single-item `Project` over a streamable chain, and
+/// only when the estimated row count clears a high bar (below it the block/serialize
+/// overhead loses to the vectorized materialized path). Returns `None` to fall back to
+/// `gremlin_results_json(run(plan))`. Byte-identical: same rows in the same
+/// (source-id/frontier) order, same per-cell rendering (`col_into_values` +
+/// `json::write_value`).
+/// Is `body` (the per-block body from `streaming_chain`, with its leaf source replaced
+/// by `Plan::Row`) exactly one `Expand` over the block source, carrying no operator that
+/// breaks the two invariants the streaming win depends on? That is the only chain whose
+/// streamed form reliably beats materializing (measured):
+///   - exactly ONE hop — a deeper chain re-runs every hop per block and loses (1.3-7.6x);
+///   - the only `Filter` allowed is a bare `PropertyExists` presence check (which
+///     `values()` always inserts) — the row estimate the caller gates on models presence
+///     accurately, but a VALUE comparison (`has(eq(..))`) it over-counts wildly, which
+///     would wave a large regression through the row floor.
+fn single_hop_no_filter(body: &Plan) -> bool {
+    match body {
+        Plan::Project { input, .. } | Plan::EdgeVertex { input, .. } => {
+            single_hop_no_filter(input)
+        }
+        Plan::Filter { input, pred } => {
+            matches!(pred, crate::ir::Expr::PropertyExists { .. }) && single_hop_no_filter(input)
+        }
+        Plan::Expand { input, .. } => matches!(input.as_ref(), Plan::Row),
+        _ => false,
+    }
+}
+
+pub fn try_stream_gremlin_json(
+    plan: &Plan,
+    store: &Store,
+    track: bool,
+    min_rows: f64,
+) -> Option<String> {
+    if track {
+        return None; // a path/lineage result is not this shape
+    }
+    let Plan::Project { input, items } = plan else {
+        return None;
+    };
+    if items.len() != 1 {
+        return None; // a Gremlin result is a single column
+    }
+    // STRUCTURAL gate (measured — see `plan_probe`): stream ONLY the one shape that
+    // reliably wins — a SINGLE hop with NO filter. A deeper chain re-runs every hop
+    // per block and loses (1.3-7.6x); a filtered chain defeats the row estimate
+    // (`has(eq(..))` estimates 144k but matches ~1, so a row gate would wave a 7.6x
+    // regression through). Requiring one bare Expand sidesteps both — and there the
+    // estimate is trustworthy, so the `min_rows` floor gates the rest.
+    let (inner_body, ids) = streaming_chain(input, store)?;
+    if !single_hop_no_filter(&inner_body) {
+        return None;
+    }
+    // Deliberately HIGH floor: below it the block/serialize overhead loses to the
+    // vectorized materialized path — we do NOT opt in early.
+    if crate::cost::estimate(input, store).rows < min_rows {
+        return None;
+    }
+    // Run the chain BELOW the projection per block, then serialize the one output value
+    // per row directly — fusing render + serialize so the string heap is touched once,
+    // not once to `clone` into a `Col::Str`/`Vec<Value>` and again to serialize. When the
+    // sole item is a bare `Prop` over the block's node frontier, `write_nodes_prop_json`
+    // reads and writes each property in one scattered pass (no `Arc` bump, no `Value`);
+    // any other item falls back to project-then-`write_col_json` (still one pass, no
+    // `Vec<Value>`). Byte-identical to `pull_body(Project{..})` then `write_value` each.
+    const BLOCK: usize = 8192;
+    let single_prop = match items.as_slice() {
+        [(_, Expr::Prop { slot, key })] => Some((*slot, key.as_str())),
+        _ => None,
+    };
+    let mut out = String::from("[");
+    let mut first = true;
+    let mut start = 0usize;
+    while start < ids.len() {
+        let end = (start + BLOCK).min(ids.len());
+        let batch = pull_body(
+            &inner_body,
+            store,
+            &Batch::single(Col::Nodes(ids[start..end].to_vec())),
+        )
+        .ok()?;
+        // Fused fast path: one Prop over a fully-present scalar node column.
+        if let Some((slot, key)) = single_prop {
+            if let Col::Nodes(nids) = batch.slot(slot) {
+                if write_nodes_prop_json(&mut out, store, nids, key, &mut first) {
+                    start = end;
+                    continue;
+                }
+            }
+        }
+        // General path: project the item(s) to one column, serialize it in place.
+        let cols = eval_all(items.iter().map(|(_, e)| e), store, &batch).ok()?;
+        let col = cols.into_iter().next()?;
+        write_col_json(&mut out, &col, store, &mut first);
+        start = end;
+    }
+    out.push(']');
+    Some(out)
+}
+
+/// Serialize `nids`'s value for property `key` straight into `out` (comma-separated,
+/// `first` tracking whether a leading comma is due), when the property is a
+/// fully-present scalar column — the fused render+serialize fast path. Returns `false`
+/// WITHOUT writing anything when the shape isn't handled (a sentinel id, an absent
+/// value, or a non-scalar column), so the caller can fall back for that block. The
+/// bytes written are identical to `read_property` → `write_value`: a `Str`/`Dict` cell
+/// as a JSON string, `Num` per the number rules, `Bool` as a literal.
+fn write_nodes_prop_json(
+    out: &mut String,
+    store: &Store,
+    nids: &[u32],
+    key: &str,
+    first: &mut bool,
+) -> bool {
+    if nids.contains(&u32::MAX) {
+        return false; // a null sentinel needs the general NULL-carrying path
+    }
+    let Some(column) = store.column(key) else {
+        return false; // missing column → all NULL, let the general path emit nulls
+    };
+    // All-present check up front: a partial column must not emit a half-written block.
+    let present = match column {
+        Column::Num { present, .. }
+        | Column::Str { present, .. }
+        | Column::Dict { present, .. }
+        | Column::Bool { present, .. } => present,
+        _ => return false,
+    };
+    if nids.iter().any(|&id| !present[id as usize]) {
+        return false;
+    }
+    let sep = |out: &mut String, first: &mut bool| {
+        if !*first {
+            out.push(',');
+        }
+        *first = false;
+    };
+    match column {
+        Column::Str { data, .. } => {
+            for &id in nids {
+                sep(out, first);
+                crate::json::write_string(out, &data[id as usize]);
+            }
+        }
+        Column::Dict { dict, codes, .. } => {
+            for &id in nids {
+                sep(out, first);
+                crate::json::write_string(out, &dict[codes[id as usize] as usize]);
+            }
+        }
+        Column::Num { data, .. } => {
+            for &id in nids {
+                sep(out, first);
+                crate::json::write_value(out, &Value::Num(data[id as usize]));
+            }
+        }
+        Column::Bool { data, .. } => {
+            for &id in nids {
+                sep(out, first);
+                out.push_str(if data[id as usize] { "true" } else { "false" });
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Serialize a whole projected `Col` into `out` (comma-separated, `first`-tracked),
+/// without the `Col` → `Vec<Value>` step `col_into_values` would take: a typed column
+/// (`Str`/`Num`/`Bool`) writes each cell straight, and only a boxed `Gen` column defers
+/// to `write_value`. Byte-identical to serializing `col_into_values(col)` cell by cell.
+fn write_col_json(out: &mut String, col: &Col, store: &Store, first: &mut bool) {
+    let sep = |out: &mut String, first: &mut bool| {
+        if !*first {
+            out.push(',');
+        }
+        *first = false;
+    };
+    match col {
+        Col::Str(v) => {
+            for s in v {
+                sep(out, first);
+                crate::json::write_string(out, s);
+            }
+        }
+        Col::Num(v) => {
+            for &x in v {
+                sep(out, first);
+                crate::json::write_value(out, &Value::Num(x));
+            }
+        }
+        Col::Bool(v) => {
+            for &b in v {
+                sep(out, first);
+                out.push_str(if b { "true" } else { "false" });
+            }
+        }
+        // Nodes/Edges render as element maps, Gen carries arbitrary values — both need
+        // the full renderer. Reuse `col_into_values` (the identical cells) for these.
+        _ => {
+            for v in col_into_values(col.clone(), store) {
+                sep(out, first);
+                crate::json::write_value(out, &v);
+            }
+        }
+    }
+}
+
+/// Entry point the FFI's `lnk_e_gremlin_json` uses: stream the result JSON when the shape
+/// and cost allow, else materialize + serialize as before. Kept here (not in the FFI) so
+/// it has the plan + streaming machinery; falls back transparently.
+pub fn run_gremlin_json(plan: &Plan, store: &Store) -> String {
+    try_run_gremlin_json(plan, store).expect("read plan evaluation faulted")
+}
+
+/// Fallible Gremlin-JSON entry point: an evaluation fault (a bad cast, a cross-type
+/// order, …) returns `Err` instead of panicking, so the FFI can surface it as a null
+/// result rather than unwinding across the C boundary (which aborts the process).
+pub fn try_run_gremlin_json(plan: &Plan, store: &Store) -> Result<String, String> {
+    // Fused element/value-map serialization: for a terminal node-map projection, write
+    // the JSON straight from the columns and skip building a `Value::Map` tree per row
+    // (the dominant cost of these shapes — ~8-10 heap allocs/row otherwise). No cost
+    // gate: it is strictly less work than build-then-serialize, so it wins at all sizes.
+    if let Some(json) = try_fused_map_json(plan, store) {
+        return Ok(json);
+    }
+    if let Some(json) = try_fused_fold_json(plan, store) {
+        return Ok(json);
+    }
+    if let Some(json) = try_fused_maplit_json(plan, store) {
+        return Ok(json);
+    }
+    // Measured crossover (see `plan_probe`): below ~1M output rows the materialized
+    // path ties or wins; the streamed sink pulls 20-29% ahead only at 1M-2.7M+, where
+    // it also never builds the full frontier column. Deliberately high — we do NOT opt
+    // in eagerly (matches the `pull_top_output_streamed` precedent).
+    const STREAM_JSON_ROWS: f64 = 1_000_000.0;
+    let track = needs_lineage(plan);
+    if let Some(json) = try_stream_gremlin_json(plan, store, track, STREAM_JSON_ROWS) {
+        return Ok(json);
+    }
+    Ok(crate::json::gremlin_results_json(&try_run(plan, store)?))
+}
+
+/// The node-map projection shapes the fused serializer handles, each byte-identical to
+/// building the corresponding `Value::Map` then serializing it.
+enum NodeMapKind {
+    /// A bare node frontier → the NESTED `{id, labels:[…], properties:{…}}` render
+    /// (`node_result_value`), where `id` falls back to the dense id as a string.
+    Nested,
+    /// Gremlin `elementMap()` → the FLAT `{id, label, <props…>}`, where `id`/`label`
+    /// are NULL (not a dense-id fallback) when absent.
+    Flat,
+    /// Gremlin `valueMap()` (`wrap=false`) / `propertyMap()` (`wrap=true`, each value in
+    /// a one-element list) → just the present properties.
+    Value { wrap: bool },
+}
+
+/// `g.V().project(k…).by(e…)` and GQL map projections — a terminal `Project{[MapLit]}`
+/// — serialized straight to `[{k:v,…},…]`, skipping the per-row `Value::Map` (its Vec,
+/// Arc, and freshly-allocated key Arcs). Values are computed vectorized (`eval_all`) once;
+/// a scalar cell writes directly, an element cell falls back to `render_cell` (its element
+/// map). Byte-identical to building the map then serializing: same key order, same values.
+fn try_fused_maplit_json(plan: &Plan, store: &Store) -> Option<String> {
+    let Plan::Project { input, items } = plan else {
+        return None;
+    };
+    let [(_, Expr::MapLit { entries })] = items.as_slice() else {
+        return None;
+    };
+    if needs_lineage(plan) {
+        return None;
+    }
+    let batch = pull(input, store, false).ok()?;
+    let cols = eval_all(entries.iter().map(|(_, e)| e), store, &batch).ok()?;
+    let mut out = String::from("[");
+    for i in 0..batch.rows() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        for (j, ((k, _), col)) in entries.iter().zip(&cols).enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            crate::json::write_string(&mut out, k);
+            out.push(':');
+            match col {
+                Col::Str(v) => crate::json::write_string(&mut out, &v[i]),
+                Col::Num(v) => crate::json::write_value(&mut out, &Value::Num(v[i])),
+                Col::Bool(v) => out.push_str(if v[i] { "true" } else { "false" }),
+                other => crate::json::write_value(&mut out, &render_cell(other, i, store)),
+            }
+        }
+        out.push('}');
+    }
+    out.push(']');
+    Some(out)
+}
+
+/// `g.V().fold()` / `g.E().fold()` — a whole node/edge frontier collected into ONE list —
+/// serialized straight to `[[<element maps>]]`, skipping the `Value::List` of `Value::Map`
+/// trees the general `Collect` aggregate builds (the same per-node allocation the terminal
+/// map writer eliminates, here for the list-wrapped fold). Only a keyless, non-distinct
+/// `Collect(Slot)` over a node/edge frontier; anything else falls back.
+fn try_fused_fold_json(plan: &Plan, store: &Store) -> Option<String> {
+    let Plan::Aggregate { input, keys, aggs } = plan else {
+        return None;
+    };
+    if !keys.is_empty() || aggs.len() != 1 || needs_lineage(plan) {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.func != AggFn::Collect || agg.distinct {
+        return None;
+    }
+    let Some(Expr::Slot(s)) = &agg.arg else {
+        return None;
+    };
+    let batch = pull(input, store, false).ok()?;
+    let cols = resolve_node_cols(store, &[]);
+    let mut out = String::from("[[");
+    match batch.slot(*s) {
+        Col::Nodes(ids) => {
+            for (n, &id) in ids.iter().enumerate() {
+                if n > 0 {
+                    out.push(',');
+                }
+                if id == u32::MAX {
+                    out.push_str("null");
+                } else {
+                    write_node_nested_map(&mut out, store, id, &cols);
+                }
+            }
+        }
+        Col::Edges(eids) => {
+            let ecols = resolve_edge_cols(store, &[]);
+            for (n, &eid) in eids.iter().enumerate() {
+                if n > 0 {
+                    out.push(',');
+                }
+                if eid == u32::MAX {
+                    out.push_str("null");
+                } else {
+                    write_edge_nested_map(&mut out, store, eid, &ecols);
+                }
+            }
+        }
+        _ => return None, // a folded scalar list is not an element-map fold
+    }
+    out.push_str("]]");
+    Some(out)
+}
+
+/// Serialize a terminal single-column node-map projection directly to JSON, skipping the
+/// per-row `Value::Map` tree. Returns `None` (→ the caller's slower path) for anything
+/// not a node frontier rendered as an element/value map: an edge frontier, a scalar
+/// projection, a lineage-tracked plan, or a non-`Slot` map argument.
+fn try_fused_map_json(plan: &Plan, store: &Store) -> Option<String> {
+    if needs_lineage(plan) {
+        return None;
+    }
+    // `input` is the plan whose batch to pull; `slot` the frontier column within it.
+    let (input, kind, slot, filter): (&Plan, NodeMapKind, usize, Vec<String>) = match plan {
+        Plan::Project { input, items } if items.len() == 1 => match &items[0].1 {
+            // A bare frontier projection renders as the nested element map (render_cell).
+            Expr::Slot(s) => (input.as_ref(), NodeMapKind::Nested, *s, Vec::new()),
+            Expr::Call { name, args }
+                if matches!(name.as_str(), "element_map" | "value_map" | "property_map") =>
+            {
+                let Some(Expr::Slot(s)) = args.first() else {
+                    return None; // a non-slot element arg (rare) keeps the general path
+                };
+                let filter = args[1..]
+                    .iter()
+                    .filter_map(|e| match e {
+                        Expr::Lit(Value::Str(s)) => Some(s.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                let kind = match name.as_str() {
+                    "element_map" => NodeMapKind::Flat,
+                    "value_map" => NodeMapKind::Value { wrap: false },
+                    _ => NodeMapKind::Value { wrap: true },
+                };
+                (input.as_ref(), kind, *s, filter)
+            }
+            _ => return None,
+        },
+        // A projection-LESS read frontier (`g.V()`, `g.E()`, a bare filtered/dedup'd
+        // frontier): `try_run` renders slot 0 as its nested element map when
+        // `output_names` is None. Mirror that exact single-column path, fused.
+        other if output_names(other).is_none() => (other, NodeMapKind::Nested, 0, Vec::new()),
+        _ => return None,
+    };
+    let batch = pull(input, store, false).ok()?;
+    let mut out = String::from("[");
+    match batch.slot(slot) {
+        Col::Nodes(ids) => {
+            let cols = resolve_node_cols(store, &filter);
+            for (n, &id) in ids.iter().enumerate() {
+                if n > 0 {
+                    out.push(',');
+                }
+                if id == u32::MAX {
+                    out.push_str("null"); // the OPTIONAL-match null sentinel
+                    continue;
+                }
+                match &kind {
+                    NodeMapKind::Nested => write_node_nested_map(&mut out, store, id, &cols),
+                    NodeMapKind::Flat => write_node_flat_map(&mut out, store, id, &cols),
+                    NodeMapKind::Value { wrap } => write_node_value_map(&mut out, id, &cols, *wrap),
+                }
+            }
+        }
+        Col::Edges(eids) => {
+            let cols = resolve_edge_cols(store, &filter);
+            for (n, &eid) in eids.iter().enumerate() {
+                if n > 0 {
+                    out.push(',');
+                }
+                if eid == u32::MAX {
+                    out.push_str("null");
+                    continue;
+                }
+                match &kind {
+                    NodeMapKind::Nested => write_edge_nested_map(&mut out, store, eid, &cols),
+                    NodeMapKind::Flat => write_edge_flat_map(&mut out, store, eid, &cols),
+                    NodeMapKind::Value { wrap } => write_edge_value_map(&mut out, eid, &cols, *wrap),
+                }
+            }
+        }
+        // A scalar column (e.g. a projected value) is not an element map — fall back.
+        _ => return None,
+    }
+    out.push(']');
+    Some(out)
+}
+
+/// A resolved read handle for one edge property — the dense numeric overlay when fresh,
+/// else the boxed per-eid map. `cell(eid)` returns the present value or `None`, matching
+/// `store.edge_prop`/`has_edge_prop` byte-for-byte (the overlay is kept in step with the
+/// boxed source, and only homogeneously-numeric keys get one).
+enum EdgeCol<'a> {
+    Num(&'a [f64], &'a [bool]),
+    Boxed(&'a crate::store::EdgeMap),
+}
+
+impl EdgeCol<'_> {
+    fn cell(&self, eid: u32) -> Option<Value> {
+        match self {
+            EdgeCol::Num(data, present) => {
+                let i = eid as usize;
+                (i < present.len() && present[i]).then(|| Value::Num(data[i]))
+            }
+            EdgeCol::Boxed(map) => map.get(&eid).cloned(),
+        }
+    }
+}
+
+/// Resolve the edge property read handles once, in the SAME sorted-key order and
+/// membership the per-edge path produced — hoisting `edge_prop_keys()` clone+sort and
+/// the per-key `edge_prop_map`/`edge_num_column` lookups out of the row loop.
+fn resolve_edge_cols<'a>(store: &'a Store, filter: &[String]) -> Vec<(std::sync::Arc<str>, EdgeCol<'a>)> {
+    use std::sync::Arc;
+    let keys: Vec<String> = if filter.is_empty() {
+        store.edge_prop_keys() // already sorted
+    } else {
+        let mut k = filter.to_vec();
+        k.sort();
+        k
+    };
+    keys.into_iter()
+        .filter_map(|k| {
+            let col = match store.edge_num_column(&k) {
+                Some((d, p)) => EdgeCol::Num(d, p),
+                None => EdgeCol::Boxed(store.edge_prop_map(&k)?),
+            };
+            Some((Arc::from(k.as_str()), col))
+        })
+        .collect()
+}
+
+/// A node's external id as a JSON string, falling back to its dense id (the `id`/`from`/
+/// `to` rule for the NESTED renders).
+fn write_node_ext_or_dense(out: &mut String, store: &Store, n: u32) {
+    match store.node_ext_id(n) {
+        Some(ext) => crate::json::write_string(out, &ext),
+        None => crate::json::write_string(out, &n.to_string()),
+    }
+}
+
+/// A `{id, label}` endpoint stub for the flat edge `elementMap` — `id`/`label` NULL when
+/// absent (matching the `node_id`/`node_label` closures).
+fn write_node_stub(out: &mut String, store: &Store, v: u32) {
+    out.push_str("{\"id\":");
+    match store.node_ext_id(v) {
+        Some(ext) => crate::json::write_string(out, &ext),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"label\":");
+    match store.labels_of(v).first() {
+        Some(l) => crate::json::write_string(out, l),
+        None => out.push_str("null"),
+    }
+    out.push('}');
+}
+
+/// `{id, from, to, labels:[type?], properties:{sorted present}}` — the nested edge render,
+/// byte-identical to `edge_result_value(store, eid)` serialized.
+fn write_edge_nested_map(
+    out: &mut String,
+    store: &Store,
+    eid: u32,
+    cols: &[(std::sync::Arc<str>, EdgeCol<'_>)],
+) {
+    out.push_str("{\"id\":");
+    match store.edge_ext_id(eid) {
+        Some(ext) => crate::json::write_string(out, &ext),
+        None => crate::json::write_string(out, &format!("e{eid}")),
+    }
+    let (src, dst) = store.edge_endpoints(eid).unwrap_or((0, 0));
+    out.push_str(",\"from\":");
+    write_node_ext_or_dense(out, store, src);
+    out.push_str(",\"to\":");
+    write_node_ext_or_dense(out, store, dst);
+    out.push_str(",\"labels\":[");
+    if let Some(t) = store.edge_type_name(eid) {
+        crate::json::write_string(out, &t);
+    }
+    out.push_str("],\"properties\":{");
+    let mut first = true;
+    for (k, col) in cols {
+        if let Some(v) = col.cell(eid) {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            crate::json::write_string(out, k);
+            out.push(':');
+            crate::json::write_value(out, &v);
+        }
+    }
+    out.push_str("}}");
+}
+
+/// `{id, label, IN:{…}, OUT:{…}, <sorted props flat>}` — the flat Gremlin `elementMap()`
+/// on an edge (IN is the destination, OUT the source; `id`/`label` NULL when absent).
+fn write_edge_flat_map(
+    out: &mut String,
+    store: &Store,
+    eid: u32,
+    cols: &[(std::sync::Arc<str>, EdgeCol<'_>)],
+) {
+    out.push_str("{\"id\":");
+    match store.edge_ext_id(eid) {
+        Some(ext) => crate::json::write_string(out, &ext),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"label\":");
+    match store.edge_type_name(eid) {
+        Some(t) => crate::json::write_string(out, &t),
+        None => out.push_str("null"),
+    }
+    if let Some((src, dst)) = store.edge_endpoints(eid) {
+        out.push_str(",\"IN\":");
+        write_node_stub(out, store, dst);
+        out.push_str(",\"OUT\":");
+        write_node_stub(out, store, src);
+    }
+    for (k, col) in cols {
+        if let Some(v) = col.cell(eid) {
+            out.push(',');
+            crate::json::write_string(out, k);
+            out.push(':');
+            crate::json::write_value(out, &v);
+        }
+    }
+    out.push('}');
+}
+
+/// `{sorted present edge props}` — Gremlin `valueMap()`/`propertyMap()` on an edge.
+fn write_edge_value_map(
+    out: &mut String,
+    eid: u32,
+    cols: &[(std::sync::Arc<str>, EdgeCol<'_>)],
+    wrap: bool,
+) {
+    out.push('{');
+    let mut first = true;
+    for (k, col) in cols {
+        if let Some(v) = col.cell(eid) {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            crate::json::write_string(out, k);
+            out.push(':');
+            if wrap {
+                out.push('[');
+                crate::json::write_value(out, &v);
+                out.push(']');
+            } else {
+                crate::json::write_value(out, &v);
+            }
+        }
+    }
+    out.push('}');
+}
+
+/// Write one present property column cell straight to `out` (the caller guarantees
+/// `present_at(i)`), avoiding the `Arc`/`Value` a `Column::read` would build for the
+/// scalar cases. Byte-identical to `write_value(&col.read(i))`.
+fn write_col_cell_json(out: &mut String, col: &crate::store::Column, i: usize) {
+    use crate::store::Column;
+    match col {
+        Column::Str { data, .. } => crate::json::write_string(out, &data[i]),
+        Column::Dict { dict, codes, .. } => {
+            crate::json::write_string(out, &dict[codes[i] as usize]);
+        }
+        Column::Num { data, .. } => crate::json::write_value(out, &Value::Num(data[i])),
+        Column::Bool { data, .. } => out.push_str(if data[i] { "true" } else { "false" }),
+        // Temporal / Gen: defer to the value renderer (the leaf types the fast path skips).
+        other => crate::json::write_value(out, &other.read(i)),
+    }
+}
+
+/// `{id, labels:[sorted], properties:{sorted present}}` — the nested node render, written
+/// directly. Byte-identical to `node_result_value(store, id)` serialized.
+fn write_node_nested_map(
+    out: &mut String,
+    store: &Store,
+    id: u32,
+    cols: &[(std::sync::Arc<str>, &crate::store::Column)],
+) {
+    let i = id as usize;
+    out.push_str("{\"id\":");
+    match store.node_ext_id(id) {
+        Some(ext) => crate::json::write_string(out, &ext),
+        None => crate::json::write_string(out, &id.to_string()),
+    }
+    out.push_str(",\"labels\":[");
+    for (j, l) in store.labels_of(id).iter().enumerate() {
+        if j > 0 {
+            out.push(',');
+        }
+        crate::json::write_string(out, l);
+    }
+    out.push_str("],\"properties\":{");
+    let mut first = true;
+    for (k, col) in cols {
+        if col.present_at(i) {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            crate::json::write_string(out, k);
+            out.push(':');
+            write_col_cell_json(out, col, i);
+        }
+    }
+    out.push_str("}}");
+}
+
+/// `{id, label, <sorted present props flat>}` — the flat Gremlin `elementMap()` shape.
+/// `id`/`label` are NULL when absent (no dense-id fallback, unlike the nested render).
+fn write_node_flat_map(
+    out: &mut String,
+    store: &Store,
+    id: u32,
+    cols: &[(std::sync::Arc<str>, &crate::store::Column)],
+) {
+    let i = id as usize;
+    out.push_str("{\"id\":");
+    match store.node_ext_id(id) {
+        Some(ext) => crate::json::write_string(out, &ext),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"label\":");
+    match store.labels_of(id).first() {
+        Some(l) => crate::json::write_string(out, l),
+        None => out.push_str("null"),
+    }
+    // id and label are always emitted, so every property is comma-prefixed.
+    for (k, col) in cols {
+        if col.present_at(i) {
+            out.push(',');
+            crate::json::write_string(out, k);
+            out.push(':');
+            write_col_cell_json(out, col, i);
+        }
+    }
+    out.push('}');
+}
+
+/// `{sorted present props}` — Gremlin `valueMap()` (`wrap=false`) or `propertyMap()`
+/// (`wrap=true`, each value wrapped in a one-element list).
+fn write_node_value_map(
+    out: &mut String,
+    id: u32,
+    cols: &[(std::sync::Arc<str>, &crate::store::Column)],
+    wrap: bool,
+) {
+    let i = id as usize;
+    out.push('{');
+    let mut first = true;
+    for (k, col) in cols {
+        if col.present_at(i) {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            crate::json::write_string(out, k);
+            out.push(':');
+            if wrap {
+                out.push('[');
+                write_col_cell_json(out, col, i);
+                out.push(']');
+            } else {
+                write_col_cell_json(out, col, i);
+            }
+        }
+    }
+    out.push('}');
+}
+
 /// Keep the rows of `batch` whose key (the `key_slots` tuple) is seen for the FIRST
 /// time, threading the seen-set across calls (streamed dedup). A SINGLE node/edge key
 /// slot (`typed`) deduplicates by raw `u32` id — no per-row byte-key serialization,
@@ -2768,26 +3610,30 @@ fn aggregate(
     aggs: &[Agg],
 ) -> Result<Batch, String> {
     let n = batch.rows();
-    let key_cols: Vec<Col> = eval_all(keys.iter().map(|(_, e)| e), store, batch)?;
 
-    // With no keys the whole input is one group, and a scalar aggregate over
-    // EMPTY input still emits that one group (SQL: `count(*)` over nothing is 0,
-    // one row) — hence n_groups is forced to 1 there. A GROUPED aggregate over
-    // empty input has no groups and emits zero rows, which falls out naturally.
-    let (group_of, first_row, n_groups) = if keys.is_empty() {
-        (vec![0u32; n], Vec::new(), 1)
+    // With no keys the whole input is one group, and a scalar aggregate over EMPTY input
+    // still emits that one group (SQL: `count(*)` over nothing is 0, one row). A single
+    // dict-column key groups by CODE (first-seen) without decoding + string-hashing every
+    // row — same group assignment as `assign_groups` on the decoded strings (a code and
+    // its string share first-occurrence), so identical groups, order, and per-group
+    // summation. Only a dict key over a node frontier takes it; every other key evals its
+    // columns and groups as before.
+    let (group_of, _first_row, n_groups, key_out) = if let Some((g, fr, kc)) =
+        try_dict_grouping(keys, store, batch)
+    {
+        let ng = fr.len();
+        (g, fr, ng, vec![kc])
+    } else if keys.is_empty() {
+        (vec![0u32; n], Vec::new(), 1, Vec::new())
     } else {
+        let key_cols: Vec<Col> = eval_all(keys.iter().map(|(_, e)| e), store, batch)?;
         let (g, fr) = assign_groups(&key_cols, n);
         let ng = fr.len();
-        (g, fr, ng)
+        let ko = key_cols.iter().map(|c| c.gather(&fr)).collect();
+        (g, fr, ng, ko)
     };
 
-    // Key output columns: each key's value at its group's first row.
-    let mut slots: Vec<Col> = if keys.is_empty() {
-        Vec::new()
-    } else {
-        key_cols.iter().map(|c| c.gather(&first_row)).collect()
-    };
+    let mut slots: Vec<Col> = key_out;
 
     for agg in aggs {
         let arg_col = agg
@@ -2825,6 +3671,57 @@ fn aggregate(
     }
 
     Ok(Batch::of(slots))
+}
+
+/// First-seen grouping for a SINGLE dict-column key, by code — avoiding the per-row dict
+/// decode + string hash `assign_groups` would pay. Returns `(group_of, first_row,
+/// key_output_col)`; the key output is each group's decoded value (absent → NULL), built
+/// once per group. `None` unless the sole key is `Prop{slot, <dict col>}` over a node
+/// frontier. Byte-identical grouping: a code and its string share their first occurrence.
+fn try_dict_grouping(
+    keys: &[(String, Expr)],
+    store: &Store,
+    batch: &Batch,
+) -> Option<(Vec<u32>, Vec<usize>, Col)> {
+    let [(_, Expr::Prop { slot, key })] = keys else {
+        return None;
+    };
+    let Some(Column::Dict {
+        dict,
+        codes,
+        present,
+    }) = store.column(key)
+    else {
+        return None;
+    };
+    let Col::Nodes(ids) = batch.slot(*slot) else {
+        return None;
+    };
+    let mut code_to_group: Vec<u32> = vec![u32::MAX; dict.len()];
+    let mut null_group: Option<u32> = None;
+    let mut first_row: Vec<usize> = Vec::new();
+    let mut key_vals: Vec<Value> = Vec::new();
+    let mut group_of: Vec<u32> = Vec::with_capacity(ids.len());
+    for (i, &id) in ids.iter().enumerate() {
+        let g = if id != u32::MAX && present[id as usize] {
+            let c = codes[id as usize] as usize;
+            if code_to_group[c] == u32::MAX {
+                code_to_group[c] = first_row.len() as u32;
+                first_row.push(i);
+                key_vals.push(Value::Str(dict[c].clone()));
+            }
+            code_to_group[c]
+        } else {
+            *null_group.get_or_insert_with(|| {
+                let g = first_row.len() as u32;
+                first_row.push(i);
+                key_vals.push(Value::Null);
+                g
+            })
+        };
+        group_of.push(g);
+    }
+    Some((group_of, first_row, Col::Gen(key_vals)))
 }
 
 /// Assign a dense, first-seen group id to every row from its key columns.
@@ -3199,6 +4096,63 @@ fn reverse_dir(dir: Dir) -> Dir {
 /// only the (unspecified) row order differs — the multiset is preserved. `None`
 /// unless the shape matches, the target is index-seekable, the cost says flip, and
 /// no path is tracked / no edge is bound.
+/// The reverse-walk win for shortest paths: `Filter{endpoint == t} over ShortestPath`
+/// resolves the target set `t` and hands it to the BFS as an early stop, so each source
+/// stops sweeping the moment every target is settled rather than exploring the whole
+/// reachable component. The filter is STILL applied to the result here, so the output is
+/// byte-identical to the unbounded path — this only avoids materializing rows the filter
+/// would drop. Conservative: only an indexed `endpoint.key == lit` over `min == 0`.
+fn try_shortest_early_stop(pred: &Expr, input: &Plan, store: &Store, track: bool) -> Option<Batch> {
+    let Plan::ShortestPath {
+        input: sp_in,
+        from,
+        dir,
+        edge_label,
+        min: 0, // `*` only — a `+` (min 1) has source-as-endpoint cycle cases
+        max,
+        selector,
+        edge_pred,
+    } = input
+    else {
+        return None;
+    };
+    let (key, value) = target_eq(pred)?; // endpoint (slot 1) `== lit`
+    if !store.has_hash_index(&key) {
+        return None; // resolve the target set from the index, else keep the normal path
+    }
+    let targets = store.index_lookup(&key, &value)?;
+    if targets.is_empty() {
+        return None; // no target → the normal path yields empty; nothing to accelerate
+    }
+    let sp_batch = shortest_path(
+        &pull(sp_in, store, track).ok()?,
+        store,
+        *from,
+        *dir,
+        edge_label,
+        0,
+        *max,
+        *selector,
+        edge_pred.as_deref(),
+        Some(&targets),
+    );
+    // Apply the endpoint filter exactly as the general path would — the early stop only
+    // changed which never-kept rows were produced, so this reproduces the same result.
+    let keep: Vec<usize> = match try_filter_keep(pred, store, &sp_batch) {
+        Some(k) => k,
+        None => {
+            let mask = eval(pred, store, &sp_batch).ok()?;
+            match &mask {
+                Col::Bool(bs) => (0..bs.len()).filter(|&i| bs[i]).collect(),
+                other => (0..other.len())
+                    .filter(|&i| other.value_at(i).is_true())
+                    .collect(),
+            }
+        }
+    };
+    Some(sp_batch.gather(&keep))
+}
+
 fn try_reverse_expand(pred: &Expr, input: &Plan, store: &Store, track: bool) -> Option<Batch> {
     if track {
         return None; // a path-reading query keeps the forward walk (lineage)
@@ -3694,6 +4648,155 @@ fn range_seek_ids(store: &Store, label: &str, key: &str, op: CompareOp, value: &
 /// short-circuiting existence check for `where(out/in/both)` — scans adjacency until
 /// the first match, never materializing the neighbours. Self-loop doubling is moot for
 /// existence.
+/// A simple predicate on the neighbour a `where(out()/in()/both())` hop lands on — the
+/// leaf inside `Exists { Filter{pred} over Expand }`. Extracted so the semijoin can test
+/// it per neighbour with early-stop instead of expanding the whole frontier.
+enum NbrPred {
+    Cmp(String, CompareOp, Value),
+    Exists(String),
+    Labeled(Vec<String>),
+}
+
+/// Recognize a single leaf predicate on the hop's neighbour (a property compare, a
+/// presence test, or a label test), referencing a slot OTHER than the source `from` — so
+/// it is the appended endpoint. `None` for anything compound/unsupported (→ general path).
+fn simple_nbr_pred(pred: &Expr, from: usize) -> Option<NbrPred> {
+    match pred {
+        Expr::Compare { op, left, right } => {
+            let (slot, key, v, flip) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Prop { slot, key }, Expr::Lit(v)) => (*slot, key.clone(), v.clone(), false),
+                (Expr::Lit(v), Expr::Prop { slot, key }) => (*slot, key.clone(), v.clone(), true),
+                _ => return None,
+            };
+            if slot == from || v.is_null() {
+                return None;
+            }
+            let op = if flip {
+                match op {
+                    CompareOp::Lt => CompareOp::Gt,
+                    CompareOp::Le => CompareOp::Ge,
+                    CompareOp::Gt => CompareOp::Lt,
+                    CompareOp::Ge => CompareOp::Le,
+                    other => *other,
+                }
+            } else {
+                *op
+            };
+            Some(NbrPred::Cmp(key, op, v))
+        }
+        Expr::PropertyExists { slot, key } if *slot != from => Some(NbrPred::Exists(key.clone())),
+        Expr::IsLabeled { slot, labels } if *slot != from => Some(NbrPred::Labeled(labels.clone())),
+        // `<label> IN labels(m)` — the `(m:Label)` test, UNNORMALIZED inside an EXISTS body
+        // (the optimizer doesn't descend into subquery bodies), treated as a label test.
+        Expr::In { needle, haystack } => {
+            if let (Expr::Lit(Value::Str(l)), Expr::Call { name, args }) =
+                (needle.as_ref(), haystack.as_ref())
+            {
+                if name == "labels" && args.len() == 1 {
+                    if let Expr::Slot(s) = args[0] {
+                        if s != from {
+                            return Some(NbrPred::Labeled(vec![l.to_string()]));
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// A CONJUNCTION of simple neighbour predicates — `has(k,v)` plus the `(m:Label)` label
+/// test the GQL `EXISTS { (n)->(m:Label) WHERE … }` and `(b:Label)` patterns add. Every
+/// leaf of the `And`-tree must be a simple neighbour predicate, else `None`.
+fn simple_nbr_preds(pred: &Expr, from: usize) -> Option<Vec<NbrPred>> {
+    fn collect(e: &Expr, from: usize, out: &mut Vec<NbrPred>) -> bool {
+        match e {
+            Expr::And(a, b) => collect(a, from, out) && collect(b, from, out),
+            other => match simple_nbr_pred(other, from) {
+                Some(p) => {
+                    out.push(p);
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+    let mut out = Vec::new();
+    collect(pred, from, &mut out).then_some(())?;
+    (!out.is_empty()).then_some(out)
+}
+
+/// Does node `nbr` satisfy the leaf (3VL: only a definite TRUE counts, matching the body
+/// filter's "keep if TRUE" — a NULL operand is UNKNOWN, not a match).
+fn nbr_pred_ok(store: &Store, nbr: u32, p: &NbrPred) -> bool {
+    match p {
+        NbrPred::Exists(k) => store.has_prop(nbr, k),
+        NbrPred::Labeled(ls) => ls.iter().any(|l| store.is_labeled(nbr, l)),
+        NbrPred::Cmp(k, op, v) => {
+            let a = store.prop(nbr, k);
+            if a.is_null() {
+                return false;
+            }
+            match op {
+                CompareOp::Eq => value::equals(&a, v),
+                CompareOp::Ne => !value::equals(&a, v),
+                other => value::cmp_partial(&a, v).is_some_and(|o| match other {
+                    CompareOp::Lt => o.is_lt(),
+                    CompareOp::Le => o.is_le(),
+                    CompareOp::Gt => o.is_gt(),
+                    CompareOp::Ge => o.is_ge(),
+                    _ => false,
+                }),
+            }
+        }
+    }
+}
+
+/// Does `v` have ANY neighbour whose (pre-resolved) numeric column satisfies `op t`?
+/// Early-stops. The raw-column form of [`node_has_matching_nbr`] — one column resolution
+/// for the whole query instead of a `store.prop` hash lookup per neighbour.
+fn node_has_num_nbr(
+    store: &Store,
+    v: u32,
+    dir: Dir,
+    want: &[u32],
+    col: (&[f64], &[bool]),
+    cmp: (CompareOp, f64),
+) -> bool {
+    let (data, present) = col;
+    let (op, t) = cmp;
+    let has_extra = store.has_multi_label_edges();
+    let type_ok = |et: u32, eid: u32| {
+        want.is_empty()
+            || want
+                .iter()
+                .any(|&w| w == et || (has_extra && store.edge_type_matches(et, eid, w)))
+    };
+    let hit = |a: &crate::store::Adj| {
+        type_ok(a.etype, a.eid) && present[a.nbr as usize] && num_pred(op, data[a.nbr as usize], t)
+    };
+    (matches!(dir, Dir::Out | Dir::Both) && store.out(v).iter().any(hit))
+        || (matches!(dir, Dir::In | Dir::Both) && store.inc(v).iter().any(hit))
+}
+
+/// Does `v` have ANY neighbour (in `dir`, edge-type in `want`) satisfying ALL of `preds`?
+/// Early-stops on the first match — the semijoin win over expanding every neighbour.
+fn node_has_matching_nbr(store: &Store, v: u32, dir: Dir, want: &[u32], preds: &[NbrPred]) -> bool {
+    let has_extra = store.has_multi_label_edges();
+    let type_ok = |et: u32, eid: u32| {
+        want.is_empty()
+            || want
+                .iter()
+                .any(|&w| w == et || (has_extra && store.edge_type_matches(et, eid, w)))
+    };
+    let hit = |a: &crate::store::Adj| {
+        type_ok(a.etype, a.eid) && preds.iter().all(|p| nbr_pred_ok(store, a.nbr, p))
+    };
+    (matches!(dir, Dir::Out | Dir::Both) && store.out(v).iter().any(hit))
+        || (matches!(dir, Dir::In | Dir::Both) && store.inc(v).iter().any(hit))
+}
+
 fn node_has_nbr(store: &Store, v: u32, dir: Dir, want: &[u32]) -> bool {
     let has_extra = store.has_multi_label_edges();
     let type_ok = |et: u32, eid: u32| {
@@ -4151,6 +5254,12 @@ fn try_filtered_count(
     if let Some(c) = try_stream_num_count(store, label, pred) {
         return Some(scalar_num(c as f64));
     }
+    if let Some(c) = try_stream_membership_count(store, label, pred) {
+        return Some(scalar_num(c as f64));
+    }
+    if let Some(c) = try_stream_dict_pred_count(store, label, pred) {
+        return Some(scalar_num(c as f64));
+    }
     // Fallback: materialize the scan and run the general vectorized filter (string /
     // disjunction / NOT predicates the streaming path does not special-case).
     let batch = pull(scan, store, false).ok()?;
@@ -4289,6 +5398,469 @@ fn try_edge_filtered_count(
             });
         }
     }
+    Some(scalar_num(count as f64))
+}
+
+/// A searched `CASE` that is a categorical remap: EVERY branch condition is
+/// `<dict col> = <string literal>` on ONE key. Returns the slot, key, and a code →
+/// first-matching-branch-index table (`None` where no branch matches that dict value).
+fn case_dict_lookup(
+    branches: &[(Expr, Expr)],
+    store: &Store,
+) -> Option<(usize, String, Vec<Option<usize>>)> {
+    if branches.is_empty() {
+        return None;
+    }
+    let mut slot_key: Option<(usize, String)> = None;
+    let mut lits: Vec<&str> = Vec::with_capacity(branches.len());
+    for (cond, _) in branches {
+        let Expr::Compare {
+            op: CompareOp::Eq,
+            left,
+            right,
+        } = cond
+        else {
+            return None;
+        };
+        let (s, k, v) = match (left.as_ref(), right.as_ref()) {
+            (Expr::Prop { slot, key }, Expr::Lit(Value::Str(v)))
+            | (Expr::Lit(Value::Str(v)), Expr::Prop { slot, key }) => (*slot, key, v),
+            _ => return None,
+        };
+        match &slot_key {
+            None => slot_key = Some((s, k.clone())),
+            Some((s0, k0)) if *s0 == s && k0 == k => {}
+            Some(_) => return None,
+        }
+        lits.push(v.as_ref());
+    }
+    let (slot, key) = slot_key?;
+    let Some(Column::Dict { dict, .. }) = store.column(&key) else {
+        return None;
+    };
+    let code_to_branch: Vec<Option<usize>> = dict
+        .iter()
+        .map(|dstr| lits.iter().position(|lit| dstr.as_ref() == *lit))
+        .collect();
+    Some((slot, key, code_to_branch))
+}
+
+/// Is `pred` a disjunction (or a single term) of `slot.key == <literal>`, all on ONE
+/// key? Returns that key and the literal values — the shape `x IN [a, b, …]` desugars to.
+fn eq_disjunction_on_slot(pred: &Expr, slot: usize) -> Option<(String, Vec<Value>)> {
+    fn collect(e: &Expr, slot: usize, key: &mut Option<String>, vals: &mut Vec<Value>) -> bool {
+        match e {
+            Expr::Or(a, b) => collect(a, slot, key, vals) && collect(b, slot, key, vals),
+            Expr::Compare {
+                op: CompareOp::Eq,
+                left,
+                right,
+            } => {
+                let (k, v) = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Prop { slot: s, key }, Expr::Lit(v))
+                    | (Expr::Lit(v), Expr::Prop { slot: s, key })
+                        if *s == slot =>
+                    {
+                        (key, v)
+                    }
+                    _ => return false,
+                };
+                if v.is_null() {
+                    return false; // a NULL term makes non-matches UNKNOWN, not FALSE
+                }
+                match key.as_deref() {
+                    None => *key = Some(k.clone()),
+                    Some(existing) if existing == k => {}
+                    Some(_) => return false, // mixed keys — not this shape
+                }
+                vals.push(v.clone());
+                true
+            }
+            _ => false,
+        }
+    }
+    let (mut key, mut vals) = (None, Vec::new());
+    collect(pred, slot, &mut key, &mut vals).then_some(())?;
+    Some((key?, vals))
+}
+
+/// If every leaf of `pred` that touches a row is `Prop { slot, key }` for ONE `(slot,
+/// key)` (no label tests, presence tests, or other columns), return it — the predicate is
+/// a pure function of a single property, evaluable once per distinct value.
+fn sole_prop_ref(pred: &Expr) -> Option<(usize, String)> {
+    fn walk(e: &Expr, seen: &mut Option<(usize, String)>) -> bool {
+        match e {
+            Expr::Lit(_) => true,
+            Expr::Prop { slot, key } => match seen {
+                None => {
+                    *seen = Some((*slot, key.clone()));
+                    true
+                }
+                Some((s0, k0)) => *s0 == *slot && k0 == key,
+            },
+            Expr::Not(a) => walk(a, seen),
+            Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => walk(a, seen) && walk(b, seen),
+            Expr::Compare { left, right, .. } => walk(left, seen) && walk(right, seen),
+            Expr::Call { args, .. } => args.iter().all(|a| walk(a, seen)),
+            Expr::In { needle, haystack } => walk(needle, seen) && walk(haystack, seen),
+            _ => false, // other slots, subqueries, label/presence tests → not pure-in-key
+        }
+    }
+    let mut seen = None;
+    walk(pred, &mut seen).then_some(())?;
+    seen
+}
+
+/// [`sole_prop_ref`] constrained to a specific `slot` (returns just the key).
+fn sole_prop_key(pred: &Expr, slot: usize) -> Option<String> {
+    sole_prop_ref(pred).filter(|(s, _)| *s == slot).map(|(_, k)| k)
+}
+
+/// Evaluate a single-property predicate for one concrete value of that property, by
+/// substituting the literal and folding the now-constant expression. `None` on a faulting
+/// eval; `Some(true)` only when the result is definitely TRUE (3VL — the keep condition).
+fn dict_pred_value(pred: &Expr, slot: usize, key: &str, v: &Value, store: &Store) -> Option<bool> {
+    let e = subst_prop(pred, slot, key, v);
+    let col = eval(&e, store, &Batch::single(Col::Num(vec![0.0]))).ok()?;
+    Some(matches!(col.value_at(0), Value::Bool(true)))
+}
+
+/// Evaluate a scalar expression that is a pure function of one DICT column by computing it
+/// once per distinct dict value (≤ dict size) and mapping each row to the shared result —
+/// so `upper(city)`, `substring(city, …)`, etc. over a categorical column do dict.len()
+/// string allocations instead of one per row (the result `Value`s, including `Arc<str>`,
+/// are cloned per row = a refcount bump, not a new allocation). Byte-identical: the value
+/// is a function of the property alone (absent → the NULL case, computed once).
+fn try_eval_dict_scalar(expr: &Expr, store: &Store, batch: &Batch) -> Option<Col> {
+    let (slot, key) = sole_prop_ref(expr)?;
+    let Col::Nodes(ids) = batch.slot(slot) else {
+        return None;
+    };
+    let Some(Column::Dict {
+        dict,
+        codes,
+        present,
+    }) = store.column(&key)
+    else {
+        return None;
+    };
+    let ev = |v: &Value| -> Option<Value> {
+        let e = subst_prop(expr, slot, &key, v);
+        Some(eval(&e, store, &Batch::single(Col::Num(vec![0.0]))).ok()?.value_at(0))
+    };
+    let mut per_code = Vec::with_capacity(dict.len());
+    for dv in dict.iter() {
+        per_code.push(ev(&Value::Str(dv.clone()))?);
+    }
+    let null_val = ev(&Value::Null)?;
+    Some(Col::Gen(
+        ids.iter()
+            .map(|&id| {
+                if id != u32::MAX && present[id as usize] {
+                    per_code[codes[id as usize] as usize].clone()
+                } else {
+                    null_val.clone()
+                }
+            })
+            .collect(),
+    ))
+}
+
+/// Keep-list for a predicate that is a pure function of one DICT column: evaluate it once
+/// per distinct dict value, then keep rows whose code matches — the projection sibling of
+/// [`try_stream_dict_pred_count`], for `WHERE <dict pred> RETURN …`. Byte-identical to the
+/// per-row boxed filter (same 3VL TRUE-keeps rule).
+fn try_filter_keep_dict(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usize>> {
+    let (slot, key) = sole_prop_ref(pred)?;
+    let Col::Nodes(ids) = batch.slot(slot) else {
+        return None;
+    };
+    let Some(Column::Dict {
+        dict,
+        codes,
+        present,
+    }) = store.column(&key)
+    else {
+        return None;
+    };
+    let mut matches = Vec::with_capacity(dict.len());
+    for dv in dict.iter() {
+        matches.push(dict_pred_value(pred, slot, &key, &Value::Str(dv.clone()), store)?);
+    }
+    let null_match = dict_pred_value(pred, slot, &key, &Value::Null, store)?;
+    Some(
+        ids.iter()
+            .enumerate()
+            .filter_map(|(i, &id)| {
+                let hit = if id != u32::MAX && present[id as usize] {
+                    matches[codes[id as usize] as usize]
+                } else {
+                    null_match
+                };
+                hit.then_some(i)
+            })
+            .collect(),
+    )
+}
+
+/// Replace every `Prop { slot, key }` in `e` with `Lit(value)` — so a predicate that is a
+/// pure function of one property becomes a constant expression, evaluable once.
+fn subst_prop(e: &Expr, slot: usize, key: &str, value: &Value) -> Expr {
+    match e {
+        Expr::Prop { slot: s, key: k } if *s == slot && k == key => Expr::Lit(value.clone()),
+        Expr::Not(a) => Expr::Not(Box::new(subst_prop(a, slot, key, value))),
+        Expr::And(a, b) => Expr::And(
+            Box::new(subst_prop(a, slot, key, value)),
+            Box::new(subst_prop(b, slot, key, value)),
+        ),
+        Expr::Or(a, b) => Expr::Or(
+            Box::new(subst_prop(a, slot, key, value)),
+            Box::new(subst_prop(b, slot, key, value)),
+        ),
+        Expr::Xor(a, b) => Expr::Xor(
+            Box::new(subst_prop(a, slot, key, value)),
+            Box::new(subst_prop(b, slot, key, value)),
+        ),
+        Expr::Compare { op, left, right } => Expr::Compare {
+            op: *op,
+            left: Box::new(subst_prop(left, slot, key, value)),
+            right: Box::new(subst_prop(right, slot, key, value)),
+        },
+        Expr::Call { name, args } => Expr::Call {
+            name: name.clone(),
+            args: args.iter().map(|a| subst_prop(a, slot, key, value)).collect(),
+        },
+        Expr::In { needle, haystack } => Expr::In {
+            needle: Box::new(subst_prop(needle, slot, key, value)),
+            haystack: Box::new(subst_prop(haystack, slot, key, value)),
+        },
+        other => other.clone(),
+    }
+}
+
+/// Streaming count for ANY predicate that is a pure function of one DICT column: evaluate
+/// it once per distinct dict value (≤ dict size), then count code membership in a single
+/// pass — never materializing rows. Covers `STARTS WITH … OR …`, `CONTAINS`, ranges, and
+/// arbitrary boolean combinations over a categorical column. Byte-identical: a row is
+/// counted iff the predicate is definitely TRUE for its value (or NULL, evaluated once).
+fn try_stream_dict_pred_count(store: &Store, label: &Option<String>, pred: &Expr) -> Option<u64> {
+    let key = sole_prop_key(pred, 0)?;
+    let Some(Column::Dict {
+        dict,
+        codes,
+        present,
+    }) = store.column(&key)
+    else {
+        return None;
+    };
+    let eval_const = |v: &Value| -> Option<bool> {
+        let e = subst_prop(pred, 0, &key, v);
+        let col = eval(&e, store, &Batch::single(Col::Num(vec![0.0]))).ok()?;
+        Some(matches!(col.value_at(0), Value::Bool(true)))
+    };
+    let mut matches = Vec::with_capacity(dict.len());
+    for dv in dict.iter() {
+        matches.push(eval_const(&Value::Str(dv.clone()))?);
+    }
+    let null_match = eval_const(&Value::Null)?;
+    let mut count = 0u64;
+    scan_visit(store, label, |i| {
+        let hit = if present[i] {
+            matches[codes[i] as usize]
+        } else {
+            null_match
+        };
+        if hit {
+            count += 1;
+        }
+    });
+    Some(count)
+}
+
+/// Streaming count for categorical membership — `col IN [a, b, …]` (desugared to an
+/// OR-chain of equals) on a `Dict` or `Str` column — the string sibling of
+/// `try_stream_num_count`. Maps the literals to dict CODES once, then counts matches in
+/// one pass over the bucket, never materializing an id vector or keep list. Byte-identical
+/// to the OR filter (a literal absent from the dict simply matches nothing).
+fn try_stream_membership_count(store: &Store, label: &Option<String>, pred: &Expr) -> Option<u64> {
+    let (key, vals) = eq_disjunction_on_slot(pred, 0)?;
+    let mut count = 0u64;
+    match store.column(&key)? {
+        Column::Dict {
+            dict,
+            codes,
+            present,
+        } => {
+            // Every literal must be a string (else it can't equal a dict value). Resolve
+            // to codes; a literal not in the dict contributes no code (never matches).
+            let mut targets: Vec<u32> = Vec::with_capacity(vals.len());
+            for v in &vals {
+                let Value::Str(s) = v else { return None };
+                if let Some(c) = dict.iter().position(|d| d.as_ref() == s.as_ref()) {
+                    targets.push(c as u32);
+                }
+            }
+            scan_visit(store, label, |i| {
+                if present[i] && targets.contains(&codes[i]) {
+                    count += 1;
+                }
+            });
+        }
+        Column::Str { data, present } => {
+            let mut targets: Vec<&str> = Vec::with_capacity(vals.len());
+            for v in &vals {
+                let Value::Str(s) = v else { return None };
+                targets.push(s.as_ref());
+            }
+            scan_visit(store, label, |i| {
+                if present[i] && targets.iter().any(|t| data[i].as_ref() == *t) {
+                    count += 1;
+                }
+            });
+        }
+        _ => return None,
+    }
+    Some(count)
+}
+
+/// `DISTINCT`/`dedup()` over `values(<dict col>)`: emit the distinct dict values in
+/// FIRST-SEEN order by scanning codes against a `dict.len()` bitset — never decoding or
+/// hashing the per-row strings. Byte-identical to the general first-seen dedup (first
+/// occurrence of a code == first occurrence of its string). Bails (→ general path) on any
+/// absent value or null-sentinel id, whose NULL dedup this fast path doesn't model.
+fn try_distinct_dict_col(input: &Plan, store: &Store) -> Option<Batch> {
+    let Plan::Project { input: pin, items } = input else {
+        return None;
+    };
+    let [(_, Expr::Prop { slot, key })] = items.as_slice() else {
+        return None;
+    };
+    let Some(Column::Dict {
+        dict,
+        codes,
+        present,
+    }) = store.column(key)
+    else {
+        return None;
+    };
+    let frontier = pull(pin, store, false).ok()?;
+    // The property may sit on any bound slot — slot 0 for `values(k).dedup()`, but the
+    // hop endpoint (e.g. slot 2) for `out().out().values(k).dedup()`.
+    let Col::Nodes(ids) = frontier.slot(*slot) else {
+        return None;
+    };
+    let mut seen = vec![false; dict.len()];
+    let mut out: Vec<Arc<str>> = Vec::new();
+    for &id in ids {
+        if id == u32::MAX {
+            return None; // a NULL value in the dedup — let the general path handle it
+        }
+        let i = id as usize;
+        if !present[i] {
+            return None;
+        }
+        let c = codes[i] as usize;
+        if !seen[c] {
+            seen[c] = true;
+            out.push(dict[c].clone());
+        }
+    }
+    Some(Batch::of(vec![Col::Str(out)]))
+}
+
+/// `MATCH (a)-[]->(b) WHERE b.k <op> a.k RETURN count(*)` — a hop whose survival compares
+/// the two ENDPOINTS' numeric properties. Stream the edges and compare the source/neighbor
+/// num columns directly, never building the neighbor frontier or a boxed compare. A count
+/// is order-free, so byte-identical (NaN / absent → not counted, matching the 3VL filter).
+fn try_edge_cross_count(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.func != AggFn::Count || agg.arg.is_some() || agg.distinct {
+        return None;
+    }
+    let Plan::Filter { input: expand, pred } = input else {
+        return None;
+    };
+    let Plan::Expand {
+        input: scan,
+        from: 0, // source at slot 0, neighbour appended at slot 1
+        dir,
+        edge_label,
+        bind_edge: false,
+        double_loops: _,
+    } = expand.as_ref()
+    else {
+        return None;
+    };
+    let Plan::Scan { label } = scan.as_ref() else {
+        return None;
+    };
+    // The predicate is the endpoint compare, optionally AND a neighbour-label test (the
+    // `(b:Label)` pattern) — peel that off and check the label per edge.
+    let (cmp, nbr_labels): (&Expr, Option<&[String]>) = match pred {
+        Expr::Compare { .. } => (pred, None),
+        Expr::And(a, b) => match (a.as_ref(), b.as_ref()) {
+            (c @ Expr::Compare { .. }, Expr::IsLabeled { slot: 1, labels })
+            | (Expr::IsLabeled { slot: 1, labels }, c @ Expr::Compare { .. }) => (c, Some(labels)),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    // The compare relates two properties, each on slot 0 (source) or slot 1 (neighbour).
+    let Expr::Compare { op, left, right } = cmp else {
+        return None;
+    };
+    let (Expr::Prop { slot: ls, key: lk }, Expr::Prop { slot: rs, key: rk }) =
+        (left.as_ref(), right.as_ref())
+    else {
+        return None;
+    };
+    if *ls > 1 || *rs > 1 {
+        return None;
+    }
+    let (Some(Column::Num { data: ld, present: lp }), Some(Column::Num { data: rd, present: rp })) =
+        (store.column(lk), store.column(rk))
+    else {
+        return None; // unboxed numeric endpoints only
+    };
+    let want = match want_etypes(store, edge_label) {
+        Ok(w) => w,
+        Err(()) => return Some(scalar_num(0.0)),
+    };
+    // O(1) neighbour-label check: a membership bitset beats a `is_labeled` binary-search
+    // per edge (which made this LOSE to the general path).
+    let nbr_bits: Option<Vec<bool>> = nbr_labels.map(|labels| {
+        let mut b = vec![false; store.node_count()];
+        for l in labels {
+            for &id in store.nodes_with_label(l) {
+                b[id as usize] = true;
+            }
+        }
+        b
+    });
+    let mut count = 0u64;
+    scan_visit(store, label, |src| {
+        let src = src as u32;
+        for_each_nbr(store, src, *dir, &want, false, |nbr, _| {
+            if let Some(bits) = &nbr_bits {
+                if !bits[nbr as usize] {
+                    return; // neighbour fails its `(b:Label)` constraint
+                }
+            }
+            let li = if *ls == 0 { src } else { nbr } as usize;
+            let ri = if *rs == 0 { src } else { nbr } as usize;
+            if lp[li] && rp[ri] && num_pred(*op, ld[li], rd[ri]) {
+                count += 1;
+            }
+        });
+    });
     Some(scalar_num(count as f64))
 }
 
@@ -4706,6 +6278,11 @@ fn try_varlen_distinctby_count(
             if *bind_edge {
                 return None; // the bound edge slot shifts the endpoint; not this shape
             }
+            // A single hop below the dedup; a deeper chain (`both().both().dedup()`) keeps
+            // its already-good path — materialize the earlier hops, BFS the last — because
+            // a full multi-level BFS from the scan re-expands the whole (dense) graph and
+            // measured ~8x SLOWER on a dense 2-hop. (Rejected optimization, kept for the
+            // note.)
             (ex_inner.as_ref(), *from, *dir, edge_label, 1u32, 1u32)
         }
         _ => return None,
@@ -6702,7 +8279,13 @@ fn var_length(
     // Gremlin `both()` self-loop doubling — a self-loop is walked twice (see the
     // `double_loops` field on Plan::VarLength).
     double_loops: bool,
-) -> Batch {
+) -> Result<Batch, String> {
+    // Anti-runaway budget: a per-path (WALK) `repeat`/var-length expansion fans out as
+    // degree^depth, so on a dense graph it materializes billions of rows and OOM-kills
+    // the host. Cap the total emitted rows at `limits.trail` (core's guard, same
+    // default); the DFS stops descending once past it and we return a loud
+    // `E_RESOURCE_EXHAUSTED` rather than a truncated result.
+    let budget = store.limits().trail;
     let empty = || {
         let mut slots: Vec<Col> = batch.slots.iter().map(|_| Col::Nodes(vec![])).collect();
         slots.push(Col::Nodes(vec![]));
@@ -6722,7 +8305,7 @@ fn var_length(
     // places the landed node there so a pred like `hasLabel(endpoint)` resolves.
     let endpoint_slot = batch.slots.len();
     let Col::Nodes(src) = batch.slot(from) else {
-        return empty();
+        return Ok(empty());
     };
 
     // A named path over the pattern (`MATCH p = (a)-[:R]->{1,3}(b)`) needs the
@@ -6772,11 +8355,25 @@ fn var_length(
             until_stop.map(|p| (p, endpoint_slot)),
             body_filter.map(|p| (p, endpoint_slot)),
             double_loops,
+            budget,
         );
         if node_unique {
             used.pop();
         }
         debug_assert!(used.is_empty());
+        // Once the emit count clears the budget the DFS above stopped descending; bail
+        // out of the source loop too rather than starting the next source's walk.
+        if keep.len() as u64 > budget {
+            break;
+        }
+    }
+
+    if keep.len() as u64 > budget {
+        return Err(format!(
+            "E_RESOURCE_EXHAUSTED: variable-length traversal exceeded the trail limit of \
+             {budget} rows; add a tighter bound/`LIMIT`, dedup the frontier, or raise the \
+             limit (ConfigId::LimitsTrail)"
+        ));
     }
 
     let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
@@ -6793,7 +8390,7 @@ fn var_length(
             edge_offsets: bufs.edge_offsets,
         });
     }
-    out
+    Ok(out)
 }
 
 /// Materialize the group-variable lists for ONE emitted repetition-path and push
@@ -7386,7 +8983,15 @@ fn varlen_dfs(
     body_filter: Option<(&Expr, usize)>,
     // Gremlin `both()` self-loop doubling — keep the in-side copy of a self-loop.
     double_loops: bool,
+    // Anti-runaway cap on total emitted rows (`limits.trail`). Once `keep` passes it,
+    // every pending frame returns immediately, halting the exponential descent; the
+    // caller then turns the overflow into `E_RESOURCE_EXHAUSTED`.
+    budget: u64,
 ) {
+    // Budget tripped by a sibling branch — stop descending (the walk is being aborted).
+    if keep.len() as u64 > budget {
+        return;
+    }
     // A body filter prunes a hop target that fails it — no emit, no descent (the source
     // at len 0 is not a hop target, so it is exempt).
     if len > 0 {
@@ -7541,6 +9146,7 @@ fn varlen_dfs(
             until_stop,
             body_filter,
             double_loops,
+            budget,
         );
         node_stack.pop();
         edge_stack.pop();
@@ -7565,6 +9171,13 @@ fn shortest_path(
     max: Option<u32>,
     selector: crate::ir::ShortestSelector,
     edge_pred: Option<&Expr>,
+    // Target-aware early stop (the reverse-walk win): when the endpoint is constrained to
+    // a resolved node set (a `Filter{endpoint == t}` fused in above), bound each source's
+    // BFS to the deepest target's distance instead of sweeping the whole component. Pure
+    // optimization — the outer filter still runs, so the KEPT rows (targets, with their
+    // shortest paths and multiplicity) are byte-identical; only never-kept nodes beyond
+    // the targets go unexplored. Applied only for `min == 0` (no `+`-cycle source cases).
+    early_stop: Option<&[u32]>,
 ) -> Batch {
     use crate::ir::ShortestSelector;
     let empty = || {
@@ -7590,6 +9203,25 @@ fn shortest_path(
     let Col::Nodes(src) = batch.slot(from) else {
         return empty();
     };
+
+    // Target membership bitset for the early stop (only `min == 0`, so a target
+    // discovered at any depth is a valid endpoint — no `+`-cycle subtlety). `remaining`
+    // per source counts distinct targets still undiscovered; when it hits 0 the last
+    // target's distance `D` is the deepest, and every target's shortest predecessors sit
+    // at depth < D, so once we pop a node at depth >= D all targets are fully settled.
+    let n_nodes = store.node_count();
+    let target_bits: Option<Vec<bool>> = early_stop.filter(|_| min == 0).map(|ts| {
+        let mut b = vec![false; n_nodes];
+        for &t in ts {
+            if (t as usize) < n_nodes {
+                b[t as usize] = true;
+            }
+        }
+        b
+    });
+    let remaining_init: usize = target_bits
+        .as_ref()
+        .map_or(0, |b| b.iter().filter(|&&x| x).count());
 
     // When the input carries a path, each emitted row reconstructs the node/edge
     // chain start..endpoint so `Expr::Path` (nodes(p)/path_length(p)) sees the whole
@@ -7620,8 +9252,24 @@ fn shortest_path(
         // valid endpoint at the shortest such length (a cycle) — standard BFS never
         // re-reaches `start`, so collect the closing edges here.
         let mut cycle_edges: Vec<(u32, u32, u32)> = Vec::new();
+        // Early-stop bookkeeping (a no-op when `target_bits` is None).
+        let mut remaining = remaining_init;
+        let mut stop_dist: Option<u32> = None;
+        if let Some(bits) = &target_bits {
+            if bits[start as usize] && remaining > 0 {
+                remaining -= 1;
+                if remaining == 0 {
+                    stop_dist = Some(0); // source IS the only target — nothing to explore
+                }
+            }
+        }
         while let Some(v) = q.pop_front() {
             let dv = dist[&v];
+            // All targets settled and their predecessors (depth < D) fully dequeued: any
+            // node at depth >= D is beyond every target and would be filtered out anyway.
+            if stop_dist.is_some_and(|d| dv >= d) {
+                break;
+            }
             if max.is_some_and(|m| dv >= m) {
                 continue; // hop cap: do not expand past `max`
             }
@@ -7646,6 +9294,16 @@ fn shortest_path(
                         preds.entry(a.nbr).or_default().push((v, a.eid));
                         order.push(a.nbr);
                         q.push_back(a.nbr);
+                        // First time we reach a target: once all are found, the deepest is
+                        // at `dv + 1`, so stop after the current (depth `dv`) level drains.
+                        if let Some(bits) = &target_bits {
+                            if bits[a.nbr as usize] && remaining > 0 {
+                                remaining -= 1;
+                                if remaining == 0 {
+                                    stop_dist = Some(dv + 1);
+                                }
+                            }
+                        }
                     }
                     // Another edge onto a node at its shortest distance — a second
                     // shortest-path predecessor.
@@ -8506,6 +10164,12 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             return arith_general(*op, &l, &r);
         }
         Expr::Call { name, args } => {
+            // A call that is a pure function of one dict column (`upper(city)`, …) is
+            // computed per distinct value, not per row. (Element functions take a Slot
+            // arg, not a Prop, so `sole_prop_ref` rejects them — no conflict below.)
+            if let Some(col) = try_eval_dict_scalar(expr, store, batch) {
+                return Ok(col);
+            }
             // `element_id(node|edge)` → the element's PRESERVED external id string.
             if name == "element_id" {
                 let arg = eval(&args[0], store, batch)?;
@@ -8640,30 +10304,22 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                 let node_id = |id: u32| store.node_ext_id(id).map_or(Value::Null, Value::Str);
                 let arg = eval(&args[0], store, batch)?;
                 let n = batch.rows();
+                // Resolve the node columns ONCE (sorted, present-filtered per node below)
+                // instead of re-cloning+sorting the key list and HashMap-probing per node.
+                let node_cols = resolve_node_cols(store, &filter);
                 let out: Vec<Value> = (0..n)
                     .map(|i| {
                         let mut entries: Vec<(Value, Value)> = Vec::new();
                         match arg.value_at(i) {
                             Value::Num(id) if matches!(arg, Col::Nodes(_)) => {
                                 let id = id as u32;
+                                let ni = id as usize;
                                 entries.push((Value::Str("id".into()), node_id(id)));
                                 entries.push((Value::Str("label".into()), node_label(id)));
-                                let keys = if filter.is_empty() {
-                                    store.prop_keys()
-                                } else {
-                                    filter.clone()
-                                };
-                                let mut props: Vec<(String, Value)> = keys
-                                    .into_iter()
-                                    .filter(|k| store.has_prop(id, k))
-                                    .map(|k| {
-                                        let v = store.prop(id, &k);
-                                        (k, v)
-                                    })
-                                    .collect();
-                                props.sort_by(|a, b| a.0.cmp(&b.0));
-                                for (k, v) in props {
-                                    entries.push((Value::Str(k.into()), v));
+                                for (k, col) in &node_cols {
+                                    if col.present_at(ni) {
+                                        entries.push((Value::Str(Arc::clone(k)), col.read(ni)));
+                                    }
                                 }
                             }
                             Value::Num(eid) if matches!(arg, Col::Edges(_)) => {
@@ -8734,23 +10390,28 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                     .collect();
                 let arg = eval(&args[0], store, batch)?;
                 let n = batch.rows();
+                // Node columns resolved ONCE (sorted); the node arm reads straight from
+                // them, skipping the per-node key clone+sort and per-key HashMap probes.
+                let node_cols = resolve_node_cols(store, &filter);
                 let out: Vec<Value> = (0..n)
                     .map(|i| {
+                        // The node arm emits its (already-sorted) pairs directly; only the
+                        // edge arm builds an unsorted `pairs` that needs the sort below.
                         let mut pairs: Vec<(String, Value)> = match arg.value_at(i) {
                             Value::Num(id) if matches!(arg, Col::Nodes(_)) => {
-                                let id = id as u32;
-                                let keys = if filter.is_empty() {
-                                    store.prop_keys()
-                                } else {
-                                    filter.clone()
+                                let ni = id as usize;
+                                return {
+                                    let entries: Vec<(Value, Value)> = node_cols
+                                        .iter()
+                                        .filter(|(_, col)| col.present_at(ni))
+                                        .map(|(k, col)| {
+                                            let v = col.read(ni);
+                                            let v = if wrap { Value::List(vec![v]) } else { v };
+                                            (Value::Str(Arc::clone(k)), v)
+                                        })
+                                        .collect();
+                                    Value::Map(Arc::new(entries))
                                 };
-                                keys.into_iter()
-                                    .filter(|k| store.has_prop(id, k))
-                                    .map(|k| {
-                                        let v = store.prop(id, &k);
-                                        (k, v)
-                                    })
-                                    .collect()
                             }
                             Value::Num(eid) if matches!(arg, Col::Edges(_)) => {
                                 let eid = eid as u32;
@@ -9128,12 +10789,16 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             // (`pi()`, `e()`) has no arg columns yet still yields one value per row.
             let cols = eval_all(args, store, batch)?;
             let n = batch.rows();
-            let out = (0..n)
-                .map(|i| {
-                    let row: Vec<Value> = cols.iter().map(|c| c.value_at(i)).collect();
-                    call_scalar_checked(name, &row)
-                })
-                .collect::<Result<Vec<Value>, String>>()?;
+            // Reuse ONE argument buffer across rows instead of heap-allocating a fresh
+            // `Vec<Value>` per row — a general win for every multi-arg scalar function
+            // (concat, substring, replace, …), which otherwise paid `n` allocations.
+            let mut buf: Vec<Value> = Vec::with_capacity(cols.len());
+            let mut out: Vec<Value> = Vec::with_capacity(n);
+            for i in 0..n {
+                buf.clear();
+                buf.extend(cols.iter().map(|c| c.value_at(i)));
+                out.push(call_scalar_checked(name, &buf)?);
+            }
             Col::Gen(out)
         }
         Expr::List { items } => {
@@ -9190,6 +10855,38 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
             branches,
             otherwise,
         } => {
+            // Categorical remap fast path: every branch is `<dict col> = <str literal>`.
+            // Precompute code → first-matching-branch once, then map each row by its code
+            // instead of evaluating a full compare column per branch. Byte-identical: an
+            // absent value / null-sentinel matches no branch (→ ELSE), same as the 3VL
+            // compares below.
+            if let Some((slot, key, code_to_branch)) = case_dict_lookup(branches, store) {
+                if let (Some(Column::Dict { codes, present, .. }), Col::Nodes(ids)) =
+                    (store.column(&key), batch.slot(slot))
+                {
+                    let vals = eval_all(branches.iter().map(|(_, v)| v), store, batch)?;
+                    let else_col = otherwise
+                        .as_ref()
+                        .map(|e| eval(e, store, batch))
+                        .transpose()?;
+                    let out: Vec<Value> = ids
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &id)| {
+                            let bi = (id != u32::MAX && present[id as usize])
+                                .then(|| code_to_branch[codes[id as usize] as usize])
+                                .flatten();
+                            match bi {
+                                Some(b) => vals[b].value_at(i),
+                                None => else_col
+                                    .as_ref()
+                                    .map_or(Value::Null, |c| c.value_at(i)),
+                            }
+                        })
+                        .collect();
+                    return Ok(Col::Gen(out));
+                }
+            }
             let conds = eval_all(branches.iter().map(|(c, _)| c), store, batch)?;
             let vals = eval_all(branches.iter().map(|(_, v)| v), store, batch)?;
             let else_col = otherwise
@@ -9343,6 +11040,71 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                                 .map(|&v| v != u32::MAX && node_has_nbr(store, v, *dir, &want))
                                 .collect(),
                         ));
+                    }
+                }
+            }
+            // Filtered semijoin: `where(out().has(k,v))` / GQL `EXISTS { (n)->(m:L) WHERE
+            // … }` — a CHAIN of `Filter`s over `Expand over Row`. Check the neighbour
+            // predicates per source with early-stop, instead of expanding every neighbour
+            // of the frontier then filtering + back-mapping. Only SIMPLE leaves on the
+            // neighbour (compares / presence / label tests).
+            {
+                let mut cur = body.as_ref();
+                let mut filter_preds: Vec<&Expr> = Vec::new();
+                while let Plan::Filter { input, pred } = cur {
+                    filter_preds.push(pred);
+                    cur = input.as_ref();
+                }
+                if let Plan::Expand {
+                    input,
+                    from,
+                    dir,
+                    edge_label,
+                    bind_edge: false,
+                    double_loops: _,
+                } = cur
+                {
+                    if !filter_preds.is_empty() && matches!(**input, Plan::Row) {
+                        let preds: Option<Vec<NbrPred>> = filter_preds
+                            .iter()
+                            .map(|p| simple_nbr_preds(p, *from))
+                            .collect::<Option<Vec<_>>>()
+                            .map(|v| v.into_iter().flatten().collect());
+                        if let (Col::Nodes(ids), Some(preds)) = (batch.slot(*from), preds) {
+                            let want = match want_etypes(store, edge_label) {
+                                Ok(w) => w,
+                                Err(()) => return Ok(Col::Bool(vec![false; ids.len()])),
+                            };
+                            // Raw-column fast path for a lone numeric neighbour compare:
+                            // resolve the column ONCE, not per neighbour via `store.prop`.
+                            if let [NbrPred::Cmp(k, op, Value::Num(t))] = preds.as_slice() {
+                                if let Some(Column::Num { data, present }) = store.column(k) {
+                                    return Ok(Col::Bool(
+                                        ids.iter()
+                                            .map(|&v| {
+                                                v != u32::MAX
+                                                    && node_has_num_nbr(
+                                                        store,
+                                                        v,
+                                                        *dir,
+                                                        &want,
+                                                        (data, present),
+                                                        (*op, *t),
+                                                    )
+                                            })
+                                            .collect(),
+                                    ));
+                                }
+                            }
+                            return Ok(Col::Bool(
+                                ids.iter()
+                                    .map(|&v| {
+                                        v != u32::MAX
+                                            && node_has_matching_nbr(store, v, *dir, &want, &preds)
+                                    })
+                                    .collect(),
+                            ));
+                        }
                     }
                 }
             }
@@ -9676,7 +11438,7 @@ fn pull_body(plan: &Plan, store: &Store, seed: &Batch) -> Result<Batch, String> 
             until.as_deref(),
             body_filter.as_deref(),
             *double_loops,
-        ),
+        )?,
         Plan::Filter { input, pred } => {
             let b = pull_body(input, store, seed)?;
             let mask = eval(pred, store, &b)?;
@@ -11344,6 +13106,11 @@ fn try_num_conjunction(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<
 }
 
 fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usize>> {
+    // A predicate that is a pure function of ONE dict column: evaluate per distinct value
+    // (≤ dict size) and keep by code, instead of a boxed eval per row.
+    if let Some(keep) = try_filter_keep_dict(pred, store, batch) {
+        return Some(keep);
+    }
     // `NOT p` pushes into the raw fast paths by inverting `p` (De Morgan + operator
     // flip), exact for the keep-TRUE filter. If the inverted form is not itself
     // fast-pathable, this returns None and the caller evaluates the original `NOT`

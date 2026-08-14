@@ -28,6 +28,39 @@ unsafe fn store_ref<'a>(s: *const Store) -> Option<&'a Store> {
     unsafe { s.as_ref() }
 }
 
+/// Borrow an engine `Store` handle mutably (null → `None`).
+///
+/// # Safety
+/// If non-null, `s` must point to a live `Store` not otherwise aliased for `'a`.
+unsafe fn store_mut<'a>(s: *mut Store) -> Option<&'a mut Store> {
+    // SAFETY: as_mut() yields None for null; otherwise the caller's # Safety contract requires exclusive access to a live, aligned Store for 'a.
+    unsafe { s.as_mut() }
+}
+
+/// Set one engine resource limit by its stable `ConfigId` (mirrors core's
+/// `lnk_graph_set_config`, same id space — so one host code path configures either
+/// engine). Returns 1 when applied, 0 for a null handle / unknown id / zero value, so a
+/// host on an older artifact can report an unsupported setting rather than silently
+/// running with the default.
+///
+/// # Safety
+/// `s` must be a valid `Store` handle (or null).
+#[no_mangle]
+pub unsafe extern "C" fn lnk_e_graph_set_config(s: *mut Store, id: u32, value: u64) -> u32 {
+    // SAFETY: forwards this fn's # Safety contract to store_mut (null -> None).
+    let Some(store) = (unsafe { store_mut(s) }) else {
+        return 0;
+    };
+    let Some(id) = lenke_engine::store::ConfigId::from_u32(id) else {
+        return 0;
+    };
+    if value == 0 {
+        return 0; // reject a zero ceiling (matches core), which would break every query
+    }
+    store.set_limit(id, value);
+    1
+}
+
 /// Borrow a caller-owned byte buffer as UTF-8 `&str` (null or non-UTF-8 → `None`).
 ///
 /// # Safety
@@ -133,9 +166,18 @@ pub unsafe extern "C" fn lnk_e_gremlin_json(
         Err(_) => return std::ptr::null_mut(),
     };
     let plan = lenke_engine::opt::optimize_indexed(plan, store);
-    let rows = lenke_engine::exec::run(&plan, store);
+    // Run behind a panic backstop: an evaluation fault returns `Err` (→ null), and even a
+    // genuine panic (e.g. an internal index bug) is caught rather than unwinding across
+    // this `extern "C"` boundary — which is undefined behavior / a process abort. A
+    // faulting query must fail this ONE call, never take the host down.
+    let json = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lenke_engine::exec::try_run_gremlin_json(&plan, store)
+    })) {
+        Ok(Ok(json)) => json,
+        Ok(Err(_)) | Err(_) => return std::ptr::null_mut(),
+    };
     // SAFETY: out_len is writable per this fn's # Safety contract.
-    unsafe { out_string(lenke_engine::json::gremlin_results_json(&rows), out_len) }
+    unsafe { out_string(json, out_len) }
 }
 
 /// Run a GQL query against the engine store and return a `{columns, rows}` JSON document
@@ -161,7 +203,14 @@ pub unsafe extern "C" fn lnk_e_query_rows(
         Err(_) => return std::ptr::null_mut(),
     };
     let plan = lenke_engine::opt::optimize_indexed(plan, store);
-    let rows = lenke_engine::exec::run(&plan, store);
+    // Panic backstop (see `lnk_e_gremlin_json`): a faulting query fails this one call with
+    // a null result, never unwinds across the C boundary.
+    let json = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lenke_engine::exec::try_run(&plan, store).map(|r| lenke_engine::json::gql_rows_json(&r))
+    })) {
+        Ok(Ok(json)) => json,
+        Ok(Err(_)) | Err(_) => return std::ptr::null_mut(),
+    };
     // SAFETY: out_len is writable per this fn's # Safety contract.
-    unsafe { out_string(lenke_engine::json::gql_rows_json(&rows), out_len) }
+    unsafe { out_string(json, out_len) }
 }

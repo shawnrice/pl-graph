@@ -5964,6 +5964,265 @@ mod tests {
         assert_eq!(ids("g.V().order().by('age').range(3, 13).id()"), asc[3..13]);
     }
 
+    /// The streaming JSON sink (`try_stream_gremlin_json`) must be BYTE-IDENTICAL to
+    /// materializing the whole result then serializing — same rows, same order, same
+    /// per-cell rendering. Forced on (`min_rows = 0`) so the gate can't hide a mismatch,
+    /// over a single-hop `values` chain (the shape it accepts). This is the invariant the
+    /// cost gate exists to exploit safely, not to protect.
+    #[test]
+    fn streaming_json_sink_matches_materialized_bytes() {
+        let mut b = Builder::default();
+        let n = 200u32;
+        for i in 0..n {
+            b.node(&["N"], &[("name", s(&format!("p{i}")))]);
+        }
+        for i in 0..n {
+            for d in 1..=3u32 {
+                b.edge(i, (i + d) % n, "R"); // out() fans out 3x — a real frontier
+            }
+        }
+        let st = b.build();
+        let plan = crate::opt::optimize_indexed(super::parse("g.V().out().values('name')").unwrap(), &st);
+        let materialized = crate::json::gremlin_results_json(&run(&plan, &st));
+        let streamed = crate::exec::try_stream_gremlin_json(&plan, &st, false, 0.0)
+            .expect("single-hop values is a streamable shape");
+        assert_eq!(streamed, materialized);
+    }
+
+    /// The fused element/value-map JSON writer (`run_gremlin_json`'s node-map fast path)
+    /// must be BYTE-IDENTICAL to building the `Value::Map` tree then serializing it
+    /// (`gremlin_results_json(run(..))`) — across the nested render, flat `elementMap`,
+    /// `valueMap`, a key filter, absent properties, and multi-label nodes. This is the
+    /// invariant the whole optimization rests on: it may skip the tree only if the bytes
+    /// are the same.
+    #[test]
+    fn fused_map_json_matches_value_tree_bytes() {
+        let mut b = Builder::default();
+        // Mixed graph: some nodes miss `age`/`city`; every 5th node is also VIP; a bool.
+        for i in 0..120u32 {
+            let mut props: Vec<(&str, Value)> =
+                vec![("name", s(&format!("p{i}"))), ("active", Value::Bool(i % 2 == 0))];
+            if i % 3 != 0 {
+                props.push(("age", n(f64::from(i % 40 + 18))));
+            }
+            if i % 4 != 0 {
+                props.push(("city", s(["oslo", "bergen", "tromso"][(i % 3) as usize])));
+            }
+            let labels: &[&str] = if i % 5 == 0 { &["N", "VIP"] } else { &["N"] };
+            b.node(labels, &props);
+        }
+        for i in 0..120u32 {
+            b.edge(i, (i + 1) % 120, "R");
+            b.edge(i, (i + 7) % 120, "R");
+        }
+        let st = b.build();
+        for q in [
+            "g.V().out().elementMap()",
+            "g.V().out().valueMap()",
+            "g.V().out().elementMap('name', 'age')",
+            "g.V().out().valueMap('city', 'missingkey')",
+            "g.V().out()",
+            "g.V().hasLabel('VIP').elementMap()",
+        ] {
+            let plan = crate::opt::optimize_indexed(super::parse(q).unwrap(), &st);
+            let fused = crate::exec::run_gremlin_json(&plan, &st);
+            let tree = crate::json::gremlin_results_json(&run(&plan, &st));
+            assert_eq!(fused, tree, "fused vs value-tree diverged for `{q}`");
+        }
+    }
+
+    /// Target-aware shortest-path early stop must be byte-identical to the full BFS: a
+    /// `Filter{endpoint == t}` over `ShortestPath` bounds the search to the target's
+    /// distance, but the filter still runs, so the KEPT rows (paths + multiplicity) are
+    /// unchanged. Compare an INDEXED store (early stop fires) against an UNINDEXED one
+    /// (full BFS) across ANY/ALL and endpoint/path returns, including a diamond that gives
+    /// a node two distinct shortest paths (exercises `ALL` multiplicity).
+    #[test]
+    fn shortest_path_early_stop_matches_full_bfs() {
+        // 0->1->4 and 0->2->4 (two shortest paths to 4), then 4->5->6->7 (a tail).
+        let edges = [(0, 1), (0, 2), (1, 4), (2, 4), (4, 5), (5, 6), (6, 7), (0, 3), (3, 4)];
+        let mut nd = String::new();
+        for i in 0..8u32 {
+            nd.push_str(&format!("{{\"id\":\"{i}\",\"labels\":[\"N\"],\"props\":{{\"k\":{i}}}}}\n"));
+        }
+        for (j, (a, b)) in edges.iter().enumerate() {
+            nd.push_str(&format!(
+                "{{\"id\":\"e{j}\",\"from\":\"{a}\",\"to\":\"{b}\",\"labels\":[\"R\"],\"props\":{{}}}}\n"
+            ));
+        }
+        let plain = crate::ndjson::from_ndjson(&nd).unwrap();
+        let mut indexed = crate::ndjson::from_ndjson(&nd).unwrap();
+        indexed.create_index("k"); // makes `try_shortest_early_stop` fire
+
+        let gql_json = |st: &crate::store::Store, q: &str| {
+            let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), st);
+            crate::json::gql_rows_json(&run(&plan, st))
+        };
+        for tgt in [4u32, 7, 3] {
+            for sel in ["ANY", "ALL"] {
+                for ret in ["b.k", "path_length(p)"] {
+                    let q = format!(
+                        "MATCH p = {sel} SHORTEST (a:N {{k:0}})-[]->*(b:N {{k:{tgt}}}) RETURN {ret}"
+                    );
+                    assert_eq!(
+                        gql_json(&plain, &q),
+                        gql_json(&indexed, &q),
+                        "early-stop diverged from full BFS for `{q}`"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `repeat(...).dedup().count()` — the order-free reachability-COUNT shape — must run
+    /// as a per-level BFS (`varlen_distinct_endpoint_count`), NOT by materializing the
+    /// exponential walk. Two assertions: (1) the count equals the distinct endpoints a
+    /// shallow walk actually produces; (2) a DEEP count completes and stays under the trail
+    /// ceiling — proof it never enumerates the (astronomical) walk.
+    #[test]
+    fn reachability_count_is_bfs_not_walk_enumeration() {
+        let mut nd = String::new();
+        for i in 0..300u32 {
+            nd.push_str(&format!("{{\"id\":\"{i}\",\"labels\":[\"N\"],\"props\":{{}}}}\n"));
+        }
+        for e in 0..900u32 {
+            let (from, to) = (e % 300, (e * 11 + 3) % 300);
+            nd.push_str(&format!(
+                "{{\"id\":\"e{e}\",\"from\":\"{from}\",\"to\":\"{to}\",\"labels\":[\"R\"],\"props\":{{}}}}\n"
+            ));
+        }
+        let st = crate::ndjson::from_ndjson(&nd).unwrap();
+        let count = |q: &str| -> f64 {
+            let plan = crate::opt::optimize_indexed(super::parse(q).unwrap(), &st);
+            crate::exec::run_gremlin_json(&plan, &st)
+                .trim_matches(|c| c == '[' || c == ']')
+                .parse()
+                .unwrap()
+        };
+        // (1) BFS count == distinct endpoints of the actual 2-step walk.
+        let plan = crate::opt::optimize_indexed(
+            super::parse("g.V().repeat(both()).times(2)").unwrap(),
+            &st,
+        );
+        let walk = run(&plan, &st);
+        let endpoint_col = walk.names.len() - 1;
+        let mut distinct: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for row in walk.rows.iter() {
+            distinct.insert(format!("{:?}", row[endpoint_col]));
+        }
+        assert_eq!(count("g.V().repeat(both()).times(2).dedup().count()"), distinct.len() as f64);
+
+        // (2) A DEEP reach-count still completes — impossible via walk enumeration (the
+        // default trail ceiling would trip long before depth 30 if it enumerated).
+        let deep = count("g.V().repeat(both()).times(30).dedup().count()");
+        assert!(deep > 0.0 && deep <= 300.0, "deep reach-count out of range: {deep}");
+    }
+
+    /// A runaway per-path `repeat` must trip the `trail` limit with a loud
+    /// `E_RESOURCE_EXHAUSTED` — never a truncated result, never an OOM — and the ceiling
+    /// must be configurable (the same anti-runaway contract, and defaults, as core).
+    #[test]
+    fn trail_limit_caps_runaway_traversal_and_is_configurable() {
+        use crate::store::ConfigId;
+        // A dense-ish graph so `repeat(both())` fans out fast.
+        let mut nd = String::new();
+        for i in 0..200u32 {
+            nd.push_str(&format!("{{\"id\":\"{i}\",\"labels\":[\"N\"],\"props\":{{}}}}\n"));
+        }
+        for e in 0..800u32 {
+            let (from, to) = (e % 200, (e * 7 + 1) % 200);
+            nd.push_str(&format!(
+                "{{\"id\":\"e{e}\",\"from\":\"{from}\",\"to\":\"{to}\",\"labels\":[\"R\"],\"props\":{{}}}}\n"
+            ));
+        }
+        let mut st = crate::ndjson::from_ndjson(&nd).unwrap();
+        assert_eq!(st.limits().trail, 1_000_000); // core-matching default
+
+        let run_q = |st: &crate::store::Store, q: &str| {
+            let plan = crate::opt::optimize_indexed(super::parse(q).unwrap(), st);
+            crate::exec::try_run(&plan, st)
+        };
+        let is_exhausted = |r: &Result<crate::exec::Rows, String>| {
+            matches!(r, Err(e) if e.contains("E_RESOURCE_EXHAUSTED"))
+        };
+
+        // A shallow walk is well under the default ceiling — it completes.
+        assert!(run_q(&st, "g.V().repeat(both()).times(1)").is_ok());
+
+        // Tighten the ceiling: a walk that exceeds it now errors (not truncates).
+        st.set_limit(ConfigId::LimitsTrail, 2_000);
+        let tight = run_q(&st, "g.V().repeat(both()).times(3)");
+        assert!(is_exhausted(&tight), "expected E_RESOURCE_EXHAUSTED, got {tight:?}");
+
+        // Raise it back above the result size: the SAME query now completes.
+        st.set_limit(ConfigId::LimitsTrail, 100_000_000);
+        assert!(run_q(&st, "g.V().repeat(both()).times(3)").is_ok());
+    }
+
+    /// The fused writer must also match the value-tree bytes for EDGE frontiers — the
+    /// nested `{id, from, to, labels, properties}`, the flat `elementMap` with its
+    /// `IN`/`OUT` endpoint stubs, and `valueMap` — over edges carrying numeric and string
+    /// properties (some absent), and for bare `g.E()`. Built from ndjson so the edges have
+    /// real properties (the test `Builder::edge` sets none).
+    #[test]
+    fn fused_edge_map_json_matches_value_tree_bytes() {
+        let mut nd = String::new();
+        for i in 0..40u32 {
+            nd.push_str(&format!(
+                "{{\"id\":\"{i}\",\"labels\":[\"N\"],\"props\":{{\"name\":\"p{i}\"}}}}\n"
+            ));
+        }
+        for e in 0..80u32 {
+            let (from, to) = (e % 40, (e + 3) % 40);
+            // Half the edges carry a string `kind`; all carry numeric `w`; some typed T2.
+            let mut props = format!("\"w\":{}", e % 50);
+            if e % 2 == 0 {
+                props.push_str(&format!(",\"kind\":\"{}\"", ["buy", "sell"][(e % 2) as usize]));
+            }
+            let lbl = if e % 5 == 0 { "T2" } else { "R" };
+            nd.push_str(&format!(
+                "{{\"id\":\"edge{e}\",\"from\":\"{from}\",\"to\":\"{to}\",\"labels\":[\"{lbl}\"],\"props\":{{{props}}}}}\n"
+            ));
+        }
+        let st = crate::ndjson::from_ndjson(&nd).unwrap();
+        for q in [
+            "g.E().elementMap()",
+            "g.E().valueMap()",
+            "g.E().elementMap('w')",
+            "g.E().valueMap('kind', 'absent')",
+            "g.E()",
+            "g.V().outE().elementMap()",
+            "g.V().outE().valueMap()",
+        ] {
+            let plan = crate::opt::optimize_indexed(super::parse(q).unwrap(), &st);
+            let fused = crate::exec::run_gremlin_json(&plan, &st);
+            let tree = crate::json::gremlin_results_json(&run(&plan, &st));
+            assert_eq!(fused, tree, "fused vs value-tree diverged for `{q}`");
+        }
+    }
+
+    /// The gate is STRUCTURAL, not just a row count: a chain the streamed form would
+    /// regress on must be rejected regardless of size. A deeper (2-hop) chain re-runs
+    /// every hop per block and loses; a VALUE-comparison filter (`has(eq(..))`) defeats
+    /// the row estimate the floor trusts. Both must return `None` even at `min_rows = 0`,
+    /// while the one accepted shape (single hop + presence filter) passes.
+    #[test]
+    fn streaming_gate_rejects_deep_and_value_filtered_chains() {
+        let mut b = Builder::default();
+        for i in 0..50u32 {
+            b.node(&["N"], &[("name", s(&format!("p{i}")))]);
+            b.edge(i, (i + 1) % 50, "R");
+        }
+        let st = b.build();
+        let opt = |q: &str| crate::opt::optimize_indexed(super::parse(q).unwrap(), &st);
+        // Accepted: one hop, presence filter from `values`.
+        assert!(crate::exec::try_stream_gremlin_json(&opt("g.V().out().values('name')"), &st, false, 0.0).is_some());
+        // Rejected: two hops (per-block re-expansion tax).
+        assert!(crate::exec::try_stream_gremlin_json(&opt("g.V().out().out().values('name')"), &st, false, 0.0).is_none());
+        // Rejected: a value comparison the estimate over-counts.
+        assert!(crate::exec::try_stream_gremlin_json(&opt("g.V().out().has('name', eq('p5')).values('name')"), &st, false, 0.0).is_none());
+    }
+
     /// A type filter must match an edge's SECONDARY label, not just its primary type —
     /// the per-edge `edge_has_extra` bit (which skips the extras probe for single-label
     /// edges) must be SET for a multi-label edge, or the secondary match is missed.

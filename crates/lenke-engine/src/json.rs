@@ -16,7 +16,7 @@ use crate::value::Value;
 use std::fmt::Write;
 
 /// Append `v` to `out` as JSON.
-fn write_value(out: &mut String, v: &Value) {
+pub(crate) fn write_value(out: &mut String, v: &Value) {
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -87,8 +87,17 @@ fn write_number(out: &mut String, x: f64) {
 }
 
 /// A JSON string literal (RFC 8259 escaping).
-fn write_string(out: &mut String, s: &str) {
+pub(crate) fn write_string(out: &mut String, s: &str) {
     out.push('"');
+    // Fast path: if NO byte needs escaping — none is `"`, `\`, or a control byte
+    // (< 0x20) — the literal is `s` verbatim, so copy it in one `push_str` (a memcpy)
+    // instead of walking `char`s. UTF-8 continuation/lead bytes are all >= 0x80, so a
+    // byte scan never false-flags a multi-byte char. Byte-identical to the loop below.
+    if !s.bytes().any(|b| b < 0x20 || b == b'"' || b == b'\\') {
+        out.push_str(s);
+        out.push('"');
+        return;
+    }
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),

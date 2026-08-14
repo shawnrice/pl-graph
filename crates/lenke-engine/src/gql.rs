@@ -5209,9 +5209,13 @@ impl Parser {
     }
 }
 
-/// An open `{n,}` upper bound is capped here (path enumeration is exponential;
-/// an unbounded quantifier needs the reachability form, not enumeration).
-const MAX_VARLEN: u32 = 32;
+/// An open upper bound (`+`, `*`, `{n,}`) is genuinely unbounded — matching core's
+/// transitive-closure semantics. Enumeration terminates anyway in Trail mode (a trail
+/// can't repeat an edge, so its length is bounded by the edge count), and the trail
+/// LIMIT is the anti-runaway guard: a closure too large to enumerate fails LOUDLY with
+/// `E_RESOURCE_EXHAUSTED` rather than being silently truncated to a wrong answer (which a
+/// hard 32-hop cap here did — it returned a subset of the real result set).
+const MAX_VARLEN: u32 = u32::MAX;
 
 /// Build the projection (or aggregation) a `RETURN`/`WITH` item list describes,
 /// attached above `plan`, and return it with the ordered output column names. An

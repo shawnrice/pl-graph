@@ -479,11 +479,68 @@ pub struct Adj {
 
 /// The graph. Nodes are dense ids `0..node_count`. Labels and properties are
 /// looked up by name; a label bucket (`by_label`) is the seed for a scan.
+/// Resource ceilings — ANTI-RUNAWAY bounds, not semantics. A query under the ceiling
+/// behaves identically whatever the ceiling is; tripping one is a loud
+/// `E_RESOURCE_EXHAUSTED`, never a truncated result. Mirrors `lenke-core`'s `GraphLimits`
+/// (same fields, same defaults) so the columnar engine enforces the SAME guards at the
+/// SAME thresholds as the shipped row engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphLimits {
+    /// Ceiling on `range(start, end [, step])` element count.
+    pub range: u64,
+    /// Cap on total variable-length / `repeat` traversal rows a single expansion may
+    /// emit — the guard against exponential blowup on a dense graph (core's `trail`).
+    pub trail: u64,
+    /// Ceiling on the intermediate frontier a fixed-length multi-segment scan may
+    /// materialize before the trailing hop/LIMIT prunes it.
+    pub intermediate: u64,
+    /// Ceiling on operator-chain length (parser-applied; `E_SYNTAX` when tripped).
+    pub operator_chain: u64,
+}
+
+impl Default for GraphLimits {
+    fn default() -> Self {
+        Self {
+            range: 1_000_000,
+            trail: 1_000_000,
+            intermediate: 50_000_000,
+            operator_chain: 10_000,
+        }
+    }
+}
+
+/// Stable wire ids for [`GraphLimits`] knobs — the FFI limit setter is ONE export keyed
+/// by id (append-only), matching core's `ConfigId` so the same host code drives both
+/// engines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ConfigId {
+    LimitsRange = 0,
+    LimitsTrail = 1,
+    LimitsIntermediate = 2,
+    LimitsOperatorChain = 3,
+}
+
+impl ConfigId {
+    #[must_use]
+    pub const fn from_u32(v: u32) -> Option<Self> {
+        match v {
+            0 => Some(Self::LimitsRange),
+            1 => Some(Self::LimitsTrail),
+            2 => Some(Self::LimitsIntermediate),
+            3 => Some(Self::LimitsOperatorChain),
+            _ => None,
+        }
+    }
+}
+
 /// Adjacency is per-node out/in lists (a simple layout for now; a CSR pack is a
 /// later optimization that changes nothing above this module).
 #[derive(Default)]
 pub struct Store {
     node_count: usize,
+    /// Resource ceilings (default [`GraphLimits::default`]); set via [`Store::set_limit`].
+    limits: GraphLimits,
     /// label name -> the sorted node ids carrying it (the scan seed).
     by_label: HashMap<String, Vec<u32>>,
     /// property name -> its typed column (length == node_count).
@@ -653,6 +710,23 @@ impl Store {
     #[must_use]
     pub fn node_count(&self) -> usize {
         self.node_count
+    }
+
+    /// The active resource ceilings (see [`GraphLimits`]).
+    #[must_use]
+    pub fn limits(&self) -> GraphLimits {
+        self.limits
+    }
+
+    /// Override one resource ceiling, keyed by its stable [`ConfigId`] — the single entry
+    /// point a host (or the FFI) uses to configure limits, matching core's keyed setter.
+    pub fn set_limit(&mut self, id: ConfigId, value: u64) {
+        match id {
+            ConfigId::LimitsRange => self.limits.range = value,
+            ConfigId::LimitsTrail => self.limits.trail = value,
+            ConfigId::LimitsIntermediate => self.limits.intermediate = value,
+            ConfigId::LimitsOperatorChain => self.limits.operator_chain = value,
+        }
     }
 
     /// The interned id for an edge-type name, or `None` if no edge ever used it
@@ -2563,6 +2637,7 @@ impl Builder {
         }
         let mut st = Store {
             node_count: n,
+            limits: GraphLimits::default(),
             by_label: self.by_label,
             props,
             prop_keys_cache: std::sync::RwLock::default(),
