@@ -203,22 +203,28 @@ fn plan_has_varlen(plan: &Plan) -> bool {
     }
 }
 
-pub fn try_run(plan: &Plan, store: &Store) -> Result<Rows, String> {
-    // Run a deep-recursion (traversal) plan on a big stack so an unbounded quantifier
-    // can't overflow; a simple plan keeps the cheap direct path. Stack is virtual —
-    // reserving a large size costs nothing until the recursion actually uses it.
-    if plan_has_varlen(plan) {
-        const BIG_STACK: usize = 1 << 30; // 1 GiB (virtual)
-        return std::thread::scope(|s| {
-            std::thread::Builder::new()
-                .stack_size(BIG_STACK)
-                .spawn_scoped(s, || try_run_inner(plan, store))
-                .expect("spawn traversal thread")
-                .join()
-                .expect("traversal thread panicked")
-        });
+/// Run `f` on a large (virtual) stack when `plan` contains a deep-recursion traversal, so
+/// an unbounded quantifier's recursive DFS can't overflow the default 8 MB stack; a simple
+/// plan runs `f` directly. Reserving a big stack costs nothing until the recursion uses
+/// it. Used by every entry that may drive a traversal — `try_run` and the Gremlin-JSON
+/// sinks, which call `pull` off the main path.
+fn on_big_stack<T: Send>(plan: &Plan, f: impl FnOnce() -> T + Send) -> T {
+    if !plan_has_varlen(plan) {
+        return f();
     }
-    try_run_inner(plan, store)
+    const BIG_STACK: usize = 1 << 30; // 1 GiB
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(BIG_STACK)
+            .spawn_scoped(s, f)
+            .expect("spawn traversal thread")
+            .join()
+            .expect("traversal thread panicked")
+    })
+}
+
+pub fn try_run(plan: &Plan, store: &Store) -> Result<Rows, String> {
+    on_big_stack(plan, || try_run_inner(plan, store))
 }
 
 fn try_run_inner(plan: &Plan, store: &Store) -> Result<Rows, String> {
@@ -2716,6 +2722,13 @@ pub fn run_gremlin_json(plan: &Plan, store: &Store) -> String {
 /// order, …) returns `Err` instead of panicking, so the FFI can surface it as a null
 /// result rather than unwinding across the C boundary (which aborts the process).
 pub fn try_run_gremlin_json(plan: &Plan, store: &Store) -> Result<String, String> {
+    // The fused/streamed sinks below call `pull` directly (off `try_run`'s path), so a
+    // var-length traversal here would recurse on the normal stack — route it to the big
+    // one, same as `try_run`.
+    on_big_stack(plan, || try_run_gremlin_json_inner(plan, store))
+}
+
+fn try_run_gremlin_json_inner(plan: &Plan, store: &Store) -> Result<String, String> {
     // Fused element/value-map serialization: for a terminal node-map projection, write
     // the JSON straight from the columns and skip building a `Value::Map` tree per row
     // (the dominant cost of these shapes — ~8-10 heap allocs/row otherwise). No cost

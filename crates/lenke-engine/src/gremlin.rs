@@ -6118,6 +6118,34 @@ mod tests {
         assert!(deep > 0.0 && deep <= 300.0, "deep reach-count out of range: {deep}");
     }
 
+    /// A DEEP traversal (recursion depth = hop count) must not overflow the stack — the
+    /// recursive var-length DFS runs on a large stack (`on_big_stack`). A 25k-node chain
+    /// walked end to end recurses ~25k frames, well past the default 8 MB stack, yet must
+    /// complete. Tiny result (one path), so this exercises DEPTH, not fan-out. Guards both
+    /// the `try_run` path and (via the JSON entry) the Gremlin sinks that call `pull`
+    /// directly.
+    #[test]
+    fn deep_traversal_runs_on_a_large_stack() {
+        let n = 25_000u32;
+        let mut nd = String::new();
+        for i in 0..n {
+            nd.push_str(&format!(
+                "{{\"id\":\"n{i}\",\"labels\":[\"P\"],\"props\":{{\"name\":\"p{i}\"}}}}\n"
+            ));
+        }
+        for i in 0..n - 1 {
+            nd.push_str(&format!(
+                "{{\"id\":\"e{i}\",\"from\":\"n{i}\",\"to\":\"n{}\",\"labels\":[\"R\"],\"props\":{{}}}}\n",
+                i + 1
+            ));
+        }
+        let st = crate::ndjson::from_ndjson(&nd).unwrap();
+        // From n0, exactly n-1 R-hops reaches the single last node.
+        let q = format!("MATCH (s:P {{name:'p0'}})-[:R]->{{{}}}(t) RETURN t.name AS r", n - 1);
+        let plan = crate::opt::optimize_indexed(crate::gql::parse(&q).unwrap(), &st);
+        assert_eq!(run(&plan, &st).rows.len(), 1);
+    }
+
     /// A runaway per-path `repeat` must trip the `trail` limit with a loud
     /// `E_RESOURCE_EXHAUSTED` — never a truncated result, never an OOM — and the ceiling
     /// must be configurable (the same anti-runaway contract, and defaults, as core).
