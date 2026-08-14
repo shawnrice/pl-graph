@@ -8325,69 +8325,47 @@ fn var_length(
     // per-row node/edge chain so path_length(p)/nodes(p)/edges(p) resolve; the
     // input carries a lineage exactly when the plan reads the path.
     let track = batch.lineage.is_some();
-    let mut keep = Vec::new();
-    let mut ends = Vec::new();
-    // For Trail this is the EDGE stack; for Simple/Acyclic the NODE stack (seeded
-    // with the start). Empty for Walk.
-    let mut used: Vec<u32> = Vec::new();
-    let mut bufs = PathBufs::new();
-    // One accumulating list column per group bind, row-aligned with `keep`/`ends`.
-    let mut group_cols: Vec<Vec<Value>> = vec![Vec::new(); group_binds.len()];
-    let node_unique = matches!(mode, PathMode::Simple | PathMode::Acyclic);
-    for (row, &v) in src.iter().enumerate() {
-        if node_unique {
-            used.push(v); // mark the start node
-        }
-        // The node/edge chain from the source to the DFS frontier — seeded with the
-        // source so `push_path` (which skips `chain[0]`, already the input path's
-        // tail) reconstructs the whole path.
-        let mut node_stack = vec![v];
-        let mut edge_stack: Vec<u32> = Vec::new();
-        varlen_dfs(
-            store,
-            v,
-            0,
-            min,
-            max,
-            dir,
-            &want,
-            mode,
-            v,
-            &mut used,
-            row,
-            &mut keep,
-            &mut ends,
-            if track { Some(batch) } else { None },
-            &mut node_stack,
-            &mut edge_stack,
-            &mut bufs,
-            group_binds,
-            &mut group_cols,
-            per_rep_pred,
-            k,
-            until_stop.map(|p| (p, endpoint_slot)),
-            body_filter.map(|p| (p, endpoint_slot)),
-            double_loops,
-            budget,
-        );
-        if node_unique {
-            used.pop();
-        }
-        debug_assert!(used.is_empty());
-        // Once the emit count clears the budget the DFS above stopped descending; bail
-        // out of the source loop too rather than starting the next source's walk.
-        if keep.len() as u64 > budget {
-            break;
-        }
-    }
+    // Materialize each emitted path into keep/ends (+ lineage / group columns).
+    let mut sink = CollectEmit {
+        keep: Vec::new(),
+        ends: Vec::new(),
+        bufs: PathBufs::new(),
+        group_cols: vec![Vec::new(); group_binds.len()],
+        batch: if track { Some(batch) } else { None },
+        group_binds,
+        k,
+        budget,
+    };
+    run_varlen(
+        src,
+        store,
+        &want,
+        min,
+        max,
+        dir,
+        mode,
+        per_rep_pred,
+        k,
+        until_stop.map(|p| (p, endpoint_slot)),
+        body_filter.map(|p| (p, endpoint_slot)),
+        double_loops,
+        &mut sink,
+    );
 
-    if keep.len() as u64 > budget {
+    if sink.keep.len() as u64 > budget {
         return Err(format!(
             "E_RESOURCE_EXHAUSTED: variable-length traversal exceeded the trail limit of \
              {budget} rows; add a tighter bound/`LIMIT`, dedup the frontier, or raise the \
              limit (ConfigId::LimitsTrail)"
         ));
     }
+    let CollectEmit {
+        keep,
+        ends,
+        bufs,
+        group_cols,
+        ..
+    } = sink;
 
     let mut slots: Vec<Col> = batch.slots.iter().map(|c| c.gather(&keep)).collect();
     slots.push(Col::Nodes(ends));
@@ -8959,7 +8937,116 @@ fn nested_group(
 /// on-path elements that block reuse under `mode` — edge ids for a trail, node ids
 /// for Simple/Acyclic (seeded with `start`). See [`varlen_step`].
 #[allow(clippy::too_many_arguments)]
-fn varlen_dfs(
+/// The per-path emit action of the var-length DFS. Parameterizing it lets the same
+/// traversal either MATERIALIZE rows into a batch ([`CollectEmit`]) or STREAM them
+/// straight to an output sink without ever building the batch — the memory win for a
+/// huge closure. Each emit is a completed path whose endpoint is `node_stack.last()`.
+trait VarlenEmit {
+    fn emit(&mut self, row: usize, node_stack: &[u32], edge_stack: &[u32]);
+    /// Stop descending — the emit budget (or a stream's output cap) is exhausted.
+    fn should_stop(&self) -> bool;
+}
+
+/// The materializing emit: reproduces exactly the old inline `keep`/`ends`/lineage/group
+/// pushes, so a batch built through it is byte-identical to before the refactor.
+struct CollectEmit<'a> {
+    keep: Vec<usize>,
+    ends: Vec<u32>,
+    bufs: PathBufs,
+    group_cols: Vec<Vec<Value>>,
+    batch: Option<&'a Batch>,
+    group_binds: &'a [(crate::ir::GroupPos, usize)],
+    k: u32,
+    budget: u64,
+}
+
+impl VarlenEmit for CollectEmit<'_> {
+    fn emit(&mut self, row: usize, node_stack: &[u32], edge_stack: &[u32]) {
+        let endpoint = *node_stack.last().expect("a path always has an endpoint");
+        self.keep.push(row);
+        self.ends.push(endpoint);
+        if let Some(b) = self.batch {
+            push_path(
+                b,
+                row,
+                node_stack,
+                edge_stack,
+                &mut self.bufs.values,
+                &mut self.bufs.offsets,
+                &mut self.bufs.edges,
+                &mut self.bufs.edge_offsets,
+            );
+        }
+        if !self.group_binds.is_empty() {
+            push_group_cols(node_stack, edge_stack, self.k, self.group_binds, &mut self.group_cols);
+        }
+    }
+    fn should_stop(&self) -> bool {
+        self.keep.len() as u64 > self.budget
+    }
+}
+
+/// Drive the var-length DFS from every source in `src`, feeding each completed path to
+/// `sink`. The per-source setup (Simple/Acyclic node marking, the seeded stacks) that used
+/// to live inline in `var_length` — factored out so a streaming caller reuses the exact
+/// same traversal.
+#[allow(clippy::too_many_arguments)]
+fn run_varlen<S: VarlenEmit>(
+    src: &[u32],
+    store: &Store,
+    want: &[u32],
+    min: u32,
+    max: u32,
+    dir: Dir,
+    mode: PathMode,
+    per_rep_pred: Option<&Expr>,
+    k: u32,
+    until_stop: Option<(&Expr, usize)>,
+    body_filter: Option<(&Expr, usize)>,
+    double_loops: bool,
+    sink: &mut S,
+) {
+    let node_unique = matches!(mode, PathMode::Simple | PathMode::Acyclic);
+    let mut used: Vec<u32> = Vec::new();
+    for (row, &v) in src.iter().enumerate() {
+        if node_unique {
+            used.push(v);
+        }
+        let mut node_stack = vec![v];
+        let mut edge_stack: Vec<u32> = Vec::new();
+        varlen_dfs(
+            store,
+            v,
+            0,
+            min,
+            max,
+            dir,
+            want,
+            mode,
+            v,
+            &mut used,
+            row,
+            &mut node_stack,
+            &mut edge_stack,
+            per_rep_pred,
+            k,
+            until_stop,
+            body_filter,
+            double_loops,
+            sink,
+        );
+        if node_unique {
+            used.pop();
+        }
+        debug_assert!(used.is_empty());
+        if sink.should_stop() {
+            break; // budget/cap tripped — do not start the next source's walk
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn varlen_dfs<S: VarlenEmit>(
     store: &Store,
     v: u32,
     len: u32,
@@ -8971,18 +9058,10 @@ fn varlen_dfs(
     start: u32,
     used: &mut Vec<u32>,
     row: usize,
-    keep: &mut Vec<usize>,
-    ends: &mut Vec<u32>,
-    // Lineage recording (a named path): `Some(input_batch)` records each emitted
-    // path into `bufs`; `node_stack`/`edge_stack` hold the chain source..`v`.
-    track_batch: Option<&Batch>,
+    // `node_stack`/`edge_stack` hold the chain source..`v`; the emit reads the endpoint
+    // (`node_stack.last()`) and the whole path from them.
     node_stack: &mut Vec<u32>,
     edge_stack: &mut Vec<u32>,
-    bufs: &mut PathBufs,
-    // Group-variable materialization (a RepeatGroup): at each emit, push one list per
-    // bind (source/edge/target across reps) into `group_cols`. Empty = no group vars.
-    group_binds: &[(crate::ir::GroupPos, usize)],
-    group_cols: &mut Vec<Vec<Value>>,
     // A per-repetition predicate over the rep's scalar (source=0, edge=1, target=2);
     // a hop that fails it is not descended into (the path through it is pruned).
     per_rep_pred: Option<&Expr>,
@@ -8996,13 +9075,11 @@ fn varlen_dfs(
     body_filter: Option<(&Expr, usize)>,
     // Gremlin `both()` self-loop doubling — keep the in-side copy of a self-loop.
     double_loops: bool,
-    // Anti-runaway cap on total emitted rows (`limits.trail`). Once `keep` passes it,
-    // every pending frame returns immediately, halting the exponential descent; the
-    // caller then turns the overflow into `E_RESOURCE_EXHAUSTED`.
-    budget: u64,
+    // Where each completed path goes (materialize or stream), and the stop condition.
+    sink: &mut S,
 ) {
-    // Budget tripped by a sibling branch — stop descending (the walk is being aborted).
-    if keep.len() as u64 > budget {
+    // Budget/cap tripped by a sibling branch — stop descending (the walk is aborting).
+    if sink.should_stop() {
         return;
     }
     // A body filter prunes a hop target that fails it — no emit, no descent (the source
@@ -9032,23 +9109,8 @@ fn varlen_dfs(
     let until_hit = until_stop.map(|(p, slot)| until_ok(p, store, slot, v));
     let emit_here = at_boundary && until_hit.unwrap_or(true);
     if emit_here {
-        keep.push(row);
-        ends.push(v);
-        if let Some(b) = track_batch {
-            push_path(
-                b,
-                row,
-                node_stack,
-                edge_stack,
-                &mut bufs.values,
-                &mut bufs.offsets,
-                &mut bufs.edges,
-                &mut bufs.edge_offsets,
-            );
-        }
-        if !group_binds.is_empty() {
-            push_group_cols(node_stack, edge_stack, k, group_binds, group_cols);
-        }
+        // `node_stack` ends at `v` (the recursion pushed it), so it IS this path.
+        sink.emit(row, node_stack, edge_stack);
     }
     // An `until` match at an emit boundary stops the walk here (the loop exit); a match
     // BELOW `min` (e.g. a post-form do-while source that already satisfies `pred`) does
@@ -9099,31 +9161,14 @@ fn varlen_dfs(
             VarStep::Skip => continue,
             VarStep::Close => {
                 // Emit the closing endpoint (the start) at this length, no descent —
-                // only at a rep boundary for a multi-hop unit.
+                // only at a rep boundary for a multi-hop unit. Push the closing node/edge
+                // so the path (and its `node_stack.last()` endpoint) is complete, then pop.
                 if len + 1 >= min && (len + 1).is_multiple_of(k) {
-                    keep.push(row);
-                    ends.push(a.nbr);
-                    if track_batch.is_some() || !group_binds.is_empty() {
-                        node_stack.push(a.nbr);
-                        edge_stack.push(a.eid);
-                        if let Some(b) = track_batch {
-                            push_path(
-                                b,
-                                row,
-                                node_stack,
-                                edge_stack,
-                                &mut bufs.values,
-                                &mut bufs.offsets,
-                                &mut bufs.edges,
-                                &mut bufs.edge_offsets,
-                            );
-                        }
-                        if !group_binds.is_empty() {
-                            push_group_cols(node_stack, edge_stack, k, group_binds, group_cols);
-                        }
-                        node_stack.pop();
-                        edge_stack.pop();
-                    }
+                    node_stack.push(a.nbr);
+                    edge_stack.push(a.eid);
+                    sink.emit(row, node_stack, edge_stack);
+                    node_stack.pop();
+                    edge_stack.pop();
                 }
                 continue;
             }
@@ -9146,20 +9191,14 @@ fn varlen_dfs(
             start,
             used,
             row,
-            keep,
-            ends,
-            track_batch,
             node_stack,
             edge_stack,
-            bufs,
-            group_binds,
-            group_cols,
             per_rep_pred,
             k,
             until_stop,
             body_filter,
             double_loops,
-            budget,
+            sink,
         );
         node_stack.pop();
         edge_stack.pop();
