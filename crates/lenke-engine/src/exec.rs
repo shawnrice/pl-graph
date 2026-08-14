@@ -1967,6 +1967,14 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             if let Some(b) = try_distinct_scan_multi(input, store) {
                 return Ok(b);
             }
+            // The hop-endpoint sibling: DISTINCT over properties of a chain frontier keys
+            // each endpoint node off storage (dict codes), never building the exploded
+            // frontier's property columns. Lineage-free (DISTINCT collapses paths).
+            if !track {
+                if let Some(b) = try_distinct_frontier_multi(input, store) {
+                    return Ok(b);
+                }
+            }
             let batch = pull(input, store, track)?;
             // Typed single-column fast path: dedup by the raw value (a `&str`, the
             // f64 group bits, or a dense id) — no per-row byte-key serialization.
@@ -13325,6 +13333,78 @@ fn try_distinct_scan_multi(input: &Plan, store: &Store) -> Option<Batch> {
             }
         }
     });
+    Some(Batch::of(outs.into_iter().map(Col::Gen).collect()))
+}
+
+/// The frontier sibling of [`try_distinct_scan_multi`]: `RETURN DISTINCT b.a, b.b, …`
+/// where `b` is a HOP-CHAIN endpoint. Pull the chain (cheap `Col::Nodes` columns — the
+/// traversal is unavoidable, but NO per-hop property column is built), then key each
+/// endpoint node straight off storage via [`ColKeyer`] (a 4-byte dict CODE, not a hashed
+/// string) and clone an `Arc` only for a surviving tuple. This drops the two costs the
+/// general path pays over the exploded frontier: materializing full `Arc<str>` property
+/// columns (`eval_all`) and byte-keying decoded strings. Dedup is first-seen over the
+/// batch's row order — the same order the general dedup sees — so it is byte-identical.
+/// `None` unless every projected key is a plain property of the chain frontier backed by a
+/// Num/Str/Bool/Dict column.
+fn try_distinct_frontier_multi(input: &Plan, store: &Store) -> Option<Batch> {
+    let Plan::Project { input: chain, items } = input else {
+        return None;
+    };
+    if items.is_empty() {
+        return None;
+    }
+    let endpoint = chain_width(chain)?.checked_sub(1)?;
+    let mut readers: Vec<ColKeyer> = Vec::with_capacity(items.len());
+    for (_, e) in items {
+        let Expr::Prop { slot, key } = e else {
+            return None;
+        };
+        if *slot != endpoint || key.contains('.') {
+            return None; // must be a plain property of the chain frontier
+        }
+        readers.push(ColKeyer::of(store.column(key))?);
+    }
+    // A single non-DICT column is better served by the typed dedup after the (cheap) pull:
+    // for a raw Str/Num the byte-key here loses to its `FnvSet<&str>` / f64-bits set. The
+    // byte-key only pays off when it skips a Dict DECODE (a low-card code, 4 bytes) or when
+    // a composite (multi-column) key is unavoidable anyway.
+    if readers.len() == 1 && !matches!(readers[0], ColKeyer::Dict { .. }) {
+        return None;
+    }
+    // Pull the chain only (no Project): its slots are `Col::Nodes`, never the boxed
+    // property columns the general path would build. A pull fault bails to the general
+    // path (which re-pulls and surfaces the error) rather than swallowing it.
+    let batch = pull(chain, store, false).ok()?;
+    let Col::Nodes(frontier) = batch.slot(endpoint) else {
+        return None;
+    };
+    let ncol = readers.len();
+    let mut outs: Vec<Vec<Value>> = vec![Vec::new(); ncol];
+    let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
+    let mut buf: Vec<u8> = Vec::new();
+    for &node in frontier {
+        buf.clear();
+        // An OPTIONAL-unmatched endpoint (`u32::MAX`) reads as all-NULL — the same key
+        // and tuple an all-absent real node yields, so they collide identically.
+        if node == u32::MAX {
+            // One `0` (the absent tag) per column — the all-NULL key.
+            buf.resize(readers.len(), 0);
+        } else {
+            for r in &readers {
+                r.key_into(node as usize, &mut buf);
+            }
+        }
+        if !seen.contains(buf.as_slice()) {
+            seen.insert(buf.clone());
+            for (c, r) in readers.iter().enumerate() {
+                outs[c].push(if node == u32::MAX {
+                    Value::Null
+                } else {
+                    r.value_at(node as usize)
+                });
+            }
+        }
+    }
     Some(Batch::of(outs.into_iter().map(Col::Gen).collect()))
 }
 
