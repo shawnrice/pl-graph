@@ -4618,6 +4618,27 @@ fn reverse_seed_decide(pred: &Expr, input: &Plan, store: &Store, track: bool) ->
     // boxes a residual, so it needs the selectivity guard; a large OR union in particular
     // must NOT flip when a downstream LIMIT could stream the forward walk cheaply.
     let loose = target_eq(pred, ep_slot).is_some();
+    // A SINGLE-hop non-loose seed has a cheap forward alternative: sweep the endpoint type's
+    // edges off the per-type CSR (`fwd`). Reverse-seeding a NON-selective range instead seeds
+    // its large bucket and walks the SPARSE type-in edges back — a random probe per seed that
+    // costs more than the sequential forward sweep. Decline when the bucket is not smaller than
+    // that forward cost (the `reverse_seed_worth` guard prices against the SOURCE scan, which
+    // over-fires for a sparse type — `age >= 77` = 92k seeds vs 80k forward F edges). Byte-
+    // identical either way — this only picks the cheaper equivalent plan.
+    if hops.len() == 1 && !loose {
+        if let Some(ep) = hops.last() {
+            let fwd: usize = ep
+                .want
+                .iter()
+                .filter_map(|&t| store.out_typed_flat(t).map(<[_]>::len))
+                .sum();
+            // A random type-in probe per seed costs ~10x a sequential forward edge read, so
+            // the reverse-seed only wins when its bucket is well under a tenth of `fwd`.
+            if fwd > 0 && bucket.len().saturating_mul(8) >= fwd {
+                return None;
+            }
+        }
+    }
     if !reverse_seed_worth(bucket.len(), source_rows, loose, store) {
         return None;
     }
@@ -6282,15 +6303,11 @@ fn try_fused_hop_num_count(input: &Plan, store: &Store) -> Option<u64> {
     // selective. The `reverse_seed_worth` guard prices the reverse walk against the SOURCE
     // scan (node count), which over-fires for a sparse type: seeding `age >= 77` (92k of 400k)
     // and walking the sparse F-in edges back cost MORE than sweeping the 80k F edges forward.
-    let flat_len = store.out_typed_flat(w)?.len();
-    if let Some(rs) = reverse_seed_decide(pred, exp, store, false) {
-        // The reverse walk seeds `bucket` endpoints and looks each one up in the (sparse,
-        // scattered) type-in index — a RANDOM probe per seed, measured ~10x the cost of one
-        // SEQUENTIAL forward edge read. So the reverse-seed only wins when its bucket is well
-        // under a tenth of the type's forward edge count; otherwise sweep the edges forward.
-        if rs.bucket.len().saturating_mul(8) < flat_len {
-            return None; // reverse-seed is the genuinely smaller job
-        }
+    // Defer to the reverse-seed exactly when it is the cheaper plan — `reverse_seed_decide`
+    // now declines a non-selective range over a sparse type (bucket ≥ ~⅛ the type's forward
+    // edge count), so a `Some` here means the endpoint is genuinely selective.
+    if reverse_seed_decide(pred, exp, store, false).is_some() {
+        return None;
     }
     let mut count = 0u64;
     // When the source set is the WHOLE graph (an unlabelled scan, or a label every live
