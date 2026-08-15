@@ -14222,6 +14222,18 @@ fn invert_pred(e: &Expr) -> Option<Expr> {
 /// same) and produces the row's output `Value` — both reading the column directly,
 /// borrowing a `&str` for the key rather than boxing or cloning per row. A `Dict`
 /// column keys on its decoded string, exactly as a `Str` would.
+/// One column's contribution to a composite DISTINCT key — the typed alternative to the
+/// byte-key, so a high-card Str cell hashes as a BORROWED `&str` (no per-node byte copy). The
+/// key tuple is positional, so parts of different types never need a discriminating tag.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum KeyPart<'a> {
+    Absent,
+    Bool(u8),
+    Num(u64),
+    Code(u32),
+    Str(&'a str),
+}
+
 enum ColKeyer<'a> {
     Dict {
         dict: &'a [std::sync::Arc<str>],
@@ -14305,6 +14317,46 @@ impl<'a> ColKeyer<'a> {
                     out.push(u8::from(data[i]));
                 } else {
                     out.push(0);
+                }
+            }
+        }
+    }
+
+    /// Row `i`'s composite-key PART — the typed value the byte-key encodes, but BORROWING a
+    /// Str cell's `&str` instead of copying its bytes (a high-card Str column is where the
+    /// byte-key's per-node alloc+copy dominates; the borrow hashes the same content with no
+    /// copy). Positional in the key tuple, so no cross-column tag is needed: a column is a
+    /// fixed type, and `Dict` keys on its CODE exactly as the byte-key does (same string →
+    /// same code). `Num` uses `num_group_bits` so the induced equivalence matches the byte-key
+    /// (−0.0/0.0 and the NaNs collapse identically).
+    fn key_part(&self, i: usize) -> KeyPart<'a> {
+        match self {
+            Self::Dict { codes, present, .. } => {
+                if present[i] {
+                    KeyPart::Code(codes[i])
+                } else {
+                    KeyPart::Absent
+                }
+            }
+            Self::Str { data, present } => {
+                if present[i] {
+                    KeyPart::Str(&data[i])
+                } else {
+                    KeyPart::Absent
+                }
+            }
+            Self::Num { data, present } => {
+                if present[i] {
+                    KeyPart::Num(value::num_group_bits(data[i]))
+                } else {
+                    KeyPart::Absent
+                }
+            }
+            Self::Bool { data, present } => {
+                if present[i] {
+                    KeyPart::Bool(u8::from(data[i]))
+                } else {
+                    KeyPart::Absent
                 }
             }
         }
@@ -14774,23 +14826,49 @@ fn try_distinct_frontier_multi(input: &Plan, store: &Store) -> Option<Batch> {
     let frontier: &[u32] = &frontier;
     let ncol = readers.len();
     let mut outs: Vec<Vec<Value>> = vec![Vec::new(); ncol];
+    // A hop endpoint repeats; building+hashing the composite key is the cost, so skip duplicate
+    // NODES with a cheap bitset and key only each distinct node once. Order-preserving (first
+    // occurrence drives insertion); `u32::MAX` (optional-unmatched) reads as all-Absent/all-NULL,
+    // so it dedups against an all-absent real node identically.
+    let mut seen_node = vec![false; store.node_count()];
+    // TWO-column fast path WITH a high-card Str column: a FIXED `(KeyPart, KeyPart)` tuple — no
+    // per-node heap alloc, and it BORROWS the Str cell's `&str` (no byte copy). That copy+alloc is
+    // what makes a Str composite lose; for all-Num / Dict pairs the compact byte-key is smaller
+    // than the enum tuple, so they keep it.
+    if ncol == 2 && readers.iter().any(|r| matches!(r, ColKeyer::Str { .. })) {
+        let (r0, r1) = (&readers[0], &readers[1]);
+        let mut seen: FnvSet<(KeyPart, KeyPart)> = FnvSet::default();
+        for &node in frontier {
+            if node != u32::MAX && std::mem::replace(&mut seen_node[node as usize], true) {
+                continue;
+            }
+            let key = if node == u32::MAX {
+                (KeyPart::Absent, KeyPart::Absent)
+            } else {
+                let i = node as usize;
+                (r0.key_part(i), r1.key_part(i))
+            };
+            if seen.insert(key) {
+                for (c, r) in readers.iter().enumerate() {
+                    outs[c].push(if node == u32::MAX {
+                        Value::Null
+                    } else {
+                        r.value_at(node as usize)
+                    });
+                }
+            }
+        }
+        return Some(Batch::of(outs.into_iter().map(Col::Gen).collect()));
+    }
+    // General N-column path: a byte-key tuple (`u32::MAX` → one all-NULL key per column).
     let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
     let mut buf: Vec<u8> = Vec::new();
-    // A hop endpoint repeats; building+hashing the composite key (the Str columns' bytes
-    // above all) is the cost, so skip duplicate NODES with a cheap bitset and key only
-    // each distinct node once. Order-preserving (first occurrence still drives insertion);
-    // `u32::MAX` (optional-unmatched) is not a real id, so its all-NULL key still dedups
-    // through `seen`.
-    let mut seen_node = vec![false; store.node_count()];
     for &node in frontier {
         if node != u32::MAX && std::mem::replace(&mut seen_node[node as usize], true) {
-            continue; // duplicate endpoint node — already keyed
+            continue;
         }
         buf.clear();
-        // An OPTIONAL-unmatched endpoint (`u32::MAX`) reads as all-NULL — the same key
-        // and tuple an all-absent real node yields, so they collide identically.
         if node == u32::MAX {
-            // One `0` (the absent tag) per column — the all-NULL key.
             buf.resize(readers.len(), 0);
         } else {
             for r in &readers {
@@ -16803,6 +16881,45 @@ mod tests {
         let st2 = b2.build();
         // targets passing age>=60: q0→q1(80✓), q0→q3(30✗), q1→q2(90✓), q3→q1(80✓) = 3.
         assert_eq!(count_of(q, &st2), 3.0, "universal flat-sweep path");
+    }
+
+    /// A two-column DISTINCT with a high-card Str column dedups on the (Str, other) tuple key
+    /// exactly as the byte-key would: same distinct tuples, first-seen order, and a present-null
+    /// component collapses with an absent one.
+    #[test]
+    fn str_composite_distinct_dedups_correctly() {
+        let mut b = Builder::default();
+        let src = b.node(&["N"], &[("name", s("src"))]);
+        // (alice,30) twice via two neighbours, (alice,40) once, (bob,30) once → 3 distinct tuples.
+        let n1 = b.node(&["N"], &[("name", s("alice")), ("age", n(30.0))]);
+        let n2 = b.node(&["N"], &[("name", s("alice")), ("age", n(30.0))]);
+        let n3 = b.node(&["N"], &[("name", s("alice")), ("age", n(40.0))]);
+        let n4 = b.node(&["N"], &[("name", s("bob")), ("age", n(30.0))]);
+        b.edge(src, n1, "R");
+        b.edge(src, n2, "R");
+        b.edge(src, n3, "R");
+        b.edge(src, n4, "R");
+        let st = b.build();
+        let out = run(
+            &crate::gql::parse("MATCH (a)-[:R]->(x) RETURN DISTINCT x.name AS n, x.age AS g")
+                .unwrap(),
+            &st,
+        );
+        let mut tuples: Vec<(String, String)> = out
+            .rows
+            .iter()
+            .map(|r| (format!("{:?}", r[0]), format!("{:?}", r[1])))
+            .collect();
+        assert_eq!(tuples.len(), 3, "three distinct (name, age) tuples");
+        tuples.sort();
+        assert_eq!(
+            tuples,
+            vec![
+                ("Str(\"alice\")".into(), "Num(30.0)".into()),
+                ("Str(\"alice\")".into(), "Num(40.0)".into()),
+                ("Str(\"bob\")".into(), "Num(30.0)".into()),
+            ]
+        );
     }
 
     /// A single-type hop over the per-type CSR returns the type's neighbours in the SAME
