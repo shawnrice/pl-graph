@@ -669,7 +669,8 @@ fn main() {
         println!("targeted: timing queries from {path}\n  {:>7} {:>9} {:>9}  query", "ratio", "eng_ms", "core_ms");
         for line in text.lines() {
             let q = line.rsplit("  ").next().unwrap_or(line).trim();
-            if q.is_empty() || !q.to_ascii_uppercase().contains("MATCH") {
+            let up = q.to_ascii_uppercase();
+            if q.is_empty() || !(up.contains("MATCH") || up.contains("CALL")) {
                 continue;
             }
             let e = time_engine_guarded(&estore, q, REPS, budget);

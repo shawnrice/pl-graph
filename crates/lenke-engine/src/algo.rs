@@ -414,6 +414,85 @@ pub fn personalized_pagerank(
     live.into_iter().map(|v| (v, pr[v as usize])).collect()
 }
 
+/// One node's winning label from the frozen `labels` snapshot: the most frequent label
+/// among its `csr` neighbours, ties broken by smallest id. `None` = no neighbours (keep).
+/// `count`/`touched` are reused scratch (a dense per-label tally reset via the touched
+/// list, O(degree) per node); each parallel worker owns its own pair.
+fn lp_pick(
+    v: u32,
+    csr: &Csr,
+    labels: &[u32],
+    count: &mut [u32],
+    touched: &mut Vec<u32>,
+) -> Option<u32> {
+    touched.clear();
+    for &u in csr.nbrs(v) {
+        let lbl = labels[u as usize];
+        if count[lbl as usize] == 0 {
+            touched.push(lbl);
+        }
+        count[lbl as usize] += 1;
+    }
+    let mut best: Option<(u32, u32)> = None; // (label, count)
+    for &lbl in touched.iter() {
+        let c = count[lbl as usize];
+        if best.is_none_or(|(bl, bc)| c > bc || (c == bc && lbl < bl)) {
+            best = Some((lbl, c));
+        }
+    }
+    for &lbl in touched.iter() {
+        count[lbl as usize] = 0; // reset only what this node touched
+    }
+    best.map(|(lbl, _)| lbl)
+}
+
+/// One synchronous round: each node in `live` adopts its winning label from the frozen
+/// `labels`. With `threads > 1` the work is split into scoped-thread chunks — every node's
+/// result is independent, so the merged `next` is identical to the single-thread round
+/// (same tally, same tie-break, order-independent). Each worker owns its dense tally.
+fn lp_round(live: &[u32], csr: &Csr, labels: &[u32], n: usize, threads: usize) -> Vec<u32> {
+    let mut next = labels.to_vec();
+    if threads <= 1 {
+        let mut count = vec![0u32; n];
+        let mut touched: Vec<u32> = Vec::new();
+        for &v in live {
+            if let Some(lbl) = lp_pick(v, csr, labels, &mut count, &mut touched) {
+                next[v as usize] = lbl;
+            }
+        }
+        return next;
+    }
+    let chunk = live.len().div_ceil(threads);
+    let parts: Vec<Vec<(u32, u32)>> = std::thread::scope(|s| {
+        let handles: Vec<_> = live
+            .chunks(chunk)
+            .map(|ch| {
+                s.spawn(move || {
+                    let mut count = vec![0u32; n];
+                    let mut touched: Vec<u32> = Vec::new();
+                    let mut out = Vec::with_capacity(ch.len());
+                    for &v in ch {
+                        if let Some(lbl) = lp_pick(v, csr, labels, &mut count, &mut touched) {
+                            out.push((v, lbl));
+                        }
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("label-prop round"))
+            .collect()
+    });
+    for part in &parts {
+        for &(v, lbl) in part {
+            next[v as usize] = lbl;
+        }
+    }
+    next
+}
+
 /// Synchronous label propagation (community detection). Every node starts labelled
 /// with its own id; each round it adopts the label most common among its UNDIRECTED
 /// neighbours (out + in), ties broken by the SMALLEST label id. Rounds are
@@ -434,46 +513,21 @@ pub fn label_propagation(
     let live = store.all_nodes();
     let mut labels: Vec<u32> = (0..n as u32).collect();
     if let Some(want) = want_etype(store, edge_label) {
-        // Reused scratch: a dense per-label tally indexed by label id (labels are
-        // always in `0..n`), reset via a touched-list so each node costs O(degree),
-        // not O(n) — and never a per-node heap allocation (the previous `HashMap`
-        // per node per iteration was the whole cost). The winner is identical: the
-        // most-frequent label, ties broken by smallest id (order-independent).
-        let mut count = vec![0u32; n];
-        let mut touched: Vec<u32> = Vec::new();
-        // Both-direction CSR built once and swept every iteration (order = out then
-        // in, as `for_each_nbr` gives — the tally is order-independent anyway).
+        // Both-direction CSR built once and swept every iteration.
         let csr = Csr::build(store, Dir::Both, want, n);
+        // A round is embarrassingly parallel — every node reads the frozen `labels` and
+        // its result is independent — so split `live` across scoped threads (the engine
+        // has no rayon; std::thread::scope is its parallel primitive, as the traversal
+        // path uses). Each worker owns its dense tally and returns (node, label) pairs
+        // that the main thread applies, so the result is byte-identical to a sequential
+        // round. Small graphs stay single-threaded (thread setup would dominate).
+        let threads = if live.len() >= 8192 {
+            std::thread::available_parallelism().map_or(1, std::num::NonZero::get).min(8)
+        } else {
+            1
+        };
         for _ in 0..iterations {
-            let mut next = labels.clone();
-            for &v in &live {
-                touched.clear();
-                for &u in csr.nbrs(v) {
-                    let lbl = labels[u as usize];
-                    if count[lbl as usize] == 0 {
-                        touched.push(lbl);
-                    }
-                    count[lbl as usize] += 1;
-                }
-                // Most-frequent label; tie → smallest label id. No neighbours → keep.
-                let mut best: Option<(u32, u32)> = None; // (label, count)
-                for &lbl in &touched {
-                    let c = count[lbl as usize];
-                    let better = match best {
-                        None => true,
-                        Some((bl, bc)) => c > bc || (c == bc && lbl < bl),
-                    };
-                    if better {
-                        best = Some((lbl, c));
-                    }
-                }
-                if let Some((lbl, _)) = best {
-                    next[v as usize] = lbl;
-                }
-                for &lbl in &touched {
-                    count[lbl as usize] = 0; // reset only what this node touched
-                }
-            }
+            let next = lp_round(&live, &csr, &labels, n, threads);
             if next == labels {
                 break; // converged
             }
@@ -2123,6 +2177,45 @@ mod tests {
             label_propagation(&st, Some("NOPE"), DEFAULT_LABEL_ITERATIONS),
             vec![(0, 0), (1, 1), (2, 2), (3, 3)]
         );
+    }
+
+    #[test]
+    fn label_propagation_parallel_round_matches_sequential() {
+        // A graph past the parallel threshold (>= 8192 nodes) with deterministic edges.
+        let mut b = Builder::default();
+        let nn = 9000u32;
+        for _ in 0..nn {
+            b.node(&["N"], &[]);
+        }
+        for i in 0..nn {
+            b.edge(i, (i.wrapping_mul(7).wrapping_add(1)) % nn, "R");
+            b.edge(i, (i + 1) % nn, "R");
+        }
+        let st = b.build();
+        let n = st.node_count();
+        let live = st.all_nodes();
+        let csr = Csr::build(&st, Dir::Both, want_etype(&st, Some("R")).unwrap(), n);
+        // The 8-thread round must equal the single-thread round, round after round.
+        let mut seq: Vec<u32> = (0..n as u32).collect();
+        let mut par = seq.clone();
+        for _ in 0..3 {
+            seq = lp_round(&live, &csr, &seq, n, 1);
+            par = lp_round(&live, &csr, &par, n, 8);
+            assert_eq!(seq, par);
+        }
+        // And the public entry (which picks the parallel path here) agrees with a forced
+        // single-thread run to convergence.
+        let got = label_propagation(&st, Some("R"), DEFAULT_LABEL_ITERATIONS);
+        let mut want: Vec<u32> = (0..n as u32).collect();
+        for _ in 0..DEFAULT_LABEL_ITERATIONS {
+            let nxt = lp_round(&live, &csr, &want, n, 1);
+            if nxt == want {
+                break;
+            }
+            want = nxt;
+        }
+        let want_pairs: Vec<(u32, u32)> = live.iter().map(|&v| (v, want[v as usize])).collect();
+        assert_eq!(got, want_pairs);
     }
 
     #[test]
