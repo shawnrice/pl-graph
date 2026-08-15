@@ -1815,6 +1815,15 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                         Some(pull(input, store, track)?)
                     }
                     None => match input.as_ref() {
+                        // A `DISTINCT <low-card dict prop> LIMIT n` whose distinct count
+                        // cannot reach `n` has a non-binding LIMIT — the capped stream then
+                        // scans every block (never hitting the cap) paying per-block dedup,
+                        // while the vectorized dedup is far cheaper. Drop to the plain
+                        // DISTINCT; `order_page` slices (a no-op). The `+1` leaves room for a
+                        // NULL, which DISTINCT counts but the dict does not.
+                        Plan::Distinct { input: inner } if distinct_cap_cannot_bind(inner, c, store) => {
+                            Some(pull(input, store, track)?)
+                        }
                         Plan::Distinct { input: inner } => {
                             pull_distinct_capped_stream(inner, store, c)?
                         }
@@ -4625,6 +4634,25 @@ fn reverse_seed_decide<'a>(
         src_label,
         bucket,
     })
+}
+
+/// A `DISTINCT` whose result cannot reach `cap` rows: its input projects a single bare
+/// property that is a low-cardinality dict column with `distinct_count + 1 <= cap` (the
+/// `+1` covers a possible NULL, which DISTINCT counts as a value but the dict does not).
+/// A `LIMIT cap` over such a DISTINCT cannot bind.
+fn distinct_cap_cannot_bind(distinct_input: &Plan, cap: usize, store: &Store) -> bool {
+    let Plan::Project { items, .. } = distinct_input else {
+        return false;
+    };
+    if items.len() != 1 {
+        return false;
+    }
+    let Expr::Prop { key, .. } = &items[0].1 else {
+        return false;
+    };
+    store
+        .distinct_count(key)
+        .is_some_and(|d| d.saturating_add(1) <= cap)
 }
 
 /// Would `plan` reverse-seed? Peeks through the row-preserving wrappers that sit above
@@ -15657,6 +15685,34 @@ mod tests {
         for (q, want) in &cases {
             assert_eq!(&sorted(&st, q), want, "reverse {q}");
         }
+    }
+
+    /// `DISTINCT <low-card dict prop> LIMIT n` with `n` above the distinct count returns
+    /// the same rows as the uncapped DISTINCT (the LIMIT is a no-op) — the fast path must
+    /// not drop or reorder values.
+    #[test]
+    fn distinct_dict_limit_noop_matches_uncapped() {
+        let mut b = Builder::default();
+        for i in 0..40u32 {
+            b.node(&["N"], &[("c", s(["x", "y", "z"][(i % 3) as usize]))]);
+        }
+        let st = b.build();
+        let rows = |q: &str| {
+            let mut v = names_of(&run(&crate::gql::parse(q).unwrap(), &st), 0);
+            v.sort();
+            v
+        };
+        let full = rows("MATCH (n) RETURN DISTINCT n.c AS x");
+        assert_eq!(full, vec!["x", "y", "z"]);
+        // LIMIT 10 > 3 distinct → no-op; the vectorized fast path yields the same set.
+        assert_eq!(rows("MATCH (n) RETURN DISTINCT n.c AS x LIMIT 10"), full);
+        // A binding LIMIT still caps (3 distinct, LIMIT 2 → 2 rows).
+        assert_eq!(
+            run(&crate::gql::parse("MATCH (n) RETURN DISTINCT n.c AS x LIMIT 2").unwrap(), &st)
+                .rows
+                .len(),
+            2
+        );
     }
 
     /// The generalized seeds — range (`>`), positive `IN`, and `OR` of seedables — each
