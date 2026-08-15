@@ -14220,10 +14220,20 @@ fn try_distinct_frontier_prop(input: &Plan, store: &Store) -> Option<Batch> {
     };
     match col {
         Column::Str { data, present } => {
+            // A hop endpoint repeats (degree-many paths reach it), and string hashing is
+            // the cost — so dedup the NODES first with a cheap bitset and hash only each
+            // distinct node's string once. Order is unchanged: a node's first occurrence
+            // still drives insertion, later ones are skipped (before they were re-hashed
+            // and dropped by the string set). Different nodes with equal strings still
+            // collapse via the string set.
+            let mut seen_node = vec![false; store.node_count()];
             let mut seen: FnvSet<&str> = FnvSet::default();
             for &node in frontier {
                 if node != u32::MAX && present[node as usize] {
                     let i = node as usize;
+                    if std::mem::replace(&mut seen_node[i], true) {
+                        continue; // duplicate endpoint node — already accounted for
+                    }
                     if seen.insert(data[i].as_ref()) {
                         out.push(Value::Str(data[i].clone()));
                     }
@@ -14323,7 +14333,16 @@ fn try_distinct_frontier_multi(input: &Plan, store: &Store) -> Option<Batch> {
     let mut outs: Vec<Vec<Value>> = vec![Vec::new(); ncol];
     let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
     let mut buf: Vec<u8> = Vec::new();
+    // A hop endpoint repeats; building+hashing the composite key (the Str columns' bytes
+    // above all) is the cost, so skip duplicate NODES with a cheap bitset and key only
+    // each distinct node once. Order-preserving (first occurrence still drives insertion);
+    // `u32::MAX` (optional-unmatched) is not a real id, so its all-NULL key still dedups
+    // through `seen`.
+    let mut seen_node = vec![false; store.node_count()];
     for &node in frontier {
+        if node != u32::MAX && std::mem::replace(&mut seen_node[node as usize], true) {
+            continue; // duplicate endpoint node — already keyed
+        }
         buf.clear();
         // An OPTIONAL-unmatched endpoint (`u32::MAX`) reads as all-NULL — the same key
         // and tuple an all-absent real node yields, so they collide identically.
@@ -19664,6 +19683,49 @@ mod tests {
         let mut got = names_of(&out, 0);
         got.sort();
         assert_eq!(got, vec!["bob", "carol"]);
+    }
+
+    /// DISTINCT over a hop endpoint with DUPLICATE endpoints (a node reached by several
+    /// edges) and a shared high-card value: the node-dedup fast path must skip the
+    /// duplicate node yet still collapse two DIFFERENT nodes carrying the same string —
+    /// single-column and composite (multi-column).
+    #[test]
+    fn distinct_frontier_dedups_duplicate_endpoints() {
+        let mut bd = Builder::default();
+        let b0 = bd.node(&["N"], &[("name", s("alpha")), ("city", s("x"))]);
+        let b1 = bd.node(&["N"], &[("name", s("beta")), ("city", s("y"))]);
+        let b2 = bd.node(&["N"], &[("name", s("alpha")), ("city", s("x"))]); // diff node, same values
+        let a0 = bd.node(&["N"], &[]);
+        let a1 = bd.node(&["N"], &[]);
+        let a2 = bd.node(&["N"], &[]);
+        let a3 = bd.node(&["N"], &[]);
+        bd.edge(a0, b0, "R");
+        bd.edge(a1, b0, "R"); // b0 reached twice → duplicate endpoint node
+        bd.edge(a2, b1, "R");
+        bd.edge(a3, b2, "R"); // same (name, city) via a different node
+        let st = bd.build();
+        // Single-column (Str frontier path): distinct names collapse b0's duplicate AND
+        // b2's shared name → {alpha, beta}.
+        let mut got = names_of(
+            &run(
+                &crate::gql::parse("MATCH (a)-[:R]->(x) RETURN DISTINCT x.name AS n").unwrap(),
+                &st,
+            ),
+            0,
+        );
+        got.sort();
+        assert_eq!(got, vec!["alpha", "beta"]);
+        // Composite (multi-column frontier path): (alpha,x) appears via b0 and b2 → one row.
+        assert_eq!(
+            run(
+                &crate::gql::parse("MATCH (a)-[:R]->(x) RETURN DISTINCT x.name AS n, x.city AS c")
+                    .unwrap(),
+                &st,
+            )
+            .rows
+            .len(),
+            2
+        );
     }
 
     // --- Join (multi-pattern / shared variable) ---
