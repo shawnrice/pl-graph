@@ -16608,6 +16608,39 @@ mod tests {
         assert_eq!(c0, c1s);
     }
 
+    /// `X AND (Y OR Z)` where `X ∧ Z` is numerically contradictory drops the Z branch, and a
+    /// NON-contradictory Z is preserved — both must return the SAME rows as the un-simplified
+    /// predicate (the simplification is logically exact, not just a fast path).
+    #[test]
+    fn contradictory_or_branch_pruned_matches_semantics() {
+        let mut b = Builder::default();
+        let hi = b.node(&["N"], &[("name", s("hit")), ("age", n(50.0))]);
+        let lo = b.node(&["N"], &[("name", s("hit")), ("age", n(10.0))]);
+        let ms = b.node(&["N"], &[("name", s("miss")), ("age", n(50.0))]);
+        let src = b.node(&["N"], &[("name", s("src"))]);
+        b.edge(src, hi, "R");
+        b.edge(src, lo, "R");
+        b.edge(src, ms, "R");
+        let st = b.build();
+        let sorted = |q: &str| {
+            let mut v = names_of(&run(&crate::gql::parse(q).unwrap(), &st), 0);
+            v.sort();
+            v
+        };
+        // age>=40 AND age<20 is contradictory → the OR collapses to name='hit'. Only hit(50)
+        // satisfies age>=40 AND name='hit'; miss(50) fails the name, lo(10) fails the age.
+        assert_eq!(
+            sorted("MATCH (a)-[:R]->(b) WHERE (b.age >= 40 AND (b.name = 'hit' OR b.age < 20)) RETURN b.name AS n"),
+            vec!["hit"]
+        );
+        // age>=45 is NOT contradictory with age>=40 → NO pruning: miss(50) satisfies the OR via
+        // age>=45, so it MUST survive (guards against over-pruning).
+        assert_eq!(
+            sorted("MATCH (a)-[:R]->(b) WHERE (b.age >= 40 AND (b.name = 'hit' OR b.age >= 45)) RETURN b.name AS n"),
+            vec!["hit", "miss"]
+        );
+    }
+
     /// A single-type hop over the per-type CSR returns the type's neighbours in the SAME
     /// order (and multiplicity) as the flat scan filtering on the edge type — the byte-identity
     /// the partition must preserve. Interleaves F and R out-edges from one source.

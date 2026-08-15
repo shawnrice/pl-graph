@@ -231,10 +231,23 @@ fn normalize_pred(e: Expr, input: &Plan) -> Expr {
                 other => Expr::Not(Box::new(other)),
             }
         }
-        Expr::And(a, b) => Expr::And(
-            Box::new(normalize_pred(*a, input)),
-            Box::new(normalize_pred(*b, input)),
-        ),
+        Expr::And(a, b) => {
+            let a = normalize_pred(*a, input);
+            let b = normalize_pred(*b, input);
+            // Flatten, then drop any OR-disjunct that a sibling numeric conjunct makes
+            // unsatisfiable (`score < 26 AND (city = 'n546' OR score >= 71)` → the score>=71
+            // branch is contradictory, leaving the seedable `... AND city = 'n546'`).
+            let mut conj = Vec::new();
+            flatten_and(a, &mut conj);
+            flatten_and(b, &mut conj);
+            let bounds: Vec<(usize, String, CompareOp, f64)> =
+                conj.iter().filter_map(num_bound).collect();
+            let simplified: Vec<Expr> = conj
+                .into_iter()
+                .map(|c| prune_or_branches(c, &bounds))
+                .collect();
+            and_all(simplified).expect("non-empty: at least the two original conjuncts")
+        }
         Expr::Or(a, b) => Expr::Or(
             Box::new(normalize_pred(*a, input)),
             Box::new(normalize_pred(*b, input)),
@@ -1337,6 +1350,103 @@ fn and_all(conjs: Vec<Expr>) -> Option<Expr> {
     let mut it = conjs.into_iter();
     let first = it.next()?;
     Some(it.fold(first, |acc, e| Expr::And(Box::new(acc), Box::new(e))))
+}
+
+/// Flatten a top-level OR tree into its disjuncts (order preserved).
+fn flatten_or(e: Expr, out: &mut Vec<Expr>) {
+    match e {
+        Expr::Or(a, b) => {
+            flatten_or(*a, out);
+            flatten_or(*b, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// Rebuild a left-leaning OR-chain from disjuncts; `None` if empty.
+fn or_all(disj: Vec<Expr>) -> Option<Expr> {
+    let mut it = disj.into_iter();
+    let first = it.next()?;
+    Some(it.fold(first, |acc, e| Expr::Or(Box::new(acc), Box::new(e))))
+}
+
+/// A numeric bound `Prop{slot,key} <op> Num` (or the mirror) — the atom the
+/// contradiction simplifier reasons over. `None` for anything else.
+fn num_bound(e: &Expr) -> Option<(usize, String, CompareOp, f64)> {
+    let Expr::Compare { op, left, right } = e else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Prop { slot, key }, Expr::Lit(crate::value::Value::Num(v))) => {
+            Some((*slot, key.clone(), *op, *v))
+        }
+        (Expr::Lit(crate::value::Value::Num(v)), Expr::Prop { slot, key }) => {
+            Some((*slot, key.clone(), flip_cmp(*op), *v))
+        }
+        _ => None,
+    }
+}
+
+/// Are two numeric bounds on the SAME property jointly UNSATISFIABLE for every present
+/// value (`x < 26` AND `x >= 71`)? Builds the feasible interval (tightest lower, tightest
+/// upper) and reports it empty. Conservative: `Ne` bounds and any non-overlap it cannot
+/// prove return `false` (keep the branch). NULL is irrelevant — a NULL cell makes both the
+/// original and the simplified predicate UNKNOWN, so pruning a provably-false disjunct is
+/// three-valued-safe.
+fn bounds_contradict(a: (CompareOp, f64), b: (CompareOp, f64)) -> bool {
+    let mut lo: Option<(f64, bool)> = None; // (value, inclusive)
+    let mut hi: Option<(f64, bool)> = None;
+    let tighten_lo = |lo: &mut Option<(f64, bool)>, v: f64, incl: bool| {
+        if lo.is_none_or(|(cur, ci)| v > cur || (v == cur && !incl && ci)) {
+            *lo = Some((v, incl));
+        }
+    };
+    let tighten_hi = |hi: &mut Option<(f64, bool)>, v: f64, incl: bool| {
+        if hi.is_none_or(|(cur, ci)| v < cur || (v == cur && !incl && ci)) {
+            *hi = Some((v, incl));
+        }
+    };
+    for (op, v) in [a, b] {
+        match op {
+            CompareOp::Gt => tighten_lo(&mut lo, v, false),
+            CompareOp::Ge => tighten_lo(&mut lo, v, true),
+            CompareOp::Lt => tighten_hi(&mut hi, v, false),
+            CompareOp::Le => tighten_hi(&mut hi, v, true),
+            CompareOp::Eq => {
+                tighten_lo(&mut lo, v, true);
+                tighten_hi(&mut hi, v, true);
+            }
+            CompareOp::Ne => return false, // a hole, not an interval bound
+        }
+    }
+    match (lo, hi) {
+        (Some((l, li)), Some((h, hii))) => l > h || (l == h && !(li && hii)),
+        _ => false,
+    }
+}
+
+/// `X AND (Y OR Z)` where `X ∧ Z` is numerically contradictory ⇒ `Z` can never hold for a
+/// row that also satisfies `X`, so it drops out of the OR (`(X AND Y) OR (X AND false)` =
+/// `X AND Y`). Given the AND's sibling numeric `bounds`, prune every disjunct of an OR
+/// conjunct that a sibling contradicts; a fully-pruned OR is unsatisfiable under the AND
+/// (Lit false). Non-OR conjuncts pass through. Logically exact → byte-identical.
+fn prune_or_branches(e: Expr, bounds: &[(usize, String, CompareOp, f64)]) -> Expr {
+    if !matches!(e, Expr::Or(_, _)) {
+        return e;
+    }
+    let mut disj = Vec::new();
+    flatten_or(e, &mut disj);
+    let before = disj.len();
+    disj.retain(|d| match num_bound(d) {
+        Some((s, k, op, v)) => !bounds
+            .iter()
+            .any(|(bs, bk, bop, bv)| *bs == s && *bk == k && bounds_contradict((op, v), (*bop, *bv))),
+        None => true, // keep non-numeric disjuncts (unanalyzed)
+    });
+    if disj.len() == before {
+        return or_all(disj).expect("non-empty: nothing was pruned");
+    }
+    or_all(disj).unwrap_or(Expr::Lit(crate::value::Value::Bool(false)))
 }
 
 /// Split `pred`'s conjuncts into those referencing only slots `< bound` (pushable
