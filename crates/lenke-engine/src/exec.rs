@@ -4543,17 +4543,15 @@ fn try_shortest_early_stop(pred: &Expr, input: &Plan, store: &Store, track: bool
     Some(sp_batch.gather(&keep))
 }
 
-/// The parsed, cardinality-approved decision for a reverse-seed: the hop chain
-/// (innermost-first), its per-hop edge-type want-sets, the source scan's label, and
-/// the indexed endpoint `key = value`. Produced by [`reverse_seed_decide`] using only
-/// O(1) index lookups (no walk), so a caller can cheaply ask "would this reverse-seed?"
-/// before committing to it.
+/// The cardinality-approved decision for a reverse-seed: the hop chain (innermost-first),
+/// its per-hop edge-type want-sets, the source scan's label, and the seeded endpoint
+/// bucket (the candidate node ids from the index). Produced by [`reverse_seed_decide`],
+/// which materializes the bucket to size the cardinality guard.
 struct RevSeed<'a> {
     levels: Vec<(Dir, &'a [String])>,
     wants: Vec<Vec<u32>>,
     src_label: Option<String>,
-    key: String,
-    value: Value,
+    bucket: Vec<u32>,
 }
 
 fn reverse_seed_decide<'a>(
@@ -4596,21 +4594,21 @@ fn reverse_seed_decide<'a>(
     }
     // levels[k] is hop k (feeds slot k, appends slot k+1): innermost-first.
     let levels: Vec<(Dir, &[String])> = chain.iter().rev().map(|&(_, d, e)| (d, e)).collect();
-    // pred must be `target.key = lit` on the FINAL slot (slot n) with a hash index.
-    // The seed is an indexed equality on the FINAL slot — `pred` itself, or, when `pred`
-    // is a conjunction, one of its conjuncts (the rest becomes a residual filter over the
-    // seeded rows). `seed_equality` already requires the hash index.
-    let (key, value) = seed_equality(pred, n, store)?;
+    // Seed the endpoint (slot n) from the index — an equality, range, IN, OR, or the more
+    // selective conjunct of an AND; the residual filter (below) exacts the answer.
+    let bucket = seed_bucket(pred, n, store)?;
     // Cardinality decision: seed the SMALLER side. The forward plan scans every source
-    // and walks the whole fan-out before filtering; reverse seeds the target bucket and
+    // and walks the whole fan-out before filtering; reverse seeds the endpoint bucket and
     // walks back only the paths that actually reach it, so the saving compounds per hop.
-    // Flip only when the target bucket is smaller than the source scan.
-    let target_rows = store.index_bucket_len(&key, &value)?;
+    // Flip only when the endpoint bucket is smaller than the source scan.
     let source_rows = match &src_label {
         Some(l) => store.nodes_with_label(l).len(),
         None => store.live_node_count(),
     };
-    if target_rows >= source_rows {
+    // Loose for a bare equality (no residual) or a top-level OR (forward eval boxes);
+    // tight for a foldable range/IN/AND, which the forward scan handles cheaply.
+    let loose = target_eq(pred, n).is_some() || matches!(pred, Expr::Or(..));
+    if !reverse_seed_worth(bucket.len(), source_rows, loose, store) {
         return None;
     }
     // Resolve each hop's edge-type want-set once (an unknown label matches nothing).
@@ -4625,8 +4623,7 @@ fn reverse_seed_decide<'a>(
         levels,
         wants,
         src_label,
-        key,
-        value,
+        bucket,
     })
 }
 
@@ -4692,15 +4689,12 @@ fn try_reverse_expand(pred: &Expr, input: &Plan, store: &Store, track: bool) -> 
         levels,
         wants,
         src_label,
-        key,
-        value,
+        bucket,
     } = reverse_seed_decide(pred, input, store, track)?;
     let n = levels.len();
-    // Seed the final slot from the index bucket (raw — the forward path does not constrain
-    // the target's label), then reverse-walk the chain to the labeled sources.
-    let targets = store.index_lookup(&key, &value)?;
+    // Reverse-walk the chain from the seeded endpoint bucket to the labeled sources.
     let rows = reverse_walk_chain(
-        targets.iter().map(|&t| vec![t]).collect(),
+        bucket.iter().map(|&t| vec![t]).collect(),
         &levels,
         &wants,
         src_label.as_deref(),
@@ -4791,16 +4785,16 @@ fn try_reverse_varlen(pred: &Expr, input: &Plan, store: &Store, track: bool) -> 
         return None;
     }
     let ep_slot = fixed + 1;
-    // The seed is an indexed equality on the endpoint — `pred` itself, or a conjunct of it.
-    let (key, value) = seed_equality(pred, ep_slot, store)?;
+    // Seed the endpoint from the index (equality / range / IN / OR / more selective AND
+    // conjunct); the residual filter (below) exacts the answer.
+    let bucket = seed_bucket(pred, ep_slot, store)?;
     // Cardinality decision: flip only when the endpoint bucket is smaller than the source
     // scan (the same guard as the fixed-length seed).
-    let target_rows = store.index_bucket_len(&key, &value)?;
     let source_rows = match &src_label {
         Some(l) => store.nodes_with_label(l).len(),
         None => store.live_node_count(),
     };
-    if target_rows >= source_rows {
+    if bucket.len() >= source_rows {
         return None;
     }
     let fixed_levels: Vec<(Dir, &[String])> = chain.iter().rev().map(|&(_, d, e)| (d, e)).collect();
@@ -4813,7 +4807,7 @@ fn try_reverse_varlen(pred: &Expr, input: &Plan, store: &Store, track: bool) -> 
     }
     // Walk the var-length in reverse from the endpoint bucket. Decline (forward path) if
     // the reverse walk itself trips the trail guard — a huge-in-degree endpoint.
-    let seed = Batch::of(vec![Col::Nodes(store.index_lookup(&key, &value)?)]);
+    let seed = Batch::of(vec![Col::Nodes(bucket)]);
     let rev = var_length(
         &seed,
         store,
@@ -4872,19 +4866,138 @@ fn residual_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usize>
     })
 }
 
-/// An indexed equality on `slot` to seed on: `pred` if it is `slot.key = lit` with a
-/// hash index, else — when `pred` is a conjunction — the first such conjunct. The other
-/// conjuncts are re-applied as a residual filter by the caller.
-fn seed_equality(pred: &Expr, slot: usize, store: &Store) -> Option<(String, Value)> {
-    if let Some((k, v)) = target_eq(pred, slot) {
-        if store.has_hash_index(&k) {
-            return Some((k, v));
-        }
+/// The candidate endpoint node ids for a seedable predicate on `slot` — a DEDUPED set
+/// that is a SUPERSET of the predicate's exact matches. The caller's residual filter
+/// (whenever `pred` isn't a bare equality) narrows it to the exact set, so this only has
+/// to over-approximate, which keeps NULL / cross-type / ordering edge cases the residual's
+/// job. Handles an indexed equality (hash), a range op (range index), a positive
+/// `IN [lits]` (union of hash buckets), an `OR` of seedables (union), and an `AND` (the
+/// more selective conjunct's bucket). `None` when nothing on `slot` is seedable.
+fn seed_bucket(pred: &Expr, slot: usize, store: &Store) -> Option<Vec<u32>> {
+    if let Some(b) = seed_pure(pred, slot, store) {
+        return Some(b);
     }
     if let Expr::And(l, r) = pred {
-        return seed_equality(l, slot, store).or_else(|| seed_equality(r, slot, store));
+        // Seed the more selective conjunct; the residual applies the whole conjunction.
+        return match (seed_bucket(l, slot, store), seed_bucket(r, slot, store)) {
+            (Some(a), Some(b)) => Some(if a.len() <= b.len() { a } else { b }),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
     }
     None
+}
+
+/// Is a reverse-seed over a FIXED-hop chain worth it? The forward count/agg folds during
+/// a single scan (cheap, no materialization); the reverse-seed materializes the walked
+/// rows and boxes any residual over them. When the forward predicate ALSO folds cheaply
+/// (a simple range/IN/AND that `try_filter_keep` handles), the reverse only wins on a
+/// SMALL FRACTION of the scan — require its fan-out (bucket × degree²) to stay under the
+/// forward scan. A `loose` predicate (bare equality — no residual; or a top-level `OR`,
+/// whose forward eval boxes per row) wins on any bucket smaller than the scan.
+/// (Var-length seeds skip this — their forward path is a trail-limit blow-up.)
+fn reverse_seed_worth(bucket: usize, source: usize, loose: bool, store: &Store) -> bool {
+    if bucket >= source {
+        return false;
+    }
+    if loose {
+        return true;
+    }
+    let deg = (store.edge_count() as f64 / store.live_node_count().max(1) as f64).max(1.0);
+    (bucket as f64) * deg * deg < source as f64
+}
+
+/// A predicate whose ENTIRE match set is captured by one index bucket or a union of them
+/// (equality / range / positive `IN` / `OR` of such) — the deduped candidate set. Never
+/// descends an `AND` (that needs a residual only the caller applies).
+fn seed_pure(pred: &Expr, slot: usize, store: &Store) -> Option<Vec<u32>> {
+    if let Some((k, v)) = target_eq(pred, slot) {
+        if store.has_hash_index(&k) {
+            return store.index_lookup(&k, &v);
+        }
+    }
+    if let Some((k, op, v)) = endpoint_range(pred, slot) {
+        if store.has_range_index(&k) {
+            return store.range_lookup(&k, op, &v);
+        }
+    }
+    if let Some((k, vals)) = endpoint_in(pred, slot) {
+        if store.has_hash_index(&k) {
+            let mut ids = Vec::new();
+            for v in &vals {
+                ids.extend(store.index_lookup(&k, v)?);
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            return Some(ids);
+        }
+    }
+    if let Expr::Or(l, r) = pred {
+        let mut a = seed_pure(l, slot, store)?;
+        a.extend(seed_pure(r, slot, store)?);
+        a.sort_unstable();
+        a.dedup();
+        return Some(a);
+    }
+    None
+}
+
+/// `slot.key <op> lit` (or the mirror) with a range op — the endpoint-range analogue of
+/// [`target_eq`]. The mirror flips the operator so `lit <op> slot.key` reads as the seek.
+fn endpoint_range(pred: &Expr, slot: usize) -> Option<(String, CompareOp, Value)> {
+    let Expr::Compare { op, left, right } = pred else {
+        return None;
+    };
+    if !matches!(
+        op,
+        CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
+    ) {
+        return None;
+    }
+    let flip = |o: CompareOp| match o {
+        CompareOp::Lt => CompareOp::Gt,
+        CompareOp::Le => CompareOp::Ge,
+        CompareOp::Gt => CompareOp::Lt,
+        CompareOp::Ge => CompareOp::Le,
+        other => other,
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Prop { slot: s, key }, Expr::Lit(v)) if *s == slot => {
+            (!v.is_null()).then(|| (key.clone(), *op, v.clone()))
+        }
+        (Expr::Lit(v), Expr::Prop { slot: s, key }) if *s == slot => {
+            (!v.is_null()).then(|| (key.clone(), flip(*op), v.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// `slot.key IN [lit, lit, …]` → (key, literal values). Positive `IN` over a literal list
+/// only (a `NOT … IN` is not a superset seed); every element must be a non-null literal.
+fn endpoint_in(pred: &Expr, slot: usize) -> Option<(String, Vec<Value>)> {
+    let Expr::In { needle, haystack } = pred else {
+        return None;
+    };
+    let Expr::Prop { slot: s, key } = needle.as_ref() else {
+        return None;
+    };
+    if *s != slot {
+        return None;
+    }
+    let Expr::List { items } = haystack.as_ref() else {
+        return None;
+    };
+    let mut vals = Vec::with_capacity(items.len());
+    for it in items {
+        let Expr::Lit(v) = it else {
+            return None;
+        };
+        if v.is_null() {
+            return None;
+        }
+        vals.push(v.clone());
+    }
+    (!vals.is_empty()).then(|| (key.clone(), vals))
 }
 
 /// Parse `Prop{slot, key} = Lit(value)` (or its mirror) — an equality on the given slot.
@@ -15543,6 +15656,54 @@ mod tests {
         st.create_index("name"); // compound reverse var-length fires
         for (q, want) in &cases {
             assert_eq!(&sorted(&st, q), want, "reverse {q}");
+        }
+    }
+
+    /// The generalized seeds — range (`>`), positive `IN`, and `OR` of seedables — each
+    /// return the forward walk's exact multiset (the `OR` case has s1 twice: it reaches an
+    /// age-matched endpoint and a city-matched one). Forward with no index; seeded with a
+    /// hash index (equality/IN) and a range index (range) present.
+    #[test]
+    fn reverse_range_in_or_seeds_match_forward() {
+        let mut b = Builder::default();
+        let e1 = b.node(&["N"], &[("name", s("e1")), ("age", n(95.0)), ("city", s("oslo"))]);
+        let e2 = b.node(&["N"], &[("name", s("e2")), ("age", n(99.0)), ("city", s("bergen"))]);
+        let e3 = b.node(&["N"], &[("name", s("e3")), ("age", n(50.0)), ("city", s("oslo"))]);
+        let s1 = b.node(&["N"], &[("name", s("s1"))]);
+        let s2 = b.node(&["N"], &[("name", s("s2"))]);
+        let s3 = b.node(&["N"], &[("name", s("s3"))]);
+        b.edge(s1, e1, "R");
+        b.edge(s2, e2, "R");
+        b.edge(s1, e3, "R");
+        b.edge(s3, e1, "R");
+        let mut st = b.build();
+        let cases: [(&str, Vec<&str>); 3] = [
+            (
+                "MATCH (a)-[:R]->(b) WHERE b.age > 90 RETURN a.name AS a",
+                vec!["s1", "s2", "s3"],
+            ),
+            (
+                "MATCH (a)-[:R]->(b) WHERE b.age IN [95, 99] RETURN a.name AS a",
+                vec!["s1", "s2", "s3"],
+            ),
+            (
+                "MATCH (a)-[:R]->(b) WHERE (b.age > 90 OR b.city = 'oslo') RETURN a.name AS a",
+                vec!["s1", "s1", "s2", "s3"],
+            ),
+        ];
+        let sorted = |st: &Store, q: &str| {
+            let mut v = names_of(&run(&crate::gql::parse(q).unwrap(), st), 0);
+            v.sort();
+            v
+        };
+        for (q, want) in &cases {
+            assert_eq!(&sorted(&st, q), want, "forward {q}");
+        }
+        st.create_index("age"); // IN over the hash index
+        st.create_index("city"); // OR's equality disjunct
+        st.create_range_index("age"); // range / OR's range disjunct
+        for (q, want) in &cases {
+            assert_eq!(&sorted(&st, q), want, "seeded {q}");
         }
     }
 

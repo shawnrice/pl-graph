@@ -103,7 +103,8 @@ fn engine_fixture(n: u32, deg: u32) -> Store {
     // fixture gets, so the comparison stays fair. Default: no indexes (the original bench).
     if env_u32("FUZZ_INDEX", 0) != 0 {
         for k in ["name", "city", "age", "score"] {
-            st.create_index(k);
+            st.create_index(k); // hash: equality / IN seeds
+            st.create_range_index(k); // range: <,<=,>,>= seeds (matches core's range-capable index)
         }
     }
     st
