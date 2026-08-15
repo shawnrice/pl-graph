@@ -4955,8 +4955,13 @@ fn reverse_seed_worth(bucket: usize, source: usize, loose: bool, store: &Store) 
     if loose {
         return true;
     }
+    // The reverse-seed materializes ~bucket × reverse-degree rows; it wins when that stays
+    // under the forward scan of `source`. `deg` is the GLOBAL avg degree, an over-estimate
+    // for a sparse edge type (e.g. F here is ~1/20 of R) — but the residual is now
+    // vectorized (`eval_mask`), so a single `deg` factor (not `deg²`) already gates the
+    // large-bucket dense-edge cases while admitting the selective sparse-edge ranges.
     let deg = (store.edge_count() as f64 / store.live_node_count().max(1) as f64).max(1.0);
-    (bucket as f64) * deg * deg < source as f64
+    (bucket as f64) * deg < source as f64
 }
 
 /// A predicate whose ENTIRE match set is captured by one index bucket or a union of them
