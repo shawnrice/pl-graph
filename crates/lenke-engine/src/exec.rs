@@ -14215,13 +14215,10 @@ fn try_distinct_varlen_expr(input: &Plan, store: &Store) -> Option<Batch> {
     if !items.iter().all(|(_, e)| refs_only_slot(e, endpoint)) {
         return None;
     }
-    let eps = match chain.as_ref() {
-        Plan::VarLength { .. } => varlen_distinct_endpoints(chain, None, endpoint, store)?,
-        Plan::Filter { input: vl, pred } if matches!(vl.as_ref(), Plan::VarLength { .. }) => {
-            varlen_distinct_endpoints(vl, Some(pred), endpoint, store)?
-        }
-        _ => return None,
-    };
+    if !chain_has_varlen(chain) {
+        return None; // fixed chains keep the existing frontier/materialize path
+    }
+    let eps = distinct_chain_endpoints(chain, store)?;
     let n = eps.len();
     let mut cols: Vec<Col> = (0..endpoint).map(|_| Col::Nodes(vec![0u32; n])).collect();
     cols.push(Col::Nodes(eps));
@@ -14230,93 +14227,118 @@ fn try_distinct_varlen_expr(input: &Plan, store: &Store) -> Option<Batch> {
     Some(distinct_batch(Batch::of(projected)))
 }
 
-/// The DISTINCT reachable endpoints of a plain var-length hop `vl`, optionally narrowed by
-/// an endpoint-only predicate `ep_pred` (a WHERE directly on the var-length endpoint). Runs
-/// the var-length DFS with an endpoint-dedup sink (each endpoint once, first-seen order),
-/// then applies `ep_pred` over just those endpoints — byte-identical to materialize → filter
-/// → dedup, without building the path rows. `None` (caller falls back to the general path)
-/// when `vl` is not a plain var-length, the source frontier isn't a pure chain, or the
-/// predicate reads a slot other than the endpoint.
-fn varlen_distinct_endpoints(
-    vl: &Plan,
-    ep_pred: Option<&Expr>,
-    endpoint: usize,
-    store: &Store,
-) -> Option<Vec<u32>> {
-    let Plan::VarLength {
-        input,
-        from: _,
-        dir,
-        edge_label,
-        min,
-        max,
-        mode,
-        until: None,
-        body_filter: None,
-        double_loops,
-    } = vl
-    else {
-        return None;
-    };
-    // Endpoint-WHERE pre-checks (before any walk): an INDEXED bare-equality endpoint is far
-    // better served by the reverse var-length seed (seed the ~1 node, reverse-walk) — decline
-    // so the general path reaches it. And we can only narrow by a predicate that reads ONLY
-    // the endpoint slot.
-    if let Some(pred) = ep_pred {
-        if let Some((k, _)) = target_eq(pred, endpoint) {
-            if store.has_hash_index(&k) {
+/// Does the chain contain a var-length hop? Only then is the endpoint-dedup worth its
+/// per-node bitsets over the materialize path (a pure fixed chain has no path explosion).
+fn chain_has_varlen(p: &Plan) -> bool {
+    match p {
+        Plan::VarLength { .. } => true,
+        Plan::Expand { input, .. } | Plan::Filter { input, .. } => chain_has_varlen(input),
+        _ => false,
+    }
+}
+
+/// The DISTINCT reachable-endpoint SET of a chain, deduping at EVERY hop instead of
+/// materializing paths — the reachable set is all a DISTINCT (or `min`/`max`) over the
+/// endpoint depends on, so this is byte-identical to materialize-then-dedup (an unordered
+/// result is set-compared). O(V+E), not O(paths): a var-length hop runs the dedup sink; a
+/// fixed hop takes the deduped neighbours of the deduped source; a Filter narrows by an
+/// endpoint-only predicate. `None` (caller falls back) for a branch/bound-edge/re-entrant
+/// chain, an indexed bare-equality WHERE (better served by the reverse seed), or a
+/// predicate that reads a non-endpoint slot.
+fn distinct_chain_endpoints(chain: &Plan, store: &Store) -> Option<Vec<u32>> {
+    let n = store.node_count();
+    match chain {
+        Plan::Scan { .. } | Plan::IndexSeek { .. } | Plan::RangeSeek { .. } => {
+            let mut f = frontier_ids(chain, store)?;
+            let mut seen = vec![false; n];
+            f.retain(|&x| x != u32::MAX && !std::mem::replace(&mut seen[x as usize], true));
+            Some(f)
+        }
+        Plan::Expand {
+            input,
+            from,
+            dir,
+            edge_label,
+            bind_edge: false,
+            double_loops: false,
+        } => {
+            if *from != chain_pull_width(input)?.checked_sub(1)? {
+                return None; // must expand from the current endpoint (a straight chain)
+            }
+            let src = distinct_chain_endpoints(input, store)?;
+            let want = want_etypes(store, edge_label).ok()?;
+            let mut seen = vec![false; n];
+            let mut out = Vec::new();
+            for &s in &src {
+                for_each_nbr(store, s, *dir, &want, false, |nbr, _| {
+                    if !std::mem::replace(&mut seen[nbr as usize], true) {
+                        out.push(nbr);
+                    }
+                });
+            }
+            Some(out)
+        }
+        Plan::VarLength {
+            input,
+            from,
+            dir,
+            edge_label,
+            min,
+            max,
+            mode,
+            until: None,
+            body_filter: None,
+            double_loops,
+        } => {
+            if *from != chain_pull_width(input)?.checked_sub(1)? {
                 return None;
             }
+            let src = distinct_chain_endpoints(input, store)?;
+            let want = match want_etypes(store, edge_label) {
+                Ok(w) => w,
+                Err(()) => vec![u32::MAX],
+            };
+            let mut sink = DistinctEndpointEmit {
+                seen: vec![false; n],
+                out: Vec::new(),
+            };
+            run_varlen(
+                &src, store, &want, *min, *max, *dir, *mode, None, 1, None, None, *double_loops,
+                &mut sink,
+            );
+            Some(sink.out)
         }
-        if !refs_only_slot(pred, endpoint) {
-            return None;
+        Plan::Filter { input, pred } => {
+            let endpoint = chain_pull_width(input)?.checked_sub(1)?;
+            // An indexed bare-equality endpoint is better served by the reverse seed (seed
+            // the ~1 node) — decline. Only an endpoint-only predicate can filter the set.
+            if let Some((k, _)) = target_eq(pred, endpoint) {
+                if store.has_hash_index(&k) {
+                    return None;
+                }
+            }
+            if !refs_only_slot(pred, endpoint) {
+                return None;
+            }
+            let eps = distinct_chain_endpoints(input, store)?;
+            let rows = eps.len();
+            let mut cols: Vec<Col> = (0..endpoint).map(|_| Col::Nodes(vec![0u32; rows])).collect();
+            cols.push(Col::Nodes(eps));
+            let batch = Batch::of(cols);
+            let mask = eval_mask(pred, store, &batch).ok()?;
+            let Col::Nodes(eps) = batch.slot(endpoint) else {
+                return None;
+            };
+            Some(
+                eps.iter()
+                    .enumerate()
+                    .filter(|&(i, _)| mask.get(i) == Some(&Some(true)))
+                    .map(|(_, &e)| e)
+                    .collect(),
+            )
         }
+        _ => None,
     }
-    // Walk each DISTINCT source once (first-seen order preserved) — a repeated source
-    // re-reaches the same endpoints, so this keeps endpoint first-seen order and avoids
-    // re-exploring. u32::MAX (optional-unmatched) never feeds a plain chain.
-    let full_src = frontier_ids(input, store)?;
-    let mut seen_src = vec![false; store.node_count()];
-    let mut src: Vec<u32> = Vec::new();
-    for &s in &full_src {
-        if s != u32::MAX && !std::mem::replace(&mut seen_src[s as usize], true) {
-            src.push(s);
-        }
-    }
-    let want = match want_etypes(store, edge_label) {
-        Ok(w) => w,
-        Err(()) => vec![u32::MAX], // unknown type matches nothing (a `*` still emits reps)
-    };
-    let mut sink = DistinctEndpointEmit {
-        seen: vec![false; store.node_count()],
-        out: Vec::new(),
-    };
-    run_varlen(
-        &src, store, &want, *min, *max, *dir, *mode, None, 1, None, None, *double_loops,
-        &mut sink,
-    );
-    let eps = sink.out;
-    let Some(pred) = ep_pred else {
-        return Some(eps);
-    };
-    // Narrow by the endpoint WHERE (already checked endpoint-only above): build a batch with
-    // the endpoint at its slot (dummies below) and reuse the vectorized mask, keeping the
-    // endpoints that pass in first-seen order.
-    let n = eps.len();
-    let mut cols: Vec<Col> = (0..endpoint).map(|_| Col::Nodes(vec![0u32; n])).collect();
-    cols.push(Col::Nodes(eps));
-    let batch = Batch::of(cols);
-    let mask = eval_mask(pred, store, &batch).ok()?;
-    let Col::Nodes(eps) = batch.slot(endpoint) else {
-        return None;
-    };
-    Some(
-        eps.iter()
-            .enumerate()
-            .filter(|&(i, _)| mask.get(i) == Some(&Some(true)))
-            .map(|(_, &e)| e)
-            .collect(),
-    )
 }
 
 /// The row-order endpoint frontier of a chain for a fused DISTINCT path: a pure Scan/Expand
@@ -14324,20 +14346,12 @@ fn varlen_distinct_endpoints(
 /// materialized, unlike a full `pull`); a filtered chain is pulled once and its endpoint slot
 /// cloned out.
 fn chain_frontier(chain: &Plan, store: &Store, endpoint: usize) -> Option<Vec<u32>> {
-    // A (optionally endpoint-WHERE'd) var-length chain: DISTINCT needs only the reachable-
-    // endpoint SET, so walk with an endpoint-dedup sink instead of materializing every path.
-    match chain {
-        Plan::VarLength { .. } => {
-            if let Some(eps) = varlen_distinct_endpoints(chain, None, endpoint, store) {
-                return Some(eps);
-            }
+    // A chain containing a var-length: DISTINCT needs only the reachable-endpoint SET, so
+    // dedup at every hop instead of materializing every path.
+    if chain_has_varlen(chain) {
+        if let Some(eps) = distinct_chain_endpoints(chain, store) {
+            return Some(eps);
         }
-        Plan::Filter { input, pred } if matches!(input.as_ref(), Plan::VarLength { .. }) => {
-            if let Some(eps) = varlen_distinct_endpoints(input, Some(pred), endpoint, store) {
-                return Some(eps);
-            }
-        }
-        _ => {}
     }
     match frontier_ids(chain, store) {
         Some(f) => Some(f),
@@ -19884,6 +19898,12 @@ mod tests {
         assert_eq!(
             sorted("MATCH (a)-[:R]->{1,2}(x) RETURN DISTINCT upper(x.name) AS n"),
             vec!["M1", "M2", "T"]
+        );
+        // Var-length in the MIDDLE (a fixed R hop AFTER it): reachable x {m1,m2,t}, then
+        // x→y: m1→t, m2→t, t→none. Distinct y set = {t}. Dedups at every hop.
+        assert_eq!(
+            sorted("MATCH (a)-[:R]->{1,2}(x)-[:R]->(y) RETURN DISTINCT y.name AS n"),
+            vec!["t"]
         );
     }
 
