@@ -2006,34 +2006,14 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                 if let Some(b) = try_distinct_frontier_multi(input, store) {
                     return Ok(b);
                 }
+                // The expression sibling: `DISTINCT <expr over the endpoint>` (substring,
+                // coalesce, arithmetic …) over a var-length hop — dedup endpoints, then
+                // project + dedup, never materializing the paths.
+                if let Some(b) = try_distinct_varlen_expr(input, store) {
+                    return Ok(b);
+                }
             }
-            let batch = pull(input, store, track)?;
-            // Typed single-column fast path: dedup by the raw value (a `&str`, the
-            // f64 group bits, or a dense id) — no per-row byte-key serialization.
-            if let Some(keep) = try_distinct_typed(&batch) {
-                return Ok(batch.gather(&keep));
-            }
-            let n = batch.rows();
-            let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
-            let mut buf = Vec::new();
-            let keep: Vec<usize> = (0..n)
-                .filter(|&i| {
-                    // Key the whole row across every slot, via the grouping
-                    // notion (NaN/-0 collapse) — never predicate equality. The
-                    // buffer is reused across rows; only a NEW row allocates.
-                    buf.clear();
-                    for c in &batch.slots {
-                        value::group_key_into(&c.value_at(i), &mut buf);
-                    }
-                    if seen.contains(buf.as_slice()) {
-                        false
-                    } else {
-                        seen.insert(buf.clone());
-                        true
-                    }
-                })
-                .collect();
-            batch.gather(&keep)
+            distinct_batch(pull(input, store, track)?)
         }
         Plan::DistinctBy { input, key_slots } => {
             // `values(<dict col>).dedup()`: dedup on the dict CODES (≤ dict size) in one
@@ -14194,6 +14174,62 @@ fn try_distinct_scan_multi(input: &Plan, store: &Store) -> Option<Batch> {
     Some(Batch::of(outs.into_iter().map(Col::Gen).collect()))
 }
 
+/// Dedup a materialized batch's whole rows: the typed single-column fast path (raw value,
+/// no byte-key) else a per-row composite group-key. First-seen order.
+fn distinct_batch(batch: Batch) -> Batch {
+    if let Some(keep) = try_distinct_typed(&batch) {
+        return batch.gather(&keep);
+    }
+    let n = batch.rows();
+    let mut seen: FnvSet<Vec<u8>> = FnvSet::default();
+    let mut buf = Vec::new();
+    let keep: Vec<usize> = (0..n)
+        .filter(|&i| {
+            buf.clear();
+            for c in &batch.slots {
+                value::group_key_into(&c.value_at(i), &mut buf);
+            }
+            if seen.contains(buf.as_slice()) {
+                false
+            } else {
+                seen.insert(buf.clone());
+                true
+            }
+        })
+        .collect();
+    batch.gather(&keep)
+}
+
+/// `DISTINCT <expr(endpoint)…>` over a (optionally endpoint-WHERE'd) var-length hop, where
+/// every projected expression reads ONLY the endpoint slot. Dedup the reachable endpoints
+/// (no path materialization), evaluate the projection over just them, then dedup the
+/// projected rows — byte-identical to materialize → project → dedup (the projection depends
+/// only on the endpoint, so deduping endpoints first can't change the distinct result or its
+/// first-seen order). `None` when not that shape (caller falls back). Bare-Prop projections
+/// are already handled by `try_distinct_frontier_prop`/`_multi`; this catches expressions.
+fn try_distinct_varlen_expr(input: &Plan, store: &Store) -> Option<Batch> {
+    let Plan::Project { input: chain, items } = input else {
+        return None;
+    };
+    let endpoint = chain_pull_width(chain)?.checked_sub(1)?;
+    if !items.iter().all(|(_, e)| refs_only_slot(e, endpoint)) {
+        return None;
+    }
+    let eps = match chain.as_ref() {
+        Plan::VarLength { .. } => varlen_distinct_endpoints(chain, None, endpoint, store)?,
+        Plan::Filter { input: vl, pred } if matches!(vl.as_ref(), Plan::VarLength { .. }) => {
+            varlen_distinct_endpoints(vl, Some(pred), endpoint, store)?
+        }
+        _ => return None,
+    };
+    let n = eps.len();
+    let mut cols: Vec<Col> = (0..endpoint).map(|_| Col::Nodes(vec![0u32; n])).collect();
+    cols.push(Col::Nodes(eps));
+    let batch = Batch::of(cols);
+    let projected = eval_all(items.iter().map(|(_, e)| e), store, &batch).ok()?;
+    Some(distinct_batch(Batch::of(projected)))
+}
+
 /// The DISTINCT reachable endpoints of a plain var-length hop `vl`, optionally narrowed by
 /// an endpoint-only predicate `ep_pred` (a WHERE directly on the var-length endpoint). Runs
 /// the var-length DFS with an endpoint-dedup sink (each endpoint once, first-seen order),
@@ -19842,6 +19878,12 @@ mod tests {
         assert_eq!(
             sorted("MATCH (a)-[:R]->{1,2}(x) WHERE x.score < 60 RETURN DISTINCT x.name AS n"),
             vec!["m1", "t"]
+        );
+        // DISTINCT over an ENDPOINT EXPRESSION: upper(name) over {m1,m2,t} → {M1,M2,T}.
+        // Exercises try_distinct_varlen_expr (dedup endpoints, then project the expression).
+        assert_eq!(
+            sorted("MATCH (a)-[:R]->{1,2}(x) RETURN DISTINCT upper(x.name) AS n"),
+            vec!["M1", "M2", "T"]
         );
     }
 
