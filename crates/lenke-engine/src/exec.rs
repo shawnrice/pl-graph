@@ -5827,6 +5827,8 @@ fn chain_pull_width(plan: &Plan) -> Option<usize> {
         Plan::Expand {
             input, bind_edge, ..
         } => Some(chain_pull_width(input)? + if *bind_edge { 2 } else { 1 }),
+        // A plain var-length hop appends one endpoint slot (no bound edge / groups here).
+        Plan::VarLength { input, .. } => Some(chain_pull_width(input)? + 1),
         Plan::Filter { input, .. } => chain_pull_width(input),
         _ => None,
     }
@@ -9913,6 +9915,30 @@ impl VarlenEmit for CollectEmit<'_> {
     }
     fn should_stop(&self) -> bool {
         self.keep.len() as u64 > self.budget
+    }
+}
+
+/// A var-length sink that keeps only the DISTINCT reachable endpoints, in first-seen order.
+/// For `DISTINCT`/`min`/`max` over a var-length endpoint the answer depends only on the SET
+/// of reachable endpoints (not per-path multiplicity), so emitting each endpoint once —
+/// same DFS exploration — is byte-identical to materializing every path and then deduping,
+/// while never building the (potentially millions of) path rows. It also has no emit
+/// budget, so it COMPLETES the shapes the materializing walk refuses with E_RESOURCE
+/// (matching core, which completes them).
+struct DistinctEndpointEmit {
+    seen: Vec<bool>,
+    out: Vec<u32>,
+}
+
+impl VarlenEmit for DistinctEndpointEmit {
+    fn emit(&mut self, _row: usize, node_stack: &[u32], _edge_stack: &[u32]) {
+        let ep = *node_stack.last().expect("a path always has an endpoint");
+        if !std::mem::replace(&mut self.seen[ep as usize], true) {
+            self.out.push(ep);
+        }
+    }
+    fn should_stop(&self) -> bool {
+        false // explore fully; only distinct endpoints are kept, so memory stays bounded
     }
 }
 
@@ -14173,6 +14199,48 @@ fn try_distinct_scan_multi(input: &Plan, store: &Store) -> Option<Batch> {
 /// materialized, unlike a full `pull`); a filtered chain is pulled once and its endpoint slot
 /// cloned out.
 fn chain_frontier(chain: &Plan, store: &Store, endpoint: usize) -> Option<Vec<u32>> {
+    // A plain var-length chain: DISTINCT only needs the reachable-endpoint SET, so run the
+    // walk with an endpoint-dedup sink (each endpoint once, first-seen order) rather than
+    // materializing every path. Byte-identical to materialize-then-dedup and it completes
+    // the shapes the full walk refuses (trail limit). Only DISTINCT calls chain_frontier.
+    if let Plan::VarLength {
+        input,
+        from: _,
+        dir,
+        edge_label,
+        min,
+        max,
+        mode,
+        until: None,
+        body_filter: None,
+        double_loops,
+    } = chain
+    {
+        // Walk each DISTINCT source once (first-seen order) — a repeated source re-reaches
+        // the same endpoints, so deduping sources keeps the endpoint first-seen order and
+        // avoids re-exploring. u32::MAX (optional-unmatched) never feeds a plain chain.
+        let full_src = frontier_ids(input, store)?;
+        let mut seen_src = vec![false; store.node_count()];
+        let mut src: Vec<u32> = Vec::new();
+        for &s in &full_src {
+            if s != u32::MAX && !std::mem::replace(&mut seen_src[s as usize], true) {
+                src.push(s);
+            }
+        }
+        let want = match want_etypes(store, edge_label) {
+            Ok(w) => w,
+            Err(()) => vec![u32::MAX], // unknown type matches nothing (a `*` still emits reps)
+        };
+        let mut sink = DistinctEndpointEmit {
+            seen: vec![false; store.node_count()],
+            out: Vec::new(),
+        };
+        run_varlen(
+            &src, store, &want, *min, *max, *dir, *mode, None, 1, None, None, *double_loops,
+            &mut sink,
+        );
+        return Some(sink.out);
+    }
     match frontier_ids(chain, store) {
         Some(f) => Some(f),
         None => {
@@ -19677,6 +19745,38 @@ mod tests {
     }
 
     /// DISTINCT after Expand: the set of nodes reached by KNOWS from anyone.
+    /// DISTINCT over a VAR-LENGTH endpoint keeps only the reachable-endpoint SET (the
+    /// endpoint-dedup walk), byte-identical to materialize-then-dedup: `t` is reached by two
+    /// length-2 paths (s→m1→t, s→m2→t) yet appears once.
+    #[test]
+    fn distinct_varlength_endpoint_set() {
+        let mut b = Builder::default();
+        let src = b.node(&["N"], &[("name", s("s"))]);
+        let m1 = b.node(&["N"], &[("name", s("m1"))]);
+        let m2 = b.node(&["N"], &[("name", s("m2"))]);
+        let t = b.node(&["N"], &[("name", s("t"))]);
+        b.edge(src, m1, "R");
+        b.edge(src, m2, "R");
+        b.edge(m1, t, "R");
+        b.edge(m2, t, "R");
+        let st = b.build();
+        let sorted = |q: &str| {
+            let mut v = names_of(&run(&crate::gql::parse(q).unwrap(), &st), 0);
+            v.sort();
+            v
+        };
+        // {1,2}: len1 → m1,m2 ; len2 → t (via m1 and via m2, deduped). s is never reached.
+        assert_eq!(
+            sorted("MATCH (a)-[:R]->{1,2}(x) RETURN DISTINCT x.name AS n"),
+            vec!["m1", "m2", "t"]
+        );
+        // {2,2}: exactly two hops → only t (once, despite two paths).
+        assert_eq!(
+            sorted("MATCH (a)-[:R]->{2,2}(x) RETURN DISTINCT x.name AS n"),
+            vec!["t"]
+        );
+    }
+
     #[test]
     fn distinct_reached_set() {
         let store = social();
