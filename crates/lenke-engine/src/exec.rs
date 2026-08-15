@@ -1875,6 +1875,12 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             concat_batches(&subs)
         }
         Plan::Project { input, items } => {
+            // Fused numeric-filtered projection streams the surviving frontier instead of
+            // materializing the whole `[src, nbr]` expand batch (a fixed cost that loses to
+            // core's streaming when the filter is mid-selective). Falls through otherwise.
+            if let Some(b) = try_fused_hop_project(input, items, store, track) {
+                return Ok(b);
+            }
             // Project produces a batch whose slots ARE the projected columns, so
             // an operator above it (Distinct, OrderPage) works on the output
             // values, not the pre-projection bindings.
@@ -6348,6 +6354,88 @@ fn try_fused_hop_num_count(input: &Plan, store: &Store) -> Option<u64> {
         }
     });
     Some(count)
+}
+
+/// Fused numeric-filtered PROJECTION over `Project(Filter(<numeric conj>, Expand(Scan)))`.
+/// The general path pulls the whole expand into an `[src, nbr]` batch, filters, and GATHERS
+/// the survivors — a fixed ~0.8ms for an 80k-edge hop no matter how few rows survive, which
+/// loses to core's streaming when the filter is mid-selective (survivors ≪ edges) but not
+/// selective enough to reverse-seed. Instead STREAM the type's edges (per-type CSR), test the
+/// numeric predicate inline, collect just the surviving TARGET ids, and evaluate the projection
+/// over that survivor frontier — the survivor count of output rows, never the `[src, nbr]`
+/// intermediate. Byte-identical: same typed test per (src, nbr) PATH, survivors in the same
+/// (source, out_adj) order the expand emits, projection unchanged. `None` unless every projected
+/// item reads only the endpoint (slot 1), lineage-free, single-type Out hop, per-type CSR fresh,
+/// and the endpoint is not reverse-seedable.
+fn try_fused_hop_project(
+    input: &Plan,
+    items: &[(String, Expr)],
+    store: &Store,
+    track: bool,
+) -> Option<Batch> {
+    if track || items.is_empty() {
+        return None;
+    }
+    let Plan::Filter { input: exp, pred } = input else {
+        return None;
+    };
+    let Plan::Expand {
+        input: scan,
+        from: 0,
+        dir: Dir::Out,
+        edge_label,
+        bind_edge: false,
+        double_loops: false,
+    } = exp.as_ref()
+    else {
+        return None;
+    };
+    let Plan::Scan { label } = scan.as_ref() else {
+        return None;
+    };
+    if store.has_multi_label_edges() || !items.iter().all(|(_, e)| refs_only_slot(e, 1)) {
+        return None;
+    }
+    let (key, bounds) = num_conj_on_slot(pred, 1)?;
+    let Some(Column::Num { data, present }) = store.column(&key) else {
+        return None;
+    };
+    let want = want_etypes(store, edge_label).ok()?;
+    let [w] = want.as_slice() else {
+        return None;
+    };
+    let w = *w;
+    if reverse_seed_decide(pred, exp, store, false).is_some() {
+        return None;
+    }
+    let keep = |j: usize| present[j] && bounds.iter().all(|&(op, t)| num_pred(op, data[j], t));
+    let flat = store.out_typed_flat(w)?;
+    let universal = match label {
+        None => true,
+        Some(l) => store.nodes_with_label(l).len() == store.live_node_count(),
+    };
+    let mut survivors: Vec<u32> = Vec::new();
+    if universal {
+        for a in flat {
+            if keep(a.nbr as usize) {
+                survivors.push(a.nbr);
+            }
+        }
+    } else {
+        scan_visit(store, label, |i| {
+            if let Some(sl) = store.out_typed_csr(i as u32, w) {
+                for a in sl {
+                    if keep(a.nbr as usize) {
+                        survivors.push(a.nbr);
+                    }
+                }
+            }
+        });
+    }
+    // Evaluate the projection over the survivor frontier (endpoint at slot 1).
+    let cols = vec![Col::Nodes(vec![0u32; survivors.len()]), Col::Nodes(survivors)];
+    let out = eval_all(items.iter().map(|(_, e)| e), store, &Batch::of(cols)).ok()?;
+    Some(Batch::of(out))
 }
 
 /// Fused scalar aggregate — `count(*)` / `sum` / `min` / `max` — over
@@ -17053,6 +17141,43 @@ mod tests {
                 ("Str(\"bob\")".into(), "Num(30.0)".into()),
             ]
         );
+    }
+
+    /// The fused numeric-filtered projection returns the SAME rows (as a multiset) as the
+    /// general materialize+filter+gather+project path — same survivors, same projected values.
+    #[test]
+    fn fused_hop_projection_matches_general() {
+        let mut b = Builder::default();
+        let src = b.node(&["Person"], &[("name", s("src"))]);
+        for (sc, nm) in [(10.0, "a"), (60.0, "b"), (30.0, "c"), (90.0, "d"), (20.0, "e")] {
+            let t = b.node(&["Person"], &[("score", n(sc)), ("name", s(nm))]);
+            b.edge(src, t, "F");
+        }
+        let st = b.build();
+        // score < 50 keeps a(10,→'a'), c(30,→'c'), e(20,→'e'); b,d dropped.
+        let mut got = names_of(
+            &run(
+                &crate::gql::parse("MATCH (a:Person)-[:F]->(b) WHERE b.score < 50 RETURN b.name AS n")
+                    .unwrap(),
+                &st,
+            ),
+            0,
+        );
+        got.sort();
+        assert_eq!(got, vec!["a", "c", "e"]);
+        // A projected expression (not a bare prop) over the survivor frontier still works.
+        let mut up = names_of(
+            &run(
+                &crate::gql::parse(
+                    "MATCH (a:Person)-[:F]->(b) WHERE b.score < 50 RETURN upper(b.name) AS n",
+                )
+                .unwrap(),
+                &st,
+            ),
+            0,
+        );
+        up.sort();
+        assert_eq!(up, vec!["A", "C", "E"]);
     }
 
     /// The fused mask-aggregate (count/sum/min/max over a complex-predicate typed hop) returns
