@@ -15283,6 +15283,10 @@ fn eval_mask(expr: &Expr, store: &Store, batch: &Batch) -> Result<Vec<Option<boo
                 as_truth(&eval(expr, store, batch)?)
             }
         }
+        Expr::Call { name, args } => match typed_strsearch_mask(name, args, store, batch) {
+            Some(m) => m,
+            None => as_truth(&eval(expr, store, batch)?),
+        },
         _ => as_truth(&eval(expr, store, batch)?),
     })
 }
@@ -15398,6 +15402,55 @@ fn typed_str_mask(
         ),
         _ => None,
     }
+}
+
+/// A string-search leaf `prop STARTS WITH / ENDS WITH / CONTAINS lit` (a `Call` over a
+/// node `Str`/`Dict` column) → typed mask, scanning `&str` directly instead of boxing each
+/// cell through `str_bool`. `None` when it is not that shape; a present string cell tests,
+/// an absent cell — or a non-string / missing column — is UNKNOWN (matching `str_bool`'s
+/// NULL), so the mask equals the boxed result row-for-row.
+fn typed_strsearch_mask(
+    name: &str,
+    args: &[Expr],
+    store: &Store,
+    batch: &Batch,
+) -> Option<Vec<Option<bool>>> {
+    let (Expr::Prop { slot, key }, Expr::Lit(Value::Str(sub))) = (args.first()?, args.get(1)?)
+    else {
+        return None;
+    };
+    let f: fn(&str, &str) -> bool = match name {
+        "starts_with" => |s, t| s.starts_with(t),
+        "ends_with" => |s, t| s.ends_with(t),
+        "contains" => |s, t| s.contains(t),
+        _ => return None,
+    };
+    let Col::Nodes(ids) = batch.slot(*slot) else {
+        return None;
+    };
+    let sub = sub.as_ref();
+    Some(match store.column(key) {
+        Some(Column::Str { data, present }) => ids
+            .iter()
+            .map(|&id| {
+                let i = id as usize;
+                present[i].then(|| f(data[i].as_ref(), sub))
+            })
+            .collect(),
+        Some(Column::Dict {
+            dict,
+            codes,
+            present,
+        }) => ids
+            .iter()
+            .map(|&id| {
+                let i = id as usize;
+                present[i].then(|| f(dict[codes[i] as usize].as_ref(), sub))
+            })
+            .collect(),
+        // Missing or non-string column → `str_bool` yields NULL for every row.
+        _ => vec![None; ids.len()],
+    })
 }
 
 fn zip_bool(
@@ -15948,6 +16001,33 @@ mod tests {
         // NOT of the above: n0 F, n1 T, n2 F, n3 NOT null = null (dropped).
         assert_eq!(
             cities("MATCH (n) WHERE NOT (n.age > 50 OR n.city = 'oslo') RETURN n.city AS c"),
+            vec!["bergen"]
+        );
+    }
+
+    /// A string-search leaf (`STARTS WITH`/`ENDS WITH`/`CONTAINS`) inside a complex
+    /// predicate keeps three-valued semantics through `eval_mask`: a null string cell is
+    /// UNKNOWN (dropped, or `NOT UNKNOWN` = UNKNOWN), matching the boxed `str_bool`.
+    #[test]
+    fn eval_mask_string_search_three_valued() {
+        let mut b = Builder::default();
+        b.node(&["N"], &[("name", s("apple")), ("city", s("oslo"))]); // n0
+        b.node(&["N"], &[("name", s("banana")), ("city", s("bergen"))]); // n1
+        b.node(&["N"], &[("city", s("bergen"))]); // n2: name null
+        let st = b.build();
+        let cities = |q: &str| {
+            let mut v = names_of(&run(&crate::gql::parse(q).unwrap(), &st), 0);
+            v.sort();
+            v
+        };
+        // n0 name STARTS 'a' = T; n1 F or 'bergen' ENDS 'o' = F; n2 null OR F = null (drop).
+        assert_eq!(
+            cities("MATCH (n) WHERE (n.name STARTS WITH 'a' OR n.city ENDS WITH 'o') RETURN n.city AS c"),
+            vec!["oslo"]
+        );
+        // NOT (name STARTS 'a'): n0 F, n1 T, n2 NOT null = null (drop).
+        assert_eq!(
+            cities("MATCH (n) WHERE NOT (n.name STARTS WITH 'a') RETURN n.city AS c"),
             vec!["bergen"]
         );
     }
