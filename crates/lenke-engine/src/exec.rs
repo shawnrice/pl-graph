@@ -14217,6 +14217,36 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
     if let Some(keep) = try_filter_keep_dict(pred, store, batch) {
         return Some(keep);
     }
+    // A numeric compare on an EDGE property (`e0.w <op> lit`): read the edge column by each
+    // row's edge id in one raw-f64 pass. Without this an edge predicate is not fast-pathable,
+    // so a conjunction like `c.name = 'x' AND e0.w <> 680` fell off the intersection path onto
+    // the boxed general eval over the whole materialized 2-hop frontier. Absent → dropped
+    // (NULL compare is UNKNOWN), matching the general filter.
+    if let Expr::Compare { op, left, right } = pred {
+        let bound = match (left.as_ref(), right.as_ref()) {
+            (Expr::Prop { slot, key }, Expr::Lit(Value::Num(t))) => Some((*slot, key, *op, *t)),
+            (Expr::Lit(Value::Num(t)), Expr::Prop { slot, key }) => {
+                Some((*slot, key, flip_op(*op), *t))
+            }
+            _ => None,
+        };
+        if let Some((slot, key, op, t)) = bound {
+            if let (Col::Edges(eids), Some((data, present))) =
+                (batch.slot(slot), store.edge_num_column(key))
+            {
+                return Some(
+                    eids.iter()
+                        .enumerate()
+                        .filter(|&(_, &eid)| {
+                            let i = eid as usize;
+                            present[i] && num_pred(op, data[i], t)
+                        })
+                        .map(|(row, _)| row)
+                        .collect(),
+                );
+            }
+        }
+    }
     // `NOT p` pushes into the raw fast paths by inverting `p` (De Morgan + operator
     // flip), exact for the keep-TRUE filter. If the inverted form is not itself
     // fast-pathable, this returns None and the caller evaluates the original `NOT`
