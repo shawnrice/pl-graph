@@ -14395,7 +14395,9 @@ fn distinct_chain_endpoints(chain: &Plan, store: &Store) -> Option<Vec<u32>> {
 /// cloned out.
 fn chain_frontier(chain: &Plan, store: &Store, endpoint: usize) -> Option<Vec<u32>> {
     // A chain containing a var-length: DISTINCT needs only the reachable-endpoint SET, so
-    // dedup at every hop instead of materializing every path.
+    // dedup at every hop instead of materializing every path. (A fixed-hop fan-out is left
+    // to frontier_ids + the caller's node-dedup bitset — routing it through the recursion
+    // here only adds a redundant second bitset for no measured gain.)
     if chain_has_varlen(chain) {
         if let Some(eps) = distinct_chain_endpoints(chain, store) {
             return Some(eps);
@@ -14945,6 +14947,69 @@ fn try_num_conjunction(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<
     )
 }
 
+/// Raw Str/Dict scan for `col STARTS/ENDS/CONTAINS lit`, keeping matches (`negate=false`)
+/// or the complement (`negate=true`, i.e. `NOT (…)`). Semantics match `str_bool`: a present
+/// string cell tests `f` (or `!f`); an absent/NULL cell is UNKNOWN under the inner test and
+/// dropped EITHER way — the present-guard stays, so `NOT` does not resurrect absent rows,
+/// exactly as `eval_mask`'s `Not(Some(false)) = Some(true)`, `Not(None) = None` does. A
+/// non-string / absent-everywhere column yields no match (empty) in both directions. `None`
+/// when the predicate is not this shape (caller falls to the general path).
+fn try_keep_strsearch(
+    pred: &Expr,
+    store: &Store,
+    batch: &Batch,
+    negate: bool,
+) -> Option<Vec<usize>> {
+    let Expr::Call { name, args } = pred else {
+        return None;
+    };
+    let (test, slot, key, sub) = match (name.as_str(), args.as_slice()) {
+        (
+            t @ ("starts_with" | "ends_with" | "contains"),
+            [Expr::Prop { slot, key }, Expr::Lit(Value::Str(sub))],
+        ) => (t, *slot, key, sub),
+        _ => return None,
+    };
+    let Col::Nodes(ids) = batch.slot(slot) else {
+        return None;
+    };
+    let f: fn(&str, &str) -> bool = match test {
+        "starts_with" => |s, t| s.starts_with(t),
+        "ends_with" => |s, t| s.ends_with(t),
+        _ => |s, t| s.contains(t),
+    };
+    let sub = sub.as_ref();
+    let mut keep = Vec::new();
+    match store.column(key) {
+        Some(Column::Str { data, present }) => {
+            for (row, &id) in ids.iter().enumerate() {
+                let i = id as usize;
+                if present[i] && (f(data[i].as_ref(), sub) != negate) {
+                    keep.push(row);
+                }
+            }
+            Some(keep)
+        }
+        Some(Column::Dict {
+            dict,
+            codes,
+            present,
+        }) => {
+            for (row, &id) in ids.iter().enumerate() {
+                let i = id as usize;
+                if present[i] && (f(dict[codes[i] as usize].as_ref(), sub) != negate) {
+                    keep.push(row);
+                }
+            }
+            Some(keep)
+        }
+        // Column absent everywhere → every cell UNKNOWN → dropped (both directions).
+        None => Some(Vec::new()),
+        // A non-string column: `str_bool` yields NULL → no match (both directions).
+        _ => Some(Vec::new()),
+    }
+}
+
 fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usize>> {
     // A predicate that is a pure function of ONE dict column: evaluate per distinct value
     // (≤ dict size) and keep by code, instead of a boxed eval per row.
@@ -15031,6 +15096,13 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
                 }
             }
         }
+        // `NOT (col STARTS/ENDS/CONTAINS lit)` — the same raw Str/Dict scan as the
+        // positive case, keeping the COMPLEMENT. `invert_pred` cannot turn a search Call
+        // into a positive fast form, so without this the negation fell to the boxed eval
+        // over the whole hop (the recurring `NOT ends_with` + projection loss).
+        if let Some(keep) = try_keep_strsearch(inner, store, batch, true) {
+            return Some(keep);
+        }
         return invert_pred(inner).and_then(|pos| try_filter_keep(&pos, store, batch));
     }
     // A CONJUNCTION of typed-numeric `prop <op> literal` compares on one node slot
@@ -15085,54 +15157,9 @@ fn try_filter_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usiz
     }
     // A string-search predicate `col STARTS WITH / ENDS WITH / CONTAINS lit` (which
     // desugars to a `starts_with`/`ends_with`/`contains` call) over a raw Str/Dict
-    // column — scan `&str` directly, no per-cell `Value` boxing through
-    // `call_scalar` (the same win the Str compare path gets). Semantics match
-    // `str_bool`: a present string cell tests, an absent/NULL cell is UNKNOWN →
-    // dropped; a non-string column has no match and falls to the general path.
-    if let Expr::Call { name, args } = pred {
-        if let (
-            test @ ("starts_with" | "ends_with" | "contains"),
-            [Expr::Prop { slot, key }, Expr::Lit(Value::Str(sub))],
-        ) = (name.as_str(), args.as_slice())
-        {
-            if let Col::Nodes(ids) = batch.slot(*slot) {
-                let f: fn(&str, &str) -> bool = match test {
-                    "starts_with" => |s, t| s.starts_with(t),
-                    "ends_with" => |s, t| s.ends_with(t),
-                    _ => |s, t| s.contains(t),
-                };
-                let sub = sub.as_ref();
-                let mut keep = Vec::new();
-                match store.column(key) {
-                    Some(Column::Str { data, present }) => {
-                        for (row, &id) in ids.iter().enumerate() {
-                            let i = id as usize;
-                            if present[i] && f(data[i].as_ref(), sub) {
-                                keep.push(row);
-                            }
-                        }
-                        return Some(keep);
-                    }
-                    Some(Column::Dict {
-                        dict,
-                        codes,
-                        present,
-                    }) => {
-                        for (row, &id) in ids.iter().enumerate() {
-                            let i = id as usize;
-                            if present[i] && f(dict[codes[i] as usize].as_ref(), sub) {
-                                keep.push(row);
-                            }
-                        }
-                        return Some(keep);
-                    }
-                    // Column absent everywhere → every cell UNKNOWN → dropped.
-                    None => return Some(Vec::new()),
-                    // A non-string column: `str_bool` yields NULL → no match.
-                    _ => return Some(Vec::new()),
-                }
-            }
-        }
+    // column — scan `&str` directly, no per-cell `Value` boxing through `call_scalar`.
+    if let Some(keep) = try_keep_strsearch(pred, store, batch, false) {
+        return Some(keep);
     }
     let Expr::Compare { op, left, right } = pred else {
         return None;
@@ -16422,6 +16449,48 @@ mod tests {
         for (q, want) in &cases {
             assert_eq!(&sorted(&st, q), want, "seeded {q}");
         }
+    }
+
+    /// `NOT (col STARTS/ENDS/CONTAINS lit)` over a hop keeps the complement via the raw
+    /// scan, and — critically — an ABSENT cell stays dropped (UNKNOWN under the inner
+    /// search, so NOT-UNKNOWN is UNKNOWN), matching the general eval_mask path exactly.
+    #[test]
+    fn not_strsearch_keep_matches_general() {
+        let mut b = Builder::default();
+        let e1 = b.node(&["N"], &[("name", s("alpha")), ("city", s("oslo"))]);
+        let e2 = b.node(&["N"], &[("name", s("beta")), ("city", s("bergen"))]);
+        let e3 = b.node(&["N"], &[("name", s("gamma"))]); // city ABSENT
+        let src = b.node(&["N"], &[("name", s("src"))]);
+        b.edge(src, e1, "R");
+        b.edge(src, e2, "R");
+        b.edge(src, e3, "R");
+        let st = b.build();
+        let sorted = |q: &str| {
+            let mut v = names_of(&run(&crate::gql::parse(q).unwrap(), &st), 0);
+            v.sort();
+            v
+        };
+        // ENDS WITH 'ta': only beta; NOT keeps alpha, gamma.
+        assert_eq!(
+            sorted("MATCH (a)-[:R]->(b) WHERE NOT b.name ENDS WITH 'ta' RETURN b.name AS n"),
+            vec!["alpha", "gamma"]
+        );
+        // STARTS WITH 'a': only alpha; NOT keeps beta, gamma.
+        assert_eq!(
+            sorted("MATCH (a)-[:R]->(b) WHERE NOT b.name STARTS WITH 'a' RETURN b.name AS n"),
+            vec!["beta", "gamma"]
+        );
+        // CONTAINS 'mm': only gamma; NOT keeps alpha, beta.
+        assert_eq!(
+            sorted("MATCH (a)-[:R]->(b) WHERE NOT b.name CONTAINS 'mm' RETURN b.name AS n"),
+            vec!["alpha", "beta"]
+        );
+        // NOT city CONTAINS 'o': oslo fails, bergen keeps (beta), gamma's city ABSENT is
+        // UNKNOWN → dropped (not resurrected by NOT).
+        assert_eq!(
+            sorted("MATCH (a)-[:R]->(b) WHERE NOT b.city CONTAINS 'o' RETURN b.name AS n"),
+            vec!["beta"]
+        );
     }
 
     /// A conjunction seeded on its equality conjunct (`c.name = 'hit' AND c.age > 50`)
