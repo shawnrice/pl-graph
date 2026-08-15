@@ -4991,10 +4991,13 @@ fn reverse_seed_worth(bucket: usize, source: usize, loose: bool, store: &Store) 
         return true;
     }
     // The reverse-seed materializes ~bucket × reverse-degree rows; it wins when that stays
-    // under the forward scan of `source`. `deg` is the GLOBAL avg degree, an over-estimate
-    // for a sparse edge type (e.g. F here is ~1/20 of R) — but the residual is now
-    // vectorized (`eval_mask`), so a single `deg` factor (not `deg²`) already gates the
-    // large-bucket dense-edge cases while admitting the selective sparse-edge ranges.
+    // under the forward scan of `source`. `deg` is the GLOBAL avg degree — deliberately: a
+    // per-edge-type degree was TRIED (2026-08-15) and REVERTED, because the sparse edge type
+    // here (F, deg 1) made a NON-selective range bucket (`score >= 89` = 91% of nodes) pass
+    // `bucket × 1 < source` and wrongly fire the seed, materializing ~all the graph (26ms vs
+    // the 3.6ms forward win). The global degree correctly declines those. The residual is
+    // vectorized (`eval_mask`), so a single `deg` factor (not `deg²`) already admits the
+    // genuinely selective ranges while declining the dense/non-selective ones.
     let deg = (store.edge_count() as f64 / store.live_node_count().max(1) as f64).max(1.0);
     (bucket as f64) * deg < source as f64
 }
