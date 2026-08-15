@@ -1739,6 +1739,16 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // never evaluate arbitrary expressions, so they cannot fault.)
             if let Some(b) = try_scan_count(input, keys, aggs, store)
                 .or_else(|| try_filtered_count(input, keys, aggs, store))
+                .or_else(|| {
+                    (keys.is_empty()
+                        && aggs.len() == 1
+                        && aggs[0].func == AggFn::Count
+                        && aggs[0].arg.is_none()
+                        && !aggs[0].distinct)
+                        .then(|| try_fused_hop_num_count(input, store))
+                        .flatten()
+                        .map(|c| scalar_num(c as f64))
+                })
                 .or_else(|| try_edge_filtered_count(input, keys, aggs, store))
                 .or_else(|| try_varlen_count(input, keys, aggs, store))
                 .or_else(|| try_edge_cross_count(input, keys, aggs, store))
@@ -6225,6 +6235,97 @@ fn try_filtered_count(
     let batch = pull(scan, store, false).ok()?;
     let keep = try_filter_keep(pred, store, &batch)?;
     Some(scalar_num(keep.len() as f64))
+}
+
+/// Fused `count(*)` over `Filter(<numeric conj on the frontier>, Expand(Scan))` — the
+/// single-hop analogue of [`try_filtered_count`]'s streaming. Iterate the source label's
+/// bucket, take each source's type-`w` edges from the per-type CSR (only the matching
+/// edges — a sparse type does not pay the dense degree), and test the numeric predicate
+/// INLINE against the neighbour's column, counting per (src, nbr) PATH — no `[src, nbr]`
+/// batch, no keep list, no separate filter pass. Byte-identical: the same typed compare
+/// per path as the materialize path (multiplicity kept, present-null dropped). Declined for
+/// a reverse-seedable (selective) predicate, and only when the per-type CSR is fresh (else
+/// the flat-scan expand+materialize path stays correct).
+fn try_fused_hop_num_count(input: &Plan, store: &Store) -> Option<u64> {
+    let Plan::Filter { input: exp, pred } = input else {
+        return None;
+    };
+    let Plan::Expand {
+        input: scan,
+        from: 0,
+        dir: Dir::Out,
+        edge_label,
+        bind_edge: false,
+        double_loops: false,
+    } = exp.as_ref()
+    else {
+        return None;
+    };
+    let Plan::Scan { label } = scan.as_ref() else {
+        return None;
+    };
+    if store.has_multi_label_edges() {
+        return None;
+    }
+    let (key, bounds) = num_conj_on_slot(pred, 1)?;
+    let Some(Column::Num { data, present }) = store.column(&key) else {
+        return None;
+    };
+    // A single wanted etype (the per-type CSR keys on one type; a disjunction reorders).
+    let want = want_etypes(store, edge_label).ok()?;
+    let [w] = want.as_slice() else {
+        return None;
+    };
+    let w = *w;
+    // Forward-count cost ≈ the number of type-`w` edges (the flat partition). Only decline to
+    // the reverse-seed when its endpoint bucket is SMALLER than that — i.e. genuinely more
+    // selective. The `reverse_seed_worth` guard prices the reverse walk against the SOURCE
+    // scan (node count), which over-fires for a sparse type: seeding `age >= 77` (92k of 400k)
+    // and walking the sparse F-in edges back cost MORE than sweeping the 80k F edges forward.
+    let flat_len = store.out_typed_flat(w)?.len();
+    if let Some(rs) = reverse_seed_decide(pred, exp, store, false) {
+        // The reverse walk seeds `bucket` endpoints and looks each one up in the (sparse,
+        // scattered) type-in index — a RANDOM probe per seed, measured ~10x the cost of one
+        // SEQUENTIAL forward edge read. So the reverse-seed only wins when its bucket is well
+        // under a tenth of the type's forward edge count; otherwise sweep the edges forward.
+        if rs.bucket.len().saturating_mul(8) < flat_len {
+            return None; // reverse-seed is the genuinely smaller job
+        }
+    }
+    let mut count = 0u64;
+    // When the source set is the WHOLE graph (an unlabelled scan, or a label every live
+    // node carries), every type-`w` edge's source qualifies — so count the type's edges
+    // DIRECTLY off the flat per-type partition (5x fewer than the node count for a sparse
+    // type: core's structure), no per-source offset walk. Byte-identical: each edge is one
+    // (src, nbr) path, exactly once, and every src is in the source set.
+    let universal = match label {
+        None => true,
+        Some(l) => store.nodes_with_label(l).len() == store.live_node_count(),
+    };
+    if universal {
+        let flat = store.out_typed_flat(w)?;
+        for a in flat {
+            let j = a.nbr as usize;
+            if present[j] && bounds.iter().all(|&(op, t)| num_pred(op, data[j], t)) {
+                count += 1;
+            }
+        }
+        return Some(count);
+    }
+    // Otherwise walk the labelled sources, taking each one's type-`w` slice. (The overlay is
+    // already known fresh — `out_typed_flat` above returned Some — so the per-source lookups
+    // never spuriously miss.)
+    scan_visit(store, label, |i| {
+        if let Some(sl) = store.out_typed_csr(i as u32, w) {
+            for a in sl {
+                let j = a.nbr as usize;
+                if present[j] && bounds.iter().all(|&(op, t)| num_pred(op, data[j], t)) {
+                    count += 1;
+                }
+            }
+        }
+    });
+    Some(count)
 }
 
 /// Count nodes of `label` whose `pred` holds, STREAMING the label bucket with raw
@@ -16639,6 +16740,48 @@ mod tests {
             sorted("MATCH (a)-[:R]->(b) WHERE (b.age >= 40 AND (b.name = 'hit' OR b.age >= 45)) RETURN b.name AS n"),
             vec!["hit", "miss"]
         );
+    }
+
+    /// The fused single-hop `count(*)` over a numeric-filtered typed hop counts exactly the
+    /// (source, neighbour) PATHS whose neighbour passes the filter — the same value the
+    /// materialize path yields — for BOTH a universal source label (flat-edge sweep) and a
+    /// labelled SUBSET (per-source slice), never counting an edge from an out-of-label source.
+    #[test]
+    fn fused_hop_count_matches_materialize_value() {
+        let count_of = |q: &str, st: &Store| -> f64 {
+            let out = run(&crate::gql::parse(q).unwrap(), st);
+            match &out.rows.iter().next().expect("one count row")[0] {
+                Value::Num(n) => *n,
+                other => panic!("not a number: {other:?}"),
+            }
+        };
+        // Non-universal: p* are Person, o0 is Other. Only Person sources' F edges count.
+        let mut b = Builder::default();
+        let p0 = b.node(&["Person"], &[("age", n(50.0))]);
+        let p1 = b.node(&["Person"], &[("age", n(80.0))]);
+        let p2 = b.node(&["Person"], &[("age", n(90.0))]);
+        let o0 = b.node(&["Other"], &[("age", n(30.0))]);
+        b.edge(p0, p1, "F"); // 80 >= 60 ✓
+        b.edge(p0, o0, "F"); // 30 >= 60 ✗
+        b.edge(p1, p2, "F"); // 90 >= 60 ✓
+        b.edge(o0, p1, "F"); // source o0 is NOT a Person → excluded
+        let st = b.build();
+        let q = "MATCH (a:Person)-[:F]->(b) WHERE b.age >= 60 RETURN count(*) AS c";
+        assert_eq!(count_of(q, &st), 2.0, "labelled-subset path");
+
+        // Universal: every node is a Person → the flat-edge sweep fires. Same graph, all Person.
+        let mut b2 = Builder::default();
+        let q0 = b2.node(&["Person"], &[("age", n(50.0))]);
+        let q1 = b2.node(&["Person"], &[("age", n(80.0))]);
+        let q2 = b2.node(&["Person"], &[("age", n(90.0))]);
+        let q3 = b2.node(&["Person"], &[("age", n(30.0))]);
+        b2.edge(q0, q1, "F");
+        b2.edge(q0, q3, "F");
+        b2.edge(q1, q2, "F");
+        b2.edge(q3, q1, "F"); // now q3 IS a Person → this edge counts (target q1 age80 ✓)
+        let st2 = b2.build();
+        // targets passing age>=60: q0→q1(80✓), q0→q3(30✗), q1→q2(90✓), q3→q1(80✓) = 3.
+        assert_eq!(count_of(q, &st2), 3.0, "universal flat-sweep path");
     }
 
     /// A single-type hop over the per-type CSR returns the type's neighbours in the SAME

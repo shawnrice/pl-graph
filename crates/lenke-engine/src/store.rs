@@ -854,6 +854,20 @@ impl Store {
         }
     }
 
+    /// ALL out-edges of type `etype` across every source, contiguous in (source, out_adj)
+    /// order — the whole per-type partition. Lets a hop whose source set is the entire graph
+    /// count/scan the type's edges directly (5x fewer than the node count for a sparse type)
+    /// without walking every source's offset. `None` if the overlay is stale or the etype is
+    /// unknown.
+    #[inline]
+    #[must_use]
+    pub fn out_typed_flat(&self, etype: u32) -> Option<&[Adj]> {
+        if !self.csr_fresh {
+            return None;
+        }
+        self.csr_out_typed.get(etype as usize).map(|(_, adj)| adj.as_slice())
+    }
+
     /// Node `v`'s IN edges of type `etype`, a contiguous slice in in_adj order. The
     /// in-side twin of [`out_typed_csr`].
     #[inline]
