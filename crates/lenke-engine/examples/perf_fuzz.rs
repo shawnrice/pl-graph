@@ -747,6 +747,7 @@ fn main() {
                 continue;
             }
             Err(why) => {
+                dump_skip("engine", &first_line(&why), q);
                 *skips
                     .entry(format!("engine {}", first_line(&why)))
                     .or_insert(0) += 1;
@@ -756,6 +757,7 @@ fn main() {
         let c = match time_core(&mut cgraph, q, REPS) {
             Ok(v) => v,
             Err(why) => {
+                dump_skip("core", &first_line(&why), q);
                 *skips
                     .entry(format!("core {}", first_line(&why)))
                     .or_insert(0) += 1;
@@ -903,4 +905,15 @@ fn main() {
 
 fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").chars().take(60).collect()
+}
+
+/// Append a skipped query (which engine, why, the query) to `FUZZ_SKIP_DUMP` if set —
+/// so the actual heavy/rejected shapes can be sampled, not just tallied by reason.
+fn dump_skip(side: &str, why: &str, q: &str) {
+    if let Ok(path) = std::env::var("FUZZ_SKIP_DUMP") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{side}\t{why}\t{q}");
+        }
+    }
 }
