@@ -4591,10 +4591,10 @@ fn reverse_seed_decide<'a>(
     // levels[k] is hop k (feeds slot k, appends slot k+1): innermost-first.
     let levels: Vec<(Dir, &[String])> = chain.iter().rev().map(|&(_, d, e)| (d, e)).collect();
     // pred must be `target.key = lit` on the FINAL slot (slot n) with a hash index.
-    let (key, value) = target_eq(pred, n)?;
-    if !store.has_hash_index(&key) {
-        return None;
-    }
+    // The seed is an indexed equality on the FINAL slot — `pred` itself, or, when `pred`
+    // is a conjunction, one of its conjuncts (the rest becomes a residual filter over the
+    // seeded rows). `seed_equality` already requires the hash index.
+    let (key, value) = seed_equality(pred, n, store)?;
     // Cardinality decision: seed the SMALLER side. The forward plan scans every source
     // and walks the whole fan-out before filtering; reverse seeds the target bucket and
     // walks back only the paths that actually reach it, so the saving compounds per hop.
@@ -4679,7 +4679,48 @@ fn try_reverse_expand(pred: &Expr, input: &Plan, store: &Store, track: bool) -> 
             cols[i].push(v);
         }
     }
-    Some(Batch::of(cols.into_iter().map(Col::Nodes).collect()))
+    let b = Batch::of(cols.into_iter().map(Col::Nodes).collect());
+    // A bare equality is fully satisfied by the seed. A conjunction (`… AND c.age > 30`)
+    // seeded on its equality conjunct still needs the other conjuncts applied — run the
+    // WHOLE predicate over the (small) seeded batch. Re-checking the equality is a cheap
+    // no-op and keeps group_key-vs-equals edge cases identical to the forward filter. If
+    // the residual can't be evaluated cleanly, decline (the forward path handles it).
+    if target_eq(pred, n).is_some() {
+        return Some(b);
+    }
+    let keep = residual_keep(pred, store, &b)?;
+    Some(b.gather(&keep))
+}
+
+/// Keep-indices for a residual predicate over an already-materialized (small) batch —
+/// the fast `try_filter_keep` pass, else a boxed `eval`. `None` if `eval` faults, so a
+/// caller can decline and fall back to the forward path rather than swallow the error.
+fn residual_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usize>> {
+    if let Some(keep) = try_filter_keep(pred, store, batch) {
+        return Some(keep);
+    }
+    let mask = eval(pred, store, batch).ok()?;
+    Some(match &mask {
+        Col::Bool(bs) => (0..bs.len()).filter(|&i| bs[i]).collect(),
+        other => (0..other.len())
+            .filter(|&i| other.value_at(i).is_true())
+            .collect(),
+    })
+}
+
+/// An indexed equality on `slot` to seed on: `pred` if it is `slot.key = lit` with a
+/// hash index, else — when `pred` is a conjunction — the first such conjunct. The other
+/// conjuncts are re-applied as a residual filter by the caller.
+fn seed_equality(pred: &Expr, slot: usize, store: &Store) -> Option<(String, Value)> {
+    if let Some((k, v)) = target_eq(pred, slot) {
+        if store.has_hash_index(&k) {
+            return Some((k, v));
+        }
+    }
+    if let Expr::And(l, r) = pred {
+        return seed_equality(l, slot, store).or_else(|| seed_equality(r, slot, store));
+    }
+    None
 }
 
 /// Parse `Prop{slot, key} = Lit(value)` (or its mirror) — an equality on the given slot.
@@ -15254,6 +15295,34 @@ mod tests {
         let mut got = names_of(&run(&crate::gql::parse(&q(10)).unwrap(), &st), 0);
         got.sort();
         assert_eq!(got, vec!["s3", "s3", "s4"]);
+    }
+
+    /// A conjunction seeded on its equality conjunct (`c.name = 'hit' AND c.age > 50`)
+    /// applies the remaining conjuncts as a residual filter over the seeded rows, so it
+    /// returns exactly the forward walk's rows — the seed bucket holds two 'hit' nodes
+    /// and only the one passing `age > 50` (and the paths reaching it) survive.
+    #[test]
+    fn reverse_seed_conjunction_residual_matches_forward() {
+        let mut b = Builder::default();
+        let t1 = b.node(&["N"], &[("name", s("hit")), ("age", n(99.0))]);
+        let t2 = b.node(&["N"], &[("name", s("hit")), ("age", n(10.0))]); // same name, fails age>50
+        let s1 = b.node(&["N"], &[("name", s("s1"))]);
+        let s2 = b.node(&["N"], &[("name", s("s2"))]);
+        b.edge(s1, t1, "R");
+        b.edge(s2, t2, "R");
+        b.edge(s1, t2, "R"); // s1 also reaches the filtered-out target
+        let mut st = b.build();
+        let q = "MATCH (a)-[:R]->(c) WHERE c.name = 'hit' AND c.age > 50 RETURN a.name AS a";
+        let sorted = |st: &Store| {
+            let mut v = names_of(&run(&crate::gql::parse(q).unwrap(), st), 0);
+            v.sort();
+            v
+        };
+        // Forward (no index): only s1→t1 survives (t1.age = 99).
+        assert_eq!(sorted(&st), vec!["s1"]);
+        // Index on: seed name='hit' (bucket {t1,t2}), residual age>50 keeps only t1's path.
+        st.create_index("name");
+        assert_eq!(sorted(&st), vec!["s1"]);
     }
 
     /// The reverse-seed only fires when the target bucket is smaller than the source
