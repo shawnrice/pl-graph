@@ -4625,16 +4625,20 @@ fn reverse_seed_decide(pred: &Expr, input: &Plan, store: &Store, track: bool) ->
     // that forward cost (the `reverse_seed_worth` guard prices against the SOURCE scan, which
     // over-fires for a sparse type — `age >= 77` = 92k seeds vs 80k forward F edges). Byte-
     // identical either way — this only picks the cheaper equivalent plan.
-    if hops.len() == 1 && !loose {
+    if !loose {
         if let Some(ep) = hops.last() {
             let fwd: usize = ep
                 .want
                 .iter()
                 .filter_map(|&t| store.out_typed_flat(t).map(<[_]>::len))
                 .sum();
-            // A random type-in probe per seed costs ~10x a sequential forward edge read, so
-            // the reverse-seed only wins when its bucket is well under a tenth of `fwd`.
-            if fwd > 0 && bucket.len().saturating_mul(8) >= fwd {
+            // A random type-in probe per seed costs ~10x a sequential forward edge read, so a
+            // SINGLE-hop reverse-seed wins only when its bucket is well under a tenth of `fwd`
+            // (the endpoint type's forward edge count). A MULTI-hop forward walk fans out again
+            // past `fwd`, so it is only cheaper when the bucket is at least the whole endpoint
+            // edge count — a stricter bar that keeps a mid-selective 2-hop range on the seed.
+            let factor = if hops.len() == 1 { 8 } else { 1 };
+            if fwd > 0 && bucket.len().saturating_mul(factor) >= fwd {
                 return None;
             }
         }
