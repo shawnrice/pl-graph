@@ -2000,6 +2000,13 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             // each endpoint node off storage (dict codes), never building the exploded
             // frontier's property columns. Lineage-free (DISTINCT collapses paths).
             if !track {
+                // `DISTINCT x, x, …` (every item the identical property) has the same
+                // distinct tuples in the same first-seen order as `DISTINCT x` replicated —
+                // route to the single-column fast path and clone the output, instead of the
+                // composite byte-key (measured ~3x slower on a duplicated Str column).
+                if let Some(b) = try_distinct_identical_cols(input, store, track) {
+                    return Ok(b);
+                }
                 if let Some(b) = try_distinct_frontier_prop(input, store) {
                     return Ok(b);
                 }
@@ -14535,6 +14542,40 @@ fn try_distinct_frontier_prop(input: &Plan, store: &Store) -> Option<Batch> {
 /// batch's row order — the same order the general dedup sees — so it is byte-identical.
 /// `None` unless every projected key is a plain property of the chain frontier backed by a
 /// Num/Str/Bool/Dict column.
+/// `RETURN DISTINCT x, x, …, x` where every projection item is the SAME property: the
+/// distinct tuples are `{(v, …, v) : v ∈ distinct(x)}` in `x`'s first-seen order, i.e. the
+/// single-column DISTINCT with its output column replicated. Route to the fast single-column
+/// path (typed set / dict-code bitset) and clone the one result column, instead of the
+/// composite byte-key that keys+clones the identical column N times. `None` unless the input
+/// is a Project whose ≥2 items are all the identical `Prop` (the `b.city, b.city` shape the
+/// fuzzer emits). Lineage-free (the caller gates on `!track`; DISTINCT collapses paths).
+fn try_distinct_identical_cols(input: &Plan, store: &Store, track: bool) -> Option<Batch> {
+    let Plan::Project { input: chain, items } = input else {
+        return None;
+    };
+    if items.len() < 2 {
+        return None;
+    }
+    let Expr::Prop { slot: s0, key: k0 } = &items[0].1 else {
+        return None;
+    };
+    if !items
+        .iter()
+        .all(|(_, e)| matches!(e, Expr::Prop { slot, key } if slot == s0 && key == k0))
+    {
+        return None;
+    }
+    let single = Plan::Distinct {
+        input: Box::new(Plan::Project {
+            input: chain.clone(),
+            items: vec![items[0].clone()],
+        }),
+    };
+    let b = pull(&single, store, track).ok()?;
+    let col = b.slots.into_iter().next()?;
+    Some(Batch::of(vec![col; items.len()]))
+}
+
 fn try_distinct_frontier_multi(input: &Plan, store: &Store) -> Option<Batch> {
     let Plan::Project { input: chain, items } = input else {
         return None;
@@ -16449,6 +16490,37 @@ mod tests {
         for (q, want) in &cases {
             assert_eq!(&sorted(&st, q), want, "seeded {q}");
         }
+    }
+
+    /// `DISTINCT x, x` (identical projection items) routes to the single-column path and
+    /// replicates the result column — same distinct set, and the second column is the exact
+    /// replica of the first (not a separately-keyed composite).
+    #[test]
+    fn distinct_identical_columns_replicate() {
+        let mut b = Builder::default();
+        let m1 = b.node(&["N"], &[("name", s("m1"))]);
+        let m2 = b.node(&["N"], &[("name", s("m2"))]);
+        let t = b.node(&["N"], &[("name", s("t"))]);
+        let src = b.node(&["N"], &[("name", s("src"))]);
+        b.edge(src, m1, "R");
+        b.edge(src, m2, "R");
+        b.edge(src, t, "R");
+        b.edge(m1, m2, "R"); // m1 also reaches m2 — forces the endpoint dedup
+        let st = b.build();
+        let batch = run(
+            &crate::gql::parse("MATCH (a)-[:R]->(x) RETURN DISTINCT x.name AS p, x.name AS q")
+                .unwrap(),
+            &st,
+        );
+        let mut c0 = names_of(&batch, 0);
+        let c1 = names_of(&batch, 1);
+        assert_eq!(c0.clone().into_iter().collect::<std::collections::BTreeSet<_>>().len(), c0.len(), "col0 is distinct");
+        c0.sort();
+        let mut c1s = c1.clone();
+        c1s.sort();
+        assert_eq!(c0, vec!["m1", "m2", "t"]);
+        assert_eq!(c1, names_of(&batch, 0), "second column replicates the first row-for-row");
+        assert_eq!(c0, c1s);
     }
 
     /// `NOT (col STARTS/ENDS/CONTAINS lit)` over a hop keeps the complement via the raw
