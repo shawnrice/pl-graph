@@ -16492,6 +16492,46 @@ mod tests {
         }
     }
 
+    /// `NOT (x <op> v)` normalizes to `x <neg op> v` — the negated spelling returns exactly
+    /// the positive one's rows, including the 3VL NULL case (an absent operand is UNKNOWN and
+    /// dropped either way, never resurrected) and stacked `NOT NOT NOT` collapsing.
+    #[test]
+    fn negated_comparison_matches_positive_spelling() {
+        let mut b = Builder::default();
+        let n1 = b.node(&["N"], &[("name", s("keep")), ("age", n(30.0))]);
+        let n2 = b.node(&["N"], &[("name", s("skip")), ("age", n(40.0))]);
+        let n3 = b.node(&["N"], &[("name", s("noage"))]); // age ABSENT
+        let src = b.node(&["N"], &[("name", s("src"))]);
+        b.edge(src, n1, "R");
+        b.edge(src, n2, "R");
+        b.edge(src, n3, "R");
+        let st = b.build();
+        let sorted = |q: &str| {
+            let mut v = names_of(&run(&crate::gql::parse(q).unwrap(), &st), 0);
+            v.sort();
+            v
+        };
+        // NOT (age <> 30) == age = 30 → keep n1; absent n3 is UNKNOWN, dropped both ways.
+        assert_eq!(
+            sorted("MATCH (a)-[:R]->(x) WHERE NOT x.age <> 30 RETURN x.name AS n"),
+            sorted("MATCH (a)-[:R]->(x) WHERE x.age = 30 RETURN x.name AS n"),
+        );
+        assert_eq!(
+            sorted("MATCH (a)-[:R]->(x) WHERE NOT x.age <> 30 RETURN x.name AS n"),
+            vec!["keep"]
+        );
+        // NOT (age >= 40) == age < 40 → keep n1 (30); n2 (40) excluded; absent dropped.
+        assert_eq!(
+            sorted("MATCH (a)-[:R]->(x) WHERE NOT x.age >= 40 RETURN x.name AS n"),
+            sorted("MATCH (a)-[:R]->(x) WHERE x.age < 40 RETURN x.name AS n"),
+        );
+        // Stacked negation collapses: NOT NOT NOT (age >= 40) == age < 40.
+        assert_eq!(
+            sorted("MATCH (a)-[:R]->(x) WHERE NOT NOT NOT x.age >= 40 RETURN x.name AS n"),
+            vec!["keep"]
+        );
+    }
+
     /// `DISTINCT x, x` (identical projection items) routes to the single-column path and
     /// replicates the result column — same distinct set, and the second column is the exact
     /// replica of the first (not a separately-keyed composite).

@@ -151,6 +151,20 @@ fn slot_is_node(p: &Plan, slot: usize) -> bool {
 /// `IS LABELED` lowers to the same `In(Lit, labels(slot))` form but means the edge's
 /// type, which `IsLabeled` (node labels) would answer wrongly. Recurses through the
 /// boolean combinators.
+/// The three-valued negation of a comparison operator: `NOT (a <op> b) == a <neg> b`
+/// for every present value pair (and both stay UNKNOWN on NULL, both throw on a
+/// cross-type ordering). Eq↔Ne, Lt↔Ge, Le↔Gt.
+fn negate_op(op: CompareOp) -> CompareOp {
+    match op {
+        CompareOp::Eq => CompareOp::Ne,
+        CompareOp::Ne => CompareOp::Eq,
+        CompareOp::Lt => CompareOp::Ge,
+        CompareOp::Le => CompareOp::Gt,
+        CompareOp::Gt => CompareOp::Le,
+        CompareOp::Ge => CompareOp::Lt,
+    }
+}
+
 fn normalize_pred(e: Expr, input: &Plan) -> Expr {
     match e {
         Expr::In { needle, haystack } => {
@@ -198,7 +212,25 @@ fn normalize_pred(e: Expr, input: &Plan) -> Expr {
                 haystack: Box::new(normalize_pred(*haystack, input)),
             }
         }
-        Expr::Not(a) => Expr::Not(Box::new(normalize_pred(*a, input))),
+        Expr::Not(a) => {
+            let a = normalize_pred(*a, input);
+            match a {
+                // NOT NOT x -> x (double negation; collapses the fuzzer's `NOT NOT NOT …`).
+                Expr::Not(inner) => *inner,
+                // NOT (l <op> r) -> l <neg op> r. Sound under three-valued logic: a NULL
+                // operand leaves both spellings UNKNOWN, cross-type equality stays no-match,
+                // and cross-type ordering still throws either way. Canonicalizes the negated
+                // spelling onto the SAME fast/seed path as the positive one — so
+                // `NOT d.name <> 'n929'` becomes the seedable `d.name = 'n929'` (the
+                // equivalent-spellings rule: both must cost the same).
+                Expr::Compare { op, left, right } => Expr::Compare {
+                    op: negate_op(op),
+                    left,
+                    right,
+                },
+                other => Expr::Not(Box::new(other)),
+            }
+        }
         Expr::And(a, b) => Expr::And(
             Box::new(normalize_pred(*a, input)),
             Box::new(normalize_pred(*b, input)),
