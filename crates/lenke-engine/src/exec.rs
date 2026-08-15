@@ -4619,9 +4619,11 @@ fn reverse_seed_decide(pred: &Expr, input: &Plan, store: &Store, track: bool) ->
         Some(l) => store.nodes_with_label(l).len(),
         None => store.live_node_count(),
     };
-    // Loose for a bare equality (no residual) or a top-level OR (forward eval boxes);
-    // tight for a foldable range/IN/AND, which the forward scan handles cheaply.
-    let loose = target_eq(pred, ep_slot).is_some() || matches!(pred, Expr::Or(..));
+    // Loose only for a bare equality (no residual, and a smaller-than-scan bucket already
+    // wins). Everything else — range / IN / OR / AND — MATERIALIZES the walked rows and
+    // boxes a residual, so it needs the selectivity guard; a large OR union in particular
+    // must NOT flip when a downstream LIMIT could stream the forward walk cheaply.
+    let loose = target_eq(pred, ep_slot).is_some();
     if !reverse_seed_worth(bucket.len(), source_rows, loose, store) {
         return None;
     }
@@ -4950,8 +4952,9 @@ fn seed_bucket(pred: &Expr, slot: usize, store: &Store) -> Option<Vec<u32>> {
 /// rows and boxes any residual over them. When the forward predicate ALSO folds cheaply
 /// (a simple range/IN/AND that `try_filter_keep` handles), the reverse only wins on a
 /// SMALL FRACTION of the scan — require its fan-out (bucket × degree²) to stay under the
-/// forward scan. A `loose` predicate (bare equality — no residual; or a top-level `OR`,
-/// whose forward eval boxes per row) wins on any bucket smaller than the scan.
+/// forward scan. Only a `loose` predicate (a bare equality — no residual) wins on any
+/// bucket smaller than the scan; range/IN/OR/AND all take the tight guard, so a large OR
+/// union does not flip when a downstream LIMIT could stream the forward walk cheaply.
 /// (Var-length seeds skip this — their forward path is a trail-limit blow-up.)
 fn reverse_seed_worth(bucket: usize, source: usize, loose: bool, store: &Store) -> bool {
     if bucket >= source {
