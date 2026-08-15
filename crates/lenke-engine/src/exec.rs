@@ -1799,6 +1799,15 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                     // the chain). Stream the chain block-by-block until `c` rows land —
                     // identical rows, computed early. A `DISTINCT … LIMIT` streams with
                     // incremental dedup, stopping at `c` distinct rows.
+                    None if reverse_seed_applies(input, store, track) => {
+                        // The chain's Filter reverse-seeds a selective indexed endpoint,
+                        // so the whole (bounded) result materializes far cheaper than
+                        // streaming the forward walk to the cap — which, for an empty or
+                        // selective bucket, walks the entire fan-out chasing `limit` rows
+                        // that mostly do not exist. Pull it; `order_page` slices. Keyless
+                        // page order is unspecified either way, same as the un-capped seed.
+                        Some(pull(input, store, track)?)
+                    }
                     None => match input.as_ref() {
                         Plan::Distinct { input: inner } => {
                             pull_distinct_capped_stream(inner, store, c)?
@@ -4491,7 +4500,7 @@ fn try_shortest_early_stop(pred: &Expr, input: &Plan, store: &Store, track: bool
     else {
         return None;
     };
-    let (key, value) = target_eq(pred)?; // endpoint (slot 1) `== lit`
+    let (key, value) = target_eq(pred, 1)?; // endpoint (slot 1) `== lit`
     if !store.has_hash_index(&key) {
         return None; // resolve the target set from the index, else keep the normal path
     }
@@ -4528,64 +4537,153 @@ fn try_shortest_early_stop(pred: &Expr, input: &Plan, store: &Store, track: bool
     Some(sp_batch.gather(&keep))
 }
 
-fn try_reverse_expand(pred: &Expr, input: &Plan, store: &Store, track: bool) -> Option<Batch> {
+/// The parsed, cardinality-approved decision for a reverse-seed: the hop chain
+/// (innermost-first), its per-hop edge-type want-sets, the source scan's label, and
+/// the indexed endpoint `key = value`. Produced by [`reverse_seed_decide`] using only
+/// O(1) index lookups (no walk), so a caller can cheaply ask "would this reverse-seed?"
+/// before committing to it.
+struct RevSeed<'a> {
+    levels: Vec<(Dir, &'a [String])>,
+    wants: Vec<Vec<u32>>,
+    src_label: Option<String>,
+    key: String,
+    value: Value,
+}
+
+fn reverse_seed_decide<'a>(
+    pred: &'a Expr,
+    input: &'a Plan,
+    store: &Store,
+    track: bool,
+) -> Option<RevSeed<'a>> {
     if track {
         return None; // a path-reading query keeps the forward walk (lineage)
     }
-    let Plan::Expand {
-        input: src,
-        from: 0,
-        dir,
-        edge_label,
-        bind_edge: false,
-        double_loops: false,
-    } = input
-    else {
+    // Unwrap a chain of plain expands over a scan: Expand{from:n-1}(…Expand{from:0}(Scan)).
+    // The tree is walked outermost-in, so `chain` collects hops from n-1 down to 0; the
+    // slots they append run 1..=n and the final target lands in slot n. A single expand
+    // (n = 1) is the original 1-hop anchor flip; n > 1 seeds an N-hop selective endpoint.
+    let mut chain: Vec<(usize, Dir, &[String])> = Vec::new();
+    let mut cur = input;
+    let src_label = loop {
+        match cur {
+            Plan::Expand {
+                input: inner,
+                from,
+                dir,
+                edge_label,
+                bind_edge: false,
+                double_loops: false,
+            } => {
+                chain.push((*from, *dir, edge_label.as_slice()));
+                cur = inner.as_ref();
+            }
+            Plan::Scan { label } if !chain.is_empty() => break label.clone(),
+            _ => return None, // source must bottom at an unfiltered scan
+        }
+    };
+    let n = chain.len();
+    // The outermost expand must feed from slot n-1, the next from n-2, … down to 0 — a
+    // straight chain with no branch or re-entry into an earlier slot.
+    if chain.iter().enumerate().any(|(i, (from, _, _))| *from != n - 1 - i) {
         return None;
-    };
-    let Plan::Scan { label: src_label } = src.as_ref() else {
-        return None; // source must be an unfiltered scan (else seed the source)
-    };
-    // pred must be `target.key = lit` on the appended slot (slot 1 over a 1-wide
-    // scan) with a hash index on `key`.
-    let (key, value) = target_eq(pred)?;
+    }
+    // levels[k] is hop k (feeds slot k, appends slot k+1): innermost-first.
+    let levels: Vec<(Dir, &[String])> = chain.iter().rev().map(|&(_, d, e)| (d, e)).collect();
+    // pred must be `target.key = lit` on the FINAL slot (slot n) with a hash index.
+    let (key, value) = target_eq(pred, n)?;
     if !store.has_hash_index(&key) {
         return None;
     }
-    // Cardinality decision: seed the SMALLER side. Forward seeds the source scan;
-    // reverse seeds the target bucket. Flip only when the target bucket is smaller.
+    // Cardinality decision: seed the SMALLER side. The forward plan scans every source
+    // and walks the whole fan-out before filtering; reverse seeds the target bucket and
+    // walks back only the paths that actually reach it, so the saving compounds per hop.
+    // Flip only when the target bucket is smaller than the source scan.
     let target_rows = store.index_bucket_len(&key, &value)?;
-    let source_rows = match src_label {
+    let source_rows = match &src_label {
         Some(l) => store.nodes_with_label(l).len(),
         None => store.live_node_count(),
     };
     if target_rows >= source_rows {
         return None;
     }
-    let want = match want_etypes(store, edge_label) {
-        Ok(w) => w,
-        Err(()) => return None,
-    };
-    let rev = reverse_dir(*dir);
-    // Seed the targets (raw index bucket, any label — the forward path does not
-    // constrain the target's label either), walk reverse edges to the sources, and
-    // keep only sources carrying the scan's label.
-    let targets = store.index_lookup(&key, &value)?;
-    let mut sources = Vec::new();
-    let mut ends = Vec::new();
-    for &t in &targets {
-        for_each_nbr(store, t, rev, &want, false, |a, _| {
-            if src_label.as_deref().is_none_or(|l| store.is_labeled(a, l)) {
-                sources.push(a);
-                ends.push(t);
-            }
-        });
+    // Resolve each hop's edge-type want-set once (an unknown label matches nothing).
+    let mut wants: Vec<Vec<u32>> = Vec::with_capacity(n);
+    for (_, el) in &levels {
+        match want_etypes(store, el) {
+            Ok(w) => wants.push(w),
+            Err(()) => return None,
+        }
     }
-    Some(Batch::of(vec![Col::Nodes(sources), Col::Nodes(ends)]))
+    Some(RevSeed {
+        levels,
+        wants,
+        src_label,
+        key,
+        value,
+    })
 }
 
-/// Parse `Prop{slot 1, key} = Lit(value)` (or its mirror) — a target-slot equality.
-fn target_eq(pred: &Expr) -> Option<(String, Value)> {
+/// Would `plan` reverse-seed? Peeks through the row-preserving wrappers that sit above
+/// the `Filter` (Project) so a blocking op (OrderPage) can pick the reverse-seed over a
+/// forward stream. Cheap — the underlying decision is O(1) index lookups, no walk.
+fn reverse_seed_applies(plan: &Plan, store: &Store, track: bool) -> bool {
+    match plan {
+        Plan::Project { input, .. } => reverse_seed_applies(input, store, track),
+        Plan::Filter { input, pred } => reverse_seed_decide(pred, input, store, track).is_some(),
+        _ => false,
+    }
+}
+
+fn try_reverse_expand(pred: &Expr, input: &Plan, store: &Store, track: bool) -> Option<Batch> {
+    let RevSeed {
+        levels,
+        wants,
+        src_label,
+        key,
+        value,
+    } = reverse_seed_decide(pred, input, store, track)?;
+    let n = levels.len();
+    // Seed the final slot from the index bucket (raw — the forward path does not
+    // constrain the target's label), then walk reverse hop by hop, carrying the whole
+    // row suffix. Each `row` holds the columns already resolved, in forward order
+    // [s_k, …, s_n]; a hop reverse-walks its head and prepends s_{k-1}. Intermediate
+    // nodes are unconstrained (the forward plan filters only the scan's source label),
+    // so the label check lands once, on the last prepend (hop 0 → s_0).
+    let targets = store.index_lookup(&key, &value)?;
+    let mut rows: Vec<Vec<u32>> = targets.iter().map(|&t| vec![t]).collect();
+    for k in (0..n).rev() {
+        let rev = reverse_dir(levels[k].0);
+        let want = &wants[k];
+        let last_hop = k == 0;
+        let mut next: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let head = row[0];
+            for_each_nbr(store, head, rev, want, false, |a, _| {
+                if last_hop && !src_label.as_deref().is_none_or(|l| store.is_labeled(a, l)) {
+                    return;
+                }
+                let mut r = Vec::with_capacity(row.len() + 1);
+                r.push(a);
+                r.extend_from_slice(row);
+                next.push(r);
+            });
+        }
+        rows = next;
+    }
+    // Transpose the rows (each [s_0, …, s_n], width n+1) into n+1 node columns.
+    let width = n + 1;
+    let mut cols: Vec<Vec<u32>> = (0..width).map(|_| Vec::with_capacity(rows.len())).collect();
+    for row in &rows {
+        for (i, &v) in row.iter().enumerate() {
+            cols[i].push(v);
+        }
+    }
+    Some(Batch::of(cols.into_iter().map(Col::Nodes).collect()))
+}
+
+/// Parse `Prop{slot, key} = Lit(value)` (or its mirror) — an equality on the given slot.
+fn target_eq(pred: &Expr, slot: usize) -> Option<(String, Value)> {
     let Expr::Compare {
         op: CompareOp::Eq,
         left,
@@ -4595,8 +4693,9 @@ fn target_eq(pred: &Expr) -> Option<(String, Value)> {
         return None;
     };
     match (left.as_ref(), right.as_ref()) {
-        (Expr::Prop { slot: 1, key }, Expr::Lit(v))
-        | (Expr::Lit(v), Expr::Prop { slot: 1, key }) => {
+        (Expr::Prop { slot: s, key }, Expr::Lit(v)) | (Expr::Lit(v), Expr::Prop { slot: s, key })
+            if *s == slot =>
+        {
             (!v.is_null()).then(|| (key.clone(), v.clone()))
         }
         _ => None,
@@ -15063,6 +15162,119 @@ mod tests {
         let cplan =
             crate::gql::parse("MATCH (a:Person)-[:KNOWS]->() RETURN count(*) AS c").unwrap();
         assert!(matches!(run(&cplan, &store).rows[0][0], Value::Num(x) if x == 3.0));
+    }
+
+    /// A store whose only node named "target" (n0) is reachable by several 2- and
+    /// 3-hop R-paths, plus decoy paths that never reach it. Used to prove the
+    /// multi-hop reverse-seed returns the SAME multiset as the forward walk.
+    fn reverse_seed_store() -> Store {
+        let mut b = Builder::default();
+        let t = b.node(&["N"], &[("name", s("target"))]);
+        let m1 = b.node(&["N"], &[("name", s("m1"))]);
+        let m2 = b.node(&["N"], &[("name", s("m2"))]);
+        let s3 = b.node(&["N"], &[("name", s("s3"))]);
+        let s4 = b.node(&["N"], &[("name", s("s4"))]);
+        let r8 = b.node(&["N"], &[("name", s("r8"))]);
+        let r9 = b.node(&["N"], &[("name", s("r9"))]);
+        // decoy chain that never reaches the target
+        let d0 = b.node(&["N"], &[("name", s("other"))]);
+        let d1 = b.node(&["N"], &[("name", s("d1"))]);
+        let d2 = b.node(&["N"], &[("name", s("d2"))]);
+        b.edge(m1, t, "R");
+        b.edge(m2, t, "R");
+        b.edge(s3, m1, "R");
+        b.edge(s3, m2, "R"); // s3 reaches target two ways (diamond)
+        b.edge(s4, m1, "R");
+        b.edge(r8, s3, "R");
+        b.edge(r9, s4, "R");
+        b.edge(d1, d0, "R"); // decoys
+        b.edge(d2, d1, "R");
+        b.build()
+    }
+
+    /// The multi-hop reverse-seed (an indexed selective endpoint over an Expand chain)
+    /// returns exactly the rows the forward walk does — same multiset, index on or off,
+    /// at two and three hops. Index off ⇒ forward; index on ⇒ seed-and-reverse.
+    #[test]
+    fn reverse_seed_multihop_matches_forward() {
+        let mut st = reverse_seed_store();
+        let two = "MATCH (a)-[:R]->(b)-[:R]->(c) WHERE c.name = 'target' RETURN a.name AS a";
+        let three =
+            "MATCH (a)-[:R]->(b)-[:R]->(c)-[:R]->(d) WHERE d.name = 'target' RETURN a.name AS a";
+        let sorted = |st: &Store, q: &str| {
+            let mut v = names_of(&run(&crate::gql::parse(q).unwrap(), st), 0);
+            v.sort();
+            v
+        };
+
+        // Forward (no index): 2-hop reaches target via m1 (from s3,s4) and m2 (from s3).
+        let fwd2 = sorted(&st, two);
+        assert_eq!(fwd2, vec!["s3", "s3", "s4"]);
+        let fwd3 = sorted(&st, three); // r8→s3→{m1,m2}→t, r9→s4→m1→t
+        assert_eq!(fwd3, vec!["r8", "r8", "r9"]);
+
+        // Index on: the reverse-seed fires and must return the identical multiset.
+        st.create_index("name");
+        assert_eq!(sorted(&st, two), fwd2);
+        assert_eq!(sorted(&st, three), fwd3);
+
+        // count(*) rides the same seed and matches the row count.
+        let cnt = |q: &str| match run(&crate::gql::parse(q).unwrap(), &st).rows[0][0] {
+            Value::Num(x) => x,
+            _ => panic!("count not numeric"),
+        };
+        assert_eq!(
+            cnt("MATCH (a)-[:R]->(b)-[:R]->(c) WHERE c.name = 'target' RETURN count(*) AS c"),
+            3.0
+        );
+        assert_eq!(
+            cnt("MATCH (a)-[:R]->(b)-[:R]->(c)-[:R]->(d) WHERE d.name = 'target' RETURN count(*) AS c"),
+            3.0
+        );
+    }
+
+    /// A keyless `LIMIT` over a reverse-seeded chain (the OrderPage fast path) returns
+    /// the same rows the forward walk + LIMIT does — capped below the result size, and
+    /// unchanged above it — index on or off. Guards against the OrderPage stream path
+    /// silently bypassing the seed.
+    #[test]
+    fn reverse_seed_under_limit_matches_forward() {
+        let mut st = reverse_seed_store();
+        let q = |lim: usize| {
+            format!("MATCH (a)-[:R]->(b)-[:R]->(c) WHERE c.name = 'target' RETURN a.name AS a LIMIT {lim}")
+        };
+        let rows = |st: &Store, lim: usize| run(&crate::gql::parse(&q(lim)).unwrap(), st).rows.len();
+        // Forward (no index): 3 matching rows, so LIMIT 2 caps to 2, LIMIT 10 keeps 3.
+        assert_eq!(rows(&st, 2), 2);
+        assert_eq!(rows(&st, 10), 3);
+        st.create_index("name"); // reverse-seed now fires under the LIMIT
+        assert_eq!(rows(&st, 2), 2);
+        assert_eq!(rows(&st, 10), 3);
+        // Above the result size the full multiset must match the forward walk exactly.
+        let mut got = names_of(&run(&crate::gql::parse(&q(10)).unwrap(), &st), 0);
+        got.sort();
+        assert_eq!(got, vec!["s3", "s3", "s4"]);
+    }
+
+    /// The reverse-seed only fires when the target bucket is smaller than the source
+    /// scan. A non-selective endpoint (every node named "x") must keep the forward
+    /// walk — and either way the rows are identical.
+    #[test]
+    fn reverse_seed_declines_non_selective_endpoint() {
+        let mut b = Builder::default();
+        let ids: Vec<u32> = (0..6).map(|_| b.node(&["N"], &[("name", s("x"))])).collect();
+        for w in ids.windows(2) {
+            b.edge(w[0], w[1], "R");
+        }
+        let mut st = b.build();
+        let q = "MATCH (a)-[:R]->(b)-[:R]->(c) WHERE c.name = 'x' RETURN a.name AS a";
+        let fwd = names_of(&run(&crate::gql::parse(q).unwrap(), &st), 0);
+        st.create_index("name"); // bucket = all 6 nodes >= source, so no flip
+        let idx = names_of(&run(&crate::gql::parse(q).unwrap(), &st), 0);
+        let (mut fwd, mut idx) = (fwd, idx);
+        fwd.sort();
+        idx.sort();
+        assert_eq!(fwd, idx);
     }
 
     /// `r.vf <= X AND r.vt >= Y` fuses to an `IntervalExpand` whose scan fallback now

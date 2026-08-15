@@ -98,6 +98,14 @@ fn engine_fixture(n: u32, deg: u32) -> Store {
     // completing run feasible; the default matches the shipped 1M-row bound.
     let trail = env_u32("FUZZ_TRAIL_LIMIT", 1_000_000);
     st.set_limit(lenke_engine::store::ConfigId::LimitsTrail, u64::from(trail));
+    // FUZZ_INDEX=1 backs the node properties with hash indexes so the planner can seed an
+    // equality on them (and reverse-walk a selective endpoint) — the same indexes the core
+    // fixture gets, so the comparison stays fair. Default: no indexes (the original bench).
+    if env_u32("FUZZ_INDEX", 0) != 0 {
+        for k in ["name", "city", "age", "score"] {
+            st.create_index(k);
+        }
+    }
     st
 }
 
@@ -149,7 +157,13 @@ fn core_fixture(n: u32, deg: u32) -> lenke_core::graph::Graph {
             );
         }
     }
-    lenke_core::ndjson::decode(&s).expect("core load")
+    let mut g = lenke_core::ndjson::decode(&s).expect("core load");
+    if env_u32("FUZZ_INDEX", 0) != 0 {
+        for k in ["name", "city", "age", "score"] {
+            g.create_vertex_index(k);
+        }
+    }
+    g
 }
 
 // --- query generator ---------------------------------------------------------
