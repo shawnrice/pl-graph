@@ -4552,31 +4552,25 @@ fn try_shortest_early_stop(pred: &Expr, input: &Plan, store: &Store, track: bool
     Some(sp_batch.gather(&keep))
 }
 
-/// The cardinality-approved decision for a reverse-seed: the hop chain (innermost-first),
-/// its per-hop edge-type want-sets, the source scan's label, and the seeded endpoint
-/// bucket (the candidate node ids from the index). Produced by [`reverse_seed_decide`],
+/// The cardinality-approved decision for a reverse-seed: the hop chain (innermost-first,
+/// carrying each hop's bind-edge flag), the source scan's label, the endpoint slot the
+/// predicate seeds on, and the seeded endpoint bucket. Produced by [`reverse_seed_decide`],
 /// which materializes the bucket to size the cardinality guard.
-struct RevSeed<'a> {
-    levels: Vec<(Dir, &'a [String])>,
-    wants: Vec<Vec<u32>>,
+struct RevSeed {
+    hops: Vec<RevHop>,
     src_label: Option<String>,
+    ep_slot: usize,
     bucket: Vec<u32>,
 }
 
-fn reverse_seed_decide<'a>(
-    pred: &'a Expr,
-    input: &'a Plan,
-    store: &Store,
-    track: bool,
-) -> Option<RevSeed<'a>> {
+fn reverse_seed_decide(pred: &Expr, input: &Plan, store: &Store, track: bool) -> Option<RevSeed> {
     if track {
         return None; // a path-reading query keeps the forward walk (lineage)
     }
-    // Unwrap a chain of plain expands over a scan: Expand{from:n-1}(…Expand{from:0}(Scan)).
-    // The tree is walked outermost-in, so `chain` collects hops from n-1 down to 0; the
-    // slots they append run 1..=n and the final target lands in slot n. A single expand
-    // (n = 1) is the original 1-hop anchor flip; n > 1 seeds an N-hop selective endpoint.
-    let mut chain: Vec<(usize, Dir, &[String])> = Vec::new();
+    // Unwrap a chain of expands over a scan. A hop may bind its edge (appending an edge
+    // slot before the landed node); `chain` collects them outermost-in as
+    // (from, dir, edge_label, bind_edge).
+    let mut chain: Vec<(usize, Dir, &[String], bool)> = Vec::new();
     let mut cur = input;
     let src_label = loop {
         match cur {
@@ -4585,53 +4579,56 @@ fn reverse_seed_decide<'a>(
                 from,
                 dir,
                 edge_label,
-                bind_edge: false,
+                bind_edge,
                 double_loops: false,
             } => {
-                chain.push((*from, *dir, edge_label.as_slice()));
+                chain.push((*from, *dir, edge_label.as_slice(), *bind_edge));
                 cur = inner.as_ref();
             }
             Plan::Scan { label } if !chain.is_empty() => break label.clone(),
             _ => return None, // source must bottom at an unfiltered scan
         }
     };
-    let n = chain.len();
-    // The outermost expand must feed from slot n-1, the next from n-2, … down to 0 — a
-    // straight chain with no branch or re-entry into an earlier slot.
-    if chain.iter().enumerate().any(|(i, (from, _, _))| *from != n - 1 - i) {
-        return None;
+    // Build the hops innermost-first, verifying each feeds from the running node slot (a
+    // straight chain, no branch/re-entry) and tracking where the endpoint node lands: a
+    // bound hop appends an edge slot then the node (+2), an unbound hop just the node (+1).
+    let mut hops: Vec<RevHop> = Vec::with_capacity(chain.len());
+    let mut node_slot = 0usize;
+    for &(from, dir, edge_label, bind_edge) in chain.iter().rev() {
+        if from != node_slot {
+            return None;
+        }
+        node_slot += if bind_edge { 2 } else { 1 };
+        let want = match want_etypes(store, edge_label) {
+            Ok(w) => w,
+            Err(()) => return None,
+        };
+        hops.push(RevHop {
+            dir,
+            want,
+            bind_edge,
+        });
     }
-    // levels[k] is hop k (feeds slot k, appends slot k+1): innermost-first.
-    let levels: Vec<(Dir, &[String])> = chain.iter().rev().map(|&(_, d, e)| (d, e)).collect();
-    // Seed the endpoint (slot n) from the index — an equality, range, IN, OR, or the more
-    // selective conjunct of an AND; the residual filter (below) exacts the answer.
-    let bucket = seed_bucket(pred, n, store)?;
-    // Cardinality decision: seed the SMALLER side. The forward plan scans every source
-    // and walks the whole fan-out before filtering; reverse seeds the endpoint bucket and
-    // walks back only the paths that actually reach it, so the saving compounds per hop.
-    // Flip only when the endpoint bucket is smaller than the source scan.
+    let ep_slot = node_slot;
+    // Seed the endpoint from the index — an equality, range, IN, OR, or the more selective
+    // conjunct of an AND; the residual filter (below) exacts the answer.
+    let bucket = seed_bucket(pred, ep_slot, store)?;
+    // Cardinality decision: flip only when the endpoint bucket is smaller than the source
+    // scan (the reverse walks back only the paths that reach it).
     let source_rows = match &src_label {
         Some(l) => store.nodes_with_label(l).len(),
         None => store.live_node_count(),
     };
     // Loose for a bare equality (no residual) or a top-level OR (forward eval boxes);
     // tight for a foldable range/IN/AND, which the forward scan handles cheaply.
-    let loose = target_eq(pred, n).is_some() || matches!(pred, Expr::Or(..));
+    let loose = target_eq(pred, ep_slot).is_some() || matches!(pred, Expr::Or(..));
     if !reverse_seed_worth(bucket.len(), source_rows, loose, store) {
         return None;
     }
-    // Resolve each hop's edge-type want-set once (an unknown label matches nothing).
-    let mut wants: Vec<Vec<u32>> = Vec::with_capacity(n);
-    for (_, el) in &levels {
-        match want_etypes(store, el) {
-            Ok(w) => wants.push(w),
-            Err(()) => return None,
-        }
-    }
     Some(RevSeed {
-        levels,
-        wants,
+        hops,
         src_label,
+        ep_slot,
         bucket,
     })
 }
@@ -4666,32 +4663,43 @@ fn reverse_seed_applies(plan: &Plan, store: &Store, track: bool) -> bool {
     }
 }
 
-/// Reverse-walk a chain of hops, prepending each hop's source to every partial row.
-/// `rows` start as suffixes headed by the frontier node (`row[0]`, the node to walk back
-/// from); `levels[k]`/`wants[k]` are hop k innermost-first. Intermediate nodes are
-/// unconstrained (the forward plan filters only the scan's source), so the scan's source
-/// label — when present — is enforced once, on the last prepend (hop 0 → s_0). Returns
-/// the full rows `[s_0, …]`. An empty `levels` returns `rows` unchanged.
+/// A reverse-walk hop: direction, edge-type want-set, and whether the forward hop BOUND
+/// its edge (appending an edge slot before the landed node). Innermost-first.
+struct RevHop {
+    dir: Dir,
+    want: Vec<u32>,
+    bind_edge: bool,
+}
+
+/// Reverse-walk a chain of hops, prepending each hop's source (and, for a bound-edge hop,
+/// its edge) to every partial row. `rows` start as suffixes headed by the frontier node
+/// (`row[0]`, the node to walk back from); a bound hop prepends `[src, edge]` so the row
+/// stays in forward slot order `[…, src, edge, landed, …]` and `row[0]` remains a node.
+/// Intermediate nodes are unconstrained (the forward plan filters only the scan's source),
+/// so the scan's source label is enforced once, on the last prepend (hop 0 → s_0). An
+/// empty `hops` returns `rows` unchanged.
 fn reverse_walk_chain(
     mut rows: Vec<Vec<u32>>,
-    levels: &[(Dir, &[String])],
-    wants: &[Vec<u32>],
+    hops: &[RevHop],
     src_label: Option<&str>,
     store: &Store,
 ) -> Vec<Vec<u32>> {
-    for k in (0..levels.len()).rev() {
-        let rev = reverse_dir(levels[k].0);
-        let want = &wants[k];
+    for k in (0..hops.len()).rev() {
+        let hop = &hops[k];
+        let rev = reverse_dir(hop.dir);
         let last_hop = k == 0;
         let mut next: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
         for row in &rows {
             let head = row[0];
-            for_each_nbr(store, head, rev, want, false, |a, _| {
+            for_each_nbr(store, head, rev, &hop.want, false, |a, eid| {
                 if last_hop && !src_label.is_none_or(|l| store.is_labeled(a, l)) {
                     return;
                 }
-                let mut r = Vec::with_capacity(row.len() + 1);
+                let mut r = Vec::with_capacity(row.len() + if hop.bind_edge { 2 } else { 1 });
                 r.push(a);
+                if hop.bind_edge {
+                    r.push(eid);
+                }
                 r.extend_from_slice(row);
                 next.push(r);
             });
@@ -4701,40 +4709,55 @@ fn reverse_walk_chain(
     rows
 }
 
-/// Transpose equal-width full rows into `width` node columns (a node-only batch).
-fn rows_to_batch(rows: &[Vec<u32>], width: usize) -> Batch {
-    let mut cols: Vec<Vec<u32>> = (0..width).map(|_| Vec::with_capacity(rows.len())).collect();
+/// The per-slot column kinds a reverse-walk of `hops` produces, in forward slot order:
+/// the source node, then each hop's `[edge?, landed node]`. `false` = node, `true` = edge.
+fn chain_slot_kinds(hops: &[RevHop]) -> Vec<bool> {
+    let mut kinds = vec![false]; // slot 0: the source node
+    for hop in hops {
+        if hop.bind_edge {
+            kinds.push(true); // the bound edge slot
+        }
+        kinds.push(false); // the landed node
+    }
+    kinds
+}
+
+/// Transpose full rows into columns typed by `kinds` (`true` = edge slot, else node).
+fn rows_to_batch(rows: &[Vec<u32>], kinds: &[bool]) -> Batch {
+    let mut cols: Vec<Vec<u32>> = (0..kinds.len()).map(|_| Vec::with_capacity(rows.len())).collect();
     for row in rows {
         for (i, &v) in row.iter().enumerate() {
             cols[i].push(v);
         }
     }
-    Batch::of(cols.into_iter().map(Col::Nodes).collect())
+    Batch::of(
+        cols.into_iter()
+            .zip(kinds)
+            .map(|(c, &is_edge)| if is_edge { Col::Edges(c) } else { Col::Nodes(c) })
+            .collect(),
+    )
 }
 
 fn try_reverse_expand(pred: &Expr, input: &Plan, store: &Store, track: bool) -> Option<Batch> {
     let RevSeed {
-        levels,
-        wants,
+        hops,
         src_label,
+        ep_slot,
         bucket,
     } = reverse_seed_decide(pred, input, store, track)?;
-    let n = levels.len();
-    // Reverse-walk the chain from the seeded endpoint bucket to the labeled sources.
+    // Reverse-walk the chain from the seeded endpoint bucket to the labeled sources, then
+    // transpose into node/edge columns matching the forward slot layout.
     let rows = reverse_walk_chain(
         bucket.iter().map(|&t| vec![t]).collect(),
-        &levels,
-        &wants,
+        &hops,
         src_label.as_deref(),
         store,
     );
-    let b = rows_to_batch(&rows, n + 1);
-    // A bare equality is fully satisfied by the seed. A conjunction (`… AND c.age > 30`)
-    // seeded on its equality conjunct still needs the other conjuncts applied — run the
-    // WHOLE predicate over the (small) seeded batch. Re-checking the equality is a cheap
-    // no-op and keeps group_key-vs-equals edge cases identical to the forward filter. If
-    // the residual can't be evaluated cleanly, decline (the forward path handles it).
-    if target_eq(pred, n).is_some() {
+    let b = rows_to_batch(&rows, &chain_slot_kinds(&hops));
+    // A bare equality is fully satisfied by the seed. A conjunction / range / IN / OR — or
+    // a bound-edge chain with an edge-property residual — needs the WHOLE predicate applied
+    // over the (small) seeded batch. If the residual can't evaluate cleanly, decline.
+    if target_eq(pred, ep_slot).is_some() {
         return Some(b);
     }
     let keep = residual_keep(pred, store, &b)?;
@@ -4825,13 +4848,19 @@ fn try_reverse_varlen(pred: &Expr, input: &Plan, store: &Store, track: bool) -> 
     if bucket.len() >= source_rows {
         return None;
     }
-    let fixed_levels: Vec<(Dir, &[String])> = chain.iter().rev().map(|&(_, d, e)| (d, e)).collect();
-    let mut fixed_wants: Vec<Vec<u32>> = Vec::with_capacity(fixed);
-    for (_, el) in &fixed_levels {
-        match want_etypes(store, el) {
-            Ok(w) => fixed_wants.push(w),
+    // The fixed hops are plain (no bound edge), innermost-first — the var-length output is
+    // all nodes, so the reverse-walk over them produces a node-only layout.
+    let mut fixed_hops: Vec<RevHop> = Vec::with_capacity(fixed);
+    for &(_, dir, edge_label) in chain.iter().rev() {
+        let want = match want_etypes(store, edge_label) {
+            Ok(w) => w,
             Err(()) => return None,
-        }
+        };
+        fixed_hops.push(RevHop {
+            dir,
+            want,
+            bind_edge: false,
+        });
     }
     // Walk the var-length in reverse from the endpoint bucket. Decline (forward path) if
     // the reverse walk itself trips the trail guard — a huge-in-degree endpoint.
@@ -4867,8 +4896,8 @@ fn try_reverse_varlen(pred: &Expr, input: &Plan, store: &Store, track: bool) -> 
         })
         .map(|(&b, &c)| vec![b, c])
         .collect();
-    let rows = reverse_walk_chain(rows0, &fixed_levels, &fixed_wants, src_label.as_deref(), store);
-    let out = rows_to_batch(&rows, ep_slot + 1);
+    let rows = reverse_walk_chain(rows0, &fixed_hops, src_label.as_deref(), store);
+    let out = rows_to_batch(&rows, &vec![false; ep_slot + 1]);
     // A bare equality is fully satisfied by the seed; a conjunction needs its other
     // conjuncts applied over the (small) seeded batch.
     if target_eq(pred, ep_slot).is_some() {
@@ -15713,6 +15742,49 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    /// A chain that BINDS an edge (`-[e:R]->`) with an edge-property residual reverse-seeds
+    /// correctly: the reverse-walk must capture each hop's edge and land it in the right
+    /// column, so both the edge residual (`e.w < 100`) and a `RETURN e.w` see the true edge.
+    #[test]
+    fn reverse_bound_edge_matches_forward() {
+        let mut bd = Builder::default();
+        let t = bd.node(&["N"], &[("name", s("target"))]);
+        let m1 = bd.node(&["N"], &[("name", s("m1"))]);
+        let m2 = bd.node(&["N"], &[("name", s("m2"))]);
+        let a1 = bd.node(&["N"], &[("name", s("a1"))]);
+        let a2 = bd.node(&["N"], &[("name", s("a2"))]);
+        bd.edge(m1, t, "R"); // eid 0
+        bd.edge(m2, t, "R"); // eid 1
+        bd.edge(a1, m1, "F"); // eid 2
+        bd.edge(a2, m2, "F"); // eid 3
+        let mut st = bd.build();
+        st.set_edge_prop(0, "w", n(5.0));
+        st.set_edge_prop(1, "w", n(500.0));
+        let names = |st: &Store, q: &str| {
+            let mut v = names_of(&run(&crate::gql::parse(q).unwrap(), st), 0);
+            v.sort();
+            v
+        };
+        // a1→m1-(w5)→target passes `e.w < 100`; a2→m2-(w500) fails.
+        let q = "MATCH (a)-[:F]->(m)-[e:R]->(c) WHERE c.name = 'target' AND e.w < 100 RETURN a.name AS a";
+        assert_eq!(names(&st, q), vec!["a1"]);
+        st.create_index("name");
+        assert_eq!(names(&st, q), vec!["a1"]); // reverse-seed with the edge residual applied
+
+        // The bound-edge column must carry the actual edges (RETURN reads slot 2 = edge).
+        let qe = "MATCH (a)-[:F]->(m)-[e:R]->(c) WHERE c.name = 'target' RETURN e.w AS w";
+        let mut ws: Vec<f64> = run(&crate::gql::parse(qe).unwrap(), &st)
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Num(x) => x,
+                _ => panic!("w not numeric"),
+            })
+            .collect();
+        ws.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(ws, vec![5.0, 500.0]);
     }
 
     /// The generalized seeds — range (`>`), positive `IN`, and `OR` of seedables — each
