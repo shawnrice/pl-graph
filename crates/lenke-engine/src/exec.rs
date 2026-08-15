@@ -1440,13 +1440,10 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             let keep: Vec<usize> = match try_filter_keep(pred, store, &batch) {
                 Some(keep) => keep,
                 None => {
-                    let mask = eval(pred, store, &batch)?;
-                    match &mask {
-                        Col::Bool(bs) => (0..bs.len()).filter(|&i| bs[i]).collect(),
-                        other => (0..other.len())
-                            .filter(|&i| other.value_at(i).is_true())
-                            .collect(),
-                    }
+                    // Complex predicate: vectorized three-valued mask (typed numeric leaves,
+                    // Kleene AND/OR/NOT), keep the rows that evaluate TRUE.
+                    let mask = eval_mask(pred, store, &batch)?;
+                    (0..mask.len()).filter(|&i| mask[i] == Some(true)).collect()
                 }
             };
             batch.gather(&keep)
@@ -4916,13 +4913,8 @@ fn residual_keep(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec<usize>
     if let Some(keep) = try_filter_keep(pred, store, batch) {
         return Some(keep);
     }
-    let mask = eval(pred, store, batch).ok()?;
-    Some(match &mask {
-        Col::Bool(bs) => (0..bs.len()).filter(|&i| bs[i]).collect(),
-        other => (0..other.len())
-            .filter(|&i| other.value_at(i).is_true())
-            .collect(),
-    })
+    let mask = eval_mask(pred, store, batch).ok()?;
+    Some((0..mask.len()).filter(|&i| mask[i] == Some(true)).collect())
 }
 
 /// The candidate endpoint node ids for a seedable predicate on `slot` — a DEDUPED set
@@ -5436,6 +5428,19 @@ fn num_pred(op: CompareOp, x: f64, t: f64) -> bool {
         CompareOp::Le => x <= t,
         CompareOp::Gt => x > t,
         CompareOp::Ge => x >= t,
+    }
+}
+
+/// Byte-lexicographic string comparison — the same order `value::cmp_partial`/`equals`
+/// give two present `Str`/`Dict` values, so a typed leaf matches the boxed `compare`.
+fn str_pred(op: CompareOp, a: &str, b: &str) -> bool {
+    match op {
+        CompareOp::Eq => a == b,
+        CompareOp::Ne => a != b,
+        CompareOp::Lt => a < b,
+        CompareOp::Le => a <= b,
+        CompareOp::Gt => a > b,
+        CompareOp::Ge => a >= b,
     }
 }
 
@@ -15223,6 +15228,178 @@ fn map_bool(col: &Col, f: impl Fn(Option<bool>) -> Option<bool>) -> Col {
     truth_to_col(as_truth(col).into_iter().map(f).collect())
 }
 
+/// A vectorized three-valued predicate mask over `batch` (`Some(true)`/`Some(false)`/
+/// `None` = UNKNOWN). The boolean connectives combine their operands' masks with the SAME
+/// Kleene tables `eval` uses, and a numeric leaf `prop <cmp> lit` reads the typed column
+/// directly instead of boxing two `Value`s per row through `compare`. Any other
+/// sub-expression falls back to the boxed `eval` for that node only, so the result is
+/// exactly `as_truth(eval(expr))` — this removes allocation/boxing on the boolean spine
+/// and the numeric leaves, nothing more. Used by the filter keep-set (a complex predicate
+/// that `try_filter_keep` declines) and the reverse-seed residual.
+fn eval_mask(expr: &Expr, store: &Store, batch: &Batch) -> Result<Vec<Option<bool>>, String> {
+    Ok(match expr {
+        Expr::Not(x) => eval_mask(x, store, batch)?
+            .into_iter()
+            .map(|o| o.map(|b| !b))
+            .collect(),
+        Expr::And(l, r) => {
+            let (a, b) = (eval_mask(l, store, batch)?, eval_mask(r, store, batch)?);
+            let n = a.len().min(b.len());
+            (0..n)
+                .map(|i| match (a[i], b[i]) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                })
+                .collect()
+        }
+        Expr::Or(l, r) => {
+            let (a, b) = (eval_mask(l, store, batch)?, eval_mask(r, store, batch)?);
+            let n = a.len().min(b.len());
+            (0..n)
+                .map(|i| match (a[i], b[i]) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                })
+                .collect()
+        }
+        Expr::Xor(l, r) => {
+            let (a, b) = (eval_mask(l, store, batch)?, eval_mask(r, store, batch)?);
+            let n = a.len().min(b.len());
+            (0..n)
+                .map(|i| match (a[i], b[i]) {
+                    (Some(x), Some(y)) => Some(x != y),
+                    _ => None,
+                })
+                .collect()
+        }
+        Expr::Compare { op, left, right } => {
+            if let Some(m) = typed_num_mask(*op, left, right, store, batch) {
+                m
+            } else if let Some(m) = typed_str_mask(*op, left, right, store, batch) {
+                m
+            } else {
+                as_truth(&eval(expr, store, batch)?)
+            }
+        }
+        _ => as_truth(&eval(expr, store, batch)?),
+    })
+}
+
+/// A numeric leaf `prop <cmp> lit` (or its mirror) over a node/edge frontier → typed mask,
+/// reading the Num column raw. `None` when the leaf is not a Num-column-vs-num-literal. A
+/// present Num cell is always finite (NaN/Inf are stored as NULL), so `num_pred` matches
+/// the boxed `compare`'s three-valued result exactly; an absent cell is UNKNOWN.
+fn typed_num_mask(
+    op: CompareOp,
+    left: &Expr,
+    right: &Expr,
+    store: &Store,
+    batch: &Batch,
+) -> Option<Vec<Option<bool>>> {
+    let (slot, key, op, t) = match (left, right) {
+        (Expr::Prop { slot, key }, Expr::Lit(Value::Num(t))) => (*slot, key, op, *t),
+        (Expr::Lit(Value::Num(t)), Expr::Prop { slot, key }) => (*slot, key, flip_op(op), *t),
+        _ => return None,
+    };
+    match batch.slot(slot) {
+        Col::Nodes(ids) => {
+            let Some(Column::Num { data, present }) = store.column(key) else {
+                return None;
+            };
+            Some(
+                ids.iter()
+                    .map(|&id| {
+                        let i = id as usize;
+                        present[i].then(|| num_pred(op, data[i], t))
+                    })
+                    .collect(),
+            )
+        }
+        Col::Edges(eids) => {
+            let (data, present) = store.edge_num_column(key)?;
+            Some(
+                eids.iter()
+                    .map(|&eid| {
+                        let i = eid as usize;
+                        present[i].then(|| num_pred(op, data[i], t))
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// A string leaf `prop <cmp> lit` (or its mirror) over a node frontier → typed mask,
+/// reading the `Str`/`Dict` column raw (no per-row `Value`). Equality/inequality on a
+/// `Dict` column compares interned codes (code equality ⟺ string equality); ordering and
+/// `Str` columns compare the strings directly. `None` when not a string-column-vs-string-
+/// literal; an absent cell is UNKNOWN. Cross-type (`Str` prop vs non-`Str` lit) returns
+/// `None`, so the boxed `compare` keeps its cross-type semantics.
+fn typed_str_mask(
+    op: CompareOp,
+    left: &Expr,
+    right: &Expr,
+    store: &Store,
+    batch: &Batch,
+) -> Option<Vec<Option<bool>>> {
+    let (slot, key, op, lit) = match (left, right) {
+        (Expr::Prop { slot, key }, Expr::Lit(Value::Str(s))) => (*slot, key, op, s),
+        (Expr::Lit(Value::Str(s)), Expr::Prop { slot, key }) => (*slot, key, flip_op(op), s),
+        _ => return None,
+    };
+    let Col::Nodes(ids) = batch.slot(slot) else {
+        return None;
+    };
+    let lit: &str = lit.as_ref();
+    match store.column(key)? {
+        Column::Str { data, present } => Some(
+            ids.iter()
+                .map(|&id| {
+                    let i = id as usize;
+                    present[i].then(|| str_pred(op, data[i].as_ref(), lit))
+                })
+                .collect(),
+        ),
+        Column::Dict {
+            dict,
+            codes,
+            present,
+        } if matches!(op, CompareOp::Eq | CompareOp::Ne) => {
+            // Code compare: a present cell matches iff its code equals the literal's; a
+            // literal absent from the dict matches nothing (eq→false, ne→true).
+            let lit_code = dict.iter().position(|s| s.as_ref() == lit);
+            let want_eq = matches!(op, CompareOp::Eq);
+            Some(
+                ids.iter()
+                    .map(|&id| {
+                        let i = id as usize;
+                        present[i].then(|| match lit_code {
+                            Some(lc) => (codes[i] as usize == lc) == want_eq,
+                            None => !want_eq,
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        Column::Dict {
+            dict,
+            codes,
+            present,
+        } => Some(
+            ids.iter()
+                .map(|&id| {
+                    let i = id as usize;
+                    present[i].then(|| str_pred(op, dict[codes[i] as usize].as_ref(), lit))
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 fn zip_bool(
     store: &Store,
     batch: &Batch,
@@ -15744,6 +15921,34 @@ mod tests {
                 .rows
                 .len(),
             2
+        );
+    }
+
+    /// The vectorized filter mask (`eval_mask`) keeps three-valued (Kleene) logic exact for
+    /// a complex predicate over a NULL-bearing column: an UNKNOWN row is dropped, `OR` with a
+    /// TRUE is TRUE even when the other side is UNKNOWN, and `NOT UNKNOWN` stays UNKNOWN.
+    #[test]
+    fn eval_mask_three_valued_semantics() {
+        let mut b = Builder::default();
+        b.node(&["N"], &[("age", n(60.0)), ("city", s("oslo"))]); // n0
+        b.node(&["N"], &[("age", n(10.0)), ("city", s("bergen"))]); // n1
+        b.node(&["N"], &[("city", s("oslo"))]); // n2: age absent (null)
+        b.node(&["N"], &[("city", s("bergen"))]); // n3: age absent
+        let st = b.build();
+        let cities = |q: &str| {
+            let mut v = names_of(&run(&crate::gql::parse(q).unwrap(), &st), 0);
+            v.sort();
+            v
+        };
+        // n0 age>50=T; n1 both F; n2 null OR city=T → T; n3 null OR F → null (dropped).
+        assert_eq!(
+            cities("MATCH (n) WHERE (n.age > 50 OR n.city = 'oslo') RETURN n.city AS c"),
+            vec!["oslo", "oslo"]
+        );
+        // NOT of the above: n0 F, n1 T, n2 F, n3 NOT null = null (dropped).
+        assert_eq!(
+            cities("MATCH (n) WHERE NOT (n.age > 50 OR n.city = 'oslo') RETURN n.city AS c"),
+            vec!["bergen"]
         );
     }
 
