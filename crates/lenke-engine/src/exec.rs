@@ -1422,6 +1422,12 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
             if let Some(b) = try_reverse_expand(pred, input, store, track) {
                 return Ok(b);
             }
+            // Same flip for a VAR-LENGTH hop: seed the selective indexed endpoint and walk
+            // the quantified path in reverse, instead of enumerating every forward path
+            // (which trips the trail-limit guard on a fanning graph).
+            if let Some(b) = try_reverse_varlen(pred, input, store, track) {
+                return Ok(b);
+            }
             // Target-aware shortest path: a `= t` on the endpoint bounds the BFS to the
             // target's distance (the outer filter here still runs, so this only skips
             // work the filter would discard).
@@ -4690,6 +4696,100 @@ fn try_reverse_expand(pred: &Expr, input: &Plan, store: &Store, track: bool) -> 
     }
     let keep = residual_keep(pred, store, &b)?;
     Some(b.gather(&keep))
+}
+
+/// The reverse-seed for a VAR-LENGTH hop: `Filter(endpoint.key = lit, VarLength(Scan))`.
+/// The forward walk enumerates every path from every source and filters the endpoint at
+/// the end — on a fanning graph that is the ~34M-path materialization that trips the
+/// trail-limit guard. Instead, seed the selective indexed endpoint and walk the SAME
+/// var-length in REVERSE from the bucket. Reversal preserves every mode's path validity
+/// (Trail = same edge set, Simple/Acyclic = same node set) and there is a bijection
+/// between forward trails `a⇒b` and reverse trails `b⇒a`, so the `(source, endpoint)`
+/// multiset — hence `count(*)` and every projection — is identical.
+///
+/// Reuses `var_length` itself walking `reverse_dir(dir)` from the bucket: its output is
+/// `[bucket(b), ends(a)]`, which we swap to the forward `[a, b]` layout, keep only the
+/// sources carrying the scan's label, then residual-filter by the whole predicate when
+/// the seed came from a conjunction. Plain hops only (no until/body_filter/both-loops,
+/// no path lineage); anything else declines to the forward path.
+fn try_reverse_varlen(pred: &Expr, input: &Plan, store: &Store, track: bool) -> Option<Batch> {
+    if track {
+        return None; // a path-reading query keeps the forward walk (lineage)
+    }
+    let Plan::VarLength {
+        input: src,
+        from: 0,
+        dir,
+        edge_label,
+        min,
+        max,
+        mode,
+        until,
+        body_filter,
+        double_loops,
+    } = input
+    else {
+        return None;
+    };
+    if until.is_some() || body_filter.is_some() || *double_loops {
+        return None; // Gremlin until()/body-filter/both() have no simple reverse
+    }
+    let Plan::Scan { label: src_label } = src.as_ref() else {
+        return None; // source must bottom at an unfiltered scan
+    };
+    // The seed is an indexed equality on the endpoint (slot 1) — `pred` itself, or a
+    // conjunct of it (the rest becomes a residual filter). `seed_equality` needs the index.
+    let (key, value) = seed_equality(pred, 1, store)?;
+    // Cardinality decision: flip only when the endpoint bucket is smaller than the source
+    // scan (the same guard as the fixed-length seed).
+    let target_rows = store.index_bucket_len(&key, &value)?;
+    let source_rows = match src_label {
+        Some(l) => store.nodes_with_label(l).len(),
+        None => store.live_node_count(),
+    };
+    if target_rows >= source_rows {
+        return None;
+    }
+    // Walk the var-length in reverse from the bucket. Decline (fall back to the forward
+    // path) if the reverse walk itself trips the trail guard — a huge-in-degree endpoint.
+    let seed = Batch::of(vec![Col::Nodes(store.index_lookup(&key, &value)?)]);
+    let rev = var_length(
+        &seed,
+        store,
+        0,
+        reverse_dir(*dir),
+        edge_label,
+        *min,
+        *max,
+        *mode,
+        &[],
+        None,
+        1,
+        None,
+        None,
+        false,
+    )
+    .ok()?;
+    // rev is [bucket(b), ends(a)] — swap to forward [a, b], keeping only labeled sources.
+    let (Col::Nodes(bs), Col::Nodes(as_)) = (rev.slot(0), rev.slot(1)) else {
+        return None;
+    };
+    let mut a_col = Vec::with_capacity(as_.len());
+    let mut b_col = Vec::with_capacity(bs.len());
+    for (&a, &b) in as_.iter().zip(bs.iter()) {
+        if src_label.as_deref().is_none_or(|l| store.is_labeled(a, l)) {
+            a_col.push(a);
+            b_col.push(b);
+        }
+    }
+    let out = Batch::of(vec![Col::Nodes(a_col), Col::Nodes(b_col)]);
+    // A bare equality is fully satisfied by the seed; a conjunction needs its other
+    // conjuncts applied over the (small) seeded batch.
+    if target_eq(pred, 1).is_some() {
+        return Some(out);
+    }
+    let keep = residual_keep(pred, store, &out)?;
+    Some(out.gather(&keep))
 }
 
 /// Keep-indices for a residual predicate over an already-materialized (small) batch —
@@ -15295,6 +15395,39 @@ mod tests {
         let mut got = names_of(&run(&crate::gql::parse(&q(10)).unwrap(), &st), 0);
         got.sort();
         assert_eq!(got, vec!["s3", "s3", "s4"]);
+    }
+
+    /// The reverse VAR-LENGTH seed returns the forward walk's exact multiset — including
+    /// duplicate-path multiplicity (s3 reaches the target two ways at length 2). Index
+    /// off ⇒ forward var-length; index on ⇒ seed the endpoint and walk the quantifier
+    /// backward. Covers a low and a high hop window.
+    #[test]
+    fn reverse_varlen_seed_matches_forward() {
+        let mut st = reverse_seed_store();
+        let cases: [(&str, Vec<&str>); 2] = [
+            (
+                "MATCH (a)-[:R]->{1,2}(b) WHERE b.name = 'target' RETURN a.name AS a",
+                vec!["m1", "m2", "s3", "s3", "s4"],
+            ),
+            (
+                "MATCH (a)-[:R]->{2,3}(b) WHERE b.name = 'target' RETURN a.name AS a",
+                vec!["r8", "r8", "r9", "s3", "s3", "s4"],
+            ),
+        ];
+        let sorted = |st: &Store, q: &str| {
+            let mut v = names_of(&run(&crate::gql::parse(q).unwrap(), st), 0);
+            v.sort();
+            v
+        };
+        // Forward (no index) matches the hand-computed multiset.
+        for (q, want) in &cases {
+            assert_eq!(&sorted(&st, q), want, "forward {q}");
+        }
+        // Index on → the reverse var-length seed fires and returns the identical multiset.
+        st.create_index("name");
+        for (q, want) in &cases {
+            assert_eq!(&sorted(&st, q), want, "reverse {q}");
+        }
     }
 
     /// A conjunction seeded on its equality conjunct (`c.name = 'hit' AND c.age > 50`)
