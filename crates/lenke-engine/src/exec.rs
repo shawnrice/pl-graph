@@ -1745,13 +1745,11 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                         && aggs[0].func == AggFn::Count
                         && aggs[0].arg.is_none()
                         && !aggs[0].distinct)
-                        .then(|| {
-                            try_fused_hop_num_count(input, store)
-                                .or_else(|| try_fused_hop_mask_count(input, store))
-                        })
+                        .then(|| try_fused_hop_num_count(input, store))
                         .flatten()
                         .map(|c| scalar_num(c as f64))
                 })
+                .or_else(|| try_fused_hop_mask_agg(input, keys, aggs, store))
                 .or_else(|| try_edge_filtered_count(input, keys, aggs, store))
                 .or_else(|| try_varlen_count(input, keys, aggs, store))
                 .or_else(|| try_edge_cross_count(input, keys, aggs, store))
@@ -6352,15 +6350,34 @@ fn try_fused_hop_num_count(input: &Plan, store: &Store) -> Option<u64> {
     Some(count)
 }
 
-/// Fused `count(*)` over `Filter(<any endpoint-only pred>, Expand(Scan))` — the general
-/// sibling of [`try_fused_hop_num_count`] for a predicate the inline numeric path can't take
-/// (an OR, a mixed-key disjunction, a string search). Sweep the type's edges off the per-type
-/// CSR into just the TARGET-id column, run the SAME vectorized `eval_mask` the materialize
-/// path would, and count the TRUE cells — skipping the `[src, nbr]` batch the general
-/// Aggregate builds AND the keep-gather it then discards for a count. Byte-identical: the mask
-/// is evaluated per (src, nbr) PATH exactly as the materialize filter, present-null dropped.
-/// Declined for a reverse-seedable (selective) endpoint.
-fn try_fused_hop_mask_count(input: &Plan, store: &Store) -> Option<u64> {
+/// Fused scalar aggregate — `count(*)` / `sum` / `min` / `max` — over
+/// `Filter(<any endpoint-only pred>, Expand(Scan))` for a predicate the inline numeric count
+/// can't take (an OR, a mixed-key disjunction, a string search). Sweep the type's edges off
+/// the per-type CSR into just the TARGET-id column, run the SAME vectorized `eval_mask` the
+/// materialize path would, and fold the aggregate over the TRUE cells — skipping the
+/// `[src, nbr]` batch the general Aggregate builds AND the keep-gather it discards. Byte-
+/// identical: the mask is per (src, nbr) PATH exactly as the materialize filter, and the flat
+/// partition is in the SAME (source, out_adj) order the expand emits, so a float `sum` folds in
+/// the identical order. Declined for a reverse-seedable (selective) endpoint.
+fn try_fused_hop_mask_agg(
+    input: &Plan,
+    keys: &[(String, Expr)],
+    aggs: &[Agg],
+    store: &Store,
+) -> Option<Batch> {
+    if !keys.is_empty() || aggs.len() != 1 {
+        return None;
+    }
+    let agg = &aggs[0];
+    if agg.distinct {
+        return None;
+    }
+    // count(*) has no arg; sum/min/max fold a Num property of the frontier (slot 1).
+    let arg_key: Option<&String> = match (&agg.func, agg.arg.as_ref()) {
+        (AggFn::Count, None) => None,
+        (AggFn::Sum | AggFn::Min | AggFn::Max, Some(Expr::Prop { slot: 1, key })) => Some(key),
+        _ => return None,
+    };
     let Plan::Filter { input: exp, pred } = input else {
         return None;
     };
@@ -6381,6 +6398,15 @@ fn try_fused_hop_mask_count(input: &Plan, store: &Store) -> Option<u64> {
     if store.has_multi_label_edges() || !refs_only_slot(pred, 1) {
         return None;
     }
+    // The agg property must be a plain Num column (min/max/sum semantics; a NULL cell is
+    // skipped, matching the general aggregate).
+    let agg_col: Option<(&[f64], &[bool])> = match arg_key {
+        Some(k) => match store.column(k)? {
+            Column::Num { data, present } => Some((data, present)),
+            _ => return None,
+        },
+        None => None,
+    };
     let want = want_etypes(store, edge_label).ok()?;
     let [w] = want.as_slice() else {
         return None;
@@ -6407,8 +6433,53 @@ fn try_fused_hop_mask_count(input: &Plan, store: &Store) -> Option<u64> {
     };
     // Frontier at slot 1; slot 0 is a dummy the endpoint-only predicate never reads.
     let cols = vec![Col::Nodes(vec![0u32; targets.len()]), Col::Nodes(targets)];
-    let mask = eval_mask(pred, store, &Batch::of(cols)).ok()?;
-    Some(mask.iter().filter(|m| **m == Some(true)).count() as u64)
+    let batch = Batch::of(cols);
+    let mask = eval_mask(pred, store, &batch).ok()?;
+    let Col::Nodes(targets) = batch.slot(1) else {
+        return None;
+    };
+    let is_true = |i: usize| mask.get(i) == Some(&Some(true));
+    match (&agg.func, agg_col) {
+        (AggFn::Count, _) => {
+            let c = (0..targets.len()).filter(|&i| is_true(i)).count();
+            Some(scalar_num(c as f64))
+        }
+        (AggFn::Sum, Some((data, present))) => {
+            let mut total = 0f64;
+            for (i, &t) in targets.iter().enumerate() {
+                let j = t as usize;
+                if is_true(i) && present[j] {
+                    total += data[j];
+                }
+            }
+            Some(scalar_num(total))
+        }
+        (AggFn::Min | AggFn::Max, Some((data, present))) => {
+            let want_min = matches!(agg.func, AggFn::Min);
+            let mut best: Option<f64> = None;
+            for (i, &t) in targets.iter().enumerate() {
+                let j = t as usize;
+                if is_true(i) && present[j] {
+                    let x = data[j];
+                    best = Some(match best {
+                        None => x,
+                        Some(b) => {
+                            let ord = value::cmp_num_total(x, b);
+                            if (want_min && ord.is_lt()) || (!want_min && ord.is_gt()) {
+                                x
+                            } else {
+                                b
+                            }
+                        }
+                    });
+                }
+            }
+            Some(Batch::single(Col::Gen(vec![
+                best.map_or(Value::Null, Value::Num),
+            ])))
+        }
+        _ => None,
+    }
 }
 
 /// Count nodes of `label` whose `pred` holds, STREAMING the label bucket with raw
@@ -16982,6 +17053,34 @@ mod tests {
                 ("Str(\"bob\")".into(), "Num(30.0)".into()),
             ]
         );
+    }
+
+    /// The fused mask-aggregate (count/sum/min/max over a complex-predicate typed hop) returns
+    /// the SAME scalar as the general materialize+filter+aggregate path — checked against the
+    /// un-fused plan on the same graph, so any row-order or skip divergence would show.
+    #[test]
+    fn fused_mask_agg_matches_general_aggregate() {
+        let mut b = Builder::default();
+        let src = b.node(&["Person"], &[("name", s("src"))]);
+        // targets with (score, age); the OR (score >= 50 OR age < 5) keeps some, drops others.
+        for (sc, ag) in [(10.0, 3.0), (60.0, 90.0), (55.0, 2.0), (20.0, 40.0), (99.0, 10.0)] {
+            let t = b.node(&["Person"], &[("score", n(sc)), ("age", n(ag))]);
+            b.edge(src, t, "F");
+        }
+        let st = b.build();
+        let scalar = |q: &str| -> f64 {
+            match &run(&crate::gql::parse(q).unwrap(), &st).rows.iter().next().expect("one row")[0]
+            {
+                Value::Num(n) => *n,
+                other => panic!("not a number: {other:?}"),
+            }
+        };
+        // Kept scores: 60(≥50), 55(≥50 & age<5), 99(≥50), 10(age<5) → {60,55,99,10}. 20 dropped.
+        let base = "MATCH (a:Person)-[:F]->(b) WHERE (b.score >= 50 OR b.age < 5)";
+        assert_eq!(scalar(&format!("{base} RETURN count(*) AS c")), 4.0);
+        assert_eq!(scalar(&format!("{base} RETURN sum(b.score) AS v")), 224.0);
+        assert_eq!(scalar(&format!("{base} RETURN max(b.score) AS v")), 99.0);
+        assert_eq!(scalar(&format!("{base} RETURN min(b.score) AS v")), 10.0);
     }
 
     /// A single-type hop over the per-type CSR returns the type's neighbours in the SAME
