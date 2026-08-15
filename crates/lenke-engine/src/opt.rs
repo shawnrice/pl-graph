@@ -188,7 +188,22 @@ fn normalize_pred(e: Expr, input: &Plan) -> Expr {
             // the list makes a non-matching row UNKNOWN exactly as `x = NULL` (→ NULL) does
             // inside the OR. Gated to a small literal list of a cheap needle (so the needle
             // isn't re-evaluated expensively) with at least one element.
-            if let Expr::Lit(crate::value::Value::List(items)) = haystack.as_ref() {
+            // The literal values, from a `Lit(List)` OR an `Expr::List` of literals (the
+            // parser emits the latter for an inline `[20, 39, 107]`; without this the `IN`
+            // stayed boxed in `eval_mask` — a nested `score IN […]` over a hop cost ~75x the
+            // vectorized OR — and never index-seeded).
+            let lits: Option<Vec<crate::value::Value>> = match haystack.as_ref() {
+                Expr::Lit(crate::value::Value::List(items)) => Some(items.clone()),
+                Expr::List { items } => items
+                    .iter()
+                    .map(|it| match it {
+                        Expr::Lit(v) => Some(v.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => None,
+            };
+            if let Some(items) = lits {
                 let simple_needle = matches!(
                     needle.as_ref(),
                     Expr::Prop { .. } | Expr::Slot(_) | Expr::Lit(_)
