@@ -4909,6 +4909,14 @@ fn seed_bucket(pred: &Expr, slot: usize, store: &Store) -> Option<Vec<u32>> {
         return Some(b);
     }
     if let Expr::And(l, r) = pred {
+        // Two range bounds on the SAME key (one lower, one upper) seed their exact
+        // intersection in one BTree walk — `k >= a AND k < b` narrows to [a, b) and a
+        // contradictory pair (a > b) yields the empty set. Without this, each conjunct
+        // seeds independently and we keep the wider single-bound bucket (or, when the
+        // pair is unsatisfiable, materialize a large bucket only to filter it to zero).
+        if let Some(ids) = seed_interval(l, r, slot, store) {
+            return Some(ids);
+        }
         // Seed the more selective conjunct; the residual applies the whole conjunction.
         return match (seed_bucket(l, slot, store), seed_bucket(r, slot, store)) {
             (Some(a), Some(b)) => Some(if a.len() <= b.len() { a } else { b }),
@@ -4917,6 +4925,46 @@ fn seed_bucket(pred: &Expr, slot: usize, store: &Store) -> Option<Vec<u32>> {
         };
     }
     None
+}
+
+/// Two range bounds on the SAME key with OPPOSITE directions (one lower, one upper)
+/// → seed their exact intersection via a two-sided range seek. Byte-identical: the
+/// reverse-seed re-applies the full conjunction as its residual, and the intersection
+/// is exactly the set satisfying both bounds (empty when contradictory). Same-direction
+/// pairs fall through to the generic per-conjunct seed, which already picks the tighter.
+fn seed_interval(l: &Expr, r: &Expr, slot: usize, store: &Store) -> Option<Vec<u32>> {
+    use crate::ir::CompareOp::{Ge, Gt, Le, Lt};
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+    let (kl, ol, vl) = endpoint_range(l, slot)?;
+    let (kr, or, vr) = endpoint_range(r, slot)?;
+    if kl != kr || !store.has_range_index(&kl) {
+        return None;
+    }
+    let side = |op: CompareOp, v: &Value| match op {
+        Gt => Some((true, Excluded(v.clone()))),
+        Ge => Some((true, Included(v.clone()))),
+        Lt => Some((false, Excluded(v.clone()))),
+        Le => Some((false, Included(v.clone()))),
+        _ => None,
+    };
+    let (l_low, lb) = side(ol, &vl)?;
+    let (r_low, rb) = side(or, &vr)?;
+    let (lo, hi) = match (l_low, r_low) {
+        (true, false) => (lb, rb),
+        (false, true) => (rb, lb),
+        _ => return None, // same direction — generic seed picks the tighter conjunct
+    };
+    let lo_ref = match &lo {
+        Included(v) => Included(v),
+        Excluded(v) => Excluded(v),
+        Unbounded => Unbounded,
+    };
+    let hi_ref = match &hi {
+        Included(v) => Included(v),
+        Excluded(v) => Excluded(v),
+        Unbounded => Unbounded,
+    };
+    store.range_between(&kl, lo_ref, hi_ref)
 }
 
 /// Is a reverse-seed over a FIXED-hop chain worth it? The forward count/agg folds during
@@ -16322,6 +16370,55 @@ mod tests {
         st.create_index("age"); // IN over the hash index
         st.create_index("city"); // OR's equality disjunct
         st.create_range_index("age"); // range / OR's range disjunct
+        for (q, want) in &cases {
+            assert_eq!(&sorted(&st, q), want, "seeded {q}");
+        }
+    }
+
+    /// Two range bounds on the SAME key seed their exact intersection via the two-sided
+    /// range seek. A narrow interval keeps only the in-range endpoints, a contradictory
+    /// pair (lo > hi) seeds the empty set, and a same-direction pair falls through to the
+    /// generic per-conjunct seed — all matching the forward walk.
+    #[test]
+    fn reverse_seed_interval_intersection_matches_forward() {
+        let mut b = Builder::default();
+        let e1 = b.node(&["N"], &[("name", s("e1")), ("age", n(95.0))]);
+        let e2 = b.node(&["N"], &[("name", s("e2")), ("age", n(99.0))]);
+        let e3 = b.node(&["N"], &[("name", s("e3")), ("age", n(50.0))]);
+        let s1 = b.node(&["N"], &[("name", s("s1"))]);
+        let s2 = b.node(&["N"], &[("name", s("s2"))]);
+        let s3 = b.node(&["N"], &[("name", s("s3"))]);
+        b.edge(s1, e1, "R");
+        b.edge(s2, e2, "R");
+        b.edge(s3, e1, "R");
+        b.edge(s2, e3, "R"); // e3 (age 50) is reachable but filtered out by every case
+        let mut st = b.build();
+        let cases: [(&str, Vec<&str>); 3] = [
+            // narrow interval [>90, <98] → only e1 (95); e2=99 and e3=50 excluded
+            (
+                "MATCH (a)-[:R]->(b) WHERE (b.age > 90 AND b.age < 98) RETURN a.name AS a",
+                vec!["s1", "s3"],
+            ),
+            // contradictory (>98 AND <90) → empty
+            (
+                "MATCH (a)-[:R]->(b) WHERE (b.age > 98 AND b.age < 90) RETURN a.name AS a",
+                vec![],
+            ),
+            // same direction (>40 AND >60) → e1,e2 (e3=50 fails >60); generic per-conjunct seed
+            (
+                "MATCH (a)-[:R]->(b) WHERE (b.age > 40 AND b.age > 60) RETURN a.name AS a",
+                vec!["s1", "s2", "s3"],
+            ),
+        ];
+        let sorted = |st: &Store, q: &str| {
+            let mut v = names_of(&run(&crate::gql::parse(q).unwrap(), st), 0);
+            v.sort();
+            v
+        };
+        for (q, want) in &cases {
+            assert_eq!(&sorted(&st, q), want, "forward {q}");
+        }
+        st.create_range_index("age");
         for (q, want) in &cases {
             assert_eq!(&sorted(&st, q), want, "seeded {q}");
         }

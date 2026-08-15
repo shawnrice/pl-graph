@@ -2109,6 +2109,53 @@ impl Store {
         )
     }
 
+    /// Two-sided range seek: the ids whose `key` falls in the interval bounded by
+    /// `lo` below and `hi` above. Seeds the exact intersection of two bounds on the
+    /// same key (`k >= a AND k < b`) in one BTree walk. A contradictory or empty
+    /// interval (`a > b`, or a null endpoint — nulls are not range-comparable)
+    /// returns an empty set rather than panicking in `BTreeMap::range`.
+    pub fn range_between(
+        &self,
+        key: &str,
+        lo: std::ops::Bound<&Value>,
+        hi: std::ops::Bound<&Value>,
+    ) -> Option<Vec<u32>> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let ix = self.ranges.iter().find(|i| i.key == key)?;
+        let null_end = |b: std::ops::Bound<&Value>| {
+            matches!(b, Included(v) | Excluded(v) if v.is_null())
+        };
+        if null_end(lo) || null_end(hi) {
+            return Some(Vec::new());
+        }
+        let conv = |b: std::ops::Bound<&Value>| match b {
+            Included(v) => Included(OrdVal(v.clone())),
+            Excluded(v) => Excluded(OrdVal(v.clone())),
+            Unbounded => Unbounded,
+        };
+        let lb = conv(lo);
+        let ub = conv(hi);
+        // Empty-interval guard: BTreeMap::range panics when start > end, or when
+        // start == end with either side excluded.
+        let empty = match (&lb, &ub) {
+            (Included(a), Included(b)) => a > b,
+            (Included(a), Excluded(b))
+            | (Excluded(a), Included(b))
+            | (Excluded(a), Excluded(b)) => a >= b,
+            _ => false,
+        };
+        if empty {
+            return Some(Vec::new());
+        }
+        Some(
+            ix.map
+                .range((lb, ub))
+                .flat_map(|(_, ids)| ids.iter().copied())
+                .filter(|&id| !self.deleted[id as usize])
+                .collect(),
+        )
+    }
+
     /// Remove edge `eid`'s `key` (reads NULL again).
     pub fn remove_edge_prop(&mut self, eid: u32, key: &str) {
         let rec = self.undo.is_some().then(|| Undo::RestoreEdgeCell {
