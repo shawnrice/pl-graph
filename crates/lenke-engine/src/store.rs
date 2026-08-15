@@ -662,6 +662,17 @@ pub struct Store {
     csr_in_off: Vec<u32>,
     csr_in: Vec<Adj>,
     csr_fresh: bool,
+    /// PER-TYPE CSR partition of the adjacency, indexed by etype id: `csr_out_typed[t]`
+    /// is `(off, adj)` where node `v`'s type-`t` OUT edges are `adj[off[v]..off[v+1]]`,
+    /// in the SAME order as they appear in `out_adj[v]` (so a single-type hop iterates a
+    /// contiguous slice byte-identically to the flat scan filtering `etype == t`, but
+    /// touches only the matching edges — a sparse type no longer pays for the dense
+    /// types' degree). Built alongside the flat CSR in `rebuild_csr` and gated by the
+    /// same `csr_fresh`; a stale overlay makes the accessor return `None` and the caller
+    /// falls back to the flat scan. Untyped/disjunction hops keep the flat CSR (its
+    /// out_adj order, which a type-grouped concat would not preserve).
+    csr_out_typed: Vec<(Vec<u32>, Vec<Adj>)>,
+    csr_in_typed: Vec<(Vec<u32>, Vec<Adj>)>,
     /// TYPED READ OVERLAY of the numeric edge properties. `edge_props` (the boxed
     /// eid→Value maps) stays the source of truth for writes / egress / codecs /
     /// rollback; this densifies each HOMOGENEOUSLY-NUMERIC edge key into a raw
@@ -798,7 +809,66 @@ impl Store {
             self.csr_in_off
                 .push(u32::try_from(self.csr_in.len()).expect("edge count exceeds u32"));
         }
+        // Per-type partitions: one (off, adj) per etype id, filled in out_adj/in_adj order.
+        let ntypes = self.etype_ids.len();
+        let build_typed = |adjs: &[Vec<Adj>]| -> Vec<(Vec<u32>, Vec<Adj>)> {
+            let mut typed: Vec<(Vec<u32>, Vec<Adj>)> = (0..ntypes)
+                .map(|_| {
+                    let mut off = Vec::with_capacity(n + 1);
+                    off.push(0u32);
+                    (off, Vec::new())
+                })
+                .collect();
+            for adj in adjs {
+                for a in adj {
+                    if let Some(t) = typed.get_mut(a.etype as usize) {
+                        t.1.push(*a);
+                    }
+                }
+                for t in &mut typed {
+                    t.0.push(u32::try_from(t.1.len()).expect("edge count exceeds u32"));
+                }
+            }
+            typed
+        };
+        self.csr_out_typed = build_typed(&self.out_adj);
+        self.csr_in_typed = build_typed(&self.in_adj);
         self.csr_fresh = true;
+    }
+
+    /// Node `v`'s OUT edges of type `etype`, a contiguous slice in out_adj order — the
+    /// per-type CSR fast path for a single-type hop. `None` when the overlay is stale (the
+    /// caller falls back to the flat scan) or the etype id is unknown.
+    #[inline]
+    #[must_use]
+    pub fn out_typed_csr(&self, v: u32, etype: u32) -> Option<&[Adj]> {
+        if !self.csr_fresh {
+            return None;
+        }
+        let (off, adj) = self.csr_out_typed.get(etype as usize)?;
+        let i = v as usize;
+        if i + 1 < off.len() {
+            Some(&adj[off[i] as usize..off[i + 1] as usize])
+        } else {
+            Some(&[])
+        }
+    }
+
+    /// Node `v`'s IN edges of type `etype`, a contiguous slice in in_adj order. The
+    /// in-side twin of [`out_typed_csr`].
+    #[inline]
+    #[must_use]
+    pub fn in_typed_csr(&self, v: u32, etype: u32) -> Option<&[Adj]> {
+        if !self.csr_fresh {
+            return None;
+        }
+        let (off, adj) = self.csr_in_typed.get(etype as usize)?;
+        let i = v as usize;
+        if i + 1 < off.len() {
+            Some(&adj[off[i] as usize..off[i + 1] as usize])
+        } else {
+            Some(&[])
+        }
     }
 
     /// Drop the CSR overlay (an adjacency write happened); `out`/`inc` fall back to
@@ -2723,6 +2793,8 @@ impl Builder {
             csr_in_off: Vec::new(),
             csr_in: Vec::new(),
             csr_fresh: false,
+            csr_out_typed: Vec::new(),
+            csr_in_typed: Vec::new(),
             edge_num: HashMap::new(),
             edge_num_fresh: false,
         };

@@ -5802,6 +5802,48 @@ fn for_each_nbr(
             }
             return;
         }
+        // Per-type CSR fast path: a single-type hop over a single-label graph iterates ONLY
+        // this node's type-`w` edges (a contiguous slice in out_adj order — byte-identical to
+        // the flat scan filtering `etype == w`), so a sparse type does not pay the dense
+        // types' degree. Available once the CSR overlay is fresh; a stale overlay returns None
+        // and we fall through to the flat scan below.
+        if !store.has_multi_label_edges() {
+            match dir {
+                Dir::Out => {
+                    if let Some(sl) = store.out_typed_csr(v, *w) {
+                        for a in sl {
+                            f(a.nbr, a.eid);
+                        }
+                        return;
+                    }
+                }
+                Dir::In => {
+                    if let Some(sl) = store.in_typed_csr(v, *w) {
+                        for a in sl {
+                            if !(drop_loop && a.nbr == v) {
+                                f(a.nbr, a.eid);
+                            }
+                        }
+                        return;
+                    }
+                }
+                Dir::Both => {
+                    if let (Some(o), Some(i)) =
+                        (store.out_typed_csr(v, *w), store.in_typed_csr(v, *w))
+                    {
+                        for a in o {
+                            f(a.nbr, a.eid);
+                        }
+                        for a in i {
+                            if !(drop_loop && a.nbr == v) {
+                                f(a.nbr, a.eid);
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+        }
     }
     // Empty `want` = any type; otherwise the edge must carry one of the wanted
     // labels. `edge_has_label` checks the primary type (already in `a.etype`) then,
@@ -16564,6 +16606,45 @@ mod tests {
         assert_eq!(c0, vec!["m1", "m2", "t"]);
         assert_eq!(c1, names_of(&batch, 0), "second column replicates the first row-for-row");
         assert_eq!(c0, c1s);
+    }
+
+    /// A single-type hop over the per-type CSR returns the type's neighbours in the SAME
+    /// order (and multiplicity) as the flat scan filtering on the edge type — the byte-identity
+    /// the partition must preserve. Interleaves F and R out-edges from one source.
+    #[test]
+    fn per_type_hop_preserves_flat_scan_order() {
+        let mut b = Builder::default();
+        let src = b.node(&["N"], &[("name", s("src"))]);
+        let f1 = b.node(&["N"], &[("name", s("f1"))]);
+        let r1 = b.node(&["N"], &[("name", s("r1"))]);
+        let f2 = b.node(&["N"], &[("name", s("f2"))]);
+        let r2 = b.node(&["N"], &[("name", s("r2"))]);
+        let f3 = b.node(&["N"], &[("name", s("f3"))]);
+        // Interleave the two types in insertion order: F R F R F.
+        b.edge(src, f1, "F");
+        b.edge(src, r1, "R");
+        b.edge(src, f2, "F");
+        b.edge(src, r2, "R");
+        b.edge(src, f3, "F");
+        let st = b.build();
+        // The F hop must yield f1, f2, f3 in insertion order (ORDER matters — no sort).
+        let names = names_of(
+            &run(
+                &crate::gql::parse("MATCH (a)-[:F]->(b) RETURN b.name AS n").unwrap(),
+                &st,
+            ),
+            0,
+        );
+        assert_eq!(names, vec!["f1", "f2", "f3"]);
+        // And the R hop yields r1, r2 in insertion order.
+        let rnames = names_of(
+            &run(
+                &crate::gql::parse("MATCH (a)-[:R]->(b) RETURN b.name AS n").unwrap(),
+                &st,
+            ),
+            0,
+        );
+        assert_eq!(rnames, vec!["r1", "r2"]);
     }
 
     /// `NOT (col STARTS/ENDS/CONTAINS lit)` over a hop keeps the complement via the raw
