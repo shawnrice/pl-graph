@@ -6269,28 +6269,28 @@ fn try_filtered_count(
     Some(scalar_num(keep.len() as f64))
 }
 
-/// Fused `count(*)` over `Filter(<numeric conj on the frontier>, Expand(Scan))` — the
-/// single-hop analogue of [`try_filtered_count`]'s streaming. Iterate the source label's
-/// bucket, take each source's type-`w` edges from the per-type CSR (only the matching
-/// edges — a sparse type does not pay the dense degree), and test the numeric predicate
-/// INLINE against the neighbour's column, counting per (src, nbr) PATH — no `[src, nbr]`
-/// batch, no keep list, no separate filter pass. Byte-identical: the same typed compare
-/// per path as the materialize path (multiplicity kept, present-null dropped). Declined for
-/// a reverse-seedable (selective) predicate, and only when the per-type CSR is fresh (else
-/// the flat-scan expand+materialize path stays correct).
-fn try_fused_hop_num_count(input: &Plan, store: &Store) -> Option<u64> {
+/// Common gate for the fused single-hop fast paths: `Filter(<pred>, Expand{single-type, Out,
+/// from:0, non-bind}(Scan))` over a single-label graph. Returns the scan label, the endpoint
+/// edge type, the predicate, and the Expand plan (for `reverse_seed_decide`). `None` otherwise.
+fn fused_hop_shape<'a>(
+    input: &'a Plan,
+    store: &Store,
+) -> Option<(&'a Option<String>, u32, &'a Expr, &'a Plan)> {
     let Plan::Filter { input: exp, pred } = input else {
         return None;
     };
     let Plan::Expand {
-        input: scan,
         from: 0,
         dir: Dir::Out,
         edge_label,
         bind_edge: false,
         double_loops: false,
+        ..
     } = exp.as_ref()
     else {
+        return None;
+    };
+    let Plan::Expand { input: scan, .. } = exp.as_ref() else {
         return None;
     };
     let Plan::Scan { label } = scan.as_ref() else {
@@ -6299,60 +6299,72 @@ fn try_fused_hop_num_count(input: &Plan, store: &Store) -> Option<u64> {
     if store.has_multi_label_edges() {
         return None;
     }
-    let (key, bounds) = num_conj_on_slot(pred, 1)?;
-    let Some(Column::Num { data, present }) = store.column(&key) else {
-        return None;
-    };
     // A single wanted etype (the per-type CSR keys on one type; a disjunction reorders).
     let want = want_etypes(store, edge_label).ok()?;
     let [w] = want.as_slice() else {
         return None;
     };
-    let w = *w;
-    // Forward-count cost ≈ the number of type-`w` edges (the flat partition). Only decline to
-    // the reverse-seed when its endpoint bucket is SMALLER than that — i.e. genuinely more
-    // selective. The `reverse_seed_worth` guard prices the reverse walk against the SOURCE
-    // scan (node count), which over-fires for a sparse type: seeding `age >= 77` (92k of 400k)
-    // and walking the sparse F-in edges back cost MORE than sweeping the 80k F edges forward.
-    // Defer to the reverse-seed exactly when it is the cheaper plan — `reverse_seed_decide`
-    // now declines a non-selective range over a sparse type (bucket ≥ ~⅛ the type's forward
-    // edge count), so a `Some` here means the endpoint is genuinely selective.
-    if reverse_seed_decide(pred, exp, store, false).is_some() {
-        return None;
-    }
-    let mut count = 0u64;
-    // When the source set is the WHOLE graph (an unlabelled scan, or a label every live
-    // node carries), every type-`w` edge's source qualifies — so count the type's edges
-    // DIRECTLY off the flat per-type partition (5x fewer than the node count for a sparse
-    // type: core's structure), no per-source offset walk. Byte-identical: each edge is one
-    // (src, nbr) path, exactly once, and every src is in the source set.
+    Some((label, *w, pred, exp.as_ref()))
+}
+
+/// Visit each type-`w` OUT edge's neighbour whose source is in `label`, in expand order — the
+/// flat per-type partition when the source set is the WHOLE graph (an unlabelled scan, or a
+/// label every live node carries; 5x fewer touches than a source walk for a sparse type), else
+/// each labelled source's per-type slice. One call per (src, nbr) PATH, so multiplicity is
+/// preserved. `None` if the per-type CSR overlay is stale (caller falls back to the general
+/// path). Shared by the fused count / aggregate / projection.
+fn for_each_typed_out(
+    store: &Store,
+    label: &Option<String>,
+    w: u32,
+    mut f: impl FnMut(u32),
+) -> Option<()> {
+    let flat = store.out_typed_flat(w)?; // freshness gate
     let universal = match label {
         None => true,
         Some(l) => store.nodes_with_label(l).len() == store.live_node_count(),
     };
     if universal {
-        let flat = store.out_typed_flat(w)?;
         for a in flat {
-            let j = a.nbr as usize;
-            if present[j] && bounds.iter().all(|&(op, t)| num_pred(op, data[j], t)) {
-                count += 1;
-            }
+            f(a.nbr);
         }
-        return Some(count);
-    }
-    // Otherwise walk the labelled sources, taking each one's type-`w` slice. (The overlay is
-    // already known fresh — `out_typed_flat` above returned Some — so the per-source lookups
-    // never spuriously miss.)
-    scan_visit(store, label, |i| {
-        if let Some(sl) = store.out_typed_csr(i as u32, w) {
-            for a in sl {
-                let j = a.nbr as usize;
-                if present[j] && bounds.iter().all(|&(op, t)| num_pred(op, data[j], t)) {
-                    count += 1;
+    } else {
+        scan_visit(store, label, |i| {
+            if let Some(sl) = store.out_typed_csr(i as u32, w) {
+                for a in sl {
+                    f(a.nbr);
                 }
             }
+        });
+    }
+    Some(())
+}
+
+/// Fused `count(*)` over `Filter(<numeric conj on the frontier>, Expand(Scan))` — the
+/// single-hop analogue of [`try_filtered_count`]'s streaming. Sweep the type's edges (per-type
+/// CSR) and test the numeric predicate INLINE against the neighbour's column, counting per
+/// (src, nbr) PATH — no `[src, nbr]` batch, no keep list, no separate filter pass. Byte-
+/// identical: the same typed compare per path as the materialize path (multiplicity kept,
+/// present-null dropped). Declined for a reverse-seedable (selective) predicate — the
+/// `reverse_seed_worth` guard prices the reverse walk against the SOURCE scan (node count),
+/// which over-fires for a sparse type, so `reverse_seed_decide` returning `Some` here means the
+/// endpoint is genuinely more selective than sweeping the type's edges forward.
+fn try_fused_hop_num_count(input: &Plan, store: &Store) -> Option<u64> {
+    let (label, w, pred, exp) = fused_hop_shape(input, store)?;
+    let (key, bounds) = num_conj_on_slot(pred, 1)?;
+    let Some(Column::Num { data, present }) = store.column(&key) else {
+        return None;
+    };
+    if reverse_seed_decide(pred, exp, store, false).is_some() {
+        return None;
+    }
+    let mut count = 0u64;
+    for_each_typed_out(store, label, w, |nbr| {
+        let j = nbr as usize;
+        if present[j] && bounds.iter().all(|&(op, t)| num_pred(op, data[j], t)) {
+            count += 1;
         }
-    });
+    })?;
     Some(count)
 }
 
@@ -6376,62 +6388,26 @@ fn try_fused_hop_project(
     if track || items.is_empty() {
         return None;
     }
-    let Plan::Filter { input: exp, pred } = input else {
-        return None;
-    };
-    let Plan::Expand {
-        input: scan,
-        from: 0,
-        dir: Dir::Out,
-        edge_label,
-        bind_edge: false,
-        double_loops: false,
-    } = exp.as_ref()
-    else {
-        return None;
-    };
-    let Plan::Scan { label } = scan.as_ref() else {
-        return None;
-    };
-    if store.has_multi_label_edges() || !items.iter().all(|(_, e)| refs_only_slot(e, 1)) {
+    let (label, w, pred, exp) = fused_hop_shape(input, store)?;
+    if !items.iter().all(|(_, e)| refs_only_slot(e, 1)) {
         return None;
     }
     let (key, bounds) = num_conj_on_slot(pred, 1)?;
     let Some(Column::Num { data, present }) = store.column(&key) else {
         return None;
     };
-    let want = want_etypes(store, edge_label).ok()?;
-    let [w] = want.as_slice() else {
-        return None;
-    };
-    let w = *w;
     if reverse_seed_decide(pred, exp, store, false).is_some() {
         return None;
     }
-    let keep = |j: usize| present[j] && bounds.iter().all(|&(op, t)| num_pred(op, data[j], t));
-    let flat = store.out_typed_flat(w)?;
-    let universal = match label {
-        None => true,
-        Some(l) => store.nodes_with_label(l).len() == store.live_node_count(),
-    };
+    // Stream the type's edges, collecting just the surviving TARGET ids (output-proportional,
+    // never the `[src, nbr]` intermediate); then evaluate the projection over that frontier.
     let mut survivors: Vec<u32> = Vec::new();
-    if universal {
-        for a in flat {
-            if keep(a.nbr as usize) {
-                survivors.push(a.nbr);
-            }
+    for_each_typed_out(store, label, w, |nbr| {
+        let j = nbr as usize;
+        if present[j] && bounds.iter().all(|&(op, t)| num_pred(op, data[j], t)) {
+            survivors.push(nbr);
         }
-    } else {
-        scan_visit(store, label, |i| {
-            if let Some(sl) = store.out_typed_csr(i as u32, w) {
-                for a in sl {
-                    if keep(a.nbr as usize) {
-                        survivors.push(a.nbr);
-                    }
-                }
-            }
-        });
-    }
+    })?;
     // Evaluate the projection over the survivor frontier (endpoint at slot 1).
     let cols = vec![Col::Nodes(vec![0u32; survivors.len()]), Col::Nodes(survivors)];
     let out = eval_all(items.iter().map(|(_, e)| e), store, &Batch::of(cols)).ok()?;
@@ -6466,24 +6442,8 @@ fn try_fused_hop_mask_agg(
         (AggFn::Sum | AggFn::Min | AggFn::Max, Some(Expr::Prop { slot: 1, key })) => Some(key),
         _ => return None,
     };
-    let Plan::Filter { input: exp, pred } = input else {
-        return None;
-    };
-    let Plan::Expand {
-        input: scan,
-        from: 0,
-        dir: Dir::Out,
-        edge_label,
-        bind_edge: false,
-        double_loops: false,
-    } = exp.as_ref()
-    else {
-        return None;
-    };
-    let Plan::Scan { label } = scan.as_ref() else {
-        return None;
-    };
-    if store.has_multi_label_edges() || !refs_only_slot(pred, 1) {
+    let (label, w, pred, exp) = fused_hop_shape(input, store)?;
+    if !refs_only_slot(pred, 1) {
         return None;
     }
     // The agg property must be a plain Num column (min/max/sum semantics; a NULL cell is
@@ -6495,30 +6455,11 @@ fn try_fused_hop_mask_agg(
         },
         None => None,
     };
-    let want = want_etypes(store, edge_label).ok()?;
-    let [w] = want.as_slice() else {
-        return None;
-    };
-    let w = *w;
     if reverse_seed_decide(pred, exp, store, false).is_some() {
         return None;
     }
-    let flat = store.out_typed_flat(w)?;
-    let universal = match label {
-        None => true,
-        Some(l) => store.nodes_with_label(l).len() == store.live_node_count(),
-    };
-    let targets: Vec<u32> = if universal {
-        flat.iter().map(|a| a.nbr).collect()
-    } else {
-        let mut t = Vec::new();
-        scan_visit(store, label, |i| {
-            if let Some(sl) = store.out_typed_csr(i as u32, w) {
-                t.extend(sl.iter().map(|a| a.nbr));
-            }
-        });
-        t
-    };
+    let mut targets: Vec<u32> = Vec::new();
+    for_each_typed_out(store, label, w, |nbr| targets.push(nbr))?;
     // Frontier at slot 1; slot 0 is a dummy the endpoint-only predicate never reads.
     let cols = vec![Col::Nodes(vec![0u32; targets.len()]), Col::Nodes(targets)];
     let batch = Batch::of(cols);
