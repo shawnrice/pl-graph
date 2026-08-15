@@ -1745,7 +1745,10 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                         && aggs[0].func == AggFn::Count
                         && aggs[0].arg.is_none()
                         && !aggs[0].distinct)
-                        .then(|| try_fused_hop_num_count(input, store))
+                        .then(|| {
+                            try_fused_hop_num_count(input, store)
+                                .or_else(|| try_fused_hop_mask_count(input, store))
+                        })
                         .flatten()
                         .map(|c| scalar_num(c as f64))
                 })
@@ -6347,6 +6350,65 @@ fn try_fused_hop_num_count(input: &Plan, store: &Store) -> Option<u64> {
         }
     });
     Some(count)
+}
+
+/// Fused `count(*)` over `Filter(<any endpoint-only pred>, Expand(Scan))` — the general
+/// sibling of [`try_fused_hop_num_count`] for a predicate the inline numeric path can't take
+/// (an OR, a mixed-key disjunction, a string search). Sweep the type's edges off the per-type
+/// CSR into just the TARGET-id column, run the SAME vectorized `eval_mask` the materialize
+/// path would, and count the TRUE cells — skipping the `[src, nbr]` batch the general
+/// Aggregate builds AND the keep-gather it then discards for a count. Byte-identical: the mask
+/// is evaluated per (src, nbr) PATH exactly as the materialize filter, present-null dropped.
+/// Declined for a reverse-seedable (selective) endpoint.
+fn try_fused_hop_mask_count(input: &Plan, store: &Store) -> Option<u64> {
+    let Plan::Filter { input: exp, pred } = input else {
+        return None;
+    };
+    let Plan::Expand {
+        input: scan,
+        from: 0,
+        dir: Dir::Out,
+        edge_label,
+        bind_edge: false,
+        double_loops: false,
+    } = exp.as_ref()
+    else {
+        return None;
+    };
+    let Plan::Scan { label } = scan.as_ref() else {
+        return None;
+    };
+    if store.has_multi_label_edges() || !refs_only_slot(pred, 1) {
+        return None;
+    }
+    let want = want_etypes(store, edge_label).ok()?;
+    let [w] = want.as_slice() else {
+        return None;
+    };
+    let w = *w;
+    if reverse_seed_decide(pred, exp, store, false).is_some() {
+        return None;
+    }
+    let flat = store.out_typed_flat(w)?;
+    let universal = match label {
+        None => true,
+        Some(l) => store.nodes_with_label(l).len() == store.live_node_count(),
+    };
+    let targets: Vec<u32> = if universal {
+        flat.iter().map(|a| a.nbr).collect()
+    } else {
+        let mut t = Vec::new();
+        scan_visit(store, label, |i| {
+            if let Some(sl) = store.out_typed_csr(i as u32, w) {
+                t.extend(sl.iter().map(|a| a.nbr));
+            }
+        });
+        t
+    };
+    // Frontier at slot 1; slot 0 is a dummy the endpoint-only predicate never reads.
+    let cols = vec![Col::Nodes(vec![0u32; targets.len()]), Col::Nodes(targets)];
+    let mask = eval_mask(pred, store, &Batch::of(cols)).ok()?;
+    Some(mask.iter().filter(|m| **m == Some(true)).count() as u64)
 }
 
 /// Count nodes of `label` whose `pred` holds, STREAMING the label bucket with raw
