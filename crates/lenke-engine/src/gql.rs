@@ -276,6 +276,14 @@ fn agg_fn(name: &str) -> Option<AggFn> {
 
 /// Parse a GQL query into a plan, or an error message.
 pub fn parse(query: &str) -> Result<Plan, String> {
+    parse_with_params(query, &[])
+}
+
+/// Parse a GQL query, substituting each `$name` with the supplied parameter value
+/// at parse time. An unbound `$name` is a parse error. The values are typed, so
+/// they are never spliced into the query text (no injection), and the planner sees
+/// literals (so `WHERE k = $p` / `{k: $p}` still seed an index).
+pub fn parse_with_params(query: &str, params: &[(String, Value)]) -> Result<Plan, String> {
     let toks = lex(query)?;
     let mut p = Parser {
         toks,
@@ -291,6 +299,7 @@ pub fn parse(query: &str) -> Result<Plan, String> {
         path_mode: PathMode::Trail,
         having_aggs: None,
         having_base: 0,
+        params: params.iter().cloned().collect(),
     };
     let mut plan = p.query()?;
     // `<query> UNION [ALL] <query> …`: each arm is an independent query with a fresh
@@ -360,6 +369,8 @@ enum Tok {
     Ident(String),
     Str(String),
     Num(f64),
+    /// A query parameter reference `$name` (the name, without the `$`).
+    Param(String),
 }
 
 fn lex(s: &str) -> Result<Vec<Tok>, String> {
@@ -421,6 +432,20 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             }
             '&' => out.push(Tok::Amp),
             '!' => out.push(Tok::Bang),
+            '$' => {
+                // A query parameter `$name` — the name uses the bare-identifier char set.
+                let start = i + 1;
+                let mut j = start;
+                while j < b.len() && (b[j].is_alphanumeric() || b[j] == '_') {
+                    j += 1;
+                }
+                if j == start {
+                    return Err("expected a parameter name after `$`".into());
+                }
+                out.push(Tok::Param(b[start..j].iter().collect()));
+                i = j;
+                continue;
+            }
             '=' => out.push(Tok::Eq),
             '-' => {
                 if b.get(i + 1) == Some(&'>') {
@@ -640,6 +665,11 @@ struct Parser {
     /// Post-aggregation schema index of the FIRST hoisted HAVING aggregate
     /// (`keys.len() + select_aggs.len()`); the i-th lands at `having_base + i`.
     having_base: usize,
+    /// Query parameters (`$name` → value), supplied by the caller. A `$name` is
+    /// substituted to its `Value` at parse time (see `lookup_param`), so the value
+    /// is typed — never spliced into query text (no injection) — and the planner
+    /// sees a literal (index seeding on `WHERE k = $p` / `{k: $p}` still fires).
+    params: HashMap<String, Value>,
 }
 
 impl Parser {
@@ -1681,6 +1711,10 @@ impl Parser {
     fn usize_lit(&mut self) -> Result<usize, String> {
         match self.bump() {
             Some(Tok::Num(n)) if n >= 0.0 && n.fract() == 0.0 => Ok(n as usize),
+            Some(Tok::Param(name)) => match self.lookup_param(&name)? {
+                Value::Num(n) if n >= 0.0 && n.fract() == 0.0 => Ok(n as usize),
+                _ => Err(format!("parameter `${name}` is not a non-negative integer")),
+            },
             other => Err(format!("expected a non-negative integer, got {other:?}")),
         }
     }
@@ -2099,6 +2133,14 @@ impl Parser {
     // A literal property value: number, string, the keyword true/false/null, or a
     // `[...]` list of literal values (used e.g. by `CALL personalized_pagerank(
     // {sourceNodes: ['a', 'b']})`; a list is a first-class stored property value).
+    /// Resolve a `$name` parameter to its value, or a parse error if unbound.
+    fn lookup_param(&self, name: &str) -> Result<Value, String> {
+        self.params
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("unbound parameter `${name}`"))
+    }
+
     fn literal_value(&mut self) -> Result<Value, String> {
         if self.peek() == Some(&Tok::LBracket) {
             self.bump();
@@ -2124,6 +2166,7 @@ impl Parser {
         match self.bump() {
             Some(Tok::Num(n)) => Ok(Value::Num(n)),
             Some(Tok::Str(s)) => Ok(Value::Str(s.into())),
+            Some(Tok::Param(name)) => self.lookup_param(&name),
             Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("true") => Ok(Value::Bool(true)),
             Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("false") => Ok(Value::Bool(false)),
             Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("null") => Ok(Value::Null),
@@ -4436,6 +4479,13 @@ impl Parser {
                 self.pos += 1;
                 Ok(Expr::Lit(Value::Str(s.into())))
             }
+            Some(Tok::Param(name)) => {
+                // `$name` substitutes to its typed value at parse time; a field chain
+                // may follow (`$rec.k`, `$list[0]`) so route through `field_chain`.
+                self.pos += 1;
+                let v = self.lookup_param(&name)?;
+                self.field_chain(Expr::Lit(v))
+            }
             Some(Tok::Ident(s)) => {
                 self.pos += 1;
                 // keyword literals first
@@ -5516,6 +5566,88 @@ mod tests {
             bag(&run(&parsed, store)),
             bag(&run(hand, store)),
             "parsed plan differs for `{query}`"
+        );
+    }
+
+    /// A `$name` param query returns the SAME rows as the equivalent inlined-literal
+    /// query, across every position params appear (WHERE, inline prop, IN, UNWIND,
+    /// LIMIT). The value is typed, so it is never spliced into the query text.
+    #[test]
+    fn query_params_match_inlined_literals() {
+        let store = social();
+        let same = |pq: &str, params: &[(String, Value)], lit: &str| {
+            let a = bag(&run(&super::parse_with_params(pq, params).unwrap(), &store));
+            let b = bag(&run(&super::parse(lit).unwrap(), &store));
+            assert_eq!(a, b, "`{pq}` vs `{lit}`");
+        };
+        same(
+            "MATCH (n:Person) WHERE n.age = $a RETURN n.name AS x",
+            &[("a".into(), n(30.0))],
+            "MATCH (n:Person) WHERE n.age = 30 RETURN n.name AS x",
+        );
+        same(
+            "MATCH (n:Person {name: $nm}) RETURN n.age AS a",
+            &[("nm".into(), s("alice"))],
+            "MATCH (n:Person {name: 'alice'}) RETURN n.age AS a",
+        );
+        same(
+            "MATCH (n:Person) WHERE n.name IN $names RETURN n.name AS x",
+            &[("names".into(), Value::List(vec![s("alice"), s("carol")]))],
+            "MATCH (n:Person) WHERE n.name IN ['alice', 'carol'] RETURN n.name AS x",
+        );
+        same(
+            "MATCH (n:Person) RETURN n.name AS x ORDER BY n.name LIMIT $k",
+            &[("k".into(), n(2.0))],
+            "MATCH (n:Person) RETURN n.name AS x ORDER BY n.name LIMIT 2",
+        );
+    }
+
+    /// For a scalar / inline-prop param, substitution produces the EXACT same plan as
+    /// inlining the literal — so the param path is byte-identical to the literal path
+    /// by construction, index seeding included. (Compared via derived `Debug`; `Plan`
+    /// is not `PartialEq`.)
+    #[test]
+    fn scalar_param_yields_identical_plan() {
+        let same_plan = |pq: &str, params: &[(String, Value)], lit: &str| {
+            let a = format!("{:?}", super::parse_with_params(pq, params).unwrap());
+            let b = format!("{:?}", super::parse(lit).unwrap());
+            assert_eq!(a, b, "param plan != literal plan for `{pq}`");
+        };
+        same_plan(
+            "MATCH (n:Person) WHERE n.age = $a RETURN n",
+            &[("a".into(), n(30.0))],
+            "MATCH (n:Person) WHERE n.age = 30 RETURN n",
+        );
+        same_plan(
+            "MATCH (n:Person {name: $nm}) RETURN n",
+            &[("nm".into(), s("alice"))],
+            "MATCH (n:Person {name: 'alice'}) RETURN n",
+        );
+    }
+
+    #[test]
+    fn unbound_param_is_a_parse_error() {
+        let err =
+            super::parse_with_params("MATCH (n) WHERE n.k = $missing RETURN n", &[]).unwrap_err();
+        assert!(err.contains("missing"), "unhelpful error: {err}");
+    }
+
+    /// A string param carrying query-like text is a plain VALUE — matched literally,
+    /// never parsed as syntax. This is the safety guarantee: no injection surface.
+    #[test]
+    fn string_param_is_a_value_not_injected_syntax() {
+        let store = social();
+        let rows = bag(&run(
+            &super::parse_with_params(
+                "MATCH (n:Person) WHERE n.name = $nm RETURN n.name AS x",
+                &[("nm".into(), s("alice' OR '1'='1"))],
+            )
+            .unwrap(),
+            &store,
+        ));
+        assert!(
+            rows.is_empty(),
+            "injection-looking string matched: {rows:?}"
         );
     }
 

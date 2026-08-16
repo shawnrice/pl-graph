@@ -221,13 +221,27 @@ empty), `close`, `clone` (deep copy), `config`, `stat` (counts **and version**),
 Every remaining capability returns a specific error — that stub list **is** the
 work-queue to finish before the flip:
 
-- `lnk_query` **params** (`p_len > 0`) — the one big remaining engine feature: the
-  standalone engine has no parameter binding at all (no `Param` in the IR, none in
-  the parser/evaluator), so this needs a real `Param` expr + parse + eval, not a
-  wiring change. Arrow / Arrow-IPC formats (deferred tier).
+- `lnk_query` Arrow / Arrow-IPC formats (deferred tier)
 - `lnk_open` / `lnk_encode` binary-snapshot format (deferred tier; NDJSON covers it)
 - `lnk_command` names (deferred tiers: `algo`, prepared statements, `epoch`,
   `last_write_scope`, `merge`)
+
+### Query params pass (GQL)
+
+`lnk_query` accepts a JSON params object `{"name": value, …}` (`p_ptr`/`p_len`);
+`ndjson::parse_params` decodes it with the stored-value rules (scalars, lists,
+records, temporals). `gql::parse_with_params` substitutes each `$name` to its
+typed `Value` **at parse time** — in `primary()` (expression positions),
+`literal_value()` (the inline-prop seed fast-path `{k: $p}`), and `usize_lit()`
+(`LIMIT`/`SKIP $n`). Because substitution happens before `opt`/`exec`, the value
+is typed (never spliced into query text — the safety win) and the planner sees a
+literal (so `WHERE k = $p` / `{k: $p}` still seed an index — the performance win).
+For a scalar/inline-prop param the produced plan is **byte-identical** to inlining
+the literal (asserted via derived `Debug`); behavioural equality across WHERE / IN
+/ LIMIT is covered too. 4 unit tests, and the full cross-engine corpus +
+conformance suites still pass unchanged. **Gremlin** params are a distinct
+mechanism (bytecode bindings) and remain unsupported — the ffi errors on
+non-empty params for `lang = Gremlin`.
 
 ### Lifecycle pass (clone + version)
 
@@ -238,7 +252,7 @@ every data-mutation primitive (`add_node`, `add_edge`, `set_prop`, `remove_prop`
 `remove_edge_prop`, `delete_edge`, `delete_node`) via `Store::touch`. Version is
 out-of-band metadata (not in any query result, codec, or ordering), so it does not
 affect byte-identity — verified: the full cross-engine corpus + conformance suites
-still pass. Per-token **epoch** takes a name, so it is *not* a `stat` selector; it
+still pass. Per-token **epoch** takes a name, so it is _not_ a `stat` selector; it
 rides `lnk_command "epoch"` (deferred). Covered by 2 `Store` unit tests.
 
 ### Schema pass (`src/schema_op.rs`)
@@ -259,7 +273,7 @@ Still bad-request (no backing `Store` method yet — the schema work still to do
 ### Testing note
 
 The `capi` feature exports the engine's `lnk_*` symbols, which collide with
-`lenke-core`'s identical exports. The engine's *integration* tests dev-depend on
+`lenke-core`'s identical exports. The engine's _integration_ tests dev-depend on
 core, so **do not** combine `--features capi` with them. Run `cargo test -p
 lenke-engine` (no capi) for the cross-engine conformance/corpus suites, and
 `cargo test -p lenke-engine --lib --features capi` for the ffi/schema unit tests.

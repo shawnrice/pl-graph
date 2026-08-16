@@ -455,6 +455,19 @@ pub fn parse_json(text: &str) -> Result<Json, String> {
     parse_line(text)
 }
 
+/// Parse a JSON object of query parameters `{"name": value, …}` into `(name, value)`
+/// pairs. Each value decodes with the same rules as a stored property value (scalars,
+/// lists, records, tagged temporals). A non-object is an error.
+pub fn parse_params(json: &str) -> Result<Vec<(String, Value)>, String> {
+    match parse_json(json)? {
+        Json::Obj(fields) => fields
+            .iter()
+            .map(|(k, v)| Ok((k.clone(), json_value(v)?)))
+            .collect(),
+        _ => Err("query parameters must be a JSON object".into()),
+    }
+}
+
 /// Parse exactly one JSON value from `line` (trailing whitespace allowed).
 fn parse_line(line: &str) -> Result<Json, String> {
     let mut p = JsonParser {

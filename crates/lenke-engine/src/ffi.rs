@@ -263,31 +263,53 @@ pub unsafe extern "C" fn lnk_query(
         crate::ffi_error::set("E_FFI", "null store handle or non-UTF-8 query");
         return std::ptr::null_mut();
     };
-    if !p_ptr.is_null() && p_len > 0 {
-        // TODO: wire query parameters — exec's try_run_* entries are param-free today.
-        crate::ffi_error::set("E_UNIMPLEMENTED", "query parameters are not yet wired");
-        return std::ptr::null_mut();
-    }
     if format != 0 {
         // TODO: Arrow / Arrow-IPC formats (the engine has an `arrow` module; wire it here).
         crate::ffi_error::set("E_UNIMPLEMENTED", "Arrow query formats are not yet wired");
         return std::ptr::null_mut();
     }
+    // Decode the JSON params object (`{"name": value, …}`); null / empty = none.
+    let params = if p_ptr.is_null() || p_len == 0 {
+        Vec::new()
+    } else {
+        let Some(p) = (unsafe { in_str(p_ptr, p_len) }) else {
+            crate::ffi_error::set("E_FFI", "params are not valid UTF-8");
+            return std::ptr::null_mut();
+        };
+        match crate::ndjson::parse_params(p) {
+            Ok(params) => params,
+            Err(e) => {
+                crate::ffi_error::set("E_FFI", &e);
+                return std::ptr::null_mut();
+            }
+        }
+    };
     let result = match lang {
-        0 => match crate::gql::parse(q) {
+        0 => match crate::gql::parse_with_params(q, &params) {
             Ok(plan) => {
                 let plan = crate::opt::optimize_indexed(plan, store);
                 guarded(|| crate::exec::try_run_gql_json(&plan, store))
             }
             Err(e) => Err(e),
         },
-        1 => match crate::gremlin::parse(q) {
-            Ok(plan) => {
-                let plan = crate::opt::optimize_indexed(plan, store);
-                guarded(|| crate::exec::try_run_gremlin_json(&plan, store))
+        1 => {
+            // Gremlin bindings are a distinct mechanism (bytecode bindings); the engine
+            // does not accept parameters on the Gremlin path yet.
+            if !params.is_empty() {
+                crate::ffi_error::set(
+                    "E_UNIMPLEMENTED",
+                    "Gremlin query parameters are not yet supported",
+                );
+                return std::ptr::null_mut();
             }
-            Err(e) => Err(e),
-        },
+            match crate::gremlin::parse(q) {
+                Ok(plan) => {
+                    let plan = crate::opt::optimize_indexed(plan, store);
+                    guarded(|| crate::exec::try_run_gremlin_json(&plan, store))
+                }
+                Err(e) => Err(e),
+            }
+        }
         _ => {
             crate::ffi_error::set("E_FFI", "unknown query language");
             return std::ptr::null_mut();
