@@ -10,12 +10,13 @@
  * the exotic tiers ride `command(name, input)`. The schema-DDL family becomes one
  * `schemaApply(json)` op vocabulary.
  *
- * The serialization codecs (ndjson, binary, and — via the shared `lenke-codec`
- * crate — pg-json, pg-text, graphson, csv) are fully wired. A handful of core
- * methods still have no engine equivalent (type / cardinality / edge constraints,
- * validators, invariants, direct `algo`, prepared-Arrow). Those throw a clear
- * `E_UNSUPPORTED` (or the engine's own "not supported yet" from `schemaApply`),
- * so a conformance run shows the exact gap rather than silently diverging.
+ * The full contract is wired: every serialization codec (ndjson, binary, and —
+ * via the shared `lenke-codec` crate — pg-json, pg-text, graphson, csv); the whole
+ * schema-DDL surface (indexes + drop, vertex/edge unique/required/type,
+ * cardinality, validators, invariants); direct `algo`; and prepared statements
+ * (JSON + Arrow). A failure throws a coded `LenkeError` read from the engine's
+ * out-of-band last-error channel, so callers branch on `error.code` exactly as
+ * with the core backend.
  */
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
@@ -122,6 +123,16 @@ type EngineSchemaLine = {
   keys?: string[];
   key?: string;
   label?: string;
+  etype?: string;
+  type?: string;
+  edgeType?: string;
+  direction?: 'out' | 'in';
+  min?: number;
+  max?: number | null;
+  var?: string;
+  predicate?: string;
+  name?: string;
+  query?: string;
 };
 
 const dumpLines = (bytes: Uint8Array): EngineSchemaLine[] =>
@@ -138,30 +149,103 @@ const indexKeys = (bytes: Uint8Array, on: 'vertex' | 'edge'): string[] =>
     .flatMap((o) => o.keys as string[])
     .sort();
 
-/** Map one engine `{op:…}` line to core's {@link SchemaOp} (dropping ops with no
- * core equivalent, e.g. the engine's opt-in edge-type index). */
-const toSchemaOp = (o: EngineSchemaLine): SchemaOp[] => {
-  if (o.op === 'createIndex') {
-    if (o.on === 'vertex' && o.keys?.[0] !== undefined) {
-      return [{ op: 'createVertexIndex', key: o.keys[0] }];
-    }
-
-    if (o.on === 'edge' && o.kind === 'interval' && o.keys?.length === 2) {
-      return [{ op: 'createEdgeIntervalIndex', loKey: o.keys[0], hiKey: o.keys[1] }];
-    }
-
-    return [];
+// Each engine `{op:…}` family maps to one core SchemaOp (or `[]` when it has no
+// core equivalent — e.g. the engine's opt-in edge-type index). Split per-op so
+// each mapper stays simple.
+const indexOp = (o: EngineSchemaLine): SchemaOp[] => {
+  if (o.on === 'vertex' && o.keys?.[0] !== undefined) {
+    return [{ op: 'createVertexIndex', key: o.keys[0] }];
   }
 
-  if (o.op === 'unique' && o.label !== undefined && o.keys?.[0] !== undefined) {
+  if (o.on === 'edge' && o.kind === 'interval' && o.keys?.length === 2) {
+    return [{ op: 'createEdgeIntervalIndex', loKey: o.keys[0], hiKey: o.keys[1] }];
+  }
+
+  return [];
+};
+
+const uniqueOp = (o: EngineSchemaLine): SchemaOp[] => {
+  if (o.on === 'edge' && o.etype !== undefined && o.keys?.[0] !== undefined) {
+    return [{ op: 'createEdgeUniqueConstraint', edgeType: o.etype, key: o.keys[0] }];
+  }
+
+  if (o.label !== undefined && o.keys?.[0] !== undefined) {
     return [{ op: 'createUniqueConstraint', label: o.label, key: o.keys[0] }];
   }
 
-  if (o.op === 'required' && o.label !== undefined && o.key !== undefined) {
+  return [];
+};
+
+const requiredOp = (o: EngineSchemaLine): SchemaOp[] => {
+  if (o.on === 'edge' && o.etype !== undefined && o.key !== undefined) {
+    return [{ op: 'createEdgeRequiredConstraint', edgeType: o.etype, key: o.key }];
+  }
+
+  if (o.label !== undefined && o.key !== undefined) {
     return [{ op: 'createRequiredConstraint', label: o.label, key: o.key }];
   }
 
   return [];
+};
+
+const typeOp = (o: EngineSchemaLine): SchemaOp[] => {
+  if (o.key === undefined || o.type === undefined) {
+    return [];
+  }
+
+  if (o.on === 'edge' && o.etype !== undefined) {
+    return [
+      { op: 'createEdgeTypeConstraint', edgeType: o.etype, key: o.key, type: o.type } as SchemaOp,
+    ];
+  }
+
+  if (o.label !== undefined) {
+    return [{ op: 'createTypeConstraint', label: o.label, key: o.key, type: o.type } as SchemaOp];
+  }
+
+  return [];
+};
+
+const cardinalityOp = (o: EngineSchemaLine): SchemaOp[] =>
+  o.label !== undefined &&
+  o.edgeType !== undefined &&
+  o.direction !== undefined &&
+  o.min !== undefined
+    ? [
+        {
+          op: 'createCardinalityConstraint',
+          label: o.label,
+          edgeType: o.edgeType,
+          direction: o.direction,
+          min: o.min,
+          max: o.max ?? null,
+        },
+      ]
+    : [];
+
+const validatorOp = (o: EngineSchemaLine): SchemaOp[] =>
+  o.label !== undefined && o.var !== undefined && o.predicate !== undefined
+    ? [{ op: 'createValidator', label: o.label, varName: o.var, predicate: o.predicate }]
+    : [];
+
+const invariantOp = (o: EngineSchemaLine): SchemaOp[] =>
+  o.name !== undefined && o.query !== undefined
+    ? [{ op: 'createInvariant', name: o.name, query: o.query }]
+    : [];
+
+/** Map one engine `{op:…}` schema-dump line to core's {@link SchemaOp}. */
+const toSchemaOp = (o: EngineSchemaLine): SchemaOp[] => {
+  const mapper: Record<string, (o: EngineSchemaLine) => SchemaOp[]> = {
+    createIndex: indexOp,
+    unique: uniqueOp,
+    required: requiredOp,
+    type: typeOp,
+    cardinality: cardinalityOp,
+    validator: validatorOp,
+    invariant: invariantOp,
+  };
+
+  return mapper[o.op]?.(o) ?? [];
 };
 
 /**
@@ -226,7 +310,7 @@ export const buildEngineBackend = (abi: EngineAbi): Backend => {
     createCardinalityConstraint: (handle, label, edgeType, direction, min, max) =>
       abi.schemaApply(
         handle,
-        JSON.stringify({ op: 'cardinality', label, etype: edgeType, direction, min, max }),
+        JSON.stringify({ op: 'cardinality', label, edgeType, direction, min, max }),
       ),
     createValidator: (handle, label, varName, predicate) =>
       abi.schemaApply(handle, JSON.stringify({ op: 'validator', label, var: varName, predicate })),
@@ -259,9 +343,13 @@ export const buildEngineBackend = (abi: EngineAbi): Backend => {
       abi.query(handle, LANG_GQL, query, params ?? null, FMT_ARROW_IPC),
     gremlinJson: (handle, query) => abi.query(handle, LANG_GREMLIN, query, null, FMT_JSON),
 
-    // Algorithms are reachable via GQL `CALL` (the conformant path); there is no
-    // direct algo command on the engine.
-    algo: (_handle, name) => unsupported(`algo('${name}') — run it via a GQL CALL query`),
+    // Run a native algorithm directly (also reachable via a GQL `CALL` query).
+    algo: (handle, name, config) =>
+      abi.command(
+        handle,
+        'algo',
+        JSON.stringify({ name, config: config ? (JSON.parse(config) as unknown) : {} }),
+      ),
 
     encodeNdjson: (handle) => abi.encode(handle, FMT_NDJSON),
     serialize: (handle, format) => {
@@ -330,7 +418,20 @@ export const buildEngineBackend = (abi: EngineAbi): Backend => {
 
       return abi.command(graph, 'prepared_run', payload);
     },
-    preparedQueryArrow: () =>
-      unsupported('preparedQueryArrow (prepared statements return JSON rows)'),
+    preparedQueryArrow: (p, graph, params) => {
+      const handle = prepared.get(p);
+
+      if (handle === undefined) {
+        throw new LenkeError('lenke: prepared statement is not live', { code: ErrorCode.Ffi });
+      }
+
+      const payload = JSON.stringify({
+        handle,
+        format: 'arrow',
+        ...(params ? { params: JSON.parse(params) as unknown } : {}),
+      });
+
+      return abi.command(graph, 'prepared_run', payload);
+    },
   };
 };

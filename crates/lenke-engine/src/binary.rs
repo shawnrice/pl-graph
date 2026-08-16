@@ -24,14 +24,18 @@
 //! through the shared [`crate::ndjson::build_store`], so fidelity matches NDJSON.
 
 use crate::ndjson::{build_store, StagedNdjson};
+use crate::schema_op::SchemaError;
 use crate::store::Store;
 use crate::value::{make_record, Value};
 use std::sync::Arc;
 
 /// Snapshot magic — the first four bytes of every binary snapshot.
 const MAGIC: &[u8; 4] = b"LNKB";
-/// The current binary format version (bump on any layout change).
-const VERSION: u16 = 1;
+/// The current binary format version (bump on any layout change). v2 appends the
+/// type / cardinality / edge-unique / edge-required / validator / invariant
+/// constraint sections after the edges; a v1 file (unique + required only) still
+/// loads.
+const VERSION: u16 = 2;
 
 // ------------------------------------------------------------------- writer ---
 
@@ -42,6 +46,9 @@ struct Writer {
 impl Writer {
     fn new() -> Self {
         Self { buf: Vec::new() }
+    }
+    fn u8(&mut self, v: u8) {
+        self.buf.push(v);
     }
     fn u16(&mut self, v: u16) {
         self.buf.extend_from_slice(&v.to_le_bytes());
@@ -281,6 +288,75 @@ pub fn to_binary(store: &Store) -> Vec<u8> {
             w.value(&store.edge_prop(*eid, k));
         }
     }
+
+    // v2 constraint sections (order: v-type, e-type, e-unique, e-required,
+    // cardinality, validators, invariants). A NOT-NULL type is written as a flag.
+    let write_types = |w: &mut Writer, rules: Vec<(String, String, String, bool)>| {
+        w.u32(rules.len());
+        for (target, key, ty, not_null) in rules {
+            w.str(&target);
+            w.str(&key);
+            w.str(&ty);
+            w.u8(u8::from(not_null));
+        }
+    };
+    let mut v_type = store.type_constraints();
+    v_type.sort();
+    write_types(&mut w, v_type);
+    let mut e_type = store.edge_type_constraints();
+    e_type.sort();
+    write_types(&mut w, e_type);
+
+    let mut e_unique = store.edge_unique_constraints();
+    e_unique.sort();
+    w.u32(e_unique.len());
+    for (etype, keys) in &e_unique {
+        w.str(etype);
+        w.u32(keys.len());
+        for k in keys {
+            w.str(k);
+        }
+    }
+    let mut e_required = store.edge_required_constraints();
+    e_required.sort();
+    w.u32(e_required.len());
+    for (etype, key) in &e_required {
+        w.str(etype);
+        w.str(key);
+    }
+
+    let mut cardinality = store.cardinality_constraints();
+    cardinality.sort();
+    w.u32(cardinality.len());
+    for (label, etype, direction, min, max) in &cardinality {
+        w.str(label);
+        w.str(etype);
+        w.u8(*direction);
+        w.u32(*min as usize);
+        match max {
+            Some(m) => {
+                w.u8(1);
+                w.u32(*m as usize);
+            }
+            None => w.u8(0),
+        }
+    }
+
+    let mut validators = store.validators();
+    validators.sort();
+    w.u32(validators.len());
+    for (target, var, src) in &validators {
+        w.str(target);
+        w.str(var);
+        w.str(src);
+    }
+    let mut invariants = store.invariants();
+    invariants.sort();
+    w.u32(invariants.len());
+    for (name, src) in &invariants {
+        w.str(name);
+        w.str(src);
+    }
     w.buf
 }
 
@@ -292,7 +368,7 @@ pub fn from_binary(bytes: &[u8]) -> Result<Store, String> {
         return Err("binary: bad magic (not a lenke binary snapshot)".into());
     }
     let version = r.u16()?;
-    if version != VERSION {
+    if version != 1 && version != 2 {
         return Err(format!(
             "binary: unsupported snapshot version {version} (this build reads version {VERSION})"
         ));
@@ -327,12 +403,133 @@ pub fn from_binary(bytes: &[u8]) -> Result<Store, String> {
         edges.push((from, to, ext, labels, r.props()?));
     }
 
-    build_store(StagedNdjson {
+    // v2 constraint sections (absent in a v1 file). Read before building so the
+    // reader position is consistent, then apply after the data is loaded (each
+    // re-validates against it — which passes, the snapshot having been valid).
+    let extra = if version >= 2 {
+        Some(read_v2_constraints(&mut r)?)
+    } else {
+        None
+    };
+
+    let mut store = build_store(StagedNdjson {
         constraints,
         required,
         nodes,
         edges,
+    })?;
+    if let Some(x) = extra {
+        x.apply(&mut store)?;
+    }
+    Ok(store)
+}
+
+/// The v2-only constraint sections of a binary snapshot.
+struct V2Constraints {
+    v_type: Vec<(String, String, String, bool)>,
+    e_type: Vec<(String, String, String, bool)>,
+    e_unique: Vec<(String, Vec<String>)>,
+    e_required: Vec<(String, String)>,
+    cardinality: Vec<(String, String, u8, u32, Option<u32>)>,
+    validators: Vec<(String, String, String)>,
+    invariants: Vec<(String, String)>,
+}
+
+fn read_v2_constraints(r: &mut Reader) -> Result<V2Constraints, String> {
+    let read_types = |r: &mut Reader| -> Result<Vec<(String, String, String, bool)>, String> {
+        let n = r.count()?;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push((r.str()?, r.str()?, r.str()?, r.u8()? != 0));
+        }
+        Ok(out)
+    };
+    let v_type = read_types(r)?;
+    let e_type = read_types(r)?;
+
+    let n = r.count()?;
+    let mut e_unique = Vec::with_capacity(n);
+    for _ in 0..n {
+        e_unique.push((r.str()?, r.str_list()?));
+    }
+    let n = r.count()?;
+    let mut e_required = Vec::with_capacity(n);
+    for _ in 0..n {
+        e_required.push((r.str()?, r.str()?));
+    }
+    let n = r.count()?;
+    let mut cardinality = Vec::with_capacity(n);
+    for _ in 0..n {
+        let label = r.str()?;
+        let etype = r.str()?;
+        let direction = r.u8()?;
+        let min = r.count()? as u32;
+        let max = if r.u8()? != 0 {
+            Some(r.count()? as u32)
+        } else {
+            None
+        };
+        cardinality.push((label, etype, direction, min, max));
+    }
+    let n = r.count()?;
+    let mut validators = Vec::with_capacity(n);
+    for _ in 0..n {
+        validators.push((r.str()?, r.str()?, r.str()?));
+    }
+    let n = r.count()?;
+    let mut invariants = Vec::with_capacity(n);
+    for _ in 0..n {
+        invariants.push((r.str()?, r.str()?));
+    }
+    Ok(V2Constraints {
+        v_type,
+        e_type,
+        e_unique,
+        e_required,
+        cardinality,
+        validators,
+        invariants,
     })
+}
+
+impl V2Constraints {
+    /// Re-declare every section on a freshly-loaded store (data already present).
+    fn apply(self, store: &mut Store) -> Result<(), String> {
+        for (target, key, ty, not_null) in &self.v_type {
+            let spec = if *not_null {
+                format!("{ty} NOT NULL")
+            } else {
+                ty.clone()
+            };
+            store.create_type_constraint(target, key, &spec, false)?;
+        }
+        for (target, key, ty, not_null) in &self.e_type {
+            let spec = if *not_null {
+                format!("{ty} NOT NULL")
+            } else {
+                ty.clone()
+            };
+            store.create_type_constraint(target, key, &spec, true)?;
+        }
+        for (etype, keys) in &self.e_unique {
+            let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            store.create_edge_unique_constraint(etype, &refs)?;
+        }
+        for (etype, key) in &self.e_required {
+            store.create_edge_required_constraint(etype, key)?;
+        }
+        for (label, etype, direction, min, max) in &self.cardinality {
+            store.create_cardinality_constraint(label, etype, *direction, *min, *max)?;
+        }
+        for (target, var, src) in &self.validators {
+            crate::exec::declare_validator(store, target, var, src)
+                .map_err(SchemaError::message)?;
+        }
+        for (name, src) in &self.invariants {
+            crate::exec::declare_invariant(store, name, src).map_err(SchemaError::message)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -368,6 +565,46 @@ mod tests {
         let back = from_binary(&to_binary(&st)).unwrap();
         assert_eq!(back.node_count(), 0);
         assert_eq!(back.edge_count(), 0);
+    }
+
+    #[test]
+    fn all_constraint_kinds_round_trip() {
+        // Build a graph and declare every constraint kind, then binary round-trip.
+        let mut st = from_ndjson(
+            "{\"id\":\"1\",\"labels\":[\"P\"],\"props\":{\"email\":\"a@x\",\"age\":30}}\n\
+             {\"id\":\"2\",\"labels\":[\"P\"],\"props\":{\"email\":\"b@x\",\"age\":25}}\n\
+             {\"from\":\"1\",\"to\":\"2\",\"id\":\"e0\",\"type\":\"KNOWS\",\"props\":{\"since\":2020}}\n",
+        )
+        .unwrap();
+        st.create_unique_constraint("P", &["email"]).unwrap();
+        st.create_required_constraint("P", "email").unwrap();
+        st.create_type_constraint("P", "age", "number", false)
+            .unwrap();
+        st.create_edge_unique_constraint("KNOWS", &["since"])
+            .unwrap();
+        st.create_edge_required_constraint("KNOWS", "since")
+            .unwrap();
+        st.create_type_constraint("KNOWS", "since", "number", true)
+            .unwrap();
+        st.create_cardinality_constraint("P", "KNOWS", 0, 0, Some(5))
+            .unwrap();
+        crate::exec::declare_validator(&mut st, "P", "p", "p.age >= 0").unwrap();
+        crate::exec::declare_invariant(&mut st, "nonneg", "MATCH (p:P) RETURN p.age >= 0").unwrap();
+
+        let back = from_binary(&to_binary(&st)).unwrap();
+        assert_eq!(to_ndjson(&back), to_ndjson(&st));
+        assert_eq!(back.unique_constraints(), st.unique_constraints());
+        assert_eq!(back.required_constraints(), st.required_constraints());
+        assert_eq!(back.type_constraints(), st.type_constraints());
+        assert_eq!(back.edge_type_constraints(), st.edge_type_constraints());
+        assert_eq!(back.edge_unique_constraints(), st.edge_unique_constraints());
+        assert_eq!(
+            back.edge_required_constraints(),
+            st.edge_required_constraints()
+        );
+        assert_eq!(back.cardinality_constraints(), st.cardinality_constraints());
+        assert_eq!(back.validators(), st.validators());
+        assert_eq!(back.invariants(), st.invariants());
     }
 
     #[test]

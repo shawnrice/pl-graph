@@ -112,10 +112,12 @@ fn parse_handle_field(fields: &[(String, crate::ndjson::Json)]) -> Result<u64, S
         .map_err(|_| format!("invalid prepared handle `{s}`"))
 }
 
-/// Parse a `prepared_run` payload `{"handle":"<h>", "params":{…}}`.
-fn prepared_payload(
-    input: Option<&str>,
-) -> Result<(u64, Vec<(String, crate::value::Value)>), String> {
+/// A decoded `prepared_run` payload: the handle, its params, and the output format.
+type PreparedRun = (u64, Vec<(String, crate::value::Value)>, String);
+
+/// Parse a `prepared_run` payload `{"handle":"<h>", "params":{…}, "format":"…"}`.
+/// `format` is `json` (default), `arrow`, or `arrow_ipc`.
+fn prepared_payload(input: Option<&str>) -> Result<PreparedRun, String> {
     let text = input.ok_or("prepared_run requires a {handle, params} JSON payload")?;
     let crate::ndjson::Json::Obj(fields) = crate::ndjson::parse_json(text)? else {
         return Err("prepared_run payload must be a JSON object".into());
@@ -125,7 +127,61 @@ fn prepared_payload(
         Some(p) => crate::ndjson::params_from_obj(p)?,
         None => Vec::new(),
     };
-    Ok((handle, params))
+    let format = match crate::ndjson::field(&fields, "format") {
+        Some(f) => crate::ndjson::json_string(f)?,
+        None => "json".to_string(),
+    };
+    Ok((handle, params, format))
+}
+
+/// Run the `algo` command: validate the config, run the procedure, optionally
+/// write each result to `writeProperty`, and render the `{columns, rows}` JSON.
+fn run_algo_command(
+    store: &mut Store,
+    fields: &[(String, crate::ndjson::Json)],
+) -> Result<String, String> {
+    let name = crate::ndjson::json_string(crate::ndjson::req(fields, "name")?)?;
+    let config = match crate::ndjson::field(fields, "config") {
+        Some(o) => crate::ndjson::params_from_obj(o)?,
+        None => Vec::new(),
+    };
+    crate::algo::validate_config(&config)?;
+    let column = crate::algo::procedure_result_col(&name)
+        .ok_or_else(|| format!("unknown algorithm `{name}`"))?;
+    let results = crate::algo::run_procedure(store, &name, &config)
+        .ok_or_else(|| format!("algorithm `{name}` rejected its config"))?;
+
+    // A `writeProperty` writes each result back to that node property (as core does).
+    let write_prop = config.iter().find_map(|(k, v)| {
+        if k == "writeProperty" {
+            if let crate::value::Value::Str(s) = v {
+                return Some(s.to_string());
+            }
+        }
+        None
+    });
+    if let Some(prop) = &write_prop {
+        for (node, val) in &results {
+            store.set_prop(*node, prop, val.clone());
+        }
+    }
+
+    let mut out = String::with_capacity(results.len() * 24 + 32);
+    out.push_str("{\"columns\":[\"node\",");
+    crate::ndjson::encode_string(&mut out, column);
+    out.push_str("],\"rows\":[");
+    for (i, (node, val)) in results.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('[');
+        crate::ndjson::encode_string(&mut out, &store.node_ext_id(*node).unwrap_or_default());
+        out.push(',');
+        crate::ndjson::encode_value(&mut out, val);
+        out.push(']');
+    }
+    out.push_str("]}");
+    Ok(out)
 }
 
 /// Parse a `prepared_free` payload `{"handle":"<h>"}`.
@@ -749,7 +805,7 @@ pub unsafe extern "C" fn lnk_command(
             // Input: {"handle":"<ptr>", "params":{...}}. Clone the cached plan, bind
             // the params, optimize + run against this store (the plan is graph-agnostic,
             // so one prepared statement serves any store).
-            let (handle, params) = match prepared_payload(input) {
+            let (handle, params, format) = match prepared_payload(input) {
                 Ok(hp) => hp,
                 Err(e) => {
                     crate::ffi_error::set("E_FFI", &e);
@@ -767,13 +823,32 @@ pub unsafe extern "C" fn lnk_command(
                 return std::ptr::null_mut();
             }
             let plan = crate::opt::optimize_indexed(plan, store);
-            match guarded(|| crate::exec::try_run_gql_json(&plan, store)) {
-                // SAFETY: out_len is writable per this fn's contract.
-                Ok(json) => unsafe { out_string(json, out_len) },
-                Err(e) => {
-                    set_exec_error(&e);
-                    std::ptr::null_mut()
-                }
+            // JSON rows (default) or an Arrow carrier (raw ARW1 / IPC), so a prepared
+            // statement has the same output surface as `lnk_query`.
+            match format.as_str() {
+                "arrow" | "arrow_ipc" => match guarded(|| crate::exec::try_run(&plan, store)) {
+                    Ok(rows) => {
+                        let bytes = if format == "arrow_ipc" {
+                            crate::arrow::to_arrow_ipc(&rows, true)
+                        } else {
+                            crate::arrow::to_arrow(&rows)
+                        };
+                        // SAFETY: out_len is writable per this fn's contract.
+                        unsafe { out_bytes(bytes, out_len) }
+                    }
+                    Err(e) => {
+                        set_exec_error(&e);
+                        std::ptr::null_mut()
+                    }
+                },
+                _ => match guarded(|| crate::exec::try_run_gql_json(&plan, store)) {
+                    // SAFETY: out_len is writable per this fn's contract.
+                    Ok(json) => unsafe { out_string(json, out_len) },
+                    Err(e) => {
+                        set_exec_error(&e);
+                        std::ptr::null_mut()
+                    }
+                },
             }
         }
         "prepared_free" => {
@@ -793,14 +868,34 @@ pub unsafe extern "C" fn lnk_command(
             // SAFETY: out_len is writable per this fn's contract.
             unsafe { out_string("{}".to_string(), out_len) }
         }
-        // Algorithms are reachable through the conformant GQL path already, so the
-        // direct command is a redundant fast-path we have not needed.
+        // Run a native graph algorithm directly (also reachable via GQL `CALL`).
+        // Input `{"name": "<algo>", "config": {…}}`; output a
+        // `{"columns":["node","<result>"],"rows":[["<ext id>", value], …]}` row set
+        // (same shape as core's `lnk_algo`). A `writeProperty` in the config writes
+        // each result back to that node property.
         "algo" => {
-            crate::ffi_error::set(
-                "E_UNSUPPORTED",
-                "run algorithms via GQL: lnk_query(GQL, \"CALL <name>(...) YIELD ...\")",
-            );
-            std::ptr::null_mut()
+            let Some(text) = input else {
+                crate::ffi_error::set("E_FFI", "algo requires a {name, config} JSON payload");
+                return std::ptr::null_mut();
+            };
+            let fields = match crate::ndjson::parse_json(text) {
+                Ok(crate::ndjson::Json::Obj(f)) => f,
+                Ok(_) => {
+                    crate::ffi_error::set("E_FFI", "algo payload must be a JSON object");
+                    return std::ptr::null_mut();
+                }
+                Err(e) => {
+                    crate::ffi_error::set("E_INVALID_JSON", &e);
+                    return std::ptr::null_mut();
+                }
+            };
+            match run_algo_command(store, &fields) {
+                Ok(json) => unsafe { out_string(json, out_len) },
+                Err(e) => {
+                    crate::ffi_error::set("E_INVALID_VALUE", &e);
+                    std::ptr::null_mut()
+                }
+            }
         }
         // Remaining exotic tiers (prepared statements, epoch, merge, binary snapshot)
         // are not yet built in the engine — each fills an arm here, never a new symbol.

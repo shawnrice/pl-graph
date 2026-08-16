@@ -14,11 +14,12 @@
 //! { "op": "required", "on": "vertex", "label": "Person", "key": "name" }
 //! ```
 //!
-//! [`dump`] emits the same vocabulary for the constraints it can introspect, so a
-//! `dump` → `apply` round-trip reconstructs them. Ops the engine's `Store` does
-//! not implement yet (`dropIndex`, `type`/`cardinality`/`validator`/`invariant`,
-//! and edge unique/required) are reported as [`SchemaError::BadRequest`] rather
-//! than silently ignored — that error list is the schema work still to do.
+//! The full vocabulary is supported: `createIndex`/`dropIndex`, vertex + edge
+//! `unique`/`required`/`type`, `cardinality`, `validator`, and `invariant`.
+//! Validator/invariant ops need the query evaluator, so the C ABI routes schema
+//! application through [`crate::exec::apply_schema_op`] (which handles those two
+//! and delegates the rest here). [`dump`] emits the same vocabulary, so a `dump` →
+//! `apply` round-trip reconstructs the whole schema.
 
 use crate::ndjson::{self, Json};
 use crate::store::Store;
@@ -40,6 +41,21 @@ pub enum SchemaError {
     Syntax(String),
     /// A graph-op that can't run (e.g. dropping an index that backs a constraint).
     GraphOp(String),
+}
+
+impl SchemaError {
+    /// The human message, dropping the variant tag — for a caller (e.g. the binary
+    /// loader) that surfaces schema failures over a plain `Result<_, String>`.
+    #[must_use]
+    pub fn message(self) -> String {
+        match self {
+            Self::BadRequest(m)
+            | Self::Rejected(m)
+            | Self::Invalid(m)
+            | Self::Syntax(m)
+            | Self::GraphOp(m) => m,
+        }
+    }
 }
 
 /// Map a store-layer error (which prefixes its message with a wire code) to the

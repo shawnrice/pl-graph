@@ -764,10 +764,22 @@ fn declare_validator_op(
     store: &mut Store,
     fields: &[(String, crate::ndjson::Json)],
 ) -> Result<(), crate::schema_op::SchemaError> {
-    use crate::schema_op::SchemaError;
     let target = schema_str(fields, "label")?;
     let var = schema_str(fields, "var")?;
     let pred = schema_str(fields, "predicate")?;
+    declare_validator(store, &target, &var, &pred)
+}
+
+/// Declare a validator: compose + parse the vertex/edge check queries, verify the
+/// current data conforms, then store the rule. Shared by the schema-op path and
+/// the binary-snapshot reload.
+pub(crate) fn declare_validator(
+    store: &mut Store,
+    target: &str,
+    var: &str,
+    pred: &str,
+) -> Result<(), crate::schema_op::SchemaError> {
+    use crate::schema_op::SchemaError;
     let vq = format!("MATCH ({var}:{target}) WHERE NOT ({pred}) RETURN {var} LIMIT 1");
     let eq = format!("MATCH ()-[{var}:{target}]->() WHERE NOT ({pred}) RETURN {var} LIMIT 1");
     let vplan = crate::gql::parse(&vq).map_err(SchemaError::Syntax)?;
@@ -783,7 +795,7 @@ fn declare_validator_op(
             ));
         }
     }
-    store.declare_validator(&target, &var, &pred, vec![vplan, eplan]);
+    store.declare_validator(target, var, pred, vec![vplan, eplan]);
     Ok(())
 }
 
@@ -791,16 +803,26 @@ fn declare_invariant_op(
     store: &mut Store,
     fields: &[(String, crate::ndjson::Json)],
 ) -> Result<(), crate::schema_op::SchemaError> {
-    use crate::schema_op::SchemaError;
     let name = schema_str(fields, "name")?;
     let query = schema_str(fields, "query")?;
-    let plan = crate::gql::parse(&query).map_err(SchemaError::Syntax)?;
+    declare_invariant(store, &name, &query)
+}
+
+/// Declare an invariant: parse the query, verify the current data holds, then
+/// store it. Shared by the schema-op path and the binary-snapshot reload.
+pub(crate) fn declare_invariant(
+    store: &mut Store,
+    name: &str,
+    query: &str,
+) -> Result<(), crate::schema_op::SchemaError> {
+    use crate::schema_op::SchemaError;
+    let plan = crate::gql::parse(query).map_err(SchemaError::Syntax)?;
     if rows_have_false(&try_run(&plan, store).map_err(SchemaError::Rejected)?) {
         return Err(SchemaError::Rejected(format!(
             "existing data already violates the invariant '{name}'"
         )));
     }
-    store.declare_invariant(&name, &query, plan);
+    store.declare_invariant(name, query, plan);
     Ok(())
 }
 

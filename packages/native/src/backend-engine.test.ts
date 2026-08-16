@@ -136,10 +136,65 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
       be.graphFree(g);
     });
 
-    test('unsupported methods throw E_UNSUPPORTED', async () => {
+    test('constraints enforce and reject on write (type / cardinality / validator / invariant)', async () => {
       const be = await make();
       const g = be.graphFromNdjson(NDJSON, false);
-      expect(() => be.createValidator(g, 'P', 'p', 'p.age >= 0')).toThrow();
+      // Each declaration succeeds against the conforming seed data.
+      be.createTypeConstraint(g, 'P', 'age', 'number');
+      be.createValidator(g, 'P', 'p', 'p.age >= 0');
+      be.createInvariant(g, 'nonneg', 'MATCH (p:P) RETURN p.age >= 0');
+      // A conforming insert passes; a violating one throws ConstraintViolation.
+      be.queryRows(g, "INSERT (:P {name: 'c', age: 40})");
+      const bad = () => be.queryRows(g, "INSERT (:P {name: 'd', age: -1})");
+      expect(bad).toThrow();
+
+      try {
+        bad();
+      } catch (e) {
+        expect(hasErrorCode(e, ErrorCode.ConstraintViolation)).toBe(true);
+      }
+
+      // A wrong-typed value is a ConstraintViolation too.
+      expect(() => be.queryRows(g, "INSERT (:P {name: 'e', age: 'old'})")).toThrow();
+      be.graphFree(g);
+    });
+
+    test('dropIndex, edge constraints, and dumpSchema round-trip', async () => {
+      const be = await make();
+      const g = be.graphFromNdjson(NDJSON, false);
+      be.createIndex(g, 'vertex', 'hash', ['age']);
+      expect(be.vertexIndexes(g)).toContain('age');
+      be.dropVertexIndex(g, 'age');
+      expect(be.vertexIndexes(g)).not.toContain('age');
+      // Edge unique exempts null, so it declares cleanly over the propless seed edge.
+      be.createEdgeUniqueConstraint(g, 'KNOWS', 'w');
+      be.createCardinalityConstraint(g, 'P', 'KNOWS', 'out', 0, null);
+      // The declared schema round-trips through dumpSchema.
+      const ops = be.dumpSchema(g).map((o) => o.op);
+      expect(ops).toContain('createEdgeUniqueConstraint');
+      expect(ops).toContain('createCardinalityConstraint');
+      be.graphFree(g);
+    });
+
+    test('direct algorithm run returns a node/result rowset', async () => {
+      const be = await make();
+      const g = be.graphFromNdjson(NDJSON, false);
+      const out = JSON.parse(dec.decode(be.algo(g, 'degree', '{"direction":"out"}'))) as {
+        columns: string[];
+        rows: unknown[][];
+      };
+      expect(out.columns[0]).toBe('node');
+      expect(out.rows.length).toBe(2);
+      be.graphFree(g);
+    });
+
+    test('prepared statement can return an Arrow carrier', async () => {
+      const be = await make();
+      const g = be.graphFromNdjson(NDJSON, false);
+      const p = be.prepare('MATCH (n:P) RETURN n.age AS a');
+      const arrow = be.preparedQueryArrow(p, g);
+      expect(arrow.byteLength).toBeGreaterThan(0);
+      be.preparedFree(p);
       be.graphFree(g);
     });
   });
