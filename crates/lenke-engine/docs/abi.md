@@ -153,14 +153,15 @@ of core's 12 schema-mutation symbols behind one call.
 { "op": "type",     "on": "vertex", "label": "Person", "key": "age",   "type": "number" }
 { "op": "type",     "on": "edge",   "etype": "KNOWS",  "key": "since", "type": "number" }
 
-// cardinality: edge degree per (label, etype, direction) bounded to min..=max.
-// direction "out"|"in"; omit "max" (or null) for unbounded.
-{ "op": "cardinality", "label": "Person", "etype": "OWNS", "direction": "out", "min": 0, "max": 1 }
+// cardinality: edge degree per (label, edgeType, direction) bounded to min..=max.
+// direction "out"|"in"; "max" is a number or null (unbounded).
+{ "op": "cardinality", "label": "Person", "edgeType": "OWNS", "direction": "out", "min": 0, "max": 1 }
 
-// validator: SQL-CHECK — the bound `var` element with `label` must satisfy `predicate`.
+// validator: SQL-CHECK — the `var` element carrying `label` (a vertex label OR an
+// edge type) must satisfy `predicate` (only a definite-false fails; null passes).
 { "op": "validator", "label": "Person", "var": "p", "predicate": "p.age >= 0" }
-// invariant: a named GQL query that must return zero rows to hold.
-{ "op": "invariant", "name": "no_orphans", "query": "MATCH (n) WHERE ... RETURN n" }
+// invariant: a named GQL query that holds unless its result has a boolean-false cell.
+{ "op": "invariant", "name": "ages_nonneg", "query": "MATCH (p:Person) RETURN p.age >= 0" }
 ```
 
 ## `lnk_command` registry (the exotic tiers)
@@ -177,13 +178,15 @@ exports.
 | `epoch`            | token name (raw str)     | `{epoch:N}`            | **wired** (per-token)      |
 | `merge`            | NDJSON text (raw)        | `{nodes:N, edges:M}`   | **wired** (last-wins)      |
 | `prepare`          | query text (raw str)     | `{handle:"<ptr>"}`     | **wired** (prepared stmts) |
-| `prepared_run`     | `{handle, params}`       | `{columns, rows}`      | **wired** (prepared stmts) |
+| `prepared_run`     | `{handle, params, format?}` | `{columns, rows}` / Arrow | **wired** (JSON + Arrow) |
 | `prepared_free`    | `{handle}`               | `{}`                   | **wired** (prepared stmts) |
-| `algo`             | `{name, config}`         | `{columns, rows}`      | via GQL `CALL` (redundant) |
+| `algo`             | `{name, config}`         | `{columns, rows}`      | **wired** (also via CALL)  |
 
-`algo` is listed for completeness but is _also_ reachable through
-`lnk_query(lang=GQL, "CALL pagerank(...) YIELD ...")`, which is the conformant
-home for the graph algorithms — so most hosts never need the direct command.
+`prepared_run` takes an optional `format` (`json` default, `arrow`, `arrow_ipc`),
+so a prepared statement has the same output surface as `lnk_query`. `algo` runs a
+native algorithm directly (honoring a `writeProperty` in the config) and is _also_
+reachable through `lnk_query(lang=GQL, "CALL pagerank(...) YIELD ...")`, the
+conformant home for the graph algorithms.
 
 ## Host-side impact
 
@@ -297,22 +300,27 @@ every data-mutation primitive (`add_node`, `add_edge`, `set_prop`, `remove_prop`
 out-of-band metadata (not in any query result, codec, or ordering), so it does not
 affect byte-identity — verified: the full cross-engine corpus + conformance suites
 still pass. Per-token **epoch** takes a name, so it is _not_ a `stat` selector; it
-rides `lnk_command "epoch"` (deferred). Covered by 2 `Store` unit tests.
+rides `lnk_command "epoch"` (wired). Covered by 2 `Store` unit tests.
 
-### Schema pass (`src/schema_op.rs`)
+### Schema pass (`src/exec::apply_schema_op` + `src/schema_op.rs`)
 
-`schema_apply` parses one `{"op":…}` object (reusing the engine's JSON parser via
-`ndjson::parse_json`) and dispatches to real `Store` methods; `schema_dump` emits
-the **same** vocabulary so `dump → apply` round-trips — **indexes and
-constraints**. `SchemaError` splits `BadRequest` (→ `-1`) from `Rejected` (→ `-2`).
-Covered by 11 unit tests.
+`schema_apply` (the C ABI) routes through `exec::apply_schema_op`, the single
+schema entry point: it handles the two ops that need the query evaluator
+(`validator`, `invariant`) and delegates the rest to `schema_op::apply`, which
+parses one `{"op":…}` object and dispatches to real `Store` methods. `schema_dump`
+emits the **same** vocabulary so `dump → apply` round-trips. `SchemaError` carries
+the wire code (`BadRequest`→`E_FFI`/-1, `Invalid`→`E_INVALID_VALUE`/-1,
+`Syntax`→`E_SYNTAX`/-1, `GraphOp`→`E_INVALID_GRAPH_OP`/-1,
+`Rejected`→`E_CONSTRAINT_VIOLATION`/-2).
 
-Implemented ops: `createIndex` on `vertex/hash`, `vertex/range`, `edge/interval`,
-`edge/type`; `unique` and `required` on vertices (single or composite `keys`).
-
-Still bad-request (no backing `Store` method yet — the schema work still to do):
-`dropIndex`; `type` / `cardinality` / `validator` / `invariant`; edge `unique` /
-`required` / `type` constraints.
+The **whole vocabulary is implemented**: `createIndex` (vertex hash/range, edge
+interval/type) and `dropIndex`; `unique` / `required` / `type` on both vertices
+and edges; `cardinality`; `validator`; `invariant`. Write-time enforcement is
+centralized in `Store::run_deferred_checks` (pure-store constraints, derived from
+the transaction's CDC change set) plus `exec::enforce_expr_constraints`
+(validators + invariants); a violation rolls the statement back with
+`E_CONSTRAINT_VIOLATION`. Every kind also persists in the binary snapshot (v2) and
+the schema dump. Covered by store + exec + schema_op unit tests.
 
 ### Testing note
 
