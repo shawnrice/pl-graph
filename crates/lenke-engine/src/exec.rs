@@ -408,6 +408,22 @@ fn run_insert(
     Ok(ids)
 }
 
+/// Whether `plan`'s root is a write (INSERT / SET / REMOVE / DELETE / _MERGE /
+/// addE). A write must run through [`execute`] (mutable store); a read goes through
+/// the immutable [`try_run`] path. The C ABI's `lnk_query` routes on this.
+// Only the `capi` ffi layer consults it; without that feature it is unused.
+#[cfg_attr(not(feature = "capi"), allow(dead_code))]
+pub(crate) fn is_write(plan: &Plan) -> bool {
+    matches!(
+        plan,
+        Plan::Insert { .. }
+            | Plan::InsertReturn { .. }
+            | Plan::Update { .. }
+            | Plan::Merge { .. }
+            | Plan::AddEdge { .. }
+    )
+}
+
 pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
     match plan {
         Plan::Insert { nodes, edges } => {

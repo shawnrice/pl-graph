@@ -13,9 +13,10 @@
 //! [`lnk_free`]; host-owned input memory (wasm) is [`lnk_alloc`]/[`lnk_dealloc`].
 //! Errors ride the out-of-band channel in [`crate::ffi_error`].
 //!
-//! This is a SCAFFOLD: symbols wired to methods that exist run today; every gap
-//! returns `E_UNIMPLEMENTED` with a specific message. That stub list is the
-//! work-queue to finish before the engine can be the shipped backend.
+//! Failures ride the error channel with a canonical `E_*` code from the shared
+//! `@lenke/errors` vocabulary (`E_SYNTAX`, `E_CONSTRAINT_VIOLATION`,
+//! `E_INVALID_VALUE`, `E_UNSUPPORTED`, …) so the host maps them to the same
+//! `LenkeError` the core backend produces.
 
 // C-ABI boundary module: keep every raw-pointer op an explicit `unsafe {}` block.
 #![allow(unsafe_code)]
@@ -205,7 +206,7 @@ pub unsafe extern "C" fn lnk_open(ptr: *const u8, len: usize, format: u8) -> *mu
             match crate::ndjson::from_ndjson(text) {
                 Ok(store) => Box::into_raw(Box::new(store)),
                 Err(e) => {
-                    crate::ffi_error::set("E_NDJSON", &e.to_string());
+                    crate::ffi_error::set("E_INVALID_JSON", &e.to_string());
                     std::ptr::null_mut()
                 }
             }
@@ -219,7 +220,7 @@ pub unsafe extern "C" fn lnk_open(ptr: *const u8, len: usize, format: u8) -> *mu
             match crate::binary::from_binary(bytes) {
                 Ok(store) => Box::into_raw(Box::new(store)),
                 Err(e) => {
-                    crate::ffi_error::set("E_BINARY", &e);
+                    crate::ffi_error::set("E_FFI", &e);
                     std::ptr::null_mut()
                 }
             }
@@ -322,8 +323,9 @@ pub unsafe extern "C" fn lnk_query(
     out_len: *mut usize,
 ) -> *mut u8 {
     crate::ffi_error::begin();
-    // SAFETY: forwards this fn's contract to the shims. Read-only exec today → &Store.
-    let (Some(store), Some(q)) = (unsafe { store_ref(s) }, unsafe { in_str(q_ptr, q_len) }) else {
+    // Mutable borrow: a GQL write query (SET/INSERT/_MERGE/…) needs it; reads and
+    // Gremlin reborrow it immutably.
+    let (Some(store), Some(q)) = (unsafe { store_mut(s) }, unsafe { in_str(q_ptr, q_len) }) else {
         crate::ffi_error::set("E_FFI", "null store handle or non-UTF-8 query");
         return std::ptr::null_mut();
     };
@@ -338,7 +340,7 @@ pub unsafe extern "C" fn lnk_query(
         match crate::ndjson::parse_params(p) {
             Ok(params) => params,
             Err(e) => {
-                crate::ffi_error::set("E_FFI", &e);
+                crate::ffi_error::set("E_INVALID_JSON", &e);
                 return std::ptr::null_mut();
             }
         }
@@ -354,17 +356,17 @@ pub unsafe extern "C" fn lnk_query(
             crate::ffi_error::set("E_FFI", "Arrow output is only available for GQL queries");
             return std::ptr::null_mut();
         }
-        let rows = match crate::gql::parse_with_params(q, &params) {
-            Ok(plan) => {
-                let plan = crate::opt::optimize_indexed(plan, store);
-                guarded(|| crate::exec::try_run(&plan, store))
+        let plan = match crate::gql::parse_with_params(q, &params) {
+            Ok(plan) => crate::opt::optimize_indexed(plan, store),
+            Err(e) => {
+                crate::ffi_error::set("E_SYNTAX", &e);
+                return std::ptr::null_mut();
             }
-            Err(e) => Err(e),
         };
-        let rows = match rows {
+        let rows = match guarded(|| crate::exec::try_run(&plan, store)) {
             Ok(r) => r,
             Err(e) => {
-                crate::ffi_error::set("E_QUERY", &e);
+                crate::ffi_error::set("E_INVALID_VALUE", &e);
                 return std::ptr::null_mut();
             }
         };
@@ -378,31 +380,41 @@ pub unsafe extern "C" fn lnk_query(
             }
         };
     }
+    // Parse (E_SYNTAX on failure) → optimize → run (E_INVALID_VALUE on failure).
     let result = match lang {
-        0 => match crate::gql::parse_with_params(q, &params) {
-            Ok(plan) => {
-                let plan = crate::opt::optimize_indexed(plan, store);
+        0 => {
+            let plan = match crate::gql::parse_with_params(q, &params) {
+                Ok(plan) => crate::opt::optimize_indexed(plan, store),
+                Err(e) => {
+                    crate::ffi_error::set("E_SYNTAX", &e);
+                    return std::ptr::null_mut();
+                }
+            };
+            // A write query (SET/INSERT/_MERGE/…) runs through the mutable executor
+            // and renders its result rows; a read takes the streaming JSON path.
+            if crate::exec::is_write(&plan) {
+                guarded(|| {
+                    crate::exec::execute(&plan, store).map(|rows| crate::json::gql_rows_json(&rows))
+                })
+            } else {
                 guarded(|| crate::exec::try_run_gql_json(&plan, store))
             }
-            Err(e) => Err(e),
-        },
+        }
         1 => {
             // Gremlin bindings are a distinct mechanism (bytecode bindings); the engine
             // does not accept parameters on the Gremlin path yet.
             if !params.is_empty() {
-                crate::ffi_error::set(
-                    "E_UNIMPLEMENTED",
-                    "Gremlin query parameters are not yet supported",
-                );
+                crate::ffi_error::set("E_UNSUPPORTED", "Gremlin query parameters are not supported");
                 return std::ptr::null_mut();
             }
-            match crate::gremlin::parse(q) {
-                Ok(plan) => {
-                    let plan = crate::opt::optimize_indexed(plan, store);
-                    guarded(|| crate::exec::try_run_gremlin_json(&plan, store))
+            let plan = match crate::gremlin::parse(q) {
+                Ok(plan) => crate::opt::optimize_indexed(plan, store),
+                Err(e) => {
+                    crate::ffi_error::set("E_SYNTAX", &e);
+                    return std::ptr::null_mut();
                 }
-                Err(e) => Err(e),
-            }
+            };
+            guarded(|| crate::exec::try_run_gremlin_json(&plan, store))
         }
         _ => {
             crate::ffi_error::set("E_FFI", "unknown query language");
@@ -415,7 +427,7 @@ pub unsafe extern "C" fn lnk_query(
             unsafe { out_string(json, out_len) }
         }
         Err(e) => {
-            crate::ffi_error::set("E_QUERY", &e);
+            crate::ffi_error::set("E_INVALID_VALUE", &e);
             std::ptr::null_mut()
         }
     }
@@ -476,7 +488,7 @@ pub unsafe extern "C" fn lnk_schema_apply(
             -1
         }
         Err(crate::schema_op::SchemaError::Rejected(msg)) => {
-            crate::ffi_error::set("E_CONSTRAINT", &msg);
+            crate::ffi_error::set("E_CONSTRAINT_VIOLATION", &msg);
             -2
         }
     }
@@ -595,7 +607,7 @@ pub unsafe extern "C" fn lnk_command(
                     unsafe { out_string(json, out_len) }
                 }
                 Err(e) => {
-                    crate::ffi_error::set("E_MERGE", &e);
+                    crate::ffi_error::set("E_INVALID_JSON", &e);
                     std::ptr::null_mut()
                 }
             }
@@ -632,7 +644,7 @@ pub unsafe extern "C" fn lnk_command(
                     unsafe { out_string(format!("{{\"handle\":\"{handle}\"}}"), out_len) }
                 }
                 Err(e) => {
-                    crate::ffi_error::set("E_QUERY", &e);
+                    crate::ffi_error::set("E_SYNTAX", &e);
                     std::ptr::null_mut()
                 }
             }
@@ -655,7 +667,7 @@ pub unsafe extern "C" fn lnk_command(
                 return std::ptr::null_mut();
             };
             if let Err(e) = crate::bind::bind_params(&mut plan, &params) {
-                crate::ffi_error::set("E_QUERY", &e);
+                crate::ffi_error::set("E_MISSING_PARAMETER", &e);
                 return std::ptr::null_mut();
             }
             let plan = crate::opt::optimize_indexed(plan, store);
@@ -663,7 +675,7 @@ pub unsafe extern "C" fn lnk_command(
                 // SAFETY: out_len is writable per this fn's contract.
                 Ok(json) => unsafe { out_string(json, out_len) },
                 Err(e) => {
-                    crate::ffi_error::set("E_QUERY", &e);
+                    crate::ffi_error::set("E_INVALID_VALUE", &e);
                     std::ptr::null_mut()
                 }
             }
@@ -689,7 +701,7 @@ pub unsafe extern "C" fn lnk_command(
         // direct command is a redundant fast-path we have not needed.
         "algo" => {
             crate::ffi_error::set(
-                "E_UNIMPLEMENTED",
+                "E_UNSUPPORTED",
                 "run algorithms via GQL: lnk_query(GQL, \"CALL <name>(...) YIELD ...\")",
             );
             std::ptr::null_mut()
@@ -698,7 +710,7 @@ pub unsafe extern "C" fn lnk_command(
         // are not yet built in the engine — each fills an arm here, never a new symbol.
         other => {
             crate::ffi_error::set(
-                "E_UNIMPLEMENTED",
+                "E_UNSUPPORTED",
                 &format!("command '{other}' is not yet implemented"),
             );
             std::ptr::null_mut()
