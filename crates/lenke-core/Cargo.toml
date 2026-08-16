@@ -64,6 +64,10 @@ regex = { version = "1", default-features = false, features = [
 # regular dep here while `lenke-engine` keeps `lenke-core` as a DEV-dep only, so
 # there is no build cycle (dev-deps sit outside the lib dependency graph).
 lenke-engine = { path = "../lenke-engine", optional = true }
+# The shared serialization codecs (pg-json/pg-text/graphson/csv) over a neutral
+# graph model. Zero-dep, wasm-clean; pulled in by the `codecs` feature. Core owns
+# only the Graph<->GraphData bridge (see `codec::to_graph_data`/`from_graph_data`).
+lenke-codec = { path = "../lenke-codec", optional = true }
 
 [features]
 # Composable feature set so a minimal build ships only what it uses (the binary
@@ -102,8 +106,11 @@ gremlin = ["gql", "dep:regex", "_fallible-ffi"]
 # `ndjson`: the NDJSON load/snapshot codec (hand-rolled JSON, no serde_json).
 ndjson = ["gql", "_fallible-ffi"]
 # `codecs`: the extra serialization formats (pg-json/pg-text/graphson/csv); the
-# combined dispatch also covers ndjson, so it implies it. Hand-rolled JSON — no serde.
-codecs = ["ndjson"]
+# combined dispatch also covers ndjson, so it implies it. Hand-rolled JSON — no
+# serde. The format logic itself lives in the shared, zero-dep `lenke-codec`
+# crate (over a neutral graph model), so core and the standalone engine share one
+# byte-identical implementation; core only supplies the Graph<->GraphData bridge.
+codecs = ["ndjson", "dep:lenke-codec"]
 # `arrow`: the Apache Arrow columnar result surface (binary; no serde_json). The
 # Arrow output is a query-result format, so it needs the GQL engine.
 arrow = ["gql"]

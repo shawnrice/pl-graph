@@ -1,8 +1,14 @@
 //! Serialization codecs mirroring the TypeScript `@lenke/serialization`
 //! package: **pg-json**, **pg-text**, **graphson**, and **csv**. (NDJSON has its
-//! own module, [`crate::ndjson`].) Each codec exposes `encode(&Graph) -> String`
-//! and `decode(&str) -> Result<Graph, String>`, and [`serialize`] /
-//! [`deserialize`] dispatch by format name (including `"ndjson"`).
+//! own module, [`crate::ndjson`].) [`serialize`] / [`deserialize`] dispatch by
+//! format name (including `"ndjson"`).
+//!
+//! The pg-json / pg-text / graphson / csv format logic now lives in the shared,
+//! zero-dep [`lenke_codec`] crate, over a neutral graph model — so this core and
+//! the standalone `lenke-engine` share one byte-identical implementation. This
+//! module keeps only the **bridge**: [`to_graph_data`] (Graph → neutral) and
+//! [`from_graph_data`] (neutral → Graph), plus the format dispatch that wires
+//! them to `lenke_codec` (NDJSON stays native — it has its own streaming module).
 //!
 //! ## Two faithful divergences from the TS core
 //!
@@ -19,26 +25,17 @@
 //!     (PG-JSON, GraphSON, CSV, NDJSON) **always emit** it and round-trip it.
 //!     PG-text has no id slot, so its edges re-derive `e{index}` on decode rather
 //!     than round-tripping an assigned id. **Node** ids round-trip exactly.
-//!
-//! Streaming variants (the TS `encodeStream`/`decodeStream`) are intentionally
-//! omitted: the idiomatic bulk path here is the whole-string `encode`/`decode`
-//! over the `Builder`, which is the codec-contract surface.
-
-pub mod csv;
-pub mod graphson;
-pub mod pg_json;
-pub mod pg_text;
 
 #[cfg(test)]
 mod conformance;
 
-use std::borrow::Cow;
 use std::sync::Arc;
+
+use lenke_codec::{Edge as CEdge, GraphData, Node as CNode, Value as CValue};
 
 use crate::error::{CodeError, CodeResult};
 use crate::error_codes::ErrorCode;
-use crate::graph::{Dict, Graph, Properties, Value};
-use crate::json::Json;
+use crate::graph::{Builder, Dict, EdgeRec, Graph, NodeRec, Properties, Value};
 
 // ---------------------------------------------------------------------------
 // Element/property access over the columnar store
@@ -84,100 +81,161 @@ pub(crate) fn edge_types(g: &Graph, ei: u32) -> Vec<&str> {
         .collect()
 }
 
-/// True if a float is an exact integer value — GraphSON `g:Int64` vs `g:Double`,
-/// CSV `integer` vs `float`. Mirrors JS `Number.isInteger`.
-pub(crate) fn is_intish(x: f64) -> bool {
-    x.is_finite() && x.fract() == 0.0
-}
-
 // ---------------------------------------------------------------------------
-// JSON scalar emit (shared by pg-json and graphson; mirrors ndjson)
+// Neutral-model bridge (Graph <-> lenke_codec::GraphData)
 // ---------------------------------------------------------------------------
 
-// JSON scalar emit is shared via [`crate::jsonfmt`], so every serde-free writer
-// (gremlin, ndjson, codecs) escapes strings and formats numbers identically.
-pub(crate) use crate::jsonfmt::{push_json_str, push_num};
-
-// ---------------------------------------------------------------------------
-// JSON scalar parse (shared by pg-json; graphson has its own typed decode)
-// ---------------------------------------------------------------------------
-
-/// A `serde_json::Value` as a core [`Value`]. A nested JSON object is a
-/// map/record property (a single-key `{"@date":…}` stays a tagged temporal).
-pub(crate) fn json_to_value(j: &Json) -> CodeResult<Value> {
-    Ok(match j {
-        Json::Null => Value::Null,
-        Json::Bool(b) => Value::Bool(*b),
-        // A non-finite JSON number (±Infinity from an overflowing literal like
-        // `1e400`, or NaN) is not representable in the LPG numeric model → `null`,
-        // matching the TS `normalizeValue` contract. Storing a real non-finite
-        // float would corrupt aggregates and `IS NULL` and diverge from TS.
-        Json::Num(n) => {
-            if n.is_finite() {
-                Value::Num(*n)
-            } else {
-                Value::Null
-            }
-        }
-        Json::Str(s) => Value::Str(Arc::from(s.as_ref())),
-        Json::Arr(a) => Value::List(
-            a.iter()
-                .map(json_to_value)
-                .collect::<CodeResult<Vec<_>>>()?,
-        ),
-        // A tagged temporal `{"@date":"…"}` (single key) round-trips as a scalar;
-        // any other JSON object is a record/map value (canonicalized on store).
-        Json::Obj(pairs) => match crate::json::temporal_from_pairs(pairs) {
-            Some(res) => {
-                Value::Temporal(res.map_err(|e| CodeError::new(ErrorCode::InvalidValue, e))?)
-            }
-            None => Value::Map(
-                pairs
-                    .iter()
-                    .map(|(k, v)| Ok((Arc::from(k.as_ref()), json_to_value(v)?)))
-                    .collect::<CodeResult<Vec<_>>>()?,
-            ),
+/// A core [`Value`] as a neutral [`CValue`]. A temporal becomes its `(tag, iso)`
+/// strings; every other variant maps one-to-one (a `Map` keeps its stored,
+/// canonical key order, so the codec re-emits it exactly as the store holds it).
+fn value_to_neutral(v: &Value) -> CValue {
+    match v {
+        Value::Null => CValue::Null,
+        Value::Bool(b) => CValue::Bool(*b),
+        Value::Num(x) => CValue::Num(*x),
+        Value::Str(s) => CValue::Str(s.to_string()),
+        Value::Temporal(t) => CValue::Temporal {
+            tag: t.tag().to_string(),
+            iso: t.format(),
         },
-    })
-}
-
-/// A JSON id field as a string (a string verbatim; a number/bool/null via its
-/// JSON text — matching serde_json's `Display`).
-pub(crate) fn json_id<'a>(j: &Json<'a>) -> Cow<'a, str> {
-    match j {
-        Json::Str(s) => s.clone(),
-        Json::Num(n) => Cow::Owned(crate::jsonfmt::js_number(*n)),
-        Json::Bool(b) => Cow::Owned(b.to_string()),
-        _ => Cow::Borrowed("null"),
+        Value::List(a) => CValue::List(a.iter().map(value_to_neutral).collect()),
+        Value::Map(pairs) => CValue::Map(
+            pairs
+                .iter()
+                .map(|(k, val)| (k.to_string(), value_to_neutral(val)))
+                .collect(),
+        ),
     }
 }
 
-/// A JSON array field as a `Vec<String>` (non-string elements dropped).
-pub(crate) fn json_str_array<'a>(field: Option<&Json<'a>>) -> Vec<Cow<'a, str>> {
-    field
-        .and_then(Json::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| match x {
-                    // Cloning the `Cow` keeps the INPUT's lifetime; `as_str()`
-                    // would hand back a reference into the tree instead.
-                    Json::Str(s) => Some(s.clone()),
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// How a decoder that produced a temporal-tagged value wants a *malformed* ISO
+/// string handled — the one place the codecs differ once the format logic is
+/// shared. On a valid ISO every policy yields the same `Value::Temporal`.
+#[derive(Clone, Copy)]
+enum TemporalOnErr {
+    /// Reject (`E_INVALID_VALUE`) — the JSON document codecs (pg-json, graphson).
+    Error,
+    /// Fall back to the bare ISO string — CSV's lenient scalar decode.
+    StringIso,
+    /// Fall back to the `@tag:iso` token — pg-text's lenient scalar decode.
+    TagToken,
 }
 
-/// A JSON object field as core property pairs (used by pg-json). A nested-object
-/// value anywhere is an `InvalidValue` error (see [`json_to_value`]).
-pub(crate) fn json_props<'a>(field: Option<&Json<'a>>) -> CodeResult<Vec<(Cow<'a, str>, Value)>> {
-    match field.and_then(Json::as_object) {
-        Some(m) => m
-            .iter()
-            .map(|(k, v)| Ok((k.clone(), json_to_value(v)?)))
-            .collect(),
-        None => Ok(Vec::new()),
+/// A neutral [`CValue`] as a core [`Value`]. Only a temporal can fail (an ISO
+/// string the neutral crate carried through without validating); `on_err` picks
+/// the codec-appropriate handling.
+fn value_from_neutral(v: &CValue, on_err: TemporalOnErr) -> CodeResult<Value> {
+    Ok(match v {
+        CValue::Null => Value::Null,
+        CValue::Bool(b) => Value::Bool(*b),
+        CValue::Num(x) => Value::Num(*x),
+        CValue::Str(s) => Value::Str(Arc::from(s.as_str())),
+        CValue::Temporal { tag, iso } => match crate::temporal::Temporal::parse(tag, iso) {
+            Ok(t) => Value::Temporal(t),
+            Err(e) => match on_err {
+                TemporalOnErr::Error => return Err(CodeError::new(ErrorCode::InvalidValue, e)),
+                TemporalOnErr::StringIso => Value::Str(Arc::from(iso.as_str())),
+                TemporalOnErr::TagToken => Value::Str(Arc::from(format!("@{tag}:{iso}").as_str())),
+            },
+        },
+        CValue::List(a) => Value::List(
+            a.iter()
+                .map(|e| value_from_neutral(e, on_err))
+                .collect::<CodeResult<_>>()?,
+        ),
+        CValue::Map(pairs) => Value::Map(
+            pairs
+                .iter()
+                .map(|(k, val)| Ok((Arc::from(k.as_str()), value_from_neutral(val, on_err)?)))
+                .collect::<CodeResult<_>>()?,
+        ),
+    })
+}
+
+/// Project a graph into the neutral model the shared codecs operate on. Elements
+/// are yielded in live-index order and each property bag in key-intern order
+/// (via [`element_props`]) — the exact order the codecs used to read, so the
+/// serialized bytes are unchanged.
+fn to_graph_data(g: &Graph) -> GraphData {
+    let neutral_props = |props: Vec<(&str, Value)>| -> Vec<(String, CValue)> {
+        props
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), value_to_neutral(&v)))
+            .collect()
+    };
+
+    let mut nodes = Vec::with_capacity(g.vertex_count());
+    for vi in 0..g.n as u32 {
+        if !g.is_vertex_live(vi) {
+            continue;
+        }
+        nodes.push(CNode {
+            id: g.vid.text(vi).to_string(),
+            labels: node_labels(g, vi)
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            props: neutral_props(element_props(&g.props, &g.strs, vi as usize)),
+        });
+    }
+
+    let mut edges = Vec::with_capacity(g.edge_count());
+    for i in 0..g.edge_slots() {
+        if !g.is_edge_live(i as u32) {
+            continue;
+        }
+        edges.push(CEdge {
+            // Every edge has an id (assigned or canonical `e{index}`); the
+            // id-less pg-text codec simply ignores it on encode.
+            id: Some(g.edge_id(i as u32).into_owned()),
+            from: g.vid.text(g.e_src[i]).to_string(),
+            to: g.vid.text(g.e_dst[i]).to_string(),
+            labels: edge_types(g, i as u32)
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            props: neutral_props(element_props(&g.edge_props, &g.strs, i)),
+        });
+    }
+
+    GraphData { nodes, edges }
+}
+
+/// Build a fresh graph from neutral data. `strict` enforces the declared-nodes
+/// contract (an edge endpoint must be a declared node → `MissingVertex`), used by
+/// the document codecs; the lenient path (pg-text) fabricates missing endpoints.
+fn from_graph_data(data: GraphData, strict: bool, on_err: TemporalOnErr) -> CodeResult<Graph> {
+    let mut b = Builder::default();
+    for n in data.nodes {
+        let props = n
+            .props
+            .into_iter()
+            .map(|(k, v)| Ok((k, value_from_neutral(&v, on_err)?)))
+            .collect::<CodeResult<Vec<_>>>()?;
+        b.nodes.push(NodeRec::owned(n.id, n.labels, props));
+    }
+    for e in data.edges {
+        let props = e
+            .props
+            .into_iter()
+            .map(|(k, v)| Ok((k, value_from_neutral(&v, on_err)?)))
+            .collect::<CodeResult<Vec<_>>>()?;
+        // Edges are MULTI-type: the first label is the type, the rest are extras.
+        let mut labels = e.labels.into_iter();
+        let etype = labels.next().unwrap_or_default();
+        b.edges.push(EdgeRec {
+            src: std::borrow::Cow::Owned(e.from),
+            dst: std::borrow::Cow::Owned(e.to),
+            etype: std::borrow::Cow::Owned(etype),
+            extra_labels: labels.map(std::borrow::Cow::Owned).collect(),
+            props: crate::graph::owned_props(props),
+            id: e.id.map(std::borrow::Cow::Owned),
+        });
+    }
+    if strict {
+        b.finalize_strict()
+    } else {
+        Ok(b.finalize())
     }
 }
 
@@ -185,36 +243,25 @@ pub(crate) fn json_props<'a>(field: Option<&Json<'a>>) -> CodeResult<Vec<(Cow<'a
 // Format dispatch (mirrors the TS `serialize` / `deserialize`)
 // ---------------------------------------------------------------------------
 
-/// An unrecognized format name. The codes are now structural: an unknown name is
-/// distinct from a parse failure of a *known* format (which the decoders code
-/// precisely), so the FFI layer can surface `e.code` directly.
-fn unknown_format(format: &str) -> CodeError {
-    CodeError::new(
-        ErrorCode::UnknownFormat,
-        format!("unknown serialization format '{format}'"),
-    )
+/// Map a shared-codec error (carrying an `E_*` wire string) to a core `CodeError`.
+fn map_codec_err(e: lenke_codec::CodecError) -> CodeError {
+    let code = ErrorCode::ALL
+        .iter()
+        .copied()
+        .find(|c| c.as_str() == e.code)
+        .unwrap_or(ErrorCode::Ffi);
+    CodeError::new(code, e.message)
 }
 
 /// Serialize `g` in the named format: `pg-json | pg-text | graphson | csv | ndjson`.
 pub fn serialize(g: &Graph, format: &str) -> CodeResult<String> {
-    // The flat codecs can't faithfully carry a nested record; reject loudly rather
-    // than mangle or drop it. The structured codecs (ndjson/graphson/pg-json)
-    // round-trip maps, so point the caller there.
-    if matches!(format, "pg-text" | "csv") && g.has_map_property() {
-        return Err(CodeError::new(
-            ErrorCode::Unsupported,
-            "a map/record property can't be serialized to a flat format (pg-text/csv); \
-             use a structured format: ndjson, graphson, or pg-json",
-        ));
+    // NDJSON keeps its own native streaming module.
+    if format == "ndjson" {
+        return Ok(crate::ndjson::encode(g));
     }
-    match format {
-        "pg-json" => Ok(pg_json::encode(g)),
-        "pg-text" => Ok(pg_text::encode(g)),
-        "graphson" => Ok(graphson::encode(g)),
-        "csv" => Ok(csv::encode(g)),
-        "ndjson" => Ok(crate::ndjson::encode(g)),
-        other => Err(unknown_format(other)),
-    }
+    // The flat/map rejection lives in the shared crate (byte-identical message);
+    // building the neutral projection first keeps one code path.
+    lenke_codec::serialize(&to_graph_data(g), format).map_err(map_codec_err)
 }
 
 /// Deserialize `input` in the named format into a fresh graph. A bad format name
@@ -222,17 +269,30 @@ pub fn serialize(g: &Graph, format: &str) -> CodeResult<String> {
 /// decoder's own code (`InvalidJson` / `InvalidShape` / …).
 pub fn deserialize(input: &str, format: &str) -> CodeResult<Graph> {
     let g = match format {
-        "pg-json" => pg_json::decode(input),
-        "pg-text" => Ok(pg_text::decode(input)),
-        "graphson" => graphson::decode(input),
-        "csv" => csv::decode(input),
-        "ndjson" => crate::ndjson::decode(input),
-        other => Err(unknown_format(other)),
-    }?;
+        "ndjson" => crate::ndjson::decode(input)?,
+        // The endpoint-strictness and temporal-fallback policies are per-codec:
+        // the JSON document codecs are strict + reject a bad temporal; CSV is
+        // strict but lenient on a bad temporal scalar; pg-text is lenient on both.
+        "pg-json" | "graphson" => build_from(input, format, true, TemporalOnErr::Error)?,
+        "csv" => build_from(input, format, true, TemporalOnErr::StringIso)?,
+        "pg-text" => build_from(input, format, false, TemporalOnErr::TagToken)?,
+        other => {
+            return Err(CodeError::new(
+                ErrorCode::UnknownFormat,
+                format!("unknown serialization format '{other}'"),
+            ))
+        }
+    };
     // Ingestion gate: reject loaded data holding a malformed label / edge type /
     // property key so it can't smuggle in a name that won't round-trip.
     g.validate_wellformed()?;
     Ok(g)
+}
+
+/// Deserialize via the shared crate, then bridge back to a core `Graph`.
+fn build_from(input: &str, format: &str, strict: bool, on_err: TemporalOnErr) -> CodeResult<Graph> {
+    let data = lenke_codec::deserialize(input, format).map_err(map_codec_err)?;
+    from_graph_data(data, strict, on_err)
 }
 
 #[cfg(test)]
@@ -241,8 +301,9 @@ mod tests {
 
     /// A graph with one explicitly-id'd edge, via pg-json.
     fn with_edge_id() -> Graph {
-        pg_json::decode(
+        deserialize(
             r#"{"nodes":[{"id":"a","labels":[],"properties":{}},{"id":"b","labels":[],"properties":{}}],"edges":[{"id":"pay-1","from":"a","to":"b","labels":["PAID"],"properties":{"amt":50}}]}"#,
+            "pg-json",
         )
         .unwrap()
     }

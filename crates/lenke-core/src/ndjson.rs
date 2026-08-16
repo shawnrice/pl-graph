@@ -27,7 +27,7 @@ fn to_value(j: &Json) -> CodeResult<Value> {
         // A JSON number that overflowed to ±Infinity (e.g. `1e400`) — or a NaN —
         // is not representable in the LPG numeric model, so it maps to `null` at
         // this entry point (matching the TS ndjson/pg-json codecs and the shared
-        // `codec::json_to_value`). Storing a real non-finite float would silently
+        // `lenke_codec` JSON scalar rule). Storing a real non-finite float would silently
         // corrupt count/sum/min/max/`IS NULL`/comparisons and diverge from TS.
         Json::Num(n) => {
             if n.is_finite() {

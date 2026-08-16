@@ -77,7 +77,7 @@ fn exercise(s: &str) {
     let _ = crate::temporal::ZonedDateTime::parse(s);
     let _ = crate::temporal::Duration::parse(s);
     let _ = crate::ndjson::decode(s);
-    let _ = crate::codec::csv::decode(s);
+    let _ = crate::codec::deserialize(s, "csv");
 }
 
 #[test]

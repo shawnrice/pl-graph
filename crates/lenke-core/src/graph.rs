@@ -322,8 +322,8 @@ impl Value {
     /// write.
     ///
     /// NaN and ±Infinity are not values in the LPG numeric model. Every *codec*
-    /// entry point already says so (`codec::json_to_value`, `ndjson`, `csv`,
-    /// `pg_text`) and states why: storing a real non-finite "would silently
+    /// entry point already says so (the shared `lenke_codec` JSON rule, `ndjson`,
+    /// `csv`, `pg_text`) and states why: storing a real non-finite "would silently
     /// corrupt count/sum/min/max/`IS NULL`/comparisons and diverge from TS".
     /// `Column::Num` goes further and uses NaN as its own ABSENT sentinel, so a
     /// stored NaN aliases the one bit pattern the column reserves.
