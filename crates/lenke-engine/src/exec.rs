@@ -1123,6 +1123,7 @@ fn needs_lineage(plan: &Plan) -> bool {
             Expr::Slot(_)
             | Expr::Prop { .. }
             | Expr::Lit(_)
+            | Expr::Param(_)
             | Expr::PropertyExists { .. }
             | Expr::IsLabeled { .. }
             | Expr::Exists { .. }
@@ -9346,7 +9347,7 @@ fn distinct_with_mult(nodes: &[u32], node_count_total: usize) -> (Vec<u32>, Vec<
 /// disqualifies — the signal that the frontier alone is enough to evaluate it.
 fn refs_only_slot(expr: &Expr, s: usize) -> bool {
     match expr {
-        Expr::Lit(_) => true,
+        Expr::Lit(_) | Expr::Param(_) => true,
         Expr::Slot(n) => *n == s,
         Expr::Prop { slot, .. } => *slot == s,
         Expr::Path | Expr::PathAccess { .. } | Expr::GremlinPath { .. } => false,
@@ -9498,7 +9499,8 @@ fn remap_slot(expr: &Expr, from: usize, to: usize) -> Expr {
         | Expr::CollectSubquery { .. }
         | Expr::UncorrelatedExists { .. }
         | Expr::UncorrelatedCount { .. }
-        | Expr::UncorrelatedScalar { .. } => expr.clone(),
+        | Expr::UncorrelatedScalar { .. }
+        | Expr::Param(_) => expr.clone(),
     }
 }
 
@@ -11772,6 +11774,13 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
     Ok(match expr {
         Expr::Slot(n) => batch.slot(*n).clone(),
         Expr::Lit(v) => broadcast(v.clone(), batch.rows()),
+        // A `Param` must be substituted by `bind::bind_params` before eval; if one
+        // survives, fail loudly rather than mis-evaluate (the safety net).
+        Expr::Param(name) => {
+            return Err(format!(
+                "unbound parameter `${name}` (internal: not bound before evaluation)"
+            ))
+        }
         Expr::Prop { slot, key } => read_property(store, batch.slot(*slot), key),
         // `<base>.key` — evaluate the base to a column, then read the field/property
         // from it (the general form of `Prop`).

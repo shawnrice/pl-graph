@@ -284,6 +284,19 @@ pub fn parse(query: &str) -> Result<Plan, String> {
 /// they are never spliced into the query text (no injection), and the planner sees
 /// literals (so `WHERE k = $p` / `{k: $p}` still seed an index).
 pub fn parse_with_params(query: &str, params: &[(String, Value)]) -> Result<Plan, String> {
+    parse_internal(query, params, false)
+}
+
+/// Parse a query in PREPARED mode: each `$name` becomes an unbound
+/// [`Expr::Param`](crate::ir::Expr::Param) instead of being substituted, so the
+/// parsed plan can be cached and bound to different values per run (see
+/// [`crate::bind::bind_params`]). Params in `LIMIT`/`SKIP` and literal-only
+/// positions (INSERT / procedure config) are not supported in prepared mode.
+pub fn parse_prepared(query: &str) -> Result<Plan, String> {
+    parse_internal(query, &[], true)
+}
+
+fn parse_internal(query: &str, params: &[(String, Value)], prepared: bool) -> Result<Plan, String> {
     let toks = lex(query)?;
     let mut p = Parser {
         toks,
@@ -300,6 +313,7 @@ pub fn parse_with_params(query: &str, params: &[(String, Value)]) -> Result<Plan
         having_aggs: None,
         having_base: 0,
         params: params.iter().cloned().collect(),
+        prepared,
     };
     let mut plan = p.query()?;
     // `<query> UNION [ALL] <query> …`: each arm is an independent query with a fresh
@@ -670,6 +684,10 @@ struct Parser {
     /// is typed — never spliced into query text (no injection) — and the planner
     /// sees a literal (index seeding on `WHERE k = $p` / `{k: $p}` still fires).
     params: HashMap<String, Value>,
+    /// PREPARED mode: emit each `$name` as an unbound [`crate::ir::Expr::Param`]
+    /// instead of substituting it, so the plan can be cached and bound per run. Set
+    /// by [`parse_prepared`]; the `params` map is empty then.
+    prepared: bool,
 }
 
 impl Parser {
@@ -1711,6 +1729,9 @@ impl Parser {
     fn usize_lit(&mut self) -> Result<usize, String> {
         match self.bump() {
             Some(Tok::Num(n)) if n >= 0.0 && n.fract() == 0.0 => Ok(n as usize),
+            Some(Tok::Param(name)) if self.prepared => Err(format!(
+                "parameter `${name}` in LIMIT/SKIP is not supported in a prepared statement"
+            )),
             Some(Tok::Param(name)) => match self.lookup_param(&name)? {
                 Value::Num(n) if n >= 0.0 && n.fract() == 0.0 => Ok(n as usize),
                 _ => Err(format!("parameter `${name}` is not a non-negative integer")),
@@ -2166,7 +2187,9 @@ impl Parser {
         match self.bump() {
             Some(Tok::Num(n)) => Ok(Value::Num(n)),
             Some(Tok::Str(s)) => Ok(Value::Str(s.into())),
-            Some(Tok::Param(name)) => self.lookup_param(&name),
+            // In prepared mode a `$name` is not a literal — return Err so the caller
+            // (props) re-parses it via the expression path into an `Expr::Param`.
+            Some(Tok::Param(name)) if !self.prepared => self.lookup_param(&name),
             Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("true") => Ok(Value::Bool(true)),
             Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("false") => Ok(Value::Bool(false)),
             Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("null") => Ok(Value::Null),
@@ -4480,11 +4503,16 @@ impl Parser {
                 Ok(Expr::Lit(Value::Str(s.into())))
             }
             Some(Tok::Param(name)) => {
-                // `$name` substitutes to its typed value at parse time; a field chain
-                // may follow (`$rec.k`, `$list[0]`) so route through `field_chain`.
+                // In prepared mode `$name` is an unbound Param (bound per run); a
+                // direct query substitutes it to its typed value now. Either way a
+                // field chain may follow (`$rec.k`, `$list[0]`) → route through it.
                 self.pos += 1;
-                let v = self.lookup_param(&name)?;
-                self.field_chain(Expr::Lit(v))
+                let e = if self.prepared {
+                    Expr::Param(name)
+                } else {
+                    Expr::Lit(self.lookup_param(&name)?)
+                };
+                self.field_chain(e)
             }
             Some(Tok::Ident(s)) => {
                 self.pos += 1;

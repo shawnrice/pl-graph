@@ -102,6 +102,40 @@ unsafe fn out_bytes(bytes: Vec<u8>, out_len: *mut usize) -> *mut u8 {
     Box::into_raw(boxed) as *mut u8
 }
 
+/// Parse a prepared handle out of a `{"handle":"<ptr>"}` field (a decimal string,
+/// since a 64-bit pointer does not fit a JSON f64).
+fn parse_handle_field(fields: &[(String, crate::ndjson::Json)]) -> Result<usize, String> {
+    let j = crate::ndjson::req(fields, "handle")?;
+    let s = crate::ndjson::json_string(j)?;
+    s.parse::<usize>()
+        .map_err(|_| format!("invalid prepared handle `{s}`"))
+}
+
+/// Parse a `prepared_run` payload `{"handle":"<ptr>", "params":{…}}`.
+fn prepared_payload(
+    input: Option<&str>,
+) -> Result<(usize, Vec<(String, crate::value::Value)>), String> {
+    let text = input.ok_or("prepared_run requires a {handle, params} JSON payload")?;
+    let crate::ndjson::Json::Obj(fields) = crate::ndjson::parse_json(text)? else {
+        return Err("prepared_run payload must be a JSON object".into());
+    };
+    let handle = parse_handle_field(&fields)?;
+    let params = match crate::ndjson::field(&fields, "params") {
+        Some(p) => crate::ndjson::params_from_obj(p)?,
+        None => Vec::new(),
+    };
+    Ok((handle, params))
+}
+
+/// Parse a `prepared_free` payload `{"handle":"<ptr>"}`.
+fn prepared_handle(input: Option<&str>) -> Result<usize, String> {
+    let text = input.ok_or("prepared_free requires a {handle} JSON payload")?;
+    let crate::ndjson::Json::Obj(fields) = crate::ndjson::parse_json(text)? else {
+        return Err("prepared_free payload must be a JSON object".into());
+    };
+    parse_handle_field(&fields)
+}
+
 // ----------------------------------------------------------------- plumbing ---
 
 /// The ABI version this artifact implements.
@@ -579,6 +613,70 @@ pub unsafe extern "C" fn lnk_command(
             let json = format!("{{\"epoch\":{}}}", store.epoch(token));
             // SAFETY: out_len is writable per this fn's contract.
             unsafe { out_string(json, out_len) }
+        }
+        // Prepared statements (Design A: parse once, bind + optimize + run per call —
+        // amortizes parse cost across a loop). The handle is the parsed plan's pointer
+        // as a DECIMAL STRING (a 64-bit pointer does not fit a JSON f64 exactly). The
+        // caller owns lifetime: prepare -> N× prepared_run -> prepared_free.
+        "prepare" => {
+            let Some(query) = input else {
+                crate::ffi_error::set("E_FFI", "prepare requires the query text as input");
+                return std::ptr::null_mut();
+            };
+            match crate::gql::parse_prepared(query) {
+                Ok(plan) => {
+                    let handle = Box::into_raw(Box::new(plan)) as usize;
+                    // SAFETY: out_len is writable per this fn's contract.
+                    unsafe { out_string(format!("{{\"handle\":\"{handle}\"}}"), out_len) }
+                }
+                Err(e) => {
+                    crate::ffi_error::set("E_QUERY", &e);
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        "prepared_run" => {
+            // Input: {"handle":"<ptr>", "params":{...}}. Clone the cached plan, bind
+            // the params, optimize + run against this store (the plan is graph-agnostic,
+            // so one prepared statement serves any store).
+            let Some((handle, params)) = (match prepared_payload(input) {
+                Ok(hp) => Some(hp),
+                Err(e) => {
+                    crate::ffi_error::set("E_FFI", &e);
+                    return std::ptr::null_mut();
+                }
+            }) else {
+                return std::ptr::null_mut();
+            };
+            // SAFETY: `handle` came from `prepare`'s Box::into_raw and, per the caller's
+            // lifetime contract, is still live (not yet prepared_free'd).
+            let mut plan = unsafe { (*(handle as *const crate::ir::Plan)).clone() };
+            if let Err(e) = crate::bind::bind_params(&mut plan, &params) {
+                crate::ffi_error::set("E_QUERY", &e);
+                return std::ptr::null_mut();
+            }
+            let plan = crate::opt::optimize_indexed(plan, store);
+            match guarded(|| crate::exec::try_run_gql_json(&plan, store)) {
+                // SAFETY: out_len is writable per this fn's contract.
+                Ok(json) => unsafe { out_string(json, out_len) },
+                Err(e) => {
+                    crate::ffi_error::set("E_QUERY", &e);
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        "prepared_free" => {
+            let handle = match prepared_handle(input) {
+                Ok(h) => h,
+                Err(e) => {
+                    crate::ffi_error::set("E_FFI", &e);
+                    return std::ptr::null_mut();
+                }
+            };
+            // SAFETY: `handle` came from `prepare`'s Box::into_raw and is freed once.
+            drop(unsafe { Box::from_raw(handle as *mut crate::ir::Plan) });
+            // SAFETY: out_len is writable per this fn's contract.
+            unsafe { out_string("{}".to_string(), out_len) }
         }
         // Algorithms are reachable through the conformant GQL path already, so the
         // direct command is a redundant fast-path we have not needed.

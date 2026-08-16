@@ -571,7 +571,14 @@ pub fn parse_json(text: &str) -> Result<Json, String> {
 /// pairs. Each value decodes with the same rules as a stored property value (scalars,
 /// lists, records, tagged temporals). A non-object is an error.
 pub fn parse_params(json: &str) -> Result<Vec<(String, Value)>, String> {
-    match parse_json(json)? {
+    params_from_obj(&parse_json(json)?)
+}
+
+/// Convert an ALREADY-parsed JSON object into query-parameter `(name, value)`
+/// pairs — the nested-value counterpart of [`parse_params`] (which takes text),
+/// for callers that hold a `params` sub-object (e.g. a prepared-statement payload).
+pub fn params_from_obj(obj: &Json) -> Result<Vec<(String, Value)>, String> {
+    match obj {
         Json::Obj(fields) => fields
             .iter()
             .map(|(k, v)| Ok((k.clone(), json_value(v)?)))

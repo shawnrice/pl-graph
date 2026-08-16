@@ -33,6 +33,7 @@ pub mod algo;
 pub mod arrow;
 pub mod batch;
 pub mod binary;
+pub mod bind;
 pub mod cost;
 pub mod exec;
 // The C ABI (`lnk_*` exports). Gated behind `capi` so the engine's `#[no_mangle]`

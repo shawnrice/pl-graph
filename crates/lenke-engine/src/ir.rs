@@ -144,6 +144,13 @@ pub enum Expr {
     },
     /// A constant.
     Lit(Value),
+    /// An unbound query parameter `$name`, produced by the parser ONLY in prepared
+    /// mode ([`crate::gql::parse_prepared`]). A direct `parse_with_params` call
+    /// substitutes `$name` to its [`Lit`](Expr::Param) at parse time and never
+    /// emits this. [`crate::bind::bind_params`] replaces it with the supplied value
+    /// before `opt`/`exec` run, so a `Param` reaching evaluation is an
+    /// unbound-parameter error (the safety net).
+    Param(String),
     /// The current row's PATH as a `Value::List` of node ids. Reading it is what
     /// makes a plan require lineage (see `needs_lineage`); over a plan that does
     /// not track lineage it is NULL.

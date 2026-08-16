@@ -167,15 +167,15 @@ prepared statement) are returned as an integer id into a `Store`-side slab and
 passed back in later commands — so even handle-based features add no pointer-typed
 exports.
 
-| `name`             | input                      | output                 | status                     |
-| ------------------ | -------------------------- | ---------------------- | -------------------------- |
-| `last_write_scope` | scope-key name (raw str)   | `{scopes:[…], open:b}` | **wired** (CDC)            |
-| `epoch`            | token name (raw str)       | `{epoch:N}`            | **wired** (per-token)      |
-| `merge`            | NDJSON text (raw)          | `{nodes:N, edges:M}`   | **wired** (last-wins)      |
-| `algo`             | `{name, config}`           | `{columns, rows}`      | via GQL `CALL` (redundant) |
-| `prepare`          | `{lang, query}`            | `{handle}`             | to build (prepared stmts)  |
-| `prepared_run`     | `{handle, params, format}` | carrier                | to build (prepared stmts)  |
-| `prepared_free`    | `{handle}`                 | `{}`                   | to build (prepared stmts)  |
+| `name`             | input                    | output                 | status                     |
+| ------------------ | ------------------------ | ---------------------- | -------------------------- |
+| `last_write_scope` | scope-key name (raw str) | `{scopes:[…], open:b}` | **wired** (CDC)            |
+| `epoch`            | token name (raw str)     | `{epoch:N}`            | **wired** (per-token)      |
+| `merge`            | NDJSON text (raw)        | `{nodes:N, edges:M}`   | **wired** (last-wins)      |
+| `prepare`          | query text (raw str)     | `{handle:"<ptr>"}`     | **wired** (prepared stmts) |
+| `prepared_run`     | `{handle, params}`       | `{columns, rows}`      | **wired** (prepared stmts) |
+| `prepared_free`    | `{handle}`               | `{}`                   | **wired** (prepared stmts) |
+| `algo`             | `{name, config}`         | `{columns, rows}`      | via GQL `CALL` (redundant) |
 
 `algo` is listed for completeness but is _also_ reachable through
 `lnk_query(lang=GQL, "CALL pagerank(...) YIELD ...")`, which is the conformant
@@ -223,11 +223,23 @@ version**), `query` (GQL + Gremlin JSON; GQL params; **Arrow** raw + IPC, format
 engine's own versioned format (`LNKB` magic + `u16` version header, so a future
 bump is recognized not mis-decoded) for compact/fast browser-local persistence;
 it funnels decode through the shared `build_store`, so fidelity matches NDJSON.
-Every remaining capability returns a specific error — the work-queue before the flip:
+Prepared statements (`prepare`/`prepared_run`/`prepared_free`) are wired too — see
+the pass below. **Every feature core exposes is now reachable** through the 16
+symbols; the only intentional non-command is `algo` (reachable via GQL `CALL`).
 
-- `lnk_command` names still to build: prepared statements (`prepare`/`prepared_*`
-  — needs `Expr::Param` + a bind-pass). `algo` is intentionally not a direct
-  command (reachable via GQL `CALL`).
+### Prepared statements pass (Design A: parse once, bind + run many)
+
+`prepare` parses in prepared mode ([`gql::parse_prepared`], which emits each
+`$name` as an unbound [`Expr::Param`] instead of substituting it) and returns the
+parsed plan's pointer as a decimal-string `handle` (a 64-bit pointer does not fit
+a JSON `f64`). `prepared_run` clones that cached plan, binds the run's params via
+[`bind::bind_params`] (an exhaustive `Param`→`Lit` walk over `Plan`/`Expr`), then
+optimizes + executes — so the parse cost is paid once across a loop. `prepared_free`
+drops the plan. The caller owns handle lifetime. A `Param` that survives binding is
+a loud unbound-parameter error in `eval` (the safety net). Binding-then-optimizing
+produces a plan byte-identical to a direct parameterized query (asserted via `Debug`).
+Not supported in prepared mode: params in `LIMIT`/`SKIP` and literal-only positions
+(INSERT / procedure config), which error at parse.
 
 ### Query params pass (GQL)
 
