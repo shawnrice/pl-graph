@@ -2597,6 +2597,24 @@ impl Store {
         (scopes, open)
     }
 
+    /// [`touched_scopes`](Store::touched_scopes) rendered as the CDC command's JSON
+    /// result: `{"scopes":[…],"open":<bool>}`. A subscriber to scope `S` treats the
+    /// last commit as relevant iff `open || scopes` contains `S`.
+    pub fn last_write_scope_json(&self, scope_key: &str) -> String {
+        let (scopes, open) = self.touched_scopes(scope_key);
+        let mut out = String::from("{\"scopes\":[");
+        for (i, v) in scopes.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            crate::ndjson::encode_value(&mut out, v);
+        }
+        out.push_str("],\"open\":");
+        out.push_str(if open { "true" } else { "false" });
+        out.push('}');
+        out
+    }
+
     /// Record a change into the active transaction's list (no-op outside a txn).
     /// Grows 1:1 with the undo log, so `rollback_to` can truncate both by length.
     fn record_change(&mut self, c: Change) {
@@ -3231,6 +3249,28 @@ mod tests {
         let (scopes2, open2) = st.touched_scopes("room");
         assert!(scopes2.is_empty());
         assert!(open2);
+    }
+
+    #[test]
+    fn last_write_scope_json_renders_scopes_and_open_flag() {
+        let mut st = Builder::default().build();
+        st.begin();
+        st.add_node(&["Msg"], &[("room", s("A"))]);
+        st.add_node(&["Msg"], &[("room", s("B"))]);
+        st.commit();
+        assert_eq!(
+            st.last_write_scope_json("room"),
+            r#"{"scopes":["A","B"],"open":false}"#
+        );
+
+        // An unscopable change (no `room`) flips open to true.
+        st.begin();
+        st.add_node(&["Sys"], &[]);
+        st.commit();
+        assert_eq!(
+            st.last_write_scope_json("room"),
+            r#"{"scopes":[],"open":true}"#
+        );
     }
 
     #[test]

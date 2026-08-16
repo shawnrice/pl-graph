@@ -143,7 +143,7 @@ pub fn encode_str_array(out: &mut String, items: &[String]) {
 }
 
 /// Encode a value as JSON. A non-finite number becomes `null` (no JSON form).
-fn encode_value(out: &mut String, v: &Value) {
+pub fn encode_value(out: &mut String, v: &Value) {
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),

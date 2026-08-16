@@ -167,15 +167,15 @@ prepared statement) are returned as an integer id into a `Store`-side slab and
 passed back in later commands — so even handle-based features add no pointer-typed
 exports.
 
-| `name`             | input                      | output            | tier                          |
-| ------------------ | -------------------------- | ----------------- | ----------------------------- |
-| `algo`             | `{name, config}`           | `{columns, rows}` | also reachable via GQL `CALL` |
-| `prepare`          | `{lang, query}`            | `{handle}`        | prepared statements           |
-| `prepared_run`     | `{handle, params, format}` | carrier           | prepared statements           |
-| `prepared_free`    | `{handle}`                 | `{}`              | prepared statements           |
-| `last_write_scope` | `{}`                       | `{scope}`         | CDC                           |
-| `epoch`            | `{name}`                   | `{epoch}`         | per-token change epoch        |
-| `merge`            | `{format, bytes}`          | `{}`              | fork / merge                  |
+| `name`             | input                      | output                 | status                     |
+| ------------------ | -------------------------- | ---------------------- | -------------------------- |
+| `last_write_scope` | scope-key name (raw str)   | `{scopes:[…], open:b}` | **wired** (CDC)            |
+| `algo`             | `{name, config}`           | `{columns, rows}`      | via GQL `CALL` (redundant) |
+| `prepare`          | `{lang, query}`            | `{handle}`             | to build (prepared stmts)  |
+| `prepared_run`     | `{handle, params, format}` | carrier                | to build (prepared stmts)  |
+| `prepared_free`    | `{handle}`                 | `{}`                   | to build (prepared stmts)  |
+| `epoch`            | token name (raw str)       | `{epoch}`              | to build (per-token epoch) |
+| `merge`            | `{format, bytes}`          | `{}`                   | to build (fork / merge)    |
 
 `algo` is listed for completeness but is _also_ reachable through
 `lnk_query(lang=GQL, "CALL pagerank(...) YIELD ...")`, which is the conformant
@@ -216,15 +216,19 @@ transport reshape — byte-identity and the conformance suites are unaffected.
 The skeleton exports all 16 symbols today. Wired to existing `Store` methods:
 `abi_version`, `alloc`/`dealloc`/`free`, `last_error_json`, `open` (NDJSON +
 empty), `close`, `clone` (deep copy), `config`, `stat` (counts **and version**),
-`query` (GQL + Gremlin, JSON format, param-free), `tx`, `encode` (NDJSON),
-`schema_apply` + `schema_dump` (see [`src/schema_op.rs`](../src/schema_op.rs)).
-Every remaining capability returns a specific error — that stub list **is** the
-work-queue to finish before the flip:
+`query` (GQL + Gremlin JSON; GQL params; **Arrow IPC** format 2), `tx`, `encode`
+(NDJSON), `schema_apply` + `schema_dump`, and `lnk_command "last_write_scope"`
+(CDC). Every remaining capability returns a specific error — that stub list **is**
+the work-queue to finish before the flip:
 
-- `lnk_query` Arrow / Arrow-IPC formats (deferred tier)
-- `lnk_open` / `lnk_encode` binary-snapshot format (deferred tier; NDJSON covers it)
-- `lnk_command` names (deferred tiers: `algo`, prepared statements, `epoch`,
-  `last_write_scope`, `merge`)
+- `lnk_query` **raw Arrow (format 1)** — the zero-copy ARW1 blob; needs an
+  8-byte-aligned allocator + its own free path (core has a separate `lnk_free_arrow`
+  for exactly this). Deferred pending that free-path decision; Arrow **IPC**
+  (format 2) is wired and covers the DuckDB/Polars/pandas handoff.
+- `lnk_open` / `lnk_encode` binary-snapshot format (needs a binary codec; NDJSON covers it)
+- `lnk_command` names still to build in the engine: `algo` (already reachable via
+  GQL `CALL`, so the direct command is a redundant fast-path), prepared statements,
+  `epoch`, `merge`
 
 ### Query params pass (GQL)
 

@@ -71,12 +71,23 @@ unsafe fn out_string(s: String, out_len: *mut usize) -> *mut u8 {
 }
 
 /// Run a query closure behind a panic backstop: a fault fails this ONE call with
-/// a null return, never unwinds across the `extern "C"` boundary (which is UB).
-fn guarded<F: FnOnce() -> Result<String, String>>(f: F) -> Result<String, String> {
+/// an error, never unwinds across the `extern "C"` boundary (which is UB).
+fn guarded<T, F: FnOnce() -> Result<T, String>>(f: F) -> Result<T, String> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(r) => r,
         Err(_) => Err("query evaluation panicked".to_string()),
     }
+}
+
+/// Hand a heap `Vec<u8>` back as a `(ptr, len)` buffer freed with [`lnk_free`].
+///
+/// # Safety
+/// `out_len` must be a valid, writable pointer.
+unsafe fn out_bytes(bytes: Vec<u8>, out_len: *mut usize) -> *mut u8 {
+    let boxed = bytes.into_boxed_slice();
+    // SAFETY: the caller's contract requires out_len writable.
+    unsafe { *out_len = boxed.len() };
+    Box::into_raw(boxed) as *mut u8
 }
 
 // ----------------------------------------------------------------- plumbing ---
@@ -263,11 +274,6 @@ pub unsafe extern "C" fn lnk_query(
         crate::ffi_error::set("E_FFI", "null store handle or non-UTF-8 query");
         return std::ptr::null_mut();
     };
-    if format != 0 {
-        // TODO: Arrow / Arrow-IPC formats (the engine has an `arrow` module; wire it here).
-        crate::ffi_error::set("E_UNIMPLEMENTED", "Arrow query formats are not yet wired");
-        return std::ptr::null_mut();
-    }
     // Decode the JSON params object (`{"name": value, …}`); null / empty = none.
     let params = if p_ptr.is_null() || p_len == 0 {
         Vec::new()
@@ -284,6 +290,48 @@ pub unsafe extern "C" fn lnk_query(
             }
         }
     };
+    // Arrow output (GQL only): run to a Rows batch, then frame it. Format 1 (the raw
+    // zero-copy ARW1 blob) needs an 8-byte-aligned allocator + its own free path, so it
+    // is deferred; format 2 (the portable Arrow IPC / Feather byte stream) has neither
+    // constraint and is the DuckDB/Polars/pandas handoff.
+    if format != 0 {
+        if lang != 0 {
+            crate::ffi_error::set("E_FFI", "Arrow output is only available for GQL queries");
+            return std::ptr::null_mut();
+        }
+        let rows = match crate::gql::parse_with_params(q, &params) {
+            Ok(plan) => {
+                let plan = crate::opt::optimize_indexed(plan, store);
+                guarded(|| crate::exec::try_run(&plan, store))
+            }
+            Err(e) => Err(e),
+        };
+        let rows = match rows {
+            Ok(r) => r,
+            Err(e) => {
+                crate::ffi_error::set("E_QUERY", &e);
+                return std::ptr::null_mut();
+            }
+        };
+        return match format {
+            2 => {
+                let ipc = crate::arrow::to_arrow_ipc(&rows, true);
+                // SAFETY: out_len is writable per this fn's contract.
+                unsafe { out_bytes(ipc, out_len) }
+            }
+            1 => {
+                crate::ffi_error::set(
+                    "E_UNIMPLEMENTED",
+                    "raw Arrow (format 1) needs an aligned buffer; use Arrow IPC (format 2)",
+                );
+                std::ptr::null_mut()
+            }
+            _ => {
+                crate::ffi_error::set("E_FFI", "unknown query format");
+                std::ptr::null_mut()
+            }
+        };
+    }
     let result = match lang {
         0 => match crate::gql::parse_with_params(q, &params) {
             Ok(plan) => {
@@ -401,9 +449,8 @@ pub unsafe extern "C" fn lnk_schema_dump(s: *const Store, out_len: *mut usize) -
         crate::ffi_error::set("E_FFI", "null store handle");
         return std::ptr::null_mut();
     };
-    // The constraints, in the same `{"op":…}` vocabulary lnk_schema_apply consumes, so
-    // dump -> apply round-trips. Indexes are not yet enumerable on Store (a documented
-    // gap in schema_op::dump), so they are omitted rather than faked.
+    // Indexes and constraints, in the same `{"op":…}` vocabulary lnk_schema_apply
+    // consumes, so dump -> apply round-trips (see schema_op::dump).
     let ops = crate::schema_op::dump(store);
     // SAFETY: out_len is writable per this fn's contract.
     unsafe { out_string(ops, out_len) }
@@ -465,28 +512,43 @@ pub unsafe extern "C" fn lnk_command(
 ) -> *mut u8 {
     crate::ffi_error::begin();
     // SAFETY: forwards this fn's contract to the shims.
-    let (Some(_store), Some(name)) = (unsafe { store_mut(s) }, unsafe {
+    let (Some(store), Some(name)) = (unsafe { store_mut(s) }, unsafe {
         in_str(name_ptr, name_len)
     }) else {
         crate::ffi_error::set("E_FFI", "null store handle or non-UTF-8 command name");
         return std::ptr::null_mut();
     };
-    let _input = unsafe { in_str(in_ptr, in_len) }; // JSON/bytes payload (per command)
-    let _ = out_len;
-    // TODO: dispatch table. Each arm wires an existing engine capability:
-    //   "algo"             => crate::algo::run_procedure(..)  (also reachable via GQL CALL)
-    //   "prepare"          => build a Prepared, return {handle} (id into a Store-side slab)
-    //   "prepared_run"     => run by handle
-    //   "prepared_free"    => drop by handle
-    //   "last_write_scope" => the CDC scope of the last write
-    //   "merge"            => merge an NDJSON/binary payload into this store
-    // Deliberate single-arm dispatch: the shape is a match so filling a tier adds an arm.
-    #[allow(clippy::match_single_binding)]
+    // The per-command JSON/bytes payload (interpretation is command-specific).
+    let input = unsafe { in_str(in_ptr, in_len) };
     match name {
-        _ => {
+        // CDC: the content-derived scopes the last commit touched, plus a fail-open
+        // flag. Input is the scope-key property name; output `{"scopes":[…],"open":b}`.
+        "last_write_scope" => {
+            let Some(scope_key) = input else {
+                crate::ffi_error::set(
+                    "E_FFI",
+                    "last_write_scope requires the scope-key name as the input payload",
+                );
+                return std::ptr::null_mut();
+            };
+            // SAFETY: out_len is writable per this fn's contract.
+            unsafe { out_string(store.last_write_scope_json(scope_key), out_len) }
+        }
+        // Algorithms are reachable through the conformant GQL path already, so the
+        // direct command is a redundant fast-path we have not needed.
+        "algo" => {
             crate::ffi_error::set(
                 "E_UNIMPLEMENTED",
-                &format!("command '{name}' is not yet implemented"),
+                "run algorithms via GQL: lnk_query(GQL, \"CALL <name>(...) YIELD ...\")",
+            );
+            std::ptr::null_mut()
+        }
+        // Remaining exotic tiers (prepared statements, epoch, merge, binary snapshot)
+        // are not yet built in the engine — each fills an arm here, never a new symbol.
+        other => {
+            crate::ffi_error::set(
+                "E_UNIMPLEMENTED",
+                &format!("command '{other}' is not yet implemented"),
             );
             std::ptr::null_mut()
         }
