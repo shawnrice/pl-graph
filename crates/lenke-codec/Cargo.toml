@@ -1,0 +1,19 @@
+[package]
+name = "lenke-codec"
+version = "0.0.0"
+edition = "2021"
+description = "Shared graph serialization codecs (pg-json, pg-text, graphson, csv) over a neutral graph model, used by both lenke-core and lenke-engine so the format logic lives in ONE place."
+license = "Apache-2.0"
+
+# Self-contained on purpose: no dependency on lenke-core or lenke-engine. The codecs
+# operate on a NEUTRAL data model (GraphData + Value); each engine converts its own
+# graph to/from that model, so the byte-for-byte format logic is written once here.
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+
+[dev-dependencies]
