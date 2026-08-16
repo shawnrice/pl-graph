@@ -229,10 +229,10 @@ pub fn encode_string(out: &mut String, s: &str) {
 }
 
 /// A staged node record: `(external id, labels, props)`.
-type NodeRec = (String, Vec<String>, Vec<(String, Value)>);
+pub(crate) type NodeRec = (String, Vec<String>, Vec<(String, Value)>);
 /// A staged edge record: `(from-id, to-id, edge id?, labels, props)` — an edge's
 /// first label is its type, the rest are secondary (multi-label edges).
-type EdgeRec = (
+pub(crate) type EdgeRec = (
     String,
     String,
     Option<String>,
@@ -240,14 +240,14 @@ type EdgeRec = (
     Vec<(String, Value)>,
 );
 
-/// The decoded-but-not-yet-applied contents of an NDJSON document. Shared by
-/// [`from_ndjson`] (build a fresh store) and [`merge_ndjson`] (apply into an
-/// existing one) so both read exactly one NDJSON dialect.
-struct StagedNdjson {
-    constraints: Vec<(String, Vec<String>)>,
-    required: Vec<(String, String)>,
-    nodes: Vec<NodeRec>,
-    edges: Vec<EdgeRec>,
+/// The decoded-but-not-yet-applied contents of a full-graph document. Shared by
+/// [`from_ndjson`] / [`merge_ndjson`] and the binary codec ([`crate::binary`]) so
+/// every full-graph decoder feeds the one [`build_store`] path.
+pub(crate) struct StagedNdjson {
+    pub(crate) constraints: Vec<(String, Vec<String>)>,
+    pub(crate) required: Vec<(String, String)>,
+    pub(crate) nodes: Vec<NodeRec>,
+    pub(crate) edges: Vec<EdgeRec>,
 }
 
 /// Parse an NDJSON document into staged records. External ids are PRESERVED
@@ -405,16 +405,22 @@ pub fn merge_ndjson(store: &mut Store, text: &str) -> Result<(), String> {
 /// graph with deletions re-densifies on load — round-trip is exact for a gap-free
 /// dump and STABLE from the first reload otherwise.
 pub fn from_ndjson(text: &str) -> Result<Store, String> {
+    build_store(stage_ndjson(text)?)
+}
+
+/// Build a `Store` from staged records — the shared tail of every full-graph
+/// decoder ([`from_ndjson`] and [`crate::binary::from_binary`]). Applies schema
+/// BEFORE data (the store is empty, so declaration always succeeds — INSERT-time
+/// enforcement on the reloaded store matches), then finalizes the read overlays.
+pub(crate) fn build_store(staged: StagedNdjson) -> Result<Store, String> {
     let StagedNdjson {
         constraints,
         required,
         nodes,
         edges,
-    } = stage_ndjson(text)?;
+    } = staged;
 
     let mut store = Store::default();
-    // Apply schema BEFORE data (the store is still empty, so declaration always
-    // succeeds) — so INSERT-time enforcement on the reloaded store matches.
     for (label, keys) in &constraints {
         let krefs: Vec<&str> = keys.iter().map(String::as_str).collect();
         store.create_unique_constraint(label, &krefs)?;

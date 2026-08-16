@@ -215,14 +215,16 @@ transport reshape — byte-identity and the conformance suites are unaffected.
 
 The skeleton exports all 16 symbols today. Wired to existing `Store` methods:
 `abi_version`, `alloc`/`dealloc`/`free`, `last_error_json`, `open` (NDJSON +
-empty), `close`, `clone` (deep copy), `config`, `stat` (counts **and version**),
-`query` (GQL + Gremlin JSON; GQL params; **Arrow** raw + IPC, formats 1/2), `tx`, `encode`
-(NDJSON), `schema_apply` + `schema_dump`, and `lnk_command` for `last_write_scope`
-(CDC), `epoch` (per-token), and `merge` (last-wins). Every remaining capability
-returns a specific error — that stub list **is** the work-queue before the flip:
+empty + **binary**), `close`, `clone` (deep copy), `config`, `stat` (counts **and
+version**), `query` (GQL + Gremlin JSON; GQL params; **Arrow** raw + IPC, formats
+1/2), `tx`, `encode` (NDJSON + **binary**), `schema_apply` + `schema_dump`, and
+`lnk_command` for `last_write_scope` (CDC), `epoch` (per-token), and `merge`
+(last-wins). The binary snapshot ([`src/binary.rs`](../src/binary.rs)) is the
+engine's own versioned format (`LNKB` magic + `u16` version header, so a future
+bump is recognized not mis-decoded) for compact/fast browser-local persistence;
+it funnels decode through the shared `build_store`, so fidelity matches NDJSON.
+Every remaining capability returns a specific error — the work-queue before the flip:
 
-- `lnk_open` / `lnk_encode` binary-snapshot format (needs a binary codec; NDJSON
-  already gives full-fidelity persistence, so binary is a size/speed optimization)
 - `lnk_command` names still to build: prepared statements (`prepare`/`prepared_*`
   — needs `Expr::Param` + a bind-pass). `algo` is intentionally not a direct
   command (reachable via GQL `CALL`).

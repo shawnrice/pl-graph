@@ -59,6 +59,18 @@ unsafe fn in_str<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
     std::str::from_utf8(bytes).ok()
 }
 
+/// Borrow a caller-owned byte buffer (arbitrary bytes, not UTF-8; null → `None`).
+///
+/// # Safety
+/// If non-null, `ptr`/`len` must describe a readable, initialized range valid for `'a`.
+unsafe fn in_bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: ptr non-null (checked); the caller's contract requires a readable range for 'a.
+    Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
 /// Hand a heap `String` back as a `(ptr, len)` buffer freed with [`lnk_free`].
 ///
 /// # Safety
@@ -165,11 +177,18 @@ pub unsafe extern "C" fn lnk_open(ptr: *const u8, len: usize, format: u8) -> *mu
             }
         }
         1 => {
-            crate::ffi_error::set(
-                "E_UNIMPLEMENTED",
-                "binary snapshot load is not yet implemented",
-            );
-            std::ptr::null_mut()
+            // SAFETY: forwards this fn's contract to the byte-slice shim.
+            let Some(bytes) = (unsafe { in_bytes(ptr, len) }) else {
+                crate::ffi_error::set("E_FFI", "null binary snapshot pointer");
+                return std::ptr::null_mut();
+            };
+            match crate::binary::from_binary(bytes) {
+                Ok(store) => Box::into_raw(Box::new(store)),
+                Err(e) => {
+                    crate::ffi_error::set("E_BINARY", &e);
+                    std::ptr::null_mut()
+                }
+            }
         }
         _ => {
             crate::ffi_error::set("E_FFI", "unknown open format");
@@ -471,11 +490,8 @@ pub unsafe extern "C" fn lnk_encode(s: *const Store, format: u8, out_len: *mut u
             unsafe { out_string(text, out_len) }
         }
         1 => {
-            crate::ffi_error::set(
-                "E_UNIMPLEMENTED",
-                "binary snapshot encode is not yet implemented",
-            );
-            std::ptr::null_mut()
+            // SAFETY: out_len is writable per this fn's contract.
+            unsafe { out_bytes(crate::binary::to_binary(store), out_len) }
         }
         _ => {
             crate::ffi_error::set("E_FFI", "unknown encode format");
