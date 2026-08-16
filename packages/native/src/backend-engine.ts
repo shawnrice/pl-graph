@@ -10,11 +10,12 @@
  * the exotic tiers ride `command(name, input)`. The schema-DDL family becomes one
  * `schemaApply(json)` op vocabulary.
  *
- * A handful of core methods have no engine equivalent yet (type / cardinality /
- * edge constraints, validators, invariants, direct `algo`, the pg/graphson/csv
- * codecs, prepared-Arrow). Those throw a clear `E_UNSUPPORTED` (or the engine's own
- * "not supported yet" from `schemaApply`), so a conformance run shows the exact gap
- * rather than silently diverging.
+ * The serialization codecs (ndjson, binary, and — via the shared `lenke-codec`
+ * crate — pg-json, pg-text, graphson, csv) are fully wired. A handful of core
+ * methods still have no engine equivalent (type / cardinality / edge constraints,
+ * validators, invariants, direct `algo`, prepared-Arrow). Those throw a clear
+ * `E_UNSUPPORTED` (or the engine's own "not supported yet" from `schemaApply`),
+ * so a conformance run shows the exact gap rather than silently diverging.
  */
 import { ErrorCode, LenkeError } from '@lenke/errors';
 
@@ -28,7 +29,10 @@ import type { SchemaOp } from './graph.js';
  */
 export type EngineAbi = {
   readonly abiVersion: number;
-  /** `lnk_open` — format 0 = NDJSON (null bytes = empty graph), 1 = binary. */
+  /**
+   * `lnk_open` — format 0 = NDJSON (null bytes = empty graph), 1 = binary,
+   * 2 = pg-json, 3 = pg-text, 4 = graphson, 5 = csv.
+   */
   open: (bytes: Uint8Array | null, format: number) => GraphHandle;
   /** `lnk_close`. */
   close: (handle: GraphHandle) => void;
@@ -52,7 +56,10 @@ export type EngineAbi = {
   schemaApply: (handle: GraphHandle, json: string) => void;
   /** `lnk_schema_dump` — the `{op:…}` op-list as NDJSON bytes. */
   schemaDump: (handle: GraphHandle) => Uint8Array;
-  /** `lnk_encode` — format 0 = NDJSON, 1 = binary. */
+  /**
+   * `lnk_encode` — format 0 = NDJSON, 1 = binary, 2 = pg-json, 3 = pg-text,
+   * 4 = graphson, 5 = csv.
+   */
   encode: (handle: GraphHandle, format: number) => Uint8Array;
   /** `lnk_command` — a named exotic-tier op (algo/CDC/epoch/merge/prepared). */
   command: (handle: GraphHandle, name: string, input: string | Uint8Array | null) => Uint8Array;
@@ -64,8 +71,17 @@ const LANG_GREMLIN = 1;
 const FMT_JSON = 0;
 const FMT_ARROW = 1;
 const FMT_ARROW_IPC = 2;
+// lnk_open / lnk_encode `format` bytes. 0/1 are the engine's native channels;
+// 2..5 route through the shared lenke-codec bridge (byte-identical with core).
 const FMT_NDJSON = 0;
 const FMT_BINARY = 1;
+/** The textual codecs handled by the shared crate, mapped to their format byte. */
+const CODEC_FORMAT: Record<string, number> = {
+  'pg-json': 2,
+  'pg-text': 3,
+  graphson: 4,
+  csv: 5,
+};
 const TX_BEGIN = 0;
 const TX_COMMIT = 1;
 const TX_ROLLBACK = 2;
@@ -257,6 +273,12 @@ export const buildEngineBackend = (abi: EngineAbi): Backend => {
         return abi.encode(handle, FMT_BINARY);
       }
 
+      const fmt = CODEC_FORMAT[format];
+
+      if (fmt !== undefined) {
+        return abi.encode(handle, fmt);
+      }
+
       return unsupported(`serialize('${format}')`);
     },
     deserialize: (input, format) => {
@@ -266,6 +288,12 @@ export const buildEngineBackend = (abi: EngineAbi): Backend => {
 
       if (format === 'binary') {
         return abi.open(input, FMT_BINARY);
+      }
+
+      const fmt = CODEC_FORMAT[format];
+
+      if (fmt !== undefined) {
+        return abi.open(input, fmt);
       }
 
       return unsupported(`deserialize('${format}')`);

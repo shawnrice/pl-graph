@@ -114,11 +114,32 @@ const suite = (name: string, make: () => Promise<Backend> | Backend) => {
       [g, g2, g3].forEach((h) => be.graphFree(h));
     });
 
+    test('textual codecs round-trip (pg-json, pg-text, graphson, csv)', async () => {
+      const be = await make();
+      const g = be.graphFromNdjson(NDJSON, false);
+
+      for (const fmt of ['pg-json', 'pg-text', 'graphson', 'csv']) {
+        const blob = be.serialize(g, fmt);
+        const back = be.deserialize(blob, fmt);
+        expect(be.vertexCount(back)).toBe(2);
+        expect(be.edgeCount(back)).toBe(1);
+        be.graphFree(back);
+      }
+
+      be.graphFree(g);
+    });
+
+    test('an unknown serialization format is reported', async () => {
+      const be = await make();
+      const g = be.graphFromNdjson(NDJSON, false);
+      expect(() => be.serialize(g, 'nope')).toThrow();
+      be.graphFree(g);
+    });
+
     test('unsupported methods throw E_UNSUPPORTED', async () => {
       const be = await make();
       const g = be.graphFromNdjson(NDJSON, false);
       expect(() => be.createValidator(g, 'P', 'p', 'p.age >= 0')).toThrow();
-      expect(() => be.serialize(g, 'graphson')).toThrow();
       be.graphFree(g);
     });
   });
