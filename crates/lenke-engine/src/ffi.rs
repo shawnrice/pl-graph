@@ -186,7 +186,8 @@ pub use crate::ffi_error::lnk_last_error_json;
 // ---------------------------------------------------------------- lifecycle ---
 
 /// Build a `Store`. `format`: 0 = NDJSON (a null `ptr` yields an empty graph),
-/// 1 = binary snapshot. Null on error (detail on the error channel).
+/// 1 = binary snapshot, 2 = pg-json, 3 = pg-text, 4 = graphson, 5 = csv. Null on
+/// error (detail on the error channel).
 ///
 /// # Safety
 /// If non-null, `ptr`/`len` must describe a readable byte range.
@@ -225,10 +226,38 @@ pub unsafe extern "C" fn lnk_open(ptr: *const u8, len: usize, format: u8) -> *mu
                 }
             }
         }
+        // The shared textual codecs (pg-json/pg-text/graphson/csv), via the neutral
+        // GraphData bridge — one byte-identical implementation with lenke-core.
         _ => {
-            crate::ffi_error::set("E_FFI", "unknown open format");
-            std::ptr::null_mut()
+            let Some(name) = codec_format_name(format) else {
+                crate::ffi_error::set("E_UNKNOWN_FORMAT", "unknown open format");
+                return std::ptr::null_mut();
+            };
+            // SAFETY: forwards this fn's contract to in_str.
+            let Some(text) = (unsafe { in_str(ptr, len) }) else {
+                crate::ffi_error::set("E_FFI", "codec input is not valid UTF-8");
+                return std::ptr::null_mut();
+            };
+            match crate::codec::deserialize(text, name) {
+                Ok(store) => Box::into_raw(Box::new(store)),
+                Err(e) => {
+                    crate::ffi_error::set(e.code, &e.message);
+                    std::ptr::null_mut()
+                }
+            }
         }
+    }
+}
+
+/// The textual-codec name for a `lnk_open`/`lnk_encode` format byte >= 2, or
+/// `None` for an unknown byte. NDJSON (0) and binary (1) are handled inline.
+fn codec_format_name(format: u8) -> Option<&'static str> {
+    match format {
+        2 => Some("pg-json"),
+        3 => Some("pg-text"),
+        4 => Some("graphson"),
+        5 => Some("csv"),
+        _ => None,
     }
 }
 
@@ -404,7 +433,10 @@ pub unsafe extern "C" fn lnk_query(
             // Gremlin bindings are a distinct mechanism (bytecode bindings); the engine
             // does not accept parameters on the Gremlin path yet.
             if !params.is_empty() {
-                crate::ffi_error::set("E_UNSUPPORTED", "Gremlin query parameters are not supported");
+                crate::ffi_error::set(
+                    "E_UNSUPPORTED",
+                    "Gremlin query parameters are not supported",
+                );
                 return std::ptr::null_mut();
             }
             let plan = match crate::gremlin::parse(q) {
@@ -516,8 +548,9 @@ pub unsafe extern "C" fn lnk_schema_dump(s: *const Store, out_len: *mut usize) -
 
 // ------------------------------------------------------------------ snapshot ---
 
-/// Encode the graph's data channel. `format`: 0 = NDJSON, 1 = binary. Pairs with
-/// [`lnk_schema_dump`] for a full snapshot. Null on error.
+/// Encode the graph's data channel. `format`: 0 = NDJSON, 1 = binary, 2 = pg-json,
+/// 3 = pg-text, 4 = graphson, 5 = csv. Pairs with [`lnk_schema_dump`] for a full
+/// snapshot. Null on error.
 ///
 /// # Safety
 /// `s` valid; `out_len` writable.
@@ -539,9 +572,20 @@ pub unsafe extern "C" fn lnk_encode(s: *const Store, format: u8, out_len: *mut u
             // SAFETY: out_len is writable per this fn's contract.
             unsafe { out_bytes(crate::binary::to_binary(store), out_len) }
         }
+        // The shared textual codecs, via the neutral GraphData bridge.
         _ => {
-            crate::ffi_error::set("E_FFI", "unknown encode format");
-            std::ptr::null_mut()
+            let Some(name) = codec_format_name(format) else {
+                crate::ffi_error::set("E_UNKNOWN_FORMAT", "unknown encode format");
+                return std::ptr::null_mut();
+            };
+            match crate::codec::serialize(store, name) {
+                // SAFETY: out_len is writable per this fn's contract.
+                Ok(text) => unsafe { out_string(text, out_len) },
+                Err(e) => {
+                    crate::ffi_error::set(e.code, &e.message);
+                    std::ptr::null_mut()
+                }
+            }
         }
     }
 }

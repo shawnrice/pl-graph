@@ -27,6 +27,12 @@ capi = []
 
 [dependencies]
 
+# The shared serialization codecs (pg-json/pg-text/graphson/csv) over a neutral
+# graph model — the SAME crate lenke-core uses, so both engines emit byte-identical
+# format output from identical data. Zero-dep and wasm-clean; the engine supplies
+# only the Store<->GraphData bridge (see `src/codec.rs`).
+lenke-codec = { path = "../lenke-codec" }
+
 # The Gremlin `regex()` / `TextP.regex()` predicate. The ONE runtime dependency:
 # byte-identity with core's regex predicate requires the SAME engine, so the crate
 # and its feature set mirror lenke-core exactly (linear-time, no backreferences/

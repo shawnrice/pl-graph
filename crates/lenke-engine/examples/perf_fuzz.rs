@@ -666,7 +666,10 @@ fn main() {
     // as-is) on the SAME fixture and harness. For attributing a specific optimization.
     if let Ok(path) = std::env::var("FUZZ_QUERIES") {
         let text = std::fs::read_to_string(&path).expect("read FUZZ_QUERIES file");
-        println!("targeted: timing queries from {path}\n  {:>7} {:>9} {:>9}  query", "ratio", "eng_ms", "core_ms");
+        println!(
+            "targeted: timing queries from {path}\n  {:>7} {:>9} {:>9}  query",
+            "ratio", "eng_ms", "core_ms"
+        );
         for line in text.lines() {
             let q = line.rsplit("  ").next().unwrap_or(line).trim();
             let up = q.to_ascii_uppercase();
@@ -896,7 +899,10 @@ fn main() {
         rows.sort_by(|a, b| a.query.cmp(&b.query));
         let mut out = String::new();
         for r in rows {
-            out.push_str(&format!("{:.3}\t{}\t{}\t{}\n", r.ratio, r.e_ms, r.rows, r.query));
+            out.push_str(&format!(
+                "{:.3}\t{}\t{}\t{}\n",
+                r.ratio, r.e_ms, r.rows, r.query
+            ));
         }
         match std::fs::write(&path, out) {
             Ok(()) => eprintln!("wrote {} timed templates to {path}", results.len()),
@@ -914,7 +920,11 @@ fn first_line(s: &str) -> String {
 fn dump_skip(side: &str, why: &str, q: &str) {
     if let Ok(path) = std::env::var("FUZZ_SKIP_DUMP") {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             let _ = writeln!(f, "{side}\t{why}\t{q}");
         }
     }
