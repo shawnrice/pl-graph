@@ -627,9 +627,10 @@ struct ValidatorRule {
     target: String,
     var: String,
     src: String,
-    // Read by the exec-layer validator enforcement (wired next).
-    #[allow(dead_code)]
-    pred: crate::ir::Expr,
+    /// The composed check queries (vertex + edge form of `MATCH (var:target) WHERE
+    /// NOT (src) RETURN var LIMIT 1`) — a non-empty result is a violation. Built by
+    /// the exec layer at declaration, run by it on every write.
+    checks: Vec<crate::ir::Plan>,
 }
 
 /// A declared INVARIANT: a whole-graph GQL query (`plan`, from `src`) that must
@@ -638,8 +639,8 @@ struct ValidatorRule {
 struct InvariantRule {
     name: String,
     src: String,
-    // Read by the exec-layer invariant enforcement (wired next).
-    #[allow(dead_code)]
+    /// The parsed whole-graph query; run by the exec layer on every write — any
+    /// boolean-`false` cell in the result is a violation.
     plan: crate::ir::Plan,
 }
 
@@ -1922,6 +1923,53 @@ impl Store {
         self.invariants
             .iter()
             .map(|r| (r.name.clone(), r.src.clone()))
+            .collect()
+    }
+
+    /// Store a validator (`target` = a vertex label or edge type, `var` = the bound
+    /// name, `src` = the predicate). `checks` are the composed check queries the
+    /// exec layer built (it does the declaration-time evaluation before calling).
+    pub(crate) fn declare_validator(
+        &mut self,
+        target: &str,
+        var: &str,
+        src: &str,
+        checks: Vec<crate::ir::Plan>,
+    ) {
+        self.validators.push(ValidatorRule {
+            target: target.to_string(),
+            var: var.to_string(),
+            src: src.to_string(),
+            checks,
+        });
+    }
+
+    /// Store an invariant (replacing any prior one of the same `name`). The exec
+    /// layer parses `plan` and runs the declaration-time check before calling.
+    pub(crate) fn declare_invariant(&mut self, name: &str, src: &str, plan: crate::ir::Plan) {
+        self.invariants.retain(|r| r.name != name);
+        self.invariants.push(InvariantRule {
+            name: name.to_string(),
+            src: src.to_string(),
+            plan,
+        });
+    }
+
+    /// Every validator check query — a non-empty result from any is a violation.
+    #[must_use]
+    pub(crate) fn validator_check_plans(&self) -> Vec<&crate::ir::Plan> {
+        self.validators
+            .iter()
+            .flat_map(|r| r.checks.iter())
+            .collect()
+    }
+
+    /// Every invariant as `(name, query plan)` — a boolean-`false` cell is a violation.
+    #[must_use]
+    pub(crate) fn invariant_plans(&self) -> Vec<(&str, &crate::ir::Plan)> {
+        self.invariants
+            .iter()
+            .map(|r| (r.name.as_str(), &r.plan))
             .collect()
     }
 

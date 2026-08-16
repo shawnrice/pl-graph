@@ -551,7 +551,9 @@ pub unsafe extern "C" fn lnk_schema_apply(
         return -1;
     };
     use crate::schema_op::SchemaError;
-    match crate::schema_op::apply(store, json) {
+    // The exec layer is the single schema entry point: it handles validator /
+    // invariant ops (which need the query evaluator) and delegates the rest.
+    match crate::exec::apply_schema_op(store, json) {
         Ok(()) => 0,
         Err(SchemaError::BadRequest(msg)) => {
             crate::ffi_error::set("E_FFI", &msg);
