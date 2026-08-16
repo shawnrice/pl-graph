@@ -30,11 +30,11 @@ core of the pattern; this completes it and drops the prefix.
 | Group        | Symbols                                                                              | How the fold works                                                                                                          |
 | ------------ | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
 | Plumbing     | `lnk_abi_version`, `lnk_alloc`, `lnk_dealloc`, `lnk_free`, `lnk_last_error_json` (5) | one `lnk_free` for every engine-returned buffer (core had `free_buf` + `free_arrow`)                                        |
-| Lifecycle    | `lnk_open`, `lnk_close`, `lnk_clone`, `lnk_config`, `lnk_stat` (5)                   | `lnk_stat(which)` folds the 4 count/version/epoch getters; `lnk_open(…, format)` folds ndjson + binary + empty construction |
+| Lifecycle    | `lnk_open`, `lnk_close`, `lnk_clone`, `lnk_config`, `lnk_stat` (5)                   | `lnk_stat(which)` folds the 4 count/version/epoch getters; `lnk_open(…, format)` folds ndjson + binary + pg-json/pg-text/graphson/csv + empty construction |
 | Query        | `lnk_query` (1)                                                                      | `lnk_query(lang, …, format, …)` folds `query_rows` + `gremlin_json` + `query_arrow` + `query_arrow_ipc`                     |
 | Transaction  | `lnk_tx` (1)                                                                         | `lnk_tx(action)` folds begin/commit/rollback                                                                                |
 | Schema       | `lnk_schema_apply`, `lnk_schema_dump` (2)                                            | `schema_apply(json)` folds all 10 `create_*` + 2 `drop_*`; `schema_dump` folds the 2 index-introspection reads              |
-| Snapshot     | `lnk_encode` (1)                                                                     | `lnk_encode(format)` folds ndjson + binary out                                                                              |
+| Snapshot     | `lnk_encode` (1)                                                                     | `lnk_encode(format)` folds ndjson + binary + pg-json/pg-text/graphson/csv out                                               |
 | Escape hatch | `lnk_command` (1)                                                                    | every exotic tier — no new symbols, ever                                                                                    |
 
 **16 symbols, fixed.** Compare to core's 44-and-counting.
@@ -61,12 +61,16 @@ core of the pattern; this completes it and drops the prefix.
 ## Enum parameters (the "parameterize, don't multiply" levers)
 
 ```
-lnk_open   format:  0 = NDJSON   1 = binary snapshot        (ptr null + format 0 = empty graph)
+lnk_open   format:  0 = NDJSON   1 = binary snapshot   2 = pg-json  3 = pg-text  4 = graphson  5 = csv   (ptr null + format 0 = empty graph)
 lnk_stat   which:   0 = vertex_count  1 = edge_count  2 = version   (per-token epoch takes a name → lnk_command "epoch", not a selector)
 lnk_query  lang:    0 = GQL      1 = Gremlin
 lnk_query  format:  0 = JSON rows  1 = Arrow  2 = Arrow IPC
 lnk_tx     action:  0 = begin    1 = commit  2 = rollback
-lnk_encode format:  0 = NDJSON   1 = binary snapshot
+lnk_encode format:  0 = NDJSON   1 = binary snapshot   2 = pg-json  3 = pg-text  4 = graphson  5 = csv
+
+Formats 2..5 (pg-json/pg-text/graphson/csv) route through the shared `lenke-codec`
+crate via the `src/codec.rs` Store<->GraphData bridge — the SAME format logic
+lenke-core uses, so both engines emit byte-identical bytes from identical data.
 ```
 
 An unknown enum value is a `-1` / null error, never undefined behaviour — a host
@@ -83,7 +87,7 @@ pub unsafe extern "C" fn lnk_free(ptr: *mut u8, len: usize);
 pub unsafe extern "C" fn lnk_last_error_json(out_len: *mut usize) -> *mut u8;
 
 // ---- Lifecycle (5) ----
-/// format 0 = NDJSON (null ptr = empty graph), 1 = binary snapshot. null on error.
+/// format 0 = NDJSON (null ptr = empty graph), 1 = binary, 2..5 = pg-json/pg-text/graphson/csv. null on error.
 pub unsafe extern "C" fn lnk_open(ptr: *const u8, len: usize, format: u8) -> *mut Store;
 pub unsafe extern "C" fn lnk_close(s: *mut Store);
 pub unsafe extern "C" fn lnk_clone(s: *const Store) -> *mut Store;
@@ -113,7 +117,7 @@ pub unsafe extern "C" fn lnk_schema_apply(s: *mut Store, json_ptr: *const u8, js
 pub unsafe extern "C" fn lnk_schema_dump(s: *const Store, out_len: *mut usize) -> *mut u8;
 
 // ---- Snapshot (1) ----
-/// format 0 = NDJSON, 1 = binary. Pairs with lnk_schema_dump for a full snapshot.
+/// format 0 = NDJSON, 1 = binary, 2..5 = pg-json/pg-text/graphson/csv. Pairs with lnk_schema_dump for a full snapshot.
 pub unsafe extern "C" fn lnk_encode(s: *const Store, format: u8, out_len: *mut usize) -> *mut u8;
 
 // ---- Escape hatch (1) — every exotic tier, no new symbols ----
