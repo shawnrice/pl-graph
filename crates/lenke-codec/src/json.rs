@@ -37,14 +37,13 @@ impl<'a> Json<'a> {
             _ => None,
         }
     }
-    // as_f64 / as_bool are used by the graphson codec (added next).
-    #[allow(dead_code)]
     pub(crate) fn as_f64(&self) -> Option<f64> {
         match self {
             Self::Num(n) => Some(*n),
             _ => None,
         }
     }
+    // as_bool is used by the pg-text / csv codecs (added next).
     #[allow(dead_code)]
     pub(crate) fn as_bool(&self) -> Option<bool> {
         match self {

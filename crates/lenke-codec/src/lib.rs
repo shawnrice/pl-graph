@@ -8,10 +8,13 @@
 //! layer maps a codec failure to the same `LenkeError` (`E_INVALID_JSON`,
 //! `E_INVALID_SHAPE`, `E_INVALID_VALUE`, `E_UNKNOWN_FORMAT`, `E_UNSUPPORTED`).
 
+mod csv;
+mod graphson;
 mod json;
 mod jsonfmt;
 mod model;
 mod pg_json;
+mod pg_text;
 
 pub use jsonfmt::{js_number, push_json_str, push_num, push_value};
 pub use model::{Edge, GraphData, Node, Value};
@@ -39,8 +42,6 @@ pub type CodeResult<T> = Result<T, CodecError>;
 // Wire codes (mirror @lenke/errors ErrorCode).
 pub(crate) const E_INVALID_JSON: &str = "E_INVALID_JSON";
 pub(crate) const E_INVALID_SHAPE: &str = "E_INVALID_SHAPE";
-// Used by the graphson / csv codecs (added next); referenced once they land.
-#[allow(dead_code)]
 pub(crate) const E_INVALID_VALUE: &str = "E_INVALID_VALUE";
 pub(crate) const E_UNKNOWN_FORMAT: &str = "E_UNKNOWN_FORMAT";
 pub(crate) const E_UNSUPPORTED: &str = "E_UNSUPPORTED";
@@ -48,8 +49,7 @@ pub(crate) const E_UNSUPPORTED: &str = "E_UNSUPPORTED";
 // --------------------------------------------------------------- decode helpers ---
 
 /// A finite float that is an exact integer — GraphSON `g:Int64` vs `g:Double`,
-/// CSV `integer` vs `float` (JS `Number.isInteger`). Used by graphson / csv (next).
-#[allow(dead_code)]
+/// CSV `integer` vs `float` (JS `Number.isInteger`).
 pub(crate) fn is_intish(x: f64) -> bool {
     x.is_finite() && x.fract() == 0.0
 }
@@ -151,6 +151,9 @@ pub fn serialize(g: &GraphData, format: &str) -> CodeResult<String> {
     }
     match format {
         "pg-json" => Ok(pg_json::encode(g)),
+        "graphson" => Ok(graphson::encode(g)),
+        "pg-text" => Ok(pg_text::encode(g)),
+        "csv" => Ok(csv::encode(g)),
         other => Err(unknown_format(other)),
     }
 }
@@ -161,6 +164,9 @@ pub fn serialize(g: &GraphData, format: &str) -> CodeResult<String> {
 pub fn deserialize(input: &str, format: &str) -> CodeResult<GraphData> {
     match format {
         "pg-json" => pg_json::decode(input),
+        "graphson" => graphson::decode(input),
+        "pg-text" => Ok(pg_text::decode(input)),
+        "csv" => Ok(csv::decode(input)),
         other => Err(unknown_format(other)),
     }
 }

@@ -48,15 +48,13 @@ pub struct GraphData {
     pub edges: Vec<Edge>,
 }
 
-/// The temporal tags recognized in a JSON tagged-temporal object `{"@<tag>": iso}`
-/// (matches the engines' temporal kinds). A single-key object whose key strips to
-/// one of these is a temporal; any other object is a map.
+/// The temporal kind tags (matching the engines' `Temporal::tag()`): the key in a
+/// JSON tagged-temporal object `{"@<tag>": iso}`. A single-key object whose key
+/// strips to one of these is a temporal; any other object is a map.
 pub const TEMPORAL_TAGS: &[&str] = &[
     "date",
     "localtime",
-    "time",
     "datetime",
-    "localdatetime",
     "zoned_time",
     "zoned_datetime",
     "duration",
@@ -66,4 +64,34 @@ pub const TEMPORAL_TAGS: &[&str] = &[
 #[must_use]
 pub fn is_temporal_tag(tag: &str) -> bool {
     TEMPORAL_TAGS.contains(&tag)
+}
+
+/// A temporal kind tag → its GraphSON v3 `@type` name (TinkerPop extended types).
+/// Mirrors `Temporal::graphson_type`. Returns `None` for an unknown tag.
+#[must_use]
+pub fn graphson_type(tag: &str) -> Option<&'static str> {
+    Some(match tag {
+        "date" => "gx:LocalDate",
+        "localtime" => "gx:LocalTime",
+        "datetime" => "gx:LocalDateTime",
+        "zoned_time" => "gx:OffsetTime",
+        "zoned_datetime" => "gx:OffsetDateTime",
+        "duration" => "gx:Duration",
+        _ => return None,
+    })
+}
+
+/// A GraphSON `@type` name → the temporal kind tag (the inverse of
+/// [`graphson_type`]). Mirrors `Temporal::graphson_tag`.
+#[must_use]
+pub fn graphson_tag(ty: &str) -> Option<&'static str> {
+    Some(match ty {
+        "gx:LocalDate" => "date",
+        "gx:LocalTime" => "localtime",
+        "gx:LocalDateTime" => "datetime",
+        "gx:OffsetTime" => "zoned_time",
+        "gx:OffsetDateTime" => "zoned_datetime",
+        "gx:Duration" => "duration",
+        _ => return None,
+    })
 }
