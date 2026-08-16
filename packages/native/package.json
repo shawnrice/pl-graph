@@ -18,6 +18,14 @@
       "types": "./dist/types/backend-wasm.d.ts",
       "default": "./dist/esm/backend-wasm.mjs"
     },
+    "./ffi-engine": {
+      "types": "./dist/types/backend-ffi-engine.d.ts",
+      "default": "./dist/esm/backend-ffi-engine.mjs"
+    },
+    "./wasm-engine": {
+      "types": "./dist/types/backend-wasm-engine.d.ts",
+      "default": "./dist/esm/backend-wasm-engine.mjs"
+    },
     "./arrow": {
       "types": "./dist/types/arrow.d.ts",
       "default": "./dist/esm/arrow.mjs"
