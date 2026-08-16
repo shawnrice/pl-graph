@@ -228,27 +228,31 @@ pub fn encode_string(out: &mut String, s: &str) {
     out.push('"');
 }
 
-/// Load a store from NDJSON in the [`to_ndjson`] format. Node lines
-/// (`{id,labels,props}`) come first, then edge lines (`{from,to,type,props}`).
-///
-/// The file's `id` values may have GAPS (a dump omits deleted nodes), so ids are
-/// NOT preserved: nodes are inserted in file order and get fresh dense ids, and
-/// edges are remapped through that file-id → new-id map. Consequently a dump of a
-/// graph with deletions re-densifies on load — round-trip is exact for a gap-free
-/// dump and STABLE from the first reload otherwise.
-pub fn from_ndjson(text: &str) -> Result<Store, String> {
-    // Staged records: (external id, labels, props) and (from-id, to-id, edge id?,
-    // labels, props) — an edge's first label is its type, the rest are secondary.
-    // External ids are PRESERVED verbatim (no remap to fresh dense ids), so
-    // element_id / egress round-trip.
-    type NodeRec = (String, Vec<String>, Vec<(String, Value)>);
-    type EdgeRec = (
-        String,
-        String,
-        Option<String>,
-        Vec<String>,
-        Vec<(String, Value)>,
-    );
+/// A staged node record: `(external id, labels, props)`.
+type NodeRec = (String, Vec<String>, Vec<(String, Value)>);
+/// A staged edge record: `(from-id, to-id, edge id?, labels, props)` — an edge's
+/// first label is its type, the rest are secondary (multi-label edges).
+type EdgeRec = (
+    String,
+    String,
+    Option<String>,
+    Vec<String>,
+    Vec<(String, Value)>,
+);
+
+/// The decoded-but-not-yet-applied contents of an NDJSON document. Shared by
+/// [`from_ndjson`] (build a fresh store) and [`merge_ndjson`] (apply into an
+/// existing one) so both read exactly one NDJSON dialect.
+struct StagedNdjson {
+    constraints: Vec<(String, Vec<String>)>,
+    required: Vec<(String, String)>,
+    nodes: Vec<NodeRec>,
+    edges: Vec<EdgeRec>,
+}
+
+/// Parse an NDJSON document into staged records. External ids are PRESERVED
+/// verbatim (no remap), so element_id / egress round-trip.
+fn stage_ndjson(text: &str) -> Result<StagedNdjson, String> {
     let mut constraints: Vec<(String, Vec<String>)> = Vec::new();
     let mut required: Vec<(String, String)> = Vec::new();
     let mut nodes: Vec<NodeRec> = Vec::new();
@@ -305,6 +309,108 @@ pub fn from_ndjson(text: &str) -> Result<Store, String> {
             return Err(err("object has no `schema`, `id`, or `from`".into()));
         }
     }
+    Ok(StagedNdjson {
+        constraints,
+        required,
+        nodes,
+        edges,
+    })
+}
+
+/// Merge an NDJSON document into an EXISTING store with **last-write-wins**
+/// semantics, keyed on external id: a node/edge whose id already exists has its
+/// property values overwritten (new keys added, existing keys replaced); an
+/// unknown id is inserted. Node labels are immutable once created, so only props
+/// update on an existing node. Schema lines (constraints) are applied if present.
+/// Edges are matched by their external `id`; an edge line without an `id` is
+/// always inserted (it has no identity to match).
+pub fn merge_ndjson(store: &mut Store, text: &str) -> Result<(), String> {
+    let staged = stage_ndjson(text)?;
+
+    for (label, keys) in &staged.constraints {
+        let krefs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        store.create_unique_constraint(label, &krefs)?;
+    }
+    for (label, key) in &staged.required {
+        store.create_required_constraint(label, key)?;
+    }
+
+    for (ext, labels, props) in &staged.nodes {
+        match store.node_by_ext(ext) {
+            Some(id) => {
+                // Last-wins: overwrite each supplied property value.
+                for (k, v) in props {
+                    store.set_prop(id, k, v.clone());
+                }
+            }
+            None => {
+                let lrefs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                let prefs: Vec<(&str, Value)> =
+                    props.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                store.add_node_with_id(&Arc::from(ext.as_str()), &lrefs, &prefs);
+            }
+        }
+    }
+
+    // Reverse index (edge external id → eid) over LIVE edges, built once so an
+    // edge upsert is O(1) instead of scanning per merged edge.
+    let mut ext_to_eid: std::collections::HashMap<Arc<str>, u32> = std::collections::HashMap::new();
+    for eid in store.all_edges() {
+        if let Some(ext) = store.edge_ext_id(eid) {
+            ext_to_eid.insert(ext, eid);
+        }
+    }
+
+    for (from, to, edge_id, labels, props) in &staged.edges {
+        // An edge with a known external id updates in place (last-wins on props).
+        if let Some(id) = edge_id.as_ref().and_then(|e| ext_to_eid.get(e.as_str())) {
+            for (k, v) in props {
+                store.set_edge_prop(*id, k, v.clone());
+            }
+            continue;
+        }
+        let f = store
+            .node_by_ext(from)
+            .ok_or_else(|| format!("edge references unknown node id {from}"))?;
+        let t = store
+            .node_by_ext(to)
+            .ok_or_else(|| format!("edge references unknown node id {to}"))?;
+        let etype = &labels[0];
+        let eid = match edge_id {
+            Some(id) => store.add_edge_with_id(&Arc::from(id.as_str()), f, t, etype),
+            None => store.add_edge(f, t, etype),
+        };
+        if labels.len() > 1 {
+            let extra: Vec<&str> = labels[1..].iter().map(String::as_str).collect();
+            store.set_edge_extra_labels(eid, &extra);
+        }
+        for (k, v) in props {
+            store.set_edge_prop(eid, k, v.clone());
+        }
+        if let Some(e) = edge_id {
+            ext_to_eid.insert(Arc::from(e.as_str()), eid);
+        }
+    }
+    store.rebuild_csr();
+    store.rebuild_edge_num();
+    Ok(())
+}
+
+/// Load a store from NDJSON in the [`to_ndjson`] format. Node lines
+/// (`{id,labels,props}`) come first, then edge lines (`{from,to,type,props}`).
+///
+/// The file's `id` values may have GAPS (a dump omits deleted nodes), so ids are
+/// NOT preserved: nodes are inserted in file order and get fresh dense ids, and
+/// edges are remapped through that file-id → new-id map. Consequently a dump of a
+/// graph with deletions re-densifies on load — round-trip is exact for a gap-free
+/// dump and STABLE from the first reload otherwise.
+pub fn from_ndjson(text: &str) -> Result<Store, String> {
+    let StagedNdjson {
+        constraints,
+        required,
+        nodes,
+        edges,
+    } = stage_ndjson(text)?;
 
     let mut store = Store::default();
     // Apply schema BEFORE data (the store is still empty, so declaration always
@@ -639,13 +745,65 @@ impl JsonParser {
 
 #[cfg(test)]
 mod tests {
-    use super::{from_ndjson, snapshot, to_ndjson};
+    use super::{from_ndjson, merge_ndjson, snapshot, to_ndjson};
     use crate::store::Builder;
     use crate::value::Value;
     use std::sync::Arc;
 
     fn s(x: &str) -> Value {
         Value::Str(Arc::from(x))
+    }
+
+    #[test]
+    fn merge_into_empty_equals_from_ndjson() {
+        let doc = "{\"id\":\"1\",\"labels\":[\"P\"],\"props\":{\"n\":\"a\"}}\n\
+                   {\"id\":\"2\",\"labels\":[\"P\"],\"props\":{\"n\":\"b\"}}\n\
+                   {\"from\":\"1\",\"to\":\"2\",\"id\":\"e0\",\"type\":\"R\",\"props\":{}}\n";
+        let mut merged = Builder::default().build();
+        merge_ndjson(&mut merged, doc).unwrap();
+        assert_eq!(to_ndjson(&merged), to_ndjson(&from_ndjson(doc).unwrap()));
+    }
+
+    #[test]
+    fn merge_last_wins_on_existing_node() {
+        let mut st = from_ndjson(
+            "{\"id\":\"1\",\"labels\":[\"P\"],\"props\":{\"n\":\"a\",\"k\":\"keep\"}}\n",
+        )
+        .unwrap();
+        merge_ndjson(
+            &mut st,
+            "{\"id\":\"1\",\"labels\":[\"P\"],\"props\":{\"n\":\"z\",\"age\":5}}\n",
+        )
+        .unwrap();
+        let id = st.node_by_ext("1").unwrap();
+        let v = |x: Value| format!("{x:?}"); // Value is not PartialEq — compare via Debug
+        assert_eq!(v(st.prop(id, "n")), v(s("z"))); // overwritten (last-wins)
+        assert_eq!(v(st.prop(id, "age")), v(Value::Num(5.0))); // new key added
+        assert_eq!(v(st.prop(id, "k")), v(s("keep"))); // untouched key preserved
+        assert_eq!(st.node_count(), 1); // no duplicate node
+    }
+
+    #[test]
+    fn merge_adds_unknown_node_and_upserts_edge_by_id() {
+        let mut st = from_ndjson(
+            "{\"id\":\"1\",\"labels\":[\"P\"],\"props\":{}}\n\
+             {\"id\":\"2\",\"labels\":[\"P\"],\"props\":{}}\n\
+             {\"from\":\"1\",\"to\":\"2\",\"id\":\"e0\",\"type\":\"R\",\"props\":{\"w\":1}}\n",
+        )
+        .unwrap();
+        merge_ndjson(
+            &mut st,
+            "{\"id\":\"3\",\"labels\":[\"P\"],\"props\":{}}\n\
+             {\"from\":\"1\",\"to\":\"2\",\"id\":\"e0\",\"type\":\"R\",\"props\":{\"w\":9}}\n",
+        )
+        .unwrap();
+        assert_eq!(st.node_count(), 3); // node 3 inserted
+        assert_eq!(st.edge_count(), 1); // e0 upserted in place, not duplicated
+        let eid = st.all_edges()[0];
+        assert_eq!(
+            format!("{:?}", st.edge_prop(eid, "w")),
+            format!("{:?}", Value::Num(9.0))
+        );
     }
 
     /// A required constraint survives a snapshot round trip: it dumps a schema

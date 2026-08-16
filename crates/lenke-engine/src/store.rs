@@ -694,6 +694,12 @@ pub struct Store {
     /// out-of-band metadata for host-side change detection (`useSyncExternalStore`),
     /// so it never affects cross-engine byte-identity. Read via [`Store::version`].
     version: u64,
+    /// Per-TOKEN change epochs: a label / edge-type / property-key name → the
+    /// [`version`](Store::version) at which a change last touched it. The FINE
+    /// invalidation signal behind global `version` — a React subscription watches
+    /// only the tokens its query reads, so an unrelated mutation does not
+    /// re-render it. Also metadata (never in a result), read via [`Store::epoch`].
+    epochs: HashMap<String, u64>,
 }
 
 // Store holds two derived caches behind `RwLock` (which is not `Clone`), so `Clone`
@@ -753,6 +759,7 @@ impl Clone for Store {
             edge_num: self.edge_num.clone(),
             edge_num_fresh: self.edge_num_fresh,
             version: self.version,
+            epochs: self.epochs.clone(),
         }
     }
 }
@@ -763,11 +770,31 @@ impl Store {
         self.version = self.version.wrapping_add(1);
     }
 
+    /// Stamp `token`'s change epoch with the current version. Call AFTER `touch`
+    /// (so `version` is already bumped) with each token a mutation names.
+    fn bump_epoch(&mut self, token: &str) {
+        let v = self.version;
+        // Avoid a String alloc when the token is already tracked (the common case).
+        if let Some(e) = self.epochs.get_mut(token) {
+            *e = v;
+        } else {
+            self.epochs.insert(token.to_string(), v);
+        }
+    }
+
     /// The monotonic mutation version — changes on every data mutation, for
     /// host-side change detection. Not observable in query results (see the field).
     #[must_use]
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// The change epoch of one token (a label / edge-type / property-key name): the
+    /// `version` at which a change last touched it, or 0 if never. A subscriber to
+    /// `token` re-reads when this rises. See the `epochs` field.
+    #[must_use]
+    pub fn epoch(&self, token: &str) -> u64 {
+        self.epochs.get(token).copied().unwrap_or(0)
     }
 
     /// Keys carrying a hash (equality) node index, each rendered as a dotted path.
@@ -1422,7 +1449,7 @@ impl Store {
 
     /// Add a node with `labels` and `(key, value)` properties; returns its id.
     pub fn add_node(&mut self, labels: &[&str], props: &[(&str, Value)]) -> u32 {
-        self.touch();
+        // touch()/epoch bumps happen in add_node_with_id (the leaf ingest also calls).
         // A created node mints its external id from its dense id (stable for the
         // life of the store — dense ids are never reused). Ingest supplies the
         // file's id via `add_node_with_id`.
@@ -1438,6 +1465,13 @@ impl Store {
         labels: &[&str],
         props: &[(&str, Value)],
     ) -> u32 {
+        self.touch();
+        for l in labels {
+            self.bump_epoch(l);
+        }
+        for (k, _) in props {
+            self.bump_epoch(k);
+        }
         self.invalidate_csr(); // a new node changes the adjacency shape
         let id = self.node_count as u32;
         self.node_count += 1;
@@ -1488,6 +1522,7 @@ impl Store {
     /// eid.
     pub fn add_edge_with_id(&mut self, ext: &Arc<str>, from: u32, to: u32, label: &str) -> u32 {
         self.touch();
+        self.bump_epoch(label);
         self.invalidate_csr();
         self.invalidate_edge_num(); // next_eid grows; the eid-indexed overlay is stale
         assert!(
@@ -1810,6 +1845,7 @@ impl Store {
     /// promoting it to `Gen` if `value`'s type differs from the column's.
     pub fn set_prop(&mut self, node: u32, key: &str, value: Value) {
         self.touch();
+        self.bump_epoch(key);
         let rec = self.undo.is_some().then(|| Undo::RestoreCell {
             node,
             key: key.to_string(),
@@ -1860,6 +1896,7 @@ impl Store {
     /// it to a stored `Null`; that distinction is a Phase-E concern.)
     pub fn remove_prop(&mut self, node: u32, key: &str) {
         self.touch();
+        self.bump_epoch(key);
         let rec = self.undo.is_some().then(|| Undo::RestoreCell {
             node,
             key: key.to_string(),
@@ -2352,6 +2389,7 @@ impl Store {
     /// Remove edge `eid`'s `key` (reads NULL again).
     pub fn remove_edge_prop(&mut self, eid: u32, key: &str) {
         self.touch();
+        self.bump_epoch(key);
         let rec = self.undo.is_some().then(|| Undo::RestoreEdgeCell {
             eid,
             key: key.to_string(),
@@ -2380,6 +2418,9 @@ impl Store {
     /// e.g. from a hop matched via incoming adjacency). A no-op if already gone.
     pub fn delete_edge(&mut self, u: u32, v: u32, eid: u32) {
         self.touch();
+        if let Some(t) = self.edge_type_name(eid) {
+            self.bump_epoch(&t);
+        }
         self.invalidate_csr();
         self.invalidate_edge_num();
         let logging = self.undo.is_some();
@@ -2428,6 +2469,9 @@ impl Store {
     /// absent from all scans and traversals. A no-op if already deleted.
     pub fn delete_node(&mut self, id: u32) {
         self.touch();
+        for l in self.labels_of(id) {
+            self.bump_epoch(&l);
+        }
         self.invalidate_csr();
         self.invalidate_edge_num(); // deletes incident edges
         let i = id as usize;
@@ -2942,6 +2986,7 @@ impl Builder {
             edge_num: HashMap::new(),
             edge_num_fresh: false,
             version: 0,
+            epochs: HashMap::new(),
         };
         // Flatten the freshly-built adjacency into the CSR read overlay, and densify
         // the numeric edge properties into the typed read overlay.
@@ -3095,6 +3140,29 @@ mod tests {
         let v4 = s.version();
         s.delete_edge(a, b, e);
         assert!(s.version() > v4, "delete_edge bumps");
+    }
+
+    #[test]
+    fn epoch_bumps_only_the_tokens_a_change_touches() {
+        let mut st = Store::default();
+        let a = st.add_node(&["Person"], &[("name", s("alice"))]);
+        // Both the label and the property key were touched by the add.
+        let (p0, n0) = (st.epoch("Person"), st.epoch("name"));
+        assert!(p0 > 0 && n0 > 0);
+        assert_eq!(st.epoch("Project"), 0, "an untouched token stays 0");
+
+        // A property change bumps only that property's epoch, not the label's.
+        st.set_prop(a, "age", Value::Num(30.0));
+        assert!(st.epoch("age") > n0);
+        assert_eq!(st.epoch("Person"), p0, "unrelated label epoch is unchanged");
+        assert_eq!(
+            st.epoch("name"),
+            n0,
+            "unrelated property epoch is unchanged"
+        );
+
+        // Epoch never exceeds the global version.
+        assert!(st.epoch("age") <= st.version());
     }
 
     #[test]

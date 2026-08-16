@@ -527,6 +527,43 @@ pub unsafe extern "C" fn lnk_command(
             // SAFETY: out_len is writable per this fn's contract.
             unsafe { out_string(store.last_write_scope_json(scope_key), out_len) }
         }
+        // Merge an NDJSON document into this store, last-write-wins by external id.
+        // Input is the NDJSON text; output the post-merge `{"nodes":N,"edges":M}`.
+        "merge" => {
+            let Some(text) = input else {
+                crate::ffi_error::set("E_FFI", "merge requires an NDJSON payload as input");
+                return std::ptr::null_mut();
+            };
+            match crate::ndjson::merge_ndjson(store, text) {
+                Ok(()) => {
+                    let json = format!(
+                        "{{\"nodes\":{},\"edges\":{}}}",
+                        store.node_count(),
+                        store.edge_count()
+                    );
+                    // SAFETY: out_len is writable per this fn's contract.
+                    unsafe { out_string(json, out_len) }
+                }
+                Err(e) => {
+                    crate::ffi_error::set("E_MERGE", &e);
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        // Per-token change epoch (finer invalidation than the global version).
+        // Input is the token name (label / edge-type / property-key); output `{"epoch":N}`.
+        "epoch" => {
+            let Some(token) = input else {
+                crate::ffi_error::set(
+                    "E_FFI",
+                    "epoch requires the token name as the input payload",
+                );
+                return std::ptr::null_mut();
+            };
+            let json = format!("{{\"epoch\":{}}}", store.epoch(token));
+            // SAFETY: out_len is writable per this fn's contract.
+            unsafe { out_string(json, out_len) }
+        }
         // Algorithms are reachable through the conformant GQL path already, so the
         // direct command is a redundant fast-path we have not needed.
         "algo" => {

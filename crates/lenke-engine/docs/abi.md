@@ -170,12 +170,12 @@ exports.
 | `name`             | input                      | output                 | status                     |
 | ------------------ | -------------------------- | ---------------------- | -------------------------- |
 | `last_write_scope` | scope-key name (raw str)   | `{scopes:[…], open:b}` | **wired** (CDC)            |
+| `epoch`            | token name (raw str)       | `{epoch:N}`            | **wired** (per-token)      |
+| `merge`            | NDJSON text (raw)          | `{nodes:N, edges:M}`   | **wired** (last-wins)      |
 | `algo`             | `{name, config}`           | `{columns, rows}`      | via GQL `CALL` (redundant) |
 | `prepare`          | `{lang, query}`            | `{handle}`             | to build (prepared stmts)  |
 | `prepared_run`     | `{handle, params, format}` | carrier                | to build (prepared stmts)  |
 | `prepared_free`    | `{handle}`                 | `{}`                   | to build (prepared stmts)  |
-| `epoch`            | token name (raw str)       | `{epoch}`              | to build (per-token epoch) |
-| `merge`            | `{format, bytes}`          | `{}`                   | to build (fork / merge)    |
 
 `algo` is listed for completeness but is _also_ reachable through
 `lnk_query(lang=GQL, "CALL pagerank(...) YIELD ...")`, which is the conformant
@@ -217,14 +217,15 @@ The skeleton exports all 16 symbols today. Wired to existing `Store` methods:
 `abi_version`, `alloc`/`dealloc`/`free`, `last_error_json`, `open` (NDJSON +
 empty), `close`, `clone` (deep copy), `config`, `stat` (counts **and version**),
 `query` (GQL + Gremlin JSON; GQL params; **Arrow** raw + IPC, formats 1/2), `tx`, `encode`
-(NDJSON), `schema_apply` + `schema_dump`, and `lnk_command "last_write_scope"`
-(CDC). Every remaining capability returns a specific error — that stub list **is**
-the work-queue to finish before the flip:
+(NDJSON), `schema_apply` + `schema_dump`, and `lnk_command` for `last_write_scope`
+(CDC), `epoch` (per-token), and `merge` (last-wins). Every remaining capability
+returns a specific error — that stub list **is** the work-queue before the flip:
 
-- `lnk_open` / `lnk_encode` binary-snapshot format (needs a binary codec; NDJSON covers it)
-- `lnk_command` names still to build in the engine: `algo` (already reachable via
-  GQL `CALL`, so the direct command is a redundant fast-path), prepared statements,
-  `epoch`, `merge`
+- `lnk_open` / `lnk_encode` binary-snapshot format (needs a binary codec; NDJSON
+  already gives full-fidelity persistence, so binary is a size/speed optimization)
+- `lnk_command` names still to build: prepared statements (`prepare`/`prepared_*`
+  — needs `Expr::Param` + a bind-pass). `algo` is intentionally not a direct
+  command (reachable via GQL `CALL`).
 
 ### Query params pass (GQL)
 
