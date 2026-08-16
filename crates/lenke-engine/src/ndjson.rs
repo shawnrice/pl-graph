@@ -130,7 +130,8 @@ fn encode_object(out: &mut String, keys: &[String], get: impl Fn(&str) -> Option
     out.push('}');
 }
 
-fn encode_str_array(out: &mut String, items: &[String]) {
+/// Append a JSON array of strings to `out` (shared with the schema-op vocabulary).
+pub fn encode_str_array(out: &mut String, items: &[String]) {
     out.push('[');
     for (i, s) in items.iter().enumerate() {
         if i > 0 {
@@ -208,8 +209,8 @@ fn encode_value(out: &mut String, v: &Value) {
     }
 }
 
-/// Encode a JSON string with the required escapes.
-fn encode_string(out: &mut String, s: &str) {
+/// Encode a JSON string with the required escapes (shared with the schema-op vocabulary).
+pub fn encode_string(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -356,7 +357,9 @@ pub fn from_ndjson(text: &str) -> Result<Store, String> {
 
 // --- a tiny dependency-free JSON parser (one value per line) -----------------
 
-enum Json {
+/// A parsed JSON value. Public so other engine modules (e.g. [`crate::schema_op`])
+/// can reuse the one hand-rolled, tested JSON parser instead of duplicating it.
+pub enum Json {
     Null,
     Bool(bool),
     Num(f64),
@@ -365,10 +368,12 @@ enum Json {
     Obj(Vec<(String, Json)>),
 }
 
-fn field<'a>(fields: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
+/// Look up a field by key in a JSON object's `(key, value)` list.
+pub fn field<'a>(fields: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
     fields.iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
-fn req<'a>(fields: &'a [(String, Json)], key: &str) -> Result<&'a Json, String> {
+/// Like [`field`], but a missing key is an `Err`.
+pub fn req<'a>(fields: &'a [(String, Json)], key: &str) -> Result<&'a Json, String> {
     field(fields, key).ok_or_else(|| format!("missing field `{key}`"))
 }
 /// An element id, accepted as a JSON string OR a non-negative integer (rendered as
@@ -380,13 +385,15 @@ fn json_id(j: &Json) -> Result<String, String> {
         _ => Err("expected an id (string or integer)".into()),
     }
 }
-fn json_string(j: &Json) -> Result<String, String> {
+/// A JSON string value, or `Err` for any other shape.
+pub fn json_string(j: &Json) -> Result<String, String> {
     match j {
         Json::Str(s) => Ok(s.clone()),
         _ => Err("expected a string".into()),
     }
 }
-fn json_str_array(j: &Json) -> Result<Vec<String>, String> {
+/// A JSON array of strings, or `Err` for any other shape.
+pub fn json_str_array(j: &Json) -> Result<Vec<String>, String> {
     match j {
         Json::Arr(items) => items.iter().map(json_string).collect(),
         _ => Err("expected an array of strings".into()),
@@ -440,6 +447,12 @@ fn json_value(j: &Json) -> Result<Value, String> {
             crate::value::make_record(pairs)
         }
     })
+}
+
+/// Parse exactly one JSON value from `text` (trailing whitespace allowed). The
+/// public entry to the engine's one JSON parser, for callers outside NDJSON decode.
+pub fn parse_json(text: &str) -> Result<Json, String> {
+    parse_line(text)
 }
 
 /// Parse exactly one JSON value from `line` (trailing whitespace allowed).

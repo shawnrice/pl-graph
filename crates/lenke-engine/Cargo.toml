@@ -12,7 +12,18 @@ license = "Apache-2.0"
 all = { level = "warn", priority = -1 }
 
 [lib]
-crate-type = ["lib"]
+# "lib" for the engine-compare harness (core dev-depends on it); "cdylib" so the
+# engine emits its own liblenke_engine.so / lenke_engine.wasm for the C ABI (src/ffi.rs).
+crate-type = ["lib", "cdylib"]
+
+[features]
+# `capi`: expose the C ABI (`src/ffi.rs` — the `lnk_*` exports). OFF by default so
+# that when lenke-core links this crate as a lib for its `engine-compare` harness,
+# the engine's `#[no_mangle]` symbols (lnk_abi_version, lnk_alloc, lnk_last_error_json,
+# …) do NOT collide with core's identically-named exports. Build the standalone
+# backend cdylib/wasm WITH this feature:
+#   cargo build -p lenke-engine --release --features capi
+capi = []
 
 [dependencies]
 

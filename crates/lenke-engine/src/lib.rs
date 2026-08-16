@@ -34,12 +34,19 @@ pub mod arrow;
 pub mod batch;
 pub mod cost;
 pub mod exec;
+// The C ABI (`lnk_*` exports). Gated behind `capi` so the engine's `#[no_mangle]`
+// symbols never collide with core's when core links this crate for engine-compare.
+#[cfg(feature = "capi")]
+pub mod ffi;
+#[cfg(feature = "capi")]
+pub mod ffi_error;
 pub mod gql;
 pub mod gremlin;
 pub mod ir;
 pub mod json;
 pub mod ndjson;
 pub mod opt;
+pub mod schema_op;
 pub mod store;
 pub mod temporal;
 pub mod value;
