@@ -290,10 +290,12 @@ pub unsafe extern "C" fn lnk_query(
             }
         }
     };
-    // Arrow output (GQL only): run to a Rows batch, then frame it. Format 1 (the raw
-    // zero-copy ARW1 blob) needs an 8-byte-aligned allocator + its own free path, so it
-    // is deferred; format 2 (the portable Arrow IPC / Feather byte stream) has neither
-    // constraint and is the DuckDB/Polars/pandas handoff.
+    // Arrow output (GQL only): run to a Rows batch, then frame it. Format 1 is the raw
+    // columnar ARW1 blob (column buffers at 8-aligned offsets within it — the global
+    // allocator returns >=8-aligned memory on native and wasm, so typed-array views over
+    // it are valid without a dedicated aligned allocator); format 2 is the portable Arrow
+    // IPC / Feather byte stream for the DuckDB/Polars/pandas handoff. Both are plain byte
+    // buffers freed by lnk_free.
     if format != 0 {
         if lang != 0 {
             crate::ffi_error::set("E_FFI", "Arrow output is only available for GQL queries");
@@ -314,18 +316,9 @@ pub unsafe extern "C" fn lnk_query(
             }
         };
         return match format {
-            2 => {
-                let ipc = crate::arrow::to_arrow_ipc(&rows, true);
-                // SAFETY: out_len is writable per this fn's contract.
-                unsafe { out_bytes(ipc, out_len) }
-            }
-            1 => {
-                crate::ffi_error::set(
-                    "E_UNIMPLEMENTED",
-                    "raw Arrow (format 1) needs an aligned buffer; use Arrow IPC (format 2)",
-                );
-                std::ptr::null_mut()
-            }
+            // SAFETY: out_len is writable per this fn's contract.
+            1 => unsafe { out_bytes(crate::arrow::to_arrow(&rows), out_len) },
+            2 => unsafe { out_bytes(crate::arrow::to_arrow_ipc(&rows, true), out_len) },
             _ => {
                 crate::ffi_error::set("E_FFI", "unknown query format");
                 std::ptr::null_mut()
