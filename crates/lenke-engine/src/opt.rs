@@ -1453,9 +1453,9 @@ fn prune_or_branches(e: Expr, bounds: &[(usize, String, CompareOp, f64)]) -> Exp
     flatten_or(e, &mut disj);
     let before = disj.len();
     disj.retain(|d| match num_bound(d) {
-        Some((s, k, op, v)) => !bounds
-            .iter()
-            .any(|(bs, bk, bop, bv)| *bs == s && *bk == k && bounds_contradict((op, v), (*bop, *bv))),
+        Some((s, k, op, v)) => !bounds.iter().any(|(bs, bk, bop, bv)| {
+            *bs == s && *bk == k && bounds_contradict((op, v), (*bop, *bv))
+        }),
         None => true, // keep non-numeric disjuncts (unanalyzed)
     });
     if disj.len() == before {

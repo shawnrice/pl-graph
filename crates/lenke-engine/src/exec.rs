@@ -1829,7 +1829,9 @@ fn pull(plan: &Plan, store: &Store, track: bool) -> Result<Batch, String> {
                         // while the vectorized dedup is far cheaper. Drop to the plain
                         // DISTINCT; `order_page` slices (a no-op). The `+1` leaves room for a
                         // NULL, which DISTINCT counts but the dict does not.
-                        Plan::Distinct { input: inner } if distinct_cap_cannot_bind(inner, c, store) => {
+                        Plan::Distinct { input: inner }
+                            if distinct_cap_cannot_bind(inner, c, store) =>
+                        {
                             Some(pull(input, store, track)?)
                         }
                         Plan::Distinct { input: inner } => {
@@ -2570,9 +2572,7 @@ fn pull_top_output_streamed(
 ///     would wave a large regression through the row floor.
 fn single_hop_no_filter(body: &Plan) -> bool {
     match body {
-        Plan::Project { input, .. } | Plan::EdgeVertex { input, .. } => {
-            single_hop_no_filter(input)
-        }
+        Plan::Project { input, .. } | Plan::EdgeVertex { input, .. } => single_hop_no_filter(input),
         Plan::Filter { input, pred } => {
             matches!(pred, crate::ir::Expr::PropertyExists { .. }) && single_hop_no_filter(input)
         }
@@ -3007,7 +3007,9 @@ fn try_fused_map_json(plan: &Plan, store: &Store) -> Option<String> {
                 match &kind {
                     NodeMapKind::Nested => write_edge_nested_map(&mut out, store, eid, &cols),
                     NodeMapKind::Flat => write_edge_flat_map(&mut out, store, eid, &cols),
-                    NodeMapKind::Value { wrap } => write_edge_value_map(&mut out, eid, &cols, *wrap),
+                    NodeMapKind::Value { wrap } => {
+                        write_edge_value_map(&mut out, eid, &cols, *wrap)
+                    }
                 }
             }
         }
@@ -3042,7 +3044,10 @@ impl EdgeCol<'_> {
 /// Resolve the edge property read handles once, in the SAME sorted-key order and
 /// membership the per-edge path produced — hoisting `edge_prop_keys()` clone+sort and
 /// the per-key `edge_prop_map`/`edge_num_column` lookups out of the row loop.
-fn resolve_edge_cols<'a>(store: &'a Store, filter: &[String]) -> Vec<(std::sync::Arc<str>, EdgeCol<'a>)> {
+fn resolve_edge_cols<'a>(
+    store: &'a Store,
+    filter: &[String],
+) -> Vec<(std::sync::Arc<str>, EdgeCol<'a>)> {
     use std::sync::Arc;
     let keys: Vec<String> = if filter.is_empty() {
         store.edge_prop_keys() // already sorted
@@ -3691,7 +3696,13 @@ fn order_page(
 /// keeps the cheap boxed path and does not pay the fold for nothing.
 fn typed_key_cols(cols: Vec<Col>) -> Vec<Col> {
     cols.into_iter()
-        .map(|c| if let Col::Gen(v) = c { typed_col_from_values(v) } else { c })
+        .map(|c| {
+            if let Col::Gen(v) = c {
+                typed_col_from_values(v)
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -3754,26 +3765,25 @@ fn aggregate(
     // its string share first-occurrence), so identical groups, order, and per-group
     // summation. Only a dict key over a node frontier takes it; every other key evals its
     // columns and groups as before.
-    let (group_of, _first_row, n_groups, key_out) = if let Some((g, fr, kc)) =
-        try_dict_grouping(keys, store, batch)
-    {
-        let ng = fr.len();
-        (g, fr, ng, vec![kc])
-    } else if let Some((g, kc, ng)) = try_node_prop_grouping(keys, store, batch) {
-        // A single node PROPERTY key (Str/Num/Bool) grouped with the TYPED set read straight
-        // off storage — no full `Col::Str` of `Arc` clones + byte key that eval + assign_
-        // groups would build. Works on ANY materialized batch (a join, a filtered frontier,
-        // a chain), so a grouped aggregate over a comma-join takes it too. Byte-identical.
-        (g, Vec::new(), ng, vec![kc])
-    } else if keys.is_empty() {
-        (vec![0u32; n], Vec::new(), 1, Vec::new())
-    } else {
-        let key_cols: Vec<Col> = eval_all(keys.iter().map(|(_, e)| e), store, batch)?;
-        let (g, fr) = assign_groups(&key_cols, n);
-        let ng = fr.len();
-        let ko = key_cols.iter().map(|c| c.gather(&fr)).collect();
-        (g, fr, ng, ko)
-    };
+    let (group_of, _first_row, n_groups, key_out) =
+        if let Some((g, fr, kc)) = try_dict_grouping(keys, store, batch) {
+            let ng = fr.len();
+            (g, fr, ng, vec![kc])
+        } else if let Some((g, kc, ng)) = try_node_prop_grouping(keys, store, batch) {
+            // A single node PROPERTY key (Str/Num/Bool) grouped with the TYPED set read straight
+            // off storage — no full `Col::Str` of `Arc` clones + byte key that eval + assign_
+            // groups would build. Works on ANY materialized batch (a join, a filtered frontier,
+            // a chain), so a grouped aggregate over a comma-join takes it too. Byte-identical.
+            (g, Vec::new(), ng, vec![kc])
+        } else if keys.is_empty() {
+            (vec![0u32; n], Vec::new(), 1, Vec::new())
+        } else {
+            let key_cols: Vec<Col> = eval_all(keys.iter().map(|(_, e)| e), store, batch)?;
+            let (g, fr) = assign_groups(&key_cols, n);
+            let ng = fr.len();
+            let ko = key_cols.iter().map(|c| c.gather(&fr)).collect();
+            (g, fr, ng, ko)
+        };
 
     let mut slots: Vec<Col> = key_out;
 
@@ -3956,7 +3966,14 @@ fn try_frontier_group_fold(
     aggs: &[Agg],
     store: &Store,
 ) -> Option<Batch> {
-    let [(_, Expr::Prop { slot: kslot, key: kkey })] = keys else {
+    let [(
+        _,
+        Expr::Prop {
+            slot: kslot,
+            key: kkey,
+        },
+    )] = keys
+    else {
         return None;
     };
     if kkey.contains('.') {
@@ -4025,7 +4042,17 @@ fn try_frontier_group_fold(
             None => None,
             Some(Expr::Prop { key, .. }) => {
                 let b = fb.get_or_insert_with(|| Batch::single(Col::Nodes(frontier.clone())));
-                Some(eval(&Expr::Prop { slot: 0, key: key.clone() }, store, b).ok()?)
+                Some(
+                    eval(
+                        &Expr::Prop {
+                            slot: 0,
+                            key: key.clone(),
+                        },
+                        store,
+                        b,
+                    )
+                    .ok()?,
+                )
             }
             _ => return None,
         };
@@ -4752,7 +4779,9 @@ fn chain_slot_kinds(hops: &[RevHop]) -> Vec<bool> {
 
 /// Transpose full rows into columns typed by `kinds` (`true` = edge slot, else node).
 fn rows_to_batch(rows: &[Vec<u32>], kinds: &[bool]) -> Batch {
-    let mut cols: Vec<Vec<u32>> = (0..kinds.len()).map(|_| Vec::with_capacity(rows.len())).collect();
+    let mut cols: Vec<Vec<u32>> = (0..kinds.len())
+        .map(|_| Vec::with_capacity(rows.len()))
+        .collect();
     for row in rows {
         for (i, &v) in row.iter().enumerate() {
             cols[i].push(v);
@@ -4761,7 +4790,13 @@ fn rows_to_batch(rows: &[Vec<u32>], kinds: &[bool]) -> Batch {
     Batch::of(
         cols.into_iter()
             .zip(kinds)
-            .map(|(c, &is_edge)| if is_edge { Col::Edges(c) } else { Col::Nodes(c) })
+            .map(|(c, &is_edge)| {
+                if is_edge {
+                    Col::Edges(c)
+                } else {
+                    Col::Nodes(c)
+                }
+            })
             .collect(),
     )
 }
@@ -4919,9 +4954,7 @@ fn try_reverse_varlen(pred: &Expr, input: &Plan, store: &Store, track: bool) -> 
     let rows0: Vec<Vec<u32>> = bs
         .iter()
         .zip(cs.iter())
-        .filter(|(&b, _)| {
-            fixed != 0 || src_label.as_deref().is_none_or(|l| store.is_labeled(b, l))
-        })
+        .filter(|(&b, _)| fixed != 0 || src_label.as_deref().is_none_or(|l| store.is_labeled(b, l)))
         .map(|(&b, &c)| vec![b, c])
         .collect();
     let rows = reverse_walk_chain(rows0, &fixed_hops, src_label.as_deref(), store);
@@ -5148,7 +5181,8 @@ fn target_eq(pred: &Expr, slot: usize) -> Option<(String, Value)> {
         return None;
     };
     match (left.as_ref(), right.as_ref()) {
-        (Expr::Prop { slot: s, key }, Expr::Lit(v)) | (Expr::Lit(v), Expr::Prop { slot: s, key })
+        (Expr::Prop { slot: s, key }, Expr::Lit(v))
+        | (Expr::Lit(v), Expr::Prop { slot: s, key })
             if *s == slot =>
         {
             (!v.is_null()).then(|| (key.clone(), v.clone()))
@@ -6409,7 +6443,10 @@ fn try_fused_hop_project(
         }
     })?;
     // Evaluate the projection over the survivor frontier (endpoint at slot 1).
-    let cols = vec![Col::Nodes(vec![0u32; survivors.len()]), Col::Nodes(survivors)];
+    let cols = vec![
+        Col::Nodes(vec![0u32; survivors.len()]),
+        Col::Nodes(survivors),
+    ];
     let out = eval_all(items.iter().map(|(_, e)| e), store, &Batch::of(cols)).ok()?;
     Some(Batch::of(out))
 }
@@ -6504,7 +6541,7 @@ fn try_fused_hop_mask_agg(
                 }
             }
             Some(Batch::single(Col::Gen(vec![
-                best.map_or(Value::Null, Value::Num),
+                best.map_or(Value::Null, Value::Num)
             ])))
         }
         _ => None,
@@ -6757,7 +6794,9 @@ fn sole_prop_ref(pred: &Expr) -> Option<(usize, String)> {
 
 /// [`sole_prop_ref`] constrained to a specific `slot` (returns just the key).
 fn sole_prop_key(pred: &Expr, slot: usize) -> Option<String> {
-    sole_prop_ref(pred).filter(|(s, _)| *s == slot).map(|(_, k)| k)
+    sole_prop_ref(pred)
+        .filter(|(s, _)| *s == slot)
+        .map(|(_, k)| k)
 }
 
 /// Evaluate a single-property predicate for one concrete value of that property, by
@@ -6788,17 +6827,35 @@ fn typed_col_from_values(out: Vec<Value>) -> Col {
     match first {
         Value::Num(_) if out.iter().all(|v| matches!(v, Value::Num(_))) => Col::Num(
             out.iter()
-                .map(|v| if let Value::Num(x) = v { *x } else { unreachable!() })
+                .map(|v| {
+                    if let Value::Num(x) = v {
+                        *x
+                    } else {
+                        unreachable!()
+                    }
+                })
                 .collect(),
         ),
         Value::Str(_) if out.iter().all(|v| matches!(v, Value::Str(_))) => Col::Str(
             out.into_iter()
-                .map(|v| if let Value::Str(s) = v { s } else { unreachable!() })
+                .map(|v| {
+                    if let Value::Str(s) = v {
+                        s
+                    } else {
+                        unreachable!()
+                    }
+                })
                 .collect(),
         ),
         Value::Bool(_) if out.iter().all(|v| matches!(v, Value::Bool(_))) => Col::Bool(
             out.iter()
-                .map(|v| if let Value::Bool(b) = v { *b } else { unreachable!() })
+                .map(|v| {
+                    if let Value::Bool(b) = v {
+                        *b
+                    } else {
+                        unreachable!()
+                    }
+                })
                 .collect(),
         ),
         _ => Col::Gen(out),
@@ -6820,7 +6877,11 @@ fn try_eval_dict_scalar(expr: &Expr, store: &Store, batch: &Batch) -> Option<Col
     };
     let ev = |v: &Value| -> Option<Value> {
         let e = subst_prop(expr, slot, &key, v);
-        Some(eval(&e, store, &Batch::single(Col::Num(vec![0.0]))).ok()?.value_at(0))
+        Some(
+            eval(&e, store, &Batch::single(Col::Num(vec![0.0])))
+                .ok()?
+                .value_at(0),
+        )
     };
     let mut per_code = Vec::with_capacity(dict.len());
     for dv in dict.iter() {
@@ -6859,7 +6920,13 @@ fn try_filter_keep_dict(pred: &Expr, store: &Store, batch: &Batch) -> Option<Vec
     };
     let mut matches = Vec::with_capacity(dict.len());
     for dv in dict.iter() {
-        matches.push(dict_pred_value(pred, slot, &key, &Value::Str(dv.clone()), store)?);
+        matches.push(dict_pred_value(
+            pred,
+            slot,
+            &key,
+            &Value::Str(dv.clone()),
+            store,
+        )?);
     }
     let null_match = dict_pred_value(pred, slot, &key, &Value::Null, store)?;
     Some(
@@ -6902,7 +6969,10 @@ fn subst_prop(e: &Expr, slot: usize, key: &str, value: &Value) -> Expr {
         },
         Expr::Call { name, args } => Expr::Call {
             name: name.clone(),
-            args: args.iter().map(|a| subst_prop(a, slot, key, value)).collect(),
+            args: args
+                .iter()
+                .map(|a| subst_prop(a, slot, key, value))
+                .collect(),
         },
         Expr::In { needle, haystack } => Expr::In {
             needle: Box::new(subst_prop(needle, slot, key, value)),
@@ -7059,7 +7129,11 @@ fn try_edge_cross_count(
     if agg.func != AggFn::Count || agg.arg.is_some() || agg.distinct {
         return None;
     }
-    let Plan::Filter { input: expand, pred } = input else {
+    let Plan::Filter {
+        input: expand,
+        pred,
+    } = input
+    else {
         return None;
     };
     let Plan::Expand {
@@ -7099,8 +7173,16 @@ fn try_edge_cross_count(
     if *ls > 1 || *rs > 1 {
         return None;
     }
-    let (Some(Column::Num { data: ld, present: lp }), Some(Column::Num { data: rd, present: rp })) =
-        (store.column(lk), store.column(rk))
+    let (
+        Some(Column::Num {
+            data: ld,
+            present: lp,
+        }),
+        Some(Column::Num {
+            data: rd,
+            present: rp,
+        }),
+    ) = (store.column(lk), store.column(rk))
     else {
         return None; // unboxed numeric endpoints only
     };
@@ -7318,7 +7400,12 @@ fn varlen_scan_walk(
         cursor: usize,
         pending: Option<bool>, // Some(pop_used) once we've descended into a child
     }
-    let mut stack = vec![SF { v: v0, len: 0, cursor: 0, pending: None }];
+    let mut stack = vec![SF {
+        v: v0,
+        len: 0,
+        cursor: 0,
+        pending: None,
+    }];
     'frames: while let Some(top) = stack.last_mut() {
         if let Some(pop_used) = top.pending.take() {
             if pop_used {
@@ -7334,7 +7421,8 @@ fn varlen_scan_walk(
             top.cursor += 1;
             if !want.is_empty()
                 && !want.iter().any(|&w| {
-                    w == a.etype || (store.has_multi_label_edges() && store.edge_has_label(a.eid, w))
+                    w == a.etype
+                        || (store.has_multi_label_edges() && store.edge_has_label(a.eid, w))
                 })
             {
                 continue;
@@ -7366,7 +7454,12 @@ fn varlen_scan_walk(
                 used.push(m);
             }
             top.pending = Some(mark.is_some());
-            stack.push(SF { v: a.nbr, len: clen, cursor: 0, pending: None });
+            stack.push(SF {
+                v: a.nbr,
+                len: clen,
+                cursor: 0,
+                pending: None,
+            });
             continue 'frames;
         }
     }
@@ -7389,9 +7482,21 @@ fn varlen_count_dfs(
     total: &mut u64,
     double_loops: bool,
 ) {
-    varlen_scan_walk(store, v, min, max, dir, want, mode, start, used, double_loops, &mut |_| {
-        *total += 1;
-    });
+    varlen_scan_walk(
+        store,
+        v,
+        min,
+        max,
+        dir,
+        want,
+        mode,
+        start,
+        used,
+        double_loops,
+        &mut |_| {
+            *total += 1;
+        },
+    );
 }
 
 /// The outcome of the per-hop reuse gate ([`varlen_step`]).
@@ -7712,7 +7817,9 @@ fn varlen_agg_dfs(
 ) {
     // The fold twin visits the same endpoints in the same order as the materializing
     // path (this fast-path is only taken without a `both()` double-loop, so `false`).
-    varlen_scan_walk(store, v, min, max, dir, want, mode, start, used, false, emit);
+    varlen_scan_walk(
+        store, v, min, max, dir, want, mode, start, used, false, emit,
+    );
 }
 
 /// A scalar `sum`/`avg`/`min`/`max`/`count(arg)` over a bare var-length's ENDPOINT
@@ -10274,7 +10381,13 @@ impl VarlenEmit for CollectEmit<'_> {
             );
         }
         if !self.group_binds.is_empty() {
-            push_group_cols(node_stack, edge_stack, self.k, self.group_binds, &mut self.group_cols);
+            push_group_cols(
+                node_stack,
+                edge_stack,
+                self.k,
+                self.group_binds,
+                &mut self.group_cols,
+            );
         }
     }
     fn should_stop(&self) -> bool {
@@ -10441,11 +10554,7 @@ impl VarlenEmit for StreamPropEmit<'_> {
 /// Returns `None` when the shape isn't a single-`Prop` projection of the endpoint over a
 /// plain `VarLength` (no lineage, no group binds); `Some(Err)` when the output byte cap is
 /// hit; `Some(Ok(json))` otherwise. Byte-identical to serializing the materialized result.
-fn try_stream_varlen_json(
-    plan: &Plan,
-    store: &Store,
-    gql: bool,
-) -> Option<Result<String, String>> {
+fn try_stream_varlen_json(plan: &Plan, store: &Store, gql: bool) -> Option<Result<String, String>> {
     // Output cap — generous (compact text), so far more rows complete than the 1M-row
     // trail cap the materialized path hits, yet a runaway still fails loudly.
     const BYTE_CAP: usize = 256 << 20; // 256 MiB
@@ -10670,14 +10779,30 @@ fn varlen_walk<S: VarlenEmit>(
     // The source's own pre-work (an emit at `len == 0` for `min == 0`, filters). If it
     // does not descend, there is nothing to walk.
     match varlen_enter(
-        store, v0, 0, min, max, k, per_rep_pred, until_stop, body_filter, node_stack,
-        edge_stack, row, sink,
+        store,
+        v0,
+        0,
+        min,
+        max,
+        k,
+        per_rep_pred,
+        until_stop,
+        body_filter,
+        node_stack,
+        edge_stack,
+        row,
+        sink,
     ) {
         Enter::Iterate => {}
         Enter::Prune | Enter::Stop => return,
     }
     let drop_loop = matches!(dir, Dir::Both) && !double_loops;
-    let mut stack: Vec<VarFrame> = vec![VarFrame { v: v0, len: 0, cursor: 0, pending: None }];
+    let mut stack: Vec<VarFrame> = vec![VarFrame {
+        v: v0,
+        len: 0,
+        cursor: 0,
+        pending: None,
+    }];
     // Tear the whole stack down, undoing each frame's pending child push — keeps `used`
     // and the path stacks clean on an abort so the next source starts fresh.
     macro_rules! teardown {
@@ -10714,7 +10839,8 @@ fn varlen_walk<S: VarlenEmit>(
             // Edge must carry a wanted label (primary type or, multi-label, a secondary).
             if !want.is_empty()
                 && !want.iter().any(|&w| {
-                    w == a.etype || (store.has_multi_label_edges() && store.edge_has_label(a.eid, w))
+                    w == a.etype
+                        || (store.has_multi_label_edges() && store.edge_has_label(a.eid, w))
                 })
             {
                 continue;
@@ -10761,7 +10887,12 @@ fn varlen_walk<S: VarlenEmit>(
                 Enter::Iterate => {
                     // Descend: remember how to undo this push, push the child frame.
                     top.pending = Some(mark.is_some());
-                    stack.push(VarFrame { v: a.nbr, len: len + 1, cursor: 0, pending: None });
+                    stack.push(VarFrame {
+                        v: a.nbr,
+                        len: len + 1,
+                        cursor: 0,
+                        pending: None,
+                    });
                     continue 'frames;
                 }
                 Enter::Prune => {
@@ -12675,9 +12806,7 @@ fn eval(expr: &Expr, store: &Store, batch: &Batch) -> Result<Col, String> {
                                 .flatten();
                             match bi {
                                 Some(b) => vals[b].value_at(i),
-                                None => else_col
-                                    .as_ref()
-                                    .map_or(Value::Null, |c| c.value_at(i)),
+                                None => else_col.as_ref().map_or(Value::Null, |c| c.value_at(i)),
                             }
                         })
                         .collect();
@@ -14644,7 +14773,11 @@ fn distinct_batch(batch: Batch) -> Batch {
 /// first-seen order). `None` when not that shape (caller falls back). Bare-Prop projections
 /// are already handled by `try_distinct_frontier_prop`/`_multi`; this catches expressions.
 fn try_distinct_varlen_expr(input: &Plan, store: &Store) -> Option<Batch> {
-    let Plan::Project { input: chain, items } = input else {
+    let Plan::Project {
+        input: chain,
+        items,
+    } = input
+    else {
         return None;
     };
     let endpoint = chain_pull_width(chain)?.checked_sub(1)?;
@@ -14739,7 +14872,18 @@ fn distinct_chain_endpoints(chain: &Plan, store: &Store) -> Option<Vec<u32>> {
                 out: Vec::new(),
             };
             run_varlen(
-                &src, store, &want, *min, *max, *dir, *mode, None, 1, None, None, *double_loops,
+                &src,
+                store,
+                &want,
+                *min,
+                *max,
+                *dir,
+                *mode,
+                None,
+                1,
+                None,
+                None,
+                *double_loops,
                 &mut sink,
             );
             Some(sink.out)
@@ -14758,7 +14902,9 @@ fn distinct_chain_endpoints(chain: &Plan, store: &Store) -> Option<Vec<u32>> {
             }
             let eps = distinct_chain_endpoints(input, store)?;
             let rows = eps.len();
-            let mut cols: Vec<Col> = (0..endpoint).map(|_| Col::Nodes(vec![0u32; rows])).collect();
+            let mut cols: Vec<Col> = (0..endpoint)
+                .map(|_| Col::Nodes(vec![0u32; rows]))
+                .collect();
             cols.push(Col::Nodes(eps));
             let batch = Batch::of(cols);
             let mask = eval_mask(pred, store, &batch).ok()?;
@@ -14811,7 +14957,11 @@ fn chain_frontier(chain: &Plan, store: &Store, endpoint: usize) -> Option<Vec<u3
 /// [`try_distinct_frontier_multi`] deliberately bails on (a raw Str/Num loses to the typed
 /// set there). Absence is one `Null` row (first-seen); DISTINCT order is set-compared.
 fn try_distinct_frontier_prop(input: &Plan, store: &Store) -> Option<Batch> {
-    let Plan::Project { input: chain, items } = input else {
+    let Plan::Project {
+        input: chain,
+        items,
+    } = input
+    else {
         return None;
     };
     let [(_, Expr::Prop { slot, key })] = items.as_slice() else {
@@ -14931,7 +15081,11 @@ fn try_distinct_frontier_prop(input: &Plan, store: &Store) -> Option<Batch> {
 /// is a Project whose ≥2 items are all the identical `Prop` (the `b.city, b.city` shape the
 /// fuzzer emits). Lineage-free (the caller gates on `!track`; DISTINCT collapses paths).
 fn try_distinct_identical_cols(input: &Plan, store: &Store, track: bool) -> Option<Batch> {
-    let Plan::Project { input: chain, items } = input else {
+    let Plan::Project {
+        input: chain,
+        items,
+    } = input
+    else {
         return None;
     };
     if items.len() < 2 {
@@ -14958,7 +15112,11 @@ fn try_distinct_identical_cols(input: &Plan, store: &Store, track: bool) -> Opti
 }
 
 fn try_distinct_frontier_multi(input: &Plan, store: &Store) -> Option<Batch> {
-    let Plan::Project { input: chain, items } = input else {
+    let Plan::Project {
+        input: chain,
+        items,
+    } = input
+    else {
         return None;
     };
     if items.is_empty() {
@@ -16252,13 +16410,46 @@ mod tests {
                 let mut es: Vec<u32> = Vec::new();
                 if iterative {
                     varlen_walk(
-                        store, v, min, max, dir, &[], mode, v, &mut used, v as usize, &mut ns,
-                        &mut es, None, k, None, None, double_loops, &mut sink,
+                        store,
+                        v,
+                        min,
+                        max,
+                        dir,
+                        &[],
+                        mode,
+                        v,
+                        &mut used,
+                        v as usize,
+                        &mut ns,
+                        &mut es,
+                        None,
+                        k,
+                        None,
+                        None,
+                        double_loops,
+                        &mut sink,
                     );
                 } else {
                     varlen_dfs(
-                        store, v, 0, min, max, dir, &[], mode, v, &mut used, v as usize, &mut ns,
-                        &mut es, None, k, None, None, double_loops, &mut sink,
+                        store,
+                        v,
+                        0,
+                        min,
+                        max,
+                        dir,
+                        &[],
+                        mode,
+                        v,
+                        &mut used,
+                        v as usize,
+                        &mut ns,
+                        &mut es,
+                        None,
+                        k,
+                        None,
+                        None,
+                        double_loops,
+                        &mut sink,
                     );
                 }
                 if node_unique {
@@ -16280,7 +16471,9 @@ mod tests {
             let n_nodes = 4 + (rng() % 7) as u32;
             let mut nd = String::new();
             for i in 0..n_nodes {
-                nd.push_str(&format!("{{\"id\":\"n{i}\",\"labels\":[\"P\"],\"props\":{{}}}}\n"));
+                nd.push_str(&format!(
+                    "{{\"id\":\"n{i}\",\"labels\":[\"P\"],\"props\":{{}}}}\n"
+                ));
             }
             let ecount = (rng() % (u64::from(n_nodes) * 3 + 1)) as u32;
             for e in 0..ecount {
@@ -16291,16 +16484,42 @@ mod tests {
                 ));
             }
             let store = crate::ndjson::from_ndjson(&nd).unwrap();
-            for mode in [PathMode::Walk, PathMode::Trail, PathMode::Simple, PathMode::Acyclic] {
+            for mode in [
+                PathMode::Walk,
+                PathMode::Trail,
+                PathMode::Simple,
+                PathMode::Acyclic,
+            ] {
                 for dir in [Dir::Out, Dir::In, Dir::Both] {
-                    for (min, max, k) in [(0u32, 3u32, 1u32), (1, 4, 1), (2, 2, 1), (1, 6, 2), (0, 4, 1)]
-                    {
+                    for (min, max, k) in [
+                        (0u32, 3u32, 1u32),
+                        (1, 4, 1),
+                        (2, 2, 1),
+                        (1, 6, 2),
+                        (0, 4, 1),
+                    ] {
                         for double_loops in [false, true] {
                             let rec = collect(
-                                &store, n_nodes, mode, dir, min, max, k, double_loops, false,
+                                &store,
+                                n_nodes,
+                                mode,
+                                dir,
+                                min,
+                                max,
+                                k,
+                                double_loops,
+                                false,
                             );
                             let itr = collect(
-                                &store, n_nodes, mode, dir, min, max, k, double_loops, true,
+                                &store,
+                                n_nodes,
+                                mode,
+                                dir,
+                                min,
+                                max,
+                                k,
+                                double_loops,
+                                true,
                             );
                             assert_eq!(
                                 rec, itr,
@@ -16318,8 +16537,18 @@ mod tests {
                                         used.push(src);
                                     }
                                     varlen_count_dfs(
-                                        &store, src, 0, min, max, dir, &[], mode, src, &mut used,
-                                        &mut total, double_loops,
+                                        &store,
+                                        src,
+                                        0,
+                                        min,
+                                        max,
+                                        dir,
+                                        &[],
+                                        mode,
+                                        src,
+                                        &mut used,
+                                        &mut total,
+                                        double_loops,
                                     );
                                     if node_unique {
                                         used.pop();
@@ -16340,15 +16569,26 @@ mod tests {
                                             used2.push(src);
                                         }
                                         varlen_agg_dfs(
-                                            &store, src, 0, min, max, dir, &[], mode, src,
-                                            &mut used2, &mut |v| sum += u64::from(v),
+                                            &store,
+                                            src,
+                                            0,
+                                            min,
+                                            max,
+                                            dir,
+                                            &[],
+                                            mode,
+                                            src,
+                                            &mut used2,
+                                            &mut |v| sum += u64::from(v),
                                         );
                                         if node_unique {
                                             used2.pop();
                                         }
                                     }
-                                    let want: u64 =
-                                        itr.iter().map(|(ns, _)| u64::from(*ns.last().unwrap())).sum();
+                                    let want: u64 = itr
+                                        .iter()
+                                        .map(|(ns, _)| u64::from(*ns.last().unwrap()))
+                                        .sum();
                                     assert_eq!(
                                         sum, want,
                                         "agg-sum twin vs materialized endpoints: mode={mode:?} dir={dir:?} {min}..={max}"
@@ -16372,7 +16612,9 @@ mod tests {
         // A 40k-long chain n0->n1->...; recursing it would need ~20 MB of stack.
         let mut nd = String::new();
         for i in 0..40_000u32 {
-            nd.push_str(&format!("{{\"id\":\"n{i}\",\"labels\":[\"P\"],\"props\":{{}}}}\n"));
+            nd.push_str(&format!(
+                "{{\"id\":\"n{i}\",\"labels\":[\"P\"],\"props\":{{}}}}\n"
+            ));
         }
         for i in 0..39_999u32 {
             nd.push_str(&format!(
@@ -16398,15 +16640,15 @@ mod tests {
             .spawn(move || {
                 let mut sink = CountEmit(0);
                 run_varlen(
-                    &[0],           // source = n0
+                    &[0], // source = n0
                     &store,
-                    &[],            // any edge label
-                    1,              // min
-                    u32::MAX,       // max (unbounded)
+                    &[],      // any edge label
+                    1,        // min
+                    u32::MAX, // max (unbounded)
                     Dir::Out,
                     PathMode::Walk,
                     None,
-                    1,              // k
+                    1, // k
                     None,
                     None,
                     false,
@@ -16416,8 +16658,18 @@ mod tests {
                 let mut total = 0u64;
                 let mut used: Vec<u32> = Vec::new();
                 varlen_count_dfs(
-                    &store, 0, 0, 1, u32::MAX, Dir::Out, &[], PathMode::Walk, 0, &mut used,
-                    &mut total, false,
+                    &store,
+                    0,
+                    0,
+                    1,
+                    u32::MAX,
+                    Dir::Out,
+                    &[],
+                    PathMode::Walk,
+                    0,
+                    &mut used,
+                    &mut total,
+                    false,
                 );
                 (sink.0, total)
             })
@@ -16578,7 +16830,8 @@ mod tests {
         let q = |lim: usize| {
             format!("MATCH (a)-[:R]->(b)-[:R]->(c) WHERE c.name = 'target' RETURN a.name AS a LIMIT {lim}")
         };
-        let rows = |st: &Store, lim: usize| run(&crate::gql::parse(&q(lim)).unwrap(), st).rows.len();
+        let rows =
+            |st: &Store, lim: usize| run(&crate::gql::parse(&q(lim)).unwrap(), st).rows.len();
         // Forward (no index): 3 matching rows, so LIMIT 2 caps to 2, LIMIT 10 keeps 3.
         assert_eq!(rows(&st, 2), 2);
         assert_eq!(rows(&st, 10), 3);
@@ -16697,9 +16950,12 @@ mod tests {
         assert_eq!(rows("MATCH (n) RETURN DISTINCT n.c AS x LIMIT 10"), full);
         // A binding LIMIT still caps (3 distinct, LIMIT 2 → 2 rows).
         assert_eq!(
-            run(&crate::gql::parse("MATCH (n) RETURN DISTINCT n.c AS x LIMIT 2").unwrap(), &st)
-                .rows
-                .len(),
+            run(
+                &crate::gql::parse("MATCH (n) RETURN DISTINCT n.c AS x LIMIT 2").unwrap(),
+                &st
+            )
+            .rows
+            .len(),
             2
         );
     }
@@ -16809,9 +17065,18 @@ mod tests {
     #[test]
     fn reverse_range_in_or_seeds_match_forward() {
         let mut b = Builder::default();
-        let e1 = b.node(&["N"], &[("name", s("e1")), ("age", n(95.0)), ("city", s("oslo"))]);
-        let e2 = b.node(&["N"], &[("name", s("e2")), ("age", n(99.0)), ("city", s("bergen"))]);
-        let e3 = b.node(&["N"], &[("name", s("e3")), ("age", n(50.0)), ("city", s("oslo"))]);
+        let e1 = b.node(
+            &["N"],
+            &[("name", s("e1")), ("age", n(95.0)), ("city", s("oslo"))],
+        );
+        let e2 = b.node(
+            &["N"],
+            &[("name", s("e2")), ("age", n(99.0)), ("city", s("bergen"))],
+        );
+        let e3 = b.node(
+            &["N"],
+            &[("name", s("e3")), ("age", n(50.0)), ("city", s("oslo"))],
+        );
         let s1 = b.node(&["N"], &[("name", s("s1"))]);
         let s2 = b.node(&["N"], &[("name", s("s2"))]);
         let s3 = b.node(&["N"], &[("name", s("s3"))]);
@@ -16961,12 +17226,23 @@ mod tests {
         );
         let mut c0 = names_of(&batch, 0);
         let c1 = names_of(&batch, 1);
-        assert_eq!(c0.clone().into_iter().collect::<std::collections::BTreeSet<_>>().len(), c0.len(), "col0 is distinct");
+        assert_eq!(
+            c0.clone()
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            c0.len(),
+            "col0 is distinct"
+        );
         c0.sort();
         let mut c1s = c1.clone();
         c1s.sort();
         assert_eq!(c0, vec!["m1", "m2", "t"]);
-        assert_eq!(c1, names_of(&batch, 0), "second column replicates the first row-for-row");
+        assert_eq!(
+            c1,
+            names_of(&batch, 0),
+            "second column replicates the first row-for-row"
+        );
         assert_eq!(c0, c1s);
     }
 
@@ -17090,7 +17366,13 @@ mod tests {
     fn fused_hop_projection_matches_general() {
         let mut b = Builder::default();
         let src = b.node(&["Person"], &[("name", s("src"))]);
-        for (sc, nm) in [(10.0, "a"), (60.0, "b"), (30.0, "c"), (90.0, "d"), (20.0, "e")] {
+        for (sc, nm) in [
+            (10.0, "a"),
+            (60.0, "b"),
+            (30.0, "c"),
+            (90.0, "d"),
+            (20.0, "e"),
+        ] {
             let t = b.node(&["Person"], &[("score", n(sc)), ("name", s(nm))]);
             b.edge(src, t, "F");
         }
@@ -17098,8 +17380,10 @@ mod tests {
         // score < 50 keeps a(10,→'a'), c(30,→'c'), e(20,→'e'); b,d dropped.
         let mut got = names_of(
             &run(
-                &crate::gql::parse("MATCH (a:Person)-[:F]->(b) WHERE b.score < 50 RETURN b.name AS n")
-                    .unwrap(),
+                &crate::gql::parse(
+                    "MATCH (a:Person)-[:F]->(b) WHERE b.score < 50 RETURN b.name AS n",
+                )
+                .unwrap(),
                 &st,
             ),
             0,
@@ -17129,13 +17413,23 @@ mod tests {
         let mut b = Builder::default();
         let src = b.node(&["Person"], &[("name", s("src"))]);
         // targets with (score, age); the OR (score >= 50 OR age < 5) keeps some, drops others.
-        for (sc, ag) in [(10.0, 3.0), (60.0, 90.0), (55.0, 2.0), (20.0, 40.0), (99.0, 10.0)] {
+        for (sc, ag) in [
+            (10.0, 3.0),
+            (60.0, 90.0),
+            (55.0, 2.0),
+            (20.0, 40.0),
+            (99.0, 10.0),
+        ] {
             let t = b.node(&["Person"], &[("score", n(sc)), ("age", n(ag))]);
             b.edge(src, t, "F");
         }
         let st = b.build();
         let scalar = |q: &str| -> f64 {
-            match &run(&crate::gql::parse(q).unwrap(), &st).rows.iter().next().expect("one row")[0]
+            match &run(&crate::gql::parse(q).unwrap(), &st)
+                .rows
+                .iter()
+                .next()
+                .expect("one row")[0]
             {
                 Value::Num(n) => *n,
                 other => panic!("not a number: {other:?}"),
@@ -17264,7 +17558,9 @@ mod tests {
     #[test]
     fn reverse_seed_declines_non_selective_endpoint() {
         let mut b = Builder::default();
-        let ids: Vec<u32> = (0..6).map(|_| b.node(&["N"], &[("name", s("x"))])).collect();
+        let ids: Vec<u32> = (0..6)
+            .map(|_| b.node(&["N"], &[("name", s("x"))]))
+            .collect();
         for w in ids.windows(2) {
             b.edge(w[0], w[1], "R");
         }

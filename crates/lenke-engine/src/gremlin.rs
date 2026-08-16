@@ -5982,7 +5982,8 @@ mod tests {
             }
         }
         let st = b.build();
-        let plan = crate::opt::optimize_indexed(super::parse("g.V().out().values('name')").unwrap(), &st);
+        let plan =
+            crate::opt::optimize_indexed(super::parse("g.V().out().values('name')").unwrap(), &st);
         let materialized = crate::json::gremlin_results_json(&run(&plan, &st));
         let streamed = crate::exec::try_stream_gremlin_json(&plan, &st, false, 0.0)
             .expect("single-hop values is a streamable shape");
@@ -6000,8 +6001,10 @@ mod tests {
         let mut b = Builder::default();
         // Mixed graph: some nodes miss `age`/`city`; every 5th node is also VIP; a bool.
         for i in 0..120u32 {
-            let mut props: Vec<(&str, Value)> =
-                vec![("name", s(&format!("p{i}"))), ("active", Value::Bool(i % 2 == 0))];
+            let mut props: Vec<(&str, Value)> = vec![
+                ("name", s(&format!("p{i}"))),
+                ("active", Value::Bool(i % 2 == 0)),
+            ];
             if i % 3 != 0 {
                 props.push(("age", n(f64::from(i % 40 + 18))));
             }
@@ -6040,10 +6043,22 @@ mod tests {
     #[test]
     fn shortest_path_early_stop_matches_full_bfs() {
         // 0->1->4 and 0->2->4 (two shortest paths to 4), then 4->5->6->7 (a tail).
-        let edges = [(0, 1), (0, 2), (1, 4), (2, 4), (4, 5), (5, 6), (6, 7), (0, 3), (3, 4)];
+        let edges = [
+            (0, 1),
+            (0, 2),
+            (1, 4),
+            (2, 4),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (0, 3),
+            (3, 4),
+        ];
         let mut nd = String::new();
         for i in 0..8u32 {
-            nd.push_str(&format!("{{\"id\":\"{i}\",\"labels\":[\"N\"],\"props\":{{\"k\":{i}}}}}\n"));
+            nd.push_str(&format!(
+                "{{\"id\":\"{i}\",\"labels\":[\"N\"],\"props\":{{\"k\":{i}}}}}\n"
+            ));
         }
         for (j, (a, b)) in edges.iter().enumerate() {
             nd.push_str(&format!(
@@ -6083,7 +6098,9 @@ mod tests {
     fn reachability_count_is_bfs_not_walk_enumeration() {
         let mut nd = String::new();
         for i in 0..300u32 {
-            nd.push_str(&format!("{{\"id\":\"{i}\",\"labels\":[\"N\"],\"props\":{{}}}}\n"));
+            nd.push_str(&format!(
+                "{{\"id\":\"{i}\",\"labels\":[\"N\"],\"props\":{{}}}}\n"
+            ));
         }
         for e in 0..900u32 {
             let (from, to) = (e % 300, (e * 11 + 3) % 300);
@@ -6110,12 +6127,18 @@ mod tests {
         for row in walk.rows.iter() {
             distinct.insert(format!("{:?}", row[endpoint_col]));
         }
-        assert_eq!(count("g.V().repeat(both()).times(2).dedup().count()"), distinct.len() as f64);
+        assert_eq!(
+            count("g.V().repeat(both()).times(2).dedup().count()"),
+            distinct.len() as f64
+        );
 
         // (2) A DEEP reach-count still completes — impossible via walk enumeration (the
         // default trail ceiling would trip long before depth 30 if it enumerated).
         let deep = count("g.V().repeat(both()).times(30).dedup().count()");
-        assert!(deep > 0.0 && deep <= 300.0, "deep reach-count out of range: {deep}");
+        assert!(
+            deep > 0.0 && deep <= 300.0,
+            "deep reach-count out of range: {deep}"
+        );
     }
 
     /// Streaming a var-length endpoint projection to JSON must be (1) BYTE-IDENTICAL to
@@ -6128,14 +6151,20 @@ mod tests {
         use crate::store::ConfigId;
         let mut nd = String::new();
         for i in 0..60u32 {
-            let labels: &str = if i % 4 == 0 { "[\"P\",\"V\"]" } else { "[\"P\"]" };
+            let labels: &str = if i % 4 == 0 {
+                "[\"P\",\"V\"]"
+            } else {
+                "[\"P\"]"
+            };
             // ~1/3 of nodes have NO `name` — the PropertyExists guard must drop them.
             let props = if i % 3 == 0 {
                 format!("\"age\":{}", i % 20)
             } else {
                 format!("\"age\":{},\"name\":\"p{i}\"", i % 20)
             };
-            nd.push_str(&format!("{{\"id\":\"n{i}\",\"labels\":{labels},\"props\":{{{props}}}}}\n"));
+            nd.push_str(&format!(
+                "{{\"id\":\"n{i}\",\"labels\":{labels},\"props\":{{{props}}}}}\n"
+            ));
         }
         for e in 0..120u32 {
             nd.push_str(&format!(
@@ -6155,7 +6184,10 @@ mod tests {
             let plan = crate::opt::optimize_indexed(super::parse(q).unwrap(), &st);
             let streamed = crate::exec::run_gremlin_json(&plan, &st);
             let material = crate::json::gremlin_results_json(&run(&plan, &st));
-            assert_eq!(streamed, material, "streamed vs materialized diverged for `{q}`");
+            assert_eq!(
+                streamed, material,
+                "streamed vs materialized diverged for `{q}`"
+            );
         }
         // (2) with a tiny row cap, a modest closure trips the MATERIALIZED path but the
         // streamed path (bounded by output bytes, not rows) still completes.
@@ -6184,7 +6216,9 @@ mod tests {
             } else {
                 format!("\"age\":{},\"name\":\"p{i}\"", i % 20)
             };
-            nd.push_str(&format!("{{\"id\":\"n{i}\",\"labels\":[\"P\"],\"props\":{{{props}}}}}\n"));
+            nd.push_str(&format!(
+                "{{\"id\":\"n{i}\",\"labels\":[\"P\"],\"props\":{{{props}}}}}\n"
+            ));
         }
         for e in 0..120u32 {
             nd.push_str(&format!(
@@ -6201,7 +6235,10 @@ mod tests {
             let plan = crate::opt::optimize_indexed(crate::gql::parse(q).unwrap(), &st);
             let streamed = crate::exec::try_run_gql_json(&plan, &st).unwrap();
             let material = crate::json::gql_rows_json(&crate::exec::try_run(&plan, &st).unwrap());
-            assert_eq!(streamed, material, "GQL streamed vs materialized diverged for `{q}`");
+            assert_eq!(
+                streamed, material,
+                "GQL streamed vs materialized diverged for `{q}`"
+            );
         }
         st.set_limit(ConfigId::LimitsTrail, 100);
         let plan = crate::opt::optimize_indexed(
@@ -6236,7 +6273,10 @@ mod tests {
         }
         let st = crate::ndjson::from_ndjson(&nd).unwrap();
         // From n0, exactly n-1 R-hops reaches the single last node.
-        let q = format!("MATCH (s:P {{name:'p0'}})-[:R]->{{{}}}(t) RETURN t.name AS r", n - 1);
+        let q = format!(
+            "MATCH (s:P {{name:'p0'}})-[:R]->{{{}}}(t) RETURN t.name AS r",
+            n - 1
+        );
         let plan = crate::opt::optimize_indexed(crate::gql::parse(&q).unwrap(), &st);
         assert_eq!(run(&plan, &st).rows.len(), 1);
     }
@@ -6250,7 +6290,9 @@ mod tests {
         // A dense-ish graph so `repeat(both())` fans out fast.
         let mut nd = String::new();
         for i in 0..200u32 {
-            nd.push_str(&format!("{{\"id\":\"{i}\",\"labels\":[\"N\"],\"props\":{{}}}}\n"));
+            nd.push_str(&format!(
+                "{{\"id\":\"{i}\",\"labels\":[\"N\"],\"props\":{{}}}}\n"
+            ));
         }
         for e in 0..800u32 {
             let (from, to) = (e % 200, (e * 7 + 1) % 200);
@@ -6265,9 +6307,7 @@ mod tests {
             let plan = crate::opt::optimize_indexed(super::parse(q).unwrap(), st);
             crate::exec::try_run(&plan, st)
         };
-        let is_exhausted = |r: &Result<crate::exec::Rows, String>| {
-            matches!(r, Err(e) if e.contains("E_RESOURCE_EXHAUSTED"))
-        };
+        let is_exhausted = |r: &Result<crate::exec::Rows, String>| matches!(r, Err(e) if e.contains("E_RESOURCE_EXHAUSTED"));
 
         // A shallow walk is well under the default ceiling — it completes.
         assert!(run_q(&st, "g.V().repeat(both()).times(1)").is_ok());
@@ -6275,7 +6315,10 @@ mod tests {
         // Tighten the ceiling: a walk that exceeds it now errors (not truncates).
         st.set_limit(ConfigId::LimitsTrail, 2_000);
         let tight = run_q(&st, "g.V().repeat(both()).times(3)");
-        assert!(is_exhausted(&tight), "expected E_RESOURCE_EXHAUSTED, got {tight:?}");
+        assert!(
+            is_exhausted(&tight),
+            "expected E_RESOURCE_EXHAUSTED, got {tight:?}"
+        );
 
         // Raise it back above the result size: the SAME query now completes.
         st.set_limit(ConfigId::LimitsTrail, 100_000_000);
@@ -6300,7 +6343,10 @@ mod tests {
             // Half the edges carry a string `kind`; all carry numeric `w`; some typed T2.
             let mut props = format!("\"w\":{}", e % 50);
             if e % 2 == 0 {
-                props.push_str(&format!(",\"kind\":\"{}\"", ["buy", "sell"][(e % 2) as usize]));
+                props.push_str(&format!(
+                    ",\"kind\":\"{}\"",
+                    ["buy", "sell"][(e % 2) as usize]
+                ));
             }
             let lbl = if e % 5 == 0 { "T2" } else { "R" };
             nd.push_str(&format!(
@@ -6339,11 +6385,29 @@ mod tests {
         let st = b.build();
         let opt = |q: &str| crate::opt::optimize_indexed(super::parse(q).unwrap(), &st);
         // Accepted: one hop, presence filter from `values`.
-        assert!(crate::exec::try_stream_gremlin_json(&opt("g.V().out().values('name')"), &st, false, 0.0).is_some());
+        assert!(crate::exec::try_stream_gremlin_json(
+            &opt("g.V().out().values('name')"),
+            &st,
+            false,
+            0.0
+        )
+        .is_some());
         // Rejected: two hops (per-block re-expansion tax).
-        assert!(crate::exec::try_stream_gremlin_json(&opt("g.V().out().out().values('name')"), &st, false, 0.0).is_none());
+        assert!(crate::exec::try_stream_gremlin_json(
+            &opt("g.V().out().out().values('name')"),
+            &st,
+            false,
+            0.0
+        )
+        .is_none());
         // Rejected: a value comparison the estimate over-counts.
-        assert!(crate::exec::try_stream_gremlin_json(&opt("g.V().out().has('name', eq('p5')).values('name')"), &st, false, 0.0).is_none());
+        assert!(crate::exec::try_stream_gremlin_json(
+            &opt("g.V().out().has('name', eq('p5')).values('name')"),
+            &st,
+            false,
+            0.0
+        )
+        .is_none());
     }
 
     /// A type filter must match an edge's SECONDARY label, not just its primary type —

@@ -865,7 +865,9 @@ impl Store {
         if !self.csr_fresh {
             return None;
         }
-        self.csr_out_typed.get(etype as usize).map(|(_, adj)| adj.as_slice())
+        self.csr_out_typed
+            .get(etype as usize)
+            .map(|(_, adj)| adj.as_slice())
     }
 
     /// Node `v`'s IN edges of type `etype`, a contiguous slice in in_adj order. The
@@ -2206,9 +2208,8 @@ impl Store {
     ) -> Option<Vec<u32>> {
         use std::ops::Bound::{Excluded, Included, Unbounded};
         let ix = self.ranges.iter().find(|i| i.key == key)?;
-        let null_end = |b: std::ops::Bound<&Value>| {
-            matches!(b, Included(v) | Excluded(v) if v.is_null())
-        };
+        let null_end =
+            |b: std::ops::Bound<&Value>| matches!(b, Included(v) | Excluded(v) if v.is_null());
         if null_end(lo) || null_end(hi) {
             return Some(Vec::new());
         }
