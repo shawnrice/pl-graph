@@ -159,6 +159,8 @@ pub fn run(plan: &Plan, store: &Store) -> Rows {
 /// graph can recurse far enough to overflow the default 8 MB stack (a stack overflow
 /// aborts the process — `catch_unwind` cannot recover it). Such a plan runs on a
 /// large-stack thread instead. Everything else keeps the cheap direct path.
+// Only the non-wasm `on_big_stack` consults this; wasm runs traversals inline.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn plan_has_varlen(plan: &Plan) -> bool {
     match plan {
         // `VarLength` now runs the ITERATIVE `varlen_walk` (O(1) call stack — see
@@ -213,6 +215,7 @@ fn plan_has_varlen(plan: &Plan) -> bool {
 /// plan runs `f` directly. Reserving a big stack costs nothing until the recursion uses
 /// it. Used by every entry that may drive a traversal — `try_run` and the Gremlin-JSON
 /// sinks, which call `pull` off the main path.
+#[cfg(not(target_arch = "wasm32"))]
 fn on_big_stack<T: Send>(plan: &Plan, f: impl FnOnce() -> T + Send) -> T {
     if !plan_has_varlen(plan) {
         return f();
@@ -226,6 +229,14 @@ fn on_big_stack<T: Send>(plan: &Plan, f: impl FnOnce() -> T + Send) -> T {
             .join()
             .expect("traversal thread panicked")
     })
+}
+
+/// wasm has no threads, so a deep traversal runs inline on the module's own stack.
+/// If an unbounded quantifier overflows it, raise the wasm stack size at link time
+/// (`-C link-arg=-zstack-size=…`) rather than spawning — there is nothing to spawn.
+#[cfg(target_arch = "wasm32")]
+fn on_big_stack<T>(_plan: &Plan, f: impl FnOnce() -> T) -> T {
+    f()
 }
 
 pub fn try_run(plan: &Plan, store: &Store) -> Result<Rows, String> {

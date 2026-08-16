@@ -206,10 +206,35 @@ transport reshape — byte-identity and the conformance suites are unaffected.
   the shared engine-compare build.
 - `lnk_abi_version()` returns the ABI the host asserts; the host loads core's or
   the engine's artifact by these names.
-- The engine is already single-threaded (no rayon) — exactly what the wasm
-  target needs, so core's wasm-safety work is free here.
 - Arrow buffers must use the _same_ allocator as every other returned buffer, so
   one `lnk_free` releases them all (core needed a separate `free_arrow`).
+
+## wasm build
+
+`bun run engine:build:wasm` (native cdylib: `engine:build:rust`) — both in
+`packages/native/package.json`, mirroring core's `build:wasm`/`build:rust` with
+`--features capi`. The engine builds for `wasm32-unknown-unknown` with **no
+external imports** — the module loads with `WebAssembly.instantiate(mod, {})`,
+exports its `memory` and all 16 `lnk_*`, and `lnk_abi_version()` returns 18.
+Verified end-to-end over wasm: NDJSON load → GQL query → result read, and a full
+prepared-statement lifecycle including a use-after-free surfacing as a clean
+`E_FFI` error.
+
+What it took (the only wasm-specific code):
+
+- **`on_big_stack` is cfg-gated.** On native a deep-recursion traversal runs on a
+  spawned 1 GiB-stack thread; wasm has no threads, so it runs inline
+  (`#[cfg(target_arch = "wasm32")]`). If an unbounded quantifier overflows the
+  module stack, raise it at link time (`-C link-arg=-zstack-size=…`).
+- Nothing else needed gating: the engine's only runtime dep is `regex` (pure
+  Rust); the cost estimator's `/proc/meminfo` read already falls back gracefully
+  (`.ok()…map_or(4 GiB)` — returns `Err` on wasm, no panic); `Instant` is
+  `#[cfg(test)]`-only.
+
+Known wasm limitation (shared with core): `wasm32-unknown-unknown` is
+`panic = "abort"`, so the `catch_unwind` query backstop cannot recover a faulting
+query — a genuine engine panic aborts the module instance rather than failing the
+one call. Parse/exec errors still return cleanly (they are `Result`, not panics).
 
 ## Current state of the scaffold (`src/ffi.rs`)
 
