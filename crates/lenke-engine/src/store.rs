@@ -480,6 +480,169 @@ pub struct Adj {
     pub eid: u32,
 }
 
+/// A scalar / list / open-record property type for a TYPE constraint. The names
+/// mirror the scalar set lenke-core's `PropType` accepts (its closed-record
+/// `record { … }` specs are a later addition here). `AnyRecord` is `any record`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PropType {
+    String,
+    Number,
+    Boolean,
+    Date,
+    LocalTime,
+    DateTime,
+    ZonedTime,
+    ZonedDateTime,
+    Duration,
+    List,
+    AnyRecord,
+}
+
+impl PropType {
+    /// Parse a type name (as written in a `createTypeConstraint`). `None` for an
+    /// unknown/malformed name (→ `E_INVALID_VALUE`, matching core).
+    fn from_name(s: &str) -> Option<Self> {
+        Some(match s.trim() {
+            "string" => Self::String,
+            "number" => Self::Number,
+            "boolean" => Self::Boolean,
+            "date" => Self::Date,
+            "localtime" => Self::LocalTime,
+            "datetime" => Self::DateTime,
+            "zoned_time" => Self::ZonedTime,
+            "zoned_datetime" => Self::ZonedDateTime,
+            "duration" => Self::Duration,
+            "list" => Self::List,
+            "record" | "any record" => Self::AnyRecord,
+            _ => return None,
+        })
+    }
+    /// The canonical name for the schema dump (inverse of [`from_name`]).
+    fn to_name(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Number => "number",
+            Self::Boolean => "boolean",
+            Self::Date => "date",
+            Self::LocalTime => "localtime",
+            Self::DateTime => "datetime",
+            Self::ZonedTime => "zoned_time",
+            Self::ZonedDateTime => "zoned_datetime",
+            Self::Duration => "duration",
+            Self::List => "list",
+            Self::AnyRecord => "any record",
+        }
+    }
+}
+
+/// The [`PropType`] a value satisfies, or `None` for a value EXEMPT from a scalar
+/// constraint (`Null` — nullability is the separate REQUIRED/NOT NULL concern — and
+/// a record, which no scalar type describes). Mirrors core's `value_type`.
+fn value_prop_type(v: &Value) -> Option<PropType> {
+    Some(match v {
+        Value::Null | Value::Record(_) | Value::Map(_) => return None,
+        Value::Str(_) => PropType::String,
+        Value::Num(_) => PropType::Number,
+        Value::Bool(_) => PropType::Boolean,
+        Value::List(_) => PropType::List,
+        Value::Temporal(t) => match t.tag() {
+            "localtime" => PropType::LocalTime,
+            "datetime" => PropType::DateTime,
+            "zoned_time" => PropType::ZonedTime,
+            "zoned_datetime" => PropType::ZonedDateTime,
+            "duration" => PropType::Duration,
+            _ => PropType::Date,
+        },
+    })
+}
+
+/// Whether `v` satisfies a type constraint of `ty` with `not_null`. A top-level
+/// `Null` passes the type test (only `not_null` rejects it); a record/map is
+/// exempt from a scalar type; `AnyRecord` requires a record. Mirrors core's
+/// `value_matches`.
+fn value_matches_type(v: &Value, ty: PropType, not_null: bool) -> bool {
+    if matches!(v, Value::Null) {
+        return !not_null;
+    }
+    match ty {
+        PropType::AnyRecord => matches!(v, Value::Record(_) | Value::Map(_)),
+        _ => value_prop_type(v).is_none_or(|got| got == ty),
+    }
+}
+
+/// Parse a type-constraint spec: a type name optionally suffixed ` NOT NULL`.
+/// `Err` (`E_INVALID_VALUE`-coded) on an unknown/malformed name, matching core.
+fn parse_type_spec(spec: &str) -> Result<(PropType, bool), String> {
+    let trimmed = spec.trim();
+    let (name, not_null) = match trimmed.strip_suffix("NOT NULL") {
+        Some(rest) if rest.is_empty() || rest.ends_with(char::is_whitespace) => {
+            (rest.trim_end(), true)
+        }
+        _ => (trimmed, false),
+    };
+    match PropType::from_name(name) {
+        Some(ty) => Ok((ty, not_null)),
+        None => {
+            Err("E_INVALID_VALUE: unknown or malformed type name for a type constraint".to_string())
+        }
+    }
+}
+
+/// Whether a value participates in a unique/index set (a scalar). A null, list, or
+/// record is exempt (mirrors core's index-backed edge uniqueness).
+fn is_indexable(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Temporal(_)
+    )
+}
+
+/// A declared TYPE constraint: a property `key` on a vertex label OR edge type
+/// (`target`) must be of `ty` (and non-null when `not_null`).
+#[derive(Clone)]
+struct TypeRule {
+    target: String,
+    key: String,
+    ty: PropType,
+    not_null: bool,
+}
+
+/// A declared CARDINALITY constraint: a `label` vertex's degree of `etype` edges
+/// in `direction` (0 = out, 1 = in) must lie in `min..=max` (`max: None` = ∞).
+#[derive(Clone)]
+struct CardRule {
+    label: String,
+    etype: String,
+    direction: u8,
+    min: u32,
+    max: Option<u32>,
+}
+
+/// A declared VALIDATOR: a predicate `pred` (parsed from `src`, with the element
+/// bound to `var`) that must not be definitely-false for any element carrying
+/// `target` (a vertex label or edge type). SQL-`CHECK` semantics: only `false`
+/// fails; `null`/unknown passes.
+#[derive(Clone)]
+struct ValidatorRule {
+    target: String,
+    var: String,
+    src: String,
+    // Read by the exec-layer validator enforcement (wired next).
+    #[allow(dead_code)]
+    pred: crate::ir::Expr,
+}
+
+/// A declared INVARIANT: a whole-graph GQL query (`plan`, from `src`) that must
+/// not yield a boolean-`false` cell.
+#[derive(Clone)]
+struct InvariantRule {
+    name: String,
+    src: String,
+    // Read by the exec-layer invariant enforcement (wired next).
+    #[allow(dead_code)]
+    plan: crate::ir::Plan,
+}
+
 /// The graph. Nodes are dense ids `0..node_count`. Labels and properties are
 /// looked up by name; a label bucket (`by_label`) is the seed for a scan.
 /// Resource ceilings — ANTI-RUNAWAY bounds, not semantics. A query under the ceiling
@@ -622,6 +785,21 @@ pub struct Store {
     /// the null-first-class policy; only absence violates). Enforced by the write
     /// statements, like `unique`.
     required: Vec<(String, String)>,
+    /// declared edge unique constraints as `(edge type, keys)` — at most one live
+    /// edge of the type may carry a given key tuple (null/list values exempt).
+    e_unique: Vec<(String, Vec<String>)>,
+    /// declared edge required constraints as `(edge type, key)`.
+    e_required: Vec<(String, String)>,
+    /// declared vertex TYPE constraints (scalar/list/open-record + NOT NULL).
+    v_type: Vec<TypeRule>,
+    /// declared edge TYPE constraints (`target` is the edge type).
+    e_type: Vec<TypeRule>,
+    /// declared cardinality constraints (edge-degree bounds per vertex).
+    cardinality: Vec<CardRule>,
+    /// declared validators (a per-element predicate; `target` is a label or type).
+    validators: Vec<ValidatorRule>,
+    /// declared invariants (a whole-graph query that must hold after a write).
+    invariants: Vec<InvariantRule>,
     /// edge properties: key -> (eid -> value). Boxed (not columnar) — edges are a
     /// less hot path than node scans, and eids are sparse after deletes. A deleted
     /// edge's props are left behind (eids are never reused, so a dead eid is never
@@ -742,6 +920,13 @@ impl Clone for Store {
             last_commit: self.last_commit.clone(),
             unique: self.unique.clone(),
             required: self.required.clone(),
+            e_unique: self.e_unique.clone(),
+            e_required: self.e_required.clone(),
+            v_type: self.v_type.clone(),
+            e_type: self.e_type.clone(),
+            cardinality: self.cardinality.clone(),
+            validators: self.validators.clone(),
+            invariants: self.invariants.clone(),
             edge_props: self.edge_props.clone(),
             indexes: self.indexes.clone(),
             ranges: self.ranges.clone(),
@@ -1421,6 +1606,389 @@ impl Store {
                 return Err(format!(
                     "E_REQUIRED: required constraint on {label}({key}) violated"
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    // --- Deferred constraint checks (the write-path enforcement hook) ------
+    //
+    // A write STATEMENT runs inside a transaction (begin → mutate → commit); the
+    // store primitives stay infallible so rollback can always replay them. After
+    // the mutations, the statement calls `run_deferred_checks` ONCE — it derives
+    // the touched set from the open transaction's CDC change list and re-checks
+    // every constraint that could be affected, mirroring lenke-core's commit-time
+    // `run_deferred_checks`. On the first violation it returns the coded message
+    // and the caller rolls the whole statement back.
+
+    /// Re-check every constraint the open transaction's changes could have
+    /// violated. `Ok(())` outside a transaction or when nothing changed.
+    pub fn run_deferred_checks(&self) -> Result<(), String> {
+        let Some(changes) = &self.changes else {
+            return Ok(());
+        };
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        // Touched, still-live node labels + edge types (an add or a property write
+        // can violate; a delete removes the element, so it cannot). First-seen
+        // order, deduped. `edge_changed` gates the cardinality re-check.
+        let mut labels: Vec<String> = Vec::new();
+        let mut etypes: Vec<String> = Vec::new();
+        let mut edge_changed = false;
+        for c in changes {
+            match c {
+                Change::NodeAdded(n) | Change::NodeProp { node: n, .. } => {
+                    if self.is_alive(*n) {
+                        for l in self.labels_of(*n) {
+                            if !labels.contains(&l) {
+                                labels.push(l);
+                            }
+                        }
+                    }
+                }
+                Change::EdgeAdded(eid) | Change::EdgeProp { eid, .. } => {
+                    edge_changed = true;
+                    if let Some(t) = self.edge_type_name(*eid) {
+                        if !etypes.contains(&t) {
+                            etypes.push(t);
+                        }
+                    }
+                }
+                Change::EdgeDeleted(_) => edge_changed = true,
+                Change::NodeDeleted(_) => {}
+            }
+        }
+
+        // Vertex constraints on every touched label.
+        for l in &labels {
+            self.check_unique_for_label(l)?;
+            self.check_required_for_label(l)?;
+            self.check_type_for_target(l, false)?;
+        }
+        // Edge constraints on every touched edge type.
+        for t in &etypes {
+            self.check_edge_unique_for_type(t)?;
+            self.check_edge_required_for_type(t)?;
+            self.check_type_for_target(t, true)?;
+        }
+        // Cardinality: an edge add/delete shifts degrees, and a new node of a
+        // constrained label can break a MIN. Re-check every rule when either applies.
+        if !self.cardinality.is_empty()
+            && (edge_changed
+                || labels
+                    .iter()
+                    .any(|l| self.cardinality.iter().any(|r| &r.label == l)))
+        {
+            self.check_all_cardinality()?;
+        }
+        // Validators and invariants (predicate / whole-graph query) need the query
+        // evaluator, so exec runs them after this via `enforce_expr_constraints`.
+        Ok(())
+    }
+
+    // --- Edge unique / required constraints -------------------------------
+
+    /// The declared edge unique constraints as `(edge type, keys)`.
+    #[must_use]
+    pub fn edge_unique_constraints(&self) -> Vec<(String, Vec<String>)> {
+        self.e_unique.clone()
+    }
+
+    /// Declare an edge unique constraint on `(etype, keys)` — at most one live edge
+    /// of `etype` may carry a given tuple of non-null scalar values. Null/list
+    /// values are exempt (matching core, whose edge unique is index-backed). Errors
+    /// if the CURRENT data already violates it.
+    pub fn create_edge_unique_constraint(
+        &mut self,
+        etype: &str,
+        keys: &[&str],
+    ) -> Result<(), String> {
+        let keys: Vec<String> = keys.iter().map(|s| (*s).to_string()).collect();
+        self.check_etype_unique(etype, &keys)?;
+        self.e_unique.push((etype.to_string(), keys));
+        Ok(())
+    }
+
+    fn check_edge_unique_for_type(&self, etype: &str) -> Result<(), String> {
+        for (t, keys) in &self.e_unique {
+            if t == etype {
+                self.check_etype_unique(t, keys)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_etype_unique(&self, etype: &str, keys: &[String]) -> Result<(), String> {
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        for eid in self.edges_of_type(etype) {
+            let vals: Vec<Value> = keys.iter().map(|k| self.edge_prop(eid, k)).collect();
+            // A null/list/record value is exempt (not part of the uniqueness set).
+            if vals.iter().any(|v| !is_indexable(v)) {
+                continue;
+            }
+            let mut buf = Vec::new();
+            for v in &vals {
+                crate::value::group_key_into(v, &mut buf);
+            }
+            if !seen.insert(buf) {
+                return Err(format!(
+                    "E_UNIQUE: edge unique constraint on {etype}({}) violated",
+                    keys.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The declared edge required constraints as `(edge type, key)`.
+    #[must_use]
+    pub fn edge_required_constraints(&self) -> Vec<(String, String)> {
+        self.e_required.clone()
+    }
+
+    /// Declare an edge required constraint on `(etype, key)` — every live edge of
+    /// `etype` must carry a PRESENT value for `key`. Errors if data already breaks it.
+    pub fn create_edge_required_constraint(
+        &mut self,
+        etype: &str,
+        key: &str,
+    ) -> Result<(), String> {
+        self.check_etype_required(etype, key)?;
+        self.e_required.push((etype.to_string(), key.to_string()));
+        Ok(())
+    }
+
+    fn check_edge_required_for_type(&self, etype: &str) -> Result<(), String> {
+        for (t, key) in &self.e_required {
+            if t == etype {
+                self.check_etype_required(t, key)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_etype_required(&self, etype: &str, key: &str) -> Result<(), String> {
+        for eid in self.edges_of_type(etype) {
+            if !self.has_edge_prop(eid, key) {
+                return Err(format!(
+                    "E_REQUIRED: edge required constraint on {etype}({key}) violated"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The live edge ids whose PRIMARY type is `etype` (an edge's first label).
+    fn edges_of_type(&self, etype: &str) -> Vec<u32> {
+        self.all_edges()
+            .into_iter()
+            .filter(|&e| self.edge_type_name(e).as_deref() == Some(etype))
+            .collect()
+    }
+
+    // --- Type constraints (vertex + edge) ---------------------------------
+
+    /// The declared vertex type constraints as `(label, key, type_name, not_null)`.
+    #[must_use]
+    pub fn type_constraints(&self) -> Vec<(String, String, String, bool)> {
+        self.v_type
+            .iter()
+            .map(|r| {
+                (
+                    r.target.clone(),
+                    r.key.clone(),
+                    r.ty.to_name().to_string(),
+                    r.not_null,
+                )
+            })
+            .collect()
+    }
+
+    /// The declared edge type constraints as `(edge type, key, type_name, not_null)`.
+    #[must_use]
+    pub fn edge_type_constraints(&self) -> Vec<(String, String, String, bool)> {
+        self.e_type
+            .iter()
+            .map(|r| {
+                (
+                    r.target.clone(),
+                    r.key.clone(),
+                    r.ty.to_name().to_string(),
+                    r.not_null,
+                )
+            })
+            .collect()
+    }
+
+    /// Declare a type constraint on `(target, key)`: a vertex label's or edge type's
+    /// property must be of `type_name` (a scalar name, `list`, or `record`/`any
+    /// record`, optionally suffixed ` NOT NULL`). `edge` selects the namespace.
+    /// Errors `E_INVALID_VALUE` on an unknown name, `E_TYPE` if data already breaks it.
+    pub fn create_type_constraint(
+        &mut self,
+        target: &str,
+        key: &str,
+        type_name: &str,
+        edge: bool,
+    ) -> Result<(), String> {
+        let (ty, not_null) = parse_type_spec(type_name)?;
+        self.check_target_type(target, key, ty, not_null, edge, true)?;
+        let rule = TypeRule {
+            target: target.to_string(),
+            key: key.to_string(),
+            ty,
+            not_null,
+        };
+        if edge {
+            self.e_type.push(rule);
+        } else {
+            self.v_type.push(rule);
+        }
+        Ok(())
+    }
+
+    fn check_type_for_target(&self, target: &str, edge: bool) -> Result<(), String> {
+        let rules = if edge { &self.e_type } else { &self.v_type };
+        for r in rules {
+            if r.target == target {
+                self.check_target_type(target, &r.key, r.ty, r.not_null, edge, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Check `key` on every element carrying `target` against type `ty`/`not_null`.
+    /// `declaring` picks the message (existing-data vs write violation).
+    fn check_target_type(
+        &self,
+        target: &str,
+        key: &str,
+        ty: PropType,
+        not_null: bool,
+        edge: bool,
+        declaring: bool,
+    ) -> Result<(), String> {
+        let value_of = |id: u32| -> Value {
+            if edge {
+                self.edge_prop(id, key)
+            } else {
+                self.prop(id, key)
+            }
+        };
+        let ids: Vec<u32> = if edge {
+            self.edges_of_type(target)
+        } else {
+            self.nodes_with_label(target).to_vec()
+        };
+        for id in ids {
+            if !value_matches_type(&value_of(id), ty, not_null) {
+                return Err(if declaring {
+                    "E_TYPE: existing data already violates the type constraint being declared"
+                        .to_string()
+                } else {
+                    "E_TYPE: write violates a type constraint (a value is not of the declared type)"
+                        .to_string()
+                });
+            }
+        }
+        Ok(())
+    }
+
+    // --- Cardinality constraints ------------------------------------------
+
+    /// The declared cardinality constraints as `(label, etype, direction, min, max)`.
+    #[must_use]
+    pub fn cardinality_constraints(&self) -> Vec<(String, String, u8, u32, Option<u32>)> {
+        self.cardinality
+            .iter()
+            .map(|r| (r.label.clone(), r.etype.clone(), r.direction, r.min, r.max))
+            .collect()
+    }
+
+    /// The declared validators as `(target, var, predicate source)` — for the dump.
+    #[must_use]
+    pub fn validators(&self) -> Vec<(String, String, String)> {
+        self.validators
+            .iter()
+            .map(|r| (r.target.clone(), r.var.clone(), r.src.clone()))
+            .collect()
+    }
+
+    /// The declared invariants as `(name, query source)` — for the dump.
+    #[must_use]
+    pub fn invariants(&self) -> Vec<(String, String)> {
+        self.invariants
+            .iter()
+            .map(|r| (r.name.clone(), r.src.clone()))
+            .collect()
+    }
+
+    /// Declare a cardinality constraint: a `label` vertex's `etype`-edge degree in
+    /// `direction` (0 out / 1 in) must lie in `min..=max` (`max: None` = ∞).
+    /// Re-declaring the same `(label, etype, direction)` replaces the bounds.
+    pub fn create_cardinality_constraint(
+        &mut self,
+        label: &str,
+        etype: &str,
+        direction: u8,
+        min: u32,
+        max: Option<u32>,
+    ) -> Result<(), String> {
+        self.check_cardinality_rule(label, etype, direction, min, max, true)?;
+        if let Some(r) = self
+            .cardinality
+            .iter_mut()
+            .find(|r| r.label == label && r.etype == etype && r.direction == direction)
+        {
+            r.min = min;
+            r.max = max;
+        } else {
+            self.cardinality.push(CardRule {
+                label: label.to_string(),
+                etype: etype.to_string(),
+                direction,
+                min,
+                max,
+            });
+        }
+        Ok(())
+    }
+
+    fn check_all_cardinality(&self) -> Result<(), String> {
+        for r in &self.cardinality {
+            self.check_cardinality_rule(&r.label, &r.etype, r.direction, r.min, r.max, false)?;
+        }
+        Ok(())
+    }
+
+    fn check_cardinality_rule(
+        &self,
+        label: &str,
+        etype: &str,
+        direction: u8,
+        min: u32,
+        max: Option<u32>,
+        declaring: bool,
+    ) -> Result<(), String> {
+        let tid = self.etype_id(etype);
+        for &id in self.nodes_with_label(label) {
+            let adj = if direction == 1 {
+                self.inc(id)
+            } else {
+                self.out(id)
+            };
+            let degree = match tid {
+                Some(t) => adj.iter().filter(|a| a.etype == t).count() as u32,
+                None => 0,
+            };
+            if degree < min || max.is_some_and(|m| degree > m) {
+                return Err(if declaring {
+                    "E_CARDINALITY: existing data already violates the cardinality constraint being declared".to_string()
+                } else {
+                    "E_CARDINALITY: write violates a cardinality constraint (a vertex's edge degree is outside its declared min..max bound)".to_string()
+                });
             }
         }
         Ok(())
@@ -2122,6 +2690,52 @@ impl Store {
             }
         }
         self.indexes.push(Index { path, map });
+    }
+
+    /// Drop the vertex index(es) on `key` — the hash index on that exact path
+    /// AND/OR the range index on that key. Idempotent: a no-op (still `Ok`) if no
+    /// such index exists. REJECTED if `key` backs a unique constraint — drop the
+    /// constraint first (mirrors lenke-core, which keeps a unique constraint's
+    /// backing index an invariant).
+    pub fn drop_vertex_index(&mut self, key: &str) -> Result<(), String> {
+        if self
+            .unique
+            .iter()
+            .any(|(_, keys)| keys.iter().any(|k| k == key))
+        {
+            return Err(
+                "E_INVALID_GRAPH_OP: cannot drop the vertex index; it backs a unique constraint — \
+                 drop the constraint first"
+                    .to_string(),
+            );
+        }
+        let path: Vec<String> = key.split('.').map(String::from).collect();
+        self.indexes.retain(|i| i.path != path);
+        self.ranges.retain(|r| r.key != key);
+        Ok(())
+    }
+
+    /// Drop the edge interval index if `key` is one of its `[lo, hi]` keys.
+    /// Idempotent (a no-op otherwise). REJECTED if `key` backs an edge unique
+    /// constraint (mirrors lenke-core).
+    pub fn drop_edge_index(&mut self, key: &str) -> Result<(), String> {
+        if self
+            .e_unique
+            .iter()
+            .any(|(_, keys)| keys.iter().any(|k| k == key))
+        {
+            return Err(
+                "E_INVALID_GRAPH_OP: cannot drop the edge index; it backs a unique constraint — \
+                 drop the constraint first"
+                    .to_string(),
+            );
+        }
+        if let Some(iv) = &self.interval {
+            if iv.lo_key == key || iv.hi_key == key {
+                self.interval = None;
+            }
+        }
+        Ok(())
     }
 
     /// Whether any hash index is driven by the base property `base` (so a write to
@@ -2967,6 +3581,13 @@ impl Builder {
             last_commit: Vec::new(),
             unique: Vec::new(),
             required: Vec::new(),
+            e_unique: Vec::new(),
+            e_required: Vec::new(),
+            v_type: Vec::new(),
+            e_type: Vec::new(),
+            cardinality: Vec::new(),
+            validators: Vec::new(),
+            invariants: Vec::new(),
             edge_props: HashMap::new(),
             indexes: Vec::new(),
             ranges: Vec::new(),
@@ -4034,5 +4655,139 @@ mod tests {
             .map(|t| overlap_eids(&st, 0, f64::from(t), f64::from(t)))
             .collect();
         assert_eq!(before, after);
+    }
+
+    // --- type / cardinality / edge / drop-index constraints ---------------
+
+    #[test]
+    fn type_constraint_enforced_on_write() {
+        let mut st = Store::default();
+        assert!(st
+            .create_type_constraint("P", "age", "number", false)
+            .is_ok());
+        st.begin();
+        st.add_node(&["P"], &[("age", Value::Str("old".into()))]);
+        assert!(
+            st.run_deferred_checks().is_err(),
+            "string age violates number"
+        );
+        st.rollback();
+        st.begin();
+        st.add_node(&["P"], &[("age", n(42.0))]);
+        assert!(st.run_deferred_checks().is_ok());
+        st.commit();
+    }
+
+    #[test]
+    fn type_constraint_unknown_name_is_invalid_value() {
+        let mut st = Store::default();
+        let e = st
+            .create_type_constraint("P", "age", "bogus", false)
+            .unwrap_err();
+        assert!(e.starts_with("E_INVALID_VALUE"), "{e}");
+    }
+
+    #[test]
+    fn not_null_type_constraint_rejects_absent_and_null() {
+        let mut st = Store::default();
+        st.create_type_constraint("P", "name", "string NOT NULL", false)
+            .unwrap();
+        for missing in [vec![], vec![("name", Value::Null)]] {
+            st.begin();
+            st.add_node(&["P"], &missing);
+            assert!(st.run_deferred_checks().is_err(), "NOT NULL must reject");
+            st.rollback();
+        }
+        st.begin();
+        st.add_node(&["P"], &[("name", Value::Str("ann".into()))]);
+        assert!(st.run_deferred_checks().is_ok());
+        st.commit();
+    }
+
+    #[test]
+    fn cardinality_min_and_max_enforced() {
+        let mut st = Store::default();
+        // out-degree of KNOWS must be exactly 1.
+        st.create_cardinality_constraint("P", "KNOWS", 0, 1, Some(1))
+            .unwrap();
+        st.begin();
+        st.add_node(&["P"], &[]); // 0 edges → below min
+        assert!(st.run_deferred_checks().is_err());
+        st.rollback();
+        st.begin();
+        let a = st.add_node(&["P"], &[]);
+        let b = st.add_node(&["T"], &[]);
+        let c = st.add_node(&["T"], &[]);
+        st.add_edge(a, b, "KNOWS");
+        st.add_edge(a, c, "KNOWS"); // out-degree 2 → above max
+        assert!(st.run_deferred_checks().is_err());
+        st.rollback();
+        st.begin();
+        let a = st.add_node(&["P"], &[]);
+        let b = st.add_node(&["T"], &[]);
+        st.add_edge(a, b, "KNOWS"); // exactly 1
+        assert!(st.run_deferred_checks().is_ok());
+        st.commit();
+    }
+
+    #[test]
+    fn edge_unique_enforced_and_null_exempt() {
+        let mut st = Store::default();
+        st.create_edge_unique_constraint("PAID", &["ref"]).unwrap();
+        st.begin();
+        let a = st.add_node(&["A"], &[]);
+        let b = st.add_node(&["A"], &[]);
+        let e1 = st.add_edge(a, b, "PAID");
+        st.set_edge_prop(e1, "ref", Value::Str("x".into()));
+        let e2 = st.add_edge(a, b, "PAID");
+        st.set_edge_prop(e2, "ref", Value::Str("x".into())); // duplicate
+        assert!(st.run_deferred_checks().is_err());
+        st.rollback();
+        // Two edges with an absent `ref` are exempt (nulls don't collide).
+        st.begin();
+        let a = st.add_node(&["A"], &[]);
+        let b = st.add_node(&["A"], &[]);
+        st.add_edge(a, b, "PAID");
+        st.add_edge(a, b, "PAID");
+        assert!(st.run_deferred_checks().is_ok());
+        st.commit();
+    }
+
+    #[test]
+    fn edge_required_enforced_on_write() {
+        let mut st = Store::default();
+        st.create_edge_required_constraint("PAID", "amt").unwrap();
+        st.begin();
+        let a = st.add_node(&["A"], &[]);
+        let b = st.add_node(&["A"], &[]);
+        st.add_edge(a, b, "PAID"); // missing amt
+        assert!(st.run_deferred_checks().is_err());
+        st.rollback();
+    }
+
+    #[test]
+    fn drop_index_removes_and_guards_a_backing_unique() {
+        let mut st = Store::default();
+        st.add_node(&["P"], &[("age", n(1.0))]);
+        st.create_index("age");
+        assert!(st.has_hash_index("age"));
+        assert!(st.drop_vertex_index("age").is_ok());
+        assert!(!st.has_hash_index("age"));
+        assert!(st.drop_vertex_index("age").is_ok(), "drop is idempotent");
+        // Dropping the index behind a unique constraint is rejected.
+        st.create_index("email");
+        st.create_unique_constraint("P", &["email"]).unwrap();
+        let e = st.drop_vertex_index("email").unwrap_err();
+        assert!(e.starts_with("E_INVALID_GRAPH_OP"), "{e}");
+    }
+
+    #[test]
+    fn declaring_a_constraint_the_data_breaks_is_rejected() {
+        let mut st = Store::default();
+        st.add_node(&["P"], &[("age", Value::Str("nope".into()))]);
+        let e = st
+            .create_type_constraint("P", "age", "number", false)
+            .unwrap_err();
+        assert!(e.starts_with("E_TYPE"), "{e}");
     }
 }

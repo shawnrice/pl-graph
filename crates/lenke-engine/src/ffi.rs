@@ -137,6 +137,43 @@ fn prepared_handle(input: Option<&str>) -> Result<u64, String> {
     parse_handle_field(&fields)
 }
 
+/// Report a write/eval error on the error channel with its canonical wire code.
+///
+/// The exec layer signals over `Result<_, String>`; a constraint violation carries
+/// an `E_*:`-prefixed message. Map the known prefixes to the shared `@lenke/errors`
+/// codes (so a constraint failure surfaces as `E_CONSTRAINT_VIOLATION`, matching
+/// lenke-core), stripping the prefix from the human message; anything else is a
+/// generic `E_INVALID_VALUE` evaluation error.
+fn set_exec_error(e: &str) {
+    // Every constraint kind funnels to the one canonical violation code.
+    const CONSTRAINT: &[&str] = &[
+        "E_UNIQUE",
+        "E_REQUIRED",
+        "E_TYPE",
+        "E_CARDINALITY",
+        "E_VALIDATOR",
+        "E_INVARIANT",
+    ];
+    if let Some((prefix, rest)) = e.split_once(": ") {
+        if CONSTRAINT.contains(&prefix) {
+            crate::ffi_error::set("E_CONSTRAINT_VIOLATION", rest);
+            return;
+        }
+        match prefix {
+            "E_INVALID_GRAPH_OP" => {
+                crate::ffi_error::set("E_INVALID_GRAPH_OP", rest);
+                return;
+            }
+            "E_MISSING_PARAMETER" => {
+                crate::ffi_error::set("E_MISSING_PARAMETER", rest);
+                return;
+            }
+            _ => {}
+        }
+    }
+    crate::ffi_error::set("E_INVALID_VALUE", e);
+}
+
 // ----------------------------------------------------------------- plumbing ---
 
 /// The ABI version this artifact implements.
@@ -459,7 +496,7 @@ pub unsafe extern "C" fn lnk_query(
             unsafe { out_string(json, out_len) }
         }
         Err(e) => {
-            crate::ffi_error::set("E_INVALID_VALUE", &e);
+            set_exec_error(&e);
             std::ptr::null_mut()
         }
     }
@@ -513,13 +550,26 @@ pub unsafe extern "C" fn lnk_schema_apply(
         crate::ffi_error::set("E_FFI", "null store handle or non-UTF-8 payload");
         return -1;
     };
+    use crate::schema_op::SchemaError;
     match crate::schema_op::apply(store, json) {
         Ok(()) => 0,
-        Err(crate::schema_op::SchemaError::BadRequest(msg)) => {
+        Err(SchemaError::BadRequest(msg)) => {
             crate::ffi_error::set("E_FFI", &msg);
             -1
         }
-        Err(crate::schema_op::SchemaError::Rejected(msg)) => {
+        Err(SchemaError::Invalid(msg)) => {
+            crate::ffi_error::set("E_INVALID_VALUE", &msg);
+            -1
+        }
+        Err(SchemaError::Syntax(msg)) => {
+            crate::ffi_error::set("E_SYNTAX", &msg);
+            -1
+        }
+        Err(SchemaError::GraphOp(msg)) => {
+            crate::ffi_error::set("E_INVALID_GRAPH_OP", &msg);
+            -1
+        }
+        Err(SchemaError::Rejected(msg)) => {
             crate::ffi_error::set("E_CONSTRAINT_VIOLATION", &msg);
             -2
         }
@@ -719,7 +769,7 @@ pub unsafe extern "C" fn lnk_command(
                 // SAFETY: out_len is writable per this fn's contract.
                 Ok(json) => unsafe { out_string(json, out_len) },
                 Err(e) => {
-                    crate::ffi_error::set("E_INVALID_VALUE", &e);
+                    set_exec_error(&e);
                     std::ptr::null_mut()
                 }
             }

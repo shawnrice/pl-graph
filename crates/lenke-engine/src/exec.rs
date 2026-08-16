@@ -387,22 +387,12 @@ fn run_insert(
             store.set_edge_prop(eid, k, v.clone());
         }
     }
-    // Enforce unique AND required constraints on every label this INSERT touched
-    // (roll the whole INSERT back on the first violation).
-    let mut labels: Vec<&str> = nodes
-        .iter()
-        .flat_map(|s| s.labels.iter().map(String::as_str))
-        .collect();
-    labels.sort_unstable();
-    labels.dedup();
-    for l in labels {
-        if let Err(e) = store
-            .check_unique_for_label(l)
-            .and_then(|()| store.check_required_for_label(l))
-        {
-            store.rollback();
-            return Err(e);
-        }
+    // Enforce every constraint this INSERT could have violated (unique, required,
+    // type, cardinality, validators, invariants) — roll the whole INSERT back on
+    // the first violation.
+    if let Err(e) = store.run_deferred_checks() {
+        store.rollback();
+        return Err(e);
     }
     store.commit();
     Ok(ids)
@@ -544,16 +534,6 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
             // with no recheck, so `SET u.email = <existing>` silently violated a
             // unique constraint and `REMOVE u.email` a required one.
             store.begin();
-            // Nodes whose properties changed (Set/Remove) — the ones that can newly
-            // violate a unique/required constraint. A Delete can't create a violation
-            // on another node, so it doesn't seed a recheck.
-            let touched: Vec<u32> = applied
-                .iter()
-                .filter_map(|a| match a {
-                    Applied::Set(n, _, _) | Applied::Remove(n, _) => Some(*n),
-                    _ => None,
-                })
-                .collect();
             // Pass 1: property writes and EDGE deletes. Node deletes are deferred to
             // pass 2 so an edge deleted here (`DELETE r, a, b`) leaves its endpoints
             // relationship-free before the non-DETACH node-delete check runs.
@@ -590,23 +570,11 @@ pub fn execute(plan: &Plan, store: &mut Store) -> Result<Rows, String> {
                 }
                 store.delete_node(node);
             }
-            // Recheck unique + required on every label a touched (still-live) node
-            // carries; roll the statement back on the first violation.
-            let mut labels: Vec<String> = touched
-                .iter()
-                .filter(|&&n| store.is_alive(n))
-                .flat_map(|&n| store.labels_of(n))
-                .collect();
-            labels.sort_unstable();
-            labels.dedup();
-            for l in &labels {
-                if let Err(e) = store
-                    .check_unique_for_label(l)
-                    .and_then(|()| store.check_required_for_label(l))
-                {
-                    store.rollback();
-                    return Err(e);
-                }
+            // Recheck every constraint this statement could have violated; roll it
+            // back on the first violation.
+            if let Err(e) = store.run_deferred_checks() {
+                store.rollback();
+                return Err(e);
             }
             store.commit();
             Ok(empty_rows())
@@ -733,10 +701,7 @@ fn execute_merge(
         }
     }
 
-    if let Err(e) = store
-        .check_unique_for_label(label)
-        .and_then(|()| store.check_required_for_label(label))
-    {
+    if let Err(e) = store.run_deferred_checks() {
         store.rollback();
         return Err(e);
     }

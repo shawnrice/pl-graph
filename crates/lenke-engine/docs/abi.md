@@ -27,15 +27,15 @@ core of the pattern; this completes it and drops the prefix.
 
 ## The surface at a glance: 44 → 16 (flat)
 
-| Group        | Symbols                                                                              | How the fold works                                                                                                          |
-| ------------ | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| Plumbing     | `lnk_abi_version`, `lnk_alloc`, `lnk_dealloc`, `lnk_free`, `lnk_last_error_json` (5) | one `lnk_free` for every engine-returned buffer (core had `free_buf` + `free_arrow`)                                        |
+| Group        | Symbols                                                                              | How the fold works                                                                                                                                         |
+| ------------ | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Plumbing     | `lnk_abi_version`, `lnk_alloc`, `lnk_dealloc`, `lnk_free`, `lnk_last_error_json` (5) | one `lnk_free` for every engine-returned buffer (core had `free_buf` + `free_arrow`)                                                                       |
 | Lifecycle    | `lnk_open`, `lnk_close`, `lnk_clone`, `lnk_config`, `lnk_stat` (5)                   | `lnk_stat(which)` folds the 4 count/version/epoch getters; `lnk_open(…, format)` folds ndjson + binary + pg-json/pg-text/graphson/csv + empty construction |
-| Query        | `lnk_query` (1)                                                                      | `lnk_query(lang, …, format, …)` folds `query_rows` + `gremlin_json` + `query_arrow` + `query_arrow_ipc`                     |
-| Transaction  | `lnk_tx` (1)                                                                         | `lnk_tx(action)` folds begin/commit/rollback                                                                                |
-| Schema       | `lnk_schema_apply`, `lnk_schema_dump` (2)                                            | `schema_apply(json)` folds all 10 `create_*` + 2 `drop_*`; `schema_dump` folds the 2 index-introspection reads              |
-| Snapshot     | `lnk_encode` (1)                                                                     | `lnk_encode(format)` folds ndjson + binary + pg-json/pg-text/graphson/csv out                                               |
-| Escape hatch | `lnk_command` (1)                                                                    | every exotic tier — no new symbols, ever                                                                                    |
+| Query        | `lnk_query` (1)                                                                      | `lnk_query(lang, …, format, …)` folds `query_rows` + `gremlin_json` + `query_arrow` + `query_arrow_ipc`                                                    |
+| Transaction  | `lnk_tx` (1)                                                                         | `lnk_tx(action)` folds begin/commit/rollback                                                                                                               |
+| Schema       | `lnk_schema_apply`, `lnk_schema_dump` (2)                                            | `schema_apply(json)` folds all 10 `create_*` + 2 `drop_*`; `schema_dump` folds the 2 index-introspection reads                                             |
+| Snapshot     | `lnk_encode` (1)                                                                     | `lnk_encode(format)` folds ndjson + binary + pg-json/pg-text/graphson/csv out                                                                              |
+| Escape hatch | `lnk_command` (1)                                                                    | every exotic tier — no new symbols, ever                                                                                                                   |
 
 **16 symbols, fixed.** Compare to core's 44-and-counting.
 
