@@ -48,6 +48,7 @@ pub mod ir;
 pub mod json;
 pub mod ndjson;
 pub mod opt;
+pub mod prepared;
 pub mod schema_op;
 pub mod store;
 pub mod temporal;

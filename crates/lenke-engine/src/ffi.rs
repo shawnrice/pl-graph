@@ -102,19 +102,19 @@ unsafe fn out_bytes(bytes: Vec<u8>, out_len: *mut usize) -> *mut u8 {
     Box::into_raw(boxed) as *mut u8
 }
 
-/// Parse a prepared handle out of a `{"handle":"<ptr>"}` field (a decimal string,
-/// since a 64-bit pointer does not fit a JSON f64).
-fn parse_handle_field(fields: &[(String, crate::ndjson::Json)]) -> Result<usize, String> {
+/// Parse a prepared handle out of a `{"handle":"<h>"}` field (a decimal string,
+/// since a generational handle can exceed a JS f64).
+fn parse_handle_field(fields: &[(String, crate::ndjson::Json)]) -> Result<u64, String> {
     let j = crate::ndjson::req(fields, "handle")?;
     let s = crate::ndjson::json_string(j)?;
-    s.parse::<usize>()
+    s.parse::<u64>()
         .map_err(|_| format!("invalid prepared handle `{s}`"))
 }
 
-/// Parse a `prepared_run` payload `{"handle":"<ptr>", "params":{…}}`.
+/// Parse a `prepared_run` payload `{"handle":"<h>", "params":{…}}`.
 fn prepared_payload(
     input: Option<&str>,
-) -> Result<(usize, Vec<(String, crate::value::Value)>), String> {
+) -> Result<(u64, Vec<(String, crate::value::Value)>), String> {
     let text = input.ok_or("prepared_run requires a {handle, params} JSON payload")?;
     let crate::ndjson::Json::Obj(fields) = crate::ndjson::parse_json(text)? else {
         return Err("prepared_run payload must be a JSON object".into());
@@ -127,8 +127,8 @@ fn prepared_payload(
     Ok((handle, params))
 }
 
-/// Parse a `prepared_free` payload `{"handle":"<ptr>"}`.
-fn prepared_handle(input: Option<&str>) -> Result<usize, String> {
+/// Parse a `prepared_free` payload `{"handle":"<h>"}`.
+fn prepared_handle(input: Option<&str>) -> Result<u64, String> {
     let text = input.ok_or("prepared_free requires a {handle} JSON payload")?;
     let crate::ndjson::Json::Obj(fields) = crate::ndjson::parse_json(text)? else {
         return Err("prepared_free payload must be a JSON object".into());
@@ -615,9 +615,11 @@ pub unsafe extern "C" fn lnk_command(
             unsafe { out_string(json, out_len) }
         }
         // Prepared statements (Design A: parse once, bind + optimize + run per call —
-        // amortizes parse cost across a loop). The handle is the parsed plan's pointer
-        // as a DECIMAL STRING (a 64-bit pointer does not fit a JSON f64 exactly). The
-        // caller owns lifetime: prepare -> N× prepared_run -> prepared_free.
+        // amortizes parse cost across a loop). Handles live in a generational slab
+        // (`crate::prepared`), so a stale/double handle is a clean error, never a bad
+        // dereference. The handle is a decimal string (it can exceed a JS f64). The
+        // caller owns lifetime: prepare then N prepared_run then prepared_free — and a
+        // host `using` / FinalizationRegistry reclaims a forgotten one.
         "prepare" => {
             let Some(query) = input else {
                 crate::ffi_error::set("E_FFI", "prepare requires the query text as input");
@@ -625,7 +627,7 @@ pub unsafe extern "C" fn lnk_command(
             };
             match crate::gql::parse_prepared(query) {
                 Ok(plan) => {
-                    let handle = Box::into_raw(Box::new(plan)) as usize;
+                    let handle = crate::prepared::insert(plan);
                     // SAFETY: out_len is writable per this fn's contract.
                     unsafe { out_string(format!("{{\"handle\":\"{handle}\"}}"), out_len) }
                 }
@@ -639,18 +641,19 @@ pub unsafe extern "C" fn lnk_command(
             // Input: {"handle":"<ptr>", "params":{...}}. Clone the cached plan, bind
             // the params, optimize + run against this store (the plan is graph-agnostic,
             // so one prepared statement serves any store).
-            let Some((handle, params)) = (match prepared_payload(input) {
-                Ok(hp) => Some(hp),
+            let (handle, params) = match prepared_payload(input) {
+                Ok(hp) => hp,
                 Err(e) => {
                     crate::ffi_error::set("E_FFI", &e);
                     return std::ptr::null_mut();
                 }
-            }) else {
+            };
+            // A stale/freed handle resolves to None here — a clean error, not a
+            // dangling dereference (the whole point of the generational slab).
+            let Some(mut plan) = crate::prepared::get_clone(handle) else {
+                crate::ffi_error::set("E_FFI", "invalid or freed prepared handle");
                 return std::ptr::null_mut();
             };
-            // SAFETY: `handle` came from `prepare`'s Box::into_raw and, per the caller's
-            // lifetime contract, is still live (not yet prepared_free'd).
-            let mut plan = unsafe { (*(handle as *const crate::ir::Plan)).clone() };
             if let Err(e) = crate::bind::bind_params(&mut plan, &params) {
                 crate::ffi_error::set("E_QUERY", &e);
                 return std::ptr::null_mut();
@@ -673,8 +676,12 @@ pub unsafe extern "C" fn lnk_command(
                     return std::ptr::null_mut();
                 }
             };
-            // SAFETY: `handle` came from `prepare`'s Box::into_raw and is freed once.
-            drop(unsafe { Box::from_raw(handle as *mut crate::ir::Plan) });
+            // A double-free / unknown handle returns false — a clean error, not a
+            // second drop of freed memory.
+            if !crate::prepared::free(handle) {
+                crate::ffi_error::set("E_FFI", "invalid or already-freed prepared handle");
+                return std::ptr::null_mut();
+            }
             // SAFETY: out_len is writable per this fn's contract.
             unsafe { out_string("{}".to_string(), out_len) }
         }
